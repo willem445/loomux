@@ -308,7 +308,7 @@ impl<'a> OpenIssueList<'a> {
     /// the other way costs false re-announcements, which is the failure this
     /// whole type exists to prevent.
     pub fn from_fetch(issues: &'a [RawIssue]) -> Self {
-        Self { issues, complete: true } // INERT for the red run
+        Self { issues, complete: issues.len() < MAX_INTAKE_ISSUES }
     }
 }
 
@@ -435,7 +435,7 @@ pub fn eligible_deltas(
         } else if present.contains(n) {
             false // present and no longer eligible — a real transition
         } else {
-            false // INERT for the red run: absent always forgets
+            !list.complete // absent: only "gone" if we saw the whole list
         }
     });
     last_seen.extend(eligible_now);
@@ -485,7 +485,13 @@ pub fn intake_wake_summary(
     if total > lines.len() {
         summary.push_str(&format!("; (+{} more — see label/PR/issue sweep)", total - lines.len()));
     }
-    // INERT for the red run: the truncation caveat is not appended yet.
+    if issues_truncated && !summary.is_empty() {
+        summary.push_str(&format!(
+            "; (PARTIAL: the open-issue fetch stopped at its {MAX_INTAKE_ISSUES}-issue bound, so this \
+             poll saw only the {MAX_INTAKE_ISSUES} newest open issues — list the rest yourself before \
+             treating the backlog as complete)"
+        ));
+    }
     summary
 }
 
@@ -1194,6 +1200,10 @@ mod tests {
         let s = intake_wake_summary(&[], &[], &eligible, true);
         assert!(s.contains("PARTIAL"), "a truncated fetch must say so: {s}");
         assert!(s.contains(&MAX_INTAKE_ISSUES.to_string()), "…and name the bound it hit: {s}");
+        // Reads as one clean sentence across the literal's line continuations —
+        // a dropped `\` turns the indent into a run of spaces in the delivered
+        // notice, which nothing else here would catch.
+        assert!(s.contains("bound, so this poll saw only"), "the caveat must join cleanly: {s}");
 
         let complete = intake_wake_summary(&[], &[], &eligible, false);
         assert!(!complete.contains("PARTIAL"), "a complete fetch must not cry wolf: {complete}");
