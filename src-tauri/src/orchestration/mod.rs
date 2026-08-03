@@ -30307,7 +30307,8 @@ impl OrchRegistry {
         }
         let cfg = json!({ "mcpServers": one_server_map(server) });
         fs::write(&path, serde_json::to_string_pretty(&cfg).unwrap()).map_err(|e| e.to_string())?;
-        Ok(AgentCliConfig { path, env: cli_extra_env(cli, &path) })
+        let env = cli_extra_env(cli, &path);
+        Ok(AgentCliConfig { path, env })
     }
 
     /// Write this agent's gemini policy-engine file — the admin-tier half of a
