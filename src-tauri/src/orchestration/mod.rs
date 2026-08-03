@@ -9191,6 +9191,16 @@ pub struct OrchRegistry {
     /// across a write into a pty. One lock for the family rather than one per
     /// group: these fire on a human's click.
     ///
+    /// **This is file IO under a lock, which INV-5 permits only with the
+    /// question answered rather than dodged.** The invariant's rule is "no file
+    /// IO under a lock a *poll path* takes", and no poll path takes this one —
+    /// it is reachable only from the nine live guardrail setters, each a human
+    /// gesture. The reads those setters race with (`group`, `workflow_status`,
+    /// the idle-tick and compact-nudge passes) go to the in-memory guardrails
+    /// and take the `groups` lock, which stays a leaf held for one lookup. So
+    /// the cost of holding this across a small-file rewrite is paid by the next
+    /// *click*, never by a tick or a paint.
+    ///
     /// **Not** taken by `create_group`'s first write of `group.json` (under
     /// `creation`, §4 X6) or by the marker toggles: a group being created has
     /// no guardrail UI to race, and a marker file is a different store with its
@@ -37506,10 +37516,27 @@ pub struct RoleKnobs {
 /// Create (or reattach to) an orchestration group and register its
 /// orchestrator. Returns the pane spec the frontend opens directly; initial
 /// idle workers are spawned in the background once the orchestrator binds.
+///
+/// Off-thread (#762 — see [`run_blocking`]): the longest single-gesture stall
+/// in the orchestration surface. It holds the global `creation` mutex across
+/// `group.json` plus the per-agent MCP config writes plus a session-state scan,
+/// and while it was synchronous every millisecond of that was paid on the
+/// thread that services paint — which is the whole of the launcher's
+/// "nothing happens for a moment after I hit Create".
+///
+/// **Reentrancy.** The one command in #762 whose exclusion was never
+/// accidental: `OrchRegistry::creation` (`performance.md` §4 X6) exists
+/// *because* two concurrent launches on one repo would otherwise pick the same
+/// group id — id selection by liveness and orchestrator registration are one
+/// unit by design, argued and named long before this conversion. Moving the
+/// body to a pool thread changes which thread waits on that mutex, not what it
+/// guarantees; two launches still serialize, and the second still sees the
+/// first's group as live. Nothing in the body runs before the mutex is taken
+/// except argument marshalling.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)] // launcher-collected guardrails, one field each
-pub fn create_orchestration(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn create_orchestration(
+    app: AppHandle,
     repo: String,
     initial_workers: u32,
     max_agents: u32,
@@ -37534,6 +37561,41 @@ pub fn create_orchestration(
     advanced_orchestrator: bool,
     // Per-role thinking level / context window (#687). Omitted = no knob on any
     // role, i.e. today's group byte for byte — see `RoleKnobs`.
+    role_knobs: Option<RoleKnobs>,
+) -> Result<SpawnRequest, String> {
+    let reg = reg_of(&app);
+    run_blocking(move || create_orchestration_sync(
+        &reg, repo, initial_workers, max_agents, agent_cli, orchestrator_cli, worker_cli,
+        reviewer_cli, planner_cli, worker_model, reviewer_model, orchestrator_model,
+        planner_model, auto_ops, idle_kill_minutes, max_spawns_per_hour,
+        watchdog_stall_minutes, advanced_orchestrator, role_knobs,
+    ))
+    .await
+}
+
+/// The body of [`create_orchestration`], as a plain function so the command
+/// itself is the thin delegation `performance.md` §2 P1 asks for rather than a
+/// nineteen-argument closure.
+#[allow(clippy::too_many_arguments)] // it is `create_orchestration`'s argument list, verbatim
+fn create_orchestration_sync(
+    reg: &Arc<OrchRegistry>,
+    repo: String,
+    initial_workers: u32,
+    max_agents: u32,
+    agent_cli: String,
+    orchestrator_cli: String,
+    worker_cli: String,
+    reviewer_cli: String,
+    planner_cli: String,
+    worker_model: String,
+    reviewer_model: String,
+    orchestrator_model: String,
+    planner_model: String,
+    auto_ops: bool,
+    idle_kill_minutes: u32,
+    max_spawns_per_hour: u32,
+    watchdog_stall_minutes: u32,
+    advanced_orchestrator: bool,
     role_knobs: Option<RoleKnobs>,
 ) -> Result<SpawnRequest, String> {
     // The launcher still collects one CLI + model per role — that IS the
@@ -37576,7 +37638,7 @@ pub fn create_orchestration(
         ),
     ]);
     create_orchestration_group(
-        reg.inner(),
+        reg,
         &repo,
         Guardrails {
             max_agents,
@@ -37657,8 +37719,26 @@ pub fn create_orchestration(
 /// Never fails: a broken file is `{ valid: false, errors: [...] }` and the group
 /// would fall back to the built-in roster, which is precisely what the launcher
 /// needs to say. Nothing here is persisted and no group is created.
+///
+/// Off-thread (#762 — see [`run_blocking`]): it opens and parses
+/// `.loomux/workflow.yml` from disk, on every preview gesture, on the thread
+/// that services paint. The file is small; the path it sits on need not be.
+///
+/// **Reentrancy.** Nothing to argue, and that is a property of the command
+/// rather than an absence of thought: it takes no registry state, holds no
+/// lock, writes nothing and creates no group — the doc above already says so,
+/// because the launcher's whole reason for asking is that asking is free. Two
+/// previews of one repo read the same file twice and cannot interact.
 #[tauri::command]
-pub fn orch_workflow_preview(repo: String, agent_cli: String) -> Value {
+pub async fn orch_workflow_preview(repo: String, agent_cli: String) -> Value {
+    run_blocking(move || orch_workflow_preview_sync(repo, agent_cli)).await
+}
+
+/// The body of [`orch_workflow_preview`], as a plain function: it is the
+/// launcher's answer to "what would this launch run", and the workflow tests
+/// exercise it directly, without a Tauri runtime.
+#[doc(hidden)] // pub for integration tests
+pub fn orch_workflow_preview_sync(repo: String, agent_cli: String) -> Value {
     let present = workflow::workflow_file_exists(&repo);
     let (name, blocks, gates, errors, capacity) = match workflow::load_workflow(&repo) {
         Ok(Some(wf)) => {
@@ -38269,13 +38349,29 @@ pub fn orch_group_watches(reg: tauri::State<Arc<OrchRegistry>>, group_id: String
 /// for the full contract (refusals, satisfiability, the consent boundary on live
 /// delegates). Returns the resulting workflow status — the same shape
 /// `orch_workflow_status` reads.
+///
+/// Off-thread (#762): it reads the repo's workflow file, patches `group.json`,
+/// syncs the merge-gate spec file and returns `workflow_status`.
+///
+/// **Reentrancy.** Two guards, for two different racers. The `group.json`
+/// read-modify-write and the in-memory publish are one unit under
+/// [`OrchRegistry::group_file_io`], like the guardrail knobs it sits beside —
+/// that is what this conversion adds. The other racer needs nothing added,
+/// because it was already there: `run_workflow_gate_reload`'s background pass
+/// re-arms the merge gate from the repo's current file, and #385 already made
+/// it re-read the group's guardrails immediately before writing precisely
+/// because "`set_advanced_orchestrator` runs on a different thread" — a
+/// sentence written about the webview thread that stays true, word for word,
+/// about a pool thread. The guard is released before the gate sync and the
+/// notice, so nothing waits on it across a pane write.
 #[tauri::command]
-pub fn orch_set_advanced_orchestrator(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_set_advanced_orchestrator(
+    app: AppHandle,
     group_id: String,
     on: bool,
 ) -> Result<Value, String> {
-    reg.set_advanced_orchestrator(&group_id, on, "human")
+    let reg = reg_of(&app);
+    run_blocking(move || reg.set_advanced_orchestrator(&group_id, on, "human")).await
 }
 
 /// The group's current workflow-mode status for the lifecycle UI (Slice C):
@@ -38313,29 +38409,69 @@ pub async fn orch_workflow_status(app: AppHandle, group_id: String) -> Value {
 /// Connect two agent panes (possibly in different groups) into a channel.
 /// Human-only. See `OrchRegistry::connect_agents` for the join/mint/reject
 /// rules.
+///
+/// Off-thread (#762 — see [`run_blocking`]): an audit append PER MEMBER GROUP
+/// and two pane deliveries, so its cost scales with the channel rather than
+/// being constant.
+///
+/// **The channel family's reentrancy argument, made once here.** The membership
+/// graph has had concurrent writers since #271 and does not depend on dispatch
+/// for any of its invariants. Two of them, both live today: `mark_dead` calls
+/// `cleanup_agent_channel` → `disconnect_agent` from the reaper and watchdog
+/// threads whenever a pane dies, and the agent-facing `channel_send` MCP tool
+/// mutates reply credits inside `channels` from an MCP thread. What holds the
+/// graph together is that every mutation takes `channels` and `agent_channel`
+/// **together** and does the whole decision under both — mint, join, reject,
+/// teardown — so the one-channel-per-pane invariant and the star topology's
+/// single hub are properties of a critical section, not of who called it. The
+/// audits and deliveries deliberately run after both guards drop (they can
+/// block on a pane), which is why this command's cost is off-thread work worth
+/// moving rather than lock hold time.
+///
+/// **Reentrancy.** Specific to this one: `sender_agent` is validated against
+/// the channel state *inside* that critical section — a join confirms the
+/// existing sender, a mint designates one — so two connects racing onto one
+/// channel cannot both install a hub. The loser is refused with the existing
+/// sender named, exactly as a sequential second connect would be.
 #[tauri::command]
-pub fn orch_channel_connect(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_channel_connect(
+    app: AppHandle,
     from_group: String,
     from_agent: String,
     to_group: String,
     to_agent: String,
     sender_agent: String,
 ) -> Result<Value, String> {
-    reg.connect_agents(&from_group, &from_agent, &to_group, &to_agent, &sender_agent)
+    let reg = reg_of(&app);
+    run_blocking(move || {
+        reg.connect_agents(&from_group, &from_agent, &to_group, &to_agent, &sender_agent)
+    })
+    .await
 }
 
 /// Disconnect one agent pane from its channel. Human-only; tears the
 /// channel down if this drops it below 2 members, or if the disconnected
 /// pane was the channel's sender (#271 W3 addendum, part B — a star
 /// topology has exactly one hub).
+/// Off-thread (#762): the teardown half of [`orch_channel_connect`] — the same
+/// per-group audit appends and per-member deliveries.
+///
+/// **Reentrancy.** The family argument on [`orch_channel_connect`], and this is
+/// the command that proves it rather than asserting it: `cleanup_agent_channel`
+/// has always called `OrchRegistry::disconnect_agent` from whichever thread
+/// noticed a pane die, so this exact function has been reentered off the
+/// webview thread since #271. The `agent_channel` remove is what decides
+/// whether a call is a real disconnect — a second one finds no membership and
+/// errors rather than tearing a channel down twice — and the teardown decision
+/// (below 2 members, or the sender left) is taken with both maps held.
 #[tauri::command]
-pub fn orch_channel_disconnect(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_channel_disconnect(
+    app: AppHandle,
     group: String,
     agent: String,
 ) -> Result<Value, String> {
-    reg.disconnect_agent(&group, &agent)
+    let reg = reg_of(&app);
+    run_blocking(move || reg.disconnect_agent(&group, &agent)).await
 }
 
 /// Every live channel, for the frontend's cross-tab indicators.
@@ -38355,13 +38491,24 @@ pub fn orch_channel_for_pane(reg: tauri::State<Arc<OrchRegistry>>, group: String
 /// addendum, part B5). See `OrchRegistry::set_sender` for the validation
 /// (member + token) and side effects (credits cleared, both panes notified,
 /// `channel-direction` audited).
+/// Off-thread (#762): an audit append per member group and a delivery of the
+/// direction change — the same per-member fan-out as connect, for a smaller
+/// edit.
+///
+/// **Reentrancy.** The family argument on [`orch_channel_connect`]. Specific to
+/// this one: membership and token validation and the sender swap happen under
+/// the `channels` guard, so two reassignments serialize into one final hub
+/// rather than a channel that names one sender and credits another. Reply
+/// credits are cleared as part of the same mutation, which is what stops a
+/// receiver keeping a credit minted under the previous direction.
 #[tauri::command]
-pub fn orch_channel_set_sender(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_channel_set_sender(
+    app: AppHandle,
     channel_id: String,
     new_sender_agent: String,
 ) -> Result<Value, String> {
-    reg.set_sender(&channel_id, &new_sender_agent)
+    let reg = reg_of(&app);
+    run_blocking(move || reg.set_sender(&channel_id, &new_sender_agent)).await
 }
 
 // ---------- standalone panes (#271 W3 addendum, part A): human-only, from
@@ -38369,14 +38516,26 @@ pub fn orch_channel_set_sender(
 
 /// Mint a channel-scoped identity for a newly-launching standalone pane
 /// BEFORE it boots. See `OrchRegistry::solo_prepare`.
+/// Off-thread (#762): it writes the pane's MCP config and appends an audit
+/// entry BEFORE the CLI is launched, so every millisecond of it is latency the
+/// human reads as a slow pane open.
+///
+/// **Reentrancy.** Every durable thing this creates is keyed by an id minted
+/// under `agent_seq_persist`, which is already a lock rather than an atomic
+/// (#524 rev-13 N1, so the high-water counter can never wrap and reissue), and
+/// an id is never re-minted. Two concurrent prepares therefore write two
+/// distinct config files for two distinct agents and cannot collide on a path,
+/// a token, or a roster entry. `ensure_solo_group` is idempotent — it inserts
+/// the standalone group only if absent — so racing it produces one group.
 #[tauri::command]
-pub fn orch_solo_prepare(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_solo_prepare(
+    app: AppHandle,
     cli: String,
     cwd: String,
     name: String,
 ) -> Result<Value, String> {
-    reg.solo_prepare(&cli, &cwd, &name)
+    let reg = reg_of(&app);
+    run_blocking(move || reg.solo_prepare(&cli, &cwd, &name)).await
 }
 
 /// Bind a just-spawned solo pane's pty to the `AgentEntry` `orch_solo_prepare`
@@ -38400,26 +38559,59 @@ pub fn orch_confirm_solo_copilot_autopilot(
 /// Adopt an already-running pane (no channel identity yet) as a
 /// delivery-only member on its first Connect gesture. See
 /// `OrchRegistry::solo_adopt`.
+/// Off-thread (#762): the adoption records plus an audit append, on a pane's
+/// first Connect gesture.
+///
+/// **Reentrancy.** This one needed a code change, not just an argument.
+/// `solo_adopt` was idempotent by pty through a check-then-insert — read
+/// `by_pty`, mint, insert — and the two lock acquisitions with a mint between
+/// them were only safe because the webview thread could not be inside the
+/// function twice. #762 removes that, so the claim becomes a vacant-entry
+/// insert on `by_pty`: exactly one adopt of a pty wins, and the loser rolls its
+/// own roster entry back and returns the winner's id. The alternative — a
+/// second delivery-only identity for one pane — would have been silent, since
+/// both calls return an id that looks fine.
 #[tauri::command]
-pub fn orch_solo_adopt(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_solo_adopt(
+    app: AppHandle,
     pty_id: u32,
     name: String,
     cwd: String,
 ) -> Result<Value, String> {
-    reg.solo_adopt(pty_id, &name, &cwd)
+    let reg = reg_of(&app);
+    run_blocking(move || reg.solo_adopt(pty_id, &name, &cwd)).await
 }
 
 /// End a whole orchestration: kill all its agents and (optionally) remove
 /// their worktrees. Human-initiated, destructive, audited — the frontend
 /// confirms before calling this.
+///
+/// Off-thread (#762 — see [`run_blocking`]): N SEQUENTIAL blocking
+/// `git worktree remove` spawns, then recursive directory deletes, then audits.
+/// The largest process-spawn count of any command in E1's manifest, and an
+/// INV-2 violation for as long as it ran on the webview thread — a fleet
+/// teardown froze the whole app for its duration.
+///
+/// **Reentrancy.** Every step is idempotent or reports its own failure, which
+/// is what a teardown needs to be anyway: `mark_dead` is already idempotent
+/// against the asynchronous pty-exit path (it returns `None` for an agent that
+/// is already dead, so no second exit notice is emitted), the attachment sweep
+/// and the agent-file sweep are `remove_dir_all`/scan-and-delete, and a
+/// `git worktree remove` of a path a racer already reclaimed fails and is
+/// reported in `worktree_errors` rather than lost. So a second end-group —
+/// which the human could already produce by confirming twice, since the *first*
+/// call left the members in the roster marked dead — behaves as it did before:
+/// it finds nothing live to kill and reports what it could not remove. What is
+/// new is that the two can now overlap; the outcome is the same set of
+/// reclaimed worktrees and an error row for whichever call lost each race.
 #[tauri::command]
-pub fn orch_end_group(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_end_group(
+    app: AppHandle,
     group_id: String,
     cleanup_worktrees: bool,
 ) -> Result<Value, String> {
-    reg.end_group(&group_id, cleanup_worktrees)
+    let reg = reg_of(&app);
+    run_blocking(move || reg.end_group(&group_id, cleanup_worktrees)).await
 }
 
 /// Create (or reattach to) a group and register its orchestrator, under the
@@ -39186,16 +39378,33 @@ pub fn orch_session_roles(reg: tauri::State<Arc<OrchRegistry>>) -> Vec<SessionRo
 /// Restore a recorded orchestration session (see `resume_recorded_session`).
 /// Returns the orchestrator pane spec, or null when the pane will arrive
 /// via `orch-spawn-request` (worker/reviewer rejoin).
+///
+/// Off-thread (#762): the session-restore path reads the persisted group state
+/// back from disk, the same shape as [`create_orchestration`] and on the same
+/// app-restore gesture — several of them at once when a window comes back with
+/// several orchestration tabs.
+///
+/// **Reentrancy.** It reaches `create_orchestration_group`, so it inherits
+/// [`create_orchestration`]'s argument: the `creation` mutex (`performance.md`
+/// §4 X6) makes id selection and orchestrator registration one unit, and
+/// `expect_group` pins a restore to its recorded id rather than letting it pick
+/// one — so several restores racing on app start each reattach to their own
+/// group instead of competing for a fresh id. That is why concurrent restores
+/// are the case this path was built for, not a new one.
 #[tauri::command]
-pub fn resume_orch_session(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn resume_orch_session(
+    app: AppHandle,
     session_id: String,
     group_hint: Option<String>,
     role_hint: Option<String>,
     start_fresh: bool,
 ) -> Result<Option<SpawnRequest>, String> {
-    let hint = group_hint.zip(role_hint);
-    resume_recorded_session(reg.inner(), &session_id, hint, start_fresh)
+    let reg = reg_of(&app);
+    run_blocking(move || {
+        let hint = group_hint.zip(role_hint);
+        resume_recorded_session(&reg, &session_id, hint, start_fresh)
+    })
+    .await
 }
 
 // ---------- merge-gate link resolution ----------

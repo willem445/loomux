@@ -30,10 +30,12 @@
 //! THE BOUND OF THE CLAIM, stated rather than implied. **A source scan cannot
 //! follow call chains.** A sync command whose *helper* spawns is not caught
 //! mechanically, and the shipped tree has live examples: `fm_open`'s body is
-//! one line and the blocking `ShellExecuteW` is in `filemgr.rs`'s helper;
-//! `orch_open_ref` reaches two blocking `git` spawns through a helper, and
+//! one line and the blocking `ShellExecuteW` is in `filemgr.rs`'s helper, and
 //! `orch_confirm_solo_copilot_autopilot`'s one-line body hands work to a raw
-//! thread it never names. This is the same bound `gh.rs`'s in-module
+//! thread it never names. (`orch_open_ref` was the third until #762 converted
+//! it — a scan-invisible pair of `git` spawns, found by reading rather than by
+//! failing, which is the residue this paragraph is about.) This is the same
+//! bound `gh.rs`'s in-module
 //! enumeration test (the seed this generalizes) already accepts. The scan pins
 //! the shape — which commands are sync, and that each one's cost is written
 //! down — and the manifest reason plus review carry the residue. For the same
@@ -100,26 +102,21 @@ const DEBT_OWNERS: &[(&str, &str)] = &[
         "F4 of #743: orch_session_roles fans out over every group ever created — an index or a \
          live-groups filter, not just a thread hop.",
     ),
-    (
-        "#762",
-        "F2 of #743: the orchestration mutation and lifecycle commands — group lifecycle, the \
-         guardrail marker writes, channels and solo panes, and the task board family under \
-         tasks_lock — convert to async + run_blocking with reentrancy argued per command, in two \
-         or three slices. tasks_lock's own architecture stays #747; this is dispatch only.",
-    ),
 ];
 
-/// The 91 synchronous `#[tauri::command]`s at this commit, seeded verbatim from
+/// The 51 synchronous `#[tauri::command]`s at this commit, seeded verbatim from
 /// #743's census (planning comments parts 1-2, reconciled against
-/// `APP_COMMANDS`) with #726's 16 git conversions and #752's 8 polled
-/// orchestration conversions already removed. This is today's truth, not the
+/// `APP_COMMANDS`) with #726's 16 git conversions, #752's 8 polled
+/// orchestration conversions and #762's 40 orchestration mutation and
+/// lifecycle conversions already removed. This is today's truth, not the
 /// target state.
 ///
 /// Reconciliation against the census's own totals, so a reader can check this
 /// list rather than trust it: census A=20, T=4, C=20, B=91 of 135. Here
-/// 44 async = 20 A + #726's 16 + #752's 8; 20 `cheap` = the 20 C; 5 `exception`
-/// = the 4 T plus `resize_pty` (census B, but §4 X1 argues it stays sync);
-/// 66 `debt` = 91 B − 16 (#726) − 8 (#752) − 1 (`resize_pty`).
+/// 84 async = 20 A + #726's 16 + #752's 8 + #762's 40; 20 `cheap` = the 20 C;
+/// 5 `exception` = the 4 T plus `resize_pty` (census B, but §4 X1 argues it
+/// stays sync); 26 `debt` = 91 B − 16 (#726) − 8 (#752) − 40 (#762) − 1
+/// (`resize_pty`), owned by #746 (25) and #749 (1).
 ///
 /// CITE CONVENTION. A `reason` that points at code names the **symbol** and
 /// carries the line only as a parenthetical hint (`… in `PtyManager::kill`
@@ -128,8 +125,9 @@ const DEBT_OWNERS: &[(&str, &str)] = &[
 /// across and nothing marks it stale. That is not hypothetical here: #752
 /// inserted ~101 lines into `orchestration/mod.rs` and invalidated a cite in
 /// this file, caught only in review. The symbol survives the move; the number
-/// is a convenience that is allowed to be approximate. #762's slices will keep
-/// moving `mod.rs` under this manifest, so this is the shape that holds.
+/// is a convenience that is allowed to be approximate — which #762 then proved
+/// by moving several hundred lines of `mod.rs` under this manifest across three
+/// slices without invalidating a single surviving cite.
 const SYNC_COMMANDS: &[Row] = &[
     // ---------------------------------------------------------------------
     // exception — deliberate, argued in code and in performance.md §4.
@@ -548,92 +546,6 @@ const SYNC_COMMANDS: &[Row] = &[
                  ones, and it runs at app boot and on every sidebar open. Unbounded fan-out on \
                  the webview thread; a thread hop alone would not fix it.",
         issue: Some("#749"),
-    },
-    // ---------------------------------------------------------------------
-    // debt — #762 (F2 of #743): the orchestration mutation and lifecycle
-    // commands. Every one of these pays at least one audit() file append under
-    // the global AUDIT_LOCK on the webview thread; the reason names what it
-    // adds on top. Filed as its own issue because nothing else owned them:
-    // #746 is the non-orchestration gesture set, #747/#748 are lock
-    // architecture, #749 is one command's fan-out, and #752 took the polled set.
-    // ---------------------------------------------------------------------
-    Row {
-        name: "create_orchestration",
-        class: Class::Debt,
-        reason: "Holds the global creation mutex across group.json plus the MCP config writes plus \
-                 a session-state scan, on the webview thread. The longest single-gesture stall in \
-                 the orchestration surface, and the lock makes two launches serialise behind it.",
-        issue: Some("#762"),
-    },
-    Row {
-        name: "orch_workflow_preview",
-        class: Class::Debt,
-        reason: "Reads and parses .loomux/workflow.yml from disk on the webview thread so the \
-                 launcher can preview the block list. Bounded by the file, unbounded by nothing \
-                 else, and it runs on every preview gesture.",
-        issue: Some("#762"),
-    },
-    Row {
-        name: "orch_set_advanced_orchestrator",
-        class: Class::Debt,
-        reason: "Reads the workflow file, persists the toggle, and then returns workflow_status — \
-                 which used to drag the default-branch git spawns onto this gesture as well. #752 \
-                 removed the spawns by sharing workflow_status' memo; the file IO and the sync \
-                 dispatch stay here.",
-        issue: Some("#762"),
-    },
-    Row {
-        name: "orch_channel_connect",
-        class: Class::Debt,
-        reason: "In-memory channel mutation under locks, then audit appends for each member group \
-                 and two deliveries, on the webview thread. The audits scale with the number of \
-                 groups in the channel.",
-        issue: Some("#762"),
-    },
-    Row {
-        name: "orch_channel_disconnect",
-        class: Class::Debt,
-        reason: "The teardown half of orch_channel_connect: same in-memory mutation followed by \
-                 per-group audit appends and deliveries on the webview thread.",
-        issue: Some("#762"),
-    },
-    Row {
-        name: "orch_channel_set_sender",
-        class: Class::Debt,
-        reason: "Appends an audit entry per member group and delivers the direction change, on the \
-                 webview thread — the same per-member fan-out as connect, for a smaller edit.",
-        issue: Some("#762"),
-    },
-    Row {
-        name: "orch_solo_prepare",
-        class: Class::Debt,
-        reason: "Writes the MCP config for a solo pane and appends an audit entry, on the webview \
-                 thread, before the pane's CLI is launched. Launch-path latency the user reads as \
-                 a slow pane open.",
-        issue: Some("#762"),
-    },
-    Row {
-        name: "orch_solo_adopt",
-        class: Class::Debt,
-        reason: "Inserts the adoption records and appends an audit entry on the webview thread, on \
-                 a pane's first Connect gesture.",
-        issue: Some("#762"),
-    },
-    Row {
-        name: "orch_end_group",
-        class: Class::Debt,
-        reason: "Runs N SEQUENTIAL blocking git worktree remove spawns, then recursive directory \
-                 deletes, then audits — all on the webview thread. One-shot and human-confirmed, \
-                 but it is the largest process-spawn count of any command in this manifest.",
-        issue: Some("#762"),
-    },
-    Row {
-        name: "resume_orch_session",
-        class: Class::Debt,
-        reason: "The session-restore path: reads the persisted group state back from disk on the \
-                 webview thread, the same shape as create_orchestration and on the same \
-                 app-restore gesture.",
-        issue: Some("#762"),
     },
 ];
 

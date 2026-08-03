@@ -4347,7 +4347,7 @@ fn the_preview_reports_the_roster_the_launch_would_actually_run() {
     let repo = Repo::new()
         .workflow(FOCUSED_REVIEW)
         .agent_file("worker.md", "---\ndescription: repo worker\n---\nBranch first.");
-    let p = loomux_lib::orchestration::orch_workflow_preview(repo.path(), "claude".into());
+    let p = loomux_lib::orchestration::orch_workflow_preview_sync(repo.path(), "claude".into());
 
     assert_eq!(p["present"], true);
     assert_eq!(p["valid"], true);
@@ -4392,7 +4392,7 @@ fn the_preview_surfaces_role_hint_for_the_launcher_chip() {
     let repo = Repo::new().workflow(
         "version: 1\nblocks:\n  - id: advisor\n    kind: planner\n    role_hint: advisor\n",
     );
-    let p = loomux_lib::orchestration::orch_workflow_preview(repo.path(), "claude".into());
+    let p = loomux_lib::orchestration::orch_workflow_preview_sync(repo.path(), "claude".into());
     let blocks = p["blocks"].as_array().unwrap();
     let advisor = blocks.iter().find(|b| b["id"] == "advisor").unwrap();
     assert_eq!(advisor["role_hint"], "advisor");
@@ -4422,7 +4422,7 @@ blocks:
     cli: claude
 ",
     );
-    let p = loomux_lib::orchestration::orch_workflow_preview(repo.path(), "claude".into());
+    let p = loomux_lib::orchestration::orch_workflow_preview_sync(repo.path(), "claude".into());
     assert_eq!(p["valid"], true, "the file must parse: {:?}", p["errors"]);
     let blocks = p["blocks"].as_array().unwrap();
     let deep = blocks.iter().find(|b| b["id"] == "deep").unwrap();
@@ -4442,7 +4442,7 @@ fn the_preview_shows_every_finding_and_absence_is_not_invalidity() {
     // once rather than one per edit-and-rerun cycle.
     let broken =
         "version: 1\nblocks:\n  - id: w\n    kind: not-a-kind\n  - id: r\n    kind: reviewer\n    cli: emacs\n";
-    let p = loomux_lib::orchestration::orch_workflow_preview(
+    let p = loomux_lib::orchestration::orch_workflow_preview_sync(
         Repo::new().workflow(broken).path(),
         "claude".into(),
     );
@@ -4458,7 +4458,7 @@ fn the_preview_shows_every_finding_and_absence_is_not_invalidity() {
     );
 
     // No file is not a problem — it is how you launch before you write one.
-    let none = loomux_lib::orchestration::orch_workflow_preview(Repo::new().path(), "claude".into());
+    let none = loomux_lib::orchestration::orch_workflow_preview_sync(Repo::new().path(), "claude".into());
     assert_eq!(none["present"], false);
     assert_eq!(none["valid"], true, "absence is not invalidity");
     assert!(none["errors"].as_array().unwrap().is_empty());
@@ -4682,7 +4682,7 @@ fn the_preview_never_reports_a_persona_the_spawn_would_deny() {
 
     // ...and the preview says the same, through that same predicate rather than a
     // second copy of the rule.
-    let p = loomux_lib::orchestration::orch_workflow_preview(repo.path(), "claude".into());
+    let p = loomux_lib::orchestration::orch_workflow_preview_sync(repo.path(), "claude".into());
     let orch = p["blocks"]
         .as_array()
         .unwrap()
