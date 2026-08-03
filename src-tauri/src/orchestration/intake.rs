@@ -49,9 +49,31 @@ pub const MAX_SIGNALS_IN_SUMMARY: usize = 8;
 /// stated caveat to the wake summary.
 pub const MAX_INTAKE_ISSUES: usize = 300;
 
-/// How many open PRs one intake poll asks `gh` for — the bound the tests
-/// added alongside it reason about. **Not yet requested on the command line**
-/// (see [`pr_list_argv`]), which is the defect the next commit fixes.
+/// How many open PRs one intake poll asks `gh` for.
+///
+/// `gh pr list` has [`MAX_INTAKE_ISSUES`]' defect with a different default:
+/// **30, newest first**, so without an explicit `--limit` the repo-wide
+/// check-state sweep silently sees only the 30 newest open PRs. That is worse
+/// here than plain truncation, because [`pr_check_deltas`] prunes on absence:
+/// a PR evicted from the window is *forgotten*, and when it re-enters, the
+/// terminal check state already reported for it reads as a fresh transition —
+/// a "checks SUCCESS" wake for a PR that has been green for days.
+///
+/// **200, not [`MAX_INTAKE_ISSUES`]' 300** — the bound is sized to what it
+/// bounds, not copied. Open issues are a *backlog*: they accumulate for as
+/// long as nobody closes them (94 on this repo against 9 open PRs, measured
+/// the same day). Open PRs are *in-flight work*, structurally capped by how
+/// much a repo can review at once, so 200 is already ~20× this repo's count
+/// with room for a far busier one. It is also the heavier of the two calls
+/// per item — `statusCheckRollup` is a nested check-run array per PR, where
+/// the issue listing carries a flat label list — so 200 is two of `gh`'s
+/// internal 100-item pages, holding the #656 posture (a bounded amount of
+/// `gh` work per tick) at one call per group per interval exactly as before.
+///
+/// Exceeding it is never silent, on the same rule [`MAX_INTAKE_ISSUES`]
+/// states: [`OpenPrList::from_fetch`] marks such a fetch incomplete, which
+/// suppresses the absence-means-merged inference in [`pr_check_deltas`] and
+/// adds a stated caveat to the wake summary.
 pub const MAX_INTAKE_PRS: usize = 200;
 
 // ---------------------------------------------------------------------------
@@ -204,15 +226,19 @@ pub struct RawPr {
     pub state: PrCheckState,
 }
 
-/// The exact `gh pr list` argv `poll_intake` runs, lifted out of the call
-/// site so the fetch bound becomes pinnable at all.
+/// The exact `gh pr list` argv `poll_intake` runs, built here rather than
+/// inline at the call site **so that the fetch bound is pinnable** — the same
+/// reasoning [`issue_list_argv`] states, for the same reason: inline,
+/// `--limit` is one deletable word whose removal restores the 30-newest
+/// truncation with every behavioural test still green, because every one of
+/// them hands [`pr_check_deltas`] a list directly.
+/// `the_pr_list_argv_always_carries_the_fetch_bound` fails the moment the
+/// flag or its value goes missing.
 ///
-/// **Deliberately still the unbounded argv this branch inherited** — no
-/// `--limit`, so `gh` returns its own 30 newest. Moving it here first is what
-/// lets `the_pr_list_argv_always_carries_the_fetch_bound` observe the defect
-/// rather than assert against a value it also supplies.
+/// Returns owned strings because the limit is formatted from
+/// [`MAX_INTAKE_PRS`]; the caller borrows them for `gh_capture`.
 pub fn pr_list_argv() -> Vec<String> {
-    ["pr", "list", "--state", "open", "--json", "number,title,statusCheckRollup"]
+    ["pr", "list", "--state", "open", "--limit", &MAX_INTAKE_PRS.to_string(), "--json", "number,title,statusCheckRollup"]
         .into_iter()
         .map(String::from)
         .collect()
@@ -256,9 +282,14 @@ pub struct PrCheckSignal {
 /// **complete** — every open PR there is, rather than the newest
 /// [`MAX_INTAKE_PRS`] of them.
 ///
-/// The carrier exists so the tests below can express the distinction. The
-/// **inference is deliberately still the pre-fix one**: `from_fetch` calls
-/// every response complete, exactly as `pr_check_deltas` has always assumed.
+/// The same distinction [`OpenIssueList`] carries, and it exists here for the
+/// same reason: [`pr_check_deltas`] reads *absent from the response* as
+/// *merged or closed*, which makes completeness load-bearing. On a truncated
+/// fetch the window is **membership churn**, not merely truncation — opening
+/// one PR evicts the oldest in the window, and merging something above it lets
+/// that PR back in, where its already-reported terminal state would be
+/// announced again as a fresh transition. Pagination masquerading as CI
+/// finishing.
 #[derive(Debug, Clone, Copy)]
 pub struct OpenPrList<'a> {
     pub prs: &'a [RawPr],
@@ -266,13 +297,17 @@ pub struct OpenPrList<'a> {
 }
 
 impl<'a> OpenPrList<'a> {
-    /// Wrap a fetch of open PRs.
+    /// Wrap a fetch that asked `gh` for at most [`MAX_INTAKE_PRS`] PRs.
     ///
-    /// Still answers `complete: true` unconditionally — the assumption the
-    /// unbounded listing has always silently made, kept here so the next
-    /// commit's change is the behavioural one.
+    /// Fewer came back than were asked for ⇒ that is every open PR there is.
+    /// Exactly the bound came back ⇒ **assume there are more**: `gh` reports
+    /// no total, so "exactly 200 open PRs" and "the first 200 of many" are
+    /// indistinguishable from the response alone. Erring toward incomplete
+    /// costs a stated caveat and some retained state; erring the other way
+    /// costs the false re-announcement this type exists to prevent — the
+    /// identical trade [`OpenIssueList::from_fetch`] makes.
     pub fn from_fetch(prs: &'a [RawPr]) -> Self {
-        Self { prs, complete: true }
+        Self { prs, complete: prs.len() < MAX_INTAKE_PRS }
     }
 }
 
@@ -282,12 +317,27 @@ impl<'a> OpenPrList<'a> {
 /// (an in-progress PR is not news) and never for a repeat of the same
 /// terminal state (a PR sitting at SUCCESS across two polls doesn't refire).
 ///
-/// `last_seen` is updated for every PR present (terminal or not) and
-/// **pruned of any number absent from the response, unconditionally** — the
-/// pre-fix inference this branch is here to replace: it cannot tell "merged"
-/// from "fell past the fetch bound", so on a truncated listing a PR evicted
-/// by newer ones is forgotten and re-announced when the window churns back
-/// over it.
+/// `last_seen` is updated for every PR present (terminal or not). An entry is
+/// **only ever dropped on evidence, never on absence alone**, which is why
+/// this takes an [`OpenPrList`] rather than a slice:
+/// - absent from a **complete** response → **forget it**. It genuinely merged
+///   or closed, and forgetting is what makes a REOPENED PR with the same
+///   number start fresh instead of reading its old terminal state as
+///   "unchanged".
+/// - absent from a **truncated** response → **keep it**. It may simply have
+///   fallen past [`MAX_INTAKE_PRS`], and forgetting it would re-announce its
+///   long-settled check state the moment the window churned back over it.
+///
+/// Two costs of that choice, both deliberate. **A PR that merges while beyond
+/// the bound keeps its entry** until some later poll returns a complete list,
+/// so if that number is ever reopened its old terminal state reads as
+/// unchanged and produces no wake — the PR-side twin of the property
+/// [`eligible_deltas`] gives up for an issue closed outside the window, and
+/// the same trade: a missed wake for a rare reopen beats a spurious one on
+/// every churn. **The retained map grows** while listings stay truncated, at
+/// one small entry per PR number ever seen open — bytes, and a single
+/// complete listing prunes all of it at once, so it wants no mechanism of its
+/// own.
 pub fn pr_check_deltas(last_seen: &mut HashMap<u64, PrCheckState>, current: OpenPrList) -> Vec<PrCheckSignal> {
     let mut signals = Vec::new();
     let mut still_open: HashSet<u64> = HashSet::new();
@@ -299,7 +349,9 @@ pub fn pr_check_deltas(last_seen: &mut HashMap<u64, PrCheckState>, current: Open
         }
         last_seen.insert(pr.number, pr.state);
     }
-    last_seen.retain(|n, _| still_open.contains(n));
+    if current.complete {
+        last_seen.retain(|n, _| still_open.contains(n));
+    }
     signals
 }
 
@@ -581,8 +633,14 @@ pub fn intake_wake_summary(
              treating the backlog as complete)"
         ));
     }
-    // The PR half of this caveat is what the next commit adds; today a short
-    // PR fetch is reported as nothing at all.
+    if truncated.prs && !summary.is_empty() {
+        summary.push_str(&format!(
+            "; (PARTIAL: the open-PR fetch stopped at its {MAX_INTAKE_PRS}-PR bound, so this poll's \
+             check sweep saw only the {MAX_INTAKE_PRS} newest open PRs — a PR outside that window \
+             finishing CI produces no wake, so check such a PR yourself rather than reading silence \
+             as still-running)"
+        ));
+    }
     summary
 }
 
