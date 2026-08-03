@@ -343,6 +343,7 @@ pub fn new_folder(root: &str, rel: &str, name: &str) -> Result<String, String> {
     let name = validate_name(name)?;
     let child = join_rel(rel, &name);
     let path = resolve(root, &child)?;
+    let _gate = crate::obs::LockExt::lock_safe(&MUTATION_GATE);
     if path.exists() {
         return Err(err("exists", format!("'{name}' already exists")));
     }
@@ -369,6 +370,7 @@ pub fn new_file(root: &str, rel: &str, name: &str) -> Result<String, String> {
     let name = validate_name(name)?;
     let child = join_rel(rel, &name);
     let path = resolve(root, &child)?;
+    let _gate = crate::obs::LockExt::lock_safe(&MUTATION_GATE);
     if path.exists() {
         return Err(err("exists", format!("'{name}' already exists")));
     }
@@ -395,6 +397,7 @@ pub fn rename(root: &str, rel: &str, name: &str) -> Result<String, String> {
     let name = validate_name(name)?;
     // Same guard as delete: renaming the pane's own root is not a thing.
     let from = resolve_child(root, rel)?;
+    let _gate = crate::obs::LockExt::lock_safe(&MUTATION_GATE);
     // The check-then-act below is the reason [`MUTATION_GATE`] exists.
     if !from.exists() {
         return Err(err("not-found", format!("'{rel}' no longer exists")));
