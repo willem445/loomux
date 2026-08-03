@@ -420,7 +420,8 @@ target) but no token:
 | CLI | membership | how |
 |---|---|---|
 | claude, copilot | full (token, `channel_send`) | `orch_solo_prepare` injects MCP flags at spawn |
-| codex, gemini, opencode, hermes, ante | delivery-only | no spawn-flag seam today — tracked in [#288](https://github.com/willem445/loomux/issues/288). Ante's MCP config is file-based only (`~/.ante/settings.json`, no CLI flag) — see #292. Ante also runs on macOS/Linux hosts only (no Windows binary upstream). |
+| gemini, opencode | delivery-only **as a decision, not a gap** | both are full MCP members as *group* agents — their config is a generated document delivered by an environment variable (`GEMINI_CLI_SYSTEM_SETTINGS_PATH`, `OPENCODE_CONFIG_CONTENT`). A solo launch only appends a flag string to a command line the human owns, so it cannot set environment, and neither CLI has an MCP flag to append. Closing this needs a different mechanism than #288 imagined, not a per-CLI config format. See `doc/design/opencode.md`. |
+| codex, hermes, ante | delivery-only | no spawn-flag seam today — tracked in [#288](https://github.com/willem445/loomux/issues/288). Ante's MCP config is file-based only (`~/.ante/settings.json`, no CLI flag) — see #292. Ante also runs on macOS/Linux hosts only (no Windows binary upstream). |
 | custom launcher command | delivery-only, permanently | no CLI identity to target a config format at |
 | any pane adopted via Connect (`orch_solo_adopt`) | delivery-only | never gets a token, regardless of its actual CLI |
 

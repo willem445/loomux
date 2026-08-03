@@ -3242,7 +3242,7 @@ impl NameSource {
 /// `join(", ")` in error messages). The *reasons* a CLI is or isn't in it —
 /// and what it can do once it is — live in [`CLI_CAPS`], pinned against this
 /// list by `supported_clis_match_the_capability_table`.
-pub const SUPPORTED_CLIS: [&str; 3] = ["claude", "copilot", "gemini"];
+pub const SUPPORTED_CLIS: [&str; 4] = ["claude", "copilot", "gemini", "opencode"];
 
 /// What loomux can actually make one agent CLI do — **the per-CLI capability
 /// record** (#267 stage 2).
@@ -3406,6 +3406,17 @@ pub fn clamped_knob(allowed: &[&str], v: &str) -> String {
 ///   loomux already generates gemini's settings file, so the seam exists, but
 ///   the schema needs a live verification loomux's own agents may not perform
 ///   (CLAUDE.md constraint 3), so it stays unwired and the row says so.
+/// - **opencode** — its knobs are read from the CLI's own source at the
+///   version pin recorded in `doc/design/opencode.md`, because the published
+///   docs describe reasoning effort only as per-model provider config. There
+///   IS a session-scoped variant flag, but only on `opencode run`
+///   (`--variant`, "model variant (provider-specific reasoning effort, e.g.,
+///   high, max, minimal)"), and loomux spawns the TUI, whose option table has
+///   no `variant`. The reachable seam on the TUI path is per-agent
+///   `agent.<name>.variant` in the config document loomux already generates —
+///   real, but its per-model vocabulary is provider-specific and unverified
+///   against a live run, so the row stays empty and says exactly that rather
+///   than claiming a level loomux might not be able to deliver.
 pub const CLI_CAPS: &[CliCaps] = &[
     CliCaps {
         cli: "claude",
@@ -3439,6 +3450,22 @@ pub const CLI_CAPS: &[CliCaps] = &[
         effort_note: "gemini's thinking level is a settings-file key (modelConfigs.aliases.<alias>.thinkingConfig) — the generated-settings seam exists, but the schema is unverified against a live run, so loomux does not write it yet",
         context_variants: &[],
         context_note: "gemini's context window is model-determined; its compression knobs (model.compressionThreshold) are compaction, not window size",
+    },
+    CliCaps {
+        cli: "opencode",
+        orchestration: true,
+        // Its MCP server is a config-document key with no CLI-flag equivalent,
+        // and the document is delivered by an environment variable a *group*
+        // spawn can set on the pane while a solo launch — which only appends a
+        // flag string to a command line the human owns — cannot. Same shape as
+        // gemini, so solo opencode panes stay delivery-only (#288).
+        mcp_argv_seam: false,
+        max_containment: Containment::ReadOnly,
+        containment_note: "permission rules deny by key: `edit` is the key every file-modifying tool asks under, `bash` narrows by command pattern, and a deny is refused before any prompt — so deny outranks --auto",
+        effort_levels: &[],
+        effort_note: "opencode's reasoning effort is a model VARIANT: a session flag on `opencode run` (--variant) but absent from the TUI loomux spawns, and settable per-agent in loomux's generated config (agent.<name>.variant, observed values minimal|high|max) — the seam exists, but the per-model vocabulary is provider-specific and unverified against a live run, so loomux does not write it yet",
+        context_variants: &[],
+        context_note: "opencode's context window is model-determined; no session-scoped variant switch is documented or present in the TUI's options",
     },
     CliCaps {
         cli: "codex",
@@ -3956,6 +3983,18 @@ pub(crate) fn default_model(cli: &str, role: Role) -> &'static str {
     if cli == "gemini" {
         return "pro";
     }
+    // OpenCode: EMPTY, deliberately — read by every emit path as "say nothing",
+    // so the pane inherits whatever model the human configured (their
+    // `opencode.json`, their `/models` pick). Unlike claude's strong/mid pair
+    // or gemini's single `pro`, opencode has no vendor-neutral alias at all:
+    // its ids are `provider_id/model_id` against a catalog of dozens of
+    // providers, so any default loomux picked would be a hardcoded model table
+    // — the thing #329 says ages badly — and would also silently override a
+    // human who had already chosen. A block that wants a specific model pins
+    // its own `model:`, and the launcher offers a curated list.
+    if cli == "opencode" {
+        return "";
+    }
     match role {
         Role::Orchestrator | Role::Planner => "opus",
         Role::Worker | Role::Reviewer => "sonnet",
@@ -4410,6 +4449,26 @@ pub fn cli_extra_env(cli: &str, cfg: &Path) -> Vec<(String, String)> {
     }
 }
 
+/// What [`OrchRegistry::write_mcp_config`] produced for one agent: the file it
+/// wrote, and the pane environment that CLI needs in order to read it.
+///
+/// The two travel together because for two of the four adapters they are one
+/// artifact. Claude and Copilot name the file on argv and need no env at all;
+/// gemini's file is named by an environment variable; and opencode's document
+/// does not reach the CLI as a file at all — the file is the audit copy and the
+/// env carries the bytes (see [`OPENCODE_CONFIG_CONTENT_ENV`]). Returning the
+/// path alone would leave every caller to re-derive the env from the CLI name,
+/// which is the "re-derived at a call site that then silently disagrees"
+/// failure [`CliCaps`]' own doc argues against.
+pub struct AgentCliConfig {
+    /// The generated file. Named on argv by the CLIs that can (`--mcp-config`,
+    /// `--additional-mcp-config`); an audit artifact for the ones that can't.
+    pub path: PathBuf,
+    /// Extra pane environment, on top of [`OrchRegistry::agent_pane_env`]'s
+    /// shims. Empty for an argv-seam CLI.
+    pub env: Vec<(String, String)>,
+}
+
 /// The per-agent gemini settings file: the loomux MCP server, plus (for a
 /// contained class) the `tools.exclude` layer of its deny rules and a pointer
 /// at the admin-tier policy file that carries the other layer.
@@ -4492,6 +4551,349 @@ pub fn gemini_policy_toml(containment: Containment) -> String {
         }
     }
     out
+}
+
+// ── OpenCode (#722) ────────────────────────────────────────────────────────
+//
+// Every claim below is verified against the CLI's own source at the version
+// pin recorded in `doc/design/opencode.md` (its published docs do not cover
+// the load-bearing parts), and that document carries the citations and the
+// full containment argument. Kept here in the same shape as the gemini block
+// above: literals in constants, the generated documents in pure functions, so
+// what a contained pane is actually handed can be asserted without a spawn.
+
+/// The permission KEY every file-modifying tool asks under — one key, not a
+/// list of tool names, because opencode's permission engine is keyed on the
+/// *permission* a tool requests rather than the tool's own name. `edit`,
+/// `write` and `apply_patch` all request `"edit"`, and the CLI's own read-only
+/// `plan` agent is built from exactly this one denial ("Plan mode. Disallows
+/// all edit tools.").
+///
+/// The opencode sibling of [`CLAUDE_EDIT_DENY_TOOLS`] /
+/// [`COPILOT_EDIT_DENY_TOOLS`] / [`GEMINI_EDIT_DENY_TOOLS`], and singular for
+/// a real reason rather than an oversight: a list would invite exactly the
+/// #448 failure those constants' docs describe — a name that matches nothing
+/// reading like containment — and here there is no per-tool name to get wrong.
+/// It is also why this tier is genuinely stronger than a name list: a
+/// file-modifying tool opencode ships *tomorrow* asks the same key, so it is
+/// denied with no loomux change (the fail-open direction #465 could only close
+/// for claude, closed here by construction).
+pub const OPENCODE_EDIT_DENY_PERMISSION: &str = "edit";
+
+/// The git-mutation command patterns a [`Containment::ReadOnly`] opencode
+/// agent denies under the `bash` permission — a planner only, for the reason
+/// [`CLAUDE_READONLY_DENY_GIT`] gives.
+///
+/// No space before the `*`: opencode's matcher treats `*` as zero-or-more
+/// characters against the whole command string, so `git commit*` covers a bare
+/// `git commit` as well as `git commit -m …`, where `git commit *` would miss
+/// the bare form.
+pub const OPENCODE_READONLY_DENY_GIT: &[&str] = &["git commit*", "git push*"];
+
+/// The `bash` patterns an ATTENDED opencode pane pre-approves, so the
+/// branch→commit→PR flow and `gh` don't stop a human at every step while
+/// everything else still asks. Kept as an atom because both the emitted
+/// posture and its test read it.
+///
+/// The direction here is the opposite of every other CLI's: opencode's own
+/// default is `"*": "allow"` — *more* permissive than any loomux attended
+/// pane — so the generated posture NARROWS it rather than widening a
+/// restrictive default.
+pub const OPENCODE_ATTENDED_BASH_ALLOW: &[&str] = &["git *", "gh *"];
+
+/// opencode's unattended posture, as one atom shared by the group spawn path
+/// and [`single_pane_autopilot_flags`], so the two can't drift (#101).
+///
+/// `--auto` is the documented spelling: "auto-approve permissions that are not
+/// explicitly denied". Its `--yolo` and `--dangerously-skip-permissions`
+/// aliases are marked hidden in the CLI's own option table and are deliberately
+/// not used. It is not a policy setting — it replies "allow once" to a
+/// permission that was already going to be *asked*, and a `deny` rule never
+/// raises an ask at all, which is exactly why a contained pane stays contained
+/// under it.
+pub const OPENCODE_UNATTENDED_FLAGS: &str = "--auto";
+
+/// The inline config document (JSON) loomux hands an opencode pane.
+///
+/// **Why an env var and not a file path.** opencode merges its config sources
+/// in a documented order, later winning per leaf key, and `OPENCODE_CONFIG`
+/// (the custom-file variable) loads *before* the project's own
+/// `opencode.json` and its `.opencode/` directories — so a repo could re-allow
+/// what loomux denies. `OPENCODE_CONFIG_CONTENT` loads *after* all of them.
+pub const OPENCODE_CONFIG_CONTENT_ENV: &str = "OPENCODE_CONFIG_CONTENT";
+
+/// The permission-only override, applied LAST — after the org, managed-config
+/// and MDM ranks that land *after* the inline document above.
+///
+/// Set alongside [`OPENCODE_CONFIG_CONTENT_ENV`], never instead of it, and
+/// that pairing is the containment guarantee rather than belt-and-braces for
+/// its own sake. It closes two holes the config document alone cannot: an
+/// account/managed/MDM config outranking the inline one, and — the sharper
+/// case — an `--agent` that fails to resolve, which does **not** error but
+/// prints a warning and falls back to `build`, the most permissive agent
+/// there is. A reviewer degrading into a full-write agent over a typo, with
+/// only a scrollback line to show for it, is precisely the silent failure
+/// #462's guarantee cannot survive; this variable applies globally, so it
+/// survives that fallback.
+pub const OPENCODE_PERMISSION_ENV: &str = "OPENCODE_PERMISSION";
+
+/// Suppress the CLI's boot-time self-update. The copilot `--no-auto-update`
+/// hazard exactly: a mid-boot update restarts the CLI and flushes anything
+/// typed into the first instance, i.e. the kickoff.
+///
+/// The env var, not the config document's `autoupdate` key — an environment
+/// variable cannot be overridden by a config rank loomux does not control.
+pub const OPENCODE_DISABLE_AUTOUPDATE_ENV: &str = "OPENCODE_DISABLE_AUTOUPDATE";
+
+/// Skip the repo's own `opencode.json` and `.opencode/` directories entirely
+/// — set for a CONTAINED pane only ([`Containment::denies_edits`]).
+///
+/// For a worker the repo's config is legitimate material (its commands, its
+/// own MCP servers) and loomux's document already wins the merge, so it stays
+/// loaded. For a reviewer or a planner the calculus flips: "loomux's rules win
+/// the merge" is a claim about merge order, while "the repo's rules never load"
+/// is a claim about nothing at all — and a contained pane is the one place
+/// worth paying a repo's custom commands for the simpler story.
+pub const OPENCODE_DISABLE_PROJECT_CONFIG_ENV: &str = "OPENCODE_DISABLE_PROJECT_CONFIG";
+
+/// Point this pane's session/message store at a database under the group's own
+/// state dir instead of the shared per-user one.
+///
+/// Absolute paths are honored as-is (a relative value would resolve under the
+/// CLI's own data root). Two reasons, both structural: the human's own
+/// opencode sessions stay out of a group's store — and a group's store stays
+/// out of theirs — and "the newest session in this database" becomes an
+/// unambiguous question, which is what session identification needs on a CLI
+/// that cannot be handed a session id up front. The reader itself is a later
+/// slice; this is the seam it lands on.
+pub const OPENCODE_DB_ENV: &str = "OPENCODE_DB";
+
+/// Where [`OPENCODE_DB_ENV`] points, relative to a group's state dir. A
+/// directory of its own because SQLite writes `-wal`/`-shm` siblings.
+const OPENCODE_DB_SUBDIR: &str = "opencode";
+const OPENCODE_DB_FILE: &str = "opencode.db";
+
+/// Timeout (ms) on the loomux MCP entry, raised from the documented 5000ms
+/// default: loomux's own tools do real work behind a call (`report` writes
+/// state and audits, `notify_when` registers a watch), and a tool call timing
+/// out reads to an agent as the tool being broken.
+const OPENCODE_MCP_TIMEOUT_MS: u64 = 30_000;
+
+/// A path as opencode's config document must spell it: forward slashes.
+///
+/// `{file:…}` references are substituted **textually, on the raw string,
+/// before the document is parsed** — so a Windows path's backslashes are not
+/// JSON-unescaped on the way through, and a JSON-escaped `C:\\Users\\…` would
+/// reach the filesystem with its separators doubled. Windows accepts forward
+/// slashes everywhere loomux needs them, so this side-steps the question
+/// entirely rather than betting on doubled separators resolving.
+fn opencode_path(p: &Path) -> String {
+    p.display().to_string().replace('\\', "/")
+}
+
+/// The **global** permission posture for one opencode pane — the object that
+/// rides both the config document and [`OPENCODE_PERMISSION_ENV`].
+///
+/// Two rules govern its shape, and both come from how the engine evaluates:
+///
+/// - **Last matching rule wins**, matching by wildcard on the permission key
+///   as well as the pattern. So this never emits a `"*"` KEY: a `"*"` key
+///   matches every permission, and — since rules are emitted in key order —
+///   one sitting after the specific denials would silently re-allow them.
+///   Narrow keys only, and the denials are ordered after the allows within
+///   their own key (`"*"` sorts before `"git *"` sorts before `"git commit*"`).
+/// - **A `deny` short-circuits before any prompt**, so no ask is ever raised
+///   for it and `--auto` — which only answers asks — cannot reach it.
+///
+/// The `edit: "deny"` scalar is the strong form on purpose: it becomes a rule
+/// with the `*` pattern, and the CLI drops a tool from the model's toolset
+/// entirely when the last matching rule for its permission is a `*`-pattern
+/// deny. So a contained pane does not merely fail to edit; it is never offered
+/// the tool.
+#[doc(hidden)] // pub for integration tests
+pub fn opencode_permission_json(containment: Containment, unattended: bool) -> Value {
+    let mut bash = serde_json::Map::new();
+    if unattended {
+        bash.insert("*".into(), json!("allow"));
+    } else {
+        // Attended: narrow opencode's allow-everything default back to "ask",
+        // then pre-approve the flows a human would otherwise be interrupted
+        // for on every step.
+        bash.insert("*".into(), json!("ask"));
+        for pat in OPENCODE_ATTENDED_BASH_ALLOW {
+            bash.insert((*pat).to_string(), json!("allow"));
+        }
+    }
+    if containment.denies_git_mutation() {
+        for pat in OPENCODE_READONLY_DENY_GIT {
+            bash.insert((*pat).to_string(), json!("deny"));
+        }
+    }
+    let mut perm = serde_json::Map::new();
+    perm.insert("bash".into(), Value::Object(bash));
+    perm.insert(
+        OPENCODE_EDIT_DENY_PERMISSION.to_string(),
+        if containment.denies_edits() { json!("deny") } else if unattended { json!("allow") } else { json!("ask") },
+    );
+    // The group's state dir — where every agent's role-instruction file lives
+    // — is outside the pane's worktree, and this key defaults to `ask`, so
+    // without it an unattended pane would stall on its own instructions.
+    //
+    // **The blanket form, not `{"*": "ask", "<group dir>/*": "allow"}`, and
+    // the narrow one would be a REGRESSION rather than a tightening.** Rules
+    // are concatenated defaults-then-user and the last match wins, so a user
+    // `"*": "ask"` lands AFTER opencode's own default whitelist for this key
+    // (its temp dir, its skill dirs, its reference dirs) and demotes every one
+    // of them to `ask` — turning the CLI's own internal machinery into
+    // prompts. Re-listing those dirs here would mean hardcoding another
+    // vendor's internal paths, which ages exactly as badly as a model table
+    // (#329). What the breadth actually costs is one prompt on an ATTENDED
+    // pane before the agent reads outside its worktree; `read` is not a tier
+    // loomux contains at on any CLI (see [`Containment`]: these are denials of
+    // named tools, never a filesystem sandbox), so no guarantee rests on it.
+    perm.insert("external_directory".into(), json!("allow"));
+    // Restore the `question` tool for a pane that HAS a human in it, and only
+    // then. opencode's built-in defaults deny it and its default `build` agent
+    // re-allows it — a config-declared agent (which is what every loomux pane
+    // runs) inherits the defaults, so without this an attended worker's
+    // "should I do X?" would come back as a permission error instead of a
+    // question. The other direction is just as deliberate: an unattended pane
+    // has nobody to answer, and a question it cannot get an answer to is a
+    // stall, which is the deadlock `forces_unattended` exists to prevent.
+    perm.insert("question".into(), if unattended { json!("deny") } else { json!("allow") });
+    Value::Object(perm)
+}
+
+/// The **agent-level** denials for a contained class, or `None` for an
+/// uncontained one (there is nothing to deny).
+///
+/// A separate, strictly-later ruleset than the global posture above — the
+/// engine concatenates a config-declared agent's rules after the global ones
+/// — which is what makes containment independent of key order *between* the
+/// two objects. Same denials, said twice, for the same reason gemini's are
+/// (`GEMINI_EDIT_DENY_TOOLS`): each layer covers the other's failure mode.
+/// This one survives a global posture an outranking config rank overwrote;
+/// the global one ([`OPENCODE_PERMISSION_ENV`]) survives `--agent` failing to
+/// resolve this entry at all.
+fn opencode_agent_permission_json(containment: Containment) -> Option<Value> {
+    if !containment.denies_edits() {
+        return None;
+    }
+    let mut perm = serde_json::Map::new();
+    if containment.denies_git_mutation() {
+        // DENIALS ONLY — no `"*": "allow"` alongside them. The rest of the
+        // shell is already allowed by the global posture this ruleset is
+        // concatenated after, so restating it here would only risk stating it
+        // differently, and a rule that widens is not what an agent-level block
+        // is for.
+        let mut bash = serde_json::Map::new();
+        for pat in OPENCODE_READONLY_DENY_GIT {
+            bash.insert((*pat).to_string(), json!("deny"));
+        }
+        perm.insert("bash".into(), Value::Object(bash));
+    }
+    perm.insert(OPENCODE_EDIT_DENY_PERMISSION.to_string(), json!("deny"));
+    Some(Value::Object(perm))
+}
+
+/// The whole generated config document for one opencode pane: its loomux MCP
+/// server, its share posture, its permission posture, and — when the block's
+/// contract was written to a file — its persona as a native agent entry.
+///
+/// Pure and `pub` so the document can be asserted directly: this file *is* an
+/// opencode agent's MCP identity and half of its containment, so "does it say
+/// what we think it says" must be answerable without a spawn.
+///
+/// `agent` is `(handle, prompt_file)`. The handle is namespaced
+/// ([`generated_agent_handle`], `loomux-<group>-<block>`) because the merge
+/// that lets loomux's entry win a same-name collision with a repo's own
+/// `.opencode/agents/*.md` is a DEEP merge: a colliding file would keep every
+/// key loomux left unset. A handle a repo cannot guess makes the collision
+/// impossible rather than survivable — and every field loomux cares about is
+/// emitted explicitly regardless.
+#[doc(hidden)] // pub for integration tests
+pub fn opencode_config_json(
+    port: u16,
+    token: &str,
+    containment: Containment,
+    unattended: bool,
+    agent: Option<(&str, &Path)>,
+) -> String {
+    let mut cfg = json!({
+        // No CLI flag exists for MCP servers; this key is the only channel.
+        // `oauth: false` because OAuth auto-detection is on by default and the
+        // loomux server authenticates by header — a 401 during discovery must
+        // not send opencode down a flow this server does not speak.
+        "mcp": one_server_map(json!({
+            "type": "remote",
+            "url": format!("http://127.0.0.1:{port}/mcp"),
+            "enabled": true,
+            "headers": { "X-Loomux-Agent": token },
+            "oauth": false,
+            "timeout": OPENCODE_MCP_TIMEOUT_MS,
+        })),
+        // A group agent's session is never published to a share link.
+        "share": "disabled",
+        "permission": opencode_permission_json(containment, unattended),
+    });
+    if let Some((handle, prompt)) = agent {
+        let mut entry = json!({
+            // ALWAYS explicit: an entry that resolved to a subagent mode would
+            // be refused by `--agent` and fall back to `build` with only a
+            // warning line — the same silent widening
+            // `OPENCODE_PERMISSION_ENV` exists to survive.
+            "mode": "primary",
+            // The contract by FILE, never on argv: it is many KB, and Windows
+            // CreateProcessW's 32,767-character command-line limit is a real,
+            // demo-blocking bug once a role contract rides a flag (#417).
+            "prompt": format!("{{file:{}}}", opencode_path(prompt)),
+        });
+        if let Some(perm) = opencode_agent_permission_json(containment) {
+            entry["permission"] = perm;
+        }
+        let mut agents = serde_json::Map::new();
+        agents.insert(handle.to_string(), entry);
+        cfg["agent"] = Value::Object(agents);
+    }
+    serde_json::to_string_pretty(&cfg).unwrap()
+}
+
+/// The pane environment that delivers everything above — opencode names none
+/// of it on argv.
+///
+/// Pure, so the mapping is assertable without a spawn, and separate from
+/// [`OrchRegistry::agent_pane_env`] for the reason [`cli_extra_env`] is: that
+/// one returns nothing at all when the gh/git shims can't be written, and an
+/// opencode agent silently losing its MCP identity and its containment because
+/// git wasn't installed would be a confusing failure a long way from its cause.
+///
+/// **Caller contract:** `containment`/`unattended` must be the same pair that
+/// produced `config_json`. The posture is deliberately restated here rather
+/// than lifted out of the document (a parse that could fail would have to fail
+/// *open*, dropping the very override that exists to survive everything else),
+/// so the agreement is a call-site obligation — pinned end-to-end by
+/// `an_opencode_spawn_delivers_its_config_and_containment_by_env`, which
+/// asserts the document's `permission` and this override are one object.
+#[doc(hidden)] // pub for integration tests
+pub fn opencode_pane_env(
+    config_json: &str,
+    containment: Containment,
+    unattended: bool,
+    db: &Path,
+) -> Vec<(String, String)> {
+    let mut env = vec![
+        (OPENCODE_CONFIG_CONTENT_ENV.to_string(), config_json.to_string()),
+        (
+            OPENCODE_PERMISSION_ENV.to_string(),
+            opencode_permission_json(containment, unattended).to_string(),
+        ),
+        (OPENCODE_DISABLE_AUTOUPDATE_ENV.to_string(), "1".to_string()),
+        (OPENCODE_DB_ENV.to_string(), opencode_path(db)),
+    ];
+    if containment.denies_edits() {
+        env.push((OPENCODE_DISABLE_PROJECT_CONFIG_ENV.to_string(), "1".to_string()));
+    }
+    env
 }
 
 /// The generic Claude PreCompact / SessionStart(compact) hook body (#417),
@@ -4794,8 +5196,8 @@ pub fn claude_effective_permission_mode(unattended: bool, read_only: bool) -> &'
 /// path can't drift.
 ///
 /// Returns an empty string for CLIs with no known unattended flag surface
-/// (codex/opencode/custom): the toggle is a no-op there rather than
-/// inventing flags that may not exist.
+/// (codex/custom): the toggle is a no-op there rather than inventing flags
+/// that may not exist.
 ///
 /// Ante (#292) is launcher-only here, same Tier-A shape as Hermes (#284):
 /// this function and the `AGENTS` catalog entry (`src/agents.ts`) are the only
@@ -4803,7 +5205,7 @@ pub fn claude_effective_permission_mode(unattended: bool, read_only: bool) -> &'
 /// deliberately do NOT gain an ante arm — Ante's MCP servers are configured
 /// exclusively via `~/.ante/settings.json` (no `--mcp-config`-equivalent CLI
 /// flag exists per docs). Ante stays a delivery-only channel member, like
-/// codex/opencode. (PR #323 recorded that as "adding ante to `SUPPORTED_CLIS`
+/// codex. (PR #323 recorded that as "adding ante to `SUPPORTED_CLIS`
 /// would hit `solo_prepare`'s `unreachable!` arm"; #267 removed that trap by
 /// deriving the solo seam from [`CliCaps::mcp_argv_seam`] instead of
 /// `SUPPORTED_CLIS` — but the rest of the argument, that loomux has no ante
@@ -4850,6 +5252,14 @@ pub fn single_pane_autopilot_flags(program: &str) -> String {
         // the group spawn must mean the same thing on every CLI loomux can
         // spawn, and gemini is now one.
         "gemini" => GEMINI_UNATTENDED_FLAGS.to_string(),
+        // OpenCode (#722): the same atom the group path builds — see
+        // `OPENCODE_UNATTENDED_FLAGS` for why `--auto` and not one of its two
+        // hidden aliases. No startup consent dialog is documented or present
+        // for it (unlike copilot's `--autopilot`), so a solo pane needs no
+        // answering watcher. Wired here for the #101 invariant: the launcher
+        // toggle and the group spawn must mean the same thing on every CLI
+        // loomux can spawn, and opencode is now one.
+        "opencode" => OPENCODE_UNATTENDED_FLAGS.to_string(),
         _ => String::new(),
     }
 }
@@ -6994,10 +7404,21 @@ fn parse_dollar_amount(after_dollar: &str) -> Option<f64> {
 
 /// Models are interpolated into a shell command line; restrict them to
 /// identifier-ish characters so a crafted "model" can't smuggle arguments.
+///
+/// **`/` is admitted (#722), and that widening is deliberate.** OpenCode model
+/// ids are `provider_id/model_id` — `opencode/deepseek-v4-flash-free` — so the
+/// pre-#722 filter silently turned the only id its Zen provider answers to into
+/// `opencodedeepseek-v4-flash-free`, a model that does not exist, with no error
+/// anywhere. `/` is inert in both emitted forms: it is not a glob
+/// metacharacter to a POSIX shell (only `*?[` are) and not an operator in
+/// PowerShell, so nothing about the "can't smuggle an argument" property
+/// changes. Same reasoning, and the same "widen deliberately, pin with tests"
+/// discipline, as #709's bracket decision — which went the OTHER way and kept
+/// `[`/`]` out, because those ARE glob syntax (see [`claude_model_arg`]).
 fn sanitize_model(m: &str, fallback: &str) -> String {
     let cleaned: String = m
         .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '/'))
         .collect();
     if cleaned.is_empty() {
         fallback.to_string()
@@ -7040,7 +7461,7 @@ fn claude_model_arg(model: &str, context: &str) -> String {
 /// until the group default is in hand.
 pub(crate) fn sanitize_model_opt(m: &str) -> String {
     m.chars()
-        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '/'))
         .collect()
 }
 
@@ -8332,6 +8753,26 @@ pub struct PersonaInject {
     /// generated file into the repo's own `.github/agents/` (see
     /// `profiles::is_copilot_native`).
     pub copilot_agent: Option<String>,
+    /// opencode `--agent <handle>` (#722): selects the agent entry loomux
+    /// declared in the config document it delivers by environment variable —
+    /// the third "native custom-agent flag, file-backed" shape, differing from
+    /// claude's and copilot's only in that the DEFINITION rides an env-borne
+    /// document instead of a file in a CLI-owned directory, while the contract
+    /// itself still rides a file ([`Self::opencode_prompt_file`]).
+    ///
+    /// `None` when that file could not be written — in which case the config
+    /// document declares no agent either, because an `--agent` naming an entry
+    /// that does not exist does not fail: it warns and falls back to `build`,
+    /// the most permissive agent there is. Containment does not rest on this
+    /// flag for exactly that reason (see [`OPENCODE_PERMISSION_ENV`]).
+    pub opencode_agent: Option<String>,
+    /// The file [`Self::opencode_agent`]'s entry points its `prompt` at, via
+    /// opencode's `{file:…}` reference. Written under the group's own state
+    /// dir — never into the repo's `.opencode/agents/`, which would dirty the
+    /// user's git tree with files they did not write, and never into a
+    /// per-user CLI directory, which would need an orphan sweep; a group's
+    /// files go when the group does.
+    pub opencode_prompt_file: Option<PathBuf>,
     /// Extra pre-approved tool patterns from the persona's `allow:`. Widens
     /// only *within* the capability class: deny rules beat allow rules on both
     /// CLIs, so this can never re-grant what the block's `kind` denies.
@@ -8463,6 +8904,11 @@ const COPILOT_AGENT_BODY_SAFE_CHARS: usize = 27_000;
 const GENERATED_AGENT_PREFIX: &str = "loomux-";
 const CLAUDE_AGENT_FILE_EXT: &str = ".md";
 const COPILOT_AGENT_FILE_EXT: &str = ".agent.md";
+/// opencode's contract file (#722). Not an agent definition — the definition
+/// lives in the generated config document — so this names only where that
+/// document's `{file:}` reference points, and it lives under the group dir,
+/// which is why it is out of `reclaim_group_agent_files`' scope entirely.
+const OPENCODE_AGENT_FILE_EXT: &str = ".md";
 
 fn generated_agent_handle(group: &str, block: &str) -> String {
     format!("{GENERATED_AGENT_PREFIX}{group}-{block}")
@@ -23744,9 +24190,21 @@ impl OrchRegistry {
         let has_seam = cli_caps(cli).is_some_and(|c| c.mcp_argv_seam);
         let (token, mcp_args) = if has_seam {
             let token = new_token();
-            // A solo pane is `Role::Solo` — `Containment::None`, nothing to deny.
-            let cfg =
-                self.write_mcp_config(SOLO_GROUP, &agent_id, &token, cli, Containment::None)?;
+            // A solo pane is `Role::Solo` — `Containment::None`, nothing to
+            // deny, no block, and therefore no persona to compile. Only the
+            // argv-seam CLIs reach here (`has_seam`), and neither reads either
+            // of the last two arguments.
+            let cfg = self
+                .write_mcp_config(
+                    SOLO_GROUP,
+                    &agent_id,
+                    &token,
+                    cli,
+                    Containment::None,
+                    false,
+                    &PersonaInject::default(),
+                )?
+                .path;
             let args = match cli {
                 // Every join site APPENDS this string (`launcher.ts`,
                 // `panerestore.ts`, `sessions.rs`), so on an autopilot solo
@@ -29791,9 +30249,16 @@ impl OrchRegistry {
         format_delegate_roster(rows)
     }
 
-    /// Write the per-agent MCP config the agent CLI connects with. Claude
-    /// and Copilot share the same core schema; Copilot additionally expects
-    /// a `tools` allowlist inside the server entry.
+    /// Write the per-agent MCP config the agent CLI connects with, and return
+    /// it together with the pane environment that CLI needs to read it (see
+    /// [`AgentCliConfig`]). Claude and Copilot share the same core schema;
+    /// Copilot additionally expects a `tools` allowlist inside the server entry.
+    ///
+    /// `unattended` and `persona` are opencode's (#722): its single document
+    /// carries the permission posture (which differs for an attended pane) and
+    /// the block's agent entry (which `persona_inject` must have produced
+    /// first — hence the call order at both spawn sites). Both are ignored by
+    /// every other adapter.
     ///
     /// rev-4 review (N2): this file used to ALSO carry the #417 hook config
     /// (folded into a top-level `hooks` key, passed a second time via
@@ -29812,7 +30277,9 @@ impl OrchRegistry {
         token: &str,
         cli: &str,
         containment: Containment,
-    ) -> Result<PathBuf, String> {
+        unattended: bool,
+        persona: &PersonaInject,
+    ) -> Result<AgentCliConfig, String> {
         let port = self.port();
         if port == 0 {
             return Err("loomux MCP server is not running".into());
@@ -29827,7 +30294,29 @@ impl OrchRegistry {
             let policy = self.write_gemini_policy(&dir, agent_id, containment)?;
             let cfg = gemini_settings_json(port, token, containment, policy.as_deref());
             fs::write(&path, cfg).map_err(|e| e.to_string())?;
-            return Ok(path);
+            let env = cli_extra_env(cli, &path);
+            return Ok(AgentCliConfig { path, env });
+        }
+        // OpenCode (#722): the config document is delivered by environment
+        // variable, so the file written here is the AUDIT copy — what the pane
+        // was handed, readable after the fact — while the env carries the
+        // authoritative bytes. Both come from one call to one generator, so
+        // they cannot disagree.
+        if cli == "opencode" {
+            let agent = persona
+                .opencode_agent
+                .as_deref()
+                .zip(persona.opencode_prompt_file.as_deref());
+            let cfg = opencode_config_json(port, token, containment, unattended, agent);
+            fs::write(&path, &cfg).map_err(|e| e.to_string())?;
+            // SQLite creates the database file but not its parent directory,
+            // and a pane whose store cannot be opened does not boot — so this
+            // is an error, not a best-effort mkdir.
+            let db_dir = self.group_dir(group).join(OPENCODE_DB_SUBDIR);
+            fs::create_dir_all(&db_dir).map_err(|e| e.to_string())?;
+            let env =
+                opencode_pane_env(&cfg, containment, unattended, &db_dir.join(OPENCODE_DB_FILE));
+            return Ok(AgentCliConfig { path, env });
         }
         let mut server = json!({
             "type": "http",
@@ -29839,7 +30328,8 @@ impl OrchRegistry {
         }
         let cfg = json!({ "mcpServers": one_server_map(server) });
         fs::write(&path, serde_json::to_string_pretty(&cfg).unwrap()).map_err(|e| e.to_string())?;
-        Ok(path)
+        let env = cli_extra_env(cli, &path);
+        Ok(AgentCliConfig { path, env })
     }
 
     /// Write this agent's gemini policy-engine file — the admin-tier half of a
@@ -30363,6 +30853,55 @@ impl OrchRegistry {
         Some(handle)
     }
 
+    /// Generate (or refresh) the file an opencode block's generated agent
+    /// entry points its `prompt` at (#722), returning `(handle, path)` or
+    /// `None` if it can't be written.
+    ///
+    /// **Written under the GROUP's own state dir**, unlike its claude and
+    /// copilot siblings, and for two reasons rather than one. opencode has no
+    /// user-level agents directory loomux could write a *definition* into
+    /// without also owning its lifecycle — the definition lives in the config
+    /// document instead — so all that needs a home here is the contract text;
+    /// and a file under the group dir is reclaimed when the group is, so this
+    /// needs no orphan sweep of the kind `~/.claude/agents` and
+    /// `~/.copilot/agents` do (#464/#502). The repo's own `.opencode/agents/`
+    /// is never written for the reason copilot's `.github/agents/` isn't:
+    /// loomux does not dirty a user's git tree with files they did not write.
+    ///
+    /// Beside the config document in `configs/`, deliberately: the two are one
+    /// artifact split across a file and an env var, and the config's `{file:}`
+    /// reference is what joins them.
+    ///
+    /// Written on every spawn, like `write_mcp_config`, so an edited
+    /// template/persona applies to the next agent without restarting the
+    /// group. Named for the handle so the reference and its target can't drift.
+    ///
+    /// The whole contract goes in VERBATIM — no frontmatter, no wrapper: this
+    /// file is not an agent definition (the config document is), it is the
+    /// value of that definition's `prompt`. opencode inserts it JSON-escaped,
+    /// so quotes, newlines and backslashes in a persona cannot break the
+    /// document around it, and it `.trim()`s the content, so nothing may
+    /// depend on the trailing newline.
+    fn write_opencode_agent_file(
+        &self,
+        group: &str,
+        block: &workflow::Block,
+        contract: &str,
+    ) -> Option<(String, PathBuf)> {
+        if !self.group_state_exists(group) {
+            return None;
+        }
+        let dir = self.group_dir(group).join("configs");
+        fs::create_dir_all(&dir).ok()?;
+        let handle = generated_agent_handle(group, &block.id);
+        let path = dir.join(format!("{handle}{OPENCODE_AGENT_FILE_EXT}"));
+        let instructions_path = self.group_dir(group).join(block.instructions_file());
+        let body =
+            format!("{contract}{}\n", compaction_self_check_clause(&instructions_path));
+        fs::write(&path, body).ok()?;
+        Some((handle, path))
+    }
+
     /// Generate (or refresh) a loomux-owned Copilot custom-agent file carrying
     /// `contract` (#416) — written into Copilot's OWN user-level agent
     /// directory (`~/.copilot/agents`, see [`copilot_agents_dir`]
@@ -30568,6 +31107,51 @@ impl OrchRegistry {
                             out.kickoff = Some(p.text.clone());
                         }
                     }
+                }
+            }
+            return out;
+        }
+
+        // OpenCode (#722): the same "native custom-agent flag, file-backed"
+        // shape as the two above, with the definition in the config document
+        // `write_mcp_config` generates (which is why this must run BEFORE it
+        // at every spawn site) and the contract itself in a file the entry's
+        // `prompt` references. `contract` is used whole — the full instructions
+        // body plus any persona — because opencode documents no cap on it,
+        // matching claude rather than copilot (see `copilot_agent_body`).
+        //
+        // A repo persona resolved from a `.github/agents/*.md` file
+        // (`copilot_native`) is irrelevant here: that flag records what
+        // COPILOT's `--agent` can resolve, and opencode resolves neither the
+        // file nor its frontmatter. Its text is already folded into `contract`
+        // by `block_contract_text`, so nothing is lost by ignoring the flag.
+        if cli == "opencode" {
+            match self.write_opencode_agent_file(group, block, contract) {
+                Some((handle, path)) => {
+                    out.opencode_agent = Some(handle);
+                    out.opencode_prompt_file = Some(path);
+                    out.contract_carrier = ContractCarrier::SystemLayerFull;
+                }
+                None => {
+                    // The group dir is unwritable. Emit NO `--agent` and no
+                    // agent entry: a `--agent` naming an entry that isn't
+                    // there does not fail, it falls back to `build` — the most
+                    // permissive agent — so a broken flag would be strictly
+                    // worse than no flag. Containment is unaffected either way
+                    // (it rides `OPENCODE_PERMISSION`, which applies globally);
+                    // what is lost is the durable contract, so fall back to the
+                    // kickoff-text path exactly as copilot does, and audit it
+                    // for the same reason the claude fallback is audited.
+                    if persona.is_some_and(|p| !p.text.trim().is_empty()) {
+                        out.kickoff = persona.map(|p| p.text.clone());
+                    }
+                    self.audit(group, "loomux", "opencode-agent-file-unwritable", json!({
+                        "block": block.id,
+                        "reason": "could not write the block's contract file under the group dir; \
+                                   the pane launches with no --agent (an unresolvable one would \
+                                   silently fall back to the default `build` agent) and the \
+                                   contract reaches it through the kickoff only",
+                    }));
                 }
             }
             return out;
@@ -30894,6 +31478,54 @@ impl OrchRegistry {
                     group_dir.display()
                 )
             }
+            // OpenCode (#722). The shortest arm of the four, and deliberately:
+            // its MCP server, its containment and its persona DEFINITION are
+            // all keys in a config document delivered by pane environment
+            // (`write_mcp_config`'s opencode branch + `opencode_pane_env`) —
+            // there is no `--mcp-config` analogue, no deny flag, and no
+            // `--add-dir`. `cfg` is that document's audit copy and is
+            // deliberately not named here, which is why
+            // [`CliCaps::mcp_argv_seam`] is false for opencode too.
+            //
+            // So a contained pane's denials being ABSENT from this string is
+            // the design, not an omission: they are asserted on the generated
+            // document and on the environment instead.
+            //
+            // The TUI is the surface, not `opencode run`, and that is load-
+            // bearing rather than incidental: `run` answers a permission it
+            // cannot ask a human about by REJECTING it outright, so the
+            // attended posture (`edit: ask`) would silently refuse every edit
+            // instead of prompting. Anything that moves an opencode pane onto
+            // `run` inherits that.
+            "opencode" => {
+                let mut cmd = String::from("opencode");
+                // No flag pre-assigns a session id — `--session` continues an
+                // existing one — so, like copilot and gemini, it appears only
+                // on an explicit resume.
+                if let (Some(s), true) = (session, resume) {
+                    cmd.push_str(&format!(" --session {s}"));
+                }
+                // Omitted entirely when empty: `default_model("opencode", …)`
+                // is empty on purpose (see its doc), and a blank `--model`
+                // would be an argument, not a silence.
+                if !model.is_empty() {
+                    cmd.push_str(&format!(" --model {model}"));
+                }
+                if let Some(agent) = &persona.opencode_agent {
+                    cmd.push_str(&format!(" --agent {agent}"));
+                }
+                if unattended {
+                    cmd.push(' ');
+                    cmd.push_str(OPENCODE_UNATTENDED_FLAGS);
+                }
+                // `persona.extra_allow` holds claude/copilot tool-pattern
+                // strings (`Bash(make:*)`, `shell(npm:*)`); opencode's
+                // permission keys and matcher are a different namespace, so
+                // translating them would be inventing semantics — the same
+                // decision, for the same reason, as gemini's arm. An opencode
+                // block widens nothing; it only ever gets its class's baseline.
+                cmd
+            }
             // "claude" and the explicit fallback for anything unrecognized.
             _ => {
                 // Assigning the session id up front is what makes per-task
@@ -31188,6 +31820,30 @@ impl OrchRegistry {
                 a.push(group_dir.display().to_string());
                 push(&mut a, "--allowed-mcp-server-names");
                 push(&mut a, LOOMUX_MCP_SERVER);
+            }
+            // OpenCode (#722) — see the string form for why this arm is short:
+            // its MCP, containment and persona-definition seams are one
+            // env-delivered document, not flags.
+            "opencode" => {
+                push(&mut a, "opencode");
+                if let (Some(s), true) = (session, resume) {
+                    push(&mut a, "--session");
+                    push(&mut a, s);
+                }
+                if !model.is_empty() {
+                    push(&mut a, "--model");
+                    push(&mut a, model);
+                }
+                if let Some(agent) = &persona.opencode_agent {
+                    push(&mut a, "--agent");
+                    push(&mut a, agent);
+                }
+                if unattended {
+                    // == OPENCODE_UNATTENDED_FLAGS, as a literal token.
+                    for t in OPENCODE_UNATTENDED_FLAGS.split_whitespace() {
+                        push(&mut a, t);
+                    }
+                }
             }
             // "claude" and the explicit fallback for anything unrecognized.
             _ => {
@@ -31536,8 +32192,21 @@ impl OrchRegistry {
         // #267: `role.containment()` rides in because a gemini agent's deny
         // rules ARE its config file (the policy engine is the only surface
         // that can name a built-in tool), unlike claude/copilot where they are
-        // argv flags. Inert for every other CLI.
-        let cfg = self.write_mcp_config(group_id, &agent_id, &token, &cli, role.containment())?;
+        // argv flags. #722 adds two more inputs for the same reason on
+        // opencode, whose document carries its permission posture (which
+        // depends on whether the pane is attended) and its persona entry
+        // (which `persona_inject`, above, just produced) — inert for the CLIs
+        // that name their config on argv.
+        let unattended = group.guardrails.auto_ops || role.containment().forces_unattended();
+        let cfg = self.write_mcp_config(
+            group_id,
+            &agent_id,
+            &token,
+            &cli,
+            role.containment(),
+            unattended,
+            &inject,
+        )?;
         // #417, split from `cfg` per rev-4 review N2 — Claude's hook config
         // rides a per-agent `--settings` file, so this is `None` for every
         // other CLI (Copilot's own hook wiring, below, needs no launch flag
@@ -31557,7 +32226,7 @@ impl OrchRegistry {
             &model,
             block.knobs(), // #687: already clamped to what this CLI can honor
             group.guardrails.auto_ops,
-            &cfg,
+            &cfg.path,
             hook_settings.as_deref(),
             &self.group_dir(group_id),
             Path::new(&cwd),
@@ -31571,7 +32240,7 @@ impl OrchRegistry {
             &model,
             block.knobs(),
             group.guardrails.auto_ops,
-            &cfg,
+            &cfg.path,
             hook_settings.as_deref(),
             &self.group_dir(group_id),
             Path::new(&cwd),
@@ -31673,7 +32342,7 @@ impl OrchRegistry {
                             .map(|a| (a.id.clone(), a.role.as_str(), a.idle_since_ms.is_some()))
                             .collect(),
                     );
-                    let _ = fs::remove_file(&cfg);
+                    let _ = fs::remove_file(&cfg.path);
                     return Err(format!(
                         "guardrail: {live} live agents already (max {}). Reuse an idle agent or kill one first. Live delegates: {roster}.",
                         group.guardrails.max_agents
@@ -31709,7 +32378,7 @@ impl OrchRegistry {
 
         let pane_env = {
             let mut e = self.agent_pane_env(group_id, &agent_id);
-            e.extend(cli_extra_env(&cli, &cfg));
+            e.extend(cfg.env.clone());
             e
         };
         let request = SpawnRequest {
@@ -37584,10 +38253,6 @@ fn register_orchestrator_pane(
     if cli == "copilot" {
         reg.pre_trust_copilot_folder(&group.repo);
     }
-    // An orchestrator is `Containment::None` — nothing to deny; the parameter
-    // exists for the CLIs whose deny rules live in the config file (#267).
-    let cfg =
-        reg.write_mcp_config(&group.id, &agent_id, &token, &cli, Containment::None)?;
     let resume = resume_session.is_some();
     let session_id = match resume_session {
         Some(s) => Some(sanitize_session(&s).ok_or("invalid resume session id")?),
@@ -37614,10 +38279,37 @@ fn register_orchestrator_pane(
         .unwrap_or_default();
     let contract = block_contract_text(&instructions_body, persona.as_ref());
     let inject = reg.persona_inject(&group.id, &block, &cli, persona.as_ref(), &contract);
+    // An orchestrator is `Containment::None` — nothing to deny; the parameter
+    // exists for the CLIs whose deny rules live in the config file (#267).
+    //
+    // **Written AFTER `persona_inject`, matching `spawn_agent_ex` (#722):**
+    // opencode's generated document carries the block's agent entry, and
+    // `persona_inject` is what writes the file that entry references. This used
+    // to sit above the session/persona block; nothing between there and here
+    // reads `cfg`, so moving it down is a reordering only — and it makes the
+    // two spawn sites agree on the order structurally instead of by accident.
+    //
+    // Both arguments are DERIVED, never hand-passed, for the same reason the
+    // builders below already derive theirs: an orchestrator is
+    // `Containment::None` today, but a literal here would be a second place
+    // that has to be remembered if `Role::containment` ever changes — and the
+    // unattended predicate must stay the one expression
+    // `build_agent_command_ex` recomputes internally, or a pane could get a
+    // document saying one thing and an argv saying the other.
+    let containment = block.kind.containment();
+    let cfg = reg.write_mcp_config(
+        &group.id,
+        &agent_id,
+        &token,
+        &cli,
+        containment,
+        group.guardrails.auto_ops || containment.forces_unattended(),
+        &inject,
+    )?;
     // #417, split from `cfg` per rev-4 review N2 — Claude's hook config rides
     // a per-agent `--settings` file; Copilot's own wiring needs no flag.
     let hook_settings = (cli == "claude")
-        .then(|| reg.write_hook_settings_file(&group.id, &agent_id, block.kind.containment()))
+        .then(|| reg.write_hook_settings_file(&group.id, &agent_id, containment))
         .flatten();
     if cli == "copilot" {
         let _ = reg.ensure_copilot_compact_hook();
@@ -37630,7 +38322,7 @@ fn register_orchestrator_pane(
         // `prompt:`/`allow:` on the refused one (see `parse_workflow`).
         block.knobs(),
         group.guardrails.auto_ops,
-        &cfg,
+        &cfg.path,
         hook_settings.as_deref(),
         &reg.group_dir(&group.id),
         Path::new(&group.repo),
@@ -37639,7 +38331,7 @@ fn register_orchestrator_pane(
         // Derived from the class, never hand-passed: the orchestrator is
         // `Containment::None`, and if that ever changes it changes in one
         // `match` (`Role::containment`) rather than at a literal here.
-        block.kind.containment(),
+        containment,
         &inject,
     );
     let argv = reg.build_agent_argv_ex(
@@ -37647,13 +38339,13 @@ fn register_orchestrator_pane(
         &model,
         block.knobs(),
         group.guardrails.auto_ops,
-        &cfg,
+        &cfg.path,
         hook_settings.as_deref(),
         &reg.group_dir(&group.id),
         Path::new(&group.repo),
         session_id.as_deref(),
         resume,
-        block.kind.containment(),
+        containment,
         &inject,
     );
     // Round #417 correction 6: see `command_line_length_guard`'s doc — the
@@ -37741,7 +38433,7 @@ fn register_orchestrator_pane(
         // LOOMUX_AGENT_ID (#417) and the adapter's own vars (#267).
         env: {
             let mut e = reg.agent_pane_env(&group.id, &agent_id);
-            e.extend(cli_extra_env(&cli, &cfg));
+            e.extend(cfg.env.clone());
             e
         },
         // The orchestrator's own pane is never minimized (#260) — see
