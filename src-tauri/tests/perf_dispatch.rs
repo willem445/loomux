@@ -19,9 +19,9 @@
 //! are meant to read as one idea.
 //!
 //! WHY A MANIFEST AND NOT A LINT. The property is not "no blocking sync
-//! commands exist": 66 do today, enumerated in #743's census (planning comments
-//! parts 1-2, which `performance.md` §5 names as the one source of truth) and
-//! owned by the issues in `DEBT_OWNERS`. The property is that **one cannot be
+//! commands exist": 26 do today (66 when this file landed), enumerated in
+//! #743's census (planning comments parts 1-2, which `performance.md` §5 names
+//! as the one source of truth) and owned by the issues in `DEBT_OWNERS`. The property is that **one cannot be
 //! added silently**. A new sync command fails this test until somebody writes
 //! down what it does on the webview thread and who owns moving it off, and that
 //! sentence is a review-visible diff. The debt tier is the census made
@@ -35,12 +35,11 @@
 //! thread it never names. (`orch_open_ref` was the third until #762 converted
 //! it — a scan-invisible pair of `git` spawns, found by reading rather than by
 //! failing, which is the residue this paragraph is about.) This is the same
-//! bound `gh.rs`'s in-module
-//! enumeration test (the seed this generalizes) already accepts. The scan pins
-//! the shape — which commands are sync, and that each one's cost is written
-//! down — and the manifest reason plus review carry the residue. For the same
-//! reason the `cheap` marker check is belt-and-braces on top of the review, not
-//! a substitute for it.
+//! bound `gh.rs`'s in-module enumeration test (the seed this generalizes)
+//! already accepts. The scan pins the shape — which commands are sync, and that
+//! each one's cost is written down — and the manifest reason plus review carry
+//! the residue. For the same reason the `cheap` marker check is belt-and-braces
+//! on top of the review, not a substitute for it.
 //!
 //! Nor can a scan see "nothing before the first await": it requires the
 //! delegation call to be *in* the command's own body, which is what makes an
