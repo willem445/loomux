@@ -53,6 +53,7 @@ import {
   fullAutonomyChip,
   goalCommit,
   goalFieldSync,
+  normalizeGoal,
   budgetMeter,
   formatTokens,
   isValidReleaseTag,
@@ -933,9 +934,11 @@ export class GroupView {
   private async toggleFullAutonomy(): Promise<void> {
     this.goalErrEl.textContent = "";
     const on = this.fullAutoChk.checked;
-    // goalCommit normalizes; `send` is about a goal EDIT, not about this toggle,
-    // so the goal it returns is what we hand the enable either way.
-    const { goal } = goalCommit(on, this.autonomy?.full_autonomy_goal ?? null, this.goalInput.value);
+    // Normalized here rather than left to the backend so the field shows the human
+    // exactly the goal their click is about to put in force. (A disable ignores it:
+    // "off" has no goal, by construction.)
+    const goal = normalizeGoal(this.goalInput.value);
+    this.goalInput.value = goal;
     try {
       await setFullAutonomy(this.groupId, on, goal);
     } catch (err) {
