@@ -21731,6 +21731,37 @@ fn the_orchestrator_contract_names_the_eligible_signal_and_its_partial_caveat() 
     );
 }
 
+/// The PR half of that caveat (#795). Bounding the open-PR fetch too means a
+/// `PARTIAL` summary can now come from *either* listing, so the contract can no
+/// longer describe it as a statement about the backlog: it has to say what a
+/// short PR sweep means, which is that silence about a PR outside the window is
+/// absence of evidence rather than "still running". The expected text is derived
+/// from the shipped summary builder, as above, so a reworded caveat fails here
+/// instead of drifting away from the contract that explains it.
+#[test]
+fn the_orchestrator_contract_names_the_partial_pr_sweep_caveat() {
+    let pr = intake::PrCheckSignal {
+        number: 7,
+        title: "Fix Y".into(),
+        from: intake::PrCheckState::Pending,
+        to: intake::PrCheckState::Success,
+    };
+    let partial = intake::intake_wake_summary(
+        &[],
+        std::slice::from_ref(&pr),
+        &[],
+        intake::IntakeTruncation { issues: false, prs: true },
+    );
+    assert!(partial.contains("PARTIAL:"), "a short open-PR fetch must state itself: {partial}");
+    assert!(partial.contains("open-PR fetch"), "the caveat must name which of the two fetches was short: {partial}");
+    assert!(
+        ORCHESTRATOR_TPL.contains("open-PR"),
+        "orchestrator.md must say what a PARTIAL open-PR fetch means: the check sweep saw only the \
+         newest open PRs, so a PR outside that window finishing CI produces no wake at all and must \
+         be checked rather than assumed still running (#795)"
+    );
+}
+
 #[test]
 fn dangerous_mode_setter_and_autonomous_are_mutually_exclusive() {
     let (reg, dir) = test_registry();
