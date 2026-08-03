@@ -29471,9 +29471,9 @@ impl OrchRegistry {
         // disk removal fails).
         self.force_disable_auto_merge(group, "loomux", "autonomous-suspended");
         self.force_disable_auto_release(group, "loomux", "autonomous-suspended");
-        // MUTATION (temporary, #778 rev round 1): the full-autonomy force-clear is
-        // removed here so the budget-suspension test reddens on its force-clear
-        // assertion rather than on a setup precondition. Restored in the next commit.
+        // Full autonomy (#778) is the mode that STARTS work, so a spent budget must
+        // drop it for the same reason and by the same unconditional route.
+        self.force_disable_full_autonomy(group, "loomux", "autonomous-suspended");
         // Best-effort durable disable; failure is surfaced in the audit trail.
         match remove_marker(&self.group_dir(group).join("autonomous")) {
             Ok(()) => self.audit(group, "loomux", "autonomous-off", json!({})),
@@ -29608,9 +29608,10 @@ impl OrchRegistry {
             // deliver, so both stay outside the guard.
             self.force_disable_auto_merge(group, actor, "autonomous-disabled");
             self.force_disable_auto_release(group, actor, "autonomous-disabled");
-            // MUTATION (temporary, #778 rev round 1): the full-autonomy force-clear is
-            // removed here so the autonomous-off test reddens on its force-clear
-            // assertion rather than on a setup precondition. Restored in the next commit.
+            // Same dependency for full autonomy (#778), for a stronger reason: without
+            // the idle tick there is nothing to self-select on, and an inverted start
+            // default outliving its consent is the one direction it must never have.
+            self.force_disable_full_autonomy(group, actor, "autonomous-disabled");
         }
         Ok(())
     }
@@ -29752,17 +29753,31 @@ impl OrchRegistry {
         self.full_autonomy_groups.lock_safe().contains(group)
     }
 
-    /// The goal string captured when full autonomy was enabled — the `full_autonomy`
+    /// The goal string qualifying full autonomy for a group — the `full_autonomy`
     /// marker's *content*, the same anchor-in-content shape `set_autonomous` uses for
     /// the budget anchor, so consent and the parameter that qualifies it are written
     /// atomically and come back together across a restart. `None` when the mode is
-    /// off (no marker) or when it is on with no goal (empty marker) — both of which
-    /// render as "no goal set" rather than as a goal that got lost.
+    /// on with no goal (empty marker), which renders as "no goal set" rather than as
+    /// a goal that got lost.
+    ///
+    /// **Gated on `is_full_autonomy`, and the gate is the point, not a formality.**
+    /// The marker's presence is NOT equivalent to the mode being on: the force-clear
+    /// paths are money-stops that drop the in-memory flag unconditionally and remove
+    /// the marker only best-effort (`force_disable_full_autonomy`'s `let _ =`), so a
+    /// disk failure genuinely leaves a marker — goal and all — behind while the mode
+    /// is off. In that window `full_autonomy_groups` is the authority, and reporting
+    /// the orphaned goal would have `orch_autonomy` claim consent that is not in
+    /// force. Gating here rather than at the one JSON call site makes that total: no
+    /// future caller can reintroduce it. (The orphaned marker itself is cleared by
+    /// the restart reconcile in `create_group`.)
     ///
     /// Re-sanitized on read: the marker is a file a human can hand-edit, and a
     /// newline smuggled in there would reach a CLI paste. The sanitizer is
     /// idempotent, so this costs nothing for the normal path.
     pub fn full_autonomy_goal(&self, group: &str) -> Option<String> {
+        if !self.is_full_autonomy(group) {
+            return None;
+        }
         let goal = fs::read_to_string(self.group_dir(group).join("full_autonomy")).ok()?;
         let goal = sanitize_full_autonomy_goal(&goal);
         (!goal.is_empty()).then_some(goal)
@@ -29795,9 +29810,20 @@ impl OrchRegistry {
                 );
             }
             let goal = sanitize_full_autonomy_goal(goal);
-            // Atomic reserve (mirrors set_autonomous_as / set_auto_merge): a single
-            // `insert` decides who proceeds, so a concurrent enable can't race the
-            // marker write.
+            // Atomic reserve for the FIRST enable (mirrors set_autonomous_as /
+            // set_auto_merge): a single `insert` decides who proceeds, so two
+            // concurrent first-enables can't both write the marker or double-audit.
+            //
+            // It deliberately does NOT serialize the re-aim path below, and saying so
+            // is the honest version of this comment: two concurrent re-aims carrying
+            // different goals both observe `!newly`, both pass the compare, and both
+            // write — last writer wins. That is acceptable rather than merely
+            // tolerated. The caller is a human operating one toggle in one panel, so
+            // the race needs two humans or two windows to exist at all; and neither
+            // outcome is a consent violation, because the mode is on either way and
+            // whichever goal lands is one a human typed, with BOTH re-aims in the
+            // audit trail. Holding a lock across the read-compare-write would buy
+            // ordering nobody can observe and would put file IO under the set lock.
             let newly = self.full_autonomy_groups.lock_safe().insert(group.to_string());
             let previous = if newly { None } else { self.full_autonomy_goal(group) };
             if !newly && previous.as_deref().unwrap_or("") == goal {
