@@ -3537,6 +3537,68 @@ fn a_writing_class_keeps_its_allow_patterns_before_the_deny_list() {
     assert!(argv.iter().any(|a| a == "Bash(make:*)"), "and it is one literal argv token: {argv:?}");
 }
 
+#[test]
+fn a_copilot_blocks_allow_patterns_ride_the_one_allow_tool_value() {
+    // #802's copilot half of the test above. Copilot documents `--allow-tool`
+    // as taking "a quoted, comma-separated list" and never as repeatable, so a
+    // block's patterns must EXTEND the one value that already carries the
+    // loomux MCP grant — not follow it as further occurrences, which is what
+    // made the MCP grant droppable in the first place.
+    let (reg, _d) = test_registry();
+    let repo = Repo::new().workflow(
+        "version: 1\nblocks:\n  - id: w\n    kind: worker\n    cli: copilot\n    \
+         prompt: Build it.\n    allow: [\"shell(make:*)\"]\n",
+    );
+    let g = reg.create_group(&repo.path(), rails()).unwrap();
+    let (cmd, argv, _k) = compile(&reg, &g, "w");
+
+    assert_eq!(
+        cmd.matches("--allow-tool ").count(),
+        1,
+        "a block's own patterns must not add a second occurrence: {cmd}"
+    );
+    assert!(
+        cmd.contains("--allow-tool \"loomux,shell(git:*),shell(gh:*),shell(make:*)\""),
+        "the MCP grant leads the one value and the block's pattern extends it: {cmd}"
+    );
+    assert!(
+        argv.iter().any(|a| a == "loomux,shell(git:*),shell(gh:*),shell(make:*)"),
+        "and it is one literal argv token: {argv:?}"
+    );
+}
+
+#[test]
+fn a_copilot_allow_pattern_containing_a_comma_is_refused_and_audited() {
+    // A comma SEPARATES patterns inside copilot's `--allow-tool` value, so a
+    // pattern that contains one cannot be expressed on this CLI: copilot would
+    // read it as two fragments, one of which is a prefix pattern nobody
+    // authored. There is no documented escape, so loomux refuses it rather than
+    // shipping the fragments — and says so in the audit, because a grant that
+    // silently does nothing is the failure mode #802 is about.
+    let (reg, _d) = test_registry();
+    let repo = Repo::new().workflow(
+        "version: 1\nblocks:\n  - id: w\n    kind: worker\n    cli: copilot\n    \
+         prompt: Build it.\n    allow: [\"shell(pytest,ruff)\", \"shell(make:*)\"]\n",
+    );
+    let g = reg.create_group(&repo.path(), rails()).unwrap();
+    let (cmd, argv, _k) = compile(&reg, &g, "w");
+
+    assert!(
+        !cmd.contains("pytest") && !argv.iter().any(|a| a.contains("pytest")),
+        "neither the pattern nor either fragment of it may reach the CLI: {cmd}"
+    );
+    assert!(
+        cmd.contains("--allow-tool \"loomux,shell(git:*),shell(gh:*),shell(make:*)\""),
+        "the block's other pattern is unaffected — one bad pattern is not a lost block: {cmd}"
+    );
+
+    let audit = fs::read_to_string(reg.state_root().join(&g.id).join("audit.jsonl")).unwrap();
+    assert!(
+        audit.lines().any(|l| l.contains("copilot-allow-pattern-refused") && l.contains("pytest")),
+        "refusing a pattern must be audited, not silent: {audit}"
+    );
+}
+
 // ─────────────────────────── the MCP spawn surface ──────────────────────────
 
 fn orch_caller(reg: &OrchRegistry, group: &str) -> Caller {

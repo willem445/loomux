@@ -23,6 +23,12 @@ use loomux_lib::orchestration::workflow;
 use loomux_lib::orchestration::{
     add_trusted_folder, autonomy_budget_exhausted, bracketed_paste, box_occupancy_delta,
     set_copilot_trust_home_for_test,
+    // #802: copilot's documented permission store, and the one-occurrence
+    // tool-permission value both command builders share.
+    copilot_permissions_grant, copilot_tool_permissions,
+    // #803 review B1: the path-key rules, parameterized so BOTH platform
+    // shapes are exercised on every CI leg.
+    normalize_path_key_for, same_path_key_for,
     channel_connected_event, channel_disconnected_event, channel_message_text,
     channel_updated_event, classify_human_input,
     claude_effective_permission_mode, claude_permission_mode, cli_ready, compact_checklist_warning, compact_escalation_notice,
@@ -5945,8 +5951,10 @@ fn reviewer_is_denied_editing_tools_but_keeps_its_shell() {
     // Copilot spells the same denial its own way — pinned separately because a
     // fix applied to one adapter only is the drift #448 already caught once.
     let rev = reg.build_agent_command("copilot", "auto", true, cfg, None, gdir, Path::new("C:/repo"), None, false, tier, &PersonaInject::default());
-    for denied in COPILOT_EDIT_DENY_TOOLS {
-        assert!(rev.contains(&format!("--deny-tool \"{denied}\"")), "a reviewer must deny {denied}: {rev}");
+    // #802: one `--deny-tool`, comma-separated — membership, not a flag per entry.
+    let denied = copilot_tool_patterns(&rev, "--deny-tool");
+    for t in COPILOT_EDIT_DENY_TOOLS {
+        assert!(denied.iter().any(|d| d == t), "a reviewer must deny {t}: {rev}");
     }
     assert!(!rev.contains("shell(git commit)") && !rev.contains("shell(git push)"),
         "a copilot reviewer keeps its shell git, same as the claude one: {rev}");
@@ -6151,6 +6159,101 @@ fn planner_runs_unattended_regardless_of_auto_ops() {
         "a non-auto_ops worker gets no pre-approved gh — only planners run unattended");
 }
 
+/// Read a copilot command line's `--allow-tool` / `--deny-tool` patterns —
+/// and, in doing so, assert the #802 invariant every caller below depends on:
+/// **the option appears AT MOST ONCE**, carrying a comma-separated list.
+///
+/// Copilot's CLI reference documents these options as taking "a quoted,
+/// comma-separated list" and never as repeatable — while annotating five
+/// neighbouring options "(can be used multiple times)". A repeated occurrence
+/// is therefore a form the docs don't describe, and if copilot resolves it
+/// last-wins rather than by accumulating, every pattern but the last is
+/// silently dropped — which is #802's report ("the CLI lists the loomux MCP
+/// server as available, but the agent has no permission to use its tools"),
+/// since `--allow-tool loomux` was emitted FIRST.
+///
+/// Returns the patterns in order, or an empty vec when the option is absent.
+fn copilot_tool_patterns(cmd: &str, flag: &str) -> Vec<String> {
+    let occurrences = cmd.matches(&format!("{flag} ")).count();
+    assert!(
+        occurrences <= 1,
+        "{flag} must appear at most once on a copilot command line (#802) — every pattern \
+         belongs in ONE comma-separated value; found {occurrences} occurrences in: {cmd}"
+    );
+    let needle = format!("{flag} \"");
+    let Some(i) = cmd.find(&needle) else { return Vec::new() };
+    let after = &cmd[i + needle.len()..];
+    let end = after.find('"').expect("an unterminated tool-permission value");
+    after[..end].split(',').map(str::to_string).collect()
+}
+
+/// #802 — the invariant the fix exists for, stated once, in the form a
+/// regression would break: every allow pattern loomux grants a copilot agent
+/// (the loomux MCP server, the attended git/gh pair, and a workflow block's own
+/// `allow:` patterns) rides ONE `--allow-tool`, and every denial ONE
+/// `--deny-tool`.
+///
+/// This is the copilot sibling of
+/// `claude_allow_patterns_are_not_severed_from_the_allowedtools_flag`: same
+/// failure mode (a grant that reads as present on the command line but isn't in
+/// effect), reached through a different CLI's parser. The persona patterns are
+/// what makes it bite in practice — they are the ONLY copilot-argv difference a
+/// workflow block introduces over the built-in roster, which is why #802 was
+/// reported against custom workflows specifically.
+#[test]
+fn copilot_tool_permission_flags_ride_one_occurrence_each() {
+    let (reg, _d) = test_registry();
+    let cfg = Path::new("C:/x/cfg.json");
+    let gdir = Path::new("C:/data/group");
+    let persona = PersonaInject {
+        extra_allow: vec!["shell(npm:*)".into(), "shell(cargo:*)".into()],
+        ..Default::default()
+    };
+    let cmd = |auto_ops, containment, p: &PersonaInject| {
+        reg.build_agent_command(
+            "copilot", "auto", auto_ops, cfg, None, gdir, Path::new("C:/repo"), None, false,
+            containment, p,
+        )
+    };
+
+    // The attended tier stacks the most allow patterns, so it is where a
+    // repeated-flag regression shows first.
+    let attended = cmd(false, Containment::None, &persona);
+    assert_eq!(
+        copilot_tool_patterns(&attended, "--allow-tool"),
+        ["loomux", "shell(git:*)", "shell(gh:*)", "shell(npm:*)", "shell(cargo:*)"],
+        "every allow pattern must sit in one comma-separated value, MCP server first: {attended}"
+    );
+
+    // An unattended block with a persona: the loomux grant must survive the
+    // block's own patterns, which used to be emitted as later occurrences.
+    let unattended = cmd(true, Containment::None, &persona);
+    assert_eq!(
+        copilot_tool_patterns(&unattended, "--allow-tool"),
+        ["loomux", "shell(npm:*)", "shell(cargo:*)"],
+        "an unattended agent drops the git/gh pair (it has --allow-all-tools) but never the \
+         MCP grant: {unattended}"
+    );
+
+    // A planner's denials — three patterns that used to be three flags.
+    let planner = cmd(true, Containment::ReadOnly, &PersonaInject::default());
+    assert_eq!(
+        copilot_tool_patterns(&planner, "--deny-tool"),
+        ["write", "shell(git commit)", "shell(git push)"],
+        "every denial must sit in one comma-separated value: {planner}"
+    );
+    // …and the read-only class still grants loomux, which is the whole point:
+    // a planner with no MCP tools cannot post its plan or report.
+    assert_eq!(copilot_tool_patterns(&planner, "--allow-tool"), ["loomux"]);
+
+    // An uncontained agent emits no `--deny-tool` at all rather than an empty
+    // value — a flag with nothing after it is a parse hazard, not a no-op.
+    assert!(
+        !unattended.contains("--deny-tool"),
+        "no denials means no flag: {unattended}"
+    );
+}
+
 #[test]
 fn copilot_command_uses_copilot_adapter_flags() {
     let (reg, _d) = test_registry();
@@ -6163,7 +6266,10 @@ fn copilot_command_uses_copilot_adapter_flags() {
         "the @ file marker must be inside the quotes — a bare @\" opens a PowerShell here-string, got: {cmd}"
     );
     assert!(cmd.contains("--model auto"));
-    assert!(cmd.contains("--allow-tool loomux"));
+    // The bare MCP server name is copilot's documented "all tools from this
+    // server" form (`SERVER-NAME` row of the tool-permission-patterns table);
+    // #802 changed only its packaging, never the value.
+    assert!(copilot_tool_patterns(&cmd, "--allow-tool").contains(&"loomux".to_string()), "got: {cmd}");
     assert!(cmd.contains("--add-dir \"C:/data/group\""));
     assert!(
         cmd.contains("--add-dir \"C:/repo\""),
@@ -6182,7 +6288,9 @@ fn copilot_command_uses_copilot_adapter_flags() {
     // Conservative preset keeps the explicit allowlist instead.
     let cmd = reg.build_agent_command("copilot", "auto", false, cfg, None, gdir, Path::new("C:/repo"), None, false, Containment::None, &PersonaInject::default());
     assert!(!cmd.contains("--allow-all-tools") && !cmd.contains("--autopilot"));
-    assert!(cmd.contains("--allow-tool \"shell(git:*)\"") && cmd.contains("--allow-tool \"shell(gh:*)\""));
+    let allowed = copilot_tool_patterns(&cmd, "--allow-tool");
+    assert!(allowed.iter().any(|p| p == "shell(git:*)") && allowed.iter().any(|p| p == "shell(gh:*)"),
+        "the attended tier keeps its git/gh pre-approval: {cmd}");
     // Resume reopens a tracked session via --resume; copilot has no
     // pre-assignable id, so a session without resume adds no session flag.
     let sid = "aabbccdd-1122-4334-8556-77889900aabb";
@@ -6202,17 +6310,18 @@ fn copilot_command_uses_copilot_adapter_flags() {
     // A planner (read_only=true) denies writes + git commit/push even under
     // --allow-all-tools (deny wins in Copilot); gh stays reachable.
     let plan = reg.build_agent_command("copilot", "auto", true, cfg, None, gdir, Path::new("C:/repo"), None, false, Containment::ReadOnly, &PersonaInject::default());
-    assert!(plan.contains("--deny-tool \"write\""),
+    let plan_deny = copilot_tool_patterns(&plan, "--deny-tool");
+    assert!(plan_deny.iter().any(|d| d == "write"),
         "planner must deny copilot's write category (the documented file-modification category), got: {plan}");
     // #448: `edit` is not one of Copilot's three documented --deny-tool value
     // shapes (shell(COMMAND) / write / MCP_SERVER(tool)) — it was likely
     // already as inert as MultiEdit was for Claude, so it was dropped rather
     // than kept as an unverified entry that only looked like containment.
-    assert!(!plan.contains("--deny-tool \"edit\""),
+    assert!(!plan_deny.iter().any(|d| d == "edit"),
         "edit is not a documented copilot deny-tool value — must not reappear (#448), got: {plan}");
-    assert!(plan.contains("--deny-tool \"shell(git commit)\"") && plan.contains("--deny-tool \"shell(git push)\""),
+    assert!(plan_deny.iter().any(|d| d == "shell(git commit)") && plan_deny.iter().any(|d| d == "shell(git push)"),
         "planner must deny git commit/push");
-    assert!(!plan.contains("--deny-tool \"shell(gh"), "gh stays allowed for the plan comment");
+    assert!(!plan_deny.iter().any(|d| d.starts_with("shell(gh")), "gh stays allowed for the plan comment");
 }
 
 #[test]
@@ -6231,9 +6340,10 @@ fn copilot_planner_runs_unattended_regardless_of_auto_ops() {
         "a non-auto_ops copilot planner must run unattended (all tools/paths), else it deadlocks: {plan}");
     assert!(plan.contains("--autopilot"),
         "a group planner runs in true autopilot mode; the kickoff answers the consent dialog for it");
-    assert!(plan.contains("--deny-tool \"write\"") && plan.contains("--deny-tool \"shell(git commit)\""),
+    let plan_deny = copilot_tool_patterns(&plan, "--deny-tool");
+    assert!(plan_deny.iter().any(|d| d == "write") && plan_deny.iter().any(|d| d == "shell(git commit)"),
         "writes/commit stay denied — the unattended preset doesn't loosen the read-only contract");
-    assert!(!plan.contains("--deny-tool \"shell(gh"),
+    assert!(!plan_deny.iter().any(|d| d.starts_with("shell(gh")),
         "gh stays allowed so the copilot planner can post its plan comment unattended");
     // A non-auto_ops copilot WORKER (read_only=false) is unchanged: it keeps
     // the conservative interactive preset (no allow-all).
@@ -6664,16 +6774,16 @@ fn build_agent_command_full_line_snapshots() {
     assert_eq!(
         cmd("copilot", "auto", true, Containment::None),
         "copilot --additional-mcp-config \"@C:/x/cfg.json\" --model auto \
-         --add-dir \"C:/data/group\" --add-dir \"C:/repo\" --allow-tool loomux --no-auto-update \
-         --autopilot --allow-all-tools --allow-all-paths"
+         --add-dir \"C:/data/group\" --add-dir \"C:/repo\" --no-auto-update \
+         --autopilot --allow-all-tools --allow-all-paths --allow-tool \"loomux\""
     );
 
     // Copilot worker, auto_ops OFF → the conservative git/gh allowlist branch.
     assert_eq!(
         cmd("copilot", "auto", false, Containment::None),
         "copilot --additional-mcp-config \"@C:/x/cfg.json\" --model auto \
-         --add-dir \"C:/data/group\" --add-dir \"C:/repo\" --allow-tool loomux --no-auto-update \
-         --allow-tool \"shell(git:*)\" --allow-tool \"shell(gh:*)\""
+         --add-dir \"C:/data/group\" --add-dir \"C:/repo\" --no-auto-update \
+         --allow-tool \"loomux,shell(git:*),shell(gh:*)\""
     );
 
     // Claude planner (read_only) in a NON-auto_ops group → unattended anyway,
@@ -6697,10 +6807,9 @@ fn build_agent_command_full_line_snapshots() {
     assert_eq!(
         cmd("copilot", "auto", false, Containment::ReadOnly),
         "copilot --additional-mcp-config \"@C:/x/cfg.json\" --model auto \
-         --add-dir \"C:/data/group\" --add-dir \"C:/repo\" --allow-tool loomux --no-auto-update \
-         --autopilot --allow-all-tools --allow-all-paths \
-         --deny-tool \"write\" \
-         --deny-tool \"shell(git commit)\" --deny-tool \"shell(git push)\""
+         --add-dir \"C:/data/group\" --add-dir \"C:/repo\" --no-auto-update \
+         --autopilot --allow-all-tools --allow-all-paths --allow-tool \"loomux\" \
+         --deny-tool \"write,shell(git commit),shell(git push)\""
     );
 
     // #462 — a reviewer (`NoEdits`), the tier between the two above. Every
@@ -6724,14 +6833,15 @@ fn build_agent_command_full_line_snapshots() {
     assert_eq!(
         cmd("copilot", "auto", true, Containment::NoEdits),
         "copilot --additional-mcp-config \"@C:/x/cfg.json\" --model auto \
-         --add-dir \"C:/data/group\" --add-dir \"C:/repo\" --allow-tool loomux --no-auto-update \
-         --autopilot --allow-all-tools --allow-all-paths --deny-tool \"write\""
+         --add-dir \"C:/data/group\" --add-dir \"C:/repo\" --no-auto-update \
+         --autopilot --allow-all-tools --allow-all-paths --allow-tool \"loomux\" \
+         --deny-tool \"write\""
     );
     assert_eq!(
         cmd("copilot", "auto", false, Containment::NoEdits),
         "copilot --additional-mcp-config \"@C:/x/cfg.json\" --model auto \
-         --add-dir \"C:/data/group\" --add-dir \"C:/repo\" --allow-tool loomux --no-auto-update \
-         --allow-tool \"shell(git:*)\" --allow-tool \"shell(gh:*)\" --deny-tool \"write\""
+         --add-dir \"C:/data/group\" --add-dir \"C:/repo\" --no-auto-update \
+         --allow-tool \"loomux,shell(git:*),shell(gh:*)\" --deny-tool \"write\""
     );
 
     // Unknown CLI falls back to the claude adapter byte-for-byte (never a
@@ -7175,8 +7285,9 @@ fn build_agent_argv_snapshots() {
         argv("copilot", "auto", true, Containment::NoEdits),
         vec![
             "copilot", "--additional-mcp-config", "@C:/x/cfg.json", "--model", "auto", "--add-dir",
-            "C:/data/group", "--add-dir", "C:/repo", "--allow-tool", "loomux", "--no-auto-update",
-            "--autopilot", "--allow-all-tools", "--allow-all-paths", "--deny-tool", "write",
+            "C:/data/group", "--add-dir", "C:/repo", "--no-auto-update",
+            "--autopilot", "--allow-all-tools", "--allow-all-paths",
+            "--allow-tool", "loomux", "--deny-tool", "write",
         ]
     );
 
@@ -7187,10 +7298,10 @@ fn build_agent_argv_snapshots() {
         argv("copilot", "auto", false, Containment::ReadOnly),
         vec![
             "copilot", "--additional-mcp-config", "@C:/x/cfg.json", "--model", "auto", "--add-dir",
-            "C:/data/group", "--add-dir", "C:/repo", "--allow-tool", "loomux", "--no-auto-update",
-            "--autopilot", "--allow-all-tools", "--allow-all-paths", "--deny-tool", "write",
-            "--deny-tool", "shell(git commit)", "--deny-tool",
-            "shell(git push)",
+            "C:/data/group", "--add-dir", "C:/repo", "--no-auto-update",
+            "--autopilot", "--allow-all-tools", "--allow-all-paths",
+            "--allow-tool", "loomux",
+            "--deny-tool", "write,shell(git commit),shell(git push)",
         ]
     );
 
@@ -8950,8 +9061,21 @@ fn copilot_trust_config_edit_preserves_content_and_dedupes() {
     assert!(updated.contains("firstLaunchAt"), "unknown fields must survive");
     assert!(updated.contains(r"C:\\Projects\\cattle-worker") || updated.contains("cattle-worker"));
     assert!(updated.contains("other"));
-    // Already trusted (case/separator variants): no rewrite at all.
-    assert!(add_trusted_folder(existing, r"c:/projects/cattle-worker").is_none());
+    // Already trusted: no rewrite at all.
+    assert!(add_trusted_folder(existing, r"C:\Projects\cattle-worker").is_none());
+    // A CASE/separator variant collapses only where the host filesystem is
+    // case-insensitive and treats `/` as a separator — Windows (#803 review
+    // B1). The fixture is a Windows-shaped path, so off Windows it is simply a
+    // different string and appending it is the correct answer, not a bug. The
+    // full platform matrix for this rule lives in
+    // `path_keys_follow_the_hosts_own_path_semantics`, which drives BOTH
+    // shapes on every CI platform rather than only the host's.
+    let case_variant = add_trusted_folder(existing, r"c:/projects/cattle-worker");
+    assert_eq!(
+        case_variant.is_none(),
+        cfg!(windows),
+        "a case/separator variant is the same folder on Windows and a different one elsewhere"
+    );
     // Empty/missing config: created from scratch.
     let fresh = add_trusted_folder("", r"C:\Projects\x").unwrap();
     assert!(fresh.contains("trustedFolders"));
@@ -8989,7 +9113,7 @@ fn pre_trust_copilot_folder_writes_fixture_and_leaves_real_home_untouched() {
     set_copilot_trust_home_for_test(Some(fixture.path().to_path_buf()));
 
     let (reg, _dir) = test_registry();
-    reg.pre_trust_copilot_folder(r"C:\Projects\some-agent-workspace");
+    reg.pre_trust_copilot_folder(r"C:\Projects\some-repo", r"C:\Projects\some-agent-workspace");
 
     set_copilot_trust_home_for_test(None);
 
@@ -9010,7 +9134,7 @@ fn pre_trust_copilot_folder_creates_config_when_home_is_missing() {
     set_copilot_trust_home_for_test(Some(home.clone()));
 
     let (reg, _dir) = test_registry();
-    reg.pre_trust_copilot_folder(r"C:\Projects\fresh-workspace");
+    reg.pre_trust_copilot_folder(r"C:\Projects\fresh-repo", r"C:\Projects\fresh-workspace");
 
     set_copilot_trust_home_for_test(None);
 
@@ -9027,12 +9151,302 @@ fn pre_trust_copilot_folder_never_clobbers_an_unparseable_config() {
     set_copilot_trust_home_for_test(Some(fixture.path().to_path_buf()));
 
     let (reg, _dir) = test_registry();
-    reg.pre_trust_copilot_folder(r"C:\Projects\x");
+    reg.pre_trust_copilot_folder(r"C:\Projects\x", r"C:\Projects\x");
 
     set_copilot_trust_home_for_test(None);
 
     let unchanged = fs::read_to_string(fixture.path().join("config.json")).unwrap();
     assert_eq!(unchanged, "// c\n{ not json", "an unparseable config must be left exactly alone, never clobbered");
+}
+
+/// #803 review B1: loomux ships macOS and Linux builds, not just Windows, and
+/// the location key it writes into copilot's `permissions-config.json` must be
+/// the one copilot will look up on THAT host.
+///
+/// The regression this pins is not hypothetical: an unconditional `'/' -> '\\'`
+/// rewrite turns `/home/u/repo` into `\home\u\repo`, a key copilot never
+/// matches while looking up `/home/u/repo` — a permission write that silently
+/// does nothing, which is the exact failure class #802 reports.
+///
+/// Both shapes are driven explicitly, so a Linux CI leg still tests the Windows
+/// rule and vice versa — a `#[cfg]`-split implementation would compile only its
+/// host's half and leave the other half unexercised everywhere.
+#[test]
+fn path_keys_follow_the_hosts_own_path_semantics() {
+    // ── Windows semantics: `/` and `\` are both separators, case folds.
+    assert_eq!(normalize_path_key_for(r"C:/Projects/demo/", true), r"C:\Projects\demo");
+    assert_eq!(normalize_path_key_for(r"C:\Projects\demo", true), r"C:\Projects\demo");
+    assert!(same_path_key_for(r"C:\Projects\Demo", "c:/projects/demo/", true));
+
+    // ── POSIX semantics: `/` only, case is significant.
+    assert_eq!(normalize_path_key_for("/home/u/repo/", false), "/home/u/repo");
+    assert_eq!(normalize_path_key_for("/home/u/repo", false), "/home/u/repo");
+    assert!(same_path_key_for("/home/u/repo", "/home/u/repo/", false));
+    assert!(
+        !same_path_key_for("/srv/App", "/srv/app", false),
+        "case-folding off Windows would merge two directories that genuinely differ on Linux"
+    );
+
+    // A POSIX path must survive normalization UNCHANGED — this is the blocker
+    // itself: `\home\u\repo` is a key copilot would never match.
+    assert_eq!(normalize_path_key_for("/home/u/repo", false), "/home/u/repo");
+    assert!(
+        !normalize_path_key_for("/home/u/repo", false).contains('\\'),
+        "a POSIX key must never grow a backslash"
+    );
+    // …and a backslash inside a POSIX path is a legal FILENAME character, so it
+    // is data, not a separator: rewriting or trimming it would corrupt the path.
+    assert_eq!(normalize_path_key_for(r"/home/u/we\ird", false), r"/home/u/we\ird");
+    assert_eq!(normalize_path_key_for(r"/home/u/trailing\", false), r"/home/u/trailing\");
+
+    // A bare root keeps its separator rather than normalizing to the empty key.
+    assert_eq!(normalize_path_key_for("/", false), "/");
+    assert_eq!(normalize_path_key_for(r"C:\", true), r"C:");
+
+    // …and the PRODUCTION path agrees with whichever half applies here. Driven
+    // through `copilot_permissions_grant` rather than the private host
+    // wrappers: what matters is not that a one-line wrapper delegates, it is
+    // that the key actually written to the file is one THIS host's copilot
+    // would look up.
+    let (loc, wt) = if cfg!(windows) {
+        (r"C:\Projects\demo", r"C:\Projects\demo-worktrees\w-1")
+    } else {
+        ("/home/u/demo", "/home/u/demo-worktrees/w-1")
+    };
+    let written = copilot_permissions_grant("", loc, wt, "loomux").unwrap();
+    let v: serde_json::Value = serde_json::from_str(&written).unwrap();
+    assert!(
+        !v["locations"][loc].is_null(),
+        "the location key must be this host's own path shape, verbatim: {written}"
+    );
+    if !cfg!(windows) {
+        assert!(
+            !written.contains(r"\home"),
+            "the #803 B1 regression: a POSIX key rewritten with backslashes is one copilot \
+             never matches, so the grant silently does nothing: {written}"
+        );
+    }
+}
+
+/// #803 review: a block that re-declares something loomux already grants must
+/// not make the one `--allow-tool` value say it twice — that value is now the
+/// single place a reader checks to see what an agent was granted.
+#[test]
+fn copilot_tool_permissions_do_not_repeat_a_pattern() {
+    // `loomux` and `shell(git:*)` are both already in the attended baseline.
+    let extra = vec!["loomux".to_string(), "shell(git:*)".to_string(), "shell(make:*)".to_string()];
+    let (allow, _) = copilot_tool_permissions(false, Containment::None, &extra);
+    assert_eq!(
+        allow,
+        ["loomux", "shell(git:*)", "shell(gh:*)", "shell(make:*)"],
+        "each pattern appears once, at its FIRST position: {allow:?}"
+    );
+}
+
+// ── #802: copilot's DOCUMENTED permission store ────────────────────────────
+//
+// `trustedFolders` in `config.json` is the pre-1.0.77 surface and appears in
+// none of copilot's current reference pages: `config.json` is now described as
+// automatically-managed application state whose user settings migrate to
+// `settings.json`, while directory and tool grants are documented to live in
+// `permissions-config.json`. These pin the grant loomux now writes there —
+// including the MCP approval, which is the durable form of `--allow-tool
+// loomux` and whose absence is exactly what #802 reported ("the CLI lists the
+// loomux MCP server as available, but the agent has no permission to use its
+// tools").
+
+#[test]
+fn copilot_permissions_grant_writes_the_documented_shape() {
+    const REPO: &str = r"C:\Projects\demo";
+    const WORKTREE: &str = r"C:\Projects\demo-worktrees\fix-1";
+
+    let fresh = copilot_permissions_grant("", REPO, WORKTREE, "loomux").unwrap();
+    let v: serde_json::Value = serde_json::from_str(&fresh).unwrap();
+    let entry = &v["locations"][REPO];
+    assert_eq!(
+        entry["allowed_directories"],
+        json!([WORKTREE]),
+        "the agent's own workspace must be added to the path gate: {fresh}"
+    );
+    assert_eq!(
+        entry["tool_approvals"],
+        json!([{ "kind": "mcp", "serverName": "loomux", "toolName": null }]),
+        "toolName: null is the documented 'every tool on the server' approval: {fresh}"
+    );
+
+    // Idempotent: re-granting the same pair rewrites nothing, so a suite (or a
+    // long-lived group) can't grow this file without bound the way the
+    // `trustedFolders` list once did.
+    assert!(
+        copilot_permissions_grant(&fresh, REPO, WORKTREE, "loomux").is_none(),
+        "an already-granted location must produce no write at all"
+    );
+
+    // A SECOND worktree under the same repo joins the existing location rather
+    // than creating a new one — that is the point of keying by git root.
+    let second =
+        copilot_permissions_grant(&fresh, REPO, r"C:\Projects\demo-worktrees\fix-2", "loomux")
+            .expect("a new workspace is a real change");
+    let v: serde_json::Value = serde_json::from_str(&second).unwrap();
+    assert_eq!(v["locations"].as_object().unwrap().len(), 1, "one repo, one location key: {second}");
+    assert_eq!(v["locations"][REPO]["allowed_directories"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        v["locations"][REPO]["tool_approvals"].as_array().unwrap().len(),
+        1,
+        "the MCP approval must not be appended twice: {second}"
+    );
+
+    // The user's own saved approvals — for other repos and for this one — are
+    // additive-only: this file is theirs, loomux only ever adds to it.
+    let existing = serde_json::to_string_pretty(&json!({
+        "locations": {
+            r"C:\Other\repo": { "tool_approvals": [{ "kind": "write" }] },
+            r"C:\Projects\demo": { "tool_approvals": [{ "kind": "commands", "commandIdentifiers": ["git:*"] }] },
+        }
+    }))
+    .unwrap();
+    let merged = copilot_permissions_grant(&existing, REPO, WORKTREE, "loomux").unwrap();
+    let v: serde_json::Value = serde_json::from_str(&merged).unwrap();
+    assert_eq!(v["locations"][r"C:\Other\repo"]["tool_approvals"], json!([{ "kind": "write" }]));
+    let approvals = v["locations"][REPO]["tool_approvals"].as_array().unwrap();
+    assert_eq!(approvals.len(), 2, "the user's own approval must survive: {merged}");
+    assert_eq!(approvals[0]["kind"], "commands");
+    assert_eq!(approvals[1]["serverName"], "loomux");
+
+    // An existing key naming the SAME directory is REUSED, never duplicated:
+    // copilot loads exactly one key ("If the key doesn't match, the saved
+    // approvals won't apply"), so a second spelling would strand the user's own
+    // approvals under whichever one copilot didn't pick.
+    //
+    // What counts as "the same directory" is the host's rule, not a universal
+    // one (#803 review B1): Windows folds case and separators, POSIX folds only
+    // a trailing separator. Each leg uses a variant that is genuinely the same
+    // directory ON THAT HOST, so the property under test is identical
+    // everywhere even though the spelling can't be.
+    let existing_key = if cfg!(windows) { "c:/projects/demo/" } else { r"C:\Projects\demo/" };
+    let mut locs = serde_json::Map::new();
+    locs.insert(existing_key.to_string(), json!({ "tool_approvals": [{ "kind": "write" }] }));
+    let seeded =
+        serde_json::to_string_pretty(&json!({ "locations": serde_json::Value::Object(locs) }))
+            .unwrap();
+    let variant = copilot_permissions_grant(&seeded, REPO, WORKTREE, "loomux").unwrap();
+    let v: serde_json::Value = serde_json::from_str(&variant).unwrap();
+    assert_eq!(
+        v["locations"].as_object().unwrap().len(),
+        1,
+        "a variant spelling of the same path is one location, not two: {variant}"
+    );
+    assert_eq!(v["locations"][existing_key]["tool_approvals"].as_array().unwrap().len(), 2);
+
+    // A pre-existing approval for ONE tool on the same server is a narrower
+    // grant and must NOT be mistaken for the server-wide one — otherwise a user
+    // who once approved `report` by hand would silently keep every other loomux
+    // tool ungranted, which is #802's symptom with extra steps.
+    let narrow = serde_json::to_string_pretty(&json!({
+        "locations": { r"C:\Projects\demo": { "tool_approvals": [
+            { "kind": "mcp", "serverName": "loomux", "toolName": "report" }
+        ] } }
+    }))
+    .unwrap();
+    let widened = copilot_permissions_grant(&narrow, REPO, WORKTREE, "loomux")
+        .expect("a per-tool approval does not satisfy the server-wide grant");
+    let v: serde_json::Value = serde_json::from_str(&widened).unwrap();
+    let approvals = v["locations"][REPO]["tool_approvals"].as_array().unwrap();
+    assert_eq!(approvals.len(), 2, "{widened}");
+    assert!(approvals.iter().any(|a| a["toolName"].is_null()), "{widened}");
+
+    // Corrupt file: never clobbered, same policy as `add_trusted_folder`.
+    assert!(copilot_permissions_grant("{ not json", REPO, WORKTREE, "loomux").is_none());
+}
+
+#[test]
+fn pre_trust_writes_both_permission_surfaces_and_keys_the_grant_by_repo() {
+    let fixture = tempfile::tempdir().unwrap();
+    set_copilot_trust_home_for_test(Some(fixture.path().to_path_buf()));
+
+    let (reg, _dir) = test_registry();
+    reg.pre_trust_copilot_folder(r"C:\Projects\demo", r"C:\Projects\demo-worktrees\w-1");
+
+    set_copilot_trust_home_for_test(None);
+
+    let perms = fs::read_to_string(fixture.path().join("permissions-config.json"))
+        .expect("the documented permission store must be written");
+    let v: serde_json::Value = serde_json::from_str(&perms).unwrap();
+    // Keyed by the REPO, not the worktree: copilot resolves a linked worktree
+    // back to the main repository root for permission scoping, so a grant filed
+    // under the worktree would never be found.
+    let entry = &v["locations"][r"C:\Projects\demo"];
+    assert!(!entry.is_null(), "the grant must be keyed by the repo's git root: {perms}");
+    assert_eq!(entry["allowed_directories"], json!([r"C:\Projects\demo-worktrees\w-1"]));
+    assert_eq!(entry["tool_approvals"][0]["serverName"], "loomux");
+    assert!(entry["tool_approvals"][0]["toolName"].is_null());
+
+    // The legacy surface is still written — the docs' silence about
+    // `trustedFolders` is an absence, not a documented removal, and loomux
+    // cannot see which copilot build a machine runs.
+    let legacy = fs::read_to_string(fixture.path().join("config.json")).unwrap();
+    assert!(legacy.contains("trustedFolders") && legacy.contains("w-1"), "{legacy}");
+}
+
+#[test]
+fn pre_trust_edits_the_legacy_extensionless_permissions_file_when_that_is_the_live_one() {
+    // "Older builds used an extensionless file named `permissions-config`. If
+    // `permissions-config.json` doesn't exist but the extensionless file does,
+    // the CLI still honors the legacy file." Creating the `.json` beside it
+    // would make copilot stop honoring the legacy one — silently discarding
+    // every approval the user had saved.
+    let fixture = tempfile::tempdir().unwrap();
+    fs::write(
+        fixture.path().join("permissions-config"),
+        serde_json::to_string_pretty(&json!({
+            "locations": { r"C:\Projects\demo": { "tool_approvals": [{ "kind": "write" }] } }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    set_copilot_trust_home_for_test(Some(fixture.path().to_path_buf()));
+
+    let (reg, _dir) = test_registry();
+    reg.pre_trust_copilot_folder(r"C:\Projects\demo", r"C:\Projects\demo");
+
+    set_copilot_trust_home_for_test(None);
+
+    assert!(
+        !fixture.path().join("permissions-config.json").exists(),
+        "writing the .json name would orphan the user's live legacy file"
+    );
+    let text = fs::read_to_string(fixture.path().join("permissions-config")).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let approvals = v["locations"][r"C:\Projects\demo"]["tool_approvals"].as_array().unwrap();
+    assert_eq!(approvals.len(), 2, "the user's own approval must survive the grant: {text}");
+    assert_eq!(approvals[1]["serverName"], "loomux");
+}
+
+/// The pure posture function both copilot command builders share — pinned here
+/// so a regression in the ORDER or CONTENT of the lists is caught without
+/// having to read it back out of a formatted command line.
+#[test]
+fn copilot_tool_permissions_lead_with_the_mcp_grant() {
+    let extra = vec!["shell(make:*)".to_string()];
+
+    let (allow, deny) = copilot_tool_permissions(true, Containment::None, &extra);
+    assert_eq!(allow, ["loomux", "shell(make:*)"]);
+    assert!(deny.is_empty());
+
+    let (allow, deny) = copilot_tool_permissions(false, Containment::None, &extra);
+    assert_eq!(allow, ["loomux", "shell(git:*)", "shell(gh:*)", "shell(make:*)"]);
+    assert!(deny.is_empty());
+
+    // A reviewer (NoEdits) denies writes and nothing git-related — its shell IS
+    // its job (#462).
+    let (allow, deny) = copilot_tool_permissions(true, Containment::NoEdits, &[]);
+    assert_eq!(allow, ["loomux"]);
+    assert_eq!(deny, ["write"]);
+
+    // A planner (ReadOnly) is the ladder's top rung: the reviewer's denials
+    // PLUS the git-mutation pair, never instead of them.
+    let (_, deny) = copilot_tool_permissions(true, Containment::ReadOnly, &[]);
+    assert_eq!(deny, ["write", "shell(git commit)", "shell(git push)"]);
 }
 
 // ---------- per-task sessions & resume ----------
@@ -29080,6 +29494,20 @@ fn a_throwaway_registry_never_writes_the_users_real_copilot_trusted_folders() {
     assert!(
         text.contains("trustedFolders") && text.contains("C:/tmp/copilot-repo"),
         "and it must be the real pre-trust write, not an empty file: {text}",
+    );
+
+    // #802 added a SECOND, documented permission surface to the same write —
+    // it must be contained by the same rule, or the containment audit this
+    // test exists for would have a fresh hole the day it shipped.
+    let perms = dir.path().join("copilot-home").join("permissions-config.json");
+    assert!(
+        perms.is_file(),
+        "the permissions-config write must land inside this registry's own root too: {perms:?}",
+    );
+    let perms_text = fs::read_to_string(&perms).unwrap();
+    assert!(
+        perms_text.contains("C:/tmp/copilot-repo") && perms_text.contains("loomux"),
+        "and carry the real grant, not an empty file: {perms_text}",
     );
 }
 

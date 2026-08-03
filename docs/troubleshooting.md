@@ -85,6 +85,26 @@ installed. Make sure the CLI is on your `PATH` (open a fresh terminal and run
 An agent pane that dies with an error **stays open** so you can read what
 happened — it isn't closed out from under you.
 
+## A Copilot agent can't use its loomux tools
+
+If a Copilot pane lists the `loomux` MCP server but the agent says it has no
+permission to use its tools, check `~/.copilot/permissions-config.json` (or
+`%USERPROFILE%\.copilot\permissions-config.json`). loomux records two grants
+there when it spawns a Copilot pane, keyed by the repository's git root:
+
+- your agent's workspace under `allowed_directories`, and
+- `{ "kind": "mcp", "serverName": "loomux", "toolName": null }` under
+  `tool_approvals`, which approves every loomux tool for that repository.
+
+If the file is missing or the entry isn't there, loomux couldn't write it —
+usually because `~/.copilot` isn't writable, or because `COPILOT_HOME` points
+somewhere loomux can't reach. Copilot will then prompt in-pane for each tool
+instead, which an unattended agent has no one to answer.
+
+Note that a Copilot Business or Enterprise administrator can block
+allow-all-permissions options outright; loomux can't override that policy, and
+the targeted grants above are what keep such a pane usable at all.
+
 ## macOS: "app is damaged and can't be opened"
 
 Builds are **unsigned** for now, so macOS quarantines them. Clear the attribute:
