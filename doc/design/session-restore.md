@@ -1304,3 +1304,88 @@ the `ambiguous`/`group-mismatch` copy landing on the right card's error state,
 and per-group card clearing in a live grid. Exercising those needs a real
 window and real agent CLIs (hard constraint 3), so they are left to the
 human's own validation rather than approximated with a simulated DOM.
+
+### #781 — the Sessions tab routed orchestration restores by CLI, not by membership
+
+**Symptom (human report, beta8, work PC on copilot 1.0.77).** Manually
+restoring an orchestrator session from the Sessions tab "only restores the
+session itself, not the entire orchestration setup" — the resumed agent hit
+permission prompts, including MCP, and looked like it was running with autopilot
+alone.
+
+**Root cause.** `restoreSession` (`main.ts`) chose its route with
+`s.source === "claude" ? sessions.roleFor(s) : undefined`. Written when copilot
+session ids were not tracked at all, that gate was correct then and was never
+re-derived when `spawn_copilot_session_watcher` began recording them — for
+delegates *and* for the orchestrator ("Track the copilot session this
+orchestrator just minted"). So a copilot session with a perfectly good roster
+row could never take the group-rejoin branch. It restored through
+`build_resume_command` instead: `copilot --resume=<id>` plus, at most, the
+recorded autopilot posture. No `--additional-mcp-config`, no `--add-dir` for the
+group dir or the workdir, no `--model`, no persona, no containment denies, no
+group binding.
+
+The session browser meanwhile rendered that row's `ORCH` chip and its "click to
+restore the whole orchestration" tooltip, and `docs/orchestration.md` promised
+the same. The UI's claim and the code disagreed, and the UI was right.
+
+**Why it read as "autopilot only" rather than "broken".** Per copilot's
+changelog (1.0.76, 2026-07-29), *"Resuming a session now restores its autopilot
+or plan mode instead of reverting to interactive"*. A bare `copilot --resume`
+therefore comes back **in autopilot mode** on any current copilot, so the pane
+presents as a healthy unattended agent while carrying none of the group's
+wiring — the flags the human went looking for were genuinely absent, but the
+mode they expected them to produce was there anyway.
+
+**Fix.** The route is a pure module, `sessionroute.ts`, and its rule is recorded
+membership alone: a session rejoins its group iff loomux has a record that it
+belonged to one, whatever CLI wrote it. `main.ts` executes the returned route
+and no longer computes one. The rule is unit-tested
+(`test/sessionroute.test.ts`) across both CLIs, which is the regression pin —
+the failure mode here was not a wrong rule but a *stale* one, and the cheapest
+guard against a second staleness is a test that names the CLI-independence
+explicitly.
+
+**Two claims from #458's section above are now out of date, and are corrected
+here rather than edited into that dated record.** First, its residual —
+`agentResumeCommand` re-emitting the space form on a *second* restore — was
+closed by the restore-path work it was tracked under: `panerestore.ts` branches
+on `programFromRestore(...) === "copilot"` and emits `--resume=<id>` for both
+the string and argv forms, with `test/panerestore.test.ts` pinning it and the
+function's own doc naming the oscillation hazard (two fixes undoing each other
+forever) as the reason. Second, that section labelled the space form's actual
+mis-parse **UNVERIFIED**, which is still the right label and is the one this
+change keeps: see the builder comment for what the reference does and does not
+say. `--session-id` deliberately stays space-form on both paths, because the
+reference documents *that* flag in the space form specifically.
+
+**What is deliberately NOT changed.** `build_resume_command` stays exactly as
+it is. It is the right command for a session with no recorded membership, which
+is what such a session honestly is; the bug was never that it built a poor
+command, but that sessions which had a better one available were routed to it.
+
+**Residual, stated rather than assumed.** A copilot orchestration session whose
+id the watcher never captured (it times out — `copilot-session-untracked`) has
+no roster row, so it shows no chip and restores plain. Claude has a second
+route for exactly that case, a loomux-signature scan of its own transcript
+(`scan_claude_jsonl` → `detect_orch_signature`); copilot has no equivalent
+because it stores no transcript beside the session. `session-state/<id>/` holds
+`workspace.yaml`, `checkpoints/`, `files/` and `research/` — the conversation
+itself lives in `~/.copilot/session-store.db`, a SQLite file loomux will not
+take a dependency on to read. So that class of session is unrecoverable *into a
+group* on copilot today, and the row does not pretend otherwise: no chip, no
+promise, a plain pane.
+
+**Flag-spelling re-verification (secondary, #781's original hypothesis).**
+`--allow-all-tools` and `--allow-all-paths` were re-checked against copilot
+1.0.77's reference and have not been renamed or deprecated; the citations now
+sit on `COPILOT_UNATTENDED_FLAGS`. One documented limit is recorded there too,
+because a work machine is where it bites: the *Permissive options* section
+states that on a Copilot Business or Enterprise license "these commands may be
+blocked by an enterprise administrator". An org that blocks bypass-permissions
+mode neuters both flags while leaving `--autopilot` (not a permissive option)
+working — a posture indistinguishable from this bug from the outside, which is
+why the flag path was worth clearing before concluding it was innocent. loomux
+cannot flag its way past a policy; the targeted grants it already emits
+(`--allow-tool loomux`, `--add-dir`) are not permissive options and are what
+keeps such a pane usable at all.

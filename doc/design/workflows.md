@@ -1479,6 +1479,30 @@ own workflow file raise a finding in the pane would have merged green (rev-14 F2
 now runs `npm test` on all three platforms, which is also what makes every other pure-module
 test in `test/` a gate rather than a convention.
 
+### An undeliverable knob's refusal is an authoring rail (#782)
+
+The `effort:`/`context:` caps check has two audiences and only one of them has a UI. A human
+picking a knob in the launcher gets it greyed out with the vendor reason attached, from
+`agent_cli_knobs` — same `CLI_CAPS` rows the parser consults, so the two cannot disagree. An
+**agent** authoring the file has no such surface: the parse error is the entire rail, and a
+verdict ("cli \"copilot\" cannot set effort") leaves it choosing between deleting the key and
+rewriting the block's `cli:` by guesswork. It reported the resulting YAML errors as a loomux
+bug, which is the right read — a refusal that doesn't say what to do instead is an
+unfinished refusal.
+
+So `validate_knob` names the block, the knob, the exact value, the vendor reason, and both
+escapes. The escape list is *derived*: it asks every `CLI_CAPS` row loomux can spawn whether
+it carries that value. No CLI is named in `workflow.rs`, wiring a knob on another CLI updates
+the message with no edit, and — per CLAUDE.md constraint 8 — the product code stays free of
+per-vendor special-casing. The skill (`.claude/skills/author-loomux-workflow`) carries the
+matrix as a snapshot and says plainly that `CLI_CAPS` wins when the two disagree.
+
+The loudness is only affordable because a refused file cannot wedge anything: `load_workflow`
+returns the errors, the launcher preview reports `valid: false` with them attached, and a
+launch falls back to the built-in roster. That property is now pinned by its own test rather
+than left as a comment — if a broken file could block a spawn, this check would have to be
+silent, which is the failure mode #687 existed to remove.
+
 ## Intake as data: the `intake:` block (#382 P1)
 
 `.loomux/workflow.yml` gained a second top-level block, `intake:`, the missing

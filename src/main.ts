@@ -92,6 +92,7 @@ import {
   type ReconcilePane,
   type SessionRecord,
 } from "./sessionreconcile";
+import { sessionRestoreRoute } from "./sessionroute";
 import { planGroupResume, partitionByGroup } from "./groupresume";
 import {
   IDLE_RESTORE_CARD_STATE,
@@ -1824,18 +1825,22 @@ setInterval(() => void reconcileSessionIds(), 20_000);
 async function restoreSession(s: SessionInfo): Promise<void> {
   // Recorded orchestration sessions restore into their group — MCP identity,
   // badges, and task board included — instead of a powerless plain `--resume`.
-  const orchRole = s.source === "claude" ? sessions.roleFor(s) : undefined;
-  if (orchRole) {
+  // The route is decided by RECORDED MEMBERSHIP alone (`sessionroute.ts`, #781):
+  // this used to gate on `s.source === "claude"`, which silently demoted every
+  // copilot orchestration session to a bare `--resume` the chip beside it
+  // promised it would not be.
+  const route = sessionRestoreRoute(s, sessions.roleFor(s));
+  if (route.kind === "orchestration") {
     // Route a restored group into the tab that OWNS it, if one exists — a
     // persisted tab (its shell restored on boot) whose group binding survived,
     // or a tab already hosting that group this session. This is the real
     // persistence↔restore integration (#63): the group re-inhabits its own tab
     // through the resume machinery, not whatever tab happens to be active. Only
     // when no tab owns the group does it land in the active tab.
-    const owning = tabs.workspaceForGroup(orchRole.group_id);
+    const owning = tabs.workspaceForGroup(route.groupId);
     const ws = owning ?? tabs.activeWorkspace;
     if (owning && owning.id !== tabs.activeTabId) tabs.switchTo(owning.id);
-    const hint = { group: orchRole.group_id, role: orchRole.role };
+    const hint = { group: route.groupId, role: route.role };
     // #412: the resume/rejoin machinery never opens a pane speculatively — a
     // failure throws BEFORE anything is spawned (see `resolve_worker_resume_cwd`
     // in the backend), so there is never a degraded plain pane to clean up
@@ -1867,7 +1872,7 @@ async function restoreSession(s: SessionInfo): Promise<void> {
       // create_orchestration_group's Launch::Resume contract), a worker/
       // reviewer's start-fresh reuses its recorded task in a NEW worktree.
       const whatItDoes =
-        orchRole.role === "orchestrator"
+        route.role === "orchestrator"
           ? "Start a fresh orchestrator session instead? It reattaches to this group's existing board and roster."
           : "Start a fresh session instead, with the same task, in a new worktree?";
       const startFresh = await confirmModal(
@@ -1888,11 +1893,11 @@ async function restoreSession(s: SessionInfo): Promise<void> {
     }
     return;
   }
-  // Plain (non-orchestration) sessions restore into the active tab.
+  // Plain (non-orchestration) sessions restore into the active tab. A row with
+  // no recorded membership genuinely IS a plain session — it carries no chip
+  // claiming otherwise — so this is the honest route, not a degraded one.
   const ws = tabs.activeWorkspace;
-  const name =
-    (s.source === "claude" ? "claude · " : "copilot · ") +
-    (s.title.length > 34 ? s.title.slice(0, 34) + "…" : s.title);
+  const name = route.paneName;
   const pane = await ws.grid.openPane(
     // #440 D1c: pass the id we're already holding. Without this, a session
     // restored by hand from the Sessions sidebar came back DORMANT on the

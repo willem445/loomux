@@ -4003,6 +4003,28 @@ pub(crate) fn default_model(cli: &str, role: Role) -> &'static str {
 /// `--autopilot` to build [`COPILOT_GROUP_AUTOPILOT_FLAGS`] — kept as its own
 /// constant purely so the two flag strings are built from one shared atom
 /// instead of two independently-typed literals that could drift apart.
+///
+/// **Spellings re-verified against copilot 1.0.77's reference (#781, checked
+/// 2026-08-03), with no drift.** The
+/// [allow/deny reference](https://docs.github.com/en/copilot/how-tos/copilot-cli/use-copilot-cli/allowing-tools)
+/// still lists `--allow-all-tools` ("Full access to the available tools") under
+/// *Permissive options*, and the
+/// [programmatic reference](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-programmatic-reference)
+/// still lists `--allow-all-paths` ("Disable file-path verification entirely").
+/// Neither page marks either flag deprecated or renamed, so both atoms stay
+/// exactly as spelled.
+///
+/// **One documented limit loomux cannot flag its way past**, recorded here
+/// because a work machine is where it bites: the same *Permissive options*
+/// section states, verbatim, "If you have a Copilot Business or Copilot
+/// Enterprise license, these commands may be blocked by an enterprise
+/// administrator." An org that blocks bypass-permissions mode neuters these two
+/// atoms while leaving `--autopilot` (not a permissive option) working, so the
+/// pane runs unattended and prompts anyway. The targeted grants loomux emits
+/// alongside them — `--allow-tool loomux` in the base command, `--add-dir` for
+/// the group dir and workdir — are NOT permissive options and are what keeps
+/// such a pane usable at all. Nothing here can override the policy, and loomux
+/// must not pretend to.
 pub const COPILOT_UNATTENDED_FLAGS: &str = "--allow-all-tools --allow-all-paths";
 
 /// Copilot's unattended-autopilot flags: [`COPILOT_UNATTENDED_FLAGS`] plus
@@ -31201,10 +31223,47 @@ impl OrchRegistry {
         let unattended = auto_ops || containment.forces_unattended();
         match cli {
             "copilot" => {
-                // Copilot has `--resume <id>` but no way to pre-assign an
-                // id, so sessions aren't tracked for it (yet).
+                // Copilot has `--resume` but no way to pre-assign an id, so an
+                // id is discovered after boot (`spawn_copilot_session_watcher`)
+                // rather than minted here the way claude's is.
+                //
+                // **The `=` is required, not cosmetic (#458, re-verified for
+                // #781).** Per the CLI command reference (raw-fetched via
+                // `curl -sL "https://docs.github.com/api/article/body?pathname=\
+                // /en/copilot/reference/copilot-cli-reference/cli-command-reference"`,
+                // per the `agent-cli-reference` skill's no-WebFetch rule, checked
+                // 2026-08-03) the flag is optional-value — `-r`, `--resume[=VALUE]`
+                // — and the page now says outright: "Bare `--resume` (no value)
+                // shows an interactive session picker, which requires a TTY. If
+                // multiple sessions exist and the picker can't be shown … the CLI
+                // exits with an error instead of silently starting a new session —
+                // pass an explicit `--resume=SESSION-ID` or use `--continue`."
+                //
+                // **What is documented, and what is not.** Documented: the
+                // `[=VALUE]` notation, and the instruction to pass
+                // `--resume=SESSION-ID` explicitly. NOT documented: whether the
+                // space form actually mis-parses — the same page writes
+                // `--resume <TASK-ID>` in prose (describing resuming a remote
+                // task, not demonstrating the parse), so the two readings are not
+                // settled by the docs, and CLAUDE.md constraint 3 rules out
+                // spawning a real copilot to settle it. So this is "use the form
+                // the reference tells you to use", not "fixed a confirmed
+                // mis-parse" — the failure it would avoid (a TTY picker, or an
+                // outright exit, in a pane loomux is about to type a kickoff
+                // into) is severe enough that the free option wins without
+                // needing the stronger claim.
+                // #458 fixed this on the Sessions-tab command (`scan_copilot`) and
+                // left the spawn path alone because nothing routed a copilot
+                // orchestration session here; #781 does, so it moves too.
+                //
+                // NOT `--session-id <id>`, which is also documented and exact:
+                // it "creates a new session when the value is a valid UUID" and
+                // nothing matches — and copilot's ids ARE UUIDs, so a stale id
+                // would silently open a blank session wearing the right name.
+                // `--resume=` fails loudly on a missing id instead, which is the
+                // behavior a rejoin wants.
                 let resume_flag = match (session, resume) {
-                    (Some(s), true) => format!("--resume {s} "),
+                    (Some(s), true) => format!("--resume={s} "),
                     _ => String::new(),
                 };
                 // NOTE: the @ (copilot's file-path marker) must sit INSIDE
@@ -31558,8 +31617,19 @@ impl OrchRegistry {
             "copilot" => {
                 push(&mut a, "copilot");
                 if let (Some(s), true) = (session, resume) {
-                    push(&mut a, "--resume");
-                    push(&mut a, s);
+                    // ONE argv element, `=`-joined — the form the reference
+                    // tells you to pass (see the string builder's comment).
+                    //
+                    // Kept in step with the string form rather than argued
+                    // separately, because what an optional-value flag does with
+                    // a SEPARATE argv element is exactly what the docs do not
+                    // say. The reasoning that it would be read as a positional
+                    // is an inference from the `[=VALUE]` notation, and the same
+                    // page writes `--resume <TASK-ID>` in prose elsewhere, so
+                    // the inference is not even unopposed. Following the
+                    // documented instruction costs nothing and needs no theory
+                    // of the parser; the theory is what would need proving.
+                    a.push(format!("--resume={s}"));
                 }
                 push(&mut a, "--additional-mcp-config");
                 // The @ marker rides on the path as a single argv element (no

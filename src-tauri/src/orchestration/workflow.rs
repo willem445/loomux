@@ -908,6 +908,15 @@ pub fn role_hint_names() -> String {
 /// deferral `cli_can_host` makes for the containment check) — `clamped()`
 /// re-runs the CLI half at spawn, where the real CLI is in hand.
 ///
+/// **The refusal also says what to do instead (#782).** An agent authoring a
+/// `.loomux/workflow.yml` has no launcher to grey the knob out for it, so the
+/// only rail it gets is this sentence — and "copilot cannot set effort" alone
+/// leaves it guessing between deleting the key and changing the block's CLI.
+/// The remedy is derived from [`CLI_CAPS`](super::CLI_CAPS) by asking every
+/// row loomux can actually spawn whether it carries THIS value, so a newly
+/// wired seam (gemini's `thinkingConfig`, say) changes the message with no
+/// edit here and no CLI named in this file — CLAUDE.md constraint 8.
+///
 /// Returns the normalized (trimmed, lowercased) value; empty for an absent key.
 /// One function for both keys so the two can never drift on case handling or on
 /// which check fires first.
@@ -917,6 +926,7 @@ fn validate_knob(
     vocabulary: &[&str],
     cli: &str,
     cli_supports: Option<(&[&str], &str)>,
+    knob_of: fn(&super::CliCaps) -> &'static [&'static str],
 ) -> Result<String, String> {
     let want = raw.trim().to_ascii_lowercase();
     if want.is_empty() {
@@ -930,7 +940,24 @@ fn validate_knob(
     }
     if let Some((supported, note)) = cli_supports {
         if !supported.contains(&want.as_str()) {
-            return Err(format!("cli {cli:?} cannot set {field}: — {note}"));
+            let alternatives: Vec<&str> = super::CLI_CAPS
+                .iter()
+                .filter(|c| c.orchestration && knob_of(c).contains(&want.as_str()))
+                .map(|c| c.cli)
+                .collect();
+            let remedy = if alternatives.is_empty() {
+                format!(
+                    "no cli loomux spawns can set {field} {want:?} today — drop the key and take \
+                     the CLI's own default"
+                )
+            } else {
+                format!(
+                    "drop the key (the CLI's own default applies), or give this block a cli: that \
+                     can set it — {}",
+                    alternatives.join(", ")
+                )
+            };
+            return Err(format!("cli {cli:?} cannot set {field} {want:?} — {note}. Fix: {remedy}"));
         }
     }
     Ok(want)
@@ -1180,6 +1207,7 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
             super::EFFORT_LEVELS,
             &cli,
             caps.map(|c| (c.effort_levels, c.effort_note)),
+            |c| c.effort_levels,
         ) {
             Ok(v) => v,
             Err(e) => {
@@ -1193,6 +1221,7 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
             super::CONTEXT_VARIANTS,
             &cli,
             caps.map(|c| (c.context_variants, c.context_note)),
+            |c| c.context_variants,
         ) {
             Ok(v) => v,
             Err(e) => {
