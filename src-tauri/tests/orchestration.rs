@@ -1022,7 +1022,18 @@ fn guardrail_clamps_and_sanitizes() {
     assert_eq!(g.max_spawns_per_hour, 240, "spawn-rate cap clamps to the ceiling");
     assert_eq!(g.watchdog_stall_minutes, 1440, "watchdog stall timeout clamps to 24h");
     assert_eq!(g.agent_cli, "claude", "unknown group CLIs fall back to claude explicitly");
-    assert_eq!(g.model_for(Role::Worker), "sonnetrm-rf", "shell metacharacters must be stripped");
+    // #722 widened `sanitize_model` to admit `/` (opencode ids are
+    // `provider_id/model_id`), so the fixture's trailing slash now survives
+    // where it used to be dropped incidentally. The property this line exists
+    // for is unchanged and is asserted below rather than left to the literal:
+    // `/` is not a shell metacharacter — it is glob-inert in a POSIX shell and
+    // not an operator in PowerShell — so what a crafted model could actually
+    // smuggle (the `;` and the spaces) is still gone.
+    let worker = g.model_for(Role::Worker);
+    assert_eq!(worker, "sonnetrm-rf/", "shell metacharacters must be stripped");
+    for bad in [' ', ';', '&', '|', '$', '`', '(', ')', '[', ']', '*', '?', '"', '\''] {
+        assert!(!worker.contains(bad), "{bad:?} must never survive into a model id: {worker:?}");
+    }
     assert_eq!(g.model_for(Role::Reviewer), "sonnet", "empty model falls back to default");
     // Reasoning classes (orchestrator, planner) default to the strong tier on Claude.
     assert_eq!(g.model_for(Role::Planner), "opus", "empty planner model falls back to the reasoning tier");
