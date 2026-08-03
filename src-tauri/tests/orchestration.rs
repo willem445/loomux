@@ -38508,3 +38508,124 @@ fn a_kill_snapshot_invalidates_the_polled_usage_memo() {
          was still live"
     );
 }
+
+
+// ---------------------------------------------------------------------------
+// #762 (F2 of #743) — concurrency pins for the two behaviour changes the
+// dispatch conversion required. Both exist because moving these command bodies
+// off the webview thread removed an ACCIDENTAL mutual exclusion: one thread ran
+// every command, so no two could interleave. These pin what replaced it.
+// ---------------------------------------------------------------------------
+
+/// `solo_adopt`'s idempotence-by-pty must survive two callers at once, not just
+/// two in sequence (the sibling test above covers sequence).
+///
+/// Its check-then-insert — read `by_pty`, mint an id, insert — is two lock
+/// acquisitions with a mint between them, and until #762 the webview thread was
+/// the only thing that stopped a second Connect gesture landing inside that
+/// window. The failure it would produce is the silent kind: TWO delivery-only
+/// identities for one pane, with both calls returning an id that looks fine.
+///
+/// The fix is a vacant-entry claim on `by_pty`, so the assertion is exact
+/// rather than statistical: however the two threads interleave, the registry
+/// must hold exactly one Solo agent for this pty and both callers must be told
+/// the same id.
+#[test]
+fn concurrent_solo_adopts_of_one_pty_mint_exactly_one_identity() {
+    let (reg, _d) = test_registry();
+    let reg = std::sync::Arc::new(reg);
+    // Several ptys, each adopted twice at once: one round would pass by luck
+    // roughly as often as the race loses.
+    for pty in 2000u32..2040 {
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let reg = std::sync::Arc::clone(&reg);
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait(); // start both inside the window, not one after the other
+                    reg.solo_adopt(pty, "already running", "C:/tmp/x").unwrap()
+                })
+            })
+            .collect();
+        let ids: Vec<String> = handles
+            .into_iter()
+            .map(|h| h.join().unwrap()["agent_id"].as_str().unwrap().to_string())
+            .collect();
+
+        assert_eq!(
+            ids[0], ids[1],
+            "pty {pty}: two concurrent adopts returned different agent ids, so one pane now has \
+             two identities — the check-then-insert lost its race (#762)"
+        );
+    }
+
+    // One `solo-adopt` audit line per pty, and no more. The loser of the claim
+    // returns before it audits, so this counts WINNERS — the direct observable
+    // for "exactly one identity was minted per pane".
+    let adopted = audit_count(&reg, SOLO_GROUP, "solo-adopt");
+    assert_eq!(
+        adopted, 40,
+        "expected one adoption per pty across 40 ptys, got {adopted} — a second identity for one \
+         pane is exactly what the check-then-insert used to allow (#762)"
+    );
+}
+
+/// A consent marker and the in-memory set it mirrors must still agree once two
+/// concurrent toggles have finished — the invariant #762 rev-260 B1 found
+/// broken.
+///
+/// The marker file is load-time truth: `create_group`'s re-seed rebuilds the
+/// gate from DISK. So "memory OFF, marker on disk" is not a cosmetic
+/// disagreement — it restores merge authority the human explicitly withdrew, at
+/// the next restart, audited as a benign `auto-merge-resumed`.
+///
+/// Reaching it takes no exotic timing: `set_auto_merge` released the set lock
+/// between its reserve and its marker write, so a disable running inside that
+/// window removed a marker that did not exist yet (`remove_marker` maps
+/// NotFound to Ok), cleared the set, and let the enable recreate the file
+/// behind it. The group panel does not disable the control while a call is in
+/// flight, so a double-click emits exactly this enable/disable pair.
+///
+/// Asserted at quiescence, after both threads join, so the check is
+/// deterministic even though which side wins is not: `marker_io` now spans
+/// check-reserve-write, and agreement is guaranteed however the two order
+/// themselves.
+#[test]
+fn concurrent_consent_toggles_leave_the_marker_and_memory_agreeing() {
+    let (reg, _d, gid, _oid) = autonomous_setup();
+    let marker = reg.state_root().join(&gid).join("auto_merge");
+    let reg = std::sync::Arc::new(reg);
+
+    for round in 0..200 {
+        // Known state each round: gate off, no marker.
+        reg.set_auto_merge(&gid, false).unwrap();
+        assert!(!marker.is_file(), "round {round}: reset left a marker behind");
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = [true, false]
+            .into_iter()
+            .map(|on| {
+                let reg = std::sync::Arc::clone(&reg);
+                let gid = gid.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let _ = reg.set_auto_merge(&gid, on);
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let in_memory = reg.is_auto_merge(&gid);
+        let on_disk = marker.is_file();
+        assert_eq!(
+            in_memory, on_disk,
+            "round {round}: auto-merge is {in_memory} in memory but {on_disk} on disk. The \
+             re-seed at the next restart reads DISK, so a false-on-disk here hands back merge \
+             authority the human turned off (#762 rev-260 B1)"
+        );
+    }
+}
