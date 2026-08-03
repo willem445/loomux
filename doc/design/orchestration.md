@@ -2541,8 +2541,9 @@ check-state transitions.
   nonzero and due (`intake::due_intake_polls`, the `notify::due_watches` per-group-interval
   idiom, plus that idiom's per-tick cap and oldest-polled-first ordering — see "Bounding one
   tick") — shells out
-  to `gh issue list --json number,title,labels` and `gh pr list --json
-  number,title,statusCheckRollup` (via the existing `gh_capture` helper `poll_watches` already
+  to `gh issue list --limit N --json number,title,labels` and `gh pr list --limit N --json
+  number,title,statusCheckRollup` (argv built by `intake::issue_list_argv`/`intake::pr_list_argv`
+  — see "A bounded listing is only half the fix" below; via the existing `gh_capture` helper `poll_watches` already
   uses; no new subprocess plumbing) and diffs the result against that group's last-seen state
   (`OrchRegistry.intake_seen`, in-memory only — the `watches`/`idle_tick_times` lifetime class).
   Two calls per due group regardless of how many issues/PRs exist — the API-budget discipline
@@ -2562,6 +2563,32 @@ check-state transitions.
   `notify::sanitize_gh_text` exactly like every other GitHub-derived field reaching a `[loomux]`
   notice (issue titles are third-party text — the #189 threat model applies here too), capped at
   `MAX_SIGNALS_IN_SUMMARY` with a stated "+N more" rather than growing unboundedly.
+- **A bounded listing is only half the fix (#785 for issues, #795 for PRs).** Both `gh`
+  subcommands default to **30, newest first**, so both halves of the sweep were silently reading
+  a window rather than a repo. Adding `--limit` alone would not have been enough, because two of
+  the three diffs infer *absence means gone* — `eligible_deltas` ("no longer eligible") and
+  `pr_check_deltas` ("merged or closed"). Under any bound the window **churns**: filing an issue
+  or opening a PR evicts the oldest in the window, and closing something above it lets that item
+  back in, where a forgotten entry re-announces itself. For `pr_check_deltas` that reads as a
+  "checks SUCCESS" wake for a PR that has been green for days. So each listing carries its own
+  completeness (`OpenIssueList`/`OpenPrList`, `from_fetch`: *fewer than the bound came back ⇒ we
+  saw the whole list*; *exactly the bound ⇒ assume there are more*, since `gh` reports no total),
+  an entry is dropped only on **evidence** — present-and-changed, or absent from a **complete**
+  listing — and hitting a bound is stated in the wake summary as a `PARTIAL:` caveat rather than
+  applied silently. `label_deltas` never needed any of this: it only touches items present in the
+  response and never removes an absent one's entry, so a churning window is invisible to it.
+  Two consequences are accepted rather than fixed: an item that closes **while beyond the bound**
+  keeps its entry, so a later reopen reads as unchanged and produces no wake (reopen-is-news
+  survives only inside the window); and `last_seen` grows while listings stay truncated, at one
+  small entry per number ever seen, which a single complete listing prunes at once. Both are the
+  cheap side of the trade — a missed wake for a rare out-of-window reopen against a spurious one
+  on every churn — and are why the bounds (`MAX_INTAKE_ISSUES` 300, `MAX_INTAKE_PRS` 200) are
+  sized to make truncation rare rather than routine. The two bounds differ deliberately: open
+  issues are a backlog that accumulates, open PRs are in-flight work capped by review capacity,
+  and the PR call is the heavier per item (a nested `statusCheckRollup` per PR against a flat
+  label list). Each argv is built by a function rather than spelled inline **so the bound is
+  pinnable** — inline, `--limit` is one deletable word whose removal restores the defect with
+  every behavioural test still green, since they all hand the diffs a listing directly.
 - **The gate itself (`intake::idle_tick_gate`).** Once `idle_tick_should_fire`'s quiet-window
   threshold clears (unchanged from #83), a group with the gate ON consults **four** signals
   before actually notifying: a pending intake signal from the poller above; an outstanding
