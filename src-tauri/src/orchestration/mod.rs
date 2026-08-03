@@ -39153,13 +39153,28 @@ pub fn bind_agent(reg: tauri::State<Arc<OrchRegistry>>, agent_id: String, pty_id
 /// recorded at the highest precedence tier — an orchestrator `rename_agent`
 /// afterwards will not override it (#95r). Best-effort: the pane already shows
 /// the new name locally, so a stale/unknown id just fails silently here.
+/// Off-thread (#762 — see [`run_blocking`]): `persist_agent_record` rewrites
+/// `agents.json` while holding the global `tasks_lock` — the lock the board
+/// family and the usage poll contend on. That lock's architecture is #747; this
+/// is the dispatch half.
+///
+/// **Reentrancy.** `rename_agent` has always been reachable from MCP threads
+/// (the orchestrator's own `rename_agent` tool) and from the spawn path, so the
+/// webview thread was never what made it safe. The decision is taken whole
+/// under the `agents` lock — liveness, the #95r precedence check and the name
+/// write are one critical section, and the entry is cloned out of it — so a
+/// human rename racing an orchestrator rename resolves by RANK, not by arrival:
+/// the orchestrator's loses to a name the human set, whichever order they land
+/// in. That is the property #95r asked for, and it is stronger than the
+/// ordering this conversion gives up.
 #[tauri::command]
-pub fn orch_agent_renamed(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_agent_renamed(
+    app: AppHandle,
     agent_id: String,
     name: String,
 ) -> Result<(), String> {
-    reg.rename_agent(&agent_id, &name, NameSource::Human).map(|_| ())
+    let reg = reg_of(&app);
+    run_blocking(move || reg.rename_agent(&agent_id, &name, NameSource::Human).map(|_| ())).await
 }
 
 /// Session ↔ orchestration-role mapping for the session browser badges.
@@ -39427,13 +39442,26 @@ pub async fn orch_merge_queue(app: AppHandle, group_id: String) -> Value {
 /// near-simultaneous sends is best-effort — the per-pty delivery mutex is not
 /// FIFO). Empty text, a paused group, and a dead orchestrator all surface as
 /// errors the strip shows the human.
+///
+/// Off-thread (#762 — see [`run_blocking`]): `deliver_prompt` appends audits
+/// and persists the durable delivery queue, the same fsync-and-rename shape as
+/// every other durable write here.
+///
+/// **Reentrancy.** The property the compose strip actually needs — that a
+/// message lands whole and is never interleaved with another writer's — is
+/// held by the per-pane delivery mutex, not by dispatch: this command has
+/// always shared that path with worker reports, orchestrator notices and every
+/// MCP-thread delivery, which is exactly why loomux funnels all of them through
+/// one writer per pane. What the webview thread contributed was the *relative*
+/// order of two near-simultaneous human steers, and the doc above already
+/// disclaims it ("relative order of near-simultaneous sends is best-effort —
+/// the per-pty delivery mutex is not FIFO"). That sentence predates this
+/// conversion and is why it costs nothing: the guarantee being kept is
+/// wholeness, and the one being given up was never claimed.
 #[tauri::command]
-pub fn orch_steer(
-    reg: tauri::State<Arc<OrchRegistry>>,
-    group_id: String,
-    text: String,
-) -> Result<(), String> {
-    reg.steer_orchestrator(&group_id, &text)
+pub async fn orch_steer(app: AppHandle, group_id: String, text: String) -> Result<(), String> {
+    let reg = reg_of(&app);
+    run_blocking(move || reg.steer_orchestrator(&group_id, &text)).await
 }
 
 /// Result of saving a steering-strip attachment: the absolute file path plus
@@ -39452,28 +39480,45 @@ pub struct SavedAttachment {
 /// `invoke`. Returns the saved path and the group's orchestrator CLI; the
 /// frontend turns those into the per-CLI "Attached image" reference line before
 /// sending through `orch_steer`.
+///
+/// Off-thread (#762): the base64 decode AND the disk write, both of which are
+/// as large as the image the human pasted and neither of which anything bounds
+/// below `MAX_ATTACHMENT_B64_LEN`. The decode is moved deliberately too — it is
+/// megabytes of CPU on the thread that services paint, and leaving it in front
+/// of the first `.await` would be #724's mistake with extra steps.
+///
+/// **Reentrancy.** Each call writes a distinct file: `save_attachment` mints
+/// the name from a monotonic counter, so two pastes cannot name the same path
+/// and there is no read-modify-write to lose. The audit append is serialized by
+/// the audit lock, and `orchestrator_cli` is an in-memory roster read. Nothing
+/// here was serialized by dispatch except the *order* of two attachments'
+/// filenames, which nothing reads as meaningful.
 #[tauri::command]
-pub fn orch_save_attachment(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_save_attachment(
+    app: AppHandle,
     group_id: String,
     ext: String,
     data_b64: String,
 ) -> Result<SavedAttachment, String> {
-    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-    // Reject an oversize payload before decoding — see MAX_ATTACHMENT_B64_LEN.
-    if data_b64.len() > MAX_ATTACHMENT_B64_LEN {
-        return Err(format!(
-            "attachment too large (max {MAX_ATTACHMENT_BYTES} bytes)"
-        ));
-    }
-    let bytes = B64
-        .decode(data_b64.as_bytes())
-        .map_err(|e| format!("invalid attachment encoding: {e}"))?;
-    let path = reg.save_attachment(&group_id, &ext, &bytes)?;
-    Ok(SavedAttachment {
-        path: path.to_string_lossy().to_string(),
-        cli: reg.orchestrator_cli(&group_id),
+    let reg = reg_of(&app);
+    run_blocking(move || {
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        // Reject an oversize payload before decoding — see MAX_ATTACHMENT_B64_LEN.
+        if data_b64.len() > MAX_ATTACHMENT_B64_LEN {
+            return Err(format!(
+                "attachment too large (max {MAX_ATTACHMENT_BYTES} bytes)"
+            ));
+        }
+        let bytes = B64
+            .decode(data_b64.as_bytes())
+            .map_err(|e| format!("invalid attachment encoding: {e}"))?;
+        let path = reg.save_attachment(&group_id, &ext, &bytes)?;
+        Ok(SavedAttachment {
+            path: path.to_string_lossy().to_string(),
+            cli: reg.orchestrator_cli(&group_id),
+        })
     })
+    .await
 }
 
 /// The human board's task write. `deps` (#582) is the whole new link array —
@@ -39483,9 +39528,34 @@ pub fn orch_save_attachment(
 /// rather than landing a broken graph. The human's edits stay
 /// last-writer-wins: `claim` is deliberately not exposed here, since the
 /// board's authority is the human's, not a queue discipline.
+///
+/// Off-thread (#762 — see [`run_blocking`]): a `tasks.json` read plus a full
+/// atomic rewrite of the board plus an audit append, inside the
+/// [`OrchRegistry::tasks_lock`] guard. The board family's base cost; every
+/// command below adds to this one.
+///
+/// **The board family's reentrancy argument, made once here.** This family is
+/// the one place in #762 where the conversion changes nothing at all about who
+/// can interleave, and the reason is written on the lock: `tasks_lock` exists
+/// because "MCP threads and the human UI mutate the same tasks.json". Every
+/// board write below has therefore always run concurrently with an agent's
+/// `upsert_task`/`claim_task` from an MCP thread, and every one of them is a
+/// read-modify-write held whole under that guard, ending in an `atomic_write`
+/// — so a reader sees one complete board or the other, never a merge of two.
+/// What the webview thread added was ordering *between two human edits*, and
+/// the board's stated discipline for those is already last-writer-wins ("the
+/// human's edits stay last-writer-wins", above). Each command states only what
+/// is specific to it — and `tasks_lock`'s own architecture (file IO under a
+/// process-global lock) is **#747**, untouched here: this slice moves the wait
+/// off the thread that paints, it does not shorten it.
+///
+/// **Reentrancy.** Specific to this one: the board notice is emitted after the
+/// guard is released, so two upserts can announce out of order — a cosmetic
+/// ordering on a notice whose content names the task and its new status, not a
+/// delta, so neither reading is wrong.
 #[tauri::command]
-pub fn orch_upsert_task(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_upsert_task(
+    app: AppHandle,
     group_id: String,
     id: Option<String>,
     title: Option<String>,
@@ -39493,37 +39563,60 @@ pub fn orch_upsert_task(
     note: Option<String>,
     deps: Option<Vec<String>>,
 ) -> Result<Task, String> {
-    let task = reg.upsert_task(
-        &group_id,
-        "human",
-        id.as_deref(),
-        TaskPatch { title, status, note, deps, ..Default::default() },
-    )?;
-    reg.notify_board_edit(&group_id, &format!("{} \"{}\" is now {}", task.id, task.title, task.status));
-    Ok(task)
+    let reg = reg_of(&app);
+    run_blocking(move || {
+        let task = reg.upsert_task(
+            &group_id,
+            "human",
+            id.as_deref(),
+            TaskPatch { title, status, note, deps, ..Default::default() },
+        )?;
+        reg.notify_board_edit(&group_id, &format!("{} \"{}\" is now {}", task.id, task.title, task.status));
+        Ok(task)
+    })
+    .await
 }
 
+/// Delete one task from the board.
+///
+/// Off-thread (#762): the same read-plus-full-board-rewrite under `tasks_lock`
+/// as [`orch_upsert_task`], with an audit append.
+///
+/// **Reentrancy.** The family argument above. Specific to this one: deleting is
+/// idempotent against a board it may lose a race to — a second delete of a row
+/// that is already gone removes nothing and rewrites the same board — so two
+/// concurrent deletes cannot compound into the loss of a row neither named.
 #[tauri::command]
-pub fn orch_delete_task(
-    reg: tauri::State<Arc<OrchRegistry>>,
-    group_id: String,
-    id: String,
-) -> Result<(), String> {
-    reg.delete_task(&group_id, "human", &id)?;
-    reg.notify_board_edit(&group_id, &format!("deleted task {id}"));
-    Ok(())
+pub async fn orch_delete_task(app: AppHandle, group_id: String, id: String) -> Result<(), String> {
+    let reg = reg_of(&app);
+    run_blocking(move || {
+        reg.delete_task(&group_id, "human", &id)?;
+        reg.notify_board_edit(&group_id, &format!("deleted task {id}"));
+        Ok(())
+    })
+    .await
 }
 
 /// Delete all `done` tasks in one action. The single board-change notice is
 /// emitted inside `delete_done_tasks` (coalesced for the batch, #120), so —
 /// unlike the single-delete command — none is fanned out here. Returns the ids
 /// removed so the frontend can confirm what it cleared.
+///
+/// Off-thread (#762): one full-board rewrite under `tasks_lock` plus audits.
+///
+/// **Reentrancy.** The family argument on [`orch_upsert_task`]. Specific to
+/// this one: the *selection* is computed inside the guard, from the board this
+/// call is about to rewrite — not from the caller's snapshot — so a task that
+/// an agent moved to `done` a millisecond earlier is either wholly included or
+/// wholly not, and the returned id list is what was actually removed rather
+/// than what the frontend guessed would be.
 #[tauri::command]
-pub fn orch_delete_done_tasks(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_delete_done_tasks(
+    app: AppHandle,
     group_id: String,
 ) -> Result<Vec<String>, String> {
-    reg.delete_done_tasks(&group_id, "human")
+    let reg = reg_of(&app);
+    run_blocking(move || reg.delete_done_tasks(&group_id, "human")).await
 }
 
 /// Delete a specific set of tasks by id — the board's multi-select "delete
@@ -39532,24 +39625,53 @@ pub fn orch_delete_done_tasks(
 /// single-delete command — none is fanned out here. Unknown ids are skipped
 /// (the board may have changed under the selection), not errored. Returns the
 /// ids actually removed so the frontend can confirm what it cleared.
+///
+/// Off-thread (#762): the same `tasks_lock` guard around a full-board rewrite,
+/// plus per-task audit detail.
+///
+/// **Reentrancy.** The family argument on [`orch_upsert_task`]. Specific to
+/// this one: it is deliberately *not* all-or-nothing — ids that no longer name
+/// a row are skipped and audited as skipped, which is exactly the "the board
+/// changed under the human's selection" case a lost race produces. So the
+/// interleaving this conversion admits is one the command already had to
+/// handle, and it reports it rather than silently widening the delete.
 #[tauri::command]
-pub fn orch_delete_tasks(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_delete_tasks(
+    app: AppHandle,
     group_id: String,
     ids: Vec<String>,
 ) -> Result<Vec<String>, String> {
-    reg.delete_tasks(&group_id, "human", &ids)
+    let reg = reg_of(&app);
+    run_blocking(move || reg.delete_tasks(&group_id, "human", &ids)).await
 }
 
+/// Reorder the board — the priority order the orchestrator follows.
+///
+/// Off-thread (#762): a full-board atomic rewrite under `tasks_lock` per call,
+/// and reorders arrive in bursts, so this is the board row whose rate is set by
+/// how fast the human clicks rather than by a discrete considered gesture.
+///
+/// **Reentrancy.** The family argument on [`orch_upsert_task`], plus the one
+/// question a *reordering* has to answer, since `performance.md` §4 X1 keeps
+/// `resize_pty` synchronous on exactly this ground: can two of these land out
+/// of order and leave stale state with nothing to correct it? No, twice over.
+/// The payload is the WHOLE order, never a delta, and each click recomputes it
+/// from the same rendered board — so a rapid pair sends the same array twice
+/// and is idempotent however it interleaves. And where X1 has no event that
+/// re-reports ConPTY's geometry, this has one: any write emits
+/// `orch-tasks-changed`, and every open board re-reads `tasks.json` and
+/// re-renders from it. A losing write cannot leave the UI asserting an order
+/// the file does not have.
 #[tauri::command]
-pub fn orch_reorder_tasks(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_reorder_tasks(
+    app: AppHandle,
     group_id: String,
     ids: Vec<String>,
 ) -> Result<(), String> {
+    let reg = reg_of(&app);
     // No typed notice: reorders come in bursts; board order is read via
     // list_tasks whenever the orchestrator plans.
-    reg.reorder_tasks(&group_id, "human", &ids)
+    run_blocking(move || reg.reorder_tasks(&group_id, "human", &ids)).await
 }
 
 // ---------- merge-gate actions (human side) ----------
@@ -39560,37 +39682,78 @@ pub fn orch_reorder_tasks(
 /// Open a task's issue or PR reference in the default browser. `kind` is
 /// `"issue"` or `"pr"`; `value` is the stored reference (`#12`, `12`, or a
 /// full URL).
+///
+/// Off-thread (#762 — see [`run_blocking`]): up to two BLOCKING `git` spawns to
+/// resolve the remote URL, then an audit append. This is an INV-2 violation
+/// while it is synchronous — a process spawn on the thread that services paint
+/// — and the reason it was `debt` rather than `cheap` even though its body
+/// looks like three statements: the spawns are in `git_remote_web_base`, past
+/// where E1's scan can see. The browser open itself is detached, so the spawns
+/// were the whole cost.
+///
+/// **Reentrancy.** Nothing here mutates orchestration state: it reads the
+/// group's repo (memory, falling back to `group.json`), shells out read-only,
+/// appends one audit line through the audit lock, and hands a URL to the OS.
+/// Two of these racing open two browser tabs, which is what two clicks mean.
 #[tauri::command]
-pub fn orch_open_ref(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_open_ref(
+    app: AppHandle,
     group_id: String,
     kind: String,
     value: String,
 ) -> Result<(), String> {
+    let reg = reg_of(&app);
+    run_blocking(move || orch_open_ref_sync(&reg, &group_id, &kind, &value)).await
+}
+
+/// The body of [`orch_open_ref`], as a plain function so the command stays a
+/// thin delegation (`performance.md` §2 P1) and the resolution logic stays
+/// callable without a Tauri runtime.
+fn orch_open_ref_sync(
+    reg: &OrchRegistry,
+    group_id: &str,
+    kind: &str,
+    value: &str,
+) -> Result<(), String> {
     let repo = reg
-        .group(&group_id)
+        .group(group_id)
         .map(|g| g.repo)
-        .or_else(|| reg.load_group_file(&group_id).map(|(repo, _)| repo))
+        .or_else(|| reg.load_group_file(group_id).map(|(repo, _)| repo))
         .ok_or("unknown group")?;
     let base = git_remote_web_base(&repo);
-    let url = resolve_ref_url(base.as_deref(), &kind, &value)
+    let url = resolve_ref_url(base.as_deref(), kind, value)
         .ok_or("no URL for this reference — the repo may have no GitHub remote")?;
-    reg.audit(&group_id, "human", "open-ref", json!({ "kind": kind, "url": url }));
+    reg.audit(group_id, "human", "open-ref", json!({ "kind": kind, "url": url }));
     open_external_url(&url)
 }
 
 /// Approve a merge-gate item: mark it done and notify the orchestrator to
 /// merge. The human's direct sign-off, so the status change is applied here.
+/// Off-thread (#762): an [`orch_upsert_task`]-sized board write under
+/// `tasks_lock`, plus minting the grant file, plus the delivery.
+///
+/// **Reentrancy.** The board write itself is the family argument on
+/// [`orch_upsert_task`]. Specific to this one, and worth stating rather than
+/// waving at: the merge-gate check is a check-then-act (`ensure_at_merge_gate`,
+/// then the upsert), so a second Approve that used to arrive *after* the first
+/// — and be refused, the item no longer being at the gate — can now overlap it
+/// and pass. What that produces is bounded by the grant's own shape: the grant
+/// is keyed `merge_grants/pr-<N>` and written with `atomic_write`, so two mints
+/// for one PR leave ONE single-use file, not two authorizations. The duplicate
+/// is a duplicate *notice* to the orchestrator, never a second merge — and
+/// `pr_number` resolves the key from the task's own ref, so the two racers
+/// cannot even grant different PRs.
 #[tauri::command]
-pub fn orch_approve_task(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_approve_task(
+    app: AppHandle,
     group_id: String,
     id: String,
     // Optional approve-with-comment note (#83): delivered to the orchestrator with
     // the one-time merge grant, e.g. "approved — also bump the changelog first".
     comment: Option<String>,
 ) -> Result<Task, String> {
-    reg.approve_task(&group_id, &id, comment.as_deref())
+    let reg = reg_of(&app);
+    run_blocking(move || reg.approve_task(&group_id, &id, comment.as_deref())).await
 }
 
 /// Approve a whole board selection at the merge gate (#507): one per-PR
@@ -39598,28 +39761,49 @@ pub fn orch_approve_task(
 /// issued N times — and ONE consolidated notice to the orchestrator instead
 /// of N prompts. All-or-nothing: if any item is not at the merge gate the
 /// call fails having minted nothing.
+/// Off-thread (#762): one board write plus a grant file minted PER ITEM, under
+/// the same guard — so the file count scales with the selection.
+///
+/// **Reentrancy.** As [`orch_approve_task`], with the all-or-nothing pre-flight
+/// noted: validation runs against ONE board snapshot before anything is
+/// written, so a racer that flips an item out of the gate in between makes this
+/// call fail having minted nothing, rather than approving a subset. That is the
+/// designed answer to a board that changed under the selection (#507), not a
+/// property this conversion has to add.
 #[tauri::command]
-pub fn orch_approve_tasks(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_approve_tasks(
+    app: AppHandle,
     group_id: String,
     // Board selection in board order, each with its own optional note.
     items: Vec<ApproveItem>,
 ) -> Result<Vec<Task>, String> {
-    reg.approve_tasks(&group_id, &items)
+    let reg = reg_of(&app);
+    run_blocking(move || reg.approve_tasks(&group_id, &items)).await
 }
 
 /// Issue a one-time human merge grant for a PR (#83), independent of the board —
 /// a human-pane path to authorize exactly one default-branch merge. Optional
 /// comment is delivered to the orchestrator with the grant. HUMAN-ONLY (Tauri
 /// command; no MCP tool reaches grant-writing).
+/// Off-thread (#762): the grant file write, an audit append, and the delivery
+/// of the grant to the orchestrator's pane.
+///
+/// **Reentrancy.** The grant is a single `atomic_write` to a path keyed by the
+/// PR number, carrying an expiry and a nonce from a process-global counter.
+/// Two mints for one PR therefore produce one file with one nonce — the shim
+/// consumes one merge either way — and two mints for different PRs touch
+/// different paths. There is no read-modify-write to lose and no shared
+/// directory state to corrupt, so nothing here depended on the webview thread;
+/// what it contributed was the order of two notices.
 #[tauri::command]
-pub fn orch_grant_merge(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_grant_merge(
+    app: AppHandle,
     group_id: String,
     pr: String,
     comment: Option<String>,
 ) -> Result<u64, String> {
-    reg.grant_merge(&group_id, &pr, comment.as_deref(), "human")
+    let reg = reg_of(&app);
+    run_blocking(move || reg.grant_merge(&group_id, &pr, comment.as_deref(), "human")).await
 }
 
 /// Issue a human release grant for `tag` (#83/#438): authorizes the whole
@@ -39627,51 +39811,77 @@ pub fn orch_grant_merge(
 /// for `RELEASE_GRANT_TTL_SECS`, not a single command. Releases are never
 /// blanket-allowed by autonomous mode, so this explicit grant is the only path.
 /// Optional comment delivered to the orchestrator. HUMAN-ONLY.
+/// Off-thread (#762): grant file, audit append and delivery.
+///
+/// **Reentrancy.** [`orch_grant_merge`]'s argument against an independent
+/// directory, keyed by tag rather than PR number: one atomic write per tag, no
+/// read-modify-write, and a TTL the file carries itself rather than inferring
+/// from arrival order.
 #[tauri::command]
-pub fn orch_grant_release(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_grant_release(
+    app: AppHandle,
     group_id: String,
     tag: String,
     comment: Option<String>,
 ) -> Result<(), String> {
-    reg.grant_release(&group_id, &tag, comment.as_deref(), "human")
+    let reg = reg_of(&app);
+    run_blocking(move || reg.grant_release(&group_id, &tag, comment.as_deref(), "human")).await
 }
 
 /// Request changes on a merge-gate item: record the findings and deliver them
 /// to the orchestrator to route back to a worker.
+/// Off-thread (#762): extra `tasks.json` reads on top of an upsert-sized write
+/// under `tasks_lock`, plus a delivery to the worker.
+///
+/// **Reentrancy.** The family argument on [`orch_upsert_task`]. Specific to the
+/// start/proceed/request-changes trio: each is a status transition the
+/// orchestrator is *told about* rather than one it infers, so two of them
+/// racing deliver two notices about a board whose final state both notices name
+/// explicitly — the orchestrator reads the board, not the sequence of prompts.
 #[tauri::command]
-pub fn orch_request_changes(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_request_changes(
+    app: AppHandle,
     group_id: String,
     id: String,
     findings: String,
 ) -> Result<Task, String> {
-    reg.request_changes(&group_id, &id, &findings)
+    let reg = reg_of(&app);
+    run_blocking(move || reg.request_changes(&group_id, &id, &findings)).await
 }
 
 /// Start a queued item: record a human-attributed note and tell the
 /// orchestrator to begin work. Does not flip the status — the orchestrator
 /// moves it to `in-progress` when it actually assigns a worker.
+/// Off-thread (#762): the same shape as [`orch_request_changes`] — extra board
+/// reads, an upsert-sized write under `tasks_lock`, and a delivery.
+///
+/// **Reentrancy.** As [`orch_request_changes`]. Specific to this one: it
+/// deliberately does NOT flip the status (the orchestrator does that when it
+/// actually assigns a worker), so it has no transition to lose a race over — it
+/// records a human-attributed note and asks.
 #[tauri::command]
-pub fn orch_start_task(
-    reg: tauri::State<Arc<OrchRegistry>>,
-    group_id: String,
-    id: String,
-) -> Result<Task, String> {
-    reg.start_task(&group_id, &id)
+pub async fn orch_start_task(app: AppHandle, group_id: String, id: String) -> Result<Task, String> {
+    let reg = reg_of(&app);
+    run_blocking(move || reg.start_task(&group_id, &id)).await
 }
 
 /// Proceed on a prototype item (#147): flip it to `in-progress`, record the
 /// human's sign-off, and tell the orchestrator to promote the prototype to a
 /// full production build. The human's demo-gate verdict, so the status change
 /// is applied here (mirrors `orch_approve_task`).
+/// Off-thread (#762): extra board reads, an upsert-sized write under
+/// `tasks_lock` and a delivery; the third member of the
+/// start/proceed/request-changes trio.
+///
+/// **Reentrancy.** As [`orch_request_changes`]. Specific to this one: like
+/// approve, it applies the status change itself (the human's demo-gate
+/// verdict), so a duplicate lands the same `in-progress` twice and delivers two
+/// promote notices — idempotent on the board, and the second notice names the
+/// same item and the same verdict.
 #[tauri::command]
-pub fn orch_proceed_task(
-    reg: tauri::State<Arc<OrchRegistry>>,
-    group_id: String,
-    id: String,
-) -> Result<Task, String> {
-    reg.proceed_task(&group_id, &id)
+pub async fn orch_proceed_task(app: AppHandle, group_id: String, id: String) -> Result<Task, String> {
+    let reg = reg_of(&app);
+    run_blocking(move || reg.proceed_task(&group_id, &id)).await
 }
 
 #[cfg(test)]
