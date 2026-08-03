@@ -365,38 +365,6 @@ const SYNC_COMMANDS: &[Row] = &[
         issue: Some("#746"),
     },
     Row {
-        name: "probe_agent_cli",
-        class: Class::Debt,
-        reason: "On a cache miss it spawns the agent CLI with --help and poll-joins it for up to \
-                 8 seconds, on the webview thread. Cached afterwards, so the freeze is once per \
-                 CLI per session — the longest single stall any command here can produce.",
-        issue: Some("#746"),
-    },
-    Row {
-        name: "open_in_editor",
-        class: Class::Debt,
-        reason: "Probes PATH and PATHEXT with stats and then spawns the editor detached, on the \
-                 webview thread. The spawn is detached so the wait is short, but the PATH probing \
-                 in front of it is not bounded by anything the app controls.",
-        issue: Some("#746"),
-    },
-    Row {
-        name: "voice_start",
-        class: Class::Debt,
-        reason: "Waits on ready_rx.recv() for the WASAPI device to open WHILE HOLDING the \
-                 recording mutex, on the webview thread. An indeterminate wait, not a bounded \
-                 one: a slow or contended audio device freezes the GUI for as long as it takes.",
-        issue: Some("#746"),
-    },
-    Row {
-        name: "voice_cancel",
-        class: Class::Debt,
-        reason: "Blocking thread-join of the capture thread on the webview thread. Locks are not \
-                 held across it, and it is called from Esc, pane close and app teardown — so the \
-                 stall lands exactly when the user is trying to get out.",
-        issue: Some("#746"),
-    },
-    Row {
         name: "git_watch",
         class: Class::Debt,
         reason: "Computes the repo signature (stats and reads) on the webview thread. #763 (S7) \

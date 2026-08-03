@@ -188,17 +188,38 @@ fn probe_uncached(program: &str) -> CliProbe {
 /// cached for the app run; failures are NOT — a CLI installed while loomux
 /// is running must become launchable on the next probe (spawns already see
 /// it via fresh-PATH resolution).
+///
+/// Off-thread (#746 — `crate::blocking::run_blocking`, P1 of
+/// `doc/design/performance.md`). On a cache miss this spawns the agent CLI with
+/// `--help` and poll-joins it for up to eight seconds, which Tauri ran on the
+/// webview thread: the longest single stall any command in the census could
+/// produce, and a process spawn there besides (INV-2).
+///
+/// **Reentrancy — an interleaving accepted, not a guard.** The cache lock is
+/// taken twice, released between, and off-thread two probes of the same program
+/// can therefore both miss it and both run `--help`. That is deliberate rather
+/// than overlooked. The probe is a PURE function of the program name and the
+/// machine's PATH, so both computations agree and the second `insert` overwrites
+/// an identical value; the whole cost of the race is one duplicate subprocess,
+/// once per CLI per session. Holding the lock across `probe_uncached` would fix
+/// a non-problem by creating a real one: the launcher probes several CLIs to
+/// build its picker, and serializing them behind one lock would turn N
+/// independent eight-second worst cases into their SUM — the exact stall this
+/// conversion exists to remove, moved rather than deleted.
 #[tauri::command]
-pub fn probe_agent_cli(program: String) -> CliProbe {
-    let program = program.trim().to_lowercase();
-    if let Some(hit) = cache().lock().unwrap().get(&program) {
-        return hit.clone();
-    }
-    let probe = probe_uncached(&program);
-    if probe.available {
-        cache().lock().unwrap().insert(program, probe.clone());
-    }
-    probe
+pub async fn probe_agent_cli(program: String) -> CliProbe {
+    crate::blocking::run_blocking(move || {
+        let program = program.trim().to_lowercase();
+        if let Some(hit) = cache().lock().unwrap().get(&program) {
+            return hit.clone();
+        }
+        let probe = probe_uncached(&program);
+        if probe.available {
+            cache().lock().unwrap().insert(program, probe.clone());
+        }
+        probe
+    })
+    .await
 }
 
 #[cfg(test)]
