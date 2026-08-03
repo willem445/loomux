@@ -229,6 +229,40 @@ fn the_statusline_read_still_finds_the_figure_the_pane_is_showing() {
     );
 }
 
+// ---------- INV-5: marker IO out from under the toggle guards ----------
+
+#[test]
+fn the_notify_toggle_does_its_io_once_per_actual_transition() {
+    // #743 S7 moved the marker write and the audit append out from under the
+    // `notify_groups` guard (`pause_group`'s shape, in the same file). The
+    // guard's `insert`/`remove` is what still decides that the IO happens at
+    // all, so this pins the property the move must not lose: repeating a toggle
+    // that changes nothing writes nothing and audits nothing.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let marker = reg.state_root().join(&g.id).join("notify");
+
+    assert!(!reg.notify_enabled(&g.id), "off is the default");
+    reg.set_notify(&g.id, true).unwrap();
+    reg.set_notify(&g.id, true).unwrap();
+    assert!(reg.notify_enabled(&g.id));
+    assert!(marker.exists(), "the durable marker must survive a restart");
+    assert_eq!(
+        reg.audit_log(&g.id).iter().filter(|e| e.action == "notify-on").count(),
+        1,
+        "a repeat of a no-op toggle must not audit a second transition"
+    );
+
+    reg.set_notify(&g.id, false).unwrap();
+    reg.set_notify(&g.id, false).unwrap();
+    assert!(!reg.notify_enabled(&g.id));
+    assert!(!marker.exists(), "disabling must remove the marker, not just the memory");
+    assert_eq!(
+        reg.audit_log(&g.id).iter().filter(|e| e.action == "notify-off").count(),
+        1
+    );
+}
+
 #[test]
 fn a_pane_that_is_gone_reports_no_statusline_cost() {
     // The fail-safe direction, unchanged by the bound: no pane, no figure —

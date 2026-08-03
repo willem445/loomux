@@ -6982,16 +6982,42 @@ pub fn worktree_cleanup_targets(repo: &str, cwds: &[String]) -> Vec<String> {
 /// return the dollar amount from the lowest line that carries one — that is
 /// the freshest statusline render. Thousands separators are tolerated.
 /// Returns `None` when no `$<amount>` token is present.
-/// The statusline dollar figure for one pane, read straight off its output
-/// ring — [`OrchRegistry::compute_usage_snapshot`]'s last-resort branch,
-/// extracted so an integration test can drive the read a real pane gets
-/// (the `preenter_admission` seam; `self.app` cannot be resolved headless).
+/// How much of a pane's output ring the usage poll reads looking for the CLI's
+/// own statusline dollar figure (#743 S7, `performance.md` INV-5 / P3).
 ///
-/// This is on the app's hottest poll (`orch_group_usage`, 2 s + 4 s, per
-/// agent), which is why the read is bounded rather than a whole-ring clone —
-/// see `STATUSLINE_SCAN_BYTES`.
+/// 64 KiB — a quarter of `OUTPUT_RING_CAP`, and 16x `ATTENTION_SCAN_BYTES`.
+/// The statusline is a live status line: redrawn in place with every frame the
+/// CLI paints, so the figure is always inside the most recent repaint. The
+/// window is sized for that repaint rather than for the figure, and generously
+/// — one full-screen redraw of a very large pane (300x100 cells) with heavy
+/// SGR styling is still well inside 64 KiB, where the attention scan's 4 KiB
+/// would not be. ASSUMED, with its falsifier named: a CLI that paints its
+/// statusline LESS often than every 64 KiB of other output would stop being
+/// read, and the observable is a pane whose usage `source` stays `"none"`
+/// while the CLI is visibly showing a `$` figure.
+///
+/// Truncation cannot corrupt the answer, only lose it. `parse_session_cost`
+/// scans lines back-to-front, so the only line a window boundary can mangle is
+/// the OLDEST one in it, and mangling can only ever delete characters: a `$`
+/// that survives has the whole amount after it intact, and a `$` that does not
+/// survive yields no match. A lost figure lands on the branch that already
+/// handles "this CLI shows nothing" (subscription/Max accounts, a killed
+/// pane) — `source` stays `"none"` and no cost is claimed, which is the
+/// fail-safe direction for a figure that feeds the budget meters.
+const STATUSLINE_SCAN_BYTES: usize = 64 * 1024;
+
+/// The statusline dollar figure for one pane — [`OrchRegistry::compute_usage_
+/// snapshot`]'s last-resort branch, extracted so an integration test can drive
+/// the read a real pane gets (the `preenter_admission` seam; `self.app` cannot
+/// be resolved headless).
+///
+/// This sits on the app's hottest poll — `orch_group_usage`, every 2 s from an
+/// open group view and every 4 s from each group-bound tab, per agent — which
+/// is why it reads the last `STATUSLINE_SCAN_BYTES` rather than cloning and
+/// ANSI-stripping the whole ≤256 KiB ring for one number that is by
+/// construction the last thing painted.
 pub fn statusline_cost(ptys: &crate::pty::PtyManager, pty_id: u32) -> Option<f64> {
-    let raw = ptys.output_tail(pty_id)?;
+    let raw = ptys.output_tail_bounded(pty_id, STATUSLINE_SCAN_BYTES)?;
     parse_session_cost(&strip_ansi(&raw))
 }
 
@@ -22322,12 +22348,26 @@ impl OrchRegistry {
     /// integration-test seam, and same reason, as
     /// [`Self::compact_signals_from`], which it runs beside on every
     /// compact-nudge wake.
+    ///
+    /// Snapshot-then-release for the same reason (#743 S7). Each read is only
+    /// a counter load, so the CPU under the guard was never the problem here;
+    /// the LOCK ORDER was. Reading a pty while holding `agents` makes the pair
+    /// nested, and a nested pair is only safe as long as every future caller
+    /// remembers the direction — whereas a snapshot cannot be got wrong. It is
+    /// three lines and it is the sibling of the read above, on the same wake:
+    /// leaving one of the two nested would have made the invariant a
+    /// coincidence rather than a rule.
     #[doc(hidden)] // pub for integration tests
     pub fn output_totals_from(&self, ptys: &crate::pty::PtyManager) -> HashMap<String, u64> {
-        self.agents
+        let panes: Vec<(String, u32)> = self
+            .agents
             .lock_safe()
             .values()
-            .filter_map(|a| Some((a.id.clone(), ptys.output_total(a.pty_id?)?)))
+            .filter_map(|a| Some((a.id.clone(), a.pty_id?)))
+            .collect();
+        panes
+            .into_iter()
+            .filter_map(|(id, pty_id)| Some((id, ptys.output_total(pty_id)?)))
             .collect()
     }
 
@@ -25715,19 +25755,46 @@ impl OrchRegistry {
     /// `flush_stranded_text` seam, and the same reason for it: nothing can
     /// resolve `self.app` headless, so the inline version was
     /// undeletable-by-test).
+    ///
+    /// **The snapshot is the point (#743 S7, `performance.md` INV-5/P3.)** The
+    /// `agents` lock is taken to clone out `(id, pty_id)` and RELEASED before
+    /// any pty is touched — the same map-lock→release→leaf shape
+    /// `PtyManager::writer_handle` states for the pty side, and the same one
+    /// the attention scan (#725) already uses. Iterating the guard directly
+    /// held `agents` across N whole-ring clones and N `strip_ansi` passes, on
+    /// a cadence that goes to 10 s whenever any agent anywhere has a compact
+    /// arm open — so a single slow pane serialised every reader of the agent
+    /// registry behind it, including the attention scan and the usage poll
+    /// that runs on the webview thread.
+    ///
+    /// The tail read itself stays whole-ring, deliberately: three detectors
+    /// read it with three different reaches — `auto_compact_banner_detected`
+    /// wants only the last non-blank line, `human_typed_compact_detected`
+    /// wants anything typed inside `MANUAL_COMPACT_DETECT_WINDOW_MS` (3 min),
+    /// and the Copilot completion marker sits wherever the CLI last painted
+    /// it. Narrowing the window would shorten the middle one's reach, which
+    /// is a detection change, not a lock change; the cost it would save is
+    /// already bounded and argued at [`Self::any_compact_pending`], and the
+    /// cheaper lever named there (skip the read for agents that cannot
+    /// possibly be mid-compact) does not cost reach at all. Deferred to that
+    /// lever rather than done here — see performance.md §4 X5.
     #[doc(hidden)] // pub for integration tests
     pub fn compact_signals_from(
         &self,
         ptys: &crate::pty::PtyManager,
     ) -> HashMap<String, (String, u64)> {
-        self.agents
+        let panes: Vec<(String, u32)> = self
+            .agents
             .lock_safe()
             .values()
-            .filter_map(|a| {
-                let pty_id = a.pty_id?;
+            .filter_map(|a| Some((a.id.clone(), a.pty_id?)))
+            .collect();
+        panes
+            .into_iter()
+            .filter_map(|(id, pty_id)| {
                 let tail = strip_ansi(&ptys.output_tail(pty_id)?);
                 let last_input = ptys.last_user_input_ms(pty_id).unwrap_or(0);
-                Some((a.id.clone(), (tail, last_input)))
+                Some((id, (tail, last_input)))
             })
             .collect()
     }
@@ -26123,16 +26190,37 @@ impl OrchRegistry {
 
     /// Enable/disable desktop notifications for a group, durably (a `notify`
     /// marker file, mirroring the pause marker) so the choice survives restarts.
+    ///
+    /// Marker write and audit append run with the set guard RELEASED (#743 S7,
+    /// `performance.md` INV-5) — `pause_group`'s shape, in the same file, which
+    /// this had drifted from: the transition is decided under a temporary
+    /// guard, the IO follows. It also un-nests `AUDIT_LOCK` (process-global,
+    /// §4 X6) from inside `notify_groups`, so no lock-ordering question
+    /// survives here at all.
+    ///
+    /// **Reentrancy.** The set's own `insert`/`remove` still decides: only the
+    /// caller that actually flipped the state does the IO, so concurrent
+    /// enables produce one marker and one audit line however they interleave.
+    /// An enable racing a disable resolves to whichever won the set lock, which
+    /// is the non-determinism two fast clicks already had — and both callers
+    /// are the sync `orch_set_notify` command, dispatched on the one webview
+    /// thread, so the interleave needs two panes of the same group toggling in
+    /// the same instant to exist at all.
     pub fn set_notify(&self, group: &str, on: bool) -> Result<(), String> {
         let dir = self.group_dir(group);
-        let mut set = self.notify_groups.lock_safe();
+        let changed = if on {
+            self.notify_groups.lock_safe().insert(group.to_string())
+        } else {
+            self.notify_groups.lock_safe().remove(group)
+        };
+        if !changed {
+            return Ok(());
+        }
         if on {
-            if set.insert(group.to_string()) {
-                fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-                let _ = fs::write(dir.join("notify"), b"");
-                self.audit(group, "human", "notify-on", json!({}));
-            }
-        } else if set.remove(group) {
+            fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+            let _ = fs::write(dir.join("notify"), b"");
+            self.audit(group, "human", "notify-on", json!({}));
+        } else {
             let _ = fs::remove_file(dir.join("notify"));
             self.audit(group, "human", "notify-off", json!({}));
         }
@@ -26150,16 +26238,24 @@ impl OrchRegistry {
     /// `spawn_expanded` marker file, mirroring `notify`) so the choice survives
     /// restarts. `on=true` means "expand every spawn like before #260";
     /// `on=false` (the default) restores the minimize-on-spawn behavior.
+    /// Marker write and audit append run with the set guard released, and the
+    /// transition is decided under it — [`Self::set_notify`]'s shape, for the
+    /// reasons argued there (#743 S7).
     pub fn set_spawn_expanded(&self, group: &str, on: bool) -> Result<(), String> {
         let dir = self.group_dir(group);
-        let mut set = self.spawn_expanded_groups.lock_safe();
+        let changed = if on {
+            self.spawn_expanded_groups.lock_safe().insert(group.to_string())
+        } else {
+            self.spawn_expanded_groups.lock_safe().remove(group)
+        };
+        if !changed {
+            return Ok(());
+        }
         if on {
-            if set.insert(group.to_string()) {
-                fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-                let _ = fs::write(dir.join("spawn_expanded"), b"");
-                self.audit(group, "human", "spawn-expanded-on", json!({}));
-            }
-        } else if set.remove(group) {
+            fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+            let _ = fs::write(dir.join("spawn_expanded"), b"");
+            self.audit(group, "human", "spawn-expanded-on", json!({}));
+        } else {
             let _ = fs::remove_file(dir.join("spawn_expanded"));
             self.audit(group, "human", "spawn-expanded-off", json!({}));
         }
@@ -36455,6 +36551,29 @@ impl OrchRegistry {
         json!(list)
     }
 
+    /// The `get_output` MCP tool: what an orchestrator sees when it looks at a
+    /// pane.
+    ///
+    /// **This one keeps the whole-ring read, and that is the argued answer, not
+    /// an oversight (#743 S7).** The census named it alongside the usage poll's
+    /// statusline read as the other surviving unbounded `output_tail`
+    /// (comment 5162020708 §4.4), and the two resolve opposite ways because
+    /// they are different kinds of read:
+    ///
+    /// - It is not cadenced. One call per explicit `get_output`, from an agent
+    ///   that decided to look — not a timer, and nothing on the webview thread
+    ///   waits for it. `performance.md` INV-5 is about latency-sensitive
+    ///   paths; this is not one.
+    /// - Truncating it would change the ANSWER, not just the cost. #520
+    ///   replays the raw escape stream onto a composed grid instead of
+    ///   stripping it, precisely so a TUI's redraw churn overwrites itself
+    ///   here exactly as it did on the human's screen. A replay that starts
+    ///   mid-stream starts with no cursor position, no scroll region and no
+    ///   attribute state, so any cell whose last paint fell outside the window
+    ///   comes back blank — a static screen that has not been fully repainted
+    ///   in a while would be reported to the orchestrator as empty. That is
+    ///   the behaviour question #725 flagged, and the fidelity the tool is
+    ///   for.
     pub fn agent_output_tail(&self, agent_id: &str, lines: usize) -> Result<String, String> {
         let a = self.agent(agent_id).ok_or("unknown agent")?;
         let pty_id = a.pty_id.ok_or("agent has no terminal")?;

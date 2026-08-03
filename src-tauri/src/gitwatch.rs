@@ -64,28 +64,46 @@ impl GitWatcher {
     /// repointing at the same git dir keeps the stored signature, so no spurious
     /// refresh fires and a change that happened mid-interval is still caught on
     /// the next poll.
+    ///
+    /// The baseline `repo_signature` runs *outside* the lock (#743 S7), the way
+    /// `poll_changed` below already stats outside it — snapshot the decision,
+    /// release, do the I/O, re-acquire to store. This is the same file's own
+    /// documented rule, which only this method was breaking: a hung stat on an
+    /// unresponsive network drive stalled the pane that asked for the repoint
+    /// *and* every other watch, including the poll thread's compare-and-store.
+    ///
+    /// **Reentrancy.** Two things can be concurrent with the released window,
+    /// and neither can corrupt it. The poll thread may compare-and-store while
+    /// we are stat-ing: it guards on `git_dir`, so it can only ever update the
+    /// signature of the watch that is *still* pointed where it read from, and
+    /// our insert then replaces that whole entry with a baseline for the NEW
+    /// repo. And another `watch`/`unwatch` cannot interleave at all — both are
+    /// sync `#[tauri::command]`s (`git_watch`/`git_unwatch`), so the one
+    /// webview thread serialises them; the re-check under the second
+    /// acquisition is there anyway, so "repointing at the same repo keeps the
+    /// stored signature" stays true by construction rather than by dispatch.
     pub fn watch(&self, id: u32, cwd: &str) {
-        let resolved = resolve_git_dirs(Path::new(cwd));
-        let mut map = self.watches.lock_safe();
-        match resolved {
-            Some((git_dir, common_dir)) => {
-                let same = map.get(&id).is_some_and(|w| w.git_dir == git_dir);
-                if !same {
-                    let last_sig = repo_signature(&git_dir, &common_dir);
-                    map.insert(
-                        id,
-                        Watch {
-                            git_dir,
-                            common_dir,
-                            last_sig,
-                        },
-                    );
-                }
-            }
-            None => {
-                map.remove(&id);
-            }
+        let Some((git_dir, common_dir)) = resolve_git_dirs(Path::new(cwd)) else {
+            self.watches.lock_safe().remove(&id);
+            return;
+        };
+        // Cheap check under a temporary guard, then release for the I/O.
+        if self.watches.lock_safe().get(&id).is_some_and(|w| w.git_dir == git_dir) {
+            return;
         }
+        let last_sig = repo_signature(&git_dir, &common_dir);
+        let mut map = self.watches.lock_safe();
+        if map.get(&id).is_some_and(|w| w.git_dir == git_dir) {
+            return; // installed while we were stat-ing; its baseline is fresher
+        }
+        map.insert(
+            id,
+            Watch {
+                git_dir,
+                common_dir,
+                last_sig,
+            },
+        );
     }
 
     /// Stop watching pane `id` (called when its pane is disposed).
@@ -453,6 +471,35 @@ mod tests {
         fs::create_dir_all(&sub).unwrap();
         w.watch(1, &sub.to_string_lossy());
         assert_eq!(w.poll_changed(), vec![1]);
+    }
+
+    #[test]
+    fn watch_repointed_to_a_different_repo_takes_a_fresh_baseline() {
+        // #743 S7 moved the baseline `repo_signature` out from under the
+        // `watches` lock, so the stat now runs in a window where the map is
+        // unlocked. The property that must survive that: a pane repointed at a
+        // DIFFERENT repo is baselined against the repo it moved to, not the one
+        // it left — otherwise the very next poll reports a spurious change for
+        // a repo nothing touched.
+        let tmp = tempfile::tempdir().unwrap();
+        let first = tmp.path().join("first");
+        let second = tmp.path().join("second");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        init_git(&first);
+        init_git(&second);
+        let w = GitWatcher::new();
+
+        w.watch(9, &first.to_string_lossy());
+        w.watch(9, &second.to_string_lossy());
+        assert_eq!(w.len(), 1, "a repoint replaces the watch, never adds one");
+        assert!(
+            w.poll_changed().is_empty(),
+            "the new repo was baselined at the repoint, so nothing is due yet"
+        );
+
+        fs::write(second.join(".git").join("HEAD"), "ref: refs/heads/side\n").unwrap();
+        assert_eq!(w.poll_changed(), vec![9], "and the new repo is the one being watched");
     }
 
     #[test]
