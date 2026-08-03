@@ -26753,8 +26753,9 @@ impl OrchRegistry {
     }
 
     /// The group's lifetime usage-token total (live + historical snapshots), the
-    /// figure the autonomy budget meters against. Reuses `group_usage` so the
-    /// live-agent refresh and the exact-token summing live in one place.
+    /// figure the autonomy budget meters against. Reuses the `group_usage`
+    /// computation so the live-agent refresh and the exact-token summing live
+    /// in one place.
     fn group_token_total(&self, group: &str) -> u64 {
         self.group_token_total_within(group, Duration::ZERO)
     }
@@ -28342,6 +28343,12 @@ impl OrchRegistry {
         if self.paused.lock_safe().remove(group) {
             let _ = fs::remove_file(self.group_dir(group).join("paused"));
         }
+        // …and the polled usage memo (#743 S4b), for the same reason: a group
+        // id is chosen by liveness and can be handed out again, so a surviving
+        // entry would be a dead group's figures answering for a new one. Also
+        // what keeps the map bounded by LIVE groups rather than by every group
+        // this process ever opened.
+        self.invalidate_usage_memo(group);
 
         self.audit(group, "human", "group-end", json!({
             "killed": killed,
