@@ -7016,6 +7016,7 @@ const STATUSLINE_SCAN_BYTES: usize = 64 * 1024;
 /// is why it reads the last `STATUSLINE_SCAN_BYTES` rather than cloning and
 /// ANSI-stripping the whole ≤256 KiB ring for one number that is by
 /// construction the last thing painted.
+#[doc(hidden)] // pub for integration tests
 pub fn statusline_cost(ptys: &crate::pty::PtyManager, pty_id: u32) -> Option<f64> {
     let raw = ptys.output_tail_bounded(pty_id, STATUSLINE_SCAN_BYTES)?;
     parse_session_cost(&strip_ansi(&raw))
@@ -9100,6 +9101,40 @@ pub struct OrchRegistry {
     /// orchestrator is registered — without this, two concurrent launches
     /// on one repo would share an id.
     creation: Mutex<()>,
+    /// Serializes a durable per-group **marker toggle** — the set mutation and
+    /// the marker file write/remove that makes it survive a restart — as one
+    /// unit (#743 S7 rev-231 N1). `set_notify` / `set_spawn_expanded`.
+    ///
+    /// **Why a second lock rather than just holding the set's.** The marker
+    /// file is load-time truth: it is what rebuilds the set at startup, so a
+    /// set mutation and its file write that can interleave do not merely race
+    /// for an instant — they can leave the file saying ON while memory says
+    /// OFF, and that divergence PERSISTS across the next restart, which then
+    /// reads the file. Holding the set's own lock across the write would fix
+    /// that and reintroduce exactly what INV-5 forbids: file IO under a lock a
+    /// poll path takes (`notify_enabled` / `spawn_expanded` are read by the
+    /// group view). So the *ordering* moves to a lock that no poll path ever
+    /// takes, and the set lock goes back to being a leaf held for one insert.
+    ///
+    /// This is deliberately structural rather than an appeal to dispatch.
+    /// Both toggles are sync commands today, so the one webview thread already
+    /// serialises them and the interleave cannot occur — but that is a fact
+    /// about the *callers*, invalidated silently by the first background or
+    /// MCP caller, and #743's own slices are converting sync commands to
+    /// off-thread ones. `GitWatcher::watch`'s released window in this same
+    /// change is safe by construction (its re-check), and this is held to the
+    /// same standard rather than a weaker one.
+    ///
+    /// Lock order: `marker_io` is taken FIRST and outermost — the set locks
+    /// and `AUDIT_LOCK` are taken under it, never the reverse. One lock for
+    /// both toggles, not one per group: these fire on a human's click.
+    ///
+    /// `pause_group`/`resume_group` have the same shape and the same latent
+    /// divergence, and are NOT folded in here — they predate this slice
+    /// (indeed the census cites `pause_group` as the pattern this drifted
+    /// from), and `resume_group` does far more than marker IO, so bringing it
+    /// under one lock is its own argument, not this change's.
+    marker_io: Mutex<()>,
     /// Test seam (#222): when set, `pr_head` returns this instead of shelling out
     /// to `gh pr view --json headRefOid`. The verdict↔revision binding has to be
     /// exercised through the real MCP dispatch against a repo that isn't on GitHub;
@@ -19350,6 +19385,7 @@ impl OrchRegistry {
             usage_memo: Mutex::new(HashMap::new()),
             default_branch_memo: Mutex::new(HashMap::new()),
             creation: Mutex::new(()),
+            marker_io: Mutex::new(()),
             pr_head_override: Mutex::new(None),
             pr_body_override: Mutex::new(None),
             paused: Mutex::new(HashSet::new()),
@@ -26198,15 +26234,20 @@ impl OrchRegistry {
     /// §4 X6) from inside `notify_groups`, so no lock-ordering question
     /// survives here at all.
     ///
-    /// **Reentrancy.** The set's own `insert`/`remove` still decides: only the
-    /// caller that actually flipped the state does the IO, so concurrent
-    /// enables produce one marker and one audit line however they interleave.
-    /// An enable racing a disable resolves to whichever won the set lock, which
-    /// is the non-determinism two fast clicks already had — and both callers
-    /// are the sync `orch_set_notify` command, dispatched on the one webview
-    /// thread, so the interleave needs two panes of the same group toggling in
-    /// the same instant to exist at all.
+    /// **Reentrancy.** Two things decide, and they are one unit. The set's own
+    /// `insert`/`remove` decides *whether* this call is a real transition, so
+    /// only the caller that actually flipped the state does the IO and repeated
+    /// enables produce one marker and one audit line. [`Self::marker_io`] then
+    /// decides the *order*: it is held across the whole toggle, so an enable
+    /// and a disable racing each other cannot land their file operations in the
+    /// opposite order to their set mutations. Without it the loser's write
+    /// could survive the winner's, leaving the marker — which is what rebuilds
+    /// this set at startup — disagreeing with memory for the rest of the
+    /// process AND across the next restart. See `marker_io`'s doc for why that
+    /// is not left to the fact that both callers happen to be sync commands on
+    /// the webview thread.
     pub fn set_notify(&self, group: &str, on: bool) -> Result<(), String> {
+        let _io = self.marker_io.lock_safe();
         let dir = self.group_dir(group);
         let changed = if on {
             self.notify_groups.lock_safe().insert(group.to_string())
@@ -26238,10 +26279,12 @@ impl OrchRegistry {
     /// `spawn_expanded` marker file, mirroring `notify`) so the choice survives
     /// restarts. `on=true` means "expand every spawn like before #260";
     /// `on=false` (the default) restores the minimize-on-spawn behavior.
-    /// Marker write and audit append run with the set guard released, and the
-    /// transition is decided under it — [`Self::set_notify`]'s shape, for the
-    /// reasons argued there (#743 S7).
+    /// Marker write and audit append run with the set guard released, the
+    /// transition decided under it, and the whole toggle ordered by
+    /// [`Self::marker_io`] — [`Self::set_notify`]'s shape, for the reasons
+    /// argued there (#743 S7).
     pub fn set_spawn_expanded(&self, group: &str, on: bool) -> Result<(), String> {
+        let _io = self.marker_io.lock_safe();
         let dir = self.group_dir(group);
         let changed = if on {
             self.spawn_expanded_groups.lock_safe().insert(group.to_string())

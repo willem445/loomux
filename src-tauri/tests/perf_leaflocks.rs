@@ -264,6 +264,53 @@ fn the_notify_toggle_does_its_io_once_per_actual_transition() {
 }
 
 #[test]
+fn concurrent_notify_toggles_never_leave_the_marker_disagreeing_with_memory() {
+    // rev-231 N1. The marker file is LOAD-TIME TRUTH — it is what rebuilds the
+    // in-memory set at startup — so a set mutation and its file write that can
+    // interleave do not merely race for an instant: the file can end up saying
+    // ON while memory says OFF, and the next restart believes the file. That is
+    // a divergence which survives the process, which is why `marker_io` orders
+    // the toggle structurally instead of the code resting on both callers
+    // happening to be sync commands on the webview thread.
+    //
+    // Honest about what this is: a **deterministic green, a probabilistic red**.
+    // With the ordering lock the invariant cannot be violated, so this never
+    // flakes; without it the interleave has to be hit, so it would not fail
+    // every run. It is a regression guard, not the red-before-green evidence —
+    // the argument in `marker_io`'s doc is the primary defence, and this test
+    // is what stops a future edit quietly removing it.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let marker = reg.state_root().join(&g.id).join("notify");
+
+    let threads: Vec<_> = (0..8)
+        .map(|t| {
+            let reg = reg.clone();
+            let group = g.id.clone();
+            std::thread::spawn(move || {
+                for i in 0..25 {
+                    reg.set_notify(&group, (t + i) % 2 == 0).unwrap();
+                }
+            })
+        })
+        .collect();
+    for t in threads {
+        t.join().expect("toggle thread");
+    }
+
+    // Whatever the last toggle was, the durable answer and the live answer are
+    // the same answer. They are read by different things — the marker by the
+    // next process, the set by this one — and a user who turns notifications
+    // off must not find them on after a restart.
+    assert_eq!(
+        marker.exists(),
+        reg.notify_enabled(&g.id),
+        "the notify marker and the in-memory set disagree: a restart would silently \
+         resurrect the setting the human last turned off (#743 S7 rev-231 N1)"
+    );
+}
+
+#[test]
 fn a_pane_that_is_gone_reports_no_statusline_cost() {
     // The fail-safe direction, unchanged by the bound: no pane, no figure —
     // never a stale or fabricated one.
