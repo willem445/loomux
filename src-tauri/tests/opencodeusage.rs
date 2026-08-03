@@ -414,6 +414,11 @@ fn test_registry() -> (OrchRegistry, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let reg = OrchRegistry::new(dir.path().to_path_buf());
     reg.set_port(45997);
+    // The claude arm of `compute_usage_snapshot` reads a transcript root, and
+    // `the_opencode_arm_never_fires_for_another_cli` drives it deliberately —
+    // point it at this disposable tree so no test here ever reads the real
+    // `~/.claude/projects`.
+    reg.set_claude_projects_dir(dir.path().join("claude-projects"));
     reg.set_claude_agents_dir_override(dir.path().join("claude-agents"));
     reg.set_copilot_agents_dir_override(dir.path().join("copilot-agents"));
     reg.set_compact_hook_dir_override(dir.path().join("compacthook"));
@@ -424,7 +429,7 @@ fn test_registry() -> (OrchRegistry, tempfile::TempDir) {
 #[test]
 fn an_opencode_agents_usage_comes_from_the_group_store_and_is_reported_not_estimated() {
     let (reg, _d) = test_registry();
-    let g = reg.create_group("C:/Projects/loomux", rails("opencode")).unwrap();
+    let g = reg.create_group("C:/tmp/opencode-repo", rails("opencode")).unwrap();
     let w = reg.spawn_agent(&g.id, Role::Worker, "w", "task", false, None).unwrap();
 
     // Session identification is slice C's; until it lands nothing sets this,
@@ -465,7 +470,7 @@ fn an_opencode_agents_usage_comes_from_the_group_store_and_is_reported_not_estim
 #[test]
 fn an_opencode_agent_whose_session_is_not_identified_yet_reports_no_usage() {
     let (reg, _d) = test_registry();
-    let g = reg.create_group("C:/Projects/loomux", rails("opencode")).unwrap();
+    let g = reg.create_group("C:/tmp/opencode-repo", rails("opencode")).unwrap();
     let w = reg.spawn_agent(&g.id, Role::Worker, "w", "task", false, None).unwrap();
     // A store with real spend in it — but nothing ties this agent to that
     // session, and guessing (newest row, only row, …) would attribute another
@@ -481,7 +486,7 @@ fn an_opencode_agent_whose_session_is_not_identified_yet_reports_no_usage() {
 #[test]
 fn a_missing_store_leaves_an_opencode_agent_at_zero_rather_than_wedging() {
     let (reg, _d) = test_registry();
-    let g = reg.create_group("C:/Projects/loomux", rails("opencode")).unwrap();
+    let g = reg.create_group("C:/tmp/opencode-repo", rails("opencode")).unwrap();
     let w = reg.spawn_agent(&g.id, Role::Worker, "w", "task", false, None).unwrap();
     let mut entry = w.clone();
     entry.session_id = Some(SES.to_string());
@@ -495,7 +500,7 @@ fn a_missing_store_leaves_an_opencode_agent_at_zero_rather_than_wedging() {
 #[test]
 fn the_opencode_arm_never_fires_for_another_cli() {
     let (reg, _d) = test_registry();
-    let g = reg.create_group("C:/Projects/loomux", rails("claude")).unwrap();
+    let g = reg.create_group("C:/tmp/opencode-repo", rails("claude")).unwrap();
     let w = reg.spawn_agent(&g.id, Role::Worker, "w", "task", false, None).unwrap();
     let mut entry = w.clone();
     entry.session_id = Some(SES.to_string());
