@@ -18,3 +18,4 @@ playwright-report/
 # is committed, this is not.
 .loomux/workflow.layout.json
 .scratch/
+.scratch/
