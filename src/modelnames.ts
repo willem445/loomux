@@ -57,14 +57,44 @@ const ALIAS_DESCRIPTIONS: Record<string, Record<string, string>> = {
  *  how the vendor writes it. */
 const ACRONYMS = new Set(["gpt", "api", "cli"]);
 
+/** Words whose own vendor spelling is neither lower-case nor title-case, keyed
+ *  by the lower-cased token. A BRAND, never a model: brands are stable, which is
+ *  what keeps this out of the #329 "model tables age badly" trap — the entry
+ *  spells a name the vendor has already committed to, and says nothing about
+ *  which of that vendor's models exist.
+ *
+ *  `deepseek` — the OpenCode Zen catalog lists it as "DeepSeek V4 Flash Free"
+ *  (Zen docs, per the `agent-cli-reference` discipline), so title-casing it to
+ *  "Deepseek" would be loomux mis-spelling somebody's product. */
+const WORD_CASINGS: Record<string, string> = { deepseek: "DeepSeek" };
+
 const isVersionToken = (t: string): boolean => /^\d+(\.\d+)*$/.test(t);
 const isWordToken = (t: string): boolean => /^[A-Za-z]+$/.test(t);
+/** `v4` in `deepseek-v4-flash-free`: a version written with its own `v`, which
+ *  the vendor renders as a separate word ("DeepSeek V4 Flash Free") rather than
+ *  binding it to the previous token the way a bare `4` binds. */
+const isVeeVersionToken = (t: string): boolean => /^v\d+(\.\d+)*$/.test(t);
 
-/** `claude-sonnet-4.6` → `Claude Sonnet 4.6`, `gpt-5.3-codex` → `GPT-5.3 Codex`.
+/** A provider id is the part before the `/` in opencode's `provider_id/model_id`
+ *  ids. Recognized narrowly on purpose: lower-case identifier characters only,
+ *  so a Bedrock ARN or any other identifier that merely happens to contain a `/`
+ *  is NOT split and goes on falling through to the untouched-passthrough. */
+const isProviderId = (t: string): boolean => /^[a-z0-9][a-z0-9._-]*$/.test(t);
+
+/** `claude-sonnet-4.6` → `Claude Sonnet 4.6`, `gpt-5.3-codex` → `GPT-5.3 Codex`,
+ *  `opencode/deepseek-v4-flash-free` → `DeepSeek V4 Flash Free`.
  *
  *  Structural only: it splits on `-`, title-cases words, upper-cases known
  *  acronyms, and rejoins version segments (`4-8` → `4.8`, the way Anthropic
  *  writes the model it names). It knows no model, so it cannot go stale.
+ *
+ *  **A `provider_id/model_id` id (opencode, #722) is named by its model half.**
+ *  The provider is dropped from the NAME, not from the id: `modelLabel` renders
+ *  `<id> — <name>`, so the id in front already carries `opencode/` verbatim and
+ *  repeating it in the name is width spent on nothing. The split is deliberately
+ *  narrow (one `/`, a lower-case identifier in front, a model half the
+ *  prettifier can actually improve) — anything else falls through untouched
+ *  rather than being half-rewritten.
  *
  *  **Returns the id untouched when it is not a plain hyphenated id** — a Bedrock
  *  inference-profile ARN, a gateway deployment name, anything with a `:` or
@@ -73,10 +103,32 @@ const isWordToken = (t: string): boolean => /^[A-Za-z]+$/.test(t);
 export function prettyModelId(id: string): string {
   const raw = id.trim();
   if (!raw) return "";
+  const slash = raw.indexOf("/");
+  if (slash !== -1) {
+    const provider = raw.slice(0, slash);
+    const model = raw.slice(slash + 1);
+    // A second `/` means this is not the two-part form (nor anything else this
+    // function can name), so it stays an identifier.
+    if (!isProviderId(provider) || !model || model.includes("/")) return raw;
+    const pretty = prettyModelId(model);
+    // The model half being unimprovable is the whole id being unimprovable —
+    // handing back a name that had only lost the provider off the front would be
+    // a mangle, which is the one outcome this function must never produce. The
+    // comparison is case-insensitive for the same reason `modelLabel`'s is:
+    // `opencode/auto` → `Auto` is a re-casing, and a name that only re-cases the
+    // id has not earned the space it takes.
+    return pretty.toLowerCase() === model.toLowerCase() ? raw : pretty;
+  }
   const tokens = raw.split("-");
-  if (!tokens.every((t) => isWordToken(t) || isVersionToken(t))) return raw;
+  if (!tokens.every((t) => isWordToken(t) || isVersionToken(t) || isVeeVersionToken(t))) return raw;
   const out: string[] = [];
   for (const t of tokens) {
+    if (isVeeVersionToken(t)) {
+      // Its own word: `deepseek-v4-flash-free` is "DeepSeek V4 Flash Free", not
+      // "DeepSeek.V4" — the `v` is already the separator the vendor wrote.
+      out.push(`V${t.slice(1)}`);
+      continue;
+    }
     if (isVersionToken(t)) {
       const prev = out[out.length - 1];
       // A version following a version is one version cut at a hyphen
@@ -92,7 +144,11 @@ export function prettyModelId(id: string): string {
       continue;
     }
     const lower = t.toLowerCase();
-    out.push(ACRONYMS.has(lower) ? lower.toUpperCase() : lower.charAt(0).toUpperCase() + lower.slice(1));
+    out.push(
+      ACRONYMS.has(lower)
+        ? lower.toUpperCase()
+        : (WORD_CASINGS[lower] ?? lower.charAt(0).toUpperCase() + lower.slice(1))
+    );
   }
   return out.join(" ");
 }
@@ -108,4 +164,22 @@ export function modelLabel(cli: string, id: string): string {
   // Case-insensitive, and NOT separator-insensitive: `auto`/`Auto` is noise, but
   // `claude-sonnet-4.6`/`Claude Sonnet 4.6` is the whole point of the exercise.
   return !pretty || pretty.toLowerCase() === raw.toLowerCase() ? raw : `${raw} — ${pretty}`;
+}
+
+/** What the picker shows for the curated entry whose id is EMPTY — the "send no
+ *  `--model` at all" option (`orchclis.INHERIT_MODEL`, #722). It is a real menu
+ *  entry, so it needs real text: an option rendered from `modelLabel("")` would
+ *  be a blank line the human has to guess at.
+ *
+ *  Deliberately not folded into `modelLabel`, whose `"" in → "" out` contract is
+ *  the right answer to "what is this id called": an empty id has no name, and
+ *  every OTHER caller asking that question wants nothing back rather than a
+ *  sentence. This function answers a different question — what a dropdown ROW
+ *  should read — which is why the two are separate. */
+export const INHERIT_MODEL_LABEL = "(none) — the model your own CLI config selects";
+
+/** The label for one row of a curated model list: `INHERIT_MODEL_LABEL` for the
+ *  empty id, `modelLabel` for every real one. */
+export function modelOptionLabel(cli: string, id: string): string {
+  return id.trim() === "" ? INHERIT_MODEL_LABEL : modelLabel(cli, id);
 }

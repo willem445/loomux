@@ -27,6 +27,7 @@ import {
   addBlock,
   newBlock,
   isValidBlockId,
+  isWorkflowCli,
   hasErrors,
   BLOCK_KINDS,
   WORKFLOW_VERSION,
@@ -1462,4 +1463,85 @@ test("with no capability data the knob checks DEFER — they never guess", () =>
   );
   // And a file that pins no knobs is unaffected whether caps are present or not.
   assert.deepEqual(codes(validateWorkflow(starterWorkflow(), lookup)), []);
+});
+
+// ---------- opencode as a spawnable block cli (#722) ----------
+
+/** opencode's `agent_cli_knobs` reply, verbatim from `CLI_CAPS` (mod.rs). */
+const OPENCODE_KNOBS: CliKnobs = {
+  cli: "opencode",
+  known: true,
+  effort: {
+    values: [],
+    note: "opencode's reasoning effort is a model VARIANT: a session flag on `opencode run` (--variant) but absent from the TUI loomux spawns, and settable per-agent in loomux's generated config (agent.<name>.variant, observed values minimal|high|max) — the seam exists, but the per-model vocabulary is provider-specific and unverified against a live run, so loomux does not write it yet",
+  },
+  context: {
+    values: [],
+    note: "opencode's context window is model-determined; no session-scoped variant switch is documented or present in the TUI's options",
+  },
+};
+
+const lookupWithOpencode = (cli: string, model: string) =>
+  cli === "opencode" ? knobState(OPENCODE_KNOBS, cli, model) : lookup(cli, model);
+
+test("a block may run cli: opencode, model and all (#722)", () => {
+  // The backend spawns it (`SUPPORTED_CLIS`), so a pane that flagged the file
+  // would send a human to fix a file that is already correct — and the pane's
+  // block editor would not even offer the CLI in its dropdown.
+  assert.ok(isWorkflowCli("opencode"));
+  const w = starterWorkflow();
+  w.blocks[1]!.cli = "opencode";
+  w.blocks[1]!.model = "opencode/deepseek-v4-flash-free";
+  assert.deepEqual(codes(validateWorkflow(w, lookupWithOpencode)), []);
+  // Through the text the human actually writes, provider `/` and all — parse,
+  // validate, serialize, re-read, with the id intact at every step.
+  const src = `version: 1
+blocks:
+  - id: rev-oc
+    name: Second opinion
+    kind: reviewer
+    cli: opencode
+    model: opencode/deepseek-v4-flash-free
+`;
+  const { workflow, findings } = parseWorkflow(src);
+  assert.deepEqual(
+    findings.map((f) => f.code),
+    []
+  );
+  assert.equal(workflow.blocks[0]!.cli, "opencode");
+  assert.equal(workflow.blocks[0]!.model, "opencode/deepseek-v4-flash-free");
+  const reread = parseWorkflow(serializeWorkflow(workflow)).workflow;
+  assert.equal(reread.blocks[0]!.model, "opencode/deepseek-v4-flash-free", "the provider prefix must survive a save");
+  // And the roster still rejects what the backend cannot spawn — widening the
+  // list must not have turned the check into a rubber stamp.
+  const bad = starterWorkflow();
+  bad.blocks[1]!.cli = "opencodex";
+  assert.ok(has(validateWorkflow(bad), "unknown-cli"));
+});
+
+test("an opencode block declaring effort: is a finding quoting opencode's own reason (#722)", () => {
+  // The real engine refuses it (`validate_knob`), because opencode's TUI has no
+  // variant flag. The pane has to say the same thing, in opencode's words — and
+  // must NOT quietly accept a level it cannot deliver just because the CLI is
+  // newly spawnable.
+  const w = starterWorkflow();
+  w.blocks[1]!.cli = "opencode";
+  w.blocks[1]!.effort = "high";
+  const f = validateWorkflow(w, lookupWithOpencode);
+  assert.deepEqual(codes(f), ["knob-unavailable"]);
+  const finding = f.find((x) => x.code === "knob-unavailable")!;
+  assert.equal(finding.blockId, "worker");
+  assert.equal(finding.severity, "error");
+  assert.match(finding.message, /--variant/, "the vendor's reason, not 'unsupported'");
+  // Same for context, and a block that pins neither stays clean.
+  const ctx = starterWorkflow();
+  ctx.blocks[1]!.cli = "opencode";
+  ctx.blocks[1]!.context = "1m";
+  assert.match(
+    validateWorkflow(ctx, lookupWithOpencode).find((x) => x.code === "knob-unavailable")!.message,
+    /model-determined/
+  );
+  const clean = starterWorkflow();
+  clean.blocks[1]!.cli = "opencode";
+  assert.deepEqual(codes(validateWorkflow(clean, lookupWithOpencode)), []);
 });

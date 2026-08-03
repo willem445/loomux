@@ -11,7 +11,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { modelLabel, prettyModelId } from "../src/modelnames.ts";
+import { modelLabel, modelOptionLabel, prettyModelId, INHERIT_MODEL_LABEL } from "../src/modelnames.ts";
 
 test("a documented Claude Code alias carries the vendor's own description", () => {
   assert.equal(modelLabel("claude", "sonnet"), "sonnet — latest Sonnet, for daily coding tasks");
@@ -71,4 +71,83 @@ test("the prettifier: hyphens become spaces, acronyms stay upper, versions rejoi
   assert.equal(prettyModelId("gpt-5.2"), "GPT-5.2");
   assert.equal(prettyModelId("gpt-5.3-codex"), "GPT-5.3 Codex");
   assert.equal(prettyModelId("gemini-2.5-pro"), "Gemini 2.5 Pro");
+});
+
+// ---------- provider-prefixed ids: opencode's `provider_id/model_id` (#722) ----------
+
+test("a provider-prefixed id is named by its model half, and keeps the `/` in the id (#722)", () => {
+  // The one thing that must never happen to an opencode id is the mangle slice A
+  // fixed in the backend: dropping the `/` turns
+  // `opencode/deepseek-v4-flash-free` into a model that does not exist. The label
+  // shows the id verbatim and adds the vendor's own name for it.
+  assert.equal(
+    modelLabel("opencode", "opencode/deepseek-v4-flash-free"),
+    "opencode/deepseek-v4-flash-free — DeepSeek V4 Flash Free"
+  );
+  assert.equal(modelLabel("opencode", "opencode/gpt-5.1-codex"), "opencode/gpt-5.1-codex — GPT-5.1 Codex");
+  // The NAME drops the provider (the id in front already carries it — repeating
+  // it is width spent on nothing); the ID never loses a character of it.
+  assert.equal(prettyModelId("opencode/deepseek-v4-flash-free"), "DeepSeek V4 Flash Free");
+  for (const id of [
+    "opencode/deepseek-v4-flash-free",
+    "opencode/deepseek-v4-flash",
+    "opencode/gpt-5.1-codex",
+    "anthropic/claude-sonnet-4.6",
+  ]) {
+    assert.ok(modelLabel("opencode", id).startsWith(`${id} `), `the id must survive verbatim: ${id}`);
+    assert.ok(modelLabel("opencode", id).includes("/"), `the provider separator must survive: ${id}`);
+  }
+});
+
+test("`v4` is a word, and DeepSeek is spelled the way its vendor spells it (#722)", () => {
+  // "DeepSeek V4 Flash Free" is the Zen catalog's own name for it. Title-casing
+  // would give "Deepseek", and binding the version would give "DeepSeek.V4" —
+  // both are loomux mis-spelling somebody else's product.
+  assert.equal(prettyModelId("deepseek-v4-flash-free"), "DeepSeek V4 Flash Free");
+  assert.equal(prettyModelId("deepseek-v4-flash"), "DeepSeek V4 Flash");
+});
+
+test("an id that merely CONTAINS a `/` is not split into a provider and a model", () => {
+  // A Bedrock inference-profile ARN has slashes and is not a `provider/model`
+  // id. Half-rewriting one would produce a name that is wrong rather than
+  // pretty, which is the outcome the prettifier exists to avoid.
+  const arn =
+    "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/us.anthropic.claude-sonnet-4-6-v1:0";
+  assert.equal(prettyModelId(arn), arn);
+  assert.equal(modelLabel("claude", arn), arn);
+  // Two slashes is not the two-part form either, and a `/` with nothing after it
+  // names no model at all.
+  assert.equal(prettyModelId("a/b/claude-sonnet-4.6"), "a/b/claude-sonnet-4.6");
+  assert.equal(prettyModelId("opencode/"), "opencode/");
+  // A provider whose model half has no name to give back stays an identifier in
+  // full — never a bare prefix with the model stripped off it.
+  assert.equal(prettyModelId("opencode/auto"), "opencode/auto");
+  assert.equal(modelLabel("opencode", "opencode/auto"), "opencode/auto");
+});
+
+// ---------- the "no --model at all" row (#722) ----------
+
+test("the empty curated id renders as a real row, not a blank one (#722)", () => {
+  // opencode is the one CLI with no alias to default to, so its list offers
+  // "inherit whatever the human configured" as an actual option. An option
+  // rendered from `modelLabel("")` would be a blank line to guess at.
+  assert.equal(modelOptionLabel("opencode", ""), INHERIT_MODEL_LABEL);
+  assert.ok(INHERIT_MODEL_LABEL.trim().length > 0, "the inherit row must have text");
+  // …and it says nothing about which model that is, because loomux does not know.
+  assert.ok(
+    !/deepseek|sonnet|opus|gpt/i.test(INHERIT_MODEL_LABEL),
+    "the inherit row must not name a model loomux is not selecting"
+  );
+  // Whitespace is not a model id either.
+  assert.equal(modelOptionLabel("opencode", "   "), INHERIT_MODEL_LABEL);
+  // Every non-empty id goes through `modelLabel` unchanged — one label rule, not two.
+  for (const [cli, id] of [
+    ["claude", "sonnet"],
+    ["opencode", "opencode/deepseek-v4-flash-free"],
+    ["copilot", "auto"],
+  ] as const) {
+    assert.equal(modelOptionLabel(cli, id), modelLabel(cli, id));
+  }
+  // `modelLabel` itself keeps its own contract: an empty id has no NAME.
+  assert.equal(modelLabel("opencode", ""), "");
 });

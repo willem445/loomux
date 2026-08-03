@@ -368,6 +368,53 @@ Both rows ship empty, with notes that say why:
 - **context.** Model-determined; no session-scoped variant switch is documented
   or present in the TUI's options.
 
+## The launcher and the workflow pane (#722 slice D)
+
+The frontend adds no vendor fact of its own. It asks
+(`agent_cli_knobs` → `CLI_CAPS`) and renders the answer: both opencode knobs
+come back with an empty value set and a note, which the existing generic path
+already renders as *disabled, carrying opencode's own reason*. No opencode
+special case exists in `selectorknobs.ts`, and adding one would be how the
+launcher comes to advertise a `--variant` loomux does not write.
+
+**The model picker offers "no model at all" as a real row, and lands on it.**
+Every other CLI has a vendor-neutral alias to default a role to — claude's
+strong/mid pair, copilot's `auto`, gemini's `pro`. opencode has none, which is
+why `default_model("opencode", _)` is empty. If the launcher defaulted a role
+to a curated id anyway, the two would disagree: the backend would be inheriting
+the human's own `opencode.json` model while the form quietly pinned one over
+it. So `orchclis.ts`' opencode row pins nothing on any role, and its curated
+list starts with the empty id — which the picker labels rather than rendering as
+a blank line, because a menu row a human cannot read is not an option.
+
+The curated ids are a shortcut, not a catalog:
+`opencode/deepseek-v4-flash-free` (the free Zen model #722 exists for), its paid
+sibling `opencode/deepseek-v4-flash`, and `opencode/gpt-5.1-codex` (the models
+reference's own example). The Zen free tier is broader and deliberately not
+enumerated — each row is another line of hardcoded model table to go stale
+(#329), against a `custom…` entry that already accepts any id and a merge with
+whatever the CLI's own `--help` reports.
+
+**The `/` survives every hop the frontend owns.** A curated id is the option's
+`value` verbatim; only the *label* is prettified, and the prettifier now names a
+`provider_id/model_id` id by its model half (`opencode/deepseek-v4-flash-free —
+DeepSeek V4 Flash Free`) while the id in front keeps every character. It splits
+narrowly — one `/`, a lower-case identifier in front, a model half it can
+actually improve — so a Bedrock ARN goes on passing through untouched, and an id
+whose model half only re-cases (`opencode/auto`) gets no name at all rather than
+a name with the provider stripped off it. The roster box prettifies nothing: it
+states what will be spawned, so an opencode block reads
+`reviewer · opencode · opencode/deepseek-v4-flash-free`, and an unpinned one
+reads `default model`.
+
+**PATH detection is unchanged, and deliberately not presence-gating.** opencode
+is listed like every other CLI; the launcher probes the program, warns inline as
+you pick, and refuses the whole launch on submit if it is missing. Hiding a CLI
+until a probe resolved would read as loomux having forgotten it — the same rule
+the disabled-with-a-reason knobs follow. The orchestrator-mode CLI id IS the
+program name probed, which `test/orchclis.test.ts` pins against the launchable
+agent catalog.
+
 ## Deliberately not done
 
 - **Solo-pane full channel membership** (#288). Not a gap: a solo launch
