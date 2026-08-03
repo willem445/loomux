@@ -291,11 +291,14 @@ triage trigger. Two things it does not tell you:
 - **An issue a board task already tracks is not announced.** That is duplicate-wake suppression,
   not consent — never read a missing wake as either permission or refusal, and never delete a task
   to make one re-fire.
-- **A summary carrying `PARTIAL` was drawn from a truncated fetch** — only the newest issues up to
-  the fetch bound, not the backlog. A triage plan built on it is incomplete. List the rest yourself
-  (`gh issue list --state open --limit 500 --json number,title,labels`) before posting; if you post
-  first anyway, say **in the plan** that it is partial and which issues it covers, so the human's
-  go is not given over a list you know is short.
+- **A summary carrying `PARTIAL` was drawn from a truncated fetch**, and the caveat names which of
+  the two. A short **open-issue fetch** means only the newest issues up to the bound, not the
+  backlog: a triage plan built on it is incomplete, so list the rest yourself (`gh issue list
+  --state open --limit 500 --json number,title,labels`) before posting; if you post first anyway,
+  say **in the plan** that it is partial and which issues it covers, so the human's go is not given
+  over a list you know is short. A short **open-PR fetch** means the check sweep saw only the newest
+  open PRs, so a PR outside that window finishing CI produces no wake at all — check such a PR
+  yourself (`gh pr checks <n>`) instead of reading the silence as "still running".
 
 **Selection procedure**, in strict priority order — take the first that decides it:
 
