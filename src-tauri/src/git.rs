@@ -56,12 +56,32 @@ use std::process::Command;
 ///
 /// Reads are deliberately NOT queued: they were already async since #399, so
 /// they could always overlap a write, and queueing them behind an unbounded
-/// fetch would be a new stall rather than a restoration. That overlap is safe
-/// only because the reads that touch the index never take `index.lock` —
-/// `git_status` and both index-reading `git_diff` modes pass
-/// `--no-optional-locks`, which is what suppresses git's opportunistic
-/// index write-back (pinned by `worktree_diff_never_writes_the_index` and its
-/// staged sibling). A read added here without that flag reopens the hazard.
+/// fetch would be a new stall rather than a restoration.
+///
+/// That overlap is *mostly* lock-free, and the exception is stated rather than
+/// glossed. Measured per command, in the state that provokes git's
+/// opportunistic index write-back — an entry that is stat-dirty but
+/// content-identical — and pinned by
+/// `only_git_status_is_protected_from_the_index_write`:
+///
+/// | read | takes `index.lock`? |
+/// | --- | --- |
+/// | `git_status` | no — `--no-optional-locks` suppresses it |
+/// | `git_diff` (staged) | no — `--cached` never refreshes |
+/// | `git_diff` (worktree) | **yes, and no flag prevents it** |
+///
+/// `git diff` rewrites the index with or without `--no-optional-locks`
+/// (`builtin/diff.c` refreshes through a path that never consults the setting),
+/// so that flag is deliberately not passed there: a no-op that reads like
+/// protection is worse than none. The residual is that a refresh-driven
+/// worktree diff can make a concurrent `stage`/`commit` fail to take the lock.
+/// It is not new — an async read could overlap a main-thread write ever since
+/// #399 — but #726 widens the window, because a read can now be *dispatched*
+/// while a write is running, where before the busy main thread prevented that.
+/// Closing it means either queueing the worktree diff (which would stall the
+/// diff pane behind an unbounded fetch, trading a rare error for a routine
+/// one) or retrying a lock-failed write; neither belongs in this change, and
+/// the test above is what keeps the choice from being forgotten.
 ///
 /// What the queue does *not* claim. It covers commands issued through the
 /// webview, not every writer in the process, and two others sit outside it:
@@ -263,17 +283,27 @@ pub async fn git_status(repo: String) -> Result<GitStatus, String> {
 /// Unified diff for one file. `mode`: "worktree" | "staged" | "commit" |
 /// "untracked".
 ///
-/// The two index-reading modes pass `--no-optional-locks`, like `git_status`.
-/// `git diff` otherwise performs an *opportunistic* index refresh: when an
-/// entry is stat-dirty but content-identical it rewrites `.git/index`, taking
-/// `index.lock` to do it. That write is pure optimization — the diff is
-/// identical without it — but it makes a read contend with a concurrent write,
-/// and since #726 a prompt-driven refresh (up to 2/s) or gitwatch's 1 s poll
-/// can now land in the middle of a queued `commit`/`stage`, which would then
-/// fail with "Unable to create '.git/index.lock'". Reads are outside the write
-/// queue precisely because they are supposed to be lock-free; this is what
-/// makes that true rather than assumed. `commit` mode (`git show`) and
-/// `untracked` never touch the index, so neither needs it.
+/// Worktree mode takes `index.lock`, and there is no flag that stops it.
+///
+/// `git diff` performs an *opportunistic* index refresh: when an entry is
+/// stat-dirty but content-identical it rewrites `.git/index` to cache the
+/// corrected stat, locking to do so. That write is pure optimization — the diff
+/// is byte-identical without it — but it makes this read contend with a
+/// concurrent write, and the loser is the writer: `refresh_index_quietly` gives
+/// up silently if it cannot lock, while a `commit`/`stage` that cannot lock
+/// fails with "Unable to create '.git/index.lock'".
+///
+/// The obvious fix does NOT work, which is measured rather than assumed
+/// (`only_git_status_is_protected_from_the_index_write` pins all three cells):
+/// `--no-optional-locks` suppresses the write for `git status`, but `git diff`
+/// rewrites the index with or without it, because `builtin/diff.c` refreshes
+/// through a path that never consults the setting. So the flag is deliberately
+/// NOT passed here — carrying a no-op that reads like protection is worse than
+/// carrying none. `--cached` never writes the index at all, and `commit` mode
+/// (`git show`) and `untracked` never touch it.
+///
+/// The residual is therefore real and is argued where it belongs, in
+/// `run_blocking`'s note on why reads stay outside the write queue.
 fn git_diff_sync(
     repo: String,
     path: String,
@@ -283,26 +313,11 @@ fn git_diff_sync(
     match mode.as_str() {
         "worktree" => run_git(
             &repo,
-            &[
-                "--no-optional-locks",
-                "-c",
-                "core.quotepath=false",
-                "diff",
-                "--",
-                &path,
-            ],
+            &["-c", "core.quotepath=false", "diff", "--", &path],
         ),
         "staged" => run_git(
             &repo,
-            &[
-                "--no-optional-locks",
-                "-c",
-                "core.quotepath=false",
-                "diff",
-                "--cached",
-                "--",
-                &path,
-            ],
+            &["-c", "core.quotepath=false", "diff", "--cached", "--", &path],
         ),
         "commit" => {
             let h = hash.ok_or("missing hash")?;
@@ -2020,17 +2035,18 @@ mod tests {
         );
     }
 
-    // ----- reads must not take index.lock (#726) -----
+    // ----- reads, index.lock, and what actually protects against it (#726) -----
 
-    /// Leave `f.txt` stat-dirty but content-identical — the exact state that
-    /// makes `git diff` want to write a refreshed index back — and return the
-    /// repo-relative path plus the `.git/index` bytes to compare against.
-    fn stat_dirty_repo(d: &Path) -> Vec<u8> {
-        // Same content, so the blob is unchanged and any diff must be empty;
-        // a clearly different mtime, so the entry's cached stat is stale. A day
+    /// Put `f.txt` in the one state that provokes git's opportunistic index
+    /// write — stat-dirty but content-identical — and return the `.git/index`
+    /// bytes as they stand just before the command under test runs.
+    fn stat_dirty_index(d: &Path) -> Vec<u8> {
+        // Same content, so the blob is unchanged and every diff below must be
+        // empty; a clearly different mtime, so the cached stat is stale. A day
         // back leaves no room for filesystem timestamp granularity to hide it.
         let f = d.join("f.txt");
-        std::fs::write(&f, "a\n").unwrap();
+        std::fs::write(&f, "a
+").unwrap();
         let t = std::fs::metadata(&f).unwrap().modified().unwrap();
         std::fs::File::options()
             .write(true)
@@ -2041,60 +2057,61 @@ mod tests {
         std::fs::read(d.join(".git").join("index")).unwrap()
     }
 
-    /// Both index-reading diff modes get their own test rather than one loop:
-    /// a loop panics on the first mode, which would leave the second mode's
-    /// assertion un-reached and therefore un-evidenced by any red.
-    #[test]
-    fn worktree_diff_never_writes_the_index() {
-        // Reads sit OUTSIDE the write queue (src/gitqueue.ts) on the argument
-        // that they are lock-free, and since #726 a prompt-driven refresh or
-        // gitwatch's 1 s poll can land in the middle of a queued commit/stage.
-        // `git diff` breaks that argument unless told not to: it takes
-        // `index.lock` to write back an opportunistically refreshed index —
-        // pure optimization, since the diff is identical either way.
-        let repo = new_repo();
-        let d = repo.path();
-        commit(d, "f.txt", "a\n", "A");
-        let before = stat_dirty_repo(d);
-
-        let out = git_diff_sync(p(d), "f.txt".into(), "worktree".into(), None).unwrap();
-        assert!(out.is_empty(), "content is unchanged, so the diff must be empty");
-        assert_eq!(
-            std::fs::read(d.join(".git").join("index")).unwrap(),
-            before,
-            "`git diff` rewrote .git/index — it takes index.lock to do that, so this read can \
-             knock over a concurrent stage/commit (#726). Pass --no-optional-locks."
-        );
-    }
-
-    /// NOT evidence for the `--cached` flag, and labelled so rather than left
-    /// looking like its sibling. In the mutation round that stripped
-    /// `--no-optional-locks` from BOTH diff modes (run 30782892203) this test
-    /// stayed green on all three platforms while `worktree_diff_…` reddened:
-    /// today's `git diff --cached` simply does not perform the opportunistic
-    /// index write-back, so no red for it can be banked and the flag on that
-    /// mode is precautionary.
+    /// Reads are left OUTSIDE the write queue (`src/gitqueue.ts`) on the
+    /// argument that they do not take `index.lock`. That argument is only as
+    /// good as which reads actually honour it, and the answer is not uniform —
+    /// so it is measured here rather than assumed, per command, in the one
+    /// state that provokes the write.
     ///
-    /// Kept anyway, as characterization rather than a pin: it asserts a fact
-    /// about git, not about us, and if a future git version starts refreshing
-    /// the index on `--cached` this is what tells us — which is also why the
-    /// flag stays on that arm. Weaker than it looks, said out loud (#689).
+    /// The uncomfortable cell is deliberate: `git diff` on the worktree DOES
+    /// rewrite the index, and `--no-optional-locks` does not stop it (verified
+    /// both ways — CI run 30783307529 failed an assertion claiming otherwise on
+    /// all three platforms while the flag was being passed). `builtin/diff.c`
+    /// refreshes through a path that never consults the setting, so the flag is
+    /// not passed there and this test pins the fact the design has to live
+    /// with. If a future git starts honouring it, THIS TEST FAILS — which is
+    /// the point: that is the day the read/write overlap note in
+    /// `run_blocking`'s doc can be revisited.
     #[test]
-    fn staged_diff_never_writes_the_index() {
+    fn only_git_status_is_protected_from_the_index_write() {
         let repo = new_repo();
         let d = repo.path();
-        commit(d, "f.txt", "a\n", "A");
-        let before = stat_dirty_repo(d);
+        commit(d, "f.txt", "a
+", "A");
+        let index = d.join(".git").join("index");
 
+        // `git status` — protected, and this is what makes #399's flag load
+        // bearing rather than decorative.
+        let before = stat_dirty_index(d);
+        git_status_sync(p(d)).unwrap();
+        assert_eq!(
+            std::fs::read(&index).unwrap(),
+            before,
+            "`git status` rewrote .git/index despite --no-optional-locks — the flag stopped              working, and the whole reads-are-lock-free argument rests on it (#726)"
+        );
+
+        // `git diff --cached` — never writes, with or without any flag.
+        let before = stat_dirty_index(d);
         let out = git_diff_sync(p(d), "f.txt".into(), "staged".into(), None).unwrap();
         assert!(out.is_empty(), "index matches HEAD, so the staged diff must be empty");
         assert_eq!(
-            std::fs::read(d.join(".git").join("index")).unwrap(),
+            std::fs::read(&index).unwrap(),
             before,
-            "`git diff --cached` rewrote .git/index — see worktree_diff_never_writes_the_index"
+            "`git diff --cached` started writing the index"
+        );
+
+        // `git diff` on the worktree — DOES write, and cannot be told not to.
+        // Asserting the defect rather than wishing it away keeps the residual
+        // impossible to forget and tells us the day git changes it.
+        let before = stat_dirty_index(d);
+        let out = git_diff_sync(p(d), "f.txt".into(), "worktree".into(), None).unwrap();
+        assert!(out.is_empty(), "content is unchanged, so the worktree diff must be empty");
+        assert_ne!(
+            std::fs::read(&index).unwrap(),
+            before,
+            "`git diff` no longer rewrites the index — good news, and a reason to revisit              run_blocking's note on reads overlapping writes (#726)"
         );
     }
-
     // ----- off-the-main-thread dispatch (#726, completing #399) -----
 
     #[test]

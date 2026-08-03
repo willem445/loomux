@@ -12,10 +12,11 @@
 //
 // Reads are deliberately NOT queued: they have been async since #399, so they
 // could always overlap a write, and putting them behind an unbounded fetch
-// would be a new stall rather than a restoration. That overlap is safe only
-// because the reads that touch the index pass `--no-optional-locks` (backend
-// side) so they never take `index.lock` to write back a refreshed one —
-// `git_status` and both index-reading `git_diff` modes do.
+// would be a new stall rather than a restoration. That overlap is lock-free
+// for `git_status` and for staged diffs, but NOT for a worktree diff — git
+// rewrites the index there and no flag prevents it. The measured matrix and
+// the residual it leaves live with the backend, in `run_blocking`'s doc in
+// src-tauri/src/git.rs; don't restate it here, it drifted once already.
 
 import { invoke } from "@tauri-apps/api/core";
 import { SerialQueue } from "./gitqueue";
