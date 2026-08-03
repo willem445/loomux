@@ -30721,6 +30721,14 @@ fn record_verdict_tells_the_reviewer_what_it_could_not_sample() {
 fn the_no_arg_sweep_caps_live_resolution_and_never_truncates_silently() {
     use loomux_lib::orchestration::mcp::LIST_VERDICTS_MAX_LIVE;
     let (reg, _d, _repo, gid) = gated_group("");
+    // `gated_group` seams the HEAD read but not the BODY one, so without this
+    // the ~45 body reads below spawn the RUNNER'S OWN `gh` — which the #791
+    // probe run caught red-handed, a row carrying gh's real "set the GH_TOKEN
+    // environment variable" complaint. Harmless before this PR; a flake source
+    // after it, because a sweep now has a 30s wall-clock budget and a runner
+    // whose `gh` answered slowly would trip it and fail this test for a reason
+    // that has nothing to do with the cap it is pinning.
+    reg.set_pr_body_override(Some("a body every PR in this test shares".into()));
     let sec = reviewer_caller(&reg, &gid, "rev-security");
     let orch = reg.spawn_agent(&gid, Role::Orchestrator, "orch", "", false, None).unwrap();
     let co = reg.resolve_token(&orch.token).unwrap();
