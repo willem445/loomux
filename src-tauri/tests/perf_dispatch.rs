@@ -365,35 +365,6 @@ const SYNC_COMMANDS: &[Row] = &[
         issue: Some("#746"),
     },
     Row {
-        name: "load_ui_tabs",
-        class: Class::Debt,
-        reason: "Reads the persisted tab layout from disk on the webview thread, including the \
-                 quarantine-rename path taken when the file will not parse. Once per launch, but \
-                 it is launch latency the user feels as a slow start.",
-        issue: Some("#746"),
-    },
-    Row {
-        name: "save_ui_tabs",
-        class: Class::Debt,
-        reason: "Serialises the tab layout, fsyncs it and renames it into place, on the webview \
-                 thread. Fired on layout gestures, so the fsync lands mid-interaction.",
-        issue: Some("#746"),
-    },
-    Row {
-        name: "load_settings",
-        class: Class::Debt,
-        reason: "Reads and parses settings.json on the webview thread, with the same \
-                 quarantine-rename fallback as load_ui_tabs when the file is corrupt.",
-        issue: Some("#746"),
-    },
-    Row {
-        name: "save_settings",
-        class: Class::Debt,
-        reason: "Writes settings.json with an fsync and a rename, on the webview thread, from the \
-                 settings dialog's save gesture.",
-        issue: Some("#746"),
-    },
-    Row {
         name: "record_copilot_launch_posture",
         class: Class::Debt,
         reason: "Reads the launch-intent file and writes it back fsync-ed and renamed, on the \
