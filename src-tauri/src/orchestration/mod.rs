@@ -40605,6 +40605,11 @@ mod idle_tick_notice_tests {
         let n = idle_tick_notice(None, false);
         assert!(n.starts_with("[loomux] idle tick: you have been idle"), "got: {n}");
         assert!(!n.contains("host-side intake poll"), "must not claim a finding that doesn't exist: {n}");
+        // #805: the fallback pointed at the allow-listed label by name; it must
+        // name the label `gh.rs`'s ALLOWED_LABELS/validate_labels actually accepts
+        // (`agent-investigation`), not the shorter `agent-investigate` the
+        // issue-#82 plan text used, which the backend rejects on write.
+        assert!(n.contains("agent-investigation"), "must name the real, writable label: {n}");
     }
 
     #[test]
