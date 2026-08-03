@@ -100,9 +100,10 @@ const DEBT_OWNERS: &[(&str, &str)] = &[
     ),
     (
         "#743 S7",
-        "Slice S7 (leaf locks): gitwatch's signature IO moves outside the watches lock, and \
-         PtyManager::kill drops the map lock before killer.kill(). Both are INV-5 lock-scope \
-         work on commands this test classes by their dispatch, not their locks.",
+        "Slice S7 (leaf locks): gitwatch's signature IO moves outside the watches lock. INV-5 \
+         lock-scope work on a command this test classes by its dispatch, not its locks. (S7's \
+         plan also lists PtyManager::kill, but see the kill_pty row — that one is already a \
+         leaf, so it is not a debt row here.)",
     ),
     (
         "#762",
@@ -124,6 +125,16 @@ const DEBT_OWNERS: &[(&str, &str)] = &[
 /// 44 async = 20 A + #726's 16 + #752's 8; 20 `cheap` = the 20 C; 5 `exception`
 /// = the 4 T plus `resize_pty` (census B, but §4 X1 argues it stays sync);
 /// 66 `debt` = 91 B − 16 (#726) − 8 (#752) − 1 (`resize_pty`).
+///
+/// CITE CONVENTION. A `reason` that points at code names the **symbol** and
+/// carries the line only as a parenthetical hint (`… in `PtyManager::kill`
+/// (pty.rs:507 at this commit)`). Raw line numbers rot the moment anything
+/// above them moves, and they rot *silently* — a rebase carries the old number
+/// across and nothing marks it stale. That is not hypothetical here: #752
+/// inserted ~101 lines into `orchestration/mod.rs` and invalidated a cite in
+/// this file, caught only in review. The symbol survives the move; the number
+/// is a convenience that is allowed to be approximate. #762's slices will keep
+/// moving `mod.rs` under this manifest, so this is the shape that holds.
 const SYNC_COMMANDS: &[Row] = &[
     // ---------------------------------------------------------------------
     // exception — deliberate, argued in code and in performance.md §4.
@@ -134,8 +145,8 @@ const SYNC_COMMANDS: &[Row] = &[
         reason: "Stays sync to inherit arrival ordering from main-thread dispatch: two different \
                  sizes can be outstanding and off-thread dispatch could land them in either \
                  order, leaving ConPTY at the older geometry with no event to correct it. See \
-                 performance.md §4 X1; the argument and its named falsifier are in code at \
-                 pty.rs:1566-1594.",
+                 performance.md §4 X1; the argument and its named falsifier are the doc comment \
+                 on `resize_pty` itself (pty.rs:1566-1594 at this commit).",
         issue: None,
     },
     Row {
@@ -143,8 +154,8 @@ const SYNC_COMMANDS: &[Row] = &[
         class: Class::Exception,
         reason: "Hands the delete to a dedicated OS thread that enters its own STA, because \
                  SHFileOperationW is a Shell/COM API and a generic async pool has no defined \
-                 apartment state. See performance.md §4 X2; argued in code at \
-                 filemgr.rs:846-886.",
+                 apartment state. See performance.md §4 X2; argued in the doc comment on \
+                 `fm_delete_start` itself (filemgr.rs:846-886 at this commit).",
         issue: None,
     },
     Row {
@@ -180,18 +191,20 @@ const SYNC_COMMANDS: &[Row] = &[
         class: Class::Cheap,
         reason: "One Path::is_file() stat of the sideloaded conpty.dll next to the exe, to pick \
                  the reported conhost build. A single stat of a local path, read once at launcher \
-                 time — named here rather than hidden, because it is the one row where cheap \
-                 means one syscall rather than none.",
+                 time — named here rather than hidden, because the marker check below cannot see \
+                 a stat (#769) and this row is why that gap is not theoretical.",
         issue: None,
     },
     Row {
         name: "kill_pty",
         class: Class::Cheap,
-        reason: "Removes the handle from the map and signals the child; killer.kill() is a \
-                 non-waiting syscall. The cost that is real here is lock scope, not dispatch: the \
-                 kill runs under the ptys map lock (pty.rs:507-513), the one exception to this \
-                 file's own map-then-leaf rule. That is INV-5 work, owned by S7.",
-        issue: Some("#743 S7"),
+        reason: "Removes the handle from the map, then signals the child; killer.kill() is a \
+                 non-waiting syscall. It already follows P3: `PtyManager::kill` takes the map lock \
+                 inside a `let` initializer, so the guard is a temporary dropped at that \
+                 statement's semicolon and the kill runs with the map lock RELEASED. #743's census \
+                 (part 1) reads this as a lock-held exception and S7's plan inherits that; the \
+                 code has had this shape since it was written, so there is nothing to move.",
+        issue: None,
     },
     Row {
         name: "ft_search_cancel",
@@ -313,10 +326,11 @@ const SYNC_COMMANDS: &[Row] = &[
     Row {
         name: "orch_confirm_solo_copilot_autopilot",
         class: Class::Cheap,
-        reason: "The body is a one-line delegate that registers the consent watcher; the watcher \
-                 itself runs on a helper-spawned thread (mod.rs:23898), which is off the webview \
-                 thread but out of this scan's reach — the call-chain bound this file states up \
-                 front. The census labels it C/T for exactly that reason.",
+        reason: "The body is a one-line delegate to `OrchRegistry::confirm_solo_copilot_autopilot`, \
+                 which starts the consent watcher on a raw std::thread::spawn and returns \
+                 (mod.rs:23999 at this commit) — off the webview thread, but out of this scan's \
+                 reach, which is the call-chain bound this file states up front. The census labels \
+                 it C/T for exactly that reason.",
         issue: None,
     },
     Row {
@@ -1555,9 +1569,12 @@ fn cheap_commands_carry_no_spawn_shell_out_or_filesystem_marker() {
     }
     assert!(
         problems.is_empty(),
-        "{problems:?} — `cheap` means in-memory only (performance.md §3 INV-1). A command that \
-         spawns a process or touches the filesystem on the webview thread is `debt` with an \
-         owning issue, or an argued `exception` in §4; it is never cheap"
+        "{problems:?} — `cheap` means in-memory only (performance.md §3 INV-1). A command whose \
+         body carries one of these markers belongs in `debt` with an owning issue, or in an \
+         argued `exception` in §4. Note what this can and cannot say: the marker list is INV-2's, \
+         verbatim, so a filesystem PROBE (`Path::is_file`, `exists`) is not on it and a cheap row \
+         can still hold one — `pty_backend_info` does, disclosed in its reason. Widening the list \
+         is an INV-2 change, tracked as #769; until then the reason field carries that residue"
     );
 }
 
@@ -1651,7 +1668,17 @@ fn every_declared_owner_actually_owns_something() {
     // converted is a closed issue still listed as pending work — the same
     // staleness the manifest equality refuses for rows, applied to the table
     // that gives them their meaning.
-    let used: BTreeSet<&str> = SYNC_COMMANDS.iter().filter_map(|r| r.issue).collect();
+    //
+    // **Debt rows only.** A non-debt row may name an issue as a pointer (a
+    // `cheap` row noting who owns its lock scope, say), and counting those
+    // would let one keep an owner alive after its last real debt converted —
+    // exactly the staleness this test exists to catch, hidden by a row that
+    // was never the issue's work in the first place.
+    let used: BTreeSet<&str> = SYNC_COMMANDS
+        .iter()
+        .filter(|r| r.class == Class::Debt)
+        .filter_map(|r| r.issue)
+        .collect();
     let unused: Vec<&str> = DEBT_OWNERS
         .iter()
         .map(|(id, _)| *id)
