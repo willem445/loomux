@@ -35,8 +35,8 @@ Each is shipped, tested, and citable — prefer copying one to inventing a shape
 
 - **P1 — `spawn_blocking` the whole body.** The command is a thin `async fn`
   whose entire body is handed off, nothing before the first await. Precedent:
-  `gh.rs` (all 10 commands, #724), `write_pty`/`change_dir` (`pty.rs:1552`,
-  #734).
+  `gh.rs` (all 10 commands, #724), `write_pty` (`pty.rs:1552`) and `change_dir`
+  (`:1657`), both #734.
 - **P2 — Coalesce per frame, leading edge, byte cap.** Bound a
   producer-rate stream backend-side to ≤1 event per pane per 60 Hz frame with
   a hard batch cap, emitting immediately when the producer has been quiet so
@@ -88,25 +88,27 @@ scan pins the shape.
   with class `cheap` (in-memory only), `exception` (§4), or `debt` (an existing
   offender, owning issue named). A new unargued sync command is refused by a
   test, not by a reviewer's memory. Sync commands that hand work to a raw
-  `std::thread::spawn` and return are `exception` entries. *Enforced: E1.*
+  `std::thread::spawn` and return are `exception` entries.
+  *Enforced: E1 (#743 S2).*
 - **INV-2 — No process spawn and no network round trip on the webview thread,
   ever.** No class permits it: `cheap` bodies additionally must carry no
   `Command::new` / `ShellExecuteW` / `.output(` / `fs::` marker, and only a
   `debt` entry may name one, each pointing at its conversion issue. Webview-
-  thread file IO is an `exception` only with a stated bound. *Enforced: E1 +
-  review.*
+  thread file IO is an `exception` only with a stated bound.
+  *Enforced: E1 (#743 S2) + review.*
 - **INV-3 — Producer-rate event streams are bounded before the webview pays.**
   A stream whose rate is set by an external producer (child output, agent
   activity, a walk) is bounded backend-side by P2 or handler-side by P5. Every
   `listen()` appears in E2's stream manifest with `{rate class, bound:
   backend-coalesced | rAF-gated | throttled | argued-none(reason)}`; a new
-  listener with no declared bound is refused. *Enforced: E2.*
+  listener with no declared bound is refused. *Enforced: E2 (#743 S3).*
 - **INV-4 — Cadenced work declares itself.** Every `setInterval` appears in
   E2's timer manifest with `{cadence, visibility policy: gated |
   component-scoped | argued(reason)}`; a frontend timer that drives IPC or
   rendering is visibility-aware or argued. A backend tick is bounded per tick
   (#656/#695) and never holds a cross-group lock across subprocess IO — the
-  merge-queue driver is the argued exception (§4 X4). *Enforced: E2 + review.*
+  merge-queue driver is the argued exception (§4 X4).
+  *Enforced: E2 (#743 S3) + review.*
 - **INV-5 — Locks on latency-sensitive paths are leaves.** Map lock → release →
   leaf lock; reads are request-sized rather than clone-then-slice; CPU work
   (ANSI strip, parse, JSON format) runs outside the guard; no file IO under a
@@ -130,7 +132,7 @@ These are deliberate and stay. Each is argued **in code** at the cite; an E1/E2
 | **X3** | The `thread::spawn`-and-stream family: `ft_search_start`, `ft_files_start`, `fm_hash_start` | `fileedit.rs:1134`, `:1211`, `filehash.rs:221` | Sync commands that start a cancellable streaming walk and return immediately. The work is off the webview thread and the results arrive as bounded batch events (P5 gates the handler side); the shared cancel registry is why they are threads with a flag rather than opaque pool tasks. | INV-1 |
 | **X4** | `mq_state_lock` held across git/gh subprocess runs, on the fleet's single gh-poll thread | `orchestration/mod.rs:8849` (doc), `:36636`, `mqdriver.rs:202` | One registry-wide lock is deliberate — the driver services one group per tick, so per-group locks buy no usable concurrency at the cost of a lock-ordering question. Every call is bounded by `MQ_CMD_TIMEOUT` (60 s), and the coupling is self-documented. **Scope of the exception: it costs fleet latency, not GUI latency** — nothing here runs on the webview thread. Decoupling is #748, not a licence to widen this. | INV-4, INV-5 |
 | **X5** | The compact-nudge cadence reads every agent's full pty tail | `orchestration/mod.rs:25714-25749` (doc), `:25750` | The elevated cadence is registry-wide and its cost is bounded and stated: ≤256 KiB × 6 wakes/min per agent (sub-1 MiB/s for a large fleet), and the elevated cadence itself cannot run beyond ~20 min by the state machine's own timeouts. Two cheap tightenings are named in-code, neither built speculatively. | INV-5 |
-| **X6** | `AUDIT_LOCK` and `creation` are process-global | `orchestration/mod.rs:9903`, `:8965` | Both serialize by design. `AUDIT_LOCK` makes append and rotation one unit and is held only for the open+write, never across orchestration work; the JSON is formatted before the lock is taken. `creation` serializes group id choice against orchestrator registration, which is a correctness requirement, and fires once per group launch. Named so each stays a decision rather than an accident. | INV-5 |
+| **X6** | `AUDIT_LOCK` and `creation` are process-global | `orchestration/mod.rs:9903`, `:8965`, `:10077-10083` | Both serialize by design. `AUDIT_LOCK` makes append and rotation one unit and is held only for the open+write, never across orchestration work; the JSON is formatted before the lock is taken. `creation` serializes group id choice against orchestrator registration, which is a correctness requirement, and fires once per group launch. Named so each stays a decision rather than an accident. | INV-5 |
 
 An exception is not a precedent. A new one needs its own argument, in code at
 the site, and a row here.
