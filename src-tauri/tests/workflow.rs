@@ -4302,6 +4302,29 @@ fn a_workflow_group_is_told_to_spawn_by_block_and_fan_out_to_every_reviewer() {
 }
 
 #[test]
+fn the_gate_section_names_passing_the_pr_to_list_verdicts_as_the_norm() {
+    // #791. `list_verdicts(pr)` was already written this way here, but only as a
+    // form — nothing said the bare `list_verdicts()` costs live `gh` calls for
+    // every PR the group has ever recorded a verdict on, so a reader picking
+    // between the two had no reason to prefer either. On a slow network that
+    // choice is the difference between an answer and a wedged turn.
+    //
+    // Pinned as SUBSTANCE (`flat`), not as bytes: the rule is what must survive
+    // a reflow of the paragraph it lives in.
+    let (reg, _d) = test_registry();
+    let repo = Repo::new().workflow(FOCUSED_REVIEW);
+    let g = reg.create_group(&repo.path(), rails()).unwrap();
+    let orch = flat(&instructions_lf(&reg, &g.id, "orchestrator.md"));
+
+    assert!(orch.contains("`list_verdicts(pr)` is the norm"),
+        "the norm has to be stated outright: {orch}");
+    assert!(orch.contains("deliberate, rare choice"),
+        "…and the no-arg form named as the exception rather than an equal alternative: {orch}");
+    assert!(orch.contains("live `gh` calls"),
+        "…with the COST that makes it one, or it reads as style advice: {orch}");
+}
+
+#[test]
 fn a_focused_reviewer_is_told_it_is_one_of_several_and_to_stay_in_its_lane() {
     // The failure this prevents: three reviewers each doing the same generic
     // review, tripling the bill and burying the one finding that was theirs.

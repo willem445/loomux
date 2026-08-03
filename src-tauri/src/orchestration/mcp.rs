@@ -242,9 +242,9 @@ fn tool_defs(role: Role, role_hint: Option<&str>) -> Vec<Value> {
             json!({ "id": { "type": "string", "description": "Task id, e.g. t-3" } }),
             &["id"]),
         tool("list_verdicts",
-            "Read the recorded review verdicts for a PR: which reviewer block recorded what (pass | fail | escalate), when, and its summary — plus, when this repo's .loomux/workflow.yml declares a merge gate, whether that gate is satisfied. This is STATE, not a notification: it is what the loomux gh interceptor reads when it decides whether to allow `gh pr merge`. Each verdict also carries `body_changed` when loomux can tell whether the PR body moved since it was recorded (absent = it cannot tell): on a `pass` that means the text a squash merge would commit is not what was approved — send the reviewer back; on a `fail`/`escalate` it means the body was edited afterwards, so check whether the finding is already fixed before routing it to a worker. Omit pr to list every PR with a recorded verdict.",
+            "Read the recorded review verdicts for a PR: which reviewer block recorded what (pass | fail | escalate), when, and its summary — plus, when this repo's .loomux/workflow.yml declares a merge gate, whether that gate is satisfied. This is STATE, not a notification: it is what the loomux gh interceptor reads when it decides whether to allow `gh pr merge`. Each verdict also carries `body_changed` when loomux can tell whether the PR body moved since it was recorded (absent = it cannot tell): on a `pass` that means the text a squash merge would commit is not what was approved — send the reviewer back; on a `fail`/`escalate` it means the body was edited afterwards, so check whether the finding is already fixed before routing it to a worker. PASS `pr` WHENEVER YOU HAVE ONE — you almost always do, since you are asking about a PR someone just reported. Omitting it is a deliberate, rare choice (a cold start, or a sweep for verdicts you have lost track of): the no-arg form walks EVERY PR this group has ever recorded a verdict for and makes live `gh` calls per PR to resolve its head and body, so it costs proportionally more the longer the group has run and is the form that suffers first on a slow or proxied network.",
             json!({
-                "pr": { "type": "string", "description": "PR number, #n, or URL. Omit to list all PRs with verdicts." },
+                "pr": { "type": "string", "description": "PR number, #n, or URL. Pass this whenever you have one. Omit ONLY to sweep every PR with a verdict — proportionally slower, live gh calls per PR." },
             }),
             &[]),
         tool("request_compact",
@@ -1224,7 +1224,16 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             // happens next (send the findings back to the worker, ask the human,
             // merge), and loomux's design norm is that agent→agent traffic arrives
             // as a VISIBLE prompt in the recipient's pane — never a side channel.
-            let gate = reg.gate_status_line(&caller.group, rec.pr);
+            // The digest `record_verdict` just bound this verdict to IS the PR
+            // body's digest right now — so the gate line reuses it rather than
+            // spending a second `gh pr view --json body` on the same fact one
+            // instant later (#791). Empty means the body was unreadable, which
+            // is what `None` means here too.
+            let gate = reg.gate_status_line_with(
+                &caller.group,
+                rec.pr,
+                (!rec.body_digest.is_empty()).then_some(rec.body_digest.as_str()),
+            );
             let _ = reg.deliver_to_orchestrator(
                 &caller.group,
                 &format!(
@@ -1272,7 +1281,7 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                         .verdicts(&caller.group, pr)
                         .into_iter()
                         .map(|v| {
-                            let changed = v.body_changed(now.as_deref());
+                            let changed = v.body_changed(now.as_deref().ok());
                             let mut val = serde_json::to_value(&v).unwrap_or(Value::Null);
                             if let (Some(changed), Some(obj)) = (changed, val.as_object_mut()) {
                                 obj.insert("body_changed".into(), json!(changed));
@@ -1280,11 +1289,25 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                             val
                         })
                         .collect();
-                    json!({
+                    // The gate line wants the SAME digest — handed over rather
+                    // than re-fetched, so one PR costs two live `gh` reads and
+                    // not three (#791).
+                    let mut row = json!({
                         "pr": pr,
                         "verdicts": verdicts,
-                        "gate": reg.gate_status_line(&caller.group, pr),
-                    })
+                        "gate": reg.gate_status_line_with(&caller.group, pr, now.as_deref().ok()),
+                    });
+                    // #791: an unreadable body is why `body_changed` is absent
+                    // above, and absent-with-no-reason is exactly the shape that
+                    // sent a human digging through loomux's source. Present only
+                    // when the read actually failed, so the happy path is byte
+                    // for byte what it was — and it names the bound when the bound
+                    // is what stopped it ("timed out after 20s"), which is the one
+                    // answer an agent could not previously get at all.
+                    if let (Err(why), Some(obj)) = (&now, row.as_object_mut()) {
+                        obj.insert("body_read_error".into(), json!(why));
+                    }
+                    row
                 })
                 .collect();
             Ok(serde_json::to_string(&out).unwrap_or_default())
