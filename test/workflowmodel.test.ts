@@ -1467,7 +1467,12 @@ test("with no capability data the knob checks DEFER — they never guess", () =>
 
 // ---------- opencode as a spawnable block cli (#722) ----------
 
-/** opencode's `agent_cli_knobs` reply, verbatim from `CLI_CAPS` (mod.rs). */
+/** opencode's `agent_cli_knobs` reply, verbatim from `CLI_CAPS` (mod.rs). A
+ *  hand-copied literal, like every other fixture here — the note text's fidelity
+ *  to the Rust source (including the `--variant` / `model-determined` substrings
+ *  the assertions below match on) is pinned by `selectorknobs.test.ts`' last
+ *  test, which reads `CLI_CAPS` back. What THIS file asks of it is only that a
+ *  finding quotes the CLI's own reason rather than saying "unsupported". */
 const OPENCODE_KNOBS: CliKnobs = {
   cli: "opencode",
   known: true,

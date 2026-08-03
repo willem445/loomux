@@ -21,6 +21,9 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { knobState, knobValue, type CliKnobs } from "../src/selectorknobs.ts";
 
 /** The `agent_cli_knobs` reply for claude, verbatim from `CLI_CAPS` (mod.rs). */
@@ -174,12 +177,13 @@ test("knobValue: a disabled knob can never put a value on the wire", () => {
 
 // ---------- opencode (#722): both knobs off, with the real seam named ----------
 
-/** opencode's reply, verbatim from `CLI_CAPS` (mod.rs, slice A). Both value sets
- *  are empty and both notes are long, and that is the point: the effort note
- *  names a seam that genuinely EXISTS (`--variant` on `opencode run`,
- *  `agent.<name>.variant` in the generated config) and says why loomux does not
- *  write it yet. A shorter "unsupported" would have been a claim the source
- *  contradicts. */
+/** opencode's reply, verbatim from `CLI_CAPS` (mod.rs, slice A) — and *pinned*
+ *  verbatim, not merely captioned so: the last test in this file reads both
+ *  strings back out of the Rust source. Both value sets are empty and both notes
+ *  are long, and that is the point: the effort note names a seam that genuinely
+ *  EXISTS (`--variant` on `opencode run`, `agent.<name>.variant` in the
+ *  generated config) and says why loomux does not write it yet. A shorter
+ *  "unsupported" would have been a claim the source contradicts. */
 const OPENCODE: CliKnobs = {
   cli: "opencode",
   known: true,
@@ -240,4 +244,51 @@ test("a claude reply that arrives late must not enable knobs on an opencode row 
   assert.equal(stale.effort.enabled, false);
   assert.equal(stale.context.enabled, false);
   assert.match(stale.effort.reason, /has not read opencode's capabilities yet/);
+});
+
+test("rev-237 finding 1: the opencode fixture's notes mirror the Rust source they're copied from (#722)", () => {
+  // The fixture above is a hand-copied literal, so every assertion in this file
+  // that compares against it is really the copy against itself: emptying or
+  // REWORDING opencode's notes in `CLI_CAPS` cannot redden a frontend test. The
+  // emptying half is already policed backend-side
+  // (`src-tauri/tests/orchestration.rs`, which asserts every row's notes are
+  // non-empty); DRIFT was policed nowhere, and a fixture that says "verbatim" and
+  // isn't leaves this file asserting text the UI no longer renders, green.
+  //
+  // Same fix, same reasoning as `roster.test.ts`'s `MAX_AGENTS_CEILING` pin:
+  // nothing at the type level ties a TS copy to a Rust literal, so read the Rust
+  // back and fail loudly the day someone changes one without the other, rather
+  // than trusting a caption to catch it.
+  const here = dirname(fileURLToPath(import.meta.url));
+  const rustSrc = readFileSync(join(here, "..", "src-tauri", "src", "orchestration", "mod.rs"), "utf8");
+  const row = rustSrc.match(/CliCaps \{\s*\n\s*cli: "opencode",[\s\S]*?\n {4}\},/);
+  assert.ok(
+    row,
+    "mod.rs's opencode CLI_CAPS row must match this exact pattern — update it here too if that block's shape changes"
+  );
+  const declared = (key: string): string => {
+    const m = row![0].match(new RegExp(`${key}: "([^"]*)"`));
+    assert.ok(m, `opencode's ${key} must be a plain string literal in mod.rs — update this reader if it stops being one`);
+    return m![1]!;
+  };
+  assert.equal(OPENCODE.effort.note, declared("effort_note"), "the effort note has drifted from CLI_CAPS");
+  assert.equal(OPENCODE.context.note, declared("context_note"), "the context note has drifted from CLI_CAPS");
+  // The value sets are the other half of the claim, and the one that decides
+  // whether the knobs render at all: an opencode row that grew a vocabulary
+  // backend-side must not keep being tested as though it had none.
+  assert.match(row[0], /effort_levels: &\[\],/, "opencode's effort vocabulary is no longer empty in CLI_CAPS");
+  assert.match(row[0], /context_variants: &\[\],/, "opencode's context vocabulary is no longer empty in CLI_CAPS");
+
+  // Two OTHER test files match substrings of these notes — this file's
+  // `--variant` / `agent.<name>.variant` assertions and
+  // `workflowmodel.test.ts`'s finding-message ones. Assert them against the RUST
+  // text, so a reword that kept those tests green by matching a stale copy fails
+  // here instead.
+  for (const needle of ["--variant", "agent.<name>.variant"]) {
+    assert.ok(
+      declared("effort_note").includes(needle),
+      `tests match on "${needle}" — it must still be in CLI_CAPS' own effort note`
+    );
+  }
+  assert.ok(declared("context_note").includes("model-determined"), "tests match on 'model-determined'");
 });
