@@ -31,8 +31,9 @@
 //! follow call chains.** A sync command whose *helper* spawns is not caught
 //! mechanically, and the shipped tree has live examples: `fm_open`'s body is
 //! one line and the blocking `ShellExecuteW` is in `filemgr.rs`'s helper;
-//! `orch_workflow_status` is a one-line delegate whose chain reaches two to
-//! four blocking `git` spawns. This is the same bound `gh.rs`'s in-module
+//! `orch_open_ref` reaches two blocking `git` spawns through a helper, and
+//! `orch_confirm_solo_copilot_autopilot`'s one-line body hands work to a raw
+//! thread it never names. This is the same bound `gh.rs`'s in-module
 //! enumeration test (the seed this generalizes) already accepts. The scan pins
 //! the shape — which commands are sync, and that each one's cost is written
 //! down — and the manifest reason plus review carry the residue. For the same
