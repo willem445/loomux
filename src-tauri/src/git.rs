@@ -2067,6 +2067,18 @@ mod tests {
         );
     }
 
+    /// NOT evidence for the `--cached` flag, and labelled so rather than left
+    /// looking like its sibling. In the mutation round that stripped
+    /// `--no-optional-locks` from BOTH diff modes (run 30782892203) this test
+    /// stayed green on all three platforms while `worktree_diff_…` reddened:
+    /// today's `git diff --cached` simply does not perform the opportunistic
+    /// index write-back, so no red for it can be banked and the flag on that
+    /// mode is precautionary.
+    ///
+    /// Kept anyway, as characterization rather than a pin: it asserts a fact
+    /// about git, not about us, and if a future git version starts refreshing
+    /// the index on `--cached` this is what tells us — which is also why the
+    /// flag stays on that arm. Weaker than it looks, said out loud (#689).
     #[test]
     fn staged_diff_never_writes_the_index() {
         let repo = new_repo();
