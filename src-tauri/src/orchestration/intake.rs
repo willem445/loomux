@@ -293,8 +293,21 @@ pub fn board_tracked_issues(refs: &[&str]) -> HashSet<u64> {
 /// legitimately buys is not re-announcing work that already has a task. The
 /// consent boundary is the hold label and the contract around it.
 pub fn eligible_unstarted(issues: &[RawIssue], hold_label: &str, board_tracked: &HashSet<u64>) -> Vec<EligibleSignal> {
-    let _ = (issues, hold_label, board_tracked);
-    Vec::new()
+    // An empty spelling would make the hold check match nothing at all, i.e.
+    // announce every held issue as eligible. No resolution path produces one
+    // (`sanitize_intake_label` and `read_intake` both fall back to the
+    // built-in default), so this is unreachable today — but it is a consent
+    // boundary, and the only safe answer to "I don't know what a hold looks
+    // like" is to claim nothing is startable.
+    if hold_label.trim().is_empty() {
+        return Vec::new();
+    }
+    issues
+        .iter()
+        .filter(|i| !board_tracked.contains(&i.number))
+        .filter(|i| !i.labels.iter().any(|l| l.eq_ignore_ascii_case(hold_label)))
+        .map(|i| EligibleSignal { number: i.number, title: i.title.clone() })
+        .collect()
 }
 
 /// Diff the currently-eligible set against `last_seen` (the issue numbers that
@@ -331,8 +344,16 @@ pub fn eligible_deltas(
     hold_label: &str,
     board_tracked: &HashSet<u64>,
 ) -> Vec<EligibleSignal> {
-    let _ = (&last_seen, full_autonomy, current, hold_label, board_tracked);
-    Vec::new()
+    if !full_autonomy {
+        last_seen.clear();
+        return Vec::new();
+    }
+    let Some(current) = current else { return Vec::new() };
+    let eligible = eligible_unstarted(current, hold_label, board_tracked);
+    let signals: Vec<EligibleSignal> =
+        eligible.iter().filter(|s| !last_seen.contains(&s.number)).cloned().collect();
+    *last_seen = eligible.iter().map(|s| s.number).collect();
+    signals
 }
 
 // ---------------------------------------------------------------------------
@@ -818,6 +839,16 @@ mod tests {
         let issues = vec![issue(1, "held by the repo's own label", &["do-not-touch"]), issue(2, "not held here", &["agent-hold"])];
         let got = eligible_unstarted(&issues, "do-not-touch", &HashSet::new());
         assert_eq!(numbers(&got), vec![2], "the resolved profile spelling is the boundary, not the built-in default: {got:?}");
+    }
+
+    /// No resolution path can hand this function an empty hold spelling, so
+    /// this pins the answer for the day one does: "I don't know what a hold
+    /// looks like" must mean nothing is startable, not everything is.
+    #[test]
+    fn eligible_unstarted_fails_closed_on_an_empty_hold_spelling() {
+        let issues = vec![issue(1, "unlabeled", &[]), issue(2, "held", &["agent-hold"])];
+        assert!(eligible_unstarted(&issues, "", &HashSet::new()).is_empty(), "an unknown boundary starts nothing");
+        assert!(eligible_unstarted(&issues, "   ", &HashSet::new()).is_empty());
     }
 
     #[test]

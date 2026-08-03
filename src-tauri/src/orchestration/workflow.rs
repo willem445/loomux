@@ -1434,7 +1434,7 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
                     &default_intake.prototype,
                     &mut errs,
                 ),
-                hold: default_intake.hold.clone(),
+                hold: sanitize_intake_label("hold", &ri.labels.hold, &default_intake.hold, &mut errs),
             }
         }
     };

@@ -21373,6 +21373,43 @@ fn full_autonomy_requires_autonomous_mode() {
     assert_eq!(reg.autonomy_state(&g.id)["full_autonomy"].as_bool(), Some(true));
 }
 
+/// Enabling full autonomy is the **triage trigger**: the enable notice tells
+/// the orchestrator to post one ranked plan over the whole backlog, and what
+/// actually delivers that backlog is the intake poller finding every eligible
+/// issue "new". That only holds if the enable empties the eligible seen-set —
+/// otherwise an off→on flip inside one poll interval inherits a set populated
+/// under different consent and the next poll announces nothing at all.
+#[test]
+fn enabling_full_autonomy_rearms_the_eligible_backlog_as_a_triage_trigger() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    reg.set_autonomous(&g.id, true).unwrap();
+
+    reg.seed_intake_eligible_seen(&g.id, &[11, 12, 13]);
+    reg.set_full_autonomy(&g.id, true, "harden any bugs").unwrap();
+    assert!(
+        reg.intake_eligible_seen(&g.id).is_empty(),
+        "an enable must leave nothing 'already seen', or the triage pass has no backlog to rank"
+    );
+
+    // A re-aim is a re-triage: the goal is what decides whether an eligible
+    // issue is worth starting, so changing it must put the backlog back in
+    // front of the orchestrator rather than leaving it judged under the old one.
+    reg.seed_intake_eligible_seen(&g.id, &[11, 12, 13]);
+    reg.set_full_autonomy(&g.id, true, "close out the beta blockers").unwrap();
+    assert!(reg.intake_eligible_seen(&g.id).is_empty(), "a goal re-aim must re-arm the backlog too");
+
+    // A no-op enable (same goal) changes no consent, so it leaves the poller's
+    // delta state alone — re-announcing a backlog nobody re-aimed would be noise.
+    reg.seed_intake_eligible_seen(&g.id, &[11, 12, 13]);
+    reg.set_full_autonomy(&g.id, true, "close out the beta blockers").unwrap();
+    assert_eq!(
+        reg.intake_eligible_seen(&g.id),
+        vec![11, 12, 13],
+        "a duplicate enable with the same goal must not re-announce the backlog"
+    );
+}
+
 #[test]
 fn full_autonomy_goal_round_trips_through_marker_state_and_restart() {
     let (reg, dir) = test_registry();
