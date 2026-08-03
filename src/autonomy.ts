@@ -55,8 +55,11 @@ export interface AutonomyState {
    *  autonomous, like `auto_release`. */
   full_autonomy: boolean;
   /** #778: the opaque goal qualifying full autonomy, or null when there is none —
-   *  including whenever the mode is off (the marker holding it only exists while
-   *  it is on), so the panel never renders a goal that isn't in force. */
+   *  and always null while the mode is off, because the backend accessor is gated
+   *  on the live in-memory flag rather than on the marker file (a force-clear drops
+   *  the flag unconditionally but removes the marker only best-effort, so a goal
+   *  can outlive the consent it qualified). The panel therefore never renders a
+   *  goal that isn't in force. */
   full_autonomy_goal: string | null;
   budget_tokens: number;
   budget_anchor_tokens: number;
@@ -252,9 +255,10 @@ export interface GoalCommit {
 
 /** Decide what a goal commit means.
  *
- *  - **Mode OFF → park it.** The goal lives in the `full_autonomy` marker, which
- *    only exists while the mode is on, so there is nowhere to put it yet; the
- *    enable itself carries it (set-then-enable, exactly like the budget field).
+ *  - **Mode OFF → park it.** A goal only means anything as the parameter of a live
+ *    consent — the backend reports none while the mode is off, and there is no
+ *    "set the goal" command to call anyway; the enable itself carries it
+ *    (set-then-enable, exactly like the budget field).
  *  - **Mode ON, unchanged after normalization → nothing.** Re-enabling would
  *    deliver another full-autonomy notice into the orchestrator's pane for no
  *    reason.

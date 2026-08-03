@@ -928,8 +928,9 @@ export class GroupView {
   }
 
   /** Commit the full-autonomy toggle (#778). The enable carries whatever goal is
-   *  in the field (set-then-enable — the goal lives in the marker this creates),
-   *  normalized the same way the backend will normalize it. A rejected write (e.g.
+   *  in the field (set-then-enable — the enable IS how a goal reaches the backend;
+   *  there is no separate set-goal command), normalized the same way the backend
+   *  will normalize it. A rejected write (e.g.
    *  autonomous off) toasts and the poll re-syncs the real state. */
   private async toggleFullAutonomy(): Promise<void> {
     this.goalErrEl.textContent = "";
