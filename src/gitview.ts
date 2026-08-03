@@ -25,6 +25,7 @@ import {
   gitRebase,
   gitBranches,
   gitWorktreeList,
+  gitWriteInFlight,
   type BranchInfo,
   type CommitInfo,
   type FileEntry,
@@ -42,6 +43,7 @@ import {
   normalizePath,
   type Worktree,
 } from "./gitworktree";
+import { QUEUE_WAIT_LIMIT_MS } from "./gitqueue";
 import { computeLanes, renderRowSvg } from "./gitgraph";
 import { shortRev, fmtWhen, fmtWhenFull, authorLine } from "./gitformat";
 import { renderDiff } from "./diffrender";
@@ -730,11 +732,32 @@ export class GitView {
 
   /** Run a mutating git action, surface errors, refresh either way. */
   private async act(fn: () => Promise<void>): Promise<void> {
+    // #726: mutating commands are serialized (src/gitqueue.ts), so this one may
+    // not start immediately — and a stuck head job (an unreachable remote) can
+    // hold it for the full wait limit. `runOp()` and `push()` spin their own
+    // button; the paths through here are file rows and context-menu items with
+    // no such affordance, so an unannounced wait reads as a click that did
+    // nothing. Say it out loud instead.
+    //
+    // Held for the full QUEUE_WAIT_LIMIT_MS rather than the usual 2.5 s dwell:
+    // this is a state ("something else is running"), not an event, and a notice
+    // that vanishes after 2.5 s of a possible 60 s wait puts the surface right
+    // back to looking hung. It comes down when the wait resolves — replaced by
+    // the error toast below on failure, or cleared explicitly on success — and
+    // the wait itself is bounded by the queue, which rejects rather than
+    // running late, so that rejection lands in the catch like any other error.
+    const announced = gitWriteInFlight();
+    if (announced) {
+      this.toast("Waiting for another git operation to finish…", "ok", QUEUE_WAIT_LIMIT_MS);
+    }
+    let failed = false;
     try {
       await fn();
     } catch (err) {
+      failed = true;
       this.toast(String(err));
     }
+    if (announced && !failed) this.clearToast();
     await this.refresh();
     this.host.onRepoAction?.();
   }
@@ -749,15 +772,24 @@ export class GitView {
     }
   }
 
-  private toast(message: string, kind: "err" | "ok" = "err"): void {
+  /** Show a toast. `holdMs` overrides the default dwell for a notice that must
+   *  outlast it — a state that is true until something clears it, rather than
+   *  an event that happened (see `act()`'s queue-wait notice). Any later toast
+   *  replaces it, and `clearToast()` takes it down early. */
+  private toast(message: string, kind: "err" | "ok" = "err", holdMs?: number): void {
     this.toastEl.textContent = message;
     this.toastEl.className = `git-toast ${kind}`;
     this.toastEl.hidden = false;
     clearTimeout(this.toastTimer);
     this.toastTimer = window.setTimeout(
       () => (this.toastEl.hidden = true),
-      kind === "ok" ? 2500 : 6000
+      holdMs ?? (kind === "ok" ? 2500 : 6000)
     );
+  }
+
+  private clearToast(): void {
+    clearTimeout(this.toastTimer);
+    this.toastEl.hidden = true;
   }
 
   private setBusy(btn: HTMLButtonElement, on: boolean): void {

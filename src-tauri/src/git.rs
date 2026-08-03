@@ -11,16 +11,97 @@ use serde::Serialize;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
-/// Run a git-backed computation off the webview main thread (issue #399).
+/// Run a git-backed computation off the webview main thread (issues #399, #726).
 /// Tauri dispatches a *synchronous* `#[tauri::command]` by calling it directly
 /// on the main thread — the exact mechanism issue #207 already diagnosed for
 /// the file-editor search command ("Tauri runs sync commands on the main
-/// (webview) thread"). Every command on the git pane's open/refresh path shells
-/// out to `git` and can block for as long as a slow scan takes (a large working
-/// tree, a big history, a stalled network share), so each is a thin `async fn`
-/// wrapper that hands the real work — still a plain, directly unit-testable
-/// sync function — to a blocking-pool thread via
-/// `tauri::async_runtime::spawn_blocking` and awaits it here instead.
+/// (webview) thread"). Every command here shells out to `git` and can block for
+/// as long as a slow scan takes (a large working tree, a big history, a stalled
+/// network share) or, for fetch/push/pull, an entire remote round trip — which
+/// is unbounded. So each is a thin `async fn` wrapper that hands the real work
+/// — still a plain, directly unit-testable `*_sync` function — to a
+/// blocking-pool thread via `tauri::async_runtime::spawn_blocking` and awaits
+/// it here instead.
+///
+/// #399 converted only the pane's open/refresh path; #726 finished the module,
+/// and the `every_tauri_command_in_this_module_is_async_and_delegates` test
+/// below pins that so a new command can't quietly land synchronous. Note the
+/// test requires the delegation, not just the `async` keyword: Tauri polls a
+/// command's future on the main thread, so an `async fn` that ran its spawn
+/// inline before its first real await would freeze the GUI exactly as a sync
+/// one does. Keep each wrapper a single `run_blocking(move || …_sync(…)).await`
+/// — every argument check and every spawn belongs on the far side of it.
+///
+/// ## What going off-thread gives up
+///
+/// The freeze WAS an accidental mutual exclusion: while the main thread sat
+/// inside a `git` spawn, no second invoke could start, so no two of these could
+/// overlap. Off-thread they can. Unlike `gh.rs` (#724), that is not free here —
+/// these commands mutate an index and a working tree, and two concurrent `git`
+/// invocations against the same worktree contend on `index.lock`, where git
+/// fails the loser rather than corrupting anything. Nothing is corrupted, but a
+/// user who clicked *stage* then *commit* in quick succession used to get both
+/// (the second invoke queued behind the first) and would now get an error
+/// toast.
+///
+/// That exclusion is therefore restored deliberately, in the frontend, at the
+/// one choke point every caller already goes through: the typed wrappers in
+/// `src/git.ts` run every mutating command through a single FIFO queue
+/// (`src/gitqueue.ts`), so their spawns stay serialized in click order exactly
+/// as the main thread used to serialize them — while the GUI stays live,
+/// because waiting in a promise queue blocks nothing. A sequencer op is one
+/// queued job *including its unwind*: `run_sequencer` runs the command and its
+/// `--abort` inside a single `_sync` body, so no other frontend git op can
+/// interleave between a conflict and the abort that cleans up after it.
+///
+/// Reads are deliberately NOT queued: they were already async since #399, so
+/// they could always overlap a write, and queueing them behind an unbounded
+/// fetch would be a new stall rather than a restoration.
+///
+/// That overlap is *mostly* lock-free, and the exception is stated rather than
+/// glossed. Measured per command, in the state that provokes git's
+/// opportunistic index write-back — an entry that is stat-dirty but
+/// content-identical — and pinned by
+/// `only_git_status_is_protected_from_the_index_write`:
+///
+/// | read | takes `index.lock`? |
+/// | --- | --- |
+/// | `git_status` | no — `--no-optional-locks` suppresses it |
+/// | `git_diff` (staged) | no — `--cached` never refreshes |
+/// | `git_diff` (worktree) | **yes, and no flag prevents it** |
+///
+/// `git diff` rewrites the index with or without `--no-optional-locks`
+/// (`builtin/diff.c` refreshes through a path that never consults the setting),
+/// so that flag is deliberately not passed there: a no-op that reads like
+/// protection is worse than none. The residual is that a refresh-driven
+/// worktree diff can make a concurrent `stage`/`commit` fail to take the lock.
+/// It is not new — an async read could overlap a main-thread write ever since
+/// #399 — but #726 widens the window, because a read can now be *dispatched*
+/// while a write is running, where before the busy main thread prevented that.
+///
+/// **Accepted, not fixed, and tracked as #754**, which carries the matrix above
+/// and both mitigations weighed and rejected for this change: queueing the
+/// worktree diff would stall the diff pane behind an unbounded fetch, trading a
+/// rare error for a routine one, and retrying a lock-failed write in `run_git`
+/// is a new mechanism of its own. The test above is the other half of that
+/// decision — it fails the day any cell changes, so #754 is revisited on
+/// evidence rather than left to rot.
+///
+/// What the queue does *not* claim. It covers commands issued through the
+/// webview, not every writer in the process, and two others sit outside it:
+/// the pane's own terminal (an agent running `git commit` in the very worktree
+/// the view is showing), and loomux's own backend — `Registry::spawn_agent_ex`
+/// calls `git_worktree_add_sync` directly from its own thread, never through a
+/// command. Both bypassed the freeze in exactly the same way, so neither is
+/// new; they are named so "the window is serialized" is never claimed. So
+/// `index.lock` and a surfaced error were always the real arbiter.
+///
+/// And what it costs: a slow head job delays every later mutating op,
+/// window-wide, across unrelated repos. That is the ordering the main thread
+/// already imposed and strictly better than freezing for the same duration —
+/// but a freeze is unmissable where a queue is silent, so the wait is bounded
+/// (`QUEUE_WAIT_LIMIT_MS`) and rejects rather than running late, and the git
+/// view announces a wait on the paths that have no button to spin.
 async fn run_blocking<T, F>(f: F) -> Result<T, String>
 where
     F: FnOnce() -> Result<T, String> + Send + 'static,
@@ -205,6 +286,37 @@ pub async fn git_status(repo: String) -> Result<GitStatus, String> {
 
 /// Unified diff for one file. `mode`: "worktree" | "staged" | "commit" |
 /// "untracked".
+///
+/// Worktree mode takes `index.lock`, and there is no flag that stops it.
+///
+/// `git diff` performs an *opportunistic* index refresh: when an entry is
+/// stat-dirty but content-identical it rewrites `.git/index` to cache the
+/// corrected stat, locking to do so. That write is pure optimization — the diff
+/// is byte-identical without it — but it makes this read contend with a
+/// concurrent write, and the loser is the writer: `refresh_index_quietly` gives
+/// up silently if it cannot lock, while a `commit`/`stage` that cannot lock
+/// fails with "Unable to create '.git/index.lock'".
+///
+/// The obvious fix does NOT work. `--no-optional-locks` suppresses the write
+/// for `git status` but not for `git diff` — the **evidence** is the measured
+/// matrix in `only_git_status_is_protected_from_the_index_write`, which is what
+/// to re-check if this ever looks wrong. The **explanation**, read in git
+/// v2.47.0 rather than recalled: `builtin/commit.c`'s `cmd_status` guards its
+/// lock with `if (use_optional_locks())`, while `builtin/diff.c` reaches the
+/// index through `refresh_index_quietly()`, which calls
+/// `repo_hold_locked_index(the_repository, &lock_file, 0)` unconditionally —
+/// `use_optional_locks` appears nowhere in that file. Same call, one guarded
+/// and one not. (That `0` is also why the writer is the loser: a diff that
+/// cannot lock hits `if (fd < 0) return;` and gives up silently, where a
+/// `commit`/`stage` that cannot lock fails loudly.)
+///
+/// So the flag is deliberately NOT passed here — carrying a no-op that reads
+/// like protection is worse than carrying none. `--cached` never writes the
+/// index at all, and `commit` mode (`git show`) and `untracked` never touch it.
+///
+/// The residual is therefore real, accepted rather than fixed, and tracked as
+/// #754; it is argued where it belongs, in `run_blocking`'s note on why reads
+/// stay outside the write queue.
 fn git_diff_sync(
     repo: String,
     path: String,
@@ -281,15 +393,18 @@ pub async fn git_commit_files(repo: String, hash: String) -> Result<Vec<FileEntr
     run_blocking(move || git_commit_files_sync(repo, hash)).await
 }
 
-#[tauri::command]
-pub fn git_stage(repo: String, paths: Vec<String>) -> Result<(), String> {
+fn git_stage_sync(repo: String, paths: Vec<String>) -> Result<(), String> {
     let mut args = vec!["add", "-A", "--"];
     args.extend(paths.iter().map(String::as_str));
     run_git(&repo, &args).map(|_| ())
 }
 
 #[tauri::command]
-pub fn git_unstage(repo: String, paths: Vec<String>, empty_repo: bool) -> Result<(), String> {
+pub async fn git_stage(repo: String, paths: Vec<String>) -> Result<(), String> {
+    run_blocking(move || git_stage_sync(repo, paths)).await
+}
+
+fn git_unstage_sync(repo: String, paths: Vec<String>, empty_repo: bool) -> Result<(), String> {
     // `restore --staged` needs a HEAD; before the first commit fall back to
     // removing from the index.
     let mut args: Vec<&str> = if empty_repo {
@@ -302,8 +417,21 @@ pub fn git_unstage(repo: String, paths: Vec<String>, empty_repo: bool) -> Result
 }
 
 #[tauri::command]
-pub fn git_commit(repo: String, message: String) -> Result<(), String> {
+pub async fn git_unstage(
+    repo: String,
+    paths: Vec<String>,
+    empty_repo: bool,
+) -> Result<(), String> {
+    run_blocking(move || git_unstage_sync(repo, paths, empty_repo)).await
+}
+
+fn git_commit_sync(repo: String, message: String) -> Result<(), String> {
     run_git(&repo, &["commit", "-m", &message]).map(|_| ())
+}
+
+#[tauri::command]
+pub async fn git_commit(repo: String, message: String) -> Result<(), String> {
+    run_blocking(move || git_commit_sync(repo, message)).await
 }
 
 /// Check out a ref. With `track` the ref is a remote-tracking branch picked
@@ -316,8 +444,7 @@ pub fn git_commit(repo: String, message: String) -> Result<(), String> {
 /// branch named 'topic' already exists" the moment a local `topic` is present
 /// (the common case — you've already worked on it once). Splitting the two
 /// cases makes checking out a remote branch idempotent.
-#[tauri::command]
-pub fn git_checkout(repo: String, refname: String, track: bool) -> Result<(), String> {
+fn git_checkout_sync(repo: String, refname: String, track: bool) -> Result<(), String> {
     // `--` can't guard this the way it does elsewhere — for checkout it's the
     // pathspec separator — so reject a leading-`-` name outright (see check_name).
     check_name(&refname, "ref")?;
@@ -344,6 +471,11 @@ pub fn git_checkout(repo: String, refname: String, track: bool) -> Result<(), St
             .map(|_| ())
             .map_err(|e| checkout_error(&refname, &e))
     }
+}
+
+#[tauri::command]
+pub async fn git_checkout(repo: String, refname: String, track: bool) -> Result<(), String> {
+    run_blocking(move || git_checkout_sync(repo, refname, track)).await
 }
 
 /// Configured remote names (`git remote`). Empty on any error, so the caller
@@ -434,8 +566,7 @@ fn run_sequencer(repo: &str, args: &[&str], abort: &[&str], label: &str) -> Resu
 
 /// Fetch from remotes and prune deleted remote branches. A repo with no remote
 /// configured is a no-op success, so the refresh button never errors locally.
-#[tauri::command]
-pub fn git_fetch(repo: String, remote: Option<String>) -> Result<(), String> {
+fn git_fetch_sync(repo: String, remote: Option<String>) -> Result<(), String> {
     if let Some(r) = &remote {
         check_name(r, "remote")?;
         return run_git(&repo, &["fetch", "--prune", r]).map(|_| ());
@@ -446,12 +577,16 @@ pub fn git_fetch(repo: String, remote: Option<String>) -> Result<(), String> {
     run_git(&repo, &["fetch", "--all", "--prune"]).map(|_| ())
 }
 
+#[tauri::command]
+pub async fn git_fetch(repo: String, remote: Option<String>) -> Result<(), String> {
+    run_blocking(move || git_fetch_sync(repo, remote)).await
+}
+
 /// Push the current branch. With `set_upstream`, publish it to the first
 /// configured remote and set tracking (`push -u <remote> <branch>`); otherwise
 /// a plain `git push`, which needs an upstream already set. Auth / network
 /// failures surface verbatim.
-#[tauri::command]
-pub fn git_push(repo: String, set_upstream: bool) -> Result<(), String> {
+fn git_push_sync(repo: String, set_upstream: bool) -> Result<(), String> {
     if !set_upstream {
         return run_git(&repo, &["push"]).map(|_| ());
     }
@@ -469,25 +604,37 @@ pub fn git_push(repo: String, set_upstream: bool) -> Result<(), String> {
     run_git(&repo, &["push", "-u", remote, branch]).map(|_| ())
 }
 
+#[tauri::command]
+pub async fn git_push(repo: String, set_upstream: bool) -> Result<(), String> {
+    run_blocking(move || git_push_sync(repo, set_upstream)).await
+}
+
 /// Pull fast-forward-only — never creates an implicit merge or rebase. A
 /// diverged branch fails with git's "not possible to fast-forward" message,
 /// surfaced so the user resolves it deliberately.
-#[tauri::command]
-pub fn git_pull(repo: String) -> Result<(), String> {
+fn git_pull_sync(repo: String) -> Result<(), String> {
     run_git(&repo, &["pull", "--ff-only"]).map(|_| ())
 }
 
-/// Create a lightweight tag `name` at `hash`.
 #[tauri::command]
-pub fn git_tag(repo: String, name: String, hash: String) -> Result<(), String> {
+pub async fn git_pull(repo: String) -> Result<(), String> {
+    run_blocking(move || git_pull_sync(repo)).await
+}
+
+/// Create a lightweight tag `name` at `hash`.
+fn git_tag_sync(repo: String, name: String, hash: String) -> Result<(), String> {
     check_name(&name, "tag name")?;
     check_name(&hash, "commit")?;
     run_git(&repo, &["tag", &name, &hash]).map(|_| ())
 }
 
-/// Create branch `name` at `hash`, optionally checking it out.
 #[tauri::command]
-pub fn git_branch_create(
+pub async fn git_tag(repo: String, name: String, hash: String) -> Result<(), String> {
+    run_blocking(move || git_tag_sync(repo, name, hash)).await
+}
+
+/// Create branch `name` at `hash`, optionally checking it out.
+fn git_branch_create_sync(
     repo: String,
     name: String,
     hash: String,
@@ -502,9 +649,18 @@ pub fn git_branch_create(
     }
 }
 
-/// Cherry-pick `hash` onto the current branch. Conflicts abort (see module note).
 #[tauri::command]
-pub fn git_cherry_pick(repo: String, hash: String) -> Result<(), String> {
+pub async fn git_branch_create(
+    repo: String,
+    name: String,
+    hash: String,
+    checkout: bool,
+) -> Result<(), String> {
+    run_blocking(move || git_branch_create_sync(repo, name, hash, checkout)).await
+}
+
+/// Cherry-pick `hash` onto the current branch. Conflicts abort (see module note).
+fn git_cherry_pick_sync(repo: String, hash: String) -> Result<(), String> {
     check_name(&hash, "commit")?;
     run_sequencer(
         &repo,
@@ -514,9 +670,13 @@ pub fn git_cherry_pick(repo: String, hash: String) -> Result<(), String> {
     )
 }
 
-/// Revert `hash` on the current branch (creates an inverse commit). Conflicts abort.
 #[tauri::command]
-pub fn git_revert(repo: String, hash: String) -> Result<(), String> {
+pub async fn git_cherry_pick(repo: String, hash: String) -> Result<(), String> {
+    run_blocking(move || git_cherry_pick_sync(repo, hash)).await
+}
+
+/// Revert `hash` on the current branch (creates an inverse commit). Conflicts abort.
+fn git_revert_sync(repo: String, hash: String) -> Result<(), String> {
     check_name(&hash, "commit")?;
     run_sequencer(
         &repo,
@@ -526,9 +686,13 @@ pub fn git_revert(repo: String, hash: String) -> Result<(), String> {
     )
 }
 
-/// Merge `refname` into the current branch. Conflicts abort.
 #[tauri::command]
-pub fn git_merge(repo: String, refname: String) -> Result<(), String> {
+pub async fn git_revert(repo: String, hash: String) -> Result<(), String> {
+    run_blocking(move || git_revert_sync(repo, hash)).await
+}
+
+/// Merge `refname` into the current branch. Conflicts abort.
+fn git_merge_sync(repo: String, refname: String) -> Result<(), String> {
     check_name(&refname, "ref")?;
     run_sequencer(
         &repo,
@@ -538,9 +702,13 @@ pub fn git_merge(repo: String, refname: String) -> Result<(), String> {
     )
 }
 
-/// Rebase the current branch onto `upstream`. Conflicts abort.
 #[tauri::command]
-pub fn git_rebase(repo: String, upstream: String) -> Result<(), String> {
+pub async fn git_merge(repo: String, refname: String) -> Result<(), String> {
+    run_blocking(move || git_merge_sync(repo, refname)).await
+}
+
+/// Rebase the current branch onto `upstream`. Conflicts abort.
+fn git_rebase_sync(repo: String, upstream: String) -> Result<(), String> {
     check_name(&upstream, "ref")?;
     run_sequencer(
         &repo,
@@ -550,12 +718,16 @@ pub fn git_rebase(repo: String, upstream: String) -> Result<(), String> {
     )
 }
 
+#[tauri::command]
+pub async fn git_rebase(repo: String, upstream: String) -> Result<(), String> {
+    run_blocking(move || git_rebase_sync(repo, upstream)).await
+}
+
 /// All local and remote-tracking branches, for the checkout menu. (`for-each-ref`
 /// has its own format language that does NOT expand `%x1f` like `git log`, so
 /// each ref is one line — ref names never contain whitespace — and the current
 /// branch is resolved separately.)
-#[tauri::command]
-pub fn git_branches(repo: String) -> Result<Vec<BranchInfo>, String> {
+fn git_branches_sync(repo: String) -> Result<Vec<BranchInfo>, String> {
     let current = run_git(&repo, &["rev-parse", "--abbrev-ref", "HEAD"])
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
@@ -586,9 +758,13 @@ pub fn git_branches(repo: String) -> Result<Vec<BranchInfo>, String> {
     Ok(branches)
 }
 
-/// Throw away changes to one file: restore tracked files, delete untracked.
 #[tauri::command]
-pub fn git_discard(repo: String, path: String, untracked: bool) -> Result<(), String> {
+pub async fn git_branches(repo: String) -> Result<Vec<BranchInfo>, String> {
+    run_blocking(move || git_branches_sync(repo)).await
+}
+
+/// Throw away changes to one file: restore tracked files, delete untracked.
+fn git_discard_sync(repo: String, path: String, untracked: bool) -> Result<(), String> {
     if untracked {
         let rel = Path::new(&path);
         if rel.is_absolute() || rel.components().any(|c| matches!(c, Component::ParentDir)) {
@@ -599,6 +775,11 @@ pub fn git_discard(repo: String, path: String, untracked: bool) -> Result<(), St
     } else {
         run_git(&repo, &["restore", "--", &path]).map(|_| ())
     }
+}
+
+#[tauri::command]
+pub async fn git_discard(repo: String, path: String, untracked: bool) -> Result<(), String> {
+    run_blocking(move || git_discard_sync(repo, path, untracked)).await
 }
 
 /// Names must be usable both as a branch name and as a relative directory:
@@ -792,8 +973,16 @@ fn symbolic_origin_head(repo: &str) -> Option<String> {
 /// `--no-track` keeps the agent branch upstream-free, matching the old
 /// HEAD-based behavior (the worker publishes with `push -u`).
 /// Returns the worktree's absolute path.
-#[tauri::command]
-pub fn git_worktree_add(repo: String, name: String, base: Option<String>) -> Result<String, String> {
+///
+/// `pub` rather than private like the other `*_sync` bodies: orchestration cuts
+/// an agent's worktree by calling this directly (`Registry::spawn_agent_ex`),
+/// on its own thread and never through the command layer, so it needs the plain
+/// synchronous function — not the `async` wrapper below.
+pub fn git_worktree_add_sync(
+    repo: String,
+    name: String,
+    base: Option<String>,
+) -> Result<String, String> {
     if !valid_worktree_name(&name) {
         return Err(format!(
             "invalid worktree name {name:?} — use letters, digits, and . _ - /"
@@ -868,6 +1057,15 @@ pub fn git_worktree_add(repo: String, name: String, base: Option<String>) -> Res
     }
 
     Ok(dest_str)
+}
+
+#[tauri::command]
+pub async fn git_worktree_add(
+    repo: String,
+    name: String,
+    base: Option<String>,
+) -> Result<String, String> {
+    run_blocking(move || git_worktree_add_sync(repo, name, base)).await
 }
 
 /// List every worktree of this repo as raw `git worktree list --porcelain`
@@ -1383,16 +1581,16 @@ mod tests {
         let d = repo.path();
         let a = commit(d, "f.txt", "a\n", "A");
 
-        git_tag(p(d), "v1".into(), a.clone()).unwrap();
+        git_tag_sync(p(d), "v1".into(), a.clone()).unwrap();
         assert!(run_git(&p(d), &["tag"]).unwrap().contains("v1"));
         // A name that looks like an option is rejected before spawning git.
-        assert!(git_tag(p(d), "-x".into(), a.clone()).is_err());
+        assert!(git_tag_sync(p(d), "-x".into(), a.clone()).is_err());
 
-        git_branch_create(p(d), "topic".into(), a.clone(), false).unwrap();
-        let names: Vec<String> = git_branches(p(d)).unwrap().into_iter().map(|b| b.name).collect();
+        git_branch_create_sync(p(d), "topic".into(), a.clone(), false).unwrap();
+        let names: Vec<String> = git_branches_sync(p(d)).unwrap().into_iter().map(|b| b.name).collect();
         assert!(names.contains(&"main".to_string()) && names.contains(&"topic".to_string()));
         let current: Vec<String> =
-            git_branches(p(d)).unwrap().into_iter().filter(|b| b.current).map(|b| b.name).collect();
+            git_branches_sync(p(d)).unwrap().into_iter().filter(|b| b.current).map(|b| b.name).collect();
         assert_eq!(current, vec!["main"]);
     }
 
@@ -1401,15 +1599,15 @@ mod tests {
         let repo = new_repo();
         let d = repo.path();
         commit(d, "f.txt", "one\n", "A");
-        git_branch_create(p(d), "feat".into(), "HEAD".into(), true).unwrap();
+        git_branch_create_sync(p(d), "feat".into(), "HEAD".into(), true).unwrap();
         commit(d, "f.txt", "two\n", "B on feat");
 
-        git_checkout(p(d), "main".into(), false).unwrap();
+        git_checkout_sync(p(d), "main".into(), false).unwrap();
         assert_eq!(read(d, "f.txt"), "one\n");
 
         // An uncommitted change that checkout would clobber must be refused.
         std::fs::write(d.join("f.txt"), "dirty\n").unwrap();
-        let err = git_checkout(p(d), "feat".into(), false).unwrap_err();
+        let err = git_checkout_sync(p(d), "feat".into(), false).unwrap_err();
         assert!(err.contains("would be overwritten") || err.contains("overwritten by checkout"));
         // Still on main with the dirty content intact.
         assert_eq!(read(d, "f.txt"), "dirty\n");
@@ -1422,9 +1620,9 @@ mod tests {
         commit(d, "f.txt", "a\n", "A");
         // A leading-`-` name is blocked before ever reaching git, so it can't
         // be parsed as an option (checkout can't use `--` to guard it).
-        let err = git_checkout(p(d), "-f".into(), false).unwrap_err();
+        let err = git_checkout_sync(p(d), "-f".into(), false).unwrap_err();
         assert!(err.contains("must not start with '-'"), "got: {err}");
-        assert!(git_checkout(p(d), "--track".into(), true).is_err());
+        assert!(git_checkout_sync(p(d), "--track".into(), true).is_err());
     }
 
     #[test]
@@ -1472,7 +1670,7 @@ mod tests {
         commit(up.path(), "f.txt", "one\n", "A");
         setup_git(up.path(), &["branch", "topic/nested"]);
         setup_git(up.path(), &["remote", "add", "origin", &p(bare.path())]);
-        git_push(p(up.path()), true).unwrap();
+        git_push_sync(p(up.path()), true).unwrap();
         setup_git(up.path(), &["push", "-q", "origin", "topic/nested"]);
 
         // Fresh clone: no local `topic/nested` yet → create a tracking branch.
@@ -1482,7 +1680,7 @@ mod tests {
         setup_git(&d, &["config", "user.name", "Two"]);
         setup_git(&d, &["config", "user.email", "two@example.com"]);
 
-        git_checkout(p(&d), "origin/topic/nested".into(), true).unwrap();
+        git_checkout_sync(p(&d), "origin/topic/nested".into(), true).unwrap();
         assert_eq!(
             run_git(&p(&d), &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap().trim(),
             "topic/nested"
@@ -1496,8 +1694,8 @@ mod tests {
         // Switch away, then re-check-out the remote ref. #96: the old
         // `checkout --track` fataled here because `topic/nested` now exists
         // locally; we must just switch back to it.
-        git_checkout(p(&d), "main".into(), false).unwrap();
-        git_checkout(p(&d), "origin/topic/nested".into(), true).unwrap();
+        git_checkout_sync(p(&d), "main".into(), false).unwrap();
+        git_checkout_sync(p(&d), "origin/topic/nested".into(), true).unwrap();
         assert_eq!(
             run_git(&p(&d), &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap().trim(),
             "topic/nested"
@@ -1510,21 +1708,21 @@ mod tests {
         let repo = new_repo();
         let d = repo.path();
         commit(d, "f.txt", "L1\n", "A");
-        git_branch_create(p(d), "feature".into(), "HEAD".into(), true).unwrap();
+        git_branch_create_sync(p(d), "feature".into(), "HEAD".into(), true).unwrap();
         let b = commit(d, "f.txt", "L1\nL2\n", "add L2");
-        git_checkout(p(d), "main".into(), false).unwrap();
-        git_cherry_pick(p(d), b).unwrap();
+        git_checkout_sync(p(d), "main".into(), false).unwrap();
+        git_cherry_pick_sync(p(d), b).unwrap();
         assert!(read(d, "f.txt").contains("L2"));
 
         // Conflicting apply: same line changed two ways → abort, tree clean.
         let repo2 = new_repo();
         let d2 = repo2.path();
         commit(d2, "f.txt", "base\n", "A");
-        git_branch_create(p(d2), "feature".into(), "HEAD".into(), true).unwrap();
+        git_branch_create_sync(p(d2), "feature".into(), "HEAD".into(), true).unwrap();
         let fb = commit(d2, "f.txt", "feature\n", "feature edit");
-        git_checkout(p(d2), "main".into(), false).unwrap();
+        git_checkout_sync(p(d2), "main".into(), false).unwrap();
         commit(d2, "f.txt", "mainline\n", "main edit");
-        let err = git_cherry_pick(p(d2), fb).unwrap_err();
+        let err = git_cherry_pick_sync(p(d2), fb).unwrap_err();
         assert!(err.contains("cherry-pick failed"));
         assert!(is_clean(d2), "conflict must be aborted to a clean tree");
         assert_eq!(read(d2, "f.txt"), "mainline\n");
@@ -1536,7 +1734,7 @@ mod tests {
         let d = repo.path();
         commit(d, "f.txt", "a\n", "A");
         let b = commit(d, "f.txt", "a\nb\n", "B adds b");
-        git_revert(p(d), b).unwrap();
+        git_revert_sync(p(d), b).unwrap();
         assert_eq!(read(d, "f.txt"), "a\n");
         // A revert is a new commit, so the tree is clean afterwards.
         assert!(is_clean(d));
@@ -1548,21 +1746,21 @@ mod tests {
         let repo = new_repo();
         let d = repo.path();
         commit(d, "f.txt", "base\n", "A");
-        git_branch_create(p(d), "feature".into(), "HEAD".into(), true).unwrap();
+        git_branch_create_sync(p(d), "feature".into(), "HEAD".into(), true).unwrap();
         commit(d, "g.txt", "new\n", "add g");
-        git_checkout(p(d), "main".into(), false).unwrap();
-        git_merge(p(d), "feature".into()).unwrap();
+        git_checkout_sync(p(d), "main".into(), false).unwrap();
+        git_merge_sync(p(d), "feature".into()).unwrap();
         assert!(d.join("g.txt").exists());
 
         // Conflicting merge → abort, tree clean.
         let repo2 = new_repo();
         let d2 = repo2.path();
         commit(d2, "f.txt", "base\n", "A");
-        git_branch_create(p(d2), "feature".into(), "HEAD".into(), true).unwrap();
+        git_branch_create_sync(p(d2), "feature".into(), "HEAD".into(), true).unwrap();
         commit(d2, "f.txt", "feature\n", "feature edit");
-        git_checkout(p(d2), "main".into(), false).unwrap();
+        git_checkout_sync(p(d2), "main".into(), false).unwrap();
         commit(d2, "f.txt", "mainline\n", "main edit");
-        let err = git_merge(p(d2), "feature".into()).unwrap_err();
+        let err = git_merge_sync(p(d2), "feature".into()).unwrap_err();
         assert!(err.contains("merge failed"));
         assert!(is_clean(d2), "conflicted merge must be aborted");
     }
@@ -1572,12 +1770,12 @@ mod tests {
         let repo = new_repo();
         let d = repo.path();
         commit(d, "f.txt", "base\n", "A");
-        git_branch_create(p(d), "feature".into(), "HEAD".into(), true).unwrap();
+        git_branch_create_sync(p(d), "feature".into(), "HEAD".into(), true).unwrap();
         commit(d, "feat.txt", "feature work\n", "feature commit");
-        git_checkout(p(d), "main".into(), false).unwrap();
+        git_checkout_sync(p(d), "main".into(), false).unwrap();
         commit(d, "main.txt", "main work\n", "main commit");
-        git_checkout(p(d), "feature".into(), false).unwrap();
-        git_rebase(p(d), "main".into()).unwrap();
+        git_checkout_sync(p(d), "feature".into(), false).unwrap();
+        git_rebase_sync(p(d), "main".into()).unwrap();
         // After rebasing onto main, the feature branch sees main's file too.
         assert!(d.join("main.txt").exists());
         assert!(d.join("feat.txt").exists());
@@ -1596,10 +1794,10 @@ mod tests {
         let d1 = repo1.path();
         commit(d1, "f.txt", "one\n", "A");
         setup_git(d1, &["remote", "add", "origin", &p(bare.path())]);
-        git_push(p(d1), true).unwrap(); // set upstream + push
+        git_push_sync(p(d1), true).unwrap(); // set upstream + push
         // A plain push now works because the upstream is set.
         commit(d1, "f.txt", "one\ntwo\n", "B");
-        git_push(p(d1), false).unwrap();
+        git_push_sync(p(d1), false).unwrap();
 
         // Repo 2 clones, adds a commit, pushes it.
         let clone_dir = tempfile::tempdir().unwrap();
@@ -1609,19 +1807,19 @@ mod tests {
         setup_git(&d2, &["config", "user.email", "two@example.com"]);
         setup_git(&d2, &["config", "core.autocrlf", "false"]);
         commit(&d2, "f.txt", "one\ntwo\nthree\n", "C from clone");
-        git_push(p(&d2), false).unwrap();
+        git_push_sync(p(&d2), false).unwrap();
 
         // Repo 1 fetches and fast-forwards to C.
-        git_fetch(p(d1), None).unwrap();
-        git_pull(p(d1)).unwrap();
+        git_fetch_sync(p(d1), None).unwrap();
+        git_pull_sync(p(d1)).unwrap();
         assert_eq!(read(d1, "f.txt"), "one\ntwo\nthree\n");
 
         // Divergence makes a fast-forward pull fail (never an implicit merge).
         commit(d1, "f.txt", "one\ntwo\nthree\nlocal\n", "D local only");
         commit(&d2, "f.txt", "one\ntwo\nthree\nremote\n", "E remote only");
-        git_push(p(&d2), false).unwrap();
-        git_fetch(p(d1), None).unwrap();
-        let err = git_pull(p(d1)).unwrap_err();
+        git_push_sync(p(&d2), false).unwrap();
+        git_fetch_sync(p(d1), None).unwrap();
+        let err = git_pull_sync(p(d1)).unwrap_err();
         assert!(
             err.contains("fast-forward") || err.contains("Not possible") || err.contains("diverging"),
             "diverged pull should refuse: {err}"
@@ -1635,7 +1833,7 @@ mod tests {
         commit(d, "f.txt", "a\n", "A");
         // Add a second worktree via the same command the UI uses. Cut from
         // HEAD explicitly so this doesn't depend on origin (no remote here).
-        let wt = git_worktree_add(p(d), "feature/x".into(), Some("HEAD".into())).unwrap();
+        let wt = git_worktree_add_sync(p(d), "feature/x".into(), Some("HEAD".into())).unwrap();
 
         let porcelain = git_worktree_list_sync(p(d)).unwrap();
         // The main tree is listed first, then the added one on its branch.
@@ -1663,7 +1861,7 @@ mod tests {
         let repo = new_repo();
         commit(repo.path(), "f.txt", "a\n", "A");
         // No remote configured — fetch must succeed quietly, not error.
-        git_fetch(p(repo.path()), None).unwrap();
+        git_fetch_sync(p(repo.path()), None).unwrap();
     }
 
     /// Branch of a worktree checked out by `git_worktree_add` — errors (empty)
@@ -1686,7 +1884,7 @@ mod tests {
         let seed = new_repo();
         commit(seed.path(), "base.txt", "base\n", "base on main");
         setup_git(seed.path(), &["remote", "add", "origin", &p(bare.path())]);
-        git_push(p(seed.path()), true).unwrap();
+        git_push_sync(p(seed.path()), true).unwrap();
 
         // The "primary" checkout: clone, then wander onto a feature branch with
         // a stray commit — exactly the trap. Its HEAD is incidental state.
@@ -1700,7 +1898,7 @@ mod tests {
         commit(&primary, "stray.txt", "stray\n", "stray docs commit");
 
         // Default base (None): must cut from origin/main, NOT the stray HEAD.
-        let wt = git_worktree_add(p(&primary), "agent-x".into(), None).unwrap();
+        let wt = git_worktree_add_sync(p(&primary), "agent-x".into(), None).unwrap();
         // Born on the new branch — never a detached HEAD (#204).
         assert_eq!(worktree_branch(&wt), "agent-x");
         assert!(Path::new(&wt).join("base.txt").exists(), "should carry main's file");
@@ -1710,7 +1908,7 @@ mod tests {
         );
 
         // Explicit base stacks deliberately: cut from the feature branch.
-        let wt2 = git_worktree_add(p(&primary), "agent-y".into(), Some("docs/stray".into())).unwrap();
+        let wt2 = git_worktree_add_sync(p(&primary), "agent-y".into(), Some("docs/stray".into())).unwrap();
         assert_eq!(worktree_branch(&wt2), "agent-y");
         assert!(
             Path::new(&wt2).join("stray.txt").exists(),
@@ -1727,7 +1925,7 @@ mod tests {
         setup_git(repo.path(), &["checkout", "-q", "-b", "feature/wip"]);
         commit(repo.path(), "wip.txt", "wip\n", "wip");
 
-        let wt = git_worktree_add(p(repo.path()), "agent-z".into(), None).unwrap();
+        let wt = git_worktree_add_sync(p(repo.path()), "agent-z".into(), None).unwrap();
         assert_eq!(worktree_branch(&wt), "agent-z");
         assert!(Path::new(&wt).join("base.txt").exists());
         assert!(
@@ -1756,7 +1954,7 @@ mod tests {
         commit(seed.path(), "base.txt", "base\n", "base");
         commit(seed.path(), "trunk.txt", "trunk\n", "trunk only");
         setup_git(seed.path(), &["remote", "add", "origin", &p(bare.path())]);
-        git_push(p(seed.path()), true).unwrap(); // pushes `trunk`, sets upstream
+        git_push_sync(p(seed.path()), true).unwrap(); // pushes `trunk`, sets upstream
 
         let clone_dir = tempfile::tempdir().unwrap();
         setup_git(clone_dir.path(), &["clone", "-q", &p(bare.path()), "wc"]);
@@ -1775,7 +1973,7 @@ mod tests {
 
         // Must succeed, repairing origin/HEAD to origin/trunk and cutting from
         // it — not `fatal: Not a valid object name: 'origin/master'`.
-        let wt = git_worktree_add(p(&primary), "agent-x".into(), None).unwrap();
+        let wt = git_worktree_add_sync(p(&primary), "agent-x".into(), None).unwrap();
         assert_eq!(worktree_branch(&wt), "agent-x");
         assert!(
             Path::new(&wt).join("trunk.txt").exists(),
@@ -1804,7 +2002,7 @@ mod tests {
         // cut from root, never touching feat/base.
         setup_git(d, &["branch", "agent/x", &root]);
 
-        let err = git_worktree_add(p(d), "agent/x".into(), Some("feat/base".into()))
+        let err = git_worktree_add_sync(p(d), "agent/x".into(), Some("feat/base".into()))
             .expect_err("agent/x does not descend from feat/base — must fail loudly");
         assert!(err.contains("agent/x"), "error should name the branch: {err}");
         assert!(err.contains("feat/base"), "error should name the requested base: {err}");
@@ -1832,7 +2030,7 @@ mod tests {
         commit(d, "extra.txt", "extra\n", "agent's own commit");
         setup_git(d, &["checkout", "-q", "main"]);
 
-        let wt = git_worktree_add(p(d), "agent/x".into(), Some("feat/base".into())).unwrap();
+        let wt = git_worktree_add_sync(p(d), "agent/x".into(), Some("feat/base".into())).unwrap();
         assert!(Path::new(&wt).join("extra.txt").exists());
         assert!(Path::new(&wt).join("feat.txt").exists());
     }
@@ -1842,11 +2040,245 @@ mod tests {
         let repo = new_repo();
         let d = repo.path();
         commit(d, "f.txt", "a\n", "A");
-        let err = git_worktree_add(p(d), "agent-w".into(), Some("origin/nope".into())).unwrap_err();
+        let err = git_worktree_add_sync(p(d), "agent-w".into(), Some("origin/nope".into())).unwrap_err();
         assert!(!err.is_empty());
         assert!(
             !git_worktree_list_sync(p(d)).unwrap().contains("agent-w"),
             "an unresolvable base must not leave a worktree behind"
         );
+    }
+
+    // ----- reads, index.lock, and what actually protects against it (#726) -----
+
+    /// Put `f.txt` in the one state that provokes git's opportunistic index
+    /// write — stat-dirty but content-identical — and return the `.git/index`
+    /// bytes as they stand just before the command under test runs.
+    fn stat_dirty_index(d: &Path) -> Vec<u8> {
+        // Same content, so the blob is unchanged and every diff below must be
+        // empty; a clearly different mtime, so the cached stat is stale. A day
+        // back leaves no room for filesystem timestamp granularity to hide it.
+        let f = d.join("f.txt");
+        std::fs::write(&f, "a
+").unwrap();
+        let t = std::fs::metadata(&f).unwrap().modified().unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&f)
+            .unwrap()
+            .set_modified(t - std::time::Duration::from_secs(86_400))
+            .unwrap();
+        std::fs::read(d.join(".git").join("index")).unwrap()
+    }
+
+    /// Reads are left OUTSIDE the write queue (`src/gitqueue.ts`) on the
+    /// argument that they do not take `index.lock`. That argument is only as
+    /// good as which reads actually honour it, and the answer is not uniform —
+    /// so it is measured here rather than assumed, per command, in the one
+    /// state that provokes the write.
+    ///
+    /// The uncomfortable cell is deliberate: `git diff` on the worktree DOES
+    /// rewrite the index, and `--no-optional-locks` does not stop it (verified
+    /// both ways — CI run 30783307529 failed an assertion claiming otherwise on
+    /// all three platforms while the flag was being passed). So the flag is not
+    /// passed there, and this test pins the fact the design has to live with.
+    ///
+    /// That `assert_ne!` is also the **fixture's vacuity guard**. All three
+    /// cells depend on `stat_dirty_index` actually producing a stat-dirty
+    /// entry; if it ever stopped — a git change, a filesystem that quantises
+    /// the backdated mtime away — the two `assert_eq!` cells would pass while
+    /// measuring nothing. The `assert_ne!` is the one that reddens instead, so
+    /// the quiet cells cannot rot silently.
+    ///
+    /// **If the `assert_ne!` fails, do this** (you will not be me, and "good
+    /// news" without an instruction reads like a flake): first check the
+    /// fixture per the paragraph above — a dead fixture and a fixed git look
+    /// identical from here, and only one of them is good news. If the fixture
+    /// is sound, git stopped taking the lock: flip the assertion, revisit #754
+    /// (it may be closable outright), and re-decide the read-exclusion note in
+    /// `run_blocking`'s doc, which currently accepts a residual that would no
+    /// longer exist.
+    #[test]
+    fn only_git_status_is_protected_from_the_index_write() {
+        let repo = new_repo();
+        let d = repo.path();
+        commit(d, "f.txt", "a
+", "A");
+        let index = d.join(".git").join("index");
+
+        // `git status` — protected, and this is what makes #399's flag load
+        // bearing rather than decorative.
+        let before = stat_dirty_index(d);
+        git_status_sync(p(d)).unwrap();
+        assert_eq!(
+            std::fs::read(&index).unwrap(),
+            before,
+            "`git status` rewrote .git/index despite --no-optional-locks — the flag stopped              working, and the whole reads-are-lock-free argument rests on it (#726)"
+        );
+
+        // `git diff --cached` — never writes, with or without any flag.
+        let before = stat_dirty_index(d);
+        let out = git_diff_sync(p(d), "f.txt".into(), "staged".into(), None).unwrap();
+        assert!(out.is_empty(), "index matches HEAD, so the staged diff must be empty");
+        assert_eq!(
+            std::fs::read(&index).unwrap(),
+            before,
+            "`git diff --cached` started writing the index"
+        );
+
+        // `git diff` on the worktree — DOES write, and cannot be told not to.
+        // Asserting the defect rather than wishing it away keeps the residual
+        // impossible to forget and tells us the day git changes it.
+        let before = stat_dirty_index(d);
+        let out = git_diff_sync(p(d), "f.txt".into(), "worktree".into(), None).unwrap();
+        assert!(out.is_empty(), "content is unchanged, so the worktree diff must be empty");
+        assert_ne!(
+            std::fs::read(&index).unwrap(),
+            before,
+            "`git diff` no longer rewrites the index — good news, and a reason to revisit              run_blocking's note on reads overlapping writes (#726)"
+        );
+    }
+    // ----- off-the-main-thread dispatch (#726, completing #399) -----
+
+    #[test]
+    fn run_blocking_runs_the_work_on_another_thread() {
+        // The whole point of the wrapper: the caller's thread — the webview
+        // main thread in production — must not be the one that runs the `git`
+        // spawn. Asserting the closure observes a DIFFERENT thread id is the
+        // only direct evidence of that; `async fn` alone proves nothing, since
+        // an async command whose body still ran inline would be just as frozen.
+        let caller = std::thread::current().id();
+        let worker: std::thread::ThreadId =
+            tauri::async_runtime::block_on(run_blocking(move || Ok(std::thread::current().id())))
+                .unwrap();
+        assert_ne!(
+            worker, caller,
+            "run_blocking executed the closure on the calling thread — the GUI freeze (#726) is back"
+        );
+        // Errors still propagate through unchanged: the wrapper is transparent
+        // to the Result the sync body returns, which is what lets every command
+        // keep its exact contract.
+        let err: Result<(), String> =
+            tauri::async_runtime::block_on(run_blocking(|| Err("boom".to_string())));
+        assert_eq!(err.unwrap_err(), "boom");
+    }
+
+    #[test]
+    fn every_tauri_command_in_this_module_is_async_and_delegates() {
+        // #726's claim is about EVERY git-shelling command in this module, and
+        // a single sync straggler would keep the freeze while the module's doc
+        // claimed otherwise — #399 converted only the git pane's open/refresh
+        // path and left sixteen behind for exactly that reason. So this scans
+        // this file's own source rather than trusting a hand transcription (the
+        // `tests/acl_manifest.rs` precedent, which parses `generate_handler!`
+        // out of `src/lib.rs` for the same reason), and `gh.rs`'s sibling scan
+        // added in #724.
+        //
+        // Bound of the claim, stated rather than implied: this covers the `git`
+        // module only. Every `git` spawn in it goes through `run_git`, which is
+        // a private `fn`, so no command outside this module can reach one
+        // through it. `gitwatch.rs`'s `git_watch` / `git_unwatch` are
+        // deliberately NOT here and stay synchronous: they are in-memory
+        // registry writes under a mutex, not `git` spawns.
+        //
+        // Split so the literal never appears as a whole line in this file —
+        // otherwise the scan would find its own source and mis-report.
+        const ATTR: &str = concat!("#[tauri::", "command]");
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/git.rs"))
+            .expect("read src/git.rs");
+
+        let lines: Vec<&str> = src.lines().map(str::trim).collect();
+        let mut found: Vec<String> = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            if *line != ATTR {
+                continue;
+            }
+            let at = i + 1
+                + lines[i + 1..]
+                    .iter()
+                    .position(|l| !l.is_empty() && !l.starts_with("//") && !l.starts_with('#'))
+                    .unwrap_or_else(|| panic!("{ATTR} at line {} has no function after it", i + 1));
+            let sig = lines[at];
+            assert!(
+                sig.starts_with("pub async fn "),
+                "line {}: `{sig}` is a synchronous #[tauri::command] — Tauri dispatches it on the \
+                 webview main thread, so its `git` spawn freezes the GUI for the whole run \
+                 (#726). Make it a thin `pub async fn` over `run_blocking`.",
+                at + 1
+            );
+
+            // `async` alone is NOT the property. An `async fn` whose body still
+            // called the sync work inline would satisfy the check above and
+            // freeze the GUI exactly as before — Tauri polls a command's future
+            // on the main thread, so work done before the first real await point
+            // runs there. The delegation to `run_blocking` is what actually
+            // moves it, so require it in the command's OWN body: from the
+            // signature to the first top-level `}` (these wrappers are one
+            // expression, so a nested block that stopped this scan early would
+            // itself be a shape worth failing on).
+            let end = at
+                + 1
+                + lines[at + 1..]
+                    .iter()
+                    .position(|l| *l == "}")
+                    .unwrap_or_else(|| panic!("no top-level `}}` closing the fn at line {}", at + 1));
+            assert!(
+                lines[at..end].iter().any(|l| l.contains("run_blocking(")),
+                "line {}: `{sig}` is async but its body never calls `run_blocking(` — an async \
+                 command that runs its `git` spawn inline is polled on the webview main thread and \
+                 freezes the GUI just as a sync one does (#726). Hand the body to \
+                 `run_blocking(move || …_sync(…)).await`.",
+                at + 1
+            );
+
+            let name = sig["pub async fn ".len()..]
+                .split(|c: char| c == '(' || c.is_whitespace())
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            found.push(name);
+        }
+
+        found.sort();
+        // The six #399 already converted (the pane's open/refresh path) plus
+        // the sixteen #726 converted — set equality, so a seventeenth command
+        // added to this module forces a deliberate update here rather than
+        // slipping in synchronous.
+        let mut expected = vec![
+            // #399
+            "git_commit_files",
+            "git_diff",
+            "git_log",
+            "git_repo_root",
+            "git_status",
+            "git_worktree_list",
+            // #726
+            "git_branch_create",
+            "git_branches",
+            "git_checkout",
+            "git_cherry_pick",
+            "git_commit",
+            "git_discard",
+            "git_fetch",
+            "git_merge",
+            "git_pull",
+            "git_push",
+            "git_rebase",
+            "git_revert",
+            "git_stage",
+            "git_tag",
+            "git_unstage",
+            "git_worktree_add",
+        ];
+        expected.sort();
+        assert_eq!(
+            found, expected,
+            "the set of tauri commands in git.rs changed — a new one must be async over \
+             run_blocking (see the module note) and listed here, so the enumeration this test \
+             pins can't silently go stale"
+        );
+        // NB: this equality is also the scan's own vacuity guard — a marker
+        // that stopped matching (a formatting change, a renamed attribute path)
+        // yields an empty `found` and fails here, rather than letting the
+        // per-command assertions above pass vacuously over nothing.
     }
 }

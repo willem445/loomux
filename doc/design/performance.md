@@ -35,8 +35,12 @@ Each is shipped, tested, and citable — prefer copying one to inventing a shape
 
 - **P1 — `spawn_blocking` the whole body.** The command is a thin `async fn`
   whose entire body is handed off, nothing before the first await. Precedent:
-  `gh.rs` (all 10 commands, #724), `write_pty` (`pty.rs:1552`) and `change_dir`
-  (`:1657`), both #734.
+  `git.rs` (all 22 commands, #399 + #726), `gh.rs` (all 10 commands, #724),
+  `write_pty` (`pty.rs:1552`) and `change_dir` (`:1657`), both #734. `git.rs`
+  is the one to copy: it is the largest instance, and the only one whose
+  conversion had to give something up — the freeze it removed was also an
+  accidental mutual exclusion, so it carries the worked example of restoring
+  the ordering (`src/gitqueue.ts`) and of the residual left behind (#754).
 - **P2 — Coalesce per frame, leading edge, byte cap.** Bound a
   producer-rate stream backend-side to ≤1 event per pane per 60 Hz frame with
   a hard batch cap, emitting immediately when the producer has been quiet so

@@ -31457,7 +31457,10 @@ impl OrchRegistry {
         } else if use_worktree && role != Role::Orchestrator && role != Role::Planner {
             // Cut the branch from the default branch (or an explicit `base`),
             // never the primary checkout's incidental HEAD (#204).
-            let wt = crate::git::git_worktree_add(group.repo.clone(), branch_name.clone(), base.clone())?;
+            // `_sync` because this is not the command path: spawning runs on
+            // the caller's own thread, never the webview main thread, so it
+            // wants the plain function rather than the `async` #726 wrapper.
+            let wt = crate::git::git_worktree_add_sync(group.repo.clone(), branch_name.clone(), base.clone())?;
             // #359: a reviewer's worktree is scratch space, not a checkout of
             // the PR it's reviewing — that branch may already be checked out
             // in the worker's own worktree, and git refuses the same branch
