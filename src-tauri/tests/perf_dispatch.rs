@@ -589,14 +589,6 @@ const SYNC_COMMANDS: &[Row] = &[
         issue: Some("#762"),
     },
     Row {
-        name: "orch_set_max_agents",
-        class: Class::Debt,
-        reason: "A full group.json read-modify-write plus an audit append on the webview thread, \
-                 from the max-agents control. The RMW is the pattern the whole guardrail family \
-                 repeats below.",
-        issue: Some("#762"),
-    },
-    Row {
         name: "orch_set_autonomous",
         class: Class::Debt,
         reason: "Writes the autonomy marker, appends audits, and cascades force-disables to the \

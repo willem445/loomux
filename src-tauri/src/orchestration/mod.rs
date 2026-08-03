@@ -37713,11 +37713,14 @@ pub fn orch_notify_enabled(reg: tauri::State<Arc<OrchRegistry>>, group_id: Strin
 
 /// Enable/disable desktop notifications for a group (durable, per-group).
 #[tauri::command]
-pub fn orch_set_notify(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_set_notify(
+    reg: tauri::State<'_, Arc<OrchRegistry>>,
     group_id: String,
     enabled: bool,
 ) -> Result<(), String> {
+    // DELIBERATELY WRONG (#762 red probe): `async` with the work still inline.
+    // Tauri polls this future on the webview thread, so nothing moved. This is
+    // #724's inline-mutation recipe, and E1 must say so.
     reg.set_notify(&group_id, enabled)
 }
 
