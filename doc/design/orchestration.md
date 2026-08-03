@@ -10821,18 +10821,52 @@ Git root used for permission scoping"* and states *"Linked worktrees resolve to 
 repository root, so they share permissions with the main worktree"* — so a worker in a
 dedicated worktree looks its approvals up under the repo it was cut from. The worktree
 still needs the path gate, which is what it contributes to `allowed_directories`. An
-existing key differing only by case or separator is **reused**, never duplicated: Copilot
-loads exactly one key (*"If the key doesn't match, the saved approvals won't apply"*), so a
+existing key naming the same directory is **reused**, never duplicated: Copilot loads
+exactly one key (*"If the key doesn't match, the saved approvals won't apply"*), so a
 second spelling would strand the user's own approvals under whichever one Copilot didn't
 pick. For the same reason the legacy extensionless `permissions-config` filename is edited
 in place when it is the live one — creating the `.json` beside it would make Copilot stop
 honouring the legacy file and silently discard every approval the user had saved.
+
+**"The same directory" is the host's rule, not Windows's.** loomux ships macOS and Linux
+builds, and the first cut of this writer normalized every key the Windows way — `/` folded
+to `\`, compared case-insensitively. Off Windows that is not a normalization but a
+corruption: `/home/u/repo` became `\home\u\repo`, a key Copilot never matches while looking
+up `/home/u/repo`. A permission write that silently does nothing is the very failure class
+#802 is about, so the fix would have reproduced the bug on two of the three platforms
+loomux ships.
+
+The reference states both halves of the rule in one sentence, and only the first half is
+Windows: the CLI *"compares paths case-insensitively on Windows, and compares paths
+**case-sensitively on other platforms**"*. So case folds only on Windows — folding
+everywhere would merge `/srv/App` and `/srv/app`, two genuinely distinct directories on
+Linux — and `\` is rewritten only on Windows, because elsewhere it is a legal *filename
+character* rather than a separator. A trailing separator is stripped on both, but never
+down to an empty key: a bare root keeps its separator.
+
+This is expressed as one `const HOST_IS_WINDOWS: bool = cfg!(windows)` feeding pure
+`*_for(…, windows: bool)` functions, rather than as `#[cfg]`-split function bodies. The
+reason is testability: a `#[cfg]` split compiles only its host's half, so the POSIX rule
+would go unexercised on the Windows CI leg and vice versa — each platform's tests would
+pass while proving nothing about the other. `path_keys_follow_the_hosts_own_path_semantics`
+drives **both** shapes explicitly on every leg, plus a small host-semantics check that the
+production wrappers agree with whichever half applies.
 
 **The legacy `trustedFolders` write stays.** Absence across three reference pages is a
 sourced absence, not a documented removal, and loomux cannot observe which Copilot build a
 machine runs. Dropping it would trade a confirmed gap for a possible regression. Both
 writes remain inside the `is_live_registry()` containment rule described above — the
 permissions store is a second file under the same predicate, not a second exception to it.
+
+**Both writes are `atomic_write`, not `fs::write`.** These are the *user's* files:
+`permissions-config.json` holds every approval they have ever granted Copilot in any repo,
+and `config.json` holds Copilot's authentication state. `fs::write` truncates before it
+writes, so a disk-full or a crash mid-write leaves an empty or half-written file and the
+user silently loses the lot — #133's failure verbatim (a disk-full `fs::write` truncated
+`tasks.json` and destroyed the live board), and strictly worse here because the data is not
+loomux's to lose and loomux cannot regenerate it. The grant stays best-effort at the policy
+level — a failure means Copilot prompts as before, never a failed spawn — but a failure can
+no longer be *destructive*.
 
 ### The red herring: block containment defaults
 

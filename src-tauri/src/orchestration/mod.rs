@@ -4407,7 +4407,24 @@ pub fn copilot_tool_permissions(
         // are a ladder (see `Containment`).
         deny.extend(COPILOT_READONLY_DENY_GIT.iter().map(|s| (*s).to_string()));
     }
+    // #803 review: a block that re-declares a pattern loomux already grants
+    // (`allow: ["loomux"]`, or `shell(git:*)` on an attended block) would
+    // otherwise repeat it inside the one value. Harmless to copilot, but it
+    // makes the command line say something loomux does not mean, and this
+    // value is now the single place a reader checks to see what an agent was
+    // granted — so it should read as the grant, not as a concatenation.
+    // First occurrence wins, so the documented order above is preserved.
+    dedupe_preserving_order(&mut allow);
+    dedupe_preserving_order(&mut deny);
     (allow, deny)
+}
+
+/// Drop repeat entries, keeping each value's FIRST position. Exact string
+/// equality — these are tool patterns, not paths, so none of
+/// [`same_path_key`]'s separator/case latitude applies.
+fn dedupe_preserving_order(v: &mut Vec<String>) {
+    let mut seen: HashSet<String> = HashSet::new();
+    v.retain(|s| seen.insert(s.clone()));
 }
 
 /// Gemini CLI's built-in tool names, per the official
@@ -10161,14 +10178,64 @@ fn agent_id_suffix(id: &str) -> Option<u32> {
     id.rsplit_once('-').and_then(|(_, tail)| tail.parse().ok())
 }
 
-/// Compare two filesystem paths the way both copilot config surfaces below
-/// need them compared: separator-insensitive, trailing-separator-insensitive,
-/// and case-insensitive (loomux is Windows-only, and the copilot
-/// configuration-directory reference states `allowed_directories` paths are
-/// compared "case-insensitively on Windows").
-fn same_path_key(a: &str, b: &str) -> bool {
-    let norm = |s: &str| s.replace('/', "\\").trim_end_matches('\\').to_lowercase();
+/// Whether this build's host uses Windows path semantics. A `const` from
+/// `cfg!` rather than `#[cfg]`-duplicated function bodies, so the rules below
+/// stay one readable pair of branches — and, more importantly, so
+/// [`normalize_path_key_for`] / [`same_path_key_for`] can be driven with BOTH
+/// values from a test on ANY platform. A `#[cfg]`-split pair would compile only
+/// its host's half, leaving the other half untested everywhere it matters.
+const HOST_IS_WINDOWS: bool = cfg!(windows);
+
+/// Normalize a path for use as (or comparison against) a copilot
+/// `permissions-config.json` location key, under `windows` path semantics.
+///
+/// **Platform-correct, not Windows-shaped (#803 review B1).** loomux ships
+/// macOS and Linux builds as well as Windows, and the previous unconditional
+/// `'/' -> '\\'` rewrite was actively destructive off Windows: it turned
+/// `/home/u/repo` into `\home\u\repo`, a key copilot would never match while
+/// looking up `/home/u/repo` — a permission write that silently does nothing,
+/// which is the exact failure class #802 is about.
+///
+/// - **Separators.** On Windows both `/` and `\` are separators, so `/` folds
+///   to `\`. On every other platform `\` is a legal *filename character*, so
+///   rewriting it would corrupt a real path rather than normalize one.
+/// - **Trailing separator.** Stripped either way — `…/repo` and `…/repo/` name
+///   one directory. Never stripped down to nothing: a bare root (`/`, or a
+///   Windows `C:\`) keeps its last separator rather than becoming `""`.
+#[doc(hidden)] // pub for integration tests: BOTH platform shapes, on any host
+pub fn normalize_path_key_for(s: &str, windows: bool) -> String {
+    let sep = if windows { '\\' } else { '/' };
+    let swapped = if windows { s.replace('/', "\\") } else { s.to_string() };
+    let trimmed = swapped.trim_end_matches(sep);
+    // `"/"` / `"C:\"` trim to `""`; keep one separator instead of an empty key.
+    if trimmed.is_empty() { swapped } else { trimmed.to_string() }
+}
+
+/// Whether two paths name the same location under `windows` path semantics.
+///
+/// Case folding is **Windows-only**, per the copilot configuration-directory
+/// reference on this very field: the CLI *"compares paths case-insensitively on
+/// Windows, and compares paths **case-sensitively on other platforms**"*. Case
+/// folding everywhere would merge `/srv/App` and `/srv/app` — two distinct
+/// directories on Linux — into one entry, so loomux would write its grant under
+/// whichever spelling it saw first and copilot would fail to match the other.
+#[doc(hidden)] // pub for integration tests: BOTH platform shapes, on any host
+pub fn same_path_key_for(a: &str, b: &str, windows: bool) -> bool {
+    let norm = |s: &str| {
+        let n = normalize_path_key_for(s, windows);
+        if windows { n.to_lowercase() } else { n }
+    };
     norm(a) == norm(b)
+}
+
+/// [`normalize_path_key_for`] at this host's semantics.
+fn normalize_path_key(s: &str) -> String {
+    normalize_path_key_for(s, HOST_IS_WINDOWS)
+}
+
+/// [`same_path_key_for`] at this host's semantics.
+fn same_path_key(a: &str, b: &str) -> bool {
+    same_path_key_for(a, b, HOST_IS_WINDOWS)
 }
 
 /// The JSONC-ish split both copilot config editors below share: leading `//`
@@ -10262,11 +10329,14 @@ fn copilot_permissions_file(home: &Path) -> PathBuf {
 /// approvals up under the repo it was cut from. The worktree still needs the
 /// *path* gate, which is what `folder` adds to `allowed_directories`.
 ///
-/// An existing location key that differs only by case or separator is REUSED
-/// rather than duplicated: "The key must match the location where Copilot CLI
-/// is running. If the key doesn't match, the saved approvals won't apply", so
-/// two keys for one repo would leave the user's own approvals stranded under
-/// whichever one copilot didn't pick.
+/// An existing location key naming the same directory is REUSED rather than
+/// duplicated: "The key must match the location where Copilot CLI is running.
+/// If the key doesn't match, the saved approvals won't apply", so two keys for
+/// one repo would leave the user's own approvals stranded under whichever one
+/// copilot didn't pick. "Same directory" is decided by [`same_path_key`], whose
+/// latitude is **platform-correct, not universal** (#803 review B1): a
+/// case-variant spelling is the same key on Windows and a DIFFERENT one
+/// everywhere else, because that is what copilot itself does.
 pub fn copilot_permissions_grant(
     config_text: &str,
     location: &str,
@@ -10289,7 +10359,7 @@ pub fn copilot_permissions_grant(
         .keys()
         .find(|k| same_path_key(k.as_str(), location))
         .cloned()
-        .unwrap_or_else(|| location.replace('/', "\\").trim_end_matches('\\').to_string());
+        .unwrap_or_else(|| normalize_path_key(location));
     let entry = locations.entry(key).or_insert_with(|| json!({})).as_object_mut()?;
 
     let mut changed = false;
@@ -10392,6 +10462,22 @@ pub fn set_copilot_trust_home_for_test(home: Option<PathBuf>) {
 ///
 /// Module-private on purpose: nothing outside this module should be able to
 /// name a "write the trust grant HERE" primitive.
+/// **Both writes go through [`atomic_write`], not `fs::write` (#803 review
+/// B2).** These are the USER's files, not loomux's: `permissions-config.json`
+/// holds every tool and directory approval they have ever granted copilot, in
+/// any repo, and `config.json` holds copilot's own authentication state. A
+/// plain `fs::write` truncates the destination before it writes, so a
+/// disk-full or a crash mid-write leaves an empty or half-written file — and
+/// the user silently loses the lot. That is the #133 failure verbatim (a
+/// disk-full `fs::write` truncated `tasks.json` and destroyed the live board),
+/// and it is strictly worse here because the data is not loomux's to lose and
+/// loomux cannot regenerate it. `atomic_write` writes a same-directory temp,
+/// fsyncs it, and renames it over the destination, so a failure leaves the
+/// previous good file intact.
+///
+/// Still best-effort at the policy level: a failed grant means copilot prompts
+/// as it did before, never a failed spawn. What changes is that a failure can
+/// no longer be *destructive*.
 fn pre_trust_copilot_folder_in(home: &Path, location: &str, folder: &str) {
     // The documented store (#802) — see `copilot_permissions_grant`.
     let perms_path = copilot_permissions_file(home);
@@ -10399,16 +10485,15 @@ fn pre_trust_copilot_folder_in(home: &Path, location: &str, folder: &str) {
     if let Some(updated) =
         copilot_permissions_grant(&perms_text, location, folder, LOOMUX_MCP_SERVER)
     {
-        let _ = fs::create_dir_all(home);
-        let _ = fs::write(&perms_path, updated);
+        // `atomic_write` creates the destination directory itself.
+        let _ = atomic_write(&perms_path, updated.as_bytes());
     }
     // The pre-1.0.77 surface, kept because the current docs' silence about
     // `trustedFolders` is an absence, not a documented removal.
     let path = home.join("config.json");
     let text = fs::read_to_string(&path).unwrap_or_default();
     if let Some(updated) = add_trusted_folder(&text, folder) {
-        let _ = fs::create_dir_all(home);
-        let _ = fs::write(&path, updated);
+        let _ = atomic_write(&path, updated.as_bytes());
     }
 }
 

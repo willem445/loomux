@@ -26,6 +26,9 @@ use loomux_lib::orchestration::{
     // #802: copilot's documented permission store, and the one-occurrence
     // tool-permission value both command builders share.
     copilot_permissions_grant, copilot_tool_permissions,
+    // #803 review B1: the path-key rules, parameterized so BOTH platform
+    // shapes are exercised on every CI leg.
+    normalize_path_key_for, same_path_key_for,
     channel_connected_event, channel_disconnected_event, channel_message_text,
     channel_updated_event, classify_human_input,
     claude_effective_permission_mode, claude_permission_mode, cli_ready, compact_checklist_warning, compact_escalation_notice,
@@ -9058,8 +9061,21 @@ fn copilot_trust_config_edit_preserves_content_and_dedupes() {
     assert!(updated.contains("firstLaunchAt"), "unknown fields must survive");
     assert!(updated.contains(r"C:\\Projects\\cattle-worker") || updated.contains("cattle-worker"));
     assert!(updated.contains("other"));
-    // Already trusted (case/separator variants): no rewrite at all.
-    assert!(add_trusted_folder(existing, r"c:/projects/cattle-worker").is_none());
+    // Already trusted: no rewrite at all.
+    assert!(add_trusted_folder(existing, r"C:\Projects\cattle-worker").is_none());
+    // A CASE/separator variant collapses only where the host filesystem is
+    // case-insensitive and treats `/` as a separator — Windows (#803 review
+    // B1). The fixture is a Windows-shaped path, so off Windows it is simply a
+    // different string and appending it is the correct answer, not a bug. The
+    // full platform matrix for this rule lives in
+    // `path_keys_follow_the_hosts_own_path_semantics`, which drives BOTH
+    // shapes on every CI platform rather than only the host's.
+    let case_variant = add_trusted_folder(existing, r"c:/projects/cattle-worker");
+    assert_eq!(
+        case_variant.is_none(),
+        cfg!(windows),
+        "a case/separator variant is the same folder on Windows and a different one elsewhere"
+    );
     // Empty/missing config: created from scratch.
     let fresh = add_trusted_folder("", r"C:\Projects\x").unwrap();
     assert!(fresh.contains("trustedFolders"));
@@ -9143,6 +9159,90 @@ fn pre_trust_copilot_folder_never_clobbers_an_unparseable_config() {
     assert_eq!(unchanged, "// c\n{ not json", "an unparseable config must be left exactly alone, never clobbered");
 }
 
+/// #803 review B1: loomux ships macOS and Linux builds, not just Windows, and
+/// the location key it writes into copilot's `permissions-config.json` must be
+/// the one copilot will look up on THAT host.
+///
+/// The regression this pins is not hypothetical: an unconditional `'/' -> '\\'`
+/// rewrite turns `/home/u/repo` into `\home\u\repo`, a key copilot never
+/// matches while looking up `/home/u/repo` — a permission write that silently
+/// does nothing, which is the exact failure class #802 reports.
+///
+/// Both shapes are driven explicitly, so a Linux CI leg still tests the Windows
+/// rule and vice versa — a `#[cfg]`-split implementation would compile only its
+/// host's half and leave the other half unexercised everywhere.
+#[test]
+fn path_keys_follow_the_hosts_own_path_semantics() {
+    // ── Windows semantics: `/` and `\` are both separators, case folds.
+    assert_eq!(normalize_path_key_for(r"C:/Projects/demo/", true), r"C:\Projects\demo");
+    assert_eq!(normalize_path_key_for(r"C:\Projects\demo", true), r"C:\Projects\demo");
+    assert!(same_path_key_for(r"C:\Projects\Demo", "c:/projects/demo/", true));
+
+    // ── POSIX semantics: `/` only, case is significant.
+    assert_eq!(normalize_path_key_for("/home/u/repo/", false), "/home/u/repo");
+    assert_eq!(normalize_path_key_for("/home/u/repo", false), "/home/u/repo");
+    assert!(same_path_key_for("/home/u/repo", "/home/u/repo/", false));
+    assert!(
+        !same_path_key_for("/srv/App", "/srv/app", false),
+        "case-folding off Windows would merge two directories that genuinely differ on Linux"
+    );
+
+    // A POSIX path must survive normalization UNCHANGED — this is the blocker
+    // itself: `\home\u\repo` is a key copilot would never match.
+    assert_eq!(normalize_path_key_for("/home/u/repo", false), "/home/u/repo");
+    assert!(
+        !normalize_path_key_for("/home/u/repo", false).contains('\\'),
+        "a POSIX key must never grow a backslash"
+    );
+    // …and a backslash inside a POSIX path is a legal FILENAME character, so it
+    // is data, not a separator: rewriting or trimming it would corrupt the path.
+    assert_eq!(normalize_path_key_for(r"/home/u/we\ird", false), r"/home/u/we\ird");
+    assert_eq!(normalize_path_key_for(r"/home/u/trailing\", false), r"/home/u/trailing\");
+
+    // A bare root keeps its separator rather than normalizing to the empty key.
+    assert_eq!(normalize_path_key_for("/", false), "/");
+    assert_eq!(normalize_path_key_for(r"C:\", true), r"C:");
+
+    // …and the PRODUCTION path agrees with whichever half applies here. Driven
+    // through `copilot_permissions_grant` rather than the private host
+    // wrappers: what matters is not that a one-line wrapper delegates, it is
+    // that the key actually written to the file is one THIS host's copilot
+    // would look up.
+    let (loc, wt) = if cfg!(windows) {
+        (r"C:\Projects\demo", r"C:\Projects\demo-worktrees\w-1")
+    } else {
+        ("/home/u/demo", "/home/u/demo-worktrees/w-1")
+    };
+    let written = copilot_permissions_grant("", loc, wt, "loomux").unwrap();
+    let v: serde_json::Value = serde_json::from_str(&written).unwrap();
+    assert!(
+        !v["locations"][loc].is_null(),
+        "the location key must be this host's own path shape, verbatim: {written}"
+    );
+    if !cfg!(windows) {
+        assert!(
+            !written.contains(r"\home"),
+            "the #803 B1 regression: a POSIX key rewritten with backslashes is one copilot \
+             never matches, so the grant silently does nothing: {written}"
+        );
+    }
+}
+
+/// #803 review: a block that re-declares something loomux already grants must
+/// not make the one `--allow-tool` value say it twice — that value is now the
+/// single place a reader checks to see what an agent was granted.
+#[test]
+fn copilot_tool_permissions_do_not_repeat_a_pattern() {
+    // `loomux` and `shell(git:*)` are both already in the attended baseline.
+    let extra = vec!["loomux".to_string(), "shell(git:*)".to_string(), "shell(make:*)".to_string()];
+    let (allow, _) = copilot_tool_permissions(false, Containment::None, &extra);
+    assert_eq!(
+        allow,
+        ["loomux", "shell(git:*)", "shell(gh:*)", "shell(make:*)"],
+        "each pattern appears once, at its FIRST position: {allow:?}"
+    );
+}
+
 // ── #802: copilot's DOCUMENTED permission store ────────────────────────────
 //
 // `trustedFolders` in `config.json` is the pre-1.0.77 surface and appears in
@@ -9213,27 +9313,30 @@ fn copilot_permissions_grant_writes_the_documented_shape() {
     assert_eq!(approvals[0]["kind"], "commands");
     assert_eq!(approvals[1]["serverName"], "loomux");
 
-    // A location key that differs only by case/separator is REUSED, never
-    // duplicated: copilot loads exactly one key ("If the key doesn't match, the
-    // saved approvals won't apply"), so a second spelling would strand the
-    // user's own approvals under whichever one copilot didn't pick.
-    let variant = copilot_permissions_grant(
-        &serde_json::to_string_pretty(&json!({
-            "locations": { "c:/projects/demo/": { "tool_approvals": [{ "kind": "write" }] } }
-        }))
-        .unwrap(),
-        REPO,
-        WORKTREE,
-        "loomux",
-    )
-    .unwrap();
+    // An existing key naming the SAME directory is REUSED, never duplicated:
+    // copilot loads exactly one key ("If the key doesn't match, the saved
+    // approvals won't apply"), so a second spelling would strand the user's own
+    // approvals under whichever one copilot didn't pick.
+    //
+    // What counts as "the same directory" is the host's rule, not a universal
+    // one (#803 review B1): Windows folds case and separators, POSIX folds only
+    // a trailing separator. Each leg uses a variant that is genuinely the same
+    // directory ON THAT HOST, so the property under test is identical
+    // everywhere even though the spelling can't be.
+    let existing_key = if cfg!(windows) { "c:/projects/demo/" } else { r"C:\Projects\demo/" };
+    let mut locs = serde_json::Map::new();
+    locs.insert(existing_key.to_string(), json!({ "tool_approvals": [{ "kind": "write" }] }));
+    let seeded =
+        serde_json::to_string_pretty(&json!({ "locations": serde_json::Value::Object(locs) }))
+            .unwrap();
+    let variant = copilot_permissions_grant(&seeded, REPO, WORKTREE, "loomux").unwrap();
     let v: serde_json::Value = serde_json::from_str(&variant).unwrap();
     assert_eq!(
         v["locations"].as_object().unwrap().len(),
         1,
-        "a case/separator variant of the same path is one location, not two: {variant}"
+        "a variant spelling of the same path is one location, not two: {variant}"
     );
-    assert_eq!(v["locations"]["c:/projects/demo/"]["tool_approvals"].as_array().unwrap().len(), 2);
+    assert_eq!(v["locations"][existing_key]["tool_approvals"].as_array().unwrap().len(), 2);
 
     // A pre-existing approval for ONE tool on the same server is a narrower
     // grant and must NOT be mistaken for the server-wide one — otherwise a user
