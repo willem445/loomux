@@ -175,16 +175,31 @@ impl GitWatcher {
     /// Is `ticket` still the newest intent claimed for `id`? Takes the guard as
     /// an argument rather than the lock, so a caller can hold the decision and
     /// the action it authorises together.
+    ///
+    /// **`intents` is never pruned, and that is load-bearing — do not "clean it
+    /// up".** Nothing removes an entry: `unwatch` claims a NEWER ticket rather
+    /// than removing the pane's, which is precisely what makes a close a
+    /// tombstone instead of a gap. Prune it — on `unwatch`, or from a periodic
+    /// sweep of closed panes — and the `map_or(true, …)` below reads the missing
+    /// entry as "still current", so a `watch_claimed` that was stat-ing when the
+    /// pane closed reinstalls the watch that close removed. That is exactly the
+    /// orphan the ticket exists to prevent: an entry the poll thread stats every
+    /// second, forever, for a pane that no longer exists.
+    ///
+    /// The map is therefore monotonic for the process lifetime, by design and
+    /// not by omission: one `u32 -> u64` per pane id ever watched. Twelve bytes
+    /// against a pane that costs megabytes, and the field's own doc carries the
+    /// same bound.
     fn is_current(
         &self,
         intents: &std::sync::MutexGuard<'_, HashMap<u32, u64>>,
         id: u32,
         ticket: u64,
     ) -> bool {
-        // An absent entry reads as current: every path claims before it acts,
-        // so this cannot happen — and if it somehow did, declining every write
-        // would break the watcher silently, while allowing one degrades to the
-        // pre-#746 behaviour.
+        // So an absent entry cannot happen today — every path claims before it
+        // acts, and nothing deletes. It reads as current anyway because that
+        // degrades to the pre-#746 behaviour, where declining every write would
+        // instead break the watcher silently.
         intents.get(&id).map_or(true, |newest| *newest == ticket)
     }
 

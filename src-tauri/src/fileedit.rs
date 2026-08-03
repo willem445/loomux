@@ -101,12 +101,15 @@ static ATOMIC_WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
 /// gate is held across check+write, and the promise holds by a lock instead of
 /// by a thread.
 ///
-/// **Granularity: one file, not one command.** `replace` takes it per file
-/// inside its loop rather than around the whole run — an unbounded project-wide
-/// replace must not block a single-file save for its whole duration, and the
-/// unit that matters is a file's own read-modify-write. A save racing a replace
-/// therefore lands wholly before or wholly after that file's rewrite, never
-/// between its read and its rename.
+/// **Hold scope: one file, not one command — the gate itself is module-wide.**
+/// This is ONE mutex guarding every write in this module, so writes to
+/// different files serialise against each other; what "per file" describes is
+/// how long it is HELD, never a per-file lock. `replace` takes and releases it
+/// once per file inside its loop rather than around the whole run — an
+/// unbounded project-wide replace must not block a single-file save for its
+/// whole duration, and the unit that matters is a file's own
+/// read-modify-write. A save racing a replace therefore lands wholly before or
+/// wholly after that file's rewrite, never between its read and its rename.
 ///
 /// It guards `()`: there is no shared datum, only an order. Poison-tolerant for
 /// the same reason (`obs::LockExt`) — a panic mid-write leaves the filesystem
@@ -1036,9 +1039,13 @@ pub fn replace(
                 continue;
             }
         };
-        // One file's read-modify-write is one unit against a concurrent
-        // `ft_write_file` — see [`WRITE_GATE`]. Taken per file, not around the
-        // loop: the file count here is unbounded.
+        // Acquire and release the module-wide [`WRITE_GATE`] once per
+        // iteration, so one file's read-modify-write is one unit against a
+        // concurrent `ft_write_file`. This is about how long the gate is HELD,
+        // not about its granularity: there is ONE mutex for every write in this
+        // module, so writes to different files serialise against each other
+        // too. Per iteration rather than around the loop because the file count
+        // here is unbounded.
         let _gate = WRITE_GATE.lock_safe();
         let bytes = match std::fs::read(&path) {
             Ok(b) => b,
@@ -1322,8 +1329,11 @@ pub async fn ft_replace(
     files: Vec<String>,
     opts: SearchOpts,
 ) -> Result<ReplaceResult, String> {
-    // **Reentrancy.** Per-file, [`WRITE_GATE`] makes each read-modify-write one
-    // unit against a concurrent save (and against another replace). Across
+    // **Reentrancy.** [`WRITE_GATE`] — one module-wide mutex, not a per-file
+    // lock — is taken and released once per file, so each file's
+    // read-modify-write is one unit against a concurrent save (and against
+    // another replace). Two different files never write concurrently either;
+    // what varies per file is only how long the gate is held. Across
     // files it deliberately holds nothing: a project-wide replace is not one
     // transaction and never was — it re-reads and re-matches each file at apply
     // time, and reports every file it did not touch in `skipped`, which is the
