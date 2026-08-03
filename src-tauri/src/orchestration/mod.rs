@@ -3819,18 +3819,24 @@ pub struct Guardrails {
     /// renderer, `gh.rs`'s label allow-list, `idle_tick_notice()` — reads the
     /// same value.
     ///
-    /// **NOT YET wired to the #332 host poller (rev-33 finding, #429):** the
-    /// P1 comment above once claimed the poller was a consumer too; it isn't
-    /// — `intake::INTAKE_LABELS` is a hardcoded `["agent-ready",
-    /// "agent-investigation"]` const, not read from this field. That was a
-    /// low-stakes gap while the gate shipped default-off (#429's smart
-    /// default hadn't landed, so almost no group actually engaged the
-    /// poller); it is a real one now that the gate is ON by default for
-    /// every autonomous group — a repo with a custom `intake:` profile
-    /// (different labels) gets a poller silently checking the WRONG ones,
-    /// never finding its own custom-labeled intake. TODO(#382 P2): wire
+    /// **Only PARTLY wired to the #332 host poller (rev-33 finding, #429):**
+    /// the P1 comment above once claimed the poller was a consumer; for the
+    /// intake labels it still isn't — `intake::INTAKE_LABELS` is a hardcoded
+    /// `["agent-ready", "agent-investigation"]` const, not read from this
+    /// field. That was a low-stakes gap while the gate shipped default-off
+    /// (#429's smart default hadn't landed, so almost no group actually
+    /// engaged the poller); it is a real one now that the gate is ON by
+    /// default for every autonomous group — a repo with a custom `intake:`
+    /// profile (different labels) gets a poller silently checking the WRONG
+    /// ones, never finding its own custom-labeled intake. TODO(#382 P2): wire
     /// `poll_intake`/`label_deltas` to read this field's resolved labels
     /// instead of the hardcoded const.
+    ///
+    /// `hold` is the exception, wired from the start (#778): `poll_intake`
+    /// reads it from here for every full-autonomy eligibility check. Deliberate
+    /// — it is a **consent boundary** (the human's veto over what may be
+    /// started), and repeating the hardcoded-const gap on one of those would
+    /// mean a repo that renamed the label gets its vetoes silently ignored.
     ///
     /// Available regardless of the toggle: autonomous mode can run with the
     /// built-in roster, so a consumer must always have a profile to read, not
@@ -7341,6 +7347,7 @@ fn read_intake(g: &Value) -> workflow::IntakeProfile {
         investigate: label("investigate", &default.investigate),
         owned: label("owned", &default.owned),
         prototype: label("prototype", &default.prototype),
+        hold: label("hold", &default.hold),
     }
 }
 
@@ -7354,6 +7361,7 @@ fn intake_json(p: &workflow::IntakeProfile) -> Value {
             "investigate": p.investigate,
             "owned": p.owned,
             "prototype": p.prototype,
+            "hold": p.hold,
         },
     })
 }
@@ -23275,6 +23283,14 @@ impl OrchRegistry {
     /// is due (#406) — with the same `now` that tick's notify half used, so
     /// both halves of one wake stamp the same instant.
     ///
+    /// For a group in **full autonomy** (#778) the same `gh issue list`
+    /// response answers a second question — which open issues are eligible to
+    /// start and unstarted (`intake::eligible_deltas`) — so the self-select
+    /// signal costs zero extra `gh` calls and zero tokens. It rides
+    /// `has_intake_signal` like every other finding here: the idle-tick gate
+    /// gains no new parameter, and the one-notice latch, hourly cap and
+    /// bounded fallback all apply to it unchanged.
+    ///
     /// A `gh` failure for one call (auth, `gh` missing, rate-limited) simply
     /// skips that half of the diff for this scan — it still stamps the poll
     /// attempt (so a persistently-failing `gh` doesn't get retried every
@@ -23291,33 +23307,88 @@ impl OrchRegistry {
         let due = intake::due_intake_polls(now, &minutes, &last_poll);
         for group in due {
             let Some(repo) = repos.get(&group) else { continue };
-            let issues_raw =
-                self.gh_capture(repo, &["issue", "list", "--state", "open", "--json", "number,title,labels"]);
+            // The argv is built by `intake::issue_list_argv` rather than
+            // spelled inline so its `--limit` is pinned by a test: `gh issue
+            // list` defaults to the 30 NEWEST open issues, which silently hid
+            // most of a mid-sized repo's backlog from both diffs below
+            // (measured on loomux itself: 30 of 94). See
+            // `intake::MAX_INTAKE_ISSUES` for why 300, and why hitting the
+            // bound is reported rather than silently applied.
+            let issue_argv = intake::issue_list_argv();
+            let issue_args: Vec<&str> = issue_argv.iter().map(String::as_str).collect();
+            let issues_raw = self.gh_capture(repo, &issue_args);
             let prs_raw =
                 self.gh_capture(repo, &["pr", "list", "--state", "open", "--json", "number,title,statusCheckRollup"]);
             self.intake_last_poll_ms.lock_safe().insert(group.clone(), now);
 
-            let (label_signals, pr_signals) = {
+            // Full-autonomy eligibility inputs (#778), resolved before the
+            // seen-state lock: this group's own hold-label spelling (a repo
+            // may rename it — the veto is a consent boundary, so the poller
+            // reads the resolved profile rather than a const), and the issue
+            // numbers the board already tracks. Both are cheap and neither is
+            // computed for a group that isn't in full autonomy. A group that
+            // opted OUT of intake polling entirely (`intake_poll_minutes:
+            // Some(0)`) is never due here at all, in this mode as in any
+            // other: its orchestrator still gets the bounded fallback
+            // heartbeat, and the contract has it sweep for eligible work
+            // itself — the gate stays a gate, not a second consent surface.
+            //
+            // Read outside the `intake_seen` lock that `eligible_deltas` later
+            // writes under, which leaves one narrow residual (rev-266 NB2): a
+            // re-aim landing between this read and that write has its
+            // `set_full_autonomy` re-arm overwritten, losing that one triage
+            // trigger. Left as-is deliberately — closing it means taking
+            // `full_autonomy_groups` while holding `intake_seen`, the exact
+            // reverse of the order `set_full_autonomy` uses, trading a
+            // microsecond window on a human-driven toggle for a lock-order
+            // inversion. The ON notice reaches the orchestrator either way, and
+            // the next poll re-announces anything genuinely new.
+            let full_autonomy = self.is_full_autonomy(&group);
+            let (hold_label, board_tracked) = if full_autonomy {
+                let hold = self
+                    .groups
+                    .lock_safe()
+                    .get(&group)
+                    .map(|g| g.guardrails.intake.hold.clone())
+                    .unwrap_or_else(|| workflow::builtin_intake_profile().hold);
+                let tasks = self.tasks(&group);
+                let refs: Vec<&str> = tasks.iter().filter_map(|t| t.issue.as_deref()).collect();
+                (hold, intake::board_tracked_issues(&refs))
+            } else {
+                (String::new(), HashSet::new())
+            };
+
+            let (label_signals, pr_signals, eligible_signals, issues_truncated) = {
                 let mut seen = self.intake_seen.lock_safe();
                 let state = seen.entry(group.clone()).or_default();
-                let labels = issues_raw
-                    .as_deref()
-                    .ok()
-                    .and_then(intake::parse_issue_list)
-                    .map(|issues| intake::label_deltas(&mut state.labels, &issues))
+                // Parsed once and read by both diffs — the label delta and the
+                // eligibility delta are two questions about the same `gh issue
+                // list` response, not two fetches.
+                let issues = issues_raw.as_deref().ok().and_then(intake::parse_issue_list);
+                let listing = issues.as_deref().map(intake::OpenIssueList::from_fetch);
+                let labels = listing
+                    .map(|l| intake::label_deltas(&mut state.labels, l.issues))
                     .unwrap_or_default();
+                let eligible = intake::eligible_deltas(
+                    &mut state.eligible,
+                    full_autonomy,
+                    listing,
+                    &hold_label,
+                    &board_tracked,
+                );
                 let prs = prs_raw
                     .as_deref()
                     .ok()
                     .and_then(intake::parse_pr_list)
                     .map(|prs| intake::pr_check_deltas(&mut state.pr_checks, &prs))
                     .unwrap_or_default();
-                (labels, prs)
+                (labels, prs, eligible, listing.is_some_and(|l| !l.complete))
             };
-            if label_signals.is_empty() && pr_signals.is_empty() {
+            if label_signals.is_empty() && pr_signals.is_empty() && eligible_signals.is_empty() {
                 continue;
             }
-            let summary = intake::intake_wake_summary(&label_signals, &pr_signals);
+            let summary =
+                intake::intake_wake_summary(&label_signals, &pr_signals, &eligible_signals, issues_truncated);
             self.audit(&group, "loomux", "intake-signal", json!({ "summary": summary }));
             // Fold into any not-yet-delivered pending summary rather than
             // clobbering it — two poll scans can each find something new
@@ -23341,6 +23412,29 @@ impl OrchRegistry {
     #[doc(hidden)] // pub for integration tests: observe that a scan ran, without shelling to `gh`
     pub fn intake_last_poll_at(&self, group: &str) -> Option<u64> {
         self.intake_last_poll_ms.lock_safe().get(group).copied()
+    }
+
+    /// The issue numbers this group's intake poller last saw as
+    /// eligible-unstarted (#778), sorted.
+    ///
+    /// Same `#[doc(hidden)]` test-seam rationale as `intake_last_poll_at`
+    /// above: `poll_intake`'s own path needs a live `gh`, so without a seam
+    /// the one property that makes an enable a **triage trigger** — that
+    /// turning full autonomy on empties this set, so the next poll announces
+    /// the whole backlog — could only be asserted by re-implementing it in
+    /// the test.
+    #[doc(hidden)] // pub for integration tests: observe the eligible seen-set without shelling to `gh`
+    pub fn intake_eligible_seen(&self, group: &str) -> Vec<u64> {
+        let seen = self.intake_seen.lock_safe();
+        let mut n: Vec<u64> = seen.get(group).map(|s| s.eligible.iter().copied().collect()).unwrap_or_default();
+        n.sort_unstable();
+        n
+    }
+
+    #[doc(hidden)] // pub for integration tests: seed the eligible seen-set without shelling to `gh`
+    pub fn seed_intake_eligible_seen(&self, group: &str, numbers: &[u64]) {
+        self.intake_seen.lock_safe().entry(group.to_string()).or_default().eligible =
+            numbers.iter().copied().collect();
     }
 
     #[doc(hidden)] // pub for integration tests: seed a pending intake signal without shelling to `gh`
@@ -26820,6 +26914,17 @@ impl OrchRegistry {
                 }
                 return Err(format!("failed to enable full autonomy: {e}"));
             }
+            // Re-arm the triage trigger (#778). `intake_seen[group].eligible` means
+            // "eligible at the last intake poll", and an empty one is what makes the
+            // next poll announce the whole eligible backlog once — precisely the
+            // triage pass the enable notice tells the orchestrator to post. The
+            // poller clears it while the mode is off, but only for groups it
+            // actually reaches, so an off→on flip inside one poll interval would
+            // otherwise inherit a set populated under different consent and announce
+            // nothing at all. A re-aim clears it too: the goal is what decides
+            // whether an eligible issue is worth starting, so a human who changes it
+            // is asking for the backlog to be judged again.
+            self.intake_seen.lock_safe().entry(group.to_string()).or_default().eligible.clear();
             if newly {
                 self.audit(group, "human", "full-autonomy-on", json!({ "goal": goal }));
             } else {

@@ -1501,12 +1501,20 @@ intake:
     investigate: agent-investigation    # "look, don't build"
     owned:       agent-managed          # "mine" ownership marker
     prototype:   agent-prototype        # demo-gated; optional
+    hold:        agent-hold             # human veto — never start this (#778)
 ```
 
 Every field is optional and falls back to the built-in default independently —
 a repo can override `labels.ready:` alone and inherit `investigate`/`owned`/
-`prototype` unchanged, and can omit `intake:` entirely, which resolves to
-`workflow::builtin_intake_profile()` exactly.
+`prototype`/`hold` unchanged, and can omit `intake:` entirely, which resolves
+to `workflow::builtin_intake_profile()` exactly.
+
+`hold:` is the one label whose meaning is a *veto* rather than a selector: it
+names the label the #332 host poller must treat as "the human said no" when a
+group runs in full autonomy, where the start default inverts and every open
+issue is otherwise eligible (#778). Its spelling is read from the resolved
+profile at poll time, not from a const — a repo that renamed the label must
+still have its vetoes honored.
 
 ### Why it is inert vocabulary, not a capability
 
