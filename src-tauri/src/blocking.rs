@@ -15,6 +15,17 @@
 //! modules, not about delegation — so folding them in here is a separate
 //! change, not a drive-by in a perf slice.
 //!
+//! **And the four raw `spawn_blocking` call sites are left raw, deliberately.**
+//! `pty.rs` `write_pty`/`change_dir` (#734), `sessions.rs` `list_sessions` and
+//! `voice.rs` `voice_stop` (#58) each converted before this module existed and
+//! each does something with the join failure that this helper would change:
+//! two map it into their `Result` as a domain error the frontend toasts, and
+//! `list_sessions` degrades it to an empty list because every caller of that
+//! one is already written to assume "best-effort, resumable on failure". Those
+//! are decisions with their own doc comments, not boilerplate waiting to be
+//! deduplicated. #746 converted commands in all three of those files and did
+//! not touch their neighbours' error handling on the way past.
+//!
 //! **What the command owes on top of calling this.** Delegation is only half of
 //! INV-1: `spawn_blocking` moves the body, and Tauri still polls the future on
 //! the webview thread up to the first `.await`, so anything a command does
