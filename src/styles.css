@@ -1715,6 +1715,11 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .issues-label.agent {
   background: var(--accent-dim); border-color: var(--accent); color: #eaf0ff;
 }
+/* agent-hold (#778): the human veto reads RED, never in the accent that means
+   "queued for agents" — a held issue must be distinguishable at a glance. */
+.issues-label.hold {
+  background: #4a1113; border-color: #b60205; color: #ffd9da;
+}
 .issues-when { font-size: 10.5px; color: var(--text-dim); }
 
 .issues-row-actions { flex: none; display: flex; align-items: center; gap: 5px; }
@@ -1727,6 +1732,12 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .issues-toggle:disabled { opacity: 0.5; cursor: default; }
 .issues-toggle.on {
   background: var(--accent); border-color: var(--accent); color: #10131f; font-weight: 600;
+}
+/* The agent-hold veto toggle (#778): red on hover and when engaged, so the
+   button that stops agents never looks like the buttons that start them. */
+.issues-toggle.hold:hover:not(:disabled) { border-color: #b60205; color: #ffd9da; }
+.issues-toggle.hold.on {
+  background: #b60205; border-color: #b60205; color: #fff; font-weight: 600;
 }
 /* Read-only orchestrator-owned marker. */
 .issues-toggle.managed {
@@ -2478,6 +2489,27 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   background: color-mix(in srgb, var(--danger) 16%, transparent);
   border-radius: 5px; padding: 1px 6px; margin: -1px -2px;
 }
+/* Row B2 (#778): full autonomy + its goal. Amber like the other "this widens what
+   agents may do" affordances, and solid once engaged so the mode in which the
+   orchestrator picks its own work is unmissable. */
+.group-auto-full { display: flex; align-items: center; gap: 8px 14px; flex-wrap: wrap; }
+.group-auto-check.full { color: #e0af68; font-weight: 600; }
+.group-auto-check.full input { accent-color: #e0af68; }
+.group-auto-check.full.on {
+  background: rgba(224, 175, 104, 0.16);
+  border-radius: 5px; padding: 1px 6px; margin: -1px -2px;
+}
+.group-auto-goal { display: flex; align-items: center; gap: 6px; flex: 1 1 220px; min-width: 0; }
+.group-auto-binput.goal { flex: 1 1 auto; width: auto; min-width: 0; }
+/* Header chip: only rendered while the mode is live (the element is hidden
+   otherwise), so it never becomes background furniture. */
+.group-auto-chip {
+  font-size: 9.5px; font-weight: 600; letter-spacing: 0.03em;
+  border-radius: 4px; padding: 1px 7px; white-space: nowrap;
+  background: rgba(224, 175, 104, 0.18); color: #e0af68;
+  border: 1px solid rgba(224, 175, 104, 0.45);
+}
+.group-auto-chip[hidden] { display: none; }
 .group-auto-budget { display: flex; align-items: center; gap: 6px; }
 .group-auto-blabel { color: var(--text-dim); font-size: 11px; }
 .group-auto-binput {

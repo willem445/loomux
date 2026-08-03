@@ -28,14 +28,21 @@ export const AGENT_READY = "agent-ready";
 // permits; the other value would be rejected by gh_issue_set_labels.
 export const AGENT_INVESTIGATE = "agent-investigation";
 export const AGENT_MANAGED = "agent-managed";
+/** #778: the human's veto. Under full autonomy every open issue is eligible to be
+ *  started EXCEPT a held one, so this label is the boundary — and applying it here
+ *  is the gesture that draws it. Deliberately NOT a go-signal (see
+ *  `AGENT_GO_LABELS`): holding an issue is the opposite instruction. */
+export const AGENT_HOLD = "agent-hold";
 
 /** The labels a human toggles from the issues view to hand an issue to the
  *  orchestrator (apply `agent-ready` to start work, `agent-investigate` to ask
- *  for a plan). Order is the display order. */
-export const TOGGLEABLE_LABELS = [AGENT_READY, AGENT_INVESTIGATE] as const;
+ *  for a plan) — or, with `agent-hold`, to keep one away from it (#778). Order is
+ *  the display order: the two go-signals, then the veto. */
+export const TOGGLEABLE_LABELS = [AGENT_READY, AGENT_INVESTIGATE, AGENT_HOLD] as const;
 
 /** Labels that mean "an orchestrator picks this up" — used to highlight rows
- *  already queued for agents. */
+ *  already queued for agents. `agent-hold` is pointedly absent: it is a veto, and
+ *  a held issue must never read as one that is queued. */
 const AGENT_GO_LABELS = new Set<string>([AGENT_READY, AGENT_INVESTIGATE]);
 
 /** True when the issue already carries a go-signal label, i.e. an orchestrator

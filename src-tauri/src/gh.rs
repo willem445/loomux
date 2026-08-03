@@ -56,17 +56,24 @@ where
 }
 
 /// Labels the issues view is permitted to add/remove. These are the durable
-/// go-signals the orchestrator's intake poll watches for (see
+/// signals the orchestrator's intake poll watches for (see
 /// `orchestration/templates/orchestrator.md`): `agent-ready` / `agent-investigation`
-/// say *start*, `agent-managed` says *owned*. Anything else is rejected before a
-/// spawn — the allow-list is the whole point of routing labels through the
+/// say *start*, `agent-managed` says *owned*, and `agent-hold` (#778) says *do not
+/// start* — the human's veto under full autonomy, writable from the issues view
+/// because applying it there IS the veto gesture. Anything else is rejected before
+/// a spawn — the allow-list is the whole point of routing labels through the
 /// backend rather than letting the frontend pass label strings.
 ///
 /// NB: the label that actually exists on the repo (and that `gh issue edit
 /// --add-label` therefore accepts) is `agent-investigation`, not the shorter
 /// `agent-investigate` the issue-#82 plan text used. We use the real label so
 /// the write succeeds and the orchestrator's substring match still picks it up.
-const ALLOWED_LABELS: [&str; 3] = ["agent-ready", "agent-investigation", "agent-managed"];
+const ALLOWED_LABELS: [&str; 4] = [
+    "agent-ready",
+    "agent-investigation",
+    "agent-managed",
+    "agent-hold",
+];
 
 /// Per-list cap for [`gh_activity`] (the progress-timeline view, #608). Bounded
 /// so a long-lived repo can't hand the timeline an unbounded payload — but the
@@ -90,6 +97,13 @@ fn label_spec(name: &str) -> Option<(&'static str, &'static str)> {
         "agent-investigation" => Some((
             "fbca04",
             "Research only — findings as an issue comment; no code",
+        )),
+        // #778. Red, and the description states the rule rather than naming it, so
+        // the label is legible on GitHub to someone who has never read the
+        // orchestrator contract — including the human deciding whether to apply it.
+        "agent-hold" => Some((
+            "b60205",
+            "Held by the human — full-autonomy agents must not start this",
         )),
         _ => None,
     }
@@ -1256,9 +1270,17 @@ mod tests {
         for ok in ALLOWED_LABELS {
             assert!(validate_labels(&[ok.to_string()]).is_ok(), "{ok}");
         }
+        // The #778 veto label is writable from the issues view: it is the human's
+        // one-click hold gesture under full autonomy, so a rejection here would
+        // leave the consent boundary with no UI at all.
+        assert!(validate_labels(&["agent-hold".to_string()]).is_ok());
         // A plausible-but-wrong label (the plan's misspelling) is rejected — it
         // isn't the real repo label, so writing it would fail at gh anyway.
         assert!(validate_labels(&["agent-investigate".to_string()]).is_err());
+        // Near-misses of the hold label are still rejected: only the exact
+        // spelling the poller and the contract use may be written.
+        assert!(validate_labels(&["human-only".to_string()]).is_err());
+        assert!(validate_labels(&["agent-held".to_string()]).is_err());
         // Arbitrary labels are rejected outright.
         assert!(validate_labels(&["bug".to_string()]).is_err());
         // A mixed set fails if any entry is disallowed.
@@ -1307,6 +1329,16 @@ mod tests {
         assert_eq!(
             label_spec("agent-managed"),
             Some(("5319e7", "Managed by a loomux orchestrator"))
+        );
+        // agent-hold (#778) is created RED, and its description states the rule it
+        // enforces: a repo that has never seen the label gets one whose meaning is
+        // legible on GitHub without reading the orchestrator contract.
+        assert_eq!(
+            label_spec("agent-hold"),
+            Some((
+                "b60205",
+                "Held by the human — full-autonomy agents must not start this"
+            ))
         );
         // Non-allow-listed names have no spec (defense in depth vs. arbitrary
         // label creation).
