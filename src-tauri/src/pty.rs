@@ -504,6 +504,17 @@ impl PtyManager {
     }
 
     /// Kill one child; the waiter thread reaps it and emits `pty-exit`.
+    ///
+    /// **The `let` on the `remove` line is load-bearing, not a style choice**
+    /// (#743 S7, INV-5). A temporary `MutexGuard` in a `let` initializer is
+    /// dropped at the end of *that statement*, so the global map lock is
+    /// released the instant the handle is out — and `killer.kill()`, a
+    /// `TerminateProcess`/`kill(2)` syscall that can block on a wedged child,
+    /// then runs holding nothing. Rewriting this as a bound guard
+    /// (`let mut ptys = self.ptys.lock_safe(); let h = ptys.remove(&id);`)
+    /// looks identical and is not: it extends the lock over the syscall,
+    /// which is exactly what `writer_handle`'s stated lock order forbids.
+    /// `kill_all` above has the same shape for the same reason.
     pub fn kill(&self, id: u32) {
         self.expected_exits.lock_safe().insert(id);
         let handle = self.ptys.lock_safe().remove(&id);
@@ -682,6 +693,23 @@ impl PtyManager {
         if let Some(pty) = ptys.get(&id) {
             pty.user_input_ms.store(ms, Ordering::Relaxed);
         }
+    }
+
+    /// The pane's own output-ring mutex, so an integration test can HOLD it and
+    /// make every `output_tail`/`output_tail_bounded` of that pane park inside
+    /// the read (#743 S7).
+    ///
+    /// This is the read-side counterpart of [`PtyWriteGate`], and it exists for
+    /// the same reason: a leaf-lock claim ("while this pane's ring is being
+    /// read, everything else still moves") is only provable if the read can be
+    /// held still deterministically, without sleeps or a race against how fast
+    /// a 256 KiB clone happens to run on the host. It hands back the REAL lock
+    /// the shipped readers take — no parallel mechanism, so what a test wedges
+    /// is what production wedges. Nothing in the product path calls it, and it
+    /// adds no field, branch or cost to the read itself.
+    #[doc(hidden)] // pub for integration tests
+    pub fn output_ring_for_test(&self, id: u32) -> Option<Arc<Mutex<OutputBuf>>> {
+        Some(self.ptys.lock_safe().get(&id)?.output.clone())
     }
 }
 

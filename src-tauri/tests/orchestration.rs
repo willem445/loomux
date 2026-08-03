@@ -28025,6 +28025,7 @@ fn no_registry_construction_bypasses_the_test_agent_dir_overrides() {
         ("workflow.rs", 1),      // relaunch_registry
         ("lessonsfile.rs", 1),   // test_registry
         ("prompts.rs", 1),       // test_registry
+        ("perf_leaflocks.rs", 1), // test_registry
     ];
     let mut files = Vec::new();
     collect_rs_files(tests_dir, &mut files);

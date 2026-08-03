@@ -6982,6 +6982,46 @@ pub fn worktree_cleanup_targets(repo: &str, cwds: &[String]) -> Vec<String> {
 /// return the dollar amount from the lowest line that carries one — that is
 /// the freshest statusline render. Thousands separators are tolerated.
 /// Returns `None` when no `$<amount>` token is present.
+/// How much of a pane's output ring the usage poll reads looking for the CLI's
+/// own statusline dollar figure (#743 S7, `performance.md` INV-5 / P3).
+///
+/// 64 KiB — a quarter of `OUTPUT_RING_CAP`, and 16x `ATTENTION_SCAN_BYTES`.
+/// The statusline is a live status line: redrawn in place with every frame the
+/// CLI paints, so the figure is always inside the most recent repaint. The
+/// window is sized for that repaint rather than for the figure, and generously
+/// — one full-screen redraw of a very large pane (300x100 cells) with heavy
+/// SGR styling is still well inside 64 KiB, where the attention scan's 4 KiB
+/// would not be. ASSUMED, with its falsifier named: a CLI that paints its
+/// statusline LESS often than every 64 KiB of other output would stop being
+/// read, and the observable is a pane whose usage `source` stays `"none"`
+/// while the CLI is visibly showing a `$` figure.
+///
+/// Truncation cannot corrupt the answer, only lose it. `parse_session_cost`
+/// scans lines back-to-front, so the only line a window boundary can mangle is
+/// the OLDEST one in it, and mangling can only ever delete characters: a `$`
+/// that survives has the whole amount after it intact, and a `$` that does not
+/// survive yields no match. A lost figure lands on the branch that already
+/// handles "this CLI shows nothing" (subscription/Max accounts, a killed
+/// pane) — `source` stays `"none"` and no cost is claimed, which is the
+/// fail-safe direction for a figure that feeds the budget meters.
+const STATUSLINE_SCAN_BYTES: usize = 64 * 1024;
+
+/// The statusline dollar figure for one pane — [`OrchRegistry::compute_usage_
+/// snapshot`]'s last-resort branch, extracted so an integration test can drive
+/// the read a real pane gets (the `preenter_admission` seam; `self.app` cannot
+/// be resolved headless).
+///
+/// This sits on the app's hottest poll — `orch_group_usage`, every 2 s from an
+/// open group view and every 4 s from each group-bound tab, per agent — which
+/// is why it reads the last `STATUSLINE_SCAN_BYTES` rather than cloning and
+/// ANSI-stripping the whole ≤256 KiB ring for one number that is by
+/// construction the last thing painted.
+#[doc(hidden)] // pub for integration tests
+pub fn statusline_cost(ptys: &crate::pty::PtyManager, pty_id: u32) -> Option<f64> {
+    let raw = ptys.output_tail_bounded(pty_id, STATUSLINE_SCAN_BYTES)?;
+    parse_session_cost(&strip_ansi(&raw))
+}
+
 pub fn parse_session_cost(text: &str) -> Option<f64> {
     for line in text.lines().rev() {
         if let Some(cost) = line
@@ -9061,6 +9101,40 @@ pub struct OrchRegistry {
     /// orchestrator is registered — without this, two concurrent launches
     /// on one repo would share an id.
     creation: Mutex<()>,
+    /// Serializes a durable per-group **marker toggle** — the set mutation and
+    /// the marker file write/remove that makes it survive a restart — as one
+    /// unit (#743 S7 rev-231 N1). `set_notify` / `set_spawn_expanded`.
+    ///
+    /// **Why a second lock rather than just holding the set's.** The marker
+    /// file is load-time truth: it is what rebuilds the set at startup, so a
+    /// set mutation and its file write that can interleave do not merely race
+    /// for an instant — they can leave the file saying ON while memory says
+    /// OFF, and that divergence PERSISTS across the next restart, which then
+    /// reads the file. Holding the set's own lock across the write would fix
+    /// that and reintroduce exactly what INV-5 forbids: file IO under a lock a
+    /// poll path takes (`notify_enabled` / `spawn_expanded` are read by the
+    /// group view). So the *ordering* moves to a lock that no poll path ever
+    /// takes, and the set lock goes back to being a leaf held for one insert.
+    ///
+    /// This is deliberately structural rather than an appeal to dispatch.
+    /// Both toggles are sync commands today, so the one webview thread already
+    /// serialises them and the interleave cannot occur — but that is a fact
+    /// about the *callers*, invalidated silently by the first background or
+    /// MCP caller, and #743's own slices are converting sync commands to
+    /// off-thread ones. `GitWatcher::watch`'s released window in this same
+    /// change is safe by construction (its re-check), and this is held to the
+    /// same standard rather than a weaker one.
+    ///
+    /// Lock order: `marker_io` is taken FIRST and outermost — the set locks
+    /// and `AUDIT_LOCK` are taken under it, never the reverse. One lock for
+    /// both toggles, not one per group: these fire on a human's click.
+    ///
+    /// `pause_group`/`resume_group` have the same shape and the same latent
+    /// divergence, and are NOT folded in here — they predate this slice
+    /// (indeed the census cites `pause_group` as the pattern this drifted
+    /// from), and `resume_group` does far more than marker IO, so bringing it
+    /// under one lock is its own argument, not this change's.
+    marker_io: Mutex<()>,
     /// Test seam (#222): when set, `pr_head` returns this instead of shelling out
     /// to `gh pr view --json headRefOid`. The verdict↔revision binding has to be
     /// exercised through the real MCP dispatch against a repo that isn't on GitHub;
@@ -19311,6 +19385,7 @@ impl OrchRegistry {
             usage_memo: Mutex::new(HashMap::new()),
             default_branch_memo: Mutex::new(HashMap::new()),
             creation: Mutex::new(()),
+            marker_io: Mutex::new(()),
             pr_head_override: Mutex::new(None),
             pr_body_override: Mutex::new(None),
             paused: Mutex::new(HashSet::new()),
@@ -22302,10 +22377,33 @@ impl OrchRegistry {
             return HashMap::new();
         };
         let ptys = app.state::<crate::pty::PtyManager>();
-        self.agents
+        self.output_totals_from(&ptys)
+    }
+
+    /// [`Self::agent_output_totals`] with the pty manager passed in — same
+    /// integration-test seam, and same reason, as
+    /// [`Self::compact_signals_from`], which it runs beside on every
+    /// compact-nudge wake.
+    ///
+    /// Snapshot-then-release for the same reason (#743 S7). Each read is only
+    /// a counter load, so the CPU under the guard was never the problem here;
+    /// the LOCK ORDER was. Reading a pty while holding `agents` makes the pair
+    /// nested, and a nested pair is only safe as long as every future caller
+    /// remembers the direction — whereas a snapshot cannot be got wrong. It is
+    /// three lines and it is the sibling of the read above, on the same wake:
+    /// leaving one of the two nested would have made the invariant a
+    /// coincidence rather than a rule.
+    #[doc(hidden)] // pub for integration tests
+    pub fn output_totals_from(&self, ptys: &crate::pty::PtyManager) -> HashMap<String, u64> {
+        let panes: Vec<(String, u32)> = self
+            .agents
             .lock_safe()
             .values()
-            .filter_map(|a| Some((a.id.clone(), ptys.output_total(a.pty_id?)?)))
+            .filter_map(|a| Some((a.id.clone(), a.pty_id?)))
+            .collect();
+        panes
+            .into_iter()
+            .filter_map(|(id, pty_id)| Some((id, ptys.output_total(pty_id)?)))
             .collect()
     }
 
@@ -25683,14 +25781,56 @@ impl OrchRegistry {
             return HashMap::new();
         };
         let ptys = app.state::<crate::pty::PtyManager>();
-        self.agents
+        self.compact_signals_from(&ptys)
+    }
+
+    /// [`Self::agent_compact_signals`] with the pty manager passed in — the
+    /// EXACT body the compact-nudge cadence runs, minus the `AppHandle`
+    /// lookup, so an integration test can drive it against a real
+    /// fake-child-backed `PtyManager` (the `preenter_admission` /
+    /// `flush_stranded_text` seam, and the same reason for it: nothing can
+    /// resolve `self.app` headless, so the inline version was
+    /// undeletable-by-test).
+    ///
+    /// **The snapshot is the point (#743 S7, `performance.md` INV-5/P3.)** The
+    /// `agents` lock is taken to clone out `(id, pty_id)` and RELEASED before
+    /// any pty is touched — the same map-lock→release→leaf shape
+    /// `PtyManager::writer_handle` states for the pty side, and the same one
+    /// the attention scan (#725) already uses. Iterating the guard directly
+    /// held `agents` across N whole-ring clones and N `strip_ansi` passes, on
+    /// a cadence that goes to 10 s whenever any agent anywhere has a compact
+    /// arm open — so a single slow pane serialised every reader of the agent
+    /// registry behind it, including the attention scan and the usage poll
+    /// that runs on the webview thread.
+    ///
+    /// The tail read itself stays whole-ring, deliberately: three detectors
+    /// read it with three different reaches — `auto_compact_banner_detected`
+    /// wants only the last non-blank line, `human_typed_compact_detected`
+    /// wants anything typed inside `MANUAL_COMPACT_DETECT_WINDOW_MS` (3 min),
+    /// and the Copilot completion marker sits wherever the CLI last painted
+    /// it. Narrowing the window would shorten the middle one's reach, which
+    /// is a detection change, not a lock change; the cost it would save is
+    /// already bounded and argued at [`Self::any_compact_pending`], and the
+    /// cheaper lever named there (skip the read for agents that cannot
+    /// possibly be mid-compact) does not cost reach at all. Deferred to that
+    /// lever rather than done here — see performance.md §4 X5.
+    #[doc(hidden)] // pub for integration tests
+    pub fn compact_signals_from(
+        &self,
+        ptys: &crate::pty::PtyManager,
+    ) -> HashMap<String, (String, u64)> {
+        let panes: Vec<(String, u32)> = self
+            .agents
             .lock_safe()
             .values()
-            .filter_map(|a| {
-                let pty_id = a.pty_id?;
+            .filter_map(|a| Some((a.id.clone(), a.pty_id?)))
+            .collect();
+        panes
+            .into_iter()
+            .filter_map(|(id, pty_id)| {
                 let tail = strip_ansi(&ptys.output_tail(pty_id)?);
                 let last_input = ptys.last_user_input_ms(pty_id).unwrap_or(0);
-                Some((a.id.clone(), (tail, last_input)))
+                Some((id, (tail, last_input)))
             })
             .collect()
     }
@@ -26086,16 +26226,42 @@ impl OrchRegistry {
 
     /// Enable/disable desktop notifications for a group, durably (a `notify`
     /// marker file, mirroring the pause marker) so the choice survives restarts.
+    ///
+    /// Marker write and audit append run with the set guard RELEASED (#743 S7,
+    /// `performance.md` INV-5) — `pause_group`'s shape, in the same file, which
+    /// this had drifted from: the transition is decided under a temporary
+    /// guard, the IO follows. It also un-nests `AUDIT_LOCK` (process-global,
+    /// §4 X6) from inside `notify_groups`, so no lock-ordering question
+    /// survives here at all.
+    ///
+    /// **Reentrancy.** Two things decide, and they are one unit. The set's own
+    /// `insert`/`remove` decides *whether* this call is a real transition, so
+    /// only the caller that actually flipped the state does the IO and repeated
+    /// enables produce one marker and one audit line. [`Self::marker_io`] then
+    /// decides the *order*: it is held across the whole toggle, so an enable
+    /// and a disable racing each other cannot land their file operations in the
+    /// opposite order to their set mutations. Without it the loser's write
+    /// could survive the winner's, leaving the marker — which is what rebuilds
+    /// this set at startup — disagreeing with memory for the rest of the
+    /// process AND across the next restart. See `marker_io`'s doc for why that
+    /// is not left to the fact that both callers happen to be sync commands on
+    /// the webview thread.
     pub fn set_notify(&self, group: &str, on: bool) -> Result<(), String> {
+        let _io = self.marker_io.lock_safe();
         let dir = self.group_dir(group);
-        let mut set = self.notify_groups.lock_safe();
+        let changed = if on {
+            self.notify_groups.lock_safe().insert(group.to_string())
+        } else {
+            self.notify_groups.lock_safe().remove(group)
+        };
+        if !changed {
+            return Ok(());
+        }
         if on {
-            if set.insert(group.to_string()) {
-                fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-                let _ = fs::write(dir.join("notify"), b"");
-                self.audit(group, "human", "notify-on", json!({}));
-            }
-        } else if set.remove(group) {
+            fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+            let _ = fs::write(dir.join("notify"), b"");
+            self.audit(group, "human", "notify-on", json!({}));
+        } else {
             let _ = fs::remove_file(dir.join("notify"));
             self.audit(group, "human", "notify-off", json!({}));
         }
@@ -26113,16 +26279,26 @@ impl OrchRegistry {
     /// `spawn_expanded` marker file, mirroring `notify`) so the choice survives
     /// restarts. `on=true` means "expand every spawn like before #260";
     /// `on=false` (the default) restores the minimize-on-spawn behavior.
+    /// Marker write and audit append run with the set guard released, the
+    /// transition decided under it, and the whole toggle ordered by
+    /// [`Self::marker_io`] — [`Self::set_notify`]'s shape, for the reasons
+    /// argued there (#743 S7).
     pub fn set_spawn_expanded(&self, group: &str, on: bool) -> Result<(), String> {
+        let _io = self.marker_io.lock_safe();
         let dir = self.group_dir(group);
-        let mut set = self.spawn_expanded_groups.lock_safe();
+        let changed = if on {
+            self.spawn_expanded_groups.lock_safe().insert(group.to_string())
+        } else {
+            self.spawn_expanded_groups.lock_safe().remove(group)
+        };
+        if !changed {
+            return Ok(());
+        }
         if on {
-            if set.insert(group.to_string()) {
-                fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-                let _ = fs::write(dir.join("spawn_expanded"), b"");
-                self.audit(group, "human", "spawn-expanded-on", json!({}));
-            }
-        } else if set.remove(group) {
+            fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+            let _ = fs::write(dir.join("spawn_expanded"), b"");
+            self.audit(group, "human", "spawn-expanded-on", json!({}));
+        } else {
             let _ = fs::remove_file(dir.join("spawn_expanded"));
             self.audit(group, "human", "spawn-expanded-off", json!({}));
         }
@@ -27880,11 +28056,9 @@ impl OrchRegistry {
         if let Some(app) = self.app.lock_safe().clone() {
             if let Some(pty) = entry.pty_id {
                 let ptys = app.state::<crate::pty::PtyManager>();
-                if let Some(raw) = ptys.output_tail(pty) {
-                    if let Some(c) = parse_session_cost(&strip_ansi(&raw)) {
-                        snap.source = "statusline".to_string();
-                        snap.cost_usd = Some(c); // reported by the CLI, not estimated
-                    }
+                if let Some(c) = statusline_cost(&ptys, pty) {
+                    snap.source = "statusline".to_string();
+                    snap.cost_usd = Some(c); // reported by the CLI, not estimated
                 }
             }
         }
@@ -36420,6 +36594,29 @@ impl OrchRegistry {
         json!(list)
     }
 
+    /// The `get_output` MCP tool: what an orchestrator sees when it looks at a
+    /// pane.
+    ///
+    /// **This one keeps the whole-ring read, and that is the argued answer, not
+    /// an oversight (#743 S7).** The census named it alongside the usage poll's
+    /// statusline read as the other surviving unbounded `output_tail`
+    /// (comment 5162020708 §4.4), and the two resolve opposite ways because
+    /// they are different kinds of read:
+    ///
+    /// - It is not cadenced. One call per explicit `get_output`, from an agent
+    ///   that decided to look — not a timer, and nothing on the webview thread
+    ///   waits for it. `performance.md` INV-5 is about latency-sensitive
+    ///   paths; this is not one.
+    /// - Truncating it would change the ANSWER, not just the cost. #520
+    ///   replays the raw escape stream onto a composed grid instead of
+    ///   stripping it, precisely so a TUI's redraw churn overwrites itself
+    ///   here exactly as it did on the human's screen. A replay that starts
+    ///   mid-stream starts with no cursor position, no scroll region and no
+    ///   attribute state, so any cell whose last paint fell outside the window
+    ///   comes back blank — a static screen that has not been fully repainted
+    ///   in a while would be reported to the orchestrator as empty. That is
+    ///   the behaviour question #725 flagged, and the fidelity the tool is
+    ///   for.
     pub fn agent_output_tail(&self, agent_id: &str, lines: usize) -> Result<String, String> {
         let a = self.agent(agent_id).ok_or("unknown agent")?;
         let pty_id = a.pty_id.ok_or("agent has no terminal")?;
