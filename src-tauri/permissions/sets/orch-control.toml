@@ -32,6 +32,7 @@ permissions = [
     "allow-orch-set-autonomous",
     "allow-orch-set-auto-merge",
     "allow-orch-set-auto-release",
+    "allow-orch-set-full-autonomy",
     "allow-orch-set-dangerous-mode",
     "allow-orch-set-autonomy-budget",
     "allow-orch-set-idle-tick-minutes",

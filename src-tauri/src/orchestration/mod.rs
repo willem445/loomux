@@ -270,6 +270,20 @@ pub fn auto_release_notice(on: bool) -> String {
     }
 }
 
+/// The cap, in characters, on a full-autonomy goal string (#778).
+pub const MAX_FULL_AUTONOMY_GOAL_CHARS: usize = 500;
+
+/// STUB (slice A red pass) — the real normalizer lands with the toggle.
+pub fn sanitize_full_autonomy_goal(raw: &str) -> String {
+    raw.to_string()
+}
+
+/// STUB (slice A red pass) — the real notice text lands with the toggle.
+pub fn full_autonomy_notice(on: bool, goal: &str) -> String {
+    let _ = (on, goal);
+    String::new()
+}
+
 /// Notice delivered to the orchestrator when supervised dangerous mode is toggled
 /// (#83), or force-cleared because autonomous mode was enabled (`by_autonomous`).
 pub fn dangerous_mode_notice(on: bool, by_autonomous: bool) -> String {
@@ -10315,6 +10329,14 @@ pub struct OrchRegistry {
     /// (absent), so turning autonomous on never surprise-publishes. Durable
     /// `auto_release` marker; gated behind autonomous exactly like `auto_merge`.
     auto_release_groups: Mutex<HashSet<String>>,
+    /// Full autonomy (#778): groups whose orchestrator self-selects eligible work
+    /// on its idle tick instead of waiting for the human's opt-in label funnel.
+    /// A dependent toggle of autonomous mode exactly like `auto_merge` /
+    /// `auto_release` — enabling requires autonomous ON, and autonomous-off or a
+    /// budget suspension force-clears it. Durable `full_autonomy` marker whose
+    /// *content* is the enable-time goal string (the autonomous marker's
+    /// anchor-in-content precedent: consent and its parameter captured together).
+    full_autonomy_groups: Mutex<HashSet<String>>,
     /// Supervised dangerous mode (#83): groups where the human — present and
     /// supervising — has authorized the orchestrator to merge/release itself
     /// WITHOUT being autonomous. Default OFF. **Mutually exclusive with
@@ -22089,6 +22111,7 @@ impl OrchRegistry {
             autonomous_groups: Mutex::new(HashSet::new()),
             auto_merge_groups: Mutex::new(HashSet::new()),
             auto_release_groups: Mutex::new(HashSet::new()),
+            full_autonomy_groups: Mutex::new(HashSet::new()),
             dangerous_groups: Mutex::new(HashSet::new()),
             spawn_expanded_groups: Mutex::new(HashSet::new()),
             idle_tick_times: Mutex::new(HashMap::new()),
@@ -29607,6 +29630,23 @@ impl OrchRegistry {
         Ok(())
     }
 
+    /// Whether full autonomy (#778) is on for a group: the orchestrator self-selects
+    /// eligible work on its idle tick instead of waiting for the opt-in label funnel.
+    pub fn is_full_autonomy(&self, group: &str) -> bool {
+        self.full_autonomy_groups.lock_safe().contains(group)
+    }
+
+    /// STUB (slice A red pass) — the goal read lands with the toggle.
+    pub fn full_autonomy_goal(&self, _group: &str) -> Option<String> {
+        None
+    }
+
+    /// STUB (slice A red pass) — the real toggle lands next.
+    pub fn set_full_autonomy(&self, group: &str, on: bool, goal: &str) -> Result<(), String> {
+        let _ = (group, on, goal);
+        Ok(())
+    }
+
     /// Whether supervised dangerous mode is on for a group (the human is present and
     /// authorized manual merges/releases outside autonomous mode). Mutually
     /// exclusive with autonomous.
@@ -30078,6 +30118,11 @@ impl OrchRegistry {
             "autonomous": on,
             "auto_merge": self.is_auto_merge(group),
             "auto_release": self.is_auto_release(group),
+            // Full autonomy (#778) and its goal. The goal is null whenever the mode
+            // is off — the marker that holds it only exists while it is on — so the
+            // panel never renders a goal that isn't in force.
+            "full_autonomy": self.is_full_autonomy(group),
+            "full_autonomy_goal": self.full_autonomy_goal(group),
             "dangerous_mode": self.is_dangerous_mode(group),
             "budget_tokens": budget,
             "budget_anchor_tokens": anchor,
@@ -36422,6 +36467,18 @@ impl OrchRegistry {
         }
     }
 
+    /// The value of the `autonomous idle-tick mode is {…}` clause in the
+    /// orchestrator's kickoff config. OFF and plain-autonomous are pinned
+    /// byte-for-byte by `orchestration.rs`: a kickoff is the contract a fresh boot
+    /// or resume reads, so a silent wording drift there changes what every existing
+    /// group is told, and the full-autonomy branch (#778) must be additive to it.
+    fn autonomous_kickoff_clause(&self, group: &str) -> String {
+        if !self.is_autonomous(group) {
+            return "off".to_string();
+        }
+        "ON (you will get [loomux] idle tick wakes to run your cadence unattended)".to_string()
+    }
+
     fn kickoff_body(
         &self,
         a: &AgentEntry,
@@ -36459,7 +36516,7 @@ impl OrchRegistry {
                 automerge = if self.is_auto_merge(&g.id) { "ENABLED (you may merge adequately-tested PRs yourself)" } else { "disabled (human merge gate is absolute — never merge)" },
                 autorelease = if self.is_auto_release(&g.id) { "ENABLED (you may publish releases/tags yourself while autonomous)" } else { "disabled (releases/tags need an explicit human grant — never publish)" },
                 dangerous = if self.is_dangerous_mode(&g.id) { "ON — the human is present and supervising, and has authorized you to merge to the default branch AND publish releases/tags yourself without a per-item grant (audit + announce each; still hold anything genuinely risky)" } else { "off" },
-                autonomous = if self.is_autonomous(&g.id) { "ON (you will get [loomux] idle tick wakes to run your cadence unattended)" } else { "off" },
+                autonomous = self.autonomous_kickoff_clause(&g.id),
             ),
             Role::Worker | Role::Reviewer | Role::Planner => {
                 let head = format!(
@@ -42160,6 +42217,12 @@ pub async fn orch_group_usage(app: AppHandle, group_id: String) -> Value {
 //   orch_set_auto_merge(group_id, enabled: bool) -> Result<(), String>
 //     Flip the merge gate. Default OFF = human approval required (today's
 //     behavior). ON lets the orchestrator merge adequately-tested PRs itself.
+//   orch_set_full_autonomy(group_id, enabled: bool, goal: String) -> Result<(), String>
+//     Flip full autonomy (#778): the orchestrator self-selects eligible work on its
+//     idle tick instead of waiting for the opt-in label funnel. Dependent on
+//     autonomous (rejects enable while off). `goal` is opaque, normalized to one
+//     bounded line; empty/whitespace = no goal. Re-enabling with a DIFFERENT goal
+//     re-aims the mode rather than no-opping — the goal is the consent's parameter.
 //   orch_set_autonomy_budget(group_id, tokens: u64) -> Result<u64, String>
 //     Per-group autonomous-era token budget; 0 = no cap. Returns the applied value.
 //   orch_set_idle_tick_minutes(group_id, minutes: u32) -> Result<u32, String>
@@ -42171,7 +42234,8 @@ pub async fn orch_group_usage(app: AppHandle, group_id: String) -> Value {
 //     The runtime remedy if a chatty CLI's idle repaints starve the tick.
 //   orch_autonomy(group_id) -> Value
 //     The whole panel state in one read:
-//       { autonomous: bool, auto_merge: bool, budget_tokens: u64,
+//       { autonomous: bool, auto_merge: bool, full_autonomy: bool,
+//         full_autonomy_goal: string | null, budget_tokens: u64,
 //         budget_anchor_tokens: u64, spend_since_enable_tokens: u64 | null,
 //         suspended: bool, idle_tick_minutes: u32, idle_activity_floor_bytes: u64,
 //         quiet_secs: u64 | null, eligible_in_secs: u64 | null,
@@ -42286,6 +42350,30 @@ pub async fn orch_set_auto_release(
 ) -> Result<(), String> {
     let reg = reg_of(&app);
     run_blocking(move || reg.set_auto_release(&group_id, enabled)).await
+}
+
+/// Enable/disable full autonomy for a group (#778, durable, audited). A dependent
+/// toggle of autonomous mode like the two above: enabling is rejected unless
+/// autonomous is on, and autonomous-off or a budget suspension force-clears it.
+/// `goal` is opaque to loomux — it is captured, normalized and echoed, never
+/// parsed or scored (what work is valuable is the orchestrator's judgment, stated
+/// in its contract, not policy in product code). Empty/whitespace = no goal.
+///
+/// **Async + `run_blocking`, unlike its `orch_set_auto_merge` siblings.** Those are
+/// `SYNC_COMMANDS` rows in `tests/perf_dispatch.rs` — #743's census of *existing*
+/// debt, which #762 owns draining; the roadmap is deleting rows, so a command
+/// written today does the marker write, the audit append and the pane delivery off
+/// the webview thread (INV-1's §2 P1 shape) rather than adding a row to a list
+/// being emptied.
+#[tauri::command]
+pub async fn orch_set_full_autonomy(
+    app: AppHandle,
+    group_id: String,
+    enabled: bool,
+    goal: String,
+) -> Result<(), String> {
+    let reg = reg_of(&app);
+    run_blocking(move || reg.set_full_autonomy(&group_id, enabled, &goal)).await
 }
 
 /// Enable/disable supervised dangerous mode for a group (#83, durable, audited).
