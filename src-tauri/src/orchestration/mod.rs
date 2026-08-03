@@ -30108,10 +30108,12 @@ impl OrchRegistry {
         if let Some(sha) = self.pr_head_override.lock_safe().clone() {
             return Ok(sha);
         }
-        let out = self.gh_capture(
-            repo,
-            &["pr", "view", &pr.to_string(), "--json", "headRefOid", "--jq", ".headRefOid"],
-        )?;
+        let out = self
+            .gh_capture(
+                repo,
+                &["pr", "view", &pr.to_string(), "--json", "headRefOid", "--jq", ".headRefOid"],
+            )
+            .map_err(Self::gh_failure_text)?;
         let sha = workflow::sanitize_sha(&out);
         if sha.is_empty() {
             return Err(format!("gh pr view #{pr}: no head oid in the response"));
@@ -30143,6 +30145,35 @@ impl OrchRegistry {
             return Ok(body);
         }
         self.gh_capture(repo, &["pr", "view", &pr.to_string(), "--json", "body", "--jq", ".body"])
+            .map_err(Self::gh_failure_text)
+    }
+
+    /// A failed `gh` read's message, made safe to quote back to an agent
+    /// (rev-lead finding 1 on #791).
+    ///
+    /// The `Err` side of these two reads is **`gh`'s raw stderr** — multi-line,
+    /// uncapped, and carrying whatever the remote said. Before #791 it went
+    /// nowhere; now it is surfaced deliberately (that is the diagnosability
+    /// half of this change), and one of the places it surfaces is the gate line
+    /// that `review_verdict` pastes into the ORCHESTRATOR'S PANE inside a
+    /// `[loomux] …` notice. So a stderr carrying a newline plus the literal
+    /// `[loomux]` forges a line that reads as loomux's own — the same forgery
+    /// `notify::sanitize_gh_text` was written for, where the attacker-controlled
+    /// text was a fork PR's workflow job name.
+    ///
+    /// Sanitized HERE, at the two functions that mint these errors, rather than
+    /// at each place one is displayed: a per-call-site fix leaves the next
+    /// consumer of `pr_head`/`pr_body` exposed, and this change added three
+    /// consumers at once. Deliberately NOT pushed down into `gh_capture`, whose
+    /// other caller is the notify poller — `notify::condition_poll_result`
+    /// classifies on stderr text (`Err("no checks reported")` → `Pending`), so
+    /// capping and rewriting it there would change poll classification, which
+    /// is a different change with a different argument.
+    ///
+    /// `NOTICE_FIELD_CAP` is the cap for exactly this: one field's worth of
+    /// GitHub-derived text entering a `[loomux]` notice.
+    fn gh_failure_text(raw: String) -> String {
+        notify::sanitize_gh_text(&raw, notify::NOTICE_FIELD_CAP)
     }
 
     /// The digest of the PR's body as it stands now — what a recorded verdict's
@@ -30223,7 +30254,7 @@ impl OrchRegistry {
         pr: &str,
         verdict: &str,
         summary: &str,
-    ) -> Result<workflow::ReviewVerdict, String> {
+    ) -> Result<(workflow::ReviewVerdict, Vec<String>), String> {
         let a = self.agent(agent_id).ok_or_else(|| format!("unknown agent: {agent_id}"))?;
         if a.group != group {
             return Err(format!("unknown agent: {agent_id}")); // never leak other groups' ids
@@ -30253,16 +30284,40 @@ impl OrchRegistry {
         // stored empty, which the gate reads as stale — so a verdict loomux could
         // not bind to a commit can never open a gate on its own.
         let repo = self.group(group).map(|g| g.repo).unwrap_or_default();
-        let head = self.pr_head(&repo, num).unwrap_or_default();
+        // Both reads are still best-effort — an unresolvable head or body is
+        // stored empty and the gate fails closed on it — but the REASON is no
+        // longer dropped on the floor (rev-lead, #791). A reviewer whose verdict
+        // silently records no head has done everything right and still cannot
+        // open the gate, and before this it had nothing to read that said so;
+        // "diagnosable rather than silent" is this change's whole point, and a
+        // swallowed reason here is the same defect one function over.
+        let mut warnings: Vec<String> = Vec::new();
+        let head = match self.pr_head(&repo, num) {
+            Ok(h) => h,
+            Err(why) => {
+                warnings.push(format!(
+                    "could not resolve PR #{num}'s head commit ({why}) — this verdict is recorded \
+                     with an EMPTY head, which the merge gate reads as stale, so it cannot open \
+                     the gate on its own. Re-record once `gh` can see the PR."
+                ));
+                String::new()
+            }
+        };
         // …and the BODY it reviewed (#565). Computed here, never passed in: a
         // property that depends on the reviewer remembering to include it is an
         // intention, not a mechanism — and a reviewer cannot record the digest of a
         // body it did not read if it never touches the digest at all. Unreadable
         // body → empty, which reads as unknown and can satisfy nothing.
-        let body_digest = self
-            .pr_body(&repo, num)
-            .map(|b| workflow::body_digest(&b))
-            .unwrap_or_default();
+        let body_digest = match self.pr_body(&repo, num) {
+            Ok(b) => workflow::body_digest(&b),
+            Err(why) => {
+                warnings.push(format!(
+                    "could not read PR #{num}'s body ({why}) — this verdict records no body \
+                     digest, so an `also: body-unchanged` condition cannot be satisfied by it."
+                ));
+                String::new()
+            }
+        };
         let rec = workflow::ReviewVerdict {
             pr: num,
             block,
@@ -30287,8 +30342,9 @@ impl OrchRegistry {
             "head": rec.head,
             "body_digest": rec.body_digest,
             "summary": rec.summary.chars().take(500).collect::<String>(),
+            "warnings": warnings.clone(),
         }));
-        Ok(rec)
+        Ok((rec, warnings))
     }
 
     /// Every verdict recorded for a PR, by reviewer block (block order).
@@ -30443,6 +30499,12 @@ impl OrchRegistry {
             // different reactions from whoever is looking at it. The reason is
             // appended rather than woven in, so the sentence a reader (and the
             // pins on it) already knows stays exactly where it was.
+            //
+            // The interpolated text is `gh` stderr, and this line is pasted
+            // into the orchestrator's pane inside a `[loomux]` notice by
+            // `review_verdict` — it is inert because `pr_head` sanitized it at
+            // the source (`gh_failure_text`), which is where the argument for
+            // doing it there rather than here lives.
             workflow::GateOutcome::UnknownRevision => format!(
                 "merge gate for PR #{pr}: loomux cannot resolve the PR's current head commit, so \
                  it cannot tell whether the recorded verdicts reviewed the code that would merge. \
