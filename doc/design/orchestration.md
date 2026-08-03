@@ -582,10 +582,12 @@ orchestrator a value system to match its operational one:
   Repetition is not memory: a summary keeps a document's *shape* and loses its *rules*. So the
   eleven rules whose loss is dangerous — the merge gate, the question-hold, disposition, the
   architectural bar, red-before-green, red main, fleet staleness, the label funnel, bounded loops,
-  one-task-per-worker, externalized memory — are stated **once**, in an `## INVARIANTS` digest at
-  the very top, which the orchestrator is told to re-read at session start and after every
-  compaction. Every body section then *stops restating them* and holds only the procedure and the
-  why, cross-referencing the digest by number. That is what pays for the additions above: the
+  one-task-per-worker, externalized memory — are stated **once**, in an `## INVARIANTS` digest
+  leading the bulk of the document (#381 later put a short **Your first turn** call-sequence
+  primer ahead of it, but the digest still precedes every heavier policy section), which the
+  orchestrator is told to re-read at session start and after every compaction. Every body
+  section then *stops restating them* and holds only the procedure and the why, cross-referencing
+  the digest by number. That is what pays for the additions above: the
   orchestrator template grew seven new rules and still ends up denser than it was
   (≈513 → 625 lines for ~2× the rules), because the rhetoric that carried the old ones is gone.
 
@@ -2733,6 +2735,24 @@ discipline (#590) rests on.
   watch cancelled with a reason someone can read) beats thread growth nothing reports, and it
   is diagnosable where a thousand parked threads are not. In the ordinary stall the child IS
   `gh`: killing it closes both pipes, the readers end at once, and the backlog stays empty.
+- **The accounting is an invariant of the whole function, not a step on the timeout path**
+  (#699). Once the two readers exist, every exit accounts for both exactly once: the arm where
+  the child exited on its own joins them, and *every* arm that gives up on a live child — the
+  timeout, and the one where the bounded wait itself errors — goes through one shared
+  `abandon_child_and_readers` (kill, bounded reap, park both). The two returns that precede
+  the readers, the backlog refusal and a failed `spawn`, have nothing to account for. That is
+  an invariant of every *return*; one **unwind** escapes it, deliberately. `std::thread::spawn`
+  panics if the OS refuses a thread, so a panic between the two reader spawns would unwind with
+  the first handle untracked — the exact residue this rule exists to eliminate, reached without
+  passing through any of the arms above. It stays out of scope because the fix would be a
+  `Builder::new().spawn()` failure channel invented for a case this process cannot reach: the
+  ceiling holds the whole backlog at 16 threads, which is not where an OS refuses one. Recorded
+  rather than closed, so the next reader knows it was weighed. The
+  wait-error arm was originally a bare `?`, which read like the conservative choice and is the
+  opposite of one: a dropped handle is invisible to the sweep, so the ceiling's admission
+  predicate answers with a count that omits precisely the readers that will never end — and
+  dropping a `std::process::Child` does not kill the process, so the child that keeps them
+  blocked stays alive too. Uncounted is worse than parked, never better.
 - **No arm of the bound is itself unbounded.** Every wait on a child goes through
   `wait_bounded`, including the post-kill reap on the timeout path (`GH_CAPTURE_REAP_TIMEOUT`).
   A bare `wait()` there would be the one place a "bounded" path could still block forever: the
@@ -5153,6 +5173,19 @@ header chip and, via a listener, mirrors the state onto a minimized pane's **doc
   tail looks like a live interactive prompt (`prompt_wait_detected`). The quiet + no-keystroke
   gate is what separates a *live* prompt the human must answer from the same words scrolled
   past or a prompt the human is already typing into.
+- **The tail read is BOUNDED, because it happens under the keystroke path's lock (#717).**
+  Every pane's tail is read through `attention_tail`, which asks
+  `PtyManager::output_tail_bounded` for the trailing `ATTENTION_SCAN_BYTES` (4096) and strips
+  ANSI *after* the read has returned, so nothing is scanned under a lock at all. It used to
+  clone the whole (up to 256 KB) ring and slice the same 4 KB off the result — a 64x copy on a
+  saturated ring, taken while holding the global `ptys` mutex that `write_pty` /
+  `note_user_input` take on every keystroke and behind which the pane's own reader thread
+  queues to append its next chunk. What the detectors see is byte-identical either way
+  (`strip_ansi(&ring[len-N..])` *is* `strip_ansi(&last_N)`), so the heuristic is untouched;
+  only the hold changed. That identity is also why no assertion on the scan's *output* can
+  police this, and why `attention_tail` and `pane_attention_inputs_from` take the raw reader
+  as a closure rather than a pre-read `Vec<u8>`: the size of the request is the only thing a
+  test can reach — `Tier1Scan::read`'s precedent, for the same reason.
 - **#40 — questions weren't detected.** `prompt_wait_detected` originally only fired on a
   selection glyph that *starts* an option line (`starts_with('❯')`), a `1. yes` numbered menu,
   explicit `y/n` tokens, or a fixed list of permission phrasings. Two real interactive-question
@@ -5441,7 +5474,8 @@ subtree — structural, not dependent on any test's own cleanup code running. Ve
 **Cost (rev-15 N4).** Each checkpoint used to clone the FULL (up to 256 KB) output ring and
 `strip_ansi` all of it every 250ms poll, for up to 120s, across up to four sites per delivery.
 `PtyManager::output_tail_bounded` reads only the trailing `QUESTION_SCAN_TAIL_BYTES` (4096, matching
-the attention path's own trailing-window precedent, `pane_attention_inputs_from`) directly off the
+the attention path's own trailing window, `ATTENTION_SCAN_BYTES` — which since #717 is the size of
+that path's *read*, not just of the slice it took afterwards) directly off the
 back of the ring's `VecDeque` — `O(bounded bytes)`, not `O(ring length)` — cutting both the clone and
 the `strip_ansi` pass to a fixed, small size regardless of how much the pane has ever printed.
 
@@ -6518,6 +6552,78 @@ and only the first physical row carries the marker), and a marker row that has i
 off still leaves its continuation unmarked. Both are under-masks. Closing them still needs
 loomux to know *what* it wrote to a pane rather than that a row claims it did — delivery
 machinery, not detection.
+
+## #727: a pointer glyph with nothing after it is a prompt, not a menu
+
+**Problem.** Deliveries to a pane resumed from a previous session were queued behind "an
+interactive question is on screen" and never flushed — 25 minutes over a *visibly idle* pane, three
+panes killed, two queued deliveries dropped with them. It reproduced on demand: resume the session,
+send anything, watch it queue.
+
+The phantom question was the CLI's own input box. Claude Code paints an empty box as a bare `❯` on
+its own row, and `leads_with_pointer` — the `pointer-option` signal — read that as a menu's
+highlighted choice. Every `delivery-aborted-question` record in the group's audit log fired on that
+glyph, and none on a real dialog.
+
+**Why nothing could clear it.** The glyph poisons both of the guard's readings at once, which is
+exactly the case #534's grid release was supposed to cover and the one place it could not:
+
+- On the **ring**, the glyph sits in the last painted lines by construction — it *is* what the CLI
+  redraws underneath everything else — so the mechanism that saves the other `❯` false positives
+  (finished-turn prose scrolling out of the last-3-lines window) cannot reach it. `strip_ansi`
+  deletes cursor addressing, so the glyph also concatenates onto whatever was addressed next,
+  producing a matched "line" that was never on any screen.
+- On the **grid**, `pointer_rendered` scans every rendered row for a leading pointer and finds the
+  same bare glyph. So `grid_evidence_for` answered `StillRendered` for *any* `pointer-option` match
+  on *any* screen of that CLI, and the single transition #534 added — match + `NotRendered` →
+  release — was unreachable for this signal class. Not weakened: dead.
+
+A resumed pane turns that into a permanent latch rather than a 120-second one. Its restored screen
+is static, so no repaint ever comes to change either reading, and the hold ends only when the pane
+dies.
+
+**Fix.** The pointer must lead *content*: `leads_with_pointer` now requires something other than
+framing after the glyph (`is_frame_char` on both sides, so a boxed empty prompt `│ ❯   │` reads the
+same as a bare one). This narrows the **signal**, not the guard — a highlighted menu choice points
+*at an option*, and no dialog's selected option is blank — so every hold that ever mattered is
+untouched, and the release path that was dead code comes back to life for the class that needs it
+most.
+
+**Rejected: widening the notice mask instead.** The ring's matched line was
+`❯ [loomux] pr #715 checks: …`, so masking loomux's own notice through a leading prompt glyph would
+also have cleared this repro. It fixes the wrong layer: the ring is *allowed* to over-match (it is
+the trigger; the grid is what releases), the mask is the security-sensitive surface where a
+widening claims rows loomux cannot prove it wrote, and the bare glyph would still have pinned the
+grid at `StillRendered` for every other `pointer-option` hold on the same CLI.
+
+**Tests.** `f1`–`f4` in `tests/orchestration.rs`, over
+`tests/fixtures/attention/fp-resumed-agent-idle-prompt.txt` — the repro's own restored screen,
+captured from `get_output` on the pane that wedged. `f1` pins the glyph inside the detector's
+pointer window first, so it cannot pass for the reason the other `❯` negatives pass; `f2` runs the
+production predicate over both readings of that screen; `f3` is the fail-safe direction (a pointer
+leading a real option still matches, still re-reads on the grid framed or bare, still holds end to
+end); `f4` is the latch itself — a genuine menu match on the ring, released once the screen becomes
+the idle prompt. The fixture also joins the existing `prompt_wait_detected` and `attention_tick`
+negative sets.
+
+**Residual.** A CLI that paints its input box with a *placeholder* (`❯ Try "fix the build"`) still
+leads a pointer with content and still matches. That is not new — the older box shape
+(`idle-input-box.txt`) uses `>`, which was never a pointer glyph — but it is the shape to watch if
+a CLI adopts `❯` plus placeholder text; the answer then is the same one this note takes, a narrower
+signal, not a wider mask.
+
+**The assumption this rests on, stated so a future TUI change is a known break and not a mystery:
+a pointer and the option it points at render on the SAME row.** That is what makes "nothing after
+the glyph" mean "this points at no option" rather than "the option is elsewhere". Two things could
+falsify it — a CLI that paints the glyph on its own row above a multi-row option, or a wrap that
+lands exactly at the glyph — and either would make a *live* menu read as an empty prompt, which is
+the expensive direction. Neither is speculative-only: the whole reason this bug existed is that a
+CLI changed its input box from `> ` to a bare `❯`, so the same surface moves again. What limits the
+damage if it does is that `pointer-option` is one disjunct of five and the last one tried — a real
+dialog painted that way would still have to carry no footer, no numbered option and no yes/no token
+to go undetected, and `grid_evidence_for` reads `prompt_wait_detected` over the whole screen as
+well. The signal to re-check on a CLI upgrade is therefore this one, and `f3` is the test that
+would have to be widened: today it asserts a pointer row and its option are one string.
 
 ## Delivery queue (#445)
 

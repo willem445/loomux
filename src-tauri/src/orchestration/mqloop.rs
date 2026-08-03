@@ -775,15 +775,129 @@ pub fn requeue_survivors(state: &mut MergeQueueState, survivors: &[u64]) {
     }
 }
 
+/// **Has the queue drained?** — §4's "zero entries with no batch in flight", as
+/// one predicate rather than as an open-coded `any(...)` at each site.
+///
+/// Both halves matter and they answer different questions. The entries half is
+/// "is there work left that was approved against the target"; the batch half is
+/// "is there an object already built against it". A cancel can take the last
+/// live entry out from under an **in-flight** batch (§10 abandons it on the next
+/// tick, not synchronously), so the entries half alone would call that drained
+/// while a scratch ref and a draft PR built for the old target are still on the
+/// remote.
+fn drained(state: &MergeQueueState) -> bool {
+    state.batch.is_none() && !state.entries.iter().any(|e| !e.state().is_terminal())
+}
+
+/// **A drained queue is a finished campaign**: release the target *and* drop the
+/// terminal entries it left behind (§4).
+///
+/// Called from every point that can be the one that drains the queue — a
+/// finished batch, a cancel, a reconcile that strands what it cannot resume —
+/// because "the last non-terminal entry left" is not an event any single one of
+/// them owns. Releasing only while [`drained`] also keeps the empty target away
+/// from the paths that build a refspec out of it: `drive`'s `landable` guard
+/// fires only while an entry is live, and `start_batch` reads the target only
+/// after finding a `Queued` entry, so an empty target is reachable exactly where
+/// nothing reads it.
+///
+/// The two halves are one event, which is why they are one function. A target
+/// and a set of corpses are both properties of *the work that was in the queue*;
+/// keeping either past the drain makes the queue describe a campaign that is
+/// over. Reported live against a queue wedged by #710: the pane read
+/// `merge queue · → integration/batch3 · 4 entries` with four cancelled entries
+/// and nothing queued, because the corpses were only ever dropped by
+/// `prune_terminal` at a land — which a campaign that ends in cancellation never
+/// reaches. Note the agent-facing `status_view` already filtered terminal
+/// entries; `mergeqview::project` does not (`entries_total` is
+/// `state.entries.len()`), so the file itself has to be the thing that is clean.
+///
+/// # Why `kicked-back` survives the drain and the other two do not
+///
+/// The three terminal states are not the same kind of fact, and a blanket
+/// `prune_terminal` here says they are:
+///
+/// - **`cancelled`** is somebody saying "take this out" — the request has been
+///   honoured and there is nothing left to tell them.
+/// - **`landed`** is work that succeeded; the land path already prunes it.
+/// - **`kicked-back`** is the queue telling an owner something they have **not
+///   acted on yet** (a conflict, a culprit, a gate refusal, a batch a restart
+///   could not resume). Dropping it at the drain deletes the only row that names
+///   *which* PR bounced at the exact moment the queue empties — which is the
+///   moment someone goes to look. §4's "strand loudly" would survive only in the
+///   audit log, and a pane that shows nothing is not loud.
+///
+/// So the drain clears the finished work and keeps the unfinished conversation,
+/// bounded by [`trim_terminal`] so "keeps" cannot mean "accumulates". This is
+/// the same argument [`MAX_TERMINAL_RETAINED`] makes for a live campaign, and it
+/// would be incoherent to make it there and not here.
+fn release_if_drained(state: &mut MergeQueueState) {
+    if drained(state) {
+        state.target.clear();
+        // Spelled as "terminal AND not kicked-back" rather than as "keep only
+        // kicked-back": every entry here is terminal by [`drained`]'s own
+        // definition today, but a retain that deletes whatever that predicate
+        // does not name would quietly start eating live entries if `drained`
+        // were ever loosened. The cost of the longer condition is nothing; the
+        // cost of the coupling is the queue silently dropping queued work.
+        state.entries.retain(|e| !e.state().is_terminal() || e.state() == EntryState::KickedBack);
+        trim_terminal(state);
+    }
+}
+
+/// How many terminal entries the queue keeps before the oldest are dropped —
+/// in a live campaign, and for the `kicked-back` rows that survive a drain.
+///
+/// Not zero, and not unbounded, and both bounds have a reason:
+///
+/// - **Not zero** — a `kicked-back` entry is the one durable place a human sees
+///   *which* PR bounced out of the campaign they are watching, and dropping it
+///   the instant it goes terminal would leave the pane silently one row shorter.
+/// - **Not unbounded** — `mergeqview::project` renders the first
+///   [`VIEW_ENTRY_LIMIT`](super::mergeqview::VIEW_ENTRY_LIMIT) entries **in file
+///   order**, and corpses sit at the front. Enough of them and the live entries
+///   are pushed out of the window: a pane showing a full page of cancelled work
+///   and none of the queued work, which is the reported symptom made worse
+///   rather than better. `MAX_ENTRIES` does not bound this — it counts only
+///   non-terminal entries, on purpose.
+///
+/// Eight, for the same reason [`MAX_EXAMINED_PER_BUILD`] is eight: it is enough
+/// to see what just happened, and it leaves the view window overwhelmingly to
+/// live work (≥56 of 64 rows).
+pub const MAX_TERMINAL_RETAINED: usize = 8;
+
+/// Drop the **oldest** terminal entries beyond [`MAX_TERMINAL_RETAINED`],
+/// keeping the queue's order.
+///
+/// Deliberately not "drop terminal entries older than T": the queue holds an
+/// `enqueued_ms` per entry and no clock of its own, and a rule keyed on elapsed
+/// time would need one threaded through every call site to answer a question
+/// about *volume*. Count is the property that actually bounds the file and the
+/// view window.
+fn trim_terminal(state: &mut MergeQueueState) {
+    let terminal = state.entries.iter().filter(|e| e.state().is_terminal()).count();
+    let Some(mut excess) = terminal.checked_sub(MAX_TERMINAL_RETAINED).filter(|n| *n > 0) else {
+        return;
+    };
+    // `retain` visits in order, so the entries dropped are the ones nearest the
+    // front — the oldest, which is what "keep the most recent" means for a list
+    // that is only ever appended to.
+    state.entries.retain(|e| {
+        if excess > 0 && e.state().is_terminal() {
+            excess -= 1;
+            false
+        } else {
+            true
+        }
+    });
+}
+
 /// Clear the in-flight batch record once it is finished, and release the target
 /// when the queue has drained (§4: a target is a property of the work in the
 /// queue, never a configured setting).
 pub fn finish_batch(state: &mut MergeQueueState) {
     state.batch = None;
-    let live = state.entries.iter().any(|e| !e.state().is_terminal());
-    if !live {
-        state.target.clear();
-    }
+    release_if_drained(state);
 }
 
 /// Drop terminal entries so the file stays bounded, keeping the queue's order.
@@ -966,6 +1080,9 @@ pub fn reconcile_batch(
         for pr in orphans {
             strand(state, &mut report, pr, "in-flight with no batch record on disk");
         }
+        // Stranding is terminal, so this too can be what empties the queue —
+        // and there is no batch record here to hold the §4 release off.
+        release_if_drained(state);
         return report;
     };
 
@@ -1002,7 +1119,11 @@ pub fn reconcile_batch(
                 strand(state, &mut report, pr, &why);
             }
             report.cleanup_failed = cleanup_worktree(r, &batch.id);
-            state.batch = None;
+            // Stranding moved every member to a terminal state, so a restart
+            // that cannot resume its batch can also be what drains the queue —
+            // and a target held past that point is the #710 wedge, arrived at
+            // through recovery instead of through a cancel.
+            finish_batch(state);
             report.notices.push(format!(
                 "[loomux] merge queue: batch {} could NOT be resumed after a restart ({}). {} entr{} kicked back; nothing landed.",
                 quote(&batch.id),
@@ -1203,8 +1324,40 @@ pub fn enqueue(
         return refuse(refusal::QUEUE_FULL);
     }
 
+    // **§4's release, asked once more here — before the decision, and whatever
+    // the decision turns out to be.**
+    //
+    // This is the whole of #710. The `base-not-target` refusal exists to stop
+    // queued entries being retargeted under them; a [`drained`] queue has nobody
+    // to protect, so a target left behind there refuses every future branch with
+    // "this queue is already landing elsewhere — drain it first" about a queue
+    // that IS drained. Nothing recovers from it either: `merge_queue.json` is
+    // persistent by design, so a restart re-reads the same residue and one
+    // cancelled batch wedges the group for good (found live: an empty queue
+    // still pointing at a deleted `integration/batch3`).
+    //
+    // Asked here as well as at every transition that can drain the queue, and
+    // the redundancy is the point: this one clears a residue left by a build
+    // that predates those calls, or by a path added later that forgets to
+    // release. Because it is a release rather than a read-side exception, a
+    // refusal below cannot leave the queue still *naming* a branch it is not
+    // landing on until the next restart (rev N2) — `queue_merge_with` persists
+    // a refusal that changed the state for exactly this reason.
+    //
+    // Placed after the three cheap refusals above, not before them: a disabled
+    // queue must stay byte-for-byte untouched (§12), and `already-queued` and
+    // `queue-full` can only fire on a queue that is not drained anyway.
+    //
+    // It also drops the previous campaign's corpses, which is why a queue that
+    // re-establishes a target never shows the old campaign's cancelled entries:
+    // they are gone at the drain, and gone again here for a file that drained
+    // under a build that did not do it.
+    release_if_drained(state);
     // §7.1: live, through the real `gh`. `current_target` is whatever the queue
-    // has established so far — empty until the first successful enqueue.
+    // has established so far — empty until the first successful enqueue, and,
+    // after the release above, empty on any drained queue by construction. A
+    // live entry still holds it, and the drain-first answer for that case is
+    // exactly what it always was.
     let current = (!state.target.trim().is_empty()).then(|| state.target.clone());
     let (target, facts) =
         match resolve_and_validate_target(r, pr, current.as_deref(), asserted_target) {
@@ -1227,12 +1380,21 @@ pub fn enqueue(
         });
     }
 
-    // Established here, and only here (§4).
+    // Established here, and only here (§4) — and on a drained queue this
+    // establishes rather than re-confirms, because the validation above ran with
+    // no `current_target` to match. A live entry can never reach this line with
+    // a different branch: `validate_target` refused it.
     state.target = target;
     // A prior terminal entry for this PR is replaced rather than accumulated:
     // §4 is explicit that a kicked-back PR comes back as a NEW entry, so its
     // corpse must not sit in the file forever.
     state.entries.retain(|e| e.pr != pr || !e.state().is_terminal());
+    // …and the *other* PRs' corpses are bounded, which that line alone never did
+    // — it only ever tidied the one PR being re-enqueued, so a campaign that
+    // absorbed cancels without landing kept every one of them. See
+    // [`MAX_TERMINAL_RETAINED`] for why the bound is a count and why it is not
+    // zero.
+    trim_terminal(state);
     state.entries.push(QueueEntry::new(pr, &facts.head, now_ms));
     let position = state.entries.iter().filter(|e| !e.state().is_terminal()).count();
     EnqueueOutcome::Queued { position }
@@ -1265,7 +1427,16 @@ pub fn cancel(state: &mut MergeQueueState, pr: u64) -> CancelOutcome {
         return CancelOutcome::Refused { reason: refusal::NOT_QUEUED };
     }
     match advance_entry(state, pr, EntryState::Cancelled) {
-        Ok(Some(_)) => CancelOutcome::Cancelled { was },
+        Ok(Some(_)) => {
+            // §4's release, on the path that most often *is* the last transition
+            // out of the queue. Without it a cancelled queue keeps naming a
+            // branch it is not landing on — and one that may not exist any more
+            // (#710). Deliberately does nothing while a batch is in flight: that
+            // one is the driver's to abandon, and `finish_batch` re-asks this
+            // question once it has.
+            release_if_drained(state);
+            CancelOutcome::Cancelled { was }
+        }
         // Unreachable while `transition` allows every non-terminal → cancelled,
         // and still handled: a refusal the state machine invents is reported,
         // never rendered as a success.
@@ -1564,7 +1735,11 @@ fn advance_in_flight(
             set_batch_tag(state, *pr, None);
         }
         teardown(r, cfg.group, &batch, rep);
-        state.batch = None;
+        // `finish_batch` rather than a bare `state.batch = None`: every member
+        // may have been the cancel that emptied the queue (`requeue` leaves a
+        // terminal entry alone by design), and that is the §4 release this batch
+        // record was the last thing holding off.
+        finish_batch(state);
         rep.changed = true;
         rep.audit(
             audit_action::BATCH_ABORTED,
@@ -1585,7 +1760,9 @@ fn advance_in_flight(
             set_batch_tag(state, *pr, None);
         }
         teardown(r, cfg.group, &batch, rep);
-        state.batch = None;
+        // Every member just went terminal, so this can be the transition that
+        // drains the queue — same §4 release as the abandon path above.
+        finish_batch(state);
         rep.changed = true;
         rep.audit(
             audit_action::STRANDED,

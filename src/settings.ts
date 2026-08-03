@@ -27,10 +27,34 @@ export interface AppSettings {
    *  (#155, shortcuts.ts): don't unconditionally steal a key an in-pane
    *  program may need, offer the interception as a choice instead. */
   pasteOnPlainCtrlV: boolean;
+  /** How long a VISIBLE but unfocused pane batches its PTY output before
+   *  writing it to xterm, in ms (#720). The focused pane is never throttled.
+   *  `0` turns throttling off entirely, restoring the pre-#720 behaviour where
+   *  every visible pane rendered every frame.
+   *
+   *  This is a knob, not a preference, and it exists because the payoff is
+   *  machine-dependent in a way loomux cannot measure for you: the saving is
+   *  render passes, so it scales with how many panes are streaming at once and
+   *  with how expensive rendering is on your GPU/renderer. Setting it to `0`
+   *  and relaunching is the A/B — see doc/design/pane-render-throttle.md. */
+  unfocusedRenderThrottleMs: number;
 }
+
+/** Upper bound on `unfocusedRenderThrottleMs`. A hand-edit of `10000` would
+ *  make unfocused panes update once every ten seconds, which reads as a broken
+ *  app rather than as a tuning choice; clamp instead of honouring it. */
+export const MAX_RENDER_THROTTLE_MS = 1000;
 
 export const DEFAULT_SETTINGS: AppSettings = {
   pasteOnPlainCtrlV: true,
+  // Six 60 Hz frames. Long enough that a streaming unfocused pane renders ~6×
+  // less often (xterm coalesces writes within a frame into one render pass and
+  // nothing across frames), short enough that a human glancing across the grid
+  // reads it as motion rather than as a stutter — 10 Hz is well clear of the
+  // few-Hz range where intermittent motion starts looking stepped. This is the
+  // single source of truth for the shipped window; panethrottle.ts holds the
+  // policy that consumes it and no copy of the number.
+  unfocusedRenderThrottleMs: 100,
 };
 
 /** Serialize settings for `saveSettings`. Always writes every known key (no
@@ -38,7 +62,14 @@ export const DEFAULT_SETTINGS: AppSettings = {
  *  meant to be hand-read/edited, so an absent key would just be confusing;
  *  the exhaustive Copy&Paste-equivalent of tabstore's encodeTabs. */
 export function encodeSettings(s: AppSettings): string {
-  return JSON.stringify({ pasteOnPlainCtrlV: s.pasteOnPlainCtrlV }, null, 2);
+  return JSON.stringify(
+    {
+      pasteOnPlainCtrlV: s.pasteOnPlainCtrlV,
+      unfocusedRenderThrottleMs: s.unfocusedRenderThrottleMs,
+    },
+    null,
+    2
+  );
 }
 
 /** Parse persisted settings, tolerating anything malformed by returning null
@@ -60,7 +91,20 @@ export function decodeSettings(raw: string | null): AppSettings | null {
   return {
     pasteOnPlainCtrlV:
       typeof r.pasteOnPlainCtrlV === "boolean" ? r.pasteOnPlainCtrlV : DEFAULT_SETTINGS.pasteOnPlainCtrlV,
+    unfocusedRenderThrottleMs: throttleMs(r.unfocusedRenderThrottleMs),
   };
+}
+
+/** Per-key fallback for `unfocusedRenderThrottleMs`. A NEGATIVE value takes the
+ *  default rather than being clamped to 0: `0` is a meaningful setting (throttling
+ *  off) and `-1` is a typo, so silently reading a typo as "off" would quietly
+ *  disable the feature and look like it never worked. Anything non-numeric,
+ *  non-finite, or absent takes the default the same way every other key does. */
+function throttleMs(v: unknown): number {
+  if (typeof v !== "number" || !Number.isFinite(v) || v < 0) {
+    return DEFAULT_SETTINGS.unfocusedRenderThrottleMs;
+  }
+  return Math.min(v, MAX_RENDER_THROTTLE_MS);
 }
 
 // ---------- in-memory singleton ----------

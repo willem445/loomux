@@ -13,7 +13,8 @@ the Windows baseline, no live agent testing) live in [`CLAUDE.md`](../../CLAUDE.
 
 ```
 src-tauri/src/
-  pty.rs            PTY lifecycle (spawn/write/resize/kill) + output streaming; per-kind Terminal shells (PowerShell/cmd/Git Bash, #194) + Git Bash discovery
+  pty.rs            PTY lifecycle (spawn/write/resize/kill) + output streaming; per-kind Terminal shells (PowerShell/cmd/Git Bash, #194) + Git Bash discovery. The input path never blocks under the global `ptys` map lock (#719): the per-pane writer/master are shared handles cloned out under it, `write_pty`/`change_dir` run their whole body on `spawn_blocking`, and there is deliberately no backend write queue — back pressure is what bounds memory. See doc/design/pty-input-path.md
+  ptyout.rs         per-pane coalescing of PTY output before it crosses IPC (#712): a `pty-output` event costs one one-shot script compilation on the GUI thread, so the emit rate is bounded to one per 60 Hz frame per pane (leading-edge, so a quiet pane's chunk still crosses on arrival) instead of one per `read()` return. Bytes, order and the orchestration output ring are untouched. See doc/design/pty-output-coalescing.md
   sessions.rs       agent session discovery (one collect_*_candidates fn per agent source); metadata-first + a persisted head-parse index (session-index.json) so a long history costs a stat, not a parse (#493). See doc/design/session-index.md
   orchestration/    agent groups: registry, guardrails, MCP server, audit. Compact-survival is
     layered (#329, #416, #417): a durable role CONTRACT riding the CLI's own system-prompt layer
@@ -93,6 +94,8 @@ src/
   groupresume.ts    pure whole-group resume plan: orchestrator first, delegates rejoin-or-skip, and ONE plan is ONE group -- members are partitioned by their own recorded group, a member naming another group is refused, an unattributable set fails loudly (DOM-free, unit-tested, #194/#485)
   sessionreconcile.ts pure post-start session-id adoption matcher (refuses on any ambiguity) + the dormant card's "resume last session" candidate lookup (DOM-free, unit-tested, #440). See doc/design/session-id-learning.md
   panefit.ts        pure "hidden => no PTY resize" decision (the no-resize invariant)
+  panethrottle.ts   pure flush policy for a VISIBLE but unfocused pane's PTY output (#720): batch into one write per window so xterm renders it ~6x less often (renderRows coalesces within an animation frame, never across one); leading-edge, so a quiet pane is never delayed, and byte-exact -- only the moment of the write moves. DOM-free, unit-tested. See doc/design/pane-render-throttle.md
+  webglretry.ts     pure BOUNDED backoff for re-acquiring a lost WebGL context (#720): a context is a capped resource, so one pane re-acquiring evicts another's and an unbounded retry live-locks between panes. 2s/10s/60s then stop; a hide/show or a 5-minute healthy lifetime opens a fresh streak. DOM-free, unit-tested. See doc/design/pane-render-throttle.md
   sessions.ts       session browser sidebar: source/role chips, and (#1) each session's recorded task/goal, repo, branch, and PR (when the board has one) — absent rather than guessed for a session predating the field
   sessionstore.ts   the app's ONE session list: single-flight scan sharing so no two consumers can scan the disk at once (#493) (DOM-free, unit-tested). See doc/design/session-index.md
   sessionmeta.ts    pure session-browser task/repo-branch/PR formatting + truncation (#1) (DOM-free, unit-tested)

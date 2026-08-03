@@ -1623,8 +1623,63 @@ pub fn wait_bounded(
 /// See [`OrchRegistry::capture_with_timeout`]'s comment for the argument behind
 /// each step; it is not repeated here.
 pub fn capture_raw_with_timeout(
+    cmd: std::process::Command,
+    timeout: Duration,
+) -> Result<(std::process::ExitStatus, String, String), String> {
+    capture_raw_inner(cmd, timeout, wait_bounded)
+}
+
+/// The same capture with its **main wait forced to fail** — the one arm of
+/// `capture_raw_inner` that a test cannot otherwise reach (#699).
+///
+/// Reaching it for real needs `Child::try_wait` itself to error, which no
+/// supported platform does on demand, and the arm is precisely where the
+/// reader accounting used to be dropped. So the wait is injected rather than
+/// mocked away: the production entry point above hands in `wait_bounded` and
+/// this one hands in a closure that errors, and every other step — the spawn,
+/// the two readers, the abandon accounting, the post-kill reap — is the same
+/// code in both. Same `#[doc(hidden)] pub` idiom as
+/// `seed_leaked_readers_for_test`: a seam, not a second implementation.
+#[doc(hidden)] // pub for integration tests: force the wait-error early return
+pub fn capture_raw_with_failing_wait_for_test(
+    cmd: std::process::Command,
+    timeout: Duration,
+) -> Result<(std::process::ExitStatus, String, String), String> {
+    capture_raw_inner(cmd, timeout, |_child, _timeout| Err("forced wait failure (test seam)".to_string()))
+}
+
+/// Give up on a child mid-capture: kill it, reap it on its own deadline, and
+/// park **both** readers where the ceiling can see them — the one accounting
+/// step every abandonment arm goes through (#699). Returns `reason` so a call
+/// site is a single `return Err(abandon_child_and_readers(…))` and cannot
+/// account for one reader, or neither, by omission.
+///
+/// The reap goes through `wait_bounded` for the reason `GH_CAPTURE_REAP_TIMEOUT`
+/// exists: a bound whose last act is an unbounded `wait()` is not a bound. On
+/// the wait-error arm that reap will normally fail immediately too (whatever
+/// broke `try_wait` is still broken), which costs nothing — it is an `Err`,
+/// which is already bounded, and the kill above is what the readers need.
+fn abandon_child_and_readers(
+    child: &mut std::process::Child,
+    out_reader: std::thread::JoinHandle<Vec<u8>>,
+    err_reader: std::thread::JoinHandle<Vec<u8>>,
+    reason: String,
+) -> String {
+    let _ = child.kill();
+    let _ = wait_bounded(child, GH_CAPTURE_REAP_TIMEOUT);
+    let mut leaked = GH_CAPTURE_LEAKED_READERS.lock_safe();
+    leaked.push(out_reader);
+    leaked.push(err_reader);
+    reason
+}
+
+/// The body of the capture, with the main wait injected so the wait-error arm
+/// is reachable from a test (see `capture_raw_with_failing_wait_for_test`).
+/// `wait` is `wait_bounded` in production and nothing else.
+fn capture_raw_inner(
     mut cmd: std::process::Command,
     timeout: Duration,
+    wait: impl Fn(&mut std::process::Child, Duration) -> Result<Option<std::process::ExitStatus>, String>,
 ) -> Result<(std::process::ExitStatus, String, String), String> {
     use std::io::Read as _;
     use std::process::Stdio;
@@ -1653,15 +1708,32 @@ pub fn capture_raw_with_timeout(
         buf
     });
 
-    let Some(status) = wait_bounded(&mut child, timeout)? else {
-        let _ = child.kill();
-        // Reap on its own deadline (rev-lead finding 2). A bound whose last act
-        // is an unbounded `wait()` is not a bound.
-        let _ = wait_bounded(&mut child, GH_CAPTURE_REAP_TIMEOUT);
-        let mut leaked = GH_CAPTURE_LEAKED_READERS.lock_safe();
-        leaked.push(out_reader);
-        leaked.push(err_reader);
-        return Err(format!("timed out after {}s", timeout.as_secs()));
+    // From here on both readers exist, and every exit accounts for both of
+    // them exactly once: the arm below joins them, and every arm that gives up
+    // on a live child parks them via `abandon_child_and_readers` (kill, bounded
+    // reap, park). Nothing between the two `spawn`s above and this point can
+    // return, and the two returns that precede them — the backlog refusal and a
+    // failed `Command::spawn` — have no readers to account for. (A panic in the
+    // second `std::thread::spawn` would unwind past all of this rather than
+    // return through it; out of scope, and the design note records why.)
+    //
+    // #699: the wait-error arm used to be a bare `?`. Uncounted is worse than
+    // parked, not better — the ceiling admits on "how many readers are still
+    // blocked", so readers the sweep can never see make the bound understate
+    // the process it exists to bound, and the child stayed alive too (dropping
+    // a `Child` does not kill it), which is precisely what keeps those readers
+    // blocked forever.
+    let waited = match wait(&mut child, timeout) {
+        Ok(waited) => waited,
+        Err(e) => return Err(abandon_child_and_readers(&mut child, out_reader, err_reader, e)),
+    };
+    let Some(status) = waited else {
+        return Err(abandon_child_and_readers(
+            &mut child,
+            out_reader,
+            err_reader,
+            format!("timed out after {}s", timeout.as_secs()),
+        ));
     };
 
     // Exited on its own: both pipes are at EOF (or about to be), so these joins
@@ -1678,6 +1750,39 @@ pub fn capture_raw_with_timeout(
 #[doc(hidden)] // pub for integration tests: observe the process-wide reader backlog
 pub fn gh_capture_live_readers() -> usize {
     sweep_leaked_readers()
+}
+
+/// The backlog list itself, **unswept**: how many reader handles are parked,
+/// whether or not their reader has since ended (#699).
+///
+/// `gh_capture_live_readers` answers the question the ceiling asks and is
+/// therefore the wrong instrument for pinning the accounting: on an ordinary
+/// abandonment the kill closes both pipes and the readers end within
+/// milliseconds, so a swept count cannot tell "parked, then ended" from "never
+/// parked at all" — it reads the same either way, and which one a test sees is
+/// a race it loses on some platforms and not others. Counting the list itself
+/// makes "both handles were handed to the ceiling" observable on its own terms.
+#[doc(hidden)] // pub for integration tests
+pub fn gh_capture_parked_readers() -> usize {
+    GH_CAPTURE_LEAKED_READERS.lock_safe().len()
+}
+
+/// Empty the backlog and hand back what was parked, so a test can start from a
+/// known-zero baseline (#699).
+///
+/// The list is process-wide and every capture test contributes to it, so "this
+/// call parked exactly two" is not observable as a before/after delta: the
+/// confound is not merely what earlier tests left behind, it is that the next
+/// capture's own opening sweep *removes* the ones that have since ended, moving
+/// the count down underneath the baseline while the two new handles push it up
+/// (measured on CI: before 4, after 4, with both readers correctly parked).
+///
+/// Dropping a `JoinHandle` does not stop its thread — the handles simply stop
+/// being tracked, which is the same residue the ceiling already tolerates for
+/// a reader that ended, and it is confined to a test process.
+#[doc(hidden)] // pub for integration tests
+pub fn drain_parked_readers_for_test() -> Vec<std::thread::JoinHandle<Vec<u8>>> {
+    std::mem::take(&mut *GH_CAPTURE_LEAKED_READERS.lock_safe())
 }
 
 /// Park `n` controllable blocked readers in the backlog, as a real abandoned
@@ -2082,6 +2187,17 @@ const ATTENTION_QUIET_MS: u64 = 4000;
 /// If the human typed into a pane within this window it does not "need
 /// attention" — they are already at the keyboard on it.
 const ATTENTION_RECENT_INPUT_MS: u64 = 6000;
+/// How many RAW bytes of a pane's output ring one attention tick reads (#717).
+/// Everything the scan looks for (a prompt, a question, a menu) is the last
+/// thing the CLI painted, so the tail has always been all it needed — but the
+/// read used to fetch the whole (up to 256 KB) ring and slice these bytes off
+/// the end, and that fetch happens under the global `ptys` mutex, the one
+/// `write_pty`/`note_user_input` take on every keystroke and the one the pane's
+/// own reader thread contends with on the ring behind it. Bounding the REQUEST
+/// is the entire point: the stripped text handed to the detectors is
+/// byte-identical either way (`strip_ansi(&ring[len-N..])` is
+/// `strip_ansi(&last_N)`), so what changes is only how long the lock is held.
+pub const ATTENTION_SCAN_BYTES: usize = 4096;
 /// How long the frontend gets to open a pane and report its pty id.
 const BIND_TIMEOUT: Duration = Duration::from_secs(20);
 /// Gap between the bracketed paste and the Enter that submits it.
@@ -2294,9 +2410,10 @@ const QUESTION_HOLD_POLL: Duration = Duration::from_millis(250);
 /// Bytes of the pane's live output tail scanned for a pending question
 /// (rev-15 N4): `prompt_wait_detected` only ever reads the last ~12 non-empty
 /// lines, so a bounded trailing slice is enough — matches the attention
-/// path's own trailing-window precedent (`pane_attention_inputs_from`, which
-/// trims to this same size for the identical "the prompt is at the end"
-/// reason), instead of cloning the whole (up to 256 KB) output ring on every
+/// path's own trailing window (`ATTENTION_SCAN_BYTES`, the same size for the
+/// identical "the prompt is at the end" reason — and since #717 the size of
+/// that path's READ, not just of the slice it took afterwards), instead of
+/// cloning the whole (up to 256 KB) output ring on every
 /// 250ms poll for up to two minutes.
 const QUESTION_SCAN_TAIL_BYTES: usize = 4096;
 /// Bytes replayed onto a composed grid for the "is it still DISPLAYED"
@@ -6245,25 +6362,53 @@ pub fn prompt_wait_detected(tail: &str) -> bool {
 /// ([`pointer_rendered`]), and two copies of a de-framing rule is exactly how
 /// the two readings would drift apart.
 fn deframe(l: &str) -> &str {
-    l.trim_start_matches(|c: char| {
-        c == '│' || c == '┃' || c == '|' || c == '*' || c == '●' || c == '•' || c == '◆'
-            || c.is_whitespace()
-    })
+    l.trim_start_matches(is_frame_char)
+}
+
+/// What `deframe` treats as decoration rather than content.
+///
+/// Hoisted out of `deframe` (#727) so [`leads_with_pointer`] can ask the same
+/// question of what FOLLOWS a pointer glyph as `deframe` asks of what precedes
+/// it — one strip set, so "is there content here" means the same thing on both
+/// sides of the glyph.
+fn is_frame_char(c: char) -> bool {
+    c == '│' || c == '┃' || c == '|' || c == '*' || c == '●' || c == '•' || c == '◆'
+        || c.is_whitespace()
 }
 
 /// The glyphs that mark a menu's highlighted choice when they LEAD a line.
 const POINTER_GLYPHS: [char; 3] = ['❯', '›', '→'];
 
-/// Does this line LEAD with a menu pointer, after any box framing?
+/// Does this line LEAD with a menu pointer that POINTS AT SOMETHING, after any
+/// box framing?
 ///
 /// The single definition of the pointer rule (#534 rev-13). Both readings call
 /// it — the ring detector over its last painted lines, [`pointer_rendered`]
 /// over every rendered row — because a re-read that is looser than the detector
 /// it stands in for would pin holds open on ordinary prose, and one that is
 /// tighter would release into a live menu. Neither is allowed to drift.
+///
+/// **The glyph must lead content, and that is #727.** Claude Code's own input
+/// box is a bare `❯` on its own row when empty — an idle pane's *prompt*, the
+/// opposite of a question. Matching it made every idle Claude Code pane read as
+/// "a menu is displayed" on BOTH readings at once: the ring matched whatever
+/// `strip_ansi` had concatenated that glyph onto, and [`pointer_rendered`] then
+/// found the same bare glyph among the rendered rows, so `grid_evidence_for`
+/// answered `StillRendered` forever and the one release #534 added could never
+/// fire. A resumed pane made it permanent — its replayed screen is static, so
+/// nothing ever repaints the glyph away — and three panes were lost to a
+/// 25-minute hold over a visibly idle input box.
+///
+/// This narrows the signal rather than the guard: a highlighted menu choice is
+/// a pointer *at an option*, and there is no dialog whose selected option is
+/// blank. A pointer with only framing after it (`│ ❯   │`) is likewise pointing
+/// at nothing — hence [`is_frame_char`] on both sides rather than a bare
+/// `trim`, so an empty prompt inside a box is read the same as one outside it.
 fn leads_with_pointer(line: &str) -> bool {
     let d = deframe(line);
-    POINTER_GLYPHS.iter().any(|g| d.starts_with(*g))
+    POINTER_GLYPHS
+        .iter()
+        .any(|g| d.strip_prefix(*g).is_some_and(|rest| !rest.trim_matches(is_frame_char).is_empty()))
 }
 
 /// Does any rendered row lead with a menu pointer (#534 rev-13)?
@@ -11003,6 +11148,24 @@ pub fn resolve_output_text(live: Option<String>, last_exit_tail: Option<&str>) -
         // last resort rather than inventing content that was never seen.
         _ => Err("terminal already closed".to_string()),
     }
+}
+
+/// One pane's attention-scan tail: a BOUNDED raw read of its output ring,
+/// ANSI-stripped (#717).
+///
+/// `read` is the raw-byte reader — `PtyManager::output_tail_bounded` at every
+/// production call site (`attention_inputs` for agent panes,
+/// `pane_attention_inputs_from` for plain ones). A closure rather than the
+/// manager itself for the same reason `Tier1Scan::read` takes one: the SIZE of
+/// the request is the only thing an assertion can reach here. Slicing the last
+/// `ATTENTION_SCAN_BYTES` off a whole-ring read produces a byte-identical
+/// string, so a test that only looks at the returned text cannot tell a 4 KB
+/// copy under the `ptys` mutex from a 256 KB one — and the copy is the defect.
+///
+/// The strip runs OUTSIDE the read (the reader has already released both locks
+/// by the time it returns), so no scanning happens under the lock at all.
+pub fn attention_tail(read: impl FnOnce(usize) -> Option<Vec<u8>>) -> Option<String> {
+    read(ATTENTION_SCAN_BYTES).map(|raw| strip_ansi(&raw))
 }
 
 /// Strip ANSI escape sequences (CSI, OSC, two-byte ESC) and carriage
@@ -22208,7 +22371,11 @@ impl OrchRegistry {
     /// bounds one call, not the process: the very case that justifies not
     /// joining is the case where they never finish, and a persistently
     /// stalling condition is re-polled every tick. So an abandoned reader is
-    /// parked in `GH_CAPTURE_LEAKED_READERS` instead of forgotten, every
+    /// parked in `GH_CAPTURE_LEAKED_READERS` instead of forgotten — on **every**
+    /// arm that gives up on a live child, the timeout and the one where the
+    /// bounded wait itself errors alike (#699), since a reader that is dropped
+    /// rather than parked is invisible to the sweep and the ceiling then
+    /// understates the very backlog it admits on. Every
     /// capture first sweeps the ones that have since ended, and a capture is
     /// refused outright once `GH_CAPTURE_MAX_LEAKED_READERS` are still
     /// blocked. Note what that trade is: past the ceiling, `gh` polling in
@@ -26928,19 +27095,31 @@ impl OrchRegistry {
             return (outs, tails, ins);
         };
         let ptys = app.state::<crate::pty::PtyManager>();
-        for a in self.agents.lock_safe().values() {
-            let Some(pid) = a.pty_id else { continue };
+        // Snapshot (agent id, pty id) and DROP the agents lock before touching
+        // any pty: the reads below each take the global `ptys` mutex, and
+        // holding `agents` across all of them pins two locks for the length of
+        // the whole gather instead of one lock per read (#717). An agent that
+        // disappears in the gap simply has no pty to read, which is the same
+        // outcome the `pty_id`/`output_total` guards already produce and which
+        // the scan already treats as "no item this tick".
+        let panes: Vec<(String, u32)> = self
+            .agents
+            .lock_safe()
+            .values()
+            .filter_map(|a| a.pty_id.map(|pid| (a.id.clone(), pid)))
+            .collect();
+        for (id, pid) in panes {
             if let Some(t) = ptys.output_total(pid) {
-                outs.insert(a.id.clone(), t);
+                outs.insert(id.clone(), t);
             }
-            if let Some(raw) = ptys.output_tail(pid) {
-                // A prompt is at the very end; strip only the last few KB so
-                // the scan stays cheap against a saturated 256 KB ring.
-                let start = raw.len().saturating_sub(4096);
-                tails.insert(a.id.clone(), strip_ansi(&raw[start..]));
+            // A prompt is at the very end, so only the last few KB are read —
+            // never the whole (up to 256 KB) ring, which is a copy made under
+            // the same mutex every keystroke takes (#717).
+            if let Some(t) = attention_tail(|n| ptys.output_tail_bounded(pid, n)) {
+                tails.insert(id.clone(), t);
             }
             if let Some(u) = ptys.last_user_input_ms(pid) {
-                ins.insert(a.id.clone(), u);
+                ins.insert(id, u);
             }
         }
         (outs, tails, ins)
@@ -26949,7 +27128,8 @@ impl OrchRegistry {
     /// Pty snapshots for every live pane that is NOT a registered agent, keyed
     /// by pty id, plus the agent-pty set. Feeds `plain_pane_attention` so the
     /// scan reaches plain shells the human opened by hand (#40). Empty without an
-    /// app handle (unit tests drive the pure core `pane_attention_inputs_from`).
+    /// app handle (tests drive the gather core `pane_attention_inputs_from`, which
+    /// owns the bounded ring read and takes its reader injected).
     #[allow(clippy::type_complexity)]
     fn pane_attention_inputs(
         &self,
@@ -26966,44 +27146,55 @@ impl OrchRegistry {
         let ptys = app.state::<crate::pty::PtyManager>();
         let mut live = Vec::new();
         for pid in ptys.live_ids() {
-            // Skip agent ptys *before* touching the ring: `attention_tick`
-            // already covers them, and `attention_inputs` already cloned their
-            // (up-to-256 KB) output ring this tick — cloning it a second time
-            // here would be pure waste (#40 review).
+            // Skip agent ptys *before* touching the pty at all: `attention_tick`
+            // already covers them, and `attention_inputs` already read their
+            // tail this tick — reading it a second time here would be pure
+            // waste (#40 review). The gather core below repeats the skip, which
+            // is where a test can observe that the ring is never READ for an
+            // agent pty rather than merely that no entry came out (#717).
             if agent_ptys.contains(&pid) {
                 continue;
             }
             let Some(total) = ptys.output_total(pid) else { continue };
-            let raw = ptys.output_tail(pid).unwrap_or_default();
             let input = ptys.last_user_input_ms(pid).unwrap_or(0);
-            live.push((pid, total, raw, input));
+            live.push((pid, total, input));
         }
-        let (outs, tails, ins) = self.pane_attention_inputs_from(&live, &agent_ptys);
+        let (outs, tails, ins) = self.pane_attention_inputs_from(
+            &live,
+            |pid, n| ptys.output_tail_bounded(pid, n),
+            &agent_ptys,
+        );
         (outs, tails, ins, agent_ptys)
     }
 
-    /// Pure core of `pane_attention_inputs`: build the pty-keyed snapshot maps
+    /// Gather core of `pane_attention_inputs`: build the pty-keyed snapshot maps
     /// `plain_pane_attention` consumes from a list of live pane snapshots
-    /// `(pty_id, output_total, raw_tail, last_input_ms)`, ANSI-stripping only the
-    /// trailing few KB of each tail (a prompt is at the end). Agent ptys are
-    /// skipped. Pure w.r.t. the pty, so run_attention's gather wiring is testable
+    /// `(pty_id, output_total, last_input_ms)`, reading and ANSI-stripping only
+    /// the trailing `ATTENTION_SCAN_BYTES` of each tail (a prompt is at the
+    /// end). Agent ptys are skipped without being read at all.
+    ///
+    /// `read` is the raw-byte reader — `PtyManager::output_tail_bounded` in
+    /// production — rather than a pre-read `Vec<u8>` per pane, so the size of
+    /// the request the scan makes under the `ptys` mutex is part of what this
+    /// function decides, and therefore part of what a test can pin (#717). Pure
+    /// w.r.t. the OS otherwise, so run_attention's gather wiring stays testable
     /// with a fake live-ids source (#40 review).
     #[allow(clippy::type_complexity)]
     pub fn pane_attention_inputs_from(
         &self,
-        live: &[(u32, u64, Vec<u8>, u64)],
+        live: &[(u32, u64, u64)],
+        mut read: impl FnMut(u32, usize) -> Option<Vec<u8>>,
         agent_ptys: &HashSet<u32>,
     ) -> (HashMap<u32, u64>, HashMap<u32, String>, HashMap<u32, u64>) {
         let mut outs = HashMap::new();
         let mut tails = HashMap::new();
         let mut ins = HashMap::new();
-        for (pid, total, raw, input) in live {
+        for (pid, total, input) in live {
             if agent_ptys.contains(pid) {
                 continue;
             }
             outs.insert(*pid, *total);
-            let start = raw.len().saturating_sub(4096);
-            tails.insert(*pid, strip_ansi(&raw[start..]));
+            tails.insert(*pid, attention_tail(|n| read(*pid, n)).unwrap_or_default());
             ins.insert(*pid, *input);
         }
         (outs, tails, ins)
@@ -35224,6 +35415,14 @@ impl OrchRegistry {
             }
         };
         let verdicts = self.verdict_map(group, pr);
+        // #710: `enqueue` releases a stale target on a drained queue whatever it
+        // then decides, so even a REFUSED enqueue can be a state change worth
+        // persisting — otherwise `merge_queue_status` keeps naming a branch the
+        // queue is not landing on until the next restart's reconcile. Snapshotted
+        // rather than inferred from the outcome, the same way
+        // `merge_queue_reconcile_with` decides its write: a value comparison
+        // cannot drift out of step with what the callee actually mutates.
+        let before = state.clone();
         let outcome =
             mqloop::enqueue(runner, &mut state, pr, target, enabled, &gate, &verdicts, now_ms());
         match outcome {
@@ -35241,8 +35440,25 @@ impl OrchRegistry {
                 json!({ "queued": true, "position": position })
             }
             mqloop::EnqueueOutcome::Refused { reason } => {
-                self.audit(group, "loomux", mqdriver::audit_action::ENQUEUE_REFUSED,
-                    json!({ "pr": pr, "reason": reason }));
+                // Written only when the refusal actually changed something — a
+                // released stale target, today. Unconditionally writing here
+                // would create a `merge_queue.json` for any group whose first
+                // `queue_merge` is refused, which collapses slice F's `absent`
+                // state (`merge_queue_view` distinguishes "never enqueued" from
+                // "empty queue"); a default state is already drained, so the
+                // release is a no-op there and `state == before` holds.
+                let mut detail = json!({ "pr": pr, "reason": reason });
+                if state != before {
+                    if let Err(e) = mqloop::store_state(&dir, &state) {
+                        // The refusal itself stands — it is a decision about this
+                        // PR and nothing about the write changes it. But a
+                        // release that did not reach disk means the queue still
+                        // names a branch it is not landing on, so it is stated in
+                        // the audit rather than lost (no silent failures).
+                        detail["stale_target_not_released"] = Value::from(e);
+                    }
+                }
+                self.audit(group, "loomux", mqdriver::audit_action::ENQUEUE_REFUSED, detail);
                 json!({ "refused": reason })
             }
         }

@@ -13,8 +13,8 @@ use loomux_lib::orchestration::intake::MAX_INTAKE_POLLS_PER_TICK;
 // #656 (rev-lead findings 1 and 2): the bounded child wait, and the
 // process-wide ceiling on readers abandoned by a timed-out capture.
 use loomux_lib::orchestration::{
-    gh_capture_admitted, gh_capture_live_readers, seed_leaked_readers_for_test, wait_bounded,
-    GH_CAPTURE_MAX_LEAKED_READERS,
+    drain_parked_readers_for_test, gh_capture_admitted, gh_capture_live_readers, gh_capture_parked_readers,
+    seed_leaked_readers_for_test, wait_bounded, GH_CAPTURE_MAX_LEAKED_READERS,
 };
 use loomux_lib::orchestration::mcp::dispatch;
 use loomux_lib::orchestration::notify;
@@ -106,6 +106,10 @@ use loomux_lib::orchestration::{
     record_stranded_outcome_at_for_test,
     should_notify_unconfirmed, single_pane_autopilot_flags,
     spawn_opens_minimized,
+    // #717: the attention scan's per-pane ring read, and the byte budget it is
+    // bounded to — the whole of what that issue changes is the SIZE of this
+    // request, so both have to be reachable from a test.
+    attention_tail, ATTENTION_SCAN_BYTES,
     spawn_rate_exceeded, spawn_request_expired, strip_ansi, submit_confirmed, submit_sequence,
     board_summaries, cap_task_notes, task_ready, task_summary, unmet_deps,
     unconfirmed_delivery_notice, delivery_eaten_notice, watchdog_should_notify, worktree_cleanup_targets,
@@ -539,6 +543,88 @@ fn the_queue_tools_refuse_queue_disabled_until_the_repo_opts_in() {
     // And the read did NOT create the state file — a status call that conjured
     // one would collapse slice F's `absent` state for every group.
     assert!(!d.path().join(&co.group).join("merge_queue.json").exists());
+}
+
+/// **#710 (rev N2): a REFUSED enqueue still releases a stale target — on disk.**
+///
+/// The queue-core half is pinned in `tests/mergequeue.rs`; what only this file
+/// can reach is the registry path around it. `queue_merge_with`'s refusal arm
+/// did not write at all, so a released target would have lived in a state object
+/// that was dropped on the way out and `merge_queue_status` — which reads the
+/// file — would have gone on naming a branch the queue is not landing on until
+/// the next restart's reconcile.
+///
+/// The second half is the trap that write could have sprung: writing
+/// unconditionally would create a `merge_queue.json` for any group whose first
+/// `queue_merge` is refused, collapsing slice F's `absent` state (§12) for every
+/// repo that ever mistyped a PR number.
+#[test]
+fn a_refused_enqueue_releases_a_stale_target_without_conjuring_a_queue_file() {
+    /// A PR whose base IS the default branch: constraint 7 refuses it before any
+    /// target can be established, so the only state change available to this
+    /// enqueue is the release.
+    struct BaseIsDefault;
+    impl loomux_lib::orchestration::mqdriver::MqRunner for BaseIsDefault {
+        fn git(
+            &self,
+            args: &[&str],
+        ) -> Result<loomux_lib::orchestration::mqdriver::CmdOut, String> {
+            panic!("constraint 7 refuses before any git call: {args:?}")
+        }
+        fn gh(
+            &self,
+            args: &[&str],
+        ) -> Result<loomux_lib::orchestration::mqdriver::CmdOut, String> {
+            let joined = args.join(" ");
+            let stdout = if joined.contains("repo view") {
+                "main\n".to_string()
+            } else {
+                json!({ "baseRefName": "main", "headRefOid": "a".repeat(40), "body": "b" })
+                    .to_string()
+            };
+            Ok(loomux_lib::orchestration::mqdriver::CmdOut {
+                code: Some(0),
+                stdout,
+                stderr: String::new(),
+            })
+        }
+    }
+
+    let (reg, d) = test_registry();
+    let repo = repo_with_merge_queue("mq-stale-target", true);
+    let g = reg.create_group(repo.to_str().unwrap(), advanced_rails()).unwrap();
+    let qfile = d.path().join(&g.id).join("merge_queue.json");
+
+    // The field state of #710: an empty queue still pointing at the branch a
+    // cancelled batch left behind.
+    fs::write(&qfile, r#"{"version":1,"target":"integration/batch3","entries":[]}"#).unwrap();
+
+    let v = reg.queue_merge_with(&g.id, 705, None, &BaseIsDefault);
+    assert_eq!(v["refused"], json!("base-is-default"), "the refusal itself is unchanged");
+
+    let after: Value = serde_json::from_str(&fs::read_to_string(&qfile).unwrap()).unwrap();
+    assert_eq!(after["target"], json!(""), "the release reached disk: {after}");
+    assert_eq!(
+        reg.merge_queue_status(&g.id)["target"],
+        json!(""),
+        "so status stops naming it at the first touch, not at the next restart"
+    );
+
+    // A group that never queued anything has no file, and a refused enqueue must
+    // not conjure one — `merge_queue_view` distinguishes "never enqueued" from
+    // "empty queue", and an always-present file collapses the two.
+    let repo2 = repo_with_merge_queue("mq-stale-target-absent", true);
+    let g2 = reg.create_group(repo2.to_str().unwrap(), advanced_rails()).unwrap();
+    let qfile2 = d.path().join(&g2.id).join("merge_queue.json");
+    assert!(!qfile2.exists(), "fixture precondition");
+
+    let v = reg.queue_merge_with(&g2.id, 705, None, &BaseIsDefault);
+    assert_eq!(v["refused"], json!("base-is-default"));
+    assert!(
+        !qfile2.exists(),
+        "a refused enqueue must not create merge_queue.json — the default state is already \
+         drained, so the release is a no-op and nothing changed to write"
+    );
 }
 
 /// A PR that is not in the queue cannot be cancelled, and is told so — rather
@@ -20227,6 +20313,16 @@ const FIX_FP_BREADCRUMB: &str = include_str!("fixtures/attention/fp-breadcrumb-s
 const FIX_FP_LEADING_PTR: &str = include_str!("fixtures/attention/fp-leading-pointer-prose.txt");
 const FIX_FP_FENCED_PTR: &str = include_str!("fixtures/attention/fp-fenced-pointer-block.txt");
 const FIX_POS_PTR_LAST: &str = include_str!("fixtures/attention/pos-pointer-last-line.txt");
+// #727, from the live repro: a RESUMED pane's restored screen — a finished
+// turn's report, then the CLI's chrome. The input box is a bare `❯` on its own
+// row (Claude Code's empty prompt, under a custom-agent rule), and it is the
+// third-from-last non-empty row, so it lands squarely inside the detector's own
+// last-3-painted-lines pointer window. Nothing on this screen is asking anyone
+// anything; the pane is idle at an empty box. Captured shape, not imagined:
+// this is `get_output`'s render of w-209 in group loomux-68435179, the pane the
+// question gate held for 25 minutes.
+const FIX_FP_RESUMED_IDLE: &str =
+    include_str!("fixtures/attention/fp-resumed-agent-idle-prompt.txt");
 
 #[test]
 fn prompt_wait_detected_fires_on_interactive_question_fixtures() {
@@ -25631,6 +25727,11 @@ fn prompt_wait_detected_ignores_finished_turn_prose_about_ui() {
         ("› UI breadcrumb", FIX_FP_BREADCRUMB),
         ("leading ❯ repro steps", FIX_FP_LEADING_PTR),
         ("fenced ❯ command block", FIX_FP_FENCED_PTR),
+        // #727: not prose about a UI — the CLI's OWN empty input box, whose
+        // prompt glyph is a bare `❯` in the last painted lines. Unlike the four
+        // above it cannot be pushed out of range by anything, because it IS the
+        // thing the CLI redraws underneath.
+        ("empty ❯ prompt box", FIX_FP_RESUMED_IDLE),
     ] {
         assert!(
             !prompt_wait_detected(&strip_ansi(fixture.as_bytes())),
@@ -25686,6 +25787,7 @@ fn attention_does_not_flag_streaming_or_idle_fixtures() {
         FIX_FP_BREADCRUMB,
         FIX_FP_LEADING_PTR,
         FIX_FP_FENCED_PTR,
+        FIX_FP_RESUMED_IDLE,
     ] {
         let tail: HashMap<String, String> =
             [(wid.clone(), strip_ansi(fixture.as_bytes()))].into_iter().collect();
@@ -25846,14 +25948,27 @@ fn pane_attention_inputs_from_strips_ansi_and_skips_agent_ptys() {
     // #40 review: drive the gather wiring with a fake live-ids source. Raw bytes
     // carry ANSI + box drawing; the built tail must be stripped, agent ptys must
     // be skipped (not gathered), and the stripped tail must still detect a prompt.
+    //
+    // #717: the reader is injected rather than pre-read, so this also pins WHAT
+    // the gather asks each pane's ring for — a bounded tail, never the whole
+    // (up to 256 KB) ring — and that an agent pty's ring is never read AT ALL,
+    // which the old shape could only assert by the absence of an output entry.
     let (reg, _d, _g, _w) = attention_setup();
     let raw_menu = FIX_COPILOT_ASK.as_bytes().to_vec();
     let live = vec![
-        (7u32, 42u64, raw_menu.clone(), 0u64),   // a plain pane
-        (5u32, 99u64, raw_menu.clone(), 123u64), // an agent's pty — must be skipped
+        (7u32, 42u64, 0u64),   // a plain pane
+        (5u32, 99u64, 123u64), // an agent's pty — must be skipped
     ];
     let agent_ptys: HashSet<u32> = [5u32].into_iter().collect();
-    let (outs, tails, ins) = reg.pane_attention_inputs_from(&live, &agent_ptys);
+    let requests: std::cell::RefCell<Vec<(u32, usize)>> = std::cell::RefCell::new(Vec::new());
+    let (outs, tails, ins) = reg.pane_attention_inputs_from(
+        &live,
+        |pid, n| {
+            requests.borrow_mut().push((pid, n));
+            Some(raw_menu.clone())
+        },
+        &agent_ptys,
+    );
 
     assert!(!outs.contains_key(&5) && !tails.contains_key(&5), "agent pty must be skipped");
     assert_eq!(outs.get(&7), Some(&42u64));
@@ -25861,6 +25976,102 @@ fn pane_attention_inputs_from_strips_ansi_and_skips_agent_ptys() {
     let tail7 = tails.get(&7).expect("plain pty tail present");
     assert!(!tail7.contains('\u{1b}'), "ANSI escapes must be stripped from the gathered tail");
     assert!(prompt_wait_detected(tail7), "the stripped tail still detects the menu");
+    assert_eq!(
+        *requests.borrow(),
+        vec![(7u32, ATTENTION_SCAN_BYTES)],
+        "the gather must make exactly one BOUNDED read, for the plain pane only: an \
+         unbounded request (or any request at all against the agent's pty) is a whole-ring \
+         clone taken under the same mutex every keystroke takes (#717)"
+    );
+}
+
+#[test]
+fn a_pane_the_scan_cannot_read_still_gets_an_entry_rather_than_vanishing() {
+    // The failure edge of the injected read (#717): a pty that died between
+    // `live_ids` and the tail read hands back `None`. That must not drop the
+    // pane out of the maps — `plain_pane_attention` compares this tick's
+    // output_total against the last one, and a pane that vanishes from `outs`
+    // is a pane whose quiet-streak bookkeeping restarts. An empty tail is the
+    // honest answer (nothing readable => nothing prompt-shaped), and it is what
+    // the pre-#717 `output_tail(pid).unwrap_or_default()` produced too.
+    let (reg, _d, _g, _w) = attention_setup();
+    let live = vec![(9u32, 7u64, 0u64)];
+    let (outs, tails, ins) =
+        reg.pane_attention_inputs_from(&live, |_, _| None, &HashSet::new());
+    assert_eq!(outs.get(&9), Some(&7u64), "an unreadable pane keeps its output counter entry");
+    assert_eq!(ins.get(&9), Some(&0u64));
+    assert_eq!(tails.get(&9).map(String::as_str), Some(""), "and an empty tail, not a missing one");
+    assert!(!prompt_wait_detected(tails.get(&9).unwrap()), "an empty tail is never a question");
+}
+
+#[test]
+fn the_attention_scan_reads_only_the_tail_of_a_saturated_ring_never_the_whole_of_it() {
+    // #717. The attention tick's ring read happens under the global `ptys`
+    // mutex — the same one `write_pty`/`note_user_input` take on every
+    // keystroke, and the same one the pane's reader thread queues behind to
+    // append. It used to clone the WHOLE ring (up to 256 KB) and then slice the
+    // last 4 KB off the result.
+    //
+    // The slice makes the two shapes produce byte-identical text, so no
+    // assertion about the returned STRING can tell them apart. What separates
+    // them is the size of the request, and that is what this pins — against a
+    // real `PtyManager` whose ring is genuinely saturated, so "bounded" is a
+    // measurement and not an arithmetic identity on a short buffer.
+    let pm = PtyManager::default();
+    let pty = 7717u32;
+    pm.register_fake_for_test(pty, b"");
+    // Saturate the ring the way the reader thread does (cap arithmetic and
+    // all), then paint a real question as the last thing on screen.
+    let chunk = vec![b'x'; 64 * 1024];
+    for _ in 0..5 {
+        pm.append_fake_output_for_test(pty, &chunk);
+    }
+    pm.append_fake_output_for_test(pty, FIX_COPILOT_ASK.as_bytes());
+    assert_eq!(
+        pm.output_tail(pty).unwrap().len(),
+        256 * 1024,
+        "the ring must actually be saturated — otherwise a bounded read proves nothing"
+    );
+
+    let requested = std::cell::Cell::new(0usize);
+    let handed_back = std::cell::Cell::new(0usize);
+    let tail = attention_tail(|n| {
+        requested.set(n);
+        let raw = pm.output_tail_bounded(pty, n);
+        handed_back.set(raw.as_ref().map_or(0, Vec::len));
+        raw
+    })
+    .expect("the fake pty is alive");
+
+    assert_eq!(
+        requested.get(),
+        ATTENTION_SCAN_BYTES,
+        "the scan must ask for a bounded tail; asking for the ring is the defect"
+    );
+    assert_eq!(
+        handed_back.get(),
+        ATTENTION_SCAN_BYTES,
+        "and on a saturated ring that request must copy 4 KB under the lock, not 256 KB"
+    );
+    assert!(prompt_wait_detected(&tail), "the bounded tail still carries the live question");
+
+    // The pre-#717 shape, written out as a control rather than described:
+    // clone the whole ring, then slice the same bytes off the end. The text is
+    // IDENTICAL — which is the point. A future edit that reverts the call sites
+    // to `output_tail` is reverting to something this file states the cost of,
+    // and no output assertion anywhere would notice.
+    let whole = pm.output_tail(pty).expect("the fake pty is alive");
+    let start = whole.len().saturating_sub(ATTENTION_SCAN_BYTES);
+    assert_eq!(
+        strip_ansi(&whole[start..]),
+        tail,
+        "bounding the read must not change one byte of what the detectors see"
+    );
+    assert_eq!(
+        whole.len() / handed_back.get(),
+        64,
+        "the copy the old shape made under the lock was 64x this one on a saturated ring"
+    );
 }
 
 #[test]
@@ -31108,6 +31319,119 @@ fn a_timeout_that_cannot_close_its_pipes_parks_its_readers_in_the_backlog() {
     );
 }
 
+/// …and the SAME accounting on the arm that isn't a timeout (#699): when the
+/// wait itself errors, the capture used to return through a bare `?`, which
+/// dropped both readers on the floor. Uncounted is worse than parked, not
+/// better — the ceiling's admission predicate is "how many readers are still
+/// blocked", so readers the sweep can never see are exactly the ones that make
+/// the bound lie about the process it is supposed to bound.
+///
+/// Driven through the injected-wait seam because reaching this arm for real
+/// needs `Child::try_wait` to error, which no supported platform does on
+/// demand; every other step (spawn, readers, kill, reap, accounting) is the
+/// same code the production entry point runs.
+///
+/// Counted on the backlog list **unswept**, and from a drained baseline —
+/// unlike the timeout test above, which can afford a swept before/after delta
+/// because its grandchild holds the pipes open across the whole call. Neither
+/// shortcut survives here, and both were tried:
+/// - a *swept* count reads the same whether the handles were parked or
+///   dropped, because the forced error arrives at once and the kill closes
+///   both pipes within milliseconds. That race was green on macos and red on
+///   ubuntu/windows.
+/// - a *delta* against whatever earlier capture tests left parked is measured
+///   against a baseline the call itself moves: its opening sweep drops the
+///   handles that have since ended (CI: before 4, after 4, with both readers
+///   correctly parked).
+///
+/// So: start from zero and assert the exact number. What is being pinned is
+/// the accounting, not how long the readers happened to survive it.
+#[test]
+fn a_wait_error_parks_both_its_readers_where_the_ceiling_can_see_them() {
+    let _serial = capture_lock();
+    let _drained = drain_parked_readers_for_test();
+    assert_eq!(gh_capture_parked_readers(), 0, "precondition: the baseline this test measures against is empty");
+
+    let err = loomux_lib::orchestration::capture_raw_with_failing_wait_for_test(
+        shell_command(&sleep_script(20)),
+        Duration::from_secs(1),
+    )
+    .expect_err("a wait that fails is a failed capture");
+    assert!(err.contains("forced wait failure"), "precondition: this must be the wait-error arm, not the timeout: {err}");
+
+    assert_eq!(
+        gh_capture_parked_readers(),
+        2,
+        "BOTH readers a failed wait abandons must be handed to the ceiling, not dropped where the \
+         sweep can never see them — one or none is how a bound comes to understate its own backlog"
+    );
+}
+
+/// The other half of "exactly once" (rev-lead N1): the success arm **joins**
+/// both readers, so it must park neither. The two tests above pin "at least
+/// once" on the abandonment arm and say nothing about this one — an edit that
+/// parked the handles on the way out as well as joining them would pass every
+/// other test in this section while growing the backlog on the *healthy* path,
+/// until the ceiling refused captures because captures had been succeeding.
+///
+/// Same instruments as the parking test, for the same reasons: drained
+/// baseline, unswept count.
+#[test]
+fn a_successful_capture_parks_neither_of_its_readers() {
+    let _serial = capture_lock();
+    let _drained = drain_parked_readers_for_test();
+    assert_eq!(gh_capture_parked_readers(), 0, "precondition: the baseline this test measures against is empty");
+
+    let out = OrchRegistry::capture_with_timeout(shell_command("echo loomux-699"), Duration::from_secs(10))
+        .expect("a fast child must succeed");
+    assert!(out.contains("loomux-699"), "precondition: this must be the success arm, not a refusal: {out:?}");
+
+    assert_eq!(
+        gh_capture_parked_readers(),
+        0,
+        "the success arm joins both readers, so it must park neither — a handle both joined and \
+         parked is counted twice, and the ceiling then shrinks on captures that WORKED"
+    );
+}
+
+/// The other half of "abandon" on that arm: the child is KILLED, not simply
+/// forgotten (#699). Dropping a `std::process::Child` does not kill the
+/// process, so the bare-`?` return left a live child behind holding both pipes
+/// — which is also why its readers would never have ended on their own.
+///
+/// Observed through the child's own side effect rather than a PID: the script
+/// writes a sentinel a beat after it starts, so a child that survived the
+/// early return leaves proof, and one that was killed cannot. `current_dir` +
+/// a relative name keeps the redirect target out of the script string, which
+/// `cmd.exe` and `Command`'s MSVC quoting disagree about (see `cat_command`).
+#[test]
+fn a_wait_error_kills_the_child_it_abandons() {
+    let _serial = capture_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let sentinel = dir.path().join("survived.txt");
+    let script = if cfg!(windows) {
+        "ping -n 3 127.0.0.1 >NUL & echo x > survived.txt"
+    } else {
+        "sleep 2; echo x > survived.txt"
+    };
+    let mut cmd = shell_command(script);
+    cmd.current_dir(dir.path());
+
+    let err = loomux_lib::orchestration::capture_raw_with_failing_wait_for_test(cmd, Duration::from_secs(1))
+        .expect_err("a wait that fails is a failed capture");
+    assert!(err.contains("forced wait failure"), "precondition: this must be the wait-error arm: {err}");
+
+    // Well past the child's own delay: if it is still alive it has had every
+    // chance to write, so this cannot pass by being fast.
+    std::thread::sleep(Duration::from_secs(5));
+    assert!(
+        !sentinel.exists(),
+        "the abandoned child must be killed on this arm too — it wrote {} after the capture returned, \
+         so the capture left a live child (and two readers that could never end) behind",
+        sentinel.display()
+    );
+}
+
 /// The intake half's per-scan cap, on a live registry rather than only in the
 /// pure selector: N autonomous groups falling due on one scan wake used to be
 /// 2N sequential `gh` round-trips inside a single tick of the one loop that
@@ -35247,6 +35571,7 @@ fn b1_prompt_wait_match_and_prompt_wait_detected_can_never_disagree() {
         ("fp-breadcrumb", FIX_FP_BREADCRUMB),
         ("fp-leading-ptr", FIX_FP_LEADING_PTR),
         ("fp-fenced-ptr", FIX_FP_FENCED_PTR),
+        ("fp-resumed-idle", FIX_FP_RESUMED_IDLE),
     ] {
         let stripped = strip_ansi(tail.as_bytes());
         assert_eq!(
@@ -36730,6 +37055,168 @@ fn e8_a_plain_pane_holding_a_relayed_notice_raises_no_chip_either() {
     assert!(
         quiet.is_empty(),
         "a plain pane showing only loomux's own notice is not waiting on anything: {quiet:?}"
+    );
+}
+
+// ---------- #727: an empty prompt glyph is not a menu pointer ----------
+//
+// The live incident: a pane resumed from a previous session sat at a visibly
+// idle, empty input box, and the question gate held every delivery to it for
+// 25 minutes — twice, deterministically, on the same session. Three panes were
+// lost to it and two queued deliveries were dropped with them.
+//
+// The phantom question was the CLI's own prompt. Claude Code paints an empty
+// input box as a bare `❯` on its own row, and `leads_with_pointer` read that as
+// a menu's highlighted choice. That poisons BOTH readings at once, which is why
+// nothing could clear it: the ring matched (the glyph is in the last painted
+// lines, and `strip_ansi` concatenates it onto whatever was addressed next), and
+// `pointer_rendered` then found the same bare glyph among the rendered rows, so
+// the grid answered `StillRendered` and #534's release — the only thing that
+// ends a hold without a human — could never fire. A resumed pane makes it
+// permanent: its restored screen is static, so the glyph is never repainted
+// away.
+
+#[test]
+fn f1_the_clis_own_empty_prompt_glyph_is_not_a_menu_pointer() {
+    let tail = strip_ansi(FIX_FP_RESUMED_IDLE.as_bytes());
+
+    // Precondition, and the reason this fixture is not a duplicate of the other
+    // `❯` negatives: those are safe because the CLI's redrawn box pushes the
+    // glyph out of the last-3-painted-lines window. This glyph IS that box, so
+    // it is inside the window by construction and nothing can push it out.
+    let last_painted: Vec<String> = tail
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .rev()
+        .take(3)
+        .collect();
+    assert!(
+        last_painted.iter().any(|l| l == "❯"),
+        "precondition: the bare prompt glyph must be inside the detector's own pointer \
+         window, or this test would pass for the reason the other fixtures pass: {last_painted:?}"
+    );
+
+    assert!(
+        prompt_wait_match(&tail).is_none(),
+        "a pointer with nothing after it points at no option — it is an empty prompt, \
+         and an idle pane is the opposite of a pane parked on a question: {:?}",
+        prompt_wait_match(&tail)
+    );
+}
+
+#[test]
+fn f2_a_resumed_panes_restored_screen_does_not_hold_a_delivery() {
+    // The repro, end to end at the gate that queued the delivery: both
+    // readings of the restored screen, through the production predicate.
+    let raw = FIX_FP_RESUMED_IDLE.as_bytes().to_vec();
+
+    // The grid must be worth reading, or a release here would be the blind-start
+    // hole (`Unreadable` -> the ring's word stands) rather than the fix.
+    let visible = trustworthy_composition(loomux_lib::orchestration::termgrid::render_visible(
+        &raw, 100, 12,
+    ))
+    .expect("precondition: the restored screen composes to a readable grid");
+    assert!(
+        visible.contains("auto mode on"),
+        "precondition: the CLI's chrome is genuinely rendered — this is a live screen, \
+         not an absent one: {visible:?}"
+    );
+
+    let pred =
+        question_hold_predicate_sampled(move || sample_from_raw(&raw, 100, 12), None, None, Vec::new());
+    assert!(
+        !pred(),
+        "a pane idling at an empty input box must take its delivery immediately (#727)"
+    );
+}
+
+#[test]
+fn f3_a_pointer_leading_a_real_option_still_matches_and_still_holds() {
+    // The fail-SAFE direction, which this narrowing must not touch: a pointer
+    // that leads an actual choice is still a menu, on both readings.
+    let m = prompt_wait_match(&strip_ansi(FIX_POS_PTR_LAST.as_bytes()))
+        .expect("a highlighted menu choice is still a question");
+    assert_eq!(m.signal, "pointer-option", "and still THIS signal class");
+
+    for screen in [
+        "❯ Overwrite\n  Keep both",
+        // Framed on BOTH sides — the boxed dialog `deframe` exists for. The
+        // trailing border must not be mistaken for "points at nothing".
+        "│ ❯ Overwrite   │\n│   Keep both   │",
+        // A different glyph, and one sitting far above the chrome: the grid
+        // re-read is spatial (C11), and stays so.
+        "→ 1. retry\n  2. abort\nstatus\nstatus\n> \nready",
+    ] {
+        assert!(
+            match_still_rendered(screen, &m),
+            "a pointer leading an option is still the menu, framed or not: {screen:?}"
+        );
+    }
+
+    // ...and the empty prompt is the ONLY thing that stops being one.
+    for empty in ["❯", "  ❯  ", "│ ❯   │", "›"] {
+        assert!(
+            !match_still_rendered(empty, &m),
+            "a glyph with only framing after it is a prompt, not a choice: {empty:?}"
+        );
+    }
+
+    // End to end on a fully composed screen, so the hold is the production
+    // decision and not just the predicate's opinion about a string.
+    let live = painted(&[
+        "Overwrite the existing file?",
+        "❯ Overwrite",
+        "  Keep both",
+        "",
+        "esc to cancel",
+    ]);
+    let pred = question_hold_predicate_sampled(
+        move || sample_from_raw(&live, 100, 10),
+        None,
+        None,
+        Vec::new(),
+    );
+    assert!(pred(), "a live menu must still hold the delivery (#420)");
+}
+
+#[test]
+fn f4_a_pointer_hold_releases_once_the_menu_gives_way_to_an_idle_prompt() {
+    // The latch itself, at the reading that is supposed to break it.
+    //
+    // The ring matched a genuine pointer menu and, being append-only, goes on
+    // matching it forever; #534 gave the grid the power to end that hold when
+    // the screen no longer shows it. An idle Claude Code pane's own `❯` made
+    // the grid answer `StillRendered` on EVERY screen, so for this signal class
+    // that release was dead code — which is what turned a transient hold into a
+    // 25-minute one.
+    let m = prompt_wait_match(&redraw_fragmented_pointer_tail()).expect("matches on the ring");
+    assert_eq!(m.needle, QuestionNeedle::LeadingPointer, "the class this is about");
+
+    let idle = loomux_lib::orchestration::termgrid::render_visible(
+        FIX_FP_RESUMED_IDLE.as_bytes(),
+        100,
+        12,
+    );
+    assert!(
+        idle.contains('❯'),
+        "precondition: the prompt glyph IS on the screen — the fix is that it is not a \
+         menu, never that it stopped being rendered: {idle:?}"
+    );
+    assert!(
+        !flat_contains_line(&idle, &m.line),
+        "precondition: the concatenated ring needle is not on this screen either"
+    );
+
+    assert_eq!(
+        grid_evidence_for(&m, Some(&idle)),
+        GridEvidence::NotRendered,
+        "the menu is not among the rendered rows, and an empty prompt is not a stand-in for it"
+    );
+    assert!(
+        !question_shown(Some(&m), Some(&idle)),
+        "the dialog cleared — the hold must end without a human (#534's one transition, \
+         which #727 had made unreachable)"
     );
 }
 
