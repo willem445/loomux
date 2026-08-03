@@ -54,7 +54,11 @@
  *  `GIT_TERMINAL_PROMPT=0` suppresses a *terminal* credential prompt, not a GUI
  *  credential helper — so `fetch`/`push`/`pull` against an unreachable remote
  *  can genuinely never return, and an unbounded queue behind one of those is a
- *  suppression with no answer for "the signal never clears" (#496, #513, #518).
+ *  suppression with no answer for "the signal never clears" — INV-6 in
+ *  `doc/design/performance.md` ("any suppression driven by a fallible signal
+ *  has a release that does not depend on that signal"), the invariant behind
+ *  #496, #513 and #518. The release here does not consult the head job at all:
+ *  it is this job's own elapsed wait.
  *
  *  Why abandon rather than release: releasing the waiter would let its `git`
  *  spawn run *concurrently* with the stuck one, which is precisely the race

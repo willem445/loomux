@@ -297,14 +297,22 @@ pub async fn git_status(repo: String) -> Result<GitStatus, String> {
 /// up silently if it cannot lock, while a `commit`/`stage` that cannot lock
 /// fails with "Unable to create '.git/index.lock'".
 ///
-/// The obvious fix does NOT work, which is measured rather than assumed
-/// (`only_git_status_is_protected_from_the_index_write` pins all three cells):
-/// `--no-optional-locks` suppresses the write for `git status`, but `git diff`
-/// rewrites the index with or without it, because `builtin/diff.c` refreshes
-/// through a path that never consults the setting. So the flag is deliberately
-/// NOT passed here — carrying a no-op that reads like protection is worse than
-/// carrying none. `--cached` never writes the index at all, and `commit` mode
-/// (`git show`) and `untracked` never touch it.
+/// The obvious fix does NOT work. `--no-optional-locks` suppresses the write
+/// for `git status` but not for `git diff` — the **evidence** is the measured
+/// matrix in `only_git_status_is_protected_from_the_index_write`, which is what
+/// to re-check if this ever looks wrong. The **explanation**, read in git
+/// v2.47.0 rather than recalled: `builtin/commit.c`'s `cmd_status` guards its
+/// lock with `if (use_optional_locks())`, while `builtin/diff.c` reaches the
+/// index through `refresh_index_quietly()`, which calls
+/// `repo_hold_locked_index(the_repository, &lock_file, 0)` unconditionally —
+/// `use_optional_locks` appears nowhere in that file. Same call, one guarded
+/// and one not. (That `0` is also why the writer is the loser: a diff that
+/// cannot lock hits `if (fd < 0) return;` and gives up silently, where a
+/// `commit`/`stage` that cannot lock fails loudly.)
+///
+/// So the flag is deliberately NOT passed here — carrying a no-op that reads
+/// like protection is worse than carrying none. `--cached` never writes the
+/// index at all, and `commit` mode (`git show`) and `untracked` never touch it.
 ///
 /// The residual is therefore real, accepted rather than fixed, and tracked as
 /// #754; it is argued where it belongs, in `run_blocking`'s note on why reads
@@ -2071,12 +2079,24 @@ mod tests {
     /// The uncomfortable cell is deliberate: `git diff` on the worktree DOES
     /// rewrite the index, and `--no-optional-locks` does not stop it (verified
     /// both ways — CI run 30783307529 failed an assertion claiming otherwise on
-    /// all three platforms while the flag was being passed). `builtin/diff.c`
-    /// refreshes through a path that never consults the setting, so the flag is
-    /// not passed there and this test pins the fact the design has to live
-    /// with. If a future git starts honouring it, THIS TEST FAILS — which is
-    /// the point: that is the day the read/write overlap note in
-    /// `run_blocking`'s doc can be revisited.
+    /// all three platforms while the flag was being passed). So the flag is not
+    /// passed there, and this test pins the fact the design has to live with.
+    ///
+    /// That `assert_ne!` is also the **fixture's vacuity guard**. All three
+    /// cells depend on `stat_dirty_index` actually producing a stat-dirty
+    /// entry; if it ever stopped — a git change, a filesystem that quantises
+    /// the backdated mtime away — the two `assert_eq!` cells would pass while
+    /// measuring nothing. The `assert_ne!` is the one that reddens instead, so
+    /// the quiet cells cannot rot silently.
+    ///
+    /// **If the `assert_ne!` fails, do this** (you will not be me, and "good
+    /// news" without an instruction reads like a flake): first check the
+    /// fixture per the paragraph above — a dead fixture and a fixed git look
+    /// identical from here, and only one of them is good news. If the fixture
+    /// is sound, git stopped taking the lock: flip the assertion, revisit #754
+    /// (it may be closable outright), and re-decide the read-exclusion note in
+    /// `run_blocking`'s doc, which currently accepts a residual that would no
+    /// longer exist.
     #[test]
     fn only_git_status_is_protected_from_the_index_write() {
         let repo = new_repo();
