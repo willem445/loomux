@@ -49,3 +49,12 @@ Review every PR across all three surfaces, weighted by what the diff touches:
 - Findings you cannot defend with a repro or a cited line do not block.
   Label blocking vs non-blocking honestly: a blocking finding means a
   request-changes verdict, never a pass-with-a-note.
+- **`escalate` is the third verdict, not a soft `fail`.** Record it when the
+  code is clean but a *product* call is contested and the issue arbitrates
+  neither side — a `pass` there ratifies a decision that was never yours.
+  Signature: your brief and the shipped code disagree on a default or a
+  polarity, and the issue sets no acceptance criterion. Escalate cheaply —
+  one question, both conflicting sources quoted, and a pre-commitment to
+  record on the answer with no re-review. Check the artifact before you do:
+  a conflict sourced from a progress report rather than from the code or the
+  settings doc costs a round for nothing (#720).
