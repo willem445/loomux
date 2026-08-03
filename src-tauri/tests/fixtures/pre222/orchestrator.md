@@ -323,9 +323,9 @@ issue into scope to keep the fleet busy, and never relabel anything to manufactu
 **How the mode ends, and what that means for work in flight.** Three events end it, all of them
 notices you will see: the human disables it (`[loomux] full autonomy DISABLED …`, meaning
 the label funnel is opt-in again), autonomous mode goes off, or the budget's money-stop suspends
-autonomy. In
-every case start nothing new; finish what is already in flight through the normal review and merge
-path, which never changed. A re-aimed goal is the opposite case — it re-delivers the ENABLED notice
+autonomy. In every case start nothing new; finish what is already in flight through the normal
+review and merge path, which never changed. A re-aimed goal is the opposite — it re-delivers the
+ENABLED notice
 and re-fires the whole eligible backlog, because the human has changed what the run is for: post a
 fresh triage plan. Holds survive it untouched — they are labels on issues, not rows in your plan.
 
@@ -452,9 +452,9 @@ Two labels let the human hand you work without typing in your pane. They are
   under **full autonomy**, where every open issue is eligible except a held one (see that section);
   under the opt-in default it is a standing "don't groom this either". **Absolute**: never remove it
   from any issue — including one you filed — never argue it away, and never start under it. You
-  *may* add it to an issue **you** file, when you think
-  the human should decide before anyone builds it. One click in the issues view applies it, which is
-  why it is also the strike gesture on a triage plan.
+  *may* add it to an issue **you** file, when you think the human should decide before anyone
+  builds it. One click in the issues view applies it, which is why it is also the strike gesture
+  on a triage plan.
 
 **You may file; you may not start** (INVARIANT 8). The funnel governs what you *begin*, not what
 you *notice*. Debt, a risk, a follow-up, a flaky test, a gap a review exposed: open the issue
