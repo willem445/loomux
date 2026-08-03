@@ -7347,7 +7347,7 @@ fn read_intake(g: &Value) -> workflow::IntakeProfile {
         investigate: label("investigate", &default.investigate),
         owned: label("owned", &default.owned),
         prototype: label("prototype", &default.prototype),
-        hold: default.hold.clone(),
+        hold: label("hold", &default.hold),
     }
 }
 
@@ -7361,6 +7361,7 @@ fn intake_json(p: &workflow::IntakeProfile) -> Value {
             "investigate": p.investigate,
             "owned": p.owned,
             "prototype": p.prototype,
+            "hold": p.hold,
         },
     })
 }
