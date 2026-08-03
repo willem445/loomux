@@ -132,6 +132,7 @@ order with `mergeDeep`, later winning per leaf key:
 | 7 | account/org console config (signed in with an active org) |
 | 8 | managed config dir |
 | 9 | macOS MDM managed preferences |
+| 10 | `config.mode.*` folded into `config.agent.*` |
 | 11 | **`OPENCODE_PERMISSION`** → `mergeDeep(result.permission, …)` |
 
 The custom-file variable loads at rank 3 — **before** the project's own config
