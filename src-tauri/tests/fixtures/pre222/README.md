@@ -507,6 +507,29 @@ so far:
   CI**). INVARIANTS and every other section are otherwise untouched — this only moves what
   a fresh session hits first.
 
+- **#778, the consent boundary points both ways** — `orchestrator.md` only (`worker.md`/
+  `reviewer.md`/`planner.md` neither start work nor read the funnel, and did not move). Full
+  autonomy inverts the start default for a group: every open issue becomes eligible except the
+  ones the human held. Nothing host-side blocks a start — the funnel has always been
+  contract-enforced, and the *enforced* boundary stays ship-side in the `gh` shim — so under this
+  mode the template text **is** the consent boundary, which is why the re-bless is the review
+  surface for the whole feature. **INVARIANT 8** is rewritten to state both directions: opt-in is
+  still the default (including plain autonomous mode), and full autonomy applies only when the
+  kickoff config or a `[loomux] FULL AUTONOMY ENABLED` notice says so, with `agent-hold`, a struck
+  triage row, and an untriaged pre-existing issue as the three exceptions to eligibility — closing
+  on the sentence the rest of the feature hangs off: it widens what may be **started**, never what
+  may be **shipped**. A new **Full autonomy** subsection under **Autonomous mode (idle-tick)**
+  carries the operational half: post one ranked triage plan over all open issues and wait for an
+  explicit go before touching the pre-existing backlog; read the `issue #N eligible under
+  full-autonomy` wake lines (and treat a `PARTIAL` summary as a backlog the poller did not fully
+  see, so a plan built on it says so); select in a stated priority order (board order, milestone/
+  priority label, `agent-ready`, then a value judgment against the goal); announce a one-line
+  rationale per pickup in the pane and as the board task's first note; park an out-of-goal issue
+  at the bottom of the board rather than starting or holding it; stop when the queue empties; and
+  start nothing new once a disable, an autonomous-off or the budget money-stop ends the mode. A
+  fourth **Label signals** row states `agent-hold` itself: absolute, never removed by an agent,
+  addable only to an issue the agent filed.
+
 `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was` renders
 **these** with the six pre-#222 template variables and asserts that a group launched
 with the advanced orchestrator **off** gets exactly that text. They are the
@@ -529,8 +552,9 @@ a human, not a re-run.
 
   **A plain `cp` of the live template is wrong**, and it fails in a way that hides its
   own cause. These files are the live template *minus* the key(s) `LIVE` lists for it
-  in `tests/workflow.rs` — `{{WORKFLOW}}` and `{{POST_MERGE_WORKFLOW_HOOK}}` for
-  `orchestrator.md`, `{{BLOCK_NOTE}}{{ADVISOR_CONSULT_NOTE}}` for `worker.md`,
+  in `tests/workflow.rs` — read that array, not this sentence, which is a copy of it and
+  has been stale before: `{{WORKFLOW}}`, `{{POST_MERGE_WORKFLOW_HOOK}}` and `{{MERGE_QUEUE}}`
+  for `orchestrator.md`, `{{BLOCK_NOTE}}{{ADVISOR_CONSULT_NOTE}}` for `worker.md`,
   `{{BLOCK_NOTE}}` for `reviewer.md` and `planner.md` — because
   `a_workflow_placeholder_must_sit_at_the_end_of_a_line_it_shares` asserts exactly
   "live, stripped of its keys, equals the golden". The *legacy* vars (`{{GROUP_ID}}`,
@@ -568,7 +592,7 @@ substitution `render_with_legacy_vars` does, not a text filter:
 
 ```sh
 python -c "
-keys={'orchestrator':['{{WORKFLOW}}','{{POST_MERGE_WORKFLOW_HOOK}}'],
+keys={'orchestrator':['{{WORKFLOW}}','{{POST_MERGE_WORKFLOW_HOOK}}','{{MERGE_QUEUE}}'],
       'worker':['{{BLOCK_NOTE}}','{{ADVISOR_CONSULT_NOTE}}'],
       'reviewer':['{{BLOCK_NOTE}}'],'planner':['{{BLOCK_NOTE}}']}
 for f,ks in keys.items():
