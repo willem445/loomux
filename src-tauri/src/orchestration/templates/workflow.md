@@ -32,7 +32,10 @@ of them). A `fail` or `escalate` from **any** named reviewer refuses the merge w
 others recorded — first-to-approve never wins. Read the state with **`list_verdicts(pr)`**: it
 is what the interceptor reads, and it tells you whether a merge is possible before you attempt
 one. A reviewer's `[loomux] … recorded verdict …` message in your pane is a courtesy copy;
-`list_verdicts` is the truth.
+`list_verdicts` is the truth. **Pass the pr.** `list_verdicts(pr)` is the norm and the bare
+`list_verdicts()` is a deliberate, rare choice — a cold start, or a sweep for verdicts you have
+lost track of — because the no-arg form re-resolves EVERY PR this group has recorded a verdict
+on through live `gh` calls, and so gets slower the longer the group runs.
 
 Three things follow, and each of them bites if you learn it the hard way:
 
