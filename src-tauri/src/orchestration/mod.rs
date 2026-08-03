@@ -9125,7 +9125,9 @@ pub struct OrchRegistry {
     creation: Mutex<()>,
     /// Serializes a durable per-group **marker toggle** — the set mutation and
     /// the marker file write/remove that makes it survive a restart — as one
-    /// unit (#743 S7 rev-231 N1). `set_notify` / `set_spawn_expanded`.
+    /// unit (#743 S7 rev-231 N1). `set_notify` / `set_spawn_expanded`, and since
+    /// #762 the four **consent** toggles: `set_autonomous_as`, `set_auto_merge`,
+    /// `set_auto_release`, `set_dangerous_mode`.
     ///
     /// **Why a second lock rather than just holding the set's.** The marker
     /// file is load-time truth: it is what rebuilds the set at startup, so a
@@ -9147,6 +9149,32 @@ pub struct OrchRegistry {
     /// change is safe by construction (its re-check), and this is held to the
     /// same standard rather than a weaker one.
     ///
+    /// **#762 is the caller that paragraph predicted, and the consent toggles
+    /// joined for the reason it gives.** They have the identical shape — reserve
+    /// in a set, then write or remove a marker — and their divergence is worse
+    /// than a stale badge: a disable racing an enable removes a marker that has
+    /// not been written yet (`remove_marker` maps NotFound to Ok), clears the
+    /// set, and lets the enable recreate the file afterwards. Memory then says
+    /// OFF while disk says ON, and the next restart's re-seed reads DISK —
+    /// restoring merge, release or autonomous authority the human explicitly
+    /// withdrew, audited as a benign `*-resumed`. Found in review of #762
+    /// (rev-260 B1) against a paragraph that had claimed it was impossible.
+    ///
+    /// The enable arm of `set_autonomous_as` computes its budget anchor
+    /// (`group_token_total`, a usage aggregation over every pane) inside this
+    /// window, deliberately: it is the widest part of the reserve-to-write gap,
+    /// so excluding it would protect the narrow half and ship the wide one. The
+    /// cost is that another toggle can wait behind it — a human click behind a
+    /// human click's work, never a poll or a paint, and never a pty write, since
+    /// every delivery is outside the guard (§2 P6).
+    ///
+    /// **`suspend_autonomous` deliberately does NOT take this lock**, so the
+    /// idle-tick budget money-stop can never wait on a human's toggle. The
+    /// enable-vs-suspend interleave it leaves is the one variant that IS
+    /// reconciled at restart: a suspension co-writes `autonomy_suspended`, and
+    /// `create_group`'s re-seed checks that marker first and forces the group
+    /// back OFF regardless of a surviving `autonomous` marker.
+    ///
     /// Lock order: `marker_io` is taken FIRST and outermost — the set locks
     /// and `AUDIT_LOCK` are taken under it, never the reverse. One lock for
     /// both toggles, not one per group: these fire on a human's click.
@@ -9155,8 +9183,60 @@ pub struct OrchRegistry {
     /// divergence, and are NOT folded in here — they predate this slice
     /// (indeed the census cites `pause_group` as the pattern this drifted
     /// from), and `resume_group` does far more than marker IO, so bringing it
-    /// under one lock is its own argument, not this change's.
+    /// under one lock is its own argument, not this change's. That still holds
+    /// after #762: a pause marker that disagrees with memory costs a suppressed
+    /// or duplicated delivery, not a restored authority, which is why the
+    /// consent toggles were worth the widening and these two are still not.
     marker_io: Mutex<()>,
+    /// Serializes a live **guardrail** edit — the `group.json` read-modify-write
+    /// and the in-memory publish that follows it — as one unit (#762, F2 of
+    /// #743). `set_max_agents`, `set_advanced_orchestrator`, and every
+    /// `persist_guardrail_*` setter (budget, idle tick, activity floor, the four
+    /// compact-nudge knobs).
+    ///
+    /// **What it is protecting, precisely.** Each of those setters is a
+    /// read-modify-write of ONE file: read `group.json`, patch one key, write
+    /// the whole document back. Two of them running at once on the same group
+    /// both read the pre-state, and the second write silently drops the first
+    /// one's key — the classic lost update, on the file that carries the
+    /// group's identity and its consent-bearing guardrails. Serializing the
+    /// publish too (not just the write) is what keeps disk and memory from
+    /// settling in opposite orders: without it, A-persists, B-persists,
+    /// B-publishes, A-publishes leaves the file saying 5 and the enforcement
+    /// path reading 3, and nothing re-reads the file until the next restart.
+    ///
+    /// **Why this is a new lock and not a pre-existing one.** It is [`Self::
+    /// marker_io`]'s argument applied to the other durable per-group store, and
+    /// it exists for the same reason: until #762 every one of these setters was
+    /// a *sync* `#[tauri::command]`, so the single webview thread serialized
+    /// them for free and the interleave could not occur. That was a fact about
+    /// the callers, not about the code — and #762 is exactly the change that
+    /// invalidates it. `atomic_write`'s own doc already states the shipped
+    /// position that `group.json` has concurrent writers and must therefore
+    /// never share a temp name; this is the other half of that, for the
+    /// read-modify-write the unique temp name cannot make atomic.
+    ///
+    /// Lock order: taken FIRST and outermost — the `groups` lock and
+    /// `AUDIT_LOCK` may be taken under it, never the reverse — and released
+    /// before any pane delivery or merge-gate sync, so nothing waits on it
+    /// across a write into a pty. One lock for the family rather than one per
+    /// group: these fire on a human's click.
+    ///
+    /// **This is file IO under a lock, which INV-5 permits only with the
+    /// question answered rather than dodged.** The invariant's rule is "no file
+    /// IO under a lock a *poll path* takes", and no poll path takes this one —
+    /// it is reachable only from the nine live guardrail setters, each a human
+    /// gesture. The reads those setters race with (`group`, `workflow_status`,
+    /// the idle-tick and compact-nudge passes) go to the in-memory guardrails
+    /// and take the `groups` lock, which stays a leaf held for one lookup. So
+    /// the cost of holding this across a small-file rewrite is paid by the next
+    /// *click*, never by a tick or a paint.
+    ///
+    /// **Not** taken by `create_group`'s first write of `group.json` (under
+    /// `creation`, §4 X6) or by the marker toggles: a group being created has
+    /// no guardrail UI to race, and a marker file is a different store with its
+    /// own ordering lock.
+    group_file_io: Mutex<()>,
     /// Test seam (#222): when set, `pr_head` returns this instead of shelling out
     /// to `gh pr view --json headRefOid`. The verdict↔revision binding has to be
     /// exercised through the real MCP dispatch against a repo that isn't on GitHub;
@@ -19408,6 +19488,7 @@ impl OrchRegistry {
             default_branch_memo: Mutex::new(HashMap::new()),
             creation: Mutex::new(()),
             marker_io: Mutex::new(()),
+            group_file_io: Mutex::new(()),
             pr_head_override: Mutex::new(None),
             pr_body_override: Mutex::new(None),
             paused: Mutex::new(HashSet::new()),
@@ -24195,7 +24276,27 @@ impl OrchRegistry {
             killed_by: None,
         };
         self.agents.lock_safe().insert(agent_id.clone(), entry);
-        self.by_pty.lock_safe().insert(pty_id, agent_id.clone());
+        // Claim the pty as ONE decision, and let the loser of a race roll its
+        // own entry back. The `by_pty` read at the top of this function makes
+        // the ordinary re-adopt cheap; it does not make the mint idempotent,
+        // because check-then-insert is two lock acquisitions with a mint
+        // between them. What used to close that window was the webview thread
+        // — a second Connect gesture could not be *inside* the first call —
+        // and #762 takes that away, so the vacant-entry insert becomes the
+        // whole decision: exactly one adopt of a pty wins, and the loser
+        // returns the winner's id instead of leaving a second delivery-only
+        // identity for one pane in the roster.
+        let winner = match self.by_pty.lock_safe().entry(pty_id) {
+            std::collections::hash_map::Entry::Occupied(e) => e.get().clone(),
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert(agent_id.clone());
+                agent_id.clone()
+            }
+        };
+        if winner != agent_id {
+            self.agents.lock_safe().remove(&agent_id);
+            return Ok(json!({ "agent_id": winner }));
+        }
         self.audit(SOLO_GROUP, "human", "solo-adopt", json!({ "agent": agent_id, "pty_id": pty_id }));
         Ok(json!({ "agent_id": agent_id }))
     }
@@ -26435,59 +26536,90 @@ impl OrchRegistry {
     fn set_autonomous_as(&self, group: &str, on: bool, actor: &str) -> Result<(), String> {
         let dir = self.group_dir(group);
         if on {
-            // Reserve the enable atomically (L1): a single `insert` decides who
-            // proceeds, so a concurrent/duplicate enable can't double-anchor or
-            // race the marker write. Only the first caller (newly inserted) writes
-            // the anchor + marker; anyone else sees it already on and no-ops.
-            let newly = self.autonomous_groups.lock_safe().insert(group.to_string());
-            if !newly {
-                return Ok(()); // already on — don't re-anchor
-            }
-            // Anchor = spend at enable time, so the budget delta starts at 0.
-            // Computed without holding the set lock (group_usage takes its own).
-            let anchor = self.group_token_total(group);
-            if let Err(e) = fs::create_dir_all(&dir)
-                .and_then(|_| fs::write(dir.join("autonomous"), anchor.to_string()))
             {
-                // Roll back the reservation so memory never claims ON without a
-                // durable marker (a lost enable is the safe direction — it fails
-                // OFF and re-asks for consent — but we still surface the failure).
-                self.autonomous_groups.lock_safe().remove(group);
-                return Err(format!("failed to enable autonomous mode: {e}"));
+                // #762 rev-260 B1: the reserve and the marker write are ONE unit,
+                // ordered by `marker_io`. The set `insert` alone decides *who*
+                // proceeds, but it does not decide *when* the file lands — the set
+                // lock is released the moment the statement ends, and everything
+                // between it and the write used to be protected only by the fact
+                // that both callers were sync commands on the webview thread. This
+                // conversion removes that, and the resulting interleave is not
+                // benign: a disable running inside this window removes a marker
+                // that is not there yet (`remove_marker` maps NotFound to Ok),
+                // clears the set, and then THIS write recreates the marker — memory
+                // OFF, consent marker on disk, autonomous mode resurrected at the
+                // next restart's re-seed without the human ever re-consenting.
+                //
+                // The anchor computation is deliberately INSIDE the window. It is
+                // the widest part of it (a full usage aggregation over every pane),
+                // so leaving it out would be protecting the narrow half and
+                // shipping the wide one.
+                let _io = self.marker_io.lock_safe();
+                // Reserve the enable atomically (L1): a single `insert` decides who
+                // proceeds, so a concurrent/duplicate enable can't double-anchor or
+                // race the marker write. Only the first caller (newly inserted) writes
+                // the anchor + marker; anyone else sees it already on and no-ops.
+                let newly = self.autonomous_groups.lock_safe().insert(group.to_string());
+                if !newly {
+                    return Ok(()); // already on — don't re-anchor
+                }
+                // Anchor = spend at enable time, so the budget delta starts at 0.
+                // Computed without holding the set lock (group_usage takes its own).
+                let anchor = self.group_token_total(group);
+                if let Err(e) = fs::create_dir_all(&dir)
+                    .and_then(|_| fs::write(dir.join("autonomous"), anchor.to_string()))
+                {
+                    // Roll back the reservation so memory never claims ON without a
+                    // durable marker (a lost enable is the safe direction — it fails
+                    // OFF and re-asks for consent — but we still surface the failure).
+                    self.autonomous_groups.lock_safe().remove(group);
+                    return Err(format!("failed to enable autonomous mode: {e}"));
+                }
+                // A genuine (re-)enable resolves any prior budget suspension: clear the
+                // suspended marker so the UI stops flagging it. Best-effort — it's a
+                // UI hint, and `autonomy_state` only reports suspended while OFF anyway.
+                let _ = remove_marker(&dir.join("autonomy_suspended"));
+                self.audit(group, actor, "autonomous-on",
+                    json!({ "budget_anchor_tokens": anchor }));
             }
-            // A genuine (re-)enable resolves any prior budget suspension: clear the
-            // suspended marker so the UI stops flagging it. Best-effort — it's a
-            // UI hint, and `autonomy_state` only reports suspended while OFF anyway.
-            let _ = remove_marker(&dir.join("autonomy_suspended"));
-            self.audit(group, actor, "autonomous-on",
-                json!({ "budget_anchor_tokens": anchor }));
+            // Outside the guard: this delivers a notice into a pane, and a full
+            // pipe parks the writer (performance.md §2 P6). Nothing that can block
+            // on an agent's terminal belongs under a process-global lock.
+            //
             // Mutual exclusion (#83): supervised dangerous mode is the *not*-
             // autonomous manual mode, so enabling autonomous force-clears it
             // (audited + human-visible notice).
             self.force_disable_dangerous_mode(group, actor, "autonomous-enabled", true);
         } else {
-            if !self.autonomous_groups.lock_safe().contains(group) {
-                return Ok(()); // already off
+            {
+                // Same unit as the enable arm above, in the mirror direction: the
+                // marker removal and the set removal cannot be split by a racing
+                // enable.
+                let _io = self.marker_io.lock_safe();
+                if !self.autonomous_groups.lock_safe().contains(group) {
+                    return Ok(()); // already off
+                }
+                // Remove the durable marker FIRST and fail the call if it doesn't go
+                // (L2): a surviving marker would silently re-enable autonomous mode on
+                // the next restart's re-seed without renewed consent. Only flip the
+                // in-memory flag once disk agrees, so a failed disable leaves state
+                // consistently ON (matching the marker the human still sees).
+                if let Err(e) = remove_marker(&dir.join("autonomous")) {
+                    self.audit(group, actor, "autonomous-off-failed", json!({ "error": e }));
+                    return Err(format!(
+                        "couldn't disable autonomous mode: the consent marker could not be \
+                         removed, so it stays ON — retry or check disk/permissions"
+                    ));
+                }
+                self.autonomous_groups.lock_safe().remove(group);
+                // Clear the idle-tick latch so a later re-enable starts clean.
+                self.clear_idle_tick_latch(group);
+                self.audit(group, actor, "autonomous-off", json!({}));
             }
-            // Remove the durable marker FIRST and fail the call if it doesn't go
-            // (L2): a surviving marker would silently re-enable autonomous mode on
-            // the next restart's re-seed without renewed consent. Only flip the
-            // in-memory flag once disk agrees, so a failed disable leaves state
-            // consistently ON (matching the marker the human still sees).
-            if let Err(e) = remove_marker(&dir.join("autonomous")) {
-                self.audit(group, actor, "autonomous-off-failed", json!({ "error": e }));
-                return Err(format!(
-                    "couldn't disable autonomous mode: the consent marker could not be \
-                     removed, so it stays ON — retry or check disk/permissions"
-                ));
-            }
-            self.autonomous_groups.lock_safe().remove(group);
-            // Clear the idle-tick latch so a later re-enable starts clean.
-            self.clear_idle_tick_latch(group);
-            self.audit(group, actor, "autonomous-off", json!({}));
             // Dependency (#83): auto-merge AND auto-release exist only in autonomous
             // mode, so turning autonomous OFF force-disables both unconditionally
-            // (rev-79 F4) — the pair can never be gate-on/autonomous-off.
+            // (rev-79 F4) — the pair can never be gate-on/autonomous-off. Both
+            // deliver, so both stay outside the guard.
             self.force_disable_auto_merge(group, actor, "autonomous-disabled");
             self.force_disable_auto_release(group, actor, "autonomous-disabled");
         }
@@ -26508,6 +26640,17 @@ impl OrchRegistry {
     /// one audited notice so the running orchestrator learns the new gate.
     pub fn set_auto_merge(&self, group: &str, on: bool) -> Result<(), String> {
         let dir = self.group_dir(group);
+        // #762 rev-260 B1: `marker_io` makes the dependency check, the reserve and
+        // the marker write one unit — see `set_autonomous_as` for the interleave
+        // this closes and why the set lock alone cannot. Released before the
+        // notice below, which writes into a pane (§2 P6).
+        //
+        // Holding the `is_autonomous` check inside the same window also closes the
+        // HUMAN-vs-human half of #788: an autonomous-off cannot now land between
+        // this check and this reserve, because that path takes the same lock for
+        // its own marker region. #788 stays open for the idle-tick half
+        // (`suspend_autonomous`), which deliberately does not take this lock.
+        let _io = self.marker_io.lock_safe();
         if on {
             // Dependency (#83): auto-merge authority exists ONLY in autonomous mode.
             // Reject enabling it while autonomous is off so the pair can never be
@@ -26548,6 +26691,7 @@ impl OrchRegistry {
             self.auto_merge_groups.lock_safe().remove(group);
             self.audit(group, "human", "auto-merge-off", json!({}));
         }
+        drop(_io);
         // Tell the running orchestrator the gate moved (best-effort; a dead/paused
         // orchestrator just misses it and re-reads its kickoff config on resume).
         let _ = self.deliver_to_orchestrator(group, &auto_merge_notice(on), "loomux");
@@ -26568,6 +26712,10 @@ impl OrchRegistry {
     /// audited notice to the orchestrator.
     pub fn set_auto_release(&self, group: &str, on: bool) -> Result<(), String> {
         let dir = self.group_dir(group);
+        // #762 rev-260 B1: same unit and same reason as `set_auto_merge` — this
+        // marker carries release/tag authority, so the interleave that resurrects
+        // a withdrawn one at restart is the same defect wearing a different name.
+        let _io = self.marker_io.lock_safe();
         if on {
             // Same dependency as auto-merge: auto-release authority exists ONLY in
             // autonomous mode, so the pair can never be auto_release-on/autonomous-off.
@@ -26604,6 +26752,7 @@ impl OrchRegistry {
             self.auto_release_groups.lock_safe().remove(group);
             self.audit(group, "human", "auto-release-off", json!({}));
         }
+        drop(_io);
         let _ = self.deliver_to_orchestrator(group, &auto_release_notice(on), "loomux");
         Ok(())
     }
@@ -26624,6 +26773,14 @@ impl OrchRegistry {
     /// bypass class as grant files, closed by a machine account).
     pub fn set_dangerous_mode(&self, group: &str, on: bool) -> Result<(), String> {
         let dir = self.group_dir(group);
+        // #762 rev-260 B1/B2: same unit as the two gates above. This one is the
+        // clearest case of the conversion CREATING the exposure rather than
+        // widening it — `force_disable_dangerous_mode` has exactly one call site
+        // (`set_autonomous_as`'s enable arm) and no background path reaches it, so
+        // until this commit the webview thread really was the only thing keeping
+        // two dangerous-mode toggles from interleaving. It is restored here rather
+        // than argued away.
+        let _io = self.marker_io.lock_safe();
         if on {
             // Mutual exclusion: dangerous mode is the *supervised, not-autonomous*
             // mode. Reject enabling it while autonomous is on.
@@ -26660,6 +26817,7 @@ impl OrchRegistry {
             self.dangerous_groups.lock_safe().remove(group);
             self.audit(group, "human", "dangerous-mode-off", json!({ "reason": "human" }));
         }
+        drop(_io);
         let _ = self.deliver_to_orchestrator(group, &dangerous_mode_notice(on, false), "loomux");
         Ok(())
     }
@@ -26720,6 +26878,7 @@ impl OrchRegistry {
     /// raising the budget after a suspension lets the human resume without losing
     /// the already-counted spend. Returns the applied value.
     pub fn set_autonomy_budget(&self, group: &str, tokens: u64) -> Result<u64, String> {
+        let _io = self.group_file_io.lock_safe();
         let old = self
             .group(group)
             .ok_or("unknown group")?
@@ -26749,6 +26908,7 @@ impl OrchRegistry {
     /// loop reads it fresh each pass) and persisted, then audited. Returns the
     /// applied (clamped) value — lets the human drop it to 1–2 min to verify.
     pub fn set_idle_tick_minutes(&self, group: &str, minutes: u32) -> Result<u32, String> {
+        let _io = self.group_file_io.lock_safe();
         let applied = if minutes == 0 {
             DEFAULT_IDLE_TICK_MINUTES
         } else {
@@ -26787,6 +26947,7 @@ impl OrchRegistry {
     /// applied (clamped) value — raise it if a chatty CLI's idle repaints starve the
     /// tick, lower it if real small outputs read as idle.
     pub fn set_idle_activity_floor(&self, group: &str, bytes: u64) -> Result<u64, String> {
+        let _io = self.group_file_io.lock_safe();
         let applied = if bytes == 0 {
             DEFAULT_IDLE_ACTIVITY_FLOOR_BYTES
         } else {
@@ -26846,13 +27007,18 @@ impl OrchRegistry {
                 obj.insert("guardrails".into(), json!({ key: value }));
             }
         }
+        // Crash-safe write, exactly as `persist_max_agents` and
+        // `persist_advanced_orchestrator` do it — this was the one `group.json`
+        // writer still hand-rolling a temp-and-rename against a FIXED sibling
+        // name (`group.json.tmp`) and without an fsync. Both mattered once
+        // these setters left the webview thread (#762): a shared temp name is
+        // what `atomic_write`'s own doc says concurrent writers to this file
+        // must not have, and the missing fsync is #133's disk-full hole. The
+        // read-modify-write above is serialized by `group_file_io`; this makes
+        // the write half match the rest of the family rather than differ from
+        // it for no reason anybody could state.
         let body = serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?;
-        let tmp = dir.join("group.json.tmp");
-        fs::write(&tmp, &body).map_err(|e| e.to_string())?;
-        if fs::rename(&tmp, &path).is_err() {
-            fs::write(&path, &body).map_err(|e| e.to_string())?;
-            let _ = fs::remove_file(&tmp);
-        }
+        atomic_write(&path, body.as_bytes()).map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -26864,6 +27030,7 @@ impl OrchRegistry {
     /// (the compact-nudge loop reads it fresh each pass) and persisted, then
     /// audited. Returns the applied (clamped) value.
     pub fn set_compact_nudge_minutes(&self, group: &str, minutes: u32) -> Result<u32, String> {
+        let _io = self.group_file_io.lock_safe();
         let applied = minutes.min(MAX_COMPACT_NUDGE_MINUTES);
         let old = self
             .group(group)
@@ -26891,6 +27058,7 @@ impl OrchRegistry {
     /// `["orchestrator"]` if empty) since a live setter bypasses `clamped()`.
     /// Persisted + audited. Returns the applied set.
     pub fn set_compact_nudge_roles(&self, group: &str, roles: Vec<String>) -> Result<Vec<String>, String> {
+        let _io = self.group_file_io.lock_safe();
         let applied = canonicalize_compact_nudge_roles(roles);
         let old = self
             .group(group)
@@ -26919,6 +27087,7 @@ impl OrchRegistry {
     /// shape as `compact_nudge_minutes`. Written to the in-memory guardrail
     /// and persisted, then audited. Returns the applied (clamped) value.
     pub fn set_compact_context_threshold(&self, group: &str, percent: u32) -> Result<u32, String> {
+        let _io = self.group_file_io.lock_safe();
         let applied = percent.min(MAX_COMPACT_CONTEXT_THRESHOLD_PERCENT);
         let old = self
             .group(group)
@@ -26950,6 +27119,7 @@ impl OrchRegistry {
     /// (clamped) value. Never gates `request_compact` itself — see
     /// `compact_nudge_context_floor_met`'s doc.
     pub fn set_compact_nudge_min_context_percent(&self, group: &str, percent: u32) -> Result<u32, String> {
+        let _io = self.group_file_io.lock_safe();
         let applied = percent.min(100);
         let old = self
             .group(group)
@@ -27218,6 +27388,7 @@ impl OrchRegistry {
         if !(1..=MAX_AGENTS_CEILING).contains(&n) {
             return Err(format!("max agents must be between 1 and {MAX_AGENTS_CEILING}"));
         }
+        let _io = self.group_file_io.lock_safe();
         let info = self.group(group).ok_or("unknown group")?;
         let old = info.guardrails.max_agents;
         if n == old {
@@ -27370,8 +27541,15 @@ impl OrchRegistry {
     /// `orch_workflow_status` reads, so the toggle's own confirm and a later
     /// status poll can never disagree.
     pub fn set_advanced_orchestrator(&self, group: &str, on: bool, actor: &str) -> Result<Value, String> {
+        // `group_file_io` covers the whole decide-persist-publish window (its
+        // doc has the argument), so the flag this reads is the flag the write
+        // below patches. Released before `workflow_status` on either exit:
+        // that call can resolve a default branch through `git`, and no other
+        // group's guardrail write should wait behind a subprocess.
+        let _io = self.group_file_io.lock_safe();
         let info = self.group(group).ok_or("unknown group")?;
         if on == info.guardrails.advanced_orchestrator {
+            drop(_io);
             return Ok(self.workflow_status(group));
         }
 
@@ -27442,13 +27620,55 @@ impl OrchRegistry {
             self.audit(group, "loomux", "workflow-loaded", detail);
         }
 
-        // Arm/clear the merge gate through the SAME path a fresh launch runs
-        // (`sync_merge_gate`): `Some` writes the spec file the shim reads,
-        // `None` removes it. On OFF, `gate` is still `None` here, so this
-        // clears whatever was armed.
-        self.sync_merge_gate(group, gate.as_ref());
-        if let Some(g) = &gate {
-            let missing = workflow::gate_missing_blocks(g, &guardrails.blocks);
+        self.audit(
+            group,
+            actor,
+            if on { "advanced-orchestrator-on" } else { "advanced-orchestrator-off" },
+            json!({}),
+        );
+        // #762 rev-260 B3: the gate sync stays INSIDE `group_file_io`. An earlier
+        // revision dropped the guard above this point on a pure INV-5/latency
+        // argument and did not notice it had reopened a race this file already
+        // refuses in writing: two toggles could publish their flags in one order
+        // and commit their gate specs in the other, leaving a merge-gate spec
+        // armed for a group whose `advanced_orchestrator` is now off — which
+        // `reload_merge_gate_if_changed` will not clear, because it returns early
+        // for an off group. `sync_merge_gate` only writes a small file and audits
+        // (no pane delivery, no subprocess), so ordering it here costs nothing the
+        // guard was protecting against.
+        //
+        // The precedent is `reload_merge_gate_if_changed`'s own #385 re-check,
+        // which refuses the identical hole in these words: "that's the SAFE
+        // direction (more enforcement, not less) — but it is still a real bug, and
+        // 'it fails safe' is not a reason to ship a known race in security
+        // machinery."
+        self.sync_merge_gate_locked(group, gate.as_ref(), &guardrails.blocks);
+        drop(_io);
+        let _ =
+            self.deliver_to_orchestrator(group, &workflow_mode_notice(on, &name, gate.as_ref()), "loomux");
+
+        Ok(self.workflow_status(group))
+    }
+
+    /// Arm/clear the merge gate through the SAME path a fresh launch runs
+    /// (`sync_merge_gate`): `Some` writes the spec file the shim reads, `None`
+    /// removes it. On a toggle-OFF, `gate` is `None`, so this clears whatever
+    /// was armed.
+    ///
+    /// **Callers hold `group_file_io`** (#762 rev-260 B3). The gate spec and the
+    /// `advanced_orchestrator` flag it belongs to are one decision, and two
+    /// toggles that commit them in opposite orders leave an armed gate on a
+    /// group that is no longer in workflow mode. Split out only so that ordering
+    /// is visible at the call site rather than implied by indentation.
+    fn sync_merge_gate_locked(
+        &self,
+        group: &str,
+        gate: Option<&workflow::Gate>,
+        blocks: &[workflow::Block],
+    ) {
+        self.sync_merge_gate(group, gate);
+        if let Some(g) = gate {
+            let missing = workflow::gate_missing_blocks(g, blocks);
             if !missing.is_empty() {
                 self.audit(group, "loomux", "merge-gate-unsatisfiable", json!({
                     "missing_blocks": missing,
@@ -27456,17 +27676,6 @@ impl OrchRegistry {
                 }));
             }
         }
-
-        self.audit(
-            group,
-            actor,
-            if on { "advanced-orchestrator-on" } else { "advanced-orchestrator-off" },
-            json!({}),
-        );
-        let _ =
-            self.deliver_to_orchestrator(group, &workflow_mode_notice(on, &name, gate.as_ref()), "loomux");
-
-        Ok(self.workflow_status(group))
     }
 
     /// The group's current workflow-mode status (#316) — the single derivation
@@ -37297,9 +37506,21 @@ pub fn start_attention(reg: Arc<OrchRegistry>) {
 
 // ---------- tauri commands ----------
 
-/// Run a POLLED orchestration command's whole body off the webview main thread
-/// (#743 S4c — the shape #399 gave `git.rs`, #724 gave `gh.rs`, and #719 gave
+/// Run an orchestration command's whole body off the webview main thread
+/// (#743 S4c for the polled reads, #762 for the mutation and lifecycle
+/// commands — the shape #399 gave `git.rs`, #724 gave `gh.rs`, and #719 gave
 /// `write_pty`).
+///
+/// **Every conversion here owes a reentrancy argument, in code, at the
+/// command.** The synchronous dispatch this removes was an accidental mutual
+/// exclusion: one thread ran every command body, so no two could interleave and
+/// nothing had to say why that was safe. Moving them off it is therefore not a
+/// pure latency change — it is a concurrency change — and #726's finding is
+/// that the ordering a conversion gives up has to be restored deliberately
+/// where anything depended on it, never assumed away. So each command below
+/// carries a `**Reentrancy.**` paragraph naming the guard that actually makes
+/// it safe (a lock, an atomic reserve, an idempotent write) or the interleaving
+/// it accepts and why. A conversion with no such paragraph is not finished.
 ///
 /// Tauri dispatches a *synchronous* `#[tauri::command]` by calling it directly
 /// on the webview/GUI thread, and — #724's review finding — it polls an async
@@ -37410,10 +37631,27 @@ pub struct RoleKnobs {
 /// Create (or reattach to) an orchestration group and register its
 /// orchestrator. Returns the pane spec the frontend opens directly; initial
 /// idle workers are spawned in the background once the orchestrator binds.
+///
+/// Off-thread (#762 — see [`run_blocking`]): the longest single-gesture stall
+/// in the orchestration surface. It holds the global `creation` mutex across
+/// `group.json` plus the per-agent MCP config writes plus a session-state scan,
+/// and while it was synchronous every millisecond of that was paid on the
+/// thread that services paint — which is the whole of the launcher's
+/// "nothing happens for a moment after I hit Create".
+///
+/// **Reentrancy.** The one command in #762 whose exclusion was never
+/// accidental: `OrchRegistry::creation` (`performance.md` §4 X6) exists
+/// *because* two concurrent launches on one repo would otherwise pick the same
+/// group id — id selection by liveness and orchestrator registration are one
+/// unit by design, argued and named long before this conversion. Moving the
+/// body to a pool thread changes which thread waits on that mutex, not what it
+/// guarantees; two launches still serialize, and the second still sees the
+/// first's group as live. Nothing in the body runs before the mutex is taken
+/// except argument marshalling.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)] // launcher-collected guardrails, one field each
-pub fn create_orchestration(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn create_orchestration(
+    app: AppHandle,
     repo: String,
     initial_workers: u32,
     max_agents: u32,
@@ -37438,6 +37676,41 @@ pub fn create_orchestration(
     advanced_orchestrator: bool,
     // Per-role thinking level / context window (#687). Omitted = no knob on any
     // role, i.e. today's group byte for byte — see `RoleKnobs`.
+    role_knobs: Option<RoleKnobs>,
+) -> Result<SpawnRequest, String> {
+    let reg = reg_of(&app);
+    run_blocking(move || create_orchestration_sync(
+        &reg, repo, initial_workers, max_agents, agent_cli, orchestrator_cli, worker_cli,
+        reviewer_cli, planner_cli, worker_model, reviewer_model, orchestrator_model,
+        planner_model, auto_ops, idle_kill_minutes, max_spawns_per_hour,
+        watchdog_stall_minutes, advanced_orchestrator, role_knobs,
+    ))
+    .await
+}
+
+/// The body of [`create_orchestration`], as a plain function so the command
+/// itself is the thin delegation `performance.md` §2 P1 asks for rather than a
+/// nineteen-argument closure.
+#[allow(clippy::too_many_arguments)] // it is `create_orchestration`'s argument list, verbatim
+fn create_orchestration_sync(
+    reg: &Arc<OrchRegistry>,
+    repo: String,
+    initial_workers: u32,
+    max_agents: u32,
+    agent_cli: String,
+    orchestrator_cli: String,
+    worker_cli: String,
+    reviewer_cli: String,
+    planner_cli: String,
+    worker_model: String,
+    reviewer_model: String,
+    orchestrator_model: String,
+    planner_model: String,
+    auto_ops: bool,
+    idle_kill_minutes: u32,
+    max_spawns_per_hour: u32,
+    watchdog_stall_minutes: u32,
+    advanced_orchestrator: bool,
     role_knobs: Option<RoleKnobs>,
 ) -> Result<SpawnRequest, String> {
     // The launcher still collects one CLI + model per role — that IS the
@@ -37480,7 +37753,7 @@ pub fn create_orchestration(
         ),
     ]);
     create_orchestration_group(
-        reg.inner(),
+        reg,
         &repo,
         Guardrails {
             max_agents,
@@ -37561,8 +37834,26 @@ pub fn create_orchestration(
 /// Never fails: a broken file is `{ valid: false, errors: [...] }` and the group
 /// would fall back to the built-in roster, which is precisely what the launcher
 /// needs to say. Nothing here is persisted and no group is created.
+///
+/// Off-thread (#762 — see [`run_blocking`]): it opens and parses
+/// `.loomux/workflow.yml` from disk, on every preview gesture, on the thread
+/// that services paint. The file is small; the path it sits on need not be.
+///
+/// **Reentrancy.** Nothing to argue, and that is a property of the command
+/// rather than an absence of thought: it takes no registry state, holds no
+/// lock, writes nothing and creates no group — the doc above already says so,
+/// because the launcher's whole reason for asking is that asking is free. Two
+/// previews of one repo read the same file twice and cannot interact.
 #[tauri::command]
-pub fn orch_workflow_preview(repo: String, agent_cli: String) -> Value {
+pub async fn orch_workflow_preview(repo: String, agent_cli: String) -> Value {
+    run_blocking(move || orch_workflow_preview_sync(repo, agent_cli)).await
+}
+
+/// The body of [`orch_workflow_preview`], as a plain function: it is the
+/// launcher's answer to "what would this launch run", and the workflow tests
+/// exercise it directly, without a Tauri runtime.
+#[doc(hidden)] // pub for integration tests
+pub fn orch_workflow_preview_sync(repo: String, agent_cli: String) -> Value {
     let present = workflow::workflow_file_exists(&repo);
     let (name, blocks, gates, errors, capacity) = match workflow::load_workflow(&repo) {
         Ok(Some(wf)) => {
@@ -37712,13 +38003,26 @@ pub fn orch_notify_enabled(reg: tauri::State<Arc<OrchRegistry>>, group_id: Strin
 }
 
 /// Enable/disable desktop notifications for a group (durable, per-group).
+///
+/// Off-thread (#762 — see [`run_blocking`]): a marker file write or remove plus
+/// an audit append under the process-global audit lock.
+///
+/// **Reentrancy.** Already argued, and argued for exactly this change:
+/// [`OrchRegistry::marker_io`] orders the whole toggle while the
+/// `notify_groups` set's own insert/remove decides whether this call is the
+/// real transition, so concurrent toggles produce one marker and one audit line
+/// and cannot land their file operations in the opposite order to their set
+/// mutations (#743 S7). That lock's doc says in as many words that leaving the
+/// ordering to "both toggles are sync commands on the webview thread" is a fact
+/// about callers, invalidated by the first off-thread one. This is that caller.
 #[tauri::command]
-pub fn orch_set_notify(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_set_notify(
+    app: AppHandle,
     group_id: String,
     enabled: bool,
 ) -> Result<(), String> {
-    reg.set_notify(&group_id, enabled)
+    let reg = reg_of(&app);
+    run_blocking(move || reg.set_notify(&group_id, enabled)).await
 }
 
 /// Whether this group has opted OUT of the #260 minimize-on-spawn default
@@ -37730,26 +38034,51 @@ pub fn orch_spawn_expanded(reg: tauri::State<Arc<OrchRegistry>>, group_id: Strin
 }
 
 /// Opt a group in/out of the #260 minimize-on-spawn default (durable, per-group).
+///
+/// Off-thread (#762): the same marker write plus audit append as
+/// [`orch_set_notify`], from a strip-toggle gesture.
+///
+/// **Reentrancy.** [`OrchRegistry::set_spawn_expanded`] is `set_notify`'s shape
+/// deliberately and shares its guard — the same [`OrchRegistry::marker_io`]
+/// orders both toggles, and the `spawn_expanded_groups` set's insert/remove
+/// decides the transition — so the argument on `orch_set_notify` covers this
+/// command without restating it. One lock for the pair, not one each, is what
+/// makes that true.
 #[tauri::command]
-pub fn orch_set_spawn_expanded(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_set_spawn_expanded(
+    app: AppHandle,
     group_id: String,
     expanded: bool,
 ) -> Result<(), String> {
-    reg.set_spawn_expanded(&group_id, expanded)
+    let reg = reg_of(&app);
+    run_blocking(move || reg.set_spawn_expanded(&group_id, expanded)).await
 }
 
 /// Change a live group's max live-agent cap (durable, bounds-checked, audited).
 /// Takes effect on the next spawn; lowering it below the current live count
 /// blocks new spawns until attrition rather than killing anyone. Returns the
 /// applied value. Human action from the GroupView overlay.
+///
+/// Off-thread (#762): a full `group.json` read-modify-write plus an audit
+/// append — the pattern the whole guardrail family below repeats.
+///
+/// **Reentrancy.** The read of the old cap, the `group.json` patch and the
+/// in-memory publish are one unit under [`OrchRegistry::group_file_io`], added
+/// by this slice for this family: a guardrail setter is a read-modify-write of
+/// one file, so two of them interleaving drop a key (last writer wins on a
+/// document both read pre-state from) and can leave disk and memory settled in
+/// opposite orders. The stepper's own burst behaviour is unchanged — the notice
+/// is coalesced by `record_max_notice` under its own lock (#79), which never
+/// depended on dispatch — and two racing steppers still settle last-writer-wins
+/// on the value, which is what a human holding a button down is asking for.
 #[tauri::command]
-pub fn orch_set_max_agents(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_set_max_agents(
+    app: AppHandle,
     group_id: String,
     max_agents: u32,
 ) -> Result<u32, String> {
-    reg.set_max_agents(&group_id, max_agents, "human")
+    let reg = reg_of(&app);
+    run_blocking(move || reg.set_max_agents(&group_id, max_agents, "human")).await
 }
 
 /// Aggregate per-pane session cost/usage into one group summary for the UI.
@@ -37810,37 +38139,104 @@ pub async fn orch_group_usage(app: AppHandle, group_id: String) -> Value {
 //     `waiting_for_activity`). Both are null while off / no live orchestrator.
 
 /// Enable/disable autonomous idle-tick mode for a group (durable, audited).
+///
+/// Off-thread (#762): a marker write carrying the budget anchor, audit appends,
+/// and the force-disable cascade onto the dependent gates — several file
+/// operations per gesture.
+///
+/// **Reentrancy.** The set's `insert` reserves the enable, and the disable
+/// removes the marker before it touches memory — but neither makes the reserve
+/// and the marker write ONE unit, and this command's marker carries consent.
+/// [`OrchRegistry::marker_io`] now spans that whole region (rev-260 B1), the
+/// budget-anchor computation included, because the anchor is the widest part of
+/// the gap it has to close. Without it a disable landing mid-enable removes a
+/// marker that is not written yet, clears the set, and lets the enable recreate
+/// the file behind it — memory OFF, `autonomous` marker on disk, and the next
+/// restart's re-seed resurrects autonomous mode from disk with no human in the
+/// loop.
+///
+/// An earlier revision of this paragraph asserted that pairing was impossible
+/// and cited the idle-tick thread as a pre-existing racer that made the
+/// question moot. The racer is real (`run_idle_tick` →
+/// `enforce_autonomy_budgets` → `suspend_autonomous`) but it does not make the
+/// human-vs-human pairing safe, and that pairing is ordinary rather than
+/// exotic: the group panel does not disable the control while the call is in
+/// flight, so a double-click emits enable-then-disable. The idle-tick variant
+/// stays outside the guard on purpose — a budget money-stop must never wait on
+/// a human's toggle — and is the one variant restart genuinely reconciles, via
+/// the `autonomy_suspended` marker it co-writes.
 #[tauri::command]
-pub fn orch_set_autonomous(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_set_autonomous(
+    app: AppHandle,
     group_id: String,
     enabled: bool,
 ) -> Result<(), String> {
-    reg.set_autonomous(&group_id, enabled)
+    let reg = reg_of(&app);
+    run_blocking(move || reg.set_autonomous(&group_id, enabled)).await
 }
 
 /// Enable/disable the auto-merge gate for a group (durable, audited). Default OFF
 /// = human merges; ON lets the orchestrator merge adequately-tested PRs itself.
+///
+/// Off-thread (#762): marker write, audit append, and a delivery into the
+/// orchestrator's pane.
+///
+/// **Reentrancy.** [`OrchRegistry::marker_io`] spans the dependency check, the
+/// reserve and the marker write (rev-260 B1) — the same unit, for the same
+/// reason, as [`orch_set_autonomous`] above: without it a disable racing an
+/// enable leaves memory OFF with an `auto_merge` marker on disk, and the next
+/// restart re-seeds merge authority the human had explicitly withdrawn. The
+/// disk-first fail-loud disable and the atomic reserve are still there; they
+/// were never sufficient on their own, and an earlier revision of this
+/// paragraph claimed they were.
+///
+/// Holding the `is_autonomous` check inside the same window also closes the
+/// **human-vs-human** half of #788 as a side effect: an autonomous-off can no
+/// longer land between this check and this reserve, because that path takes the
+/// same lock for its own marker region.
+///
+/// **The residual that remains, stated rather than glossed** (#788): the
+/// idle-tick half. `suspend_autonomous` force-disables this gate from the
+/// budget enforcer without taking `marker_io` — deliberately, so a money-stop
+/// never waits on a human's click — so an autonomous suspension can still land
+/// between the check and the reserve. That window predates this PR (it has been
+/// open since #83) and is bounded on both ends: `auto_merge` is an instruction
+/// rendered into the orchestrator's config, not the merge enforcement itself (a
+/// default-branch merge still needs a grant), and `create_group`'s re-seed
+/// reconciles the pair on the next restart, clearing a stale marker and
+/// auditing it.
 #[tauri::command]
-pub fn orch_set_auto_merge(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_set_auto_merge(
+    app: AppHandle,
     group_id: String,
     enabled: bool,
 ) -> Result<(), String> {
-    reg.set_auto_merge(&group_id, enabled)
+    let reg = reg_of(&app);
+    run_blocking(move || reg.set_auto_merge(&group_id, enabled)).await
 }
 
 /// Enable/disable the auto-release gate for a group (durable, audited, independent
 /// of auto-merge). Default OFF = releases/tags need a per-tag human grant; ON lets
 /// the orchestrator publish releases itself while autonomous. Rejects enable unless
 /// autonomous is on.
+///
+/// Off-thread (#762): the same marker write, audit and delivery as
+/// [`orch_set_auto_merge`], from the same settings surface.
+///
+/// **Reentrancy.** [`OrchRegistry::set_auto_release`] mirrors
+/// [`OrchRegistry::set_auto_merge`] exactly against an independent marker, so
+/// the argument on [`orch_set_auto_merge`] applies verbatim: the same
+/// `marker_io` unit over check-reserve-write (rev-260 B1), closing the same
+/// resurrect-on-restart interleave — here for release and tag authority — and
+/// the same remaining idle-tick residual under #788.
 #[tauri::command]
-pub fn orch_set_auto_release(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_set_auto_release(
+    app: AppHandle,
     group_id: String,
     enabled: bool,
 ) -> Result<(), String> {
-    reg.set_auto_release(&group_id, enabled)
+    let reg = reg_of(&app);
+    run_blocking(move || reg.set_auto_release(&group_id, enabled)).await
 }
 
 /// Enable/disable supervised dangerous mode for a group (#83, durable, audited).
@@ -37848,95 +38244,204 @@ pub fn orch_set_auto_release(
 /// to the default branch and publish releases/tags itself, WITHOUT autonomous mode.
 /// Mutually exclusive with autonomous: rejects enable while autonomous is on, and
 /// enabling autonomous force-clears it.
+///
+/// Off-thread (#762): marker write, audit append and delivery. A deliberately
+/// rare gesture, which is why it ranks below the polled set rather than being
+/// harmless.
+///
+/// **Reentrancy.** Same `marker_io` unit as the two gates above (rev-260 B1),
+/// and this is the member of the family where the conversion *created* the
+/// exposure rather than widening it — worth stating plainly, because an earlier
+/// revision of this paragraph claimed the opposite. It named a background
+/// racer that does not exist: `force_disable_dangerous_mode` has exactly one
+/// call site, `set_autonomous_as`'s enable arm, and no background path reaches
+/// it (`suspend_autonomous` force-disables the two gates, never this). So until
+/// this commit the webview thread genuinely was the only thing serializing two
+/// dangerous-mode toggles, and the guard restores that rather than inheriting
+/// it from somewhere else.
+///
+/// The mutual exclusion with autonomous is still a check-then-set and is still
+/// #788's, in the direction the guard does not cover: an autonomous-on landing
+/// between this call's check and its reserve clears nothing and leaves both
+/// modes set. That grants the union of two authorities the human enabled with
+/// two clicks, not a third neither asked for, and `create_group`'s re-seed
+/// reconciles the pair at the next restart.
 #[tauri::command]
-pub fn orch_set_dangerous_mode(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_set_dangerous_mode(
+    app: AppHandle,
     group_id: String,
     enabled: bool,
 ) -> Result<(), String> {
-    reg.set_dangerous_mode(&group_id, enabled)
+    let reg = reg_of(&app);
+    run_blocking(move || reg.set_dangerous_mode(&group_id, enabled)).await
 }
+
+// ---------- the persisted guardrail knobs ----------
+//
+// Seven commands, one shape: read the current value, patch that one key in
+// `group.json`, publish the new value into the in-memory guardrails the running
+// loops read, audit. All off-thread as of #762.
+//
+// **Their reentrancy argument is one argument, made once here and cited by
+// each.** A read-modify-write of a shared document is the textbook lost update:
+// two of these running at once on the same group both read the pre-state, and
+// the second write drops the first one's key — on the file that carries the
+// group's consent-bearing guardrails. The webview thread used to make that
+// impossible for free. [`OrchRegistry::group_file_io`] now makes it impossible
+// on purpose, holding the read, the patch and the in-memory publish as one unit
+// (so disk and memory cannot settle in opposite orders either), and its own doc
+// carries the full argument including the lock order. Each command below states
+// only what is specific to it.
 
 /// Set a group's autonomous-era token budget (0 = no cap; durable, audited).
 /// Returns the applied value.
+///
+/// Off-thread (#762): a `group.json` read-modify-write plus an audit append.
+///
+/// **Reentrancy.** The family argument above, under
+/// [`OrchRegistry::group_file_io`]. Specific to this knob: it deliberately does
+/// NOT move the enable-time anchor, so a budget raise racing the idle-tick
+/// thread's `enforce_autonomy_budgets` cannot change what that pass has already
+/// counted — the worst interleaving is a suspension that the new budget would
+/// have avoided, which the human resolves by re-enabling, and which was already
+/// possible before this conversion.
 #[tauri::command]
-pub fn orch_set_autonomy_budget(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_set_autonomy_budget(
+    app: AppHandle,
     group_id: String,
     tokens: u64,
 ) -> Result<u64, String> {
-    reg.set_autonomy_budget(&group_id, tokens)
+    let reg = reg_of(&app);
+    run_blocking(move || reg.set_autonomy_budget(&group_id, tokens)).await
 }
 
 /// Set a group's idle-tick quiet window in minutes (0 → default; floored at 1,
 /// clamped to the max; durable, audited). Returns the applied value. Lets the
 /// human drop it to 1–2 min to verify autonomous mode fires quickly.
+///
+/// Off-thread (#762): a `group.json` read-modify-write plus an audit append.
+///
+/// **Reentrancy.** The family argument above, under
+/// [`OrchRegistry::group_file_io`]. Specific to this knob: the idle-tick loop
+/// reads the in-memory value fresh each pass and never caches it, so a tick
+/// that overlaps this write uses either the old cadence or the new one — both
+/// are cadences the human chose, and neither is a torn value, because the
+/// publish happens under the same guard as the write it followed.
 #[tauri::command]
-pub fn orch_set_idle_tick_minutes(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_set_idle_tick_minutes(
+    app: AppHandle,
     group_id: String,
     minutes: u32,
 ) -> Result<u32, String> {
-    reg.set_idle_tick_minutes(&group_id, minutes)
+    let reg = reg_of(&app);
+    run_blocking(move || reg.set_idle_tick_minutes(&group_id, minutes)).await
 }
 
 /// Set a group's idle-tick activity floor in bytes (0 → default; floored at 1,
 /// clamped to 1 MiB; durable, audited). Returns the applied value. The runtime
 /// remedy if a chatty CLI's idle repaints exceed the default and starve the tick.
+///
+/// Off-thread (#762): a `group.json` read-modify-write plus an audit append.
+///
+/// **Reentrancy.** The family argument above, under
+/// [`OrchRegistry::group_file_io`]. Specific to this knob: like the tick
+/// cadence beside it, the floor is re-read by the idle-tick and compact-nudge
+/// passes every time rather than latched, so an overlapping pass sees one whole
+/// value or the other and no pass can straddle the change.
 #[tauri::command]
-pub fn orch_set_idle_activity_floor(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_set_idle_activity_floor(
+    app: AppHandle,
     group_id: String,
     bytes: u64,
 ) -> Result<u64, String> {
-    reg.set_idle_activity_floor(&group_id, bytes)
+    let reg = reg_of(&app);
+    run_blocking(move || reg.set_idle_activity_floor(&group_id, bytes)).await
 }
 
 /// Set a group's compact-nudge quiet window in minutes (#287; 0 = off,
 /// clamped to the max; durable, audited). Returns the applied value.
+///
+/// Off-thread (#762): a `group.json` read-modify-write plus an audit append.
+///
+/// **Reentrancy.** The family argument above, under
+/// [`OrchRegistry::group_file_io`]. Specific to this knob: `0` is the feature's
+/// off switch rather than a "use the default" sentinel, so the write that turns
+/// the nudge off is the same single-key patch as any other value — there is no
+/// second store to keep in step with it, and nothing to reconcile if a
+/// compact-nudge pass overlaps.
 #[tauri::command]
-pub fn orch_set_compact_nudge_minutes(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_set_compact_nudge_minutes(
+    app: AppHandle,
     group_id: String,
     minutes: u32,
 ) -> Result<u32, String> {
-    reg.set_compact_nudge_minutes(&group_id, minutes)
+    let reg = reg_of(&app);
+    run_blocking(move || reg.set_compact_nudge_minutes(&group_id, minutes)).await
 }
 
 /// Set a group's compact-nudge eligible roles (#287; unrecognized names
 /// dropped, empty falls back to `["orchestrator"]`; durable, audited).
 /// Returns the applied set.
+///
+/// Off-thread (#762): a `group.json` read-modify-write plus an audit append.
+///
+/// **Reentrancy.** The family argument above, under
+/// [`OrchRegistry::group_file_io`]. Specific to this knob: the value is a whole
+/// canonicalized *set*, replaced outright rather than added to, so two writers
+/// cannot merge into a roster neither of them chose — the loser's set is
+/// overwritten entire, which is the same last-writer-wins the control's own
+/// semantics already give (a checkbox group submits its whole state).
 #[tauri::command]
-pub fn orch_set_compact_nudge_roles(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_set_compact_nudge_roles(
+    app: AppHandle,
     group_id: String,
     roles: Vec<String>,
 ) -> Result<Vec<String>, String> {
-    reg.set_compact_nudge_roles(&group_id, roles)
+    let reg = reg_of(&app);
+    run_blocking(move || reg.set_compact_nudge_roles(&group_id, roles)).await
 }
 
 /// Set a group's compact-nudge context-usage escalation threshold (#328; `0`
 /// = off, clamped to 100; durable, audited). Returns the applied value.
+///
+/// Off-thread (#762): a `group.json` read-modify-write plus an audit append.
+///
+/// **Reentrancy.** The family argument above, under
+/// [`OrchRegistry::group_file_io`]. Specific to this knob: it is read only by
+/// the compact-nudge escalation decision, which takes no lock and holds no
+/// snapshot across passes, so an overlapping pass reads one whole percentage or
+/// the other.
 #[tauri::command]
-pub fn orch_set_compact_context_threshold(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_set_compact_context_threshold(
+    app: AppHandle,
     group_id: String,
     percent: u32,
 ) -> Result<u32, String> {
-    reg.set_compact_context_threshold(&group_id, percent)
+    let reg = reg_of(&app);
+    run_blocking(move || reg.set_compact_context_threshold(&group_id, percent)).await
 }
 
 /// Set a group's compact-nudge min-context floor (benchtest finding; `0` =
 /// off — the heuristic lull-timer fires on the lull alone, today's behavior;
 /// clamped to 100; durable, audited). Never gates an agent's own
 /// `request_compact`. Returns the applied value.
+///
+/// Off-thread (#762): a `group.json` read-modify-write plus an audit append.
+///
+/// **Reentrancy.** The family argument above, under
+/// [`OrchRegistry::group_file_io`]. Specific to this knob: it is the one
+/// tri-state in the family, and this setter only ever writes `Some` — it can
+/// never restore the unset/smart-default arm — so no interleaving of two writes
+/// can produce a value the tri-state does not already admit, and the guard is
+/// what stops one of them being dropped on the way to disk.
 #[tauri::command]
-pub fn orch_set_compact_nudge_min_context_percent(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_set_compact_nudge_min_context_percent(
+    app: AppHandle,
     group_id: String,
     percent: u32,
 ) -> Result<u32, String> {
-    reg.set_compact_nudge_min_context_percent(&group_id, percent)
+    let reg = reg_of(&app);
+    run_blocking(move || reg.set_compact_nudge_min_context_percent(&group_id, percent)).await
 }
 
 /// The group's autonomous-mode state for the panel: toggles, budget, anchor, and
@@ -37977,13 +38482,29 @@ pub fn orch_group_watches(reg: tauri::State<Arc<OrchRegistry>>, group_id: String
 /// for the full contract (refusals, satisfiability, the consent boundary on live
 /// delegates). Returns the resulting workflow status — the same shape
 /// `orch_workflow_status` reads.
+///
+/// Off-thread (#762): it reads the repo's workflow file, patches `group.json`,
+/// syncs the merge-gate spec file and returns `workflow_status`.
+///
+/// **Reentrancy.** Two guards, for two different racers. The `group.json`
+/// read-modify-write and the in-memory publish are one unit under
+/// [`OrchRegistry::group_file_io`], like the guardrail knobs it sits beside —
+/// that is what this conversion adds. The other racer needs nothing added,
+/// because it was already there: `run_workflow_gate_reload`'s background pass
+/// re-arms the merge gate from the repo's current file, and #385 already made
+/// it re-read the group's guardrails immediately before writing precisely
+/// because "`set_advanced_orchestrator` runs on a different thread" — a
+/// sentence written about the webview thread that stays true, word for word,
+/// about a pool thread. The guard is released before the gate sync and the
+/// notice, so nothing waits on it across a pane write.
 #[tauri::command]
-pub fn orch_set_advanced_orchestrator(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_set_advanced_orchestrator(
+    app: AppHandle,
     group_id: String,
     on: bool,
 ) -> Result<Value, String> {
-    reg.set_advanced_orchestrator(&group_id, on, "human")
+    let reg = reg_of(&app);
+    run_blocking(move || reg.set_advanced_orchestrator(&group_id, on, "human")).await
 }
 
 /// The group's current workflow-mode status for the lifecycle UI (Slice C):
@@ -38021,29 +38542,69 @@ pub async fn orch_workflow_status(app: AppHandle, group_id: String) -> Value {
 /// Connect two agent panes (possibly in different groups) into a channel.
 /// Human-only. See `OrchRegistry::connect_agents` for the join/mint/reject
 /// rules.
+///
+/// Off-thread (#762 — see [`run_blocking`]): an audit append PER MEMBER GROUP
+/// and two pane deliveries, so its cost scales with the channel rather than
+/// being constant.
+///
+/// **The channel family's reentrancy argument, made once here.** The membership
+/// graph has had concurrent writers since #271 and does not depend on dispatch
+/// for any of its invariants. Two of them, both live today: `mark_dead` calls
+/// `cleanup_agent_channel` → `disconnect_agent` from the reaper and watchdog
+/// threads whenever a pane dies, and the agent-facing `channel_send` MCP tool
+/// mutates reply credits inside `channels` from an MCP thread. What holds the
+/// graph together is that every mutation takes `channels` and `agent_channel`
+/// **together** and does the whole decision under both — mint, join, reject,
+/// teardown — so the one-channel-per-pane invariant and the star topology's
+/// single hub are properties of a critical section, not of who called it. The
+/// audits and deliveries deliberately run after both guards drop (they can
+/// block on a pane), which is why this command's cost is off-thread work worth
+/// moving rather than lock hold time.
+///
+/// **Reentrancy.** Specific to this one: `sender_agent` is validated against
+/// the channel state *inside* that critical section — a join confirms the
+/// existing sender, a mint designates one — so two connects racing onto one
+/// channel cannot both install a hub. The loser is refused with the existing
+/// sender named, exactly as a sequential second connect would be.
 #[tauri::command]
-pub fn orch_channel_connect(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_channel_connect(
+    app: AppHandle,
     from_group: String,
     from_agent: String,
     to_group: String,
     to_agent: String,
     sender_agent: String,
 ) -> Result<Value, String> {
-    reg.connect_agents(&from_group, &from_agent, &to_group, &to_agent, &sender_agent)
+    let reg = reg_of(&app);
+    run_blocking(move || {
+        reg.connect_agents(&from_group, &from_agent, &to_group, &to_agent, &sender_agent)
+    })
+    .await
 }
 
 /// Disconnect one agent pane from its channel. Human-only; tears the
 /// channel down if this drops it below 2 members, or if the disconnected
 /// pane was the channel's sender (#271 W3 addendum, part B — a star
 /// topology has exactly one hub).
+/// Off-thread (#762): the teardown half of [`orch_channel_connect`] — the same
+/// per-group audit appends and per-member deliveries.
+///
+/// **Reentrancy.** The family argument on [`orch_channel_connect`], and this is
+/// the command that proves it rather than asserting it: `cleanup_agent_channel`
+/// has always called `OrchRegistry::disconnect_agent` from whichever thread
+/// noticed a pane die, so this exact function has been reentered off the
+/// webview thread since #271. The `agent_channel` remove is what decides
+/// whether a call is a real disconnect — a second one finds no membership and
+/// errors rather than tearing a channel down twice — and the teardown decision
+/// (below 2 members, or the sender left) is taken with both maps held.
 #[tauri::command]
-pub fn orch_channel_disconnect(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_channel_disconnect(
+    app: AppHandle,
     group: String,
     agent: String,
 ) -> Result<Value, String> {
-    reg.disconnect_agent(&group, &agent)
+    let reg = reg_of(&app);
+    run_blocking(move || reg.disconnect_agent(&group, &agent)).await
 }
 
 /// Every live channel, for the frontend's cross-tab indicators.
@@ -38063,13 +38624,24 @@ pub fn orch_channel_for_pane(reg: tauri::State<Arc<OrchRegistry>>, group: String
 /// addendum, part B5). See `OrchRegistry::set_sender` for the validation
 /// (member + token) and side effects (credits cleared, both panes notified,
 /// `channel-direction` audited).
+/// Off-thread (#762): an audit append per member group and a delivery of the
+/// direction change — the same per-member fan-out as connect, for a smaller
+/// edit.
+///
+/// **Reentrancy.** The family argument on [`orch_channel_connect`]. Specific to
+/// this one: membership and token validation and the sender swap happen under
+/// the `channels` guard, so two reassignments serialize into one final hub
+/// rather than a channel that names one sender and credits another. Reply
+/// credits are cleared as part of the same mutation, which is what stops a
+/// receiver keeping a credit minted under the previous direction.
 #[tauri::command]
-pub fn orch_channel_set_sender(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_channel_set_sender(
+    app: AppHandle,
     channel_id: String,
     new_sender_agent: String,
 ) -> Result<Value, String> {
-    reg.set_sender(&channel_id, &new_sender_agent)
+    let reg = reg_of(&app);
+    run_blocking(move || reg.set_sender(&channel_id, &new_sender_agent)).await
 }
 
 // ---------- standalone panes (#271 W3 addendum, part A): human-only, from
@@ -38077,14 +38649,26 @@ pub fn orch_channel_set_sender(
 
 /// Mint a channel-scoped identity for a newly-launching standalone pane
 /// BEFORE it boots. See `OrchRegistry::solo_prepare`.
+/// Off-thread (#762): it writes the pane's MCP config and appends an audit
+/// entry BEFORE the CLI is launched, so every millisecond of it is latency the
+/// human reads as a slow pane open.
+///
+/// **Reentrancy.** Every durable thing this creates is keyed by an id minted
+/// under `agent_seq_persist`, which is already a lock rather than an atomic
+/// (#524 rev-13 N1, so the high-water counter can never wrap and reissue), and
+/// an id is never re-minted. Two concurrent prepares therefore write two
+/// distinct config files for two distinct agents and cannot collide on a path,
+/// a token, or a roster entry. `ensure_solo_group` is idempotent — it inserts
+/// the standalone group only if absent — so racing it produces one group.
 #[tauri::command]
-pub fn orch_solo_prepare(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_solo_prepare(
+    app: AppHandle,
     cli: String,
     cwd: String,
     name: String,
 ) -> Result<Value, String> {
-    reg.solo_prepare(&cli, &cwd, &name)
+    let reg = reg_of(&app);
+    run_blocking(move || reg.solo_prepare(&cli, &cwd, &name)).await
 }
 
 /// Bind a just-spawned solo pane's pty to the `AgentEntry` `orch_solo_prepare`
@@ -38108,26 +38692,71 @@ pub fn orch_confirm_solo_copilot_autopilot(
 /// Adopt an already-running pane (no channel identity yet) as a
 /// delivery-only member on its first Connect gesture. See
 /// `OrchRegistry::solo_adopt`.
+/// Off-thread (#762): the adoption records plus an audit append, on a pane's
+/// first Connect gesture.
+///
+/// **Reentrancy.** This one needed a code change, not just an argument.
+/// `solo_adopt` was idempotent by pty through a check-then-insert — read
+/// `by_pty`, mint, insert — and the two lock acquisitions with a mint between
+/// them were only safe because the webview thread could not be inside the
+/// function twice. #762 removes that, so the claim becomes a vacant-entry
+/// insert on `by_pty`: exactly one adopt of a pty wins, and the loser rolls its
+/// own roster entry back and returns the winner's id. The alternative — a
+/// second delivery-only identity for one pane — would have been silent, since
+/// both calls return an id that looks fine.
 #[tauri::command]
-pub fn orch_solo_adopt(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_solo_adopt(
+    app: AppHandle,
     pty_id: u32,
     name: String,
     cwd: String,
 ) -> Result<Value, String> {
-    reg.solo_adopt(pty_id, &name, &cwd)
+    let reg = reg_of(&app);
+    run_blocking(move || reg.solo_adopt(pty_id, &name, &cwd)).await
 }
 
 /// End a whole orchestration: kill all its agents and (optionally) remove
 /// their worktrees. Human-initiated, destructive, audited — the frontend
 /// confirms before calling this.
+///
+/// Off-thread (#762 — see [`run_blocking`]): N SEQUENTIAL blocking
+/// `git worktree remove` spawns, then recursive directory deletes, then audits.
+/// The largest process-spawn count of any command in E1's manifest, and an
+/// INV-2 violation for as long as it ran on the webview thread — a fleet
+/// teardown froze the whole app for its duration.
+///
+/// **Reentrancy.** Every step is idempotent or reports its own failure, which
+/// is what a teardown needs to be anyway: `mark_dead` is already idempotent
+/// against the asynchronous pty-exit path (it returns `None` for an agent that
+/// is already dead, so no second exit notice is emitted), the attachment sweep
+/// and the agent-file sweep are `remove_dir_all`/scan-and-delete, and a
+/// `git worktree remove` of a path a racer already reclaimed fails and is
+/// reported in `worktree_errors` rather than lost. So a second end-group —
+/// which the human could already produce by confirming twice, since the *first*
+/// call left the members in the roster marked dead — behaves as it did before:
+/// it finds nothing live to kill and reports what it could not remove. What is
+/// new is that the two can now overlap; the outcome is the same set of
+/// reclaimed worktrees and an error row for whichever call lost each race.
+///
+/// **End-versus-CREATE is the interleaving this does not cover** (rev-260).
+/// This takes no `creation` lock, and group ids are chosen by liveness and
+/// therefore reused, so a relaunch that starts while a teardown is still in its
+/// tail can be handed the id the teardown is finishing with — and then the
+/// teardown's directory sweep and its `orch-group-ended` emit land on the NEW
+/// group's files and panes. Ending a group is a deliberate, confirmed gesture
+/// and relaunching into one mid-teardown is not something a careful human does
+/// on purpose, but it is reachable now in a way it was not when the two
+/// commands could not overlap. Recorded rather than fixed: serializing this
+/// against `creation` is a lifecycle change, not a dispatch one, and it is the
+/// same lock gap **#799** owns from the resume side.
 #[tauri::command]
-pub fn orch_end_group(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_end_group(
+    app: AppHandle,
     group_id: String,
     cleanup_worktrees: bool,
 ) -> Result<Value, String> {
-    reg.end_group(&group_id, cleanup_worktrees)
+    let reg = reg_of(&app);
+    run_blocking(move || reg.end_group(&group_id, cleanup_worktrees)).await
 }
 
 /// Create (or reattach to) a group and register its orchestrator, under the
@@ -38668,6 +39297,17 @@ pub fn resume_recorded_session(
     }
 
     if record.role == "orchestrator" {
+        // #799: this liveness pre-check runs OUTSIDE the `creation` lock (the
+        // only `creation.lock_safe()` is inside `create_group_ex`), so what it
+        // reads can be stale by the time the pane actually spawns — a teardown
+        // racing a resume can validate here against a group that is gone a
+        // moment later, and two restores of one session can both pass it. That
+        // is pre-existing, but #762 made it reachable in a way it was not when
+        // these commands could not overlap: see `resume_orch_session`'s
+        // **Reentrancy.** paragraph for the argument, and #799 for the guard
+        // shape (re-check under `creation`, or a liveness token the spawn
+        // re-validates). Documented here rather than fixed — the fix is
+        // lifecycle locking, not dispatch.
         if record.group_live {
             return Err(format!(
                 "group {} already has a live orchestrator — focus its pane instead",
@@ -38861,13 +39501,28 @@ pub fn bind_agent(reg: tauri::State<Arc<OrchRegistry>>, agent_id: String, pty_id
 /// recorded at the highest precedence tier — an orchestrator `rename_agent`
 /// afterwards will not override it (#95r). Best-effort: the pane already shows
 /// the new name locally, so a stale/unknown id just fails silently here.
+/// Off-thread (#762 — see [`run_blocking`]): `persist_agent_record` rewrites
+/// `agents.json` while holding the global `tasks_lock` — the lock the board
+/// family and the usage poll contend on. That lock's architecture is #747; this
+/// is the dispatch half.
+///
+/// **Reentrancy.** `rename_agent` has always been reachable from MCP threads
+/// (the orchestrator's own `rename_agent` tool) and from the spawn path, so the
+/// webview thread was never what made it safe. The decision is taken whole
+/// under the `agents` lock — liveness, the #95r precedence check and the name
+/// write are one critical section, and the entry is cloned out of it — so a
+/// human rename racing an orchestrator rename resolves by RANK, not by arrival:
+/// the orchestrator's loses to a name the human set, whichever order they land
+/// in. That is the property #95r asked for, and it is stronger than the
+/// ordering this conversion gives up.
 #[tauri::command]
-pub fn orch_agent_renamed(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_agent_renamed(
+    app: AppHandle,
     agent_id: String,
     name: String,
 ) -> Result<(), String> {
-    reg.rename_agent(&agent_id, &name, NameSource::Human).map(|_| ())
+    let reg = reg_of(&app);
+    run_blocking(move || reg.rename_agent(&agent_id, &name, NameSource::Human).map(|_| ())).await
 }
 
 /// Session ↔ orchestration-role mapping for the session browser badges.
@@ -38879,16 +39534,47 @@ pub fn orch_session_roles(reg: tauri::State<Arc<OrchRegistry>>) -> Vec<SessionRo
 /// Restore a recorded orchestration session (see `resume_recorded_session`).
 /// Returns the orchestrator pane spec, or null when the pane will arrive
 /// via `orch-spawn-request` (worker/reviewer rejoin).
+///
+/// Off-thread (#762): the session-restore path reads the persisted group state
+/// back from disk, the same shape as [`create_orchestration`] and on the same
+/// app-restore gesture — several of them at once when a window comes back with
+/// several orchestration tabs.
+///
+/// **Reentrancy.** It reaches `create_orchestration_group`, so it inherits
+/// [`create_orchestration`]'s argument for the case it was built for: several
+/// restores of DIFFERENT sessions racing on app start each carry their own
+/// `expect_group`, and the `creation` mutex (`performance.md` §4 X6) makes id
+/// selection and orchestrator registration one unit, so they reattach to their
+/// own groups instead of competing for a fresh id.
+///
+/// **The same-session case is weaker, and rev-260 was right to flag it.** The
+/// `already has a live orchestrator` precheck runs OUTSIDE `creation` (the only
+/// `creation.lock_safe()` is inside `create_group_ex`), so two restores of ONE
+/// recorded session can both pass it. The loser is refused — `expect_group`
+/// pins the id and rejects the one liveness picked instead — but only after
+/// `create_group_ex` has already run for that second id, leaving a group
+/// materialized that nothing asked for, and reporting a cause that describes
+/// the id mismatch rather than the double restore. Pre-conversion the second
+/// call ran strictly after the first and returned the clean "already has a live
+/// orchestrator" error, so this IS newly reachable. It is recorded rather than
+/// fixed because the fix is to take `creation` across the precheck (or hand the
+/// spawn a liveness token to re-validate), which changes the restore path's
+/// locking rather than its dispatch: **#799** owns it, and cites this paragraph
+/// back from the precheck itself.
 #[tauri::command]
-pub fn resume_orch_session(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn resume_orch_session(
+    app: AppHandle,
     session_id: String,
     group_hint: Option<String>,
     role_hint: Option<String>,
     start_fresh: bool,
 ) -> Result<Option<SpawnRequest>, String> {
-    let hint = group_hint.zip(role_hint);
-    resume_recorded_session(reg.inner(), &session_id, hint, start_fresh)
+    let reg = reg_of(&app);
+    run_blocking(move || {
+        let hint = group_hint.zip(role_hint);
+        resume_recorded_session(&reg, &session_id, hint, start_fresh)
+    })
+    .await
 }
 
 // ---------- merge-gate link resolution ----------
@@ -39135,13 +39821,26 @@ pub async fn orch_merge_queue(app: AppHandle, group_id: String) -> Value {
 /// near-simultaneous sends is best-effort — the per-pty delivery mutex is not
 /// FIFO). Empty text, a paused group, and a dead orchestrator all surface as
 /// errors the strip shows the human.
+///
+/// Off-thread (#762 — see [`run_blocking`]): `deliver_prompt` appends audits
+/// and persists the durable delivery queue, the same fsync-and-rename shape as
+/// every other durable write here.
+///
+/// **Reentrancy.** The property the compose strip actually needs — that a
+/// message lands whole and is never interleaved with another writer's — is
+/// held by the per-pane delivery mutex, not by dispatch: this command has
+/// always shared that path with worker reports, orchestrator notices and every
+/// MCP-thread delivery, which is exactly why loomux funnels all of them through
+/// one writer per pane. What the webview thread contributed was the *relative*
+/// order of two near-simultaneous human steers, and the doc above already
+/// disclaims it ("relative order of near-simultaneous sends is best-effort —
+/// the per-pty delivery mutex is not FIFO"). That sentence predates this
+/// conversion and is why it costs nothing: the guarantee being kept is
+/// wholeness, and the one being given up was never claimed.
 #[tauri::command]
-pub fn orch_steer(
-    reg: tauri::State<Arc<OrchRegistry>>,
-    group_id: String,
-    text: String,
-) -> Result<(), String> {
-    reg.steer_orchestrator(&group_id, &text)
+pub async fn orch_steer(app: AppHandle, group_id: String, text: String) -> Result<(), String> {
+    let reg = reg_of(&app);
+    run_blocking(move || reg.steer_orchestrator(&group_id, &text)).await
 }
 
 /// Result of saving a steering-strip attachment: the absolute file path plus
@@ -39160,28 +39859,45 @@ pub struct SavedAttachment {
 /// `invoke`. Returns the saved path and the group's orchestrator CLI; the
 /// frontend turns those into the per-CLI "Attached image" reference line before
 /// sending through `orch_steer`.
+///
+/// Off-thread (#762): the base64 decode AND the disk write, both of which are
+/// as large as the image the human pasted and neither of which anything bounds
+/// below `MAX_ATTACHMENT_B64_LEN`. The decode is moved deliberately too — it is
+/// megabytes of CPU on the thread that services paint, and leaving it in front
+/// of the first `.await` would be #724's mistake with extra steps.
+///
+/// **Reentrancy.** Each call writes a distinct file: `save_attachment` mints
+/// the name from a monotonic counter, so two pastes cannot name the same path
+/// and there is no read-modify-write to lose. The audit append is serialized by
+/// the audit lock, and `orchestrator_cli` is an in-memory roster read. Nothing
+/// here was serialized by dispatch except the *order* of two attachments'
+/// filenames, which nothing reads as meaningful.
 #[tauri::command]
-pub fn orch_save_attachment(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_save_attachment(
+    app: AppHandle,
     group_id: String,
     ext: String,
     data_b64: String,
 ) -> Result<SavedAttachment, String> {
-    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-    // Reject an oversize payload before decoding — see MAX_ATTACHMENT_B64_LEN.
-    if data_b64.len() > MAX_ATTACHMENT_B64_LEN {
-        return Err(format!(
-            "attachment too large (max {MAX_ATTACHMENT_BYTES} bytes)"
-        ));
-    }
-    let bytes = B64
-        .decode(data_b64.as_bytes())
-        .map_err(|e| format!("invalid attachment encoding: {e}"))?;
-    let path = reg.save_attachment(&group_id, &ext, &bytes)?;
-    Ok(SavedAttachment {
-        path: path.to_string_lossy().to_string(),
-        cli: reg.orchestrator_cli(&group_id),
+    let reg = reg_of(&app);
+    run_blocking(move || {
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        // Reject an oversize payload before decoding — see MAX_ATTACHMENT_B64_LEN.
+        if data_b64.len() > MAX_ATTACHMENT_B64_LEN {
+            return Err(format!(
+                "attachment too large (max {MAX_ATTACHMENT_BYTES} bytes)"
+            ));
+        }
+        let bytes = B64
+            .decode(data_b64.as_bytes())
+            .map_err(|e| format!("invalid attachment encoding: {e}"))?;
+        let path = reg.save_attachment(&group_id, &ext, &bytes)?;
+        Ok(SavedAttachment {
+            path: path.to_string_lossy().to_string(),
+            cli: reg.orchestrator_cli(&group_id),
+        })
     })
+    .await
 }
 
 /// The human board's task write. `deps` (#582) is the whole new link array —
@@ -39191,9 +39907,34 @@ pub fn orch_save_attachment(
 /// rather than landing a broken graph. The human's edits stay
 /// last-writer-wins: `claim` is deliberately not exposed here, since the
 /// board's authority is the human's, not a queue discipline.
+///
+/// Off-thread (#762 — see [`run_blocking`]): a `tasks.json` read plus a full
+/// atomic rewrite of the board plus an audit append, inside the
+/// [`OrchRegistry::tasks_lock`] guard. The board family's base cost; every
+/// command below adds to this one.
+///
+/// **The board family's reentrancy argument, made once here.** This family is
+/// the one place in #762 where the conversion changes nothing at all about who
+/// can interleave, and the reason is written on the lock: `tasks_lock` exists
+/// because "MCP threads and the human UI mutate the same tasks.json". Every
+/// board write below has therefore always run concurrently with an agent's
+/// `upsert_task`/`claim_task` from an MCP thread, and every one of them is a
+/// read-modify-write held whole under that guard, ending in an `atomic_write`
+/// — so a reader sees one complete board or the other, never a merge of two.
+/// What the webview thread added was ordering *between two human edits*, and
+/// the board's stated discipline for those is already last-writer-wins ("the
+/// human's edits stay last-writer-wins", above). Each command states only what
+/// is specific to it — and `tasks_lock`'s own architecture (file IO under a
+/// process-global lock) is **#747**, untouched here: this slice moves the wait
+/// off the thread that paints, it does not shorten it.
+///
+/// **Reentrancy.** Specific to this one: the board notice is emitted after the
+/// guard is released, so two upserts can announce out of order — a cosmetic
+/// ordering on a notice whose content names the task and its new status, not a
+/// delta, so neither reading is wrong.
 #[tauri::command]
-pub fn orch_upsert_task(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_upsert_task(
+    app: AppHandle,
     group_id: String,
     id: Option<String>,
     title: Option<String>,
@@ -39201,37 +39942,64 @@ pub fn orch_upsert_task(
     note: Option<String>,
     deps: Option<Vec<String>>,
 ) -> Result<Task, String> {
-    let task = reg.upsert_task(
-        &group_id,
-        "human",
-        id.as_deref(),
-        TaskPatch { title, status, note, deps, ..Default::default() },
-    )?;
-    reg.notify_board_edit(&group_id, &format!("{} \"{}\" is now {}", task.id, task.title, task.status));
-    Ok(task)
+    let reg = reg_of(&app);
+    run_blocking(move || {
+        let task = reg.upsert_task(
+            &group_id,
+            "human",
+            id.as_deref(),
+            TaskPatch { title, status, note, deps, ..Default::default() },
+        )?;
+        reg.notify_board_edit(&group_id, &format!("{} \"{}\" is now {}", task.id, task.title, task.status));
+        Ok(task)
+    })
+    .await
 }
 
+/// Delete one task from the board.
+///
+/// Off-thread (#762): the same read-plus-full-board-rewrite under `tasks_lock`
+/// as [`orch_upsert_task`], with an audit append.
+///
+/// **Reentrancy.** The family argument above. Specific to this one: the whole
+/// find-and-remove runs inside `tasks_lock`, so two concurrent deletes cannot
+/// interleave into the loss of a row neither named. They are not
+/// *indistinguishable*, though, and an earlier revision of this paragraph said
+/// they were: the loser of a race for the same id gets an `unknown task` error
+/// rather than a silent no-op, because `delete_task` reports a miss. That is
+/// the honest outcome to surface — the board did change under the click — and
+/// the frontend's `mutate` already toasts it and resyncs.
 #[tauri::command]
-pub fn orch_delete_task(
-    reg: tauri::State<Arc<OrchRegistry>>,
-    group_id: String,
-    id: String,
-) -> Result<(), String> {
-    reg.delete_task(&group_id, "human", &id)?;
-    reg.notify_board_edit(&group_id, &format!("deleted task {id}"));
-    Ok(())
+pub async fn orch_delete_task(app: AppHandle, group_id: String, id: String) -> Result<(), String> {
+    let reg = reg_of(&app);
+    run_blocking(move || {
+        reg.delete_task(&group_id, "human", &id)?;
+        reg.notify_board_edit(&group_id, &format!("deleted task {id}"));
+        Ok(())
+    })
+    .await
 }
 
 /// Delete all `done` tasks in one action. The single board-change notice is
 /// emitted inside `delete_done_tasks` (coalesced for the batch, #120), so —
 /// unlike the single-delete command — none is fanned out here. Returns the ids
 /// removed so the frontend can confirm what it cleared.
+///
+/// Off-thread (#762): one full-board rewrite under `tasks_lock` plus audits.
+///
+/// **Reentrancy.** The family argument on [`orch_upsert_task`]. Specific to
+/// this one: the *selection* is computed inside the guard, from the board this
+/// call is about to rewrite — not from the caller's snapshot — so a task that
+/// an agent moved to `done` a millisecond earlier is either wholly included or
+/// wholly not, and the returned id list is what was actually removed rather
+/// than what the frontend guessed would be.
 #[tauri::command]
-pub fn orch_delete_done_tasks(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_delete_done_tasks(
+    app: AppHandle,
     group_id: String,
 ) -> Result<Vec<String>, String> {
-    reg.delete_done_tasks(&group_id, "human")
+    let reg = reg_of(&app);
+    run_blocking(move || reg.delete_done_tasks(&group_id, "human")).await
 }
 
 /// Delete a specific set of tasks by id — the board's multi-select "delete
@@ -39240,24 +40008,53 @@ pub fn orch_delete_done_tasks(
 /// single-delete command — none is fanned out here. Unknown ids are skipped
 /// (the board may have changed under the selection), not errored. Returns the
 /// ids actually removed so the frontend can confirm what it cleared.
+///
+/// Off-thread (#762): the same `tasks_lock` guard around a full-board rewrite,
+/// plus per-task audit detail.
+///
+/// **Reentrancy.** The family argument on [`orch_upsert_task`]. Specific to
+/// this one: it is deliberately *not* all-or-nothing — ids that no longer name
+/// a row are skipped and audited as skipped, which is exactly the "the board
+/// changed under the human's selection" case a lost race produces. So the
+/// interleaving this conversion admits is one the command already had to
+/// handle, and it reports it rather than silently widening the delete.
 #[tauri::command]
-pub fn orch_delete_tasks(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_delete_tasks(
+    app: AppHandle,
     group_id: String,
     ids: Vec<String>,
 ) -> Result<Vec<String>, String> {
-    reg.delete_tasks(&group_id, "human", &ids)
+    let reg = reg_of(&app);
+    run_blocking(move || reg.delete_tasks(&group_id, "human", &ids)).await
 }
 
+/// Reorder the board — the priority order the orchestrator follows.
+///
+/// Off-thread (#762): a full-board atomic rewrite under `tasks_lock` per call,
+/// and reorders arrive in bursts, so this is the board row whose rate is set by
+/// how fast the human clicks rather than by a discrete considered gesture.
+///
+/// **Reentrancy.** The family argument on [`orch_upsert_task`], plus the one
+/// question a *reordering* has to answer, since `performance.md` §4 X1 keeps
+/// `resize_pty` synchronous on exactly this ground: can two of these land out
+/// of order and leave stale state with nothing to correct it? No, twice over.
+/// The payload is the WHOLE order, never a delta, and each click recomputes it
+/// from the same rendered board — so a rapid pair sends the same array twice
+/// and is idempotent however it interleaves. And where X1 has no event that
+/// re-reports ConPTY's geometry, this has one: any write emits
+/// `orch-tasks-changed`, and every open board re-reads `tasks.json` and
+/// re-renders from it. A losing write cannot leave the UI asserting an order
+/// the file does not have.
 #[tauri::command]
-pub fn orch_reorder_tasks(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_reorder_tasks(
+    app: AppHandle,
     group_id: String,
     ids: Vec<String>,
 ) -> Result<(), String> {
+    let reg = reg_of(&app);
     // No typed notice: reorders come in bursts; board order is read via
     // list_tasks whenever the orchestrator plans.
-    reg.reorder_tasks(&group_id, "human", &ids)
+    run_blocking(move || reg.reorder_tasks(&group_id, "human", &ids)).await
 }
 
 // ---------- merge-gate actions (human side) ----------
@@ -39268,37 +40065,89 @@ pub fn orch_reorder_tasks(
 /// Open a task's issue or PR reference in the default browser. `kind` is
 /// `"issue"` or `"pr"`; `value` is the stored reference (`#12`, `12`, or a
 /// full URL).
+///
+/// Off-thread (#762 — see [`run_blocking`]): up to two BLOCKING `git` spawns to
+/// resolve the remote URL, then an audit append. This is an INV-2 violation
+/// while it is synchronous — a process spawn on the thread that services paint
+/// — and the reason it was `debt` rather than `cheap` even though its body
+/// looks like three statements: the spawns are in `git_remote_web_base`, past
+/// where E1's scan can see. The browser open itself is detached, so the spawns
+/// were the whole cost.
+///
+/// **Reentrancy.** Nothing here mutates orchestration state: it reads the
+/// group's repo (memory, falling back to `group.json`), shells out read-only,
+/// appends one audit line through the audit lock, and hands a URL to the OS.
+/// Two of these racing open two browser tabs, which is what two clicks mean.
 #[tauri::command]
-pub fn orch_open_ref(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_open_ref(
+    app: AppHandle,
     group_id: String,
     kind: String,
     value: String,
 ) -> Result<(), String> {
+    let reg = reg_of(&app);
+    run_blocking(move || orch_open_ref_sync(&reg, &group_id, &kind, &value)).await
+}
+
+/// The body of [`orch_open_ref`], as a plain function so the command stays a
+/// thin delegation (`performance.md` §2 P1) and the resolution logic stays
+/// callable without a Tauri runtime.
+fn orch_open_ref_sync(
+    reg: &OrchRegistry,
+    group_id: &str,
+    kind: &str,
+    value: &str,
+) -> Result<(), String> {
     let repo = reg
-        .group(&group_id)
+        .group(group_id)
         .map(|g| g.repo)
-        .or_else(|| reg.load_group_file(&group_id).map(|(repo, _)| repo))
+        .or_else(|| reg.load_group_file(group_id).map(|(repo, _)| repo))
         .ok_or("unknown group")?;
     let base = git_remote_web_base(&repo);
-    let url = resolve_ref_url(base.as_deref(), &kind, &value)
+    let url = resolve_ref_url(base.as_deref(), kind, value)
         .ok_or("no URL for this reference — the repo may have no GitHub remote")?;
-    reg.audit(&group_id, "human", "open-ref", json!({ "kind": kind, "url": url }));
+    reg.audit(group_id, "human", "open-ref", json!({ "kind": kind, "url": url }));
     open_external_url(&url)
 }
 
 /// Approve a merge-gate item: mark it done and notify the orchestrator to
 /// merge. The human's direct sign-off, so the status change is applied here.
+/// Off-thread (#762): an [`orch_upsert_task`]-sized board write under
+/// `tasks_lock`, plus minting the grant file, plus the delivery.
+///
+/// **Reentrancy.** The board write itself is the family argument on
+/// [`orch_upsert_task`]. Specific to this one, and worth stating rather than
+/// waving at: the merge-gate check is a check-then-act (`ensure_at_merge_gate`,
+/// then the upsert), so a second Approve that used to arrive *after* the first
+/// — and be refused, the item no longer being at the gate — can now overlap it
+/// and pass. What that produces is bounded by the grant's own shape: the grant
+/// is keyed `merge_grants/pr-<N>` and written with `atomic_write`, so two mints
+/// for one PR leave ONE single-use file, not two authorizations. The duplicate
+/// is a duplicate *notice* to the orchestrator, never a second merge — and
+/// `pr_number` resolves the key from the task's own ref, so the two racers
+/// cannot even grant different PRs.
+///
+/// **The board write is not idempotent, though** (rev-260): the approval note
+/// is pushed onto the task's note list, not set, and that list is capped at
+/// `MAX_TASK_NOTES`. So a duplicate approve leaves two identical notes and
+/// pushes the oldest ones one step closer to `cap_task_notes`' collapse — which
+/// preserves them as a counted placeholder rather than dropping them silently,
+/// so nothing is lost outright, but the task's readable history is shortened by
+/// a click that changed nothing. The authority is bounded; the note trail is
+/// not. The same unguarded gate check is shared with [`orch_request_changes`]
+/// and [`orch_proceed_task`], so the widening is the trio's, not this command's
+/// alone.
 #[tauri::command]
-pub fn orch_approve_task(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_approve_task(
+    app: AppHandle,
     group_id: String,
     id: String,
     // Optional approve-with-comment note (#83): delivered to the orchestrator with
     // the one-time merge grant, e.g. "approved — also bump the changelog first".
     comment: Option<String>,
 ) -> Result<Task, String> {
-    reg.approve_task(&group_id, &id, comment.as_deref())
+    let reg = reg_of(&app);
+    run_blocking(move || reg.approve_task(&group_id, &id, comment.as_deref())).await
 }
 
 /// Approve a whole board selection at the merge gate (#507): one per-PR
@@ -39306,28 +40155,62 @@ pub fn orch_approve_task(
 /// issued N times — and ONE consolidated notice to the orchestrator instead
 /// of N prompts. All-or-nothing: if any item is not at the merge gate the
 /// call fails having minted nothing.
+/// Off-thread (#762): one board write plus a grant file minted PER ITEM, under
+/// the same guard — so the file count scales with the selection.
+///
+/// **Reentrancy.** As [`orch_approve_task`]. The all-or-nothing pre-flight is
+/// narrower than it sounds and is worth stating exactly, since this is the
+/// command that mints merge grants in bulk (rev-260 B4). It is all-or-nothing
+/// **against the batch's own items** — every id must exist, be at the gate, and
+/// name a PR no sibling names, before anything is written — and it reads the
+/// board through `tasks()`, which takes NO lock. The write loop that follows
+/// takes `tasks_lock` once per item and does not re-check the gate. So a racer
+/// that flips an item out of the merge gate after the snapshot is invisible to
+/// this call: the batch approves that item and mints its grant, and returns
+/// `Ok`. An earlier revision of this paragraph claimed the opposite — that such
+/// a racer makes the call fail having minted nothing — which describes neither
+/// the code nor any guard it has.
+///
+/// That interleaving predates the conversion (the MCP board tools have always
+/// run on their own threads), and #762 does not widen it: the pre-flight and
+/// the writes were never one critical section on any thread. It is recorded
+/// here rather than fixed because making it true means re-checking each item's
+/// gate state under the write lock, which changes #507's designed batch
+/// semantics — see the PR discussion.
 #[tauri::command]
-pub fn orch_approve_tasks(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_approve_tasks(
+    app: AppHandle,
     group_id: String,
     // Board selection in board order, each with its own optional note.
     items: Vec<ApproveItem>,
 ) -> Result<Vec<Task>, String> {
-    reg.approve_tasks(&group_id, &items)
+    let reg = reg_of(&app);
+    run_blocking(move || reg.approve_tasks(&group_id, &items)).await
 }
 
 /// Issue a one-time human merge grant for a PR (#83), independent of the board —
 /// a human-pane path to authorize exactly one default-branch merge. Optional
 /// comment is delivered to the orchestrator with the grant. HUMAN-ONLY (Tauri
 /// command; no MCP tool reaches grant-writing).
+/// Off-thread (#762): the grant file write, an audit append, and the delivery
+/// of the grant to the orchestrator's pane.
+///
+/// **Reentrancy.** The grant is a single `atomic_write` to a path keyed by the
+/// PR number, carrying an expiry and a nonce from a process-global counter.
+/// Two mints for one PR therefore produce one file with one nonce — the shim
+/// consumes one merge either way — and two mints for different PRs touch
+/// different paths. There is no read-modify-write to lose and no shared
+/// directory state to corrupt, so nothing here depended on the webview thread;
+/// what it contributed was the order of two notices.
 #[tauri::command]
-pub fn orch_grant_merge(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_grant_merge(
+    app: AppHandle,
     group_id: String,
     pr: String,
     comment: Option<String>,
 ) -> Result<u64, String> {
-    reg.grant_merge(&group_id, &pr, comment.as_deref(), "human")
+    let reg = reg_of(&app);
+    run_blocking(move || reg.grant_merge(&group_id, &pr, comment.as_deref(), "human")).await
 }
 
 /// Issue a human release grant for `tag` (#83/#438): authorizes the whole
@@ -39335,51 +40218,77 @@ pub fn orch_grant_merge(
 /// for `RELEASE_GRANT_TTL_SECS`, not a single command. Releases are never
 /// blanket-allowed by autonomous mode, so this explicit grant is the only path.
 /// Optional comment delivered to the orchestrator. HUMAN-ONLY.
+/// Off-thread (#762): grant file, audit append and delivery.
+///
+/// **Reentrancy.** [`orch_grant_merge`]'s argument against an independent
+/// directory, keyed by tag rather than PR number: one atomic write per tag, no
+/// read-modify-write, and a TTL the file carries itself rather than inferring
+/// from arrival order.
 #[tauri::command]
-pub fn orch_grant_release(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_grant_release(
+    app: AppHandle,
     group_id: String,
     tag: String,
     comment: Option<String>,
 ) -> Result<(), String> {
-    reg.grant_release(&group_id, &tag, comment.as_deref(), "human")
+    let reg = reg_of(&app);
+    run_blocking(move || reg.grant_release(&group_id, &tag, comment.as_deref(), "human")).await
 }
 
 /// Request changes on a merge-gate item: record the findings and deliver them
 /// to the orchestrator to route back to a worker.
+/// Off-thread (#762): extra `tasks.json` reads on top of an upsert-sized write
+/// under `tasks_lock`, plus a delivery to the worker.
+///
+/// **Reentrancy.** The family argument on [`orch_upsert_task`]. Specific to the
+/// start/proceed/request-changes trio: each is a status transition the
+/// orchestrator is *told about* rather than one it infers, so two of them
+/// racing deliver two notices about a board whose final state both notices name
+/// explicitly — the orchestrator reads the board, not the sequence of prompts.
 #[tauri::command]
-pub fn orch_request_changes(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_request_changes(
+    app: AppHandle,
     group_id: String,
     id: String,
     findings: String,
 ) -> Result<Task, String> {
-    reg.request_changes(&group_id, &id, &findings)
+    let reg = reg_of(&app);
+    run_blocking(move || reg.request_changes(&group_id, &id, &findings)).await
 }
 
 /// Start a queued item: record a human-attributed note and tell the
 /// orchestrator to begin work. Does not flip the status — the orchestrator
 /// moves it to `in-progress` when it actually assigns a worker.
+/// Off-thread (#762): the same shape as [`orch_request_changes`] — extra board
+/// reads, an upsert-sized write under `tasks_lock`, and a delivery.
+///
+/// **Reentrancy.** As [`orch_request_changes`]. Specific to this one: it
+/// deliberately does NOT flip the status (the orchestrator does that when it
+/// actually assigns a worker), so it has no transition to lose a race over — it
+/// records a human-attributed note and asks.
 #[tauri::command]
-pub fn orch_start_task(
-    reg: tauri::State<Arc<OrchRegistry>>,
-    group_id: String,
-    id: String,
-) -> Result<Task, String> {
-    reg.start_task(&group_id, &id)
+pub async fn orch_start_task(app: AppHandle, group_id: String, id: String) -> Result<Task, String> {
+    let reg = reg_of(&app);
+    run_blocking(move || reg.start_task(&group_id, &id)).await
 }
 
 /// Proceed on a prototype item (#147): flip it to `in-progress`, record the
 /// human's sign-off, and tell the orchestrator to promote the prototype to a
 /// full production build. The human's demo-gate verdict, so the status change
 /// is applied here (mirrors `orch_approve_task`).
+/// Off-thread (#762): extra board reads, an upsert-sized write under
+/// `tasks_lock` and a delivery; the third member of the
+/// start/proceed/request-changes trio.
+///
+/// **Reentrancy.** As [`orch_request_changes`]. Specific to this one: like
+/// approve, it applies the status change itself (the human's demo-gate
+/// verdict), so a duplicate lands the same `in-progress` twice and delivers two
+/// promote notices — idempotent on the board, and the second notice names the
+/// same item and the same verdict.
 #[tauri::command]
-pub fn orch_proceed_task(
-    reg: tauri::State<Arc<OrchRegistry>>,
-    group_id: String,
-    id: String,
-) -> Result<Task, String> {
-    reg.proceed_task(&group_id, &id)
+pub async fn orch_proceed_task(app: AppHandle, group_id: String, id: String) -> Result<Task, String> {
+    let reg = reg_of(&app);
+    run_blocking(move || reg.proceed_task(&group_id, &id)).await
 }
 
 #[cfg(test)]
