@@ -3992,9 +3992,9 @@ pub(crate) fn default_model(cli: &str, role: Role) -> &'static str {
     // — the thing #329 says ages badly — and would also silently override a
     // human who had already chosen. A block that wants a specific model pins
     // its own `model:`, and the launcher offers a curated list.
-    if cli == "opencode" {
-        return "";
-    }
+    // TEMPORARY (#722, red-before-green probe — restored in the very next
+    // commit): this arm is removed so `opencode_blocks_default_to_no_model_at_all`
+    // can be SEEN to fail on CI, which is the evidence it arrived without.
     match role {
         Role::Orchestrator | Role::Planner => "opus",
         Role::Worker | Role::Reviewer => "sonnet",
