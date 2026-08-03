@@ -142,4 +142,7 @@ command also needs an ACL grant** (#363): add its bare name to
 `command_manifest::APP_COMMANDS`, then grant it to `main` — directly in
 `capabilities/default.json` or via one of the sets under `permissions/sets/`
 aggregated into `main-ui`. `tests/acl_manifest.rs` fails loudly if either step
-is missed; see doc/design/acl-manifest.md.
+is missed; see doc/design/acl-manifest.md. A new command, event listener or
+timer must also satisfy the webview-thread responsiveness invariants, which
+`tests/perf_dispatch.rs` and `test/perfpolicy.test.ts` enforce against a
+declared manifest — see doc/design/performance.md.
