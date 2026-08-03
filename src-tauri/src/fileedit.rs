@@ -524,6 +524,7 @@ pub fn write_file(
     if path.is_dir() {
         return Err(err("is-dir", format!("path is a directory: {rel}")));
     }
+    let _gate = WRITE_GATE.lock_safe();
     if let Some(expected) = expected_hash.filter(|h| !h.is_empty()) {
         // The caller read the file first and expects it unchanged. Compare
         // against what's on disk *now*; any drift (edited, deleted) is a conflict.

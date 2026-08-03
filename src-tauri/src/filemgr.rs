@@ -52,6 +52,37 @@ use std::path::{Path, PathBuf};
 use crate::fileedit::{err, safe_resolve};
 use tauri::{AppHandle, Emitter};
 
+/// Serializes the three MUTATING gestures this module moved off the webview
+/// thread (#746): `new_folder`, `new_file`, `rename`.
+///
+/// **Why one of them needed it and the other two came along.** Two of the three
+/// refuse-if-present checks are atomic in the filesystem itself and say so in
+/// their own docs: `new_file`'s `create_new(true)` is called out as "the
+/// load-bearing flag", with its `exists()` check explicitly demoted to "only
+/// there for the nicer message", and `new_folder`'s `create_dir` is the same
+/// refuse-if-present shape. `rename` is NOT: its clobber guard is a plain
+/// `to.exists()` followed by `fs::rename`, and that gap was closed only by
+/// Tauri running the sync command alone on the webview thread. Off-thread, two
+/// renames racing for one target name — or a rename racing a create of it —
+/// can both find the target absent, and `fs::rename` then overwrites without a
+/// word (on Windows too: `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`). The
+/// file that vanishes is the one the doc says a file manager must never lose to
+/// a rename typo.
+///
+/// So the gate covers the *set*, not just `rename`: making one operation
+/// exclusive against itself would still leave a `new_file` free to land inside
+/// its check-then-rename window. Three single syscalls under one mutex costs
+/// nothing anybody waits on, and it is exactly the exclusion dispatch used to
+/// give for free.
+///
+/// **`fm_delete_start` is deliberately NOT here**, and that is not an
+/// oversight: it has run on its own thread since #216, so a delete racing a
+/// rename is a window this conversion did not open and this gate would not
+/// close. Holding a shared mutex across `SHFileOperationW` over a
+/// `node_modules`-sized tree would also block every create and rename for
+/// minutes — trading a rare, pre-existing race for a routine freeze.
+static MUTATION_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Does any component of `rel` name something Windows would silently MANGLE?
 ///
 /// The Win32 path layer strips trailing spaces and dots from each component before
@@ -288,6 +319,7 @@ pub fn new_folder(root: &str, rel: &str, name: &str) -> Result<String, String> {
     let name = validate_name(name)?;
     let child = join_rel(rel, &name);
     let path = resolve(root, &child)?;
+    let _gate = crate::obs::LockExt::lock_safe(&MUTATION_GATE);
     if path.exists() {
         return Err(err("exists", format!("'{name}' already exists")));
     }
@@ -314,6 +346,7 @@ pub fn new_file(root: &str, rel: &str, name: &str) -> Result<String, String> {
     let name = validate_name(name)?;
     let child = join_rel(rel, &name);
     let path = resolve(root, &child)?;
+    let _gate = crate::obs::LockExt::lock_safe(&MUTATION_GATE);
     if path.exists() {
         return Err(err("exists", format!("'{name}' already exists")));
     }
@@ -340,6 +373,8 @@ pub fn rename(root: &str, rel: &str, name: &str) -> Result<String, String> {
     let name = validate_name(name)?;
     // Same guard as delete: renaming the pane's own root is not a thing.
     let from = resolve_child(root, rel)?;
+    // The check-then-act below is the reason [`MUTATION_GATE`] exists.
+    let _gate = crate::obs::LockExt::lock_safe(&MUTATION_GATE);
     if !from.exists() {
         return Err(err("not-found", format!("'{rel}' no longer exists")));
     }
@@ -837,19 +872,28 @@ pub fn capabilities() -> Caps {
 // argued reason.
 //
 // **Reentrancy — the family argument, for the four filesystem gestures below.**
-// Synchronous dispatch used to order them against each other; nothing else did,
-// and nothing else needs to. Each is a SINGLE filesystem operation whose
-// atomicity was never this process's to provide: `create_dir`, `File::create`
-// and `rename` are the OS's own units, and every one of them already had to
-// tolerate the agent running in the pane doing exactly the same thing at
-// exactly the same moment — a file manager watching a live working directory
-// has no exclusive access to it and never claimed any. So two gestures racing
-// resolve to whichever the filesystem applies first, with the loser getting the
-// same typed `exists`/`not-found` error it would get from losing to the agent,
-// and `fm_list` sees the directory on one side of that change or the other.
-// What is NOT in this class is a read-then-write, which can lose an update
-// where a single syscall cannot — this module has none (that is `fileedit`'s
-// `WRITE_GATE`, and `sessions`'s launch-intent lock).
+// Synchronous dispatch used to order them against each other, and the honest
+// answer is that it was doing real work for ONE of them.
+//
+// `fm_list` is a read: it sees the directory on one side of a concurrent change
+// or the other, which is all a listing has ever been — the agent in the pane can
+// `mkdir` between the frontend's request and this walk, and always could.
+//
+// `fm_new_folder` and `fm_new_file` refuse an existing target in a SINGLE
+// syscall, and each says so where it is implemented: `create_new(true)` is
+// called out in `new_file`'s own doc as the load-bearing flag with its
+// `exists()` check demoted to "only there for the nicer message", and
+// `create_dir` (not `_all`) is the same refuse-if-present shape. Their
+// atomicity was never this process's to provide, so the conversion does not
+// touch it.
+//
+// `fm_rename` is the one that is NOT in that class, and the family argument
+// would be wrong if it swept it in: its clobber guard is `to.exists()` followed
+// by `fs::rename`, a check-then-act whose window was closed by nothing but the
+// single dispatch thread. That is what [`MUTATION_GATE`] is for — see its doc
+// for why the gate covers all three mutations rather than `rename` alone, and
+// `concurrent_renames_onto_one_target_leave_exactly_one_winner_and_lose_no_file`
+// in `tests/filemgr.rs` for the file it stops disappearing.
 
 #[tauri::command]
 pub async fn fm_list(root: String, rel: String) -> Result<Vec<FmEntry>, String> {
