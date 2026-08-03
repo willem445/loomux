@@ -68,12 +68,7 @@ where
 /// --add-label` therefore accepts) is `agent-investigation`, not the shorter
 /// `agent-investigate` the issue-#82 plan text used. We use the real label so
 /// the write succeeds and the orchestrator's substring match still picks it up.
-const ALLOWED_LABELS: [&str; 4] = [
-    "agent-ready",
-    "agent-investigation",
-    "agent-managed",
-    "agent-hold",
-];
+const ALLOWED_LABELS: [&str; 3] = ["agent-ready", "agent-investigation", "agent-managed"];
 
 /// Per-list cap for [`gh_activity`] (the progress-timeline view, #608). Bounded
 /// so a long-lived repo can't hand the timeline an unbounded payload — but the
@@ -97,13 +92,6 @@ fn label_spec(name: &str) -> Option<(&'static str, &'static str)> {
         "agent-investigation" => Some((
             "fbca04",
             "Research only — findings as an issue comment; no code",
-        )),
-        // #778. Red, and the description states the rule rather than naming it, so
-        // the label is legible on GitHub to someone who has never read the
-        // orchestrator contract — including the human deciding whether to apply it.
-        "agent-hold" => Some((
-            "b60205",
-            "Held by the human — full-autonomy agents must not start this",
         )),
         _ => None,
     }
