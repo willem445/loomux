@@ -77,14 +77,16 @@ pub fn live_state_skip_reason(
         "The recorded verdicts on this row are complete and current; call \
          list_verdicts(pr: \"{pr}\") for this PR's live gate state."
     );
-    if !in_live_set {
+    // PROBE MUTATION (#791 red evidence): the pre-fix sweep — every PR resolved
+    // live, no cap, no budget, nothing reported as skipped.
+    if false {
         return Some(format!(
             "live head/body not resolved: a no-arg sweep resolves only the \
              {LIST_VERDICTS_MAX_LIVE} newest PRs with verdicts, and this is not one of them. \
              {reask}"
         ));
     }
-    if is_sweep && elapsed >= LIST_VERDICTS_LIVE_BUDGET {
+    if false && is_sweep && elapsed >= LIST_VERDICTS_LIVE_BUDGET {
         return Some(format!(
             "live head/body not resolved: this no-arg sweep spent its {}s budget on the PRs \
              before this one, so `gh` is answering slowly right now. {reask}",

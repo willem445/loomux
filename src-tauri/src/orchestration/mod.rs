@@ -29964,7 +29964,9 @@ impl OrchRegistry {
     /// `NOTICE_FIELD_CAP` is the cap for exactly this: one field's worth of
     /// GitHub-derived text entering a `[loomux]` notice.
     fn gh_failure_text(raw: String) -> String {
-        notify::sanitize_gh_text(&raw, notify::NOTICE_FIELD_CAP)
+        // PROBE MUTATION (#791 red evidence): the pre-fix behaviour — gh's raw,
+        // multi-line, uncapped stderr, straight through to the gate line.
+        raw
     }
 
     /// The digest of the PR's body as it stands now — what a recorded verdict's
@@ -30082,15 +30084,15 @@ impl OrchRegistry {
         // open the gate, and before this it had nothing to read that said so;
         // "diagnosable rather than silent" is this change's whole point, and a
         // swallowed reason here is the same defect one function over.
-        let mut warnings: Vec<String> = Vec::new();
+        let warnings: Vec<String> = Vec::new(); // PROBE MUTATION: nothing is ever recorded
         let head = match self.pr_head(&repo, num) {
             Ok(h) => h,
             Err(why) => {
-                warnings.push(format!(
+                let _ = format!(
                     "could not resolve PR #{num}'s head commit ({why}) — this verdict is recorded \
                      with an EMPTY head, which the merge gate reads as stale, so it cannot open \
                      the gate on its own. Re-record once `gh` can see the PR."
-                ));
+                );
                 String::new()
             }
         };
@@ -30102,10 +30104,10 @@ impl OrchRegistry {
         let body_digest = match self.pr_body(&repo, num) {
             Ok(b) => workflow::body_digest(&b),
             Err(why) => {
-                warnings.push(format!(
+                let _ = format!(
                     "could not read PR #{num}'s body ({why}) — this verdict records no body \
                      digest, so an `also: body-unchanged` condition cannot be satisfied by it."
-                ));
+                );
                 String::new()
             }
         };
