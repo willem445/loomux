@@ -9247,6 +9247,20 @@ pub struct OrchRegistry {
     /// integration tests record a verdict against a known body and then edit it —
     /// the race #565 is about — without a live GitHub PR. `None` in the app.
     pr_body_override: Mutex<Option<String>>,
+    /// Test seam (#791): when set, `gh_capture` runs THIS program on THIS
+    /// deadline instead of the resolved `gh` on `GH_CAPTURE_TIMEOUT`.
+    ///
+    /// The property it exists for — the `gh` reads on the MCP request path are
+    /// **bounded**, so a stalled child returns a diagnosable error instead of
+    /// wedging the calling agent's turn — is not reachable through the two seams
+    /// above: they short-circuit before the spawn, which is precisely their job.
+    /// Nor through the real `gh`, which no test in this repo may run
+    /// (constraint 3) and which answers in milliseconds on a CI runner anyway.
+    /// So a test points this at a script that outlives the deadline and asserts
+    /// the call comes back at all. The deadline rides along because the
+    /// production bound is 20 seconds and a suite that spends 20 seconds per
+    /// timeout assertion is a suite people stop running. `None` in the app.
+    gh_exec_override: Mutex<Option<(PathBuf, Duration)>>,
     /// Groups the human has paused: loomux stops delivering prompts/kickoffs
     /// to them so their agents idle out (see `deliver_prompt`). Mirrored to a
     /// `paused` marker file per group so it survives restarts.
@@ -19491,6 +19505,7 @@ impl OrchRegistry {
             group_file_io: Mutex::new(()),
             pr_head_override: Mutex::new(None),
             pr_body_override: Mutex::new(None),
+            gh_exec_override: Mutex::new(None),
             paused: Mutex::new(HashSet::new()),
             spawn_times: Mutex::new(HashMap::new()),
             self_arc: Mutex::new(Weak::new()),
@@ -22767,31 +22782,46 @@ impl OrchRegistry {
     /// Shell out to `gh` in `repo` and capture stdout on success / stderr on
     /// failure. Resolves the binary through `winpath::resolve_program` (a bare
     /// `Command::new("gh")` won't resolve a Windows `gh.cmd` shim-free — see
-    /// `write_shim`'s note, and the same resolution `pr_head`-shaped helpers
-    /// elsewhere in this file use) and pins `CREATE_NO_WINDOW` so no console
-    /// flashes on a Windows host. This is the only place the notify poller
-    /// spawns a process, and the argv is always backend-built from a `u64`
-    /// (see `notify::Condition`) — never caller text — so nothing
-    /// agent-controlled ever reaches a command line. `repo` comes from the
-    /// caller's group (resolved server-side), never from an argument, so
-    /// constraint 6 (group_id as a trusted path segment) is never engaged
-    /// here either.
+    /// `write_shim`'s note) and pins `CREATE_NO_WINDOW` so no console flashes
+    /// on a Windows host. `repo` comes from the caller's group (resolved
+    /// server-side), never from an argument, so constraint 6 (group_id as a
+    /// trusted path segment) is never engaged here.
     ///
-    /// NB: this is a fresh helper, not a lift of an existing `pr_head` — at
-    /// the time this landed, `main` had no `pr_head` (it exists only on the
-    /// not-yet-merged #222 branch). Once #222 merges, a follow-up should fold
-    /// `pr_head` into this shared helper rather than keep two copies of the
-    /// same subprocess shape.
+    /// **This is the one place the backend spawns `gh`** (#791). It began as
+    /// the notify poller's helper, with `pr_head`/`pr_body` keeping a second
+    /// copy of the same subprocess shape — and that copy was the copy without
+    /// the bound: `list_verdicts` walked every verdict PR through it and a
+    /// slow network wedged the calling agent's MCP turn outright, with no
+    /// error and no way to tell what it was waiting on. So the fold the
+    /// original note here asked for once #222 merged is done, and the reason
+    /// it matters is stronger than tidiness: a second spawn site is a second
+    /// site that can be written without `capture_with_timeout`.
+    ///
+    /// Two consequences of routing the MCP path through here, both deliberate:
+    /// every `gh` read in the process now shares the abandoned-reader ceiling
+    /// (`GH_CAPTURE_MAX_LEAKED_READERS`), so a wedged poller can refuse an MCP
+    /// read with a named backlog error — which is the trade `capture_with_timeout`
+    /// already documents, and a named refusal beats a hang; and the argv is no
+    /// longer always backend-built from a `u64`, since `pr_head`/`pr_body` build
+    /// theirs from a parsed PR number. That number is `pr_number`-parsed into a
+    /// `u64` before it gets here, so it is still never caller text on a command
+    /// line.
     fn gh_capture(&self, repo: &str, args: &[&str]) -> Result<String, String> {
         if !Path::new(repo).is_dir() {
             return Err(format!("no such directory: {repo}"));
         }
-        let Some(program) = crate::winpath::resolve_program(
-            "gh",
-            &crate::winpath::launch_path(),
-            &crate::winpath::launch_pathext(),
-        ) else {
-            return Err("gh-not-found".to_string());
+        let (program, timeout) = match self.gh_exec_override.lock_safe().clone() {
+            Some(exec) => exec,
+            None => {
+                let Some(program) = crate::winpath::resolve_program(
+                    "gh",
+                    &crate::winpath::launch_path(),
+                    &crate::winpath::launch_pathext(),
+                ) else {
+                    return Err("gh-not-found".to_string());
+                };
+                (program, GH_CAPTURE_TIMEOUT)
+            }
         };
         let mut cmd = std::process::Command::new(program);
         cmd.current_dir(repo)
@@ -22804,7 +22834,14 @@ impl OrchRegistry {
             use std::os::windows::process::CommandExt;
             cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
         }
-        Self::capture_with_timeout(cmd, GH_CAPTURE_TIMEOUT)
+        Self::capture_with_timeout(cmd, timeout)
+    }
+
+    /// Test seam: see `gh_exec_override`. `None` restores the real `gh` on the
+    /// production deadline.
+    #[doc(hidden)] // pub for integration tests
+    pub fn set_gh_exec_override(&self, exec: Option<(PathBuf, Duration)>) {
+        *self.gh_exec_override.lock_safe() = exec;
     }
 
     /// Run `cmd` to completion and capture it the way `Command::output()`
@@ -30063,32 +30100,25 @@ impl OrchRegistry {
     /// `pr_head_override` is the test seam (mirroring `claude_projects_dir`): the
     /// integration tests must be able to record a verdict against a known revision
     /// without a GitHub repo, and every one of them drives the real MCP dispatch.
-    fn pr_head(&self, repo: &str, pr: u64) -> Option<String> {
+    ///
+    /// `Err` carries **why** rather than collapsing to `None` (#791): a read that
+    /// timed out and a PR that does not exist are the same absence to the gate,
+    /// and completely different things to the agent staring at the answer.
+    fn pr_head(&self, repo: &str, pr: u64) -> Result<String, String> {
         if let Some(sha) = self.pr_head_override.lock_safe().clone() {
-            return Some(sha);
+            return Ok(sha);
         }
-        if !Path::new(repo).is_dir() {
-            return None;
+        let out = self
+            .gh_capture(
+                repo,
+                &["pr", "view", &pr.to_string(), "--json", "headRefOid", "--jq", ".headRefOid"],
+            )
+            .map_err(Self::gh_failure_text)?;
+        let sha = workflow::sanitize_sha(&out);
+        if sha.is_empty() {
+            return Err(format!("gh pr view #{pr}: no head oid in the response"));
         }
-        let gh = crate::winpath::resolve_program(
-            "gh",
-            &crate::winpath::launch_path(),
-            &crate::winpath::launch_pathext(),
-        )?;
-        let mut cmd = std::process::Command::new(gh);
-        cmd.current_dir(repo)
-            .args(["pr", "view", &pr.to_string(), "--json", "headRefOid", "--jq", ".headRefOid"]);
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW — never flash a console
-        }
-        let out = cmd.output().ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        let sha = workflow::sanitize_sha(&String::from_utf8_lossy(&out.stdout));
-        (!sha.is_empty()).then_some(sha)
+        Ok(sha)
     }
 
     /// Test seam: pretend `gh pr view --json headRefOid` returns this commit for
@@ -30103,41 +30133,53 @@ impl OrchRegistry {
     /// verdict reviews (#565), and on a squash-merging repo the text that becomes
     /// the permanent commit message.
     ///
-    /// `None` when gh is absent, unauthenticated, or the PR isn't there. That is
-    /// deliberately distinct from `Some(String::new())`, a PR with a genuinely
-    /// empty body: the first means *unknown* (fail closed — no digest is recorded
-    /// and nothing may claim the body is unchanged), the second is a real body that
-    /// digests like any other.
-    fn pr_body(&self, repo: &str, pr: u64) -> Option<String> {
+    /// `Err` when gh is absent, unauthenticated, the read timed out, or the PR
+    /// isn't there. That is deliberately distinct from `Ok(String::new())`, a PR
+    /// with a genuinely empty body: the first means *unknown* (fail closed — no
+    /// digest is recorded and nothing may claim the body is unchanged), the second
+    /// is a real body that digests like any other. Since #791 the `Err` also says
+    /// which of those it was, because "the body is unreadable" and "the body read
+    /// hit its 20-second bound" want different reactions from whoever is reading.
+    fn pr_body(&self, repo: &str, pr: u64) -> Result<String, String> {
         if let Some(body) = self.pr_body_override.lock_safe().clone() {
-            return Some(body);
+            return Ok(body);
         }
-        if !Path::new(repo).is_dir() {
-            return None;
-        }
-        let gh = crate::winpath::resolve_program(
-            "gh",
-            &crate::winpath::launch_path(),
-            &crate::winpath::launch_pathext(),
-        )?;
-        let mut cmd = std::process::Command::new(gh);
-        cmd.current_dir(repo)
-            .args(["pr", "view", &pr.to_string(), "--json", "body", "--jq", ".body"]);
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW — never flash a console
-        }
-        let out = cmd.output().ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        Some(String::from_utf8_lossy(&out.stdout).into_owned())
+        self.gh_capture(repo, &["pr", "view", &pr.to_string(), "--json", "body", "--jq", ".body"])
+            .map_err(Self::gh_failure_text)
+    }
+
+    /// A failed `gh` read's message, made safe to quote back to an agent
+    /// (rev-lead finding 1 on #791).
+    ///
+    /// The `Err` side of these two reads is **`gh`'s raw stderr** — multi-line,
+    /// uncapped, and carrying whatever the remote said. Before #791 it went
+    /// nowhere; now it is surfaced deliberately (that is the diagnosability
+    /// half of this change), and one of the places it surfaces is the gate line
+    /// that `review_verdict` pastes into the ORCHESTRATOR'S PANE inside a
+    /// `[loomux] …` notice. So a stderr carrying a newline plus the literal
+    /// `[loomux]` forges a line that reads as loomux's own — the same forgery
+    /// `notify::sanitize_gh_text` was written for, where the attacker-controlled
+    /// text was a fork PR's workflow job name.
+    ///
+    /// Sanitized HERE, at the two functions that mint these errors, rather than
+    /// at each place one is displayed: a per-call-site fix leaves the next
+    /// consumer of `pr_head`/`pr_body` exposed, and this change added three
+    /// consumers at once. Deliberately NOT pushed down into `gh_capture`, whose
+    /// other caller is the notify poller — `notify::condition_poll_result`
+    /// classifies on stderr text (`Err("no checks reported")` → `Pending`), so
+    /// capping and rewriting it there would change poll classification, which
+    /// is a different change with a different argument.
+    ///
+    /// `NOTICE_FIELD_CAP` is the cap for exactly this: one field's worth of
+    /// GitHub-derived text entering a `[loomux]` notice.
+    fn gh_failure_text(raw: String) -> String {
+        notify::sanitize_gh_text(&raw, notify::NOTICE_FIELD_CAP)
     }
 
     /// The digest of the PR's body as it stands now — what a recorded verdict's
-    /// `body_digest` is compared against. `None` when the body can't be read.
-    fn pr_body_digest(&self, group: &str, pr: u64) -> Option<String> {
+    /// `body_digest` is compared against. `Err` (carrying why) when the body
+    /// can't be read.
+    fn pr_body_digest(&self, group: &str, pr: u64) -> Result<String, String> {
         let repo = self.group(group).map(|g| g.repo).unwrap_or_default();
         self.pr_body(&repo, pr).map(|b| workflow::body_digest(&b))
     }
@@ -30165,13 +30207,18 @@ impl OrchRegistry {
     /// Empty on both counts when the current body cannot be read, or when the
     /// verdicts carry no digest: "cannot tell" is reported by the gate that refuses,
     /// never as a drift claim here.
-    fn body_drift(&self, group: &str, pr: u64) -> (Vec<String>, Vec<String>) {
-        let Some(now) = self.pr_body_digest(group, pr) else {
+    ///
+    /// `now` is the PR body's digest as it stands, passed IN rather than fetched
+    /// here (#791). It is the same fact `list_verdicts` needs to answer
+    /// `body_changed` per verdict, and fetching it twice per PR meant the no-arg
+    /// fan-out spent three `gh` calls per PR on two facts.
+    fn body_drift(&self, group: &str, pr: u64, now: Option<&str>) -> (Vec<String>, Vec<String>) {
+        let Some(now) = now else {
             return (Vec::new(), Vec::new());
         };
         let (mut passed, mut blocking) = (Vec::new(), Vec::new());
         for v in self.verdicts(group, pr) {
-            if v.body_changed(Some(&now)) == Some(true) {
+            if v.body_changed(Some(now)) == Some(true) {
                 if v.verdict.is_blocking() {
                     blocking.push(v.block);
                 } else {
@@ -30207,7 +30254,7 @@ impl OrchRegistry {
         pr: &str,
         verdict: &str,
         summary: &str,
-    ) -> Result<workflow::ReviewVerdict, String> {
+    ) -> Result<(workflow::ReviewVerdict, Vec<String>), String> {
         let a = self.agent(agent_id).ok_or_else(|| format!("unknown agent: {agent_id}"))?;
         if a.group != group {
             return Err(format!("unknown agent: {agent_id}")); // never leak other groups' ids
@@ -30237,14 +30284,40 @@ impl OrchRegistry {
         // stored empty, which the gate reads as stale — so a verdict loomux could
         // not bind to a commit can never open a gate on its own.
         let repo = self.group(group).map(|g| g.repo).unwrap_or_default();
-        let head = self.pr_head(&repo, num).unwrap_or_default();
+        // Both reads are still best-effort — an unresolvable head or body is
+        // stored empty and the gate fails closed on it — but the REASON is no
+        // longer dropped on the floor (rev-lead, #791). A reviewer whose verdict
+        // silently records no head has done everything right and still cannot
+        // open the gate, and before this it had nothing to read that said so;
+        // "diagnosable rather than silent" is this change's whole point, and a
+        // swallowed reason here is the same defect one function over.
+        let mut warnings: Vec<String> = Vec::new();
+        let head = match self.pr_head(&repo, num) {
+            Ok(h) => h,
+            Err(why) => {
+                warnings.push(format!(
+                    "could not resolve PR #{num}'s head commit ({why}) — this verdict is recorded \
+                     with an EMPTY head, which the merge gate reads as stale, so it cannot open \
+                     the gate on its own. Re-record once `gh` can see the PR."
+                ));
+                String::new()
+            }
+        };
         // …and the BODY it reviewed (#565). Computed here, never passed in: a
         // property that depends on the reviewer remembering to include it is an
         // intention, not a mechanism — and a reviewer cannot record the digest of a
         // body it did not read if it never touches the digest at all. Unreadable
         // body → empty, which reads as unknown and can satisfy nothing.
-        let body_digest =
-            self.pr_body(&repo, num).map(|b| workflow::body_digest(&b)).unwrap_or_default();
+        let body_digest = match self.pr_body(&repo, num) {
+            Ok(b) => workflow::body_digest(&b),
+            Err(why) => {
+                warnings.push(format!(
+                    "could not read PR #{num}'s body ({why}) — this verdict records no body \
+                     digest, so an `also: body-unchanged` condition cannot be satisfied by it."
+                ));
+                String::new()
+            }
+        };
         let rec = workflow::ReviewVerdict {
             pr: num,
             block,
@@ -30269,8 +30342,9 @@ impl OrchRegistry {
             "head": rec.head,
             "body_digest": rec.body_digest,
             "summary": rec.summary.chars().take(500).collect::<String>(),
+            "warnings": warnings.clone(),
         }));
-        Ok(rec)
+        Ok((rec, warnings))
     }
 
     /// Every verdict recorded for a PR, by reviewer block (block order).
@@ -30316,6 +30390,32 @@ impl OrchRegistry {
     /// the same shapes. A status line that said SATISFIED while the shim refused
     /// would be worse than no status line at all.
     pub fn gate_status_line(&self, group: &str, pr: u64) -> Option<String> {
+        // Sampled here for the callers that have no digest of their own. The
+        // gate check comes FIRST: a group with no gate returns `None` without
+        // spending a `gh` call on a line it will not print (#791).
+        if !self.merge_gate_declared(group) {
+            return None;
+        }
+        let body = self.pr_body_digest(group, pr).ok();
+        self.gate_status_line_with(group, pr, body.as_deref())
+    }
+
+    /// `gate_status_line` with the PR body's current digest supplied by the
+    /// caller (#791) — `None` meaning "could not be read", exactly as a failed
+    /// sample here would.
+    ///
+    /// Every caller that wants this line ALSO wants that digest for its own
+    /// answer (`list_verdicts` reports `body_changed` per verdict; a reviewer
+    /// recording a verdict has just bound one). Re-fetching it inside made the
+    /// no-arg `list_verdicts` fan-out spend three live `gh pr view` calls per PR
+    /// for two facts, which on a slow network is three chances to burn the
+    /// bound instead of two.
+    pub fn gate_status_line_with(
+        &self,
+        group: &str,
+        pr: u64,
+        body_digest: Option<&str>,
+    ) -> Option<String> {
         if !self.merge_gate_declared(group) {
             return None;
         }
@@ -30332,7 +30432,8 @@ impl OrchRegistry {
         };
         let repo = self.group(group).map(|g| g.repo).unwrap_or_default();
         let head = self.pr_head(&repo, pr);
-        let outcome = workflow::evaluate_merge_gate(&gate, &self.verdict_map(group, pr), head.as_deref());
+        let outcome =
+            workflow::evaluate_merge_gate(&gate, &self.verdict_map(group, pr), head.as_ref().ok().map(|s| s.as_str()));
         let also = if gate.also.is_empty() {
             String::new()
         } else {
@@ -30356,7 +30457,7 @@ impl OrchRegistry {
         // squash-merging repo it is the commit message. Reported on BOTH classes and
         // enforced on neither here — enforcement is the opt-in `also: body-unchanged`
         // condition, checked at merge time in the shim, exactly like `ci-green`.
-        let (drift_passed, drift_blocking) = self.body_drift(group, pr);
+        let (drift_passed, drift_blocking) = self.body_drift(group, pr, body_digest);
         let mut body_note = String::new();
         if !drift_passed.is_empty() {
             body_note.push_str(&format!(
@@ -30392,10 +30493,23 @@ impl OrchRegistry {
                  refused until then.{also} {GATE_REFUSAL_EXITS}",
                 waiting(&outstanding, &stale)
             ),
+            // #791: name the reason. "Cannot resolve the head" reads the same
+            // whether gh is missing, the PR is gone, or the read burned its
+            // 20-second bound on a stalled connection — and those want three
+            // different reactions from whoever is looking at it. The reason is
+            // appended rather than woven in, so the sentence a reader (and the
+            // pins on it) already knows stays exactly where it was.
+            //
+            // The interpolated text is `gh` stderr, and this line is pasted
+            // into the orchestrator's pane inside a `[loomux]` notice by
+            // `review_verdict` — it is inert because `pr_head` sanitized it at
+            // the source (`gh_failure_text`), which is where the argument for
+            // doing it there rather than here lives.
             workflow::GateOutcome::UnknownRevision => format!(
                 "merge gate for PR #{pr}: loomux cannot resolve the PR's current head commit, so \
                  it cannot tell whether the recorded verdicts reviewed the code that would merge. \
-                 The merge is refused until it can. {GATE_REFUSAL_EXITS}"
+                 The merge is refused until it can.{} {GATE_REFUSAL_EXITS}",
+                head.as_ref().err().map(|e| format!(" (gh pr view #{pr}: {e})")).unwrap_or_default()
             ),
         };
         Some(format!("{line}{body_note}"))

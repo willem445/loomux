@@ -18,6 +18,82 @@ use std::sync::Arc;
 
 const MAX_BODY: usize = 1024 * 1024;
 
+/// How many PRs a **no-arg** `list_verdicts` resolves live (#791, rev-lead).
+///
+/// The per-call bound this PR adds turns "forever" into 20 seconds, which is
+/// the hang fixed; it does not make N x 2 bounded reads fast. A group's
+/// verdict directory only grows — 184 PRs was the worst case measured on the
+/// human's own fleet — and 368 bounded reads is still most of an hour. That is
+/// a slower hang, not a fixed one, so the sweep is bounded in COUNT as well as
+/// per call.
+///
+/// Twenty is the newest twenty. It covers "what am I currently reviewing"
+/// (which is what a sweep after a compact is actually for) with room to spare,
+/// and pins the sweep's own worst case at 20 x 2 x `GH_CAPTURE_TIMEOUT`, which
+/// the budget below then cuts to something a turn can absorb. PRs past the cap
+/// still appear in the response with their full recorded verdicts — only the
+/// live half is skipped, and the row says so.
+pub const LIST_VERDICTS_MAX_LIVE: usize = 20;
+
+/// Wall-clock budget for a **no-arg** `list_verdicts`'s live reads (#791).
+///
+/// The count cap alone still admits 20 x 2 timed-out reads — over 13 minutes
+/// with a dead remote, which is exactly the "the agent's turn never comes back"
+/// complaint in a longer coat. So the sweep also stops resolving live state
+/// once it has spent this long, and says which PRs it stopped short of.
+///
+/// Checked BEFORE each PR's reads, so the true ceiling is this plus one PR's
+/// worth of bounded reads (~30s + 40s worst case) — bounded, statable, and
+/// short enough to sit inside a turn. Deliberately NOT a deadline on the reads
+/// themselves: `capture_with_timeout` already owns that, and two competing
+/// deadlines on one child is how a bound acquires an edge case.
+///
+/// An explicit `pr` is never budgeted. The agent named one PR and is entitled
+/// to a real answer about it; only the unbounded-by-construction sweep is.
+pub const LIST_VERDICTS_LIVE_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Why this PR's live head/body was not resolved, or `None` to resolve it —
+/// the sweep's two limits, decided purely (#791, rev-lead).
+///
+/// Split out from the handler so the BUDGET arm is testable without a test
+/// that actually waits 30 seconds: reaching it for real needs a sweep whose
+/// earlier PRs were slow, which is a fixture made of sleeping subprocesses.
+/// The decision is the part with the policy in it; the reads around it are
+/// already covered.
+///
+/// Every arm returns text naming the PR to re-ask about, because a bound the
+/// caller cannot see is indistinguishable from a wrong answer: an agent that
+/// reads a row with no `gate` and no explanation concludes the group has no
+/// gate. That is the "no silent truncation" rule, in the one place that can
+/// break it.
+#[doc(hidden)] // pub for integration tests
+pub fn live_state_skip_reason(
+    in_live_set: bool,
+    is_sweep: bool,
+    elapsed: std::time::Duration,
+    pr: u64,
+) -> Option<String> {
+    let reask = format!(
+        "The recorded verdicts on this row are complete and current; call \
+         list_verdicts(pr: \"{pr}\") for this PR's live gate state."
+    );
+    if !in_live_set {
+        return Some(format!(
+            "live head/body not resolved: a no-arg sweep resolves only the \
+             {LIST_VERDICTS_MAX_LIVE} newest PRs with verdicts, and this is not one of them. \
+             {reask}"
+        ));
+    }
+    if is_sweep && elapsed >= LIST_VERDICTS_LIVE_BUDGET {
+        return Some(format!(
+            "live head/body not resolved: this no-arg sweep spent its {}s budget on the PRs \
+             before this one, so `gh` is answering slowly right now. {reask}",
+            LIST_VERDICTS_LIVE_BUDGET.as_secs()
+        ));
+    }
+    None
+}
+
 /// Bind on an ephemeral localhost port, record it in the registry, and serve
 /// forever (one thread per request; tool calls that wait on pane binds can
 /// block their thread without stalling other agents).
@@ -242,9 +318,9 @@ fn tool_defs(role: Role, role_hint: Option<&str>) -> Vec<Value> {
             json!({ "id": { "type": "string", "description": "Task id, e.g. t-3" } }),
             &["id"]),
         tool("list_verdicts",
-            "Read the recorded review verdicts for a PR: which reviewer block recorded what (pass | fail | escalate), when, and its summary — plus, when this repo's .loomux/workflow.yml declares a merge gate, whether that gate is satisfied. This is STATE, not a notification: it is what the loomux gh interceptor reads when it decides whether to allow `gh pr merge`. Each verdict also carries `body_changed` when loomux can tell whether the PR body moved since it was recorded (absent = it cannot tell): on a `pass` that means the text a squash merge would commit is not what was approved — send the reviewer back; on a `fail`/`escalate` it means the body was edited afterwards, so check whether the finding is already fixed before routing it to a worker. Omit pr to list every PR with a recorded verdict.",
+            "Read the recorded review verdicts for a PR: which reviewer block recorded what (pass | fail | escalate), when, and its summary — plus, when this repo's .loomux/workflow.yml declares a merge gate, whether that gate is satisfied. This is STATE, not a notification: it is what the loomux gh interceptor reads when it decides whether to allow `gh pr merge`. Each verdict also carries `body_changed` when loomux can tell whether the PR body moved since it was recorded (absent = it cannot tell): on a `pass` that means the text a squash merge would commit is not what was approved — send the reviewer back; on a `fail`/`escalate` it means the body was edited afterwards, so check whether the finding is already fixed before routing it to a worker. PASS `pr` WHENEVER YOU HAVE ONE — you almost always do, since you are asking about a PR someone just reported. Omitting it is a deliberate, rare choice (a cold start, or a sweep for verdicts you have lost track of): the no-arg form walks EVERY PR this group has ever recorded a verdict for and makes live `gh` calls per PR to resolve its head and body, so it costs proportionally more the longer the group has run and is the form that suffers first on a slow or proxied network. The no-arg form is also BOUNDED: it lists every PR's recorded verdicts in full, but resolves live head/body state for at most the 20 newest and only while a 30s budget lasts. Any row it skipped says so in `live_state_skipped` and names the PR to re-ask about — nothing is silently truncated, but a sweep is not a substitute for asking about the PR you care about.",
             json!({
-                "pr": { "type": "string", "description": "PR number, #n, or URL. Omit to list all PRs with verdicts." },
+                "pr": { "type": "string", "description": "PR number, #n, or URL. Pass this whenever you have one. Omit ONLY to sweep every PR with a verdict — proportionally slower, live gh calls per PR." },
             }),
             &[]),
         tool("request_compact",
@@ -1219,12 +1295,22 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             let pr = arg_str(args, "pr").ok_or("pr required")?;
             let verdict = arg_str(args, "verdict").ok_or("verdict required")?;
             let summary = arg_str(args, "summary").ok_or("summary required")?;
-            let rec = reg.record_verdict(&caller.group, &caller.agent_id, pr, verdict, summary)?;
+            let (rec, warnings) =
+                reg.record_verdict(&caller.group, &caller.agent_id, pr, verdict, summary)?;
             // A verdict is also news: the orchestrator is the one that decides what
             // happens next (send the findings back to the worker, ask the human,
             // merge), and loomux's design norm is that agent→agent traffic arrives
             // as a VISIBLE prompt in the recipient's pane — never a side channel.
-            let gate = reg.gate_status_line(&caller.group, rec.pr);
+            // The digest `record_verdict` just bound this verdict to IS the PR
+            // body's digest right now — so the gate line reuses it rather than
+            // spending a second `gh pr view --json body` on the same fact one
+            // instant later (#791). Empty means the body was unreadable, which
+            // is what `None` means here too.
+            let gate = reg.gate_status_line_with(
+                &caller.group,
+                rec.pr,
+                (!rec.body_digest.is_empty()).then_some(rec.body_digest.as_str()),
+            );
             let _ = reg.deliver_to_orchestrator(
                 &caller.group,
                 &format!(
@@ -1238,8 +1324,19 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                 ),
                 &caller.agent_id,
             );
+            // Anything loomux could not sample while recording goes back to the
+            // REVIEWER, which is the only party positioned to act on it (#791,
+            // rev-lead). A verdict recorded with an empty head is a verdict that
+            // will not open the gate, and the reviewer that wrote it is the one
+            // who has to re-record — telling it only the happy half is how a
+            // reviewer ends up insisting it already passed something.
+            let warned = if warnings.is_empty() {
+                String::new()
+            } else {
+                format!(" NOTE: {}", warnings.join(" "))
+            };
             Ok(format!(
-                "recorded: {} on PR #{} attributed to block {}. {}",
+                "recorded: {} on PR #{} attributed to block {}. {}{warned}",
                 rec.verdict.as_str().to_uppercase(),
                 rec.pr,
                 rec.block,
@@ -1249,11 +1346,29 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             ))
         }
         "list_verdicts" => {
-            let prs = match arg_str(args, "pr") {
+            let asked = arg_str(args, "pr");
+            let prs = match asked {
                 Some(pr) => vec![super::pr_number(pr)
                     .ok_or_else(|| format!("no PR number found in {pr:?}"))?],
                 None => reg.verdict_prs(&caller.group),
             };
+            // Which PRs get their LIVE state resolved (#791, rev-lead). An
+            // explicit `pr` always does — the agent named it. The no-arg sweep
+            // resolves at most the newest `LIST_VERDICTS_MAX_LIVE`, because a
+            // long-running group's verdict directory only grows and the bound
+            // this PR adds is per-call: 184 PRs x 2 bounded reads is still most
+            // of an hour, which is a slower hang, not a fixed one.
+            //
+            // Newest-first is the selection, not the ORDER: rows stay ascending
+            // by PR so the response shape is stable and diffable, and only the
+            // membership of "resolved live" is picked by recency. An agent
+            // sweeping for verdicts it lost track of wants the current work.
+            let live: std::collections::HashSet<u64> = if asked.is_some() {
+                prs.iter().copied().collect()
+            } else {
+                prs.iter().rev().take(LIST_VERDICTS_MAX_LIVE).copied().collect()
+            };
+            let started = std::time::Instant::now();
             let out: Vec<Value> = prs
                 .into_iter()
                 .map(|pr| {
@@ -1267,12 +1382,41 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                     // check". Handling is asymmetric and the gate line says which is
                     // which: on a `pass` it is a hazard, on a `fail` it is the fix
                     // loop and quite possibly a finding that is already fixed.
-                    let now = reg.pr_body_digest(&caller.group, pr);
+                    // Is this PR one of the ones we resolve live? Two limits, and
+                    // BOTH are reported on the row rather than applied silently:
+                    // a row that quietly lost its `gate` reads exactly like a
+                    // group with no gate, which is a worse answer than no answer.
+                    //
+                    // The verdicts themselves are local files and cost nothing,
+                    // so every PR is still listed in full — it is only the LIVE
+                    // half that is bounded. Nothing is truncated away.
+                    let skip = live_state_skip_reason(
+                        live.contains(&pr),
+                        asked.is_none(),
+                        started.elapsed(),
+                        pr,
+                    );
+
+                    // #565: a verdict pins the head SHA, so a moved head is visible.
+                    // The PR BODY is not part of that SHA and moves silently — and
+                    // on a squash-merging repo it is the commit message. `body_changed`
+                    // is the same staleness question asked of the other half of the
+                    // reviewed artifact, per verdict: true/false when it can be
+                    // answered, ABSENT when it cannot (no digest recorded, the body
+                    // unreadable now, or the live half skipped above) — never a
+                    // `false` that means "we didn't check". Handling is asymmetric
+                    // and the gate line says which is which: on a `pass` it is a
+                    // hazard, on a `fail` it is the fix loop and quite possibly a
+                    // finding that is already fixed.
+                    let now = match &skip {
+                        Some(_) => Err(String::new()), // not read at all — see `skip`
+                        None => reg.pr_body_digest(&caller.group, pr),
+                    };
                     let verdicts: Vec<Value> = reg
                         .verdicts(&caller.group, pr)
                         .into_iter()
                         .map(|v| {
-                            let changed = v.body_changed(now.as_deref());
+                            let changed = v.body_changed(now.as_deref().ok());
                             let mut val = serde_json::to_value(&v).unwrap_or(Value::Null);
                             if let (Some(changed), Some(obj)) = (changed, val.as_object_mut()) {
                                 obj.insert("body_changed".into(), json!(changed));
@@ -1280,11 +1424,43 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                             val
                         })
                         .collect();
-                    json!({
+                    // The gate line wants the SAME digest — handed over rather
+                    // than re-fetched, so one PR costs two live `gh` reads and
+                    // not three (#791).
+                    let mut row = json!({
                         "pr": pr,
                         "verdicts": verdicts,
-                        "gate": reg.gate_status_line(&caller.group, pr),
-                    })
+                    });
+                    if let Some(obj) = row.as_object_mut() {
+                        match &skip {
+                            Some(why) => {
+                                obj.insert("live_state_skipped".into(), json!(why));
+                            }
+                            None => {
+                                obj.insert(
+                                    "gate".into(),
+                                    json!(reg.gate_status_line_with(
+                                        &caller.group,
+                                        pr,
+                                        now.as_deref().ok()
+                                    )),
+                                );
+                                // #791: an unreadable body is why `body_changed`
+                                // is absent above, and absent-with-no-reason is
+                                // exactly the shape that sent a human digging
+                                // through loomux's source. Present only when the
+                                // read actually FAILED (never when it was skipped
+                                // — that has its own field), so the happy path is
+                                // byte for byte what it was, and it names the
+                                // bound when the bound is what stopped it
+                                // ("timed out after 20s").
+                                if let Err(why) = &now {
+                                    obj.insert("body_read_error".into(), json!(why));
+                                }
+                            }
+                        }
+                    }
+                    row
                 })
                 .collect();
             Ok(serde_json::to_string(&out).unwrap_or_default())
