@@ -14,14 +14,10 @@ work, and let it run.**
 unsupervised — agents alone planning, building, adversarially reviewing, and
 shipping the work, with humans holding only the merge and release gates.
 
-- 27.2h of active development observed over a 71.7h window: 22.3h with no human
-  present, 4.9h with one
+- 82% of development time unsupervised — 22.3 of 27.2 hours of active
+  development ran with no human present, 4.9h with one
 - 48 human touch-points (prompts, merge approvals, release grants) against ~21,600
   audited agent/system events — about 0.2%
-- In that window: 2 features shipped, 17 merged PRs, zero reverts
-
-*Measured from this repo's own orchestration audit log, Aug 2026 — minute-bucketed
-activity; human presence = ±7.5 min around any human-actor audit event.*
 
 Loomux is a native desktop terminal for Windows, macOS and Linux — instant matrix
 splits, nameable panes, project tabs, session restore — with an
