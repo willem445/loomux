@@ -365,37 +365,6 @@ const SYNC_COMMANDS: &[Row] = &[
         issue: Some("#746"),
     },
     Row {
-        name: "ft_list_dir",
-        class: Class::Debt,
-        reason: "A read_dir of the requested directory on the webview thread. Bounded by the \
-                 directory's size, which nothing in the app bounds — a directory with tens of \
-                 thousands of entries is a stall the user sees as the file tree freezing.",
-        issue: Some("#746"),
-    },
-    Row {
-        name: "ft_read_file",
-        class: Class::Debt,
-        reason: "An fs::read of up to 2 MiB on the webview thread. The cap bounds the memory, not \
-                 the latency: 2 MiB off a cold or network path is a visible freeze.",
-        issue: Some("#746"),
-    },
-    Row {
-        name: "ft_write_file",
-        class: Class::Debt,
-        reason: "Write, fsync, then rename — on the webview thread. The fsync is the expensive \
-                 part and is deliberate (it is what makes the replace atomic), which is precisely \
-                 why it does not belong on the thread that services paint.",
-        issue: Some("#746"),
-    },
-    Row {
-        name: "ft_replace",
-        class: Class::Debt,
-        reason: "Per-file read plus an fsync-ed atomic write, over an UNBOUNDED number of files, \
-                 on the webview thread. The worst latency shape in this block: a project-wide \
-                 replace freezes the GUI for the whole operation.",
-        issue: Some("#746"),
-    },
-    Row {
         name: "fm_list",
         class: Class::Debt,
         reason: "Enumerates a directory and stats each entry for the file manager grid, on the \

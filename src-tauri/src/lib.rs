@@ -1,3 +1,4 @@
+mod blocking; // the shared P1 delegation helper for the #746 gesture commands
 mod cliprobe;
 pub mod command_manifest; // pub: the ACL coherence integration test links APP_COMMANDS (#363)
 mod editor;

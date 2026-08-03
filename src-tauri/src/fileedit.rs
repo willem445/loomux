@@ -86,6 +86,34 @@ const EXCLUDED_DIRS: &[&str] = &["node_modules", "target", "dist", "build", "ven
 /// same directory can't collide. Paired with `process::id()` — no getrandom.
 static ATOMIC_WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// Serializes every write this module performs, so a read-then-write stays ONE
+/// unit (#746).
+///
+/// **What it replaces.** `ft_write_file`'s `expected_hash` check is
+/// check-then-act: read the file's current hash, compare, write. That is only a
+/// concurrency guard while nothing can slip between the two halves, and until
+/// #746 nothing could — both commands were synchronous, so Tauri ran them one
+/// at a time on the webview thread and the dispatch itself was the mutual
+/// exclusion. Off-thread, two saves of the same file quoting the same
+/// `expected_hash` would BOTH read the pre-write hash, both pass, and both
+/// write: one user's edit silently lost, on the exact path whose doc promises
+/// "the write is refused and the file is left byte-for-byte untouched". So the
+/// gate is held across check+write, and the promise holds by a lock instead of
+/// by a thread.
+///
+/// **Granularity: one file, not one command.** `replace` takes it per file
+/// inside its loop rather than around the whole run — an unbounded project-wide
+/// replace must not block a single-file save for its whole duration, and the
+/// unit that matters is a file's own read-modify-write. A save racing a replace
+/// therefore lands wholly before or wholly after that file's rewrite, never
+/// between its read and its rename.
+///
+/// It guards `()`: there is no shared datum, only an order. Poison-tolerant for
+/// the same reason (`obs::LockExt`) — a panic mid-write leaves the filesystem
+/// in whatever state it left it, and refusing every later write on top of that
+/// helps nobody.
+static WRITE_GATE: Mutex<()> = Mutex::new(());
+
 // ---------- wire types ----------
 
 /// One entry in a directory listing. `is_symlink` entries are shown but never
@@ -482,6 +510,10 @@ pub fn read_file(root: &str, rel: &str) -> Result<FileRead, String> {
 /// `conflict` error and the file is left byte-for-byte untouched — the optimistic
 /// concurrency guard for "someone else edited this while it was open". Pass
 /// `None` (or an empty string) only when creating a brand-new file.
+///
+/// The hash check and the write are one unit, held by [`WRITE_GATE`] — see its
+/// doc for why check-then-act stopped being safe the moment `ft_write_file`
+/// went off the webview thread (#746).
 pub fn write_file(
     root: &str,
     rel: &str,
@@ -492,6 +524,7 @@ pub fn write_file(
     if path.is_dir() {
         return Err(err("is-dir", format!("path is a directory: {rel}")));
     }
+    let _gate = WRITE_GATE.lock_safe();
     if let Some(expected) = expected_hash.filter(|h| !h.is_empty()) {
         // The caller read the file first and expects it unchanged. Compare
         // against what's on disk *now*; any drift (edited, deleted) is a conflict.
@@ -1003,6 +1036,10 @@ pub fn replace(
                 continue;
             }
         };
+        // One file's read-modify-write is one unit against a concurrent
+        // `ft_write_file` — see [`WRITE_GATE`]. Taken per file, not around the
+        // loop: the file count here is unbounded.
+        let _gate = WRITE_GATE.lock_safe();
         let bytes = match std::fs::read(&path) {
             Ok(b) => b,
             Err(e) => {
@@ -1055,25 +1092,51 @@ pub fn replace(
 //
 // Thin wrappers: all logic lives in the `pub fn`s above so the integration test
 // (`tests/fileedit.rs`) can exercise it without a Tauri runtime.
+//
+// #746: and thin *async* wrappers, each handing its whole body to the blocking
+// pool (`crate::blocking::run_blocking`, P1 of `doc/design/performance.md`).
+// Every one of these is filesystem work Tauri used to run on the thread that
+// services paint — a `read_dir` of a directory nothing bounds, an `fs::read` of
+// up to 2 MiB, an fsync-ed atomic write, and (`ft_replace`) that write over an
+// unbounded number of files. The streaming commands below (`ft_search_start`,
+// `ft_files_start`) stay sync on purpose: they start a cancellable walk on a
+// raw thread and return, which is performance.md §4 X3.
 
 #[tauri::command]
-pub fn ft_list_dir(root: String, rel: String) -> Result<Vec<Entry>, String> {
-    list_dir(&root, &rel)
+pub async fn ft_list_dir(root: String, rel: String) -> Result<Vec<Entry>, String> {
+    // **Reentrancy.** A pure read: it resolves a path and enumerates it, holds
+    // no lock and mutates nothing. Two listings of one directory cannot
+    // interact, and a listing racing a create/rename/delete sees the directory
+    // either side of that change — which is what a directory listing has always
+    // been, since nothing stops the agent in the pane from `mkdir`-ing between
+    // the frontend's request and this walk.
+    crate::blocking::run_blocking(move || list_dir(&root, &rel)).await
 }
 
 #[tauri::command]
-pub fn ft_read_file(root: String, rel: String) -> Result<FileRead, String> {
-    read_file(&root, &rel)
+pub async fn ft_read_file(root: String, rel: String) -> Result<FileRead, String> {
+    // **Reentrancy.** A pure read, and the hash it returns is what makes a
+    // later write safe rather than this read: `ft_write_file` re-checks it
+    // against disk under `WRITE_GATE`. A read racing a write therefore sees
+    // pre- or post-write content (never a mixture — writes are rename-atomic)
+    // and carries the matching hash either way, so a save built on it either
+    // applies or reports `conflict`, exactly as before.
+    crate::blocking::run_blocking(move || read_file(&root, &rel)).await
 }
 
 #[tauri::command]
-pub fn ft_write_file(
+pub async fn ft_write_file(
     root: String,
     rel: String,
     content: String,
     expected_hash: Option<String>,
 ) -> Result<WriteResult, String> {
-    write_file(&root, &rel, &content, expected_hash)
+    // **Reentrancy.** This is the command that needed a guard building rather
+    // than naming: sync dispatch was what made `expected_hash`'s
+    // check-then-write one unit, so the conversion moves that job to
+    // [`WRITE_GATE`]. See its doc — and `concurrent_saves_with_the_same_hash`
+    // in `tests/fileedit.rs`, which pins "exactly one of N racing saves wins".
+    crate::blocking::run_blocking(move || write_file(&root, &rel, &content, expected_hash)).await
 }
 
 // ---------- streaming search (issue #207) ----------
@@ -1252,12 +1315,21 @@ pub fn ft_files_start(
 }
 
 #[tauri::command]
-pub fn ft_replace(
+pub async fn ft_replace(
     root: String,
     query: String,
     replacement: String,
     files: Vec<String>,
     opts: SearchOpts,
 ) -> Result<ReplaceResult, String> {
-    replace(&root, &query, &replacement, files, opts)
+    // **Reentrancy.** Per-file, [`WRITE_GATE`] makes each read-modify-write one
+    // unit against a concurrent save (and against another replace). Across
+    // files it deliberately holds nothing: a project-wide replace is not one
+    // transaction and never was — it re-reads and re-matches each file at apply
+    // time, and reports every file it did not touch in `skipped`, which is the
+    // same partial-application contract the synchronous version had if it hit
+    // an unreadable file halfway through. What changes is only that the
+    // interleaving can now come from another command rather than from the
+    // agent running in the pane; the per-file unit is what makes either safe.
+    crate::blocking::run_blocking(move || replace(&root, &query, &replacement, files, opts)).await
 }
