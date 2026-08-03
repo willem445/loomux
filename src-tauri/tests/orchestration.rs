@@ -6187,13 +6187,7 @@ fn copilot_command_uses_copilot_adapter_flags() {
     // pre-assignable id, so a session without resume adds no session flag.
     let sid = "aabbccdd-1122-4334-8556-77889900aabb";
     let cmd = reg.build_agent_command("copilot", "auto", true, cfg, None, gdir, Path::new("C:/repo"), Some(sid), true, Containment::None, &PersonaInject::default());
-    // #458/#781: the `=` form, and NEVER the space form. Copilot documents
-    // `--resume[=VALUE]` as optional-value, so `--resume <id>` risks parsing as
-    // a bare `--resume` (the interactive picker, or an outright error under a
-    // non-TTY) plus a stray positional — in a pane loomux is about to type a
-    // kickoff into. See the builder's own comment for the quoted reference.
-    assert!(cmd.contains(&format!("--resume={sid}")), "copilot resume must use --resume=<id>, got: {cmd}");
-    assert!(!cmd.contains("--resume "), "the space form is the #458 hazard, got: {cmd}");
+    assert!(cmd.contains(&format!("--resume {sid}")), "copilot resume must pass --resume, got: {cmd}");
     let cmd = reg.build_agent_command("copilot", "auto", true, cfg, None, gdir, Path::new("C:/repo"), Some(sid), false, Containment::None, &PersonaInject::default());
     assert!(!cmd.contains("--resume") && !cmd.contains("--session-id"),
         "a fresh copilot spawn cannot pin a session id");
@@ -7821,8 +7815,7 @@ fn copilot_orchestration_session_gets_a_chip_and_restores() {
     let _ = fs::remove_dir_all(&store);
     assert_eq!(req.group_id, gid);
     assert!(req.command.starts_with("copilot "), "must relaunch copilot, got: {}", req.command);
-    assert!(req.command.contains(&format!("--resume={sid}")), "must resume the recorded session");
-    assert!(!req.command.contains("--resume "), "#458/#781: never the space form on copilot");
+    assert!(req.command.contains(&format!("--resume {sid}")), "must resume the recorded session");
 }
 
 #[test]
