@@ -27360,8 +27360,9 @@ impl OrchRegistry {
     fn default_branch_within(&self, repo: &str, max_age: Duration) -> Option<String> {
         {
             let memo = self.default_branch_memo.lock_safe();
+            // M1 (#743 S4 red evidence — TEMPORARY): lookup neutralised.
             if let Some((at, name)) = memo.get(repo) {
-                if at.elapsed() < max_age {
+                if false && at.elapsed() < max_age {
                     return name.clone();
                 }
             }
@@ -28016,8 +28017,10 @@ impl OrchRegistry {
             memo.entry(group.to_string()).or_default().clone()
         };
         let mut slot = cell.lock_safe();
+        // M1 (#743 S4 red evidence — TEMPORARY): the memo lookup is neutralised,
+        // so every call recomputes exactly as base does.
         if let Some((at, value)) = slot.as_ref() {
-            if at.elapsed() < max_age {
+            if false && at.elapsed() < max_age {
                 return value.clone();
             }
         }
@@ -37352,9 +37355,9 @@ pub fn orch_workflow_preview(repo: String, agent_cli: String) -> Value {
 /// the set lock — the same non-determinism two fast human clicks already had,
 /// and the group view disables the button for the duration of the call.
 #[tauri::command]
-pub async fn orch_pause_group(app: AppHandle, group_id: String) -> Result<(), String> {
-    let reg = reg_of(&app);
-    run_blocking(move || reg.pause_group(&group_id)).await
+pub fn orch_pause_group(app: AppHandle, group_id: String) -> Result<(), String> {
+    // M1 (#743 S4 red evidence - TEMPORARY): reverted to a sync command.
+    reg_of(&app).pause_group(&group_id)
 }
 
 /// Resume a paused group: prompt/kickoff delivery flows again.
@@ -37370,8 +37373,8 @@ pub async fn orch_pause_group(app: AppHandle, group_id: String) -> Result<(), St
 /// registration, #470, is the second line of defence.)
 #[tauri::command]
 pub async fn orch_resume_group(app: AppHandle, group_id: String) -> Result<(), String> {
-    let reg = reg_of(&app);
-    run_blocking(move || reg.resume_group(&group_id)).await
+    // M1 (#743 S4 red evidence - TEMPORARY): #724 mutation - async, body inline.
+    reg_of(&app).resume_group(&group_id)
 }
 
 /// Whether a group is currently paused (drives the pause/resume button state).
@@ -37459,8 +37462,8 @@ pub fn orch_set_max_agents(
 /// thread.
 #[tauri::command]
 pub async fn orch_group_usage(app: AppHandle, group_id: String) -> Value {
-    let reg = reg_of(&app);
-    run_blocking(move || reg.group_usage_within(&group_id, USAGE_POLL_MAX_AGE)).await
+    // M1 (#743 S4 red evidence - TEMPORARY): #724 mutation - async, body inline.
+    reg_of(&app).group_usage_within(&group_id, USAGE_POLL_MAX_AGE)
 }
 
 // ---------- autonomous mode (#83): toggles + budget + state read ----------
@@ -37644,8 +37647,8 @@ pub fn orch_set_compact_nudge_min_context_percent(
 /// share a single computation rather than racing to do it twice.
 #[tauri::command]
 pub async fn orch_autonomy(app: AppHandle, group_id: String) -> Value {
-    let reg = reg_of(&app);
-    run_blocking(move || reg.autonomy_state_within(&group_id, USAGE_POLL_MAX_AGE)).await
+    // M1 (#743 S4 red evidence - TEMPORARY): #724 mutation - async, body inline.
+    reg_of(&app).autonomy_state_within(&group_id, USAGE_POLL_MAX_AGE)
 }
 
 /// Live-agent count, role breakdown, and uptime for the lifecycle panel.
@@ -37695,8 +37698,8 @@ pub fn orch_set_advanced_orchestrator(
 /// which is last-writer-wins on a value every racer resolves identically.
 #[tauri::command]
 pub async fn orch_workflow_status(app: AppHandle, group_id: String) -> Value {
-    let reg = reg_of(&app);
-    run_blocking(move || reg.workflow_status(&group_id)).await
+    // M1 (#743 S4 red evidence - TEMPORARY): #724 mutation - async, body inline.
+    reg_of(&app).workflow_status(&group_id)
 }
 
 // ---------- cross-workspace channels (#271): human-only connect/disconnect ----------
@@ -38767,9 +38770,9 @@ fn open_external_url(url: &str) -> Result<(), String> {
 /// old file or the whole new one, never a torn one; the main-thread dispatch
 /// this replaces was serializing readers against each other for nothing.
 #[tauri::command]
-pub async fn orch_tasks(app: AppHandle, group_id: String) -> Vec<Task> {
-    let reg = reg_of(&app);
-    run_blocking(move || reg.tasks(&group_id)).await
+pub fn orch_tasks(app: AppHandle, group_id: String) -> Vec<Task> {
+    // M1 (#743 S4 red evidence - TEMPORARY): reverted to a sync command.
+    reg_of(&app).tasks(&group_id)
 }
 
 /// Audit-log timeline for the pane's audit-viewer overlay (read-only). Oldest
@@ -38787,9 +38790,9 @@ pub async fn orch_tasks(app: AppHandle, group_id: String) -> Vec<Task> {
 /// and counts — and which was already possible, since appends have always come
 /// from other threads.
 #[tauri::command]
-pub async fn orch_audit(app: AppHandle, group_id: String) -> Vec<AuditEntry> {
-    let reg = reg_of(&app);
-    run_blocking(move || reg.audit_log(&group_id)).await
+pub fn orch_audit(app: AppHandle, group_id: String) -> Vec<AuditEntry> {
+    // M1 (#743 S4 red evidence - TEMPORARY): reverted to a sync command.
+    reg_of(&app).audit_log(&group_id)
 }
 
 /// The group's merge queue for the lifecycle chrome (#581 slice F) —
@@ -38813,9 +38816,9 @@ pub async fn orch_audit(app: AppHandle, group_id: String) -> Vec<AuditEntry> {
 /// state one tick old. Every writer stores through `atomic_write`, so a
 /// concurrent read sees one whole version or the other.
 #[tauri::command]
-pub async fn orch_merge_queue(app: AppHandle, group_id: String) -> Value {
-    let reg = reg_of(&app);
-    run_blocking(move || mergeqview::merge_queue_view(&reg.group_dir(&group_id))).await
+pub fn orch_merge_queue(app: AppHandle, group_id: String) -> Value {
+    // M1 (#743 S4 red evidence - TEMPORARY): reverted to a sync command.
+    mergeqview::merge_queue_view(&reg_of(&app).group_dir(&group_id))
 }
 
 /// Human steering from the loomux compose strip (#43, option C): enqueue
