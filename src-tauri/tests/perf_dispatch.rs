@@ -19,7 +19,7 @@
 //! are meant to read as one idea.
 //!
 //! WHY A MANIFEST AND NOT A LINT. The property is not "no blocking sync
-//! commands exist": 74 do today, enumerated in #743's census (planning comments
+//! commands exist": 66 do today, enumerated in #743's census (planning comments
 //! parts 1-2, which `performance.md` §5 names as the one source of truth) and
 //! owned by the issues in `DEBT_OWNERS`. The property is that **one cannot be
 //! added silently**. A new sync command fails this test until somebody writes
@@ -98,38 +98,31 @@ const DEBT_OWNERS: &[(&str, &str)] = &[
          live-groups filter, not just a thread hop.",
     ),
     (
-        "#743 S4 (#752)",
-        "Slice S4, IN FLIGHT on #752: the polled orchestration commands (the group view's 2 s \
-         batch, the tab strip's 4 s loop, the 1.5 s follow polls) go async-delegating and their \
-         hot reads get memoised. When #752 merges these rows go red together and come out as one \
-         block — that is the mechanism working, not a conflict.",
-    ),
-    (
         "#743 S7",
         "Slice S7 (leaf locks): gitwatch's signature IO moves outside the watches lock, and \
          PtyManager::kill drops the map lock before killer.kill(). Both are INV-5 lock-scope \
          work on commands this test classes by their dispatch, not their locks.",
     ),
     (
-        "#743",
-        "The orchestration mutation and lifecycle commands: enumerated by the census (part 2a) \
-         but NOT yet carved into a slice. They are gesture- and lifecycle-rate, so the census \
-         ranked them below the polled set (S4) and the gesture set (F1); the parent issue holds \
-         them until one of those lands and the next slice is scoped. Naming the parent is the \
-         honest answer for a row nobody has taken — it is not a place to park a polled command.",
+        "#762",
+        "F2 of #743: the orchestration mutation and lifecycle commands — group lifecycle, the \
+         guardrail marker writes, channels and solo panes, and the task board family under \
+         tasks_lock — convert to async + run_blocking with reentrancy argued per command, in two \
+         or three slices. tasks_lock's own architecture stays #747; this is dispatch only.",
     ),
 ];
 
-/// The 99 synchronous `#[tauri::command]`s at this commit, seeded verbatim from
+/// The 91 synchronous `#[tauri::command]`s at this commit, seeded verbatim from
 /// #743's census (planning comments parts 1-2, reconciled against
-/// `APP_COMMANDS`) with #726's 16 git conversions already removed. This is
-/// today's truth, not the target state.
+/// `APP_COMMANDS`) with #726's 16 git conversions and #752's 8 polled
+/// orchestration conversions already removed. This is today's truth, not the
+/// target state.
 ///
 /// Reconciliation against the census's own totals, so a reader can check this
 /// list rather than trust it: census A=20, T=4, C=20, B=91 of 135. Here
-/// 36 async = 20 A + #726's 16; 20 `cheap` = the 20 C; 5 `exception` = the 4 T
-/// plus `resize_pty` (census B, but §4 X1 argues it stays sync); 74 `debt` =
-/// 91 B − 16 (#726) − 1 (`resize_pty`).
+/// 44 async = 20 A + #726's 16 + #752's 8; 20 `cheap` = the 20 C; 5 `exception`
+/// = the 4 T plus `resize_pty` (census B, but §4 X1 argues it stays sync);
+/// 66 `debt` = 91 B − 16 (#726) − 8 (#752) − 1 (`resize_pty`).
 const SYNC_COMMANDS: &[Row] = &[
     // ---------------------------------------------------------------------
     // exception — deliberate, argued in code and in performance.md §4.
@@ -532,78 +525,6 @@ const SYNC_COMMANDS: &[Row] = &[
         issue: Some("#743 S7"),
     },
     // ---------------------------------------------------------------------
-    // debt — #743 S4, IN FLIGHT on #752. These eight are one block on purpose:
-    // when #752 merges they all become async-delegating at once and this whole
-    // section comes out as a single hunk. Until then they describe today's
-    // shipped behaviour, which is what this manifest is for.
-    // ---------------------------------------------------------------------
-    Row {
-        name: "orch_workflow_status",
-        class: Class::Debt,
-        reason: "Resolves the repo default branch through a chain that ends in two to four \
-                 blocking git spawns, with no cache, from a one-line body. It is in the group \
-                 view's 2 s poll batch, so every open group view spawns git every 2 seconds on \
-                 the webview thread.",
-        issue: Some("#743 S4 (#752)"),
-    },
-    Row {
-        name: "orch_group_usage",
-        class: Class::Debt,
-        reason: "The heaviest polled command: per-live-agent transcript JSONL reads, then a \
-                 usage.json read and full rewrite PER AGENT under the global tasks_lock. It is in \
-                 the 2 s batch AND the 4 s tab-strip loop, and orch_autonomy re-runs the whole \
-                 chain a second time in the same tick.",
-        issue: Some("#743 S4 (#752)"),
-    },
-    Row {
-        name: "orch_autonomy",
-        class: Class::Debt,
-        reason: "Cheap marker reads when autonomy is off; when it is on, it re-runs the entire \
-                 orch_group_usage chain a second time inside the same 2 s tick, on the webview \
-                 thread. The conditional is why the census ranked the pair together.",
-        issue: Some("#743 S4 (#752)"),
-    },
-    Row {
-        name: "orch_tasks",
-        class: Class::Debt,
-        reason: "Reads and parses tasks.json on every call with no cache, on the webview thread. \
-                 It is driven by the orch-tasks-changed event, which agents write in bursts, so \
-                 the reads multiply with the burst rather than with the poll.",
-        issue: Some("#743 S4 (#752)"),
-    },
-    Row {
-        name: "orch_audit",
-        class: Class::Debt,
-        reason: "Reads and parses audit.1.jsonl and audit.jsonl in full on every call, on the \
-                 webview thread, behind the audit view's 1.5 s follow poll — so the cost scales \
-                 with how much a session has logged.",
-        issue: Some("#743 S4 (#752)"),
-    },
-    Row {
-        name: "orch_merge_queue",
-        class: Class::Debt,
-        reason: "Reads merge_queue.json per call on the webview thread. Deliberately NOT under \
-                 mq_state_lock (the driver holds that across subprocess runs, §4 X4), so the read \
-                 is unblocked but still synchronous, in the 2 s poll batch.",
-        issue: Some("#743 S4 (#752)"),
-    },
-    Row {
-        name: "orch_pause_group",
-        class: Class::Debt,
-        reason: "Writes the pause marker file and appends an audit entry on the webview thread; \
-                 the registry lock is dropped before the IO. Gesture-rate, but it shares S4's \
-                 conversion because the resume half sits in the same poll-adjacent path.",
-        issue: Some("#743 S4 (#752)"),
-    },
-    Row {
-        name: "orch_resume_group",
-        class: Class::Debt,
-        reason: "Removes the pause marker, reads back the audit log and flushes the held delivery \
-                 queue, all on the webview thread. The audit read is the unbounded part: it grows \
-                 with the session.",
-        issue: Some("#743 S4 (#752)"),
-    },
-    // ---------------------------------------------------------------------
     // debt — #749: the one orchestration row with its own dedicated issue.
     // ---------------------------------------------------------------------
     Row {
@@ -616,9 +537,12 @@ const SYNC_COMMANDS: &[Row] = &[
         issue: Some("#749"),
     },
     // ---------------------------------------------------------------------
-    // debt — #743: the orchestration mutation and lifecycle commands. Every
-    // one of these pays at least one audit() file append under the global
-    // AUDIT_LOCK on the webview thread; the reason names what it adds on top.
+    // debt — #762 (F2 of #743): the orchestration mutation and lifecycle
+    // commands. Every one of these pays at least one audit() file append under
+    // the global AUDIT_LOCK on the webview thread; the reason names what it
+    // adds on top. Filed as its own issue because nothing else owned them:
+    // #746 is the non-orchestration gesture set, #747/#748 are lock
+    // architecture, #749 is one command's fan-out, and #752 took the polled set.
     // ---------------------------------------------------------------------
     Row {
         name: "create_orchestration",
@@ -626,7 +550,7 @@ const SYNC_COMMANDS: &[Row] = &[
         reason: "Holds the global creation mutex across group.json plus the MCP config writes plus \
                  a session-state scan, on the webview thread. The longest single-gesture stall in \
                  the orchestration surface, and the lock makes two launches serialise behind it.",
-        issue: Some("#743"),
+        issue: Some("#762"),
     },
     Row {
         name: "orch_workflow_preview",
@@ -634,7 +558,7 @@ const SYNC_COMMANDS: &[Row] = &[
         reason: "Reads and parses .loomux/workflow.yml from disk on the webview thread so the \
                  launcher can preview the block list. Bounded by the file, unbounded by nothing \
                  else, and it runs on every preview gesture.",
-        issue: Some("#743"),
+        issue: Some("#762"),
     },
     Row {
         name: "orch_set_notify",
@@ -642,14 +566,14 @@ const SYNC_COMMANDS: &[Row] = &[
         reason: "Keeps the registry guard bound across fs::write / remove of the notify marker \
                  plus the audit append — so the IO happens with the lock held, on the webview \
                  thread. The same file's pause_group shows the drop-then-write pattern this wants.",
-        issue: Some("#743"),
+        issue: Some("#762"),
     },
     Row {
         name: "orch_set_spawn_expanded",
         class: Class::Debt,
         reason: "The same bound-guard shape as orch_set_notify: marker write and audit append with \
                  the registry guard still held, on the webview thread, from a strip-toggle gesture.",
-        issue: Some("#743"),
+        issue: Some("#762"),
     },
     Row {
         name: "orch_set_max_agents",
@@ -657,7 +581,7 @@ const SYNC_COMMANDS: &[Row] = &[
         reason: "A full group.json read-modify-write plus an audit append on the webview thread, \
                  from the max-agents control. The RMW is the pattern the whole guardrail family \
                  repeats below.",
-        issue: Some("#743"),
+        issue: Some("#762"),
     },
     Row {
         name: "orch_set_autonomous",
@@ -665,21 +589,21 @@ const SYNC_COMMANDS: &[Row] = &[
         reason: "Writes the autonomy marker, appends audits, and cascades force-disables to the \
                  dependent toggles — several file operations per gesture, all on the webview \
                  thread.",
-        issue: Some("#743"),
+        issue: Some("#762"),
     },
     Row {
         name: "orch_set_auto_merge",
         class: Class::Debt,
         reason: "Marker write plus audit plus a delivery to the orchestrator pane, on the webview \
                  thread. The delivery is what makes it more than one write.",
-        issue: Some("#743"),
+        issue: Some("#762"),
     },
     Row {
         name: "orch_set_auto_release",
         class: Class::Debt,
         reason: "The release-grant twin of orch_set_auto_merge: same marker write, audit and \
                  delivery on the webview thread, from the same settings surface.",
-        issue: Some("#743"),
+        issue: Some("#762"),
     },
     Row {
         name: "orch_set_dangerous_mode",
@@ -687,64 +611,65 @@ const SYNC_COMMANDS: &[Row] = &[
         reason: "Marker write, audit append and delivery on the webview thread. A deliberately \
                  rare gesture, which is why it ranks below the polled set rather than being \
                  harmless.",
-        issue: Some("#743"),
+        issue: Some("#762"),
     },
     Row {
         name: "orch_set_autonomy_budget",
         class: Class::Debt,
         reason: "persist_guardrail_* : a full group.json read-modify-write plus an audit append \
                  on the webview thread, for the autonomy token budget.",
-        issue: Some("#743"),
+        issue: Some("#762"),
     },
     Row {
         name: "orch_set_idle_tick_minutes",
         class: Class::Debt,
         reason: "The same guardrail read-modify-write of group.json plus audit, on the webview \
                  thread, for the idle-tick cadence knob.",
-        issue: Some("#743"),
+        issue: Some("#762"),
     },
     Row {
         name: "orch_set_idle_activity_floor",
         class: Class::Debt,
         reason: "Guardrail read-modify-write of group.json plus audit on the webview thread, for \
                  the idle activity floor.",
-        issue: Some("#743"),
+        issue: Some("#762"),
     },
     Row {
         name: "orch_set_compact_nudge_minutes",
         class: Class::Debt,
         reason: "Guardrail read-modify-write of group.json plus audit on the webview thread, for \
                  the compact-nudge cadence.",
-        issue: Some("#743"),
+        issue: Some("#762"),
     },
     Row {
         name: "orch_set_compact_nudge_roles",
         class: Class::Debt,
         reason: "Guardrail read-modify-write of group.json plus audit on the webview thread, for \
                  the set of roles the compact nudge applies to.",
-        issue: Some("#743"),
+        issue: Some("#762"),
     },
     Row {
         name: "orch_set_compact_context_threshold",
         class: Class::Debt,
         reason: "Guardrail read-modify-write of group.json plus audit on the webview thread, for \
                  the context threshold that arms the nudge.",
-        issue: Some("#743"),
+        issue: Some("#762"),
     },
     Row {
         name: "orch_set_compact_nudge_min_context_percent",
         class: Class::Debt,
         reason: "Guardrail read-modify-write of group.json plus audit on the webview thread, for \
                  the minimum context percentage the nudge will act on.",
-        issue: Some("#743"),
+        issue: Some("#762"),
     },
     Row {
         name: "orch_set_advanced_orchestrator",
         class: Class::Debt,
         reason: "Reads the workflow file, persists the toggle, and then returns workflow_status — \
-                 which drags the default-branch git spawns onto this gesture as well. S4 removes \
-                 the spawns via the shared memo; the file IO and the sync dispatch stay here.",
-        issue: Some("#743"),
+                 which used to drag the default-branch git spawns onto this gesture as well. #752 \
+                 removed the spawns by sharing workflow_status' memo; the file IO and the sync \
+                 dispatch stay here.",
+        issue: Some("#762"),
     },
     Row {
         name: "orch_channel_connect",
@@ -752,21 +677,21 @@ const SYNC_COMMANDS: &[Row] = &[
         reason: "In-memory channel mutation under locks, then audit appends for each member group \
                  and two deliveries, on the webview thread. The audits scale with the number of \
                  groups in the channel.",
-        issue: Some("#743"),
+        issue: Some("#762"),
     },
     Row {
         name: "orch_channel_disconnect",
         class: Class::Debt,
         reason: "The teardown half of orch_channel_connect: same in-memory mutation followed by \
                  per-group audit appends and deliveries on the webview thread.",
-        issue: Some("#743"),
+        issue: Some("#762"),
     },
     Row {
         name: "orch_channel_set_sender",
         class: Class::Debt,
         reason: "Appends an audit entry per member group and delivers the direction change, on the \
                  webview thread — the same per-member fan-out as connect, for a smaller edit.",
-        issue: Some("#743"),
+        issue: Some("#762"),
     },
     Row {
         name: "orch_solo_prepare",
@@ -774,14 +699,14 @@ const SYNC_COMMANDS: &[Row] = &[
         reason: "Writes the MCP config for a solo pane and appends an audit entry, on the webview \
                  thread, before the pane's CLI is launched. Launch-path latency the user reads as \
                  a slow pane open.",
-        issue: Some("#743"),
+        issue: Some("#762"),
     },
     Row {
         name: "orch_solo_adopt",
         class: Class::Debt,
         reason: "Inserts the adoption records and appends an audit entry on the webview thread, on \
                  a pane's first Connect gesture.",
-        issue: Some("#743"),
+        issue: Some("#762"),
     },
     Row {
         name: "orch_end_group",
@@ -789,7 +714,7 @@ const SYNC_COMMANDS: &[Row] = &[
         reason: "Runs N SEQUENTIAL blocking git worktree remove spawns, then recursive directory \
                  deletes, then audits — all on the webview thread. One-shot and human-confirmed, \
                  but it is the largest process-spawn count of any command in this manifest.",
-        issue: Some("#743"),
+        issue: Some("#762"),
     },
     Row {
         name: "orch_agent_renamed",
@@ -797,7 +722,7 @@ const SYNC_COMMANDS: &[Row] = &[
         reason: "persist_agent_record rewrites agents.json WHILE HOLDING the global tasks_lock — \
                  the lock the board family and the usage poll contend on — from the webview \
                  thread. The lock architecture itself is #747; the sync dispatch is this row.",
-        issue: Some("#743"),
+        issue: Some("#762"),
     },
     Row {
         name: "resume_orch_session",
@@ -805,7 +730,7 @@ const SYNC_COMMANDS: &[Row] = &[
         reason: "The session-restore path: reads the persisted group state back from disk on the \
                  webview thread, the same shape as create_orchestration and on the same \
                  app-restore gesture.",
-        issue: Some("#743"),
+        issue: Some("#762"),
     },
     Row {
         name: "orch_steer",
@@ -813,7 +738,7 @@ const SYNC_COMMANDS: &[Row] = &[
         reason: "deliver_prompt appends audits and persists the durable delivery queue on the \
                  webview thread. A steer is human-gestured, but the queue write is the same \
                  fsync-and-rename shape as every other durable write here.",
-        issue: Some("#743"),
+        issue: Some("#762"),
     },
     Row {
         name: "orch_save_attachment",
@@ -821,7 +746,7 @@ const SYNC_COMMANDS: &[Row] = &[
         reason: "Writes the attachment payload to disk and appends an audit entry, on the webview \
                  thread. The write is as large as the attachment the human pasted, which nothing \
                  bounds.",
-        issue: Some("#743"),
+        issue: Some("#762"),
     },
     Row {
         name: "orch_upsert_task",
@@ -829,28 +754,28 @@ const SYNC_COMMANDS: &[Row] = &[
         reason: "Reads tasks.json and rewrites the WHOLE board atomically, plus an audit append, \
                  INSIDE the global tasks_lock guard, on the webview thread. The board family's \
                  base cost; every row below adds to this one.",
-        issue: Some("#743"),
+        issue: Some("#762"),
     },
     Row {
         name: "orch_delete_task",
         class: Class::Debt,
         reason: "The same read-plus-full-board-rewrite under tasks_lock as orch_upsert_task, with \
                  an audit append, on the webview thread.",
-        issue: Some("#743"),
+        issue: Some("#762"),
     },
     Row {
         name: "orch_delete_done_tasks",
         class: Class::Debt,
         reason: "One full-board rewrite under tasks_lock plus audits, on the webview thread. It \
                  removes many rows in one pass, so it is the cheapest of the bulk board edits.",
-        issue: Some("#743"),
+        issue: Some("#762"),
     },
     Row {
         name: "orch_delete_tasks",
         class: Class::Debt,
         reason: "Bulk delete: the same tasks_lock guard around a full-board rewrite and per-task \
                  audit appends, on the webview thread.",
-        issue: Some("#743"),
+        issue: Some("#762"),
     },
     Row {
         name: "orch_reorder_tasks",
@@ -858,7 +783,7 @@ const SYNC_COMMANDS: &[Row] = &[
         reason: "A full-board atomic rewrite under tasks_lock per call, on the webview thread — \
                  and reorders arrive in DRAG BURSTS, so this is the board row whose rate is set \
                  by a pointer, not by a discrete gesture.",
-        issue: Some("#743"),
+        issue: Some("#762"),
     },
     Row {
         name: "orch_open_ref",
@@ -866,56 +791,56 @@ const SYNC_COMMANDS: &[Row] = &[
         reason: "Runs up to two blocking git spawns to resolve the remote URL, then appends an \
                  audit entry, on the webview thread. The browser open itself is detached, so the \
                  spawns are the whole cost.",
-        issue: Some("#743"),
+        issue: Some("#762"),
     },
     Row {
         name: "orch_approve_task",
         class: Class::Debt,
         reason: "An orch_upsert_task-sized board write plus minting the grant file, under the \
                  tasks_lock guard, on the webview thread.",
-        issue: Some("#743"),
+        issue: Some("#762"),
     },
     Row {
         name: "orch_approve_tasks",
         class: Class::Debt,
         reason: "The bulk variant: one board write plus a grant file minted PER ITEM, under the \
                  same guard, on the webview thread — so the file count scales with the selection.",
-        issue: Some("#743"),
+        issue: Some("#762"),
     },
     Row {
         name: "orch_grant_merge",
         class: Class::Debt,
         reason: "Writes the merge grant file, appends an audit entry and delivers the grant to the \
                  agent, on the webview thread.",
-        issue: Some("#743"),
+        issue: Some("#762"),
     },
     Row {
         name: "orch_grant_release",
         class: Class::Debt,
         reason: "The release-grant twin of orch_grant_merge: grant file, audit append and \
                  delivery, on the webview thread.",
-        issue: Some("#743"),
+        issue: Some("#762"),
     },
     Row {
         name: "orch_request_changes",
         class: Class::Debt,
         reason: "Extra tasks.json reads on top of an orch_upsert_task-sized write, plus a delivery \
                  to the worker, under the tasks_lock guard on the webview thread.",
-        issue: Some("#743"),
+        issue: Some("#762"),
     },
     Row {
         name: "orch_start_task",
         class: Class::Debt,
         reason: "The same shape as orch_request_changes — extra board reads, an upsert-sized write \
                  under tasks_lock, and a delivery — on the webview thread.",
-        issue: Some("#743"),
+        issue: Some("#762"),
     },
     Row {
         name: "orch_proceed_task",
         class: Class::Debt,
         reason: "Extra board reads, an upsert-sized write under tasks_lock and a delivery, on the \
                  webview thread; the third member of the start/proceed/request-changes trio.",
-        issue: Some("#743"),
+        issue: Some("#762"),
     },
 ];
 
