@@ -49,17 +49,35 @@ use std::process::Command;
 /// `src/git.ts` run every mutating command through a single FIFO queue
 /// (`src/gitqueue.ts`), so their spawns stay serialized in click order exactly
 /// as the main thread used to serialize them — while the GUI stays live,
-/// because waiting in a promise queue blocks nothing. Reads (`git_status` and
-/// friends) are deliberately NOT queued: they were already async since #399,
-/// so they could always overlap a write, which is why `git_status` passes
-/// `--no-optional-locks`.
+/// because waiting in a promise queue blocks nothing. A sequencer op is one
+/// queued job *including its unwind*: `run_sequencer` runs the command and its
+/// `--abort` inside a single `_sync` body, so no other frontend git op can
+/// interleave between a conflict and the abort that cleans up after it.
 ///
-/// What the queue does *not* claim: it is a loomux-window guarantee, not a repo
-/// lock. The pane's own terminal — an agent running `git commit` in the very
-/// worktree the view is showing — has always been a concurrent writer that
-/// loomux never excluded, so `index.lock` and a surfaced error were always the
-/// real arbiter. This restores what the freeze provided; it does not pretend to
-/// more.
+/// Reads are deliberately NOT queued: they were already async since #399, so
+/// they could always overlap a write, and queueing them behind an unbounded
+/// fetch would be a new stall rather than a restoration. That overlap is safe
+/// only because the reads that touch the index never take `index.lock` —
+/// `git_status` and both index-reading `git_diff` modes pass
+/// `--no-optional-locks`, which is what suppresses git's opportunistic
+/// index write-back (pinned by `worktree_diff_never_writes_the_index` and its
+/// staged sibling). A read added here without that flag reopens the hazard.
+///
+/// What the queue does *not* claim. It covers commands issued through the
+/// webview, not every writer in the process, and two others sit outside it:
+/// the pane's own terminal (an agent running `git commit` in the very worktree
+/// the view is showing), and loomux's own backend — `Registry::spawn_agent_ex`
+/// calls `git_worktree_add_sync` directly from its own thread, never through a
+/// command. Both bypassed the freeze in exactly the same way, so neither is
+/// new; they are named so "the window is serialized" is never claimed. So
+/// `index.lock` and a surfaced error were always the real arbiter.
+///
+/// And what it costs: a slow head job delays every later mutating op,
+/// window-wide, across unrelated repos. That is the ordering the main thread
+/// already imposed and strictly better than freezing for the same duration —
+/// but a freeze is unmissable where a queue is silent, so the wait is bounded
+/// (`QUEUE_WAIT_LIMIT_MS`) and rejects rather than running late, and the git
+/// view announces a wait on the paths that have no button to spin.
 async fn run_blocking<T, F>(f: F) -> Result<T, String>
 where
     F: FnOnce() -> Result<T, String> + Send + 'static,
@@ -244,6 +262,18 @@ pub async fn git_status(repo: String) -> Result<GitStatus, String> {
 
 /// Unified diff for one file. `mode`: "worktree" | "staged" | "commit" |
 /// "untracked".
+///
+/// The two index-reading modes pass `--no-optional-locks`, like `git_status`.
+/// `git diff` otherwise performs an *opportunistic* index refresh: when an
+/// entry is stat-dirty but content-identical it rewrites `.git/index`, taking
+/// `index.lock` to do it. That write is pure optimization — the diff is
+/// identical without it — but it makes a read contend with a concurrent write,
+/// and since #726 a prompt-driven refresh (up to 2/s) or gitwatch's 1 s poll
+/// can now land in the middle of a queued `commit`/`stage`, which would then
+/// fail with "Unable to create '.git/index.lock'". Reads are outside the write
+/// queue precisely because they are supposed to be lock-free; this is what
+/// makes that true rather than assumed. `commit` mode (`git show`) and
+/// `untracked` never touch the index, so neither needs it.
 fn git_diff_sync(
     repo: String,
     path: String,
@@ -253,11 +283,26 @@ fn git_diff_sync(
     match mode.as_str() {
         "worktree" => run_git(
             &repo,
-            &["-c", "core.quotepath=false", "diff", "--", &path],
+            &[
+                "--no-optional-locks",
+                "-c",
+                "core.quotepath=false",
+                "diff",
+                "--",
+                &path,
+            ],
         ),
         "staged" => run_git(
             &repo,
-            &["-c", "core.quotepath=false", "diff", "--cached", "--", &path],
+            &[
+                "--no-optional-locks",
+                "-c",
+                "core.quotepath=false",
+                "diff",
+                "--cached",
+                "--",
+                &path,
+            ],
         ),
         "commit" => {
             let h = hash.ok_or("missing hash")?;
@@ -1972,6 +2017,69 @@ mod tests {
         assert!(
             !git_worktree_list_sync(p(d)).unwrap().contains("agent-w"),
             "an unresolvable base must not leave a worktree behind"
+        );
+    }
+
+    // ----- reads must not take index.lock (#726) -----
+
+    /// Leave `f.txt` stat-dirty but content-identical — the exact state that
+    /// makes `git diff` want to write a refreshed index back — and return the
+    /// repo-relative path plus the `.git/index` bytes to compare against.
+    fn stat_dirty_repo(d: &Path) -> Vec<u8> {
+        // Same content, so the blob is unchanged and any diff must be empty;
+        // a clearly different mtime, so the entry's cached stat is stale. A day
+        // back leaves no room for filesystem timestamp granularity to hide it.
+        let f = d.join("f.txt");
+        std::fs::write(&f, "a\n").unwrap();
+        let t = std::fs::metadata(&f).unwrap().modified().unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&f)
+            .unwrap()
+            .set_modified(t - std::time::Duration::from_secs(86_400))
+            .unwrap();
+        std::fs::read(d.join(".git").join("index")).unwrap()
+    }
+
+    /// Both index-reading diff modes get their own test rather than one loop:
+    /// a loop panics on the first mode, which would leave the second mode's
+    /// assertion un-reached and therefore un-evidenced by any red.
+    #[test]
+    fn worktree_diff_never_writes_the_index() {
+        // Reads sit OUTSIDE the write queue (src/gitqueue.ts) on the argument
+        // that they are lock-free, and since #726 a prompt-driven refresh or
+        // gitwatch's 1 s poll can land in the middle of a queued commit/stage.
+        // `git diff` breaks that argument unless told not to: it takes
+        // `index.lock` to write back an opportunistically refreshed index —
+        // pure optimization, since the diff is identical either way.
+        let repo = new_repo();
+        let d = repo.path();
+        commit(d, "f.txt", "a\n", "A");
+        let before = stat_dirty_repo(d);
+
+        let out = git_diff_sync(p(d), "f.txt".into(), "worktree".into(), None).unwrap();
+        assert!(out.is_empty(), "content is unchanged, so the diff must be empty");
+        assert_eq!(
+            std::fs::read(d.join(".git").join("index")).unwrap(),
+            before,
+            "`git diff` rewrote .git/index — it takes index.lock to do that, so this read can \
+             knock over a concurrent stage/commit (#726). Pass --no-optional-locks."
+        );
+    }
+
+    #[test]
+    fn staged_diff_never_writes_the_index() {
+        let repo = new_repo();
+        let d = repo.path();
+        commit(d, "f.txt", "a\n", "A");
+        let before = stat_dirty_repo(d);
+
+        let out = git_diff_sync(p(d), "f.txt".into(), "staged".into(), None).unwrap();
+        assert!(out.is_empty(), "index matches HEAD, so the staged diff must be empty");
+        assert_eq!(
+            std::fs::read(d.join(".git").join("index")).unwrap(),
+            before,
+            "`git diff --cached` rewrote .git/index — see worktree_diff_never_writes_the_index"
         );
     }
 

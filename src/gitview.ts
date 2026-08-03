@@ -25,6 +25,7 @@ import {
   gitRebase,
   gitBranches,
   gitWorktreeList,
+  gitWriteInFlight,
   type BranchInfo,
   type CommitInfo,
   type FileEntry,
@@ -730,6 +731,15 @@ export class GitView {
 
   /** Run a mutating git action, surface errors, refresh either way. */
   private async act(fn: () => Promise<void>): Promise<void> {
+    // #726: mutating commands are serialized (src/gitqueue.ts), so this one may
+    // not start immediately — and a stuck head job (an unreachable remote) can
+    // hold it for the full wait limit. `runOp()` and `push()` spin their own
+    // button; the paths through here are file rows and context-menu items with
+    // no such affordance, so an unannounced wait reads as a click that did
+    // nothing. Say it out loud instead. The wait itself is bounded by the
+    // queue, which rejects rather than running late — that error lands in the
+    // catch below like any other.
+    if (gitWriteInFlight()) this.toast("Waiting for another git operation to finish…", "ok");
     try {
       await fn();
     } catch (err) {

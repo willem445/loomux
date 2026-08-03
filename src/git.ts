@@ -5,17 +5,28 @@
 // Every MUTATING command goes through `writes` (#726). The backend commands are
 // all async now, so two of them can genuinely overlap where the old GUI-thread
 // freeze made that impossible; the queue restores that ordering without the
-// freeze. See src/gitqueue.ts for the full argument, and note the shape it
-// depends on: the queue lives here, at the one choke point every caller already
-// goes through, so a call site cannot forget it. Read commands are deliberately
-// NOT queued — they have been async since #399 and could always overlap a
-// write, which is why `git_status` passes `--no-optional-locks`.
+// freeze. See src/gitqueue.ts for the full argument — including what it does
+// not cover and what the wait costs — and note the shape it depends on: the
+// queue lives here, at the one choke point every caller already goes through,
+// so a call site cannot forget it.
+//
+// Reads are deliberately NOT queued: they have been async since #399, so they
+// could always overlap a write, and putting them behind an unbounded fetch
+// would be a new stall rather than a restoration. That overlap is safe only
+// because the reads that touch the index pass `--no-optional-locks` (backend
+// side) so they never take `index.lock` to write back a refreshed one —
+// `git_status` and both index-reading `git_diff` modes do.
 
 import { invoke } from "@tauri-apps/api/core";
 import { SerialQueue } from "./gitqueue";
 
 /** Serializes the mutating git commands in click order (#726). */
 const writes = new SerialQueue();
+
+/** Whether a mutating git command is in flight, i.e. whether one issued now
+ *  would have to wait. Exposed for the git view's `act()` paths, which have no
+ *  button to spin and would otherwise look hung (see gitqueue.ts). */
+export const gitWriteInFlight = (): boolean => writes.busy;
 
 export interface RefInfo {
   name: string;

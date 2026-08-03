@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { SerialQueue } from "../src/gitqueue.ts";
+import { SerialQueue, QUEUE_WAIT_LIMIT_MS, WAITED_TOO_LONG } from "../src/gitqueue.ts";
 
 /** A job that resolves only when its returned `finish` is called, and records
  *  when it started and stopped so overlap is observable rather than inferred. */
@@ -82,6 +82,89 @@ test("a failed job does not wedge the queue", async () => {
     })
   );
   assert.equal(await q.run(async () => "still working"), "still working");
+});
+
+test("a job that waits past the limit is abandoned, never run late", async () => {
+  // The bounded-suppression rule (#496, #513, #518): `run_git` spawns with no
+  // timeout and GIT_TERMINAL_PROMPT=0 does not cover a GUI credential helper,
+  // so the head job can genuinely never settle. Without a bound, every later
+  // mutating op in the window waits forever with nothing on screen.
+  const log: string[] = [];
+  const q = new SerialQueue();
+  const stuck = controllable(log, "stuck");
+
+  const head = q.run(stuck.work, 10_000);
+  const late = q.run(async () => {
+    log.push("+late");
+    return "ran";
+  }, 20);
+
+  // Raced against a watchdog rather than awaited directly, because the whole
+  // property is "this settles even though the head job never does". Awaiting an
+  // unbounded queue would hang the suite forever instead of failing it — a
+  // timeout is not evidence, an assertion is.
+  const outcome = await Promise.race([
+    late.then(
+      () => "ran to completion",
+      (e: Error) => (e.message === WAITED_TOO_LONG ? "abandoned" : `other rejection: ${e.message}`)
+    ),
+    new Promise((r) => setTimeout(() => r("still waiting"), 300)),
+  ]);
+  assert.equal(
+    outcome,
+    "abandoned",
+    "a job queued behind a head that never settles was not bounded — every later mutating op " +
+      "in the window is stuck for the life of the process (#496, #513, #518)"
+  );
+  // The critical half: abandoning must FAIL the job, never release it to run
+  // beside the stuck one — that would be the index.lock race the queue exists
+  // to prevent, smuggled past the guard by a timer.
+  assert.deepEqual(log, ["+stuck"], "the abandoned job ran anyway");
+
+  stuck.finish();
+  await head;
+  await new Promise((r) => setTimeout(r, 20));
+  assert.deepEqual(log, ["+stuck", "-stuck"], "the abandoned job ran when its turn finally came");
+});
+
+test("the wait clock covers the wait only, never the job's own duration", async () => {
+  // A legitimately slow push must not be cut off mid-flight — the bound exists
+  // for jobs that never START, not for jobs that take a while.
+  const q = new SerialQueue();
+  const slow = await q.run(async () => {
+    await new Promise((r) => setTimeout(r, 60));
+    return "finished";
+  }, 20);
+  assert.equal(slow, "finished");
+});
+
+test("a job that gets its turn in time is unaffected by the bound", async () => {
+  const q = new SerialQueue();
+  const results = await Promise.all([
+    q.run(async () => "a", 5_000),
+    q.run(async () => "b", 5_000),
+    q.run(async () => "c", 5_000),
+  ]);
+  assert.deepEqual(results, ["a", "b", "c"]);
+  assert.ok(QUEUE_WAIT_LIMIT_MS >= 30_000, "the default bound must not be tight enough to trip on a slow-but-normal op");
+});
+
+test("busy reports whether a job issued now would have to wait", async () => {
+  // Drives the git view's "Waiting for another git operation…" notice on the
+  // act() paths, which have no button to spin (gitview.ts act()).
+  const log: string[] = [];
+  const q = new SerialQueue();
+  assert.equal(q.busy, false, "an idle queue must not claim to be busy");
+
+  const job = controllable(log, "j");
+  const p = q.run(job.work);
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(q.busy, true, "a job is in flight, so the next one would wait");
+
+  job.finish();
+  await p;
+  assert.equal(q.busy, false, "the queue drained but still claims to be busy");
 });
 
 test("every mutating git binding routes through the queue, and no read does", () => {
