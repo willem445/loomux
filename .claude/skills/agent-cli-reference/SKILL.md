@@ -37,6 +37,28 @@ GitHub Copilot (root: https://docs.github.com/en/copilot/reference):
   https://docs.github.com/en/copilot/reference — navigate to the CLI section
   for the current layout rather than trusting a deep link.
 
+OpenCode (root: https://opencode.ai/docs/):
+
+- CLI flags (`--model`, `--agent`, `--session`, `--auto`, `opencode run`):
+  https://opencode.ai/docs/cli/
+- Config file, env overrides (`OPENCODE_CONFIG_CONTENT`) and the documented
+  merge precedence: https://opencode.ai/docs/config/
+- Permissions (`allow`/`ask`/`deny`, key list, last-match rule):
+  https://opencode.ai/docs/permissions/
+- Agents (config `agent` key, markdown agents, `{file:…}` prompts, per-agent
+  permission): https://opencode.ai/docs/agents/
+- MCP servers (config-key only, remote shape): https://opencode.ai/docs/mcp-servers/
+- Models and id format (`provider_id/model_id`): https://opencode.ai/docs/models/
+- OpenCode Zen (the curated model list and its ids): https://opencode.ai/docs/zen/
+- Rules (`AGENTS.md`/`CLAUDE.md` loading): https://opencode.ai/docs/rules/
+- Windows/WSL guidance: https://opencode.ai/docs/windows-wsl
+
+Its docs are silent on several surfaces loomux depends on (the session store's
+layout, the exact merge ranks, `--agent` failure behavior, `run` without
+`--auto`), so those are read from the CLI's own source at a pinned commit and
+recorded as labeled observations in `doc/design/opencode.md` — not inferred,
+and not presented as contract.
+
 Any other agent CLI: find the vendor's official reference before wiring
 anything, and ADD its root URL to this index in the
 same PR that introduces the dependency. A CLI with no reference docs gets
