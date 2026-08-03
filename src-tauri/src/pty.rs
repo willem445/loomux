@@ -1131,16 +1131,27 @@ fn effective_shell_kind(requested: ShellKind) -> ShellKind {
 /// disable, with a reason) the Git Bash shell kind before a pane is spawned
 /// (#194 P2). `None` = Git for Windows isn't installed. Always `None` off
 /// Windows, where Git Bash isn't a concept.
+///
+/// Off-thread (#746 — `crate::blocking::run_blocking`, P1 of
+/// `doc/design/performance.md`): `find_git_bash` stats a bounded candidate list
+/// and scans PATH, on the thread that services paint, at launcher time.
+///
+/// **Reentrancy.** A pure read of the machine, with no lock and no mutation:
+/// two probes stat the same paths and agree. Nothing here is cached, so there
+/// is not even a cache for a race to disagree about.
 #[tauri::command]
-pub fn discover_git_bash() -> Option<String> {
-    #[cfg(target_os = "windows")]
-    {
-        find_git_bash().map(|p| p.to_string_lossy().into_owned())
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        None
-    }
+pub async fn discover_git_bash() -> Option<String> {
+    crate::blocking::run_blocking(|| {
+        #[cfg(target_os = "windows")]
+        {
+            find_git_bash().map(|p| p.to_string_lossy().into_owned())
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            None
+        }
+    })
+    .await
 }
 
 /// Whether the direct-CLI spawn path (issue #78) is disabled by the escape
@@ -1313,10 +1324,40 @@ pub fn spawn_pane_child(
         .map_err(|e| e.to_string())
 }
 
+/// Open a ConPTY and spawn the pane's child on it, returning the pane's id.
+///
+/// Off-thread (#746 — `crate::blocking::run_blocking`, P1 of
+/// `doc/design/performance.md`): `openpty` plus `CreateProcess` is a **process
+/// spawn**, which INV-2 refuses on the webview thread outright — and the
+/// ConPTY handshake in front of it is not bounded by anything loomux controls.
+/// Once per pane and human-gestured, so it is not a hot path; it is the one
+/// INV-2 names without qualification.
+///
+/// `state: State<PtyManager>` becomes `app.try_state` INSIDE the closure, the
+/// same move `write_pty` and `change_dir` made in #734: a borrowed `State` is
+/// not `'static` and cannot cross into the pool. Tauri injects both, and
+/// neither appears in the argument object the frontend sends, so the wire
+/// contract is byte-identical.
+///
+/// **Reentrancy.** Two spawns off-thread are two independent ConPTYs — there is
+/// no shared resource between them but the id counter and the map, and both are
+/// already concurrency-safe on their own terms: `next_id` is an
+/// `AtomicU32::fetch_add`, so ids stay unique however the spawns interleave,
+/// and the `ptys` insert is one map mutation under a briefly-held lock (the
+/// three worker threads it then starts are spawned per pane and share nothing
+/// with another pane's).
+///
+/// What that gives up, stated plainly: the ids two concurrent spawns receive
+/// are no longer necessarily in the order the two calls arrived, because the
+/// counter is read after the openpty rather than before. Nothing depends on it.
+/// An id is an opaque handle returned to its own caller through its own promise
+/// — `src/pty.ts` pairs them that way, orchestration binds an agent to whatever
+/// id its own spawn returned, and no code anywhere compares two ids for order.
+/// A restore that wants panes in a fixed order gets it from the layout it is
+/// replaying, not from the counter.
 #[tauri::command]
-pub fn spawn_pty(
+pub async fn spawn_pty(
     app: AppHandle,
-    state: State<PtyManager>,
     cols: u16,
     rows: u16,
     cwd: Option<String>,
@@ -1334,6 +1375,28 @@ pub fn spawn_pty(
     // `command`); unknown/absent falls back to PowerShell explicitly.
     shell_kind: Option<String>,
 ) -> Result<u32, String> {
+    crate::blocking::run_blocking(move || {
+        spawn_pty_blocking(app, cols, rows, cwd, command, argv, env, shell_kind)
+    })
+    .await
+}
+
+/// The body of [`spawn_pty`], run on the blocking pool. Split out so the
+/// command itself is a one-line delegate with nothing before its first await
+/// (INV-1's delegation half — an `async fn` that works inline is polled on the
+/// webview thread and freezes it exactly as a sync one would, #724).
+#[allow(clippy::too_many_arguments)]
+fn spawn_pty_blocking(
+    app: AppHandle,
+    cols: u16,
+    rows: u16,
+    cwd: Option<String>,
+    command: Option<String>,
+    argv: Option<Vec<String>>,
+    env: Option<Vec<(String, String)>>,
+    shell_kind: Option<String>,
+) -> Result<u32, String> {
+    let state = app.try_state::<PtyManager>().ok_or("pty state unavailable")?;
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize {
@@ -1410,6 +1473,14 @@ pub fn spawn_pty(
 
     crate::obs::breadcrumb("pty-open", &format!("id={id} cols={cols} rows={rows}"));
 
+    // Clone what the waiter thread needs out of the manager, then release the
+    // handle: `State<'_, PtyManager>` borrows `app`, and the waiter below MOVES
+    // `app` into itself. All three are `Arc`s, so this is three pointer copies.
+    let ptys = state.ptys.clone();
+    let expected_exits = state.expected_exits.clone();
+    let neutral_gate_throttle = state.neutral_gate_throttle.clone();
+    drop(state);
+
     // Reader thread: stream output on a single shared channel keyed by id.
     // The frontend router buffers payloads for panes that haven't attached
     // their handler yet, so no output can be lost at startup. A rolling tail
@@ -1466,10 +1537,7 @@ pub fn spawn_pty(
 
     // Waiter thread: reap the child, then tear down and notify. Orchestration
     // learns about agent deaths here (authoritative, even if the frontend
-    // never noticed the pane).
-    let ptys = state.ptys.clone();
-    let expected_exits = state.expected_exits.clone();
-    let neutral_gate_throttle = state.neutral_gate_throttle.clone();
+    // never noticed the pane). Its three handles were cloned out above.
     std::thread::spawn(move || {
         let status = child.wait();
         // Snapshot the removed handle's output BEFORE it's dropped (#281): the
@@ -1654,13 +1722,39 @@ pub struct DirInfo {
 
 /// Resolve display name + git branch for a shell-reported directory. Called
 /// from the frontend each time a pane emits its working directory.
+///
+/// Off-thread (#746 — `crate::blocking::run_blocking`, P1 of
+/// `doc/design/performance.md`): `git_branch` stats and reads `.git` and `HEAD`
+/// walking up the parent directories.
+///
+/// **Why converted rather than left to the throttle.** #743's plan allowed this
+/// row to be absorbed by S5's caller-side bound instead, and #764 (S5) has since
+/// landed: `refreshthrottle.ts` holds a pane to one repo-signal reaction per
+/// `REPO_SIGNAL_WINDOW_MS`, which is what stopped a rebase or an agent's commit
+/// loop from driving this at burst rate. That fixed the RATE and not the STALL.
+/// A throttle bounds how OFTEN the webview thread pays; it says nothing about
+/// what one payment costs, and one payment here is an unbounded walk up a
+/// directory chain — on a cold or network path, or a deep tree, a visible freeze
+/// that the throttle then guarantees will recur every window. INV-2 admits
+/// filesystem work on that thread only as declared debt or as an `exception`
+/// with a stated bound, and "≤1 per 500 ms" is a bound on frequency, not on
+/// latency. So the row is drained the way the other twenty-four are.
+///
+/// **Reentrancy.** A pure function of `path`: no state, no lock, nothing
+/// written. Two panes reporting the same cwd read the same files and compute
+/// the same answer, and a `git checkout` landing mid-read yields the branch on
+/// one side of it or the other — which is what a `HEAD` read has always been,
+/// since nothing has ever held that repo still.
 #[tauri::command]
-pub fn dir_info(path: String) -> DirInfo {
-    let dir = Path::new(&path);
-    DirInfo {
-        cwd: abbreviate_home(dir),
-        branch: git_branch(dir),
-    }
+pub async fn dir_info(path: String) -> DirInfo {
+    crate::blocking::run_blocking(move || {
+        let dir = Path::new(&path);
+        DirInfo {
+            cwd: abbreviate_home(dir),
+            branch: git_branch(dir),
+        }
+    })
+    .await
 }
 
 /// Send a `cd` into a pane's shell, so the folder picker can drive it. The

@@ -336,35 +336,6 @@ const SYNC_COMMANDS: &[Row] = &[
     // debt — #746 (F1): the sync gesture commands outside orchestration.
     // ---------------------------------------------------------------------
     Row {
-        name: "spawn_pty",
-        class: Class::Debt,
-        reason: "Runs openpty plus the child process creation (ConPTY handshake and CreateProcess) \
-                 on the webview thread; the ptys lock is taken only for the insert. Once per pane \
-                 and human-gestured, but it is a process spawn on the GUI thread, which INV-2 \
-                 admits only as declared debt.",
-        issue: Some("#746"),
-    },
-    Row {
-        name: "dir_info",
-        class: Class::Debt,
-        reason: "Stats and reads .git and HEAD walking up the parent directories, on the webview \
-                 thread. Was the hottest row in this block — one sync read per OSC-7 cwd report \
-                 and per git-changed event, per pane watching the repo, so a rebase or an agent's \
-                 commit loop drove it. #764 (S5) bounded the CALLER to one read per pane per \
-                 REPO_SIGNAL_WINDOW_MS with a leading edge, which is why this is now an ordinary \
-                 gesture-rate row rather than the urgent one; the sync dispatch itself is what F1 \
-                 still owns.",
-        issue: Some("#746"),
-    },
-    Row {
-        name: "discover_git_bash",
-        class: Class::Debt,
-        reason: "Stats a bounded candidate list and scans PATH looking for git-bash, on the \
-                 webview thread, once at launcher time. F1's list enumerates the other pty.rs \
-                 gesture commands and omits this one; it is the same shape and rides with them.",
-        issue: Some("#746"),
-    },
-    Row {
         name: "git_watch",
         class: Class::Debt,
         reason: "Computes the repo signature (stats and reads) on the webview thread. #763 (S7) \
