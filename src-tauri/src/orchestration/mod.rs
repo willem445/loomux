@@ -31237,9 +31237,21 @@ impl OrchRegistry {
                 // shows an interactive session picker, which requires a TTY. If
                 // multiple sessions exist and the picker can't be shown … the CLI
                 // exits with an error instead of silently starting a new session —
-                // pass an explicit `--resume=SESSION-ID` or use `--continue`." The
-                // space form risks parsing as bare-flag-plus-positional, i.e. the
-                // picker in a pane loomux is about to type a kickoff into.
+                // pass an explicit `--resume=SESSION-ID` or use `--continue`."
+                //
+                // **What is documented, and what is not.** Documented: the
+                // `[=VALUE]` notation, and the instruction to pass
+                // `--resume=SESSION-ID` explicitly. NOT documented: whether the
+                // space form actually mis-parses — the same page writes
+                // `--resume <TASK-ID>` in prose (describing resuming a remote
+                // task, not demonstrating the parse), so the two readings are not
+                // settled by the docs, and CLAUDE.md constraint 3 rules out
+                // spawning a real copilot to settle it. So this is "use the form
+                // the reference tells you to use", not "fixed a confirmed
+                // mis-parse" — the failure it would avoid (a TTY picker, or an
+                // outright exit, in a pane loomux is about to type a kickoff
+                // into) is severe enough that the free option wins without
+                // needing the stronger claim.
                 // #458 fixed this on the Sessions-tab command (`scan_copilot`) and
                 // left the spawn path alone because nothing routed a copilot
                 // orchestration session here; #781 does, so it moves too.
@@ -31605,11 +31617,18 @@ impl OrchRegistry {
             "copilot" => {
                 push(&mut a, "copilot");
                 if let (Some(s), true) = (session, resume) {
-                    // ONE argv element, `=`-joined — see the string builder's
-                    // resume comment. The hazard is worse here, not better: an
-                    // optional-value flag takes its value from the SAME argv
-                    // element, so a separate `s` element is a positional and
-                    // `--resume` is bare.
+                    // ONE argv element, `=`-joined — the form the reference
+                    // tells you to pass (see the string builder's comment).
+                    //
+                    // Kept in step with the string form rather than argued
+                    // separately, because what an optional-value flag does with
+                    // a SEPARATE argv element is exactly what the docs do not
+                    // say. The reasoning that it would be read as a positional
+                    // is an inference from the `[=VALUE]` notation, and the same
+                    // page writes `--resume <TASK-ID>` in prose elsewhere, so
+                    // the inference is not even unopposed. Following the
+                    // documented instruction costs nothing and needs no theory
+                    // of the parser; the theory is what would need proving.
                     a.push(format!("--resume={s}"));
                 }
                 push(&mut a, "--additional-mcp-config");

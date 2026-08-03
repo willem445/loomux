@@ -1346,6 +1346,19 @@ the failure mode here was not a wrong rule but a *stale* one, and the cheapest
 guard against a second staleness is a test that names the CLI-independence
 explicitly.
 
+**Two claims from #458's section above are now out of date, and are corrected
+here rather than edited into that dated record.** First, its residual —
+`agentResumeCommand` re-emitting the space form on a *second* restore — was
+closed by the restore-path work it was tracked under: `panerestore.ts` branches
+on `programFromRestore(...) === "copilot"` and emits `--resume=<id>` for both
+the string and argv forms, with `test/panerestore.test.ts` pinning it and the
+function's own doc naming the oscillation hazard (two fixes undoing each other
+forever) as the reason. Second, that section labelled the space form's actual
+mis-parse **UNVERIFIED**, which is still the right label and is the one this
+change keeps: see the builder comment for what the reference does and does not
+say. `--session-id` deliberately stays space-form on both paths, because the
+reference documents *that* flag in the space form specifically.
+
 **What is deliberately NOT changed.** `build_resume_command` stays exactly as
 it is. It is the right command for a session with no recorded membership, which
 is what such a session honestly is; the bug was never that it built a poor
