@@ -42,8 +42,14 @@ tell the orchestrator, so the next one like it goes to `worker-quick`.
    Cover at least one edge/failure case — for anything fail-closed, test the
    *refusal*. Backend tests that link the lib go in `src-tauri/tests/` (integration
    tests only — the Windows manifest rides on `-tests`-scoped link args).
-   **Red before green, evidenced.** Run your new tests against the base branch (stash the
-   implementation, keep the tests) and confirm they fail for the *expected* reason — not on a
+   **Red before green, evidenced.** Commit the tests FIRST, as their own commit(s) on the
+   branch, and let CI redden that tree — never `git stash` the implementation to strip it
+   (the stash stack is shared across every worktree of this repo, #299; commit-first is
+   #493). Every new test that touches only *pre-existing* public API belongs in that
+   tests-only commit: the test is "does it compile without my change", not "is it about my
+   feature". A pin that shipped alongside the feature anyway is evidenced after the fact —
+   one commit removing exactly the thing under test, the CI run naming which test noticed,
+   then restore (#745). Confirm they fail for the *expected* reason — not on a
    compile error, which proves nothing about behaviour. Paste the command and the failure line
    into the PR body, next to the same command passing on your branch. `rev-tests` is going to
    try to break your pins anyway; a pin you have already seen go red is one you don't lose that
