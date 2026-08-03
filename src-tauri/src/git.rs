@@ -2177,8 +2177,10 @@ mod tests {
         // module only. Every `git` spawn in it goes through `run_git`, which is
         // a private `fn`, so no command outside this module can reach one
         // through it. `gitwatch.rs`'s `git_watch` / `git_unwatch` are
-        // deliberately NOT here and stay synchronous: they are in-memory
-        // registry writes under a mutex, not `git` spawns.
+        // deliberately NOT here: they read `.git` metadata directly and spawn
+        // no `git` at all, so this scan has nothing to say about them. Their
+        // own dispatch is E1's business — `git_watch` went async in #746 and
+        // `git_unwatch` is an argued `cheap` row there.
         //
         // Split so the literal never appears as a whole line in this file —
         // otherwise the scan would find its own source and mis-report.
