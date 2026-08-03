@@ -20169,12 +20169,24 @@ fn the_orchestrator_contract_names_the_partial_pr_sweep_caveat() {
         intake::IntakeTruncation { issues: false, prs: true },
     );
     assert!(partial.contains("PARTIAL:"), "a short open-PR fetch must state itself: {partial}");
-    assert!(partial.contains("open-PR fetch"), "the caveat must name which of the two fetches was short: {partial}");
+    // The phrase the summary uses to name WHICH fetch was short, carried over
+    // to the contract verbatim. Deliberately not the bare token "open-PR": the
+    // template already says "open-PR check-state changes" in its intake-gate
+    // description, which silently satisfied the first cut of this assertion on
+    // a template that explained nothing about a truncated sweep — a pin that
+    // passes before the clause it pins exists is a decoration.
+    let names_the_fetch = "open-PR fetch";
+    assert!(partial.contains(names_the_fetch), "the caveat must name which of the two fetches was short: {partial}");
     assert!(
-        ORCHESTRATOR_TPL.contains("open-PR"),
-        "orchestrator.md must say what a PARTIAL open-PR fetch means: the check sweep saw only the \
-         newest open PRs, so a PR outside that window finishing CI produces no wake at all and must \
-         be checked rather than assumed still running (#795)"
+        ORCHESTRATOR_TPL.contains(names_the_fetch),
+        "orchestrator.md must name the short fetch the way the summary does ({names_the_fetch}), so \
+         the orchestrator can tell a truncated PR sweep from a truncated backlog (#795)"
+    );
+    assert!(
+        ORCHESTRATOR_TPL.contains("produces no wake"),
+        "orchestrator.md must say what a PARTIAL open-PR fetch COSTS: a PR outside the window \
+         finishing CI produces no wake at all, so silence about it is absence of evidence and must \
+         be checked rather than read as still-running (#795)"
     );
 }
 
