@@ -940,24 +940,10 @@ fn validate_knob(
     }
     if let Some((supported, note)) = cli_supports {
         if !supported.contains(&want.as_str()) {
-            let alternatives: Vec<&str> = super::CLI_CAPS
-                .iter()
-                .filter(|c| c.orchestration && knob_of(c).contains(&want.as_str()))
-                .map(|c| c.cli)
-                .collect();
-            let remedy = if alternatives.is_empty() {
-                format!(
-                    "no cli loomux spawns can set {field} {want:?} today — drop the key and take \
-                     the CLI's own default"
-                )
-            } else {
-                format!(
-                    "drop the key (the CLI's own default applies), or give this block a cli: that \
-                     can set it — {}",
-                    alternatives.join(", ")
-                )
-            };
-            return Err(format!("cli {cli:?} cannot set {field} {want:?} — {note}. Fix: {remedy}"));
+            // RED-PROOF MUTATION (#782): the pre-fix message — a verdict with no
+            // remedy, no value, and the stray colon. Nothing else in the tree changes.
+            let _ = knob_of;
+            return Err(format!("cli {cli:?} cannot set {field}: — {note}"));
         }
     }
     Ok(want)
