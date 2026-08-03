@@ -4320,6 +4320,96 @@ pub const COPILOT_EDIT_DENY_TOOLS: &[&str] = &["write"];
 /// [`COPILOT_EDIT_DENY_TOOLS`].
 pub const COPILOT_READONLY_DENY_GIT: &[&str] = &["shell(git commit)", "shell(git push)"];
 
+/// The git/gh pre-approval an **attended** copilot agent gets in place of the
+/// unattended allow-all atoms, so the branch→commit→PR flow doesn't prompt on
+/// every command. The `shell(COMMAND)` spec's `:*` suffix is documented to
+/// match "the command stem followed by a space, preventing partial matches. For
+/// example, `shell(git:*)` matches `git push` and `git pull` but does not match
+/// `gitea`."
+pub const COPILOT_ATTENDED_ALLOW: &[&str] = &["shell(git:*)", "shell(gh:*)"];
+
+/// The separator between two patterns inside ONE `--allow-tool`/`--deny-tool`
+/// value.
+///
+/// **One occurrence per option — never a repeated flag (#802).** Per the CLI
+/// command reference (raw-fetched via `curl -sL "https://docs.github.com/api/\
+/// article/body?pathname=/en/copilot/reference/copilot-cli-reference/\
+/// cli-command-reference"`, per the `agent-cli-reference` skill's raw-fetch
+/// recipe, checked 2026-08-03), `--allow-tool=TOOL ...` is "Tools the CLI has
+/// permission to use. Will not prompt for permission. **For multiple tools, use
+/// a quoted, comma-separated list.**", and `--deny-tool=TOOL ...` says the same.
+/// Neither is documented as repeatable — and that table is demonstrably careful
+/// about the distinction: `--add-dir`, `--attachment`, `--add-github-mcp-tool`,
+/// `--add-github-mcp-toolset` and `--disable-mcp-server` each carry "(can be
+/// used multiple times)", and `--secret-env-vars` carries BOTH annotations at
+/// once ("(can be used multiple times). For multiple variables, use a quoted,
+/// comma-separated list."). The allow/deny how-to agrees from the other side:
+/// "The value for each of these options is a comma-separated list of tool
+/// kinds".
+///
+/// So the repeated form loomux emitted before #802 is a form the docs never
+/// describe, and its failure mode — if a later occurrence *replaces* an earlier
+/// one instead of accumulating — is exactly the #802 report: the base
+/// `--allow-tool loomux` grant silently dropped by the git/gh pair or by a
+/// block's `allow:` patterns emitted after it. Those extra occurrences are, on
+/// copilot, the ONLY argv difference a workflow block introduces over the
+/// built-in roster.
+///
+/// **This does not claim to have caught the parser in the act.** Whether
+/// copilot accumulates or last-wins is undocumented, and CLAUDE.md constraint 3
+/// rules out spawning a real copilot to find out. The point is that the single
+/// comma-separated occurrence is correct under *either* reading, so it needs no
+/// theory of the parser — the repeated form did. (The same undocumented
+/// question is already flagged, and deliberately not relied on, at the solo-pane
+/// MCP join site in `spawn_solo_agent`.)
+pub const COPILOT_TOOL_LIST_SEP: &str = ",";
+
+/// The `--allow-tool` and `--deny-tool` values a copilot agent launches with,
+/// as ordered pattern lists ready to join with [`COPILOT_TOOL_LIST_SEP`].
+/// Shared by the string and argv builders so the two can't drift, and pure so
+/// the whole posture is assertable without a spawn (CLAUDE.md constraint 3).
+///
+/// The allow list always leads with [`LOOMUX_MCP_SERVER`] — the bare
+/// server-name form, which the reference's "Tool permission patterns" table
+/// documents as a permission kind in its own right (`SERVER-NAME | MCP server
+/// tool invocation | MyMCP(create_issue), MyMCP`) with a worked example: "#
+/// Allow all tools from a server / `copilot --allow-tool='MyMCP'`". #802's
+/// first hypothesis was that copilot 1.0.77 had stopped matching a bare server
+/// name and now required a per-tool or pattern spec; the reference says
+/// otherwise, so the *value* is unchanged and only its packaging moved.
+///
+/// Deny is separate rather than folded in because deny is not a stronger allow:
+/// "Deny rules always take precedence over allow rules, even when `--allow-all`
+/// is set", which is what lets a planner/reviewer stay contained under the
+/// unattended allow-all atoms.
+#[doc(hidden)] // pub for integration tests
+pub fn copilot_tool_permissions(
+    unattended: bool,
+    containment: Containment,
+    extra_allow: &[String],
+) -> (Vec<String>, Vec<String>) {
+    let mut allow = vec![LOOMUX_MCP_SERVER.to_string()];
+    if !unattended {
+        // An unattended agent already has `--allow-all-tools`; the git/gh pair
+        // is the attended tier's substitute for it, not an addition to it.
+        allow.extend(COPILOT_ATTENDED_ALLOW.iter().map(|s| (*s).to_string()));
+    }
+    // A block's own `allow:` patterns come last — the capability-closure rule
+    // in `persona_inject` has already emptied this for a read-only class.
+    allow.extend(extra_allow.iter().cloned());
+
+    let mut deny: Vec<String> = Vec::new();
+    if containment.denies_edits() {
+        deny.extend(COPILOT_EDIT_DENY_TOOLS.iter().map(|s| (*s).to_string()));
+    }
+    if containment.denies_git_mutation() {
+        // Nested the same way the claude arm nests its git denials: the tiers
+        // are a ladder (see `Containment`).
+        deny.extend(COPILOT_READONLY_DENY_GIT.iter().map(|s| (*s).to_string()));
+    }
+    (allow, deny)
+}
+
 /// Gemini CLI's built-in tool names, per the official
 /// [Tools reference](https://github.com/google-gemini/gemini-cli/blob/main/docs/reference/tools.md)
 /// ("Available tools", fetched as raw markdown via the GitHub contents API and
@@ -10071,14 +10161,21 @@ fn agent_id_suffix(id: &str) -> Option<u32> {
     id.rsplit_once('-').and_then(|(_, tail)| tail.parse().ok())
 }
 
-/// Add a folder to copilot's `trustedFolders` config, returning the new
-/// file content — or None when nothing should be written (already trusted,
-/// or the existing config is unparseable and must not be clobbered). The
-/// file is JSONC-ish: leading `//` comment lines before a JSON object;
-/// comments and unknown fields are preserved.
-pub fn add_trusted_folder(config_text: &str, folder: &str) -> Option<String> {
+/// Compare two filesystem paths the way both copilot config surfaces below
+/// need them compared: separator-insensitive, trailing-separator-insensitive,
+/// and case-insensitive (loomux is Windows-only, and the copilot
+/// configuration-directory reference states `allowed_directories` paths are
+/// compared "case-insensitively on Windows").
+fn same_path_key(a: &str, b: &str) -> bool {
+    let norm = |s: &str| s.replace('/', "\\").trim_end_matches('\\').to_lowercase();
+    norm(a) == norm(b)
+}
+
+/// The JSONC-ish split both copilot config editors below share: leading `//`
+/// comment lines, then a JSON object. Returns `(comments, body)`.
+fn split_jsonc_comment_header(text: &str) -> (&str, &str) {
     let mut comment_len = 0;
-    for line in config_text.split_inclusive('\n') {
+    for line in text.split_inclusive('\n') {
         let t = line.trim();
         if t.starts_with("//") || t.is_empty() {
             comment_len += line.len();
@@ -10086,7 +10183,160 @@ pub fn add_trusted_folder(config_text: &str, folder: &str) -> Option<String> {
             break;
         }
     }
-    let (comments, body) = config_text.split_at(comment_len);
+    text.split_at(comment_len)
+}
+
+/// The name of copilot's saved-permissions file, and its legacy extensionless
+/// spelling. Per the configuration-directory reference: "Older builds used an
+/// extensionless file named `permissions-config`. If `permissions-config.json`
+/// doesn't exist but the extensionless file does, the CLI still honors the
+/// legacy file. Use `permissions-config.json` for new edits."
+///
+/// That fallback is why [`copilot_permissions_file`] exists rather than a
+/// hardcoded join: creating `permissions-config.json` beside a user's existing
+/// legacy file would make the CLI stop honouring the legacy one, silently
+/// discarding every approval they had saved.
+const COPILOT_PERMISSIONS_FILE: &str = "permissions-config.json";
+const COPILOT_PERMISSIONS_FILE_LEGACY: &str = "permissions-config";
+
+/// Which permissions file to edit inside `home` — see
+/// [`COPILOT_PERMISSIONS_FILE`] for why the legacy name can't just be ignored.
+fn copilot_permissions_file(home: &Path) -> PathBuf {
+    let modern = home.join(COPILOT_PERMISSIONS_FILE);
+    if !modern.exists() {
+        let legacy = home.join(COPILOT_PERMISSIONS_FILE_LEGACY);
+        if legacy.exists() {
+            return legacy;
+        }
+    }
+    modern
+}
+
+/// Loomux's grant in copilot's **documented** permission store,
+/// `~/.copilot/permissions-config.json` — returning the new file content, or
+/// `None` when nothing needs writing (already granted, or the existing file is
+/// unparseable and must not be clobbered).
+///
+/// **Why this file, when [`add_trusted_folder`] already writes one (#802).**
+/// The `config.json` / `trustedFolders` pair is the pre-1.0.77 surface, and it
+/// appears in no page of copilot's current reference. Per the configuration-
+/// directory reference (raw-fetched via `curl -sL "https://docs.github.com/api/\
+/// article/body?pathname=/en/copilot/reference/copilot-cli-reference/\
+/// cli-config-dir-reference"`, per the `agent-cli-reference` skill's raw-fetch
+/// recipe, checked 2026-08-03), `config.json` "Stores internal application
+/// state that is managed automatically by the CLI, including authentication
+/// data … You should not normally need to edit this file", and "Any user
+/// settings in `config.json` at startup are automatically migrated to
+/// `settings.json`". `trustedFolders` is absent from that file's description,
+/// from `settings.json`'s full settings table, and from this file's full
+/// schema. What the docs DO name is this file — "Saved tool and directory
+/// permissions per project" — and the allow/deny how-to
+/// (`…/how-tos/copilot-cli/use-copilot-cli/allowing-tools`) says outright: "Any
+/// directories you grant access to are saved to the same file."
+///
+/// That is an ABSENCE claim, so it is sourced rather than assumed — but an
+/// absence across three reference pages is not proof the old key was *removed*,
+/// only that it is no longer described. So the legacy write stays alongside
+/// this one (see [`OrchRegistry::pre_trust_copilot_folder`]): loomux cannot
+/// observe which copilot build a machine runs, and dropping the old key would
+/// trade a confirmed gap for a possible regression.
+///
+/// **Two grants, both straight off the documented schema:**
+/// - `locations.<key>.allowed_directories` — "Extra directories that the path
+///   gate can access for this location."
+/// - `locations.<key>.tool_approvals` `{ kind: "mcp", serverName, toolName:
+///   null }` — "Approves one MCP tool, or every tool on the server when
+///   `toolName` is `null`", with "`serverName` must match the configured MCP
+///   server name exactly. Use the raw server name from your MCP configuration,
+///   not a sanitized tool-name prefix." This is the durable form of the grant
+///   `--allow-tool <server>` already makes on argv, and "the CLI lists the
+///   loomux MCP server as available, but the agent has no permission to use its
+///   tools" (#802) is a report of its absence. It grants nothing to a non-loomux
+///   session: an approval names a server, and a session that never loads
+///   loomux's `--additional-mcp-config` has no such server to invoke.
+///
+/// **`location` is the git root, not the agent's workdir.** The reference keys
+/// this map by "the Git root used for permission scoping" and states "Linked
+/// worktrees resolve to the main repository root, so they share permissions
+/// with the main worktree" — so a worker in a dedicated worktree looks its
+/// approvals up under the repo it was cut from. The worktree still needs the
+/// *path* gate, which is what `folder` adds to `allowed_directories`.
+///
+/// An existing location key that differs only by case or separator is REUSED
+/// rather than duplicated: "The key must match the location where Copilot CLI
+/// is running. If the key doesn't match, the saved approvals won't apply", so
+/// two keys for one repo would leave the user's own approvals stranded under
+/// whichever one copilot didn't pick.
+pub fn copilot_permissions_grant(
+    config_text: &str,
+    location: &str,
+    folder: &str,
+    mcp_server: &str,
+) -> Option<String> {
+    let (comments, body) = split_jsonc_comment_header(config_text);
+    let mut v: Value = if body.trim().is_empty() {
+        json!({})
+    } else {
+        serde_json::from_str(body).ok()?
+    };
+    let locations = v
+        .as_object_mut()?
+        .entry("locations")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()?;
+    // Reuse an equivalent key rather than adding a second spelling of it.
+    let key = locations
+        .keys()
+        .find(|k| same_path_key(k.as_str(), location))
+        .cloned()
+        .unwrap_or_else(|| location.replace('/', "\\").trim_end_matches('\\').to_string());
+    let entry = locations.entry(key).or_insert_with(|| json!({})).as_object_mut()?;
+
+    let mut changed = false;
+
+    let dirs = entry
+        .entry("allowed_directories")
+        .or_insert_with(|| json!([]))
+        .as_array_mut()?;
+    if !dirs.iter().any(|e| e.as_str().is_some_and(|s| same_path_key(s, folder))) {
+        dirs.push(json!(folder));
+        changed = true;
+    }
+
+    let approval = json!({ "kind": "mcp", "serverName": mcp_server, "toolName": null });
+    let approvals = entry
+        .entry("tool_approvals")
+        .or_insert_with(|| json!([]))
+        .as_array_mut()?;
+    // A server-wide approval is `toolName: null`; a pre-existing approval for
+    // ONE tool on the same server is not the same grant and must not satisfy
+    // this check, or a hand-approved `report` would suppress the rest.
+    let already = approvals.iter().any(|e| {
+        e.get("kind").and_then(Value::as_str) == Some("mcp")
+            && e.get("serverName").and_then(Value::as_str) == Some(mcp_server)
+            && e.get("toolName").is_some_and(Value::is_null)
+    });
+    if !already {
+        approvals.push(approval);
+        changed = true;
+    }
+
+    if !changed {
+        return None;
+    }
+    Some(format!("{comments}{}\n", serde_json::to_string_pretty(&v).ok()?))
+}
+
+/// Add a folder to copilot's `trustedFolders` config, returning the new
+/// file content — or None when nothing should be written (already trusted,
+/// or the existing config is unparseable and must not be clobbered). The
+/// file is JSONC-ish: leading `//` comment lines before a JSON object;
+/// comments and unknown fields are preserved.
+///
+/// The pre-1.0.77 surface — see [`copilot_permissions_grant`], which is the
+/// documented one and is written alongside this (#802).
+pub fn add_trusted_folder(config_text: &str, folder: &str) -> Option<String> {
+    let (comments, body) = split_jsonc_comment_header(config_text);
     let mut v: Value = if body.trim().is_empty() {
         json!({})
     } else {
@@ -10097,8 +10347,7 @@ pub fn add_trusted_folder(config_text: &str, folder: &str) -> Option<String> {
         .entry("trustedFolders")
         .or_insert_with(|| json!([]))
         .as_array_mut()?;
-    let norm = |s: &str| s.replace('/', "\\").trim_end_matches('\\').to_lowercase();
-    if arr.iter().any(|e| e.as_str().is_some_and(|s| norm(s) == norm(folder))) {
+    if arr.iter().any(|e| e.as_str().is_some_and(|s| same_path_key(s, folder))) {
         return None;
     }
     arr.push(json!(folder));
@@ -10143,7 +10392,18 @@ pub fn set_copilot_trust_home_for_test(home: Option<PathBuf>) {
 ///
 /// Module-private on purpose: nothing outside this module should be able to
 /// name a "write the trust grant HERE" primitive.
-fn pre_trust_copilot_folder_in(home: &Path, folder: &str) {
+fn pre_trust_copilot_folder_in(home: &Path, location: &str, folder: &str) {
+    // The documented store (#802) — see `copilot_permissions_grant`.
+    let perms_path = copilot_permissions_file(home);
+    let perms_text = fs::read_to_string(&perms_path).unwrap_or_default();
+    if let Some(updated) =
+        copilot_permissions_grant(&perms_text, location, folder, LOOMUX_MCP_SERVER)
+    {
+        let _ = fs::create_dir_all(home);
+        let _ = fs::write(&perms_path, updated);
+    }
+    // The pre-1.0.77 surface, kept because the current docs' silence about
+    // `trustedFolders` is an absence, not a documented removal.
     let path = home.join("config.json");
     let text = fs::read_to_string(&path).unwrap_or_default();
     if let Some(updated) = add_trusted_folder(&text, folder) {
@@ -19707,13 +19967,18 @@ impl OrchRegistry {
     /// that build a registry without fixturing anything — lands inside the
     /// registry's own root via `copilot_home_dir`.
     #[doc(hidden)] // pub for integration tests (#475's seam drives this path)
-    pub fn pre_trust_copilot_folder(&self, folder: &str) {
+    /// `location` is the repo whose git root scopes the grant; `folder` is the
+    /// directory this agent actually works in (its worktree, or the repo
+    /// itself). They differ for a worker in a dedicated worktree — see
+    /// [`copilot_permissions_grant`] for why the key is the repo and the
+    /// worktree rides `allowed_directories`.
+    pub fn pre_trust_copilot_folder(&self, location: &str, folder: &str) {
         if let Some(home) = COPILOT_TRUST_HOME_OVERRIDE.with(|c| c.borrow().clone()) {
-            pre_trust_copilot_folder_in(&home, folder);
+            pre_trust_copilot_folder_in(&home, location, folder);
             return;
         }
         let Some(home) = self.copilot_home_dir() else { return };
-        pre_trust_copilot_folder_in(&home, folder);
+        pre_trust_copilot_folder_in(&home, location, folder);
     }
 
     /// Copilot's own custom-agent directory (`~/.copilot/agents`, per its
@@ -31311,6 +31576,30 @@ impl OrchRegistry {
         let mut out = PersonaInject { extra_allow: allow, ..Default::default() };
 
         if cli == "copilot" {
+            // #802: a comma SEPARATES patterns inside a `--allow-tool` value on
+            // copilot ("a quoted, comma-separated list"), so a pattern that
+            // contains one is unrepresentable on this CLI — copilot would read
+            // `shell(git log --format=a,b)` as the two fragments
+            // `shell(git log --format=a` and `b)`, neither of which is the
+            // grant that was written, and one of which is a prefix pattern
+            // nobody authored. There is no documented escape, so loomux refuses
+            // the pattern rather than inventing one or shipping the fragments.
+            // Audited, never silent — the block still launches, one grant
+            // narrower, and the record says which and why. Claude's
+            // `--allowedTools` is space-separated and unaffected, which is why
+            // this lives in the copilot branch rather than in the shared
+            // capability-closure filter above.
+            let (keep, refused): (Vec<String>, Vec<String>) =
+                out.extra_allow.drain(..).partition(|p| !p.contains(','));
+            if !refused.is_empty() {
+                self.audit(group, "loomux", "copilot-allow-pattern-refused", json!({
+                    "block": block.id,
+                    "allow": refused,
+                    "why": "a comma separates patterns inside copilot's --allow-tool value, \
+                            so a pattern containing one cannot be expressed on this CLI",
+                }));
+            }
+            out.extra_allow = keep;
             if persona.is_some_and(|p| p.copilot_native) {
                 // Unchanged (#222): a user-authored `.github/agents/*.md`
                 // persona reaches Copilot by pointing `--agent` at the exact
@@ -31597,9 +31886,15 @@ impl OrchRegistry {
                 // CLI and flushes anything typed into the first instance.
                 // --add-dir <workdir>: pre-trusts the agent's workspace so
                 // panes don't stall on a folder-trust prompt.
+                //
+                // #802: the tool-permission flags are NOT built inline here any
+                // more — they are collected and emitted ONCE at the end of this
+                // arm, as a single comma-separated value each. See
+                // `COPILOT_TOOL_LIST_SEP` for why a repeated `--allow-tool` was
+                // a form the docs never described.
                 let mut cmd = format!(
                     "copilot {resume_flag}--additional-mcp-config \"@{}\" --model {model} \
-                     --add-dir \"{}\" --add-dir \"{}\" --allow-tool loomux --no-auto-update",
+                     --add-dir \"{}\" --add-dir \"{}\" --no-auto-update",
                     cfg.display(),
                     group_dir.display(),
                     workdir.display()
@@ -31618,24 +31913,6 @@ impl OrchRegistry {
                     // in Copilot.
                     cmd.push(' ');
                     cmd.push_str(COPILOT_GROUP_AUTOPILOT_FLAGS);
-                } else {
-                    cmd.push_str(" --allow-tool \"shell(git:*)\" --allow-tool \"shell(gh:*)\"");
-                }
-                if containment.denies_edits() {
-                    // Deny file writes even under --allow-all-tools (deny takes
-                    // precedence in Copilot). `gh` and the shell are left
-                    // allowed — the planner posts its plan comment, the reviewer
-                    // (#462) runs the tests. Literals live in
-                    // COPILOT_EDIT_DENY_TOOLS (see its doc for what's verified
-                    // vs. UNVERIFIED, #448).
-                    for t in COPILOT_EDIT_DENY_TOOLS {
-                        cmd.push_str(&format!(" --deny-tool \"{t}\""));
-                    }
-                }
-                if containment.denies_git_mutation() {
-                    for t in COPILOT_READONLY_DENY_GIT {
-                        cmd.push_str(&format!(" --deny-tool \"{t}\""));
-                    }
                 }
                 // Copilot's native custom agent (#222). `--agent <name>` resolves
                 // the name against `.github/agents/` — it CANNOT take an inline
@@ -31648,8 +31925,30 @@ impl OrchRegistry {
                 if let Some(agent) = &persona.copilot_agent {
                     cmd.push_str(&format!(" --agent {agent}"));
                 }
-                for pat in &persona.extra_allow {
-                    cmd.push_str(&format!(" --allow-tool \"{pat}\""));
+                // #802 — ONE `--allow-tool` and at most one `--deny-tool`, each
+                // carrying a comma-separated list, per the documented value
+                // form (`COPILOT_TOOL_LIST_SEP`). The whole value is quoted
+                // because a `shell(git commit)` pattern contains a space, and
+                // because the docs' own examples quote it.
+                //
+                // The deny value denies file writes even under
+                // `--allow-all-tools` ("Deny rules always take precedence over
+                // allow rules"). `gh` and the shell stay allowed — the planner
+                // posts its plan comment, the reviewer (#462) runs the tests.
+                // Literals live in COPILOT_EDIT_DENY_TOOLS /
+                // COPILOT_READONLY_DENY_GIT (see the former for what's verified
+                // vs. UNVERIFIED, #448).
+                let (allow, deny) =
+                    copilot_tool_permissions(unattended, containment, &persona.extra_allow);
+                cmd.push_str(&format!(
+                    " --allow-tool \"{}\"",
+                    allow.join(COPILOT_TOOL_LIST_SEP)
+                ));
+                if !deny.is_empty() {
+                    cmd.push_str(&format!(
+                        " --deny-tool \"{}\"",
+                        deny.join(COPILOT_TOOL_LIST_SEP)
+                    ));
                 }
                 cmd
             }
@@ -31964,8 +32263,6 @@ impl OrchRegistry {
                 a.push(group_dir.display().to_string());
                 push(&mut a, "--add-dir");
                 a.push(workdir.display().to_string());
-                push(&mut a, "--allow-tool");
-                push(&mut a, "loomux");
                 push(&mut a, "--no-auto-update");
                 if unattended {
                     // Reuse the atom directly: no quotes/embedded spaces, so the
@@ -31973,31 +32270,21 @@ impl OrchRegistry {
                     for t in COPILOT_GROUP_AUTOPILOT_FLAGS.split_whitespace() {
                         push(&mut a, t);
                     }
-                } else {
-                    push(&mut a, "--allow-tool");
-                    push(&mut a, "shell(git:*)");
-                    push(&mut a, "--allow-tool");
-                    push(&mut a, "shell(gh:*)");
-                }
-                if containment.denies_edits() {
-                    for t in COPILOT_EDIT_DENY_TOOLS {
-                        push(&mut a, "--deny-tool");
-                        push(&mut a, t);
-                    }
-                }
-                if containment.denies_git_mutation() {
-                    for t in COPILOT_READONLY_DENY_GIT {
-                        push(&mut a, "--deny-tool");
-                        push(&mut a, t);
-                    }
                 }
                 if let Some(agent) = &persona.copilot_agent {
                     push(&mut a, "--agent");
                     push(&mut a, agent);
                 }
-                for pat in &persona.extra_allow {
-                    push(&mut a, "--allow-tool");
-                    push(&mut a, pat);
+                // #802 — one occurrence each, same order and same atoms as the
+                // string form (which quotes the joined value; there is no shell
+                // here, so it is one literal argv element instead).
+                let (allow, deny) =
+                    copilot_tool_permissions(unattended, containment, &persona.extra_allow);
+                push(&mut a, "--allow-tool");
+                a.push(allow.join(COPILOT_TOOL_LIST_SEP));
+                if !deny.is_empty() {
+                    push(&mut a, "--deny-tool");
+                    a.push(deny.join(COPILOT_TOOL_LIST_SEP));
                 }
             }
             // Gemini (#267) — see the string form for why this arm is short:
@@ -32335,7 +32622,10 @@ impl OrchRegistry {
         };
 
         if cli == "copilot" {
-            self.pre_trust_copilot_folder(&cwd);
+            // The grant is keyed by the GROUP'S REPO, not `cwd`: a worker's
+            // dedicated worktree is a linked worktree, which copilot resolves
+            // back to the main repository root for permission scoping (#802).
+            self.pre_trust_copilot_folder(&group.repo, &cwd);
         }
 
         // The block's persona, compiled to this CLI's native custom-agent flags
@@ -38962,7 +39252,7 @@ fn register_orchestrator_pane(
     let token = new_token();
     let agent_id = format!("orch-{}", reg.mint_agent_seq(&group.id));
     if cli == "copilot" {
-        reg.pre_trust_copilot_folder(&group.repo);
+        reg.pre_trust_copilot_folder(&group.repo, &group.repo);
     }
     // An orchestrator is `Containment::None` — nothing to deny; the parameter
     // exists for the CLIs whose deny rules live in the config file (#267).

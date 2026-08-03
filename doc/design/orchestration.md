@@ -3838,14 +3838,16 @@ It lives in one predicate because the first two attempts open-coded it per site,
 site was then missed:
 
 - `user_cli_dir` — the generated agent dirs.
-- `copilot_home_dir` — Copilot's hook config **and** its `trustedFolders` config.
+- `copilot_home_dir` — Copilot's hook config **and** its permission grants (since #802, both
+  `permissions-config.json` and the legacy `config.json`/`trustedFolders`; see "Copilot's two
+  permission surfaces" below).
 
-That third one, `pre_trust_copilot_folder`, is worth naming: it appends the spawn's workspace path
-to `trustedFolders` in the user's real `~/.copilot/config.json`. It is the worst of the three to
-leak on two counts the others don't share — `trustedFolders` is a **security** setting (it
-suppresses Copilot's folder-trust prompt), and its entries are per-workspace **paths**, so a suite
-spawning into fresh temp dirs appends a new entry every run and grows without bound. The observed
-config had collected 36 of them. It was missed by an audit that *did* list it, because it was a
+That third one, `pre_trust_copilot_folder`, is worth naming: it grants the spawn's workspace path
+in the user's real `~/.copilot`. It is the worst of the three to leak on two counts the others
+don't share — it is a **security** setting (it suppresses Copilot's folder-trust prompt and
+approves loomux's MCP tools), and its entries are per-workspace **paths**, so a suite spawning
+into fresh temp dirs appends a new entry every run and grows without bound. The observed config
+had collected 36 of them. It was missed by an audit that *did* list it, because it was a
 free function with no registry to ask: the very property that made it unfixable by the rule being
 applied is what excused it from the rule. **A rule copied per site is a rule the next site
 forgets.**
@@ -10754,6 +10756,101 @@ derivation, and it would turn a per-agent record into a group-shared one where e
 directives land in everyone else's context. They are complementary and deliberately kept apart: a
 dep says *t-5 waits on t-3*, a ledger line says *why the human wanted it that way*. The relationship
 to aim for is that a reader of one can find the other — never that either becomes the other.
+
+## Copilot's two permission surfaces, and why loomux writes both (#802)
+
+A block-spawned Copilot delegate came up with the loomux MCP server listed and none of its
+tools permitted. Three candidate causes were checked against the reference; two of them
+turned out to be the same defect wearing different clothes, and the third was a red herring
+worth recording so it isn't re-investigated.
+
+### The flags: one occurrence, not one per pattern
+
+`--allow-tool` and `--deny-tool` are documented to take **"a quoted, comma-separated
+list"**, and neither is annotated *"(can be used multiple times)"* — while `--add-dir`,
+`--attachment`, `--add-github-mcp-tool`, `--add-github-mcp-toolset` and
+`--disable-mcp-server` all are, and `--secret-env-vars` carries both annotations at once.
+The reference is precise about this distinction, so its silence here is a signal.
+
+loomux emitted them repeated: `--allow-tool loomux`, then the attended `shell(git:*)` /
+`shell(gh:*)` pair, then one occurrence per `allow:` pattern a workflow block declares. If
+Copilot resolves repeated occurrences last-wins rather than by accumulating, the MCP grant
+— emitted **first** — is the one that disappears. That is the reported symptom exactly.
+
+This is not a claim to have caught the parser doing it: whether Copilot accumulates or
+overwrites is undocumented, and settling it needs a real `copilot` run, which CLAUDE.md
+constraint 3 reserves for a human. The point is that the single comma-separated occurrence
+is correct under *either* reading, so it needs no theory of the parser. The repeated form
+did. (This is the same shape as #610 on Claude's `--allowedTools`, reached through a
+different CLI: a grant that reads as present on the command line but isn't in effect.)
+
+It also answers the "workflow blocks specifically" half of the report. Tracing the spawn
+path end to end, a workflow-block spawn and a built-in-roster spawn go through the *same*
+`build_agent_command_ex`/`build_agent_argv_ex` with the same `guardrails.auto_ops` and the
+same `role.containment()` — there is no block-specific arm. The **only** copilot-argv
+difference a workflow block introduces is extra `--allow-tool` occurrences from its
+persona's `allow:` patterns.
+
+### The store: `permissions-config.json`, not `config.json`
+
+`pre_trust_copilot_folder` wrote `trustedFolders` into `~/.copilot/config.json`. That pair
+appears in **no** page of Copilot's current reference. `config.json` is now *"internal
+application state that is managed automatically by the CLI, including authentication
+data"*, whose user settings *"are automatically migrated to `settings.json`"*;
+`trustedFolders` is absent from that description, from `settings.json`'s full settings
+table, and from `permissions-config.json`'s full schema. What the reference **does**
+describe is `permissions-config.json` — *"Saved tool and directory permissions per
+project"* — and the allow/deny how-to says outright: *"Any directories you grant access to
+are saved to the same file."*
+
+So loomux now writes the documented store, with two grants straight off its schema:
+
+- `locations.<key>.allowed_directories` — *"Extra directories that the path gate can access
+  for this location."*
+- `locations.<key>.tool_approvals` `{ kind: "mcp", serverName: "loomux", toolName: null }` —
+  *"Approves one MCP tool, or every tool on the server when `toolName` is `null`"*, with
+  *"`serverName` must match the configured MCP server name exactly."*
+
+That second one is the durable form of the grant `--allow-tool loomux` already makes on
+argv, and its absence is what the report describes. It widens nothing outside loomux: an
+approval names a *server*, and a session that never loads loomux's
+`--additional-mcp-config` has no such server to invoke.
+
+**The key is the git root, not the agent's workdir.** The reference keys this map by *"the
+Git root used for permission scoping"* and states *"Linked worktrees resolve to the main
+repository root, so they share permissions with the main worktree"* — so a worker in a
+dedicated worktree looks its approvals up under the repo it was cut from. The worktree
+still needs the path gate, which is what it contributes to `allowed_directories`. An
+existing key differing only by case or separator is **reused**, never duplicated: Copilot
+loads exactly one key (*"If the key doesn't match, the saved approvals won't apply"*), so a
+second spelling would strand the user's own approvals under whichever one Copilot didn't
+pick. For the same reason the legacy extensionless `permissions-config` filename is edited
+in place when it is the live one — creating the `.json` beside it would make Copilot stop
+honouring the legacy file and silently discard every approval the user had saved.
+
+**The legacy `trustedFolders` write stays.** Absence across three reference pages is a
+sourced absence, not a documented removal, and loomux cannot observe which Copilot build a
+machine runs. Dropping it would trade a confirmed gap for a possible regression. Both
+writes remain inside the `is_live_registry()` containment rule described above — the
+permissions store is a second file under the same predicate, not a second exception to it.
+
+### The red herring: block containment defaults
+
+The third candidate — that a workflow block defaults to a containment forcing Copilot's
+deny arm — does not exist. Containment is never declared per block: it is
+`role.containment()`, derived from the block's `kind`, on both spawn paths. A `kind:
+worker` block gets `Containment::None` whether it came from `workflow.yml` or the built-in
+roster.
+
+### What is still unverified
+
+Whether a bare server name in `--allow-tool` matches on 1.0.77 was the report's leading
+hypothesis; the reference refutes it — the tool-permission-patterns table lists
+`SERVER-NAME` as a Kind in its own right (`MyMCP(create_issue)`, `MyMCP`) with the worked
+example *"Allow all tools from a server: `copilot --allow-tool='MyMCP'`"*. The value is
+unchanged; only its packaging moved. What remains genuinely open is the accumulate-vs-
+overwrite question above, and (unchanged from #463) whether an unmatched `--deny-tool`
+value warns, errors, or no-ops. Both need a live run a human owns.
 
 ## Risks / limitations
 

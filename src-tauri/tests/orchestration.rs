@@ -23,6 +23,9 @@ use loomux_lib::orchestration::workflow;
 use loomux_lib::orchestration::{
     add_trusted_folder, autonomy_budget_exhausted, bracketed_paste, box_occupancy_delta,
     set_copilot_trust_home_for_test,
+    // #802: copilot's documented permission store, and the one-occurrence
+    // tool-permission value both command builders share.
+    copilot_permissions_grant, copilot_tool_permissions,
     channel_connected_event, channel_disconnected_event, channel_message_text,
     channel_updated_event, classify_human_input,
     claude_effective_permission_mode, claude_permission_mode, cli_ready, compact_checklist_warning, compact_escalation_notice,
@@ -9094,7 +9097,7 @@ fn pre_trust_copilot_folder_writes_fixture_and_leaves_real_home_untouched() {
     set_copilot_trust_home_for_test(Some(fixture.path().to_path_buf()));
 
     let (reg, _dir) = test_registry();
-    reg.pre_trust_copilot_folder(r"C:\Projects\some-agent-workspace");
+    reg.pre_trust_copilot_folder(r"C:\Projects\some-repo", r"C:\Projects\some-agent-workspace");
 
     set_copilot_trust_home_for_test(None);
 
@@ -9115,7 +9118,7 @@ fn pre_trust_copilot_folder_creates_config_when_home_is_missing() {
     set_copilot_trust_home_for_test(Some(home.clone()));
 
     let (reg, _dir) = test_registry();
-    reg.pre_trust_copilot_folder(r"C:\Projects\fresh-workspace");
+    reg.pre_trust_copilot_folder(r"C:\Projects\fresh-repo", r"C:\Projects\fresh-workspace");
 
     set_copilot_trust_home_for_test(None);
 
@@ -9132,7 +9135,7 @@ fn pre_trust_copilot_folder_never_clobbers_an_unparseable_config() {
     set_copilot_trust_home_for_test(Some(fixture.path().to_path_buf()));
 
     let (reg, _dir) = test_registry();
-    reg.pre_trust_copilot_folder(r"C:\Projects\x");
+    reg.pre_trust_copilot_folder(r"C:\Projects\x", r"C:\Projects\x");
 
     set_copilot_trust_home_for_test(None);
 
@@ -9140,7 +9143,208 @@ fn pre_trust_copilot_folder_never_clobbers_an_unparseable_config() {
     assert_eq!(unchanged, "// c\n{ not json", "an unparseable config must be left exactly alone, never clobbered");
 }
 
+// ── #802: copilot's DOCUMENTED permission store ────────────────────────────
+//
+// `trustedFolders` in `config.json` is the pre-1.0.77 surface and appears in
+// none of copilot's current reference pages: `config.json` is now described as
+// automatically-managed application state whose user settings migrate to
+// `settings.json`, while directory and tool grants are documented to live in
+// `permissions-config.json`. These pin the grant loomux now writes there —
+// including the MCP approval, which is the durable form of `--allow-tool
+// loomux` and whose absence is exactly what #802 reported ("the CLI lists the
+// loomux MCP server as available, but the agent has no permission to use its
+// tools").
 
+#[test]
+fn copilot_permissions_grant_writes_the_documented_shape() {
+    const REPO: &str = r"C:\Projects\demo";
+    const WORKTREE: &str = r"C:\Projects\demo-worktrees\fix-1";
+
+    let fresh = copilot_permissions_grant("", REPO, WORKTREE, "loomux").unwrap();
+    let v: serde_json::Value = serde_json::from_str(&fresh).unwrap();
+    let entry = &v["locations"][REPO];
+    assert_eq!(
+        entry["allowed_directories"],
+        json!([WORKTREE]),
+        "the agent's own workspace must be added to the path gate: {fresh}"
+    );
+    assert_eq!(
+        entry["tool_approvals"],
+        json!([{ "kind": "mcp", "serverName": "loomux", "toolName": null }]),
+        "toolName: null is the documented 'every tool on the server' approval: {fresh}"
+    );
+
+    // Idempotent: re-granting the same pair rewrites nothing, so a suite (or a
+    // long-lived group) can't grow this file without bound the way the
+    // `trustedFolders` list once did.
+    assert!(
+        copilot_permissions_grant(&fresh, REPO, WORKTREE, "loomux").is_none(),
+        "an already-granted location must produce no write at all"
+    );
+
+    // A SECOND worktree under the same repo joins the existing location rather
+    // than creating a new one — that is the point of keying by git root.
+    let second =
+        copilot_permissions_grant(&fresh, REPO, r"C:\Projects\demo-worktrees\fix-2", "loomux")
+            .expect("a new workspace is a real change");
+    let v: serde_json::Value = serde_json::from_str(&second).unwrap();
+    assert_eq!(v["locations"].as_object().unwrap().len(), 1, "one repo, one location key: {second}");
+    assert_eq!(v["locations"][REPO]["allowed_directories"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        v["locations"][REPO]["tool_approvals"].as_array().unwrap().len(),
+        1,
+        "the MCP approval must not be appended twice: {second}"
+    );
+
+    // The user's own saved approvals — for other repos and for this one — are
+    // additive-only: this file is theirs, loomux only ever adds to it.
+    let existing = serde_json::to_string_pretty(&json!({
+        "locations": {
+            r"C:\Other\repo": { "tool_approvals": [{ "kind": "write" }] },
+            r"C:\Projects\demo": { "tool_approvals": [{ "kind": "commands", "commandIdentifiers": ["git:*"] }] },
+        }
+    }))
+    .unwrap();
+    let merged = copilot_permissions_grant(&existing, REPO, WORKTREE, "loomux").unwrap();
+    let v: serde_json::Value = serde_json::from_str(&merged).unwrap();
+    assert_eq!(v["locations"][r"C:\Other\repo"]["tool_approvals"], json!([{ "kind": "write" }]));
+    let approvals = v["locations"][REPO]["tool_approvals"].as_array().unwrap();
+    assert_eq!(approvals.len(), 2, "the user's own approval must survive: {merged}");
+    assert_eq!(approvals[0]["kind"], "commands");
+    assert_eq!(approvals[1]["serverName"], "loomux");
+
+    // A location key that differs only by case/separator is REUSED, never
+    // duplicated: copilot loads exactly one key ("If the key doesn't match, the
+    // saved approvals won't apply"), so a second spelling would strand the
+    // user's own approvals under whichever one copilot didn't pick.
+    let variant = copilot_permissions_grant(
+        &serde_json::to_string_pretty(&json!({
+            "locations": { "c:/projects/demo/": { "tool_approvals": [{ "kind": "write" }] } }
+        }))
+        .unwrap(),
+        REPO,
+        WORKTREE,
+        "loomux",
+    )
+    .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&variant).unwrap();
+    assert_eq!(
+        v["locations"].as_object().unwrap().len(),
+        1,
+        "a case/separator variant of the same path is one location, not two: {variant}"
+    );
+    assert_eq!(v["locations"]["c:/projects/demo/"]["tool_approvals"].as_array().unwrap().len(), 2);
+
+    // A pre-existing approval for ONE tool on the same server is a narrower
+    // grant and must NOT be mistaken for the server-wide one — otherwise a user
+    // who once approved `report` by hand would silently keep every other loomux
+    // tool ungranted, which is #802's symptom with extra steps.
+    let narrow = serde_json::to_string_pretty(&json!({
+        "locations": { r"C:\Projects\demo": { "tool_approvals": [
+            { "kind": "mcp", "serverName": "loomux", "toolName": "report" }
+        ] } }
+    }))
+    .unwrap();
+    let widened = copilot_permissions_grant(&narrow, REPO, WORKTREE, "loomux")
+        .expect("a per-tool approval does not satisfy the server-wide grant");
+    let v: serde_json::Value = serde_json::from_str(&widened).unwrap();
+    let approvals = v["locations"][REPO]["tool_approvals"].as_array().unwrap();
+    assert_eq!(approvals.len(), 2, "{widened}");
+    assert!(approvals.iter().any(|a| a["toolName"].is_null()), "{widened}");
+
+    // Corrupt file: never clobbered, same policy as `add_trusted_folder`.
+    assert!(copilot_permissions_grant("{ not json", REPO, WORKTREE, "loomux").is_none());
+}
+
+#[test]
+fn pre_trust_writes_both_permission_surfaces_and_keys_the_grant_by_repo() {
+    let fixture = tempfile::tempdir().unwrap();
+    set_copilot_trust_home_for_test(Some(fixture.path().to_path_buf()));
+
+    let (reg, _dir) = test_registry();
+    reg.pre_trust_copilot_folder(r"C:\Projects\demo", r"C:\Projects\demo-worktrees\w-1");
+
+    set_copilot_trust_home_for_test(None);
+
+    let perms = fs::read_to_string(fixture.path().join("permissions-config.json"))
+        .expect("the documented permission store must be written");
+    let v: serde_json::Value = serde_json::from_str(&perms).unwrap();
+    // Keyed by the REPO, not the worktree: copilot resolves a linked worktree
+    // back to the main repository root for permission scoping, so a grant filed
+    // under the worktree would never be found.
+    let entry = &v["locations"][r"C:\Projects\demo"];
+    assert!(!entry.is_null(), "the grant must be keyed by the repo's git root: {perms}");
+    assert_eq!(entry["allowed_directories"], json!([r"C:\Projects\demo-worktrees\w-1"]));
+    assert_eq!(entry["tool_approvals"][0]["serverName"], "loomux");
+    assert!(entry["tool_approvals"][0]["toolName"].is_null());
+
+    // The legacy surface is still written — the docs' silence about
+    // `trustedFolders` is an absence, not a documented removal, and loomux
+    // cannot see which copilot build a machine runs.
+    let legacy = fs::read_to_string(fixture.path().join("config.json")).unwrap();
+    assert!(legacy.contains("trustedFolders") && legacy.contains("w-1"), "{legacy}");
+}
+
+#[test]
+fn pre_trust_edits_the_legacy_extensionless_permissions_file_when_that_is_the_live_one() {
+    // "Older builds used an extensionless file named `permissions-config`. If
+    // `permissions-config.json` doesn't exist but the extensionless file does,
+    // the CLI still honors the legacy file." Creating the `.json` beside it
+    // would make copilot stop honoring the legacy one — silently discarding
+    // every approval the user had saved.
+    let fixture = tempfile::tempdir().unwrap();
+    fs::write(
+        fixture.path().join("permissions-config"),
+        serde_json::to_string_pretty(&json!({
+            "locations": { r"C:\Projects\demo": { "tool_approvals": [{ "kind": "write" }] } }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    set_copilot_trust_home_for_test(Some(fixture.path().to_path_buf()));
+
+    let (reg, _dir) = test_registry();
+    reg.pre_trust_copilot_folder(r"C:\Projects\demo", r"C:\Projects\demo");
+
+    set_copilot_trust_home_for_test(None);
+
+    assert!(
+        !fixture.path().join("permissions-config.json").exists(),
+        "writing the .json name would orphan the user's live legacy file"
+    );
+    let text = fs::read_to_string(fixture.path().join("permissions-config")).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let approvals = v["locations"][r"C:\Projects\demo"]["tool_approvals"].as_array().unwrap();
+    assert_eq!(approvals.len(), 2, "the user's own approval must survive the grant: {text}");
+    assert_eq!(approvals[1]["serverName"], "loomux");
+}
+
+/// The pure posture function both copilot command builders share — pinned here
+/// so a regression in the ORDER or CONTENT of the lists is caught without
+/// having to read it back out of a formatted command line.
+#[test]
+fn copilot_tool_permissions_lead_with_the_mcp_grant() {
+    let extra = vec!["shell(make:*)".to_string()];
+
+    let (allow, deny) = copilot_tool_permissions(true, Containment::None, &extra);
+    assert_eq!(allow, ["loomux", "shell(make:*)"]);
+    assert!(deny.is_empty());
+
+    let (allow, deny) = copilot_tool_permissions(false, Containment::None, &extra);
+    assert_eq!(allow, ["loomux", "shell(git:*)", "shell(gh:*)", "shell(make:*)"]);
+    assert!(deny.is_empty());
+
+    // A reviewer (NoEdits) denies writes and nothing git-related — its shell IS
+    // its job (#462).
+    let (allow, deny) = copilot_tool_permissions(true, Containment::NoEdits, &[]);
+    assert_eq!(allow, ["loomux"]);
+    assert_eq!(deny, ["write"]);
+
+    // A planner (ReadOnly) is the ladder's top rung: the reviewer's denials
+    // PLUS the git-mutation pair, never instead of them.
+    let (_, deny) = copilot_tool_permissions(true, Containment::ReadOnly, &[]);
+    assert_eq!(deny, ["write", "shell(git commit)", "shell(git push)"]);
+}
 
 // ---------- per-task sessions & resume ----------
 
@@ -29189,6 +29393,19 @@ fn a_throwaway_registry_never_writes_the_users_real_copilot_trusted_folders() {
         "and it must be the real pre-trust write, not an empty file: {text}",
     );
 
+    // #802 added a SECOND, documented permission surface to the same write —
+    // it must be contained by the same rule, or the containment audit this
+    // test exists for would have a fresh hole the day it shipped.
+    let perms = dir.path().join("copilot-home").join("permissions-config.json");
+    assert!(
+        perms.is_file(),
+        "the permissions-config write must land inside this registry's own root too: {perms:?}",
+    );
+    let perms_text = fs::read_to_string(&perms).unwrap();
+    assert!(
+        perms_text.contains("C:/tmp/copilot-repo") && perms_text.contains("loomux"),
+        "and carry the real grant, not an empty file: {perms_text}",
+    );
 }
 
 #[test]
