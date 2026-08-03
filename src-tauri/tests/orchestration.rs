@@ -20056,6 +20056,91 @@ fn full_autonomy_goal_sanitizer_flattens_bounds_and_neutralizes() {
     assert_eq!(sanitize_full_autonomy_goal(&spacey), spacey);
 }
 
+// ---------- full autonomy (#778): the contract the toggle inverts ----------
+//
+// The toggle above only widens what loomux WAKES the orchestrator about. Nothing
+// in loomux blocks a start — the funnel has always been contract-enforced — so
+// under full autonomy the text every default group's orchestrator reads IS the
+// consent boundary, and a rule that quietly falls out of it is the boundary
+// quietly disappearing. These pins sit on the LIVE template for the same reason
+// #590's pair above do: the pre222 golden fails as "re-bless me", which names no
+// rule and teaches nobody which one went missing.
+
+/// The three things INVARIANT 8 has to keep saying once the start default can
+/// invert: the veto label, the mode that inverts it, and the ranked plan the
+/// pre-existing backlog waits behind. Concepts, not sentences — except the last
+/// assertion, which is a sentence on purpose: "widens what you may START, never
+/// what you may SHIP" is the one line separating this toggle from the merge and
+/// release gates it deliberately does not touch, and a paraphrase of it is
+/// exactly how a reader talks itself into the wrong half.
+#[test]
+fn orchestrator_template_carries_the_full_autonomy_consent_boundary() {
+    for concept in ["agent-hold", "Full autonomy", "triage plan"] {
+        assert!(
+            ORCHESTRATOR_TPL.contains(concept),
+            "orchestrator.md no longer names `{concept}` — under full autonomy the contract IS \
+             the consent boundary (nothing host-side blocks a start), so a missing piece of it \
+             is a missing boundary (#778)"
+        );
+    }
+    assert!(
+        ORCHESTRATOR_TPL.contains("never what you may SHIP"),
+        "orchestrator.md must state that full autonomy widens what may be STARTED and never \
+         what may be SHIPPED — the merge gate, release gate, review discipline and budget are \
+         untouched by this toggle, and that sentence is what keeps them that way (#778)"
+    );
+}
+
+/// Cross-slice byte agreement: the contract quotes the notice the orchestrator
+/// will actually be handed. Both sides are pinned to the *shipped* strings
+/// rather than to each other's prose, so a reworded notice fails here instead of
+/// leaving the template quoting a marker no group is ever sent.
+#[test]
+fn the_orchestrator_contract_quotes_the_full_autonomy_notice_it_will_receive() {
+    let on = full_autonomy_notice(true, "harden any bugs");
+    let marker = "[loomux] FULL AUTONOMY ENABLED";
+    assert!(on.starts_with(marker), "the ON notice's own marker moved: {on}");
+    assert!(
+        ORCHESTRATOR_TPL.contains(marker),
+        "orchestrator.md must quote `{marker}` exactly as delivered — the notice is one of the \
+         only two ways an orchestrator learns the start default inverted (#778)"
+    );
+    // The OFF notice restates the opt-in default the invariant has to agree with:
+    // a disable that reads as "start only labelled work" and a contract that says
+    // otherwise is the disable failing open.
+    let off = full_autonomy_notice(false, "");
+    assert!(off.contains("the label funnel is opt-in again"), "the OFF notice's default moved: {off}");
+    assert!(
+        ORCHESTRATOR_TPL.contains("the label funnel is opt-in"),
+        "orchestrator.md must state the opt-in default the OFF notice returns to (#778)"
+    );
+}
+
+/// The eligibility signal is the wake the orchestrator acts on, and a bounded
+/// fetch means it can arrive PARTIAL — drawn from the newest
+/// `MAX_INTAKE_ISSUES` open issues rather than the whole backlog. A triage plan
+/// built from a partial view is incomplete, so the contract has to name both the
+/// line and the caveat; the expected text is derived from the shipped summary
+/// builder, never retyped, so a reworded signal fails here.
+#[test]
+fn the_orchestrator_contract_names_the_eligible_signal_and_its_partial_caveat() {
+    let sig = intake::EligibleSignal { number: 42, title: "Do the thing".into() };
+    let summary = intake::intake_wake_summary(&[], &[], std::slice::from_ref(&sig), false);
+    assert!(summary.contains("eligible under full-autonomy"), "the signal's wording moved: {summary}");
+    assert!(
+        ORCHESTRATOR_TPL.contains("eligible under full-autonomy"),
+        "orchestrator.md must name the wake line the poller actually sends, so the orchestrator \
+         acts on it instead of re-polling what loomux already told it (#778)"
+    );
+    let partial = intake::intake_wake_summary(&[], &[], std::slice::from_ref(&sig), true);
+    assert!(partial.contains("PARTIAL:"), "the truncation caveat's wording moved: {partial}");
+    assert!(
+        ORCHESTRATOR_TPL.contains("PARTIAL"),
+        "orchestrator.md must say what a PARTIAL-flagged burst means: the backlog was not fully \
+         seen, so a triage plan built from it is incomplete and must say so (#778)"
+    );
+}
+
 #[test]
 fn dangerous_mode_setter_and_autonomous_are_mutually_exclusive() {
     let (reg, dir) = test_registry();
