@@ -23307,8 +23307,16 @@ impl OrchRegistry {
         let due = intake::due_intake_polls(now, &minutes, &last_poll);
         for group in due {
             let Some(repo) = repos.get(&group) else { continue };
-            let issues_raw =
-                self.gh_capture(repo, &["issue", "list", "--state", "open", "--json", "number,title,labels"]);
+            // `--limit` is not optional: `gh issue list` defaults to the 30
+            // NEWEST open issues, which silently hid most of a mid-sized
+            // repo's backlog from both diffs below (measured on loomux itself:
+            // 30 of 94). See `intake::MAX_INTAKE_ISSUES` for why 300 and why
+            // the bound is reported rather than silently applied.
+            let issue_limit = intake::MAX_INTAKE_ISSUES.to_string();
+            let issues_raw = self.gh_capture(
+                repo,
+                &["issue", "list", "--state", "open", "--limit", &issue_limit, "--json", "number,title,labels"],
+            );
             let prs_raw =
                 self.gh_capture(repo, &["pr", "list", "--state", "open", "--json", "number,title,statusCheckRollup"]);
             self.intake_last_poll_ms.lock_safe().insert(group.clone(), now);
@@ -23324,6 +23332,17 @@ impl OrchRegistry {
             // other: its orchestrator still gets the bounded fallback
             // heartbeat, and the contract has it sweep for eligible work
             // itself — the gate stays a gate, not a second consent surface.
+            //
+            // Read outside the `intake_seen` lock that `eligible_deltas` later
+            // writes under, which leaves one narrow residual (rev-266 NB2): a
+            // re-aim landing between this read and that write has its
+            // `set_full_autonomy` re-arm overwritten, losing that one triage
+            // trigger. Left as-is deliberately — closing it means taking
+            // `full_autonomy_groups` while holding `intake_seen`, the exact
+            // reverse of the order `set_full_autonomy` uses, trading a
+            // microsecond window on a human-driven toggle for a lock-order
+            // inversion. The ON notice reaches the orchestrator either way, and
+            // the next poll re-announces anything genuinely new.
             let full_autonomy = self.is_full_autonomy(&group);
             let (hold_label, board_tracked) = if full_autonomy {
                 let hold = self
@@ -23339,21 +23358,21 @@ impl OrchRegistry {
                 (String::new(), HashSet::new())
             };
 
-            let (label_signals, pr_signals, eligible_signals) = {
+            let (label_signals, pr_signals, eligible_signals, issues_truncated) = {
                 let mut seen = self.intake_seen.lock_safe();
                 let state = seen.entry(group.clone()).or_default();
                 // Parsed once and read by both diffs — the label delta and the
                 // eligibility delta are two questions about the same `gh issue
                 // list` response, not two fetches.
                 let issues = issues_raw.as_deref().ok().and_then(intake::parse_issue_list);
-                let labels = issues
-                    .as_deref()
-                    .map(|issues| intake::label_deltas(&mut state.labels, issues))
+                let listing = issues.as_deref().map(intake::OpenIssueList::from_fetch);
+                let labels = listing
+                    .map(|l| intake::label_deltas(&mut state.labels, l.issues))
                     .unwrap_or_default();
                 let eligible = intake::eligible_deltas(
                     &mut state.eligible,
                     full_autonomy,
-                    issues.as_deref(),
+                    listing,
                     &hold_label,
                     &board_tracked,
                 );
@@ -23363,12 +23382,13 @@ impl OrchRegistry {
                     .and_then(intake::parse_pr_list)
                     .map(|prs| intake::pr_check_deltas(&mut state.pr_checks, &prs))
                     .unwrap_or_default();
-                (labels, prs, eligible)
+                (labels, prs, eligible, listing.is_some_and(|l| !l.complete))
             };
             if label_signals.is_empty() && pr_signals.is_empty() && eligible_signals.is_empty() {
                 continue;
             }
-            let summary = intake::intake_wake_summary(&label_signals, &pr_signals, &eligible_signals);
+            let summary =
+                intake::intake_wake_summary(&label_signals, &pr_signals, &eligible_signals, issues_truncated);
             self.audit(&group, "loomux", "intake-signal", json!({ "summary": summary }));
             // Fold into any not-yet-delivered pending summary rather than
             // clobbering it — two poll scans can each find something new
