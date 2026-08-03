@@ -189,7 +189,7 @@ pub fn idle_tick_notice(intake_summary: Option<&str>, summary_incomplete: bool) 
         ),
         _ => "[loomux] idle tick: you have been idle and autonomous mode is on. Run your \
      monitoring cadence now — re-sync (list_tasks, list_agents, get_state), poll \
-     for labeled intake (agent-ready / agent-investigate) and START that work, and \
+     for labeled intake (agent-ready / agent-investigation) and START that work, and \
      re-check your open PRs (CI + new comments). You will get this at most once per \
      idle window; producing any output resets the clock."
             .to_string(),
@@ -40980,6 +40980,11 @@ mod idle_tick_notice_tests {
         let n = idle_tick_notice(None, false);
         assert!(n.starts_with("[loomux] idle tick: you have been idle"), "got: {n}");
         assert!(!n.contains("host-side intake poll"), "must not claim a finding that doesn't exist: {n}");
+        // #805: the fallback pointed at the allow-listed label by name; it must
+        // name the label `gh.rs`'s ALLOWED_LABELS/validate_labels actually accepts
+        // (`agent-investigation`), not the shorter `agent-investigate` the
+        // issue-#82 plan text used, which the backend rejects on write.
+        assert!(n.contains("agent-investigation"), "must name the real, writable label: {n}");
     }
 
     #[test]
