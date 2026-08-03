@@ -449,6 +449,29 @@ fn norm_path(s: &str) -> String {
 // can't catch that mutation).
 const LAUNCH_INTENT_CAP: usize = 300;
 
+/// Makes one launch-intent record a single read-modify-write (#746).
+///
+/// **What it replaces.** Both `record_*_launch_posture_impl`s load the whole
+/// store, patch one entry, cap-and-evict, and write the file back. That is a
+/// read-modify-write with no lock, and until #746 it did not need one: the two
+/// commands were synchronous, so Tauri ran them alone on the webview thread and
+/// no second writer could exist. E1's own debt row said as much — "There is no
+/// lock: concurrent-write safety rests on rename atomicity alone, which the
+/// conversion must preserve rather than assume."
+///
+/// Rename atomicity is not enough on its own, and that is the point: it
+/// guarantees a reader never sees half a file, not that a writer's read is still
+/// current when it writes. Two concurrent records both load the pre-write store
+/// and the second's rename discards the first's entry entirely — a launch whose
+/// posture was recorded and then silently was not, which a later Sessions-tab
+/// resume reads as "no record" and guesses at (#456/#457's whole subject).
+///
+/// So the load, the patch, the cap and the write are held here as one unit.
+/// It costs nothing anybody waits on: this is a per-launch gesture on the
+/// blocking pool, not a poll path, so the lock is a leaf held across a small
+/// file's read and write and INV-5 has no quarrel with it.
+static LAUNCH_INTENT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum Posture {
     True,
@@ -650,12 +673,22 @@ fn posture_key(s: &str) -> String {
 /// per key, LRU-evicted whole, never a flat log of individual writes) — this
 /// is a convenience record, not a durable-correctness store, and must never
 /// block or fail a launch.
+///
+/// Off-thread (#746 — `crate::blocking::run_blocking`, P1 of
+/// `doc/design/performance.md`): it reads the intent file and writes it back
+/// fsync-ed and renamed, which Tauri used to do on the thread that services
+/// paint, at the exact moment the user is launching something.
+///
+/// **Reentrancy.** [`LAUNCH_INTENT_LOCK`] — see its doc. This is the one shape
+/// where rename atomicity alone is not the guard: a read-modify-write can lose
+/// an update where a single syscall cannot.
 #[tauri::command]
-pub fn record_copilot_launch_posture(cwd: String, autopilot: bool) -> Result<(), String> {
-    record_copilot_launch_posture_impl(&cwd, autopilot)
+pub async fn record_copilot_launch_posture(cwd: String, autopilot: bool) -> Result<(), String> {
+    crate::blocking::run_blocking(move || record_copilot_launch_posture_impl(&cwd, autopilot)).await
 }
 
 fn record_copilot_launch_posture_impl(cwd: &str, autopilot: bool) -> Result<(), String> {
+    let _one_writer = crate::obs::LockExt::lock_safe(&LAUNCH_INTENT_LOCK);
     let mut store = load_launch_intent();
     let key = IntentKey::Cwd { cli: "copilot".to_string(), cwd: posture_key(cwd) };
     let now = now_ms();
@@ -682,15 +715,25 @@ fn record_copilot_launch_posture_impl(cwd: &str, autopilot: bool) -> Result<(), 
 /// Same best-effort contract as the copilot command above. A blank id is a
 /// no-op: nothing reliable to key on (mirrors the copilot command's cwd
 /// guard, `posture_in`'s empty-string check).
+///
+/// Off-thread and serialized exactly as the copilot command above (#746) —
+/// same file, same [`LAUNCH_INTENT_LOCK`], same reason.
 #[tauri::command]
-pub fn record_claude_launch_posture(session_id: String, autopilot: bool) -> Result<(), String> {
-    record_claude_launch_posture_impl(&session_id, autopilot)
+pub async fn record_claude_launch_posture(
+    session_id: String,
+    autopilot: bool,
+) -> Result<(), String> {
+    crate::blocking::run_blocking(move || {
+        record_claude_launch_posture_impl(&session_id, autopilot)
+    })
+    .await
 }
 
 fn record_claude_launch_posture_impl(session_id: &str, autopilot: bool) -> Result<(), String> {
     if session_id.trim().is_empty() {
         return Ok(());
     }
+    let _one_writer = crate::obs::LockExt::lock_safe(&LAUNCH_INTENT_LOCK);
     let mut store = load_launch_intent();
     let key = IntentKey::Session { id: session_id.to_string() };
     let now = now_ms();
@@ -1722,6 +1765,72 @@ mod launch_intent_tests {
 
         record_copilot_launch_posture_impl("C:/work/y", false).unwrap();
         assert_eq!(copilot_launch_posture("C:/work/y"), Some(false));
+        clear_seam();
+    }
+
+    #[test]
+    fn concurrent_records_do_not_lose_each_other() {
+        // #746's reentrancy pin. Recording a posture is load → patch → cap →
+        // write-the-whole-file-back, and what made it one unit was Tauri
+        // running the synchronous command alone on the webview thread. Off-
+        // thread that exclusion is gone, so `LAUNCH_INTENT_LOCK` has to be it:
+        // without it two writers both load the pre-write store and the second
+        // rename discards the first's entry, i.e. a launch whose posture was
+        // recorded and then silently was not.
+        //
+        // The property is an equality on the whole key set — every id written
+        // must be readable afterwards — so a partial loss is as red as a total
+        // one. The seams are thread-local (see `set_launch_intent_path_for_test`),
+        // so each worker binds them to the SAME file inside this test's tempdir.
+        let d = tempfile::tempdir().unwrap();
+        let store = d.path().join("launch-intent.json");
+        let legacy = d.path().join("copilot-posture.json");
+        set_launch_intent_path_for_test(Some(store.clone()));
+        set_legacy_copilot_posture_path_for_test(Some(legacy.clone()));
+
+        const WRITERS: usize = 8;
+        const PER_WRITER: usize = 25; // 200 keys, under LAUNCH_INTENT_CAP (300)
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(WRITERS));
+        let mut handles = Vec::new();
+        for w in 0..WRITERS {
+            let (store, legacy, barrier) = (store.clone(), legacy.clone(), barrier.clone());
+            handles.push(std::thread::spawn(move || {
+                set_launch_intent_path_for_test(Some(store));
+                set_legacy_copilot_posture_path_for_test(Some(legacy));
+                barrier.wait();
+                for i in 0..PER_WRITER {
+                    record_claude_launch_posture_impl(&format!("sess-{w}-{i}"), i % 2 == 0)
+                        .unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let loaded = load_launch_intent();
+        let missing: Vec<String> = (0..WRITERS)
+            .flat_map(|w| (0..PER_WRITER).map(move |i| format!("sess-{w}-{i}")))
+            .filter(|id| claude_posture_in(&loaded, id).is_none())
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "{} of {} recorded postures were lost to a concurrent write — a read-modify-write \
+             needs a lock, not just an atomic rename (missing e.g. {:?})",
+            missing.len(),
+            WRITERS * PER_WRITER,
+            &missing[..missing.len().min(5)]
+        );
+        // …and each survivor kept its OWN value, not another writer's.
+        for w in 0..WRITERS {
+            for i in 0..PER_WRITER {
+                assert_eq!(
+                    claude_posture_in(&loaded, &format!("sess-{w}-{i}")),
+                    Some(i % 2 == 0),
+                    "sess-{w}-{i} came back with the wrong posture"
+                );
+            }
+        }
         clear_seam();
     }
 

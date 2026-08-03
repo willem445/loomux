@@ -365,21 +365,6 @@ const SYNC_COMMANDS: &[Row] = &[
         issue: Some("#746"),
     },
     Row {
-        name: "record_copilot_launch_posture",
-        class: Class::Debt,
-        reason: "Reads the launch-intent file and writes it back fsync-ed and renamed, on the \
-                 webview thread. There is no lock: concurrent-write safety rests on rename \
-                 atomicity alone, which the conversion must preserve rather than assume.",
-        issue: Some("#746"),
-    },
-    Row {
-        name: "record_claude_launch_posture",
-        class: Class::Debt,
-        reason: "The Claude twin of record_copilot_launch_posture: same intent read, same \
-                 fsync-and-rename write on the webview thread, same rename-atomicity argument.",
-        issue: Some("#746"),
-    },
-    Row {
         name: "probe_agent_cli",
         class: Class::Debt,
         reason: "On a cache miss it spawns the agent CLI with --help and poll-joins it for up to \
