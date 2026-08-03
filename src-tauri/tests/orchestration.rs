@@ -51,6 +51,7 @@ use loomux_lib::orchestration::{
     gh_shim_cmd, gh_shim_sh, git_shim_cmd, git_shim_sh, git_tag_push, grant_segment, grant_unexpired, hold_for_human_input,
     resolve_shim_toolchain, ShimPaths,
     hold_until_quiet, idle_output_is_activity, idle_should_kill, idle_tick_should_fire,
+    loomux_shim_cmd, loomux_shim_sh,
     // #406: the unified `gh` poller's shared scan cadence.
     intake_scan_due,
     low_disk_notice, low_disk_transition, max_agents_notice, pr_number, release_gate_decision,
@@ -17608,6 +17609,70 @@ fn git_shim_script_bakes_real_git_and_gates_tag_push() {
     assert!(!sh.contains("loomux_grant_settle"),
         "nothing in the git shim consumes a grant, so there is nothing to settle");
     assert!(!sh.contains("\r"), "the POSIX git shim must be LF-only");
+}
+
+/// #815: the launcher block is a refusal, not a gate — the properties worth
+/// pinning are the ones whose absence would quietly turn it back into a launch.
+#[test]
+fn loomux_shim_refuses_outright_with_no_path_that_runs_the_launcher() {
+    let sh = loomux_shim_sh();
+    assert!(sh.starts_with("#!/bin/sh"));
+    assert!(sh.trim_end().ends_with("exit 1"), "the only way out is a refusal");
+    assert!(sh.contains("self-launch-blocked"), "audits the refusal");
+    assert!(!sh.contains("\r"), "the POSIX loomux shim must be LF-only");
+    // No delegation and no grant path: a real launcher is never resolved, so there
+    // is nothing to exec, and no marker/grant can authorize one.
+    assert!(!sh.contains("exec "), "nothing is ever exec'd — that would be the launch");
+    assert!(!sh.contains("grant") && !sh.contains("dangerous_mode") && !sh.contains("autonomous"),
+        "no marker or grant may unlock the launcher; there is no authorized agent use");
+
+    let cmd = loomux_shim_cmd();
+    assert!(cmd.trim_end().ends_with("exit /b 1"), "the .cmd refuses too");
+    assert!(cmd.contains("self-launch-blocked"), "the .cmd audits the refusal");
+    // Deliberately unlike gh.cmd/git.cmd: no sh delegation, and therefore no
+    // `:loomux_no_sh` fallback that would run the real launcher when sh is absent.
+    assert!(!cmd.contains("LOOMUX_SH") && !cmd.contains("loomux_no_sh"),
+        "a refusal must not have a degraded path that falls through to the launcher");
+    // cmd.exe re-parses an echo's text after expanding it, so the message itself
+    // (past the `>&2 echo ` redirect, which is meant to be parsed) must carry no
+    // metacharacter — one stray `(` and the refusal dies as a syntax error instead
+    // of printing, leaving an agent with a bare non-zero exit and no explanation.
+    let msg = cmd.lines().find_map(|l| l.strip_prefix(">&2 echo ")).expect("an echoed refusal");
+    assert!(!msg.contains(['(', ')', '<', '>', '|', '&', '^', '%', '"']),
+        "the echoed message must carry no cmd.exe metacharacter: {msg}");
+}
+
+#[test]
+fn loomux_shim_harness_blocks_the_launcher_and_audits_it() {
+    use std::process::Command;
+    if Command::new("sh").arg("-c").arg("exit 0").status().map(|s| !s.success()).unwrap_or(true) {
+        eprintln!("SKIP loomux_shim_harness…: no POSIX sh");
+        return;
+    }
+    let td = tempfile::tempdir().unwrap();
+    let (root, group) = (td.path(), td.path().join("group"));
+    std::fs::create_dir_all(&group).unwrap();
+    let shim = root.join("loomux");
+    std::fs::write(&shim, loomux_shim_sh()).unwrap();
+
+    // Every shape an agent might reach for — bare, a flag, the launcher's own
+    // reinstall escape hatch — refuses identically. There is no allowed argv.
+    for argv in [vec![], vec!["--version"], vec!["--reinstall"]] {
+        let out = Command::new("sh").arg(&shim).args(&argv)
+            .env("LOOMUX_GROUP_DIR", &group).env("LOOMUX_AGENT_ID", "w-1")
+            .output().unwrap();
+        assert!(!out.status.success(), "`loomux {argv:?}` must refuse");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("blocked") && err.contains("MCP"),
+            "the refusal must say what to do instead: {err}");
+    }
+    // One audit line per attempt, naming the agent that tried.
+    let audit = std::fs::read_to_string(group.join("audit.jsonl")).unwrap();
+    assert_eq!(audit.lines().filter(|l| l.contains("self-launch-blocked")).count(), 3);
+    assert!(audit.contains("\"agent\":\"w-1\""), "the audit names the agent: {audit}");
+    for line in audit.lines() {
+        serde_json::from_str::<serde_json::Value>(line).expect("each audit line is valid JSON");
+    }
 }
 
 #[test]
