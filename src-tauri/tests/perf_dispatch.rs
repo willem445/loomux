@@ -19,7 +19,7 @@
 //! are meant to read as one idea.
 //!
 //! WHY A MANIFEST AND NOT A LINT. The property is not "no blocking sync
-//! commands exist": 26 do today (66 when this file landed), enumerated in
+//! commands exist": 1 does today (66 when this file landed), enumerated in
 //! #743's census (planning comments parts 1-2, which `performance.md` §5 names
 //! as the one source of truth) and owned by the issues in `DEBT_OWNERS`. The property is that **one cannot be
 //! added silently**. A new sync command fails this test until somebody writes
@@ -29,12 +29,15 @@
 //!
 //! THE BOUND OF THE CLAIM, stated rather than implied. **A source scan cannot
 //! follow call chains.** A sync command whose *helper* spawns is not caught
-//! mechanically, and the shipped tree has live examples: `fm_open`'s body is
-//! one line and the blocking `ShellExecuteW` is in `filemgr.rs`'s helper, and
+//! mechanically, and the shipped tree still has one:
 //! `orch_confirm_solo_copilot_autopilot`'s one-line body hands work to a raw
-//! thread it never names. (`orch_open_ref` was the third until #762 converted
-//! it — a scan-invisible pair of `git` spawns, found by reading rather than by
-//! failing, which is the residue this paragraph is about.) This is the same
+//! thread it never names. Two more were live examples until their conversions
+//! took them out of the sync tier — `orch_open_ref` (#762, a scan-invisible
+//! pair of `git` spawns) and `fm_open`/`fm_open_with` (#746, a one-line body
+//! over a blocking `ShellExecuteW` in `filemgr.rs`'s helper). Both were found
+//! by reading rather than by failing, which is the residue this paragraph is
+//! about, and neither being here any more is why it names them anyway: the
+//! bound did not narrow, the tier did. This is the same
 //! bound `gh.rs`'s in-module enumeration test (the seed this generalizes)
 //! already accepts. The scan pins the shape — which commands are sync, and that
 //! each one's cost is written down — and the manifest reason plus review carry
@@ -89,33 +92,25 @@ struct Row {
 /// against the issue, not free text that quietly names anything.
 const DEBT_OWNERS: &[(&str, &str)] = &[
     (
-        "#746",
-        "F1 of #743: the remaining sync gesture commands (filemgr, fileedit, uistate, sessions, \
-         cliprobe, editor, spawn_pty, dir_info, voice) convert to async + run_blocking in two \
-         quick-tier slices, each deleting its rows here. Two rows ride with them that F1's list \
-         does not name — discover_git_bash and git_watch, both pty/gitwatch commands of the same \
-         shape; each says so in its own reason rather than widening the issue silently.",
-    ),
-    (
         "#749",
         "F4 of #743: orch_session_roles fans out over every group ever created — an index or a \
          live-groups filter, not just a thread hop.",
     ),
 ];
 
-/// The 51 synchronous `#[tauri::command]`s at this commit, seeded verbatim from
+/// The 26 synchronous `#[tauri::command]`s at this commit, seeded verbatim from
 /// #743's census (planning comments parts 1-2, reconciled against
 /// `APP_COMMANDS`) with #726's 16 git conversions, #752's 8 polled
-/// orchestration conversions and #762's 40 orchestration mutation and
-/// lifecycle conversions already removed. This is today's truth, not the
-/// target state.
+/// orchestration conversions, #762's 40 orchestration mutation and lifecycle
+/// conversions and #746's 25 gesture conversions already removed. This is
+/// today's truth, not the target state.
 ///
 /// Reconciliation against the census's own totals, so a reader can check this
 /// list rather than trust it: census A=20, T=4, C=20, B=91 of 135. Here
-/// 84 async = 20 A + #726's 16 + #752's 8 + #762's 40; 20 `cheap` = the 20 C;
-/// 5 `exception` = the 4 T plus `resize_pty` (census B, but §4 X1 argues it
-/// stays sync); 26 `debt` = 91 B − 16 (#726) − 8 (#752) − 40 (#762) − 1
-/// (`resize_pty`), owned by #746 (25) and #749 (1).
+/// 109 async = 20 A + #726's 16 + #752's 8 + #762's 40 + #746's 25;
+/// 20 `cheap` = the 20 C; 5 `exception` = the 4 T plus `resize_pty` (census B,
+/// but §4 X1 argues it stays sync); 1 `debt` = 91 B − 16 (#726) − 8 (#752)
+/// − 40 (#762) − 25 (#746) − 1 (`resize_pty`), owned by #749.
 ///
 /// CITE CONVENTION. A `reason` that points at code names the **symbol** and
 /// carries the line only as a parenthetical hint (`… in `PtyManager::kill`
@@ -138,7 +133,7 @@ const SYNC_COMMANDS: &[Row] = &[
                  sizes can be outstanding and off-thread dispatch could land them in either \
                  order, leaving ConPTY at the older geometry with no event to correct it. See \
                  performance.md §4 X1; the argument and its named falsifier are the doc comment \
-                 on `resize_pty` itself (pty.rs:1566-1594 at this commit).",
+                 on `resize_pty` itself (pty.rs:1662-1692 at this commit).",
         issue: None,
     },
     Row {
@@ -147,7 +142,7 @@ const SYNC_COMMANDS: &[Row] = &[
         reason: "Hands the delete to a dedicated OS thread that enters its own STA, because \
                  SHFileOperationW is a Shell/COM API and a generic async pool has no defined \
                  apartment state. See performance.md §4 X2; argued in the doc comment on \
-                 `fm_delete_start` itself (filemgr.rs:846-886 at this commit).",
+                 `fm_delete_start` itself (filemgr.rs:903-944 at this commit).",
         issue: None,
     },
     Row {
@@ -216,9 +211,11 @@ const SYNC_COMMANDS: &[Row] = &[
     Row {
         name: "git_unwatch",
         class: Class::Cheap,
-        reason: "Removes one entry from the watches map so the poll loop stops servicing it. A \
-                 single map mutation under a briefly-held lock; unlike git_watch it reads nothing \
-                 from disk.",
+        reason: "Removes one entry from the watches map so the poll loop stops servicing it, and \
+                 claims a dispatch ticket in the intents map so an in-flight git_watch cannot \
+                 reinstall the watch it just removed (#746). Two map mutations under briefly-held \
+                 leaf locks; unlike git_watch it reads nothing from disk, and its claim has to run \
+                 on the webview thread — being sync is what puts it in arrival order.",
         issue: None,
     },
     Row {
@@ -333,21 +330,8 @@ const SYNC_COMMANDS: &[Row] = &[
         issue: None,
     },
     // ---------------------------------------------------------------------
-    // debt — #746 (F1): the sync gesture commands outside orchestration.
-    // ---------------------------------------------------------------------
-    Row {
-        name: "git_watch",
-        class: Class::Debt,
-        reason: "Computes the repo signature (stats and reads) on the webview thread. #763 (S7) \
-                 moved that IO OUTSIDE the watches mutex, so the lock-scope half — the reason this \
-                 row used to belong to S7 — is done; what is left is the plain one, a sync \
-                 filesystem command Tauri dispatches on the thread that services paint. F1's list \
-                 does not name gitwatch, same as discover_git_bash above; it is the same shape and \
-                 rides with them.",
-        issue: Some("#746"),
-    },
-    // ---------------------------------------------------------------------
-    // debt — #749: the one orchestration row with its own dedicated issue.
+    // debt — #749, the last row in this tier. #746 (F1) drained the other 25;
+    // #726, #752 and #762 the 64 before them.
     // ---------------------------------------------------------------------
     Row {
         name: "orch_session_roles",
@@ -1050,10 +1034,11 @@ fn every_sync_command_is_declared_and_every_declaration_is_still_sync() {
 #[test]
 fn cheap_commands_carry_no_spawn_shell_out_or_filesystem_marker() {
     // INV-2, belt and braces on top of the review. It cannot see through a
-    // helper — `fm_open`'s one-line body hides a blocking ShellExecuteW, which
-    // is why that command is `debt` by argument rather than by detection — but
-    // it does refuse the cheapest way to get this wrong: writing `cheap` on a
-    // row whose body visibly shells out or touches the filesystem.
+    // helper — until #746 converted it, `fm_open`'s one-line body hid a
+    // blocking ShellExecuteW, which is why that command was `debt` by argument
+    // rather than by detection — but it does refuse the cheapest way to get
+    // this wrong: writing `cheap` on a row whose body visibly shells out or
+    // touches the filesystem.
     let sites = commands();
     let mut problems: Vec<String> = Vec::new();
     for row in SYNC_COMMANDS.iter().filter(|r| r.class == Class::Cheap) {
