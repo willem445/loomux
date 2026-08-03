@@ -1477,7 +1477,7 @@ fn the_scan_still_tells_async_from_sync() {
     );
     assert!(
         sites.iter().any(|s| s.file.contains("orchestration/")),
-        "the walk did not descend into src/orchestration/ — 63 of the 135 commands live there, so \
+        "the walk did not descend into src/orchestration/ — 64 of the 136 commands live there, so \
          a non-recursive walk would leave nearly half the surface undeclared rather than red"
     );
 }
