@@ -86,6 +86,7 @@ import { rankFileNames, moveSelection, basenameStart, queryTerms, type FileNameH
 import { fileIconSvg, folderIconSvg } from "./fileicons";
 import { confirmModal } from "./modal";
 import { showToast } from "./toast";
+import { FrameGate } from "./framegate";
 
 /** What the hosting pane provides. */
 export interface FileExplorerHost {
@@ -178,6 +179,14 @@ export class FileExplorerView {
   /** The in-flight column run's id, or null. Cancelled on navigate/dispose. */
   private hashRunId: number | null = null;
   private hashUnlisten: (() => void) | null = null;
+  /** One hash-column repaint per FRAME, however fast the batches stream (#743 S5).
+   *  `fm_hash_start` emits a batch every 8 files and each repaint is a
+   *  querySelectorAll over every visible row, so hashing a large folder used to be
+   *  hundreds of whole-listing DOM passes on the webview thread. Same P5 gate the
+   *  `ft-files` index already uses below (onFilesBatch), as a module. */
+  private hashPaintGate = new FrameGate(() => {
+    if (!this.disposed) this.paintHashCells();
+  });
   /** An on-demand digest we are waiting on (the Hash → submenu, or a click-to-hash cell).
    *  Keyed by the run id so a late batch from an abandoned dialog can't land in a new one. */
   private hashRequests = new Map<number, (r: { digest?: string; error?: string }) => void>();
@@ -797,8 +806,15 @@ export class FileExplorerView {
         this.hashCells.set(r.rel, { kind: "error", message: r.error ?? "hash failed" });
       }
     }
-    if (b.done) this.hashRunId = null;
-    this.paintHashCells();
+    // The final batch paints straight away — the run is over, so there is no
+    // stream left to coalesce and the column must not sit a frame behind its
+    // last result. Everything before it goes through the frame gate.
+    if (b.done) {
+      this.hashRunId = null;
+      this.paintHashCells();
+    } else {
+      this.hashPaintGate.request();
+    }
   }
 
   /** Update the hash column IN PLACE. Deliberately not a re-render: results stream in

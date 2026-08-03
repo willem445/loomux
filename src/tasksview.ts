@@ -36,6 +36,7 @@ import {
   type WorkflowStatus,
 } from "./orchestration";
 import { normalizeComment } from "./autonomy";
+import { CoalescingRefresh } from "./refreshgate";
 import { approveWillMerge, gateExitsMessage } from "./workflowstatus";
 
 export interface OrchTaskNote {
@@ -119,6 +120,14 @@ export class TasksView {
   private pickingFocus = false;
   /** A refresh arrived while the human was mid-edit; run it on blur. */
   private pendingRefresh = false;
+  /** Single-flight + trailing-edge merge for this view's refresh (#743 S5).
+   *  `orch-tasks-changed` fires on EVERY `write_tasks`, and agents write in
+   *  bursts (a plan posting ten tasks, a batch status sweep), so an ungated
+   *  handler cost one full refetch — three backend commands and a whole-board
+   *  re-render — per write, per open board. A burst of N now costs the run
+   *  already in flight plus exactly one trailing run, which reads the final
+   *  state, so nothing is lost by coalescing. */
+  private readonly refresher = new CoalescingRefresh(() => this.refreshNow());
   /** The open request-changes modal, if any (kept to one at a time). */
   private dialogEl: HTMLElement | null = null;
   private unlisten: UnlistenFn | null = null;
@@ -205,12 +214,12 @@ export class TasksView {
     // Deferred refreshes (see refresh()) run once the editor loses focus.
     this.listEl.addEventListener("focusout", () => {
       window.setTimeout(() => {
-        if (this.pendingRefresh && !this.isEditing()) void this.refresh();
+        if (this.pendingRefresh && !this.isEditing()) this.refresh();
       }, 0);
     });
 
     void listen<{ group_id: string }>("orch-tasks-changed", ({ payload }) => {
-      if (payload.group_id === this.groupId) void this.refresh();
+      if (payload.group_id === this.groupId) this.refresh();
     }).then((u) => {
       if (this.disposed) u();
       else this.unlisten = u;
@@ -219,7 +228,7 @@ export class TasksView {
 
   /** Called by the pane whenever the view is (re)opened, in either mode. */
   show(): void {
-    void this.refresh();
+    this.refresh();
   }
 
   /** Reflect which mode the pane currently has this view mounted in —
@@ -266,7 +275,7 @@ export class TasksView {
       await action;
     } catch (err) {
       this.toast(String(err));
-      void this.refresh(); // resync UI with reality after a failed edit
+      this.refresh(); // resync UI with reality after a failed edit
     }
   }
 
@@ -277,7 +286,15 @@ export class TasksView {
     return !!a && this.listEl.contains(a) && (a.tagName === "INPUT" || a.tagName === "TEXTAREA");
   }
 
-  private async refresh(): Promise<void> {
+  /** Ask for a refresh. Coalesced — see `refresher`. The gate lives here rather
+   *  than at each call site so a future caller cannot forget it, and so the
+   *  event handler and the human's own actions share one in-flight run. */
+  private refresh(): void {
+    this.refresher.request();
+  }
+
+  /** One board refresh. Only `refresher` calls this. */
+  private async refreshNow(): Promise<void> {
     if (this.disposed) return;
     if (this.isEditing()) {
       // Orchestrator updates mustn't clobber a human's half-typed edit;

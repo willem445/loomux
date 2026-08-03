@@ -142,6 +142,14 @@ export class Grid {
     return this.leaves.size;
   }
 
+  /** Every pane the grid owns, docked ones included — the population
+   *  `allPanes()` would return, WITHOUT building the array. Used by the
+   *  attention gate's topology token (#743 S5), which runs on a 3 s tick and
+   *  must not allocate to answer "did the pane set move?". */
+  get allPaneCount(): number {
+    return this.leaves.size + this.minimizedPanes.length;
+  }
+
   panes(): Pane[] {
     return [...this.leaves.keys()];
   }
