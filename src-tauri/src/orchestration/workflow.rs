@@ -429,6 +429,13 @@ pub struct IntakeProfile {
     /// to the built-in default) — every label field works this way, see
     /// [`sanitize_intake_label`].
     pub prototype: String,
+    /// "Held by the human — do not start this" (#778). The one label whose
+    /// meaning is a *veto* rather than a selector: under full autonomy the
+    /// start default inverts (every open issue is eligible), and this is the
+    /// boundary that stays opt-**out**. Vocabulary only, like every field
+    /// here — it names which label the host poller must treat as a hold, and
+    /// can never grant anything.
+    pub hold: String,
 }
 
 impl Default for IntakeProfile {
@@ -455,6 +462,7 @@ pub fn builtin_intake_profile() -> IntakeProfile {
         investigate: "agent-investigation".to_string(),
         owned: "agent-managed".to_string(),
         prototype: "agent-prototype".to_string(),
+        hold: "agent-hold".to_string(),
     }
 }
 
@@ -793,6 +801,8 @@ struct RawIntakeLabels {
     owned: String,
     #[serde(default)]
     prototype: String,
+    #[serde(default)]
+    hold: String,
 }
 
 #[derive(Deserialize)]
@@ -1424,6 +1434,7 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
                     &default_intake.prototype,
                     &mut errs,
                 ),
+                hold: default_intake.hold.clone(),
             }
         }
     };
@@ -2271,7 +2282,7 @@ mod tests {
             let RawIntake { source: _, labels: _ } = v;
         }
         fn raw_intake_labels_fields(v: RawIntakeLabels) {
-            let RawIntakeLabels { ready: _, investigate: _, owned: _, prototype: _ } = v;
+            let RawIntakeLabels { ready: _, investigate: _, owned: _, prototype: _, hold: _ } = v;
         }
         // #581 §11.2: `merge_queue:` is policy for a host-run queue that pushes
         // refs on the backend's own authority, so the inventory rule matters

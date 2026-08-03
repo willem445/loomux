@@ -8143,6 +8143,7 @@ fn read_intake(g: &Value) -> workflow::IntakeProfile {
         investigate: label("investigate", &default.investigate),
         owned: label("owned", &default.owned),
         prototype: label("prototype", &default.prototype),
+        hold: default.hold.clone(),
     }
 }
 
@@ -26258,7 +26259,7 @@ impl OrchRegistry {
             if label_signals.is_empty() && pr_signals.is_empty() {
                 continue;
             }
-            let summary = intake::intake_wake_summary(&label_signals, &pr_signals);
+            let summary = intake::intake_wake_summary(&label_signals, &pr_signals, &[]);
             self.audit(&group, "loomux", "intake-signal", json!({ "summary": summary }));
             // Fold into any not-yet-delivered pending summary rather than
             // clobbering it — two poll scans can each find something new
