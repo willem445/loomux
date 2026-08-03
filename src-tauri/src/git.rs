@@ -1849,4 +1849,149 @@ mod tests {
             "an unresolvable base must not leave a worktree behind"
         );
     }
+
+    // ----- off-the-main-thread dispatch (#726, completing #399) -----
+
+    #[test]
+    fn run_blocking_runs_the_work_on_another_thread() {
+        // The whole point of the wrapper: the caller's thread — the webview
+        // main thread in production — must not be the one that runs the `git`
+        // spawn. Asserting the closure observes a DIFFERENT thread id is the
+        // only direct evidence of that; `async fn` alone proves nothing, since
+        // an async command whose body still ran inline would be just as frozen.
+        let caller = std::thread::current().id();
+        let worker: std::thread::ThreadId =
+            tauri::async_runtime::block_on(run_blocking(move || Ok(std::thread::current().id())))
+                .unwrap();
+        assert_ne!(
+            worker, caller,
+            "run_blocking executed the closure on the calling thread — the GUI freeze (#726) is back"
+        );
+        // Errors still propagate through unchanged: the wrapper is transparent
+        // to the Result the sync body returns, which is what lets every command
+        // keep its exact contract.
+        let err: Result<(), String> =
+            tauri::async_runtime::block_on(run_blocking(|| Err("boom".to_string())));
+        assert_eq!(err.unwrap_err(), "boom");
+    }
+
+    #[test]
+    fn every_tauri_command_in_this_module_is_async_and_delegates() {
+        // #726's claim is about EVERY git-shelling command in this module, and
+        // a single sync straggler would keep the freeze while the module's doc
+        // claimed otherwise — #399 converted only the git pane's open/refresh
+        // path and left sixteen behind for exactly that reason. So this scans
+        // this file's own source rather than trusting a hand transcription (the
+        // `tests/acl_manifest.rs` precedent, which parses `generate_handler!`
+        // out of `src/lib.rs` for the same reason), and `gh.rs`'s sibling scan
+        // added in #724.
+        //
+        // Bound of the claim, stated rather than implied: this covers the `git`
+        // module only. Every `git` spawn in it goes through `run_git`, which is
+        // a private `fn`, so no command outside this module can reach one
+        // through it. `gitwatch.rs`'s `git_watch` / `git_unwatch` are
+        // deliberately NOT here and stay synchronous: they are in-memory
+        // registry writes under a mutex, not `git` spawns.
+        //
+        // Split so the literal never appears as a whole line in this file —
+        // otherwise the scan would find its own source and mis-report.
+        const ATTR: &str = concat!("#[tauri::", "command]");
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/git.rs"))
+            .expect("read src/git.rs");
+
+        let lines: Vec<&str> = src.lines().map(str::trim).collect();
+        let mut found: Vec<String> = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            if *line != ATTR {
+                continue;
+            }
+            let at = i + 1
+                + lines[i + 1..]
+                    .iter()
+                    .position(|l| !l.is_empty() && !l.starts_with("//") && !l.starts_with('#'))
+                    .unwrap_or_else(|| panic!("{ATTR} at line {} has no function after it", i + 1));
+            let sig = lines[at];
+            assert!(
+                sig.starts_with("pub async fn "),
+                "line {}: `{sig}` is a synchronous #[tauri::command] — Tauri dispatches it on the \
+                 webview main thread, so its `git` spawn freezes the GUI for the whole run \
+                 (#726). Make it a thin `pub async fn` over `run_blocking`.",
+                at + 1
+            );
+
+            // `async` alone is NOT the property. An `async fn` whose body still
+            // called the sync work inline would satisfy the check above and
+            // freeze the GUI exactly as before — Tauri polls a command's future
+            // on the main thread, so work done before the first real await point
+            // runs there. The delegation to `run_blocking` is what actually
+            // moves it, so require it in the command's OWN body: from the
+            // signature to the first top-level `}` (these wrappers are one
+            // expression, so a nested block that stopped this scan early would
+            // itself be a shape worth failing on).
+            let end = at
+                + 1
+                + lines[at + 1..]
+                    .iter()
+                    .position(|l| *l == "}")
+                    .unwrap_or_else(|| panic!("no top-level `}}` closing the fn at line {}", at + 1));
+            assert!(
+                lines[at..end].iter().any(|l| l.contains("run_blocking(")),
+                "line {}: `{sig}` is async but its body never calls `run_blocking(` — an async \
+                 command that runs its `git` spawn inline is polled on the webview main thread and \
+                 freezes the GUI just as a sync one does (#726). Hand the body to \
+                 `run_blocking(move || …_sync(…)).await`.",
+                at + 1
+            );
+
+            let name = sig["pub async fn ".len()..]
+                .split(|c: char| c == '(' || c.is_whitespace())
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            found.push(name);
+        }
+
+        found.sort();
+        // The six #399 already converted (the pane's open/refresh path) plus
+        // the sixteen #726 converted — set equality, so a seventeenth command
+        // added to this module forces a deliberate update here rather than
+        // slipping in synchronous.
+        let mut expected = vec![
+            // #399
+            "git_commit_files",
+            "git_diff",
+            "git_log",
+            "git_repo_root",
+            "git_status",
+            "git_worktree_list",
+            // #726
+            "git_branch_create",
+            "git_branches",
+            "git_checkout",
+            "git_cherry_pick",
+            "git_commit",
+            "git_discard",
+            "git_fetch",
+            "git_merge",
+            "git_pull",
+            "git_push",
+            "git_rebase",
+            "git_revert",
+            "git_stage",
+            "git_tag",
+            "git_unstage",
+            "git_worktree_add",
+        ];
+        expected.sort();
+        assert_eq!(
+            found, expected,
+            "the set of tauri commands in git.rs changed — a new one must be async over \
+             run_blocking (see the module note) and listed here, so the enumeration this test \
+             pins can't silently go stale"
+        );
+        // NB: this equality is also the scan's own vacuity guard — a marker
+        // that stopped matching (a formatting change, a renamed attribute path)
+        // yields an empty `found` and fails here, rather than letting the
+        // per-command assertions above pass vacuously over nothing.
+    }
 }
