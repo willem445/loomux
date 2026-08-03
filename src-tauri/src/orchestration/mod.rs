@@ -38747,7 +38747,8 @@ pub async fn orch_solo_adopt(
 /// and relaunching into one mid-teardown is not something a careful human does
 /// on purpose, but it is reachable now in a way it was not when the two
 /// commands could not overlap. Recorded rather than fixed: serializing this
-/// against `creation` is a lifecycle change, not a dispatch one.
+/// against `creation` is a lifecycle change, not a dispatch one, and it is the
+/// same lock gap **#799** owns from the resume side.
 #[tauri::command]
 pub async fn orch_end_group(
     app: AppHandle,
@@ -39296,6 +39297,17 @@ pub fn resume_recorded_session(
     }
 
     if record.role == "orchestrator" {
+        // #799: this liveness pre-check runs OUTSIDE the `creation` lock (the
+        // only `creation.lock_safe()` is inside `create_group_ex`), so what it
+        // reads can be stale by the time the pane actually spawns — a teardown
+        // racing a resume can validate here against a group that is gone a
+        // moment later, and two restores of one session can both pass it. That
+        // is pre-existing, but #762 made it reachable in a way it was not when
+        // these commands could not overlap: see `resume_orch_session`'s
+        // **Reentrancy.** paragraph for the argument, and #799 for the guard
+        // shape (re-check under `creation`, or a liveness token the spawn
+        // re-validates). Documented here rather than fixed — the fix is
+        // lifecycle locking, not dispatch.
         if record.group_live {
             return Err(format!(
                 "group {} already has a live orchestrator — focus its pane instead",
@@ -39544,10 +39556,11 @@ pub fn orch_session_roles(reg: tauri::State<Arc<OrchRegistry>>) -> Vec<SessionRo
 /// materialized that nothing asked for, and reporting a cause that describes
 /// the id mismatch rather than the double restore. Pre-conversion the second
 /// call ran strictly after the first and returned the clean "already has a live
-/// orchestrator" error, so this IS newly reachable. It is recorded here rather
-/// than fixed because the fix is to take `creation` across the precheck, which
-/// changes the restore path's locking rather than its dispatch — see the PR
-/// discussion for where it lands.
+/// orchestrator" error, so this IS newly reachable. It is recorded rather than
+/// fixed because the fix is to take `creation` across the precheck (or hand the
+/// spawn a liveness token to re-validate), which changes the restore path's
+/// locking rather than its dispatch: **#799** owns it, and cites this paragraph
+/// back from the precheck itself.
 #[tauri::command]
 pub async fn resume_orch_session(
     app: AppHandle,
