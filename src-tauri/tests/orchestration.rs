@@ -20125,19 +20125,68 @@ fn the_orchestrator_contract_quotes_the_full_autonomy_notice_it_will_receive() {
 #[test]
 fn the_orchestrator_contract_names_the_eligible_signal_and_its_partial_caveat() {
     let sig = intake::EligibleSignal { number: 42, title: "Do the thing".into() };
-    let summary = intake::intake_wake_summary(&[], &[], std::slice::from_ref(&sig), false);
+    let summary =
+        intake::intake_wake_summary(&[], &[], std::slice::from_ref(&sig), intake::IntakeTruncation::default());
     assert!(summary.contains("eligible under full-autonomy"), "the signal's wording moved: {summary}");
     assert!(
         ORCHESTRATOR_TPL.contains("eligible under full-autonomy"),
         "orchestrator.md must name the wake line the poller actually sends, so the orchestrator \
          acts on it instead of re-polling what loomux already told it (#778)"
     );
-    let partial = intake::intake_wake_summary(&[], &[], std::slice::from_ref(&sig), true);
+    let partial = intake::intake_wake_summary(
+        &[],
+        &[],
+        std::slice::from_ref(&sig),
+        intake::IntakeTruncation { issues: true, prs: false },
+    );
     assert!(partial.contains("PARTIAL:"), "the truncation caveat's wording moved: {partial}");
     assert!(
         ORCHESTRATOR_TPL.contains("PARTIAL"),
         "orchestrator.md must say what a PARTIAL-flagged burst means: the backlog was not fully \
          seen, so a triage plan built from it is incomplete and must say so (#778)"
+    );
+}
+
+/// The PR half of that caveat (#795). Bounding the open-PR fetch too means a
+/// `PARTIAL` summary can now come from *either* listing, so the contract can no
+/// longer describe it as a statement about the backlog: it has to say what a
+/// short PR sweep means, which is that silence about a PR outside the window is
+/// absence of evidence rather than "still running". The expected text is derived
+/// from the shipped summary builder, as above, so a reworded caveat fails here
+/// instead of drifting away from the contract that explains it.
+#[test]
+fn the_orchestrator_contract_names_the_partial_pr_sweep_caveat() {
+    let pr = intake::PrCheckSignal {
+        number: 7,
+        title: "Fix Y".into(),
+        from: intake::PrCheckState::Pending,
+        to: intake::PrCheckState::Success,
+    };
+    let partial = intake::intake_wake_summary(
+        &[],
+        std::slice::from_ref(&pr),
+        &[],
+        intake::IntakeTruncation { issues: false, prs: true },
+    );
+    assert!(partial.contains("PARTIAL:"), "a short open-PR fetch must state itself: {partial}");
+    // The phrase the summary uses to name WHICH fetch was short, carried over
+    // to the contract verbatim. Deliberately not the bare token "open-PR": the
+    // template already says "open-PR check-state changes" in its intake-gate
+    // description, which silently satisfied the first cut of this assertion on
+    // a template that explained nothing about a truncated sweep — a pin that
+    // passes before the clause it pins exists is a decoration.
+    let names_the_fetch = "open-PR fetch";
+    assert!(partial.contains(names_the_fetch), "the caveat must name which of the two fetches was short: {partial}");
+    assert!(
+        ORCHESTRATOR_TPL.contains(names_the_fetch),
+        "orchestrator.md must name the short fetch the way the summary does ({names_the_fetch}), so \
+         the orchestrator can tell a truncated PR sweep from a truncated backlog (#795)"
+    );
+    assert!(
+        ORCHESTRATOR_TPL.contains("produces no wake"),
+        "orchestrator.md must say what a PARTIAL open-PR fetch COSTS: a PR outside the window \
+         finishing CI produces no wake at all, so silence about it is absence of evidence and must \
+         be checked rather than read as still-running (#795)"
     );
 }
 

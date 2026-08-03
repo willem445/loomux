@@ -530,6 +530,14 @@ so far:
   fourth **Label signals** row states `agent-hold` itself: absolute, never removed by an agent,
   addable only to an issue the agent filed.
 
+- **#795, `PARTIAL` names which fetch was short** — `orchestrator.md` only, one bullet. The
+  intake poll bounds two listings, not one, so a `PARTIAL` caveat can now come from either the
+  open-issue fetch or the open-PR fetch. The clause added by #778 named only the issue case, and
+  read as an assertion about the backlog whichever fetch was actually truncated. It now splits:
+  the issue half is unchanged, and a short **open-PR** fetch is stated as what it is — the check
+  sweep saw only the newest open PRs, so a PR outside that window finishing CI produces no wake,
+  and the orchestrator must check it rather than read the silence as "still running".
+
 `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was` renders
 **these** with the six pre-#222 template variables and asserts that a group launched
 with the advanced orchestrator **off** gets exactly that text. They are the
