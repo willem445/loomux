@@ -106,6 +106,56 @@ crc = "3"
 # sanitization) rather than merely its input. See doc/design/workflows.md.
 serde_norway = "0.9.42"
 
+# Read-only SQLite, for OpenCode's session/message store (#722). OpenCode keeps
+# per-session cost and token counters in one `session` row of a single SQLite
+# database (`OPENCODE_DB`, per group — see doc/design/opencode.md); loomux reads
+# that row and never writes it (`src/opencodedb.rs` opens `mode=ro`).
+#
+# VETTED AGAINST THE GETRANDOM BAN above. Audit run 2026-08-03; reproduce with
+# the commands below (all are resolution/graph queries — none compiles):
+#
+#   cargo tree -e normal,build --target x86_64-pc-windows-msvc -p rusqlite
+#     rusqlite → bitflags, fallible-iterator, fallible-streaming-iterator,
+#                smallvec, libsqlite3-sys
+#                  [build-dependencies] cc → find-msvc-tools, shlex;
+#                                       pkg-config; vcpkg
+#     — no getrandom anywhere, not even as a build-dependency, on the very
+#     target the ProcessPrng hazard is about.
+#
+# rusqlite DOES list `getrandom` — as a `[dev-dependencies]` entry, for its own
+# wasm test suite. A dependency's dev-deps are never built for a downstream
+# crate, so it cannot reach loomux's binary; `-e normal,build` above is what
+# makes that visible rather than assumed. `default-features = false` is
+# deliberate on top of that: rusqlite's default `cache` feature pulls hashlink
+# → hashbrown, and its default `ffi-sqlite-wasm-rs` pulls a wasm FFI backend —
+# neither is wanted for a handful of one-shot SELECTs, and dropping both keeps
+# the added graph to the five packages named above.
+#
+#   cargo tree -e normal --target all -i getrandom@0.2.17 / @0.3.4 / @0.4.3
+# still prints only the three PRE-EXISTING edges the note above enumerates
+# (redox-only via dirs; tauri's own; tauri's uuid/codegen chain) — this
+# dependency adds no fourth.
+#
+# `bundled` compiles SQLite's own C amalgamation into the binary via the `cc`
+# build-dependency. That is the point, not a side effect: constraint 8 (no
+# operator-setup assumptions) rules out linking whatever `sqlite3.dll` happens
+# to be on a user's machine, and the C core is plain ANSI C with no CSPRNG
+# import — SQLite's randomness comes from its own VFS, which on Windows uses
+# the system time and process/thread ids, never bcryptprimitives!ProcessPrng.
+# Cost, stated plainly: a cold `cargo check`/`cargo test` now compiles ~250k
+# lines of C once per platform (cached by swatinem/rust-cache thereafter), and
+# exactly five packages enter the lock — rusqlite, libsqlite3-sys,
+# fallible-iterator, fallible-streaming-iterator, vcpkg. bitflags, smallvec,
+# cc and pkg-config were already there.
+#
+# WHY NOT hand-roll a SQLite file-format reader, given this repo hand-rolls its
+# MCP JSON-RPC: the same line as `serde_norway`'s — loomux does not *define*
+# this format. It is a b-tree file with overflow pages, a write-ahead log, and
+# a live writer appending to it; a subset reader would not fail cleanly on a
+# WAL frame it did not understand, it would return a stale or wrong number and
+# call it an agent's spend.
+rusqlite = { version = "0.40", default-features = false, features = ["bundled"] }
+
 # Vendor-neutral GPU metrics on Windows: PDH performance counters give
 # per-engine utilization + dedicated VRAM usage for any WDDM adapter (AMD,
 # Intel, NVIDIA); DXGI reports total VRAM and the adapter name.
