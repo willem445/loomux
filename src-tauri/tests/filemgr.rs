@@ -739,6 +739,56 @@ fn the_event_carries_the_path_so_a_pane_that_navigated_away_can_still_place_it()
 
 // ---------- concurrency: the exclusion sync dispatch used to provide (#746) ----------
 
+/// The mechanism pin, deterministic on every platform.
+///
+/// The race test below pins the real consequence — a file must not vanish —
+/// but it can only fail where the check-then-act window is wide enough to hit.
+/// With `MUTATION_GATE` removed it reddened on windows-latest (7 of 8 renames
+/// accepted) while ubuntu-22.04 and macos-latest passed 39/39, because the
+/// window on a tmpfs tempdir is narrower than thread wake-up skew. So the race
+/// test alone would leave `rename`'s guard unpinned on two of three platforms.
+///
+/// This one has no window to hit: hold the gate, then require that a `rename`
+/// on another thread has NOT completed. A held mutex genuinely blocks (so the
+/// guarded case cannot flake) and an ungated `rename` returns in microseconds
+/// (so the unguarded case cannot pass). The failure direction is one-way by
+/// construction.
+#[test]
+fn rename_parks_on_the_mutation_gate_rather_than_racing_it() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Barrier};
+    use std::time::Duration;
+
+    let root = tempfile::tempdir().unwrap();
+    let rp = root.path().to_str().unwrap().to_string();
+    new_file(&rp, "", "only.txt").unwrap();
+
+    let held = loomux_lib::filemgr::hold_mutation_gate_for_test();
+    let done = Arc::new(AtomicBool::new(false));
+    // Wait for the worker to be RUNNING before timing anything, so a slow
+    // thread spawn can never be mistaken for a blocked rename.
+    let running = Arc::new(Barrier::new(2));
+    let worker = {
+        let (rp, done, running) = (rp.clone(), done.clone(), running.clone());
+        std::thread::spawn(move || {
+            running.wait();
+            let _ = rename(&rp, "only.txt", "renamed.txt");
+            done.store(true, Ordering::SeqCst);
+        })
+    };
+    running.wait();
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        !done.load(Ordering::SeqCst),
+        "rename ran to completion while MUTATION_GATE was held — it is not taking the gate, so          its `to.exists()` check and its `fs::rename` are not one unit, on ANY platform"
+    );
+
+    drop(held);
+    worker.join().unwrap();
+    assert!(done.load(Ordering::SeqCst), "releasing the gate must let the rename through");
+    assert!(root.path().join("renamed.txt").exists(), "and it must actually have renamed");
+}
+
 #[test]
 fn concurrent_renames_onto_one_target_leave_exactly_one_winner_and_lose_no_file() {
     // #746's reentrancy pin for `fm_rename`, and the one command in this module

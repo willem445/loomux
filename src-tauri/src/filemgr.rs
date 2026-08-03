@@ -83,6 +83,30 @@ use tauri::{AppHandle, Emitter};
 /// minutes — trading a rare, pre-existing race for a routine freeze.
 static MUTATION_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Test-only seam: hold [`MUTATION_GATE`] so a test can ask whether a gated
+/// call actually parks on it.
+///
+/// **Why a seam rather than only the threaded race test.** The end-to-end race
+/// test (`concurrent_renames_onto_one_target_leave_exactly_one_winner_and_lose_no_file`)
+/// pins the real property — a file must not vanish — but its sensitivity is
+/// platform-dependent, and measurably so: with the gate removed it reddened on
+/// windows-latest (7 of 8 renames accepted) while ubuntu and macOS passed
+/// 39/39, because the `to.exists()`-to-`fs::rename` window on a tmpfs tempdir
+/// is narrower than thread wake-up skew. A pin that can only fail on one of
+/// three platforms is not a pin on the other two.
+///
+/// So this seam backs it with a check that is deterministic everywhere: hold
+/// the gate, call a gated function on another thread, and require that it has
+/// NOT completed. A held mutex genuinely blocks, so the guarded case cannot
+/// flake; an ungated call returns immediately, so the unguarded case cannot
+/// pass. This is `performance.md` P3's own stated technique for a new lock that
+/// matters — the one `tests/perf_leaflocks.rs` uses to park a read inside a
+/// held mutex — applied to a write gate instead of a read path.
+#[doc(hidden)] // pub for integration tests
+pub fn hold_mutation_gate_for_test() -> std::sync::MutexGuard<'static, ()> {
+    crate::obs::LockExt::lock_safe(&MUTATION_GATE)
+}
+
 /// Does any component of `rel` name something Windows would silently MANGLE?
 ///
 /// The Win32 path layer strips trailing spaces and dots from each component before
