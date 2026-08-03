@@ -78,10 +78,14 @@ use std::process::Command;
 /// It is not new — an async read could overlap a main-thread write ever since
 /// #399 — but #726 widens the window, because a read can now be *dispatched*
 /// while a write is running, where before the busy main thread prevented that.
-/// Closing it means either queueing the worktree diff (which would stall the
-/// diff pane behind an unbounded fetch, trading a rare error for a routine
-/// one) or retrying a lock-failed write; neither belongs in this change, and
-/// the test above is what keeps the choice from being forgotten.
+///
+/// **Accepted, not fixed, and tracked as #754**, which carries the matrix above
+/// and both mitigations weighed and rejected for this change: queueing the
+/// worktree diff would stall the diff pane behind an unbounded fetch, trading a
+/// rare error for a routine one, and retrying a lock-failed write in `run_git`
+/// is a new mechanism of its own. The test above is the other half of that
+/// decision — it fails the day any cell changes, so #754 is revisited on
+/// evidence rather than left to rot.
 ///
 /// What the queue does *not* claim. It covers commands issued through the
 /// webview, not every writer in the process, and two others sit outside it:
@@ -302,8 +306,9 @@ pub async fn git_status(repo: String) -> Result<GitStatus, String> {
 /// carrying none. `--cached` never writes the index at all, and `commit` mode
 /// (`git show`) and `untracked` never touch it.
 ///
-/// The residual is therefore real and is argued where it belongs, in
-/// `run_blocking`'s note on why reads stay outside the write queue.
+/// The residual is therefore real, accepted rather than fixed, and tracked as
+/// #754; it is argued where it belongs, in `run_blocking`'s note on why reads
+/// stay outside the write queue.
 fn git_diff_sync(
     repo: String,
     path: String,
