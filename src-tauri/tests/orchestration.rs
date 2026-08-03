@@ -19832,6 +19832,37 @@ fn full_autonomy_goal_round_trips_through_marker_state_and_restart() {
 }
 
 #[test]
+fn a_goal_is_never_reported_for_a_mode_that_is_off() {
+    // The force-clear paths are money-stops: they drop the in-memory flag
+    // UNCONDITIONALLY and remove the marker only best-effort (`let _ =`), so a disk
+    // failure genuinely leaves a `full_autonomy` marker — goal and all — behind
+    // while the mode is off. `is_full_autonomy` is the authority in that window, so
+    // the goal must read as absent: a panel rendering a goal for a mode that is not
+    // running is claiming consent that is not in force. The stale marker itself is
+    // cleared by the reconcile on the next restart, which is a different test.
+    //
+    // Setup deliberately turns the mode off via the EXPLICIT disable rather than via
+    // a force-clear, so this test pins the gate and not the force-clear paths — the
+    // two are separate claims and must fail separately.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let marker = reg.state_root().join(&g.id).join("full_autonomy");
+    reg.set_autonomous(&g.id, true).unwrap();
+    reg.set_full_autonomy(&g.id, true, "harden any bugs").unwrap();
+    reg.set_full_autonomy(&g.id, false, "").unwrap();
+    assert!(!reg.is_full_autonomy(&g.id) && !marker.is_file());
+    // Simulate the removal having failed: the marker, and its goal, survive.
+    std::fs::write(&marker, b"harden any bugs").unwrap();
+    assert!(!reg.is_full_autonomy(&g.id), "the in-memory flag stays authoritative");
+    assert_eq!(reg.full_autonomy_goal(&g.id), None,
+        "a goal must never be reported for a mode that is off");
+    let state = reg.autonomy_state(&g.id);
+    assert_eq!(state["full_autonomy"].as_bool(), Some(false));
+    assert!(state["full_autonomy_goal"].is_null(),
+        "orch_autonomy must not surface a goal that is not in force");
+}
+
+#[test]
 fn disabling_autonomous_force_disables_full_autonomy() {
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();

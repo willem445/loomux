@@ -26498,9 +26498,9 @@ impl OrchRegistry {
         // disk removal fails).
         self.force_disable_auto_merge(group, "loomux", "autonomous-suspended");
         self.force_disable_auto_release(group, "loomux", "autonomous-suspended");
-        // Full autonomy (#778) is the mode that STARTS work, so a spent budget must
-        // drop it for the same reason and by the same unconditional route.
-        self.force_disable_full_autonomy(group, "loomux", "autonomous-suspended");
+        // MUTATION (temporary, #778 rev round 1): the full-autonomy force-clear is
+        // removed here so the budget-suspension test reddens on its force-clear
+        // assertion rather than on a setup precondition. Restored in the next commit.
         // Best-effort durable disable; failure is surfaced in the audit trail.
         match remove_marker(&self.group_dir(group).join("autonomous")) {
             Ok(()) => self.audit(group, "loomux", "autonomous-off", json!({})),
@@ -26604,10 +26604,9 @@ impl OrchRegistry {
             // (rev-79 F4) — the pair can never be gate-on/autonomous-off.
             self.force_disable_auto_merge(group, actor, "autonomous-disabled");
             self.force_disable_auto_release(group, actor, "autonomous-disabled");
-            // Same dependency for full autonomy (#778), for a stronger reason: without
-            // the idle tick there is nothing to self-select on, and an inverted start
-            // default outliving its consent is the one direction it must never have.
-            self.force_disable_full_autonomy(group, actor, "autonomous-disabled");
+            // MUTATION (temporary, #778 rev round 1): the full-autonomy force-clear is
+            // removed here so the autonomous-off test reddens on its force-clear
+            // assertion rather than on a setup precondition. Restored in the next commit.
         }
         Ok(())
     }
