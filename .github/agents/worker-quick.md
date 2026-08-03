@@ -48,11 +48,13 @@ and costs the human a debugging session later.
    that echo the implementation; no test that cannot fail. Backend tests that link the lib go
    in `src-tauri/tests/` (integration tests only). Frontend logic gets a DOM-free
    pure module + `test/*.test.ts`.
-   Then prove it: commit the test FIRST as its own commit and let CI redden that tree — never
+   Then prove it: commit the test FIRST as its own commit and redden that tree — never
    `git stash` your change to strip it (the stash stack is shared across every worktree of this
-   repo, #299; commit-first is #493). Watch it fail for the reason you expect, and paste that
-   command + failure line into the PR body beside the passing run. It costs a minute, and it is
-   the difference between a test and a decoration.
+   repo, #299; commit-first is #493). Rust red comes from CI, since local `cargo` is banned;
+   frontend red is `node --test` on that same committed tree, locally, in a second. Watch it
+   fail for the reason you expect, and paste that command + failure line into the PR body
+   beside the passing run. It costs a minute, and it is the difference between a test and a
+   decoration.
 3. **Loop on CI until every check is green, not on the host.** Push early and open
    the PR as a **draft**, linking the issue (`Closes #N`) — `gh pr create --draft`
    (local `cargo` of any kind is banned — CI is the build; frontend-only checks
