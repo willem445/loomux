@@ -1333,7 +1333,9 @@ fn list_sessions_sync() -> Vec<SessionInfo> {
 /// already-tolerant "best-effort, assume resumable on failure" handling.
 #[tauri::command]
 pub async fn list_sessions() -> Vec<SessionInfo> {
-    list_sessions_sync()
+    tauri::async_runtime::spawn_blocking(list_sessions_sync)
+        .await
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
