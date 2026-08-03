@@ -262,6 +262,24 @@ pub fn pr_check_deltas(last_seen: &mut HashMap<u64, PrCheckState>, current: &[Ra
 // Eligible-unstarted issues — the full-autonomy intake signal (#778)
 // ---------------------------------------------------------------------------
 
+/// The exact `gh issue list` argv `poll_intake` runs, built here rather than
+/// inline at the call site **so that the fetch bound is pinnable**.
+///
+/// Inline, `--limit` was one deletable word whose removal restored the
+/// 30-newest truncation bug with every test still green — the same
+/// silent-restore shape the completeness plumbing exists to prevent, sitting
+/// one layer below it. `the_issue_list_argv_always_carries_the_fetch_bound`
+/// fails the moment the flag or its value goes missing.
+///
+/// Returns owned strings because the limit is formatted from
+/// [`MAX_INTAKE_ISSUES`]; the caller borrows them for `gh_capture`.
+pub fn issue_list_argv() -> Vec<String> {
+    ["issue", "list", "--state", "open", "--limit", &MAX_INTAKE_ISSUES.to_string(), "--json", "number,title,labels"]
+        .into_iter()
+        .map(String::from)
+        .collect()
+}
+
 /// One open issue that is eligible to start under full autonomy and that no
 /// board task is tracking yet — the host-side, zero-token half of the
 /// self-select loop. Carries only what the wake summary names; **what the
@@ -1038,6 +1056,33 @@ mod tests {
     }
 
     // ---------- completeness: the fetch bound must not look like a closure ----------
+
+    /// **The bound must actually be requested.** Everything else in this file
+    /// reasons about a fetch that asked for [`MAX_INTAKE_ISSUES`] issues; if
+    /// the flag is not on the command line, `gh` quietly returns its own 30
+    /// and every one of those tests still passes, because they all operate on
+    /// a listing handed to them rather than on the one the poller fetched.
+    /// This is the only assertion standing between that and a silent
+    /// regression.
+    #[test]
+    fn the_issue_list_argv_always_carries_the_fetch_bound() {
+        let argv = issue_list_argv();
+        let at = argv.iter().position(|a| a == "--limit").unwrap_or_else(|| {
+            panic!("the issue listing must request a bound — without --limit gh returns its own 30: {argv:?}")
+        });
+        assert_eq!(
+            argv.get(at + 1),
+            Some(&MAX_INTAKE_ISSUES.to_string()),
+            "--limit must carry the bound the rest of this module reasons about: {argv:?}"
+        );
+        // Independent of the constant's value, so this is not the pin checking
+        // itself: a bound at or under gh's own default would buy nothing.
+        assert!(MAX_INTAKE_ISSUES > 30, "the bound must beat gh's 30-issue default to be worth requesting");
+        // The rest of the call shape, so a rewrite of this argv can't quietly
+        // change what is fetched either.
+        assert_eq!(&argv[..4], &["issue", "list", "--state", "open"], "got: {argv:?}");
+        assert!(argv.contains(&"number,title,labels".to_string()), "the fields both diffs read: {argv:?}");
+    }
 
     /// The boundary rule, stated directly: `gh` reports no total, so "exactly
     /// the bound came back" is indistinguishable from "the first N of many"

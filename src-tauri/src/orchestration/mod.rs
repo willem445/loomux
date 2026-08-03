@@ -26248,16 +26248,16 @@ impl OrchRegistry {
         let due = intake::due_intake_polls(now, &minutes, &last_poll);
         for group in due {
             let Some(repo) = repos.get(&group) else { continue };
-            // `--limit` is not optional: `gh issue list` defaults to the 30
-            // NEWEST open issues, which silently hid most of a mid-sized
-            // repo's backlog from both diffs below (measured on loomux itself:
-            // 30 of 94). See `intake::MAX_INTAKE_ISSUES` for why 300 and why
-            // the bound is reported rather than silently applied.
-            let issue_limit = intake::MAX_INTAKE_ISSUES.to_string();
-            let issues_raw = self.gh_capture(
-                repo,
-                &["issue", "list", "--state", "open", "--limit", &issue_limit, "--json", "number,title,labels"],
-            );
+            // The argv is built by `intake::issue_list_argv` rather than
+            // spelled inline so its `--limit` is pinned by a test: `gh issue
+            // list` defaults to the 30 NEWEST open issues, which silently hid
+            // most of a mid-sized repo's backlog from both diffs below
+            // (measured on loomux itself: 30 of 94). See
+            // `intake::MAX_INTAKE_ISSUES` for why 300, and why hitting the
+            // bound is reported rather than silently applied.
+            let issue_argv = intake::issue_list_argv();
+            let issue_args: Vec<&str> = issue_argv.iter().map(String::as_str).collect();
+            let issues_raw = self.gh_capture(repo, &issue_args);
             let prs_raw =
                 self.gh_capture(repo, &["pr", "list", "--state", "open", "--json", "number,title,statusCheckRollup"]);
             self.intake_last_poll_ms.lock_safe().insert(group.clone(), now);
