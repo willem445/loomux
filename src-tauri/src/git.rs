@@ -284,6 +284,7 @@ fn git_diff_sync(
         "worktree" => run_git(
             &repo,
             &[
+                "--no-optional-locks",
                 "-c",
                 "core.quotepath=false",
                 "diff",
@@ -294,6 +295,7 @@ fn git_diff_sync(
         "staged" => run_git(
             &repo,
             &[
+                "--no-optional-locks",
                 "-c",
                 "core.quotepath=false",
                 "diff",
@@ -1051,11 +1053,6 @@ fn git_worktree_list_sync(repo: String) -> Result<String, String> {
 
 #[tauri::command]
 pub async fn git_worktree_list(repo: String) -> Result<String, String> {
-    run_blocking(move || git_worktree_list_sync(repo)).await
-}
-
-#[tauri::command]
-pub async fn git_mutation_probe(repo: String) -> Result<String, String> {
     run_blocking(move || git_worktree_list_sync(repo)).await
 }
 
