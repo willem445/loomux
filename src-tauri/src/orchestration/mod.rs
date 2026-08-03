@@ -22810,7 +22810,19 @@ impl OrchRegistry {
         if !Path::new(repo).is_dir() {
             return Err(format!("no such directory: {repo}"));
         }
-        let (program, timeout) = self.gh_program()?;
+        let (program, timeout) = match self.gh_exec_override.lock_safe().clone() {
+            Some(exec) => exec,
+            None => {
+                let Some(program) = crate::winpath::resolve_program(
+                    "gh",
+                    &crate::winpath::launch_path(),
+                    &crate::winpath::launch_pathext(),
+                ) else {
+                    return Err("gh-not-found".to_string());
+                };
+                (program, GH_CAPTURE_TIMEOUT)
+            }
+        };
         let mut cmd = std::process::Command::new(program);
         cmd.current_dir(repo)
             .args(args)
@@ -22823,27 +22835,6 @@ impl OrchRegistry {
             cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
         }
         Self::capture_with_timeout(cmd, timeout)
-    }
-
-    /// Which program a `gh` read runs, and on what deadline: the resolved `gh`
-    /// on `GH_CAPTURE_TIMEOUT`, or whatever `gh_exec_override` names. `Err`
-    /// when `gh` isn't installed — a fact the callers surface rather than
-    /// treating as "nothing to report".
-    ///
-    /// Split out from `gh_capture` so the override cannot be honoured on one
-    /// spawn path and forgotten on another: there is one answer to "what do we
-    /// run, and for how long", and every `gh` read in the backend asks it here.
-    fn gh_program(&self) -> Result<(PathBuf, Duration), String> {
-        if let Some(exec) = self.gh_exec_override.lock_safe().clone() {
-            return Ok(exec);
-        }
-        crate::winpath::resolve_program(
-            "gh",
-            &crate::winpath::launch_path(),
-            &crate::winpath::launch_pathext(),
-        )
-        .map(|program| (program, GH_CAPTURE_TIMEOUT))
-        .ok_or_else(|| "gh-not-found".to_string())
     }
 
     /// Test seam: see `gh_exec_override`. `None` restores the real `gh` on the
@@ -30117,23 +30108,11 @@ impl OrchRegistry {
         if let Some(sha) = self.pr_head_override.lock_safe().clone() {
             return Ok(sha);
         }
-        let (program, _timeout) = self.gh_program()?;
-        if !Path::new(repo).is_dir() {
-            return Err(format!("no such directory: {repo}"));
-        }
-        let mut cmd = std::process::Command::new(program);
-        cmd.current_dir(repo)
-            .args(["pr", "view", &pr.to_string(), "--json", "headRefOid", "--jq", ".headRefOid"]);
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW — never flash a console
-        }
-        let out = cmd.output().map_err(|e| e.to_string())?;
-        if !out.status.success() {
-            return Err(format!("gh exited with {}", out.status));
-        }
-        let sha = workflow::sanitize_sha(&String::from_utf8_lossy(&out.stdout));
+        let out = self.gh_capture(
+            repo,
+            &["pr", "view", &pr.to_string(), "--json", "headRefOid", "--jq", ".headRefOid"],
+        )?;
+        let sha = workflow::sanitize_sha(&out);
         if sha.is_empty() {
             return Err(format!("gh pr view #{pr}: no head oid in the response"));
         }
@@ -30163,23 +30142,7 @@ impl OrchRegistry {
         if let Some(body) = self.pr_body_override.lock_safe().clone() {
             return Ok(body);
         }
-        let (program, _timeout) = self.gh_program()?;
-        if !Path::new(repo).is_dir() {
-            return Err(format!("no such directory: {repo}"));
-        }
-        let mut cmd = std::process::Command::new(program);
-        cmd.current_dir(repo)
-            .args(["pr", "view", &pr.to_string(), "--json", "body", "--jq", ".body"]);
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW — never flash a console
-        }
-        let out = cmd.output().map_err(|e| e.to_string())?;
-        if !out.status.success() {
-            return Err(format!("gh exited with {}", out.status));
-        }
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        self.gh_capture(repo, &["pr", "view", &pr.to_string(), "--json", "body", "--jq", ".body"])
     }
 
     /// The digest of the PR's body as it stands now — what a recorded verdict's
