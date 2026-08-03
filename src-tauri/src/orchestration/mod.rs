@@ -9157,6 +9157,45 @@ pub struct OrchRegistry {
     /// from), and `resume_group` does far more than marker IO, so bringing it
     /// under one lock is its own argument, not this change's.
     marker_io: Mutex<()>,
+    /// Serializes a live **guardrail** edit — the `group.json` read-modify-write
+    /// and the in-memory publish that follows it — as one unit (#762, F2 of
+    /// #743). `set_max_agents`, `set_advanced_orchestrator`, and every
+    /// `persist_guardrail_*` setter (budget, idle tick, activity floor, the four
+    /// compact-nudge knobs).
+    ///
+    /// **What it is protecting, precisely.** Each of those setters is a
+    /// read-modify-write of ONE file: read `group.json`, patch one key, write
+    /// the whole document back. Two of them running at once on the same group
+    /// both read the pre-state, and the second write silently drops the first
+    /// one's key — the classic lost update, on the file that carries the
+    /// group's identity and its consent-bearing guardrails. Serializing the
+    /// publish too (not just the write) is what keeps disk and memory from
+    /// settling in opposite orders: without it, A-persists, B-persists,
+    /// B-publishes, A-publishes leaves the file saying 5 and the enforcement
+    /// path reading 3, and nothing re-reads the file until the next restart.
+    ///
+    /// **Why this is a new lock and not a pre-existing one.** It is [`Self::
+    /// marker_io`]'s argument applied to the other durable per-group store, and
+    /// it exists for the same reason: until #762 every one of these setters was
+    /// a *sync* `#[tauri::command]`, so the single webview thread serialized
+    /// them for free and the interleave could not occur. That was a fact about
+    /// the callers, not about the code — and #762 is exactly the change that
+    /// invalidates it. `atomic_write`'s own doc already states the shipped
+    /// position that `group.json` has concurrent writers and must therefore
+    /// never share a temp name; this is the other half of that, for the
+    /// read-modify-write the unique temp name cannot make atomic.
+    ///
+    /// Lock order: taken FIRST and outermost — the `groups` lock and
+    /// `AUDIT_LOCK` may be taken under it, never the reverse — and released
+    /// before any pane delivery or merge-gate sync, so nothing waits on it
+    /// across a write into a pty. One lock for the family rather than one per
+    /// group: these fire on a human's click.
+    ///
+    /// **Not** taken by `create_group`'s first write of `group.json` (under
+    /// `creation`, §4 X6) or by the marker toggles: a group being created has
+    /// no guardrail UI to race, and a marker file is a different store with its
+    /// own ordering lock.
+    group_file_io: Mutex<()>,
     /// Test seam (#222): when set, `pr_head` returns this instead of shelling out
     /// to `gh pr view --json headRefOid`. The verdict↔revision binding has to be
     /// exercised through the real MCP dispatch against a repo that isn't on GitHub;
@@ -19408,6 +19447,7 @@ impl OrchRegistry {
             default_branch_memo: Mutex::new(HashMap::new()),
             creation: Mutex::new(()),
             marker_io: Mutex::new(()),
+            group_file_io: Mutex::new(()),
             pr_head_override: Mutex::new(None),
             pr_body_override: Mutex::new(None),
             paused: Mutex::new(HashSet::new()),
@@ -24195,7 +24235,27 @@ impl OrchRegistry {
             killed_by: None,
         };
         self.agents.lock_safe().insert(agent_id.clone(), entry);
-        self.by_pty.lock_safe().insert(pty_id, agent_id.clone());
+        // Claim the pty as ONE decision, and let the loser of a race roll its
+        // own entry back. The `by_pty` read at the top of this function makes
+        // the ordinary re-adopt cheap; it does not make the mint idempotent,
+        // because check-then-insert is two lock acquisitions with a mint
+        // between them. What used to close that window was the webview thread
+        // — a second Connect gesture could not be *inside* the first call —
+        // and #762 takes that away, so the vacant-entry insert becomes the
+        // whole decision: exactly one adopt of a pty wins, and the loser
+        // returns the winner's id instead of leaving a second delivery-only
+        // identity for one pane in the roster.
+        let winner = match self.by_pty.lock_safe().entry(pty_id) {
+            std::collections::hash_map::Entry::Occupied(e) => e.get().clone(),
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert(agent_id.clone());
+                agent_id.clone()
+            }
+        };
+        if winner != agent_id {
+            self.agents.lock_safe().remove(&agent_id);
+            return Ok(json!({ "agent_id": winner }));
+        }
         self.audit(SOLO_GROUP, "human", "solo-adopt", json!({ "agent": agent_id, "pty_id": pty_id }));
         Ok(json!({ "agent_id": agent_id }))
     }
@@ -26720,6 +26780,7 @@ impl OrchRegistry {
     /// raising the budget after a suspension lets the human resume without losing
     /// the already-counted spend. Returns the applied value.
     pub fn set_autonomy_budget(&self, group: &str, tokens: u64) -> Result<u64, String> {
+        let _io = self.group_file_io.lock_safe();
         let old = self
             .group(group)
             .ok_or("unknown group")?
@@ -26749,6 +26810,7 @@ impl OrchRegistry {
     /// loop reads it fresh each pass) and persisted, then audited. Returns the
     /// applied (clamped) value — lets the human drop it to 1–2 min to verify.
     pub fn set_idle_tick_minutes(&self, group: &str, minutes: u32) -> Result<u32, String> {
+        let _io = self.group_file_io.lock_safe();
         let applied = if minutes == 0 {
             DEFAULT_IDLE_TICK_MINUTES
         } else {
@@ -26787,6 +26849,7 @@ impl OrchRegistry {
     /// applied (clamped) value — raise it if a chatty CLI's idle repaints starve the
     /// tick, lower it if real small outputs read as idle.
     pub fn set_idle_activity_floor(&self, group: &str, bytes: u64) -> Result<u64, String> {
+        let _io = self.group_file_io.lock_safe();
         let applied = if bytes == 0 {
             DEFAULT_IDLE_ACTIVITY_FLOOR_BYTES
         } else {
@@ -26846,13 +26909,18 @@ impl OrchRegistry {
                 obj.insert("guardrails".into(), json!({ key: value }));
             }
         }
+        // Crash-safe write, exactly as `persist_max_agents` and
+        // `persist_advanced_orchestrator` do it — this was the one `group.json`
+        // writer still hand-rolling a temp-and-rename against a FIXED sibling
+        // name (`group.json.tmp`) and without an fsync. Both mattered once
+        // these setters left the webview thread (#762): a shared temp name is
+        // what `atomic_write`'s own doc says concurrent writers to this file
+        // must not have, and the missing fsync is #133's disk-full hole. The
+        // read-modify-write above is serialized by `group_file_io`; this makes
+        // the write half match the rest of the family rather than differ from
+        // it for no reason anybody could state.
         let body = serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?;
-        let tmp = dir.join("group.json.tmp");
-        fs::write(&tmp, &body).map_err(|e| e.to_string())?;
-        if fs::rename(&tmp, &path).is_err() {
-            fs::write(&path, &body).map_err(|e| e.to_string())?;
-            let _ = fs::remove_file(&tmp);
-        }
+        atomic_write(&path, body.as_bytes()).map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -26864,6 +26932,7 @@ impl OrchRegistry {
     /// (the compact-nudge loop reads it fresh each pass) and persisted, then
     /// audited. Returns the applied (clamped) value.
     pub fn set_compact_nudge_minutes(&self, group: &str, minutes: u32) -> Result<u32, String> {
+        let _io = self.group_file_io.lock_safe();
         let applied = minutes.min(MAX_COMPACT_NUDGE_MINUTES);
         let old = self
             .group(group)
@@ -26891,6 +26960,7 @@ impl OrchRegistry {
     /// `["orchestrator"]` if empty) since a live setter bypasses `clamped()`.
     /// Persisted + audited. Returns the applied set.
     pub fn set_compact_nudge_roles(&self, group: &str, roles: Vec<String>) -> Result<Vec<String>, String> {
+        let _io = self.group_file_io.lock_safe();
         let applied = canonicalize_compact_nudge_roles(roles);
         let old = self
             .group(group)
@@ -26919,6 +26989,7 @@ impl OrchRegistry {
     /// shape as `compact_nudge_minutes`. Written to the in-memory guardrail
     /// and persisted, then audited. Returns the applied (clamped) value.
     pub fn set_compact_context_threshold(&self, group: &str, percent: u32) -> Result<u32, String> {
+        let _io = self.group_file_io.lock_safe();
         let applied = percent.min(MAX_COMPACT_CONTEXT_THRESHOLD_PERCENT);
         let old = self
             .group(group)
@@ -26950,6 +27021,7 @@ impl OrchRegistry {
     /// (clamped) value. Never gates `request_compact` itself — see
     /// `compact_nudge_context_floor_met`'s doc.
     pub fn set_compact_nudge_min_context_percent(&self, group: &str, percent: u32) -> Result<u32, String> {
+        let _io = self.group_file_io.lock_safe();
         let applied = percent.min(100);
         let old = self
             .group(group)
@@ -27218,6 +27290,7 @@ impl OrchRegistry {
         if !(1..=MAX_AGENTS_CEILING).contains(&n) {
             return Err(format!("max agents must be between 1 and {MAX_AGENTS_CEILING}"));
         }
+        let _io = self.group_file_io.lock_safe();
         let info = self.group(group).ok_or("unknown group")?;
         let old = info.guardrails.max_agents;
         if n == old {
@@ -27370,8 +27443,15 @@ impl OrchRegistry {
     /// `orch_workflow_status` reads, so the toggle's own confirm and a later
     /// status poll can never disagree.
     pub fn set_advanced_orchestrator(&self, group: &str, on: bool, actor: &str) -> Result<Value, String> {
+        // `group_file_io` covers the whole decide-persist-publish window (its
+        // doc has the argument), so the flag this reads is the flag the write
+        // below patches. Released before `workflow_status` on either exit:
+        // that call can resolve a default branch through `git`, and no other
+        // group's guardrail write should wait behind a subprocess.
+        let _io = self.group_file_io.lock_safe();
         let info = self.group(group).ok_or("unknown group")?;
         if on == info.guardrails.advanced_orchestrator {
+            drop(_io);
             return Ok(self.workflow_status(group));
         }
 
@@ -27441,6 +27521,10 @@ impl OrchRegistry {
         if let Some(detail) = loaded_audit {
             self.audit(group, "loomux", "workflow-loaded", detail);
         }
+        // The guardrail edit is published; everything below is gate state and
+        // notification, which must not run under the file lock (the delivery
+        // types into a pane and can block).
+        drop(_io);
 
         // Arm/clear the merge gate through the SAME path a fresh launch runs
         // (`sync_merge_gate`): `Some` writes the spec file the shim reads,
@@ -37297,9 +37381,21 @@ pub fn start_attention(reg: Arc<OrchRegistry>) {
 
 // ---------- tauri commands ----------
 
-/// Run a POLLED orchestration command's whole body off the webview main thread
-/// (#743 S4c — the shape #399 gave `git.rs`, #724 gave `gh.rs`, and #719 gave
+/// Run an orchestration command's whole body off the webview main thread
+/// (#743 S4c for the polled reads, #762 for the mutation and lifecycle
+/// commands — the shape #399 gave `git.rs`, #724 gave `gh.rs`, and #719 gave
 /// `write_pty`).
+///
+/// **Every conversion here owes a reentrancy argument, in code, at the
+/// command.** The synchronous dispatch this removes was an accidental mutual
+/// exclusion: one thread ran every command body, so no two could interleave and
+/// nothing had to say why that was safe. Moving them off it is therefore not a
+/// pure latency change — it is a concurrency change — and #726's finding is
+/// that the ordering a conversion gives up has to be restored deliberately
+/// where anything depended on it, never assumed away. So each command below
+/// carries a `**Reentrancy.**` paragraph naming the guard that actually makes
+/// it safe (a lock, an atomic reserve, an idempotent write) or the interleaving
+/// it accepts and why. A conversion with no such paragraph is not finished.
 ///
 /// Tauri dispatches a *synchronous* `#[tauri::command]` by calling it directly
 /// on the webview/GUI thread, and — #724's review finding — it polls an async
@@ -37712,13 +37808,26 @@ pub fn orch_notify_enabled(reg: tauri::State<Arc<OrchRegistry>>, group_id: Strin
 }
 
 /// Enable/disable desktop notifications for a group (durable, per-group).
+///
+/// Off-thread (#762 — see [`run_blocking`]): a marker file write or remove plus
+/// an audit append under the process-global audit lock.
+///
+/// **Reentrancy.** Already argued, and argued for exactly this change:
+/// [`OrchRegistry::marker_io`] orders the whole toggle while the
+/// `notify_groups` set's own insert/remove decides whether this call is the
+/// real transition, so concurrent toggles produce one marker and one audit line
+/// and cannot land their file operations in the opposite order to their set
+/// mutations (#743 S7). That lock's doc says in as many words that leaving the
+/// ordering to "both toggles are sync commands on the webview thread" is a fact
+/// about callers, invalidated by the first off-thread one. This is that caller.
 #[tauri::command]
-pub fn orch_set_notify(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_set_notify(
+    app: AppHandle,
     group_id: String,
     enabled: bool,
 ) -> Result<(), String> {
-    reg.set_notify(&group_id, enabled)
+    let reg = reg_of(&app);
+    run_blocking(move || reg.set_notify(&group_id, enabled)).await
 }
 
 /// Whether this group has opted OUT of the #260 minimize-on-spawn default
@@ -37730,26 +37839,51 @@ pub fn orch_spawn_expanded(reg: tauri::State<Arc<OrchRegistry>>, group_id: Strin
 }
 
 /// Opt a group in/out of the #260 minimize-on-spawn default (durable, per-group).
+///
+/// Off-thread (#762): the same marker write plus audit append as
+/// [`orch_set_notify`], from a strip-toggle gesture.
+///
+/// **Reentrancy.** [`OrchRegistry::set_spawn_expanded`] is `set_notify`'s shape
+/// deliberately and shares its guard — the same [`OrchRegistry::marker_io`]
+/// orders both toggles, and the `spawn_expanded_groups` set's insert/remove
+/// decides the transition — so the argument on `orch_set_notify` covers this
+/// command without restating it. One lock for the pair, not one each, is what
+/// makes that true.
 #[tauri::command]
-pub fn orch_set_spawn_expanded(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_set_spawn_expanded(
+    app: AppHandle,
     group_id: String,
     expanded: bool,
 ) -> Result<(), String> {
-    reg.set_spawn_expanded(&group_id, expanded)
+    let reg = reg_of(&app);
+    run_blocking(move || reg.set_spawn_expanded(&group_id, expanded)).await
 }
 
 /// Change a live group's max live-agent cap (durable, bounds-checked, audited).
 /// Takes effect on the next spawn; lowering it below the current live count
 /// blocks new spawns until attrition rather than killing anyone. Returns the
 /// applied value. Human action from the GroupView overlay.
+///
+/// Off-thread (#762): a full `group.json` read-modify-write plus an audit
+/// append — the pattern the whole guardrail family below repeats.
+///
+/// **Reentrancy.** The read of the old cap, the `group.json` patch and the
+/// in-memory publish are one unit under [`OrchRegistry::group_file_io`], added
+/// by this slice for this family: a guardrail setter is a read-modify-write of
+/// one file, so two of them interleaving drop a key (last writer wins on a
+/// document both read pre-state from) and can leave disk and memory settled in
+/// opposite orders. The stepper's own burst behaviour is unchanged — the notice
+/// is coalesced by `record_max_notice` under its own lock (#79), which never
+/// depended on dispatch — and two racing steppers still settle last-writer-wins
+/// on the value, which is what a human holding a button down is asking for.
 #[tauri::command]
-pub fn orch_set_max_agents(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_set_max_agents(
+    app: AppHandle,
     group_id: String,
     max_agents: u32,
 ) -> Result<u32, String> {
-    reg.set_max_agents(&group_id, max_agents, "human")
+    let reg = reg_of(&app);
+    run_blocking(move || reg.set_max_agents(&group_id, max_agents, "human")).await
 }
 
 /// Aggregate per-pane session cost/usage into one group summary for the UI.
@@ -37810,37 +37944,92 @@ pub async fn orch_group_usage(app: AppHandle, group_id: String) -> Value {
 //     `waiting_for_activity`). Both are null while off / no live orchestrator.
 
 /// Enable/disable autonomous idle-tick mode for a group (durable, audited).
+///
+/// Off-thread (#762): a marker write carrying the budget anchor, audit appends,
+/// and the force-disable cascade onto the dependent gates — several file
+/// operations per gesture.
+///
+/// **Reentrancy.** This one never had the exclusion to lose. The idle-tick
+/// timer thread already runs the same mutations: `run_idle_tick` →
+/// `enforce_autonomy_budgets` → `suspend_autonomous`, which drops the group
+/// from `autonomous_groups`, removes the marker, and force-disables auto-merge
+/// and auto-release — all from a background thread, all while this command was
+/// still sync on the webview thread. So [`OrchRegistry::set_autonomous`] was
+/// written for concurrent callers and shows it: the enable path *reserves* with
+/// a single `insert` and only the caller that newly inserted anchors and writes
+/// the marker (a duplicate enable can never double-anchor), and the disable
+/// path removes the marker FIRST and fails the call if disk refuses, so a
+/// racing pair can never leave memory OFF with a consent marker still on disk.
 #[tauri::command]
-pub fn orch_set_autonomous(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_set_autonomous(
+    app: AppHandle,
     group_id: String,
     enabled: bool,
 ) -> Result<(), String> {
-    reg.set_autonomous(&group_id, enabled)
+    let reg = reg_of(&app);
+    run_blocking(move || reg.set_autonomous(&group_id, enabled)).await
 }
 
 /// Enable/disable the auto-merge gate for a group (durable, audited). Default OFF
 /// = human merges; ON lets the orchestrator merge adequately-tested PRs itself.
+///
+/// Off-thread (#762): marker write, audit append, and a delivery into the
+/// orchestrator's pane.
+///
+/// **Reentrancy.** Same standing race as [`orch_set_autonomous`], through the
+/// same background path: `suspend_autonomous` calls `force_disable_auto_merge`
+/// from the idle-tick thread, so the gate set has always had a second writer.
+/// [`OrchRegistry::set_auto_merge`] mirrors the autonomous shape for it —
+/// atomic reserve on enable, disk-first fail-loud on disable — so the gate can
+/// never end up ON in memory with no marker, nor OFF with one.
+///
+/// **The residual, stated rather than glossed** (#788). The autonomous-mode
+/// precondition is a check-then-set: an autonomous-off landing between this
+/// call's `is_autonomous` check and its reserve force-disables a gate that is
+/// not in the set yet, and the reserve then lands behind it — leaving
+/// auto-merge on with autonomous off. That window is **not created here**; it
+/// is already open between the idle-tick thread's `suspend_autonomous` and a
+/// human enable, and has been since #83. What this conversion adds is a second
+/// way in (two near-simultaneous human toggles, which the webview thread used
+/// to order for free). It is bounded on both ends: `auto_merge` is an
+/// instruction rendered into the orchestrator's config, not the merge
+/// enforcement itself (a default-branch merge still needs a grant), and
+/// `create_group`'s re-seed reconciles the pair on the next restart, clearing a
+/// stale marker and auditing it. Closing it properly means one lock over the
+/// gate family whose scope excludes the pane delivery each toggle ends with —
+/// that is #788's job, not a paragraph's.
 #[tauri::command]
-pub fn orch_set_auto_merge(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_set_auto_merge(
+    app: AppHandle,
     group_id: String,
     enabled: bool,
 ) -> Result<(), String> {
-    reg.set_auto_merge(&group_id, enabled)
+    let reg = reg_of(&app);
+    run_blocking(move || reg.set_auto_merge(&group_id, enabled)).await
 }
 
 /// Enable/disable the auto-release gate for a group (durable, audited, independent
 /// of auto-merge). Default OFF = releases/tags need a per-tag human grant; ON lets
 /// the orchestrator publish releases itself while autonomous. Rejects enable unless
 /// autonomous is on.
+///
+/// Off-thread (#762): the same marker write, audit and delivery as
+/// [`orch_set_auto_merge`], from the same settings surface.
+///
+/// **Reentrancy.** [`OrchRegistry::set_auto_release`] mirrors
+/// [`OrchRegistry::set_auto_merge`] exactly against an independent marker, so
+/// the argument on [`orch_set_auto_merge`] applies verbatim — including its
+/// residual: the autonomous-mode precondition is the same check-then-set, with
+/// the same standing racer (`suspend_autonomous` on the idle-tick thread), the
+/// same restart reconcile, and the same owner in #788.
 #[tauri::command]
-pub fn orch_set_auto_release(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_set_auto_release(
+    app: AppHandle,
     group_id: String,
     enabled: bool,
 ) -> Result<(), String> {
-    reg.set_auto_release(&group_id, enabled)
+    let reg = reg_of(&app);
+    run_blocking(move || reg.set_auto_release(&group_id, enabled)).await
 }
 
 /// Enable/disable supervised dangerous mode for a group (#83, durable, audited).
@@ -37848,95 +38037,198 @@ pub fn orch_set_auto_release(
 /// to the default branch and publish releases/tags itself, WITHOUT autonomous mode.
 /// Mutually exclusive with autonomous: rejects enable while autonomous is on, and
 /// enabling autonomous force-clears it.
+///
+/// Off-thread (#762): marker write, audit append and delivery. A deliberately
+/// rare gesture, which is why it ranks below the polled set rather than being
+/// harmless.
+///
+/// **Reentrancy.** Same shape as the two gates above — atomic reserve on
+/// enable, disk-first fail-loud on disable — and the same standing second
+/// writer: `set_autonomous_as` force-clears dangerous mode from whichever
+/// thread enables autonomous, which since #762 may be a pool thread and was
+/// already the idle-tick thread by way of the suspension path. The mutual
+/// exclusion with autonomous is the same check-then-set as the gates' and has
+/// the same owner (#788): an autonomous-on landing between this call's check
+/// and its reserve clears nothing and leaves both modes set. What that grants
+/// is the union of two authorities the human enabled with two clicks, not a
+/// third one neither click asked for — and `create_group`'s re-seed reconciles
+/// the pair on the next restart, exactly as it does for the gates.
 #[tauri::command]
-pub fn orch_set_dangerous_mode(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_set_dangerous_mode(
+    app: AppHandle,
     group_id: String,
     enabled: bool,
 ) -> Result<(), String> {
-    reg.set_dangerous_mode(&group_id, enabled)
+    let reg = reg_of(&app);
+    run_blocking(move || reg.set_dangerous_mode(&group_id, enabled)).await
 }
+
+// ---------- the persisted guardrail knobs ----------
+//
+// Seven commands, one shape: read the current value, patch that one key in
+// `group.json`, publish the new value into the in-memory guardrails the running
+// loops read, audit. All off-thread as of #762.
+//
+// **Their reentrancy argument is one argument, made once here and cited by
+// each.** A read-modify-write of a shared document is the textbook lost update:
+// two of these running at once on the same group both read the pre-state, and
+// the second write drops the first one's key — on the file that carries the
+// group's consent-bearing guardrails. The webview thread used to make that
+// impossible for free. [`OrchRegistry::group_file_io`] now makes it impossible
+// on purpose, holding the read, the patch and the in-memory publish as one unit
+// (so disk and memory cannot settle in opposite orders either), and its own doc
+// carries the full argument including the lock order. Each command below states
+// only what is specific to it.
 
 /// Set a group's autonomous-era token budget (0 = no cap; durable, audited).
 /// Returns the applied value.
+///
+/// Off-thread (#762): a `group.json` read-modify-write plus an audit append.
+///
+/// **Reentrancy.** The family argument above, under
+/// [`OrchRegistry::group_file_io`]. Specific to this knob: it deliberately does
+/// NOT move the enable-time anchor, so a budget raise racing the idle-tick
+/// thread's `enforce_autonomy_budgets` cannot change what that pass has already
+/// counted — the worst interleaving is a suspension that the new budget would
+/// have avoided, which the human resolves by re-enabling, and which was already
+/// possible before this conversion.
 #[tauri::command]
-pub fn orch_set_autonomy_budget(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_set_autonomy_budget(
+    app: AppHandle,
     group_id: String,
     tokens: u64,
 ) -> Result<u64, String> {
-    reg.set_autonomy_budget(&group_id, tokens)
+    let reg = reg_of(&app);
+    run_blocking(move || reg.set_autonomy_budget(&group_id, tokens)).await
 }
 
 /// Set a group's idle-tick quiet window in minutes (0 → default; floored at 1,
 /// clamped to the max; durable, audited). Returns the applied value. Lets the
 /// human drop it to 1–2 min to verify autonomous mode fires quickly.
+///
+/// Off-thread (#762): a `group.json` read-modify-write plus an audit append.
+///
+/// **Reentrancy.** The family argument above, under
+/// [`OrchRegistry::group_file_io`]. Specific to this knob: the idle-tick loop
+/// reads the in-memory value fresh each pass and never caches it, so a tick
+/// that overlaps this write uses either the old cadence or the new one — both
+/// are cadences the human chose, and neither is a torn value, because the
+/// publish happens under the same guard as the write it followed.
 #[tauri::command]
-pub fn orch_set_idle_tick_minutes(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_set_idle_tick_minutes(
+    app: AppHandle,
     group_id: String,
     minutes: u32,
 ) -> Result<u32, String> {
-    reg.set_idle_tick_minutes(&group_id, minutes)
+    let reg = reg_of(&app);
+    run_blocking(move || reg.set_idle_tick_minutes(&group_id, minutes)).await
 }
 
 /// Set a group's idle-tick activity floor in bytes (0 → default; floored at 1,
 /// clamped to 1 MiB; durable, audited). Returns the applied value. The runtime
 /// remedy if a chatty CLI's idle repaints exceed the default and starve the tick.
+///
+/// Off-thread (#762): a `group.json` read-modify-write plus an audit append.
+///
+/// **Reentrancy.** The family argument above, under
+/// [`OrchRegistry::group_file_io`]. Specific to this knob: like the tick
+/// cadence beside it, the floor is re-read by the idle-tick and compact-nudge
+/// passes every time rather than latched, so an overlapping pass sees one whole
+/// value or the other and no pass can straddle the change.
 #[tauri::command]
-pub fn orch_set_idle_activity_floor(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_set_idle_activity_floor(
+    app: AppHandle,
     group_id: String,
     bytes: u64,
 ) -> Result<u64, String> {
-    reg.set_idle_activity_floor(&group_id, bytes)
+    let reg = reg_of(&app);
+    run_blocking(move || reg.set_idle_activity_floor(&group_id, bytes)).await
 }
 
 /// Set a group's compact-nudge quiet window in minutes (#287; 0 = off,
 /// clamped to the max; durable, audited). Returns the applied value.
+///
+/// Off-thread (#762): a `group.json` read-modify-write plus an audit append.
+///
+/// **Reentrancy.** The family argument above, under
+/// [`OrchRegistry::group_file_io`]. Specific to this knob: `0` is the feature's
+/// off switch rather than a "use the default" sentinel, so the write that turns
+/// the nudge off is the same single-key patch as any other value — there is no
+/// second store to keep in step with it, and nothing to reconcile if a
+/// compact-nudge pass overlaps.
 #[tauri::command]
-pub fn orch_set_compact_nudge_minutes(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_set_compact_nudge_minutes(
+    app: AppHandle,
     group_id: String,
     minutes: u32,
 ) -> Result<u32, String> {
-    reg.set_compact_nudge_minutes(&group_id, minutes)
+    let reg = reg_of(&app);
+    run_blocking(move || reg.set_compact_nudge_minutes(&group_id, minutes)).await
 }
 
 /// Set a group's compact-nudge eligible roles (#287; unrecognized names
 /// dropped, empty falls back to `["orchestrator"]`; durable, audited).
 /// Returns the applied set.
+///
+/// Off-thread (#762): a `group.json` read-modify-write plus an audit append.
+///
+/// **Reentrancy.** The family argument above, under
+/// [`OrchRegistry::group_file_io`]. Specific to this knob: the value is a whole
+/// canonicalized *set*, replaced outright rather than added to, so two writers
+/// cannot merge into a roster neither of them chose — the loser's set is
+/// overwritten entire, which is the same last-writer-wins the control's own
+/// semantics already give (a checkbox group submits its whole state).
 #[tauri::command]
-pub fn orch_set_compact_nudge_roles(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_set_compact_nudge_roles(
+    app: AppHandle,
     group_id: String,
     roles: Vec<String>,
 ) -> Result<Vec<String>, String> {
-    reg.set_compact_nudge_roles(&group_id, roles)
+    let reg = reg_of(&app);
+    run_blocking(move || reg.set_compact_nudge_roles(&group_id, roles)).await
 }
 
 /// Set a group's compact-nudge context-usage escalation threshold (#328; `0`
 /// = off, clamped to 100; durable, audited). Returns the applied value.
+///
+/// Off-thread (#762): a `group.json` read-modify-write plus an audit append.
+///
+/// **Reentrancy.** The family argument above, under
+/// [`OrchRegistry::group_file_io`]. Specific to this knob: it is read only by
+/// the compact-nudge escalation decision, which takes no lock and holds no
+/// snapshot across passes, so an overlapping pass reads one whole percentage or
+/// the other.
 #[tauri::command]
-pub fn orch_set_compact_context_threshold(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_set_compact_context_threshold(
+    app: AppHandle,
     group_id: String,
     percent: u32,
 ) -> Result<u32, String> {
-    reg.set_compact_context_threshold(&group_id, percent)
+    let reg = reg_of(&app);
+    run_blocking(move || reg.set_compact_context_threshold(&group_id, percent)).await
 }
 
 /// Set a group's compact-nudge min-context floor (benchtest finding; `0` =
 /// off — the heuristic lull-timer fires on the lull alone, today's behavior;
 /// clamped to 100; durable, audited). Never gates an agent's own
 /// `request_compact`. Returns the applied value.
+///
+/// Off-thread (#762): a `group.json` read-modify-write plus an audit append.
+///
+/// **Reentrancy.** The family argument above, under
+/// [`OrchRegistry::group_file_io`]. Specific to this knob: it is the one
+/// tri-state in the family, and this setter only ever writes `Some` — it can
+/// never restore the unset/smart-default arm — so no interleaving of two writes
+/// can produce a value the tri-state does not already admit, and the guard is
+/// what stops one of them being dropped on the way to disk.
 #[tauri::command]
-pub fn orch_set_compact_nudge_min_context_percent(
-    reg: tauri::State<Arc<OrchRegistry>>,
+pub async fn orch_set_compact_nudge_min_context_percent(
+    app: AppHandle,
     group_id: String,
     percent: u32,
 ) -> Result<u32, String> {
-    reg.set_compact_nudge_min_context_percent(&group_id, percent)
+    let reg = reg_of(&app);
+    run_blocking(move || reg.set_compact_nudge_min_context_percent(&group_id, percent)).await
 }
 
 /// The group's autonomous-mode state for the panel: toggles, budget, anchor, and
