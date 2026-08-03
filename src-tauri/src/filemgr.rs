@@ -382,6 +382,11 @@ pub fn delete(root: &str, rel: &str) -> Result<bool, String> {
 /// worker inherits nothing. So the worker must enter its **own** apartment, and leave it
 /// again, exactly once. That is what this guard is.
 ///
+/// #746 generalized it: `open_os` and `open_with_os` call `ShellExecuteW`, whose own
+/// documented remarks make the same request for the same reason, and they left the main
+/// thread in the same conversion. Three callers, one guard — the argument is about the
+/// Shell, not about `SHFileOperationW`.
+///
 /// The three return values all mean different things and all matter:
 ///
 ///   * `S_OK`     — we initialized the apartment. We must uninitialize it.
@@ -392,13 +397,17 @@ pub fn delete(root: &str, rel: &str) -> Result<bool, String> {
 ///                  is exactly why the two are handled together below rather than by
 ///                  matching `S_OK` alone.
 ///   * `RPC_E_CHANGED_MODE` — the thread is already an MTA and refuses to become an STA.
-///                  Our call took **no** reference, so we must **not** release one. (We
-///                  always spawn a fresh thread, so this cannot happen in practice; it is
-///                  handled because getting it wrong would unbalance somebody else's COM.)
+///                  Our call took **no** reference, so we must **not** release one. This
+///                  stopped being hypothetical with #746: `open_os`/`open_with_os` now
+///                  enter here from the blocking pool, whose threads are REUSED across
+///                  tasks, so "a fresh thread with no apartment" is no longer something
+///                  this type may assume. It never assumed it — the arm was written
+///                  because getting it wrong would unbalance somebody else's COM — and
+///                  that is precisely why the conversion could reuse it unchanged.
 ///
-/// RAII rather than a call pair: `delete_path` has several early returns, and an early
-/// return that skips `CoUninitialize` leaks an apartment reference for the life of the
-/// thread. `Drop` cannot be skipped.
+/// RAII rather than a call pair: every caller has early returns, and one that skips
+/// `CoUninitialize` leaks an apartment reference for the life of the thread — which on a
+/// POOL thread outlives the task that leaked it. `Drop` cannot be skipped.
 #[cfg(windows)]
 struct ComApartment {
     /// Did our `CoInitializeEx` take a reference that we owe back?
@@ -552,12 +561,28 @@ pub fn open_default(root: &str, rel: &str) -> Result<(), String> {
     open_os(&path)
 }
 
+/// **The apartment (#746).** `ShellExecuteW` can delegate to COM-activated Shell
+/// extensions — verb implementations, context-menu handlers, data sources — and
+/// Microsoft's own guidance is that COM be initialized before the call, some of
+/// those extensions requiring the single-threaded apartment
+/// (learn.microsoft.com/en-us/windows/win32/api/shellapi/nf-shellapi-shellexecuteexw,
+/// "Remarks"). Until #746 that requirement was satisfied *implicitly*: this ran
+/// on the main thread, which wry `OleInitialize`s. Off it, the blocking pool's
+/// apartment state is nobody's business, so [`ComApartment`] enters an STA for
+/// the duration exactly as `delete_path` does (performance.md §4 X2's argument,
+/// applied to the sibling API rather than cited at it). RAII, so the early
+/// returns below cannot leak the reference; `RPC_E_CHANGED_MODE` (a pool thread
+/// somebody else already made an MTA) degrades to "do not uninitialize what we
+/// did not initialize" rather than failing the open — which is the pre-#746
+/// behaviour for any extension that does not insist on an STA.
 #[cfg(windows)]
 fn open_os(path: &Path) -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt;
     use windows::core::PCWSTR;
     use windows::Win32::UI::Shell::ShellExecuteW;
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    let _com = ComApartment::enter();
 
     let wide: Vec<u16> = path
         .as_os_str()
@@ -705,12 +730,20 @@ pub fn open_with(root: &str, rel: &str) -> Result<(), String> {
     open_with_os(&path)
 }
 
+/// Same apartment argument as [`open_os`], and it binds harder here: the
+/// `openas` verb IS a modal Shell dialog, so this is the call in the module
+/// most likely to reach a COM-activated handler. The dialog runs its own modal
+/// message loop on whichever thread calls — which used to be the webview
+/// thread, i.e. loomux's entire UI froze behind a chooser the user had to
+/// dismiss. It now runs on a pool thread inside its own STA.
 #[cfg(windows)]
 fn open_with_os(path: &Path) -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt;
     use windows::core::PCWSTR;
     use windows::Win32::UI::Shell::ShellExecuteW;
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    let _com = ComApartment::enter();
 
     let wide: Vec<u16> = path
         .as_os_str()
@@ -782,25 +815,49 @@ pub fn capabilities() -> Caps {
 }
 
 // ---------- commands ----------
+//
+// #746: thin async wrappers over the blocking pool (P1 of
+// `doc/design/performance.md`). Every one of these was a synchronous
+// `#[tauri::command]`, which Tauri dispatches on the webview thread — so a
+// directory enumeration nothing bounds, a `CreateDirectory`, a rename across a
+// network share, an `explorer.exe` spawn and a BLOCKING `ShellExecuteW` all ran
+// on the thread that services paint. `fm_delete_start` (§4 X2) and
+// `fm_capabilities` (in-memory) are the two that stay sync, each for its own
+// argued reason.
+//
+// **Reentrancy — the family argument, for the four filesystem gestures below.**
+// Synchronous dispatch used to order them against each other; nothing else did,
+// and nothing else needs to. Each is a SINGLE filesystem operation whose
+// atomicity was never this process's to provide: `create_dir`, `File::create`
+// and `rename` are the OS's own units, and every one of them already had to
+// tolerate the agent running in the pane doing exactly the same thing at
+// exactly the same moment — a file manager watching a live working directory
+// has no exclusive access to it and never claimed any. So two gestures racing
+// resolve to whichever the filesystem applies first, with the loser getting the
+// same typed `exists`/`not-found` error it would get from losing to the agent,
+// and `fm_list` sees the directory on one side of that change or the other.
+// What is NOT in this class is a read-then-write, which can lose an update
+// where a single syscall cannot — this module has none (that is `fileedit`'s
+// `WRITE_GATE`, and `sessions`'s launch-intent lock).
 
 #[tauri::command]
-pub fn fm_list(root: String, rel: String) -> Result<Vec<FmEntry>, String> {
-    list(&root, &rel)
+pub async fn fm_list(root: String, rel: String) -> Result<Vec<FmEntry>, String> {
+    crate::blocking::run_blocking(move || list(&root, &rel)).await
 }
 
 #[tauri::command]
-pub fn fm_new_folder(root: String, rel: String, name: String) -> Result<String, String> {
-    new_folder(&root, &rel, &name)
+pub async fn fm_new_folder(root: String, rel: String, name: String) -> Result<String, String> {
+    crate::blocking::run_blocking(move || new_folder(&root, &rel, &name)).await
 }
 
 #[tauri::command]
-pub fn fm_new_file(root: String, rel: String, name: String) -> Result<String, String> {
-    new_file(&root, &rel, &name)
+pub async fn fm_new_file(root: String, rel: String, name: String) -> Result<String, String> {
+    crate::blocking::run_blocking(move || new_file(&root, &rel, &name)).await
 }
 
 #[tauri::command]
-pub fn fm_rename(root: String, rel: String, name: String) -> Result<String, String> {
-    rename(&root, &rel, &name)
+pub async fn fm_rename(root: String, rel: String, name: String) -> Result<String, String> {
+    crate::blocking::run_blocking(move || rename(&root, &rel, &name)).await
 }
 
 /// One completed delete, streamed back as an `fm-delete` event (#216).
@@ -901,17 +958,28 @@ pub fn fm_capabilities() -> Caps {
     capabilities()
 }
 
+/// **Reentrancy.** Spawns `explorer.exe` (or `open`/`xdg-open`) and returns
+/// without waiting; it mutates nothing loomux owns and holds no lock, so two
+/// reveals are two independent child processes. The `exists` probe in front of
+/// the spawn can go stale between check and spawn — it already could, since the
+/// pane's own agent can delete the path — and the shell's own "item not found"
+/// is what the user sees then, exactly as before.
 #[tauri::command]
-pub fn fm_reveal(root: String, rel: String) -> Result<(), String> {
-    reveal(&root, &rel)
+pub async fn fm_reveal(root: String, rel: String) -> Result<(), String> {
+    crate::blocking::run_blocking(move || reveal(&root, &rel)).await
 }
 
+/// **Reentrancy.** No shared state at all: this resolves a path and hands it to
+/// the shell. The apartment question the move raises is answered in
+/// [`open_with_os`], not here — see its doc.
 #[tauri::command]
-pub fn fm_open_with(root: String, rel: String) -> Result<(), String> {
-    open_with(&root, &rel)
+pub async fn fm_open_with(root: String, rel: String) -> Result<(), String> {
+    crate::blocking::run_blocking(move || open_with(&root, &rel)).await
 }
 
+/// **Reentrancy.** Same as [`fm_open_with`]: a path resolve and a shell handoff,
+/// no lock and no mutation. See [`open_os`] for the apartment.
 #[tauri::command]
-pub fn fm_open(root: String, rel: String) -> Result<(), String> {
-    open_default(&root, &rel)
+pub async fn fm_open(root: String, rel: String) -> Result<(), String> {
+    crate::blocking::run_blocking(move || open_default(&root, &rel)).await
 }

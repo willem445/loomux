@@ -365,58 +365,6 @@ const SYNC_COMMANDS: &[Row] = &[
         issue: Some("#746"),
     },
     Row {
-        name: "fm_list",
-        class: Class::Debt,
-        reason: "Enumerates a directory and stats each entry for the file manager grid, on the \
-                 webview thread. Same unbounded-directory exposure as ft_list_dir.",
-        issue: Some("#746"),
-    },
-    Row {
-        name: "fm_new_folder",
-        class: Class::Debt,
-        reason: "Creates a directory on the webview thread. One syscall, but on a slow or remote \
-                 path it blocks input and paint for as long as the filesystem takes.",
-        issue: Some("#746"),
-    },
-    Row {
-        name: "fm_new_file",
-        class: Class::Debt,
-        reason: "Creates an empty file on the webview thread — the same one-syscall-but-blocking \
-                 shape as fm_new_folder, and converted with it.",
-        issue: Some("#746"),
-    },
-    Row {
-        name: "fm_rename",
-        class: Class::Debt,
-        reason: "Renames a path on the webview thread. Cheap locally and arbitrarily slow across \
-                 a network share, which is the case the conversion exists for.",
-        issue: Some("#746"),
-    },
-    Row {
-        name: "fm_reveal",
-        class: Class::Debt,
-        reason: "Spawns explorer.exe to reveal a path. A process spawn on the webview thread — \
-                 the INV-2 violation the debt class exists to name — and the spawn is in a helper, \
-                 so the marker check would not see it either.",
-        issue: Some("#746"),
-    },
-    Row {
-        name: "fm_open",
-        class: Class::Debt,
-        reason: "Calls the BLOCKING ShellExecuteW to open a path with its registered handler, from \
-                 a one-line body whose helper does the call. Shell handler resolution can take \
-                 seconds on a cold association, all of it on the GUI thread.",
-        issue: Some("#746"),
-    },
-    Row {
-        name: "fm_open_with",
-        class: Class::Debt,
-        reason: "The open-with dialog variant of fm_open: also a blocking ShellExecuteW in a \
-                 helper, and it can put a modal shell dialog up while the webview thread is the \
-                 one waiting on it.",
-        issue: Some("#746"),
-    },
-    Row {
         name: "load_ui_tabs",
         class: Class::Debt,
         reason: "Reads the persisted tab layout from disk on the webview thread, including the \
