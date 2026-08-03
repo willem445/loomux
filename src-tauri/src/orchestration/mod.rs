@@ -6982,6 +6982,19 @@ pub fn worktree_cleanup_targets(repo: &str, cwds: &[String]) -> Vec<String> {
 /// return the dollar amount from the lowest line that carries one — that is
 /// the freshest statusline render. Thousands separators are tolerated.
 /// Returns `None` when no `$<amount>` token is present.
+/// The statusline dollar figure for one pane, read straight off its output
+/// ring — [`OrchRegistry::compute_usage_snapshot`]'s last-resort branch,
+/// extracted so an integration test can drive the read a real pane gets
+/// (the `preenter_admission` seam; `self.app` cannot be resolved headless).
+///
+/// This is on the app's hottest poll (`orch_group_usage`, 2 s + 4 s, per
+/// agent), which is why the read is bounded rather than a whole-ring clone —
+/// see `STATUSLINE_SCAN_BYTES`.
+pub fn statusline_cost(ptys: &crate::pty::PtyManager, pty_id: u32) -> Option<f64> {
+    let raw = ptys.output_tail(pty_id)?;
+    parse_session_cost(&strip_ansi(&raw))
+}
+
 pub fn parse_session_cost(text: &str) -> Option<f64> {
     for line in text.lines().rev() {
         if let Some(cost) = line
@@ -22302,6 +22315,15 @@ impl OrchRegistry {
             return HashMap::new();
         };
         let ptys = app.state::<crate::pty::PtyManager>();
+        self.output_totals_from(&ptys)
+    }
+
+    /// [`Self::agent_output_totals`] with the pty manager passed in — same
+    /// integration-test seam, and same reason, as
+    /// [`Self::compact_signals_from`], which it runs beside on every
+    /// compact-nudge wake.
+    #[doc(hidden)] // pub for integration tests
+    pub fn output_totals_from(&self, ptys: &crate::pty::PtyManager) -> HashMap<String, u64> {
         self.agents
             .lock_safe()
             .values()
@@ -25683,6 +25705,21 @@ impl OrchRegistry {
             return HashMap::new();
         };
         let ptys = app.state::<crate::pty::PtyManager>();
+        self.compact_signals_from(&ptys)
+    }
+
+    /// [`Self::agent_compact_signals`] with the pty manager passed in — the
+    /// EXACT body the compact-nudge cadence runs, minus the `AppHandle`
+    /// lookup, so an integration test can drive it against a real
+    /// fake-child-backed `PtyManager` (the `preenter_admission` /
+    /// `flush_stranded_text` seam, and the same reason for it: nothing can
+    /// resolve `self.app` headless, so the inline version was
+    /// undeletable-by-test).
+    #[doc(hidden)] // pub for integration tests
+    pub fn compact_signals_from(
+        &self,
+        ptys: &crate::pty::PtyManager,
+    ) -> HashMap<String, (String, u64)> {
         self.agents
             .lock_safe()
             .values()
@@ -27880,11 +27917,9 @@ impl OrchRegistry {
         if let Some(app) = self.app.lock_safe().clone() {
             if let Some(pty) = entry.pty_id {
                 let ptys = app.state::<crate::pty::PtyManager>();
-                if let Some(raw) = ptys.output_tail(pty) {
-                    if let Some(c) = parse_session_cost(&strip_ansi(&raw)) {
-                        snap.source = "statusline".to_string();
-                        snap.cost_usd = Some(c); // reported by the CLI, not estimated
-                    }
+                if let Some(c) = statusline_cost(&ptys, pty) {
+                    snap.source = "statusline".to_string();
+                    snap.cost_usd = Some(c); // reported by the CLI, not estimated
                 }
             }
         }
