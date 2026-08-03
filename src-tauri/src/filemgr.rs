@@ -736,6 +736,17 @@ pub fn open_with(root: &str, rel: &str) -> Result<(), String> {
 /// message loop on whichever thread calls — which used to be the webview
 /// thread, i.e. loomux's entire UI froze behind a chooser the user had to
 /// dismiss. It now runs on a pool thread inside its own STA.
+///
+/// **ASSUMED, and it cannot be tested headlessly: that the chooser still
+/// renders and behaves from a non-GUI STA thread.** The evidence for it is that
+/// the dialog runs its OWN modal message loop and is not owned by any of
+/// loomux's windows — `hwndOwner` was already `None` here before the move, so
+/// it was never parented to the webview and never inherited its message queue.
+/// What a pool thread adds is an apartment (above) and nothing else it needs.
+/// The falsifier is specific: if "Open with…" ever stops showing a dialog, or
+/// shows one that will not take input, THIS is the assumption to break first —
+/// and the fix then is a dedicated OS thread as `fm_delete_start` uses (§4 X2),
+/// not a return to the webview thread.
 #[cfg(windows)]
 fn open_with_os(path: &Path) -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt;
