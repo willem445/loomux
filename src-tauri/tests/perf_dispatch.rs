@@ -883,13 +883,6 @@ const SYNC_COMMANDS: &[Row] = &[
         issue: Some("#743"),
     },
     Row {
-        name: "orch_grant_merge",
-        class: Class::Debt,
-        reason: "Writes the merge grant file, appends an audit entry and delivers the grant to the \
-                 agent, on the webview thread.",
-        issue: Some("#743"),
-    },
-    Row {
         name: "orch_grant_release",
         class: Class::Debt,
         reason: "The release-grant twin of orch_grant_merge: grant file, audit append and \
