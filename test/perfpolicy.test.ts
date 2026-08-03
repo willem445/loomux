@@ -48,6 +48,15 @@
 // event name that is not a literal, is not something it can name — so it
 // refuses to pass over one instead, by counting call sites and requiring the
 // count to match what it extracted.
+//
+// The one shape it cannot see at all is a **self-rescheduling `setTimeout`** —
+// a `tick()` that ends by scheduling itself is a fixed-cadence poll wearing a
+// different call, and nothing here would ask it to declare a cadence. This
+// test does not go looking for them (deciding which of `src/`'s ~30
+// `setTimeout` uses are one-shots is a reading job, not a regex), so INV-4
+// names `setInterval` on purpose and the reviewer rule is the residue: a new
+// recurring poll is written as `setInterval` and declared here, or its shape
+// is argued in the PR that introduces it.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
