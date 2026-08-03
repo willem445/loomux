@@ -134,7 +134,7 @@ Top level (`RawWorkflow`, `deny_unknown_fields`):
 | `blocks` | list of block | no (default `[]`) | at least one block, or `"no blocks declared"` |
 | `edges` | list of edge | no (default `[]`) | advisory only |
 | `gates` | map\<string, gate\> | no (default `{}`) | only the `merge` key is read by the `gh` shim today |
-| `intake` | map | no (default: built-in profile) | where autonomous work comes from and what its label vocabulary is: `source` (`github-labels` (default), `board`, `none` — `board`/`none` are schema-reserved, not yet wired) and `labels` (`ready`, `investigate`, `owned`, `prototype`; each independently overridable). It can never grant a capability, and there is no spelling of it that disables the human merge gate |
+| `intake` | map | no (default: built-in profile) | where autonomous work comes from and what its label vocabulary is: `source` (`github-labels` (default), `board`, `none` — `board`/`none` are schema-reserved, not yet wired) and `labels` (`ready`, `investigate`, `owned`, `prototype`, `hold`; each independently overridable — `hold` names the human-veto label a full-autonomy group must never start, default `agent-hold`). It can never grant a capability, and there is no spelling of it that disables the human merge gate |
 | `merge_queue` | map | no (default: disabled) | `enabled` (bool), `max_batch`, `checks_timeout_minutes`. Absent means disabled |
 
 One block (`RawBlock`, `deny_unknown_fields`):
