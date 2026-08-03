@@ -84,7 +84,13 @@ Each is shipped, tested, and citable — prefer copying one to inventing a shape
   signals in — leading edge, and the trailing run is what stops the last signal
   of a burst being the dropped one), and `refreshgate.ts`'s `CoalescingRefresh`
   (single-flight plus a trailing merge; its window is the duration of a run, so
-  it needs no constant and a slower backend coalesces harder).
+  it needs no constant and a slower backend coalesces harder). And the
+  suppression case: `pollgate.ts` (#743 S6) stops a poll's interval while the
+  window is hidden, and — because `visibilitychange` is a notification and a
+  notification can be missed — releases on a re-READ of the current visibility
+  state every `HIDDEN_RECHECK_MS` (5 s) rather than on the event that
+  suppressed it. The recheck issues no IPC, so the independent release costs
+  nothing the suppression was there to save.
 - **P5 — rAF dirty-flag on the handler side.** A batch stream sets a flag and
   schedules one `requestAnimationFrame` render instead of rendering per batch.
   Precedent: `FileExplorer.onFilesBatch` (`fileexplorer.ts`, the `ft-files`

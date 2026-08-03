@@ -14,6 +14,7 @@ import { swapEditor } from "./domutil";
 import { attentionPresentation } from "./attention";
 import { pauseGroup, resumeGroup, groupSummary, groupUsage } from "./orchestration";
 import { tabCounts } from "./tabcounts";
+import { PollGate } from "./pollgate";
 
 // Reuse the orchestration group palette (orchbadge.ts GROUP_COLORS) so a tab's
 // color vocabulary matches the group-accent colors the panes already use.
@@ -62,8 +63,15 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
   private menu: HTMLElement | null = null;
   private preview: HTMLElement | null = null;
   private previewTimer: number | null = null;
+  /** The open preview's repaint closure, held so the visibility gate can
+   *  re-arm (and catch up) the timer it owns without reopening the popup. */
+  private previewPaint: (() => void) | null = null;
   private previewWsId: string | null = null;
   private status = new Map<string, TabStatus>();
+  private statusTimer: number | null = null;
+  /** Visibility gates for this strip's two timers (#743 S6, pollgate.ts). */
+  private statusGate: PollGate;
+  private previewGate: PollGate;
   /** The tab whose close is armed for a two-step confirm (destructive close of a
    *  group-owning tab), and its auto-disarm timer. Mirrors the group view's
    *  "End orchestration" arm/confirm (groupview.ts) so ending a project's agents
@@ -89,7 +97,51 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
     tabs.onChange(() => this.render());
     // Poll bound groups for agent count / cost / paused (#63). Cheap; the
     // strip only re-renders when a value actually differs.
-    window.setInterval(() => void this.pollStatus(), 4000);
+    //
+    // Visibility-gated (#743 S6). This is the app's one app-lifetime poll —
+    // armed here and never cleared — and every tick invokes groupSummary AND
+    // groupUsage for EVERY group-bound tab, so behind a minimized window it was
+    // the largest standing IPC cost in the app while feeding a strip nobody
+    // could see. The gate stops the timer outright while the window is hidden
+    // and runs one catch-up poll when it comes back, so the strip is current by
+    // the time it is looked at instead of up to 4 s stale.
+    //
+    // What is deliberately NOT done here: per-tab cadence tiers. The plan (#743
+    // S6) left open whether background tabs should stretch or skip groupUsage,
+    // and the answer is neither — a background tab's badge IS what the strip is
+    // for, so polling only the active tab would remove the feature to save its
+    // cost, and S4 already collapsed the expensive half (groupUsage now shares
+    // one ~1 s backend snapshot across every caller). Window visibility is the
+    // axis where the work is worth nothing; tab position is not.
+    this.statusGate = new PollGate({
+      arm: () => {
+        this.statusTimer = window.setInterval(() => void this.pollStatus(), 4000);
+      },
+      disarm: () => {
+        if (this.statusTimer !== null) clearInterval(this.statusTimer);
+        this.statusTimer = null;
+      },
+      refresh: () => void this.pollStatus(),
+    });
+    this.statusGate.enable();
+
+    // The hover preview's own repaint timer (below) is gated too: it issues no
+    // IPC, but re-serializing up to eight panes every 700 ms is real webview-
+    // thread work, and a window minimized with a preview open keeps a pointer
+    // "over" the strip as far as the DOM is concerned — nothing synthesizes the
+    // mouseleave that would otherwise close it.
+    this.previewGate = new PollGate({
+      arm: () => {
+        if (this.previewPaint !== null) {
+          this.previewTimer = window.setInterval(this.previewPaint, PREVIEW_REFRESH_MS);
+        }
+      },
+      disarm: () => {
+        if (this.previewTimer !== null) clearInterval(this.previewTimer);
+        this.previewTimer = null;
+      },
+      refresh: () => this.previewPaint?.(),
+    });
 
     // Preview lifecycle (#63 — no stuck preview). These live on the
     // stable strip element (not per-tab), so a re-render never orphans them and
@@ -665,7 +717,8 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
       this.positionPreview(pop, anchorRect, cw + 16, ch + 16);
     };
     paint();
-    this.previewTimer = window.setInterval(paint, PREVIEW_REFRESH_MS);
+    this.previewPaint = paint;
+    this.previewGate.enable();
   }
 
   /** Build the preview composite: nested flex boxes mirroring the split tree,
@@ -787,10 +840,10 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
   }
 
   private closePreview(): void {
-    if (this.previewTimer !== null) {
-      clearInterval(this.previewTimer);
-      this.previewTimer = null;
-    }
+    // `disable()` clears the timer through the gate's own disarm, so the
+    // handle is cleared on every close path exactly as it was before.
+    this.previewGate.disable();
+    this.previewPaint = null;
     this.preview?.remove();
     this.preview = null;
     this.previewWsId = null;
