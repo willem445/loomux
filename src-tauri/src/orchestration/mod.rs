@@ -24276,11 +24276,27 @@ impl OrchRegistry {
             killed_by: None,
         };
         self.agents.lock_safe().insert(agent_id.clone(), entry);
-        // DELIBERATELY BACKED OUT (#762 red probe 3 of 3): the vacant-entry
-        // claim is replaced by the original blind insert, so the check at the
-        // top of this function is a check-then-insert again. Restored in the
-        // next commit.
-        self.by_pty.lock_safe().insert(pty_id, agent_id.clone());
+        // Claim the pty as ONE decision, and let the loser of a race roll its
+        // own entry back. The `by_pty` read at the top of this function makes
+        // the ordinary re-adopt cheap; it does not make the mint idempotent,
+        // because check-then-insert is two lock acquisitions with a mint
+        // between them. What used to close that window was the webview thread
+        // — a second Connect gesture could not be *inside* the first call —
+        // and #762 takes that away, so the vacant-entry insert becomes the
+        // whole decision: exactly one adopt of a pty wins, and the loser
+        // returns the winner's id instead of leaving a second delivery-only
+        // identity for one pane in the roster.
+        let winner = match self.by_pty.lock_safe().entry(pty_id) {
+            std::collections::hash_map::Entry::Occupied(e) => e.get().clone(),
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert(agent_id.clone());
+                agent_id.clone()
+            }
+        };
+        if winner != agent_id {
+            self.agents.lock_safe().remove(&agent_id);
+            return Ok(json!({ "agent_id": winner }));
+        }
         self.audit(SOLO_GROUP, "human", "solo-adopt", json!({ "agent": agent_id, "pty_id": pty_id }));
         Ok(json!({ "agent_id": agent_id }))
     }
@@ -26624,9 +26640,17 @@ impl OrchRegistry {
     /// one audited notice so the running orchestrator learns the new gate.
     pub fn set_auto_merge(&self, group: &str, on: bool) -> Result<(), String> {
         let dir = self.group_dir(group);
-        // DELIBERATELY BACKED OUT (#762 red probe 3 of 3): the `marker_io` guard
-        // is removed so the reserve and the marker write are two units again.
-        // Restored in the next commit.
+        // #762 rev-260 B1: `marker_io` makes the dependency check, the reserve and
+        // the marker write one unit — see `set_autonomous_as` for the interleave
+        // this closes and why the set lock alone cannot. Released before the
+        // notice below, which writes into a pane (§2 P6).
+        //
+        // Holding the `is_autonomous` check inside the same window also closes the
+        // HUMAN-vs-human half of #788: an autonomous-off cannot now land between
+        // this check and this reserve, because that path takes the same lock for
+        // its own marker region. #788 stays open for the idle-tick half
+        // (`suspend_autonomous`), which deliberately does not take this lock.
+        let _io = self.marker_io.lock_safe();
         if on {
             // Dependency (#83): auto-merge authority exists ONLY in autonomous mode.
             // Reject enabling it while autonomous is off so the pair can never be
@@ -26667,6 +26691,7 @@ impl OrchRegistry {
             self.auto_merge_groups.lock_safe().remove(group);
             self.audit(group, "human", "auto-merge-off", json!({}));
         }
+        drop(_io);
         // Tell the running orchestrator the gate moved (best-effort; a dead/paused
         // orchestrator just misses it and re-reads its kickoff config on resume).
         let _ = self.deliver_to_orchestrator(group, &auto_merge_notice(on), "loomux");
