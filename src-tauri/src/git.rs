@@ -330,7 +330,7 @@ fn git_diff_sync(
         ),
         "staged" => run_git(
             &repo,
-            &["-c", "core.quotepath=false", "diff", "--cached", "--", &path],
+            &["-c", "core.quotepath=false", "diff", "--", &path],
         ),
         "commit" => {
             let h = hash.ok_or("missing hash")?;
