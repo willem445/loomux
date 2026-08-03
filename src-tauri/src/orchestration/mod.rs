@@ -26258,8 +26258,15 @@ impl OrchRegistry {
             let issue_argv = intake::issue_list_argv();
             let issue_args: Vec<&str> = issue_argv.iter().map(String::as_str).collect();
             let issues_raw = self.gh_capture(repo, &issue_args);
-            let prs_raw =
-                self.gh_capture(repo, &["pr", "list", "--state", "open", "--json", "number,title,statusCheckRollup"]);
+            // Same treatment for the PR half, and for a sharper reason (#795):
+            // `gh pr list` also defaults to the 30 NEWEST, and
+            // `pr_check_deltas` prunes on absence — so past the default the
+            // window churns and a PR re-entering it re-fires a terminal check
+            // state it already reported. See `intake::MAX_INTAKE_PRS` for why
+            // 200 rather than the issue bound.
+            let pr_argv = intake::pr_list_argv();
+            let pr_args: Vec<&str> = pr_argv.iter().map(String::as_str).collect();
+            let prs_raw = self.gh_capture(repo, &pr_args);
             self.intake_last_poll_ms.lock_safe().insert(group.clone(), now);
 
             // Full-autonomy eligibility inputs (#778), resolved before the
@@ -26299,7 +26306,7 @@ impl OrchRegistry {
                 (String::new(), HashSet::new())
             };
 
-            let (label_signals, pr_signals, eligible_signals, issues_truncated) = {
+            let (label_signals, pr_signals, eligible_signals, truncated) = {
                 let mut seen = self.intake_seen.lock_safe();
                 let state = seen.entry(group.clone()).or_default();
                 // Parsed once and read by both diffs — the label delta and the
@@ -26317,19 +26324,22 @@ impl OrchRegistry {
                     &hold_label,
                     &board_tracked,
                 );
-                let prs = prs_raw
-                    .as_deref()
-                    .ok()
-                    .and_then(intake::parse_pr_list)
-                    .map(|prs| intake::pr_check_deltas(&mut state.pr_checks, &prs))
+                let parsed_prs = prs_raw.as_deref().ok().and_then(intake::parse_pr_list);
+                let pr_listing = parsed_prs.as_deref().map(intake::OpenPrList::from_fetch);
+                let prs = pr_listing
+                    .map(|l| intake::pr_check_deltas(&mut state.pr_checks, l))
                     .unwrap_or_default();
-                (labels, prs, eligible, listing.is_some_and(|l| !l.complete))
+                let truncated = intake::IntakeTruncation {
+                    issues: listing.is_some_and(|l| !l.complete),
+                    prs: pr_listing.is_some_and(|l| !l.complete),
+                };
+                (labels, prs, eligible, truncated)
             };
             if label_signals.is_empty() && pr_signals.is_empty() && eligible_signals.is_empty() {
                 continue;
             }
             let summary =
-                intake::intake_wake_summary(&label_signals, &pr_signals, &eligible_signals, issues_truncated);
+                intake::intake_wake_summary(&label_signals, &pr_signals, &eligible_signals, truncated);
             self.audit(&group, "loomux", "intake-signal", json!({ "summary": summary }));
             // Fold into any not-yet-delivered pending summary rather than
             // clobbering it — two poll scans can each find something new
