@@ -43,11 +43,11 @@
 // bounds anything at runtime — it checks that the claim exists, is one of the
 // legal shapes, and still points at real code (an `rAF-gated` row's cite must
 // contain a `requestAnimationFrame`). The residue is carried by review, the
-// same stated bound E1 accepts for call chains (§3). It also only reads
-// `src/*.ts`: a listener registered from Rust-side generated code, or with an
-// event name that is not a literal, is not something it can name — so it
-// refuses to pass over one instead, by counting call sites and requiring the
-// count to match what it extracted.
+// same stated bound E1 accepts for call chains (§3). It reads every `.ts`
+// under `src/` at any depth, but a listener registered from Rust-side
+// generated code, or with an event name that is not a literal, is not
+// something it can name — so it refuses to pass over one instead, by counting
+// call sites and requiring the count to match what it extracted.
 //
 // The one shape it cannot see at all is a **self-rescheduling `setTimeout`** —
 // a `tick()` that ends by scheduling itself is a fixed-cadence poll wearing a
@@ -559,12 +559,57 @@ test("intervalHits resolves both literal and named cadences, and refuses the res
 const SRC_DIR = new URL("../src/", import.meta.url);
 const REPO = new URL("../", import.meta.url);
 
-function realSources(): Source[] {
-  return readdirSync(SRC_DIR)
-    .filter((f) => f.endsWith(".ts"))
-    .sort()
-    .map((f) => ({ path: `src/${f}`, text: readFileSync(new URL(f, SRC_DIR), "utf8") }));
+/** Every file under `dir` with `ext`, **recursively**, as paths relative to
+ *  `dir` with `/` separators.
+ *
+ *  The normalization is not cosmetic: `readdirSync(..., {recursive: true})`
+ *  yields `perfhole\probe.ts` on Windows and `perfhole/probe.ts` elsewhere, so
+ *  without it a nested file's `path` — the thing failure messages print and
+ *  `cite` values are compared against — would be platform-dependent. The
+ *  normalized form also resolves back to a readable URL on both. */
+function walk(dir: URL, ext: string): string[] {
+  return readdirSync(dir, { recursive: true })
+    .map((entry) => String(entry).replace(/\\/g, "/"))
+    .filter((f) => f.endsWith(ext))
+    .sort();
 }
+
+/** The scan's input: every `.ts` under `src/`, at any depth.
+ *
+ *  Depth matters more than it looks. A flat read of `src/` is how this test
+ *  fails SILENTLY — a listener in a `src/<subdir>/` nobody added yet is not a
+ *  hit the manifest is missing, it is a file the scan never opens, and the
+ *  suite stays green with an undeclared stream in the tree (found in review on
+ *  this PR, reproduced with a planted probe). That is the one failure mode the
+ *  header's whole argument is against, so the walk descends. */
+function realSources(): Source[] {
+  return walk(SRC_DIR, ".ts").map((f) => ({
+    path: `src/${f}`,
+    text: readFileSync(new URL(f, SRC_DIR), "utf8"),
+  }));
+}
+
+test("the walk descends into subdirectories, on this platform", () => {
+  // The specimen for the recursion itself. `src/` is flat today, so nothing in
+  // the manifest tests would notice if the walk quietly stopped descending —
+  // which is exactly the state this file shipped in. Pinning it needs a tree
+  // that HAS subdirectories, and the repo already has one: `src-tauri/src/`.
+  // Walking it for `.rs` proves descent and separator normalization together,
+  // without planting a file in `src/` or writing to a temp directory.
+  const rust = walk(new URL("src-tauri/src/", REPO), ".rs");
+  const nested = rust.filter((f) => f.includes("/"));
+  assert.ok(
+    nested.includes("orchestration/mod.rs"),
+    `the walk did not descend: it found ${rust.length} .rs files but ${nested.length} below the ` +
+      `top level, and not orchestration/mod.rs. A non-recursive walk makes a listener in a new ` +
+      `src/ subdirectory invisible rather than undeclared — silence, not a failure`
+  );
+  assert.ok(
+    nested.every((f) => !f.includes("\\")),
+    `the walk leaked a platform separator into a path: ${nested.find((f) => f.includes("\\"))} — ` +
+      `paths are normalized to "/" so failure messages and cites read the same everywhere`
+  );
+});
 
 test("every backend event stream src/ listens to is declared in the stream manifest", () => {
   const hits = realSources().flatMap(listenHits);
@@ -679,76 +724,182 @@ test("the scan still sees the code it is supposed to read", () => {
   }
 });
 
-test("every declared bound and policy carries an argument that still points at real code", () => {
-  const RATES: RateClass[] = ["producer", "cadenced", "lifecycle", "gesture"];
-  const BOUNDS: Bound[] = ["backend-coalesced", "rAF-gated", "throttled", "argued-none"];
-  const POLICIES: VisibilityPolicy[] = ["gated", "component-scoped", "argued"];
-  const ISSUE = /#\d+/;
+const RATES: RateClass[] = ["producer", "cadenced", "lifecycle", "gesture"];
+const BOUNDS: Bound[] = ["backend-coalesced", "rAF-gated", "throttled", "argued-none"];
+const POLICIES: VisibilityPolicy[] = ["gated", "component-scoped", "argued"];
+const ISSUE = /#\d+/;
 
-  for (const row of STREAMS) {
-    const at = `STREAMS["${row.event}"]`;
-    assert.ok(RATES.includes(row.rate), `${at}: unknown rate class "${row.rate}"`);
-    assert.ok(
-      BOUNDS.includes(row.bound),
+/** Reads a repo-relative file, or `null` if it does not exist. Injected so the
+ *  row rules can be exercised against synthetic rows — see the unit tests
+ *  below, which is how the `throttled` branch stays live code while no shipped
+ *  stream is bound that way. */
+type ReadText = (path: string) => string | null;
+
+const readRepoText: ReadText = (path) => {
+  const url = new URL(path, REPO);
+  return existsSync(url) ? readFileSync(url, "utf8") : null;
+};
+
+/** Everything wrong with one stream row, as sentences. Empty = the row's
+ *  argument exists, is a legal shape, and still points at real code. */
+function streamRowProblems(row: StreamRow, readText: ReadText): string[] {
+  const at = `STREAMS["${row.event}"]`;
+  const problems: string[] = [];
+  if (!RATES.includes(row.rate)) problems.push(`${at}: unknown rate class "${row.rate}"`);
+  if (!BOUNDS.includes(row.bound)) {
+    problems.push(
       `${at}: "${row.bound}" is not one of performance.md §3 INV-3's bounds — a new kind of ` +
         `bound is a design-note change first`
     );
-    assert.ok(
-      existsSync(new URL(row.cite, REPO)),
+  }
+  const cited = readText(row.cite);
+  if (cited === null) {
+    problems.push(
       `${at}: cite "${row.cite}" does not exist — an argument that points at a deleted file is ` +
         `not an argument`
     );
-    assert.ok(
-      row.reason.length >= 60,
+  }
+  if (row.reason.length < 60) {
+    problems.push(
       `${at}: the reason has to say what bounds the stream (or what it costs unbounded), in a sentence`
     );
-    if (row.bound === "rAF-gated") {
-      const text = readFileSync(new URL(row.cite, REPO), "utf8");
-      assert.match(
-        text,
-        /requestAnimationFrame\s*\(/,
-        `${at}: claims the P5 rAF gate but ${row.cite} contains no requestAnimationFrame — the ` +
-          `gate was removed or moved, and the claim went stale with it`
-      );
-    }
-    if (row.bound === "throttled") {
-      const text = readFileSync(new URL(row.cite, REPO), "utf8");
-      assert.match(
-        text,
-        /throttle/i,
-        `${at}: claims a throttle but ${row.cite} has no throttle in it`
-      );
-    }
-    // INV-3's teeth: producer-rate is the class the invariant exists for, so
-    // one may be left unbounded only as declared, owned debt. Everything else
-    // may argue its rate away in prose.
-    if (row.rate === "producer" && row.bound === "argued-none") {
-      assert.match(
-        row.debt ?? "",
-        ISSUE,
-        `${at}: a producer-rate stream with no bound must name the issue that owns bounding it ` +
-          `(performance.md §3 INV-3) — "argued-none" is not a place to park one quietly`
-      );
-    }
-    if (row.debt !== null) {
-      assert.match(row.debt, ISSUE, `${at}: a debt row must name its owning issue`);
-    }
   }
-
-  for (const row of TIMERS) {
-    const at = `TIMERS["${row.key}"]`;
-    assert.ok(
-      POLICIES.includes(row.policy),
-      `${at}: "${row.policy}" is not one of performance.md §3 INV-4's visibility policies`
+  // A bound that names a mechanism must still find that mechanism where it
+  // says it lives. `throttled` has no shipped row today — `git-changed`'s
+  // 500 ms notifyPrompt window is real, but that row is `argued-none` because
+  // its point is the UNGATED refreshDir beside it — so this branch is kept
+  // honest by the unit tests rather than by a manifest entry.
+  if (cited !== null && row.bound === "rAF-gated" && !/requestAnimationFrame\s*\(/.test(cited)) {
+    problems.push(
+      `${at}: claims the P5 rAF gate but ${row.cite} contains no requestAnimationFrame — the ` +
+        `gate was removed or moved, and the claim went stale with it`
     );
-    assert.ok(
-      row.reason.length >= 60,
+  }
+  if (cited !== null && row.bound === "throttled" && !/throttle/i.test(cited)) {
+    problems.push(`${at}: claims a throttle but ${row.cite} has no throttle in it`);
+  }
+  // INV-3's teeth: producer-rate is the class the invariant exists for, so
+  // one may be left unbounded only as declared, owned debt. Everything else
+  // may argue its rate away in prose.
+  if (row.rate === "producer" && row.bound === "argued-none" && !ISSUE.test(row.debt ?? "")) {
+    problems.push(
+      `${at}: a producer-rate stream with no bound must name the issue that owns bounding it ` +
+        `(performance.md §3 INV-3) — "argued-none" is not a place to park one quietly`
+    );
+  }
+  if (row.debt !== null && !ISSUE.test(row.debt)) {
+    problems.push(`${at}: a debt row must name its owning issue`);
+  }
+  return problems;
+}
+
+/** Everything wrong with one timer row. */
+function timerRowProblems(row: TimerRow): string[] {
+  const at = `TIMERS["${row.key}"]`;
+  const problems: string[] = [];
+  if (!POLICIES.includes(row.policy)) {
+    problems.push(`${at}: "${row.policy}" is not one of performance.md §3 INV-4's visibility policies`);
+  }
+  if (row.reason.length < 60) {
+    problems.push(
       `${at}: a timer that is not visibility-gated owes a sentence saying what it costs while hidden`
     );
-    if (row.debt !== null) {
-      assert.match(row.debt, ISSUE, `${at}: a debt row must name its owning issue`);
-    }
   }
+  if (row.debt !== null && !ISSUE.test(row.debt)) {
+    problems.push(`${at}: a debt row must name its owning issue`);
+  }
+  return problems;
+}
+
+test("every declared bound and policy carries an argument that still points at real code", () => {
+  assert.deepEqual(
+    STREAMS.flatMap((r) => streamRowProblems(r, readRepoText)),
+    []
+  );
+  assert.deepEqual(
+    TIMERS.flatMap(timerRowProblems),
+    []
+  );
+});
+
+test("neither manifest can hold two rows for the same subject", () => {
+  // The manifest side of a guard the scan side already has. A duplicate would
+  // not fail either set comparison — `new Map(TIMERS.map(...))` silently keeps
+  // the last row, and STREAMS is compared as a Set — so two contradictory
+  // rows for one event could both sit here, and whichever the code happened to
+  // read would be "the" declared bound.
+  const events = STREAMS.map((r) => r.event);
+  assert.deepEqual(
+    events.filter((e, i) => events.indexOf(e) !== i),
+    [],
+    "STREAMS declares the same event twice — delete one; two rows for one stream means the " +
+      "manifest asserts two different bounds and the reader picks"
+  );
+  const keys = TIMERS.map((r) => r.key);
+  assert.deepEqual(
+    keys.filter((k, i) => keys.indexOf(k) !== i),
+    [],
+    "TIMERS declares the same timer twice — the Map lookup keeps only the last, so the other " +
+      "row's cadence and policy are never checked against anything"
+  );
+});
+
+test("the row rules fire on every shape they are written for, including `throttled`", () => {
+  // `throttled` is §3 vocabulary with no shipped row, which is how a branch in
+  // a test file becomes untested code (found in review on this PR). These are
+  // the synthetic rows that keep every branch live, so the check is ready the
+  // day a stream is bounded that way rather than being discovered broken then.
+  const files: Record<string, string> = {
+    "src/with-raf.ts": "requestAnimationFrame(() => paint());",
+    "src/with-throttle.ts": "// leading-edge throttle window\nconst throttleMs = 100;",
+    "src/plain.ts": "export const nothing = 1;",
+  };
+  const read: ReadText = (p) => files[p] ?? null;
+  const ok: StreamRow = {
+    event: "fake",
+    rate: "lifecycle",
+    bound: "argued-none",
+    cite: "src/plain.ts",
+    reason: "x".repeat(60),
+    debt: null,
+  };
+  const only = (row: StreamRow): string => {
+    const problems = streamRowProblems(row, read);
+    assert.equal(problems.length, 1, `expected exactly one problem, got: ${problems.join(" | ")}`);
+    return problems[0];
+  };
+
+  assert.deepEqual(streamRowProblems(ok, read), [], "a well-formed row has no problems");
+  assert.deepEqual(
+    streamRowProblems({ ...ok, bound: "throttled", cite: "src/with-throttle.ts" }, read),
+    [],
+    "a throttled row citing a file that HAS a throttle passes"
+  );
+  assert.match(
+    only({ ...ok, bound: "throttled", cite: "src/plain.ts" }),
+    /claims a throttle but src\/plain\.ts has no throttle in it/
+  );
+  assert.deepEqual(
+    streamRowProblems({ ...ok, bound: "rAF-gated", cite: "src/with-raf.ts" }, read),
+    [],
+    "an rAF-gated row citing a file that HAS the gate passes"
+  );
+  assert.match(only({ ...ok, bound: "rAF-gated", cite: "src/plain.ts" }), /no requestAnimationFrame/);
+  assert.match(only({ ...ok, cite: "src/gone.ts" }), /does not exist/);
+  assert.match(only({ ...ok, reason: "too short" }), /in a sentence/);
+  assert.match(only({ ...ok, rate: "producer" }), /must name the issue that owns bounding it/);
+  assert.match(only({ ...ok, debt: "S6, no issue number" }), /must name its owning issue/);
+  // ...and the same for the timer rules.
+  const timer: TimerRow = {
+    key: "src/fake.ts@1000",
+    cadenceMs: 1000,
+    policy: "argued",
+    reason: "x".repeat(60),
+    debt: null,
+  };
+  assert.deepEqual(timerRowProblems(timer), []);
+  assert.match(timerRowProblems({ ...timer, reason: "short" })[0], /what it costs while hidden/);
+  assert.match(timerRowProblems({ ...timer, debt: "S6" })[0], /must name its owning issue/);
 });
 
 test("a timer's `gated` claim and the file's actual gate agree, in both directions", () => {
