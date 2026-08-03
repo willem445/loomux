@@ -507,7 +507,20 @@ for claude/copilot today — see "Standalone panes" above.
 
 The orchestrator pane has a lifecycle toggle (`Alt+O` or the group icon) with a
 one-glance summary — how many agents are live, the role breakdown, uptime, each
-agent's state, and running session cost with a group total. From here you can:
+agent's state, and running session cost with a group total.
+
+**Where those cost figures come from.** Tokens are exact — read from each CLI's own
+record of the session, never scraped off the pane. Dollars depend on the CLI. For
+Claude Code, loomux prices the tokens itself against a dated table, so the figure is
+an **estimate** — and on a subscription/Max account the real marginal cost is $0
+regardless, which is why tokens are the honest metric there. OpenCode prices its own
+sessions, so loomux **reports** its number instead of guessing one (including a
+genuine $0.00 on a free model, which is an answer, not a blank). Each total is
+labelled accordingly — *estimated*, *reported*, or *mixed* for a group running both.
+A CLI with no readable record falls back to whatever dollar figure it prints in its
+own statusline, which disappears when the pane does.
+
+From the lifecycle panel you can:
 
 - **Pause** the group — loomux stops delivering prompts so its agents finish
   their turn and idle out (reversible with resume). **Pausing holds deliveries

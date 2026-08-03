@@ -8533,8 +8533,9 @@ pub struct UsageSnapshot {
     pub name: String,
     pub role: String,
     /// Where the figures came from: `transcript` (token-derived, exact tokens),
-    /// `statusline` (last-resort parse of the CLI's own dollar figure), or
-    /// `none` (nothing available yet).
+    /// `session-db` (opencode's own `session` row — exact tokens AND its own
+    /// dollar figure, #722), `statusline` (last-resort parse of the CLI's own
+    /// dollar figure), or `none` (nothing available yet).
     pub source: String,
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -20034,6 +20035,18 @@ impl OrchRegistry {
         self.root.join(group)
     }
 
+    /// This group's OpenCode session store — the file `OPENCODE_DB` points
+    /// every opencode pane in the group at (#722).
+    ///
+    /// One function rather than two `join`s at the two call sites, because the
+    /// spawn that CREATES this path and the usage read that CONSUMES it
+    /// disagreeing would not fail loudly: the reader would simply find no
+    /// database and report an agent as having spent nothing.
+    #[doc(hidden)] // pub for integration tests
+    pub fn opencode_db_path(&self, group: &str) -> PathBuf {
+        self.group_dir(group).join(OPENCODE_DB_SUBDIR).join(OPENCODE_DB_FILE)
+    }
+
     /// Scratch dir holding images pasted/attached into the steering strip (#72).
     /// A subdir of the group state dir, so it's naturally per-group and swept
     /// on group end alongside the worktrees.
@@ -28115,11 +28128,16 @@ impl OrchRegistry {
     }
 
     /// Compute an agent's current usage from the best available source, in
-    /// preference order: the CLI's own session transcript (token records —
-    /// exact, and readable even after the pane is gone) → a last-resort parse
-    /// of the dollar figure the CLI prints in its statusline. Returns a
-    /// snapshot keyed for durable accumulation (issue #42).
-    fn compute_usage_snapshot(&self, entry: &AgentEntry, cli: &str) -> UsageSnapshot {
+    /// preference order: the CLI's own session record (token counts — exact,
+    /// and readable even after the pane is gone) → a last-resort parse of the
+    /// dollar figure the CLI prints in its statusline. Returns a snapshot
+    /// keyed for durable accumulation (issue #42).
+    ///
+    /// `#[doc(hidden)] pub` for the integration tests: this is the function
+    /// that decides which source an agent's usage comes from, and pinning that
+    /// choice per CLI is only meaningful against the real one.
+    #[doc(hidden)] // pub for integration tests
+    pub fn compute_usage_snapshot(&self, entry: &AgentEntry, cli: &str) -> UsageSnapshot {
         let key = entry
             .session_id
             .clone()
@@ -28164,6 +28182,42 @@ impl OrchRegistry {
                         snap.cache_read_tokens = u.tokens.cache_read_tokens;
                         snap.cost_usd = u.cost_usd;
                         snap.estimated = true; // token-derived dollar estimate
+                        snap.model = u.model;
+                        return snap;
+                    }
+                }
+            }
+        }
+
+        // OpenCode writes no transcript file: its `session` row already holds
+        // the dollar cost it computed itself plus five token counters, in the
+        // group's own SQLite store (#722). So the dollars here are REPORTED,
+        // not estimated — `estimated: false` is what keeps `group_usage` from
+        // blending them into a total labelled as a price-table guess.
+        //
+        // A degrade (no store, unopenable, schema drift) is deliberately
+        // SILENT: this runs on the polled `group_usage` path, so auditing a
+        // failure here would write an audit line every UI tick for as long as
+        // the condition lasted. Falling through to the statusline, and to a
+        // zero-usage agent if that finds nothing either, is the whole
+        // degraded-not-fatal posture — see `crate::opencodedb`.
+        if cli == "opencode" {
+            // Until an opencode pane's session is identified, there is no id
+            // to key on and this arm simply does not fire.
+            if let Some(sid) = entry.session_id.as_deref() {
+                let db = self.opencode_db_path(&entry.group);
+                if let Ok(Some(u)) = crate::usage::opencode_session_usage(&db, sid) {
+                    // Same guard as the claude arm: a session row that exists
+                    // but has counted nothing yet must not overwrite history
+                    // with zeros, nor pre-empt the statusline fallback.
+                    if u.tokens.total() > 0 {
+                        snap.source = "session-db".to_string();
+                        snap.input_tokens = u.tokens.input_tokens;
+                        snap.output_tokens = u.tokens.output_tokens;
+                        snap.cache_creation_tokens = u.tokens.cache_creation_tokens;
+                        snap.cache_read_tokens = u.tokens.cache_read_tokens;
+                        snap.cost_usd = u.cost_usd;
+                        snap.estimated = false; // priced by opencode, not by us
                         snap.model = u.model;
                         return snap;
                     }
@@ -28371,7 +28425,7 @@ impl OrchRegistry {
             "live_tokens": live_tokens,
             "lifetime_tokens": lifetime_tokens,
             "agents": rows,
-            "note": "Tokens come from each agent's session transcript and are exact; dollar figures are estimated from a dated model price table. Subscription/Max accounts have no marginal dollar cost (the CLI statusline shows $0.00), so tokens are the reliable metric. Killed/recycled agents stay in the lifetime total; statusline-parsed dollars are a last-resort fallback.",
+            "note": "Tokens come from each agent's own session record — a transcript, or opencode's session row — and are exact; dollar figures are estimated from a dated model price table EXCEPT where the CLI priced them itself (opencode does), which the per-total basis labels. Subscription/Max accounts have no marginal dollar cost (the CLI statusline shows $0.00), so tokens are the reliable metric. Killed/recycled agents stay in the lifetime total; statusline-parsed dollars are a last-resort fallback.",
         })
     }
 
@@ -30312,10 +30366,10 @@ impl OrchRegistry {
             // SQLite creates the database file but not its parent directory,
             // and a pane whose store cannot be opened does not boot — so this
             // is an error, not a best-effort mkdir.
-            let db_dir = self.group_dir(group).join(OPENCODE_DB_SUBDIR);
+            let db = self.opencode_db_path(group);
+            let db_dir = db.parent().expect("opencode_db_path always has a parent").to_path_buf();
             fs::create_dir_all(&db_dir).map_err(|e| e.to_string())?;
-            let env =
-                opencode_pane_env(&cfg, containment, unattended, &db_dir.join(OPENCODE_DB_FILE));
+            let env = opencode_pane_env(&cfg, containment, unattended, &db);
             return Ok(AgentCliConfig { path, env });
         }
         let mut server = json!({
