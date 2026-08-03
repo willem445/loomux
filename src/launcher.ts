@@ -56,7 +56,8 @@ import {
   isContentKind,
 } from "./panesetup";
 import { agentCliKnobs, discoverGitBash } from "./pty";
-import { modelLabel } from "./modelnames";
+import { modelOptionLabel } from "./modelnames";
+import { ORCH_CLIS, orchCliFor } from "./orchclis";
 import { knobState, knobValue, type CliKnobs, type KnobState, type KnobStates } from "./selectorknobs";
 import { ftRootIsDir } from "./fileapi";
 import {
@@ -142,26 +143,6 @@ export type WelcomeResult =
    *  edits — a confirmed directory, like files/editor. The workflow FILE is not probed:
    *  a repo without one is the normal starting point, and the pane offers to create it. */
   | { kind: "workflow"; name: string; root: string };
-
-interface OrchCli {
-  id: string;
-  models: string[];
-  defaults: Record<OrchRole, string>;
-}
-const ORCH_CLIS: OrchCli[] = [
-  {
-    id: "claude",
-    models: ["sonnet", "opus", "haiku", "fable"],
-    // Reasoning-heavy roles (orchestrator, planner) default to the strong
-    // tier; executing roles (worker, reviewer) to the mid tier.
-    defaults: { orchestrator: "opus", worker: "sonnet", reviewer: "sonnet", planner: "opus" },
-  },
-  {
-    id: "copilot",
-    models: ["auto", "claude-sonnet-4.6", "claude-haiku-4.5", "gpt-5.2", "gpt-5.3-codex"],
-    defaults: { orchestrator: "auto", worker: "auto", reviewer: "auto", planner: "auto" },
-  },
-];
 
 const basename = (p: string): string => p.split(/[\\/]/).filter(Boolean).pop() ?? "";
 
@@ -259,10 +240,12 @@ class ModelPicker {
       ...models.map((m) => {
         const o = document.createElement("option");
         o.value = m;
-        // The VALUE stays the raw id — it is what `--model` receives. Only the
-        // label is prettified, and only where the name says something the id
-        // doesn't (modelnames.ts).
-        o.textContent = modelLabel(cli, m);
+        // The VALUE stays the raw id — it is what `--model` receives, `/` and
+        // all (#722: opencode's ids are `provider_id/model_id`). Only the label
+        // is prettified, and only where the name says something the id doesn't
+        // (modelnames.ts). The empty id is a real entry — "send no --model" —
+        // and gets the one label that isn't derived from an id.
+        o.textContent = modelOptionLabel(cli, m);
         return o;
       })
     );
@@ -840,10 +823,6 @@ export class WelcomeForm {
     return p;
   }
 
-  private orchCliFor(id: string): OrchCli {
-    return ORCH_CLIS.find((c) => c.id === id) ?? ORCH_CLIS[0];
-  }
-
   /** In orchestrator mode the agent list is restricted to CLIs the backend has
    *  orchestration adapters for, and the model options + defaults follow the
    *  selected CLI: curated list immediately, then merged with whatever the CLI's
@@ -873,7 +852,7 @@ export class WelcomeForm {
    *  first, merged with the CLI's own reported models once the probe returns. */
   private applyRoleModels(role: OrchRole): void {
     const rc = this.roleControls.find((r) => r.key === role)!;
-    const cli = this.orchCliFor(rc.cli.value);
+    const cli = orchCliFor(rc.cli.value);
     rc.model.setOptions(cli.models, cli.defaults[role], cli.id);
     this.applyRoleKnobs(role);
     void this.probe(cli.id).then((p) => {
@@ -908,7 +887,7 @@ export class WelcomeForm {
    *  whatever the DOM still shows. */
   private roleKnobState(role: OrchRole): KnobStates {
     const rc = this.roleControls.find((r) => r.key === role)!;
-    const cli = this.orchCliFor(rc.cli.value);
+    const cli = orchCliFor(rc.cli.value);
     const model = rc.model.value || cli.defaults[role];
     return knobState(this.knownKnobs.get(cli.id) ?? null, cli.id, model);
   }
@@ -923,10 +902,10 @@ export class WelcomeForm {
    *  payload: the two must agree or the form would show a level it isn't sending. */
   private applyRoleKnobs(role: OrchRole): void {
     const rc = this.roleControls.find((r) => r.key === role)!;
-    const cliId = this.orchCliFor(rc.cli.value).id;
+    const cliId = orchCliFor(rc.cli.value).id;
     void this.knobsFor(cliId).then(() => {
       // The human may have moved the picker while the lookup was in flight.
-      if (this.kind !== "orchestrator" || this.orchCliFor(rc.cli.value).id !== cliId) return;
+      if (this.kind !== "orchestrator" || orchCliFor(rc.cli.value).id !== cliId) return;
       this.paintRoleKnobs(role);
     });
     this.paintRoleKnobs(role);
@@ -967,8 +946,8 @@ export class WelcomeForm {
       const states = this.roleKnobState(rc.key);
       return {
         key: rc.key,
-        cli: this.orchCliFor(rc.cli.value).id,
-        model: rc.model.value || this.orchCliFor(rc.cli.value).defaults[rc.key],
+        cli: orchCliFor(rc.cli.value).id,
+        model: rc.model.value || orchCliFor(rc.cli.value).defaults[rc.key],
         // Through `knobValue`, so the preview shows what the payload will carry
         // and not what a control disabled under the human still displays (#687).
         effort: knobValue(states.effort, rc.effort.value),
@@ -1001,7 +980,7 @@ export class WelcomeForm {
     }
     const advanced = this.advancedInput.checked;
     const repo = this.repoInput.value.trim();
-    const cli = this.orchCliFor(this.agentSel.value).id;
+    const cli = orchCliFor(this.agentSel.value).id;
     const seq = ++this.rosterSeq;
     // With the toggle off there is nothing to ask the backend *unless* we want to
     // tell the human their workflow file is being ignored — which is worth one
@@ -1136,7 +1115,7 @@ export class WelcomeForm {
    *  null for a terminal / content pane (no CLI to probe — none of them runs one). */
   private currentProgram(): string | null {
     if (this.kind === "terminal" || isContentKind(this.kind)) return null;
-    if (this.kind === "orchestrator") return this.orchCliFor(this.agentSel.value).id;
+    if (this.kind === "orchestrator") return orchCliFor(this.agentSel.value).id;
     const agent = AGENTS.find((a) => a.id === this.agentSel.value) ?? AGENTS[0];
     const command = agent.id === "custom" ? this.customInput.value.trim() : agent.command;
     return command.split(/\s+/)[0]?.toLowerCase() || null;
@@ -1145,8 +1124,8 @@ export class WelcomeForm {
   /** Distinct agent CLIs an orchestrator launch would spawn across all roles —
    *  each must be on PATH (issue #4: roles can run different CLIs). */
   private orchProgramsToCheck(): string[] {
-    const ids = new Set<string>([this.orchCliFor(this.agentSel.value).id]);
-    for (const rc of this.roleControls) ids.add(this.orchCliFor(rc.cli.value).id);
+    const ids = new Set<string>([orchCliFor(this.agentSel.value).id]);
+    for (const rc of this.roleControls) ids.add(orchCliFor(rc.cli.value).id);
     return [...ids];
   }
 
@@ -1379,7 +1358,7 @@ export class WelcomeForm {
         }
       }
       addRecentRepo(plan.repo);
-      const groupCli = this.orchCliFor(this.agentSel.value);
+      const groupCli = orchCliFor(this.agentSel.value);
       setDefaultAgent(groupCli.id);
       // One source for what each role will run, knobs included: `rolePicks` is
       // already what the roster preview above consented the human to, and it has
