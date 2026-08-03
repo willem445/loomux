@@ -50,6 +50,14 @@ export interface AutonomyState {
    *  merges/releases WITHOUT autonomous. Mutually exclusive with `autonomous`
    *  (enabling autonomous clears it; enabling this while autonomous is rejected). */
   dangerous_mode: boolean;
+  /** #778: whether the orchestrator self-selects eligible work on its idle tick
+   *  instead of waiting for the opt-in label funnel. A dependent toggle of
+   *  autonomous, like `auto_release`. */
+  full_autonomy: boolean;
+  /** #778: the opaque goal qualifying full autonomy, or null when there is none —
+   *  including whenever the mode is off (the marker holding it only exists while
+   *  it is on), so the panel never renders a goal that isn't in force. */
+  full_autonomy_goal: string | null;
   budget_tokens: number;
   budget_anchor_tokens: number;
   spend_since_enable_tokens: number | null;
@@ -145,6 +153,58 @@ export function dangerousControl(autonomous: boolean, dangerous: boolean): Toggl
     return { checked: false, disabled: true, tooltip: DANGEROUS_NEEDS_AUTONOMOUS_OFF };
   }
   return { checked: dangerous, disabled: false, tooltip: "" };
+}
+
+// ---------- full autonomy (#778) ----------
+//
+// INERT: the shapes below exist so the tests in test/autonomy.test.ts fail on
+// BEHAVIOUR rather than on a missing import. The implementing commit replaces
+// every body here.
+
+export const FULL_AUTONOMY_REQUIRES_AUTONOMOUS = "full autonomy requires Autonomous mode";
+
+/** Cap on a goal string. */
+export const MAX_GOAL_CHARS = 500;
+
+export function fullAutonomyControl(_autonomous: boolean, fullAutonomy: boolean): ToggleControl {
+  return { checked: fullAutonomy, disabled: false, tooltip: "" };
+}
+
+export function normalizeGoal(raw: string): string {
+  return raw;
+}
+
+export function goalClause(goal: string | null): string {
+  return goal ?? "";
+}
+
+/** What committing the goal field should do. */
+export interface GoalCommit {
+  send: boolean;
+  goal: string;
+}
+
+export function goalCommit(
+  _fullAutonomy: boolean,
+  _liveGoal: string | null,
+  raw: string
+): GoalCommit {
+  return { send: true, goal: raw };
+}
+
+export function goalFieldSync(_fullAutonomy: boolean, liveGoal: string | null): string | null {
+  return liveGoal ?? "";
+}
+
+/** The section-header chip announcing the mode. */
+export interface ModeChip {
+  shown: boolean;
+  text: string;
+  tooltip: string;
+}
+
+export function fullAutonomyChip(fullAutonomy: boolean, _goal: string | null): ModeChip {
+  return { shown: fullAutonomy, text: "", tooltip: "" };
 }
 
 // ---------- budget meter math ----------
