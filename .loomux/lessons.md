@@ -74,7 +74,8 @@ state once is fine, waiting is the defect.
   `Part of #N` / `Mitigates #N`.
 - The scan is textual, context-blind: `close`/`fix`/`resolve` next to `#N` fires even in
   blockquotes/caveats/aggregated commits. Grep body and `git log` for it before
-  opening/updating a `Part of` PR, and reword (#569, #615).
+  opening/updating a `Part of` PR, and reword. Whoever merges scrubs the aggregated
+  message and re-reads partly-addressed issues after (#569, #615).
 - Prose written against a plan stays dated to it, even across a rebase onto its own
   subject: re-read every doc/design-note/`SKILL.md` claim against what a sibling slice
   actually SHIPPED, never the plan both were written from, before marking ready
