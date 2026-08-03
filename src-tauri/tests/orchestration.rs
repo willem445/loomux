@@ -5945,8 +5945,10 @@ fn reviewer_is_denied_editing_tools_but_keeps_its_shell() {
     // Copilot spells the same denial its own way — pinned separately because a
     // fix applied to one adapter only is the drift #448 already caught once.
     let rev = reg.build_agent_command("copilot", "auto", true, cfg, None, gdir, Path::new("C:/repo"), None, false, tier, &PersonaInject::default());
-    for denied in COPILOT_EDIT_DENY_TOOLS {
-        assert!(rev.contains(&format!("--deny-tool \"{denied}\"")), "a reviewer must deny {denied}: {rev}");
+    // #802: one `--deny-tool`, comma-separated — membership, not a flag per entry.
+    let denied = copilot_tool_patterns(&rev, "--deny-tool");
+    for t in COPILOT_EDIT_DENY_TOOLS {
+        assert!(denied.iter().any(|d| d == t), "a reviewer must deny {t}: {rev}");
     }
     assert!(!rev.contains("shell(git commit)") && !rev.contains("shell(git push)"),
         "a copilot reviewer keeps its shell git, same as the claude one: {rev}");
@@ -6151,6 +6153,101 @@ fn planner_runs_unattended_regardless_of_auto_ops() {
         "a non-auto_ops worker gets no pre-approved gh — only planners run unattended");
 }
 
+/// Read a copilot command line's `--allow-tool` / `--deny-tool` patterns —
+/// and, in doing so, assert the #802 invariant every caller below depends on:
+/// **the option appears AT MOST ONCE**, carrying a comma-separated list.
+///
+/// Copilot's CLI reference documents these options as taking "a quoted,
+/// comma-separated list" and never as repeatable — while annotating five
+/// neighbouring options "(can be used multiple times)". A repeated occurrence
+/// is therefore a form the docs don't describe, and if copilot resolves it
+/// last-wins rather than by accumulating, every pattern but the last is
+/// silently dropped — which is #802's report ("the CLI lists the loomux MCP
+/// server as available, but the agent has no permission to use its tools"),
+/// since `--allow-tool loomux` was emitted FIRST.
+///
+/// Returns the patterns in order, or an empty vec when the option is absent.
+fn copilot_tool_patterns(cmd: &str, flag: &str) -> Vec<String> {
+    let occurrences = cmd.matches(&format!("{flag} ")).count();
+    assert!(
+        occurrences <= 1,
+        "{flag} must appear at most once on a copilot command line (#802) — every pattern \
+         belongs in ONE comma-separated value; found {occurrences} occurrences in: {cmd}"
+    );
+    let needle = format!("{flag} \"");
+    let Some(i) = cmd.find(&needle) else { return Vec::new() };
+    let after = &cmd[i + needle.len()..];
+    let end = after.find('"').expect("an unterminated tool-permission value");
+    after[..end].split(',').map(str::to_string).collect()
+}
+
+/// #802 — the invariant the fix exists for, stated once, in the form a
+/// regression would break: every allow pattern loomux grants a copilot agent
+/// (the loomux MCP server, the attended git/gh pair, and a workflow block's own
+/// `allow:` patterns) rides ONE `--allow-tool`, and every denial ONE
+/// `--deny-tool`.
+///
+/// This is the copilot sibling of
+/// `claude_allow_patterns_are_not_severed_from_the_allowedtools_flag`: same
+/// failure mode (a grant that reads as present on the command line but isn't in
+/// effect), reached through a different CLI's parser. The persona patterns are
+/// what makes it bite in practice — they are the ONLY copilot-argv difference a
+/// workflow block introduces over the built-in roster, which is why #802 was
+/// reported against custom workflows specifically.
+#[test]
+fn copilot_tool_permission_flags_ride_one_occurrence_each() {
+    let (reg, _d) = test_registry();
+    let cfg = Path::new("C:/x/cfg.json");
+    let gdir = Path::new("C:/data/group");
+    let persona = PersonaInject {
+        extra_allow: vec!["shell(npm:*)".into(), "shell(cargo:*)".into()],
+        ..Default::default()
+    };
+    let cmd = |auto_ops, containment, p: &PersonaInject| {
+        reg.build_agent_command(
+            "copilot", "auto", auto_ops, cfg, None, gdir, Path::new("C:/repo"), None, false,
+            containment, p,
+        )
+    };
+
+    // The attended tier stacks the most allow patterns, so it is where a
+    // repeated-flag regression shows first.
+    let attended = cmd(false, Containment::None, &persona);
+    assert_eq!(
+        copilot_tool_patterns(&attended, "--allow-tool"),
+        ["loomux", "shell(git:*)", "shell(gh:*)", "shell(npm:*)", "shell(cargo:*)"],
+        "every allow pattern must sit in one comma-separated value, MCP server first: {attended}"
+    );
+
+    // An unattended block with a persona: the loomux grant must survive the
+    // block's own patterns, which used to be emitted as later occurrences.
+    let unattended = cmd(true, Containment::None, &persona);
+    assert_eq!(
+        copilot_tool_patterns(&unattended, "--allow-tool"),
+        ["loomux", "shell(npm:*)", "shell(cargo:*)"],
+        "an unattended agent drops the git/gh pair (it has --allow-all-tools) but never the \
+         MCP grant: {unattended}"
+    );
+
+    // A planner's denials — three patterns that used to be three flags.
+    let planner = cmd(true, Containment::ReadOnly, &PersonaInject::default());
+    assert_eq!(
+        copilot_tool_patterns(&planner, "--deny-tool"),
+        ["write", "shell(git commit)", "shell(git push)"],
+        "every denial must sit in one comma-separated value: {planner}"
+    );
+    // …and the read-only class still grants loomux, which is the whole point:
+    // a planner with no MCP tools cannot post its plan or report.
+    assert_eq!(copilot_tool_patterns(&planner, "--allow-tool"), ["loomux"]);
+
+    // An uncontained agent emits no `--deny-tool` at all rather than an empty
+    // value — a flag with nothing after it is a parse hazard, not a no-op.
+    assert!(
+        !unattended.contains("--deny-tool"),
+        "no denials means no flag: {unattended}"
+    );
+}
+
 #[test]
 fn copilot_command_uses_copilot_adapter_flags() {
     let (reg, _d) = test_registry();
@@ -6163,7 +6260,10 @@ fn copilot_command_uses_copilot_adapter_flags() {
         "the @ file marker must be inside the quotes — a bare @\" opens a PowerShell here-string, got: {cmd}"
     );
     assert!(cmd.contains("--model auto"));
-    assert!(cmd.contains("--allow-tool loomux"));
+    // The bare MCP server name is copilot's documented "all tools from this
+    // server" form (`SERVER-NAME` row of the tool-permission-patterns table);
+    // #802 changed only its packaging, never the value.
+    assert!(copilot_tool_patterns(&cmd, "--allow-tool").contains(&"loomux".to_string()), "got: {cmd}");
     assert!(cmd.contains("--add-dir \"C:/data/group\""));
     assert!(
         cmd.contains("--add-dir \"C:/repo\""),
@@ -6182,7 +6282,9 @@ fn copilot_command_uses_copilot_adapter_flags() {
     // Conservative preset keeps the explicit allowlist instead.
     let cmd = reg.build_agent_command("copilot", "auto", false, cfg, None, gdir, Path::new("C:/repo"), None, false, Containment::None, &PersonaInject::default());
     assert!(!cmd.contains("--allow-all-tools") && !cmd.contains("--autopilot"));
-    assert!(cmd.contains("--allow-tool \"shell(git:*)\"") && cmd.contains("--allow-tool \"shell(gh:*)\""));
+    let allowed = copilot_tool_patterns(&cmd, "--allow-tool");
+    assert!(allowed.iter().any(|p| p == "shell(git:*)") && allowed.iter().any(|p| p == "shell(gh:*)"),
+        "the attended tier keeps its git/gh pre-approval: {cmd}");
     // Resume reopens a tracked session via --resume; copilot has no
     // pre-assignable id, so a session without resume adds no session flag.
     let sid = "aabbccdd-1122-4334-8556-77889900aabb";
@@ -6202,17 +6304,18 @@ fn copilot_command_uses_copilot_adapter_flags() {
     // A planner (read_only=true) denies writes + git commit/push even under
     // --allow-all-tools (deny wins in Copilot); gh stays reachable.
     let plan = reg.build_agent_command("copilot", "auto", true, cfg, None, gdir, Path::new("C:/repo"), None, false, Containment::ReadOnly, &PersonaInject::default());
-    assert!(plan.contains("--deny-tool \"write\""),
+    let plan_deny = copilot_tool_patterns(&plan, "--deny-tool");
+    assert!(plan_deny.iter().any(|d| d == "write"),
         "planner must deny copilot's write category (the documented file-modification category), got: {plan}");
     // #448: `edit` is not one of Copilot's three documented --deny-tool value
     // shapes (shell(COMMAND) / write / MCP_SERVER(tool)) — it was likely
     // already as inert as MultiEdit was for Claude, so it was dropped rather
     // than kept as an unverified entry that only looked like containment.
-    assert!(!plan.contains("--deny-tool \"edit\""),
+    assert!(!plan_deny.iter().any(|d| d == "edit"),
         "edit is not a documented copilot deny-tool value — must not reappear (#448), got: {plan}");
-    assert!(plan.contains("--deny-tool \"shell(git commit)\"") && plan.contains("--deny-tool \"shell(git push)\""),
+    assert!(plan_deny.iter().any(|d| d == "shell(git commit)") && plan_deny.iter().any(|d| d == "shell(git push)"),
         "planner must deny git commit/push");
-    assert!(!plan.contains("--deny-tool \"shell(gh"), "gh stays allowed for the plan comment");
+    assert!(!plan_deny.iter().any(|d| d.starts_with("shell(gh")), "gh stays allowed for the plan comment");
 }
 
 #[test]
@@ -6231,9 +6334,10 @@ fn copilot_planner_runs_unattended_regardless_of_auto_ops() {
         "a non-auto_ops copilot planner must run unattended (all tools/paths), else it deadlocks: {plan}");
     assert!(plan.contains("--autopilot"),
         "a group planner runs in true autopilot mode; the kickoff answers the consent dialog for it");
-    assert!(plan.contains("--deny-tool \"write\"") && plan.contains("--deny-tool \"shell(git commit)\""),
+    let plan_deny = copilot_tool_patterns(&plan, "--deny-tool");
+    assert!(plan_deny.iter().any(|d| d == "write") && plan_deny.iter().any(|d| d == "shell(git commit)"),
         "writes/commit stay denied — the unattended preset doesn't loosen the read-only contract");
-    assert!(!plan.contains("--deny-tool \"shell(gh"),
+    assert!(!plan_deny.iter().any(|d| d.starts_with("shell(gh")),
         "gh stays allowed so the copilot planner can post its plan comment unattended");
     // A non-auto_ops copilot WORKER (read_only=false) is unchanged: it keeps
     // the conservative interactive preset (no allow-all).
@@ -6664,16 +6768,16 @@ fn build_agent_command_full_line_snapshots() {
     assert_eq!(
         cmd("copilot", "auto", true, Containment::None),
         "copilot --additional-mcp-config \"@C:/x/cfg.json\" --model auto \
-         --add-dir \"C:/data/group\" --add-dir \"C:/repo\" --allow-tool loomux --no-auto-update \
-         --autopilot --allow-all-tools --allow-all-paths"
+         --add-dir \"C:/data/group\" --add-dir \"C:/repo\" --no-auto-update \
+         --autopilot --allow-all-tools --allow-all-paths --allow-tool \"loomux\""
     );
 
     // Copilot worker, auto_ops OFF → the conservative git/gh allowlist branch.
     assert_eq!(
         cmd("copilot", "auto", false, Containment::None),
         "copilot --additional-mcp-config \"@C:/x/cfg.json\" --model auto \
-         --add-dir \"C:/data/group\" --add-dir \"C:/repo\" --allow-tool loomux --no-auto-update \
-         --allow-tool \"shell(git:*)\" --allow-tool \"shell(gh:*)\""
+         --add-dir \"C:/data/group\" --add-dir \"C:/repo\" --no-auto-update \
+         --allow-tool \"loomux,shell(git:*),shell(gh:*)\""
     );
 
     // Claude planner (read_only) in a NON-auto_ops group → unattended anyway,
@@ -6697,10 +6801,9 @@ fn build_agent_command_full_line_snapshots() {
     assert_eq!(
         cmd("copilot", "auto", false, Containment::ReadOnly),
         "copilot --additional-mcp-config \"@C:/x/cfg.json\" --model auto \
-         --add-dir \"C:/data/group\" --add-dir \"C:/repo\" --allow-tool loomux --no-auto-update \
-         --autopilot --allow-all-tools --allow-all-paths \
-         --deny-tool \"write\" \
-         --deny-tool \"shell(git commit)\" --deny-tool \"shell(git push)\""
+         --add-dir \"C:/data/group\" --add-dir \"C:/repo\" --no-auto-update \
+         --autopilot --allow-all-tools --allow-all-paths --allow-tool \"loomux\" \
+         --deny-tool \"write,shell(git commit),shell(git push)\""
     );
 
     // #462 — a reviewer (`NoEdits`), the tier between the two above. Every
@@ -6724,14 +6827,15 @@ fn build_agent_command_full_line_snapshots() {
     assert_eq!(
         cmd("copilot", "auto", true, Containment::NoEdits),
         "copilot --additional-mcp-config \"@C:/x/cfg.json\" --model auto \
-         --add-dir \"C:/data/group\" --add-dir \"C:/repo\" --allow-tool loomux --no-auto-update \
-         --autopilot --allow-all-tools --allow-all-paths --deny-tool \"write\""
+         --add-dir \"C:/data/group\" --add-dir \"C:/repo\" --no-auto-update \
+         --autopilot --allow-all-tools --allow-all-paths --allow-tool \"loomux\" \
+         --deny-tool \"write\""
     );
     assert_eq!(
         cmd("copilot", "auto", false, Containment::NoEdits),
         "copilot --additional-mcp-config \"@C:/x/cfg.json\" --model auto \
-         --add-dir \"C:/data/group\" --add-dir \"C:/repo\" --allow-tool loomux --no-auto-update \
-         --allow-tool \"shell(git:*)\" --allow-tool \"shell(gh:*)\" --deny-tool \"write\""
+         --add-dir \"C:/data/group\" --add-dir \"C:/repo\" --no-auto-update \
+         --allow-tool \"loomux,shell(git:*),shell(gh:*)\" --deny-tool \"write\""
     );
 
     // Unknown CLI falls back to the claude adapter byte-for-byte (never a
@@ -7175,8 +7279,9 @@ fn build_agent_argv_snapshots() {
         argv("copilot", "auto", true, Containment::NoEdits),
         vec![
             "copilot", "--additional-mcp-config", "@C:/x/cfg.json", "--model", "auto", "--add-dir",
-            "C:/data/group", "--add-dir", "C:/repo", "--allow-tool", "loomux", "--no-auto-update",
-            "--autopilot", "--allow-all-tools", "--allow-all-paths", "--deny-tool", "write",
+            "C:/data/group", "--add-dir", "C:/repo", "--no-auto-update",
+            "--autopilot", "--allow-all-tools", "--allow-all-paths",
+            "--allow-tool", "loomux", "--deny-tool", "write",
         ]
     );
 
@@ -7187,10 +7292,10 @@ fn build_agent_argv_snapshots() {
         argv("copilot", "auto", false, Containment::ReadOnly),
         vec![
             "copilot", "--additional-mcp-config", "@C:/x/cfg.json", "--model", "auto", "--add-dir",
-            "C:/data/group", "--add-dir", "C:/repo", "--allow-tool", "loomux", "--no-auto-update",
-            "--autopilot", "--allow-all-tools", "--allow-all-paths", "--deny-tool", "write",
-            "--deny-tool", "shell(git commit)", "--deny-tool",
-            "shell(git push)",
+            "C:/data/group", "--add-dir", "C:/repo", "--no-auto-update",
+            "--autopilot", "--allow-all-tools", "--allow-all-paths",
+            "--allow-tool", "loomux",
+            "--deny-tool", "write,shell(git commit),shell(git push)",
         ]
     );
 
@@ -9034,6 +9139,8 @@ fn pre_trust_copilot_folder_never_clobbers_an_unparseable_config() {
     let unchanged = fs::read_to_string(fixture.path().join("config.json")).unwrap();
     assert_eq!(unchanged, "// c\n{ not json", "an unparseable config must be left exactly alone, never clobbered");
 }
+
+
 
 // ---------- per-task sessions & resume ----------
 
@@ -29081,6 +29188,7 @@ fn a_throwaway_registry_never_writes_the_users_real_copilot_trusted_folders() {
         text.contains("trustedFolders") && text.contains("C:/tmp/copilot-repo"),
         "and it must be the real pre-trust write, not an empty file: {text}",
     );
+
 }
 
 #[test]
