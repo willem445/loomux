@@ -126,10 +126,11 @@ const STREAMS: StreamRow[] = [
     cite: "src/refreshthrottle.ts",
     reason:
       "The emit itself is a first bound: gitwatch polls at 1 s and emits only when the signature " +
-      "changed, so <=1/s per watched pane. Both halves of the pane's reaction then run through " +
-      "one leading-edge REPO_SIGNAL_WINDOW_MS (500 ms) policy — the git view's refresh and the " +
-      "header's dir_info read, which used to ride every event ungated (#743 S5). dir_info's own " +
-      "sync dispatch is E1's row to close, not this one's.",
+      "changed, so <=1/s per watched pane. Both halves of the pane's reaction — the git view's " +
+      "refresh and the header's dir_info read, which used to ride every event ungated (#743 S5) " +
+      "— then run the same leading-edge REPO_SIGNAL_WINDOW_MS (500 ms) policy, each in its own " +
+      "window (the view's advances only while it is visible), so each is <=1 pass per window. " +
+      "dir_info's own sync dispatch is E1's row to close, not this one's.",
     debt: null,
   },
   {

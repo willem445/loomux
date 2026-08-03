@@ -9,9 +9,18 @@
 // was already throttled to 500 ms; the `dir_info` half rode every event
 // ungated, so a rebase or a checkout loop turned a 1 Hz watcher into an
 // unbounded stream of sync commands on the webview thread (#743's census, part
-// 2b). Both halves now run through this policy, so a pane's reaction to repo
-// churn is at most one pass per window, with the trailing edge guaranteeing the
-// last signal is not the one that gets dropped.
+// 2b). Both halves now run through this policy, each bounded to one pass per
+// window, with the trailing edge guaranteeing the last signal is not the one
+// that gets dropped.
+//
+// Two windows, one policy — not one shared window. Each half keeps its own
+// `lastRunMs`, and they are meant to drift: the view's advances only while it
+// is visible, the pane's whenever a cwd is known, and either can fire in a
+// window the other has already spent. What is shared is the decision and the
+// constant, so the two cannot disagree about how long a window is. A single
+// window across both would be a different (and worse) design: whichever half
+// signalled first would suppress the other, which is how a chip goes stale
+// behind a view that refreshed instead.
 //
 // Leading edge, deliberately: the first signal into a quiet pane runs
 // immediately (a `cd` or a commit must move the chip now, not in half a
@@ -41,8 +50,8 @@ export interface RefreshInput {
 
 /** How long a pane coalesces repository-change signals for. 500 ms is the
  *  window `GitView.notifyPrompt` has always used; keeping ONE constant here is
- *  what makes "the same window governs both halves of the reaction" a fact
- *  rather than two numbers that agree today. */
+ *  what stops the two halves of the reaction being two numbers free to drift
+ *  apart — see the note above on why they are still two windows. */
 export const REPO_SIGNAL_WINDOW_MS = 500;
 
 export function decideRefresh(i: RefreshInput): RefreshDecision {

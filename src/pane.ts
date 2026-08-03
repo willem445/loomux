@@ -2298,8 +2298,9 @@ export class Pane implements VoiceTargetPane {
       setGitWatch(this.ptyId, path);
     }
     // Refresh even when the path is unchanged: the *branch* can change
-    // without a cd (git checkout). Throttled with the git view's own reaction
-    // to the same signal — see signalDirRefresh.
+    // without a cd (git checkout). Throttled on the same policy as the git
+    // view's own reaction to this signal, in its own window — see
+    // signalDirRefresh.
     this.signalDirRefresh();
   }
 
@@ -2344,8 +2345,12 @@ export class Pane implements VoiceTargetPane {
   }
 
   private runDirRefresh(): void {
-    this.dirRefreshAt = Date.now();
+    // Guard BEFORE stamping: the window records when a read actually happened.
+    // Stamping a no-op — a pane that has not reported a cwd yet, or one being
+    // disposed — would start a window nothing paid for, and the next real
+    // signal inside it would be deferred half a second for no reason.
     if (this.disposed || !this.cwdRaw) return;
+    this.dirRefreshAt = Date.now();
     void this.refreshDir(this.cwdRaw);
   }
 

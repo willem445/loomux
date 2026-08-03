@@ -531,10 +531,12 @@ export class GitView {
   }
 
   /** Called on every shell prompt (and on every backend `git-changed`);
-   *  refreshes at most twice a second. The policy is `refreshthrottle.ts` —
-   *  shared with the pane's own `dir_info` reaction to the same two signals, so
-   *  one window governs both halves rather than two numbers that happen to
-   *  agree (#743 S5). */
+   *  refreshes at most twice a second. The policy and the 500 ms constant come
+   *  from `refreshthrottle.ts`, shared with the pane's own `dir_info` reaction
+   *  to the same two signals (#743 S5) — one policy, but a window of its own:
+   *  this one only advances while the view is visible (the early return above),
+   *  so the two deliberately drift apart when the view is closed. Each is
+   *  bounded to one pass per window; neither bounds the other. */
   notifyPrompt(): void {
     if (!this.visible || this.disposed) return;
     const d = decideRefresh({
