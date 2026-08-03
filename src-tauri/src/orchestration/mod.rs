@@ -189,7 +189,7 @@ pub fn idle_tick_notice(intake_summary: Option<&str>, summary_incomplete: bool) 
         ),
         _ => "[loomux] idle tick: you have been idle and autonomous mode is on. Run your \
      monitoring cadence now — re-sync (list_tasks, list_agents, get_state), poll \
-     for labeled intake (agent-ready / agent-investigate) and START that work, and \
+     for labeled intake (agent-ready / agent-investigation) and START that work, and \
      re-check your open PRs (CI + new comments). You will get this at most once per \
      idle window; producing any output resets the clock."
             .to_string(),
