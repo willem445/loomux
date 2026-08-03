@@ -104,6 +104,9 @@ When anything (PR body OR code comment) claims a specific test or mechanism poli
 specific property, run the one mutation that removes it and watch WHICH tests redden —
 the predicted-vs-actual failure diff is the value. A matching result is evidence; a
 mismatch is a correction, and disclosing it beats a quiet re-run (#664, #673, #682).
+A red evidences only the assertion it REACHED and MOVED — a run that panics earlier, a
+split test's already-green half, or a companion that also passed broken prove nothing
+about the property; split the test, or say which half moved (#710, #712, #727).
 
 ## A test's specimen must stay a member of the class it witnesses
 
@@ -120,3 +123,9 @@ Slice tests drive the seams, so a lifecycle nothing invokes stays green while do
 nothing. List each new lifecycle fn's call sites, discarding the module's own and the
 tests' — nothing left means the door is connected to nothing. Wire it, or name the
 deferred caller and its issue in the PR (#661 `e20`, #698, #700).
+
+## A multi-line shell script is a file, not a `-c` argument
+
+Long inline Bash dies on Git Bash quoting (`unexpected EOF ... matching '`, reported 50+
+lines into a compound command) from a quote you cannot see. Write it to `./.scratch/` and
+run the file, or pipe prose via `--body-file -`. Re-trying inline is the second cost.
