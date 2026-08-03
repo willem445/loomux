@@ -29945,7 +29945,7 @@ impl OrchRegistry {
             // nothing at all. A re-aim clears it too: the goal is what decides
             // whether an eligible issue is worth starting, so a human who changes it
             // is asking for the backlog to be judged again.
-            // MUTATED for the red run: the re-arm is removed.
+            self.intake_seen.lock_safe().entry(group.to_string()).or_default().eligible.clear();
             if newly {
                 self.audit(group, "human", "full-autonomy-on", json!({ "goal": goal }));
             } else {
