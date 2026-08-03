@@ -733,7 +733,6 @@ fn record_claude_launch_posture_impl(session_id: &str, autopilot: bool) -> Resul
     if session_id.trim().is_empty() {
         return Ok(());
     }
-    let _one_writer = crate::obs::LockExt::lock_safe(&LAUNCH_INTENT_LOCK);
     let mut store = load_launch_intent();
     let key = IntentKey::Session { id: session_id.to_string() };
     let now = now_ms();

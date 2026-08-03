@@ -202,6 +202,12 @@ const SYNC_COMMANDS: &[Row] = &[
         issue: None,
     },
     Row {
+        name: "fm_list",
+        class: Class::Cheap,
+        reason: "RED EVIDENCE ONLY (#746): a row for a command this branch converted, put back                  to show the manifest equality bites in the backwards direction too.",
+        issue: None,
+    },
+    Row {
         name: "fm_capabilities",
         class: Class::Cheap,
         reason: "Returns the compile-time capability flags for the file manager surface. A \

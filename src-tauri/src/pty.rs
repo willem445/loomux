@@ -1747,14 +1747,11 @@ pub struct DirInfo {
 /// since nothing has ever held that repo still.
 #[tauri::command]
 pub async fn dir_info(path: String) -> DirInfo {
-    crate::blocking::run_blocking(move || {
-        let dir = Path::new(&path);
-        DirInfo {
-            cwd: abbreviate_home(dir),
-            branch: git_branch(dir),
-        }
-    })
-    .await
+    let dir = Path::new(&path);
+    DirInfo {
+        cwd: abbreviate_home(dir),
+        branch: git_branch(dir),
+    }
 }
 
 /// Send a `cd` into a pane's shell, so the folder picker can drive it. The

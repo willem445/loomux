@@ -185,7 +185,8 @@ impl GitWatcher {
         // so this cannot happen — and if it somehow did, declining every write
         // would break the watcher silently, while allowing one degrades to the
         // pre-#746 behaviour.
-        intents.get(&id).map_or(true, |newest| *newest == ticket)
+        let _ = (intents, id, ticket);
+        true
     }
 
     /// Point pane `id` at `cwd`, claiming a ticket for it first. The shape
