@@ -3992,9 +3992,9 @@ pub(crate) fn default_model(cli: &str, role: Role) -> &'static str {
     // — the thing #329 says ages badly — and would also silently override a
     // human who had already chosen. A block that wants a specific model pins
     // its own `model:`, and the launcher offers a curated list.
-    // TEMPORARY (#722, red-before-green probe — restored in the very next
-    // commit): this arm is removed so `opencode_blocks_default_to_no_model_at_all`
-    // can be SEEN to fail on CI, which is the evidence it arrived without.
+    if cli == "opencode" {
+        return "";
+    }
     match role {
         Role::Orchestrator | Role::Planner => "opus",
         Role::Worker | Role::Reviewer => "sonnet",
@@ -4738,6 +4738,19 @@ pub fn opencode_permission_json(containment: Containment, unattended: bool) -> V
     // The group's state dir — where every agent's role-instruction file lives
     // — is outside the pane's worktree, and this key defaults to `ask`, so
     // without it an unattended pane would stall on its own instructions.
+    //
+    // **The blanket form, not `{"*": "ask", "<group dir>/*": "allow"}`, and
+    // the narrow one would be a REGRESSION rather than a tightening.** Rules
+    // are concatenated defaults-then-user and the last match wins, so a user
+    // `"*": "ask"` lands AFTER opencode's own default whitelist for this key
+    // (its temp dir, its skill dirs, its reference dirs) and demotes every one
+    // of them to `ask` — turning the CLI's own internal machinery into
+    // prompts. Re-listing those dirs here would mean hardcoding another
+    // vendor's internal paths, which ages exactly as badly as a model table
+    // (#329). What the breadth actually costs is one prompt on an ATTENDED
+    // pane before the agent reads outside its worktree; `read` is not a tier
+    // loomux contains at on any CLI (see [`Containment`]: these are denials of
+    // named tools, never a filesystem sandbox), so no guarantee rests on it.
     perm.insert("external_directory".into(), json!("allow"));
     // Restore the `question` tool for a pane that HAS a human in it, and only
     // then. opencode's built-in defaults deny it and its default `build` agent
@@ -4853,6 +4866,14 @@ pub fn opencode_config_json(
 /// one returns nothing at all when the gh/git shims can't be written, and an
 /// opencode agent silently losing its MCP identity and its containment because
 /// git wasn't installed would be a confusing failure a long way from its cause.
+///
+/// **Caller contract:** `containment`/`unattended` must be the same pair that
+/// produced `config_json`. The posture is deliberately restated here rather
+/// than lifted out of the document (a parse that could fail would have to fail
+/// *open*, dropping the very override that exists to survive everything else),
+/// so the agreement is a call-site obligation — pinned end-to-end by
+/// `an_opencode_spawn_delivers_its_config_and_containment_by_env`, which
+/// asserts the document's `permission` and this override are one object.
 #[doc(hidden)] // pub for integration tests
 pub fn opencode_pane_env(
     config_json: &str,
@@ -38267,19 +38288,28 @@ fn register_orchestrator_pane(
     // to sit above the session/persona block; nothing between there and here
     // reads `cfg`, so moving it down is a reordering only — and it makes the
     // two spawn sites agree on the order structurally instead of by accident.
+    //
+    // Both arguments are DERIVED, never hand-passed, for the same reason the
+    // builders below already derive theirs: an orchestrator is
+    // `Containment::None` today, but a literal here would be a second place
+    // that has to be remembered if `Role::containment` ever changes — and the
+    // unattended predicate must stay the one expression
+    // `build_agent_command_ex` recomputes internally, or a pane could get a
+    // document saying one thing and an argv saying the other.
+    let containment = block.kind.containment();
     let cfg = reg.write_mcp_config(
         &group.id,
         &agent_id,
         &token,
         &cli,
-        Containment::None,
-        group.guardrails.auto_ops,
+        containment,
+        group.guardrails.auto_ops || containment.forces_unattended(),
         &inject,
     )?;
     // #417, split from `cfg` per rev-4 review N2 — Claude's hook config rides
     // a per-agent `--settings` file; Copilot's own wiring needs no flag.
     let hook_settings = (cli == "claude")
-        .then(|| reg.write_hook_settings_file(&group.id, &agent_id, block.kind.containment()))
+        .then(|| reg.write_hook_settings_file(&group.id, &agent_id, containment))
         .flatten();
     if cli == "copilot" {
         let _ = reg.ensure_copilot_compact_hook();
@@ -38301,7 +38331,7 @@ fn register_orchestrator_pane(
         // Derived from the class, never hand-passed: the orchestrator is
         // `Containment::None`, and if that ever changes it changes in one
         // `match` (`Role::containment`) rather than at a literal here.
-        block.kind.containment(),
+        containment,
         &inject,
     );
     let argv = reg.build_agent_argv_ex(
@@ -38315,7 +38345,7 @@ fn register_orchestrator_pane(
         Path::new(&group.repo),
         session_id.as_deref(),
         resume,
-        block.kind.containment(),
+        containment,
         &inject,
     );
     // Round #417 correction 6: see `command_line_length_guard`'s doc — the

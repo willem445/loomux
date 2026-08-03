@@ -294,6 +294,19 @@ role-instruction file lives under the group's state dir, outside the worktree,
 and that key defaults to `ask` — without it an unattended pane would stall on
 its own contract.
 
+It is the **blanket** form rather than the narrow `{"*": "ask", "<group
+dir>/*": "allow"}` that the stated requirement would suggest, and the narrow
+one would be a regression, not a tightening. Rules are concatenated
+defaults-then-user with last-match-wins, so a user `"*": "ask"` lands *after*
+opencode's own default whitelist for this key — its temp dir, its skill dirs,
+its reference dirs — and demotes every one of them to `ask`, turning the CLI's
+own internal machinery into prompts. Re-listing those paths here would mean
+hardcoding another vendor's internals, which ages exactly as badly as a model
+table (#329). What the breadth costs is one prompt on an *attended* pane before
+the agent reads outside its worktree; `read` is not a tier loomux contains at
+on any CLI (see `Containment`: these are denials of named tools, never a
+filesystem sandbox), so no guarantee rests on it.
+
 `question` is keyed on **attended**, not on containment, and it exists because
 of a consequence of running every pane as a config-declared agent: the built-in
 defaults ruleset denies `question`, and only the default `build` agent

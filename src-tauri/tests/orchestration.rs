@@ -7954,6 +7954,20 @@ fn an_opencode_spawn_delivers_its_config_and_containment_by_env() {
         "a worker keeps the repo's own opencode config: {env:?}"
     );
 
+    // **The two copies of the posture must BE the same posture.** The document
+    // and the override are produced by two calls that each derive from
+    // `(containment, unattended)`; today one call site passes the same locals
+    // to both, but nothing in the signatures forces that, and a future arm
+    // passing a stale pair would give a pane a document saying one thing and
+    // an override — the layer that wins — saying another. Assert the equality
+    // rather than rely on call-site discipline.
+    let wperm: Value =
+        serde_json::from_str(env.get("OPENCODE_PERMISSION").expect("worker permission")).unwrap();
+    assert_eq!(
+        cfg["permission"], wperm,
+        "the document's posture and the OPENCODE_PERMISSION override must be one object"
+    );
+
     // The reviewer is the class the #462 guarantee lives or dies on.
     let (_rid, rev) = spawn(Role::Reviewer, "rev");
     let renv: HashMap<&str, &str> = rev.env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
@@ -7987,6 +8001,11 @@ fn an_opencode_spawn_delivers_its_config_and_containment_by_env() {
         "a contained pane does not load the repo's own opencode config at all — a repo cannot \
          then contribute permission rules to the merge: {renv:?}"
     );
+    // Same equality as the worker's, on the class the #462 guarantee rests on:
+    // a contained pane is exactly where a stale override would matter most.
+    let rcfg: Value =
+        serde_json::from_str(renv.get("OPENCODE_CONFIG_CONTENT").expect("reviewer doc")).unwrap();
+    assert_eq!(rcfg["permission"], rperm, "document and override must be one object");
 
     // …and a planner additionally loses the git-mutation subcommands.
     let (_pid, planner) = spawn(Role::Planner, "p");
@@ -8039,6 +8058,12 @@ fn an_opencode_spawn_delivers_its_config_and_containment_by_env() {
 
 /// The body of a `"bash": { … }` object as it is EMITTED, one per occurrence.
 /// A bash object's values are all scalars, so the next `}` closes it.
+///
+/// The needle carries the space `to_string_pretty` emits, so a switch to the
+/// compact serializer would make this return nothing — and a caller that only
+/// loops over the result would then assert nothing at all while staying green.
+/// Every caller must therefore assert the COUNT before looping; see the one
+/// below.
 fn emitted_bash_objects(doc: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut rest = doc;
@@ -8085,7 +8110,20 @@ fn an_opencode_denial_is_never_emitted_before_something_that_re_allows_it() {
             );
         }
 
-        for body in emitted_bash_objects(&doc) {
+        let objects = emitted_bash_objects(&doc);
+        // Without this the loop below can go VACUOUS and stay green: the
+        // helper's needle carries the space `to_string_pretty` emits, so a
+        // switch to the compact serializer would return an empty vec and
+        // silently retire the whole rule-order pin. A ReadOnly pane with an
+        // agent entry emits exactly two — the global posture and the
+        // agent-level denials.
+        assert_eq!(
+            objects.len(),
+            2,
+            "expected the global and agent-level bash objects; a count of 0 means the helper's \
+             needle stopped matching, not that the document stopped carrying them: {doc}"
+        );
+        for body in objects {
             let deny = body
                 .find("\"deny\"")
                 .unwrap_or_else(|| panic!("a ReadOnly pane denies git mutation: {body}"));
