@@ -7682,7 +7682,7 @@ fn a_model_id_may_carry_a_provider_prefix_but_never_shell_syntax() {
         "version: 1\nblocks:\n  - id: worker\n    kind: worker\n    model: opencode/deepseek-v4-flash-free\n",
     )
     .expect("a provider-prefixed model id must parse");
-    let worker = parsed.iter().find(|b| b.id == "worker").expect("the worker block");
+    let worker = parsed.blocks.iter().find(|b| b.id == "worker").expect("the worker block");
     assert_eq!(
         worker.model, "opencode/deepseek-v4-flash-free",
         "the provider prefix must survive sanitizing — dropping the slash yields a model id \
@@ -7710,7 +7710,7 @@ fn a_model_id_may_carry_a_provider_prefix_but_never_shell_syntax() {
         "version: 1\nblocks:\n  - id: worker\n    kind: worker\n    model: \"sonnet; rm -rf / && echo\"\n",
     )
     .expect("the hostile model is sanitized, not rejected");
-    let worker = hostile.iter().find(|b| b.id == "worker").expect("the worker block");
+    let worker = hostile.blocks.iter().find(|b| b.id == "worker").expect("the worker block");
     for bad in [' ', ';', '&', '|', '$', '`', '(', ')', '[', ']', '"', '\''] {
         assert!(
             !worker.model.contains(bad),
@@ -7835,13 +7835,13 @@ fn opencode_launch_flags_per_posture() {
 /// does, so this is the load-time half of the gate.
 #[test]
 fn a_workflow_file_may_declare_opencode_blocks() {
-    let blocks = workflow::parse_workflow(
+    let wf = workflow::parse_workflow(
         "version: 1\nblocks:\n  - id: w-oc\n    kind: worker\n    cli: opencode\n\
          \n  - id: rev-oc\n    kind: reviewer\n    cli: opencode\n\
          \n  - id: plan-oc\n    kind: planner\n    cli: opencode\n",
     )
     .expect("opencode blocks must parse for every class it can contain");
-    assert_eq!(blocks.iter().filter(|b| b.cli == "opencode").count(), 3, "{blocks:?}");
+    assert_eq!(wf.blocks.iter().filter(|b| b.cli == "opencode").count(), 3, "{wf:?}");
 }
 
 /// **The delivery seam.** opencode names no config file on argv: its MCP
