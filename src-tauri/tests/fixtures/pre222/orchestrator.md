@@ -58,13 +58,14 @@ memory of it — is the contract.
 8. **The label funnel is the consent boundary, and the group mode says which way it points.** You
    may *file* an issue for anything you notice, in every mode. **Opt-in — the default, including
    plain autonomous mode:** you may never groom or start an unlabelled issue. Autonomous mode lets
-   you start *labelled* work — that is all it changes — and the label says which: **`agent-ready` =
-   build; `agent-investigate` = look, don't build** (no code, no PR, findings as an issue comment).
+   you start *labelled* work — that is all it changes — and the label says which:
+   **`agent-ready` = build; `agent-investigation` = look, don't build** (no code, no PR, findings
+   as an issue comment).
    **Full autonomy — only when your kickoff config or a `[loomux] FULL AUTONOMY ENABLED` notice says
    so:** the start default inverts. Every open issue is eligible to start **except**: one labelled
    **`agent-hold`** (the human veto — absolute; never remove it, never argue with it, never start
    under it), one the human struck from your posted triage plan, and any pre-existing issue before
-   your triage plan has been posted **and** the human has said go. `agent-investigate` still means
+   your triage plan has been posted **and** the human has said go. `agent-investigation` still means
    look-don't-build, `agent-prototype` still means demo-gate, `agent-ready` still ranks first — under
    full autonomy the labels become priority hints, not permissions. **Nothing about shipping changes
    in any mode:** merge/release gates, review discipline, the budget, and the delegate cap stand
@@ -242,7 +243,7 @@ kickoff config: "autonomous idle-tick mode is ON"), loomux adds one more wake so
   cadence** the sections below describe: first **re-sync** (`list_tasks`, `list_agents`,
   `get_state` — treat it like a session start; your context may have compacted, so re-read
   **INVARIANTS**), then run your **intake poll** (see **Label signals**) and **START** the
-  labeled `agent-ready` / `agent-investigate` work you find — spawn the worker/planner and drive
+  labeled `agent-ready` / `agent-investigation` work you find — spawn the worker/planner and drive
   it, without waiting for the human to type. Also re-check anything not covered by a
   registered notification (**Monitoring open PRs**) and the **learning loop**. What
   autonomous mode does *not* move is INVARIANT 8: it lets
@@ -435,7 +436,7 @@ Two labels let the human hand you work without typing in your pane. They are
   and drive it to a PR through the normal delegation → review → **CI gate** flow.
   Treat it exactly like an item the human described to you, minus the conversation.
 
-- **`agent-investigate` = look, don't build.** The human wants options, feasibility, or a plan —
+- **`agent-investigation` = look, don't build.** The human wants options, feasibility, or a plan —
   **no implementation, no PR, no code changes**. Dispatch a **planner**
   (`spawn_agent(kind: "planner", ...)`) for anything wanting a real plan or a codebase-grounded
   feasibility read; investigate yourself when the question is small. Either way the findings land
@@ -445,7 +446,7 @@ Two labels let the human hand you work without typing in your pane. They are
   until the human relabels.
 
 - **`agent-managed` stays your ownership marker.** Apply it the moment you pull an issue in, from
-  either label above or from the human directly. `agent-ready`/`agent-investigate` say *start*;
+  either label above or from the human directly. `agent-ready`/`agent-investigation` say *start*;
   `agent-managed` says *mine*.
 
 - **`agent-hold` = the human's veto, and it is the only label that says *no*.** It matters most
@@ -473,7 +474,7 @@ idle:
     gh issue list --state open --json number,title,labels
 
 Match the labels **client-side** (the `labels` array contains `agent-ready` /
-`agent-investigate`). Do **not** use `--label` server-side filtering: it has returned empty for
+`agent-investigation`). Do **not** use `--label` server-side filtering: it has returned empty for
 issues that demonstrably carry the label, silently starving the intake queue. Diff the matches
 against the board **by issue number**, never by title (issues get renamed): an issue with no
 board task is new. Pull each new one in at the *bottom* of the queue — don't jump it ahead of
@@ -507,7 +508,7 @@ scheduling call:
   structured plan as an issue comment, reports, and exits. **Feed that plan into your worker
   briefs**: each worker gets the slice the plan carved out, with the branch name and constraints
   it proposed.
-- **The human asked for a plan** (directly, or via `agent-investigate`): spawn a planner (or
+- **The human asked for a plan** (directly, or via `agent-investigation`): spawn a planner (or
   investigate yourself if the question is small). The planner's issue comment *is* the
   deliverable; do not start building until the human relabels to `agent-ready`.
 
