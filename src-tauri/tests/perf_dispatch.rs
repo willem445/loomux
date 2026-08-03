@@ -129,6 +129,19 @@ const DEBT_OWNERS: &[(&str, &str)] = &[
 /// by moving several hundred lines of `mod.rs` under this manifest across three
 /// slices without invalidating a single surviving cite.
 const SYNC_COMMANDS: &[Row] = &[
+    // DELIBERATELY WRONG (#762 red probe 2 of 2): `orch_set_notify` IS converted
+    // — it is a thin async fn over run_blocking two commits ago — and this row
+    // was left behind. That is the "a conversion that lands without deleting its
+    // row is just as red" half of the manifest equality, and probe 1 could not
+    // show it: the `undeclared` assertion lives in the same test and fires
+    // first, so it masked this one. Reverted in the next commit.
+    Row {
+        name: "orch_set_notify",
+        class: Class::Cheap,
+        reason: "A stale row kept on purpose for one CI run, to show the manifest equality biting \
+                 in the direction that polices #762's own 40 deletions.",
+        issue: None,
+    },
     // ---------------------------------------------------------------------
     // exception — deliberate, argued in code and in performance.md §4.
     // ---------------------------------------------------------------------
