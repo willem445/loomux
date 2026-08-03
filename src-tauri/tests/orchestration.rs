@@ -38267,6 +38267,16 @@ fn orchestration_command_sites() -> Vec<(String, bool, String)> {
 /// move the work, because Tauri polls a command's future on the main thread —
 /// an `async fn` that calls its sync body inline is exactly as blocking as the
 /// sync command it replaced.
+///
+/// **Scope: an allow-list of eight, NOT set equality over the module** — and
+/// that is a smaller guarantee than the `gh.rs`/`git.rs` scans this borrows its
+/// mechanics from. Those assert over every command they contain, so a new
+/// offender forces a deliberate update. This one pins that these eight *stay*
+/// converted and says nothing about a ninth polled sync command landing later.
+/// Refusing a new unargued sync command anywhere in the crate is **E1's** job
+/// (`perf_dispatch.rs` + its `SYNC_COMMANDS` manifest, performance.md INV-1),
+/// which is slice **S2** — so a reader who wants that half should look there
+/// and not mistake this test for it (rev-231 finding 1).
 #[test]
 fn the_polled_orchestration_commands_are_async_and_delegate_off_thread() {
     const OFF_THREAD: &[&str] = &[

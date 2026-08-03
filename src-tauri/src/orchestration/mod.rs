@@ -9020,6 +9020,18 @@ pub struct OrchRegistry {
     /// against a computation in flight. A computation whose cell was dropped
     /// mid-flight stores into an orphan and the next caller recomputes: one
     /// wasted computation, never a stale answer.
+    ///
+    /// **Why the invalidation set is `{upsert_usage_snapshot, end_group}` and
+    /// not, say, spawn.** The two are not symmetric. A newly spawned agent
+    /// whose row appears up to a window late is harmless — it has no spend yet,
+    /// and the next tick shows it. A killed agent that keeps rendering as LIVE
+    /// is not: its snapshot has just been captured from outside this
+    /// computation, and a group view showing a dead agent as live is a wrong
+    /// statement about what is running. Invalidate where being late is wrong,
+    /// not everywhere something changed.
+    ///
+    /// **Bounded by LIVE groups**: `end_group` drops the entry, so the map does
+    /// not accumulate one per group this process ever opened.
     usage_memo: Mutex<HashMap<String, Arc<Mutex<Option<(std::time::Instant, Value)>>>>>,
     /// Per-REPO memo for the display-only default-branch name (#743 S4a),
     /// keyed by repo path so two groups on one repo share the answer.
@@ -9034,6 +9046,15 @@ pub struct OrchRegistry {
     ///
     /// The lock is never held across the `git` spawns — check, release, resolve,
     /// insert.
+    ///
+    /// **Its bound, stated because every other map here states one**: nothing
+    /// evicts, so this holds one small entry per distinct repo path for the
+    /// process lifetime. That is deliberate rather than overlooked. Unlike
+    /// [`Self::usage_memo`] there is no lifecycle event to hang eviction on — a
+    /// repo outlives the groups opened on it, which is exactly why the key is
+    /// the repo and not the group — and the population is the set of repos a
+    /// human has opened in one session: single digits, a branch name each.
+    /// Eviction machinery would cost more than the thing it reclaims.
     default_branch_memo: Mutex<HashMap<String, (std::time::Instant, Option<String>)>>,
     /// Serializes group creation + orchestrator registration: the group id
     /// is chosen by liveness, and a group only becomes live once its
@@ -27940,8 +27961,10 @@ impl OrchRegistry {
     /// shape ran a full `usage.json` read plus an atomic rewrite *per live
     /// agent* and then read the file once more to summarise it, so an N-agent
     /// group paid `2N + 1` file operations on every 2 s poll. Returning the
-    /// merged list is what removes the trailing read: under the lock the
-    /// in-memory list IS the file's contents at write time.
+    /// merged list is what removes the trailing read: **when the write
+    /// succeeds**, the in-memory list under this lock IS the file's contents.
+    /// When it fails it is not, and the returned list falls back to a re-read
+    /// rather than reporting spend that never persisted — see the write site.
     ///
     /// An empty `incoming` writes nothing — it is a plain read, which is what a
     /// group with no live agents does every tick.
@@ -27959,7 +27982,16 @@ impl OrchRegistry {
         // Crash-safe write: a crash mid-write leaves the old (valid) file
         // intact, never a half-written usage.json (#133).
         let body = serde_json::to_string_pretty(&list).unwrap();
-        let _ = atomic_write(&dir.join("usage.json"), body.as_bytes());
+        if atomic_write(&dir.join("usage.json"), body.as_bytes()).is_err() {
+            // The merged list is NOT what is on disk, so it must not be what
+            // the caller summarises (rev-231 finding 3). Re-read and report the
+            // figures that actually persisted — which is what the pre-#743
+            // shape's trailing read did implicitly. The alternative is putting
+            // spend on screen that never landed and vanishes on the next tick,
+            // and a cost meter that invents a number on a failing disk is worse
+            // than one that stops moving. Costs a read only on the failure path.
+            return self.load_usage_snapshots(group);
+        }
         list
     }
 
@@ -37693,8 +37725,9 @@ pub fn orch_set_advanced_orchestrator(
 /// satisfiability guarantee) — `{ advanced, name, default_branch: string|null,
 /// blocks: [{id,kind,cli,model,persona}],
 /// gate: {require,reviewers,also,satisfiable,missing_blocks} | null }`.
-/// Part of the group view's 2 s poll batch (groupview.ts:637-658), alongside
-/// `orch_group_summary` — not a once-per-open read.
+/// Part of the group view's 2 s poll batch — `GroupView.load()`'s nine-invoke
+/// `Promise.all` (groupview.ts:649-672), alongside `orch_group_summary` — not
+/// a once-per-open read.
 ///
 /// Off-thread (#743 S4c), and its `default_branch` is memoised per repo (#743
 /// S4a) — resolving that name costs 2-4 blocking `git` spawns, which this was
