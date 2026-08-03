@@ -44,6 +44,7 @@ import {
   type Worktree,
 } from "./gitworktree";
 import { QUEUE_WAIT_LIMIT_MS } from "./gitqueue";
+import { decideRefresh, REPO_SIGNAL_WINDOW_MS } from "./refreshthrottle";
 import { computeLanes, renderRowSvg } from "./gitgraph";
 import { shortRev, fmtWhen, fmtWhenFull, authorLine } from "./gitformat";
 import { renderDiff } from "./diffrender";
@@ -529,17 +530,26 @@ export class GitView {
     this.applyChangesHeight(parseStoredSize(readSize(KEY_CHANGES_H)) ?? DEFAULT_CHANGES_H, false);
   }
 
-  /** Called on every shell prompt; refreshes at most twice a second. */
+  /** Called on every shell prompt (and on every backend `git-changed`);
+   *  refreshes at most twice a second. The policy is `refreshthrottle.ts` —
+   *  shared with the pane's own `dir_info` reaction to the same two signals, so
+   *  one window governs both halves rather than two numbers that happen to
+   *  agree (#743 S5). */
   notifyPrompt(): void {
     if (!this.visible || this.disposed) return;
-    const since = Date.now() - this.lastRefresh;
-    if (since >= 500) {
+    const d = decideRefresh({
+      nowMs: Date.now(),
+      lastRunMs: this.lastRefresh,
+      timerPending: this.throttleTimer !== undefined,
+      windowMs: REPO_SIGNAL_WINDOW_MS,
+    });
+    if (d.kind === "run") {
       void this.refresh();
-    } else if (this.throttleTimer === undefined) {
+    } else if (d.kind === "schedule") {
       this.throttleTimer = window.setTimeout(() => {
         this.throttleTimer = undefined;
         if (this.visible && !this.disposed) void this.refresh();
-      }, 500 - since);
+      }, d.dueInMs);
     }
   }
 

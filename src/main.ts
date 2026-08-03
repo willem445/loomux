@@ -59,6 +59,7 @@ import {
   type AttentionItem,
 } from "./orchestration";
 import { tabAttention, sameAttention, findPaneByPty, orchestratorLaunchTarget } from "./tabroute";
+import { AttentionGate } from "./attentiongate";
 import {
   encodeTabs,
   decodeTabs,
@@ -268,12 +269,29 @@ async function launchOrchestratorTab(config: OrchestratorConfig): Promise<void> 
   persistTabs();
 }
 
+const attentionGate = new AttentionGate();
+
+/** A token that changes whenever the pane population does: the tab list, in
+ *  order, with each tab's pane count (docked panes included). Allocation-free
+ *  apart from the string — it must be cheaper than the pass it guards, so it
+ *  counts panes rather than walking them. */
+function paneTopology(): string {
+  let token = "";
+  for (const ws of tabs.tabs) token += `${ws.id}:${ws.grid.allPaneCount};`;
+  return token;
+}
+
 /** Apply an attention scan across all tabs: badge each pane by its pty (the
  *  pre-tabs behavior, now spanning every tab) AND badge the tab-strip entry of
  *  any tab that owns a needs-attention pty — so a hidden tab's blocked agent
  *  still surfaces (#63). Uses a live pty→tab map built from the actual
  *  panes, so plain (#40) panes badge their tab too, not just bound agents. */
 function applyAttention(items: AttentionItem[]): void {
+  // The 3 s tick re-emits the whole set whether or not anything moved, so the
+  // pass below — every pane of every tab, plus the tab-attention recompute —
+  // only runs when the payload or the pane population actually changed
+  // (#743 S5; see attentiongate.ts for why the payload alone is not enough).
+  if (!attentionGate.shouldApply(items, paneTopology())) return;
   const byPty = new Map<number, AttentionItem>();
   for (const it of items) if (it.pty_id !== null) byPty.set(it.pty_id, it);
   const ptyToWs = new Map<number, string>();

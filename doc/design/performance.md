@@ -63,11 +63,19 @@ Each is shipped, tested, and citable — prefer copying one to inventing a shape
   `DEFAULT_SETTINGS.unfocusedRenderThrottleMs` in `settings.ts`, so the policy
   module owns the policy and settings owns the number — #733) and
   `webglretry.ts` (`WEBGL_RETRY_DELAYS_MS` 2s/10s/60s then stop;
-  `WEBGL_HEALTHY_MS` 5 min or a hide/show opens a fresh streak).
+  `WEBGL_HEALTHY_MS` 5 min or a hide/show opens a fresh streak). Two more on
+  the handler side (#743): `refreshthrottle.ts`
+  (`REPO_SIGNAL_WINDOW_MS` = 500, the window a pane reacts to repo-change
+  signals in — leading edge, and the trailing run is what stops the last signal
+  of a burst being the dropped one), and `refreshgate.ts`'s `CoalescingRefresh`
+  (single-flight plus a trailing merge; its window is the duration of a run, so
+  it needs no constant and a slower backend coalesces harder).
 - **P5 — rAF dirty-flag on the handler side.** A batch stream sets a flag and
   schedules one `requestAnimationFrame` render instead of rendering per batch.
   Precedent: `FileExplorer.onFilesBatch` (`fileexplorer.ts`, the `ft-files`
-  gate); `scheduleRender()` for `ft-search` (`fileedit.ts`).
+  gate); `scheduleRender()` for `ft-search` (`fileedit.ts`); `framegate.ts`
+  (`FrameGate`), the same shape as an injectable-scheduler module so the
+  coalescing itself is unit-testable — it gates the `fm-hash` column (#743).
 - **P6 — Backpressure, not queues, for pipes.** A full pipe parks the writer;
   that is the bounded-memory answer. Do not add a backend write queue to
   "smooth" it — an unbounded queue converts a stall into unbounded memory.

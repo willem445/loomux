@@ -92,10 +92,11 @@ interface StreamRow {
   debt: string | null;
 }
 
-/** Every `listen()` in `src/*.ts`, keyed by event name. Seeded verbatim from
- *  the #743 census (plan part 2b, comment 5162018391) — this is today's truth,
- *  not the target state; S5 (`perf/743-stream-bounds`) is what deletes the
- *  debt rows. */
+/** Every `listen()` in `src/*.ts`, keyed by event name. Seeded from the #743
+ *  census (plan part 2b, comment 5162018391) and kept at today's truth, never
+ *  at the target state. Its four debt rows were the census's four unbounded
+ *  streams; S5 bounded them, so each now names the mechanism that does it and
+ *  a `debt` here means a gap that is still open. */
 const STREAMS: StreamRow[] = [
   {
     event: "pty-output",
@@ -121,13 +122,15 @@ const STREAMS: StreamRow[] = [
   {
     event: "git-changed",
     rate: "cadenced",
-    bound: "argued-none",
-    cite: "src/gitview.ts",
+    bound: "throttled",
+    cite: "src/refreshthrottle.ts",
     reason:
-      "The emit itself is the bound: gitwatch polls at 1 s and emits only when the signature " +
-      "changed, so <=1/s per watched pane. notifyPrompt is throttled 500 ms on top. The gap: " +
-      "refreshDir's dir_info invoke rides every event ungated, and dir_info is still a sync command.",
-    debt: "#743 S5 (fold refreshDir into the 500 ms notifyPrompt window); #746 owns dir_info",
+      "The emit itself is a first bound: gitwatch polls at 1 s and emits only when the signature " +
+      "changed, so <=1/s per watched pane. Both halves of the pane's reaction then run through " +
+      "one leading-edge REPO_SIGNAL_WINDOW_MS (500 ms) policy — the git view's refresh and the " +
+      "header's dir_info read, which used to ride every event ungated (#743 S5). dir_info's own " +
+      "sync dispatch is E1's row to close, not this one's.",
+    debt: null,
   },
   {
     event: "system-metrics",
@@ -163,13 +166,14 @@ const STREAMS: StreamRow[] = [
   {
     event: "fm-hash",
     rate: "producer",
-    bound: "argued-none",
-    cite: "src/fileexplorer.ts",
+    bound: "rAF-gated",
+    cite: "src/framegate.ts",
     reason:
-      "Unbounded today: the backend emits one batch per 8 files hashed and paintHashCells does a " +
-      "full querySelectorAll over every visible row per batch, so hashing a large tree is " +
-      "hundreds of whole-DOM passes on the webview thread.",
-    debt: "#743 S5 (copy the ft-files rAF gate onto paintHashCells)",
+      "P5, the same gate ft-files uses, as a module: the backend emits one batch per 8 files " +
+      "hashed and each paint is a querySelectorAll over every visible row, so the batches set a " +
+      "dirty flag and one requestAnimationFrame repaints the column at most once per frame " +
+      "(#743 S5). The run's final batch paints straight through — nothing left to coalesce.",
+    debt: null,
   },
   {
     event: "fm-delete",
@@ -224,12 +228,14 @@ const STREAMS: StreamRow[] = [
     event: "orch-attention",
     rate: "cadenced",
     bound: "argued-none",
-    cite: "src/orchestration.ts",
+    cite: "src/attentiongate.ts",
     reason:
-      "A 3 s backend tick that emits unconditionally and carries the FULL attention set with no " +
-      "diff, so every tick costs an O(panes x tabs) re-badge even when nothing changed. Bounded " +
-      "in rate by the tick, unbounded in per-tick work.",
-    debt: "#743 S5 (diff the payload against the previous set before applyAttention)",
+      "A 3 s backend tick, so the rate is a constant; what needed bounding was the per-tick work, " +
+      "an O(panes x tabs) re-badge paid whether or not anything moved. The handler now compares " +
+      "the payload AND the pane population against the last applied pass and returns before " +
+      "touching a pane when neither changed (#743 S5). Not one of INV-3's three named mechanisms " +
+      "— a diff is not a coalescer — so it is argued here rather than mislabelled as one.",
+    debt: null,
   },
   {
     event: "orch-delivery-held",
@@ -276,13 +282,15 @@ const STREAMS: StreamRow[] = [
   {
     event: "orch-tasks-changed",
     rate: "producer",
-    bound: "argued-none",
-    cite: "src/tasksview.ts",
+    bound: "throttled",
+    cite: "src/refreshgate.ts",
     reason:
-      "Unbounded today: emitted on EVERY write_tasks, which agents drive in bursts, and each " +
-      "event is a full board refetch plus re-render in every open TasksView — 10 rapid writes " +
-      "with N views open costs 10xN full refetches.",
-    debt: "#743 S5 (per-view single-flight + trailing-edge merge, the refreshGate precedent)",
+      "Emitted on EVERY write_tasks, which agents drive in bursts. Each open board now refreshes " +
+      "through CoalescingRefresh: single-flight with a trailing-edge merge, so a burst of N " +
+      "writes costs the refetch already in flight plus exactly one more, per view, and the " +
+      "trailing one reads the final board so nothing is lost (#743 S5). Self-clocking — its " +
+      "window is the duration of a refresh, so a slower backend coalesces harder.",
+    debt: null,
   },
 ];
 
@@ -765,10 +773,8 @@ function streamRowProblems(row: StreamRow, readText: ReadText): string[] {
     );
   }
   // A bound that names a mechanism must still find that mechanism where it
-  // says it lives. `throttled` has no shipped row today — `git-changed`'s
-  // 500 ms notifyPrompt window is real, but that row is `argued-none` because
-  // its point is the UNGATED refreshDir beside it — so this branch is kept
-  // honest by the unit tests rather than by a manifest entry.
+  // says it lives — a claim whose cite no longer implements it is the failure
+  // mode a manifest has that a lint does not.
   if (cited !== null && row.bound === "rAF-gated" && !/requestAnimationFrame\s*\(/.test(cited)) {
     problems.push(
       `${at}: claims the P5 rAF gate but ${row.cite} contains no requestAnimationFrame — the ` +
@@ -845,10 +851,10 @@ test("neither manifest can hold two rows for the same subject", () => {
 });
 
 test("the row rules fire on every shape they are written for, including `throttled`", () => {
-  // `throttled` is §3 vocabulary with no shipped row, which is how a branch in
-  // a test file becomes untested code (found in review on this PR). These are
-  // the synthetic rows that keep every branch live, so the check is ready the
-  // day a stream is bounded that way rather than being discovered broken then.
+  // Synthetic rows, so every branch of the row rules stays live whatever the
+  // shipped manifest happens to contain — a branch no row exercises is untested
+  // code in a test file, and the day a row first needs it is the wrong day to
+  // find it broken.
   const files: Record<string, string> = {
     "src/with-raf.ts": "requestAnimationFrame(() => paint());",
     "src/with-throttle.ts": "// leading-edge throttle window\nconst throttleMs = 100;",

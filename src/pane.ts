@@ -40,6 +40,7 @@ import {
 import { createOrderedWriter } from "./ptywrite";
 import { createHumanOriginLatch } from "./humanorigin";
 import { decideFlush, WOKEN, MAX_PENDING_BYTES } from "./panethrottle";
+import { decideRefresh, REPO_SIGNAL_WINDOW_MS } from "./refreshthrottle";
 import { planWebglRetry } from "./webglretry";
 import { showToast } from "./toast";
 import { isAppShortcut } from "./shortcuts";
@@ -495,6 +496,10 @@ export class Pane implements VoiceTargetPane {
   /** Directory the external-change git watch is currently pointed at (#36),
    *  so we only re-issue the backend call when the pane actually changes dir. */
   private watchedPath: string | null = null;
+  /** When the last signal-driven `dir_info` read ran, and the trailing timer if
+   *  one is booked — the pane half of the repo-signal throttle (signalDirRefresh). */
+  private dirRefreshAt = 0;
+  private dirRefreshTimer: number | undefined;
   /** Lazily created git view; null until the first toggle. */
   private gitView: GitView | null = null;
   /** Floating container for the git view + divider. It overlays the top of
@@ -2293,16 +2298,55 @@ export class Pane implements VoiceTargetPane {
       setGitWatch(this.ptyId, path);
     }
     // Refresh even when the path is unchanged: the *branch* can change
-    // without a cd (git checkout), and dir_info is cheap.
-    void this.refreshDir(path);
+    // without a cd (git checkout). Throttled with the git view's own reaction
+    // to the same signal — see signalDirRefresh.
+    this.signalDirRefresh();
   }
 
   /** The backend saw this pane's repo change on disk (an external checkout /
    *  commit / stage). Drive the same refresh a shell prompt would: the git
-   *  view (throttled) and the header branch chip. */
+   *  view (throttled) and the header branch chip (throttled the same way). */
   private onExternalGitChange(): void {
     this.gitView?.notifyPrompt();
-    if (this.cwdRaw) void this.refreshDir(this.cwdRaw);
+    this.signalDirRefresh();
+  }
+
+  /** React to a "this pane's repository may have moved" signal — a shell prompt
+   *  (OSC 7) or the backend's `git-changed` watcher — by re-reading `dir_info`
+   *  for the header's cwd/branch chips.
+   *
+   *  Bounded to one read per `REPO_SIGNAL_WINDOW_MS` per pane (#743 S5). Both
+   *  signals are producer-paced, not gestures: `git-changed` polls at 1 Hz and
+   *  fires on every index/HEAD/ref move, so a rebase, a `git add -p` session or
+   *  another agent's commit loop used to put one sync `dir_info` on the webview
+   *  thread per event, on every pane watching that repo. Leading edge, so a
+   *  plain `cd` still moves the chip immediately; trailing run reads the
+   *  CURRENT cwd, so the last signal of a burst is never the one dropped.
+   *
+   *  Deliberately not applied to the mount-time and repo-action refreshes:
+   *  those are one-shot and gesture-paced, and delaying them would trade a real
+   *  latency for no bound at all. */
+  private signalDirRefresh(): void {
+    const d = decideRefresh({
+      nowMs: Date.now(),
+      lastRunMs: this.dirRefreshAt,
+      timerPending: this.dirRefreshTimer !== undefined,
+      windowMs: REPO_SIGNAL_WINDOW_MS,
+    });
+    if (d.kind === "run") {
+      this.runDirRefresh();
+    } else if (d.kind === "schedule") {
+      this.dirRefreshTimer = window.setTimeout(() => {
+        this.dirRefreshTimer = undefined;
+        this.runDirRefresh();
+      }, d.dueInMs);
+    }
+  }
+
+  private runDirRefresh(): void {
+    this.dirRefreshAt = Date.now();
+    if (this.disposed || !this.cwdRaw) return;
+    void this.refreshDir(this.cwdRaw);
   }
 
   /** Refuse an overlay on a CONTENT pane (#214/#217), with a reason.
@@ -4211,6 +4255,7 @@ export class Pane implements VoiceTargetPane {
     clearTimeout(this.shiftTimer);
     clearTimeout(this.composeStatusTimer);
     clearTimeout(this.flushTimer); // #720 output throttle
+    clearTimeout(this.dirRefreshTimer); // #743 repo-signal throttle
     clearTimeout(this.webglRetryTimer); // #720 WebGL re-acquire
     // Abort any in-flight voice capture aimed at this pane (releases the mic).
     voiceController.notifyPaneDisposed(this);
