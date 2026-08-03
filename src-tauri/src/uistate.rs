@@ -97,6 +97,9 @@ pub fn write_atomic_seq(path: &Path, contents: &str, ticket: u64) -> Result<(), 
     let mut marks = crate::obs::LockExt::lock_safe(&WRITE_HIGH_WATER);
     // `>` and not `>=`: tickets are unique (`fetch_add`), so the two differ only
     // for a ticket compared against itself, which cannot happen.
+    if marks.iter().any(|(p, seen)| p == path && *seen > ticket) {
+        return Ok(());
+    }
     let wrote = write_atomic(path, contents);
     if wrote.is_ok() {
         match marks.iter_mut().find(|(p, _)| p == path) {
