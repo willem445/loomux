@@ -944,8 +944,12 @@ test("a timer's `gated` claim and the file's actual gate agree, in both directio
   // file that adopts the gate for one of its timers cannot leave a second one
   // outside it and say nothing. That is what pulled the tab strip's 700 ms
   // hover-preview timer into S6 — the row had to become true or the wiring had
-  // to. If a file ever genuinely needs one gated and one ungated timer, this
-  // assertion is the thing to extend, with the argument written down.
+  // to. There is deliberately NO prose escape: a `reason` saying why one timer
+  // sits outside its file's gate is not read here and must not be written as if
+  // it were, because a check a sentence can satisfy is not an equivalence. If a
+  // file ever genuinely needs one gated and one ungated timer, that is an
+  // enforcement change — extend this assertion under #767 (E2 hardening), with
+  // the argument written down, rather than arguing past it in a row.
   const GATE = /document\.hidden|visibilitychange|pollgate/;
   for (const row of TIMERS) {
     const file = row.key.split("@")[0];
@@ -960,8 +964,10 @@ test("a timer's `gated` claim and the file's actual gate agree, in both directio
       assert.ok(
         !gated,
         `${file} now has a visibility gate but ${row.key} is still declared "${row.policy}" — ` +
-          `upgrade the row to "gated" (or say in its reason why THIS timer is deliberately ` +
-          `outside the gate its own file uses)`
+          `upgrade the row to "gated", or take the timer out of the gate. This is a per-file ` +
+          `equivalence and nothing in the row's prose relaxes it: one timer inside its file's ` +
+          `gate and another outside it is an enforcement change, so it goes to #767, not into a ` +
+          `reason field`
       );
     }
   }
