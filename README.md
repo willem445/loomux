@@ -8,6 +8,22 @@ work, and let it run.**
 
 ![A loomux window running an orchestrator and several agent panes](sample.jpg)
 
+[![Autonomous](https://img.shields.io/badge/autonomous-82%25%20unsupervised-blueviolet)](#hand-it-a-batch-of-work-and-walk-away)
+
+**loomux builds itself.** Across a measured 71.7-hour window, 82% of loomux's own
+development time ran fully unsupervised — agents alone planning, building,
+adversarially reviewing, and shipping the work, with humans holding only the merge
+and release gates.
+
+- 27.2h of active development observed; 22.3h with no human present, 4.8h with one
+- 48 human touch-points (prompts, merge approvals, release grants) against ~21,600
+  audited agent/system events — about 0.2%
+- In that window: 2 features, 17 merged PRs, ~40 review findings fixed, zero
+  reverts, `main` green throughout
+
+*Measured from this repo's own orchestration audit log, Aug 2026 — minute-bucketed
+activity; human presence = ±7.5 min around any human-actor audit event.*
+
 Loomux is a native desktop terminal for Windows, macOS and Linux — instant matrix
 splits, nameable panes, project tabs, session restore — with an
 **orchestrator/worker workflow built in**. Point a group at a repo, label some
