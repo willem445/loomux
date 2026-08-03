@@ -165,6 +165,18 @@ export class GroupView {
   private releaseArmed = false;
   private releaseArmTimer: number | undefined;
   private pauseBtn: HTMLButtonElement;
+  /** In-flight guard for the pause/resume toggle (#743 S4c).
+   *
+   *  `orch_pause_group`/`orch_resume_group` moved off the webview main thread,
+   *  so Tauri's dispatch no longer blocks the second click while the first call
+   *  is still running. A repeated PAUSE (or repeated resume) is harmless — the
+   *  registry only writes the marker and audits when its in-memory `paused` set
+   *  actually transitioned — but the MIXED pair is not: a resume's queue flush
+   *  can land after a pause has already re-armed the hold, delivering payloads
+   *  the human just asked loomux to sit on. This restores exactly the mutual
+   *  exclusion the synchronous dispatch used to provide, at the one call site
+   *  that lacked it (the tab-bar menu closes on click, so it cannot re-fire). */
+  private pauseInFlight = false;
   private notifyBtn: HTMLButtonElement;
   // Workflow-mode chrome (#316): active workflow + armed gate, and the live
   // advanced-orchestrator toggle.
@@ -666,11 +678,17 @@ export class GroupView {
   }
 
   private async togglePause(): Promise<void> {
+    if (this.pauseInFlight) return; // see `pauseInFlight`
+    this.pauseInFlight = true;
+    this.pauseBtn.disabled = true;
     try {
       if (this.paused) await resumeGroup(this.groupId);
       else await pauseGroup(this.groupId);
     } catch (err) {
       this.toast(String(err));
+    } finally {
+      this.pauseInFlight = false;
+      this.pauseBtn.disabled = false;
     }
     await this.load();
   }
