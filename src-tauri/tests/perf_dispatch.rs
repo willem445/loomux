@@ -91,19 +91,14 @@ const DEBT_OWNERS: &[(&str, &str)] = &[
         "#746",
         "F1 of #743: the remaining sync gesture commands (filemgr, fileedit, uistate, sessions, \
          cliprobe, editor, spawn_pty, dir_info, voice) convert to async + run_blocking in two \
-         quick-tier slices, each deleting its rows here.",
+         quick-tier slices, each deleting its rows here. Two rows ride with them that F1's list \
+         does not name — discover_git_bash and git_watch, both pty/gitwatch commands of the same \
+         shape; each says so in its own reason rather than widening the issue silently.",
     ),
     (
         "#749",
         "F4 of #743: orch_session_roles fans out over every group ever created — an index or a \
          live-groups filter, not just a thread hop.",
-    ),
-    (
-        "#743 S7",
-        "Slice S7 (leaf locks): gitwatch's signature IO moves outside the watches lock. INV-5 \
-         lock-scope work on a command this test classes by its dispatch, not its locks. (S7's \
-         plan also lists PtyManager::kill, but see the kill_pty row — that one is already a \
-         leaf, so it is not a debt row here.)",
     ),
     (
         "#762",
@@ -201,9 +196,9 @@ const SYNC_COMMANDS: &[Row] = &[
         reason: "Removes the handle from the map, then signals the child; killer.kill() is a \
                  non-waiting syscall. It already follows P3: `PtyManager::kill` takes the map lock \
                  inside a `let` initializer, so the guard is a temporary dropped at that \
-                 statement's semicolon and the kill runs with the map lock RELEASED. #743's census \
-                 (part 1) reads this as a lock-held exception and S7's plan inherits that; the \
-                 code has had this shape since it was written, so there is nothing to move.",
+                 statement's semicolon and the kill runs with the map lock RELEASED. The census \
+                 (part 1) read it as a lock-held exception; #763 resolved that row as wrong with \
+                 no code change and made the shape self-documenting at the fn.",
         issue: None,
     },
     Row {
@@ -356,9 +351,12 @@ const SYNC_COMMANDS: &[Row] = &[
         name: "dir_info",
         class: Class::Debt,
         reason: "Stats and reads .git and HEAD walking up the parent directories, on the webview \
-                 thread. The hottest row in this block: it fires per OSC-7 cwd report and on \
-                 every git-changed refresh, so its rate is set by the child, not by a gesture. F1 \
-                 may absorb it into S5's throttle instead of converting it.",
+                 thread. Was the hottest row in this block — one sync read per OSC-7 cwd report \
+                 and per git-changed event, per pane watching the repo, so a rebase or an agent's \
+                 commit loop drove it. #764 (S5) bounded the CALLER to one read per pane per \
+                 REPO_SIGNAL_WINDOW_MS with a leading edge, which is why this is now an ordinary \
+                 gesture-rate row rather than the urgent one; the sync dispatch itself is what F1 \
+                 still owns.",
         issue: Some("#746"),
     },
     Row {
@@ -528,16 +526,16 @@ const SYNC_COMMANDS: &[Row] = &[
                  stall lands exactly when the user is trying to get out.",
         issue: Some("#746"),
     },
-    // ---------------------------------------------------------------------
-    // debt — #743 S7: commands whose conversion is entangled with lock scope.
-    // ---------------------------------------------------------------------
     Row {
         name: "git_watch",
         class: Class::Debt,
-        reason: "Computes the repo signature (stats and reads) WHILE HOLDING the watches mutex, \
-                 on the webview thread — unlike the same file's poll loop, which snapshots and \
-                 releases first. The lock scope is the interesting half, so S7 owns it.",
-        issue: Some("#743 S7"),
+        reason: "Computes the repo signature (stats and reads) on the webview thread. #763 (S7) \
+                 moved that IO OUTSIDE the watches mutex, so the lock-scope half — the reason this \
+                 row used to belong to S7 — is done; what is left is the plain one, a sync \
+                 filesystem command Tauri dispatches on the thread that services paint. F1's list \
+                 does not name gitwatch, same as discover_git_bash above; it is the same shape and \
+                 rides with them.",
+        issue: Some("#746"),
     },
     // ---------------------------------------------------------------------
     // debt — #749: the one orchestration row with its own dedicated issue.
