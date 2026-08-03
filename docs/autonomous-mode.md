@@ -256,9 +256,18 @@ approve-with-comment path:
   control for a tag) writes a one-time authorization for **that specific PR or tag**
   and tells the orchestrator to go ahead. You can attach a comment ("approved — bump
   the changelog first") delivered alongside the authorization.
-- A grant is **single-use** (consumed the moment it's used) and **expires after 30
-  minutes**. A grant for PR #5 can't authorize merging #7, and a merge grant can't
-  authorize a release.
+- A **merge** grant is **single-use** (consumed the moment it's used) and **expires
+  after 30 minutes**. A grant for PR #5 can't authorize merging #7, and a merge grant
+  can't authorize a release.
+- A **release** grant covers the whole release of **one tag** — pushing that tag,
+  creating or editing its GitHub release, and writing that release's notes — and
+  **expires after 90 minutes**. It is not single-use, because a release is not one
+  command: the tag push kicks off a build that takes tens of minutes, and the notes
+  are written against the release that build created. It authorizes **no other tag
+  and no other release** (a call that names a release by numeric id is resolved back
+  to its tag before it is checked, and refused if that tag isn't the granted one or
+  can't be resolved at all), nothing at all once it expires, and **not** the version
+  bump PR's merge — that still needs its own Approve.
 - **Approving several at once** (board **✓ Approve selected (N)**) is the same thing
   N times, not something wider: one separate single-use, 30-minute grant per PR, and
   no "bulk" authorization exists for the shim to honour. The only difference is that
@@ -280,9 +289,10 @@ distinctly:
 | Audit marker | Meaning |
 | --- | --- |
 | `merge-gate-allowed` / `release-gate-allowed` | the autonomous blanket toggle |
-| `merge-gate-granted` / `release-gate-granted` | a one-time human grant |
+| `merge-gate-granted` / `release-gate-granted` | an explicit human grant |
 | `merge-gate-dangerous` / `release-gate-dangerous` | supervised dangerous mode |
 | `merge-gate-blocked` / `release-gate-blocked` | refused — logged with the reason (agent exits non-zero) |
+| `release-id-resolved` / `release-id-unresolved` | a call naming a release by numeric id was (or could not be) resolved to its tag before the grant was checked |
 
 So the trail always says *which* gate let something through, or why it was stopped.
 Open it in the [audit viewer](orchestration.html#steering-attention-and-audit)
@@ -298,7 +308,7 @@ row.
 | **Auto-merge** | off (approval required) | autonomous | orchestrator may self-merge default-branch PRs (instructed to require adequate testing) |
 | **Auto-release** | off | autonomous | orchestrator publishes releases/tags |
 | **Dangerous mode** | off | supervised (*not* autonomous) | manual merges/releases without per-item approval |
-| **Per-item grant** | — | any time | one merge or one release, single-use, 30-min TTL |
+| **Per-item grant** | — | any time | one merge (single-use, 30-min TTL) or one tag's whole release (90-min TTL) |
 
 ## Requirements
 

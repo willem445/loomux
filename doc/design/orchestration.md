@@ -4827,23 +4827,47 @@ The blanket markers are all-or-nothing, so a human clicking board **Approve** �
 one-time **grant** the shim also honors.
 
 - **Grant files.** A grant is a small file under the group dir the shim consults:
-  `merge_grants/pr-<N>` (a default-branch merge of PR N) or `release_grants/<tag>` (a
-  release/tag publish). Line 1 is a unix-seconds **expiry** (`GRANT_TTL_SECS` = 30 min); the
-  shim treats the grant as valid iff the file exists and now < expiry. Files are written with
-  `atomic_write` (temp + rename, temp name = pid + `GRANT_SEQ`, no getrandom) so the shim can
-  never read a half-written grant.
-- **Claim, then settle on the real outcome (#256/#303).** A grant is not spent on
+  `merge_grants/pr-<N>` (a default-branch merge of PR N) or `release_grants/<tag>` (the release
+  of tag `<tag>`). Line 1 is a unix-seconds **expiry** — `GRANT_TTL_SECS` = 30 min for merges,
+  `RELEASE_GRANT_TTL_SECS` = 90 min for releases (why they differ: *Two kinds of grant* below);
+  the shim treats the grant as valid iff the file exists and now < expiry. Files are written
+  with `atomic_write` (temp + rename, temp name = pid + `GRANT_SEQ`, no getrandom) so the shim
+  can never read a half-written grant.
+- **Two kinds of grant, and the reason they differ (#438).** A **merge** grant is one-time: a
+  merge is one action, and "merge PR #7" cannot mean anything else. A **release** grant is a
+  **pipeline** grant: "release vX.Y.Z" is not one command but a sequence — push the `vX.Y.Z`
+  tag, let `release.yml` build and create the release, write that release's notes — and
+  charging the human a fresh authorization per step is a bug, not a safety property. It shipped
+  as one: v1.0.0 cost three human touches for one authorized release, and v1.1.0-beta6 spent
+  its grant on the tag push and then refused the notes write that belonged to the same release.
+  So a release grant is **checked and never consumed** (`RELEASE_GRANT_VALID_SH`, substituted
+  byte-identically into both shims from one Rust const). What bounds it instead:
+  **tag identity** — the file is keyed by tag segment, so it authorizes exactly one tag's
+  release and nothing else; **the TTL** — re-read and re-compared to the clock on *every* step,
+  so the window is a hard wall rather than a first-use wall, and an expired grant is deleted on
+  sight; and **default-deny** — no file, an unparseable expiry, or a clock the shim cannot read
+  at all all refuse. That last one is deliberately stricter than the merge path's claim (which
+  treats an unreadable `date` as "not yet expired"): a token spent once can tolerate that, a
+  grant that stays live until a timestamp cannot. The bump-PR merge is **not** in scope — it
+  stays under the merge gate with its own Approve, so nothing here weakens what a merge needs.
+  90 minutes is chosen to cover a slow four-platform matrix plus a re-run of one failed leg;
+  #438's other idea — auto-extending the window while steps keep succeeding — was rejected
+  because a window any authorized step renews has no bound, and "the agent kept working" is not
+  evidence the human still consents.
+- **Claim, then settle on the real outcome (#256).** The **merge** grant is not spent on
   interception — it is **claimed** (`loomux_grant_claim`: an atomic `mv` to a `.claimed`
   sibling, so a concurrent claimant loses the race outright rather than double-spending) and
   only **settled** (`loomux_grant_settle`) once the real `gh` call it authorizes has actually
   run: consumed (`rm`) on exit 0, restored to the original path on any other exit so a retry
-  can still use it. A merge or release/tag publish GitHub itself refuses (draft PR, branch
-  protection, a stale head, a transient API error, a tag that already exists) must not burn
-  the human's one-time grant — live incidents for both the merge grant (#256, PR #226) and the
-  release grant (#303) hinged on exactly this. If the shim process dies between claim and
-  settle, the original grant file stays gone and the orphaned `.claimed` file is never
-  consulted again — a crash requires a fresh grant, never a second use. Both gates share this
-  one mechanism (not two copies).
+  can still use it. A merge GitHub itself refuses (draft PR, branch protection, a stale head, a
+  transient API error) must not burn the human's one-time grant — the #256 live incident (PR
+  #226) hinged on exactly this. If the shim process dies between claim and settle, the original
+  grant file stays gone and the orphaned `.claimed` file is never consulted again — a crash
+  requires a fresh grant, never a second use. Release grants shared this machinery until #438
+  (#303 and #315 were the same bug class for `gh release` and `git push` respectively) and no
+  longer need it: nothing is spent, so nothing can be burned by a step that failed, and both
+  issues' property now holds by construction rather than by remembering to call settle. The
+  git shim, which gates only releases, therefore carries no claim/settle at all.
 - **Decision.** `gh_gate_decision` gains a `grant_valid` input: a default-branch merge is
   allowed by `(autonomous && auto_merge)` **OR** a valid grant for *that* PR (`AllowGrant`,
   consumed). The shim resolves the PR **number** via the real gh (`--json baseRefName,number`)
@@ -4958,9 +4982,44 @@ reconcile on read, mirrored into the kickoff config + a live notice, and surface
   **fails safe to the gate** (blanket-markers-only). The tag is resolved for grant-keying from the
   locus (argv `ref=refs/tags/<t>`, a `--input` file's `"ref"`, the URL `…/git/refs/tags/<t>`,
   `tag_name=<t>`, or an inline graphql `tagName:"<t>"` / `name:"refs/tags/<t>"`); where it isn't
-  (stdin body, opaque graphql, `DELETE …/releases/<id>` by numeric id), only the blanket markers
-  (`autonomous && auto_release`, or supervised `dangerous && !autonomous`) can allow it — otherwise
-  **fail-safe block**. A non-release api call (an issues endpoint, a branch `refs/heads` write, an
+  (stdin body, opaque graphql), only the blanket markers (`autonomous && auto_release`, or
+  supervised `dangerous && !autonomous`) can allow it — otherwise **fail-safe block**.
+  **Release-id addressing resolves (#437).** A call that names a release by numeric id —
+  `gh api -X PATCH repos/O/R/releases/<id> -F body=@notes.md`, which is how the release skill
+  *mandates* notes be applied, by canonical id rather than by tag lookup that a duplicate
+  release can make ambiguous (#282) — carries no tag anywhere in its argv, so it used to be
+  unmatchable against any grant and was refused outright (the refusal read `release/tag ()`,
+  the empty parens being the whole diagnosis). The gate now resolves the id to its tag with
+  **one read-only GET** against the real gh, after the blanket openings so a marker-allowed
+  release pays nothing for it, and then gates on that tag like any other.
+
+  **The id is the locus, and it outranks the argv.** This is the part that carries the
+  security argument, and the first cut got it wrong: resolution was conditional on the argv
+  naming no tag, so `-f tag_name=<granted>` suppressed it and a live grant reached *every*
+  release in the repo — `gh api -X PATCH …/releases/777 -f tag_name=v1.2.3 -f
+  make_latest=true` keyed the gate on the granted tag, retagged an unauthorized release and
+  took `latest`; `-X DELETE … -f tag_name=v1.2.3` deleted one (the API ignores `tag_name` on a
+  DELETE, so it was there purely to satisfy the gate). It is the exact mirror of the `#196`
+  decoys — those *loosen* the gate with a cosmetic `refs/heads`, this one *satisfies* it with
+  a cosmetic tag — and the suite had no case for that direction. So: whenever the URL names
+  one specific release, the argv tag is **discarded** before anything is keyed on it, and
+  three outcomes follow. Resolved and consistent → gate on the resolved tag. Resolved but the
+  argv named a *different* tag → **refuse**, because that is either a retag (publishing a tag
+  nobody granted) or a decoy, and letting the resolved tag simply win would allow the retag
+  whenever the resolved tag happened to be the granted one. Not resolvable → **refuse**: a
+  lookup that errors, 404s, prints nothing, prints `null`, or prints anything that is not a
+  plausible ref name leaves the tag empty, and an unresolvable id is never "probably fine".
+  `POST …/releases` (create) has no id in the URL, so `tag_name` remains its locus.
+
+  **What makes the traversal case safe is the resolved path, not a pattern.** The GET uses
+  `$a_path` — the write's own path, verbatim, not lowercased and not a reconstructed prefix —
+  so gh normalizes one string and the two calls cannot address different releases. (An earlier
+  cut resolved `${prefix}releases/${id}`, and *there* `…/releases/555/../444` really would
+  have read release 555's tag and written to 444.) The `..` and last-segment tests that
+  remain are not what closes that; they decide whether the URL counts as **id-addressed**,
+  which matters because a release loomux cannot pin down (`…/releases/555/assets`,
+  `…/releases/../777`) must still deny the argv tag the chance to speak for it. Each is
+  pinned by a mutation that flips a refusal to an allow when it is removed. A non-release api call (an issues endpoint, a branch `refs/heads` write, an
   read-only GET) passes through untouched. The **graphql arm**: the endpoint is recognized by
   **suffix** (`graphql` | `/graphql` | `*/graphql`, incl. the full-URL host form) — not an exact
   `graphql` string, which a `gh api /graphql`/full-URL POST would have slipped (#196 r4) — and it

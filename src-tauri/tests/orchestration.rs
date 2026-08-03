@@ -17178,11 +17178,14 @@ fn git_shim_script_bakes_real_git_and_gates_tag_push() {
     assert!(sh.contains("refs/tags/"), "detects explicit tag refs");
     assert!(sh.contains("release_grants/"), "gates on a release grant");
     assert!(sh.contains("release-gate-blocked"), "audits refusals");
-    // #315: the grant is CLAIMED (atomic mv to .claimed) before the real push
-    // runs, and SETTLED (consumed on success, restored on failure) after —
-    // not deleted up front on interception (the #256/#303 bug class).
-    assert!(sh.contains("loomux_grant_claim") && sh.contains("loomux_grant_settle"),
-        "tag-push grant uses the shared claim/settle mechanics, not burn-on-interception");
+    // #438: the tag push checks the release grant and never spends it — a
+    // release grant covers its tag's whole pipeline until its TTL. The #256/
+    // #303/#315 bug class (a grant burned on a step that never landed) is
+    // therefore structural here, not settle-dependent.
+    assert!(sh.contains("loomux_release_grant_valid"),
+        "the tag-push gate consults the shared release-grant validity check");
+    assert!(!sh.contains("loomux_grant_settle"),
+        "nothing in the git shim consumes a grant, so there is nothing to settle");
     assert!(!sh.contains("\r"), "the POSIX git shim must be LF-only");
 }
 
@@ -17546,11 +17549,29 @@ fn shim_paths() -> ShimPaths {
 /// "succeeds". Returns its path. Shared by the harness tests.
 fn write_fake_gh(root: &std::path::Path, log: &std::path::Path) -> std::path::PathBuf {
     let p = root.join("fakegh");
+    // The `api … --jq .tag_name` arm answers the shim's #437 release-id → tag
+    // lookup from `$FAKE_REL_MAP` ("<id>=<tag> <id>=<tag> …"). An id that is not
+    // in the map exits NON-ZERO with no output, which is what a 404 / no-such-
+    // release / offline gh looks like to the shim — i.e. the fail-closed input.
+    // Unset FAKE_REL_MAP therefore means "no release id resolves", which is the
+    // pre-#437 world and keeps every existing expectation in this file honest.
     std::fs::write(&p, format!(
         "#!/bin/sh\n\
          echo \"ARGS: $*\" >> \"{log}\"\n\
          if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"view\" ]; then printf '%s %s\\n' \"$FAKE_BASE\" \"$FAKE_NUM\"; exit 0; fi\n\
          if [ \"$1\" = \"repo\" ] && [ \"$2\" = \"view\" ]; then printf '%s\\n' \"$FAKE_DEFAULT\"; exit 0; fi\n\
+         if [ \"$1\" = \"api\" ]; then\n\
+           case \"$*\" in\n\
+             *--jq*.tag_name*)\n\
+               _p=\"\"\n\
+               for a in \"$@\"; do case \"$a\" in *releases/*) _p=$a ;; esac; done\n\
+               _id=${{_p##*releases/}}\n\
+               for e in $FAKE_REL_MAP; do\n\
+                 case \"$e\" in \"$_id=\"*) printf '%s\\n' \"${{e#*=}}\"; exit 0 ;; esac\n\
+               done\n\
+               exit 1 ;;\n\
+           esac\n\
+         fi\n\
          printf 'FAKE-GH-RAN\\n'; exit 0\n",
         log = log.display()
     )).unwrap();
@@ -17608,12 +17629,14 @@ fn gh_shim_harness_grant_authorizes_one_merge_and_releases_are_gated() {
     assert!(!run(&["release", "create", "v1.2.3"], "0"), "release blocked even in autonomous+auto_merge");
     write_grant("release_grants", "v1.2.3");
     assert!(run(&["release", "create", "v1.2.3"], "0"), "release grant → allowed");
-    assert!(!group.join("release_grants/v1.2.3").exists(), "release grant consumed");
+    // #438: NOT consumed — a release grant covers its tag's whole pipeline for
+    // its TTL. (Merge grants above are still one-time; that asymmetry is the
+    // point, since a merge is one action and a release is several.)
+    assert!(group.join("release_grants/v1.2.3").exists(), "release grant stays live for the rest of the pipeline");
     // Read-only release subcommand passes through.
     assert!(run(&["release", "view", "v1.2.3"], "0"), "release view is not gated");
     // rev-86 LOW: value-flags BEFORE the tag must not misparse it — a granted
     // release with --title still resolves tag v1.2.3 and is allowed.
-    write_grant("release_grants", "v1.2.3");
     assert!(run(&["release", "create", "--title", "My Release", "v1.2.3"], "0"),
         "granted release with --title before the tag must be allowed, not misparsed");
     assert!(!run(&["release", "create", "--title", "My Release", "v9.9.9"], "0"),
@@ -17819,13 +17842,16 @@ fn write_fake_gh_with_release_exit(root: &std::path::Path, log: &std::path::Path
 }
 
 #[test]
-fn gh_shim_harness_a_release_publish_that_fails_at_github_does_not_burn_the_one_time_grant() {
+fn gh_shim_harness_a_release_publish_that_fails_at_github_does_not_burn_the_grant() {
     // #303 (same bug class as #256): a granted `gh release create` was let
     // through, GitHub refused it (tag already exists, a transient API error,
     // …), and the interceptor had already deleted the release grant on
-    // interception — the human would have had to re-grant. Proven against the
-    // REAL generated shim: a publish that exits non-zero must leave the grant
-    // usable for a retry; only a publish that exits 0 may consume it.
+    // interception — the human would have had to re-grant. #438 makes that
+    // property structural rather than settle-dependent: a release grant is a
+    // pipeline grant, checked and never spent, so NO outcome burns it. This
+    // still executes the REAL generated shim, and now pins BOTH halves — a
+    // refused publish is retryable (#303) AND a successful one leaves the
+    // grant live for the next step of the same release (#438).
     use std::process::Command;
     if Command::new("sh").arg("-c").arg("exit 0").status().map(|s| !s.success()).unwrap_or(true) {
         eprintln!("SKIP gh_shim_harness_a_release_publish_that_fails…: no POSIX sh");
@@ -17858,28 +17884,408 @@ fn gh_shim_harness_a_release_publish_that_fails_at_github_does_not_burn_the_one_
     write_grant("v1.2.3");
     assert!(!run("v1.2.3", "1"), "a failed publish must fail (surface GitHub's refusal)");
     assert!(grant_path("v1.2.3").exists(), "a failed publish must NOT consume the grant — this is the #303 bug");
-    assert!(!grant_path("v1.2.3.claimed").exists(), "no orphaned .claimed file after a resolved failure");
+    assert!(!grant_path("v1.2.3.claimed").exists(), "the release path claims nothing, so it can leave no .claimed file");
 
-    // The SAME grant authorizes a retry, and a successful publish DOES consume it.
+    // The SAME grant authorizes a retry — and a SUCCESSFUL publish leaves it
+    // live too (#438). This assertion is the inverse of what it was before this
+    // fix ("a successful publish consumes the grant"), deliberately: the human
+    // authorized the release of v1.2.3, and `gh release create` is only the
+    // first step of it. Burning the grant here is what forced a second human
+    // grant for the notes write that follows.
     assert!(run("v1.2.3", "0"), "retry with the still-usable grant must succeed");
-    assert!(!grant_path("v1.2.3").exists(), "a successful publish consumes the grant");
-    assert!(!grant_path("v1.2.3.claimed").exists(), "no orphaned .claimed file after a resolved success");
+    assert!(grant_path("v1.2.3").exists(), "a successful publish must leave the pipeline grant live for the next step");
+    assert!(run("v1.2.3", "0"), "the same grant covers a further step of the same release");
 
-    // The now-consumed grant cannot authorize a second publish.
-    assert!(!run("v1.2.3", "0"), "a consumed grant must not authorize another publish");
+    // …but only until it expires. An expired grant refuses and is cleaned up,
+    // which is the ONLY thing now bounding a release grant's lifetime, so it is
+    // the assertion that matters most in this file.
+    std::fs::write(group.join("release_grants/v1.2.3"), b"1\n1\n").unwrap();
+    assert!(!run("v1.2.3", "0"), "expired grant → blocked, even for a tag that was mid-pipeline");
+    assert!(!grant_path("v1.2.3").exists(), "expired grant is cleaned up, not left usable");
 
-    // Expired grants are still cleaned up (never claimed, never left behind).
-    std::fs::write(group.join("release_grants/v9.9.9"), b"1\n1\n").unwrap();
-    assert!(!run("v9.9.9", "0"), "expired grant → blocked");
-    assert!(!grant_path("v9.9.9").exists(), "expired grant is cleaned up, not left claimable");
+    // And only for its own tag: a live v1.2.3 grant is not a release grant.
+    write_grant("v1.2.3");
+    assert!(!run("v9.9.9", "0"), "a v1.2.3 grant must not authorize publishing v9.9.9");
+}
 
-    // Crash-between semantics: an orphaned `.claimed` file with no matching
-    // grant (as if the process died between claim and settle) must NOT
-    // authorize a publish — the bare grant file is gone, so the next publish
-    // sees "no grant" and fails closed, requiring a fresh one.
-    std::fs::create_dir_all(group.join("release_grants")).unwrap();
-    std::fs::write(group.join("release_grants/v13.0.0.claimed"), b"99999999999\n1\n").unwrap();
-    assert!(!run("v13.0.0", "0"), "an orphaned .claimed file with no live grant must not authorize a publish");
+#[test]
+fn release_grant_covers_one_tags_whole_pipeline_and_resolves_release_ids_fail_closed() {
+    // The headline pin for #437 + #438, executed end to end against BOTH real
+    // generated shims sharing one group dir — because the incident spanned them:
+    // the v1.1.0-beta6 grant was spent by the GIT shim's tag push, and the notes
+    // write that the GH shim then refused was part of the same release the human
+    // had already authorized. It was refused twice over, in fact: once because
+    // the grant was gone, and once because the notes call is addressed by
+    // canonical release id (`gh api -X PATCH …/releases/<id>`, which the release
+    // skill MANDATES over tag lookup, #282) and the shim could not extract a tag
+    // from it at all — the refusal literally read "release/tag ()".
+    //
+    // Four properties, and the last three are the security envelope that makes
+    // the first one safe to want:
+    //   (a) ONE grant covers tag push → release create/edit → notes-by-id.
+    //   (b) A different release id resolves to ITS OWN tag and is REFUSED.
+    //   (c) Expiry still refuses — the TTL is the wall, not the first use.
+    //   (d) An id loomux cannot resolve is REFUSED (fail-closed), never assumed
+    //       to belong to the granted tag.
+    use std::process::Command;
+    if Command::new("sh").arg("-c").arg("exit 0").status().map(|s| !s.success()).unwrap_or(true) {
+        eprintln!("SKIP release_grant_covers_one_tags_whole_pipeline…: no POSIX sh");
+        return;
+    }
+    let td = tempfile::tempdir().unwrap();
+    let root = td.path();
+    let group = root.join("group");
+    std::fs::create_dir_all(&group).unwrap();
+    let log = root.join("gh.log");
+
+    let fake_gh = write_fake_gh(root, &log);
+    let gh = root.join("gh");
+    std::fs::write(&gh, gh_shim_sh(&fake_gh.display().to_string(), &shim_paths())).unwrap();
+    // Fake git: `rev-parse` confirms $FAKE_TAG is a real tag; anything else "succeeds".
+    let fake_git = root.join("fakegit");
+    std::fs::write(&fake_git,
+        "#!/bin/sh\n\
+         if [ \"$1\" = \"rev-parse\" ]; then\n\
+           for a in \"$@\"; do case \"$a\" in refs/tags/*) [ \"$a\" = \"refs/tags/$FAKE_TAG\" ] && exit 0 ;; esac; done\n\
+           exit 1\n\
+         fi\n\
+         printf 'FAKE-GIT-RAN\\n'; exit 0\n").unwrap();
+    let git = root.join("git");
+    std::fs::write(&git, git_shim_sh(&fake_git.display().to_string(), &shim_paths())).unwrap();
+    let _ = Command::new("sh").arg("-c").arg(format!(
+        "chmod +x '{}' '{}' '{}' '{}'",
+        fake_gh.display(), gh.display(), fake_git.display(), git.display())).status();
+
+    // Release 555 is v1.2.3's (the granted one); 777 belongs to a different
+    // release entirely; every other id is unknown to gh (exits non-zero).
+    const REL_MAP: &str = "555=v1.2.3 777=v0.0.9";
+    let run_gh = |argv: &[&str]| -> bool {
+        Command::new("sh").arg(&gh).args(argv)
+            .env("LOOMUX_GROUP_DIR", &group).env("FAKE_REL_MAP", REL_MAP)
+            .status().unwrap().success()
+    };
+    let run_git = |argv: &[&str]| -> bool {
+        Command::new("sh").arg(&git).args(argv)
+            .env("LOOMUX_GROUP_DIR", &group).env("FAKE_TAG", "v1.2.3")
+            .status().unwrap().success()
+    };
+    let grant_path = group.join("release_grants").join("v1.2.3");
+    let write_grant = |expiry: &str| {
+        std::fs::create_dir_all(group.join("release_grants")).unwrap();
+        std::fs::write(&grant_path, format!("{expiry}\n1\n").as_bytes()).unwrap();
+    };
+    let audit = || std::fs::read_to_string(group.join("audit.jsonl")).unwrap_or_default();
+    let clear_audit = || { std::fs::write(group.join("audit.jsonl"), b"").unwrap(); };
+
+    // Baseline: with no grant at all, every step of the release is refused. If
+    // this ever passes, nothing below is measuring what it claims to.
+    let notes: &[&str] = &["api", "-X", "PATCH", "repos/o/r/releases/555", "-F", "body=@notes.md"];
+    assert!(!run_git(&["push", "origin", "refs/tags/v1.2.3"]), "no grant → tag push refused");
+    assert!(!run_gh(notes), "no grant → notes write refused");
+
+    // ---- (a) ONE grant, the whole pipeline, in the order a real release runs.
+    write_grant("99999999999");
+    assert!(run_git(&["push", "origin", "refs/tags/v1.2.3"]), "granted tag push must be allowed");
+    assert!(grant_path.exists(), "the tag push must NOT spend the grant — the release has more steps");
+    assert!(run_gh(&["release", "edit", "v1.2.3", "--notes", "x"]), "same grant covers the release edit");
+    clear_audit();
+    assert!(run_gh(notes), "same grant covers the release-NOTES write addressed by release id (#437)");
+    let a = audit();
+    assert!(a.contains("release-id-resolved") && a.contains("v1.2.3"),
+        "the id → tag resolution must be in the audit trail, got: {a}");
+    assert!(grant_path.exists(), "the grant is still live after the pipeline — only its TTL ends it");
+
+    // ---- (b) A DIFFERENT release is not covered, however it is addressed.
+    // 777 resolves to v0.0.9, so the v1.2.3 grant does not match it — this is
+    // the `make_latest` flip on somebody else's release, refused.
+    assert!(!run_gh(&["api", "-X", "PATCH", "repos/o/r/releases/777", "-f", "make_latest=true"]),
+        "a v1.2.3 grant must not authorize writing to another tag's release");
+    assert!(!run_gh(&["api", "-X", "DELETE", "repos/o/r/releases/777"]),
+        "a v1.2.3 grant must not authorize deleting another tag's release");
+    assert!(!run_gh(&["release", "create", "v0.0.9"]), "…nor publishing another tag by name");
+    assert!(!run_git(&["push", "origin", "refs/tags/v9.9.9"]), "…nor pushing another tag");
+
+    // A URL that names a release loomux cannot pin down — a traversal, or a
+    // sub-resource of one — resolves to nothing and is refused. (What makes
+    // that *safe* rather than merely conservative is that the resolving GET
+    // uses the write's own path verbatim, so the two can never address
+    // different releases; these shapes are refused because identity can't be
+    // established, and `an_id_addressed_release_write_never_takes_its_identity_
+    // from_a_caller_supplied_tag` is where it matters that the argv tag doesn't
+    // get to answer instead.)
+    assert!(!run_gh(&["api", "-X", "PATCH", "repos/o/r/releases/555/../777", "-f", "make_latest=true"]),
+        "a traversal inside a releases URL is not identifiable → refused");
+    assert!(!run_gh(&["api", "-X", "POST", "repos/o/r/releases/555/assets"]),
+        "a sub-resource of the granted release resolves to nothing → stays fail-closed");
+
+    // ---- (d) Fail-closed on an id gh cannot resolve. 999 is in no map entry,
+    // so the lookup exits non-zero with no output — a 404, a network failure, a
+    // gh that isn't authenticated. None of those may be read as "close enough".
+    clear_audit();
+    assert!(!run_gh(&["api", "-X", "PATCH", "repos/o/r/releases/999", "-F", "body=@notes.md"]),
+        "an unresolvable release id must be REFUSED, not assumed to be the granted one");
+    let a = audit();
+    assert!(a.contains("release-id-unresolved"), "the failed resolution must be audited, got: {a}");
+    assert!(a.contains("release-gate-blocked"), "…and the call blocked as a release-gate event, got: {a}");
+    assert!(grant_path.exists(), "a refusal must not consume the grant either");
+
+    // ---- (c) Expiry is the wall. Everything above stops the instant it passes.
+    write_grant("1");
+    assert!(!run_gh(notes), "expired grant → the notes write is refused");
+    assert!(!grant_path.exists(), "an expired grant is deleted, not left usable");
+    write_grant("1");
+    assert!(!run_git(&["push", "origin", "refs/tags/v1.2.3"]), "expired grant → the tag push is refused");
+    assert!(!run_gh(&["release", "edit", "v1.2.3", "--notes", "x"]), "expired grant → the release edit is refused");
+
+    // A read-only GET of the same release is not a publish and never was gated —
+    // pinned here so the id-resolution work can't quietly start gating reads.
+    assert!(run_gh(&["api", "repos/o/r/releases/555"]), "a read-only release GET still passes through");
+}
+
+#[test]
+fn release_id_addressed_calls_resolve_to_their_tag_before_the_grant_is_checked() {
+    // #437 ON ITS OWN. The pipeline test above covers this too, but it reaches
+    // it only *after* asserting #438's retained-grant behaviour — so on the
+    // pre-fix shim it panics on a #438 line and #437 is never witnessed red at
+    // all. This test's FIRST assertion is the #437 one, against a grant no
+    // earlier step has touched: it fails on the old shim because an
+    // id-addressed release write carries no tag to key a grant on, and for no
+    // other reason. Two halves of one PR need two witnesses.
+    use std::process::Command;
+    if Command::new("sh").arg("-c").arg("exit 0").status().map(|s| !s.success()).unwrap_or(true) {
+        eprintln!("SKIP release_id_addressed_calls_resolve…: no POSIX sh");
+        return;
+    }
+    let td = tempfile::tempdir().unwrap();
+    let root = td.path();
+    let group = root.join("group");
+    std::fs::create_dir_all(&group).unwrap();
+    let log = root.join("gh.log");
+    let fake = write_fake_gh(root, &log);
+    let shim = root.join("gh");
+    std::fs::write(&shim, gh_shim_sh(&fake.display().to_string(), &shim_paths())).unwrap();
+    let _ = Command::new("sh").arg("-c").arg(format!("chmod +x '{}' '{}'", fake.display(), shim.display())).status();
+
+    // 555 is the granted tag's release; 777 is somebody else's; nothing else resolves.
+    let run = |argv: &[&str]| -> bool {
+        Command::new("sh").arg(&shim).args(argv)
+            .env("LOOMUX_GROUP_DIR", &group).env("FAKE_REL_MAP", "555=v1.2.3 777=v0.0.9")
+            .status().unwrap().success()
+    };
+    let write_grant = || {
+        std::fs::create_dir_all(group.join("release_grants")).unwrap();
+        std::fs::write(group.join("release_grants/v1.2.3"), b"99999999999\n1\n").unwrap();
+    };
+
+    // THE #437 ASSERTION. `gh api -X PATCH repos/O/R/releases/<id> -F body=@…`
+    // is how the release skill mandates notes be applied — by canonical release
+    // id, never by tag lookup, because a tag can resolve to more than one
+    // release (#282). Under a live grant for the tag that release belongs to,
+    // it must be ALLOWED.
+    write_grant();
+    assert!(run(&["api", "-X", "PATCH", "repos/o/r/releases/555", "-F", "body=@notes.md"]),
+        "an id-addressed write to the GRANTED tag's release must resolve and be allowed (#437)");
+
+    // …and the resolution is what authorizes it, not the mere presence of a
+    // grant: the same shape against a release belonging to another tag is
+    // refused, with the same grant still live.
+    assert!(!run(&["api", "-X", "PATCH", "repos/o/r/releases/777", "-F", "body=@notes.md"]),
+        "the id must be resolved to ITS tag — another release is not covered");
+    // An id gh cannot resolve at all (404 / network / unauthenticated) is
+    // refused, never charitably read as the granted one.
+    assert!(!run(&["api", "-X", "PATCH", "repos/o/r/releases/424242", "-F", "body=@notes.md"]),
+        "an unresolvable release id fails closed");
+    // No grant at all → refused even for the resolvable id, so the assertion
+    // above is measuring the grant match and not a hole in the gate.
+    let _ = std::fs::remove_dir_all(group.join("release_grants"));
+    assert!(!run(&["api", "-X", "PATCH", "repos/o/r/releases/555", "-F", "body=@notes.md"]),
+        "resolving an id must not by itself authorize anything");
+}
+
+#[test]
+fn a_releases_tags_url_takes_its_identity_from_the_url_not_from_a_body_field() {
+    // Review round 2. `…/releases/tags/<tag>` names its release by TAG, right in
+    // the URL — but the gate read that shape as "no locus" and fell through to
+    // the ordinary tag path, where a body field answered for it:
+    //
+    //   gh api -X PATCH repos/o/r/releases/tags/v0.0.9 -f tag_name=<granted>
+    //
+    // was allowed while addressing somebody else's release. It is B1's shape
+    // one endpoint over, and it survived B1's fix because that fix keyed on
+    // "the URL carries a numeric id" and this URL carries a tag instead.
+    //
+    // GitHub exposes no write on that endpoint today, so this was unreachable
+    // rather than exploitable — which is exactly why it is worth closing: the
+    // gate would have been resting on the shape of someone else's API surface,
+    // and a surface that grows a write later does not send us a note. The tag is
+    // right there in the URL, so identity is derived from it with NO lookup.
+    use std::process::Command;
+    if Command::new("sh").arg("-c").arg("exit 0").status().map(|s| !s.success()).unwrap_or(true) {
+        eprintln!("SKIP a_releases_tags_url_takes_its_identity…: no POSIX sh");
+        return;
+    }
+    let td = tempfile::tempdir().unwrap();
+    let root = td.path();
+    let group = root.join("group");
+    std::fs::create_dir_all(&group).unwrap();
+    let log = root.join("gh.log");
+    let fake = write_fake_gh(root, &log);
+    let shim = root.join("gh");
+    std::fs::write(&shim, gh_shim_sh(&fake.display().to_string(), &shim_paths())).unwrap();
+    let _ = Command::new("sh").arg("-c").arg(format!("chmod +x '{}' '{}'", fake.display(), shim.display())).status();
+
+    let run = |argv: &[&str]| -> bool {
+        Command::new("sh").arg(&shim).args(argv)
+            .env("LOOMUX_GROUP_DIR", &group)
+            .env("FAKE_REL_MAP", "555=v1.2.3 777=v0.0.9")
+            .status().unwrap().success()
+    };
+    let grant = |tag: &str| {
+        let d = group.join("release_grants");
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join(tag), b"99999999999\n1\n").unwrap();
+    };
+
+    // The decoys: URL names v0.0.9's release, body claims the granted tag.
+    grant("v1.2.3");
+    for decoy in [
+        &["api", "-X", "PATCH", "repos/o/r/releases/tags/v0.0.9", "-f", "tag_name=v1.2.3"] as &[&str],
+        &["api", "-X", "DELETE", "repos/o/r/releases/tags/v0.0.9", "-f", "tag_name=v1.2.3"],
+        &["api", "-X", "PATCH", "repos/o/r/releases/tags/v0.0.9", "-F", "ref=refs/tags/v1.2.3"],
+        // A traversal in the tag position names no identifiable release either.
+        &["api", "-X", "PATCH", "repos/o/r/releases/tags/../v9", "-f", "tag_name=v1.2.3"],
+    ] {
+        assert!(!run(decoy), "the URL's tag segment is the locus, not a body field: {decoy:?}");
+    }
+
+    // …and the legitimate direction still works: the URL naming the GRANTED tag
+    // is allowed, and does it WITHOUT an API call, because the answer is in the
+    // URL. (`write_fake_gh` logs every invocation; the shim's id→tag lookup is
+    // the only thing that would put `tag_name` in that log for this argv.)
+    std::fs::write(&log, b"").unwrap();
+    assert!(run(&["api", "-X", "PATCH", "repos/o/r/releases/tags/v1.2.3", "-F", "body=@notes.md"]),
+        "a write to the granted tag's own releases/tags URL is allowed");
+    let logged = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(!logged.contains("tag_name"),
+        "the URL already carries the tag — resolving it must cost no API call, got: {logged}");
+
+    // Tag CASE is part of a tag, so the value is taken from the ORIGINAL path
+    // even though the shape test runs on the lowercased copy: a grant for
+    // `vRelease` must still be found when the URL says `vRelease`.
+    //
+    // Deliberately NOT asserted here: that `vrelease` is refused under a
+    // `vRelease` grant. It is refused on Linux and ALLOWED on Windows and macOS,
+    // and neither is this change's doing — a grant is looked up by opening
+    // `release_grants/<segment>`, so tag matching inherits the host filesystem's
+    // case sensitivity. That predates this PR (the same lookup keys merge grants
+    // and the git shim's tag push on the base branch) and is disclosed in the PR
+    // body rather than papered over with a test that would be red on two of the
+    // three CI platforms. What this pin does catch, on any case-sensitive host,
+    // is the value being lowercased on its way to the grant lookup.
+    grant("vRelease");
+    assert!(run(&["api", "-X", "PATCH", "repos/o/r/releases/tags/vRelease", "-F", "body=@notes.md"]),
+        "the tag is taken from the original path, so its case survives to the grant lookup");
+}
+
+#[test]
+fn an_id_addressed_release_write_never_takes_its_identity_from_a_caller_supplied_tag() {
+    // rev B1. Widening the grant to a whole pipeline is paid for by the claim
+    // that it still reaches exactly ONE tag — and that claim was false. The
+    // resolution was conditional on the argv naming no tag, so one extra flag
+    // suppressed it and handed a live grant the run of every release in the repo:
+    //
+    //   gh api -X PATCH repos/o/r/releases/777 -f tag_name=v1.2.3 -f make_latest=true
+    //
+    // keyed the gate on v1.2.3, found the human's grant for it, and then retagged
+    // release 777 and took `latest`. `-X DELETE … -f tag_name=v1.2.3` deleted an
+    // arbitrary release the same way (`tag_name` is ignored by the API on a
+    // DELETE — it existed only to satisfy the gate).
+    //
+    // This is the MIRROR of the decoys in
+    // `gh_shim_harness_gates_raw_api_tag_ref_by_locus_defeating_decoys`: those
+    // try to LOOSEN the gate with a cosmetic `refs/heads`, these SATISFY it with
+    // a cosmetic tag. The suite had no case for that direction, which is why the
+    // hole survived a green run. The rule pinned here: for a URL that names one
+    // release, identity comes from the ID, never from a body field the caller
+    // wrote — including when the id cannot be resolved, where the argv tag must
+    // not get to answer instead.
+    use std::process::Command;
+    if Command::new("sh").arg("-c").arg("exit 0").status().map(|s| !s.success()).unwrap_or(true) {
+        eprintln!("SKIP an_id_addressed_release_write_never_takes…: no POSIX sh");
+        return;
+    }
+    let td = tempfile::tempdir().unwrap();
+    let root = td.path();
+    let group = root.join("group");
+    std::fs::create_dir_all(&group).unwrap();
+    let log = root.join("gh.log");
+    let fake = write_fake_gh(root, &log);
+    let shim = root.join("gh");
+    std::fs::write(&shim, gh_shim_sh(&fake.display().to_string(), &shim_paths())).unwrap();
+    let _ = Command::new("sh").arg("-c").arg(format!("chmod +x '{}' '{}'", fake.display(), shim.display())).status();
+
+    // 555 → v1.2.3 (granted). 777 → v0.0.9 (someone else's). 888 → a tag_name
+    // that is not a plausible ref name at all. Nothing else resolves.
+    let run = |argv: &[&str]| -> bool {
+        Command::new("sh").arg(&shim).args(argv)
+            .env("LOOMUX_GROUP_DIR", &group)
+            .env("FAKE_REL_MAP", "555=v1.2.3 777=v0.0.9 888=has;semi")
+            .status().unwrap().success()
+    };
+    let grant = |tag: &str| {
+        let d = group.join("release_grants");
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join(tag), b"99999999999\n1\n").unwrap();
+    };
+    let audit = || std::fs::read_to_string(group.join("audit.jsonl")).unwrap_or_default();
+    let clear_audit = || { std::fs::write(group.join("audit.jsonl"), b"").unwrap(); };
+
+    // Control: the grant genuinely works for the release it is for, so every
+    // refusal below is the decoy being rejected and not the gate being shut.
+    grant("v1.2.3");
+    assert!(run(&["api", "-X", "PATCH", "repos/o/r/releases/555", "-F", "body=@notes.md"]),
+        "control: the granted release's own notes write is allowed");
+
+    // THE B1 SHAPES. Each names release 777 — which belongs to v0.0.9 — while
+    // claiming the granted tag in a field the caller chose.
+    for decoy in [
+        &["api", "-X", "PATCH", "repos/o/r/releases/777", "-f", "tag_name=v1.2.3", "-f", "make_latest=true"] as &[&str],
+        &["api", "-X", "DELETE", "repos/o/r/releases/777", "-f", "tag_name=v1.2.3"],
+        &["api", "-X", "PATCH", "repos/o/r/releases/777", "-F", "ref=refs/tags/v1.2.3"],
+        // …and the two shapes where the id CANNOT be resolved, where falling back
+        // to the argv tag would reopen the hole in a different dress.
+        &["api", "-X", "POST", "repos/o/r/releases/777/assets", "-f", "tag_name=v1.2.3"],
+        &["api", "-X", "PATCH", "repos/o/r/releases/../777", "-f", "tag_name=v1.2.3"],
+    ] {
+        assert!(!run(decoy), "a caller-supplied tag must not authorize an id-addressed write: {decoy:?}");
+    }
+
+    // The inverse direction: the URL names the GRANTED release, but the body
+    // would move it onto another tag. That publishes a tag nobody authorized, so
+    // it is refused rather than allowed on the strength of the resolved tag.
+    clear_audit();
+    assert!(!run(&["api", "-X", "PATCH", "repos/o/r/releases/555", "-f", "tag_name=v9.9.9"]),
+        "retagging the granted release onto an ungranted tag must be refused");
+    let a = audit();
+    assert!(a.contains("release-id-tag-mismatch"), "the two-tags-named case is audited distinctly, got: {a}");
+
+    // A tag_name read back from the API that is not a plausible ref name is
+    // rejected before it can be path-sanitized into some OTHER grant's segment
+    // (`has;semi` would sanitize to `has_semi`).
+    grant("has_semi");
+    assert!(!run(&["api", "-X", "PATCH", "repos/o/r/releases/888", "-F", "body=@notes.md"]),
+        "an implausible resolved tag_name must be rejected, not sanitized into a grant match");
+
+    // Unchanged: for `POST …/releases` (create) there is no id in the URL, so
+    // tag_name IS the locus and still keys the grant. This is the case the B1
+    // fix must not break.
+    grant("v1.2.3");
+    assert!(run(&["api", "-X", "POST", "repos/o/r/releases", "-f", "tag_name=v1.2.3"]),
+        "creating a release still keys on tag_name — there is no id to resolve");
+    assert!(!run(&["api", "-X", "POST", "repos/o/r/releases", "-f", "tag_name=v8"]),
+        "…and still refuses another tag");
 }
 
 #[test]
@@ -17922,7 +18328,10 @@ fn git_shim_harness_gates_tag_pushes() {
     assert!(!run(&["push", "origin", "refs/tags/v1.2.3"], ""), "tag push blocked without grant");
     grant("v1.2.3");
     assert!(run(&["push", "origin", "refs/tags/v1.2.3"], ""), "tag push allowed with grant");
-    assert!(!group.join("release_grants/v1.2.3").exists(), "release grant consumed");
+    // #438: the tag push is the FIRST step of the release, not the whole of it —
+    // the grant stays live so the `gh release`/notes steps ride the same one.
+    assert!(group.join("release_grants/v1.2.3").exists(), "the tag push must not spend the pipeline grant");
+    let _ = std::fs::remove_file(group.join("release_grants/v1.2.3"));
     // Bulk tag push → always blocked.
     assert!(!run(&["push", "--tags"], ""), "--tags is blocked");
     assert!(!run(&["push", "origin", "--follow-tags"], ""), "--follow-tags is blocked");
@@ -17932,7 +18341,8 @@ fn git_shim_harness_gates_tag_pushes() {
     // tag (v + letter) MUST be gated, not slip through the old `v[0-9]` pattern.
     grant("vbeta");
     assert!(run(&["push", "origin", "vbeta"], "vbeta"), "granted vbeta tag push allowed");
-    assert!(!run(&["push", "origin", "vbeta"], "vbeta"), "vbeta tag push blocked once the grant is consumed");
+    std::fs::write(group.join("release_grants/vbeta"), b"1\n1\n").unwrap(); // expire it
+    assert!(!run(&["push", "origin", "vbeta"], "vbeta"), "vbeta tag push blocked once the grant expires");
     assert!(!run(&["push", "origin", "vRelease"], "vRelease"), "vRelease (v* tag) is gated");
     // A non-v* ref never triggers release.yml, so it is NOT gated even if it's a tag.
     assert!(run(&["push", "origin", "nightly"], "nightly"), "a non-v* tag is not a release → not gated");
@@ -17973,14 +18383,15 @@ fn write_fake_git_with_push_exit(root: &std::path::Path) -> std::path::PathBuf {
 }
 
 #[test]
-fn git_shim_harness_a_tag_push_that_fails_does_not_burn_the_one_time_grant() {
+fn git_shim_harness_a_tag_push_that_fails_does_not_burn_the_grant() {
     // #315 (same bug class as #256/#303): the tag-push grant was consumed on
     // interception, before the real `git push` ran — a push git/GitHub
     // refuses (network, remote hook, protected ref, …) burned the one-time
     // grant on a push that never landed, leaving the human to re-grant.
-    // Proven against the REAL generated shim: a push that exits non-zero must
-    // leave the grant usable for a retry; only a push that exits 0 may
-    // consume it.
+    // #438 makes that unconditional: a release grant is never spent by any
+    // outcome, so a refused push has nothing to burn. Proven against the REAL
+    // generated shim — and the failure path is the interesting one to keep,
+    // because a future re-introduction of consume-on-use would land here first.
     use std::process::Command;
     if Command::new("sh").arg("-c").arg("exit 0").status().map(|s| !s.success()).unwrap_or(true) {
         eprintln!("SKIP git_shim_harness_a_tag_push_that_fails…: no POSIX sh");
@@ -18013,33 +18424,28 @@ fn git_shim_harness_a_tag_push_that_fails_does_not_burn_the_one_time_grant() {
     write_grant("v1.2.3");
     assert!(!run("1"), "a failed push must fail (surface git's refusal)");
     assert!(grant_path("v1.2.3").exists(), "a failed push must NOT consume the grant — this is the #315 bug");
-    assert!(!grant_path("v1.2.3.claimed").exists(), "no orphaned .claimed file after a resolved failure");
-    // #315 review NB2: the restore was silent in the audit — a failed push
-    // must leave a trace that the grant was handed back for retry, not just
-    // consume-or-not silence.
-    let audit = std::fs::read_to_string(group.join("audit.jsonl")).unwrap_or_default();
-    assert!(audit.contains("release-gate-restored"), "a restored grant must be audited, got: {audit}");
+    // The release path claims nothing, so it can never strand a `.claimed`
+    // sibling either — the crash-between-claim-and-settle hole simply has no
+    // shape here any more (the merge gate still claims, and still pins it).
+    assert!(!grant_path("v1.2.3.claimed").exists(), "the release path must not create a .claimed file at all");
 
-    // The SAME grant authorizes a retry, and a successful push DOES consume it.
+    // The SAME grant authorizes a retry, and a successful push leaves it live
+    // for the rest of THIS release's pipeline (#438).
     assert!(run("0"), "retry with the still-usable grant must succeed");
-    assert!(!grant_path("v1.2.3").exists(), "a successful push consumes the grant");
-    assert!(!grant_path("v1.2.3.claimed").exists(), "no orphaned .claimed file after a resolved success");
+    assert!(grant_path("v1.2.3").exists(), "a successful push leaves the pipeline grant live");
+    assert!(!grant_path("v1.2.3.claimed").exists(), "still no .claimed file after a success");
+    assert!(run("0"), "the same grant covers a re-push of the same tag inside its window");
 
-    // The now-consumed grant cannot authorize a second push.
-    assert!(!run("0"), "a consumed grant must not authorize another push");
-
-    // Expired grants are still cleaned up (never claimed, never left behind).
+    // Expired grants are refused and cleaned up — the one and only stop.
     std::fs::write(group.join("release_grants/v1.2.3"), b"1\n1\n").unwrap();
     assert!(!run("0"), "expired grant → blocked");
-    assert!(!grant_path("v1.2.3").exists(), "expired grant is cleaned up, not left claimable");
+    assert!(!grant_path("v1.2.3").exists(), "expired grant is cleaned up, not left usable");
 
-    // Crash-between semantics: an orphaned `.claimed` file with no matching
-    // grant (as if the process died between claim and settle) must NOT
-    // authorize a push — the bare grant file is gone, so the next push sees
-    // "no grant" and fails closed, requiring a fresh one.
+    // A stray `.claimed` file (left over from a pre-#438 shim, or hand-made)
+    // is NOT a grant path and must authorize nothing.
     std::fs::create_dir_all(group.join("release_grants")).unwrap();
     std::fs::write(group.join("release_grants/v1.2.3.claimed"), b"99999999999\n1\n").unwrap();
-    assert!(!run("0"), "an orphaned .claimed file with no live grant must not authorize a push");
+    assert!(!run("0"), "a stray .claimed file with no live grant must not authorize a push");
 }
 
 /// Extract a named shell function's body — everything from the line after its
@@ -18057,20 +18463,32 @@ fn extract_shell_fn(script: &str, name: &str) -> String {
 }
 
 #[test]
-fn gh_and_git_shim_grant_claim_settle_fragments_stay_byte_identical() {
-    // #315 review NB1: loomux_grant_claim/loomux_grant_settle are inlined
-    // separately in the gh shim and the git shim (the git shim is a separate
-    // generated script with no shared shell lib) — nothing pins the two
-    // copies to the same mechanics. A one-sided edit to either fragment (a
-    // claim race fixed in one shim but not the other, an audit event added
-    // to one and not the other, …) must go red here, not drift silently.
+fn gh_and_git_shim_release_grant_check_stays_byte_identical() {
+    // #315 review NB1, carried forward to #438's replacement: the release-grant
+    // validity check is inlined into two separately generated scripts with no
+    // shared shell lib, and it is the single place deciding what a release grant
+    // is worth. A one-sided edit — a TTL comparison relaxed in one shim, an
+    // expiry cleanup dropped from the other — must go red here, not drift.
+    //
+    // It is now substituted from ONE Rust const, so this asserts a property the
+    // build already guarantees rather than reconciling two hand-kept copies;
+    // that is deliberate belt-and-braces on a security boundary, and it is what
+    // goes red if someone "helpfully" re-inlines a second copy.
     let gh = gh_shim_sh("C:/Program Files/GitHub CLI/gh.exe", &shim_paths());
     let git = git_shim_sh("C:/Program Files/Git/cmd/git.exe", &shim_paths());
-    for f in ["loomux_grant_claim", "loomux_grant_settle"] {
-        let a = extract_shell_fn(&gh, f);
-        let b = extract_shell_fn(&git, f);
-        assert_eq!(a, b, "{f} has drifted between the gh shim and the git shim");
-    }
+    let a = extract_shell_fn(&gh, "loomux_release_grant_valid");
+    let b = extract_shell_fn(&git, "loomux_release_grant_valid");
+    assert_eq!(a, b, "loomux_release_grant_valid has drifted between the gh shim and the git shim");
+    // It must genuinely gate on the expiry, not merely exist.
+    assert!(a.contains("head -n1") && a.contains("date +%s") && a.contains("-ge"),
+        "the release-grant check must compare the grant's expiry against the clock, got: {a}");
+    assert!(a.contains("rm -f"), "an expired release grant must be deleted, not left on disk");
+    // The one-time claim/settle machinery now serves the MERGE gate only — it
+    // must be gone from the git shim, which has no one-time grants left.
+    assert!(gh.contains("loomux_grant_claim") && gh.contains("loomux_grant_settle"),
+        "the gh shim's merge gate still claims/settles its one-time per-PR grant");
+    assert!(!git.contains("loomux_grant_claim") && !git.contains("loomux_grant_settle"),
+        "the git shim gates only releases, which are never consumed — no dead claim/settle");
 }
 
 /// Record that a #509 pin could not arm — visibly, and in a way that cannot let
@@ -18840,7 +19258,10 @@ fn every_shim_normalizer_is_guarded_or_explicitly_exempted() {
     let shims = [
         // 11 → 12 with #565's `b_norm` (the PR body, canonicalized for the
         // `also: body-unchanged` digest) — a deliberate addition, and guarded.
-        ("gh", gh_shim_sh("C:/gh.exe", &paths), 12usize),
+        // 12 → 13 with #437's `_tag` (the tag a release id resolves to, CR-
+        // stripped before it is matched against a grant) — also deliberate, also
+        // guarded: an empty result there would key the grant lookup on nothing.
+        ("gh", gh_shim_sh("C:/gh.exe", &paths), 13usize),
         ("git", git_shim_sh("C:/git.exe", &paths), 1usize),
     ];
     let mut all_sites: Vec<(String, String)> = Vec::new();
@@ -19679,25 +20100,36 @@ fn gh_shim_harness_gates_raw_api_release_and_tag_ref_shapes() {
     assert!(!run(post_release), "dangerous ignored while autonomous → api release blocked");
     clear("autonomous"); clear("dangerous_mode");
 
-    // 4) A matching per-tag grant authorizes exactly one publish of the resolvable-tag
-    //    shapes (tag resolved from the api fields), then is consumed.
+    // 4) A matching per-tag grant authorizes the resolvable-tag shapes (tag
+    //    resolved from the api fields) — and, since #438, keeps authorizing them
+    //    for its window instead of being spent by the first one.
     for shape in resolvable {
         clear_audit();
         write_grant("v9");
         assert!(run(shape), "grant for v9 must allow: {shape:?}");
         assert!(audit().contains("release-gate-granted"), "granted marker for {shape:?}, got: {}", audit());
-        assert!(!group.join("release_grants/v9").exists(), "grant consumed for {shape:?}");
-        assert!(!run(shape), "consumed grant → second publish blocked: {shape:?}");
+        assert!(group.join("release_grants/v9").exists(), "grant retained for {shape:?} (#438)");
+        assert!(run(shape), "the same grant still covers a repeat of the same step: {shape:?}");
+        // …until it expires, which is the only thing that ends it.
+        std::fs::write(group.join("release_grants/v9"), b"1\n1\n").unwrap();
+        assert!(!run(shape), "expired grant → blocked: {shape:?}");
     }
     // A grant for the wrong tag cannot authorize another tag.
     write_grant("v9");
     assert!(!run(&["api", "-X", "POST", "repos/o/r/releases", "-f", "tag_name=v8"]), "a v9 grant cannot publish v8");
 
-    // 5) DELETE-by-id has no cheaply-resolvable tag → a per-tag grant can't help;
-    //    only the blanket markers (above) allow it. With just a grant present, blocked.
+    // 5) DELETE-by-id: since #437 the shim resolves the id to its tag with one
+    //    read-only lookup, so it IS grant-keyable — but only against the tag that
+    //    id actually belongs to, and only when gh can resolve it. Here the fake gh
+    //    has no FAKE_REL_MAP entry, so the lookup fails and the call stays blocked
+    //    (fail-closed), exactly as it was before the resolution existed. The
+    //    resolvable and wrong-tag cases are pinned in
+    //    release_grant_covers_one_tags_whole_pipeline_and_resolves_release_ids_fail_closed.
     let _ = std::fs::remove_dir_all(group.join("release_grants"));
     write_grant("v9");
-    assert!(!run(delete_release), "DELETE-by-id is not grant-keyable → blocked");
+    clear_audit();
+    assert!(!run(delete_release), "an unresolvable release id is not grant-keyable → blocked");
+    assert!(audit().contains("release-id-unresolved"), "the failed resolution is audited, got: {}", audit());
 
     // Refusals are audited as release-gate (not merge-gate) events.
     let _ = std::fs::remove_dir_all(group.join("release_grants"));
@@ -19815,13 +20247,16 @@ fn gh_shim_harness_gates_raw_api_tag_ref_by_locus_defeating_decoys() {
     clear("dangerous_mode");
 
     // ---- Grant keys on the tag resolved from the LOCUS (argv ref, URL path, parsed
-    // body, graphql name); consumed on use; a wrong-tag grant does not authorize.
+    // body, graphql name); retained for its window (#438); a wrong-tag grant does
+    // not authorize.
     for s in [plain, patch_move, input_tag, gql_createref] {
         clear_audit();
         write_grant("v9");
         assert!(run(s), "a v9 grant must allow the tag-resolvable shape: {s:?}");
         assert!(audit().contains("release-gate-granted"), "granted marker for {s:?}, got: {}", audit());
-        assert!(!group.join("release_grants/v9").exists(), "grant consumed for {s:?}");
+        assert!(group.join("release_grants/v9").exists(), "the grant covers the rest of v9's pipeline: {s:?}");
+        std::fs::write(group.join("release_grants/v9"), b"1\n1\n").unwrap();
+        assert!(!run(s), "…but not once it has expired: {s:?}");
     }
     write_grant("v9");
     assert!(!run(&["api", "-X", "PATCH", "repos/o/r/git/refs/tags/v8", "-f", "sha=x"]), "a v9 grant cannot move tag v8");
@@ -19944,15 +20379,16 @@ fn gh_shim_harness_gates_graphql_endpoint_variants_and_variable_ref() {
     }
     clear("autonomous"); clear("auto_release");
 
-    // ---- A v9 grant allows once + consumed: resolved from the -F ref= variable, and
-    // from an inline refs/tags name in a deleteRef.
+    // ---- A v9 grant allows, and is retained for its window (#438): resolved from
+    // the -F ref= variable, and from an inline refs/tags name in a deleteRef.
     write_grant("v9");
     assert!(run(&["api", "https://api.github.com/graphql", "-F", "ref=refs/tags/v9", "-f", cr_var]),
         "a v9 grant resolved from the graphql variable must allow the createRef");
-    assert!(!group.join("release_grants/v9").exists(), "grant consumed");
-    write_grant("v9");
+    assert!(group.join("release_grants/v9").exists(), "grant retained for the rest of v9's pipeline");
     assert!(run(del_ref_name), "a v9 grant resolved from an inline deleteRef refs/tags name must allow");
-    assert!(!group.join("release_grants/v9").exists(), "grant consumed by deleteRef");
+    // Expiry is what ends it — for the graphql arm too.
+    std::fs::write(group.join("release_grants/v9"), b"1\n1\n").unwrap();
+    assert!(!run(del_ref_name), "an expired v9 grant must not allow the deleteRef");
 }
 
 #[test]

@@ -67,6 +67,16 @@ git tag vX.Y.Z
 git push origin vX.Y.Z
 ```
 
+**Ask for the release grant once.** The grant the human issues for `vX.Y.Z`
+covers that tag's whole pipeline — this tag push, `gh release create|edit
+vX.Y.Z`, and the release-notes write in step 4 — for ~90 minutes. It is not
+spent by the tag push, so do **not** go back to the human for a second grant
+mid-release; if a step is refused, the reason is one of: the window expired
+(ask for a fresh grant, saying so), the call names a *different* tag or
+release, or a release id loomux could not resolve (the refusal message says
+which). The version-bump PR's merge in step 1 is **not** covered — that is
+still the human's merge, as always.
+
 ## 3. Watch the workflow
 
 `gh run list --workflow release.yml` then watch the run — `create-release`,
@@ -135,6 +145,10 @@ real notes after the assets are up:
   `release_id` is what keeps them from drifting onto the wrong one. The
   idempotence guard and the concurrency group make a stray duplicate
   unlikely, but "never by tag" costs nothing and closes the class outright.
+  The gate resolves that `release_id` back to its tag before matching your
+  release grant, so id-addressed notes are covered by the same grant as the
+  tag push — no second authorization, and no need to fall back to the
+  tag-named edit this rule exists to avoid (#437).
   - `promote` also warns (non-fatally, right before it flips the release
     public) if the release body is still empty at that point, so a
     notes-less publish is loud in the run log instead of silently going out

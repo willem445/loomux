@@ -424,6 +424,59 @@ fn shim_deps_preamble(utils_dir: Option<&str>) -> String {
     )
 }
 
+/// The release-grant validity check, embedded **byte-identically** into both the
+/// `gh` shim and the `git` shim (two separately generated scripts with no shared
+/// shell library) — by construction from this one const, not by two copies that
+/// happen to agree today. It is the single place that decides what a release
+/// grant is worth, so a one-sided edit is not expressible.
+///
+/// **A release grant is a PIPELINE grant, not a one-time token (#438).** When the
+/// human authorizes "release vX.Y.Z" they are authorizing the steps that release
+/// actually takes — the `vX.Y.Z` tag push, `gh release create|edit vX.Y.Z`, and
+/// the release-notes write against that tag's release. Burning the grant on the
+/// first of those and refusing the rest is the bug: the live v1.1.0-beta6 cut
+/// spent its grant on the tag push and then had to ask the human a second time
+/// for the notes PATCH, which was part of the same release the human had already
+/// said yes to (and v1.0.0 needed three touches for one release).
+///
+/// **What still bounds it** — and this is the whole security argument, since the
+/// grant is no longer self-limiting by use count:
+/// - **Tag identity.** The grant file is keyed by tag segment, so it authorizes
+///   `vX.Y.Z` and nothing else. Another tag, and another release (an id-addressed
+///   call resolves to ITS OWN tag before this check — a `make_latest` flip on some
+///   other release resolves to that release's tag and finds no grant), are refused
+///   exactly as before.
+/// - **The TTL.** Every step re-reads line 1 and re-compares it to the clock, so
+///   the window is a hard wall, not a first-use wall. One second past expiry the
+///   next step is refused and the file is deleted.
+/// - **Default-deny.** No grant file, an unparseable expiry, or a clock we cannot
+///   read at all → refuse.
+///
+/// The clock check is deliberately **stricter** than `loomux_grant_claim`'s (which
+/// treats an unreadable `date` as "not yet expired"): a token spent once can
+/// tolerate that, a grant that stays live until a timestamp cannot — an
+/// unevaluable window is an unbounded one.
+///
+/// This is also why the release path has **no claim/settle** (the merge gate keeps
+/// it): that machinery exists to stop a one-time grant being double-spent and to
+/// hand it back when the step it authorized failed. With nothing spent there is
+/// nothing to double-spend and nothing to restore — and #303/#315 ("a publish or
+/// tag push GitHub refuses must not burn the human's grant") now hold by
+/// construction rather than by remembering to call settle.
+const RELEASE_GRANT_VALID_SH: &str = r#"loomux_release_grant_valid() { # $1=grantfile
+  [ -f "$1" ] || return 1
+  exp=$(head -n1 "$1" 2>/dev/null)
+  case "$exp" in ''|*[!0-9]*) exp=0 ;; esac
+  now=$(date +%s 2>/dev/null)
+  case "$now" in ''|*[!0-9]*) return 1 ;; esac
+  if [ "$now" -ge "$exp" ]; then
+    rm -f "$1"
+    return 1
+  fi
+  return 0
+}
+"#;
+
 #[doc(hidden)] // pub so the integration test can pin the security-critical guards
 pub fn gh_shim_sh(real_gh: &str, paths: &ShimPaths) -> String {
     // Template uses a placeholder (not format!) so the shell's own `$`/`{}` stay
@@ -458,8 +511,19 @@ loomux_block_wf() { # $1=reason $2=detail
   loomux_audit "merge-gate-workflow-blocked" "{\"reason\":\"$1\",\"pr\":\"$num\"}"
   exit 1
 }
-loomux_block_release() { # $1=tag $2=action
-  printf '%s\n' "loomux: publishing a release/tag ($1) requires an explicit human grant — releases publish to the world (GitHub release + npm), which autonomous mode does NOT authorize. Ask the human to grant the release; do NOT publish." >&2
+loomux_block_release() { # $1=tag $2=action $3=conflicting caller-supplied tag (optional)
+  if [ -n "$3" ]; then
+    # rev B1: the URL names one release and the body names a different tag. Never
+    # matched against a grant — a grant authorizes ONE tag and this call names two.
+    printf '%s\n' "loomux: refusing this release call — the release it addresses is tagged '$1', but the call's own tag_name/ref field says '$3'. loomux takes an id-addressed release's identity from the id in the URL, never from a tag field the caller supplied, so this cannot be matched to a grant: a grant authorizes one tag and this names two. If you meant to edit the '$1' release, drop the tag_name/ref field. If you meant to RETAG it to '$3', that publishes a tag nobody has authorized — ask the human to grant '$3' first; do NOT publish." >&2
+  elif [ -n "$1" ]; then
+    printf '%s\n' "loomux: publishing a release/tag ($1) requires an explicit human grant — releases publish to the world (GitHub release + npm), which autonomous mode does NOT authorize. Ask the human to grant the release; do NOT publish." >&2
+  else
+    # #437: the pre-fix message rendered this case as "release/tag ()" — the empty
+    # parens being the only clue that the shim had found no tag to key a grant on,
+    # which is a different problem needing a different action from the agent.
+    printf '%s\n' "loomux: this call publishes a release but names no tag loomux could resolve, so it cannot be matched against a release grant — and a grant authorizes ONE tag, never 'whichever release this turns out to be'. Refusing it rather than guessing. If you addressed a release by numeric id, check that id exists and that gh can read it (loomux resolves id → tag with one read-only lookup); otherwise address the release by its tag. Then ask the human to grant THAT release; do NOT publish." >&2
+  fi
   loomux_audit "release-gate-blocked" "{\"tag\":\"$1\",\"action\":\"$2\"}"
   exit 1
 }
@@ -487,12 +551,15 @@ loomux_sha256() { # stdin → 64 hex chars, or empty
   case "$_h" in *[!0-9a-f]*) _h='' ;; esac
   printf '%s' "$_h"
 }
-# #256/#303: CLAIM a one-time grant without spending it yet — a gated command
-# (merge OR release/tag publish) must consume its grant only when the real
-# `gh` call it authorizes actually SUCCEEDS (live incident: a merge grant
-# burned on a draft PR that GitHub refused to merge, leaving the PR unmerged
-# and the human having to re-Approve; #303 is the same bug class for release
-# grants). An expired grant is still deleted here (never usable, no reason to
+# #256: CLAIM a one-time grant without spending it yet — the MERGE gate's grant
+# (`merge_grants/pr-<N>`) is the only one-time grant left, and it must be
+# consumed only when the real `gh` call it authorizes actually SUCCEEDS (live
+# incident: a merge grant burned on a draft PR that GitHub refused to merge,
+# leaving the PR unmerged and the human having to re-Approve). Release grants
+# used to share this (#303/#315) and no longer do — they are pipeline grants
+# now, checked and never spent (see loomux_release_grant_valid), which is why
+# those two issues' property holds here by construction rather than by settle.
+# An expired grant is still deleted here (never usable, no reason to
 # keep it around). A live grant is instead handed off via `mv` to a
 # `.claimed` sibling — a RENAME, which POSIX guarantees atomic — so exactly
 # one caller can ever win it: two concurrent claimants both see the file
@@ -523,12 +590,10 @@ loomux_grant_claim() { # $1=grantfile
 }
 # Finish a claim made by loomux_grant_claim, once the real gh's exit status is
 # known: consume it (rm) on success, or restore it to the original grant path
-# on failure so a retry can still use it. Shared by the merge gate and the
-# release gate (#303) — one settle mechanism, not two copies. $1=original
-# grantfile $2=claimed file $3=the real gh's exit code $4=audit label to emit
-# on restore (optional — #315 review: a restore was silent in the audit; the
-# merge gate still passes nothing here and stays silent, only the release
-# gate's callers pass "release-gate-restored").
+# on failure so a retry can still use it. The merge gate is now its only
+# caller. $1=original grantfile $2=claimed file $3=the real gh's exit code
+# $4=audit label to emit on restore (optional — the merge gate passes nothing
+# and stays silent).
 loomux_grant_settle() { # $1=grantfile $2=claimed $3=exit-code $4=restore-audit-label
   if [ "$3" -eq 0 ]; then
     rm -f "$2"   # succeeded — the one-time grant is spent
@@ -542,31 +607,78 @@ loomux_grant_settle() { # $1=grantfile $2=claimed $3=exit-code $4=restore-audit-
 # a v* tag ref, create/edit/delete a release, graphql *Release mutation) — routes
 # through here, so the api path can never diverge from the subcommand path. Allowed
 # by autonomous+auto_release (blanket, not grant-consumed), supervised dangerous
-# mode (human present, not autonomous), or a valid one-time per-tag grant; else
-# fail-safe block. $1=tag ("" when not cheaply resolvable — then only the blanket
-# markers can allow), $2=action label. Returns 0 to allow; blocks with a message
-# + exit 1 (never returns) otherwise. On a GRANT-backed allow this only CLAIMS
-# the grant (#303, same fix as #256's merge grant) — it sets `_grant_claimed`
-# (the claimed path) and `_rg_gf` (the original grant path) and leaves spending
-# it to the caller: run the real gh, then `loomux_grant_settle "$_rg_gf"
-# "$_grant_claimed" "$rc"`. On a blanket allow (autonomous+auto_release or
-# dangerous mode) `_grant_claimed` is left empty — those aren't a one-time
-# resource, so the caller can `exec` the real gh directly with nothing to
-# settle.
-loomux_release_gate() { # $1=tag $2=action
-  _tag="$1"; _action="$2"
-  _grant_claimed=""
+# mode (human present, not autonomous), or a valid per-tag grant; else fail-safe
+# block. $1=tag as resolved from the argv ("" when the argv named none), $2=action
+# label, $3=the `repos/…/releases/<id>` path to resolve when the call addresses a
+# release by numeric id AND that id could be isolated safely, $4="1" when the URL
+# addresses one specific release at all (#437/rev B1 — then $4, not $1, decides
+# identity: see below, and note $4=1 with $3="" means "names a release we cannot
+# identify", which refuses). Returns 0 to allow; blocks with a message + exit 1
+# (never returns) otherwise. A grant-backed allow does NOT consume anything
+# (#438) — see loomux_release_grant_valid — so every caller just `exec`s the real
+# gh.
+__RELEASE_GRANT_VALID__
+loomux_release_gate() { # $1=argv tag $2=action $3=path to resolve ("") $4="1" if the URL names one release $5=tag the URL itself carries
+  _tag="$1"; _action="$2"; _relpath="$3"; _relid="$4"; _urltag="$5"
   if [ -n "$LOOMUX_GROUP_DIR" ] && [ -f "$LOOMUX_GROUP_DIR/autonomous" ] && [ -f "$LOOMUX_GROUP_DIR/auto_release" ]; then
     loomux_audit "release-gate-allowed" "{\"tag\":\"$_tag\",\"action\":\"$_action\"}"; return 0
   fi
   if [ -n "$LOOMUX_GROUP_DIR" ] && [ -f "$LOOMUX_GROUP_DIR/dangerous_mode" ] && [ ! -f "$LOOMUX_GROUP_DIR/autonomous" ]; then
     loomux_audit "release-gate-dangerous" "{\"tag\":\"$_tag\",\"action\":\"$_action\"}"; return 0
   fi
+  # #437: an id-addressed release write (`gh api … repos/O/R/releases/<id>`) carries
+  # NO tag anywhere in its argv, so the per-tag grant lookup below had nothing to key
+  # on and every such call was refused — including the release-NOTES write, which the
+  # release skill MANDATES be addressed by canonical release id precisely so notes
+  # can't drift onto a duplicate release the tag also resolves to (#282). Resolve the
+  # id to its tag with ONE read-only GET against the REAL gh (never the shim — no
+  # recursion), and gate on that tag like any other. Deliberately placed AFTER the
+  # blanket openings so a marker-allowed release costs no extra API call.
+  #
+  # When the path names a specific release ($_relid), the ID is the identity and any
+  # tag the argv supplied is DISCARDED before it can key anything (rev B1 — see the
+  # api arm's own note). Three outcomes, none of which can fall back to the argv tag:
+  #
+  #  1. Resolved, and the argv named no tag or the SAME tag → gate on the resolved
+  #     tag. This is the release-notes write, the case #437 exists for.
+  #  2. Resolved, but the argv named a DIFFERENT tag → refuse outright and say so.
+  #     This is either a retag (moving release <id> onto another tag, which
+  #     publishes a tag nobody granted) or a decoy trying to borrow this grant for
+  #     another release. Both need their own authorization, so neither may proceed
+  #     on the strength of a grant for a third tag. Letting the resolved tag simply
+  #     win would allow case 2's retag whenever the resolved tag happened to be the
+  #     granted one — refusing is the tighter of the two options the review offered.
+  #  3. Not resolvable at all → refuse. FAIL-CLOSED is the whole security argument:
+  #     a lookup that errors, 404s, prints nothing, prints `null`, prints anything
+  #     that is not a plausible ref name, or a path whose id could not be isolated
+  #     ($_relpath empty), leaves $_tag EMPTY, which matches no grant. An id loomux
+  #     cannot resolve is never "probably fine".
+  if [ "$_relid" = "1" ]; then
+    _argvtag="$_tag"
+    # The URL's own tag segment, when it has one (`…/releases/tags/<tag>`), is
+    # already the answer — no lookup, no API call. Otherwise resolve the id.
+    _tag="$_urltag"; _src="url"
+    if [ -z "$_tag" ] && [ -n "$_relpath" ]; then
+      _src="lookup"
+      _rawtag=$("$REAL_GH" api "$_relpath" --jq '.tag_name' 2>/dev/null | head -n1)
+      _tag=$(printf '%s' "$_rawtag" | tr -d '\r')
+      loomux_norm_guard "$_rawtag" "$_tag" "release-id-tag-name"
+      case "$_tag" in ''|null|*[!A-Za-z0-9._+/-]*) _tag="" ;; esac
+    fi
+    if [ -z "$_tag" ]; then
+      loomux_audit "release-id-unresolved" "{\"path\":\"$_relpath\",\"action\":\"$_action\"}"
+    elif [ -n "$_argvtag" ] && [ "$_argvtag" != "$_tag" ]; then
+      loomux_audit "release-id-tag-mismatch" "{\"path\":\"$_relpath\",\"tag\":\"$_tag\",\"claimed\":\"$_argvtag\",\"src\":\"$_src\",\"action\":\"$_action\"}"
+      loomux_block_release "$_tag" "$_action" "$_argvtag"
+    else
+      loomux_audit "release-id-resolved" "{\"path\":\"$_relpath\",\"tag\":\"$_tag\",\"src\":\"$_src\",\"action\":\"$_action\"}"
+    fi
+  fi
   _safe=$(printf '%s' "$_tag" | tr -c 'A-Za-z0-9._-' '_')
   loomux_norm_guard "$_tag" "$_safe" "release-grant-tag"
   _rg_gf=""
   [ -n "$LOOMUX_GROUP_DIR" ] && [ -n "$_safe" ] && _rg_gf="$LOOMUX_GROUP_DIR/release_grants/$_safe"
-  if [ -n "$_rg_gf" ] && loomux_grant_claim "$_rg_gf"; then
+  if [ -n "$_rg_gf" ] && loomux_release_grant_valid "$_rg_gf"; then
     loomux_audit "release-gate-granted" "{\"tag\":\"$_tag\",\"action\":\"$_action\"}"; return 0
   fi
   loomux_block_release "$_tag" "$_action"
@@ -605,15 +717,9 @@ __GIT_PLUMBING__
 if [ "$cmd" = "release" ]; then
   case "$sub" in
     create|edit|delete)
-      loomux_release_gate "$sel" "$sub"   # allow (return) or block (exit); tag = $sel
-      if [ -n "$_grant_claimed" ]; then
-        # Grant-backed allow: run (not exec) so the exit status can settle the
-        # claim — #303, same reasoning as the merge grant's fix (#256).
-        "$REAL_GH" "$@"
-        rc=$?
-        loomux_grant_settle "$_rg_gf" "$_grant_claimed" "$rc" "release-gate-restored"
-        exit "$rc"
-      fi
+      # `gh release <sub> <tag>` names its tag as the SELECTOR — that is the locus,
+      # not a body field, so there is no id to resolve and nothing to cross-check.
+      loomux_release_gate "$sel" "$sub" "" "" ""   # allow (return) or block (exit); tag = $sel
       exec "$REAL_GH" "$@" ;;
     *) exec "$REAL_GH" "$@" ;;
   esac
@@ -759,15 +865,84 @@ if [ "$cmd" = "api" ]; then
     fi
   fi
   if [ "$is_rel" = "1" ]; then
-    loomux_release_gate "$rtag" "api"   # allow (return) or block (exit)
-    if [ -n "$_grant_claimed" ]; then
-      # Grant-backed allow: run (not exec) so the exit status can settle the
-      # claim — #303, same reasoning as the merge grant's fix (#256).
-      "$REAL_GH" "$@"
-      rc=$?
-      loomux_grant_settle "$_rg_gf" "$_grant_claimed" "$rc" "release-gate-restored"
-      exit "$rc"
-    fi
+    # #437: hand the gate the release resource this call addresses, so it can
+    # resolve id → tag itself.
+    #
+    # `_relid=1` means "this URL names ONE SPECIFIC release by numeric id". That
+    # flag is computed UNCONDITIONALLY — never skipped because the argv happened
+    # to mention a tag — and it is the security-critical half of #437 (rev B1).
+    # For such a call the release's identity is the ID; `tag_name=`/`ref=` are
+    # body fields the CALLER chose, so trusting them here let one live grant
+    # reach every release in the repo:
+    #   gh api -X PATCH repos/o/r/releases/777 -f tag_name=v1.2.3 -f make_latest=true
+    # keyed the gate on v1.2.3, found the human's grant, and retagged release 777
+    # (never authorized by anyone) plus stole `latest`. `-X DELETE … -f
+    # tag_name=v1.2.3` did the same to delete one — `tag_name` is ignored by the
+    # API on a DELETE, so it existed purely to satisfy the gate. That is the
+    # mirror image of the decoys `gh_shim_harness_gates_raw_api_tag_ref_by_locus_
+    # defeating_decoys` already defeats: those loosen the gate, these SATISFY it.
+    # This is exactly the locus principle the rest of this arm follows — for
+    # `git/refs/tags/v9` the locus IS the tag; for `releases/<id>` it is the id.
+    #
+    # `_relpath` — the resource to GET — is `$a_path` ITSELF, not a reconstructed
+    # prefix and not the lowercased copy (rev N2). That is the property the whole
+    # resolution rests on: gh normalizes the string it is given, so resolving and
+    # writing the SAME string can never address two different releases. An earlier
+    # cut resolved `${prefix}releases/${id}`, and there `…/releases/555/../444`
+    # really would have read release 555's tag and written to 444 — with `$a_path`
+    # that divergence is not expressible.
+    #
+    # So the two shape tests below are NOT what makes traversal safe (the PR body
+    # said they were; that was written against the prefix design and was wrong).
+    # What they do is decide `_relid`, and that is load-bearing for a different
+    # reason: a URL that names a release loomux cannot pin down must still count
+    # as id-addressed, so the argv tag is refused the chance to speak for it.
+    #   - `…/releases/555/assets`  → id-addressed, unidentifiable → refuse
+    #   - `…/releases/../777`      → id-addressed, unidentifiable → refuse
+    # Drop either test and `-f tag_name=<granted>` walks through on those shapes,
+    # which is B1 again in a different dress. Both are pinned by mutation.
+    #
+    # `…/releases/tags/<tag>` (rev round 2) names its release by TAG, in the URL.
+    # That is a locus in the plainest sense — no lookup needed, the answer is
+    # right there — so it is read from the URL and outranks the argv exactly as a
+    # resolved id does. Before that it fell through to the ordinary tag path, and
+    # `-X PATCH …/releases/tags/v0.0.9 -f tag_name=<granted>` was allowed while
+    # naming somebody else's release. GitHub happens to expose no write on that
+    # endpoint today, so it was unreachable rather than harmless — and "unreachable
+    # because of the shape of someone else's API surface" is not a property this
+    # gate should rest on. `…/releases/latest` names no specific release and is
+    # left to the ordinary tag path.
+    _relpath=""; _relid=0; _urltag=""
+    case "$path_low" in
+      releases/*|*/releases/*)
+        case "$path_low" in
+          *..*)
+            # A traversal inside a releases URL: whatever it resolves to, loomux
+            # cannot say WHICH release that is, so nothing may speak for it.
+            _relid=1 ;;
+          releases/tags/*|*/releases/tags/*)
+            # Identity comes from the URL's own tag segment. Taken from $a_path,
+            # never $path_low, because a tag's CASE is part of it (`vRelease` is
+            # not `vrelease`) and this value is matched against a grant. If the
+            # caller spelled the fixed segments in another case, $a_path won't
+            # match and the tag stays empty — which refuses, not guesses.
+            _relid=1
+            case "$a_path" in
+              *releases/tags/*) _urltag=${a_path##*releases/tags/}; _urltag=${_urltag%%/*} ;;
+            esac
+            case "$_urltag" in ''|*[!A-Za-z0-9._+-]*) _urltag="" ;; esac ;;
+          *)
+            _rid=${path_low##*releases/}
+            case "$_rid" in
+              ''|*[!0-9]*)
+                # Not a bare id — but still id-ADDRESSED when it STARTS with
+                # digits (`555/assets`), i.e. a sub-resource of one release.
+                case "$_rid" in [0-9]*) _relid=1 ;; esac ;;
+              *) _relid=1; _relpath="$a_path" ;;
+            esac ;;
+        esac ;;
+    esac
+    loomux_release_gate "$rtag" "api" "$_relpath" "$_relid" "$_urltag"   # allow (return) or block (exit)
     exec "$REAL_GH" "$@"
   fi
 fi
@@ -1032,6 +1207,7 @@ loomux_block "gate-closed" "$default" "$num"
     // built separately with explicit `\r\n`.
     TPL.replace("__REAL_GH__", real_gh)
         .replace("__DEPS_PREAMBLE__\n", &shim_deps_preamble(paths.utils_dir.as_deref()))
+        .replace("__RELEASE_GRANT_VALID__\n", RELEASE_GRANT_VALID_SH)
         .replace("__GIT_PLUMBING__\n", &gh_shim_git_plumbing(paths.git_dir.as_deref()))
         .replace("\r\n", "\n")
 }
@@ -1241,45 +1417,14 @@ loomux_block_release() { # $1=tag $2=action
   loomux_audit "release-gate-blocked" "{\"tag\":\"$1\",\"action\":\"$2\"}"
   exit 1
 }
-# #256/#303/#315: CLAIM a one-time grant without spending it yet — see the gh
-# shim's loomux_grant_claim for the full rationale (same mechanics, inlined
-# here since this is a separate generated script with no shared shell lib).
-# An expired grant is deleted outright (never usable). A live grant is handed
-# off via `mv` to a `.claimed` sibling — an atomic POSIX rename — so exactly
-# one caller can ever win it. Sets `_grant_claimed` on success; the caller
-# runs the real git push and finishes with `loomux_grant_settle` (consume on
-# success, restore on failure) so a rejected push (network, remote hook,
-# protected ref) doesn't burn a grant that never actually published anything.
-loomux_grant_claim() { # $1=grantfile
-  gf="$1"
-  [ -f "$gf" ] || return 1
-  exp=$(head -n1 "$gf" 2>/dev/null)
-  case "$exp" in ''|*[!0-9]*) exp=0 ;; esac
-  now=$(date +%s 2>/dev/null); [ -z "$now" ] && now=0
-  if [ "$now" -ge "$exp" ]; then
-    rm -f "$gf"
-    return 1
-  fi
-  claimed="$gf.claimed"
-  if mv "$gf" "$claimed" 2>/dev/null; then
-    _grant_claimed="$claimed"
-    return 0
-  fi
-  return 1   # lost the race to another concurrent claimant
-}
-# Finish a claim made by loomux_grant_claim, once the real push's exit status
-# is known: consume it (rm) on success, or restore it to the original grant
-# path on failure so a retry can still use it. $4=audit label to emit on
-# restore (optional — #315 review: a restore was silent in the audit; the
-# caller below passes "release-gate-restored").
-loomux_grant_settle() { # $1=grantfile $2=claimed $3=exit-code $4=restore-audit-label
-  if [ "$3" -eq 0 ]; then
-    rm -f "$2"   # succeeded — the one-time grant is spent
-  else
-    mv "$2" "$1" 2>/dev/null   # failed — restore for a retry
-    [ -n "$4" ] && loomux_audit "$4" "{\"grant\":\"$1\"}"
-  fi
-}
+# The release-grant validity check — emitted from the SAME Rust const as the gh
+# shim's copy (RELEASE_GRANT_VALID_SH), whose doc comment carries the full
+# rationale: a release grant is a PIPELINE grant for its tag (#438), checked and
+# never consumed, bounded by tag identity + TTL. Nothing here is one-time, so
+# unlike the gh shim's merge gate this script needs no claim/settle at all —
+# #315 ("a push git/GitHub refuses must not burn the grant") is now true because
+# no push can burn it, not because a settle call remembers to hand it back.
+__RELEASE_GRANT_VALID__
 
 # Find the git subcommand, skipping value-taking globals. Non-push → exec now.
 cmd=""; want=""
@@ -1341,28 +1486,24 @@ if [ -n "$LOOMUX_GROUP_DIR" ] && [ -f "$LOOMUX_GROUP_DIR/dangerous_mode" ] && [ 
   loomux_audit "release-gate-dangerous" "{\"tag\":\"$tag\",\"action\":\"push\"}"
   exec "$REAL_GIT" "$@"
 fi
-# Otherwise a one-time per-tag grant authorizes exactly this tag push. #315:
-# CLAIM the grant and only spend it once the real push actually succeeds — a
-# push git/GitHub refuses (network, remote hook, protected ref) must leave
-# the grant usable for a retry, not burn it on a push that never landed
-# (same fix as #256's merge grant / #303's release grant).
+# Otherwise a per-tag grant authorizes this tag push — and the rest of THAT
+# tag's release pipeline (#438): the grant is checked, not spent, so the
+# `gh release`/notes steps that follow this push ride the same authorization
+# until it expires. It still authorizes exactly one tag.
 safe=$(printf '%s' "$tag" | tr -c 'A-Za-z0-9._-' '_')
 loomux_norm_guard "$tag" "$safe" "release-grant-tag"
 gf=""
 [ -n "$LOOMUX_GROUP_DIR" ] && [ -n "$safe" ] && gf="$LOOMUX_GROUP_DIR/release_grants/$safe"
-_grant_claimed=""
-if [ -n "$gf" ] && loomux_grant_claim "$gf"; then
+if [ -n "$gf" ] && loomux_release_grant_valid "$gf"; then
   loomux_audit "release-gate-granted" "{\"tag\":\"$tag\",\"action\":\"push\"}"
-  "$REAL_GIT" "$@"
-  rc=$?
-  loomux_grant_settle "$gf" "$_grant_claimed" "$rc" "release-gate-restored"
-  exit "$rc"
+  exec "$REAL_GIT" "$@"
 fi
 loomux_block_release "$tag" "push"
 "#;
     // Normalize to LF (see gh_shim_sh) — a CRLF POSIX script is broken.
     TPL.replace("__REAL_GIT__", real_git)
         .replace("__DEPS_PREAMBLE__\n", &shim_deps_preamble(paths.utils_dir.as_deref()))
+        .replace("__RELEASE_GRANT_VALID__\n", RELEASE_GRANT_VALID_SH)
         .replace("\r\n", "\n")
 }
 
@@ -2563,11 +2704,30 @@ static ATTACH_SEQ: AtomicU32 = AtomicU32::new(0);
 /// collides across concurrent writers.
 static GRANT_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Enforced-gate grants (#83) are one-time and short-lived: a human sign-off
-/// authorizes exactly one privileged action within this window, then the grant is
-/// consumed or expires. 30 minutes is long enough for CI to finish and the merge
-/// to run, short enough that a forgotten grant can't linger as a standing opening.
+/// Merge grants (#83) are one-time and short-lived: a human sign-off authorizes
+/// exactly one privileged action within this window, then the grant is consumed
+/// or expires. 30 minutes is long enough for CI to finish and the merge to run,
+/// short enough that a forgotten grant can't linger as a standing opening.
 const GRANT_TTL_SECS: u64 = 30 * 60;
+
+/// Release grants (#438) get their own, longer window, because unlike a merge
+/// they are **not** one action: the human's "release vX.Y.Z" authorizes a
+/// pipeline — push the tag, wait out the `release.yml` matrix (four platform
+/// build legs; 25-40 min is normal), then write the release notes against the
+/// release that run created. At the merge grant's 30 minutes the notes step
+/// lands *after* expiry on a perfectly ordinary release, and the human gets
+/// asked a second time for something they already authorized — which is the
+/// complaint #438 was filed about, just moved rather than fixed.
+///
+/// 90 minutes is a deliberate number and the one worth arguing with: it covers a
+/// slow matrix plus a re-run of one failed leg with margin, and it is still a
+/// **hard wall** — the shim re-checks it on every step, so a forgotten grant
+/// stops authorizing anything the moment it passes, and it never authorizes more
+/// than its own tag. The alternative #438 floats — auto-extending the window
+/// while pipeline steps keep succeeding — was rejected: a window that any
+/// authorized step renews has no bound at all, and "the agent kept working" is
+/// not evidence the human still consents.
+const RELEASE_GRANT_TTL_SECS: u64 = 90 * 60;
 
 // Copilot session tracking: unlike Claude, copilot can't be handed a session
 // id up front — it mints one and writes `~/.copilot/session-state/<id>/` a
@@ -6181,7 +6341,12 @@ pub fn gh_release_action(args: &[String]) -> Option<(String, String)> {
 
 /// The gate decision for a release/tag publish (#83). Parallel to
 /// `gh_gate_decision` for merges: allowed when **`(autonomous && auto_release)`**
-/// (the blanket opening) OR a valid one-time grant for that tag (consumed). Because
+/// (the blanket opening) OR a valid grant for that tag. Note the asymmetry with
+/// merges that #438 introduced: `AllowGrant` here does **not** mean "consumed" —
+/// a release grant is a pipeline grant, re-checked per step and bounded by tag
+/// identity + TTL rather than by use count (`RELEASE_GRANT_VALID_SH`). This
+/// function is unchanged by that: whether the caller spends what it matched is
+/// the shim's business, not the decision's. Because
 /// publishing to the world (GitHub release + npm via a `v*` tag → release.yml) is a
 /// bigger blast radius than a merge, releases get their **own independent** toggle
 /// (`auto_release`, default OFF) — turning on autonomous never surprise-publishes;
@@ -28897,11 +29062,19 @@ impl OrchRegistry {
         Ok(num)
     }
 
-    /// Write a one-time human **release/tag** grant for `tag` (#83): authorizes one
-    /// `gh release create|edit|delete <tag>` or one `git push` of that tag within
-    /// `GRANT_TTL_SECS`. Releases publish to the world, so — unlike merges — they
-    /// are NEVER blanket-allowed by autonomous+auto_merge; each needs an explicit
-    /// grant. Optional `comment` delivered to the orchestrator. Human-only, same
+    /// Write a human **release/tag** grant for `tag` (#83, widened by #438):
+    /// authorizes the release PIPELINE for that one tag — the `git push` of the
+    /// tag, `gh release create|edit|delete <tag>`, and the release-API writes
+    /// against that tag's release (the notes write, addressed by canonical
+    /// release id, which the shim resolves back to a tag; #437) — for
+    /// `RELEASE_GRANT_TTL_SECS`. It is checked on every step, never consumed, so
+    /// one authorization covers one release instead of one command; what bounds
+    /// it is the tag and the TTL. It does NOT cover the version-bump PR's merge:
+    /// that stays under the merge gate, needing its own Approve.
+    ///
+    /// Releases publish to the world, so — unlike merges — they are NEVER
+    /// blanket-allowed by autonomous+auto_merge; each needs an explicit grant.
+    /// Optional `comment` delivered to the orchestrator. Human-only, same
     /// boundary as `grant_merge`.
     pub fn grant_release(
         &self,
@@ -28919,20 +29092,32 @@ impl OrchRegistry {
         }
         let seg = grant_segment(tag);
         let nonce = GRANT_SEQ.fetch_add(1, Ordering::Relaxed);
-        let expires = now_ms() / 1000 + GRANT_TTL_SECS;
+        let expires = now_ms() / 1000 + RELEASE_GRANT_TTL_SECS;
         let path = self.grant_dir(group, "release_grants").join(&seg);
         atomic_write(&path, format!("{expires}\n{nonce}\n").as_bytes()).map_err(|e| e.to_string())?;
         self.audit(group, actor, "release-grant-written",
             json!({ "tag": tag, "expires_secs": expires, "nonce": nonce }));
-        let mins = GRANT_TTL_SECS / 60;
+        let mins = RELEASE_GRANT_TTL_SECS / 60;
         let note = comment.map(str::trim).filter(|c| !c.is_empty());
+        // Says what the grant now actually covers (#438). The old wording —
+        // "a one-time release/tag publish … publish THAT release/tag once" —
+        // would now understate the authorization, and an agent that believes its
+        // grant is spent goes back to the human for a second one, which is the
+        // whole bug. It is equally explicit about the two edges: one tag, and the
+        // bump PR is not included.
         let msg = match note {
             Some(c) => format!(
-                "[loomux] the human GRANTED a one-time release/tag publish of {tag} (valid ~{mins} min). \
-                 Note from the human: {c}\nYou may now publish THAT release/tag once; report when done."),
+                "[loomux] the human GRANTED the release of {tag} (valid ~{mins} min). This covers the WHOLE \
+                 pipeline for THAT tag — pushing {tag}, creating/editing its GitHub release, and writing its \
+                 release notes — for the whole window, so do NOT come back for a second grant mid-release. It \
+                 covers no other tag or release, and NOT the version-bump PR's merge (that still needs Approve). \
+                 Note from the human: {c}\nReport when the release is done."),
             None => format!(
-                "[loomux] the human GRANTED a one-time release/tag publish of {tag} (valid ~{mins} min). \
-                 You may now publish THAT release/tag once; report when done."),
+                "[loomux] the human GRANTED the release of {tag} (valid ~{mins} min). This covers the WHOLE \
+                 pipeline for THAT tag — pushing {tag}, creating/editing its GitHub release, and writing its \
+                 release notes — for the whole window, so do NOT come back for a second grant mid-release. It \
+                 covers no other tag or release, and NOT the version-bump PR's merge (that still needs Approve). \
+                 Report when the release is done."),
         };
         let _ = self.deliver_to_orchestrator(group, &msg, "human");
         Ok(())
@@ -38477,10 +38662,11 @@ pub fn orch_grant_merge(
     reg.grant_merge(&group_id, &pr, comment.as_deref(), "human")
 }
 
-/// Issue a one-time human release/tag grant for `tag` (#83): authorizes one
-/// `gh release …`/tag-push of that tag. Releases are never blanket-allowed by
-/// autonomous mode, so this explicit grant is the only path. Optional comment
-/// delivered to the orchestrator. HUMAN-ONLY.
+/// Issue a human release grant for `tag` (#83/#438): authorizes the whole
+/// release pipeline for that ONE tag — tag push, `gh release …`, release notes —
+/// for `RELEASE_GRANT_TTL_SECS`, not a single command. Releases are never
+/// blanket-allowed by autonomous mode, so this explicit grant is the only path.
+/// Optional comment delivered to the orchestrator. HUMAN-ONLY.
 #[tauri::command]
 pub fn orch_grant_release(
     reg: tauri::State<Arc<OrchRegistry>>,
