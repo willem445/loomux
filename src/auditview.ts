@@ -8,6 +8,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { asObject, str, summarize, type AuditEntry } from "./auditsummary";
 import { nextWindowStart, backfillWindowStart } from "./auditwindow";
+import { PollGate } from "./pollgate";
 
 export type { AuditEntry };
 
@@ -90,6 +91,22 @@ export class AuditView {
   private expanded = new Set<string>();
   private follow = false;
   private followTimer: number | undefined;
+  /** Window-visibility gate around the follow timer (#743 S6, pollgate.ts).
+   *  Follow is opt-in and cleared on dispose, but an armed follow behind a
+   *  minimized window still refetched the whole log and re-rendered it every
+   *  1.5 s — component scope says nothing about whether anyone is looking. */
+  private followGate: PollGate = new PollGate({
+    arm: () => {
+      this.followTimer = window.setInterval(() => void this.load(), FOLLOW_MS);
+    },
+    disarm: () => {
+      if (this.followTimer !== undefined) {
+        clearInterval(this.followTimer);
+        this.followTimer = undefined;
+      }
+    },
+    refresh: () => void this.load(),
+  });
   private disposed = false;
   /** Signature of the last render's data, to skip no-op follow re-renders
    *  (which would otherwise fight the human's scroll/expand). */
@@ -208,8 +225,9 @@ export class AuditView {
     this.followBtn.textContent = this.follow ? "⏸ following" : "▶ follow";
     if (this.follow) {
       // Poll on an interval; each tick reloads and (if the human is at the
-      // bottom) sticks to the newest line.
-      this.followTimer = window.setInterval(() => void this.load(), FOLLOW_MS);
+      // bottom) sticks to the newest line. The gate owns the timer, so the
+      // interval exists only while the window is visible.
+      this.followGate.enable();
       void this.load();
     } else {
       this.stopFollow();
@@ -217,10 +235,7 @@ export class AuditView {
   }
 
   private stopFollow(): void {
-    if (this.followTimer !== undefined) {
-      clearInterval(this.followTimer);
-      this.followTimer = undefined;
-    }
+    this.followGate.disable();
   }
 
   private async load(): Promise<void> {

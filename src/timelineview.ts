@@ -56,6 +56,7 @@ import {
   toggleCategory,
   type TimelineNote,
 } from "./timelinechrome";
+import { PollGate } from "./pollgate";
 
 /** Audit re-poll cadence while following — the same 1.5s the audit view uses,
  *  since it is the same underlying read. The gh half is refreshed far more
@@ -131,6 +132,22 @@ export class TimelineView {
 
   private follow = false;
   private followTimer: number | undefined;
+  /** Window-visibility gate around the follow timer (#743 S6, pollgate.ts) —
+   *  the audit view's shape, for the same reason: an armed follow behind a
+   *  minimized window refetched the whole audit log every 1.5 s to redraw
+   *  lanes nobody could see. */
+  private followGate: PollGate = new PollGate({
+    arm: () => {
+      this.followTimer = window.setInterval(() => void this.load(false), FOLLOW_MS);
+    },
+    disarm: () => {
+      if (this.followTimer !== undefined) {
+        clearInterval(this.followTimer);
+        this.followTimer = undefined;
+      }
+    },
+    refresh: () => void this.load(false),
+  });
   private disposed = false;
   private gate = new RefreshGate();
   private resizeObs: ResizeObserver;
@@ -272,7 +289,7 @@ export class TimelineView {
     this.followBtn.classList.toggle("on", this.follow);
     this.followBtn.textContent = this.follow ? "⏸ following" : "▶ follow";
     if (this.follow) {
-      this.followTimer = window.setInterval(() => void this.load(false), FOLLOW_MS);
+      this.followGate.enable();
       void this.load(false);
     } else {
       this.stopFollow();
@@ -280,10 +297,7 @@ export class TimelineView {
   }
 
   private stopFollow(): void {
-    if (this.followTimer !== undefined) {
-      clearInterval(this.followTimer);
-      this.followTimer = undefined;
-    }
+    this.followGate.disable();
   }
 
   private toggleCategoryChip(cat: TimelineCategory): void {

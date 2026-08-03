@@ -316,6 +316,21 @@ it's a knob rather than a fixed answer: set it to `0`, relaunch, and compare. If
 loomux feels *worse* with the throttle on, that's worth reporting — and `0`
 restores exactly the old behaviour in the meantime.
 
+### What loomux stops doing while its window is hidden
+
+Minimize loomux (or leave it fully behind another window) and every timed
+refresh in the UI pauses: the tab strip's agent/cost chips, an open project
+panel, a hover preview, and an armed **▶ follow** in the audit or timeline
+view. Bring the window back and each one refreshes immediately, so what you see
+is current rather than up to a poll-interval stale.
+
+**Your agents are not paused by this.** Panes keep running, output keeps
+arriving and scrolling, deliveries keep landing, and every backend watcher
+(orchestration, git, merge queue) is untouched — only the window's own polling
+for things to *draw* stops, because nothing it draws can be seen. There is no
+setting: a hidden window has nothing to show, and the refresh on return is
+what makes that safe.
+
 ## Keyboard shortcuts
 
 The single source of truth for keybindings is `src/shortcuts.ts` in the repo;

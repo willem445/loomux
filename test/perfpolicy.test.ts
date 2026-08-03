@@ -318,62 +318,72 @@ interface TimerRow {
   debt: string | null;
 }
 
-/** Every `setInterval()` in `src/*.ts`. Seeded verbatim from the #743 census
- *  (plan part 2b): as of this file, NOTHING in `src/` reads `document.hidden`
- *  or listens for `visibilitychange`, so no row is `gated` yet. S6
- *  (`perf/743-visibility-polls`) is the slice that changes that; recording the
- *  aspiration here instead of the truth would make this test a decoration. */
+/** Every `setInterval()` in `src/*.ts`. Seeded from the #743 census (plan part
+ *  2b), which found that NOTHING in `src/` had ever read `document.hidden` —
+ *  every poll here was component-scoped at best and none of them knew whether
+ *  the window was on screen. S6 wired the five that drive IPC or rendering
+ *  through `src/pollgate.ts`, so `gated` rows are now the majority and the
+ *  gate's own recheck ticker is a row like any other. Kept at today's truth,
+ *  never at the target state. */
 const TIMERS: TimerRow[] = [
   {
     key: "src/tabbar.ts@4000",
     cadenceMs: 4000,
-    policy: "argued",
+    policy: "gated",
     reason:
-      "App-lifetime tick: started in the tab strip's constructor and never cleared. Each tick's " +
-      "pollStatus() loops EVERY group-bound tab and invokes groupSummary plus groupUsage (the " +
-      "transcript-scanning command), so a minimized window still pays it forever. No visibility " +
-      "gate today; the strip only re-renders when a value differs, which bounds the paint, not the IPC.",
-    debt: "#743 S6 (pollgate.ts: pause or stretch while hidden; decide groupUsage's fate in-slice)",
+      "App-lifetime tick: armed in the tab strip's constructor and never cleared, and each tick's " +
+      "pollStatus() loops EVERY group-bound tab invoking groupSummary plus groupUsage — the " +
+      "largest standing IPC cost in the app. The PollGate stops the interval outright while the " +
+      "window is hidden (not an early return inside the tick) and runs one catch-up poll on the " +
+      "way back (#743 S6). Cadence tiers by tab position were considered and rejected in-slice: " +
+      "a background tab's badge is what the strip is FOR, and S4 already made groupUsage share " +
+      "one ~1 s backend snapshot across callers.",
+    debt: null,
   },
   {
     key: "src/tabbar.ts@PREVIEW_REFRESH_MS",
     cadenceMs: 700,
-    policy: "component-scoped",
+    policy: "gated",
     reason:
-      "Alive only while a hover preview is open and cleared when it closes, so it cannot run " +
-      "against a window nobody is looking at — a hover is by definition a pointer on the strip. " +
-      "Rebuilds preview DOM only; no backend invoke per tick.",
+      "Alive only while a hover preview is open, and now gated on top of that. Component scope " +
+      "looked sufficient — a hover is a pointer on the strip — but nothing synthesizes a " +
+      "mouseleave when a window is minimized, so a preview open at that moment kept " +
+      "re-serializing up to eight panes every 700 ms. No IPC per tick; the cost is webview-thread " +
+      "render work, which is exactly what INV-4 asks a hidden window not to pay.",
     debt: null,
   },
   {
     key: "src/groupview.ts@POLL_MS",
     cadenceMs: 2000,
-    policy: "component-scoped",
+    policy: "gated",
     reason:
-      "Armed by show() and cleared by hide() on every close/eviction path, so it stops with the " +
-      "panel. That is component scope, not visibility: a panel left open behind a minimized " +
-      "window keeps paying Promise.all of nine invokes plus a full render every 2 s.",
-    debt: "#743 S6 (visibility gate on top of the existing component scope)",
+      "Armed by show() and cleared by hide() on every close/eviction path, and gated on window " +
+      "visibility inside that scope (#743 S6) — the two are different questions, and a panel left " +
+      "open behind a minimized window used to keep paying Promise.all of nine invokes plus a full " +
+      "render every 2 s. The gate's arm keeps the defensive clear-before-arm show() used to do.",
+    debt: null,
   },
   {
     key: "src/auditview.ts@FOLLOW_MS",
     cadenceMs: 1500,
-    policy: "component-scoped",
+    policy: "gated",
     reason:
       "Opt-in: armed only by the follow toggle, cleared by the toggle and by dispose(), so it " +
-      "cannot outlive the view. Once armed it refetches orch_audit and re-renders every tick " +
-      "whether or not the window is visible.",
-    debt: "#743 S6 (pause the follow poll while hidden, refresh on visible)",
+      "cannot outlive the view — and gated within that, so an armed follow behind a hidden window " +
+      "refetches nothing and re-renders nothing until the window is back, then catches up once " +
+      "(#743 S6).",
+    debt: null,
   },
   {
     key: "src/timelineview.ts@FOLLOW_MS",
     cadenceMs: 1500,
-    policy: "component-scoped",
+    policy: "gated",
     reason:
-      "The timeline's follow toggle, same shape as auditview's: armed on toggle, cleared on " +
-      "toggle and dispose. Its gh half is separately self-gated to GH_REFRESH_MS (60 s) in " +
-      "timelinechrome.ts, so a tick is one orch_audit refetch, not two shell-outs.",
-    debt: "#743 S6 (pause the follow poll while hidden, refresh on visible)",
+      "The timeline's follow toggle, same shape and same gate as auditview's: armed on toggle, " +
+      "cleared on toggle and dispose, suppressed while the window is hidden (#743 S6). Its gh " +
+      "half is separately self-gated to GH_REFRESH_MS (60 s) in timelinechrome.ts, so a tick is " +
+      "one orch_audit refetch, not two shell-outs.",
+    debt: null,
   },
   {
     key: "src/main.ts@20_000",
@@ -384,6 +394,19 @@ const TIMERS: TimerRow[] = [
       "the real listSessions scan is gated to RECONCILE_MIN_INTERVAL_MS (>=60 s) inside " +
       "reconcileSessionIds, and the 20 s cadence exists so a pane that starts qualifying " +
       "mid-window is picked up promptly. A hidden window pays a predicate, not IPC.",
+    debt: null,
+  },
+  {
+    key: "src/pollgate.ts@HIDDEN_RECHECK_MS",
+    cadenceMs: 5000,
+    policy: "gated",
+    reason:
+      "The gate's own release path, and the only timer here that runs ONLY while the window is " +
+      "hidden: a suppressed poll re-reads document.visibilityState every 5 s instead of trusting " +
+      "the visibilitychange event it was suppressed by, so a lost or never-delivered event cannot " +
+      "wedge a panel permanently (performance.md §2 P4; the standing rule that a suppression on a " +
+      "fallible signal owes an independent release). One boolean read per wake, no IPC, no paint " +
+      "— a hidden window still makes zero data polls, which is the point of the slice.",
     debt: null,
   },
 ];
@@ -911,13 +934,18 @@ test("the row rules fire on every shape they are written for, including `throttl
 
 test("a timer's `gated` claim and the file's actual gate agree, in both directions", () => {
   // The one row-level claim that is cheap to verify end to end, checked as an
-  // equivalence so it does work in BOTH states of the world. Today nothing in
-  // `src/` consults `document.hidden` or `visibilitychange` (#743's census,
-  // grep-confirmed), so it is the second direction that runs: no row may claim
-  // `gated`. When S6 lands `pollgate.ts` the first direction takes over and the
-  // rows it wires must be upgraded from `argued`/`component-scoped` to `gated`
-  // in the same PR — which is the point of recording today's truth here rather
-  // than the aspiration.
+  // equivalence so it does work in BOTH states of the world. Both directions
+  // now run: S6 wired five timers through `pollgate.ts`, so those rows must
+  // claim `gated` and their files must show it, while `src/main.ts`'s ungated
+  // 20 s tick is held to the other direction — it may not quietly acquire a
+  // gate while still declaring itself `argued`.
+  //
+  // The check is per FILE, not per timer, which is deliberate and has teeth: a
+  // file that adopts the gate for one of its timers cannot leave a second one
+  // outside it and say nothing. That is what pulled the tab strip's 700 ms
+  // hover-preview timer into S6 — the row had to become true or the wiring had
+  // to. If a file ever genuinely needs one gated and one ungated timer, this
+  // assertion is the thing to extend, with the argument written down.
   const GATE = /document\.hidden|visibilitychange|pollgate/;
   for (const row of TIMERS) {
     const file = row.key.split("@")[0];

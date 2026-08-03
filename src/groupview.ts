@@ -60,6 +60,7 @@ import { compactionStatusLabel, compactionStatusTitle, contextUsageLabel } from 
 import { roleLabel } from "./orchbadge";
 import { getDefaultAgent } from "./agents";
 import { confirmModal } from "./modal";
+import { PollGate } from "./pollgate";
 
 /** Hard bounds on the live-agent cap, mirroring the launcher's input range and
  *  the backend's `MAX_AGENTS_CEILING`. The backend re-validates; these only
@@ -216,6 +217,25 @@ export class GroupView {
   private spawnExpandedFlag = false;
   private autonomy: AutonomyState | null = null;
   private pollTimer: number | undefined;
+  /** Window-visibility gate around that timer (#743 S6, pollgate.ts). Component
+   *  scope (`show()`/`hide()`) and window visibility are different questions:
+   *  this panel was already scoped and still polled nine invokes every 2 s
+   *  behind a minimized window. */
+  private pollGate: PollGate = new PollGate({
+    arm: () => {
+      // Defensive clear-before-arm, kept from the pre-gate `show()`: a stray
+      // leftover timer would double the cadence rather than restart it.
+      if (this.pollTimer !== undefined) clearInterval(this.pollTimer);
+      this.pollTimer = window.setInterval(() => void this.load(), POLL_MS);
+    },
+    disarm: () => {
+      if (this.pollTimer !== undefined) {
+        clearInterval(this.pollTimer);
+        this.pollTimer = undefined;
+      }
+    },
+    refresh: () => void this.load(),
+  });
   private disposed = false;
   /** True once End is clicked once: the second click within the window
    *  actually tears the group down (two-step confirm for a destructive op). */
@@ -593,12 +613,10 @@ export class GroupView {
   /** Called by the pane whenever the view is (re)opened, in either mode. */
   show(): void {
     void this.load();
-    // A stray leftover timer would double the poll cadence rather than
-    // merely restarting it — clear before arming (defensive: `hide()` below
-    // already clears on every close/eviction path, but `show()` itself
-    // shouldn't have to trust that it always ran first).
-    if (this.pollTimer !== undefined) clearInterval(this.pollTimer);
-    this.pollTimer = window.setInterval(() => void this.load(), POLL_MS);
+    // The gate arms the timer if (and only if) the window is visible, and
+    // re-arms it with one catch-up load whenever it becomes visible again.
+    // The clear-before-arm this used to do inline lives in the gate's `arm`.
+    this.pollGate.enable();
   }
 
   /** Called by the pane whenever the view is about to become hidden, in
@@ -609,10 +627,10 @@ export class GroupView {
    *  `dispose()` was the only thing that ever cleared, stacking concurrent
    *  polls against the backend. */
   hide(): void {
-    if (this.pollTimer !== undefined) {
-      clearInterval(this.pollTimer);
-      this.pollTimer = undefined;
-    }
+    // Through the gate, so the visibility subscription and any recheck ticker
+    // go with the timer — a panel closed behind a hidden window must leave
+    // nothing running at all.
+    this.pollGate.disable();
   }
 
   /** Reflect whether the pane currently has this view in its embed-panel
