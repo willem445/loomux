@@ -1971,6 +1971,32 @@ const WORKFLOW_GATE_POLL_INTERVAL: Duration = Duration::from_secs(30);
 /// short enough that neither a transient auth blip nor a fresh review parks a
 /// batch for a coffee break.
 const MQ_DRIVE_BACKOFF_MS: u64 = 5 * 60_000;
+/// #743 S4b: how long a computed group-usage summary may be re-served to the
+/// POLLED command path before it is recomputed.
+///
+/// One second, chosen against the poll cadences it has to collapse: the group
+/// view's 2 s batch fires `orch_group_usage` and `orch_autonomy` (whose budget
+/// meter runs the same computation) concurrently in one `Promise.all`, and the
+/// tab bar polls at 4 s per group-bound tab. A window of one second is short
+/// enough that no tick ever *skips* a refresh — every 2 s tick still recomputes
+/// — and long enough that the several reads inside one tick share a single
+/// computation. It is the freshness bound, not a cache lifetime: figures are a
+/// cost meter refreshed twice a second at worst, and every non-polled caller
+/// (the MCP tool, the autonomy anchor, the budget enforcer) passes
+/// `Duration::ZERO` and never sees a stored value at all.
+const USAGE_POLL_MAX_AGE: Duration = Duration::from_millis(1000);
+/// #743 S4a: how long the repo's resolved default-branch NAME may be re-served
+/// before it is re-resolved from `git`.
+///
+/// Coarse — five minutes — because the answer changes only when a repo's
+/// default branch is renamed or first created, and because resolving it costs
+/// 2-4 blocking `git` spawns that `orch_workflow_status` was paying every 2 s
+/// per open group view. The staleness this ADDS is bounded by this constant and
+/// is strictly smaller than the staleness the value already carries by design:
+/// [`crate::git::default_branch_name`] reads local refs only, so it is stale
+/// until something happens to fetch, with no bound at all. Display-only — no
+/// gate reads it (see that function's doc).
+const DEFAULT_BRANCH_MAX_AGE: Duration = Duration::from_secs(5 * 60);
 /// Autonomous mode (#83): default output-quiet window before an idle tick fires,
 /// when the group's `idle_tick_minutes` guardrail isn't set. Lowered from the
 /// original 15 to **5** after a live test: a human who turns autonomous mode on
@@ -8958,6 +8984,57 @@ pub struct OrchRegistry {
     /// Serializes task-board read-modify-write cycles (MCP threads and the
     /// human UI mutate the same tasks.json).
     tasks_lock: Mutex<()>,
+    /// Serializes every read-modify-write of a group's `usage.json` (#743 S4b).
+    ///
+    /// **A leaf of its own, split out of `tasks_lock`.** The usage store used to
+    /// share the board's lock, which put per-live-agent transcript reads and a
+    /// full `usage.json` rewrite inside the one process-global mutex that the
+    /// whole task board also serializes on — so one group's board write stalled
+    /// another group's usage poll, and vice versa, on the app's hottest polled
+    /// path. The two files have no shared invariant: nothing reads a task and a
+    /// usage snapshot together, so nothing needed them under one lock.
+    ///
+    /// **Lock order: takes no other registry lock while held** except
+    /// `AUDIT_LOCK`, on `load_usage_snapshots`' corrupt-file branch — the same
+    /// nesting the `tasks_lock` version already had. Callers hold no registry
+    /// lock when they take it.
+    usage_lock: Mutex<()>,
+    /// Per-group memo for the polled usage read (#743 S4b) — the value
+    /// [`OrchRegistry::group_usage_within`] serves when the stored one is
+    /// younger than the caller's `max_age`.
+    ///
+    /// **Why it exists.** `orch_group_usage` is the heaviest polled command in
+    /// the app (per-live-agent transcript reads plus a `usage.json`
+    /// read-modify-write), and three callers ask for it inside the same ~2 s
+    /// tick: the group view, the tab bar, and `orch_autonomy`'s budget meter.
+    /// The memo makes that one computation instead of three.
+    ///
+    /// **`Arc<Mutex<..>>` per group, not one map lock.** The outer map lock is
+    /// held only long enough to clone the per-group cell out (pty.rs's
+    /// map-lock → release → leaf-lock rule, applied here); the cell is then held
+    /// across the computation, which is what collapses a concurrent stampede
+    /// into a single compute rather than merely a shorter one.
+    ///
+    /// **Invalidation drops the map entry and never locks the cell**
+    /// (`invalidate_usage_memo`), so an external writer can never deadlock
+    /// against a computation in flight. A computation whose cell was dropped
+    /// mid-flight stores into an orphan and the next caller recomputes: one
+    /// wasted computation, never a stale answer.
+    usage_memo: Mutex<HashMap<String, Arc<Mutex<Option<(std::time::Instant, Value)>>>>>,
+    /// Per-REPO memo for the display-only default-branch name (#743 S4a),
+    /// keyed by repo path so two groups on one repo share the answer.
+    ///
+    /// `orch_workflow_status` is in the group view's 2 s batch and resolving
+    /// this name costs 2-4 blocking `git` spawns, so it was 2-4 process spawns
+    /// every 2 s per open group view. The name is display-only and already
+    /// documented as unboundedly stale (see [`crate::git::default_branch_name`]:
+    /// it reads local refs, so it is only as fresh as whatever last fetched);
+    /// a coarse TTL therefore adds a *bounded* staleness on top of an unbounded
+    /// one, and no gate reads it.
+    ///
+    /// The lock is never held across the `git` spawns — check, release, resolve,
+    /// insert.
+    default_branch_memo: Mutex<HashMap<String, (std::time::Instant, Option<String>)>>,
     /// Serializes group creation + orchestrator registration: the group id
     /// is chosen by liveness, and a group only becomes live once its
     /// orchestrator is registered — without this, two concurrent launches
@@ -19209,6 +19286,9 @@ impl OrchRegistry {
             unconfirmed_pending: Arc::new(Mutex::new(HashMap::new())),
             orch_notice_inbox: Arc::new(Mutex::new(HashMap::new())),
             tasks_lock: Mutex::new(()),
+            usage_lock: Mutex::new(()),
+            usage_memo: Mutex::new(HashMap::new()),
+            default_branch_memo: Mutex::new(HashMap::new()),
             creation: Mutex::new(()),
             pr_head_override: Mutex::new(None),
             pr_body_override: Mutex::new(None),
@@ -26676,7 +26756,17 @@ impl OrchRegistry {
     /// figure the autonomy budget meters against. Reuses `group_usage` so the
     /// live-agent refresh and the exact-token summing live in one place.
     fn group_token_total(&self, group: &str) -> u64 {
-        self.group_usage(group)
+        self.group_token_total_within(group, Duration::ZERO)
+    }
+
+    /// [`Self::group_token_total`], sharing the polled usage memo when
+    /// `max_age` allows (#743 S4b). The panel read passes
+    /// [`USAGE_POLL_MAX_AGE`] so `orch_autonomy` stops re-running the whole
+    /// usage chain a second time inside the same 2 s tick the group view
+    /// already ran it in; the anchor and the budget enforcer pass
+    /// `Duration::ZERO` and keep an exact, live figure.
+    fn group_token_total_within(&self, group: &str, max_age: Duration) -> u64 {
+        self.group_usage_within(group, max_age)
             .get("lifetime_tokens")
             .and_then(Value::as_u64)
             .unwrap_or(0)
@@ -26690,6 +26780,15 @@ impl OrchRegistry {
     /// output-quiet and how many seconds until the next tick is eligible (so the
     /// panel can show "next tick in ~Xm" instead of the tick being invisible).
     pub fn autonomy_state(&self, group: &str) -> Value {
+        self.autonomy_state_within(group, Duration::ZERO)
+    }
+
+    /// [`Self::autonomy_state`], with the usage memo's freshness window as a
+    /// parameter (#743 S4b) — the only figure it affects is
+    /// `spend_since_enable_tokens`, which is derived from the group's lifetime
+    /// token total. `Duration::ZERO` keeps a live read.
+    #[doc(hidden)] // pub for integration tests
+    pub fn autonomy_state_within(&self, group: &str, usage_max_age: Duration) -> Value {
         let on = self.is_autonomous(group);
         let rails = self.group(group).map(|g| g.guardrails);
         let budget = rails.as_ref().map(|g| g.autonomy_budget_tokens).unwrap_or(0);
@@ -26699,7 +26798,10 @@ impl OrchRegistry {
             .filter(|&m| m > 0)
             .unwrap_or(DEFAULT_IDLE_TICK_MINUTES);
         let anchor = if on { self.autonomy_anchor(group) } else { 0 };
-        let spend = on.then(|| self.group_token_total(group).saturating_sub(anchor));
+        let spend = on.then(|| {
+            self.group_token_total_within(group, usage_max_age)
+                .saturating_sub(anchor)
+        });
         // `suspended` is meaningful only while OFF: true iff the budget enforcer
         // (not the user) flipped it off, so the UI can distinguish "budget spent —
         // raise it or re-enable" from a plain user toggle-off.
@@ -27185,6 +27287,14 @@ impl OrchRegistry {
     /// ref it resolves live.
     #[doc(hidden)] // pub for integration tests
     pub fn workflow_status(&self, group: &str) -> Value {
+        self.workflow_status_within(group, DEFAULT_BRANCH_MAX_AGE)
+    }
+
+    /// [`Self::workflow_status`], with the default-branch memo's freshness
+    /// window as a parameter (#743 S4a). `Duration::ZERO` forces a live
+    /// resolution; see [`Self::default_branch_memo`].
+    #[doc(hidden)] // pub for integration tests
+    pub fn workflow_status_within(&self, group: &str, default_branch_max_age: Duration) -> Value {
         let info = self.group(group);
         let guardrails = info.as_ref().map(|g| g.guardrails.clone()).unwrap_or_default();
         let name = if guardrails.advanced_orchestrator {
@@ -27217,8 +27327,11 @@ impl OrchRegistry {
         // is also as stale as the clone's last fetch — a rename on the remote
         // reads as the old name here until something fetches (rev-157 NB1/NB2).
         // Both are tolerable for the same reason: the label is the only
-        // consumer, and no gate reads this.
-        let default_branch = info.as_ref().and_then(|g| crate::git::default_branch_name(&g.repo));
+        // consumer, and no gate reads this. #743 S4a adds a third, bounded,
+        // source of staleness for the same reason — see `default_branch_within`.
+        let default_branch = info
+            .as_ref()
+            .and_then(|g| self.default_branch_within(&g.repo, default_branch_max_age));
         json!({
             "advanced": guardrails.advanced_orchestrator,
             "name": name,
@@ -27232,6 +27345,32 @@ impl OrchRegistry {
             })).collect::<Vec<_>>(),
             "gate": gate,
         })
+    }
+
+    /// The repo's default-branch NAME, served from [`Self::default_branch_memo`]
+    /// when the stored answer is younger than `max_age` (#743 S4a).
+    ///
+    /// `None` is memoised too, and deliberately: a repo that resolves to
+    /// "unknown" is the *worst* case for the uncached path — the full ladder
+    /// runs, every probe fails, and nothing is learnt — so re-running it every
+    /// 2 s is precisely what this exists to stop.
+    ///
+    /// The memo lock is released before the `git` spawns and re-taken after: no
+    /// registry lock is ever held across a subprocess here.
+    fn default_branch_within(&self, repo: &str, max_age: Duration) -> Option<String> {
+        {
+            let memo = self.default_branch_memo.lock_safe();
+            if let Some((at, name)) = memo.get(repo) {
+                if at.elapsed() < max_age {
+                    return name.clone();
+                }
+            }
+        }
+        let fresh = crate::git::default_branch_name(repo);
+        self.default_branch_memo
+            .lock_safe()
+            .insert(repo.to_string(), (std::time::Instant::now(), fresh.clone()));
+        fresh
     }
 
     /// Deliver any debounced cap-change notice whose quiet window has elapsed
@@ -27751,13 +27890,13 @@ impl OrchRegistry {
         }
     }
 
-    /// Upsert one agent's snapshot into the group's durable `usage.json`,
-    /// matched by `key`. Shares the task-board file lock. Public for the
-    /// kill-snapshot accumulation test.
-    #[doc(hidden)]
-    pub fn upsert_usage_snapshot(&self, group: &str, snap: UsageSnapshot) {
-        let _guard = self.tasks_lock.lock_safe();
-        let mut list = self.load_usage_snapshots(group);
+    /// Merge one snapshot into `list`, matched by `key`. Pure — no lock, no I/O.
+    ///
+    /// Factored out of `upsert_usage_snapshot` (#743 S4b) so a whole tick's
+    /// worth of live-agent snapshots can go through ONE load-write cycle
+    /// without the merge rule being restated per caller. The rule itself is
+    /// unchanged.
+    fn merge_usage_entry(list: &mut Vec<UsageSnapshot>, snap: UsageSnapshot) {
         match list.iter_mut().find(|s| s.key == snap.key) {
             Some(existing) => {
                 // A transcript only ever grows, so a read that comes back empty
@@ -27790,12 +27929,59 @@ impl OrchRegistry {
             }
             None => list.push(snap),
         }
+    }
+
+    /// Merge `incoming` into the group's durable `usage.json` under
+    /// [`Self::usage_lock`] and return the resulting list — the store as it now
+    /// sits on disk.
+    ///
+    /// **One load-merge-write for the whole batch (#743 S4b).** The previous
+    /// shape ran a full `usage.json` read plus an atomic rewrite *per live
+    /// agent* and then read the file once more to summarise it, so an N-agent
+    /// group paid `2N + 1` file operations on every 2 s poll. Returning the
+    /// merged list is what removes the trailing read: under the lock the
+    /// in-memory list IS the file's contents at write time.
+    ///
+    /// An empty `incoming` writes nothing — it is a plain read, which is what a
+    /// group with no live agents does every tick.
+    fn merge_usage_snapshots(&self, group: &str, incoming: Vec<UsageSnapshot>) -> Vec<UsageSnapshot> {
+        let _guard = self.usage_lock.lock_safe();
+        let mut list = self.load_usage_snapshots(group);
+        if incoming.is_empty() {
+            return list;
+        }
+        for snap in incoming {
+            Self::merge_usage_entry(&mut list, snap);
+        }
         let dir = self.group_dir(group);
         let _ = fs::create_dir_all(&dir);
         // Crash-safe write: a crash mid-write leaves the old (valid) file
-        // intact, never a half-written usage.json (#133). Holds `tasks_lock`.
+        // intact, never a half-written usage.json (#133).
         let body = serde_json::to_string_pretty(&list).unwrap();
         let _ = atomic_write(&dir.join("usage.json"), body.as_bytes());
+        list
+    }
+
+    /// Upsert one agent's snapshot into the group's durable `usage.json`,
+    /// matched by `key`. Public for the kill-snapshot accumulation test, and
+    /// used by `mark_dead` to capture an exiting agent's spend.
+    ///
+    /// Invalidates the polled memo: this is a write from OUTSIDE the usage
+    /// computation, and a kill's captured spend must not wait out a poll window
+    /// before the group view can see it.
+    #[doc(hidden)]
+    pub fn upsert_usage_snapshot(&self, group: &str, snap: UsageSnapshot) {
+        self.merge_usage_snapshots(group, vec![snap]);
+        self.invalidate_usage_memo(group);
+    }
+
+    /// Drop the group's memoised usage value (#743 S4b).
+    ///
+    /// Removes the map entry rather than clearing the cell, and so takes only
+    /// the outer map lock: an invalidation can never block on — or deadlock
+    /// against — a computation holding the cell. See [`Self::usage_memo`].
+    fn invalidate_usage_memo(&self, group: &str) {
+        self.usage_memo.lock_safe().remove(group);
     }
 
     /// Aggregate the group's usage into one summary with a **live vs lifetime**
@@ -27804,6 +27990,48 @@ impl OrchRegistry {
     /// exited, so the lifetime total never forgets historical spend. Tokens are
     /// exact; dollar figures are estimates (labelled per agent).
     pub fn group_usage(&self, group: &str) -> Value {
+        // `ZERO` = never serve a stored value. Every existing caller (the MCP
+        // `group_usage` tool, the autonomy anchor, the budget enforcer, the
+        // tests) keeps exactly today's semantics; only the polled UI path opts
+        // into a window. The computation still REFRESHES the memo, so a poll
+        // arriving right after one of these reads is free.
+        self.group_usage_within(group, Duration::ZERO)
+    }
+
+    /// [`Self::group_usage`], served from the per-group memo when the stored
+    /// value is younger than `max_age` (#743 S4b). See [`Self::usage_memo`] for
+    /// why the memo exists and why the per-group cell is held across the
+    /// computation.
+    ///
+    /// **`max_age` is a bound, not a cache-forever switch**: a stored value is
+    /// served only while `elapsed() < max_age`, measured on `Instant` (a
+    /// monotonic clock — a wall-clock jump cannot extend the window), and
+    /// `Duration::ZERO` disables serving entirely.
+    #[doc(hidden)] // pub for integration tests
+    pub fn group_usage_within(&self, group: &str, max_age: Duration) -> Value {
+        // Map lock → release → per-group cell (pty.rs's rule): the outer lock is
+        // held only to clone the cell's Arc out.
+        let cell = {
+            let mut memo = self.usage_memo.lock_safe();
+            memo.entry(group.to_string()).or_default().clone()
+        };
+        let mut slot = cell.lock_safe();
+        if let Some((at, value)) = slot.as_ref() {
+            if at.elapsed() < max_age {
+                return value.clone();
+            }
+        }
+        // Held across the computation on purpose: a second caller arriving mid
+        // computation waits and then finds the fresh value, which is what makes
+        // a groupview + tabbar + orch_autonomy stampede ONE computation rather
+        // than three shorter ones.
+        let fresh = self.compute_group_usage(group);
+        *slot = Some((std::time::Instant::now(), fresh.clone()));
+        fresh
+    }
+
+    /// The uncached usage computation behind [`Self::group_usage_within`].
+    fn compute_group_usage(&self, group: &str) -> Value {
         let live_agents: Vec<AgentEntry> = self
             .agents
             .lock_safe()
@@ -27821,19 +28049,20 @@ impl OrchRegistry {
             .unwrap_or_else(|| "claude".to_string());
 
         // Refresh each live agent's durable snapshot from its current usage.
+        // The transcript reads happen OUTSIDE the usage lock — only the merge
+        // and the write are serialized (#743 S4b).
         let mut live_keys: HashSet<String> = HashSet::new();
+        let mut fresh: Vec<UsageSnapshot> = Vec::with_capacity(live_agents.len());
         for a in &live_agents {
             let cli = rails.as_ref().map(|g| g.cli_for(a.role)).unwrap_or("claude");
             let snap = self.compute_usage_snapshot(a, cli);
             live_keys.insert(snap.key.clone());
-            self.upsert_usage_snapshot(group, snap);
+            fresh.push(snap);
         }
 
-        // The store now holds live + historical (killed) snapshots.
-        let snaps = {
-            let _guard = self.tasks_lock.lock_safe();
-            self.load_usage_snapshots(group)
-        };
+        // One load-merge-write for the whole tick; the returned list is the
+        // store as it now sits on disk — live + historical (killed) snapshots.
+        let snaps = self.merge_usage_snapshots(group, fresh);
 
         let (mut live_cost, mut lifetime_cost) = (0.0f64, 0.0f64);
         let (mut live_cost_known, mut lifetime_cost_known) = (false, false);
@@ -36762,6 +36991,48 @@ pub fn start_attention(reg: Arc<OrchRegistry>) {
 
 // ---------- tauri commands ----------
 
+/// Run a POLLED orchestration command's whole body off the webview main thread
+/// (#743 S4c — the shape #399 gave `git.rs`, #724 gave `gh.rs`, and #719 gave
+/// `write_pty`).
+///
+/// Tauri dispatches a *synchronous* `#[tauri::command]` by calling it directly
+/// on the webview/GUI thread, and — #724's review finding — it polls an async
+/// command's future on that thread too, so anything before the first `.await`
+/// is still main-thread work. Each converted command below therefore resolves
+/// its registry handle (an `Arc` clone: one pointer copy, no I/O, no blocking
+/// lock) and hands the ENTIRE remaining body to `spawn_blocking`.
+///
+/// **Why these commands take `tauri::AppHandle` instead of
+/// `tauri::State<'_, Arc<OrchRegistry>>`.** A borrowed argument gives an async
+/// command a lifetime parameter, which Tauri only supports for a `Result`
+/// return — and these payloads are frozen contracts the frontend is built
+/// against (CLAUDE.md constraint 5), so widening a `Value` to `Result<Value,
+/// _>` is not available. Both `AppHandle` and `State` are injected by Tauri and
+/// neither appears in the argument object the frontend sends, so the wire
+/// contract is byte-identical either way.
+///
+/// **A panicking body stays a panic.** It is re-raised here rather than
+/// degraded to an invented empty payload: moving work off the main thread must
+/// not change what a bug does, and no command here can honestly synthesise the
+/// answer it failed to compute.
+async fn run_blocking<T, F>(f: F) -> T
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    match tauri::async_runtime::spawn_blocking(f).await {
+        Ok(v) => v,
+        Err(e) => panic!("orchestration command task failed: {e}"),
+    }
+}
+
+/// The registry handle for a converted command — see [`run_blocking`]. Cheap
+/// and non-blocking (a managed-state lookup plus an `Arc` clone), which is what
+/// makes it safe to run before the first `.await`.
+fn reg_of(app: &AppHandle) -> Arc<OrchRegistry> {
+    app.state::<Arc<OrchRegistry>>().inner().clone()
+}
+
 /// The flags the single-pane launcher appends to a `program` command when its
 /// "autopilot / allow all" toggle is on (#101). Empty for CLIs with no known
 /// unattended surface. Shares `single_pane_autopilot_flags` with the group
@@ -37073,15 +37344,37 @@ pub fn orch_workflow_preview(repo: String, agent_cli: String) -> Value {
 
 /// Pause a group: loomux stops delivering prompts/kickoffs so its agents
 /// idle out (cost containment). Human action from the pane UI.
+///
+/// Off-thread (#743 S4c — see [`run_blocking`]): a marker write plus an audit
+/// append under the process-global audit lock.
+///
+/// **Reentrancy.** The durable write is guarded by the `paused` set's own
+/// insert: `pause_group` writes the marker and audits only when the insert was
+/// NEWLY true, so two concurrent pauses produce one write and one audit line
+/// however they interleave. A pause racing a resume resolves to whichever wins
+/// the set lock — the same non-determinism two fast human clicks already had,
+/// and the group view disables the button for the duration of the call.
 #[tauri::command]
-pub fn orch_pause_group(reg: tauri::State<Arc<OrchRegistry>>, group_id: String) -> Result<(), String> {
-    reg.pause_group(&group_id)
+pub async fn orch_pause_group(app: AppHandle, group_id: String) -> Result<(), String> {
+    let reg = reg_of(&app);
+    run_blocking(move || reg.pause_group(&group_id)).await
 }
 
 /// Resume a paused group: prompt/kickoff delivery flows again.
+///
+/// Off-thread (#743 S4c): marker removal, an audit-log READ (the pause window's
+/// suppressed deliveries), an audit append, and the queue flush that re-delivers
+/// everything the pause held.
+///
+/// **Reentrancy.** Same guard as `orch_pause_group`, in the mirror direction:
+/// the audit read, the notice, and `flush_paused_queues` run only when the
+/// `paused` set's remove reported the group WAS paused, so a double-resume
+/// cannot flush a pane's queue twice. (The drainer's own at-most-one-per-pane
+/// registration, #470, is the second line of defence.)
 #[tauri::command]
-pub fn orch_resume_group(reg: tauri::State<Arc<OrchRegistry>>, group_id: String) -> Result<(), String> {
-    reg.resume_group(&group_id)
+pub async fn orch_resume_group(app: AppHandle, group_id: String) -> Result<(), String> {
+    let reg = reg_of(&app);
+    run_blocking(move || reg.resume_group(&group_id)).await
 }
 
 /// Whether a group is currently paused (drives the pause/resume button state).
@@ -37154,9 +37447,23 @@ pub fn orch_set_max_agents(
 }
 
 /// Aggregate per-pane session cost/usage into one group summary for the UI.
+///
+/// **The app's heaviest polled command** (census #1): a transcript read per live
+/// agent plus a `usage.json` read-modify-write, asked for by the group view's
+/// 2 s batch, the tab bar's 4 s loop for every group-bound tab, and — through
+/// the budget meter — `orch_autonomy` in the same tick. #743 S4b moves the whole
+/// body off the webview thread and serves it through the per-group memo, so
+/// those callers share ONE computation per [`USAGE_POLL_MAX_AGE`] window.
+///
+/// **Reentrancy.** The read-modify-write is serialized by
+/// [`OrchRegistry::usage_lock`], and concurrent pollers collapse onto one
+/// computation in the memo. The webview's own dispatch was never what made this
+/// safe: the MCP `group_usage` tool has always run the same chain from an MCP
+/// thread.
 #[tauri::command]
-pub fn orch_group_usage(reg: tauri::State<Arc<OrchRegistry>>, group_id: String) -> Value {
-    reg.group_usage(&group_id)
+pub async fn orch_group_usage(app: AppHandle, group_id: String) -> Value {
+    let reg = reg_of(&app);
+    run_blocking(move || reg.group_usage_within(&group_id, USAGE_POLL_MAX_AGE)).await
 }
 
 // ---------- autonomous mode (#83): toggles + budget + state read ----------
@@ -37328,9 +37635,20 @@ pub fn orch_set_compact_nudge_min_context_percent(
 
 /// The group's autonomous-mode state for the panel: toggles, budget, anchor, and
 /// spend-since-enable. Single read the UI renders all three controls from.
+///
+/// Off-thread (#743 S4c), and — while autonomous is ON — sharing the group
+/// view's usage computation rather than re-running the whole chain a second
+/// time in the same 2 s tick (#743 S4b, census part 2a row 27).
+///
+/// **Reentrancy.** The markers, guardrails, and agent state it reads are
+/// read-only here. The token total is not: it runs the same usage computation
+/// `orch_group_usage` does, whose `usage.json` read-modify-write is serialized
+/// by [`OrchRegistry::usage_lock`] — and inside one window the two commands
+/// share a single computation rather than racing to do it twice.
 #[tauri::command]
-pub fn orch_autonomy(reg: tauri::State<Arc<OrchRegistry>>, group_id: String) -> Value {
-    reg.autonomy_state(&group_id)
+pub async fn orch_autonomy(app: AppHandle, group_id: String) -> Value {
+    let reg = reg_of(&app);
+    run_blocking(move || reg.autonomy_state_within(&group_id, USAGE_POLL_MAX_AGE)).await
 }
 
 /// Live-agent count, role breakdown, and uptime for the lifecycle panel.
@@ -37368,11 +37686,20 @@ pub fn orch_set_advanced_orchestrator(
 /// satisfiability guarantee) — `{ advanced, name, default_branch: string|null,
 /// blocks: [{id,kind,cli,model,persona}],
 /// gate: {require,reviewers,also,satisfiable,missing_blocks} | null }`.
-/// A slower, separate read from `orch_group_summary` (polled hot) — fetched on
-/// group open/refresh and after the toggle notice, like `orch_group_watches`.
+/// Part of the group view's 2 s poll batch (groupview.ts:637-658), alongside
+/// `orch_group_summary` — not a once-per-open read.
+///
+/// Off-thread (#743 S4c), and its `default_branch` is memoised per repo (#743
+/// S4a) — resolving that name costs 2-4 blocking `git` spawns, which this was
+/// paying every 2 s per open group view.
+///
+/// **Reentrancy.** Reads only — the workflow file, in-memory guardrails, and
+/// the branch name; the sole mutation is filling the in-memory branch memo,
+/// which is last-writer-wins on a value every racer resolves identically.
 #[tauri::command]
-pub fn orch_workflow_status(reg: tauri::State<Arc<OrchRegistry>>, group_id: String) -> Value {
-    reg.workflow_status(&group_id)
+pub async fn orch_workflow_status(app: AppHandle, group_id: String) -> Value {
+    let reg = reg_of(&app);
+    run_blocking(move || reg.workflow_status(&group_id)).await
 }
 
 // ---------- cross-workspace channels (#271): human-only connect/disconnect ----------
@@ -38434,17 +38761,38 @@ fn open_external_url(url: &str) -> Result<(), String> {
 // MCP. Human edits are audited as actor "human" and (except reorders, which
 // are too chatty) surface in the orchestrator pane as a typed notice.
 
+/// The group's task board. Off-thread (#743 S4c): a `tasks.json` read and parse
+/// per call with no cache, re-fired by every `orch-tasks-changed` event — so an
+/// agent's board-write burst multiplied it by the number of open boards.
+///
+/// **Reentrancy.** A pure read that takes no lock. Board writers rewrite
+/// `tasks.json` through `atomic_write`, so a concurrent reader sees the whole
+/// old file or the whole new one, never a torn one; the main-thread dispatch
+/// this replaces was serializing readers against each other for nothing.
 #[tauri::command]
-pub fn orch_tasks(reg: tauri::State<Arc<OrchRegistry>>, group_id: String) -> Vec<Task> {
-    reg.tasks(&group_id)
+pub async fn orch_tasks(app: AppHandle, group_id: String) -> Vec<Task> {
+    let reg = reg_of(&app);
+    run_blocking(move || reg.tasks(&group_id)).await
 }
 
 /// Audit-log timeline for the pane's audit-viewer overlay (read-only). Oldest
 /// first; the frontend filters, expands prompt texts, and — in follow mode —
 /// re-polls this command.
+///
+/// Off-thread (#743 S4c): follow mode re-reads and re-parses both
+/// `audit.1.jsonl` and `audit.jsonl` every 1.5 s, from the audit viewer and the
+/// timeline alike.
+///
+/// **Reentrancy.** Reads only, bar an in-memory one-shot that keeps the
+/// unreadable-lines breadcrumb from repeating per poll. Appends are
+/// line-oriented and serialized by the audit lock; a reader racing one can
+/// observe a torn final line, which `parse_audit_lines_counted` already skips
+/// and counts — and which was already possible, since appends have always come
+/// from other threads.
 #[tauri::command]
-pub fn orch_audit(reg: tauri::State<Arc<OrchRegistry>>, group_id: String) -> Vec<AuditEntry> {
-    reg.audit_log(&group_id)
+pub async fn orch_audit(app: AppHandle, group_id: String) -> Vec<AuditEntry> {
+    let reg = reg_of(&app);
+    run_blocking(move || reg.audit_log(&group_id)).await
 }
 
 /// The group's merge queue for the lifecycle chrome (#581 slice F) —
@@ -38458,9 +38806,19 @@ pub fn orch_audit(reg: tauri::State<Arc<OrchRegistry>>, group_id: String) -> Vec
 /// `group_id` is trusted as a path segment exactly as every sibling `orch_*`
 /// command trusts it (CLAUDE.md constraint 6) — the webview is the only caller
 /// and this adds no agent-reachable input.
+///
+/// Off-thread (#743 S4c): a `merge_queue.json` read on the group view's 2 s
+/// batch.
+///
+/// **Reentrancy.** A pure read that takes no lock — deliberately not
+/// `mq_state_lock`, which the driver holds across `git`/`gh` subprocess runs
+/// (census part 2c §4.2); waiting on it would be strictly worse than reading a
+/// state one tick old. Every writer stores through `atomic_write`, so a
+/// concurrent read sees one whole version or the other.
 #[tauri::command]
-pub fn orch_merge_queue(reg: tauri::State<Arc<OrchRegistry>>, group_id: String) -> Value {
-    mergeqview::merge_queue_view(&reg.group_dir(&group_id))
+pub async fn orch_merge_queue(app: AppHandle, group_id: String) -> Value {
+    let reg = reg_of(&app);
+    run_blocking(move || mergeqview::merge_queue_view(&reg.group_dir(&group_id))).await
 }
 
 /// Human steering from the loomux compose strip (#43, option C): enqueue

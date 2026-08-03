@@ -38201,3 +38201,292 @@ fn the_effort_flag_does_not_sever_the_allowedtools_value_list() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// #743 S4 — the poll path: memoised hot reads, and the polled commands moving
+// off the webview main thread. The census (#743 parts 1-2) ranked these as the
+// app's #1 GUI-thread duty cycle while a human types.
+// ---------------------------------------------------------------------------
+
+/// Every `#[tauri::command]` site in `src/orchestration/mod.rs`, as
+/// `(name, is_async, body)`.
+///
+/// A source scan, like `gh.rs`'s own `every_tauri_command_in_this_module_is_
+/// async_and_delegates` (#724) — same mechanics, applied to the orchestration
+/// module. Read from `CARGO_MANIFEST_DIR` rather than `include_str!` so a
+/// tens-of-thousands-of-lines module is not baked into the test binary.
+///
+/// A chunk counts only when the first non-attribute line after the marker is
+/// the `pub fn` / `pub async fn` itself, so the marker appearing inside a doc
+/// comment (it does — `run_blocking`'s doc names it) is skipped rather than
+/// mis-attributed to whatever function happens to follow.
+fn orchestration_command_sites() -> Vec<(String, bool, String)> {
+    let src = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/orchestration/mod.rs"),
+    )
+    .expect("src/orchestration/mod.rs must be readable from the manifest dir");
+    // Split so this test's own source never matches the marker it scans for.
+    let marker = concat!("#[tauri::", "command]");
+    let mut out = Vec::new();
+    for chunk in src.split(marker).skip(1) {
+        let mut sig: Option<&str> = None;
+        for line in chunk.lines() {
+            let t = line.trim_start();
+            if t.is_empty() || t.starts_with("#[") || t.starts_with("#!") {
+                continue;
+            }
+            sig = Some(t);
+            break;
+        }
+        let Some(sig) = sig else { continue };
+        let is_async = sig.starts_with("pub async fn ");
+        let Some(after) = sig
+            .strip_prefix("pub async fn ")
+            .or_else(|| sig.strip_prefix("pub fn "))
+        else {
+            continue; // not a command signature (a doc-comment mention)
+        };
+        let Some(paren) = after.find('(') else { continue };
+        let name = after[..paren].trim().to_string();
+        // The body runs from the signature to the first closing brace in
+        // column 0 — top-level items always close there.
+        let from_sig = &chunk[chunk.find(sig).unwrap_or(0)..];
+        let body = match from_sig.find("\n}") {
+            Some(end) => from_sig[..end].to_string(),
+            None => from_sig.to_string(),
+        };
+        out.push((name, is_async, body));
+    }
+    out
+}
+
+/// The polled orchestration commands #743 S4c moves off the webview main
+/// thread: each must be an `async fn` whose body actually delegates.
+///
+/// Both halves matter and #724's mutation round is why: `async` alone does not
+/// move the work, because Tauri polls a command's future on the main thread —
+/// an `async fn` that calls its sync body inline is exactly as blocking as the
+/// sync command it replaced.
+#[test]
+fn the_polled_orchestration_commands_are_async_and_delegate_off_thread() {
+    const OFF_THREAD: &[&str] = &[
+        "orch_pause_group",
+        "orch_resume_group",
+        "orch_group_usage",
+        "orch_autonomy",
+        "orch_workflow_status",
+        "orch_tasks",
+        "orch_audit",
+        "orch_merge_queue",
+    ];
+    let sites = orchestration_command_sites();
+
+    // Vacuity guards. A marker that stopped matching, or a module that moved,
+    // must fail loudly rather than pass over nothing.
+    assert!(
+        sites.len() >= 60,
+        "the scan found only {} command sites in orchestration/mod.rs — the marker or the \
+         signature shape has drifted, and every assertion below would be vacuous",
+        sites.len()
+    );
+    let (_, autopilot_async, _) = sites
+        .iter()
+        .find(|(n, _, _)| n == "agent_autopilot_flags")
+        .cloned()
+        .expect("agent_autopilot_flags is a command site");
+    assert!(
+        !autopilot_async,
+        "the scan must be able to tell a sync command from an async one; \
+         `agent_autopilot_flags` is a static table lookup with nothing to delegate, \
+         so it is the counter-specimen"
+    );
+
+    for want in OFF_THREAD {
+        let (_, is_async, body) = sites
+            .iter()
+            .find(|(n, _, _)| n == want)
+            .cloned()
+            .unwrap_or_else(|| panic!("{want} must exist as a command site"));
+        assert!(
+            is_async,
+            "#743 S4c: `{want}` is polled on a fixed cadence and does blocking I/O, so it must \
+             be an `async fn` — a sync command is dispatched directly on the webview thread"
+        );
+        assert!(
+            body.contains("run_blocking("),
+            "#743 S4c: `{want}` is `async` but its body never reaches `run_blocking(` — Tauri \
+             polls the future on the main thread, so an inline body is still main-thread work \
+             (#724's mutation finding). Body:\n{body}"
+        );
+    }
+}
+
+/// #743 S4a: `orch_workflow_status` is in the group view's 2 s batch, and
+/// resolving the repo's default-branch NAME costs 2-4 blocking `git` spawns.
+/// Inside the memo's window the polled read must serve the stored answer — and
+/// the window must be a bound, not a freeze.
+///
+/// The name is display-only and already documented as unboundedly stale
+/// (`git::default_branch_name` reads local refs, so it is only as fresh as
+/// whatever last fetched), which is what makes memoising it free of correctness.
+#[test]
+fn workflow_status_memoises_the_default_branch_name_within_its_window() {
+    let root = tempfile::tempdir().unwrap();
+    let repo = root.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(args)
+            .output()
+            .expect("git must be installed for this test");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "t@t"]);
+    git(&["config", "user.name", "t"]);
+    fs::write(repo.join("f.txt"), "hi").unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "init"]);
+    // The resolution ladder prefers `main` over `master`, so start on `master`:
+    // renaming to `main` later makes the LIVE answer change, which is the only
+    // way to tell a served memo from a fresh resolution.
+    git(&["branch", "-M", "master"]);
+
+    let (reg, _d) = test_registry();
+    let g = reg.create_group(repo.to_str().unwrap(), rails()).unwrap();
+
+    assert_eq!(
+        reg.workflow_status(&g.id)["default_branch"],
+        "master",
+        "the first read resolves live"
+    );
+
+    git(&["branch", "-M", "main"]);
+
+    assert_eq!(
+        reg.workflow_status(&g.id)["default_branch"],
+        "master",
+        "#743 S4a: inside DEFAULT_BRANCH_MAX_AGE the polled read must serve the memo instead \
+         of spawning `git` 2-4 more times — the live answer is now `main`"
+    );
+    assert_eq!(
+        reg.workflow_status_within(&g.id, Duration::ZERO)["default_branch"],
+        "main",
+        "the memo is a BOUNDED window, not a freeze: a zero window resolves live"
+    );
+    assert_eq!(
+        reg.workflow_status(&g.id)["default_branch"],
+        "main",
+        "and a live resolution refreshes what the window then serves"
+    );
+}
+
+/// Fixture: a claude session transcript under `<projects>/<encoded-cwd>/`, the
+/// shape `compute_usage_snapshot`'s primary source reads.
+fn write_usage_transcript(dir: &Path, sid: &str, input: u64, output: u64) {
+    fs::create_dir_all(dir).unwrap();
+    let text = format!(
+        "{}\n{}\n",
+        json!({"type":"user","message":{"content":"hi"}}),
+        json!({"type":"assistant","message":{"id":"m1","model":"claude-opus-4-8",
+            "usage":{"input_tokens":input,"output_tokens":output,
+                     "cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}),
+    );
+    fs::write(dir.join(format!("{sid}.jsonl")), text).unwrap();
+}
+
+/// #743 S4b: `orch_group_usage` is the heaviest polled command in the app, and
+/// three callers ask for it inside the same ~2 s tick (group view, tab bar, and
+/// `orch_autonomy`'s budget meter). Inside one window they must share ONE
+/// computation; past it, the next caller recomputes.
+#[test]
+fn group_usage_serves_one_snapshot_per_window_and_recomputes_past_it() {
+    let proj = tempfile::tempdir().unwrap();
+    let (reg, _d) = test_registry();
+    reg.set_claude_projects_dir(proj.path().to_path_buf());
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg
+        .spawn_agent(&g.id, Role::Worker, "w", "task", false, None)
+        .unwrap();
+    let sid = w.session_id.clone().expect("a claude worker gets a session id");
+    let encoded = proj.path().join("C--tmp-repo");
+    write_usage_transcript(&encoded, &sid, 1000, 500);
+
+    // Far longer than any real poll gap, so the window — not the clock — is
+    // what the assertions are about.
+    let window = Duration::from_secs(3600);
+
+    assert_eq!(
+        reg.group_usage_within(&g.id, window)["lifetime_tokens"].as_u64(),
+        Some(1500),
+        "the first read computes"
+    );
+
+    // The agent keeps working: the live answer is now 3000 tokens.
+    write_usage_transcript(&encoded, &sid, 2000, 1000);
+
+    assert_eq!(
+        reg.group_usage_within(&g.id, window)["lifetime_tokens"].as_u64(),
+        Some(1500),
+        "#743 S4b: a second polled caller inside the window must be served the stored \
+         snapshot — not a second per-live-agent transcript scan and usage.json rewrite"
+    );
+    assert_eq!(
+        reg.group_usage_within(&g.id, Duration::ZERO)["lifetime_tokens"].as_u64(),
+        Some(3000),
+        "the window is a BOUND, not a cache: a zero window recomputes"
+    );
+    assert_eq!(
+        reg.group_usage(&g.id)["lifetime_tokens"].as_u64(),
+        Some(3000),
+        "and the public `group_usage` keeps its uncached contract — the MCP tool, the \
+         autonomy anchor, and the budget enforcer all still read live"
+    );
+}
+
+/// #743 S4b: `mark_dead` captures an exiting agent's spend by writing
+/// `usage.json` from OUTSIDE the usage computation, so it must drop the memo.
+/// Without that, a killed agent keeps rendering as live in the group view until
+/// the window expires.
+#[test]
+fn a_kill_snapshot_invalidates_the_polled_usage_memo() {
+    let proj = tempfile::tempdir().unwrap();
+    let (reg, _d) = test_registry();
+    reg.set_claude_projects_dir(proj.path().to_path_buf());
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg
+        .spawn_agent(&g.id, Role::Worker, "w", "task", false, None)
+        .unwrap();
+    let sid = w.session_id.clone().unwrap();
+    write_usage_transcript(&proj.path().join("C--tmp-repo"), &sid, 1000, 500);
+
+    let window = Duration::from_secs(3600);
+    let is_live = |v: &serde_json::Value| -> bool {
+        v["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["id"] == w.id.as_str())
+            .expect("the worker has a usage row")["live"]
+            == true
+    };
+
+    assert!(
+        is_live(&reg.group_usage_within(&g.id, window)),
+        "the worker is live"
+    );
+
+    reg.mark_dead(&w.id, Some(0));
+
+    assert!(
+        !is_live(&reg.group_usage_within(&g.id, window)),
+        "#743 S4b: the kill's own usage write must invalidate the memo, so the very next \
+         polled read reports the agent dead instead of serving a snapshot taken while it \
+         was still live"
+    );
+}
