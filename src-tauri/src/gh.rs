@@ -1256,9 +1256,17 @@ mod tests {
         for ok in ALLOWED_LABELS {
             assert!(validate_labels(&[ok.to_string()]).is_ok(), "{ok}");
         }
+        // The #778 veto label is writable from the issues view: it is the human's
+        // one-click hold gesture under full autonomy, so a rejection here would
+        // leave the consent boundary with no UI at all.
+        assert!(validate_labels(&["agent-hold".to_string()]).is_ok());
         // A plausible-but-wrong label (the plan's misspelling) is rejected — it
         // isn't the real repo label, so writing it would fail at gh anyway.
         assert!(validate_labels(&["agent-investigate".to_string()]).is_err());
+        // Near-misses of the hold label are still rejected: only the exact
+        // spelling the poller and the contract use may be written.
+        assert!(validate_labels(&["human-only".to_string()]).is_err());
+        assert!(validate_labels(&["agent-held".to_string()]).is_err());
         // Arbitrary labels are rejected outright.
         assert!(validate_labels(&["bug".to_string()]).is_err());
         // A mixed set fails if any entry is disallowed.
@@ -1307,6 +1315,16 @@ mod tests {
         assert_eq!(
             label_spec("agent-managed"),
             Some(("5319e7", "Managed by a loomux orchestrator"))
+        );
+        // agent-hold (#778) is created RED, and its description states the rule it
+        // enforces: a repo that has never seen the label gets one whose meaning is
+        // legible on GitHub without reading the orchestrator contract.
+        assert_eq!(
+            label_spec("agent-hold"),
+            Some((
+                "b60205",
+                "Held by the human — full-autonomy agents must not start this"
+            ))
         );
         // Non-allow-listed names have no spec (defense in depth vs. arbitrary
         // label creation).

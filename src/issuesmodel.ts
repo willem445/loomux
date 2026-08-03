@@ -28,6 +28,9 @@ export const AGENT_READY = "agent-ready";
 // permits; the other value would be rejected by gh_issue_set_labels.
 export const AGENT_INVESTIGATE = "agent-investigation";
 export const AGENT_MANAGED = "agent-managed";
+// INERT (#778): the constant exists so the hold tests fail on behaviour rather
+// than on a missing import; the implementing commit adds it to TOGGLEABLE_LABELS.
+export const AGENT_HOLD = "agent-hold";
 
 /** The labels a human toggles from the issues view to hand an issue to the
  *  orchestrator (apply `agent-ready` to start work, `agent-investigate` to ask
