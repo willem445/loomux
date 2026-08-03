@@ -7230,7 +7230,7 @@ fn build_agent_argv_matches_command_line() {
     // `--agent <handle>` naming a generated FILE, or (the write-failure
     // fallback) `--append-system-prompt-file "<path>"` — a path can still
     // contain spaces, so it's still worth its own matrix entry.
-    let personas: [PersonaInject; 5] = [
+    let personas: [PersonaInject; 6] = [
         PersonaInject::default(),
         PersonaInject { claude_agent: Some("loomux-g-1-rev-sec".into()), ..PersonaInject::default() },
         PersonaInject {
