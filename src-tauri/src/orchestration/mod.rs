@@ -31223,10 +31223,35 @@ impl OrchRegistry {
         let unattended = auto_ops || containment.forces_unattended();
         match cli {
             "copilot" => {
-                // Copilot has `--resume <id>` but no way to pre-assign an
-                // id, so sessions aren't tracked for it (yet).
+                // Copilot has `--resume` but no way to pre-assign an id, so an
+                // id is discovered after boot (`spawn_copilot_session_watcher`)
+                // rather than minted here the way claude's is.
+                //
+                // **The `=` is required, not cosmetic (#458, re-verified for
+                // #781).** Per the CLI command reference (raw-fetched via
+                // `curl -sL "https://docs.github.com/api/article/body?pathname=\
+                // /en/copilot/reference/copilot-cli-reference/cli-command-reference"`,
+                // per the `agent-cli-reference` skill's no-WebFetch rule, checked
+                // 2026-08-03) the flag is optional-value — `-r`, `--resume[=VALUE]`
+                // — and the page now says outright: "Bare `--resume` (no value)
+                // shows an interactive session picker, which requires a TTY. If
+                // multiple sessions exist and the picker can't be shown … the CLI
+                // exits with an error instead of silently starting a new session —
+                // pass an explicit `--resume=SESSION-ID` or use `--continue`." The
+                // space form risks parsing as bare-flag-plus-positional, i.e. the
+                // picker in a pane loomux is about to type a kickoff into.
+                // #458 fixed this on the Sessions-tab command (`scan_copilot`) and
+                // left the spawn path alone because nothing routed a copilot
+                // orchestration session here; #781 does, so it moves too.
+                //
+                // NOT `--session-id <id>`, which is also documented and exact:
+                // it "creates a new session when the value is a valid UUID" and
+                // nothing matches — and copilot's ids ARE UUIDs, so a stale id
+                // would silently open a blank session wearing the right name.
+                // `--resume=` fails loudly on a missing id instead, which is the
+                // behavior a rejoin wants.
                 let resume_flag = match (session, resume) {
-                    (Some(s), true) => format!("--resume {s} "),
+                    (Some(s), true) => format!("--resume={s} "),
                     _ => String::new(),
                 };
                 // NOTE: the @ (copilot's file-path marker) must sit INSIDE
@@ -31580,8 +31605,12 @@ impl OrchRegistry {
             "copilot" => {
                 push(&mut a, "copilot");
                 if let (Some(s), true) = (session, resume) {
-                    push(&mut a, "--resume");
-                    push(&mut a, s);
+                    // ONE argv element, `=`-joined — see the string builder's
+                    // resume comment. The hazard is worse here, not better: an
+                    // optional-value flag takes its value from the SAME argv
+                    // element, so a separate `s` element is a positional and
+                    // `--resume` is bare.
+                    a.push(format!("--resume={s}"));
                 }
                 push(&mut a, "--additional-mcp-config");
                 // The @ marker rides on the path as a single argv element (no
