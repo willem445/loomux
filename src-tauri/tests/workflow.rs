@@ -20,7 +20,7 @@ use loomux_lib::orchestration::mcp::dispatch;
 use loomux_lib::orchestration::profiles::{self, ProfileMode};
 use loomux_lib::orchestration::workflow::{self, GateRequire};
 use loomux_lib::orchestration::{
-    block_contract_text, cli_caps, command_line_length_guard, Caller, Containment, ContractCarrier, Guardrails, Launch, OrchRegistry, Role, EFFORT_LEVELS,
+    block_contract_text, cli_caps, command_line_length_guard, Caller, Containment, ContractCarrier, Guardrails, Launch, OrchRegistry, Role, CLI_CAPS, EFFORT_LEVELS,
 };
 use serde_json::{json, Value};
 use std::fs;
@@ -6074,7 +6074,7 @@ fn a_knob_that_is_unknown_or_undeliverable_is_a_loud_parse_error() {
     )
     .unwrap_err();
     assert!(
-        errs.iter().any(|e| e.contains("cli \"copilot\" cannot set context:")
+        errs.iter().any(|e| e.contains("cli \"copilot\" cannot set context \"1m\"")
             && e.contains(cli_caps("copilot").unwrap().context_note)),
         "the refusal must carry copilot's own reason: {errs:?}"
     );
@@ -6083,7 +6083,7 @@ fn a_knob_that_is_unknown_or_undeliverable_is_a_loud_parse_error() {
     )
     .unwrap_err();
     assert!(
-        errs.iter().any(|e| e.contains("cli \"gemini\" cannot set effort:")
+        errs.iter().any(|e| e.contains("cli \"gemini\" cannot set effort \"high\"")
             && e.contains(cli_caps("gemini").unwrap().effort_note)),
         "{errs:?}"
     );
@@ -6091,7 +6091,7 @@ fn a_knob_that_is_unknown_or_undeliverable_is_a_loud_parse_error() {
         "version: 1\nblocks:\n  - id: w\n    kind: worker\n    cli: copilot\n    effort: low\n",
     )
     .unwrap_err();
-    assert!(errs.iter().any(|e| e.contains("cli \"copilot\" cannot set effort:")), "{errs:?}");
+    assert!(errs.iter().any(|e| e.contains("cli \"copilot\" cannot set effort \"low\"")), "{errs:?}");
 
     // (3) A block that inherits the group's CLI defers the cli half — the
     // group default is not known at parse time (the same deferral
@@ -6108,6 +6108,112 @@ fn a_knob_that_is_unknown_or_undeliverable_is_a_loud_parse_error() {
         "version: 1\nblocks:\n  - id: w\n    kind: worker\n    efort: high\n"
     )
     .is_err());
+}
+
+/// #782 — the refusal has to be an AUTHORING RAIL, not just a verdict.
+///
+/// A human gets the launcher, which greys an undeliverable knob out with its
+/// reason attached; an agent writing `.loomux/workflow.yml` gets this string
+/// and nothing else. So it must locate the mistake (which block, which knob,
+/// which value), explain it in the vendor's own terms, AND say what to do
+/// instead — otherwise the author's next move is a guess between deleting the
+/// key and rewriting the block's `cli:`.
+///
+/// The remedy is derived from `CLI_CAPS`, never written per-CLI (CLAUDE.md
+/// constraint 8): this asserts the suggested CLI list IS the set of spawnable
+/// rows carrying that value, so wiring a knob on another CLI updates the
+/// message with no test edit and no source edit.
+#[test]
+fn an_undeliverable_knob_names_the_block_the_value_the_reason_and_the_fix() {
+    let errs = workflow::parse_workflow(
+        "version: 1\nblocks:\n\
+         \x20 - id: orchestrator\n    kind: orchestrator\n    cli: claude\n\
+         \x20 - id: rev-ui\n    kind: reviewer\n    cli: copilot\n    effort: xhigh\n",
+    )
+    .unwrap_err();
+    let e = errs
+        .iter()
+        .find(|e| e.contains("effort"))
+        .unwrap_or_else(|| panic!("no effort error at all: {errs:?}"));
+
+    // WHERE: the block's index AND its id — a file with several copilot blocks
+    // must not leave the author bisecting to find which one is meant.
+    assert!(e.contains("blocks[1]") && e.contains("(rev-ui)"), "must locate the block: {e}");
+    // WHAT: the knob and the exact value that was refused.
+    assert!(e.contains("cannot set effort \"xhigh\""), "must name knob and value: {e}");
+    // WHY: the vendor fact from copilot's own capability row, not "unsupported".
+    assert!(e.contains(cli_caps("copilot").unwrap().effort_note), "must carry the reason: {e}");
+    // HOW: both escapes, and the CLI list derived from CLI_CAPS itself.
+    let can: Vec<&str> = CLI_CAPS
+        .iter()
+        .filter(|c| c.orchestration && c.effort_levels.contains(&"xhigh"))
+        .map(|c| c.cli)
+        .collect();
+    assert!(!can.is_empty(), "the fixture assumes some spawnable cli can set effort");
+    assert!(e.contains("drop the key"), "must offer the delete-it escape: {e}");
+    assert!(
+        e.contains(&can.join(", ")),
+        "must offer the move-it escape, listing exactly the caps-derived CLIs {can:?}: {e}"
+    );
+
+    // A knob NO spawnable CLI can deliver must not invent an alternative — it
+    // says so and offers only the escape that exists. `context: 1m` is that
+    // case today (claude alone carries it), so this drives the branch by
+    // asserting the message tracks the caps table rather than a literal.
+    let errs = workflow::parse_workflow(
+        "version: 1\nblocks:\n  - id: w\n    kind: worker\n    cli: gemini\n    context: 1m\n",
+    )
+    .unwrap_err();
+    let e = errs.iter().find(|e| e.contains("context")).unwrap();
+    let can: Vec<&str> = CLI_CAPS
+        .iter()
+        .filter(|c| c.orchestration && c.context_variants.contains(&"1m"))
+        .map(|c| c.cli)
+        .collect();
+    if can.is_empty() {
+        assert!(e.contains("no cli loomux spawns can set"), "{e}");
+    } else {
+        assert!(e.contains(&can.join(", ")), "{e}");
+    }
+    assert!(e.contains("drop the key"), "{e}");
+}
+
+/// #782 — a workflow file loomux refuses must never WEDGE a group.
+///
+/// The failure mode is the whole reason the knob check is allowed to be loud:
+/// `load_workflow` returns the errors, the launcher's preview reports
+/// `valid: false` with them attached, and a launch falls back to the built-in
+/// roster. If a broken file could instead block a spawn, "loud" would mean
+/// "unusable" and the check would have to be silent.
+#[test]
+fn a_refused_workflow_file_reports_errors_and_never_blocks_a_launch() {
+    let repo = Repo::new().workflow(
+        "version: 1\nblocks:\n  - id: w\n    kind: worker\n    cli: copilot\n    effort: high\n",
+    );
+    // Refused, WITH the reason — not `Ok` carrying half-parsed blocks, and not
+    // a panic that would take the caller down with it.
+    let errs = match workflow::load_workflow(&repo.path()) {
+        Err(errs) => errs,
+        other => panic!("a knob copilot cannot deliver must refuse the load: {other:?}"),
+    };
+    assert!(
+        errs.iter().any(|e| e.contains("cannot set effort") && e.contains("drop the key")),
+        "the refusal must carry the authoring rail out to the caller: {errs:?}"
+    );
+
+    // And the roster a launch then runs is the built-in one — synthesized
+    // exactly as a repo with NO workflow file gets, so a refused file reads as
+    // "no workflow", never as "no agents".
+    let fallback = workflow::builtin_roster("copilot");
+    assert!(
+        !workflow::roster_is_custom(&fallback),
+        "the fallback must be the built-in roster: {fallback:?}"
+    );
+    assert!(
+        fallback.iter().any(|b| b.kind == Role::Orchestrator)
+            && fallback.iter().any(|b| b.kind == Role::Worker),
+        "the fallback roster must still be able to run work: {fallback:?}"
+    );
 }
 
 /// The orchestrator block's pin list widens by exactly two value-set picks

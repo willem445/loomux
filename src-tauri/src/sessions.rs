@@ -768,6 +768,20 @@ fn copilot_launch_posture(cwd: &str) -> Option<bool> {
 /// CLIs. Reuses the SAME flag atoms a fresh launch builds
 /// (`single_pane_autopilot_flags`/`COPILOT_GROUP_AUTOPILOT_FLAGS`) — one
 /// seam, never a second copy that could drift.
+///
+/// **THIS COMMAND IS FOR A PLAIN SESSION ONLY, and the frontend is what keeps
+/// it that way (#781).** Nothing here carries orchestration wiring — no
+/// `--additional-mcp-config`, no `--add-dir`, no `--model`, no persona, no
+/// group binding — because a session that HAS a recorded orchestration
+/// membership never reaches this string: `sessionroute.ts` routes it to
+/// `resume_recorded_session`, which rebuilds the full spawn command. This
+/// string is what a session with no such record honestly is. It was also, for
+/// every copilot orchestration session, what one silently GOT until #781, and
+/// on copilot that failure is near-invisible: per the CLI's changelog (1.0.76,
+/// 2026-07-29 — "Resuming a session now restores its autopilot or plan mode
+/// instead of reverting to interactive"), a bare `copilot --resume` comes back
+/// IN autopilot mode, so a pane with none of the wiring still reads as a
+/// healthy autopilot agent.
 fn build_resume_command(cli: &str, session_id: &str, cwd: &str, store: &LaunchIntentStore) -> String {
     match cli {
         "copilot" => {

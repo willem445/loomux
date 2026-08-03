@@ -4003,6 +4003,28 @@ pub(crate) fn default_model(cli: &str, role: Role) -> &'static str {
 /// `--autopilot` to build [`COPILOT_GROUP_AUTOPILOT_FLAGS`] — kept as its own
 /// constant purely so the two flag strings are built from one shared atom
 /// instead of two independently-typed literals that could drift apart.
+///
+/// **Spellings re-verified against copilot 1.0.77's reference (#781, checked
+/// 2026-08-03), with no drift.** The
+/// [allow/deny reference](https://docs.github.com/en/copilot/how-tos/copilot-cli/use-copilot-cli/allowing-tools)
+/// still lists `--allow-all-tools` ("Full access to the available tools") under
+/// *Permissive options*, and the
+/// [programmatic reference](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-programmatic-reference)
+/// still lists `--allow-all-paths` ("Disable file-path verification entirely").
+/// Neither page marks either flag deprecated or renamed, so both atoms stay
+/// exactly as spelled.
+///
+/// **One documented limit loomux cannot flag its way past**, recorded here
+/// because a work machine is where it bites: the same *Permissive options*
+/// section states, verbatim, "If you have a Copilot Business or Copilot
+/// Enterprise license, these commands may be blocked by an enterprise
+/// administrator." An org that blocks bypass-permissions mode neuters these two
+/// atoms while leaving `--autopilot` (not a permissive option) working, so the
+/// pane runs unattended and prompts anyway. The targeted grants loomux emits
+/// alongside them — `--allow-tool loomux` in the base command, `--add-dir` for
+/// the group dir and workdir — are NOT permissive options and are what keeps
+/// such a pane usable at all. Nothing here can override the policy, and loomux
+/// must not pretend to.
 pub const COPILOT_UNATTENDED_FLAGS: &str = "--allow-all-tools --allow-all-paths";
 
 /// Copilot's unattended-autopilot flags: [`COPILOT_UNATTENDED_FLAGS`] plus

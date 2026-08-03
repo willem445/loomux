@@ -165,6 +165,31 @@ that exists but is unwired pending live schema verification). Declaring
 `effort:`/`context:` on a block whose `cli:` can't honor it is a parse error
 naming the CLI and why, not a value that silently does nothing.
 
+**Which CLI carries which knob — check before you write either key.** The
+launcher greys an undeliverable knob out for a human; authoring the file by
+hand there is no such rail, so this is it:
+
+| `cli:` | `effort:` | `context:` | why |
+|---|---|---|---|
+| `claude` | `low`, `medium`, `high`, `xhigh`, `max` | `1m` | `--effort <level>` is a session flag; `[1m]` is a model-alias suffix |
+| `copilot` | **none** | **none** | effort is `~/.copilot/settings.json`-only (no flag, no env, and loomux never writes a user's global settings); the context window is the interactive `/context` control |
+| `gemini` | **none** | **none** | its thinking level is a settings-file key whose schema is unverified, so loomux does not write it; its window is model-determined |
+
+**This table is a snapshot; `CliCaps` is the truth.** The rows come from
+`CLI_CAPS` in `src-tauri/src/orchestration/mod.rs`, which the `agent_cli_knobs`
+Tauri command serves to the launcher — same source, so the launcher's greyed-out
+select and `parse_workflow`'s refusal can never disagree. A knob gets wired on a
+new CLI by adding values to that row, and this table is then stale. If the two
+disagree, `CLI_CAPS` wins and this table is the bug. **An empty cell is a
+positive claim, not a gap** — it means loomux has looked for a seam and found
+none it can use, which is why the parse error can quote a vendor reason rather
+than saying "unsupported".
+
+If you get the refusal anyway, read it: it names the block (index and id), the
+knob, the exact value, the vendor reason, and both fixes — drop the key, or move
+the block to a `cli:` that carries it. Dropping the key is not a downgrade; it
+means the CLI's own default applies.
+
 **A third check exists for `context:`, but it is not in `parse_workflow` —
 a clean parse is necessary, not sufficient.** The `[1m]` suffix also has to
 fit the block's `model:`: it's only defined for the `sonnet`/`opus`/
@@ -332,7 +357,8 @@ As an authoring agent you cannot invoke either directly, so:
      block, etc.);
    - `effort:`/`context:` not in loomux's closed vocabulary, or set on a
      block whose `cli:` can't honor that knob (e.g. `context: 1m` on a
-     `copilot` block) — see the caps-gating rule in Step 4;
+     `copilot` block) — check the per-CLI knob matrix in Step 4 BEFORE
+     writing either key; the refusal names both fixes if you don't;
    - `context: 1m` paired with a `model:` that has no `[1m]` form (`haiku`,
      `fable`, `best`, `default`) — `parse_workflow` does not check this (it
      checks the CLI, not the model), so this combination parses clean and

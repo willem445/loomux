@@ -926,8 +926,12 @@ work queue.
 [session browser](features/session-browser.html) (`ORCH` / `W` / `REV` chips).
 Clicking a dead group's orchestrator session restores the *whole* orchestration
 — same group id, state, task board, and audit history, with fresh MCP identity
-wired into the resumed conversation. A plain `claude --resume` would come back
-powerless (no MCP tools, no task board); this path never does.
+wired into the resumed conversation. A plain `claude --resume` / `copilot
+--resume` would come back powerless (no MCP tools, no task board); this path
+never does. Whether a clicked row takes it is decided by the recorded
+membership the chip itself reflects, never by which CLI wrote the session — a
+chipped row restores its group on every agent CLI, and a row with no chip is a
+plain session and restores as one.
 
 **Per-task sessions:** each worker is scoped to exactly one work item, and loomux
 records its session id. Follow-ups on a finished task *resume* that worker's
