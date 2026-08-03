@@ -50,6 +50,10 @@ Each is shipped, tested, and citable — prefer copying one to inventing a shape
   conversion had to give something up — the freeze it removed was also an
   accidental mutual exclusion, so it carries the worked example of restoring
   the ordering (`src/gitqueue.ts`) and of the residual left behind (#754).
+  The delegation helper for a NEW conversion is `blocking.rs` `run_blocking`
+  (#746, shared by the nine gesture modules); `git.rs`, `gh.rs` and
+  `orchestration/mod.rs` keep their own older private copies, which is history,
+  not a pattern to extend.
 - **P2 — Coalesce per frame, leading edge, byte cap.** Bound a
   producer-rate stream backend-side to ≤1 event per pane per 60 Hz frame with
   a hard batch cap, emitting immediately when the producer has been quiet so
@@ -102,6 +106,25 @@ Each is shipped, tested, and citable — prefer copying one to inventing a shape
   "smooth" it — an unbounded queue converts a stall into unbounded memory.
   Precedent: `pty.rs` `write_pty`'s doc (~L1570, the argument) and
   `doc/design/pty-input-path.md` §2.
+- **P7 — A dispatch ticket, when the conversion took an ORDER away.** P1
+  removes an accidental mutual exclusion: one thread ran every command body, so
+  arrival order *was* application order and nothing had to say so. Where
+  something depended on that, restore the order rather than the exclusion — a
+  mutex gives back "not at the same time", never "the later one wins". The
+  shape: claim a monotonic ticket in the command **before the first await**
+  (that poll runs on the webview thread, so it is stamped in arrival order),
+  carry it into the blocking body, and have the body decline if a newer ticket
+  has since been claimed for the same subject. Precedent, both #746:
+  `uistate.rs` `write_atomic_seq` (per-path high-water mark — an older tab
+  layout landing second would otherwise stick, because `persistTabs` never
+  re-offers bytes it already issued) and `gitwatch.rs` `GitWatcher::claim`
+  (per-pane, where the sharper case is not a stale repoint but `git_unwatch`:
+  a pane closed mid-flight would have its watch REINSTALLED, leaking a poll
+  target for the life of the process — so the close claims a ticket too, which
+  is what makes it a tombstone rather than a gap). Reach for this only when an
+  order was actually load-bearing; most conversions find their guard already
+  written (a lock, an atomic, an idempotent write) and owe only the sentence
+  naming it.
 
 ## 3. The invariants
 
@@ -201,7 +224,6 @@ Owning issues:
 | area | issue |
 |---|---|
 | 16 sync git-shelling commands | #726 |
-| remaining sync gesture commands (filemgr, fileedit, uistate, sessions, cliprobe, editor, `spawn_pty`, `dir_info`, voice) | #746 |
 | `tasks_lock` architecture — file IO out from under the board family's lock | #747 |
 | `mq_state_lock` / single gh-poll-thread decoupling (fleet latency; §4 X4) | #748 |
 | `orch_session_roles` unbounded fan-out | #749 |

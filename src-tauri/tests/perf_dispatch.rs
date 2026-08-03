@@ -19,7 +19,7 @@
 //! are meant to read as one idea.
 //!
 //! WHY A MANIFEST AND NOT A LINT. The property is not "no blocking sync
-//! commands exist": 26 do today (66 when this file landed), enumerated in
+//! commands exist": 1 does today (66 when this file landed), enumerated in
 //! #743's census (planning comments parts 1-2, which `performance.md` §5 names
 //! as the one source of truth) and owned by the issues in `DEBT_OWNERS`. The property is that **one cannot be
 //! added silently**. A new sync command fails this test until somebody writes
@@ -29,12 +29,15 @@
 //!
 //! THE BOUND OF THE CLAIM, stated rather than implied. **A source scan cannot
 //! follow call chains.** A sync command whose *helper* spawns is not caught
-//! mechanically, and the shipped tree has live examples: `fm_open`'s body is
-//! one line and the blocking `ShellExecuteW` is in `filemgr.rs`'s helper, and
+//! mechanically, and the shipped tree still has one:
 //! `orch_confirm_solo_copilot_autopilot`'s one-line body hands work to a raw
-//! thread it never names. (`orch_open_ref` was the third until #762 converted
-//! it — a scan-invisible pair of `git` spawns, found by reading rather than by
-//! failing, which is the residue this paragraph is about.) This is the same
+//! thread it never names. Two more were live examples until their conversions
+//! took them out of the sync tier — `orch_open_ref` (#762, a scan-invisible
+//! pair of `git` spawns) and `fm_open`/`fm_open_with` (#746, a one-line body
+//! over a blocking `ShellExecuteW` in `filemgr.rs`'s helper). Both were found
+//! by reading rather than by failing, which is the residue this paragraph is
+//! about, and neither being here any more is why it names them anyway: the
+//! bound did not narrow, the tier did. This is the same
 //! bound `gh.rs`'s in-module enumeration test (the seed this generalizes)
 //! already accepts. The scan pins the shape — which commands are sync, and that
 //! each one's cost is written down — and the manifest reason plus review carry
@@ -89,33 +92,25 @@ struct Row {
 /// against the issue, not free text that quietly names anything.
 const DEBT_OWNERS: &[(&str, &str)] = &[
     (
-        "#746",
-        "F1 of #743: the remaining sync gesture commands (filemgr, fileedit, uistate, sessions, \
-         cliprobe, editor, spawn_pty, dir_info, voice) convert to async + run_blocking in two \
-         quick-tier slices, each deleting its rows here. Two rows ride with them that F1's list \
-         does not name — discover_git_bash and git_watch, both pty/gitwatch commands of the same \
-         shape; each says so in its own reason rather than widening the issue silently.",
-    ),
-    (
         "#749",
         "F4 of #743: orch_session_roles fans out over every group ever created — an index or a \
          live-groups filter, not just a thread hop.",
     ),
 ];
 
-/// The 51 synchronous `#[tauri::command]`s at this commit, seeded verbatim from
+/// The 26 synchronous `#[tauri::command]`s at this commit, seeded verbatim from
 /// #743's census (planning comments parts 1-2, reconciled against
 /// `APP_COMMANDS`) with #726's 16 git conversions, #752's 8 polled
-/// orchestration conversions and #762's 40 orchestration mutation and
-/// lifecycle conversions already removed. This is today's truth, not the
-/// target state.
+/// orchestration conversions, #762's 40 orchestration mutation and lifecycle
+/// conversions and #746's 25 gesture conversions already removed. This is
+/// today's truth, not the target state.
 ///
 /// Reconciliation against the census's own totals, so a reader can check this
 /// list rather than trust it: census A=20, T=4, C=20, B=91 of 135. Here
-/// 84 async = 20 A + #726's 16 + #752's 8 + #762's 40; 20 `cheap` = the 20 C;
-/// 5 `exception` = the 4 T plus `resize_pty` (census B, but §4 X1 argues it
-/// stays sync); 26 `debt` = 91 B − 16 (#726) − 8 (#752) − 40 (#762) − 1
-/// (`resize_pty`), owned by #746 (25) and #749 (1).
+/// 109 async = 20 A + #726's 16 + #752's 8 + #762's 40 + #746's 25;
+/// 20 `cheap` = the 20 C; 5 `exception` = the 4 T plus `resize_pty` (census B,
+/// but §4 X1 argues it stays sync); 1 `debt` = 91 B − 16 (#726) − 8 (#752)
+/// − 40 (#762) − 25 (#746) − 1 (`resize_pty`), owned by #749.
 ///
 /// CITE CONVENTION. A `reason` that points at code names the **symbol** and
 /// carries the line only as a parenthetical hint (`… in `PtyManager::kill`
@@ -138,7 +133,7 @@ const SYNC_COMMANDS: &[Row] = &[
                  sizes can be outstanding and off-thread dispatch could land them in either \
                  order, leaving ConPTY at the older geometry with no event to correct it. See \
                  performance.md §4 X1; the argument and its named falsifier are the doc comment \
-                 on `resize_pty` itself (pty.rs:1566-1594 at this commit).",
+                 on `resize_pty` itself (pty.rs:1662-1692 at this commit).",
         issue: None,
     },
     Row {
@@ -147,7 +142,7 @@ const SYNC_COMMANDS: &[Row] = &[
         reason: "Hands the delete to a dedicated OS thread that enters its own STA, because \
                  SHFileOperationW is a Shell/COM API and a generic async pool has no defined \
                  apartment state. See performance.md §4 X2; argued in the doc comment on \
-                 `fm_delete_start` itself (filemgr.rs:846-886 at this commit).",
+                 `fm_delete_start` itself (filemgr.rs:903-944 at this commit).",
         issue: None,
     },
     Row {
@@ -216,9 +211,11 @@ const SYNC_COMMANDS: &[Row] = &[
     Row {
         name: "git_unwatch",
         class: Class::Cheap,
-        reason: "Removes one entry from the watches map so the poll loop stops servicing it. A \
-                 single map mutation under a briefly-held lock; unlike git_watch it reads nothing \
-                 from disk.",
+        reason: "Removes one entry from the watches map so the poll loop stops servicing it, and \
+                 claims a dispatch ticket in the intents map so an in-flight git_watch cannot \
+                 reinstall the watch it just removed (#746). Two map mutations under briefly-held \
+                 leaf locks; unlike git_watch it reads nothing from disk, and its claim has to run \
+                 on the webview thread — being sync is what puts it in arrival order.",
         issue: None,
     },
     Row {
@@ -333,209 +330,8 @@ const SYNC_COMMANDS: &[Row] = &[
         issue: None,
     },
     // ---------------------------------------------------------------------
-    // debt — #746 (F1): the sync gesture commands outside orchestration.
-    // ---------------------------------------------------------------------
-    Row {
-        name: "spawn_pty",
-        class: Class::Debt,
-        reason: "Runs openpty plus the child process creation (ConPTY handshake and CreateProcess) \
-                 on the webview thread; the ptys lock is taken only for the insert. Once per pane \
-                 and human-gestured, but it is a process spawn on the GUI thread, which INV-2 \
-                 admits only as declared debt.",
-        issue: Some("#746"),
-    },
-    Row {
-        name: "dir_info",
-        class: Class::Debt,
-        reason: "Stats and reads .git and HEAD walking up the parent directories, on the webview \
-                 thread. Was the hottest row in this block — one sync read per OSC-7 cwd report \
-                 and per git-changed event, per pane watching the repo, so a rebase or an agent's \
-                 commit loop drove it. #764 (S5) bounded the CALLER to one read per pane per \
-                 REPO_SIGNAL_WINDOW_MS with a leading edge, which is why this is now an ordinary \
-                 gesture-rate row rather than the urgent one; the sync dispatch itself is what F1 \
-                 still owns.",
-        issue: Some("#746"),
-    },
-    Row {
-        name: "discover_git_bash",
-        class: Class::Debt,
-        reason: "Stats a bounded candidate list and scans PATH looking for git-bash, on the \
-                 webview thread, once at launcher time. F1's list enumerates the other pty.rs \
-                 gesture commands and omits this one; it is the same shape and rides with them.",
-        issue: Some("#746"),
-    },
-    Row {
-        name: "ft_list_dir",
-        class: Class::Debt,
-        reason: "A read_dir of the requested directory on the webview thread. Bounded by the \
-                 directory's size, which nothing in the app bounds — a directory with tens of \
-                 thousands of entries is a stall the user sees as the file tree freezing.",
-        issue: Some("#746"),
-    },
-    Row {
-        name: "ft_read_file",
-        class: Class::Debt,
-        reason: "An fs::read of up to 2 MiB on the webview thread. The cap bounds the memory, not \
-                 the latency: 2 MiB off a cold or network path is a visible freeze.",
-        issue: Some("#746"),
-    },
-    Row {
-        name: "ft_write_file",
-        class: Class::Debt,
-        reason: "Write, fsync, then rename — on the webview thread. The fsync is the expensive \
-                 part and is deliberate (it is what makes the replace atomic), which is precisely \
-                 why it does not belong on the thread that services paint.",
-        issue: Some("#746"),
-    },
-    Row {
-        name: "ft_replace",
-        class: Class::Debt,
-        reason: "Per-file read plus an fsync-ed atomic write, over an UNBOUNDED number of files, \
-                 on the webview thread. The worst latency shape in this block: a project-wide \
-                 replace freezes the GUI for the whole operation.",
-        issue: Some("#746"),
-    },
-    Row {
-        name: "fm_list",
-        class: Class::Debt,
-        reason: "Enumerates a directory and stats each entry for the file manager grid, on the \
-                 webview thread. Same unbounded-directory exposure as ft_list_dir.",
-        issue: Some("#746"),
-    },
-    Row {
-        name: "fm_new_folder",
-        class: Class::Debt,
-        reason: "Creates a directory on the webview thread. One syscall, but on a slow or remote \
-                 path it blocks input and paint for as long as the filesystem takes.",
-        issue: Some("#746"),
-    },
-    Row {
-        name: "fm_new_file",
-        class: Class::Debt,
-        reason: "Creates an empty file on the webview thread — the same one-syscall-but-blocking \
-                 shape as fm_new_folder, and converted with it.",
-        issue: Some("#746"),
-    },
-    Row {
-        name: "fm_rename",
-        class: Class::Debt,
-        reason: "Renames a path on the webview thread. Cheap locally and arbitrarily slow across \
-                 a network share, which is the case the conversion exists for.",
-        issue: Some("#746"),
-    },
-    Row {
-        name: "fm_reveal",
-        class: Class::Debt,
-        reason: "Spawns explorer.exe to reveal a path. A process spawn on the webview thread — \
-                 the INV-2 violation the debt class exists to name — and the spawn is in a helper, \
-                 so the marker check would not see it either.",
-        issue: Some("#746"),
-    },
-    Row {
-        name: "fm_open",
-        class: Class::Debt,
-        reason: "Calls the BLOCKING ShellExecuteW to open a path with its registered handler, from \
-                 a one-line body whose helper does the call. Shell handler resolution can take \
-                 seconds on a cold association, all of it on the GUI thread.",
-        issue: Some("#746"),
-    },
-    Row {
-        name: "fm_open_with",
-        class: Class::Debt,
-        reason: "The open-with dialog variant of fm_open: also a blocking ShellExecuteW in a \
-                 helper, and it can put a modal shell dialog up while the webview thread is the \
-                 one waiting on it.",
-        issue: Some("#746"),
-    },
-    Row {
-        name: "load_ui_tabs",
-        class: Class::Debt,
-        reason: "Reads the persisted tab layout from disk on the webview thread, including the \
-                 quarantine-rename path taken when the file will not parse. Once per launch, but \
-                 it is launch latency the user feels as a slow start.",
-        issue: Some("#746"),
-    },
-    Row {
-        name: "save_ui_tabs",
-        class: Class::Debt,
-        reason: "Serialises the tab layout, fsyncs it and renames it into place, on the webview \
-                 thread. Fired on layout gestures, so the fsync lands mid-interaction.",
-        issue: Some("#746"),
-    },
-    Row {
-        name: "load_settings",
-        class: Class::Debt,
-        reason: "Reads and parses settings.json on the webview thread, with the same \
-                 quarantine-rename fallback as load_ui_tabs when the file is corrupt.",
-        issue: Some("#746"),
-    },
-    Row {
-        name: "save_settings",
-        class: Class::Debt,
-        reason: "Writes settings.json with an fsync and a rename, on the webview thread, from the \
-                 settings dialog's save gesture.",
-        issue: Some("#746"),
-    },
-    Row {
-        name: "record_copilot_launch_posture",
-        class: Class::Debt,
-        reason: "Reads the launch-intent file and writes it back fsync-ed and renamed, on the \
-                 webview thread. There is no lock: concurrent-write safety rests on rename \
-                 atomicity alone, which the conversion must preserve rather than assume.",
-        issue: Some("#746"),
-    },
-    Row {
-        name: "record_claude_launch_posture",
-        class: Class::Debt,
-        reason: "The Claude twin of record_copilot_launch_posture: same intent read, same \
-                 fsync-and-rename write on the webview thread, same rename-atomicity argument.",
-        issue: Some("#746"),
-    },
-    Row {
-        name: "probe_agent_cli",
-        class: Class::Debt,
-        reason: "On a cache miss it spawns the agent CLI with --help and poll-joins it for up to \
-                 8 seconds, on the webview thread. Cached afterwards, so the freeze is once per \
-                 CLI per session — the longest single stall any command here can produce.",
-        issue: Some("#746"),
-    },
-    Row {
-        name: "open_in_editor",
-        class: Class::Debt,
-        reason: "Probes PATH and PATHEXT with stats and then spawns the editor detached, on the \
-                 webview thread. The spawn is detached so the wait is short, but the PATH probing \
-                 in front of it is not bounded by anything the app controls.",
-        issue: Some("#746"),
-    },
-    Row {
-        name: "voice_start",
-        class: Class::Debt,
-        reason: "Waits on ready_rx.recv() for the WASAPI device to open WHILE HOLDING the \
-                 recording mutex, on the webview thread. An indeterminate wait, not a bounded \
-                 one: a slow or contended audio device freezes the GUI for as long as it takes.",
-        issue: Some("#746"),
-    },
-    Row {
-        name: "voice_cancel",
-        class: Class::Debt,
-        reason: "Blocking thread-join of the capture thread on the webview thread. Locks are not \
-                 held across it, and it is called from Esc, pane close and app teardown — so the \
-                 stall lands exactly when the user is trying to get out.",
-        issue: Some("#746"),
-    },
-    Row {
-        name: "git_watch",
-        class: Class::Debt,
-        reason: "Computes the repo signature (stats and reads) on the webview thread. #763 (S7) \
-                 moved that IO OUTSIDE the watches mutex, so the lock-scope half — the reason this \
-                 row used to belong to S7 — is done; what is left is the plain one, a sync \
-                 filesystem command Tauri dispatches on the thread that services paint. F1's list \
-                 does not name gitwatch, same as discover_git_bash above; it is the same shape and \
-                 rides with them.",
-        issue: Some("#746"),
-    },
-    // ---------------------------------------------------------------------
-    // debt — #749: the one orchestration row with its own dedicated issue.
+    // debt — #749, the last row in this tier. #746 (F1) drained the other 25;
+    // #726, #752 and #762 the 64 before them.
     // ---------------------------------------------------------------------
     Row {
         name: "orch_session_roles",
@@ -1238,10 +1034,11 @@ fn every_sync_command_is_declared_and_every_declaration_is_still_sync() {
 #[test]
 fn cheap_commands_carry_no_spawn_shell_out_or_filesystem_marker() {
     // INV-2, belt and braces on top of the review. It cannot see through a
-    // helper — `fm_open`'s one-line body hides a blocking ShellExecuteW, which
-    // is why that command is `debt` by argument rather than by detection — but
-    // it does refuse the cheapest way to get this wrong: writing `cheap` on a
-    // row whose body visibly shells out or touches the filesystem.
+    // helper — until #746 converted it, `fm_open`'s one-line body hid a
+    // blocking ShellExecuteW, which is why that command was `debt` by argument
+    // rather than by detection — but it does refuse the cheapest way to get
+    // this wrong: writing `cheap` on a row whose body visibly shells out or
+    // touches the filesystem.
     let sites = commands();
     let mut problems: Vec<String> = Vec::new();
     for row in SYNC_COMMANDS.iter().filter(|r| r.class == Class::Cheap) {

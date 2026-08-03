@@ -44,9 +44,10 @@
 /// Managed Tauri state. On Windows it holds the two live phases of a capture —
 /// the mic recording, and the running whisper subprocess (as a kill-on-close
 /// Job Object handle so cancel / pane-close / app-exit can terminate it, never
-/// orphan it — issue #78). Both are `Arc`s so the async `voice_stop` command can
-/// clone them out and move the blocking work onto `spawn_blocking` without
-/// holding the webview thread. Off Windows it's an empty marker.
+/// orphan it — issue #78). Both are `Arc`s so an async command can clone them
+/// out and move the blocking work onto the pool without holding the webview
+/// thread — `voice_stop` since #58, and `voice_start`/`voice_cancel` since
+/// #746, so all three commands now do. Off Windows it's an empty marker.
 #[cfg(windows)]
 #[derive(Default)]
 pub struct VoiceState {
@@ -65,10 +66,28 @@ const VOICE_UNAVAILABLE: &str = "voice capture is only available on Windows in t
 // ---------- commands ----------
 
 /// Begin capturing from the default input device.
+///
+/// Off-thread (#746 — `crate::blocking::run_blocking`, P1 of
+/// `doc/design/performance.md`), and this one was the worst shape in the family:
+/// `win::start` waits on `ready_rx.recv()` for the WASAPI device to open WHILE
+/// HOLDING the recording mutex. That is an indeterminate wait, not a bounded
+/// one — a slow, contended or absent audio device froze the GUI for as long as
+/// it took. Only the `Arc` clone stays on the webview thread, exactly as
+/// `voice_stop` beside it has done since #58.
+///
+/// **Reentrancy.** The recording mutex was always the guard and is now the only
+/// one: `win::start` takes it, refuses with "already recording" if the slot is
+/// full, and holds it across the device open, so two starts resolve to one
+/// recording and one error however they interleave. A `voice_cancel` racing a
+/// start blocks on that same mutex and therefore cancels the recording the
+/// start installed, never a half-installed one — and it can now be DISPATCHED
+/// during a slow device open at all, which is new: before, the start was
+/// occupying the very thread the cancel needed.
 #[cfg(windows)]
 #[tauri::command]
-pub fn voice_start(state: tauri::State<'_, VoiceState>) -> Result<(), String> {
-    win::start(&state.recording)
+pub async fn voice_start(state: tauri::State<'_, VoiceState>) -> Result<(), String> {
+    let recording = state.recording.clone();
+    crate::blocking::run_blocking(move || win::start(&recording)).await
 }
 
 /// Stop the active recording, transcribe it locally, and return the text.
@@ -95,16 +114,29 @@ pub async fn voice_stop(
 /// Cancel any active capture: stop an in-flight recording and/or kill the
 /// running whisper subprocess (dropping the Job Object handle terminates it).
 /// Idempotent — used by Esc, pane close, and app teardown.
+///
+/// Off-thread (#746): `win::cancel` JOINS the capture thread, a blocking wait
+/// Tauri ran on the webview thread — and it is reached from Esc, pane close and
+/// teardown, so the stall landed exactly when the user was trying to get out.
+///
+/// **Reentrancy.** Idempotent by construction, which is what makes this safe
+/// without a new guard: both halves are `Option::take` under their own mutex,
+/// so a second cancel (or two concurrent ones) finds `None` and does nothing.
+/// Against a concurrent `voice_start` the recording mutex orders them — see
+/// that command's note; against a `voice_stop` the same `take` decides which
+/// one owns the recording, and the loser reports "not recording", which is the
+/// pre-existing contract for cancelling a capture that already stopped.
 #[cfg(windows)]
 #[tauri::command]
-pub fn voice_cancel(state: tauri::State<'_, VoiceState>) -> Result<(), String> {
-    win::cancel(&state.recording, &state.transcribing);
+pub async fn voice_cancel(state: tauri::State<'_, VoiceState>) -> Result<(), String> {
+    let (recording, transcribing) = (state.recording.clone(), state.transcribing.clone());
+    crate::blocking::run_blocking(move || win::cancel(&recording, &transcribing)).await;
     Ok(())
 }
 
 #[cfg(not(windows))]
 #[tauri::command]
-pub fn voice_start(_state: tauri::State<'_, VoiceState>) -> Result<(), String> {
+pub async fn voice_start(_state: tauri::State<'_, VoiceState>) -> Result<(), String> {
     Err(VOICE_UNAVAILABLE.into())
 }
 
@@ -121,7 +153,7 @@ pub async fn voice_stop(
 /// frontend calls this on pane dispose, so it must succeed quietly.
 #[cfg(not(windows))]
 #[tauri::command]
-pub fn voice_cancel(_state: tauri::State<'_, VoiceState>) -> Result<(), String> {
+pub async fn voice_cancel(_state: tauri::State<'_, VoiceState>) -> Result<(), String> {
     Ok(())
 }
 

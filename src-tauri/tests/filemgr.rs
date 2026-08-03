@@ -736,3 +736,133 @@ fn the_event_carries_the_path_so_a_pane_that_navigated_away_can_still_place_it()
     assert_eq!(json["rel"], "deep/nested/tree", "the full rel, not a basename");
     assert_eq!(json["recycled"], true);
 }
+
+// ---------- concurrency: the exclusion sync dispatch used to provide (#746) ----------
+
+/// The mechanism pin, deterministic on every platform.
+///
+/// The race test below pins the real consequence — a file must not vanish —
+/// but it can only fail where the check-then-act window is wide enough to hit.
+/// With `MUTATION_GATE` removed it reddened on windows-latest (7 of 8 renames
+/// accepted) while ubuntu-22.04 and macos-latest passed 39/39, because the
+/// window on a tmpfs tempdir is narrower than thread wake-up skew. So the race
+/// test alone would leave `rename`'s guard unpinned on two of three platforms.
+///
+/// This one has no window to hit: hold the gate, then require that a `rename`
+/// on another thread has NOT completed. A held mutex genuinely blocks (so the
+/// guarded case cannot flake) and an ungated `rename` returns in microseconds
+/// (so the unguarded case cannot pass). The failure direction is one-way by
+/// construction.
+#[test]
+fn rename_parks_on_the_mutation_gate_rather_than_racing_it() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Barrier};
+    use std::time::Duration;
+
+    let root = tempfile::tempdir().unwrap();
+    let rp = root.path().to_str().unwrap().to_string();
+    new_file(&rp, "", "only.txt").unwrap();
+
+    let held = loomux_lib::filemgr::hold_mutation_gate_for_test();
+    let done = Arc::new(AtomicBool::new(false));
+    // Wait for the worker to be RUNNING before timing anything, so a slow
+    // thread spawn can never be mistaken for a blocked rename.
+    let running = Arc::new(Barrier::new(2));
+    let worker = {
+        let (rp, done, running) = (rp.clone(), done.clone(), running.clone());
+        std::thread::spawn(move || {
+            running.wait();
+            let _ = rename(&rp, "only.txt", "renamed.txt");
+            done.store(true, Ordering::SeqCst);
+        })
+    };
+    running.wait();
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        !done.load(Ordering::SeqCst),
+        "rename ran to completion while MUTATION_GATE was held — it is not taking the gate, so          its `to.exists()` check and its `fs::rename` are not one unit, on ANY platform"
+    );
+
+    drop(held);
+    worker.join().unwrap();
+    assert!(done.load(Ordering::SeqCst), "releasing the gate must let the rename through");
+    assert!(root.path().join("renamed.txt").exists(), "and it must actually have renamed");
+}
+
+#[test]
+fn concurrent_renames_onto_one_target_leave_exactly_one_winner_and_lose_no_file() {
+    // #746's reentrancy pin for `fm_rename`, and the one command in this module
+    // whose refuse-if-present guard is NOT atomic in the filesystem.
+    // `new_file`'s `create_new(true)` and `new_folder`'s `create_dir` refuse an
+    // existing target in one syscall; `rename` checks `to.exists()` and THEN
+    // calls `fs::rename`, which overwrites without a word (`MoveFileExW` with
+    // MOVEFILE_REPLACE_EXISTING on Windows, silently on Unix). Nothing closed
+    // that gap but Tauri running the sync command alone on the webview thread.
+    //
+    // The property, as an equality so it bites both ways: N sources racing to
+    // rename themselves onto ONE target name must produce exactly ONE Ok and
+    // N-1 `exists` — and, the half that is really about data loss, the total
+    // number of files must not drop. Without the gate several threads pass the
+    // exists() check and each `fs::rename` clobbers the last winner's file.
+    let root = tempfile::tempdir().unwrap();
+    let rp = root.path().to_str().unwrap().to_string();
+
+    const RACERS: usize = 8;
+    for i in 0..RACERS {
+        new_file(&rp, "", &format!("src{i}.txt")).unwrap();
+        fs::write(root.path().join(format!("src{i}.txt")), format!("body-{i}")).unwrap();
+    }
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(RACERS));
+    let winners = std::sync::Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
+    let refusals = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let mut handles = Vec::new();
+    for i in 0..RACERS {
+        let (rp, barrier) = (rp.clone(), barrier.clone());
+        let (winners, refusals) = (winners.clone(), refusals.clone());
+        handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            match rename(&rp, &format!("src{i}.txt"), "TARGET.txt") {
+                Ok(_) => winners.lock().unwrap().push(i),
+                Err(e) => refusals.lock().unwrap().push(e),
+            }
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    let winners = winners.lock().unwrap();
+    assert_eq!(
+        winners.len(),
+        1,
+        "{} of {RACERS} racing renames onto one target were accepted — `to.exists()` can only \
+         refuse a file it is able to see, and it only sees one if the check and the rename are \
+         one unit (filemgr::MUTATION_GATE)",
+        winners.len()
+    );
+    for e in refusals.lock().unwrap().iter() {
+        assert_eq!(err_code(e), "exists", "the losers must be refused, not fail some other way: {e}");
+    }
+
+    // The data-loss half. Every source that was refused must still be on disk
+    // under its ORIGINAL name, and the target must hold the winner's bytes —
+    // so the file count is unchanged and nothing was silently overwritten.
+    let winner = winners[0];
+    assert_eq!(
+        fs::read_to_string(root.path().join("TARGET.txt")).unwrap(),
+        format!("body-{winner}"),
+    );
+    for i in 0..RACERS {
+        if i == winner {
+            continue;
+        }
+        assert!(
+            root.path().join(format!("src{i}.txt")).exists(),
+            "src{i}.txt was consumed by a rename that reported failure — a file lost to a \
+             clobber the exists() check was supposed to prevent"
+        );
+    }
+    let count = fs::read_dir(root.path()).unwrap().filter_map(|e| e.ok()).count();
+    assert_eq!(count, RACERS, "one entry per original file: {RACERS} in, {count} out");
+}

@@ -39,6 +39,77 @@ static ATOMIC_WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
 /// (mirrors `obs::LOG_DIR_OVERRIDE`). `None` in production.
 static STATE_DIR_OVERRIDE: Mutex<Option<PathBuf>> = Mutex::new(None);
 
+/// Hands out the dispatch tickets [`write_atomic_seq`] orders writes by. See
+/// [`next_write_ticket`].
+static WRITE_TICKET: AtomicU64 = AtomicU64::new(0);
+
+/// The newest ticket already durably written, per path — the high-water mark
+/// [`write_atomic_seq`] compares against. Keyed by path because `tabs.json` and
+/// `settings.json` are independent files with independent save gestures; a slow
+/// settings write must not make a tab save look stale. A `Vec` and not a
+/// `HashMap`: it holds two entries in production and three in a test, and a
+/// linear scan of two is not worth a hasher.
+static WRITE_HIGH_WATER: Mutex<Vec<(PathBuf, u64)>> = Mutex::new(Vec::new());
+
+/// Take the next dispatch ticket. Called by a save command **before** its first
+/// `.await` — that is the whole point (#746).
+///
+/// Tauri dispatches a command's future on the webview thread up to its first
+/// await, so a ticket taken there is stamped in ARRIVAL order, the same order
+/// synchronous dispatch used to impose on the writes themselves. One relaxed
+/// `fetch_add` is in-memory work of the same class as the `cheap` commands that
+/// run entirely on that thread, and is what lets everything after it move off.
+fn next_write_ticket() -> u64 {
+    WRITE_TICKET.fetch_add(1, Ordering::Relaxed)
+}
+
+/// [`write_atomic`], plus the ordering the conversion took away (#746).
+///
+/// **What broke.** `save_ui_tabs`/`save_settings` were synchronous, so Tauri ran
+/// them one at a time on the webview thread and the LAST gesture's bytes were
+/// necessarily the last on disk. Off-thread, two saves are two pool tasks and
+/// the rename order is whatever the scheduler picks: an older layout can land
+/// after a newer one. That is not a transient wobble — `main.ts`'s `persistTabs`
+/// suppresses a save whose bytes match the last one it ISSUED, so once a stale
+/// write wins, the correct bytes are never re-offered and the user's tab layout
+/// stays one gesture behind until something else changes it.
+///
+/// **What replaces it.** A ticket per save, taken in arrival order on the
+/// webview thread, and a per-path high-water mark. A write whose ticket is older
+/// than what is already on disk is DROPPED, not queued — the newer content is
+/// already durable, so writing the older bytes could only undo it. The lock is
+/// held across the write itself as well, so two accepted writes cannot interleave
+/// inside `write_atomic` and land their renames out of order either.
+///
+/// Dropping reports `Ok`: the caller asked for its content to be durable, and
+/// content at least as new as it is. `flushTabs` (the quit path, #219) awaits
+/// this and must not be told the last save of the session failed when it did
+/// not.
+///
+/// The mark advances only on a write that actually LANDED. A failed newer write
+/// must not veto an older one — the older bytes are then the freshest thing
+/// anybody managed to persist, and the frontend's retry (`persistTabs` clears
+/// `lastPersisted` on error) is what eventually supersedes them.
+///
+/// Public so the unit tests below can drive the ordering directly; there is no
+/// production caller outside this file.
+pub fn write_atomic_seq(path: &Path, contents: &str, ticket: u64) -> Result<(), String> {
+    let mut marks = crate::obs::LockExt::lock_safe(&WRITE_HIGH_WATER);
+    // `>` and not `>=`: tickets are unique (`fetch_add`), so the two differ only
+    // for a ticket compared against itself, which cannot happen.
+    if marks.iter().any(|(p, seen)| p == path && *seen > ticket) {
+        return Ok(());
+    }
+    let wrote = write_atomic(path, contents);
+    if wrote.is_ok() {
+        match marks.iter_mut().find(|(p, _)| p == path) {
+            Some((_, seen)) => *seen = ticket,
+            None => marks.push((path.to_path_buf(), ticket)),
+        }
+    }
+    wrote
+}
+
 /// The app-global state root (see `obs::data_root`), or the test override
 /// when one is set.
 fn state_dir() -> PathBuf {
@@ -108,35 +179,68 @@ pub fn load_or_quarantine(path: &Path) -> Option<String> {
     Some(raw)
 }
 
+// ---------- tauri commands ----------
+//
+// #746: all four are thin async fns over the blocking pool (P1 of
+// `doc/design/performance.md`). The loads read and parse a file — and, when it
+// will not parse, RENAME it aside — at launch, which the user feels as a slow
+// start. The saves serialize, fsync and rename, which is deliberate durability
+// work fired on layout gestures and settings changes, i.e. landing in the
+// middle of an interaction. None of it belongs on the thread that paints.
+
 /// Read the persisted tab set as an opaque JSON string, or `null` if there's
 /// nothing durable yet (first run) or the stored file was corrupt (quarantined).
+///
+/// **Reentrancy.** Called once per launch. A load racing a save resolves to
+/// whichever the filesystem orders first and reads a *whole* file either way —
+/// saves are rename-atomic, which is what `write_atomic` is for. The quarantine
+/// rename it can perform is idempotent: a second quarantine of the same corrupt
+/// file renames over the same target, which is the behaviour
+/// `load_or_quarantine` already documents ("the newest corruption is the most
+/// useful to inspect").
 #[tauri::command]
-pub fn load_ui_tabs() -> Option<String> {
-    load_or_quarantine(&tabs_path())
+pub async fn load_ui_tabs() -> Option<String> {
+    crate::blocking::run_blocking(|| load_or_quarantine(&tabs_path())).await
 }
 
 /// Persist the tab set (an opaque JSON string produced by `tabstore.ts`),
 /// atomically. Errors surface to the caller, which treats persistence as
 /// best-effort and never blocks the UI on it.
+///
+/// **Reentrancy.** The one command in this module that needed a guard BUILT
+/// rather than named: sync dispatch was what made the last gesture's bytes the
+/// last on disk, and off-thread it is [`write_atomic_seq`]'s ticket that does.
+/// See its doc for why a plain mutex is not enough (mutual exclusion without
+/// ordering still lets an older save win) and why `persistTabs`'s
+/// identical-bytes dedup is what turns "one gesture stale" into "stale until
+/// something else changes".
 #[tauri::command]
-pub fn save_ui_tabs(contents: String) -> Result<(), String> {
-    write_atomic(&tabs_path(), &contents)
+pub async fn save_ui_tabs(contents: String) -> Result<(), String> {
+    let ticket = next_write_ticket();
+    crate::blocking::run_blocking(move || write_atomic_seq(&tabs_path(), &contents, ticket)).await
 }
 
 /// Read the persisted app settings (#370: `terminal.pasteOnPlainCtrlV` and
 /// whatever else lands here later) as an opaque JSON string, or `null` on
 /// first run / a quarantined corrupt file — `src/settings.ts` degrades that
 /// to its defaults, exactly like `load_ui_tabs`/`tabstore.ts`.
+///
+/// **Reentrancy.** Identical to [`load_ui_tabs`], on the sibling file.
 #[tauri::command]
-pub fn load_settings() -> Option<String> {
-    load_or_quarantine(&settings_path())
+pub async fn load_settings() -> Option<String> {
+    crate::blocking::run_blocking(|| load_or_quarantine(&settings_path())).await
 }
 
 /// Persist app settings (an opaque JSON string produced by `settings.ts`),
 /// atomically. Same best-effort contract as `save_ui_tabs`.
+///
+/// **Reentrancy.** Same ticket as [`save_ui_tabs`], against its own path's
+/// high-water mark — the two files never gate each other.
 #[tauri::command]
-pub fn save_settings(contents: String) -> Result<(), String> {
-    write_atomic(&settings_path(), &contents)
+pub async fn save_settings(contents: String) -> Result<(), String> {
+    let ticket = next_write_ticket();
+    crate::blocking::run_blocking(move || write_atomic_seq(&settings_path(), &contents, ticket))
+        .await
 }
 
 #[cfg(test)]
@@ -202,6 +306,76 @@ mod tests {
             fs::read_to_string(&quarantined).unwrap(),
             "{ \"tabs\": [ trunc",
             "the bad file is preserved verbatim for inspection"
+        );
+    }
+
+    #[test]
+    fn a_stale_write_never_overwrites_a_newer_one_that_already_landed() {
+        // #746's ordering pin. Synchronous dispatch made the LAST save gesture
+        // the last bytes on disk; off-thread, two saves are two pool tasks and
+        // the older one can land second. Here the older ticket is applied
+        // second on purpose — the scheduling this test cannot control, made
+        // deterministic — and must be dropped rather than written.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("tabs.json");
+        let (older, newer) = (next_write_ticket(), next_write_ticket());
+        write_atomic_seq(&path, "NEW-LAYOUT", newer).unwrap();
+        write_atomic_seq(&path, "old-layout", older).unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "NEW-LAYOUT",
+            "an older save landing after a newer one overwrote it — and persistTabs's \
+             identical-bytes dedup means the correct layout is never re-offered, so this is \
+             stale until some unrelated change happens to fire another save"
+        );
+    }
+
+    #[test]
+    fn the_ordering_guard_is_per_path_and_lets_ordered_writes_through() {
+        // The other direction, so the guard cannot pass by refusing everything.
+        // (1) a newer ticket on the same path still writes, and (2) a sibling
+        // file's older ticket is NOT gated by it — `tabs.json` and
+        // `settings.json` have independent save gestures, and a slow settings
+        // write must not make a tab save look stale.
+        let tmp = tempfile::tempdir().unwrap();
+        let tabs = tmp.path().join("tabs.json");
+        let settings = tmp.path().join("settings.json");
+        let (t1, t2, t3) = (next_write_ticket(), next_write_ticket(), next_write_ticket());
+        write_atomic_seq(&settings, "settings-first", t1).unwrap();
+        write_atomic_seq(&tabs, "tabs-v1", t2).unwrap();
+        write_atomic_seq(&tabs, "tabs-v2", t3).unwrap();
+        assert_eq!(fs::read_to_string(&tabs).unwrap(), "tabs-v2", "in-order writes must apply");
+        // t1 < t3, but it is a different file: it must not be dropped.
+        let t4 = next_write_ticket();
+        write_atomic_seq(&settings, "settings-second", t4).unwrap();
+        assert_eq!(fs::read_to_string(&settings).unwrap(), "settings-second");
+    }
+
+    #[test]
+    fn a_failed_write_does_not_veto_a_later_older_one() {
+        // The mark advances only on a write that landed. Otherwise a newer save
+        // that failed (disk full, a locked destination) would silently gate the
+        // older bytes that are then the freshest anybody can persist.
+        let tmp = tempfile::tempdir().unwrap();
+        // `write_atomic` creates the target's parent, so a missing parent is not
+        // a failure. Make the parent a FILE instead: `create_dir_all` then
+        // cannot succeed and the write fails for real, on the same path the
+        // later write uses.
+        let blocker = tmp.path().join("blocked");
+        fs::write(&blocker, "not a directory").unwrap();
+        let path = blocker.join("tabs.json");
+        let (older, newer) = (next_write_ticket(), next_write_ticket());
+        assert!(
+            write_atomic_seq(&path, "never-lands", newer).is_err(),
+            "the fixture must actually fail, or this test proves nothing"
+        );
+        fs::remove_file(&blocker).unwrap(); // the transient condition clears
+        write_atomic_seq(&path, "older-but-real", older).unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "older-but-real",
+            "a newer write that never landed gated an older one that could — leaving the file \
+             with neither"
         );
     }
 

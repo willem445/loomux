@@ -281,6 +281,66 @@ fn write_with_stale_hash_is_conflict_and_leaves_file_untouched() {
     );
 }
 
+#[test]
+fn concurrent_saves_with_the_same_expected_hash_leave_exactly_one_winner() {
+    // #746's reentrancy pin for `ft_write_file`. `expected_hash` is documented
+    // as "the write is refused and the file is left byte-for-byte untouched"
+    // when the file changed since it was read — an optimistic-concurrency
+    // promise that is check-then-act, and was kept only by Tauri running the
+    // synchronous command alone on the webview thread. Off-thread (#746) that
+    // exclusion is gone, so `WRITE_GATE` has to be it.
+    //
+    // The property, stated as an equality so it bites both ways: N racing saves
+    // that all quote the SAME starting hash must produce exactly ONE `Ok` and
+    // N-1 `conflict`s — and the file's final content must be that one winner's,
+    // whole. Without the gate every thread reads the pre-write hash, every
+    // check passes, and the successes climb well above one.
+    let root = tempfile::tempdir().unwrap();
+    let rp = root.path().to_str().unwrap().to_string();
+    let start = write_file(&rp, "race.txt", "original", None).unwrap().hash;
+
+    const RACERS: usize = 8;
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(RACERS));
+    let winners = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let conflicts = std::sync::Arc::new(AtomicUsize::new(0));
+    let mut handles = Vec::new();
+    for i in 0..RACERS {
+        let (rp, start) = (rp.clone(), start.clone());
+        let (barrier, winners, conflicts) =
+            (barrier.clone(), winners.clone(), conflicts.clone());
+        handles.push(std::thread::spawn(move || {
+            let body = format!("saved-by-{i}");
+            barrier.wait(); // fire them as close to simultaneously as we can
+            match write_file(&rp, "race.txt", &body, Some(start)) {
+                Ok(_) => winners.lock().unwrap().push(body),
+                Err(e) => {
+                    assert_eq!(err_code(&e), "conflict", "got: {e}");
+                    conflicts.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    let winners = winners.lock().unwrap();
+    assert_eq!(
+        winners.len(),
+        1,
+        "{} of {RACERS} racing saves quoting one hash were accepted — the \
+         optimistic-concurrency guard only refuses a write it can see, and it can only see \
+         one if the check and the write are one unit (fileedit::WRITE_GATE)",
+        winners.len()
+    );
+    assert_eq!(conflicts.load(Ordering::SeqCst), RACERS - 1);
+    assert_eq!(
+        fs::read_to_string(root.path().join("race.txt")).unwrap(),
+        winners[0],
+        "the file must hold the accepted write in full, not a later loser's bytes"
+    );
+}
+
 // ---------- search ----------
 
 #[test]

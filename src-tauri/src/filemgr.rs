@@ -52,6 +52,61 @@ use std::path::{Path, PathBuf};
 use crate::fileedit::{err, safe_resolve};
 use tauri::{AppHandle, Emitter};
 
+/// Serializes the three MUTATING gestures this module moved off the webview
+/// thread (#746): `new_folder`, `new_file`, `rename`.
+///
+/// **Why one of them needed it and the other two came along.** Two of the three
+/// refuse-if-present checks are atomic in the filesystem itself and say so in
+/// their own docs: `new_file`'s `create_new(true)` is called out as "the
+/// load-bearing flag", with its `exists()` check explicitly demoted to "only
+/// there for the nicer message", and `new_folder`'s `create_dir` is the same
+/// refuse-if-present shape. `rename` is NOT: its clobber guard is a plain
+/// `to.exists()` followed by `fs::rename`, and that gap was closed only by
+/// Tauri running the sync command alone on the webview thread. Off-thread, two
+/// renames racing for one target name — or a rename racing a create of it —
+/// can both find the target absent, and `fs::rename` then overwrites without a
+/// word (on Windows too: `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`). The
+/// file that vanishes is the one the doc says a file manager must never lose to
+/// a rename typo.
+///
+/// So the gate covers the *set*, not just `rename`: making one operation
+/// exclusive against itself would still leave a `new_file` free to land inside
+/// its check-then-rename window. Three single syscalls under one mutex costs
+/// nothing anybody waits on, and it is exactly the exclusion dispatch used to
+/// give for free.
+///
+/// **`fm_delete_start` is deliberately NOT here**, and that is not an
+/// oversight: it has run on its own thread since #216, so a delete racing a
+/// rename is a window this conversion did not open and this gate would not
+/// close. Holding a shared mutex across `SHFileOperationW` over a
+/// `node_modules`-sized tree would also block every create and rename for
+/// minutes — trading a rare, pre-existing race for a routine freeze.
+static MUTATION_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Test-only seam: hold [`MUTATION_GATE`] so a test can ask whether a gated
+/// call actually parks on it.
+///
+/// **Why a seam rather than only the threaded race test.** The end-to-end race
+/// test (`concurrent_renames_onto_one_target_leave_exactly_one_winner_and_lose_no_file`)
+/// pins the real property — a file must not vanish — but its sensitivity is
+/// platform-dependent, and measurably so: with the gate removed it reddened on
+/// windows-latest (7 of 8 renames accepted) while ubuntu and macOS passed
+/// 39/39, because the `to.exists()`-to-`fs::rename` window on a tmpfs tempdir
+/// is narrower than thread wake-up skew. A pin that can only fail on one of
+/// three platforms is not a pin on the other two.
+///
+/// So this seam backs it with a check that is deterministic everywhere: hold
+/// the gate, call a gated function on another thread, and require that it has
+/// NOT completed. A held mutex genuinely blocks, so the guarded case cannot
+/// flake; an ungated call returns immediately, so the unguarded case cannot
+/// pass. This is `performance.md` P3's own stated technique for a new lock that
+/// matters — the one `tests/perf_leaflocks.rs` uses to park a read inside a
+/// held mutex — applied to a write gate instead of a read path.
+#[doc(hidden)] // pub for integration tests
+pub fn hold_mutation_gate_for_test() -> std::sync::MutexGuard<'static, ()> {
+    crate::obs::LockExt::lock_safe(&MUTATION_GATE)
+}
+
 /// Does any component of `rel` name something Windows would silently MANGLE?
 ///
 /// The Win32 path layer strips trailing spaces and dots from each component before
@@ -288,6 +343,7 @@ pub fn new_folder(root: &str, rel: &str, name: &str) -> Result<String, String> {
     let name = validate_name(name)?;
     let child = join_rel(rel, &name);
     let path = resolve(root, &child)?;
+    let _gate = crate::obs::LockExt::lock_safe(&MUTATION_GATE);
     if path.exists() {
         return Err(err("exists", format!("'{name}' already exists")));
     }
@@ -314,6 +370,7 @@ pub fn new_file(root: &str, rel: &str, name: &str) -> Result<String, String> {
     let name = validate_name(name)?;
     let child = join_rel(rel, &name);
     let path = resolve(root, &child)?;
+    let _gate = crate::obs::LockExt::lock_safe(&MUTATION_GATE);
     if path.exists() {
         return Err(err("exists", format!("'{name}' already exists")));
     }
@@ -340,6 +397,8 @@ pub fn rename(root: &str, rel: &str, name: &str) -> Result<String, String> {
     let name = validate_name(name)?;
     // Same guard as delete: renaming the pane's own root is not a thing.
     let from = resolve_child(root, rel)?;
+    let _gate = crate::obs::LockExt::lock_safe(&MUTATION_GATE);
+    // The check-then-act below is the reason [`MUTATION_GATE`] exists.
     if !from.exists() {
         return Err(err("not-found", format!("'{rel}' no longer exists")));
     }
@@ -382,6 +441,11 @@ pub fn delete(root: &str, rel: &str) -> Result<bool, String> {
 /// worker inherits nothing. So the worker must enter its **own** apartment, and leave it
 /// again, exactly once. That is what this guard is.
 ///
+/// #746 generalized it: `open_os` and `open_with_os` call `ShellExecuteW`, whose own
+/// documented remarks make the same request for the same reason, and they left the main
+/// thread in the same conversion. Three callers, one guard — the argument is about the
+/// Shell, not about `SHFileOperationW`.
+///
 /// The three return values all mean different things and all matter:
 ///
 ///   * `S_OK`     — we initialized the apartment. We must uninitialize it.
@@ -392,13 +456,17 @@ pub fn delete(root: &str, rel: &str) -> Result<bool, String> {
 ///                  is exactly why the two are handled together below rather than by
 ///                  matching `S_OK` alone.
 ///   * `RPC_E_CHANGED_MODE` — the thread is already an MTA and refuses to become an STA.
-///                  Our call took **no** reference, so we must **not** release one. (We
-///                  always spawn a fresh thread, so this cannot happen in practice; it is
-///                  handled because getting it wrong would unbalance somebody else's COM.)
+///                  Our call took **no** reference, so we must **not** release one. This
+///                  stopped being hypothetical with #746: `open_os`/`open_with_os` now
+///                  enter here from the blocking pool, whose threads are REUSED across
+///                  tasks, so "a fresh thread with no apartment" is no longer something
+///                  this type may assume. It never assumed it — the arm was written
+///                  because getting it wrong would unbalance somebody else's COM — and
+///                  that is precisely why the conversion could reuse it unchanged.
 ///
-/// RAII rather than a call pair: `delete_path` has several early returns, and an early
-/// return that skips `CoUninitialize` leaks an apartment reference for the life of the
-/// thread. `Drop` cannot be skipped.
+/// RAII rather than a call pair: every caller has early returns, and one that skips
+/// `CoUninitialize` leaks an apartment reference for the life of the thread — which on a
+/// POOL thread outlives the task that leaked it. `Drop` cannot be skipped.
 #[cfg(windows)]
 struct ComApartment {
     /// Did our `CoInitializeEx` take a reference that we owe back?
@@ -552,12 +620,28 @@ pub fn open_default(root: &str, rel: &str) -> Result<(), String> {
     open_os(&path)
 }
 
+/// **The apartment (#746).** `ShellExecuteW` can delegate to COM-activated Shell
+/// extensions — verb implementations, context-menu handlers, data sources — and
+/// Microsoft's own guidance is that COM be initialized before the call, some of
+/// those extensions requiring the single-threaded apartment
+/// (learn.microsoft.com/en-us/windows/win32/api/shellapi/nf-shellapi-shellexecuteexw,
+/// "Remarks"). Until #746 that requirement was satisfied *implicitly*: this ran
+/// on the main thread, which wry `OleInitialize`s. Off it, the blocking pool's
+/// apartment state is nobody's business, so [`ComApartment`] enters an STA for
+/// the duration exactly as `delete_path` does (performance.md §4 X2's argument,
+/// applied to the sibling API rather than cited at it). RAII, so the early
+/// returns below cannot leak the reference; `RPC_E_CHANGED_MODE` (a pool thread
+/// somebody else already made an MTA) degrades to "do not uninitialize what we
+/// did not initialize" rather than failing the open — which is the pre-#746
+/// behaviour for any extension that does not insist on an STA.
 #[cfg(windows)]
 fn open_os(path: &Path) -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt;
     use windows::core::PCWSTR;
     use windows::Win32::UI::Shell::ShellExecuteW;
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    let _com = ComApartment::enter();
 
     let wide: Vec<u16> = path
         .as_os_str()
@@ -705,12 +789,31 @@ pub fn open_with(root: &str, rel: &str) -> Result<(), String> {
     open_with_os(&path)
 }
 
+/// Same apartment argument as [`open_os`], and it binds harder here: the
+/// `openas` verb IS a modal Shell dialog, so this is the call in the module
+/// most likely to reach a COM-activated handler. The dialog runs its own modal
+/// message loop on whichever thread calls — which used to be the webview
+/// thread, i.e. loomux's entire UI froze behind a chooser the user had to
+/// dismiss. It now runs on a pool thread inside its own STA.
+///
+/// **ASSUMED, and it cannot be tested headlessly: that the chooser still
+/// renders and behaves from a non-GUI STA thread.** The evidence for it is that
+/// the dialog runs its OWN modal message loop and is not owned by any of
+/// loomux's windows — `hwndOwner` was already `None` here before the move, so
+/// it was never parented to the webview and never inherited its message queue.
+/// What a pool thread adds is an apartment (above) and nothing else it needs.
+/// The falsifier is specific: if "Open with…" ever stops showing a dialog, or
+/// shows one that will not take input, THIS is the assumption to break first —
+/// and the fix then is a dedicated OS thread as `fm_delete_start` uses (§4 X2),
+/// not a return to the webview thread.
 #[cfg(windows)]
 fn open_with_os(path: &Path) -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt;
     use windows::core::PCWSTR;
     use windows::Win32::UI::Shell::ShellExecuteW;
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    let _com = ComApartment::enter();
 
     let wide: Vec<u16> = path
         .as_os_str()
@@ -782,25 +885,58 @@ pub fn capabilities() -> Caps {
 }
 
 // ---------- commands ----------
+//
+// #746: thin async wrappers over the blocking pool (P1 of
+// `doc/design/performance.md`). Every one of these was a synchronous
+// `#[tauri::command]`, which Tauri dispatches on the webview thread — so a
+// directory enumeration nothing bounds, a `CreateDirectory`, a rename across a
+// network share, an `explorer.exe` spawn and a BLOCKING `ShellExecuteW` all ran
+// on the thread that services paint. `fm_delete_start` (§4 X2) and
+// `fm_capabilities` (in-memory) are the two that stay sync, each for its own
+// argued reason.
+//
+// **Reentrancy — the family argument, for the four filesystem gestures below.**
+// Synchronous dispatch used to order them against each other, and the honest
+// answer is that it was doing real work for ONE of them.
+//
+// `fm_list` is a read: it sees the directory on one side of a concurrent change
+// or the other, which is all a listing has ever been — the agent in the pane can
+// `mkdir` between the frontend's request and this walk, and always could.
+//
+// `fm_new_folder` and `fm_new_file` refuse an existing target in a SINGLE
+// syscall, and each says so where it is implemented: `create_new(true)` is
+// called out in `new_file`'s own doc as the load-bearing flag with its
+// `exists()` check demoted to "only there for the nicer message", and
+// `create_dir` (not `_all`) is the same refuse-if-present shape. Their
+// atomicity was never this process's to provide, so the conversion does not
+// touch it.
+//
+// `fm_rename` is the one that is NOT in that class, and the family argument
+// would be wrong if it swept it in: its clobber guard is `to.exists()` followed
+// by `fs::rename`, a check-then-act whose window was closed by nothing but the
+// single dispatch thread. That is what [`MUTATION_GATE`] is for — see its doc
+// for why the gate covers all three mutations rather than `rename` alone, and
+// `concurrent_renames_onto_one_target_leave_exactly_one_winner_and_lose_no_file`
+// in `tests/filemgr.rs` for the file it stops disappearing.
 
 #[tauri::command]
-pub fn fm_list(root: String, rel: String) -> Result<Vec<FmEntry>, String> {
-    list(&root, &rel)
+pub async fn fm_list(root: String, rel: String) -> Result<Vec<FmEntry>, String> {
+    crate::blocking::run_blocking(move || list(&root, &rel)).await
 }
 
 #[tauri::command]
-pub fn fm_new_folder(root: String, rel: String, name: String) -> Result<String, String> {
-    new_folder(&root, &rel, &name)
+pub async fn fm_new_folder(root: String, rel: String, name: String) -> Result<String, String> {
+    crate::blocking::run_blocking(move || new_folder(&root, &rel, &name)).await
 }
 
 #[tauri::command]
-pub fn fm_new_file(root: String, rel: String, name: String) -> Result<String, String> {
-    new_file(&root, &rel, &name)
+pub async fn fm_new_file(root: String, rel: String, name: String) -> Result<String, String> {
+    crate::blocking::run_blocking(move || new_file(&root, &rel, &name)).await
 }
 
 #[tauri::command]
-pub fn fm_rename(root: String, rel: String, name: String) -> Result<String, String> {
-    rename(&root, &rel, &name)
+pub async fn fm_rename(root: String, rel: String, name: String) -> Result<String, String> {
+    crate::blocking::run_blocking(move || rename(&root, &rel, &name)).await
 }
 
 /// One completed delete, streamed back as an `fm-delete` event (#216).
@@ -901,17 +1037,28 @@ pub fn fm_capabilities() -> Caps {
     capabilities()
 }
 
+/// **Reentrancy.** Spawns `explorer.exe` (or `open`/`xdg-open`) and returns
+/// without waiting; it mutates nothing loomux owns and holds no lock, so two
+/// reveals are two independent child processes. The `exists` probe in front of
+/// the spawn can go stale between check and spawn — it already could, since the
+/// pane's own agent can delete the path — and the shell's own "item not found"
+/// is what the user sees then, exactly as before.
 #[tauri::command]
-pub fn fm_reveal(root: String, rel: String) -> Result<(), String> {
-    reveal(&root, &rel)
+pub async fn fm_reveal(root: String, rel: String) -> Result<(), String> {
+    crate::blocking::run_blocking(move || reveal(&root, &rel)).await
 }
 
+/// **Reentrancy.** No shared state at all: this resolves a path and hands it to
+/// the shell. The apartment question the move raises is answered in
+/// [`open_with_os`], not here — see its doc.
 #[tauri::command]
-pub fn fm_open_with(root: String, rel: String) -> Result<(), String> {
-    open_with(&root, &rel)
+pub async fn fm_open_with(root: String, rel: String) -> Result<(), String> {
+    crate::blocking::run_blocking(move || open_with(&root, &rel)).await
 }
 
+/// **Reentrancy.** Same as [`fm_open_with`]: a path resolve and a shell handoff,
+/// no lock and no mutation. See [`open_os`] for the apartment.
 #[tauri::command]
-pub fn fm_open(root: String, rel: String) -> Result<(), String> {
-    open_default(&root, &rel)
+pub async fn fm_open(root: String, rel: String) -> Result<(), String> {
+    crate::blocking::run_blocking(move || open_default(&root, &rel)).await
 }

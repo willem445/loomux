@@ -40,9 +40,26 @@ fn editor_args(dir: &str) -> Vec<String> {
 /// Open `dir` in the configured `editor`, spawned detached. Returns a
 /// user-facing error string on any failure (unconfigured, missing folder,
 /// editor not found, or spawn failure) so the frontend can toast it.
+///
+/// Off-thread (#746 — `crate::blocking::run_blocking`, P1 of
+/// `doc/design/performance.md`). The spawn is detached, so the wait is short —
+/// but the PATH/PATHEXT probing in front of it is a sequence of stats over a
+/// list nothing in the app bounds, and the spawn is still a process spawn,
+/// which INV-2 refuses on the webview thread outright.
+///
+/// **Reentrancy.** Nothing to guard: it validates two strings, resolves a
+/// program against a PATH snapshot it takes itself, and spawns a detached
+/// child. No lock, no shared state, nothing written. Two clicks launch two
+/// editors, which is what two clicks meant before.
 #[tauri::command]
-pub fn open_in_editor(editor: String, dir: String) -> Result<(), String> {
-    let (editor, dir) = validate(&editor, &dir)?;
+pub async fn open_in_editor(editor: String, dir: String) -> Result<(), String> {
+    crate::blocking::run_blocking(move || open_in_editor_sync(&editor, &dir)).await
+}
+
+/// The body of [`open_in_editor`], as a plain function — kept separate so the
+/// command stays a one-line delegate with nothing before its first await.
+fn open_in_editor_sync(editor: &str, dir: &str) -> Result<(), String> {
+    let (editor, dir) = validate(editor, dir)?;
     let path_env = crate::winpath::launch_path();
     let program = crate::winpath::resolve_program(editor, &path_env, &crate::winpath::launch_pathext())
         .ok_or_else(|| format!("Editor not found on PATH: {editor}"))?;
