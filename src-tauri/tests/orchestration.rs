@@ -20125,14 +20125,20 @@ fn the_orchestrator_contract_quotes_the_full_autonomy_notice_it_will_receive() {
 #[test]
 fn the_orchestrator_contract_names_the_eligible_signal_and_its_partial_caveat() {
     let sig = intake::EligibleSignal { number: 42, title: "Do the thing".into() };
-    let summary = intake::intake_wake_summary(&[], &[], std::slice::from_ref(&sig), false);
+    let summary =
+        intake::intake_wake_summary(&[], &[], std::slice::from_ref(&sig), intake::IntakeTruncation::default());
     assert!(summary.contains("eligible under full-autonomy"), "the signal's wording moved: {summary}");
     assert!(
         ORCHESTRATOR_TPL.contains("eligible under full-autonomy"),
         "orchestrator.md must name the wake line the poller actually sends, so the orchestrator \
          acts on it instead of re-polling what loomux already told it (#778)"
     );
-    let partial = intake::intake_wake_summary(&[], &[], std::slice::from_ref(&sig), true);
+    let partial = intake::intake_wake_summary(
+        &[],
+        &[],
+        std::slice::from_ref(&sig),
+        intake::IntakeTruncation { issues: true, prs: false },
+    );
     assert!(partial.contains("PARTIAL:"), "the truncation caveat's wording moved: {partial}");
     assert!(
         ORCHESTRATOR_TPL.contains("PARTIAL"),
