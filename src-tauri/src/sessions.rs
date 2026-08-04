@@ -408,13 +408,11 @@ pub fn opencode_store_from(
     let data = || {
         match xdg_data_home {
             Some(p) if !p.as_os_str().is_empty() => Some(p.to_path_buf()),
-            _ => home.map(|h| h.join(".opencode")),
+            _ => home.map(|h| h.join(".local").join("share")),
         }
         .map(|d| d.join("opencode"))
     };
-    let _ = db_flag;
-    #[allow(clippy::match_single_binding)]
-    match None::<&str> {
+    match db_flag.map(str::trim).filter(|f| !f.is_empty()) {
         // `is_absolute() || has_root()`, not `is_absolute()` alone, because
         // the vendor's test is Node's `path.isAbsolute` — which on Windows
         // calls a ROOTED path absolute (`\opencode.db`, drive-relative but
@@ -907,6 +905,7 @@ fn build_resume_command(cli: &str, session_id: &str, cwd: &str, store: &LaunchIn
         // Without this arm the `_` fallback below would answer for opencode —
         // emitting `claude --resume ses_…`, i.e. the WRONG CLI handed an id
         // belonging to another vendor's store.
+        "opencode" => format!("opencode --session {session_id}"),
         _ => {
             let base = format!("claude --resume {session_id}");
             if claude_posture_in(store, session_id) == Some(true) {
@@ -1341,10 +1340,8 @@ fn scan_opencode(limit: usize, intent: &LaunchIntentStore) -> Vec<SessionInfo> {
     let Some(db) = opencode_store_path() else {
         return Vec::new();
     };
-    let rows = match crate::opencodedb::recent_sessions(&db, limit) {
-        Ok(rows) => rows,
-        Err(crate::opencodedb::Unavailable::Absent) => return Vec::new(),
-        Err(e) => panic!("probe: {e}"),
+    let Ok(rows) = crate::opencodedb::recent_sessions(&db, limit) else {
+        return Vec::new();
     };
     rows.into_iter()
         .map(|r| {
@@ -1356,7 +1353,7 @@ fn scan_opencode(limit: usize, intent: &LaunchIntentStore) -> Vec<SessionInfo> {
                 // `title` is `NOT NULL` but a session titles itself from its
                 // first turn, so a store can hold a genuinely empty one —
                 // named the same way an untitled copilot session is.
-                title,
+                title: if title.is_empty() { "OpenCode session".to_string() } else { title },
                 cwd: r.directory,
                 modified_ms: r.updated_ms,
                 // A session in the GLOBAL store was written by a pane that had
@@ -1494,9 +1491,10 @@ fn scan_sessions() -> (Vec<SessionInfo>, ScanStats) {
     // (or vice versa). The sort is stable and `out` is already newest-first, so
     // rows that tie on a timestamp keep exactly the order they had before this
     // source existed.
-    let opencode = scan_opencode(usize::MAX, &intent);
+    let opencode = scan_opencode(LIST_LIMIT, &intent);
     let opencode_rows = opencode.len();
     out.extend(opencode);
+    out.sort_by(|a, b| b.modified_ms.cmp(&a.modified_ms));
     out.truncate(LIST_LIMIT);
 
     let stats =
