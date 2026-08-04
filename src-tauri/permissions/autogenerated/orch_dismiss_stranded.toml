@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-orch-dismiss-stranded"
+description = "Enables the orch_dismiss_stranded command without any pre-configured scope."
+commands.allow = ["orch_dismiss_stranded"]
+
+[[permission]]
+identifier = "deny-orch-dismiss-stranded"
+description = "Denies the orch_dismiss_stranded command without any pre-configured scope."
+commands.deny = ["orch_dismiss_stranded"]

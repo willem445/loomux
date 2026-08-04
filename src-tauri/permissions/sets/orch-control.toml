@@ -25,6 +25,7 @@ permissions = [
     "allow-orch-resume-group",
     "allow-orch-ack-attention",
     "allow-orch-ack-attention-pty",
+    "allow-orch-dismiss-stranded",
     "allow-orch-set-notify",
     "allow-orch-set-spawn-expanded",
     "allow-orch-set-max-agents",

@@ -40,6 +40,50 @@ export function attentionPresentation(reason: string): AttentionPresentation {
   };
 }
 
+/** Whether a pane's attention chip carries its own dismiss control (#825 M1),
+ *  and what that control shows. */
+export interface AttentionDismiss {
+  /** Render the dismiss control at all? */
+  dismissible: boolean;
+  /** Glyph on the control. Empty when there is none. */
+  label: string;
+  /** Tooltip on the control. Empty when there is none. */
+  title: string;
+}
+
+/** The tooltip on the dismiss control. It is deliberately two claims wide: what
+ *  the gesture settles (the chip) and what it leaves exactly as it was (the
+ *  pane). A human who is allowed to take a warning down on their own say-so is
+ *  owed both, or "dismiss" reads as "resolve" and someone walks away from a
+ *  genuinely wedged pane. */
+const DISMISS_TITLE =
+  "Dismiss this alert — it takes the chip down only, it does not unstick the pane";
+
+/** Whether the chip for `reason` on a pane identified by `agentId` offers an
+ *  explicit dismiss (#825 M1), and what to draw for it.
+ *
+ *  **Only `stranded`, and that is the whole rule.** It is the one LATCHED
+ *  reason: raised backend-side into `attn_stranded` and held until something
+ *  removes it, which for several blocker classes is nothing at all — so an idle
+ *  pane can wear a stuck-prompt chip indefinitely. The others are re-derived by
+ *  every 3-second attention scan (`waiting`, `gate`) or already released by the
+ *  focus ack (`report`, `blocked`), so a dismiss control on them would be a
+ *  button whose effect visibly evaporates on the next tick — which teaches the
+ *  human that dismissing does not work, the very complaint this exists to fix.
+ *
+ *  **No agent id, no control.** The backend releases the badge by agent id
+ *  (`orch_dismiss_stranded`), so a plain (non-orchestration) pane has nothing
+ *  to send; offering the control there would be a click that silently fails. */
+export function attentionDismiss(
+  reason: string | null,
+  agentId: string | null,
+): AttentionDismiss {
+  if (reason !== "stranded" || !agentId) {
+    return { dismissible: false, label: "", title: "" };
+  }
+  return { dismissible: true, label: "✕", title: DISMISS_TITLE };
+}
+
 /** A pane's current attention state, as exposed by `Pane.attention`. */
 export interface PaneAttention {
   label: string;

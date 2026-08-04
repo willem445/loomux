@@ -35682,6 +35682,72 @@ impl OrchRegistry {
         }
     }
 
+    /// The human explicitly dismissed a pane's stuck-prompt chip (#825 M1).
+    ///
+    /// **Valid for every [`StrandedBlocker`]**, including
+    /// [`StrandedBlocker::PauseSuppressed`] — whose loss is *historical* and so
+    /// can never be released by any reading of the pane — because the release
+    /// evidence here is not an inference about the pane at all. It is the one
+    /// reader the badge exists for saying "seen", aimed at the chip itself, so
+    /// loomux fabricates no claim by obeying it.
+    ///
+    /// **It takes the CHIP down and nothing else.** No hold is released, no
+    /// queue entry is admitted, and no Enter is ever pressed — a dismissal
+    /// changes exactly one thing: whether a warning is on screen. If the pane
+    /// really is still wedged, everything that would have re-raised the badge
+    /// still can, with the one stated exception below.
+    ///
+    /// **Deliberately NOT the focus ack** ([`Self::ack_attention`]). Focusing a
+    /// pane is what the human does all day in order to type into it, so
+    /// treating it as "seen" would take down chips nobody read — and for the
+    /// `Unverifiable` / `Exhausted` classes the chip may be the only trace of a
+    /// prompt still sitting unsubmitted in a box loomux could not read. This
+    /// gesture is unambiguous; that one is not. (Nor is it an expiry: elapsed
+    /// time clears the notice precisely on the unattended machine where nobody
+    /// saw it.)
+    ///
+    /// **Audited as its own event, not only as a clear.** [`Self::clear_stranded`]
+    /// records the reason but not the *class*, and for the classes that claim
+    /// the box may still hold text the class IS the diagnosis. So a dismissal
+    /// writes `stranded-dismissed` — actor `human`, carrying the blocker token
+    /// and how long the chip stood — ahead of the clear. A dismissed badge is
+    /// therefore fully reconstructible from the audit log; it is never a silent
+    /// disappearance, which is the whole reason a human is allowed to take one
+    /// down on their own say-so.
+    ///
+    /// **The one thing a dismissal does not get back.** For `QuestionStale` /
+    /// `HumanInput` the badge is raised through a hold episode's `badged`
+    /// one-shot ([`held_escalation`]), which has already fired — so within that
+    /// same episode the chip will not re-raise. That is accepted for an
+    /// explicit dismissal (the human just said they had seen it) rather than
+    /// papered over by re-arming the one-shot, which would turn one gesture
+    /// into a chip that comes straight back.
+    ///
+    /// Returns whether a badge was actually up. `false` — an unknown agent, or
+    /// one with no chip — is a no-op that audits nothing: there is no state
+    /// change to record.
+    pub fn dismiss_stranded(&self, agent_id: &str) -> bool {
+        // The group is loomux's own fact about the pane, so it is read from the
+        // registry rather than taken from the caller: constraint 6 would let a
+        // command accept it as a path segment, and not accepting one at all is
+        // strictly narrower. An id with no agent record cannot have a chip on
+        // screen either — `attention_tick` builds its items from `agents` — so
+        // this rejects only ids that could never have been clicked.
+        let Some(group) = self.agent(agent_id).map(|a| a.group) else { return false };
+        let Some(note) = self.stranded_note(agent_id) else { return false };
+        self.audit(&group, "human", "stranded-dismissed", json!({
+            "to": agent_id,
+            "blocker": note.blocker.map(|b| b.as_str()).unwrap_or("self-healing"),
+            "stranded_ms": now_ms().saturating_sub(note.since_ms),
+        }));
+        // Read-then-clear, the shape the late monitor's arms already use. A
+        // clear that lands in between leaves a `stranded-dismissed` line whose
+        // `stranded-cleared` partner names the other mechanism's reason — which
+        // is the honest record of what happened, not a lost one.
+        self.clear_stranded(&group, agent_id, "human-dismissed");
+        true
+    }
+
     /// #560: record one drainer observation against `pty_id`'s hold episode,
     /// returning when the (possibly just-opened) episode began, or `None` when
     /// no episode is open.
@@ -39979,6 +40045,32 @@ pub fn orch_ack_attention(reg: tauri::State<Arc<OrchRegistry>>, agent_id: String
 #[tauri::command]
 pub fn orch_ack_attention_pty(reg: tauri::State<Arc<OrchRegistry>>, pty_id: u32) {
     reg.ack_attention_pty(pty_id);
+}
+
+/// The human explicitly dismissed a pane's "stuck prompt" chip (#825 M1): the
+/// deliberate gesture that releases a latched `stranded` badge, valid for every
+/// blocker class. Resolves to whether a badge was actually up.
+///
+/// Deliberately distinct from [`orch_ack_attention`], which fires on pane
+/// *focus* — see [`OrchRegistry::dismiss_stranded`] for why a chip that may be
+/// the only trace of an unsubmitted prompt must not come down on that.
+///
+/// Off-thread (#762 — see [`run_blocking`]): up to two audit appends under the
+/// process-global audit lock.
+///
+/// **Reentrancy.** The `attn_stranded` map is the guard, twice over: the
+/// `stranded_note` read decides whether this call has anything to dismiss at
+/// all, and `clear_stranded`'s `remove` audits the clear only for the caller
+/// that actually took the note out — so an impatient double-click produces one
+/// clear, with the second call returning `false` having audited nothing. Two
+/// genuinely concurrent dismissals of one chip can write two
+/// `stranded-dismissed` lines against a single `stranded-cleared`; that is the
+/// intended record, since each of those lines reports a human gesture and only
+/// the clear reports a state change.
+#[tauri::command]
+pub async fn orch_dismiss_stranded(app: AppHandle, agent_id: String) -> bool {
+    let reg = reg_of(&app);
+    run_blocking(move || reg.dismiss_stranded(&agent_id)).await
 }
 
 /// Whether desktop notifications are enabled for a group (toggle button state).

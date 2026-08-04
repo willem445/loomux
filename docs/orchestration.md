@@ -347,6 +347,20 @@ These deserve their own detail — see:
   blocked, or when a task hits a human merge gate. An optional per-group
   **desktop notification** toggle (🔔 in the lifecycle panel) raises an OS toast
   for those events (off by default).
+  - Most chips clear themselves: they're recomputed every few seconds, and
+    clicking one focuses the pane and acknowledges it.
+  - The red **⚠ stuck prompt** chip is the exception. It means a prompt loomux
+    sent was never submitted, and it stays up until loomux has evidence the pane
+    is fine again — which, on a pane that has gone idle, may never arrive. So
+    that chip carries its own **✕ dismiss** button beside it. Clicking ✕ takes
+    the chip down for good, whatever raised it.
+  - **✕ takes the chip down and nothing else.** It does not unstick the pane, and
+    loomux never presses Enter on your behalf because you dismissed something. If
+    the prompt really is still sitting unsubmitted in that pane's input box, it
+    still is afterwards — so if you're not sure, look at the pane first (hover the
+    chip: it says what it thinks is blocking). Every dismissal is written to the
+    group's audit log with what was dismissed and how long it had been up, so a
+    chip you cleared can always be looked up later.
 - **Audit viewer** (`Alt+A` or the history icon) — opens the group's
   `audit.jsonl` as a filterable, searchable timeline: every prompt, spawn, task
   edit, delivery outcome, and state write, one row each. A **follow** button
