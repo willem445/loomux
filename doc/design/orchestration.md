@@ -10886,6 +10886,111 @@ unchanged; only its packaging moved. What remains genuinely open is the accumula
 overwrite question above, and (unchanged from #463) whether an unmatched `--deny-tool`
 value warns, errors, or no-ops. Both need a live run a human owns.
 
+## A `StrandedSubmit` marker is a repair, not a payload (#813)
+
+The self-heal marker (#445 seam 3, #496 PR-C) is pushed to the **front** of a pane's
+delivery queue, the drainer only ever drains the front, and its press was gated on
+`should_flush_before_paste` — which requires that *no human has typed since our own
+submit*. Every part of that was deliberate, and together they deadlock.
+
+`human_input_block` (#518) re-arms for `HUMAN_INPUT_BLOCK_BOUND_MS` from the human's
+**last** keystroke. So the marker's release condition is anti-correlated with the human's
+own recovery: click into the wedged pane, press Enter to submit the stranded prompt, then
+keep typing to talk to the CLI, and the marker is pinned at the head of the queue for as
+long as you stay engaged. Everything queued behind it — every steering prompt — silently
+never delivers, and the `attn_stranded` chip, which clears only on a **confirmed delivery
+to that pane**, cannot come down either, because no delivery can happen. That is #813's
+live incident: three orchestrator panes, a workstation lock, and a group that only a
+restart recovered.
+
+The fix is a reclassification, not a new mechanism. Every *other* queue entry carries text
+that exists nowhere else; a marker carries an **Enter**. So the marker was the one queue
+entry whose failure to fire cost *other* work, and nothing bounded it.
+`stranded_marker_action` makes the precedence a value (`failed_arm_route`'s shape, for
+`failed_arm_route`'s reason) with three retire cells and three holds.
+
+### What a retirement is allowed to rest on
+
+This is the part that took a review round, and it is the whole of the design.
+
+The first cut retired on **"a keystroke landed after our submit, and `input_pending` is
+false"**. That is wrong twice over, and both errors have the same root — reasoning about
+*who typed* instead of about *where our text is*.
+
+**It cannot tell a person from a phantom.** #518 exists precisely because a terminal
+auto-reply can be misclassified as a keystroke, and a phantom's signature is exactly that
+pair: a stamp, an empty occupancy counter. Worse, `BoundedOut` is reachable *only* with
+`!box_pending`, so a retirement on that pair always fires strictly **before** the bound
+could release. The first cut did not coexist with #518's bound; it made that bound
+**unreachable from this path**, while writing `human-resolved` into the audit trail for a
+pane no human had touched.
+
+**And `!box_pending` is not "the box is empty".** `input_box_len` counts characters the
+*human* typed (`note_user_input`); loomux's own paste goes out through `write_bytes`, which
+never touches it. So a retirement there can happen while **our own prompt is still sitting
+in that box** — and `deliver_now` does *not* abort when `flush_stranded_text` declines, so
+the next queue entry pastes on top of it and the pre-Enter wait submits both prompts merged
+as one. That is the #81/#84/#111 collision the stranded flush exists to prevent, re-opened
+by the repair meant to help. The marker's head-of-line block had been *accidentally*
+preventing it.
+
+So a retirement now requires a positive [`BoxReading::NotHolding`] on our own recorded text
+— the tail was long enough to have contained our paste, and does not. Only then does the
+keystroke record pick the **name**, which is all it was ever fit to decide. `Holds`,
+`Unverifiable`, and "no text on record" all fall through to the ordinary gates: nothing
+retires on an absence of evidence, which is the one direction that could re-open either
+hazard.
+
+| reading | before | now |
+| --- | --- | --- |
+| ledger not `Some(false)` — nothing stranded | retry forever | `Retire(NothingStranded)` |
+| `NotHolding` **and** a keystroke since our submit | retry forever | `Retire(HumanResolved)` |
+| `NotHolding` with no keystroke on record | retry forever | `Retire(TextGone)` |
+| `box_pending` — human characters outstanding | decline | `Retry(BoxOccupied)` — unchanged |
+| `human_input_block` holds | decline | `Retry(BoxOccupied)` — unchanged |
+| live question | decline | `Retry(Question)` — unchanged |
+| clear | press | `Press` — unchanged |
+
+That the ledger now carries the text at all is the enabling change:
+`DeliveryOutcome::stranded_text` is written by the two paths that know it — the ownership
+publish before the first Enter, and `record_aborted_preenter_outcome` — because the marker
+itself carries no text, and without it nothing downstream can ask the only question that
+licenses a retirement.
+
+### What retiring cannot lose
+
+A retirement means our text is **not in the box**. There is therefore no Enter left for the
+marker to press that could have submitted it, and nothing for a later paste to collide
+with. The case where our Enter would still have been right is exactly `Holds`, and that is
+the case the marker keeps retrying — at which point the suppression is bounded by evidence
+rather than by a timer, which is the release the repo's standing rule prefers
+(#496/#513/#518): the same event that makes the press possible is the one that ends the
+hold.
+
+The residual is a pane whose text `Holds` indefinitely behind a gate that never clears.
+There the queue does stay held — correctly, since the alternative is merging two prompts —
+and #496 PR-C's badge plus `QUESTION_HOLD_STALE_AFTER`'s escalation are what tell the
+human, exactly as they did before. What #813 removes is not that hold; it is the hold that
+survived the human *fixing it*.
+
+### The badge
+
+`HumanResolved` is the one cell that clears the chip (`clear_stranded`, reason
+`human-resolved`): a person demonstrably acted on the pane and our text is gone. `TextGone`
+does **not** — our text left the box with nobody at the keyboard, which is
+`StrandedBlocker::NotHolding`'s own situation ("never confirmed and its text is gone —
+check the pane"), and clearing there would answer a question loomux cannot answer.
+`NothingStranded` establishes nothing about the pane at all.
+
+That decision has to be the **only** one, which is a second edit rather than a consequence
+of the first. `note_hold` drops a badged pane's stranded note whenever an episode ends, and
+#813 added a second ender — so `Retired` silently inherited a badge clear that the retire
+arm had already decided against, and a `TextGone` badge came down behind its back. The
+clear there is now restricted to `HoldObservation::Delivered`: a delivery is the pane
+*proving* it can accept a write, and a retirement is by construction the case where it
+proved nothing (that is the whole reason `Retired` is not `Delivered`). Ending the episode
+and clearing the badge were one decision because until #813 only one observation did both.
+
 ## Risks / limitations
 
 - Kickoff typing races CLI boot; a fixed delay (4s) + bracketed paste is used. If a

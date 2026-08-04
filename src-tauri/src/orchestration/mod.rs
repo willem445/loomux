@@ -12590,6 +12590,24 @@ pub struct DeliveryOutcome {
     /// inference_guard_until_ms`'s doc for why this specific distinction
     /// matters.
     from: String,
+    /// #813 round 2: the text this delivery left sitting in the pane's box, for
+    /// readers that must ask **whether our own text is still there** — a
+    /// question no other field on this record, and no other signal on the pane,
+    /// can answer.
+    ///
+    /// `input_box_len` cannot answer it: that counter tracks characters the
+    /// HUMAN typed (`PtyManager::note_user_input`), and loomux's own paste goes
+    /// out through `write_bytes`, which never touches it. So `!input_pending`
+    /// means "no human characters are outstanding", NOT "the box is empty", and
+    /// a reader that treats the two as the same thing is reasoning about a
+    /// different pane than the one in front of it. That conflation is exactly
+    /// what #813's first cut got wrong.
+    ///
+    /// `None` where there is no text to look for — a record from a path that
+    /// pasted nothing, or one that predates this field. Every consumer treats
+    /// `None` as "no reading available" and takes the conservative branch,
+    /// never as "the box is clear".
+    stranded_text: Option<String>,
 }
 
 /// Record a pre-Enter question-abort's outcome (#420 rev-15 B3, extracted
@@ -12611,8 +12629,14 @@ pub fn record_aborted_preenter_outcome(
     last_delivery: &Mutex<HashMap<u32, DeliveryOutcome>>,
     pty_id: u32,
     delivery_from: String,
+    // #813: the text that is sitting in the box right now. This call site is
+    // the one that KNOWS it — the paste it made is the stranded text — and the
+    // marker queued immediately after carries no text of its own, so if it is
+    // not recorded here nothing downstream can ever ask whether it is still
+    // there.
+    pasted_text: Option<String>,
 ) {
-    record_inflight_delivery(last_delivery, pty_id, now_ms(), delivery_from);
+    record_inflight_delivery(last_delivery, pty_id, now_ms(), delivery_from, pasted_text);
 }
 
 /// Publish a delivery's OWNERSHIP of a pane into the ledger (#454) — the
@@ -12657,11 +12681,14 @@ pub fn record_inflight_delivery(
     pty_id: u32,
     submit_sent_ms: u64,
     delivery_from: String,
+    // #813: see `DeliveryOutcome::stranded_text`.
+    pasted_text: Option<String>,
 ) {
     last_delivery.lock_safe().insert(pty_id, DeliveryOutcome {
         confirmed: false,
         submit_sent_ms,
         from: delivery_from,
+        stranded_text: pasted_text,
     });
 }
 
@@ -12735,11 +12762,15 @@ pub fn record_stranded_outcome_at_for_test(
     pty_id: u32,
     delivery_from: String,
     submit_sent_ms: u64,
+    // #813: the stranded text this back-dated record is about, so a test can
+    // drive the box reading the real decision now turns on.
+    pasted_text: Option<String>,
 ) {
     last_delivery.lock_safe().insert(pty_id, DeliveryOutcome {
         confirmed: false,
         submit_sent_ms,
         from: delivery_from,
+        stranded_text: pasted_text,
     });
 }
 
@@ -15130,7 +15161,14 @@ fn run_late_confirmation_monitor(
             MonitorAction::Confirm { merged, correction } => {
                 last_delivery.lock_safe().insert(
                     pty_id,
-                    DeliveryOutcome { confirmed: true, submit_sent_ms, from: delivery_from.clone() },
+                    // #813: `confirmed` means our text went in, so there is
+                    // nothing stranded left to look for.
+                    DeliveryOutcome {
+                        confirmed: true,
+                        submit_sent_ms,
+                        from: delivery_from.clone(),
+                        stranded_text: None,
+                    },
                 );
                 append_audit(&root, &group, "loomux", "delivery-confirmed-late", json!({
                     "to": agent, "confirm_source": "hook", "confirm_merged": merged, "was_failed": correction,
@@ -15537,6 +15575,14 @@ enum DeliverOutcome {
     /// `write_admission_badges_the_gate_that_actually_blocked` exists to
     /// prevent.
     AbortedPreEnter(queue::EnqueueReason),
+    /// #813: a `StrandedSubmit` marker was dropped without pressing anything —
+    /// see `stranded_marker_action`. Its own variant rather than `Done`
+    /// because `Done`'s whole meaning is that the pane took a write, and this
+    /// pane did not: reusing it would make `HoldObservation::Delivered` — "the
+    /// pane accepted a write" — a false claim in the audit trail, which is the
+    /// unbacked-claim class this module mints separate variants to avoid
+    /// (`QuestionStale` vs `Question`, `QueueFull` vs `Exhausted`).
+    Retired(StrandedRetireReason),
 }
 
 /// The delivery body itself — paste, echo-verify, submit, confirm — pulled
@@ -16030,7 +16076,8 @@ fn deliver_now(
             // EARLIER delivery left, so the next delivery's flush
             // could wrongly conclude nothing needs clearing and
             // append its own paste onto this one's abandoned text.
-            record_aborted_preenter_outcome(&last_delivery, pty_id, delivery_from);
+            record_aborted_preenter_outcome(
+                &last_delivery, pty_id, delivery_from, Some(pasted_text.clone()));
             return DeliverOutcome::AbortedPreEnter(queue::EnqueueReason::Question);
         }
     }
@@ -16060,7 +16107,8 @@ fn deliver_now(
         append_audit(&root, &group, "loomux", "delivery-aborted-human-input", json!({
             "to": agent, "stage": "pre-enter", "reason": "box occupied at submit time",
         }));
-        record_aborted_preenter_outcome(&last_delivery, pty_id, delivery_from);
+        record_aborted_preenter_outcome(
+            &last_delivery, pty_id, delivery_from, Some(pasted_text.clone()));
         return DeliverOutcome::AbortedPreEnter(preenter.enqueue_reason());
     }
     // #112 round 2: Tier 1's precondition, OBSERVED right here rather
@@ -16127,7 +16175,12 @@ fn deliver_now(
     // in-flight marker. The final `confirmed` value is written to the same
     // key at the end of the window below; until then the honest state is
     // exactly what this records — a delivery in flight, not yet landed.
-    record_inflight_delivery(&last_delivery, pty_id, submit_sent_ms, delivery_from.clone());
+    record_inflight_delivery(
+        &last_delivery, pty_id, submit_sent_ms, delivery_from.clone(),
+        // #813: the paste has landed by this point, so this record can answer
+        // "is our text still in that box?" for every later reader.
+        Some(pasted_text.clone()),
+    );
     let _ = ptys.write_bytes(pty_id, submit);
 
     // Copilot autopilot consent (#101/#179): a fresh --autopilot copilot
@@ -16415,7 +16468,15 @@ fn deliver_now(
     // posture, unchanged).
     last_delivery
         .lock_safe()
-        .insert(pty_id, DeliveryOutcome { confirmed, submit_sent_ms, from: delivery_from.clone() });
+        .insert(pty_id, DeliveryOutcome {
+            confirmed,
+            submit_sent_ms,
+            from: delivery_from.clone(),
+            // #813: a CONFIRMED delivery's text went in, so there is nothing
+            // stranded to look for; an unconfirmed one's may still be sitting
+            // in the box, which is precisely the reading the marker needs.
+            stranded_text: (!confirmed).then(|| pasted_text.clone()),
+        });
     append_audit(&root, &group, "loomux", "prompt-typed", json!({
         "to": agent,
         "cli": cli,
@@ -16564,15 +16625,203 @@ fn deliver_now(
     DeliverOutcome::Done
 }
 
-/// Replay a queued `StrandedSubmit` marker (#445 seam 3): the text is
-/// already sitting in the box from an earlier paste whose Enter was
-/// withheld — press it via the SAME `flush_stranded_text` logic a normal
-/// delivery's own pre-paste step already uses (guarded by
-/// `human_typed_since`, so a person's own line is never blind-submitted).
-/// Returns whether it actually fired; `false` means the guard declined (a
-/// question reappeared, or a human is mid-line) — the caller leaves the
-/// marker queued and retries next tick, no cap, exactly like every other
-/// queued entry.
+/// Why a queued `StrandedSubmit` marker was retired instead of pressed
+/// (#813). Each variant is a distinct audit token, because "there was nothing
+/// left to submit", "a human submitted it for us" and "our text left the box
+/// with nobody at the keyboard" are three different facts about the same pane,
+/// and a shared string could not tell a reader which one happened.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StrandedRetireReason {
+    /// The pane's delivery ledger no longer says anything is stranded — the
+    /// last delivery confirmed, or there is no record at all (a restart drops
+    /// the in-memory ledger while the queue is persisted). Pressing Enter
+    /// against that is a blind press with nothing behind it.
+    NothingStranded,
+    /// #813's incident cell. Our stranded text is verifiably **gone from the
+    /// box**, and a human keystroke landed on this pane after our own submit —
+    /// so a person dealt with it, which is exactly what the queue was waiting
+    /// for and exactly what it could not see.
+    HumanResolved,
+    /// Our stranded text is verifiably gone from the box, and **no** human
+    /// keystroke is on record since our submit — the CLI consumed it, replaced
+    /// it with a placeholder, or it never really landed. Nothing left to press
+    /// Enter against either way, but deliberately NOT `HumanResolved`: that
+    /// name would put a person in the audit trail who was never there, and it
+    /// is the one of these two that licenses taking the badge down.
+    TextGone,
+}
+
+impl StrandedRetireReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StrandedRetireReason::NothingStranded => "nothing-stranded",
+            StrandedRetireReason::HumanResolved => "human-resolved",
+            StrandedRetireReason::TextGone => "text-gone",
+        }
+    }
+
+    /// Whether this retirement is evidence that the pane no longer needs a
+    /// human, i.e. whether it takes the `attn_stranded` chip down.
+    ///
+    /// Only `HumanResolved`. `TextGone` says our text left the box with nobody
+    /// at the keyboard, which is precisely [`StrandedBlocker::NotHolding`]'s
+    /// situation — "never confirmed and its text is gone — check the pane" —
+    /// and clearing on it would answer a question loomux cannot answer.
+    /// `NothingStranded` establishes nothing about the pane at all.
+    pub fn resolves_the_pane(self) -> bool {
+        matches!(self, StrandedRetireReason::HumanResolved)
+    }
+}
+
+/// What the drainer should do with the `StrandedSubmit` marker at the front of
+/// a pane's queue (#813) — the precedence as a VALUE, for the reason
+/// `failed_arm_route` gives for the same shape: a `return`-ordered version of
+/// this lives only as control flow inside a function no test in this repo can
+/// construct, and #585 is the precedent for that being how a wrong ordering
+/// survives review.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StrandedMarkerAction {
+    /// Press the Enter the stranded delivery never got.
+    Press,
+    /// Drop the marker and let the queue move on.
+    Retire(StrandedRetireReason),
+    /// A live gate is in the way, or our text is still sitting there and
+    /// cannot be pressed yet — leave the marker queued and retry, carrying the
+    /// gate that actually declined so the caller's notice and audit name it
+    /// (the mislabel #532 rev-12 NB1 closed on `AbortedPreEnter`, arriving
+    /// here).
+    Retry(queue::EnqueueReason),
+}
+
+/// **A marker is a repair, not a payload** — and that is the whole argument for
+/// #813 (see `doc/design/orchestration.md`).
+///
+/// Before this, a marker that could not fire stayed at the FRONT of the pane's
+/// queue and was retried "next tick, no cap, exactly like every other queued
+/// entry". But it is not like every other queued entry: every other one carries
+/// text that exists nowhere else, whereas a marker carries an **Enter**. So the
+/// marker was the one queue entry whose failure to fire cost *other* work, and
+/// nothing bounded it.
+///
+/// Worse, its release condition was ANTI-CORRELATED with the human's own
+/// recovery. `human_input_block` re-arms for `HUMAN_INPUT_BLOCK_BOUND_MS` from
+/// the human's LAST keystroke, so a human who does the sane thing — click into
+/// the wedged pane, press Enter to submit the stranded prompt, then keep typing
+/// to talk to the CLI — pins the marker at the head of the queue for as long as
+/// they stay engaged, and every steering prompt behind it silently never
+/// delivers. That is #813's live incident, step for step.
+///
+/// # The evidence a retirement rests on, and why it is about the TEXT
+///
+/// The first cut of this fix retired on "a keystroke landed after our submit
+/// **and** `input_pending` is false", and that was wrong twice over.
+///
+/// **It could not tell a person from a phantom.** #518 exists because a
+/// terminal auto-reply can be misclassified as a keystroke, and that is exactly
+/// the shape this reading has: a stamp, an empty occupancy counter. Retiring on
+/// it fired inside `HUMAN_INPUT_BLOCK_BOUND_MS`, i.e. strictly before
+/// `BoundedOut` — which is only reachable with `!box_pending` — could ever be
+/// reached, so it did not merely coexist with #518's bound, it made that bound
+/// **unreachable from this path**, and wrote `human-resolved` into the audit
+/// trail for a pane no human had touched.
+///
+/// **And `!box_pending` is not "the box is empty".** `input_box_len` counts
+/// characters the HUMAN typed; loomux's own paste never touches it. So the
+/// first cut retired while our own prompt could still be sitting in that box —
+/// and the next queue entry, whose `deliver_now` does NOT abort when
+/// `flush_stranded_text` declines, would then paste **on top of it** and submit
+/// both prompts merged as one. That is the #81/#84/#111 collision the stranded
+/// flush exists to prevent, re-opened by the repair meant to help.
+///
+/// Both hazards have one root — reasoning about *who typed* instead of *where
+/// our text is* — so both close with one change. A retirement now requires a
+/// positive [`BoxReading::NotHolding`]: the tail was long enough to have
+/// contained our paste and does not. Then, and only then, the keystroke record
+/// picks the NAME (`HumanResolved` vs `TextGone`), which is all it was ever fit
+/// to decide.
+///
+/// `Holds`, `Unverifiable` and "no text on record" all fall through to the
+/// ordinary gates. Nothing retires on an absence of evidence — the one
+/// direction that could re-open either hazard.
+///
+/// # What retiring cannot lose
+///
+/// A retirement means our text is not in the box. There is therefore no Enter
+/// left for this marker to press that could submit it, and nothing for a later
+/// paste to collide with. The case where our Enter WOULD still have been right
+/// is precisely `Holds`, and that is the case this function keeps retrying.
+///
+/// Pure and total so every cell of the matrix is directly assertable.
+#[doc(hidden)] // pub for integration tests
+pub fn stranded_marker_action(
+    prev_confirmed: Option<bool>,
+    // What Tier 1 says about OUR OWN stranded text, or `None` when the ledger
+    // carries no text to look for. `None` and `Unverifiable` are different
+    // facts ("we have nothing to look for" vs "we looked and could not tell")
+    // and both take the same conservative branch, which is why neither is
+    // collapsed into the other.
+    text_reading: Option<BoxReading>,
+    // Whether a human keystroke is on record for this pane since our own
+    // submit — `tier1_trusted`'s inverse. Names a retirement; never licenses
+    // one.
+    human_stamped_since: bool,
+    human_block: HumanInputBlock,
+    box_pending: bool,
+    // A CLOSURE, not a bool, for the reason `question_hold_predicate_sampled`
+    // takes a sampler: answering it costs a 64 KiB grid recomposition, and most
+    // of the decisions below never need to ask. Called at most once, and only
+    // on the path that actually consults it.
+    question_active: impl FnOnce() -> bool,
+) -> StrandedMarkerAction {
+    // Nothing stranded to submit. `should_flush_before_paste`'s own condition,
+    // read as a retire rather than as a decline: a decline here retried forever
+    // against a ledger that can never say `Some(false)` again.
+    if !matches!(prev_confirmed, Some(false)) {
+        return StrandedMarkerAction::Retire(StrandedRetireReason::NothingStranded);
+    }
+    // The one positive reading that licenses a retirement: our text is gone
+    // from the box. See the header for why nothing weaker will do.
+    if text_reading == Some(BoxReading::NotHolding) {
+        return StrandedMarkerAction::Retire(if human_stamped_since {
+            StrandedRetireReason::HumanResolved
+        } else {
+            StrandedRetireReason::TextGone
+        });
+    }
+    // #510's absolute, unchanged: human-typed characters are outstanding in the
+    // box, so never press Enter over them.
+    if box_pending {
+        return StrandedMarkerAction::Retry(queue::EnqueueReason::BoxOccupied);
+    }
+    // #518, unchanged and now genuinely reachable: a human typed here since our
+    // submit, so hold — but only until the bound, after which `holds()` reads
+    // false and this falls through to the press. That bound is the ONLY thing
+    // that releases a stamp which may have been a phantom, which is why nothing
+    // above may retire on the stamp alone.
+    //
+    // `BoxOccupied` is the honest reason: the box is occupied — by OUR text,
+    // which is the entire premise of a marker existing. Whose text it is lives
+    // in the `stranded-marker-*` audit, not in the queue's reason vocabulary.
+    if human_block.holds() {
+        return StrandedMarkerAction::Retry(queue::EnqueueReason::BoxOccupied);
+    }
+    // #420, unchanged: a live question owns the Enter key.
+    if question_active() {
+        return StrandedMarkerAction::Retry(queue::EnqueueReason::Question);
+    }
+    StrandedMarkerAction::Press
+}
+
+/// Replay a queued `StrandedSubmit` marker (#445 seam 3): the text is already
+/// sitting in the box from an earlier paste whose Enter was withheld — press it
+/// via the SAME `flush_stranded_text` logic a normal delivery's own pre-paste
+/// step already uses (guarded by `human_typed_since`, so a person's own line is
+/// never blind-submitted).
+///
+/// #813: returns `stranded_marker_action`'s three-way rather than a bool. A
+/// `Retry` is the old `false` (leave it queued); a `Retire` is new and is the
+/// fix — see that function for the evidence a retirement rests on and why it
+/// has to be about our text rather than about who typed.
 #[doc(hidden)] // pub for integration tests (#496 PR-C drives the REAL replay)
 pub fn drain_stranded_submit(
     ptys: &crate::pty::PtyManager,
@@ -16583,30 +16832,109 @@ pub fn drain_stranded_submit(
     // #576: threaded through to `flush_stranded_text`'s question gate — see
     // there for why this reader gets the record too.
     delivered: Vec<String>,
-) -> bool {
+) -> StrandedMarkerAction {
     let prev = last_delivery.lock_safe().get(&pty_id).cloned();
     let prev_confirmed = prev.as_ref().map(|o| o.confirmed);
     // #518: the SAME derivation the self-heal's trigger used
     // (`human_input_block`), not a second opinion. rev-47 NB1 is the failure
     // this avoids: a marker admitted on one rule and pressed under another
-    // never fires, and the badge quietly goes on claiming loomux is handling
-    // a re-send it will decline forever. Deliberately unaudited here — this
-    // path has no `root`/`group` seam, and the decision it re-derives was
-    // already recorded (`human-input-block-released`, stage `stranded`) at the
-    // trigger that admitted this marker.
-    let human_typed_since = prev
+    // never fires, and the badge quietly goes on claiming loomux is handling a
+    // re-send it will decline forever.
+    let human_block = prev
         .as_ref()
-        .map(|o| human_input_block_now(ptys, pty_id, o.submit_sent_ms).holds())
-        .unwrap_or(false);
-    let flushed =
-        flush_stranded_text(ptys, pty_id, prev_confirmed, human_typed_since, submit, delivered);
-    if flushed {
+        .map(|o| human_input_block_now(ptys, pty_id, o.submit_sent_ms))
+        .unwrap_or(HumanInputBlock::None);
+    // The same `tier1_trusted` reading `human_input_block` takes, kept separate
+    // because it answers a different question: the block decides whether to
+    // WRITE, this decides what to CALL a retirement that has already been
+    // licensed by the box reading below.
+    let human_stamped_since = prev.as_ref().is_some_and(|o| {
+        !tier1_trusted(ptys.last_user_input_ms(pty_id).unwrap_or(0), o.submit_sent_ms)
+    });
+    // #532: taken HERE, at the press, never inherited. `unwrap_or(true)` on a
+    // closed pty is the fail-safe direction, matching `flush_stranded_text`.
+    let box_pending = ptys.input_pending(pty_id).unwrap_or(true);
+    // #813: Tier 1, on our OWN text — the same `Tier1Scan` widening read and
+    // the same `box_reading` the late-confirmation monitor takes, not a second
+    // implementation of either.
+    //
+    // **Cost, declared (performance.md §3 INV-4: cadenced work says what it
+    // costs).** This runs on the drainer's `QUEUE_DRAIN_POLL` (2 s), so it is
+    // fixed-cadence work and owes a bound. Three things bound it:
+    //
+    // 1. **Scope.** It runs only while a `StrandedSubmit` marker is at the
+    //    FRONT of a pane's queue — not per pane, not per poll of an ordinary
+    //    queue, and not at all on a pane that has never stranded a delivery.
+    //    A marker is rare and self-limiting: this very reading is what retires
+    //    it, so the work ends the condition that schedules it.
+    // 2. **Per call.** One `Tier1Scan::for_paste` normalize of the recorded
+    //    paste, then at most `TIER1_SCAN_WIDEN_ROUNDS` ring reads capped at
+    //    `TIER1_SCAN_WIDEN_MAX_BYTES` — `Tier1Scan::widen`'s own bound, not a
+    //    fresh one. No IPC and no lock beyond the ring's own.
+    // 3. **Precedent.** `run_late_confirmation_monitor` takes the identical
+    //    read every `LATE_MONITOR_POLL` (5 s) for the whole of a delivery's
+    //    unconfirmed life, so this is a shape the app already pays at a
+    //    comparable cadence, on the same panes, for the same question.
+    //
+    // Deliberately gated on the ledger rather than taken unconditionally: a
+    // marker whose pane reports anything but `Some(false)` retires on that
+    // alone (see `stranded_marker_action`'s first cell), so paying for a box
+    // read there would be buying an answer nothing consults. Not hoisted out
+    // of the poll the way the late monitor hoists its `Tier1Scan` — this
+    // function is called fresh per pass and owns no state between them, and
+    // #559 rev-13 N2's hoist is available to a future caller that does.
+    let text_reading = matches!(prev_confirmed, Some(false))
+        .then(|| prev.as_ref().and_then(|o| o.stranded_text.clone()))
+        .flatten()
+        .map(|text| {
+            let mut scan = Tier1Scan::for_paste(&text);
+            let read = scan.read(|n| ptys.output_tail_bounded(pty_id, n));
+            box_reading(read.as_ref().map(|r| r.stripped.as_str()), &text)
+        });
+    let action = stranded_marker_action(
+        prev_confirmed,
+        text_reading,
+        human_stamped_since,
+        human_block,
+        box_pending,
+        // #576: the record reaches BOTH readers of the question gate — this one
+        // and `flush_stranded_text`'s own. Fixing one and leaving the other was
+        // rev-126's finding (`e7`).
+        || question_active_now(ptys, pty_id, None, delivered.clone()),
+    );
+    if action != StrandedMarkerAction::Press {
+        return action;
+    }
+    // The press itself still goes through `flush_stranded_text`, which
+    // re-derives its own gates: this function decides, that one writes, and
+    // neither trusts the other's reading.
+    if flush_stranded_text(ptys, pty_id, prev_confirmed, human_block.holds(), submit, delivered) {
         last_delivery.lock_safe().insert(
             pty_id,
-            DeliveryOutcome { confirmed: true, submit_sent_ms: now_ms(), from: delivery_from },
+            DeliveryOutcome {
+                confirmed: true,
+                submit_sent_ms: now_ms(),
+                from: delivery_from,
+                // #813: pressed, so nothing is stranded any more.
+                stranded_text: None,
+            },
         );
+        StrandedMarkerAction::Press
+    } else {
+        // A decline AFTER we decided `Press` means a gate flipped between the
+        // two reads (or the write itself failed on a pty that has since
+        // closed). Re-read the cheap half rather than asserting a reason:
+        // `flush_stranded_text` consults exactly two gates, so a box that is
+        // now occupied names itself, and the question is the only thing left it
+        // could have been. That inference is stated rather than hardcoded —
+        // the hardcoded `Question` here was itself the mislabel this PR removes
+        // everywhere else.
+        StrandedMarkerAction::Retry(if ptys.input_pending(pty_id).unwrap_or(true) {
+            queue::EnqueueReason::BoxOccupied
+        } else {
+            queue::EnqueueReason::Question
+        })
     }
-    flushed
 }
 
 /// The delivery-queue drainer (#445, generalized by #470 into the ONLY way
@@ -17241,13 +17569,18 @@ fn run_queue_drainer(
             queue::QueuedPayload::StrandedSubmit => {
                 let _guard = lock.lock_safe();
                 let submit = submit_sequence(&cli);
-                if drain_stranded_submit(
+                match drain_stranded_submit(
                     &ptys, &reg.last_delivery, front.from.clone(), pty_id, submit,
                     reg.delivered_notice_lines(pty_id),
                 ) {
-                    DeliverOutcome::Done
-                } else {
-                    DeliverOutcome::AbortedPrePaste(queue::EnqueueReason::Question)
+                    StrandedMarkerAction::Press => DeliverOutcome::Done,
+                    StrandedMarkerAction::Retire(why) => DeliverOutcome::Retired(why),
+                    // #532 rev-12 NB1, arriving here: the gate that ACTUALLY
+                    // declined, never a hardcoded `Question`. This arm used to
+                    // report every decline as an interactive question, sending
+                    // the orchestrator to look for a dialog that a box-occupied
+                    // hold never painted.
+                    StrandedMarkerAction::Retry(reason) => DeliverOutcome::AbortedPrePaste(reason),
                 }
             }
         };
@@ -17263,8 +17596,10 @@ fn run_queue_drainer(
         // the poll above did not, which is what covers a hold that lives
         // entirely inside `deliver_now` — every poll reads writable, every
         // attempt then aborts, and pre-#560 nothing ever started a clock.
+        // #813 adds a second ender that is not a delivery — see `Retired`.
         let observation = match outcome {
             DeliverOutcome::Done => HoldObservation::Delivered,
+            DeliverOutcome::Retired(_) => HoldObservation::Retired,
             DeliverOutcome::AbortedPrePaste(_) | DeliverOutcome::AbortedPreEnter(_) => {
                 HoldObservation::Aborted
             }
@@ -17278,6 +17613,35 @@ fn run_queue_drainer(
                 // #532/#560: the hold episode ended at the `note_hold` call
                 // above — a delivered entry means whatever was holding this pane
                 // is over, so a LATER hold clocks and badges afresh.
+                lower_chip();
+            }
+            // #813: the marker leaves the queue without having pressed
+            // anything, so the entries behind it get their turn — that release
+            // IS the fix. Everything else here mirrors `Done` because the queue
+            // consequence is the same (this entry is finished with), and only
+            // the audit and the badge treat it differently.
+            DeliverOutcome::Retired(why) => {
+                reg.audit(&group, "loomux", "stranded-marker-retired", json!({
+                    "to": &front.agent_id,
+                    "reason": why.as_str(),
+                    // The whole point, in one number: how much work this
+                    // marker was holding behind it when it was retired.
+                    "depth_behind": depth.saturating_sub(1),
+                }));
+                // The chip the human has been staring at comes down on the
+                // evidence that they resolved it themselves — `HumanResolved`
+                // and nothing else (`resolves_the_pane`). `TextGone` says our
+                // text left the box with nobody at the keyboard, which is
+                // `StrandedBlocker::NotHolding`'s own situation and NOT a
+                // clear; `NothingStranded` establishes nothing about the pane.
+                // #496 PR-C's badge is the channel that must survive a repair
+                // loomux could not make. `clear_stranded` is a no-op when no
+                // note is up, so this never invents a clear.
+                if why.resolves_the_pane() {
+                    reg.clear_stranded(&group, &front.agent_id, why.as_str());
+                }
+                reg.pop_batch_dequeued(&group, pty_id, &closed);
+                reg.queue_still_notified.lock_safe().remove(&pty_id);
                 lower_chip();
             }
             DeliverOutcome::AbortedPrePaste(reason) => {
@@ -19185,6 +19549,12 @@ pub enum HoldObservation {
     Aborted,
     /// A delivery LANDED (`DeliverOutcome::Done`) — the pane accepted a write.
     Delivered,
+    /// #813: loomux gave up on a `StrandedSubmit` repair it could not safely
+    /// perform (`DeliverOutcome::Retired`). Ends the episode exactly as
+    /// `Delivered` does — loomux is no longer holding this pane on that entry,
+    /// and the next entry clocks and badges afresh — but says so without
+    /// claiming the pane accepted a write.
+    Retired,
 }
 
 /// #560: does this observation end the pane's hold episode?
@@ -19209,7 +19579,9 @@ pub enum HoldObservation {
 /// drainer, because that removal has to be atomic with the queue check.
 pub fn ends_hold_episode(observation: HoldObservation) -> bool {
     match observation {
-        HoldObservation::Delivered => true,
+        // #813: a retired marker ends the episode for the same reason a
+        // delivery does — whatever loomux was holding this pane for is over.
+        HoldObservation::Delivered | HoldObservation::Retired => true,
         HoldObservation::HeldPoll | HoldObservation::WritablePoll | HoldObservation::Aborted => false,
     }
 }
@@ -19220,7 +19592,9 @@ pub fn ends_hold_episode(observation: HoldObservation) -> bool {
 pub fn opens_hold_episode(observation: HoldObservation) -> bool {
     match observation {
         HoldObservation::HeldPoll | HoldObservation::Aborted => true,
-        HoldObservation::WritablePoll | HoldObservation::Delivered => false,
+        HoldObservation::WritablePoll
+        | HoldObservation::Delivered
+        | HoldObservation::Retired => false,
     }
 }
 
@@ -34789,7 +35163,18 @@ impl OrchRegistry {
             // Only clear the badge if this episode is the one that raised it.
             // A `Delivered` on a pane that was never escalated must not reach
             // in and drop some other mechanism's badge.
-            if had.is_some_and(|e| e.badged)
+            //
+            // #813: and only a DELIVERY may clear it here at all. `Retired`
+            // ends the episode without the pane having accepted anything, so
+            // it establishes nothing about whether the pane still needs a
+            // human — the whole distinction `HoldObservation::Retired` exists
+            // to keep out of the audit trail. The retire arm owns that
+            // decision per reason (`StrandedRetireReason::resolves_the_pane`),
+            // and clearing here as well would take a `TextGone` or
+            // `NothingStranded` badge down behind that decision's back, which
+            // is precisely the badge story those two variants exist to avoid.
+            if observation == HoldObservation::Delivered
+                && had.is_some_and(|e| e.badged)
                 && self
                     .stranded_note(agent_id)
                     .is_some_and(|n| matches!(n.blocker, Some(StrandedBlocker::QuestionStale) | Some(StrandedBlocker::HumanInput)))
