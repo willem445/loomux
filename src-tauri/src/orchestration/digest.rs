@@ -330,7 +330,10 @@ fn parse_checkpoint_titles(md: &str) -> Vec<(usize, String)> {
 /// model's scratchpad, not what it did), plus `step-start`, `step-finish`,
 /// `snapshot`, `patch`, `file`, `agent`, `retry`, `compaction` and `subtask`,
 /// none of which carry conversation content or a tool outcome.
+#[allow(unreachable_code, unused_mut, unused_variables)]
 pub fn parse_opencode_transcript_events(rows: &[crate::opencodedb::TranscriptRow]) -> Vec<TranscriptEvent> {
+    // PROBE (#722 slice B2): no normalizer, exactly as before this slice.
+    return Vec::new();
     let mut events = Vec::new();
     // One message's document repeats across every one of its parts, so it is
     // parsed once and reused until the id changes — the reason `message_id`
@@ -537,7 +540,8 @@ impl FrictionWindow {
 /// (`parse_copilot_session_events`), so this predicate is unreachable there.
 /// Pinned by `the_edit_tool_predicate_spans_clis_without_widening_past_them`.
 fn is_edit_tool(name: &str) -> bool {
-    matches!(name.to_ascii_lowercase().as_str(), "edit" | "write" | "multiedit")
+    // PROBE (#722 slice B2): the pre-change predicate, claude spellings only.
+    matches!(name, "Edit" | "Write" | "MultiEdit")
 }
 
 // ---------------------------------------------------------------------------
