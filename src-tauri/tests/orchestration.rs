@@ -14800,6 +14800,334 @@ fn box_holds_paste_is_the_documented_precondition_check_and_post_enter_signal_al
     assert!(!box_holds_paste(post_enter_tail_accepted, pasted), "post-Enter: box consumed it");
 }
 
+// ───────── #821: a per-row gutter through a multi-row paste is not an absence ─────────
+//
+// `normalize_prompt_text` flattens the whole tail, so copilot's framed composer
+// — which draws `┃ ` down EVERY row it wrapped a paste onto — puts its gutter
+// *inside* the haystack, interleaved through the needle. Containment fails on
+// text plainly still in the box, and the reading is not merely wrong but
+// CONFIDENTLY wrong: the only guard between a failed containment and
+// `NotHolding` is a length test, and decoration ADDS characters, so the tail is
+// always longer than the paste it just failed to contain.
+//
+// Post-#819 that reading LICENSES retirement (`stranded_marker_action` retires
+// on `Some(BoxReading::NotHolding)`), and #819's safety argument — "nothing
+// retires on an absence of evidence" — does not cover counterfeit evidence OF
+// an absence. So a false negative here retires a marker whose text is still in
+// the box: the Enter that would have submitted it is never pressed, and the
+// next queue entry pastes on top and submits both merged, which is the
+// #81/#84/#111 collision that licence exists to prevent.
+
+/// Copilot's framed composer holding a multi-row loomux paste. Reconstructed
+/// from the shapes cited in #820 (`copilot-cli#4116`'s verbatim composer
+/// paste), not captured — constraint 3 forbids a live copilot.
+const FIX_BOX_GUTTER_MULTIROW: &str =
+    include_str!("fixtures/attention/copilot-framed-composer-multirow-paste.txt");
+/// The same, plus the scrollbar track on the RIGHT edge (`copilot-cli#4009` —
+/// `┃` serves as both composer border and scrollbar). `deframe` strips LEADING
+/// decoration only, so this stays unreadable by design: it is the shape the
+/// partial-match probe exists for.
+const FIX_BOX_GUTTER_SCROLLBAR: &str =
+    include_str!("fixtures/attention/copilot-framed-composer-scrollbar.txt");
+/// The exact text loomux pasted into the pane both fixtures show.
+const GUTTER_PASTE_TEXT: &str = "Review requested changes on PR #814.\n\
+     Read the findings on the PR itself and address every item.\n\
+     Push fixes to the same branch and report when ready for re-review.";
+
+#[test]
+fn h1_a_gutter_through_a_multirow_paste_does_not_read_as_gone() {
+    let tail = strip_ansi(FIX_BOX_GUTTER_MULTIROW.as_bytes());
+
+    // Preconditions, so this fails for the reason it claims: the gutter really
+    // is on every row of our paste, and the tail really is longer than the
+    // paste — which is what makes the length guard useless here.
+    assert_eq!(
+        tail.lines().filter(|l| l.contains('┃')).count(),
+        3,
+        "precondition: the gutter is on EVERY row of the paste, not just the first: {tail:?}"
+    );
+    assert!(
+        tail.split_whitespace().collect::<Vec<_>>().join(" ").len()
+            > GUTTER_PASTE_TEXT.split_whitespace().collect::<Vec<_>>().join(" ").len(),
+        "precondition: the decorated tail is LONGER than the paste, so the length guard \
+         cannot catch the miss — that is the whole shape of #821"
+    );
+
+    assert!(
+        box_holds_paste(&tail, GUTTER_PASTE_TEXT),
+        "our text is sitting in the box behind a per-row gutter — that is still holding"
+    );
+}
+
+#[test]
+fn h2_a_gutter_through_our_paste_never_licenses_a_retirement() {
+    // The consequence, at the decision #819 keyed on the reading. This is the
+    // test that says what the bug COSTS rather than that a helper is wrong.
+    let tail = strip_ansi(FIX_BOX_GUTTER_MULTIROW.as_bytes());
+    let reading = box_reading(Some(&tail), GUTTER_PASTE_TEXT);
+    assert_eq!(reading, BoxReading::Holds, "the box holds our text; say so");
+
+    let action = stranded_marker_action(
+        Some(false),
+        Some(reading),
+        false,
+        HumanInputBlock::None,
+        false,
+        || false,
+    );
+    assert!(
+        !matches!(action, StrandedMarkerAction::Retire(_)),
+        "retiring here strands our own text forever AND lets the next delivery paste on top \
+         of it — the #81/#84/#111 collision #819's licence exists to prevent: got {action:?}"
+    );
+}
+
+#[test]
+fn h3_decoration_we_cannot_account_for_reads_unverifiable_rather_than_absent() {
+    // The arm that makes this robust to decoration nobody has catalogued.
+    // `deframe` removes LEADING decoration, so a trailing scrollbar `┃` still
+    // defeats containment — and it must not therefore read as absence.
+    let tail = strip_ansi(FIX_BOX_GUTTER_SCROLLBAR.as_bytes());
+    assert!(
+        !box_holds_paste(&tail, GUTTER_PASTE_TEXT),
+        "precondition: trailing decoration is genuinely NOT handled by de-framing — this test \
+         is about the fallback, and would prove nothing if containment already succeeded"
+    );
+    assert_eq!(
+        box_reading(Some(&tail), GUTTER_PASTE_TEXT),
+        BoxReading::Unverifiable,
+        "our paste's own line is still visibly on screen: we looked and could not tell, which \
+         is not the same as it being gone"
+    );
+    let action = stranded_marker_action(
+        Some(false),
+        Some(BoxReading::Unverifiable),
+        true,
+        HumanInputBlock::Blocked,
+        false,
+        || false,
+    );
+    assert!(
+        !matches!(action, StrandedMarkerAction::Retire(_)),
+        "#819 already treats Unverifiable as no evidence — that is what makes this arm safe"
+    );
+}
+
+#[test]
+fn h4_a_genuinely_consumed_box_still_reads_as_gone_and_still_retires() {
+    // The floor, and the cost of getting the probe wrong. `Unverifiable` falls
+    // through to the ordinary gates, so a probe that fired on everything would
+    // erode #813/#819's repair back toward the deadlock it exists to break.
+    // Long enough to clear the length guard on its own, or this would pass as
+    // `Unverifiable` for a reason that has nothing to do with the probe.
+    let consumed = "● Reading src-tauri/src/orchestration/mod.rs to find the delivery gate.\n\
+         ● The queue drainer re-reads write_admission every poll, so the hold lives there\n\
+           rather than inside deliver_now's own capped waits.\n\
+         ● Working on it.\n\n\
+         ┃                                                                  ┃\n\
+         \x20 @ files · # issues";
+    assert!(
+        consumed.split_whitespace().collect::<Vec<_>>().join(" ").len()
+            > GUTTER_PASTE_TEXT.split_whitespace().collect::<Vec<_>>().join(" ").len(),
+        "precondition: the tail clears the length guard, so `NotHolding` below is the probe's \
+         verdict and not the length test's"
+    );
+    assert_eq!(
+        box_reading(Some(consumed), GUTTER_PASTE_TEXT),
+        BoxReading::NotHolding,
+        "no fragment of our paste is on screen — this is a real absence and must stay one"
+    );
+    assert!(
+        matches!(
+            stranded_marker_action(
+                Some(false), Some(BoxReading::NotHolding), false,
+                HumanInputBlock::None, false, || false,
+            ),
+            StrandedMarkerAction::Retire(StrandedRetireReason::TextGone)
+        ),
+        "and #819's repair still fires"
+    );
+
+    // A paste with no line long enough to be evidence yields no probe at all,
+    // so it keeps the pre-#821 reading rather than a coincidence-prone one.
+    assert_eq!(
+        box_reading(Some("● idle\n┃ ok ┃\n  @ files"), "ok\nfine"),
+        BoxReading::NotHolding,
+        "short lines are not evidence; absence of a probe is not a licence to invent one"
+    );
+}
+
+/// Copilot's chevron composer in a NARROW pane (~35 columns — a four-way
+/// split, which is this product's premise), wrapping a brief line immediately
+/// before a mid-line `|`. Reconstructed from #820's cited shapes, not captured.
+const FIX_BOX_NARROW_PIPE_WRAP: &str =
+    include_str!("fixtures/attention/copilot-narrow-pane-pipe-wrap.txt");
+/// The line that fixture's composer is holding. The `|` is MID-line here and
+/// row-LEADING there, which is the whole mechanism.
+const NARROW_PIPE_PASTE_TEXT: &str = "Check the queue depth with ps aux | grep loomux and report it";
+
+#[test]
+fn h6_de_framing_never_costs_a_match_the_flat_comparison_would_have_found() {
+    // rev-306 B1. De-framing is a strict IMPROVEMENT or it is a regression;
+    // there is no third option, because the reading it feeds is one where a
+    // false `NotHolding` is the expensive error.
+    //
+    // A wrap that pushes a mid-line `|` (or `*`, `•`, `●`, `◆`, `│`, `┃`) to a
+    // row START strips it from the TAIL — `deframe` sees a row-leading frame
+    // char — while the NEEDLE keeps it, because there it is mid-line and
+    // `deframe` is leading-only. Containment then fails on text that is
+    // verbatim on screen. The length arm cannot fire (the tail is longer, as
+    // always here), and the probe carries the same `|` from the same line, so
+    // it fails for the same reason: `NotHolding`, where the pre-#821 flat
+    // comparison read `Holds`.
+    //
+    // A wrap boundary lands inside the probe's 48-character sample exactly when
+    // the composer is under 48 columns, so this needs no degenerate pane — a
+    // 25-47 column split is ordinary. An earlier residual bounded this at
+    // "sub-24-character lines", which governs only whether a probe is FORMED,
+    // never whether a formed probe MATCHES.
+    let tail = strip_ansi(FIX_BOX_NARROW_PIPE_WRAP.as_bytes());
+
+    // Preconditions — the geometry this depends on, asserted rather than
+    // assumed, since a fixture that drifts would pass for the wrong reason.
+    let widest = tail.lines().map(|l| l.chars().count()).max().unwrap_or(0);
+    assert!(
+        (25..=47).contains(&widest),
+        "precondition: an ORDINARY narrow pane, not a degenerate one — that is the whole \
+         disagreement about reach: {widest} columns"
+    );
+    assert!(
+        tail.lines().any(|l| l.trim_start().starts_with('|')),
+        "precondition: a wrapped row LEADS with the pipe, which is what `deframe` strips: {tail:?}"
+    );
+    assert!(
+        NARROW_PIPE_PASTE_TEXT.contains(" | "),
+        "precondition: and the same pipe is MID-line in our own text, where `deframe` keeps it"
+    );
+
+    assert!(
+        box_holds_paste(&tail, NARROW_PIPE_PASTE_TEXT),
+        "the text is verbatim on screen and the pre-#821 comparison found it — de-framing must \
+         never LOSE a match, only add one"
+    );
+    assert_eq!(box_reading(Some(&tail), NARROW_PIPE_PASTE_TEXT), BoxReading::Holds);
+
+    // The consequence, at the decision that spends the reading — the same shape
+    // as `h2`, because this is the same harm arriving by a different route.
+    let action = stranded_marker_action(
+        Some(false),
+        Some(box_reading(Some(&tail), NARROW_PIPE_PASTE_TEXT)),
+        false,
+        HumanInputBlock::None,
+        false,
+        || false,
+    );
+    assert!(
+        !matches!(action, StrandedMarkerAction::Retire(_)),
+        "a regression into `NotHolding` retires the marker over our own un-submitted text — the \
+         #81/#84/#111 collision this change exists to close: got {action:?}"
+    );
+}
+
+/// A frame-heavy paste: every line is a markdown table row, so `deframe`
+/// strips a leading `|` from each and the de-framed needle is materially
+/// shorter than the flat one (192 vs 204 characters normalized — a 12-char
+/// gap, two per line).
+const FRAME_HEAVY_PASTE: &str = "| record | rev-306 | re-record the verdict on the final head |\n\
+     | step | owner | notes |\n\
+     | rebase | w-300 | onto main |\n\
+     | verify | rev-306 | matrix |\n\
+     | merge | human | gated |\n\
+     | sweep | w-300 | disjuncts |";
+
+#[test]
+fn h7_a_short_read_is_unverifiable_on_either_routes_arithmetic() {
+    // rev-307. Once `box_holds_paste` became a disjunction, every arm BELOW it
+    // had to be asked of both routes too — and the length arm was still asking
+    // one. De-framing shrinks a frame-heavy needle (a markdown table: 204 flat,
+    // 192 de-framed) more than it shrinks an un-gutted tail, so a truncated read
+    // whose length falls in that 12-character gap is:
+    //
+    //   * too short for the FLAT needle      -> pre-#821 said `Unverifiable`
+    //   * long enough for the DE-FRAMED one  -> the de-framed arm stays silent
+    //
+    // and the probe cannot rescue it, because truncating from the FRONT removes
+    // the longest line the probe is sampled from. `NotHolding` — our text may
+    // well be in that box, and we have just told `stranded_marker_action` it is
+    // not. Same direction as the containment defect, narrower trigger (it needs
+    // a short read as well), same class.
+    let screen = format!("● Ready.\n{FRAME_HEAVY_PASTE}\n  @ files · # issues");
+    let flat = screen.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Truncate from the FRONT — a real short read keeps the tail END.
+    let tail: String = flat.chars().skip(flat.chars().count() - 197).collect();
+
+    // Preconditions: the shape this depends on, so a drifting fixture fails
+    // loudly rather than passing for an unrelated reason.
+    assert!(
+        FRAME_HEAVY_PASTE.lines().all(|l| l.trim_start().starts_with('|')),
+        "precondition: FRAME-heavy — every line leads with a character `deframe` strips, which \
+         is what opens the gap between the two normalized needle lengths"
+    );
+    assert!(
+        !box_holds_paste(&tail, FRAME_HEAVY_PASTE),
+        "precondition: neither containment route finds it, so the reading is decided by the \
+         arms below — this test is about those, not about containment"
+    );
+    let flat_needle = FRAME_HEAVY_PASTE.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        tail.chars().count() < flat_needle.chars().count(),
+        "precondition: a genuinely SHORT read — the flat arithmetic says we could not have seen \
+         the whole paste, which is exactly what `Unverifiable` means"
+    );
+
+    assert_eq!(
+        box_reading(Some(&tail), FRAME_HEAVY_PASTE),
+        BoxReading::Unverifiable,
+        "a read too short for either route's needle is one we could not take — `NotHolding` here \
+         is a confident absence asserted from a partial view"
+    );
+
+    // The consequence, at the decision that spends it — the third time this
+    // same harm arrives by a new route (`h2` gutter, `h6` wrap, `h7` short read).
+    let action = stranded_marker_action(
+        Some(false),
+        Some(box_reading(Some(&tail), FRAME_HEAVY_PASTE)),
+        false,
+        HumanInputBlock::None,
+        false,
+        || false,
+    );
+    assert!(
+        !matches!(action, StrandedMarkerAction::Retire(_)),
+        "#819 retires only on a POSITIVE `NotHolding`; a truncated read is not one: got {action:?}"
+    );
+}
+
+#[test]
+fn h5_a_markdown_bullet_in_a_brief_is_not_mistaken_for_box_framing() {
+    // The trap in de-framing only the TAIL. `is_frame_char` counts `*`, `•` and
+    // `|` as framing, so a brief carrying an ordinary bullet list or table
+    // would have those stripped from the tail and kept in the needle — every
+    // such paste would fail containment, clear the length guard (the tail being
+    // longer, exactly as in the gutter case) and read as a confident absence.
+    // That is the #821 failure re-introduced by the #821 fix, so it is pinned.
+    let bulleted = "Do these in order:\n\
+         * rebase onto main and re-read the findings\n\
+         * push the fix and wait for the full matrix\n\
+         | step | owner |";
+    let rendered = "● Ready.\n\
+         ┃ Do these in order:\n\
+         ┃ * rebase onto main and re-read the findings\n\
+         ┃ * push the fix and wait for the full matrix\n\
+         ┃ | step | owner |\n\
+         \x20 @ files · # issues";
+    assert!(
+        box_holds_paste(rendered, bulleted),
+        "a bullet is our own text, not the CLI's frame — and it is on both sides, so it cancels"
+    );
+    assert_eq!(box_reading(Some(rendered), bulleted), BoxReading::Holds);
+}
+
 #[test]
 fn confirm_state_for_maps_each_source_to_the_correct_three_state_outcome() {
     // Pinned directly: a mutation swapping any one of these arms is exactly
@@ -36719,6 +37047,18 @@ fn the_census_margin_is_the_same_cliff_the_reading_decides() {
     // disagree, a live distribution of `margin_chars` is a distribution of
     // something other than "how often Tier 1 could not verify", and the
     // measurement #583 is for would answer the wrong question convincingly.
+    //
+    // **#821 weakened this from an equivalence to an IMPLICATION, deliberately**
+    // (rev-305 B2). A negative margin still means the length arm fired; the
+    // reverse no longer holds, because #821 added a second `Unverifiable` arm —
+    // the partial-match probe — that fires on a tail LONGER than the paste and
+    // is therefore invisible to a margin. `margin_chars`' own doc says exactly
+    // that, and this assertion used to say the opposite in the same commit,
+    // passing only because none of the four fixtures below reach the new arm
+    // (a single-line all-ASCII paste leading with `[loomux]`, and a `truncated`
+    // case cut from the FRONT, which removes the very characters the probe
+    // samples). The counterexample is pinned below rather than left as the case
+    // that would break this, so the weakening is enforced instead of stated.
     let pasted = flush_paste(8 * 1024);
     let scan = tier1_scan_bytes(&pasted);
     let echoed = format!("  done\n\n> {pasted}\n");
@@ -36732,21 +37072,51 @@ fn the_census_margin_is_the_same_cliff_the_reading_decides() {
     ];
     for (name, tail) in cases {
         let census = Tier1ScanCensus::measure(scan, Some((tail.len(), &tail)), &pasted);
-        assert_eq!(
-            census.margin_chars().is_some_and(|m| m < 0),
-            box_reading(Some(&tail), &pasted) == BoxReading::Unverifiable,
-            "{name}: the recorded margin and the reading must decide the same cliff"
-        );
+        let reading = box_reading(Some(&tail), &pasted);
+        if census.margin_chars().is_some_and(|m| m < 0) {
+            assert_eq!(
+                reading,
+                BoxReading::Unverifiable,
+                "{name}: a negative margin IS the length arm — the number and the decision \
+                 must not disagree about the cliff the number describes"
+            );
+        }
     }
 
     // The one `Unverifiable` the margin cannot speak for, stated rather than
-    // left to the equivalence above: no read happened at all (pty gone), so
+    // left to the implication above: no read happened at all (pty gone), so
     // every measurement is null. That is the same distinction `tail_bytes`
     // carries between `None` and `Some(0)` — nothing measured is not zero.
     let blind = Tier1ScanCensus::measure(scan, None, &pasted);
     assert_eq!(box_reading(None, &pasted), BoxReading::Unverifiable);
     assert_eq!(blind.margin_chars(), None);
     assert_eq!(blind.retained_pct(), None);
+
+    // ...and the OTHER one, which is #821's and is the reason the assertion
+    // above is an implication rather than an equivalence. `h3`'s scrollbar
+    // fixture: the tail is comfortably longer than the paste, so the margin is
+    // positive and the length arm never fires — yet the reading is
+    // `Unverifiable`, because our own line is visibly on screen behind
+    // decoration `deframe` cannot reach. A margin histogram counts the length
+    // arm, not "how often Tier 1 could not verify", and pinning the gap here is
+    // what stops a future contributor reading this test's name and "fixing" a
+    // red by making the READING agree with the census.
+    let decorated = strip_ansi(FIX_BOX_GUTTER_SCROLLBAR.as_bytes());
+    let probed = Tier1ScanCensus::measure(
+        tier1_scan_bytes(GUTTER_PASTE_TEXT),
+        Some((decorated.len(), &decorated)),
+        GUTTER_PASTE_TEXT,
+    );
+    assert!(
+        probed.margin_chars().is_some_and(|m| m >= 0),
+        "precondition: this read had ample headroom — the length arm is not what fired: {:?}",
+        probed.margin_chars()
+    );
+    assert_eq!(
+        box_reading(Some(&decorated), GUTTER_PASTE_TEXT),
+        BoxReading::Unverifiable,
+        "the probe arm fires on a tail LONGER than the paste, so no margin can ever see it"
+    );
 }
 
 #[test]

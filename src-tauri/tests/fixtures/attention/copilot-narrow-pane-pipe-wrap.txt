@@ -1,0 +1,7 @@
+[36m●[0m Ready.
+
+───────────────────────────────────
+[38;5;153m❯[0m Check the queue depth with ps aux
+  | grep loomux and report it
+───────────────────────────────────
+  [2m@ files[0m

@@ -6801,6 +6801,178 @@ that changed and a bare detector call no longer covers the risk.
 - #727's placeholder residual is untouched. A placeholder is the CLI's text, not ours, so this
   change has nothing to say about it and the answer there is still a narrower signal.
 
+## #821: the same rendering, the other gate — and the failure direction inverts
+
+**Problem.** `box_holds_paste` normalized its tail with `normalize_prompt_text`, which flattens the
+whole string. Copilot's framed composer draws `┃ ` down **every** row it wrapped a paste onto, so
+the gutter lands *inside* the haystack, interleaved through the needle: the tail normalizes to
+`"┃ line one ┃ line two"` against a paste of `"line one line two"`, and containment fails on text
+that is plainly still in the box. Same rendering family as #820, one gate over.
+
+**Why it was worse than a wrong answer.** The only thing between a failed containment and a
+confident `NotHolding` was a length test:
+
+```rust
+if !norm_pasted.is_empty() && normalize_prompt_text(tail).len() < norm_pasted.len() {
+    return BoxReading::Unverifiable;
+}
+BoxReading::NotHolding
+```
+
+Decoration **adds** characters, so a tail whose gutters defeated the containment is always *longer*
+than the paste it failed to contain. The one safety net is bypassed by the very thing that caused
+the miss. A second-order version of the same arithmetic: `box_holds_paste`'s window is
+`norm_pasted.len() + BOX_TAIL_WINDOW_SLACK` from the tail end and `Tier1Scan::for_paste` sizes the
+read to match, so a paste wrapping past ~100 rows pushes its own start outside the window before
+containment even runs. De-framing fixes that too, where widening the slack would not.
+
+**What it costs, post-#819.** #819's licence is explicit that it rests on this reading being true
+when it says so — *"Nothing retires on an absence of evidence — the one direction that could
+re-open either hazard."* A false `NotHolding` is not an absence of evidence; it is **counterfeit
+evidence of an absence**, the one input that argument does not defend against.
+`stranded_marker_action` retires on it directly, so the marker retires while our text is still in
+the box: the Enter that would have submitted it is never pressed (the strand #813/#819 exist to
+repair becomes permanent), the next queue entry pastes on top of it and submits both merged — the
+#81/#84/#111 collision #819's own doc names as the hazard this licence closes — and the audit
+records `TextGone` for a pane whose text is demonstrably still there. The rule is right; its input
+was not trustworthy on copilot's rendering.
+
+**The failure direction inverts, and that changes the fix.** In #820 the gate was the question
+detector, where under-masking is safe and over-masking releases an Enter into a live dialog. Here
+it is the reverse: a false `Holds`/`Unverifiable` costs a retry (#819 already trades an
+unconditional deadlock for a conditional one), while a false `NotHolding` costs the collision
+above. **`NotHolding` is the reading that must be earned.** So the fix is two coupled parts.
+
+**1. `normalize_deframed`, on BOTH sides.** `normalize_prompt_text` with each line `deframe`d
+first — #820's `deframe`, shared, not a second notion of what decoration is.
+
+Applying it to the tail alone is the tempting version and it is *worse than the bug*.
+`is_frame_char` counts `*`, `•`, `●`, `◆` and `|` as framing, so a brief carrying an ordinary
+markdown bullet list or table would have those stripped from the tail and kept in the needle. Every
+such paste — and orchestrator briefs are full of them — would fail containment, clear the length
+guard for exactly the gutter reason, and read as a confident `NotHolding`: this defect
+re-introduced by its own fix, on a far more common shape. De-framing both sides cancels it, since
+the two lose the same characters and only specificity is spent. The read-SIZING sites
+(`tier1_scan_bytes`, `Tier1Scan::for_paste`) keep `normalize_prompt_text` deliberately — they size
+a request rather than compare, so an un-de-framed needle only ever asks for more tail, which is
+conservative and preserves #559's "no read is ever narrower than it was".
+
+**1b. And the de-framed route is ADDED to the flat one, never substituted for it.**
+`box_holds_paste` runs both normalizations and holds if either matches. That is the property the
+whole change rests on — **#821 can only ever add `Holds` readings** — and it is structural rather
+than argued, which matters because the argued version was wrong twice before it was right (see the
+residuals). It also costs almost nothing: the second route runs only on the path that was already
+about to answer "not holding".
+
+**2. `paste_echo_probe` — a partial match is never an absence.** De-framing handles the decoration
+we know about; the probe covers the decoration we do not, *without modelling any of it*. If the
+longest line of our paste is still in the window but the whole will not match, the text is
+evidently there and the rendering is what we failed to read — `Unverifiable`, which #819 already
+treats as no evidence at all. That is what makes this robust to a trailing gutter, the scrollbar's
+own `┃` on the right edge ([copilot-cli#4009](https://github.com/github/copilot-cli/issues/4009)),
+a re-indent, or whatever the next TUI release paints.
+
+The probe is taken from **one line**, and that is not an implementation detail. The obvious probe —
+"the first N characters of the needle" — spans a row boundary as soon as N passes the first line,
+so it dies to the same decoration it exists to detect; a backstop that fails the way the thing it
+backstops fails is not one. The longest line, because more of our own prose is stronger evidence;
+truncated to `PASTE_ECHO_PROBE_CHARS` (48) so a wrapping line probes only its first row; floored at
+`PASTE_ECHO_PROBE_MIN_CHARS` (24, the `R_TOP_MIN_ANCHOR_CHARS` figure and argument) so a paste of
+short lines yields no probe rather than a coincidence-prone one.
+
+**Why not `reconstructs_to_end`.** #820 built it, and it is the wrong instrument here.
+Reconstruction verifies row *structure* rather than a character sequence — strictly more precise,
+strictly more brittle, since any decoration it cannot account for ends the run. In #820 that
+brittleness was free: a failed reconstruction under-masks, and an under-mask costs a hold. Here it
+would manufacture the confident negative this change exists to remove. **The shared thing is the
+definition of decoration (`deframe`), not the instrument built on it** — which is the general
+lesson, since the two gates read the same screens through the same CLI rendering and will keep
+being tempted toward one recogniser.
+
+**Measurement moved with the comparison — all of it.** `Tier1Scan::read`'s widening and BOTH of
+`Tier1ScanCensus::measure`'s terms now normalize the same way. The first cut moved `tail_chars`
+alone and left `paste_chars` on `normalize_prompt_text` one line below (rev-305 B1), which
+differenced two normalizations: `margin_chars` is a difference, so it is meaningful only while its
+two terms measure the same kind of string, and the gap was exactly the framing characters a brief's
+own markdown bullets and table rows carry — the `h5` shape, so the bias was systematic,
+one-directional, and pointed at over-reporting the very arm the number is read to count. The
+read-SIZING sites keep `normalize_prompt_text` deliberately, and the distinction is the whole
+lesson: **sizing a request may be conservative, measuring a comparison may not.**
+
+`margin_chars` also now states plainly that #821 added a second `Unverifiable` arm it cannot see —
+a read with ample margin can still be unreadable, because the partial-match arm fires on a tail
+that is *longer* than the paste — and the census test asserts the surviving **implication**
+(negative margin ⇒ `Unverifiable`) with `h3`'s fixture pinned as the counterexample, rather than
+the equivalence it used to claim. A doc admission and a test asserting its negation in the same
+commit is how the next contributor gets told to "fix" the reading to match the census.
+
+**Tests.** `h1`–`h5` in `tests/orchestration.rs` over two fixtures in the #820 copilot-decorated
+family (reconstructed from cited sources, not captured — constraint 3). `h1` is the containment,
+with the "tail is longer than the paste" arithmetic asserted as a precondition so it cannot pass
+for the wrong reason; `h2` is the *consequence* at `stranded_marker_action`, which is what the bug
+actually costs; `h3` is the probe arm, over a fixture whose trailing scrollbar `┃` de-framing
+genuinely cannot reach; `h4` is the floor in the expensive direction — a genuinely consumed box
+still reads gone and still retires, so the fix cannot buy safety by eroding #813/#819's repair;
+`h5` pins the markdown-bullet trap above. #819's retirement matrix and #820's `g1`–`g6` are the
+rest of the floor, the latter because `deframe` is now shared across both gates.
+
+**Residuals.**
+
+- The probe can fail, and it is narrower than "a pane under ~48 columns breaks it" (rev-305 Ground
+  4 corrected an earlier, more pessimistic wording). The probe is matched against
+  `normalize_deframed` of the tail — every row already leading-de-framed and the whole thing
+  flattened to single-space-joined words — so spanning a *word-wrapped* boundary is fine, which is
+  the entire known copilot shape. It fails only where its span crosses a boundary carrying
+  decoration `deframe` cannot reach (a trailing scrollbar `┃`) or a HARD mid-word wrap, which
+  splits one word into two tokens and inserts a space the needle lacks. A narrow pane raises the
+  odds of crossing a boundary; it is not itself the breaker.
+
+  **Why that is still not a regression, on the argument that survives (rev-306 F1).** An earlier
+  wording justified this with "containment is wrap-agnostic", and that clause does not survive the
+  second cause: a hard mid-word wrap defeats *containment* too, not merely the probe. The
+  conclusion stands on a different footing — that case is **unchanged by #821 rather than
+  introduced by it**. `normalize_prompt_text` flattened the break into a space the needle lacked in
+  exactly the same way, so a hard mid-word wrap read `NotHolding` before this change and reads
+  `NotHolding` after it. What #821 moves is elsewhere, and both moves are away from the dangerous
+  reading: de-framing turns the gutter case from `NotHolding` into `Holds`, and the probe turns
+  residual failures into `Unverifiable`. Sizing the probe from real terminal geometry would buy
+  nothing here and would couple this to a width the comparison deliberately does not know.
+
+  **And the superset property is now structural rather than argued** (rev-306 B1). An earlier
+  version of this note disclosed a corner where de-framing could *lose* a match the flat comparison
+  had found — a wrap pushing a mid-line `|`/`*` to a row start, so `deframe` strips it from the
+  tail (row-leading) while the needle keeps it (mid-line) — and bounded it at "a pane narrow enough
+  to wrap a sub-24-character line, degenerate for a GUI pane". **That bound was wrong.** It came
+  from the case where no probe is FORMED, and says nothing about whether a formed probe MATCHES:
+  the probe samples that same needle line, so it carries the same `|` and fails for the same
+  reason. A wrap boundary lands inside its 48-character sample exactly when the composer is under
+  48 columns — a 25-47 column four-way split, which is this product's premise, not a degenerate
+  case. `ps aux | grep loomux` wrapped before the pipe read `NotHolding` where the flat comparison
+  read `Holds`: a new route to the reading this whole change exists to make expensive.
+
+  `box_holds_paste` therefore tries **both** normalizations and holds if either matches, so #821
+  can only ever ADD `Holds` readings. That is a property of the construction rather than of a case
+  analysis, which matters because the case analysis had already been wrong twice. A narrower
+  `deframe` (box-drawing glyphs only, sparing `*` and `|`) would dodge both known shapes, would
+  still be a case analysis, and would mint the second notion of decoration that sharing `deframe`
+  exists to avoid. The three fixtures now exercise different routes — `h1`'s gutter matches only
+  de-framed, `h6`'s pipe wrap only flat, `h3`'s scrollbar neither — which is what keeps both from
+  being redundant.
+
+  **The probe is not what guarantees this and never could be**: it shares the failure mode of the
+  containment it backstops. Its job is the narrower one of turning a residual containment failure
+  into `Unverifiable` rather than a confident absence.
+- A wrap landing such that a continuation row *starts* with a character `deframe` strips (the `|`
+  in `ps aux | grep`, mid-line in our own text) de-frames on the tail side but not the needle side,
+  so the de-framed route fails. **An earlier version of this bullet said the probe catches it as
+  `Unverifiable`. It does not** — the probe samples that same needle line and carries the same
+  character, so it fails identically; that claim was the reasoning error behind the wrong bound
+  above. The flat route is what catches it, and catches it as `Holds`, which is also what the
+  pre-#821 code answered. `h6` pins it.
+- The premise remains sourced from copilot-cli issue evidence rather than a live capture
+  (constraint 3). The fix does not depend on which composer a pane gets: it is about *any* per-row
+  decoration, not about `┃`.
+
 ## Delivery queue (#445)
 
 **Problem.** `deliver_prompt` has three hold-cap seams — pre-paste box-occupied (#111,
