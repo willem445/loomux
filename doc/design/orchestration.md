@@ -11354,9 +11354,9 @@ could never have been clicked, and refusing to accept a group as a path segment 
 
 ### Not in this slice
 
-The automatic releases for the three evidence-bearing classes are M2, immediately below.
-`QueueFull`'s drain-edge re-admission is plan-312's M3, and #825 stays open for it. This
-slice adds no automatic release of any kind.
+The automatic releases for the three evidence-bearing classes are M2, immediately below;
+`QueueFull`'s re-admission is M3, below that. This slice adds no automatic release of any
+kind.
 
 ## The badge honesty check outlives the monitor that made it (#825, M2)
 
@@ -11480,6 +11480,89 @@ drainer's own #819 retirement also writes, so a `stranded-janitor` line (blocker
 `human_since_submit`) goes ahead of the clear: without it a human whose chip vanished could
 not tell which mechanism took it down, nor what it read to decide. Only on an actual clear —
 never per pass.
+
+## The refused re-send is retried, not reasoned about (#825, M3)
+
+`QueueFull` is the last of the five, and the only one whose badge is not a claim about *where
+our text is*. It says loomux could not even **queue** the re-send `actuate_stranded` had
+already decided to make, because the pane was at `queue::QUEUE_MAX_PER_PANE`. M2's matrix
+therefore has nothing to say about it: no reading of that box answers "was the marker
+admitted". The honest answer is to admit it once there is room.
+
+So M3 clears nothing. A successful re-admission **re-words** the chip to the in-flight heal
+wording (`None`) and hands the pane back to the machinery that owns every other marker — the
+marker's own gates at the press (#819/#824), a confirmed delivery's clear in `deliver_now`,
+#819's retirement reasons. It mints no `stranded-cleared` reason of its own because it takes
+no chip down; the one line it writes is `stranded-readmit`, which is what explains the wording
+change to whoever greps for it.
+
+This is a **repair** gap as much as a badge gap, and the repair half is the larger one. Before
+it, the Enter loomux had decided to press and could not queue was never pressed at all, however
+much room opened afterwards, on any pane whose late monitor had exited.
+
+### Why it is not a hook on the drain edge
+
+plan-312 put M3 at `note_queue_capacity`'s `Full` → not-`Full` transition, beside
+`announce_refusal_roster` (#658). That hook could never have admitted anything, and the reason
+is a runtime fact a read-only plan could not see: every production caller able to produce that
+edge — `pop_front_dequeued`, `pop_batch_dequeued`, `drop_superseded` — runs on the drainer
+thread, which holds its `queue_draining` registration from `ensure_drainer` right through to
+`commit_exit`. `stranded_admission_gate` answers `drainer-active` there, every time. (The one
+other caller, `drop_queue`, is destroying the pane's queue.)
+
+It is also the wrong moment on the merits, which is what makes this a relocation rather than a
+workaround. `stranded_admission_gate`'s own doc already says what a live drainer means: a
+delivery is queued for this pane, and *that* delivery's pre-paste `flush_stranded_text` presses
+exactly the Enter this marker wants pressed. The moment nothing else will press it is the
+moment the queue has gone quiet and the drainer has exited — which is also the only moment the
+marker can be admitted at all. The retry therefore observes the pane **after** the drain
+instead of during it: the same hoist M2 performed out of the late monitor's lifetime, pointed
+at the drainer's.
+
+`the_drain_edge_itself_could_never_have_admitted_the_refused_re_send` pins this rather than
+leaving it as prose. It drives the real edge — a real cap, a real refusal, a real
+`pop_front_dequeued` — with the registration a real drainer holds, then releases it: same pane,
+same queue, same chip, and only then does the marker go in.
+
+*Rejected: teaching the gate that the drainer may admit its own marker between a
+`pop_front_dequeued` and its next peek.* It is true that the drainer owns no entry at that
+instant, and it re-opens #496 PR-C rev-47 B1 by construction — replacing a fused check-and-push
+with a parameter every future caller of `note_queue_capacity` would have to get right — to buy
+a repair that the very next queued delivery's pre-paste flush already performs.
+
+### The gate, and what it costs
+
+`queuefull_readmit_gate(blocker, depth, drainer_active)` is pure and total: `not-queue-full`
+(every other chip is somebody else's release), `still-full` (the chip is still true), and
+`drainer-active`, named with `stranded_admission_gate`'s own word so the pre-check and the check
+under the lock cannot drift into two vocabularies. It is only a pre-check — the real one is
+still the fused check-and-push inside `admit_stranded_selfheal` — and it exists so a declined
+pass is *silent* rather than writing a refusal line every 30s. Its depth test mirrors
+`push_stranded_front_locked`'s own `>=` rather than `queue::capacity_state`'s badge
+classification, because it has to ask the question the push will ask.
+
+The pass rides the divided attention tick M2 established, and is cheaper than the janitor by a
+wide margin: no pty read at any point. One uncontended `attn_stranded` lock on a healthy
+session, two map reads per badged pane, one `queues` critical section for the pane that passes.
+It is self-limiting in the same sense — a successful re-admission re-words the chip off
+`QueueFull`, so the work ends the condition that schedules it. The bound is stated at
+`start_attention` beside M2's.
+
+Two orderings are load-bearing and are commented where they are relied on. The re-word happens
+**after** the admission: `admit_stranded_selfheal` calls `note_queue_capacity`, which treats a
+chip whose blocker is `None` as nobody's badge and would stamp a depth badge over the in-flight
+wording — `actuate_stranded` orders it the same way for the same reason. And the write goes
+through `reword_stranded`, so a chip dismissed in the gap stays dismissed; the marker is still
+the right thing to have queued, because a dismissal takes down a warning rather than
+un-stranding a prompt.
+
+### What it never does
+
+It never presses Enter, and it never decides that pressing one is safe. It queues the marker
+`actuate_stranded` had already decided on; every gate that governs the press is re-derived at
+the press by `drain_stranded_submit`, against the pane as it is then. Nothing is released on
+inference, and nothing about *when* loomux presses Enter changes — which is what keeps the whole
+of #825 outside #813's blast radius.
 
 ## Risks / limitations
 
