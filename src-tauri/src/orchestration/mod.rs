@@ -9082,9 +9082,12 @@ pub struct OrchRegistry {
     /// A drain-on-read map rather than a field on [`AgentEntry`] because this is
     /// news about a *spawn*, not state of an *agent*: it is true exactly once,
     /// at the moment the orchestrator can still act on it, and nothing later
-    /// re-reads it. Taking it also means the map cannot grow without bound
-    /// across a long-lived group. Same shape as `record_verdict`'s `warnings`
-    /// return, which the `review_verdict` reply already appends as `NOTE:`.
+    /// re-reads it. Same shape as `record_verdict`'s `warnings` return, which
+    /// the `review_verdict` reply already appends as `NOTE:`.
+    ///
+    /// A spawn that never goes through the MCP tool has no reader, so taking it
+    /// is not by itself a bound — the insert site prunes ids that are no longer
+    /// live agents instead.
     spawn_notices: Mutex<HashMap<String, Vec<String>>>,
     port: AtomicU16,
     /// Agent-id counter: `w-3`, `rev-8`, `solo-2`, `orch-1` all mint their
@@ -33112,17 +33115,6 @@ impl OrchRegistry {
         let instructions_body = self.render_block_instructions(&group, &block, persona.as_ref(), &vars);
         let contract = block_contract_text(&instructions_body, persona.as_ref());
         let inject = self.persona_inject(group_id, &block, &cli, persona.as_ref(), &contract);
-        // #802: anything `persona_inject` had to say about this block's persona
-        // goes back to whoever asked for the spawn, not only to the audit log.
-        // Stashed here (rather than returned) because `spawn_agent_ex`'s return
-        // value is the agent record every caller already expects — see
-        // `spawn_notices`.
-        if !inject.warnings.is_empty() {
-            self.spawn_notices
-                .lock_safe()
-                .insert(agent_id.clone(), inject.warnings.clone());
-        }
-
         // #267: `role.containment()` rides in because a gemini agent's deny
         // rules ARE its config file (the policy engine is the only surface
         // that can name a built-in tool), unlike claude/copilot where they are
@@ -33274,6 +33266,29 @@ impl OrchRegistry {
         }
         self.by_token.lock_safe().insert(token, agent_id.clone());
         self.persist_agent_record(&entry, "running");
+        // #802: anything `persona_inject` had to say about this block's persona
+        // goes back to whoever asked for the spawn, not only to the audit log.
+        // Stashed (rather than returned) because `spawn_agent_ex`'s return value
+        // is the agent record every caller already expects — see
+        // `spawn_notices`.
+        //
+        // Deliberately AFTER the agent is registered, not next to
+        // `persona_inject` where the warnings are produced: every early `return
+        // Err` between the two (the race-free live-agent cap re-check is the
+        // real one) would otherwise leave a notice keyed to an agent id that
+        // never came to exist, and nothing would ever take it. Pruning
+        // already-gone ids on the way in bounds it the rest of the way, for the
+        // spawn paths that don't go through the MCP tool and so never read it.
+        if !inject.warnings.is_empty() {
+            // The live set is snapshotted and the `agents` lock RELEASED before
+            // `spawn_notices` is taken: no site anywhere takes these two in the
+            // other order today, and not nesting them is what keeps that a
+            // property of the code rather than of a reader's memory.
+            let live: Vec<String> = self.agents.lock_safe().keys().cloned().collect();
+            let mut notices = self.spawn_notices.lock_safe();
+            notices.retain(|id, _| live.iter().any(|l| l == id));
+            notices.insert(agent_id.clone(), inject.warnings.clone());
+        }
         self.audit(group_id, "loomux", "agent-spawn", json!({
             "agent": agent_id, "role": role, "name": display, "cwd": cwd,
             "cli": cli, "model": model, "worktree": use_worktree, "branch": branch_name, "task": task,
