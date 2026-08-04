@@ -18182,16 +18182,20 @@ pub fn stranded_paste_guard(
     // ledger carries none to look for.
     text_reading: Option<BoxReading>,
 ) -> StrandedPasteGuard {
-    // ⚠ TEMPORARY — #824 RED EVIDENCE (A of two), reverted before ready.
-    // The PRE-#824 behaviour: deliver_now ignored the declined flush entirely
-    // and always went on to paste. Written against the final signature so the
-    // new tests fail on their ASSERTIONS, not on a compile error.
+    // ⚠ TEMPORARY — #824 RED EVIDENCE (B of two), reverted by the next commit.
+    // The maximally OVER-ABORTING version: abort on a `Holds` reading OR on any
+    // declined flush, ignoring `flushed` and ignoring the ledger.
     //
-    // This run cannot red the guards that say the abort must NOT fire
-    // (`flushed` first, ledger check, Unverifiable/NotHolding) — pre-#824 never
-    // aborted at all, so they pass vacuously. Run B is the over-aborting
-    // neuter that reds those.
-    let _ = (prev_confirmed, flushed, text_reading);
+    // Run A neutered to the pre-#824 fall-through, which never aborted, so the
+    // three guards that say the abort must NOT fire passed there vacuously.
+    // This is the shape they exist against, and it is not a strawman: "abort
+    // whenever the flush declined" is the naive reading of the issue title, and
+    // on a hot path it converts a rare merge into routine stalls.
+    if text_reading == Some(BoxReading::Holds)
+        || (!flushed && matches!(prev_confirmed, Some(false)))
+    {
+        return StrandedPasteGuard::AbortStranded;
+    }
     StrandedPasteGuard::Paste
 }
 
