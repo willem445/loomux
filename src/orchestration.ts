@@ -150,6 +150,18 @@ export interface DeliveryHeldEvent {
 export const ackAttention = (agentId: string): Promise<void> =>
   invoke("orch_ack_attention", { agentId });
 
+/** The human explicitly dismissed a pane's "⚠ stuck prompt" chip (#825 M1): the
+ *  deliberate gesture that releases a LATCHED stranded badge, valid for every
+ *  blocker class — including the ones no reading of the pane can ever release.
+ *
+ *  Deliberately not `ackAttention`, which the frontend fires on pane focus: that
+ *  gesture is ambiguous (the human focuses a pane to type in it), and a chip
+ *  that may be the only trace of an unsubmitted prompt must not come down on an
+ *  ambiguous signal. Takes the CHIP down and nothing else — no hold is
+ *  released, no Enter is pressed. Resolves to whether a badge was actually up. */
+export const dismissStranded = (agentId: string): Promise<boolean> =>
+  invoke<boolean>("orch_dismiss_stranded", { agentId });
+
 /** Whether desktop notifications are enabled for a group. */
 export const notifyEnabled = (groupId: string): Promise<boolean> =>
   invoke<boolean>("orch_notify_enabled", { groupId });

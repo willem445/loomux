@@ -512,6 +512,19 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .pane-attn[data-reason="stranded"] {
   color: #ff9db0; background: rgba(247, 118, 142, 0.16); border-color: rgba(247, 118, 142, 0.4);
 }
+/* The explicit dismiss beside a latched `stranded` chip (#825 M1). Tinted to
+   match that chip and sized to sit against it, so the pair reads as one
+   control with an X on the end — the gesture has to be obvious and one click,
+   which is the whole complaint it answers. It does NOT pulse: the alert is what
+   asks for attention; the way to get rid of it should not also be flashing. */
+.pane-attn-dismiss {
+  flex: none; cursor: pointer;
+  font-size: 9px; font-weight: 700; line-height: 1;
+  border: 1px solid rgba(247, 118, 142, 0.4); border-radius: 4px;
+  padding: 2.5px 5px; margin-left: -3px;
+  color: #ff9db0; background: rgba(247, 118, 142, 0.16);
+}
+.pane-attn-dismiss:hover { background: rgba(247, 118, 142, 0.3); color: #ffc2ce; }
 .pane.needs-attention .pane-header {
   box-shadow: inset 3px 0 0 var(--group-color, var(--accent)), inset 0 -2px 0 #e0af68;
 }

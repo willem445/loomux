@@ -11278,6 +11278,86 @@ clear there is now restricted to `HoldObservation::Delivered`: a delivery is the
 proved nothing (that is the whole reason `Retired` is not `Delivered`). Ending the episode
 and clearing the badge were one decision because until #813 only one observation did both.
 
+## An explicit dismiss is a release the pane cannot supply (#825, M1)
+
+`attn_stranded` is a **latched** map, and that is deliberate: a chip that goes down while a
+pane is still wedged is worse than one that overstays. But line the `StrandedBlocker`
+variants up against everything that clears one and five of them — `NotHolding`,
+`Unverifiable`, `Exhausted`, `QueueFull`, `PauseSuppressed` — have no release at all except
+a *later confirmed delivery to the same pane*. On a pane that goes idle there may never be
+another delivery, so a finished worker can wear a stuck-prompt chip indefinitely. The
+gesture a human would reach for does not help either: `orch_ack_attention` clears
+`attn_reports`, not `attn_stranded`.
+
+That is not a cosmetic complaint. A badge nobody can take down is a badge people learn to
+ignore, and the classes above include the ones that matter most when they are real.
+
+### The gesture is the evidence
+
+`dismiss_stranded` releases the chip on the one signal that is neither an inference nor a
+timer: the reader the badge exists for, saying "seen", with a gesture aimed at the chip
+itself. Nothing about the pane is being claimed, so nothing can be claimed wrongly — which
+is why this one release is valid for **every** class, including the two that bracket the
+problem:
+
+- `PauseSuppressed` describes a loss that already happened. It cannot become untrue, so no
+  reading of the pane could ever release it.
+- `Unverifiable` describes a box loomux could not read. Precisely because of that, no
+  reading of the pane is trusted *to*.
+
+Between them they rule out every automatic release, and the human is what is left.
+
+### What it settles, and what it deliberately leaves alone
+
+A dismissal changes exactly one thing: whether a warning is on screen. No hold is released,
+no queue entry admitted, no Enter pressed — this is the safety line, because it keeps the
+whole of #825 outside #813's blast radius. The chip's own tooltip carries the same two
+claims ("takes the chip down only, it does not unstick the pane"), since a human allowed to
+retire a warning on their own say-so is owed both halves; "dismiss" read as "resolve" is how
+someone walks away from a genuinely wedged pane.
+
+The one thing a dismissal does not get back: for `QuestionStale` / `HumanInput` the badge is
+raised through a hold episode's `badged` one-shot, which has already fired, so within that
+same episode the chip will not re-raise. That is accepted for an explicit dismissal rather
+than papered over by re-arming the one-shot — which would answer one deliberate gesture with
+a chip that comes straight back.
+
+### Why not the focus ack, and why not an expiry
+
+The cheapest-looking fix is to let `ack_attention` clear the stranded map too. It is
+rejected: that ack fires on pane **focus**, which the human performs all day merely to type,
+so it would take down chips nobody read — and on `Unverifiable` / `Exhausted` the chip may be
+the only trace of a prompt still sitting unsubmitted in a box loomux could not read. The
+same ambiguity is why the frontend offers the dismiss control only for `stranded`: the other
+attention reasons are re-derived by every 3-second scan or already released by the ack, so a
+dismiss control on them would visibly evaporate on the next tick and teach the human that
+dismissing does not work — the complaint this exists to answer.
+
+A timed expiry is rejected on the standing rule (prefer independent evidence over elapsed
+time, #496/#513/#518): an expiry on an unattended machine clears the notice precisely when
+nobody saw it, which is the case the badge exists for.
+
+### A dismissed badge stays diagnosable
+
+`clear_stranded` records the reason but not the class, and for the classes that claim the
+box may still hold text, the class *is* the diagnosis. So a dismissal writes its own
+`stranded-dismissed` line first — actor `human`, carrying the blocker token and how long the
+chip stood — and then clears with `why: "human-dismissed"`. Two lines, on purpose: one
+reports a human act, the other a state change, and a concurrent clear from some other
+mechanism is then visible as exactly that rather than as a lost record. Letting a person
+retire a warning is only defensible while what they retired survives the retiring.
+
+The command takes an agent id and nothing else; the group is read from the registry. A chip
+can only be on screen for an agent `attention_tick` emitted, so an id with no agent record
+could never have been clicked, and refusing to accept a group as a path segment (constraint
+6) is strictly narrower than trusting one.
+
+### Not in this slice
+
+The automatic releases for the three evidence-bearing classes (a badge janitor that outlives
+the late monitor) and `QueueFull`'s drain-edge re-admission are plan-312's M2 and M3, and
+#825 stays open for them. This slice adds no automatic release of any kind.
+
 ## Risks / limitations
 
 - Kickoff typing races CLI boot; a fixed delay (4s) + bracketed paste is used. If a

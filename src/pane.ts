@@ -45,7 +45,8 @@ import { decideRefresh, REPO_SIGNAL_WINDOW_MS } from "./refreshthrottle";
 import { planWebglRetry } from "./webglretry";
 import { showToast } from "./toast";
 import { isAppShortcut } from "./shortcuts";
-import { attentionPresentation } from "./attention";
+import { attentionPresentation, attentionDismiss } from "./attention";
+import { dismissStranded } from "./orchestration";
 import { heldPresentation } from "./heldbadge";
 import { makeRenameCommit } from "./panerename";
 import { shouldResizePty } from "./panefit";
@@ -633,6 +634,10 @@ export class Pane implements VoiceTargetPane {
   /** "needs attention" chip in the header (attention routing #6); hidden until
    *  the backend flags this pane. */
   private attnChip: HTMLButtonElement;
+  /** The explicit-dismiss control beside the attention chip (#825 M1). Shown
+   *  only for the one LATCHED reason (`stranded`), which is the only chip a
+   *  human can otherwise be left unable to clear. */
+  private attnDismiss: HTMLButtonElement;
   private attentionReason: string | null = null;
   private attentionDetail: string | null = null;
   /** "delivery held" chip in the header (#246): the moment loomux is
@@ -774,6 +779,24 @@ export class Pane implements VoiceTargetPane {
       this.acknowledgeAttention();
     });
     header.appendChild(this.attnChip);
+
+    // The explicit dismiss (#825 M1), as a SIBLING button rather than something
+    // inside the chip: the chip is itself a <button>, and a button nested in a
+    // button is invalid HTML that browsers silently un-nest. Header chrome, like
+    // the chip it sits beside — it floats in the header and never touches the
+    // terminal's size, so constraint 1 (never resize the PTY for a UI feature)
+    // holds trivially. Hidden unless the pane wears a dismissible chip.
+    this.attnDismiss = document.createElement("button");
+    this.attnDismiss.className = "pane-attn-dismiss";
+    this.attnDismiss.hidden = true;
+    this.attnDismiss.addEventListener("click", (e) => {
+      // Not `onFocus`/`focus()` like the chip beside it: dismissing is the
+      // human saying they are DONE with this alert, which is the opposite of
+      // asking to be taken to the pane.
+      e.stopPropagation();
+      this.dismissAttention();
+    });
+    header.appendChild(this.attnDismiss);
 
     // "Delivery held" chip (#246): purely informational, no click handler —
     // the hold only clears when the backend resolves it.
@@ -2157,6 +2180,13 @@ export class Pane implements VoiceTargetPane {
       this.attnChip.hidden = false;
       this.el.classList.add("needs-attention");
     }
+    // The dismiss control follows the chip (#825 M1) — see `attentionDismiss`
+    // for why only the latched `stranded` reason gets one.
+    const dismiss = attentionDismiss(reason, this.orchAgent);
+    this.attnDismiss.textContent = dismiss.label;
+    this.attnDismiss.title = dismiss.title;
+    this.attnDismiss.setAttribute("aria-label", dismiss.title);
+    this.attnDismiss.hidden = !dismiss.dismissible;
     // A minimized pane's element is detached, so its header chip is invisible;
     // the listener lets the grid mirror this state onto the dock chip.
     this.dockSyncListener?.();
@@ -2289,6 +2319,24 @@ export class Pane implements VoiceTargetPane {
     } else if (this.ptyId !== null) {
       invoke("orch_ack_attention_pty", { ptyId: this.ptyId }).catch(() => {});
     }
+  }
+
+  /** The human deliberately dismissed this pane's stuck-prompt chip (#825 M1):
+   *  release the latched backend badge, which — unlike the focus ack above —
+   *  is an unambiguous "I have seen this", so it is allowed to clear a warning
+   *  that no reading of the pane could.
+   *
+   *  The chip goes down locally first. The backend clear is what makes it STAY
+   *  down (the 3-second attention scan re-emits the whole set every tick), but
+   *  a chip that lingered for a tick after a deliberate click is precisely the
+   *  "clearing alerts is unreliable" feel this gesture exists to fix. If the
+   *  call fails, the next scan puts the chip straight back — the honest
+   *  outcome, and self-correcting without a retry of our own. */
+  private dismissAttention(): void {
+    const agentId = this.orchAgent;
+    if (!agentId || this.attentionReason !== "stranded") return;
+    this.setAttention(null);
+    dismissStranded(agentId).catch(() => {});
   }
 
   /** Handle an OSC 7 working-directory report from the shell. Payloads are

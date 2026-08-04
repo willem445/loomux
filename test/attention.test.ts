@@ -2,7 +2,7 @@
 // pane header chip and the minimize-dock chip. Run with `npm test`.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { attentionPresentation, dockChipAttention } from "../src/attention.ts";
+import { attentionPresentation, dockChipAttention, attentionDismiss } from "../src/attention.ts";
 
 test("each known reason maps to its label", () => {
   assert.equal(attentionPresentation("blocked").label, "⚠ blocked");
@@ -77,4 +77,54 @@ test("a docked pane with no attention shows no dot, only a restore hint", () => 
   assert.equal(chip.needsAttention, false);
   assert.equal(chip.urgent, false);
   assert.equal(chip.title, "Restore editor");
+});
+
+// #825 M1: the explicit dismiss. `stranded` is the one LATCHED reason — it
+// stays up until something removes it backend-side, and for several blocker
+// classes nothing ever does — so it is the one that needs a gesture of its own.
+test("the latched stranded chip is the one that offers an explicit dismiss", () => {
+  const d = attentionDismiss("stranded", "w-3");
+  assert.equal(d.dismissible, true);
+  assert.notEqual(d.label, "", "a dismissible chip needs something to click");
+});
+
+test("the live-recomputed reasons offer no dismiss control", () => {
+  // These are re-derived by every 3-second attention scan (waiting/gate) or
+  // already released by the focus ack (report/blocked). A dismiss control on
+  // them would be a button that visibly does nothing — the chip is back on the
+  // next tick — which teaches the human that dismissing does not work, the
+  // exact complaint #825 exists to fix.
+  for (const reason of ["waiting", "report", "gate", "blocked"]) {
+    assert.equal(
+      attentionDismiss(reason, "w-3").dismissible,
+      false,
+      `${reason} is not dismissible`,
+    );
+  }
+  assert.equal(attentionDismiss(null, "w-3").dismissible, false, "no chip, nothing to dismiss");
+});
+
+test("a stranded chip with no agent identity offers no dismiss", () => {
+  // The backend releases the badge by agent id (`orch_dismiss_stranded`), so a
+  // plain pane — which has no orchestration identity — has nothing to send.
+  // Offering the control anyway would be a click that silently fails.
+  assert.equal(attentionDismiss("stranded", null).dismissible, false);
+  assert.equal(attentionDismiss("stranded", "").dismissible, false, "an empty id is no id");
+});
+
+test("the dismiss tooltip promises only what the dismiss actually does", () => {
+  // It takes the CHIP down; it does not unstick the pane. A tooltip that
+  // implied otherwise would be the false claim this whole issue is about —
+  // a human who reads "resolve" and walks away from a genuinely wedged pane.
+  //
+  // The disclaimer is pinned as a phrase rather than a vibe because it IS the
+  // guarantee: a chip the human can take down on their own say-so is only
+  // honest while the control says what it settles and what it leaves alone.
+  const { title } = attentionDismiss("stranded", "w-3");
+  assert.match(title, /dismiss/i);
+  assert.match(
+    title,
+    /does not unstick the pane/i,
+    `the tooltip must say what it does NOT do: ${title}`,
+  );
 });
