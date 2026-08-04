@@ -14460,10 +14460,7 @@ pub fn stranded_badge_release(
 ) -> BadgeRelease {
     // Nothing weaker than a positive absence is evidence. Ordered first so no
     // arm below can be reached on a reading that never happened.
-    // MUTATION 1 (#825 M2 red evidence) — was `!= Some(NotHolding)`. Lets a
-    // `Holds` or `Unverifiable` reading reach the class arms, i.e. releases on
-    // a reading that establishes nothing.
-    if reading.is_none() {
+    if reading != Some(BoxReading::NotHolding) {
         return BadgeRelease::Keep;
     }
     if saw_text_in_box {
@@ -14482,14 +14479,9 @@ pub fn stranded_badge_release(
         // never become untrue, so no pane reading may release it; the human's
         // explicit dismiss is its release, M1. Every hold class already has
         // one.)
-        // MUTATION 2 (#825 M2 red evidence) — the last two arms are added.
-        // Releases the classes no pane reading can answer: `PauseSuppressed`
-        // (a loss that already happened) and `QueueFull` (M3's retry).
         Some(StrandedBlocker::NotHolding)
         | Some(StrandedBlocker::Unverifiable)
-        | Some(StrandedBlocker::Exhausted)
-        | Some(StrandedBlocker::PauseSuppressed)
-        | Some(StrandedBlocker::QueueFull) => {
+        | Some(StrandedBlocker::Exhausted) => {
             if human_stamped_since {
                 // The one name in this vocabulary for "a person dealt with it",
                 // taken from #819's enum rather than spelled again, so the
@@ -30137,11 +30129,11 @@ impl OrchRegistry {
                 .filter(|(_, note)| janitor_watches(note.blocker))
                 .filter_map(|(id, note)| {
                     let a = agents.get(id)?;
-                    // MUTATION 4 (#825 M2 red evidence) — the Running filter is
-                    // removed, so the janitor judges a dead pane's chip from a
-                    // ring nobody is writing to and attributes it to a person.
                     // A pane with no running agent cannot be un-wedged by
                     // anyone, and `attention_tick` prunes its note anyway.
+                    if a.status != AgentStatus::Running {
+                        return None;
+                    }
                     Some((id.clone(), a.group.clone(), a.pty_id?, note.blocker))
                 })
                 .collect()
@@ -30154,10 +30146,7 @@ impl OrchRegistry {
             // that raised the chip does not change the question this asks —
             // "is the text loomux most recently left in this pane still there"
             // — and `drain_stranded_submit` reads the record the same way.
-            // MUTATION 3 (#825 M2 red evidence) — was a `continue`. Treats "no
-            // recorded text to look for" as an empty paste, which `box_reading`
-            // reads as `NotHolding`: a release on a pane never examined.
-            let text = outcome.stranded_text.clone().unwrap_or_default();
+            let Some(text) = outcome.stranded_text.clone() else { continue };
             let reading = {
                 let mut scan = Tier1Scan::for_paste(&text);
                 let read = scan.read(|n| ptys.output_tail_bounded(pty_id, n));
