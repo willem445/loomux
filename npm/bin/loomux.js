@@ -21,7 +21,7 @@ const path = require("path");
 const { spawn, spawnSync } = require("child_process");
 
 const REPO = "willem445/loomux";
-const { version: PKG_VERSION } = require("../package.json");
+const { version: PKG_VERSION, name: PKG_NAME } = require("../package.json");
 
 const BLUE = "\x1b[1;34m";
 const GREEN = "\x1b[1;32m";
@@ -93,18 +93,135 @@ function cacheDir() {
   return path.join(base, "loomux");
 }
 
-// ---------- platform installers ----------
+// ---------- version ordering ----------
+
+// Split a semver-ish string into [major, minor, patch, prerelease[]], or null if
+// it doesn't parse. Build metadata (`+…`) is ignored, as semver requires.
+function parseVersion(v) {
+  const m = /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/.exec(
+    String(v).trim()
+  );
+  if (!m) return null;
+  return [Number(m[1]), Number(m[2]), Number(m[3]), m[4] ? m[4].split(".") : []];
+}
+
+// Compare two prerelease identifiers. Semver says numeric identifiers compare
+// numerically and alphanumeric ones compare as ASCII — but this project tags
+// `beta9`, `beta10`, where a flat ASCII compare puts beta10 BELOW beta9 ("1" <
+// "9") and would hand us a downgrade that reads as an upgrade. So each
+// identifier is compared as alternating runs of digits and non-digits, digits
+// numerically: "beta9" < "beta10", and plain semver forms are unaffected.
+function compareIdentifier(a, b) {
+  const runs = (s) => s.match(/\d+|\D+/g) || [];
+  const [ra, rb] = [runs(a), runs(b)];
+  for (let i = 0; i < Math.max(ra.length, rb.length); i++) {
+    const [x, y] = [ra[i], rb[i]];
+    if (x === undefined) return -1;
+    if (y === undefined) return 1;
+    const [nx, ny] = [/^\d+$/.test(x), /^\d+$/.test(y)];
+    if (nx && ny) {
+      if (Number(x) !== Number(y)) return Number(x) < Number(y) ? -1 : 1;
+    } else if (nx !== ny) {
+      return nx ? -1 : 1; // numeric identifiers rank below alphanumeric ones
+    } else if (x !== y) {
+      return x < y ? -1 : 1;
+    }
+  }
+  return 0;
+}
+
+// -1 / 0 / 1 for a < b, a == b, a > b; null when either side doesn't parse.
+function compareVersions(a, b) {
+  const [pa, pb] = [parseVersion(a), parseVersion(b)];
+  if (!pa || !pb) return null;
+  for (let i = 0; i < 3; i++) if (pa[i] !== pb[i]) return pa[i] < pb[i] ? -1 : 1;
+  // A prerelease ranks below the release it precedes: 1.1.0-beta9 < 1.1.0.
+  if (pa[3].length === 0 || pb[3].length === 0) {
+    if (pa[3].length === pb[3].length) return 0;
+    return pa[3].length ? -1 : 1;
+  }
+  for (let i = 0; i < Math.max(pa[3].length, pb[3].length); i++) {
+    const [x, y] = [pa[3][i], pb[3][i]];
+    if (x === undefined) return -1; // fewer identifiers ranks lower
+    if (y === undefined) return 1;
+    const c = compareIdentifier(x, y);
+    if (c !== 0) return c;
+  }
+  return 0;
+}
 
 // The installed app can be older than this launcher (updating the npm package
-// replaces only the launcher, never the app it installed earlier). Each
-// platform reads the version of whatever is actually installed; a mismatch
-// triggers a reinstall. `null` (version undetectable) launches as-is so a
-// broken probe can't cause a download-on-every-launch loop.
+// replaces only the launcher, never the app it installed earlier). Each platform
+// reads the version of whatever is actually installed; only an installed app that
+// is genuinely OLDER is reinstalled.
+//
+// Ordering, not equality (#815). `installed !== PKG_VERSION` treated *any*
+// difference as "upgrade", so a stable launcher left on PATH reinstalled — i.e.
+// DOWNGRADED — a newer prerelease install every single time it ran, while
+// announcing an upgrade. That reinstall is what killed a running app, so the
+// wrong direction here is not a cosmetic bug.
+//
+// Launch as-is whenever the answer isn't a confident "older": `null` (version
+// undetectable, or either side unparseable) keeps a broken probe from causing a
+// download-on-every-launch loop, same as before.
 function shouldLaunchExisting(installed) {
-  if (installed === null || installed === PKG_VERSION) return true;
+  if (installed === null) return true;
+  const cmp = compareVersions(installed, PKG_VERSION);
+  if (cmp === null) {
+    say(`can't order installed v${installed} against launcher v${PKG_VERSION} — launching as-is`);
+    return true;
+  }
+  if (cmp === 0) return true;
+  if (cmp > 0) {
+    say(
+      `installed app is v${installed}, newer than this launcher (v${PKG_VERSION}) — ` +
+        `launching it as-is (update the launcher with \`npm i -g ${PKG_NAME}@latest\`)`
+    );
+    return true;
+  }
   say(`installed app is v${installed}, launcher is v${PKG_VERSION} — upgrading`);
   return false;
 }
+
+// ---------- running-instance guard ----------
+
+// Is a Loomux desktop app running right now? Installing over one is what makes
+// the launcher lethal: the silent installer terminates the running process to
+// replace its files, taking down the app and anything running inside it.
+//
+// Unknown (no probe, or the probe failed) is reported as "not running": on both
+// platforms the probe ships with the OS, so a failure means something exotic, and
+// a launcher that refuses to install on such a machine is a worse bug than one
+// that installs. The ordering fix above is what makes this a rare path at all.
+function loomuxIsRunning() {
+  if (process.platform === "win32") {
+    // A filter that matches nothing still exits 0 ("INFO: No tasks…"), so test
+    // the output rather than the status.
+    const out = spawnSync("tasklist", ["/FI", "IMAGENAME eq Loomux.exe", "/NH"], {
+      encoding: "utf8",
+    });
+    return /Loomux\.exe/i.test(out.stdout || "");
+  }
+  if (process.platform === "darwin") {
+    const out = spawnSync("pgrep", ["-x", "Loomux"], { encoding: "utf8" });
+    return out.status === 0 && (out.stdout || "").trim() !== "";
+  }
+  return false; // Linux runs an AppImage in place; nothing is ever replaced.
+}
+
+// Refuse to install while the app is running — including under `--reinstall`,
+// which is an escape hatch for a broken install, not consent to kill a live one.
+// Quitting first is always the user's call to make, never the launcher's.
+function refuseIfRunning() {
+  if (!loomuxIsRunning()) return;
+  die(
+    "Loomux is running — refusing to install over it. The installer would " +
+      "terminate the running app to replace its files, closing every window and " +
+      "anything running inside it. Quit Loomux, then run this again."
+  );
+}
+
+// ---------- platform installers ----------
 
 async function runLinux(getRelease) {
   const arch = process.arch;
@@ -149,6 +266,7 @@ async function runMac(getRelease) {
     return;
   }
 
+  refuseIfRunning();
   const release = await getRelease();
   const re = process.arch === "arm64" ? /_aarch64\.dmg$/ : /_x64\.dmg$/;
   const asset = pickAsset(release, re);
@@ -218,6 +336,7 @@ async function runWindows(getRelease) {
     return;
   }
 
+  refuseIfRunning();
   const release = await getRelease();
   const asset = pickAsset(release, /-setup\.exe$/);
   if (!asset) die(`no Windows installer in release ${release.tag_name}`);
@@ -267,4 +386,11 @@ async function main() {
   }
 }
 
-main().catch((e) => die(e && e.message ? e.message : String(e)));
+// Only run when invoked as the `loomux` bin — `require`d (by test/launcher.test.ts)
+// this file just exposes the pure ordering logic, which is where a wrong answer
+// costs a running install.
+if (require.main === module) {
+  main().catch((e) => die(e && e.message ? e.message : String(e)));
+}
+
+module.exports = { compareVersions, parseVersion, shouldLaunchExisting, loomuxIsRunning };
