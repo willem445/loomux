@@ -66,6 +66,15 @@ export interface FlushInput {
    *  policy, which is what the `unfocusedRenderThrottleMs: 0` setting selects
    *  and what the A/B arm of the tests measures against. */
   windowMs: number;
+  /** Whether the whole DOCUMENT is hidden — occluded, minimized, or behind a
+   *  locked workstation (`document.visibilityState === "hidden"`).
+   *
+   *  A property of the document, not of the pane, which is why it cannot be
+   *  folded into `live`: `live` is the grid's ACTIVE pane and stays active
+   *  while the window is hidden, so keying on it alone would leave exactly one
+   *  pane per grid at its normal cadence and every other one behind the
+   *  clamp. See `decideFlush` for why hidden must flush. */
+  hidden: boolean;
   /** Hard ceiling on held bytes: a pane emitting faster than the window can
    *  drain must not grow an unbounded backlog in loomux's own list. */
   maxPendingBytes: number;
@@ -98,6 +107,26 @@ export const MAX_PENDING_BYTES = 1024 * 1024;
  *  arithmetic — this runs on every chunk of every pane. */
 export function decideFlush(i: FlushInput): FlushDecision {
   if (i.windowMs <= 0) return { kind: "flush" }; // throttling off: pre-#720 policy
+  // #813. A hidden document renders NOTHING, so the deferral has nothing left
+  // to buy — and it is not free. Grouped with the off switch above because both
+  // are "the throttle does not apply at all", not "this pane is special".
+  //
+  // What it buys: zero. Every saving this module claims is a `renderRows` pass,
+  // and `RenderDebouncer` schedules every refresh on `requestAnimationFrame`
+  // (browser/RenderDebouncer.ts), which does not fire in a hidden page.
+  //
+  // What it costs: the reply path. Deferring re-arms `window.setTimeout`, which
+  // a hidden page clamps, and xterm's `WriteBuffer.write` then schedules its
+  // parse behind a SECOND setTimeout of its own. Two clamped stages in series
+  // sit in front of the one path out of xterm that is not display — the bytes
+  // the terminal writes back DOWN the pty (DA/DSR/OSC-colour/XTVERSION replies
+  // and DEC-1004 focus reports), which xterm emits only when it PARSES the
+  // query that asked for them. An agent CLI waiting on one of those waits on
+  // our timer. A Windows session lock marks the window occluded for its whole
+  // duration, which is #813's reported window.
+  //
+  // Deliberately NOT expressed as `live`: see `FlushInput.hidden`.
+  if (i.hidden) return { kind: "flush" };
   if (i.live) return { kind: "flush" }; // focused / just-typed-into: per-frame cadence
   if (i.lastFlushMs === WOKEN) return { kind: "flush" }; // leading edge
   if (i.pendingBytes >= i.maxPendingBytes) return { kind: "flush" }; // backlog bound

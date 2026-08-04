@@ -203,3 +203,53 @@ reduce — so trading its correctness (wide-character and emoji cell widths) for
 saving of unknown size, in a change that could not measure that size, would be a
 guess dressed as an optimisation. #720 asked for a measurement first; there is
 none, so there is no change.
+
+## The throttle is off while the document is hidden (#813)
+
+`decideFlush` returns `flush` unconditionally when `document.visibilityState` is
+`"hidden"`, alongside the `windowMs <= 0` off switch — both are "the throttle does
+not apply at all" rather than "this pane is special".
+
+**Why: the saving goes to zero and the cost does not.** Everything above justifies
+the deferral by `renderRows` passes skipped. A hidden page performs none of them —
+`RenderDebouncer` schedules every refresh on `requestAnimationFrame`
+(`browser/RenderDebouncer.ts`), which does not fire while the page is hidden. So
+the deferral buys nothing there.
+
+It still charges, and it charges on a path that is not display. Deferring re-arms
+`window.setTimeout`, and xterm's `WriteBuffer.write` then schedules its own parse
+behind a second `setTimeout` — quoted from `common/input/WriteBuffer.ts`:
+
+```ts
+if (this._didUserInput) { … this._innerWrite(); return; }
+setTimeout(() => this._innerWrite());
+```
+
+A terminal answers a program's query — DA/DSR, OSC 10/11/4 colour, XTVERSION —
+only when it **parses** that query, and the answer travels back **down the pty** to
+the child. So both timer stages sit in front of the terminal's reply channel, and
+an agent CLI that queries its terminal mid-session waits on loomux's throttle plus
+xterm's parse scheduling. `src/humanorigin.ts` records that copilot's TUI issues
+exactly those queries "at boot and again mid-session on redraw/focus churn".
+
+**Two tiers of evidence, and they are not the same tier.** The xterm half above is
+quoted from this repo's own `node_modules` and is checkable here. The browser half
+— that a hidden page clamps `setTimeout`, and that a Windows session lock marks
+windows occluded so the page reports hidden for the lock's whole duration — is
+documented platform behaviour that cannot be cited from this tree. It is stated as
+what it is rather than folded into the quotations.
+
+**What this does NOT claim.** It does not claim to be the whole of #813, and it
+changes nothing about delivery. The backend never reads xterm: `ptyout.rs` tees the
+output ring on the reader thread *before* any coalescing, so paste, Enter, echo
+verification and the Tier 1/2/3 confirm tiers are unaffected by when the frontend
+parses anything. What this changes is only how promptly the terminal can answer the
+child while nobody is looking at the window.
+
+**Live-validation residue.** A locked workstation is not something CI can exercise,
+and this repo cannot measure the reply latency it removes. What is verifiable here
+is the policy (`test/panethrottle.test.ts`) and the wiring by inspection. The
+remaining question — whether prompt replies while hidden actually keep an agent CLI
+responsive across a real lock — is the human's to answer on the machine that
+reported it, exactly as `unfocusedRenderThrottleMs` exists to let them A/B the
+original change.

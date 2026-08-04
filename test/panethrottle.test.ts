@@ -32,6 +32,7 @@ const streaming: FlushInput = {
   pendingBytes: 512,
   windowMs: 100,
   maxPendingBytes: MAX_PENDING_BYTES,
+  hidden: false,
 };
 
 // ---------- the shipped policy ----------
@@ -143,4 +144,104 @@ test("dueInMs is never below 1ms, so a flush is always actually scheduled", () =
   assert.equal(d.kind, "defer");
   if (d.kind !== "defer") return;
   assert.ok(d.dueInMs >= 1, `dueInMs was ${d.dueInMs}`);
+});
+
+// ---------- #813: a hidden window has no render passes to save ----------
+//
+// The throttle's ENTIRE justification is render passes: an unfocused pane
+// written to once per window renders ~6x fewer times, because xterm's
+// RenderDebouncer coalesces within a frame and never across (see the module
+// doc). A hidden document performs none of them — RenderDebouncer schedules
+// every refresh on requestAnimationFrame, which does not fire in a hidden page
+// (node_modules/@xterm/xterm/src/browser/RenderDebouncer.ts, `_animationFrame`).
+// So while the window is hidden the deferral buys exactly zero.
+//
+// It is not free, though, and that is why this is a fix rather than a tidy-up.
+// Deferring re-arms `window.setTimeout`, which a hidden page clamps; xterm's own
+// `WriteBuffer.write` then schedules its parse behind a SECOND setTimeout
+// ("if (this._didUserInput) {...} setTimeout(() => this._innerWrite())" — that
+// file, verbatim). Two clamped timer stages in series sit in front of the one
+// path out of xterm that is NOT display: the bytes the terminal writes back
+// DOWN the pty — DA/DSR/OSC-colour/XTVERSION auto-replies and focus reports,
+// which xterm emits only when it PARSES the query. A Windows session lock marks
+// the window occluded, so that is the whole duration of a lock.
+//
+// This module cannot test the reply path — it is a pure policy core, and the
+// coupling is a browser one. What it CAN pin is the policy: while hidden, do not
+// defer. See doc/design/pane-render-throttle.md for the mechanism and the
+// live-validation residue.
+
+test("SHIPPED: a hidden window never defers — the deferral buys no render pass and costs the reply path", () => {
+  // The exact input the shipped window defers when visible (asserted above):
+  // an unfocused pane, mid-stream, one frame after its last flush, well under
+  // the backlog cap. Hidden, it must go straight through.
+  const input = {
+    ...streaming,
+    lastFlushMs: 1_000,
+    nowMs: 1_016,
+    windowMs: SHIPPED_WINDOW_MS,
+  };
+  assert.equal(
+    decideFlush({ ...input, hidden: false }).kind,
+    "defer",
+    "control: visible, this is the case the throttle exists for"
+  );
+  assert.deepEqual(
+    decideFlush({ ...input, hidden: true }),
+    { kind: "flush" },
+    "hidden: nothing renders, so holding it back saves nothing and delays every terminal " +
+      "auto-reply behind a clamped timer"
+  );
+});
+
+test("hidden flushes EVERY pane, not just the grid's active one", () => {
+  // `live` is the grid's active pane — still 'active' while the window is
+  // hidden, so exactly one pane per grid would keep its cadence and every other
+  // one would sit behind the clamp. The whole point is that hidden is a
+  // property of the DOCUMENT, so it cannot be answered per pane.
+  for (const live of [false, true]) {
+    assert.deepEqual(
+      decideFlush({ ...streaming, live, hidden: true }),
+      { kind: "flush" },
+      `live=${live} must still flush while hidden`
+    );
+  }
+});
+
+test("hidden overrides a window a visible pane would still be inside", () => {
+  // Not merely 'hidden happens to agree with the leading edge': pick a moment
+  // deep inside the window, where the visible answer is a defer with most of
+  // the window left to run.
+  const midWindow = { ...streaming, lastFlushMs: 1_000, nowMs: 1_005, windowMs: 100 };
+  const visible = decideFlush({ ...midWindow, hidden: false });
+  assert.equal(visible.kind, "defer");
+  if (visible.kind === "defer") assert.equal(visible.dueInMs, 95, "95ms of window still to run");
+  assert.deepEqual(decideFlush({ ...midWindow, hidden: true }), { kind: "flush" });
+});
+
+test("hidden:false leaves every pre-existing rule exactly as it was", () => {
+  // The regression guard. This change must be invisible to a visible window —
+  // every assertion in this file above ran with hidden:false via `streaming`,
+  // and these re-state the three shapes most likely to be disturbed by an
+  // early return added at the top of the function.
+  assert.deepEqual(decideFlush({ ...streaming, hidden: false, live: true }), { kind: "flush" });
+  assert.deepEqual(
+    decideFlush({ ...streaming, hidden: false, lastFlushMs: WOKEN }),
+    { kind: "flush" },
+    "leading edge"
+  );
+  assert.equal(
+    decideFlush({ ...streaming, hidden: false }).kind,
+    "defer",
+    "and an unfocused mid-stream chunk still defers, which is #720 itself"
+  );
+});
+
+test("the off switch still wins, hidden or not", () => {
+  // `unfocusedRenderThrottleMs: 0` is a true bypass and must not acquire a new
+  // reason to be consulted: with throttling off there is no deferral for hidden
+  // to override, and both answers must agree.
+  for (const hidden of [false, true]) {
+    assert.deepEqual(decideFlush({ ...streaming, windowMs: 0, hidden }), { kind: "flush" });
+  }
 });
