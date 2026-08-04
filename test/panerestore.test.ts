@@ -18,6 +18,7 @@ import {
   findResumedPaneIndex,
   programFromRestore,
   normalizeAgentProgram,
+  sessionCliFromCommand,
   shouldWatchCopilotOnRestore,
   AUTO_RESUME_AGENTS,
   type RestoreAction,
@@ -482,6 +483,93 @@ test("resume falls back to argv when there is no string command", () => {
 
 test("resume with neither command nor argv best-efforts a bare claude --resume", () => {
   assert.deepEqual(agentResumeCommand(null, null, "s5"), { command: "claude --resume s5" });
+});
+
+// ---------- #722: which session-store CLI a command names ----------
+
+test("sessionCliFromCommand answers for every CLI whose sessions loomux can scan", () => {
+  // The invariant: this set IS `SessionInfo["source"]`. A CLI the backend
+  // scanner lists but this answers null for is a pane that can never adopt the
+  // session sitting in the sidebar under its own cwd — which is what an
+  // opencode pane was before this slice.
+  assert.equal(sessionCliFromCommand("claude --model opus"), "claude");
+  assert.equal(sessionCliFromCommand("copilot --resume=abc"), "copilot");
+  assert.equal(sessionCliFromCommand("opencode --auto"), "opencode");
+});
+
+test("sessionCliFromCommand normalizes a path-qualified or .exe-suffixed program", () => {
+  // #457's case, which applies to the new CLI too rather than only to the two
+  // that had it when the normalizer was written.
+  assert.equal(sessionCliFromCommand("C:\\tools\\opencode.exe --auto"), "opencode");
+  assert.equal(sessionCliFromCommand("/usr/local/bin/opencode"), "opencode");
+});
+
+test("sessionCliFromCommand is null for a CLI with no session store loomux reads", () => {
+  // Not "unknown programs are opencode now": gemini and codex are real agent
+  // CLIs loomux can launch, and neither has a scanner — so there is nothing to
+  // match a pane of theirs against, and claiming one would be worse than null.
+  assert.equal(sessionCliFromCommand("gemini"), null);
+  assert.equal(sessionCliFromCommand("codex --yolo"), null);
+  assert.equal(sessionCliFromCommand("pwsh"), null);
+  assert.equal(sessionCliFromCommand(""), null);
+  assert.equal(sessionCliFromCommand(null), null);
+  assert.equal(sessionCliFromCommand(undefined), null);
+});
+
+// ---------- #722: opencode names a session with a different flag ----------
+//
+// opencode has no `--resume` and no `--session-id`: `--session <id>` continues
+// an existing session, and nothing pre-assigns one. So the two builders below
+// cannot share claude's flag names for an opencode line — and the line is not
+// hypothetical, it is what a Sessions-tab restore records for the pane
+// (`opencode --session <id>`, straight from the backend's own scanner), which
+// is exactly the input the NEXT tab restore feeds back into this function.
+
+test("resume rewrites an opencode line with --session, never claude's --resume", () => {
+  assert.deepEqual(agentResumeCommand("opencode --model opencode/gpt-5.1-codex", null, "ses_a"), {
+    command: "opencode --model opencode/gpt-5.1-codex --session ses_a",
+  });
+});
+
+test("resume replaces an opencode line's recorded --session rather than doubling it", () => {
+  // The compounding case: a pane restored from the Sessions tab already
+  // carries `--session <old>`, so a builder that only knew claude's flag names
+  // would append a second one on every restore, forever.
+  assert.deepEqual(agentResumeCommand("opencode --session ses_old --auto", null, "ses_new"), {
+    command: "opencode --auto --session ses_new",
+  });
+  assert.deepEqual(agentResumeCommand(null, ["opencode", "--session", "ses_old"], "ses_new"), {
+    argv: ["opencode", "--session", "ses_new"],
+  });
+});
+
+test("a claude/copilot line's --session is NOT a session flag — the widening is opencode-scoped", () => {
+  // The excision set stays per-CLI on purpose: `--session` is opencode's flag
+  // name, and whether it means something else to claude or copilot is a vendor
+  // fact this project has not verified. So an unrecognized `--session` on
+  // another CLI's line survives verbatim, like any other flag loomux does not
+  // own — it is never guessed away.
+  assert.deepEqual(agentResumeCommand("claude --session keep-me --resume old", null, "s1"), {
+    command: "claude --session keep-me --resume s1",
+  });
+  assert.deepEqual(agentFreshCommand("copilot --session keep-me", null, "s2"), {
+    command: "copilot --session keep-me --session-id s2",
+  });
+});
+
+test("fresh drops an opencode line's identity entirely — no flag can pre-assign one", () => {
+  // The doomed-resume fallback: this arm is only reached once the caller has
+  // established the recorded session is NOT resumable, so re-emitting
+  // `--session <id>` would be the very resume it exists to avoid, and
+  // `--session-id <id>` is a flag opencode does not have. The pane starts a
+  // genuinely new conversation instead, and the reconciler learns its id
+  // afterwards exactly as it does for any other bare opencode pane.
+  assert.deepEqual(agentFreshCommand("opencode --session ses_dead --auto", null, "ses_x"), {
+    command: "opencode --auto",
+  });
+  assert.deepEqual(agentFreshCommand(null, ["opencode", "--session", "ses_dead"], "ses_x"), {
+    argv: ["opencode"],
+  });
 });
 
 // ---------- #449: property — session-flag excision must never reflow untouched bytes ----------

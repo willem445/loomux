@@ -32,6 +32,9 @@
 // the plan's promised one-line switch, kept literally one line here.
 
 import type { PersistedPane, PersistedLayoutNode, PersistedEmbed } from "./tabstore";
+// The CLIs loomux can scan sessions for (`SessionInfo["source"]`), imported
+// rather than re-spelled — see `sessionCliFromCommand` (#722).
+import type { Cli } from "./sessionreconcile";
 
 /** The adopted default (#194): auto-resume agent panes into their prior session.
  *  Set to false for the conservative all-dormant behavior (every agent gets a
@@ -261,6 +264,26 @@ const QUOTED_OR_BARE_VALUE = `"[^"]*"|\\S+`;
  *  recorded the command, only the flag's literal text. */
 const SESSION_FLAG_NAMES = ["--session-id", "--resume"];
 
+/** The same set plus opencode's own, for a line this module has ALREADY
+ *  identified as opencode's (#722). opencode names a session with
+ *  `--session <id>` and has no `--session-id` at all — nothing pre-assigns an
+ *  id there — so `--session` is a third session-identity flag its excision has
+ *  to recognize, or a pane re-resumed twice ends up carrying
+ *  `opencode --session A --session A`.
+ *
+ *  Deliberately NOT merged into `SESSION_FLAG_NAMES` above, whose doc is
+ *  explicit that it is applied to every recorded line whatever CLI wrote it:
+ *  whether `--session` means something else to claude or copilot is an
+ *  unverified vendor fact, and the rule for those is to check the official
+ *  reference, not to assume. Adding it globally would risk excising a flag
+ *  this project never established the meaning of; adding it per-CLI risks
+ *  nothing, because the program is already known at both call sites.
+ *
+ *  Exact-match, so the `--session-id` prefix relationship is a non-issue: a
+ *  bare token equals one name or the other, and the `=` form is matched as
+ *  `--session=` / `--session-id=`, which cannot alias either. */
+const OPENCODE_SESSION_FLAG_NAMES = [...SESSION_FLAG_NAMES, "--session"];
+
 /** True when `raw` — the RAW slice of ONE token, quotes included if it was a
  *  quoted token — is a session flag written bare (no value attached: not
  *  even a trailing `=`). A quoted token's raw slice always starts with `"`,
@@ -268,16 +291,16 @@ const SESSION_FLAG_NAMES = ["--session-id", "--resume"];
  *  that happens to discuss `--resume`) can never equal a bare flag name —
  *  this is what keeps `stripSessionFlagsFrom*` from mistaking quoted content
  *  for a flag (#471 review round 2, case 5). */
-function isBareSessionFlag(raw: string): boolean {
-  return SESSION_FLAG_NAMES.includes(raw);
+function isBareSessionFlag(raw: string, names: readonly string[]): boolean {
+  return names.includes(raw);
 }
 
 /** True when `raw` is a session flag's SELF-CONTAINED `=value` token —
  *  including an EMPTY value (`--resume=`) — so it needs no following value
  *  token consumed. Same quote-immunity as `isBareSessionFlag` above, for the
  *  same reason. */
-function isEqSessionFlag(raw: string): boolean {
-  return SESSION_FLAG_NAMES.some((name) => raw.startsWith(`${name}=`));
+function isEqSessionFlag(raw: string, names: readonly string[]): boolean {
+  return names.some((name) => raw.startsWith(`${name}=`));
 }
 
 /** Quote-aware tokenizer WITH POSITIONS into the ORIGINAL string: a fully
@@ -331,13 +354,16 @@ function tokenizeWithPositions(command: string): Array<{ start: number; end: num
  *  Each drop absorbs exactly ONE leading whitespace character (mirroring
  *  what a single flag[+value] run displaced), so untouched whitespace
  *  elsewhere is never reflowed. */
-function stripSessionFlagsFromCommand(command: string): string {
+function stripSessionFlagsFromCommand(
+  command: string,
+  names: readonly string[] = SESSION_FLAG_NAMES
+): string {
   const tokens = tokenizeWithPositions(command);
   const dropRanges: Array<[number, number]> = [];
   for (let i = 0; i < tokens.length; i++) {
     const raw = command.slice(tokens[i].start, tokens[i].end);
-    const bare = isBareSessionFlag(raw);
-    if (!bare && !isEqSessionFlag(raw)) continue;
+    const bare = isBareSessionFlag(raw, names);
+    if (!bare && !isEqSessionFlag(raw, names)) continue;
     let dropStart = tokens[i].start;
     let dropEnd = tokens[i].end;
     if (bare && i + 1 < tokens.length) {
@@ -366,16 +392,19 @@ function stripSessionFlagsFromCommand(command: string): string {
  *  flag-name/value-form coverage: bare (never swallowing a following
  *  element that is itself another flag), `=` form (incl. empty), and
  *  repeated occurrences. */
-function stripSessionFlagsFromArgv(tokens: string[]): string[] {
+function stripSessionFlagsFromArgv(
+  tokens: string[],
+  names: readonly string[] = SESSION_FLAG_NAMES
+): string[] {
   const out: string[] = [];
   for (let i = 0; i < tokens.length; i++) {
     const t = tokens[i];
-    if (isBareSessionFlag(t)) {
+    if (isBareSessionFlag(t, names)) {
       const next = tokens[i + 1];
       if (next !== undefined && !next.startsWith("--")) i++; // consume the value, when there is one
       continue;
     }
-    if (isEqSessionFlag(t)) continue;
+    if (isEqSessionFlag(t, names)) continue;
     out.push(t);
   }
   return out;
@@ -415,6 +444,15 @@ function stripSessionFlagsFromArgv(tokens: string[]): string[] {
  *      notices the asymmetry finds a test explaining it, not a TODO.
  *   4. A command needing no change comes back byte-identical apart from the
  *      appended flag (#442's guarantee, general to this whole module).
+ *   5. **opencode resumes with `--session <id>`, not `--resume`** (#722): it
+ *      has no `--resume` flag at all, so the default arm would hand its TUI a
+ *      flag it does not know — and a pane opened from the Sessions tab is
+ *      recorded with `opencode --session <id>` already, so without this the
+ *      very next tab restore would rewrite it to
+ *      `opencode --session A --resume A`. Space form, matching the resume arm
+ *      of the backend's own `build_agent_command`; its excision uses
+ *      `OPENCODE_SESSION_FLAG_NAMES` so the recorded `--session` is dropped
+ *      rather than doubled.
  *
  *  Prefers the string `command`; falls back to structured `argv`, then to a
  *  bare `claude --resume` (the historical default — a bare fallback with no
@@ -425,17 +463,25 @@ export function agentResumeCommand(
   argv: string[] | null,
   sessionId: string
 ): { command?: string; argv?: string[] } {
-  // copilot only: `=` form. Every other/unknown CLI (claude, or no CLI
-  // detected at all): space form, unchanged from this function's original
-  // behavior. See property 2 above for why copilot is the one exception.
-  const isCopilot = programFromRestore(command, argv) === "copilot";
+  // Three shapes, by detected CLI: copilot's `=` form (property 2), opencode's
+  // different flag NAME (property 5), and — for claude or no CLI detected at
+  // all — the space-form `--resume` this function has always emitted.
+  const program = programFromRestore(command, argv);
+  const isCopilot = program === "copilot";
+  const isOpencode = program === "opencode";
+  const names = isOpencode ? OPENCODE_SESSION_FLAG_NAMES : SESSION_FLAG_NAMES;
   if (command && command.trim()) {
-    const resumeFlag = isCopilot ? `--resume=${sessionId}` : `--resume ${sessionId}`;
-    return { command: `${stripSessionFlagsFromCommand(command)} ${resumeFlag}` };
+    const resumeFlag = isCopilot
+      ? `--resume=${sessionId}`
+      : isOpencode
+        ? `--session ${sessionId}`
+        : `--resume ${sessionId}`;
+    return { command: `${stripSessionFlagsFromCommand(command, names)} ${resumeFlag}` };
   }
   if (argv && argv.length) {
-    const stripped = stripSessionFlagsFromArgv(argv);
-    return { argv: isCopilot ? [...stripped, `--resume=${sessionId}`] : [...stripped, "--resume", sessionId] };
+    const stripped = stripSessionFlagsFromArgv(argv, names);
+    if (isCopilot) return { argv: [...stripped, `--resume=${sessionId}`] };
+    return { argv: [...stripped, isOpencode ? "--session" : "--resume", sessionId] };
   }
   return { command: `claude --resume ${sessionId}` };
 }
@@ -454,24 +500,51 @@ export function agentResumeCommand(
  *  `=`-form copilot `--resume`: the copilot CLI reference documents
  *  `--session-id ID` specifically in the space form, so the two flags are
  *  correctly asymmetric. `test/panerestore.test.ts` pins this explicitly so
- *  a future cleanup pass finds the reason, not just the inconsistency. */
+ *  a future cleanup pass finds the reason, not just the inconsistency.
+ *
+ *  **opencode keeps no identity across this fallback, because it cannot**
+ *  (#722): no opencode flag pre-assigns a session id — `--session` continues
+ *  an existing one, and there is no `--session-id` — so the recorded id is
+ *  dropped along with any stale session flag and the pane starts a genuinely
+ *  new conversation, whose id the reconciler learns afterwards exactly as it
+ *  does for any other bare opencode pane. Appending `--session-id` to an
+ *  opencode line instead (what the shared arm would do) hands its TUI an
+ *  unknown flag; appending `--session <id>` would be worse than that — it is
+ *  precisely the doomed resume this function exists to avoid, since this arm
+ *  is only reached when the caller has established that the session is not
+ *  resumable. */
 export function agentFreshCommand(
   command: string | null,
   argv: string[] | null,
   sessionId: string
 ): { command?: string; argv?: string[] } {
+  const isOpencode = programFromRestore(command, argv) === "opencode";
+  const names = isOpencode ? OPENCODE_SESSION_FLAG_NAMES : SESSION_FLAG_NAMES;
   if (command && command.trim()) {
-    return { command: `${stripSessionFlagsFromCommand(command)} --session-id ${sessionId}` };
+    const stripped = stripSessionFlagsFromCommand(command, names);
+    return { command: isOpencode ? stripped : `${stripped} --session-id ${sessionId}` };
   }
   if (argv && argv.length) {
-    return { argv: [...stripSessionFlagsFromArgv(argv), "--session-id", sessionId] };
+    const stripped = stripSessionFlagsFromArgv(argv, names);
+    return { argv: isOpencode ? stripped : [...stripped, "--session-id", sessionId] };
   }
   return { command: `claude --session-id ${sessionId}` };
 }
 
 /** The two CLIs `solo_prepare` (mod.rs:10441) mints a channel identity for —
  *  the only ones whose recorded command can carry the flags `stripSoloMcpFlags`
- *  below recognizes. */
+ *  below recognizes.
+ *
+ *  Bound to `CliCaps::mcp_argv_seam`, NOT to the set of CLIs whose sessions
+ *  loomux can list: opencode joined `SessionInfo["source"]` in #722 and stays
+ *  out of here, because its MCP/containment seam is an env-delivered config
+ *  document rather than flags on a command line (`solo_prepare`'s own
+ *  `unreachable!` arm covers every seamless CLI). A solo opencode pane is
+ *  delivery-only from birth and its recorded command carries no identity flags
+ *  at all, so there is nothing for this type to name and nothing for
+ *  `stripSoloMcpFlags` to excise — it comes back from that function untouched,
+ *  as `cli: null`, which is correct. This widens when opencode gets an argv
+ *  seam, not when the Sessions tab learns to list it. */
 export type SoloCli = "claude" | "copilot";
 
 // The minted config path is always a real Windows profile path
@@ -690,6 +763,27 @@ export function normalizeAgentProgram(raw: string): string {
 export function programFromRestore(command: string | null, argv: string[] | null): string | null {
   const first = command?.trim().split(/\s+/)[0] || argv?.[0];
   return first ? normalizeAgentProgram(first) : null;
+}
+
+/** Which session-STORE CLI a launch command names, or null when it names none
+ *  — `Pane.agentCli`'s body, moved here (#722) so it is unit-testable and so
+ *  this file's single first-token derivation is followed by a single
+ *  membership test, rather than that set being spelled a second time in
+ *  `pane.ts` (the #452 theme this module already carries for the derivation
+ *  itself).
+ *
+ *  The set is exactly `Cli` — `SessionInfo["source"]`, the CLIs loomux can
+ *  scan sessions for — and that identity is the point rather than a
+ *  coincidence: this answer is matched against `listSessions()` rows, so a CLI
+ *  the scanner lists but this returns `null` for is a pane that can never
+ *  adopt the session sitting in the sidebar under its own cwd. Everything else
+ *  — codex, gemini, a plain shell, a program loomux does not know — is null,
+ *  because there is no store to match it against. */
+export function sessionCliFromCommand(command: string | null | undefined): Cli | null {
+  const first = command?.trim().split(/\s+/)[0];
+  if (!first) return null;
+  const program = normalizeAgentProgram(first);
+  return program === "claude" || program === "copilot" || program === "opencode" ? program : null;
 }
 
 /** Whether a restored copilot pane's command/argv actually carries

@@ -194,11 +194,33 @@ fast disk while a regression re-parsed everything.
 count**, not a timing: no caller can start a scan that a completed or in-flight
 scan could have answered.
 
+## A source with no files, and so no index (#722)
+
+opencode keeps its sessions in one SQLite database, so `scan_opencode` joins
+the scan *after* the two parts above and takes part in neither: there is no
+candidate to collect (nothing on disk names a session) and nothing to cache
+(one indexed `SELECT` returns every column, for every session, in one go — the
+per-file head-parse this index exists to avoid does not exist here).
+
+Reusing the index for it would have been worse than pointless. Entries are
+keyed by **file path** and validated by `(mtime, len)`, and every one of those
+sessions shares a single file whose mtime moves on every write — so all N rows
+would collide on one key and invalidate together whenever any one session was
+touched.
+
+The two bounds still hold, applied where they fit: the row limit is pushed into
+the query as a `LIMIT`, and the merged list is **re-sorted** by timestamp and
+cut to `LIST_LIMIT` — so the cap keeps meaning "the newest 300 sessions on this
+machine", not 300 per source. `ScanStats::opencode` counts those rows
+separately from `parsed`/`reused` for the same reason: neither word describes
+them.
+
 ## Where the pieces live
 
 | Concern | File |
 | --- | --- |
 | Candidate collection (metadata only, per CLI) | `src-tauri/src/sessions.rs` — `collect_claude_candidates`, `collect_copilot_candidates`, `candidate_meta` |
+| The file-less source (one query, no index) | `src-tauri/src/sessions.rs` — `scan_opencode`, `opencode_store_from`; the SQL in `src-tauri/src/opencodedb.rs` — `recent_sessions` |
 | Bound + cache + stats | `src-tauri/src/sessions.rs` — `scan_sessions`, `LIST_LIMIT`, `ScanStats` |
 | Index load/save, version gate, test seam | `src-tauri/src/sessions.rs` — `load_session_index`, `save_session_index`, `set_session_index_path_for_test` |
 | Re-derived (never cached) row fields | `src-tauri/src/sessions.rs` — `to_session_info` |

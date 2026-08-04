@@ -422,6 +422,76 @@ pub fn identify_session_on(
     })
 }
 
+// ── Browsing a store's sessions (#722 slice C2) ────────────────────────────
+
+/// One root session, as the Sessions browser lists it.
+///
+/// Deliberately the store's own columns and nothing derived: the title is
+/// untidied, the directory is the raw `session.directory` string (forward
+/// slashes on Windows), and the timestamp is the column. Turning those into a
+/// `SessionInfo` — tidying, the resume command, the row limit's meaning across
+/// CLIs — is `sessions.rs`'s job, the same boundary
+/// [`SessionTotals`] keeps for usage.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionRow {
+    pub id: String,
+    pub title: String,
+    pub directory: String,
+    /// `session.time_updated`, unix **milliseconds** — the unit the store's own
+    /// records are in (`LOCAL-OBSERVED`, slice-V memo §1b: a `message.data`
+    /// blob from this machine carries `"time": {"created": 1785703307950}`,
+    /// and an id's first 6 bytes are the same millisecond clock).
+    pub updated_ms: u64,
+}
+
+/// The `limit` most recently updated **root** sessions in the store at `db`.
+///
+/// `parent_id IS NULL` for the same reason [`identify_session_on`] has it: a
+/// subagent session is a row of its own, and listing one offers the human a
+/// conversation they never had — its parent's `@explore` detour — as if it
+/// were a session to resume.
+///
+/// **Ordered by `time_updated`, never by id.** OpenCode may mint ids
+/// `descending` (a bitwise-inverted timestamp, `id.ts#L62`, slice-V memo §1c),
+/// so id order is not time order and sorting on it would silently shuffle the
+/// list on a machine whose opencode chose the other direction.
+///
+/// The `LIMIT` is pushed into SQL rather than applied after: the caller shows
+/// at most a few hundred rows, and a store with a long history should not
+/// materialize every one of them to throw them away — the same bound
+/// `sessions.rs` learned to apply before parsing in #493.
+pub fn recent_sessions(db: &Path, limit: usize) -> Result<Vec<SessionRow>, Unavailable> {
+    recent_sessions_on(&open_readonly(db)?, limit)
+}
+
+/// [`recent_sessions`] against an already-open connection.
+pub fn recent_sessions_on(conn: &Connection, limit: usize) -> Result<Vec<SessionRow>, Unavailable> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, title, directory, time_updated FROM session \
+             WHERE parent_id IS NULL ORDER BY time_updated DESC LIMIT ?1",
+        )
+        .map_err(drift)?;
+    let rows = stmt
+        .query_map([limit as i64], |r| {
+            Ok(SessionRow {
+                id: r.get(0)?,
+                title: r.get(1)?,
+                directory: r.get(2)?,
+                // A negative timestamp is not a time this codebase has a use
+                // for, and `as u64` on one would wrap to something
+                // astronomical — the same clamp the token counters get below.
+                updated_ms: sane_count(r.get::<_, i64>(3)?),
+            })
+        })
+        .map_err(drift)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(drift)?);
+    }
+    Ok(out)
+}
+
 /// The directory a session recorded for itself, for resolving where to resume
 /// it — the opencode analogue of reading a claude transcript's `cwd` or a
 /// copilot `workspace.yaml`'s. `Ok(None)`: the store is readable and has no

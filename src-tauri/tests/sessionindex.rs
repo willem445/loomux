@@ -17,20 +17,27 @@
 use loomux_lib::sessions::{
     find_session_cwd, list_sessions_for_test, set_claude_projects_root_for_test,
     set_copilot_session_state_root_for_test, set_launch_intent_path_for_test,
-    set_legacy_copilot_posture_path_for_test, set_session_index_path_for_test, LIST_LIMIT,
+    set_legacy_copilot_posture_path_for_test, set_opencode_store_for_test,
+    set_session_index_path_for_test, LIST_LIMIT,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, UNIX_EPOCH};
 
-/// Every store path the scan touches, bound to one tempdir. Both CLI roots are
+/// Every store path the scan touches, bound to one tempdir. Every CLI root is
 /// bound even when a test only fixtures one of them: the scan is a single pass
-/// over both, so leaving either unbound would walk the developer's real
-/// `~/.claude`/`~/.copilot` history — slow, non-deterministic, and (with 826
-/// real sessions) big enough to push a test's own fixtures past `LIST_LIMIT`.
-/// The launch-intent pair is bound for the same reason: `resume_command` is
-/// derived from it, and an unbound legacy path would read the developer's real
-/// `copilot-posture.json`.
+/// over all of them, so leaving any unbound would walk the developer's real
+/// `~/.claude`/`~/.copilot`/opencode history — slow, non-deterministic, and
+/// (with 826 real sessions) big enough to push a test's own fixtures past
+/// `LIST_LIMIT`. The launch-intent pair is bound for the same reason:
+/// `resume_command` is derived from it, and an unbound legacy path would read
+/// the developer's real `copilot-posture.json`.
+///
+/// #722 added the third store, and it is bound to a path inside the tempdir
+/// that nothing here creates: these tests are about the FILE-backed sources,
+/// so opencode's contribution to every one of them must be a deterministic
+/// zero rather than whatever the developer's own opencode has been up to.
+/// `tests/opencodebrowse.rs` is where that source is fixtured and asserted on.
 struct Seam {
     _tmp: tempfile::TempDir,
     claude: PathBuf,
@@ -50,6 +57,7 @@ fn seam() -> Seam {
     set_session_index_path_for_test(Some(index.clone()));
     set_launch_intent_path_for_test(Some(tmp.path().join("launch-intent.json")));
     set_legacy_copilot_posture_path_for_test(Some(tmp.path().join("copilot-posture.json")));
+    set_opencode_store_for_test(Some(tmp.path().join("opencode").join("opencode.db")));
     Seam { _tmp: tmp, claude, copilot, index }
 }
 
@@ -59,6 +67,7 @@ fn clear_seams() {
     set_session_index_path_for_test(None);
     set_launch_intent_path_for_test(None);
     set_legacy_copilot_posture_path_for_test(None);
+    set_opencode_store_for_test(None);
 }
 
 /// Stamp an exact mtime, so "the newest 300" is a fact about the fixture rather
