@@ -20673,9 +20673,6 @@ impl OrchRegistry {
                 // already drops a session whose transcript won't read, so a
                 // missing store shrinks `sessions_scanned` rather than failing
                 // somebody else's digest.
-                // PROBE 2 (#722 slice B2): the pre-change refusal.
-                return Err(format!("session_digest does not support agent CLI {cli:?}"));
-                #[allow(unreachable_code)]
                 let db = self.opencode_db_path(group);
                 let rows = crate::opencodedb::session_transcript(&db, session_id)
                     .map_err(|e| format!("no opencode transcript for session {session_id}: {e}"))?;
