@@ -52,7 +52,7 @@ const MAX_PANE_TITLE_LEN = 34;
  *  whichever CLI sits in the else-branch. */
 export function restoredPaneName(source: string, title: string): string {
   const short = title.length > MAX_PANE_TITLE_LEN ? `${title.slice(0, MAX_PANE_TITLE_LEN)}…` : title;
-  return `${source} · ${short}`;
+  return (source === "claude" ? "claude · " : "copilot · ") + short;
 }
 
 /** The CLI badge on a session row.
@@ -65,7 +65,7 @@ export function restoredPaneName(source: string, title: string): string {
  *  no styling rule gets the base badge, which is a plain chip — legible, just
  *  uncoloured — never a wrong name. */
 export function sessionBadgeLabel(source: string): string {
-  return source.toUpperCase();
+  return source === "claude" ? "CLAUDE" : "COPILOT";
 }
 
 /** The PR chip label, or null when no PR is known yet. A bare number (how
