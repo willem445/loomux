@@ -28217,7 +28217,7 @@ impl OrchRegistry {
                         snap.cache_creation_tokens = u.tokens.cache_creation_tokens;
                         snap.cache_read_tokens = u.tokens.cache_read_tokens;
                         snap.cost_usd = u.cost_usd;
-                        snap.estimated = false; // priced by opencode, not by us
+                        snap.estimated = true; // PROBE 13
                         snap.model = u.model;
                         return snap;
                     }
