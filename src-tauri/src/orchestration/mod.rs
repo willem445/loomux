@@ -30313,6 +30313,11 @@ impl OrchRegistry {
         &self,
         last_delivery: &Mutex<HashMap<u32, DeliveryOutcome>>,
     ) {
+        // RED ROUND 1 (#825 M3): the feature stubbed to a no-op, so the tests
+        // that assert it DOES something are seen to fail. Reverted immediately.
+        if std::hint::black_box(true) {
+            return;
+        }
         // Snapshot first, then drop both locks before touching the queue map —
         // `attention_tick`'s lock order (`attn_stranded`, then `agents`), the
         // same discipline the janitor pass follows. Nothing is filtered by class
