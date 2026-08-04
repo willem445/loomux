@@ -12067,22 +12067,33 @@ fn a_complete_opencode_session_id_is_not_mistaken_for_a_truncated_prefix() {
         "the id must arrive intact, not rewritten to some roster entry: {agents}"
     );
 
-    // And the shape check must not become a blanket "anything starting with
-    // `ses_`": a genuinely truncated opencode id is still a prefix, and one
-    // matching nothing in the roster is still an unknown session.
-    let short = dispatch(&reg, &co, "tools/call", &json!({
-        "name": "spawn_agent",
-        "arguments": {
-            "kind": "worker",
-            "resume_session": "ses_03bd2d53",
-            "cwd": dir.path().to_string_lossy(),
-            "task": "follow-up",
-        },
-    })).unwrap();
-    assert_eq!(
-        short["isError"], true,
-        "a truncated opencode id resolves or fails as a prefix, never passes through: {short:?}"
-    );
+    // And the shape check must not decay into a blanket "anything starting
+    // with `ses_`". Both of these are still prefixes, and both match nothing
+    // in the roster, so both must be refused rather than passed through.
+    //
+    // Neither shares a prefix with `full_opencode` on purpose: the spawn above
+    // put that id ON the roster, so `ses_03bd2d53` would now resolve against
+    // it perfectly legitimately (#190's whole feature) and would be pinning
+    // test order rather than the shape rule.
+    for not_full in [
+        "ses_99999999",                   // truncated
+        "ses_9zbd2d53dffeiBvu9PvuCPjxT7", // right length, non-hex timestamp
+    ] {
+        let r = dispatch(&reg, &co, "tools/call", &json!({
+            "name": "spawn_agent",
+            "arguments": {
+                "kind": "worker",
+                "resume_session": not_full,
+                "cwd": dir.path().to_string_lossy(),
+                "task": "follow-up",
+            },
+        })).unwrap();
+        assert_eq!(
+            r["isError"], true,
+            "{not_full:?} is not a complete opencode id and must resolve as a prefix \
+             (here: fail as unknown), never pass through: {r:?}"
+        );
+    }
 }
 
 #[test]
