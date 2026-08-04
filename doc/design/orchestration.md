@@ -6857,6 +6857,13 @@ the two lose the same characters and only specificity is spent. The read-SIZING 
 a request rather than compare, so an un-de-framed needle only ever asks for more tail, which is
 conservative and preserves #559's "no read is ever narrower than it was".
 
+**1b. And the de-framed route is ADDED to the flat one, never substituted for it.**
+`box_holds_paste` runs both normalizations and holds if either matches. That is the property the
+whole change rests on — **#821 can only ever add `Holds` readings** — and it is structural rather
+than argued, which matters because the argued version was wrong twice before it was right (see the
+residuals). It also costs almost nothing: the second route runs only on the path that was already
+about to answer "not holding".
+
 **2. `paste_echo_probe` — a partial match is never an absence.** De-framing handles the decoration
 we know about; the probe covers the decoration we do not, *without modelling any of it*. If the
 longest line of our paste is still in the window but the whole will not match, the text is
@@ -6931,20 +6938,37 @@ rest of the floor, the latter because `deframe` is now shared across both gates.
   residual failures into `Unverifiable`. Sizing the probe from real terminal geometry would buy
   nothing here and would couple this to a width the comparison deliberately does not know.
 
-  **The one corner where it is not a superset**, found while re-deriving that argument rather than
-  left for a later reviewer: de-framing can cost a match that previously succeeded, where a row
-  boundary lands immediately before a character `is_frame_char` strips which is MID-line in our own
-  text — a wrap between `run` and `* now`, so the tail loses the `*` and the needle keeps it. In
-  any real delivery that lands on `Unverifiable`, via the length arm or the probe; but a paste
-  whose longest line is under `PASTE_ECHO_PROBE_MIN_CHARS` has no probe, and it can then read
-  `NotHolding` where the pre-#821 code read `Holds`. That needs a pane narrow enough to wrap a
-  sub-24-character line — degenerate for a GUI pane, and strictly narrower than the hard-wrap case
-  — so the claim to make is "no width at which this regresses **for any real delivery**", not a
-  universal one.
-- A wrap landing such that a continuation row *starts* with a character `deframe` strips (a `*` in
-  `2 * 3`, mid-line in our own text) de-frames on the tail side but not the needle side.
-  Containment then fails and the probe catches it as `Unverifiable` — the safe direction, and the
-  case the probe exists for.
+  **And the superset property is now structural rather than argued** (rev-306 B1). An earlier
+  version of this note disclosed a corner where de-framing could *lose* a match the flat comparison
+  had found — a wrap pushing a mid-line `|`/`*` to a row start, so `deframe` strips it from the
+  tail (row-leading) while the needle keeps it (mid-line) — and bounded it at "a pane narrow enough
+  to wrap a sub-24-character line, degenerate for a GUI pane". **That bound was wrong.** It came
+  from the case where no probe is FORMED, and says nothing about whether a formed probe MATCHES:
+  the probe samples that same needle line, so it carries the same `|` and fails for the same
+  reason. A wrap boundary lands inside its 48-character sample exactly when the composer is under
+  48 columns — a 25-47 column four-way split, which is this product's premise, not a degenerate
+  case. `ps aux | grep loomux` wrapped before the pipe read `NotHolding` where the flat comparison
+  read `Holds`: a new route to the reading this whole change exists to make expensive.
+
+  `box_holds_paste` therefore tries **both** normalizations and holds if either matches, so #821
+  can only ever ADD `Holds` readings. That is a property of the construction rather than of a case
+  analysis, which matters because the case analysis had already been wrong twice. A narrower
+  `deframe` (box-drawing glyphs only, sparing `*` and `|`) would dodge both known shapes, would
+  still be a case analysis, and would mint the second notion of decoration that sharing `deframe`
+  exists to avoid. The three fixtures now exercise different routes — `h1`'s gutter matches only
+  de-framed, `h6`'s pipe wrap only flat, `h3`'s scrollbar neither — which is what keeps both from
+  being redundant.
+
+  **The probe is not what guarantees this and never could be**: it shares the failure mode of the
+  containment it backstops. Its job is the narrower one of turning a residual containment failure
+  into `Unverifiable` rather than a confident absence.
+- A wrap landing such that a continuation row *starts* with a character `deframe` strips (the `|`
+  in `ps aux | grep`, mid-line in our own text) de-frames on the tail side but not the needle side,
+  so the de-framed route fails. **An earlier version of this bullet said the probe catches it as
+  `Unverifiable`. It does not** — the probe samples that same needle line and carries the same
+  character, so it fails identically; that claim was the reasoning error behind the wrong bound
+  above. The flat route is what catches it, and catches it as `Holds`, which is also what the
+  pre-#821 code answered. `h6` pins it.
 - The premise remains sourced from copilot-cli issue evidence rather than a live capture
   (constraint 3). The fix does not depend on which composer a pane gets: it is about *any* per-row
   decoration, not about `┃`.
