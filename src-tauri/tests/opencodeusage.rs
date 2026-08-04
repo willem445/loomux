@@ -251,7 +251,18 @@ fn a_schema_missing_the_token_columns_degrades_instead_of_panicking() {
 
     match opencodedb::session_usage(&s.db(), SES) {
         Err(Unavailable::Query(e)) => {
-            assert!(e.contains("tokens_input") || e.contains("no such column"), "{e}")
+            // Same trap as rev-298's F3, at a second site: `e` is SQLite's
+            // diagnosis followed by an echo of the failing statement, and the
+            // echo names every column the query mentions — so the old
+            // `contains("tokens_input")` disjunct matched the echo rather than
+            // the report, and would have held even against an empty diagnosis.
+            // Pin the diagnosis itself, which is everything before the echo.
+            let diagnosis = e.split(" in ").next().unwrap_or_default();
+            assert_eq!(
+                diagnosis, "no such column: s.cost",
+                "the degrade has to carry which column is missing, not merely \
+                 quote the query back: {e}"
+            );
         }
         other => panic!("schema drift must degrade to Unavailable::Query, got {other:?}"),
     }
@@ -562,11 +573,27 @@ fn a_store_that_cannot_be_read_is_diagnosed_once_not_once_per_poll() {
          exactly when something is wrong with it: {lines:?}"
     );
     assert_eq!(lines[0]["detail"]["kind"], "unreadable");
-    assert!(
-        lines[0]["detail"]["detail"].as_str().unwrap_or_default().contains("tokens_input"),
-        "the line has to carry WHICH column went missing, or it is a bare \
-         'something failed' that sends the reader back to the code: {:?}",
-        lines[0]
+
+    // SQLite's message is `no such column: <col> in <the whole statement> at
+    // offset N` — a DIAGNOSIS followed by an echo of the failing SQL. The echo
+    // names every column the query mentions, so a `contains(…)` against the
+    // whole string is satisfied by the echo alone and would still pass if the
+    // diagnosis were empty (rev-298 F3: this assertion used to look for
+    // `tokens_input`, which appears ONLY in the echo — the column SQLite
+    // actually reports missing here is `s.cost`, the rollup's first reference
+    // to a column the drifted table lacks).
+    //
+    // So pin the diagnosis, which is everything before the echo. Matching it
+    // exactly is safe precisely because SQLite is `bundled`: the message text
+    // comes from a C library whose version this repo pins itself, not from
+    // whatever the operator has installed.
+    let detail = lines[0]["detail"]["detail"].as_str().unwrap_or_default();
+    let diagnosis = detail.split(" in ").next().unwrap_or_default();
+    assert_eq!(
+        diagnosis, "opencode database schema drift: no such column: s.cost",
+        "the line has to carry WHICH column the store is missing; an assertion \
+         that matches the echoed SQL instead would pass on any error at all — \
+         full detail: {detail:?}"
     );
 }
 
