@@ -2738,6 +2738,105 @@ const COPILOT_SESSION_POLL: Duration = Duration::from_millis(1000);
 /// Give up watching after this long (copilot never initialized, or crashed).
 const COPILOT_SESSION_TIMEOUT: Duration = Duration::from_secs(90);
 
+// OpenCode session tracking (#722): the same after-the-fact problem as
+// copilot's, one store down — `--session` continues an existing session and
+// nothing pre-assigns one, so loomux learns the id by watching this group's
+// own store (`OPENCODE_DB`) for a row that was not there before the spawn.
+/// How often to poll the group's store. Slower than copilot's tick because
+/// each one is a SQLite open + query rather than a directory listing, and
+/// because the deadline below is an order of magnitude longer.
+const OPENCODE_SESSION_POLL: Duration = Duration::from_secs(2);
+/// Give up watching after this long.
+///
+/// Far longer than copilot's 90s, and the reason is an honest gap rather than
+/// caution: loomux cannot verify whether opencode writes the `session` row at
+/// TUI boot or only when the first turn starts — checking would mean spawning
+/// the real CLI, which constraint 3 forbids. A deadline picked for "at boot"
+/// would silently leave every pane whose first turn was late (a kickoff queued
+/// behind a busy pane, a human who walked away) permanently unidentified, and
+/// the failure would look exactly like the CLI not being installed. Ten
+/// minutes covers the first turn either way; the cost of being wrong in this
+/// direction is one sleeping thread.
+const OPENCODE_SESSION_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Where to look for the session a just-spawned pane is about to mint, plus
+/// the snapshot of what was already there (#722).
+///
+/// Only the CLIs that mint their own id after boot have one. Claude is handed
+/// its id up front (`--session-id`), so there is nothing to learn; gemini has
+/// no session store loomux reads.
+#[derive(Clone, Debug)]
+#[doc(hidden)] // pub for integration tests
+pub enum SessionBaseline {
+    /// The ids under `~/.copilot/session-state`, and the root they came from —
+    /// carried rather than re-resolved so the poll cannot end up reading a
+    /// different directory than the baseline was taken from.
+    Copilot { ids: HashSet<String>, root: PathBuf },
+    /// The ids in **this group's** opencode store. The path is deliberately
+    /// *not* carried: it is recomputed per poll from `opencode_db_path`, the
+    /// one function the spawn that creates the store and the usage read that
+    /// consumes it already share (#812).
+    OpenCode { ids: HashSet<String> },
+}
+
+impl SessionBaseline {
+    fn cli(&self) -> &'static str {
+        match self {
+            SessionBaseline::Copilot { .. } => "copilot",
+            SessionBaseline::OpenCode { .. } => "opencode",
+        }
+    }
+    fn poll(&self) -> Duration {
+        match self {
+            SessionBaseline::Copilot { .. } => COPILOT_SESSION_POLL,
+            SessionBaseline::OpenCode { .. } => OPENCODE_SESSION_POLL,
+        }
+    }
+    fn timeout(&self) -> Duration {
+        match self {
+            SessionBaseline::Copilot { .. } => COPILOT_SESSION_TIMEOUT,
+            SessionBaseline::OpenCode { .. } => OPENCODE_SESSION_TIMEOUT,
+        }
+    }
+}
+
+/// The outcome of one poll of a session store.
+///
+/// `Contested` and `Unreadable` exist so that giving up can say *why*: a pane
+/// that never identified because two sessions matched needs a different answer
+/// from a human than one whose CLI never wrote a session at all, and both
+/// otherwise surface only as "no session id".
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[doc(hidden)] // pub for integration tests
+pub enum SessionSearch {
+    /// Nothing new yet — keep polling. The normal answer for a booting pane.
+    Waiting,
+    Found(String),
+    /// More than one candidate, carrying how many. Refused, never guessed —
+    /// see `opencodedb::identify_session_on`.
+    Contested(usize),
+    Unreadable(String),
+}
+
+impl SessionSearch {
+    /// What to record when the watch gives up in this state.
+    fn untracked_reason(&self) -> String {
+        match self {
+            // `Found` cannot reach here (the watcher returns on it), but a
+            // reason string is not the place to `unreachable!()` a background
+            // thread over.
+            SessionSearch::Waiting | SessionSearch::Found(_) => {
+                "no new session appeared before timeout".to_string()
+            }
+            SessionSearch::Contested(n) => format!(
+                "{n} candidate sessions matched this pane's directory and none could be told \
+                 apart — refused rather than bind the wrong conversation"
+            ),
+            SessionSearch::Unreadable(e) => format!("session store unreadable: {e}"),
+        }
+    }
+}
+
 /// An agent's **capability class** — the closed enum (#222).
 ///
 /// Before the block model this enum *was* an agent's identity: it decided the
@@ -10027,10 +10126,55 @@ fn new_session_uuid() -> String {
 
 /// Session ids get interpolated into a shell command line; validate (not
 /// filter — a mangled id would silently resume the wrong session).
+///
+/// **The alphabet is ASCII alphanumerics plus `-` and `_`, and the widening to
+/// reach that is deliberate (#722).** It used to be hex digits and `-`, which
+/// is exactly a Claude UUID and nothing else — so every opencode id was
+/// rejected outright: opencode mints `ses_` + 12 hex + 14 base62
+/// (`ses_03bd2d53dffeiBvu9PvuCPjxT7`, `SOURCE`, `id.ts`), whose `_` and
+/// mixed-case letters both fell outside. `spawn_agent(resume_session = <an
+/// opencode id>)` failed as "invalid resume session id" with nothing malformed
+/// about the id.
+///
+/// **The size of the widening, stated accurately:** the alphabet goes from 23
+/// characters (`0-9a-fA-F` plus `-`) to 64 (`0-9A-Za-z` plus `-` and `_`), so
+/// **41** characters were added — the non-hex ASCII letters, and `_`. It is
+/// emphatically not "two more characters"; an earlier revision of this comment
+/// said so and was wrong, which is worth not repeating in a validator whose
+/// whole job is to bound what may reach a path join.
+///
+/// What the widening does *not* admit is the property that matters, and it is
+/// unchanged: no path separator, no `.` (so `.`/`..` cannot be spelled), no
+/// whitespace, no quote, no shell or PowerShell metacharacter, no NUL. Every
+/// one of the 41 added characters is an ASCII letter, inert in a path
+/// component and inert on a command line, so everything downstream that treats
+/// a session id as a path component (`digest::is_safe_session_id`, and the
+/// `Path::join` in `read_session_transcript_events`) or interpolates it into a
+/// command line keeps every guarantee it had. Same deliberate-widening shape
+/// as `sanitize_model`'s `/`, and pinned the same way.
+///
+/// **This gate is global, not per-CLI, and that is a deliberate trade
+/// (rev-306 NB2).** A malformed *claude* id — one carrying `g`-`z` — now gets
+/// past this door and fails later, inside the CLI, instead of failing here.
+/// Making the alphabet per-CLI is entirely possible (both callers have `cli`
+/// in scope), and was rejected: this function is a **safety** gate answering
+/// "can this string escape a path or an argument", not an **authenticity**
+/// gate answering "is this a well-formed id for this vendor". It never
+/// answered the second question anyway — `aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa`
+/// names no session and passed cleanly before this change too — so per-CLI
+/// shapes would buy an earlier error only for the narrow "typo that happens to
+/// contain a non-hex letter" case, while adding a vendor-shape table whose
+/// failure mode is refusing a *valid* session the day a vendor changes its id
+/// format. That is precisely the bug this slice just fixed for opencode, and
+/// it is not one to reintroduce for the others. Shape questions are answered
+/// by `is_full_session_id` and roster resolution, where being wrong yields a
+/// diagnosable "unknown session" rather than a flat refusal.
 fn sanitize_session(s: &str) -> Option<String> {
     let t = s.trim();
-    (!t.is_empty() && t.len() <= 64 && t.chars().all(|c| c.is_ascii_hexdigit() || c == '-'))
-        .then(|| t.to_string())
+    (!t.is_empty()
+        && t.len() <= 64
+        && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+    .then(|| t.to_string())
 }
 
 /// A Claude Code session id's full length: `8-4-4-4-12` hex hyphenated (see
@@ -10038,16 +10182,61 @@ fn sanitize_session(s: &str) -> Option<String> {
 /// truncated prefix rather than a (possibly external/unrecorded) full id.
 const FULL_SESSION_ID_LEN: usize = 36;
 
+/// Is `s` an opencode session id in full (#722)?
+///
+/// `ses_` + 12 lowercase hex (a 6-byte timestamp) + 14 base62, 30 characters
+/// in all (`SOURCE`, `id.ts`). Recognized by *shape* because opencode's ids are
+/// shorter than a claude UUID: without this, [`is_full_session_id`] would read
+/// a complete opencode id as a truncated prefix and refuse it as an unknown
+/// session — see there for why that matters.
+///
+/// Compared character by character rather than by byte-slicing at 12: a
+/// caller-supplied string is not guaranteed ASCII, and `&rest[..12]` on one
+/// that is not would panic on a char boundary. This is fed by an MCP argument,
+/// so "no caller can get here with such a string" is not a claim worth betting
+/// a panic on.
+fn is_opencode_session_id(s: &str) -> bool {
+    let Some(rest) = s.strip_prefix("ses_") else {
+        return false;
+    };
+    let mut chars = rest.chars();
+    let stamp_ok = chars
+        .by_ref()
+        .take(12)
+        .filter(|c| c.is_ascii_digit() || ('a'..='f').contains(c))
+        .count()
+        == 12;
+    let tail: Vec<char> = chars.collect();
+    stamp_ok && tail.len() == 14 && tail.iter().all(|c| c.is_ascii_alphanumeric())
+}
+
+/// Is `s` already a complete session id for some CLI loomux supports, as
+/// opposed to a prefix of one?
+///
+/// The distinction decides whether [`resolve_session_ref`] passes an input
+/// through untouched or insists on resolving it against this group's roster.
+/// Length alone answered that while claude was the only CLI minting ids
+/// loomux had to recognize; an opencode id is 30 characters, so length alone
+/// would call every complete one a prefix and reject any that this group's
+/// roster happened not to record — a session from another group's audit log, a
+/// roster that lost the entry — as "unknown session", where the equivalent
+/// claude id passes through. Two shapes, one question.
+fn is_full_session_id(s: &str) -> bool {
+    s.len() >= FULL_SESSION_ID_LEN || is_opencode_session_id(s)
+}
+
 /// Resolve a caller-supplied `resume_session` value to the one full session id
 /// it names (#190). A hand-copied or logged session id is naturally truncated
 /// (8 hex chars is what humans and terminals show), and Claude Code session ids
 /// are full UUIDs — before this, a truncated id just failed to resolve with no
 /// indication of why. An exact match against this group's roster wins outright,
-/// whatever its length. Otherwise, an input that is already full-length is
-/// passed through unchanged — it may be a genuine session this group never
-/// recorded (a resume with an explicit `kind`/`block` has always allowed that;
-/// #190 is only about *truncated* ids, which can never be "the real thing" on
-/// their own). Only a SHORTER input is treated as a prefix to resolve: zero
+/// whatever its length. Otherwise, an input that is already a complete id for
+/// some supported CLI ([`is_full_session_id`] — length for claude, shape for
+/// opencode) is passed through unchanged — it may be a genuine session this
+/// group never recorded (a resume with an explicit `kind`/`block` has always
+/// allowed that; #190 is only about *truncated* ids, which can never be "the
+/// real thing" on their own). Only a shorter, shapeless input is treated as a
+/// prefix to resolve: zero
 /// matches is a plain "unknown session" (never seen it, in full or part), two
 /// or more is "ambiguous" and lists every candidate so the caller can pick —
 /// this must never silently choose one.
@@ -10064,7 +10253,7 @@ fn resolve_session_ref(records: &[AgentRecord], input: &str) -> Result<String, S
     if records.iter().any(|r| r.session.as_deref() == Some(input)) {
         return Ok(input.to_string());
     }
-    if input.len() >= FULL_SESSION_ID_LEN {
+    if is_full_session_id(input) {
         return Ok(input.to_string());
     }
     let mut matches: Vec<&str> =
@@ -10111,8 +10300,12 @@ fn resolve_session_ref(records: &[AgentRecord], input: &str) -> Result<String, S
 /// arise at this layer: a session id names at most one file in the store, by
 /// construction — that outcome is scoped to `resolve_session_ref`'s prefix
 /// matching, above.
-pub(crate) fn resolve_resume_cwd(cli: &str, session_id: &str) -> Result<String, String> {
-    match crate::sessions::find_session_cwd(cli, session_id) {
+pub(crate) fn resolve_resume_cwd(
+    cli: &str,
+    session_id: &str,
+    opencode_db: Option<&Path>,
+) -> Result<String, String> {
+    match session_cwd_in_store(cli, session_id, opencode_db) {
         Ok(Some(cwd)) if Path::new(&cwd).is_dir() => Ok(cwd),
         // Found the session, but its record carries no cwd at all (a session
         // whose first ≤60 lines never mention one) — distinct from "not
@@ -10133,6 +10326,43 @@ pub(crate) fn resolve_resume_cwd(cli: &str, session_id: &str) -> Result<String, 
              on this machine — it may have been cleared, or the record is stale."
         )),
         Err(e) => Err(format!("resume-store-unreadable: could not read the {cli} session store: {e}")),
+    }
+}
+
+/// Where a session recorded that it ran, read from the CLI's own store (#722).
+///
+/// This exists because `sessions::find_session_cwd` answers for exactly two
+/// CLIs and sends *everything else* down its claude arm — so before this, an
+/// opencode resume searched `~/.claude/projects`, found nothing, and told the
+/// caller, in those words, that the session "was not found in the opencode
+/// session history on this machine". Not a cosmetic wrong: `register_group_pane`
+/// hard-fails a resume on that answer, which made an opencode group
+/// unresumable outright.
+///
+/// opencode's answer comes from **this group's** store rather than a global
+/// one, because that is where a group's panes write: `OPENCODE_DB` points each
+/// of them at `opencode_db_path(group)`. `None` for the db (a caller with no
+/// group in hand) is "not found", never a fall-through to another CLI's store.
+///
+/// `Absent` maps to `Ok(None)` deliberately — a group whose store was never
+/// created has no such session, which is exactly "not found in the history",
+/// not a store failure the caller should be told to go investigate.
+#[doc(hidden)] // pub for integration tests
+pub fn session_cwd_in_store(
+    cli: &str,
+    session_id: &str,
+    opencode_db: Option<&Path>,
+) -> Result<Option<String>, String> {
+    if cli != "opencode" {
+        return crate::sessions::find_session_cwd(cli, session_id);
+    }
+    let Some(db) = opencode_db else {
+        return Ok(None);
+    };
+    match crate::opencodedb::session_directory(db, session_id) {
+        Ok(dir) => Ok(dir),
+        Err(crate::opencodedb::Unavailable::Absent) => Ok(None),
+        Err(e) => Err(e.to_string()),
     }
 }
 
@@ -10160,11 +10390,12 @@ pub(crate) fn resolve_worker_resume_cwd(
     session_id: &str,
     roster_cwd: Option<&str>,
     group_repo: &str,
+    opencode_db: Option<&Path>,
 ) -> Result<String, String> {
     if let Some(c) = roster_cwd.filter(|c| !c.trim().is_empty() && Path::new(c).is_dir()) {
         return Ok(c.to_string());
     }
-    let cwd = resolve_resume_cwd(cli, session_id)?;
+    let cwd = resolve_resume_cwd(cli, session_id, opencode_db)?;
     if Path::new(&cwd) == Path::new(group_repo) {
         return Err(format!(
             "resume-workspace-missing: session {session_id}'s only recorded workspace is the \
@@ -21308,24 +21539,81 @@ impl OrchRegistry {
             .unwrap_or_default()
     }
 
-    /// Poll `~/.copilot/session-state` for the session the just-spawned
-    /// copilot pane created (the one absent from `baseline`) and bind its id
-    /// to the pane. Runs on its own thread — copilot writes the session a few
-    /// seconds into boot. Gives up after `COPILOT_SESSION_TIMEOUT`.
-    fn spawn_copilot_session_watcher(
+    /// Snapshot the sessions a CLI's store already holds, immediately before a
+    /// pane is spawned, so the one that pane mints can be told apart later.
+    /// `None` for a CLI with nothing to learn (claude is handed its id;
+    /// gemini has no store loomux reads), and `None` when the snapshot itself
+    /// could not be taken — see below.
+    ///
+    /// **A baseline that cannot be read is not an empty baseline.** An empty
+    /// one says "the store held nothing", which makes every session in it a
+    /// candidate; if the truth was "the store could not be opened this
+    /// instant", that turns another pane's existing session into this pane's
+    /// answer. So a real degrade refuses to watch at all — the pane stays
+    /// unidentified, exactly as an opencode pane is today — and says so once
+    /// in the audit log. A *missing* store is the opposite case and genuinely
+    /// is an empty baseline: opencode has not created the group's file yet,
+    /// which is the ordinary state of the first pane in a group.
+    #[doc(hidden)] // pub for integration tests
+    pub fn capture_session_baseline(
+        &self,
+        cli: &str,
+        group: &str,
+    ) -> Option<SessionBaseline> {
+        match cli {
+            "copilot" => crate::sessions::copilot_session_state_root().map(|root| {
+                let ids = crate::sessions::copilot_session_ids(&root);
+                SessionBaseline::Copilot { ids, root }
+            }),
+            "opencode" => match crate::opencodedb::session_ids(&self.opencode_db_path(group)) {
+                Ok(ids) => Some(SessionBaseline::OpenCode { ids }),
+                Err(crate::opencodedb::Unavailable::Absent) => {
+                    Some(SessionBaseline::OpenCode { ids: HashSet::new() })
+                }
+                Err(e) => {
+                    self.audit(group, "loomux", "session-untracked", json!({
+                        "cli": "opencode",
+                        "reason": format!(
+                            "could not snapshot the session store before spawning, so a new \
+                             session cannot be told from an existing one: {e}"
+                        ),
+                    }));
+                    None
+                }
+            },
+            _ => None,
+        }
+    }
+
+    /// Poll the CLI's own session store for the session this just-spawned pane
+    /// created — the one absent from `baseline` — and bind its id to the pane.
+    /// Runs on its own thread; both CLIs write the session some seconds into
+    /// boot. Gives up after the baseline's own deadline.
+    ///
+    /// One watcher for both CLIs (#722), not a copilot one and an opencode
+    /// twin: the shape is identical — snapshot before the spawn, poll for what
+    /// appeared, stop on a dead or already-identified pane, audit once on
+    /// giving up — and only *where to look* differs, which is what
+    /// [`SessionBaseline`] carries.
+    fn spawn_session_watcher(
         self: Arc<Self>,
         agent_id: String,
         group_id: String,
         cwd: String,
-        baseline: HashSet<String>,
+        baseline: SessionBaseline,
     ) {
-        let Some(root) = crate::sessions::copilot_session_state_root() else {
-            return;
-        };
         std::thread::spawn(move || {
-            let deadline = std::time::Instant::now() + COPILOT_SESSION_TIMEOUT;
+            let deadline = std::time::Instant::now() + baseline.timeout();
+            // Why the LAST outcome and not the first: the interesting reason a
+            // watch times out is the one still true at the deadline. A store
+            // that was briefly unreadable and then fine, or a contest that
+            // resolved, must not be what the audit line blames.
+            // Declared without an initial value on purpose: every path that
+            // reaches the timeout check below has already assigned one this
+            // tick, so a placeholder here could only ever be dead.
+            let mut last;
             loop {
-                std::thread::sleep(COPILOT_SESSION_POLL);
+                std::thread::sleep(baseline.poll());
                 // Stop if the pane died or was already associated (a resume
                 // re-spawn, or a manual edit) — nothing left to track.
                 match self.agent(&agent_id) {
@@ -21334,37 +21622,149 @@ impl OrchRegistry {
                     Some(_) => {}
                     None => return,
                 }
-                if let Some(sid) =
-                    crate::sessions::newest_new_copilot_session(&root, &baseline, &cwd)
-                {
-                    self.associate_copilot_session(&group_id, &agent_id, &sid);
-                    return;
+                last = self.search_for_session(&group_id, &agent_id, &cwd, &baseline);
+                if let SessionSearch::Found(sid) = &last {
+                    if self.associate_session(&group_id, &agent_id, sid) {
+                        return;
+                    }
+                    // Lost the race: another pane bound this id between our
+                    // search and our write. Keep watching rather than giving
+                    // up — the winner's claim now excludes that id from our
+                    // search, so the next tick looks for a session of our own,
+                    // which is also exactly what the timeout should report if
+                    // one never appears.
+                    last = SessionSearch::Waiting;
                 }
                 if std::time::Instant::now() >= deadline {
-                    self.audit(&group_id, "loomux", "copilot-session-untracked",
-                        json!({ "agent": agent_id, "reason": "no new session-state appeared before timeout" }));
+                    self.audit(&group_id, "loomux", "session-untracked", json!({
+                        "agent": agent_id,
+                        "cli": baseline.cli(),
+                        "reason": last.untracked_reason(),
+                    }));
                     return;
                 }
             }
         });
     }
 
-    /// Bind a discovered copilot session id to a live pane: update the agent
-    /// map, the durable roster (`agents.json`), and any task board item this
-    /// agent owns — the same session trail Claude gets at spawn. Best-effort.
-    /// Public for the session watcher and its tests; a no-op if the pane is
-    /// gone or already carries a session id.
-    pub fn associate_copilot_session(&self, group_id: &str, agent_id: &str, session_id: &str) {
-        let entry = {
-            let mut agents = self.agents.lock_safe();
-            let Some(a) = agents.get_mut(agent_id) else { return };
-            // Don't clobber an id set in the meantime (e.g. a resume).
-            if a.session_id.is_some() {
-                return;
+    /// One poll of the CLI's session store. Split out of the watcher loop so
+    /// the decision is testable without a thread, a clock, or a live pane.
+    #[doc(hidden)] // pub for integration tests
+    pub fn search_for_session(
+        &self,
+        group_id: &str,
+        agent_id: &str,
+        cwd: &str,
+        baseline: &SessionBaseline,
+    ) -> SessionSearch {
+        match baseline {
+            SessionBaseline::Copilot { ids, root } => {
+                match crate::sessions::newest_new_copilot_session(root, ids, cwd) {
+                    Some(sid) => SessionSearch::Found(sid),
+                    None => SessionSearch::Waiting,
+                }
             }
-            a.session_id = Some(session_id.to_string());
-            a.clone()
+            SessionBaseline::OpenCode { ids } => {
+                // The store is the group's, resolved through the ONE function
+                // the spawn that creates it and the usage read that consumes it
+                // already share (#812) — three callers agreeing by
+                // construction rather than by three matching literals.
+                let db = self.opencode_db_path(group_id);
+                // Sessions other panes in this group have already taken. A
+                // group's store is shared by every pane in it, and several of
+                // those panes run in the SAME directory (the orchestrator, the
+                // reviewer, any worker without its own worktree), so directory
+                // plus baseline alone does not separate them — see
+                // `opencodedb::identify_session_on`.
+                let claimed = self.claimed_sessions(group_id, agent_id);
+                match crate::opencodedb::identify_session(&db, cwd, ids, &claimed) {
+                    Ok(crate::opencodedb::Identified::One(sid)) => SessionSearch::Found(sid),
+                    Ok(crate::opencodedb::Identified::None) => SessionSearch::Waiting,
+                    Ok(crate::opencodedb::Identified::Contested(n)) => SessionSearch::Contested(n),
+                    // Absent is not a degrade here, it is the ordinary state of
+                    // a store opencode has not created yet — the same reading
+                    // `note_opencode_db_degrade` gives it.
+                    Err(crate::opencodedb::Unavailable::Absent) => SessionSearch::Waiting,
+                    Err(e) => SessionSearch::Unreadable(e.to_string()),
+                }
+            }
+        }
+    }
+
+    /// Session ids already bound to OTHER panes in this group.
+    ///
+    /// Live agents only, deliberately: a pane that died before this one
+    /// spawned had its session created before the baseline snapshot, so the
+    /// baseline already excludes it — reading `agents.json` every poll would
+    /// buy nothing and put a file read on a polled path.
+    fn claimed_sessions(&self, group_id: &str, except_agent: &str) -> HashSet<String> {
+        self.agents
+            .lock_safe()
+            .values()
+            .filter(|a| a.group == group_id && a.id != except_agent)
+            .filter_map(|a| a.session_id.clone())
+            .collect()
+    }
+
+    /// Bind a discovered session id to a live pane: update the agent map, the
+    /// durable roster (`agents.json`), and any task board item this agent owns
+    /// — the same session trail Claude gets at spawn. Best-effort. Public for
+    /// the session watcher and its tests.
+    ///
+    /// Returns whether this call bound the id. `false` — a no-op — when the
+    /// pane is gone, when it already carries an id, or when **another pane in
+    /// this group is already bound to this session**. That last one is not a
+    /// formality: see the comment inside, and note that a caller which treats
+    /// `false` as "done" turns a lost race into a permanently unidentified
+    /// pane. The watcher keeps polling instead.
+    pub fn associate_session(&self, group_id: &str, agent_id: &str, session_id: &str) -> bool {
+        // The lock scope DECIDES; everything else happens after the guard
+        // drops — same shape, and same reason, as `note_opencode_db_degrade`:
+        // `audit` takes its own locks, and holding an unrelated one across it
+        // is how lock-order bugs start. Keeping the two sites identical also
+        // means this file has one pattern for "record a refusal" rather than
+        // two a reader has to tell apart (rev-306 F1). What must stay inside
+        // the guard is only the check-and-write pair below, which is the whole
+        // point of NB3.
+        let (entry, taken_by_another) = {
+            let mut agents = self.agents.lock_safe();
+            // The claim exclusion `search_for_session` applies is READ under
+            // this lock and then released before the store is queried, so two
+            // watchers can both be inside that window at once: with one
+            // candidate visible and neither pane bound yet, both searches
+            // legitimately answer `Found(same id)`. Refusing here — under the
+            // one lock that also performs the write — is what makes the
+            // exclusion hold, rather than merely usually holding. Without it
+            // the refusal policy protects only the two-candidate case and
+            // leaks exactly the harm it exists to prevent (one conversation
+            // bound to two panes) in the one-candidate case (rev-306 NB3).
+            if agents.values().any(|a| {
+                a.group == group_id
+                    && a.id != agent_id
+                    && a.session_id.as_deref() == Some(session_id)
+            }) {
+                (None, true)
+            } else {
+                match agents.get_mut(agent_id) {
+                    // Don't clobber an id set in the meantime (e.g. a resume).
+                    Some(a) if a.session_id.is_none() => {
+                        a.session_id = Some(session_id.to_string());
+                        (Some(a.clone()), false)
+                    }
+                    // Pane gone, or already carries an id: a no-op either way.
+                    _ => (None, false),
+                }
+            }
         };
+        if taken_by_another {
+            self.audit(group_id, "loomux", "session-claim-refused", json!({
+                "agent": agent_id,
+                "session": session_id,
+                "reason": "another pane in this group is already bound to this session",
+            }));
+            return false;
+        }
+        let Some(entry) = entry else { return false };
         let status = match entry.status {
             AgentStatus::Dead => "dead",
             _ => "running",
@@ -21389,8 +21789,14 @@ impl OrchRegistry {
                 let _ = self.write_tasks(group_id, &tasks);
             }
         }
-        self.audit(group_id, "loomux", "copilot-session",
+        // One event for one fact (#722): this fires for copilot and opencode
+        // alike, so a reader asking "when did this pane get its session" does
+        // not have to know which CLI it was to know which line to look for.
+        // The CLI itself is not repeated here — this agent's `agent-spawn`
+        // line already records it, and a second copy could only ever disagree.
+        self.audit(group_id, "loomux", "session-learned",
             json!({ "agent": agent_id, "session": session_id }));
+        true
     }
 
     /// Roster entries derived from `agent-spawn` audit lines. Backfill for
@@ -32206,15 +32612,12 @@ impl OrchRegistry {
             None => (cli == "claude").then(new_session_uuid),
         };
 
-        // Copilot mints its own session id after boot (no `--session-id`), so
-        // snapshot the sessions that already exist now, before this pane's
-        // copilot starts — the watcher then identifies the newly appeared one.
-        let copilot_baseline = (!resume && cli == "copilot")
-            .then(|| {
-                crate::sessions::copilot_session_state_root()
-                    .map(|root| crate::sessions::copilot_session_ids(&root))
-                    .unwrap_or_default()
-            });
+        // Copilot and opencode mint their own session id after boot (neither
+        // has a `--session-id`), so snapshot the sessions that already exist
+        // now, before this pane's CLI starts — the watcher then identifies the
+        // newly appeared one.
+        let session_baseline =
+            (!resume).then(|| self.capture_session_baseline(&cli, group_id)).flatten();
 
         let branch_name = branch
             .map(|b| b.trim().to_string())
@@ -32585,14 +32988,14 @@ impl OrchRegistry {
                         self.kickoff_prompt(&a, &group, &branch_note, inject.kickoff.as_deref());
                     self.deliver_prompt(&agent_id, &kickoff, "loomux", Delivery::FreshKickoff)?;
                 }
-                // Copilot minted a session as it booted; watch for it and bind
+                // The CLI minted a session as it booted; watch for it and bind
                 // its id to this pane's roster record so the session becomes
                 // resumable and shows in the session browser. Needs an owned
                 // registry (background thread) — a no-op in unit tests, which
                 // don't set the self-arc.
-                if let Some(baseline) = copilot_baseline {
+                if let Some(baseline) = session_baseline {
                     if let Some(reg) = self.arc() {
-                        reg.spawn_copilot_session_watcher(
+                        reg.spawn_session_watcher(
                             agent_id.clone(),
                             group_id.to_string(),
                             cwd.clone(),
@@ -38386,15 +38789,11 @@ fn register_orchestrator_pane(
         Some(s) => Some(sanitize_session(&s).ok_or("invalid resume session id")?),
         None => (cli == "claude").then(new_session_uuid),
     };
-    // Copilot mints its own id on boot; snapshot existing sessions now so the
-    // orchestrator's newly created one can be tracked (this is what gives a
-    // copilot orchestration its ORCH chip and restore).
-    let copilot_baseline = (!resume && cli == "copilot")
-        .then(|| {
-            crate::sessions::copilot_session_state_root()
-                .map(|root| crate::sessions::copilot_session_ids(&root))
-                .unwrap_or_default()
-        });
+    // Copilot and opencode mint their own id on boot; snapshot existing
+    // sessions now so the orchestrator's newly created one can be tracked
+    // (this is what gives such an orchestration its ORCH chip and restore).
+    let session_baseline =
+        (!resume).then(|| reg.capture_session_baseline(&cli, &group.id)).flatten();
     // The orchestrator block's persona, if the workflow file gave it one. A
     // broken one is audited and dropped, never fatal.
     let persona = reg.resolve_persona_or_audit(group, &block);
@@ -38638,9 +39037,9 @@ fn register_orchestrator_pane(
         };
         let delivery = if resume { Delivery::ResumeKickoff } else { Delivery::FreshKickoff };
         let _ = reg2.deliver_prompt(&agent_id, &kickoff, "loomux", delivery);
-        // Track the copilot session this orchestrator just minted.
-        if let Some(baseline) = copilot_baseline {
-            reg2.clone().spawn_copilot_session_watcher(
+        // Track the session this orchestrator just minted.
+        if let Some(baseline) = session_baseline {
+            reg2.clone().spawn_session_watcher(
                 agent_id.clone(),
                 group2.id.clone(),
                 group2.repo.clone(),
@@ -38877,7 +39276,14 @@ pub fn resume_recorded_session(
                 .block_for(Role::Orchestrator)
                 .map(|b| workflow::cli_of(b, &guardrails.agent_cli).to_string())
                 .unwrap_or_else(|| guardrails.agent_cli.clone());
-            match crate::sessions::find_session_cwd(&cli, session_id) {
+            // Via the store router, not `sessions::find_session_cwd` directly
+            // (#722): its `_` arm searches CLAUDE's projects directory for
+            // every CLI it doesn't name, so an opencode orchestrator resume
+            // used to fail here — "not found in the opencode session history"
+            // after looking somewhere else entirely — and no opencode group
+            // could be reopened at all.
+            let db = reg.opencode_db_path(&record.group_id);
+            match session_cwd_in_store(&cli, session_id, Some(&db)) {
                 Ok(Some(_)) => {}
                 Ok(None) => {
                     return Err(format!(
@@ -39014,6 +39420,7 @@ pub fn resume_recorded_session(
             session_id,
             matched.as_ref().map(|r| r.cwd.as_str()),
             &group.repo,
+            Some(&reg.opencode_db_path(&group.id)), // #722: this group's store
         )?;
         (Some(sid.clone()), Some(cwd), false, String::new())
     };

@@ -8436,7 +8436,7 @@ fn associating_a_copilot_session_records_it_on_roster_and_task_board() {
 
     // The watcher discovered copilot's session id and binds it to the pane.
     let sid = "0f9e8d7c-1234-4abc-8def-0011223344ff";
-    reg.associate_copilot_session(&g.id, &w.id, sid);
+    reg.associate_session(&g.id, &w.id, sid);
 
     // Agent map now carries the id (so list_agents/resume can use it).
     let agents = reg.list_agents(&g.id);
@@ -8456,7 +8456,7 @@ fn associating_a_copilot_session_records_it_on_roster_and_task_board() {
     assert_eq!(task.session.as_deref(), Some(sid));
 
     // Idempotent: a second (late) discovery must not clobber the bound id.
-    reg.associate_copilot_session(&g.id, &w.id, "ffffffff-0000-4000-8000-000000000000");
+    reg.associate_session(&g.id, &w.id, "ffffffff-0000-4000-8000-000000000000");
     let agents = reg.list_agents(&g.id);
     let entry = agents.as_array().unwrap().iter().find(|a| a["id"] == w.id.as_str()).unwrap();
     assert_eq!(entry["session"], sid, "an already-tracked pane keeps its first session id");
@@ -8480,7 +8480,7 @@ fn copilot_orchestration_session_gets_a_chip_and_restores() {
         // once it appears on disk (here, driven directly).
         let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
         assert!(orch.session_id.is_none());
-        reg.associate_copilot_session(&g.id, &orch.id, sid);
+        reg.associate_session(&g.id, &orch.id, sid);
         // Session browser now has an ORCH chip for this copilot session.
         let roles: Vec<_> = reg.session_roles().into_iter().filter(|r| r.session_id == sid).collect();
         assert_eq!(roles.len(), 1);
@@ -12026,6 +12026,74 @@ fn resume_session_unique_prefix_resolves_to_the_full_id() {
         resumed["session"], json!(full),
         "resumed agent must carry the resolved FULL session id, got: {agents}"
     );
+}
+
+/// #722: a COMPLETE opencode session id this group's roster never recorded
+/// must pass through, exactly as a complete claude one does. Opencode's ids
+/// are 30 characters, so the length-only test that used to answer "is this a
+/// full id?" called every one of them a truncated prefix — and a prefix that
+/// matches no roster entry is rejected as an unknown session. The equivalent
+/// claude id (36 chars) sails through, which is the asymmetry this closes.
+#[test]
+fn a_complete_opencode_session_id_is_not_mistaken_for_a_truncated_prefix() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let co = reg.resolve_token(&orch.token).unwrap();
+    // A roster holding some OTHER session, so nothing here can resolve by
+    // exact match or by prefix — the pass-through is the only way out.
+    write_roster(&reg, &g.id, &["e3bc3b80-1111-4111-8111-111111111111"]);
+    let dir = tempfile::tempdir().unwrap();
+    let full_opencode = "ses_03bd2d53dffeiBvu9PvuCPjxT7"; // ses_ + 12 hex + 14 base62
+
+    let r = dispatch(&reg, &co, "tools/call", &json!({
+        "name": "spawn_agent",
+        "arguments": {
+            "kind": "worker",
+            "resume_session": full_opencode,
+            "cwd": dir.path().to_string_lossy(),
+            "task": "follow-up",
+        },
+    })).unwrap();
+    assert_eq!(
+        r["isError"], false,
+        "a complete opencode id must pass through, not be resolved as a prefix: {r:?}"
+    );
+
+    let agents = reg.list_agents(&co.group);
+    let resumed = agents.as_array().unwrap().iter().find(|a| a["role"] == "worker").unwrap();
+    assert_eq!(
+        resumed["session"], json!(full_opencode),
+        "the id must arrive intact, not rewritten to some roster entry: {agents}"
+    );
+
+    // And the shape check must not decay into a blanket "anything starting
+    // with `ses_`". Both of these are still prefixes, and both match nothing
+    // in the roster, so both must be refused rather than passed through.
+    //
+    // Neither shares a prefix with `full_opencode` on purpose: the spawn above
+    // put that id ON the roster, so `ses_03bd2d53` would now resolve against
+    // it perfectly legitimately (#190's whole feature) and would be pinning
+    // test order rather than the shape rule.
+    for not_full in [
+        "ses_99999999",                   // truncated
+        "ses_9zbd2d53dffeiBvu9PvuCPjxT7", // right length, non-hex timestamp
+    ] {
+        let r = dispatch(&reg, &co, "tools/call", &json!({
+            "name": "spawn_agent",
+            "arguments": {
+                "kind": "worker",
+                "resume_session": not_full,
+                "cwd": dir.path().to_string_lossy(),
+                "task": "follow-up",
+            },
+        })).unwrap();
+        assert_eq!(
+            r["isError"], true,
+            "{not_full:?} is not a complete opencode id and must resolve as a prefix \
+             (here: fail as unknown), never pass through: {r:?}"
+        );
+    }
 }
 
 #[test]
@@ -28713,6 +28781,7 @@ fn no_registry_construction_bypasses_the_test_agent_dir_overrides() {
         ("lessonsfile.rs", 1),   // test_registry
         ("prompts.rs", 1),       // test_registry
         ("opencodeusage.rs", 1), // test_registry
+        ("opencodesessions.rs", 1), // test_registry
     ];
     let mut files = Vec::new();
     collect_rs_files(tests_dir, &mut files);

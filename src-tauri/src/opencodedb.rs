@@ -60,6 +60,7 @@
 //! failed to checkpoint.
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
+use std::collections::HashSet;
 use std::path::Path;
 use std::time::Duration;
 
@@ -220,7 +221,6 @@ pub fn session_usage_on(
     conn: &Connection,
     session_id: &str,
 ) -> Result<Option<SessionTotals>, Unavailable> {
-    let drift = |e: rusqlite::Error| Unavailable::Query(e.to_string());
     // The root row first: it answers both "does this session exist at all"
     // (which the rollup's COALESCE'd SUM cannot — an empty set sums to zero,
     // indistinguishable from a real zero-token session) and "what model is
@@ -255,6 +255,190 @@ pub fn session_usage_on(
         cache_write: sane_count(cache_write),
         model,
     }))
+}
+
+/// Any `rusqlite` failure *after* a successful open is schema drift as far as
+/// this module is concerned: the file opened, so it is a database; it just is
+/// not shaped the way the DDL above says. Shared by every query here so one
+/// classification covers them all.
+fn drift(e: rusqlite::Error) -> Unavailable {
+    Unavailable::Query(e.to_string())
+}
+
+// ── Session identification (#722 slice C) ──────────────────────────────────
+//
+// Which session a pane owns cannot be asked of this store by project: the
+// project id is `sha1("git-remote:" + host/path)` (`SOURCE`, `project.ts`), so
+// every worktree of one repo — which is every agent in a loomux group —
+// collides on a single project row. What separates them is the `directory`
+// column, plus knowing which rows are NEW.
+//
+// So identification is the copilot pattern, one store down: snapshot the ids
+// that exist before the pane is spawned, then poll for one that appeared
+// since, in this pane's directory, that no other pane has already taken.
+
+/// Every session id the store already holds — the snapshot taken *before* a
+/// pane is spawned, so the session that pane later creates can be told apart
+/// from the ones that were already there.
+///
+/// Includes subagent rows deliberately, even though [`identify_session_on`]
+/// would never adopt one: a baseline is "what was already here", and making it
+/// selective would only create a class of row whose absence from the baseline
+/// means nothing.
+///
+/// A store that does not exist yet is [`Unavailable::Absent`] and that is the
+/// *ordinary* case, not a failure: the first opencode pane in a group is
+/// spawned against a file opencode has not created yet. Callers treat it as an
+/// empty baseline.
+pub fn session_ids(db: &Path) -> Result<HashSet<String>, Unavailable> {
+    session_ids_on(&open_readonly(db)?)
+}
+
+/// [`session_ids`] against an already-open connection.
+pub fn session_ids_on(conn: &Connection) -> Result<HashSet<String>, Unavailable> {
+    let mut stmt = conn.prepare("SELECT id FROM session").map_err(drift)?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0)).map_err(drift)?;
+    let mut out = HashSet::new();
+    for id in rows {
+        out.insert(id.map_err(drift)?);
+    }
+    Ok(out)
+}
+
+/// What one identification attempt found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Identified {
+    /// No candidate yet — this pane's opencode has not written its session row.
+    /// The caller polls; this is the normal answer for the first seconds of a
+    /// pane's life.
+    None,
+    /// Exactly one candidate. This pane's session.
+    One(String),
+    /// More than one unclaimed candidate matches this directory, carrying how
+    /// many. Deliberately not a pick — see [`identify_session_on`].
+    Contested(usize),
+}
+
+/// The session a just-spawned pane in `directory` created, if it can be named
+/// without guessing.
+///
+/// A candidate is a row that is all four of:
+///
+/// - **`parent_id IS NULL`** — subagent sessions are rows of their own
+///   (`LOCAL-OBSERVED`: a row with `agent = "explore"` and a title ending
+///   `(@explore subagent)`), and binding a pane to its own subagent would make
+///   every later read — usage, resume, digest — answer about the wrong
+///   conversation.
+/// - **in `directory`**, compared with [`crate::sessions::norm_path`], the same
+///   rule copilot's session store is compared with. opencode writes this column
+///   with forward slashes (`LOCAL-OBSERVED`: `C:/Projects/loomux`) while a
+///   pane's cwd arrives with backslashes, so a raw string compare would match
+///   nothing on Windows.
+/// - **absent from `baseline`** — it appeared after this pane was spawned.
+/// - **absent from `claimed`** — no other pane in this group has taken it.
+///
+/// **The result does not depend on the order rows come back in**, which is why
+/// there is no `ORDER BY` here: with more than one candidate this refuses, so
+/// no ordering could ever break a tie, and a newest-first sort would be a rule
+/// nothing reads — the kind that looks load-bearing to the next person and
+/// quietly justifies a wrong pick if the refusal is ever softened.
+///
+/// **Two or more candidates refuse rather than pick**, which is where this
+/// departs from `newest_new_copilot_session`'s newest-wins. The difference is
+/// not taste, it is the store: copilot's is the machine's, and two panes racing
+/// in one directory is the exotic case; a group's opencode store is written by
+/// *every pane in that group*, and the orchestrator, the reviewer and any
+/// worker without its own worktree all sit in the repo root — so a contested
+/// match is the ordinary case here, not the corner. `doc/design/session-id-
+/// learning.md`'s ambiguity policy already settled which way to fail: a refused
+/// match costs a pane that stays unidentified (degrading exactly as an
+/// opencode pane does today), while a wrong one silently reports one agent's
+/// spend as another's and resumes a human into a conversation that is not the
+/// one they asked for.
+///
+/// Refusal is usually self-healing rather than terminal: the caller keeps
+/// polling, and the moment the *other* pane's watcher claims its session, the
+/// count falls to one and this pane identifies normally. Panes in one group
+/// are spawned one at a time, seconds apart, so the ordinary case is that the
+/// earlier pane's session is already in the later pane's baseline and no
+/// contest arises at all.
+///
+/// **The residual, stated rather than assumed away:** if two panes in the SAME
+/// directory are spawned close enough together that neither's session had
+/// appeared when the other's baseline was taken, both see two candidates and
+/// both refuse — nothing breaks the tie, and neither identifies. That is the
+/// deliberate cost of the policy: both panes stay at the status quo an
+/// opencode pane is in today (no usage attribution, no resume), and the
+/// watcher's timeout audits *contested* rather than a silent nothing, so the
+/// state is diagnosable instead of mysterious. The alternative — picking one —
+/// buys identification for one pane by giving the other pane's conversation
+/// away, undetectably.
+pub fn identify_session(
+    db: &Path,
+    directory: &str,
+    baseline: &HashSet<String>,
+    claimed: &HashSet<String>,
+) -> Result<Identified, Unavailable> {
+    identify_session_on(&open_readonly(db)?, directory, baseline, claimed)
+}
+
+/// [`identify_session`] against an already-open connection.
+pub fn identify_session_on(
+    conn: &Connection,
+    directory: &str,
+    baseline: &HashSet<String>,
+    claimed: &HashSet<String>,
+) -> Result<Identified, Unavailable> {
+    let want = crate::sessions::norm_path(directory);
+    // An empty cwd would otherwise match every session whose directory is also
+    // empty — "I don't know where this pane is" must never widen the search.
+    if want.is_empty() {
+        return Ok(Identified::None);
+    }
+    let mut stmt = conn
+        .prepare("SELECT id, directory FROM session WHERE parent_id IS NULL")
+        .map_err(drift)?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+        .map_err(drift)?;
+    let mut hits: Vec<String> = Vec::new();
+    for row in rows {
+        let (id, dir) = row.map_err(drift)?;
+        if baseline.contains(&id) || claimed.contains(&id) {
+            continue;
+        }
+        if crate::sessions::norm_path(&dir) != want {
+            continue;
+        }
+        hits.push(id);
+    }
+    Ok(match hits.len() {
+        0 => Identified::None,
+        1 => Identified::One(hits.remove(0)),
+        n => Identified::Contested(n),
+    })
+}
+
+/// The directory a session recorded for itself, for resolving where to resume
+/// it — the opencode analogue of reading a claude transcript's `cwd` or a
+/// copilot `workspace.yaml`'s. `Ok(None)`: the store is readable and has no
+/// such session.
+pub fn session_directory(db: &Path, session_id: &str) -> Result<Option<String>, Unavailable> {
+    session_directory_on(&open_readonly(db)?, session_id)
+}
+
+/// [`session_directory`] against an already-open connection.
+pub fn session_directory_on(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Option<String>, Unavailable> {
+    conn.query_row(
+        "SELECT directory FROM session WHERE id = ?1",
+        [session_id],
+        |r| r.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(drift)
 }
 
 /// A cost is only worth reporting if it is finite and non-negative. SQLite

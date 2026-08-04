@@ -481,14 +481,91 @@ of the process. `Absent` is never audited at all — a group whose opencode pane
 have not booted has no store yet, which is the ordinary state. Same one-shot
 shape as `HoldEpisode`'s `announced`/`notice_reported`.
 
-**What is not read here.** Which session a pane owns. The store cannot be
-queried for that by project — the project id is a hash of the git origin
-remote, so every loomux worktree of one repo collides — and the answer is
-`session.directory` plus a spawn baseline, which is slice C's. Until it lands,
-`compute_usage_snapshot`'s opencode arm has no id to key on and simply does not
-fire; guessing (newest row, only row) would attribute one pane's spend to
-another. `opencodedb::session_usage_on` takes an open connection precisely so
-that slice pays for one open, not two.
+**What is not read here.** Which session a pane owns — that is the next
+section's, on the same connection: `opencodedb::session_usage_on` takes an open
+connection precisely so identification pays for one open, not two. Until a
+pane's session is named, `compute_usage_snapshot`'s opencode arm has no id to
+key on and simply does not fire.
+
+## Session identification (#722 slice C)
+
+OpenCode has no `--session-id`. `--session` *continues* an existing session and
+nothing pre-assigns one, so loomux cannot hand a pane its identity the way it
+does claude's — it has to learn it afterwards. That makes the shape copilot's:
+snapshot the store before the spawn, poll for what appeared, bind it.
+
+**The project id cannot answer this, and that is not a detail.** OpenCode
+derives it as `sha1("git-remote:" + host/path)` (`SOURCE`, `project.ts`), so
+every worktree of one repo — which is every agent in a loomux group — resolves
+to a single project row. What separates panes is the `session.directory`
+column.
+
+**A candidate is four things at once:** `parent_id IS NULL` (subagents are
+`session` rows too, and binding a pane to its own subagent would make usage,
+resume and digest all answer about the wrong conversation while looking
+healthy); in this pane's directory; absent from the pre-spawn baseline; and not
+already bound to another pane in the group.
+
+That last one is the difference from copilot, and it exists because the stores
+differ. Copilot's is the machine's, and two panes racing in one directory is
+the exotic case. A group's opencode store is written by **every pane in that
+group**, and the orchestrator, the reviewer and any worker without its own
+worktree all run in the repo root — so "the newest new session in this
+directory" naming *another pane's* session is the ordinary case here, not the
+corner.
+
+**Two candidates refuse rather than pick.** `doc/design/session-id-learning.md`
+settled this exact class of contest already, and the asymmetry it settled it on
+holds here unchanged: a refused match costs a pane that stays unidentified —
+precisely the status quo of an opencode pane before this slice — while a wrong
+one reports one agent's spend as another's and resumes a human into a
+conversation that is not theirs, undetectably. Refusal is usually self-healing:
+the watcher keeps polling, and when the other pane's watcher claims its
+session, the count falls to one.
+
+The residual is real and named rather than assumed away: two panes in the *same
+directory*, spawned close enough together that neither's session existed when
+the other's baseline was taken, both refuse and neither identifies. Panes are
+spawned one at a time, seconds apart, so the ordinary case is that the earlier
+pane's session is already in the later one's baseline — but when it does
+happen, the timeout audits `contested` with a count, so the state is
+diagnosable rather than a silent nothing.
+
+**A baseline that cannot be read is not an empty baseline.** An empty one says
+"the store held nothing", which makes everything in it a candidate; if the
+truth was "the file could not be opened this instant", that hands this pane a
+session that belongs to someone else. So a real degrade refuses to watch at
+all and says so once in the audit log. A *missing* store is the opposite and
+genuinely is empty — that is the first opencode pane in a group, whose file
+opencode has not created yet.
+
+**One watcher, not two.** `spawn_session_watcher` serves copilot and opencode;
+`SessionBaseline` carries where to look, and the poll interval and deadline
+come with it. OpenCode's deadline is ten minutes against copilot's ninety
+seconds, and that is an honest gap rather than caution: loomux cannot verify
+whether opencode writes the `session` row at TUI boot or at the first turn —
+checking means running the real CLI, which constraint 3 forbids — and a
+deadline chosen for "at boot" would leave every pane whose first turn was late
+permanently unidentified, looking exactly like a CLI that was never installed.
+
+### Two things an opencode pane could not do at all
+
+Both are identity, both were found building this slice.
+
+- **`sanitize_session` rejected every opencode id.** It admitted hex digits and
+  `-`: exactly a claude UUID. OpenCode mints `ses_` + 12 hex + 14 base62, so
+  `spawn_agent(resume_session = <an opencode id>)` failed as "invalid resume
+  session id" with nothing wrong with the id. Widened to ASCII alphanumerics
+  plus `-` and `_` — which still admits no separator, no `.`, no whitespace, no
+  quote and no shell metacharacter, so the `Path::join` and command-line
+  interpolation downstream keep every property they had.
+- **An opencode group could not be reopened.** `sessions::find_session_cwd`
+  answers for claude and copilot and sends everything else down its *claude*
+  arm, so an opencode orchestrator resume searched `~/.claude/projects`, found
+  nothing, and hard-failed with "not found in the opencode session history on
+  this machine". `session_cwd_in_store` routes opencode to the group's own
+  store — which is where its panes write, `OPENCODE_DB` pointing every one of
+  them at `opencode_db_path(group)`.
 
 ## Deliberately not done
 

@@ -323,9 +323,17 @@ fn read_copilot_session(dir: &Path) -> Option<CopilotSession> {
     Some(CopilotSession { id, title, cwd, modified_ms: mtime_ms(&ws) })
 }
 
-/// Path comparison for copilot cwds: Windows is case- and slash-insensitive,
-/// and a trailing separator must not matter.
-fn norm_path(s: &str) -> String {
+/// Path comparison for a CLI session store's recorded working directory:
+/// Windows is case- and slash-insensitive, and a trailing separator must not
+/// matter.
+///
+/// `pub(crate)` because opencode needs the identical rule and must not carry a
+/// second copy of it (#722 slice C): its `session.directory` column is written
+/// with forward slashes where a pane's cwd arrives with backslashes, which is
+/// exactly the mismatch this normalizes — the same shape as copilot's
+/// `workspace.yaml` `cwd`, so it is the same function, not a sibling that
+/// could drift.
+pub(crate) fn norm_path(s: &str) -> String {
     s.replace('/', "\\").trim_end_matches('\\').to_lowercase()
 }
 
@@ -363,7 +371,7 @@ fn norm_path(s: &str) -> String {
 //     claude case only — the eviction-ambiguity residual #460 documented as
 //     a follow-up for this issue.
 //   - `IntentKey::Cwd` — copilot solo panes never get an id at launch (it
-//     mints its own, invisibly, and `spawn_copilot_session_watcher` in
+//     mints its own, invisibly, and `spawn_session_watcher` in
 //     orchestration/mod.rs learns one after the fact only for GROUP
 //     agents), so this reuses #460's original cwd-keyed, conflict-tracked
 //     machinery verbatim, just moved under this wider key type. Precise
