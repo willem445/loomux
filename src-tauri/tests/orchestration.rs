@@ -27124,13 +27124,31 @@ fn an_explicit_dismiss_releases_every_blocker_class_and_names_it_in_the_audit() 
              say loomux decided something it deliberately refuses to decide"
         );
         assert_eq!(dismissed.detail["to"], json!(wid), "{token}: and it names the pane");
-        assert!(
-            log.iter().any(|e| e.action == "stranded-cleared"
-                && e.detail["why"] == json!("human-dismissed")),
-            "{token}: the clear names the gesture as its reason, so the badge's whole lifetime \
-             stays reconstructible from one grep"
-        );
     }
+}
+
+#[test]
+fn a_dismissed_badges_clear_names_the_gesture_as_its_reason() {
+    // Deliberately its own test rather than a tail assertion on the per-class
+    // one above, so that a red here says exactly which half moved: not "the
+    // dismissal happened" but "the CLEAR is attributed to the gesture". The two
+    // records are separate on purpose — `stranded-dismissed` reports a human
+    // act, `stranded-cleared` a state change — and a grep starting from either
+    // has to land on the same story.
+    let (reg, _d, g, wid) = attention_setup();
+    reg.mark_stranded(&g, &wid, Some(StrandedBlocker::PauseSuppressed));
+    assert!(reg.dismiss_stranded(&wid), "precondition: the gesture released the badge");
+
+    let cleared = reg
+        .audit_log(&g)
+        .into_iter()
+        .find(|e| e.action == "stranded-cleared")
+        .expect("the clear is audited, as every stranded clear is");
+    assert_eq!(
+        cleared.detail["why"],
+        json!("human-dismissed"),
+        "a clear naming some other mechanism would put loomux's name on a decision a human made"
+    );
 }
 
 #[test]
