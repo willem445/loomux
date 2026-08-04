@@ -10982,6 +10982,15 @@ does **not** — our text left the box with nobody at the keyboard, which is
 check the pane"), and clearing there would answer a question loomux cannot answer.
 `NothingStranded` establishes nothing about the pane at all.
 
+That decision has to be the **only** one, which is a second edit rather than a consequence
+of the first. `note_hold` drops a badged pane's stranded note whenever an episode ends, and
+#813 added a second ender — so `Retired` silently inherited a badge clear that the retire
+arm had already decided against, and a `TextGone` badge came down behind its back. The
+clear there is now restricted to `HoldObservation::Delivered`: a delivery is the pane
+*proving* it can accept a write, and a retirement is by construction the case where it
+proved nothing (that is the whole reason `Retired` is not `Delivered`). Ending the episode
+and clearing the badge were one decision because until #813 only one observation did both.
+
 ## Risks / limitations
 
 - Kickoff typing races CLI boot; a fixed delay (4s) + bracketed paste is used. If a

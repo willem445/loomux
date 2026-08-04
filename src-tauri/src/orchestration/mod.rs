@@ -16640,11 +16640,40 @@ pub fn drain_stranded_submit(
     // #813: Tier 1, on our OWN text — the same `Tier1Scan` widening read and
     // the same `box_reading` the late-confirmation monitor takes, not a second
     // implementation of either.
-    let text_reading = prev.as_ref().and_then(|o| o.stranded_text.clone()).map(|text| {
-        let mut scan = Tier1Scan::for_paste(&text);
-        let read = scan.read(|n| ptys.output_tail_bounded(pty_id, n));
-        box_reading(read.as_ref().map(|r| r.stripped.as_str()), &text)
-    });
+    //
+    // **Cost, declared (performance.md §3 INV-4: cadenced work says what it
+    // costs).** This runs on the drainer's `QUEUE_DRAIN_POLL` (2 s), so it is
+    // fixed-cadence work and owes a bound. Three things bound it:
+    //
+    // 1. **Scope.** It runs only while a `StrandedSubmit` marker is at the
+    //    FRONT of a pane's queue — not per pane, not per poll of an ordinary
+    //    queue, and not at all on a pane that has never stranded a delivery.
+    //    A marker is rare and self-limiting: this very reading is what retires
+    //    it, so the work ends the condition that schedules it.
+    // 2. **Per call.** One `Tier1Scan::for_paste` normalize of the recorded
+    //    paste, then at most `TIER1_SCAN_WIDEN_ROUNDS` ring reads capped at
+    //    `TIER1_SCAN_WIDEN_MAX_BYTES` — `Tier1Scan::widen`'s own bound, not a
+    //    fresh one. No IPC and no lock beyond the ring's own.
+    // 3. **Precedent.** `run_late_confirmation_monitor` takes the identical
+    //    read every `LATE_MONITOR_POLL` (5 s) for the whole of a delivery's
+    //    unconfirmed life, so this is a shape the app already pays at a
+    //    comparable cadence, on the same panes, for the same question.
+    //
+    // Deliberately gated on the ledger rather than taken unconditionally: a
+    // marker whose pane reports anything but `Some(false)` retires on that
+    // alone (see `stranded_marker_action`'s first cell), so paying for a box
+    // read there would be buying an answer nothing consults. Not hoisted out
+    // of the poll the way the late monitor hoists its `Tier1Scan` — this
+    // function is called fresh per pass and owns no state between them, and
+    // #559 rev-13 N2's hoist is available to a future caller that does.
+    let text_reading = matches!(prev_confirmed, Some(false))
+        .then(|| prev.as_ref().and_then(|o| o.stranded_text.clone()))
+        .flatten()
+        .map(|text| {
+            let mut scan = Tier1Scan::for_paste(&text);
+            let read = scan.read(|n| ptys.output_tail_bounded(pty_id, n));
+            box_reading(read.as_ref().map(|r| r.stripped.as_str()), &text)
+        });
     let action = stranded_marker_action(
         prev_confirmed,
         text_reading,
@@ -34699,7 +34728,18 @@ impl OrchRegistry {
             // Only clear the badge if this episode is the one that raised it.
             // A `Delivered` on a pane that was never escalated must not reach
             // in and drop some other mechanism's badge.
-            if had.is_some_and(|e| e.badged)
+            //
+            // #813: and only a DELIVERY may clear it here at all. `Retired`
+            // ends the episode without the pane having accepted anything, so
+            // it establishes nothing about whether the pane still needs a
+            // human — the whole distinction `HoldObservation::Retired` exists
+            // to keep out of the audit trail. The retire arm owns that
+            // decision per reason (`StrandedRetireReason::resolves_the_pane`),
+            // and clearing here as well would take a `TextGone` or
+            // `NothingStranded` badge down behind that decision's back, which
+            // is precisely the badge story those two variants exist to avoid.
+            if observation == HoldObservation::Delivered
+                && had.is_some_and(|e| e.badged)
                 && self
                     .stranded_note(agent_id)
                     .is_some_and(|n| matches!(n.blocker, Some(StrandedBlocker::QuestionStale) | Some(StrandedBlocker::HumanInput)))

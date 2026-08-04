@@ -24271,6 +24271,55 @@ fn only_an_accepted_delivery_ends_a_hold_episode() {
 }
 
 #[test]
+fn retiring_a_marker_ends_the_episode_without_clearing_the_badge() {
+    // #813 review F2. `note_hold` drops a badged pane's stranded note when an
+    // episode ENDS, and #813 added a second ender — so `Retired` inherited a
+    // badge clear that its own retire arm had already decided against, taking a
+    // `TextGone`/`NothingStranded` badge down behind that decision's back. The
+    // two paths disagreed, and the code was the one that was wrong.
+    //
+    // The rule: a DELIVERY licenses the clear here, because the pane proved it
+    // can accept a write. A retirement proves nothing of the sort — it is the
+    // whole reason `HoldObservation::Retired` is not `Delivered` — so the badge
+    // decision belongs to the retire arm alone (`resolves_the_pane`).
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 8134u32;
+    let bound = QUESTION_HOLD_STALE_AFTER.as_millis() as u64;
+    let t0 = 1_000_000u64;
+    let step = |admission, now| reg.hold_escalation_step(&g.id, &w.id, pty, admission, 1, now, bound, None);
+
+    // Drive a real hold episode to its escalation, so a badge is genuinely up
+    // and genuinely owned by THIS episode — the only case `note_hold` clears.
+    step(WriteAdmission::HoldBoxOccupied, t0);
+    assert_eq!(
+        step(WriteAdmission::HoldBoxOccupied, t0 + bound),
+        HeldEscalation::Badge(StrandedBlocker::HumanInput)
+    );
+    assert!(reg.hold_episode_badged(pty), "precondition: this episode raised the badge");
+    assert!(reg.stranded_note(&w.id).is_some(), "precondition: the chip is up");
+
+    reg.note_hold(&g.id, &w.id, pty, HoldObservation::Retired, t0 + bound + 6_000);
+
+    assert_eq!(
+        reg.hold_episode_since(pty),
+        None,
+        "the episode still ENDS — loomux is no longer holding this pane on that entry, so a \
+         later hold clocks and badges afresh"
+    );
+    assert!(
+        reg.stranded_note(&w.id).is_some(),
+        "but the chip stays: retiring a marker is not the pane accepting a write, and the \
+         retire arm — not this function — decides per reason whether the human is done here"
+    );
+    assert_eq!(
+        hold_audit_count(&reg, &g.id, "stranded-cleared"), 0,
+        "and nothing was audited as cleared, because nothing was"
+    );
+}
+
+#[test]
 fn a_writable_poll_never_re_badges_a_pane_that_was_already_escalated() {
     // Symptom 1, end to end, through the step the drainer calls.
     //
