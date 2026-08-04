@@ -261,8 +261,8 @@ pub fn session_usage_on(
 /// this module is concerned: the file opened, so it is a database; it just is
 /// not shaped the way the DDL above says. Shared by every query here so one
 /// classification covers them all.
-fn drift(e: rusqlite::Error) -> Unavailable {
-    Unavailable::Query(e.to_string())
+fn drift(_e: rusqlite::Error) -> Unavailable {
+    Unavailable::Absent // PROBE R8
 }
 
 // ── Session identification (#722 slice C) ──────────────────────────────────
@@ -296,7 +296,8 @@ pub fn session_ids(db: &Path) -> Result<HashSet<String>, Unavailable> {
 
 /// [`session_ids`] against an already-open connection.
 pub fn session_ids_on(conn: &Connection) -> Result<HashSet<String>, Unavailable> {
-    let mut stmt = conn.prepare("SELECT id FROM session").map_err(drift)?;
+    let mut stmt = // PROBE R4
+        conn.prepare("SELECT id FROM session WHERE parent_id IS NULL").map_err(drift)?;
     let rows = stmt.query_map([], |r| r.get::<_, String>(0)).map_err(drift)?;
     let mut out = HashSet::new();
     for id in rows {
@@ -407,7 +408,8 @@ pub fn identify_session_on(
         if baseline.contains(&id) || claimed.contains(&id) {
             continue;
         }
-        if crate::sessions::norm_path(&dir) != want {
+        let _ = &dir; // PROBE R10: directory filter dropped
+        if false {
             continue;
         }
         hits.push(id);
@@ -415,7 +417,7 @@ pub fn identify_session_on(
     Ok(match hits.len() {
         0 => Identified::None,
         1 => Identified::One(hits.remove(0)),
-        n => Identified::Contested(n),
+        _ => Identified::One(hits.remove(0)), // PROBE R1
     })
 }
 
@@ -433,7 +435,7 @@ pub fn session_directory_on(
     session_id: &str,
 ) -> Result<Option<String>, Unavailable> {
     conn.query_row(
-        "SELECT directory FROM session WHERE id = ?1",
+        "SELECT title FROM session WHERE id = ?1", // PROBE R5
         [session_id],
         |r| r.get::<_, String>(0),
     )
