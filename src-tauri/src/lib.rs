@@ -166,6 +166,7 @@ pub fn run() {
             orchestration::orch_group_paused,
             orchestration::orch_ack_attention,
             orchestration::orch_ack_attention_pty,
+            orchestration::orch_dismiss_stranded,
             orchestration::orch_notify_enabled,
             orchestration::orch_set_notify,
             orchestration::orch_spawn_expanded,

@@ -27062,6 +27062,151 @@ fn a_dead_agents_stranded_badge_is_pruned() {
     assert!(reg.stranded_note(&wid).is_none(), "a dead agent's badge must not linger in the registry");
 }
 
+// ---- #825 M1: the explicit human dismiss ----
+
+#[test]
+fn an_explicit_dismiss_releases_every_blocker_class_and_names_it_in_the_audit() {
+    // The gesture is a first-class release for EVERY class, and the two ends of
+    // that set are why: `PauseSuppressed` describes a loss that already
+    // happened, so no reading of the pane could ever release it, while
+    // `Unverifiable` describes a box loomux could not read, so no reading of the
+    // pane is trusted TO. Between them they rule out every automatic release,
+    // and the human saying "seen" is the one piece of evidence that is neither
+    // an inference nor a timer.
+    //
+    // The audit half is not decoration. For the classes that claim the box may
+    // still hold an unsubmitted prompt, the chip can be the only trace of it —
+    // so what the human took down has to survive the taking-down, or a
+    // dismissed badge becomes exactly the silent loss the badge exists to
+    // prevent. The class token is what makes it diagnosable afterwards.
+    for (blocker, token) in [
+        (Some(StrandedBlocker::NotHolding), "not-holding"),
+        (Some(StrandedBlocker::Unverifiable), "box-unverifiable"),
+        (Some(StrandedBlocker::Exhausted), "heal-budget-spent"),
+        (Some(StrandedBlocker::QueueFull), "queue-full"),
+        (Some(StrandedBlocker::PauseSuppressed), "pause-suppressed"),
+        (Some(StrandedBlocker::HumanInput), "human-input"),
+        (Some(StrandedBlocker::Question), "question"),
+        (Some(StrandedBlocker::QuestionStale), "question-hold-stale"),
+        (Some(StrandedBlocker::QueueNearFull), "queue-near-full"),
+        (Some(StrandedBlocker::QueueAtCapacity), "queue-at-capacity"),
+        // The in-flight heal badge (`blocker: None`) is a chip like any other
+        // and a human looking at a stale one has the same complaint.
+        (None, "self-healing"),
+    ] {
+        let (reg, _d, g, wid) = attention_setup();
+        reg.mark_stranded(&g, &wid, blocker);
+        assert!(reg.stranded_note(&wid).is_some(), "{token}: precondition — the chip is up");
+
+        assert!(
+            reg.dismiss_stranded(&wid),
+            "{token}: the dismiss must report that it took a badge down"
+        );
+        assert!(
+            reg.stranded_note(&wid).is_none(),
+            "{token}: an explicit dismiss releases every class — a class the gesture cannot \
+             clear is a chip the human has no way to get rid of, which is the live complaint"
+        );
+
+        let log = reg.audit_log(&g);
+        let dismissed = log
+            .iter()
+            .find(|e| e.action == "stranded-dismissed")
+            .unwrap_or_else(|| panic!("{token}: the dismissal must be in the audit, not silent"));
+        assert_eq!(
+            dismissed.detail["blocker"],
+            json!(token),
+            "{token}: the class is the diagnosis a dismissed badge has to leave behind"
+        );
+        assert_eq!(
+            dismissed.actor, "human",
+            "{token}: a dismissal is a human act — attributing it to loomux would make the log \
+             say loomux decided something it deliberately refuses to decide"
+        );
+        assert_eq!(dismissed.detail["to"], json!(wid), "{token}: and it names the pane");
+        assert!(
+            log.iter().any(|e| e.action == "stranded-cleared"
+                && e.detail["why"] == json!("human-dismissed")),
+            "{token}: the clear names the gesture as its reason, so the badge's whole lifetime \
+             stays reconstructible from one grep"
+        );
+    }
+}
+
+#[test]
+fn focusing_a_pane_is_not_evidence_that_releases_its_stuck_prompt_chip() {
+    // The "cheapest partial improvement" #825 floats and plan-312 rejects.
+    // `ack_attention` fires on pane FOCUS — the gesture the human performs all
+    // day merely to type — so wiring the chip to it would take down badges
+    // nobody read. On `Unverifiable` that is the worst case in the issue made
+    // real: loomux could not read the box, so the chip may be the only sign
+    // that a prompt is still sitting in it unsubmitted.
+    let (reg, _d, g, wid) = attention_setup();
+    reg.mark_stranded(&g, &wid, Some(StrandedBlocker::Unverifiable));
+
+    reg.ack_attention(&wid);
+    assert!(
+        reg.stranded_note(&wid).is_some(),
+        "focus is not evidence: only a gesture aimed at the chip itself releases it"
+    );
+    assert_eq!(
+        hold_audit_count(&reg, &g, "stranded-cleared"),
+        0,
+        "and nothing was audited as cleared, because nothing was"
+    );
+
+    assert!(reg.dismiss_stranded(&wid), "the deliberate gesture is the one that releases it");
+    assert!(reg.stranded_note(&wid).is_none());
+}
+
+#[test]
+fn dismissing_a_chip_that_is_not_up_changes_nothing_and_audits_nothing() {
+    // A dismissal line is a record of a human releasing a warning. Writing one
+    // for a click that released nothing would put gestures in the log that
+    // never took anything down, which is what makes the log worth reading.
+    let (reg, _d, g, wid) = attention_setup();
+
+    assert!(!reg.dismiss_stranded(&wid), "no chip is up — there is nothing to release");
+    assert!(
+        !reg.dismiss_stranded("w-not-an-agent"),
+        "and an id with no agent record cannot have had a chip on screen at all"
+    );
+    assert_eq!(hold_audit_count(&reg, &g, "stranded-dismissed"), 0);
+    assert_eq!(hold_audit_count(&reg, &g, "stranded-cleared"), 0);
+
+    // The second half of an impatient double-click.
+    reg.mark_stranded(&g, &wid, Some(StrandedBlocker::Unverifiable));
+    assert!(reg.dismiss_stranded(&wid));
+    assert!(!reg.dismiss_stranded(&wid), "the second click has nothing left to take down");
+    assert_eq!(
+        hold_audit_count(&reg, &g, "stranded-dismissed"),
+        1,
+        "one gesture that released something, one line"
+    );
+    assert_eq!(hold_audit_count(&reg, &g, "stranded-cleared"), 1);
+}
+
+#[test]
+fn a_dismiss_takes_down_one_panes_chip_and_leaves_the_rest_of_the_group_alone() {
+    // The chip names a pane, and the dismiss is scoped to the pane the human
+    // clicked. A dismiss that swept the group would silently retire warnings
+    // about panes the human never looked at — the same false-release harm as
+    // clearing on focus, one blast radius up.
+    let (reg, _d, g, wid) = attention_setup();
+    let other = reg.spawn_agent(&g, Role::Worker, "w2", "more work", false, None).unwrap();
+    reg.mark_stranded(&g, &wid, Some(StrandedBlocker::NotHolding));
+    reg.mark_stranded(&g, &other.id, Some(StrandedBlocker::Unverifiable));
+
+    assert!(reg.dismiss_stranded(&wid));
+
+    assert!(reg.stranded_note(&wid).is_none(), "the clicked pane's chip is down");
+    assert_eq!(
+        reg.stranded_note(&other.id).and_then(|n| n.blocker),
+        Some(StrandedBlocker::Unverifiable),
+        "and the other pane's is untouched — nobody has said they saw THAT one"
+    );
+}
+
 #[test]
 fn prompt_wait_detected_ignores_quiet_non_prompts() {
     // Ordinary streaming output — even when it ends on a numbered summary list —

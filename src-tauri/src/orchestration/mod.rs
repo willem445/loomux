@@ -35563,6 +35563,16 @@ impl OrchRegistry {
         }
     }
 
+    /// The human explicitly dismissed a pane's stuck-prompt chip (#825 M1).
+    ///
+    /// RED-EVIDENCE STUB: deliberately does nothing, so the tests added in this
+    /// commit fail on the assertion they are meant to police rather than on a
+    /// missing symbol. The real body — and the argument for it — lands in the
+    /// next commit.
+    pub fn dismiss_stranded(&self, _agent_id: &str) -> bool {
+        false
+    }
+
     /// #560: record one drainer observation against `pty_id`'s hold episode,
     /// returning when the (possibly just-opened) episode began, or `None` when
     /// no episode is open.
@@ -39860,6 +39870,32 @@ pub fn orch_ack_attention(reg: tauri::State<Arc<OrchRegistry>>, agent_id: String
 #[tauri::command]
 pub fn orch_ack_attention_pty(reg: tauri::State<Arc<OrchRegistry>>, pty_id: u32) {
     reg.ack_attention_pty(pty_id);
+}
+
+/// The human explicitly dismissed a pane's "stuck prompt" chip (#825 M1): the
+/// deliberate gesture that releases a latched `stranded` badge, valid for every
+/// blocker class. Resolves to whether a badge was actually up.
+///
+/// Deliberately distinct from [`orch_ack_attention`], which fires on pane
+/// *focus* — see [`OrchRegistry::dismiss_stranded`] for why a chip that may be
+/// the only trace of an unsubmitted prompt must not come down on that.
+///
+/// Off-thread (#762 — see [`run_blocking`]): up to two audit appends under the
+/// process-global audit lock.
+///
+/// **Reentrancy.** The `attn_stranded` map is the guard, twice over: the
+/// `stranded_note` read decides whether this call has anything to dismiss at
+/// all, and `clear_stranded`'s `remove` audits the clear only for the caller
+/// that actually took the note out — so an impatient double-click produces one
+/// clear, with the second call returning `false` having audited nothing. Two
+/// genuinely concurrent dismissals of one chip can write two
+/// `stranded-dismissed` lines against a single `stranded-cleared`; that is the
+/// intended record, since each of those lines reports a human gesture and only
+/// the clear reports a state change.
+#[tauri::command]
+pub async fn orch_dismiss_stranded(app: AppHandle, agent_id: String) -> bool {
+    let reg = reg_of(&app);
+    run_blocking(move || reg.dismiss_stranded(&agent_id)).await
 }
 
 /// Whether desktop notifications are enabled for a group (toggle button state).
