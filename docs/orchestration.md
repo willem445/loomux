@@ -425,14 +425,18 @@ own, the notice rides back on its next tool call instead of being typed into it.
 
 **When you fix a stuck prompt yourself.** A **⚠ stuck prompt** chip means a prompt was typed
 into that pane but never submitted, and loomux queues a repair — one Enter, held back until the
-pane is safe to write to. If you get there first (click into the pane, press Enter, or clear the
-box), loomux now notices: the repair is dropped rather than pressed a second time, the chip comes
-down, and anything queued behind it — steering messages, worker reports — starts flowing again on
-the next poll. Before this, your fix was invisible to the queue, and continuing to type in that
-pane kept the repair pending indefinitely, silently holding everything behind it. A repair loomux
-*can't* perform for other reasons (your own half-typed line still in the box, a dialog on screen)
-is given up on after ten minutes rather than held forever — by then the chip is already telling
-you the pane needs you, and the queue no longer waits on a press that isn't coming.
+pane is safe to write to. If you get there first (click into the pane and press Enter, or clear
+the box), loomux now checks the pane rather than the keyboard: once the prompt is no longer
+sitting in the box, the repair is dropped instead of pressed a second time, the chip comes down,
+and anything queued behind it — steering messages, worker reports — starts flowing again on the
+next poll. Before this, your fix was invisible to the queue, and continuing to type in that pane
+kept the repair pending indefinitely, silently holding everything behind it.
+
+The repair is only ever dropped once loomux can *see* that the prompt has left the box. While
+it is still sitting there, loomux keeps waiting for a safe moment to press Enter — because the
+alternative is pasting the next message on top of it and sending the two merged into one. So a
+pane blocked by your own half-typed line, or by a dialog waiting for an answer, still holds its
+queue, and the chip is what tells you it needs you.
 
 ## Cross-workspace channels
 

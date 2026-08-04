@@ -10904,39 +10904,83 @@ live incident: three orchestrator panes, a workstation lock, and a group that on
 restart recovered.
 
 The fix is a reclassification, not a new mechanism. Every *other* queue entry carries text
-that exists nowhere else; a marker carries an **Enter** that `deliver_now`'s own pre-paste
-`flush_stranded_text` — which every entry queued behind it runs before pasting — would
-press anyway. So the marker was the one queue entry whose failure to fire cost *other*
-work, and nothing bounded it. `stranded_marker_action` makes the precedence a value
-(`failed_arm_route`'s shape, for `failed_arm_route`'s reason) with three retire cells:
+that exists nowhere else; a marker carries an **Enter**. So the marker was the one queue
+entry whose failure to fire cost *other* work, and nothing bounded it.
+`stranded_marker_action` makes the precedence a value (`failed_arm_route`'s shape, for
+`failed_arm_route`'s reason) with three retire cells and three holds.
+
+### What a retirement is allowed to rest on
+
+This is the part that took a review round, and it is the whole of the design.
+
+The first cut retired on **"a keystroke landed after our submit, and `input_pending` is
+false"**. That is wrong twice over, and both errors have the same root — reasoning about
+*who typed* instead of about *where our text is*.
+
+**It cannot tell a person from a phantom.** #518 exists precisely because a terminal
+auto-reply can be misclassified as a keystroke, and a phantom's signature is exactly that
+pair: a stamp, an empty occupancy counter. Worse, `BoundedOut` is reachable *only* with
+`!box_pending`, so a retirement on that pair always fires strictly **before** the bound
+could release. The first cut did not coexist with #518's bound; it made that bound
+**unreachable from this path**, while writing `human-resolved` into the audit trail for a
+pane no human had touched.
+
+**And `!box_pending` is not "the box is empty".** `input_box_len` counts characters the
+*human* typed (`note_user_input`); loomux's own paste goes out through `write_bytes`, which
+never touches it. So a retirement there can happen while **our own prompt is still sitting
+in that box** — and `deliver_now` does *not* abort when `flush_stranded_text` declines, so
+the next queue entry pastes on top of it and the pre-Enter wait submits both prompts merged
+as one. That is the #81/#84/#111 collision the stranded flush exists to prevent, re-opened
+by the repair meant to help. The marker's head-of-line block had been *accidentally*
+preventing it.
+
+So a retirement now requires a positive [`BoxReading::NotHolding`] on our own recorded text
+— the tail was long enough to have contained our paste, and does not. Only then does the
+keystroke record pick the **name**, which is all it was ever fit to decide. `Holds`,
+`Unverifiable`, and "no text on record" all fall through to the ordinary gates: nothing
+retires on an absence of evidence, which is the one direction that could re-open either
+hazard.
 
 | reading | before | now |
 | --- | --- | --- |
 | ledger not `Some(false)` — nothing stranded | retry forever | `Retire(NothingStranded)` |
-| `Blocked` **and box empty** — human resolved it | retry forever | `Retire(HumanResolved)` |
-| hold ran past `QUESTION_HOLD_STALE_AFTER` | retry forever | `Retire(Unfirable)` |
-| `box_pending` (human characters outstanding) | decline | `Retry(BoxOccupied)` — unchanged |
+| `NotHolding` **and** a keystroke since our submit | retry forever | `Retire(HumanResolved)` |
+| `NotHolding` with no keystroke on record | retry forever | `Retire(TextGone)` |
+| `box_pending` — human characters outstanding | decline | `Retry(BoxOccupied)` — unchanged |
+| `human_input_block` holds | decline | `Retry(BoxOccupied)` — unchanged |
 | live question | decline | `Retry(Question)` — unchanged |
 | clear | press | `Press` — unchanged |
 
-Two adjacent rules are deliberately *not* absorbed. `BoundedOut` still **presses**: #518's
-bound exists because the stamp may be a phantom auto-reply, in which case nobody touched
-the pane and our text really is still sitting there. And `box_pending` still blocks the
-`HumanResolved` retire outright, because #510's absolute — never write over a human's
-outstanding characters — is what licenses reading an empty box as "they dealt with it".
+That the ledger now carries the text at all is the enabling change:
+`DeliveryOutcome::stranded_text` is written by the two paths that know it — the ownership
+publish before the first Enter, and `record_aborted_preenter_outcome` — because the marker
+itself carries no text, and without it nothing downstream can ask the only question that
+licenses a retirement.
 
-**What retiring cannot lose.** If our Enter would have been the correct one, the next entry
-in the queue presses it: `deliver_now` runs the same `flush_stranded_text` under the same
-guards before its own paste. The marker only matters when there is *no* next entry — an
-idle pane — and there the `HumanResolved` cell is the case we want to retire on anyway. The
-residual is an idle pane that reaches the `Unfirable` bound, and there #496 PR-C's badge is
-already up, raised at the same clock, saying the pane needs a human. A badge is the channel
-that was always going to be the answer for a pane loomux cannot safely write to; the bound
-only stops loomux from *also* holding the queue while it waits.
+### What retiring cannot lose
 
-`HumanResolved` is additionally the one cell that clears the chip (`clear_stranded`, reason
-`human-resolved`). The other two establish nothing about whether the pane still needs a
-person, so they leave the badge exactly as they found it.
+A retirement means our text is **not in the box**. There is therefore no Enter left for the
+marker to press that could have submitted it, and nothing for a later paste to collide
+with. The case where our Enter would still have been right is exactly `Holds`, and that is
+the case the marker keeps retrying — at which point the suppression is bounded by evidence
+rather than by a timer, which is the release the repo's standing rule prefers
+(#496/#513/#518): the same event that makes the press possible is the one that ends the
+hold.
+
+The residual is a pane whose text `Holds` indefinitely behind a gate that never clears.
+There the queue does stay held — correctly, since the alternative is merging two prompts —
+and #496 PR-C's badge plus `QUESTION_HOLD_STALE_AFTER`'s escalation are what tell the
+human, exactly as they did before. What #813 removes is not that hold; it is the hold that
+survived the human *fixing it*.
+
+### The badge
+
+`HumanResolved` is the one cell that clears the chip (`clear_stranded`, reason
+`human-resolved`): a person demonstrably acted on the pane and our text is gone. `TextGone`
+does **not** — our text left the box with nobody at the keyboard, which is
+`StrandedBlocker::NotHolding`'s own situation ("never confirmed and its text is gone —
+check the pane"), and clearing there would answer a question loomux cannot answer.
+`NothingStranded` establishes nothing about the pane at all.
 
 ## Risks / limitations
 

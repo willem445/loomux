@@ -21974,14 +21974,14 @@ fn the_drain_press_declines_over_a_line_the_human_left_before_our_submit() {
     // compare is structurally blind to content that predates our own submit.
     // No question is on screen either. Every pre-#532 gate says "flush".
     pm.note_user_input(pty_id, "half a thought", true);
-    record_aborted_preenter_outcome(&last_delivery, pty_id, "w-1".to_string());
+    record_aborted_preenter_outcome(&last_delivery, pty_id, "w-1".to_string(), None);
     assert_eq!(
         pm.input_pending(pty_id),
         Some(true),
         "precondition: the human's characters are outstanding in the box"
     );
 
-    let action = drain_stranded_submit(&pm, &last_delivery, "w-1".to_string(), pty_id, b"\r", Vec::new(), None);
+    let action = drain_stranded_submit(&pm, &last_delivery, "w-1".to_string(), pty_id, b"\r", Vec::new());
 
     assert_eq!(
         action,
@@ -22058,7 +22058,7 @@ fn record_aborted_preenter_outcome_makes_the_next_deliverys_flush_actually_fire(
     let last_delivery: std::sync::Mutex<HashMap<u32, _>> = std::sync::Mutex::new(HashMap::new());
     let pty_id = 3;
 
-    record_aborted_preenter_outcome(&last_delivery, pty_id, "w-1".to_string());
+    record_aborted_preenter_outcome(&last_delivery, pty_id, "w-1".to_string(), None);
 
     let prev_confirmed = recorded_confirmed(&last_delivery, pty_id);
     assert_eq!(prev_confirmed, Some(false), "an aborted pre-Enter delivery must record itself as unconfirmed");
@@ -22110,7 +22110,7 @@ fn record_aborted_preenter_outcome_makes_the_next_deliverys_flush_actually_fire(
 macro_rules! ledger_with {
     ($pty:expr, $submit_sent_ms:expr) => {{
         let m: std::sync::Mutex<HashMap<u32, _>> = std::sync::Mutex::new(HashMap::new());
-        record_inflight_delivery(&m, $pty, $submit_sent_ms, "loomux".to_string());
+        record_inflight_delivery(&m, $pty, $submit_sent_ms, "loomux".to_string(), None);
         m
     }};
 }
@@ -22142,7 +22142,7 @@ fn a_resends_inflight_claim_supersedes_the_stale_monitor_before_its_own_record_c
     // single line `deliver_now` gained: everything the Enter causes,
     // including the record D1's monitor would otherwise match, happens after
     // this point.
-    record_inflight_delivery(&last_delivery, pty, d2_ms, "loomux".to_string());
+    record_inflight_delivery(&last_delivery, pty, d2_ms, "loomux".to_string(), None);
 
     // (3) D1's monitor's next tick, taken in the real order: hook first, then
     // ledger. Any record it can see now is checked against a ledger that
@@ -22223,7 +22223,7 @@ fn a_stranded_badge_survives_an_inflight_claim_and_drops_on_a_confirmed_one() {
     let d1_ms = 1_000u64;
     let last_delivery = ledger_with!(pty, d1_ms);
 
-    record_inflight_delivery(&last_delivery, pty, 9_000, "loomux".to_string());
+    record_inflight_delivery(&last_delivery, pty, 9_000, "loomux".to_string(), None);
     assert_eq!(
         observe_ledger(&last_delivery, pty, d1_ms),
         LedgerView { superseded: true, outstanding: false, newer_confirmed: false },
@@ -22233,7 +22233,7 @@ fn a_stranded_badge_survives_an_inflight_claim_and_drops_on_a_confirmed_one() {
     let pm = PtyManager::default();
     pm.register_fake_for_test(pty, STRANDED_TAIL.as_bytes());
     assert_eq!(
-        drain_stranded_submit(&pm, &last_delivery, "loomux".to_string(), pty, b"\r", Vec::new(), None),
+        drain_stranded_submit(&pm, &last_delivery, "loomux".to_string(), pty, b"\r", Vec::new()),
         StrandedMarkerAction::Press
     );
     assert!(
@@ -22775,9 +22775,9 @@ fn a_queued_stranded_submit_presses_enter_through_the_real_replay() {
     let captured = pm.register_fake_for_test(pty, STRANDED_TAIL.as_bytes());
     let last_delivery: std::sync::Mutex<HashMap<u32, _>> = std::sync::Mutex::new(HashMap::new());
     // The ledger state a stranded delivery leaves: recorded, unconfirmed.
-    record_aborted_preenter_outcome(&last_delivery, pty, "loomux".to_string());
+    record_aborted_preenter_outcome(&last_delivery, pty, "loomux".to_string(), None);
 
-    let action = drain_stranded_submit(&pm, &last_delivery, "loomux".to_string(), pty, b"\r", Vec::new(), None);
+    let action = drain_stranded_submit(&pm, &last_delivery, "loomux".to_string(), pty, b"\r", Vec::new());
 
     assert_eq!(
         action,
@@ -23124,7 +23124,7 @@ fn a_re_delivery_supersedes_the_monitor_that_triggered_it() {
     // The lost kickoff's own ledger entry: in flight, unconfirmed. Its
     // monitor is watching under this `submit_sent_ms`.
     let kickoff_ms = 1_000u64;
-    record_inflight_delivery(&last_delivery, pty, kickoff_ms, "loomux".to_string());
+    record_inflight_delivery(&last_delivery, pty, kickoff_ms, "loomux".to_string(), None);
     assert_eq!(
         observe_ledger(&last_delivery, pty, kickoff_ms),
         LedgerView { superseded: false, outstanding: true, newer_confirmed: false },
@@ -23139,7 +23139,7 @@ fn a_re_delivery_supersedes_the_monitor_that_triggered_it() {
     // `submit_sent_ms` for every delivery, so a re-delivery can never reuse
     // the original's identity).
     let redelivery_ms = kickoff_ms + 1;
-    record_inflight_delivery(&last_delivery, pty, redelivery_ms, "loomux".to_string());
+    record_inflight_delivery(&last_delivery, pty, redelivery_ms, "loomux".to_string(), None);
 
     let view = observe_ledger(&last_delivery, pty, kickoff_ms);
     assert!(view.superseded, "the re-delivery must take ownership of the pane from the old monitor");
@@ -35372,7 +35372,7 @@ fn a_stale_human_input_block_releases_the_real_stranded_press() {
     // after it, and nothing has touched the pane since. `last > submit` (the
     // latch is SET) and `now - last >= bound` (it has gone stale).
     let stamp = now_ms() - (HUMAN_INPUT_BLOCK_BOUND_MS + 60_000);
-    record_stranded_outcome_at_for_test(&last_delivery, pty, "loomux".to_string(), stamp - 60_000);
+    record_stranded_outcome_at_for_test(&last_delivery, pty, "loomux".to_string(), stamp - 60_000, None);
     pm.set_user_input_ms_for_test(pty, stamp);
     assert_eq!(
         pm.input_pending(pty),
@@ -35380,7 +35380,7 @@ fn a_stale_human_input_block_releases_the_real_stranded_press() {
         "precondition: nothing of the human's is in the box — the bound may only release on this"
     );
 
-    let action = drain_stranded_submit(&pm, &last_delivery, "loomux".to_string(), pty, b"\r", Vec::new(), None);
+    let action = drain_stranded_submit(&pm, &last_delivery, "loomux".to_string(), pty, b"\r", Vec::new());
 
     assert_eq!(
         action,
@@ -35407,7 +35407,7 @@ fn a_fresh_human_keystroke_still_blocks_the_real_stranded_press() {
     // as "no human input since our submit" and this test would pass for the
     // wrong reason (it did, on the first run — the press fired because the two
     // timestamps tied, not because the guard let it through).
-    record_stranded_outcome_at_for_test(&last_delivery, pty, "loomux".to_string(), now_ms() - 5_000);
+    record_stranded_outcome_at_for_test(&last_delivery, pty, "loomux".to_string(), now_ms() - 5_000, None);
 
     // A genuine keystroke, through the real signal path: a real key event
     // (`human_origin: true`) carrying real content.
@@ -35417,7 +35417,7 @@ fn a_fresh_human_keystroke_still_blocks_the_real_stranded_press() {
         "precondition: the keystroke lands strictly after the delivery's own submit"
     );
 
-    let action = drain_stranded_submit(&pm, &last_delivery, "loomux".to_string(), pty, b"\r", Vec::new(), None);
+    let action = drain_stranded_submit(&pm, &last_delivery, "loomux".to_string(), pty, b"\r", Vec::new());
 
     assert_eq!(
         action,
@@ -35442,6 +35442,7 @@ fn a_stale_block_with_human_text_still_in_the_box_never_releases_the_press() {
         pty,
         "loomux".to_string(),
         now_ms() - (HUMAN_INPUT_BLOCK_BOUND_MS + 120_000),
+        None,
     );
 
     // Human types a line and leaves it sitting; then time passes. The
@@ -35451,7 +35452,7 @@ fn a_stale_block_with_human_text_still_in_the_box_never_releases_the_press() {
     let stamp = now_ms() - (HUMAN_INPUT_BLOCK_BOUND_MS + 60_000);
     pm.set_user_input_ms_for_test(pty, stamp);
 
-    let action = drain_stranded_submit(&pm, &last_delivery, "loomux".to_string(), pty, b"\r", Vec::new(), None);
+    let action = drain_stranded_submit(&pm, &last_delivery, "loomux".to_string(), pty, b"\r", Vec::new());
 
     assert_eq!(
         action,
@@ -35470,112 +35471,196 @@ fn a_stale_block_with_human_text_still_in_the_box_never_releases_the_press() {
 // delivered NOTHING — every steering prompt behind the `StrandedSubmit` marker
 // was silently held — and the "⚠ stuck prompt" chip stayed up until a restart.
 //
-// The mechanism is a deadlock by construction, and the tests below pin each
-// half of it. `admit_stranded_selfheal` pushes the marker to the FRONT of the
-// pane's queue; the drainer only ever drains the front; and the marker's press
-// is gated on `human_input_block`, which re-arms for HUMAN_INPUT_BLOCK_BOUND_MS
-// from the human's LAST keystroke. So the human's own recovery action — press
-// Enter, then keep typing to talk to the CLI — is precisely what pins the head
-// of the queue, for as long as they stay engaged.
+// The mechanism is a deadlock by construction. `admit_stranded_selfheal` pushes
+// the marker to the FRONT of the pane's queue; the drainer only ever drains the
+// front; and the marker's press is gated on `human_input_block`, which re-arms
+// for HUMAN_INPUT_BLOCK_BOUND_MS from the human's LAST keystroke. So the human's
+// own recovery action — press Enter, then keep typing to talk to the CLI — is
+// precisely what pins the head of the queue, for as long as they stay engaged.
 //
-// The two properties that must not regress while fixing it are pinned above,
-// deliberately, in the tests this section follows: #510 (never press over a
-// human's outstanding characters) and #518 (a `BoundedOut` stamp may be a
-// PHANTOM auto-reply, so it must still press — our text may really be there).
+// WHAT THE RETIREMENT IS ALLOWED TO REST ON is the whole of the review round
+// that shaped these tests, and it is why every case below is written in terms of
+// a `BoxReading` rather than a keystroke:
+//
+//   - Retiring on "a stamp landed and `input_pending` is false" cannot tell a
+//     person from a #518 phantom, and it fires strictly INSIDE the bound, so it
+//     made `BoundedOut` unreachable from this path while writing "human-resolved"
+//     into the audit for a pane nobody had touched.
+//   - And `!box_pending` is not "the box is empty": `input_box_len` counts what
+//     the HUMAN typed, never loomux's own paste. Retiring there could leave OUR
+//     prompt sitting in the box for the next queue entry to paste on top of and
+//     submit as one merged prompt — the #81/#84/#111 collision, re-opened by the
+//     repair meant to help.
+//
+// So a retirement requires a positive `BoxReading::NotHolding`, and the keystroke
+// record only picks the NAME. `Holds`, `Unverifiable` and "no text on record" all
+// fall through to the ordinary gates — nothing retires on an absence of evidence.
+
+/// The pane tail a stranded prompt leaves: our text sitting unsubmitted after
+/// the box's `>` marker. `box_holds_paste` reads this as `Holds`.
+const STRANDED_PROMPT: &str = "please post the status roll-up on #496";
+
+/// The same pane after the prompt went in: long enough post-normalize to be an
+/// informative absence rather than `Unverifiable`, and containing no copy of
+/// the prompt itself.
+const CLEARED_TAIL: &str =
+    "  ⎿  done\n\n● Posted it, linked both follow-ups, and left the thread open for review.\n\n> \n";
 
 #[test]
 fn a_human_who_submits_the_stranded_prompt_retires_the_marker() {
-    // THE incident cell, pure. A human keystroke landed after our submit
-    // (`Blocked`) and none of their characters are outstanding (`!box_pending`)
-    // — so the line that held our text was submitted or killed BY HAND. The
-    // marker's Enter is redundant at best and a stray blind Enter at worst, and
-    // before #813 this cell meant "retry forever", holding the whole queue.
+    // THE incident cell. Our text is verifiably GONE from the box, and a human
+    // keystroke is on record since our submit — a person dealt with it, which is
+    // exactly what the queue was waiting for and could not see. Before #813 this
+    // was "retry forever", holding every steering prompt behind it.
     assert_eq!(
-        stranded_marker_action(Some(false), HumanInputBlock::Blocked, false, || false, None, 600_000),
+        stranded_marker_action(
+            Some(false), Some(BoxReading::NotHolding), true,
+            HumanInputBlock::Blocked, false, || false,
+        ),
         StrandedMarkerAction::Retire(StrandedRetireReason::HumanResolved)
     );
-    // Still retires with a question on screen: the marker is being dropped, not
-    // pressed, so nothing here can answer a dialog.
+    // Still retires with a question on screen: retiring writes nothing, so a
+    // live dialog is not a reason to keep holding the queue.
     assert_eq!(
-        stranded_marker_action(Some(false), HumanInputBlock::Blocked, false, || true, None, 600_000),
-        StrandedMarkerAction::Retire(StrandedRetireReason::HumanResolved),
-        "retiring writes nothing, so a live question is not a reason to keep holding the queue"
+        stranded_marker_action(
+            Some(false), Some(BoxReading::NotHolding), true,
+            HumanInputBlock::Blocked, false, || true,
+        ),
+        StrandedMarkerAction::Retire(StrandedRetireReason::HumanResolved)
+    );
+    assert!(
+        StrandedRetireReason::HumanResolved.resolves_the_pane(),
+        "and this is the one retirement that takes the chip down"
     );
 }
 
 #[test]
-fn the_human_resolved_retire_never_fires_over_outstanding_human_characters() {
-    // #510's absolute, unchanged and load-bearing: the retire is licensed by an
-    // EMPTY box, never by the keystroke alone. Flip `box_pending` and the same
-    // block must go back to holding.
+fn text_gone_with_nobody_at_the_keyboard_retires_under_its_own_name() {
+    // Same reading, no keystroke: the CLI consumed our text, collapsed it to a
+    // placeholder, or it never really landed. Nothing left to press Enter
+    // against either way — but calling it `human-resolved` would put a person in
+    // the audit trail who was never there, and it must NOT take the badge down:
+    // this is `StrandedBlocker::NotHolding`'s own situation, whose wording is
+    // "never confirmed and its text is gone — check the pane".
     assert_eq!(
-        stranded_marker_action(Some(false), HumanInputBlock::Blocked, true, || false, None, 600_000),
+        stranded_marker_action(
+            Some(false), Some(BoxReading::NotHolding), false,
+            HumanInputBlock::None, false, || false,
+        ),
+        StrandedMarkerAction::Retire(StrandedRetireReason::TextGone)
+    );
+    assert!(!StrandedRetireReason::TextGone.resolves_the_pane());
+    assert!(!StrandedRetireReason::NothingStranded.resolves_the_pane());
+}
+
+#[test]
+fn a_marker_never_retires_while_our_text_is_still_in_the_box() {
+    // The #111 collision guard, and the reason the retirement is keyed on the
+    // TEXT. `input_pending` is false here — no HUMAN characters are outstanding
+    // — and the first cut of this fix retired on exactly that. But our own
+    // prompt is still sitting in the box (`Holds`), and `deliver_now` does not
+    // abort when `flush_stranded_text` declines, so the next queue entry would
+    // paste on top of it and submit both prompts merged as one.
+    //
+    // Every combination that could tempt a retirement must keep holding.
+    for block in [HumanInputBlock::None, HumanInputBlock::Blocked, HumanInputBlock::BoundedOut] {
+        for stamped in [false, true] {
+            let action = stranded_marker_action(
+                Some(false), Some(BoxReading::Holds), stamped, block, false, || false,
+            );
+            assert!(
+                !matches!(action, StrandedMarkerAction::Retire(_)),
+                "a `Holds` reading must never retire (block={block:?} stamped={stamped}), got {action:?}"
+            );
+        }
+    }
+    // And specifically: the exact shape the first cut retired on.
+    assert_eq!(
+        stranded_marker_action(
+            Some(false), Some(BoxReading::Holds), true,
+            HumanInputBlock::Blocked, false, || false,
+        ),
         StrandedMarkerAction::Retry(queue::EnqueueReason::BoxOccupied)
     );
 }
 
 #[test]
-fn a_bounded_out_stamp_still_presses_because_it_may_be_a_phantom() {
-    // #518's argument, which #813 must not quietly absorb into its own. A
-    // `BoundedOut` block is a stamp older than the bound over an empty box —
-    // and the reason that releases rather than retires is that the stamp may
-    // have been a terminal auto-reply misclassified as a keystroke, in which
-    // case no human ever touched the pane and our text really is still sitting
-    // in the box waiting for exactly this Enter.
+fn a_marker_never_retires_on_a_reading_it_could_not_take() {
+    // `Unverifiable` ("we looked and could not tell") and `None` ("we have
+    // nothing to look for") are different facts, and neither is evidence. Both
+    // take the conservative branch — the one direction that could re-open either
+    // hazard is retiring on an absence.
+    for reading in [Some(BoxReading::Unverifiable), None] {
+        let action = stranded_marker_action(
+            Some(false), reading, true, HumanInputBlock::Blocked, false, || false,
+        );
+        assert!(
+            !matches!(action, StrandedMarkerAction::Retire(_)),
+            "reading {reading:?} is not evidence of anything, got {action:?}"
+        );
+    }
+}
+
+#[test]
+fn a_phantom_stamp_cannot_retire_a_marker_and_518s_bound_stays_reachable() {
+    // #518's whole premise is that a terminal auto-reply can be misclassified as
+    // a keystroke. The first cut of #813 retired on (stamp + empty occupancy),
+    // which is precisely a phantom's shape — and since `BoundedOut` is only
+    // reachable with `!box_pending`, that retirement fired strictly BEFORE the
+    // bound could ever release, making #518 unreachable from this path.
+    //
+    // Now the phantom holds, exactly as #518 intends...
     assert_eq!(
-        stranded_marker_action(Some(false), HumanInputBlock::BoundedOut, false, || false, None, 600_000),
-        StrandedMarkerAction::Press
+        stranded_marker_action(
+            Some(false), Some(BoxReading::Holds), true,
+            HumanInputBlock::Blocked, false, || false,
+        ),
+        StrandedMarkerAction::Retry(queue::EnqueueReason::BoxOccupied),
+        "a stamp that may be a phantom must hold, not retire"
     );
+    // ...and the bound is genuinely reachable: once the stamp goes stale over an
+    // empty box, `holds()` reads false and the press happens, which is the whole
+    // of #518's own fix and the only thing that releases a phantom.
     assert_eq!(
-        stranded_marker_action(Some(false), HumanInputBlock::None, false, || false, None, 600_000),
+        stranded_marker_action(
+            Some(false), Some(BoxReading::Holds), true,
+            HumanInputBlock::BoundedOut, false, || false,
+        ),
         StrandedMarkerAction::Press,
-        "and the ordinary case — nobody typed at all — is untouched"
+        "#518's bound must still release the press — this is what the first cut made unreachable"
     );
 }
 
 #[test]
 fn a_marker_with_nothing_stranded_is_retired_rather_than_retried_forever() {
     // `should_flush_before_paste` required `Some(false)` and every other ledger
-    // state simply declined — forever, at the head of the queue. `Some(true)`
-    // is a pane whose later delivery confirmed; `None` is the pane a restart
-    // left with a persisted queue and no in-memory ledger. Neither can ever
-    // become `Some(false)` again, so retrying is a permanent block.
+    // state simply declined — forever, at the head of the queue. `Some(true)` is
+    // a pane whose later delivery confirmed; `None` is the pane a restart left
+    // with a persisted queue and no in-memory ledger. Neither can ever become
+    // `Some(false)` again, so retrying is a permanent block.
     assert_eq!(
-        stranded_marker_action(Some(true), HumanInputBlock::None, false, || false, None, 600_000),
+        stranded_marker_action(
+            Some(true), Some(BoxReading::Holds), false,
+            HumanInputBlock::None, false, || false,
+        ),
         StrandedMarkerAction::Retire(StrandedRetireReason::NothingStranded)
     );
     assert_eq!(
-        stranded_marker_action(None, HumanInputBlock::None, false, || false, None, 600_000),
+        stranded_marker_action(None, None, false, HumanInputBlock::None, false, || false),
         StrandedMarkerAction::Retire(StrandedRetireReason::NothingStranded)
     );
 }
 
 #[test]
-fn the_marker_hold_is_bounded_and_the_bound_outranks_both_live_gates() {
-    // The standing rule: a suppression driven by a fallible signal needs a
-    // release that does not depend on that signal — and this one holds OTHER
-    // work hostage while it waits. Both live gates are latch-capable
-    // (`input_box_len` over an empty box, a stale `(y/n)` in the byte ring), so
-    // the bound has to outrank BOTH or it could never fire at all.
+fn the_human_resolved_retire_never_fires_over_outstanding_human_characters() {
+    // #510's absolute, unchanged: a human's own line is in the box, so nothing
+    // here may write and nothing may conclude they are done with it — not even
+    // on a `NotHolding` reading of OUR text, which says nothing about theirs.
     assert_eq!(
-        stranded_marker_action(Some(false), HumanInputBlock::None, true, || false, Some(600_000), 600_000),
-        StrandedMarkerAction::Retire(StrandedRetireReason::Unfirable),
-        "a box-occupied hold that has run to the bound"
-    );
-    assert_eq!(
-        stranded_marker_action(Some(false), HumanInputBlock::None, false, || true, Some(900_000), 600_000),
-        StrandedMarkerAction::Retire(StrandedRetireReason::Unfirable),
-        "a question hold that has run past the bound"
-    );
-    // One millisecond short is still a hold: the bound is a bound, not a
-    // shortcut past the two gates.
-    assert_eq!(
-        stranded_marker_action(Some(false), HumanInputBlock::None, true, || false, Some(599_999), 600_000),
-        StrandedMarkerAction::Retry(queue::EnqueueReason::BoxOccupied)
-    );
-    // And a pane with no open hold episode can never reach it.
-    assert_eq!(
-        stranded_marker_action(Some(false), HumanInputBlock::None, true, || false, None, 600_000),
+        stranded_marker_action(
+            Some(false), Some(BoxReading::Holds), true,
+            HumanInputBlock::Blocked, true, || false,
+        ),
         StrandedMarkerAction::Retry(queue::EnqueueReason::BoxOccupied)
     );
 }
@@ -35584,15 +35669,21 @@ fn the_marker_hold_is_bounded_and_the_bound_outranks_both_live_gates() {
 fn a_retry_names_the_gate_that_actually_declined() {
     // The drainer used to report EVERY declined marker as
     // `EnqueueReason::Question`, sending the orchestrator to look for a dialog
-    // that a box-occupied hold never painted — the same mislabel #532 rev-12
-    // NB1 closed on the `AbortedPreEnter` path, arriving here.
+    // that a box-occupied hold never painted — the same mislabel #532 rev-12 NB1
+    // closed on the `AbortedPreEnter` path, arriving here.
     assert_eq!(
-        stranded_marker_action(Some(false), HumanInputBlock::None, true, || true, None, 600_000),
+        stranded_marker_action(
+            Some(false), Some(BoxReading::Holds), false,
+            HumanInputBlock::None, true, || true,
+        ),
         StrandedMarkerAction::Retry(queue::EnqueueReason::BoxOccupied),
         "box occupancy outranks the question, and it is the box that gets named"
     );
     assert_eq!(
-        stranded_marker_action(Some(false), HumanInputBlock::None, false, || true, None, 600_000),
+        stranded_marker_action(
+            Some(false), Some(BoxReading::Holds), false,
+            HumanInputBlock::None, false, || true,
+        ),
         StrandedMarkerAction::Retry(queue::EnqueueReason::Question)
     );
 }
@@ -35600,26 +35691,33 @@ fn a_retry_names_the_gate_that_actually_declined() {
 #[test]
 fn the_question_gate_is_not_sampled_by_a_decision_that_does_not_need_it() {
     // Answering the question gate costs a 64 KiB grid recomposition
-    // (`question_sample` → `termgrid::render_visible`), paid on a 2 s poll. The
-    // three retire cells and the box-occupied retry all decide without it, and
-    // a closure that panics is the only way to pin that they do not ask — a
-    // `bool` parameter would make this untestable by construction, which is
-    // exactly how it would drift back.
+    // (`question_sample` → `termgrid::render_visible`), paid on a 2 s poll. Every
+    // decision except the last one reaches its answer without it, and a closure
+    // that panics is the only way to pin that they do not ask — a `bool`
+    // parameter would make this untestable by construction, which is exactly how
+    // it would drift back.
     let never = || -> bool { panic!("the question gate must not be sampled on this path") };
     assert_eq!(
-        stranded_marker_action(Some(true), HumanInputBlock::None, false, never, None, 600_000),
+        stranded_marker_action(Some(true), None, false, HumanInputBlock::None, false, never),
         StrandedMarkerAction::Retire(StrandedRetireReason::NothingStranded)
     );
     assert_eq!(
-        stranded_marker_action(Some(false), HumanInputBlock::Blocked, false, never, None, 600_000),
+        stranded_marker_action(
+            Some(false), Some(BoxReading::NotHolding), true,
+            HumanInputBlock::Blocked, false, never,
+        ),
         StrandedMarkerAction::Retire(StrandedRetireReason::HumanResolved)
     );
     assert_eq!(
-        stranded_marker_action(Some(false), HumanInputBlock::None, true, never, Some(600_000), 600_000),
-        StrandedMarkerAction::Retire(StrandedRetireReason::Unfirable)
+        stranded_marker_action(
+            Some(false), Some(BoxReading::Holds), false, HumanInputBlock::None, true, never,
+        ),
+        StrandedMarkerAction::Retry(queue::EnqueueReason::BoxOccupied)
     );
     assert_eq!(
-        stranded_marker_action(Some(false), HumanInputBlock::None, true, never, None, 600_000),
+        stranded_marker_action(
+            Some(false), Some(BoxReading::Holds), true, HumanInputBlock::Blocked, false, never,
+        ),
         StrandedMarkerAction::Retry(queue::EnqueueReason::BoxOccupied)
     );
 }
@@ -35627,41 +35725,41 @@ fn the_question_gate_is_not_sampled_by_a_decision_that_does_not_need_it() {
 #[test]
 fn a_human_pressing_enter_in_the_pane_retires_the_queued_marker() {
     // The WIRED form of the incident, through `drain_stranded_submit` — the
-    // function `run_queue_drainer` actually calls — against a real
-    // `PtyManager` with a fake child. A pure test cannot see this: the whole
-    // defect was that the human's Enter feeds BOTH halves of the gate at once
-    // (it stamps `user_input_ms` AND zeroes `input_box_len`), and only the real
-    // `note_user_input` does both.
+    // function `run_queue_drainer` actually calls — against a real `PtyManager`
+    // with a fake child. A pure test cannot see this: the defect turns on the
+    // human's Enter feeding BOTH halves of the old gate in one write (it stamps
+    // `user_input_ms` AND zeroes `input_box_len`), and on the pane's tail no
+    // longer holding our text, and only the real `PtyManager` produces both.
     let pm = PtyManager::default();
     let pty = 8131u32;
-    let captured = pm.register_fake_for_test(pty, STRANDED_TAIL.as_bytes());
+    // The pane AFTER the human submitted our prompt: the box no longer holds it.
+    let captured = pm.register_fake_for_test(pty, CLEARED_TAIL.as_bytes());
     let last_delivery: std::sync::Mutex<HashMap<u32, _>> = std::sync::Mutex::new(HashMap::new());
-    // The ledger state a stranded delivery leaves: recorded, unconfirmed — and
-    // dated a minute BACK. `tier1_trusted` compares with `<=`, so a record
-    // stamped `now` and a keystroke stamped `now` land in the same millisecond
-    // and read as "no human has typed since our submit", which is a fact about
-    // this test's clock and not about the pane. The real strand is minutes old
-    // by the time a human gets to it (`record_aborted_preenter_outcome` is what
-    // production calls; the back-dated variant exists for exactly this).
-    record_stranded_outcome_at_for_test(&last_delivery, pty, "loomux".to_string(), now_ms() - 60_000);
+    // The ledger a stranded delivery leaves — unconfirmed, carrying the text it
+    // left in the box — dated a minute back. `tier1_trusted` compares with `<=`,
+    // so a record and a keystroke stamped in the same millisecond would read as
+    // "no human has typed since our submit": a fact about the test's clock, not
+    // the pane.
+    record_stranded_outcome_at_for_test(
+        &last_delivery,
+        pty,
+        "loomux".to_string(),
+        now_ms() - 60_000,
+        Some(STRANDED_PROMPT.to_string()),
+    );
 
     // The human rescues the pane by hand: click in, press Enter. `\r` with
-    // nothing after it classifies `Submit`, which stamps the keystroke clock
-    // and empties the occupancy counter in the same write.
+    // nothing after it classifies `Submit`, which stamps the keystroke clock and
+    // empties the occupancy counter in the same write.
     pm.note_user_input(pty, "\r", true);
-    assert_eq!(
-        pm.input_pending(pty),
-        Some(false),
-        "precondition: their Enter emptied the box"
-    );
+    assert_eq!(pm.input_pending(pty), Some(false), "precondition: their Enter emptied the box");
     assert!(
         pm.last_user_input_ms(pty).unwrap_or(0) > now_ms() - 5_000,
-        "precondition: their Enter stamped the keystroke clock strictly after the strand, so \
-         the block reads `Blocked` rather than `tier1_trusted`"
+        "precondition: the keystroke lands strictly after the strand, so the block reads Blocked"
     );
 
     let action =
-        drain_stranded_submit(&pm, &last_delivery, "loomux".to_string(), pty, b"\r", Vec::new(), None);
+        drain_stranded_submit(&pm, &last_delivery, "loomux".to_string(), pty, b"\r", Vec::new());
 
     assert_eq!(
         action,
@@ -35671,12 +35769,49 @@ fn a_human_pressing_enter_in_the_pane_retires_the_queued_marker() {
     );
     assert!(
         captured.lock().unwrap().is_empty(),
-        "and it must retire WITHOUT writing: a second Enter into a box a human just cleared \
-         is the stray blind press this whole guard exists to prevent, got {:?}",
+        "and it must retire WITHOUT writing: a second Enter into a box a human just cleared is \
+         the stray blind press this guard exists to prevent, got {:?}",
         captured.lock().unwrap()
     );
 }
 
+#[test]
+fn the_wired_marker_holds_while_the_pane_still_shows_our_stranded_text() {
+    // The B4 regression, wired: the SAME keystroke evidence as the test above —
+    // a human Enter, occupancy back to zero — but the pane's tail still shows our
+    // prompt sitting in the box. `input_pending` cannot see our own text (it
+    // counts only what the human typed), so the first cut of this fix retired
+    // here, and the next queue entry would then paste on top of a prompt still
+    // waiting to be submitted and send both as one.
+    let pm = PtyManager::default();
+    let pty = 8132u32;
+    let captured = pm.register_fake_for_test(pty, STRANDED_TAIL.as_bytes());
+    let last_delivery: std::sync::Mutex<HashMap<u32, _>> = std::sync::Mutex::new(HashMap::new());
+    record_stranded_outcome_at_for_test(
+        &last_delivery,
+        pty,
+        "loomux".to_string(),
+        now_ms() - 60_000,
+        // STRANDED_TAIL's own prompt line, so the box reading is `Holds`.
+        Some(STRANDED_PROMPT.to_string()),
+    );
+    pm.note_user_input(pty, "\r", true);
+    assert_eq!(pm.input_pending(pty), Some(false), "precondition: no HUMAN characters outstanding");
+
+    let action =
+        drain_stranded_submit(&pm, &last_delivery, "loomux".to_string(), pty, b"\r", Vec::new());
+
+    assert!(
+        !matches!(action, StrandedMarkerAction::Retire(_)),
+        "our prompt is still in that box — retiring here hands the next queue entry a merge \
+         collision (#81/#84/#111), got {action:?}"
+    );
+    assert!(
+        captured.lock().unwrap().is_empty(),
+        "and #518 still holds the press while the keystroke is fresh, got {:?}",
+        captured.lock().unwrap()
+    );
+}
 #[test]
 fn a_bounded_out_block_lets_the_stranded_decision_reach_self_heal() {
     // The ACTION half of the bound (the brief's "downgrades to
