@@ -552,3 +552,37 @@ test("the built-in roster carries the launcher's per-role knobs", () => {
   assert.equal(blocks.find((b) => b.id === "reviewer")!.effort, "");
   assert.equal(blocks.find((b) => b.id === "reviewer")!.context, "");
 });
+
+// ---------- an opencode block in the pre-launch roster (#722) ----------
+
+test("an opencode block reads with its provider prefix intact (#722)", () => {
+  // The roster box is the consent surface: it is where the human reads which
+  // model each block will run on, BEFORE the group spawns. An id shown with the
+  // `/` dropped would name a model that does not exist — the exact mangle slice
+  // A's `sanitize_model` widening removed from the spawn path — and the human
+  // would have consented to something else.
+  assert.equal(
+    describeBlock(block({ id: "rev-oc", kind: "reviewer", cli: "opencode", model: "opencode/deepseek-v4-flash-free" })),
+    "reviewer · opencode · opencode/deepseek-v4-flash-free"
+  );
+  // Nothing is prettified here — this line is what will be spawned, not a label.
+  const line = describeBlock(
+    block({ id: "w", kind: "worker", cli: "opencode", model: "opencode/gpt-5.1-codex", persona: "profile" })
+  );
+  assert.equal(line, "worker · opencode · opencode/gpt-5.1-codex · repo persona (file)");
+});
+
+test("an opencode block with no model says so, rather than inventing one (#722)", () => {
+  // `default_model("opencode", _)` is empty by design: the pane inherits whatever
+  // the human's own opencode config selects. "default model" is the honest way to
+  // render that, and the launcher's per-role default is the same empty string.
+  assert.equal(
+    describeBlock(block({ id: "w", kind: "worker", cli: "opencode", model: "" })),
+    "worker · opencode · default model"
+  );
+  const picked = builtinRoster([{ key: "worker", cli: "opencode", model: "" }], "opencode");
+  const worker = picked.find((b) => b.kind === "worker")!;
+  assert.equal(worker.cli, "opencode");
+  assert.equal(worker.model, "", "an empty pick must stay empty — never back-filled with a guess");
+  assert.equal(describeBlock(worker), "worker · opencode · default model");
+});

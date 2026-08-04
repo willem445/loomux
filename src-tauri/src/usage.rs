@@ -21,6 +21,16 @@
 //! usage record, add a `copilot_session_usage` reader here and it slots in
 //! ahead of the fallback with no other changes.
 //!
+//! **OpenCode** writes no transcript file at all: sessions, messages and parts
+//! live in one SQLite database, and the `session` row itself already carries
+//! the dollar cost OpenCode computed *and* five token counters. So
+//! `opencode_session_usage` reads one row instead of folding message records —
+//! and the dollars are **reported by the CLI, not estimated here**, which is
+//! why OpenCode needs no `price_for` entry. The read itself lives in
+//! `crate::opencodedb`; this module only maps its shape onto
+//! [`SessionUsage`], which is the lossy half and belongs where the other CLIs'
+//! mappings are.
+//!
 //! Everything here is best-effort and pure where it matters: the parser
 //! (`parse_claude_transcript`) takes text and is exercised by fixture tests,
 //! never a live CLI.
@@ -388,6 +398,50 @@ pub fn claude_session_usage_in(root: &Path, session_id: &str) -> Option<SessionU
         text.push('\n');
     }
     Some(parse_claude_transcript(&text))
+}
+
+// ---------------------------------------------------------------------------
+// OpenCode session store (#722)
+// ---------------------------------------------------------------------------
+
+/// Read an OpenCode session's usage from the SQLite store at `db` — the
+/// group's own database, per `OPENCODE_DB` (see `doc/design/opencode.md`).
+///
+/// `Ok(None)` is "readable store, no such session yet"; `Err` is a degrade the
+/// caller reports as zero usage (`crate::opencodedb::Unavailable`).
+///
+/// **Two mapping decisions, both lossy, both deliberate:**
+///
+/// - **Reasoning tokens are folded into `output_tokens`.** OpenCode counts
+///   them in a fifth bucket loomux has no column for, and dropping them would
+///   under-report — a real session on this machine spent 1193 reasoning
+///   tokens against 1115 output ones, so the fold is the difference between
+///   roughly right and roughly half. `output` is also where they already sit
+///   for the CLI loomux compares against: Claude's transcript counts thinking
+///   inside `output_tokens`, so folding makes the two CLIs' `output` bucket
+///   mean the same thing rather than two different things under one label.
+/// - **`cache_write` maps to `cache_creation_tokens`.** Same quantity under
+///   two vendors' names — tokens written INTO the cache, which is what
+///   Claude's `cache_creation_input_tokens` counts.
+///
+/// The dollar figure passes through untouched and is **reported**, not
+/// estimated: OpenCode priced it against its own provider table, so no
+/// `price_for` lookup happens and callers must not label it an estimate.
+/// `Some(0.0)` is a real answer on a free model, not a missing one.
+pub fn opencode_session_usage(
+    db: &Path,
+    session_id: &str,
+) -> Result<Option<SessionUsage>, crate::opencodedb::Unavailable> {
+    Ok(crate::opencodedb::session_usage(db, session_id)?.map(|t| SessionUsage {
+        tokens: TokenUsage {
+            input_tokens: t.input,
+            output_tokens: t.output + t.reasoning,
+            cache_creation_tokens: t.cache_write,
+            cache_read_tokens: t.cache_read,
+        },
+        cost_usd: Some(t.cost_usd),
+        model: t.model,
+    }))
 }
 
 /// Bytes read from the END of a transcript file for the tail-based signals

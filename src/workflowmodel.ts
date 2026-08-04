@@ -53,12 +53,14 @@ export function isBlockKind(v: string): v is BlockKind {
 /** The agent CLIs a block may run. Mirrors the backend's `SUPPORTED_CLIS`
  *  (orchestration/mod.rs) — a block naming anything else is a finding, not a spawn.
  *
- *  `gemini` (#267 stage 2) is what makes "run one reviewer on a different
- *  CLI/model than the worker" buy a genuinely different model family rather
- *  than a second Claude-family opinion. Which CLIs can host which *kinds* is a
- *  separate question the backend owns (`CLI_CAPS` / `cli_can_host`): membership
- *  here is spawnability, not capability. */
-export const WORKFLOW_CLIS = ["claude", "copilot", "gemini"] as const;
+ *  `gemini` (#267 stage 2) and `opencode` (#722) are what make "run one reviewer
+ *  on a different CLI/model than the worker" buy a genuinely different model
+ *  family rather than a second Claude-family opinion — opencode most of all,
+ *  since its model ids name a provider (`opencode/deepseek-v4-flash-free`) and
+ *  reach a catalog no other adapter here can. Which CLIs can host which *kinds*
+ *  is a separate question the backend owns (`CLI_CAPS` / `cli_can_host`):
+ *  membership here is spawnability, not capability. */
+export const WORKFLOW_CLIS = ["claude", "copilot", "gemini", "opencode"] as const;
 export type WorkflowCli = (typeof WORKFLOW_CLIS)[number];
 
 export function isWorkflowCli(v: string): v is WorkflowCli {

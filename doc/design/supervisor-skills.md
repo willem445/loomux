@@ -416,8 +416,8 @@ Why derived-on-read won:
    manufacture it — accidentally, by re-filing the same candidate, or by a
    window whose quoted content is instruction-shaped (the untrusted-digest
    risk this design already carries a two-layer guard for). Derived-on-read
-   is computed from transcripts **no agent authors** — a Claude/Copilot CLI
-   writes them — so the evidence and the agent proposing on it are
+   is computed from transcripts **no agent authors** — the agent CLI writes
+   them — so the evidence and the agent proposing on it are
    structurally separate. #459 already tracks `.loomux/workflow.yml` as an
    agent-writable live gate input; adding a second such surface to close
    *this* particular loop would have been the wrong trade.
@@ -466,9 +466,11 @@ either way".
   capability-closure proof, and the launcher preview/roster chip. Landed
   first; everything else rebases onto it.
 - **B — session digest** (parallel with A): the `session_digest` MCP tool and
-  the friction-window extractor that normalizes Claude/Copilot transcripts.
-  Shipped with an interim worker-kind-wide gate (role_hint hadn't landed
-  yet); tightened to `role_hint == process` by D's binding rider.
+  the friction-window extractor, fed by one transcript normalizer per agent
+  CLI (Claude and Copilot here; OpenCode's landed with #722's slice B2, see
+  `doc/design/opencode.md`). Shipped with an interim worker-kind-wide gate
+  (role_hint hadn't landed yet); tightened to `role_hint == process` by D's
+  binding rider.
 - **C — personas/templates** (above): the default advisor/process personas,
   the workflow-conditional prose, and the `mechanics_core` addendum keyed off
   `role_hint`.

@@ -1,9 +1,11 @@
 //! Session-digest friction extraction (#250/#324 slice B).
 //!
-//! A worker's raw transcript (Claude `.jsonl` or Copilot `session-state`) is
-//! too large and too noisy to feed an agent directly — full file contents,
-//! tool output, thinking blocks. This module normalizes both source shapes
-//! into one small event stream, then reduces that stream, deterministically
+//! A worker's raw transcript (Claude `.jsonl`, Copilot `session-state`, or
+//! OpenCode's SQLite `message`/`part` rows) is too large and too noisy to feed
+//! an agent directly — full file contents, tool output, thinking blocks. This
+//! module normalizes every source shape — one normalizer per CLI, all of them
+//! producing [`TranscriptEvent`], and no parallel mechanism behind any of
+//! them — into one small event stream, then reduces that stream, deterministically
 //! and without any LLM, into "friction windows": the wall, the attempts, the
 //! fix. Only those windows (plus three cheap anchors) are meant to reach an
 //! agent — see `session_digest` in `mcp.rs` / `OrchRegistry::session_digest`
@@ -18,8 +20,8 @@ use serde::Serialize;
 use serde_json::Value;
 
 /// One event in a normalized transcript, source-agnostic — the same shape
-/// whether it came from a Claude `.jsonl` line or a Copilot session-state
-/// read. `role` is `"user"` or `"assistant"`.
+/// whether it came from a Claude `.jsonl` line, a Copilot session-state read,
+/// or an OpenCode `part` row. `role` is `"user"` or `"assistant"`.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct TranscriptEvent {
     pub role: String,
@@ -290,6 +292,174 @@ fn parse_checkpoint_titles(md: &str) -> Vec<(usize, String)> {
 }
 
 // ---------------------------------------------------------------------------
+// OpenCode SQLite normalization
+// ---------------------------------------------------------------------------
+
+/// Normalize one OpenCode session's stored messages and parts into the same
+/// event stream Claude and Copilot produce. The rows come from
+/// [`opencodedb::session_transcript`](crate::opencodedb::session_transcript) —
+/// the group's read-only store, the ONE SQLite path — and this function stays
+/// pure like its two siblings: documents in, events out, no disk.
+///
+/// **Where OpenCode differs from Claude's wire format**, since the mapping is
+/// only obvious once that is said out loud (schema `SOURCE-VERIFIED` at
+/// `anomalyco/opencode@f67e80c2`, tag `v1.18.11`,
+/// `packages/schema/src/v1/session.ts`; see `doc/design/opencode.md`):
+///
+/// - **A message carries no text.** Both a user's prompt and an assistant's
+///   reply live in `part` rows hanging off the message, so the message
+///   document is read for exactly one thing — its `role` — and everything
+///   else comes from the part.
+/// - **One `tool` part carries the call AND its outcome.** Claude writes a
+///   `tool_use` block and, a message later, a `tool_result` block; OpenCode
+///   writes one row whose `state` is `pending | running | completed | error`.
+///   So a completed or failed tool part expands to TWO events here — the
+///   `ToolCall` every friction signature pairs against, then the `ToolResult`
+///   carrying `output` (completed) or `error` (error). A `pending`/`running`
+///   part emits the call and no result: that call genuinely has no outcome
+///   yet, and inventing a clean one would erase a wall the session died on.
+/// - **Both events carry the MESSAGE's role**, so a tool call and its result
+///   are both `"assistant"` where Claude's result would be `"user"`. Nothing
+///   reads `role` except `build_digest`'s "first user `Text`" prompt anchor,
+///   and no friction signature does — so mirroring Claude's turn convention
+///   would be a fiction with no reader.
+///
+/// Part types other than `text` and `tool` are skipped, and the full list is
+/// worth naming rather than hiding behind a wildcard: `reasoning` (skipped
+/// for the same reason `push_claude_block` skips `thinking` — it is the
+/// model's scratchpad, not what it did), plus `step-start`, `step-finish`,
+/// `snapshot`, `patch`, `file`, `agent`, `retry`, `compaction` and `subtask`,
+/// none of which carry conversation content or a tool outcome.
+pub fn parse_opencode_transcript_events(rows: &[crate::opencodedb::TranscriptRow]) -> Vec<TranscriptEvent> {
+    let mut events = Vec::new();
+    // One message's document repeats across every one of its parts, so it is
+    // parsed once and reused until the id changes — the reason `message_id`
+    // rides on the row at all.
+    let mut cur_message: &str = "";
+    let mut role: Option<String> = None;
+    for row in rows {
+        if row.message_id != cur_message {
+            cur_message = row.message_id.as_str();
+            role = serde_json::from_str::<Value>(&row.message_json)
+                .ok()
+                .and_then(|m| m.get("role").and_then(Value::as_str).map(str::to_string))
+                // `Info` is a union of exactly `user` and `assistant` at the
+                // pin. Anything else is a shape this normalizer has not been
+                // read against — skip it rather than emit an event whose role
+                // no consumer knows how to read.
+                .filter(|r| r == "user" || r == "assistant");
+        }
+        let Some(role) = role.as_deref() else { continue };
+        // Malformed JSON is skipped, not fatal — same posture as the Claude
+        // arm's per-line skip. A digest of most of a session beats an error.
+        let Ok(part) = serde_json::from_str::<Value>(&row.part_json) else { continue };
+        let ts_ms = u64::try_from(row.time_created_ms).ok();
+        push_opencode_part(&mut events, role, ts_ms, &part);
+    }
+    events
+}
+
+fn push_opencode_part(events: &mut Vec<TranscriptEvent>, role: &str, ts_ms: Option<u64>, p: &Value) {
+    match p.get("type").and_then(Value::as_str) {
+        Some("text") => {
+            // `synthetic` text is scaffolding OpenCode injects on the model's
+            // behalf (its own `SYNTHETIC_ATTACHMENT_PROMPT`, for one), and
+            // `ignored` is text it has already decided not to feed the model.
+            // Neither is anything an agent or a human said, and `initial_prompt`
+            // is the first user `Text` in this stream — so letting one through
+            // would put a machine-written string where the task brief goes.
+            if p.get("synthetic").and_then(Value::as_bool).unwrap_or(false)
+                || p.get("ignored").and_then(Value::as_bool).unwrap_or(false)
+            {
+                return;
+            }
+            if let Some(t) = p.get("text").and_then(Value::as_str) {
+                if !t.is_empty() {
+                    events.push(TranscriptEvent {
+                        role: role.to_string(),
+                        kind: EventKind::Text { text: truncate(t, TEXT_CAP) },
+                        ts_ms,
+                    });
+                }
+            }
+        }
+        Some("tool") => {
+            let id = p.get("callID").and_then(Value::as_str).unwrap_or_default().to_string();
+            let name = p.get("tool").and_then(Value::as_str).unwrap_or_default().to_string();
+            let state = p.get("state");
+            // Every `ToolState` arm carries `input`, including `pending` and
+            // `running` — so a call's arguments are readable whatever became
+            // of it.
+            let input = state.and_then(|s| s.get("input"));
+            let command = input.and_then(|i| i.get("command")).and_then(Value::as_str).map(str::to_string);
+            // `filePath` first, then `path`: the pin ships two tools both
+            // named `edit`, and they disagree on this key —
+            // `packages/opencode/src/tool/edit.ts` (the v1 tool whose runner
+            // writes these very part rows) takes `filePath`, while
+            // `packages/core/src/tool/edit.ts` takes `path`. Reading only one
+            // spelling would switch the reverted-edit signature off silently
+            // the day the other tool wins, which is precisely the failure a
+            // digest cannot report on itself.
+            let file_path = input
+                .and_then(|i| i.get("filePath").or_else(|| i.get("path")))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let old_string = input
+                .and_then(|i| i.get("oldString"))
+                .and_then(Value::as_str)
+                .map(|s| truncate(s, TEXT_CAP));
+            let new_string = input
+                .and_then(|i| i.get("newString"))
+                .and_then(Value::as_str)
+                .map(|s| truncate(s, TEXT_CAP));
+            let summary = command
+                .clone()
+                .or_else(|| file_path.clone())
+                .unwrap_or_else(|| truncate(&input.map(Value::to_string).unwrap_or_default(), 120));
+            events.push(TranscriptEvent {
+                role: role.to_string(),
+                kind: EventKind::ToolCall {
+                    id: id.clone(),
+                    name,
+                    command,
+                    file_path,
+                    old_string,
+                    new_string,
+                    summary: truncate(&summary, 120),
+                },
+                ts_ms,
+            });
+            let (is_error, text) = match state.and_then(|s| s.get("status")).and_then(Value::as_str) {
+                Some("completed") => (false, opencode_state_text(state.and_then(|s| s.get("output")))),
+                Some("error") => (true, opencode_state_text(state.and_then(|s| s.get("error")))),
+                // pending/running (or a status this reader has not been read
+                // against): the call stands alone, no result event.
+                _ => return,
+            };
+            events.push(TranscriptEvent {
+                role: role.to_string(),
+                kind: EventKind::ToolResult { tool_use_id: id, is_error, text: truncate(&text, TEXT_CAP) },
+                ts_ms,
+            });
+        }
+        _ => {}
+    }
+}
+
+/// A completed tool's `output` and a failed one's `error` are both plain
+/// strings at the pin (`ToolStateCompleted`/`ToolStateError`). Non-string
+/// values are serialized rather than dropped: the friction key is built from
+/// this text, and an empty error message would collapse every failure of one
+/// tool into a single key.
+fn opencode_state_text(v: Option<&Value>) -> String {
+    match v {
+        Some(Value::String(s)) => s.clone(),
+        Some(other) => other.to_string(),
+        None => String::new(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Friction-window extraction (Stage-1 mechanical reduction, no LLM)
 // ---------------------------------------------------------------------------
 
@@ -350,8 +520,24 @@ impl FrictionWindow {
     }
 }
 
+/// Whether a tool name is a file-mutating edit, for the reverted-edit
+/// signature.
+///
+/// **Case-insensitive deliberately, and shared across every CLI** (#722 slice
+/// B2): Claude names these tools `Edit`/`Write`/`MultiEdit`, OpenCode names
+/// the same two `edit`/`write`. Normalizing OpenCode's names to Claude's
+/// inside the normalizer was the alternative and is worse — it would put a
+/// tool name in the event stream that the transcript does not contain, for
+/// every consumer downstream, to satisfy one predicate.
+///
+/// The widening is safe in both directions rather than merely convenient for
+/// OpenCode. Claude's tool names are a fixed set and none of them differs
+/// from these three only by case, so no Claude tool changes classification;
+/// Copilot's normalizer emits no `ToolCall` events at all
+/// (`parse_copilot_session_events`), so this predicate is unreachable there.
+/// Pinned by `the_edit_tool_predicate_spans_clis_without_widening_past_them`.
 fn is_edit_tool(name: &str) -> bool {
-    matches!(name, "Edit" | "Write" | "MultiEdit")
+    matches!(name.to_ascii_lowercase().as_str(), "edit" | "write" | "multiedit")
 }
 
 // ---------------------------------------------------------------------------
@@ -1226,5 +1412,310 @@ mod tests {
         apply_recurrence(&mut d, &others);
         assert_eq!(d.windows[0].recurrence, MAX_CORROBORATED_BY + 3);
         assert_eq!(d.windows[0].corroborated_by.len(), MAX_CORROBORATED_BY);
+    }
+
+    // ---- OpenCode normalization (#722 slice B2) ----
+    //
+    // Every fixture below is the row shape OpenCode's own store holds:
+    // `message.data` / `part.data` as JSON documents, per
+    // `packages/{core/src/session/sql.ts,schema/src/v1/session.ts}` at
+    // `anomalyco/opencode@f67e80c2` (tag `v1.18.11`). No opencode process is
+    // ever started to produce them (CLAUDE.md constraint 3).
+
+    fn oc_row(message_id: &str, role: &str, ts: i64, part: Value) -> crate::opencodedb::TranscriptRow {
+        crate::opencodedb::TranscriptRow {
+            message_id: message_id.into(),
+            time_created_ms: ts,
+            // The real document carries far more (agent, model, path, tokens…);
+            // `role` is the only field this normalizer reads, and the extra
+            // key is here so the fixture is a subset of the real shape rather
+            // than a two-field invention.
+            message_json: json!({ "role": role, "agent": "build" }).to_string(),
+            part_json: part.to_string(),
+        }
+    }
+
+    fn oc_text(text: &str) -> Value {
+        json!({ "type": "text", "text": text })
+    }
+
+    /// A completed `bash` part, the exact `ToolPart`+`ToolStateCompleted`
+    /// shape: `callID`/`tool` on the part, `input`/`output` on the state.
+    fn oc_bash(call: &str, command: &str, output: &str) -> Value {
+        json!({ "type": "tool", "callID": call, "tool": "bash",
+                "state": { "status": "completed", "input": { "command": command },
+                           "output": output, "title": command, "metadata": {},
+                           "time": { "start": 1, "end": 2 } } })
+    }
+
+    fn oc_bash_error(call: &str, command: &str, error: &str) -> Value {
+        json!({ "type": "tool", "callID": call, "tool": "bash",
+                "state": { "status": "error", "input": { "command": command },
+                           "error": error, "time": { "start": 1, "end": 2 } } })
+    }
+
+    /// An `edit` part. `path_key` is the input key the edit tool spells its
+    /// target with — the pin ships two tools named `edit` that disagree
+    /// (`filePath` vs `path`), which is why the normalizer reads both.
+    fn oc_edit(call: &str, path_key: &str, file: &str, old: &str, new: &str) -> Value {
+        json!({ "type": "tool", "callID": call, "tool": "edit",
+                "state": { "status": "completed",
+                           "input": { path_key: file, "oldString": old, "newString": new },
+                           "output": "ok", "title": file, "metadata": {},
+                           "time": { "start": 1, "end": 2 } } })
+    }
+
+    #[test]
+    fn opencode_rows_normalize_to_the_same_event_shape_as_the_other_clis() {
+        let rows = vec![
+            oc_row("msg_1", "user", 1_785_703_307_950, oc_text("fix the flaky test")),
+            oc_row("msg_2", "assistant", 1_785_703_308_000, oc_text("running the suite")),
+            oc_row("msg_2", "assistant", 1_785_703_308_000, oc_bash("c1", "npm test", "1 passing")),
+        ];
+        let events = parse_opencode_transcript_events(&rows);
+        // One text + one text + (call, result) — the tool part is TWO events.
+        assert_eq!(events.len(), 4, "{events:?}");
+        assert!(events.iter().all(|e| e.role == "user" || e.role == "assistant"));
+        assert!(matches!(&events[0].kind, EventKind::Text { text } if text == "fix the flaky test"));
+        assert_eq!(events[0].role, "user");
+        assert_eq!(events[0].ts_ms, Some(1_785_703_307_950));
+        assert!(matches!(&events[2].kind, EventKind::ToolCall { id, name, command: Some(c), .. }
+            if id == "c1" && name == "bash" && c == "npm test"));
+        assert!(matches!(&events[3].kind, EventKind::ToolResult { tool_use_id, is_error: false, text }
+            if tool_use_id == "c1" && text == "1 passing"));
+    }
+
+    /// The mapping this slice exists for: OpenCode stores a call and its
+    /// outcome in ONE row, so the pairing every friction signature depends on
+    /// has to be manufactured here or no opencode session ever yields a
+    /// window.
+    #[test]
+    fn an_opencode_tool_part_expands_into_a_call_and_its_outcome() {
+        let rows = vec![oc_row("msg_1", "assistant", 1, oc_bash_error("c1", "cargo check", "error[E0433]: failed to resolve"))];
+        let events = parse_opencode_transcript_events(&rows);
+        assert_eq!(events.len(), 2, "an errored tool part is a call AND a failed result: {events:?}");
+        let EventKind::ToolResult { tool_use_id, is_error, text } = &events[1].kind else {
+            panic!("expected a ToolResult, got {:?}", events[1].kind)
+        };
+        assert_eq!(tool_use_id, "c1", "the result must pair with the call's callID");
+        assert!(is_error, "state.status == \"error\" is the is_error signal");
+        assert_eq!(text, "error[E0433]: failed to resolve", "the error text is the state's `error`, not its `output`");
+    }
+
+    /// A tool that never finished has no outcome to report. Emitting a clean
+    /// result would erase the wall a session may have died on — the one place
+    /// a fabricated event would silently *remove* friction from the digest.
+    #[test]
+    fn an_unfinished_opencode_tool_part_emits_the_call_and_no_result() {
+        for status in ["pending", "running"] {
+            let part = json!({ "type": "tool", "callID": "c1", "tool": "bash",
+                               "state": { "status": status, "input": { "command": "npm test" } } });
+            let events = parse_opencode_transcript_events(&[oc_row("msg_1", "assistant", 1, part)]);
+            assert_eq!(events.len(), 1, "{status}: {events:?}");
+            assert!(matches!(&events[0].kind, EventKind::ToolCall { command: Some(c), .. } if c == "npm test"),
+                    "{status}: the call's input is still readable");
+        }
+    }
+
+    #[test]
+    fn an_opencode_failed_command_becomes_a_tool_error_window() {
+        let rows = vec![
+            oc_row("msg_1", "user", 1, oc_text("build it")),
+            oc_row("msg_2", "assistant", 2, oc_bash_error("c1", "npm test", "npm: command not found")),
+            oc_row("msg_3", "assistant", 3, oc_bash("c2", "pnpm test", "1 passing")),
+        ];
+        let events = parse_opencode_transcript_events(&rows);
+        let windows = extract_friction_windows(&events);
+        assert!(
+            windows.iter().any(|w| w.signature == FrictionSignature::ToolError),
+            "a failed opencode tool must reach the extractor: {windows:?}"
+        );
+        assert!(
+            windows.iter().any(|w| w.signature == FrictionSignature::NearDuplicateCommand),
+            "npm->pnpm is the same wall it is for claude: {windows:?}"
+        );
+    }
+
+    /// The reverted-edit signature over opencode's lowercase tool names —
+    /// dead without the `is_edit_tool` widening, and the `filePath` spelling
+    /// the v1 edit tool (the one whose runner writes these rows) uses.
+    #[test]
+    fn an_opencode_edit_that_rewrites_its_own_new_string_is_a_reverted_edit() {
+        let rows = vec![
+            oc_row("msg_1", "assistant", 1, oc_edit("c1", "filePath", "C:/w/src/foo.rs", "let x = 1;", "let x = 2;")),
+            oc_row("msg_2", "assistant", 2, oc_edit("c2", "filePath", "C:/w/src/foo.rs", "let x = 2;", "let x = 1;")),
+        ];
+        let windows = extract_friction_windows(&parse_opencode_transcript_events(&rows));
+        let w = windows.iter().find(|w| w.signature == FrictionSignature::RevertedEdit).expect("a RevertedEdit window");
+        assert_eq!(w.key, "reverted_edit:foo.rs");
+    }
+
+    /// The same session, had the core edit tool written it: `path` instead of
+    /// `filePath`. Reading one spelling only would make this window vanish
+    /// with no error anywhere.
+    #[test]
+    fn an_opencode_edit_spelled_with_the_core_tools_path_key_is_still_a_reverted_edit() {
+        let rows = vec![
+            oc_row("msg_1", "assistant", 1, oc_edit("c1", "path", "C:/w/src/foo.rs", "let x = 1;", "let x = 2;")),
+            oc_row("msg_2", "assistant", 2, oc_edit("c2", "path", "C:/w/src/foo.rs", "let x = 2;", "let x = 1;")),
+        ];
+        let windows = extract_friction_windows(&parse_opencode_transcript_events(&rows));
+        assert!(
+            windows.iter().any(|w| w.signature == FrictionSignature::RevertedEdit),
+            "the `path` spelling must be read too: {windows:?}"
+        );
+    }
+
+    /// `is_edit_tool` is shared by every CLI's event stream, so widening it
+    /// for opencode has to leave Claude's classification exactly as it was.
+    /// Both directions are asserted: what must now match, and what must still
+    /// miss — `NotebookEdit` is the near-miss that keeps the widening from
+    /// being "any name containing edit".
+    #[test]
+    fn the_edit_tool_predicate_spans_clis_without_widening_past_them() {
+        for name in ["Edit", "Write", "MultiEdit", "edit", "write", "multiedit"] {
+            assert!(is_edit_tool(name), "{name} must classify as an edit tool");
+        }
+        for name in ["NotebookEdit", "Read", "Bash", "bash", "read", "editor", "webfetch", "todowrite"] {
+            assert!(!is_edit_tool(name), "{name} must NOT classify as an edit tool");
+        }
+    }
+
+    /// The claude-side half of the same guarantee, at the signature level
+    /// rather than the predicate's: a Claude transcript's reverted edit still
+    /// fires, and a Claude `NotebookEdit` pair still does not.
+    #[test]
+    fn widening_the_edit_predicate_leaves_claude_transcripts_classified_as_before() {
+        let reverted = vec![
+            edit_call("t1", "src/foo.rs", "let x = 1;", "let x = 2;"),
+            tool_result("t1", false, "ok"),
+            edit_call("t2", "src/foo.rs", "let x = 2;", "let x = 1;"),
+            tool_result("t2", false, "ok"),
+        ];
+        assert!(
+            extract_friction_windows(&reverted).iter().any(|w| w.signature == FrictionSignature::RevertedEdit),
+            "claude's `Edit` must still be detected"
+        );
+
+        let notebook: Vec<TranscriptEvent> = reverted
+            .iter()
+            .map(|e| match &e.kind {
+                EventKind::ToolCall { id, command, file_path, old_string, new_string, summary, .. } => TranscriptEvent {
+                    role: e.role.clone(),
+                    kind: EventKind::ToolCall {
+                        id: id.clone(),
+                        name: "NotebookEdit".into(),
+                        command: command.clone(),
+                        file_path: file_path.clone(),
+                        old_string: old_string.clone(),
+                        new_string: new_string.clone(),
+                        summary: summary.clone(),
+                    },
+                    ts_ms: e.ts_ms,
+                },
+                _ => e.clone(),
+            })
+            .collect();
+        assert!(
+            !extract_friction_windows(&notebook).iter().any(|w| w.signature == FrictionSignature::RevertedEdit),
+            "a tool name that only CONTAINS `edit` must stay unclassified"
+        );
+    }
+
+    /// `synthetic`/`ignored` text is scaffolding OpenCode injects, not
+    /// anything anyone said — and `initial_prompt` is the first user `Text`,
+    /// so letting one through would put a machine-written string where the
+    /// task brief goes.
+    #[test]
+    fn synthetic_and_ignored_opencode_text_never_becomes_the_initial_prompt() {
+        let rows = vec![
+            oc_row("msg_1", "user", 1, json!({ "type": "text", "text": "Attached media from tool result:", "synthetic": true })),
+            oc_row("msg_1", "user", 1, json!({ "type": "text", "text": "stale draft", "ignored": true })),
+            oc_row("msg_1", "user", 1, oc_text("fix the flaky test")),
+        ];
+        let events = parse_opencode_transcript_events(&rows);
+        assert_eq!(events.len(), 1, "{events:?}");
+        let d = build_digest(&events, None, None, None);
+        assert_eq!(d.initial_prompt.as_deref(), Some("fix the flaky test"));
+    }
+
+    /// Reasoning is the model's scratchpad, exactly like Claude's `thinking`
+    /// blocks, and the remaining part types carry no conversation content —
+    /// none of them may become an event.
+    ///
+    /// The `text` part is load-bearing, not scenery: an assertion that a list
+    /// is EMPTY passes just as well when the normalizer does nothing at all,
+    /// so on its own this would be a test that cannot fail. Surrounding the
+    /// skipped types with one part that must survive makes it fail in both
+    /// directions — if a skipped type starts emitting, and if the normalizer
+    /// stops emitting.
+    #[test]
+    fn opencode_part_types_with_no_conversation_content_are_skipped() {
+        let rows = vec![
+            oc_row("msg_1", "assistant", 1, json!({ "type": "reasoning", "text": "hmm", "time": { "start": 1 } })),
+            oc_row("msg_1", "assistant", 1, json!({ "type": "step-start" })),
+            oc_row("msg_1", "assistant", 1, json!({ "type": "step-finish", "reason": "stop", "cost": 0.0,
+                                                    "tokens": { "input": 1, "output": 1, "reasoning": 0, "cache": { "read": 0, "write": 0 } } })),
+            oc_row("msg_1", "assistant", 1, oc_text("the one part that carries content")),
+            oc_row("msg_1", "assistant", 1, json!({ "type": "snapshot", "snapshot": "abc" })),
+            oc_row("msg_1", "assistant", 1, json!({ "type": "patch", "hash": "abc", "files": ["src/foo.rs"] })),
+            oc_row("msg_1", "assistant", 1, json!({ "type": "compaction", "auto": true })),
+        ];
+        let events = parse_opencode_transcript_events(&rows);
+        assert_eq!(events.len(), 1, "only the text part may survive: {events:?}");
+        assert!(matches!(&events[0].kind, EventKind::Text { text } if text == "the one part that carries content"));
+    }
+
+    /// A store read mid-write, a row this reader has not been read against, a
+    /// message role that is neither: skipped, never fatal. The digest of most
+    /// of a session beats an error — the same posture as the Claude arm's
+    /// per-line skip.
+    #[test]
+    fn malformed_or_unknown_opencode_rows_are_skipped_not_fatal() {
+        let mut rows = vec![
+            crate::opencodedb::TranscriptRow {
+                message_id: "msg_0".into(),
+                time_created_ms: 1,
+                message_json: "{not json".into(),
+                part_json: oc_text("invisible").to_string(),
+            },
+            crate::opencodedb::TranscriptRow {
+                message_id: "msg_1".into(),
+                time_created_ms: 1,
+                message_json: json!({ "role": "system" }).to_string(),
+                part_json: oc_text("also invisible").to_string(),
+            },
+            crate::opencodedb::TranscriptRow {
+                message_id: "msg_2".into(),
+                time_created_ms: 1,
+                message_json: json!({ "role": "user" }).to_string(),
+                part_json: "{not json".into(),
+            },
+        ];
+        assert!(parse_opencode_transcript_events(&rows).is_empty(), "nothing readable, nothing emitted");
+        rows.push(oc_row("msg_3", "user", 2, oc_text("survivor")));
+        let events = parse_opencode_transcript_events(&rows);
+        assert_eq!(events.len(), 1, "the readable row still lands: {events:?}");
+        assert!(matches!(&events[0].kind, EventKind::Text { text } if text == "survivor"));
+    }
+
+    /// A message's document is parsed once and reused across its parts. If
+    /// that cache ever outlived its message id, every part of the session
+    /// would inherit the first message's role — and `initial_prompt` would
+    /// pick up an assistant's reply.
+    #[test]
+    fn each_opencode_messages_role_applies_only_to_its_own_parts() {
+        let rows = vec![
+            oc_row("msg_1", "assistant", 1, oc_text("I will start by reading the code")),
+            oc_row("msg_2", "user", 2, oc_text("no, fix the flaky test first")),
+            oc_row("msg_2", "user", 2, oc_text("and only that")),
+        ];
+        let events = parse_opencode_transcript_events(&rows);
+        assert_eq!(
+            events.iter().map(|e| e.role.as_str()).collect::<Vec<_>>(),
+            vec!["assistant", "user", "user"],
+        );
+        let d = build_digest(&events, None, None, None);
+        assert_eq!(d.initial_prompt.as_deref(), Some("no, fix the flaky test first"));
     }
 }

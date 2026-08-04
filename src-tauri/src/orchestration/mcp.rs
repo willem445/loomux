@@ -1028,7 +1028,12 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                         };
                         let cli = super::workflow::cli_of(b, &g.guardrails.agent_cli);
                         let roster_cwd = owner.as_ref().map(|o| o.cwd.as_str());
-                        match super::resolve_worker_resume_cwd(cli, sid, roster_cwd, &g.repo) {
+                        // The opencode store to consult is this group's own
+                        // (#722) — its panes write nowhere else.
+                        let db = reg.opencode_db_path(&g.id);
+                        match super::resolve_worker_resume_cwd(
+                            cli, sid, roster_cwd, &g.repo, Some(&db),
+                        ) {
                             Ok(c) => Some(c),
                             Err(tagged) => {
                                 return Err(format!(

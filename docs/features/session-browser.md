@@ -26,6 +26,14 @@ It scans the local machine for resumable agent sessions:
   prompt, resumed with `claude --resume <id>`).
 - **Copilot CLI** — `~/.copilot/session-state/*/workspace.yaml` (resumed with
   `copilot --resume=<id>`) (#458).
+- **OpenCode** — its own SQLite store, `~/.local/share/opencode/opencode.db`
+  (`$XDG_DATA_HOME` and `$OPENCODE_DB` are honoured, exactly as opencode itself
+  resolves them), resumed with `opencode --session <id>`.
+
+Only *your own* opencode sessions are listed — the ones a solo pane or your own
+terminal created. Sessions belonging to an orchestration group live in that
+group's own store and are reopened by restoring the group, not as standalone
+panes.
 
 Clicking a session opens a new pane in the session's original working directory
 and resumes it there. The pane is auto-named from the session.

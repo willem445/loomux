@@ -48,9 +48,13 @@ loomux can launch; availability is the CLI's own. **Ante** is the one standing
 exception worth knowing before you pick it: Antigma documents it as macOS- and
 Linux-only and ships no Windows binary, so on Windows it will fail to launch no
 matter how the pane is configured. The launcher also warns inline when a
-selected CLI isn't installed. Orchestration groups are narrower still — an
-orchestrator, worker, reviewer or planner must be **Claude Code or Copilot
-CLI**, the two loomux has orchestration adapters for.
+selected CLI isn't installed. Orchestration groups are narrower still — the
+launcher's own role pickers offer **Claude Code, Copilot CLI, or OpenCode**
+for orchestrator/worker/reviewer/planner. That's a curated suggestion list,
+not the full set loomux can orchestrate on: a `.loomux/workflow.yml` block
+can also name **Gemini CLI** for a reviewer lane (see
+[cross-model reviewers](orchestration.html#setting-up-a-cross-model-reviewer))
+— it just isn't one of the launcher's own dropdown options.
 
 ### The file editor and git panes
 

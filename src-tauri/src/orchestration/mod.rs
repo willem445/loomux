@@ -2880,6 +2880,105 @@ const COPILOT_SESSION_POLL: Duration = Duration::from_millis(1000);
 /// Give up watching after this long (copilot never initialized, or crashed).
 const COPILOT_SESSION_TIMEOUT: Duration = Duration::from_secs(90);
 
+// OpenCode session tracking (#722): the same after-the-fact problem as
+// copilot's, one store down — `--session` continues an existing session and
+// nothing pre-assigns one, so loomux learns the id by watching this group's
+// own store (`OPENCODE_DB`) for a row that was not there before the spawn.
+/// How often to poll the group's store. Slower than copilot's tick because
+/// each one is a SQLite open + query rather than a directory listing, and
+/// because the deadline below is an order of magnitude longer.
+const OPENCODE_SESSION_POLL: Duration = Duration::from_secs(2);
+/// Give up watching after this long.
+///
+/// Far longer than copilot's 90s, and the reason is an honest gap rather than
+/// caution: loomux cannot verify whether opencode writes the `session` row at
+/// TUI boot or only when the first turn starts — checking would mean spawning
+/// the real CLI, which constraint 3 forbids. A deadline picked for "at boot"
+/// would silently leave every pane whose first turn was late (a kickoff queued
+/// behind a busy pane, a human who walked away) permanently unidentified, and
+/// the failure would look exactly like the CLI not being installed. Ten
+/// minutes covers the first turn either way; the cost of being wrong in this
+/// direction is one sleeping thread.
+const OPENCODE_SESSION_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Where to look for the session a just-spawned pane is about to mint, plus
+/// the snapshot of what was already there (#722).
+///
+/// Only the CLIs that mint their own id after boot have one. Claude is handed
+/// its id up front (`--session-id`), so there is nothing to learn; gemini has
+/// no session store loomux reads.
+#[derive(Clone, Debug)]
+#[doc(hidden)] // pub for integration tests
+pub enum SessionBaseline {
+    /// The ids under `~/.copilot/session-state`, and the root they came from —
+    /// carried rather than re-resolved so the poll cannot end up reading a
+    /// different directory than the baseline was taken from.
+    Copilot { ids: HashSet<String>, root: PathBuf },
+    /// The ids in **this group's** opencode store. The path is deliberately
+    /// *not* carried: it is recomputed per poll from `opencode_db_path`, the
+    /// one function the spawn that creates the store and the usage read that
+    /// consumes it already share (#812).
+    OpenCode { ids: HashSet<String> },
+}
+
+impl SessionBaseline {
+    fn cli(&self) -> &'static str {
+        match self {
+            SessionBaseline::Copilot { .. } => "copilot",
+            SessionBaseline::OpenCode { .. } => "opencode",
+        }
+    }
+    fn poll(&self) -> Duration {
+        match self {
+            SessionBaseline::Copilot { .. } => COPILOT_SESSION_POLL,
+            SessionBaseline::OpenCode { .. } => OPENCODE_SESSION_POLL,
+        }
+    }
+    fn timeout(&self) -> Duration {
+        match self {
+            SessionBaseline::Copilot { .. } => COPILOT_SESSION_TIMEOUT,
+            SessionBaseline::OpenCode { .. } => OPENCODE_SESSION_TIMEOUT,
+        }
+    }
+}
+
+/// The outcome of one poll of a session store.
+///
+/// `Contested` and `Unreadable` exist so that giving up can say *why*: a pane
+/// that never identified because two sessions matched needs a different answer
+/// from a human than one whose CLI never wrote a session at all, and both
+/// otherwise surface only as "no session id".
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[doc(hidden)] // pub for integration tests
+pub enum SessionSearch {
+    /// Nothing new yet — keep polling. The normal answer for a booting pane.
+    Waiting,
+    Found(String),
+    /// More than one candidate, carrying how many. Refused, never guessed —
+    /// see `opencodedb::identify_session_on`.
+    Contested(usize),
+    Unreadable(String),
+}
+
+impl SessionSearch {
+    /// What to record when the watch gives up in this state.
+    fn untracked_reason(&self) -> String {
+        match self {
+            // `Found` cannot reach here (the watcher returns on it), but a
+            // reason string is not the place to `unreachable!()` a background
+            // thread over.
+            SessionSearch::Waiting | SessionSearch::Found(_) => {
+                "no new session appeared before timeout".to_string()
+            }
+            SessionSearch::Contested(n) => format!(
+                "{n} candidate sessions matched this pane's directory and none could be told \
+                 apart — refused rather than bind the wrong conversation"
+            ),
+            SessionSearch::Unreadable(e) => format!("session store unreadable: {e}"),
+        }
+    }
+}
+
 /// An agent's **capability class** — the closed enum (#222).
 ///
 /// Before the block model this enum *was* an agent's identity: it decided the
@@ -3384,7 +3483,7 @@ impl NameSource {
 /// `join(", ")` in error messages). The *reasons* a CLI is or isn't in it —
 /// and what it can do once it is — live in [`CLI_CAPS`], pinned against this
 /// list by `supported_clis_match_the_capability_table`.
-pub const SUPPORTED_CLIS: [&str; 3] = ["claude", "copilot", "gemini"];
+pub const SUPPORTED_CLIS: [&str; 4] = ["claude", "copilot", "gemini", "opencode"];
 
 /// What loomux can actually make one agent CLI do — **the per-CLI capability
 /// record** (#267 stage 2).
@@ -3548,6 +3647,17 @@ pub fn clamped_knob(allowed: &[&str], v: &str) -> String {
 ///   loomux already generates gemini's settings file, so the seam exists, but
 ///   the schema needs a live verification loomux's own agents may not perform
 ///   (CLAUDE.md constraint 3), so it stays unwired and the row says so.
+/// - **opencode** — its knobs are read from the CLI's own source at the
+///   version pin recorded in `doc/design/opencode.md`, because the published
+///   docs describe reasoning effort only as per-model provider config. There
+///   IS a session-scoped variant flag, but only on `opencode run`
+///   (`--variant`, "model variant (provider-specific reasoning effort, e.g.,
+///   high, max, minimal)"), and loomux spawns the TUI, whose option table has
+///   no `variant`. The reachable seam on the TUI path is per-agent
+///   `agent.<name>.variant` in the config document loomux already generates —
+///   real, but its per-model vocabulary is provider-specific and unverified
+///   against a live run, so the row stays empty and says exactly that rather
+///   than claiming a level loomux might not be able to deliver.
 pub const CLI_CAPS: &[CliCaps] = &[
     CliCaps {
         cli: "claude",
@@ -3581,6 +3691,22 @@ pub const CLI_CAPS: &[CliCaps] = &[
         effort_note: "gemini's thinking level is a settings-file key (modelConfigs.aliases.<alias>.thinkingConfig) — the generated-settings seam exists, but the schema is unverified against a live run, so loomux does not write it yet",
         context_variants: &[],
         context_note: "gemini's context window is model-determined; its compression knobs (model.compressionThreshold) are compaction, not window size",
+    },
+    CliCaps {
+        cli: "opencode",
+        orchestration: true,
+        // Its MCP server is a config-document key with no CLI-flag equivalent,
+        // and the document is delivered by an environment variable a *group*
+        // spawn can set on the pane while a solo launch — which only appends a
+        // flag string to a command line the human owns — cannot. Same shape as
+        // gemini, so solo opencode panes stay delivery-only (#288).
+        mcp_argv_seam: false,
+        max_containment: Containment::ReadOnly,
+        containment_note: "permission rules deny by key: `edit` is the key every file-modifying tool asks under, `bash` narrows by command pattern, and a deny is refused before any prompt — so deny outranks --auto",
+        effort_levels: &[],
+        effort_note: "opencode's reasoning effort is a model VARIANT: a session flag on `opencode run` (--variant) but absent from the TUI loomux spawns, and settable per-agent in loomux's generated config (agent.<name>.variant, observed values minimal|high|max) — the seam exists, but the per-model vocabulary is provider-specific and unverified against a live run, so loomux does not write it yet",
+        context_variants: &[],
+        context_note: "opencode's context window is model-determined; no session-scoped variant switch is documented or present in the TUI's options",
     },
     CliCaps {
         cli: "codex",
@@ -4097,6 +4223,18 @@ pub(crate) fn default_model(cli: &str, role: Role) -> &'static str {
     // table ages badly.
     if cli == "gemini" {
         return "pro";
+    }
+    // OpenCode: EMPTY, deliberately — read by every emit path as "say nothing",
+    // so the pane inherits whatever model the human configured (their
+    // `opencode.json`, their `/models` pick). Unlike claude's strong/mid pair
+    // or gemini's single `pro`, opencode has no vendor-neutral alias at all:
+    // its ids are `provider_id/model_id` against a catalog of dozens of
+    // providers, so any default loomux picked would be a hardcoded model table
+    // — the thing #329 says ages badly — and would also silently override a
+    // human who had already chosen. A block that wants a specific model pins
+    // its own `model:`, and the launcher offers a curated list.
+    if cli == "opencode" {
+        return "";
     }
     match role {
         Role::Orchestrator | Role::Planner => "opus",
@@ -4718,6 +4856,26 @@ pub fn cli_extra_env(cli: &str, cfg: &Path) -> Vec<(String, String)> {
     }
 }
 
+/// What [`OrchRegistry::write_mcp_config`] produced for one agent: the file it
+/// wrote, and the pane environment that CLI needs in order to read it.
+///
+/// The two travel together because for two of the four adapters they are one
+/// artifact. Claude and Copilot name the file on argv and need no env at all;
+/// gemini's file is named by an environment variable; and opencode's document
+/// does not reach the CLI as a file at all — the file is the audit copy and the
+/// env carries the bytes (see [`OPENCODE_CONFIG_CONTENT_ENV`]). Returning the
+/// path alone would leave every caller to re-derive the env from the CLI name,
+/// which is the "re-derived at a call site that then silently disagrees"
+/// failure [`CliCaps`]' own doc argues against.
+pub struct AgentCliConfig {
+    /// The generated file. Named on argv by the CLIs that can (`--mcp-config`,
+    /// `--additional-mcp-config`); an audit artifact for the ones that can't.
+    pub path: PathBuf,
+    /// Extra pane environment, on top of [`OrchRegistry::agent_pane_env`]'s
+    /// shims. Empty for an argv-seam CLI.
+    pub env: Vec<(String, String)>,
+}
+
 /// The per-agent gemini settings file: the loomux MCP server, plus (for a
 /// contained class) the `tools.exclude` layer of its deny rules and a pointer
 /// at the admin-tier policy file that carries the other layer.
@@ -4800,6 +4958,349 @@ pub fn gemini_policy_toml(containment: Containment) -> String {
         }
     }
     out
+}
+
+// ── OpenCode (#722) ────────────────────────────────────────────────────────
+//
+// Every claim below is verified against the CLI's own source at the version
+// pin recorded in `doc/design/opencode.md` (its published docs do not cover
+// the load-bearing parts), and that document carries the citations and the
+// full containment argument. Kept here in the same shape as the gemini block
+// above: literals in constants, the generated documents in pure functions, so
+// what a contained pane is actually handed can be asserted without a spawn.
+
+/// The permission KEY every file-modifying tool asks under — one key, not a
+/// list of tool names, because opencode's permission engine is keyed on the
+/// *permission* a tool requests rather than the tool's own name. `edit`,
+/// `write` and `apply_patch` all request `"edit"`, and the CLI's own read-only
+/// `plan` agent is built from exactly this one denial ("Plan mode. Disallows
+/// all edit tools.").
+///
+/// The opencode sibling of [`CLAUDE_EDIT_DENY_TOOLS`] /
+/// [`COPILOT_EDIT_DENY_TOOLS`] / [`GEMINI_EDIT_DENY_TOOLS`], and singular for
+/// a real reason rather than an oversight: a list would invite exactly the
+/// #448 failure those constants' docs describe — a name that matches nothing
+/// reading like containment — and here there is no per-tool name to get wrong.
+/// It is also why this tier is genuinely stronger than a name list: a
+/// file-modifying tool opencode ships *tomorrow* asks the same key, so it is
+/// denied with no loomux change (the fail-open direction #465 could only close
+/// for claude, closed here by construction).
+pub const OPENCODE_EDIT_DENY_PERMISSION: &str = "edit";
+
+/// The git-mutation command patterns a [`Containment::ReadOnly`] opencode
+/// agent denies under the `bash` permission — a planner only, for the reason
+/// [`CLAUDE_READONLY_DENY_GIT`] gives.
+///
+/// No space before the `*`: opencode's matcher treats `*` as zero-or-more
+/// characters against the whole command string, so `git commit*` covers a bare
+/// `git commit` as well as `git commit -m …`, where `git commit *` would miss
+/// the bare form.
+pub const OPENCODE_READONLY_DENY_GIT: &[&str] = &["git commit*", "git push*"];
+
+/// The `bash` patterns an ATTENDED opencode pane pre-approves, so the
+/// branch→commit→PR flow and `gh` don't stop a human at every step while
+/// everything else still asks. Kept as an atom because both the emitted
+/// posture and its test read it.
+///
+/// The direction here is the opposite of every other CLI's: opencode's own
+/// default is `"*": "allow"` — *more* permissive than any loomux attended
+/// pane — so the generated posture NARROWS it rather than widening a
+/// restrictive default.
+pub const OPENCODE_ATTENDED_BASH_ALLOW: &[&str] = &["git *", "gh *"];
+
+/// opencode's unattended posture, as one atom shared by the group spawn path
+/// and [`single_pane_autopilot_flags`], so the two can't drift (#101).
+///
+/// `--auto` is the documented spelling: "auto-approve permissions that are not
+/// explicitly denied". Its `--yolo` and `--dangerously-skip-permissions`
+/// aliases are marked hidden in the CLI's own option table and are deliberately
+/// not used. It is not a policy setting — it replies "allow once" to a
+/// permission that was already going to be *asked*, and a `deny` rule never
+/// raises an ask at all, which is exactly why a contained pane stays contained
+/// under it.
+pub const OPENCODE_UNATTENDED_FLAGS: &str = "--auto";
+
+/// The inline config document (JSON) loomux hands an opencode pane.
+///
+/// **Why an env var and not a file path.** opencode merges its config sources
+/// in a documented order, later winning per leaf key, and `OPENCODE_CONFIG`
+/// (the custom-file variable) loads *before* the project's own
+/// `opencode.json` and its `.opencode/` directories — so a repo could re-allow
+/// what loomux denies. `OPENCODE_CONFIG_CONTENT` loads *after* all of them.
+pub const OPENCODE_CONFIG_CONTENT_ENV: &str = "OPENCODE_CONFIG_CONTENT";
+
+/// The permission-only override, applied LAST — after the org, managed-config
+/// and MDM ranks that land *after* the inline document above.
+///
+/// Set alongside [`OPENCODE_CONFIG_CONTENT_ENV`], never instead of it, and
+/// that pairing is the containment guarantee rather than belt-and-braces for
+/// its own sake. It closes two holes the config document alone cannot: an
+/// account/managed/MDM config outranking the inline one, and — the sharper
+/// case — an `--agent` that fails to resolve, which does **not** error but
+/// prints a warning and falls back to `build`, the most permissive agent
+/// there is. A reviewer degrading into a full-write agent over a typo, with
+/// only a scrollback line to show for it, is precisely the silent failure
+/// #462's guarantee cannot survive; this variable applies globally, so it
+/// survives that fallback.
+pub const OPENCODE_PERMISSION_ENV: &str = "OPENCODE_PERMISSION";
+
+/// Suppress the CLI's boot-time self-update. The copilot `--no-auto-update`
+/// hazard exactly: a mid-boot update restarts the CLI and flushes anything
+/// typed into the first instance, i.e. the kickoff.
+///
+/// The env var, not the config document's `autoupdate` key — an environment
+/// variable cannot be overridden by a config rank loomux does not control.
+pub const OPENCODE_DISABLE_AUTOUPDATE_ENV: &str = "OPENCODE_DISABLE_AUTOUPDATE";
+
+/// Skip the repo's own `opencode.json` and `.opencode/` directories entirely
+/// — set for a CONTAINED pane only ([`Containment::denies_edits`]).
+///
+/// For a worker the repo's config is legitimate material (its commands, its
+/// own MCP servers) and loomux's document already wins the merge, so it stays
+/// loaded. For a reviewer or a planner the calculus flips: "loomux's rules win
+/// the merge" is a claim about merge order, while "the repo's rules never load"
+/// is a claim about nothing at all — and a contained pane is the one place
+/// worth paying a repo's custom commands for the simpler story.
+pub const OPENCODE_DISABLE_PROJECT_CONFIG_ENV: &str = "OPENCODE_DISABLE_PROJECT_CONFIG";
+
+/// Point this pane's session/message store at a database under the group's own
+/// state dir instead of the shared per-user one.
+///
+/// Absolute paths are honored as-is (a relative value would resolve under the
+/// CLI's own data root). Two reasons, both structural: the human's own
+/// opencode sessions stay out of a group's store — and a group's store stays
+/// out of theirs — and "the newest session in this database" becomes an
+/// unambiguous question, which is what session identification needs on a CLI
+/// that cannot be handed a session id up front. The reader itself is a later
+/// slice; this is the seam it lands on.
+pub const OPENCODE_DB_ENV: &str = "OPENCODE_DB";
+
+/// Where [`OPENCODE_DB_ENV`] points, relative to a group's state dir. A
+/// directory of its own because SQLite writes `-wal`/`-shm` siblings.
+const OPENCODE_DB_SUBDIR: &str = "opencode";
+const OPENCODE_DB_FILE: &str = "opencode.db";
+
+/// Timeout (ms) on the loomux MCP entry, raised from the documented 5000ms
+/// default: loomux's own tools do real work behind a call (`report` writes
+/// state and audits, `notify_when` registers a watch), and a tool call timing
+/// out reads to an agent as the tool being broken.
+const OPENCODE_MCP_TIMEOUT_MS: u64 = 30_000;
+
+/// A path as opencode's config document must spell it: forward slashes.
+///
+/// `{file:…}` references are substituted **textually, on the raw string,
+/// before the document is parsed** — so a Windows path's backslashes are not
+/// JSON-unescaped on the way through, and a JSON-escaped `C:\\Users\\…` would
+/// reach the filesystem with its separators doubled. Windows accepts forward
+/// slashes everywhere loomux needs them, so this side-steps the question
+/// entirely rather than betting on doubled separators resolving.
+fn opencode_path(p: &Path) -> String {
+    p.display().to_string().replace('\\', "/")
+}
+
+/// The **global** permission posture for one opencode pane — the object that
+/// rides both the config document and [`OPENCODE_PERMISSION_ENV`].
+///
+/// Two rules govern its shape, and both come from how the engine evaluates:
+///
+/// - **Last matching rule wins**, matching by wildcard on the permission key
+///   as well as the pattern. So this never emits a `"*"` KEY: a `"*"` key
+///   matches every permission, and — since rules are emitted in key order —
+///   one sitting after the specific denials would silently re-allow them.
+///   Narrow keys only, and the denials are ordered after the allows within
+///   their own key (`"*"` sorts before `"git *"` sorts before `"git commit*"`).
+/// - **A `deny` short-circuits before any prompt**, so no ask is ever raised
+///   for it and `--auto` — which only answers asks — cannot reach it.
+///
+/// The `edit: "deny"` scalar is the strong form on purpose: it becomes a rule
+/// with the `*` pattern, and the CLI drops a tool from the model's toolset
+/// entirely when the last matching rule for its permission is a `*`-pattern
+/// deny. So a contained pane does not merely fail to edit; it is never offered
+/// the tool.
+#[doc(hidden)] // pub for integration tests
+pub fn opencode_permission_json(containment: Containment, unattended: bool) -> Value {
+    let mut bash = serde_json::Map::new();
+    if unattended {
+        bash.insert("*".into(), json!("allow"));
+    } else {
+        // Attended: narrow opencode's allow-everything default back to "ask",
+        // then pre-approve the flows a human would otherwise be interrupted
+        // for on every step.
+        bash.insert("*".into(), json!("ask"));
+        for pat in OPENCODE_ATTENDED_BASH_ALLOW {
+            bash.insert((*pat).to_string(), json!("allow"));
+        }
+    }
+    if containment.denies_git_mutation() {
+        for pat in OPENCODE_READONLY_DENY_GIT {
+            bash.insert((*pat).to_string(), json!("deny"));
+        }
+    }
+    let mut perm = serde_json::Map::new();
+    perm.insert("bash".into(), Value::Object(bash));
+    perm.insert(
+        OPENCODE_EDIT_DENY_PERMISSION.to_string(),
+        if containment.denies_edits() { json!("deny") } else if unattended { json!("allow") } else { json!("ask") },
+    );
+    // The group's state dir — where every agent's role-instruction file lives
+    // — is outside the pane's worktree, and this key defaults to `ask`, so
+    // without it an unattended pane would stall on its own instructions.
+    //
+    // **The blanket form, not `{"*": "ask", "<group dir>/*": "allow"}`, and
+    // the narrow one would be a REGRESSION rather than a tightening.** Rules
+    // are concatenated defaults-then-user and the last match wins, so a user
+    // `"*": "ask"` lands AFTER opencode's own default whitelist for this key
+    // (its temp dir, its skill dirs, its reference dirs) and demotes every one
+    // of them to `ask` — turning the CLI's own internal machinery into
+    // prompts. Re-listing those dirs here would mean hardcoding another
+    // vendor's internal paths, which ages exactly as badly as a model table
+    // (#329). What the breadth actually costs is one prompt on an ATTENDED
+    // pane before the agent reads outside its worktree; `read` is not a tier
+    // loomux contains at on any CLI (see [`Containment`]: these are denials of
+    // named tools, never a filesystem sandbox), so no guarantee rests on it.
+    perm.insert("external_directory".into(), json!("allow"));
+    // Restore the `question` tool for a pane that HAS a human in it, and only
+    // then. opencode's built-in defaults deny it and its default `build` agent
+    // re-allows it — a config-declared agent (which is what every loomux pane
+    // runs) inherits the defaults, so without this an attended worker's
+    // "should I do X?" would come back as a permission error instead of a
+    // question. The other direction is just as deliberate: an unattended pane
+    // has nobody to answer, and a question it cannot get an answer to is a
+    // stall, which is the deadlock `forces_unattended` exists to prevent.
+    perm.insert("question".into(), if unattended { json!("deny") } else { json!("allow") });
+    Value::Object(perm)
+}
+
+/// The **agent-level** denials for a contained class, or `None` for an
+/// uncontained one (there is nothing to deny).
+///
+/// A separate, strictly-later ruleset than the global posture above — the
+/// engine concatenates a config-declared agent's rules after the global ones
+/// — which is what makes containment independent of key order *between* the
+/// two objects. Same denials, said twice, for the same reason gemini's are
+/// (`GEMINI_EDIT_DENY_TOOLS`): each layer covers the other's failure mode.
+/// This one survives a global posture an outranking config rank overwrote;
+/// the global one ([`OPENCODE_PERMISSION_ENV`]) survives `--agent` failing to
+/// resolve this entry at all.
+fn opencode_agent_permission_json(containment: Containment) -> Option<Value> {
+    if !containment.denies_edits() {
+        return None;
+    }
+    let mut perm = serde_json::Map::new();
+    if containment.denies_git_mutation() {
+        // DENIALS ONLY — no `"*": "allow"` alongside them. The rest of the
+        // shell is already allowed by the global posture this ruleset is
+        // concatenated after, so restating it here would only risk stating it
+        // differently, and a rule that widens is not what an agent-level block
+        // is for.
+        let mut bash = serde_json::Map::new();
+        for pat in OPENCODE_READONLY_DENY_GIT {
+            bash.insert((*pat).to_string(), json!("deny"));
+        }
+        perm.insert("bash".into(), Value::Object(bash));
+    }
+    perm.insert(OPENCODE_EDIT_DENY_PERMISSION.to_string(), json!("deny"));
+    Some(Value::Object(perm))
+}
+
+/// The whole generated config document for one opencode pane: its loomux MCP
+/// server, its share posture, its permission posture, and — when the block's
+/// contract was written to a file — its persona as a native agent entry.
+///
+/// Pure and `pub` so the document can be asserted directly: this file *is* an
+/// opencode agent's MCP identity and half of its containment, so "does it say
+/// what we think it says" must be answerable without a spawn.
+///
+/// `agent` is `(handle, prompt_file)`. The handle is namespaced
+/// ([`generated_agent_handle`], `loomux-<group>-<block>`) because the merge
+/// that lets loomux's entry win a same-name collision with a repo's own
+/// `.opencode/agents/*.md` is a DEEP merge: a colliding file would keep every
+/// key loomux left unset. A handle a repo cannot guess makes the collision
+/// impossible rather than survivable — and every field loomux cares about is
+/// emitted explicitly regardless.
+#[doc(hidden)] // pub for integration tests
+pub fn opencode_config_json(
+    port: u16,
+    token: &str,
+    containment: Containment,
+    unattended: bool,
+    agent: Option<(&str, &Path)>,
+) -> String {
+    let mut cfg = json!({
+        // No CLI flag exists for MCP servers; this key is the only channel.
+        // `oauth: false` because OAuth auto-detection is on by default and the
+        // loomux server authenticates by header — a 401 during discovery must
+        // not send opencode down a flow this server does not speak.
+        "mcp": one_server_map(json!({
+            "type": "remote",
+            "url": format!("http://127.0.0.1:{port}/mcp"),
+            "enabled": true,
+            "headers": { "X-Loomux-Agent": token },
+            "oauth": false,
+            "timeout": OPENCODE_MCP_TIMEOUT_MS,
+        })),
+        // A group agent's session is never published to a share link.
+        "share": "disabled",
+        "permission": opencode_permission_json(containment, unattended),
+    });
+    if let Some((handle, prompt)) = agent {
+        let mut entry = json!({
+            // ALWAYS explicit: an entry that resolved to a subagent mode would
+            // be refused by `--agent` and fall back to `build` with only a
+            // warning line — the same silent widening
+            // `OPENCODE_PERMISSION_ENV` exists to survive.
+            "mode": "primary",
+            // The contract by FILE, never on argv: it is many KB, and Windows
+            // CreateProcessW's 32,767-character command-line limit is a real,
+            // demo-blocking bug once a role contract rides a flag (#417).
+            "prompt": format!("{{file:{}}}", opencode_path(prompt)),
+        });
+        if let Some(perm) = opencode_agent_permission_json(containment) {
+            entry["permission"] = perm;
+        }
+        let mut agents = serde_json::Map::new();
+        agents.insert(handle.to_string(), entry);
+        cfg["agent"] = Value::Object(agents);
+    }
+    serde_json::to_string_pretty(&cfg).unwrap()
+}
+
+/// The pane environment that delivers everything above — opencode names none
+/// of it on argv.
+///
+/// Pure, so the mapping is assertable without a spawn, and separate from
+/// [`OrchRegistry::agent_pane_env`] for the reason [`cli_extra_env`] is: that
+/// one returns nothing at all when the gh/git shims can't be written, and an
+/// opencode agent silently losing its MCP identity and its containment because
+/// git wasn't installed would be a confusing failure a long way from its cause.
+///
+/// **Caller contract:** `containment`/`unattended` must be the same pair that
+/// produced `config_json`. The posture is deliberately restated here rather
+/// than lifted out of the document (a parse that could fail would have to fail
+/// *open*, dropping the very override that exists to survive everything else),
+/// so the agreement is a call-site obligation — pinned end-to-end by
+/// `an_opencode_spawn_delivers_its_config_and_containment_by_env`, which
+/// asserts the document's `permission` and this override are one object.
+#[doc(hidden)] // pub for integration tests
+pub fn opencode_pane_env(
+    config_json: &str,
+    containment: Containment,
+    unattended: bool,
+    db: &Path,
+) -> Vec<(String, String)> {
+    let mut env = vec![
+        (OPENCODE_CONFIG_CONTENT_ENV.to_string(), config_json.to_string()),
+        (
+            OPENCODE_PERMISSION_ENV.to_string(),
+            opencode_permission_json(containment, unattended).to_string(),
+        ),
+        (OPENCODE_DISABLE_AUTOUPDATE_ENV.to_string(), "1".to_string()),
+        (OPENCODE_DB_ENV.to_string(), opencode_path(db)),
+    ];
+    if containment.denies_edits() {
+        env.push((OPENCODE_DISABLE_PROJECT_CONFIG_ENV.to_string(), "1".to_string()));
+    }
+    env
 }
 
 /// The generic Claude PreCompact / SessionStart(compact) hook body (#417),
@@ -5102,8 +5603,8 @@ pub fn claude_effective_permission_mode(unattended: bool, read_only: bool) -> &'
 /// path can't drift.
 ///
 /// Returns an empty string for CLIs with no known unattended flag surface
-/// (codex/opencode/custom): the toggle is a no-op there rather than
-/// inventing flags that may not exist.
+/// (codex/custom): the toggle is a no-op there rather than inventing flags
+/// that may not exist.
 ///
 /// Ante (#292) is launcher-only here, same Tier-A shape as Hermes (#284):
 /// this function and the `AGENTS` catalog entry (`src/agents.ts`) are the only
@@ -5111,7 +5612,7 @@ pub fn claude_effective_permission_mode(unattended: bool, read_only: bool) -> &'
 /// deliberately do NOT gain an ante arm — Ante's MCP servers are configured
 /// exclusively via `~/.ante/settings.json` (no `--mcp-config`-equivalent CLI
 /// flag exists per docs). Ante stays a delivery-only channel member, like
-/// codex/opencode. (PR #323 recorded that as "adding ante to `SUPPORTED_CLIS`
+/// codex. (PR #323 recorded that as "adding ante to `SUPPORTED_CLIS`
 /// would hit `solo_prepare`'s `unreachable!` arm"; #267 removed that trap by
 /// deriving the solo seam from [`CliCaps::mcp_argv_seam`] instead of
 /// `SUPPORTED_CLIS` — but the rest of the argument, that loomux has no ante
@@ -5158,6 +5659,14 @@ pub fn single_pane_autopilot_flags(program: &str) -> String {
         // the group spawn must mean the same thing on every CLI loomux can
         // spawn, and gemini is now one.
         "gemini" => GEMINI_UNATTENDED_FLAGS.to_string(),
+        // OpenCode (#722): the same atom the group path builds — see
+        // `OPENCODE_UNATTENDED_FLAGS` for why `--auto` and not one of its two
+        // hidden aliases. No startup consent dialog is documented or present
+        // for it (unlike copilot's `--autopilot`), so a solo pane needs no
+        // answering watcher. Wired here for the #101 invariant: the launcher
+        // toggle and the group spawn must mean the same thing on every CLI
+        // loomux can spawn, and opencode is now one.
+        "opencode" => OPENCODE_UNATTENDED_FLAGS.to_string(),
         _ => String::new(),
     }
 }
@@ -7342,10 +7851,21 @@ fn parse_dollar_amount(after_dollar: &str) -> Option<f64> {
 
 /// Models are interpolated into a shell command line; restrict them to
 /// identifier-ish characters so a crafted "model" can't smuggle arguments.
+///
+/// **`/` is admitted (#722), and that widening is deliberate.** OpenCode model
+/// ids are `provider_id/model_id` — `opencode/deepseek-v4-flash-free` — so the
+/// pre-#722 filter silently turned the only id its Zen provider answers to into
+/// `opencodedeepseek-v4-flash-free`, a model that does not exist, with no error
+/// anywhere. `/` is inert in both emitted forms: it is not a glob
+/// metacharacter to a POSIX shell (only `*?[` are) and not an operator in
+/// PowerShell, so nothing about the "can't smuggle an argument" property
+/// changes. Same reasoning, and the same "widen deliberately, pin with tests"
+/// discipline, as #709's bracket decision — which went the OTHER way and kept
+/// `[`/`]` out, because those ARE glob syntax (see [`claude_model_arg`]).
 fn sanitize_model(m: &str, fallback: &str) -> String {
     let cleaned: String = m
         .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '/'))
         .collect();
     if cleaned.is_empty() {
         fallback.to_string()
@@ -7388,7 +7908,7 @@ fn claude_model_arg(model: &str, context: &str) -> String {
 /// until the group default is in hand.
 pub(crate) fn sanitize_model_opt(m: &str) -> String {
     m.chars()
-        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '/'))
         .collect()
 }
 
@@ -8460,8 +8980,9 @@ pub struct UsageSnapshot {
     pub name: String,
     pub role: String,
     /// Where the figures came from: `transcript` (token-derived, exact tokens),
-    /// `statusline` (last-resort parse of the CLI's own dollar figure), or
-    /// `none` (nothing available yet).
+    /// `session-db` (opencode's own `session` row — exact tokens AND its own
+    /// dollar figure, #722), `statusline` (last-resort parse of the CLI's own
+    /// dollar figure), or `none` (nothing available yet).
     pub source: String,
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -8680,6 +9201,26 @@ pub struct PersonaInject {
     /// generated file into the repo's own `.github/agents/` (see
     /// `profiles::is_copilot_native`).
     pub copilot_agent: Option<String>,
+    /// opencode `--agent <handle>` (#722): selects the agent entry loomux
+    /// declared in the config document it delivers by environment variable —
+    /// the third "native custom-agent flag, file-backed" shape, differing from
+    /// claude's and copilot's only in that the DEFINITION rides an env-borne
+    /// document instead of a file in a CLI-owned directory, while the contract
+    /// itself still rides a file ([`Self::opencode_prompt_file`]).
+    ///
+    /// `None` when that file could not be written — in which case the config
+    /// document declares no agent either, because an `--agent` naming an entry
+    /// that does not exist does not fail: it warns and falls back to `build`,
+    /// the most permissive agent there is. Containment does not rest on this
+    /// flag for exactly that reason (see [`OPENCODE_PERMISSION_ENV`]).
+    pub opencode_agent: Option<String>,
+    /// The file [`Self::opencode_agent`]'s entry points its `prompt` at, via
+    /// opencode's `{file:…}` reference. Written under the group's own state
+    /// dir — never into the repo's `.opencode/agents/`, which would dirty the
+    /// user's git tree with files they did not write, and never into a
+    /// per-user CLI directory, which would need an orphan sweep; a group's
+    /// files go when the group does.
+    pub opencode_prompt_file: Option<PathBuf>,
     /// Extra pre-approved tool patterns from the persona's `allow:`. Widens
     /// only *within* the capability class: deny rules beat allow rules on both
     /// CLIs, so this can never re-grant what the block's `kind` denies.
@@ -8977,6 +9518,11 @@ const COPILOT_AGENT_BODY_SAFE_CHARS: usize = 27_000;
 const GENERATED_AGENT_PREFIX: &str = "loomux-";
 const CLAUDE_AGENT_FILE_EXT: &str = ".md";
 const COPILOT_AGENT_FILE_EXT: &str = ".agent.md";
+/// opencode's contract file (#722). Not an agent definition — the definition
+/// lives in the generated config document — so this names only where that
+/// document's `{file:}` reference points, and it lives under the group dir,
+/// which is why it is out of `reclaim_group_agent_files`' scope entirely.
+const OPENCODE_AGENT_FILE_EXT: &str = ".md";
 
 fn generated_agent_handle(group: &str, block: &str) -> String {
     format!("{GENERATED_AGENT_PREFIX}{group}-{block}")
@@ -9799,6 +10345,20 @@ pub struct OrchRegistry {
     /// `start_max_notice_flusher` loop delivers one coalesced notice per burst
     /// once the group falls quiet.
     pending_max_notice: Mutex<HashMap<String, PendingMaxNotice>>,
+    /// Which opencode-store degrade (#722) has already been audited for a
+    /// group, so a persistent one costs one line instead of one per poll.
+    ///
+    /// Keyed by group, holding the KIND (`"open"` / `"unreadable"`), never the
+    /// message: a message could in principle vary between reads, and a latch
+    /// that re-fires on a changed string is not a latch. Same episode shape as
+    /// [`HoldEpisode::announced`] — the entry is dropped the moment a read
+    /// succeeds, so a condition that recurs after a genuine recovery is
+    /// diagnosed again rather than silenced for the life of the process.
+    ///
+    /// `Unavailable::Absent` is deliberately never recorded here and never
+    /// audited: a group whose opencode panes have not booted has no store yet,
+    /// which is the ordinary state, not an incident.
+    opencode_db_degraded: Mutex<HashMap<String, &'static str>>,
     /// Test-only override of the Claude transcript root (`~/.claude/projects`).
     /// `None` in production. Set via `set_claude_projects_dir` so the usage
     /// reader can be pointed at a fixture tree without touching global env —
@@ -10294,10 +10854,55 @@ fn new_session_uuid() -> String {
 
 /// Session ids get interpolated into a shell command line; validate (not
 /// filter — a mangled id would silently resume the wrong session).
+///
+/// **The alphabet is ASCII alphanumerics plus `-` and `_`, and the widening to
+/// reach that is deliberate (#722).** It used to be hex digits and `-`, which
+/// is exactly a Claude UUID and nothing else — so every opencode id was
+/// rejected outright: opencode mints `ses_` + 12 hex + 14 base62
+/// (`ses_03bd2d53dffeiBvu9PvuCPjxT7`, `SOURCE`, `id.ts`), whose `_` and
+/// mixed-case letters both fell outside. `spawn_agent(resume_session = <an
+/// opencode id>)` failed as "invalid resume session id" with nothing malformed
+/// about the id.
+///
+/// **The size of the widening, stated accurately:** the alphabet goes from 23
+/// characters (`0-9a-fA-F` plus `-`) to 64 (`0-9A-Za-z` plus `-` and `_`), so
+/// **41** characters were added — the non-hex ASCII letters, and `_`. It is
+/// emphatically not "two more characters"; an earlier revision of this comment
+/// said so and was wrong, which is worth not repeating in a validator whose
+/// whole job is to bound what may reach a path join.
+///
+/// What the widening does *not* admit is the property that matters, and it is
+/// unchanged: no path separator, no `.` (so `.`/`..` cannot be spelled), no
+/// whitespace, no quote, no shell or PowerShell metacharacter, no NUL. Every
+/// one of the 41 added characters is an ASCII letter, inert in a path
+/// component and inert on a command line, so everything downstream that treats
+/// a session id as a path component (`digest::is_safe_session_id`, and the
+/// `Path::join` in `read_session_transcript_events`) or interpolates it into a
+/// command line keeps every guarantee it had. Same deliberate-widening shape
+/// as `sanitize_model`'s `/`, and pinned the same way.
+///
+/// **This gate is global, not per-CLI, and that is a deliberate trade
+/// (rev-306 NB2).** A malformed *claude* id — one carrying `g`-`z` — now gets
+/// past this door and fails later, inside the CLI, instead of failing here.
+/// Making the alphabet per-CLI is entirely possible (both callers have `cli`
+/// in scope), and was rejected: this function is a **safety** gate answering
+/// "can this string escape a path or an argument", not an **authenticity**
+/// gate answering "is this a well-formed id for this vendor". It never
+/// answered the second question anyway — `aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa`
+/// names no session and passed cleanly before this change too — so per-CLI
+/// shapes would buy an earlier error only for the narrow "typo that happens to
+/// contain a non-hex letter" case, while adding a vendor-shape table whose
+/// failure mode is refusing a *valid* session the day a vendor changes its id
+/// format. That is precisely the bug this slice just fixed for opencode, and
+/// it is not one to reintroduce for the others. Shape questions are answered
+/// by `is_full_session_id` and roster resolution, where being wrong yields a
+/// diagnosable "unknown session" rather than a flat refusal.
 fn sanitize_session(s: &str) -> Option<String> {
     let t = s.trim();
-    (!t.is_empty() && t.len() <= 64 && t.chars().all(|c| c.is_ascii_hexdigit() || c == '-'))
-        .then(|| t.to_string())
+    (!t.is_empty()
+        && t.len() <= 64
+        && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+    .then(|| t.to_string())
 }
 
 /// A Claude Code session id's full length: `8-4-4-4-12` hex hyphenated (see
@@ -10305,16 +10910,61 @@ fn sanitize_session(s: &str) -> Option<String> {
 /// truncated prefix rather than a (possibly external/unrecorded) full id.
 const FULL_SESSION_ID_LEN: usize = 36;
 
+/// Is `s` an opencode session id in full (#722)?
+///
+/// `ses_` + 12 lowercase hex (a 6-byte timestamp) + 14 base62, 30 characters
+/// in all (`SOURCE`, `id.ts`). Recognized by *shape* because opencode's ids are
+/// shorter than a claude UUID: without this, [`is_full_session_id`] would read
+/// a complete opencode id as a truncated prefix and refuse it as an unknown
+/// session — see there for why that matters.
+///
+/// Compared character by character rather than by byte-slicing at 12: a
+/// caller-supplied string is not guaranteed ASCII, and `&rest[..12]` on one
+/// that is not would panic on a char boundary. This is fed by an MCP argument,
+/// so "no caller can get here with such a string" is not a claim worth betting
+/// a panic on.
+fn is_opencode_session_id(s: &str) -> bool {
+    let Some(rest) = s.strip_prefix("ses_") else {
+        return false;
+    };
+    let mut chars = rest.chars();
+    let stamp_ok = chars
+        .by_ref()
+        .take(12)
+        .filter(|c| c.is_ascii_digit() || ('a'..='f').contains(c))
+        .count()
+        == 12;
+    let tail: Vec<char> = chars.collect();
+    stamp_ok && tail.len() == 14 && tail.iter().all(|c| c.is_ascii_alphanumeric())
+}
+
+/// Is `s` already a complete session id for some CLI loomux supports, as
+/// opposed to a prefix of one?
+///
+/// The distinction decides whether [`resolve_session_ref`] passes an input
+/// through untouched or insists on resolving it against this group's roster.
+/// Length alone answered that while claude was the only CLI minting ids
+/// loomux had to recognize; an opencode id is 30 characters, so length alone
+/// would call every complete one a prefix and reject any that this group's
+/// roster happened not to record — a session from another group's audit log, a
+/// roster that lost the entry — as "unknown session", where the equivalent
+/// claude id passes through. Two shapes, one question.
+fn is_full_session_id(s: &str) -> bool {
+    s.len() >= FULL_SESSION_ID_LEN || is_opencode_session_id(s)
+}
+
 /// Resolve a caller-supplied `resume_session` value to the one full session id
 /// it names (#190). A hand-copied or logged session id is naturally truncated
 /// (8 hex chars is what humans and terminals show), and Claude Code session ids
 /// are full UUIDs — before this, a truncated id just failed to resolve with no
 /// indication of why. An exact match against this group's roster wins outright,
-/// whatever its length. Otherwise, an input that is already full-length is
-/// passed through unchanged — it may be a genuine session this group never
-/// recorded (a resume with an explicit `kind`/`block` has always allowed that;
-/// #190 is only about *truncated* ids, which can never be "the real thing" on
-/// their own). Only a SHORTER input is treated as a prefix to resolve: zero
+/// whatever its length. Otherwise, an input that is already a complete id for
+/// some supported CLI ([`is_full_session_id`] — length for claude, shape for
+/// opencode) is passed through unchanged — it may be a genuine session this
+/// group never recorded (a resume with an explicit `kind`/`block` has always
+/// allowed that; #190 is only about *truncated* ids, which can never be "the
+/// real thing" on their own). Only a shorter, shapeless input is treated as a
+/// prefix to resolve: zero
 /// matches is a plain "unknown session" (never seen it, in full or part), two
 /// or more is "ambiguous" and lists every candidate so the caller can pick —
 /// this must never silently choose one.
@@ -10331,7 +10981,7 @@ fn resolve_session_ref(records: &[AgentRecord], input: &str) -> Result<String, S
     if records.iter().any(|r| r.session.as_deref() == Some(input)) {
         return Ok(input.to_string());
     }
-    if input.len() >= FULL_SESSION_ID_LEN {
+    if is_full_session_id(input) {
         return Ok(input.to_string());
     }
     let mut matches: Vec<&str> =
@@ -10378,8 +11028,12 @@ fn resolve_session_ref(records: &[AgentRecord], input: &str) -> Result<String, S
 /// arise at this layer: a session id names at most one file in the store, by
 /// construction — that outcome is scoped to `resolve_session_ref`'s prefix
 /// matching, above.
-pub(crate) fn resolve_resume_cwd(cli: &str, session_id: &str) -> Result<String, String> {
-    match crate::sessions::find_session_cwd(cli, session_id) {
+pub(crate) fn resolve_resume_cwd(
+    cli: &str,
+    session_id: &str,
+    opencode_db: Option<&Path>,
+) -> Result<String, String> {
+    match session_cwd_in_store(cli, session_id, opencode_db) {
         Ok(Some(cwd)) if Path::new(&cwd).is_dir() => Ok(cwd),
         // Found the session, but its record carries no cwd at all (a session
         // whose first ≤60 lines never mention one) — distinct from "not
@@ -10400,6 +11054,43 @@ pub(crate) fn resolve_resume_cwd(cli: &str, session_id: &str) -> Result<String, 
              on this machine — it may have been cleared, or the record is stale."
         )),
         Err(e) => Err(format!("resume-store-unreadable: could not read the {cli} session store: {e}")),
+    }
+}
+
+/// Where a session recorded that it ran, read from the CLI's own store (#722).
+///
+/// This exists because `sessions::find_session_cwd` answers for exactly two
+/// CLIs and sends *everything else* down its claude arm — so before this, an
+/// opencode resume searched `~/.claude/projects`, found nothing, and told the
+/// caller, in those words, that the session "was not found in the opencode
+/// session history on this machine". Not a cosmetic wrong: `register_group_pane`
+/// hard-fails a resume on that answer, which made an opencode group
+/// unresumable outright.
+///
+/// opencode's answer comes from **this group's** store rather than a global
+/// one, because that is where a group's panes write: `OPENCODE_DB` points each
+/// of them at `opencode_db_path(group)`. `None` for the db (a caller with no
+/// group in hand) is "not found", never a fall-through to another CLI's store.
+///
+/// `Absent` maps to `Ok(None)` deliberately — a group whose store was never
+/// created has no such session, which is exactly "not found in the history",
+/// not a store failure the caller should be told to go investigate.
+#[doc(hidden)] // pub for integration tests
+pub fn session_cwd_in_store(
+    cli: &str,
+    session_id: &str,
+    opencode_db: Option<&Path>,
+) -> Result<Option<String>, String> {
+    if cli != "opencode" {
+        return crate::sessions::find_session_cwd(cli, session_id);
+    }
+    let Some(db) = opencode_db else {
+        return Ok(None);
+    };
+    match crate::opencodedb::session_directory(db, session_id) {
+        Ok(dir) => Ok(dir),
+        Err(crate::opencodedb::Unavailable::Absent) => Ok(None),
+        Err(e) => Err(e.to_string()),
     }
 }
 
@@ -10427,11 +11118,12 @@ pub(crate) fn resolve_worker_resume_cwd(
     session_id: &str,
     roster_cwd: Option<&str>,
     group_repo: &str,
+    opencode_db: Option<&Path>,
 ) -> Result<String, String> {
     if let Some(c) = roster_cwd.filter(|c| !c.trim().is_empty() && Path::new(c).is_dir()) {
         return Ok(c.to_string());
     }
-    let cwd = resolve_resume_cwd(cli, session_id)?;
+    let cwd = resolve_resume_cwd(cli, session_id, opencode_db)?;
     if Path::new(&cwd) == Path::new(group_repo) {
         return Err(format!(
             "resume-workspace-missing: session {session_id}'s only recorded workspace is the \
@@ -21402,6 +22094,7 @@ impl OrchRegistry {
             idle_tick_times: Mutex::new(HashMap::new()),
             compact_nudge_times: Mutex::new(HashMap::new()),
             pending_max_notice: Mutex::new(HashMap::new()),
+            opencode_db_degraded: Mutex::new(HashMap::new()),
             claude_projects_dir: Mutex::new(None),
             claude_agents_dir_override: Mutex::new(None),
             copilot_agents_dir_override: Mutex::new(None),
@@ -21775,6 +22468,18 @@ impl OrchRegistry {
         self.root.join(group)
     }
 
+    /// This group's OpenCode session store — the file `OPENCODE_DB` points
+    /// every opencode pane in the group at (#722).
+    ///
+    /// One function rather than two `join`s at the two call sites, because the
+    /// spawn that CREATES this path and the usage read that CONSUMES it
+    /// disagreeing would not fail loudly: the reader would simply find no
+    /// database and report an agent as having spent nothing.
+    #[doc(hidden)] // pub for integration tests
+    pub fn opencode_db_path(&self, group: &str) -> PathBuf {
+        self.group_dir(group).join(OPENCODE_DB_SUBDIR).join(OPENCODE_DB_FILE)
+    }
+
     /// Scratch dir holding images pasted/attached into the steering strip (#72).
     /// A subdir of the group state dir, so it's naturally per-group and swept
     /// on group end alongside the worktrees.
@@ -22011,7 +22716,7 @@ impl OrchRegistry {
                 return self.session_digest(group, DigestLookup::Task(task.id));
             }
         };
-        let events = self.read_session_transcript_events(&cli, &session_id)?;
+        let events = self.read_session_transcript_events(group, &cli, &session_id)?;
         let mut digest = digest::build_digest(&events, final_diff_ref, outcome, title);
         // The #324 recurrence pass. Everything above this line describes ONE
         // session, which is exactly as much as the process-pro's durability
@@ -22067,7 +22772,7 @@ impl OrchRegistry {
         let out = candidates
             .into_iter()
             .filter_map(|(label, cli, sid)| {
-                let events = self.read_session_transcript_events(&cli, &sid).ok()?;
+                let events = self.read_session_transcript_events(group, &cli, &sid).ok()?;
                 Some((label, digest::session_friction_keys(&events)))
             })
             .collect::<Vec<_>>();
@@ -22087,15 +22792,26 @@ impl OrchRegistry {
     /// `group_usage` uses. Copilot: `session-state/<id>/` carries no
     /// per-turn transcript today (see `digest::parse_copilot_session_events`'s
     /// doc) — best-effort from what's on disk, never an error just because
-    /// the richer files are absent.
+    /// the richer files are absent. OpenCode: the group's own SQLite store
+    /// (#722 slice B2), which is why this takes `group` at all — the store is
+    /// per-group by construction (`OPENCODE_DB`), unlike the two
+    /// machine-global session roots above.
     ///
-    /// `session_id` reaches a filesystem path join below on both branches.
-    /// It's usually system-assigned (Claude's own session uuid), but
+    /// `session_id` reaches a filesystem path join on the claude and copilot
+    /// branches. It's usually system-assigned (Claude's own session uuid), but
     /// `Task.session` can be set by an agent through `upsert_task`'s
     /// free-form `session` field — reject anything that isn't a plain path
     /// component before it ever reaches `Path::join` (review finding NB4,
-    /// #250/#324 slice B follow-up).
-    fn read_session_transcript_events(&self, cli: &str, session_id: &str) -> Result<Vec<digest::TranscriptEvent>, String> {
+    /// #250/#324 slice B follow-up). The opencode branch binds it as a SQL
+    /// parameter instead, so it is not a path there; the check runs first for
+    /// all three regardless, because an id this registry would refuse to look
+    /// up on disk is not one to go looking for in a database either.
+    fn read_session_transcript_events(
+        &self,
+        group: &str,
+        cli: &str,
+        session_id: &str,
+    ) -> Result<Vec<digest::TranscriptEvent>, String> {
         if !digest::is_safe_session_id(session_id) {
             return Err(format!("invalid session id: {session_id:?}"));
         }
@@ -22131,6 +22847,23 @@ impl OrchRegistry {
                 let workspace = fs::read_to_string(dir.join("workspace.yaml")).unwrap_or_default();
                 let checkpoints = fs::read_to_string(dir.join("checkpoints").join("index.md")).unwrap_or_default();
                 Ok(digest::parse_copilot_session_events(&workspace, &checkpoints))
+            }
+            "opencode" => {
+                // The group's store, through the one read-only path
+                // `opencodedb` exposes — never a second connection route to
+                // the same file. `Unavailable` is a degrade for the polled
+                // usage meter, but a digest is a single deliberate call whose
+                // whole product is this transcript, so it surfaces as an error
+                // carrying the reason (absent store / unopenable / schema
+                // drift) instead of an empty digest that would read as "this
+                // worker hit no friction". `corroborating_session_keys`
+                // already drops a session whose transcript won't read, so a
+                // missing store shrinks `sessions_scanned` rather than failing
+                // somebody else's digest.
+                let db = self.opencode_db_path(group);
+                let rows = crate::opencodedb::session_transcript(&db, session_id)
+                    .map_err(|e| format!("no opencode transcript for session {session_id}: {e}"))?;
+                Ok(digest::parse_opencode_transcript_events(&rows))
             }
             other => Err(format!("session_digest does not support agent CLI {other:?}")),
         }
@@ -23021,24 +23754,81 @@ impl OrchRegistry {
             .unwrap_or_default()
     }
 
-    /// Poll `~/.copilot/session-state` for the session the just-spawned
-    /// copilot pane created (the one absent from `baseline`) and bind its id
-    /// to the pane. Runs on its own thread — copilot writes the session a few
-    /// seconds into boot. Gives up after `COPILOT_SESSION_TIMEOUT`.
-    fn spawn_copilot_session_watcher(
+    /// Snapshot the sessions a CLI's store already holds, immediately before a
+    /// pane is spawned, so the one that pane mints can be told apart later.
+    /// `None` for a CLI with nothing to learn (claude is handed its id;
+    /// gemini has no store loomux reads), and `None` when the snapshot itself
+    /// could not be taken — see below.
+    ///
+    /// **A baseline that cannot be read is not an empty baseline.** An empty
+    /// one says "the store held nothing", which makes every session in it a
+    /// candidate; if the truth was "the store could not be opened this
+    /// instant", that turns another pane's existing session into this pane's
+    /// answer. So a real degrade refuses to watch at all — the pane stays
+    /// unidentified, exactly as an opencode pane is today — and says so once
+    /// in the audit log. A *missing* store is the opposite case and genuinely
+    /// is an empty baseline: opencode has not created the group's file yet,
+    /// which is the ordinary state of the first pane in a group.
+    #[doc(hidden)] // pub for integration tests
+    pub fn capture_session_baseline(
+        &self,
+        cli: &str,
+        group: &str,
+    ) -> Option<SessionBaseline> {
+        match cli {
+            "copilot" => crate::sessions::copilot_session_state_root().map(|root| {
+                let ids = crate::sessions::copilot_session_ids(&root);
+                SessionBaseline::Copilot { ids, root }
+            }),
+            "opencode" => match crate::opencodedb::session_ids(&self.opencode_db_path(group)) {
+                Ok(ids) => Some(SessionBaseline::OpenCode { ids }),
+                Err(crate::opencodedb::Unavailable::Absent) => {
+                    Some(SessionBaseline::OpenCode { ids: HashSet::new() })
+                }
+                Err(e) => {
+                    self.audit(group, "loomux", "session-untracked", json!({
+                        "cli": "opencode",
+                        "reason": format!(
+                            "could not snapshot the session store before spawning, so a new \
+                             session cannot be told from an existing one: {e}"
+                        ),
+                    }));
+                    None
+                }
+            },
+            _ => None,
+        }
+    }
+
+    /// Poll the CLI's own session store for the session this just-spawned pane
+    /// created — the one absent from `baseline` — and bind its id to the pane.
+    /// Runs on its own thread; both CLIs write the session some seconds into
+    /// boot. Gives up after the baseline's own deadline.
+    ///
+    /// One watcher for both CLIs (#722), not a copilot one and an opencode
+    /// twin: the shape is identical — snapshot before the spawn, poll for what
+    /// appeared, stop on a dead or already-identified pane, audit once on
+    /// giving up — and only *where to look* differs, which is what
+    /// [`SessionBaseline`] carries.
+    fn spawn_session_watcher(
         self: Arc<Self>,
         agent_id: String,
         group_id: String,
         cwd: String,
-        baseline: HashSet<String>,
+        baseline: SessionBaseline,
     ) {
-        let Some(root) = crate::sessions::copilot_session_state_root() else {
-            return;
-        };
         std::thread::spawn(move || {
-            let deadline = std::time::Instant::now() + COPILOT_SESSION_TIMEOUT;
+            let deadline = std::time::Instant::now() + baseline.timeout();
+            // Why the LAST outcome and not the first: the interesting reason a
+            // watch times out is the one still true at the deadline. A store
+            // that was briefly unreadable and then fine, or a contest that
+            // resolved, must not be what the audit line blames.
+            // Declared without an initial value on purpose: every path that
+            // reaches the timeout check below has already assigned one this
+            // tick, so a placeholder here could only ever be dead.
+            let mut last;
             loop {
-                std::thread::sleep(COPILOT_SESSION_POLL);
+                std::thread::sleep(baseline.poll());
                 // Stop if the pane died or was already associated (a resume
                 // re-spawn, or a manual edit) — nothing left to track.
                 match self.agent(&agent_id) {
@@ -23047,37 +23837,149 @@ impl OrchRegistry {
                     Some(_) => {}
                     None => return,
                 }
-                if let Some(sid) =
-                    crate::sessions::newest_new_copilot_session(&root, &baseline, &cwd)
-                {
-                    self.associate_copilot_session(&group_id, &agent_id, &sid);
-                    return;
+                last = self.search_for_session(&group_id, &agent_id, &cwd, &baseline);
+                if let SessionSearch::Found(sid) = &last {
+                    if self.associate_session(&group_id, &agent_id, sid) {
+                        return;
+                    }
+                    // Lost the race: another pane bound this id between our
+                    // search and our write. Keep watching rather than giving
+                    // up — the winner's claim now excludes that id from our
+                    // search, so the next tick looks for a session of our own,
+                    // which is also exactly what the timeout should report if
+                    // one never appears.
+                    last = SessionSearch::Waiting;
                 }
                 if std::time::Instant::now() >= deadline {
-                    self.audit(&group_id, "loomux", "copilot-session-untracked",
-                        json!({ "agent": agent_id, "reason": "no new session-state appeared before timeout" }));
+                    self.audit(&group_id, "loomux", "session-untracked", json!({
+                        "agent": agent_id,
+                        "cli": baseline.cli(),
+                        "reason": last.untracked_reason(),
+                    }));
                     return;
                 }
             }
         });
     }
 
-    /// Bind a discovered copilot session id to a live pane: update the agent
-    /// map, the durable roster (`agents.json`), and any task board item this
-    /// agent owns — the same session trail Claude gets at spawn. Best-effort.
-    /// Public for the session watcher and its tests; a no-op if the pane is
-    /// gone or already carries a session id.
-    pub fn associate_copilot_session(&self, group_id: &str, agent_id: &str, session_id: &str) {
-        let entry = {
-            let mut agents = self.agents.lock_safe();
-            let Some(a) = agents.get_mut(agent_id) else { return };
-            // Don't clobber an id set in the meantime (e.g. a resume).
-            if a.session_id.is_some() {
-                return;
+    /// One poll of the CLI's session store. Split out of the watcher loop so
+    /// the decision is testable without a thread, a clock, or a live pane.
+    #[doc(hidden)] // pub for integration tests
+    pub fn search_for_session(
+        &self,
+        group_id: &str,
+        agent_id: &str,
+        cwd: &str,
+        baseline: &SessionBaseline,
+    ) -> SessionSearch {
+        match baseline {
+            SessionBaseline::Copilot { ids, root } => {
+                match crate::sessions::newest_new_copilot_session(root, ids, cwd) {
+                    Some(sid) => SessionSearch::Found(sid),
+                    None => SessionSearch::Waiting,
+                }
             }
-            a.session_id = Some(session_id.to_string());
-            a.clone()
+            SessionBaseline::OpenCode { ids } => {
+                // The store is the group's, resolved through the ONE function
+                // the spawn that creates it and the usage read that consumes it
+                // already share (#812) — three callers agreeing by
+                // construction rather than by three matching literals.
+                let db = self.opencode_db_path(group_id);
+                // Sessions other panes in this group have already taken. A
+                // group's store is shared by every pane in it, and several of
+                // those panes run in the SAME directory (the orchestrator, the
+                // reviewer, any worker without its own worktree), so directory
+                // plus baseline alone does not separate them — see
+                // `opencodedb::identify_session_on`.
+                let claimed = self.claimed_sessions(group_id, agent_id);
+                match crate::opencodedb::identify_session(&db, cwd, ids, &claimed) {
+                    Ok(crate::opencodedb::Identified::One(sid)) => SessionSearch::Found(sid),
+                    Ok(crate::opencodedb::Identified::None) => SessionSearch::Waiting,
+                    Ok(crate::opencodedb::Identified::Contested(n)) => SessionSearch::Contested(n),
+                    // Absent is not a degrade here, it is the ordinary state of
+                    // a store opencode has not created yet — the same reading
+                    // `note_opencode_db_degrade` gives it.
+                    Err(crate::opencodedb::Unavailable::Absent) => SessionSearch::Waiting,
+                    Err(e) => SessionSearch::Unreadable(e.to_string()),
+                }
+            }
+        }
+    }
+
+    /// Session ids already bound to OTHER panes in this group.
+    ///
+    /// Live agents only, deliberately: a pane that died before this one
+    /// spawned had its session created before the baseline snapshot, so the
+    /// baseline already excludes it — reading `agents.json` every poll would
+    /// buy nothing and put a file read on a polled path.
+    fn claimed_sessions(&self, group_id: &str, except_agent: &str) -> HashSet<String> {
+        self.agents
+            .lock_safe()
+            .values()
+            .filter(|a| a.group == group_id && a.id != except_agent)
+            .filter_map(|a| a.session_id.clone())
+            .collect()
+    }
+
+    /// Bind a discovered session id to a live pane: update the agent map, the
+    /// durable roster (`agents.json`), and any task board item this agent owns
+    /// — the same session trail Claude gets at spawn. Best-effort. Public for
+    /// the session watcher and its tests.
+    ///
+    /// Returns whether this call bound the id. `false` — a no-op — when the
+    /// pane is gone, when it already carries an id, or when **another pane in
+    /// this group is already bound to this session**. That last one is not a
+    /// formality: see the comment inside, and note that a caller which treats
+    /// `false` as "done" turns a lost race into a permanently unidentified
+    /// pane. The watcher keeps polling instead.
+    pub fn associate_session(&self, group_id: &str, agent_id: &str, session_id: &str) -> bool {
+        // The lock scope DECIDES; everything else happens after the guard
+        // drops — same shape, and same reason, as `note_opencode_db_degrade`:
+        // `audit` takes its own locks, and holding an unrelated one across it
+        // is how lock-order bugs start. Keeping the two sites identical also
+        // means this file has one pattern for "record a refusal" rather than
+        // two a reader has to tell apart (rev-306 F1). What must stay inside
+        // the guard is only the check-and-write pair below, which is the whole
+        // point of NB3.
+        let (entry, taken_by_another) = {
+            let mut agents = self.agents.lock_safe();
+            // The claim exclusion `search_for_session` applies is READ under
+            // this lock and then released before the store is queried, so two
+            // watchers can both be inside that window at once: with one
+            // candidate visible and neither pane bound yet, both searches
+            // legitimately answer `Found(same id)`. Refusing here — under the
+            // one lock that also performs the write — is what makes the
+            // exclusion hold, rather than merely usually holding. Without it
+            // the refusal policy protects only the two-candidate case and
+            // leaks exactly the harm it exists to prevent (one conversation
+            // bound to two panes) in the one-candidate case (rev-306 NB3).
+            if agents.values().any(|a| {
+                a.group == group_id
+                    && a.id != agent_id
+                    && a.session_id.as_deref() == Some(session_id)
+            }) {
+                (None, true)
+            } else {
+                match agents.get_mut(agent_id) {
+                    // Don't clobber an id set in the meantime (e.g. a resume).
+                    Some(a) if a.session_id.is_none() => {
+                        a.session_id = Some(session_id.to_string());
+                        (Some(a.clone()), false)
+                    }
+                    // Pane gone, or already carries an id: a no-op either way.
+                    _ => (None, false),
+                }
+            }
         };
+        if taken_by_another {
+            self.audit(group_id, "loomux", "session-claim-refused", json!({
+                "agent": agent_id,
+                "session": session_id,
+                "reason": "another pane in this group is already bound to this session",
+            }));
+            return false;
+        }
+        let Some(entry) = entry else { return false };
         let status = match entry.status {
             AgentStatus::Dead => "dead",
             _ => "running",
@@ -23102,8 +24004,14 @@ impl OrchRegistry {
                 let _ = self.write_tasks(group_id, &tasks);
             }
         }
-        self.audit(group_id, "loomux", "copilot-session",
+        // One event for one fact (#722): this fires for copilot and opencode
+        // alike, so a reader asking "when did this pane get its session" does
+        // not have to know which CLI it was to know which line to look for.
+        // The CLI itself is not repeated here — this agent's `agent-spawn`
+        // line already records it, and a second copy could only ever disagree.
+        self.audit(group_id, "loomux", "session-learned",
             json!({ "agent": agent_id, "session": session_id }));
+        true
     }
 
     /// Roster entries derived from `agent-spawn` audit lines. Backfill for
@@ -25976,9 +26884,21 @@ impl OrchRegistry {
         let has_seam = cli_caps(cli).is_some_and(|c| c.mcp_argv_seam);
         let (token, mcp_args) = if has_seam {
             let token = new_token();
-            // A solo pane is `Role::Solo` — `Containment::None`, nothing to deny.
-            let cfg =
-                self.write_mcp_config(SOLO_GROUP, &agent_id, &token, cli, Containment::None)?;
+            // A solo pane is `Role::Solo` — `Containment::None`, nothing to
+            // deny, no block, and therefore no persona to compile. Only the
+            // argv-seam CLIs reach here (`has_seam`), and neither reads either
+            // of the last two arguments.
+            let cfg = self
+                .write_mcp_config(
+                    SOLO_GROUP,
+                    &agent_id,
+                    &token,
+                    cli,
+                    Containment::None,
+                    false,
+                    &PersonaInject::default(),
+                )?
+                .path;
             let args = match cli {
                 // Every join site APPENDS this string (`launcher.ts`,
                 // `panerestore.ts`, `sessions.rs`), so on an autopilot solo
@@ -30412,11 +31332,16 @@ impl OrchRegistry {
     }
 
     /// Compute an agent's current usage from the best available source, in
-    /// preference order: the CLI's own session transcript (token records —
-    /// exact, and readable even after the pane is gone) → a last-resort parse
-    /// of the dollar figure the CLI prints in its statusline. Returns a
-    /// snapshot keyed for durable accumulation (issue #42).
-    fn compute_usage_snapshot(&self, entry: &AgentEntry, cli: &str) -> UsageSnapshot {
+    /// preference order: the CLI's own session record (token counts — exact,
+    /// and readable even after the pane is gone) → a last-resort parse of the
+    /// dollar figure the CLI prints in its statusline. Returns a snapshot
+    /// keyed for durable accumulation (issue #42).
+    ///
+    /// `#[doc(hidden)] pub` for the integration tests: this is the function
+    /// that decides which source an agent's usage comes from, and pinning that
+    /// choice per CLI is only meaningful against the real one.
+    #[doc(hidden)] // pub for integration tests
+    pub fn compute_usage_snapshot(&self, entry: &AgentEntry, cli: &str) -> UsageSnapshot {
         let key = entry
             .session_id
             .clone()
@@ -30468,6 +31393,46 @@ impl OrchRegistry {
             }
         }
 
+        // OpenCode writes no transcript file: its `session` row already holds
+        // the dollar cost it computed itself plus five token counters, in the
+        // group's own SQLite store (#722). So the dollars here are REPORTED,
+        // not estimated — `estimated: false` is what keeps `group_usage` from
+        // blending them into a total labelled as a price-table guess.
+        //
+        // A degrade (no store, unopenable, schema drift) never fails the
+        // snapshot — it falls through to the statusline, and to a zero-usage
+        // agent if that finds nothing either, which is the whole
+        // degraded-not-fatal posture (see `crate::opencodedb`). But it is not
+        // silent either: `note_opencode_db_degrade` writes ONE audit line per
+        // episode, so a drifted schema and a never-booted pane stop looking
+        // identical to whoever is debugging, without this polled path becoming
+        // an audit entry every UI tick (rev-298 F2).
+        if cli == "opencode" {
+            // Until an opencode pane's session is identified, there is no id
+            // to key on and this arm simply does not fire.
+            if let Some(sid) = entry.session_id.as_deref() {
+                let db = self.opencode_db_path(&entry.group);
+                let read = crate::usage::opencode_session_usage(&db, sid);
+                self.note_opencode_db_degrade(&entry.group, &db, read.as_ref().err());
+                if let Ok(Some(u)) = read {
+                    // Same guard as the claude arm: a session row that exists
+                    // but has counted nothing yet must not overwrite history
+                    // with zeros, nor pre-empt the statusline fallback.
+                    if u.tokens.total() > 0 {
+                        snap.source = "session-db".to_string();
+                        snap.input_tokens = u.tokens.input_tokens;
+                        snap.output_tokens = u.tokens.output_tokens;
+                        snap.cache_creation_tokens = u.tokens.cache_creation_tokens;
+                        snap.cache_read_tokens = u.tokens.cache_read_tokens;
+                        snap.cost_usd = u.cost_usd;
+                        snap.estimated = false; // priced by opencode, not by us
+                        snap.model = u.model;
+                        return snap;
+                    }
+                }
+            }
+        }
+
         // Last resort: the dollar figure the CLI renders in its own statusline.
         // Unreliable (empty on subscription/Max accounts; gone once the pane is
         // killed), so it only runs when no transcript usage was found.
@@ -30481,6 +31446,61 @@ impl OrchRegistry {
             }
         }
         snap
+    }
+
+    /// Record — at most once per episode — that a group's opencode store could
+    /// not be read, and why (#722, rev-298 F2).
+    ///
+    /// The problem this solves: `compute_usage_snapshot` treats every
+    /// [`crate::opencodedb::Unavailable`] the same way, because there is
+    /// nothing useful it could do differently. That is right for the SNAPSHOT
+    /// and wrong for the RECORD — a drifted schema and a pane whose CLI never
+    /// booted both surface as "not from the store", so the one condition that
+    /// needs a human looks exactly like the one that needs nobody.
+    ///
+    /// Why a latch and not just an audit call: this runs on `group_usage`,
+    /// which the group view polls every couple of seconds, so an unlatched line
+    /// would be an audit entry every tick for as long as the condition lasted —
+    /// the log flooded worst precisely when something is wrong with it. Keyed
+    /// by KIND rather than message so a varying error string cannot defeat the
+    /// latch, and dropped on the first successful read so a recurrence after a
+    /// real recovery is diagnosed again instead of being silenced for the
+    /// process's life.
+    ///
+    /// `Absent` is passed through without a line on purpose: no store yet is
+    /// the ordinary state of a group whose opencode panes have not booted, and
+    /// auditing it would put a line in every claude-only group that ever spawns
+    /// an opencode pane.
+    fn note_opencode_db_degrade(
+        &self,
+        group: &str,
+        db: &Path,
+        err: Option<&crate::opencodedb::Unavailable>,
+    ) {
+        use crate::opencodedb::Unavailable;
+        let kind = match err {
+            Some(Unavailable::Open(_)) => "open",
+            Some(Unavailable::Query(_)) => "unreadable",
+            // A successful read, or a store that simply is not there yet:
+            // either way this group has no live degrade episode.
+            Some(Unavailable::Absent) | None => {
+                self.opencode_db_degraded.lock_safe().remove(group);
+                return;
+            }
+        };
+        let mut seen = self.opencode_db_degraded.lock_safe();
+        if seen.get(group) == Some(&kind) {
+            return; // already diagnosed this episode
+        }
+        seen.insert(group.to_string(), kind);
+        // Dropped before auditing: `audit` takes its own locks, and holding an
+        // unrelated one across it is how lock-order bugs start.
+        drop(seen);
+        self.audit(group, "loomux", "opencode-usage-degraded", json!({
+            "kind": kind,
+            "detail": err.map(ToString::to_string).unwrap_or_default(),
+            "db": db.to_string_lossy(),
+        }));
     }
 
     fn load_usage_snapshots(&self, group: &str) -> Vec<UsageSnapshot> {
@@ -30767,7 +31787,7 @@ impl OrchRegistry {
             "live_tokens": live_tokens,
             "lifetime_tokens": lifetime_tokens,
             "agents": rows,
-            "note": "Tokens come from each agent's session transcript and are exact; dollar figures are estimated from a dated model price table. Subscription/Max accounts have no marginal dollar cost (the CLI statusline shows $0.00), so tokens are the reliable metric. Killed/recycled agents stay in the lifetime total; statusline-parsed dollars are a last-resort fallback.",
+            "note": "Tokens come from each agent's own session record — a transcript, or opencode's session row — and are exact; dollar figures are estimated from a dated model price table EXCEPT where the CLI priced them itself (opencode does), which the per-total basis labels. Subscription/Max accounts have no marginal dollar cost (the CLI statusline shows $0.00), so tokens are the reliable metric. Killed/recycled agents stay in the lifetime total; statusline-parsed dollars are a last-resort fallback.",
         })
     }
 
@@ -32758,9 +33778,16 @@ impl OrchRegistry {
         format_delegate_roster(rows)
     }
 
-    /// Write the per-agent MCP config the agent CLI connects with. Claude
-    /// and Copilot share the same core schema; Copilot additionally expects
-    /// a `tools` allowlist inside the server entry.
+    /// Write the per-agent MCP config the agent CLI connects with, and return
+    /// it together with the pane environment that CLI needs to read it (see
+    /// [`AgentCliConfig`]). Claude and Copilot share the same core schema;
+    /// Copilot additionally expects a `tools` allowlist inside the server entry.
+    ///
+    /// `unattended` and `persona` are opencode's (#722): its single document
+    /// carries the permission posture (which differs for an attended pane) and
+    /// the block's agent entry (which `persona_inject` must have produced
+    /// first — hence the call order at both spawn sites). Both are ignored by
+    /// every other adapter.
     ///
     /// rev-4 review (N2): this file used to ALSO carry the #417 hook config
     /// (folded into a top-level `hooks` key, passed a second time via
@@ -32779,7 +33806,9 @@ impl OrchRegistry {
         token: &str,
         cli: &str,
         containment: Containment,
-    ) -> Result<PathBuf, String> {
+        unattended: bool,
+        persona: &PersonaInject,
+    ) -> Result<AgentCliConfig, String> {
         let port = self.port();
         if port == 0 {
             return Err("loomux MCP server is not running".into());
@@ -32794,7 +33823,29 @@ impl OrchRegistry {
             let policy = self.write_gemini_policy(&dir, agent_id, containment)?;
             let cfg = gemini_settings_json(port, token, containment, policy.as_deref());
             fs::write(&path, cfg).map_err(|e| e.to_string())?;
-            return Ok(path);
+            let env = cli_extra_env(cli, &path);
+            return Ok(AgentCliConfig { path, env });
+        }
+        // OpenCode (#722): the config document is delivered by environment
+        // variable, so the file written here is the AUDIT copy — what the pane
+        // was handed, readable after the fact — while the env carries the
+        // authoritative bytes. Both come from one call to one generator, so
+        // they cannot disagree.
+        if cli == "opencode" {
+            let agent = persona
+                .opencode_agent
+                .as_deref()
+                .zip(persona.opencode_prompt_file.as_deref());
+            let cfg = opencode_config_json(port, token, containment, unattended, agent);
+            fs::write(&path, &cfg).map_err(|e| e.to_string())?;
+            // SQLite creates the database file but not its parent directory,
+            // and a pane whose store cannot be opened does not boot — so this
+            // is an error, not a best-effort mkdir.
+            let db = self.opencode_db_path(group);
+            let db_dir = db.parent().expect("opencode_db_path always has a parent").to_path_buf();
+            fs::create_dir_all(&db_dir).map_err(|e| e.to_string())?;
+            let env = opencode_pane_env(&cfg, containment, unattended, &db);
+            return Ok(AgentCliConfig { path, env });
         }
         let mut server = json!({
             "type": "http",
@@ -32806,7 +33857,8 @@ impl OrchRegistry {
         }
         let cfg = json!({ "mcpServers": one_server_map(server) });
         fs::write(&path, serde_json::to_string_pretty(&cfg).unwrap()).map_err(|e| e.to_string())?;
-        Ok(path)
+        let env = cli_extra_env(cli, &path);
+        Ok(AgentCliConfig { path, env })
     }
 
     /// Write this agent's gemini policy-engine file — the admin-tier half of a
@@ -33343,6 +34395,55 @@ impl OrchRegistry {
         Some(handle)
     }
 
+    /// Generate (or refresh) the file an opencode block's generated agent
+    /// entry points its `prompt` at (#722), returning `(handle, path)` or
+    /// `None` if it can't be written.
+    ///
+    /// **Written under the GROUP's own state dir**, unlike its claude and
+    /// copilot siblings, and for two reasons rather than one. opencode has no
+    /// user-level agents directory loomux could write a *definition* into
+    /// without also owning its lifecycle — the definition lives in the config
+    /// document instead — so all that needs a home here is the contract text;
+    /// and a file under the group dir is reclaimed when the group is, so this
+    /// needs no orphan sweep of the kind `~/.claude/agents` and
+    /// `~/.copilot/agents` do (#464/#502). The repo's own `.opencode/agents/`
+    /// is never written for the reason copilot's `.github/agents/` isn't:
+    /// loomux does not dirty a user's git tree with files they did not write.
+    ///
+    /// Beside the config document in `configs/`, deliberately: the two are one
+    /// artifact split across a file and an env var, and the config's `{file:}`
+    /// reference is what joins them.
+    ///
+    /// Written on every spawn, like `write_mcp_config`, so an edited
+    /// template/persona applies to the next agent without restarting the
+    /// group. Named for the handle so the reference and its target can't drift.
+    ///
+    /// The whole contract goes in VERBATIM — no frontmatter, no wrapper: this
+    /// file is not an agent definition (the config document is), it is the
+    /// value of that definition's `prompt`. opencode inserts it JSON-escaped,
+    /// so quotes, newlines and backslashes in a persona cannot break the
+    /// document around it, and it `.trim()`s the content, so nothing may
+    /// depend on the trailing newline.
+    fn write_opencode_agent_file(
+        &self,
+        group: &str,
+        block: &workflow::Block,
+        contract: &str,
+    ) -> Option<(String, PathBuf)> {
+        if !self.group_state_exists(group) {
+            return None;
+        }
+        let dir = self.group_dir(group).join("configs");
+        fs::create_dir_all(&dir).ok()?;
+        let handle = generated_agent_handle(group, &block.id);
+        let path = dir.join(format!("{handle}{OPENCODE_AGENT_FILE_EXT}"));
+        let instructions_path = self.group_dir(group).join(block.instructions_file());
+        let body =
+            format!("{contract}{}\n", compaction_self_check_clause(&instructions_path));
+        fs::write(&path, body).ok()?;
+        Some((handle, path))
+    }
+
     /// Generate (or refresh) a loomux-owned Copilot custom-agent file carrying
     /// `contract` (#416) — written into Copilot's OWN user-level agent
     /// directory (`~/.copilot/agents`, see [`copilot_agents_dir`]
@@ -33750,6 +34851,51 @@ impl OrchRegistry {
             return out;
         }
 
+        // OpenCode (#722): the same "native custom-agent flag, file-backed"
+        // shape as the two above, with the definition in the config document
+        // `write_mcp_config` generates (which is why this must run BEFORE it
+        // at every spawn site) and the contract itself in a file the entry's
+        // `prompt` references. `contract` is used whole — the full instructions
+        // body plus any persona — because opencode documents no cap on it,
+        // matching claude rather than copilot (see `copilot_agent_body`).
+        //
+        // A repo persona resolved from a `.github/agents/*.md` file
+        // (`copilot_native`) is irrelevant here: that flag records what
+        // COPILOT's `--agent` can resolve, and opencode resolves neither the
+        // file nor its frontmatter. Its text is already folded into `contract`
+        // by `block_contract_text`, so nothing is lost by ignoring the flag.
+        if cli == "opencode" {
+            match self.write_opencode_agent_file(group, block, contract) {
+                Some((handle, path)) => {
+                    out.opencode_agent = Some(handle);
+                    out.opencode_prompt_file = Some(path);
+                    out.contract_carrier = ContractCarrier::SystemLayerFull;
+                }
+                None => {
+                    // The group dir is unwritable. Emit NO `--agent` and no
+                    // agent entry: a `--agent` naming an entry that isn't
+                    // there does not fail, it falls back to `build` — the most
+                    // permissive agent — so a broken flag would be strictly
+                    // worse than no flag. Containment is unaffected either way
+                    // (it rides `OPENCODE_PERMISSION`, which applies globally);
+                    // what is lost is the durable contract, so fall back to the
+                    // kickoff-text path exactly as copilot does, and audit it
+                    // for the same reason the claude fallback is audited.
+                    if persona.is_some_and(|p| !p.text.trim().is_empty()) {
+                        out.kickoff = persona.map(|p| p.text.clone());
+                    }
+                    self.audit(group, "loomux", "opencode-agent-file-unwritable", json!({
+                        "block": block.id,
+                        "reason": "could not write the block's contract file under the group dir; \
+                                   the pane launches with no --agent (an unresolvable one would \
+                                   silently fall back to the default `build` agent) and the \
+                                   contract reaches it through the kickoff only",
+                    }));
+                }
+            }
+            return out;
+        }
+
         // Claude (and the fallback adapter): the durable contract ALWAYS
         // rides the system-prompt layer now — every block, persona or not
         // — but as of round #417 correction 6, by FILE, never argv. The
@@ -34118,6 +35264,54 @@ impl OrchRegistry {
                     group_dir.display()
                 )
             }
+            // OpenCode (#722). The shortest arm of the four, and deliberately:
+            // its MCP server, its containment and its persona DEFINITION are
+            // all keys in a config document delivered by pane environment
+            // (`write_mcp_config`'s opencode branch + `opencode_pane_env`) —
+            // there is no `--mcp-config` analogue, no deny flag, and no
+            // `--add-dir`. `cfg` is that document's audit copy and is
+            // deliberately not named here, which is why
+            // [`CliCaps::mcp_argv_seam`] is false for opencode too.
+            //
+            // So a contained pane's denials being ABSENT from this string is
+            // the design, not an omission: they are asserted on the generated
+            // document and on the environment instead.
+            //
+            // The TUI is the surface, not `opencode run`, and that is load-
+            // bearing rather than incidental: `run` answers a permission it
+            // cannot ask a human about by REJECTING it outright, so the
+            // attended posture (`edit: ask`) would silently refuse every edit
+            // instead of prompting. Anything that moves an opencode pane onto
+            // `run` inherits that.
+            "opencode" => {
+                let mut cmd = String::from("opencode");
+                // No flag pre-assigns a session id — `--session` continues an
+                // existing one — so, like copilot and gemini, it appears only
+                // on an explicit resume.
+                if let (Some(s), true) = (session, resume) {
+                    cmd.push_str(&format!(" --session {s}"));
+                }
+                // Omitted entirely when empty: `default_model("opencode", …)`
+                // is empty on purpose (see its doc), and a blank `--model`
+                // would be an argument, not a silence.
+                if !model.is_empty() {
+                    cmd.push_str(&format!(" --model {model}"));
+                }
+                if let Some(agent) = &persona.opencode_agent {
+                    cmd.push_str(&format!(" --agent {agent}"));
+                }
+                if unattended {
+                    cmd.push(' ');
+                    cmd.push_str(OPENCODE_UNATTENDED_FLAGS);
+                }
+                // `persona.extra_allow` holds claude/copilot tool-pattern
+                // strings (`Bash(make:*)`, `shell(npm:*)`); opencode's
+                // permission keys and matcher are a different namespace, so
+                // translating them would be inventing semantics — the same
+                // decision, for the same reason, as gemini's arm. An opencode
+                // block widens nothing; it only ever gets its class's baseline.
+                cmd
+            }
             // "claude" and the explicit fallback for anything unrecognized.
             _ => {
                 // Assigning the session id up front is what makes per-task
@@ -34412,6 +35606,30 @@ impl OrchRegistry {
                 push(&mut a, "--allowed-mcp-server-names");
                 push(&mut a, LOOMUX_MCP_SERVER);
             }
+            // OpenCode (#722) — see the string form for why this arm is short:
+            // its MCP, containment and persona-definition seams are one
+            // env-delivered document, not flags.
+            "opencode" => {
+                push(&mut a, "opencode");
+                if let (Some(s), true) = (session, resume) {
+                    push(&mut a, "--session");
+                    push(&mut a, s);
+                }
+                if !model.is_empty() {
+                    push(&mut a, "--model");
+                    push(&mut a, model);
+                }
+                if let Some(agent) = &persona.opencode_agent {
+                    push(&mut a, "--agent");
+                    push(&mut a, agent);
+                }
+                if unattended {
+                    // == OPENCODE_UNATTENDED_FLAGS, as a literal token.
+                    for t in OPENCODE_UNATTENDED_FLAGS.split_whitespace() {
+                        push(&mut a, t);
+                    }
+                }
+            }
             // "claude" and the explicit fallback for anything unrecognized.
             _ => {
                 push(&mut a, "claude");
@@ -34645,15 +35863,12 @@ impl OrchRegistry {
             None => (cli == "claude").then(new_session_uuid),
         };
 
-        // Copilot mints its own session id after boot (no `--session-id`), so
-        // snapshot the sessions that already exist now, before this pane's
-        // copilot starts — the watcher then identifies the newly appeared one.
-        let copilot_baseline = (!resume && cli == "copilot")
-            .then(|| {
-                crate::sessions::copilot_session_state_root()
-                    .map(|root| crate::sessions::copilot_session_ids(&root))
-                    .unwrap_or_default()
-            });
+        // Copilot and opencode mint their own session id after boot (neither
+        // has a `--session-id`), so snapshot the sessions that already exist
+        // now, before this pane's CLI starts — the watcher then identifies the
+        // newly appeared one.
+        let session_baseline =
+            (!resume).then(|| self.capture_session_baseline(&cli, group_id)).flatten();
 
         let branch_name = branch
             .map(|b| b.trim().to_string())
@@ -34764,8 +35979,21 @@ impl OrchRegistry {
         // #267: `role.containment()` rides in because a gemini agent's deny
         // rules ARE its config file (the policy engine is the only surface
         // that can name a built-in tool), unlike claude/copilot where they are
-        // argv flags. Inert for every other CLI.
-        let cfg = self.write_mcp_config(group_id, &agent_id, &token, &cli, role.containment())?;
+        // argv flags. #722 adds two more inputs for the same reason on
+        // opencode, whose document carries its permission posture (which
+        // depends on whether the pane is attended) and its persona entry
+        // (which `persona_inject`, above, just produced) — inert for the CLIs
+        // that name their config on argv.
+        let unattended = group.guardrails.auto_ops || role.containment().forces_unattended();
+        let cfg = self.write_mcp_config(
+            group_id,
+            &agent_id,
+            &token,
+            &cli,
+            role.containment(),
+            unattended,
+            &inject,
+        )?;
         // #417, split from `cfg` per rev-4 review N2 — Claude's hook config
         // rides a per-agent `--settings` file, so this is `None` for every
         // other CLI (Copilot's own hook wiring, below, needs no launch flag
@@ -34785,7 +36013,7 @@ impl OrchRegistry {
             &model,
             block.knobs(), // #687: already clamped to what this CLI can honor
             group.guardrails.auto_ops,
-            &cfg,
+            &cfg.path,
             hook_settings.as_deref(),
             &self.group_dir(group_id),
             Path::new(&cwd),
@@ -34799,7 +36027,7 @@ impl OrchRegistry {
             &model,
             block.knobs(),
             group.guardrails.auto_ops,
-            &cfg,
+            &cfg.path,
             hook_settings.as_deref(),
             &self.group_dir(group_id),
             Path::new(&cwd),
@@ -34901,7 +36129,7 @@ impl OrchRegistry {
                             .map(|a| (a.id.clone(), a.role.as_str(), a.idle_since_ms.is_some()))
                             .collect(),
                     );
-                    let _ = fs::remove_file(&cfg);
+                    let _ = fs::remove_file(&cfg.path);
                     return Err(format!(
                         "guardrail: {live} live agents already (max {}). Reuse an idle agent or kill one first. Live delegates: {roster}.",
                         group.guardrails.max_agents
@@ -34960,7 +36188,7 @@ impl OrchRegistry {
 
         let pane_env = {
             let mut e = self.agent_pane_env(group_id, &agent_id);
-            e.extend(cli_extra_env(&cli, &cfg));
+            e.extend(cfg.env.clone());
             e
         };
         let request = SpawnRequest {
@@ -35039,14 +36267,14 @@ impl OrchRegistry {
                         self.kickoff_prompt(&a, &group, &branch_note, inject.kickoff.as_deref());
                     self.deliver_prompt(&agent_id, &kickoff, "loomux", Delivery::FreshKickoff)?;
                 }
-                // Copilot minted a session as it booted; watch for it and bind
+                // The CLI minted a session as it booted; watch for it and bind
                 // its id to this pane's roster record so the session becomes
                 // resumable and shows in the session browser. Needs an owned
                 // registry (background thread) — a no-op in unit tests, which
                 // don't set the self-arc.
-                if let Some(baseline) = copilot_baseline {
+                if let Some(baseline) = session_baseline {
                     if let Some(reg) = self.arc() {
-                        reg.spawn_copilot_session_watcher(
+                        reg.spawn_session_watcher(
                             agent_id.clone(),
                             group_id.to_string(),
                             cwd.clone(),
@@ -41671,24 +42899,16 @@ fn register_orchestrator_pane(
     if cli == "copilot" {
         reg.pre_trust_copilot_folder(&group.repo, &group.repo);
     }
-    // An orchestrator is `Containment::None` — nothing to deny; the parameter
-    // exists for the CLIs whose deny rules live in the config file (#267).
-    let cfg =
-        reg.write_mcp_config(&group.id, &agent_id, &token, &cli, Containment::None)?;
     let resume = resume_session.is_some();
     let session_id = match resume_session {
         Some(s) => Some(sanitize_session(&s).ok_or("invalid resume session id")?),
         None => (cli == "claude").then(new_session_uuid),
     };
-    // Copilot mints its own id on boot; snapshot existing sessions now so the
-    // orchestrator's newly created one can be tracked (this is what gives a
-    // copilot orchestration its ORCH chip and restore).
-    let copilot_baseline = (!resume && cli == "copilot")
-        .then(|| {
-            crate::sessions::copilot_session_state_root()
-                .map(|root| crate::sessions::copilot_session_ids(&root))
-                .unwrap_or_default()
-        });
+    // Copilot and opencode mint their own id on boot; snapshot existing
+    // sessions now so the orchestrator's newly created one can be tracked
+    // (this is what gives such an orchestration its ORCH chip and restore).
+    let session_baseline =
+        (!resume).then(|| reg.capture_session_baseline(&cli, &group.id)).flatten();
     // The orchestrator block's persona, if the workflow file gave it one. A
     // broken one is audited and dropped, never fatal.
     let persona = reg.resolve_persona_or_audit(group, &block);
@@ -41701,10 +42921,37 @@ fn register_orchestrator_pane(
         .unwrap_or_default();
     let contract = block_contract_text(&instructions_body, persona.as_ref());
     let inject = reg.persona_inject(&group.id, &block, &cli, persona.as_ref(), &contract);
+    // An orchestrator is `Containment::None` — nothing to deny; the parameter
+    // exists for the CLIs whose deny rules live in the config file (#267).
+    //
+    // **Written AFTER `persona_inject`, matching `spawn_agent_ex` (#722):**
+    // opencode's generated document carries the block's agent entry, and
+    // `persona_inject` is what writes the file that entry references. This used
+    // to sit above the session/persona block; nothing between there and here
+    // reads `cfg`, so moving it down is a reordering only — and it makes the
+    // two spawn sites agree on the order structurally instead of by accident.
+    //
+    // Both arguments are DERIVED, never hand-passed, for the same reason the
+    // builders below already derive theirs: an orchestrator is
+    // `Containment::None` today, but a literal here would be a second place
+    // that has to be remembered if `Role::containment` ever changes — and the
+    // unattended predicate must stay the one expression
+    // `build_agent_command_ex` recomputes internally, or a pane could get a
+    // document saying one thing and an argv saying the other.
+    let containment = block.kind.containment();
+    let cfg = reg.write_mcp_config(
+        &group.id,
+        &agent_id,
+        &token,
+        &cli,
+        containment,
+        group.guardrails.auto_ops || containment.forces_unattended(),
+        &inject,
+    )?;
     // #417, split from `cfg` per rev-4 review N2 — Claude's hook config rides
     // a per-agent `--settings` file; Copilot's own wiring needs no flag.
     let hook_settings = (cli == "claude")
-        .then(|| reg.write_hook_settings_file(&group.id, &agent_id, block.kind.containment()))
+        .then(|| reg.write_hook_settings_file(&group.id, &agent_id, containment))
         .flatten();
     if cli == "copilot" {
         let _ = reg.ensure_copilot_compact_hook();
@@ -41717,7 +42964,7 @@ fn register_orchestrator_pane(
         // `prompt:`/`allow:` on the refused one (see `parse_workflow`).
         block.knobs(),
         group.guardrails.auto_ops,
-        &cfg,
+        &cfg.path,
         hook_settings.as_deref(),
         &reg.group_dir(&group.id),
         Path::new(&group.repo),
@@ -41726,7 +42973,7 @@ fn register_orchestrator_pane(
         // Derived from the class, never hand-passed: the orchestrator is
         // `Containment::None`, and if that ever changes it changes in one
         // `match` (`Role::containment`) rather than at a literal here.
-        block.kind.containment(),
+        containment,
         &inject,
     );
     let argv = reg.build_agent_argv_ex(
@@ -41734,13 +42981,13 @@ fn register_orchestrator_pane(
         &model,
         block.knobs(),
         group.guardrails.auto_ops,
-        &cfg,
+        &cfg.path,
         hook_settings.as_deref(),
         &reg.group_dir(&group.id),
         Path::new(&group.repo),
         session_id.as_deref(),
         resume,
-        block.kind.containment(),
+        containment,
         &inject,
     );
     // Round #417 correction 6: see `command_line_length_guard`'s doc — the
@@ -41828,7 +43075,7 @@ fn register_orchestrator_pane(
         // LOOMUX_AGENT_ID (#417) and the adapter's own vars (#267).
         env: {
             let mut e = reg.agent_pane_env(&group.id, &agent_id);
-            e.extend(cli_extra_env(&cli, &cfg));
+            e.extend(cfg.env.clone());
             e
         },
         // The orchestrator's own pane is never minimized (#260) — see
@@ -41905,9 +43152,9 @@ fn register_orchestrator_pane(
         };
         let delivery = if resume { Delivery::ResumeKickoff } else { Delivery::FreshKickoff };
         let _ = reg2.deliver_prompt(&agent_id, &kickoff, "loomux", delivery);
-        // Track the copilot session this orchestrator just minted.
-        if let Some(baseline) = copilot_baseline {
-            reg2.clone().spawn_copilot_session_watcher(
+        // Track the session this orchestrator just minted.
+        if let Some(baseline) = session_baseline {
+            reg2.clone().spawn_session_watcher(
                 agent_id.clone(),
                 group2.id.clone(),
                 group2.repo.clone(),
@@ -42155,7 +43402,14 @@ pub fn resume_recorded_session(
                 .block_for(Role::Orchestrator)
                 .map(|b| workflow::cli_of(b, &guardrails.agent_cli).to_string())
                 .unwrap_or_else(|| guardrails.agent_cli.clone());
-            match crate::sessions::find_session_cwd(&cli, session_id) {
+            // Via the store router, not `sessions::find_session_cwd` directly
+            // (#722): its `_` arm searches CLAUDE's projects directory for
+            // every CLI it doesn't name, so an opencode orchestrator resume
+            // used to fail here — "not found in the opencode session history"
+            // after looking somewhere else entirely — and no opencode group
+            // could be reopened at all.
+            let db = reg.opencode_db_path(&record.group_id);
+            match session_cwd_in_store(&cli, session_id, Some(&db)) {
                 Ok(Some(_)) => {}
                 Ok(None) => {
                     return Err(format!(
@@ -42292,6 +43546,7 @@ pub fn resume_recorded_session(
             session_id,
             matched.as_ref().map(|r| r.cwd.as_str()),
             &group.repo,
+            Some(&reg.opencode_db_path(&group.id)), // #722: this group's store
         )?;
         (Some(sid.clone()), Some(cwd), false, String::new())
     };

@@ -59,3 +59,15 @@ test("plain pane names truncate a long title at 34 chars", () => {
     paneName: `copilot · ${"y".repeat(34)}…`,
   });
 });
+
+// #722: this module's own plain-pane arm predates the backend's third session
+// source and named it with a two-CLI ternary that fell through to "copilot"
+// for anything else — the same mislabel class #722's C2 slice fixed in the
+// session badge and the resume command. A third (or fourth) source must read
+// its own name here too, not the ternary's else-branch.
+test("a third CLI's session names itself, not the ternary's else-branch", () => {
+  assert.deepEqual(sessionRestoreRoute({ source: "opencode", title: "scratch" }, undefined), {
+    kind: "plain",
+    paneName: "opencode · scratch",
+  });
+});
