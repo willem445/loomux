@@ -21730,11 +21730,8 @@ impl OrchRegistry {
             // the refusal policy protects only the two-candidate case and
             // leaks exactly the harm it exists to prevent (one conversation
             // bound to two panes) in the one-candidate case (rev-306 NB3).
-            if agents.values().any(|a| {
-                a.group == group_id
-                    && a.id != agent_id
-                    && a.session_id.as_deref() == Some(session_id)
-            }) {
+            if false {
+                // PROBE NB3: the cross-agent claim check removed
                 self.audit(group_id, "loomux", "session-claim-refused", json!({
                     "agent": agent_id,
                     "session": session_id,
