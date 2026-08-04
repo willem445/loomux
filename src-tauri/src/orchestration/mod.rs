@@ -14894,44 +14894,65 @@ pub fn box_reading(stripped_tail: Option<&str>, pasted: &str) -> BoxReading {
     if box_holds_paste(tail, pasted) {
         return BoxReading::Holds;
     }
-    // #821: the same normalization `box_holds_paste` just compared through, on
-    // both sides — a length test measuring a different string than the
-    // containment it backstops is how the gutter defect slipped past the one
-    // guard that could have caught it.
-    let norm_pasted = normalize_deframed(pasted);
     // An empty paste is `NotHolding`, matching `box_holds_paste`'s own
     // "nothing to still be holding" — the answer is false for a reason that
-    // is about the paste, not about how much tail we could see.
-    if norm_pasted.is_empty() {
+    // is about the paste, not about how much tail we could see. Both routes
+    // must agree it is empty: a paste that is ONLY framing (`* * *`) de-frames
+    // to nothing while still being text under the flat route.
+    if normalize_deframed(pasted).is_empty() && normalize_prompt_text(pasted).is_empty() {
         return BoxReading::NotHolding;
     }
-    let norm_tail = normalize_deframed(tail);
-    if norm_tail.len() < norm_pasted.len() {
-        return BoxReading::Unverifiable;
-    }
-    // #821: **a PARTIAL match is not an absence.**
+    // **Every arm below is asked of BOTH routes** (#821, rev-307). Once
+    // `box_holds_paste` became a disjunction, an arm that consults one
+    // normalization is asking about one of the two comparisons that could have
+    // found our text — and answering for both. That asymmetry is this file's
+    // recurring defect, now in its third instance:
     //
-    // Until here, the only thing between a failed containment and a confident
-    // negative was the length test above — and per-row decoration ADDS
-    // characters, so a tail whose gutters defeated the containment is always
-    // LONGER than the paste it failed to contain. The one safety net was
-    // bypassed by the very thing that caused the miss, and the reading came
-    // out `NotHolding`: not an absence of evidence, but counterfeit evidence
-    // of an absence, which is the single input `stranded_marker_action`'s
-    // retirement licence does not defend against.
+    // - the LENGTH arm. De-framing shrinks a frame-heavy needle (a markdown
+    //   table row) more than it shrinks an un-gutted tail, so the de-framed
+    //   test can decline to fire exactly where the flat one would have. On a
+    //   truncated read that lands on `NotHolding` where the pre-#821 code said
+    //   `Unverifiable` — the dangerous direction, on a narrower trigger than
+    //   the containment defect but the same kind.
+    // - the PROBE arm, found by the rev-307 sweep rather than reported. The
+    //   probe carries whatever frame characters are MID-line in our own text,
+    //   and a wrap that pushed one to a row start removes it from the de-framed
+    //   tail — so a de-framed probe can miss where a flat probe matches. It
+    //   only bites once both containments have failed, which a truncated read
+    //   supplies.
     //
-    // De-framing above fixes the decoration we know about. This covers the
-    // decoration we do not — a trailing gutter, the scrollbar's own `┃` on the
-    // right edge, a re-indent, whatever the next TUI release paints — WITHOUT
-    // having to model any of it: if our paste's opening is still sitting in the
-    // window but the whole of it will not match, the text is evidently there
-    // and the rendering is what we failed to read. That is exactly
-    // `Unverifiable` ("we looked and could not tell"), and it is the reading
-    // #819 already treats as no evidence at all.
-    //
-    if let Some(probe) = paste_echo_probe(pasted) {
-        if box_tail_window(&norm_tail, norm_pasted.len()).contains(&probe) {
+    // Asking each arm per route and OR-ing makes the property structural
+    // instead of a claim to re-verify every time this function grows an arm:
+    // any route that could have found the text gets to say "I could not tell".
+    // `Unverifiable` is the safe answer here, so a union is the safe shape.
+    for norm in [normalize_deframed as fn(&str) -> String, normalize_prompt_text] {
+        let norm_pasted = norm(pasted);
+        if norm_pasted.is_empty() {
+            continue; // this route has nothing to look for; the other may.
+        }
+        let norm_tail = norm(tail);
+        if norm_tail.len() < norm_pasted.len() {
             return BoxReading::Unverifiable;
+        }
+        // **A PARTIAL match is not an absence.** The length test above only
+        // catches a tail too SHORT to have held our paste; per-row decoration
+        // ADDS characters, so the tail that defeated containment is typically
+        // LONGER than the paste it failed to contain and sails past it. What
+        // is left would be `NotHolding`: not an absence of evidence, but
+        // counterfeit evidence of an absence, which is the single input
+        // `stranded_marker_action`'s retirement licence does not defend
+        // against.
+        //
+        // So: if our paste's own line is still sitting in the window while the
+        // whole of it will not match, the text is evidently there and the
+        // rendering is what we failed to read. That covers decoration nobody
+        // has catalogued — a trailing gutter, the scrollbar's `┃` on the right
+        // edge, a re-indent, whatever the next TUI release paints — without
+        // modelling any of it.
+        if let Some(probe) = paste_echo_probe(pasted, norm) {
+            if box_tail_window(&norm_tail, norm_pasted.len()).contains(&probe) {
+                return BoxReading::Unverifiable;
+            }
         }
     }
     BoxReading::NotHolding
@@ -14994,13 +15015,19 @@ pub fn box_reading(stripped_tail: Option<&str>, pasted: &str) -> BoxReading {
 ///
 /// The guarantee lives in [`box_holds_paste`] instead, where it is structural:
 /// the de-framed route is a SUPERSET of the flat one, so #821 can only add
-/// `Holds` readings. This probe's job is narrower and unchanged — turning a
-/// residual containment failure into `Unverifiable` rather than a confident
-/// absence.
-fn paste_echo_probe(pasted: &str) -> Option<String> {
+/// `Holds` readings. This probe's job is narrower — turning a residual
+/// containment failure into `Unverifiable` rather than a confident absence.
+///
+/// **`norm` is a parameter for the same reason (rev-307 sweep).** A probe built
+/// under one normalization and searched in a tail under that same one is a
+/// probe for ONE of [`box_holds_paste`]'s two routes; run alone it answers for
+/// both, and can therefore miss where the other route's probe would have hit.
+/// [`box_reading`] runs it once per route and takes the union, so no route's
+/// evidence is silently spent on the other's behalf.
+fn paste_echo_probe(pasted: &str, norm: fn(&str) -> String) -> Option<String> {
     pasted
         .lines()
-        .map(normalize_deframed)
+        .map(norm)
         .max_by_key(|l| l.chars().count())
         .filter(|l| l.chars().count() >= PASTE_ECHO_PROBE_MIN_CHARS)
         .map(|l| l.chars().take(PASTE_ECHO_PROBE_CHARS).collect())
@@ -15108,6 +15135,14 @@ impl Tier1ScanCensus {
     /// was decisive, and a histogram of this measures short reads only. Said
     /// plainly rather than left for a reader to discover, because "negative is
     /// exactly the arm" was true when written and quietly stopped being so.
+    ///
+    /// **And since the rev-307 sweep there are two LENGTH arms, of which this
+    /// measures one.** `box_reading` runs its length test once per
+    /// normalization and takes the union, so a read can be `Unverifiable` on
+    /// the flat route's arithmetic while this de-framed margin is comfortably
+    /// positive. The implication (negative margin ⇒ `Unverifiable`) still
+    /// holds — a union only ever adds — but the converse is now false twice
+    /// over rather than once.
     pub fn margin_chars(&self) -> Option<i64> {
         self.tail_chars.map(|chars| chars as i64 - self.paste_chars as i64)
     }
