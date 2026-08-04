@@ -2539,6 +2539,32 @@ pub const TIER1_SCAN_WIDEN_ROUNDS: u32 = 3;
 /// framing/prompt-symbol/cursor characters immediately around our text
 /// without widening the window enough to reach unrelated older output.
 const BOX_TAIL_WINDOW_SLACK: usize = 200;
+/// How much of one paste LINE [`paste_echo_probe`] samples for
+/// [`box_reading`]'s "a partial match is not an absence" arm (#821).
+///
+/// Bounded above by what a single rendered row can hold: the probe's whole
+/// value is that it survives per-row decoration, which it only does while it
+/// stays inside one row. 48 characters is comfortably inside the narrowest pane
+/// anyone runs while being far past coincidence for prose.
+///
+/// **The cost of firing too readily is real, and it is not the safe
+/// direction.** `Unverifiable` falls through to `stranded_marker_action`'s
+/// ordinary gates, so a probe that fires on everything erodes #813/#819's
+/// repair back toward the deadlock it exists to break — a conditional deadlock
+/// traded for a more frequent one. Too strict, and a decorated tail keeps
+/// reading as a confident absence, which is the collision #819's licence exists
+/// to prevent. The second is the expensive one, which is why the floor below
+/// sits where it does rather than higher.
+const PASTE_ECHO_PROBE_CHARS: usize = 48;
+/// The evidence floor under [`paste_echo_probe`]: a line shorter than this
+/// yields no probe at all (#821).
+///
+/// Same figure and same argument as `R_TOP_MIN_ANCHOR_CHARS` and
+/// `SELF_ECHO_MIN_POINTER_CHARS` — short fragments are not evidence, and a
+/// probe built from one would fire on coincidence, which here means declining
+/// to retire a marker that should have retired. A paste with no line this long
+/// simply keeps the pre-#821 reading.
+const PASTE_ECHO_PROBE_MIN_CHARS: usize = 24;
 /// How long the extended post-window monitor polls before each check —
 /// cheap (a tail read + a marker-file read), so this can be fairly tight
 /// without real cost.
@@ -12925,6 +12951,64 @@ fn normalize_prompt_text(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// [`normalize_prompt_text`], with each LINE [`deframe`]d first — the form the
+/// Tier 1 box comparison runs in (#821).
+///
+/// **The defect.** Flattening a rendered tail whole puts the CLI's per-row
+/// decoration *inside* the haystack, interleaved through whatever it decorated.
+/// Copilot's framed composer draws `┃ ` down **every** row it wrapped a paste
+/// onto, so `normalize_prompt_text` of that tail is `"┃ line one ┃ line two"`
+/// while the paste it is compared against is `"line one line two"`. Containment
+/// fails on text that is plainly still in the box.
+///
+/// **Applied to BOTH sides, and that is load bearing rather than tidy.** The
+/// tempting version de-frames only the tail, on the reasoning that our own
+/// paste carries no decoration. It is wrong, and wrong in the dangerous
+/// direction: [`is_frame_char`] counts `*`, `•`, `●`, `◆` and `|` as framing,
+/// so a brief containing an ordinary **markdown bullet list or table** would
+/// have its `*`/`|` stripped out of the tail and kept in the needle. Every such
+/// paste — and orchestrator briefs are full of them — would fail containment,
+/// land past the length guard (the tail being longer, exactly as in the gutter
+/// case), and read as a confident `NotHolding`. That is the very failure this
+/// change exists to remove, re-introduced by the change itself. De-framing both
+/// sides cancels it: the two lose the same characters, so containment is
+/// unaffected and only specificity is spent.
+///
+/// The read-SIZING sites (`tier1_scan_bytes`, `Tier1Scan::for_paste`)
+/// deliberately keep `normalize_prompt_text`: they size a request rather than
+/// compare, so measuring the needle un-de-framed only ever asks for MORE tail
+/// than the comparison needs, which is the conservative direction and preserves
+/// #559's "no read is ever narrower than it was".
+///
+/// **Why `deframe` and not #820's full reconstruction.** `mask_own_paste`
+/// stitches a wrapped line back together with [`reconstructs_to_end`], which is
+/// strictly more precise — it verifies row STRUCTURE, not just the character
+/// sequence — and strictly more brittle: any decoration it cannot account for
+/// (a trailing gutter, the scrollbar's own `┃` on the right edge, a re-indent)
+/// ends the run. There, brittleness was free: a failed reconstruction
+/// under-masks, and an under-mask only costs a hold. **Here it is not.** This
+/// feeds [`BoxReading`], where the expensive error is a confident `NotHolding`,
+/// so the recogniser wants to be permissive about `Holds` and the residual
+/// imprecision is handled by refusing to call a partial match an absence (see
+/// [`box_reading`]). Same shared notion of what decoration is — one
+/// [`deframe`], not a second copy of the rule — but a different instrument
+/// built on it, because the failure direction is inverted.
+fn normalize_deframed(s: &str) -> String {
+    s.lines().flat_map(|l| deframe(l).split_whitespace()).collect::<Vec<_>>().join(" ")
+}
+
+/// The slice of a normalized tail that a needle of `needle_len` is looked for
+/// within — the last `needle_len + BOX_TAIL_WINDOW_SLACK` characters.
+///
+/// One definition, because [`box_holds_paste`] and [`box_reading`]'s partial
+/// probe must search the *same* window: a probe that ranged wider than the
+/// containment it is qualifying could call a match partial on evidence the
+/// containment was never allowed to see.
+fn box_tail_window(norm_tail: &str, needle_len: usize) -> &str {
+    let start = norm_tail.len().saturating_sub(needle_len + BOX_TAIL_WINDOW_SLACK);
+    norm_tail.get(start..).unwrap_or(norm_tail)
+}
+
 /// The three tiers a delivery's `promptsubmit` hook records can resolve to
 /// against the text it pasted, in ascending strength:
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -14456,15 +14540,16 @@ pub fn stranded_detail(name: &str, blocker: Option<StrandedBlocker>) -> String {
 /// (`true` => still pending/vetoable, `false` => consumed/accepted).
 #[doc(hidden)] // pub for integration tests
 pub fn box_holds_paste(stripped_tail: &str, pasted: &str) -> bool {
-    let norm_pasted = normalize_prompt_text(pasted);
+    // #821: BOTH sides de-framed per line. See `normalize_deframed` for why
+    // de-framing only the tail would be worse than the bug — a markdown bullet
+    // in a brief would then read as a confident absence — and why this shares
+    // one `deframe` rather than minting a second notion of decoration.
+    let norm_pasted = normalize_deframed(pasted);
     if norm_pasted.is_empty() {
         return false; // nothing to still be holding
     }
-    let norm_tail = normalize_prompt_text(stripped_tail);
-    let window = norm_pasted.len() + BOX_TAIL_WINDOW_SLACK;
-    let start = norm_tail.len().saturating_sub(window);
-    let recent = norm_tail.get(start..).unwrap_or(&norm_tail);
-    recent.contains(&norm_pasted)
+    let norm_tail = normalize_deframed(stripped_tail);
+    box_tail_window(&norm_tail, norm_pasted.len()).contains(&norm_pasted)
 }
 
 /// How many raw tail bytes Tier 1 must ask for to have any chance of finding
@@ -14667,7 +14752,12 @@ impl Tier1Scan {
         loop {
             let raw = read(requested)?;
             let stripped = strip_ansi(&raw);
-            let chars = normalize_prompt_text(&stripped).len();
+            // #821: measured through the SAME normalization the containment
+            // runs on. Counting the un-de-framed length credits the read with
+            // the CLI's own gutters — characters `box_holds_paste` will never
+            // search — so the widening would stop early believing it had
+            // covered a window it had not.
+            let chars = normalize_deframed(&stripped).len();
             let wider = (rounds < TIER1_SCAN_WIDEN_ROUNDS)
                 .then(|| self.widen(requested, raw.len(), chars))
                 .flatten();
@@ -14759,14 +14849,79 @@ pub fn box_reading(stripped_tail: Option<&str>, pasted: &str) -> BoxReading {
     if box_holds_paste(tail, pasted) {
         return BoxReading::Holds;
     }
-    let norm_pasted = normalize_prompt_text(pasted);
+    // #821: the same normalization `box_holds_paste` just compared through, on
+    // both sides — a length test measuring a different string than the
+    // containment it backstops is how the gutter defect slipped past the one
+    // guard that could have caught it.
+    let norm_pasted = normalize_deframed(pasted);
     // An empty paste is `NotHolding`, matching `box_holds_paste`'s own
     // "nothing to still be holding" — the answer is false for a reason that
     // is about the paste, not about how much tail we could see.
-    if !norm_pasted.is_empty() && normalize_prompt_text(tail).len() < norm_pasted.len() {
+    if norm_pasted.is_empty() {
+        return BoxReading::NotHolding;
+    }
+    let norm_tail = normalize_deframed(tail);
+    if norm_tail.len() < norm_pasted.len() {
         return BoxReading::Unverifiable;
     }
+    // #821: **a PARTIAL match is not an absence.**
+    //
+    // Until here, the only thing between a failed containment and a confident
+    // negative was the length test above — and per-row decoration ADDS
+    // characters, so a tail whose gutters defeated the containment is always
+    // LONGER than the paste it failed to contain. The one safety net was
+    // bypassed by the very thing that caused the miss, and the reading came
+    // out `NotHolding`: not an absence of evidence, but counterfeit evidence
+    // of an absence, which is the single input `stranded_marker_action`'s
+    // retirement licence does not defend against.
+    //
+    // De-framing above fixes the decoration we know about. This covers the
+    // decoration we do not — a trailing gutter, the scrollbar's own `┃` on the
+    // right edge, a re-indent, whatever the next TUI release paints — WITHOUT
+    // having to model any of it: if our paste's opening is still sitting in the
+    // window but the whole of it will not match, the text is evidently there
+    // and the rendering is what we failed to read. That is exactly
+    // `Unverifiable` ("we looked and could not tell"), and it is the reading
+    // #819 already treats as no evidence at all.
+    //
+    if let Some(probe) = paste_echo_probe(pasted) {
+        if box_tail_window(&norm_tail, norm_pasted.len()).contains(&probe) {
+            return BoxReading::Unverifiable;
+        }
+    }
     BoxReading::NotHolding
+}
+
+/// The strongest fragment of `pasted` that a single rendered ROW can be
+/// expected to hold intact — [`box_reading`]'s partial-match probe — or `None`
+/// where no line is long enough to be evidence of anything (#821).
+///
+/// **Why a line and not the flattened paste.** The obvious probe is "the first
+/// N characters of the needle", and it is wrong for exactly the reason the
+/// needle itself failed: as soon as N runs past the first line, the probe spans
+/// a row boundary and any per-row decoration breaks it too. A probe that dies
+/// to the same thing it is meant to detect is not a backstop. Taking it from
+/// ONE line keeps it inside one rendered row, where the only decoration is
+/// leading and [`deframe`] has already removed it.
+///
+/// The LONGEST line, because that is the strongest evidence available: the more
+/// of our own prose a fragment carries, the less it can be something the CLI
+/// happened to paint. Truncated to [`PASTE_ECHO_PROBE_CHARS`] so a long line
+/// that WRAPS still probes only its first row, and floored at
+/// [`PASTE_ECHO_PROBE_MIN_CHARS`] so a paste of short lines yields no probe at
+/// all rather than a coincidence-prone one — that paste keeps the pre-#821
+/// behaviour, which is the honest outcome when there is no evidence to be had.
+///
+/// **Residual:** a pane narrower than the probe wraps it across rows, so it
+/// breaks and the reading falls through to `NotHolding`. That is the same
+/// direction #821 exists to fix, narrowed to panes under ~48 columns.
+fn paste_echo_probe(pasted: &str) -> Option<String> {
+    pasted
+        .lines()
+        .map(normalize_deframed)
+        .max_by_key(|l| l.chars().count())
+        .filter(|l| l.chars().count() >= PASTE_ECHO_PROBE_MIN_CHARS)
+        .map(|l| l.chars().take(PASTE_ECHO_PROBE_CHARS).collect())
 }
 
 /// One Tier 1 box read, MEASURED (#583) — the numbers the `BoxReading` beside
@@ -14830,13 +14985,21 @@ impl Tier1ScanCensus {
             // part of the shrink (a TUI pads every box row out to the terminal
             // width), and a census that measured only the ANSI half would
             // under-report the loss that actually decides the reading.
-            tail_chars: read.map(|(_, stripped)| normalize_prompt_text(stripped).len()),
+            //
+            // #821: "the same normalization" is now `normalize_deframed`,
+            // and this line moves with it rather than being left behind. The
+            // claim `margin_chars` makes below — that a histogram of it IS
+            // `box_reading`'s `Unverifiable` arm rather than a proxy for it —
+            // is only true while both measure the identical string, and
+            // per-row gutters are precisely a shrink this census exists to
+            // report.
+            tail_chars: read.map(|(_, stripped)| normalize_deframed(stripped).len()),
             paste_chars: normalize_prompt_text(pasted).len(),
         }
     }
 
     /// Characters of headroom the read had over the text it was looking for.
-    /// **Negative is exactly the `Unverifiable` arm** for every paste
+    /// **Negative is exactly the LENGTH `Unverifiable` arm** for every paste
     /// `deliver_prompt` can actually make (a non-empty one): `box_reading`
     /// compares the same two normalized lengths, so a histogram of this over a
     /// live group IS the distribution #583 asks for rather than a proxy for
@@ -14844,6 +15007,14 @@ impl Tier1ScanCensus {
     /// that arm, so the equivalence holds there vacuously rather than by
     /// exception. `None` is the one `Unverifiable` this cannot speak for — no
     /// read happened, so there is no margin, which is itself the reading.
+    ///
+    /// **#821 added a SECOND `Unverifiable` arm this cannot see.** A read with
+    /// ample margin can still be unreadable — the partial-match arm fires on a
+    /// tail that is *longer* than the paste, which is the whole shape of the
+    /// gutter defect. So a non-negative margin no longer implies the reading
+    /// was decisive, and a histogram of this measures short reads only. Said
+    /// plainly rather than left for a reader to discover, because "negative is
+    /// exactly the arm" was true when written and quietly stopped being so.
     pub fn margin_chars(&self) -> Option<i64> {
         self.tail_chars.map(|chars| chars as i64 - self.paste_chars as i64)
     }
