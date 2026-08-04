@@ -407,7 +407,9 @@ pub fn identify_session_on(
         if baseline.contains(&id) || claimed.contains(&id) {
             continue;
         }
-        if crate::sessions::norm_path(&dir) != want {
+        // PROBE R11: raw string equality instead of the shared normalizer
+        let _ = &want;
+        if dir != directory {
             continue;
         }
         hits.push(id);
