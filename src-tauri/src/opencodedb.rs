@@ -337,9 +337,11 @@ pub enum Identified {
 /// - **absent from `baseline`** — it appeared after this pane was spawned.
 /// - **absent from `claimed`** — no other pane in this group has taken it.
 ///
-/// Ordered by `time_created DESC`, never by id: ids may be minted `descending`
-/// (a bitwise-inverted timestamp prefix, `SOURCE`, `id.ts`), so the id string
-/// does not order by age.
+/// **The result does not depend on the order rows come back in**, which is why
+/// there is no `ORDER BY` here: with more than one candidate this refuses, so
+/// no ordering could ever break a tie, and a newest-first sort would be a rule
+/// nothing reads — the kind that looks load-bearing to the next person and
+/// quietly justifies a wrong pick if the refusal is ever softened.
 ///
 /// **Two or more candidates refuse rather than pick**, which is where this
 /// departs from `newest_new_copilot_session`'s newest-wins. The difference is
@@ -354,9 +356,23 @@ pub enum Identified {
 /// spend as another's and resumes a human into a conversation that is not the
 /// one they asked for.
 ///
-/// Refusal is also self-healing rather than terminal: the caller keeps polling,
-/// and the moment the *other* pane's watcher claims its session, the count
-/// falls to one and this pane identifies normally.
+/// Refusal is usually self-healing rather than terminal: the caller keeps
+/// polling, and the moment the *other* pane's watcher claims its session, the
+/// count falls to one and this pane identifies normally. Panes in one group
+/// are spawned one at a time, seconds apart, so the ordinary case is that the
+/// earlier pane's session is already in the later pane's baseline and no
+/// contest arises at all.
+///
+/// **The residual, stated rather than assumed away:** if two panes in the SAME
+/// directory are spawned close enough together that neither's session had
+/// appeared when the other's baseline was taken, both see two candidates and
+/// both refuse — nothing breaks the tie, and neither identifies. That is the
+/// deliberate cost of the policy: both panes stay at the status quo an
+/// opencode pane is in today (no usage attribution, no resume), and the
+/// watcher's timeout audits *contested* rather than a silent nothing, so the
+/// state is diagnosable instead of mysterious. The alternative — picking one —
+/// buys identification for one pane by giving the other pane's conversation
+/// away, undetectably.
 pub fn identify_session(
     db: &Path,
     directory: &str,
@@ -380,10 +396,7 @@ pub fn identify_session_on(
         return Ok(Identified::None);
     }
     let mut stmt = conn
-        .prepare(
-            "SELECT id, directory FROM session \
-             WHERE parent_id IS NULL ORDER BY time_created DESC",
-        )
+        .prepare("SELECT id, directory FROM session WHERE parent_id IS NULL")
         .map_err(drift)?;
     let rows = stmt
         .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))

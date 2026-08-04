@@ -21538,7 +21538,10 @@ impl OrchRegistry {
             // watch times out is the one still true at the deadline. A store
             // that was briefly unreadable and then fine, or a contest that
             // resolved, must not be what the audit line blames.
-            let mut last = SessionSearch::Waiting;
+            // Declared without an initial value on purpose: every path that
+            // reaches the timeout check below has already assigned one this
+            // tick, so a placeholder here could only ever be dead.
+            let mut last;
             loop {
                 std::thread::sleep(baseline.poll());
                 // Stop if the pane died or was already associated (a resume
@@ -32492,7 +32495,7 @@ impl OrchRegistry {
         // now, before this pane's CLI starts — the watcher then identifies the
         // newly appeared one.
         let session_baseline =
-            (!resume).then(|| self.capture_session_baseline(cli, group_id)).flatten();
+            (!resume).then(|| self.capture_session_baseline(&cli, group_id)).flatten();
 
         let branch_name = branch
             .map(|b| b.trim().to_string())

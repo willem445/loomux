@@ -28713,6 +28713,7 @@ fn no_registry_construction_bypasses_the_test_agent_dir_overrides() {
         ("lessonsfile.rs", 1),   // test_registry
         ("prompts.rs", 1),       // test_registry
         ("opencodeusage.rs", 1), // test_registry
+        ("opencodesessions.rs", 1), // test_registry
     ];
     let mut files = Vec::new();
     collect_rs_files(tests_dir, &mut files);
