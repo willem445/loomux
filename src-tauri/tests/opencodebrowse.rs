@@ -231,10 +231,32 @@ fn xdg_data_home_relocates_the_store() {
 #[test]
 fn the_opencode_db_variable_wins_exactly_as_the_vendor_resolves_it() {
     let home = PathBuf::from("C:/Users/Someone");
+    // A ROOTED value is taken as given on every platform — which is the case
+    // `Path::is_absolute` alone gets wrong on Windows (it wants a prefix too,
+    // while Node's `isAbsolute`, the predicate opencode itself applies, does
+    // not). Deliberately one literal rather than a `cfg`-per-platform pair:
+    // this is the assertion that the two agree.
+    assert_eq!(
+        opencode_store_from(Some("/elsewhere/mine.db"), None, Some(&home)),
+        Some(PathBuf::from("/elsewhere/mine.db")),
+        "a rooted OPENCODE_DB is used verbatim, on every platform"
+    );
+    // The drive-qualified form is absolute only where drive letters mean
+    // something. On unix it is an ordinary relative NAME, and opencode's own
+    // `isAbsolute` says the same there — so joining it under the data
+    // directory is fidelity, not a bug, and is asserted rather than skipped.
+    #[cfg(windows)]
     assert_eq!(
         opencode_store_from(Some("D:/elsewhere/mine.db"), None, Some(&home)),
         Some(PathBuf::from("D:/elsewhere/mine.db")),
-        "an absolute OPENCODE_DB is used verbatim"
+        "a drive-qualified OPENCODE_DB is used verbatim on Windows"
+    );
+    #[cfg(not(windows))]
+    assert_eq!(
+        opencode_store_from(Some("D:/elsewhere/mine.db"), None, Some(&home)),
+        Some(home.join(".local").join("share").join("opencode").join("D:/elsewhere/mine.db")),
+        "off Windows a drive letter is not a root — the vendor resolves this under the data \
+         directory too, and loomux must agree with it rather than with the string's looks"
     );
     assert_eq!(
         opencode_store_from(Some("mine.db"), None, Some(&home)),

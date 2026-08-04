@@ -413,7 +413,19 @@ pub fn opencode_store_from(
         .map(|d| d.join("opencode"))
     };
     match db_flag.map(str::trim).filter(|f| !f.is_empty()) {
-        Some(f) if f == ":memory:" || Path::new(f).is_absolute() => Some(PathBuf::from(f)),
+        // `is_absolute() || has_root()`, not `is_absolute()` alone, because
+        // the vendor's test is Node's `path.isAbsolute` — which on Windows
+        // calls a ROOTED path absolute (`\opencode.db`, drive-relative but
+        // rooted) as well as a fully-qualified one. Rust's `is_absolute`
+        // requires both a prefix and a root, so it alone would resolve such a
+        // value UNDER the data directory while opencode used it as given, and
+        // loomux would list a store the human's own CLI never writes to.
+        // `has_root` adds exactly that case and nothing else (`C:opencode.db`,
+        // which Node also calls relative, stays relative). On unix the two are
+        // the same predicate, so this changes nothing there.
+        Some(f) if f == ":memory:" || Path::new(f).is_absolute() || Path::new(f).has_root() => {
+            Some(PathBuf::from(f))
+        }
         Some(f) => Some(data()?.join(f)),
         None => Some(data()?.join("opencode.db")),
     }
