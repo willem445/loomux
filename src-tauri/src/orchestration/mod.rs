@@ -8533,8 +8533,9 @@ pub struct UsageSnapshot {
     pub name: String,
     pub role: String,
     /// Where the figures came from: `transcript` (token-derived, exact tokens),
-    /// `statusline` (last-resort parse of the CLI's own dollar figure), or
-    /// `none` (nothing available yet).
+    /// `session-db` (opencode's own `session` row — exact tokens AND its own
+    /// dollar figure, #722), `statusline` (last-resort parse of the CLI's own
+    /// dollar figure), or `none` (nothing available yet).
     pub source: String,
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -9517,6 +9518,20 @@ pub struct OrchRegistry {
     /// `start_max_notice_flusher` loop delivers one coalesced notice per burst
     /// once the group falls quiet.
     pending_max_notice: Mutex<HashMap<String, PendingMaxNotice>>,
+    /// Which opencode-store degrade (#722) has already been audited for a
+    /// group, so a persistent one costs one line instead of one per poll.
+    ///
+    /// Keyed by group, holding the KIND (`"open"` / `"unreadable"`), never the
+    /// message: a message could in principle vary between reads, and a latch
+    /// that re-fires on a changed string is not a latch. Same episode shape as
+    /// [`HoldEpisode::announced`] — the entry is dropped the moment a read
+    /// succeeds, so a condition that recurs after a genuine recovery is
+    /// diagnosed again rather than silenced for the life of the process.
+    ///
+    /// `Unavailable::Absent` is deliberately never recorded here and never
+    /// audited: a group whose opencode panes have not booted has no store yet,
+    /// which is the ordinary state, not an incident.
+    opencode_db_degraded: Mutex<HashMap<String, &'static str>>,
     /// Test-only override of the Claude transcript root (`~/.claude/projects`).
     /// `None` in production. Set via `set_claude_projects_dir` so the usage
     /// reader can be pointed at a fixture tree without touching global env —
@@ -19675,6 +19690,7 @@ impl OrchRegistry {
             idle_tick_times: Mutex::new(HashMap::new()),
             compact_nudge_times: Mutex::new(HashMap::new()),
             pending_max_notice: Mutex::new(HashMap::new()),
+            opencode_db_degraded: Mutex::new(HashMap::new()),
             claude_projects_dir: Mutex::new(None),
             claude_agents_dir_override: Mutex::new(None),
             copilot_agents_dir_override: Mutex::new(None),
@@ -20032,6 +20048,18 @@ impl OrchRegistry {
 
     fn group_dir(&self, group: &str) -> PathBuf {
         self.root.join(group)
+    }
+
+    /// This group's OpenCode session store — the file `OPENCODE_DB` points
+    /// every opencode pane in the group at (#722).
+    ///
+    /// One function rather than two `join`s at the two call sites, because the
+    /// spawn that CREATES this path and the usage read that CONSUMES it
+    /// disagreeing would not fail loudly: the reader would simply find no
+    /// database and report an agent as having spent nothing.
+    #[doc(hidden)] // pub for integration tests
+    pub fn opencode_db_path(&self, group: &str) -> PathBuf {
+        self.group_dir(group).join(OPENCODE_DB_SUBDIR).join(OPENCODE_DB_FILE)
     }
 
     /// Scratch dir holding images pasted/attached into the steering strip (#72).
@@ -28115,11 +28143,16 @@ impl OrchRegistry {
     }
 
     /// Compute an agent's current usage from the best available source, in
-    /// preference order: the CLI's own session transcript (token records —
-    /// exact, and readable even after the pane is gone) → a last-resort parse
-    /// of the dollar figure the CLI prints in its statusline. Returns a
-    /// snapshot keyed for durable accumulation (issue #42).
-    fn compute_usage_snapshot(&self, entry: &AgentEntry, cli: &str) -> UsageSnapshot {
+    /// preference order: the CLI's own session record (token counts — exact,
+    /// and readable even after the pane is gone) → a last-resort parse of the
+    /// dollar figure the CLI prints in its statusline. Returns a snapshot
+    /// keyed for durable accumulation (issue #42).
+    ///
+    /// `#[doc(hidden)] pub` for the integration tests: this is the function
+    /// that decides which source an agent's usage comes from, and pinning that
+    /// choice per CLI is only meaningful against the real one.
+    #[doc(hidden)] // pub for integration tests
+    pub fn compute_usage_snapshot(&self, entry: &AgentEntry, cli: &str) -> UsageSnapshot {
         let key = entry
             .session_id
             .clone()
@@ -28171,6 +28204,46 @@ impl OrchRegistry {
             }
         }
 
+        // OpenCode writes no transcript file: its `session` row already holds
+        // the dollar cost it computed itself plus five token counters, in the
+        // group's own SQLite store (#722). So the dollars here are REPORTED,
+        // not estimated — `estimated: false` is what keeps `group_usage` from
+        // blending them into a total labelled as a price-table guess.
+        //
+        // A degrade (no store, unopenable, schema drift) never fails the
+        // snapshot — it falls through to the statusline, and to a zero-usage
+        // agent if that finds nothing either, which is the whole
+        // degraded-not-fatal posture (see `crate::opencodedb`). But it is not
+        // silent either: `note_opencode_db_degrade` writes ONE audit line per
+        // episode, so a drifted schema and a never-booted pane stop looking
+        // identical to whoever is debugging, without this polled path becoming
+        // an audit entry every UI tick (rev-298 F2).
+        if cli == "opencode" {
+            // Until an opencode pane's session is identified, there is no id
+            // to key on and this arm simply does not fire.
+            if let Some(sid) = entry.session_id.as_deref() {
+                let db = self.opencode_db_path(&entry.group);
+                let read = crate::usage::opencode_session_usage(&db, sid);
+                self.note_opencode_db_degrade(&entry.group, &db, read.as_ref().err());
+                if let Ok(Some(u)) = read {
+                    // Same guard as the claude arm: a session row that exists
+                    // but has counted nothing yet must not overwrite history
+                    // with zeros, nor pre-empt the statusline fallback.
+                    if u.tokens.total() > 0 {
+                        snap.source = "session-db".to_string();
+                        snap.input_tokens = u.tokens.input_tokens;
+                        snap.output_tokens = u.tokens.output_tokens;
+                        snap.cache_creation_tokens = u.tokens.cache_creation_tokens;
+                        snap.cache_read_tokens = u.tokens.cache_read_tokens;
+                        snap.cost_usd = u.cost_usd;
+                        snap.estimated = false; // priced by opencode, not by us
+                        snap.model = u.model;
+                        return snap;
+                    }
+                }
+            }
+        }
+
         // Last resort: the dollar figure the CLI renders in its own statusline.
         // Unreliable (empty on subscription/Max accounts; gone once the pane is
         // killed), so it only runs when no transcript usage was found.
@@ -28186,6 +28259,61 @@ impl OrchRegistry {
             }
         }
         snap
+    }
+
+    /// Record — at most once per episode — that a group's opencode store could
+    /// not be read, and why (#722, rev-298 F2).
+    ///
+    /// The problem this solves: `compute_usage_snapshot` treats every
+    /// [`crate::opencodedb::Unavailable`] the same way, because there is
+    /// nothing useful it could do differently. That is right for the SNAPSHOT
+    /// and wrong for the RECORD — a drifted schema and a pane whose CLI never
+    /// booted both surface as "not from the store", so the one condition that
+    /// needs a human looks exactly like the one that needs nobody.
+    ///
+    /// Why a latch and not just an audit call: this runs on `group_usage`,
+    /// which the group view polls every couple of seconds, so an unlatched line
+    /// would be an audit entry every tick for as long as the condition lasted —
+    /// the log flooded worst precisely when something is wrong with it. Keyed
+    /// by KIND rather than message so a varying error string cannot defeat the
+    /// latch, and dropped on the first successful read so a recurrence after a
+    /// real recovery is diagnosed again instead of being silenced for the
+    /// process's life.
+    ///
+    /// `Absent` is passed through without a line on purpose: no store yet is
+    /// the ordinary state of a group whose opencode panes have not booted, and
+    /// auditing it would put a line in every claude-only group that ever spawns
+    /// an opencode pane.
+    fn note_opencode_db_degrade(
+        &self,
+        group: &str,
+        db: &Path,
+        err: Option<&crate::opencodedb::Unavailable>,
+    ) {
+        use crate::opencodedb::Unavailable;
+        let kind = match err {
+            Some(Unavailable::Open(_)) => "open",
+            Some(Unavailable::Query(_)) => "unreadable",
+            // A successful read, or a store that simply is not there yet:
+            // either way this group has no live degrade episode.
+            Some(Unavailable::Absent) | None => {
+                self.opencode_db_degraded.lock_safe().remove(group);
+                return;
+            }
+        };
+        let mut seen = self.opencode_db_degraded.lock_safe();
+        if seen.get(group) == Some(&kind) {
+            return; // already diagnosed this episode
+        }
+        seen.insert(group.to_string(), kind);
+        // Dropped before auditing: `audit` takes its own locks, and holding an
+        // unrelated one across it is how lock-order bugs start.
+        drop(seen);
+        self.audit(group, "loomux", "opencode-usage-degraded", json!({
+            "kind": kind,
+            "detail": err.map(ToString::to_string).unwrap_or_default(),
+            "db": db.to_string_lossy(),
+        }));
     }
 
     fn load_usage_snapshots(&self, group: &str) -> Vec<UsageSnapshot> {
@@ -28371,7 +28499,7 @@ impl OrchRegistry {
             "live_tokens": live_tokens,
             "lifetime_tokens": lifetime_tokens,
             "agents": rows,
-            "note": "Tokens come from each agent's session transcript and are exact; dollar figures are estimated from a dated model price table. Subscription/Max accounts have no marginal dollar cost (the CLI statusline shows $0.00), so tokens are the reliable metric. Killed/recycled agents stay in the lifetime total; statusline-parsed dollars are a last-resort fallback.",
+            "note": "Tokens come from each agent's own session record — a transcript, or opencode's session row — and are exact; dollar figures are estimated from a dated model price table EXCEPT where the CLI priced them itself (opencode does), which the per-total basis labels. Subscription/Max accounts have no marginal dollar cost (the CLI statusline shows $0.00), so tokens are the reliable metric. Killed/recycled agents stay in the lifetime total; statusline-parsed dollars are a last-resort fallback.",
         })
     }
 
@@ -30312,10 +30440,10 @@ impl OrchRegistry {
             // SQLite creates the database file but not its parent directory,
             // and a pane whose store cannot be opened does not boot — so this
             // is an error, not a best-effort mkdir.
-            let db_dir = self.group_dir(group).join(OPENCODE_DB_SUBDIR);
+            let db = self.opencode_db_path(group);
+            let db_dir = db.parent().expect("opencode_db_path always has a parent").to_path_buf();
             fs::create_dir_all(&db_dir).map_err(|e| e.to_string())?;
-            let env =
-                opencode_pane_env(&cfg, containment, unattended, &db_dir.join(OPENCODE_DB_FILE));
+            let env = opencode_pane_env(&cfg, containment, unattended, &db);
             return Ok(AgentCliConfig { path, env });
         }
         let mut server = json!({

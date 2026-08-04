@@ -351,7 +351,7 @@ never tell two agents apart, and this is the seam that replaces it. SQLite
 creates the database file but not its parent directory, so loomux creates it
 and treats a failure as a spawn error rather than a best-effort mkdir.
 
-The reader itself is not in this slice; this is the seam it lands on.
+The reader lands on this seam — see *Usage and cost readback*, below.
 
 ## Knobs (#687)
 
@@ -414,6 +414,81 @@ until a probe resolved would read as loomux having forgotten it — the same rul
 the disabled-with-a-reason knobs follow. The orchestrator-mode CLI id IS the
 program name probed, which `test/orchclis.test.ts` pins against the launchable
 agent catalog.
+
+## Usage and cost readback (#722 slice B)
+
+Every other CLI loomux reads usage from writes a transcript file. OpenCode
+writes a database, and the `session` row for a pane already carries the dollar
+cost it computed itself plus **five** token counters (`SOURCE` + `LOCAL-OBSERVED`,
+the DDL is quoted in `src-tauri/src/opencodedb.rs`). So the reader is one row,
+not a fold over message records, and OpenCode gets **no `price_for` entry** —
+loomux would be second-guessing a number the vendor already computed against
+its own provider table.
+
+That is why an opencode agent's dollars come back `estimated: false` and land
+in `group_usage`'s **reported** basis, next to Claude's *estimated* one. A
+group running both reads *mixed*, which is the honest label: blending a
+price-table guess and a vendor's own invoice under one word would make neither
+checkable.
+
+**Two mappings are lossy, and both are decisions.** loomux has four token
+buckets; OpenCode has five.
+
+- **Reasoning folds into `output`.** It is a separate counter for OpenCode, and
+  a real session on the maintainer's machine spent 1193 reasoning tokens
+  against 1115 output ones — dropping it would have halved that session. It
+  goes to `output` rather than anywhere else because that is where the CLI
+  loomux compares against already puts it: Claude counts thinking inside
+  `output_tokens`, so the fold makes one bucket mean one thing.
+- **`cache_write` is `cache_creation`.** The same quantity under two vendors'
+  names.
+
+**A pane's usage is its session plus its subagent sessions.** OpenCode's
+subagents are `session` rows of their own with `parent_id` set, and their spend
+is spend the pane caused; charging only the root row would under-report exactly
+the agents that fan out most. The rollup is a recursive CTE over `parent_id`,
+so depth is not assumed — and it uses `UNION`, not `UNION ALL`, so a cycle in
+those edges could never spin.
+
+**Read-only, not `immutable`.** The connection is `SQLITE_OPEN_READ_ONLY`:
+SQLite refuses every write on one, so loomux cannot corrupt or lock out a live
+opencode whatever this code does. `immutable=1` was the tempting alternative —
+it skips locking entirely — and it is wrong as the primary: an immutable
+connection ignores the WAL and reads the main file alone, which for a live
+agent means silently missing most of the session. A meter that under-reports
+without saying so is worse than one that reports nothing. It survives only as a
+*fallback* for a store whose writer died without checkpointing, where the
+`-shm` rebuild a plain read-only open would need is itself a write.
+
+**Every failure is a degrade.** Absent store, unopenable file, drifted schema,
+lock contention past a 250ms bound — each yields a zero-usage agent and a fall
+through to the statusline, never an error the group has to be rescued from.
+The schema is a vendor's internal detail with no compatibility promise, so
+drift is a *when*, not an *if*.
+
+**Degraded is not the same as undiagnosable.** The snapshot cannot act on
+*which* degrade it hit, but the record must still say: a drifted schema needs a
+human and a never-booted pane needs nobody, and both otherwise surface only as
+"not from the store". `note_opencode_db_degrade` writes one
+`opencode-usage-degraded` line per **episode** per group, carrying the kind and
+the underlying message. It has to be latched, because this runs on the polled
+`group_usage` path — an unlatched line would be an audit entry every UI tick
+for as long as the condition lasted, flooding the log exactly when something is
+wrong with it. Latched by *kind*, not by message, so a varying error string
+cannot defeat the latch; cleared on the first successful read, so a recurrence
+after a real recovery is a new incident rather than one silenced for the life
+of the process. `Absent` is never audited at all — a group whose opencode panes
+have not booted has no store yet, which is the ordinary state. Same one-shot
+shape as `HoldEpisode`'s `announced`/`notice_reported`.
+
+**What is not read here.** Which session a pane owns. The store cannot be
+queried for that by project — the project id is a hash of the git origin
+remote, so every loomux worktree of one repo collides — and the answer is
+`session.directory` plus a spawn baseline, which is slice C's. Until it lands,
+`compute_usage_snapshot`'s opencode arm has no id to key on and simply does not
+fire; guessing (newest row, only row) would attribute one pane's spend to
+another. `opencodedb::session_usage_on` takes an open connection precisely so
+that slice pays for one open, not two.
 
 ## Deliberately not done
 
