@@ -24323,7 +24323,12 @@ fn retiring_a_marker_ends_the_episode_without_clearing_the_badge() {
     let pty = 8134u32;
     let bound = QUESTION_HOLD_STALE_AFTER.as_millis() as u64;
     let t0 = 1_000_000u64;
-    let step = |admission, now| reg.hold_escalation_step(&g.id, &w.id, pty, admission, 1, now, bound, None);
+    // #820: the trailing `None` is the question-gate witness, which this test
+    // has nothing to say about — its admission is `HoldBoxOccupied`, so no
+    // question ever matched. Supplying it changes nothing about #813's
+    // retirement semantics, which are what this test is pinning.
+    let step =
+        |admission, now| reg.hold_escalation_step(&g.id, &w.id, pty, admission, 1, now, bound, None, None);
 
     // Drive a real hold episode to its escalation, so a badge is genuinely up
     // and genuinely owned by THIS episode — the only case `note_hold` clears.
@@ -24369,7 +24374,7 @@ fn a_writable_poll_never_re_badges_a_pane_that_was_already_escalated() {
     let pty = 5601u32;
     let bound = QUESTION_HOLD_STALE_AFTER.as_millis() as u64;
     let t0 = 1_000_000u64;
-    let step = |admission, now| reg.hold_escalation_step(&g.id, &w.id, pty, admission, 1, now, bound, None);
+    let step = |admission, now| reg.hold_escalation_step(&g.id, &w.id, pty, admission, 1, now, bound, None, None);
 
     assert_eq!(
         step(WriteAdmission::HoldBoxOccupied, t0),
@@ -24456,7 +24461,7 @@ fn a_stranded_front_marker_never_pushes_the_escalation_clock_forward() {
 
     // The pane is held; the episode opens. Then the paste lands and the Enter is
     // withheld: the text entry is replaced by a marker minted right now.
-    reg.hold_escalation_step(&g.id, &w.id, pty, WriteAdmission::HoldQuestion, 1, t0, bound, None);
+    reg.hold_escalation_step(&g.id, &w.id, pty, WriteAdmission::HoldQuestion, 1, t0, bound, None, None);
     reg.enqueue_text(&g.id, &w.id, "loomux", "the brief", pty, queue::EnqueueReason::Arrival).unwrap();
     reg.enqueue_stranded_front(&g.id, &w.id, "loomux", pty, queue::EnqueueReason::Question)
         .unwrap();
@@ -24492,7 +24497,7 @@ fn a_stranded_front_marker_never_pushes_the_escalation_clock_forward() {
          the very event that proves the pane is stuck"
     );
     assert_eq!(
-        reg.hold_escalation_step(&g.id, &w.id, pty, WriteAdmission::HoldQuestion, 2, now, bound, None),
+        reg.hold_escalation_step(&g.id, &w.id, pty, WriteAdmission::HoldQuestion, 2, now, bound, None, None),
         HeldEscalation::Badge(StrandedBlocker::QuestionStale),
         "and the step the drainer actually calls takes the episode clock, not the front entry"
     );
@@ -24552,8 +24557,8 @@ fn a_pane_whose_queue_goes_away_ends_its_hold_episode() {
     let bound = QUESTION_HOLD_STALE_AFTER.as_millis() as u64;
     let t0 = 3_000_000u64;
 
-    reg.hold_escalation_step(&g.id, &w.id, pty, WriteAdmission::HoldBoxOccupied, 1, t0, bound, None);
-    reg.hold_escalation_step(&g.id, &w.id, pty, WriteAdmission::HoldBoxOccupied, 1, t0 + bound, bound, None);
+    reg.hold_escalation_step(&g.id, &w.id, pty, WriteAdmission::HoldBoxOccupied, 1, t0, bound, None, None);
+    reg.hold_escalation_step(&g.id, &w.id, pty, WriteAdmission::HoldBoxOccupied, 1, t0 + bound, bound, None, None);
     assert_eq!(reg.hold_episode_since(pty), Some(t0));
     assert!(reg.hold_episode_badged(pty));
 
@@ -24779,7 +24784,7 @@ fn a_pane_holding_loomuxs_own_notice_past_the_bound_tells_the_orchestrator() {
     // shape, where the box belongs to the CLI's own turn and not to a person.
     let step = |now| {
         reg.hold_escalation_step(&g.id, &w.id, pty, WriteAdmission::HoldBoxOccupied, 2, now, bound,
-            Some(t0 - 60_000))
+            Some(t0 - 60_000), None)
     };
 
     assert_eq!(step(t0), HeldEscalation::Chip(HeldReason::BoxOccupied), "the episode opens");
@@ -24818,9 +24823,9 @@ fn a_pane_holding_loomuxs_own_notice_past_the_bound_tells_the_orchestrator() {
     reg.note_hold(&g.id, &w.id, pty, HoldObservation::Delivered, t0 + bound + 6_000);
     let t1 = t0 + bound + 8_000;
     reg.hold_escalation_step(&g.id, &w.id, pty, WriteAdmission::HoldBoxOccupied, 2, t1, bound,
-        Some(t0 - 60_000));
+        Some(t0 - 60_000), None);
     reg.hold_escalation_step(&g.id, &w.id, pty, WriteAdmission::HoldBoxOccupied, 2, t1 + bound,
-        bound, Some(t1 + 1_000));
+        bound, Some(t1 + 1_000), None);
     let lines = audit_entries(&reg, &g.id, "notice-undeliverable");
     assert_eq!(lines.len(), 2, "a fresh episode is a fresh incident");
     assert_eq!(
@@ -24852,7 +24857,7 @@ fn the_notice_still_fires_when_another_mechanism_already_owns_the_badge() {
 
     let step = |now| {
         reg.hold_escalation_step(&g.id, &w.id, pty, WriteAdmission::HoldBoxOccupied, 1, now, bound,
-            Some(0))
+            Some(0), None)
     };
     step(t0);
     step(t0 + bound);
@@ -24892,9 +24897,9 @@ fn a_held_kickoff_is_not_reported_as_an_undeliverable_notice() {
     reg.enqueue_text(&g.id, &w.id, "loomux", "You are a worker. Your task: fix #1", pty,
         queue::EnqueueReason::KickoffRecovery).unwrap();
     reg.hold_escalation_step(&g.id, &w.id, pty, WriteAdmission::HoldBoxOccupied, 1, t0, bound,
-        Some(0));
+        Some(0), None);
     let escalation = reg.hold_escalation_step(&g.id, &w.id, pty, WriteAdmission::HoldBoxOccupied, 1,
-        t0 + bound, bound, Some(0));
+        t0 + bound, bound, Some(0), None);
 
     assert_eq!(
         escalation,
@@ -24936,7 +24941,7 @@ fn a_bound_crossed_with_nothing_queued_does_not_burn_the_report() {
     let t0 = 9_000_000u64;
     let step = |now| {
         reg.hold_escalation_step(&g.id, &w.id, pty, WriteAdmission::HoldBoxOccupied, 1, now, bound,
-            Some(0))
+            Some(0), None)
     };
 
     // An ordinary follow-up from the orchestrator — work, not a notice.
@@ -25036,9 +25041,9 @@ fn an_undeliverable_notice_is_never_reported_as_a_front_door_refusal() {
     reg.enqueue_text(&g.id, &w.id, "loomux", &notify::watch_conflicting_notice("watch-4", 577),
         pty, queue::EnqueueReason::Arrival).unwrap();
     reg.hold_escalation_step(&g.id, &w.id, pty, WriteAdmission::HoldBoxOccupied, 1, t0, bound,
-        Some(0));
+        Some(0), None);
     reg.hold_escalation_step(&g.id, &w.id, pty, WriteAdmission::HoldBoxOccupied, 1, t0 + bound,
-        bound, Some(0));
+        bound, Some(0), None);
     assert_eq!(
         audit_entries(&reg, &g.id, "notice-undeliverable").len(),
         1,
@@ -25078,9 +25083,9 @@ fn an_orchestrators_own_stuck_pane_parks_its_notice_in_the_inbox() {
     reg.enqueue_text(&g.id, &orch.id, "loomux", &notify::watch_conflicting_notice("watch-3", 577),
         pty, queue::EnqueueReason::Arrival).unwrap();
     reg.hold_escalation_step(&g.id, &orch.id, pty, WriteAdmission::HoldBoxOccupied, 1, t0, bound,
-        Some(0));
+        Some(0), None);
     reg.hold_escalation_step(&g.id, &orch.id, pty, WriteAdmission::HoldBoxOccupied, 1, t0 + bound,
-        bound, Some(0));
+        bound, Some(0), None);
 
     let suppressed = audit_entries(&reg, &g.id, "notice-suppressed");
     assert_eq!(suppressed.len(), 1, "the in-band notice is suppressed, as it must be");
@@ -39172,24 +39177,40 @@ fn g6_the_queue_polls_hold_record_names_what_the_question_gate_matched() {
     // vocabulary the detector actually emits.
     let matched = prompt_wait_match(&strip_ansi(FIX_COPILOT_ASK.as_bytes()))
         .expect("the captured copilot dialog matches");
+    let seen = QuestionWitnessed { matched: matched.clone(), grid: GridEvidence::StillRendered };
 
     reg.hold_escalation_step(
-        &g.id, &w.id, pty, WriteAdmission::HoldQuestion, 1, t0, bound, None,
+        &g.id, &w.id, pty, WriteAdmission::HoldQuestion, 1, t0, bound, None, Some(&seen),
     );
 
     let rows = audit_entries(&reg, &g.id, "delivery-held-in-queue");
     assert_eq!(rows.len(), 1, "one line per hold EPISODE, unchanged");
-    assert_eq!(
-        rows[0]["detail"]["blocked_on"], "question",
-        "precondition: the row IS written and IS the question-blocked one — so the assertion \
-         below fails on the missing evidence and not on the wrong path to it"
-    );
+    assert_eq!(rows[0]["detail"]["blocked_on"], "question");
     assert_eq!(
         rows[0]["detail"]["matched"]["signal"], matched.signal,
         "the record has to say WHICH rule fired — the fastest way to spot one misfiring on \
          our own prose, and the field whose absence left #820 undiagnosable"
     );
     assert_eq!(rows[0]["detail"]["matched"]["line"], matched.line, "and the line it fired on");
+    assert_eq!(
+        rows[0]["detail"]["matched"]["grid"], "still-rendered",
+        "and whether the screen agreed"
+    );
+
+    // `null`, not a missing key, where the gate matched nothing — for a
+    // question-blocked row that disagreement is itself the finding, and an
+    // absent key is indistinguishable from an older build.
+    let pty2 = 8201u32;
+    reg.hold_escalation_step(
+        &g.id, &w.id, pty2, WriteAdmission::HoldBoxOccupied, 1, t0, bound, None, None,
+    );
+    let rows = audit_entries(&reg, &g.id, "delivery-held-in-queue");
+    assert_eq!(rows.len(), 2);
+    assert!(
+        rows[1]["detail"]["matched"].is_null(),
+        "no match seen must be RECORDED, not omitted: {:?}",
+        rows[1]
+    );
 }
 
 #[test]

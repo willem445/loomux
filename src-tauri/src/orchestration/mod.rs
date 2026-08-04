@@ -17370,10 +17370,13 @@ fn run_queue_drainer(
             // `pasted_text` (the entry it is considering has written nothing
             // yet), so `mask_own_paste` cannot help — and the pane in front of
             // it is full of the PREVIOUS delivery's notices, wraps and all.
-            let admission = write_admission(
-                box_pending,
-                question_active_now(&ptys, pty_id, None, reg.delivered_notice_lines(pty_id)),
-            );
+            // #820: witnessed, not merely decided. This poll is the ONLY
+            // reader of the gate whose hold has no cap, so it is the one whose
+            // audit has to say what it keyed on — see
+            // `question_active_witnessed`.
+            let (question_active, question_seen) =
+                question_active_witnessed(&ptys, pty_id, None, reg.delivered_notice_lines(pty_id));
+            let admission = write_admission(box_pending, question_active);
             // #532: the escalation decision is `held_escalation`'s, not an
             // inline `&&` chain here (rev-12 B1) — this loop is where a held
             // delivery actually LIVES, since `deliver_now` holds only for its
@@ -17399,6 +17402,11 @@ fn run_queue_drainer(
                 // `ptys` this poll already consulted for `box_pending`, so the
                 // classification and the gate reading describe the same instant.
                 ptys.last_user_input_ms(pty_id),
+                // #820: from the SAME poll as `admission` above, for the same
+                // reason `last_user_input_ms` is read there — an audit that
+                // described a different instant than the decision it annotates
+                // would be worse than no audit at all.
+                question_seen.as_ref(),
             );
             match escalation {
                 // #563: the pane is held right now — say so right now. This
@@ -18167,23 +18175,139 @@ fn wait_for_box_clear(ptys: &crate::pty::PtyManager, pty_id: u32) -> PasteDecisi
 /// gap, because delta-vs-one-number can't distinguish "still my own paste
 /// settling" from "their dialog, appeared in the same window" — both are
 /// just "more bytes since X." Content can: `deliver_prompt` knows EXACTLY
-/// what it pasted. Masking out only the lines that are OUR OWN text (trim +
-/// lowercase compared, matching `prompt_wait_detected`'s own line
-/// normalization) leaves whatever the CLI itself painted — including a
+/// what it pasted. Masking out only the lines that are OUR OWN text leaves
+/// whatever the CLI itself painted — including a
 /// dialog that rendered mid-paste — fully visible to the detector; a paste
 /// whose own text happens to contain "(y/n)" or "do you want to run" masks
 /// itself away to nothing, because every line of it IS a pasted line.
+///
+/// **#820: a CLI does not render our paste as our lines, and comparing whole
+/// lines for equality is what made this mask miss.** The original rule was
+/// `row.trim().to_lowercase() == pasted_line`, and every way a CLI paints our
+/// text defeats it: copilot 1.0.7x prefixes its fallback composer row with
+/// `❯ ` (U+276F — a [`POINTER_GLYPHS`] member), draws a `┃ ` border down
+/// *every* row its framed composer wrapped our line onto, and echoes the
+/// submitted prompt back into its transcript as `❯ <text>` with a right-aligned
+/// `HH:mm`. Any one of those leaves a row of OUR text in front of the detector,
+/// and it then takes only one such row leading with `❯`/`›`/`→` — which the
+/// composer prefix supplies outright, and a wrap boundary supplies whenever a
+/// brief's own prose wraps onto one (`red → green`, `main → beta10`) — for
+/// `pointer-option` to fire on loomux's own prompt. Nothing repaints an
+/// unsubmitted box, so the ring stays frozen on it and
+/// [`pointer_rendered`] finds the same glyph among the rendered rows: the #727
+/// latch exactly, re-entered through our own paste, and neither reading can
+/// ever release it.
+///
+/// So the comparison is made against the row a CLI actually paints:
+///
+/// - **De-framed**, so a bordered composer (`┃ our text`) is compared on its
+///   content — the same [`deframe`] every other reading here already uses.
+/// - **Wrap-reconstructed**, so one pasted line spread over several rows is
+///   claimed as one run, via the same [`reconstructs_to_end`] discipline
+///   [`mask_loomux_notices_with_record`] uses: contiguous, in order, from the
+///   line's own start, and to its END rather than a prefix. A run that does not
+///   account for the whole line claims nothing, so the failure direction is
+///   under-masking — a hold that stands, which is the cheap error.
+/// - **Pointer-stripped, but only as a SECOND attempt and only above an
+///   evidence floor.** See [`SELF_ECHO_MIN_POINTER_CHARS`]: a box border is
+///   decoration by construction, whereas a pointer glyph is the entire
+///   `pointer-option` signal, so stripping one is a claim that needs paying for.
+///
+/// What does NOT change is the reason this mask is allowed to be greedy about
+/// our own text at all: `deliver_prompt` knows EXACTLY what it pasted. A paste
+/// whose own text happens to contain `(y/n)` still masks itself away to
+/// nothing, because every line of it IS a pasted line, while a dialog the CLI
+/// painted mid-paste stays fully visible — that was always the point of a
+/// CONTENT-based exclusion, and it is what a byte-COUNT baseline could never do
+/// (the history above). #820 changes only HOW a row is recognised as ours,
+/// never WHICH text counts as ours.
 pub fn mask_own_paste(tail: &str, pasted_text: &str) -> String {
-    let pasted_lines: std::collections::HashSet<String> = pasted_text
-        .lines()
-        .map(|l| l.trim().to_lowercase())
-        .filter(|l| !l.is_empty())
-        .collect();
-    tail.lines()
-        .filter(|l| !pasted_lines.contains(&l.trim().to_lowercase()))
-        .collect::<Vec<_>>()
-        .join("\n")
+    let rows: Vec<&str> = tail.lines().collect();
+    let mut norm: Vec<String> = rows.iter().map(|r| wrap_normalize(deframe(r))).collect();
+    // The same rows read once more with a leading pointer glyph removed. Kept
+    // beside the ordinary reading rather than replacing it, so the plain
+    // comparison is always tried first and the pointer strip can only ever
+    // claim MORE — never differently.
+    let unpointed: Vec<Option<String>> =
+        rows.iter().map(|r| strip_leading_pointer(r).map(wrap_normalize)).collect();
+    let pasted: Vec<String> =
+        pasted_text.lines().map(wrap_normalize).filter(|l| !l.is_empty()).collect();
+    let mut keep = vec![true; rows.len()];
+    let mut i = 0;
+    while i < rows.len() {
+        if norm[i].is_empty() {
+            i += 1;
+            continue;
+        }
+        let mut claimed = pasted.iter().find_map(|line| reconstructs_to_end(&norm, i, line, 0));
+        if claimed.is_none() {
+            if let Some(head) = unpointed[i].clone() {
+                // Only this row is re-read without its glyph; the continuation
+                // rows of the same wrap run stay on the ordinary reading,
+                // because only the FIRST row of a composer's line carries the
+                // prompt chevron.
+                let framed = std::mem::replace(&mut norm[i], head);
+                claimed = pasted
+                    .iter()
+                    .filter(|line| line.chars().count() >= SELF_ECHO_MIN_POINTER_CHARS)
+                    .find_map(|line| reconstructs_to_end(&norm, i, line, 0));
+                if claimed.is_none() {
+                    norm[i] = framed;
+                }
+            }
+        }
+        match claimed {
+            Some(end) => {
+                keep[i..end].fill(false);
+                i = end;
+            }
+            None => i += 1,
+        }
+    }
+    rows.iter().zip(keep).filter_map(|(r, k)| k.then_some(*r)).collect::<Vec<_>>().join("\n")
 }
+
+/// This row with a leading menu-pointer glyph removed, after any box framing —
+/// or `None` where it does not lead with one (#820).
+///
+/// Deliberately NOT folded into [`deframe`]. `deframe`'s strip set is
+/// decoration: a border, a bullet, an indent, none of which any detector rule
+/// keys on. A pointer glyph is the opposite — it *is* [`leads_with_pointer`]'s
+/// whole signal — so a reading that stripped it globally would delete the
+/// `pointer-option` signal outright rather than narrowing it. It is removed in
+/// exactly one place, for exactly one question: *is this row our own text with
+/// the CLI's prompt chevron in front of it.*
+fn strip_leading_pointer(line: &str) -> Option<&str> {
+    let d = deframe(line);
+    POINTER_GLYPHS.iter().find_map(|g| d.strip_prefix(*g))
+}
+
+/// How long a pasted line must be before [`mask_own_paste`] will claim a row
+/// on the strength of a POINTER-stripped comparison (#820).
+///
+/// The floor exists because the two things being told apart can be
+/// byte-identical. `❯ Overwrite` is our own composer holding a one-word paste,
+/// and it is also a live dialog's highlighted choice; the only evidence
+/// separating them is that we know what we pasted, and a short line is weak
+/// evidence — a brief containing a bare `Yes` line would otherwise let
+/// `❯ Yes` be masked out of a genuine permission dialog, which releases an
+/// Enter into it. That is the #420 harm, and over-masking is the one direction
+/// this file never chooses.
+///
+/// 24 characters, the same figure and the same argument as
+/// [`R_TOP_MIN_ANCHOR_CHARS`]: it clears every stock menu option a CLI paints
+/// (`Yes`, `No`, `Overwrite`, `Keep both`, `1. Yes`) while sitting far below
+/// any line of an orchestrator brief or a steer. The cost is borne only by
+/// short claims that were never good evidence.
+///
+/// **Stated residual:** a delivery whose every line is shorter than this, sitting
+/// in a chevron composer, is still not masked and can still latch the gate. The
+/// pointer strip is what answers the shape #820 reported; the floor is what
+/// keeps that from being a hole, and buying the last case would need evidence
+/// this mask does not have. The `matched` field added to
+/// `delivery-held-in-queue` in the same change is what makes such a hold name
+/// itself.
+const SELF_ECHO_MIN_POINTER_CHARS: usize = 24;
 
 /// The marker every notice loomux writes into a pane opens with, and the whole
 /// basis of [`mask_loomux_notices`] (#576).
@@ -18935,7 +19059,8 @@ where
         // "still displayed" about our own paste (rev-15 N1 / rev-19 B-A).
         // Two masks, both on BOTH readings. `mask_own_paste` needs this
         // delivery's text and so is `None` at every checkpoint that runs before
-        // one (`question_active_now`'s three call sites); the notice mask needs
+        // one (`question_active_now`'s call sites — four since #819 added
+        // `stranded_marker_action`'s); the notice mask needs
         // no `pasted_text` at all, which is exactly why it closes #576 — the
         // outer drainer gate has no `pasted_text` to mask with, yet the pane is
         // full of the PREVIOUS delivery's notices. Since #576's residual it
@@ -19077,12 +19202,40 @@ fn question_active_now(
     pasted_text: Option<&str>,
     delivered: Vec<String>,
 ) -> bool {
-    question_hold_predicate_sampled(
+    question_active_witnessed(ptys, pty_id, pasted_text, delivered).0
+}
+
+/// [`question_active_now`], plus WHAT the detector matched (#820).
+///
+/// The one-shot read is where a *sustained* hold lives. `deliver_now`'s own
+/// holds are individually capped and every one of them already audits its
+/// match (`witness_audit`, #513(c)/F2); the queue drainer re-arms this read
+/// every `QUEUE_DRAIN_POLL` with **no** cap, so the record a human actually
+/// diagnoses a strand from is the drainer's — and that record said
+/// `blocked_on: "question"` and nothing whatever about which shape, on which
+/// line, with what the screen said about it. #513's blind spot, one hold
+/// class over, and the reason #820's false positive could not name itself:
+/// the pane was held for the whole of a session by a signal no record
+/// identified.
+///
+/// A witness rather than a re-read at the audit site, for the same reason
+/// `wait_for_question_clear` returns one: a fresh read there would describe a
+/// different instant than the one that decided.
+fn question_active_witnessed(
+    ptys: &crate::pty::PtyManager,
+    pty_id: u32,
+    pasted_text: Option<&str>,
+    delivered: Vec<String>,
+) -> (bool, Option<QuestionWitnessed>) {
+    let witness: QuestionWitness = Default::default();
+    let active = question_hold_predicate_sampled(
         || question_sample(ptys, pty_id),
         pasted_text.map(str::to_string),
-        None,
+        Some(std::rc::Rc::clone(&witness)),
         delivered,
-    )()
+    )();
+    let seen = witness.borrow().clone();
+    (active, seen)
 }
 
 /// #532: the guards a delivery must find satisfied **at one instant**, on the
@@ -35363,6 +35516,13 @@ impl OrchRegistry {
         now_ms: u64,
         bound_ms: u64,
         last_user_input_ms: Option<u64>,
+        // #820: what the question gate matched on THIS poll, or `None` where
+        // it matched nothing (including every poll blocked on the box rather
+        // than a question). Threaded in for the same reason
+        // `last_user_input_ms` is — this method has no `PtyManager`, the
+        // caller does, and re-reading the pane here would annotate the
+        // decision with a different instant's evidence.
+        matched: Option<&QuestionWitnessed>,
     ) -> HeldEscalation {
         // #590 L2: threaded in rather than read here because this method has no
         // `PtyManager` — the caller does. It is the same class of parameter as
@@ -35402,6 +35562,12 @@ impl OrchRegistry {
                 "blocked_on": admission.enqueue_reason().as_str(),
                 "held_ms": now_ms.saturating_sub(started_ms),
                 "depth": depth,
+                // #820: the same `matched` shape every capped hold and every
+                // abort has carried since #513(c)/F2 — signal class, the
+                // bounded line it fired on, and what the composed screen said.
+                // `null` here means the gate matched nothing, which for a
+                // `blocked_on: "question"` row is itself the finding.
+                "matched": witness_audit(matched),
             }));
         }
         let escalation = held_escalation(
