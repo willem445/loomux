@@ -35614,19 +35614,18 @@ impl OrchRegistry {
         // strictly narrower. An id with no agent record cannot have a chip on
         // screen either — `attention_tick` builds its items from `agents` — so
         // this rejects only ids that could never have been clicked.
-        // RED-EVIDENCE MUTATIONS (#825), reverted in the next commit. Four, each
-        // aimed at a DIFFERENT test so none masks another: (C) an unknown id
-        // reports success, (A) the `stranded-dismissed` line is not written,
-        // (B) the clear names another mechanism, (D) the dismissal sweeps the
-        // whole group instead of the pane that was clicked.
-        let Some(group) = self.agent(agent_id).map(|a| a.group) else { return true }; // (C)
-        let Some(_note) = self.stranded_note(agent_id) else { return false };
-        // (A): no `stranded-dismissed` audit line here.
-        // (D): sweep every agent's badge, not just this pane's.
-        let all: Vec<String> = self.agents.lock_safe().keys().cloned().collect();
-        for id in all {
-            self.clear_stranded(&group, &id, "resolved"); // (B): the wrong reason.
-        }
+        let Some(group) = self.agent(agent_id).map(|a| a.group) else { return false };
+        let Some(note) = self.stranded_note(agent_id) else { return false };
+        self.audit(&group, "human", "stranded-dismissed", json!({
+            "to": agent_id,
+            "blocker": note.blocker.map(|b| b.as_str()).unwrap_or("self-healing"),
+            "stranded_ms": now_ms().saturating_sub(note.since_ms),
+        }));
+        // Read-then-clear, the shape the late monitor's arms already use. A
+        // clear that lands in between leaves a `stranded-dismissed` line whose
+        // `stranded-cleared` partner names the other mechanism's reason — which
+        // is the honest record of what happened, not a lost one.
+        self.clear_stranded(&group, agent_id, "human-dismissed");
         true
     }
 
