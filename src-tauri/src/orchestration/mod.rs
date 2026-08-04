@@ -10136,14 +10136,39 @@ fn new_session_uuid() -> String {
 /// opencode id>)` failed as "invalid resume session id" with nothing malformed
 /// about the id.
 ///
-/// What the widening does *not* admit is the point: no path separator, no `.`
-/// (so `.`/`..` cannot be spelled), no whitespace, no quote, and no shell or
-/// PowerShell metacharacter. Everything downstream that treats a session id as
-/// a path component (`digest::is_safe_session_id`, and the `Path::join` in
-/// `read_session_transcript_events`) or interpolates it into a command line
-/// keeps every property it had before — the set grew by two characters that
-/// are inert in all of those positions. Same deliberate-widening shape as
-/// `sanitize_model`'s `/`, and pinned the same way.
+/// **The size of the widening, stated accurately:** the alphabet goes from 23
+/// characters (`0-9a-fA-F` plus `-`) to 64 (`0-9A-Za-z` plus `-` and `_`), so
+/// **41** characters were added — the non-hex ASCII letters, and `_`. It is
+/// emphatically not "two more characters"; an earlier revision of this comment
+/// said so and was wrong, which is worth not repeating in a validator whose
+/// whole job is to bound what may reach a path join.
+///
+/// What the widening does *not* admit is the property that matters, and it is
+/// unchanged: no path separator, no `.` (so `.`/`..` cannot be spelled), no
+/// whitespace, no quote, no shell or PowerShell metacharacter, no NUL. Every
+/// one of the 41 added characters is an ASCII letter, inert in a path
+/// component and inert on a command line, so everything downstream that treats
+/// a session id as a path component (`digest::is_safe_session_id`, and the
+/// `Path::join` in `read_session_transcript_events`) or interpolates it into a
+/// command line keeps every guarantee it had. Same deliberate-widening shape
+/// as `sanitize_model`'s `/`, and pinned the same way.
+///
+/// **This gate is global, not per-CLI, and that is a deliberate trade
+/// (rev-306 NB2).** A malformed *claude* id — one carrying `g`-`z` — now gets
+/// past this door and fails later, inside the CLI, instead of failing here.
+/// Making the alphabet per-CLI is entirely possible (both callers have `cli`
+/// in scope), and was rejected: this function is a **safety** gate answering
+/// "can this string escape a path or an argument", not an **authenticity**
+/// gate answering "is this a well-formed id for this vendor". It never
+/// answered the second question anyway — `aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa`
+/// names no session and passed cleanly before this change too — so per-CLI
+/// shapes would buy an earlier error only for the narrow "typo that happens to
+/// contain a non-hex letter" case, while adding a vendor-shape table whose
+/// failure mode is refusing a *valid* session the day a vendor changes its id
+/// format. That is precisely the bug this slice just fixed for opencode, and
+/// it is not one to reintroduce for the others. Shape questions are answered
+/// by `is_full_session_id` and roster resolution, where being wrong yields a
+/// diagnosable "unknown session" rather than a flat refusal.
 fn sanitize_session(s: &str) -> Option<String> {
     let t = s.trim();
     (!t.is_empty()
@@ -21599,8 +21624,16 @@ impl OrchRegistry {
                 }
                 last = self.search_for_session(&group_id, &agent_id, &cwd, &baseline);
                 if let SessionSearch::Found(sid) = &last {
-                    self.associate_session(&group_id, &agent_id, sid);
-                    return;
+                    if self.associate_session(&group_id, &agent_id, sid) {
+                        return;
+                    }
+                    // Lost the race: another pane bound this id between our
+                    // search and our write. Keep watching rather than giving
+                    // up — the winner's claim now excludes that id from our
+                    // search, so the next tick looks for a session of our own,
+                    // which is also exactly what the timeout should report if
+                    // one never appears.
+                    last = SessionSearch::Waiting;
                 }
                 if std::time::Instant::now() >= deadline {
                     self.audit(&group_id, "loomux", "session-untracked", json!({
@@ -21676,15 +21709,43 @@ impl OrchRegistry {
     /// Bind a discovered session id to a live pane: update the agent map, the
     /// durable roster (`agents.json`), and any task board item this agent owns
     /// — the same session trail Claude gets at spawn. Best-effort. Public for
-    /// the session watcher and its tests; a no-op if the pane is gone or
-    /// already carries a session id.
-    pub fn associate_session(&self, group_id: &str, agent_id: &str, session_id: &str) {
+    /// the session watcher and its tests.
+    ///
+    /// Returns whether this call bound the id. `false` — a no-op — when the
+    /// pane is gone, when it already carries an id, or when **another pane in
+    /// this group is already bound to this session**. That last one is not a
+    /// formality: see the comment inside, and note that a caller which treats
+    /// `false` as "done" turns a lost race into a permanently unidentified
+    /// pane. The watcher keeps polling instead.
+    pub fn associate_session(&self, group_id: &str, agent_id: &str, session_id: &str) -> bool {
         let entry = {
             let mut agents = self.agents.lock_safe();
-            let Some(a) = agents.get_mut(agent_id) else { return };
+            // The claim exclusion `search_for_session` applies is READ under
+            // this lock and then released before the store is queried, so two
+            // watchers can both be inside that window at once: with one
+            // candidate visible and neither pane bound yet, both searches
+            // legitimately answer `Found(same id)`. Refusing here — under the
+            // one lock that also performs the write — is what makes the
+            // exclusion hold, rather than merely usually holding. Without it
+            // the refusal policy protects only the two-candidate case and
+            // leaks exactly the harm it exists to prevent (one conversation
+            // bound to two panes) in the one-candidate case (rev-306 NB3).
+            if agents.values().any(|a| {
+                a.group == group_id
+                    && a.id != agent_id
+                    && a.session_id.as_deref() == Some(session_id)
+            }) {
+                self.audit(group_id, "loomux", "session-claim-refused", json!({
+                    "agent": agent_id,
+                    "session": session_id,
+                    "reason": "another pane in this group is already bound to this session",
+                }));
+                return false;
+            }
+            let Some(a) = agents.get_mut(agent_id) else { return false };
             // Don't clobber an id set in the meantime (e.g. a resume).
             if a.session_id.is_some() {
-                return;
+                return false;
             }
             a.session_id = Some(session_id.to_string());
             a.clone()
@@ -21720,6 +21781,7 @@ impl OrchRegistry {
         // line already records it, and a second copy could only ever disagree.
         self.audit(group_id, "loomux", "session-learned",
             json!({ "agent": agent_id, "session": session_id }));
+        true
     }
 
     /// Roster entries derived from `agent-spawn` audit lines. Backfill for

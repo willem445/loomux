@@ -423,6 +423,59 @@ fn a_panes_search_excludes_the_sessions_its_group_siblings_hold() {
 }
 
 #[test]
+fn one_session_can_never_be_bound_to_two_panes() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/opencode-repo", rails("opencode")).unwrap();
+    let a = reg.spawn_agent(&g.id, Role::Worker, "a", "t", false, None).unwrap();
+    let b = reg.spawn_agent(&g.id, Role::Reviewer, "b", "t", false, None).unwrap();
+
+    // ONE session has appeared, in the directory both panes share. This is the
+    // case the two-candidate refusal does not cover, and the one the claim
+    // exclusion is supposed to: with neither pane bound yet, both searches
+    // legitimately see a single unclaimed candidate.
+    let cwd = a.cwd.clone();
+    let dir = cwd.replace('\\', "/");
+    store(&reg.opencode_db_path(&g.id), &[Row { directory: &dir, ..Row::new(NEW) }]);
+    let baseline = SessionBaseline::OpenCode { ids: none() };
+
+    // The window is real, not hypothetical: the claim exclusion is read under
+    // the agents lock and released before the store is queried, so both panes
+    // are told to bind the SAME id.
+    assert_eq!(
+        reg.search_for_session(&g.id, &a.id, &cwd, &baseline),
+        SessionSearch::Found(NEW.to_string())
+    );
+    assert_eq!(
+        reg.search_for_session(&g.id, &b.id, &cwd, &baseline),
+        SessionSearch::Found(NEW.to_string()),
+        "both panes see the same unclaimed candidate — this is the race, and it is reachable"
+    );
+
+    // Only one of them may act on it. The refusal has to live under the same
+    // lock as the write, or the exclusion merely usually holds.
+    assert!(reg.associate_session(&g.id, &a.id, NEW), "the first claim binds");
+    assert!(
+        !reg.associate_session(&g.id, &b.id, NEW),
+        "the second must be refused — binding one conversation to two panes is the exact harm \
+         the whole refusal policy exists to prevent"
+    );
+
+    assert_eq!(reg.agent(&a.id).unwrap().session_id.as_deref(), Some(NEW));
+    assert_eq!(
+        reg.agent(&b.id).unwrap().session_id,
+        None,
+        "the losing pane stays unidentified rather than sharing a session"
+    );
+
+    // And it is not stranded: the winner's claim now excludes that id, so the
+    // loser is back to waiting for a session of its own.
+    assert_eq!(
+        reg.search_for_session(&g.id, &b.id, &cwd, &baseline),
+        SessionSearch::Waiting
+    );
+}
+
+#[test]
 fn a_learned_session_reaches_the_roster_and_the_usage_key() {
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/opencode-repo", rails("opencode")).unwrap();
@@ -494,10 +547,12 @@ fn a_session_id_that_could_escape_a_path_or_a_command_line_is_still_refused() {
     let g = reg.create_group("C:/tmp/opencode-repo", rails("opencode")).unwrap();
     let dir = tempfile::tempdir().unwrap();
 
-    // The widening admitted two characters, not "letters and symbols": a
-    // session id still reaches a `Path::join` (`read_session_transcript_events`)
-    // and a shell command line, so every separator, dot, quote, space and
-    // metacharacter must still bounce.
+    // The widening added 41 characters (23-character alphabet -> 64): every
+    // non-hex ASCII letter, plus `_`. All 41 are inert in a path component and
+    // on a command line — which is the property this pins, because a session
+    // id still reaches a `Path::join` (`read_session_transcript_events`) and a
+    // shell command line. Every separator, dot, quote, space and metacharacter
+    // must still bounce.
     for bad in [
         "../../etc/passwd",
         r"..\..\windows",
