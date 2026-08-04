@@ -55,6 +55,19 @@ export function restoredPaneName(source: string, title: string): string {
   return `${source} · ${short}`;
 }
 
+/** The CLI badge on a session row.
+ *
+ *  Read off the row, not branched on it (#722) — the same correction
+ *  `restoredPaneName` above carries, and the same bug it had:
+ *  `s.source === "claude" ? "CLAUDE" : "COPILOT"` labelled every session that
+ *  was neither one **COPILOT**, so the sidebar would have asserted the wrong
+ *  CLI about a row whose resume command names a different one. A source with
+ *  no styling rule gets the base badge, which is a plain chip — legible, just
+ *  uncoloured — never a wrong name. */
+export function sessionBadgeLabel(source: string): string {
+  return source.toUpperCase();
+}
+
 /** The PR chip label, or null when no PR is known yet. A bare number (how
  *  the board stores most PR refs) renders as "#123"; anything already
  *  prefixed or otherwise shaped is shown verbatim. */

@@ -1,10 +1,13 @@
-// Session browser sidebar: lists resumable Claude Code and Copilot CLI
-// sessions discovered by the backend; clicking one restores it into a
-// new pane.
+// Session browser sidebar: lists the resumable agent sessions the backend
+// discovered — Claude Code's and Copilot CLI's transcripts, OpenCode's store
+// (#722) — and clicking one restores it into a new pane. Nothing here
+// enumerates those CLIs: the badge, the label and the filter all read the
+// row's own `source`, so a scanner added on the backend shows up correctly
+// here without a matching edit.
 
 import { listSessions, type SessionInfo } from "./pty";
 import type { SessionRoleInfo } from "./orchestration";
-import { taskSummary, repoBranchLine, prLabel } from "./sessionmeta";
+import { taskSummary, repoBranchLine, prLabel, sessionBadgeLabel } from "./sessionmeta";
 import { RefreshGate } from "./refreshgate";
 import { SessionStore } from "./sessionstore";
 
@@ -179,7 +182,7 @@ export class SessionBrowser {
       empty.className = "sessions-empty";
       empty.textContent = q
         ? "No sessions match."
-        : "No Claude Code or Copilot sessions found on this machine.";
+        : "No agent sessions found on this machine.";
       this.listEl.appendChild(empty);
       return;
     }
@@ -193,7 +196,7 @@ export class SessionBrowser {
       top.className = "session-top";
       const badge = document.createElement("span");
       badge.className = `session-badge ${s.source}`;
-      badge.textContent = s.source === "claude" ? "CLAUDE" : "COPILOT";
+      badge.textContent = sessionBadgeLabel(s.source);
       const title = document.createElement("span");
       title.className = "session-title";
       title.textContent = s.title;

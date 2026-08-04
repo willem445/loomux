@@ -2,7 +2,7 @@
 // `npm test`.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { taskSummary, repoBranchLine, prLabel, restoredPaneName } from "../src/sessionmeta.ts";
+import { taskSummary, repoBranchLine, prLabel, restoredPaneName, sessionBadgeLabel } from "../src/sessionmeta.ts";
 import type { SessionRoleInfo } from "../src/orchestration.ts";
 
 const role = (over: Partial<SessionRoleInfo> = {}): SessionRoleInfo => ({
@@ -94,4 +94,13 @@ test("restoredPaneName cuts a long title with an ellipsis, keeping the CLI prefi
 test("restoredPaneName leaves a title that fits exactly alone — no ellipsis on a non-cut", () => {
   const exact = "z".repeat(34);
   assert.equal(restoredPaneName("claude", exact), `claude · ${exact}`);
+});
+
+test("sessionBadgeLabel names the row's own CLI, whichever it is", () => {
+  assert.equal(sessionBadgeLabel("claude"), "CLAUDE");
+  assert.equal(sessionBadgeLabel("copilot"), "COPILOT");
+  // The sidebar's own version of restoredPaneName's bug: a two-arm ternary
+  // labelled an opencode row COPILOT — the badge asserting one CLI while the
+  // resume command underneath it named another.
+  assert.equal(sessionBadgeLabel("opencode"), "OPENCODE");
 });
