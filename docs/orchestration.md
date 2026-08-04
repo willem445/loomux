@@ -423,6 +423,17 @@ three it looked like — a pane mid-turn, a human's own line in the box, or a di
 answer — because those need different things from you. If the stuck pane is the orchestrator's
 own, the notice rides back on its next tool call instead of being typed into it.
 
+**When you fix a stuck prompt yourself.** A **⚠ stuck prompt** chip means a prompt was typed
+into that pane but never submitted, and loomux queues a repair — one Enter, held back until the
+pane is safe to write to. If you get there first (click into the pane, press Enter, or clear the
+box), loomux now notices: the repair is dropped rather than pressed a second time, the chip comes
+down, and anything queued behind it — steering messages, worker reports — starts flowing again on
+the next poll. Before this, your fix was invisible to the queue, and continuing to type in that
+pane kept the repair pending indefinitely, silently holding everything behind it. A repair loomux
+*can't* perform for other reasons (your own half-typed line still in the box, a dialog on screen)
+is given up on after ten minutes rather than held forever — by then the chip is already telling
+you the pane needs you, and the queue no longer waits on a press that isn't coming.
+
 ## Cross-workspace channels
 
 Every orchestration group is isolated by design — one group's agents never see another's

@@ -10886,6 +10886,58 @@ unchanged; only its packaging moved. What remains genuinely open is the accumula
 overwrite question above, and (unchanged from #463) whether an unmatched `--deny-tool`
 value warns, errors, or no-ops. Both need a live run a human owns.
 
+## A `StrandedSubmit` marker is a repair, not a payload (#813)
+
+The self-heal marker (#445 seam 3, #496 PR-C) is pushed to the **front** of a pane's
+delivery queue, the drainer only ever drains the front, and its press was gated on
+`should_flush_before_paste` — which requires that *no human has typed since our own
+submit*. Every part of that was deliberate, and together they deadlock.
+
+`human_input_block` (#518) re-arms for `HUMAN_INPUT_BLOCK_BOUND_MS` from the human's
+**last** keystroke. So the marker's release condition is anti-correlated with the human's
+own recovery: click into the wedged pane, press Enter to submit the stranded prompt, then
+keep typing to talk to the CLI, and the marker is pinned at the head of the queue for as
+long as you stay engaged. Everything queued behind it — every steering prompt — silently
+never delivers, and the `attn_stranded` chip, which clears only on a **confirmed delivery
+to that pane**, cannot come down either, because no delivery can happen. That is #813's
+live incident: three orchestrator panes, a workstation lock, and a group that only a
+restart recovered.
+
+The fix is a reclassification, not a new mechanism. Every *other* queue entry carries text
+that exists nowhere else; a marker carries an **Enter** that `deliver_now`'s own pre-paste
+`flush_stranded_text` — which every entry queued behind it runs before pasting — would
+press anyway. So the marker was the one queue entry whose failure to fire cost *other*
+work, and nothing bounded it. `stranded_marker_action` makes the precedence a value
+(`failed_arm_route`'s shape, for `failed_arm_route`'s reason) with three retire cells:
+
+| reading | before | now |
+| --- | --- | --- |
+| ledger not `Some(false)` — nothing stranded | retry forever | `Retire(NothingStranded)` |
+| `Blocked` **and box empty** — human resolved it | retry forever | `Retire(HumanResolved)` |
+| hold ran past `QUESTION_HOLD_STALE_AFTER` | retry forever | `Retire(Unfirable)` |
+| `box_pending` (human characters outstanding) | decline | `Retry(BoxOccupied)` — unchanged |
+| live question | decline | `Retry(Question)` — unchanged |
+| clear | press | `Press` — unchanged |
+
+Two adjacent rules are deliberately *not* absorbed. `BoundedOut` still **presses**: #518's
+bound exists because the stamp may be a phantom auto-reply, in which case nobody touched
+the pane and our text really is still sitting there. And `box_pending` still blocks the
+`HumanResolved` retire outright, because #510's absolute — never write over a human's
+outstanding characters — is what licenses reading an empty box as "they dealt with it".
+
+**What retiring cannot lose.** If our Enter would have been the correct one, the next entry
+in the queue presses it: `deliver_now` runs the same `flush_stranded_text` under the same
+guards before its own paste. The marker only matters when there is *no* next entry — an
+idle pane — and there the `HumanResolved` cell is the case we want to retire on anyway. The
+residual is an idle pane that reaches the `Unfirable` bound, and there #496 PR-C's badge is
+already up, raised at the same clock, saying the pane needs a human. A badge is the channel
+that was always going to be the answer for a pane loomux cannot safely write to; the bound
+only stops loomux from *also* holding the queue while it waits.
+
+`HumanResolved` is additionally the one cell that clears the chip (`clear_stranded`, reason
+`human-resolved`). The other two establish nothing about whether the pane still needs a
+person, so they leave the badge exactly as they found it.
+
 ## Risks / limitations
 
 - Kickoff typing races CLI boot; a fixed delay (4s) + bracketed paste is used. If a
