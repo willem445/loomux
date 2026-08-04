@@ -1,0 +1,7 @@
+[36m●[0m Ready.
+
+[2mC:\Projects\loomux [⎇ main][0m
+────────────────────────────────────────────────────────────────────────
+[38;5;153m❯[0m Review requested changes on PR #814 and push fixes to the same branch.
+────────────────────────────────────────────────────────────────────────
+  [2m@ files · # issues[0m                          [2mSession: 4.2 AIC used[0m
