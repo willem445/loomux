@@ -16065,13 +16065,56 @@ fn deliver_now(
             "bound_ms": HUMAN_INPUT_BLOCK_BOUND_MS,
         }));
     }
-    if flush_stranded_text(
+    let flushed = flush_stranded_text(
         &ptys, pty_id, prev.as_ref().map(|o| o.confirmed), human_block.holds(), submit,
         delivered_lines(&reg, pty_id),
-    ) {
+    );
+    if flushed {
         append_audit(&root, &group, "loomux", "delivery-flush",
             json!({ "to": agent, "reason": "previous delivery unconfirmed" }));
         std::thread::sleep(FLUSH_SETTLE);
+    }
+    // #824: the flush DECLINED and nothing below can see why it matters. No
+    // guard between here and the paste can observe loomux's own text — see
+    // `stranded_paste_guard` for why `input_pending` structurally cannot — so
+    // without this, the paste lands on top of a prompt still waiting to be
+    // submitted and the pre-Enter quiet wait sends both as one.
+    //
+    // Cost: this read is taken ONLY when the flush declined AND the ledger says
+    // the previous delivery is unconfirmed AND it recorded text to look for.
+    // A delivery into a pane with nothing stranded — the overwhelming majority
+    // — pays a `matches!` and nothing else. Within that, the read is
+    // `Tier1Scan`'s own bounded widening (`TIER1_SCAN_WIDEN_ROUNDS`, capped at
+    // `TIER1_SCAN_WIDEN_MAX_BYTES`), the same one the late monitor and #819's
+    // marker drain already take on this pane.
+    let stranded_reading = (!flushed
+        && matches!(prev.as_ref().map(|o| o.confirmed), Some(false)))
+    .then(|| prev.as_ref().and_then(|o| o.stranded_text.clone()))
+    .flatten()
+    .map(|text| {
+        let mut scan = Tier1Scan::for_paste(&text);
+        let read = scan.read(|n| ptys.output_tail_bounded(pty_id, n));
+        box_reading(read.as_ref().map(|r| r.stripped.as_str()), &text)
+    });
+    if stranded_paste_guard(prev.as_ref().map(|o| o.confirmed), flushed, stranded_reading)
+        == StrandedPasteGuard::AbortStranded
+    {
+        append_audit(&root, &group, "loomux", "delivery-aborted-stranded-text", json!({
+            "to": agent,
+            "reason": "the previous delivery's text is still in the box and the flush declined — \
+                       pasting would merge two prompts",
+            // Which gate held the flush back, so a reader can tell a human-block
+            // decline from a question one without re-deriving it.
+            "flush_blocked_by": if human_block.holds() { "human-input" } else { "question-or-box" },
+        }));
+        // Re-queued and retried by the drainer, with no cap, exactly like every
+        // other pre-paste abort. It converges on the same two events that would
+        // have let the flush fire: the human clears the box themselves (the
+        // reading turns `NotHolding`), or #518's bound releases the human block
+        // and the flush presses. A pane where neither happens is a held pane,
+        // and #560's escalation badges it — which is the outcome this issue
+        // wants, in place of two prompts merged into one.
+        return DeliverOutcome::AbortedPrePaste(queue::EnqueueReason::BoxOccupied);
     }
 
     // Human-input paste guard (#111): the quiet backstop above only waits
@@ -18073,6 +18116,82 @@ pub fn should_flush_before_paste_now(
     should_flush_before_paste(prev_confirmed, human_typed_since)
         && !question_active
         && !box_pending
+}
+
+/// What `deliver_now` does about a stranded-text flush that **declined** (#824).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StrandedPasteGuard {
+    /// Nothing of ours is provably in the box — paste, exactly as before.
+    Paste,
+    /// Our own prompt is still sitting in that box and the flush could not
+    /// clear it. Do not paste on top of it.
+    AbortStranded,
+}
+
+/// #824: the missing half of `flush_stranded_text`'s contract.
+///
+/// The flush is the mechanism that clears a previous delivery's stranded text
+/// before this one pastes. It can DECLINE — `should_flush_before_paste_now`
+/// returns false whenever a human typed since our submit, a question is live,
+/// or human characters are outstanding — and `deliver_now` used to ignore that,
+/// carrying straight on to the paste.
+///
+/// **Why no existing guard catches it.** The pre-paste guard between the flush
+/// and the paste is `wait_for_box_clear`, which reads
+/// `PtyManager::input_pending`, i.e. `input_box_len`. That counter is written by
+/// `note_user_input` and by nothing else, and `note_user_input` is reached from
+/// exactly one place — `write_from_frontend`. Orchestration's own typing goes
+/// out through `write_bytes`, which touches no counter at all. So
+/// `!input_pending` means "no HUMAN characters are outstanding", **never** "the
+/// box is empty", and our own pasted prompt is invisible to every guard on this
+/// path. The sequence that follows is ordinary rather than exotic: a delivery
+/// strands, a human presses Enter (or types a character and backspaces it out),
+/// the flush declines on the human block, `input_pending` reads false, and the
+/// next delivery pastes ON TOP of the stranded prompt — which the pre-Enter
+/// quiet wait then submits as one merged prompt. That is the #81/#84/#111
+/// collision the flush exists to prevent, reached through the flush's own
+/// decline.
+///
+/// **Gated on a POSITIVE reading, never on the decline.** `Holds` is the only
+/// answer that aborts. `Unverifiable` keeps today's behaviour deliberately: it
+/// is common near the Tier 1 scan cap (#583/#685's census), and aborting on it
+/// would hold ordinary traffic for a reading that says nothing — trading a rare
+/// merge for a routine stall. `NotHolding` means our text is gone, which is
+/// exactly when pasting is safe. So this can only ever abort a delivery loomux
+/// can SEE the collision coming for, which bounds the blast radius to the
+/// evidence.
+///
+/// **#828 is what makes that reading load-bearing.** Before it,
+/// `box_holds_paste` could answer a confident `NotHolding` for text that was on
+/// screen behind per-row gutter decoration — so this guard would have been
+/// silently absent precisely under the copilot rendering it is for. Post-#828
+/// the reading is a structural superset whose safe answer is `Unverifiable`,
+/// which is the branch that keeps today's behaviour here.
+///
+/// Pure and total, so every cell is directly assertable — `deliver_now` needs a
+/// concrete `Wry` `AppHandle` and is unreachable by every test in this repo,
+/// which is the same reason `preenter_admission` and `flush_stranded_text` were
+/// extracted rather than left inline.
+#[doc(hidden)] // pub for integration tests
+pub fn stranded_paste_guard(
+    prev_confirmed: Option<bool>,
+    // Whether `flush_stranded_text` actually pressed. `true` means the box was
+    // cleared by our own Enter, so there is nothing left to collide with.
+    flushed: bool,
+    // Tier 1 on the PREVIOUS delivery's own recorded text, or `None` when the
+    // ledger carries none to look for.
+    text_reading: Option<BoxReading>,
+) -> StrandedPasteGuard {
+    if flushed {
+        return StrandedPasteGuard::Paste;
+    }
+    if !matches!(prev_confirmed, Some(false)) {
+        return StrandedPasteGuard::Paste;
+    }
+    if text_reading == Some(BoxReading::Holds) {
+        return StrandedPasteGuard::AbortStranded;
+    }
+    StrandedPasteGuard::Paste
 }
 
 /// The stranded-text flush STEP (#81/#84, #420 rev-15 B1) — decides via
