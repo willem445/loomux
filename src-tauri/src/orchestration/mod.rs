@@ -14933,10 +14933,33 @@ pub fn box_reading(stripped_tail: Option<&str>, pasted: &str) -> BoxReading {
 /// crosses a row boundary that carries decoration `deframe` cannot reach, or a
 /// hard mid-word wrap — a narrow pane raises the odds of crossing a boundary
 /// at all, it does not itself break anything. Where that happens the reading
-/// falls through to `NotHolding`. Containment is wrap-agnostic either way, so
-/// such a pane loses only this backstop, which did not exist before #821:
-/// there is no width at which this is a regression, only one at which it is
-/// less of an improvement.
+/// falls through to `NotHolding`.
+///
+/// **Why that is still not a regression** (rev-306 F1). An earlier wording
+/// justified this with "containment is wrap-agnostic", and that does not
+/// survive the second cause above: a hard mid-word wrap splits one word into
+/// two tokens, so it defeats CONTAINMENT too, not merely the probe. The
+/// conclusion holds on a different argument — that case is **unchanged by
+/// #821, not introduced by it**. `normalize_prompt_text` flattened the break
+/// into a space the needle lacked in exactly the same way, so a hard mid-word
+/// wrap read `NotHolding` before this change and reads `NotHolding` after it.
+/// What #821 moves is elsewhere, and both directions are away from the
+/// dangerous reading: de-framing turns the gutter case from `NotHolding` into
+/// `Holds`, and the probe turns residual failures into `Unverifiable`.
+///
+/// **The one corner where that is not a superset**, found while re-deriving
+/// this rather than left for a later reviewer: de-framing can cost a match
+/// that previously succeeded, where a row boundary lands immediately before a
+/// character [`is_frame_char`] strips which is MID-line in our own text (a
+/// wrap between `run` and `* now`). The tail loses the `*`, the needle keeps
+/// it. That lands on `Unverifiable` via the length arm or this probe in any
+/// real delivery — but for a paste whose longest line is under
+/// [`PASTE_ECHO_PROBE_MIN_CHARS`] there is no probe, and it can read
+/// `NotHolding` where the pre-#821 code read `Holds`. It needs a pane narrow
+/// enough to wrap a sub-24-character line, which is degenerate for a GUI pane,
+/// and it is strictly narrower than the hard-wrap case above — but it is a
+/// corner, so "no width at which this regresses" is true of every real
+/// delivery rather than universally.
 fn paste_echo_probe(pasted: &str) -> Option<String> {
     pasted
         .lines()

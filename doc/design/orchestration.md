@@ -6918,10 +6918,29 @@ rest of the floor, the latter because `deframe` is now shared across both gates.
   the entire known copilot shape. It fails only where its span crosses a boundary carrying
   decoration `deframe` cannot reach (a trailing scrollbar `┃`) or a HARD mid-word wrap, which
   splits one word into two tokens and inserts a space the needle lacks. A narrow pane raises the
-  odds of crossing a boundary; it is not itself the breaker. **And containment is wrap-agnostic**,
-  so such a pane loses only this backstop — which did not exist before #821. There is no width at
-  which this change is a regression, only one at which it is less of an improvement, which is why
-  sizing the probe from real terminal geometry is not worth the coupling.
+  odds of crossing a boundary; it is not itself the breaker.
+
+  **Why that is still not a regression, on the argument that survives (rev-306 F1).** An earlier
+  wording justified this with "containment is wrap-agnostic", and that clause does not survive the
+  second cause: a hard mid-word wrap defeats *containment* too, not merely the probe. The
+  conclusion stands on a different footing — that case is **unchanged by #821 rather than
+  introduced by it**. `normalize_prompt_text` flattened the break into a space the needle lacked in
+  exactly the same way, so a hard mid-word wrap read `NotHolding` before this change and reads
+  `NotHolding` after it. What #821 moves is elsewhere, and both moves are away from the dangerous
+  reading: de-framing turns the gutter case from `NotHolding` into `Holds`, and the probe turns
+  residual failures into `Unverifiable`. Sizing the probe from real terminal geometry would buy
+  nothing here and would couple this to a width the comparison deliberately does not know.
+
+  **The one corner where it is not a superset**, found while re-deriving that argument rather than
+  left for a later reviewer: de-framing can cost a match that previously succeeded, where a row
+  boundary lands immediately before a character `is_frame_char` strips which is MID-line in our own
+  text — a wrap between `run` and `* now`, so the tail loses the `*` and the needle keeps it. In
+  any real delivery that lands on `Unverifiable`, via the length arm or the probe; but a paste
+  whose longest line is under `PASTE_ECHO_PROBE_MIN_CHARS` has no probe, and it can then read
+  `NotHolding` where the pre-#821 code read `Holds`. That needs a pane narrow enough to wrap a
+  sub-24-character line — degenerate for a GUI pane, and strictly narrower than the hard-wrap case
+  — so the claim to make is "no width at which this regresses **for any real delivery**", not a
+  universal one.
 - A wrap landing such that a continuation row *starts* with a character `deframe` strips (a `*` in
   `2 * 3`, mid-line in our own text) de-frames on the tail side but not the needle side.
   Containment then fails and the probe catches it as `Unverifiable` — the safe direction, and the
