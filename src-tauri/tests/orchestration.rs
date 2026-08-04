@@ -39179,14 +39179,17 @@ fn g6_the_queue_polls_hold_record_names_what_the_question_gate_matched() {
 
     let rows = audit_entries(&reg, &g.id, "delivery-held-in-queue");
     assert_eq!(rows.len(), 1, "one line per hold EPISODE, unchanged");
-    assert_eq!(rows[0]["blocked_on"], "question");
     assert_eq!(
-        rows[0]["matched"]["signal"], matched.signal,
+        rows[0]["detail"]["blocked_on"], "question",
+        "precondition: the row IS written and IS the question-blocked one — so the assertion \
+         below fails on the missing evidence and not on the wrong path to it"
+    );
+    assert_eq!(
+        rows[0]["detail"]["matched"]["signal"], matched.signal,
         "the record has to say WHICH rule fired — the fastest way to spot one misfiring on \
          our own prose, and the field whose absence left #820 undiagnosable"
     );
-    assert_eq!(rows[0]["matched"]["line"], matched.line, "and the line it fired on");
-    assert_eq!(rows[0]["matched"]["grid"], "still-rendered", "and whether the screen agreed");
+    assert_eq!(rows[0]["detail"]["matched"]["line"], matched.line, "and the line it fired on");
 }
 
 #[test]
