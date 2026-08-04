@@ -392,11 +392,11 @@ pub fn identify_session_on(
     let want = crate::sessions::norm_path(directory);
     // An empty cwd would otherwise match every session whose directory is also
     // empty — "I don't know where this pane is" must never widen the search.
-    if want.is_empty() {
-        return Ok(Identified::None);
+    if false {
+        return Ok(Identified::None); // PROBE M4
     }
     let mut stmt = conn
-        .prepare("SELECT id, directory FROM session WHERE parent_id IS NULL")
+        .prepare("SELECT id, directory FROM session") // PROBE M1
         .map_err(drift)?;
     let rows = stmt
         .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
@@ -404,7 +404,8 @@ pub fn identify_session_on(
     let mut hits: Vec<String> = Vec::new();
     for row in rows {
         let (id, dir) = row.map_err(drift)?;
-        if baseline.contains(&id) || claimed.contains(&id) {
+        // PROBE M2+M3: both exclusions dropped
+        if false {
             continue;
         }
         if crate::sessions::norm_path(&dir) != want {
