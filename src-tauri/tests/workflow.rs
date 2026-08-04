@@ -1966,6 +1966,182 @@ fn copilot_native_agent_is_refused_when_the_handle_names_a_different_file() {
     assert!(kickoff.is_none(), "the native flag carries it — nothing to inject");
 }
 
+// ───── #802: a persona's `tools:` filter must not strip loomux's MCP tools ─────
+//
+// The live failure, three rounds deep: every custom-workflow copilot delegate
+// came up with the loomux MCP server listed and none of its tools usable, while
+// the built-in roster on the same machine was fine. Copilot's custom-agent
+// `tools:` frontmatter is a FILTER over built-in AND MCP tools (custom-agents
+// configuration reference, *Tools processing*), and a `profile:` pointing at a
+// `.github/agents/*.md` that carries one is the ONLY thing a workflow block adds
+// to the `--agent` target. loomux's own generated file has never had the key, so
+// it inherits the documented all-tools default — hence the split.
+
+/// A copilot block whose `profile:` names `.github/agents/<file>`.
+fn copilot_profile_workflow(block: &str, file: &str) -> String {
+    format!(
+        "version: 1\nblocks:\n  - id: {block}\n    kind: worker\n    cli: copilot\n\
+         \x20   profile: .github/agents/{file}\n"
+    )
+}
+
+#[test]
+fn copilot_persona_tools_list_without_loomux_is_repaired_by_a_generated_copy() {
+    let (reg, d) = test_registry();
+    let repo = Repo::new()
+        .workflow(&copilot_profile_workflow("w", "scoped.md"))
+        .agent_file(
+            "scoped.md",
+            "---\nname: scoped\ndescription: A scoped worker.\ntools: [\"read\", \"edit\", \"execute\"]\n---\nBranch, then open a PR.",
+        );
+    let g = reg.create_group(&repo.path(), rails()).unwrap();
+    let (cmd, argv, _kickoff) = compile(&reg, &g, "w");
+
+    // The whole defect in one assertion: `--agent scoped` hands copilot a file
+    // whose `tools:` list filters every loomux tool out of the delegate. It must
+    // name loomux's OWN copy instead.
+    let handle = argv[argv.iter().position(|a| a == "--agent").unwrap() + 1].clone();
+    assert_ne!(
+        handle, "scoped",
+        "a persona whose tools: list drops loomux must not be launched as-is — that delegate \
+         cannot report (#802): {cmd}"
+    );
+
+    let generated = fs::read_to_string(d.path().join("copilot-agents").join(format!("{handle}.agent.md")))
+        .expect("the generated copy must exist");
+    // Valid YAML frontmatter, not just a substring that looks right — the same
+    // bar `generated_agent_files_satisfy_each_clis_documented_required_
+    // frontmatter_fields` set after `CustomAgentLoadFailedError`.
+    let front: serde_norway::Value = {
+        let mut parts = generated.splitn(3, "---\n");
+        assert_eq!(parts.next(), Some(""), "must open with a bare --- line: {generated}");
+        serde_norway::from_str(parts.next().expect("a closing --- must follow"))
+            .unwrap_or_else(|e| panic!("frontmatter did not parse as YAML: {e}\n{generated}"))
+    };
+    let tools: Vec<String> = front["tools"]
+        .as_sequence()
+        .unwrap_or_else(|| panic!("the copy must carry a tools: sequence: {generated}"))
+        .iter()
+        .map(|t| t.as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        tools.contains(&"loomux/*".to_string()),
+        "the documented server-wildcard grant must be present: {tools:?}"
+    );
+    // The user's own scoping intent survives verbatim — loomux widens by exactly
+    // one server, it does not hand the delegate every tool in the CLI.
+    for kept in ["read", "edit", "execute"] {
+        assert!(tools.contains(&kept.to_string()), "the persona's own entries must survive: {tools:?}");
+    }
+    assert!(
+        generated.contains("Branch, then open a PR."),
+        "and the persona text still reaches the agent: {generated}"
+    );
+
+    let audit = fs::read_to_string(reg.state_root().join(&g.id).join("audit.jsonl")).unwrap();
+    assert!(
+        audit.lines().any(|l| l.contains("copilot-persona-tools-gap")),
+        "the class that cost #802 three rounds must never be silent again: {audit}"
+    );
+}
+
+#[test]
+fn copilot_persona_that_grants_loomux_or_declares_no_tools_keeps_the_native_path() {
+    // The repair must not over-trigger: an unfiltered persona (the common case,
+    // and every file in this repo's own `.github/agents/`) is untouched, and so
+    // is one that already grants the server — by `*`, by `loomux/*`, or by the
+    // bare argv spelling the CLI's own `--allow-tool` uses.
+    for tools_line in ["", "tools: [\"*\"]\n", "tools: [\"read\", \"loomux/*\"]\n", "tools: [\"read\", \"loomux\"]\n"] {
+        let (reg, d) = test_registry();
+        let repo = Repo::new().workflow(&copilot_profile_workflow("w", "open.md")).agent_file(
+            "open.md",
+            &format!("---\nname: open\ndescription: An open worker.\n{tools_line}---\nDo the work."),
+        );
+        let g = reg.create_group(&repo.path(), rails()).unwrap();
+        let (cmd, _argv, kickoff) = compile(&reg, &g, "w");
+        assert!(
+            cmd.contains("--agent open"),
+            "tools_line {tools_line:?} grants loomux (or filters nothing), so #222's native path \
+             is unchanged: {cmd}"
+        );
+        assert!(kickoff.is_none(), "the native flag carries it: {tools_line:?}");
+        // The generated-copy directory is keyed by a handle loomux mints, so
+        // assert on the directory rather than guessing the name: nothing at all
+        // should have been written for a persona that needed no repair.
+        let copies = d.path().join("copilot-agents");
+        let wrote_any = fs::read_dir(&copies).map(|mut e| e.next().is_some()).unwrap_or(false);
+        assert!(!wrote_any, "loomux wrote a copy it did not need: {tools_line:?}");
+        let audit = fs::read_to_string(reg.state_root().join(&g.id).join("audit.jsonl")).unwrap();
+        assert!(
+            !audit.lines().any(|l| l.contains("copilot-persona-tools-gap")),
+            "a false-positive warning would train the human to ignore the real one: {tools_line:?}\n{audit}"
+        );
+    }
+}
+
+#[test]
+fn copilot_persona_declaring_its_own_mcp_servers_is_warned_never_rewritten() {
+    // The one case loomux must NOT repair. A generated copy models loomux's own
+    // server and nothing else, so re-pointing `--agent` at it would silently
+    // delete the servers the user declared — trading #802's missing-tools bug
+    // for a different one. Warn loudly, launch native, let a human fix the file.
+    let (reg, _d) = test_registry();
+    let repo = Repo::new().workflow(&copilot_profile_workflow("w", "byo.md")).agent_file(
+        "byo.md",
+        "---\nname: byo\ndescription: Brings its own MCP.\ntools: [\"read\", \"custom-mcp/tool-1\"]\n\
+         mcp-servers:\n  custom-mcp:\n    type: local\n    command: node\n---\nUse the custom server.",
+    );
+    let g = reg.create_group(&repo.path(), rails()).unwrap();
+    let (cmd, _argv, _kickoff) = compile(&reg, &g, "w");
+    assert!(
+        cmd.contains("--agent byo"),
+        "dropping a user's own mcp-servers to fix a tools gap is not a trade loomux may make: {cmd}"
+    );
+    let audit = fs::read_to_string(reg.state_root().join(&g.id).join("audit.jsonl")).unwrap();
+    let line = audit
+        .lines()
+        .find(|l| l.contains("copilot-persona-tools-gap"))
+        .unwrap_or_else(|| panic!("the unrepaired gap is the MOST important one to say out loud: {audit}"));
+    assert!(
+        line.contains("mcp-servers"),
+        "the audit must say WHY it was left alone, or the next reader re-opens #802: {line}"
+    );
+}
+
+#[test]
+fn mcp_spawn_reply_says_when_a_persona_tools_list_stripped_the_loomux_server() {
+    // The detection half, at the surface that matters: whoever asked for the
+    // spawn is the party that can fix the file. #802 survived two doc-grounded
+    // fixes because nothing said this out loud at spawn time — an agent that
+    // cannot call loomux looks, from inside its own pane, exactly like loomux
+    // being broken.
+    let (reg, _d) = test_registry();
+    let repo = Repo::new()
+        .workflow(&copilot_profile_workflow("w", "scoped.md"))
+        .agent_file(
+            "scoped.md",
+            "---\nname: scoped\ndescription: A scoped worker.\ntools: [\"read\"]\n---\nDo the work.",
+        )
+        .git_init();
+    let g = reg.create_group(&repo.path(), rails()).unwrap();
+    let caller = orch_caller(&reg, &g.id);
+    let out = dispatch(
+        &reg,
+        &caller,
+        "tools/call",
+        &json!({ "name": "spawn_agent", "arguments": { "block": "w", "task": "t" } }),
+    )
+    .unwrap();
+    assert_eq!(out["isError"], json!(false), "{:?}", out["content"][0]["text"]);
+    let text = out["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("loomux/*"),
+        "the reply must carry the exact line to add to the persona file: {text}"
+    );
+    assert!(text.contains("scoped"), "...and name the persona to add it to: {text}");
+}
+
+
 // ───── #417 correction round 5, promoted to an enum in round 8: contract_carrier ─────
 
 #[test]
