@@ -113,10 +113,23 @@ export function documentVisibility(doc: VisibilityDocument): VisibilitySource {
 let sharedSource: VisibilitySource | null = null;
 
 /** The one source every gate shares by default, created on first use so that
- *  importing this module from Node (the unit tests) never touches `document`. */
-function defaultVisibility(): VisibilitySource {
+ *  importing this module from Node (the unit tests) never touches `document`.
+ *
+ *  Exported (#813) because the poll gate is no longer the only consumer: the
+ *  pane output throttle reads the same bit per chunk (`panethrottle.ts`'s
+ *  `hidden`). One definition of what "hidden" MEANS — `visibilityState !==
+ *  "hidden"`, per this module's own note on why that beats `document.hidden` —
+ *  matters more once two subsystems act on it, since a second inline spelling
+ *  is free to drift from this one. Still lazy, so a Node import of anything
+ *  that transitively reaches here does not touch `document` unless it asks. */
+export function sharedVisibility(): VisibilitySource {
   if (sharedSource === null) sharedSource = documentVisibility(document);
   return sharedSource;
+}
+
+/** Internal alias kept for the gate's own call sites. */
+function defaultVisibility(): VisibilitySource {
+  return sharedVisibility();
 }
 
 export interface PollGateOptions {

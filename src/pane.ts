@@ -40,6 +40,7 @@ import {
 import { createOrderedWriter } from "./ptywrite";
 import { createHumanOriginLatch } from "./humanorigin";
 import { decideFlush, WOKEN, MAX_PENDING_BYTES } from "./panethrottle";
+import { sharedVisibility } from "./pollgate";
 import { decideRefresh, REPO_SIGNAL_WINDOW_MS } from "./refreshthrottle";
 import { planWebglRetry } from "./webglretry";
 import { showToast } from "./toast";
@@ -1395,6 +1396,14 @@ export class Pane implements VoiceTargetPane {
       pendingBytes: this.pendingOutBytes,
       windowMs: getSettings().unfocusedRenderThrottleMs,
       maxPendingBytes: MAX_PENDING_BYTES,
+      // #813: read per chunk rather than latched on `visibilitychange`. The
+      // event is a notification and a notification can be missed — the same
+      // reason pollgate.ts re-READS the state instead of trusting the event it
+      // was suppressed by — and here a missed event would mean a pane that
+      // keeps deferring behind a clamped timer for as long as the window stays
+      // hidden, with nothing to release it. A property read per chunk is
+      // cheaper than the timer it replaces.
+      hidden: !sharedVisibility().visible(),
     });
     if (decision.kind === "flush") {
       this.flushOutput();

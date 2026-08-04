@@ -106,7 +106,11 @@ const STREAMS: StreamRow[] = [
     reason:
       "The app's only per-chunk producer flood, and now its best-covered stream: P2 bounds it " +
       "backend-side to <=1 event per pane per 16 ms with a 64 KiB batch cap and a leading edge " +
-      "(#714), and unfocused panes are throttled again handler-side by panethrottle.ts (#720/#733).",
+      "(#714), and unfocused panes are throttled again handler-side by panethrottle.ts (#720/#733). " +
+      "That handler-side throttle is OFF while the document is hidden (#813): its saving is " +
+      "render passes, and a hidden page schedules none (RenderDebouncer is rAF-driven), while " +
+      "the deferral's own setTimeout is clamped by the hidden page and sits in front of xterm's " +
+      "query auto-replies — the one path out of the terminal that is not display.",
     debt: null,
   },
   {
