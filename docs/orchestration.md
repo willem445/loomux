@@ -351,9 +351,17 @@ These deserve their own detail — see:
     clicking one focuses the pane and acknowledges it.
   - The red **⚠ stuck prompt** chip is the exception. It means a prompt loomux
     sent was never submitted, and it stays up until loomux has evidence the pane
-    is fine again — which, on a pane that has gone idle, may never arrive. So
-    that chip carries its own **✕ dismiss** button beside it. Clicking ✕ takes
-    the chip down for good, whatever raised it.
+    is fine again. loomux keeps looking for that evidence for as long as the chip
+    is up — every half-minute or so it re-reads the pane, even long after the
+    delivery that raised the chip has been given up on. If the prompt has left the
+    box **and** you have typed in that pane since, the chip comes down on its own;
+    if the prompt is still sitting there, or loomux cannot read enough of the pane
+    to tell, the chip stays, because taking it down would be the one mistake it
+    exists to prevent.
+  - Some chips have no reading that could ever release them — one reporting
+    messages that were discarded while the group was paused is about something
+    that already happened. So that chip carries its own **✕ dismiss** button
+    beside it. Clicking ✕ takes the chip down for good, whatever raised it.
   - **✕ takes the chip down and nothing else.** It does not unstick the pane, and
     loomux never presses Enter on your behalf because you dismissed something. If
     the prompt really is still sitting unsubmitted in that pane's input box, it
@@ -451,6 +459,23 @@ it is still sitting there, loomux keeps waiting for a safe moment to press Enter
 alternative is pasting the next message on top of it and sending the two merged into one. So a
 pane blocked by your own half-typed line, or by a dialog waiting for an answer, still holds its
 queue, and the chip is what tells you it needs you.
+
+**And on a pane nobody is delivering to any more.** The check above rides a repair or a
+delivery, so it used to stop once loomux gave up on the pane — after which a chip on a
+finished worker or a drained orchestrator could stay up until you restarted. It no longer
+does: for as long as a **⚠ stuck prompt** chip is up, loomux re-reads that pane every half
+minute and applies the same rule. Two things have to be true together for the chip to come
+down by itself — the prompt is no longer in the box, **and** you have typed in that pane
+since loomux submitted it. Either alone is not enough, deliberately: a prompt that vanished
+with nobody at the keyboard is exactly the case where the chip is the only trace left of it,
+and a keystroke on its own says nothing about where the prompt went.
+
+Between those, the wording can still change under you. A chip that said loomux could not
+read the pane, or that its repair attempts were used up, becomes "its text is gone — check
+the pane" once loomux can see the box is clear. That is the chip getting more honest, not a
+new problem: it stays up, and it stays up until you deal with it or dismiss it. Whatever
+takes a chip down — your ✕, or loomux's own reading — is written to the group's audit log
+with what it was and what was read, so you can always look up where one went.
 
 ## Cross-workspace channels
 

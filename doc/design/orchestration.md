@@ -11354,9 +11354,132 @@ could never have been clicked, and refusing to accept a group as a path segment 
 
 ### Not in this slice
 
-The automatic releases for the three evidence-bearing classes (a badge janitor that outlives
-the late monitor) and `QueueFull`'s drain-edge re-admission are plan-312's M2 and M3, and
-#825 stays open for them. This slice adds no automatic release of any kind.
+The automatic releases for the three evidence-bearing classes are M2, immediately below.
+`QueueFull`'s drain-edge re-admission is plan-312's M3, and #825 stays open for it. This
+slice adds no automatic release of any kind.
+
+## The badge honesty check outlives the monitor that made it (#825, M2)
+
+The issue's framing needs one correction, and it decides the shape of the fix.
+`run_late_confirmation_monitor`'s `KeepWaiting` arm has kept a raised chip honest on every
+5-second tick since #496 PR-C: it reads the box against our own stranded text, clears on a
+genuine present→absent transition, and re-derives the chip's wording live. So the latch was
+never *"no release logic exists"*. The release logic **dies with the monitor** at
+`LATE_MONITOR_MAX_LIFETIME` (four hours), and on an idle pane nothing looks again — ever.
+
+The latch is therefore two regimes of *observation*, not two regimes of *logic*, and the
+honest fix is to hoist the check rather than invent a second one. `DeliveryOutcome::
+stranded_text` (#813) already outlives the monitor, so every input this needs persists
+already; there is no new bookkeeping anywhere in M2.
+
+### One matrix, one writer, two observers
+
+- `stranded_badge_release` is the decision: `Clear(why) | Reword(blocker) | Keep`.
+- `OrchRegistry::apply_stranded_verdict` is the write.
+- The monitor's `KeepWaiting` arm and `OrchRegistry::stranded_janitor_pass` are two
+  *observers* that ask them the same question.
+
+Two honesty checks that could drift is the failure mode a copy would have shipped: a chip
+that clears under a live monitor and re-latches an hour later, or the reverse, with no
+reader able to say which was right. The hoist also drags two cells into the monitor that
+were not there before — #819's human-resolved clear, and the wording upgrade below — and
+that is the point rather than a side effect. A chip must not mean one thing while a monitor
+is alive and another an hour after it exits.
+
+### The bar for a clear, per class
+
+The three classes a pane reading can answer are `NotHolding`, `Unverifiable` and
+`Exhausted`: each one's badge is a claim about *where our text is*, so a later reading of
+the same box is evidence about the same question. A clear needs #819's `HumanResolved` bar,
+unchanged and extended from the queued-marker path to badge-only panes — a positive
+`BoxReading::NotHolding` on the text the ledger still records, **and** a human keystroke
+since our own submit. The reason string is taken from `StrandedRetireReason::HumanResolved`
+rather than spelled again, so the drainer's retirement and the janitor's clear cannot come
+to mean two different things in a log someone is reading to find out where their prompt
+went.
+
+Each half is load-bearing:
+
+- `NotHolding` alone is `StrandedRetireReason::TextGone`, which #819 declined to clear on —
+  "our text left the box with nobody at the keyboard" is exactly `StrandedBlocker::
+  NotHolding`'s own sentence, and clearing there answers a question loomux cannot answer.
+- The keystroke alone is #518's phantom, which is why a stamp only ever *names* a release a
+  box reading has already licensed.
+
+Requiring both is also what contains the two residuals this inherits. #828's remaining
+false `NotHolding` (a hard mid-word wrap) can only ever change a chip's *wording*, so a
+clear takes two independent failures — a misread box *and* a phantom keystroke — which is
+the same conjunction #819 already accepts one path over. A false clear on `NotHolding`
+alone would be a clear on `TextGone`, which is the thing neither path does.
+
+Where the reading is `NotHolding` and no keystroke is on record, the chip stays up and is
+**re-worded** to `NotHolding`. `Unverifiable` says "we could not read the box" and
+`Exhausted` says "a heal fired and the text still read `Holds`"; both are stale sentences
+about a box we have now read, and a chip that overstates what loomux knows is the same
+honesty failure as one that overstays.
+
+Everything else keeps the chip. `Holds`, `Unverifiable` and "no recorded text" are three
+different facts sharing one conservative branch — nothing is released on an absence of
+evidence, the single direction that could hide an unsubmitted prompt behind a chip that
+went away. `PauseSuppressed` and the queue and hold classes are not this mechanism's to
+release at all: a box reading establishes nothing about them.
+
+### Why the two observers are not symmetric
+
+`saw_text_in_box` is a fact about the **observer**, not the pane, and it is the only input
+the two differ on. The monitor watches one delivery continuously, so it can witness a
+genuine present→absent transition — our text was in that box and now is not, so whoever
+pressed Enter, the pane is not wedged. The janitor starts, by construction, on panes whose
+monitor is already gone; it has no such memory, can never witness a transition, and so
+passes `false` always and clears on the stricter bar instead. The transition clear is
+unchanged by the hoist: it still fires for every class, and it still outranks the
+keystroke-named clear, because where the text went is a stronger claim than who was at the
+keyboard.
+
+### A re-word is never a raise
+
+Since M1, an absent `attn_stranded` entry can mean *a human dismissed the chip*. Every
+badge-honesty write reads the note at the top of a pass and writes it back at the bottom, so
+"there was a chip here a moment ago" is exactly the stale premise a dismissal invalidates —
+and `mark_stranded` **inserts**. On the monitor's live re-check that was a live defect in
+its most reproducible form: dismiss the "loomux is re-sending it" chip and it came straight
+back on the next 5-second tick.
+
+`reword_stranded` updates in place or does nothing, so an absent entry stays absent whatever
+the timing. It also takes the blocker the caller judged and compares before it writes, so a
+verdict about a chip another mechanism has since re-raised cannot overwrite the fresher
+diagnosis. The janitor inherits both guarantees by going through the same writer, and it
+never iterates anything but entries that already exist.
+
+### Cadence and cost
+
+The pass rides the existing attention loop (3s) every tenth tick, ~30s, rather than owning a
+thread: it answers the same "does this pane still need the human" question that loop exists
+to ask, just from the pane instead of from the registry. The cadence is divided because the
+answer only changes when a human touches the pane, and the work reads a pty ring. 30s is a
+choice, not a finding; the INV-4 bound that makes it defensible sits at the call site in
+`start_attention` and rests on four things — no pty read at all unless a chip is up in one
+of the three classes (`attn_stranded` is empty on a healthy session, and the pass returns
+after one uncontended map lock); per badged pane one `Tier1Scan::for_paste` normalize plus
+`Tier1Scan::widen`'s own capped ring reads and one keystroke-stamp read; one sixth the rate
+at which the late monitor already takes the identical read on the same panes; and a worst
+case bounded by the badged-pane count.
+
+It is self-limiting in the sense #819 F3 used: the reading is what takes the chip down, so
+the work ends the condition that schedules it.
+
+### What it writes, and what it never writes
+
+The janitor takes a chip down or re-words one. No hold is released, no queue entry admitted,
+no Enter pressed, no byte written to a pane — the same safety line M1 states, and what keeps
+the whole of #825 outside #813's blast radius.
+
+A clear by inference owes its evidence the way M1's `stranded-dismissed` records the class
+behind a clear by gesture. `stranded-cleared` alone says `why: "human-resolved"`, which the
+drainer's own #819 retirement also writes, so a `stranded-janitor` line (blocker, reading,
+`human_since_submit`) goes ahead of the clear: without it a human whose chip vanished could
+not tell which mechanism took it down, nor what it read to decide. Only on an actual clear —
+never per pass.
 
 ## Risks / limitations
 

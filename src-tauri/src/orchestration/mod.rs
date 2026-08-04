@@ -2408,6 +2408,17 @@ const MAX_IDLE_TICK_FALLBACK_MINUTES: u32 = 60 * 24 * 7;
 /// (idle-with-prompt detection; report/gate signals are event-driven and
 /// picked up on the next tick).
 const ATTENTION_INTERVAL: Duration = Duration::from_secs(3);
+/// How many attention ticks apart the stuck-prompt badge janitor runs (#825
+/// M2) — every 10th, so ~30s. It rides this loop rather than owning a thread
+/// because it is the same "does this pane still need the human" question the
+/// loop already exists to ask, just answered from the pane instead of from the
+/// registry; a second thread would be a second cadence to reason about for no
+/// gain. Divided rather than per-tick because the answer only changes when a
+/// human touches the pane: at 3s the pass would take ten times the pane reads
+/// to notice the same thing ten times later at worst, which is the wrong
+/// trade for work that reads a pty ring. See `start_attention` for the cost
+/// bound this cadence is half of.
+const STRANDED_JANITOR_EVERY_N_TICKS: u64 = 10;
 /// A pane's terminal output must be stable (unchanged) at least this long
 /// before an idle-with-prompt is asserted — the CLI has stopped painting and
 /// is genuinely parked on a prompt, not mid-render. Measured across ticks, so
@@ -14345,6 +14356,177 @@ pub fn stranded_reword(live: StrandedBlocker, redelivery_in_flight: bool) -> Opt
     }
 }
 
+/// What one live box reading is allowed to do to a badge that is already up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BadgeRelease {
+    /// Take the chip down, with this `clear_stranded` reason.
+    Clear(&'static str),
+    /// Keep the chip up and say something truer about it. Never an insert —
+    /// see [`OrchRegistry::reword_stranded`].
+    Reword(StrandedBlocker),
+    /// This reading establishes nothing that changes the chip.
+    Keep,
+}
+
+/// The badge-honesty matrix (#825 M2): given a raised badge and one live
+/// reading of the pane, may the chip come down, and if not, does it still say
+/// the right thing?
+///
+/// # Why this is a function and not two pieces of inline logic
+///
+/// The check itself is not new. `run_late_confirmation_monitor`'s `KeepWaiting`
+/// arm has kept a raised badge honest every `LATE_MONITOR_POLL` since #496
+/// PR-C — but only for as long as that monitor lives, which is
+/// `LATE_MONITOR_MAX_LIFETIME` (four hours) at the outside and usually far
+/// less. So the badge latch has never really been two regimes of *logic*, only
+/// two regimes of *observation*: while a monitor is alive the chip
+/// self-corrects, and after it exits nothing looks at the pane again, ever.
+/// That is the whole of #825's "indefinite latch" for the three classes below.
+///
+/// The fix is therefore a hoist, not a second opinion. This function is the
+/// decision, extracted; the monitor's arm and `OrchRegistry::stranded_janitor_
+/// pass` are two *observers* that ask it the same question. Two honesty checks
+/// that could drift is the failure mode a copy would have shipped — the one
+/// where a chip clears under a live monitor and re-latches an hour later, or
+/// the reverse, and no reader could say which was right.
+///
+/// # What each caller can and cannot see
+///
+/// `saw_text_in_box` is the one input the two observers genuinely differ on,
+/// and it is a fact about the *observer*, not the pane. The monitor watches one
+/// delivery continuously, so it can witness a genuine present→absent
+/// TRANSITION: our text was in that box, and now it is not, so whoever pressed
+/// Enter, the pane is no longer wedged. The janitor arrives with no such
+/// memory — it starts, by construction, on panes whose monitor is already gone
+/// — so it can never pass anything but `false` here, and needs strictly
+/// stronger evidence to clear on. Hence the two clear arms.
+///
+/// # The evidence bar for a clear without a transition
+///
+/// Exactly #819's `HumanResolved` bar, extended from the queued-marker path to
+/// badge-only panes: a positive [`BoxReading::NotHolding`] on the text the
+/// ledger still records **and** a human keystroke on this pane since our own
+/// submit. Both halves are load-bearing.
+///
+/// - `NotHolding` alone is [`StrandedRetireReason::TextGone`], which #819
+///   deliberately declined to clear on: our text left the box with nobody at
+///   the keyboard is precisely [`StrandedBlocker::NotHolding`]'s own sentence
+///   ("never confirmed and its text is gone — check the pane"). Clearing there
+///   would answer a question loomux cannot answer.
+/// - The keystroke alone is #518's phantom — a terminal auto-reply
+///   misclassified as a person — and is why the stamp only ever *names* a
+///   release that a box reading has already licensed. It never licenses one.
+///
+/// Requiring both also contains the two residuals this inherits rather than
+/// absorbing them silently:
+///
+/// 1. **#828's remaining false `NotHolding`** (a hard mid-word wrap). A lone
+///    false reading only ever re-words here; it takes two independent failures
+///    — a misread box AND a phantom keystroke — to reach a clear, and that
+///    conjunction is the same one #819 already accepts on the marker path.
+/// 2. **#518's phantom stamp.** Same bar, same path, same acceptance. A
+///    phantom over a genuinely-gone text is a clear on `TextGone`, which is why
+///    nothing below may clear on `NotHolding` alone.
+///
+/// # Reading the matrix
+///
+/// Nothing but a positive `NotHolding` establishes anything at all. `Holds`
+/// (our text is demonstrably still sitting there), `Unverifiable` (we looked
+/// and could not tell) and `None` (the ledger records no text to look for) are
+/// three different facts, and all three keep the chip: this is the direction
+/// where being wrong hides a prompt nobody will re-send.
+///
+/// Pure and total, so every cell is directly assertable.
+#[doc(hidden)] // pub for integration tests
+pub fn stranded_badge_release(
+    // The chip that is currently up. `None` is the in-flight-heal wording
+    // ("loomux is re-sending it"), which is not this matrix's business — the
+    // monitor re-derives that one live from `stranded_selfheal_action`.
+    blocker: Option<StrandedBlocker>,
+    // What Tier 1 says about OUR OWN stranded text, or `None` when there is no
+    // recorded text to look for. Kept distinct for the reason
+    // `stranded_marker_action` keeps them distinct: "nothing to look for" and
+    // "looked and could not tell" are different facts that happen to take the
+    // same conservative branch.
+    reading: Option<BoxReading>,
+    // A human keystroke is on record for this pane since our submit —
+    // `tier1_trusted`'s inverse, the same derivation `drain_stranded_submit`
+    // takes. Names a release; never licenses one.
+    human_stamped_since: bool,
+    // The observer WATCHED our text sit in this box earlier in its own life, so
+    // a `NotHolding` now is a transition rather than a standing state. Only the
+    // late monitor can ever pass `true`; see the header.
+    saw_text_in_box: bool,
+) -> BadgeRelease {
+    // Nothing weaker than a positive absence is evidence. Ordered first so no
+    // arm below can be reached on a reading that never happened.
+    if reading != Some(BoxReading::NotHolding) {
+        return BadgeRelease::Keep;
+    }
+    if saw_text_in_box {
+        // #496 PR-C's own clear, unchanged and still the strongest reading
+        // available: present→absent, whoever pressed the Enter. It outranks the
+        // keystroke-named clear below because it is about the text rather than
+        // about who was at the keyboard, and it holds for EVERY class — a
+        // transition unwedges the pane whatever the chip happened to say.
+        return BadgeRelease::Clear("text-left-the-box");
+    }
+    match blocker {
+        // The three classes #825 leaves with no release: each one's badge is a
+        // claim about where our text is, so each one is answerable by a later
+        // reading of the same box. (`QueueFull` is a retry, not a clear — M3.
+        // `PauseSuppressed` describes a loss that already happened and can
+        // never become untrue, so no pane reading may release it; the human's
+        // explicit dismiss is its release, M1. Every hold class already has
+        // one.)
+        Some(StrandedBlocker::NotHolding)
+        | Some(StrandedBlocker::Unverifiable)
+        | Some(StrandedBlocker::Exhausted) => {
+            if human_stamped_since {
+                // The one name in this vocabulary for "a person dealt with it",
+                // taken from #819's enum rather than spelled again, so the
+                // drainer's retirement and this clear can never come to mean
+                // two different things in the audit.
+                BadgeRelease::Clear(StrandedRetireReason::HumanResolved.as_str())
+            } else if blocker != Some(StrandedBlocker::NotHolding) {
+                // The honesty upgrade. `Unverifiable` says "we could not read
+                // the box" and `Exhausted` says "a heal fired and did not
+                // take, and the text read `Holds`" — both are now stale
+                // sentences about a box we CAN read and which does not hold
+                // our text. The chip stays up (nobody has shown a human dealt
+                // with it) but it stops claiming more than we know.
+                BadgeRelease::Reword(StrandedBlocker::NotHolding)
+            } else {
+                // Already the truest thing we can say.
+                BadgeRelease::Keep
+            }
+        }
+        _ => BadgeRelease::Keep,
+    }
+}
+
+/// Whether a raised chip is worth a janitor pane read at all (#825 M2).
+///
+/// **Derived from the matrix rather than restated as a list.** The classes the
+/// janitor watches are, by definition, exactly the ones where some reading it
+/// can actually take would change the chip — so this asks
+/// [`stranded_badge_release`] instead of naming `NotHolding` / `Unverifiable` /
+/// `Exhausted` a second time. A hand-written list is a second copy of the
+/// matrix's domain, and it goes stale the first time a class is added to one
+/// and not the other: too narrow silently drops a class from the janitor with
+/// nothing red, too wide only costs a read. Neither can happen if there is one
+/// list and it is the function.
+///
+/// `NotHolding` is the only reading that ever produces a verdict (every other
+/// arm keeps the chip), and `saw_text_in_box` is always `false` for this
+/// observer, so the two keystroke states are the whole space to probe.
+fn janitor_watches(blocker: Option<StrandedBlocker>) -> bool {
+    [true, false].into_iter().any(|stamped| {
+        stranded_badge_release(blocker, Some(BoxReading::NotHolding), stamped, false)
+            != BadgeRelease::Keep
+    })
+}
+
 /// Whether a self-heal may admit its `StrandedSubmit` marker right now
 /// (#496 PR-C), and if not, the audited reason. `None` = admit.
 ///
@@ -15402,17 +15584,48 @@ fn run_late_confirmation_monitor(
                         &pasted_text,
                     );
 
-                    if paste_seen_in_box && reading == BoxReading::NotHolding {
-                        // Drop the badge the moment the stranded text leaves
-                        // the box — whoever pressed Enter (a human rescuing
-                        // the pane, or our own self-heal on a CLI that
-                        // reports no hook), it is no longer wedged and must
-                        // not keep claiming it is. Only a genuine
-                        // present→absent transition clears (see
-                        // `paste_seen_in_box`).
+                    // #825 M2: the verdict is `stranded_badge_release`'s, not
+                    // this loop's. What used to be decided here is now decided
+                    // in one place that OUTLIVES this thread — the janitor asks
+                    // the identical question of the identical reading every
+                    // ~30s once `LATE_MONITOR_MAX_LIFETIME` has taken this
+                    // monitor away. This arm keeps only what is genuinely its
+                    // own: `paste_seen_in_box`, the present→absent TRANSITION
+                    // no observer without a continuous watch can ever witness,
+                    // which is why it is passed in rather than re-derived.
+                    //
+                    // Two cells therefore reach this monitor that never did
+                    // before, both strictly narrowing what the chip claims:
+                    // #819's human-resolved clear, and the `Unverifiable` /
+                    // `Exhausted` → `NotHolding` honesty re-word. That is the
+                    // point of one matrix rather than two — a chip must not
+                    // mean one thing under a live monitor and another an hour
+                    // after it exits.
+                    //
+                    // `tier1_trusted`'s inverse, taken here at the same instant
+                    // as the reading it will be judged with. A stamp read, not
+                    // a tail scan — nothing measurable on top of the box read
+                    // this arm already takes.
+                    let human_stamped_since = !tier1_trusted(
+                        ptys.last_user_input_ms(pty_id).unwrap_or(0),
+                        submit_sent_ms,
+                    );
+                    let verdict = stranded_badge_release(
+                        note.blocker,
+                        Some(reading),
+                        human_stamped_since,
+                        paste_seen_in_box,
+                    );
+                    if r.apply_stranded_verdict(&group, &agent, note.blocker, verdict) {
+                        // The badge this flag was tracking is gone; a chip
+                        // raised again later starts its own transition.
                         paste_seen_in_box = false;
-                        r.clear_stranded(&group, &agent, "text-left-the-box");
                     } else if note.blocker.is_none() {
+                        // Reachable exactly as before: an in-flight-heal chip
+                        // only ever reaches `Keep` above (the class arms are
+                        // the three a pane reading answers), so the sole way
+                        // this arm was skipped then and now is the transition
+                        // clear.
                         // rev-47 NB1: the badge says "loomux is re-sending
                         // it", but an admitted marker is not a fired one —
                         // `flush_stranded_text` re-decides at press time and
@@ -15450,7 +15663,21 @@ fn run_late_confirmation_monitor(
                             // lost-kickoff re-delivery is queued but not yet
                             // drained (review F2).
                             if let Some(word) = stranded_reword(blocker, redeliveries_used > 0) {
-                                r.mark_stranded(&group, &agent, Some(word));
+                                // #825 M2: through the same applier, so this
+                                // is a re-word and never a raise. The note was
+                                // read at the top of the arm and is written
+                                // back here, and since M1 an entry that has
+                                // vanished in between means a human dismissed
+                                // the chip — a `mark_stranded` insert would
+                                // hand it straight back on this monitor's very
+                                // next 5s tick, which is the live complaint in
+                                // its most reproducible form.
+                                r.apply_stranded_verdict(
+                                    &group,
+                                    &agent,
+                                    note.blocker,
+                                    BadgeRelease::Reword(word),
+                                );
                             }
                         }
                     }
@@ -29828,6 +30055,131 @@ impl OrchRegistry {
         }
     }
 
+    /// The badge janitor (#825 M2): production entry point, resolving the pty
+    /// manager the same way every other attention read does. Without an
+    /// `AppHandle` there are no ptys to read and nothing to decide, which is
+    /// the honest headless answer rather than a degraded one — see
+    /// [`Self::stranded_janitor_pass`], which tests drive directly.
+    pub fn run_stranded_janitor(&self) {
+        let Some(app) = self.app.lock_safe().clone() else { return };
+        let ptys = app.state::<crate::pty::PtyManager>();
+        let ledger = self.last_delivery.clone();
+        self.stranded_janitor_pass(&ptys, &ledger);
+    }
+
+    /// One janitor pass over the raised stuck-prompt chips (#825 M2): the
+    /// badge-honesty check `run_late_confirmation_monitor` performs every
+    /// `LATE_MONITOR_POLL`, run from somewhere that outlives the monitor.
+    ///
+    /// **It is the same check, not a second one.** Both this and the monitor's
+    /// `KeepWaiting` arm take the same `Tier1Scan` + [`box_reading`] every other
+    /// reader of our own stranded text takes (#828 fixed that whole family at
+    /// once, and a third implementation would leave one of them behind next
+    /// time), and both hand the result to [`stranded_badge_release`], which
+    /// owns the decision. The only thing this observer cannot supply is
+    /// `saw_text_in_box`: it starts, by design, on panes whose monitor is long
+    /// gone, so it never witnesses a present→absent transition and must clear
+    /// on the stricter #819 bar instead. That asymmetry is load-bearing, and it
+    /// is an input to the shared matrix rather than a fork of it.
+    ///
+    /// **What it reads, and why that survives the monitor.**
+    /// `DeliveryOutcome::stranded_text` (#813) is the ledger's own record of
+    /// the text we left in a pane's box. It outlives the monitor thread, so
+    /// there is nothing new to bookkeep here — every input this needs already
+    /// persists. A record carrying no text is skipped before any pane read: a
+    /// confirmed delivery clears the field by construction, so "no text" means
+    /// there is nothing to look for, not that the box is clear.
+    ///
+    /// **It can only ever take a chip down or re-word one.** It iterates
+    /// entries that already exist in `attn_stranded` and re-words through
+    /// [`Self::reword_stranded`], which cannot insert — so a chip a human
+    /// dismissed stays dismissed even if this pass judged it microseconds
+    /// earlier. Nothing here presses Enter, admits a queue entry, or releases a
+    /// hold; the only state it touches is whether a warning is on screen.
+    ///
+    /// Takes its two impure sources as parameters — the shape
+    /// [`drain_stranded_submit`] uses, and for the same reason: the attention
+    /// loop's own pty reads go through the `AppHandle`, which a headless
+    /// integration test does not have, so a pass wired only to `self.app` would
+    /// be untestable end to end.
+    #[doc(hidden)] // pub for integration tests
+    pub fn stranded_janitor_pass(
+        &self,
+        ptys: &crate::pty::PtyManager,
+        last_delivery: &Mutex<HashMap<u32, DeliveryOutcome>>,
+    ) {
+        // Snapshot the badged panes, then drop both locks before touching a
+        // pty: every read below takes the global `ptys` mutex, and holding
+        // registry locks across them pins three locks for the length of the
+        // whole pass instead of one at a time (#717's discipline, the shape
+        // `attention_inputs` uses). A pane that changes in the gap is handled
+        // where it is acted on — `clear_stranded` is a no-op on an absent
+        // entry, and `reword_stranded` compares before it writes.
+        let panes: Vec<(String, String, u32, Option<StrandedBlocker>)> = {
+            let notes = self.attn_stranded.lock_safe();
+            // The common case by a wide margin: no chip anywhere, so the pass
+            // costs one uncontended map lock and returns without ever looking
+            // at the agents map, let alone a pty.
+            if notes.is_empty() {
+                return;
+            }
+            let agents = self.agents.lock_safe();
+            notes
+                .iter()
+                .filter(|(_, note)| janitor_watches(note.blocker))
+                .filter_map(|(id, note)| {
+                    let a = agents.get(id)?;
+                    // A pane with no running agent cannot be un-wedged by
+                    // anyone, and `attention_tick` prunes its note anyway.
+                    if a.status != AgentStatus::Running {
+                        return None;
+                    }
+                    Some((id.clone(), a.group.clone(), a.pty_id?, note.blocker))
+                })
+                .collect()
+        };
+
+        for (agent_id, group, pty_id, judged) in panes {
+            let Some(outcome) = last_delivery.lock_safe().get(&pty_id).cloned() else { continue };
+            // The ledger's CURRENT stranded text, which is the only text still
+            // findable in that box. A newer delivery having superseded the one
+            // that raised the chip does not change the question this asks —
+            // "is the text loomux most recently left in this pane still there"
+            // — and `drain_stranded_submit` reads the record the same way.
+            let Some(text) = outcome.stranded_text.clone() else { continue };
+            let reading = {
+                let mut scan = Tier1Scan::for_paste(&text);
+                let read = scan.read(|n| ptys.output_tail_bounded(pty_id, n));
+                box_reading(read.as_ref().map(|r| r.stripped.as_str()), &text)
+            };
+            // `tier1_trusted`'s inverse against THIS record's submit — the same
+            // derivation `drain_stranded_submit` takes to name a retirement,
+            // deliberately not `human_input_block_now`: that one decides
+            // whether it is safe to WRITE, and this pass never writes to a pane.
+            let human_stamped_since =
+                !tier1_trusted(ptys.last_user_input_ms(pty_id).unwrap_or(0), outcome.submit_sent_ms);
+            // `saw_text_in_box: false`, always and by construction — see the
+            // header. This observer has no continuous watch to have seen a
+            // transition with, so it clears on the stricter #819 bar instead.
+            let verdict = stranded_badge_release(judged, Some(reading), human_stamped_since, false);
+            if let BadgeRelease::Clear(_) = verdict {
+                // A clear by INFERENCE owes its evidence, the way M1's
+                // `stranded-dismissed` records the class behind a clear by
+                // gesture. `stranded-cleared` alone says `why: human-resolved`,
+                // which the drainer's own retirement (#819) also writes — so
+                // without this line a human whose chip vanished could not tell
+                // which mechanism took it down, nor what it read to decide.
+                self.audit(&group, "loomux", "stranded-janitor", json!({
+                    "to": agent_id,
+                    "blocker": judged.map(|b| b.as_str()).unwrap_or("self-healing"),
+                    "reading": reading.as_str(),
+                    "human_since_submit": human_stamped_since,
+                }));
+            }
+            self.apply_stranded_verdict(&group, &agent_id, judged, verdict);
+        }
+    }
+
     /// Record a spawn against the group's rolling-hour window and report
     /// whether the spawn-rate guardrail is now exceeded. Checks and records
     /// under one lock so concurrent spawns can't both slip past the cap.
@@ -35661,6 +36013,99 @@ impl OrchRegistry {
             m.insert(agent_id.to_string(), StrandedNote { blocker, since_ms });
             since_ms
         };
+        self.audit_stranded_attention(group, agent_id, blocker, since_ms);
+    }
+
+    /// Re-word a chip that is **already up** (#825 M2), returning whether one
+    /// was. Never inserts, which is the entire difference from
+    /// [`Self::mark_stranded`] and the reason it exists.
+    ///
+    /// **An absent entry means "nothing to do", and specifically not "raise
+    /// one".** Since #825 M1 a missing note can mean a human dismissed the
+    /// chip, so a re-word that inserted would hand them back the warning they
+    /// just took down — the live complaint, reopened by the mechanism meant to
+    /// fix it. Every re-word runs on a reading taken moments earlier, so
+    /// "moments earlier there was a chip here" is exactly the stale premise a
+    /// dismissal invalidates, and the map's own `get_mut` is the only check
+    /// that cannot race it: absent stays absent.
+    ///
+    /// `expected` guards the other half of the same gap — the chip is still up
+    /// but now says something else, because another mechanism re-raised it
+    /// between the read and this write. Re-wording *that* would overwrite a
+    /// fresher diagnosis with a verdict about a chip that is gone. Passing the
+    /// blocker the caller actually judged makes the update a compare-and-set.
+    ///
+    /// Audited as `stranded-attention`, identically to a re-word through
+    /// `mark_stranded` (which is what the late monitor's live re-check has
+    /// always been): the badge's history stays one grep, not two.
+    #[doc(hidden)] // pub for integration tests
+    pub fn reword_stranded(
+        &self,
+        group: &str,
+        agent_id: &str,
+        expected: Option<StrandedBlocker>,
+        to: Option<StrandedBlocker>,
+    ) -> bool {
+        let Some(since_ms) = ({
+            let mut m = self.attn_stranded.lock_safe();
+            match m.get_mut(agent_id) {
+                Some(note) if note.blocker == expected => {
+                    note.blocker = to;
+                    Some(note.since_ms)
+                }
+                _ => None,
+            }
+        }) else {
+            return false;
+        };
+        self.audit_stranded_attention(group, agent_id, to, since_ms);
+        true
+    }
+
+    /// Apply one [`stranded_badge_release`] verdict to a pane's chip (#825 M2),
+    /// returning whether the chip came down.
+    ///
+    /// The single WRITER, as that function is the single decider. Both
+    /// observers — the late monitor's `KeepWaiting` arm and
+    /// [`Self::stranded_janitor_pass`] — go through here, so the same verdict
+    /// cannot come to mean two things depending on which of them reached it
+    /// first. In particular a `Reword` is a re-word from both, never a raise:
+    /// see [`Self::reword_stranded`] for why an absent entry has to stay
+    /// absent.
+    ///
+    /// `judged` is the blocker the verdict was decided from, carried through so
+    /// the write can check the chip is still that one.
+    #[doc(hidden)] // pub for integration tests
+    pub fn apply_stranded_verdict(
+        &self,
+        group: &str,
+        agent_id: &str,
+        judged: Option<StrandedBlocker>,
+        verdict: BadgeRelease,
+    ) -> bool {
+        match verdict {
+            BadgeRelease::Clear(why) => {
+                self.clear_stranded(group, agent_id, why);
+                true
+            }
+            BadgeRelease::Reword(to) => {
+                self.reword_stranded(group, agent_id, judged, Some(to));
+                false
+            }
+            BadgeRelease::Keep => false,
+        }
+    }
+
+    /// The one `stranded-attention` audit line, shared by every writer of the
+    /// badge so a raise and a re-word cannot drift into two vocabularies for
+    /// the same event (the reason `BoxReading::as_str` lives next to its enum).
+    fn audit_stranded_attention(
+        &self,
+        group: &str,
+        agent_id: &str,
+        blocker: Option<StrandedBlocker>,
+        since_ms: u64,
+    ) {
         self.audit(group, "loomux", "stranded-attention", json!({
             "to": agent_id,
             "blocker": blocker.map(|b| b.as_str()).unwrap_or("self-healing"),
@@ -39548,10 +39993,51 @@ pub fn start_max_notice_flusher(reg: Arc<OrchRegistry>) {
 /// human merge gates), pushes the set to the frontend for pane badges, and
 /// toasts newly-attention panes in notification-enabled groups. Started once at
 /// app setup.
+/// (#825 M2) Every `STRANDED_JANITOR_EVERY_N_TICKS`th pass also runs the
+/// stuck-prompt badge janitor, so a raised chip keeps being checked against
+/// the pane after `run_late_confirmation_monitor` — which has done exactly
+/// that check every 5s since #496 PR-C — exits at
+/// `LATE_MONITOR_MAX_LIFETIME`. It runs FIRST so a chip this pass takes down
+/// is already gone from the item set `run_attention` emits in the same tick,
+/// rather than being shown one more time and disappearing 3s later.
+///
+/// **Cost, declared (performance.md §3 INV-4: cadenced work says what it
+/// costs).** Fixed-cadence work, so it owes a bound. Four things bound it:
+///
+/// 1. **Scope.** Zero pty reads unless a stuck-prompt chip is actually up, in
+///    one of the classes a pane reading can answer, on a Running agent with a
+///    pty. `attn_stranded` is empty on every healthy session, and the pass
+///    returns on that check having taken one uncontended map lock and nothing
+///    else — no agents lock, no ledger, no ring. The badged case is rare and
+///    self-limiting: this very reading is what takes the chip down, so the
+///    work ends the condition that schedules it (#819 F3's argument, and
+///    `drain_stranded_submit`'s).
+/// 2. **Per badged pane.** One ledger lock + clone, one `Tier1Scan::for_paste`
+///    normalize of the recorded text, then at most `TIER1_SCAN_WIDEN_ROUNDS`
+///    ring reads capped at `TIER1_SCAN_WIDEN_MAX_BYTES` — `Tier1Scan::widen`'s
+///    own bound, not a fresh one — and one `last_user_input_ms` stamp read. No
+///    IPC, no fs, no lock beyond the ring's own, and nothing held across a pty
+///    read.
+/// 3. **Cadence.** 30s, against the 5s the late monitor already spends on the
+///    identical read on the same panes: one sixth the rate, for the far
+///    smaller set of panes that still carry a chip. Where the two overlap (a
+///    chip up while its monitor is alive) the extra cost is one such read per
+///    30s, and the verdict is identical by construction — both ask
+///    `stranded_badge_release`.
+/// 4. **Worst case.** Bounded by the number of badged panes, which is bounded
+///    by the fleet size; a fleet where every pane carries a stuck-prompt chip
+///    has a much louder problem than this loop.
 pub fn start_attention(reg: Arc<OrchRegistry>) {
-    std::thread::spawn(move || loop {
-        std::thread::sleep(ATTENTION_INTERVAL);
-        reg.run_attention(now_ms());
+    std::thread::spawn(move || {
+        let mut tick: u64 = 0;
+        loop {
+            std::thread::sleep(ATTENTION_INTERVAL);
+            tick = tick.wrapping_add(1);
+            if tick % STRANDED_JANITOR_EVERY_N_TICKS == 0 {
+                reg.run_stranded_janitor();
+            }
+            reg.run_attention(now_ms());
+        }
     });
 }
 
