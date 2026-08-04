@@ -12028,6 +12028,63 @@ fn resume_session_unique_prefix_resolves_to_the_full_id() {
     );
 }
 
+/// #722: a COMPLETE opencode session id this group's roster never recorded
+/// must pass through, exactly as a complete claude one does. Opencode's ids
+/// are 30 characters, so the length-only test that used to answer "is this a
+/// full id?" called every one of them a truncated prefix — and a prefix that
+/// matches no roster entry is rejected as an unknown session. The equivalent
+/// claude id (36 chars) sails through, which is the asymmetry this closes.
+#[test]
+fn a_complete_opencode_session_id_is_not_mistaken_for_a_truncated_prefix() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let co = reg.resolve_token(&orch.token).unwrap();
+    // A roster holding some OTHER session, so nothing here can resolve by
+    // exact match or by prefix — the pass-through is the only way out.
+    write_roster(&reg, &g.id, &["e3bc3b80-1111-4111-8111-111111111111"]);
+    let dir = tempfile::tempdir().unwrap();
+    let full_opencode = "ses_03bd2d53dffeiBvu9PvuCPjxT7"; // ses_ + 12 hex + 14 base62
+
+    let r = dispatch(&reg, &co, "tools/call", &json!({
+        "name": "spawn_agent",
+        "arguments": {
+            "kind": "worker",
+            "resume_session": full_opencode,
+            "cwd": dir.path().to_string_lossy(),
+            "task": "follow-up",
+        },
+    })).unwrap();
+    assert_eq!(
+        r["isError"], false,
+        "a complete opencode id must pass through, not be resolved as a prefix: {r:?}"
+    );
+
+    let agents = reg.list_agents(&co.group);
+    let resumed = agents.as_array().unwrap().iter().find(|a| a["role"] == "worker").unwrap();
+    assert_eq!(
+        resumed["session"], json!(full_opencode),
+        "the id must arrive intact, not rewritten to some roster entry: {agents}"
+    );
+
+    // And the shape check must not become a blanket "anything starting with
+    // `ses_`": a genuinely truncated opencode id is still a prefix, and one
+    // matching nothing in the roster is still an unknown session.
+    let short = dispatch(&reg, &co, "tools/call", &json!({
+        "name": "spawn_agent",
+        "arguments": {
+            "kind": "worker",
+            "resume_session": "ses_03bd2d53",
+            "cwd": dir.path().to_string_lossy(),
+            "task": "follow-up",
+        },
+    })).unwrap();
+    assert_eq!(
+        short["isError"], true,
+        "a truncated opencode id resolves or fails as a prefix, never passes through: {short:?}"
+    );
+}
+
 #[test]
 fn resume_session_ambiguous_prefix_fails_and_lists_candidates() {
     let (reg, _d) = test_registry();

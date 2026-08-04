@@ -10157,16 +10157,61 @@ fn sanitize_session(s: &str) -> Option<String> {
 /// truncated prefix rather than a (possibly external/unrecorded) full id.
 const FULL_SESSION_ID_LEN: usize = 36;
 
+/// Is `s` an opencode session id in full (#722)?
+///
+/// `ses_` + 12 lowercase hex (a 6-byte timestamp) + 14 base62, 30 characters
+/// in all (`SOURCE`, `id.ts`). Recognized by *shape* because opencode's ids are
+/// shorter than a claude UUID: without this, [`is_full_session_id`] would read
+/// a complete opencode id as a truncated prefix and refuse it as an unknown
+/// session — see there for why that matters.
+///
+/// Compared character by character rather than by byte-slicing at 12: a
+/// caller-supplied string is not guaranteed ASCII, and `&rest[..12]` on one
+/// that is not would panic on a char boundary. This is fed by an MCP argument,
+/// so "no caller can get here with such a string" is not a claim worth betting
+/// a panic on.
+fn is_opencode_session_id(s: &str) -> bool {
+    let Some(rest) = s.strip_prefix("ses_") else {
+        return false;
+    };
+    let mut chars = rest.chars();
+    let stamp_ok = chars
+        .by_ref()
+        .take(12)
+        .filter(|c| c.is_ascii_digit() || ('a'..='f').contains(c))
+        .count()
+        == 12;
+    let tail: Vec<char> = chars.collect();
+    stamp_ok && tail.len() == 14 && tail.iter().all(|c| c.is_ascii_alphanumeric())
+}
+
+/// Is `s` already a complete session id for some CLI loomux supports, as
+/// opposed to a prefix of one?
+///
+/// The distinction decides whether [`resolve_session_ref`] passes an input
+/// through untouched or insists on resolving it against this group's roster.
+/// Length alone answered that while claude was the only CLI minting ids
+/// loomux had to recognize; an opencode id is 30 characters, so length alone
+/// would call every complete one a prefix and reject any that this group's
+/// roster happened not to record — a session from another group's audit log, a
+/// roster that lost the entry — as "unknown session", where the equivalent
+/// claude id passes through. Two shapes, one question.
+fn is_full_session_id(s: &str) -> bool {
+    s.len() >= FULL_SESSION_ID_LEN || is_opencode_session_id(s)
+}
+
 /// Resolve a caller-supplied `resume_session` value to the one full session id
 /// it names (#190). A hand-copied or logged session id is naturally truncated
 /// (8 hex chars is what humans and terminals show), and Claude Code session ids
 /// are full UUIDs — before this, a truncated id just failed to resolve with no
 /// indication of why. An exact match against this group's roster wins outright,
-/// whatever its length. Otherwise, an input that is already full-length is
-/// passed through unchanged — it may be a genuine session this group never
-/// recorded (a resume with an explicit `kind`/`block` has always allowed that;
-/// #190 is only about *truncated* ids, which can never be "the real thing" on
-/// their own). Only a SHORTER input is treated as a prefix to resolve: zero
+/// whatever its length. Otherwise, an input that is already a complete id for
+/// some supported CLI ([`is_full_session_id`] — length for claude, shape for
+/// opencode) is passed through unchanged — it may be a genuine session this
+/// group never recorded (a resume with an explicit `kind`/`block` has always
+/// allowed that; #190 is only about *truncated* ids, which can never be "the
+/// real thing" on their own). Only a shorter, shapeless input is treated as a
+/// prefix to resolve: zero
 /// matches is a plain "unknown session" (never seen it, in full or part), two
 /// or more is "ambiguous" and lists every candidate so the caller can pick —
 /// this must never silently choose one.
@@ -10183,7 +10228,7 @@ fn resolve_session_ref(records: &[AgentRecord], input: &str) -> Result<String, S
     if records.iter().any(|r| r.session.as_deref() == Some(input)) {
         return Ok(input.to_string());
     }
-    if input.len() >= FULL_SESSION_ID_LEN {
+    if is_full_session_id(input) {
         return Ok(input.to_string());
     }
     let mut matches: Vec<&str> =
