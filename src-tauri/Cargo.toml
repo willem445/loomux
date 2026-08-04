@@ -112,29 +112,57 @@ serde_norway = "0.9.42"
 # that row and never writes it (`src/opencodedb.rs` opens `mode=ro`).
 #
 # VETTED AGAINST THE GETRANDOM BAN above. Audit run 2026-08-03; reproduce with
-# the commands below (all are resolution/graph queries — none compiles):
+# the commands below (all are resolution/graph queries — none compiles).
 #
-#   cargo tree -e normal,build --target x86_64-pc-windows-msvc -p rusqlite
+# WHAT THE BAN ACTUALLY TESTS, because this entry is the one that gets copied:
+# the 0xc0000139 failure is a **load-time import of the shipped loomux.exe**.
+# So the question is only ever "can this crate's code end up LINKED INTO that
+# binary". Three kinds of edge cannot, whatever `cargo tree` shows:
+#   - **build-dependencies** — they compile and RUN ON THE HOST during the
+#     build (build scripts, proc macros). Nothing they link reaches loomux.exe.
+#   - **dev-dependencies of a dependency** — never built for a downstream crate.
+#   - **edges gated to a target we do not ship**, e.g. redox-only.
+# "No getrandom in `-e normal,build`" is NOT the bar and this dependency does
+# not meet it (see below). The bar is the NORMAL (linked) graph.
+#
+# THE LINKED GRAPH — this is the load-bearing check:
+#
+#   cargo tree -e normal --target x86_64-pc-windows-msvc -p rusqlite
 #     rusqlite → bitflags, fallible-iterator, fallible-streaming-iterator,
-#                smallvec, libsqlite3-sys
-#                  [build-dependencies] cc → find-msvc-tools, shlex;
-#                                       pkg-config; vcpkg
-#     — no getrandom anywhere, not even as a build-dependency, on the very
-#     target the ProcessPrng hazard is about.
+#                smallvec, libsqlite3-sys       (no getrandom at any depth)
 #
 # rusqlite DOES list `getrandom` — as a `[dev-dependencies]` entry, for its own
-# wasm test suite. A dependency's dev-deps are never built for a downstream
-# crate, so it cannot reach loomux's binary; `-e normal,build` above is what
-# makes that visible rather than assumed. `default-features = false` is
-# deliberate on top of that: rusqlite's default `cache` feature pulls hashlink
-# → hashbrown, and its default `ffi-sqlite-wasm-rs` pulls a wasm FFI backend —
-# neither is wanted for a handful of one-shot SELECTs, and dropping both keeps
-# the added graph to the five packages named above.
+# wasm test suite. Never built for us; `-e normal` is what makes that visible
+# rather than assumed. `default-features = false` is deliberate on top of that:
+# rusqlite's default `cache` feature pulls hashlink → hashbrown, and its default
+# `ffi-sqlite-wasm-rs` pulls a wasm FFI backend — neither is wanted for a
+# handful of one-shot SELECTs, and dropping both keeps the added graph to the
+# five packages named below.
+#
+# THE BUILD-SIDE EDGE, NAMED SO A FUTURE AUDITOR IS NOT AMBUSHED (rev-298 B1,
+# which caught an earlier version of this note asserting the opposite):
+# **Cargo.lock contains `cc → jobserver → getrandom 0.4.3`**, and jobserver
+# declares that dependency `[target."cfg(windows)".dependencies]` — i.e.
+# specifically on the target this ban is about. It is fine, twice over:
+#   1. `cc`/`jobserver` are BUILD-dependencies (libsqlite3-sys's build script).
+#      Host-side; never linked into loomux.exe. See the rule above.
+#   2. It is PRE-EXISTING. `cc` and `jobserver` are both already in the base
+#      lock, so this dependency adds no getrandom path — it adds a new
+#      *consumer* of a build-dep that already pulled one. `git diff` on
+#      Cargo.lock for this change touches ZERO getrandom/jobserver lines.
+#
+# Expect `cargo tree` and `Cargo.lock` to DISAGREE here, and know why before
+# concluding anything: the lock records the union of a package's possible
+# dependencies, while `cargo tree` applies feature resolution. jobserver is
+# gated behind `cc`'s `parallel` feature, which nothing in this graph enables,
+# so `cargo tree -e normal,build … -i jobserver` prints "nothing to print"
+# while the lock plainly lists it. Neither output is wrong; a note that quotes
+# only the first and says "no getrandom anywhere" IS.
 #
 #   cargo tree -e normal --target all -i getrandom@0.2.17 / @0.3.4 / @0.4.3
-# still prints only the three PRE-EXISTING edges the note above enumerates
-# (redox-only via dirs; tauri's own; tauri's uuid/codegen chain) — this
-# dependency adds no fourth.
+# still prints only the three PRE-EXISTING NORMAL-graph edges the note above
+# enumerates (redox-only via dirs; tauri's own; tauri's uuid/codegen chain) —
+# this dependency adds no fourth.
 #
 # `bundled` compiles SQLite's own C amalgamation into the binary via the `cc`
 # build-dependency. That is the point, not a side effect: constraint 8 (no

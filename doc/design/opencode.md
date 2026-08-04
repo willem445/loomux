@@ -463,10 +463,23 @@ without saying so is worse than one that reports nothing. It survives only as a
 **Every failure is a degrade.** Absent store, unopenable file, drifted schema,
 lock contention past a 250ms bound — each yields a zero-usage agent and a fall
 through to the statusline, never an error the group has to be rescued from.
-This runs on the polled `group_usage` path, so the degrade is also *silent*:
-auditing it would write a line per UI tick for as long as the condition lasted.
 The schema is a vendor's internal detail with no compatibility promise, so
 drift is a *when*, not an *if*.
+
+**Degraded is not the same as undiagnosable.** The snapshot cannot act on
+*which* degrade it hit, but the record must still say: a drifted schema needs a
+human and a never-booted pane needs nobody, and both otherwise surface only as
+"not from the store". `note_opencode_db_degrade` writes one
+`opencode-usage-degraded` line per **episode** per group, carrying the kind and
+the underlying message. It has to be latched, because this runs on the polled
+`group_usage` path — an unlatched line would be an audit entry every UI tick
+for as long as the condition lasted, flooding the log exactly when something is
+wrong with it. Latched by *kind*, not by message, so a varying error string
+cannot defeat the latch; cleared on the first successful read, so a recurrence
+after a real recovery is a new incident rather than one silenced for the life
+of the process. `Absent` is never audited at all — a group whose opencode panes
+have not booted has no store yet, which is the ordinary state. Same one-shot
+shape as `HoldEpisode`'s `announced`/`notice_reported`.
 
 **What is not read here.** Which session a pane owns. The store cannot be
 queried for that by project — the project id is a hash of the git origin

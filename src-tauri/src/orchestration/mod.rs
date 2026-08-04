@@ -9518,6 +9518,20 @@ pub struct OrchRegistry {
     /// `start_max_notice_flusher` loop delivers one coalesced notice per burst
     /// once the group falls quiet.
     pending_max_notice: Mutex<HashMap<String, PendingMaxNotice>>,
+    /// Which opencode-store degrade (#722) has already been audited for a
+    /// group, so a persistent one costs one line instead of one per poll.
+    ///
+    /// Keyed by group, holding the KIND (`"open"` / `"unreadable"`), never the
+    /// message: a message could in principle vary between reads, and a latch
+    /// that re-fires on a changed string is not a latch. Same episode shape as
+    /// [`HoldEpisode::announced`] — the entry is dropped the moment a read
+    /// succeeds, so a condition that recurs after a genuine recovery is
+    /// diagnosed again rather than silenced for the life of the process.
+    ///
+    /// `Unavailable::Absent` is deliberately never recorded here and never
+    /// audited: a group whose opencode panes have not booted has no store yet,
+    /// which is the ordinary state, not an incident.
+    opencode_db_degraded: Mutex<HashMap<String, &'static str>>,
     /// Test-only override of the Claude transcript root (`~/.claude/projects`).
     /// `None` in production. Set via `set_claude_projects_dir` so the usage
     /// reader can be pointed at a fixture tree without touching global env —
@@ -19676,6 +19690,7 @@ impl OrchRegistry {
             idle_tick_times: Mutex::new(HashMap::new()),
             compact_nudge_times: Mutex::new(HashMap::new()),
             pending_max_notice: Mutex::new(HashMap::new()),
+            opencode_db_degraded: Mutex::new(HashMap::new()),
             claude_projects_dir: Mutex::new(None),
             claude_agents_dir_override: Mutex::new(None),
             copilot_agents_dir_override: Mutex::new(None),
@@ -28195,18 +28210,22 @@ impl OrchRegistry {
         // not estimated — `estimated: false` is what keeps `group_usage` from
         // blending them into a total labelled as a price-table guess.
         //
-        // A degrade (no store, unopenable, schema drift) is deliberately
-        // SILENT: this runs on the polled `group_usage` path, so auditing a
-        // failure here would write an audit line every UI tick for as long as
-        // the condition lasted. Falling through to the statusline, and to a
-        // zero-usage agent if that finds nothing either, is the whole
-        // degraded-not-fatal posture — see `crate::opencodedb`.
+        // A degrade (no store, unopenable, schema drift) never fails the
+        // snapshot — it falls through to the statusline, and to a zero-usage
+        // agent if that finds nothing either, which is the whole
+        // degraded-not-fatal posture (see `crate::opencodedb`). But it is not
+        // silent either: `note_opencode_db_degrade` writes ONE audit line per
+        // episode, so a drifted schema and a never-booted pane stop looking
+        // identical to whoever is debugging, without this polled path becoming
+        // an audit entry every UI tick (rev-298 F2).
         if cli == "opencode" {
             // Until an opencode pane's session is identified, there is no id
             // to key on and this arm simply does not fire.
             if let Some(sid) = entry.session_id.as_deref() {
                 let db = self.opencode_db_path(&entry.group);
-                if let Ok(Some(u)) = crate::usage::opencode_session_usage(&db, sid) {
+                let read = crate::usage::opencode_session_usage(&db, sid);
+                self.note_opencode_db_degrade(&entry.group, &db, read.as_ref().err());
+                if let Ok(Some(u)) = read {
                     // Same guard as the claude arm: a session row that exists
                     // but has counted nothing yet must not overwrite history
                     // with zeros, nor pre-empt the statusline fallback.
@@ -28240,6 +28259,61 @@ impl OrchRegistry {
             }
         }
         snap
+    }
+
+    /// Record — at most once per episode — that a group's opencode store could
+    /// not be read, and why (#722, rev-298 F2).
+    ///
+    /// The problem this solves: `compute_usage_snapshot` treats every
+    /// [`crate::opencodedb::Unavailable`] the same way, because there is
+    /// nothing useful it could do differently. That is right for the SNAPSHOT
+    /// and wrong for the RECORD — a drifted schema and a pane whose CLI never
+    /// booted both surface as "not from the store", so the one condition that
+    /// needs a human looks exactly like the one that needs nobody.
+    ///
+    /// Why a latch and not just an audit call: this runs on `group_usage`,
+    /// which the group view polls every couple of seconds, so an unlatched line
+    /// would be an audit entry every tick for as long as the condition lasted —
+    /// the log flooded worst precisely when something is wrong with it. Keyed
+    /// by KIND rather than message so a varying error string cannot defeat the
+    /// latch, and dropped on the first successful read so a recurrence after a
+    /// real recovery is diagnosed again instead of being silenced for the
+    /// process's life.
+    ///
+    /// `Absent` is passed through without a line on purpose: no store yet is
+    /// the ordinary state of a group whose opencode panes have not booted, and
+    /// auditing it would put a line in every claude-only group that ever spawns
+    /// an opencode pane.
+    fn note_opencode_db_degrade(
+        &self,
+        group: &str,
+        db: &Path,
+        err: Option<&crate::opencodedb::Unavailable>,
+    ) {
+        use crate::opencodedb::Unavailable;
+        let kind = match err {
+            Some(Unavailable::Open(_)) => "open",
+            Some(Unavailable::Query(_)) => "unreadable",
+            // A successful read, or a store that simply is not there yet:
+            // either way this group has no live degrade episode.
+            Some(Unavailable::Absent) | None => {
+                self.opencode_db_degraded.lock_safe().remove(group);
+                return;
+            }
+        };
+        let mut seen = self.opencode_db_degraded.lock_safe();
+        if seen.get(group) == Some(&kind) {
+            return; // already diagnosed this episode
+        }
+        seen.insert(group.to_string(), kind);
+        // Dropped before auditing: `audit` takes its own locks, and holding an
+        // unrelated one across it is how lock-order bugs start.
+        drop(seen);
+        self.audit(group, "loomux", "opencode-usage-degraded", json!({
+            "kind": kind,
+            "detail": err.map(ToString::to_string).unwrap_or_default(),
+            "db": db.to_string_lossy(),
+        }));
     }
 
     fn load_usage_snapshots(&self, group: &str) -> Vec<UsageSnapshot> {

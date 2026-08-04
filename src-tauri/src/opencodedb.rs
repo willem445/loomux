@@ -34,6 +34,12 @@
 //! [`BUSY_TIMEOUT_MS`] — it runs on the polled `group_usage` path, where a
 //! wedge would freeze a UI tick.
 //!
+//! The variant is not decoration: degrading is not the same as being
+//! undiagnosable, and `OrchRegistry::note_opencode_db_degrade` turns these into
+//! one audit line per episode so a drifted schema and a never-booted pane stop
+//! looking alike. Which is why [`Unavailable::Query`] carries its message and
+//! [`Unavailable::Absent`] is a distinct arm rather than one more error string.
+//!
 //! # Read-only, and why not `immutable`
 //!
 //! The primary open is `SQLITE_OPEN_READ_ONLY`: SQLite refuses every write on

@@ -513,3 +513,110 @@ fn the_opencode_arm_never_fires_for_another_cli() {
     assert_ne!(snap.source, "session-db");
     assert_eq!(snap.input_tokens, 0);
 }
+
+// ---------------------------------------------------------------------------
+// Diagnosability: one line per degrade episode (rev-298 F2)
+// ---------------------------------------------------------------------------
+
+/// Audit entries a group recorded under `action`.
+fn audit_entries(reg: &OrchRegistry, group: &str, action: &str) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(reg.state_root().join(group).join("audit.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|e| e["action"] == action)
+        .collect()
+}
+
+/// Write a `session` table that has an `id` but none of the token columns —
+/// the shape a schema drift would leave behind.
+fn drifted_store(path: &Path) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let conn = Connection::open(path).unwrap();
+    conn.execute_batch("CREATE TABLE session (id text PRIMARY KEY, parent_id text, model text)")
+        .unwrap();
+    conn.execute("INSERT INTO session (id, model) VALUES (?1, 'm')", [SES]).unwrap();
+}
+
+#[test]
+fn a_store_that_cannot_be_read_is_diagnosed_once_not_once_per_poll() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/opencode-repo", rails("opencode")).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "task", false, None).unwrap();
+    let mut entry = w.clone();
+    entry.session_id = Some(SES.to_string());
+    drifted_store(&reg.opencode_db_path(&g.id));
+
+    // The group view polls `group_usage` every couple of seconds; ten ticks is
+    // a twenty-second glance at a broken store.
+    for _ in 0..10 {
+        let snap = reg.compute_usage_snapshot(&entry, "opencode");
+        assert_eq!(snap.source, "none", "a drifted store still degrades to no usage");
+    }
+
+    let lines = audit_entries(&reg, &g.id, "opencode-usage-degraded");
+    assert_eq!(
+        lines.len(),
+        1,
+        "one line per episode, not per poll — an unlatched audit floods the log \
+         exactly when something is wrong with it: {lines:?}"
+    );
+    assert_eq!(lines[0]["detail"]["kind"], "unreadable");
+    assert!(
+        lines[0]["detail"]["detail"].as_str().unwrap_or_default().contains("tokens_input"),
+        "the line has to carry WHICH column went missing, or it is a bare \
+         'something failed' that sends the reader back to the code: {:?}",
+        lines[0]
+    );
+}
+
+#[test]
+fn an_absent_store_is_never_audited_at_all() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/opencode-repo", rails("opencode")).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "task", false, None).unwrap();
+    let mut entry = w.clone();
+    entry.session_id = Some(SES.to_string());
+    // No store: an opencode pane that has not booted yet, which is ordinary.
+
+    for _ in 0..3 {
+        reg.compute_usage_snapshot(&entry, "opencode");
+    }
+    assert!(
+        audit_entries(&reg, &g.id, "opencode-usage-degraded").is_empty(),
+        "a group whose panes have not booted has no incident to report; auditing \
+         it would put a line in every group that ever spawns an opencode pane"
+    );
+}
+
+#[test]
+fn a_degrade_that_recurs_after_a_recovery_is_diagnosed_again() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/opencode-repo", rails("opencode")).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "task", false, None).unwrap();
+    let mut entry = w.clone();
+    entry.session_id = Some(SES.to_string());
+    let db = reg.opencode_db_path(&g.id);
+
+    drifted_store(&db);
+    reg.compute_usage_snapshot(&entry, "opencode");
+    reg.compute_usage_snapshot(&entry, "opencode");
+
+    // The operator upgrades opencode and the store is whole again.
+    std::fs::remove_file(&db).unwrap();
+    store(&db, &[Row { input: 15_260, ..Row::new(SES) }]);
+    let ok = reg.compute_usage_snapshot(&entry, "opencode");
+    assert_eq!(ok.source, "session-db", "the recovered store must actually read");
+
+    // …and then drifts again. A latch that never clears would swallow this,
+    // leaving the second incident invisible for the life of the process.
+    std::fs::remove_file(&db).unwrap();
+    drifted_store(&db);
+    reg.compute_usage_snapshot(&entry, "opencode");
+
+    assert_eq!(
+        audit_entries(&reg, &g.id, "opencode-usage-degraded").len(),
+        2,
+        "a successful read ends the episode, so a genuine recurrence is a new incident"
+    );
+}
