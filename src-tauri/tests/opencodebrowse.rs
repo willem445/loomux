@@ -412,7 +412,13 @@ fn sessions_from_every_directory_are_listed() {
     );
 
     let (rows, _) = list_sessions_for_test();
-    let cwds: Vec<&str> = opencode_rows(&rows).iter().map(|r| r.cwd.as_str()).collect();
+    // Sorted, so this pins exactly what its name claims — that neither
+    // directory is filtered out — and not, incidentally, the ORDER, which
+    // `rows_are_ordered_by_time_not_by_id_string` owns. A probe round proved
+    // the point: an ordering mutation turned this test red too, which makes a
+    // red here ambiguous about what actually broke.
+    let mut cwds: Vec<&str> = opencode_rows(&rows).iter().map(|r| r.cwd.as_str()).collect();
+    cwds.sort_unstable();
 
     assert_eq!(cwds, vec!["C:/Projects/loomux", "D:/other/project"]);
 }
