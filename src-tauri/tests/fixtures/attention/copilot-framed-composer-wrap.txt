@@ -1,0 +1,5 @@
+[36m●[0m Ready.
+
+[36m┃[0m Order of work: understand the failure first, then design the fix,
+[36m┃[0m → then implement it and get CI green on all three platforms.
+  [2m@ files · # issues[0m

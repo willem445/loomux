@@ -6686,6 +6686,121 @@ to go undetected, and `grid_evidence_for` reads `prompt_wait_detected` over the 
 well. The signal to re-check on a CLI upgrade is therefore this one, and `f3` is the test that
 would have to be widened: today it asserts a pointer row and its option are one string.
 
+## #820: a pointer glyph leading loomux's OWN text is not a menu either
+
+**Problem.** On a copilot 1.0.77 fleet, deliveries stranded "quite often" in ordinary use. The
+pane-header chip read the question-gate wording — *stuck behind a question the user needs to
+answer* — while the screen held nothing but loomux's own prompt, sitting unsubmitted in copilot's
+input box. #727 one notch over: that narrowing removed the *empty* prompt glyph, and this is the
+same signal, the same latch, with the box **full**.
+
+**Cause: the self-echo exclusion compared the wrong thing.** `mask_own_paste` is what keeps the
+detector from reading loomux's own paste as pane content, and its rule was whole-line equality —
+`row.trim().to_lowercase() == pasted_line`. A CLI does not render our paste as our lines. Copilot
+1.0.7x, specifically:
+
+| What copilot paints | Why equality misses it |
+| --- | --- |
+| chevron composer input row: `❯ <our line>` | `❯` (U+276F) is a `POINTER_GLYPHS` member and is not framing, so nothing strips it |
+| framed composer (1.0.64+ prompt frame): `┃ <our line>`, re-wrapped, `┃ ` on **every** row | each row is a *fragment* of our line, so no row equals one |
+| transcript echo of the submitted prompt: `❯ <our line>` + right-aligned dim `HH:mm` | a prefix and a suffix the pasted line does not have |
+
+One surviving row of ours is enough. `leads_with_pointer` needs only a `❯`/`›`/`→` **leading** the
+de-framed row: the chevron composer supplies that outright, and in framed mode the `┃ ` de-frames
+away and a *wrap boundary* supplies it whenever a brief's own prose puts an arrow at the start of a
+row — `red → green`, `main → beta10`, ordinary orchestrator writing. `pointer-option` then fires on
+loomux's own prompt.
+
+**Why it latched.** #727's mechanism verbatim. Nothing repaints an unsubmitted box, so the ring's
+last-painted window is frozen on the row; `pointer_rendered` scans every rendered row and finds the
+same glyph, so `grid_evidence_for` answers `StillRendered` on every poll and `NotRendered` — the
+one reading that ends a hold without a human — is unreachable. The capped hold runs out, the
+delivery aborts, the text stays stranded in the box, and the queue drainer's own gate
+(`question_active_now`, which has **no** `pasted_text` at all) re-reads the same frozen screen
+forever.
+
+Claude Code is not hit: its composer prefix is `>`, which was never a pointer glyph.
+
+**Fix: compare against the row the CLI actually paints.** `mask_own_paste` keeps its rule — mask
+only what loomux itself pasted — and changes only how a row is *recognised* as ours:
+
+- **de-framed**, via the same `deframe` every other reading here uses, so a bordered composer is
+  compared on its content;
+- **wrap-reconstructed**, via the same `reconstructs_to_end` discipline
+  `mask_loomux_notices_with_record` uses — contiguous, in order, from the line's own start, and to
+  its END rather than a prefix, so a run that does not account for the whole line claims nothing;
+- **pointer-stripped, as a second attempt only, above an evidence floor**
+  (`SELF_ECHO_MIN_POINTER_CHARS`, 24 chars, the `R_TOP_MIN_ANCHOR_CHARS` figure and argument). A
+  box border is decoration by construction; a pointer glyph is the entire `pointer-option` signal,
+  so stripping one is a claim that has to be paid for. `❯ Overwrite` is our own composer holding a
+  one-word paste *and* a live dialog's highlighted choice, byte for byte — claiming it on that
+  evidence would mask a genuine dialog into "no question" and release an Enter into it, which is
+  the #420 harm.
+
+**#727 said the answer to this shape was "a narrower signal, not a wider mask". This takes the
+other one, and the reason is that the evidence available is different.** That residual anticipated
+a CLI *placeholder* (`❯ Try "fix the build"`) — decorative hint text loomux does not author, cannot
+recognise, and could therefore only ever have handled by narrowing the signal. Here the content
+after the glyph is **ours**, known exactly, on the same thread that wrote it. And the mask #727
+declined to widen was `mask_loomux_notices`, whose entry is partly agent-authored and which can
+claim rows loomux cannot prove it wrote; `mask_own_paste` is not that mask — its input is the
+literal byte string `deliver_prompt` just pasted, unreachable from pane output, so the objection
+does not transfer. Narrowing the signal is also *exhausted* here: there is no shape separating
+`❯ Review requested changes on PR #814…` from copilot's own
+`❯ 2. this should reach the agent — please confirm you see this message? (Esc to stop)`, an
+arbitrary-prose `ask_user` option. Authorship is the only discriminator left, and it is the one the
+mask has.
+
+**Second finding: the hold that strands is the one with no evidence.** Every capped hold and every
+abort has carried `matched: {signal, line, grid}` since #513(c)/F2 — but those are bounded by
+construction. The hold a human sits in front of lives in the queue drainer, which re-arms the gate
+every `QUEUE_DRAIN_POLL` with no cap, and its `delivery-held-in-queue` row recorded
+`blocked_on: "question"` and nothing about *which* shape, on *which* line, with what the screen
+said. #513's blind spot, one hold class over, and the reason #820 could not be diagnosed from
+`audit.jsonl` at all. `question_active_witnessed` now returns the poll's own witness and the
+drainer threads it into `hold_escalation_step` — from the same poll as the admission it annotates,
+for the same reason `last_user_input_ms` is read there.
+
+**Tests.** `g1`–`g6` in `tests/orchestration.rs`, over two fixtures under
+`tests/fixtures/attention/`. Both are **reconstructed from cited copilot-cli sources rather than
+captured** — constraint 3 forbids spawning a real copilot — so each test asserts the property it
+depends on as a precondition rather than assuming it: `g1` pins the `❯ ` row inside the detector's
+own pointer window (the #727 `f1` pattern) *and* that the raw screen genuinely fires
+`pointer-option`, `g3` pins that the row which fired is the *wrapped continuation* and not the
+first. `g2` is the repro end to end through the production predicate. `g4` pins both halves of the
+floor — a short option is not claimable, a long line is. `g5` re-runs every captured real dialog
+and every #40/#727 false positive **through the new exclusion**, because the mask is the argument
+that changed and a bare detector call no longer covers the risk.
+
+**Residuals, stated.**
+
+- The `question_active_now(…, None, …)` readers have no `pasted_text`, so a paste stranded by some
+  *other* cause can still latch them. There are **four** since #819: `deliver_now`'s pre-paste
+  re-verify loop, `stranded_marker_action`'s closure (#819's), `flush_stranded_text`, and the queue
+  drainer — the last being the one this change witnesses. Closing it generally needs a per-pane record of
+  delivered *payload* text, which is exactly the widening `loomux_authored_lines` refuses (`e11`:
+  it would hand an agent a row-deleting mask over its own pane). Not taken. The new `matched` field
+  is what makes such a hold name itself.
+
+  **#819's reader is the interesting one, and deliberately left alone.** `stranded_marker_action`
+  materializes the pane's `stranded_text` a few lines above its `question_active_now` closure, so
+  it is the one caller that *could* supply a `pasted_text` without any new record — which makes it
+  the obvious place to close the residual, and exactly the wrong place to do it in passing.
+  That gate feeds a **blind Enter** (`flush_stranded_text`'s own doc: "a blind Enter with no
+  downstream net"), so masking more of the screen there decides when loomux presses Enter into a
+  pane it cannot fully read. That is a safety argument about #813/#819's retirement path, not a
+  side effect this change is entitled to take, and it belongs in its own issue with its own
+  fail-closed reasoning.
+- A delivery whose every line is shorter than `SELF_ECHO_MIN_POINTER_CHARS`, sitting in a chevron
+  composer, is still unmasked. The floor is what keeps the fix from being a hole; buying the last
+  case would need evidence this mask does not have.
+- The transcript echo (`❯ <our line>` + `HH:mm`) is not masked — the trailing timestamp defeats
+  reconstruct-to-end. It is transient rather than latching: once the ring stops matching,
+  `question_shown` is false whatever the grid says, and copilot's own repaints push the row out of
+  the last-painted window within a poll or two.
+- #727's placeholder residual is untouched. A placeholder is the CLI's text, not ours, so this
+  change has nothing to say about it and the answer there is still a narrower signal.
+
 ## Delivery queue (#445)
 
 **Problem.** `deliver_prompt` has three hold-cap seams — pre-paste box-occupied (#111,

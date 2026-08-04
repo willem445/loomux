@@ -21252,6 +21252,41 @@ const FIX_POS_PTR_LAST: &str = include_str!("fixtures/attention/pos-pointer-last
 // question gate held for 25 minutes.
 const FIX_FP_RESUMED_IDLE: &str =
     include_str!("fixtures/attention/fp-resumed-agent-idle-prompt.txt");
+// #820: copilot 1.0.7x holding a loomux delivery that has been pasted into its
+// composer and not yet submitted — the pane a human photographed for the issue
+// ("the chip reads the question-gate wording and the screen holds only loomux's
+// own prompt"). Two shapes, because copilot has two composers and BOTH put a
+// row of our own text in front of the detector:
+//
+//  - `copilot-composer-holds-our-paste`: the chevron composer, whose input row
+//    literally begins with `❯ ` — a `POINTER_GLYPHS` member, so our own paste
+//    reads as a menu's highlighted choice;
+//  - `copilot-framed-composer-wrap`: the 1.0.64+ prompt frame, where the `┃ `
+//    border de-frames away and the WRAP is what leaves an arrow leading a row —
+//    ordinary orchestrator prose (`red → green`) is full of them.
+//
+// **Reconstructed from cited sources, not captured** (CLAUDE.md constraint 3
+// forbids spawning a real copilot to capture one): the `❯ ` input row is the
+// shape pasted in github/copilot-cli#4070 (v1.0.69) and #4292 (v1.0.61), the
+// per-row `┃ ` border is the verbatim composer paste in #4116 (v1.0.71-0), and
+// the `@ files · # issues` hint bar is #4184 (v1.0.72-0). Anything a test needs
+// to be true of the SHAPE — that the offending row lands inside the detector's
+// own last-3-painted-lines window — is asserted as a precondition rather than
+// assumed, the way #727's own fixture test does it.
+const FIX_COPILOT_COMPOSER_PASTE: &str =
+    include_str!("fixtures/attention/copilot-composer-holds-our-paste.txt");
+const FIX_COPILOT_FRAMED_WRAP: &str =
+    include_str!("fixtures/attention/copilot-framed-composer-wrap.txt");
+/// The exact text loomux pasted into the pane `FIX_COPILOT_COMPOSER_PASTE`
+/// shows — one logical line, as `deliver_prompt` would still be holding it at
+/// the pre-Enter checkpoint.
+const COMPOSER_PASTE_TEXT: &str =
+    "Review requested changes on PR #814 and push fixes to the same branch.";
+/// The same, for the framed fixture: one logical line the composer wrapped
+/// across two rows, with one of the brief's own arrows landing at the start of
+/// the second.
+const FRAMED_PASTE_TEXT: &str = "Order of work: understand the failure first, then design the \
+     fix, → then implement it and get CI green on all three platforms.";
 
 #[test]
 fn prompt_wait_detected_fires_on_interactive_question_fixtures() {
@@ -24288,7 +24323,12 @@ fn retiring_a_marker_ends_the_episode_without_clearing_the_badge() {
     let pty = 8134u32;
     let bound = QUESTION_HOLD_STALE_AFTER.as_millis() as u64;
     let t0 = 1_000_000u64;
-    let step = |admission, now| reg.hold_escalation_step(&g.id, &w.id, pty, admission, 1, now, bound, None);
+    // #820: the trailing `None` is the question-gate witness, which this test
+    // has nothing to say about — its admission is `HoldBoxOccupied`, so no
+    // question ever matched. Supplying it changes nothing about #813's
+    // retirement semantics, which are what this test is pinning.
+    let step =
+        |admission, now| reg.hold_escalation_step(&g.id, &w.id, pty, admission, 1, now, bound, None, None);
 
     // Drive a real hold episode to its escalation, so a badge is genuinely up
     // and genuinely owned by THIS episode — the only case `note_hold` clears.
@@ -24334,7 +24374,7 @@ fn a_writable_poll_never_re_badges_a_pane_that_was_already_escalated() {
     let pty = 5601u32;
     let bound = QUESTION_HOLD_STALE_AFTER.as_millis() as u64;
     let t0 = 1_000_000u64;
-    let step = |admission, now| reg.hold_escalation_step(&g.id, &w.id, pty, admission, 1, now, bound, None);
+    let step = |admission, now| reg.hold_escalation_step(&g.id, &w.id, pty, admission, 1, now, bound, None, None);
 
     assert_eq!(
         step(WriteAdmission::HoldBoxOccupied, t0),
@@ -24421,7 +24461,7 @@ fn a_stranded_front_marker_never_pushes_the_escalation_clock_forward() {
 
     // The pane is held; the episode opens. Then the paste lands and the Enter is
     // withheld: the text entry is replaced by a marker minted right now.
-    reg.hold_escalation_step(&g.id, &w.id, pty, WriteAdmission::HoldQuestion, 1, t0, bound, None);
+    reg.hold_escalation_step(&g.id, &w.id, pty, WriteAdmission::HoldQuestion, 1, t0, bound, None, None);
     reg.enqueue_text(&g.id, &w.id, "loomux", "the brief", pty, queue::EnqueueReason::Arrival).unwrap();
     reg.enqueue_stranded_front(&g.id, &w.id, "loomux", pty, queue::EnqueueReason::Question)
         .unwrap();
@@ -24457,7 +24497,7 @@ fn a_stranded_front_marker_never_pushes_the_escalation_clock_forward() {
          the very event that proves the pane is stuck"
     );
     assert_eq!(
-        reg.hold_escalation_step(&g.id, &w.id, pty, WriteAdmission::HoldQuestion, 2, now, bound, None),
+        reg.hold_escalation_step(&g.id, &w.id, pty, WriteAdmission::HoldQuestion, 2, now, bound, None, None),
         HeldEscalation::Badge(StrandedBlocker::QuestionStale),
         "and the step the drainer actually calls takes the episode clock, not the front entry"
     );
@@ -24517,8 +24557,8 @@ fn a_pane_whose_queue_goes_away_ends_its_hold_episode() {
     let bound = QUESTION_HOLD_STALE_AFTER.as_millis() as u64;
     let t0 = 3_000_000u64;
 
-    reg.hold_escalation_step(&g.id, &w.id, pty, WriteAdmission::HoldBoxOccupied, 1, t0, bound, None);
-    reg.hold_escalation_step(&g.id, &w.id, pty, WriteAdmission::HoldBoxOccupied, 1, t0 + bound, bound, None);
+    reg.hold_escalation_step(&g.id, &w.id, pty, WriteAdmission::HoldBoxOccupied, 1, t0, bound, None, None);
+    reg.hold_escalation_step(&g.id, &w.id, pty, WriteAdmission::HoldBoxOccupied, 1, t0 + bound, bound, None, None);
     assert_eq!(reg.hold_episode_since(pty), Some(t0));
     assert!(reg.hold_episode_badged(pty));
 
@@ -24744,7 +24784,7 @@ fn a_pane_holding_loomuxs_own_notice_past_the_bound_tells_the_orchestrator() {
     // shape, where the box belongs to the CLI's own turn and not to a person.
     let step = |now| {
         reg.hold_escalation_step(&g.id, &w.id, pty, WriteAdmission::HoldBoxOccupied, 2, now, bound,
-            Some(t0 - 60_000))
+            Some(t0 - 60_000), None)
     };
 
     assert_eq!(step(t0), HeldEscalation::Chip(HeldReason::BoxOccupied), "the episode opens");
@@ -24783,9 +24823,9 @@ fn a_pane_holding_loomuxs_own_notice_past_the_bound_tells_the_orchestrator() {
     reg.note_hold(&g.id, &w.id, pty, HoldObservation::Delivered, t0 + bound + 6_000);
     let t1 = t0 + bound + 8_000;
     reg.hold_escalation_step(&g.id, &w.id, pty, WriteAdmission::HoldBoxOccupied, 2, t1, bound,
-        Some(t0 - 60_000));
+        Some(t0 - 60_000), None);
     reg.hold_escalation_step(&g.id, &w.id, pty, WriteAdmission::HoldBoxOccupied, 2, t1 + bound,
-        bound, Some(t1 + 1_000));
+        bound, Some(t1 + 1_000), None);
     let lines = audit_entries(&reg, &g.id, "notice-undeliverable");
     assert_eq!(lines.len(), 2, "a fresh episode is a fresh incident");
     assert_eq!(
@@ -24817,7 +24857,7 @@ fn the_notice_still_fires_when_another_mechanism_already_owns_the_badge() {
 
     let step = |now| {
         reg.hold_escalation_step(&g.id, &w.id, pty, WriteAdmission::HoldBoxOccupied, 1, now, bound,
-            Some(0))
+            Some(0), None)
     };
     step(t0);
     step(t0 + bound);
@@ -24857,9 +24897,9 @@ fn a_held_kickoff_is_not_reported_as_an_undeliverable_notice() {
     reg.enqueue_text(&g.id, &w.id, "loomux", "You are a worker. Your task: fix #1", pty,
         queue::EnqueueReason::KickoffRecovery).unwrap();
     reg.hold_escalation_step(&g.id, &w.id, pty, WriteAdmission::HoldBoxOccupied, 1, t0, bound,
-        Some(0));
+        Some(0), None);
     let escalation = reg.hold_escalation_step(&g.id, &w.id, pty, WriteAdmission::HoldBoxOccupied, 1,
-        t0 + bound, bound, Some(0));
+        t0 + bound, bound, Some(0), None);
 
     assert_eq!(
         escalation,
@@ -24901,7 +24941,7 @@ fn a_bound_crossed_with_nothing_queued_does_not_burn_the_report() {
     let t0 = 9_000_000u64;
     let step = |now| {
         reg.hold_escalation_step(&g.id, &w.id, pty, WriteAdmission::HoldBoxOccupied, 1, now, bound,
-            Some(0))
+            Some(0), None)
     };
 
     // An ordinary follow-up from the orchestrator — work, not a notice.
@@ -25001,9 +25041,9 @@ fn an_undeliverable_notice_is_never_reported_as_a_front_door_refusal() {
     reg.enqueue_text(&g.id, &w.id, "loomux", &notify::watch_conflicting_notice("watch-4", 577),
         pty, queue::EnqueueReason::Arrival).unwrap();
     reg.hold_escalation_step(&g.id, &w.id, pty, WriteAdmission::HoldBoxOccupied, 1, t0, bound,
-        Some(0));
+        Some(0), None);
     reg.hold_escalation_step(&g.id, &w.id, pty, WriteAdmission::HoldBoxOccupied, 1, t0 + bound,
-        bound, Some(0));
+        bound, Some(0), None);
     assert_eq!(
         audit_entries(&reg, &g.id, "notice-undeliverable").len(),
         1,
@@ -25043,9 +25083,9 @@ fn an_orchestrators_own_stuck_pane_parks_its_notice_in_the_inbox() {
     reg.enqueue_text(&g.id, &orch.id, "loomux", &notify::watch_conflicting_notice("watch-3", 577),
         pty, queue::EnqueueReason::Arrival).unwrap();
     reg.hold_escalation_step(&g.id, &orch.id, pty, WriteAdmission::HoldBoxOccupied, 1, t0, bound,
-        Some(0));
+        Some(0), None);
     reg.hold_escalation_step(&g.id, &orch.id, pty, WriteAdmission::HoldBoxOccupied, 1, t0 + bound,
-        bound, Some(0));
+        bound, Some(0), None);
 
     let suppressed = audit_entries(&reg, &g.id, "notice-suppressed");
     assert_eq!(suppressed.len(), 1, "the in-band notice is suppressed, as it must be");
@@ -38937,6 +38977,239 @@ fn f4_a_pointer_hold_releases_once_the_menu_gives_way_to_an_idle_prompt() {
         !question_shown(Some(&m), Some(&idle)),
         "the dialog cleared — the hold must end without a human (#534's one transition, \
          which #727 had made unreachable)"
+    );
+}
+
+// ---------- #820: a pointer glyph leading OUR OWN text is not a menu either ----------
+//
+// #727 narrowed `leads_with_pointer` so a pointer pointing at NOTHING — a CLI's
+// empty input box — stops reading as a menu. #820 is the same latch, through
+// the same signal, with the box FULL. Copilot 1.0.7x paints its chevron
+// composer's input row as `❯ <text>`, so from the instant loomux pastes a
+// delivery into that box, loomux's own prompt LEADS a line with a
+// `POINTER_GLYPHS` member; and where the framed composer is used instead, the
+// `┃ ` border de-frames away and a wrap boundary drops one of the brief's own
+// arrows at the start of a row. Either way the pane reads as parked on a menu
+// while the only thing on screen is what loomux itself just wrote.
+//
+// The self-echo exclusion was supposed to make that a non-event and did not,
+// because it compared whole rendered lines to whole pasted lines for EQUALITY —
+// and a CLI does not render our paste as our lines. It frames it, wraps it, and
+// prefixes it.
+//
+// The latch that follows is #727's verbatim: nothing repaints an unsubmitted
+// box, so the ring stays frozen on the row, `pointer_rendered` finds the same
+// glyph among the rendered rows, and `GridEvidence::NotRendered` — the one
+// reading that ends a hold without a human — is unreachable.
+
+#[test]
+fn g1_copilots_own_composer_holding_our_paste_is_not_a_menu_pointer() {
+    let tail = strip_ansi(FIX_COPILOT_COMPOSER_PASTE.as_bytes());
+
+    // Precondition, and the same one #727's f1 asserts for the same reason: a
+    // composer row outside the detector's own last-3-painted-lines window would
+    // make this pass on WINDOWING rather than on the exclusion it is about.
+    let last_painted: Vec<String> = tail
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .rev()
+        .take(3)
+        .collect();
+    assert!(
+        last_painted.iter().any(|l| l.starts_with('❯')),
+        "precondition: the composer's `❯ ` input row must sit inside the pointer window, or \
+         this test proves nothing: {last_painted:?}"
+    );
+    // ...and the row must genuinely fire the signal without the exclusion, or
+    // the assertion below would be celebrating a signal that never fired.
+    let unmasked = prompt_wait_match(&tail).expect("the raw screen IS pointer-shaped");
+    assert_eq!(unmasked.signal, "pointer-option", "and by THIS signal class");
+
+    let masked = mask_own_paste(&tail, COMPOSER_PASTE_TEXT);
+    assert!(
+        prompt_wait_match(&masked).is_none(),
+        "a pointer leading text loomux itself just pasted is loomux's own prompt, not a menu's \
+         highlighted choice (#820): {:?}",
+        prompt_wait_match(&masked)
+    );
+}
+
+#[test]
+fn g2_a_delivery_is_not_held_by_its_own_text_sitting_in_the_copilot_composer() {
+    // The repro end to end, at the checkpoint that actually held it: both
+    // readings of the live screen, through the production predicate, with the
+    // `pasted_text` a pre-Enter checkpoint really does have.
+    let raw = FIX_COPILOT_COMPOSER_PASTE.as_bytes().to_vec();
+
+    // The grid must be worth reading, or a release here would be the
+    // blind-start hole (`Unreadable` → the ring's word stands) rather than the
+    // fix — #727's f2 makes the same check for the same reason.
+    let visible = trustworthy_composition(loomux_lib::orchestration::termgrid::render_visible(
+        &raw, 100, 10,
+    ))
+    .expect("precondition: the composer screen composes to a readable grid");
+    assert!(
+        visible.contains("@ files"),
+        "precondition: the CLI's own chrome is genuinely rendered — a live screen, not an \
+         absent one: {visible:?}"
+    );
+
+    let pred = question_hold_predicate_sampled(
+        move || sample_from_raw(&raw, 100, 10),
+        Some(COMPOSER_PASTE_TEXT.to_string()),
+        None,
+        Vec::new(),
+    );
+    assert!(
+        !pred(),
+        "a delivery must not be held behind the delivery's own text (#820) — and this is the \
+         hold that never ends, because an unsubmitted box repaints nothing"
+    );
+}
+
+#[test]
+fn g3_a_wrapped_paste_row_that_opens_with_an_arrow_is_still_our_own_text() {
+    // The framed composer, where no prompt chevron is involved at ALL: the
+    // `┃ ` border de-frames away and the WRAP is what does the damage, dropping
+    // one of the brief's own `→`s at the start of a row. This is why the fix is
+    // wrap reconstruction and not merely a chevron strip — a mask that only
+    // stripped the glyph would still miss every framed pane.
+    let tail = strip_ansi(FIX_COPILOT_FRAMED_WRAP.as_bytes());
+    let unmasked = prompt_wait_match(&tail).expect("the raw screen IS pointer-shaped");
+    assert_eq!(unmasked.signal, "pointer-option");
+    assert!(
+        unmasked.line.contains("then implement it"),
+        "precondition: the row that fired is the WRAPPED continuation of our own brief, not \
+         its first row: {:?}",
+        unmasked.line
+    );
+
+    let masked = mask_own_paste(&tail, FRAMED_PASTE_TEXT);
+    assert!(
+        prompt_wait_match(&masked).is_none(),
+        "one pasted line wrapped across rows is still one pasted line (#820): {:?}",
+        prompt_wait_match(&masked)
+    );
+}
+
+#[test]
+fn g4_a_short_pasted_line_never_claims_a_menu_option_row() {
+    // The fail-SAFE direction, and the whole reason `SELF_ECHO_MIN_POINTER_CHARS`
+    // exists. `❯ Overwrite` is our own composer holding a one-word paste, and it
+    // is also a live dialog's highlighted choice — byte for byte the same row.
+    // Claiming it on that evidence would mask a genuine dialog into "no
+    // question" and release an Enter into it, which is the #420 harm.
+    let tail = strip_ansi(FIX_POS_PTR_LAST.as_bytes());
+    let masked = mask_own_paste(&tail, "Overwrite\nKeep both");
+    let m = prompt_wait_match(&masked)
+        .expect("a real dialog whose options are short must still be a question (#420)");
+    assert_eq!(m.needle, QuestionNeedle::LeadingPointer, "and still by the pointer");
+
+    // ...and the floor is about the EVIDENCE, not about pointers as such: the
+    // same shape, with a line long enough to be recognisably ours, IS claimed.
+    // Both halves are pinned, because a floor set to zero and a floor set to
+    // infinity are each a different bug.
+    let long = "Overwrite the existing file and keep the previous one as a backup";
+    let long_tail = format!("? Are you sure?\n❯ {long}\n  Cancel");
+    let long_masked = mask_own_paste(&long_tail, long);
+    assert!(
+        prompt_wait_match(&long_masked).is_none(),
+        "a pointer leading a line long enough to be recognisably ours is our own echo: {:?}",
+        prompt_wait_match(&long_masked)
+    );
+}
+
+#[test]
+fn g5_every_captured_real_dialog_still_holds_with_a_delivery_on_screen() {
+    // #727's suite is the floor, and the argument that CHANGED is the mask —
+    // so each captured shape is re-checked THROUGH the new exclusion with a
+    // delivery's worth of our own text supplied, rather than by re-asserting a
+    // bare detector call that no longer covers the risk.
+    let paste = "Please rebase onto main and re-read the review findings on PR #814 \
+                 before pushing anything else.";
+    for (name, fixture) in [
+        ("claude-askuserquestion", FIX_CLAUDE_ASK),
+        ("copilot-question", FIX_COPILOT_ASK),
+        ("copilot-multichoice", FIX_COPILOT_MULTICHOICE),
+        ("claude-mcp-approval", FIX_CLAUDE_MCP_APPROVAL),
+        ("pointer-last", FIX_POS_PTR_LAST),
+    ] {
+        let masked = mask_own_paste(&strip_ansi(fixture.as_bytes()), paste);
+        assert!(
+            prompt_wait_match(&masked).is_some(),
+            "{name}: a real dialog must still hold the delivery — #727's suite is the floor"
+        );
+    }
+    // ...and every false positive #40 and #727 already closed must stay closed.
+    for (name, fixture) in [
+        ("fp-resumed-idle", FIX_FP_RESUMED_IDLE),
+        ("fp-prose-arrow-keys", FIX_FP_PROSE),
+        ("fp-shell-prompt-glyph", FIX_FP_SHELL),
+        ("fp-breadcrumb-separator", FIX_FP_BREADCRUMB),
+    ] {
+        let masked = mask_own_paste(&strip_ansi(fixture.as_bytes()), paste);
+        assert!(
+            prompt_wait_match(&masked).is_none(),
+            "{name}: must still take its delivery immediately: {:?}",
+            prompt_wait_match(&masked)
+        );
+    }
+}
+
+#[test]
+fn g6_the_queue_polls_hold_record_names_what_the_question_gate_matched() {
+    // #820, finding 1. Every capped hold and every abort has recorded `matched`
+    // since #513(c)/F2 — but the hold a human actually sits in front of is the
+    // drainer's, which re-arms with NO cap, and it recorded `blocked_on:
+    // "question"` and nothing whatever else. A false positive that parks a pane
+    // for a whole session is precisely the record that has to name its own
+    // shape, and #820 could not be diagnosed from `audit.jsonl` at all.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 8200u32;
+    let bound = QUESTION_HOLD_STALE_AFTER.as_millis() as u64;
+    let t0 = 1_000_000u64;
+
+    // The witness the drainer's own poll produced — a real detector match off a
+    // real screen, not a hand-built one, so the audit is pinned to the
+    // vocabulary the detector actually emits.
+    let matched = prompt_wait_match(&strip_ansi(FIX_COPILOT_ASK.as_bytes()))
+        .expect("the captured copilot dialog matches");
+    let seen = QuestionWitnessed { matched: matched.clone(), grid: GridEvidence::StillRendered };
+
+    reg.hold_escalation_step(
+        &g.id, &w.id, pty, WriteAdmission::HoldQuestion, 1, t0, bound, None, Some(&seen),
+    );
+
+    let rows = audit_entries(&reg, &g.id, "delivery-held-in-queue");
+    assert_eq!(rows.len(), 1, "one line per hold EPISODE, unchanged");
+    assert_eq!(rows[0]["detail"]["blocked_on"], "question");
+    assert_eq!(
+        rows[0]["detail"]["matched"]["signal"], matched.signal,
+        "the record has to say WHICH rule fired — the fastest way to spot one misfiring on \
+         our own prose, and the field whose absence left #820 undiagnosable"
+    );
+    assert_eq!(rows[0]["detail"]["matched"]["line"], matched.line, "and the line it fired on");
+    assert_eq!(
+        rows[0]["detail"]["matched"]["grid"], "still-rendered",
+        "and whether the screen agreed"
+    );
+
+    // `null`, not a missing key, where the gate matched nothing — for a
+    // question-blocked row that disagreement is itself the finding, and an
+    // absent key is indistinguishable from an older build.
+    let pty2 = 8201u32;
+    reg.hold_escalation_step(
+        &g.id, &w.id, pty2, WriteAdmission::HoldBoxOccupied, 1, t0, bound, None, None,
+    );
+    let rows = audit_entries(&reg, &g.id, "delivery-held-in-queue");
+    assert_eq!(rows.len(), 2);
+    assert!(
+        rows[1]["detail"]["matched"].is_null(),
+        "no match seen must be RECORDED, not omitted: {:?}",
+        rows[1]
     );
 }
 
