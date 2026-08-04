@@ -510,9 +510,6 @@ pub fn session_transcript_on(
     conn: &Connection,
     session_id: &str,
 ) -> Result<Vec<TranscriptRow>, Unavailable> {
-    // PROBE (#722 slice B2): no transcript reader, exactly as before this slice.
-    #[allow(unreachable_code, unused_variables)]
-    return Ok(Vec::new());
     let mut stmt = conn
         .prepare(
             "SELECT m.id, m.time_created, m.data, p.data \
