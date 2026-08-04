@@ -100,6 +100,9 @@ use loomux_lib::orchestration::{
     drain_stranded_submit, stranded_admission_gate, stranded_detail, stranded_selfheal_action,
     // #813: a marker that cannot fire must not hold the rest of the pane queue behind it.
     stranded_marker_action, StrandedMarkerAction, StrandedRetireReason,
+    // #824: the missing half of flush_stranded_text's contract — what deliver_now
+    // does when the flush DECLINES and our own text is still in the box.
+    stranded_paste_guard, StrandedPasteGuard,
     StrandedAction, StrandedBlocker, STRANDED_SELFHEAL_MAX_HEALS,
     kickoff_recovery_action, KickoffDecline, KickoffRecovery,
     KICKOFF_REDELIVERY_MAX, KICKOFF_TURN_EVIDENCE_BYTES, await_cli_ready, ReadyWait,
@@ -40547,4 +40550,150 @@ fn concurrent_consent_toggles_leave_the_marker_and_memory_agreeing() {
              authority the human turned off (#762 rev-260 B1)"
         );
     }
+}
+
+// ---------- #824: a declined flush is not permission to paste ----------
+//
+// `flush_stranded_text` is the mechanism that clears a previous delivery's
+// stranded text before this one pastes, and it can DECLINE — a human typed
+// since our submit, a question is live, human characters are outstanding.
+// `deliver_now` ignored that and carried on to the paste.
+//
+// Nothing between the flush and the paste can catch it, and the reason is
+// structural rather than an oversight: the pre-paste guard is
+// `wait_for_box_clear` → `PtyManager::input_pending` → `input_box_len`, a
+// counter written by `note_user_input` and by nothing else — and
+// `note_user_input` is reached from exactly ONE place, `write_from_frontend`.
+// Orchestration's own typing goes out through `write_bytes`, which touches no
+// counter at all. So `!input_pending` means "no HUMAN characters outstanding",
+// never "the box is empty", and loomux's own pasted prompt is invisible to
+// every guard on the path.
+//
+// The incident shape is ordinary: a delivery strands, the human presses Enter
+// (or types a character and backspaces it out), the flush declines on the human
+// block, `input_pending` reads false, and the next delivery pastes ON TOP of
+// the stranded prompt — which the pre-Enter quiet wait then submits as one
+// merged prompt. That is the #81/#84/#111 collision, reached through the
+// flush's own decline.
+//
+// The guard is gated on a POSITIVE `Holds` and nothing weaker. `Unverifiable`
+// keeps today's behaviour on purpose (common near the Tier 1 scan cap per
+// #583/#685 — aborting on it would trade a rare merge for a routine stall), and
+// `NotHolding` is precisely when pasting is safe.
+
+#[test]
+fn a_declined_flush_over_our_own_stranded_text_aborts_instead_of_pasting() {
+    // THE incident cell. The flush declined, the ledger says the previous
+    // delivery is unconfirmed, and Tier 1 can see our text still in the box.
+    assert_eq!(
+        stranded_paste_guard(Some(false), false, Some(BoxReading::Holds)),
+        StrandedPasteGuard::AbortStranded
+    );
+}
+
+#[test]
+fn a_flush_that_actually_pressed_never_blocks_the_paste() {
+    // `flushed` is the box having been cleared by our OWN Enter, so there is
+    // nothing left to collide with — and the reading is stale by construction
+    // (it describes the pane before the press). Checked first for that reason.
+    assert_eq!(
+        stranded_paste_guard(Some(false), true, Some(BoxReading::Holds)),
+        StrandedPasteGuard::Paste,
+        "a successful flush is the box being cleared; blocking after it would deadlock every \
+         delivery into a pane that had ever stranded one"
+    );
+}
+
+#[test]
+fn only_a_positive_holds_reading_aborts_the_paste() {
+    // The blast-radius bound, stated as a matrix. `Unverifiable` is the one that
+    // matters commercially: it is routine near the scan cap, and aborting on it
+    // would convert a rare merge into a routine stall on ordinary traffic.
+    for reading in [Some(BoxReading::NotHolding), Some(BoxReading::Unverifiable), None] {
+        assert_eq!(
+            stranded_paste_guard(Some(false), false, reading),
+            StrandedPasteGuard::Paste,
+            "reading {reading:?} is not evidence of a collision, so it must not abort"
+        );
+    }
+}
+
+#[test]
+fn a_pane_with_nothing_stranded_is_untouched_by_this_guard() {
+    // The overwhelming majority of deliveries. `Some(true)` is a pane whose last
+    // delivery confirmed; `None` is a pane with no ledger entry at all. Neither
+    // may pay anything here, whatever the tail happens to look like.
+    for prev in [Some(true), None] {
+        assert_eq!(
+            stranded_paste_guard(prev, false, Some(BoxReading::Holds)),
+            StrandedPasteGuard::Paste,
+            "prev_confirmed={prev:?} has nothing stranded, so a Holds reading is about \
+             somebody else's text"
+        );
+    }
+}
+
+#[test]
+fn the_wired_declined_flush_leaves_the_pane_untouched_when_our_text_is_still_there() {
+    // The WIRED half, driving the real `flush_stranded_text` against a real
+    // `PtyManager` — the function `deliver_now` actually calls. A pure test
+    // cannot see the part that made this reachable: that the human's Enter
+    // stamps the keystroke clock AND empties the occupancy counter in one
+    // write, so the flush declines on the human block while `input_pending`
+    // simultaneously reads clear. Only the real `note_user_input` does both.
+    let pm = PtyManager::default();
+    let pty = 8241u32;
+    let captured = pm.register_fake_for_test(pty, STRANDED_TAIL.as_bytes());
+    let last_delivery: std::sync::Mutex<HashMap<u32, _>> = std::sync::Mutex::new(HashMap::new());
+    record_stranded_outcome_at_for_test(
+        &last_delivery,
+        pty,
+        "loomux".to_string(),
+        now_ms() - 60_000,
+        Some(STRANDED_PROMPT.to_string()),
+    );
+
+    // The human touches the pane: Enter classifies `Submit`, which stamps the
+    // clock and zeroes the counter in the same write.
+    pm.note_user_input(pty, "\r", true);
+    assert_eq!(
+        pm.input_pending(pty),
+        Some(false),
+        "precondition: the ONLY box guard on this path now reads clear — which is the defect"
+    );
+
+    let human_block = human_input_block(
+        pm.last_user_input_ms(pty).unwrap_or(0),
+        now_ms() - 60_000,
+        pm.input_pending(pty).unwrap_or(true),
+        now_ms(),
+        HUMAN_INPUT_BLOCK_BOUND_MS,
+    );
+    assert_eq!(human_block, HumanInputBlock::Blocked, "precondition: the human-block route");
+
+    let flushed = flush_stranded_text(
+        &pm,
+        pty,
+        recorded_confirmed(&last_delivery, pty),
+        human_block.holds(),
+        b"\r",
+        Vec::new(),
+    );
+    assert!(!flushed, "precondition: the flush declines, and pre-#824 that was the end of it");
+    assert!(
+        captured.lock().unwrap().is_empty(),
+        "a declining flush writes nothing, so the stranded text is still sitting there"
+    );
+
+    // Tier 1 on our own recorded text — the reading `deliver_now` now takes.
+    let mut scan = Tier1Scan::for_paste(STRANDED_PROMPT);
+    let read = scan.read(|n| pm.output_tail_bounded(pty, n));
+    let reading = box_reading(read.as_ref().map(|r| r.stripped.as_str()), STRANDED_PROMPT);
+    assert_eq!(reading, BoxReading::Holds, "precondition: the pane still shows our prompt");
+
+    assert_eq!(
+        stranded_paste_guard(recorded_confirmed(&last_delivery, pty), flushed, Some(reading)),
+        StrandedPasteGuard::AbortStranded,
+        "so the delivery must abort pre-paste — pasting here merges two prompts into one (#824)"
+    );
 }
