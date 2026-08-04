@@ -15029,6 +15029,80 @@ fn h6_de_framing_never_costs_a_match_the_flat_comparison_would_have_found() {
     );
 }
 
+/// A frame-heavy paste: every line is a markdown table row, so `deframe`
+/// strips a leading `|` from each and the de-framed needle is materially
+/// shorter than the flat one (192 vs 204 characters normalized — a 12-char
+/// gap, two per line).
+const FRAME_HEAVY_PASTE: &str = "| record | rev-306 | re-record the verdict on the final head |\n\
+     | step | owner | notes |\n\
+     | rebase | w-300 | onto main |\n\
+     | verify | rev-306 | matrix |\n\
+     | merge | human | gated |\n\
+     | sweep | w-300 | disjuncts |";
+
+#[test]
+fn h7_a_short_read_is_unverifiable_on_either_routes_arithmetic() {
+    // rev-307. Once `box_holds_paste` became a disjunction, every arm BELOW it
+    // had to be asked of both routes too — and the length arm was still asking
+    // one. De-framing shrinks a frame-heavy needle (a markdown table: 204 flat,
+    // 192 de-framed) more than it shrinks an un-gutted tail, so a truncated read
+    // whose length falls in that 12-character gap is:
+    //
+    //   * too short for the FLAT needle      -> pre-#821 said `Unverifiable`
+    //   * long enough for the DE-FRAMED one  -> the de-framed arm stays silent
+    //
+    // and the probe cannot rescue it, because truncating from the FRONT removes
+    // the longest line the probe is sampled from. `NotHolding` — our text may
+    // well be in that box, and we have just told `stranded_marker_action` it is
+    // not. Same direction as the containment defect, narrower trigger (it needs
+    // a short read as well), same class.
+    let screen = format!("● Ready.\n{FRAME_HEAVY_PASTE}\n  @ files · # issues");
+    let flat = screen.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Truncate from the FRONT — a real short read keeps the tail END.
+    let tail: String = flat.chars().skip(flat.chars().count() - 197).collect();
+
+    // Preconditions: the shape this depends on, so a drifting fixture fails
+    // loudly rather than passing for an unrelated reason.
+    assert!(
+        FRAME_HEAVY_PASTE.lines().all(|l| l.trim_start().starts_with('|')),
+        "precondition: FRAME-heavy — every line leads with a character `deframe` strips, which \
+         is what opens the gap between the two normalized needle lengths"
+    );
+    assert!(
+        !box_holds_paste(&tail, FRAME_HEAVY_PASTE),
+        "precondition: neither containment route finds it, so the reading is decided by the \
+         arms below — this test is about those, not about containment"
+    );
+    let flat_needle = FRAME_HEAVY_PASTE.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        tail.chars().count() < flat_needle.chars().count(),
+        "precondition: a genuinely SHORT read — the flat arithmetic says we could not have seen \
+         the whole paste, which is exactly what `Unverifiable` means"
+    );
+
+    assert_eq!(
+        box_reading(Some(&tail), FRAME_HEAVY_PASTE),
+        BoxReading::Unverifiable,
+        "a read too short for either route's needle is one we could not take — `NotHolding` here \
+         is a confident absence asserted from a partial view"
+    );
+
+    // The consequence, at the decision that spends it — the third time this
+    // same harm arrives by a new route (`h2` gutter, `h6` wrap, `h7` short read).
+    let action = stranded_marker_action(
+        Some(false),
+        Some(box_reading(Some(&tail), FRAME_HEAVY_PASTE)),
+        false,
+        HumanInputBlock::None,
+        false,
+        || false,
+    );
+    assert!(
+        !matches!(action, StrandedMarkerAction::Retire(_)),
+        "#819 retires only on a POSITIVE `NotHolding`; a truncated read is not one: got {action:?}"
+    );
+}
+
 #[test]
 fn h5_a_markdown_bullet_in_a_brief_is_not_mistaken_for_box_framing() {
     // The trap in de-framing only the TAIL. `is_frame_char` counts `*`, `•` and
