@@ -14644,16 +14644,18 @@ pub fn queuefull_readmit_gate(
     if blocker != Some(StrandedBlocker::QueueFull) {
         return Some("not-queue-full");
     }
-    // RED ROUND 2, mutation 1 (#825 M3): the `still-full` arm removed.
-    let _ = depth;
+    // The condition that raised the chip is still true, so the chip is still
+    // right and there is nothing to retry.
+    if depth >= queue::QUEUE_MAX_PER_PANE {
+        return Some("still-full");
+    }
     // Same word as `stranded_admission_gate`'s, and the same fact — pushing in
     // front of a drainer that owns the front entry is the rev-47 B1 race. Named
     // here as well so a caller can decline BEFORE attempting, which is what
     // keeps a declined pass silent instead of writing a skip line every 30s.
-    // RED ROUND 2, mutation 2 (#825 M3): the `drainer-active` arm removed —
-    // which is exactly the hook plan-312 asked for, at exactly the moment it
-    // would have run.
-    let _ = drainer_active;
+    if drainer_active {
+        return Some("drainer-active");
+    }
     None
 }
 
@@ -30329,8 +30331,11 @@ impl OrchRegistry {
                 .iter()
                 .filter_map(|(id, note)| {
                     let a = agents.get(id)?;
-                    // RED ROUND 2, mutation 4 (#825 M3): the liveness filter
-                    // removed.
+                    // A pane with no running agent has nothing to submit into,
+                    // and `attention_tick` prunes its note anyway.
+                    if a.status != AgentStatus::Running {
+                        return None;
+                    }
                     Some((id.clone(), a.group.clone(), a.pty_id?, note.blocker))
                 })
                 .collect()
@@ -30348,10 +30353,9 @@ impl OrchRegistry {
             // sender (#560's rule: a record that guesses is worse than none).
             // No record at all means nothing on this pane is still accountable
             // as stranded, and there is nothing to re-submit.
-            // RED ROUND 2, mutation 3 (#825 M3): the ledger lookup dropped, the
-            // sender guessed.
-            let _ = last_delivery;
-            let from = "loomux".to_string();
+            let Some(from) = last_delivery.lock_safe().get(&pty_id).map(|o| o.from.clone()) else {
+                continue;
+            };
             let admitted = match self.admit_stranded_selfheal(&group, &agent_id, &from, pty_id) {
                 Ok(admitted) => admitted,
                 // The queue went back to cap between the gate read and the push
