@@ -1642,6 +1642,13 @@ mod tests {
     /// Reasoning is the model's scratchpad, exactly like Claude's `thinking`
     /// blocks, and the remaining part types carry no conversation content —
     /// none of them may become an event.
+    ///
+    /// The `text` part is load-bearing, not scenery: an assertion that a list
+    /// is EMPTY passes just as well when the normalizer does nothing at all,
+    /// so on its own this would be a test that cannot fail. Surrounding the
+    /// skipped types with one part that must survive makes it fail in both
+    /// directions — if a skipped type starts emitting, and if the normalizer
+    /// stops emitting.
     #[test]
     fn opencode_part_types_with_no_conversation_content_are_skipped() {
         let rows = vec![
@@ -1649,11 +1656,14 @@ mod tests {
             oc_row("msg_1", "assistant", 1, json!({ "type": "step-start" })),
             oc_row("msg_1", "assistant", 1, json!({ "type": "step-finish", "reason": "stop", "cost": 0.0,
                                                     "tokens": { "input": 1, "output": 1, "reasoning": 0, "cache": { "read": 0, "write": 0 } } })),
+            oc_row("msg_1", "assistant", 1, oc_text("the one part that carries content")),
             oc_row("msg_1", "assistant", 1, json!({ "type": "snapshot", "snapshot": "abc" })),
             oc_row("msg_1", "assistant", 1, json!({ "type": "patch", "hash": "abc", "files": ["src/foo.rs"] })),
             oc_row("msg_1", "assistant", 1, json!({ "type": "compaction", "auto": true })),
         ];
-        assert!(parse_opencode_transcript_events(&rows).is_empty(), "{rows:?}");
+        let events = parse_opencode_transcript_events(&rows);
+        assert_eq!(events.len(), 1, "only the text part may survive: {events:?}");
+        assert!(matches!(&events[0].kind, EventKind::Text { text } if text == "the one part that carries content"));
     }
 
     /// A store read mid-write, a row this reader has not been read against, a
