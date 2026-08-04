@@ -10148,7 +10148,7 @@ fn sanitize_session(s: &str) -> Option<String> {
     let t = s.trim();
     (!t.is_empty()
         && t.len() <= 64
-        && t.chars().all(|c| c.is_ascii_hexdigit() || c == '-')) // PROBE M6
+        && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'))
     .then(|| t.to_string())
 }
 
@@ -10283,8 +10283,8 @@ pub fn session_cwd_in_store(
     session_id: &str,
     opencode_db: Option<&Path>,
 ) -> Result<Option<String>, String> {
-    if true {
-        return crate::sessions::find_session_cwd(cli, session_id); // PROBE M7
+    if cli != "opencode" {
+        return crate::sessions::find_session_cwd(cli, session_id);
     }
     let Some(db) = opencode_db else {
         return Ok(None);
@@ -21500,7 +21500,6 @@ impl OrchRegistry {
                 Err(crate::opencodedb::Unavailable::Absent) => {
                     Some(SessionBaseline::OpenCode { ids: HashSet::new() })
                 }
-                Err(_) if true => Some(SessionBaseline::OpenCode { ids: HashSet::new() }), // PROBE M5
                 Err(e) => {
                     self.audit(group, "loomux", "session-untracked", json!({
                         "cli": "opencode",
