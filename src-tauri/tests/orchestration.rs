@@ -8436,7 +8436,7 @@ fn associating_a_copilot_session_records_it_on_roster_and_task_board() {
 
     // The watcher discovered copilot's session id and binds it to the pane.
     let sid = "0f9e8d7c-1234-4abc-8def-0011223344ff";
-    reg.associate_copilot_session(&g.id, &w.id, sid);
+    reg.associate_session(&g.id, &w.id, sid);
 
     // Agent map now carries the id (so list_agents/resume can use it).
     let agents = reg.list_agents(&g.id);
@@ -8456,7 +8456,7 @@ fn associating_a_copilot_session_records_it_on_roster_and_task_board() {
     assert_eq!(task.session.as_deref(), Some(sid));
 
     // Idempotent: a second (late) discovery must not clobber the bound id.
-    reg.associate_copilot_session(&g.id, &w.id, "ffffffff-0000-4000-8000-000000000000");
+    reg.associate_session(&g.id, &w.id, "ffffffff-0000-4000-8000-000000000000");
     let agents = reg.list_agents(&g.id);
     let entry = agents.as_array().unwrap().iter().find(|a| a["id"] == w.id.as_str()).unwrap();
     assert_eq!(entry["session"], sid, "an already-tracked pane keeps its first session id");
@@ -8480,7 +8480,7 @@ fn copilot_orchestration_session_gets_a_chip_and_restores() {
         // once it appears on disk (here, driven directly).
         let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
         assert!(orch.session_id.is_none());
-        reg.associate_copilot_session(&g.id, &orch.id, sid);
+        reg.associate_session(&g.id, &orch.id, sid);
         // Session browser now has an ORCH chip for this copilot session.
         let roles: Vec<_> = reg.session_roles().into_iter().filter(|r| r.session_id == sid).collect();
         assert_eq!(roles.len(), 1);
