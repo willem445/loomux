@@ -301,7 +301,7 @@ so the file is there to find. Edit it and relaunch loomux to pick up a change
 | Key | Default | What changing it does |
 | --- | --- | --- |
 | `pasteOnPlainCtrlV` | `true` | Set `false` and plain `Ctrl+V` in a terminal pane passes through to whatever's running there (vim, readline, an agent CLI) instead of pasting. `Ctrl+Shift+V` still always pastes. |
-| `unfocusedRenderThrottleMs` | `100` | How long a **visible but unfocused** pane batches its output before drawing it, in milliseconds. The pane you're focused on is never throttled, and a pane that has been quiet still draws its next output immediately — only a pane that is already streaming, that you aren't reading, is batched. Set `0` to turn it off and draw every pane at full rate (see below). Values above `1000` are clamped. |
+| `unfocusedRenderThrottleMs` | `100` | How long a **visible but unfocused** pane batches its output before drawing it, in milliseconds. The pane you're focused on is never throttled, and a pane that has been quiet still draws its next output immediately — only a pane that is already streaming, that you aren't reading, is batched. Batching also switches off entirely while the loomux window is hidden — see below. Set `0` to turn it off and draw every pane at full rate (see below). Values above `1000` are clamped. |
 
 ### Why `unfocusedRenderThrottleMs` exists
 
@@ -323,6 +323,13 @@ refresh in the UI pauses: the tab strip's agent/cost chips, an open project
 panel, a hover preview, and an armed **▶ follow** in the audit or timeline
 view. Bring the window back and each one refreshes immediately, so what you see
 is current rather than up to a poll-interval stale.
+
+One thing goes the other way: the `unfocusedRenderThrottleMs` batching above
+switches **off** while the window is hidden, so every pane takes its output
+immediately instead of in batches. Batching exists to save redraws, and a hidden
+window has no redraws to save — while holding output back would delay the
+replies your panes' terminals send back to the programs running in them. A
+locked screen counts as hidden, which is when that matters most.
 
 **Your agents are not paused by this.** Panes keep running, output keeps
 arriving and scrolling, deliveries keep landing, and every backend watcher
