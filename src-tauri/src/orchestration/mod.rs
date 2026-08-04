@@ -16556,26 +16556,39 @@ pub fn stranded_marker_action(
     // on the path that actually consults it.
     question_active: impl FnOnce() -> bool,
 ) -> StrandedMarkerAction {
-    // ⚠ TEMPORARY — #813 RED EVIDENCE (B of two), reverted before this PR is
-    // ready. This is the FIRST CUT of this fix — the design the review round
-    // rejected — reproduced against the final signature.
-    //
-    // Its evidence rule is the defect: it retires on (a keystroke landed after
-    // our submit) AND (`input_pending` is false), i.e. on who typed rather than
-    // on where our text is. Run A (the pre-#813 decision) cannot fail the
-    // must-NOT-retire guards, because pre-#813 never retired at all; THIS is
-    // the code those guards exist against, so this is the run that reds them.
-    let _ = text_reading;
-    let _ = human_stamped_since;
+    // Nothing stranded to submit. `should_flush_before_paste`'s own condition,
+    // read as a retire rather than as a decline: a decline here retried forever
+    // against a ledger that can never say `Some(false)` again.
     if !matches!(prev_confirmed, Some(false)) {
         return StrandedMarkerAction::Retire(StrandedRetireReason::NothingStranded);
     }
-    if human_block == HumanInputBlock::Blocked && !box_pending {
-        return StrandedMarkerAction::Retire(StrandedRetireReason::HumanResolved);
+    // The one positive reading that licenses a retirement: our text is gone
+    // from the box. See the header for why nothing weaker will do.
+    if text_reading == Some(BoxReading::NotHolding) {
+        return StrandedMarkerAction::Retire(if human_stamped_since {
+            StrandedRetireReason::HumanResolved
+        } else {
+            StrandedRetireReason::TextGone
+        });
     }
+    // #510's absolute, unchanged: human-typed characters are outstanding in the
+    // box, so never press Enter over them.
     if box_pending {
         return StrandedMarkerAction::Retry(queue::EnqueueReason::BoxOccupied);
     }
+    // #518, unchanged and now genuinely reachable: a human typed here since our
+    // submit, so hold — but only until the bound, after which `holds()` reads
+    // false and this falls through to the press. That bound is the ONLY thing
+    // that releases a stamp which may have been a phantom, which is why nothing
+    // above may retire on the stamp alone.
+    //
+    // `BoxOccupied` is the honest reason: the box is occupied — by OUR text,
+    // which is the entire premise of a marker existing. Whose text it is lives
+    // in the `stranded-marker-*` audit, not in the queue's reason vocabulary.
+    if human_block.holds() {
+        return StrandedMarkerAction::Retry(queue::EnqueueReason::BoxOccupied);
+    }
+    // #420, unchanged: a live question owns the Enter key.
     if question_active() {
         return StrandedMarkerAction::Retry(queue::EnqueueReason::Question);
     }
