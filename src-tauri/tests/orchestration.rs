@@ -17671,7 +17671,12 @@ fn loomux_shim_harness_blocks_the_launcher_and_audits_it() {
     assert_eq!(audit.lines().filter(|l| l.contains("self-launch-blocked")).count(), 3);
     assert!(audit.contains("\"agent\":\"w-1\""), "the audit names the agent: {audit}");
     for line in audit.lines() {
-        serde_json::from_str::<serde_json::Value>(line).expect("each audit line is valid JSON");
+        let v: serde_json::Value =
+            serde_json::from_str(line).expect("each audit line is valid JSON");
+        // ts_ms must be a NUMBER, not merely present: `date +%s%3N` yields a
+        // literal `3N` tail on BSD date (macOS), which silently corrupts the whole
+        // line. Parseability alone wouldn't catch a quoted or truncated stamp.
+        assert!(v["ts_ms"].is_number(), "ts_ms must be numeric: {line}");
     }
 }
 
