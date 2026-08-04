@@ -77,10 +77,11 @@ looks like a loomux bug.
 
 ## An agent CLI isn't found
 
-Orchestration and agent panes drive the `claude` and/or `copilot` CLIs — loomux
-doesn't bundle them. The launcher warns inline when a selected role's CLI isn't
-installed. Make sure the CLI is on your `PATH` (open a fresh terminal and run
-`claude --version` / `copilot --version`).
+Orchestration and agent panes drive the `claude`, `copilot`, and `opencode`
+CLIs — loomux doesn't bundle them. The launcher warns inline when a selected
+role's CLI isn't installed. Make sure the CLI is on your `PATH` (open a fresh
+terminal and run `claude --version` / `copilot --version` / `opencode
+--version`).
 
 An agent pane that dies with an error **stays open** so you can read what
 happened — it isn't closed out from under you.
