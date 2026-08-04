@@ -29,7 +29,10 @@
 //! That schema is a vendor's internal detail with no compatibility promise, so
 //! every failure mode here is **degraded, never fatal**: a store that is
 //! absent, unopenable, or shaped differently than the above yields
-//! [`Unavailable`], and the caller reports zero usage and moves on. Nothing in
+//! [`Unavailable`] rather than an error, and what that means is the caller's
+//! call — the polled usage meter reports zero and moves on, while a digest,
+//! whose entire product is the transcript it came to read, surfaces the reason
+//! instead of returning an empty one (see `session_transcript`). Nothing in
 //! this module panics, retries in a loop, or blocks for longer than
 //! [`BUSY_TIMEOUT_MS`] — it runs on the polled `group_usage` path, where a
 //! wedge would freeze a UI tick.
