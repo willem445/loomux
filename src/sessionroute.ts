@@ -4,6 +4,14 @@
 // group rejoin, or a plain pane — so the RULE is unit-tested
 // (test/sessionroute.test.ts) without a DOM, a pane, or the backend.
 //
+// The plain-pane arm names its pane via `restoredPaneName` (sessionmeta.ts),
+// not a branch of its own (#722): this module landed (#781) before the
+// backend's third session source did, so its own `paneName` was still the
+// two-CLI ternary `restoredPaneName` replaced elsewhere for the same reason
+// (that file's own comment has the story) — an opencode row restoring here
+// would have been mislabelled `copilot · …` again, the exact bug class #722's
+// C2 slice exists to close. One source of truth for the label, not two.
+//
 // THE RULE IS RECORDED MEMBERSHIP, NEVER THE CLI. A session rejoins its group
 // iff loomux has a record that it belonged to one — a roster row from
 // `orch_session_roles`, or the transcript-signature fallback the session
@@ -31,6 +39,8 @@
 // the same failure: loomux has no evidence it was ever in a group, the row
 // carries no chip claiming otherwise, and a plain pane is exactly what it is.
 
+import { restoredPaneName } from "./sessionmeta.ts";
+
 /** The recorded orchestration membership of a session — the fields the route
  *  needs out of the session browser's `SessionRoleInfo`. */
 export interface RecordedRole {
@@ -40,8 +50,9 @@ export interface RecordedRole {
 
 /** Just enough of a `listSessions()` row to route it. */
 export interface RoutableSession {
-  /** The CLI that wrote the session ("claude" | "copilot"). Deliberately NOT
-   *  part of the route decision — it only labels the plain pane. */
+  /** The CLI that wrote the session — read, never branched on, for the plain
+   *  pane's label (see `restoredPaneName`). Deliberately NOT part of the
+   *  route decision itself. */
   source: string;
   title: string;
 }
@@ -50,10 +61,6 @@ export interface RoutableSession {
 export type SessionRestoreRoute =
   | { kind: "orchestration"; groupId: string; role: string }
   | { kind: "plain"; paneName: string };
-
-/** Longest session title kept intact in a plain pane's name; anything longer is
- *  truncated with an ellipsis so a pane tab stays readable. */
-const PANE_NAME_TITLE_LIMIT = 34;
 
 /** Route one Sessions-tab click.
  *
@@ -69,9 +76,5 @@ export function sessionRestoreRoute(
   if (role) {
     return { kind: "orchestration", groupId: role.group_id, role: role.role };
   }
-  const title =
-    s.title.length > PANE_NAME_TITLE_LIMIT
-      ? s.title.slice(0, PANE_NAME_TITLE_LIMIT) + "…"
-      : s.title;
-  return { kind: "plain", paneName: `${s.source === "claude" ? "claude" : "copilot"} · ${title}` };
+  return { kind: "plain", paneName: restoredPaneName(s.source, s.title) };
 }

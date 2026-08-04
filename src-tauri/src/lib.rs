@@ -11,6 +11,7 @@ mod gitwatch;
 mod winpath;
 mod metrics;
 mod obs;
+pub mod opencodedb; // pub: the #722 usage-readback integration tests link its reader
 pub mod orchestration; // pub: integration smoke test links through it
 pub mod pty; // pub: Job-Object integration test links `assign_kill_on_close_job`
 pub mod ptyout; // pub: the #712 output-coalescing integration test drives `pty_output_pump`

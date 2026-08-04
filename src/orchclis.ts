@@ -1,0 +1,100 @@
+// The launcher's orchestrator-mode CLI catalog: which agent CLIs a group can be
+// launched on, the curated model ids each one suggests, and the per-role default.
+//
+// DOM-free and I/O-free so `test/orchclis.test.ts` can pin it directly — it used
+// to be a `const` inside launcher.ts, where the one thing worth testing about it
+// (that a role's default is a model the picker actually offers, and that loomux
+// never quietly pins a model the human didn't ask for) could not be.
+//
+// **This is a SUGGESTION list, not a capability claim.** Membership here says
+// "the launcher can start a group on this CLI"; what a CLI can *do* is the
+// backend's to state (`CLI_CAPS` / `cli_can_host`, and `agent_cli_knobs` for the
+// knobs). The model lists are shortcuts for the ids this repo's issues actually
+// target — the picker merges whatever the CLI's own `--help` reports and always
+// keeps a `custom…` entry, so a missing id costs a human one line of typing, and
+// a stale id in a hardcoded table would cost them a failed spawn (#329).
+//
+// Every id here is one PATH probe (`probe_agent_cli`) away from being refused at
+// submit: the `id` IS the program name the launcher probes, which is why
+// `orchclis.test.ts` pins it against `AGENTS`.
+
+import type { OrchRole } from "./roster";
+
+/** The curated-list entry that means **no `--model` at all**: the pane runs on
+ *  whatever model the human's own CLI config selects.
+ *
+ *  Only offered where the CLI has no vendor-neutral alias to default to
+ *  (opencode — see its row), because there it is the only honest default: any id
+ *  loomux picked would silently override a human who had already chosen one, and
+ *  the backend's `default_model("opencode", _)` returns exactly this for the same
+ *  reason (#722). It is a real, selectable option rather than an absence, so the
+ *  form can *say* "inherit" instead of leaving a role looking unset. */
+export const INHERIT_MODEL = "";
+
+export interface OrchCli {
+  /** The CLI id AND the program name the launcher probes on PATH. */
+  id: string;
+  /** Curated model ids to suggest, in menu order. */
+  models: string[];
+  /** The model each capability class starts on. `INHERIT_MODEL` means "send
+   *  nothing and let the CLI decide" — never a silent pick. Every value must be
+   *  either `INHERIT_MODEL` or one of `models`, or the picker would open on its
+   *  `custom…` branch with a prefilled id (pinned in `orchclis.test.ts`). */
+  defaults: Record<OrchRole, string>;
+}
+
+export const ORCH_CLIS: OrchCli[] = [
+  {
+    id: "claude",
+    models: ["sonnet", "opus", "haiku", "fable"],
+    // Reasoning-heavy roles (orchestrator, planner) default to the strong
+    // tier; executing roles (worker, reviewer) to the mid tier.
+    defaults: { orchestrator: "opus", worker: "sonnet", reviewer: "sonnet", planner: "opus" },
+  },
+  {
+    id: "copilot",
+    models: ["auto", "claude-sonnet-4.6", "claude-haiku-4.5", "gpt-5.2", "gpt-5.3-codex"],
+    defaults: { orchestrator: "auto", worker: "auto", reviewer: "auto", planner: "auto" },
+  },
+  {
+    // #722. Model ids here are `provider_id/model_id` — the `/` is part of the
+    // id, and the backend's `sanitize_model` was widened to stop dropping it
+    // (it silently turned `opencode/deepseek-v4-flash-free` into a model that
+    // does not exist). Nothing on this path may re-mangle it: the picker's
+    // option VALUE is the raw id, and only the label is prettified.
+    //
+    // The curated ids, and where each one comes from:
+    //   opencode/deepseek-v4-flash-free  the free Zen model #722 exists for
+    //                                    ("DeepSeek V4 Flash Free", Zen docs;
+    //                                    provider key `opencode`, not `zen`,
+    //                                    confirmed against the CLI's own model
+    //                                    parser in the #722 verification memo)
+    //   opencode/deepseek-v4-flash       its paid sibling, same memo
+    //   opencode/gpt-5.1-codex           the models reference's own example id
+    // The Zen free tier is broader than this, and deliberately not enumerated:
+    // each extra row is another line of hardcoded model table to go stale
+    // (#329), against a `custom…` entry that already accepts any id.
+    id: "opencode",
+    models: [INHERIT_MODEL, "opencode/deepseek-v4-flash-free", "opencode/deepseek-v4-flash", "opencode/gpt-5.1-codex"],
+    // NO default, on every role — the one CLI where that is the honest answer.
+    // opencode has no vendor-neutral alias at all (no `sonnet`, no `auto`, no
+    // `pro`): its catalog spans dozens of providers, so any default loomux
+    // picked would be both a hardcoded model table and a silent override of the
+    // human's own `opencode.json` / `/models` choice. This mirrors the backend's
+    // `default_model("opencode", _)` — the launcher and the spawn path have to
+    // agree, or the form would advertise an inheritance it then overrode.
+    defaults: {
+      orchestrator: INHERIT_MODEL,
+      worker: INHERIT_MODEL,
+      reviewer: INHERIT_MODEL,
+      planner: INHERIT_MODEL,
+    },
+  },
+];
+
+/** The catalog row for a CLI id, falling back to the first row — the launcher's
+ *  Agent field can hold an id that orchestrator mode does not offer (a solo-only
+ *  CLI, `custom`), and every caller here needs *a* row rather than a crash. */
+export function orchCliFor(id: string): OrchCli {
+  return ORCH_CLIS.find((c) => c.id === id) ?? ORCH_CLIS[0]!;
+}

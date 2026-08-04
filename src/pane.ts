@@ -87,7 +87,11 @@ import { WorkflowView } from "./workflowview";
 import { WORKFLOW_FILE } from "./workflowmodel";
 import type { PersistedPane, PersistedPaneKind } from "./tabstore";
 import type { TabPaneInfo } from "./tabcounts";
-import { adoptableSessionId, hasForkSession, normalizeAgentProgram } from "./panerestore";
+import { adoptableSessionId, hasForkSession, sessionCliFromCommand } from "./panerestore";
+// The reconciler's own CLI set, imported rather than re-spelled: `agentCli`
+// below exists to be matched against `listSessions()` rows, so the two must
+// name the same CLIs by construction (#722).
+import type { Cli } from "./sessionreconcile";
 
 // Inline icons so the toolbar renders identically regardless of installed
 // fonts; they inherit color via `currentColor`.
@@ -3457,15 +3461,15 @@ export class Pane implements VoiceTargetPane {
    *  helper `panerestore.ts`'s `programFromRestore` and main.ts's D2
    *  dormant-card sniff now call, converging what used to be three
    *  independent (and identically incomplete) first-token derivations
-   *  (#440/#452). "claude" | "copilot" | null for a plain shell, an
-   *  unrecognized program, or before launch. Used by the session reconciler
-   *  to match this pane's cwd against `listSessions()`'s `source` without
-   *  re-deriving the parse elsewhere. */
-  get agentCli(): "claude" | "copilot" | null {
-    const first = this.spawnCommand?.trim().split(/\s+/)[0];
-    if (!first) return null;
-    const program = normalizeAgentProgram(first);
-    return program === "claude" || program === "copilot" ? program : null;
+   *  (#440/#452). `Cli | null` — null for a plain shell, an unrecognized
+   *  program, or before launch. Used by the session reconciler to match this
+   *  pane's cwd against `listSessions()`'s `source` without re-deriving the
+   *  parse elsewhere, which is why the set recognized here is exactly the set
+   *  of sources a row can carry: a CLI the scanner lists but this getter
+   *  answers `null` for is a pane that can never adopt the session sitting in
+   *  the sidebar under its own cwd (#722). */
+  get agentCli(): Cli | null {
+    return sessionCliFromCommand(this.spawnCommand);
   }
 
   /** True when this pane's current launch command/argv carries `--fork-session`

@@ -1039,7 +1039,18 @@ fn guardrail_clamps_and_sanitizes() {
     assert_eq!(g.max_spawns_per_hour, 240, "spawn-rate cap clamps to the ceiling");
     assert_eq!(g.watchdog_stall_minutes, 1440, "watchdog stall timeout clamps to 24h");
     assert_eq!(g.agent_cli, "claude", "unknown group CLIs fall back to claude explicitly");
-    assert_eq!(g.model_for(Role::Worker), "sonnetrm-rf", "shell metacharacters must be stripped");
+    // #722 widened `sanitize_model` to admit `/` (opencode ids are
+    // `provider_id/model_id`), so the fixture's trailing slash now survives
+    // where it used to be dropped incidentally. The property this line exists
+    // for is unchanged and is asserted below rather than left to the literal:
+    // `/` is not a shell metacharacter — it is glob-inert in a POSIX shell and
+    // not an operator in PowerShell — so what a crafted model could actually
+    // smuggle (the `;` and the spaces) is still gone.
+    let worker = g.model_for(Role::Worker);
+    assert_eq!(worker, "sonnetrm-rf/", "shell metacharacters must be stripped");
+    for bad in [' ', ';', '&', '|', '$', '`', '(', ')', '[', ']', '*', '?', '"', '\''] {
+        assert!(!worker.contains(bad), "{bad:?} must never survive into a model id: {worker:?}");
+    }
     assert_eq!(g.model_for(Role::Reviewer), "sonnet", "empty model falls back to default");
     // Reasoning classes (orchestrator, planner) default to the strong tier on Claude.
     assert_eq!(g.model_for(Role::Planner), "opus", "empty planner model falls back to the reasoning tier");
@@ -6417,9 +6428,24 @@ fn single_pane_autopilot_flags_per_cli() {
     );
     assert_eq!(single_pane_autopilot_flags("Gemini"), gemini);
 
+    // OpenCode (#722): `--auto` — "auto-approve permissions that are not
+    // explicitly denied". The `--yolo` / `--dangerously-skip-permissions`
+    // aliases are hidden in its own option table, so the documented spelling
+    // is the one loomux emits. Same atom as the group path
+    // (`OPENCODE_UNATTENDED_FLAGS`), asserted in
+    // `opencode_launcher_and_group_paths_share_one_unattended_atom`.
+    let opencode = single_pane_autopilot_flags("opencode");
+    assert_eq!(
+        opencode, "--auto",
+        "opencode autopilot must use the documented spelling, got: {opencode}"
+    );
+    assert_eq!(single_pane_autopilot_flags("OpenCode"), opencode);
+
     // CLIs with no known unattended surface get no flags (the toggle is inert),
-    // rather than inventing flags that may not exist.
-    for other in ["codex", "opencode", "aider", ""] {
+    // rather than inventing flags that may not exist. `opencode` left this
+    // class in #722 — replaced by `custom`, the placeholder this function's own
+    // doc names, so the specimen count and the property both survive.
+    for other in ["codex", "custom", "aider", ""] {
         assert_eq!(single_pane_autopilot_flags(other), "",
             "{other:?} has no unattended flag surface — must return empty");
     }
@@ -7343,7 +7369,7 @@ fn build_agent_argv_matches_command_line() {
     // `--agent <handle>` naming a generated FILE, or (the write-failure
     // fallback) `--append-system-prompt-file "<path>"` — a path can still
     // contain spaces, so it's still worth its own matrix entry.
-    let personas: [PersonaInject; 5] = [
+    let personas: [PersonaInject; 6] = [
         PersonaInject::default(),
         PersonaInject { claude_agent: Some("loomux-g-1-rev-sec".into()), ..PersonaInject::default() },
         PersonaInject {
@@ -7353,6 +7379,14 @@ fn build_agent_argv_matches_command_line() {
         PersonaInject { copilot_agent: Some("repo-worker".into()), ..PersonaInject::default() },
         PersonaInject {
             extra_allow: vec!["Bash(make:*)".into(), "mcp__probe".into()],
+            ..PersonaInject::default()
+        },
+        // #722: opencode's own `--agent <handle>`. Its prompt FILE never
+        // reaches either form (it is referenced from the generated config
+        // document, not from argv), so the handle is the whole surface.
+        PersonaInject {
+            opencode_agent: Some("loomux-g-1-rev-sec".into()),
+            opencode_prompt_file: Some(PathBuf::from("C:/data/group/configs/loomux-g-1-rev sec.md")),
             ..PersonaInject::default()
         },
     ];
@@ -7371,7 +7405,10 @@ fn build_agent_argv_matches_command_line() {
         workflow::ModelKnobs { effort: "", context: "1m" },
         workflow::ModelKnobs { effort: "low", context: "1m" },
     ];
-    for cli in ["claude", "copilot", "totally-unknown-cli"] {
+    // Every adapter, not just the two the matrix started with: an arm only one
+    // of the two builders emits is precisely the drift this exists to catch,
+    // and a CLI absent from the list is an arm nobody is checking.
+    for cli in ["claude", "copilot", "gemini", "opencode", "totally-unknown-cli"] {
         for auto_ops in [false, true] {
             // Every tier, not just the two that existed before #462 — a
             // middle tier that only one of the two forms emits is exactly the
@@ -7399,6 +7436,29 @@ fn build_agent_argv_matches_command_line() {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    // #722: the one input the matrix above cannot carry — an EMPTY model. It
+    // is opencode's normal state (`default_model` returns empty so the pane
+    // inherits the human's own choice), and it is the case where the two forms
+    // could most easily disagree: a string builder that emits `--model ` with
+    // nothing after it tokenizes to one token where argv has two.
+    for containment in [Containment::None, Containment::NoEdits, Containment::ReadOnly] {
+        for (session, resume) in sessions {
+            for persona in &personas {
+                let line = reg.build_agent_command(
+                    "opencode", "", true, cfg, None, gdir, wd, session, resume, containment, persona,
+                );
+                let argv = reg.build_agent_argv(
+                    "opencode", "", true, cfg, None, gdir, wd, session, resume, containment, persona,
+                );
+                assert_eq!(shell_tokenize(&line), argv, "line: {line}");
+                assert!(
+                    !argv.iter().any(|t| t == "--model"),
+                    "an empty model emits no flag at all: {argv:?}"
+                );
             }
         }
     }
@@ -7748,6 +7808,633 @@ fn gemini_edit_deny_tools_are_known_gemini_tools() {
     );
 }
 
+// ── OpenCode (#722 slice A) ────────────────────────────────────────────────
+//
+// Every assertion below is written against the BEHAVIOR the adapter must
+// have, not its internals, so each one compiles — and fails — on the tree
+// that predates the adapter. That is the red half of this slice's
+// red-before-green evidence; the white-box pins on the generated config
+// document (`opencode_config_json`) sit further down and can only exist once
+// the function does.
+
+/// The group whose CLI is opencode, on the built-in roster — models left
+/// empty so `default_model("opencode", …)` decides, which for opencode means
+/// "say nothing and inherit whatever the human configured".
+fn opencode_rails() -> Guardrails {
+    Guardrails {
+        max_agents: 4,
+        agent_cli: "opencode".into(),
+        blocks: workflow::default_roster(&[
+            (Role::Orchestrator, "", ""),
+            (Role::Worker, "", ""),
+            (Role::Reviewer, "", ""),
+            (Role::Planner, "", ""),
+        ]),
+        auto_ops: false,
+        idle_kill_minutes: 0,
+        max_spawns_per_hour: 0,
+        watchdog_stall_minutes: 0,
+        ..Guardrails::default()
+    }
+}
+
+/// **The latent mangle bug (#722).** OpenCode model ids are
+/// `provider_id/model_id` — `opencode/deepseek-v4-flash-free` — and
+/// `sanitize_model`/`sanitize_model_opt` dropped every `/`, so that id
+/// silently became `opencodedeepseek-v4-flash-free`: a model that does not
+/// exist, delivered without a word of complaint.
+///
+/// Widened deliberately and pinned here, exactly as #709 widened it for
+/// brackets: `/` is inert to both emitted forms (it is not a glob
+/// metacharacter in a POSIX shell and not an operator in PowerShell), so
+/// admitting it costs nothing that the second half of this test doesn't still
+/// refuse.
+#[test]
+fn a_model_id_may_carry_a_provider_prefix_but_never_shell_syntax() {
+    let parsed = workflow::parse_workflow(
+        "version: 1\nblocks:\n  - id: worker\n    kind: worker\n    model: opencode/deepseek-v4-flash-free\n",
+    )
+    .expect("a provider-prefixed model id must parse");
+    let worker = parsed.blocks.iter().find(|b| b.id == "worker").expect("the worker block");
+    assert_eq!(
+        worker.model, "opencode/deepseek-v4-flash-free",
+        "the provider prefix must survive sanitizing — dropping the slash yields a model id \
+         that does not exist, and the CLI is handed it without any error"
+    );
+
+    // The same widening, one layer down: `clamped()` normalizes a hand-edited
+    // group.json's models through `sanitize_model` (the fallback-carrying
+    // twin), and it must agree.
+    let rails = Guardrails {
+        agent_cli: "claude".into(),
+        blocks: workflow::default_roster(&[(Role::Worker, "", "opencode/deepseek-v4-flash-free")]),
+        ..rails()
+    }
+    .clamped();
+    assert_eq!(
+        rails.model_for(Role::Worker),
+        "opencode/deepseek-v4-flash-free",
+        "clamped() must not mangle a provider-prefixed model either"
+    );
+
+    // …and the sanitizer is still a sanitizer. Anything that could smuggle an
+    // argument onto the command line the model is interpolated into stays out.
+    let hostile = workflow::parse_workflow(
+        "version: 1\nblocks:\n  - id: worker\n    kind: worker\n    model: \"sonnet; rm -rf / && echo\"\n",
+    )
+    .expect("the hostile model is sanitized, not rejected");
+    let worker = hostile.blocks.iter().find(|b| b.id == "worker").expect("the worker block");
+    for bad in [' ', ';', '&', '|', '$', '`', '(', ')', '[', ']', '"', '\''] {
+        assert!(
+            !worker.model.contains(bad),
+            "{bad:?} must never survive into a model id: {:?}",
+            worker.model
+        );
+    }
+}
+
+/// opencode joins the spawnable set, and — unlike codex — with a real
+/// containment ceiling, so it may host a reviewer and a planner.
+///
+/// The ceiling is `ReadOnly` because opencode's permission engine denies by
+/// permission KEY (`edit`), and `edit` is the key every file-modifying tool
+/// asks under — the vendor's own read-only `plan` agent is built from exactly
+/// that rule. See `doc/design/opencode.md` for the citations.
+#[test]
+fn opencode_is_a_spawnable_cli_with_a_containment_ceiling() {
+    assert!(
+        SUPPORTED_CLIS.contains(&"opencode"),
+        "opencode must be group-spawnable: {SUPPORTED_CLIS:?}"
+    );
+    let caps = cli_caps("opencode").expect("opencode must have a capability row");
+    assert!(caps.orchestration, "the row and SUPPORTED_CLIS must agree");
+    assert!(
+        !caps.mcp_argv_seam,
+        "opencode's MCP config is an env-delivered document, not an argv flag — a solo launch \
+         cannot set env, so it stays delivery-only (#288)"
+    );
+    assert_eq!(
+        caps.max_containment,
+        Containment::ReadOnly,
+        "opencode denies the edit permission and the git-mutation shell prefixes"
+    );
+    for role in [Role::Orchestrator, Role::Worker, Role::Reviewer, Role::Planner] {
+        assert!(
+            cli_can_host("opencode", role).is_ok(),
+            "opencode must be able to host a {role:?}"
+        );
+    }
+}
+
+/// The launch line itself. Four properties, each of which a wrong adapter
+/// gets wrong in its own direction: the program, the unattended posture, the
+/// resume flag, and the omit-when-empty model.
+#[test]
+fn opencode_launch_flags_per_posture() {
+    let (reg, _d) = test_registry();
+    let cfg = Path::new("C:/x/cfg.json");
+    let gdir = Path::new("C:/data/group");
+    let wd = Path::new("C:/repo");
+    let cmd = |model: &str, auto: bool, session: Option<&str>, resume: bool, c: Containment| {
+        reg.build_agent_command(
+            "opencode", model, auto, cfg, None, gdir, wd, session, resume, c,
+            &PersonaInject::default(),
+        )
+    };
+
+    let attended = cmd("opencode/deepseek-v4-flash-free", false, None, false, Containment::None);
+    assert!(
+        attended.starts_with("opencode "),
+        "the program must be opencode, not the claude fallback: {attended}"
+    );
+    assert!(
+        attended.contains("--model opencode/deepseek-v4-flash-free"),
+        "the provider-prefixed model must reach argv intact: {attended}"
+    );
+    assert!(
+        !attended.contains("--auto"),
+        "an attended pane must not auto-approve permission asks: {attended}"
+    );
+
+    // Unattended (`auto_ops`) — `--auto` is opencode's documented spelling;
+    // `--yolo`/`--dangerously-skip-permissions` are undocumented aliases and
+    // are deliberately not used.
+    let unattended = cmd("opencode/deepseek-v4-flash-free", true, None, false, Containment::None);
+    assert!(unattended.contains("--auto"), "{unattended}");
+    assert!(
+        !unattended.contains("--yolo") && !unattended.contains("skip-permissions"),
+        "only the documented spelling: {unattended}"
+    );
+
+    // A planner is `ReadOnly`, hence always unattended — a human it could ask
+    // is not there, and gating it would only deadlock it.
+    let planner = cmd("", false, None, false, Containment::ReadOnly);
+    assert!(planner.contains("--auto"), "a ReadOnly class runs unattended: {planner}");
+
+    // An empty model means "inherit the human's configured default" — loomux
+    // has no vendor-neutral alias pair for opencode and refuses to hardcode a
+    // model table (#329), so the flag is omitted entirely rather than emitted
+    // with an empty value.
+    assert!(
+        !planner.contains("--model"),
+        "an empty model must omit the flag, not emit a blank one: {planner}"
+    );
+
+    // Resume: opencode's `--session <id>` continues an existing session. There
+    // is no way to pre-assign one, so it appears on a resume and never
+    // otherwise.
+    let fresh = cmd("", false, Some("ses_03bd2d53dffeiBvu9PvuCPjxT7"), false, Containment::None);
+    assert!(!fresh.contains("--session"), "a cold start pre-assigns nothing: {fresh}");
+    let resumed = cmd("", false, Some("ses_03bd2d53dffeiBvu9PvuCPjxT7"), true, Containment::None);
+    assert!(
+        resumed.contains("--session ses_03bd2d53dffeiBvu9PvuCPjxT7"),
+        "a resume must continue the recorded session: {resumed}"
+    );
+
+    // The structured form the pane actually spawns is built from the same
+    // atoms; `build_agent_argv_matches_command_line` pins the whole matrix,
+    // this pins the one token that decides which program runs.
+    let argv = reg.build_agent_argv(
+        "opencode", "", true, cfg, None, gdir, wd, None, false, Containment::None,
+        &PersonaInject::default(),
+    );
+    assert_eq!(argv.first().map(String::as_str), Some("opencode"), "{argv:?}");
+    assert!(argv.iter().any(|a| a == "--auto"), "{argv:?}");
+    assert!(!argv.iter().any(|a| a == "--model"), "{argv:?}");
+}
+
+/// A workflow file may declare opencode blocks, including the contained
+/// classes — the parser consults the same capability table the spawn path
+/// does, so this is the load-time half of the gate.
+#[test]
+fn a_workflow_file_may_declare_opencode_blocks() {
+    let wf = workflow::parse_workflow(
+        "version: 1\nblocks:\n  - id: w-oc\n    kind: worker\n    cli: opencode\n\
+         \n  - id: rev-oc\n    kind: reviewer\n    cli: opencode\n\
+         \n  - id: plan-oc\n    kind: planner\n    cli: opencode\n",
+    )
+    .expect("opencode blocks must parse for every class it can contain");
+    assert_eq!(wf.blocks.iter().filter(|b| b.cli == "opencode").count(), 3, "{wf:?}");
+}
+
+/// **The delivery seam.** opencode names no config file on argv: its MCP
+/// server, its containment and its persona all ride environment variables set
+/// on the pane loomux spawns. So this goes through the real spawn site and
+/// reads what that site built — a command line alone could look perfect while
+/// the agent booted with no loomux MCP server and no denials at all.
+#[test]
+fn an_opencode_spawn_delivers_its_config_and_containment_by_env() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/opencode-repo", opencode_rails()).unwrap();
+    let spawn = |role: Role, name: &str| {
+        let a = reg.spawn_agent(&g.id, role, name, "t", false, None).unwrap();
+        (a.id.clone(), reg.spawn_request_for_test(&a.id).expect("no spawn request"))
+    };
+
+    let (_wid, worker) = spawn(Role::Worker, "w");
+    let env: HashMap<&str, &str> =
+        worker.env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+
+    // The config document — the only channel opencode's MCP server has.
+    let cfg: Value = serde_json::from_str(
+        env.get("OPENCODE_CONFIG_CONTENT").expect("the generated config must ride the pane env"),
+    )
+    .expect("OPENCODE_CONFIG_CONTENT must be valid JSON");
+    assert_eq!(cfg["mcp"]["loomux"]["type"].as_str(), Some("remote"), "{cfg}");
+    assert!(
+        cfg["mcp"]["loomux"]["url"].as_str().unwrap_or_default().contains("/mcp"),
+        "the loomux MCP endpoint: {cfg}"
+    );
+    assert!(
+        cfg["mcp"]["loomux"]["headers"]["X-Loomux-Agent"].is_string(),
+        "the per-agent token is what makes every MCP call attributable: {cfg}"
+    );
+    assert_eq!(
+        cfg["mcp"]["loomux"]["oauth"], json!(false),
+        "OAuth auto-detection is on by default and loomux authenticates by header — a 401 \
+         during discovery must not start a flow this server never speaks: {cfg}"
+    );
+    assert_eq!(
+        cfg["share"].as_str(), Some("disabled"),
+        "a group agent's session is never published: {cfg}"
+    );
+
+    // Autoupdate is suppressed by ENV, not by the config key: a mid-boot
+    // self-update restarts the CLI and flushes the kickoff (the copilot
+    // `--no-auto-update` hazard), and an env var cannot be overridden by the
+    // org/managed/MDM config ranks that land after the inline document.
+    assert_eq!(env.get("OPENCODE_DISABLE_AUTOUPDATE"), Some(&"1"), "{env:?}");
+
+    // The per-group database: absolute, under this group's own state dir, so
+    // a group's sessions are separable from the human's own and from every
+    // other group's.
+    let db = env.get("OPENCODE_DB").expect("the per-group db path must be set");
+    assert!(Path::new(db).is_absolute(), "OPENCODE_DB must be absolute: {db}");
+    assert!(
+        db.replace('\\', "/").contains(&g.id),
+        "the database must live under THIS group's dir: {db}"
+    );
+
+    // A worker is uncontained — nothing to deny, and the repo's own project
+    // config is left loading.
+    assert!(
+        env.get("OPENCODE_DISABLE_PROJECT_CONFIG").is_none(),
+        "a worker keeps the repo's own opencode config: {env:?}"
+    );
+
+    // **The two copies of the posture must BE the same posture.** The document
+    // and the override are produced by two calls that each derive from
+    // `(containment, unattended)`; today one call site passes the same locals
+    // to both, but nothing in the signatures forces that, and a future arm
+    // passing a stale pair would give a pane a document saying one thing and
+    // an override — the layer that wins — saying another. Assert the equality
+    // rather than rely on call-site discipline.
+    let wperm: Value =
+        serde_json::from_str(env.get("OPENCODE_PERMISSION").expect("worker permission")).unwrap();
+    assert_eq!(
+        cfg["permission"], wperm,
+        "the document's posture and the OPENCODE_PERMISSION override must be one object"
+    );
+
+    // The reviewer is the class the #462 guarantee lives or dies on.
+    let (_rid, rev) = spawn(Role::Reviewer, "rev");
+    let renv: HashMap<&str, &str> = rev.env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let rperm: Value = serde_json::from_str(
+        renv.get("OPENCODE_PERMISSION")
+            .expect("containment must ALSO ride OPENCODE_PERMISSION, which no config rank can \
+                     override and which survives an --agent resolution failure"),
+    )
+    .expect("OPENCODE_PERMISSION must be valid JSON");
+    assert_eq!(
+        rperm["edit"], json!("deny"),
+        "a reviewer may not edit: `edit` is the permission every file-modifying tool asks \
+         under, and denying it with the `*` pattern removes them from the model's tools \
+         entirely: {rperm}"
+    );
+    // The group is not `auto_ops`, so a reviewer is ATTENDED — its shell asks
+    // rather than being pre-approved. What matters for #462 is that it is
+    // reachable at all (a reviewer runs the tests), and that the flows it works
+    // through are not the ones being interrupted.
+    assert!(
+        rperm["bash"].is_object() && rperm["bash"]["*"] == json!("ask"),
+        "a reviewer's shell is intact — it runs the tests (#462): {rperm}"
+    );
+    assert_eq!(rperm["bash"]["git *"], json!("allow"), "{rperm}");
+    assert_eq!(
+        rperm["bash"]["git push*"], Value::Null,
+        "a reviewer keeps git: only the ReadOnly tier loses commit/push (#462): {rperm}"
+    );
+    assert_eq!(
+        renv.get("OPENCODE_DISABLE_PROJECT_CONFIG"), Some(&"1"),
+        "a contained pane does not load the repo's own opencode config at all — a repo cannot \
+         then contribute permission rules to the merge: {renv:?}"
+    );
+    // Same equality as the worker's, on the class the #462 guarantee rests on:
+    // a contained pane is exactly where a stale override would matter most.
+    let rcfg: Value =
+        serde_json::from_str(renv.get("OPENCODE_CONFIG_CONTENT").expect("reviewer doc")).unwrap();
+    assert_eq!(rcfg["permission"], rperm, "document and override must be one object");
+
+    // …and a planner additionally loses the git-mutation subcommands.
+    let (_pid, planner) = spawn(Role::Planner, "p");
+    let penv: HashMap<&str, &str> =
+        planner.env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let pperm: Value =
+        serde_json::from_str(penv.get("OPENCODE_PERMISSION").expect("planner permission")).unwrap();
+    assert_eq!(pperm["bash"]["git commit*"], json!("deny"), "{pperm}");
+    assert_eq!(pperm["bash"]["git push*"], json!("deny"), "{pperm}");
+    // A planner is ReadOnly, hence always unattended even in this non-auto_ops
+    // group — so the shell is open apart from the two denials above, which is
+    // what leaves `gh` reachable for the plan comment.
+    assert_eq!(pperm["bash"]["*"], json!("allow"), "{pperm}");
+
+    // The persona/contract reaches opencode as a native agent, selected on
+    // argv and defined in the config document, with the handle namespaced so a
+    // repo's own `.opencode/agents/*.md` cannot deep-merge into it.
+    let pcfg: Value =
+        serde_json::from_str(penv.get("OPENCODE_CONFIG_CONTENT").unwrap()).unwrap();
+    let agents = pcfg["agent"].as_object().expect("the block's agent entry");
+    let (handle, entry) = agents.iter().next().expect("exactly one generated agent");
+    assert!(handle.starts_with("loomux-"), "generated handles are namespaced: {handle}");
+    assert!(
+        planner.command.contains(&format!("--agent {handle}")),
+        "the pane must actually select it — an unresolvable --agent falls back to `build`, the \
+         most permissive agent there is: {}",
+        planner.command
+    );
+    assert_eq!(
+        entry["mode"].as_str(), Some("primary"),
+        "a subagent-mode entry is refused by --agent and silently falls back to `build`: {entry}"
+    );
+    let prompt = entry["prompt"].as_str().expect("the contract rides a file reference");
+    assert!(
+        prompt.starts_with("{file:") && prompt.ends_with('}'),
+        "the role contract travels by FILE, never on argv: {prompt}"
+    );
+    let path = prompt.trim_start_matches("{file:").trim_end_matches('}');
+    assert!(
+        !path.contains('\\'),
+        "file references are substituted textually BEFORE the JSON is parsed, so a Windows \
+         backslash path arrives with its separators doubled — emit forward slashes: {path}"
+    );
+    assert!(
+        fs::read_to_string(path).is_ok_and(|t| !t.trim().is_empty()),
+        "a missing file reference is fatal to config load — it must be written before the \
+         pane spawns: {path}"
+    );
+}
+
+/// The body of a `"bash": { … }` object as it is EMITTED, one per occurrence.
+/// A bash object's values are all scalars, so the next `}` closes it.
+///
+/// The needle carries the space `to_string_pretty` emits, so a switch to the
+/// compact serializer would make this return nothing — and a caller that only
+/// loops over the result would then assert nothing at all while staying green.
+/// Every caller must therefore assert the COUNT before looping; see the one
+/// below.
+fn emitted_bash_objects(doc: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = doc;
+    while let Some(i) = rest.find("\"bash\": {") {
+        let body = &rest[i + "\"bash\": {".len()..];
+        let end = body.find('}').expect("an unterminated bash object");
+        out.push(body[..end].to_string());
+        rest = &body[end..];
+    }
+    out
+}
+
+/// **Rule order is the containment.** opencode evaluates permission rules by
+/// taking the LAST one that matches — matching by wildcard on the permission
+/// KEY as well as on the pattern — and it emits them in the order the config
+/// document spells them. Two ways that turns a denial into nothing, both
+/// pinned here:
+///
+/// - a `"*"` KEY (not pattern) sitting after the specific denials matches
+///   every permission and silently re-allows them;
+/// - a `"git *": "allow"` sitting after `"git commit*": "deny"` re-allows the
+///   commit.
+#[test]
+fn an_opencode_denial_is_never_emitted_before_something_that_re_allows_it() {
+    for unattended in [false, true] {
+        let doc = loomux_lib::orchestration::opencode_config_json(
+            5123,
+            "tok-abc",
+            Containment::ReadOnly,
+            unattended,
+            Some(("loomux-g-plan", Path::new("C:/g/configs/loomux-g-plan.md"))),
+        );
+        let cfg: Value = serde_json::from_str(&doc).expect("the generated document must be JSON");
+
+        for (what, perm) in
+            [("global", &cfg["permission"]), ("agent", &cfg["agent"]["loomux-g-plan"]["permission"])]
+        {
+            let keys: Vec<&String> =
+                perm.as_object().expect("a permission object").keys().collect();
+            assert!(
+                !keys.iter().any(|k| k.as_str() == "*"),
+                "the {what} permission block must never carry a `*` KEY — it matches every \
+                 permission, and one emitted after the denials re-allows them: {keys:?}"
+            );
+        }
+
+        let objects = emitted_bash_objects(&doc);
+        // Without this the loop below can go VACUOUS and stay green: the
+        // helper's needle carries the space `to_string_pretty` emits, so a
+        // switch to the compact serializer would return an empty vec and
+        // silently retire the whole rule-order pin. A ReadOnly pane with an
+        // agent entry emits exactly two — the global posture and the
+        // agent-level denials.
+        assert_eq!(
+            objects.len(),
+            2,
+            "expected the global and agent-level bash objects; a count of 0 means the helper's \
+             needle stopped matching, not that the document stopped carrying them: {doc}"
+        );
+        for body in objects {
+            let deny = body
+                .find("\"deny\"")
+                .unwrap_or_else(|| panic!("a ReadOnly pane denies git mutation: {body}"));
+            for allow in body.match_indices("\"allow\"") {
+                assert!(
+                    allow.0 < deny,
+                    "every allow must be emitted BEFORE the first deny — last match wins, so an \
+                     allow after a deny silently reopens it: {body}"
+                );
+            }
+        }
+    }
+}
+
+/// The two postures, and the one property that separates them: an attended
+/// pane must ASK, because opencode's own default is to allow everything —
+/// louder than any other CLI loomux spawns, where the default is restrictive
+/// and loomux widens it.
+#[test]
+fn an_attended_opencode_pane_narrows_the_clis_allow_everything_default() {
+    use loomux_lib::orchestration::opencode_permission_json;
+
+    let attended = opencode_permission_json(Containment::None, false);
+    assert_eq!(attended["edit"], json!("ask"), "{attended}");
+    assert_eq!(attended["bash"]["*"], json!("ask"), "{attended}");
+    for pat in ["git *", "gh *"] {
+        assert_eq!(
+            attended["bash"][pat], json!("allow"),
+            "the branch→commit→PR flow is pre-approved so a human isn't stopped at every \
+             step: {attended}"
+        );
+    }
+
+    let unattended = opencode_permission_json(Containment::None, true);
+    assert_eq!(unattended["edit"], json!("allow"), "{unattended}");
+    assert_eq!(unattended["bash"]["*"], json!("allow"), "{unattended}");
+
+    // Both postures reach outside the worktree: the pane's own role
+    // instructions live under the group's state dir, and this key defaults to
+    // `ask`, so without it an unattended pane would stall on its own contract.
+    for posture in [&attended, &unattended] {
+        assert_eq!(posture["external_directory"], json!("allow"), "{posture}");
+    }
+
+    // `question` follows the HUMAN, not containment. opencode's defaults deny
+    // it and only its built-in `build` agent re-allows it, so a loomux pane —
+    // which always runs a config-declared agent — would otherwise answer an
+    // attended worker's "should I do X?" with a permission error instead of a
+    // question. Unattended it must stay denied: nobody is there to answer, and
+    // a question with no answer is a stall.
+    assert_eq!(attended["question"], json!("allow"), "{attended}");
+    assert_eq!(unattended["question"], json!("deny"), "{unattended}");
+
+    // Containment overrides the posture in the one direction that matters, and
+    // never the other way: a contained pane denies regardless of `unattended`.
+    for unattended in [false, true] {
+        assert_eq!(
+            opencode_permission_json(Containment::NoEdits, unattended)["edit"],
+            json!("deny")
+        );
+        assert_eq!(
+            opencode_permission_json(Containment::ReadOnly, unattended)["bash"]["git push*"],
+            json!("deny")
+        );
+        // A reviewer keeps git: only the ReadOnly tier loses commit/push.
+        assert_eq!(
+            opencode_permission_json(Containment::NoEdits, unattended)["bash"]["git push*"],
+            Value::Null
+        );
+    }
+}
+
+/// The env mapping, asserted without a spawn — including the one entry that is
+/// conditional, and the one that must never be relative.
+#[test]
+fn opencode_pane_env_carries_the_document_the_override_and_the_group_database() {
+    use loomux_lib::orchestration::opencode_pane_env;
+
+    let db = Path::new("C:/state/groups/g-1/opencode/opencode.db");
+    let env: HashMap<String, String> =
+        opencode_pane_env("{\"share\":\"disabled\"}", Containment::None, false, db)
+            .into_iter()
+            .collect();
+    assert_eq!(env["OPENCODE_CONFIG_CONTENT"], "{\"share\":\"disabled\"}");
+    assert_eq!(env["OPENCODE_DISABLE_AUTOUPDATE"], "1");
+    assert_eq!(
+        env["OPENCODE_DB"], "C:/state/groups/g-1/opencode/opencode.db",
+        "forward slashes, and absolute — a relative value resolves under the CLI's own data \
+         root, i.e. NOT under the group dir"
+    );
+    // The permission override is the layer that survives an --agent resolution
+    // failure, so it ships on every pane, contained or not.
+    assert!(env.contains_key("OPENCODE_PERMISSION"), "{env:?}");
+    assert!(
+        !env.contains_key("OPENCODE_DISABLE_PROJECT_CONFIG"),
+        "an uncontained pane keeps the repo's own opencode config: {env:?}"
+    );
+
+    for c in [Containment::NoEdits, Containment::ReadOnly] {
+        let env: HashMap<String, String> = opencode_pane_env("{}", c, true, db).into_iter().collect();
+        assert_eq!(
+            env["OPENCODE_DISABLE_PROJECT_CONFIG"], "1",
+            "a contained pane does not load the repo's config at all, so the repo cannot \
+             contribute a rule to the permission merge: {env:?}"
+        );
+    }
+}
+
+/// The #101 invariant on the fourth CLI: the launcher toggle and the group
+/// spawn path must mean the same thing, built from one atom rather than two
+/// independently-typed literals.
+#[test]
+fn opencode_launcher_and_group_paths_share_one_unattended_atom() {
+    use loomux_lib::orchestration::OPENCODE_UNATTENDED_FLAGS;
+    let (reg, _d) = test_registry();
+    let group = reg.build_agent_command(
+        "opencode", "m", true, Path::new("C:/x/cfg.json"), None, Path::new("C:/data/group"),
+        Path::new("C:/repo"), None, false, Containment::None, &PersonaInject::default(),
+    );
+    assert!(group.contains(OPENCODE_UNATTENDED_FLAGS), "{group}");
+    assert_eq!(single_pane_autopilot_flags("opencode"), OPENCODE_UNATTENDED_FLAGS);
+}
+
+/// The mirror of `gemini_blocks_default_to_geminis_reasoning_tier`, and it
+/// asserts the opposite thing on purpose: an opencode block has NO default
+/// model, so the pane inherits whatever the human configured.
+///
+/// Empty is a decision, not a hole. opencode ids are `provider_id/model_id`
+/// against a catalog of dozens of providers with no vendor-neutral alias, so
+/// any default loomux picked would be a hardcoded model table (#329) that also
+/// silently overrode a human who had already chosen. What a wrong
+/// implementation does instead is fall through to `default_model`'s claude
+/// branch and hand opencode `sonnet`/`opus` — a model its providers do not
+/// serve — which is exactly what this pins against.
+#[test]
+fn opencode_blocks_default_to_no_model_at_all() {
+    let g = Guardrails { agent_cli: "opencode".into(), ..Guardrails::default() };
+    for role in [Role::Orchestrator, Role::Worker, Role::Reviewer, Role::Planner] {
+        assert_eq!(
+            g.model_for(role),
+            "",
+            "an opencode {role:?} must inherit the human's own model, not a claude tier"
+        );
+    }
+    // …and a block that DOES pin one keeps it, provider prefix and all.
+    let pinned = Guardrails {
+        agent_cli: "opencode".into(),
+        blocks: workflow::default_roster(&[(
+            Role::Worker,
+            "opencode",
+            "opencode/deepseek-v4-flash-free",
+        )]),
+        ..Guardrails::default()
+    }
+    .clamped();
+    assert_eq!(pinned.model_for(Role::Worker), "opencode/deepseek-v4-flash-free");
+}
+
+/// The [`OPENCODE_EDIT_DENY_PERMISSION`] pin — the opencode sibling of
+/// `claude_edit_deny_tools_are_known_claude_tools`, and the same limits: it
+/// catches loomux naming a key opencode does not evaluate (a rule matching
+/// nothing reads exactly like containment), not opencode renaming the key out
+/// from under an unrefreshed snapshot.
+///
+/// It is a single key rather than a list because the engine denies by the
+/// permission a tool REQUESTS, and `edit`, `write` and `apply_patch` all
+/// request `edit` — the same one key the CLI's own read-only `plan` agent is
+/// built from. See `doc/design/opencode.md` for the source citations.
+#[test]
+fn opencode_denies_the_permission_key_every_editing_tool_asks_under() {
+    use loomux_lib::orchestration::{OPENCODE_EDIT_DENY_PERMISSION, OPENCODE_READONLY_DENY_GIT};
+    assert_eq!(OPENCODE_EDIT_DENY_PERMISSION, "edit");
+    // The shell is deliberately untouched by the edit denial: denying it would
+    // deny the tests a reviewer exists to run (#462).
+    assert_ne!(OPENCODE_EDIT_DENY_PERMISSION, "bash");
+    // No space before the `*`: the matcher is zero-or-more against the whole
+    // command, so `git commit*` covers a bare `git commit` and `git commit *`
+    // would not.
+    for pat in OPENCODE_READONLY_DENY_GIT {
+        assert!(pat.ends_with('*') && !pat.ends_with(" *"), "{pat:?}");
+    }
+}
+
 #[test]
 fn shell_tokenize_handles_quotes_and_at_marker() {
     assert_eq!(
@@ -7877,7 +8564,7 @@ fn associating_a_copilot_session_records_it_on_roster_and_task_board() {
 
     // The watcher discovered copilot's session id and binds it to the pane.
     let sid = "0f9e8d7c-1234-4abc-8def-0011223344ff";
-    reg.associate_copilot_session(&g.id, &w.id, sid);
+    reg.associate_session(&g.id, &w.id, sid);
 
     // Agent map now carries the id (so list_agents/resume can use it).
     let agents = reg.list_agents(&g.id);
@@ -7897,7 +8584,7 @@ fn associating_a_copilot_session_records_it_on_roster_and_task_board() {
     assert_eq!(task.session.as_deref(), Some(sid));
 
     // Idempotent: a second (late) discovery must not clobber the bound id.
-    reg.associate_copilot_session(&g.id, &w.id, "ffffffff-0000-4000-8000-000000000000");
+    reg.associate_session(&g.id, &w.id, "ffffffff-0000-4000-8000-000000000000");
     let agents = reg.list_agents(&g.id);
     let entry = agents.as_array().unwrap().iter().find(|a| a["id"] == w.id.as_str()).unwrap();
     assert_eq!(entry["session"], sid, "an already-tracked pane keeps its first session id");
@@ -7921,7 +8608,7 @@ fn copilot_orchestration_session_gets_a_chip_and_restores() {
         // once it appears on disk (here, driven directly).
         let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
         assert!(orch.session_id.is_none());
-        reg.associate_copilot_session(&g.id, &orch.id, sid);
+        reg.associate_session(&g.id, &orch.id, sid);
         // Session browser now has an ORCH chip for this copilot session.
         let roles: Vec<_> = reg.session_roles().into_iter().filter(|r| r.session_id == sid).collect();
         assert_eq!(roles.len(), 1);
@@ -11771,6 +12458,74 @@ fn resume_session_unique_prefix_resolves_to_the_full_id() {
         resumed["session"], json!(full),
         "resumed agent must carry the resolved FULL session id, got: {agents}"
     );
+}
+
+/// #722: a COMPLETE opencode session id this group's roster never recorded
+/// must pass through, exactly as a complete claude one does. Opencode's ids
+/// are 30 characters, so the length-only test that used to answer "is this a
+/// full id?" called every one of them a truncated prefix — and a prefix that
+/// matches no roster entry is rejected as an unknown session. The equivalent
+/// claude id (36 chars) sails through, which is the asymmetry this closes.
+#[test]
+fn a_complete_opencode_session_id_is_not_mistaken_for_a_truncated_prefix() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let co = reg.resolve_token(&orch.token).unwrap();
+    // A roster holding some OTHER session, so nothing here can resolve by
+    // exact match or by prefix — the pass-through is the only way out.
+    write_roster(&reg, &g.id, &["e3bc3b80-1111-4111-8111-111111111111"]);
+    let dir = tempfile::tempdir().unwrap();
+    let full_opencode = "ses_03bd2d53dffeiBvu9PvuCPjxT7"; // ses_ + 12 hex + 14 base62
+
+    let r = dispatch(&reg, &co, "tools/call", &json!({
+        "name": "spawn_agent",
+        "arguments": {
+            "kind": "worker",
+            "resume_session": full_opencode,
+            "cwd": dir.path().to_string_lossy(),
+            "task": "follow-up",
+        },
+    })).unwrap();
+    assert_eq!(
+        r["isError"], false,
+        "a complete opencode id must pass through, not be resolved as a prefix: {r:?}"
+    );
+
+    let agents = reg.list_agents(&co.group);
+    let resumed = agents.as_array().unwrap().iter().find(|a| a["role"] == "worker").unwrap();
+    assert_eq!(
+        resumed["session"], json!(full_opencode),
+        "the id must arrive intact, not rewritten to some roster entry: {agents}"
+    );
+
+    // And the shape check must not decay into a blanket "anything starting
+    // with `ses_`". Both of these are still prefixes, and both match nothing
+    // in the roster, so both must be refused rather than passed through.
+    //
+    // Neither shares a prefix with `full_opencode` on purpose: the spawn above
+    // put that id ON the roster, so `ses_03bd2d53` would now resolve against
+    // it perfectly legitimately (#190's whole feature) and would be pinning
+    // test order rather than the shape rule.
+    for not_full in [
+        "ses_99999999",                   // truncated
+        "ses_9zbd2d53dffeiBvu9PvuCPjxT7", // right length, non-hex timestamp
+    ] {
+        let r = dispatch(&reg, &co, "tools/call", &json!({
+            "name": "spawn_agent",
+            "arguments": {
+                "kind": "worker",
+                "resume_session": not_full,
+                "cwd": dir.path().to_string_lossy(),
+                "task": "follow-up",
+            },
+        })).unwrap();
+        assert_eq!(
+            r["isError"], true,
+            "{not_full:?} is not a complete opencode id and must resolve as a prefix \
+             (here: fail as unknown), never pass through: {r:?}"
+        );
+    }
 }
 
 #[test]
@@ -30032,6 +30787,9 @@ fn no_registry_construction_bypasses_the_test_agent_dir_overrides() {
         ("lessonsfile.rs", 1),   // test_registry
         ("prompts.rs", 1),       // test_registry
         ("perf_leaflocks.rs", 1), // test_registry
+        ("opencodeusage.rs", 1), // test_registry
+        ("opencodesessions.rs", 1), // test_registry
+        ("opencodedigest.rs", 1), // test_registry
     ];
     let mut files = Vec::new();
     collect_rs_files(tests_dir, &mut files);
