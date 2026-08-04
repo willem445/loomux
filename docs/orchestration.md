@@ -597,6 +597,32 @@ doesn't drop the gate to keep merges flowing; it arms the gate anyway and
 shows a loud warning in the lifecycle panel, so the mismatch is something you
 see rather than something a bounced merge makes you go find.
 
+**Copilot personas: a `tools:` list must let loomux through.** If a block sets
+`cli: copilot` and points `profile:` at a `.github/agents/*.md` file, Copilot
+loads that file directly — and if the file declares a `tools:` list, that list
+*filters* everything the agent can reach, MCP servers included. A list that
+never names loomux produces a delegate that can see the loomux server and use
+none of it: it cannot report, read the task board, or be steered, and from
+inside its own pane it looks like loomux is broken. Add the server to the list:
+
+```yaml
+tools: ["read", "edit", "execute", "loomux/*"]
+```
+
+loomux repairs this for you where it safely can — it launches such a block from
+its own stand-in for the persona, carrying every line of your file plus that
+grant, and never edits anything in your repo — but it always tells you, in the
+spawn reply and the audit log, which file to fix.
+
+Three cases it deliberately leaves alone, because each is a choice you made
+rather than something you forgot. It says so, and the fix is yours:
+
+- the persona declares its own `mcp-servers:` — loomux's stand-in would drop them;
+- `tools: []`, which disables every tool — loomux won't turn "nothing" into
+  "nothing except loomux";
+- the list already names loomux per-tool (`loomux/report`) — loomux won't widen a
+  scope you set on purpose.
+
 **Reviewer diversity across models.** A block's `cli`/`model` are set
 per-block, so nothing stops a reviewer lane from running on a different
 CLI/model than the one that wrote the code — a second model tends to catch a
