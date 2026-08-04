@@ -14957,6 +14957,78 @@ fn h4_a_genuinely_consumed_box_still_reads_as_gone_and_still_retires() {
     );
 }
 
+/// Copilot's chevron composer in a NARROW pane (~35 columns — a four-way
+/// split, which is this product's premise), wrapping a brief line immediately
+/// before a mid-line `|`. Reconstructed from #820's cited shapes, not captured.
+const FIX_BOX_NARROW_PIPE_WRAP: &str =
+    include_str!("fixtures/attention/copilot-narrow-pane-pipe-wrap.txt");
+/// The line that fixture's composer is holding. The `|` is MID-line here and
+/// row-LEADING there, which is the whole mechanism.
+const NARROW_PIPE_PASTE_TEXT: &str = "Check the queue depth with ps aux | grep loomux and report it";
+
+#[test]
+fn h6_de_framing_never_costs_a_match_the_flat_comparison_would_have_found() {
+    // rev-306 B1. De-framing is a strict IMPROVEMENT or it is a regression;
+    // there is no third option, because the reading it feeds is one where a
+    // false `NotHolding` is the expensive error.
+    //
+    // A wrap that pushes a mid-line `|` (or `*`, `•`, `●`, `◆`, `│`, `┃`) to a
+    // row START strips it from the TAIL — `deframe` sees a row-leading frame
+    // char — while the NEEDLE keeps it, because there it is mid-line and
+    // `deframe` is leading-only. Containment then fails on text that is
+    // verbatim on screen. The length arm cannot fire (the tail is longer, as
+    // always here), and the probe carries the same `|` from the same line, so
+    // it fails for the same reason: `NotHolding`, where the pre-#821 flat
+    // comparison read `Holds`.
+    //
+    // A wrap boundary lands inside the probe's 48-character sample exactly when
+    // the composer is under 48 columns, so this needs no degenerate pane — a
+    // 25-47 column split is ordinary. An earlier residual bounded this at
+    // "sub-24-character lines", which governs only whether a probe is FORMED,
+    // never whether a formed probe MATCHES.
+    let tail = strip_ansi(FIX_BOX_NARROW_PIPE_WRAP.as_bytes());
+
+    // Preconditions — the geometry this depends on, asserted rather than
+    // assumed, since a fixture that drifts would pass for the wrong reason.
+    let widest = tail.lines().map(|l| l.chars().count()).max().unwrap_or(0);
+    assert!(
+        (25..=47).contains(&widest),
+        "precondition: an ORDINARY narrow pane, not a degenerate one — that is the whole \
+         disagreement about reach: {widest} columns"
+    );
+    assert!(
+        tail.lines().any(|l| l.trim_start().starts_with('|')),
+        "precondition: a wrapped row LEADS with the pipe, which is what `deframe` strips: {tail:?}"
+    );
+    assert!(
+        NARROW_PIPE_PASTE_TEXT.contains(" | "),
+        "precondition: and the same pipe is MID-line in our own text, where `deframe` keeps it"
+    );
+
+    assert!(
+        box_holds_paste(&tail, NARROW_PIPE_PASTE_TEXT),
+        "the text is verbatim on screen and the pre-#821 comparison found it — de-framing must \
+         never LOSE a match, only add one"
+    );
+    assert_eq!(box_reading(Some(&tail), NARROW_PIPE_PASTE_TEXT), BoxReading::Holds);
+
+    // The consequence, at the decision that spends the reading — the same shape
+    // as `h2`, because this is the same harm arriving by a different route.
+    let action = stranded_marker_action(
+        Some(false),
+        Some(box_reading(Some(&tail), NARROW_PIPE_PASTE_TEXT)),
+        false,
+        HumanInputBlock::None,
+        false,
+        || false,
+    );
+    assert!(
+        !matches!(action, StrandedMarkerAction::Retire(_)),
+        "a regression into `NotHolding` retires the marker over our own un-submitted text — the \
+         #81/#84/#111 collision this change exists to close: got {action:?}"
+    );
+}
+
 #[test]
 fn h5_a_markdown_bullet_in_a_brief_is_not_mistaken_for_box_framing() {
     // The trap in de-framing only the TAIL. `is_frame_char` counts `*`, `•` and
