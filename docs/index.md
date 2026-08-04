@@ -21,10 +21,10 @@ carrying an agent (or just a shell).
 
 Loomux gives you Windows Terminal–class smoothness with the multiplexing
 features it lacks: instant matrix splits, nameable panes, a native session
-browser that restores Claude Code and GitHub Copilot CLI sessions straight into
-a pane, and — the headline feature — a built-in **orchestrator/worker** workflow
-for running a small fleet of AI agents, each in its own visible pane, that you
-gatekeep only at review and merge.
+browser that restores Claude Code, GitHub Copilot CLI, and OpenCode sessions
+straight into a pane, and — the headline feature — a built-in
+**orchestrator/worker** workflow for running a small fleet of AI agents, each
+in its own visible pane, that you gatekeep only at review and merge.
 
 ![A loomux window with several agent panes](https://raw.githubusercontent.com/willem445/loomux/main/sample.jpg)
 

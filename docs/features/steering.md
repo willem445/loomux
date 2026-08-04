@@ -53,8 +53,9 @@ several.
 
 On send, loomux saves each image to the group's scratch dir and adds an
 `Attached image:` reference line to the message — formatted the way the
-orchestrator's CLI reads it (a plain path for Claude Code, an `@<path>` mention
-for Copilot) — so the agent opens the screenshot.
+orchestrator's CLI reads it (a plain path for Claude Code, OpenCode, and every
+other CLI except Copilot, which gets an `@<path>` mention) — so the agent
+opens the screenshot.
 
 - Accepted formats: **PNG, JPEG, GIF, WebP, BMP**.
 - Up to **10 MB each** and **8 per message**.

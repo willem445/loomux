@@ -90,18 +90,19 @@ From here you can:
   falls back to PowerShell rather than failing to start.
 - **Name** a pane with `F2` so you can tell your agents apart.
 - **Restore a past agent session** with the session browser (`Ctrl+Shift+P`) —
-  it scans your machine for resumable Claude Code and Copilot CLI sessions and
-  drops the one you pick back into a pane, in its original folder. See the
-  [session browser](features/session-browser.html).
+  it scans your machine for resumable Claude Code, Copilot CLI, and OpenCode
+  sessions and drops the one you pick back into a pane, in its original folder.
+  See the [session browser](features/session-browser.html).
 
 ## Your first agent pane
 
 Loomux is built to run AI coding agents, but it doesn't bundle them — it drives
-the CLIs you already have installed. The two first-class ones are:
+the CLIs you already have installed. The three first-class ones are:
 
 - **[Claude Code](https://claude.com/claude-code)** — the `claude` CLI.
 - **[GitHub Copilot CLI](https://github.com/github/copilot-cli)** — the
   `copilot` CLI.
+- **[OpenCode](https://opencode.ai/)** — the `opencode` CLI.
 
 Make sure at least one is installed and on your `PATH`. Then, to open an agent
 in a pane:
@@ -118,9 +119,11 @@ Copilot, the same true autopilot mode an orchestration worker gets (`--autopilot
 --allow-all-tools --allow-all-paths`). Copilot only opens its blocking "Enable
 autopilot mode" dialog on the pane's first submit, which for a lone pane is your
 own first Enter — so loomux runs a watcher that answers it for you rather than
-leaving it on screen. Uncheck the box to launch in the CLI's normal interactive
-mode. Loomux never uses `--dangerously-skip-permissions`. Your last choice is
-remembered for next time.
+leaving it on screen. For OpenCode it's `--auto`, which answers each permission
+ask itself as it comes up rather than opening a separate confirmation dialog, so
+no watcher is needed on a fresh launch. Uncheck the box to launch in the CLI's
+normal interactive mode. Loomux never uses `--dangerously-skip-permissions`.
+Your last choice is remembered for next time.
 
 That posture survives a **restore**, too (an app restart, or resuming from the
 session browser) — but only when loomux launched the session itself *and*
@@ -129,7 +132,9 @@ session, so it's never ambiguous; for Copilot — which hands loomux no session 
 at launch — it's per folder, so two sessions launched from the same folder with
 the toggle flipped between them deliberately resolve to *no* flags rather than a
 guess. A session with no such record comes back in plain interactive mode instead
-of guessing; `Shift+Tab` still cycles it into autopilot by hand.
+of guessing; `Shift+Tab` still cycles it into autopilot by hand. OpenCode keeps
+no restore-posture record yet, so a restored OpenCode pane always comes back
+plain — same `Shift+Tab` fallback.
 
 Want more than one agent? Set **Panes** above 1 on the Agent kind to spawn *N*
 independent agent panes at once. And when you're ready to hand a whole queue of
@@ -140,7 +145,7 @@ work to a fleet that manages itself, that's the
 
 | For | Requirement |
 | --- | --- |
-| Running an agent pane | `claude` and/or `copilot` on your `PATH` |
+| Running an agent pane | `claude`, `copilot`, and/or `opencode` on your `PATH` |
 | The issues/PR view and the orchestration PR workflow | `gh` CLI, authenticated (`gh auth login`) |
 | Voice prompts (Windows, opt-in) | a whisper.cpp runtime + a model — see [Voice prompts](features/voice-prompts.html) |
 
