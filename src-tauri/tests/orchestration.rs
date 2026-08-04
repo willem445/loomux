@@ -14800,6 +14800,188 @@ fn box_holds_paste_is_the_documented_precondition_check_and_post_enter_signal_al
     assert!(!box_holds_paste(post_enter_tail_accepted, pasted), "post-Enter: box consumed it");
 }
 
+// ───────── #821: a per-row gutter through a multi-row paste is not an absence ─────────
+//
+// `normalize_prompt_text` flattens the whole tail, so copilot's framed composer
+// — which draws `┃ ` down EVERY row it wrapped a paste onto — puts its gutter
+// *inside* the haystack, interleaved through the needle. Containment fails on
+// text plainly still in the box, and the reading is not merely wrong but
+// CONFIDENTLY wrong: the only guard between a failed containment and
+// `NotHolding` is a length test, and decoration ADDS characters, so the tail is
+// always longer than the paste it just failed to contain.
+//
+// Post-#819 that reading LICENSES retirement (`stranded_marker_action` retires
+// on `Some(BoxReading::NotHolding)`), and #819's safety argument — "nothing
+// retires on an absence of evidence" — does not cover counterfeit evidence OF
+// an absence. So a false negative here retires a marker whose text is still in
+// the box: the Enter that would have submitted it is never pressed, and the
+// next queue entry pastes on top and submits both merged, which is the
+// #81/#84/#111 collision that licence exists to prevent.
+
+/// Copilot's framed composer holding a multi-row loomux paste. Reconstructed
+/// from the shapes cited in #820 (`copilot-cli#4116`'s verbatim composer
+/// paste), not captured — constraint 3 forbids a live copilot.
+const FIX_BOX_GUTTER_MULTIROW: &str =
+    include_str!("fixtures/attention/copilot-framed-composer-multirow-paste.txt");
+/// The same, plus the scrollbar track on the RIGHT edge (`copilot-cli#4009` —
+/// `┃` serves as both composer border and scrollbar). `deframe` strips LEADING
+/// decoration only, so this stays unreadable by design: it is the shape the
+/// partial-match probe exists for.
+const FIX_BOX_GUTTER_SCROLLBAR: &str =
+    include_str!("fixtures/attention/copilot-framed-composer-scrollbar.txt");
+/// The exact text loomux pasted into the pane both fixtures show.
+const GUTTER_PASTE_TEXT: &str = "Review requested changes on PR #814.\n\
+     Read the findings on the PR itself and address every item.\n\
+     Push fixes to the same branch and report when ready for re-review.";
+
+#[test]
+fn h1_a_gutter_through_a_multirow_paste_does_not_read_as_gone() {
+    let tail = strip_ansi(FIX_BOX_GUTTER_MULTIROW.as_bytes());
+
+    // Preconditions, so this fails for the reason it claims: the gutter really
+    // is on every row of our paste, and the tail really is longer than the
+    // paste — which is what makes the length guard useless here.
+    assert_eq!(
+        tail.lines().filter(|l| l.contains('┃')).count(),
+        3,
+        "precondition: the gutter is on EVERY row of the paste, not just the first: {tail:?}"
+    );
+    assert!(
+        tail.split_whitespace().collect::<Vec<_>>().join(" ").len()
+            > GUTTER_PASTE_TEXT.split_whitespace().collect::<Vec<_>>().join(" ").len(),
+        "precondition: the decorated tail is LONGER than the paste, so the length guard \
+         cannot catch the miss — that is the whole shape of #821"
+    );
+
+    assert!(
+        box_holds_paste(&tail, GUTTER_PASTE_TEXT),
+        "our text is sitting in the box behind a per-row gutter — that is still holding"
+    );
+}
+
+#[test]
+fn h2_a_gutter_through_our_paste_never_licenses_a_retirement() {
+    // The consequence, at the decision #819 keyed on the reading. This is the
+    // test that says what the bug COSTS rather than that a helper is wrong.
+    let tail = strip_ansi(FIX_BOX_GUTTER_MULTIROW.as_bytes());
+    let reading = box_reading(Some(&tail), GUTTER_PASTE_TEXT);
+    assert_eq!(reading, BoxReading::Holds, "the box holds our text; say so");
+
+    let action = stranded_marker_action(
+        Some(false),
+        Some(reading),
+        false,
+        HumanInputBlock::None,
+        false,
+        || false,
+    );
+    assert!(
+        !matches!(action, StrandedMarkerAction::Retire(_)),
+        "retiring here strands our own text forever AND lets the next delivery paste on top \
+         of it — the #81/#84/#111 collision #819's licence exists to prevent: got {action:?}"
+    );
+}
+
+#[test]
+fn h3_decoration_we_cannot_account_for_reads_unverifiable_rather_than_absent() {
+    // The arm that makes this robust to decoration nobody has catalogued.
+    // `deframe` removes LEADING decoration, so a trailing scrollbar `┃` still
+    // defeats containment — and it must not therefore read as absence.
+    let tail = strip_ansi(FIX_BOX_GUTTER_SCROLLBAR.as_bytes());
+    assert!(
+        !box_holds_paste(&tail, GUTTER_PASTE_TEXT),
+        "precondition: trailing decoration is genuinely NOT handled by de-framing — this test \
+         is about the fallback, and would prove nothing if containment already succeeded"
+    );
+    assert_eq!(
+        box_reading(Some(&tail), GUTTER_PASTE_TEXT),
+        BoxReading::Unverifiable,
+        "our paste's own line is still visibly on screen: we looked and could not tell, which \
+         is not the same as it being gone"
+    );
+    let action = stranded_marker_action(
+        Some(false),
+        Some(BoxReading::Unverifiable),
+        true,
+        HumanInputBlock::Blocked,
+        false,
+        || false,
+    );
+    assert!(
+        !matches!(action, StrandedMarkerAction::Retire(_)),
+        "#819 already treats Unverifiable as no evidence — that is what makes this arm safe"
+    );
+}
+
+#[test]
+fn h4_a_genuinely_consumed_box_still_reads_as_gone_and_still_retires() {
+    // The floor, and the cost of getting the probe wrong. `Unverifiable` falls
+    // through to the ordinary gates, so a probe that fired on everything would
+    // erode #813/#819's repair back toward the deadlock it exists to break.
+    // Long enough to clear the length guard on its own, or this would pass as
+    // `Unverifiable` for a reason that has nothing to do with the probe.
+    let consumed = "● Reading src-tauri/src/orchestration/mod.rs to find the delivery gate.\n\
+         ● The queue drainer re-reads write_admission every poll, so the hold lives there\n\
+           rather than inside deliver_now's own capped waits.\n\
+         ● Working on it.\n\n\
+         ┃                                                                  ┃\n\
+         \x20 @ files · # issues";
+    assert!(
+        consumed.split_whitespace().collect::<Vec<_>>().join(" ").len()
+            > GUTTER_PASTE_TEXT.split_whitespace().collect::<Vec<_>>().join(" ").len(),
+        "precondition: the tail clears the length guard, so `NotHolding` below is the probe's \
+         verdict and not the length test's"
+    );
+    assert_eq!(
+        box_reading(Some(consumed), GUTTER_PASTE_TEXT),
+        BoxReading::NotHolding,
+        "no fragment of our paste is on screen — this is a real absence and must stay one"
+    );
+    assert!(
+        matches!(
+            stranded_marker_action(
+                Some(false), Some(BoxReading::NotHolding), false,
+                HumanInputBlock::None, false, || false,
+            ),
+            StrandedMarkerAction::Retire(StrandedRetireReason::TextGone)
+        ),
+        "and #819's repair still fires"
+    );
+
+    // A paste with no line long enough to be evidence yields no probe at all,
+    // so it keeps the pre-#821 reading rather than a coincidence-prone one.
+    assert_eq!(
+        box_reading(Some("● idle\n┃ ok ┃\n  @ files"), "ok\nfine"),
+        BoxReading::NotHolding,
+        "short lines are not evidence; absence of a probe is not a licence to invent one"
+    );
+}
+
+#[test]
+fn h5_a_markdown_bullet_in_a_brief_is_not_mistaken_for_box_framing() {
+    // The trap in de-framing only the TAIL. `is_frame_char` counts `*`, `•` and
+    // `|` as framing, so a brief carrying an ordinary bullet list or table
+    // would have those stripped from the tail and kept in the needle — every
+    // such paste would fail containment, clear the length guard (the tail being
+    // longer, exactly as in the gutter case) and read as a confident absence.
+    // That is the #821 failure re-introduced by the #821 fix, so it is pinned.
+    let bulleted = "Do these in order:\n\
+         * rebase onto main and re-read the findings\n\
+         * push the fix and wait for the full matrix\n\
+         | step | owner |";
+    let rendered = "● Ready.\n\
+         ┃ Do these in order:\n\
+         ┃ * rebase onto main and re-read the findings\n\
+         ┃ * push the fix and wait for the full matrix\n\
+         ┃ | step | owner |\n\
+         \x20 @ files · # issues";
+    assert!(
+        box_holds_paste(rendered, bulleted),
+        "a bullet is our own text, not the CLI's frame — and it is on both sides, so it cancels"
+    );
+    assert_eq!(box_reading(Some(rendered), bulleted), BoxReading::Holds);
+}
+
 #[test]
 fn confirm_state_for_maps_each_source_to_the_correct_three_state_outcome() {
     // Pinned directly: a mutation swapping any one of these arms is exactly
