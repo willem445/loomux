@@ -2418,6 +2418,11 @@ const ATTENTION_INTERVAL: Duration = Duration::from_secs(3);
 /// to notice the same thing ten times later at worst, which is the wrong
 /// trade for work that reads a pty ring. See `start_attention` for the cost
 /// bound this cadence is half of.
+///
+/// (#825 M3) It paces the `QueueFull` re-admission pass on the same tick. That
+/// one is strictly cheaper — two map reads per badged pane and no pty read at
+/// all — so it is here to share one cadence to reason about rather than because
+/// it needs slowing down.
 const STRANDED_JANITOR_EVERY_N_TICKS: u64 = 10;
 /// A pane's terminal output must be stable (unchanged) at least this long
 /// before an idle-with-prompt is asserted — the CLI has stopped painting and
@@ -14573,6 +14578,83 @@ pub fn stranded_admission_gate(drainer_active: bool, front_is_marker: bool) -> O
     }
     if front_is_marker {
         return Some("submit-already-queued");
+    }
+    None
+}
+
+/// Whether a raised [`StrandedBlocker::QueueFull`] chip's refused re-send may be
+/// admitted **now** (#825 M3), and if not, the reason it is not yet time.
+/// `None` = go.
+///
+/// `QueueFull` is the one unreleased class whose release is a **retry rather
+/// than a reading**. Its badge does not claim anything about where our text is
+/// — [`stranded_badge_release`]'s matrix has nothing to say about it — it says
+/// loomux could not even *queue* the re-send. The honest answer to that is to
+/// queue it once there is room, and let the confirm/retire machinery that owns
+/// every other marker own this one too.
+///
+/// # Why this is not a hook on the drain edge
+///
+/// plan-312's M3 put the retry at `note_queue_capacity`'s `Full` → not-`Full`
+/// transition, beside `announce_refusal_roster` (#658). That edge cannot admit
+/// anything, and the reason is a runtime fact a read-only plan could not see:
+/// every production caller able to produce it — [`OrchRegistry::pop_front_dequeued`],
+/// [`OrchRegistry::pop_batch_dequeued`] and [`OrchRegistry::drop_superseded`] —
+/// runs on the drainer thread, which holds its `queue_draining` registration
+/// from `ensure_drainer` right through to `commit_exit`. So
+/// [`stranded_admission_gate`] would answer `Some("drainer-active")` at every
+/// real drain edge, every time, forever. (The one other caller,
+/// `OrchRegistry::drop_queue`, is destroying the pane's queue; re-admitting
+/// there would be queueing for a pane that is going away.)
+///
+/// It is also the wrong moment **on the merits**, which is what makes this a
+/// relocation rather than a workaround. `stranded_admission_gate`'s own doc
+/// says what a live drainer means: a delivery is already queued for this pane,
+/// and THAT delivery's pre-paste `flush_stranded_text` presses exactly the
+/// Enter this marker wants pressed. The moment nothing else will press it is
+/// the moment the queue has gone quiet and the drainer has exited — which is
+/// also the only moment the marker can be admitted at all. So M3 observes the
+/// pane *after* the drain rather than during it: the same "hoist the work out
+/// of the lifetime of the thread that dies" M2 applied to the late monitor,
+/// pointed at the drainer instead.
+///
+/// *Rejected:* teaching the gate that the drainer may admit its own marker
+/// between a `pop_front_dequeued` and its next peek. It is true that the
+/// drainer owns no entry at that instant — but it re-opens #496 PR-C rev-47
+/// B1 by construction, replacing a fused check-and-push with a parameter every
+/// future caller of `note_queue_capacity` would have to get right, for a repair
+/// the very next queued delivery's pre-paste flush already performs.
+///
+/// Pure and total, so every cell is directly assertable. The depth check
+/// mirrors `push_stranded_front_locked`'s own refusal condition rather than
+/// `queue::capacity_state`'s badge classification: this is a pre-check that
+/// exists to keep a still-full pane from attempting-and-failing (and auditing a
+/// `delivery-dropped` line) on every pass, so it has to ask the same question
+/// the push will ask. The real check is still the one inside
+/// [`OrchRegistry::admit_stranded_selfheal`], taken under the `queues` lock.
+pub fn queuefull_readmit_gate(
+    blocker: Option<StrandedBlocker>,
+    depth: usize,
+    drainer_active: bool,
+) -> Option<&'static str> {
+    // Only `QueueFull` names a re-send that was REFUSED and never queued. Every
+    // other chip is somebody else's release — M1's dismiss, M2's matrix, or the
+    // hold and depth classes' own conditions — and the in-flight wording
+    // (`None`) is a submit that is already pending.
+    if blocker != Some(StrandedBlocker::QueueFull) {
+        return Some("not-queue-full");
+    }
+    // The condition that raised the chip is still true, so the chip is still
+    // right and there is nothing to retry.
+    if depth >= queue::QUEUE_MAX_PER_PANE {
+        return Some("still-full");
+    }
+    // Same word as `stranded_admission_gate`'s, and the same fact — pushing in
+    // front of a drainer that owns the front entry is the rev-47 B1 race. Named
+    // here as well so a caller can decline BEFORE attempting, which is what
+    // keeps a declined pass silent instead of writing a skip line every 30s.
+    if drainer_active {
+        return Some("drainer-active");
     }
     None
 }
@@ -30180,6 +30262,138 @@ impl OrchRegistry {
         }
     }
 
+    /// The `QueueFull` re-admission (#825 M3): production entry point, riding
+    /// the same divided attention tick as [`Self::run_stranded_janitor`].
+    ///
+    /// Needs no `AppHandle` to decide anything — its evidence is queue-depth
+    /// state, not a pane reading — so unlike the janitor it runs headless. An
+    /// app handle is consulted only to nudge a drainer for the marker it
+    /// admitted, exactly as `actuate_stranded` does.
+    pub fn run_stranded_queuefull_readmit(&self) {
+        let ledger = self.last_delivery.clone();
+        self.stranded_queuefull_pass(&ledger);
+    }
+
+    /// One re-admission pass over the raised stuck-prompt chips (#825 M3): a
+    /// pane whose chip says loomux could not even *queue* its re-send, and
+    /// whose queue now has room, gets that re-send queued.
+    ///
+    /// **A retry, not a release — nothing here is cleared on inference.** The
+    /// chip is re-worded to the in-flight heal wording (`None`, "loomux is
+    /// re-sending it") because a submit really is pending again, and from there
+    /// the existing machinery owns it: the marker's own
+    /// [`drain_stranded_submit`] re-derives every gate at the press, a
+    /// confirmed delivery clears the chip in `deliver_now`, and a marker that
+    /// retires does so through #819's reasons. So M3 mints no `stranded-cleared`
+    /// `why` of its own — it takes no chip down.
+    ///
+    /// **What it fixes is a repair gap, not only a badge gap.** Before this,
+    /// the Enter that `actuate_stranded` decided to press and could not queue
+    /// was never pressed at all, however much room opened later, on any pane
+    /// whose late monitor had exited. The badge outliving its truth was the
+    /// visible half of that.
+    ///
+    /// **Why the pass and not the drain edge** is [`queuefull_readmit_gate`]'s
+    /// header, and it is the deviation from plan-312's letter: at every real
+    /// drain edge a drainer is registered, so an admission there is refused by
+    /// construction — and is redundant besides, because the deliveries still
+    /// queued behind it each press that Enter on their way in.
+    ///
+    /// **Never a raise.** It writes through [`Self::reword_stranded`], which
+    /// cannot insert, so a chip a human dismissed (M1) stays dismissed even if
+    /// this pass admitted a marker microseconds earlier. The marker is still the
+    /// honest thing to have queued in that case: a dismissal takes down a
+    /// warning, it does not un-strand a prompt.
+    ///
+    /// Takes the ledger as a parameter, the shape [`Self::stranded_janitor_pass`]
+    /// and [`drain_stranded_submit`] both use, so a headless integration test can
+    /// drive it end to end.
+    #[doc(hidden)] // pub for integration tests
+    pub fn stranded_queuefull_pass(
+        &self,
+        last_delivery: &Mutex<HashMap<u32, DeliveryOutcome>>,
+    ) {
+        // Snapshot first, then drop both locks before touching the queue map —
+        // `attention_tick`'s lock order (`attn_stranded`, then `agents`), the
+        // same discipline the janitor pass follows. Nothing is filtered by class
+        // here on purpose: `queuefull_readmit_gate` is the one place that names
+        // the class, so a second copy of its domain cannot go stale against it
+        // (`janitor_watches`' reason, reached the other way round).
+        let panes: Vec<(String, String, u32, Option<StrandedBlocker>)> = {
+            let notes = self.attn_stranded.lock_safe();
+            // The common case by a wide margin: no chip anywhere, so the pass
+            // costs one uncontended map lock and returns.
+            if notes.is_empty() {
+                return;
+            }
+            let agents = self.agents.lock_safe();
+            notes
+                .iter()
+                .filter_map(|(id, note)| {
+                    let a = agents.get(id)?;
+                    // A pane with no running agent has nothing to submit into,
+                    // and `attention_tick` prunes its note anyway.
+                    if a.status != AgentStatus::Running {
+                        return None;
+                    }
+                    Some((id.clone(), a.group.clone(), a.pty_id?, note.blocker))
+                })
+                .collect()
+        };
+
+        for (agent_id, group, pty_id, judged) in panes {
+            let depth = self.queue_depth(pty_id);
+            if queuefull_readmit_gate(judged, depth, self.drainer_active(pty_id)).is_some() {
+                continue;
+            }
+            // The sender of the delivery whose text is stranded — the same
+            // `delivery_from` the late monitor hands `actuate_stranded`, read
+            // from the ledger rather than invented, so the marker's queue entry
+            // and the `DeliveryOutcome` a successful press writes name the same
+            // sender (#560's rule: a record that guesses is worse than none).
+            // No record at all means nothing on this pane is still accountable
+            // as stranded, and there is nothing to re-submit.
+            let Some(from) = last_delivery.lock_safe().get(&pty_id).map(|o| o.from.clone()) else {
+                continue;
+            };
+            let admitted = match self.admit_stranded_selfheal(&group, &agent_id, &from, pty_id) {
+                Ok(admitted) => admitted,
+                // The queue went back to cap between the gate read and the push
+                // — the race the gate is a pre-check for, not a guarantee
+                // against. `audit_stranded_push` has already recorded the
+                // refusal; the chip stays `QueueFull`, which is still exactly
+                // true, and the next pass tries again.
+                Err(_) => continue,
+            };
+            self.audit(&group, "loomux", "stranded-readmit", json!({
+                "to": agent_id,
+                "depth": depth,
+                "cap": queue::QUEUE_MAX_PER_PANE,
+                // `false` = a marker was already queued for this pane
+                // (`submit-already-queued`; the drainer-active decline cannot
+                // reach here, the gate took it). Either way a submit is pending,
+                // which is what the re-worded chip goes on to say — and this
+                // line is what explains that wording change to whoever greps.
+                "admitted": admitted,
+            }));
+            // AFTER the admission, never before. `admit_stranded_selfheal` calls
+            // `note_queue_capacity`, which treats a chip whose blocker is `None`
+            // as nobody's badge (`existing.is_none()`) and would stamp its own
+            // depth badge over the in-flight wording. Re-wording second leaves
+            // the `QueueFull` chip standing across that call, which that
+            // function will not touch — the identical ordering, for the
+            // identical reason, as `actuate_stranded`'s.
+            self.reword_stranded(&group, &agent_id, judged, None);
+            // Best-effort nudge, the shape `actuate_stranded` and
+            // `redeliver_lost_kickoff` both use; `ensure_drainer` is idempotent.
+            // Without an app handle (headless tests) nothing drains — the marker
+            // stays queued, which is the honest state.
+            if let (Some(app), Some(reg)) = (self.app.lock_safe().clone(), self.arc()) {
+                reg.ensure_drainer(app, group.clone(), pty_id, None);
+            }
+        }
+    }
+
     /// Record a spawn against the group's rolling-hour window and report
     /// whether the spawn-rate guardrail is now exceeded. Checks and records
     /// under one lock so concurrent spawns can't both slip past the cap.
@@ -36706,13 +36920,30 @@ impl OrchRegistry {
     /// the real check reads — a headless test has no `AppHandle`, so it
     /// cannot spawn an actual drainer to produce this state (same shape as
     /// `set_rotate_check_pause_for_test` / `register_fake_for_test`).
+    ///
+    /// Returns the minted generation (`None` if one was already registered) so
+    /// a test can hand it back to [`Self::release_drainer_for_test`] and model
+    /// a drainer's whole lifetime, not only its middle.
     #[doc(hidden)] // test-only seam
-    pub fn register_drainer_for_test(&self, pty_id: u32) {
+    pub fn register_drainer_for_test(&self, pty_id: u32) -> Option<u64> {
         // Through the same `claim` the real `ensure_drainer` uses (#497):
         // there is no raw insert to reach for, and a test seam that wrote
         // this map some other way would be a second way in — exactly what
         // the newtype exists to not have.
-        let _ = self.queue_draining.claim(pty_id, || self.drainer_gen.fetch_add(1, Ordering::SeqCst) + 1);
+        self.queue_draining.claim(pty_id, || self.drainer_gen.fetch_add(1, Ordering::SeqCst) + 1)
+    }
+
+    /// Deregister the fake drainer `register_drainer_for_test` claimed — the
+    /// `commit_exit` half of the same seam (#825 M3), so a test can assert what
+    /// changes at the moment a drainer *exits* rather than only what is true
+    /// while one runs.
+    ///
+    /// Takes the generation, because the newtype's ONE removal takes the
+    /// generation (#497/#470 B1 round 2) and a test seam that reached past that
+    /// would be the ungenerationed removal the type exists to make unwritable.
+    #[doc(hidden)] // test-only seam
+    pub fn release_drainer_for_test(&self, pty_id: u32, generation: u64) -> bool {
+        self.queue_draining.release(pty_id, generation)
     }
 
     /// This pane's current stranded state, if any (#496 PR-C). Test/read-only
@@ -40027,6 +40258,32 @@ pub fn start_max_notice_flusher(reg: Arc<OrchRegistry>) {
 /// 4. **Worst case.** Bounded by the number of badged panes, which is bounded
 ///    by the fleet size; a fleet where every pane carries a stuck-prompt chip
 ///    has a much louder problem than this loop.
+///
+/// (#825 M3) The same tick then runs the `QueueFull` re-admission, which is the
+/// one unreleased class whose answer is a retry rather than a reading — see
+/// [`queuefull_readmit_gate`] for why it observes the pane *after* a drain
+/// instead of hooking the drain edge itself. It rides this cadence rather than
+/// a second one because it asks the same question at the same moment, and it is
+/// **cheaper than the janitor by a wide margin**: no pty read, no ledger clone,
+/// no ring scan. Its bound, same INV-4 discipline:
+///
+/// 1. **Scope.** Returns after one uncontended `attn_stranded` lock unless a
+///    chip is up somewhere — the healthy-session case, identical to the
+///    janitor's. Self-limiting in the same sense: a successful re-admission
+///    re-words the chip off `QueueFull`, so the work ends the condition that
+///    schedules it, and a pane can only be re-admitted for as long as its own
+///    badge says the re-send was refused.
+/// 2. **Per badged pane.** Two uncontended map reads (`queue_depth`,
+///    `drainer_active`) before anything else, and for the pane that passes them
+///    one `admit_stranded_selfheal` — a single `queues` critical section and one
+///    ledger read. No pty read at all, at any point: nothing here looks at a
+///    pane, which is the whole difference between a retry and a reading.
+/// 3. **Cadence and worst case.** As above — 30s, bounded by the badged-pane
+///    count.
+///
+/// Both passes run BEFORE `run_attention` so a chip either of them changed is
+/// emitted this tick with its new wording, rather than being shown stale once
+/// more and corrected 3s later.
 pub fn start_attention(reg: Arc<OrchRegistry>) {
     std::thread::spawn(move || {
         let mut tick: u64 = 0;
@@ -40035,6 +40292,7 @@ pub fn start_attention(reg: Arc<OrchRegistry>) {
             tick = tick.wrapping_add(1);
             if tick % STRANDED_JANITOR_EVERY_N_TICKS == 0 {
                 reg.run_stranded_janitor();
+                reg.run_stranded_queuefull_readmit();
             }
             reg.run_attention(now_ms());
         }

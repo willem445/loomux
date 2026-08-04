@@ -477,6 +477,18 @@ new problem: it stays up, and it stays up until you deal with it or dismiss it. 
 takes a chip down — your ✕, or loomux's own reading — is written to the group's audit log
 with what it was and what was read, so you can always look up where one went.
 
+**One chip is answered by loomux retrying, not by loomux looking.** A **⚠ stuck prompt** chip
+that says the repair could not even be *queued* — the pane already had the maximum number of
+messages waiting — is not a claim about what is in the box, so re-reading the pane could never
+settle it. Instead, once that pane's queue has drained and nothing is delivering to it, loomux
+queues the repair it could not queue before, and the chip changes to "loomux is re-sending it".
+From there it behaves like any other repair: held back until the pane is safe to write to,
+dropped if you get there first, and gone once the message lands. If the queue is still full, or
+a delivery is in progress, the chip stays exactly as it was and loomux tries again shortly —
+nothing is taken down on a guess. Before this the repair was simply never attempted again, so a
+pane that filled up once could carry that chip until you restarted, with the prompt still
+sitting unsent in its box.
+
 ## Cross-workspace channels
 
 Every orchestration group is isolated by design — one group's agents never see another's

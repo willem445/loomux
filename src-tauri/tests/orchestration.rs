@@ -103,6 +103,8 @@ use loomux_lib::orchestration::{
     // #825 M2: the badge-honesty matrix, hoisted out of the late monitor so a
     // raised chip keeps being checked after that monitor's 4h cap.
     stranded_badge_release, BadgeRelease,
+    // #825 M3: the one unreleased class whose answer is a retry, not a reading.
+    queuefull_readmit_gate,
     // #824: the missing half of flush_stranded_text's contract — what deliver_now
     // does when the flush DECLINES and our own text is still in the box.
     stranded_paste_guard, StrandedPasteGuard,
@@ -23223,7 +23225,7 @@ fn a_selfheal_never_cuts_in_front_of_a_drainer_that_owns_an_entry() {
     let pty = 4964u32;
     reg.enqueue_text(&g.id, &w.id, "loomux", "mid-delivery", pty, queue::EnqueueReason::Arrival)
         .unwrap();
-    reg.register_drainer_for_test(pty);
+    let _generation = reg.register_drainer_for_test(pty).expect("nothing holds this pty yet");
     assert!(reg.drainer_active(pty));
 
     let healed = reg.actuate_stranded(&g.id, &w.id, "loomux", pty, StrandedAction::SelfHeal);
@@ -27749,6 +27751,393 @@ fn a_dead_agents_chip_is_not_the_janitors_to_clear() {
         0,
         "the janitor does not clear a dead pane's chip — the attention scan prunes it"
     );
+}
+
+// ---------- #825 M3: `QueueFull`'s release is a RETRY, not a reading ----------
+//
+// The last of #825's five unreleased classes, and the only one whose badge is
+// not a claim about where our text is. `QueueFull` says loomux could not even
+// QUEUE the re-send it had already decided to make — so the honest answer is to
+// queue it once there is room, not to infer anything from the pane. Nothing here
+// clears a chip: a successful re-admission RE-WORDS it to the in-flight heal
+// wording and hands the pane back to the confirm/retire machinery that owns
+// every other marker.
+//
+// It also closes a REPAIR gap, not only a badge gap. Before this, the Enter
+// `actuate_stranded` decided to press and could not queue was never pressed at
+// all, however much room opened afterwards, on any pane whose late monitor had
+// exited.
+//
+// WHY THIS IS NOT A HOOK ON THE #658 DRAIN EDGE is pinned below rather than
+// argued in prose, because it is the deviation from plan-312's letter: every
+// production caller that can produce the `Full` → not-`Full` transition runs on
+// the drainer thread, which holds its `queue_draining` registration until
+// `commit_exit` — so an admission there is refused by construction, every time.
+
+/// A pane whose stuck-prompt chip says the re-send was **refused**, produced the
+/// way production produces one: fill the pane's queue to its cap, then let
+/// `actuate_stranded`'s admission be rejected. Nothing is faked — the chip, its
+/// audit trail and the queue depth are all the real ones, which is what makes
+/// the drain below a real drain.
+///
+/// The ledger record is back-dated a minute for the reason `janitor_pane!`'s is,
+/// and carries the sender so the re-admitted marker can be checked against it:
+/// a marker that invented its own `from` would put a lie in the one line a human
+/// greps to find out who sent the prompt that wedged (#560).
+///
+/// Yields `(reg, tempdir, group, agent id, pty id, ledger)`.
+macro_rules! queuefull_pane {
+    () => {{
+        let (reg, dir, g, wid) = attention_setup();
+        let pty = 8261u32;
+        reg.set_pty_for_test(&wid, pty);
+        for i in 0..queue::QUEUE_MAX_PER_PANE {
+            reg.enqueue_text(
+                &g, &wid, "orch", &format!("d-{i}"), pty, queue::EnqueueReason::BehindQueue,
+            )
+            .expect("the cap is the point — every one of these has to be admitted");
+        }
+        let healed = reg.actuate_stranded(&g, &wid, "orch", pty, StrandedAction::SelfHeal);
+        assert!(!healed, "precondition: a marker refused at cap is not a heal");
+        assert_eq!(
+            reg.stranded_note(&wid).and_then(|n| n.blocker),
+            Some(StrandedBlocker::QueueFull),
+            "precondition: the refusal is what raises the chip this slice releases"
+        );
+        let ledger: std::sync::Mutex<HashMap<u32, _>> = std::sync::Mutex::new(HashMap::new());
+        record_stranded_outcome_at_for_test(
+            &ledger,
+            pty,
+            "orch".to_string(),
+            now_ms() - 60_000,
+            Some(STRANDED_PROMPT.to_string()),
+        );
+        (reg, dir, g, wid, pty, ledger)
+    }};
+}
+
+/// Dequeue the way the drainer does — the ONLY thing that produces the `Full` →
+/// not-`Full` transition on a live pane — until the depth is at most `target`.
+///
+/// More than one pop can be needed to come off the cap, and the reason is
+/// itself #658: the first drain edge is where the refusal roster is announced,
+/// and on a headless registry that announcement is admitted to this very queue
+/// and never drained (`deliver_prompt_as` only withdraws an entry that landed
+/// FIRST). So the pane bounces back to its cap once, and the second pop is the
+/// one that sticks. Bounded, so a queue that never comes down fails the test
+/// rather than hanging it.
+fn drain_to_depth(reg: &OrchRegistry, group: &str, pty: u32, target: usize) -> usize {
+    for _ in 0..(queue::QUEUE_MAX_PER_PANE * 4) {
+        let depth = reg.queue_depth(pty);
+        if depth <= target {
+            return depth;
+        }
+        let front = reg.queue_snapshot(pty).into_iter().next().expect("a non-empty queue has a front");
+        reg.pop_front_dequeued(group, pty, front.id, front.enqueued_ms);
+    }
+    panic!("the pane's queue never came down to {target}");
+}
+
+fn drain_below_cap(reg: &OrchRegistry, group: &str, pty: u32) -> usize {
+    drain_to_depth(reg, group, pty, queue::QUEUE_MAX_PER_PANE - 1)
+}
+
+fn marker_count(reg: &OrchRegistry, pty: u32) -> usize {
+    reg.queue_snapshot(pty)
+        .iter()
+        .filter(|e| matches!(e.payload, queue::QueuedPayload::StrandedSubmit))
+        .count()
+}
+
+#[test]
+fn the_drain_edge_itself_could_never_have_admitted_the_refused_re_send() {
+    // THE PIN for this slice's deviation from plan-312, and the reason it is a
+    // test rather than a paragraph: the plan put M3 at `note_queue_capacity`'s
+    // `Full` → not-`Full` edge, beside `announce_refusal_roster` (#658). A
+    // read-only plan cannot see runtime registrations, and this is one: every
+    // production caller able to produce that edge — `pop_front_dequeued`,
+    // `pop_batch_dequeued`, `drop_superseded` — runs on the drainer thread,
+    // which holds `queue_draining` from `ensure_drainer` through to
+    // `commit_exit`. A hook there would decline `drainer-active` on every real
+    // drain, forever, and repair nothing.
+    //
+    // So this drives the real edge with the registration a real drainer holds,
+    // and then releases it — same pane, same queue, same chip; only the
+    // drainer's lifetime differs — which is exactly the difference between the
+    // plan's placement and this one.
+    let (reg, _d, g, wid, pty, ledger) = queuefull_pane!();
+    let generation = reg.register_drainer_for_test(pty).expect("no drainer holds this pty yet");
+
+    let depth = drain_below_cap(&reg, &g, pty);
+    assert!(depth < queue::QUEUE_MAX_PER_PANE, "the pane's depth really did come down from its cap");
+
+    // The #658 edge fired: this IS the moment plan-312 aimed at.
+    let pressure = reg
+        .audit_log(&g)
+        .into_iter()
+        .find(|e| e.action == "delivery-queue-pressure" && e.detail["was"] == json!("full"))
+        .expect("a pane leaving its cap audits the transition — the edge M3 was planned onto");
+    assert_ne!(pressure.detail["state"], json!("full"), "and it is a transition OUT of full");
+
+    // And at that exact instant the admission is refused, whoever asks.
+    assert!(reg.drainer_active(pty), "the thread that produced the edge is still registered");
+    assert_eq!(
+        queuefull_readmit_gate(Some(StrandedBlocker::QueueFull), depth, reg.drainer_active(pty)),
+        Some("drainer-active"),
+        "a drain-edge hook is a no-op by construction, not merely usually"
+    );
+
+    // Wired: a pass running here changes nothing at all.
+    reg.stranded_queuefull_pass(&ledger);
+    assert_eq!(marker_count(&reg, pty), 0, "nothing may be pushed in front of a live drainer");
+    assert_eq!(
+        reg.stranded_note(&wid).and_then(|n| n.blocker),
+        Some(StrandedBlocker::QueueFull),
+        "and the chip is still exactly true — the re-send is still not queued"
+    );
+    assert_eq!(hold_audit_count(&reg, &g, "stranded-readmit"), 0);
+
+    // The drainer exits. THIS is the moment that can admit, and the moment no
+    // hook on the transition above would ever have seen.
+    assert!(reg.release_drainer_for_test(pty, generation), "the drainer deregisters on exit");
+    reg.stranded_queuefull_pass(&ledger);
+    assert_eq!(
+        marker_count(&reg, pty),
+        1,
+        "with room in the queue and nobody draining it, the refused re-send is finally queued"
+    );
+}
+
+#[test]
+fn queuefull_readmit_gate_admits_one_class_and_only_with_room_and_no_drainer() {
+    // The matrix, directly. Three conditions, and each one is a different kind
+    // of "not yet": the wrong chip is somebody else's release entirely, a full
+    // queue means the chip is still telling the truth, and a live drainer is
+    // #496 PR-C rev-47 B1's fused-admission rule, which this pass obeys rather
+    // than re-litigates.
+    let cap = queue::QUEUE_MAX_PER_PANE;
+    assert_eq!(
+        queuefull_readmit_gate(Some(StrandedBlocker::QueueFull), cap - 1, false),
+        None,
+        "the one cell that admits: the chip says the re-send was refused, and there is now room"
+    );
+
+    // Every other chip, including the in-flight wording, is left alone. A pass
+    // that widened to `NotHolding` / `Unverifiable` / `Exhausted` would be
+    // pressing Enter on M2's evidence, which M2 deliberately never does.
+    for blocker in [
+        Some(StrandedBlocker::NotHolding),
+        Some(StrandedBlocker::Unverifiable),
+        Some(StrandedBlocker::Exhausted),
+        Some(StrandedBlocker::PauseSuppressed),
+        Some(StrandedBlocker::HumanInput),
+        Some(StrandedBlocker::Question),
+        Some(StrandedBlocker::QuestionStale),
+        Some(StrandedBlocker::QueueNearFull),
+        Some(StrandedBlocker::QueueAtCapacity),
+        None,
+    ] {
+        assert_eq!(
+            queuefull_readmit_gate(blocker, 0, false),
+            Some("not-queue-full"),
+            "{blocker:?} names no refused re-send, so there is nothing here to re-admit"
+        );
+    }
+
+    // Still at cap: the condition that raised the chip has not changed, so the
+    // chip is right and an attempt would only write a `delivery-dropped` line
+    // every pass.
+    assert_eq!(
+        queuefull_readmit_gate(Some(StrandedBlocker::QueueFull), cap, false),
+        Some("still-full"),
+    );
+    assert_eq!(
+        queuefull_readmit_gate(Some(StrandedBlocker::QueueFull), cap + 1, false),
+        Some("still-full"),
+        "over cap counts as full too — the push asks `>=`, and so does this"
+    );
+    // A live drainer, named with `stranded_admission_gate`'s own word so the
+    // pre-check and the check under the lock cannot drift into two vocabularies.
+    assert_eq!(
+        queuefull_readmit_gate(Some(StrandedBlocker::QueueFull), 0, true),
+        Some("drainer-active"),
+    );
+    assert_eq!(stranded_admission_gate(true, false), Some("drainer-active"));
+}
+
+#[test]
+fn a_drained_queue_finally_gets_the_refused_re_send_queued_and_the_chip_says_so() {
+    // The headline cell, wired: the pane whose re-send was refused at cap, whose
+    // queue has since drained, and whose late monitor is long gone. Before this
+    // the marker was never pushed and the chip sat there claiming a refusal that
+    // had stopped being true — the exact "loomux gave up and nothing re-attempts"
+    // #825 names for this class.
+    let (reg, _d, g, wid, pty, ledger) = queuefull_pane!();
+    drain_below_cap(&reg, &g, pty);
+
+    reg.stranded_queuefull_pass(&ledger);
+
+    let snap = reg.queue_snapshot(pty);
+    let marker = snap.first().expect("the queue is not empty");
+    assert!(
+        matches!(marker.payload, queue::QueuedPayload::StrandedSubmit),
+        "the re-send goes to the FRONT: it presses Enter on text already in the box, so anything \
+         pasted ahead of it would land on top of that text"
+    );
+    assert_eq!(
+        marker.reason.as_str(),
+        "stranded-self-heal",
+        "and it carries the trigger that admitted it (#560), not the shared helper's old guess"
+    );
+    assert_eq!(
+        marker.from, "orch",
+        "the sender comes from the ledger record, so the queue line and the `DeliveryOutcome` a \
+         press writes name the same person"
+    );
+
+    assert_eq!(
+        reg.stranded_note(&wid).map(|n| n.blocker),
+        Some(None),
+        "the chip is RE-WORDED to the in-flight heal, never taken down: a submit really is \
+         pending again, and the confirm/retire machinery owns it from here"
+    );
+    let readmit = reg
+        .audit_log(&g)
+        .into_iter()
+        .find(|e| e.action == "stranded-readmit")
+        .expect("the wording changed, so the log has to say what changed it");
+    assert_eq!(readmit.detail["admitted"], json!(true));
+    assert_eq!(readmit.detail["cap"], json!(queue::QUEUE_MAX_PER_PANE));
+    // M3 takes no chip down, so it mints no `stranded-cleared` reason of its own
+    // — the distinct-token-per-mechanism rule, satisfied by not needing one.
+    assert_eq!(
+        hold_audit_count(&reg, &g, "stranded-cleared"),
+        0,
+        "a retry is not a release: nothing here clears on inference"
+    );
+}
+
+#[test]
+fn a_queue_still_at_its_cap_keeps_the_chip_and_costs_nothing() {
+    // The chip is still exactly true — there is still no room — so the pass must
+    // do nothing AND write nothing. Attempting-and-failing every 30s would fill
+    // `audit.jsonl` with `delivery-dropped` lines about a refusal already
+    // recorded once, which is why the depth pre-check exists at all.
+    let (reg, _d, g, wid, pty, ledger) = queuefull_pane!();
+    let before = reg.audit_log(&g).len();
+
+    reg.stranded_queuefull_pass(&ledger);
+
+    assert_eq!(reg.queue_depth(pty), queue::QUEUE_MAX_PER_PANE, "nothing was pushed");
+    assert_eq!(marker_count(&reg, pty), 0);
+    assert_eq!(
+        reg.stranded_note(&wid).and_then(|n| n.blocker),
+        Some(StrandedBlocker::QueueFull),
+        "the chip stays, because what it says is still what is happening"
+    );
+    assert_eq!(reg.audit_log(&g).len(), before, "a declined pass is silent, not merely harmless");
+}
+
+#[test]
+fn a_marker_already_queued_re_words_the_chip_without_pushing_a_second_one() {
+    // The `submit-already-queued` decline, which is a decline about the WORLD,
+    // not about this pass: the submit the chip says was refused is in fact
+    // pending. `actuate_stranded` calls that an in-flight heal (`None`) and does
+    // not burn its budget on it; this must say the same thing, or the same state
+    // would read two ways depending on which mechanism looked.
+    let (reg, _d, g, wid, pty, ledger) = queuefull_pane!();
+    // Two slots, not one: the marker below takes one, and the pass must still
+    // find room when it looks — otherwise this would decline `still-full` and
+    // test nothing it claims to.
+    drain_to_depth(&reg, &g, pty, queue::QUEUE_MAX_PER_PANE - 2);
+    assert!(
+        reg.admit_stranded_selfheal(&g, &wid, "orch", pty).expect("there is room now"),
+        "precondition: a marker is queued for this pane"
+    );
+    assert!(reg.queue_depth(pty) < queue::QUEUE_MAX_PER_PANE, "and the pane is not back at its cap");
+
+    reg.stranded_queuefull_pass(&ledger);
+
+    assert_eq!(marker_count(&reg, pty), 1, "one pending submit, not two");
+    assert_eq!(
+        reg.stranded_note(&wid).map(|n| n.blocker),
+        Some(None),
+        "a submit IS pending, so the chip says so rather than going on claiming a refusal"
+    );
+    let readmit = reg
+        .audit_log(&g)
+        .into_iter()
+        .find(|e| e.action == "stranded-readmit")
+        .expect("the wording still changed, so it is still explained");
+    assert_eq!(
+        readmit.detail["admitted"],
+        json!(false),
+        "and the line says this pass pushed nothing — the marker was already there"
+    );
+}
+
+#[test]
+fn the_re_admission_never_hands_back_a_chip_a_human_has_dismissed() {
+    // The hazard M1 created, which every #825 mechanism has to walk past: an
+    // absent `attn_stranded` entry can mean "a human said they had seen it", so
+    // a write that INSERTED would hand back the chip they just took down. This
+    // pass writes through `reword_stranded` for that reason.
+    //
+    // A second pane keeps a chip up so the pass runs its whole loop instead of
+    // returning on the empty-map fast path — otherwise this would pass for a
+    // reason that has nothing to do with the guarantee.
+    let (reg, _d, g, wid, pty, ledger) = queuefull_pane!();
+    let other = reg.spawn_agent(&g, Role::Worker, "w2", "t", false, None).unwrap();
+    reg.set_pty_for_test(&other.id, 8262);
+    reg.mark_stranded(&g, &other.id, Some(StrandedBlocker::PauseSuppressed));
+    drain_below_cap(&reg, &g, pty);
+    assert!(reg.dismiss_stranded(&wid), "precondition: the human took the chip down");
+
+    reg.stranded_queuefull_pass(&ledger);
+
+    assert!(
+        reg.stranded_note(&wid).is_none(),
+        "an absent entry means nothing to do — never something to raise"
+    );
+    // And the dismissal is a fact about a WARNING, not about the pane: a
+    // dismissed chip does not un-strand the prompt, so nothing was queued either.
+    assert_eq!(marker_count(&reg, pty), 0);
+}
+
+#[test]
+fn a_pane_with_no_delivery_record_has_nothing_to_re_submit() {
+    // "We have no record" is not "there is text to re-submit". Without the
+    // ledger there is no sender to name on the queue entry, and a marker that
+    // guessed one would put a lie in the line a human greps for who sent the
+    // wedged prompt (#560) — so the pass declines instead.
+    let (reg, _d, g, wid, pty, _ledger) = queuefull_pane!();
+    drain_below_cap(&reg, &g, pty);
+    let empty: std::sync::Mutex<HashMap<u32, _>> = std::sync::Mutex::new(HashMap::new());
+    record_stranded_outcome_at_for_test(&empty, 9_999, "orch".to_string(), now_ms() - 60_000, None);
+
+    reg.stranded_queuefull_pass(&empty);
+
+    assert_eq!(marker_count(&reg, pty), 0, "no record for this pane — nothing to re-submit");
+    assert_eq!(
+        reg.stranded_note(&wid).and_then(|n| n.blocker),
+        Some(StrandedBlocker::QueueFull),
+        "and the chip stays: declining to act is not evidence that the refusal is over"
+    );
+}
+
+#[test]
+fn a_dead_agents_chip_is_not_re_admitted() {
+    // A pane with no running agent has nothing to submit INTO, and its note is
+    // `attention_tick`'s to prune. Queueing a marker for it would be queueing
+    // an Enter press for a pane that is gone.
+    let (reg, _d, g, wid, pty, ledger) = queuefull_pane!();
+    drain_below_cap(&reg, &g, pty);
+    reg.mark_dead(&wid, Some(1));
+
+    reg.stranded_queuefull_pass(&ledger);
+
+    assert_eq!(marker_count(&reg, pty), 0);
+    assert_eq!(hold_audit_count(&reg, &g, "stranded-readmit"), 0);
 }
 
 #[test]
