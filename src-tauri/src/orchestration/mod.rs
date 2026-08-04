@@ -28296,8 +28296,9 @@ impl OrchRegistry {
             Some(Unavailable::Query(_)) => "unreadable",
             // A successful read, or a store that simply is not there yet:
             // either way this group has no live degrade episode.
-            Some(Unavailable::Absent) | None => {
-                self.opencode_db_degraded.lock_safe().remove(group);
+            Some(Unavailable::Absent) => "absent", // PROBE A
+            None => {
+                // PROBE B: latch deliberately not cleared
                 return;
             }
         };
