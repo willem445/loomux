@@ -16455,40 +16455,21 @@ pub fn stranded_marker_action(
     hold_ms: Option<u64>,
     stale_after_ms: u64,
 ) -> StrandedMarkerAction {
-    // Nothing stranded to submit. `should_flush_before_paste`'s own condition,
-    // read as a retire rather than as a decline: a decline here retried
-    // forever against a ledger that will never say `Some(false)` again.
-    if !matches!(prev_confirmed, Some(false)) {
-        return StrandedMarkerAction::Retire(StrandedRetireReason::NothingStranded);
-    }
-    // #813. `Blocked` with an EMPTY box is the human-resolved reading: the
-    // stamp says a person typed here after our submit, and `input_pending`
-    // says none of THEIR characters are outstanding — so whatever line held
-    // our text was submitted or killed by hand.
-    //
-    // `BoundedOut` deliberately does NOT retire. #518's bound exists because
-    // the stamp may be a phantom (a terminal auto-reply misclassified as a
-    // keystroke), in which case no human ever touched the pane and our text
-    // really is still sitting there — pressing is right, exactly as before.
-    // The behavioural surface of this whole function is that ONE cell:
-    // `Blocked` + empty box, which used to mean "retry forever".
-    if human_block == HumanInputBlock::Blocked && !box_pending {
-        return StrandedMarkerAction::Retire(StrandedRetireReason::HumanResolved);
-    }
-    // The bound, and it must outrank the two live gates below or it could
-    // never fire — a suppression driven by a fallible signal needs a release
-    // that does not depend on that signal, and this one holds OTHER work
-    // hostage while it waits (#496/#513/#518, the repo's standing rule).
-    if hold_ms.is_some_and(|held| held >= stale_after_ms) {
-        return StrandedMarkerAction::Retire(StrandedRetireReason::Unfirable);
-    }
-    // #510's absolute, unchanged: human-typed characters are outstanding in
-    // the box, so never press Enter over them.
-    if box_pending {
-        return StrandedMarkerAction::Retry(queue::EnqueueReason::BoxOccupied);
-    }
-    // #420, unchanged: a live question owns the Enter key.
-    if question_active() {
+    // ⚠ TEMPORARY — this commit is #813's RED EVIDENCE and the very next commit
+    // reverts it. What follows is the PRE-#813 decision, written against the
+    // POST-#813 signature so the new tests fail on their ASSERTIONS rather than
+    // on a compile error (a compile error masks behaviour instead of testing
+    // it — the DoD's own words). It is exactly what the drainer did before:
+    // `should_flush_before_paste`'s two conditions, the two live gates, and
+    // every single decline reported as `Question` — the hardcode this PR also
+    // removes. `hold_ms`/`stale_after_ms` are unused here because the bound is
+    // precisely what did not exist.
+    let _ = (hold_ms, stale_after_ms);
+    if !matches!(prev_confirmed, Some(false))
+        || human_block.holds()
+        || box_pending
+        || question_active()
+    {
         return StrandedMarkerAction::Retry(queue::EnqueueReason::Question);
     }
     StrandedMarkerAction::Press

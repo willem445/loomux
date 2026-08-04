@@ -35636,8 +35636,14 @@ fn a_human_pressing_enter_in_the_pane_retires_the_queued_marker() {
     let pty = 8131u32;
     let captured = pm.register_fake_for_test(pty, STRANDED_TAIL.as_bytes());
     let last_delivery: std::sync::Mutex<HashMap<u32, _>> = std::sync::Mutex::new(HashMap::new());
-    // The ledger state a stranded delivery leaves: recorded, unconfirmed.
-    record_aborted_preenter_outcome(&last_delivery, pty, "loomux".to_string());
+    // The ledger state a stranded delivery leaves: recorded, unconfirmed — and
+    // dated a minute BACK. `tier1_trusted` compares with `<=`, so a record
+    // stamped `now` and a keystroke stamped `now` land in the same millisecond
+    // and read as "no human has typed since our submit", which is a fact about
+    // this test's clock and not about the pane. The real strand is minutes old
+    // by the time a human gets to it (`record_aborted_preenter_outcome` is what
+    // production calls; the back-dated variant exists for exactly this).
+    record_stranded_outcome_at_for_test(&last_delivery, pty, "loomux".to_string(), now_ms() - 60_000);
 
     // The human rescues the pane by hand: click in, press Enter. `\r` with
     // nothing after it classifies `Submit`, which stamps the keystroke clock
@@ -35649,8 +35655,9 @@ fn a_human_pressing_enter_in_the_pane_retires_the_queued_marker() {
         "precondition: their Enter emptied the box"
     );
     assert!(
-        pm.last_user_input_ms(pty).unwrap_or(0) > 0,
-        "precondition: their Enter stamped the keystroke clock, so the block reads `Blocked`"
+        pm.last_user_input_ms(pty).unwrap_or(0) > now_ms() - 5_000,
+        "precondition: their Enter stamped the keystroke clock strictly after the strand, so \
+         the block reads `Blocked` rather than `tier1_trusted`"
     );
 
     let action =
