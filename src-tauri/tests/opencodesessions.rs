@@ -246,14 +246,22 @@ fn two_unclaimed_candidates_refuse_rather_than_bind_the_wrong_conversation() {
 }
 
 #[test]
-fn a_pane_with_no_recorded_directory_never_widens_the_search() {
+fn a_pane_with_no_recorded_directory_never_matches_a_row_with_none_either() {
     let s = Scratch::new("nocwd");
-    store(&s.db(), &[Row::new(NEW)]);
+    // The row that makes this testable rather than decorative: a session whose
+    // own `directory` is empty. Without the guard, "I don't know where this
+    // pane is" and "this session recorded nowhere" normalize to the same key
+    // and MATCH — an unknown pane would adopt it.
+    store(&s.db(), &[Row { directory: "", ..Row::new(NEW) }]);
 
-    // "I don't know where this pane is" must not become "match anything" —
-    // an empty key would otherwise be a wildcard against every row.
     assert_eq!(
         opencodedb::identify_session(&s.db(), "", &none(), &none()).unwrap(),
+        Identified::None,
+        "two unknowns must not compare equal"
+    );
+    // And a pane that DOES know where it is still isn't handed it.
+    assert_eq!(
+        opencodedb::identify_session(&s.db(), CWD, &none(), &none()).unwrap(),
         Identified::None
     );
 }
