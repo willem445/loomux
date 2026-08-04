@@ -16556,9 +16556,28 @@ pub fn stranded_marker_action(
     // on the path that actually consults it.
     question_active: impl FnOnce() -> bool,
 ) -> StrandedMarkerAction {
-    // Nothing stranded to submit. `should_flush_before_paste`'s own condition,
-    // read as a retire rather than as a decline: a decline here retried forever
-    // against a ledger that can never say `Some(false)` again.
+    // ⚠ TEMPORARY — #813 RED EVIDENCE (A of two), reverted before this PR is
+    // ready. This is the PRE-#813 decision, written against the post-#813
+    // signature so the new tests fail on their ASSERTIONS rather than on a
+    // compile error. It is what the drainer did before the issue:
+    // `should_flush_before_paste`'s two conditions, the two live gates, and
+    // every decline reported as `Question`.
+    //
+    // What this run CANNOT evidence, and run B exists for: the guards that say
+    // a marker must NOT retire (`Holds`, `Unverifiable`, no record). Pre-#813
+    // never retired at all, so they pass here vacuously — they are regression
+    // guards against the FIRST CUT of this fix, which is what run B neuters to.
+    let _ = (text_reading, human_stamped_since);
+    if !matches!(prev_confirmed, Some(false))
+        || human_block.holds()
+        || box_pending
+        || question_active()
+    {
+        return StrandedMarkerAction::Retry(queue::EnqueueReason::Question);
+    }
+    return StrandedMarkerAction::Press;
+
+    #[allow(unreachable_code)]
     if !matches!(prev_confirmed, Some(false)) {
         return StrandedMarkerAction::Retire(StrandedRetireReason::NothingStranded);
     }
