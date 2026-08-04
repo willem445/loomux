@@ -129,13 +129,18 @@ pub struct SessionTotals {
 /// `parent_id` edges ever contained a cycle: a row already in `tree` is not
 /// re-added.
 const ROLLUP_SQL: &str = "\
+WITH RECURSIVE tree(id) AS (
+    SELECT id FROM session WHERE id = ?1
+    UNION
+    SELECT s.id FROM session s JOIN tree t ON s.parent_id = t.id
+)
 SELECT COALESCE(SUM(s.cost), 0.0),
        COALESCE(SUM(s.tokens_input), 0),
        COALESCE(SUM(s.tokens_output), 0),
        COALESCE(SUM(s.tokens_reasoning), 0),
        COALESCE(SUM(s.tokens_cache_read), 0),
        COALESCE(SUM(s.tokens_cache_write), 0)
-  FROM session s WHERE s.id = ?1";
+  FROM session s WHERE s.id IN (SELECT id FROM tree)";
 
 /// `file:` URI for `db` with `immutable=1`, for [`open_immutable`].
 ///
@@ -150,6 +155,7 @@ pub fn immutable_uri(db: &Path) -> String {
     let mut s = String::from("file:");
     for ch in db.display().to_string().chars() {
         match ch {
+            '\\' => s.push('/'),
             '?' => s.push_str("%3f"),
             '#' => s.push_str("%23"),
             '%' => s.push_str("%25"),
@@ -166,9 +172,15 @@ pub fn open_readonly(db: &Path) -> Result<Connection, Unavailable> {
     // Checked before asking SQLite so "the agent never ran" is its own arm
     // rather than an `unable to open database file` string a caller would have
     // to pattern-match. This is the common case, not an error case.
+    if !db.is_file() {
+        return Err(Unavailable::Absent);
+    }
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    let _ = flags;
-    let conn = open_immutable(db).map_err(|e| Unavailable::Open(e.to_string()))?;
+    let conn = match Connection::open_with_flags(db, flags) {
+        Ok(c) => c,
+        Err(primary) => open_immutable(db)
+            .map_err(|second| Unavailable::Open(format!("{primary}; immutable retry: {second}")))?,
+    };
     conn.busy_timeout(Duration::from_millis(BUSY_TIMEOUT_MS))
         .map_err(|e| Unavailable::Open(e.to_string()))?;
     Ok(conn)
@@ -202,7 +214,7 @@ pub fn session_usage_on(
     conn: &Connection,
     session_id: &str,
 ) -> Result<Option<SessionTotals>, Unavailable> {
-    let drift = |_e: rusqlite::Error| Unavailable::Absent;
+    let drift = |e: rusqlite::Error| Unavailable::Query(e.to_string());
     // The root row first: it answers both "does this session exist at all"
     // (which the rollup's COALESCE'd SUM cannot — an empty set sums to zero,
     // indistinguishable from a real zero-token session) and "what model is
@@ -213,7 +225,7 @@ pub fn session_usage_on(
         })
         .optional()
         .map_err(drift)?;
-    let model = model.flatten();
+    let Some(model) = model else { return Ok(None) };
 
     let (cost, input, output, reasoning, cache_read, cache_write) = conn
         .query_row(ROLLUP_SQL, [session_id], |r| {
@@ -233,8 +245,8 @@ pub fn session_usage_on(
         input: sane_count(input),
         output: sane_count(output),
         reasoning: sane_count(reasoning),
-        cache_read: sane_count(cache_write),
-        cache_write: sane_count(cache_read),
+        cache_read: sane_count(cache_read),
+        cache_write: sane_count(cache_write),
         model,
     }))
 }
@@ -245,12 +257,16 @@ pub fn session_usage_on(
 /// poisons that sum for the whole group (and serializes to `null`, so the UI
 /// would read "no cost figure at all"). Clamped here, at the boundary.
 fn sane_cost(c: f64) -> f64 {
-    c
+    if c.is_finite() && c > 0.0 {
+        c
+    } else {
+        0.0
+    }
 }
 
 /// Same posture for the counters: a negative token count is not a number this
 /// codebase has a use for, and `as u64` on one would wrap to something
 /// astronomical.
 fn sane_count(n: i64) -> u64 {
-    n as u64
+    n.max(0) as u64
 }

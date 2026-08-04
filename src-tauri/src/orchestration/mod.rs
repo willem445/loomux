@@ -28206,9 +28206,7 @@ impl OrchRegistry {
             // to key on and this arm simply does not fire.
             if let Some(sid) = entry.session_id.as_deref() {
                 let db = self.opencode_db_path(&entry.group);
-                let probe = crate::usage::opencode_session_usage(&db, sid)
-                    .expect("PROBE: a degrade treated as fatal");
-                if let Some(u) = probe {
+                if let Ok(Some(u)) = crate::usage::opencode_session_usage(&db, sid) {
                     // Same guard as the claude arm: a session row that exists
                     // but has counted nothing yet must not overwrite history
                     // with zeros, nor pre-empt the statusline fallback.
@@ -28219,7 +28217,7 @@ impl OrchRegistry {
                         snap.cache_creation_tokens = u.tokens.cache_creation_tokens;
                         snap.cache_read_tokens = u.tokens.cache_read_tokens;
                         snap.cost_usd = u.cost_usd;
-                        snap.estimated = true; // PROBE
+                        snap.estimated = false; // priced by opencode, not by us
                         snap.model = u.model;
                         return snap;
                     }

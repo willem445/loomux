@@ -435,11 +435,11 @@ pub fn opencode_session_usage(
     Ok(crate::opencodedb::session_usage(db, session_id)?.map(|t| SessionUsage {
         tokens: TokenUsage {
             input_tokens: t.input,
-            output_tokens: t.output,
+            output_tokens: t.output + t.reasoning,
             cache_creation_tokens: t.cache_write,
             cache_read_tokens: t.cache_read,
         },
-        cost_usd: (t.cost_usd > 0.0).then_some(t.cost_usd),
+        cost_usd: Some(t.cost_usd),
         model: t.model,
     }))
 }
