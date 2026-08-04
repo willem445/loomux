@@ -49,8 +49,11 @@ exception worth knowing before you pick it: Antigma documents it as macOS- and
 Linux-only and ships no Windows binary, so on Windows it will fail to launch no
 matter how the pane is configured. The launcher also warns inline when a
 selected CLI isn't installed. Orchestration groups are narrower still — an
-orchestrator, worker, reviewer or planner must be **Claude Code or Copilot
-CLI**, the two loomux has orchestration adapters for.
+orchestrator, worker, reviewer or planner must be **Claude Code, Copilot
+CLI, or OpenCode**, the three loomux has orchestration adapters for. A
+workflow block can also name **Gemini CLI** for a reviewer lane (see
+[cross-model reviewers](orchestration.html#setting-up-a-cross-model-reviewer)),
+though the launcher's own role pickers don't offer it directly.
 
 ### The file editor and git panes
 

@@ -651,9 +651,9 @@ Three things worth knowing before you enable it:
 
 ### Setting up a cross-model reviewer
 
-`cli:` accepts `claude`, `copilot`, or `gemini`. So a workflow whose worker
-runs on Claude gets a genuinely different model family reviewing it by naming
-one on a reviewer block:
+`cli:` accepts `claude`, `copilot`, `gemini`, or `opencode`. So a workflow
+whose worker runs on Claude gets a genuinely different model family
+reviewing it by naming one on a reviewer block:
 
 ```yaml
 version: 1
@@ -690,6 +690,22 @@ Two differences worth knowing before you pick gemini for a lane:
 - **No session history features.** loomux can't resume a gemini session or
   read its transcript — gemini mints its own session ids rather than
   accepting one, so there's nothing for loomux to record and reopen later.
+
+`cli: opencode` is a fourth choice, and it runs opposite gemini on that last
+point:
+
+- **`allow:` doesn't apply to an opencode block either.** Its permission keys
+  (`edit`, `bash`, …) are a different namespace from the Claude/Copilot
+  tool-matcher strings `allow:` speaks, so an opencode block also runs with
+  its class's baseline and can't be widened — same decision, same reason, as
+  gemini's arm.
+- **No compact nudge.** opencode isn't on the short list of CLIs loomux will
+  paste `/compact` into (claude and copilot only), so an opencode agent's
+  context management is left to the CLI itself, same as gemini's.
+- **Session history *does* work.** opencode has no `--session-id` to hand a
+  pane up front, so loomux learns which session is the reviewer's after it
+  starts rather than minting one — but once bound, that session resumes and
+  its transcript reads back like any claude or copilot one.
 
 **Why not codex?** codex can't deny its editing tool by name, and its sandbox
 is all-or-nothing — strict enough to block the tests and `gh` a review needs,
@@ -939,8 +955,10 @@ work queue.
 [session browser](features/session-browser.html) (`ORCH` / `W` / `REV` chips).
 Clicking a dead group's orchestrator session restores the *whole* orchestration
 — same group id, state, task board, and audit history, with fresh MCP identity
-wired into the resumed conversation. A plain `claude --resume` would come back
-powerless (no MCP tools, no task board); this path never does.
+wired into the resumed conversation — whether that orchestrator runs Claude
+Code, Copilot CLI, or OpenCode. A plain `claude --resume` (or opencode's
+`--session <id>`) would come back powerless (no MCP tools, no task board);
+this path never does.
 
 **Per-task sessions:** each worker is scoped to exactly one work item, and loomux
 records its session id. Follow-ups on a finished task *resume* that worker's
@@ -974,8 +992,8 @@ it gates, the per-item approve-with-comment grants, and the gate's audit trail.
 
 ## Requirements
 
-- An agent CLI on `PATH` — `claude`, `copilot`, or `gemini`. Roles can run on
-  different ones (see [cross-model reviewers](#setting-up-a-cross-model-reviewer)).
+- An agent CLI on `PATH` — `claude`, `copilot`, `gemini`, or `opencode`. Roles
+  can run on different ones (see [cross-model reviewers](#setting-up-a-cross-model-reviewer)).
   The launcher warns inline as you pick, and re-checks on submit — if one of
   those CLIs isn't on `PATH` it refuses the whole launch rather than starting
   the group. A CLI named by a `.loomux/workflow.yml` block is not checked at
