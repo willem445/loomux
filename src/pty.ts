@@ -36,7 +36,12 @@ export interface SpawnOptions {
 
 export interface SessionInfo {
   id: string;
-  source: "claude" | "copilot";
+  /** Which CLI's store this row came out of. Mirrors `SessionInfo.source` in
+   *  `src-tauri/src/sessions.rs` — a plain string over IPC, so nothing checks
+   *  the two sets against each other and a scanner added there without a
+   *  widening here is silently mis-handled (#722: an opencode row read as
+   *  copilot's) rather than rejected. */
+  source: "claude" | "copilot" | "opencode";
   title: string;
   cwd: string;
   modified_ms: number;

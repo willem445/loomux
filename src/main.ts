@@ -21,6 +21,7 @@ import {
   type PtyExit,
   type SessionInfo,
 } from "./pty";
+import { restoredPaneName } from "./sessionmeta";
 import { decodeSettings, encodeSettings, setSettings, DEFAULT_SETTINGS } from "./settings";
 import { modal, confirmModal } from "./modal";
 import { SubmitLatch } from "./panesetup";
@@ -1872,9 +1873,7 @@ async function restoreSession(s: SessionInfo): Promise<void> {
   }
   // Plain (non-orchestration) sessions restore into the active tab.
   const ws = tabs.activeWorkspace;
-  const name =
-    (s.source === "claude" ? "claude · " : "copilot · ") +
-    (s.title.length > 34 ? s.title.slice(0, 34) + "…" : s.title);
+  const name = restoredPaneName(s.source, s.title);
   const pane = await ws.grid.openPane(
     // #440 D1c: pass the id we're already holding. Without this, a session
     // restored by hand from the Sessions sidebar came back DORMANT on the

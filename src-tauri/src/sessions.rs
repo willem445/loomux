@@ -2,11 +2,18 @@
 //!
 //! Claude Code:    ~/.claude/projects/<encoded-path>/<uuid>.jsonl
 //! Copilot CLI:    ~/.copilot/session-state/<uuid>/workspace.yaml
+//! OpenCode:       <xdg-data>/opencode/opencode.db (one SQLite store, #722)
 //!
-//! Both scanners are best-effort: unreadable or malformed entries are
+//! Every scanner is best-effort: unreadable or malformed entries are
 //! skipped, and a missing tool simply yields an empty list. New agent
 //! sources can be added by implementing another `scan_*` function and
 //! extending `list_sessions`.
+//!
+//! Two of the three enumerate FILES, one queries a DATABASE, and that shows
+//! up in the shape of the scan below: the candidate/`session-index.json`
+//! machinery (#493) exists to avoid re-reading the head of a file that hasn't
+//! changed, which is a cost opencode's store simply doesn't have — see
+//! `scan_opencode`.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -20,7 +27,14 @@ use std::time::UNIX_EPOCH;
 pub struct SessionInfo {
     /// Session id understood by the agent's `--resume` flag.
     pub id: String,
-    /// Which agent owns the session: "claude" | "copilot".
+    /// Which agent owns the session: "claude" | "copilot" | "opencode".
+    ///
+    /// The frontend declares this same set as a union type
+    /// (`SessionInfo["source"]` in `src/pty.ts`), and nothing checks the two
+    /// against each other — the row crosses an IPC boundary as a plain string.
+    /// A source added here without widening that type there is a row the
+    /// frontend silently mis-handles rather than fails on, which is why #722
+    /// landed both halves together.
     pub source: String,
     /// Human-readable one-liner (first prompt or session name).
     pub title: String,
@@ -335,6 +349,97 @@ fn read_copilot_session(dir: &Path) -> Option<CopilotSession> {
 /// could drift.
 pub(crate) fn norm_path(s: &str) -> String {
     s.replace('/', "\\").trim_end_matches('\\').to_lowercase()
+}
+
+// ---------- opencode: the human's OWN store (#722 slice C2) ----------
+//
+// Which database is the whole question here. loomux points a GROUP's panes at
+// a per-group file through `OPENCODE_DB` (`orchestration::OPENCODE_DB_ENV`),
+// but a solo pane — the only kind this tab can offer to reopen at all — is
+// launched with no such variable, so it writes where an unadorned `opencode`
+// writes: the human's own global store. That is the one this scanner reads,
+// and the group stores are deliberately NOT scanned: a group's sessions are
+// reopened through the group, with its roster, board and MCP identity
+// (`resumeOrchSession`), never as a bare `--session` pane.
+
+thread_local! {
+    /// Test seam for `opencode_store_path()`, with the same thread-scoping
+    /// rationale as `CLAUDE_PROJECTS_ROOT_OVERRIDE` — and the same necessity:
+    /// a scan test that left this unbound would read the DEVELOPER'S real
+    /// opencode history, making its row counts a fact about that machine.
+    static OPENCODE_STORE_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Test-only seam: fixture the SQLite store `scan_opencode` reads, for the
+/// calling thread only. See `set_claude_projects_root_for_test` for why this is
+/// a real `pub` function rather than `#[cfg(test)]`.
+#[doc(hidden)] // pub for integration tests
+pub fn set_opencode_store_for_test(path: Option<PathBuf>) {
+    OPENCODE_STORE_OVERRIDE.with(|c| *c.borrow_mut() = path);
+}
+
+/// The store an `opencode` launched from THIS process's environment would use,
+/// as a pure function of the three inputs the vendor's own resolution reads —
+/// so both branches are testable without `std::env::set_var`, which is
+/// unsynchronized mutation racing every other test thread in the binary.
+///
+/// A faithful port of `database.ts::path()` + `global.ts`'s `Path.data`
+/// (`SOURCE-VERIFIED`, `anomalyco/opencode@f67e80c2`, recorded on #722's
+/// slice-V memo §1a): `OPENCODE_DB` wins — absolute (or `:memory:`) as-is, a
+/// bare name resolved under the data directory — and otherwise the store is
+/// `<xdgData>/opencode/opencode.db`, where `xdgData` is `XDG_DATA_HOME` or
+/// `<home>/.local/share` (that fallback on Windows too, which is why the
+/// observed path there is `%USERPROFILE%\.local\share\opencode`).
+///
+/// **The default channel's file, and only that one.** opencode names the
+/// database after its installation channel (`opencode-<channel>.db` outside
+/// `latest`/`beta`/`prod`, same source). This does not go hunting for those
+/// siblings, because a listed row is only worth showing if the resume command
+/// beside it works — and that command is a bare `opencode`, which reads
+/// exactly the file resolved here. Rows out of another channel's store would
+/// offer the human sessions their `opencode` cannot open.
+#[doc(hidden)] // pub for integration tests
+pub fn opencode_store_from(
+    db_flag: Option<&str>,
+    xdg_data_home: Option<&Path>,
+    home: Option<&Path>,
+) -> Option<PathBuf> {
+    let data = || {
+        match xdg_data_home {
+            Some(p) if !p.as_os_str().is_empty() => Some(p.to_path_buf()),
+            _ => home.map(|h| h.join(".local").join("share")),
+        }
+        .map(|d| d.join("opencode"))
+    };
+    match db_flag.map(str::trim).filter(|f| !f.is_empty()) {
+        // `is_absolute() || has_root()`, not `is_absolute()` alone, because
+        // the vendor's test is Node's `path.isAbsolute` — which on Windows
+        // calls a ROOTED path absolute (`\opencode.db`, drive-relative but
+        // rooted) as well as a fully-qualified one. Rust's `is_absolute`
+        // requires both a prefix and a root, so it alone would resolve such a
+        // value UNDER the data directory while opencode used it as given, and
+        // loomux would list a store the human's own CLI never writes to.
+        // `has_root` adds exactly that case and nothing else (`C:opencode.db`,
+        // which Node also calls relative, stays relative). On unix the two are
+        // the same predicate, so this changes nothing there.
+        Some(f) if f == ":memory:" || Path::new(f).is_absolute() || Path::new(f).has_root() => {
+            Some(PathBuf::from(f))
+        }
+        Some(f) => Some(data()?.join(f)),
+        None => Some(data()?.join("opencode.db")),
+    }
+}
+
+fn opencode_store_path() -> Option<PathBuf> {
+    if let Some(p) = OPENCODE_STORE_OVERRIDE.with(|c| c.borrow().clone()) {
+        return Some(p);
+    }
+    opencode_store_from(
+        std::env::var("OPENCODE_DB").ok().as_deref(),
+        std::env::var("XDG_DATA_HOME").ok().map(PathBuf::from).as_deref(),
+        dirs::home_dir().as_deref(),
+    )
 }
 
 // ---------- launch-intent store: autopilot posture (#456, generalized #457) ----------
@@ -786,6 +891,21 @@ fn build_resume_command(cli: &str, session_id: &str, cwd: &str, store: &LaunchIn
                 base
             }
         }
+        // #722 slice C2. `--session <id>` CONTINUES an existing session — the
+        // same flag, in the same space form, `build_agent_command`'s opencode
+        // arm already emits on a resume (opencode has no `--session-id` to
+        // pre-assign an id with, so there is nothing else it could be).
+        //
+        // No posture arm, and that is #460's rule rather than an omission:
+        // nothing records a launch intent for an opencode pane
+        // (`record_claude_launch_posture`/`record_copilot_launch_posture` are
+        // the only two), so there is no unambiguous ON record to honor and a
+        // bare resume is the smaller grant. `--auto` is never inferred here.
+        //
+        // Without this arm the `_` fallback below would answer for opencode —
+        // emitting `claude --resume ses_…`, i.e. the WRONG CLI handed an id
+        // belonging to another vendor's store.
+        "opencode" => format!("opencode --session {session_id}"),
         _ => {
             let base = format!("claude --resume {session_id}");
             if claude_posture_in(store, session_id) == Some(true) {
@@ -1197,6 +1317,58 @@ fn to_session_info(source: &str, e: &IndexEntry, intent: &LaunchIntentStore) -> 
     }
 }
 
+/// The newest `limit` opencode sessions in the human's own store, as rows the
+/// Sessions tab can show (#722 slice C2).
+///
+/// **No candidates, no index entry — deliberately.** `session-index.json`
+/// (#493) exists to avoid re-reading the head of a TRANSCRIPT that hasn't
+/// changed, a per-file cost this source does not have: one indexed `SELECT`
+/// returns every column these rows need, for every session, at once. Reusing
+/// the index here would also be wrong-shaped rather than merely unnecessary —
+/// it is keyed by file PATH and validated by `(mtime, len)`, and every session
+/// in this store shares one file whose mtime moves on every write, so all N
+/// rows would collide on a single key and invalidate together on any one
+/// session's turn.
+///
+/// Reads through `opencodedb::open_readonly` — the one sanctioned path to this
+/// store (slices B and C), never a second connection mechanism. Every
+/// `Unavailable` degrades to no rows: an absent store (opencode has never run
+/// here) reads exactly like a missing `~/.claude/projects`, and a drifted
+/// schema is a vendor's internal detail moving under us, never a reason to
+/// fail a scan that has two other sources to report.
+fn scan_opencode(limit: usize, intent: &LaunchIntentStore) -> Vec<SessionInfo> {
+    let Some(db) = opencode_store_path() else {
+        return Vec::new();
+    };
+    let Ok(rows) = crate::opencodedb::recent_sessions(&db, limit) else {
+        return Vec::new();
+    };
+    rows.into_iter()
+        .map(|r| {
+            let title = tidy_title(&r.title, 90);
+            SessionInfo {
+                resume_command: build_resume_command("opencode", &r.id, &r.directory, intent),
+                id: r.id,
+                source: "opencode".to_string(),
+                // `title` is `NOT NULL` but a session titles itself from its
+                // first turn, so a store can hold a genuinely empty one —
+                // named the same way an untitled copilot session is.
+                title: if title.is_empty() { "OpenCode session".to_string() } else { title },
+                cwd: r.directory,
+                modified_ms: r.updated_ms,
+                // A session in the GLOBAL store was written by a pane that had
+                // no `OPENCODE_DB` — which is to say never by a loomux group
+                // agent, since every one of those is pointed at its group's own
+                // file. So there is no orchestration identity to be found here.
+                // Unlike copilot's `None` (a transcript this scanner simply
+                // doesn't parse), that is structural, not a gap.
+                orch_role: None,
+                orch_group: None,
+            }
+        })
+        .collect()
+}
+
 /// What one scan actually did. Exposed (via `list_sessions_for_test`) so the
 /// #493 tests can pin the SHAPE of the work — "no file was opened twice", "the
 /// parse count is bounded by the row limit, not by history" — instead of
@@ -1212,10 +1384,17 @@ pub struct ScanStats {
     pub parsed: usize,
     /// Files served from the persisted index without being opened.
     pub reused: usize,
+    /// Root sessions read out of opencode's store this scan, before the row
+    /// limit's final cut (#722 slice C2). Counted apart from `files_seen`/
+    /// `parsed`/`reused` because none of those three describe it: it is one
+    /// query, not a file per session, so there is nothing to head-parse and
+    /// nothing an index could save.
+    pub opencode: usize,
 }
 
-/// Scan of every recorded Claude/Copilot session on disk, bounded two ways
-/// (#493).
+/// Scan of every session this machine has recorded — claude's and copilot's
+/// files, plus opencode's store (#722 slice C2, merged at the end) — with the
+/// file half bounded two ways (#493).
 ///
 /// The cost this replaces (issue #342, measured in #493): a machine with a long
 /// orchestration history accumulates thousands of `.claude/projects/**/*.jsonl`
@@ -1296,13 +1475,30 @@ fn scan_sessions() -> (Vec<SessionInfo>, ScanStats) {
     // Nothing parsed AND the same entry count means the index on disk already
     // equals what we'd write (the only way an entry can differ is by having been
     // re-parsed), so a steady-state launch does no write at all. The index is
-    // also self-pruning: it only ever holds the rows this scan returned, so it
-    // can't grow past `LIST_LIMIT` however long the history gets.
+    // also self-pruning: it only ever holds the file-backed rows this scan
+    // considered, so it can't grow past `LIST_LIMIT` however long the history
+    // gets. (A row the opencode merge below pushes past the limit still keeps
+    // its entry — the index caches a PARSE, and that parse is still valid; what
+    // it must never do is grow without bound, which it still cannot.)
     if parsed > 0 || fresh.len() != cached.len() {
         save_session_index(fresh);
     }
 
-    let stats = ScanStats { files_seen, rows: out.len(), parsed, reused };
+    // #722 slice C2. Merged by a re-sort rather than appended, so `LIST_LIMIT`
+    // keeps meaning what it has always meant: the newest N sessions ON THIS
+    // MACHINE, whichever CLI wrote them — not N per source, which would let a
+    // long opencode history push out claude rows newer than every row it added
+    // (or vice versa). The sort is stable and `out` is already newest-first, so
+    // rows that tie on a timestamp keep exactly the order they had before this
+    // source existed.
+    let opencode = scan_opencode(LIST_LIMIT, &intent);
+    let opencode_rows = opencode.len();
+    out.extend(opencode);
+    out.sort_by(|a, b| b.modified_ms.cmp(&a.modified_ms));
+    out.truncate(LIST_LIMIT);
+
+    let stats =
+        ScanStats { files_seen, rows: out.len(), parsed, reused, opencode: opencode_rows };
     (out, stats)
 }
 
@@ -1322,11 +1518,13 @@ fn list_sessions_sync() -> Vec<SessionInfo> {
     crate::obs::breadcrumb(
         "startup",
         &format!(
-            "list_sessions: {} file(s) seen, {} listed ({} parsed, {} from index) in {:?}",
+            "list_sessions: {} file(s) seen, {} listed ({} parsed, {} from index, \
+             {} from opencode's store) in {:?}",
             s.files_seen,
             s.rows,
             s.parsed,
             s.reused,
+            s.opencode,
             start.elapsed()
         ),
     );

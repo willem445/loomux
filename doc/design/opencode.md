@@ -636,6 +636,54 @@ the session made from evidence nobody read. Recurrence is unaffected either way:
 read, so a missing store shrinks `sessions_scanned` rather than failing another
 agent's digest.
 
+## The Sessions browser (#722 slice C2)
+
+The sidebar lists resumable sessions from every CLI's own store, and opencode's
+is a database rather than a directory of transcripts. Three decisions carry the
+weight.
+
+**It reads the human's GLOBAL store, not any group's.** `OPENCODE_DB` is set
+per group, so a group's sessions live in `opencode_db_path(group)` and a *solo*
+pane — the only kind this sidebar can reopen at all — writes where an unadorned
+`opencode` writes. Which file that is, is the vendor's own resolution ported
+verbatim (`sessions::opencode_store_from`): `OPENCODE_DB` first (absolute as-is,
+a bare name under the data directory), otherwise `<xdgData>/opencode/opencode.db`
+with `xdgData` = `XDG_DATA_HOME` or `<home>/.local/share` — that fallback on
+Windows too, which is why the observed path there is
+`%USERPROFILE%\.local\share\opencode`. Only the default channel's file is read:
+a listed row is worth showing only if the resume command beside it works, and
+that command is a bare `opencode`, which reads exactly that file. Group sessions
+are deliberately absent — they are reopened *through the group*, with its
+roster, board and MCP identity, never as a bare `--session` pane.
+
+**No index entry, and that is not an oversight.** `session-index.json` (#493)
+exists to avoid re-reading the head of a transcript that has not changed. There
+is no such cost here — one indexed `SELECT` returns every column, for every
+session, at once — and reusing the index would be actively wrong-shaped: it is
+keyed by file path and validated by `(mtime, len)`, so all N sessions would
+collide on one key and invalidate together whenever any one of them was
+written. The `LIST_LIMIT` cut is pushed into the SQL instead, and the merge is
+a re-sort of the whole list rather than an append, so the limit keeps meaning
+"the newest N sessions on this machine" rather than N per source.
+
+**The frontend widened in the same change, because a row is not typed on the
+wire.** `SessionInfo.source` is a plain string over IPC: the backend's set and
+the frontend's `"claude" | "copilot"` union were never checked against each
+other, so a third scanner shipping alone would have been silently mis-handled,
+not rejected — an opencode session named `copilot · …` in the pane title, and
+resumed with `claude --resume ses_…`. What moved with it: the reconciler's
+`Cli`, `Pane.agentCli` (now `panerestore::sessionCliFromCommand`, so the set is
+spelled once), and `agentResumeCommand`/`agentFreshCommand`, which have to know
+that opencode names a session with `--session` and has no flag that
+pre-assigns one — so its "start fresh with the same identity" arm keeps no
+identity, because there is none to keep.
+
+`panerestore`'s `SoloCli` deliberately did **not** move. It is bound to
+`CliCaps::mcp_argv_seam`, not to what loomux can scan: opencode has no argv MCP
+seam, a solo opencode pane is delivery-only from birth, and its recorded
+command carries no identity flags for `stripSoloMcpFlags` to excise. That type
+widens when the seam arrives, not when the sidebar learns to list the CLI.
+
 ## Deliberately not done
 
 - **Reasoning parts in the digest.** OpenCode stores the model's reasoning as

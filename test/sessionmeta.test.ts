@@ -2,7 +2,7 @@
 // `npm test`.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { taskSummary, repoBranchLine, prLabel } from "../src/sessionmeta.ts";
+import { taskSummary, repoBranchLine, prLabel, restoredPaneName, sessionBadgeLabel } from "../src/sessionmeta.ts";
 import type { SessionRoleInfo } from "../src/orchestration.ts";
 
 const role = (over: Partial<SessionRoleInfo> = {}): SessionRoleInfo => ({
@@ -70,4 +70,37 @@ test("prLabel passes through an already-shaped PR reference verbatim", () => {
 test("prLabel is null when no PR is recorded yet", () => {
   assert.equal(prLabel(role({ pr: null })), null);
   assert.equal(prLabel(undefined), null);
+});
+
+// ---------- #722: the restored pane's name ----------
+
+test("restoredPaneName names the CLI the row actually came from", () => {
+  assert.equal(restoredPaneName("claude", "fix the login bug"), "claude · fix the login bug");
+  assert.equal(restoredPaneName("copilot", "fix the login bug"), "copilot · fix the login bug");
+  // The one this replaced a two-arm ternary for: with `source` read instead of
+  // branched on, a third scanner's rows are named correctly the day they
+  // arrive rather than inheriting whichever CLI sat in the else-branch — which
+  // is how an opencode session would have opened a pane called "copilot · …".
+  assert.equal(restoredPaneName("opencode", "fix the login bug"), "opencode · fix the login bug");
+});
+
+test("restoredPaneName cuts a long title with an ellipsis, keeping the CLI prefix intact", () => {
+  const out = restoredPaneName("opencode", "y".repeat(200));
+  assert.ok(out.startsWith("opencode · "), "the CLI must survive the truncation");
+  assert.ok(out.endsWith("…"), "a cut title must say it was cut");
+  assert.equal(out, `opencode · ${"y".repeat(34)}…`);
+});
+
+test("restoredPaneName leaves a title that fits exactly alone — no ellipsis on a non-cut", () => {
+  const exact = "z".repeat(34);
+  assert.equal(restoredPaneName("claude", exact), `claude · ${exact}`);
+});
+
+test("sessionBadgeLabel names the row's own CLI, whichever it is", () => {
+  assert.equal(sessionBadgeLabel("claude"), "CLAUDE");
+  assert.equal(sessionBadgeLabel("copilot"), "COPILOT");
+  // The sidebar's own version of restoredPaneName's bug: a two-arm ternary
+  // labelled an opencode row COPILOT — the badge asserting one CLI while the
+  // resume command underneath it named another.
+  assert.equal(sessionBadgeLabel("opencode"), "OPENCODE");
 });

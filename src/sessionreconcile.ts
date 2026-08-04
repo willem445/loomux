@@ -26,7 +26,13 @@
 // candidate — for any pane it touches — is refused outright rather than
 // guessed. Worst case after a refusal is exactly today's status quo.
 
-export type Cli = "claude" | "copilot";
+/** The CLIs a `listSessions()` row can name (`SessionInfo["source"]`) — the
+ *  set this module matches panes against. `opencode` joined it with #722's
+ *  scanner: its rows arrive with a cwd and a session id like any other, so the
+ *  matching and refusal logic below applies unchanged, and leaving it out
+ *  would silently make every opencode pane unadoptable while the sidebar
+ *  listed the very session it should have adopted. */
+export type Cli = "claude" | "copilot" | "opencode";
 
 /** Just enough of a `listSessions()` row to match against, for both functions
  *  below. main.ts maps the backend's `SessionInfo[]` (source→cli, modified_ms

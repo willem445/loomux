@@ -35,6 +35,39 @@ export function repoBranchLine(role: SessionRoleInfo | undefined): string | null
   return null;
 }
 
+/** How much of a session's title fits in a restored pane's name before it is
+ *  cut. Unchanged from the inline value this replaced. */
+const MAX_PANE_TITLE_LEN = 34;
+
+/** The pane name a Sessions-tab restore opens with: the CLI that owns the
+ *  session, then its title.
+ *
+ *  Derived from the row's own `source` rather than a per-CLI branch (#722).
+ *  What this replaced was `s.source === "claude" ? "claude · " : "copilot · "`,
+ *  which was correct only while there were exactly two sources — the moment
+ *  the backend's scanner learned a third, that ternary labelled every opencode
+ *  session "copilot · …": a pane naming the wrong CLI, with nothing to catch
+ *  it, since `source` crosses IPC as a plain string. Reading the field means a
+ *  fourth source is named correctly on arrival instead of silently joining
+ *  whichever CLI sits in the else-branch. */
+export function restoredPaneName(source: string, title: string): string {
+  const short = title.length > MAX_PANE_TITLE_LEN ? `${title.slice(0, MAX_PANE_TITLE_LEN)}…` : title;
+  return `${source} · ${short}`;
+}
+
+/** The CLI badge on a session row.
+ *
+ *  Read off the row, not branched on it (#722) — the same correction
+ *  `restoredPaneName` above carries, and the same bug it had:
+ *  `s.source === "claude" ? "CLAUDE" : "COPILOT"` labelled every session that
+ *  was neither one **COPILOT**, so the sidebar would have asserted the wrong
+ *  CLI about a row whose resume command names a different one. A source with
+ *  no styling rule gets the base badge, which is a plain chip — legible, just
+ *  uncoloured — never a wrong name. */
+export function sessionBadgeLabel(source: string): string {
+  return source.toUpperCase();
+}
+
 /** The PR chip label, or null when no PR is known yet. A bare number (how
  *  the board stores most PR refs) renders as "#123"; anything already
  *  prefixed or otherwise shaped is shown verbatim. */

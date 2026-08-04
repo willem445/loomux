@@ -986,6 +986,11 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 }
 .session-badge.claude { background: #382d20; color: #e8a865; }
 .session-badge.copilot { background: #20303c; color: #6cb6ff; }
+/* #722: a third session source. Teal, so it reads apart from copilot's blue
+   at a glance in a mixed list — and distinct from the role/PR chips, which
+   sit on the same row and mean something else entirely. A source with no rule
+   here still renders as the base chip above: uncoloured, never unlabelled. */
+.session-badge.opencode { background: #1f3330; color: #7fd6c0; }
 .session-badge.orch-role.orchestrator { background: #2a2440; color: #c7a9ff; }
 .session-badge.orch-role.worker { background: #1e2a3c; color: #8db0ff; }
 .session-badge.orch-role.reviewer { background: #203527; color: #b4e878; }
