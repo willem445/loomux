@@ -2142,6 +2142,55 @@ fn mcp_spawn_reply_says_when_a_persona_tools_list_stripped_the_loomux_server() {
 }
 
 
+#[test]
+fn a_tools_frontmatter_is_read_in_every_yaml_shape_a_real_agent_file_uses() {
+    // Detection is only as good as the parse behind it. All three shapes are
+    // valid YAML and all three appear in real `.github/agents/*.md` files; a
+    // reader that handled only the flow sequence would silently score a block
+    // list as "no tools:" — i.e. as "grants everything" — which is precisely the
+    // false negative #802 cannot afford a second time.
+    let flow = profiles::parse_profile("a", "---\nname: a\ndescription: d\ntools: [read, edit]\n---\nbody").unwrap();
+    let quoted = profiles::parse_profile("a", "---\nname: a\ndescription: d\ntools: [\"read\", \"edit\"]\n---\nbody").unwrap();
+    let scalar = profiles::parse_profile("a", "---\nname: a\ndescription: d\ntools: read, edit\n---\nbody").unwrap();
+    let block = profiles::parse_profile("a", "---\nname: a\ndescription: d\ntools:\n  - read\n  - edit\n---\nbody").unwrap();
+    for (label, p) in [("flow", &flow), ("quoted", &quoted), ("scalar", &scalar), ("block", &block)] {
+        assert_eq!(
+            p.tools.as_deref(),
+            Some(["read".to_string(), "edit".to_string()].as_slice()),
+            "{label} shape must read as the same two tools"
+        );
+        assert!(!p.grants_mcp_server("loomux"), "{label}: neither entry grants loomux");
+        assert!(!p.mentions_mcp_server("loomux"), "{label}: nor mentions it");
+    }
+
+    // Absent vs. empty are DIFFERENT, and the difference is a capability:
+    // absent is copilot's documented all-tools default, empty is its documented
+    // "disables all tools". Collapsing them into a plain Vec would make the
+    // empty list read as "grants everything" and hide the worst case of all.
+    let absent = profiles::parse_profile("a", "---\nname: a\ndescription: d\n---\nbody").unwrap();
+    assert_eq!(absent.tools, None);
+    assert!(absent.grants_mcp_server("loomux"), "no filter means every tool, loomux's included");
+    let empty = profiles::parse_profile("a", "---\nname: a\ndescription: d\ntools: []\n---\nbody").unwrap();
+    assert_eq!(empty.tools.as_deref(), Some::<&[String]>(&[]));
+    assert!(!empty.grants_mcp_server("loomux"), "an explicit empty list disables everything");
+
+    // A per-tool grant is *mentioned* but not a full grant — the warning says
+    // something different in that case, and it has to be able to tell.
+    let partial = profiles::parse_profile("a", "---\nname: a\ndescription: d\ntools: [\"loomux/report\"]\n---\nbody").unwrap();
+    assert!(!partial.grants_mcp_server("loomux"));
+    assert!(partial.mentions_mcp_server("loomux"));
+
+    // `mcp-servers:` presence is what blocks the rewrite; a file without it must
+    // never be mistaken for one that has it.
+    let byo = profiles::parse_profile(
+        "a",
+        "---\nname: a\ndescription: d\nmcp-servers:\n  custom:\n    command: node\n---\nbody",
+    )
+    .unwrap();
+    assert!(byo.has_mcp_servers);
+    assert!(!absent.has_mcp_servers);
+}
+
 // ───── #417 correction round 5, promoted to an enum in round 8: contract_carrier ─────
 
 #[test]

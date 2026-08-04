@@ -4583,6 +4583,43 @@ pub const GEMINI_ATTENDED_FLAGS: &str = "--approval-mode default";
 /// the string that was a literal in three places is now one constant.
 pub const LOOMUX_MCP_SERVER: &str = "loomux";
 
+/// The `tools:` entries a generated Copilot agent file adds so loomux's own MCP
+/// server survives a persona's tool filter (#802).
+///
+/// `loomux/*` is the documented spelling: the [custom-agents configuration
+/// reference](https://docs.github.com/en/copilot/reference/custom-agents-configuration)'s
+/// *Tools* section says *"You can also explicitly enable all tools from a
+/// specific MCP server using `some-mcp-server/*`"*, alongside *"Tool names from
+/// specific MCP servers can be prefixed with the server name followed by a
+/// `/`"*.
+///
+/// The bare `loomux` alongside it is a **deliberate hedge, and free**. The same
+/// section states *"All unrecognized tool names are ignored"*, so an entry the
+/// CLI does not understand costs nothing — while the failure it insures against
+/// is #802 recurring silently for a fourth round because the one documented
+/// spelling turned out not to be what the 1.0.x CLI matches on (the CLI's own
+/// `--allow-tool` takes the bare server name, so both spellings are live in
+/// Copilot's vocabulary). Drop the bare form once a live run confirms which one
+/// Copilot honors — the answer is a live observation loomux cannot make for
+/// itself (CLAUDE.md constraint 3).
+pub const COPILOT_LOOMUX_TOOL_GRANTS: [&str; 2] = ["loomux/*", LOOMUX_MCP_SERVER];
+
+/// A persona's `tools:` list with [`COPILOT_LOOMUX_TOOL_GRANTS`] appended —
+/// the user's own scoping intent preserved verbatim, widened by exactly the one
+/// server loomux needs the delegate to be able to call (#802).
+///
+/// Order matters only for readability; duplicates are dropped so re-rendering a
+/// file that already grants the server is idempotent.
+fn copilot_tools_with_loomux(tools: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = tools.to_vec();
+    for grant in COPILOT_LOOMUX_TOOL_GRANTS {
+        if !out.iter().any(|t| t == grant) {
+            out.push(grant.to_string());
+        }
+    }
+    out
+}
+
 /// `{ "loomux": <server> }` — the one-entry server map every CLI's generated
 /// config wraps its server entry in, keyed by [`LOOMUX_MCP_SERVER`] so the name
 /// on argv (`--allowed-mcp-server-names loomux`, `--allow-tool loomux`,
@@ -8615,6 +8652,16 @@ pub struct PersonaInject {
     /// contract read back from the instructions file — the true fallback,
     /// nothing else is durable).
     pub contract_carrier: ContractCarrier,
+    /// Human-facing notices this compilation produced (#802), surfaced in the
+    /// `spawn_agent` reply as well as in the audit log.
+    ///
+    /// The audit alone was not enough, and that is the whole lesson of #802:
+    /// the failure it describes — a persona's `tools:` filter silently
+    /// stripping loomux's own MCP server from the delegate — cost three rounds
+    /// precisely because nothing said it out loud at spawn time. Whoever asked
+    /// for the spawn is the party that can fix the file, so the notice goes
+    /// back to them and not only to a log nobody reads mid-incident.
+    pub warnings: Vec<String>,
 }
 
 /// A block's persona after the `prompt:` / `profile:` sources have been
@@ -8639,6 +8686,107 @@ pub struct ResolvedPersona {
     /// Set when the persona came from a user-authored `.github/agents/*.md`,
     /// which is the only thing Copilot's native `--agent` can resolve.
     pub copilot_native: bool,
+    /// The persona file's own `tools:` list (#802), `None` when it declares
+    /// none. Copilot's `tools:` is a FILTER over built-in AND MCP tools, so a
+    /// list that omits loomux's server strips the delegate's report channel —
+    /// see [`profiles::AgentProfile::tools`] and `persona_inject`.
+    pub copilot_tools: Option<Vec<String>>,
+    /// Whether the persona file declares its own `mcp-servers:` block (#802) —
+    /// the one case where loomux must not repair a `tools:` gap by re-pointing
+    /// `--agent` at a generated copy. See
+    /// [`profiles::AgentProfile::has_mcp_servers`].
+    pub copilot_has_mcp_servers: bool,
+}
+
+impl ResolvedPersona {
+    /// Whether this persona's own `tools:` filter would leave loomux's MCP
+    /// tools available to the agent Copilot launches from it (#802). Always
+    /// true for a persona that declares no `tools:` — Copilot's documented
+    /// default is every tool.
+    pub fn grants_loomux_tools(&self) -> bool {
+        profiles::tools_grant_mcp_server(self.copilot_tools.as_deref(), LOOMUX_MCP_SERVER)
+    }
+
+    /// Whether the `tools:` list names loomux's server at all, including a
+    /// single-tool grant like `loomux/report` (#802). Wording only — see
+    /// [`profiles::AgentProfile::mentions_mcp_server`].
+    pub fn mentions_loomux_tools(&self) -> bool {
+        profiles::tools_mention_mcp_server(self.copilot_tools.as_deref(), LOOMUX_MCP_SERVER)
+    }
+}
+
+/// The spawn-time notice for a persona whose `tools:` filter drops loomux's MCP
+/// server (#802).
+///
+/// It names the block, the persona, what the list says, and the exact line to
+/// add — because the failure this describes is indistinguishable, from inside
+/// the delegate's pane, from "loomux is broken". Three rounds of #802 went by
+/// on that ambiguity.
+/// What loomux actually did about a persona's `tools:` gap (#802) — the three
+/// outcomes [`copilot_tools_gap_warning`] has to be able to tell apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[doc(hidden)] // pub for integration tests
+pub enum ToolsGapAction {
+    /// `--agent` was re-pointed at a loomux-generated copy carrying the same
+    /// list plus the loomux grant. The spawn works; the repo file still needs
+    /// the one-line fix.
+    Repaired,
+    /// Left native on purpose: the persona declares its own `mcp-servers:`, and
+    /// a generated copy would drop them. The delegate is genuinely broken until
+    /// a human edits the file.
+    KeptNativeForMcpServers,
+    /// The copy could not be written (unwritable agents dir, or a body over the
+    /// documented size cap), so no `--agent` file is in play at all.
+    RepairFailed,
+}
+
+#[doc(hidden)] // pub for integration tests
+pub fn copilot_tools_gap_warning(
+    block_id: &str,
+    persona: &ResolvedPersona,
+    action: ToolsGapAction,
+) -> String {
+    let listed = persona.copilot_tools.clone().unwrap_or_default();
+    let shown = if listed.is_empty() {
+        "an empty list (which Copilot documents as \"disables all tools\")".to_string()
+    } else {
+        format!("[{}]", listed.join(", "))
+    };
+    let partial = if persona.mentions_loomux_tools() {
+        format!(
+            " It grants some {LOOMUX_MCP_SERVER} tools but not all of them, so the delegate \
+             would be missing whichever ones it did not name."
+        )
+    } else {
+        String::new()
+    };
+    let tail = match action {
+        ToolsGapAction::Repaired => format!(
+            "loomux launched it from a generated copy of that persona carrying the same list \
+             plus \"{}\" instead, so this spawn works — but the repo file is still the one to \
+             fix.",
+            COPILOT_LOOMUX_TOOL_GRANTS.join("\", \""),
+        ),
+        ToolsGapAction::KeptNativeForMcpServers => {
+            "loomux did NOT rewrite it, because the persona declares its own `mcp-servers:` \
+             block and a generated copy would drop those servers — so THIS DELEGATE CANNOT \
+             CALL loomux until the file is fixed."
+                .to_string()
+        }
+        ToolsGapAction::RepairFailed => {
+            "loomux could not write its generated copy, so this delegate launched with no \
+             agent file at all: it keeps its loomux tools, but the persona reached it as \
+             kickoff text instead of its system prompt."
+                .to_string()
+        }
+    };
+    format!(
+        "block {block_id}: copilot persona \"{}\" declares tools: {shown}, which does not grant \
+         loomux's MCP server. Copilot's `tools:` is a FILTER over built-in AND MCP tools, so the \
+         loomux server loads but none of its tools reach the agent (#802).{partial} Add \
+         \"loomux/*\" to that file's tools: list. {tail}",
+        persona.name,
+    )
 }
 
 /// The durable role CONTRACT for a block (#416): `instructions_body` (the
@@ -8927,6 +9075,17 @@ pub struct OrchRegistry {
     /// the only site that needs this; `register_orchestrator_pane` RETURNS its
     /// request, so its own wiring is already assertable.
     test_spawn_requests: Mutex<HashMap<String, SpawnRequest>>,
+    /// Per-agent notices produced while compiling a spawn (#802), waiting to be
+    /// read ONCE by the `spawn_agent` reply that caused them
+    /// ([`Self::take_spawn_notices`]).
+    ///
+    /// A drain-on-read map rather than a field on [`AgentEntry`] because this is
+    /// news about a *spawn*, not state of an *agent*: it is true exactly once,
+    /// at the moment the orchestrator can still act on it, and nothing later
+    /// re-reads it. Taking it also means the map cannot grow without bound
+    /// across a long-lived group. Same shape as `record_verdict`'s `warnings`
+    /// return, which the `review_verdict` reply already appends as `NOTE:`.
+    spawn_notices: Mutex<HashMap<String, Vec<String>>>,
     port: AtomicU16,
     /// Agent-id counter: `w-3`, `rev-8`, `solo-2`, `orch-1` all mint their
     /// numeric suffix here. **Registry-global, not per-group** — one counter
@@ -19878,6 +20037,7 @@ impl OrchRegistry {
             by_pty: Mutex::new(HashMap::new()),
             pending_binds: Mutex::new(HashMap::new()),
             test_spawn_requests: Mutex::new(HashMap::new()),
+            spawn_notices: Mutex::new(HashMap::new()),
             port: AtomicU16::new(0),
             // Seeded from disk on the first mint, not here — see `seq`'s doc.
             seq: AtomicU32::new(0),
@@ -19973,6 +20133,15 @@ impl OrchRegistry {
     #[doc(hidden)]
     pub fn set_copilot_agents_dir_override(&self, dir: PathBuf) {
         *self.copilot_agents_dir_override.lock_safe() = Some(dir);
+    }
+
+    /// Take (and clear) the notices a spawn produced for `agent_id` (#802).
+    ///
+    /// Empty for the overwhelming majority of spawns. Read once, by the
+    /// `spawn_agent` reply — see [`Self::spawn_notices`].
+    #[doc(hidden)] // pub for mcp.rs and the integration tests
+    pub fn take_spawn_notices(&self, agent_id: &str) -> Vec<String> {
+        self.spawn_notices.lock_safe().remove(agent_id).unwrap_or_default()
     }
 
     /// Point the #417 compact-hook script directory at a specific directory,
@@ -31461,6 +31630,10 @@ impl OrchRegistry {
                 mode: p.mode,
                 allow: p.allow.iter().chain(block.allow.iter()).cloned().collect(),
                 copilot_native: native,
+                // #802: carried, not applied here — `persona_inject` is where
+                // the CLI is known, and this only means anything on copilot.
+                copilot_tools: p.tools.clone(),
+                copilot_has_mcp_servers: p.has_mcp_servers,
             }));
         }
         if let Some(prompt) = block.prompt.as_deref() {
@@ -31480,6 +31653,10 @@ impl OrchRegistry {
                 mode: profiles::ProfileMode::Append,
                 allow: block.allow.clone(),
                 copilot_native: false,
+                // An inline `prompt:` is not a copilot agent file and has no
+                // frontmatter of its own to declare either of these.
+                copilot_tools: None,
+                copilot_has_mcp_servers: false,
             }));
         }
         // No persona, but a block may still carry `allow:` patterns.
@@ -31491,6 +31668,8 @@ impl OrchRegistry {
                 mode: profiles::ProfileMode::Append,
                 allow: block.allow.clone(),
                 copilot_native: false,
+                copilot_tools: None,
+                copilot_has_mcp_servers: false,
             }));
         }
         Ok(None)
@@ -31696,8 +31875,28 @@ impl OrchRegistry {
         // looks at the FIRST `\n---` after the opening one, so a `---`
         // line anywhere inside `body_text` itself is inert.
         let description = format!("loomux {} agent for group {group}", block.id);
+        // #802: `tools:` is emitted ONLY when the persona this copy is made from
+        // declared one. Omitting the key is Copilot's documented "all available
+        // tools", which is what every generated file has always relied on and
+        // what makes the built-in roster work — so a persona with no filter must
+        // keep producing a file with no filter, not one that suddenly enumerates
+        // a list loomux invented. When there IS a list, it is reproduced
+        // verbatim plus `COPILOT_LOOMUX_TOOL_GRANTS`: the user's scoping intent
+        // is preserved and widened by exactly the one server the delegate needs
+        // in order to report at all.
+        let tools_line = match persona.and_then(|p| p.copilot_tools.as_deref()) {
+            Some(tools) => format!(
+                "tools: [{}]\n",
+                copilot_tools_with_loomux(tools)
+                    .iter()
+                    .map(|t| yaml_double_quoted(t))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            None => String::new(),
+        };
         let body = format!(
-            "---\nname: {handle}\ndescription: {}\n---\n{body_text}\n",
+            "---\nname: {handle}\ndescription: {}\n{tools_line}---\n{body_text}\n",
             yaml_double_quoted(&clamp_agent_description(&description))
         );
         let path = dir.join(format!("{handle}{COPILOT_AGENT_FILE_EXT}"));
@@ -31777,7 +31976,69 @@ impl OrchRegistry {
                 }));
             }
             out.extra_allow = keep;
-            if persona.is_some_and(|p| p.copilot_native) {
+            // #802, THE ROOT CAUSE. Copilot's custom-agent `tools:` frontmatter
+            // is a FILTER, not an addition — the custom-agents configuration
+            // reference's *Tools processing* section: "The `tools` list filters
+            // the set of tools that are made available to the agent - whether
+            // built-in or sourced from MCP servers", with "If no tools are
+            // specified, all available tools are enabled".
+            //
+            // So a `.github/agents/*.md` persona carrying `tools: [read, edit]`
+            // strips EVERY loomux MCP tool from the delegate `--agent` launches:
+            // the server still loads (it rides `--additional-mcp-config`, so the
+            // CLI lists it as available) and none of its tools survive the
+            // filter. That is #802's report word for word — "MCP visible but not
+            // usable" — and it is why only workflow blocks with a `profile:`
+            // were affected while the built-in roster was fine: loomux's OWN
+            // generated agent file has never had a `tools:` key, so it inherits
+            // the documented all-tools default.
+            //
+            // Neither `--allow-tool loomux` nor the `permissions-config.json`
+            // approval (#803) can undo it: those grant PERMISSION over what is
+            // available, and this decides what is available at all. The only
+            // documented repair is an agent file whose own list carries the
+            // grant — and loomux may never write into the user's
+            // `.github/agents/` (#222). So it re-points `--agent` at a
+            // loomux-owned copy in `~/.copilot/agents/` carrying the user's list
+            // PLUS `COPILOT_LOOMUX_TOOL_GRANTS`, which is the generated-file
+            // path that already exists a few lines below.
+            let tools_gap = persona.filter(|p| !p.grants_loomux_tools());
+            if let Some(p) = tools_gap {
+                let repairable = !p.copilot_has_mcp_servers;
+                let listed = p.copilot_tools.clone().unwrap_or_default();
+                self.audit(group, "loomux", "copilot-persona-tools-gap", json!({
+                    "block": block.id,
+                    "persona": p.name,
+                    "tools": listed,
+                    "missing": COPILOT_LOOMUX_TOOL_GRANTS,
+                    "mentions_server": p.mentions_loomux_tools(),
+                    "action": if repairable {
+                        "re-pointed --agent at a loomux-generated copy carrying the same tools plus the loomux grant"
+                    } else {
+                        "left native — the persona declares its own mcp-servers, which a generated copy would drop"
+                    },
+                }));
+                // A persona that also declares `mcp-servers:` is the one case
+                // loomux must NOT rewrite: the generated copy models loomux's
+                // own server and nothing else, so re-pointing `--agent` at it
+                // would silently delete servers the user asked for — trading
+                // this missing-tools bug for a different one. Warn, launch
+                // native as before, and let the human add the one line.
+                if !repairable {
+                    out.warnings.push(copilot_tools_gap_warning(
+                        &block.id,
+                        p,
+                        ToolsGapAction::KeptNativeForMcpServers,
+                    ));
+                    out.copilot_agent = persona.map(|p| p.name.clone());
+                    return out;
+                }
+                // Fall through to the generated-file path below, deliberately
+                // skipping the native early-return even for a `.github/agents/`
+                // persona: `write_copilot_agent_file` carries this persona's own
+                // `tools:` list into the copy, so the user's scoping intent is
+                // preserved and only the loomux server is added to it.
+            } else if persona.is_some_and(|p| p.copilot_native) {
                 // Unchanged (#222): a user-authored `.github/agents/*.md`
                 // persona reaches Copilot by pointing `--agent` at the exact
                 // file loomux read and kind-checked. Synthesizing a wrapper
@@ -31822,6 +32083,20 @@ impl OrchRegistry {
                         }
                     }
                 }
+            }
+            // #802: the gap notice is worded from what actually happened, not
+            // from what was intended — the write above can still fail, and a
+            // warning claiming a repair that never landed is worse than none.
+            if let Some(p) = tools_gap {
+                out.warnings.push(copilot_tools_gap_warning(
+                    &block.id,
+                    p,
+                    if out.copilot_agent.is_some() {
+                        ToolsGapAction::Repaired
+                    } else {
+                        ToolsGapAction::RepairFailed
+                    },
+                ));
             }
             return out;
         }
@@ -32837,6 +33112,16 @@ impl OrchRegistry {
         let instructions_body = self.render_block_instructions(&group, &block, persona.as_ref(), &vars);
         let contract = block_contract_text(&instructions_body, persona.as_ref());
         let inject = self.persona_inject(group_id, &block, &cli, persona.as_ref(), &contract);
+        // #802: anything `persona_inject` had to say about this block's persona
+        // goes back to whoever asked for the spawn, not only to the audit log.
+        // Stashed here (rather than returned) because `spawn_agent_ex`'s return
+        // value is the agent record every caller already expects — see
+        // `spawn_notices`.
+        if !inject.warnings.is_empty() {
+            self.spawn_notices
+                .lock_safe()
+                .insert(agent_id.clone(), inject.warnings.clone());
+        }
 
         // #267: `role.containment()` rides in because a gemini agent's deny
         // rules ARE its config file (the policy engine is the only surface

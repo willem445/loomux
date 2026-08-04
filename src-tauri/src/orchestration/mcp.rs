@@ -1066,8 +1066,20 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                 .as_deref()
                 .map(|s| format!("Session {s}."))
                 .unwrap_or_else(|| "Session id will appear in list_agents once Copilot initializes.".into());
+            // #802: a persona whose `tools:` filter would have stripped loomux's
+            // own MCP tools from this delegate says so HERE, in the reply to the
+            // spawn that caused it — the orchestrator is the party that can
+            // route it to the human, and a delegate silently unable to `report`
+            // is indistinguishable from loomux being broken. Same `NOTE:` shape
+            // `review_verdict` already uses for what it could not sample.
+            let notices = reg.take_spawn_notices(&a.id);
+            let noted = if notices.is_empty() {
+                String::new()
+            } else {
+                format!(" NOTE: {}", notices.join(" "))
+            };
             Ok(format!(
-                "spawned {} (\"{}\", block {}, {:?}){}. {} It will report when ready.",
+                "spawned {} (\"{}\", block {}, {:?}){}. {} It will report when ready.{noted}",
                 a.id,
                 a.name,
                 a.block,

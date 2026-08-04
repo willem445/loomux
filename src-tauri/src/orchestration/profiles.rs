@@ -35,7 +35,7 @@
 //! ---
 //! name: worker
 //! description: Repo-specific worker persona.
-//! tools: [read, edit, shell]      # copilot-native; loomux ignores it
+//! tools: [read, edit, shell]      # copilot-native; loomux READS it (see below)
 //! model: opus                     # copilot-native; loomux ignores it (see below)
 //! # loomux extensions:
 //! kind: worker                    # compatibility CHECK against the block's kind
@@ -44,6 +44,26 @@
 //! ---
 //! <persona instructions>
 //! ```
+//!
+//! **`tools:` is copilot's, but loomux cannot ignore it (#802).** It is a
+//! FILTER, not an addition. Per GitHub's [custom-agents configuration
+//! reference](https://docs.github.com/en/copilot/reference/custom-agents-configuration),
+//! *Tools processing*: *"The `tools` list filters the set of tools that are made
+//! available to the agent - whether built-in or sourced from MCP servers"*, and
+//! *"If no tools are specified, all available tools are enabled"*. So a persona
+//! file carrying `tools: [read, edit]` and pointed at by a `cli: copilot` block
+//! silently strips **loomux's own MCP tools** from the delegate it launches: the
+//! server still loads (it rides `--additional-mcp-config`, so the CLI lists it)
+//! and every one of its tools is filtered out — an agent that cannot `report`,
+//! cannot read the task board, and cannot be steered. That is the live failure
+//! #802 reports, and it is invisible from argv, which is why the list is parsed
+//! here now instead of being skipped as "copilot's business".
+//!
+//! What loomux does about it lives in `persona_inject`/`write_copilot_agent_file`
+//! (`mod.rs`): it never edits the user's file (#222), it re-points `--agent` at a
+//! loomux-owned copy carrying the SAME list plus the loomux grant. The grant
+//! spelling is the documented one: *"You can also explicitly enable all tools
+//! from a specific MCP server using `some-mcp-server/*`"*.
 //!
 //! **`model:` is not a loomux knob.** Copilot reads it itself when it loads the
 //! file via `--agent`; loomux takes the model from the *block* (`model:` in
@@ -122,6 +142,130 @@ pub struct AgentProfile {
     /// Copilot custom-agent name (`--agent <name>`); defaults to `name`, which
     /// Copilot resolves against the same `.github/agents` files.
     pub copilot_agent: Option<String>,
+    /// The file's `tools:` list, verbatim (#802). `None` = the key is absent,
+    /// which Copilot documents as "all available tools"; `Some(vec![])` = an
+    /// explicit `tools: []`, which it documents as "disables all tools" — two
+    /// states an `Option` keeps apart and a plain `Vec` would not.
+    ///
+    /// loomux does not *apply* this (it is Copilot's own filter) but it must
+    /// READ it: see the module docs for why a list that omits loomux's MCP
+    /// server produces a delegate that cannot report.
+    pub tools: Option<Vec<String>>,
+    /// Whether the file declares its own `mcp-servers:` block (#802).
+    ///
+    /// Presence only — loomux neither parses nor reproduces the block. It is
+    /// recorded because it is the one case where loomux must NOT re-point
+    /// `--agent` at a generated copy to repair a `tools:` gap: the copy would
+    /// silently drop MCP servers the user declared, trading one missing-tools
+    /// bug for another. Such a file gets the loud warning and no rewrite.
+    pub has_mcp_servers: bool,
+}
+
+impl AgentProfile {
+    /// Whether this persona's `tools:` filter leaves **every** tool of MCP
+    /// server `server` available to the agent (#802).
+    ///
+    /// True when the key is absent (*"If no tools are specified, all available
+    /// tools are enabled"*), when it carries the `*` wildcard (*"or use `tools:
+    /// ["*"]` to enable all available tools"*), or when it names the server's
+    /// own wildcard (*"You can also explicitly enable all tools from a specific
+    /// MCP server using `some-mcp-server/*`"*) — all three quoted from the
+    /// custom-agents configuration reference's *Tools* section.
+    ///
+    /// A bare `<server>` entry counts too. The reference does not document that
+    /// spelling for `tools:` (it documents it for the CLI's `--allow-tool`), but
+    /// it also says *"All unrecognized tool names are ignored"* — so a user who
+    /// wrote the argv spelling into their agent file has either already granted
+    /// the server or written an inert entry, and in neither case is loomux's
+    /// rewrite the thing that fixes it. Treating it as a grant keeps loomux from
+    /// second-guessing a file that may well be correct on a newer CLI.
+    pub fn grants_mcp_server(&self, server: &str) -> bool {
+        tools_grant_mcp_server(self.tools.as_deref(), server)
+    }
+
+    /// Whether the `tools:` list names `server` at all — including a per-tool
+    /// grant like `loomux/report` (#802).
+    ///
+    /// Only used to word the warning: "your list grants `loomux/report` but not
+    /// the rest" is a different sentence from "your list never mentions loomux",
+    /// and a human chasing this bug deserves the accurate one.
+    pub fn mentions_mcp_server(&self, server: &str) -> bool {
+        tools_mention_mcp_server(self.tools.as_deref(), server)
+    }
+}
+
+/// [`AgentProfile::grants_mcp_server`] over a bare list, so the same rule serves
+/// a parsed profile and a [`ResolvedPersona`](super::ResolvedPersona) (which
+/// carries the list onward to the spawn) without either re-deciding it.
+pub fn tools_grant_mcp_server(tools: Option<&[String]>, server: &str) -> bool {
+    let Some(tools) = tools else { return true };
+    let server_wildcard = format!("{server}/*");
+    tools.iter().any(|t| {
+        let t = t.trim();
+        t == "*" || t == server || t == server_wildcard
+    })
+}
+
+/// [`AgentProfile::mentions_mcp_server`] over a bare list. See
+/// [`tools_grant_mcp_server`].
+pub fn tools_mention_mcp_server(tools: Option<&[String]>, server: &str) -> bool {
+    let Some(tools) = tools else { return false };
+    let prefix = format!("{server}/");
+    tools.iter().any(|t| {
+        let t = t.trim();
+        t == server || t.starts_with(&prefix)
+    })
+}
+
+/// Read a frontmatter `tools:` value into a list (#802).
+///
+/// Three shapes reach this, because all three are valid YAML and real agent
+/// files in the wild use each: a flow sequence (`tools: [read, edit]`, quoted or
+/// not), a bare comma-separated scalar (`tools: read, edit`), and a block
+/// sequence
+///
+/// ```yaml
+/// tools:
+///   - read
+///   - edit
+/// ```
+///
+/// which [`parse_frontmatter`] has already folded into the single value
+/// `"- read - edit"` (it joins continuation lines with a space). The block form
+/// is why this cannot simply split on commas: that form has none. It is detected
+/// by the leading `- ` marker and split on ` - `, which no tool name can contain
+/// — a hyphenated name (`rubber-duck`, `some-mcp-server/*`) has no spaces around
+/// its hyphen, so it survives intact.
+fn parse_tools_value(value: &str) -> Vec<String> {
+    let v = value.trim();
+    let v = v.strip_prefix('[').and_then(|s| s.strip_suffix(']')).unwrap_or(v);
+    let v = v.trim();
+    let parts: Vec<&str> = match v.strip_prefix("- ") {
+        Some(rest) => rest.split(" - ").collect(),
+        None => v.split(',').collect(),
+    };
+    parts.iter().filter_map(|t| sanitize_tool(t)).collect()
+}
+
+/// Tool names are re-emitted by loomux into a generated agent file's YAML
+/// frontmatter (`write_copilot_agent_file`), so strip anything that could break
+/// out of the double-quoted scalar they land in, or out of the flow sequence
+/// that holds them.
+///
+/// Deliberately narrower than [`sanitize_allow`]: these are tool *names* and
+/// namespaced wildcards (`read`, `shell`, `loomux/*`, `azure.ext/some-tool`),
+/// never the parenthesised permission patterns `allow:` carries — and the comma
+/// is dropped rather than kept, because here it is the separator this function's
+/// caller already split on.
+fn sanitize_tool(s: &str) -> Option<String> {
+    let cleaned: String = s
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '*' | '_' | '-' | '.' | '/' | ':'))
+        .collect();
+    (!cleaned.is_empty()).then_some(cleaned)
 }
 
 /// Map a `kind:`/`role:` hint onto a capability class. `None` for a value that
@@ -224,6 +368,8 @@ pub fn parse_profile(stem: &str, text: &str) -> Option<AgentProfile> {
         mode: ProfileMode::Append,
         allow: Vec::new(),
         copilot_agent: None,
+        tools: None,
+        has_mcp_servers: false,
     };
     for (key, value) in parse_frontmatter(front) {
         match key.as_str() {
@@ -246,8 +392,17 @@ pub fn parse_profile(stem: &str, text: &str) -> Option<AgentProfile> {
                 }
             }
             "copilot-agent" | "copilot_agent" => p.copilot_agent = sanitize_name(&value),
-            // tools / agents / target / … are copilot-native; copilot reads
-            // them itself via --agent.
+            // #802: copilot-native, and copilot applies it itself — but it is a
+            // FILTER over every tool including loomux's own MCP server, so
+            // loomux reads it to detect (and repair) a list that would strip
+            // the delegate's ability to report. See the module docs.
+            "tools" => p.tools = Some(parse_tools_value(&value)),
+            // Presence only — see `has_mcp_servers`. `parse_frontmatter` folds
+            // the block's indented children into this value, so an empty value
+            // here still means the key was written.
+            "mcp-servers" | "mcp_servers" => p.has_mcp_servers = true,
+            // agents / target / … are copilot-native; copilot reads them
+            // itself via --agent.
             _ => {}
         }
     }
