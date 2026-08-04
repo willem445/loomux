@@ -100,6 +100,9 @@ use loomux_lib::orchestration::{
     drain_stranded_submit, stranded_admission_gate, stranded_detail, stranded_selfheal_action,
     // #813: a marker that cannot fire must not hold the rest of the pane queue behind it.
     stranded_marker_action, StrandedMarkerAction, StrandedRetireReason,
+    // #825 M2: the badge-honesty matrix, hoisted out of the late monitor so a
+    // raised chip keeps being checked after that monitor's 4h cap.
+    stranded_badge_release, BadgeRelease,
     // #824: the missing half of flush_stranded_text's contract — what deliver_now
     // does when the flush DECLINES and our own text is still in the box.
     stranded_paste_guard, StrandedPasteGuard,
@@ -27225,6 +27228,526 @@ fn a_dismiss_takes_down_one_panes_chip_and_leaves_the_rest_of_the_group_alone() 
         reg.stranded_note(&other.id).and_then(|n| n.blocker),
         Some(StrandedBlocker::Unverifiable),
         "and the other pane's is untouched — nobody has said they saw THAT one"
+    );
+}
+
+// ---- #825 M2: the badge janitor — the honesty check, hoisted ----
+//
+// The gap this closes, precisely. `run_late_confirmation_monitor`'s
+// `KeepWaiting` arm has kept a raised chip honest every 5s since #496 PR-C, so
+// the latch was never really "no release logic exists" — it was that the
+// release logic DIES WITH THE MONITOR at `LATE_MONITOR_MAX_LIFETIME` (4h), and
+// on an idle pane nothing ever looks again. So the fix is a hoist: one matrix
+// (`stranded_badge_release`), one writer (`apply_stranded_verdict`), and two
+// observers that ask it the same question — the monitor while it lives, and
+// `stranded_janitor_pass` for as long as the chip is up.
+//
+// WHAT A CLEAR IS ALLOWED TO REST ON is the whole of this section, and it is
+// #819's bar unchanged: a positive `BoxReading::NotHolding` on the text the
+// ledger still records, AND a human keystroke since our submit. Neither half
+// alone:
+//
+//   - `NotHolding` alone is `StrandedRetireReason::TextGone`, which #819
+//     deliberately declined to clear on — our text left the box with nobody at
+//     the keyboard is exactly `StrandedBlocker::NotHolding`'s own sentence.
+//   - The keystroke alone is #518's phantom, which is why the stamp only ever
+//     NAMES a release a box reading has already licensed.
+//
+// The asymmetry between the two observers is deliberate and load-bearing.
+// `saw_text_in_box` is a fact about the OBSERVER: the monitor watches one
+// delivery continuously and can witness a present→absent transition; the
+// janitor starts on panes whose monitor is already gone and never can, so it
+// clears on the stricter bar instead.
+
+/// The three classes #825 leaves with no release, and their audit tokens.
+const JANITOR_CLASSES: [(StrandedBlocker, &str); 3] = [
+    (StrandedBlocker::NotHolding, "not-holding"),
+    (StrandedBlocker::Unverifiable, "box-unverifiable"),
+    (StrandedBlocker::Exhausted, "heal-budget-spent"),
+];
+
+/// Every class a pane reading must NOT release: the queue and hold classes,
+/// `PauseSuppressed` (a loss that already happened, so no reading of the pane
+/// could ever make it untrue), and the in-flight-heal wording.
+const NOT_THE_JANITORS_BUSINESS: [Option<StrandedBlocker>; 8] = [
+    Some(StrandedBlocker::QueueFull),
+    Some(StrandedBlocker::PauseSuppressed),
+    Some(StrandedBlocker::HumanInput),
+    Some(StrandedBlocker::Question),
+    Some(StrandedBlocker::QuestionStale),
+    Some(StrandedBlocker::QueueNearFull),
+    Some(StrandedBlocker::QueueAtCapacity),
+    None,
+];
+
+#[test]
+fn the_janitor_clears_a_stuck_chip_only_on_819s_human_resolved_bar() {
+    // The cell the whole slice exists for, and the one that has to survive the
+    // monitor: text verifiably gone, a person on record at the keyboard since
+    // our submit. Nothing about this depends on a monitor being alive — that
+    // is the point.
+    for (blocker, token) in JANITOR_CLASSES {
+        assert_eq!(
+            stranded_badge_release(Some(blocker), Some(BoxReading::NotHolding), true, false),
+            BadgeRelease::Clear(StrandedRetireReason::HumanResolved.as_str()),
+            "{token}: a gone text plus a human keystroke is the release #819 already licenses \
+             on the marker path — the badge-only pane is the same pane"
+        );
+    }
+    // The reason string is TAKEN from #819's enum, never spelled again. Two
+    // vocabularies for one fact is how the drainer's retirement and this clear
+    // would come to disagree in a log a human is reading to find out what
+    // happened to their prompt.
+    assert_eq!(StrandedRetireReason::HumanResolved.as_str(), "human-resolved");
+}
+
+#[test]
+fn a_gone_text_with_nobody_at_the_keyboard_re_words_and_never_clears() {
+    // The must-not-clear edge, and #819's declined cell restated where it now
+    // has a second caller. `NotHolding` alone is `TextGone`: our text left the
+    // box and no person is on record, which is precisely what
+    // `StrandedBlocker::NotHolding` already says out loud. Clearing on it would
+    // answer a question loomux cannot answer — and it would turn #828's
+    // remaining false `NotHolding` (a hard mid-word wrap) into a SILENT clear
+    // instead of a wording change.
+    assert_eq!(
+        stranded_badge_release(
+            Some(StrandedBlocker::Unverifiable),
+            Some(BoxReading::NotHolding),
+            false,
+            false,
+        ),
+        BadgeRelease::Reword(StrandedBlocker::NotHolding),
+        "\"we could not read the box\" is a stale sentence about a box we have now read"
+    );
+    assert_eq!(
+        stranded_badge_release(
+            Some(StrandedBlocker::Exhausted),
+            Some(BoxReading::NotHolding),
+            false,
+            false,
+        ),
+        BadgeRelease::Reword(StrandedBlocker::NotHolding),
+        "\"a heal fired and the text still read Holds\" is likewise no longer what we know"
+    );
+    assert_eq!(
+        stranded_badge_release(
+            Some(StrandedBlocker::NotHolding),
+            Some(BoxReading::NotHolding),
+            false,
+            false,
+        ),
+        BadgeRelease::Keep,
+        "already the truest thing available — a re-word to itself would be audit noise"
+    );
+    // Said once more as the property, so a future edit that "simplifies" the
+    // no-keystroke arm into a clear cannot pass by fixing three assertions.
+    for (blocker, token) in JANITOR_CLASSES {
+        assert!(
+            !matches!(
+                stranded_badge_release(Some(blocker), Some(BoxReading::NotHolding), false, false),
+                BadgeRelease::Clear(_)
+            ),
+            "{token}: no chip comes down on a text-gone reading with nobody at the keyboard"
+        );
+    }
+}
+
+#[test]
+fn a_reading_the_janitor_could_not_take_changes_nothing_at_all() {
+    // The second must-not-clear edge, and the one where being wrong is worst.
+    // `Holds` says our prompt is demonstrably still sitting in that box;
+    // `Unverifiable` says we looked and could not tell; `None` says the ledger
+    // has no text to look for. Three different facts, one conservative branch —
+    // nothing is ever released on an absence of evidence, which is the single
+    // direction that could hide an unsubmitted prompt behind a chip that went
+    // away.
+    for (blocker, token) in JANITOR_CLASSES {
+        for reading in [Some(BoxReading::Holds), Some(BoxReading::Unverifiable), None] {
+            for stamped in [true, false] {
+                assert_eq!(
+                    stranded_badge_release(Some(blocker), reading, stamped, false),
+                    BadgeRelease::Keep,
+                    "{token}: reading {reading:?} (stamped={stamped}) is not evidence of anything"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn the_classes_no_pane_reading_can_answer_are_left_alone_by_the_janitor() {
+    // Each of these is somebody else's release, and saying so is the reason
+    // this is a per-class matrix rather than one rule for every chip:
+    // `PauseSuppressed` describes a loss that has already happened and cannot
+    // become untrue, so no reading of the pane may release it (M1's explicit
+    // dismiss is its release); `QueueFull` wants a RETRY when room opens, not a
+    // clear (M3); the hold and depth classes already have releases keyed to the
+    // condition they name.
+    for blocker in NOT_THE_JANITORS_BUSINESS {
+        for stamped in [true, false] {
+            assert_eq!(
+                stranded_badge_release(blocker, Some(BoxReading::NotHolding), stamped, false),
+                BadgeRelease::Keep,
+                "{blocker:?} (stamped={stamped}) is not released by a box reading"
+            );
+        }
+    }
+}
+
+#[test]
+fn only_the_monitor_can_clear_on_a_transition_and_it_outranks_the_keystroke() {
+    // `saw_text_in_box` is a fact about the OBSERVER, not the pane, and this
+    // pins both halves of that. The monitor watched our text sit in the box and
+    // now sees it gone: a genuine present→absent transition, the strongest
+    // reading available, and #496 PR-C's own clear — it holds for EVERY class
+    // because a transition un-wedges the pane whatever the chip happened to say.
+    for blocker in JANITOR_CLASSES
+        .iter()
+        .map(|(b, _)| Some(*b))
+        .chain(NOT_THE_JANITORS_BUSINESS)
+    {
+        for stamped in [true, false] {
+            assert_eq!(
+                stranded_badge_release(blocker, Some(BoxReading::NotHolding), stamped, true),
+                BadgeRelease::Clear("text-left-the-box"),
+                "{blocker:?} (stamped={stamped}): the transition clear is unchanged by the hoist \
+                 and is not narrowed to the three classes"
+            );
+        }
+    }
+    // And it OUTRANKS the keystroke-named clear: the transition is about where
+    // the text went, which is a stronger claim than who was at the keyboard.
+    assert_eq!(
+        stranded_badge_release(
+            Some(StrandedBlocker::NotHolding),
+            Some(BoxReading::NotHolding),
+            true,
+            true,
+        ),
+        BadgeRelease::Clear("text-left-the-box"),
+    );
+    // Even a transition needs the reading: nothing clears on `Holds`.
+    assert_eq!(
+        stranded_badge_release(Some(StrandedBlocker::NotHolding), Some(BoxReading::Holds), true, true),
+        BadgeRelease::Keep,
+    );
+}
+
+/// A pane carrying a stuck-prompt chip, wired the way the janitor actually
+/// finds one: a real `PtyManager` with a fake child painting `$tail`, a ledger
+/// record of the text we stranded there, and **no monitor thread anywhere**.
+/// That absence is the fixture's whole point — every test below is the state a
+/// pane is in after `LATE_MONITOR_MAX_LIFETIME` has taken its monitor away, and
+/// before #825 M2 nothing looked at such a pane again, ever.
+///
+/// The record is back-dated a minute because `tier1_trusted` compares with
+/// `<=`: a record and a keystroke stamped in the same millisecond would read as
+/// "no human has typed since our submit", which is a fact about the test's
+/// clock rather than about the pane.
+///
+/// Yields `(reg, tempdir, group, agent id, PtyManager, pty id, captured writes,
+/// ledger)`. `captured` is kept by every caller so the safety line — this
+/// mechanism only ever takes chips down or re-words them, and never writes to a
+/// pane — is asserted rather than asserted-about.
+macro_rules! janitor_pane {
+    ($blocker:expr, $tail:expr) => {{
+        let (reg, dir, g, wid) = attention_setup();
+        let pty = 8251u32;
+        let pm = PtyManager::default();
+        let captured = pm.register_fake_for_test(pty, $tail.as_bytes());
+        reg.set_pty_for_test(&wid, pty);
+        reg.mark_stranded(&g, &wid, Some($blocker));
+        let ledger: std::sync::Mutex<HashMap<u32, _>> = std::sync::Mutex::new(HashMap::new());
+        record_stranded_outcome_at_for_test(
+            &ledger,
+            pty,
+            "loomux".to_string(),
+            now_ms() - 60_000,
+            Some(STRANDED_PROMPT.to_string()),
+        );
+        (reg, dir, g, wid, pm, pty, captured, ledger)
+    }};
+}
+
+#[test]
+fn the_janitor_clears_a_stuck_chip_long_after_the_monitor_that_raised_it_is_gone() {
+    // THE headline cell of #825, wired: an idle pane whose delivery stranded,
+    // whose monitor exited hours ago, and whose human quietly rescued it by
+    // pressing Enter themselves. Before this the chip stayed up until a
+    // restart — the live complaint, and the thing that trains a human to stop
+    // reading chips at all.
+    let (reg, _d, g, wid, pm, pty, captured, ledger) =
+        janitor_pane!(StrandedBlocker::NotHolding, CLEARED_TAIL);
+    // The human's own recovery: click in, press Enter. `\r` with nothing after
+    // it classifies `Submit`, which stamps the keystroke clock.
+    pm.note_user_input(pty, "\r", true);
+
+    reg.stranded_janitor_pass(&pm, &ledger);
+
+    assert!(
+        reg.stranded_note(&wid).is_none(),
+        "text verifiably gone plus a human keystroke since our submit is #819's own release bar \
+         — a chip that survives it is claiming a pane is wedged that demonstrably is not"
+    );
+    let cleared = reg
+        .audit_log(&g)
+        .into_iter()
+        .find(|e| e.action == "stranded-cleared")
+        .expect("every stranded clear is audited");
+    assert_eq!(
+        cleared.detail["why"],
+        json!("human-resolved"),
+        "and it is NOT `human-dismissed` — that reason belongs to a gesture a human made on the \
+         chip (M1). This one is loomux's own inference from the pane, and a log that spelled the \
+         two the same way could not tell them apart"
+    );
+    // A clear by inference owes the evidence it inferred from.
+    let judged = reg
+        .audit_log(&g)
+        .into_iter()
+        .find(|e| e.action == "stranded-janitor")
+        .expect("the janitor states what it read, or a vanished chip is unexplainable");
+    assert_eq!(judged.detail["reading"], json!("not-holding"));
+    assert_eq!(judged.detail["human_since_submit"], json!(true));
+    assert_eq!(judged.detail["blocker"], json!("not-holding"));
+    // The safety line, asserted: nothing in this mechanism writes to a pane.
+    assert!(
+        captured.lock().unwrap().is_empty(),
+        "the janitor takes chips down; it must never press Enter, got {:?}",
+        captured.lock().unwrap()
+    );
+}
+
+#[test]
+fn the_janitor_never_takes_a_chip_down_while_our_text_is_still_in_the_box() {
+    // The direction where being wrong is unrecoverable. Our prompt is visibly
+    // sitting in that box unsubmitted, and the chip is the only trace of it —
+    // clear here and the prompt is lost with nothing left to say so. The human
+    // keystroke is present precisely so that this test fails if the keystroke
+    // is ever allowed to license a release on its own (#518's phantom).
+    let (reg, _d, g, wid, pm, pty, captured, ledger) =
+        janitor_pane!(StrandedBlocker::NotHolding, STRANDED_TAIL);
+    pm.note_user_input(pty, "\r", true);
+
+    reg.stranded_janitor_pass(&pm, &ledger);
+
+    assert_eq!(
+        reg.stranded_note(&wid).and_then(|n| n.blocker),
+        Some(StrandedBlocker::NotHolding),
+        "our text is still there — the chip stays up and unchanged"
+    );
+    assert_eq!(hold_audit_count(&reg, &g, "stranded-cleared"), 0);
+    assert_eq!(hold_audit_count(&reg, &g, "stranded-janitor"), 0);
+    assert!(captured.lock().unwrap().is_empty());
+}
+
+#[test]
+fn an_unreadable_box_leaves_the_stuck_prompt_chip_exactly_as_it_found_it() {
+    // #559's third state, arriving at a new consumer. A tail shorter than our
+    // own paste makes containment false by arithmetic — the answer was fixed
+    // before the pane was consulted — so it is neither "holds" nor "gone", and
+    // the one thing it must never become is a release. This is the class the
+    // issue's own warning is literal about: loomux could not read the box, so
+    // the chip may be the only sign a prompt is still sitting in it.
+    let (reg, _d, g, wid, pm, pty, _cap, ledger) =
+        janitor_pane!(StrandedBlocker::Unverifiable, "> \n");
+    pm.note_user_input(pty, "\r", true);
+
+    reg.stranded_janitor_pass(&pm, &ledger);
+
+    assert_eq!(
+        reg.stranded_note(&wid).and_then(|n| n.blocker),
+        Some(StrandedBlocker::Unverifiable),
+        "not cleared, and not re-worded either: a reading that never happened may not upgrade a \
+         chip's wording any more than it may take it down"
+    );
+    assert_eq!(hold_audit_count(&reg, &g, "stranded-cleared"), 0);
+    assert_eq!(
+        hold_audit_count(&reg, &g, "stranded-attention"),
+        1,
+        "one line, from the raise in the fixture — nothing was written this pass"
+    );
+}
+
+#[test]
+fn a_gone_text_with_nobody_at_the_keyboard_upgrades_the_wording_and_keeps_the_chip() {
+    // #819's declined cell (`TextGone`), wired. The box no longer holds our
+    // text and no human keystroke is on record: not a release — but
+    // "loomux could not read the box" has become a false sentence about a box
+    // we have now read. The chip stays and says the truer thing, which is also
+    // what contains #828's residual false `NotHolding`: a lone bad reading can
+    // only ever change wording here, never take a warning away.
+    let (reg, _d, g, wid, pm, _pty, _cap, ledger) =
+        janitor_pane!(StrandedBlocker::Unverifiable, CLEARED_TAIL);
+
+    reg.stranded_janitor_pass(&pm, &ledger);
+
+    assert_eq!(
+        reg.stranded_note(&wid).and_then(|n| n.blocker),
+        Some(StrandedBlocker::NotHolding),
+        "re-worded to what we now know, and still up — nobody has shown a human dealt with it"
+    );
+    assert_eq!(
+        hold_audit_count(&reg, &g, "stranded-cleared"),
+        0,
+        "a keystroke is the other half of the bar and there was none"
+    );
+    assert_eq!(
+        hold_audit_count(&reg, &g, "stranded-attention"),
+        2,
+        "the raise, then the re-word — the badge's history stays one grep"
+    );
+}
+
+#[test]
+fn the_janitor_never_hands_back_a_chip_a_human_has_dismissed() {
+    // The hazard M1 created and this slice must not walk into: after an
+    // explicit dismiss, an absent `attn_stranded` entry can mean "a human said
+    // they had seen it". A janitor that re-raised on a fresh reading would hand
+    // the human back the chip they just took down — the live complaint,
+    // reopened by the mechanism meant to close it.
+    //
+    // Set up the ONE verdict that writes to the map at all (the re-word), then
+    // dismiss before the pass runs.
+    let (reg, _d, g, wid, pm, _pty, _cap, ledger) =
+        janitor_pane!(StrandedBlocker::Unverifiable, CLEARED_TAIL);
+    assert!(reg.dismiss_stranded(&wid), "precondition: the human took the chip down");
+
+    reg.stranded_janitor_pass(&pm, &ledger);
+
+    assert!(
+        reg.stranded_note(&wid).is_none(),
+        "an absent entry means nothing to do — never something to raise"
+    );
+    assert_eq!(
+        hold_audit_count(&reg, &g, "stranded-attention"),
+        1,
+        "only the fixture's original raise: a re-raise would be a second line here"
+    );
+}
+
+#[test]
+fn a_re_word_is_never_a_raise_and_never_overwrites_a_fresher_diagnosis() {
+    // The primitive both observers now write through, pinned directly — because
+    // the same gap exists on the late monitor's live re-check, which reads the
+    // note at the top of its arm and writes it back at the bottom, every 5s.
+    // Through `mark_stranded` that write is an INSERT, so a chip dismissed in
+    // between comes straight back; through `reword_stranded` an absent entry
+    // stays absent.
+    let (reg, _d, g, wid) = attention_setup();
+
+    assert!(
+        !reg.reword_stranded(&g, &wid, None, Some(StrandedBlocker::HumanInput)),
+        "no chip is up — a re-word has nothing to re-word and must not create one"
+    );
+    assert!(reg.stranded_note(&wid).is_none());
+    assert_eq!(hold_audit_count(&reg, &g, "stranded-attention"), 0, "and it audits nothing");
+
+    // The other half of the same gap: the chip is up, but another mechanism
+    // re-raised it with a different diagnosis since the caller last looked.
+    reg.mark_stranded(&g, &wid, Some(StrandedBlocker::PauseSuppressed));
+    assert!(
+        !reg.reword_stranded(
+            &g,
+            &wid,
+            Some(StrandedBlocker::Unverifiable),
+            Some(StrandedBlocker::NotHolding),
+        ),
+        "the verdict was about a chip that is no longer there"
+    );
+    assert_eq!(
+        reg.stranded_note(&wid).and_then(|n| n.blocker),
+        Some(StrandedBlocker::PauseSuppressed),
+        "the fresher diagnosis survives — a stale verdict must not overwrite it"
+    );
+
+    // And it does update in place when it is still the chip that was judged.
+    assert!(reg.reword_stranded(
+        &g,
+        &wid,
+        Some(StrandedBlocker::PauseSuppressed),
+        Some(StrandedBlocker::NotHolding),
+    ));
+    assert_eq!(
+        reg.stranded_note(&wid).and_then(|n| n.blocker),
+        Some(StrandedBlocker::NotHolding)
+    );
+}
+
+#[test]
+fn the_janitor_leaves_the_classes_no_pane_reading_can_answer_alone() {
+    // `PauseSuppressed` is the sharp end: it reports deliveries that were
+    // DISCARDED while the group was paused. That loss is historical — it cannot
+    // become untrue — and it never put text in anyone's box, so a box reading
+    // says precisely nothing about it. Releasing it on the strongest pane
+    // evidence available would still be releasing it on evidence about
+    // something else. `QueueFull` wants a retry when room opens (M3), not a
+    // clear.
+    for blocker in [StrandedBlocker::PauseSuppressed, StrandedBlocker::QueueFull] {
+        let (reg, _d, g, wid, pm, pty, _cap, ledger) = janitor_pane!(blocker, CLEARED_TAIL);
+        pm.note_user_input(pty, "\r", true);
+
+        reg.stranded_janitor_pass(&pm, &ledger);
+
+        assert_eq!(
+            reg.stranded_note(&wid).and_then(|n| n.blocker),
+            Some(blocker),
+            "{blocker:?} must survive a reading that has nothing to do with it"
+        );
+        assert_eq!(hold_audit_count(&reg, &g, "stranded-cleared"), 0);
+    }
+}
+
+#[test]
+fn a_pane_with_no_recorded_stranded_text_is_never_judged() {
+    // "We have nothing to look for" is not "the box is clear" — the distinction
+    // `DeliveryOutcome::stranded_text`'s own doc insists on. A pane whose ledger
+    // carries no text (a path that pasted nothing, a record from before the
+    // field existed, or a restart that dropped the in-memory ledger) yields no
+    // reading, so there is nothing to decide from and no pane read to pay for.
+    let (reg, _d, g, wid) = attention_setup();
+    let pty = 8252u32;
+    let pm = PtyManager::default();
+    pm.register_fake_for_test(pty, CLEARED_TAIL.as_bytes());
+    reg.set_pty_for_test(&wid, pty);
+    reg.mark_stranded(&g, &wid, Some(StrandedBlocker::NotHolding));
+    pm.note_user_input(pty, "\r", true);
+
+    // An empty ledger first: the pane has no delivery record at all.
+    let empty: std::sync::Mutex<HashMap<u32, _>> = std::sync::Mutex::new(HashMap::new());
+    record_stranded_outcome_at_for_test(&empty, 9_999, "loomux".to_string(), now_ms() - 60_000, None);
+    reg.stranded_janitor_pass(&pm, &empty);
+    assert!(reg.stranded_note(&wid).is_some(), "no record for this pane — nothing to judge");
+
+    // Then a record for THIS pane that carries no text.
+    let textless: std::sync::Mutex<HashMap<u32, _>> = std::sync::Mutex::new(HashMap::new());
+    record_stranded_outcome_at_for_test(&textless, pty, "loomux".to_string(), now_ms() - 60_000, None);
+    reg.stranded_janitor_pass(&pm, &textless);
+    assert!(
+        reg.stranded_note(&wid).is_some(),
+        "a record with no stranded text establishes nothing about the box either"
+    );
+    assert_eq!(hold_audit_count(&reg, &g, "stranded-cleared"), 0);
+}
+
+#[test]
+fn a_dead_agents_chip_is_not_the_janitors_to_clear() {
+    // A pane with no running agent cannot be un-wedged by anyone, and its note
+    // is `attention_tick`'s to prune (that is the one thing which prunes the
+    // latched map). The janitor reasoning about a dead pane would be reading a
+    // ring nobody is writing to and attributing the result to a person.
+    let (reg, _d, g, wid, pm, pty, _cap, ledger) =
+        janitor_pane!(StrandedBlocker::NotHolding, CLEARED_TAIL);
+    pm.note_user_input(pty, "\r", true);
+    reg.mark_dead(&wid, Some(1));
+
+    reg.stranded_janitor_pass(&pm, &ledger);
+
+    assert_eq!(
+        hold_audit_count(&reg, &g, "stranded-cleared"),
+        0,
+        "the janitor does not clear a dead pane's chip — the attention scan prunes it"
     );
 }
 
