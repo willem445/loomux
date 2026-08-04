@@ -36901,6 +36901,18 @@ fn the_census_margin_is_the_same_cliff_the_reading_decides() {
     // disagree, a live distribution of `margin_chars` is a distribution of
     // something other than "how often Tier 1 could not verify", and the
     // measurement #583 is for would answer the wrong question convincingly.
+    //
+    // **#821 weakened this from an equivalence to an IMPLICATION, deliberately**
+    // (rev-305 B2). A negative margin still means the length arm fired; the
+    // reverse no longer holds, because #821 added a second `Unverifiable` arm —
+    // the partial-match probe — that fires on a tail LONGER than the paste and
+    // is therefore invisible to a margin. `margin_chars`' own doc says exactly
+    // that, and this assertion used to say the opposite in the same commit,
+    // passing only because none of the four fixtures below reach the new arm
+    // (a single-line all-ASCII paste leading with `[loomux]`, and a `truncated`
+    // case cut from the FRONT, which removes the very characters the probe
+    // samples). The counterexample is pinned below rather than left as the case
+    // that would break this, so the weakening is enforced instead of stated.
     let pasted = flush_paste(8 * 1024);
     let scan = tier1_scan_bytes(&pasted);
     let echoed = format!("  done\n\n> {pasted}\n");
@@ -36914,21 +36926,51 @@ fn the_census_margin_is_the_same_cliff_the_reading_decides() {
     ];
     for (name, tail) in cases {
         let census = Tier1ScanCensus::measure(scan, Some((tail.len(), &tail)), &pasted);
-        assert_eq!(
-            census.margin_chars().is_some_and(|m| m < 0),
-            box_reading(Some(&tail), &pasted) == BoxReading::Unverifiable,
-            "{name}: the recorded margin and the reading must decide the same cliff"
-        );
+        let reading = box_reading(Some(&tail), &pasted);
+        if census.margin_chars().is_some_and(|m| m < 0) {
+            assert_eq!(
+                reading,
+                BoxReading::Unverifiable,
+                "{name}: a negative margin IS the length arm — the number and the decision \
+                 must not disagree about the cliff the number describes"
+            );
+        }
     }
 
     // The one `Unverifiable` the margin cannot speak for, stated rather than
-    // left to the equivalence above: no read happened at all (pty gone), so
+    // left to the implication above: no read happened at all (pty gone), so
     // every measurement is null. That is the same distinction `tail_bytes`
     // carries between `None` and `Some(0)` — nothing measured is not zero.
     let blind = Tier1ScanCensus::measure(scan, None, &pasted);
     assert_eq!(box_reading(None, &pasted), BoxReading::Unverifiable);
     assert_eq!(blind.margin_chars(), None);
     assert_eq!(blind.retained_pct(), None);
+
+    // ...and the OTHER one, which is #821's and is the reason the assertion
+    // above is an implication rather than an equivalence. `h3`'s scrollbar
+    // fixture: the tail is comfortably longer than the paste, so the margin is
+    // positive and the length arm never fires — yet the reading is
+    // `Unverifiable`, because our own line is visibly on screen behind
+    // decoration `deframe` cannot reach. A margin histogram counts the length
+    // arm, not "how often Tier 1 could not verify", and pinning the gap here is
+    // what stops a future contributor reading this test's name and "fixing" a
+    // red by making the READING agree with the census.
+    let decorated = strip_ansi(FIX_BOX_GUTTER_SCROLLBAR.as_bytes());
+    let probed = Tier1ScanCensus::measure(
+        tier1_scan_bytes(GUTTER_PASTE_TEXT),
+        Some((decorated.len(), &decorated)),
+        GUTTER_PASTE_TEXT,
+    );
+    assert!(
+        probed.margin_chars().is_some_and(|m| m >= 0),
+        "precondition: this read had ample headroom — the length arm is not what fired: {:?}",
+        probed.margin_chars()
+    );
+    assert_eq!(
+        box_reading(Some(&decorated), GUTTER_PASTE_TEXT),
+        BoxReading::Unverifiable,
+        "the probe arm fires on a tail LONGER than the paste, so no margin can ever see it"
+    );
 }
 
 #[test]

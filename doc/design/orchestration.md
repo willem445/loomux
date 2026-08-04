@@ -6882,13 +6882,22 @@ definition of decoration (`deframe`), not the instrument built on it** — which
 lesson, since the two gates read the same screens through the same CLI rendering and will keep
 being tempted toward one recogniser.
 
-**Measurement moved with the comparison.** `Tier1Scan::read`'s widening and
-`Tier1ScanCensus::measure` now normalize the same way. The census documents itself as measuring
-"the same normalization `box_reading` compares through" and `margin_chars` claims a histogram of it
-*is* the `Unverifiable` arm rather than a proxy — both false the moment the comparison moved and
-they did not. `margin_chars` also now states plainly that #821 added a second `Unverifiable` arm it
-cannot see: a read with ample margin can still be unreadable, because the partial-match arm fires
-on a tail that is *longer* than the paste.
+**Measurement moved with the comparison — all of it.** `Tier1Scan::read`'s widening and BOTH of
+`Tier1ScanCensus::measure`'s terms now normalize the same way. The first cut moved `tail_chars`
+alone and left `paste_chars` on `normalize_prompt_text` one line below (rev-305 B1), which
+differenced two normalizations: `margin_chars` is a difference, so it is meaningful only while its
+two terms measure the same kind of string, and the gap was exactly the framing characters a brief's
+own markdown bullets and table rows carry — the `h5` shape, so the bias was systematic,
+one-directional, and pointed at over-reporting the very arm the number is read to count. The
+read-SIZING sites keep `normalize_prompt_text` deliberately, and the distinction is the whole
+lesson: **sizing a request may be conservative, measuring a comparison may not.**
+
+`margin_chars` also now states plainly that #821 added a second `Unverifiable` arm it cannot see —
+a read with ample margin can still be unreadable, because the partial-match arm fires on a tail
+that is *longer* than the paste — and the census test asserts the surviving **implication**
+(negative margin ⇒ `Unverifiable`) with `h3`'s fixture pinned as the counterexample, rather than
+the equivalence it used to claim. A doc admission and a test asserting its negation in the same
+commit is how the next contributor gets told to "fix" the reading to match the census.
 
 **Tests.** `h1`–`h5` in `tests/orchestration.rs` over two fixtures in the #820 copilot-decorated
 family (reconstructed from cited sources, not captured — constraint 3). `h1` is the containment,
@@ -6902,9 +6911,17 @@ rest of the floor, the latter because `deframe` is now shared across both gates.
 
 **Residuals.**
 
-- A pane narrower than `PASTE_ECHO_PROBE_CHARS` wraps the probe across rows, so it breaks and the
-  reading falls through to `NotHolding` — the same direction #821 fixes, narrowed to panes under
-  ~48 columns.
+- The probe can fail, and it is narrower than "a pane under ~48 columns breaks it" (rev-305 Ground
+  4 corrected an earlier, more pessimistic wording). The probe is matched against
+  `normalize_deframed` of the tail — every row already leading-de-framed and the whole thing
+  flattened to single-space-joined words — so spanning a *word-wrapped* boundary is fine, which is
+  the entire known copilot shape. It fails only where its span crosses a boundary carrying
+  decoration `deframe` cannot reach (a trailing scrollbar `┃`) or a HARD mid-word wrap, which
+  splits one word into two tokens and inserts a space the needle lacks. A narrow pane raises the
+  odds of crossing a boundary; it is not itself the breaker. **And containment is wrap-agnostic**,
+  so such a pane loses only this backstop — which did not exist before #821. There is no width at
+  which this change is a regression, only one at which it is less of an improvement, which is why
+  sizing the probe from real terminal geometry is not worth the coupling.
 - A wrap landing such that a continuation row *starts* with a character `deframe` strips (a `*` in
   `2 * 3`, mid-line in our own text) de-frames on the tail side but not the needle side.
   Containment then fails and the probe catches it as `Unverifiable` — the safe direction, and the

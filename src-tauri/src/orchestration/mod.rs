@@ -2542,10 +2542,22 @@ const BOX_TAIL_WINDOW_SLACK: usize = 200;
 /// How much of one paste LINE [`paste_echo_probe`] samples for
 /// [`box_reading`]'s "a partial match is not an absence" arm (#821).
 ///
-/// Bounded above by what a single rendered row can hold: the probe's whole
-/// value is that it survives per-row decoration, which it only does while it
-/// stays inside one row. 48 characters is comfortably inside the narrowest pane
-/// anyone runs while being far past coincidence for prose.
+/// Bounded above by what a single rendered row can comfortably hold. 48
+/// characters is inside the narrowest pane anyone runs while being far past
+/// coincidence for prose.
+///
+/// **"It must stay inside one row" is the conservative heuristic, not the
+/// mechanism** (rev-305 Ground 4). The probe is matched against
+/// [`normalize_deframed`] of the tail, where every row has already had its
+/// LEADING decoration stripped and the whole thing flattened to
+/// single-space-joined words — so a probe spanning a word-wrapped row boundary
+/// matches perfectly well, which is the entire known copilot shape. Two things
+/// actually break it, and a short probe only lowers the odds of meeting either:
+/// a boundary carrying decoration `deframe` cannot reach (a trailing scrollbar
+/// `┃`), or a HARD mid-word wrap, which splits one word into two tokens and so
+/// inserts a space the needle does not have. Sizing this from the pane's real
+/// width would be a new coupling to terminal geometry for a case that is
+/// already strictly better than the status quo.
 ///
 /// **The cost of firing too readily is real, and it is not the safe
 /// direction.** `Unverifiable` falls through to `stranded_marker_action`'s
@@ -14898,11 +14910,15 @@ pub fn box_reading(stripped_tail: Option<&str>, pasted: &str) -> BoxReading {
 ///
 /// **Why a line and not the flattened paste.** The obvious probe is "the first
 /// N characters of the needle", and it is wrong for exactly the reason the
-/// needle itself failed: as soon as N runs past the first line, the probe spans
-/// a row boundary and any per-row decoration breaks it too. A probe that dies
-/// to the same thing it is meant to detect is not a backstop. Taking it from
-/// ONE line keeps it inside one rendered row, where the only decoration is
-/// leading and [`deframe`] has already removed it.
+/// needle itself failed: as soon as N runs past the first LOGICAL line it spans
+/// a `\n` the tail never had, so it can only match by accident. A probe that
+/// dies to the same thing it is meant to detect is not a backstop. Taking it
+/// from one line keeps the probe a contiguous run of the pane's own words.
+///
+/// Note this is about logical lines, not rendered rows: a long line the CLI
+/// wrapped is still one contiguous run in [`normalize_deframed`]'s output (see
+/// [`PASTE_ECHO_PROBE_CHARS`] for what does and does not survive a row
+/// boundary).
 ///
 /// The LONGEST line, because that is the strongest evidence available: the more
 /// of our own prose a fragment carries, the less it can be something the CLI
@@ -14912,9 +14928,15 @@ pub fn box_reading(stripped_tail: Option<&str>, pasted: &str) -> BoxReading {
 /// all rather than a coincidence-prone one — that paste keeps the pre-#821
 /// behaviour, which is the honest outcome when there is no evidence to be had.
 ///
-/// **Residual:** a pane narrower than the probe wraps it across rows, so it
-/// breaks and the reading falls through to `NotHolding`. That is the same
-/// direction #821 exists to fix, narrowed to panes under ~48 columns.
+/// **Residual, stated accurately** (rev-305 Ground 4 corrected an earlier,
+/// more pessimistic version of this): the probe fails only where its span
+/// crosses a row boundary that carries decoration `deframe` cannot reach, or a
+/// hard mid-word wrap — a narrow pane raises the odds of crossing a boundary
+/// at all, it does not itself break anything. Where that happens the reading
+/// falls through to `NotHolding`. Containment is wrap-agnostic either way, so
+/// such a pane loses only this backstop, which did not exist before #821:
+/// there is no width at which this is a regression, only one at which it is
+/// less of an improvement.
 fn paste_echo_probe(pasted: &str) -> Option<String> {
     pasted
         .lines()
@@ -14962,12 +14984,13 @@ pub struct Tier1ScanCensus {
     /// `None` is no read AT ALL (pty gone), never `Some(0)`: those are
     /// different facts, and not conflating them is the whole of #559.
     pub tail_bytes: Option<usize>,
-    /// What those bytes came to after `strip_ansi` + `normalize_prompt_text` —
-    /// the haystack the containment check actually gets.
+    /// What those bytes came to after `strip_ansi` + `normalize_deframed` —
+    /// the haystack the containment check actually gets (#821).
     pub tail_chars: Option<usize>,
-    /// The needle's own normalized length. Not the same number as
-    /// `tier1_paste_bytes` (which is raw), and it is this one the arithmetic
-    /// compares against.
+    /// The needle's own length under that SAME normalization (#821). Not the
+    /// same number as `tier1_paste_bytes` (which is raw), nor as the
+    /// `normalize_prompt_text` length the read-sizing sites use, and it is
+    /// this one the arithmetic compares against.
     pub paste_chars: usize,
 }
 
@@ -14986,15 +15009,25 @@ impl Tier1ScanCensus {
             // width), and a census that measured only the ANSI half would
             // under-report the loss that actually decides the reading.
             //
-            // #821: "the same normalization" is now `normalize_deframed`,
-            // and this line moves with it rather than being left behind. The
-            // claim `margin_chars` makes below — that a histogram of it IS
-            // `box_reading`'s `Unverifiable` arm rather than a proxy for it —
-            // is only true while both measure the identical string, and
-            // per-row gutters are precisely a shrink this census exists to
-            // report.
+            // #821: "the same normalization" is now `normalize_deframed`, and
+            // BOTH lines move with it. `margin_chars` is a DIFFERENCE, so it
+            // is only meaningful while its two terms measure the same kind of
+            // string — the first cut of this moved `tail_chars` alone and left
+            // `paste_chars` on `normalize_prompt_text` one line below, which
+            // differenced two normalizations and understated the margin by
+            // exactly the framing characters a brief's own markdown bullets
+            // and table rows carry (rev-305 B1). That is the shape `h5` exists
+            // for, so the bias was systematic, one-directional, and pointed at
+            // over-reporting the very arm this number is read to count.
+            //
+            // Contrast the read-SIZING sites (`tier1_scan_bytes`,
+            // `Tier1Scan::for_paste`), which deliberately keep
+            // `normalize_prompt_text`: those size a REQUEST, where an
+            // un-de-framed needle only ever asks for more tail and larger is
+            // the safe direction. These two MEASURE, and a measurement has to
+            // match the comparison it describes.
             tail_chars: read.map(|(_, stripped)| normalize_deframed(stripped).len()),
-            paste_chars: normalize_prompt_text(pasted).len(),
+            paste_chars: normalize_deframed(pasted).len(),
         }
     }
 
