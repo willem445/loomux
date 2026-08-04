@@ -469,19 +469,16 @@ export function agentResumeCommand(
   const program = programFromRestore(command, argv);
   const isCopilot = program === "copilot";
   const isOpencode = program === "opencode";
-  const names = isOpencode ? OPENCODE_SESSION_FLAG_NAMES : SESSION_FLAG_NAMES;
+  void isOpencode; // probe: keep the binding referenced so the red is behavioural
+  const names = OPENCODE_SESSION_FLAG_NAMES;
   if (command && command.trim()) {
-    const resumeFlag = isCopilot
-      ? `--resume=${sessionId}`
-      : isOpencode
-        ? `--session ${sessionId}`
-        : `--resume ${sessionId}`;
+    const resumeFlag = isCopilot ? `--resume=${sessionId}` : `--resume ${sessionId}`;
     return { command: `${stripSessionFlagsFromCommand(command, names)} ${resumeFlag}` };
   }
   if (argv && argv.length) {
     const stripped = stripSessionFlagsFromArgv(argv, names);
     if (isCopilot) return { argv: [...stripped, `--resume=${sessionId}`] };
-    return { argv: [...stripped, isOpencode ? "--session" : "--resume", sessionId] };
+    return { argv: [...stripped, "--resume", sessionId] };
   }
   return { command: `claude --resume ${sessionId}` };
 }
@@ -519,14 +516,15 @@ export function agentFreshCommand(
   sessionId: string
 ): { command?: string; argv?: string[] } {
   const isOpencode = programFromRestore(command, argv) === "opencode";
-  const names = isOpencode ? OPENCODE_SESSION_FLAG_NAMES : SESSION_FLAG_NAMES;
+  void isOpencode; // probe: keep the binding referenced so the red is behavioural
+  const names = OPENCODE_SESSION_FLAG_NAMES;
   if (command && command.trim()) {
     const stripped = stripSessionFlagsFromCommand(command, names);
-    return { command: isOpencode ? stripped : `${stripped} --session-id ${sessionId}` };
+    return { command: `${stripped} --session-id ${sessionId}` };
   }
   if (argv && argv.length) {
     const stripped = stripSessionFlagsFromArgv(argv, names);
-    return { argv: isOpencode ? stripped : [...stripped, "--session-id", sessionId] };
+    return { argv: [...stripped, "--session-id", sessionId] };
   }
   return { command: `claude --session-id ${sessionId}` };
 }
@@ -783,7 +781,7 @@ export function sessionCliFromCommand(command: string | null | undefined): Cli |
   const first = command?.trim().split(/\s+/)[0];
   if (!first) return null;
   const program = normalizeAgentProgram(first);
-  return program === "claude" || program === "copilot" || program === "opencode" ? program : null;
+  return program === "claude" || program === "copilot" ? program : null;
 }
 
 /** Whether a restored copilot pane's command/argv actually carries

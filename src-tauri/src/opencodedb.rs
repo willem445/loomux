@@ -469,7 +469,7 @@ pub fn recent_sessions_on(conn: &Connection, limit: usize) -> Result<Vec<Session
     let mut stmt = conn
         .prepare(
             "SELECT id, title, directory, time_updated FROM session \
-             WHERE parent_id IS NULL ORDER BY time_updated DESC LIMIT ?1",
+             ORDER BY id DESC LIMIT ?1",
         )
         .map_err(drift)?;
     let rows = stmt
