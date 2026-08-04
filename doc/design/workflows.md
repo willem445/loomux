@@ -330,6 +330,59 @@ A kickoff-delivered persona is framed as an **addendum**: it is introduced as a
 persona layered on the loomux mechanics in the instructions file that the same
 prompt points at. Repo text never gets to read as "ignore your instructions".
 
+### A Copilot persona's `tools:` is a filter, and it can strip loomux itself (#802)
+
+The native column above has one trapdoor, and it is the whole of #802: a
+`.github/agents/*.md` may carry a `tools:` frontmatter list, and Copilot's
+`tools:` **filters** rather than adds. Per the [custom-agents configuration
+reference](https://docs.github.com/en/copilot/reference/custom-agents-configuration),
+*Tools processing*: *"The `tools` list filters the set of tools that are made
+available to the agent - whether built-in or sourced from MCP servers"*, with
+*"If no tools are specified, all available tools are enabled"* and *"An empty
+tools list (`tools: []`) disables all tools"*.
+
+So `--agent x` on a persona whose list omits loomux launches a delegate with
+loomux's MCP **server loaded and every one of its tools filtered out** — an agent
+that cannot `report`, cannot read the board, and cannot be steered. It presents,
+from inside its own pane, as loomux being broken.
+
+Three properties of that failure are worth keeping written down, because each one
+sent a round of investigation the wrong way:
+
+- **Only `profile:` blocks were affected.** loomux's own generated agent files
+  have never carried a `tools:` key, so they inherit the documented all-tools
+  default. The built-in roster on the same machine was fine, which read as "the
+  workflow spawn path is broken" when the truth was "the file it points at is
+  narrower".
+- **No permission grant can undo it.** `--allow-tool loomux` and
+  `permissions-config.json`'s `{"kind":"mcp","serverName":"loomux","toolName":
+  null}` (see the orchestration note's *two permission surfaces*) both grant
+  permission over what is *available*; `tools:` decides what is available at all.
+  Filter first, approve second.
+- **It is invisible from argv.** The command line is identical either way; the
+  difference is inside a file in the user's repo.
+
+The repair keeps #222's rule intact — loomux still never writes into
+`.github/agents/`. Instead a persona whose list drops loomux is launched from a
+**loomux-owned copy** in `~/.copilot/agents/` carrying that same list *plus* the
+grant, in the documented spelling (*"You can also explicitly enable all tools from
+a specific MCP server using `some-mcp-server/*`"*). The user's scoping intent
+survives verbatim; loomux widens it by exactly one server, the one whose absence
+makes the delegate useless. A bare `loomux` rides alongside `loomux/*` as a hedge
+that costs nothing (*"All unrecognized tool names are ignored"*) until a live run
+settles which spelling the CLI matches on.
+
+One case is deliberately **not** repaired: a persona that also declares its own
+`mcp-servers:`. The generated copy models loomux's server and nothing else, so
+re-pointing `--agent` at it would silently delete servers the user asked for.
+That block launches native, as before, with the warning.
+
+And either way it is **loud**: an audit line (`copilot-persona-tools-gap`) and a
+`NOTE:` on the `spawn_agent` reply naming the persona and the exact line to add.
+The detection is not a nicety attached to the fix — the reason #802 cost three
+rounds is that nothing failed audibly, so the same class must never be silent
+again even where loomux repairs it.
+
 ## Harvested from PR #105
 
 PR #105 (`agent-prototype`, superseded) built roughly 70% of this backend
