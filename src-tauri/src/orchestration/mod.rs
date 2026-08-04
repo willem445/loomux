@@ -21718,7 +21718,15 @@ impl OrchRegistry {
     /// `false` as "done" turns a lost race into a permanently unidentified
     /// pane. The watcher keeps polling instead.
     pub fn associate_session(&self, group_id: &str, agent_id: &str, session_id: &str) -> bool {
-        let entry = {
+        // The lock scope DECIDES; everything else happens after the guard
+        // drops — same shape, and same reason, as `note_opencode_db_degrade`:
+        // `audit` takes its own locks, and holding an unrelated one across it
+        // is how lock-order bugs start. Keeping the two sites identical also
+        // means this file has one pattern for "record a refusal" rather than
+        // two a reader has to tell apart (rev-306 F1). What must stay inside
+        // the guard is only the check-and-write pair below, which is the whole
+        // point of NB3.
+        let (entry, taken_by_another) = {
             let mut agents = self.agents.lock_safe();
             // The claim exclusion `search_for_session` applies is READ under
             // this lock and then released before the store is queried, so two
@@ -21735,21 +21743,28 @@ impl OrchRegistry {
                     && a.id != agent_id
                     && a.session_id.as_deref() == Some(session_id)
             }) {
-                self.audit(group_id, "loomux", "session-claim-refused", json!({
-                    "agent": agent_id,
-                    "session": session_id,
-                    "reason": "another pane in this group is already bound to this session",
-                }));
-                return false;
+                (None, true)
+            } else {
+                match agents.get_mut(agent_id) {
+                    // Don't clobber an id set in the meantime (e.g. a resume).
+                    Some(a) if a.session_id.is_none() => {
+                        a.session_id = Some(session_id.to_string());
+                        (Some(a.clone()), false)
+                    }
+                    // Pane gone, or already carries an id: a no-op either way.
+                    _ => (None, false),
+                }
             }
-            let Some(a) = agents.get_mut(agent_id) else { return false };
-            // Don't clobber an id set in the meantime (e.g. a resume).
-            if a.session_id.is_some() {
-                return false;
-            }
-            a.session_id = Some(session_id.to_string());
-            a.clone()
         };
+        if taken_by_another {
+            self.audit(group_id, "loomux", "session-claim-refused", json!({
+                "agent": agent_id,
+                "session": session_id,
+                "reason": "another pane in this group is already bound to this session",
+            }));
+            return false;
+        }
+        let Some(entry) = entry else { return false };
         let status = match entry.status {
             AgentStatus::Dead => "dead",
             _ => "running",
