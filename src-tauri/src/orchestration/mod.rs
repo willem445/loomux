@@ -28302,8 +28302,9 @@ impl OrchRegistry {
             }
         };
         let mut seen = self.opencode_db_degraded.lock_safe();
-        // PROBE C: latch check removed
-
+        if seen.get(group) == Some(&kind) {
+            return; // already diagnosed this episode
+        }
         seen.insert(group.to_string(), kind);
         // Dropped before auditing: `audit` takes its own locks, and holding an
         // unrelated one across it is how lock-order bugs start.
