@@ -14552,16 +14552,49 @@ pub fn stranded_detail(name: &str, blocker: Option<StrandedBlocker>) -> String {
 /// (`true` => still pending/vetoable, `false` => consumed/accepted).
 #[doc(hidden)] // pub for integration tests
 pub fn box_holds_paste(stripped_tail: &str, pasted: &str) -> bool {
-    // #821: BOTH sides de-framed per line. See `normalize_deframed` for why
-    // de-framing only the tail would be worse than the bug — a markdown bullet
-    // in a brief would then read as a confident absence — and why this shares
-    // one `deframe` rather than minting a second notion of decoration.
-    let norm_pasted = normalize_deframed(pasted);
+    // #821: two routes, and the disjunction is the whole safety property —
+    // de-framing is a SUPERSET of the flat comparison, never a replacement
+    // (rev-306 B1). Either route finding our text is our text being present.
+    //
+    // The de-framed route is what #821 adds: it sees through a per-row gutter
+    // the flat comparison cannot. Both sides are de-framed there — see
+    // `normalize_deframed` for why the tail alone would be worse than the bug.
+    //
+    // The flat route is the pre-#821 comparison, kept because de-framing can
+    // otherwise LOSE a match it used to find. A wrap that pushes a mid-line
+    // `|`/`*` to a row START strips it from the tail (row-leading) and not from
+    // the needle (mid-line, and `deframe` is leading-only), so `ps aux | grep`
+    // wrapped before the pipe fails de-framed containment on text that is
+    // verbatim on screen — and the probe, sampling that same line, carries the
+    // same `|` and fails with it. That is a new route to `NotHolding`, the one
+    // reading this whole change exists to make expensive, and it needs only a
+    // pane under 48 columns rather than anything degenerate.
+    //
+    // Keeping both makes the property structural rather than case-analytic:
+    // #821 can only ever ADD `Holds` readings. A narrower `deframe` (box-drawing
+    // glyphs only, sparing `*` and `|`) would dodge today's two known shapes
+    // and would still be a case analysis — and it would mint a second notion of
+    // decoration, which is exactly what sharing `deframe` exists to avoid.
+    holds_paste_under(stripped_tail, pasted, normalize_deframed)
+        || holds_paste_under(stripped_tail, pasted, normalize_prompt_text)
+}
+
+/// One route of [`box_holds_paste`]: is `pasted` inside the tail-end window of
+/// `stripped_tail`, with both sides put through `norm` (#821)?
+///
+/// Taking the normalizer as a parameter rather than spelling the windowing
+/// twice is the point — the two routes must agree about what "the tail end"
+/// means, or the disjunction would be comparing different questions.
+fn holds_paste_under(
+    stripped_tail: &str,
+    pasted: &str,
+    norm: fn(&str) -> String,
+) -> bool {
+    let norm_pasted = norm(pasted);
     if norm_pasted.is_empty() {
         return false; // nothing to still be holding
     }
-    let norm_tail = normalize_deframed(stripped_tail);
-    box_tail_window(&norm_tail, norm_pasted.len()).contains(&norm_pasted)
+    box_tail_window(&norm(stripped_tail), norm_pasted.len()).contains(&norm_pasted)
 }
 
 /// How many raw tail bytes Tier 1 must ask for to have any chance of finding
@@ -14947,19 +14980,23 @@ pub fn box_reading(stripped_tail: Option<&str>, pasted: &str) -> BoxReading {
 /// dangerous reading: de-framing turns the gutter case from `NotHolding` into
 /// `Holds`, and the probe turns residual failures into `Unverifiable`.
 ///
-/// **The one corner where that is not a superset**, found while re-deriving
-/// this rather than left for a later reviewer: de-framing can cost a match
-/// that previously succeeded, where a row boundary lands immediately before a
-/// character [`is_frame_char`] strips which is MID-line in our own text (a
-/// wrap between `run` and `* now`). The tail loses the `*`, the needle keeps
-/// it. That lands on `Unverifiable` via the length arm or this probe in any
-/// real delivery — but for a paste whose longest line is under
-/// [`PASTE_ECHO_PROBE_MIN_CHARS`] there is no probe, and it can read
-/// `NotHolding` where the pre-#821 code read `Holds`. It needs a pane narrow
-/// enough to wrap a sub-24-character line, which is degenerate for a GUI pane,
-/// and it is strictly narrower than the hard-wrap case above — but it is a
-/// corner, so "no width at which this regresses" is true of every real
-/// delivery rather than universally.
+/// **This probe cannot be the thing that guarantees no regression, and an
+/// earlier version of this doc wrongly implied it could** (rev-306 B1). A wrap
+/// that pushes a mid-line `|`/`*` to a row start strips it from the tail and
+/// not from the needle — and this probe samples that same needle line, so it
+/// carries the same character and fails for the same reason. A backstop that
+/// shares the failure mode of what it backstops adds nothing there. Worse, the
+/// bound previously stated here (a paste whose longest line is under
+/// [`PASTE_ECHO_PROBE_MIN_CHARS`]) governs only whether a probe is FORMED and
+/// says nothing about whether a formed probe MATCHES: a wrap boundary lands
+/// inside the 48-character sample whenever the composer is under 48 columns, so
+/// the exposure was an ordinary 25-47 column split, not a degenerate pane.
+///
+/// The guarantee lives in [`box_holds_paste`] instead, where it is structural:
+/// the de-framed route is a SUPERSET of the flat one, so #821 can only add
+/// `Holds` readings. This probe's job is narrower and unchanged — turning a
+/// residual containment failure into `Unverifiable` rather than a confident
+/// absence.
 fn paste_echo_probe(pasted: &str) -> Option<String> {
     pasted
         .lines()
