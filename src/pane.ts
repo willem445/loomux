@@ -2326,17 +2326,25 @@ export class Pane implements VoiceTargetPane {
    *  is an unambiguous "I have seen this", so it is allowed to clear a warning
    *  that no reading of the pane could.
    *
-   *  The chip goes down locally first. The backend clear is what makes it STAY
-   *  down (the 3-second attention scan re-emits the whole set every tick), but
-   *  a chip that lingered for a tick after a deliberate click is precisely the
-   *  "clearing alerts is unreliable" feel this gesture exists to fix. If the
-   *  call fails, the next scan puts the chip straight back — the honest
-   *  outcome, and self-correcting without a retry of our own. */
+   *  The chip goes down locally first: the backend clear is what makes it STAY
+   *  down, but a chip that lingered for a tick after a deliberate click is
+   *  precisely the "clearing alerts is unreliable" feel this gesture exists to
+   *  fix.
+   *
+   *  A failed call therefore has to put it back **here**, and cannot be left to
+   *  the next attention scan. The tempting version of this comment — "if the
+   *  call fails the next tick re-badges us" — is false: `applyAttention`'s gate
+   *  (#743 S5) skips the whole pass while the backend payload is unchanged, and
+   *  a dismissal the backend never applied is exactly the case where it does not
+   *  change. The chip would stay down on a pane still wedged, which is the one
+   *  outcome this feature must never produce. */
   private dismissAttention(): void {
     const agentId = this.orchAgent;
-    if (!agentId || this.attentionReason !== "stranded") return;
+    const reason = this.attentionReason;
+    if (!agentId || reason !== "stranded") return;
+    const detail = this.attentionDetail ?? undefined;
     this.setAttention(null);
-    dismissStranded(agentId).catch(() => {});
+    dismissStranded(agentId).catch(() => this.setAttention(reason, detail));
   }
 
   /** Handle an OSC 7 working-directory report from the shell. Payloads are
