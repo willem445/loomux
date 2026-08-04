@@ -14438,7 +14438,6 @@ pub enum BadgeRelease {
 ///
 /// Pure and total, so every cell is directly assertable.
 #[doc(hidden)] // pub for integration tests
-#[allow(unreachable_code)] // RED-EVIDENCE STUB — reverted in the next commit.
 pub fn stranded_badge_release(
     // The chip that is currently up. `None` is the in-flight-heal wording
     // ("loomux is re-sending it"), which is not this matrix's business — the
@@ -14459,8 +14458,6 @@ pub fn stranded_badge_release(
     // late monitor can ever pass `true`; see the header.
     saw_text_in_box: bool,
 ) -> BadgeRelease {
-    // RED-EVIDENCE STUB (#825 M2) — reverted in the next commit.
-    return BadgeRelease::Keep;
     // Nothing weaker than a positive absence is evidence. Ordered first so no
     // arm below can be reached on a reading that never happened.
     if reading != Some(BoxReading::NotHolding) {
@@ -30118,11 +30115,6 @@ impl OrchRegistry {
         // `attention_inputs` uses). A pane that changes in the gap is handled
         // where it is acted on — `clear_stranded` is a no-op on an absent
         // entry, and `reword_stranded` compares before it writes.
-        // RED-EVIDENCE STUB (#825 M2) — the pass does not exist yet. Reverted
-        // in the next commit.
-        #[allow(clippy::needless_return)]
-        return;
-        #[allow(unreachable_code)]
         let panes: Vec<(String, String, u32, Option<StrandedBlocker>)> = {
             let notes = self.attn_stranded.lock_safe();
             // The common case by a wide margin: no chip anywhere, so the pass
@@ -36054,13 +36046,6 @@ impl OrchRegistry {
         expected: Option<StrandedBlocker>,
         to: Option<StrandedBlocker>,
     ) -> bool {
-        // RED-EVIDENCE STUB (#825 M2): the pre-change write, which is an
-        // INSERT — exactly what the monitor's live re-check did through
-        // `mark_stranded`. Reverted in the next commit.
-        let _ = expected;
-        self.mark_stranded(group, agent_id, to);
-        return true;
-        #[allow(unreachable_code)]
         let Some(since_ms) = ({
             let mut m = self.attn_stranded.lock_safe();
             match m.get_mut(agent_id) {
