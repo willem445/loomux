@@ -567,8 +567,81 @@ Both are identity, both were found building this slice.
   store — which is where its panes write, `OPENCODE_DB` pointing every one of
   them at `opencode_db_path(group)`.
 
+## Transcript and digest readback (#722 slice B2)
+
+`session_digest` reduces a finished worker's transcript to friction windows, and
+it does that behind **one normalizer per CLI**, all of them producing the same
+`digest::TranscriptEvent`. OpenCode is the third. Before it, an opencode agent's
+digest was the flat refusal `session_digest does not support agent CLI
+"opencode"` — and, less visibly, every opencode session contributed nothing to
+the #324 recurrence scan, which drops any session whose transcript will not read.
+
+The conversation lives in two more tables of the store slice B already reads, so
+the reader is one more query through the same `open_readonly`, never a second
+connection route: `message JOIN part`, scoped to one session, ordered by the
+vendor's own indexes — `message(session_id, time_created, id)` and
+`part(message_id, id)` (`SOURCE`, `session/sql.ts`). Ordering by id string is
+sound *here* and not at the session level: message and part ids are minted
+`ascending`, while session ids may be minted with an inverted timestamp
+(`SOURCE`, `id.ts` — see *Session identification*).
+
+**Three shape facts do all the work**, each `SOURCE`-verified at the pin in
+`packages/schema/src/v1/session.ts`:
+
+- **A message carries no text.** Both a human's prompt and an agent's reply are
+  `part` rows. So the message document is read for exactly one field — `role` —
+  and the digest's `initial_prompt` is the first user *text part*.
+- **One `tool` part carries the call AND its outcome**, as a `state` of
+  `pending | running | completed | error`, where `completed` holds `output` and
+  `error` holds `error`. Claude writes those as two blocks a message apart. So a
+  finished tool part expands into **two** events — the `ToolCall` every friction
+  signature pairs against, then the `ToolResult` — and an unfinished one emits
+  the call and no result. That asymmetry is deliberate: a call with no outcome
+  is exactly what a session that died mid-tool looks like, and manufacturing a
+  clean result would delete the wall from the digest rather than record it.
+- **Text parts can be `synthetic` or `ignored`** — scaffolding OpenCode injects
+  on the model's behalf, and text it has already decided not to send. Neither is
+  anything a human or an agent said, and `initial_prompt` is the first user text
+  in the stream, so admitting one would put a machine-written string where the
+  task brief goes.
+
+**One shared predicate widened rather than a parallel one added.**
+`is_edit_tool` matched `Edit`/`Write`/`MultiEdit` — Claude's spellings — and
+OpenCode names the same two `edit`/`write`, so the reverted-edit signature was
+structurally dead for it. The predicate is now case-insensitive. The alternative
+was rewriting OpenCode's tool names to Claude's inside the normalizer, which
+would put a name in the event stream that the transcript does not contain, for
+every consumer downstream, to satisfy one predicate. Nothing else moves: no
+Claude tool name differs from those three only by case (`NotebookEdit` is the
+near-miss, and still misses), and Copilot's normalizer emits no tool calls at
+all, so the predicate is unreachable there.
+
+**The edit tool's path key is genuinely ambiguous at the pin**, and the
+normalizer reads both spellings rather than choosing. Two tools are named
+`edit`: the v1 one whose runner writes these rows takes `filePath`
+(`SOURCE`, `packages/opencode/src/tool/edit.ts`), the newer core one takes
+`path` (`SOURCE`, `packages/core/src/tool/edit.ts`). Backing one would switch
+the reverted-edit signature off silently the day the other wins — the single
+failure a digest cannot report about itself, since a digest with no windows and
+a session with no friction look identical.
+
+**Degrading and erroring are different questions here.** `Unavailable` stays a
+degrade on the polled `group_usage` path, where the right answer to a missing
+store is "no number this tick". A digest is one deliberate call whose entire
+product is the transcript, so there it surfaces as an error naming the session
+and the reason — matching the claude arm's "no Claude transcript found". An
+empty digest would read as *this worker hit no friction*, which is a claim about
+the session made from evidence nobody read. Recurrence is unaffected either way:
+`corroborating_session_keys` already drops a session whose transcript will not
+read, so a missing store shrinks `sessions_scanned` rather than failing another
+agent's digest.
+
 ## Deliberately not done
 
+- **Reasoning parts in the digest.** OpenCode stores the model's reasoning as
+  its own part type. It is skipped for the same reason `push_claude_block`
+  skips Claude's `thinking` blocks: the digest reduces what an agent *did*, and
+  a scratchpad is the noisiest thing in a transcript per byte of signal.
 - **Solo-pane full channel membership** (#288). Not a gap: a solo launch
   appends flags to a command line the human owns and cannot set environment,
   and opencode has no MCP flag. Recorded as a decision in

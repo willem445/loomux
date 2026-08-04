@@ -20529,7 +20529,7 @@ impl OrchRegistry {
                 return self.session_digest(group, DigestLookup::Task(task.id));
             }
         };
-        let events = self.read_session_transcript_events(&cli, &session_id)?;
+        let events = self.read_session_transcript_events(group, &cli, &session_id)?;
         let mut digest = digest::build_digest(&events, final_diff_ref, outcome, title);
         // The #324 recurrence pass. Everything above this line describes ONE
         // session, which is exactly as much as the process-pro's durability
@@ -20585,7 +20585,7 @@ impl OrchRegistry {
         let out = candidates
             .into_iter()
             .filter_map(|(label, cli, sid)| {
-                let events = self.read_session_transcript_events(&cli, &sid).ok()?;
+                let events = self.read_session_transcript_events(group, &cli, &sid).ok()?;
                 Some((label, digest::session_friction_keys(&events)))
             })
             .collect::<Vec<_>>();
@@ -20605,15 +20605,26 @@ impl OrchRegistry {
     /// `group_usage` uses. Copilot: `session-state/<id>/` carries no
     /// per-turn transcript today (see `digest::parse_copilot_session_events`'s
     /// doc) — best-effort from what's on disk, never an error just because
-    /// the richer files are absent.
+    /// the richer files are absent. OpenCode: the group's own SQLite store
+    /// (#722 slice B2), which is why this takes `group` at all — the store is
+    /// per-group by construction (`OPENCODE_DB`), unlike the two
+    /// machine-global session roots above.
     ///
-    /// `session_id` reaches a filesystem path join below on both branches.
-    /// It's usually system-assigned (Claude's own session uuid), but
+    /// `session_id` reaches a filesystem path join on the claude and copilot
+    /// branches. It's usually system-assigned (Claude's own session uuid), but
     /// `Task.session` can be set by an agent through `upsert_task`'s
     /// free-form `session` field — reject anything that isn't a plain path
     /// component before it ever reaches `Path::join` (review finding NB4,
-    /// #250/#324 slice B follow-up).
-    fn read_session_transcript_events(&self, cli: &str, session_id: &str) -> Result<Vec<digest::TranscriptEvent>, String> {
+    /// #250/#324 slice B follow-up). The opencode branch binds it as a SQL
+    /// parameter instead, so it is not a path there; the check runs first for
+    /// all three regardless, because an id this registry would refuse to look
+    /// up on disk is not one to go looking for in a database either.
+    fn read_session_transcript_events(
+        &self,
+        group: &str,
+        cli: &str,
+        session_id: &str,
+    ) -> Result<Vec<digest::TranscriptEvent>, String> {
         if !digest::is_safe_session_id(session_id) {
             return Err(format!("invalid session id: {session_id:?}"));
         }
@@ -20649,6 +20660,23 @@ impl OrchRegistry {
                 let workspace = fs::read_to_string(dir.join("workspace.yaml")).unwrap_or_default();
                 let checkpoints = fs::read_to_string(dir.join("checkpoints").join("index.md")).unwrap_or_default();
                 Ok(digest::parse_copilot_session_events(&workspace, &checkpoints))
+            }
+            "opencode" => {
+                // The group's store, through the one read-only path
+                // `opencodedb` exposes — never a second connection route to
+                // the same file. `Unavailable` is a degrade for the polled
+                // usage meter, but a digest is a single deliberate call whose
+                // whole product is this transcript, so it surfaces as an error
+                // carrying the reason (absent store / unopenable / schema
+                // drift) instead of an empty digest that would read as "this
+                // worker hit no friction". `corroborating_session_keys`
+                // already drops a session whose transcript won't read, so a
+                // missing store shrinks `sessions_scanned` rather than failing
+                // somebody else's digest.
+                let db = self.opencode_db_path(group);
+                let rows = crate::opencodedb::session_transcript(&db, session_id)
+                    .map_err(|e| format!("no opencode transcript for session {session_id}: {e}"))?;
+                Ok(digest::parse_opencode_transcript_events(&rows))
             }
             other => Err(format!("session_digest does not support agent CLI {other:?}")),
         }

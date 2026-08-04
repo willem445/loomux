@@ -29,7 +29,10 @@
 //! That schema is a vendor's internal detail with no compatibility promise, so
 //! every failure mode here is **degraded, never fatal**: a store that is
 //! absent, unopenable, or shaped differently than the above yields
-//! [`Unavailable`], and the caller reports zero usage and moves on. Nothing in
+//! [`Unavailable`] rather than an error, and what that means is the caller's
+//! call — the polled usage meter reports zero and moves on, while a digest,
+//! whose entire product is the transcript it came to read, surfaces the reason
+//! instead of returning an empty one (see `session_transcript`). Nothing in
 //! this module panics, retries in a loop, or blocks for longer than
 //! [`BUSY_TIMEOUT_MS`] — it runs on the polled `group_usage` path, where a
 //! wedge would freeze a UI tick.
@@ -439,6 +442,97 @@ pub fn session_directory_on(
     )
     .optional()
     .map_err(drift)
+}
+
+// ── Transcript readback (#722 slice B2) ───────────────────────────────────
+//
+// The digest reads a finished session's conversation, and OpenCode keeps it in
+// two more tables of the same store. Verified at the same pin as the `session`
+// DDL above (`anomalyco/opencode@f67e80c2`, tag `v1.18.11`), from
+// `packages/core/src/session/sql.ts`:
+//
+// ```sql
+// CREATE TABLE `message` ( `id` text PRIMARY KEY, `session_id` text NOT NULL,
+//   `time_created` integer NOT NULL, `time_updated` integer NOT NULL, `data` text NOT NULL )
+// CREATE TABLE `part` ( `id` text PRIMARY KEY, `message_id` text NOT NULL,
+//   `session_id` text NOT NULL, `time_created` integer NOT NULL,
+//   `time_updated` integer NOT NULL, `data` text NOT NULL )
+// ```
+//
+// `data` is JSON on both: `message.data` is `Omit<SessionV1.Info, "id" |
+// "sessionID">` and `part.data` is `Omit<SessionV1.Part, "id" | "sessionID" |
+// "messageID">` (same file, `V1MessageData`/`V1PartData`). This module hands
+// those documents over verbatim — what they MEAN is
+// `digest::parse_opencode_transcript_events`'s job, so the two per-CLI
+// concerns stay where their claude/copilot counterparts already are: reading
+// bytes here, normalizing them there.
+
+/// One `part` row plus the message it hangs off — the unit
+/// [`digest::parse_opencode_transcript_events`](crate::orchestration::digest::parse_opencode_transcript_events)
+/// normalizes.
+///
+/// `message_json` repeats across every part of one message, which is why
+/// `message_id` rides along: the normalizer parses a message document once and
+/// reuses it until that id changes, rather than re-parsing it per part.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TranscriptRow {
+    pub message_id: String,
+    /// The MESSAGE's `time_created`, ms since the epoch (`Timestamps` defaults
+    /// to `Date.now()`, `packages/core/src/database/schema.sql.ts`). Parts
+    /// carry their own optional times inside `part_json`; this is the one that
+    /// is always present and is what the rows are ordered by.
+    pub time_created_ms: i64,
+    pub message_json: String,
+    pub part_json: String,
+}
+
+/// Every part of every message in `session_id`, in the order OpenCode itself
+/// reads them.
+///
+/// **The `ORDER BY` is the vendor's own index order**, not a guess:
+/// `message_session_time_created_id_idx` is `(session_id, time_created, id)`
+/// and `part_message_id_id_idx` is `(message_id, id)` (`session/sql.ts`).
+/// Ordering by id *string* alone would be wrong at the session level — session
+/// ids may be minted with a bitwise-inverted timestamp (`id.ts`, recorded in
+/// `doc/design/opencode.md`) — but message and part ids are minted `ascending`
+/// (`schema/src/v1/session.ts`, `MessageID.ascending`/`PartID.ascending`), so
+/// they are a sound tiebreak within a session and within a message.
+///
+/// An empty vec means the store is readable and this session has no messages —
+/// a pane that never took a turn. `Err` is a degrade, described by
+/// [`Unavailable`], exactly as everywhere else in this module.
+pub fn session_transcript(db: &Path, session_id: &str) -> Result<Vec<TranscriptRow>, Unavailable> {
+    session_transcript_on(&open_readonly(db)?, session_id)
+}
+
+/// [`session_transcript`] against an already-open connection.
+pub fn session_transcript_on(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Vec<TranscriptRow>, Unavailable> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT m.id, m.time_created, m.data, p.data \
+               FROM message m JOIN part p ON p.message_id = m.id \
+              WHERE m.session_id = ?1 \
+              ORDER BY m.time_created, m.id, p.id",
+        )
+        .map_err(drift)?;
+    let rows = stmt
+        .query_map([session_id], |r| {
+            Ok(TranscriptRow {
+                message_id: r.get(0)?,
+                time_created_ms: r.get(1)?,
+                message_json: r.get(2)?,
+                part_json: r.get(3)?,
+            })
+        })
+        .map_err(drift)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(drift)?);
+    }
+    Ok(out)
 }
 
 /// A cost is only worth reporting if it is finite and non-negative. SQLite
