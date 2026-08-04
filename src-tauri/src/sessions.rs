@@ -1353,7 +1353,7 @@ fn scan_opencode(limit: usize, intent: &LaunchIntentStore) -> Vec<SessionInfo> {
                 // `title` is `NOT NULL` but a session titles itself from its
                 // first turn, so a store can hold a genuinely empty one —
                 // named the same way an untitled copilot session is.
-                title,
+                title: if title.is_empty() { "OpenCode session".to_string() } else { title },
                 cwd: r.directory,
                 modified_ms: r.updated_ms,
                 // A session in the GLOBAL store was written by a pane that had
