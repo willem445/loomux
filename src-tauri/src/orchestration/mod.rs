@@ -34738,8 +34738,11 @@ impl OrchRegistry {
             // and clearing here as well would take a `TextGone` or
             // `NothingStranded` badge down behind that decision's back, which
             // is precisely the badge story those two variants exist to avoid.
-            if observation == HoldObservation::Delivered
-                && had.is_some_and(|e| e.badged)
+            // ⚠ TEMPORARY — #813 RED EVIDENCE (F2), reverted by the next
+            // commit. This is the pre-F2 gate: any episode-ender clears, which
+            // is how `Retired` inherited a badge clear the retire arm had
+            // already decided against.
+            if had.is_some_and(|e| e.badged)
                 && self
                     .stranded_note(agent_id)
                     .is_some_and(|n| matches!(n.blocker, Some(StrandedBlocker::QuestionStale) | Some(StrandedBlocker::HumanInput)))
