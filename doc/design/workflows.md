@@ -364,18 +364,47 @@ sent a round of investigation the wrong way:
 
 The repair keeps #222's rule intact — loomux still never writes into
 `.github/agents/`. Instead a persona whose list drops loomux is launched from a
-**loomux-owned copy** in `~/.copilot/agents/` carrying that same list *plus* the
-grant, in the documented spelling (*"You can also explicitly enable all tools from
-a specific MCP server using `some-mcp-server/*`"*). The user's scoping intent
-survives verbatim; loomux widens it by exactly one server, the one whose absence
-makes the delegate useless. A bare `loomux` rides alongside `loomux/*` as a hedge
-that costs nothing (*"All unrecognized tool names are ignored"*) until a live run
-settles which spelling the CLI matches on.
+**loomux-owned stand-in** in `~/.copilot/agents/` (a documented user-level agent
+location, and `--agent` takes a name, which is what the stand-in supplies).
 
-One case is deliberately **not** repaired: a persona that also declares its own
-`mcp-servers:`. The generated copy models loomux's server and nothing else, so
-re-pointing `--agent` at it would silently delete servers the user asked for.
-That block launches native, as before, with the warning.
+**A stand-in must not be a different persona.** It reproduces the user's
+frontmatter *verbatim* and re-authors exactly three keys: `name` (it must be the
+handle Copilot resolves the file by), `description` (Required, and loomux's own
+bookkeeping label), and `tools` (the list, plus the grant). Everything else —
+`model:` above all, but equally `infer:`, `target:`, and whatever Copilot
+documents next — is carried as written. Dropping a key loomux has no opinion
+about would change the persona's behavior as a side effect of a permissions fix,
+which is the same class of silent substitution this whole area exists to prevent.
+
+The grant uses the documented spelling (*"You can also explicitly enable all
+tools from a specific MCP server using `some-mcp-server/*`"*), with a bare
+`loomux` alongside as a hedge that costs nothing (*"All unrecognized tool names
+are ignored"*) until a live run settles which the CLI matches on.
+
+### loomux repairs an omission, never a decision
+
+Three lists are reported and **left exactly as written**, because each states a
+choice rather than an oversight:
+
+| the list says | why loomux does not touch it |
+|---|---|
+| its own `mcp-servers:` | the stand-in models loomux's server and nothing else, so substituting would silently delete servers the user declared |
+| `tools: []` | documented as *"disables all tools"* — a deliberate "nothing", not to be overruled into "nothing except loomux" |
+| `tools: ["loomux/report"]` | the server is scoped per-tool on purpose; widening it to `loomux/*` would be loomux granting itself more than it was given |
+
+A list that simply never mentions loomux is the omission — nobody writes
+`tools: [read, edit]` *meaning* "and loomux must not work" — and that is the only
+case rewritten. The distinction matters beyond tidiness: a tool that widens its
+own capability whenever it finds itself under-privileged is exactly what #222's
+capability closure forbids, and "it was for the user's own good" is the argument
+that rule exists to refuse.
+
+**Scoped to native personas only.** The filter can only bite where Copilot loads
+the *user's* file, i.e. the native path. A `profile:` outside `.github/agents/`,
+or one whose handle doesn't resolve back to its own file, is delivered by a
+generated file that never carried a `tools:` key — its list was never in force,
+so loomux neither warns about it nor starts reproducing it. Those blocks are
+byte-identical to before.
 
 And either way it is **loud**: an audit line (`copilot-persona-tools-gap`) and a
 `NOTE:` on the `spawn_agent` reply naming the persona and the exact line to add.

@@ -2046,11 +2046,68 @@ fn copilot_persona_tools_list_without_loomux_is_repaired_by_a_generated_copy() {
 }
 
 #[test]
+fn loomux_repairs_an_omission_but_never_a_deliberate_narrowing() {
+    // rev-lead N2. "Preserved, not widened" has to be true of the code, not just
+    // of the sentence — so the two lists that state a deliberate NARROWING are
+    // reported and left exactly as written, never widened into a grant the user
+    // did not give. Paired against the omission case in the same test, so it
+    // cannot pass by the repair being broken in general.
+    let case = |tools: &str| -> (String, String) {
+        let (reg, _d) = test_registry();
+        let repo = Repo::new().workflow(&copilot_profile_workflow("w", "p.md")).agent_file(
+            "p.md",
+            &format!("---\nname: p\ndescription: A worker.\ntools: {tools}\n---\nDo the work."),
+        );
+        let g = reg.create_group(&repo.path(), rails()).unwrap();
+        let (cmd, _argv, _k) = compile(&reg, &g, "w");
+        let audit = fs::read_to_string(reg.state_root().join(&g.id).join("audit.jsonl")).unwrap();
+        let line = audit
+            .lines()
+            .find(|l| l.contains("copilot-persona-tools-gap"))
+            .unwrap_or_else(|| panic!("every gap is reported, repaired or not: {audit}"))
+            .to_string();
+        (cmd, line)
+    };
+
+    // An OMISSION — nobody writes this meaning "and loomux must not work".
+    // Repaired: `--agent` moves off the user's own handle.
+    let (cmd, line) = case("[\"read\", \"edit\"]");
+    assert!(!cmd.contains("--agent p "), "an omission is repaired: {cmd}");
+    assert!(line.contains("re-pointed"), "{line}");
+
+    // A DECISION: `tools: []` is documented as "disables all tools".
+    let (cmd, line) = case("[]");
+    assert!(
+        cmd.contains("--agent p"),
+        "an explicit empty list is left exactly as written — loomux does not overrule \"no tools\" \
+         into \"none except loomux\": {cmd}"
+    );
+    assert!(line.contains("deliberate no-tools decision"), "and says why: {line}");
+
+    // A DECISION: the server is scoped per-tool on purpose.
+    let (cmd, line) = case("[\"read\", \"loomux/report\"]");
+    assert!(
+        cmd.contains("--agent p"),
+        "a per-tool scope is left as written — widening it to loomux/* would be loomux granting \
+         itself more than it was given: {cmd}"
+    );
+    assert!(line.contains("per-tool"), "and says why: {line}");
+}
+
+#[test]
 fn copilot_persona_that_grants_loomux_or_declares_no_tools_keeps_the_native_path() {
     // The repair must not over-trigger: an unfiltered persona (the common case,
     // and every file in this repo's own `.github/agents/`) is untouched, and so
     // is one that already grants the server — by `*`, by `loomux/*`, or by the
     // bare argv spelling the CLI's own `--allow-tool` uses.
+    //
+    // rev-lead N3: this was a guard that had never been observed red, i.e. a
+    // coverage *claim*. It is differential now — each granting list is paired
+    // below with the SAME list minus the grant, which must come out the other
+    // way. A regression to "always native" fails the twin; a regression to
+    // "always repair" fails these; and a `grants_mcp_server` stuck at either
+    // constant fails one side or the other. No mutation run needed, and the
+    // coverage lives in CI forever rather than in a cited log line.
     for tools_line in ["", "tools: [\"*\"]\n", "tools: [\"read\", \"loomux/*\"]\n", "tools: [\"read\", \"loomux\"]\n"] {
         let (reg, d) = test_registry();
         let repo = Repo::new().workflow(&copilot_profile_workflow("w", "open.md")).agent_file(
@@ -2076,7 +2133,133 @@ fn copilot_persona_that_grants_loomux_or_declares_no_tools_keeps_the_native_path
             !audit.lines().any(|l| l.contains("copilot-persona-tools-gap")),
             "a false-positive warning would train the human to ignore the real one: {tools_line:?}\n{audit}"
         );
+
+        // THE TWIN (rev-lead N3). The same fixture with the loomux grant struck
+        // out must come out the OTHER way. Without this, every assertion above
+        // would still pass if the repair had been disabled outright, and the
+        // test would be certifying nothing.
+        let stripped = tools_line.replace("\"loomux/*\"", "\"search\"").replace("\"loomux\"", "\"search\"");
+        let stripped = if tools_line.is_empty() { "tools: [\"read\"]\n".to_string() } else { stripped.replace("[\"*\"]", "[\"read\"]") };
+        let (reg2, d2) = test_registry();
+        let repo2 = Repo::new().workflow(&copilot_profile_workflow("w", "open.md")).agent_file(
+            "open.md",
+            &format!("---\nname: open\ndescription: An open worker.\n{stripped}---\nDo the work."),
+        );
+        let g2 = reg2.create_group(&repo2.path(), rails()).unwrap();
+        let (cmd2, _argv2, _k2) = compile(&reg2, &g2, "w");
+        assert!(
+            !cmd2.contains("--agent open "),
+            "twin of {tools_line:?} ({stripped:?}) grants loomux nothing, so it MUST be repaired — \
+             if this passes natively the assertions above prove nothing: {cmd2}"
+        );
+        let wrote_any2 = fs::read_dir(d2.path().join("copilot-agents"))
+            .map(|mut e| e.next().is_some())
+            .unwrap_or(false);
+        assert!(wrote_any2, "twin of {tools_line:?} must get the stand-in the granting case does not");
     }
+}
+
+#[test]
+fn a_non_resolving_handle_never_reaches_agent_even_on_the_tools_gap_refusal_path() {
+    // rev-lead B1. The refusal arm sets `--agent` to the persona's OWN
+    // frontmatter name, and every other site that does so is guarded by
+    // `copilot_native` — i.e. by `handle_resolves_to`, whose entire job is
+    // stopping loomux from kind-checking one file and launching another. A
+    // refusal is not an exemption from that.
+    //
+    // The fixture is the exact substitution `handle_resolves_to` exists to
+    // prevent, wearing a tools gap and its own `mcp-servers:` — the combination
+    // that reached the unguarded arm: `security-review.md` declares
+    // `name: worker`, so `--agent worker` would load the WORKER persona instead.
+    //
+    // Two independent things now stop it, and this test states the observable
+    // property both produce rather than either mechanism: the gap check is
+    // gated on `copilot_native`, so a non-resolving handle never enters the
+    // refusal arm at all; and the arm itself re-checks `copilot_native` before
+    // naming a persona's own handle. The assertion below is what a user would
+    // see, so it holds if either defence is later loosened — which a test
+    // written against the arm's internals would not.
+    let (reg, d) = test_registry();
+    let repo = Repo::new()
+        .workflow(&copilot_profile_workflow("w", "security-review.md"))
+        .agent_file(
+            "security-review.md",
+            "---\nname: worker\ndescription: Security review.\ntools: [\"read\"]\n\
+             mcp-servers:\n  custom-mcp:\n    command: node\n---\nReview for injection and authz holes.",
+        )
+        .agent_file("worker.md", "---\nname: worker\ndescription: The worker.\n---\nBranch, commit, open a PR.");
+    let g = reg.create_group(&repo.path(), rails()).unwrap();
+    let (cmd, argv, _kickoff) = compile(&reg, &g, "w");
+
+    let handle = argv[argv.iter().position(|a| a == "--agent").unwrap() + 1].clone();
+    assert_ne!(
+        handle, "worker",
+        "a refusal path must not emit --agent for a handle that resolves to a DIFFERENT file — \
+         that is the trust substitution handle_resolves_to exists to prevent: {cmd}"
+    );
+    // ...and the persona loomux actually read is still what reaches the agent,
+    // via the generated copy — never silently dropped by the refusal.
+    let generated = fs::read_to_string(d.path().join("copilot-agents").join(format!("{handle}.agent.md")))
+        .expect("the non-native persona still gets its generated file");
+    assert!(
+        generated.contains("injection and authz"),
+        "the file loomux read is the one delivered, not the one `worker` would name: {generated}"
+    );
+    // The narrowing, pinned from the other side: a non-native persona's `tools:`
+    // was never in force (Copilot never loads its file), so there is no gap to
+    // warn about and none is claimed...
+    let audit = fs::read_to_string(reg.state_root().join(&g.id).join("audit.jsonl")).unwrap();
+    assert!(
+        !audit.lines().any(|l| l.contains("copilot-persona-tools-gap")),
+        "a non-native persona has no tools gap to report: {audit}"
+    );
+    // ...and its list is NOT reproduced into the copy, which would narrow the
+    // block for the first time (rev-lead N1).
+    assert!(
+        !generated.contains("tools:"),
+        "the generated copy for a non-native persona must be unchanged by #802 — no tools: key, \
+         so Copilot's documented all-tools default still applies: {generated}"
+    );
+}
+
+#[test]
+fn a_repaired_stand_in_carries_every_other_frontmatter_key_verbatim() {
+    // rev-lead's copy-faithfulness finding. The stand-in replaces a file Copilot
+    // would otherwise have loaded whole, so a key loomux has no opinion about
+    // must survive the substitution. `model:` is the one with teeth — the
+    // reference documents it as the model the agent executes on, so dropping it
+    // would change the persona's model as a side effect of a permissions fix.
+    let (reg, d) = test_registry();
+    let repo = Repo::new().workflow(&copilot_profile_workflow("w", "rich.md")).agent_file(
+        "rich.md",
+        "---\nname: rich\ndescription: A richly configured worker.\ntools: [\"read\"]\n\
+         model: claude-sonnet-4.5\ninfer: false\ndisable-model-invocation: true\n---\nDo the work.",
+    );
+    let g = reg.create_group(&repo.path(), rails()).unwrap();
+    let (_cmd, argv, _kickoff) = compile(&reg, &g, "w");
+    let handle = argv[argv.iter().position(|a| a == "--agent").unwrap() + 1].clone();
+    let generated =
+        fs::read_to_string(d.path().join("copilot-agents").join(format!("{handle}.agent.md"))).unwrap();
+
+    let front: serde_norway::Value = {
+        let mut parts = generated.splitn(3, "---\n");
+        parts.next();
+        serde_norway::from_str(parts.next().unwrap())
+            .unwrap_or_else(|e| panic!("stand-in frontmatter must still be valid YAML: {e}\n{generated}"))
+    };
+    assert_eq!(
+        front["model"].as_str(),
+        Some("claude-sonnet-4.5"),
+        "a persona's model: must not vanish into a permissions fix: {generated}"
+    );
+    assert_eq!(front["infer"].as_bool(), Some(false), "{generated}");
+    assert_eq!(front["disable-model-invocation"].as_bool(), Some(true), "{generated}");
+    // The three loomux re-authors are loomux's, not the user's: `name` must be
+    // the handle Copilot resolves this file by, and the user's `name: rich` must
+    // NOT survive alongside it (two files claiming one handle is the ambiguity
+    // `handle_resolves_to` refuses elsewhere).
+    assert_eq!(front["name"].as_str(), Some(handle.as_str()), "{generated}");
+    assert!(front["description"].as_str().unwrap().contains("loomux"), "{generated}");
 }
 
 #[test]

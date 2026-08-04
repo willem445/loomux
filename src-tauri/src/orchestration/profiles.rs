@@ -159,6 +159,20 @@ pub struct AgentProfile {
     /// silently drop MCP servers the user declared, trading one missing-tools
     /// bug for another. Such a file gets the loud warning and no rewrite.
     pub has_mcp_servers: bool,
+    /// The file's frontmatter block, **verbatim** (between the `---` fences,
+    /// fences excluded) (#802).
+    ///
+    /// Kept because loomux's #802 repair writes a *stand-in* for this file, and
+    /// a stand-in carrying only the keys loomux happens to parse is a persona
+    /// silently changing shape: `model:`, `infer:`, `target:`,
+    /// `disable-model-invocation:` and whatever Copilot documents next are all
+    /// real keys loomux has no opinion about, and dropping them is not loomux's
+    /// call to make. Only `name`/`description`/`tools` are re-authored in the
+    /// copy (see `write_copilot_agent_file`); every other line is reproduced as
+    /// written.
+    ///
+    /// Never parsed beyond the key skim above — it is carried, not understood.
+    pub frontmatter: String,
 }
 
 impl AgentProfile {
@@ -204,6 +218,52 @@ pub fn tools_grant_mcp_server(tools: Option<&[String]>, server: &str) -> bool {
         let t = t.trim();
         t == "*" || t == server || t == server_wildcard
     })
+}
+
+/// Keys a loomux-generated stand-in re-authors for itself, and therefore the
+/// only ones [`carry_frontmatter`] drops from the user's block (#802).
+///
+/// - `name` **must** be the loomux handle: Copilot resolves `--agent` against
+///   the filename stem and the copy's stem is loomux's, so a carried-over `name`
+///   would leave the file disagreeing with its own filename *and* would put a
+///   second file into the world claiming the user's handle.
+/// - `description` is Required by the schema and is loomux's own bookkeeping
+///   label for the copy — routing text, not behavior.
+/// - `tools` is the whole point: carried verbatim *plus* the loomux grant.
+const LOOMUX_OWNED_FRONTMATTER_KEYS: [&str; 3] = ["name", "description", "tools"];
+
+/// The user's frontmatter with [`LOOMUX_OWNED_FRONTMATTER_KEYS`] removed, so a
+/// generated stand-in can re-author those three and reproduce **everything
+/// else** as written (#802) — `model:` above all, but equally any key Copilot
+/// documents that loomux has never heard of.
+///
+/// Line-oriented on purpose. A key's indented continuation lines (a folded
+/// scalar, a nested block like `mcp-servers:`) belong to it and are dropped or
+/// kept with it; a re-serialization through a YAML parser would instead
+/// normalize quoting, ordering and comments — i.e. would silently rewrite the
+/// user's file while claiming to copy it.
+pub fn carry_frontmatter(front: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    let mut dropping = false;
+    for line in front.lines() {
+        let indented = line.starts_with(' ') || line.starts_with('\t');
+        if indented || line.trim().is_empty() {
+            // Continuation (or blank) — it belongs to whatever key is open.
+            if !dropping {
+                out.push(line);
+            }
+            continue;
+        }
+        dropping = line
+            .split_once(':')
+            .is_some_and(|(k, _)| LOOMUX_OWNED_FRONTMATTER_KEYS.contains(&k.trim().to_lowercase().as_str()));
+        if !dropping {
+            out.push(line);
+        }
+    }
+    let kept = out.join("\n");
+    let kept = kept.trim_matches('\n');
+    if kept.is_empty() { String::new() } else { format!("{kept}\n") }
 }
 
 /// [`AgentProfile::mentions_mcp_server`] over a bare list. See
@@ -370,6 +430,10 @@ pub fn parse_profile(stem: &str, text: &str) -> Option<AgentProfile> {
         copilot_agent: None,
         tools: None,
         has_mcp_servers: false,
+        // Verbatim, before any key skim — `front` is exactly what sat between
+        // the fences, and the split above guarantees it contains no `---` line
+        // of its own to close the block early when it is re-emitted (#802).
+        frontmatter: front.trim_matches('\n').to_string(),
     };
     for (key, value) in parse_frontmatter(front) {
         match key.as_str() {

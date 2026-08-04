@@ -610,11 +610,18 @@ tools: ["read", "edit", "execute", "loomux/*"]
 ```
 
 loomux repairs this for you where it safely can — it launches such a block from
-its own copy of the persona carrying the same list plus that grant, and never
-edits files in your repo — but it always tells you, in the spawn reply and the
-audit log, which file to fix. One case it will not repair: a persona that also
-declares its own `mcp-servers:`, because loomux's copy would drop those servers.
-That one is yours to edit.
+its own stand-in for the persona, carrying every line of your file plus that
+grant, and never edits anything in your repo — but it always tells you, in the
+spawn reply and the audit log, which file to fix.
+
+Three cases it deliberately leaves alone, because each is a choice you made
+rather than something you forgot. It says so, and the fix is yours:
+
+- the persona declares its own `mcp-servers:` — loomux's stand-in would drop them;
+- `tools: []`, which disables every tool — loomux won't turn "nothing" into
+  "nothing except loomux";
+- the list already names loomux per-tool (`loomux/report`) — loomux won't widen a
+  scope you set on purpose.
 
 **Reviewer diversity across models.** A block's `cli`/`model` are set
 per-block, so nothing stops a reviewer lane from running on a different
