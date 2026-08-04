@@ -10148,7 +10148,7 @@ fn sanitize_session(s: &str) -> Option<String> {
     let t = s.trim();
     (!t.is_empty()
         && t.len() <= 64
-        && t.chars().all(|_c| true)) // PROBE R2
+        && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'))
     .then(|| t.to_string())
 }
 
@@ -21536,7 +21536,6 @@ impl OrchRegistry {
         group: &str,
     ) -> Option<SessionBaseline> {
         match cli {
-            "claude" => Some(SessionBaseline::OpenCode { ids: HashSet::new() }), // PROBE R6
             "copilot" => crate::sessions::copilot_session_state_root().map(|root| {
                 let ids = crate::sessions::copilot_session_ids(&root);
                 SessionBaseline::Copilot { ids, root }
@@ -21652,7 +21651,7 @@ impl OrchRegistry {
                     // Absent is not a degrade here, it is the ordinary state of
                     // a store opencode has not created yet — the same reading
                     // `note_opencode_db_degrade` gives it.
-                    Err(crate::opencodedb::Unavailable::Absent) => SessionSearch::Unreadable("PROBE R3".into()),
+                    Err(crate::opencodedb::Unavailable::Absent) => SessionSearch::Waiting,
                     Err(e) => SessionSearch::Unreadable(e.to_string()),
                 }
             }
@@ -21684,8 +21683,8 @@ impl OrchRegistry {
             let mut agents = self.agents.lock_safe();
             let Some(a) = agents.get_mut(agent_id) else { return };
             // Don't clobber an id set in the meantime (e.g. a resume).
-            if true {
-                return; // PROBE R9
+            if a.session_id.is_some() {
+                return;
             }
             a.session_id = Some(session_id.to_string());
             a.clone()
