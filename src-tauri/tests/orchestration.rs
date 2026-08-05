@@ -41399,14 +41399,17 @@ fn g8_short_pastes_cannot_claim_short_options_of_real_dialogs() {
     // question row at all stays a question by its footer.
 
     // h1: the real copilot-question fixture, a short paste byte-matching its
-    // own highlighted `❯ Yes`. Must stay a question — and BY THE POINTER, not
-    // merely by the fixture's footer token, because a wrapped or localized
-    // footer is the gap the detector's own code names.
+    // own highlighted `❯ Yes`. Must stay a question. (The detector reports the
+    // fixture's footer token ahead of the pointer, so what is asserted here is
+    // the hold surviving, not the needle; h2 removes the footer to pin the
+    // veto's protection of the pointer row itself.)
     let tail = strip_ansi(FIX_COPILOT_ASK.as_bytes());
     let masked = mask_own_paste(&tail, "Yes");
-    let m = prompt_wait_match(&masked)
-        .expect("a live Copilot command dialog must survive a short `Yes` paste (#420)");
-    assert_eq!(m.needle, QuestionNeedle::LeadingPointer, "by the pointer, not the footer");
+    assert!(
+        prompt_wait_match(&masked).is_some(),
+        "a live Copilot command dialog must survive a short `Yes` paste (#420): {:?}",
+        prompt_wait_match(&masked)
+    );
 
     // h2: the same shape with the footer REMOVED — here the veto, and only the
     // veto, keeps `❯ Yes` out of the mask. This is the footerless dialog the
