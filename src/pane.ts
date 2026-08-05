@@ -485,6 +485,22 @@ interface EmbedSlotState {
   dividerEl: HTMLElement;
 }
 
+/** xterm's own "a human just typed" parse-latency hint, reached behind two
+ *  private fields — the only path that makes `WriteBuffer.write` parse a chunk
+ *  SYNCHRONOUSLY instead of scheduling it behind a `setTimeout`
+ *  (src/common/input/WriteBuffer.ts, the `_didUserInput` fast path). Not an
+ *  invented hook: it is the exact call xterm wires to `coreService.onUserInput`
+ *  for every keystroke (src/common/CoreTerminal.ts, `this.coreService
+ *  .onUserInput(() => this._writeBuffer.handleUserInput())`). The public
+ *  `Terminal` type omits both `_core` and the WriteBuffer, so the reach is a
+ *  bounded cast against the pinned xterm — and it is `handleUserInput`, NOT
+ *  `writeSync`, because `WriteBuffer.writeSync` is marked `@deprecated
+ *  Unreliable, to be removed soon` and can drop a chunk mid-sync-loop. */
+function hintXtermSyncParse(term: Terminal): void {
+  const core = (term as unknown as { _core: { _writeBuffer: { handleUserInput(): void } } })._core;
+  core._writeBuffer.handleUserInput();
+}
+
 export class Pane implements VoiceTargetPane {
   readonly el: HTMLElement;
   readonly term: Terminal;
@@ -1471,7 +1487,26 @@ export class Pane implements VoiceTargetPane {
     // schedules a parse task when it was empty, so these N pushes cost one
     // parse task and one render pass between them — the same as a single write,
     // without copying every byte a second time to get there.
-    for (const chunk of chunks) this.term.write(chunk);
+    //
+    // #813 residual — the half of the deferral `decideFlush` cannot see.
+    // Flushing is the loomux side; each `Terminal.write` still lands in
+    // `WriteBuffer.write`, which schedules its parse on a `setTimeout` unless a
+    // keystroke set `_didUserInput` first. A hidden document clamps that timer
+    // exactly as it clamps the one `decideFlush` removed, so the terminal's
+    // auto-replies (DA/DSR/OSC-colour/XTVERSION answers, DEC-1004 focus
+    // reports — emitted only when the query is PARSED) stay stalled in front
+    // of the one path out of xterm that is not display, and an agent CLI
+    // waiting on one of them waits on our timer. A workstation lock is hidden
+    // for its whole duration, which is #813's window. While hidden, re-arm
+    // xterm's own fast path per chunk so the parse — and the reply it emits
+    // back down the pty — completes synchronously in this same call, with no
+    // clamped timer in series. Visible, the timer path is fine (nothing is
+    // clamped) and forcing sync parses would only cost the render thread.
+    const syncParse = !sharedVisibility().visible();
+    for (const chunk of chunks) {
+      if (syncParse) hintXtermSyncParse(this.term);
+      this.term.write(chunk);
+    }
   }
 
   /** Throw held output away and return the pane to quiet (#720). The ONLY
