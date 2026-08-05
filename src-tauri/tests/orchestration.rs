@@ -41386,6 +41386,53 @@ fn g7_a_short_steer_in_the_chevron_composer_is_still_our_own_prompt() {
 }
 
 #[test]
+fn g8_short_pastes_cannot_claim_short_options_of_real_dialogs() {
+    // The waiver's fail-safe, tested from the side the fixtures actually
+    // exhibit. g4 pins only the `? Overwrite …` shape (which the veto always
+    // recognized) and g5's paste is a single line above the floor, so neither
+    // ever ENGAGES the short-line waiver — but the moment a short paste can be
+    // claimed, the veto is the only thing standing between it and a live
+    // dialog's `Yes` (#420). The captured dialogs do not all head their option
+    // lists with `?`: Copilot's command dialog is `●`-bulleted, Claude's
+    // question is boxed, and both end the question row with `?`. These pin
+    // that the veto reads those shapes too, and that the one dialog with no
+    // question row at all stays a question by its footer.
+
+    // h1: the real copilot-question fixture, a short paste byte-matching its
+    // own highlighted `❯ Yes`. Must stay a question — and BY THE POINTER, not
+    // merely by the fixture's footer token, because a wrapped or localized
+    // footer is the gap the detector's own code names.
+    let tail = strip_ansi(FIX_COPILOT_ASK.as_bytes());
+    let masked = mask_own_paste(&tail, "Yes");
+    let m = prompt_wait_match(&masked)
+        .expect("a live Copilot command dialog must survive a short `Yes` paste (#420)");
+    assert_eq!(m.needle, QuestionNeedle::LeadingPointer, "by the pointer, not the footer");
+
+    // h2: the same shape with the footer REMOVED — here the veto, and only the
+    // veto, keeps `❯ Yes` out of the mask. This is the footerless dialog the
+    // #420 harm is about; a footer-token answer would leave it open.
+    let footerless = "● Allow Copilot to run the following command?\n$ npm test\n\n❯ Yes\n  \
+                      No, and tell Copilot what to do differently";
+    let footerless_masked = mask_own_paste(footerless, "Yes");
+    let m2 = prompt_wait_match(&footerless_masked)
+        .expect("a footerless Copilot dialog's short highlighted choice must still be a question");
+    assert_eq!(m2.needle, QuestionNeedle::LeadingPointer, "and still by the pointer");
+
+    // h3: the Claude MCP approval asks no question — prose preamble, then the
+    // numbered options. The veto cannot name it (nothing ends in `?`), so its
+    // protection is the confirm footer plus options no paste plausibly matches;
+    // pin that the one short paste that COULD byte-match its highlighted row
+    // still leaves the dialog a question.
+    let mcp = strip_ansi(FIX_CLAUDE_MCP_APPROVAL.as_bytes());
+    let mcp_masked = mask_own_paste(&mcp, "1. Use this MCP server");
+    assert!(
+        prompt_wait_match(&mcp_masked).is_some(),
+        "an MCP approval dialog must hold even when its highlighted row matches our paste: {:?}",
+        prompt_wait_match(&mcp_masked)
+    );
+}
+
+#[test]
 fn g5_every_captured_real_dialog_still_holds_with_a_delivery_on_screen() {
     // #727's suite is the floor, and the argument that CHANGED is the mask —
     // so each captured shape is re-checked THROUGH the new exclusion with a

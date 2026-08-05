@@ -19671,15 +19671,20 @@ pub fn mask_own_paste(tail: &str, pasted_text: &str) -> String {
                 // byte-identical whether it is our composer holding a one-word
                 // paste or a live dialog's highlighted choice — and the row
                 // cannot tell the difference. Its NEIGHBORHOOD can: every real
-                // permission dialog paints a `? ...` prompt line above its
-                // option list (every captured copilot/claude fixture does), and
-                // a composer never does — its chrome above the input row is a
-                // divider, the cwd and the status line. So the floor is waived
-                // exactly when no such header sits within
+                // dialog's option list is headed by the question it is asking —
+                // g4's `? Overwrite the existing file?`, Copilot's
+                // `● Allow Copilot to run …?` and `● Which retry strategy …?`,
+                // Claude's boxed `Which authentication …?` — and a composer
+                // never paints one: its chrome above the input row is
+                // `● Ready.`, the cwd, and a divider. So the floor is waived
+                // exactly when no such question row sits within
                 // `DIALOG_HEADER_LOOKBACK` rows above: a short pointer row that
                 // is byte-for-byte one of our pasted lines, under no dialog
                 // header, is our own composer, and masking it cannot release an
                 // Enter into a dialog — there is none there to select into.
+                // (The one captured dialog with no question row, the Claude MCP
+                // approval's prose, is kept a question by its confirm footer —
+                // see g8's h3.)
                 let own_short_composer = !dialog_header_above(&norm, i);
                 claimed = pasted
                     .iter()
@@ -19747,29 +19752,38 @@ const SELF_ECHO_MIN_POINTER_CHARS: usize = 24;
 
 /// How far above a pointer row [`dialog_header_above`] scans before giving up.
 ///
-/// 6 rows because a dialog's `? ...` header is always within that window and
-/// its decoration is not: every captured permission fixture (g4's overwrite
-/// dialog, `copilot-question`, the multichoice, the Claude question/MCP
-/// approvals) paints header-first, then the options; the composer fixture
-/// paints `● Ready.` (its "header"-shaped row), a blank, the cwd, a divider,
-/// the input row — and `● Ready.` is not a `? ...` row, so the scan finding
-/// nothing is what lets a short steer through there. A longer window only
-/// widens the risk that unrelated prior dialog text leaks into the verdict.
+/// 6 rows because a dialog's question line is always within that window and
+/// its decoration is not: g4's overwrite dialog, Copilot's command and
+/// retry-strategy questions, and the boxed Claude question all paint the
+/// question first, then the options; the composer fixture paints `● Ready.`
+/// (its "header"-shaped row), a blank, the cwd, a divider, then the input row
+/// — and `● Ready.` is not a question row, so the scan finding nothing is what
+/// lets a short steer through there. A longer window only widens the risk that
+/// unrelated prior dialog text leaks into the verdict.
 const DIALOG_HEADER_LOOKBACK: usize = 6;
 
-/// Does this row look like a live dialog's `? ...` prompt line?
+/// Does this row look like a live dialog's question line?
 ///
-/// The question glyph must open the row and be followed by real words — a
-/// bare `?` or a row that is only the glyph (which deframing can produce from
-/// a lone-`?` border cell) does not paint the question a dialog asks. Used
-/// only as a veto in [`mask_own_paste`], so the bar is set on the side of
-/// *seeing* a dialog: a row that merely resembles a prompt keeps the pointer
-/// row below it unmasked, which errs into a hold we can release, never into
-/// an Enter into a live dialog.
+/// The captured dialog fixtures head their option lists four ways, and all
+/// four resolve to one rule: the question row ends in `?`. g4's overwrite
+/// dialog is `? Overwrite the existing file?` (opens and closes with it);
+/// Copilot's command and retry-strategy questions are `●`-bulleted
+/// (`Allow Copilot to run the following command?`, `Which retry strategy …?`);
+/// Claude's AskUserQuestion sits boxed (`Which authentication approach …?`).
+/// [`deframe`] strips the bullet and the border and [`wrap_normalize`]
+/// lowercases, and every one of those is a row ending in `?`. A bare `?` — or
+/// a row that is only the glyph, which deframing can produce from a lone-`?`
+/// border cell — has no words and is not a question. The one captured dialog
+/// that asks no question, the Claude MCP approval's prose preamble, has
+/// nothing here to detect and is kept a question by its confirm footer
+/// instead. Used only as a veto in [`mask_own_paste`], so the bar is set on
+/// the side of *seeing* a dialog: a row that merely resembles a prompt keeps
+/// the pointer row below it unmasked, which errs into a hold we can release,
+/// never into an Enter into a live dialog.
 fn is_dialog_header(line: &str) -> bool {
     let row = wrap_normalize(line);
-    let words = row.strip_prefix('?').unwrap_or(&row).trim();
-    !words.is_empty() && words != "?" && row.starts_with('?')
+    let words = row.trim_matches('?').trim();
+    !words.is_empty() && (row.starts_with('?') || row.ends_with('?'))
 }
 
 /// Is there a `? ...` dialog header anywhere in the (at most
