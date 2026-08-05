@@ -41327,6 +41327,65 @@ fn g4_a_short_pasted_line_never_claims_a_menu_option_row() {
 }
 
 #[test]
+fn g7_a_short_steer_in_the_chevron_composer_is_still_our_own_prompt() {
+    // #820's stated residual, now reported for real: a SHORT steering line
+    // (`merge`, `ok`, `fix the build`) from loomux's compose strip sits in
+    // Copilot's `❯ ` chevron composer below `SELF_ECHO_MIN_POINTER_CHARS`, so
+    // the pointer strip refused it and the pre-Enter question gate latched on
+    // our own text for up to `QUESTION_HOLD_MAX`. The evidence that separates
+    // our composer from a live dialog is neighbourhood, not length: a dialog
+    // paints a `? ...` prompt row above its options (g4's fixture, every
+    // captured claude/copilot question); a composer paints none. This pins
+    // both directions of the waiver that buys the short case.
+    let tail = "● Ready.\nC:\\Projects\\loomux [⎇ main]\n──────────────────────\n❯ merge\n──────────────────────\n  @ files · # issues · Session: 4.2 AIC used";
+
+    // Precondition: the same one g1 asserts — the `❯ ` row fires the signal
+    // without the exclusion, and it sits inside the detector's own window.
+    let last_painted: Vec<String> = tail
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .rev()
+        .take(3)
+        .collect();
+    assert!(
+        last_painted.iter().any(|l| l.starts_with('❯')),
+        "precondition: the composer's `❯ ` input row must sit inside the pointer window: \
+         {last_painted:?}"
+    );
+    let unmasked = prompt_wait_match(tail).expect("the raw screen IS pointer-shaped");
+    assert_eq!(unmasked.signal, "pointer-option", "and by THIS signal class");
+
+    // h1: the short line, with no dialog header above it, IS our own prompt.
+    let masked = mask_own_paste(tail, "merge");
+    assert!(
+        prompt_wait_match(&masked).is_none(),
+        "a short line in a composer with no dialog header above it is our own steer, not a \
+         menu's choice (#820 residual): {:?}",
+        prompt_wait_match(&masked)
+    );
+
+    // h2: the SAME shape is a live dialog's choice when a `? ...` header sits
+    // above the pointer row — g4's fail-safe must survive the waiver.
+    let dialog = "? Overwrite the existing file?\n❯ Overwrite\n  Keep both";
+    let dialog_masked = mask_own_paste(dialog, "Overwrite");
+    let m = prompt_wait_match(&dialog_masked)
+        .expect("a real dialog with a short highlighted choice must still be a question (#420)");
+    assert_eq!(m.needle, QuestionNeedle::LeadingPointer, "and still by the pointer");
+
+    // h3: end to end, at the same pre-Enter checkpoint that held the pane.
+    let pred = question_hold_predicate(
+        move || Some(tail.as_bytes().to_vec()),
+        Some("merge".to_string()),
+        Vec::new(),
+    );
+    assert!(
+        !pred(),
+        "a short steer under no dialog header must not hold the delivery (#820 residual)"
+    );
+}
+
+#[test]
 fn g5_every_captured_real_dialog_still_holds_with_a_delivery_on_screen() {
     // #727's suite is the floor, and the argument that CHANGED is the mask —
     // so each captured shape is re-checked THROUGH the new exclusion with a

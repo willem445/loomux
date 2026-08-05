@@ -19666,9 +19666,26 @@ pub fn mask_own_paste(tail: &str, pasted_text: &str) -> String {
                 // because only the FIRST row of a composer's line carries the
                 // prompt chevron.
                 let framed = std::mem::replace(&mut norm[i], head);
+                // #820 residual, the human's case: a SHORT steer. The floor
+                // refuses to claim `❯ merge` (5 chars) because `❯ Overwrite` is
+                // byte-identical whether it is our composer holding a one-word
+                // paste or a live dialog's highlighted choice — and the row
+                // cannot tell the difference. Its NEIGHBORHOOD can: every real
+                // permission dialog paints a `? ...` prompt line above its
+                // option list (every captured copilot/claude fixture does), and
+                // a composer never does — its chrome above the input row is a
+                // divider, the cwd and the status line. So the floor is waived
+                // exactly when no such header sits within
+                // `DIALOG_HEADER_LOOKBACK` rows above: a short pointer row that
+                // is byte-for-byte one of our pasted lines, under no dialog
+                // header, is our own composer, and masking it cannot release an
+                // Enter into a dialog — there is none there to select into.
+                let own_short_composer = !dialog_header_above(&norm, i);
                 claimed = pasted
                     .iter()
-                    .filter(|line| line.chars().count() >= SELF_ECHO_MIN_POINTER_CHARS)
+                    .filter(|line| {
+                        line.chars().count() >= SELF_ECHO_MIN_POINTER_CHARS || own_short_composer
+                    })
                     .find_map(|line| reconstructs_to_end(&norm, i, line, 0));
                 if claimed.is_none() {
                     norm[i] = framed;
@@ -19727,6 +19744,40 @@ fn strip_leading_pointer(line: &str) -> Option<&str> {
 /// `delivery-held-in-queue` in the same change is what makes such a hold name
 /// itself.
 const SELF_ECHO_MIN_POINTER_CHARS: usize = 24;
+
+/// How far above a pointer row [`dialog_header_above`] scans before giving up.
+///
+/// 6 rows because a dialog's `? ...` header is always within that window and
+/// its decoration is not: every captured permission fixture (g4's overwrite
+/// dialog, `copilot-question`, the multichoice, the Claude question/MCP
+/// approvals) paints header-first, then the options; the composer fixture
+/// paints `● Ready.` (its "header"-shaped row), a blank, the cwd, a divider,
+/// the input row — and `● Ready.` is not a `? ...` row, so the scan finding
+/// nothing is what lets a short steer through there. A longer window only
+/// widens the risk that unrelated prior dialog text leaks into the verdict.
+const DIALOG_HEADER_LOOKBACK: usize = 6;
+
+/// Does this row look like a live dialog's `? ...` prompt line?
+///
+/// The question glyph must open the row and be followed by real words — a
+/// bare `?` or a row that is only the glyph (which deframing can produce from
+/// a lone-`?` border cell) does not paint the question a dialog asks. Used
+/// only as a veto in [`mask_own_paste`], so the bar is set on the side of
+/// *seeing* a dialog: a row that merely resembles a prompt keeps the pointer
+/// row below it unmasked, which errs into a hold we can release, never into
+/// an Enter into a live dialog.
+fn is_dialog_header(line: &str) -> bool {
+    let row = wrap_normalize(line);
+    let words = row.strip_prefix('?').unwrap_or(&row).trim();
+    !words.is_empty() && words != "?" && row.starts_with('?')
+}
+
+/// Is there a `? ...` dialog header anywhere in the (at most
+/// [`DIALOG_HEADER_LOOKBACK`]) rows above `from`?
+fn dialog_header_above(norm: &[String], from: usize) -> bool {
+    let start = from.saturating_sub(DIALOG_HEADER_LOOKBACK);
+    norm[start..from].iter().any(|row| is_dialog_header(row))
+}
 
 /// The marker every notice loomux writes into a pane opens with, and the whole
 /// basis of [`mask_loomux_notices`] (#576).
