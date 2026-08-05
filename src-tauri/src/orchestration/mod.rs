@@ -1597,7 +1597,7 @@ if [ -n "$LOOMUX_GROUP_DIR" ]; then
   printf '{"ts_ms":%s,"actor":"loomux-shim","action":"self-launch-blocked","detail":{"agent":"%s"}}\n' \
     "$ts" "$LOOMUX_AGENT_ID" >> "$LOOMUX_GROUP_DIR/audit.jsonl" 2>/dev/null || true
 fi
-printf '%s\n' "loomux: running the loomux launcher from an agent pane is blocked. It is an installer, not a window switcher: it reinstalls the desktop app whenever its version differs from its own, and the silent install kills the running Loomux — terminating this pane and every other agent mid-task. Loomux is reachable from here through its MCP tools only. If the app needs restarting, reinstalling or a version check, ask the human (message_orchestrator, or report blocked); never run it yourself." >&2
+printf '%s\n' "loomux: running the loomux launcher from an agent pane is blocked. It is an installer, not a window switcher: plain loomux installs the desktop app when it is missing and loomux update reinstalls it, and the silent install kills the running Loomux — terminating this pane and every other agent mid-task. Loomux is reachable from here through its MCP tools only. If the app needs restarting or updating, ask the human (message_orchestrator, or report blocked); never run it yourself." >&2
 exit 1
 "#;
     // Normalize to LF (see gh_shim_sh) — a CRLF POSIX script is broken.
@@ -1621,7 +1621,7 @@ pub fn loomux_shim_cmd() -> String {
      if defined LOOMUX_GROUP_DIR (\r\n\
      \x20 >>\"%LOOMUX_GROUP_DIR%\\audit.jsonl\" echo {\"ts_ms\":0,\"actor\":\"loomux-shim-cmd\",\"action\":\"self-launch-blocked\",\"detail\":{}} 2>nul\r\n\
      )\r\n\
-     >&2 echo loomux: running the loomux launcher from an agent pane is blocked. It is an installer, not a window switcher - it reinstalls the desktop app and the silent install kills the running Loomux, terminating this pane and every other agent mid-task. Use the loomux MCP tools; ask the human to restart, reinstall or version-check the app.\r\n\
+     >&2 echo loomux: running the loomux launcher from an agent pane is blocked. It is an installer, not a window switcher - plain loomux installs the app when it is missing and loomux update reinstalls it, and the silent install kills the running Loomux, terminating this pane and every other agent mid-task. Use the loomux MCP tools; ask the human to restart or update the app.\r\n\
      exit /b 1\r\n"
         .to_string()
 }

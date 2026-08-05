@@ -19579,9 +19579,10 @@ fn loomux_shim_harness_blocks_the_launcher_and_audits_it() {
     let shim = root.join("loomux");
     std::fs::write(&shim, loomux_shim_sh()).unwrap();
 
-    // Every shape an agent might reach for — bare, a flag, the launcher's own
-    // reinstall escape hatch — refuses identically. There is no allowed argv.
-    for argv in [vec![], vec!["--version"], vec!["--reinstall"]] {
+    // Every shape an agent might reach for — bare, a flag, the launcher's
+    // `update` command, or the pre-#845 `--reinstall` flag — refuses
+    // identically. There is no allowed argv.
+    for argv in [vec![], vec!["--version"], vec!["--reinstall"], vec!["update"]] {
         let out = Command::new("sh").arg(&shim).args(&argv)
             .env("LOOMUX_GROUP_DIR", &group).env("LOOMUX_AGENT_ID", "w-1")
             .output().unwrap();
@@ -19592,7 +19593,7 @@ fn loomux_shim_harness_blocks_the_launcher_and_audits_it() {
     }
     // One audit line per attempt, naming the agent that tried.
     let audit = std::fs::read_to_string(group.join("audit.jsonl")).unwrap();
-    assert_eq!(audit.lines().filter(|l| l.contains("self-launch-blocked")).count(), 3);
+    assert_eq!(audit.lines().filter(|l| l.contains("self-launch-blocked")).count(), 4);
     assert!(audit.contains("\"agent\":\"w-1\""), "the audit names the agent: {audit}");
     for line in audit.lines() {
         let v: serde_json::Value =

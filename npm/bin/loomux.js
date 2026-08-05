@@ -10,6 +10,18 @@
 // per-platform logic mirrors install.sh / install.ps1 so all three install
 // paths behave the same.
 //
+// The command has three subcommands (#845):
+//
+//   loomux            launch the installed app; install it only if missing
+//   loomux update     install/refresh the app — the only path that fetches
+//                     when something is already installed or cached
+//   loomux version    print this launcher's version
+//   loomux help       print usage
+//
+// Plain `loomux` deliberately never upgrades: the silent installers terminate
+// a running Loomux to replace its files, so autoupdate killed live agents
+// (#815) and the update decision belongs to the human as `loomux update`.
+//
 // Dependency-free on purpose: `npx loomux` should have nothing to compile
 // and nothing to trust beyond Node's own stdlib (Node >=18 for global fetch).
 
@@ -21,7 +33,7 @@ const path = require("path");
 const { spawn, spawnSync } = require("child_process");
 
 const REPO = "willem445/loomux";
-const { version: PKG_VERSION, name: PKG_NAME } = require("../package.json");
+const { version: PKG_VERSION } = require("../package.json");
 
 const BLUE = "\x1b[1;34m";
 const GREEN = "\x1b[1;32m";
@@ -38,7 +50,48 @@ function die(msg) {
   process.exit(1);
 }
 
-const REINSTALL = process.argv.slice(2).includes("--reinstall");
+// ---------- CLI ----------
+
+const HELP = `loomux ${PKG_VERSION} — Loomux desktop launcher
+
+Launches the Loomux desktop app (installing it first if needed). Run
+\`loomux\` with no arguments to launch.
+
+USAGE
+  loomux            Launch the installed app, or install it if missing. Never
+                    updates an existing install.
+  loomux update     Install/refresh the app from the matching GitHub release.
+                    Reinstalling over a running app closes it, so quit Loomux
+                    first — the launcher refuses while it is running.
+  loomux version    Print this launcher's version.
+  loomux help       Show this help.
+  loomux --help, -h Same as \`loomux help\`.
+  loomux --version  Same as \`loomux version\`.
+
+Requires Node 18+.
+`;
+
+// Resolve argv to a command. Any input we don't recognize — including trailing
+// junk after a valid command — comes back as `{command:null}` so main() dies
+// with a hint instead of guessing what the user meant.
+function parseArgs(argv) {
+  if (argv.length === 0) return { command: "launch" };
+  if (argv.length !== 1) return { command: null, arg: argv[0] };
+  switch (argv[0]) {
+    case "help":
+    case "--help":
+    case "-h":
+      return { command: "help" };
+    case "version":
+    case "--version":
+      return { command: "version" };
+    case "update":
+    case "--reinstall": // compat alias for pre-#845 scripts and muscle memory
+      return { command: "update" };
+    default:
+      return { command: null, arg: argv[0] };
+  }
+}
 
 // ---------- GitHub release lookup ----------
 
@@ -93,94 +146,28 @@ function cacheDir() {
   return path.join(base, "loomux");
 }
 
-// ---------- version ordering ----------
+// ---------- Linux AppImage cache ----------
 
-// Split a semver-ish string into [major, minor, patch, prerelease[]], or null if
-// it doesn't parse. Build metadata (`+…`) is ignored, as semver requires.
-function parseVersion(v) {
-  const m = /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/.exec(
-    String(v).trim()
-  );
-  if (!m) return null;
-  return [Number(m[1]), Number(m[2]), Number(m[3]), m[4] ? m[4].split(".") : []];
-}
-
-// Compare two prerelease identifiers. Semver says numeric identifiers compare
-// numerically and alphanumeric ones compare as ASCII — but this project tags
-// `beta9`, `beta10`, where a flat ASCII compare puts beta10 BELOW beta9 ("1" <
-// "9") and would hand us a downgrade that reads as an upgrade. So each
-// identifier is compared as alternating runs of digits and non-digits, digits
-// numerically: "beta9" < "beta10", and plain semver forms are unaffected.
-function compareIdentifier(a, b) {
-  const runs = (s) => s.match(/\d+|\D+/g) || [];
-  const [ra, rb] = [runs(a), runs(b)];
-  for (let i = 0; i < Math.max(ra.length, rb.length); i++) {
-    const [x, y] = [ra[i], rb[i]];
-    if (x === undefined) return -1;
-    if (y === undefined) return 1;
-    const [nx, ny] = [/^\d+$/.test(x), /^\d+$/.test(y)];
-    if (nx && ny) {
-      if (Number(x) !== Number(y)) return Number(x) < Number(y) ? -1 : 1;
-    } else if (nx !== ny) {
-      return nx ? -1 : 1; // numeric identifiers rank below alphanumeric ones
-    } else if (x !== y) {
-      return x < y ? -1 : 1;
-    }
+// The newest cached AppImage for this platform wins, preferring the exact
+// version this launcher ships. On Linux the cached AppImage IS the install, so
+// plain `loomux` launches whatever is there and never downloads — `loomux
+// update` is the only path that fetches again (#845). Download recency is a
+// fine stand-in for version recency: cache files are only ever created by a
+// download, never touched after.
+function pickCachedAppImage(dir, suffix, pkgVersion) {
+  let entries;
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return null;
   }
-  return 0;
-}
-
-// -1 / 0 / 1 for a < b, a == b, a > b; null when either side doesn't parse.
-function compareVersions(a, b) {
-  const [pa, pb] = [parseVersion(a), parseVersion(b)];
-  if (!pa || !pb) return null;
-  for (let i = 0; i < 3; i++) if (pa[i] !== pb[i]) return pa[i] < pb[i] ? -1 : 1;
-  // A prerelease ranks below the release it precedes: 1.1.0-beta9 < 1.1.0.
-  if (pa[3].length === 0 || pb[3].length === 0) {
-    if (pa[3].length === pb[3].length) return 0;
-    return pa[3].length ? -1 : 1;
-  }
-  for (let i = 0; i < Math.max(pa[3].length, pb[3].length); i++) {
-    const [x, y] = [pa[3][i], pb[3][i]];
-    if (x === undefined) return -1; // fewer identifiers ranks lower
-    if (y === undefined) return 1;
-    const c = compareIdentifier(x, y);
-    if (c !== 0) return c;
-  }
-  return 0;
-}
-
-// The installed app can be older than this launcher (updating the npm package
-// replaces only the launcher, never the app it installed earlier). Each platform
-// reads the version of whatever is actually installed; only an installed app that
-// is genuinely OLDER is reinstalled.
-//
-// Ordering, not equality (#815). `installed !== PKG_VERSION` treated *any*
-// difference as "upgrade", so a stable launcher left on PATH reinstalled — i.e.
-// DOWNGRADED — a newer prerelease install every single time it ran, while
-// announcing an upgrade. That reinstall is what killed a running app, so the
-// wrong direction here is not a cosmetic bug.
-//
-// Launch as-is whenever the answer isn't a confident "older": `null` (version
-// undetectable, or either side unparseable) keeps a broken probe from causing a
-// download-on-every-launch loop, same as before.
-function shouldLaunchExisting(installed) {
-  if (installed === null) return true;
-  const cmp = compareVersions(installed, PKG_VERSION);
-  if (cmp === null) {
-    say(`can't order installed v${installed} against launcher v${PKG_VERSION} — launching as-is`);
-    return true;
-  }
-  if (cmp === 0) return true;
-  if (cmp > 0) {
-    say(
-      `installed app is v${installed}, newer than this launcher (v${PKG_VERSION}) — ` +
-        `launching it as-is (update the launcher with \`npm i -g ${PKG_NAME}@latest\`)`
-    );
-    return true;
-  }
-  say(`installed app is v${installed}, launcher is v${PKG_VERSION} — upgrading`);
-  return false;
+  const re = new RegExp(`^Loomux_.+_${suffix}\\.AppImage$`);
+  const hits = entries
+    .filter((e) => e.isFile() && re.test(e.name))
+    .map((e) => path.join(dir, e.name))
+    .sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
+  if (hits.length === 0) return null;
+  return hits.find((p) => path.basename(p).includes(`_${pkgVersion}_`)) || hits[0];
 }
 
 // ---------- running-instance guard ----------
@@ -192,7 +179,8 @@ function shouldLaunchExisting(installed) {
 // Unknown (no probe, or the probe failed) is reported as "not running": on both
 // platforms the probe ships with the OS, so a failure means something exotic, and
 // a launcher that refuses to install on such a machine is a worse bug than one
-// that installs. The ordering fix above is what makes this a rare path at all.
+// that installs. Plain launch never reaches this guard at all (it never
+// installs over anything), so it only fires under `loomux update`.
 function loomuxIsRunning() {
   if (process.platform === "win32") {
     // A filter that matches nothing still exits 0 ("INFO: No tasks…"), so test
@@ -209,8 +197,8 @@ function loomuxIsRunning() {
   return false; // Linux runs an AppImage in place; nothing is ever replaced.
 }
 
-// Refuse to install while the app is running — including under `--reinstall`,
-// which is an escape hatch for a broken install, not consent to kill a live one.
+// Refuse to install while the app is running — including under `loomux update`,
+// which is an explicit ask to reinstall, not consent to kill a live instance.
 // Quitting first is always the user's call to make, never the launcher's.
 function refuseIfRunning() {
   if (!loomuxIsRunning()) return;
@@ -223,44 +211,37 @@ function refuseIfRunning() {
 
 // ---------- platform installers ----------
 
-async function runLinux(getRelease) {
+async function runLinux(getRelease, force) {
   const arch = process.arch;
   const suffix = arch === "arm64" ? "aarch64" : arch === "x64" ? "amd64" : null;
   if (!suffix) die(`unsupported Linux architecture: ${arch}`);
 
-  // AppImages are cached under their release asset name, so the version is
-  // part of the filename — a cache hit is by construction the right version.
-  let dest = path.join(cacheDir(), `Loomux_${PKG_VERSION}_${suffix}.AppImage`);
-  if (!fs.existsSync(dest) || REINSTALL) {
-    const release = await getRelease();
-    const asset = pickAsset(release, new RegExp(`_${suffix}\\.AppImage$`));
-    if (!asset) die(`no Linux (${arch}) AppImage in release ${release.tag_name}`);
-    dest = path.join(cacheDir(), asset.name);
-    if (!fs.existsSync(dest) || REINSTALL) {
-      say(`downloading ${asset.name}`);
-      await download(asset.browser_download_url, dest);
-      fs.chmodSync(dest, 0o755);
-    }
+  // Plain launch reuses whatever AppImage is cached — never a fresh download —
+  // and `update` forces one.
+  const cached = pickCachedAppImage(cacheDir(), suffix, PKG_VERSION);
+  if (cached && !force) {
+    say(`launching ${path.basename(cached)}`);
+    const child = spawn(cached, [], { detached: true, stdio: "ignore" });
+    child.unref();
+    return;
   }
+
+  const release = await getRelease();
+  const asset = pickAsset(release, new RegExp(`_${suffix}\\.AppImage$`));
+  if (!asset) die(`no Linux (${arch}) AppImage in release ${release.tag_name}`);
+  const dest = path.join(cacheDir(), asset.name);
+  say(`downloading ${asset.name}`);
+  await download(asset.browser_download_url, dest);
+  fs.chmodSync(dest, 0o755);
   say(`launching ${path.basename(dest)}`);
   // Detach so the GUI outlives this short-lived launcher process.
   const child = spawn(dest, [], { detached: true, stdio: "ignore" });
   child.unref();
 }
 
-function installedMacVersion() {
-  const out = spawnSync(
-    "defaults",
-    ["read", "/Applications/Loomux.app/Contents/Info", "CFBundleShortVersionString"],
-    { encoding: "utf8" }
-  );
-  if (out.status !== 0 || !out.stdout) return null;
-  return out.stdout.trim() || null;
-}
-
-async function runMac(getRelease) {
+async function runMac(getRelease, force) {
   const appPath = "/Applications/Loomux.app";
-  if (fs.existsSync(appPath) && !REINSTALL && shouldLaunchExisting(installedMacVersion())) {
+  if (fs.existsSync(appPath) && !force) {
     say("launching installed Loomux.app");
     spawnSync("open", ["-a", "Loomux"], { stdio: "ignore" });
     return;
@@ -311,26 +292,9 @@ function findWindowsExe() {
   return candidates.find((p) => p && fs.existsSync(p)) || null;
 }
 
-// Tauri's NSIS installer records the version it installed (per-user, HKCU).
-function installedWindowsVersion() {
-  const out = spawnSync(
-    "reg",
-    [
-      "query",
-      "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Loomux",
-      "/v",
-      "DisplayVersion",
-    ],
-    { encoding: "utf8" }
-  );
-  if (out.status !== 0 || !out.stdout) return null;
-  const m = out.stdout.match(/DisplayVersion\s+REG_SZ\s+(\S+)/);
-  return m ? m[1] : null;
-}
-
-async function runWindows(getRelease) {
+async function runWindows(getRelease, force) {
   const existing = findWindowsExe();
-  if (existing && !REINSTALL && shouldLaunchExisting(installedWindowsVersion())) {
+  if (existing && !force) {
     say("launching installed Loomux");
     spawn(existing, [], { detached: true, stdio: "ignore" }).unref();
     return;
@@ -362,10 +326,25 @@ async function runWindows(getRelease) {
 // ---------- main ----------
 
 async function main() {
+  const { command, arg } = parseArgs(process.argv.slice(2));
+  if (command === "help") {
+    process.stdout.write(HELP);
+    return;
+  }
+  if (command === "version") {
+    process.stdout.write(`${PKG_VERSION}\n`);
+    return;
+  }
+  if (command === null) {
+    die(`unexpected argument "${arg}" — try \`loomux help\``);
+  }
   if (typeof fetch !== "function") {
     die("Node 18+ is required (global fetch is unavailable in this runtime)");
   }
-  // Fetched lazily: launching an up-to-date install never touches the network.
+  // `update` forces the install path; a plain launch only installs when there
+  // is nothing to launch. Fetched lazily: a launch that finds an install never
+  // touches the network.
+  const force = command === "update";
   let releasePromise = null;
   const getRelease = () => {
     if (!releasePromise) {
@@ -376,21 +355,21 @@ async function main() {
   };
   switch (process.platform) {
     case "linux":
-      return runLinux(getRelease);
+      return runLinux(getRelease, force);
     case "darwin":
-      return runMac(getRelease);
+      return runMac(getRelease, force);
     case "win32":
-      return runWindows(getRelease);
+      return runWindows(getRelease, force);
     default:
       die(`unsupported platform: ${process.platform}`);
   }
 }
 
 // Only run when invoked as the `loomux` bin — `require`d (by test/launcher.test.ts)
-// this file just exposes the pure ordering logic, which is where a wrong answer
-// costs a running install.
+// this file just exposes the pure logic, which is where a wrong answer costs a
+// running install.
 if (require.main === module) {
   main().catch((e) => die(e && e.message ? e.message : String(e)));
 }
 
-module.exports = { compareVersions, parseVersion, shouldLaunchExisting, loomuxIsRunning };
+module.exports = { parseArgs, pickCachedAppImage, loomuxIsRunning };

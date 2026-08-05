@@ -16,12 +16,18 @@ app itself — it fetches the matching [GitHub release](https://github.com/wille
 asset for your platform (Windows installer, macOS `.dmg`, or Linux
 `AppImage`), installs/caches it, and launches it.
 
-Pass `--reinstall` to force a fresh download instead of launching a cached or
-already-installed copy:
+The command is deliberately small:
 
 ```sh
-npx loomux --reinstall
+loomux            # launch the installed app (installs it first if missing)
+loomux update     # install/refresh the app from the matching GitHub release
+loomux version    # print this launcher's version
+loomux help       # full usage
 ```
+
+Plain `loomux` never updates an existing install — reinstalling silently
+kills a running Loomux, so the update decision belongs to you: run
+`loomux update` when you want a new version.
 
 Requires Node 18+. Builds are unsigned for now; on macOS the launcher clears
 the quarantine flag for you.
