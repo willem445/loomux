@@ -41339,20 +41339,9 @@ fn g7_a_short_steer_in_the_chevron_composer_is_still_our_own_prompt() {
     // both directions of the waiver that buys the short case.
     let tail = "● Ready.\nC:\\Projects\\loomux [⎇ main]\n──────────────────────\n❯ merge\n──────────────────────\n  @ files · # issues · Session: 4.2 AIC used";
 
-    // Precondition: the same one g1 asserts — the `❯ ` row fires the signal
-    // without the exclusion, and it sits inside the detector's own window.
-    let last_painted: Vec<String> = tail
-        .lines()
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty())
-        .rev()
-        .take(3)
-        .collect();
-    assert!(
-        last_painted.iter().any(|l| l.starts_with('❯')),
-        "precondition: the composer's `❯ ` input row must sit inside the pointer window: \
-         {last_painted:?}"
-    );
+    // Precondition: the `❯ ` row fires the pointer signal without the
+    // exclusion — the same check g1 makes, and the one that proves the tail is
+    // a shape the waiver is even about.
     let unmasked = prompt_wait_match(tail).expect("the raw screen IS pointer-shaped");
     assert_eq!(unmasked.signal, "pointer-option", "and by THIS signal class");
 
@@ -41413,8 +41402,11 @@ fn g8_short_pastes_cannot_claim_short_options_of_real_dialogs() {
 
     // h2: the same shape with the footer REMOVED — here the veto, and only the
     // veto, keeps `❯ Yes` out of the mask. This is the footerless dialog the
-    // #420 harm is about; a footer-token answer would leave it open.
-    let footerless = "● Allow Copilot to run the following command?\n$ npm test\n\n❯ Yes\n  \
+    // #420 harm is about; a footer-token answer would leave it open. The
+    // command line is indented exactly as Copilot paints it, so the scan steps
+    // over it to the question (an unindented one would stop the scan — the
+    // documented residual).
+    let footerless = "● Allow Copilot to run the following command?\n  $ npm test\n\n❯ Yes\n  \
                       No, and tell Copilot what to do differently";
     let footerless_masked = mask_own_paste(footerless, "Yes");
     let m2 = prompt_wait_match(&footerless_masked)
@@ -41432,6 +41424,59 @@ fn g8_short_pastes_cannot_claim_short_options_of_real_dialogs() {
         prompt_wait_match(&mcp_masked).is_some(),
         "an MCP approval dialog must hold even when its highlighted row matches our paste: {:?}",
         prompt_wait_match(&mcp_masked)
+    );
+}
+
+#[test]
+fn g9_the_header_scan_tracks_the_option_block_not_a_fixed_window() {
+    // The calibration gap a fixed lookback budget would carry: the captured
+    // fixtures put the pointer on the FIRST option with the question one row
+    // away, but a live dialog has the pointer wherever the user last arrowed
+    // it, a multi-line `$` command under the question, and Copilot's generous
+    // blank padding. A 6-row budget loses the question when the pointer is on
+    // option 3 of a command dialog whose question owns a two-line `$` block —
+    // and then the waiver masks the live `❯ Yes`, which is the #420 harm.
+    // `dialog_header_above` now follows the option block upward instead of
+    // counting rows, so the question is found at ANY distance as long as only
+    // option/blank/indented-command rows sit between it and the pointer.
+
+    // h1: the reviewer's shape — pointer on option 3, two-line indented
+    // command block, no footer. The question is six rows up; a fixed budget of
+    // 6 would veto nothing and the `❯ Yes` row would be masked. The scan
+    // steps past the two options, the two command rows and the blanks, finds
+    // the question row, and keeps the dialog a question by the pointer.
+    let tail = "● Allow Copilot to run the following command?\n\n  $ npm test\n  --watch\n\n\
+                │   Yes, and don't ask again this session\n\
+                │   No, and tell Copilot what to do differently\n\
+                │ ❯ Yes";
+    let masked = mask_own_paste(tail, "Yes");
+    let m = prompt_wait_match(&masked)
+        .expect("a footerless dialog with the pointer on a LATER option must still be a question");
+    assert_eq!(m.needle, QuestionNeedle::LeadingPointer, "and by the pointer, not a token");
+
+    // h2: the wrapped-question variant — the `?` lands on the question's
+    // wrapped continuation row, which is indented and therefore would read as
+    // an option row to a shape scan that did not test rows for question-ness
+    // before classifying them. It is tested first, so the veto still fires.
+    let wrapped = "? Overwrite the existing file and keep a\n  copy of the previous one elsewhere?\n\n\
+                   ❯ Overwrite\n  Keep both";
+    let wrapped_masked = mask_own_paste(wrapped, "Overwrite");
+    let m3 = prompt_wait_match(&wrapped_masked)
+        .expect("a dialog whose question wraps across rows must still be a question (#420)");
+    assert_eq!(m3.needle, QuestionNeedle::LeadingPointer, "and still by the pointer");
+
+    // h3: and the composer's own chrome must still read as headerless however
+    // tall its tail is — the divider above the input row stops the scan, so a
+    // short steer under a tall scrollback is still our own prompt. (g7 pins
+    // the same for the minimal tail; this pins that extra rows above the
+    // divider do not start looking like dialog content.)
+    let tall = "──────────────────────\n  earlier output\n  keeps scrolling here\n\
+                ──────────────────────\n❯ merge\n──────────────────────\n  @ files · # issues";
+    let tall_masked = mask_own_paste(tall, "merge");
+    assert!(
+        prompt_wait_match(&tall_masked).is_none(),
+        "composer chrome above the divider is still not a dialog question: {:?}",
+        prompt_wait_match(&tall_masked)
     );
 }
 

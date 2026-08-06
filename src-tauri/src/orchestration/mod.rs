@@ -19675,17 +19675,17 @@ pub fn mask_own_paste(tail: &str, pasted_text: &str) -> String {
                 // g4's `? Overwrite the existing file?`, Copilot's
                 // `● Allow Copilot to run …?` and `● Which retry strategy …?`,
                 // Claude's boxed `Which authentication …?` — and a composer
-                // never paints one: its chrome above the input row is
-                // `● Ready.`, the cwd, and a divider. So the floor is waived
-                // exactly when no such question row sits within
-                // `DIALOG_HEADER_LOOKBACK` rows above: a short pointer row that
-                // is byte-for-byte one of our pasted lines, under no dialog
-                // header, is our own composer, and masking it cannot release an
-                // Enter into a dialog — there is none there to select into.
-                // (The one captured dialog with no question row, the Claude MCP
-                // approval's prose, is kept a question by its confirm footer —
-                // see g8's h3.)
-                let own_short_composer = !dialog_header_above(&norm, i);
+                // never paints one: its chrome above the input row is a
+                // divider, the cwd, and `● Ready.`. So the floor is waived
+                // exactly when no such question row heads the block above: a
+                // short pointer row that is byte-for-byte one of our pasted
+                // lines, under no dialog question, is our own composer, and
+                // masking it cannot release an Enter into a dialog — there is
+                // none there to select into. `dialog_header_above` is the
+                // shape-tracking scan (see its doc); the one captured dialog
+                // with no question row, the Claude MCP approval's prose, is
+                // kept a question by its confirm footer — see g8's h3.
+                let own_short_composer = !dialog_header_above(&rows, &norm, &keep, i);
                 claimed = pasted
                     .iter()
                     .filter(|line| {
@@ -19750,47 +19750,97 @@ fn strip_leading_pointer(line: &str) -> Option<&str> {
 /// itself.
 const SELF_ECHO_MIN_POINTER_CHARS: usize = 24;
 
-/// How far above a pointer row [`dialog_header_above`] scans before giving up.
-///
-/// 6 rows because a dialog's question line is always within that window and
-/// its decoration is not: g4's overwrite dialog, Copilot's command and
-/// retry-strategy questions, and the boxed Claude question all paint the
-/// question first, then the options; the composer fixture paints `● Ready.`
-/// (its "header"-shaped row), a blank, the cwd, a divider, then the input row
-/// — and `● Ready.` is not a question row, so the scan finding nothing is what
-/// lets a short steer through there. A longer window only widens the risk that
-/// unrelated prior dialog text leaks into the verdict.
-const DIALOG_HEADER_LOOKBACK: usize = 6;
-
 /// Does this row look like a live dialog's question line?
 ///
-/// The captured dialog fixtures head their option lists four ways, and all
-/// four resolve to one rule: the question row ends in `?`. g4's overwrite
-/// dialog is `? Overwrite the existing file?` (opens and closes with it);
-/// Copilot's command and retry-strategy questions are `●`-bulleted
-/// (`Allow Copilot to run the following command?`, `Which retry strategy …?`);
-/// Claude's AskUserQuestion sits boxed (`Which authentication approach …?`).
-/// [`deframe`] strips the bullet and the border and [`wrap_normalize`]
-/// lowercases, and every one of those is a row ending in `?`. A bare `?` — or
-/// a row that is only the glyph, which deframing can produce from a lone-`?`
-/// border cell — has no words and is not a question. The one captured dialog
-/// that asks no question, the Claude MCP approval's prose preamble, has
-/// nothing here to detect and is kept a question by its confirm footer
-/// instead. Used only as a veto in [`mask_own_paste`], so the bar is set on
-/// the side of *seeing* a dialog: a row that merely resembles a prompt keeps
-/// the pointer row below it unmasked, which errs into a hold we can release,
-/// never into an Enter into a live dialog.
-fn is_dialog_header(line: &str) -> bool {
-    let row = wrap_normalize(line);
+/// `row` is expected ALREADY reduced — a `norm` entry ([`deframe`] +
+/// [`wrap_normalize`]) — because the captured dialog fixtures head their
+/// option lists four ways and that reduction is what unifies them: g4's
+/// `? Overwrite the existing file?` (opens and closes with the glyph),
+/// Copilot's `●`-bulleted `Allow Copilot to run the following command?` and
+/// `Which retry strategy …?` (the bullet deframes away), and Claude's boxed
+/// `Which authentication approach …?`. Every one of those is a row ending in
+/// `?`; the trailing `trim_end_matches(is_frame_char)` additionally unwraps a
+/// box that CLOSES its border (`│ Which …? │`) — the captured Claude fixture
+/// happens not to paint one. A bare `?`, or a row that is only the glyph, has
+/// no words and is not a question. The one captured dialog that asks no
+/// question, the Claude MCP approval's prose preamble, has nothing here to
+/// detect and is kept a question by its confirm footer instead. Used only as
+/// a veto in [`mask_own_paste`], so the bar is set on the side of *seeing* a
+/// dialog: a row that merely resembles a prompt keeps the pointer row below
+/// it unmasked, which errs into a hold we can release, never into an Enter
+/// into a live dialog.
+fn is_dialog_header(row: &str) -> bool {
+    let row = row.trim_end_matches(is_frame_char);
     let words = row.trim_matches('?').trim();
     !words.is_empty() && (row.starts_with('?') || row.ends_with('?'))
 }
 
-/// Is there a `? ...` dialog header anywhere in the (at most
-/// [`DIALOG_HEADER_LOOKBACK`]) rows above `from`?
-fn dialog_header_above(norm: &[String], from: usize) -> bool {
-    let start = from.saturating_sub(DIALOG_HEADER_LOOKBACK);
-    norm[start..from].iter().any(|row| is_dialog_header(row))
+/// Is this RAW row part of a dialog's option block rather than its head?
+///
+/// The upward scan in [`dialog_header_above`] steps over exactly the rows a
+/// dialog interposes between its question and the highlighted choice: blank
+/// rows, sibling options (a row leading with a pointer glyph, or a box-framed
+/// row still indented once the frame is peeled), and indented `$ command`
+/// context under Copilot's command dialogs. [`deframe`] would not serve here —
+/// it eats indentation, and indentation is the evidence — so the peel set is
+/// only the box glyphs and pointers, leaving leading whitespace in place. A
+/// row that is none of these ends the block and, once tested as a question,
+/// stops the scan.
+fn option_block_row(raw: &str) -> bool {
+    if raw.trim().is_empty() {
+        return true;
+    }
+    let peeled = raw.trim_start_matches(|c| matches!(c, '│' | '┃' | '|' | '❯' | '›' | '→'));
+    peeled.starts_with(char::is_whitespace)
+}
+
+/// Is a live dialog's question row in the block above the pointer row at
+/// `from`?
+///
+/// Not a fixed window — a row-count budget would only be calibrated against
+/// the captured fixtures, where the pointer sits on the FIRST option and the
+/// question is one row away. Real dialogs violate both: arrowing down moves
+/// `❯` through the option list, a two-line `$ command` block or a wrapped
+/// question adds rows, and Copilot pads with blanks. The scan instead follows
+/// the dialog's actual shape: step upward from the pointer, vetoing on the
+/// first question row, stepping over the option block ([`option_block_row`]:
+/// blanks, sibling options, indented command rows), and stopping at the first
+/// row that is neither a question nor option block — a composer's divider or
+/// cwd, a dialog's prose preamble. Rows already claimed as our own text
+/// (`!keep[j]`) are skipped outright — a row proven to be our paste cannot be
+/// a dialog's question, and Copilot echoes a submitted prompt into its
+/// transcript as `❯ <text>`, the exact shape the waiver is for.
+///
+/// The evidence is NEGATIVE — absence of a dialog, not presence of a composer
+/// — the one place in this file a claim is bought without paying with content.
+/// It is accepted only because every real dialog's question row ends in `?`
+/// and the composer chrome above its input row (a divider, the cwd,
+/// `● Ready.`) never does, and because the cost of an error is a hold, not a
+/// release. Residuals: a command row the CLI does NOT indent under the question
+/// stops the scan as if it were chrome — a gap for the rare dialog that paints
+/// one unindented (Copilot and Claude both indent theirs); a headerless
+/// composer with no divider above its input row, holding agent prose that ends
+/// in `?`, still vetoes a short steer — the #820 hold, best-effort; and the
+/// ring read is emission order, so an option-block repaint that omits the
+/// question line reads headerless until the next full repaint. The trust model
+/// is unchanged from the 24-char floor (an agent that knows the pasted text
+/// can paint a header-less row to induce masking); this does not widen it.
+fn dialog_header_above(rows: &[&str], norm: &[String], keep: &[bool], from: usize) -> bool {
+    let mut j = from;
+    while j > 0 {
+        j -= 1;
+        if !keep[j] {
+            continue;
+        }
+        if is_dialog_header(&norm[j]) {
+            return true;
+        }
+        if option_block_row(rows[j]) {
+            continue;
+        }
+        return false;
+    }
+    false
 }
 
 /// The marker every notice loomux writes into a pane opens with, and the whole
