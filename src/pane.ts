@@ -495,10 +495,16 @@ interface EmbedSlotState {
  *  `Terminal` type omits both `_core` and the WriteBuffer, so the reach is a
  *  bounded cast against the pinned xterm — and it is `handleUserInput`, NOT
  *  `writeSync`, because `WriteBuffer.writeSync` is marked `@deprecated
- *  Unreliable, to be removed soon` and can drop a chunk mid-sync-loop. */
+ *  Unreliable, to be removed soon` and can drop a chunk mid-sync-loop. Both
+ *  fields are reached with optional chaining: the dependency is a caret range
+ *  (the lockfile pins today), and if either field ever changes shape this must
+ *  degrade to a silent no-op, not throw — a throw here lands inside
+ *  `flushOutput` after `pendingOut` has already been drained into `chunks`,
+ *  which would lose those bytes and throw on every later flush. */
 function hintXtermSyncParse(term: Terminal): void {
-  const core = (term as unknown as { _core: { _writeBuffer: { handleUserInput(): void } } })._core;
-  core._writeBuffer.handleUserInput();
+  const wb = (term as unknown as { _core?: { _writeBuffer?: { handleUserInput?(): void } } })
+    ._core?._writeBuffer;
+  wb?.handleUserInput?.();
 }
 
 export class Pane implements VoiceTargetPane {
@@ -1498,10 +1504,14 @@ export class Pane implements VoiceTargetPane {
     // of the one path out of xterm that is not display, and an agent CLI
     // waiting on one of them waits on our timer. A workstation lock is hidden
     // for its whole duration, which is #813's window. While hidden, re-arm
-    // xterm's own fast path per chunk so the parse — and the reply it emits
-    // back down the pty — completes synchronously in this same call, with no
-    // clamped timer in series. Visible, the timer path is fine (nothing is
-    // clamped) and forcing sync parses would only cost the render thread.
+    // xterm's own fast path per chunk so the FIRST chunk of a quiet pane is
+    // parsed — and its reply emitted back down the pty — in this same call,
+    // with no clamped timer in series. Best-effort beyond that: the fast path
+    // only engages while the write buffer is empty, and `_innerWrite` still
+    // yields at its 12ms write timeout and reschedules via `setTimeout`
+    // (clamped again), so a busy pane under lock can outlast it; the next full
+    // repaint re-parses. Visible, the timer path is fine (nothing is clamped)
+    // and forcing sync parses would only cost the render thread.
     const syncParse = !sharedVisibility().visible();
     for (const chunk of chunks) {
       if (syncParse) hintXtermSyncParse(this.term);
