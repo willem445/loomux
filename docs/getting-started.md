@@ -33,8 +33,9 @@ npm install -g loomux-desktop # then run `loomux` anytime
 
 `loomux-desktop` is a small, dependency-free launcher: it fetches the matching
 release asset for your platform (Windows installer, macOS `.dmg`, or Linux
-`AppImage`), installs/caches it, and launches it. `loomux update` forces a
-fresh download; plain `loomux` never updates an existing install.
+`AppImage`), installs/caches it, and launches it. Plain `loomux` never updates
+an existing install; `loomux update` fetches the latest release (on Linux it
+refreshes the cached AppImage).
 
 > The package is named `loomux-desktop` because the bare `loomux` name on npm
 > belongs to an unrelated tmux tool — but the command it installs is still

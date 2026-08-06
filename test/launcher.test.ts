@@ -44,48 +44,41 @@ test("unknown input is reported, never guessed at", () => {
   const r = parseArgs(["frobnicate"]);
   assert.equal(r.command, null);
   assert.equal(r.arg, "frobnicate");
-  // Trailing junk after a valid command is an error too, not silently dropped.
-  assert.equal(parseArgs(["update", "extra"]).command, null);
+  // Trailing junk after a valid command is an error too, not silently dropped —
+  // and the offending token is the junk, not the command.
+  assert.deepEqual(parseArgs(["update", "extra"]), { command: null, arg: "extra" });
+  assert.deepEqual(parseArgs(["bogus", "extra"]), { command: null, arg: "bogus" });
 });
 
-test("pickCachedAppImage prefers the version this launcher ships", () => {
+test("pickCachedAppImage picks the newest cached build, even one newer than the launcher", () => {
   const dir = mkdtempSync(join(tmpdir(), "loomux-cache-"));
   try {
-    writeFileSync(join(dir, "Loomux_1.0.0_amd64.AppImage"), "older build");
-    writeFileSync(join(dir, `Loomux_${PKG_VERSION}_amd64.AppImage`), "this launcher's build");
-    assert.equal(
-      pickCachedAppImage(dir, "amd64", PKG_VERSION),
-      join(dir, `Loomux_${PKG_VERSION}_amd64.AppImage`)
-    );
+    const launcherVer = join(dir, `Loomux_${PKG_VERSION}_amd64.AppImage`);
+    const newer = join(dir, "Loomux_999.0.0_amd64.AppImage");
+    writeFileSync(launcherVer, "this launcher's own build");
+    writeFileSync(newer, "a build an earlier `loomux update` installed");
+    // mtime decides, so pin it: the launcher-matched file must lose despite
+    // being written second (same-second writes).
+    utimesSync(launcherVer, new Date(2000, 0, 1), new Date(2000, 0, 1));
+    assert.equal(pickCachedAppImage(dir, "amd64"), newer);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
-test("pickCachedAppImage falls back to the newest cached build", () => {
+test("pickCachedAppImage returns null when nothing is cached", () => {
   const dir = mkdtempSync(join(tmpdir(), "loomux-cache-"));
   try {
-    const old = join(dir, "Loomux_1.0.0_amd64.AppImage");
-    const newer = join(dir, "Loomux_1.1.0-beta10_amd64.AppImage");
-    writeFileSync(old, "old build");
-    writeFileSync(newer, "newer build");
-    // mtime decides the fallback, so pin it: the old file must sort below even
-    // though it was created after (same-second writes).
-    utimesSync(old, new Date(2000, 0, 1), new Date(2000, 0, 1));
-    assert.equal(pickCachedAppImage(dir, "amd64", "999.0.0"), newer);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test("pickCachedAppImage ignores other platforms and non-AppImage files", () => {
-  const dir = mkdtempSync(join(tmpdir(), "loomux-cache-"));
-  try {
+    assert.equal(pickCachedAppImage(dir, "amd64"), null);
     writeFileSync(join(dir, "Loomux_1.0.0_aarch64.AppImage"), "arm build");
     writeFileSync(join(dir, "note.txt"), "irrelevant");
-    assert.equal(pickCachedAppImage(dir, "amd64", PKG_VERSION), null);
     assert.equal(
-      pickCachedAppImage(dir, "aarch64", PKG_VERSION),
+      pickCachedAppImage(dir, "amd64"),
+      null,
+      "other arch and non-AppImage files are ignored"
+    );
+    assert.equal(
+      pickCachedAppImage(dir, "aarch64"),
       join(dir, "Loomux_1.0.0_aarch64.AppImage"),
       "a matching arch still resolves"
     );

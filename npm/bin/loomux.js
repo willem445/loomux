@@ -13,8 +13,9 @@
 // The command has three subcommands (#845):
 //
 //   loomux            launch the installed app; install it only if missing
-//   loomux update     install/refresh the app — the only path that fetches
-//                     when something is already installed or cached
+//   loomux update     install/refresh the app from the latest release — the
+//                     only path that fetches when something is already
+//                     installed or cached
 //   loomux version    print this launcher's version
 //   loomux help       print usage
 //
@@ -60,9 +61,9 @@ Launches the Loomux desktop app (installing it first if needed). Run
 USAGE
   loomux            Launch the installed app, or install it if missing. Never
                     updates an existing install.
-  loomux update     Install/refresh the app from the matching GitHub release.
-                    Reinstalling over a running app closes it, so quit Loomux
-                    first — the launcher refuses while it is running.
+  loomux update     Install/refresh the app from the latest GitHub release.
+                    On Windows and macOS the launcher refuses while Loomux is
+                    running — the installer would close the running app.
   loomux version    Print this launcher's version.
   loomux help       Show this help.
   loomux --help, -h Same as \`loomux help\`.
@@ -76,7 +77,11 @@ Requires Node 18+.
 // with a hint instead of guessing what the user meant.
 function parseArgs(argv) {
   if (argv.length === 0) return { command: "launch" };
-  if (argv.length !== 1) return { command: null, arg: argv[0] };
+  if (argv.length !== 1) {
+    // A valid command followed by junk reports the junk, not the command.
+    const KNOWN = new Set(["help", "--help", "-h", "version", "--version", "update", "--reinstall"]);
+    return { command: null, arg: KNOWN.has(argv[0]) ? argv[1] : argv[0] };
+  }
   switch (argv[0]) {
     case "help":
     case "--help":
@@ -111,7 +116,8 @@ async function ghJson(url) {
 }
 
 // Prefer the release matching this package's version (so `npx loomux@X`
-// installs app vX); fall back to whatever the latest release is.
+// installs app vX); fall back to whatever the latest release is. Used by plain
+// launch's first install only.
 async function resolveRelease() {
   try {
     return await ghJson(
@@ -122,6 +128,16 @@ async function resolveRelease() {
     say(`no release tagged v${PKG_VERSION} yet — using the latest release`);
     return ghJson(`https://api.github.com/repos/${REPO}/releases/latest`);
   }
+}
+
+// `loomux update` resolves the latest STABLE release, not the tag matching this
+// launcher. Launcher and app release in lockstep, so the matching tag can never
+// be newer than what's already installed — pointing update at it would make the
+// explicit update path a no-op, or a silent downgrade under a stale launcher.
+// `releases/latest` is newest stable by construction; prereleases stay out of
+// reach (the docs point beta users at the releases page directly).
+async function resolveLatestRelease() {
+  return ghJson(`https://api.github.com/repos/${REPO}/releases/latest`);
 }
 
 /** First asset whose name matches `re`, or null. */
@@ -148,13 +164,14 @@ function cacheDir() {
 
 // ---------- Linux AppImage cache ----------
 
-// The newest cached AppImage for this platform wins, preferring the exact
-// version this launcher ships. On Linux the cached AppImage IS the install, so
-// plain `loomux` launches whatever is there and never downloads — `loomux
-// update` is the only path that fetches again (#845). Download recency is a
-// fine stand-in for version recency: cache files are only ever created by a
-// download, never touched after.
-function pickCachedAppImage(dir, suffix, pkgVersion) {
+// The newest cached AppImage for this platform wins, on every platform's rule.
+// On Linux the cached AppImage IS the install, so plain `loomux` launches the
+// newest cached build and never downloads — `loomux update` is the only path
+// that fetches again (#845). Download recency is a fine stand-in for version
+// recency: cache files are only ever created by a download, never touched
+// after. Deliberately no "prefer the launcher's own version" bias — update can
+// install a build NEWER than the launcher, and plain launch must surface it.
+function pickCachedAppImage(dir, suffix) {
   let entries;
   try {
     entries = fs.readdirSync(dir, { withFileTypes: true });
@@ -166,8 +183,7 @@ function pickCachedAppImage(dir, suffix, pkgVersion) {
     .filter((e) => e.isFile() && re.test(e.name))
     .map((e) => path.join(dir, e.name))
     .sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
-  if (hits.length === 0) return null;
-  return hits.find((p) => path.basename(p).includes(`_${pkgVersion}_`)) || hits[0];
+  return hits.length ? hits[0] : null;
 }
 
 // ---------- running-instance guard ----------
@@ -179,8 +195,9 @@ function pickCachedAppImage(dir, suffix, pkgVersion) {
 // Unknown (no probe, or the probe failed) is reported as "not running": on both
 // platforms the probe ships with the OS, so a failure means something exotic, and
 // a launcher that refuses to install on such a machine is a worse bug than one
-// that installs. Plain launch never reaches this guard at all (it never
-// installs over anything), so it only fires under `loomux update`.
+// that installs. Plain launch only reaches this guard when it found nothing to
+// launch and must install; its real job is protecting `loomux update` from an
+// install-over-running-app.
 function loomuxIsRunning() {
   if (process.platform === "win32") {
     // A filter that matches nothing still exits 0 ("INFO: No tasks…"), so test
@@ -218,7 +235,7 @@ async function runLinux(getRelease, force) {
 
   // Plain launch reuses whatever AppImage is cached — never a fresh download —
   // and `update` forces one.
-  const cached = pickCachedAppImage(cacheDir(), suffix, PKG_VERSION);
+  const cached = pickCachedAppImage(cacheDir(), suffix);
   if (cached && !force) {
     say(`launching ${path.basename(cached)}`);
     const child = spawn(cached, [], { detached: true, stdio: "ignore" });
@@ -341,15 +358,16 @@ async function main() {
   if (typeof fetch !== "function") {
     die("Node 18+ is required (global fetch is unavailable in this runtime)");
   }
-  // `update` forces the install path; a plain launch only installs when there
-  // is nothing to launch. Fetched lazily: a launch that finds an install never
-  // touches the network.
+  // `update` forces the install path and resolves the LATEST release; a plain
+  // launch only installs when there is nothing to launch, and resolves the
+  // release matching this launcher (so `npx loomux@X` installs app vX).
+  // Fetched lazily: a launch that finds an install never touches the network.
   const force = command === "update";
   let releasePromise = null;
   const getRelease = () => {
     if (!releasePromise) {
       say("fetching release info");
-      releasePromise = resolveRelease();
+      releasePromise = force ? resolveLatestRelease() : resolveRelease();
     }
     return releasePromise;
   };

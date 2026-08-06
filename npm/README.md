@@ -20,7 +20,7 @@ The command is deliberately small:
 
 ```sh
 loomux            # launch the installed app (installs it first if missing)
-loomux update     # install/refresh the app from the matching GitHub release
+loomux update     # install/refresh the app from the latest GitHub release
 loomux version    # print this launcher's version
 loomux help       # full usage
 ```
@@ -28,6 +28,10 @@ loomux help       # full usage
 Plain `loomux` never updates an existing install — reinstalling silently
 kills a running Loomux, so the update decision belongs to you: run
 `loomux update` when you want a new version.
+
+On Linux the app is a cached AppImage: plain `loomux` launches the newest
+cached build without downloading, and `loomux update` fetches the latest
+release.
 
 Requires Node 18+. Builds are unsigned for now; on macOS the launcher clears
 the quarantine flag for you.
