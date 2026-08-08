@@ -8162,6 +8162,18 @@ pub struct AgentEntry {
     /// Watchdog anti-nag latch: set once a stall notice has been delivered for
     /// the current stall, cleared when the agent produces output/reports again.
     pub watchdog_notified: bool,
+    /// #852: set instead of (never alongside a delivered) `watchdog_notified`
+    /// when a stall trips while the agent holds a live `notify_when` watch —
+    /// the notice is suppressed, not sent, because the agent is plausibly
+    /// waiting on its own registered CI check rather than stuck. Watched for
+    /// on the NEXT tick: once the agent no longer holds any live watch (it
+    /// fired, expired, failed-out, or was cancelled), `watchdog_tick` clears
+    /// this latch, clears `watchdog_notified`, and resets `last_progress_ms`
+    /// to that tick's `now` — a fresh full stall window, so the notice only
+    /// ever fires for a stall the agent is STILL silent through after its
+    /// watch resolved, never immediately off whatever was left of the old
+    /// (already-expired) window.
+    pub watchdog_watch_suppressed: bool,
     /// Autonomous idle-tick latch (#83), meaningful only for the orchestrator:
     /// set when an idle-tick notice is delivered, cleared when the pane produces
     /// output again (the orchestrator acted on the tick). Mirrors
@@ -25457,20 +25469,35 @@ impl OrchRegistry {
     /// counter from `outputs`: any growth is activity that resets the silence
     /// clock and the anti-nag latch. An agent silent (no output, no report)
     /// past its group's `watchdog_stall_minutes` earns exactly one audited
-    /// `[loomux]` nudge to the orchestrator suggesting get_output + re-send.
-    /// Paused groups are skipped entirely — delivery is suppressed there
-    /// anyway, so we must not spend the one-notice budget while paused.
-    /// Returns the notified agent ids. Split from the pty read
-    /// (`agent_output_totals`) so the stall / anti-nag / pause logic is
-    /// testable with synthetic counters and no threads. `has_watch` is the set
-    /// of agent ids currently holding a live `notify_when` watch (#248) — an
-    /// injected input like `outputs`, not a lock this function takes itself, so
-    /// it stays testable with a plain `HashSet` and no registry-watches state.
+    /// `[loomux]` nudge to the orchestrator suggesting get_output + re-send —
+    /// UNLESS it holds a live `notify_when` watch (#852): that stall is
+    /// SUPPRESSED instead (audited as `watchdog-suppressed`, never delivered),
+    /// because the agent is plausibly waiting on its own registered CI check,
+    /// not stuck. Paused groups are skipped entirely — delivery is suppressed
+    /// there anyway, so we must not spend the one-notice budget while paused.
+    /// Returns the notified (never suppressed) agent ids. Split from the pty
+    /// read (`agent_output_totals`) so the stall / anti-nag / pause / watch
+    /// logic is testable with synthetic counters and no threads. `has_watch`
+    /// maps an agent id to the live `notify_when` watch ids it currently holds
+    /// (#248/#852) — an injected input like `outputs`, not a lock this
+    /// function takes itself, so it stays testable with a plain `HashMap` and
+    /// no registry-watches state.
+    ///
+    /// The suppression latch (`watchdog_watch_suppressed`) does double duty:
+    /// while the watch stays live it prevents re-auditing every tick (the same
+    /// anti-nag shape as `watchdog_notified`, which it is set alongside), and
+    /// on the FIRST tick where the agent no longer holds any live watch (it
+    /// fired, expired, failed-out, or was cancelled) it is read to detect that
+    /// transition — at which point the clock is reset to `now` and both
+    /// latches cleared, handing the agent a fresh full stall window rather
+    /// than immediately re-flagging on whatever was left of the old,
+    /// already-expired window. Only a genuinely fresh silence past that new
+    /// window earns a notice — the combination #852 calls a real stall.
     pub fn watchdog_tick(
         &self,
         now: u64,
         outputs: &HashMap<String, u64>,
-        has_watch: &HashSet<String>,
+        has_watch: &HashMap<String, Vec<String>>,
     ) -> Vec<String> {
         let thresholds: HashMap<String, u32> = self
             .groups
@@ -25481,9 +25508,10 @@ impl OrchRegistry {
         let paused = self.paused.lock_safe().clone();
 
         // First pass under the agents lock: refresh counters and pick who to
-        // nudge. Delivery (which types into a pane and can block) happens after
-        // the lock is released.
+        // nudge or suppress. Delivery (which types into a pane and can block)
+        // happens after the lock is released.
         let mut to_notify: Vec<(String, String, String, u32)> = Vec::new();
+        let mut to_suppress: Vec<(String, String, String, u32, Vec<String>)> = Vec::new();
         {
             let mut agents = self.agents.lock_safe();
             for a in agents.values_mut() {
@@ -25496,13 +25524,14 @@ impl OrchRegistry {
                 {
                     continue;
                 }
-                // Output growth = activity: reset the clock and the latch, and
-                // this tick can't also flag the agent as stalled.
+                // Output growth = activity: reset the clock and both latches,
+                // and this tick can't also flag or suppress the agent.
                 if let Some(&cur) = outputs.get(&a.id) {
                     if cur > a.last_output_total {
                         a.last_output_total = cur;
                         a.last_progress_ms = now;
                         a.watchdog_notified = false;
+                        a.watchdog_watch_suppressed = false;
                         continue;
                     }
                 }
@@ -25511,23 +25540,54 @@ impl OrchRegistry {
                 if paused.contains(&a.group) {
                     continue;
                 }
+                let watch_ids = has_watch.get(&a.id);
+                let watching = watch_ids.is_some_and(|ids| !ids.is_empty());
+
+                // #852: the watch that was suppressing this stall has resolved
+                // since we last looked — give the agent a fresh full window
+                // starting now instead of evaluating (and possibly firing)
+                // against the old, already-expired one.
+                if a.watchdog_watch_suppressed && !watching {
+                    a.watchdog_watch_suppressed = false;
+                    a.watchdog_notified = false;
+                    a.last_progress_ms = now;
+                    continue;
+                }
+
                 let threshold = thresholds.get(&a.group).copied().unwrap_or(0);
                 if watchdog_should_notify(a.last_progress_ms, now, threshold, a.watchdog_notified) {
-                    a.watchdog_notified = true;
                     let minutes = (now.saturating_sub(a.last_progress_ms) / 60_000) as u32;
-                    to_notify.push((a.id.clone(), a.group.clone(), a.name.clone(), minutes));
+                    if watching {
+                        a.watchdog_notified = true;
+                        a.watchdog_watch_suppressed = true;
+                        to_suppress.push((
+                            a.id.clone(),
+                            a.group.clone(),
+                            a.name.clone(),
+                            minutes,
+                            watch_ids.cloned().unwrap_or_default(),
+                        ));
+                    } else {
+                        a.watchdog_notified = true;
+                        to_notify.push((a.id.clone(), a.group.clone(), a.name.clone(), minutes));
+                    }
                 }
             }
         }
 
+        for (id, group, name, minutes, watch_ids) in to_suppress {
+            self.audit(&group, "loomux", "watchdog-suppressed", json!({
+                "agent": id, "name": name, "silent_minutes": minutes, "watch_ids": watch_ids,
+            }));
+        }
+
         let mut notified = Vec::new();
         for (id, group, name, minutes) in to_notify {
-            let watching = has_watch.contains(&id);
             self.audit(&group, "loomux", "watchdog-stall",
-                json!({ "agent": id, "name": name, "silent_minutes": minutes, "has_live_watch": watching }));
+                json!({ "agent": id, "name": name, "silent_minutes": minutes, "has_live_watch": false }));
             let _ = self.deliver_to_orchestrator(
                 &group,
-                &watchdog_stall_notice(&name, &id, minutes, watching),
+                &watchdog_stall_notice(&name, &id, minutes, false),
                 "loomux",
             );
             notified.push(id);
@@ -25540,9 +25600,13 @@ impl OrchRegistry {
     pub fn run_watchdog(&self, now: u64) -> Vec<String> {
         let outputs = self.agent_output_totals();
         // Same registry state `notify_tick`/`list_notifications` read (#248) —
-        // no second store. Just the agent ids, not the watches themselves:
-        // `watchdog_tick` only needs to know whether to annotate, not what.
-        let has_watch: HashSet<String> = self.watches.lock_safe().values().map(|w| w.agent.clone()).collect();
+        // no second store. Agent id -> its live watch ids: `watchdog_tick`
+        // needs the ids too now (#852), to audit which watch suppressed a
+        // stall — an agent can hold more than one (`MAX_WATCHES_PER_AGENT`).
+        let mut has_watch: HashMap<String, Vec<String>> = HashMap::new();
+        for w in self.watches.lock_safe().values() {
+            has_watch.entry(w.agent.clone()).or_default().push(w.id.clone());
+        }
         self.watchdog_tick(now, &outputs, &has_watch)
     }
 
@@ -27075,6 +27139,7 @@ impl OrchRegistry {
             last_output_progress_ms: now_ms(), // solo panes are never idle-ticked (not Role::Orchestrator); inert
             last_output_total: 0,
             watchdog_notified: false,
+            watchdog_watch_suppressed: false,
             idle_tick_notified: false,
             compact_nudge_notified: false,
             compact_nudge_last_output_total: 0,
@@ -27219,6 +27284,7 @@ impl OrchRegistry {
             last_output_progress_ms: now_ms(), // solo panes are never idle-ticked (not Role::Orchestrator); inert
             last_output_total: 0,
             watchdog_notified: false,
+            watchdog_watch_suppressed: false,
             idle_tick_notified: false,
             compact_nudge_notified: false,
             compact_nudge_last_output_total: 0,
@@ -36193,6 +36259,7 @@ impl OrchRegistry {
             last_output_progress_ms: now_ms(),
             last_output_total: 0,
             watchdog_notified: false,
+            watchdog_watch_suppressed: false,
             idle_tick_notified: false,
             compact_nudge_notified: false,
             compact_nudge_last_output_total: 0,
@@ -43147,6 +43214,7 @@ fn register_orchestrator_pane(
         last_output_progress_ms: now_ms(), // #496: the output-only half of that clock
         last_output_total: 0,
         watchdog_notified: false,
+        watchdog_watch_suppressed: false,
         idle_tick_notified: false,
         compact_nudge_notified: false,
         compact_nudge_last_output_total: 0,

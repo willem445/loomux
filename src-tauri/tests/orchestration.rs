@@ -13356,12 +13356,12 @@ fn watchdog_flags_a_silent_worker_once_per_stall() {
     let (reg, _d, gid, wid) = watchdog_setup(5);
     let no_output = HashMap::new();
     // Long past the stall window with no output and no report → one notice.
-    assert_eq!(reg.watchdog_tick(FAR, &no_output, &HashSet::new()), vec![wid.clone()],
+    assert_eq!(reg.watchdog_tick(FAR, &no_output, &HashMap::new()), vec![wid.clone()],
         "a silent working agent must be flagged");
     let log = fs::read_to_string(reg.state_root().join(&gid).join("audit.jsonl")).unwrap();
     assert!(log.contains("watchdog-stall"), "the stall must be audited, got: {log}");
     // Anti-nag: still silent, but already notified for this same stall.
-    assert!(reg.watchdog_tick(FAR + 60_000, &no_output, &HashSet::new()).is_empty(),
+    assert!(reg.watchdog_tick(FAR + 60_000, &no_output, &HashMap::new()).is_empty(),
         "must not nag twice for one uninterrupted stall");
 }
 
@@ -13369,14 +13369,14 @@ fn watchdog_flags_a_silent_worker_once_per_stall() {
 fn watchdog_stall_resets_when_the_agent_produces_output() {
     let (reg, _d, _gid, wid) = watchdog_setup(5);
     let empty = HashMap::new();
-    assert_eq!(reg.watchdog_tick(FAR, &empty, &HashSet::new()), vec![wid.clone()]);
+    assert_eq!(reg.watchdog_tick(FAR, &empty, &HashMap::new()), vec![wid.clone()]);
     // The CLI emits output: a grown pty counter is activity — clock and latch
     // both reset, and this very tick must not also flag a stall.
     let grew: HashMap<String, u64> = [(wid.clone(), 1024u64)].into_iter().collect();
-    assert!(reg.watchdog_tick(FAR, &grew, &HashSet::new()).is_empty(), "output growth is activity, not a stall");
+    assert!(reg.watchdog_tick(FAR, &grew, &HashMap::new()).is_empty(), "output growth is activity, not a stall");
     // No further growth; a whole fresh window elapses → a brand-new notice.
     let later = FAR + 5 * 60_000 + 1;
-    assert_eq!(reg.watchdog_tick(later, &grew, &HashSet::new()), vec![wid.clone()],
+    assert_eq!(reg.watchdog_tick(later, &grew, &HashMap::new()), vec![wid.clone()],
         "a new stall after activity earns a new notice");
 }
 
@@ -13384,7 +13384,7 @@ fn watchdog_stall_resets_when_the_agent_produces_output() {
 fn watchdog_ignores_idle_dead_and_disabled_agents() {
     // A 0 stall window disables the watchdog for the whole group.
     let (off, _d0, _g0, _w0) = watchdog_setup(0);
-    assert!(off.watchdog_tick(FAR, &HashMap::new(), &HashSet::new()).is_empty(),
+    assert!(off.watchdog_tick(FAR, &HashMap::new(), &HashMap::new()).is_empty(),
         "stall window 0 disables the watchdog");
     // With the guardrail on, idle and dead agents are still out of scope: idle
     // is the reaper's concern, and a dead/reaped pane must never be nudged.
@@ -13394,7 +13394,7 @@ fn watchdog_ignores_idle_dead_and_disabled_agents() {
     reg.spawn_agent(&g.id, Role::Worker, "idle", "", false, None).unwrap();
     let dead = reg.spawn_agent(&g.id, Role::Worker, "dead", "work", false, None).unwrap();
     reg.mark_dead(&dead.id, Some(1));
-    let flagged = reg.watchdog_tick(FAR, &HashMap::new(), &HashSet::new());
+    let flagged = reg.watchdog_tick(FAR, &HashMap::new(), &HashMap::new());
     assert!(flagged.is_empty(),
         "neither an idle nor a dead agent may be watchdog-flagged, got: {flagged:?}");
 }
@@ -13403,13 +13403,13 @@ fn watchdog_ignores_idle_dead_and_disabled_agents() {
 fn watchdog_stays_quiet_for_a_paused_group() {
     let (reg, _d, gid, wid) = watchdog_setup(5);
     reg.pause_group(&gid).unwrap();
-    assert!(reg.watchdog_tick(FAR, &HashMap::new(), &HashSet::new()).is_empty(),
+    assert!(reg.watchdog_tick(FAR, &HashMap::new(), &HashMap::new()).is_empty(),
         "a paused group's agents idle out on purpose — no watchdog notices");
     // Crucially, the one-notice budget must be intact: pausing must not have
     // burned the latch, so on resume the outstanding stall still earns its
     // first notice.
     reg.resume_group(&gid).unwrap();
-    assert_eq!(reg.watchdog_tick(FAR, &HashMap::new(), &HashSet::new()), vec![wid.clone()],
+    assert_eq!(reg.watchdog_tick(FAR, &HashMap::new(), &HashMap::new()), vec![wid.clone()],
         "resuming an unattended stall must still earn its first notice");
 }
 
@@ -13421,18 +13421,18 @@ fn watchdog_stall_resets_when_the_agent_reports_or_messages() {
     let w = reg.spawn_agent(&g.id, Role::Worker, "w", "work", false, None).unwrap();
     let cw = reg.resolve_token(&w.token).unwrap();
     // Stalled and flagged (anti-nag latch now set).
-    assert_eq!(reg.watchdog_tick(FAR, &HashMap::new(), &HashSet::new()), vec![w.id.clone()]);
+    assert_eq!(reg.watchdog_tick(FAR, &HashMap::new(), &HashMap::new()), vec![w.id.clone()]);
     // A progress report is a sign of life: it clears the latch (via re-idle
     // bookkeeping), so a later silence re-notifies. If the latch had NOT been
     // cleared this tick would be empty — that's the discriminator.
     let _ = dispatch(&reg, &cw, "tools/call",
         &json!({ "name": "report", "arguments": { "status": "progress", "summary": "still going" } }));
-    assert_eq!(reg.watchdog_tick(FAR + 60_000, &HashMap::new(), &HashSet::new()), vec![w.id.clone()],
+    assert_eq!(reg.watchdog_tick(FAR + 60_000, &HashMap::new(), &HashMap::new()), vec![w.id.clone()],
         "a report must reset the stall, then a later silence re-notifies");
     // A free-form message likewise counts as activity and clears the latch.
     let _ = dispatch(&reg, &cw, "tools/call",
         &json!({ "name": "message_orchestrator", "arguments": { "text": "checking in" } }));
-    assert_eq!(reg.watchdog_tick(FAR + 120_000, &HashMap::new(), &HashSet::new()), vec![w.id.clone()],
+    assert_eq!(reg.watchdog_tick(FAR + 120_000, &HashMap::new(), &HashMap::new()), vec![w.id.clone()],
         "a message must also reset the stall, then a later silence re-notifies");
 }
 
@@ -13976,7 +13976,7 @@ fn intake_gate_fires_regardless_when_a_watchdog_stall_is_unresolved() {
     // Drive a REAL watchdog stall on a worker in the same group — the gate reads
     // `AgentEntry.watchdog_notified`, not a test-only backdoor.
     reg.spawn_agent(&g.id, Role::Worker, "w", "do work", false, None).unwrap();
-    let watch_set = std::collections::HashSet::new();
+    let watch_set = std::collections::HashMap::new();
     let fired = reg.watchdog_tick(FAR, &HashMap::new(), &watch_set);
     assert!(!fired.is_empty(), "sanity: the worker must actually be flagged stalled");
 
@@ -35175,37 +35175,44 @@ fn group_watches_truncates_a_long_note_to_the_field_cap_while_list_notifications
     assert_eq!(capped, "n".repeat(notify::NOTICE_FIELD_CAP));
 }
 
-// ---------- watchdog × live watches: the #248 stall-notice annotation ----------
+// ---------- watchdog × live watches: suppress a stall while a watch is live (#852, was #248's annotation) ----------
 
 #[test]
-fn watchdog_stall_audit_flags_an_agent_holding_a_live_watch() {
+fn watchdog_suppresses_the_stall_notice_for_an_agent_holding_a_live_watch() {
+    // (a) live watch → no notice, but an audited suppression line.
     let (reg, _d, gid, wid) = watchdog_setup(5);
     // Register a watch directly against the registry (no MCP round-trip
     // needed — this test is about `watchdog_tick`'s wiring to the same
     // `watches` state, not `notify_when` authz, which is covered elsewhere).
-    reg.register_notification(
-        &gid, &wid, notify::Condition::PrChecks { pr: 241 }, "merge if green".into(), 60,
-    )
-    .unwrap();
+    let watch = reg
+        .register_notification(&gid, &wid, notify::Condition::PrChecks { pr: 241 }, "merge if green".into(), 60)
+        .unwrap();
 
     // `run_watchdog` (not the lower-level `watchdog_tick`) so the has-watch
-    // set is built from the SAME registry read `group_watches` uses — no
+    // map is built from the SAME registry read `group_watches` uses — no
     // second store, exercised end to end.
-    assert_eq!(reg.run_watchdog(FAR), vec![wid.clone()], "the stall must still be flagged");
+    assert!(
+        reg.run_watchdog(FAR).is_empty(),
+        "a live watch must SUPPRESS the stall notice (#852), not merely annotate a delivered one"
+    );
 
     let log = fs::read_to_string(reg.state_root().join(&gid).join("audit.jsonl")).unwrap();
-    let stall_line = log.lines().find(|l| l.contains("watchdog-stall")).unwrap();
     assert!(
-        stall_line.contains("\"has_live_watch\":true"),
-        "an agent with a live watch must be flagged in the audit, got: {stall_line}"
+        !log.lines().any(|l| l.contains("watchdog-stall")),
+        "no stall notice may be audited while the watch is live, got: {log}"
     );
+    let suppressed_line = log
+        .lines()
+        .find(|l| l.contains("watchdog-suppressed"))
+        .unwrap_or_else(|| panic!("the suppression itself must still be audited (diagnosable), got: {log}"));
+    assert!(suppressed_line.contains(&wid), "must name the agent, got: {suppressed_line}");
+    assert!(suppressed_line.contains(&watch.id), "must name the watch id, got: {suppressed_line}");
 }
 
 #[test]
 fn watchdog_stall_audit_does_not_flag_a_watchless_agent() {
-    // Regression guard: a plain stalled agent (the common case, no watch at
-    // all) must read `has_live_watch:false`, not have the field default to
-    // true or be silently omitted.
+    // (c) no watch → unchanged behavior: a plain stalled agent (the common
+    // case) is still flagged and audited exactly as before #852.
     let (reg, _d, gid, wid) = watchdog_setup(5);
     assert_eq!(reg.run_watchdog(FAR), vec![wid.clone()]);
 
@@ -35215,31 +35222,87 @@ fn watchdog_stall_audit_does_not_flag_a_watchless_agent() {
         stall_line.contains("\"has_live_watch\":false"),
         "a watchless agent must not be flagged, got: {stall_line}"
     );
+    assert!(
+        !log.lines().any(|l| l.contains("watchdog-suppressed")),
+        "no suppression line for an agent with no watch, got: {log}"
+    );
 }
 
 #[test]
-fn watchdog_stall_audit_only_flags_the_watching_agent_not_every_stalled_one() {
+fn watchdog_suppression_does_not_bleed_across_agents_in_the_same_group() {
     // Two stalled workers in the same group, only one holding a watch: the
     // per-agent has_watch lookup must not bleed across agents (e.g. a naive
-    // "group has any watch" check would wrongly flag both).
+    // "group has any watch" check would wrongly suppress or flag both).
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", watchdog_rails(5)).unwrap();
     reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
     let watching = reg.spawn_agent(&g.id, Role::Worker, "watcher", "work", false, None).unwrap();
     let plain = reg.spawn_agent(&g.id, Role::Worker, "plain", "work", false, None).unwrap();
-    reg.register_notification(
-        &g.id, &watching.id, notify::Condition::WorkflowRun { run: 1 }, "".into(), 60,
-    )
-    .unwrap();
+    reg.register_notification(&g.id, &watching.id, notify::Condition::WorkflowRun { run: 1 }, "".into(), 60)
+        .unwrap();
 
     let flagged = reg.run_watchdog(FAR);
-    assert_eq!(flagged.len(), 2, "both are stalled, got: {flagged:?}");
+    assert_eq!(
+        flagged,
+        vec![plain.id.clone()],
+        "only the watchless agent may be notified; the watching one is suppressed, got: {flagged:?}"
+    );
 
     let log = fs::read_to_string(reg.state_root().join(&g.id).join("audit.jsonl")).unwrap();
-    let watching_line = log.lines().find(|l| l.contains(&watching.id) && l.contains("watchdog-stall")).unwrap();
+    assert!(
+        log.lines().any(|l| l.contains(&watching.id) && l.contains("watchdog-suppressed")),
+        "got: {log}"
+    );
+    assert!(
+        !log.lines().any(|l| l.contains(&watching.id) && l.contains("watchdog-stall")),
+        "the watching agent must never get a watchdog-stall line, got: {log}"
+    );
     let plain_line = log.lines().find(|l| l.contains(&plain.id) && l.contains("watchdog-stall")).unwrap();
-    assert!(watching_line.contains("\"has_live_watch\":true"), "got: {watching_line}");
     assert!(plain_line.contains("\"has_live_watch\":false"), "got: {plain_line}");
+}
+
+#[test]
+fn watchdog_earns_a_fresh_stall_window_once_the_suppressing_watch_resolves() {
+    // (b) watch expired + still silent past a FRESH window → notice fires.
+    let (reg, _d, gid, wid) = watchdog_setup(5);
+    let watch = reg.register_notification(&gid, &wid, notify::Condition::PrChecks { pr: 1 }, "note".into(), 5).unwrap();
+
+    // Stall trips while the watch is live: suppressed, not notified.
+    assert!(reg.run_watchdog(FAR).is_empty(), "must suppress while the watch is live");
+    let log = fs::read_to_string(reg.state_root().join(&gid).join("audit.jsonl")).unwrap();
+    assert!(log.contains("watchdog-suppressed"), "sanity: must have suppressed, got: {log}");
+
+    // The watch expires — purely time-based (`notify_tick`'s own seam, #243),
+    // so FAR (far past any real deadline_ms) expires it regardless of the
+    // real wall-clock `register_notification` used to compute that deadline.
+    assert_eq!(reg.notify_tick(FAR, &HashMap::new()), vec![watch.id.clone()], "the watch must expire");
+    let log = fs::read_to_string(reg.state_root().join(&gid).join("audit.jsonl")).unwrap();
+    assert!(log.contains("watch-expired"), "expiry must be audited, got: {log}");
+
+    // The very next watchdog tick observes the watch is gone: it must hand
+    // the agent a FRESH full stall window, not immediately re-fire off
+    // whatever was left of the old, already-expired one.
+    assert!(
+        reg.run_watchdog(FAR).is_empty(),
+        "the tick that notices the watch resolved must reset the clock, not fire immediately"
+    );
+
+    // Short of a whole fresh window since the reset: still quiet.
+    assert!(
+        reg.run_watchdog(FAR + 60_000).is_empty(),
+        "must not fire before a whole fresh window has elapsed since the watch resolved"
+    );
+
+    // A full fresh window elapses with the agent still silent: that
+    // combination — resolved watch, still nothing — is a real stall (#852).
+    assert_eq!(
+        reg.run_watchdog(FAR + 5 * 60_000 + 1),
+        vec![wid.clone()],
+        "silent through a full fresh window after the watch resolved is a real stall"
+    );
+    let log = fs::read_to_string(reg.state_root().join(&gid).join("audit.jsonl")).unwrap();
+    let stall_line = log.lines().rev().find(|l| l.contains("watchdog-stall")).unwrap();
+    assert!(stall_line.contains(&wid), "got: {stall_line}");
 }
 
 #[test]
