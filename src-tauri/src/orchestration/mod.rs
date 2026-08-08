@@ -3353,7 +3353,14 @@ channel; keep the human oriented with short summaries."
              above) must SAY so in its summary (\"pass — 2 non-blocking findings, disposition \
              pending\"). The verdict is the gate's state, and the gate is read by something that will \
              merge on it: a summary that reads like a clean bill of health is how review feedback gets \
-             dropped at the merge."
+             dropped at the merge.\n\
+             - Keep that summary to about 100 words, and make the `report(...)` after it ONE LINE \
+             (#850). The full analysis goes in the review you post on the PR; the summary is the \
+             record the gate reads, and loomux copies it into the orchestrator's pane capped, \
+             pointing at `list_verdicts` and the PR for the rest. Your report is then outcome + \
+             `ref` + `detail_url` + findings count — and never a restatement of the summary the \
+             orchestrator has just been handed, because pane text is context that agent re-pays \
+             for on every turn after this one."
         ),
         Role::Planner => format!(
             "{common}\n- You explore the codebase READ-ONLY and write an implementation plan as a \
@@ -32565,7 +32572,19 @@ impl OrchRegistry {
                      matters because a squash merge makes that body the permanent commit message. \
                      Two things follow: read the body as reviewed content, not as a preamble; and \
                      if you fail a PR *on its body*, expect the fix to change the body under your \
-                     verdict — that is the loop working, and you clear it by re-recording."
+                     verdict — that is the loop working, and you clear it by re-recording.\n\
+                     \n\
+                     **Keep the summary to about 100 words, and report ONE line after it** \
+                     (#850). Your full analysis belongs in the review you post on the PR; the \
+                     summary is the gate's record — enough for the orchestrator to route on \
+                     (what class of finding, how bad, what has to happen next). loomux types a \
+                     courtesy copy of it into the orchestrator's pane and **caps it there**, \
+                     pointing at `list_verdicts` and the PR for the rest, so a long summary does \
+                     not arrive in full anyway. Then your `report(...)` is **one line — outcome, \
+                     `ref`, `detail_url`, findings count — and never a restatement of the \
+                     summary**: the orchestrator has just read the notice, and a second copy of \
+                     the same prose becomes resident context it pays for on every turn that \
+                     follows."
                 )
             }
             None => String::new(),

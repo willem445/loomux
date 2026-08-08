@@ -665,6 +665,16 @@ until the reviewers whose passes are live have re-recorded against the body as
 it stands. It is opt-in because it is only true of squash-merging repos; where
 merges keep the PR body as discussion rather than history, leave it out.
 
+**Verdict notices are short on purpose.** Recording a verdict also types a
+courtesy notice into the orchestrator's pane, so it learns the review landed
+without polling for it. That notice carries the verdict, the PR, and only the
+**first ~400 characters** of the reviewer's summary, followed by a pointer to
+the rest — pane text becomes that agent's resident context and is re-sent on
+every turn it takes afterwards, so a full copy of every summary is paid for
+repeatedly. Nothing is lost: the whole summary stays in the verdict record (the
+orchestrator reads it with `list_verdicts`, which is also what the merge gate
+reads) and in the review posted on the PR itself.
+
 **Opt-in, every time.** A workflow file arrives with a `git clone` — the
 **advanced orchestrator** toggle is what makes a repo's workflow take effect;
 off (the default), the file is never even opened. Turning it on, at launch or

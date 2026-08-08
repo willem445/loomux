@@ -9,6 +9,14 @@
 //! The legacy shape (`status` + free-text `summary`) is unchanged and stays
 //! legal forever (soft-deprecated: accepted, but the role templates stop
 //! teaching it) — see `mcp.rs` for how the two shapes coexist in one tool.
+//!
+//! Since #850 this module also owns the cap on the OTHER agent-authored text
+//! that lands in the orchestrator's pane: the courtesy notice a recorded
+//! verdict types there (`verdict_notice_summary`). Same principle, same
+//! truncation primitive — what an agent writes into another agent's pane is
+//! resident context the recipient re-pays for on every subsequent turn, so the
+//! notice is a wake-up signal and the record lives where a reader can go get
+//! it.
 
 /// Legal `outcome` values — a superset of the legacy `status` enum. `approved`
 /// / `request_changes` let a reviewer's report classify itself without
@@ -39,17 +47,66 @@ pub fn status_for_outcome(outcome: &str) -> &'static str {
     }
 }
 
+/// Hard cap, in **characters**, on how much of a recorded verdict's summary is
+/// copied into the orchestrator's pane by the courtesy notice `review_verdict`
+/// types there (#850).
+///
+/// A summary may be up to `workflow::MAX_SUMMARY_CHARS` (4000) and every
+/// character of it used to be typed into the orchestrator's pane — then
+/// restated a second time by the reviewer's own `report(...)`. That pane text
+/// becomes the orchestrator's *resident* context, re-sent on every subsequent
+/// API call, which makes it the most expensive prose in the system: one review
+/// round of eight verdict events measured ≈15k duplicated tokens.
+///
+/// ~400 characters is a paragraph — enough to route on (what class of finding,
+/// how bad, whether to send it back or ask a human) without being the record.
+/// The record is unchanged and complete in three places a reader can reach on
+/// demand: the verdict file, `list_verdicts`, and the review posted on the PR.
+pub const VERDICT_NOTICE_SUMMARY_CAP: usize = 400;
+
 /// Truncate `note` to `NOTE_CHAR_CAP` characters, appending a marker that
 /// states the truncation happened and points at `detail_url` for the rest —
 /// never a silent cut. A no-op (returns `note` unchanged) when already under
 /// the cap, so a short note round-trips byte-for-byte.
 pub fn truncate_note(note: &str) -> String {
-    let char_count = note.chars().count();
-    if char_count <= NOTE_CHAR_CAP {
-        return note.to_string();
+    truncate_chars(note, NOTE_CHAR_CAP, |total| {
+        format!(" […truncated, {total} chars total — see detail_url]")
+    })
+}
+
+/// The summary as the orchestrator's pane receives it: capped at
+/// `VERDICT_NOTICE_SUMMARY_CAP` characters with a **fixed pointer** at where
+/// the whole thing lives (#850). Untouched when it already fits, so a reviewer
+/// writing the ~100 words the templates ask for round-trips byte-for-byte and
+/// never sees a marker.
+///
+/// The pointer names `list_verdicts` and the PR rather than "see above",
+/// because a truncated notice is read by an agent that has to *decide* whether
+/// it needs the rest — and the tool call that gets it is the actionable half.
+/// Nothing else is filtered here (newlines and the like are already handled by
+/// `workflow::sanitize_summary` at the write): this is a length cap, and a
+/// second responsibility bolted on would make the boundary tests below stop
+/// describing one thing.
+pub fn verdict_notice_summary(summary: &str) -> String {
+    truncate_chars(summary, VERDICT_NOTICE_SUMMARY_CAP, |total| {
+        format!(" […truncated, {total} chars total — full summary on the PR and via list_verdicts]")
+    })
+}
+
+/// Keep the first `cap` **characters** of `text`, appending `marker(total)`
+/// when (and only when) something was actually dropped.
+///
+/// Characters, never bytes: a byte cut mid-codepoint either panics on a slice
+/// boundary or corrupts the string, and every text reaching this module is
+/// agent-authored prose that can carry any UTF-8 at all. Shared by both caps so
+/// there is one truncation to get right rather than two that drift.
+fn truncate_chars(text: &str, cap: usize, marker: impl FnOnce(usize) -> String) -> String {
+    let char_count = text.chars().count();
+    if char_count <= cap {
+        return text.to_string();
     }
-    let mut truncated: String = note.chars().take(NOTE_CHAR_CAP).collect();
-    truncated.push_str(&format!(" […truncated, {char_count} chars total — see detail_url]"));
+    let mut truncated: String = text.chars().take(cap).collect();
+    truncated.push_str(&marker(char_count));
     truncated
 }
 

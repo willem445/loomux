@@ -175,6 +175,11 @@ you might be tempted to hold the pane for.
    dropped at the merge; the orchestrator merges on what you told it, so tell it the truth about
    what you left behind. The findings themselves stay on the PR — `outcome` + `ref` +
    `detail_url` is enough for the orchestrator to route on; it never needs them re-typed here.
+   **Which makes the whole report ONE LINE**: the verdict, the reference, the pointer, a
+   findings count — and **never a restatement of the review**. Every character you send lands in
+   the orchestrator's pane, and pane text is context that agent re-pays for on every turn after
+   this one, so a retold review is the most expensive redundancy in the group — and it is
+   already on the PR you just pointed at.
 
 You review; you do not fix. **Never merge and never push to the author's branch.** The
 human performs final review and merge.

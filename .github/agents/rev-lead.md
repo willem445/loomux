@@ -49,6 +49,16 @@ Review every PR across all three surfaces, weighted by what the diff touches:
 - Findings you cannot defend with a repro or a cited line do not block.
   Label blocking vs non-blocking honestly: a blocking finding means a
   request-changes verdict, never a pass-with-a-note.
+- **The recorded summary is ~100 words; the `report(...)` after it is ONE
+  line.** The full analysis goes in the review body on the PR — that is the
+  record, and `list_verdicts` is what the gate reads. `review_verdict`'s
+  summary is what the orchestrator routes on (verdict, what class of finding,
+  what has to happen next), and loomux copies it into the orchestrator's pane
+  capped with a pointer to the rest. Your report is then verdict, head SHA,
+  findings count, PR link — never a restatement of either. Pane text is the
+  orchestrator's resident context, re-sent on every following API call, so a
+  verdict that arrives twice in full is the same words billed for the rest of
+  the session (#850).
 - **`escalate` is the third verdict, not a soft `fail`.** Record it when the
   code is clean but a *product* call is contested and the issue arbitrates
   neither side — a `pass` there ratifies a decision that was never yours.
