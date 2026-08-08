@@ -1045,6 +1045,40 @@ fn list_agents_truncates_task_to_compact_excerpt() {
 }
 
 #[test]
+fn task_excerpt_is_utf8_safe_at_the_char_boundary() {
+    // #851 review NB1: `task_excerpt` MUST cut on a char boundary, not a
+    // byte offset — task briefs are full of multi-byte glyphs (em dashes,
+    // arrows, emoji), and a byte-offset cut like `&s[..140]` panics the
+    // instant it lands inside one instead of between two. This pins that
+    // by building a brief whose 140th CHAR is a 4-byte emoji: a byte-offset
+    // cut at byte 140 would land one byte into that emoji (139 ASCII bytes
+    // in), while a char-counted cut does not — so a regression to
+    // byte-slicing fails this test with a slice-boundary panic, not a
+    // quiet wrong answer.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let mut task = "a".repeat(139);
+    task.push('😀'); // the 140th char, 4 bytes wide — straddles byte offset 140
+    task.push_str(" and more text past the cap that must be dropped");
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", &task, false, None).unwrap();
+
+    let roster = reg.list_agents(&g.id);
+    let row = roster.as_array().unwrap().iter().find(|a| a["id"] == json!(w.id)).unwrap();
+    let excerpt = row["task"].as_str().unwrap();
+
+    // 140 kept chars (139 'a' + the intact emoji) plus the ellipsis marker —
+    // counted in chars, not bytes, so the emoji is never split.
+    assert_eq!(
+        excerpt.chars().count(),
+        141,
+        "140-char cap + ellipsis, counted in chars not bytes; got {excerpt:?}"
+    );
+    assert!(excerpt.starts_with(&"a".repeat(139)));
+    assert!(excerpt.contains('😀'), "the multi-byte char at the boundary must survive intact, got {excerpt:?}");
+    assert!(excerpt.ends_with('…'));
+}
+
+#[test]
 fn guardrail_clamps_and_sanitizes() {
     let g = Guardrails {
         max_agents: 99,
