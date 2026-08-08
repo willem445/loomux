@@ -41327,6 +41327,50 @@ fn g4_a_short_pasted_line_never_claims_a_menu_option_row() {
 }
 
 #[test]
+fn evidence_844_g7_red_before_green_probe() {
+    // PR #844 review, blocking finding 3(a): the author owes the RUN, not the
+    // reviewer's derivation, that the new g7 test is red on base (317774d)
+    // before the fix. This is that run: g7's own body (unmodified, copied
+    // verbatim from the PR branch), executed against main's `mask_own_paste`
+    // — which has the 24-char floor but none of #844's `dialog_header_above`
+    // waiver. Throwaway: this file/branch exists only to produce the CI
+    // failure cited in PR #844's body; it is never merged.
+    let tail = "● Ready.\nC:\\Projects\\loomux [⎇ main]\n──────────────────────\n❯ merge\n──────────────────────\n  @ files · # issues · Session: 4.2 AIC used";
+
+    let unmasked = prompt_wait_match(tail).expect("the raw screen IS pointer-shaped");
+    assert_eq!(unmasked.signal, "pointer-option", "and by THIS signal class");
+
+    // h1: on main, a short line in a headerless composer is NOT masked (no
+    // waiver exists yet), so this is expected to fail here.
+    let masked = mask_own_paste(tail, "merge");
+    assert!(
+        prompt_wait_match(&masked).is_none(),
+        "a short line in a composer with no dialog header above it is our own steer, not a \
+         menu's choice (#820 residual): {:?}",
+        prompt_wait_match(&masked)
+    );
+
+    // h2: the SAME shape is a live dialog's choice when a `? ...` header sits
+    // above the pointer row — g4's fail-safe must survive the waiver.
+    let dialog = "? Overwrite the existing file?\n❯ Overwrite\n  Keep both";
+    let dialog_masked = mask_own_paste(dialog, "Overwrite");
+    let m = prompt_wait_match(&dialog_masked)
+        .expect("a real dialog with a short highlighted choice must still be a question (#420)");
+    assert_eq!(m.needle, QuestionNeedle::LeadingPointer, "and still by the pointer");
+
+    // h3: end to end, at the same pre-Enter checkpoint that held the pane.
+    let pred = question_hold_predicate(
+        move || Some(tail.as_bytes().to_vec()),
+        Some("merge".to_string()),
+        Vec::new(),
+    );
+    assert!(
+        !pred(),
+        "a short steer under no dialog header must not hold the delivery (#820 residual)"
+    );
+}
+
+#[test]
 fn g5_every_captured_real_dialog_still_holds_with_a_delivery_on_screen() {
     // #727's suite is the floor, and the argument that CHANGED is the mask —
     // so each captured shape is re-checked THROUGH the new exclusion with a
