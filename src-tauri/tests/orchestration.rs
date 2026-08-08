@@ -995,11 +995,14 @@ fn list_agents_truncates_task_to_compact_excerpt() {
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
     let long = "x".repeat(4096);
     let short = "short brief, well under the cap";
+    // `rails()` caps this group at 2 live delegates, so `dead` is killed
+    // before the next spawn — otherwise three concurrent live workers would
+    // trip the guardrail this test isn't about.
     let dead = reg.spawn_agent(&g.id, Role::Worker, "dead", &long, false, None).unwrap();
+    reg.mark_dead(&dead.id, Some(0));
     let live = reg.spawn_agent(&g.id, Role::Worker, "live", &long, false, None).unwrap();
     let live_short =
         reg.spawn_agent(&g.id, Role::Worker, "live-short", short, false, None).unwrap();
-    reg.mark_dead(&dead.id, Some(0));
 
     let roster = reg.list_agents(&g.id);
     let arr = roster.as_array().unwrap();
