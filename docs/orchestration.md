@@ -440,6 +440,11 @@ is cancelled), the agent earns a fresh full stall window from that moment; only 
 *that* window is treated as a real stall and nudges the orchestrator (`watchdog-stall`).
 A stalled agent holding no watch behaves exactly as before.
 
+The suppression is bounded by the watch's own TTL (5–240 min, default 60 — see "capped ...
+and time-bounded" above), never open-ended: a genuinely hung agent holding a watch is
+silent-but-unreported for at most that TTL plus one more stall window before the orchestrator
+gets a notice, and `watchdog-suppressed` audit lines mark the wait the whole time.
+
 **When a notice can't get in.** A `[loomux]` notice is typed into the agent's pane, and a pane
 that is mid-turn can't take one — so if an agent blocks its own turn waiting on the very thing
 the notice would tell it about, the notice sits in that pane's queue and nothing clears. Loomux

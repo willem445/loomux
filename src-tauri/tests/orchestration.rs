@@ -35219,8 +35219,8 @@ fn watchdog_stall_audit_does_not_flag_a_watchless_agent() {
     let log = fs::read_to_string(reg.state_root().join(&gid).join("audit.jsonl")).unwrap();
     let stall_line = log.lines().find(|l| l.contains("watchdog-stall")).unwrap();
     assert!(
-        stall_line.contains("\"has_live_watch\":false"),
-        "a watchless agent must not be flagged, got: {stall_line}"
+        stall_line.contains(&wid),
+        "a watchless agent's stall must still be audited and notified, got: {stall_line}"
     );
     assert!(
         !log.lines().any(|l| l.contains("watchdog-suppressed")),
@@ -35257,8 +35257,10 @@ fn watchdog_suppression_does_not_bleed_across_agents_in_the_same_group() {
         !log.lines().any(|l| l.contains(&watching.id) && l.contains("watchdog-stall")),
         "the watching agent must never get a watchdog-stall line, got: {log}"
     );
-    let plain_line = log.lines().find(|l| l.contains(&plain.id) && l.contains("watchdog-stall")).unwrap();
-    assert!(plain_line.contains("\"has_live_watch\":false"), "got: {plain_line}");
+    assert!(
+        log.lines().any(|l| l.contains(&plain.id) && l.contains("watchdog-stall")),
+        "the watchless agent must still be flagged, got: {log}"
+    );
 }
 
 #[test]
@@ -35303,6 +35305,55 @@ fn watchdog_earns_a_fresh_stall_window_once_the_suppressing_watch_resolves() {
     let log = fs::read_to_string(reg.state_root().join(&gid).join("audit.jsonl")).unwrap();
     let stall_line = log.lines().rev().find(|l| l.contains("watchdog-stall")).unwrap();
     assert!(stall_line.contains(&wid), "got: {stall_line}");
+}
+
+#[test]
+fn watchdog_message_activity_clears_the_suppression_latch_too() {
+    // Review finding 3 on #852: a sign of life unrelated to the watch (a
+    // `message_orchestrator` call) must clear `watchdog_watch_suppressed`
+    // alongside `watchdog_notified`, exactly like `note_agent_activity`'s
+    // other caller. If it didn't: suppress a stall, message the
+    // orchestrator, then let the watch resolve with no further activity —
+    // the NEXT tick would wrongly take the watch-resolved reset branch on a
+    // latch the message already made stale, silently eating that tick (and
+    // its rightful notice) and delaying a genuine stall by up to one whole
+    // extra window.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", watchdog_rails(5)).unwrap();
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "work", false, None).unwrap();
+    let cw = reg.resolve_token(&w.token).unwrap();
+    reg.register_notification(&g.id, &w.id, notify::Condition::PrChecks { pr: 1 }, "note".into(), 5).unwrap();
+
+    // Stall trips while the watch is live: suppressed (both latches set).
+    assert!(reg.run_watchdog(FAR).is_empty(), "must suppress while the watch is live");
+    let log = fs::read_to_string(reg.state_root().join(&g.id).join("audit.jsonl")).unwrap();
+    assert!(log.contains("watchdog-suppressed"), "sanity: must have suppressed, got: {log}");
+
+    // A free-form message — a real sign of life, nothing to do with the
+    // watch — must reset BOTH latches, not just `watchdog_notified`.
+    let _ = dispatch(
+        &reg,
+        &cw,
+        "tools/call",
+        &json!({ "name": "message_orchestrator", "arguments": { "text": "checking in" } }),
+    );
+
+    // The watch resolves later, with no further activity from the agent.
+    assert!(!reg.notify_tick(FAR, &HashMap::new()).is_empty(), "sanity: the watch must expire");
+
+    // If the suppression latch survived the message, this tick would wrongly
+    // take the watch-resolved reset branch (latch true, watch gone) and come
+    // back empty — silently eating the tick. With the latch correctly
+    // cleared by the message, `last_progress_ms` is already the message's
+    // real timestamp, and `FAR` is unambiguously past a fresh window from
+    // it, so the stall must fire on THIS tick, not the next one.
+    assert_eq!(
+        reg.run_watchdog(FAR),
+        vec![w.id.clone()],
+        "a message must fully clear the suppression latch, so the tick after the watch \
+         later resolves fires immediately instead of eating one silent tick first"
+    );
 }
 
 #[test]

@@ -5758,22 +5758,18 @@ pub fn watchdog_should_notify(
 
 /// Compose the watchdog stall notice delivered to the orchestrator. Split out
 /// of `watchdog_tick` (the `watch_fired_notice`-style idiom from notify.rs) so
-/// the #248 annotation is unit-testable with a plain bool, no registry/app
-/// needed. `has_live_watch` mirrors `watchdog_tick`'s other injected inputs
-/// (`outputs`): the caller looks it up from the same `watches` map
-/// `notify_tick` already owns (no second store) rather than this function
-/// reaching for it itself. The annotation sits between the stall observation
-/// and the recovery instructions — a correctly-WAITING agent parked on a CI
-/// watch reads differently from a genuinely stuck one, right where the human
-/// decides whether to intervene (issue #248).
-pub fn watchdog_stall_notice(name: &str, id: &str, minutes: u32, has_live_watch: bool) -> String {
-    let watch_note = if has_live_watch {
-        " It has a live CI watch registered — may be deliberately waiting, not stuck."
-    } else {
-        ""
-    };
+/// it's unit-testable with no registry/app needed.
+///
+/// #248 originally gave this a `has_live_watch` annotation ("may be
+/// deliberately waiting, not stuck") for a stalled agent holding a live CI
+/// watch; #852 replaced that half-measure with full suppression of the
+/// notice in that case (`watchdog_tick`), so by construction a notice this
+/// function composes can never describe an agent holding a live watch —
+/// the parameter (and the branch) was dropped as dead code (review finding
+/// on #852).
+pub fn watchdog_stall_notice(name: &str, id: &str, minutes: u32) -> String {
     format!(
-        "[loomux] watchdog: agent {name} ({id}) has produced no terminal output and sent no report for {minutes}+ min — it may be stalled or waiting on input.{watch_note} Inspect it with get_output(\"{id}\"); if its kickoff was lost or it is stuck, re-send the task with send_prompt. You will get this notice at most once per stall."
+        "[loomux] watchdog: agent {name} ({id}) has produced no terminal output and sent no report for {minutes}+ min — it may be stalled or waiting on input. Inspect it with get_output(\"{id}\"); if its kickoff was lost or it is stuck, re-send the task with send_prompt. You will get this notice at most once per stall."
     )
 }
 
@@ -8162,9 +8158,9 @@ pub struct AgentEntry {
     /// Watchdog anti-nag latch: set once a stall notice has been delivered for
     /// the current stall, cleared when the agent produces output/reports again.
     pub watchdog_notified: bool,
-    /// #852: set instead of (never alongside a delivered) `watchdog_notified`
-    /// when a stall trips while the agent holds a live `notify_when` watch —
-    /// the notice is suppressed, not sent, because the agent is plausibly
+    /// #852: set alongside `watchdog_notified` when a stall trips while the
+    /// agent holds a live `notify_when` watch — but that trip does NOT
+    /// deliver a notice, it suppresses one, because the agent is plausibly
     /// waiting on its own registered CI check rather than stuck. Watched for
     /// on the NEXT tick: once the agent no longer holds any live watch (it
     /// fired, expired, failed-out, or was cancelled), `watchdog_tick` clears
@@ -8172,7 +8168,12 @@ pub struct AgentEntry {
     /// to that tick's `now` — a fresh full stall window, so the notice only
     /// ever fires for a stall the agent is STILL silent through after its
     /// watch resolved, never immediately off whatever was left of the old
-    /// (already-expired) window.
+    /// (already-expired) window. Also cleared by the other two
+    /// `watchdog_notified`-clearing sites (`note_agent_activity`,
+    /// `set_agent_idle(false)`) — any sign of life must retire a suppression
+    /// latch the same tick it retires the notice latch, or a later tick could
+    /// take the watch-resolved branch on a latch describing a stall that no
+    /// longer exists (review finding on #852).
     pub watchdog_watch_suppressed: bool,
     /// Autonomous idle-tick latch (#83), meaningful only for the orchestrator:
     /// set when an idle-tick notice is delivered, cleared when the pane produces
@@ -25280,6 +25281,13 @@ impl OrchRegistry {
                 // clear its anti-nag latch so the fresh stall gets a nudge.
                 a.last_progress_ms = now_ms();
                 a.watchdog_notified = false;
+                // #852 review finding 3: also clear the suppression latch —
+                // left set, a later tick's watch-resolved branch would fire on
+                // a latch that no longer describes anything (the watch this
+                // NEW assignment might hold, if any, hasn't even been checked
+                // yet), stamping a clock this fresh-assignment stamp already
+                // owns and delaying a genuine stall by up to one extra window.
+                a.watchdog_watch_suppressed = false;
                 // New work supersedes a prior done/blocked report — drop its
                 // attention latch so a stale badge doesn't linger.
                 self.attn_reports.lock_safe().remove(agent_id);
@@ -25366,6 +25374,14 @@ impl OrchRegistry {
             }
             a.last_progress_ms = now_ms();
             a.watchdog_notified = false;
+            // #852 review finding 3: this is a sign of life too, so it must
+            // clear the suppression latch alongside the notice latch — a
+            // `message_orchestrator` call between a suppressed stall and its
+            // watch resolving would otherwise leave `watchdog_watch_suppressed`
+            // set on a latch the agent's own activity already made stale,
+            // stamping the clock a tick late and delaying a genuine stall by
+            // up to one extra window.
+            a.watchdog_watch_suppressed = false;
         }
     }
 
@@ -25583,13 +25599,12 @@ impl OrchRegistry {
 
         let mut notified = Vec::new();
         for (id, group, name, minutes) in to_notify {
-            self.audit(&group, "loomux", "watchdog-stall",
-                json!({ "agent": id, "name": name, "silent_minutes": minutes, "has_live_watch": false }));
-            let _ = self.deliver_to_orchestrator(
-                &group,
-                &watchdog_stall_notice(&name, &id, minutes, false),
-                "loomux",
-            );
+            // #852 review finding 2: `has_live_watch` dropped — by
+            // construction an agent reaching this branch (not `to_suppress`
+            // above) never holds a live watch, so the field was a constant
+            // `false` on every line.
+            self.audit(&group, "loomux", "watchdog-stall", json!({ "agent": id, "name": name, "silent_minutes": minutes }));
+            let _ = self.deliver_to_orchestrator(&group, &watchdog_stall_notice(&name, &id, minutes), "loomux");
             notified.push(id);
         }
         notified
@@ -44720,33 +44735,19 @@ mod watchdog_stall_notice_tests {
     use super::*;
 
     #[test]
-    fn annotates_when_the_agent_has_a_live_watch() {
-        let n = watchdog_stall_notice("w-2", "w-2", 12, true);
-        assert!(n.contains("live CI watch"), "must annotate a watching agent, got: {n}");
-        assert!(n.contains("may be deliberately waiting"), "got: {n}");
-    }
-
-    #[test]
-    fn omits_the_annotation_without_a_live_watch() {
-        // The regression this guards: a plain stalled agent (no watch) must
-        // read exactly as before — no dangling "live CI watch" clause tacked
-        // onto every notice regardless of truth.
-        let n = watchdog_stall_notice("w-2", "w-2", 12, false);
-        assert!(!n.contains("live CI watch"), "must not claim a watch that doesn't exist, got: {n}");
-        assert!(!n.contains("deliberately waiting"), "got: {n}");
-    }
-
-    #[test]
-    fn still_carries_the_core_stall_fields_either_way() {
-        // The annotation must be additive, never displacing the existing
-        // name/id/minutes/get_output instructions the orchestrator relies on.
-        for has_watch in [true, false] {
-            let n = watchdog_stall_notice("w-9", "w-9", 45, has_watch);
-            assert!(n.starts_with("[loomux] watchdog:"), "got: {n}");
-            assert!(n.contains("w-9"), "got: {n}");
-            assert!(n.contains("45+ min"), "got: {n}");
-            assert!(n.contains("get_output(\"w-9\")"), "got: {n}");
-        }
+    fn carries_the_core_stall_fields() {
+        // #852 review finding 2: this module used to pin the #248
+        // has_live_watch annotation ("may be deliberately waiting, not
+        // stuck"); #852 removed that branch entirely (a notified agent can
+        // no longer hold a live watch — watchdog_tick suppresses that case
+        // instead), so there's nothing left to annotate. What's left to pin
+        // is the name/id/minutes/get_output instructions the orchestrator
+        // relies on.
+        let n = watchdog_stall_notice("w-9", "w-9", 45);
+        assert!(n.starts_with("[loomux] watchdog:"), "got: {n}");
+        assert!(n.contains("w-9"), "got: {n}");
+        assert!(n.contains("45+ min"), "got: {n}");
+        assert!(n.contains("get_output(\"w-9\")"), "got: {n}");
     }
 }
 
