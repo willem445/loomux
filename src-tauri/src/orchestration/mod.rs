@@ -25507,87 +25507,48 @@ impl OrchRegistry {
             .collect();
         let paused = self.paused.lock_safe().clone();
 
-        // First pass under the agents lock: refresh counters and pick who to
-        // nudge or suppress. Delivery (which types into a pane and can block)
-        // happens after the lock is released.
+        // #852 RED-EVIDENCE PATCH (temporary, reverted by the next commit):
+        // pre-#852 behavior restored on the new signature — always notify,
+        // never suppress — so the new suppression tests fail for the right
+        // reason (feature absent) instead of a compile error.
         let mut to_notify: Vec<(String, String, String, u32)> = Vec::new();
-        let mut to_suppress: Vec<(String, String, String, u32, Vec<String>)> = Vec::new();
         {
             let mut agents = self.agents.lock_safe();
             for a in agents.values_mut() {
-                // Only agents actively working: running, not the orchestrator,
-                // and currently assigned (idle_since_ms clear). This excludes
-                // idle, done/blocked, dead, and reaped agents by construction.
                 if a.role == Role::Orchestrator
                     || a.status != AgentStatus::Running
                     || a.idle_since_ms.is_some()
                 {
                     continue;
                 }
-                // Output growth = activity: reset the clock and both latches,
-                // and this tick can't also flag or suppress the agent.
                 if let Some(&cur) = outputs.get(&a.id) {
                     if cur > a.last_output_total {
                         a.last_output_total = cur;
                         a.last_progress_ms = now;
                         a.watchdog_notified = false;
-                        a.watchdog_watch_suppressed = false;
                         continue;
                     }
                 }
-                // A paused group's agents idle out on purpose; never nudge and
-                // never burn their one-notice budget while paused.
                 if paused.contains(&a.group) {
                     continue;
                 }
-                let watch_ids = has_watch.get(&a.id);
-                let watching = watch_ids.is_some_and(|ids| !ids.is_empty());
-
-                // #852: the watch that was suppressing this stall has resolved
-                // since we last looked — give the agent a fresh full window
-                // starting now instead of evaluating (and possibly firing)
-                // against the old, already-expired one.
-                if a.watchdog_watch_suppressed && !watching {
-                    a.watchdog_watch_suppressed = false;
-                    a.watchdog_notified = false;
-                    a.last_progress_ms = now;
-                    continue;
-                }
-
                 let threshold = thresholds.get(&a.group).copied().unwrap_or(0);
                 if watchdog_should_notify(a.last_progress_ms, now, threshold, a.watchdog_notified) {
+                    a.watchdog_notified = true;
                     let minutes = (now.saturating_sub(a.last_progress_ms) / 60_000) as u32;
-                    if watching {
-                        a.watchdog_notified = true;
-                        a.watchdog_watch_suppressed = true;
-                        to_suppress.push((
-                            a.id.clone(),
-                            a.group.clone(),
-                            a.name.clone(),
-                            minutes,
-                            watch_ids.cloned().unwrap_or_default(),
-                        ));
-                    } else {
-                        a.watchdog_notified = true;
-                        to_notify.push((a.id.clone(), a.group.clone(), a.name.clone(), minutes));
-                    }
+                    to_notify.push((a.id.clone(), a.group.clone(), a.name.clone(), minutes));
                 }
             }
         }
 
-        for (id, group, name, minutes, watch_ids) in to_suppress {
-            self.audit(&group, "loomux", "watchdog-suppressed", json!({
-                "agent": id, "name": name, "silent_minutes": minutes, "watch_ids": watch_ids,
-            }));
-        }
-
         let mut notified = Vec::new();
         for (id, group, name, minutes) in to_notify {
+            let watching = has_watch.get(&id).is_some_and(|ids| !ids.is_empty());
             self.audit(&group, "loomux", "watchdog-stall",
-                json!({ "agent": id, "name": name, "silent_minutes": minutes, "has_live_watch": false }));
+                json!({ "agent": id, "name": name, "silent_minutes": minutes, "has_live_watch": watching }));
             let _ = self.deliver_to_orchestrator(
                 &group,
-                &watchdog_stall_notice(&name, &id, minutes, false),
+                &watchdog_stall_notice(&name, &id, minutes, watching),
                 "loomux",
             );
             notified.push(id);
