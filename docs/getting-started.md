@@ -54,6 +54,11 @@ and never installs an older build over a newer one:
 | a stable release (`1.0.0`) | the newest **stable** release |
 | a beta/RC (`1.1.0-beta11`) | the newest release of either kind |
 
+If the launcher cannot read the version of your installed Loomux, `loomux
+update` stops and says so rather than guessing — it has no way to tell an update
+from a downgrade, so it does neither. Installing your preferred build once from
+the releases page clears it.
+
 To move from stable onto the beta train (or back), install that build yourself
 from [the releases page](https://github.com/willem445/loomux/releases) — the
 launcher will not switch channels for you. On Linux the app is a cached

@@ -30,6 +30,9 @@ const {
   channelOf,
   newestOnChannel,
   updateVerdict,
+  updateBaseline,
+  newestVersion,
+  installedWindowsVersion,
   pickCachedAppImage,
   appImageVersion,
 } = require("../npm/bin/loomux.js");
@@ -245,6 +248,90 @@ test("newestOnChannel skips tags it cannot order rather than guessing", () => {
     current: "1.0.0",
     release: null,
   });
+});
+
+// ---------- what update orders against ----------
+
+// `reg query` output, as Windows actually prints it.
+const regOut = (v: string) =>
+  `\r\nHKEY_LOCAL_MACHINE\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Loomux\r\n    DisplayVersion    REG_SZ    ${v}\r\n\r\n`;
+
+/** A fake `reg` that answers only for the hive/view pairs in `present`. */
+const fakeReg = (present: Record<string, string>) => (key: string, view: string | null) =>
+  present[`${key.split("\\")[0]}${view ? " " + view : ""}`] ?? "";
+
+test("a per-machine install is readable — HKCU alone is not the whole registry", () => {
+  // findWindowsExe already looks under %PROGRAMFILES%, which is a per-machine
+  // NSIS install, and those register under HKLM. Probing HKCU only made every
+  // one of them read as "no version", which updateBaseline then has to refuse —
+  // so the probe must actually cover them or `update` is broken for that user.
+  assert.equal(
+    installedWindowsVersion(fakeReg({ "HKLM /reg:64": regOut("1.1.0-beta11") })),
+    "1.1.0-beta11",
+    "a per-machine install in the native view must be found"
+  );
+  assert.equal(
+    installedWindowsVersion(fakeReg({ "HKLM /reg:32": regOut("1.1.0-beta11") })),
+    "1.1.0-beta11",
+    "...and one whose keys landed in the WOW6432Node view"
+  );
+  assert.equal(
+    installedWindowsVersion(fakeReg({ HKCU: regOut("1.0.0") })),
+    "1.0.0",
+    "per-user installs keep working"
+  );
+  assert.equal(installedWindowsVersion(fakeReg({})), null, "no key anywhere → unknown");
+});
+
+test("when two installs exist, the guard orders against the newest", () => {
+  // If ANY install on the machine is newer than the release we resolved,
+  // installing that release downgrades it. So a stale per-machine leftover must
+  // not unblock a downgrade of a newer per-user install, or the reverse.
+  assert.equal(
+    installedWindowsVersion(
+      fakeReg({ HKCU: regOut("1.1.0-beta11"), "HKLM /reg:64": regOut("0.10.0") })
+    ),
+    "1.1.0-beta11"
+  );
+  assert.equal(
+    installedWindowsVersion(
+      fakeReg({ HKCU: regOut("0.10.0"), "HKLM /reg:32": regOut("1.1.0-beta11") })
+    ),
+    "1.1.0-beta11"
+  );
+  assert.equal(newestVersion(["1.0.0", "garbage", "1.1.0-beta9"]), "1.1.0-beta9");
+  assert.equal(newestVersion(["garbage"]), null, "nothing orderable → unknown");
+  assert.equal(newestVersion([]), null);
+});
+
+test("an install whose version cannot be read stops the update — it is not a default", () => {
+  // THE fail-closed property. Substituting the launcher's own version here
+  // silently disarms the whole guard for anyone the probe cannot read.
+  assert.equal(updateBaseline(true, null), null, "installed but unreadable → refuse");
+  assert.equal(updateBaseline(true, "not-a-version"), null, "...and unparseable → refuse");
+  // The two cases that are genuinely safe stay unaffected.
+  assert.equal(updateBaseline(true, "1.1.0-beta11"), "1.1.0-beta11", "detected → order against it");
+  assert.equal(
+    updateBaseline(false, null),
+    PKG_VERSION,
+    "nothing installed → nothing to downgrade, so the launcher picks the channel"
+  );
+});
+
+test("a per-machine beta install under a stale stable launcher is not downgraded", () => {
+  // The end-to-end scenario the two mutants above combine into, and the one
+  // that reached a real user: Loomux 1.1.0-beta11 installed per-machine (HKLM),
+  // a stale 0.10.0 launcher on PATH. Reading HKCU only returned null; treating
+  // null as "use the launcher's version" then resolved the STABLE channel and
+  // installed v1.0.0 over the beta — a downgrade AND a channel switch, silent.
+  const detected = installedWindowsVersion(fakeReg({ "HKLM /reg:64": regOut("1.1.0-beta11") }));
+  const current = updateBaseline(true, detected);
+  assert.equal(current, "1.1.0-beta11", "the per-machine install is what we order against");
+  const v = updateVerdict(RELEASES, current);
+  assert.equal(v.channel, "prerelease", "not the launcher's stable channel");
+  assert.equal(v.release.tag_name, "v1.1.0-beta11");
+  assert.notEqual(v.release.tag_name, "v1.0.0", "the downgrade must not be reachable");
+  assert.equal(v.action, "reinstall");
 });
 
 // ---------- Linux AppImage cache ----------

@@ -33,7 +33,8 @@ kills a running Loomux, so the update decision belongs to you: run
 — a stable install gets the newest stable, a beta/RC install gets the newest
 build of either kind — and it refuses to install an older build over a newer
 one. To switch channels, install that build yourself from the
-[releases page](https://github.com/willem445/loomux/releases).
+[releases page](https://github.com/willem445/loomux/releases). If it cannot read
+the version you have installed, it stops and says so rather than guessing.
 
 On Linux the app is a cached AppImage: plain `loomux` launches the newest
 cached build without downloading, and `loomux update` fetches a new one. Quit

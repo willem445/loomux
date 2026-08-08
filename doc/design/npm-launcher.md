@@ -90,13 +90,49 @@ stable-only rule makes `update` a permanent no-op for the entire beta train.
 
 Channel is read from the *installed* app, not from the launcher, because the
 installed app is what an installer would overwrite. Each platform probes what it
-can: the NSIS `DisplayVersion` under HKCU on Windows, `CFBundleShortVersionString`
-on macOS, and on Linux the cached AppImage's filename — there is no installer and
-no registry there, so `Loomux_1.1.0-beta11_amd64.AppImage` is the only version
-record that exists. When nothing is installed, or a probe returns something
-unorderable, the launcher's own version stands in; it always parses, so neither
-the channel choice nor the refusal below is ever made against a version that
-could not be read.
+can:
+
+- **Windows** — the NSIS `DisplayVersion`, in all three places an install can
+  record it: `HKCU` for a per-user install (Tauri's default), and `HKLM` in both
+  the native (`reg query /reg:64`) and WOW6432Node (`/reg:32`) views for a
+  per-machine one. `findWindowsExe` has always looked under `%PROGRAMFILES%`,
+  which *is* a per-machine install, so probing only HKCU left a whole install
+  class unreadable. When more than one is found the **newest** wins: if any
+  install on the machine is newer than the resolved release, installing that
+  release downgrades it, so a stale per-machine leftover must not unblock a
+  downgrade of a newer per-user install.
+- **macOS** — `CFBundleShortVersionString` from the bundle's `Info.plist`.
+- **Linux** — the cached AppImage's filename. There is no installer and no
+  registry, so `Loomux_1.1.0-beta11_amd64.AppImage` is the only version record
+  that exists.
+
+## Unknown is not safe (`updateBaseline`)
+
+The probe has three outcomes, and the difference between the last two is the
+whole guard:
+
+| Situation | Ordered against |
+| --- | --- |
+| nothing installed | this launcher's version |
+| version detected | that version |
+| **installed, version unreadable** | **nothing — `update` refuses** |
+
+The first is safe by construction: there is nothing to downgrade when there is
+nothing there, and a first install still needs a channel to pick.
+
+The third used to substitute the launcher's version as well, and that quietly
+disarmed the entire guard for anyone the probe could not read. Concretely: a
+1.1.0-beta11 install placed per-machine (HKLM, unreadable under an HKCU-only
+probe) with a stale 0.10.0 launcher on PATH. The unknown became "0.10.0", which
+selected the **stable** channel, which resolved v1.0.0, which installed over the
+beta — a downgrade *and* a channel switch, with the no-downgrade comparison
+passing because it was comparing the launcher against itself.
+
+So an install whose version cannot be determined stops the update with a message
+saying why and what to do instead. This is the one place where refusing is
+plainly worse UX than proceeding, and it is still correct: "I cannot tell an
+update from a downgrade" is exactly the condition the guard exists for, and a
+guard that treats its own blind spot as a pass is not a guard.
 
 Switching channels is a human action — install the build you want from the
 releases page. The launcher will not do it for you in either direction.
@@ -112,6 +148,9 @@ release against the installed version and returns one of four actions:
 - `refuse` — the newest build on this channel is **older** than what is
   installed; the launcher dies with an explanation and installs nothing;
 - `none` — no orderable release on this channel at all.
+
+(A fourth refusal sits in front of all of these: an install whose version cannot
+be read never reaches the verdict at all — see `updateBaseline` above.)
 
 `refuse`, not "warn and continue": #815 was a downgrade that announced itself as
 an upgrade and killed a running app, and fixing the endpoint only removes

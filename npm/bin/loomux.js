@@ -296,25 +296,41 @@ function updateVerdict(releases, current) {
   return { action, channel, current, release };
 }
 
-// What `loomux update` orders against: the version of the app actually
-// installed, since that is the thing an installer would overwrite. Falls back to
-// this launcher's own version when nothing is installed (a first install) or the
-// probe returned something unorderable. The fallback always parses, so neither
-// the channel choice nor the refusal above is ever made against a version we
-// could not read.
-function currentVersion(installed) {
-  if (installed && parseVersion(installed)) return installed;
-  if (installed) {
-    say(
-      `can't order the installed version ("${installed}") — using this ` +
-        `launcher's v${PKG_VERSION} to pick the update instead`
-    );
-  }
-  return PKG_VERSION;
+// What `loomux update` orders against — the version of the app actually
+// installed, since that is the thing an installer would overwrite. Three cases,
+// and the difference between the last two is the whole guard:
+//
+//   nothing installed        -> this launcher's version. Nothing can be
+//                               downgraded when there is nothing there, and a
+//                               first install still needs a channel to pick.
+//   version detected         -> that version.
+//   installed but unreadable -> null, which the caller turns into a REFUSAL.
+//
+// That last case used to substitute the launcher's version too, and that
+// silently disarmed the guard for anyone the probe could not read: a per-machine
+// Windows install (HKLM) under a stale launcher on PATH would be ordered against
+// the LAUNCHER's version, so a 1.1.0-beta11 install with a 0.10.0 launcher
+// resolved "newest stable" and installed a downgrade — across channels, with no
+// message. Unknown is not safe, and it is not a default; it is the exact
+// condition the guard exists for, so it stops.
+function updateBaseline(hasExisting, detected) {
+  if (!hasExisting) return PKG_VERSION;
+  if (detected && parseVersion(detected)) return detected;
+  return null;
 }
 
-async function resolveUpdateRelease(installed) {
-  const current = currentVersion(installed);
+async function resolveUpdateRelease(hasExisting, detected) {
+  const current = updateBaseline(hasExisting, detected);
+  if (current === null) {
+    die(
+      `refusing to update: Loomux is installed but its version can't be read` +
+        (detected ? ` ("${detected}" doesn't parse)` : "") +
+        `, so there is no way to tell an update from a downgrade. Install the ` +
+        `build you want directly from ` +
+        `https://github.com/${REPO}/releases and \`loomux update\` will work ` +
+        `from there.`
+    );
+  }
   const releases = await ghJson(
     `https://api.github.com/repos/${REPO}/releases?per_page=100`
   );
@@ -478,7 +494,7 @@ async function runLinux(getRelease, command) {
     return;
   }
 
-  const release = await getRelease(appImageVersion(cached));
+  const release = await getRelease(Boolean(cached), appImageVersion(cached));
   const asset = pickAsset(release, new RegExp(`_${suffix}\\.AppImage$`));
   if (!asset) die(`no Linux (${arch}) AppImage in release ${release.tag_name}`);
   const dest = path.join(cacheDir(), asset.name);
@@ -512,7 +528,7 @@ async function runMac(getRelease, command) {
   }
 
   refuseIfRunning();
-  const release = await getRelease(existing ? installedMacVersion() : null);
+  const release = await getRelease(existing, existing ? installedMacVersion() : null);
   const re = process.arch === "arm64" ? /_aarch64\.dmg$/ : /_x64\.dmg$/;
   const asset = pickAsset(release, re);
   if (!asset) die(`no macOS (${process.arch}) build in release ${release.tag_name}`);
@@ -556,21 +572,63 @@ function findWindowsExe() {
   return candidates.find((p) => p && fs.existsSync(p)) || null;
 }
 
-// Tauri's NSIS installer records the version it installed (per-user, HKCU).
-function installedWindowsVersion() {
-  const out = spawnSync(
-    "reg",
-    [
-      "query",
-      "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Loomux",
-      "/v",
-      "DisplayVersion",
-    ],
-    { encoding: "utf8" }
-  );
-  if (out.status !== 0 || !out.stdout) return null;
-  const m = out.stdout.match(/DisplayVersion\s+REG_SZ\s+(\S+)/);
+const UNINSTALL_KEY = "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Loomux";
+
+// Every hive and registry view a Tauri/NSIS install of Loomux can record its
+// version in. HKCU is a per-user install (the Tauri default); HKLM is a
+// per-machine one — which is exactly the `%PROGRAMFILES%\Loomux\Loomux.exe`
+// candidate findWindowsExe already looks for — and on 64-bit Windows a 32-bit
+// installer writes its keys into the WOW6432Node view, which `reg query
+// /reg:32` selects (`/reg:64` selects the native one).
+//
+// Probing HKCU alone left every per-machine install unreadable, and an install
+// the guard cannot read is an install it cannot protect: see updateBaseline.
+// The three probes are cheap and the answer must be complete, so all three run.
+const WINDOWS_VERSION_PROBES = [
+  [`HKCU\\${UNINSTALL_KEY}`, null],
+  [`HKLM\\${UNINSTALL_KEY}`, "/reg:64"],
+  [`HKLM\\${UNINSTALL_KEY}`, "/reg:32"],
+];
+
+/** The DisplayVersion in `reg query` output, or null. */
+function parseDisplayVersion(out) {
+  const m = String(out || "").match(/DisplayVersion\s+REG_SZ\s+(\S+)/);
   return m ? m[1] : null;
+}
+
+// The newest of a list of versions, skipping any that don't parse; null if none
+// do. Newest wins on purpose: if ANY install on this machine is newer than the
+// release we resolved, installing that release is a downgrade for that install.
+// So a stale per-machine leftover can never unblock a downgrade of a newer
+// per-user install, or the other way round.
+function newestVersion(versions) {
+  let best = null;
+  for (const v of versions || []) {
+    if (!parseVersion(v)) continue;
+    if (best === null || compareVersions(v, best) > 0) best = v;
+  }
+  return best;
+}
+
+// A failed query is an absent key, not an error worth surfacing: on 32-bit
+// Windows `/reg:64` simply fails, and a machine with only a per-user install has
+// no HKLM key at all. Both are normal.
+function regQuery(key, view) {
+  const args = ["query", key, "/v", "DisplayVersion"];
+  if (view) args.push(view);
+  const out = spawnSync("reg", args, { encoding: "utf8" });
+  return out.status === 0 ? out.stdout || "" : "";
+}
+
+// `query` is injectable so the probe coverage and the newest-wins rule are
+// testable without a Windows registry.
+function installedWindowsVersion(query = regQuery) {
+  const found = [];
+  for (const [key, view] of WINDOWS_VERSION_PROBES) {
+    const v = parseDisplayVersion(query(key, view));
+    if (v) found.push(v);
+  }
+  return newestVersion(found);
 }
 
 async function runWindows(getRelease, command) {
@@ -582,7 +640,7 @@ async function runWindows(getRelease, command) {
   }
 
   refuseIfRunning();
-  const release = await getRelease(existing ? installedWindowsVersion() : null);
+  const release = await getRelease(Boolean(existing), existing ? installedWindowsVersion() : null);
   const asset = pickAsset(release, /-setup\.exe$/);
   if (!asset) die(`no Windows installer in release ${release.tag_name}`);
 
@@ -628,15 +686,19 @@ async function main() {
   // `update` resolves the newest release on the installed build's channel and
   // refuses a downgrade; a plain launch only installs when there is nothing to
   // launch, and resolves the release matching this launcher (so `npx loomux@X`
-  // installs app vX). The platform runner supplies the installed version because
-  // only it knows how to probe for one. Fetched lazily: a launch that finds an
-  // install never touches the network.
+  // installs app vX). The platform runner supplies BOTH whether something is
+  // installed and what version it reads, because only it knows how to probe —
+  // and the two are separate answers on purpose: "nothing there" is safe to
+  // order against this launcher, "there but unreadable" is not (updateBaseline).
+  // Fetched lazily: a launch that finds an install never touches the network.
   let releasePromise = null;
-  const getRelease = (installed) => {
+  const getRelease = (hasExisting, detected) => {
     if (!releasePromise) {
       say("fetching release info");
       releasePromise =
-        command === "update" ? resolveUpdateRelease(installed) : resolveRelease();
+        command === "update"
+          ? resolveUpdateRelease(hasExisting, detected)
+          : resolveRelease();
     }
     return releasePromise;
   };
@@ -667,6 +729,9 @@ module.exports = {
   channelOf,
   newestOnChannel,
   updateVerdict,
+  updateBaseline,
+  newestVersion,
+  installedWindowsVersion,
   pickCachedAppImage,
   appImageVersion,
   loomuxIsRunning,
