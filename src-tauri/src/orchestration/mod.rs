@@ -19823,18 +19823,19 @@ fn option_block_row(raw: &str) -> bool {
 /// in `?`, still vetoes a short steer — the #820 hold, best-effort; and the
 /// ring read is emission order, so an option-block repaint that omits the
 /// question line reads headerless until the next full repaint. Another: for
-/// this scan, [`option_block_row`]'s peel set is deliberately narrower than
-/// [`deframe`]'s — it strips only box glyphs and pointers, not the bullets
-/// `deframe` also treats as decoration — so a dialog that BULLETS its sibling
-/// options instead of indenting them stops the scan before the question, and
-/// the waiver then engages on a live highlighted choice; no captured fixture
-/// does this, so it is speculative rather than demonstrated. Widening the peel
-/// set is not free: the SAME early stop is what protects a composer (g9 h3) —
-/// its divider row is what ends the scan there, correctly, so any peel set
-/// wide enough to see past a bulleted option list would also see past that
-/// divider. The trust model is unchanged from the 24-char floor (an agent
-/// that knows the pasted text can paint a header-less row to induce masking);
-/// this does not widen it.
+/// this scan, [`option_block_row`]'s peel set is narrower than [`deframe`]'s —
+/// it strips only box glyphs and pointers, not the bullets (`*`, `●`, `•`,
+/// `◆`) `deframe` also treats as decoration — so a dialog that BULLETS its
+/// sibling options instead of indenting them stops the scan before the
+/// question, and the waiver then engages on a live highlighted choice; no
+/// captured fixture does this, so it is speculative rather than demonstrated.
+/// This is unexercised scope, not a protective tradeoff: a composer's divider
+/// row (`──…`, U+2500) is peeled by NEITHER set — it carries none of
+/// `option_block_row`'s glyphs, none of `deframe`'s bullets — so widening the
+/// peel set to match `deframe`'s would not touch g9 h3's divider protection at
+/// all; the two are unrelated. The trust model is unchanged from the 24-char
+/// floor (an agent that knows the pasted text can paint a header-less row to
+/// induce masking); this does not widen it.
 fn dialog_header_above(rows: &[&str], norm: &[String], keep: &[bool], from: usize) -> bool {
     let mut j = from;
     while j > 0 {
