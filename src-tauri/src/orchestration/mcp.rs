@@ -306,7 +306,7 @@ fn tool_defs(role: Role, role_hint: Option<&str>) -> Vec<Value> {
         return channel_tool_defs().to_vec();
     }
     let mut tools = vec![
-        tool("list_agents", "List the agents in your orchestration group with role, status, and task.",
+        tool("list_agents", "List the agents in your orchestration group with role, status, and task. `task` is a COMPACT excerpt (truncated to 140 chars + an ellipsis when the brief runs longer), for every agent alive or dead — not the full brief, which stays durable in the audit log and the task board.",
             json!({}), &[]),
         tool("get_state", "Read the group's durable orchestration state (JSON string). Survives sessions.",
             json!({}), &[]),
