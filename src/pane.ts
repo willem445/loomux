@@ -38,6 +38,7 @@ import {
   steerBoxHeight,
 } from "./steer";
 import { createOrderedWriter } from "./ptywrite";
+import { hintXtermSyncParse } from "./xtermreach";
 import { createHumanOriginLatch } from "./humanorigin";
 import { decideFlush, WOKEN, MAX_PENDING_BYTES } from "./panethrottle";
 import { sharedVisibility } from "./pollgate";
@@ -483,28 +484,6 @@ interface EmbedSlotState {
   frac: number;
   panelEl: HTMLElement;
   dividerEl: HTMLElement;
-}
-
-/** xterm's own "a human just typed" parse-latency hint, reached behind two
- *  private fields — the only path that makes `WriteBuffer.write` parse a chunk
- *  SYNCHRONOUSLY instead of scheduling it behind a `setTimeout`
- *  (src/common/input/WriteBuffer.ts, the `_didUserInput` fast path). Not an
- *  invented hook: it is the exact call xterm wires to `coreService.onUserInput`
- *  for every keystroke (src/common/CoreTerminal.ts, `this.coreService
- *  .onUserInput(() => this._writeBuffer.handleUserInput())`). The public
- *  `Terminal` type omits both `_core` and the WriteBuffer, so the reach is a
- *  bounded cast against the pinned xterm — and it is `handleUserInput`, NOT
- *  `writeSync`, because `WriteBuffer.writeSync` is marked `@deprecated
- *  Unreliable, to be removed soon` and can drop a chunk mid-sync-loop. Both
- *  fields are reached with optional chaining: the dependency is a caret range
- *  (the lockfile pins today), and if either field ever changes shape this must
- *  degrade to a silent no-op, not throw — a throw here lands inside
- *  `flushOutput` after `pendingOut` has already been drained into `chunks`,
- *  which would lose those bytes and throw on every later flush. */
-function hintXtermSyncParse(term: Terminal): void {
-  const wb = (term as unknown as { _core?: { _writeBuffer?: { handleUserInput?(): void } } })
-    ._core?._writeBuffer;
-  wb?.handleUserInput?.();
 }
 
 export class Pane implements VoiceTargetPane {

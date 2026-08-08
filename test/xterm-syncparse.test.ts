@@ -24,6 +24,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import pkg from "@xterm/headless";
+import { hintXtermSyncParse } from "../src/xtermreach.ts";
 const { Terminal } = pkg;
 
 /** Primary DA (`CSI c`) — a query the terminal answers ITSELF, with no process
@@ -78,4 +79,48 @@ test("#720 contrast: with no preceding user input the same write is parsed on a 
   assert.equal(replyPhase, null, "nothing should have been emitted synchronously");
   await new Promise<void>((resolve) => setTimeout(resolve, 0));
   assert.equal(replyPhase, "after-write", "the auto-reply arrives on a later task");
+});
+
+// #813/#844: pane.ts's `flushOutput` arms the fast path above via
+// `hintXtermSyncParse` (src/xtermreach.ts) instead of `term.input(..., true)`
+// — the actual private-field reach the fix ships, not a stand-in for it. This
+// is the same fast path the two tests above pin; the difference is which call
+// arms it, so a rename of `_core`/`_writeBuffer`/`handleUserInput` on a future
+// `@xterm/xterm` bump (a caret-range dependency) breaks THIS test first,
+// loudly, in CI — the whole point of extracting the reach into a pinnable
+// pure function.
+test("#844: hintXtermSyncParse arms the same fast path, via the exact private reach pane.ts ships", () => {
+  const term = new Terminal({ cols: 80, rows: 24, allowProposedApi: true });
+  let phase = "before-write";
+  let replyPhase: string | null = null;
+  term.onData(() => {
+    replyPhase ??= phase;
+  });
+
+  hintXtermSyncParse(term as unknown as Parameters<typeof hintXtermSyncParse>[0]);
+  phase = "during-write";
+  term.write(DA_QUERY);
+  phase = "after-write";
+
+  assert.equal(
+    replyPhase,
+    "during-write",
+    "hintXtermSyncParse should arm the same _didUserInput fast path a keystroke does"
+  );
+});
+
+// The other half of the contract: a shape hintXtermSyncParse does NOT
+// recognise must degrade to a silent no-op, never throw (its own doc comment
+// — a throw here would land inside `flushOutput` after bytes are already
+// drained out of `pendingOut`). Without this test, a future xterm bump that
+// renames `_core`/`_writeBuffer` reinstates the #813 lock stall with no test,
+// no throw, and no log line; this test doesn't catch the rename (the one
+// above does) — it pins that the degrade path itself stays silent-safe.
+test("#844: hintXtermSyncParse no-ops instead of throwing when the private chain doesn't resolve", () => {
+  const brokenShapes = [{}, { _core: {} }, { _core: { _writeBuffer: {} } }];
+  for (const shape of brokenShapes) {
+    assert.doesNotThrow(() =>
+      hintXtermSyncParse(shape as unknown as Parameters<typeof hintXtermSyncParse>[0])
+    );
+  }
 });
