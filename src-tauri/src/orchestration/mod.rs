@@ -1565,13 +1565,12 @@ pub fn git_shim_cmd(real_git: &str, sh_path: Option<&str>) -> String {
 }
 
 /// The POSIX `loomux` shim (#815): refuse, always. `loomux` on an agent's PATH is
-/// the npm launcher, and that launcher is an INSTALLER — it reinstalls the desktop
-/// app whenever the installed version differs from its own (in either direction,
-/// so an older stable launcher "upgrades" a newer beta right back down), then runs
-/// the installer silently. Run from an agent pane, the install terminates the
-/// running `Loomux.exe` to replace it, killing the app and every agent in it
-/// mid-task — including the shell that invoked it, which is why the evidence is a
-/// process that vanishes with no shutdown path and no crash report.
+/// the npm launcher, and that launcher is an INSTALLER — plain `loomux` installs
+/// the desktop app when none is present and `loomux update` reinstalls it (#845),
+/// and either way the install runs silently. Run from an agent pane, that install
+/// terminates the running `Loomux.exe` to replace it, killing the app and every
+/// agent in it mid-task — including the shell that invoked it, which is why the
+/// evidence is a process that vanishes with no shutdown path and no crash report.
 ///
 /// Unlike the gh/git shims this is not a gate: there is no agent use of the
 /// launcher to authorize (agents reach loomux through its MCP tools), so there is

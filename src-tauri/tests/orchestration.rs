@@ -19566,6 +19566,28 @@ fn loomux_shim_refuses_outright_with_no_path_that_runs_the_launcher() {
         "the echoed message must carry no cmd.exe metacharacter: {msg}");
 }
 
+/// #845: the refusal's text is a *claim about what the launcher does*, and an
+/// agent that hits the shim reads it as the authoritative description. The
+/// pre-#845 wording said the launcher "reinstalls the desktop app whenever its
+/// version differs from its own" — the autoupdate behaviour #845 removed. The
+/// structural test above and the harness below both stay green on either
+/// wording, so nothing else here notices when the message goes stale.
+#[test]
+fn loomux_shim_messages_describe_the_post_845_command_surface() {
+    for (name, text) in [("sh", loomux_shim_sh()), ("cmd", loomux_shim_cmd())] {
+        // The one command that can still reinstall is named, so the human the
+        // agent escalates to knows what they are being asked to run.
+        assert!(text.contains("loomux update reinstalls it"),
+            "the {name} refusal must name `loomux update` as the reinstall path: {text}");
+        // ...and plain `loomux` is described as installing only a MISSING app.
+        assert!(text.contains("when it is missing"),
+            "the {name} refusal must say plain loomux only installs a missing app: {text}");
+        // The removed autoupdate claim must not survive in either shim.
+        assert!(!text.contains("version differs"),
+            "the {name} refusal still carries the pre-#845 autoupdate claim: {text}");
+    }
+}
+
 #[test]
 fn loomux_shim_harness_blocks_the_launcher_and_audits_it() {
     use std::process::Command;
