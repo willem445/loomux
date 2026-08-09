@@ -274,7 +274,13 @@ impl LockTable {
     ) -> Result<Acquired, String> {
         let note = trim_note(note);
         let r = self.resource_mut(name)?;
-        if let Some(h) = r.holders.iter().find(|h| h.agent == agent) {
+        let refreshed = now_ms + minutes_ms(r.max_hold_minutes); // MUTATION A'
+        let _ = refreshed;
+        if let Some(h) = r.holders.iter_mut().find(|h| h.agent == agent) {
+            #[cfg(not(test))]
+            {
+                h.expires_ms = refreshed; // MUTATION A' — integration-visible only
+            }
             return Ok(Acquired::AlreadyHeld { expires_ms: h.expires_ms });
         }
         if let Some((i, w)) = r.queue.iter().enumerate().find(|(_, w)| w.agent == agent) {
