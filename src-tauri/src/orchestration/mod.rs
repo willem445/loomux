@@ -26274,19 +26274,28 @@ impl OrchRegistry {
     /// Gated on `advanced_orchestrator` for the same reason every other
     /// workflow-file clause is: with the toggle off, `.loomux/workflow.yml` is
     /// not this group's config at all and is never opened.
-    fn lock_resources(&self, group: &str) -> BTreeMap<String, workflow::ResourcePolicy> {
-        let Some(g) = self.group(group) else { return BTreeMap::new() };
+    ///
+    /// `None` means **"cannot tell right now"** and is not the same answer as
+    /// `Some(empty)`. A workflow file mid-save is unparseable for a moment, and
+    /// this is read on every lock call *and* on the group view's 2s poll — so
+    /// collapsing "unreadable" into "declares nothing" would drop every live
+    /// hold and queue in the group, and audit that it had, because an author
+    /// was halfway through typing. The caller reconciles on `Some` and leaves
+    /// the table exactly as it is on `None`. (The parse error is surfaced
+    /// loudly elsewhere, `workflow-invalid`; this is not the place to
+    /// re-report it.)
+    fn lock_resources(&self, group: &str) -> Option<BTreeMap<String, workflow::ResourcePolicy>> {
+        let g = self.group(group)?;
         if !g.guardrails.advanced_orchestrator {
-            return BTreeMap::new();
+            // Authoritative, not unknown: with the toggle off this group has no
+            // declared resources, and flipping it off is a real change that
+            // should drop them.
+            return Some(BTreeMap::new());
         }
         match workflow::load_workflow(&g.repo) {
-            Ok(Some(wf)) => wf.resources,
-            // A file that no longer parses leaves the group with NO declared
-            // resources, which fails toward "no locks" rather than toward a
-            // stale set nobody can see in the file. The parse error itself is
-            // surfaced loudly elsewhere (`workflow-invalid`); this is not the
-            // place to re-report it.
-            _ => BTreeMap::new(),
+            Ok(Some(wf)) => Some(wf.resources),
+            Ok(None) => Some(BTreeMap::new()), // no file: declares nothing
+            Err(_) => None,                    // unreadable: hold what we have
         }
     }
 
@@ -26300,7 +26309,12 @@ impl OrchRegistry {
         let (out, dropped) = {
             let mut all = self.locks.lock_safe();
             let table = all.entry(group.to_string()).or_default();
-            let dropped = table.sync(&declared);
+            // `None` = the config could not be read this instant; reconciling
+            // against a guess would drop live holds (see `lock_resources`).
+            let dropped = match &declared {
+                Some(d) => table.sync(d),
+                None => Vec::new(),
+            };
             (f(table), dropped)
         };
         for r in dropped {
@@ -26320,8 +26334,31 @@ impl OrchRegistry {
 
     /// The group's declared resources, for the `acquire_lock` tool description
     /// an agent reads (and for deciding whether to list the lock tools at all).
+    ///
+    /// A momentarily unreadable file falls back to what the live table already
+    /// holds, so a mid-save `workflow.yml` cannot make an agent's tool listing
+    /// blink out from under it.
     pub fn lock_menu(&self, group: &str) -> Vec<(String, workflow::ResourcePolicy)> {
-        self.lock_resources(group).into_iter().collect()
+        if let Some(declared) = self.lock_resources(group) {
+            return declared.into_iter().collect();
+        }
+        self.locks
+            .lock_safe()
+            .get(group)
+            .map(|t| {
+                t.iter()
+                    .map(|r| {
+                        (
+                            r.name.clone(),
+                            workflow::ResourcePolicy {
+                                slots: r.slots,
+                                max_hold_minutes: r.max_hold_minutes,
+                            },
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// `acquire_lock`. Returns prose: the caller either holds the lock or

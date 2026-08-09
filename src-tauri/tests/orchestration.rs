@@ -44687,3 +44687,54 @@ fn a_non_advanced_group_gets_no_locks_even_from_a_repo_that_declares_them() {
     assert!(err, "{text}");
     assert!(text.contains("declares no lock resources"), "{text}");
 }
+
+/// A `workflow.yml` mid-save is unparseable for a moment, and the lock config
+/// is re-read on every lock call AND on the group view's 2s poll. Treating
+/// "cannot read it" as "declares nothing" would drop every live hold in the
+/// group — and audit that it had — because an author was halfway through
+/// typing a line.
+#[test]
+fn a_momentarily_unreadable_workflow_file_does_not_drop_a_live_hold() {
+    let (reg, _d) = test_registry();
+    let repo = repo_with_resources("locks-unreadable", BUILD_ONE_SLOT);
+    let g = reg.create_group(repo.to_str().unwrap(), advanced_rails()).unwrap();
+    let w1 = reg.spawn_agent(&g.id, Role::Worker, "w1", "task", false, None).unwrap();
+    let c1 = reg.resolve_token(&w1.token).unwrap();
+    lock_call(&reg, &c1, "acquire_lock", json!({ "name": "build" }));
+
+    // Halfway through an edit: valid YAML, invalid workflow.
+    fs::write(repo.join(".loomux").join("workflow.yml"), "version: 99\n").unwrap();
+
+    let state = lock_json(&reg, &c1);
+    assert_eq!(
+        state["resources"][0]["holders"][0]["agent"],
+        json!(c1.agent_id),
+        "an unreadable config must not revoke a lock somebody is holding"
+    );
+    assert!(
+        !lock_audit_actions(&reg, &g.id).contains(&"lock-undeclared".to_string()),
+        "…nor claim in the audit log that the resource was undeclared"
+    );
+    // The tool listing survives it too — otherwise the holder loses the very
+    // tool it needs to release what it is holding.
+    assert!(lock_tool_names(&reg, &c1).contains(&"release_lock".to_string()));
+
+    // A file that parses and genuinely drops the resource IS honoured, and
+    // says so — this is the case the guard above must not swallow.
+    fs::write(
+        repo.join(".loomux").join("workflow.yml"),
+        format!(
+            "version: {}\nblocks:\n  - id: w\n    name: Worker\n    kind: worker\n    cli: claude\n    model: sonnet\n",
+            workflow::SCHEMA_VERSION
+        ),
+    )
+    .unwrap();
+    let state = lock_json(&reg, &c1);
+    assert!(state["resources"].as_array().unwrap().is_empty());
+    let dropped = reg
+        .audit_log(&g.id)
+        .into_iter()
+        .find(|e| e.action == "lock-undeclared")
+        .expect("dropping a declared resource with a live holder is audited");
+    assert_eq!(dropped.detail["holders"], json!([c1.agent_id]));
+}

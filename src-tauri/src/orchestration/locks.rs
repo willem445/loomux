@@ -166,29 +166,6 @@ pub struct LockTable {
 }
 
 impl LockTable {
-    /// Build the table from a repo's declared resources. An empty declaration
-    /// means the feature is off for that group: every entry point below
-    /// answers "this repo declares no lock resources".
-    pub fn new(declared: &BTreeMap<String, super::workflow::ResourcePolicy>) -> Self {
-        LockTable {
-            resources: declared
-                .iter()
-                .map(|(name, p)| {
-                    (
-                        name.clone(),
-                        Resource {
-                            name: name.clone(),
-                            slots: p.slots,
-                            max_hold_minutes: p.max_hold_minutes,
-                            holders: Vec::new(),
-                            queue: VecDeque::new(),
-                        },
-                    )
-                })
-                .collect(),
-        }
-    }
-
     /// Reconcile a live table against what the repo currently declares, so an
     /// edit to `.loomux/workflow.yml` takes effect on the next call instead of
     /// at the next loomux restart (the same live-re-read posture
@@ -502,6 +479,10 @@ mod tests {
 
     const MIN: u64 = 60_000;
 
+    /// A table built the way production builds one: empty, then reconciled
+    /// against the declared set. There is deliberately no other constructor —
+    /// a `new(declared)` that only tests called would be a second way in that
+    /// nothing shipped exercises.
     fn table(specs: &[(&str, u32, u32)]) -> LockTable {
         let declared: BTreeMap<String, ResourcePolicy> = specs
             .iter()
@@ -509,7 +490,9 @@ mod tests {
                 (n.to_string(), ResourcePolicy { slots: *slots, max_hold_minutes: *hold })
             })
             .collect();
-        LockTable::new(&declared)
+        let mut t = LockTable::default();
+        assert!(t.sync(&declared).is_empty(), "an empty table drops nothing");
+        t
     }
 
     fn all_live(_: &str) -> bool {
