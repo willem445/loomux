@@ -32924,6 +32924,13 @@ fn a_reviewer_a_gate_names_is_told_its_verdict_is_the_gate() {
     assert!(note.contains("stale"), "and that its pass does not survive a re-push");
     assert!(note.contains("escalate") && note.contains("beats any number of passes"),
         "and what a blocking verdict does");
+    // #850: what the summary is FOR, and what the report after it is. The pane cap is a
+    // mechanism, not a licence to write 600 words and let loomux cut them — a reviewer told
+    // only about the cap would keep writing the essay and lose the half that matters.
+    assert!(note.contains("about 100 words"),
+        "the recorded summary is the gate's record, not the analysis: {note}");
+    assert!(note.contains("never a restatement"),
+        "…and the report after it must not re-type it: {note}");
 
     // A group with NO gate says none of it — prose about a tool that gates nothing is
     // noise in a file agents are meant to actually read.
@@ -33479,6 +33486,118 @@ fn record_verdict_tells_the_reviewer_what_it_could_not_sample() {
 
     reg.set_gh_exec_override(None);
     drop(drain_parked_readers_for_test());
+}
+
+// ───────── #850: the verdict notice is a wake-up signal, not the record ─────────
+
+/// The one summary a reviewer records reaches the orchestrator's pane CAPPED,
+/// while every reader that can go and fetch it keeps all of it.
+///
+/// A summary may be 4000 characters (`workflow::MAX_SUMMARY_CHARS`) and all of
+/// them used to be typed into the orchestrator's pane — where they become that
+/// agent's resident context and are re-sent on every subsequent API call, which
+/// is what makes pane text the most expensive prose in the system. The record is
+/// not lost: it is in the verdict file and in `list_verdicts`, which is what the
+/// merge gate reads and what the templates already call the truth.
+///
+/// The tail marker is what makes this pin able to fail. Padding with one
+/// repeated character would leave the "the tail is gone" assertion satisfied by
+/// the kept prefix, so the summary ends in a string that appears nowhere else.
+#[test]
+fn a_long_verdict_summary_reaches_the_orchestrator_capped_and_pointing_at_the_record() {
+    use loomux_lib::orchestration::report::VERDICT_NOTICE_SUMMARY_CAP as CAP;
+    const TAIL: &str = "PARAGRAPH-NINE-THE-ORCHESTRATOR-NEVER-NEEDED";
+    let (reg, _d, _repo, gid) = gated_group("");
+    // `gated_group` seams the HEAD read but not the BODY one, so without this the
+    // two `record_verdict` calls below spawn the RUNNER'S OWN `gh` — slow, and a
+    // flake source that has nothing to do with what this test pins.
+    reg.set_pr_body_override(Some("the PR body these verdicts reviewed".into()));
+    let sec = reviewer_caller(&reg, &gid, "rev-security");
+    let orch = reg.spawn_agent(&gid, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let co = reg.resolve_token(&orch.token).unwrap();
+    // Paused, because that is how delivered wording is observable at all in test
+    // mode (no real PTY) — `delivered_texts`' own doc. The pause changes nothing
+    // upstream of delivery, which is what makes it usable as a probe here.
+    pause_with_pane(&reg, &gid, &orch.id, 8501);
+
+    // The shape a real fail verdict arrives in: the decision up front, then the
+    // analysis that belongs in the review body.
+    let summary = format!(
+        "FAIL — the empty-array case bypasses the guard. {} {TAIL}",
+        "Detail the orchestrator does not route on. ".repeat(40)
+    );
+    assert!(summary.chars().count() > CAP * 2, "fixture must actually exceed the cap");
+    recorded(&reg, &sec, "7", "fail", &summary);
+
+    let notice = delivered_texts(&reg, &gid)
+        .into_iter()
+        .find(|t| t.contains("recorded verdict"))
+        .expect("a recorded verdict must still wake the orchestrator");
+
+    // What survives: the verdict, the PR, and the head of the summary verbatim —
+    // the part the orchestrator routes on.
+    assert!(notice.contains("FAIL on PR #7"), "the routing facts are untouched: {notice}");
+    let head: String = summary.chars().take(CAP).collect();
+    assert!(notice.contains(&head), "the first {CAP} chars ride verbatim: {notice}");
+    // What does not: the tail, and it is not silently dropped.
+    assert!(!notice.contains(TAIL), "the tail must not reach the pane at all: {notice}");
+    assert!(notice.contains("truncated"), "…and the cut must be STATED, not silent: {notice}");
+    assert!(
+        notice.contains(&summary.chars().count().to_string()),
+        "…with the original length, so a reader knows how much is elsewhere: {notice}"
+    );
+    assert!(
+        notice.contains("list_verdicts"),
+        "…and the fixed pointer at the call that returns the rest: {notice}"
+    );
+
+    // The RECORD is complete on both surfaces the gate and the orchestrator read.
+    assert_eq!(reg.verdicts(&gid, 7)[0].summary, summary, "the verdict file keeps every character");
+    let out = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "list_verdicts", "arguments": { "pr": "7" } })).unwrap();
+    let parsed: Value = serde_json::from_str(out["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(parsed[0]["verdicts"][0]["summary"], json!(summary),
+        "list_verdicts is the truth the templates point at — it may not be capped too");
+
+    // A summary already inside the cap is untouched: a reviewer that writes the
+    // ~100 words the templates ask for never sees a marker.
+    recorded(&reg, &sec, "7", "pass", "pass — 2 non-blocking findings, disposition pending");
+    let short = delivered_texts(&reg, &gid)
+        .into_iter()
+        .find(|t| t.contains("PASS on PR #7"))
+        .expect("the second verdict is delivered too");
+    assert!(short.contains("pass — 2 non-blocking findings, disposition pending"));
+    assert!(!short.contains("truncated"), "a short summary must round-trip unmarked: {short}");
+}
+
+/// The boundary itself, on the pure function — in **characters**, never bytes.
+///
+/// Byte-slicing at the cap is the failure this pins: `é` is two bytes, so a byte
+/// cut lands mid-codepoint and either panics on the slice boundary or corrupts
+/// the string, and a verdict summary is free agent-authored prose that carries
+/// whatever UTF-8 the reviewer typed. Exactly-at-cap must also be a no-op, or
+/// every summary would arrive wearing a truncation marker that describes nothing.
+#[test]
+fn the_verdict_notice_cap_counts_characters_and_never_splits_a_code_point() {
+    use loomux_lib::orchestration::report::{verdict_notice_summary, VERDICT_NOTICE_SUMMARY_CAP as CAP};
+
+    let exact = "é".repeat(CAP);
+    assert_eq!(verdict_notice_summary(&exact), exact,
+        "exactly at the cap is not over it — nothing to state, nothing to cut");
+
+    // One character over, and that character is multi-byte on both sides of the
+    // cut: a byte cap of CAP would slice the 200th `é` in half.
+    let over = format!("{}Ω", "é".repeat(CAP));
+    let out = verdict_notice_summary(&over);
+    assert_eq!(out.chars().take_while(|&c| c == 'é').count(), CAP,
+        "the kept prefix must be CAP WHOLE chars: {out}");
+    assert!(!out.contains('Ω'), "…and nothing past the cap: {out}");
+    assert!(out.contains("truncated") && out.contains(&(CAP + 1).to_string()),
+        "…with the cut and the true length stated: {out}");
+    assert!(out.contains("list_verdicts") && out.contains("PR"),
+        "…and the fixed pointer at where the rest lives: {out}");
+
+    assert_eq!(verdict_notice_summary(""), "", "an empty summary is not a truncation");
 }
 
 /// The no-arg sweep is bounded in COUNT as well as per call — and says so.

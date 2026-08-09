@@ -507,6 +507,18 @@ so far:
   CI**). INVARIANTS and every other section are otherwise untouched — this only moves what
   a fresh session hits first.
 
+- **#850, a review report is one line** — `reviewer.md` only. Step 5 already said the
+  findings stay on the PR and are never re-typed into the report; what it did not say is
+  what that makes the report — so a reviewer could satisfy every sentence in it and still
+  send a 400-word restatement of its own review. The step now names the shape (verdict,
+  reference, pointer, findings count) and the cost that makes it a rule rather than a
+  preference: everything typed into the orchestrator's pane becomes context that agent
+  re-pays for on every turn afterwards, so a retold review is the most expensive
+  redundancy in the group. The same rule reaches a *gated* reviewer through its block
+  note and a `mode: replace` one through `mechanics_core(Reviewer)` — both of which also
+  carry the recorded-summary target (~100 words) that only exists where `review_verdict`
+  does, which is why it is not in this file.
+
 `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was` renders
 **these** with the six pre-#222 template variables and asserts that a group launched
 with the advanced orchestrator **off** gets exactly that text. They are the

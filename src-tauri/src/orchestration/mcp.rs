@@ -1323,6 +1323,14 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             // spending a second `gh pr view --json body` on the same fact one
             // instant later (#791). Empty means the body was unreadable, which
             // is what `None` means here too.
+            //
+            // …and the summary rides in CAPPED (#850). The notice is a wake-up
+            // signal; the record is the verdict file, `list_verdicts` and the
+            // review on the PR, all of which keep every character. What made
+            // this worth a cap rather than a guideline is that the pane text
+            // becomes the orchestrator's resident context — paid for again on
+            // every later API call — and the reviewer's own `report(...)` was
+            // arriving right behind it with the same prose a second time.
             let gate = reg.gate_status_line_with(
                 &caller.group,
                 rec.pr,
@@ -1336,7 +1344,7 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                     rec.block,
                     rec.verdict.as_str().to_uppercase(),
                     rec.pr,
-                    rec.summary,
+                    report::verdict_notice_summary(&rec.summary),
                     gate.as_deref().map(|g| format!("\n[loomux] {g}")).unwrap_or_default(),
                 ),
                 &caller.agent_id,

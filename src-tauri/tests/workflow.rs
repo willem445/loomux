@@ -2996,6 +2996,38 @@ fn every_reviewer_hears_the_findings_duty_however_its_persona_was_written() {
         }
     }
 
+    // The report DIET rides the same lockstep, and for the same reason (#850). Both surfaces
+    // already told a reviewer that the findings live on the PR; neither said what that makes
+    // the report, so a reviewer could satisfy every sentence and still restate its whole review
+    // into the orchestrator's pane — which is where the measured duplication came from (a
+    // verdict arriving in full twice, once as loomux's courtesy notice and once as the report).
+    //
+    // Two anchors, because the rule and its cost are separately deletable: drop the shape and
+    // "keep it short" becomes a matter of taste; drop the cost and the next author trims it as
+    // a nicety. Same document-wide matching as the block above, safe for the same reason —
+    // `pinned()`'s exactly-once check is what makes that checkable rather than assumed.
+    for (surface, doc) in [("mechanics_core(Reviewer)", &core), ("reviewer.md", &builtin)] {
+        let low = flat(doc);
+        for (anchor, why) in [
+            ("never a restatement",
+             "the report after a review must not re-type what the orchestrator has already been \
+              handed — the shape is the rule, and without it \"the findings live on the PR\" is \
+              satisfied by a report that repeats them anyway"),
+            ("re-pays for on every turn after this one",
+             "…and WHY it is a rule rather than a preference: pane text is the recipient's \
+              resident context, billed again on every later API call — delete the cost and the \
+              rule reads as a style note"),
+        ] {
+            pinned(surface, &low, anchor, why);
+        }
+    }
+    // The ~100-word target on the RECORDED summary rides only where `review_verdict` does — the
+    // core (all a `mode: replace` block gets) and a gated block's own note, never `reviewer.md`,
+    // which an ungated group reads and which may not name the tool at all (above).
+    pinned("mechanics_core(Reviewer)", &flat(&core), "about 100 words",
+        "the recorded summary is the gate's record, not the analysis — an unbounded one is what \
+         the pane cap then has to truncate");
+
     // The review LANES ride the same lockstep, and for the same reason (#236 F4). A repo may
     // narrow a reviewer to one lane — that is what a focused roster is for — but a lane no
     // block was ever told to cover is a lane no verdict reflects, and the gate cannot tell

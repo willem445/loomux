@@ -511,6 +511,35 @@ group has only the second, which is why it cannot be left to the flag. `reviewer
 `mechanics_core(Reviewer)` carry it in lockstep, for the reason every reviewer duty does: a
 `mode: replace` persona never reads `reviewer.md`.
 
+### The verdict notice is a signal; the record is elsewhere (#850)
+
+Text typed into a pane is not a message an agent reads once. It joins that agent's
+conversation and is re-sent with every subsequent request, so a paragraph delivered to the
+orchestrator is paid for again on every turn it takes afterwards — which makes pane text the
+most expensive prose in the system, and the orchestrator's pane the most expensive pane. A
+reviewer's verdict used to arrive there **twice in full**: once as the `[loomux] … recorded
+verdict …` courtesy notice, carrying the whole summary (up to `MAX_SUMMARY_CHARS`, 4000), and
+once more as the reviewer's own `report(...)` restating it. Measured over one review round of
+eight verdict events: ≈15k duplicated tokens, resident.
+
+Both halves are fixed where they can actually be enforced. The notice's copy of the summary is
+capped **in the tool** (`report::verdict_notice_summary`, 400 characters plus a fixed pointer
+at `list_verdicts` and the PR) — a cap the code applies, not a length a template asks for,
+which is the same argument `truncate_note` already makes for a structured report's `note`. The
+truncation is *stated*, with the original length, so a reader can tell that there is more and
+where to get it. Nothing else is touched: the verdict file and `list_verdicts` keep every
+character, and the gate reads the file — so the cap can never change what merges. (The
+`review-verdict` audit line is the one place that was already lossy, and stays exactly as it
+was: it has always recorded the summary's first 500 characters, which is a record of the event,
+not the record of the review.)
+
+The second copy cannot be capped, because it is a different call with legitimate uses, so it is
+addressed as prose in the two places a reviewer is taught to record a verdict at all (the gated
+block note and `mechanics_core(Reviewer)`): the recorded summary targets ~100 words with the
+analysis in the PR review body, and the `report(...)` after it is one line — verdict, ref,
+pointer, findings count. `reviewer.md` carries the report half only, since an ungated group has
+no verdict tool to describe (the same asymmetry every verdict rule in this section has).
+
 ### Engineering standards, not just process (#236)
 
 The prompt suite's *process* half was strong (gates, bounded loops, externalized state,
