@@ -8523,8 +8523,11 @@ make an unchanged reading compare unequal and the skip would never fire.
 
 **And the skip is bounded, because its signal is fallible** (INV-6, `performance.md` §2 P4). What the
 skip consults is loomux's *memory of having emitted*, not an acknowledgement that the webview
-received anything — so a reloaded webview, or an emit that never landed, leaves the registry
-believing a badge is on screen when none is. On a changing queue that self-corrects within a second;
+received anything — so a reloaded webview, an emit that never landed, **or a pane that was not there
+for it** (restored or spawned after the last push, which is the case the first draft of this argument
+missed and a reviewer named) leaves the registry believing a badge is on screen when none is. All
+three are one staleness with one bound, and in each the badge is late rather than absent. On a
+changing queue that self-corrects within a second;
 on a queue stalled for an hour it would never correct at all, because the coarsened reading is
 deliberately stable — the pane the badge exists for would be the one pane without one. So a non-empty
 set is re-pushed unconditionally every `QUEUE_DEPTH_REPUSH_MS` (30 s, every tenth tick), which caps

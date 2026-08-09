@@ -111,9 +111,14 @@ export function dockChipQueue(reading: QueueDepthReading | null): { marker: stri
  *  The backend pushes the FULL current set on every change, so a pane that is
  *  absent from it has an empty queue — which is why the handler clears by
  *  absence rather than waiting for a paired "cleared" event. Pure, so the
- *  apply/clear decision is testable without a grid: `depthFor` returns `null`
- *  for a pane with nothing queued, which is exactly what `setQueueDepth`
- *  takes. */
+ *  lookup half of that decision is testable without a grid.
+ *
+ *  **A miss is `undefined`, and the call site's `?? null` is a contract, not
+ *  tidying.** `setQueueDepth` takes `QueueDepthReading | null`, so `Map.get`'s
+ *  `undefined` has to be converted — and because the project compiles under
+ *  `strict`, dropping that `??` is a type error rather than a pane whose badge
+ *  clears down the falsy branch by accident. This module's own test asserts the
+ *  `undefined`, so the two agree about which value a miss actually is. */
 export function readingsByPty(items: QueueDepthReading[]): Map<number, QueueDepthReading> {
   const byPty = new Map<number, QueueDepthReading>();
   // Last wins, and it cannot happen: the backend keys its snapshot by pty. A

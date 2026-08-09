@@ -2493,10 +2493,15 @@ const STRANDED_JANITOR_EVERY_N_TICKS: u64 = 10;
 ///
 /// 30s, i.e. every tenth attention tick, chosen the way
 /// [`STRANDED_JANITOR_EVERY_N_TICKS`] was: the skip's signal is a memory of an
-/// emit, not an acknowledgement of one, so a webview that reloaded (or an emit
-/// that never landed) wears no badge and nothing in the reading will change to
-/// correct it — least of all on a queue stalled for an hour, whose coarsened
-/// reading is deliberately stable. Bounding the suppression costs at most two
+/// emit, not an acknowledgement of one, so a listener that never received the
+/// last push wears no badge and nothing in the reading will change to correct it
+/// — least of all on a queue stalled for an hour, whose coarsened reading is
+/// deliberately stable. **Three ways to be that listener, not one:** a webview
+/// that reloaded, an emit that never landed, and — the case a first draft of this
+/// paragraph missed (rev finding 3) — a PANE that was not there for it, i.e. one
+/// restored or spawned after the last push, whose badge is therefore up to this
+/// window late. All three are the same staleness with the same bound; none is a
+/// missing badge, only a late one. Bounding the suppression costs at most two
 /// emits a minute while anything is queued, and nothing at all when nothing is.
 const QUEUE_DEPTH_REPUSH_MS: u64 = 30_000;
 /// A pane's terminal output must be stable (unchanged) at least this long
@@ -40373,8 +40378,10 @@ impl OrchRegistry {
     /// fallible signal owes an independent release** (`performance.md` §2 P4).
     /// The signal here is "the webview already has this set", and it is a
     /// memory of an emit rather than an acknowledgement of one: a webview that
-    /// reloaded, or an emit that never landed, leaves this map remembering a
-    /// badge nobody is wearing. On a *changing* queue that self-corrects within
+    /// reloaded, an emit that never landed, or a pane restored/spawned after the
+    /// last push, all leave this map remembering a badge nobody is wearing —
+    /// that last case being why the release is owed even when the webview has
+    /// been up the whole time. On a *changing* queue that self-corrects within
     /// a second; on the case that matters most — a queue stalled for an hour,
     /// whose coarsened reading is deliberately stable — it would never correct
     /// at all, and the pane the badge exists for would silently have none. So a

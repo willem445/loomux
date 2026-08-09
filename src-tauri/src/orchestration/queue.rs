@@ -1221,7 +1221,7 @@ pub const QUEUE_STALLED_AFTER: Duration = Duration::from_secs(60);
 /// wait is under a minute, 1 min once it is over.
 ///
 /// **This is a rate bound, not cosmetics.** The badge is refreshed by re-pushing
-/// the reading on the attention tick (`OrchRegistry::push_queue_depth`), and that
+/// the reading on the attention tick (`OrchRegistry::queue_depth_push`), and that
 /// push is skipped when the new set is identical to the last one sent. A raw
 /// millisecond age is never identical, so every tick would emit — and a Tauri
 /// emit is a JS compile on the webview thread (`doc/design/performance.md` §1),
