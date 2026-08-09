@@ -8389,6 +8389,79 @@ boundary every delivery test in this design has. The decision it consults (`held
 every registry seam it calls (`note_queue_capacity`, `pop_front_dequeued`, `mark_stranded`) are
 driven directly; the emit calls between them are not.
 
+### #814: the queue's depth on screen, because every existing channel answers a different question
+
+**The gap.** After #563 a human learns about queue pressure at three points: a badge and a notice
+when the depth crosses `QUEUE_NEAR_FULL_AT`, another at the cap, and a still-queued notice after
+thirty minutes. Every one of them is an *edge* — something crossed a line — and every one of them
+is about a queue in trouble. Nothing said how deep the queue was right now, or how long the oldest
+prompt had been waiting, at a depth of 2. So the ordinary question a human standing in front of a
+fleet actually asks — "are deliveries flowing, or is this pane wedged?" — had no surface at all,
+and the answer had to be inferred from the *absence* of warnings. The stuck-prompt incident is what
+made that concrete: the queue was not near its cap, so nothing warned, and the only readable state
+was in `audit.jsonl`.
+
+**Why a badge rather than another notice.** The three channels #563 enumerates (chip, badge,
+in-band notice) all fire on a transition and all say "something is wrong". A depth reading is
+neither: it is a continuous, ordinary fact, and its value is that it is *there* when nothing is
+wrong, so that a human can tell the difference. That also settles what it must not do — a third
+pulsing amber chip beside `.pane-attn` and `.pane-held` would make the two that are alarms harder to
+read, so the queue chip is deliberately quiet until the queue is stalled, and only then borrows the
+amber pulse.
+
+**Discoverability is part of the requirement, not polish.** #813's own scope addition to this issue:
+the stuck-prompt chip carried its detail on hover, and the human never knew to hover. So the depth,
+the cap and the age all live in the chip's *label* (`⇥ 3/8 queued · 12s`), and the tooltip carries
+only what a sentence can add — which of the two clearable causes to check, and (at the cap) that
+arrivals are now being dropped. The same reasoning forces the dock mirror: delegate panes open
+minimized by default (`spawn_opens_minimized`), so the panes whose queues back up the most are
+exactly the ones whose header is out of the DOM, and a badge only on the header would miss them.
+
+**The clock is `undelivered_since`, not the queue front.** #560's defect, one consumer over: a
+`StrandedSubmit` marker is pushed to the FRONT carrying a fresh stamp, so on the pane whose prompt
+has been sitting unsubmitted the longest, the front is the *youngest* entry in the queue. A badge
+keyed on it would reset its own age at the exact moment the pane got stuck. The reading takes the
+minimum stamp over the queue (`queue::oldest_enqueued_ms`) *and* the pane's open hold episode, which
+is the same clock the thirty-minute notice is measured from — so the badge and that notice can never
+describe one wait with two different numbers.
+
+**`QUEUE_STALLED_AFTER` is sized by its two neighbours.** One minute: far enough above
+`QUEUE_DRAIN_POLL` (2 s) that ordinary traffic — a burst of worker reports clearing over a few
+polls — never trips it, because a badge that cries stall on healthy panes is the "trains a human to
+ignore the real one" harm `ChipGuard` exists to prevent; and far enough below
+`QUEUE_STILL_QUEUED_NOTICE_AFTER` (30 min) that a human at the window is not the last to know. Both
+bounds are asserted against the constants themselves rather than against today's numbers.
+
+**Dispatch: no new command, and no new cadence.** The reading is pushed as `orch-queue-depth` from
+`run_attention`, the 3 s tick that already emits `orch-attention` — so there is no new tauri command
+to place in E1's manifest and no second timer to gate. That choice is forced rather than
+convenient: the age has to keep *growing* on screen, the frontend deliberately owns no clock (a
+frontend ticker would be a TIMERS row in `test/perfpolicy.test.ts` and a visibility gate to
+maintain), and deriving the reading from the same `now` the attention scan already took means the
+two pushes can never disagree about when they were computed.
+
+**Its bound is a skip, and the coarsening is what makes the skip real** (INV-3;
+`doc/design/performance.md` §1 for why an emit is not free). `queue_depth_push` compares the new set
+against the last one pushed and returns `None` when they are equal, so an app with nothing queued —
+the ordinary state — emits nothing at all. A raw millisecond age would defeat that entirely, being
+never twice the same, so the wait is coarsened to what the badge can actually render differently
+(`coarsen_waiting_ms`: 1 s under a minute, 1 min above) and a pane stuck for an hour costs about one
+emit a minute instead of one every 3 s. Flooring, never rounding — a badge may understate a wait,
+never overstate it. The set is sorted by pty for the same reason: `HashMap` iteration order would
+make an unchanged reading compare unequal and the skip would never fire.
+
+**Absence is how a badge clears.** The push carries the FULL set of panes that have something
+queued, so a pane missing from it has an empty queue. There is no paired "cleared" event to lose,
+and a dropped push self-corrects on the next one — the same shape `orch-attention` uses, and the
+opposite of `orch-delivery-held`'s pairing, which can only work because a hold is a single
+identifiable episode.
+
+**Residual.** The frontend applies the set across every pane in every tab, and that sweep is not
+itself gated — it does not need to be while the backend refuses to emit an unchanged set, but the
+two facts are coupled, and a future emitter that pushes unconditionally would silently make this
+handler O(panes) per tick. `setQueueDepth` being idempotent on the whole reading is the second line
+of defence, not the first.
+
 ## The orchestrator's notice inbox: a channel that is not a delivery (#578)
 
 **Problem.** `notify_queue` returns early with `notice-suppressed` whenever the target IS the

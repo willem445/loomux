@@ -394,6 +394,19 @@ These deserve their own detail — see:
   blocked delivery would queue behind the very block it reports — so those
   notices ride back to the orchestrator on the result of its next tool call
   instead, and you'll see them in the audit viewer either way.
+- **Queue depth, on the pane header.** A pane with prompts waiting wears a chip
+  saying how many and for how long — `⇥ 3/8 queued · 12s`: three waiting out of
+  a maximum of eight, the oldest queued twelve seconds ago. It appears as soon
+  as anything is waiting and disappears when the queue drains, so "deliveries
+  are flowing" is something you can see rather than infer from the absence of
+  warnings. Once nothing has been delivered to that pane for a minute the chip
+  turns amber and says **stalled** — that is the one to act on: check the pane
+  for a question waiting on an answer, or your own half-typed line still in its
+  input box; releasing either drains the backlog. Everything you need is in the
+  chip itself, and hovering only adds a sentence. A **minimized** pane shows the
+  same count on its dock chip (`⇥3`, amber when stalled), which matters because
+  worker panes open minimized by default — the queues that back up are usually
+  the ones whose header you can't see.
 - **What a full pane refused.** A pane that hit its cap and turned deliveries
   away is told what it turned away, the moment its queue drains back below the
   cap: one line naming each refused delivery's sender, a short preview, and why

@@ -263,6 +263,23 @@ const STREAMS: StreamRow[] = [
     debt: null,
   },
   {
+    event: "orch-queue-depth",
+    rate: "cadenced",
+    bound: "argued-none",
+    cite: "src-tauri/src/orchestration/mod.rs",
+    reason:
+      "The delivery-queue depth badge (#814), pushed from the same 3 s attention tick as " +
+      "orch-attention because the age it shows must keep growing and the frontend has no clock " +
+      "(adding one would be a TIMERS row, not a free lunch). Bounded backend-side by a skip, not " +
+      "by a coalescer: queue_depth_push emits nothing when the set is identical to the last one " +
+      "pushed, and the wait it carries is coarsened to what the badge can render differently " +
+      "(coarsen_waiting_ms — 1 s under a minute, 1 min above), so an app with nothing queued emits " +
+      "zero events and a pane stuck for an hour costs ~1/min rather than 1/tick. Not one of INV-3's " +
+      "three named mechanisms — a skip is not a coalescer — so it is argued here, the same way " +
+      "orch-attention's diff is.",
+    debt: null,
+  },
+  {
     event: "orch-group-ended",
     rate: "lifecycle",
     bound: "argued-none",

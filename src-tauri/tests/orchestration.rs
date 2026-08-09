@@ -148,7 +148,7 @@ use loomux_lib::orchestration::{
 };
 use loomux_lib::pty::{phantom_gate_tick, PtyManager};
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -27794,6 +27794,241 @@ fn capacity_state_leaves_headroom_to_warn_in() {
         queue::QUEUE_MAX_PER_PANE - queue::QUEUE_NEAR_FULL_AT >= 2,
         "at least two slots of headroom, or the warning arrives with the loss rather than before it"
     );
+}
+
+/// #814: a queued entry, built by hand because these tests are about the
+/// READING taken off a queue and what is in it is incidental — the shape
+/// `queuestate.rs`'s own tests use, for the same reason.
+fn queued_at(id: u64, enqueued_ms: u64) -> queue::QueuedDelivery {
+    queue::QueuedDelivery {
+        id,
+        agent_id: "w-1".to_string(),
+        from: "orch-1".to_string(),
+        payload: queue::QueuedPayload::Text("hi".to_string()),
+        reason: queue::EnqueueReason::Arrival,
+        enqueued_ms,
+        coalesced: 0,
+        group: "g1".to_string(),
+        to_orchestrator: false,
+        session_id: None,
+        delivery_kind: Delivery::MidSession,
+    }
+}
+
+#[test]
+fn the_queue_badge_measures_the_oldest_entry_not_the_queue_front() {
+    // #814 inherits #560's defect exactly, and would have re-introduced it by
+    // reading `front().enqueued_ms` — the obvious spelling. A `StrandedSubmit`
+    // marker is pushed to the FRONT with a fresh stamp, so on the pane whose
+    // prompt has been sitting unsubmitted the longest, the front is the
+    // YOUNGEST thing in the queue: a badge keyed on it would reset its own age
+    // display at the exact moment the pane got stuck, and read "0s" on a queue
+    // that had been waiting an hour.
+    let mut q: VecDeque<queue::QueuedDelivery> = VecDeque::new();
+    q.push_back(queued_at(1, 1_000_000)); // waiting since long ago
+    q.push_front(queued_at(2, 4_000_000)); // the marker, stamped just now
+    assert_eq!(
+        queue::oldest_enqueued_ms(&q),
+        Some(1_000_000),
+        "the reading must take the MINIMUM stamp, never the front entry's"
+    );
+
+    let item = queue::queue_depth_item(7, "w-1", q.len(), 1_000_000, None, 4_000_000)
+        .expect("a non-empty queue always has a reading");
+    assert_eq!(item.depth, 2);
+    assert_eq!(item.cap, queue::QUEUE_MAX_PER_PANE, "the cap is carried, never re-spelled frontend-side");
+    assert_eq!(item.waiting_ms, 3_000_000, "the age is measured from the oldest entry (50 min)");
+    assert!(item.stalled, "and 50 minutes of no delivery is exactly what 'stalled' means");
+    assert_eq!(queue::oldest_enqueued_ms(&VecDeque::new()), None, "an empty queue has no oldest");
+    assert!(
+        queue::queue_depth_item(7, "w-1", 0, 0, None, 4_000_000).is_none(),
+        "and no badge at all — a pane with nothing queued must be absent from the pushed set"
+    );
+}
+
+#[test]
+fn the_queue_badge_never_reports_a_wait_from_a_clock_that_stepped_backward() {
+    // `now_ms` and `enqueued_ms` are the same wall clock, which an NTP
+    // correction can step BACKWARD mid-session. An unguarded subtraction wraps
+    // to ~584 million years and the badge announces a permanently stalled queue
+    // on a pane that is perfectly healthy — the "trains a human to ignore the
+    // real one" harm, delivered by arithmetic.
+    let item = queue::queue_depth_item(7, "w-1", 1, 5_000_000, None, 4_000_000).unwrap();
+    assert_eq!(item.waiting_ms, 0, "a stamp in the future reads as no wait yet");
+    assert!(!item.stalled, "and must never be reported as stalled");
+}
+
+#[test]
+fn the_stall_threshold_sits_between_a_drain_poll_and_the_thirty_minute_notice() {
+    // The two neighbours that size it, asserted against the constants
+    // themselves so a future retune of either moves this pin instead of
+    // breaking it. Too low and ordinary traffic — a burst of worker reports
+    // clearing over a few 2 s polls — reads as stalled; too high and the badge
+    // is no earlier than the agent-facing notice it exists to pre-empt, which
+    // is the whole of #814's complaint.
+    assert!(
+        queue::QUEUE_STALLED_AFTER > queue::QUEUE_DRAIN_POLL * 4,
+        "a handful of drain polls must not be enough to call a queue stalled"
+    );
+    assert!(
+        queue::QUEUE_STALLED_AFTER < queue::QUEUE_STILL_QUEUED_NOTICE_AFTER,
+        "a human at the window must learn this before the 30-minute agent notice does"
+    );
+    let stall = queue::QUEUE_STALLED_AFTER.as_millis() as u64;
+    let just_under = queue::queue_depth_item(7, "w-1", 1, 0, None, stall - 1).unwrap();
+    assert!(!just_under.stalled, "one millisecond short of the threshold is still merely busy");
+    let at = queue::queue_depth_item(7, "w-1", 1, 0, None, stall).unwrap();
+    assert!(at.stalled, "and the threshold itself trips it");
+}
+
+#[test]
+fn the_badge_age_is_coarsened_to_what_it_can_render_and_never_rounds_up() {
+    // The rate bound (INV-3's row for `orch-queue-depth`): the reading is
+    // re-pushed on the attention tick and skipped when unchanged, so a raw
+    // millisecond age — never twice the same — would defeat the skip entirely
+    // and emit on every tick for as long as anything is queued. Coarsening to
+    // the badge's own resolution is what makes the skip real.
+    assert_eq!(queue::coarsen_waiting_ms(0), 0);
+    assert_eq!(queue::coarsen_waiting_ms(999), 0, "sub-second is 0s, not a spurious 1s");
+    assert_eq!(queue::coarsen_waiting_ms(12_499), 12_000, "1 s resolution under a minute");
+    assert_eq!(queue::coarsen_waiting_ms(59_999), 59_000, "and never rounds up across the minute line");
+    assert_eq!(queue::coarsen_waiting_ms(60_000), 60_000);
+    assert_eq!(queue::coarsen_waiting_ms(119_999), 60_000, "1 min resolution above a minute");
+    assert_eq!(queue::coarsen_waiting_ms(3_659_999), 3_600_000);
+    for raw in [0u64, 1, 999, 1_000, 59_999, 60_000, 61_500, 600_000, 86_400_000] {
+        assert!(
+            queue::coarsen_waiting_ms(raw) <= raw,
+            "a coarsened age may only ever UNDERSTATE the wait: {raw}"
+        );
+    }
+    // The bound itself, stated as the property that matters: a pane stuck for an
+    // hour must not produce a distinct reading on every 3 s tick.
+    let a = queue::coarsen_waiting_ms(3_600_000);
+    let b = queue::coarsen_waiting_ms(3_603_000);
+    assert_eq!(a, b, "two ticks 3 s apart, an hour in, must coarsen to the SAME value or the skip never fires");
+}
+
+#[test]
+fn queue_depth_snapshot_reports_every_pane_that_has_a_queue_and_no_others() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let a = reg.spawn_agent(&g.id, Role::Worker, "a", "t", false, None).unwrap();
+    let b = reg.spawn_agent(&g.id, Role::Worker, "b", "t", false, None).unwrap();
+    let (pty_a, pty_b, pty_idle) = (310u32, 305u32, 311u32);
+
+    assert!(
+        reg.queue_depth_snapshot(now_ms()).is_empty(),
+        "a registry with nothing queued badges nothing — the ordinary state, and the one that has \
+         to cost no event at all"
+    );
+
+    reg.enqueue_text(&g.id, &a.id, "loomux", "one", pty_a, queue::EnqueueReason::Arrival).unwrap();
+    reg.enqueue_text(&g.id, &a.id, "loomux", "two", pty_a, queue::EnqueueReason::BehindQueue).unwrap();
+    reg.enqueue_text(&g.id, &b.id, "loomux", "solo", pty_b, queue::EnqueueReason::Arrival).unwrap();
+
+    let items = reg.queue_depth_snapshot(now_ms());
+    assert_eq!(
+        items.iter().map(|i| i.pty_id).collect::<Vec<_>>(),
+        vec![pty_b, pty_a],
+        "sorted by pty, so an unchanged reading compares equal to the last one pushed instead of \
+         depending on HashMap iteration order"
+    );
+    assert!(
+        !items.iter().any(|i| i.pty_id == pty_idle),
+        "a pane with no queue must be ABSENT, not present with depth 0 — absence is how the \
+         frontend clears a badge"
+    );
+    let deep = items.iter().find(|i| i.pty_id == pty_a).unwrap();
+    assert_eq!(deep.depth, 2);
+    assert_eq!(deep.agent_id, a.id, "the reading names whose pane it is, for the tooltip");
+    assert_eq!(deep.cap, queue::QUEUE_MAX_PER_PANE);
+    assert!(!deep.stalled, "a queue that has existed for milliseconds is not stalled");
+
+    reg.drop_queue(&g.id, pty_a, queue::DropReason::AgentDied);
+    let after = reg.queue_depth_snapshot(now_ms());
+    assert_eq!(
+        after.iter().map(|i| i.pty_id).collect::<Vec<_>>(),
+        vec![pty_b],
+        "a pane whose queue is gone leaves the set entirely"
+    );
+}
+
+#[test]
+fn a_pane_held_for_twenty_minutes_reads_stalled_even_when_every_queued_entry_is_young() {
+    // The stranded case, end to end through real code: the entries left behind a
+    // pasted-but-unsubmitted delivery can all be seconds old while the PANE has
+    // been stuck for twenty minutes. Keying the badge on entry stamps alone
+    // would show "1s" there — the exact pane #814's incident was about — which
+    // is why the reading takes `undelivered_since`, the same clock the
+    // 30-minute still-queued notice is measured from.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 312u32;
+    let now = now_ms();
+    let held_since = now - 20 * 60 * 1_000;
+
+    reg.note_hold(&g.id, &w.id, pty, HoldObservation::HeldPoll, held_since);
+    reg.enqueue_text(&g.id, &w.id, "loomux", "fresh", pty, queue::EnqueueReason::Question).unwrap();
+
+    let item = reg
+        .queue_depth_snapshot(now)
+        .into_iter()
+        .find(|i| i.pty_id == pty)
+        .expect("a queued delivery must produce a reading");
+    assert!(
+        item.waiting_ms >= 19 * 60 * 1_000,
+        "the age must come from the pane's open hold episode, not from the young entry: {}",
+        item.waiting_ms
+    );
+    assert!(item.stalled, "twenty minutes of nothing delivered is the state the badge exists to show");
+}
+
+#[test]
+fn queue_depth_push_emits_only_when_the_reading_the_human_would_see_changed() {
+    // INV-3's declared bound for `orch-queue-depth`, pinned rather than asserted
+    // in prose: an emit is a JS compile on the webview thread, and this stream
+    // rides a 3 s tick, so "skip an unchanged set" is the whole of what keeps it
+    // cheap. Nothing else in the app can see this decision — `run_attention`
+    // needs an AppHandle no test has — which is exactly why it is a separate,
+    // headless function.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 313u32;
+    let now = now_ms();
+
+    assert!(reg.queue_depth_push(now).is_none(), "an idle app must emit nothing at all");
+    assert!(reg.queue_depth_push(now + 3_000).is_none(), "and must keep emitting nothing, tick after tick");
+
+    reg.enqueue_text(&g.id, &w.id, "loomux", "one", pty, queue::EnqueueReason::Arrival).unwrap();
+    let first = reg.queue_depth_push(now).expect("a new queue is a change the webview has to be told");
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].depth, 1);
+    assert!(
+        reg.queue_depth_push(now).is_none(),
+        "the same tick's identical reading must not be pushed twice"
+    );
+    assert!(
+        reg.queue_depth_push(now + 500).is_none(),
+        "nor a reading half a second later, which coarsens to the same second"
+    );
+
+    let ticked = reg.queue_depth_push(now + 1_100).expect("a second of age IS a visible change");
+    assert_eq!(ticked[0].waiting_ms, 1_000, "…and it is the coarsened age that is pushed");
+
+    reg.enqueue_text(&g.id, &w.id, "loomux", "two", pty, queue::EnqueueReason::BehindQueue).unwrap();
+    let deeper = reg.queue_depth_push(now + 1_100).expect("a depth change must reach the webview immediately");
+    assert_eq!(deeper[0].depth, 2);
+
+    reg.drop_queue(&g.id, pty, queue::DropReason::AgentDied);
+    let drained = reg.queue_depth_push(now + 1_100).expect("a drained queue is a change too");
+    assert!(
+        drained.is_empty(),
+        "and it is pushed as an EMPTY set — the frontend clears a pane's badge by its absence, so \
+         skipping this push would leave a dead badge on screen forever"
+    );
+    assert!(reg.queue_depth_push(now + 1_100).is_none(), "then quiet again");
 }
 
 #[test]
