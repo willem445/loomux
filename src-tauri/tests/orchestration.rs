@@ -980,40 +980,102 @@ fn late_bind_on_torn_down_spawn_is_rejected() {
 }
 
 #[test]
-fn list_agents_drops_task_bodies_for_dead_agents() {
-    // Registry hygiene (#106): dead roster entries kept their full (multi-KB)
-    // task briefs, pushing one group's list_agents payload to ~86KB. A dead
-    // agent must keep its identity (for resume) but shed its task body; a live
-    // agent keeps it so the orchestrator still sees what it's working on.
+fn list_agents_truncates_task_to_compact_excerpt() {
+    // #851: list_agents returned every roster row's full task brief
+    // verbatim — a live row kept the whole multi-hundred-word spawn brief,
+    // and #106 (the prior fix, superseded here) only trimmed a DEAD row
+    // down to omitting `task` altogether. A session with a dozen dead
+    // agents, each still carrying a live neighbor's full brief, pushed one
+    // group's list_agents payload to ~4k tokens. Every row's `task` is now
+    // capped to 140 chars + an ellipsis, alive or dead alike, so a dead row
+    // keeps a hint of what it was doing instead of nothing — the full brief
+    // stays durable in the audit log/task board; this adds no new retrieval
+    // surface for it.
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
-    let big = "x".repeat(4096);
-    let dead = reg.spawn_agent(&g.id, Role::Worker, "dead", &big, false, None).unwrap();
-    let live = reg.spawn_agent(&g.id, Role::Worker, "live", &big, false, None).unwrap();
+    let long = "x".repeat(4096);
+    let short = "short brief, well under the cap";
+    // `rails()` caps this group at 2 live delegates, so `dead` is killed
+    // before the next spawn — otherwise three concurrent live workers would
+    // trip the guardrail this test isn't about.
+    let dead = reg.spawn_agent(&g.id, Role::Worker, "dead", &long, false, None).unwrap();
     reg.mark_dead(&dead.id, Some(0));
+    let live = reg.spawn_agent(&g.id, Role::Worker, "live", &long, false, None).unwrap();
+    let live_short =
+        reg.spawn_agent(&g.id, Role::Worker, "live-short", short, false, None).unwrap();
 
     let roster = reg.list_agents(&g.id);
     let arr = roster.as_array().unwrap();
     let dead_row = arr.iter().find(|a| a["id"] == json!(dead.id)).unwrap();
     let live_row = arr.iter().find(|a| a["id"] == json!(live.id)).unwrap();
+    let short_row = arr.iter().find(|a| a["id"] == json!(live_short.id)).unwrap();
 
-    // Dead agent: task body gone, but identity preserved for resume.
-    assert!(dead_row.get("task").is_none(), "dead agent must not carry a task body");
+    // Long brief: both the alive and the dead row get the SAME excerpt —
+    // capped at 140 chars plus a trailing ellipsis, never the 4096-char
+    // original, and never simply dropped for the dead row.
+    let expected_excerpt: String = long.chars().take(140).chain(std::iter::once('…')).collect();
+    assert_eq!(
+        dead_row["task"],
+        json!(expected_excerpt),
+        "dead row must still carry a bounded task excerpt, not omit it"
+    );
+    assert_eq!(
+        live_row["task"],
+        json!(expected_excerpt),
+        "live row's task must be capped the same way as a dead row's"
+    );
+
+    // Identity is unaffected — a dead row still resumes.
     assert_eq!(dead_row["status"], json!("dead"));
     assert_eq!(dead_row["name"], json!("dead"));
     assert_eq!(dead_row["role"], json!("worker"));
     assert!(dead_row.get("session").is_some(), "session kept for resume");
     assert!(dead_row.get("cwd").is_some());
 
-    // Live agent still reports its task.
-    assert_eq!(live_row["task"], json!(big));
+    // Short brief: well under the cap, comes back byte-for-byte, no ellipsis.
+    assert_eq!(short_row["task"], json!(short));
 
-    // The heavy brief no longer appears twice (dead + live) in the payload.
+    // The 4096-char brief itself never appears anywhere in the payload —
+    // only the capped excerpt does, for either row.
     assert_eq!(
-        roster.to_string().matches(&big).count(),
-        1,
-        "only the live agent's task body should remain in the roster"
+        roster.to_string().matches(&long).count(),
+        0,
+        "the full task brief must not appear in the roster — only the capped excerpt"
     );
+}
+
+#[test]
+fn task_excerpt_is_utf8_safe_at_the_char_boundary() {
+    // #851 review NB1: `task_excerpt` MUST cut on a char boundary, not a
+    // byte offset — task briefs are full of multi-byte glyphs (em dashes,
+    // arrows, emoji), and a byte-offset cut like `&s[..140]` panics the
+    // instant it lands inside one instead of between two. This pins that
+    // by building a brief whose 140th CHAR is a 4-byte emoji: a byte-offset
+    // cut at byte 140 would land one byte into that emoji (139 ASCII bytes
+    // in), while a char-counted cut does not — so a regression to
+    // byte-slicing fails this test with a slice-boundary panic, not a
+    // quiet wrong answer.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let mut task = "a".repeat(139);
+    task.push('😀'); // the 140th char, 4 bytes wide — straddles byte offset 140
+    task.push_str(" and more text past the cap that must be dropped");
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", &task, false, None).unwrap();
+
+    let roster = reg.list_agents(&g.id);
+    let row = roster.as_array().unwrap().iter().find(|a| a["id"] == json!(w.id)).unwrap();
+    let excerpt = row["task"].as_str().unwrap();
+
+    // 140 kept chars (139 'a' + the intact emoji) plus the ellipsis marker —
+    // counted in chars, not bytes, so the emoji is never split.
+    assert_eq!(
+        excerpt.chars().count(),
+        141,
+        "140-char cap + ellipsis, counted in chars not bytes; got {excerpt:?}"
+    );
+    assert!(excerpt.starts_with(&"a".repeat(139)));
+    assert!(excerpt.contains('😀'), "the multi-byte char at the boundary must survive intact, got {excerpt:?}");
+    assert!(excerpt.ends_with('…'));
 }
 
 #[test]
