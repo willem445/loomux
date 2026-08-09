@@ -26600,7 +26600,7 @@ impl OrchRegistry {
                 if let Some(extra) = extend_by.get(&group) {
                     table.extend_deadlines(*extra);
                 }
-                if false && paused.contains(&group) { // MUTATION D
+                if paused.contains(&group) {
                     continue;
                 }
                 table.sweep(now, &|a: &str| live.contains(a))
@@ -42401,7 +42401,7 @@ impl OrchRegistry {
         // here rather than left to the 30s sweep so the next worker in line
         // gets it immediately; the sweep stays as the backstop for a holder
         // that dies without this path running at all.
-        let _ = &Self::cleanup_agent_locks; // MUTATION B2 (call removed)
+        self.cleanup_agent_locks(agent_id, &snapshot.group);
         let _ = fs::remove_file(
             self.group_dir(&snapshot.group).join("configs").join(format!("{agent_id}.json")),
         );
