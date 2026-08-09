@@ -27996,39 +27996,49 @@ fn queue_depth_push_emits_only_when_the_reading_the_human_would_see_changed() {
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
     let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
     let pty = 313u32;
-    let now = now_ms();
 
-    assert!(reg.queue_depth_push(now).is_none(), "an idle app must emit nothing at all");
-    assert!(reg.queue_depth_push(now + 3_000).is_none(), "and must keep emitting nothing, tick after tick");
+    assert!(reg.queue_depth_push(now_ms()).is_none(), "an idle app must emit nothing at all");
+    assert!(
+        reg.queue_depth_push(now_ms() + 3_000).is_none(),
+        "and must keep emitting nothing, tick after tick"
+    );
 
     reg.enqueue_text(&g.id, &w.id, "loomux", "one", pty, queue::EnqueueReason::Arrival).unwrap();
-    let first = reg.queue_depth_push(now).expect("a new queue is a change the webview has to be told");
+    // Every `now` below is measured from the entry's OWN stamp rather than from
+    // a wall-clock reading taken before the enqueue: the admission does disk I/O
+    // (`queue.json`), so on a loaded runner the two can be tens of milliseconds
+    // apart — enough to straddle a coarsening boundary and make an assertion
+    // about "the same second" depend on how busy CI was.
+    let queued_at = reg.queue_snapshot(pty)[0].enqueued_ms;
+    let first =
+        reg.queue_depth_push(queued_at).expect("a new queue is a change the webview has to be told");
     assert_eq!(first.len(), 1);
     assert_eq!(first[0].depth, 1);
     assert!(
-        reg.queue_depth_push(now).is_none(),
+        reg.queue_depth_push(queued_at).is_none(),
         "the same tick's identical reading must not be pushed twice"
     );
     assert!(
-        reg.queue_depth_push(now + 500).is_none(),
+        reg.queue_depth_push(queued_at + 500).is_none(),
         "nor a reading half a second later, which coarsens to the same second"
     );
 
-    let ticked = reg.queue_depth_push(now + 1_100).expect("a second of age IS a visible change");
+    let ticked = reg.queue_depth_push(queued_at + 1_100).expect("a second of age IS a visible change");
     assert_eq!(ticked[0].waiting_ms, 1_000, "…and it is the coarsened age that is pushed");
 
     reg.enqueue_text(&g.id, &w.id, "loomux", "two", pty, queue::EnqueueReason::BehindQueue).unwrap();
-    let deeper = reg.queue_depth_push(now + 1_100).expect("a depth change must reach the webview immediately");
+    let deeper =
+        reg.queue_depth_push(queued_at + 1_100).expect("a depth change must reach the webview immediately");
     assert_eq!(deeper[0].depth, 2);
 
     reg.drop_queue(&g.id, pty, queue::DropReason::AgentDied);
-    let drained = reg.queue_depth_push(now + 1_100).expect("a drained queue is a change too");
+    let drained = reg.queue_depth_push(queued_at + 1_100).expect("a drained queue is a change too");
     assert!(
         drained.is_empty(),
         "and it is pushed as an EMPTY set — the frontend clears a pane's badge by its absence, so \
          skipping this push would leave a dead badge on screen forever"
     );
-    assert!(reg.queue_depth_push(now + 1_100).is_none(), "then quiet again");
+    assert!(reg.queue_depth_push(queued_at + 1_100).is_none(), "then quiet again");
 }
 
 #[test]
