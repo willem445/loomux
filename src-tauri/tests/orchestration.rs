@@ -44618,10 +44618,21 @@ fn the_lock_tools_refuse_a_non_holder_an_undeclared_name_and_a_planner() {
 fn re_asking_never_extends_a_hold_or_costs_a_waiter_its_place() {
     let (reg, _d, _g, c1, c2) = setup_locks("locks-idempotent", BUILD_ONE_SLOT);
     lock_call(&reg, &c1, "acquire_lock", json!({ "name": "build" }));
+    let deadline = lock_json(&reg, &c1)["resources"][0]["holders"][0]["expires_ms"].clone();
+    assert!(deadline.is_number(), "precondition: a hold carries a deadline");
+
     let (err, text) = lock_call(&reg, &c1, "acquire_lock", json!({ "name": "build" }));
     assert!(!err, "{text}");
     assert!(text.contains("already hold"), "{text}");
     assert!(text.contains("NOT extended"), "{text}");
+    // The reply's WORDS are prose and would survive a refresh untouched; this
+    // is the assertion that actually pins it. A deadline that moved on every
+    // "still mine" would make max_hold_minutes bound nothing at all.
+    assert_eq!(
+        lock_json(&reg, &c1)["resources"][0]["holders"][0]["expires_ms"],
+        deadline,
+        "a re-ask must not move the reclaim deadline"
+    );
 
     lock_call(&reg, &c2, "acquire_lock", json!({ "name": "build" }));
     let (err, text) = lock_call(&reg, &c2, "acquire_lock", json!({ "name": "build" }));

@@ -44096,9 +44096,20 @@ pub fn orch_group_watches(reg: tauri::State<Arc<OrchRegistry>>, group_id: String
 /// how deep each queue is. The SAME shape the `list_locks` MCP tool returns,
 /// deliberately: what the human sees beside the panes and what the agents read
 /// are one payload, so they can never disagree.
+///
+/// `group_id` is a path segment this command trusts (CLAUDE.md constraint 6) —
+/// the webview is the only caller and this adds no agent-reachable input.
+///
+/// **Off-thread** (performance.md §2 P1), unlike its neighbours
+/// `orch_group_summary`/`orch_group_watches`: those are pure in-memory registry
+/// reads, but this one reconciles against the repo's declared `resources:`,
+/// which reads and parses `.loomux/workflow.yml` — on the group view's 2s
+/// batch. That is the same read `orch_workflow_status` already makes on that
+/// batch, and the same reason `orch_merge_queue` is async.
 #[tauri::command]
-pub fn orch_lock_state(reg: tauri::State<Arc<OrchRegistry>>, group_id: String) -> Value {
-    reg.lock_state(&group_id)
+pub async fn orch_lock_state(app: AppHandle, group_id: String) -> Value {
+    let reg = reg_of(&app);
+    run_blocking(move || reg.lock_state(&group_id)).await
 }
 
 /// LIVE advanced-orchestrator toggle (#316), reached from the groupview button
