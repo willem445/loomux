@@ -5758,22 +5758,18 @@ pub fn watchdog_should_notify(
 
 /// Compose the watchdog stall notice delivered to the orchestrator. Split out
 /// of `watchdog_tick` (the `watch_fired_notice`-style idiom from notify.rs) so
-/// the #248 annotation is unit-testable with a plain bool, no registry/app
-/// needed. `has_live_watch` mirrors `watchdog_tick`'s other injected inputs
-/// (`outputs`): the caller looks it up from the same `watches` map
-/// `notify_tick` already owns (no second store) rather than this function
-/// reaching for it itself. The annotation sits between the stall observation
-/// and the recovery instructions — a correctly-WAITING agent parked on a CI
-/// watch reads differently from a genuinely stuck one, right where the human
-/// decides whether to intervene (issue #248).
-pub fn watchdog_stall_notice(name: &str, id: &str, minutes: u32, has_live_watch: bool) -> String {
-    let watch_note = if has_live_watch {
-        " It has a live CI watch registered — may be deliberately waiting, not stuck."
-    } else {
-        ""
-    };
+/// it's unit-testable with no registry/app needed.
+///
+/// #248 originally gave this a `has_live_watch` annotation ("may be
+/// deliberately waiting, not stuck") for a stalled agent holding a live CI
+/// watch; #852 replaced that half-measure with full suppression of the
+/// notice in that case (`watchdog_tick`), so by construction a notice this
+/// function composes can never describe an agent holding a live watch —
+/// the parameter (and the branch) was dropped as dead code (review finding
+/// on #852).
+pub fn watchdog_stall_notice(name: &str, id: &str, minutes: u32) -> String {
     format!(
-        "[loomux] watchdog: agent {name} ({id}) has produced no terminal output and sent no report for {minutes}+ min — it may be stalled or waiting on input.{watch_note} Inspect it with get_output(\"{id}\"); if its kickoff was lost or it is stuck, re-send the task with send_prompt. You will get this notice at most once per stall."
+        "[loomux] watchdog: agent {name} ({id}) has produced no terminal output and sent no report for {minutes}+ min — it may be stalled or waiting on input. Inspect it with get_output(\"{id}\"); if its kickoff was lost or it is stuck, re-send the task with send_prompt. You will get this notice at most once per stall."
     )
 }
 
@@ -8162,6 +8158,23 @@ pub struct AgentEntry {
     /// Watchdog anti-nag latch: set once a stall notice has been delivered for
     /// the current stall, cleared when the agent produces output/reports again.
     pub watchdog_notified: bool,
+    /// #852: set alongside `watchdog_notified` when a stall trips while the
+    /// agent holds a live `notify_when` watch — but that trip does NOT
+    /// deliver a notice, it suppresses one, because the agent is plausibly
+    /// waiting on its own registered CI check rather than stuck. Watched for
+    /// on the NEXT tick: once the agent no longer holds any live watch (it
+    /// fired, expired, failed-out, or was cancelled), `watchdog_tick` clears
+    /// this latch, clears `watchdog_notified`, and resets `last_progress_ms`
+    /// to that tick's `now` — a fresh full stall window, so the notice only
+    /// ever fires for a stall the agent is STILL silent through after its
+    /// watch resolved, never immediately off whatever was left of the old
+    /// (already-expired) window. Also cleared by the other two
+    /// `watchdog_notified`-clearing sites (`note_agent_activity`,
+    /// `set_agent_idle(false)`) — any sign of life must retire a suppression
+    /// latch the same tick it retires the notice latch, or a later tick could
+    /// take the watch-resolved branch on a latch describing a stall that no
+    /// longer exists (review finding on #852).
+    pub watchdog_watch_suppressed: bool,
     /// Autonomous idle-tick latch (#83), meaningful only for the orchestrator:
     /// set when an idle-tick notice is delivered, cleared when the pane produces
     /// output again (the orchestrator acted on the tick). Mirrors
@@ -25268,6 +25281,13 @@ impl OrchRegistry {
                 // clear its anti-nag latch so the fresh stall gets a nudge.
                 a.last_progress_ms = now_ms();
                 a.watchdog_notified = false;
+                // #852 review finding 3: also clear the suppression latch —
+                // left set, a later tick's watch-resolved branch would fire on
+                // a latch that no longer describes anything (the watch this
+                // NEW assignment might hold, if any, hasn't even been checked
+                // yet), stamping a clock this fresh-assignment stamp already
+                // owns and delaying a genuine stall by up to one extra window.
+                a.watchdog_watch_suppressed = false;
                 // New work supersedes a prior done/blocked report — drop its
                 // attention latch so a stale badge doesn't linger.
                 self.attn_reports.lock_safe().remove(agent_id);
@@ -25354,6 +25374,14 @@ impl OrchRegistry {
             }
             a.last_progress_ms = now_ms();
             a.watchdog_notified = false;
+            // #852 review finding 3: this is a sign of life too, so it must
+            // clear the suppression latch alongside the notice latch — a
+            // `message_orchestrator` call between a suppressed stall and its
+            // watch resolving would otherwise leave `watchdog_watch_suppressed`
+            // set on a latch the agent's own activity already made stale,
+            // stamping the clock a tick late and delaying a genuine stall by
+            // up to one extra window.
+            a.watchdog_watch_suppressed = false;
         }
     }
 
@@ -25457,20 +25485,35 @@ impl OrchRegistry {
     /// counter from `outputs`: any growth is activity that resets the silence
     /// clock and the anti-nag latch. An agent silent (no output, no report)
     /// past its group's `watchdog_stall_minutes` earns exactly one audited
-    /// `[loomux]` nudge to the orchestrator suggesting get_output + re-send.
-    /// Paused groups are skipped entirely — delivery is suppressed there
-    /// anyway, so we must not spend the one-notice budget while paused.
-    /// Returns the notified agent ids. Split from the pty read
-    /// (`agent_output_totals`) so the stall / anti-nag / pause logic is
-    /// testable with synthetic counters and no threads. `has_watch` is the set
-    /// of agent ids currently holding a live `notify_when` watch (#248) — an
-    /// injected input like `outputs`, not a lock this function takes itself, so
-    /// it stays testable with a plain `HashSet` and no registry-watches state.
+    /// `[loomux]` nudge to the orchestrator suggesting get_output + re-send —
+    /// UNLESS it holds a live `notify_when` watch (#852): that stall is
+    /// SUPPRESSED instead (audited as `watchdog-suppressed`, never delivered),
+    /// because the agent is plausibly waiting on its own registered CI check,
+    /// not stuck. Paused groups are skipped entirely — delivery is suppressed
+    /// there anyway, so we must not spend the one-notice budget while paused.
+    /// Returns the notified (never suppressed) agent ids. Split from the pty
+    /// read (`agent_output_totals`) so the stall / anti-nag / pause / watch
+    /// logic is testable with synthetic counters and no threads. `has_watch`
+    /// maps an agent id to the live `notify_when` watch ids it currently holds
+    /// (#248/#852) — an injected input like `outputs`, not a lock this
+    /// function takes itself, so it stays testable with a plain `HashMap` and
+    /// no registry-watches state.
+    ///
+    /// The suppression latch (`watchdog_watch_suppressed`) does double duty:
+    /// while the watch stays live it prevents re-auditing every tick (the same
+    /// anti-nag shape as `watchdog_notified`, which it is set alongside), and
+    /// on the FIRST tick where the agent no longer holds any live watch (it
+    /// fired, expired, failed-out, or was cancelled) it is read to detect that
+    /// transition — at which point the clock is reset to `now` and both
+    /// latches cleared, handing the agent a fresh full stall window rather
+    /// than immediately re-flagging on whatever was left of the old,
+    /// already-expired window. Only a genuinely fresh silence past that new
+    /// window earns a notice — the combination #852 calls a real stall.
     pub fn watchdog_tick(
         &self,
         now: u64,
         outputs: &HashMap<String, u64>,
-        has_watch: &HashSet<String>,
+        has_watch: &HashMap<String, Vec<String>>,
     ) -> Vec<String> {
         let thresholds: HashMap<String, u32> = self
             .groups
@@ -25481,9 +25524,10 @@ impl OrchRegistry {
         let paused = self.paused.lock_safe().clone();
 
         // First pass under the agents lock: refresh counters and pick who to
-        // nudge. Delivery (which types into a pane and can block) happens after
-        // the lock is released.
+        // nudge or suppress. Delivery (which types into a pane and can block)
+        // happens after the lock is released.
         let mut to_notify: Vec<(String, String, String, u32)> = Vec::new();
+        let mut to_suppress: Vec<(String, String, String, u32, Vec<String>)> = Vec::new();
         {
             let mut agents = self.agents.lock_safe();
             for a in agents.values_mut() {
@@ -25496,13 +25540,14 @@ impl OrchRegistry {
                 {
                     continue;
                 }
-                // Output growth = activity: reset the clock and the latch, and
-                // this tick can't also flag the agent as stalled.
+                // Output growth = activity: reset the clock and both latches,
+                // and this tick can't also flag or suppress the agent.
                 if let Some(&cur) = outputs.get(&a.id) {
                     if cur > a.last_output_total {
                         a.last_output_total = cur;
                         a.last_progress_ms = now;
                         a.watchdog_notified = false;
+                        a.watchdog_watch_suppressed = false;
                         continue;
                     }
                 }
@@ -25511,25 +25556,55 @@ impl OrchRegistry {
                 if paused.contains(&a.group) {
                     continue;
                 }
+                let watch_ids = has_watch.get(&a.id);
+                let watching = watch_ids.is_some_and(|ids| !ids.is_empty());
+
+                // #852: the watch that was suppressing this stall has resolved
+                // since we last looked — give the agent a fresh full window
+                // starting now instead of evaluating (and possibly firing)
+                // against the old, already-expired one.
+                if a.watchdog_watch_suppressed && !watching {
+                    a.watchdog_watch_suppressed = false;
+                    a.watchdog_notified = false;
+                    a.last_progress_ms = now;
+                    continue;
+                }
+
                 let threshold = thresholds.get(&a.group).copied().unwrap_or(0);
                 if watchdog_should_notify(a.last_progress_ms, now, threshold, a.watchdog_notified) {
-                    a.watchdog_notified = true;
                     let minutes = (now.saturating_sub(a.last_progress_ms) / 60_000) as u32;
-                    to_notify.push((a.id.clone(), a.group.clone(), a.name.clone(), minutes));
+                    if watching {
+                        a.watchdog_notified = true;
+                        a.watchdog_watch_suppressed = true;
+                        to_suppress.push((
+                            a.id.clone(),
+                            a.group.clone(),
+                            a.name.clone(),
+                            minutes,
+                            watch_ids.cloned().unwrap_or_default(),
+                        ));
+                    } else {
+                        a.watchdog_notified = true;
+                        to_notify.push((a.id.clone(), a.group.clone(), a.name.clone(), minutes));
+                    }
                 }
             }
         }
 
+        for (id, group, name, minutes, watch_ids) in to_suppress {
+            self.audit(&group, "loomux", "watchdog-suppressed", json!({
+                "agent": id, "name": name, "silent_minutes": minutes, "watch_ids": watch_ids,
+            }));
+        }
+
         let mut notified = Vec::new();
         for (id, group, name, minutes) in to_notify {
-            let watching = has_watch.contains(&id);
-            self.audit(&group, "loomux", "watchdog-stall",
-                json!({ "agent": id, "name": name, "silent_minutes": minutes, "has_live_watch": watching }));
-            let _ = self.deliver_to_orchestrator(
-                &group,
-                &watchdog_stall_notice(&name, &id, minutes, watching),
-                "loomux",
-            );
+            // #852 review finding 2: `has_live_watch` dropped — by
+            // construction an agent reaching this branch (not `to_suppress`
+            // above) never holds a live watch, so the field was a constant
+            // `false` on every line.
+            self.audit(&group, "loomux", "watchdog-stall", json!({ "agent": id, "name": name, "silent_minutes": minutes }));
+            let _ = self.deliver_to_orchestrator(&group, &watchdog_stall_notice(&name, &id, minutes), "loomux");
             notified.push(id);
         }
         notified
@@ -25540,9 +25615,13 @@ impl OrchRegistry {
     pub fn run_watchdog(&self, now: u64) -> Vec<String> {
         let outputs = self.agent_output_totals();
         // Same registry state `notify_tick`/`list_notifications` read (#248) —
-        // no second store. Just the agent ids, not the watches themselves:
-        // `watchdog_tick` only needs to know whether to annotate, not what.
-        let has_watch: HashSet<String> = self.watches.lock_safe().values().map(|w| w.agent.clone()).collect();
+        // no second store. Agent id -> its live watch ids: `watchdog_tick`
+        // needs the ids too now (#852), to audit which watch suppressed a
+        // stall — an agent can hold more than one (`MAX_WATCHES_PER_AGENT`).
+        let mut has_watch: HashMap<String, Vec<String>> = HashMap::new();
+        for w in self.watches.lock_safe().values() {
+            has_watch.entry(w.agent.clone()).or_default().push(w.id.clone());
+        }
         self.watchdog_tick(now, &outputs, &has_watch)
     }
 
@@ -27075,6 +27154,7 @@ impl OrchRegistry {
             last_output_progress_ms: now_ms(), // solo panes are never idle-ticked (not Role::Orchestrator); inert
             last_output_total: 0,
             watchdog_notified: false,
+            watchdog_watch_suppressed: false,
             idle_tick_notified: false,
             compact_nudge_notified: false,
             compact_nudge_last_output_total: 0,
@@ -27219,6 +27299,7 @@ impl OrchRegistry {
             last_output_progress_ms: now_ms(), // solo panes are never idle-ticked (not Role::Orchestrator); inert
             last_output_total: 0,
             watchdog_notified: false,
+            watchdog_watch_suppressed: false,
             idle_tick_notified: false,
             compact_nudge_notified: false,
             compact_nudge_last_output_total: 0,
@@ -36193,6 +36274,7 @@ impl OrchRegistry {
             last_output_progress_ms: now_ms(),
             last_output_total: 0,
             watchdog_notified: false,
+            watchdog_watch_suppressed: false,
             idle_tick_notified: false,
             compact_nudge_notified: false,
             compact_nudge_last_output_total: 0,
@@ -43147,6 +43229,7 @@ fn register_orchestrator_pane(
         last_output_progress_ms: now_ms(), // #496: the output-only half of that clock
         last_output_total: 0,
         watchdog_notified: false,
+        watchdog_watch_suppressed: false,
         idle_tick_notified: false,
         compact_nudge_notified: false,
         compact_nudge_last_output_total: 0,
@@ -44652,33 +44735,19 @@ mod watchdog_stall_notice_tests {
     use super::*;
 
     #[test]
-    fn annotates_when_the_agent_has_a_live_watch() {
-        let n = watchdog_stall_notice("w-2", "w-2", 12, true);
-        assert!(n.contains("live CI watch"), "must annotate a watching agent, got: {n}");
-        assert!(n.contains("may be deliberately waiting"), "got: {n}");
-    }
-
-    #[test]
-    fn omits_the_annotation_without_a_live_watch() {
-        // The regression this guards: a plain stalled agent (no watch) must
-        // read exactly as before — no dangling "live CI watch" clause tacked
-        // onto every notice regardless of truth.
-        let n = watchdog_stall_notice("w-2", "w-2", 12, false);
-        assert!(!n.contains("live CI watch"), "must not claim a watch that doesn't exist, got: {n}");
-        assert!(!n.contains("deliberately waiting"), "got: {n}");
-    }
-
-    #[test]
-    fn still_carries_the_core_stall_fields_either_way() {
-        // The annotation must be additive, never displacing the existing
-        // name/id/minutes/get_output instructions the orchestrator relies on.
-        for has_watch in [true, false] {
-            let n = watchdog_stall_notice("w-9", "w-9", 45, has_watch);
-            assert!(n.starts_with("[loomux] watchdog:"), "got: {n}");
-            assert!(n.contains("w-9"), "got: {n}");
-            assert!(n.contains("45+ min"), "got: {n}");
-            assert!(n.contains("get_output(\"w-9\")"), "got: {n}");
-        }
+    fn carries_the_core_stall_fields() {
+        // #852 review finding 2: this module used to pin the #248
+        // has_live_watch annotation ("may be deliberately waiting, not
+        // stuck"); #852 removed that branch entirely (a notified agent can
+        // no longer hold a live watch — watchdog_tick suppresses that case
+        // instead), so there's nothing left to annotate. What's left to pin
+        // is the name/id/minutes/get_output instructions the orchestrator
+        // relies on.
+        let n = watchdog_stall_notice("w-9", "w-9", 45);
+        assert!(n.starts_with("[loomux] watchdog:"), "got: {n}");
+        assert!(n.contains("w-9"), "got: {n}");
+        assert!(n.contains("45+ min"), "got: {n}");
+        assert!(n.contains("get_output(\"w-9\")"), "got: {n}");
     }
 }
 

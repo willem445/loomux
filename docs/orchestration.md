@@ -428,11 +428,22 @@ scratch, not merely re-listed.
 **Where you see it.** A watch is visible from *your* side too, not just the agent's. The
 group lifecycle panel (`Alt+O`) shows a **⏳ waiting on PR #241 checks (expires in 43 min)**
 line under any agent holding one — the reason a worker sitting quietly is waiting on CI, not
-stuck. Without it, a correctly-waiting agent and a genuinely hung one look identical until you
-open the audit log; the internal watchdog nudge the orchestrator gets for a silent agent says
-so too, when the silent agent holds a live watch. The audit viewer (`Alt+A`) has a one-line
-sentence for each of a watch's six lifecycle events (registered, fired, expired, failed,
-cancelled, cleaned up on agent exit) instead of raw JSON.
+stuck. The audit viewer (`Alt+A`) has a one-line sentence for each of a watch's six lifecycle
+events (registered, fired, expired, failed, cancelled, cleaned up on agent exit) instead of raw
+JSON.
+
+The internal watchdog stall check knows about a live watch too: an agent silent past its
+group's stall window while it holds one is **not** nudged to the orchestrator — it's plausibly
+waiting on its own CI check, not stuck — and the suppression itself is audited
+(`watchdog-suppressed`) so it stays diagnosable. Once that watch resolves (fires, expires, or
+is cancelled), the agent earns a fresh full stall window from that moment; only silence through
+*that* window is treated as a real stall and nudges the orchestrator (`watchdog-stall`).
+A stalled agent holding no watch behaves exactly as before.
+
+The suppression is bounded by the watch's own TTL (5–240 min, default 60 — see "capped ...
+and time-bounded" above), never open-ended: a genuinely hung agent holding a watch is
+silent-but-unreported for at most that TTL plus one more stall window before the orchestrator
+gets a notice, and `watchdog-suppressed` audit lines mark the wait the whole time.
 
 **When a notice can't get in.** A `[loomux]` notice is typed into the agent's pane, and a pane
 that is mid-turn can't take one — so if an agent blocks its own turn waiting on the very thing
