@@ -1231,12 +1231,8 @@ pub const QUEUE_STALLED_AFTER: Duration = Duration::from_secs(60);
 ///
 /// Flooring, never rounding: a badge must not claim a wait is longer than it is.
 pub fn coarsen_waiting_ms(waiting_ms: u64) -> u64 {
-    const MINUTE: u64 = 60_000;
-    if waiting_ms < MINUTE {
-        waiting_ms - waiting_ms % 1_000
-    } else {
-        waiting_ms - waiting_ms % MINUTE
-    }
+    // SCRATCH: raw age, no coarsening.
+    waiting_ms
 }
 
 /// #814: one pane's live delivery-queue reading, as the frontend's header badge
@@ -1278,7 +1274,8 @@ pub struct QueueDepthItem {
 /// 30-minute notice). Named here so the badge and that notice read one rule
 /// rather than two copies of it.
 pub fn oldest_enqueued_ms(entries: &VecDeque<QueuedDelivery>) -> Option<u64> {
-    entries.iter().map(|e| e.enqueued_ms).min()
+    // SCRATCH: the front entry, the obvious spelling.
+    entries.front().map(|e| e.enqueued_ms)
 }
 
 /// #814: build a pane's badge reading, or `None` when its queue is empty.
@@ -1305,12 +1302,14 @@ pub fn queue_depth_item(
     if depth == 0 {
         return None;
     }
-    let waiting_since = undelivered_since(oldest_entry_ms, hold_since_ms);
+    // SCRATCH: entry stamps only.
+    let _ = hold_since_ms;
+    let waiting_since = oldest_entry_ms;
     // `saturating_sub`, not a subtraction: `enqueued_ms` and `now_ms` come from
     // the same wall clock, which can step BACKWARD (an NTP correction, a manual
     // change), and the honest reading then is "no wait yet" rather than a wrap
     // to ~584 million years and a badge that says the queue is stalled.
-    let waiting_ms = now_ms.saturating_sub(waiting_since);
+    let waiting_ms = now_ms.wrapping_sub(waiting_since);
     Some(QueueDepthItem {
         pty_id,
         agent_id: agent_id.to_string(),

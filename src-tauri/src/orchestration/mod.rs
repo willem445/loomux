@@ -39233,12 +39233,9 @@ impl OrchRegistry {
     /// emits nothing at all.
     #[doc(hidden)] // pub for integration tests
     pub fn queue_depth_push(&self, now_ms: u64) -> Option<Vec<queue::QueueDepthItem>> {
+        // SCRATCH: no skip.
         let items = self.queue_depth_snapshot(now_ms);
-        let mut last = self.queue_depth_emitted.lock_safe();
-        if *last == items {
-            return None;
-        }
-        *last = items.clone();
+        *self.queue_depth_emitted.lock_safe() = items.clone();
         Some(items)
     }
 
