@@ -279,6 +279,68 @@ pub struct Gate {
     pub also: Vec<String>,
 }
 
+// ── resources: named lock resources (#858) ─────────────────────────────────
+
+/// Slots a resource gets when it declares none. One — the useful default is a
+/// mutex, and a repo that wants a semaphore says so.
+pub const RESOURCE_SLOTS_DEFAULT: u32 = 1;
+
+/// Ceiling on `slots`. Not a resource constraint — a legibility one: past this
+/// the declaration no longer serializes anything, and a repo that wrote `1000`
+/// meant something other than what it said.
+pub const RESOURCE_SLOTS_MAX: u32 = 64;
+
+/// How long a hold may last before the sweep reclaims it, when the resource
+/// declares nothing. Long enough for a real build or test run, short enough
+/// that a crashed holder's slot comes back inside a working session.
+pub const RESOURCE_MAX_HOLD_MINUTES_DEFAULT: u32 = 30;
+
+/// Ceiling on `max_hold_minutes` (8h). A hold is a bound on a *fallible*
+/// signal — "the holder will call release_lock" — and the lessons-file rule is
+/// that such a bound exists and is finite. A repo may make it generous; it may
+/// not make it decorative.
+pub const RESOURCE_MAX_HOLD_MINUTES_MAX: u32 = 480;
+
+/// How many resources one repo may declare. Every declared name is listed in
+/// the `acquire_lock` tool description that every agent in the group reads, so
+/// the cap bounds a per-agent context cost, not a memory one.
+pub const RESOURCES_MAX: usize = 32;
+
+/// One declared lock resource: how many agents may hold it at once, and how
+/// long any one of them may hold it before loomux takes it back.
+///
+/// **Policy, not mechanism** (CLAUDE.md constraint 8). Nothing here names a
+/// toolchain, a command, or a machine: `build` is a *string this repo chose*,
+/// and loomux never learns what it means. The whole schema is two numbers.
+///
+/// **Restrict-only, like the resource guard #318 designed before it.** A
+/// `resources:` block can make an agent wait; it can never grant one a
+/// capability, name a program to run, or reach the capability-closure spine
+/// (`blocks:`/`edges:`/`gates:`). The worst a hostile `.loomux/workflow.yml`
+/// can do with it is declare `slots: 1` on something everyone needs and slow
+/// the group down — and both the hold and the wait are bounded above, and
+/// every acquire/release/reclaim is audited.
+///
+/// **An absent block means the feature is off**: no `resources:` at all and
+/// the three lock tools are not even listed to the group's agents, so behavior
+/// is byte-for-byte what it was.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResourcePolicy {
+    /// Concurrent holders allowed. `1` (the default) is a mutex.
+    pub slots: u32,
+    /// The reclaim deadline on a single hold.
+    pub max_hold_minutes: u32,
+}
+
+impl Default for ResourcePolicy {
+    fn default() -> Self {
+        ResourcePolicy {
+            slots: RESOURCE_SLOTS_DEFAULT,
+            max_hold_minutes: RESOURCE_MAX_HOLD_MINUTES_DEFAULT,
+        }
+    }
+}
+
 // ── merge_queue: the bisecting merge queue's policy (#581 §11.2) ───────────
 
 /// Default batch size (§11.2). At `3`, a red batch costs at most 2 extra CI
@@ -507,6 +569,10 @@ pub struct Workflow {
     /// Merge-queue policy (#581 §11.2). Always resolved; the default is
     /// **disabled**, which is what an absent `merge_queue:` block means.
     pub merge_queue: MergeQueuePolicy,
+    /// Named lock resources (#858), keyed by the repo's own name for each.
+    /// **Empty** when the file declares no `resources:` block — which is what
+    /// turns the lock tools off for the group entirely.
+    pub resources: BTreeMap<String, ResourcePolicy>,
 }
 
 impl Workflow {
@@ -757,6 +823,29 @@ struct RawWorkflow {
     /// default-branch refusals (§7) are not reachable from this schema at all.
     #[serde(default)]
     merge_queue: Option<RawMergeQueue>,
+    /// Named lock resources (#858). Absent (or empty) means no group in this
+    /// repo gets the lock tools at all.
+    ///
+    /// Like `intake:` and `merge_queue:`, this block can never grant a
+    /// capability: every field is a number, there is no spelling that names a
+    /// program, a path, or an agent, and `deny_unknown_fields` on
+    /// [`RawResource`] makes an attempt at one a hard parse error rather than
+    /// an ignored line.
+    #[serde(default)]
+    resources: BTreeMap<String, RawResource>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawResource {
+    /// `Option` rather than a defaulted number so "omitted" and "written as 1"
+    /// are distinguishable — the parse below rejects a zero, and rejecting one
+    /// the author never wrote would be an error about nothing. (Same reasoning
+    /// as [`RawMergeQueue::max_batch`].)
+    #[serde(default)]
+    slots: Option<u32>,
+    #[serde(default)]
+    max_hold_minutes: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -1466,6 +1555,85 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
         }
     };
 
+    // Named lock resources (#858). An absent block leaves this empty, which is
+    // what makes the lock tools invisible to the group's agents.
+    //
+    // Every bad value here is a hard ERROR, never a silent substitution — the
+    // same posture `merge_queue.max_batch` takes and for the same reason: a
+    // repo declaring `slots: 0` believes its builds are serialized, and
+    // quietly handing it the default would leave that belief in place while
+    // the behaviour changed underneath it. Names are REJECTED rather than
+    // rewritten (the `blocks[].id` rule): an author who wrote `heavy build`
+    // must not end up with a resource called `heavybuild` that the
+    // `acquire_lock` call in their own worker brief cannot name.
+    let mut resources: BTreeMap<String, ResourcePolicy> = BTreeMap::new();
+    if raw.resources.len() > RESOURCES_MAX {
+        errs.push(format!(
+            "resources: {} declared — at most {RESOURCES_MAX} are allowed (every name is listed \
+             in the acquire_lock tool description every agent in the group reads)",
+            raw.resources.len()
+        ));
+    }
+    for (raw_name, rr) in &raw.resources {
+        let trimmed = raw_name.trim();
+        if trimmed.chars().count() > MAX_ID_CHARS {
+            errs.push(format!(
+                "resources: name {raw_name:?} is longer than {MAX_ID_CHARS} characters"
+            ));
+            continue;
+        }
+        let Some(name) = sanitize_id(trimmed) else {
+            errs.push(format!(
+                "resources: name {raw_name:?} has no usable characters (allowed: letters, digits, '-', '_')"
+            ));
+            continue;
+        };
+        if name != trimmed {
+            errs.push(format!(
+                "resources: name {raw_name:?} contains characters that are not allowed (letters, digits, '-', '_')"
+            ));
+            continue;
+        }
+        let slots = match rr.slots {
+            None => RESOURCE_SLOTS_DEFAULT,
+            Some(0) => {
+                errs.push(format!(
+                    "resources.{name}.slots: must be at least 1 — a resource with no slots could \
+                     never be acquired by anyone"
+                ));
+                continue;
+            }
+            Some(n) if n > RESOURCE_SLOTS_MAX => {
+                errs.push(format!(
+                    "resources.{name}.slots: {n} is above the maximum of {RESOURCE_SLOTS_MAX} — \
+                     past that a declaration serializes nothing, which is not what a `slots:` line means"
+                ));
+                continue;
+            }
+            Some(n) => n,
+        };
+        let max_hold_minutes = match rr.max_hold_minutes {
+            None => RESOURCE_MAX_HOLD_MINUTES_DEFAULT,
+            Some(0) => {
+                errs.push(format!(
+                    "resources.{name}.max_hold_minutes: must be at least 1 — a hold that expires \
+                     the moment it is granted serializes nothing"
+                ));
+                continue;
+            }
+            Some(n) if n > RESOURCE_MAX_HOLD_MINUTES_MAX => {
+                errs.push(format!(
+                    "resources.{name}.max_hold_minutes: {n} is above the maximum of \
+                     {RESOURCE_MAX_HOLD_MINUTES_MAX} — a hold on a scarce resource has to be \
+                     bounded by something a working session outlives"
+                ));
+                continue;
+            }
+            Some(n) => n,
+        };
+        resources.insert(name, ResourcePolicy { slots, max_hold_minutes });
+    }
+
     if !errs.is_empty() {
         return Err(errs);
     }
@@ -1478,6 +1646,7 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
         gates,
         intake,
         merge_queue,
+        resources,
     })
 }
 

@@ -68,7 +68,7 @@ pub const APP_COMMANDS: &[&str] = &[
     // gitwatch (2)
     "git_watch",
     "git_unwatch",
-    // orchestration (63)
+    // orchestration (64)
     "agent_autopilot_flags",
     "agent_cli_knobs",
     "create_orchestration",
@@ -124,6 +124,7 @@ pub const APP_COMMANDS: &[&str] = &[
     "orch_set_advanced_orchestrator",
     "orch_workflow_status",
     "orch_group_watches",
+    "orch_lock_state",
     "orch_end_group",
     "orch_channel_connect",
     "orch_channel_disconnect",

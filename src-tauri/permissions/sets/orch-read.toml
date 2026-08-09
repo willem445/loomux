@@ -17,6 +17,7 @@ permissions = [
     "allow-orch-workflow-preview",
     "allow-orch-workflow-status",
     "allow-orch-group-watches",
+    "allow-orch-lock-state",
     "allow-orch-channel-list",
     "allow-orch-channel-for-pane",
 ]

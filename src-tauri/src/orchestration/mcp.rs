@@ -10,6 +10,7 @@
 //! reach this server's state at all, and group A can never see group B.
 
 use super::report;
+use super::workflow;
 use super::{Caller, Delivery, NameSource, OrchRegistry, Role};
 use serde_json::{json, Value};
 use std::io::Read as _;
@@ -211,7 +212,9 @@ pub fn dispatch(
             }))
         }
         "ping" => Ok(json!({})),
-        "tools/list" => Ok(json!({ "tools": tool_defs(caller.role, caller.role_hint.as_deref()) })),
+        "tools/list" => Ok(json!({
+            "tools": tool_defs(caller.role, caller.role_hint.as_deref(), &reg.lock_menu(&caller.group))
+        })),
         "tools/call" => {
             let name = params.get("name").and_then(Value::as_str).unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
@@ -293,11 +296,40 @@ fn channel_tool_defs() -> [Value; 2] {
     ]
 }
 
+/// One line naming every declared lock resource and its shape, folded into the
+/// `acquire_lock` description. `RESOURCES_MAX` bounds it, so this can never
+/// become an unbounded string in every agent's context.
+fn lock_menu_text(locks: &[(String, workflow::ResourcePolicy)]) -> String {
+    locks
+        .iter()
+        .map(|(name, p)| {
+            format!(
+                "'{name}' ({} slot{}, max hold {} min)",
+                p.slots,
+                if p.slots == 1 { "" } else { "s" },
+                p.max_hold_minutes
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// The tool surface is role-filtered so workers never even see privileged
 /// tools; `call_tool` re-checks anyway (listing is cosmetic, not security).
 /// `role_hint` additionally scopes `session_digest` to `process`-hinted
 /// worker blocks (#250/#324 slice D) — every other tool ignores it.
-fn tool_defs(role: Role, role_hint: Option<&str>) -> Vec<Value> {
+///
+/// `locks` is the group's declared `resources:` block (#858). It is a
+/// LISTING input, not just a description input: a repo that declares no
+/// resources gets no lock tools at all, so the feature is invisible — and
+/// costs no context — everywhere it was not asked for. The names are folded
+/// into the descriptions because an agent that cannot see what exists guesses
+/// (`cargo`, `build-lock`, `ci`) and gets three refusals instead of one lock.
+fn tool_defs(
+    role: Role,
+    role_hint: Option<&str>,
+    locks: &[(String, workflow::ResourcePolicy)],
+) -> Vec<Value> {
     // A standalone pane's ENTIRE surface, full stop (#271 W3 addendum, part
     // A1): a solo token must confer zero group-scoped power. Returned here,
     // before any of the tiers below, so no future addition to the shared or
@@ -372,6 +404,55 @@ fn tool_defs(role: Role, role_hint: Option<&str>) -> Vec<Value> {
             // surface (`channel_tool_defs`) so the two listings never drift.
         ]);
         tools.extend(channel_tool_defs());
+        // Named lock resources (#858). Listed only for a group whose repo
+        // actually declares some — an absent `resources:` block means the
+        // feature is off and the tool surface is byte-for-byte what it was.
+        // Denied to a planner for the #203 reason the notification tools
+        // state: a lock outliving the pane that took it is exactly the
+        // stranded-slot case this mechanism exists to prevent.
+        // `call_tool` re-checks both (`require_not_planner`, and an undeclared
+        // resource is refused by the registry) — this filter is cosmetic.
+        if !locks.is_empty() {
+            let menu = lock_menu_text(locks);
+            tools.extend([
+                tool("acquire_lock",
+                    &format!("Take a named lock on a scarce resource this repo declares, so agents \
+                        take turns instead of colliding. THIS CALL NEVER BLOCKS and never fails for \
+                        contention: it returns either 'it is yours' or 'you are queued at position \
+                        N'. If you are queued, END YOUR TURN — do not sleep, poll, or re-call in a \
+                        loop; loomux types a [loomux] notice into this pane the moment the lock is \
+                        yours, and a pane sitting mid-turn cannot take that delivery (the same \
+                        deadlock a blocking CI wait causes). Calling it again when you already hold \
+                        or are already queued for the lock is a harmless no-op that reports where \
+                        you stand — it never extends your hold or costs you your place in line. \
+                        RELEASE IT THE MOMENT YOU ARE DONE (release_lock): a hold you forget is \
+                        reclaimed automatically at max_hold, which is audited as a reclaim and \
+                        makes everyone behind you wait for the clock instead of for you. \
+                        This repo declares: {menu}."),
+                    json!({
+                        "name": { "type": "string", "description": "The resource to lock — one of the names listed above. An unknown name is refused (with the list), never created on the fly." },
+                        "note": { "type": "string", "description": "Short label for what you are doing with it, shown to the human beside your pane and in the audit log, e.g. \"cargo test --locked\". Optional but worth it: it is what tells a human whether a 40-minute hold is progress or a hang." },
+                        "wait_minutes": { "type": "integer", "description": "How long to keep your place in the queue if the lock is busy. Default 60, clamped to 5-240. On expiry you get a [loomux] notice and are dropped from the queue — you are never left waiting silently." },
+                    }),
+                    &["name"]),
+                tool("release_lock",
+                    "Give up a lock you hold — the next agent in line gets it immediately and is \
+                     told so in its own pane. Call it as soon as the work that needed the resource \
+                     is finished, not at the end of your turn. Also withdraws a QUEUED request if \
+                     you are waiting rather than holding (useful when you no longer need the \
+                     resource — it stops you being handed a slot you would then sit on). Errors \
+                     only if you neither hold nor wait for it, which means you were never \
+                     serialized and should know.",
+                    json!({ "name": { "type": "string", "description": "The resource to release." } }),
+                    &["name"]),
+                tool("list_locks",
+                    "Read this group's live lock state as JSON: every declared resource with its \
+                     slot count, who holds it (with each holder's note and hold deadline), and the \
+                     FIFO wait queue behind it. Read-only. Use it to see whether a resource is \
+                     worth queueing for at all, or to find out who is sitting on the one you want.",
+                    json!({}), &[]),
+            ]);
+        }
     }
     if role == Role::Orchestrator {
         tools.extend([
@@ -1306,6 +1387,38 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                 w.id, w.condition.label(),
             ))
         }
+        // Named lock resources (#858). The listing above is cosmetic — these
+        // three arms are the real gate, and they enforce two things it cannot:
+        // a planner is refused outright (#203: a lock outliving its pane is
+        // the stranded slot this mechanism exists to prevent), and a resource
+        // this repo never declared is refused by the registry with the list of
+        // ones it did.
+        "acquire_lock" => {
+            require_not_planner(caller)?;
+            let name = arg_str(args, "name").ok_or("name required")?;
+            let note = arg_str(args, "note").unwrap_or("");
+            // Present-but-not-a-whole-number is REJECTED rather than silently
+            // defaulted, the `notify_when` rule: a caller that wrote "30" gets
+            // told, instead of quietly waiting an hour.
+            let wait_minutes = match args.get("wait_minutes") {
+                None | Some(Value::Null) => super::notify::clamp_expires_minutes(None),
+                Some(v) => match v.as_u64() {
+                    Some(n) => super::notify::clamp_expires_minutes(Some(n as u32)),
+                    None => {
+                        return Err(format!(
+                            "wait_minutes must be a whole number of minutes, got: {v}"
+                        ))
+                    }
+                },
+            };
+            reg.acquire_lock(&caller.group, &caller.agent_id, name, note, wait_minutes)
+        }
+        "release_lock" => {
+            require_not_planner(caller)?;
+            let name = arg_str(args, "name").ok_or("name required")?;
+            reg.release_lock(&caller.group, &caller.agent_id, name)
+        }
+        "list_locks" => Ok(reg.lock_state(&caller.group).to_string()),
         "list_notifications" => {
             require_not_planner(caller)?;
             Ok(reg.list_notifications(&caller.agent_id).to_string())

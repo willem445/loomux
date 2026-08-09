@@ -192,6 +192,7 @@ pub fn run() {
             orchestration::orch_set_advanced_orchestrator,
             orchestration::orch_workflow_status,
             orchestration::orch_group_watches,
+            orchestration::orch_lock_state,
             orchestration::orch_end_group,
             orchestration::orch_channel_connect,
             orchestration::orch_channel_disconnect,
