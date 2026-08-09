@@ -39265,11 +39265,12 @@ impl OrchRegistry {
     /// nothing to be wrong about — which is what keeps an idle app at zero.
     #[doc(hidden)] // pub for integration tests
     pub fn queue_depth_push(&self, now_ms: u64) -> Option<Vec<queue::QueueDepthItem>> {
-        // SCRATCH: no skip.
+        // SCRATCH round 2: the UNBOUNDED skip — the exact pre-self-review code,
+        // so the heal test fails on the release assertion and nothing else.
+        let _ = QUEUE_DEPTH_REPUSH_MS;
         let items = self.queue_depth_snapshot(now_ms);
         let mut last = self.queue_depth_emitted.lock_safe();
-        let stale = now_ms.saturating_sub(last.1) >= QUEUE_DEPTH_REPUSH_MS;
-        if last.0 == items && !(stale && !items.is_empty()) {
+        if last.0 == items {
             return None;
         }
         *last = (items.clone(), now_ms);
