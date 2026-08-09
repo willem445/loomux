@@ -274,9 +274,12 @@ const STREAMS: StreamRow[] = [
       "by a coalescer: queue_depth_push emits nothing when the set is identical to the last one " +
       "pushed, and the wait it carries is coarsened to what the badge can render differently " +
       "(coarsen_waiting_ms — 1 s under a minute, 1 min above), so an app with nothing queued emits " +
-      "zero events and a pane stuck for an hour costs ~1/min rather than 1/tick. Not one of INV-3's " +
-      "three named mechanisms — a skip is not a coalescer — so it is argued here, the same way " +
-      "orch-attention's diff is.",
+      "zero events and a pane stuck for an hour costs ~1/min rather than 1/tick. The skip is itself " +
+      "bounded (INV-6): a non-empty set is re-pushed every QUEUE_DEPTH_REPUSH_MS (30 s) because the " +
+      "suppression's signal is a memory of an emit, not an acknowledgement — a reloaded webview " +
+      "would otherwise wear no badge on exactly the stalled pane whose reading never changes. Not " +
+      "one of INV-3's three named mechanisms — a skip is not a coalescer — so it is argued here, " +
+      "the same way orch-attention's diff is.",
     debt: null,
   },
   {
