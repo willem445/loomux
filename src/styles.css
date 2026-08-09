@@ -548,6 +548,40 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
    affordance — nothing to click here, unlike .pane-attn — see the shared
    `.pane-attn, .pane-held` rule above for its actual declarations. */
 
+/* ---------- delivery-queue depth badge (#814) ---------- */
+/* How many prompts are waiting for this pane and for how long. Deliberately
+   QUIETER than .pane-attn/.pane-held while the queue is merely deep: a backlog
+   draining normally is information, not an alarm, and a third pulsing amber chip
+   would make the two that ARE alarms harder to read. It earns the amber pulse
+   only when the backend says the queue is stalled (nothing delivered for
+   `QUEUE_STALLED_AFTER`) — the state #814 was filed for — by borrowing the same
+   base look rather than inventing a third visual language. Header chrome: it
+   floats in the header and never affects the terminal's geometry. */
+.pane-queue {
+  flex: none;
+  font-size: 9px; font-weight: 600; letter-spacing: 0.3px;
+  border: 1px solid #33405a; border-radius: 4px; padding: 1.5px 6px;
+  color: #9aa8c7; background: rgba(122, 162, 247, 0.1);
+}
+.pane-queue[data-stalled="true"] {
+  border-color: #6a5230; color: #f2c66a; background: rgba(224, 175, 104, 0.16);
+  animation: attn-pulse 1.6s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .pane-queue[data-stalled="true"] { animation: none; }
+}
+/* The dock-chip mirror for a minimized pane (#814): a count, not a chip — see
+   grid.ts's renderDock for why the number itself has to be visible there. */
+.dock-chip-queue {
+  flex: none;
+  font-size: 8.5px; font-weight: 700;
+  border-radius: 3px; padding: 0 3px;
+  color: #9aa8c7; background: rgba(122, 162, 247, 0.14);
+}
+.dock-chip-queue[data-stalled="true"] {
+  color: #f2c66a; background: rgba(224, 175, 104, 0.22);
+}
+
 /* ---------- cross-workspace channels (#271) ---------- */
 /* The connect gesture's three visual states, each independent (so they never fight
    the grouped/attention box-shadow stripes above): an ARMED pane (right-clicked,

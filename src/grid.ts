@@ -13,6 +13,7 @@ import { Pane, type PaneEvents, type PaneOptions, type ContentPaneOptions } from
 import type { PersistedPane } from "./tabstore";
 import { dropZoneFor, indicatorFor, zoneToPlacement, type DropZone } from "./layout";
 import { dockChipAttention } from "./attention";
+import { dockChipQueue, queuePresentation } from "./queuebadge";
 import { planGroupMinimize } from "./group";
 import { shouldFocusNewPane, shouldRestoreFocus, shouldPreserveMaximize } from "./panefocus";
 import { startDragSession } from "./dragsession";
@@ -790,6 +791,29 @@ export class Grid {
         chip.style.setProperty("--connect-color", channel.color);
         if (!attn.needsAttention) {
           chip.title = `${channel.label} — connected to ${channel.peers.join(", ") || "…"}. Click to restore.`;
+        }
+      }
+
+      // Delivery-queue depth (#814): a docked pane's header chip is out of the
+      // DOM, and delegate agent panes open minimized by default — so without
+      // this the panes whose queues actually back up are the ones with no
+      // visible reading at all. Its own marker rather than a class on the chip:
+      // the count is the fact worth showing, and "3 waiting" versus "1 waiting"
+      // is not something styling can say.
+      const reading = pane.queueDepth;
+      const queue = dockChipQueue(reading);
+      if (queue && reading) {
+        const marker = document.createElement("span");
+        marker.className = "dock-chip-queue";
+        marker.textContent = queue.marker;
+        if (queue.stalled) marker.dataset.stalled = "true";
+        chip.appendChild(marker);
+        // Attention still owns the tooltip when it is present (it is the more
+        // urgent ask, the rule the channel mirror above already follows); a
+        // stalled queue outranks a plain channel membership, though, because it
+        // is a thing going wrong rather than a state of affairs.
+        if (!attn.needsAttention && (queue.stalled || !channel)) {
+          chip.title = `${pane.name}: ${queuePresentation(reading).title} · click to restore.`;
         }
       }
 
