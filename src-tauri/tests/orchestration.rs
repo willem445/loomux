@@ -44293,3 +44293,397 @@ fn the_wired_declined_flush_leaves_the_pane_untouched_when_our_text_is_still_the
         "so the delivery must abort pre-paste — pasting here merges two prompts into one (#824)"
     );
 }
+
+// ── named lock resources (#858) ────────────────────────────────────────────
+//
+// The engine's own state machine is unit-tested in
+// `src/orchestration/locks.rs`; these drive the WIRED path — the real
+// `dispatch()`, the real registry, the real audit log — because that is where
+// the parts that can silently do nothing live: the tool listing, the role
+// gate, the pane notice, the `mark_dead` reclaim, and the sweep folded into
+// the poll tick.
+
+/// A repo whose `.loomux/workflow.yml` declares `resources:`.
+fn repo_with_resources(tag: &str, body: &str) -> std::path::PathBuf {
+    let repo = scratch_dir(tag);
+    fs::create_dir_all(repo.join(".loomux")).unwrap();
+    fs::write(
+        repo.join(".loomux").join("workflow.yml"),
+        format!(
+            "version: {}\n\
+             blocks:\n  - id: w\n    name: Worker\n    kind: worker\n    cli: claude\n    model: sonnet\n\
+             {body}",
+            workflow::SCHEMA_VERSION
+        ),
+    )
+    .unwrap();
+    // The fixture asserts its own validity — a file that never parsed would
+    // otherwise fail the caller's assertion as "the feature is broken".
+    let loaded = workflow::load_workflow(repo.to_str().unwrap());
+    assert!(
+        matches!(&loaded, Ok(Some(wf)) if !wf.resources.is_empty()),
+        "fixture must parse with a non-empty resources block, got {loaded:?}"
+    );
+    repo
+}
+
+/// A group on a repo declaring `body`, plus two worker callers.
+fn setup_locks(tag: &str, body: &str) -> (OrchRegistry, tempfile::TempDir, String, Caller, Caller) {
+    let (reg, dir) = test_registry();
+    let repo = repo_with_resources(tag, body);
+    let g = reg.create_group(repo.to_str().unwrap(), advanced_rails()).unwrap();
+    let w1 = reg.spawn_agent(&g.id, Role::Worker, "w1", "task", false, None).unwrap();
+    let w2 = reg.spawn_agent(&g.id, Role::Worker, "w2", "task", false, None).unwrap();
+    let c1 = reg.resolve_token(&w1.token).unwrap();
+    let c2 = reg.resolve_token(&w2.token).unwrap();
+    (reg, dir, g.id, c1, c2)
+}
+
+const BUILD_ONE_SLOT: &str = "resources:\n  build:\n    slots: 1\n    max_hold_minutes: 45\n";
+const BUILD_ONE_MINUTE: &str = "resources:\n  build:\n    slots: 1\n    max_hold_minutes: 1\n";
+
+fn lock_call(reg: &OrchRegistry, c: &Caller, name: &str, args: Value) -> (bool, String) {
+    let r = dispatch(reg, c, "tools/call", &json!({ "name": name, "arguments": args })).unwrap();
+    (
+        r["isError"].as_bool().unwrap_or(false),
+        r["content"][0]["text"].as_str().unwrap_or_default().to_string(),
+    )
+}
+
+fn lock_tool_names(reg: &OrchRegistry, c: &Caller) -> Vec<String> {
+    dispatch(reg, c, "tools/list", &Value::Null).unwrap()["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|t| t["name"].as_str().map(str::to_string))
+        .collect()
+}
+
+fn lock_audit_actions(reg: &OrchRegistry, group: &str) -> Vec<String> {
+    reg.audit_log(group).into_iter().map(|e| e.action).collect()
+}
+
+fn lock_json(reg: &OrchRegistry, c: &Caller) -> Value {
+    let (err, text) = lock_call(reg, c, "list_locks", json!({}));
+    assert!(!err, "list_locks must not fail: {text}");
+    serde_json::from_str(&text).expect("list_locks returns JSON")
+}
+
+/// **A repo that declares nothing gets no lock tools at all** — the "an absent
+/// block means the feature is off" posture, enforced in the listing rather
+/// than only in a refusal, so the three descriptions cost no context in every
+/// group that never asked for them.
+#[test]
+fn the_lock_tools_are_listed_only_where_a_repo_declares_resources() {
+    let (reg, _d, _g, c1, _c2) = setup_locks("locks-listing", BUILD_ONE_SLOT);
+    let names = lock_tool_names(&reg, &c1);
+    for t in ["acquire_lock", "release_lock", "list_locks"] {
+        assert!(names.contains(&t.to_string()), "declared repo must offer {t}: {names:?}");
+    }
+    // The declared menu reaches the agent IN the description — an agent that
+    // cannot see what exists guesses names and collects refusals.
+    let listed = dispatch(&reg, &c1, "tools/list", &Value::Null).unwrap();
+    let desc = listed["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "acquire_lock")
+        .expect("acquire_lock is listed")["description"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(desc.contains("'build' (1 slot, max hold 45 min)"), "{desc}");
+
+    // …and a group whose repo declares none sees none of the three.
+    let (reg2, _d2, co, cw) = setup_mcp();
+    for c in [&co, &cw] {
+        let names = lock_tool_names(&reg2, c);
+        for t in ["acquire_lock", "release_lock", "list_locks"] {
+            assert!(!names.contains(&t.to_string()), "undeclared repo must not offer {t}");
+        }
+    }
+}
+
+/// The contention path end to end: the second caller is QUEUED with its
+/// position, and the call RETURNS — it is not an error and it does not block.
+#[test]
+fn a_second_worker_is_queued_with_its_position_rather_than_blocked_or_refused() {
+    let (reg, _d, g, c1, c2) = setup_locks("locks-contend", BUILD_ONE_SLOT);
+
+    let (err, text) =
+        lock_call(&reg, &c1, "acquire_lock", json!({ "name": "build", "note": "cargo test" }));
+    assert!(!err, "{text}");
+    assert!(text.contains("is YOURS"), "{text}");
+
+    let (err, text) = lock_call(&reg, &c2, "acquire_lock", json!({ "name": "build" }));
+    assert!(!err, "contention is not an error: {text}");
+    assert!(text.contains("position 1"), "{text}");
+    // The reply has to talk the caller out of the deadlock shape (#590): a
+    // worker told only "queued" invents a sleep loop, and the grant notice is
+    // typed into the very pane that loop would be blocking.
+    assert!(text.contains("END YOUR TURN"), "{text}");
+
+    let state = lock_json(&reg, &c1);
+    assert_eq!(state["resources"][0]["holders"][0]["agent"], json!(c1.agent_id));
+    assert_eq!(state["resources"][0]["holders"][0]["note"], json!("cargo test"));
+    assert_eq!(state["resources"][0]["queue"][0]["agent"], json!(c2.agent_id));
+
+    let actions = lock_audit_actions(&reg, &g);
+    assert!(actions.contains(&"lock-acquire".to_string()), "{actions:?}");
+    assert!(actions.contains(&"lock-queued".to_string()), "{actions:?}");
+}
+
+/// Releasing hands the slot to the head of the queue **and tells that agent in
+/// its own pane** — the half a state-only test would miss entirely, and the
+/// only thing that makes a non-blocking acquire usable at all.
+#[test]
+fn releasing_grants_the_slot_to_the_head_of_the_queue_and_notifies_it() {
+    let (reg, _d, g, c1, c2) = setup_locks("locks-handoff", BUILD_ONE_SLOT);
+    lock_call(&reg, &c1, "acquire_lock", json!({ "name": "build" }));
+    lock_call(&reg, &c2, "acquire_lock", json!({ "name": "build" }));
+    // A pane to deliver into, and a pause so the text is observable without a
+    // real terminal (this suite's standard delivery mock).
+    pause_with_pane(&reg, &g, &c2.agent_id, 4201);
+
+    let (err, text) = lock_call(&reg, &c1, "release_lock", json!({ "name": "build" }));
+    assert!(!err, "{text}");
+    assert!(text.contains(&c2.agent_id), "the releaser is told who took it: {text}");
+
+    let notices = delivered_texts(&reg, &g);
+    assert!(
+        notices.iter().any(|t| t.contains("[loomux] lock 'build' is yours")),
+        "the new holder must be told, in its own pane: {notices:?}"
+    );
+    let state = lock_json(&reg, &c2);
+    assert_eq!(state["resources"][0]["holders"][0]["agent"], json!(c2.agent_id));
+    assert!(state["resources"][0]["queue"].as_array().unwrap().is_empty());
+}
+
+/// A holder whose pane dies must not strand the slot. This is the reclaim that
+/// matters most: nothing else will ever release it.
+#[test]
+fn a_dead_holders_slot_is_reclaimed_and_handed_on_immediately() {
+    let (reg, _d, g, c1, c2) = setup_locks("locks-death", BUILD_ONE_SLOT);
+    lock_call(&reg, &c1, "acquire_lock", json!({ "name": "build" }));
+    lock_call(&reg, &c2, "acquire_lock", json!({ "name": "build" }));
+
+    reg.mark_dead(&c1.agent_id, Some(1));
+
+    let state = lock_json(&reg, &c2);
+    assert_eq!(
+        state["resources"][0]["holders"][0]["agent"],
+        json!(c2.agent_id),
+        "the queued worker takes the dead holder's slot, without waiting for the sweep"
+    );
+    let reclaim = reg
+        .audit_log(&g)
+        .into_iter()
+        .find(|e| e.action == "lock-reclaim")
+        .expect("the reclaim is audited");
+    assert_eq!(reclaim.detail["agent"], json!(c1.agent_id));
+    assert_eq!(reclaim.detail["why"], json!("agent-gone"));
+}
+
+/// The max-hold backstop, on the wired sweep: a holder that never releases
+/// loses the lock, is told so, and the queue moves.
+#[test]
+fn an_overrun_hold_is_reclaimed_by_the_sweep_audited_and_reported_to_its_holder() {
+    let (reg, _d, g, c1, c2) = setup_locks("locks-expiry", BUILD_ONE_MINUTE);
+    lock_call(&reg, &c1, "acquire_lock", json!({ "name": "build" }));
+    lock_call(&reg, &c2, "acquire_lock", json!({ "name": "build" }));
+    // The ex-holder needs a pane for the "your lock is gone" notice to be
+    // observable; the group is resumed again immediately because a paused
+    // group's locks are deliberately frozen (see the pause test below).
+    pause_with_pane(&reg, &g, &c1.agent_id, 4301);
+    reg.resume_group(&g).unwrap();
+
+    // Nothing has expired yet — the sweep must not reclaim early.
+    reg.locks_tick(now_ms());
+    assert!(
+        !lock_audit_actions(&reg, &g).contains(&"lock-expired".to_string()),
+        "a hold inside its window is not reclaimed"
+    );
+
+    // Two minutes on, past the declared one-minute max hold.
+    reg.locks_tick(now_ms() + 2 * 60_000);
+    let expired = reg
+        .audit_log(&g)
+        .into_iter()
+        .find(|e| e.action == "lock-expired")
+        .expect("the expiry is audited");
+    assert_eq!(expired.detail["agent"], json!(c1.agent_id));
+    assert!(
+        delivered_texts(&reg, &g).iter().any(|t| t.contains("RECLAIMED")),
+        "the ex-holder is told its work is no longer serialized"
+    );
+    let state = lock_json(&reg, &c2);
+    assert_eq!(state["resources"][0]["holders"][0]["agent"], json!(c2.agent_id));
+}
+
+/// A queued request has its own clock, and giving up is announced rather than
+/// silent — otherwise a worker that ended its turn on "you are queued" waits
+/// forever for a notice that will never come.
+#[test]
+fn a_queued_request_times_out_on_its_own_clock_and_says_so() {
+    let (reg, _d, g, c1, c2) = setup_locks("locks-waittimeout", BUILD_ONE_SLOT);
+    lock_call(&reg, &c1, "acquire_lock", json!({ "name": "build" }));
+    // 5 is the floor `clamp_expires_minutes` enforces; anything lower is
+    // clamped up to it, so this is the shortest wait a caller can actually ask
+    // for.
+    lock_call(&reg, &c2, "acquire_lock", json!({ "name": "build", "wait_minutes": 5 }));
+    pause_with_pane(&reg, &g, &c2.agent_id, 4401);
+    reg.resume_group(&g).unwrap();
+
+    reg.locks_tick(now_ms() + 6 * 60_000);
+    let timeout = reg
+        .audit_log(&g)
+        .into_iter()
+        .find(|e| e.action == "lock-wait-timeout")
+        .expect("the timeout is audited");
+    assert_eq!(timeout.detail["agent"], json!(c2.agent_id));
+    assert!(
+        delivered_texts(&reg, &g).iter().any(|t| t.contains("wait TIMED OUT")),
+        "a dropped waiter is told, never left waiting on a notice that will not come"
+    );
+    // The holder is untouched: its own 45-minute window is nowhere near.
+    let state = lock_json(&reg, &c1);
+    assert_eq!(state["resources"][0]["holders"][0]["agent"], json!(c1.agent_id));
+    assert!(state["resources"][0]["queue"].as_array().unwrap().is_empty());
+}
+
+/// A paused group is frozen solid: a pause is not a reason to take a running
+/// build's lock away, and the pause span is credited on the tick that observes
+/// it unpaused rather than charged to every hold at once.
+#[test]
+fn a_pause_does_not_expire_a_hold_the_pause_itself_froze() {
+    let (reg, _d, g, c1, _c2) = setup_locks("locks-pause", BUILD_ONE_MINUTE);
+    lock_call(&reg, &c1, "acquire_lock", json!({ "name": "build" }));
+    let t0 = now_ms();
+
+    // Paused for two minutes — twice the max hold.
+    reg.pause_group(&g).unwrap();
+    reg.locks_tick(t0);
+    reg.locks_tick(t0 + 2 * 60_000);
+    assert!(
+        !lock_audit_actions(&reg, &g).contains(&"lock-expired".to_string()),
+        "a paused group's holds do not expire"
+    );
+
+    // The tick that observes it resumed credits the pause span, so the hold
+    // survives that tick too rather than expiring the instant work resumes.
+    reg.resume_group(&g).unwrap();
+    reg.locks_tick(t0 + 2 * 60_000);
+    assert!(
+        !lock_audit_actions(&reg, &g).contains(&"lock-expired".to_string()),
+        "the pause span is credited, not charged"
+    );
+    // …and the deadline still exists: past the credited window, it goes.
+    reg.locks_tick(t0 + 4 * 60_000);
+    assert!(
+        lock_audit_actions(&reg, &g).contains(&"lock-expired".to_string()),
+        "the credit shifts the deadline, it does not remove it"
+    );
+}
+
+/// The three refusals, at the dispatch gate: a lock you never took, a resource
+/// nobody declared, and a planner (whose pane closes the moment it reports, so
+/// a lock it took could only ever come back via the backstop).
+#[test]
+fn the_lock_tools_refuse_a_non_holder_an_undeclared_name_and_a_planner() {
+    let (reg, _d, g, c1, c2) = setup_locks("locks-refusals", BUILD_ONE_SLOT);
+
+    let (err, text) = lock_call(&reg, &c2, "release_lock", json!({ "name": "build" }));
+    assert!(err, "releasing a lock you never took must fail: {text}");
+    assert!(text.contains("do not hold"), "{text}");
+
+    let (err, text) = lock_call(&reg, &c1, "acquire_lock", json!({ "name": "buld" }));
+    assert!(err, "an undeclared resource must be refused, never created: {text}");
+    assert!(text.contains("build"), "the refusal names what IS declared: {text}");
+
+    let planner = reg.spawn_agent(&g, Role::Planner, "p", "plan", false, None).unwrap();
+    let cp = reg.resolve_token(&planner.token).unwrap();
+    let (err, text) = lock_call(&reg, &cp, "acquire_lock", json!({ "name": "build" }));
+    assert!(err, "a planner must be refused at dispatch, not merely unlisted: {text}");
+    assert!(!lock_tool_names(&reg, &cp).contains(&"acquire_lock".to_string()));
+}
+
+/// Re-asking is safe in both states — the property a worker relies on after a
+/// compact, when it cannot remember whether its own call landed.
+#[test]
+fn re_asking_never_extends_a_hold_or_costs_a_waiter_its_place() {
+    let (reg, _d, _g, c1, c2) = setup_locks("locks-idempotent", BUILD_ONE_SLOT);
+    lock_call(&reg, &c1, "acquire_lock", json!({ "name": "build" }));
+    let (err, text) = lock_call(&reg, &c1, "acquire_lock", json!({ "name": "build" }));
+    assert!(!err, "{text}");
+    assert!(text.contains("already hold"), "{text}");
+    assert!(text.contains("NOT extended"), "{text}");
+
+    lock_call(&reg, &c2, "acquire_lock", json!({ "name": "build" }));
+    let (err, text) = lock_call(&reg, &c2, "acquire_lock", json!({ "name": "build" }));
+    assert!(!err, "{text}");
+    assert!(
+        text.contains("position 1"),
+        "a re-ask keeps its place, never goes to the back: {text}"
+    );
+
+    let state = lock_json(&reg, &c1);
+    assert_eq!(state["resources"][0]["queue"].as_array().unwrap().len(), 1, "not queued twice");
+}
+
+/// A waiter that no longer needs the resource can leave, instead of being
+/// handed a slot it would then sit on for a full max-hold.
+#[test]
+fn a_waiter_can_withdraw_and_the_next_agent_moves_up() {
+    let (reg, _d, g, c1, c2) = setup_locks("locks-withdraw", BUILD_ONE_SLOT);
+    let w3 = reg.spawn_agent(&g, Role::Worker, "w3", "task", false, None).unwrap();
+    let c3 = reg.resolve_token(&w3.token).unwrap();
+    lock_call(&reg, &c1, "acquire_lock", json!({ "name": "build" }));
+    lock_call(&reg, &c2, "acquire_lock", json!({ "name": "build" }));
+    lock_call(&reg, &c3, "acquire_lock", json!({ "name": "build" }));
+
+    let (err, text) = lock_call(&reg, &c2, "release_lock", json!({ "name": "build" }));
+    assert!(!err, "{text}");
+    assert!(text.contains("withdrawn"), "{text}");
+
+    let (_, text) = lock_call(&reg, &c1, "release_lock", json!({ "name": "build" }));
+    assert!(text.contains(&c3.agent_id), "w3 moves up rather than waiting behind a ghost: {text}");
+}
+
+/// Group isolation, on the lock surface: one group's contention is invisible to
+/// another's, even on the same resource name.
+#[test]
+fn locks_are_scoped_to_one_group() {
+    let (reg, _d, _g, c1, _c2) = setup_locks("locks-iso-a", BUILD_ONE_SLOT);
+    let repo_b = repo_with_resources("locks-iso-b", BUILD_ONE_SLOT);
+    let gb = reg.create_group(repo_b.to_str().unwrap(), advanced_rails()).unwrap();
+    let wb = reg.spawn_agent(&gb.id, Role::Worker, "wb", "task", false, None).unwrap();
+    let cb = reg.resolve_token(&wb.token).unwrap();
+
+    lock_call(&reg, &c1, "acquire_lock", json!({ "name": "build" }));
+    // Same NAME, different group — and therefore a different lock.
+    let (err, text) = lock_call(&reg, &cb, "acquire_lock", json!({ "name": "build" }));
+    assert!(!err, "{text}");
+    assert!(text.contains("is YOURS"), "another group's hold must not queue this one: {text}");
+
+    let state = lock_json(&reg, &cb);
+    let holders = state["resources"][0]["holders"].as_array().unwrap();
+    assert_eq!(holders.len(), 1);
+    assert_eq!(holders[0]["agent"], json!(cb.agent_id));
+}
+
+/// With the advanced orchestrator OFF, `.loomux/workflow.yml` is not the
+/// group's config at all — so the resources it declares are not in force, and
+/// the lock surface is byte-for-byte what it was before this feature.
+#[test]
+fn a_non_advanced_group_gets_no_locks_even_from_a_repo_that_declares_them() {
+    let (reg, _d) = test_registry();
+    let repo = repo_with_resources("locks-basic", BUILD_ONE_SLOT);
+    let g = reg.create_group(repo.to_str().unwrap(), rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "task", false, None).unwrap();
+    let c = reg.resolve_token(&w.token).unwrap();
+
+    assert!(!lock_tool_names(&reg, &c).contains(&"acquire_lock".to_string()));
+    let (err, text) = lock_call(&reg, &c, "acquire_lock", json!({ "name": "build" }));
+    assert!(err, "{text}");
+    assert!(text.contains("declares no lock resources"), "{text}");
+}

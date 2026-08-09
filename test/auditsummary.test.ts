@@ -220,3 +220,54 @@ test("pause-race-nudge reads as a race the admission caught", () => {
   assert.match(s, /5690/);
   assert.match(s, /42/, "and the delivery id, so it joins to delivery-queued");
 });
+
+// #858: the lock lifecycle. Every one of these would fall to the raw-JSON
+// default arm without a case, and the audit log is where "why did that build
+// take 40 minutes" gets answered after the fact — a JSON blob per line is not
+// an answer a human reads.
+test("the lock lifecycle reads as sentences, not as detail JSON", () => {
+  const taken = summarize(entry("lock-acquire", { resource: "build", note: "cargo test" }));
+  assert.match(taken, /took 'build'/);
+  assert.match(taken, /cargo test/, "the holder's own note is what makes a long hold legible");
+
+  assert.match(
+    summarize(entry("lock-queued", { resource: "build", position: 2 })),
+    /queued for 'build' at position 2/
+  );
+  assert.match(summarize(entry("lock-release", { resource: "build" })), /released 'build'/);
+
+  // loomux's own lines name the AGENT: the actor column reads "loomux", so the
+  // whole point of these is which agent lost or gained a slot.
+  const granted = summarize(
+    entry("lock-grant", { resource: "build", agent: "w-4", waited_ms: 5 * 60_000 }, "loomux")
+  );
+  assert.match(granted, /'build' → w-4/);
+  assert.match(granted, /waited 5 min/);
+
+  const expired = summarize(
+    entry("lock-expired", { resource: "build", agent: "w-3", held_ms: 45 * 60_000 }, "loomux")
+  );
+  assert.match(expired, /reclaimed from w-3/);
+  assert.match(expired, /held 45 min/);
+  assert.match(expired, /past its max hold/, "an overrun must not read like a crash");
+
+  const dead = summarize(
+    entry("lock-reclaim", { resource: "build", agent: "w-3", held_ms: 60_000, why: "agent-gone" }, "loomux")
+  );
+  assert.match(dead, /its pane is gone/, "…and a crash must not read like an overrun");
+
+  assert.match(
+    summarize(entry("lock-wait-timeout", { resource: "build", agent: "w-5", waited_ms: 60 * 60_000 }, "loomux")),
+    /w-5 gave up waiting for 'build' after 60 min/
+  );
+});
+
+test("a lock duration rounds up, so a short hold never reads as zero", () => {
+  const s = summarize(entry("lock-expired", { resource: "b", agent: "w-1", held_ms: 40_000 }, "loomux"));
+  assert.match(s, /held 1 min/, "0 min would read as a bug in the mechanism, not a short hold");
+});
+
+test("a truncated lock record degrades to '?', never to NaN", () => {
+  const s = summarize(entry("lock-grant", { resource: "build", agent: "w-4" }, "loomux"));
+  assert.match(s, /waited \? min/);
+});

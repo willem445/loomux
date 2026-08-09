@@ -973,6 +973,50 @@ export interface GroupWatch {
 export const groupWatches = (groupId: string): Promise<GroupWatch[]> =>
   invoke<GroupWatch[]>("orch_group_watches", { groupId });
 
+// ---------- lock resources (#858): the group view's lock chrome ----------
+
+/** One agent holding one slot of a declared resource. */
+export interface LockHolder {
+  agent: string;
+  /** The holder's own label for what it's doing (may be empty). */
+  note: string;
+  acquired_ms: number;
+  /** When loomux reclaims it if it isn't released first. */
+  expires_ms: number;
+}
+
+/** One agent waiting in a resource's FIFO queue. */
+export interface LockWaiter {
+  agent: string;
+  note: string;
+  queued_ms: number;
+  /** When this agent gives up waiting and leaves the queue. */
+  expires_ms: number;
+}
+
+/** One resource the repo declares under `resources:` in `.loomux/workflow.yml`. */
+export interface LockResource {
+  name: string;
+  slots: number;
+  max_hold_minutes: number;
+  holders: LockHolder[];
+  /** In queue order — index 0 is next to be granted. */
+  queue: LockWaiter[];
+}
+
+export interface LockState {
+  now_ms: number;
+  resources: LockResource[];
+}
+
+/** Live lock state for a group — the SAME payload the `list_locks` MCP tool
+ *  returns, so the human's chrome and the agents' reads can never disagree.
+ *  Never throws: a group with no declared resources (or a backend that can't
+ *  answer) reads as an empty list, and the panel hides the row rather than
+ *  losing every other field to one rejected promise. */
+export const lockState = (groupId: string): Promise<LockState> =>
+  invoke<LockState>("orch_lock_state", { groupId }).catch(() => ({ now_ms: Date.now(), resources: [] }));
+
 // ---------- group lifecycle: summary + end-orchestration (#8) ----------
 
 /** One live agent in a group lifecycle summary. */

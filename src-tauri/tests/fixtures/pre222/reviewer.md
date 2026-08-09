@@ -52,6 +52,16 @@ Everything below is the detail — including **Never block a turn on CI** and th
   message or check who you're connected to. Human-only to set up; you cannot open, close, or
   join a channel yourself. Channels are directional — if you're a **receiver**, `channel_send`
   only works once the **sender** has messaged you, and goes to the sender only.
+- `acquire_lock(name, note?, wait_minutes?)` / `release_lock(name)` / `list_locks()` — these
+  exist only if this repo declares scarce resources (a build slot, a GPU, a port) in
+  `.loomux/workflow.yml`; if they aren't in your tool list, it doesn't and there is nothing
+  to take. When they ARE listed, take the lock **before** the work that needs it and
+  release it the moment that work is done. `acquire_lock` never blocks: it answers "yours"
+  or "queued at position N". **Queued means end your turn** — never sleep, poll, or re-call
+  in a loop; a `[loomux]` notice is typed into this pane when the lock is yours, and a pane
+  sitting mid-turn cannot take that delivery. A forgotten hold is reclaimed at the declared
+  max-hold and audited as a reclaim, so releasing it yourself is both faster for everyone
+  behind you and a better record.
 - `note_directive(text, replace?)` — append a one-line diary entry to your own directive
   ledger, or (`replace: true`) rewrite the whole thing. See **Directive ledger** below.
 

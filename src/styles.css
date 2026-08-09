@@ -2470,6 +2470,26 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   padding: 5px 8px;
 }
 
+/* -- lock resources (#858) -- one row per declared resource: who holds it and
+   how deep the queue behind it is. Same density and the same overlay as the
+   merge-queue row above; nothing here resizes anything (constraint 1). Hidden
+   outright for a repo that declares no `resources:`. */
+.group-lock-row {
+  display: flex; flex-direction: column; gap: 3px; flex: none;
+  padding: 6px 12px; border-bottom: 1px solid var(--border-soft);
+}
+.group-lock-row[hidden] { display: none; }
+.group-lock-line { color: var(--text-dim); font-size: 11px; line-height: 1.4; }
+.group-lock-entries { display: flex; flex-direction: column; gap: 2px; }
+.group-lock-entry { font-size: 10.5px; line-height: 1.4; color: var(--text-dim); }
+.group-lock-entry.held { color: var(--text); }
+/* Amber = somebody is waiting on this — the panel's existing "needs your
+   attention" tone (.group-compaction-line, .pane-attn). */
+.group-lock-entry.waiting { color: #f2c66a; }
+/* Loud only for an imminent reclaim: the state is about to change on its own,
+   and a build that thinks it is still serialized is about to stop being. */
+.group-lock-entry.urgent { color: #f7768e; }
+
 /* -- autonomous mode (#83) -- two dense rows, matching the max-agents row. */
 .group-autorow {
   display: flex; flex-direction: column; gap: 6px; flex: none;

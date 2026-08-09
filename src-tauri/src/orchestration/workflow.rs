@@ -2434,6 +2434,15 @@ mod tests {
                 gates: _,
                 intake: _,
                 merge_queue: _,
+                // #858. Confirmed against the rule above before being named
+                // here: `resources:` is a map of names to two NUMBERS
+                // (`RawResource` — `slots`, `max_hold_minutes`, and
+                // `deny_unknown_fields`). It names no branch, no reviewer, no
+                // program and no agent, and nothing in the merge/release path
+                // reads it — so there is no spelling of this block that can
+                // weaken the human gate. What it CAN do is make an agent wait,
+                // which is the whole of its restrict-only contract.
+                resources: _,
             } = v;
         }
         fn raw_intake_fields(v: RawIntake) {
