@@ -38,6 +38,7 @@ import {
   steerBoxHeight,
 } from "./steer";
 import { createOrderedWriter } from "./ptywrite";
+import { hintXtermSyncParse } from "./xtermreach";
 import { createHumanOriginLatch } from "./humanorigin";
 import { decideFlush, WOKEN, MAX_PENDING_BYTES } from "./panethrottle";
 import { sharedVisibility } from "./pollgate";
@@ -1471,7 +1472,30 @@ export class Pane implements VoiceTargetPane {
     // schedules a parse task when it was empty, so these N pushes cost one
     // parse task and one render pass between them — the same as a single write,
     // without copying every byte a second time to get there.
-    for (const chunk of chunks) this.term.write(chunk);
+    //
+    // #813 residual — the half of the deferral `decideFlush` cannot see.
+    // Flushing is the loomux side; each `Terminal.write` still lands in
+    // `WriteBuffer.write`, which schedules its parse on a `setTimeout` unless a
+    // keystroke set `_didUserInput` first. A hidden document clamps that timer
+    // exactly as it clamps the one `decideFlush` removed, so the terminal's
+    // auto-replies (DA/DSR/OSC-colour/XTVERSION answers, DEC-1004 focus
+    // reports — emitted only when the query is PARSED) stay stalled in front
+    // of the one path out of xterm that is not display, and an agent CLI
+    // waiting on one of them waits on our timer. A workstation lock is hidden
+    // for its whole duration, which is #813's window. While hidden, re-arm
+    // xterm's own fast path per chunk so the FIRST chunk of a quiet pane is
+    // parsed — and its reply emitted back down the pty — in this same call,
+    // with no clamped timer in series. Best-effort beyond that: the fast path
+    // only engages while the write buffer is empty, and `_innerWrite` still
+    // yields at its 12ms write timeout and reschedules via `setTimeout`
+    // (clamped again), so a busy pane under lock can outlast it; the next full
+    // repaint re-parses. Visible, the timer path is fine (nothing is clamped)
+    // and forcing sync parses would only cost the render thread.
+    const syncParse = !sharedVisibility().visible();
+    for (const chunk of chunks) {
+      if (syncParse) hintXtermSyncParse(this.term);
+      this.term.write(chunk);
+    }
   }
 
   /** Throw held output away and return the pane to quiet (#720). The ONLY
