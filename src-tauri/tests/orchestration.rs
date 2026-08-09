@@ -44954,19 +44954,55 @@ fn a_two_slot_resource_admits_two_holders_through_the_wired_path() {
     assert!(desc.contains("'gpu' (2 slots, max hold 45 min)"), "{desc}");
 }
 
-/// Ending a group drops its lock table rather than leaving an entry the sweep
-/// iterates for the rest of the process's life (rev-lead, PR #859 finding 8).
+/// **Ending a group releases every lock its agents held, and records it.**
+///
+/// The first cut of this test asserted that `locks_tick` no longer names the
+/// ended group — which cannot fail (rev-lead, round 2): `end_group` marks every
+/// member dead first, so `cleanup_agent_locks` has already emptied the table by
+/// the time the removal line runs, and a sweep over an empty table returns an
+/// empty `Sweep` and is never pushed onto `acted`. Deleting the removal line
+/// left it green.
+///
+/// So this pins the property that IS observable and DOES redden: the audit
+/// record. `lock-reclaim` is written by `cleanup_agent_locks` on the way
+/// through `mark_dead`, and it is durable — remove that call and this test
+/// fails, which is the regression worth catching, because a group whose agents
+/// exit without their holds being released is the stranded-slot case the whole
+/// reclaim design exists to prevent.
+///
+/// **What this deliberately does NOT pin, and why.** The `self.locks` entry
+/// removal itself (finding 8) is invisible from every public surface: `locks`
+/// is private, `lock_state` re-creates the entry through `or_default()` before
+/// it can report on it, and `locks_tick` returns only the groups it *acted on*,
+/// which an empty table never is. Pinning it needs a `#[doc(hidden)] pub`
+/// accessor on `OrchRegistry` — product code, which this round is not touching
+/// (the human is demoing from this branch). Named here rather than left as a
+/// silent gap: that one line ships untested, and the accessor is the follow-up.
 #[test]
-fn ending_a_group_drops_its_lock_table() {
-    let (reg, _d, g, c1, _c2) = setup_locks("locks-endgroup", BUILD_ONE_SLOT);
+fn ending_a_group_releases_and_records_the_locks_its_agents_held() {
+    let (reg, _d, g, c1, c2) = setup_locks("locks-endgroup", BUILD_ONE_SLOT);
     lock_call(&reg, &c1, "acquire_lock", json!({ "name": "build" }));
-    assert!(!reg.lock_state(&g)["resources"].as_array().unwrap().is_empty(), "precondition");
+    lock_call(&reg, &c2, "acquire_lock", json!({ "name": "build" }));
+    assert_eq!(
+        lock_json(&reg, &c1)["resources"][0]["holders"][0]["agent"],
+        json!(c1.agent_id),
+        "precondition: w-1 holds it and w-2 is queued behind"
+    );
 
     reg.end_group(&g, false).unwrap();
 
-    // Nothing left to sweep: the tick must not even see this group.
+    let reclaims: Vec<Value> = reg
+        .audit_log(&g)
+        .into_iter()
+        .filter(|e| e.action == "lock-reclaim" || e.action == "lock-wait-cleanup")
+        .map(|e| e.detail)
+        .collect();
     assert!(
-        !reg.locks_tick(now_ms() + 60 * 60_000).contains(&g),
-        "an ended group's table is gone, not merely empty"
+        reclaims.iter().any(|d| d["agent"] == json!(c1.agent_id) && d["why"] == json!("agent-gone")),
+        "the holder's lock must be released and recorded on the way out: {reclaims:?}"
+    );
+    assert!(
+        reclaims.iter().any(|d| d["agent"] == json!(c2.agent_id)),
+        "…and so must the queued request behind it: {reclaims:?}"
     );
 }
