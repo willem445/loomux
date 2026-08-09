@@ -2487,6 +2487,18 @@ const ATTENTION_INTERVAL: Duration = Duration::from_secs(3);
 /// all — so it is here to share one cadence to reason about rather than because
 /// it needs slowing down.
 const STRANDED_JANITOR_EVERY_N_TICKS: u64 = 10;
+/// #814: how stale the delivery-queue badge's own suppression may get before it
+/// re-pushes anyway — the independent release for
+/// [`OrchRegistry::queue_depth_push`]'s skip (`performance.md` §2 P4).
+///
+/// 30s, i.e. every tenth attention tick, chosen the way
+/// [`STRANDED_JANITOR_EVERY_N_TICKS`] was: the skip's signal is a memory of an
+/// emit, not an acknowledgement of one, so a webview that reloaded (or an emit
+/// that never landed) wears no badge and nothing in the reading will change to
+/// correct it — least of all on a queue stalled for an hour, whose coarsened
+/// reading is deliberately stable. Bounding the suppression costs at most two
+/// emits a minute while anything is queued, and nothing at all when nothing is.
+const QUEUE_DEPTH_REPUSH_MS: u64 = 30_000;
 /// A pane's terminal output must be stable (unchanged) at least this long
 /// before an idle-with-prompt is asserted — the CLI has stopped painting and
 /// is genuinely parked on a prompt, not mid-render. Measured across ticks, so
@@ -10313,7 +10325,13 @@ pub struct OrchRegistry {
     ///
     /// Empty at rest — which is also the common case, and why an idle app emits
     /// nothing on this stream at all rather than a per-tick "still nothing".
-    queue_depth_emitted: Arc<Mutex<Vec<queue::QueueDepthItem>>>,
+    ///
+    /// Carries WHEN that push happened alongside it, which is what makes the
+    /// skip releasable: see [`OrchRegistry::queue_depth_push`] and
+    /// [`QUEUE_DEPTH_REPUSH_MS`] for why a suppression that only ever ends when
+    /// the reading changes would strand a badge on precisely the stalled pane
+    /// the badge is for.
+    queue_depth_emitted: Arc<Mutex<(Vec<queue::QueueDepthItem>, u64)>>,
     /// #539: unconfirmed-delivery alarms buffered for one coalesced notice
     /// per pane, keyed by `(group, agent_id, eaten)` and holding each buffered
     /// delivery's id (its `submit_sent_ms`) in the order they were raised.
@@ -22608,7 +22626,7 @@ impl OrchRegistry {
             queue_still_notified: Arc::new(Mutex::new(HashSet::new())),
             hold_episodes: Arc::new(Mutex::new(HashMap::new())),
             queue_pressure: Arc::new(Mutex::new(HashMap::new())),
-            queue_depth_emitted: Arc::new(Mutex::new(Vec::new())),
+            queue_depth_emitted: Arc::new(Mutex::new((Vec::new(), 0))),
             unconfirmed_pending: Arc::new(Mutex::new(HashMap::new())),
             orch_notice_inbox: Arc::new(Mutex::new(HashMap::new())),
             tasks_lock: Mutex::new(()),
@@ -40281,48 +40299,47 @@ impl OrchRegistry {
     /// #814: every pane with something queued right now, as the header badge
     /// shows it — the payload of `orch-queue-depth`.
     ///
-    /// **INV-5 (leaf locks).** Three uncontended map locks, each taken and
-    /// released in turn, never nested: the queue map is snapshotted to
-    /// `(pty, depth, oldest, front agent)` tuples and released BEFORE
-    /// `hold_episode_since` and `by_pty` are consulted. That order matters
-    /// because `hold_episodes` is written from the drainer poll while it holds
-    /// nothing else — nesting the other way round would put a delivery path
-    /// behind this read. The queue entries themselves are never cloned: what a
-    /// badge needs from an 8-entry deque is a count and a minimum, so the loop
-    /// takes exactly that under the lock and the payloads stay where they are
-    /// (P3, "read the tail you need").
+    /// **INV-5 (leaf locks).** Two uncontended map locks, taken and released in
+    /// turn, never nested: the queue map is snapshotted to
+    /// `(pty, depth, oldest, target)` tuples and released BEFORE
+    /// `hold_episode_since` is consulted. That order matters because
+    /// `hold_episodes` is written from the drainer poll while it holds nothing
+    /// else — nesting the other way round would put a delivery path behind this
+    /// read. The queue entries themselves are never cloned: what a badge needs
+    /// from an 8-entry deque is a count, a minimum and one id, so the loop takes
+    /// exactly that under the lock and the payloads stay where they are (P3,
+    /// "read the tail you need").
+    ///
+    /// **The target comes from the queue, and nothing else is consulted for it.**
+    /// `note_queue_capacity` needs a three-term resolution (front entry, then
+    /// remembered pressure, then `by_pty`) because it also runs on the pop that
+    /// EMPTIED the queue, when no entry is left to ask. This never does: an item
+    /// exists only while the queue is non-empty, so the front entry is always
+    /// there, and a `by_pty` fallback here would be unreachable code plus a map
+    /// clone per tick for a case that cannot arise.
     ///
     /// Sorted by pty so a set that has not changed compares equal to the last
     /// one pushed — [`Self::queue_depth_push`]'s skip depends on it, and a
     /// `HashMap` iteration order does not.
     #[doc(hidden)] // pub for integration tests
     pub fn queue_depth_snapshot(&self, now_ms: u64) -> Vec<queue::QueueDepthItem> {
-        // (pty, depth, oldest stamp, the front entry's target) — everything a
-        // badge needs and nothing else. The payloads stay in the map.
-        let panes: Vec<(u32, usize, u64, Option<String>)> = {
+        // (pty, depth, oldest stamp, whose pane it is) — everything a badge
+        // needs and nothing else. The payloads stay in the map.
+        let panes: Vec<(u32, usize, u64, String)> = {
             let queues = self.queues.read();
             queues
                 .iter()
                 .filter_map(|(&pty, q)| {
+                    let front = q.front()?;
                     let oldest = queue::oldest_enqueued_ms(q)?;
-                    Some((pty, q.len(), oldest, q.front().map(|e| e.agent_id.clone())))
+                    // `agent_id` is who the entry is queued FOR, not who sent it.
+                    Some((pty, q.len(), oldest, front.agent_id.clone()))
                 })
                 .collect()
         };
-        if panes.is_empty() {
-            return Vec::new();
-        }
-        let by_pty = self.by_pty.lock_safe().clone();
         let mut items: Vec<queue::QueueDepthItem> = panes
             .into_iter()
-            .filter_map(|(pty, depth, oldest, front_agent)| {
-                // The front entry names who the queue is FOR (`agent_id` is the
-                // target, not the sender), and `by_pty` covers a pane whose
-                // queue outlived its agent record. The same resolution order
-                // `note_queue_capacity` uses, minus its remembered-pressure
-                // term: an item exists only while the queue is non-empty, so
-                // there is always an entry to ask.
-                let agent = front_agent.or_else(|| by_pty.get(&pty).cloned()).unwrap_or_default();
+            .filter_map(|(pty, depth, oldest, agent)| {
                 queue::queue_depth_item(
                     pty,
                     &agent,
@@ -40351,14 +40368,30 @@ impl OrchRegistry {
     /// wait ticks over (`queue::coarsen_waiting_ms`), or when a pane crosses the
     /// stalled threshold. An app with nothing queued — the ordinary state —
     /// emits nothing at all.
+    ///
+    /// **And the skip is itself bounded, because a suppression driven by a
+    /// fallible signal owes an independent release** (`performance.md` §2 P4).
+    /// The signal here is "the webview already has this set", and it is a
+    /// memory of an emit rather than an acknowledgement of one: a webview that
+    /// reloaded, or an emit that never landed, leaves this map remembering a
+    /// badge nobody is wearing. On a *changing* queue that self-corrects within
+    /// a second; on the case that matters most — a queue stalled for an hour,
+    /// whose coarsened reading is deliberately stable — it would never correct
+    /// at all, and the pane the badge exists for would silently have none. So a
+    /// non-empty set is re-pushed unconditionally every
+    /// [`QUEUE_DEPTH_REPUSH_MS`], which caps the staleness at that window and
+    /// costs, at worst, two emits a minute while anything is queued. An EMPTY
+    /// set is not re-pushed: it paints no badge, so a webview that missed it has
+    /// nothing to be wrong about — which is what keeps an idle app at zero.
     #[doc(hidden)] // pub for integration tests
     pub fn queue_depth_push(&self, now_ms: u64) -> Option<Vec<queue::QueueDepthItem>> {
         let items = self.queue_depth_snapshot(now_ms);
         let mut last = self.queue_depth_emitted.lock_safe();
-        if *last == items {
+        let stale = now_ms.saturating_sub(last.1) >= QUEUE_DEPTH_REPUSH_MS;
+        if last.0 == items && !(stale && !items.is_empty()) {
             return None;
         }
-        *last = items.clone();
+        *last = (items.clone(), now_ms);
         Some(items)
     }
 
@@ -43015,7 +43048,10 @@ pub fn start_max_notice_flusher(reg: Arc<OrchRegistry>) {
 /// 3. **Emit.** At most one event per tick, and only when the coarsened reading
 ///    actually differs from the last one pushed
 ///    (`OrchRegistry::queue_depth_push`, `queue::coarsen_waiting_ms`) — so a pane
-///    stuck for an hour costs about one emit a minute, not one every 3s.
+///    stuck for an hour costs about one emit a minute, not one every 3s — plus
+///    one unconditional re-push of a non-empty set every `QUEUE_DEPTH_REPUSH_MS`,
+///    which is that suppression's independent release rather than a cadence of
+///    its own.
 pub fn start_attention(reg: Arc<OrchRegistry>) {
     std::thread::spawn(move || {
         let mut tick: u64 = 0;

@@ -8521,6 +8521,17 @@ emit a minute instead of one every 3 s. Flooring, never rounding — a badge may
 never overstate it. The set is sorted by pty for the same reason: `HashMap` iteration order would
 make an unchanged reading compare unequal and the skip would never fire.
 
+**And the skip is bounded, because its signal is fallible** (INV-6, `performance.md` §2 P4). What the
+skip consults is loomux's *memory of having emitted*, not an acknowledgement that the webview
+received anything — so a reloaded webview, or an emit that never landed, leaves the registry
+believing a badge is on screen when none is. On a changing queue that self-corrects within a second;
+on a queue stalled for an hour it would never correct at all, because the coarsened reading is
+deliberately stable — the pane the badge exists for would be the one pane without one. So a non-empty
+set is re-pushed unconditionally every `QUEUE_DEPTH_REPUSH_MS` (30 s, every tenth tick), which caps
+the staleness and costs at most two emits a minute while anything is queued. An empty set is *not*
+re-pushed: it paints no badge, so a webview that missed it has nothing to be wrong about — which is
+what keeps an idle app at exactly zero events rather than on a slow cadence.
+
 **Absence is how a badge clears.** The push carries the FULL set of panes that have something
 queued, so a pane missing from it has an empty queue. There is no paired "cleared" event to lose,
 and a dropped push self-corrects on the next one — the same shape `orch-attention` uses, and the

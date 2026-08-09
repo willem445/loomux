@@ -28797,6 +28797,46 @@ fn queue_depth_push_emits_only_when_the_reading_the_human_would_see_changed() {
          skipping this push would leave a dead badge on screen forever"
     );
     assert!(reg.queue_depth_push(queued_at + 1_100).is_none(), "then quiet again");
+    assert!(
+        reg.queue_depth_push(queued_at + 10 * 60 * 1_000).is_none(),
+        "and an EMPTY set is never re-pushed on the heal window below — it paints no badge, so a \
+         webview that missed it has nothing to be wrong about, and re-pushing would put an idle \
+         app back on a cadence"
+    );
+}
+
+#[test]
+fn the_queue_badge_skip_releases_itself_rather_than_waiting_for_the_reading_to_change() {
+    // The independent release (performance.md §2 P4), and the defect it fixes is
+    // specific: the skip's signal is a MEMORY of an emit, not an acknowledgement
+    // of one. A webview that reloaded — or an emit that never landed — wears no
+    // badge, and on a queue stalled for an hour the coarsened reading is
+    // deliberately stable, so nothing would ever change to correct it. The pane
+    // the badge exists for would be the one pane with no badge.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 314u32;
+
+    reg.enqueue_text(&g.id, &w.id, "loomux", "one", pty, queue::EnqueueReason::Arrival).unwrap();
+    let queued_at = reg.queue_snapshot(pty)[0].enqueued_ms;
+    // An hour in, where the coarsening has made two ticks 3 s apart identical —
+    // exactly the state an unbounded skip goes silent in.
+    let hour = queued_at + 3_600_000;
+    let first = reg.queue_depth_push(hour).expect("the reading itself changed, so this pushes");
+    assert!(first[0].stalled);
+    assert!(reg.queue_depth_push(hour + 3_000).is_none(), "3 s later nothing visible has changed");
+    assert!(reg.queue_depth_push(hour + 6_000).is_none(), "…nor 6 s later");
+
+    let healed = reg
+        .queue_depth_push(hour + 30_000)
+        .expect("but the suppression must release on its own window, not on the reading changing");
+    assert_eq!(
+        healed, first,
+        "and it re-pushes the SAME reading — this is a re-assertion for a webview that may have \
+         missed it, not a new fact"
+    );
+    assert!(reg.queue_depth_push(hour + 32_000).is_none(), "then quiet again until the next window");
 }
 
 #[test]
