@@ -516,12 +516,26 @@ resources:
     slots: 1              # how many agents may hold it at once — 1 is a mutex
     max_hold_minutes: 45  # loomux takes it back after this, whatever happens
   gpu:
-    slots: 2
+    slots: 2              # omitting max_hold_minutes means the default, 30
 ```
 
 What a resource *means* is entirely yours — loomux never learns that `build` is a compiler.
 It knows the name, the slot count and the clock. Declare nothing and the feature is off:
 the agents in that group are not even offered the tools.
+
+**Both settings are optional, and the defaults are not what the example above shows.** Omit
+`slots` and you get **1**; omit `max_hold_minutes` and you get **30**, not the 45 written out in
+the example. A name may use letters, digits, `-` and `_` (up to 48 characters) — anything else is
+rejected rather than quietly rewritten, so the name you type is the name your agents call.
+
+**A value out of range fails the whole file, on purpose.** `slots: 0` or above 64,
+`max_hold_minutes: 0` or above 480, a name with an illegal character, an unrecognized key inside a
+resource, or more than 32 resources are all **hard errors that stop `.loomux/workflow.yml` from
+loading at all** — taking your roster and merge gate down with them, and the launcher will show you
+why. That is deliberate: a repo that wrote `slots: 0` believes its builds are serialized, and
+quietly substituting a default would leave that belief in place while the behaviour changed
+underneath it. If your workflow file suddenly stops loading after you add a `resources:` block,
+this is the first thing to check.
 
 **What the agents get.** Three tools, and only in a group whose repo declares resources:
 `acquire_lock(name, note?, wait_minutes?)`, `release_lock(name)`, and `list_locks()`. The
@@ -545,9 +559,14 @@ queued to withdraw, so nobody sits behind a slot it no longer wants.
 pane dies (loomux reclaims it immediately and hands it to whoever is next), or the hold runs
 past `max_hold_minutes` (loomux reclaims it and tells the ex-holder its work is no longer
 serialized, so it can re-acquire). There is no state in which a resource is stuck forever
-because an agent forgot. Pausing a group freezes all of it — no expiry, no reclaim, no
-hand-off — and the paused span is credited back, so a long pause never costs a running build
-its lock.
+because an agent forgot.
+
+Pausing a group freezes the **clocks**: nothing expires, nothing times out, and the paused span is
+credited back afterwards, so a long pause never costs a running build its lock. It does not freeze
+*you* — killing a holder's pane while the group is paused still reclaims that lock and still hands
+it to whoever is next, because that is your deliberate action rather than a timer firing. (The
+notice telling the new holder sits in its pane's queue until you resume, like every other delivery
+to a paused group.)
 
 **Where you see it.** The group lifecycle panel (`Alt+O`) grows a lock section: one line per
 declared resource with how many slots are taken, who holds each (with the note it gave, e.g.

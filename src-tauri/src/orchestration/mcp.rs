@@ -431,7 +431,7 @@ fn tool_defs(
                         This repo declares: {menu}."),
                     json!({
                         "name": { "type": "string", "description": "The resource to lock — one of the names listed above. An unknown name is refused (with the list), never created on the fly." },
-                        "note": { "type": "string", "description": "Short label for what you are doing with it, shown to the human beside your pane and in the audit log, e.g. \"cargo test --locked\". Optional but worth it: it is what tells a human whether a 40-minute hold is progress or a hang." },
+                        "note": { "type": "string", "description": "Short label for what you are doing with it, e.g. \"cargo test --locked\". Optional but worth it: it is what tells a human whether a 40-minute hold is progress or a hang. It is shown to the human beside your pane, written to the audit log, AND returned to every agent in this group by list_locks — so treat it as a public label, not a private note. Whitespace is collapsed and it is capped at 200 characters." },
                         "wait_minutes": { "type": "integer", "description": "How long to keep your place in the queue if the lock is busy. Default 60, clamped to 5-240. On expiry you get a [loomux] notice and are dropped from the queue — you are never left waiting silently." },
                     }),
                     &["name"]),
@@ -604,18 +604,38 @@ fn require_orchestrator(caller: &Caller) -> Result<(), String> {
     }
 }
 
-/// The notification tools' gate (#243): denied to a planner. `tool_defs`'s
-/// role filter already keeps a planner from *seeing* these tools; this is the
-/// real check — the listing is cosmetic, not security (a planner could still
-/// try the call name directly).
-fn require_not_planner(caller: &Caller) -> Result<(), String> {
-    if caller.role == Role::Planner {
-        Err("permission denied: planners cannot register notifications — a planner's pane \
-             closes the moment it reports done (#203), and a watch that outlives its owner \
-             is garbage".into())
-    } else {
-        Ok(())
+/// What a planner is being refused, so the refusal can say why in ITS terms.
+/// #203's argument — a planner's pane closes the moment it reports `done` — has
+/// a different consequence for each family, and a planner told "you cannot
+/// register notifications" when it asked for a lock learns nothing (rev-lead,
+/// PR #859 finding 4).
+#[derive(Clone, Copy)]
+enum PlannerDenied {
+    /// `notify_when` / `list_notifications` / `cancel_notification`,
+    /// `channel_send` / `channel_status` (#243/#271).
+    Notifications,
+    /// `acquire_lock` / `release_lock` / `list_locks` (#858).
+    Locks,
+}
+
+/// The planner gate. `tool_defs`'s role filter already keeps a planner from
+/// *seeing* these tools; this is the real check — the listing is cosmetic, not
+/// security (a planner could still try the call name directly).
+fn require_not_planner(caller: &Caller, denied: PlannerDenied) -> Result<(), String> {
+    if caller.role != Role::Planner {
+        return Ok(());
     }
+    Err(match denied {
+        PlannerDenied::Notifications => "permission denied: planners cannot register \
+             notifications — a planner's pane closes the moment it reports done (#203), and a \
+             watch that outlives its owner is garbage"
+            .into(),
+        PlannerDenied::Locks => "permission denied: planners cannot take or read locks — a \
+             planner's pane closes the moment it reports done (#203), so a lock it held could \
+             only ever come back through the reclaim backstop, with everyone else queued behind \
+             it in the meantime. A planner explores read-only; it should need no scarce resource"
+            .into(),
+    })
 }
 
 /// Which capability classes the #338/#359 dedicated-workspace guards apply
@@ -1331,7 +1351,7 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
         }
 
         "notify_when" => {
-            require_not_planner(caller)?;
+            require_not_planner(caller, PlannerDenied::Notifications)?;
             let kind = arg_str(args, "kind").ok_or("kind required")?;
             let condition = match kind {
                 "pr_checks" => {
@@ -1394,7 +1414,7 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
         // this repo never declared is refused by the registry with the list of
         // ones it did.
         "acquire_lock" => {
-            require_not_planner(caller)?;
+            require_not_planner(caller, PlannerDenied::Locks)?;
             let name = arg_str(args, "name").ok_or("name required")?;
             let note = arg_str(args, "note").unwrap_or("");
             // Present-but-not-a-whole-number is REJECTED rather than silently
@@ -1414,29 +1434,40 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             reg.acquire_lock(&caller.group, &caller.agent_id, name, note, wait_minutes)
         }
         "release_lock" => {
-            require_not_planner(caller)?;
+            require_not_planner(caller, PlannerDenied::Locks)?;
             let name = arg_str(args, "name").ok_or("name required")?;
             reg.release_lock(&caller.group, &caller.agent_id, name)
         }
-        "list_locks" => Ok(reg.lock_state(&caller.group).to_string()),
+        "list_locks" => {
+            // Gated like the two mutating arms, not left bare: `list_locks` is
+            // read-only, but it returns every holder and waiter in the group,
+            // and the shared-tier read-only tool beside it (`list_notifications`)
+            // gates for the same #203 reason. The alternative — leaving the arm
+            // open and rewriting the four surfaces that promise a gate — would
+            // have made the listing filter the only thing standing between a
+            // planner token and this data, which is exactly what those surfaces
+            // say the listing is NOT (rev-lead, PR #859 finding 1).
+            require_not_planner(caller, PlannerDenied::Locks)?;
+            Ok(reg.lock_state(&caller.group).to_string())
+        }
         "list_notifications" => {
-            require_not_planner(caller)?;
+            require_not_planner(caller, PlannerDenied::Notifications)?;
             Ok(reg.list_notifications(&caller.agent_id).to_string())
         }
         "cancel_notification" => {
-            require_not_planner(caller)?;
+            require_not_planner(caller, PlannerDenied::Notifications)?;
             let id = arg_str(args, "id").ok_or("id required")?;
             reg.cancel_notification(&caller.agent_id, id)?;
             Ok(format!("cancelled {id}"))
         }
 
         "channel_send" => {
-            require_not_planner(caller)?;
+            require_not_planner(caller, PlannerDenied::Notifications)?;
             let text = arg_str(args, "text").ok_or("text required")?;
             reg.channel_send(caller, text)
         }
         "channel_status" => {
-            require_not_planner(caller)?;
+            require_not_planner(caller, PlannerDenied::Notifications)?;
             Ok(reg.channel_status(caller).to_string())
         }
 

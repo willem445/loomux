@@ -165,3 +165,49 @@ test("lockSummary counts queued agents across every resource, not just one", () 
 test("lockSummary drops the queue clause entirely when nobody is waiting", () => {
   assert.equal(lockSummary([resource()]), "locks: 0 held across 1 resource");
 });
+
+// ---------- gaps rev-lead confirmed by mutation (PR #859 finding 10) ----------
+
+test("lockSummary says '1 agent queued', not '1 agents queued'", () => {
+  // Every other queued fixture uses two waiters, so hardcoding the plural left
+  // all twelve original tests green while shipping "1 agents queued".
+  const line = lockSummary([
+    resource({
+      holders: [{ agent: "w-1", note: "", acquired_ms: NOW, expires_ms: NOW + MIN }],
+      queue: [{ agent: "w-2", note: "", queued_ms: NOW, expires_ms: NOW + MIN }],
+    }),
+  ]);
+  assert.equal(line, "locks: 1 held across 1 resource, 1 agent queued");
+});
+
+test("lockRows keeps the backend's order — the contract its own doc states", () => {
+  // Every other lockRows fixture is a single-element array, so reversing the
+  // map left all twelve green. Order is the contract because the backend sorts
+  // by name and a human scanning two panels expects the same sequence.
+  const rows = lockRows(
+    [resource({ name: "build" }), resource({ name: "gpu" }), resource({ name: "port-5173" })],
+    NOW
+  );
+  assert.deepEqual(
+    rows.map((r) => r.text.split(" ")[0]),
+    ["build", "gpu", "port-5173"]
+  );
+});
+
+test("a note is rendered verbatim — the backend is what normalizes it", () => {
+  // The whitespace collapse lives in `trim_note` (locks.rs) so the audit log
+  // and list_locks get it too; this pins that the view does not re-mangle what
+  // arrives, and that a note reaches both the row and its hover detail.
+  const [row] = lockRows(
+    [
+      resource({
+        holders: [
+          { agent: "w-3", note: "cargo test --locked", acquired_ms: NOW - MIN, expires_ms: NOW + MIN },
+        ],
+      }),
+    ],
+    NOW
+  );
+  assert.equal(row.text, "build 1/1 · w-3 (cargo test --locked) 1m");
+  assert.match(row.detail, /w-3 \(cargo test --locked\)/);
+});

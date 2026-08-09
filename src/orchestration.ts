@@ -1011,11 +1011,19 @@ export interface LockState {
 
 /** Live lock state for a group — the SAME payload the `list_locks` MCP tool
  *  returns, so the human's chrome and the agents' reads can never disagree.
- *  Never throws: a group with no declared resources (or a backend that can't
- *  answer) reads as an empty list, and the panel hides the row rather than
- *  losing every other field to one rejected promise. */
+ *
+ *  Never throws, because this rides the group panel's ten-call `Promise.all`
+ *  and one rejection there costs every other field on the panel. But a
+ *  rejection is WARNED, not swallowed: an empty list is how "this repo
+ *  declares no resources" is spelled, so without the warning a command that
+ *  fell out of a permission set — exactly what a rebase drops — would make the
+ *  whole feature silently cease to exist, indistinguishable from never having
+ *  been configured. (rev-lead, PR #859 finding 9.) */
 export const lockState = (groupId: string): Promise<LockState> =>
-  invoke<LockState>("orch_lock_state", { groupId }).catch(() => ({ now_ms: Date.now(), resources: [] }));
+  invoke<LockState>("orch_lock_state", { groupId }).catch((err) => {
+    console.warn("orch_lock_state failed — lock chrome hidden, which is NOT the same as no resources declared:", err);
+    return { now_ms: Date.now(), resources: [] };
+  });
 
 // ---------- group lifecycle: summary + end-orchestration (#8) ----------
 

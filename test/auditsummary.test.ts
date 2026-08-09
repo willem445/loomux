@@ -271,3 +271,46 @@ test("a truncated lock record degrades to '?', never to NaN", () => {
   const s = summarize(entry("lock-grant", { resource: "build", agent: "w-4" }, "loomux"));
   assert.match(s, /waited \? min/);
 });
+
+// #859 finding 10(c): the five arms the first cut added without asserting.
+// Each would have fallen through to the raw-JSON default unnoticed if its
+// label were misspelled — and the audit log is where a human reconstructs a
+// contention after the fact, so a JSON blob per line is not an answer.
+test("the idempotent and withdrawal lock actions read as sentences too", () => {
+  assert.match(
+    summarize(entry("lock-acquire-repeat", { resource: "build" })),
+    /already held 'build' \(no change\)/
+  );
+  assert.match(
+    summarize(entry("lock-queued-repeat", { resource: "build", position: 3 })),
+    /already queued for 'build' at position 3/
+  );
+  assert.match(
+    summarize(entry("lock-queue-cancel", { resource: "build", position: 2 })),
+    /withdrew from the 'build' queue \(was position 2\)/
+  );
+  assert.match(
+    summarize(entry("lock-wait-cleanup", { resource: "build", agent: "w-7", why: "agent-gone" }, "loomux")),
+    /w-7 left the 'build' queue — its pane is gone/
+  );
+  assert.match(
+    summarize(entry("lock-undeclared", { resource: "build", holders: ["w-1"], queued: [] }, "loomux")),
+    /'build' is no longer declared in \.loomux\/workflow\.yml/
+  );
+});
+
+test("every lock action has its own case — none falls through to raw JSON", () => {
+  // The default arm dumps compact detail JSON, so a misspelled label is silent.
+  // This is the cheap tripwire for that: a rendered sentence never starts with
+  // the `{` the fallback would produce.
+  const actions = [
+    "lock-acquire", "lock-acquire-repeat", "lock-queued", "lock-queued-repeat",
+    "lock-release", "lock-queue-cancel", "lock-grant", "lock-expired",
+    "lock-reclaim", "lock-wait-timeout", "lock-wait-cleanup", "lock-undeclared",
+  ];
+  for (const action of actions) {
+    const s = summarize(entry(action, { resource: "build", agent: "w-1", position: 1, held_ms: 60_000, waited_ms: 60_000 }, "loomux"));
+    assert.ok(s.length > 0, `${action} rendered nothing`);
+    assert.ok(!s.startsWith("{"), `${action} fell through to the raw-JSON default: ${s}`);
+  }
+});

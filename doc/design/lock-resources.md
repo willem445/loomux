@@ -152,11 +152,50 @@ would make every hand-off wait for a tick.
 30s cadence, same paused-group freeze, and no I/O of its own beyond the audit lines it writes.
 It takes `now` as a parameter, which is what makes expiry testable without waiting 45 minutes.
 
-**A paused group is frozen solid** — no expiry, no reclaim, no hand-off — and is credited the
-whole pause span on the tick that observes it unpaused. This is `notify_tick`'s TTL-freeze,
-applied to locks, and it needs its own `paused_locks_since` map rather than sharing the watches'
-one: two tick paths crediting the same map would charge one pause span twice. A pause is not a
-reason to take a running build's lock away.
+**A pause freezes the clocks, not the human.** `locks_tick` skips a paused group entirely — no
+expiry, no wait timeout, no hand-off driven by either — and credits it the pause span on the tick
+that observes it unpaused. This is `notify_tick`'s TTL-freeze, applied to locks, and it needs its
+own `paused_locks_since` map rather than sharing the watches' one: two tick paths crediting the
+same map would charge one pause span twice. A pause is not a reason to take a running build's lock
+away.
+
+**It does not freeze `mark_dead`, and that is the right asymmetry** — worth stating because the
+first draft of the user docs claimed otherwise (rev-lead, PR #859 finding 2). Killing a pane while
+a group is paused still reclaims that agent's holds and still promotes the queue. A timer firing
+during a pause is the thing a pause exists to suppress; a human clicking ✕ on a holder is a
+deliberate act whose whole point is that the slot comes back. The grant notice then waits in the
+new holder's pane queue until the group resumes, exactly like every other delivery to a paused
+group — so nothing is lost, it is only deferred.
+
+**The credit is clamped to what each entry actually lived through.** Panes keep running while a
+group is paused, so a lock taken *during* the pause never experienced the part of the span that
+elapsed before it existed. Unclamped, a hold granted a second before the resume would have its
+deadline pushed out by the entire pause — the generous direction, but a deadline nobody could
+predict from the config. `extend_deadlines` therefore credits
+`min(pause_span, now - acquired_ms)`, which is the same clamp, for the same reason, that rev-orch
+put on the watch TTLs in #247 ("B2").
+
+## The agent-authored `note`
+
+`acquire_lock` takes an optional `note` — a label for what the holder is doing, which is what lets
+a human tell a 40-minute hold that is progress from one that is a hang. It is the only
+agent-authored string in this feature, so it is worth being precise about where it goes: the audit
+log, `list_locks` (so **every other agent in the group reads it**, which the tool description now
+says), and the panel row plus its hover detail.
+
+It is **whitespace-collapsed and capped at 200 characters in `trim_note`**, at the engine boundary
+rather than per-renderer. The collapse is the load-bearing half: the panel's hover detail joins one
+line per holder and per waiter with `\n`, so a note that kept its own newlines could forge a queue
+entry that does not exist (`"build\n#1 in queue: w-9 — waiting 3h"`). Nothing executable is
+involved and every render path is `textContent`/`title`, but a field one agent writes and every
+other agent reads should not be able to invent structure in the surface that displays it. Doing it
+once at the boundary fixes the audit log and `list_locks` in the same stroke.
+
+The **resource name** is a separate question and is handled by the parser: `sanitize_id`'s
+letters/digits/`-`/`_` alphabet, reject-not-rewrite. That matters more than it looks, because the
+name *is* interpolated into the `[loomux]` notices typed into panes — the alphabet is what stops a
+repo-authored name from forging a prompt there. The `note` never reaches a pane-typed notice at
+all.
 
 ## Persistence: none, deliberately
 
@@ -213,7 +252,12 @@ reclaim is imminent) reuses the panel's existing colour vocabulary rather than i
 The three tools are taught in `templates/{orchestrator,worker,reviewer}.md` — but behind
 `{{LOCKS_ORCH}}` / `{{LOCKS}}`, substituted only when the group is advanced **and** the repo
 declares a non-empty `resources:`. `planner.md` gets nothing, because a planner is refused the
-tools.
+tools — **all three of them, at the dispatch gate**, not merely omitted from the listing.
+`list_locks` is read-only, but it returns every holder and waiter in the group, and the
+shared-tier read-only tool beside it (`list_notifications`) gates for the same #203 reason. The
+refusal names *locks* rather than watches: one gate, two answers (`PlannerDenied`), because #203's
+argument has a different consequence for each family and a planner told "you cannot register
+notifications" when it asked for a lock learns nothing about why.
 
 That conditionality is not tidiness. `the_default_rendering_never_names_the_gate_machinery`
 exists to catch prose naming a mechanism the reader does not have, and it caught this: the

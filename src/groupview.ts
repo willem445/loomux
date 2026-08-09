@@ -228,7 +228,7 @@ export class GroupView {
   private pollTimer: number | undefined;
   /** Window-visibility gate around that timer (#743 S6, pollgate.ts). Component
    *  scope (`show()`/`hide()`) and window visibility are different questions:
-   *  this panel was already scoped and still polled nine invokes every 2 s
+   *  this panel was already scoped and still polled ten invokes every 2 s
    *  behind a minimized window. */
   private pollGate: PollGate = new PollGate({
     arm: () => {
@@ -1231,24 +1231,17 @@ export class GroupView {
       : "Turn on workflow mode — arms this repo's declared merge gate and swaps future spawns to its roster";
   }
 
-  /** Merge-queue chrome (#581 slice F) — read-only, and every string comes
-   *  from `mergequeue.ts` (never re-derived here), the same split
-   *  `renderWorkflow` keeps with `workflowstatus.ts`.
-   *
-   *  The row is hidden in exactly ONE case: the group has no
-   *  `merge_queue.json`, which is the product default (design note §12) and
-   *  the only state where saying nothing is accurate. A queue that exists and
-   *  cannot be read renders LOUD instead — an unreadable queue and an empty
-   *  one are the same picture to a human, and this panel is where they'd be
-   *  confused.
-   *
-   *  A state or status word this build doesn't know makes the model THROW
-   *  (its rule 2). Caught here rather than left to `load()`'s toast: the
-   *  drift is worth one loud row that stays on screen, not a toast that
-   *  fades while the rest of the panel goes on looking fine. */
   /** The lock-resource section (#858). Hidden entirely for a repo that
    *  declares no `resources:` — the feature is invisible where it was never
-   *  asked for, matching the tool surface the agents get. */
+   *  asked for, matching the tool surface the agents get.
+   *
+   *  Note the deliberate contrast with `renderMergeQueue` below, which renders
+   *  LOUD rather than hiding when it cannot read its state: an unreadable
+   *  merge queue is a thing a human is about to make a merge decision on, and
+   *  an absent one is the product default. Here "no resources declared" IS the
+   *  product default and is the only state that hides the row; a read that
+   *  actually failed is reported by `lockState`'s own warning rather than
+   *  disguised as an empty list. */
   private renderLocks(): void {
     const resources = this.locks?.resources ?? [];
     const summary = lockSummary(resources);
@@ -1267,6 +1260,21 @@ export class GroupView {
     }
   }
 
+  /** Merge-queue chrome (#581 slice F) — read-only, and every string comes
+   *  from `mergequeue.ts` (never re-derived here), the same split
+   *  `renderWorkflow` keeps with `workflowstatus.ts`.
+   *
+   *  The row is hidden in exactly ONE case: the group has no
+   *  `merge_queue.json`, which is the product default (design note §12) and
+   *  the only state where saying nothing is accurate. A queue that exists and
+   *  cannot be read renders LOUD instead — an unreadable queue and an empty
+   *  one are the same picture to a human, and this panel is where they'd be
+   *  confused.
+   *
+   *  A state or status word this build doesn't know makes the model THROW
+   *  (its rule 2). Caught here rather than left to `load()`'s toast: the
+   *  drift is worth one loud row that stays on screen, not a toast that
+   *  fades while the rest of the panel goes on looking fine. */
   private renderMergeQueue(): void {
     const s = this.mergeQueueStatus;
     let view: MergeQueueView;

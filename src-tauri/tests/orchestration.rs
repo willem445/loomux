@@ -44590,12 +44590,16 @@ fn a_pause_does_not_expire_a_hold_the_pause_itself_froze() {
     );
 }
 
-/// The three refusals, at the dispatch gate: a lock you never took, a resource
-/// nobody declared, and a planner (whose pane closes the moment it reports, so
-/// a lock it took could only ever come back via the backstop).
+/// Two refusals at the dispatch gate: a lock you never took, and a resource
+/// nobody declared.
+///
+/// The planner refusal used to ride along here and no longer does — it now has
+/// its own test covering all three tools, because the plural in this one's
+/// former name was a coverage claim it did not make (rev-lead, PR #859
+/// finding 1). See `every_lock_tool_refuses_a_planner_and_says_why_in_lock_terms`.
 #[test]
-fn the_lock_tools_refuse_a_non_holder_an_undeclared_name_and_a_planner() {
-    let (reg, _d, g, c1, c2) = setup_locks("locks-refusals", BUILD_ONE_SLOT);
+fn the_lock_tools_refuse_a_non_holder_and_an_undeclared_name() {
+    let (reg, _d, _g, c1, c2) = setup_locks("locks-refusals", BUILD_ONE_SLOT);
 
     let (err, text) = lock_call(&reg, &c2, "release_lock", json!({ "name": "build" }));
     assert!(err, "releasing a lock you never took must fail: {text}");
@@ -44604,12 +44608,6 @@ fn the_lock_tools_refuse_a_non_holder_an_undeclared_name_and_a_planner() {
     let (err, text) = lock_call(&reg, &c1, "acquire_lock", json!({ "name": "buld" }));
     assert!(err, "an undeclared resource must be refused, never created: {text}");
     assert!(text.contains("build"), "the refusal names what IS declared: {text}");
-
-    let planner = reg.spawn_agent(&g, Role::Planner, "p", "plan", false, None).unwrap();
-    let cp = reg.resolve_token(&planner.token).unwrap();
-    let (err, text) = lock_call(&reg, &cp, "acquire_lock", json!({ "name": "build" }));
-    assert!(err, "a planner must be refused at dispatch, not merely unlisted: {text}");
-    assert!(!lock_tool_names(&reg, &cp).contains(&"acquire_lock".to_string()));
 }
 
 /// Re-asking is safe in both states — the property a worker relies on after a
@@ -44791,7 +44789,11 @@ fn the_lock_notes_reach_only_a_group_whose_repo_declares_resources() {
         assert!(text.contains(worker_marker), "{file} must carry the end-your-turn rule");
         assert!(!text.contains(orch_marker), "{file} must not carry the orchestrator's half");
     }
-    // A planner is refused these tools outright, so it is never told about them.
+    // planner.md is given neither fragment. That is a claim about the
+    // TEMPLATE only — the refusal itself is enforced at dispatch and pinned by
+    // `every_lock_tool_refuses_a_planner_and_says_why_in_lock_terms`, not here
+    // (rev-lead, PR #859 finding 1: this comment used to assert the refusal
+    // while testing the absence of a placeholder).
     assert!(!read(&reg, &g.id, "planner.md").contains("acquire_lock"));
 
     // A workflow with no `resources:` block: nothing, and no raw placeholder.
@@ -44814,4 +44816,157 @@ fn the_lock_notes_reach_only_a_group_whose_repo_declares_resources() {
         let text = read(&reg, &g.id, file);
         assert!(!text.contains("acquire_lock"), "{file}: toggle off means the block is not in force");
     }
+}
+
+/// **The sweep's only production seam.** `gh_poll_tick` is what makes holds and
+/// waits expire in the shipped app; every other lock test calls `locks_tick`
+/// directly, so deleting the call inside `gh_poll_tick` would leave all of them
+/// green while nothing but the `mark_dead` fast path ever reclaimed anything
+/// (rev-lead, PR #859 finding 3 — the lessons-file rule that a subsystem is not
+/// done until a production path calls it). Starts at `gh_poll_tick` for exactly
+/// the reason its merge-queue and intake siblings do.
+///
+/// No subprocess: this group is not autonomous, so the intake half returns at
+/// its no-due-groups guard before any `gh` call.
+#[test]
+fn the_gh_poll_tick_drives_the_lock_sweep() {
+    let (reg, _d, g, c1, c2) = setup_locks("locks-seam", BUILD_ONE_MINUTE);
+    lock_call(&reg, &c1, "acquire_lock", json!({ "name": "build" }));
+    lock_call(&reg, &c2, "acquire_lock", json!({ "name": "build" }));
+
+    // Two minutes on, past the declared one-minute max hold — reached through
+    // the wake the app actually runs, not through locks_tick.
+    reg.gh_poll_tick(now_ms() + 2 * 60_000, &HashMap::new());
+
+    assert!(
+        lock_audit_actions(&reg, &g).contains(&"lock-expired".to_string()),
+        "the poll tick must run the sweep: without that call nothing here expires"
+    );
+    let state = lock_json(&reg, &c2);
+    assert_eq!(
+        state["resources"][0]["holders"][0]["agent"],
+        json!(c2.agent_id),
+        "…and the queue must move on that same wake"
+    );
+}
+
+/// **All three lock tools refuse a planner, at the dispatch gate.** The plural
+/// in the older test's name was a coverage claim it did not make: it exercised
+/// `acquire_lock` alone, so `release_lock`'s check could have been deleted and
+/// `list_locks` had none at all while it stayed green (rev-lead, PR #859
+/// finding 1). This is the test that makes the claim true.
+#[test]
+fn every_lock_tool_refuses_a_planner_and_says_why_in_lock_terms() {
+    let (reg, _d, g, _c1, _c2) = setup_locks("locks-planner", BUILD_ONE_SLOT);
+    let planner = reg.spawn_agent(&g, Role::Planner, "p", "plan", false, None).unwrap();
+    let cp = reg.resolve_token(&planner.token).unwrap();
+
+    for (tool, args) in [
+        ("acquire_lock", json!({ "name": "build" })),
+        ("release_lock", json!({ "name": "build" })),
+        ("list_locks", json!({})),
+    ] {
+        let (err, text) = lock_call(&reg, &cp, tool, args);
+        assert!(err, "{tool} must refuse a planner at dispatch, not merely omit it from the listing");
+        // #859 finding 4: the refusal has to be about the thing the caller
+        // asked for. The shared gate used to answer every planner with the
+        // notification tools' reason, so a planner refused a LOCK was told
+        // about watches.
+        assert!(
+            text.contains("cannot take or read locks"),
+            "{tool}'s refusal must be in lock terms: {text}"
+        );
+        assert!(!text.contains("register notifications"), "{tool}: wrong family's reason: {text}");
+    }
+    // …and the cosmetic half stays cosmetic: a planner sees none of them.
+    let names = lock_tool_names(&reg, &cp);
+    for tool in ["acquire_lock", "release_lock", "list_locks"] {
+        assert!(!names.contains(&tool.to_string()), "a planner must not be offered {tool}");
+    }
+    // The notification family keeps its own reason — one gate, two answers.
+    let (err, text) = lock_call(&reg, &cp, "notify_when", json!({ "kind": "pr_checks", "pr": "1" }));
+    assert!(err);
+    assert!(text.contains("register notifications"), "{text}");
+}
+
+/// `wait_minutes` that is present but not a whole number is REJECTED, never
+/// silently defaulted — the `notify_when` rule, which has this same pin at
+/// `expires_minutes`. Without it the caller that wrote `"30"` waits an hour and
+/// is never told (rev-lead, PR #859 finding 5).
+#[test]
+fn a_non_integer_wait_minutes_is_refused_rather_than_defaulted() {
+    let (reg, _d, _g, c1, c2) = setup_locks("locks-waitarg", BUILD_ONE_SLOT);
+    lock_call(&reg, &c1, "acquire_lock", json!({ "name": "build" }));
+
+    for bad in [json!("30"), json!(30.5), json!(-5), json!(true)] {
+        let (err, text) =
+            lock_call(&reg, &c2, "acquire_lock", json!({ "name": "build", "wait_minutes": bad }));
+        assert!(err, "wait_minutes {bad} must be refused: {text}");
+        assert!(text.contains("whole number of minutes"), "{text}");
+    }
+    // Refused means refused: nothing was queued on the way to the error.
+    let state = lock_json(&reg, &c1);
+    assert!(state["resources"][0]["queue"].as_array().unwrap().is_empty());
+
+    // Omitted entirely is the one case that legitimately defaults, and it is
+    // the clamp's default rather than an invented one.
+    let (err, text) = lock_call(&reg, &c2, "acquire_lock", json!({ "name": "build" }));
+    assert!(!err, "{text}");
+    assert!(text.contains("60 min"), "the documented default: {text}");
+}
+
+/// **A multi-slot resource, end to end through `workflow.yml`.** `slots: 2` was
+/// covered in the engine's unit tests (from a hand-built `ResourcePolicy`) and
+/// at the parse layer, but the `workflow.yml -> LockTable.slots` chain was never
+/// exercised above 1, so a wiring bug that pinned every resource to one slot
+/// would have been invisible (rev-lead, PR #859 finding 14).
+#[test]
+fn a_two_slot_resource_admits_two_holders_through_the_wired_path() {
+    let (reg, _d, g, c1, c2) =
+        setup_locks("locks-multislot", "resources:\n  gpu:\n    slots: 2\n    max_hold_minutes: 45\n");
+    let w3 = reg.spawn_agent(&g, Role::Worker, "w3", "task", false, None).unwrap();
+    let c3 = reg.resolve_token(&w3.token).unwrap();
+
+    for c in [&c1, &c2] {
+        let (err, text) = lock_call(&reg, c, "acquire_lock", json!({ "name": "gpu" }));
+        assert!(!err && text.contains("is YOURS"), "both slots are grantable: {text}");
+    }
+    let (err, text) = lock_call(&reg, &c3, "acquire_lock", json!({ "name": "gpu" }));
+    assert!(!err, "{text}");
+    assert!(text.contains("position 1"), "the third contender queues: {text}");
+
+    let state = lock_json(&reg, &c1);
+    assert_eq!(state["resources"][0]["slots"], json!(2));
+    assert_eq!(state["resources"][0]["holders"].as_array().unwrap().len(), 2);
+
+    // And the tool description pluralizes — the menu is how an agent learns
+    // what exists, and "2 slot" would be the only place it ever reads it.
+    let listed = dispatch(&reg, &c1, "tools/list", &Value::Null).unwrap();
+    let desc = listed["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "acquire_lock")
+        .expect("acquire_lock is listed")["description"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(desc.contains("'gpu' (2 slots, max hold 45 min)"), "{desc}");
+}
+
+/// Ending a group drops its lock table rather than leaving an entry the sweep
+/// iterates for the rest of the process's life (rev-lead, PR #859 finding 8).
+#[test]
+fn ending_a_group_drops_its_lock_table() {
+    let (reg, _d, g, c1, _c2) = setup_locks("locks-endgroup", BUILD_ONE_SLOT);
+    lock_call(&reg, &c1, "acquire_lock", json!({ "name": "build" }));
+    assert!(!reg.lock_state(&g)["resources"].as_array().unwrap().is_empty(), "precondition");
+
+    reg.end_group(&g, false).unwrap();
+
+    // Nothing left to sweep: the tick must not even see this group.
+    assert!(
+        !reg.locks_tick(now_ms() + 60 * 60_000).contains(&g),
+        "an ended group's table is gone, not merely empty"
+    );
 }

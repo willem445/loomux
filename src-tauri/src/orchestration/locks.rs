@@ -214,16 +214,28 @@ impl LockTable {
         dropped
     }
 
-    /// Push every deadline out by `extra` ms — how a paused group's holds and
-    /// queued requests survive the pause instead of evaporating at the moment
-    /// it resumes. The `notify_tick` TTL-freeze precedent, applied to locks.
-    pub fn extend_deadlines(&mut self, extra: u64) {
+    /// Push every deadline out by the part of `extra` that entry actually
+    /// lived through — how a paused group's holds and queued requests survive
+    /// the pause instead of evaporating at the moment it resumes.
+    ///
+    /// The `notify_tick` TTL-freeze precedent, **including its clamp**: panes
+    /// keep running while a group is paused (only prompt delivery is
+    /// suppressed), so a lock taken *during* the pause never experienced the
+    /// part of the span that elapsed before it existed and must not be credited
+    /// for it. Without the clamp a hold granted one second before the resume
+    /// would have its deadline pushed out by the whole pause — which is the
+    /// generous direction, but it is still a deadline nobody can predict from
+    /// the config. Same bug rev-orch named on the watches in #247 ("B2");
+    /// rev-lead named it here on PR #859.
+    pub fn extend_deadlines(&mut self, now_ms: u64, extra: u64) {
         for r in self.resources.values_mut() {
             for h in r.holders.iter_mut() {
-                h.expires_ms = h.expires_ms.saturating_add(extra);
+                let earned = extra.min(now_ms.saturating_sub(h.acquired_ms));
+                h.expires_ms = h.expires_ms.saturating_add(earned);
             }
             for w in r.queue.iter_mut() {
-                w.expires_ms = w.expires_ms.saturating_add(extra);
+                let earned = extra.min(now_ms.saturating_sub(w.queued_ms));
+                w.expires_ms = w.expires_ms.saturating_add(earned);
             }
         }
     }
@@ -410,6 +422,15 @@ impl LockTable {
 }
 
 /// Hand the head of the queue a freed slot, if there is one of each.
+///
+/// **Deliberately does not check liveness** (rev-lead, PR #859 finding 7), which
+/// the sweep does. On the release path there is a window — a waiter's pane dies
+/// at T, `mark_dead` has not run yet, the holder releases at T+1s — where the
+/// slot is granted to an agent that will never take it, and the notice goes
+/// nowhere. Threading liveness in here would mean the engine reaching for
+/// registry state on every release, for a case the next 30s sweep reclaims and
+/// audits anyway (`HolderGone`). Bounded and audited is the bar the lessons-file
+/// rule sets; this is the backstop working, not an oversight.
 fn promote(r: &mut Resource, now_ms: u64) -> Option<Grant> {
     if !r.free_slots() {
         return None;
@@ -444,8 +465,21 @@ fn minutes_ms(m: u32) -> u64 {
     u64::from(m) * 60_000
 }
 
+/// Normalize an agent-authored note: collapse every run of whitespace to a
+/// single space, then cap it.
+///
+/// **The collapse is the load-bearing half** (rev-lead, PR #859 finding 11). A
+/// note is rendered into the group panel's hover detail, where the caller joins
+/// one line per holder and per waiter with `\n` — so a note containing its own
+/// newlines could forge extra queue lines there (`"build\n#1 in queue: w-9 —
+/// waiting 3h"`). It is not an injection into anything executable, and the
+/// pane-typed `[loomux]` notices never interpolate a note at all, but a field
+/// one agent writes and every other agent and the human read should not be able
+/// to invent structure in the surface that displays it. Collapsing here rather
+/// than at the renderer fixes it for the audit log and `list_locks` in the same
+/// stroke, instead of once per consumer.
 fn trim_note(note: &str) -> String {
-    note.trim().chars().take(MAX_NOTE_CHARS).collect()
+    note.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(MAX_NOTE_CHARS).collect()
 }
 
 /// The "no such resource" message, in one place so the tools and the sweep
@@ -771,7 +805,7 @@ mod tests {
         t.acquire("build", "w-1", "", 0, 60).unwrap();
         // The group was paused for an hour: without the credit, the very first
         // sweep after it resumes reclaims a lock whose holder was frozen too.
-        t.extend_deadlines(60 * MIN);
+        t.extend_deadlines(60 * MIN, 60 * MIN);
         assert!(t.sweep(60 * MIN, &all_live).is_empty());
         assert_eq!(t.get("build").unwrap().holders[0].agent, "w-1");
         // And it still expires — the credit shifts the deadline, it doesn't
@@ -780,9 +814,49 @@ mod tests {
     }
 
     #[test]
+    fn a_pause_credit_is_clamped_to_the_span_the_entry_actually_lived_through() {
+        let mut t = table(&[("build", 2, 45)]);
+        // w-1 was holding before the pause began; w-2 took the other slot 50
+        // minutes into a 60-minute pause (panes keep running while paused —
+        // only prompt delivery is suppressed — so this is routine, not exotic).
+        t.acquire("build", "w-1", "", 0, 60).unwrap();
+        t.acquire("build", "w-2", "", 50 * MIN, 60).unwrap();
+        t.extend_deadlines(60 * MIN, 60 * MIN);
+
+        let r = t.get("build").unwrap();
+        let w1 = r.holders.iter().find(|h| h.agent == "w-1").unwrap();
+        let w2 = r.holders.iter().find(|h| h.agent == "w-2").unwrap();
+        assert_eq!(w1.expires_ms, 45 * MIN + 60 * MIN, "it lived through the whole pause");
+        assert_eq!(
+            w2.expires_ms,
+            95 * MIN + 10 * MIN,
+            "…but w-2 existed for only the last 10 minutes of it, and is credited that"
+        );
+        // Unclamped, w-2's deadline would be 155m — 50 minutes later than its
+        // own max_hold could ever justify, from a pause it mostly missed.
+        assert!(w2.expires_ms < 155 * MIN);
+    }
+
+    #[test]
     fn a_note_is_trimmed_and_capped() {
         let mut t = table(&[("build", 1, 45)]);
         t.acquire("build", "w-1", &format!("  {}  ", "x".repeat(500)), 0, 60).unwrap();
         assert_eq!(t.get("build").unwrap().holders[0].note.len(), MAX_NOTE_CHARS);
+    }
+
+    #[test]
+    fn a_note_cannot_carry_its_own_line_breaks_into_the_panel() {
+        let mut t = table(&[("build", 1, 45)]);
+        // The shape that matters: the group panel joins one line per holder and
+        // per waiter with '\n', so a note that kept its own newlines could forge
+        // a queue entry that does not exist.
+        t.acquire("build", "w-1", "build\n#1 in queue: w-9 — waiting 3h", 0, 60).unwrap();
+        let note = &t.get("build").unwrap().holders[0].note;
+        assert!(!note.contains('\n'), "{note:?}");
+        assert!(!note.contains('\r'), "{note:?}");
+        assert_eq!(note, "build #1 in queue: w-9 — waiting 3h");
+        // Every other run of whitespace collapses too, tabs included.
+        t.acquire("build", "w-2", "cargo\t\t test   --locked", 0, 60).unwrap();
+        assert_eq!(t.get("build").unwrap().queue[0].note, "cargo test --locked");
     }
 }

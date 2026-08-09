@@ -2481,7 +2481,16 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .group-lock-row[hidden] { display: none; }
 .group-lock-line { color: var(--text-dim); font-size: 11px; line-height: 1.4; }
 .group-lock-entries { display: flex; flex-direction: column; gap: 2px; }
-.group-lock-entry { font-size: 10.5px; line-height: 1.4; color: var(--text-dim); }
+/* One line, always. The full text (every holder and the whole queue) is in the
+   row's `title`, so clipping here loses nothing — and an agent-authored note is
+   an input to this row's WIDTH, which in docked/embed mode reaches the terminal
+   geometry through `minChromeHeight` -> `dividerFloors` -> `applyFit`. Wrapping
+   is by-design there for panel content, but agent text should not be what
+   drives it (rev-lead, PR #859 finding 12). Matches `.group-watch-line`. */
+.group-lock-entry {
+  font-size: 10.5px; line-height: 1.4; color: var(--text-dim);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 .group-lock-entry.held { color: var(--text); }
 /* Amber = somebody is waiting on this — the panel's existing "needs your
    attention" tone (.group-compaction-line, .pane-attn). */

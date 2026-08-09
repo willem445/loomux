@@ -26643,7 +26643,7 @@ impl OrchRegistry {
                 let mut all = self.locks.lock_safe();
                 let Some(table) = all.get_mut(&group) else { continue };
                 if let Some(extra) = extend_by.get(&group) {
-                    table.extend_deadlines(*extra);
+                    table.extend_deadlines(now, *extra);
                 }
                 if paused.contains(&group) {
                     continue;
@@ -33253,6 +33253,18 @@ impl OrchRegistry {
         // but never sent (removed chips / abandoned drafts), so the cheap
         // policy is simply "cleaned up on group end", no per-image bookkeeping.
         let _ = fs::remove_dir_all(self.attachments_dir(group));
+
+        // Lock state is per-group and in-memory (#858). Every member is dead by
+        // now, so `mark_dead` has already released every hold and queue entry —
+        // what is left is the empty table itself, which `locks_tick` would
+        // otherwise iterate for the rest of the process's life. Dropped here
+        // rather than left to accumulate (rev-lead, PR #859 finding 8): the
+        // group is over, and a table keyed on an id nothing can reach again is
+        // not state, it is residue. `paused_locks_since` goes with it so a
+        // relaunch on the same repo cannot inherit a stale pause credit, which
+        // is the same reason the pause marker is cleared below.
+        self.locks.lock_safe().remove(group);
+        self.paused_locks_since.lock_safe().remove(group);
 
         // rev-4 review (N4; widened round #417 correction 6 for Claude's own
         // generated files): reclaim any generated custom-agent files this
