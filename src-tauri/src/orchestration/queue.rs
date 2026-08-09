@@ -1215,7 +1215,7 @@ pub fn should_fire_still_queued_notice(
 /// Measured against [`undelivered_since`], not against the queue front — see
 /// that function for why the front can be the *youngest* entry on exactly the
 /// pane that is most stuck.
-pub const QUEUE_STALLED_AFTER: Duration = Duration::from_secs(60);
+pub const QUEUE_STALLED_AFTER: Duration = Duration::from_secs(4); // SCRATCH round 3
 
 /// #814: the resolution the queue badge's age is reported at — 1 s while the
 /// wait is under a minute, 1 min once it is over.
@@ -1302,7 +1302,8 @@ pub fn queue_depth_item(
     hold_since_ms: Option<u64>,
     now_ms: u64,
 ) -> Option<QueueDepthItem> {
-    if depth == 0 {
+    // SCRATCH round 3: no emptiness guard.
+    if false {
         return None;
     }
     let waiting_since = undelivered_since(oldest_entry_ms, hold_since_ms);
