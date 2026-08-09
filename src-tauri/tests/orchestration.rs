@@ -44311,7 +44311,8 @@ fn repo_with_resources(tag: &str, body: &str) -> std::path::PathBuf {
         repo.join(".loomux").join("workflow.yml"),
         format!(
             "version: {}\n\
-             blocks:\n  - id: w\n    name: Worker\n    kind: worker\n    cli: claude\n    model: sonnet\n\
+             blocks:\n  - id: w\n    name: Worker\n    kind: worker\n    cli: claude\n    model: sonnet\
+             \n  - id: p\n    name: Planner\n    kind: planner\n    cli: claude\n    model: sonnet\n\
              {body}",
             workflow::SCHEMA_VERSION
         ),
@@ -44331,12 +44332,16 @@ fn repo_with_resources(tag: &str, body: &str) -> std::path::PathBuf {
 fn setup_locks(tag: &str, body: &str) -> (OrchRegistry, tempfile::TempDir, String, Caller, Caller) {
     let (reg, dir) = test_registry();
     let repo = repo_with_resources(tag, body);
-    let g = reg.create_group(repo.to_str().unwrap(), advanced_rails()).unwrap();
+    let g = reg.create_group(repo.to_str().unwrap(), lock_rails()).unwrap();
     let w1 = reg.spawn_agent(&g.id, Role::Worker, "w1", "task", false, None).unwrap();
     let w2 = reg.spawn_agent(&g.id, Role::Worker, "w2", "task", false, None).unwrap();
     let c1 = reg.resolve_token(&w1.token).unwrap();
     let c2 = reg.resolve_token(&w2.token).unwrap();
     (reg, dir, g.id, c1, c2)
+}
+
+fn lock_rails() -> Guardrails {
+    Guardrails { max_agents: 4, ..advanced_rails() }
 }
 
 const BUILD_ONE_SLOT: &str = "resources:\n  build:\n    slots: 1\n    max_hold_minutes: 45\n";
@@ -44655,7 +44660,7 @@ fn a_waiter_can_withdraw_and_the_next_agent_moves_up() {
 fn locks_are_scoped_to_one_group() {
     let (reg, _d, _g, c1, _c2) = setup_locks("locks-iso-a", BUILD_ONE_SLOT);
     let repo_b = repo_with_resources("locks-iso-b", BUILD_ONE_SLOT);
-    let gb = reg.create_group(repo_b.to_str().unwrap(), advanced_rails()).unwrap();
+    let gb = reg.create_group(repo_b.to_str().unwrap(), lock_rails()).unwrap();
     let wb = reg.spawn_agent(&gb.id, Role::Worker, "wb", "task", false, None).unwrap();
     let cb = reg.resolve_token(&wb.token).unwrap();
 
@@ -44697,7 +44702,7 @@ fn a_non_advanced_group_gets_no_locks_even_from_a_repo_that_declares_them() {
 fn a_momentarily_unreadable_workflow_file_does_not_drop_a_live_hold() {
     let (reg, _d) = test_registry();
     let repo = repo_with_resources("locks-unreadable", BUILD_ONE_SLOT);
-    let g = reg.create_group(repo.to_str().unwrap(), advanced_rails()).unwrap();
+    let g = reg.create_group(repo.to_str().unwrap(), lock_rails()).unwrap();
     let w1 = reg.spawn_agent(&g.id, Role::Worker, "w1", "task", false, None).unwrap();
     let c1 = reg.resolve_token(&w1.token).unwrap();
     lock_call(&reg, &c1, "acquire_lock", json!({ "name": "build" }));
