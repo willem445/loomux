@@ -60,18 +60,8 @@ of done**). Read them before you act, not instead of.
   **receiver**, `channel_send` is reply-only — it works once the sender has messaged you,
   and goes to the sender only, never another receiver. A peer may be **receive-only**
   (`channel_status` shows `can_send: false` for it) — it will never reply, by design.
-- `acquire_lock(name, note?, wait_minutes?)` / `release_lock(name)` / `list_locks()` — these
-  exist only if this repo declares scarce resources (a build slot, a GPU, a port) in
-  `.loomux/workflow.yml`; if they aren't in your tool list, it doesn't and there is nothing
-  to take. When they ARE listed, take the lock **before** the work that needs it and
-  release it the moment that work is done. `acquire_lock` never blocks: it answers "yours"
-  or "queued at position N". **Queued means end your turn** — never sleep, poll, or re-call
-  in a loop; a `[loomux]` notice is typed into this pane when the lock is yours, and a pane
-  sitting mid-turn cannot take that delivery. A forgotten hold is reclaimed at the declared
-  max-hold and audited as a reclaim, so releasing it yourself is both faster for everyone
-  behind you and a better record.
 - `note_directive(text, replace?)` — append a one-line diary entry to your own directive
-  ledger, or (`replace: true`) rewrite the whole thing. See **Directive ledger** below.
+  ledger, or (`replace: true`) rewrite the whole thing. See **Directive ledger** below.{{LOCKS}}
 
 Report meaningfully but sparingly: on start (`progress`, one line restating the task),
 when blocked (the one fact that changes what the orchestrator does next), and when done

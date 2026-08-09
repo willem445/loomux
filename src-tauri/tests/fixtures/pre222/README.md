@@ -534,21 +534,6 @@ so far:
   with a live/historical split) plus the `detail: true` escape hatch to the full
   per-agent table, instead of the old "total + per-agent" description that no longer
   matches a default call.
-- **#858, named lock resources** — `orchestrator.md`, `worker.md` and `reviewer.md` (not
-  `planner.md`: a planner is refused these tools, because its pane closes the moment it
-  reports and a lock outliving its holder is the stranded slot the mechanism exists to
-  prevent). One bullet each. The three tools only appear in a group whose repo declares
-  `resources:` in `.loomux/workflow.yml`, so the prose says so first — an agent that finds
-  no `acquire_lock` in its tool list is reading a repo that declares no scarce resources,
-  not a broken build. What every role is told beyond that is the same two things: take the
-  lock **before** the work and release it as soon as that work is done, and — the part
-  that is a rule rather than etiquette — **a queued acquire means end the turn**. It never
-  blocks, and the grant arrives as a `[loomux]` notice typed into the pane, so a worker
-  that "waits" for its lock is blocking the delivery of the answer it is waiting for
-  (#590's deadlock, reached by a new route). The orchestrator's bullet carries the two
-  things only it can do: name the lock in a brief (a worker never told will not think to
-  take one), and read `list_locks()` before concluding a quiet agent is stuck rather than
-  queued.
 
 `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was` renders
 **these** with the six pre-#222 template variables and asserts that a group launched

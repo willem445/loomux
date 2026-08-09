@@ -44754,3 +44754,64 @@ fn a_momentarily_unreadable_workflow_file_does_not_drop_a_live_hold() {
         .expect("dropping a declared resource with a live holder is audited");
     assert_eq!(dropped.detail["holders"], json!([c1.agent_id]));
 }
+
+/// **The `{{LOCKS}}` / `{{LOCKS_ORCH}}` fragments reach only a group whose repo
+/// actually declares resources** — and, like the merge-queue fragment, "actually
+/// declares" means BOTH the block and the advanced-orchestrator toggle.
+///
+/// The absence half is pinned hard by `tests/workflow.rs`'s blessed goldens and
+/// its `the_default_rendering_never_names_the_gate_machinery` rule — which is
+/// how this shape got caught here too: the first cut put these bullets in the
+/// base templates and that test went red, naming `.loomux/workflow.yml` in a
+/// rendering for a group that has no workflow file. What nothing pins is the
+/// **presence** half: a substitution that was always empty would satisfy every
+/// one of those, and the agents would simply never be told the tools exist.
+#[test]
+fn the_lock_notes_reach_only_a_group_whose_repo_declares_resources() {
+    let worker_marker = "Queued means END YOUR TURN";
+    let orch_marker = "why is that worker quiet";
+    let read = |reg: &OrchRegistry, g: &str, file: &str| {
+        fs::read_to_string(reg.state_root().join(g).join(file)).unwrap()
+    };
+
+    // Declared + toggle on: every role that can hold a lock is told, and each
+    // is told ITS OWN half.
+    let (reg, _d) = test_registry();
+    let repo = repo_with_resources("locks-note-on", BUILD_ONE_SLOT);
+    let g = reg.create_group(repo.to_str().unwrap(), lock_rails()).unwrap();
+    let orch = read(&reg, &g.id, "orchestrator.md");
+    assert!(orch.contains(orch_marker), "the orchestrator is told what list_locks is FOR");
+    assert!(orch.contains("name the lock in the brief"), "…and that briefing it is its job");
+    assert!(
+        !orch.contains(worker_marker),
+        "…and not the agent-side half: an orchestrator does not take build locks"
+    );
+    for file in ["worker.md", "reviewer.md"] {
+        let text = read(&reg, &g.id, file);
+        assert!(text.contains(worker_marker), "{file} must carry the end-your-turn rule");
+        assert!(!text.contains(orch_marker), "{file} must not carry the orchestrator's half");
+    }
+    // A planner is refused these tools outright, so it is never told about them.
+    assert!(!read(&reg, &g.id, "planner.md").contains("acquire_lock"));
+
+    // A workflow with no `resources:` block: nothing, and no raw placeholder.
+    let (reg, _d) = test_registry();
+    let repo = repo_with_merge_queue("locks-note-none", false); // a workflow, no resources
+    let g = reg.create_group(repo.to_str().unwrap(), advanced_rails()).unwrap();
+    for file in ["orchestrator.md", "worker.md", "reviewer.md"] {
+        let text = read(&reg, &g.id, file);
+        assert!(!text.contains("acquire_lock"), "{file}: no resources declared, no lock prose");
+        assert!(!text.contains("{{LOCKS"), "{file}: the placeholder is substituted, not left raw");
+    }
+
+    // Declared, but the advanced orchestrator OFF: still nothing. The workflow
+    // file is not in force, so neither are its resources — and that is exactly
+    // the group whose rendering must stay byte-for-byte pre-#222.
+    let (reg, _d) = test_registry();
+    let repo = repo_with_resources("locks-note-toggle-off", BUILD_ONE_SLOT);
+    let g = reg.create_group(repo.to_str().unwrap(), rails()).unwrap();
+    for file in ["orchestrator.md", "worker.md", "reviewer.md"] {
+        let text = read(&reg, &g.id, file);
+        assert!(!text.contains("acquire_lock"), "{file}: toggle off means the block is not in force");
+    }
+}

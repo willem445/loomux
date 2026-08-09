@@ -142,16 +142,6 @@ memory of it — is the contract.
   **sender** (may send any time), everyone else is a **receiver** (may only reply once the
   sender messages them, and only to the sender). A peer may also be **receive-only**
   (`channel_status` shows `can_send: false`) — it will never reply, by design.
-- `acquire_lock(name, note?, wait_minutes?)` / `release_lock(name)` / `list_locks()` — present
-  only when this repo declares scarce resources (a build slot, a GPU, a device, a port) in
-  `.loomux/workflow.yml`; if they are not in your tool list, it declares none. Your agents get
-  the same three. **Two things are yours here.** First, name the lock in the brief whenever a
-  task will touch a declared resource — a worker that was never told will not think to take
-  one. Second, `list_locks()` is the answer to "why is that worker quiet": a queued agent is
-  waiting for its turn, not stalled, and the queue tells you in what order the work will
-  actually happen — schedule around it instead of spawning a fourth worker to contend for the
-  same slot. A hold is bounded (the repo declares a max) and every acquire, release, reclaim
-  and timeout is in the audit log.
 - `note_directive(text, replace?)` — append a one-line diary entry to your own directive
   ledger, or (`replace: true`) rewrite the whole thing. See **Durability rules**.
 - `queue_orphans()` — deliveries nobody ever received, in two lists: `orphans` (a loomux

@@ -202,3 +202,29 @@ reclaim is imminent) reuses the panel's existing colour vocabulary rather than i
 - **A granted lock can idle.** An agent granted a lock while mid-turn will not read the notice
   until its turn ends. `max_hold_minutes` bounds that, and it is the same bound that covers a
   holder that simply forgets.
+- **A `mode: replace` persona is not told about locks.** The two instruction fragments are
+  substituted into the role templates, and a replace-mode block gets `mechanics_core` instead.
+  That is the same gap `MERGE_QUEUE_NOTE` has, and it is left alone here deliberately rather
+  than widened by one feature: which loomux mechanics survive a persona replacement is a
+  question about `mechanics_core`'s contract, not about this one.
+
+## Where the instructions live, and why they are conditional
+
+The three tools are taught in `templates/{orchestrator,worker,reviewer}.md` — but behind
+`{{LOCKS_ORCH}}` / `{{LOCKS}}`, substituted only when the group is advanced **and** the repo
+declares a non-empty `resources:`. `planner.md` gets nothing, because a planner is refused the
+tools.
+
+That conditionality is not tidiness. `the_default_rendering_never_names_the_gate_machinery`
+exists to catch prose naming a mechanism the reader does not have, and it caught this: the
+first cut put the bullets in the base templates, where a group with no workflow file at all
+would have read about `.loomux/workflow.yml`. Conditional framing inside the prose ("these
+exist only if your repo declares…") does not save it — that is an invitation to go looking.
+Gated on the *declaration* rather than on the toggle alone for the same reason
+`MERGE_QUEUE_NOTE` is gated on the queue being enabled: a repo can run a workflow and declare
+no resources, and that group has the workflow's machinery but not this.
+
+Two fragments rather than one because the orchestrator's job with a lock is a different job:
+an agent takes and releases one; an orchestrator decides which task needs one and reads the
+queue to understand why a worker is quiet. One shared paragraph would have had to say both
+things to both readers.

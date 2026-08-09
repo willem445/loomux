@@ -4362,14 +4362,14 @@ const LIVE: [(&str, &str, &[&str]); 4] = [
     (
         "orchestrator.md",
         loomux_lib::orchestration::ORCHESTRATOR_TPL,
-        &["{{WORKFLOW}}", "{{POST_MERGE_WORKFLOW_HOOK}}", "{{MERGE_QUEUE}}"],
+        &["{{WORKFLOW}}", "{{POST_MERGE_WORKFLOW_HOOK}}", "{{MERGE_QUEUE}}", "{{LOCKS_ORCH}}"],
     ),
     (
         "worker.md",
         loomux_lib::orchestration::WORKER_TPL,
-        &["{{BLOCK_NOTE}}{{ADVISOR_CONSULT_NOTE}}"],
+        &["{{BLOCK_NOTE}}{{ADVISOR_CONSULT_NOTE}}", "{{LOCKS}}"],
     ),
-    ("reviewer.md", loomux_lib::orchestration::REVIEWER_TPL, &["{{BLOCK_NOTE}}"]),
+    ("reviewer.md", loomux_lib::orchestration::REVIEWER_TPL, &["{{BLOCK_NOTE}}", "{{LOCKS}}"]),
     ("planner.md", loomux_lib::orchestration::PLANNER_TPL, &["{{BLOCK_NOTE}}"]),
 ];
 

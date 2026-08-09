@@ -112,6 +112,51 @@ proactively: the speculative merge **is** the mergeability probe, so a sibling t
 is kicked back at construction time with no CI spent and nothing landed. Wait to be told. This does
 **not** cover open PRs that are not queued — those still restale on every merge and still need the
 sweep."#;
+/// The `{{LOCKS}}` / `{{LOCKS_ORCH}}` fragments (#858) — substituted into
+/// `worker.md`/`reviewer.md` and `orchestrator.md` respectively, **only** when
+/// the repo declares a non-empty `resources:` block, and empty otherwise.
+///
+/// Two fragments rather than one because the orchestrator's job with a lock is
+/// a different job: an agent takes and releases one, an orchestrator decides
+/// which task needs one and reads the queue to understand its fleet. One shared
+/// paragraph would have had to say both things to both readers.
+///
+/// Conditional at all, rather than template prose, for the reason
+/// `the_default_rendering_never_names_the_gate_machinery` states: a group whose
+/// repo declares no resources has no lock tools, and prose naming a mechanism
+/// the reader does not have is an invitation to go looking for it. Gated on the
+/// declaration and not merely on the advanced-orchestrator toggle, for the same
+/// reason `MERGE_QUEUE_NOTE` is gated on the queue being enabled — a repo can
+/// run a workflow and declare no resources, and that group has the workflow's
+/// machinery but not this.
+///
+/// Each brings its own leading newline because the placeholder sits at the end
+/// of the preceding bullet's last line: an empty substitution has to leave that
+/// line exactly as it was, which is the invariant
+/// `a_workflow_placeholder_must_sit_at_the_end_of_a_line_it_shares` pins.
+const LOCKS_NOTE: &str = r#"
+- `acquire_lock(name, note?, wait_minutes?)` / `release_lock(name)` / `list_locks()` — this repo
+  declares scarce resources (a build slot, a GPU, a device, a port) that agents must take turns on.
+  Take the lock **before** the work that needs it, and release it the moment that work is done.
+  `acquire_lock` never blocks: it answers "it is yours" or "you are queued at position N".
+  **Queued means END YOUR TURN** — never sleep, poll, or re-call in a loop. A `[loomux]` notice is
+  typed into this pane when the lock becomes yours, and a pane sitting mid-turn cannot take that
+  delivery, so waiting for it is the one thing guaranteed not to work. Re-calling when you already
+  hold or already wait is a harmless no-op that reports where you stand. A hold you forget is
+  reclaimed automatically at the declared max-hold and audited as a reclaim — releasing it yourself
+  is faster for everyone behind you and a better record. `list_locks()` shows who holds what."#;
+
+/// The orchestrator's half — see [`LOCKS_NOTE`].
+const LOCKS_ORCH_NOTE: &str = r#"
+- `acquire_lock(name, note?, wait_minutes?)` / `release_lock(name)` / `list_locks()` — this repo
+  declares scarce resources (a build slot, a GPU, a device, a port); your agents get the same three
+  tools. **Two things are yours here.** First, name the lock in the brief whenever a task will touch
+  one — a worker that was never told will not think to take it, and nothing enforces it for you.
+  Second, `list_locks()` is the answer to "why is that worker quiet": a queued agent is waiting its
+  turn, not stalled, and the queue tells you in what order the work will actually happen — schedule
+  around it rather than spawning another worker to contend for the same slot. Holds are bounded (the
+  repo declares a max) and every acquire, release, reclaim and timeout is in the audit log."#;
+
 #[doc(hidden)]
 pub const WORKER_TPL: &str = include_str!("templates/worker.md");
 #[doc(hidden)]
@@ -33740,6 +33785,19 @@ impl OrchRegistry {
         } else {
             String::new()
         };
+        // #858, the same shape and the same reasoning as `merge_queue_note`
+        // directly above: gated on the DECLARATION, not merely on the toggle,
+        // because a repo can run a workflow and declare no resources — and
+        // prose about locks that do not exist is the leak these fragments are
+        // conditional to prevent.
+        let locks_declared = g.guardrails.advanced_orchestrator
+            && workflow::load_workflow(&g.repo)
+                .ok()
+                .flatten()
+                .map(|wf| !wf.resources.is_empty())
+                .unwrap_or(false);
+        let locks_note = if locks_declared { LOCKS_NOTE } else { "" };
+        let locks_orch_note = if locks_declared { LOCKS_ORCH_NOTE } else { "" };
         let vars: Vec<(&str, &str)> = vec![
             ("REPO", g.repo.as_str()),
             ("GROUP_ID", g.id.as_str()),
@@ -33755,6 +33813,8 @@ impl OrchRegistry {
             // among the earlier vars is inert — unlike the repo-authored
             // `BLOCK_NAME`, which the comment above keeps last on purpose.
             ("MERGE_QUEUE", merge_queue_note.as_str()),
+            ("LOCKS", locks_note),
+            ("LOCKS_ORCH", locks_orch_note),
             ("BLOCK_NOTE", ""),
         ];
         let dir = self.group_dir(&g.id);
