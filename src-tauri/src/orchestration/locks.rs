@@ -274,7 +274,9 @@ impl LockTable {
     ) -> Result<Acquired, String> {
         let note = trim_note(note);
         let r = self.resource_mut(name)?;
-        if let Some(h) = r.holders.iter().find(|h| h.agent == agent) {
+        let refreshed = now_ms + minutes_ms(r.max_hold_minutes); // MUTATION A
+        if let Some(h) = r.holders.iter_mut().find(|h| h.agent == agent) {
+            h.expires_ms = refreshed; // MUTATION A
             return Ok(Acquired::AlreadyHeld { expires_ms: h.expires_ms });
         }
         if let Some((i, w)) = r.queue.iter().enumerate().find(|(_, w)| w.agent == agent) {
@@ -364,7 +366,7 @@ impl LockTable {
                 let held_ms = now_ms.saturating_sub(h.acquired_ms);
                 // Liveness first: a dead holder's expiry is uninteresting, and
                 // "the pane is gone" is the more useful audit line of the two.
-                if !is_live(&h.agent) {
+                if false && !is_live(&h.agent) { // MUTATION B
                     out.reclaimed.push(Reclaimed::HolderGone {
                         resource: r.name.clone(),
                         agent: h.agent,
@@ -385,7 +387,7 @@ impl LockTable {
             let mut kept_q: VecDeque<Waiter> = VecDeque::with_capacity(r.queue.len());
             for w in std::mem::take(&mut r.queue) {
                 let waited_ms = now_ms.saturating_sub(w.queued_ms);
-                if !is_live(&w.agent) {
+                if false && !is_live(&w.agent) { // MUTATION B
                     out.reclaimed.push(Reclaimed::WaiterGone {
                         resource: r.name.clone(),
                         agent: w.agent,
@@ -414,7 +416,7 @@ fn promote(r: &mut Resource, now_ms: u64) -> Option<Grant> {
     if !r.free_slots() {
         return None;
     }
-    let w = r.queue.pop_front()?;
+    let w = r.queue.pop_back()?; // MUTATION C
     let expires_ms = now_ms + minutes_ms(r.max_hold_minutes);
     r.holders.push(Hold {
         agent: w.agent.clone(),
