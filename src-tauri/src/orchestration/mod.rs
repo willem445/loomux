@@ -12859,6 +12859,28 @@ pub(crate) fn tail_snippet(s: &str, n: usize) -> &str {
     &s[boundary..]
 }
 
+/// Cap for the `task` field in a `list_agents` roster row (#851): a spawn
+/// brief can run multiple hundred words, and a roster with a dozen dead
+/// agents each carrying its full brief verbatim pushed one group's
+/// `list_agents` response to ~4k tokens. The full brief stays retrievable
+/// where it already lives (the audit log, the task board) — this is only
+/// the roster excerpt, so the orchestrator can tell what a row is about
+/// without paying for the whole text on every call.
+const TASK_EXCERPT_CHARS: usize = 140;
+
+/// First `n` **chars** (not bytes) of `s`, with `…` appended when something
+/// was dropped. Counting chars rather than bytes keeps the cap UTF-8-safe
+/// by construction — `s.chars().take(n)` can never land mid-codepoint, so
+/// there is no boundary search to get wrong, unlike a byte-offset cut.
+fn task_excerpt(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(n).collect();
+    out.push('…');
+    out
+}
+
 /// The diagnostic clause `on_pty_exit` puts in its orchestrator notice (#281):
 /// a bare exit code can't distinguish "produced real output, then failed" from
 /// "exited before printing a single byte" (the resume-CLI-boots-and-
@@ -41029,13 +41051,19 @@ impl OrchRegistry {
             .values()
             .filter(|a| a.group == group)
             .map(|a| {
-                // Registry hygiene (#106): a dead agent keeps its identity
-                // (id/name/role/session/status/cwd) so the orchestrator can
-                // still resume its session, but sheds its task brief — dead
-                // records accumulate across a run and the full briefs pushed
-                // one group's roster to ~86KB. Live agents keep `task` so the
-                // orchestrator sees what each is working on.
-                let mut o = json!({
+                // Registry hygiene (#106 → #851): a dead agent keeps its
+                // identity (id/name/role/session/status/cwd) so the
+                // orchestrator can still resume its session. #106 had dead
+                // rows shed `task` entirely because full briefs accumulating
+                // across a run pushed one group's roster to ~86KB; #851
+                // replaces that all-or-nothing cut with a fixed-width excerpt
+                // applied to EVERY row, alive or dead, so a dead row keeps a
+                // hint of what it was doing instead of nothing at all, while
+                // the excerpt cap bounds the cost the same way the old omit
+                // did. The full brief is unaffected — it's still durable in
+                // the audit log and the task board; this is only the roster
+                // view.
+                json!({
                     "id": a.id, "name": a.name, "role": a.role,
                     // #222: which block this agent is. An orchestrator reading
                     // its roster needs the identity, not just the class — three
@@ -41044,11 +41072,8 @@ impl OrchRegistry {
                     "status": a.status,
                     "session": a.session_id, "cwd": a.cwd,
                     "idle_since_ms": a.idle_since_ms,
-                });
-                if a.status != AgentStatus::Dead {
-                    o["task"] = json!(a.task);
-                }
-                o
+                    "task": task_excerpt(&a.task, TASK_EXCERPT_CHARS),
+                })
             })
             .collect();
         list.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
