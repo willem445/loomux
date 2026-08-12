@@ -32353,29 +32353,34 @@ impl OrchRegistry {
         }
         rows.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
 
-        // How to label each dollar total: all token-estimated, all
-        // CLI-reported, or a mix. `null` when there is no cost figure.
-        let basis = |est: bool, rep: bool| -> Option<&'static str> {
-            match (est, rep) {
-                (true, true) => Some("mixed"),
-                (true, false) => Some("estimated"),
-                (false, true) => Some("reported"),
-                (false, false) => None,
-            }
-        };
-
         json!({
             "group": group,
             "cli": cli,
             "live_cost_usd": live_cost_known.then_some(live_cost),
             "lifetime_cost_usd": lifetime_cost_known.then_some(lifetime_cost),
-            "live_cost_basis": basis(live_est, live_rep),
-            "lifetime_cost_basis": basis(lifetime_est, lifetime_rep),
+            "live_cost_basis": Self::usage_cost_basis(live_est, live_rep),
+            "lifetime_cost_basis": Self::usage_cost_basis(lifetime_est, lifetime_rep),
             "live_tokens": live_tokens,
             "lifetime_tokens": lifetime_tokens,
             "agents": rows,
             "note": "Tokens come from each agent's own session record — a transcript, or opencode's session row — and are exact; dollar figures are estimated from a dated model price table EXCEPT where the CLI priced them itself (opencode does), which the per-total basis labels. Subscription/Max accounts have no marginal dollar cost (the CLI statusline shows $0.00), so tokens are the reliable metric. Killed/recycled agents stay in the lifetime total; statusline-parsed dollars are a last-resort fallback.",
         })
+    }
+
+    /// How to label a dollar total: all token-estimated, all CLI-reported, or
+    /// a mix; `None` when there is no cost figure at all. Shared — not just
+    /// similar — between this method's own `*_cost_basis` fields and the MCP
+    /// `group_usage` tool's `rest.cost_basis` (`mcp::summarize_group_usage`),
+    /// so the two can never independently drift on what "mixed" means inside
+    /// the same JSON object (#866 review finding 2: an earlier version
+    /// duplicated this as a local closure in `mcp.rs`).
+    pub(crate) fn usage_cost_basis(estimated: bool, reported: bool) -> Option<&'static str> {
+        match (estimated, reported) {
+            (true, true) => Some("mixed"),
+            (true, false) => Some("estimated"),
+            (false, true) => Some("reported"),
+            (false, false) => None,
+        }
     }
 
     // ---------- lifecycle: group summary & end-orchestration ----------

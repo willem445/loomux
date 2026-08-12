@@ -30229,6 +30229,47 @@ fn group_usage_mcp_detail_flag_returns_full_agents_table() {
     assert!(body["agent_count"].is_null());
 }
 
+#[test]
+fn group_usage_mcp_rest_cost_basis_covers_reported_and_mixed_arms() {
+    // #866 review finding 3 (round 2): every prior test's synthetic rows were
+    // `estimated: true` (`usage_snap`'s hardcoded default), so `rest.cost_basis`
+    // was only ever exercised on the "estimated" and "no cost at all" arms.
+    // This pins the other two — an opencode-style CLI-priced row (`estimated:
+    // false`) folded into `rest` alone gives "reported"; folded in alongside
+    // an estimated row gives "mixed" — against `OrchRegistry::usage_cost_basis`,
+    // the function `compute_group_usage`'s own `*_cost_basis` fields and
+    // `rest.cost_basis` now share (round-2 finding 2).
+    let (reg, _d, co, _cw) = setup_mcp();
+    // 10 "top" agents, tokens 100..1000, comfortably above everything below —
+    // they fill top_agents regardless of what lands in `rest`.
+    for i in 1..=10u64 {
+        reg.upsert_usage_snapshot(&co.group, usage_snap(&format!("top-{i}"), &format!("top-agent-{i}"), 1.0, i * 100, 0));
+    }
+    // One CLI-priced (estimated: false) row, low enough to fall into `rest`
+    // alongside the 2 zero-token live agents (orch + worker).
+    reg.upsert_usage_snapshot(
+        &co.group,
+        UsageSnapshot { estimated: false, ..usage_snap("reported-1", "reported-agent", 0.7, 50, 0) },
+    );
+
+    let via_mcp = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "group_usage", "arguments": {} })).unwrap();
+    let body: Value = serde_json::from_str(via_mcp["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(body["rest"]["count"].as_u64(), Some(3), "1 reported synthetic + 2 zero-token live agents");
+    assert_eq!(body["rest"]["cost_basis"], "reported", "rest's only cost-bearing row is CLI-priced");
+
+    // Add a second, even-lower-token row that IS estimated — now `rest` has
+    // one reported and one estimated row, so the basis must read "mixed"
+    // rather than staying "reported" or flipping to "estimated".
+    reg.upsert_usage_snapshot(&co.group, usage_snap("mixed-1", "mixed-agent", 0.3, 25, 0));
+
+    let via_mcp = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "group_usage", "arguments": {} })).unwrap();
+    let body: Value = serde_json::from_str(via_mcp["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(body["rest"]["count"].as_u64(), Some(4), "now 2 synthetic + 2 live");
+    assert_eq!(body["rest"]["cost_basis"], "mixed", "rest blends an estimated row and a reported row");
+}
+
 /// Build a durable usage snapshot for a session, as a fresh transcript read
 /// would produce.
 fn usage_snap(key: &str, agent_id: &str, cost: f64, input: u64, output: u64) -> UsageSnapshot {

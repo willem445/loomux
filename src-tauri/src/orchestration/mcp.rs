@@ -623,22 +623,6 @@ fn arg_bool(args: &Value, key: &str) -> Result<bool, String> {
 /// group's roster size (constraint: no repo/machine-specific tuning).
 const GROUP_USAGE_SUMMARY_TOP_N: usize = 10;
 
-/// How to label a dollar total: all token-estimated, all CLI-reported, or a
-/// mix. `None` when there is no cost figure at all. Same rule as
-/// `compute_group_usage`'s own `basis` closure (`orchestration/mod.rs`) —
-/// duplicated rather than shared because that one closes over locals it
-/// computes inline; applied here to `rest.cost_usd` so a summary-mode dollar
-/// figure that blends two pricing sources is never presented as one honest
-/// label (#866 review finding 3).
-fn usage_cost_basis(estimated: bool, reported: bool) -> Option<&'static str> {
-    match (estimated, reported) {
-        (true, true) => Some("mixed"),
-        (true, false) => Some("estimated"),
-        (false, true) => Some("reported"),
-        (false, false) => None,
-    }
-}
-
 /// Collapse `group_usage`'s full per-agent `agents` array into the summary
 /// an orchestrator can actually fold into a status update (#866): a
 /// 654-agent lifetime roster serialized to 173,245 chars, unreadable
@@ -700,7 +684,7 @@ fn summarize_group_usage(full: &Value, top_n: usize) -> Value {
             "count": rest_count,
             "tokens": rest_tokens,
             "cost_usd": rest_cost_known.then_some(rest_cost),
-            "cost_basis": usage_cost_basis(rest_est, rest_rep),
+            "cost_basis": OrchRegistry::usage_cost_basis(rest_est, rest_rep),
             "live": { "count": rest_live_count, "tokens": rest_live_tokens },
             "historical": { "count": rest_hist_count, "tokens": rest_hist_tokens },
         }));
