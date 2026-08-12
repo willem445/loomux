@@ -56,6 +56,23 @@ say so in the PR rather than proposing on evidence you don't have) and
 `corroboration_capped` (`true` = older sessions went unread, so every `recurrence`
 is a floor, not a total — never write "hit exactly twice" off a capped scan).
 
+**Those two bounds shrink the count; one thing inflates it.** Local `cargo` is banned
+for agents (#488), so every worker reads results through `gh pr checks`, and the DoD
+mandates a CI-visible red before green — a *correctly executed* session therefore emits
+`tool_error` windows over `gh pr checks` as its NORMAL output, on keys coarse enough
+that two healthy sessions corroborate each other into `recurrence >= 1`.
+
+- **RULE** — resolve the run id quoted in a `gh pr checks` window against that PR's own
+  round-by-round evidence log before counting the window as friction: a run cited there
+  as a deliberate red, or an exit-`8` "checks pending", is the discipline working, not a
+  wall.
+- **FAILURE SIGNATURE** — a `tool_error` window whose summary is a `gh pr checks` table
+  (`build (…) fail`, `pending`), often carrying `recurrence >= 1` against a sibling
+  worker from the same day.
+- **POINTER** — #877 and #876 (the #867 / #868 process reviews, where every such window
+  resolved to a deliberate red or a pending check); exit codes in
+  `.claude/skills/ci-validate/SKILL.md`.
+
 The one thing `recurrence` cannot see is a wall the group only ever hit ONCE but
 that is certain to recur — a documented invariant somebody violated, a constraint in
 `CLAUDE.md` that a worker missed. Proposing that on a `recurrence: 0` window is

@@ -920,6 +920,36 @@ fn the_shipped_process_persona_keys_durability_off_recurrence_not_its_own_impres
         flat_doc.contains("a young group with nothing to compare against, not a group of one-offs"),
         "must distinguish a young group from a group of one-offs: {process_doc}"
     );
+
+    // Two bounds SHRINK the count; this is the one thing that INFLATES it, and it
+    // fires on exactly the instruction above — "do not answer it from your own
+    // impression" is what makes an inflated count load-bearing rather than a
+    // number the agent can shrug off. Local `cargo` is banned for agents (#488),
+    // so every worker reads results through `gh pr checks`, and the DoD mandates a
+    // CI-visible red before green — so a *correctly executed* session emits
+    // `tool_error` windows over `gh pr checks` as its NORMAL output: exit `1` on
+    // the deliberate red round, exit `8` on checks merely pending. `session_digest`
+    // normalizes those into keys coarse enough (`… # build macos-latest fail`,
+    // `… # e2e playwright experimental`) that two healthy sessions corroborate each
+    // other into `recurrence >= 1`. Both the #867 and #868 process reviews hit this
+    // and had to resolve run ids against each PR's evidence log by hand to see it.
+    // Scoped to the recurrence section per this file's `section` doc comment: the
+    // rule is only doing its job where the counts are being read.
+    let recurrence_sec = section(&flat_doc, "that test is answered for you", "## where a learning goes");
+    assert!(
+        recurrence_sec.contains("gh pr checks"),
+        "the recurrence section must name the command whose windows inflate the count: {process_doc}"
+    );
+    assert!(
+        recurrence_sec.contains("the discipline working, not a wall"),
+        "must give the DIRECTION — a deliberate red is not friction — not merely mention the \
+         command: {process_doc}"
+    );
+    assert!(
+        recurrence_sec.contains("resolve the run id"),
+        "must name the concrete check that separates a deliberate red from a real failure, or the \
+         rule is unactionable: {process_doc}"
+    );
 }
 
 #[test]
