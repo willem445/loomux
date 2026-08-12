@@ -2404,6 +2404,23 @@ const MIN_IDLE_TICK_FALLBACK_MINUTES: u32 = 30;
 /// never disabled — see `intake_poll_minutes`'s doc for why this field, unlike
 /// that one, is never allowed to mean "off".
 const MAX_IDLE_TICK_FALLBACK_MINUTES: u32 = 60 * 24 * 7;
+/// Idle-tick fallback backoff (#864): default ceiling on the EFFECTIVE
+/// fallback interval once a group has been delta-free for several consecutive
+/// fallback wakes — the interval doubles per empty wake and stops here
+/// (`intake::fallback_interval_minutes`).
+///
+/// **24h**, so with the 3h base a fully parked group settles at 3h → 6h → 12h
+/// → 24h and then one wake per day: a parked weekend costs ~4 wakes instead of
+/// the ~16 the fixed cadence charged (the #864 evidence measured ~30 over one
+/// weekend, at 1–2 API turns over the orchestrator's whole prefix each). A day
+/// is also the longest silence that still keeps the fallback's own promise
+/// legible to a human: whatever the host-side poll misses, the orchestrator is
+/// still woken unconditionally within a day of it.
+///
+/// Set this equal to `idle_tick_fallback_minutes` to switch backoff off and
+/// get the pre-#864 fixed cadence back — one value, rather than a separate
+/// enable flag.
+const DEFAULT_IDLE_TICK_FALLBACK_MAX_MINUTES: u32 = 60 * 24;
 /// How often the attention scan recomputes which panes need the human
 /// (idle-with-prompt detection; report/gate signals are event-driven and
 /// picked up on the next tick).
@@ -4024,6 +4041,22 @@ pub struct Guardrails {
     /// because it's the backstop *for* that gate. See
     /// `intake::idle_tick_fallback_due`.
     pub idle_tick_fallback_minutes: u32,
+    /// Idle-tick fallback backoff (#864): the ceiling the fallback interval
+    /// backs off TO while a group stays delta-free. The effective interval
+    /// doubles per consecutive delta-free fallback wake
+    /// (`intake::fallback_interval_minutes`) and stops here; any delta or
+    /// human input resets it to `idle_tick_fallback_minutes`.
+    ///
+    /// Normalized like `idle_tick_fallback_minutes` itself: `0` = unset →
+    /// `DEFAULT_IDLE_TICK_FALLBACK_MAX_MINUTES`, then clamped to
+    /// `idle_tick_fallback_minutes..=MAX_IDLE_TICK_FALLBACK_MINUTES` —
+    /// floored at the base (the backoff may only ever make the backstop
+    /// slower, never quicker) and capped by the same never-disableable
+    /// ceiling. Setting it EQUAL to `idle_tick_fallback_minutes` is the
+    /// explicit opt-out: no backoff, the pre-#864 fixed cadence. There is no
+    /// live setter (same precedent as `idle_tick_fallback_minutes` itself);
+    /// the escape hatch is hand-editing `group.json`.
+    pub idle_tick_fallback_max_minutes: u32,
 }
 
 impl Guardrails {
@@ -4163,6 +4196,18 @@ impl Guardrails {
         }
         self.idle_tick_fallback_minutes =
             self.idle_tick_fallback_minutes.clamp(MIN_IDLE_TICK_FALLBACK_MINUTES, MAX_IDLE_TICK_FALLBACK_MINUTES);
+        // #864: the backoff ceiling, floored at the base — computed AFTER the
+        // two lines above, so the floor is the group's REAL, already-normalized
+        // fallback rather than a 0 that would let `fallback_interval_minutes`
+        // read a cap below its own base (it defends against that anyway; this
+        // is the same "normalize once, at the edge" discipline
+        // `idle_tick_input_defer_max_minutes` follows against `idle_tick_minutes`).
+        if self.idle_tick_fallback_max_minutes == 0 {
+            self.idle_tick_fallback_max_minutes = DEFAULT_IDLE_TICK_FALLBACK_MAX_MINUTES;
+        }
+        self.idle_tick_fallback_max_minutes = self
+            .idle_tick_fallback_max_minutes
+            .clamp(self.idle_tick_fallback_minutes, MAX_IDLE_TICK_FALLBACK_MINUTES);
         self
     }
 
@@ -10464,6 +10509,20 @@ pub struct OrchRegistry {
     /// any fire while the gate is disabled) — `intake::idle_tick_fallback_due`'s
     /// reference point.
     idle_tick_last_fired_ms: Mutex<HashMap<String, u64>>,
+    /// Idle-tick fallback backoff (#864): how many consecutive unconditional
+    /// fallback wakes this group has taken that found NOTHING — no intake
+    /// signal, no pending CI watch, no watchdog stall (the `heartbeat` fire in
+    /// `idle_tick_tick`). Widens the effective fallback interval
+    /// (`intake::fallback_interval_minutes`); reset to 0 by any delta, any
+    /// human input in the orchestrator pane, any real orchestrator output, or
+    /// any live delegate in the group.
+    ///
+    /// In-memory only, the same lifetime class as `idle_tick_times`/
+    /// `idle_tick_last_fired_ms`: a restart resets the streak, which is the
+    /// safe direction (the group goes back to its BASE cadence and has to
+    /// re-earn the backoff by observing quiet again) and is why nothing
+    /// persists it.
+    idle_tick_empty_streak: Mutex<HashMap<String, u32>>,
     /// Notification backend (#243): per-group "we last saw this group as
     /// paused at tick-time T" bookkeeping, used by `notify_tick` to freeze
     /// the TTL clock across a pause. A group appears here only while
@@ -22277,6 +22336,7 @@ impl OrchRegistry {
             intake_last_scan_ms: Mutex::new(None),
             intake_pending: Mutex::new(HashMap::new()),
             idle_tick_last_fired_ms: Mutex::new(HashMap::new()),
+            idle_tick_empty_streak: Mutex::new(HashMap::new()),
             paused_watch_since: Mutex::new(HashMap::new()),
             channels: Mutex::new(HashMap::new()),
             agent_channel: Mutex::new(HashMap::new()),
@@ -24460,6 +24520,10 @@ impl OrchRegistry {
                 intake_poll_minutes: g["intake_poll_minutes"].as_u64().map(|v| v as u32),
                 // The fallback backstop: absent → 0 → clamped() maps to the default.
                 idle_tick_fallback_minutes: g["idle_tick_fallback_minutes"].as_u64().unwrap_or(0) as u32,
+                // #864: the backoff ceiling; absent → 0 → clamped() maps to the
+                // default, so a pre-#864 group.json gets the backoff rather
+                // than a 0 that would pin it to the base forever.
+                idle_tick_fallback_max_minutes: g["idle_tick_fallback_max_minutes"].as_u64().unwrap_or(0) as u32,
             },
         ))
     }
@@ -24826,6 +24890,19 @@ impl OrchRegistry {
                 } else {
                     persisted.idle_tick_fallback_minutes.clamp(MIN_IDLE_TICK_FALLBACK_MINUTES, MAX_IDLE_TICK_FALLBACK_MINUTES)
                 };
+                // #864's ceiling rides the same re-hydration for the same
+                // reason: it is hand-edited into group.json, and a Fresh-shaped
+                // relaunch (launcher guardrails, which have no field for it)
+                // would otherwise silently reset it. Resolve 0 → default FIRST,
+                // then clamp unconditionally against the fallback resolved just
+                // above — `clamped()`'s exact order, because this floor is
+                // dynamic, not a static in-range default.
+                guardrails.idle_tick_fallback_max_minutes = (if persisted.idle_tick_fallback_max_minutes == 0 {
+                    DEFAULT_IDLE_TICK_FALLBACK_MAX_MINUTES
+                } else {
+                    persisted.idle_tick_fallback_max_minutes
+                })
+                .clamp(guardrails.idle_tick_fallback_minutes, MAX_IDLE_TICK_FALLBACK_MINUTES);
             }
         }
         // #255: advisory only — never override a cap the human set. A launcher
@@ -24877,6 +24954,7 @@ impl OrchRegistry {
                 "intake": intake_json(&info.guardrails.intake),
                 "intake_poll_minutes": info.guardrails.intake_poll_minutes,
                 "idle_tick_fallback_minutes": info.guardrails.idle_tick_fallback_minutes,
+                "idle_tick_fallback_max_minutes": info.guardrails.idle_tick_fallback_max_minutes,
             },
         }))
         .unwrap();
@@ -26335,11 +26413,32 @@ impl OrchRegistry {
             let Some(repo) = repos.get(&group) else { continue };
             let issues_raw =
                 self.gh_capture(repo, &["issue", "list", "--state", "open", "--json", "number,title,labels"]);
-            let prs_raw =
-                self.gh_capture(repo, &["pr", "list", "--state", "open", "--json", "number,title,statusCheckRollup"]);
+            // #864: `comments,reviews` ride the PR call that was already being
+            // made — the newest-comment timestamp is the one delta the
+            // orchestrator still polled by hand on every tick, and folding it
+            // in here costs zero extra round-trips (the two calls per due group
+            // this poller is budgeted for are unchanged).
+            //
+            // It DOES widen the response, and by a lot: `gh` has no sub-field
+            // selection, so every comment and review BODY comes down whether or
+            // not anything reads them. Measured on this repo at 14 open PRs
+            // (rev-368 F3): 20,034 bytes without the two fields, 288,284 with —
+            // 14.4x, ~1-2s either way, well inside `GH_CAPTURE_TIMEOUT`. The
+            // round-trip count is what stays flat, NOT the byte count: this
+            // grows linearly with total discussion volume across the (gh
+            // default) 30 most recent open PRs, so a busier repo pays
+            // proportionally more. `intake::parse_pr_list` skips the bodies
+            // without allocating them, so the cost lands on one larger response
+            // string per poll rather than per comment, and `capture_raw_inner`
+            // reads to end with no cap — there is no truncation path that could
+            // silently drop the check-state half of the same response.
+            let prs_raw = self.gh_capture(
+                repo,
+                &["pr", "list", "--state", "open", "--json", "number,title,statusCheckRollup,comments,reviews"],
+            );
             self.intake_last_poll_ms.lock_safe().insert(group.clone(), now);
 
-            let (label_signals, pr_signals) = {
+            let (label_signals, pr_signals, comment_signals) = {
                 let mut seen = self.intake_seen.lock_safe();
                 let state = seen.entry(group.clone()).or_default();
                 let labels = issues_raw
@@ -26348,18 +26447,24 @@ impl OrchRegistry {
                     .and_then(intake::parse_issue_list)
                     .map(|issues| intake::label_deltas(&mut state.labels, &issues))
                     .unwrap_or_default();
-                let prs = prs_raw
+                // One parse feeds both PR diffs — check-state transitions and
+                // comment/review activity are two questions about the same
+                // `gh pr list` response, not two polls.
+                let parsed_prs = prs_raw.as_deref().ok().and_then(intake::parse_pr_list);
+                let checks = parsed_prs
                     .as_deref()
-                    .ok()
-                    .and_then(intake::parse_pr_list)
-                    .map(|prs| intake::pr_check_deltas(&mut state.pr_checks, &prs))
+                    .map(|prs| intake::pr_check_deltas(&mut state.pr_checks, prs))
                     .unwrap_or_default();
-                (labels, prs)
+                let comments = parsed_prs
+                    .as_deref()
+                    .map(|prs| intake::pr_comment_deltas(&mut state.pr_comments, prs))
+                    .unwrap_or_default();
+                (labels, checks, comments)
             };
-            if label_signals.is_empty() && pr_signals.is_empty() {
+            if label_signals.is_empty() && pr_signals.is_empty() && comment_signals.is_empty() {
                 continue;
             }
-            let summary = intake::intake_wake_summary(&label_signals, &pr_signals);
+            let summary = intake::intake_wake_summary(&label_signals, &pr_signals, &comment_signals);
             self.audit(&group, "loomux", "intake-signal", json!({ "summary": summary }));
             // Fold into any not-yet-delivered pending summary rather than
             // clobbering it — two poll scans can each find something new
@@ -26393,6 +26498,19 @@ impl OrchRegistry {
     #[doc(hidden)] // pub for integration tests: control the fallback-due reference point precisely
     pub fn seed_idle_tick_last_fired(&self, group: &str, ms: u64) {
         self.idle_tick_last_fired_ms.lock_safe().insert(group.to_string(), ms);
+    }
+
+    /// #864: this group's consecutive delta-free fallback-wake count.
+    ///
+    /// Read-only, and deliberately NOT a way to test the backoff: the tests
+    /// that matter drive `idle_tick_tick` over a simulated timeline and assert
+    /// on WHEN ticks actually land, because that is the behavior the issue
+    /// asks for. This exists for the one assertion that timeline shape can't
+    /// make sharply — that a reset really cleared the counter rather than the
+    /// cadence merely looking right for some other reason.
+    #[doc(hidden)] // pub for integration tests
+    pub fn idle_tick_empty_streak_of(&self, group: &str) -> u32 {
+        self.idle_tick_empty_streak.lock_safe().get(group).copied().unwrap_or(0)
     }
 
     // ---------- cross-workspace channels (#271): human-connected agent-pane sessions ----------
@@ -27442,12 +27560,58 @@ impl OrchRegistry {
     /// from the pty read (`orchestrator_activity`) so the gate / latch / cap /
     /// pause logic is testable with synthetic counters — the `watchdog_tick`
     /// shape.
+    ///
+    /// **#864 — the fallback backs off while a group stays delta-free.** The
+    /// bounded fallback is what keeps a poller bug from silencing the
+    /// orchestrator, but at a fixed cadence it also charged a fully parked
+    /// group (every open item human-gated, no live delegates, nothing changing
+    /// anywhere the host can see) that cadence forever: ~30 consecutive
+    /// findings-free wakes over one parked weekend, each an API turn over the
+    /// orchestrator's whole prefix. So each fallback wake that finds NOTHING
+    /// (`heartbeat`) doubles this group's effective fallback interval, up to
+    /// `idle_tick_fallback_max_minutes` (`intake::fallback_interval_minutes`),
+    /// and the streak resets to zero — back to the base cadence — on ANY of:
+    /// a fire with a real signal behind it, human input in the pane since the
+    /// last fire, or a live delegate in the group. Note what is NOT on that
+    /// list: the orchestrator's own output, which in a parked group is mostly
+    /// its reply to the previous wake (see the output branch below). The
+    /// guarantee is unchanged in kind and only coarser in degree: the
+    /// orchestrator is still woken unconditionally, at worst once per ceiling.
     pub fn idle_tick_tick(
         &self,
         now: u64,
         outputs: &HashMap<String, u64>,
         inputs: &HashMap<String, u64>,
     ) -> Vec<String> {
+        /// One decided delivery, carried from the scan loop (which holds the
+        /// `agents` lock) to the delivery loop (which must not). Named fields
+        /// rather than the positional tuple this started as: #864 added two
+        /// more observability values and a 7-tuple stops being readable.
+        ///
+        /// - `gate_enabled` is false only for the `intake_minutes == 0` bypass
+        ///   (the pre-#332 legacy fire).
+        /// - `heartbeat` is true only when the gate fired SOLELY because the
+        ///   bounded fallback came due — no intake signal, no pending CI watch,
+        ///   no watchdog stall. The rev-95 benchtest finding (#429) was that a
+        ///   delivered wake and a suppressed one were indistinguishable in the
+        ///   audit log, which is how "the gate computes but does not gate" went
+        ///   unnoticed; this field and `gate_enabled` exist so they aren't.
+        /// - `input_defer_bound` (#496) is true only when THIS fire happened
+        ///   because `idle_tick_input_defer_max_minutes` capped the input fold,
+        ///   not because the pane was genuinely output-quiet.
+        /// - `empty_streak` / `fallback_minutes` (#864) are the delta-free
+        ///   streak AFTER this fire and the effective fallback interval that
+        ///   produced it — the same reasoning applied to the backoff: a cadence
+        ///   that decays silently is a cadence nobody can debug.
+        struct IdleTickFire {
+            id: String,
+            group: String,
+            gate_enabled: bool,
+            heartbeat: bool,
+            input_defer_bound: bool,
+            empty_streak: u32,
+            fallback_minutes: u32,
+        }
         let autonomous = self.autonomous_groups.lock_safe().clone();
         if autonomous.is_empty() {
             return Vec::new();
@@ -27456,7 +27620,7 @@ impl OrchRegistry {
         let tick_times = self.idle_tick_times.lock_safe().clone();
         // Per-group idle-tick window + activity floor (guardrails, live-adjustable).
         // Snapshot like `watchdog_tick` does its thresholds.
-        let cfg: HashMap<String, (u32, u64, u32, u32, u32)> = self
+        let cfg: HashMap<String, (u32, u64, u32, u32, u32, u32)> = self
             .groups
             .lock_safe()
             .iter()
@@ -27478,6 +27642,9 @@ impl OrchRegistry {
                         // #496: bound on how long human input alone may defer
                         // the tick past `last_output_progress_ms`.
                         g.guardrails.idle_tick_input_defer_max_minutes,
+                        // #864: the ceiling the fallback backs off TO while
+                        // this group stays delta-free.
+                        g.guardrails.idle_tick_fallback_max_minutes,
                     ),
                 )
             })
@@ -27495,24 +27662,31 @@ impl OrchRegistry {
             .filter(|a| a.watchdog_notified)
             .map(|a| a.group.clone())
             .collect();
+        // #864: groups with at least one live (running) DELEGATE — any
+        // non-orchestrator agent. The fallback backoff is suppressed for them:
+        // a group with agents in flight is not parked by any definition, and
+        // the heartbeat tick is exactly how an orchestrator notices a delegate
+        // that went quiet without reporting. Taken on its own short-lived lock
+        // in the same pass-shape as `watchdog_stall_groups` directly above,
+        // before the mutable `agents` borrow below.
+        let live_delegate_groups: HashSet<String> = self
+            .agents
+            .lock_safe()
+            .values()
+            .filter(|a| a.role != Role::Orchestrator && a.status == AgentStatus::Running)
+            .map(|a| a.group.clone())
+            .collect();
         let intake_pending = self.intake_pending.lock_safe().clone();
         let last_fired = self.idle_tick_last_fired_ms.lock_safe().clone();
+        let empty_streak = self.idle_tick_empty_streak.lock_safe().clone();
 
-        // (id, group, gate_enabled, heartbeat, input_defer_bound) — `gate_enabled`
-        // is false only for the `intake_minutes == 0` bypass (pre-#332 legacy
-        // fire); `heartbeat` is true only when the gate fired SOLELY because the
-        // bounded fallback came due (no intake signal, no pending CI watch, no
-        // watchdog stall) — the rev-95 benchtest finding (#429) showed a
-        // delivered wake and a suppressed one are otherwise indistinguishable in
-        // the audit log, which is exactly how "the gate computes but does not
-        // gate" went unnoticed: both fields are carried through to the audit
-        // entry below purely for observability. `input_defer_bound` (#496) is
-        // true only when THIS fire happened because
-        // `idle_tick_input_defer_max_minutes` capped the input fold, not because
-        // the pane was genuinely output-quiet — a tick firing for that unusual
-        // reason must say so too.
-        let mut to_notify: Vec<(String, String, bool, bool, bool)> = Vec::new();
+        let mut to_notify: Vec<IdleTickFire> = Vec::new();
         let mut skipped: Vec<(String, String)> = Vec::new();
+        // #864: (group, new streak) for every group whose delta-free streak
+        // this scan changed — collected here and applied after the `agents`
+        // borrow drops, so no second lock is ever taken while holding it (the
+        // same discipline the snapshots above follow in the other direction).
+        let mut streak_updates: Vec<(String, u32)> = Vec::new();
         {
             let mut agents = self.agents.lock_safe();
             for a in agents.values_mut() {
@@ -27528,13 +27702,14 @@ impl OrchRegistry {
                 // rebaselines the counter but does NOT reset the clock, so an
                 // occasional statusline/spinner frame can't starve the tick (the
                 // bug where any stray byte demanded another full quiet window).
-                let (threshold, floor, intake_minutes, fallback_minutes, input_defer_max_minutes) =
+                let (threshold, floor, intake_minutes, fallback_minutes, input_defer_max_minutes, fallback_max_minutes) =
                     cfg.get(&a.group).copied().unwrap_or((
                         DEFAULT_IDLE_TICK_MINUTES,
                         DEFAULT_IDLE_ACTIVITY_FLOOR_BYTES,
                         0,
                         DEFAULT_IDLE_TICK_FALLBACK_MINUTES,
                         DEFAULT_IDLE_TICK_INPUT_DEFER_MAX_MINUTES,
+                        DEFAULT_IDLE_TICK_FALLBACK_MAX_MINUTES,
                     ));
                 if let Some(&cur) = outputs.get(&a.id) {
                     let meaningful = idle_output_is_activity(a.last_output_total, cur, floor);
@@ -27546,6 +27721,17 @@ impl OrchRegistry {
                         a.last_output_progress_ms = now;
                         a.idle_tick_notified = false;
                         a.idle_tick_skip_rearm_ms = 0;
+                        // #864 deliberately does NOT reset the delta-free streak
+                        // here. Orchestrator output is not evidence that anything
+                        // changed — the dominant source of it in a parked group is
+                        // the orchestrator answering our own last wake: it sweeps,
+                        // finds nothing, and goes quiet again, which is precisely
+                        // the loop the backoff exists to slow down. Resetting on it
+                        // would make the streak un-growable in production while
+                        // still passing any test that never simulated the reply.
+                        // The three resets that DO fire (a wake with a real signal
+                        // behind it, human input, a live delegate) are all evidence
+                        // about the world, not about the orchestrator's own talking.
                         continue;
                     }
                 }
@@ -27568,6 +27754,14 @@ impl OrchRegistry {
                 // audited with its own reason instead of reading as an ordinary
                 // quiet-window fire.
                 let mut input_defer_bound = false;
+                let group_last_fired = last_fired.get(&a.group).copied().unwrap_or(0);
+                // #864: this group's delta-free streak, as it stands entering
+                // this scan. Every reset below writes BOTH this local (so the
+                // effective interval computed further down already reflects
+                // it) and `streak_updates` (so it outlives the scan) — a reset
+                // that only did the latter would still widen the interval one
+                // last time on the very scan that observed the group waking up.
+                let mut streak = empty_streak.get(&a.group).copied().unwrap_or(0);
                 if let Some(&last_in) = inputs.get(&a.id) {
                     let bound_ms = (input_defer_max_minutes as u64) * 60_000;
                     let cap = a.last_output_progress_ms.saturating_add(bound_ms);
@@ -27578,6 +27772,35 @@ impl OrchRegistry {
                     if effective > a.last_progress_ms {
                         a.last_progress_ms = effective;
                     }
+                    // #864: the human touched this pane since the last tick
+                    // fired, so the group is not parked — reset the backoff to
+                    // the base cadence. Deliberately the RAW `last_in`, not
+                    // the `input_defer_max_minutes`-clamped `effective`: the
+                    // clamp exists to stop a possibly-phantom input signal
+                    // from muting the tick FOREVER (#496), and honoring it
+                    // here would work the other way — a real human typing
+                    // past the bound would leave the streak growing.
+                    // Over-resetting only ever costs a base-cadence wake.
+                    if last_in > group_last_fired {
+                        streak = 0;
+                        streak_updates.push((a.group.clone(), 0));
+                    }
+                }
+                // #864: a group with agents in flight is not parked, whatever
+                // the host-side poll sees — and the heartbeat wake is exactly
+                // how an orchestrator notices a delegate that went quiet
+                // without reporting. Keep those groups on the base cadence.
+                //
+                // This suppresses the streak in BOTH directions — the reset
+                // here, and the increment at the fire site below. Resetting
+                // alone left the counter at 1 between a fire and the next
+                // scan (the fire's own `streak_updates` entry lands after this
+                // one and wins), so a delegate exiting in that window handed
+                // the now-parked group a doubling it never earned.
+                let backoff_suppressed = live_delegate_groups.contains(&a.group);
+                if backoff_suppressed {
+                    streak = 0;
+                    streak_updates.push((a.group.clone(), 0));
                 }
                 // A paused group's orchestrator is deliberately quiet; never tick
                 // and never burn its one-notice latch while paused.
@@ -27605,9 +27828,19 @@ impl OrchRegistry {
                 ) {
                     if intake_minutes == 0 {
                         // The gate is off for this group: fire exactly as #332
-                        // never happened.
+                        // never happened. #864's backoff rides the gate's
+                        // fallback, so it is likewise absent here — there is no
+                        // fallback to widen when every tick fires anyway.
                         a.idle_tick_notified = true;
-                        to_notify.push((a.id.clone(), a.group.clone(), false, false, input_defer_bound));
+                        to_notify.push(IdleTickFire {
+                            id: a.id.clone(),
+                            group: a.group.clone(),
+                            gate_enabled: false,
+                            heartbeat: false,
+                            input_defer_bound,
+                            empty_streak: 0,
+                            fallback_minutes: 0,
+                        });
                         continue;
                     }
                     // #329 coexistence note (rev-31 finding 2): this whole `if` is scoped to
@@ -27626,8 +27859,15 @@ impl OrchRegistry {
                     let has_intake_signal = intake_pending.get(&a.group).is_some_and(|p| !p.is_empty());
                     let has_pending_notification = notification_pending_groups.contains(&a.group);
                     let has_watchdog_stall = watchdog_stall_groups.contains(&a.group);
-                    let group_last_fired = last_fired.get(&a.group).copied().unwrap_or(0);
-                    let fallback_due = intake::idle_tick_fallback_due(group_last_fired, now, fallback_minutes);
+                    // #864: the fallback the gate consults is the group's
+                    // EFFECTIVE one — base, widened by however long it has been
+                    // delta-free. `streak` is already 0 here for any group this
+                    // scan saw waking up (see the resets above), so a group only
+                    // ever pays the widened interval while it is genuinely quiet.
+                    let effective_fallback_minutes =
+                        intake::fallback_interval_minutes(fallback_minutes, streak, fallback_max_minutes);
+                    let fallback_due =
+                        intake::idle_tick_fallback_due(group_last_fired, now, effective_fallback_minutes);
                     if intake::idle_tick_gate(has_intake_signal, has_pending_notification, has_watchdog_stall, fallback_due) {
                         a.idle_tick_notified = true;
                         // Heartbeat = the ONLY reason this fired is the bounded
@@ -27637,17 +27877,48 @@ impl OrchRegistry {
                         // marks it distinctly so a null-summary fire is never
                         // silently mistaken for a real signal, or vice versa.
                         let heartbeat = !has_intake_signal && !has_pending_notification && !has_watchdog_stall;
-                        to_notify.push((a.id.clone(), a.group.clone(), true, heartbeat, input_defer_bound));
+                        // #864: a wake that found nothing extends the streak —
+                        // this is the ONLY place it grows, so the cadence decays
+                        // once per delivered empty wake, not once per gate
+                        // evaluation (a skip re-checks every `intake_minutes`
+                        // and must not ramp the interval by itself). A wake with
+                        // a real signal behind it resets: the group is not parked.
+                        // `backoff_suppressed` short-circuits the growth entirely
+                        // so a suppressed group's streak is 0 at ALL times, not
+                        // merely re-zeroed on the following scan.
+                        streak = if heartbeat && !backoff_suppressed { streak.saturating_add(1) } else { 0 };
+                        streak_updates.push((a.group.clone(), streak));
+                        to_notify.push(IdleTickFire {
+                            id: a.id.clone(),
+                            group: a.group.clone(),
+                            gate_enabled: true,
+                            heartbeat,
+                            input_defer_bound,
+                            empty_streak: streak,
+                            fallback_minutes: effective_fallback_minutes,
+                        });
                     } else {
                         a.idle_tick_notified = true;
                         a.idle_tick_skip_rearm_ms = now + intake_minutes as u64 * 60_000;
                         let reason = format!(
                             "no intake signal, no pending CI watch, no watchdog stall, fallback not yet due \
-                             (next re-check in ~{intake_minutes}m)"
+                             (effective fallback ~{effective_fallback_minutes}m after {streak} delta-free wake(s); \
+                             next re-check in ~{intake_minutes}m)"
                         );
                         skipped.push((a.group.clone(), reason));
                     }
                 }
+            }
+        }
+
+        // #864: applied here, after the `agents` borrow above has dropped —
+        // insert rather than replace-the-map, so a group this scan never
+        // looked at (no running orchestrator yet, paused, not autonomous)
+        // keeps whatever streak it had.
+        if !streak_updates.is_empty() {
+            let mut streaks = self.idle_tick_empty_streak.lock_safe();
+            for (group, value) in streak_updates {
+                streaks.insert(group, value);
             }
         }
 
@@ -27656,7 +27927,16 @@ impl OrchRegistry {
         }
 
         let mut notified = Vec::new();
-        for (id, group, gate_enabled, heartbeat, input_defer_bound) in to_notify {
+        for IdleTickFire {
+            id,
+            group,
+            gate_enabled,
+            heartbeat,
+            input_defer_bound,
+            empty_streak: streak_after,
+            fallback_minutes: fallback_minutes_effective,
+        } in to_notify
+        {
             // Record the delivery for the per-hour backstop, pruning to the window.
             // This ring is in-memory only (like `spawn_times`): a restart resets
             // the window, which is the safe direction — the cap is a runaway
@@ -27692,6 +27972,14 @@ impl OrchRegistry {
                 "gate_enabled": gate_enabled,
                 "suppressed": false,
                 "heartbeat": heartbeat,
+                // #864: how many consecutive delta-free wakes this group has
+                // now taken, and the effective fallback interval that produced
+                // THIS one (both 0 for a gate-off bypass fire, which has no
+                // fallback at all). Without these a decaying cadence is
+                // invisible after the fact — the same observability argument
+                // `heartbeat`/`gate_enabled` were added for in #429.
+                "empty_streak": streak_after,
+                "fallback_minutes": fallback_minutes_effective,
                 // #496: distinct, audited reason when THIS fire happened only
                 // because `idle_tick_input_defer_max_minutes` capped a perpetually-
                 // refreshing input signal — an unusual reason a tick fired, and one
@@ -42084,6 +42372,10 @@ fn create_orchestration_sync(
             intake_poll_minutes: None,
             // #332: 0 → clamped() applies DEFAULT_IDLE_TICK_FALLBACK_MINUTES.
             idle_tick_fallback_minutes: 0,
+            // #864: 0 → clamped() applies DEFAULT_IDLE_TICK_FALLBACK_MAX_MINUTES,
+            // so the backoff is on by default for every new group; hand-edit
+            // group.json to pin it to the base (no backoff).
+            idle_tick_fallback_max_minutes: 0,
         },
         Launch::Fresh,
         None,

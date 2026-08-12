@@ -110,7 +110,9 @@ PRs) simply never runs. Autonomous mode adds the missing **tick source**.
 - **An intake gate runs by default whenever autonomous mode is on.** Out of the
   box, the idle window firing is not sufficient on its own: loomux also
   runs a zero-token, host-side check (`gh issue list` / `gh pr list`, no LLM
-  turn) for the same signals the tick exists to catch, and the orchestrator is
+  turn) for the same signals the tick exists to catch — a new
+  `agent-ready`/`agent-investigation` label, an open PR's checks going green or
+  red, and a new comment or review on an open PR — and the orchestrator is
   only actually woken when there's something new — or when something else
   needs it (an outstanding CI watch, an unresolved stalled-worker notice). A
   tick with nothing to report is skipped quietly (visible in the audit trail
@@ -125,6 +127,23 @@ PRs) simply never runs. Autonomous mode adds the missing **tick source**.
   not a schedule: a scan polls at most a few groups, so with many autonomous
   groups coming due together, some are picked up by the next scan a minute
   later rather than all in one burst.
+- **A group parked on you gets checked on less and less often.** That bounded
+  fallback is the one wake nothing can suppress, so a group where everything is
+  waiting on *you* — every open item human-gated, no delegates running, nothing
+  moving on GitHub — used to pay it at full price indefinitely, and over a
+  parked weekend that adds up to dozens of wake-ups that find nothing. So the
+  fallback now backs off while nothing changes: each unconditional wake that
+  finds nothing doubles the wait before the next one, up to a ceiling of a day
+  (**3h → 6h → 12h → 24h** with the defaults). It snaps straight back to the
+  base interval the moment anything happens — a label, a PR's checks, a comment
+  or review, you typing in the pane, or any delegate being alive in the group.
+  The backstop is coarser, never absent: a fully parked group is still woken
+  unconditionally at least once a day. Both ends are per-group and hand-edited
+  in `group.json` (`idle_tick_fallback_minutes` and
+  `idle_tick_fallback_max_minutes`); setting the two equal turns the backoff off
+  and restores a fixed cadence. The audit trail records the decay — each
+  `idle-tick` entry carries the `empty_streak` it reached and the
+  `fallback_minutes` interval that produced it.
 
 Autonomous mode is generic: loomux's own orchestration group is just another
 group, so turning it on for the repo loomux itself is developed in would idle-tick
