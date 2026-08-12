@@ -27855,8 +27855,14 @@ impl OrchRegistry {
                     // delta-free. `streak` is already 0 here for any group this
                     // scan saw waking up (see the resets above), so a group only
                     // ever pays the widened interval while it is genuinely quiet.
-                    let effective_fallback_minutes =
-                        intake::fallback_interval_minutes(fallback_minutes, streak, fallback_max_minutes);
+                    // SCRATCH ROUND A2 — the backoff is set aside at the WIRING,
+                    // not in the pure function (whose own unit tests stay green
+                    // and are evidenced separately in round A1, run 31556589821):
+                    // the gate consults the raw base interval, which is exactly
+                    // the pre-#864 behaviour. Every cadence test that fails on
+                    // this commit fails because the interval never widens.
+                    let _ = intake::fallback_interval_minutes(fallback_minutes, streak, fallback_max_minutes);
+                    let effective_fallback_minutes = fallback_minutes;
                     let fallback_due =
                         intake::idle_tick_fallback_due(group_last_fired, now, effective_fallback_minutes);
                     if intake::idle_tick_gate(has_intake_signal, has_pending_notification, has_watchdog_stall, fallback_due) {
