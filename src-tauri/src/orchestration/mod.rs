@@ -8792,11 +8792,26 @@ pub const LIST_TASKS_DONE_CAP: usize = 20;
 /// deletes data: `get_task` and the audit log still carry every row this
 /// drops; `include_all` on the caller's end bypasses the cap entirely. Pure
 /// (no registry, no clock) so the keep/drop rule is unit-testable directly.
-pub fn filter_done_rows(rows: Vec<TaskSummary>, _cap: usize) -> (Vec<TaskSummary>, usize) {
-    // TODO(#865 red/green): stub for the pre-fix "red" CI run — matches
-    // today's actual bug (list_tasks returns every done row forever, no
-    // omission). The next commit replaces this body with the real cap.
-    (rows, 0)
+pub fn filter_done_rows(rows: Vec<TaskSummary>, cap: usize) -> (Vec<TaskSummary>, usize) {
+    let mut done_idx: Vec<usize> =
+        rows.iter().enumerate().filter(|(_, r)| r.status == "done").map(|(i, _)| i).collect();
+    if done_idx.len() <= cap {
+        return (rows, 0);
+    }
+    let total_done = done_idx.len();
+    // Newest `updated_ms` first; ties fall back to the board's own order (by
+    // original index) so the keep-set is deterministic without leaning on
+    // sort_by's stability as the only thing pinning it.
+    done_idx.sort_by(|&a, &b| rows[b].updated_ms.cmp(&rows[a].updated_ms).then(a.cmp(&b)));
+    let keep: std::collections::HashSet<usize> = done_idx.into_iter().take(cap).collect();
+    let omitted = total_done - keep.len();
+    let filtered = rows
+        .into_iter()
+        .enumerate()
+        .filter(|(i, r)| r.status != "done" || keep.contains(i))
+        .map(|(_, r)| r)
+        .collect();
+    (filtered, omitted)
 }
 
 /// Normalize and validate one link array on write (#582): trim, drop empties,
