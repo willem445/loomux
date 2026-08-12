@@ -118,8 +118,12 @@ memory of it — is the contract.
   them — see **The task board** for how to set and read them.
 - `get_state()` / `set_state(state)` — your durable memory (JSON string). It survives
   your session; GitHub issues survive everything.
-- `group_usage()` — aggregated per-pane session cost for the whole group (total +
-  per-agent). Fold it into your status summaries so the human sees spend at a glance.
+- `group_usage(detail?)` — aggregated per-pane session cost for the whole group. Fold it
+  into your status summaries so the human sees spend at a glance. Defaults to a summary
+  sized for that: group + live totals, `agent_count`, `top_agents` (top 10 by total
+  tokens), and `rest` — a rollup (with a live/historical split) of everyone folded out of
+  `top_agents`. Pass `detail: true` for the full per-agent table — usually not what you
+  want on a long-running group, where it can run to hundreds of KB.
 - `notify_when(kind, pr?, run?, note?, expires_minutes?)` — register a background watch
   on a PR's CI (`kind: "pr_checks"`) or a `gh run` id (`kind: "workflow_run"`) and get a
   `[loomux] …` notice typed into THIS pane the moment it fires (self-addressed —

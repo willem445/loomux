@@ -436,7 +436,7 @@ fn tool_defs(role: Role, role_hint: Option<&str>) -> Vec<Value> {
             tool("remove_task", "Delete a task from the shared board.",
                 json!({ "id": { "type": "string" } }), &["id"]),
             tool("group_usage",
-                "Aggregate the group's token usage and estimated dollar cost into one summary, split live vs lifetime (killed/recycled agents still count). Tokens come from each agent's session transcript and are exact; dollars are estimated from a model price table (subscription/Max accounts show $0 in the CLI, so cite tokens). Fold it into your status updates so the human sees spend at a glance. Defaults to a SUMMARY sized for that: group + live totals, `agent_count` (the whole lifetime roster), `top_agents` (up to 10, by total tokens descending), and `rest` — `{count, tokens, cost_usd}` for every agent folded out of `top_agents`, so the summary always says how many agents it collapsed rather than silently dropping them. Pass `detail: true` for the full per-agent `agents` table instead — on a large lifetime roster (654 agents measured at 173,245 chars) that is too big to fold into a status update, so ask for it only when you need a specific agent's row.",
+                "Aggregate the group's token usage and estimated dollar cost into one summary, split live vs lifetime (killed/recycled agents still count). Tokens come from each agent's session transcript and are exact; dollars are estimated from a model price table (subscription/Max accounts show $0 in the CLI, so cite tokens). Fold it into your status updates so the human sees spend at a glance. Defaults to a SUMMARY sized for that: group + live totals, `agent_count` (the whole lifetime roster), `top_agents` (up to 10, by total tokens descending), and `rest` — `{count, tokens, cost_usd, cost_basis, live: {count, tokens}, historical: {count, tokens}}` for every agent folded out of `top_agents`. Top-N is picked by lifetime tokens, so a group with a long history can push every live agent out of `top_agents`; `rest.live` keeps their count/tokens visible instead of forcing `detail: true` just to see who's still running. `rest.cost_basis` labels whether `rest.cost_usd` is `estimated`, `reported`, or `mixed` (same rule as the top-level `*_cost_basis` fields), so a blended figure is never shown as one honest number. The `rest` count itself is what keeps this from being a silent truncation. Pass `detail: true` for the full per-agent `agents` table instead — on a large lifetime roster (654 agents measured at 173,245 chars) that is too big to fold into a status update, so ask for it only when you need a specific agent's row.",
                 json!({
                     "detail": { "type": "boolean", "description": "Return the full per-agent `agents` table instead of the top_agents/rest summary. Default false." },
                 }), &[]),
@@ -623,13 +623,36 @@ fn arg_bool(args: &Value, key: &str) -> Result<bool, String> {
 /// group's roster size (constraint: no repo/machine-specific tuning).
 const GROUP_USAGE_SUMMARY_TOP_N: usize = 10;
 
+/// How to label a dollar total: all token-estimated, all CLI-reported, or a
+/// mix. `None` when there is no cost figure at all. Same rule as
+/// `compute_group_usage`'s own `basis` closure (`orchestration/mod.rs`) —
+/// duplicated rather than shared because that one closes over locals it
+/// computes inline; applied here to `rest.cost_usd` so a summary-mode dollar
+/// figure that blends two pricing sources is never presented as one honest
+/// label (#866 review finding 3).
+fn usage_cost_basis(estimated: bool, reported: bool) -> Option<&'static str> {
+    match (estimated, reported) {
+        (true, true) => Some("mixed"),
+        (true, false) => Some("estimated"),
+        (false, true) => Some("reported"),
+        (false, false) => None,
+    }
+}
+
 /// Collapse `group_usage`'s full per-agent `agents` array into the summary
 /// an orchestrator can actually fold into a status update (#866): a
 /// 654-agent lifetime roster serialized to 173,245 chars, unreadable
 /// in-context. Group/live totals pass through unchanged; `agents` is
 /// replaced by `top_agents` (the `top_n` agents by total tokens, descending)
-/// and `rest`, an explicit `{count, tokens, cost_usd}` rollup of everyone
-/// else — the count is what keeps this from being a silent truncation.
+/// and `rest`, an explicit rollup of everyone else — the count is what keeps
+/// this from being a silent truncation.
+///
+/// `rest` is split by liveness (#866 review finding 1): top-N is chosen by
+/// **lifetime** tokens across the whole roster, so on a group with a long
+/// history and a handful of live agents, every live agent can end up in
+/// `rest` — the one row the orchestrator's own template says to fold into
+/// its status updates. `rest.live` / `rest.historical` keep that
+/// attribution visible without needing `detail: true`.
 fn summarize_group_usage(full: &Value, top_n: usize) -> Value {
     let mut agents: Vec<Value> = full["agents"].as_array().cloned().unwrap_or_default();
     // `compute_group_usage` sorts by agent id; re-sort by total tokens
@@ -643,12 +666,28 @@ fn summarize_group_usage(full: &Value, top_n: usize) -> Value {
     let rest = agents.split_off(top_n.min(agent_count));
     let rest_count = rest.len();
     let rest_tokens: u64 = rest.iter().map(|a| a["tokens"]["total"].as_u64().unwrap_or(0)).sum();
+    let (mut rest_live_count, mut rest_live_tokens) = (0u64, 0u64);
+    let (mut rest_hist_count, mut rest_hist_tokens) = (0u64, 0u64);
     let mut rest_cost_known = false;
     let mut rest_cost = 0.0f64;
+    let (mut rest_est, mut rest_rep) = (false, false);
     for a in &rest {
+        let tokens = a["tokens"]["total"].as_u64().unwrap_or(0);
+        if a["live"].as_bool().unwrap_or(false) {
+            rest_live_count += 1;
+            rest_live_tokens += tokens;
+        } else {
+            rest_hist_count += 1;
+            rest_hist_tokens += tokens;
+        }
         if let Some(c) = a["cost_usd"].as_f64() {
             rest_cost += c;
             rest_cost_known = true;
+            if a["estimated"].as_bool().unwrap_or(false) {
+                rest_est = true;
+            } else {
+                rest_rep = true;
+            }
         }
     }
 
@@ -661,6 +700,9 @@ fn summarize_group_usage(full: &Value, top_n: usize) -> Value {
             "count": rest_count,
             "tokens": rest_tokens,
             "cost_usd": rest_cost_known.then_some(rest_cost),
+            "cost_basis": usage_cost_basis(rest_est, rest_rep),
+            "live": { "count": rest_live_count, "tokens": rest_live_tokens },
+            "historical": { "count": rest_hist_count, "tokens": rest_hist_tokens },
         }));
     }
     out
