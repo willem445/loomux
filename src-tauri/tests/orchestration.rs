@@ -14082,6 +14082,251 @@ fn intake_gate_off_fires_unconditionally_exactly_like_before_332() {
          benchtest finding was exactly that these two looked identical in the audit log");
 }
 
+// ---------- #864: the fallback backs off while a group stays delta-free ----------
+//
+// Evidence from a real parked weekend (group loomux-68435179, Aug 9–11): ~30
+// consecutive idle ticks, every open item human-gated, every tick's sweep
+// finding zero change, each costing 1–2 API turns over the orchestrator's whole
+// ~180k-token prefix. The gate was working — there was genuinely nothing to
+// report — but the UNCONDITIONAL fallback underneath it fired on a cadence that
+// ignored how long the group had been delta-free.
+//
+// These tests assert on WHEN the orchestrator is actually woken across a
+// simulated timeline, not on the counter behind it: "the cadence decays" is the
+// behaviour #864 asks for, and a test that only read the streak field would
+// pass just as happily if the interval it feeds were never consulted.
+
+/// Like `autonomous_setup_with_gate`, plus #864's backoff ceiling.
+fn autonomous_setup_with_backoff(
+    intake_poll_minutes: Option<u32>,
+    fallback_minutes: u32,
+    fallback_max_minutes: u32,
+) -> (OrchRegistry, tempfile::TempDir, String, String) {
+    let (reg, dir) = test_registry();
+    let g = reg
+        .create_group(
+            "C:/tmp/repo",
+            Guardrails {
+                intake_poll_minutes,
+                idle_tick_fallback_minutes: fallback_minutes,
+                idle_tick_fallback_max_minutes: fallback_max_minutes,
+                ..rails()
+            },
+        )
+        .unwrap();
+    let o = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    reg.set_autonomous(&g.id, true).unwrap();
+    (reg, dir, g.id, o.id)
+}
+
+/// Drive `idle_tick_tick` across a simulated timeline and return the minute
+/// offsets (from `start_ms`) at which the orchestrator was actually woken.
+///
+/// **The orchestrator's reply to each wake is simulated** — a real burst of
+/// output on the scan after every fire — because that burst is what clears the
+/// one-notice latch in production. A timeline that never produced it would fire
+/// exactly once and then sit latched forever, proving nothing about cadence;
+/// worse, it would hide the case that matters most here, since a parked
+/// orchestrator's output is overwhelmingly its own answer to the previous wake.
+///
+/// `before_step` runs at each simulated minute and returns that scan's
+/// human-input map, so a test can also inject a mid-timeline event (a
+/// keystroke, a host-side signal landing) at a chosen offset.
+fn idle_tick_wake_offsets(
+    reg: &OrchRegistry,
+    orch: &str,
+    start_ms: u64,
+    span_minutes: u64,
+    step_minutes: u64,
+    mut before_step: impl FnMut(u64) -> HashMap<String, u64>,
+) -> Vec<u64> {
+    let mut wakes = Vec::new();
+    let mut output_total = 0u64;
+    let mut replying = false;
+    let mut t = 0;
+    while t <= span_minutes {
+        if replying {
+            // A real orchestrator turn dumps many KB — comfortably over the
+            // activity floor, so this reads as "it acted", exactly like the
+            // sweep a delivered wake provokes.
+            output_total += 100_000;
+            replying = false;
+        }
+        let inputs = before_step(t);
+        let outputs: HashMap<String, u64> = [(orch.to_string(), output_total)].into_iter().collect();
+        if !reg.idle_tick_tick(start_ms + t * 60_000, &outputs, &inputs).is_empty() {
+            wakes.push(t);
+            replying = true;
+        }
+        t += step_minutes;
+    }
+    wakes
+}
+
+/// Consecutive gaps between wake offsets — the cadence itself, which is what
+/// every assertion below is really about.
+fn wake_gaps(wakes: &[u64]) -> Vec<u64> {
+    wakes.windows(2).map(|w| w[1] - w[0]).collect()
+}
+
+#[test]
+fn a_delta_free_group_wakes_less_and_less_often_up_to_the_ceiling() {
+    // Base 30 min, ceiling 240 min: the cadence must double per delta-free
+    // wake and then hold — 30, 60, 120, 240, 240 — instead of charging the
+    // base cadence forever the way a fixed fallback does.
+    let (reg, _d, gid, oid) = autonomous_setup_with_backoff(Some(5), 30, 240);
+    reg.seed_idle_tick_last_fired(&gid, FAR);
+
+    let wakes = idle_tick_wake_offsets(&reg, &oid, FAR, 12 * 60, 5, |_| HashMap::new());
+
+    assert_eq!(wakes, vec![30, 90, 210, 450, 690],
+        "a delta-free group's wakes must spread out geometrically, not repeat every {} min", 30);
+    assert_eq!(wake_gaps(&wakes), vec![60, 120, 240, 240],
+        "each delta-free wake doubles the next interval until the ceiling holds it");
+    // The economics, stated as the thing the issue actually asked for: over
+    // half a day this is 5 wakes, where a fixed 30-minute fallback is 24.
+    assert!(wakes.len() < 12 * 60 / 30 / 2, "the whole point is a decayed COST, got {} wakes", wakes.len());
+}
+
+#[test]
+fn the_ceiling_is_a_ceiling_not_a_silence() {
+    // The fallback's own reason for existing survives the backoff: a group
+    // that never sees another delta is still woken unconditionally, just
+    // coarsely. Run four ceiling-widths past saturation and count.
+    let (reg, _d, gid, oid) = autonomous_setup_with_backoff(Some(5), 30, 120);
+    reg.seed_idle_tick_last_fired(&gid, FAR);
+
+    let wakes = idle_tick_wake_offsets(&reg, &oid, FAR, 12 * 60, 5, |_| HashMap::new());
+    let gaps = wake_gaps(&wakes);
+    assert_eq!(gaps.last(), Some(&120), "the cadence must settle AT the ceiling, got {gaps:?}");
+    assert!(gaps.iter().all(|&g| g <= 120), "no interval may ever exceed the ceiling: {gaps:?}");
+    assert!(wakes.len() >= 6, "a saturated group must keep being woken once per ceiling, got {wakes:?}");
+}
+
+#[test]
+fn a_host_side_delta_resets_the_cadence_to_the_base() {
+    // The reset that matters most: the group decays while nothing happens,
+    // then something DOES (the host-side poller finds a labeled issue), and
+    // the very next unconditional wake is back at the base interval — not
+    // still 120 minutes out because of quiet that is no longer true.
+    let (reg, _d, gid, oid) = autonomous_setup_with_backoff(Some(5), 30, 240);
+    reg.seed_idle_tick_last_fired(&gid, FAR);
+
+    let wakes = idle_tick_wake_offsets(&reg, &oid, FAR, 140, 5, |t| {
+        // Two delta-free wakes have landed by t=90 (streak 2, next interval
+        // 120). Land a real signal just after, mid-decay.
+        if t == 100 {
+            reg.seed_intake_pending(&gid, "issue #42 labeled agent-ready (\"Do the thing\")");
+        }
+        HashMap::new()
+    });
+
+    assert_eq!(&wakes[..2], &[30, 90], "sanity: the cadence decays before the signal lands");
+    assert_eq!(wakes[2], 100, "a host-side signal wakes the orchestrator immediately, not on the fallback");
+    assert_eq!(reg.idle_tick_empty_streak_of(&gid), 1,
+        "the signal wake resets the streak, and the delta-free wake after it re-counts from zero");
+    assert_eq!(wakes[3], 130, "the wake after a real signal must be one BASE interval later, not a decayed one");
+}
+
+#[test]
+fn human_input_resets_the_cadence_to_the_base() {
+    // "Reset on any delta or human input": someone at the keyboard means the
+    // group is no longer parked, whether or not anything on GitHub moved.
+    let (reg, _d, gid, oid) = autonomous_setup_with_backoff(Some(5), 30, 240);
+    reg.seed_idle_tick_last_fired(&gid, FAR);
+    let typed_at = FAR + 100 * 60_000;
+
+    let wakes = idle_tick_wake_offsets(&reg, &oid, FAR, 4 * 60, 5, |t| {
+        // The pty reports the LAST input timestamp, so once the human types it
+        // keeps reporting that instant on every later scan — modelled here.
+        if t >= 100 { [(oid.clone(), typed_at)].into_iter().collect() } else { HashMap::new() }
+    });
+
+    assert_eq!(&wakes[..2], &[30, 90], "sanity: the cadence decays while nobody is there");
+    assert_eq!(wakes[2], 120,
+        "after a keystroke the next unconditional wake is one BASE interval after the last fire, \
+         not the 120 minutes the decayed cadence had earned");
+}
+
+#[test]
+fn a_group_with_a_live_delegate_never_backs_off() {
+    // A group with agents in flight is not parked by any definition, and the
+    // heartbeat wake is exactly how an orchestrator notices a delegate that
+    // went quiet without reporting. The backoff must not touch it.
+    let (reg, _d, gid, oid) = autonomous_setup_with_backoff(Some(5), 30, 240);
+    reg.spawn_agent(&gid, Role::Worker, "w", "do work", false, None).unwrap();
+    reg.seed_idle_tick_last_fired(&gid, FAR);
+
+    let wakes = idle_tick_wake_offsets(&reg, &oid, FAR, 3 * 60, 5, |_| HashMap::new());
+
+    assert_eq!(wakes, vec![30, 60, 90, 120, 150, 180],
+        "with a delegate alive the fallback stays at its base cadence, got {wakes:?}");
+    assert_eq!(reg.idle_tick_empty_streak_of(&gid), 0, "and no streak is ever accumulated");
+}
+
+#[test]
+fn backoff_is_off_when_the_ceiling_equals_the_base() {
+    // The documented opt-out — one value, no separate enable flag — must
+    // reproduce the pre-#864 fixed cadence exactly.
+    let (reg, _d, gid, oid) = autonomous_setup_with_backoff(Some(5), 30, 30);
+    reg.seed_idle_tick_last_fired(&gid, FAR);
+
+    let wakes = idle_tick_wake_offsets(&reg, &oid, FAR, 3 * 60, 5, |_| HashMap::new());
+
+    assert_eq!(wakes, vec![30, 60, 90, 120, 150, 180],
+        "ceiling == base must pin the old fixed-cadence behaviour, got {wakes:?}");
+}
+
+#[test]
+fn a_backed_off_wake_is_audited_with_the_cadence_that_produced_it() {
+    // A cadence that decays silently is a cadence nobody can debug — the same
+    // observability argument #429 made for `heartbeat`/`gate_enabled`.
+    let (reg, _d, gid, oid) = autonomous_setup_with_backoff(Some(5), 30, 240);
+    reg.seed_idle_tick_last_fired(&gid, FAR);
+    idle_tick_wake_offsets(&reg, &oid, FAR, 12 * 60, 5, |_| HashMap::new());
+
+    assert!(audit_line_contains(&reg, &gid, "idle-tick", "\"empty_streak\":3"),
+        "each delta-free wake must record the streak it reached");
+    assert!(audit_line_contains(&reg, &gid, "idle-tick", "\"fallback_minutes\":240"),
+        "and the effective interval that produced it");
+    assert!(audit_line_contains(&reg, &gid, "idle-tick-skipped", "delta-free wake(s)"),
+        "a skip must state the effective cadence it is waiting on, not just 'not yet due'");
+}
+
+#[test]
+fn the_backoff_ceiling_is_normalized_and_survives_a_relaunch() {
+    // Same shape as `intake_gate_config_survives_launcher_relaunch`: the
+    // ceiling is hand-edited into group.json with no live setter, so a
+    // launcher relaunch (whose caller Guardrails have no field for it) must
+    // not silently reset it.
+    let g = Guardrails { idle_tick_fallback_minutes: 180, idle_tick_fallback_max_minutes: 0, ..rails() }.clamped();
+    assert_eq!(g.idle_tick_fallback_max_minutes, 60 * 24,
+        "0 = unset must resolve to the default ceiling, so a pre-#864 group.json gets the backoff");
+    let g = Guardrails { idle_tick_fallback_minutes: 180, idle_tick_fallback_max_minutes: 30, ..rails() }.clamped();
+    assert_eq!(g.idle_tick_fallback_max_minutes, 180,
+        "a ceiling below the base is floored at the base — the backoff may never fire FASTER than configured");
+
+    let dir = tempfile::tempdir().unwrap();
+    let gid;
+    {
+        let reg = relaunch_registry(dir.path());
+        reg.set_port(45999);
+        let g = reg
+            .create_group(
+                "C:/tmp/repo",
+                Guardrails { idle_tick_fallback_minutes: 45, idle_tick_fallback_max_minutes: 90, ..rails() },
+            )
+            .unwrap();
+        gid = g.id.clone();
+    }
+    let reg = relaunch_registry(dir.path());
+    reg.set_port(45999);
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    assert_eq!(g.id, gid, "restart resumes the same group");
+    assert_eq!(g.guardrails.idle_tick_fallback_max_minutes, 90,
+        "a hand-edited ceiling must survive a launcher relaunch, not reset to the default");
+}
+
 // ---------- #429 benchtest follow-up: suppressed/heartbeat observability ----------
 //
 // rev-95's live testbed run (loomux-testbed-cc077f09) showed six idle ticks in a row,
