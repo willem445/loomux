@@ -8802,7 +8802,7 @@ pub fn filter_done_rows(rows: Vec<TaskSummary>, cap: usize) -> (Vec<TaskSummary>
     // Newest `updated_ms` first; ties fall back to the board's own order (by
     // original index) so the keep-set is deterministic without leaning on
     // sort_by's stability as the only thing pinning it.
-    done_idx.sort_by(|&a, &b| rows[b].updated_ms.cmp(&rows[a].updated_ms).then(a.cmp(&b)));
+    done_idx.sort_by(|&a, &b| rows[b].updated_ms.cmp(&rows[a].updated_ms).then(b.cmp(&a))); // TODO(#865 red probe): flipped tie-break, should redden filter_done_rows_breaks_updated_ms_ties_by_board_order only
     let keep: std::collections::HashSet<usize> = done_idx.into_iter().take(cap).collect();
     let omitted = total_done - keep.len();
     let filtered = rows

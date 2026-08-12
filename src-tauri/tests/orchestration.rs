@@ -9433,6 +9433,22 @@ fn filter_done_rows_keeps_newest_done_and_every_non_done_row_in_board_order() {
 }
 
 #[test]
+fn filter_done_rows_breaks_updated_ms_ties_by_board_order() {
+    // Review finding (#865): the tie-break comment claimed ties fall back to
+    // board (priority) order, but no prior test had two `done` rows at the
+    // SAME `updated_ms` straddling the cap — distinct values everywhere else
+    // meant `updated_ms` alone always decided it, and the tie-break arm
+    // (`.then(a.cmp(&b))`) was unwitnessed: flipping it to `b.cmp(&a)` would
+    // have stayed green. Two `done` rows tie at 10; capped at 1, the EARLIER
+    // one on the board (t-1) must be the one that survives.
+    let rows = vec![done_row("t-1", "done", 10), done_row("t-2", "done", 10), done_row("t-3", "queued", 5)];
+    let (kept, omitted) = filter_done_rows(rows, 1);
+    assert_eq!(omitted, 1, "one of the two tied done rows is elided");
+    let ids: Vec<&str> = kept.iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(ids, ["t-1", "t-3"], "t-1 wins the tie by board order; t-2 (same updated_ms, later position) is dropped");
+}
+
+#[test]
 fn filter_done_rows_is_a_noop_at_or_under_the_cap() {
     let rows = vec![done_row("t-1", "done", 1), done_row("t-2", "done", 2), done_row("t-3", "queued", 3)];
     let (kept, omitted) = filter_done_rows(rows.clone(), 2);
