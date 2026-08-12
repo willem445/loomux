@@ -30111,6 +30111,78 @@ fn group_usage_summarizes_agents_with_null_cost_without_panes() {
     assert_eq!(denied["isError"], true, "usage aggregation is orchestrator-only");
 }
 
+#[test]
+fn group_usage_mcp_defaults_to_top_n_summary_with_explicit_rest_count() {
+    // #866: a large lifetime roster made the full per-agent table unreadable
+    // in-context (654 agents / 173,245 chars on the reporting group). The
+    // MCP tool must default to top_agents + an explicit rest rollup instead
+    // of the raw `agents` array, and never truncate silently.
+    let (reg, _d, co, _cw) = setup_mcp();
+    // setup_mcp already spawned an orchestrator + a worker (both live, zero
+    // tokens in test mode with no transcript). Add 13 more historical agents
+    // with distinct, increasing token totals so top-N selection is provable.
+    for i in 0..13u64 {
+        let tokens = (i + 1) * 100;
+        let cost = (i + 1) as f64 * 0.1;
+        reg.upsert_usage_snapshot(
+            &co.group,
+            usage_snap(&format!("session-{i}"), &format!("agent-{i}"), cost, tokens, 0),
+        );
+    }
+    // 2 live (orch + worker, 0 tokens each) + 13 synthetic = 15 total.
+    let full = reg.group_usage(&co.group);
+    assert_eq!(full["agents"].as_array().unwrap().len(), 15, "sanity: full table has all 15 agents");
+
+    let via_mcp = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "group_usage", "arguments": {} })).unwrap();
+    assert_eq!(via_mcp["isError"], false);
+    let body: Value = serde_json::from_str(via_mcp["content"][0]["text"].as_str().unwrap()).unwrap();
+
+    assert!(body["agents"].is_null(), "summary mode must not include the raw per-agent table");
+    assert_eq!(body["agent_count"].as_u64(), Some(15), "must state the whole lifetime roster size");
+
+    let top = body["top_agents"].as_array().expect("top_agents present");
+    assert_eq!(top.len(), 10, "default top-N is 10 (#866)");
+    // Sorted descending by total tokens: the 10 highest synthetic snapshots
+    // (400..=1300), not the lowest-id-first order the full table uses.
+    let top_tokens: Vec<u64> = top.iter().map(|a| a["tokens"]["total"].as_u64().unwrap()).collect();
+    assert_eq!(top_tokens, vec![1300, 1200, 1100, 1000, 900, 800, 700, 600, 500, 400]);
+
+    // The 3 lowest synthetic agents (100, 200, 300) plus the 2 zero-token
+    // live agents were folded out of top_agents — the rollup must say so
+    // explicitly rather than silently dropping them.
+    assert_eq!(body["rest"]["count"].as_u64(), Some(5), "no silent truncation: rest states its own count");
+    assert_eq!(body["rest"]["tokens"].as_u64(), Some(600));
+    assert!((body["rest"]["cost_usd"].as_f64().unwrap() - 0.6).abs() < 1e-9);
+
+    // Group/live totals pass through unchanged in summary mode.
+    assert_eq!(body["lifetime_tokens"].as_u64(), Some(9_100));
+    assert_eq!(body["live_tokens"].as_u64(), Some(0));
+}
+
+#[test]
+fn group_usage_mcp_detail_flag_returns_full_agents_table() {
+    // #866: `detail: true` is the escape hatch back to the full per-agent
+    // table for when the orchestrator actually needs one agent's row.
+    let (reg, _d, co, _cw) = setup_mcp();
+    for i in 0..13u64 {
+        reg.upsert_usage_snapshot(
+            &co.group,
+            usage_snap(&format!("session-{i}"), &format!("agent-{i}"), (i + 1) as f64 * 0.1, (i + 1) * 100, 0),
+        );
+    }
+
+    let via_mcp = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "group_usage", "arguments": { "detail": true } })).unwrap();
+    assert_eq!(via_mcp["isError"], false);
+    let body: Value = serde_json::from_str(via_mcp["content"][0]["text"].as_str().unwrap()).unwrap();
+
+    assert_eq!(body["agents"].as_array().unwrap().len(), 15, "detail:true keeps the full per-agent table");
+    assert!(body["top_agents"].is_null(), "summary fields absent in detail mode");
+    assert!(body["rest"].is_null());
+    assert!(body["agent_count"].is_null());
+}
+
 /// Build a durable usage snapshot for a session, as a fresh transcript read
 /// would produce.
 fn usage_snap(key: &str, agent_id: &str, cost: f64, input: u64, output: u64) -> UsageSnapshot {
