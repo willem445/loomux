@@ -310,6 +310,15 @@ pub struct PrCommentSignal {
 /// Firing on difference makes the failure direction one extra wake rather than
 /// a silently-missed one — the same safe direction `label_deltas` takes.
 ///
+/// **With exactly one deliberate exception, which the else-branch below states
+/// again at the line that implements it: a PR going from some discussion to
+/// NONE is silent.** Deleting the last comment leaves nothing for the
+/// orchestrator to read, so a wake for it would carry no content — and the
+/// stale `last_seen` entry it leaves behind cannot hide a later post, because
+/// any new comment necessarily carries a newer timestamp than the deleted one
+/// and so still reads as different. That is the whole of the exception: one
+/// contentless transition, with no effect on the next real one.
+///
 /// A PR seen for the first time (post-restart, or newly opened) with any
 /// discussion on it fires once, exactly like `label_deltas`/`pr_check_deltas`:
 /// a comment posted while loomux was down is precisely what must not be
@@ -333,9 +342,18 @@ pub fn pr_comment_deltas(last_seen: &mut HashMap<u64, String>, current: &[RawPr]
     for pr in current {
         still_open.insert(pr.number);
         let Some(at) = pr.newest_comment_at.as_ref() else {
-            // No discussion at all: nothing to compare, and nothing to
-            // remember either — a PR whose only comment is later deleted
-            // reads as changed on the next poll, which is the safe direction.
+            // No discussion right now: nothing to compare against, so this PR
+            // is silent — including the had-one-then-none case, where the
+            // author deleted the only comment. That transition is the ONE
+            // thing this function does not report (see the doc comment): there
+            // is nothing left to read, so the wake would carry no content.
+            //
+            // Note what does NOT happen here: `still_open.insert` above has
+            // already run, so any `last_seen` entry for this PR SURVIVES the
+            // retain below rather than being forgotten. That is harmless
+            // rather than merely tolerable — a later comment is necessarily
+            // newer than the deleted one, so it still compares as different
+            // and still fires.
             continue;
         };
         if last_seen.get(&pr.number) != Some(at) {
@@ -884,6 +902,35 @@ mod tests {
         pr_comment_deltas(&mut seen, &[pr_with_comment(1, "t", "2026-08-11T09:00:00Z")]);
         let signals = pr_comment_deltas(&mut seen, &[pr_with_comment(1, "t", "2026-08-11T08:00:00Z")]);
         assert_eq!(signals.len(), 1, "a comment removed since the last poll changed the discussion");
+    }
+
+    #[test]
+    fn pr_comment_deltas_is_silent_when_a_pr_loses_its_only_comment() {
+        // rev-368 F1: the had-one-then-NONE transition — the single case this
+        // function deliberately does not report, and the only one where it is
+        // silent about a change. Pinned rather than left implicit, because the
+        // doc comment right above it now claims exactly this shape, and an
+        // unpinned claim is how a comment drifts from the code under it.
+        let mut seen = HashMap::new();
+        pr_comment_deltas(&mut seen, &[pr_with_comment(1, "t", "2026-08-11T08:00:00Z")]);
+        let signals = pr_comment_deltas(&mut seen, &[pr(1, "t", PrCheckState::Success)]); // the comment was deleted
+        assert!(signals.is_empty(), "a PR losing its last comment carries nothing to read, so it must not wake anyone");
+    }
+
+    #[test]
+    fn a_comment_posted_after_a_deletion_still_fires() {
+        // The half of F1 that actually matters: the deletion above leaves a
+        // stale timestamp in `last_seen` (the PR is still open, so the retain
+        // keeps it). That must not swallow the NEXT real comment — if it did,
+        // the silent transition would stop being contentless and start being
+        // a missed wake, which is the failure direction this whole module is
+        // built to avoid.
+        let mut seen = HashMap::new();
+        pr_comment_deltas(&mut seen, &[pr_with_comment(1, "t", "2026-08-11T08:00:00Z")]);
+        pr_comment_deltas(&mut seen, &[pr(1, "t", PrCheckState::Success)]); // deleted
+        let signals = pr_comment_deltas(&mut seen, &[pr_with_comment(1, "t", "2026-08-11T09:00:00Z")]);
+        assert_eq!(signals.len(), 1, "a new comment after a deletion is real news and must still fire");
+        assert_eq!(signals[0].at, "2026-08-11T09:00:00Z");
     }
 
     #[test]

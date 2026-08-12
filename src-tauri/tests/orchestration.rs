@@ -14319,6 +14319,47 @@ fn a_backed_off_wake_is_audited_with_the_cadence_that_produced_it() {
         "a skip must state the effective cadence it is waiting on, not just 'not yet due'");
 }
 
+/// rev-368 F2: the `gh` contract part 1 rests on, pinned at the source.
+///
+/// The failure mode this exists for is a **silent no-op**, which is why no
+/// other test can catch it. `comments`/`reviews` are `#[serde(default)]` and
+/// their timestamps are `Option`, so dropping `comments,reviews` from
+/// `poll_intake`'s argv — or GitHub renaming `createdAt`/`submittedAt` —
+/// degrades part 1 to "no PR has ever had any discussion": no parse error, no
+/// log line, every other test still green, and
+/// `parse_pr_list_without_comment_fields_reads_as_no_activity` positively
+/// blesses that shape (correctly — it is the degradation contract). The
+/// consequence is worse than a plain regression because part 2 rests on part
+/// 1: a parked group would decay to its 24h ceiling while blind to the one
+/// thing that happens to a parked group, a human commenting.
+///
+/// Same source-parsing shape, and the same "no other test would notice"
+/// reason, as `app_setup_starts_exactly_one_gh_polling_loop` (#406). Verified
+/// against the real CLI at review time: `gh pr list --json
+/// number,title,statusCheckRollup,comments,reviews` populates both arrays with
+/// `createdAt`/`submittedAt` keys.
+#[test]
+fn poll_intake_still_asks_gh_for_comment_and_review_activity() {
+    let src = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/orchestration/mod.rs"))
+        .expect("read src/orchestration/mod.rs");
+    assert!(
+        src.contains("\"number,title,statusCheckRollup,comments,reviews\""),
+        "poll_intake must keep asking `gh pr list` for comments+reviews (#864): without those two \
+         fields every PR silently reads as having no discussion, and a parked group decays to its \
+         ceiling while blind to a human commenting — with no parse error and no other failing test"
+    );
+
+    let intake = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/orchestration/intake.rs"))
+        .expect("read src/orchestration/intake.rs");
+    for field in ["createdAt", "submittedAt"] {
+        assert!(
+            intake.contains(&format!("rename = \"{field}\"")),
+            "intake.rs must keep deserializing `{field}` — the field name is GitHub's, not ours, \
+             and a rename degrades to permanent silence rather than to an error"
+        );
+    }
+}
+
 #[test]
 fn the_backoff_ceiling_is_normalized_and_survives_a_relaunch() {
     // Same shape as `intake_gate_config_survives_launcher_relaunch`: the

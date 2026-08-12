@@ -26417,12 +26417,21 @@ impl OrchRegistry {
             // made — the newest-comment timestamp is the one delta the
             // orchestrator still polled by hand on every tick, and folding it
             // in here costs zero extra round-trips (the two calls per due group
-            // this poller is budgeted for are unchanged). It DOES widen the
-            // response: `gh` has no sub-field selection, so comment bodies come
-            // down whether or not anything reads them. `intake::parse_pr_list`
-            // skips them without allocating, so the cost is one larger string
-            // per poll, not per comment — the same "one list call, not one per
-            // item" discipline, applied to a wider list.
+            // this poller is budgeted for are unchanged).
+            //
+            // It DOES widen the response, and by a lot: `gh` has no sub-field
+            // selection, so every comment and review BODY comes down whether or
+            // not anything reads them. Measured on this repo at 14 open PRs
+            // (rev-368 F3): 20,034 bytes without the two fields, 288,284 with —
+            // 14.4x, ~1-2s either way, well inside `GH_CAPTURE_TIMEOUT`. The
+            // round-trip count is what stays flat, NOT the byte count: this
+            // grows linearly with total discussion volume across the (gh
+            // default) 30 most recent open PRs, so a busier repo pays
+            // proportionally more. `intake::parse_pr_list` skips the bodies
+            // without allocating them, so the cost lands on one larger response
+            // string per poll rather than per comment, and `capture_raw_inner`
+            // reads to end with no cap — there is no truncation path that could
+            // silently drop the check-state half of the same response.
             let prs_raw = self.gh_capture(
                 repo,
                 &["pr", "list", "--state", "open", "--json", "number,title,statusCheckRollup,comments,reviews"],

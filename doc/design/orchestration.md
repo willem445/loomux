@@ -2589,12 +2589,20 @@ check-state transitions, and (#864) new comment/review activity on an open PR.
   newest comment/review timestamp differs from the last observation — *differs*, not "is greater",
   because an edited or deleted comment moves it backwards and the question being asked is "has the
   discussion changed since loomux looked", so the failure direction is one spurious wake rather
-  than a missed one. Timestamps compare as strings: GitHub's are fixed-width UTC `Z`, so
+  than a missed one — **with one deliberate exception: a PR going from some discussion to NONE is
+  silent** (deleting the last comment leaves nothing to read, so the wake would carry no content;
+  the stale last-seen entry it leaves cannot swallow a later post, since any new comment is newer
+  than the deleted one and so still compares as different). Timestamps compare as strings:
+  GitHub's are fixed-width UTC `Z`, so
   lexicographic order is chronological and no date crate (and so no `getrandom`-pulling
   dependency — CLAUDE.md constraint 2) is needed. Comment activity rides the PR call that was
-  already being made, so the poller's two-`gh`-calls-per-due-group budget is unchanged; `gh` has no
-  sub-field selection, so bodies come down whether or not anything reads them, but serde skips them
-  without allocating and the cost is one larger response string per poll, not one per comment. It
+  already being made, so the poller's two-`gh`-calls-per-due-group **round-trip** budget is
+  unchanged — but the *bytes* are not: `gh` has no sub-field selection, so every comment and review
+  body comes down whether or not anything reads it, measured at 20,034 → 288,284 bytes (14.4x) for
+  this repo's 14 open PRs, growing linearly with discussion volume across the 30 most recent open
+  PRs `gh` returns by default. Serde skips the bodies without allocating them, so the cost lands on
+  one larger response string per poll rather than one per comment, and the read is uncapped, so no
+  truncation path can silently drop the check-state half of the same response. It
   also cannot tell an agent's PR comment from a human's — every agent shares the human's `gh`
   credential — so an orchestrator that comments and then falls quiet is woken once for its own
   words; a deliberate over-approximation, bounded by the quiet window, still cheaper than the
@@ -2687,7 +2695,9 @@ check-state transitions, and (#864) new comment/review activity on an open PR.
   converges on parked behaviour without any board introspection, since a parked group is delta-free
   by definition and saturates at the ceiling on its own, leaving one wake per day as the entire
   difference; (c) board state is only as true as the orchestrator's board hygiene, which is a weaker
-  signal than observed quiet.
+  signal than observed quiet. Whether that half is wanted at all — and if so in what weakened form,
+  e.g. a much longer parked cadence rather than zero, which would keep the backstop — is tracked in
+  issue #873.
 - **Degrade, don't deny.** A `gh` failure on either call (auth, not installed, transient) simply
   skips that half of the diff for the current scan; the poll attempt is still stamped (so a
   persistently-failing `gh` isn't retried every 60s), and the bounded fallback covers the group
