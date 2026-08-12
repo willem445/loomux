@@ -27788,7 +27788,12 @@ impl OrchRegistry {
                 // scan (the fire's own `streak_updates` entry lands after this
                 // one and wins), so a delegate exiting in that window handed
                 // the now-parked group a doubling it never earned.
-                let backoff_suppressed = live_delegate_groups.contains(&a.group);
+                // SCRATCH ROUND B2 — ONLY the live-delegate suppressor is set
+                // aside; the backoff and the comment poll are both fully
+                // present, so the two delegate tests are the only thing that
+                // can fail here, and they fail because a group with agents in
+                // flight backs off exactly like a parked one.
+                let backoff_suppressed = false && live_delegate_groups.contains(&a.group);
                 if backoff_suppressed {
                     streak = 0;
                     streak_updates.push((a.group.clone(), 0));
