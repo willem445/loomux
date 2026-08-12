@@ -436,8 +436,10 @@ fn tool_defs(role: Role, role_hint: Option<&str>) -> Vec<Value> {
             tool("remove_task", "Delete a task from the shared board.",
                 json!({ "id": { "type": "string" } }), &["id"]),
             tool("group_usage",
-                "Aggregate the group's token usage and estimated dollar cost into one summary, split live vs lifetime (killed/recycled agents still count). Tokens come from each agent's session transcript and are exact; dollars are estimated from a model price table (subscription/Max accounts show $0 in the CLI, so cite tokens). Fold it into your status updates so the human sees spend at a glance.",
-                json!({}), &[]),
+                "Aggregate the group's token usage and estimated dollar cost into one summary, split live vs lifetime (killed/recycled agents still count). Tokens come from each agent's session transcript and are exact; dollars are estimated from a model price table (subscription/Max accounts show $0 in the CLI, so cite tokens). Fold it into your status updates so the human sees spend at a glance. Defaults to a SUMMARY sized for that: group + live totals, `agent_count` (the whole lifetime roster), `top_agents` (up to 10, by total tokens descending), and `rest` — `{count, tokens, cost_usd, cost_basis, live: {count, tokens}, historical: {count, tokens}}` for every agent folded out of `top_agents`. Top-N is picked by lifetime tokens, so a group with a long history can push every live agent out of `top_agents`; `rest.live` keeps their count/tokens visible instead of forcing `detail: true` just to see who's still running. `rest.cost_basis` labels whether `rest.cost_usd` is `estimated`, `reported`, or `mixed` (same rule as the top-level `*_cost_basis` fields), so a blended figure is never shown as one honest number. The `rest` count itself is what keeps this from being a silent truncation. Pass `detail: true` for the full per-agent `agents` table instead — on a large lifetime roster (654 agents measured at 173,245 chars) that is too big to fold into a status update, so ask for it only when you need a specific agent's row.",
+                json!({
+                    "detail": { "type": "boolean", "description": "Return the full per-agent `agents` table instead of the top_agents/rest summary. Default false." },
+                }), &[]),
             tool("queue_orphans",
                 "Deliveries nobody ever received, in TWO lists: `orphans` — queued but never delivered when loomux last restarted, and unable to re-bind to a live pane; and `refused` — declined at the front door by loomux, so they were never queued at all. Call it once on session start, with the rest of your re-sync. You no longer have to poll it to learn about refusals to YOUR OWN pane: when that pane's queue drains back below its cap, loomux relays a bounded roster of what it refused while full — sender, preview, reason, and whether the sender has since got it through — on the result of your next tool call (#658). This tool is the whole group's history and the other lists; it is not your only path to your own. Returns {count, orphans:[{id, to, queued_minutes_ago, reason, source, text, text_bytes, truncated}], refused_count, refused_omitted, refused_window_truncated, refused:[{from, to, refused_minutes_ago, reason, queue_depth, enqueue_reason, payload, bytes, preview, text, truncated, consequence}]}, oldest ask first in both. `text` is the payload verbatim (capped at 8KB, with `truncated: true` and the full copy on that delivery's `prompt` line in the audit log) when it came from the durable queue snapshot — `source: \"snapshot\"`, or `source: \"archive\"`, which means the same thing to you: the payload is intact and re-sendable, it has simply aged out of the hot snapshot into `queue-orphans-archive.jsonl` so that loomux stops re-writing it on every delivery. An archived entry is still re-queued automatically if its pane ever comes back, exactly like a snapshot one; the two differ only in which file a human opens. `text` is null in exactly two cases, both meaning \"re-derive this one, don't guess\": `source: \"audit\"` (an entry queued by a loomux build older than the durable snapshot — id and target known, payload not), and `reason: \"stranded-submit-not-replayable\"` (the text had already been typed into that pane and was waiting only for Enter when loomux restarted; the pane is gone, so no bytes remain — the audit log's `prompt` line for that delivery is the only record of what it said). THESE ARE LOST WORK, NOT A LOG: each is something you or an agent sent that nobody ever received, so treat a non-empty result as a to-do list — re-send what still applies (the pane it was for is gone, so re-target it: a resumed session, or a fresh agent), and say what you dropped as stale rather than dropping it silently. An empty result is the normal case and needs no comment. Deliveries that DID re-bind (this group's orchestrator pane, or an agent resumed onto the same session id) were already re-queued automatically in their original order and are not listed here. EACH REFUSAL'S `reason` SAYS WHAT TO DO WITH IT, and they are not interchangeable: `queue-full-at-call` — the target pane was at its 8-deep cap; the pane is alive, so this is the one worth re-sending once it drains (`queue_depth` is how full it was). `agent-dead-at-call` — the target was already dead when this was sent; that pane will NEVER take it, so re-target it at a live or resumed agent or drop it as stale, and do not re-send it as-is. `no-terminal-at-call` — the target existed but had no terminal bound yet (a delivery that arrived during the spawn-to-bind window); it was simply too early, so re-send it now if the agent has since bound. `no-app-handle` / `registry-not-shared` — loomux itself could not process the pane's queue and withdrew the admission; these should never appear in a running build, so treat one as a loomux defect worth reporting to the human, not just as a payload to re-send. `queue_depth` and `enqueue_reason` are null for every reason except `queue-full-at-call`, which is the only one that reached the queue at all — null there means \"no measurement was taken\", not \"the pane was empty\". THE `refused` LIST IS DIFFERENT IN THREE WAYS, and each changes what you do with it. (1) A refusal does not need a restart to happen — a pane at capacity refuses every arrival for as long as it stays there — so this list can be non-empty on a perfectly ordinary session, and `refused_count` counts everything in the readable audit window with only the most recent 8 listed (`refused_omitted` says how many were left in `audit.jsonl`). `refused_window_truncated: true` means that window was ITSELF cut at 5000 entries, so `refused_count` counts only the readable tail and older refusals may exist that this scan never saw — read `audit.jsonl` directly (action `delivery-dropped`, and the `reason` values above) if you need the whole history. When it is false, `refused_count` really is all of them. (2) The SENDER was told synchronously (`delivery queue for … full — NOT queued`), so many of these were already handled by whoever sent them; the ones that matter are those whose sender then died, or where `from` is `loomux` itself and nobody was listening. Check before re-sending, and prefer asking the sender over guessing. (3) `text` is the payload the refusal recorded — carried on the refusal's own audit line for a refusal that never reached the queue, and for a `queue-full-at-call` one recovered from that delivery's `prompt` audit line and verified against the refusal's recorded byte count and preview. Either way, when it is non-null it is re-sendable verbatim; when it is null, `preview` (a bounded one-liner) and `bytes` are what you have — re-derive, do not guess. `payload: \"stranded-submit\"` is the one kind that never had text at all: its bytes were already pasted into that pane and only the Enter was refused, so the pane is sitting with an unsubmitted prompt in its input box (`consequence` says so) — recover it by looking at the pane, not by re-sending. NOTHING IS RE-ADMITTED BY READING THIS: a refused delivery was explicitly declined and stays declined, because slipping it back into a queue now would put it behind — or ahead of — everything the pane has accepted since. Re-sending is your call, deliberately made.",
                 json!({}), &[]),
@@ -615,6 +617,81 @@ fn arg_bool(args: &Value, key: &str) -> Result<bool, String> {
     }
 }
 
+/// Default number of top-by-tokens agents shown in `group_usage`'s summary
+/// mode (#866). A plain constant, not a per-group setting — the point is a
+/// number small enough to read in-context, not a figure tuned to any one
+/// group's roster size (constraint: no repo/machine-specific tuning).
+const GROUP_USAGE_SUMMARY_TOP_N: usize = 10;
+
+/// Collapse `group_usage`'s full per-agent `agents` array into the summary
+/// an orchestrator can actually fold into a status update (#866): a
+/// 654-agent lifetime roster serialized to 173,245 chars, unreadable
+/// in-context. Group/live totals pass through unchanged; `agents` is
+/// replaced by `top_agents` (the `top_n` agents by total tokens, descending)
+/// and `rest`, an explicit rollup of everyone else — the count is what keeps
+/// this from being a silent truncation.
+///
+/// `rest` is split by liveness (#866 review finding 1): top-N is chosen by
+/// **lifetime** tokens across the whole roster, so on a group with a long
+/// history and a handful of live agents, every live agent can end up in
+/// `rest` — the one row the orchestrator's own template says to fold into
+/// its status updates. `rest.live` / `rest.historical` keep that
+/// attribution visible without needing `detail: true`.
+fn summarize_group_usage(full: &Value, top_n: usize) -> Value {
+    let mut agents: Vec<Value> = full["agents"].as_array().cloned().unwrap_or_default();
+    // `compute_group_usage` sorts by agent id; re-sort by total tokens
+    // descending so "top" means the agents that actually moved the total.
+    agents.sort_by(|a, b| {
+        let ta = a["tokens"]["total"].as_u64().unwrap_or(0);
+        let tb = b["tokens"]["total"].as_u64().unwrap_or(0);
+        tb.cmp(&ta)
+    });
+    let agent_count = agents.len();
+    let rest = agents.split_off(top_n.min(agent_count));
+    let rest_count = rest.len();
+    let rest_tokens: u64 = rest.iter().map(|a| a["tokens"]["total"].as_u64().unwrap_or(0)).sum();
+    let (mut rest_live_count, mut rest_live_tokens) = (0u64, 0u64);
+    let (mut rest_hist_count, mut rest_hist_tokens) = (0u64, 0u64);
+    let mut rest_cost_known = false;
+    let mut rest_cost = 0.0f64;
+    let (mut rest_est, mut rest_rep) = (false, false);
+    for a in &rest {
+        let tokens = a["tokens"]["total"].as_u64().unwrap_or(0);
+        if a["live"].as_bool().unwrap_or(false) {
+            rest_live_count += 1;
+            rest_live_tokens += tokens;
+        } else {
+            rest_hist_count += 1;
+            rest_hist_tokens += tokens;
+        }
+        if let Some(c) = a["cost_usd"].as_f64() {
+            rest_cost += c;
+            rest_cost_known = true;
+            if a["estimated"].as_bool().unwrap_or(false) {
+                rest_est = true;
+            } else {
+                rest_rep = true;
+            }
+        }
+    }
+
+    let mut out = full.clone();
+    if let Some(obj) = out.as_object_mut() {
+        obj.remove("agents");
+        obj.insert("agent_count".to_string(), json!(agent_count));
+        obj.insert("top_agents".to_string(), json!(agents));
+        obj.insert("rest".to_string(), json!({
+            "count": rest_count,
+            "tokens": rest_tokens,
+            "cost_usd": rest_cost_known.then_some(rest_cost),
+            "cost_basis": OrchRegistry::usage_cost_basis(rest_est, rest_rep),
+            "live": { "count": rest_live_count, "tokens": rest_live_tokens },
+            "historical": { "count": rest_hist_count, "tokens": rest_hist_tokens },
+        }));
+    }
+    out
+}
+
 fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> Result<String, String> {
     // A standalone pane's token carries zero group-scoped power (#271 W3
     // addendum, part A1/concern 5) — `channel_send`/`channel_status` are its
@@ -714,7 +791,14 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
         }
         "group_usage" => {
             require_orchestrator(caller)?;
-            Ok(reg.group_usage(&caller.group).to_string())
+            let detail = arg_bool(args, "detail")?;
+            let full = reg.group_usage(&caller.group);
+            let out = if detail {
+                full
+            } else {
+                summarize_group_usage(&full, GROUP_USAGE_SUMMARY_TOP_N)
+            };
+            Ok(out.to_string())
         }
         "queue_orphans" => {
             require_orchestrator(caller)?;

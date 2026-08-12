@@ -528,6 +528,13 @@ so far:
   orchestrator back to a description of an array this call no longer returns, right
   when a long-lived board first starts eliding rows.
 
+- **#866, `group_usage` MCP tool gains a summary default** — `orchestrator.md` only. The
+  `group_usage()` bullet becomes `group_usage(detail?)` and now describes the summary
+  the tool actually returns by default (`agent_count`, `top_agents`, and a `rest` rollup
+  with a live/historical split) plus the `detail: true` escape hatch to the full
+  per-agent table, instead of the old "total + per-agent" description that no longer
+  matches a default call.
+
 `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was` renders
 **these** with the six pre-#222 template variables and asserts that a group launched
 with the advanced orchestrator **off** gets exactly that text. They are the

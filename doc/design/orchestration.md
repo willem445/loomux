@@ -136,7 +136,7 @@ pane stays open showing the status).
 | `rename_agent(agent_id, name)` | ✓ | ✗ |
 | `get_state()` | ✓ | ✓ |
 | `set_state(state)` | ✓ | ✗ |
-| `group_usage()` | ✓ | ✗ |
+| `group_usage(detail?)` | ✓ | ✗ |
 | `notify_when(kind, pr?, run?, note?, expires_minutes?)` | ✓ | worker/reviewer only (✗ planner) |
 | `list_notifications()` | ✓ | worker/reviewer only (✗ planner) |
 | `cancel_notification(id)` | ✓ | worker/reviewer only (✗ planner) |
@@ -1032,6 +1032,11 @@ persisted in `group.json`, and clamped in `clamped()`.
   (`parse_session_cost` scans the ANSI-stripped tail bottom-up for the freshest `$` figure);
   panes without a visible cost contribute `null` and are excluded from the total. Surfaced
   both to the orchestrator (MCP tool, for status summaries) and the UI (`orch_group_usage`).
+  The registry-level value is always the full per-agent table; the MCP `group_usage` tool
+  (#866) defaults to summarizing it instead — group/live totals, the top 10 agents by total
+  tokens, and a `rest` rollup (split live vs historical) for everyone else — with
+  `detail: true` as the escape hatch back to the full table. The UI's poll path is
+  unaffected; it always reads the registry-level value directly.
 - **Spawn-rate limit.** `max_spawns_per_hour` is a runaway-orchestrator backstop: worker/
   reviewer spawns are counted over a rolling hour (`spawn_rate_exceeded`, checked+recorded
   under one lock in `check_and_record_spawn`) and refused past the cap. Only spawns that pass
