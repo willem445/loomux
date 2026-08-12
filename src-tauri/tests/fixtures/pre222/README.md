@@ -519,6 +519,15 @@ so far:
   carry the recorded-summary target (~100 words) that only exists where `review_verdict`
   does, which is why it is not in this file.
 
+- **#865, `list_tasks` caps `done` rows** — `orchestrator.md` only. `list_tasks()`'s
+  wire shape changed from a bare compact-row array to `{ tasks: [...], omitted_done:
+  N }`: `done` rows are now capped at the newest 20 by `updated_ms` by default, with
+  `omitted_done` naming how many were left off (0 when none were) and `include_all:
+  true` returning the whole board. The `list_tasks()` tool bullet states the new
+  envelope, the cap, and `include_all` — otherwise the post-compact re-sync sends an
+  orchestrator back to a description of an array this call no longer returns, right
+  when a long-lived board first starts eliding rows.
+
 `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was` renders
 **these** with the six pre-#222 template variables and asserts that a group launched
 with the advanced orchestrator **off** gets exactly that text. They are the
