@@ -101,7 +101,8 @@ mutation that removes it and watch WHICH tests redden — a match is evidence, a
 a correction; disclose it (#664, #673, #682). A red evidences only the assertion it
 REACHED and MOVED — a panic before it, a split test's already-green half, or a companion
 that also passed broken prove nothing; split the test, or say which half moved (#710,
-#712, #727).
+#712, #727). A mutation a *reviewer* names is still unrun — run it before quoting it into
+the body, which becomes the squash message (#868).
 
 ## A test's specimen must stay a member of the class it witnesses
 
