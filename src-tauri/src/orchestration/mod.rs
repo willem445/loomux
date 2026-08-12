@@ -27781,7 +27781,15 @@ impl OrchRegistry {
                 // the host-side poll sees — and the heartbeat wake is exactly
                 // how an orchestrator notices a delegate that went quiet
                 // without reporting. Keep those groups on the base cadence.
-                if live_delegate_groups.contains(&a.group) {
+                //
+                // This suppresses the streak in BOTH directions — the reset
+                // here, and the increment at the fire site below. Resetting
+                // alone left the counter at 1 between a fire and the next
+                // scan (the fire's own `streak_updates` entry lands after this
+                // one and wins), so a delegate exiting in that window handed
+                // the now-parked group a doubling it never earned.
+                let backoff_suppressed = live_delegate_groups.contains(&a.group);
+                if backoff_suppressed {
                     streak = 0;
                     streak_updates.push((a.group.clone(), 0));
                 }
@@ -27866,7 +27874,10 @@ impl OrchRegistry {
                         // evaluation (a skip re-checks every `intake_minutes`
                         // and must not ramp the interval by itself). A wake with
                         // a real signal behind it resets: the group is not parked.
-                        streak = if heartbeat { streak.saturating_add(1) } else { 0 };
+                        // `backoff_suppressed` short-circuits the growth entirely
+                        // so a suppressed group's streak is 0 at ALL times, not
+                        // merely re-zeroed on the following scan.
+                        streak = if heartbeat && !backoff_suppressed { streak.saturating_add(1) } else { 0 };
                         streak_updates.push((a.group.clone(), streak));
                         to_notify.push(IdleTickFire {
                             id: a.id.clone(),

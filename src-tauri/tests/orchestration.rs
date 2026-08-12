@@ -14265,6 +14265,32 @@ fn a_group_with_a_live_delegate_never_backs_off() {
 }
 
 #[test]
+fn the_backoff_starts_clean_once_the_last_delegate_exits() {
+    // The window a reset-only suppressor got wrong (caught by the assertion in
+    // the test above, on run 31556665796): a wake writes the streak AFTER the
+    // suppressor's reset lands, so between a fire and the next scan a group
+    // with a live delegate carried a `1` it never earned — and a delegate
+    // exiting right there handed the newly-parked group a doubling for free.
+    // With the fix the streak is 0 at all times while suppressed, so the
+    // backoff starts from the base interval the moment the group is parked.
+    let (reg, _d, gid, oid) = autonomous_setup_with_backoff(Some(5), 30, 240);
+    let w = reg.spawn_agent(&gid, Role::Worker, "w", "do work", false, None).unwrap();
+    reg.seed_idle_tick_last_fired(&gid, FAR);
+
+    let wakes = idle_tick_wake_offsets(&reg, &oid, FAR, 4 * 60, 5, |t| {
+        // The delegate exits on the scan immediately after the first wake.
+        if t == 35 {
+            reg.mark_dead(&w.id, Some(0));
+        }
+        HashMap::new()
+    });
+
+    assert_eq!(wakes, vec![30, 60, 120, 240],
+        "the first wake after the delegate exits must be one BASE interval later — a stale streak \
+         would push it to 90 and skew every interval after it — got {wakes:?}");
+}
+
+#[test]
 fn backoff_is_off_when_the_ceiling_equals_the_base() {
     // The documented opt-out — one value, no separate enable flag — must
     // reproduce the pre-#864 fixed cadence exactly.
