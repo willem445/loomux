@@ -30154,10 +30154,56 @@ fn group_usage_mcp_defaults_to_top_n_summary_with_explicit_rest_count() {
     assert_eq!(body["rest"]["count"].as_u64(), Some(5), "no silent truncation: rest states its own count");
     assert_eq!(body["rest"]["tokens"].as_u64(), Some(600));
     assert!((body["rest"]["cost_usd"].as_f64().unwrap() - 0.6).abs() < 1e-9);
+    // usage_snap's synthetic rows are all `estimated: true` and are the only
+    // rows in `rest` with a cost at all (the live orch/worker rows are
+    // costless), so the basis must read as a clean "estimated", never "mixed".
+    assert_eq!(body["rest"]["cost_basis"], "estimated");
+    // #866 review finding 1: top-N is picked by lifetime tokens, so the two
+    // zero-token LIVE agents (orch + worker) land in `rest` alongside the 3
+    // lowest historical ones — `rest.live` must keep them attributable
+    // rather than folding them into one undifferentiated count.
+    assert_eq!(body["rest"]["live"]["count"].as_u64(), Some(2), "orch + worker are live but not in top_agents");
+    assert_eq!(body["rest"]["live"]["tokens"].as_u64(), Some(0));
+    assert_eq!(body["rest"]["historical"]["count"].as_u64(), Some(3), "the 3 lowest synthetic agents");
+    assert_eq!(body["rest"]["historical"]["tokens"].as_u64(), Some(600));
 
     // Group/live totals pass through unchanged in summary mode.
     assert_eq!(body["lifetime_tokens"].as_u64(), Some(9_100));
     assert_eq!(body["live_tokens"].as_u64(), Some(0));
+}
+
+#[test]
+fn group_usage_mcp_summary_when_roster_fits_under_top_n() {
+    // #866 review finding 2: every prior summary-mode test built 15 agents,
+    // so only the "there is a rest" branch was ever exercised. Most real
+    // groups have FEWER than `GROUP_USAGE_SUMMARY_TOP_N` agents — the path
+    // where `split_off(top_n.min(agent_count))` takes its `.min()` guard
+    // (a bare `split_off(top_n)` panics past the Vec's length) and `rest`
+    // must degrade to an honest, all-empty rollup rather than erroring or
+    // fabricating a count.
+    let (reg, _d, co, _cw) = setup_mcp();
+    for i in 0..3u64 {
+        reg.upsert_usage_snapshot(
+            &co.group,
+            usage_snap(&format!("session-{i}"), &format!("agent-{i}"), (i + 1) as f64 * 0.1, (i + 1) * 100, 0),
+        );
+    }
+    // 2 live (orch + worker) + 3 synthetic = 5, under the top-10 default.
+    let via_mcp = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "group_usage", "arguments": {} })).unwrap();
+    assert_eq!(via_mcp["isError"], false);
+    let body: Value = serde_json::from_str(via_mcp["content"][0]["text"].as_str().unwrap()).unwrap();
+
+    assert_eq!(body["agent_count"].as_u64(), Some(5));
+    assert_eq!(body["top_agents"].as_array().unwrap().len(), 5, "the whole roster fits inside top_n");
+    assert_eq!(body["rest"]["count"].as_u64(), Some(0), "nothing left over to fold in");
+    assert_eq!(body["rest"]["tokens"].as_u64(), Some(0));
+    assert!(body["rest"]["cost_usd"].is_null(), "no rows in rest means no cost figure, not zero");
+    assert!(body["rest"]["cost_basis"].is_null());
+    assert_eq!(body["rest"]["live"]["count"].as_u64(), Some(0));
+    assert_eq!(body["rest"]["live"]["tokens"].as_u64(), Some(0));
+    assert_eq!(body["rest"]["historical"]["count"].as_u64(), Some(0));
+    assert_eq!(body["rest"]["historical"]["tokens"].as_u64(), Some(0));
 }
 
 #[test]
