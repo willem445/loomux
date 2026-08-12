@@ -311,8 +311,11 @@ fn tool_defs(role: Role, role_hint: Option<&str>) -> Vec<Value> {
         tool("get_state", "Read the group's durable orchestration state (JSON string). Survives sessions.",
             json!({}), &[]),
         tool("list_tasks",
-            "Read the group's task board (JSON array, order = priority) as COMPACT rows: id, title, status, issue, pr, pr_base, assignee, session, updated_ms, note_count — NO note text. The human sees and edits the full board (with notes) beside your pane. Use note_count to tell whether a task has history worth pulling, then call get_task(id) for that task's full notes. Rows also carry the task's links and a derived `ready`: `deps` (ids this task is BLOCKED ON — ids only) and `related` (non-blocking see-also), plus `ready: true` when the task is `queued` AND every one of its deps is `done`. `ready` is what makes this call the answer to \"what is startable right now\" — top-of-board first among the ready rows — instead of re-deriving the order from prose after a compact. Both link arrays are omitted from a row that has none. Nothing here auto-flips a status: a queued task with unmet deps simply reads `ready: false`, and because every row's own status is in the same response, WHICH dep is holding it is directly readable — no second call needed.",
-            json!({}), &[]),
+            "Read the group's task board as `{ tasks: [...], omitted_done: N }` — `tasks` is COMPACT rows (order = priority): id, title, status, issue, pr, pr_base, assignee, session, updated_ms, note_count — NO note text. The human sees and edits the full board (with notes) beside your pane. Use note_count to tell whether a task has history worth pulling, then call get_task(id) for that task's full notes. Rows also carry the task's links and a derived `ready`: `deps` (ids this task is BLOCKED ON — ids only) and `related` (non-blocking see-also), plus `ready: true` when the task is `queued` AND every one of its deps is `done`. `ready` is what makes this call the answer to \"what is startable right now\" — top-of-board first among the ready rows — instead of re-deriving the order from prose after a compact. Both link arrays are omitted from a row that has none. Nothing here auto-flips a status: a queued task with unmet deps simply reads `ready: false`, and because every row's own status is in the same response, WHICH dep is holding it is directly readable — no second call needed. `done` rows are capped at the newest 20 (by updated_ms) by default so a long-lived board's hot read stays proportional to active work, not its whole history — `omitted_done` is always present and names how many `done` rows were left off (0 when nothing was), so a filtered board is never mistaken for the whole one. A dropped `done` row is not deleted: get_task(id) and the audit log still have it. Pass `include_all: true` for the full, uncapped board (e.g. reconciling history or auditing).",
+            json!({
+                "include_all": { "type": "boolean", "description": "true = return every row, bypassing the done-row cap (default false)." },
+            }),
+            &[]),
         tool("get_task",
             "Read ONE task's full record, including its note history (capped: only the newest notes are kept verbatim, older ones collapse into one placeholder — the full text of every note is always in this group's audit log regardless). Use this after list_tasks's compact row shows a note_count worth reading.",
             json!({ "id": { "type": "string", "description": "Task id, e.g. t-3" } }),
@@ -629,7 +632,11 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
     match name {
         "list_agents" => Ok(reg.list_agents(&caller.group).to_string()),
         "get_state" => Ok(reg.get_state(&caller.group)),
-        "list_tasks" => Ok(serde_json::to_string(&reg.task_summaries(&caller.group)).unwrap_or_default()),
+        "list_tasks" => {
+            let include_all = arg_bool(args, "include_all")?;
+            let (rows, omitted_done) = reg.task_summaries_for_list_tasks(&caller.group, include_all);
+            Ok(json!({ "tasks": rows, "omitted_done": omitted_done }).to_string())
+        }
         "get_task" => {
             let id = arg_str(args, "id").ok_or("id required")?;
             let task = reg.get_task(&caller.group, id).ok_or_else(|| format!("unknown task: {id}"))?;

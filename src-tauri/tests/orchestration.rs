@@ -129,9 +129,11 @@ use loomux_lib::orchestration::{
     attention_tail, ATTENTION_SCAN_BYTES,
     spawn_rate_exceeded, spawn_request_expired, strip_ansi, submit_confirmed, submit_sequence,
     board_summaries, cap_task_notes, task_ready, task_summary, unmet_deps,
+    // #865: done-row cap on list_tasks — the pure keep/drop rule and its default.
+    filter_done_rows, LIST_TASKS_DONE_CAP,
     unconfirmed_delivery_notice, delivery_eaten_notice, watchdog_should_notify, worktree_cleanup_targets,
     AgentEntry, AgentRecord, ApproveItem, AttentionItem, Caller, Containment, Delivery, DeliveryConfirmation, Guardrails, HeldReason, HumanInput, Launch, NameSource, OrchRegistry, PasteDecision, RetryGate,
-    PersonaInject, Task, TaskNote,
+    PersonaInject, Task, TaskNote, TaskSummary,
     PasteGate, Role, TaskPatch, UsageSnapshot, CLAUDE_UNATTENDED_ALLOW, COPILOT_AUTOPILOT_CONFIRM_KEYS,
     COPILOT_GROUP_AUTOPILOT_FLAGS, COPILOT_UNATTENDED_FLAGS, MAX_ATTACHMENT_BYTES,
     PLANNER_READONLY_NOTE, SOLO_GROUP, AUTOPILOT_DIALOG_WAIT, SOLO_AUTOPILOT_DIALOG_WAIT,
@@ -9383,6 +9385,128 @@ fn task_tools_are_role_gated_but_listing_is_shared() {
     let missing = dispatch(&reg, &cw, "tools/call",
         &json!({ "name": "get_task", "arguments": { "id": "t-999" } })).unwrap();
     assert_eq!(missing["isError"], true);
+}
+
+// ---------- #865: list_tasks done-row cap ----------
+
+/// A bare `TaskSummary` row for the pure `filter_done_rows` tests — no
+/// registry, no clock, `updated_ms` set explicitly so "newest" is
+/// unambiguous instead of racing the real wall clock.
+fn done_row(id: &str, status: &str, updated_ms: u64) -> TaskSummary {
+    TaskSummary {
+        id: id.into(),
+        title: format!("task {id}"),
+        status: status.into(),
+        issue: None,
+        pr: None,
+        pr_base: None,
+        assignee: None,
+        session: None,
+        updated_ms,
+        note_count: 0,
+        deps: vec![],
+        related: vec![],
+        ready: false,
+    }
+}
+
+#[test]
+fn filter_done_rows_keeps_newest_done_and_every_non_done_row_in_board_order() {
+    // Five rows, three `done` at different `updated_ms`, capped at 2: only the
+    // oldest `done` row (t-1) should be dropped, and every survivor — done or
+    // not — must keep the board's own (priority) order, not be reshuffled.
+    let rows = vec![
+        done_row("t-1", "done", 10),
+        done_row("t-2", "queued", 5),
+        done_row("t-3", "done", 30),
+        done_row("t-4", "done", 20),
+        done_row("t-5", "in-progress", 1),
+    ];
+    let (kept, omitted) = filter_done_rows(rows, 2);
+    assert_eq!(omitted, 1, "exactly the one done row beyond the cap is elided");
+    let ids: Vec<&str> = kept.iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        ["t-2", "t-3", "t-4", "t-5"],
+        "t-1 (oldest done, updated_ms 10) is dropped; every other row survives in board order"
+    );
+}
+
+#[test]
+fn filter_done_rows_is_a_noop_at_or_under_the_cap() {
+    let rows = vec![done_row("t-1", "done", 1), done_row("t-2", "done", 2), done_row("t-3", "queued", 3)];
+    let (kept, omitted) = filter_done_rows(rows.clone(), 2);
+    assert_eq!(omitted, 0, "exactly at the cap: nothing is elided");
+    assert_eq!(kept.len(), 3);
+    let (kept, omitted) = filter_done_rows(rows, 5);
+    assert_eq!(omitted, 0, "under the cap: nothing is elided");
+    assert_eq!(kept.len(), 3);
+}
+
+#[test]
+fn filter_done_rows_never_touches_a_board_with_no_done_rows() {
+    let rows = vec![done_row("t-1", "queued", 1), done_row("t-2", "in-progress", 2)];
+    let (kept, omitted) = filter_done_rows(rows, 0);
+    assert_eq!(omitted, 0);
+    assert_eq!(kept.len(), 2, "a cap of 0 still never elides a non-done row");
+}
+
+#[test]
+fn task_summaries_for_list_tasks_defaults_to_capped_and_include_all_bypasses_it() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let live = reg.upsert_task(&g.id, "orch", None, patch(Some("still going"), Some("in-progress"), None)).unwrap();
+    let total_done = LIST_TASKS_DONE_CAP + 5;
+    let mut done_ids = Vec::new();
+    for i in 0..total_done {
+        let t = reg
+            .upsert_task(&g.id, "orch", None, patch(Some(&format!("done-{i}")), Some("done"), None))
+            .unwrap();
+        done_ids.push(t.id);
+    }
+
+    // Default (capped) read.
+    let (rows, omitted) = reg.task_summaries_for_list_tasks(&g.id, false);
+    assert_eq!(omitted, total_done - LIST_TASKS_DONE_CAP, "the omitted count is exact, never approximated");
+    let kept_done = rows.iter().filter(|r| r.status == "done").count();
+    assert_eq!(kept_done, LIST_TASKS_DONE_CAP, "done rows are capped at the default");
+    assert!(rows.iter().any(|r| r.id == live.id), "the one non-done row is never elided by the cap");
+    assert_eq!(rows.len(), LIST_TASKS_DONE_CAP + 1, "total rows = capped done + the live row");
+
+    // A dropped row is elided from list_tasks, not deleted from the board —
+    // get_task still resolves it and it still counts in the full read below.
+    assert!(reg.get_task(&g.id, &done_ids[0]).is_some(), "an elided done row is still on the board");
+
+    // include_all bypasses the cap entirely.
+    let (all_rows, all_omitted) = reg.task_summaries_for_list_tasks(&g.id, true);
+    assert_eq!(all_omitted, 0, "include_all never reports an elision");
+    assert_eq!(all_rows.len(), total_done + 1, "include_all returns the whole board");
+}
+
+#[test]
+fn list_tasks_mcp_tool_reports_the_omitted_done_count_and_honors_include_all() {
+    let (reg, _d, co, cw) = setup_mcp();
+    for i in 0..(LIST_TASKS_DONE_CAP + 3) {
+        dispatch(&reg, &co, "tools/call",
+            &json!({ "name": "upsert_task", "arguments": { "title": format!("done-{i}"), "status": "done" } }))
+            .unwrap();
+    }
+    dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "upsert_task", "arguments": { "title": "still active", "status": "queued" } })).unwrap();
+
+    let listed = dispatch(&reg, &cw, "tools/call", &json!({ "name": "list_tasks", "arguments": {} })).unwrap();
+    let text = listed["content"][0]["text"].as_str().unwrap();
+    let body: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(body["omitted_done"], 3, "list_tasks names exactly how many done rows it left off: {text}");
+    assert_eq!(body["tasks"].as_array().unwrap().len(), LIST_TASKS_DONE_CAP + 1, "capped done + the one live row");
+    assert!(text.contains("still active"), "the non-done row always survives the cap: {text}");
+
+    let full = dispatch(&reg, &cw, "tools/call",
+        &json!({ "name": "list_tasks", "arguments": { "include_all": true } })).unwrap();
+    let ftext = full["content"][0]["text"].as_str().unwrap();
+    let fbody: Value = serde_json::from_str(ftext).unwrap();
+    assert_eq!(fbody["omitted_done"], 0, "include_all reports nothing elided: {ftext}");
+    assert_eq!(fbody["tasks"].as_array().unwrap().len(), LIST_TASKS_DONE_CAP + 4, "include_all returns every row");
 }
 
 // ---------- #582: dependency links, derived readiness, atomic claim ----------

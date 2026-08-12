@@ -8769,6 +8769,36 @@ pub fn board_summaries(tasks: &[Task]) -> Vec<TaskSummary> {
     tasks.iter().map(|t| task_summary(t, task_ready(t, tasks))).collect()
 }
 
+/// Default cap on `done` rows a `list_tasks` call returns when the caller
+/// hasn't asked for the full read (#865): a long-lived group's board grows
+/// without bound (294 tasks / 249 done measured an 84,280-char response,
+/// already past the orchestrator CLI's tool-result cap), so the hot read
+/// needs to stay O(active) rather than O(lifetime). Newest-N over an age
+/// horizon because it's a pure function of the rows themselves — no wall
+/// clock, so `filter_done_rows` below is deterministic and trivial to test —
+/// and it bounds the response directly regardless of how bursty or idle a
+/// group's done-rate runs, where a fixed horizon (e.g. "7 days") either lets
+/// a busy week's burst through uncapped or drops a slow group's only recent
+/// context. The number itself is a generic default (#263/constraint 8: not
+/// tuned to any one repo's board size), not a repo-specific threshold.
+pub const LIST_TASKS_DONE_CAP: usize = 20;
+
+/// Elide `done` rows beyond `cap` from an already-projected row set, keeping
+/// the `cap` most-recently-updated `done` rows and every non-`done` row, in
+/// the board's own priority order (#865). Returns the filtered rows plus how
+/// many `done` rows were dropped so the count can travel WITH the response —
+/// the point being that an orchestrator can never mistake a filtered board
+/// for the whole one the way a silent truncation would let it. Nothing here
+/// deletes data: `get_task` and the audit log still carry every row this
+/// drops; `include_all` on the caller's end bypasses the cap entirely. Pure
+/// (no registry, no clock) so the keep/drop rule is unit-testable directly.
+pub fn filter_done_rows(rows: Vec<TaskSummary>, _cap: usize) -> (Vec<TaskSummary>, usize) {
+    // TODO(#865 red/green): stub for the pre-fix "red" CI run — matches
+    // today's actual bug (list_tasks returns every done row forever, no
+    // omission). The next commit replaces this body with the real cap.
+    (rows, 0)
+}
+
 /// Normalize and validate one link array on write (#582): trim, drop empties,
 /// dedup (first occurrence wins, order preserved), reject a self-link, and
 /// reject any id that doesn't name a live task on this board.
@@ -22877,9 +22907,27 @@ impl OrchRegistry {
 
     /// Compact rows for the MCP `list_tasks` tool (#245) — see `TaskSummary`.
     /// Projected board-at-a-time, not task-at-a-time, because `ready` (#582)
-    /// is a property of a task plus its dependencies' statuses.
+    /// is a property of a task plus its dependencies' statuses. Unfiltered:
+    /// callers that need the done-row cap applied use
+    /// `task_summaries_for_list_tasks` instead — this one stays the plain
+    /// full-board projection existing callers (tests included) already rely
+    /// on returning every row.
     pub fn task_summaries(&self, group: &str) -> Vec<TaskSummary> {
         board_summaries(&self.tasks(group))
+    }
+
+    /// The MCP `list_tasks` tool's actual read path (#865): full board when
+    /// `include_all`, else `done` rows capped at `LIST_TASKS_DONE_CAP` —
+    /// newest by `updated_ms` — with the omitted count returned alongside so
+    /// the caller can say so rather than silently truncating. See
+    /// `filter_done_rows` for the keep/drop rule.
+    pub fn task_summaries_for_list_tasks(&self, group: &str, include_all: bool) -> (Vec<TaskSummary>, usize) {
+        let rows = self.task_summaries(group);
+        if include_all {
+            (rows, 0)
+        } else {
+            filter_done_rows(rows, LIST_TASKS_DONE_CAP)
+        }
     }
 
     /// One full task (including its capped note history) by id — the detail
