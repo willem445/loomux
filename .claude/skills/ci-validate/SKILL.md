@@ -238,6 +238,45 @@ evidence a worker cites for "the suite passes" in a PR description or a `done`
 report, and a run id carried over from before a rebase is evidence about a
 commit that is no longer there (step 6).
 
+## Red-before-green evidence goes through CI too
+
+Every PR owes its new tests seen *failing* without the change. With local
+`cargo` banned there is no base-branch test run to produce that red, and
+`git stash` is separately forbidden (one stash stack across every worktree,
+#299) — so the red half is produced on a **throwaway scratch branch with its
+own draft PR**, and CI's log is the failure line you quote.
+
+1. **Commit your real work first** (#493) — the scratch edits are destructive
+   and a `git checkout --` to undo them takes everything uncommitted in the
+   file with it.
+2. Cut `scratch/<issue>-red` from your branch head, set **one** behaviour
+   aside — leave everything else wired — and push.
+3. Open it as a draft titled `[scratch] … — do not merge`, body saying which
+   single behaviour is neutered and that every failure line will be quoted in
+   the real PR.
+4. Quote the run link and the failure lines in the real PR body; **close the
+   scratch PR and delete its branch** once cited.
+
+**One behaviour per round.** Two at once, or a neuter that stops it compiling,
+and the failures stop being attributable to the behaviour they evidence — a
+compile error proves nothing. Several rounds on one scratch branch is normal.
+
+### The trap: `cargo test` stops at the first failing test *binary*
+
+Neutering a lib function reddens the **lib** suite, and cargo then never runs
+the integration binary at all — so every integration-level assertion you meant
+to evidence produces no output, and the round is wasted. Split by target:
+
+- To redden a **unit test in `intake.rs`/`workflow.rs`**, neuter the pure
+  function. The lib suite is the first binary, so it is reached.
+- To redden an **integration test in `src-tauri/tests/`**, neuter the
+  **wiring** instead — the call site, or the gate's consumption of the value —
+  and leave the lib function intact, so the lib suite stays green and the
+  integration binary is actually reached.
+
+Precedent, including the mid-flight re-cut when the first shape hid the
+integration suite: #869 (scratch PRs #870, #872).
+
 ## E2E (Playwright) is CI's job, same line
 
 See `doc/design/e2e-testing.md` for the mechanism, isolation model, and CI

@@ -42,10 +42,14 @@ tell the orchestrator, so the next one like it goes to `worker-quick`.
    Cover at least one edge/failure case — for anything fail-closed, test the
    *refusal*. Backend tests that link the lib go in `src-tauri/tests/` (integration
    tests only — the Windows manifest rides on `-tests`-scoped link args).
-   **Red before green, evidenced.** Run your new tests against the base branch (stash the
-   implementation, keep the tests) and confirm they fail for the *expected* reason — not on a
-   compile error, which proves nothing about behaviour. Paste the command and the failure line
-   into the PR body, next to the same command passing on your branch. `rev-tests` is going to
+   **Red before green, evidenced.** Run your new tests without the change and confirm they fail
+   for the *expected* reason — not on a compile error, which proves nothing about behaviour.
+   **Never `git stash` to produce that red** (#299, #493): commit your real work first, then set
+   the behaviour aside on a throwaway scratch branch — for Rust that is a scratch draft PR read
+   through CI, since local `cargo` is banned. The `ci-validate` skill carries the procedure and
+   the trap that costs a round (to redden an *integration* test, neuter the wiring, not the lib
+   function). Paste the command and the failure line into the PR body, next to the same
+   command passing on your branch. `rev-tests` is going to
    try to break your pins anyway; a pin you have already seen go red is one you don't lose that
    argument over. If a new test can't be made to fail, it isn't testing your change — find out
    why before you ship it.
