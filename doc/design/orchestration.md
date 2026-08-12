@@ -2557,9 +2557,9 @@ the two cost/safety controls the unattended-spend risk demands.
 The idle tick above fires on a **fixed quiet-window schedule**, regardless of whether anything
 has actually changed — the common case in a settled group is a full LLM turn against the
 orchestrator's (largest) context that ends "nothing new, going quiet." The intake gate makes the
-tick **conditional** on a host-side, zero-token pre-check for exactly the two things the tick's
-cadence exists to catch: new/changed `agent-ready`/`agent-investigation` labels, and open-PR
-check-state transitions.
+tick **conditional** on a host-side, zero-token pre-check for exactly the things the tick's
+cadence exists to catch: new/changed `agent-ready`/`agent-investigation` labels, open-PR
+check-state transitions, and (#864) new comment/review activity on an open PR.
 
 - **A scan on the shared poller's tick** (#406; originally a second, independently-clocked
   thread of its own — see "One `gh` poller" below for why that was folded away).
@@ -2571,20 +2571,34 @@ check-state transitions.
   idiom, plus that idiom's per-tick cap and oldest-polled-first ordering — see "Bounding one
   tick") — shells out
   to `gh issue list --json number,title,labels` and `gh pr list --json
-  number,title,statusCheckRollup` (via the existing `gh_capture` helper `poll_watches` already
-  uses; no new subprocess plumbing) and diffs the result against that group's last-seen state
+  number,title,statusCheckRollup,comments,reviews` (via the existing `gh_capture` helper
+  `poll_watches` already uses; no new subprocess plumbing) and diffs the result against that
+  group's last-seen state
   (`OrchRegistry.intake_seen`, in-memory only — the `watches`/`idle_tick_times` lifetime class).
   Two calls per due group regardless of how many issues/PRs exist — the API-budget discipline
   `notify.rs`'s round-robin/per-tick cap defends, applied here as "one list call, not one per
   item."
 - **Pure diff + notice composition (`intake.rs`, mirrors `notify.rs` exactly).**
-  `label_deltas`/`pr_check_deltas` take the already-parsed `gh --json` output and the prior
+  `label_deltas`/`pr_check_deltas`/`pr_comment_deltas` take the already-parsed `gh --json` output and the prior
   poll's last-seen maps and return only what's NEW: a label present now that wasn't at the last
   observation (covers both a brand-new labeled issue and a label added to a known one; a label
   removed then re-added reads as new again, not a repeat), or a PR whose coarse check-state
   (`PrCheckState::{Pending,Success,Failure}`, classified with the exact `check_is_pending`/
   `check_is_failing` predicates `notify::pr_checks_result` already uses, so the two call sites
-  can never disagree about what "failing" means) reached a NEW terminal value. A restart empties
+  can never disagree about what "failing" means) reached a NEW terminal value, or (#864) a PR whose
+  newest comment/review timestamp differs from the last observation — *differs*, not "is greater",
+  because an edited or deleted comment moves it backwards and the question being asked is "has the
+  discussion changed since loomux looked", so the failure direction is one spurious wake rather
+  than a missed one. Timestamps compare as strings: GitHub's are fixed-width UTC `Z`, so
+  lexicographic order is chronological and no date crate (and so no `getrandom`-pulling
+  dependency — CLAUDE.md constraint 2) is needed. Comment activity rides the PR call that was
+  already being made, so the poller's two-`gh`-calls-per-due-group budget is unchanged; `gh` has no
+  sub-field selection, so bodies come down whether or not anything reads them, but serde skips them
+  without allocating and the cost is one larger response string per poll, not one per comment. It
+  also cannot tell an agent's PR comment from a human's — every agent shares the human's `gh`
+  credential — so an orchestrator that comments and then falls quiet is woken once for its own
+  words; a deliberate over-approximation, bounded by the quiet window, still cheaper than the
+  per-tick manual poll it replaces. A restart empties
   `intake_seen`, so the very next poll reads everything currently labeled/terminal as new exactly
   once — the acceptance criterion ("harmless one-time re-fire, never a repeat") falls out of the
   diff with no special-casing. `intake_wake_summary` composes the addendum text, sanitized with
@@ -2599,7 +2613,8 @@ check-state transitions.
   duty still has a job even with zero label/PR news); an unresolved watchdog stall
   (`AgentEntry.watchdog_notified` on any agent in the group); or the **bounded fallback**
   (`intake::idle_tick_fallback_due`, `Guardrails.idle_tick_fallback_minutes`, default 180 = 3h,
-  the middle of the issue's suggested 2–4h range) having come due since the group's last actual
+  the middle of the issue's suggested 2–4h range, widened while the group stays delta-free — see
+  the #864 bullet below) having come due since the group's last actual
   fire (`OrchRegistry.idle_tick_last_fired_ms`) — never since the gate was last merely
   *evaluated*, which can happen every 60s scan while a group sits quiet. Any one of the four
   fires the tick; none of them SKIPS it — audited (`idle-tick-skipped`, with the reason), never
@@ -2632,6 +2647,47 @@ check-state transitions.
   checked for zero tokens. This is the same "don't make the recipient re-derive what the sender
   already knows" principle behind #398's structured reports, applied to the opposite direction of
   the same channel.
+- **The fallback backs off while a group stays delta-free (#864).** The bounded fallback is what
+  keeps a poller bug from muting the orchestrator — but at a *fixed* interval it also charged a
+  group parked entirely on the human (every open item human-gated, no live delegates, nothing
+  changing anywhere the host can see) that interval forever: ~30 consecutive delta-free wakes over
+  one parked weekend, each 1–2 API turns over the orchestrator's whole ~180k-token prefix, each
+  sweep finding nothing. So the EFFECTIVE interval `idle_tick_gate` consults is
+  `intake::fallback_interval_minutes(base, streak, ceiling)`: the base doubles per consecutive
+  delta-free wake and stops at `Guardrails.idle_tick_fallback_max_minutes` (default 24h → 3h → 6h
+  → 12h → 24h). Three properties carry the design:
+  - **The streak grows only on a delivered wake that found nothing** (`heartbeat`), never on a gate
+    *evaluation*. A skip re-checks every `intake_poll_minutes`; ramping the interval on those would
+    couple the cadence to the poll rate rather than to observed quiet.
+  - **It resets on evidence about the world, not about the orchestrator**: a wake with a real signal
+    behind it, human input in the pane since the last fire, or any live delegate in the group.
+    Notably NOT on orchestrator output — in a parked group the dominant source of that output is the
+    orchestrator answering our own previous wake (it sweeps, finds nothing, goes quiet), which is
+    exactly the loop being slowed down. Resetting there would make the streak un-growable in
+    production while still passing any test that never simulated the reply, so the integration tests
+    simulate it deliberately.
+  - **The guarantee changes in degree, not in kind.** The orchestrator is still woken
+    unconditionally; the worst case is one wake per ceiling instead of one per base. Setting the
+    ceiling equal to the base is the documented opt-out — one value, rather than a separate enable
+    flag — and the ceiling is floored at the base in `clamped()`, so the backoff can only ever make
+    the backstop slower, never quicker. The streak lives in `OrchRegistry.idle_tick_empty_streak`,
+    in-memory like `idle_tick_times`: a restart drops back to the base cadence and has to re-earn
+    the backoff by observing quiet again, which is the safe direction.
+  `empty_streak` and the effective `fallback_minutes` ride every `idle-tick` audit entry and the
+  `idle-tick-skipped` reason, for the same reason `heartbeat`/`gate_enabled` do (#429): a cadence
+  that decays silently is a cadence nobody can debug.
+- **Why not a first-class 'parked' group state (#864's optional third part).** The issue also
+  proposed suppressing the fallback outright for a group whose board tasks are all
+  human-testing/blocked/done with zero live delegates. Half of that landed — **zero live delegates**
+  is a backoff suppressor, so a group with agents in flight always stays on its base cadence (the
+  heartbeat wake is how an orchestrator notices a delegate that went quiet without reporting). The
+  board-state half is deliberately deferred: (a) full suppression removes the backstop, and the
+  failure it exists for — a host-side poll that fails silently, expired `gh` auth being the ordinary
+  case — becomes indistinguishable from genuine silence, permanently; (b) the backoff already
+  converges on parked behaviour without any board introspection, since a parked group is delta-free
+  by definition and saturates at the ceiling on its own, leaving one wake per day as the entire
+  difference; (c) board state is only as true as the orchestrator's board hygiene, which is a weaker
+  signal than observed quiet.
 - **Degrade, don't deny.** A `gh` failure on either call (auth, not installed, transient) simply
   skips that half of the diff for the current scan; the poll attempt is still stamped (so a
   persistently-failing `gh` isn't retried every 60s), and the bounded fallback covers the group
