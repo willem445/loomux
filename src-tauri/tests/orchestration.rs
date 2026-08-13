@@ -16933,7 +16933,7 @@ fn poll_promptsubmit_hook_respects_a_baseline_that_excludes_a_stale_record() {
 #[test]
 fn promptsubmit_marker_path_matches_the_hooks_dir_convention() {
     let root = Path::new("C:/state");
-    let path = promptsubmit_marker_path(root, "group-1", "agent-1");
+    let path = promptsubmit_marker_path(root, "group-1", "agent-1").unwrap();
     assert_eq!(path, root.join("group-1").join("hooks").join("agent-1.promptsubmit.jsonl"));
 }
 

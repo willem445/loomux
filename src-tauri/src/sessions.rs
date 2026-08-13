@@ -55,7 +55,20 @@ pub struct SessionInfo {
 /// Detect loomux orchestration signatures in a transcript message. Kickoffs
 /// name the role and group; `[loomux]` notices (worker reports, exit
 /// notices, board edits) are only ever typed into orchestrator panes.
-pub(crate) fn detect_orch_signature(text: &str) -> Option<(&'static str, Option<String>)> {
+///
+/// **This is the one group id in the codebase whose source is agent-writable**
+/// (#904). A transcript is a file the agent CLI writes from the agent's own
+/// conversation, so any text an agent emits can contain the kickoff phrase and
+/// choose what follows it. The scraped id then travels: `Parsed.orch_gid` →
+/// persisted `IndexEntry` → `SessionInfo.orch_group` → the frontend → back in
+/// as `resume_orch_session(group_hint)`, which joins it onto the orchestration
+/// root. The `take_while` charset below was the *only* thing standing between
+/// that loop and a path traversal, and it is not a specification — so the
+/// result is now run through [`GroupId::parse`], the one place that decides
+/// what a group id may be. A scrape that fails it reads as "no group", exactly
+/// like a kickoff phrase with nothing after it.
+#[doc(hidden)] // pub for integration tests
+pub fn detect_orch_signature(text: &str) -> Option<(&'static str, Option<String>)> {
     for (phrase, role) in [
         ("the orchestrator of loomux agent group ", "orchestrator"),
         (" worker agent in loomux group ", "worker"),
@@ -66,7 +79,12 @@ pub(crate) fn detect_orch_signature(text: &str) -> Option<(&'static str, Option<
                 .chars()
                 .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
                 .collect();
-            return Some((role, (!gid.is_empty()).then_some(gid)));
+            return Some((
+                role,
+                crate::orchestration::GroupId::parse(&gid)
+                    .ok()
+                    .map(|g| g.into_string()),
+            ));
         }
     }
     if text.trim_start().starts_with("[loomux] ") {
@@ -1349,14 +1367,26 @@ fn to_session_info(source: &str, e: &IndexEntry, intent: &LaunchIntentStore) -> 
     // EVERY scan and never cached — a group directory can be deleted while the
     // transcript that named it stays byte-identical, so a cached `orch_group`
     // would keep claiming a group that isn't there any more.
+    // #904: both arms re-validate. The `Some(gid)` arm reads a group id back
+    // out of the PERSISTED session index — a file an older build wrote, and one
+    // nothing re-checks on load — and the derived arm builds a path from it. An
+    // id that no longer satisfies `GroupId::parse` reads as "no group" rather
+    // than travelling on to `resume_orch_session`, which would join it.
     let (orch_role, orch_group) = match (&e.orch_role, &e.orch_gid) {
-        (Some(role), Some(gid)) => (Some(role.clone()), Some(gid.clone())),
+        (Some(role), Some(gid)) => (
+            Some(role.clone()),
+            crate::orchestration::GroupId::parse(gid)
+                .ok()
+                .map(|g| g.into_string()),
+        ),
         (Some(role), None) if !e.cwd.is_empty() => {
             let gid = crate::orchestration::group_id_for_repo(&e.cwd);
-            let exists = crate::orchestration::OrchRegistry::default_root()
-                .join(&gid)
-                .join("group.json")
-                .is_file();
+            let exists = crate::orchestration::GroupId::parse(&gid).is_ok_and(|g| {
+                crate::orchestration::OrchRegistry::default_root()
+                    .join(g.as_str())
+                    .join("group.json")
+                    .is_file()
+            });
             (Some(role.clone()), exists.then_some(gid))
         }
         (Some(role), None) => (Some(role.clone()), None),
