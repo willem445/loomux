@@ -99,9 +99,19 @@ export const WORKFLOW_VERSION = 1;
 export const WORKFLOW_FILE = ".loomux/workflow.yml";
 
 /** What a `merge` gate can require of its reviewers. `all-pass` = every named reviewer
- *  recorded PASS; `threshold` = at least N of them did. */
+ *  recorded PASS; `threshold` = at least N of them did. These are the CANONICAL
+ *  spellings — what the pane offers and what it writes. */
 export const GATE_REQUIRES = ["all-pass", "threshold"] as const;
 export type GateRequire = (typeof GATE_REQUIRES)[number];
+
+/** What the ENGINE accepts, which is a superset: `all` is a synonym for `all-pass` in
+ *  `parse_workflow`'s gate match (workflow.rs). Validation reads THIS list, so a
+ *  hand-written file using the synonym stops being flagged as an error it never was —
+ *  a pane that refuses a file the engine loads is telling the same class of lie as one
+ *  that blesses a file the engine refuses, just in the other direction (#880 review).
+ *  The picker still offers `GATE_REQUIRES` only: there is no reason to offer a human
+ *  two spellings of one thing. */
+export const GATE_REQUIRES_ACCEPTED = ["all-pass", "all", "threshold"] as const;
 
 /** A legal block id: lowercase-ish, human-meaningful, safe as a filename fragment and as
  *  a shell-adjacent token. Deliberately strict — the id ends up in agent ids, pane names
@@ -2092,7 +2102,7 @@ export function validateWorkflow(w: Workflow, knobs?: KnobLookup): Finding[] {
 
   const gate = w.gates.merge;
   if (gate) {
-    if (!(GATE_REQUIRES as readonly string[]).includes(gate.require)) {
+    if (!(GATE_REQUIRES_ACCEPTED as readonly string[]).includes(gate.require)) {
       findings.push({
         severity: "error",
         code: "gate-unknown-require",

@@ -1719,26 +1719,58 @@ engine and nothing was wrong with the pane; the two simply had no shared
 statement of what a workflow file is, so they could not disagree out loud.
 `intake:`, `merge_queue:` and `resources:` each arrived the same way later.
 
-**The manifest is not documentation of the schema — it is the schema, and two
-tests hold each side to it.**
+**The manifest is the schema rather than a description of it, in the specific
+sense that tests hold each side to it — and it is worth being exact about which
+parts those tests reach, because a row nothing checks is a row that drifts.**
 
-- `src-tauri/tests/orchestration.rs` compares each section against the field
-  set serde actually accepts, derived from the `Raw*` types by *serializing*
-  maximally-populated values (`workflow::workflow_schema_keys()`) rather than
-  by hand-listing them. A hand-written list is precisely the thing that drifts,
-  and it would drift silently in the one direction that matters: a new field,
-  forgotten. Both directions fail: a `Raw*` field missing from the manifest is
-  a field no GUI control will ever be generated for; a manifest field the
-  engine doesn't have is a control that writes a key `deny_unknown_fields`
-  rejects the whole file over.
+- `src-tauri/tests/orchestration.rs` pins the **field names** of each section
+  against the set serde actually accepts, derived from the `Raw*` types by
+  *serializing* populated values (`workflow::workflow_schema_keys()`) rather
+  than by hand-listing them. A hand-written list is precisely the thing that
+  drifts, and it would drift silently in the one direction that matters: a new
+  field, forgotten. Both directions fail: a `Raw*` field missing from the
+  manifest is a field no GUI control will ever be generated for; a manifest
+  field the engine doesn't have is a control that writes a key
+  `deny_unknown_fields` rejects the whole file over.
+- The same file pins the **values half** — each field's `values`, `default`,
+  `min`, `max` and `max_entries` — against `workflow_schema_field_facts()`,
+  which reads them off the engine's own accessors and constants
+  (`SUPPORTED_CLIS`, `kind_names`, `role_hint_names`, `intake_source_names`,
+  `builtin_intake_profile`, the `MergeQueuePolicy` / `ResourcePolicy` `Default`
+  impls, `RESOURCE_*`, `NOTIFY_EXPIRES_*`, `RESOURCES_MAX`). Also both
+  directions, so metadata cannot be invented here that the engine never stated.
+  **Refuse-vs-clamp is pinned behaviorally**: the test drives `parse_workflow`
+  with an out-of-range value and checks whether the file is refused or the
+  value quietly pulled into range, because that is a fact about what the parse
+  *does* and no constant states it.
 - `test/workflowschema.test.ts` drives every manifest field through the pane's
   real parser and serializer: the parser must read it (never into `extra`), the
-  canonical serializer must emit it, and it must be either claimed by a form
-  control or explicitly listed as not yet having one.
+  canonical serializer must emit it, every enum value the pane has a rule for
+  must pass that rule, and each field must be either claimed by a form control
+  or explicitly listed as not yet having one.
 
-Two tests and not one, deliberately. They pin different sides, and a repo where
-only one is green is a repo where the pane and the engine disagree about what a
-workflow file is — which is exactly the thing a human then gets lied to about.
+Two enforcers and not one, deliberately. They pin different sides, and a repo
+where only one is green is a repo where the pane and the engine disagree about
+what a workflow file is — which is exactly the thing a human then gets lied to
+about.
+
+**What is deliberately not pinned**, so the claim above stays honest: `title`
+and `help` prose; `gate.require`'s accepted set, which the engine states only
+as match arms in `parse_workflow` and which is therefore hand-listed in
+`workflow_schema_field_facts()` with that caveat attached; and the enum fields
+the pane has no rule of its own for (`intake.source`, `effort`, `context`) —
+full engine parity for a live buffer is `workflow_check`'s job, not the
+manifest's.
+
+**An empty value can be a real value.** `block.cli: ""` means "inherit the
+group's CLI, whatever the launcher picks" and `intake.source: ""` means the
+built-in source — both are what most files actually contain, so both are
+members of their enum's `values` rather than an absence the manifest forgot to
+mention. A generated `<select>` that cannot express them cannot express a legal
+file. (The pane is stricter than the engine on exactly one of these: it still
+asks a block for an explicit `cli:`. Stricter is the safe direction — it can
+annoy, it cannot mislead someone into a file that will not load — but it is a
+divergence, and it is written down here rather than discovered later.)
 
 The pane's `KNOWN_*` sets stay hand-written and are *pinned* by that test rather
 than read from the manifest at runtime. `workflowmodel.ts` is pure and

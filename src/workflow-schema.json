@@ -2,15 +2,35 @@
   "note": [
     "The wire schema of `.loomux/workflow.yml`, as data (#880 slice A).",
     "",
-    "This file IS the contract, not a description of one. Two tests enforce it, one per side:",
-    "  - src-tauri/tests/orchestration.rs `workflow_schema_manifest_matches_the_engines_raw_types`",
-    "    compares every section below, key for key, against what the engine's `Raw*` serde",
-    "    mirrors actually accept (`workflow::workflow_schema_keys()`). A field added to or",
-    "    removed from a `Raw*` struct without editing this file is a RED test, not a silent",
-    "    gap in the GUI.",
-    "  - test/workflowschema.test.ts asserts the pane's own model round-trips every field",
-    "    below (the parser knows it — it never lands in `extra`; the canonical serializer",
-    "    emits it), and tracks which fields still have no editor.",
+    "This file is the shared statement of what a workflow file is, and two tests hold each",
+    "side to it. What they pin, exactly:",
+    "",
+    "  src-tauri/tests/orchestration.rs",
+    "    - every section's FIELD NAMES against the engine's `Raw*` serde types, both",
+    "      directions, with no exclusion list;",
+    "    - each field's `values`, `default`, `min`, `max` and `max_entries` against the",
+    "      engine's own accessors and constants (SUPPORTED_CLIS, kind_names,",
+    "      role_hint_names, intake_source_names, builtin_intake_profile, the",
+    "      MergeQueuePolicy/ResourcePolicy Default impls, RESOURCE_*, NOTIFY_EXPIRES_*,",
+    "      RESOURCES_MAX) — and in both directions, so metadata cannot be added here",
+    "      that the engine never stated;",
+    "    - `on_out_of_range` BEHAVIORALLY: the test drives `parse_workflow` with an",
+    "      out-of-range value and checks whether it refuses the file or clamps the value.",
+    "",
+    "  test/workflowschema.test.ts",
+    "    - the pane's parser reads every field (it never lands in the unknown-key bag);",
+    "    - the pane's canonical serializer emits every field, so a save drops nothing;",
+    "    - every enum value declared here is one the pane's own validator accepts, and a",
+    "      value outside the set is refused;",
+    "    - every field is either claimed by a form control or listed as not yet having one.",
+    "",
+    "NOT pinned, so nobody assumes otherwise:",
+    "    - `title` and `help` prose, and the `types` legend below;",
+    "    - `gate.require`'s value set, which is hand-listed in workflow.rs because the",
+    "      engine states it only as match arms — there is no accessor to ask;",
+    "    - the pane has no validation rule of its own for `intake.source`, `effort` or",
+    "      `context`, so the TS enum check covers only the fields it does validate;",
+    "      full engine-parity for a live buffer is slice E's `workflow_check`.",
     "",
     "It describes loomux's OWN product schema — the shape of a workflow file, never any",
     "particular repo's roster (CLAUDE.md constraint 8). `blocks:` is data; what is pinned",
@@ -34,6 +54,19 @@
     "section": "a nested mapping whose shape is the section named in `section`",
     "section-list": "a list of `section` mappings",
     "section-map": "a mapping of author-chosen names to `section` mappings"
+  },
+  "field_keys": {
+    "name": "the key as it is spelled in the file",
+    "type": "one of `types` above",
+    "values": "for `enum`: every value the ENGINE accepts, including the empty string where an empty value is meaningful (`block.cli`, `intake.source`) — a control that cannot represent one of these cannot represent a legal file",
+    "default": "what the engine BEHAVES as when the key is omitted (the placeholder a form shows), which is not always the wire default — `merge_queue.max_batch` is absent on the wire and 3 in effect",
+    "min": "lowest accepted number",
+    "max": "highest accepted number",
+    "on_out_of_range": "`refuse` = the engine rejects the whole file; `clamp` = it silently pulls the value into range. A generated control must refuse the submit in the first case and may accept-and-coerce in the second",
+    "max_entries": "for `section-map`: how many entries the engine will load before refusing the file",
+    "required": "the engine has no default for this — a file without it does not load",
+    "section": "for the container types: which section describes the value's shape",
+    "help": "prose for the human, rendered beside the control"
   },
   "sections": {
     "workflow": {
@@ -93,6 +126,7 @@
           "name": "resources",
           "type": "section-map",
           "section": "resource",
+          "max_entries": 32,
           "help": "Named lock resources agents may acquire, keyed by a name this repo chooses (loomux never learns what it means). Absent = the lock tools are not offered at all."
         }
       ]
@@ -123,9 +157,9 @@
         {
           "name": "cli",
           "type": "enum",
-          "values": ["claude", "copilot", "gemini", "opencode"],
+          "values": ["", "claude", "copilot", "gemini", "opencode"],
           "default": "",
-          "help": "The agent CLI this block spawns on. Empty inherits the group's CLI."
+          "help": "The agent CLI this block spawns on. The empty value is a real one and the state most blocks are in: it inherits the group's CLI, which is picked at launch. A named CLI must also be able to host this block's kind — the engine refuses e.g. a reviewer on a CLI with no tool-level edit deny."
         },
         {
           "name": "model",
@@ -194,14 +228,15 @@
         {
           "name": "require",
           "type": "enum",
-          "values": ["all-pass", "threshold"],
+          "values": ["all-pass", "all", "threshold"],
           "default": "all-pass",
-          "help": "`all-pass` = every named reviewer recorded PASS. `threshold` = at least N of them did."
+          "help": "`all-pass` = every named reviewer recorded PASS. `threshold` = at least N of them did. `all` is an accepted synonym for `all-pass`; `all-pass` is the spelling loomux writes. Omitting the key with a `threshold: N` present means a threshold gate."
         },
         {
           "name": "threshold",
           "type": "number",
           "min": 1,
+          "on_out_of_range": "refuse",
           "help": "How many passing reviews a `threshold` gate needs. Meaningless — and refused above the reviewer count — otherwise."
         },
         {
@@ -225,9 +260,9 @@
         {
           "name": "source",
           "type": "enum",
-          "values": ["github-labels", "board", "none"],
+          "values": ["", "github-labels", "board", "none"],
           "default": "github-labels",
-          "help": "Which adapter supplies work. `github-labels` polls issues by label (today's wired behavior); `board` and `none` are schema-reserved."
+          "help": "Which adapter supplies work. `github-labels` polls issues by label (today's wired behavior); `board` and `none` are schema-reserved. The empty value is accepted and means the default, so a repo can override just the labels without restating a source it already means."
         },
         {
           "name": "labels",
@@ -282,6 +317,7 @@
           "type": "number",
           "default": 3,
           "min": 1,
+          "on_out_of_range": "refuse",
           "help": "How many approved sub-PRs one speculative batch may carry. At 3, a red batch costs at most 2 extra CI runs to attribute."
         },
         {
@@ -290,6 +326,7 @@
           "default": 60,
           "min": 5,
           "max": 240,
+          "on_out_of_range": "clamp",
           "help": "Backstop on waiting for a batch's checks, so a repo with no checks attached surfaces as unverifiable instead of pending in silence. Clamped into range rather than refused."
         }
       ]
@@ -304,6 +341,7 @@
           "default": 1,
           "min": 1,
           "max": 64,
+          "on_out_of_range": "refuse",
           "help": "How many agents may hold it at once. 1 (the default) is a mutex; a repo that wants a semaphore says so."
         },
         {
@@ -312,6 +350,7 @@
           "default": 30,
           "min": 1,
           "max": 480,
+          "on_out_of_range": "refuse",
           "help": "How long one hold may last before the sweep reclaims it — the bound that keeps a crashed holder from parking the resource forever."
         }
       ]
