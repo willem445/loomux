@@ -11831,8 +11831,8 @@ because that refusal is the only one needing a *resolved* roster, it is delibera
   lock on the file, so a `git pull` or an agent editing it in between resolves two different
   rosters — a case this repo already treats as live and accepted (#459), which makes it likelier
   than the liveness race rather than rarer; and the candidate's own `group.json` is likewise
-  read twice, so a live toggle rewriting it, or an `end_group` removing the state dir, can turn
-  a reattach into a fresh launch between one read and the next.
+  read twice, so a live toggle rewriting it can change the roster, the advanced flag or the cap
+  a reattach restores between the two reads.
 
   None of that is behavioral — the backstop covers all of it. The enumeration matters because it
   is what a future reader will weigh when deciding whether the backstop is still needed, and

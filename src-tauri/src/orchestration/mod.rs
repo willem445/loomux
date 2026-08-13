@@ -44093,10 +44093,10 @@ fn register_orchestrator_pane(
     //     already treats mid-session edits of that file as a live, accepted
     //     reality (see #459 in `create_group_ex`'s resume arm), which makes
     //     this likelier than the liveness race, not rarer.
-    //   - **the candidate's own `group.json`.** Likewise read twice. A live
+    //   - **the candidate's own `group.json`.** Likewise read twice, and a live
     //     toggle (`orch_set_advanced_orchestrator`, `set_max_agents`) rewrites
-    //     it, and an `end_group` can remove the state dir outright — turning a
-    //     reattach into a fresh launch between one read and the next.
+    //     it — so the roster, the advanced flag or the cap a reattach restores
+    //     can differ between the two reads.
     //
     // None of these is behavioral: this check covers all of them, which is the
     // point of it existing. It is kept rather than trusting the pre-check alone
