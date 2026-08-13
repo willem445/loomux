@@ -151,82 +151,112 @@ test("a minimized pane keeps its queue count on the dock chip", async ({ appPage
   await expect(marker, "the dock marker clears by absence too").toHaveCount(0);
 });
 
-test("a narrow pane wearing several chips stays usable, and the terminal never moves", async ({
+/** The most a chip that has fully yielded its text can still cost a header:
+ *  its own padding (6px x 2) and borders (1px x 2), plus the header's 6px flex
+ *  `gap`, none of which `flex-shrink` can touch — 20px, with 4px of slack for
+ *  rounding and DPI. A cost above this means the LABEL did not collapse; a cost
+ *  of zero is not achievable by any element that exists at all, which is what
+ *  the first cut of this test wrongly demanded (measured on CI: 217px of
+ *  pre-existing overflow without the badge, 237px with it). */
+const MAX_BADGE_COST_PX = 24;
+
+test("the queue badge yields its text rather than crowding a narrow header", async ({
   appPage: page,
 }) => {
-  // Three columns in a 1280px window, so each header is ~420px and has to fit a
-  // title, the chips, and nine `flex: none` buttons — the crowding case review
-  // finding 4 asked a human to look at.
-  //
-  // **What is asserted is this badge's CONTRIBUTION, not the header's absolute
-  // fit.** A header that narrow can already be over-subscribed by chrome this
-  // PR did not add (every other chip and all nine buttons are `flex: none`), and
-  // pinning the absolute number here would make an unrelated future button a
-  // failure of the queue badge. The property that IS this PR's to keep: the
-  // badge yields first and never displaces anything interactive.
+  // **What this measures, and why not the header's absolute fit.** At three
+  // columns in a 1280px window this header is ALREADY ~217px over-subscribed by
+  // chrome this PR did not add — nine `flex: none` buttons, the title, and the
+  // other chips — so an absolute assertion would charge the queue badge for
+  // that, and would charge the next new button to it as well. What #814 owns is
+  // its own contribution: the badge is the one chip here that shrinks
+  // (`flex: 0 1 auto; min-width: 0`), so however tight the header gets it gives
+  // up its text before it costs anyone else room, and what remains is only the
+  // box it cannot shrink away.
   await createTerminalPane(page, { name: "Narrow A" });
   await page.locator("#btn-split-right").click();
   await createTerminalPane(page, { name: "Narrow B" });
-  await page.locator("#btn-split-right").click();
-  await createTerminalPane(page, { name: "Narrow C" });
 
-  const pane = paneByName(page, "Narrow C");
+  const pane = paneByName(page, "Narrow B");
   const header = pane.locator(".pane-header");
   const term = pane.locator(".pane-term");
   const closeBtn = pane.locator("button.pane-btn.close");
 
   const overflow = () => header.evaluate((el) => el.scrollWidth - el.clientWidth);
-  /** Is the rightmost interactive control still inside the header's own box? */
-  const closeInsideHeader = async () => {
+  /** How far the rightmost interactive control sits past the header's own box. */
+  const closeOverhang = async (): Promise<number> => {
     const [box, headerBox] = await Promise.all([closeBtn.boundingBox(), header.boundingBox()]);
-    if (!box || !headerBox) return null;
+    if (!box || !headerBox) throw new Error("the close button or header lost its bounding box");
     return Math.round(box.x + box.width - (headerBox.x + headerBox.width));
   };
 
-  const before = await term.boundingBox();
-  expect(before, "the pane's terminal should have a bounding box").not.toBeNull();
+  const termBefore = await term.boundingBox();
+  expect(termBefore, "the pane's terminal should have a bounding box").not.toBeNull();
 
   // Baseline: #246's delivery-held chip alone, keyed purely by pty so it needs
-  // no roster. Whatever crowding exists at this width without the queue badge
-  // is what the badge is measured against.
+  // no roster. Whatever this header costs without the queue badge is what the
+  // badge is measured against.
   for (const pty of PTYS) {
     await emitEvent(page, "orch-delivery-held", { pty_id: pty, reason: "question" });
   }
   await expect(pane.locator(".pane-held")).toBeVisible();
   const overflowHeld = await overflow();
-  const closeHeld = await closeInsideHeader();
+  const overhangHeld = await closeOverhang();
 
   await pushDepths(page, readings({ depth: 8, cap: 8, waiting_ms: 600_000, stalled: true }));
   await expect(pane.locator(".pane-queue")).toHaveCount(1);
 
-  // 1. Constraint 1, mechanically: header chrome must never reach the
-  //    terminal's geometry. A resize would move this box.
+  // 1. Constraint 1, mechanically: header chrome must never reach the terminal's
+  //    geometry. A resize would move this box.
   await expect
     .poll(async () => JSON.stringify(await term.boundingBox()), { timeout: 5_000 })
-    .toBe(JSON.stringify(before));
+    .toBe(JSON.stringify(termBefore));
 
-  // 2. The badge must not widen the header's overflow. It is the one chip here
-  //    allowed to shrink (`flex: 0 1 auto; min-width: 0`), so on a header with
-  //    no room left it gives way to nothing rather than pushing the button
-  //    cluster out.
-  const overflowBadged = await overflow();
+  // 2. Two columns: at a realistic width the badge is legible, and costs the
+  //    header nothing it did not have room for.
+  await expect(pane.locator(".pane-queue")).toBeVisible();
+  await expect(pane.locator(".pane-queue")).toHaveText(/8\/8/);
+  const twoColCost = (await overflow()) - overflowHeld;
   expect(
-    overflowBadged,
-    `the queue badge widened the header's overflow: ${overflowHeld}px without it, ` +
-      `${overflowBadged}px with it`
-  ).toBeLessThanOrEqual(overflowHeld + 1);
-
-  // 3. And nothing interactive moved out of reach: the close button ends no
-  //    further past the header's right edge than it already did.
-  const closeBadged = await closeInsideHeader();
-  expect(closeBadged, "the close button lost its bounding box").not.toBeNull();
+    twoColCost,
+    `at two columns the badge cost the header ${twoColCost}px of overflow ` +
+      `(${overflowHeld}px without it)`
+  ).toBeLessThanOrEqual(MAX_BADGE_COST_PX);
+  const twoColOverhang = (await closeOverhang()) - overhangHeld;
   expect(
-    closeBadged!,
-    `the queue badge pushed the close button further out of the header: ` +
-      `${String(closeHeld)}px without it, ${String(closeBadged)}px with it`
-  ).toBeLessThanOrEqual((closeHeld ?? 0) + 1);
+    twoColOverhang,
+    `at two columns the badge pushed the close button ${twoColOverhang}px further out ` +
+      `(overhang was ${overhangHeld}px without it)`
+  ).toBeLessThanOrEqual(MAX_BADGE_COST_PX);
 
-  // 4. The title stays a usable drag source — the same guard pane-reorder.spec
+  // 3. Three columns: the tight case. The badge's cost must stay bounded by the
+  //    box it cannot shrink — i.e. its text yielded completely — and it must not
+  //    push the close button further out by more than that same box.
+  await page.locator("#btn-split-right").click();
+  await createTerminalPane(page, { name: "Narrow C" });
+  await expect(pane.locator(".pane-queue")).toHaveCount(1);
+  const tightOverflow = await overflow();
+  const tightOverhang = await closeOverhang();
+
+  await pushDepths(page, []);
+  await expect(pane.locator(".pane-queue")).toBeHidden();
+  const withoutOverflow = await overflow();
+  const withoutOverhang = await closeOverhang();
+
+  const tightCost = tightOverflow - withoutOverflow;
+  expect(
+    tightCost,
+    `at three columns the badge cost ${tightCost}px of overflow ` +
+      `(${withoutOverflow}px without it, ${tightOverflow}px with it) — more than its own ` +
+      `padding+border+gap means the label did not collapse`
+  ).toBeLessThanOrEqual(MAX_BADGE_COST_PX);
+  const overhangCost = tightOverhang - withoutOverhang;
+  expect(
+    overhangCost,
+    `the badge pushed the close button ${overhangCost}px further past the header's edge ` +
+      `(${withoutOverhang}px without it, ${tightOverhang}px with it)`
+  ).toBeLessThanOrEqual(MAX_BADGE_COST_PX);
+
+  // 4. The title stays a usable drag source — the guard pane-reorder.spec
   //    learned to assert, now with more content beside it.
   const titleBox = await pane.locator(".pane-title").boundingBox();
   expect(titleBox?.width, "the title collapsed to an unusable drag source").toBeGreaterThan(10);
