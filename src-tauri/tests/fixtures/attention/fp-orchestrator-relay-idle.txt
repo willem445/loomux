@@ -1,0 +1,11 @@
+● w-411 reported blocked on #884 and the note is a human call, not a routing
+  one: "the shim refuses an unsigned tag — do you want to proceed with option A
+  (re-sign) or option B (drop the tag)?". Relayed to the human; nothing for me
+  to do on this until they answer.
+
+✻ Crunched for 8s
+
+────────────────────── loomux-loomux-68435179-orchestrator ──
+[38;5;153m❯[0m
+─────────────────────────────────────────────────────────────
+  [2m⏵⏵ auto mode on (shift+tab to cycle) · ← for agents[0m

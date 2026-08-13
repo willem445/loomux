@@ -2824,6 +2824,17 @@ const LATE_MONITOR_QUESTION_SCAN_BYTES: usize = 32 * 1024;
 /// (`question_hold_predicate`'s `ever_shown` gate) — a checkpoint that was
 /// never shown a question releases on its very first check, no extra delay.
 const QUESTION_RELEASE_CONSECUTIVE_CLEAR_POLLS: u32 = 2;
+/// How far up from the bottom of a composed screen [`idle_prompt_row_rendered`]
+/// looks for the CLI's own input prompt (#903).
+///
+/// A window, not the whole screen, because the reading has to mean "this is the
+/// pane's CURRENT input affordance" and not "an empty prompt was painted at some
+/// point in the scrollback". Six non-empty rows is what sits below a Claude Code
+/// box at rest (a separator, the box row, a separator, the mode footer) with room
+/// for a shortcut hint line or two — generous enough that no CLI's chrome pushes
+/// its own box out of range, small enough that a stale prompt row further up
+/// cannot license a release.
+const IDLE_PROMPT_TAIL_ROWS: usize = 6;
 
 // Kickoff readiness: a fixed boot delay loses the race on a loaded machine
 // (a CLI that boots slower than the delay flushes the pasted prompt along
@@ -7587,8 +7598,10 @@ pub fn low_disk_notice(free_bytes: u64) -> String {
 /// - *Structured* signals (numbered y/n menu, explicit y/n tokens, stock
 ///   permission phrasings) don't occur in ordinary prose, so they're honored
 ///   across the last ~12 lines.
-/// - *Prose-like* signals — a bare selection pointer and the plain-English menu
-///   footer ("use arrow keys", "enter to select") — DO appear in finished-turn
+/// - *Prose-like* signals — a bare selection pointer, the plain-English menu
+///   footer ("use arrow keys", "enter to select") and, since #903, the
+///   permission phrasings that are ordinary sentences rather than punctuated UI
+///   ([`PROSE_PERMISSION_PHRASES`]) — DO appear in finished-turn
 ///   agent output (agents describe keyboard UIs, paste shell prompts, echo
 ///   `a › b` breadcrumbs). A *live* menu paints these as the last thing on
 ///   screen, with its pointer *leading* an option line (after any box frame);
@@ -7666,6 +7679,68 @@ fn leads_with_pointer(line: &str) -> bool {
     POINTER_GLYPHS
         .iter()
         .any(|g| d.strip_prefix(*g).is_some_and(|rest| !rest.trim_matches(is_frame_char).is_empty()))
+}
+
+/// The glyphs a CLI paints to say "your turn to type" at its input box.
+///
+/// A superset of [`POINTER_GLYPHS`] in spirit but not in membership, and the
+/// difference is the point: `❯`/`›` are used for BOTH a menu's highlighted
+/// choice and an empty composer, which is why [`leads_with_pointer`] has to ask
+/// what FOLLOWS the glyph (#727). `>` and `$` are only ever prompts — Claude
+/// Code's older box and any shell — and `→` is only ever a pointer, so it is
+/// absent here.
+const PROMPT_GLYPHS: [char; 4] = ['❯', '›', '>', '$'];
+
+/// Is this rendered row an EMPTY input prompt — a prompt glyph with nothing
+/// after it but framing (#903)?
+///
+/// The exact complement of [`leads_with_pointer`]'s content requirement, over
+/// the same de-framing rule, so "a pointer at an option" and "a prompt with
+/// nothing in it" can never both be true of one row and can never drift apart.
+fn is_empty_prompt_row(line: &str) -> bool {
+    let d = deframe(line);
+    PROMPT_GLYPHS
+        .iter()
+        .any(|g| d.strip_prefix(*g).is_some_and(|rest| rest.trim_matches(is_frame_char).is_empty()))
+}
+
+/// The last [`IDLE_PROMPT_TAIL_ROWS`] non-empty rendered rows — the pane's
+/// current chrome, as opposed to whatever is still sitting above it.
+fn bottom_rendered_rows(visible: &str, n: usize) -> Vec<&str> {
+    let rows: Vec<&str> = visible.lines().filter(|l| !l.trim().is_empty()).collect();
+    rows[rows.len().saturating_sub(n)..].to_vec()
+}
+
+/// Does the pane's current chrome include an EMPTY input prompt (#903)?
+///
+/// The weaker of this module's two idleness readings, and the one the
+/// last-resort override keys on: it says an empty composer is on screen, and
+/// says nothing about what else is. [`idle_prompt_rendered`] is the stronger
+/// one.
+pub fn idle_prompt_row_rendered(visible: &str) -> bool {
+    bottom_rendered_rows(visible, IDLE_PROMPT_TAIL_ROWS).iter().any(|l| is_empty_prompt_row(l))
+}
+
+/// Is this pane sitting at an idle, empty input prompt with no menu selection
+/// anywhere on screen (#903)?
+///
+/// **Positive evidence of idleness, not the absence of evidence of a question.**
+/// The distinction is the safety argument: a screen loomux cannot read, or one
+/// whose CLI paints a box shape this does not recognise, answers `false` and the
+/// hold stands. Only a screen that actually shows an empty composer — and shows
+/// no highlighted choice anywhere, so a dialog cannot be sitting above one — is
+/// allowed to end a hold.
+///
+/// The assumption, stated so a future TUI change is a known break rather than a
+/// mystery (the same courtesy #727's note pays for its own): **a CLI does not
+/// paint a modal question and an empty free-text composer at the same time.**
+/// Every dialog the fixtures cover replaces the box while it is up. A CLI that
+/// asked a question *above* a live composer would read as idle here — which is
+/// why the pointer clause is a conjunct rather than a nicety, and why the
+/// fixtures assert this reading is false for every positive dialog capture in
+/// the suite, not merely true for the negatives.
+pub fn idle_prompt_rendered(visible: &str) -> bool {
+    idle_prompt_row_rendered(visible) && !pointer_rendered(visible)
 }
 
 /// Does any rendered row lead with a menu pointer (#534 rev-13)?
@@ -7772,6 +7847,15 @@ pub fn prompt_wait_match(tail: &str) -> Option<QuestionMatch> {
     if let Some((token, line)) = token_in(last_painted, MENU_FOOTER_TOKENS) {
         return Some(QuestionMatch::token("menu-footer", token, line));
     }
+    // #903: permission-shaped phrasings that are ALSO ordinary English, read
+    // from the last painted lines only — the same two-tier rule the pointer and
+    // the footer have always used, applied to the tokens it never covered. A
+    // live prompt paints these last; an agent's finished turn writes them in the
+    // middle of a paragraph, above the CLI's redrawn box. See
+    // `PROSE_PERMISSION_PHRASES` for why exactly these three and not the rest.
+    if let Some((token, line)) = token_in(last_painted, PROSE_PERMISSION_PHRASES) {
+        return Some(QuestionMatch::token("prose-permission-phrase", token, line));
+    }
     // Selection pointer marking the highlighted choice. A `❯`/`›`/`→` that
     // *leads* a line's content (after any box frame) is menu-shaped; the same
     // glyph mid-line is pervasive in ordinary output — pasted shell prompts
@@ -7791,7 +7875,7 @@ pub fn prompt_wait_match(tail: &str) -> Option<QuestionMatch> {
 /// function so the match can report the one that fired and
 /// [`match_still_rendered`] can look for that same one on the composed screen.
 /// Contents and order are exactly what the inline disjunctions were.
-const YES_NO_TOKENS: &[&str] = &["(y/n)", "[y/n]", "y/n)", "[y/n]?", "yes/no"];
+const YES_NO_TOKENS: &[&str] = &["(y/n)", "[y/n]", "y/n)", "[y/n]?"];
 const PERMISSION_PHRASES: &[&str] = &[
     "do you want to proceed",
     "do you want to make this edit",
@@ -7802,9 +7886,31 @@ const PERMISSION_PHRASES: &[&str] = &[
     "allow this",
     "allow command",
     "grant access",
-    "press enter to continue",
-    "waiting for your",
 ];
+/// #903: the three signals that were **sentences**, not UI structure — moved
+/// out of the two wide-window tiers above and read only from the last painted
+/// lines.
+///
+/// The wide tiers are justified by prose-safety ("these don't occur in ordinary
+/// prose", per this function's own header) and these three never met that bar:
+///
+/// - `yes/no` — the spelled-out English phrase, sitting in `YES_NO_TOKENS`
+///   beside the punctuated `(y/n)`/`[y/n]` forms that genuinely are structure.
+///   "a yes/no question", "a yes/no confirmation" is how anyone writes about
+///   one.
+/// - `waiting for your` — a bare sentence fragment. In an orchestration pane it
+///   is the *normal* thing to read: "waiting for your review", "waiting for your
+///   merge decision".
+/// - `press enter to continue` — an instruction documentation and agent prose
+///   quote constantly; `fp-prose-arrow-keys.txt` has pinned that exact shape as
+///   a false positive for the footer tier since #40.
+///
+/// Demoting costs nothing a real dialog needs: a live one paints its phrase as
+/// the last thing on screen (that is what "waiting" means), and a dialog that
+/// pushes its title above the window still carries its options — every
+/// structured tier above is untouched.
+const PROSE_PERMISSION_PHRASES: &[&str] =
+    &["yes/no", "waiting for your", "press enter to continue"];
 const NUMBERED_MENU_TOKENS: &[&str] = &["1. yes", "❯ 1."];
 const MENU_FOOTER_TOKENS: &[&str] =
     &["enter to select", "enter to confirm", "use arrow", "arrow keys", "↑↓", "↑/↓"];
@@ -17425,6 +17531,19 @@ fn deliver_now(
     // not a bool: the monitor must re-send the brief, never the flush header
     // some attempt happened to prepend to it.
     recoverable_kickoff: Option<String>,
+    // #903: the drainer's last-resort question override, decided by
+    // `question_override_admits` against a FRESH read of this pane and audited
+    // there. When set, this attempt's interactive-question gate is skipped —
+    // and ONLY that gate: the human-typing backstop, the stranded-text flush's
+    // own question check (a blind Enter, which must never run on an override's
+    // word) and every box-occupancy read below are untouched.
+    //
+    // A bool decided by the caller rather than a clock re-read here, because
+    // the decision belongs to the poll that observed the pane: re-deriving it
+    // inside this function would describe a different instant than the one that
+    // admitted the write, the same reason `wait_for_question_clear` returns its
+    // witness rather than letting the abort site re-read.
+    question_overridden: bool,
 ) -> DeliverOutcome {
     // ⚠ #561 — READ THIS BEFORE ADDING A STAGE BELOW.
     //
@@ -17680,7 +17799,14 @@ fn deliver_now(
         // Nothing of ours is on screen yet at this point in the delivery, so
         // there's no self-echo risk to gate against (`paste_baseline_total:
         // None` — see `question_hold_predicate`).
-        let (question_decision, question_seen) =
+        // #903: an override skips the hold outright rather than entering it with
+        // a shorter cap. Entering it would re-arm, for two more minutes, exactly
+        // the reading the override exists because loomux has stopped believing —
+        // and would then abort the delivery the drainer just admitted, putting
+        // the pane straight back where #903 found it.
+        let (question_decision, question_seen) = if question_overridden {
+            (PasteDecision::Paste { held_ms: 0 }, None)
+        } else {
             wait_for_question_clear(
                 &ptys,
                 pty_id,
@@ -17695,7 +17821,8 @@ fn deliver_now(
                 delivered_lines(&reg, pty_id),
                 &emit_held,
                 &emit_held_cleared,
-            );
+            )
+        };
         if question_seen.is_some() {
             // Only overwrite with a real sighting: a later round that saw
             // nothing must not erase what an earlier one held for.
@@ -17729,7 +17856,11 @@ fn deliver_now(
         // dead pane into an extra enqueue/retry cycle.
         let admission = write_admission(
             ptys.input_pending(pty_id).unwrap_or(false),
-            question_active_now(&ptys, pty_id, None, delivered_lines(&reg, pty_id)),
+            // #903: the override's second (and last) reach into this function.
+            // Short-circuited rather than ANDed after the call so an overridden
+            // attempt does not pay a pane read whose answer it would discard.
+            !question_overridden
+                && question_active_now(&ptys, pty_id, None, delivered_lines(&reg, pty_id)),
         );
         if admission.go() || recheck_round >= PREPASTE_RECHECK_ROUNDS {
             break admission;
@@ -19034,8 +19165,19 @@ fn run_queue_drainer(
         }
     };
     let mut iteration = 0u32;
+    // #903: consecutive polls whose FRESH composed-screen read showed this pane
+    // sitting at an empty input prompt. Drainer-local for the same reason
+    // `chip_reason` is — a drainer is per-pty and its exit is exactly when the
+    // observation stops being about anything — and a plain counter rather than a
+    // timestamp because what the override needs is "still idle now", proven
+    // repeatedly, not "was idle at some point".
+    let mut question_idle_streak = 0u32;
     loop {
         iteration += 1;
+        // #903: set by this iteration's own poll (below) when the last-resort
+        // override fires. Per-iteration, never carried: an override is a
+        // decision about one attempt against one reading of the pane.
+        let mut question_overridden = false;
         // #470: the very first pass of a freshly spawned drainer attempts
         // immediately — no poll sleep, no outer deliverability pre-check —
         // exactly matching the pre-#470 direct path's latency for the
@@ -19228,9 +19370,16 @@ fn run_queue_drainer(
             // reader of the gate whose hold has no cap, so it is the one whose
             // audit has to say what it keyed on — see
             // `question_active_witnessed`.
-            let (question_active, question_seen) =
+            let reading =
                 question_active_witnessed(&ptys, pty_id, None, reg.delivered_notice_lines(pty_id));
-            let admission = write_admission(box_pending, question_active);
+            let question_seen = reading.witnessed;
+            let admission = write_admission(box_pending, reading.active);
+            // #903: the streak the last-resort override keys on. Counted here,
+            // on the poll that took the reading, and reset by ANY poll that did
+            // not see an idle prompt — so it can only ever describe the pane's
+            // present, never a state it was in before something repainted.
+            question_idle_streak =
+                if reading.idle_prompt { question_idle_streak.saturating_add(1) } else { 0 };
             // #532: the escalation decision is `held_escalation`'s, not an
             // inline `&&` chain here (rev-12 B1) — this loop is where a held
             // delivery actually LIVES, since `deliver_now` holds only for its
@@ -19296,7 +19445,46 @@ fn run_queue_drainer(
                     }
                 }
             }
-            if !admission.go() {
+            // #903: the last resort. A question hold that has outlived
+            // `QUESTION_HOLD_OVERRIDE_AFTER` on a pane whose composed screen
+            // keeps showing an empty input prompt is not a question — it is the
+            // detector being wrong about a pane nobody is being asked anything
+            // by, and the human has already been badged about it for five
+            // minutes (`QUESTION_HOLD_STALE_AFTER`). Deliver.
+            //
+            // The chip is NOT lowered here: the pane is still held as far as
+            // every gate is concerned, and a successful delivery lowers it below
+            // on `Done` — the same place every other release does. Lowering it
+            // on a provisional decision is #560's symptom 1.
+            question_overridden = question_override_admits(
+                admission,
+                reg.hold_episode_since(pty_id),
+                now_ms(),
+                QUESTION_HOLD_OVERRIDE_AFTER.as_millis() as u64,
+                question_idle_streak,
+            );
+            if question_overridden {
+                // Reset so a delivery that goes on to abort for some OTHER
+                // reason cannot re-grant an override on every 2s poll: the pane
+                // has to re-prove itself idle from scratch. Bounds the audit
+                // volume too, which is the same thing said about the log.
+                question_idle_streak = 0;
+                reg.audit(&group, "loomux", "delivery-question-override", json!({
+                    "to": &front.agent_id,
+                    "held_ms": reg.hold_episode_since(pty_id)
+                        .map(|s| now_ms().saturating_sub(s)),
+                    "bound_ms": QUESTION_HOLD_OVERRIDE_AFTER.as_millis() as u64,
+                    "depth": depth,
+                    // What the detector was holding for, so a human reading this
+                    // line can tell which signal keeps misfiring — the whole
+                    // point of #820's witness, and the input to the next
+                    // narrowing.
+                    "matched": witness_audit(question_seen.as_ref()),
+                    "reason": "the question hold outlived its bound while the pane's own \
+                               screen showed an idle, empty input prompt",
+                }));
+            }
+            if !admission.go() && !question_overridden {
                 continue; // keep polling — no cap
             }
         }
@@ -19422,6 +19610,7 @@ fn run_queue_drainer(
                     payload, front.from.clone(), confirm_autopilot, wait_ready, cli, lock,
                     reg.last_delivery.clone(), target_is_orchestrator, reg_for_call,
                     fresh_kickoff.then(|| text.clone()),
+                    question_overridden,
                 );
                 if matches!(out, DeliverOutcome::Done) {
                     header_pending = false;
@@ -20952,9 +21141,19 @@ pub struct QuestionSample {
 pub enum GridEvidence {
     /// The match — or some other question shape — is among the rendered rows.
     StillRendered,
-    /// The screen composed cleanly and holds neither. This is the ONLY
-    /// reading that turns a hold into a release.
+    /// The screen composed cleanly and holds neither. Releases the hold.
     NotRendered,
+    /// The screen composed cleanly and shows the CLI sitting at an EMPTY input
+    /// prompt with no menu selection anywhere on it (#903) — whatever the ring
+    /// matched, and whatever of it is still rendered, is text on an idle pane
+    /// rather than a question anybody can answer. Releases the hold.
+    ///
+    /// Its own variant rather than folding into `NotRendered` because the two
+    /// are different findings and the audit is read by humans: `not-rendered`
+    /// says the dialog went away, `idle-prompt` says there was never a dialog —
+    /// which is the whole of #903 and the single most useful line in the log
+    /// when the detector fires on prose again.
+    IdlePrompt,
     /// No composition worth reading (pty gone, geometry unknown, nothing
     /// painted). Proves nothing in either direction; the ring's word stands.
     Unreadable,
@@ -20967,6 +21166,7 @@ impl GridEvidence {
         match self {
             GridEvidence::StillRendered => "still-rendered",
             GridEvidence::NotRendered => "not-rendered",
+            GridEvidence::IdlePrompt => "idle-prompt",
             GridEvidence::Unreadable => "unreadable",
         }
     }
@@ -20984,9 +21184,22 @@ impl GridEvidence {
 /// - [`match_still_rendered`] — catches a dialog sitting outside the
 ///   detector's own last-12-lines window, which is a *chronological* rule
 ///   applied here to a *spatial* layout and so cannot be relied on alone.
+///
+/// **#903 puts one reading ahead of both of them**, and the ordering is the
+/// change: [`idle_prompt_rendered`] is consulted FIRST, so a pane sitting at an
+/// empty composer answers `IdlePrompt` even when the matched text is plainly
+/// still on the screen. That inverts the asymmetry above for exactly one case,
+/// deliberately. The asymmetry is right when the question is "did the dialog go
+/// away" — absence of evidence is weak, so weight it toward holding. It is
+/// wrong when the question is "was this ever a dialog", because there the
+/// screen is offering *positive* evidence that it was not: a CLI showing an
+/// empty free-text box is not blocked on an answer. #903's two lost panes had a
+/// matched line, still rendered, forever, on a pane nobody was being asked
+/// anything by — `StillRendered` was true and useless.
 pub fn grid_evidence_for(m: &QuestionMatch, visible: Option<&str>) -> GridEvidence {
     match visible {
         None => GridEvidence::Unreadable,
+        Some(v) if idle_prompt_rendered(v) => GridEvidence::IdlePrompt,
         Some(v) if prompt_wait_detected(v) || match_still_rendered(v, m) => {
             GridEvidence::StillRendered
         }
@@ -21000,12 +21213,13 @@ pub fn grid_evidence_for(m: &QuestionMatch, visible: Option<&str>) -> GridEviden
 /// because the asymmetry is the safety argument and not an implementation
 /// detail:
 ///
-/// | ring | grid | reading | vs. before #534 |
+/// | ring | grid | reading | |
 /// |---|---|---|---|
-/// | no match | (not consulted) | clear | unchanged |
-/// | match | `Unreadable` | hold | unchanged |
-/// | match | `StillRendered` | hold | unchanged |
-/// | match | `NotRendered` | **clear** | **the one change** |
+/// | no match | (not consulted) | clear | |
+/// | match | `Unreadable` | hold | |
+/// | match | `StillRendered` | hold | |
+/// | match | `NotRendered` | **clear** | #534's one change |
+/// | match | `IdlePrompt` | **clear** | #903's one change |
 ///
 /// Every row but the last is today's behaviour, so the entire behavioural
 /// surface of this change is a single transition, in a single direction, and
@@ -21024,7 +21238,15 @@ pub fn grid_evidence_for(m: &QuestionMatch, visible: Option<&str>) -> GridEviden
 pub fn question_shown(ring: Option<&QuestionMatch>, visible: Option<&str>) -> bool {
     match ring {
         None => false,
-        Some(m) => grid_evidence_for(m, visible) != GridEvidence::NotRendered,
+        // Spelled as the two readings that HOLD rather than as `!= NotRendered`
+        // (#903): a sixth `GridEvidence` added later must decide which side it
+        // is on at the compiler's insistence, instead of inheriting "hold" — or,
+        // worse, "release" — from whichever way the comparison happened to be
+        // written.
+        Some(m) => matches!(
+            grid_evidence_for(m, visible),
+            GridEvidence::StillRendered | GridEvidence::Unreadable
+        ),
     }
 }
 
@@ -21258,7 +21480,27 @@ fn question_active_now(
     pasted_text: Option<&str>,
     delivered: Vec<String>,
 ) -> bool {
-    question_active_witnessed(ptys, pty_id, pasted_text, delivered).0
+    question_active_witnessed(ptys, pty_id, pasted_text, delivered).active
+}
+
+/// One one-shot reading of a pane's question gate (#903): the decision, the
+/// evidence, and — for the last-resort override — whether that same instant's
+/// composed screen showed an empty input prompt.
+///
+/// A struct rather than a widening tuple because the third field is easy to
+/// mistake for the second's negation and is not: `active` is the gate,
+/// `idle_prompt` is a fact about the CURRENT render that
+/// [`question_override_admits`] is allowed to act on only after a bound has
+/// elapsed. They disagree exactly in the case #903 exists for.
+pub struct QuestionReading {
+    /// Is the question gate holding right now?
+    pub active: bool,
+    /// What the detector matched on this poll, for the audit.
+    pub witnessed: Option<QuestionWitnessed>,
+    /// Did this poll's composed screen show an empty input prompt
+    /// ([`idle_prompt_row_rendered`])? `false` for an unreadable screen — no
+    /// composition, no idleness claim.
+    pub idle_prompt: bool,
 }
 
 /// [`question_active_now`], plus WHAT the detector matched (#820).
@@ -21282,16 +21524,26 @@ fn question_active_witnessed(
     pty_id: u32,
     pasted_text: Option<&str>,
     delivered: Vec<String>,
-) -> (bool, Option<QuestionWitnessed>) {
+) -> QuestionReading {
     let witness: QuestionWitness = Default::default();
+    // #903: captured from INSIDE the sample closure, so the idleness reading and
+    // the gate's decision are the same composed screen and not two reads
+    // microseconds apart — `question_sample`'s own doc gives the reason that
+    // distinction is correctness rather than cost.
+    let idle = std::rc::Rc::new(std::cell::Cell::new(false));
+    let idle_w = std::rc::Rc::clone(&idle);
     let active = question_hold_predicate_sampled(
-        || question_sample(ptys, pty_id),
+        move || {
+            let s = question_sample(ptys, pty_id);
+            idle_w.set(s.visible.as_deref().is_some_and(idle_prompt_row_rendered));
+            s
+        },
         pasted_text.map(str::to_string),
         Some(std::rc::Rc::clone(&witness)),
         delivered,
     )();
     let seen = witness.borrow().clone();
-    (active, seen)
+    QuestionReading { active, witnessed: seen, idle_prompt: idle.get() }
 }
 
 /// #532: the guards a delivery must find satisfied **at one instant**, on the
@@ -21495,6 +21747,82 @@ pub fn hold_bound_elapsed(held_since_ms: u64, now_ms: u64, bound_ms: u64) -> boo
         return false;
     }
     now_ms.saturating_sub(held_since_ms) >= bound_ms
+}
+
+/// #903: how long a pane's delivery may be held by the QUESTION gate alone
+/// before loomux stops believing its own detector and delivers anyway.
+///
+/// **Sized between the two clocks that already exist**, which is the whole of
+/// the choice: longer than [`QUESTION_HOLD_STALE_AFTER`] (10 min), so the human
+/// is badged and given five minutes to look before loomux acts on their behalf;
+/// shorter than `QUEUE_STILL_QUEUED_NOTICE_AFTER` (30 min), so a queue moves
+/// before the generic "still queued" notice is the first anyone hears of it.
+/// #903's own incidents ran 25 and 30+ minutes and ended with panes killed by
+/// hand — the bound has to land inside a human's patience, not merely inside
+/// infinity.
+///
+/// **Why an override is safe at all, in one line: a delivery carries a delivery
+/// id, and every receiver treats a re-seen id as a duplicate.** So the cost of a
+/// wrong override is a brief that arrives while a dialog is genuinely open — the
+/// paste lands in the dialog's lap, the human answers it, and if that paste was
+/// eaten the drainer's own recovery re-sends it under the same id, which the
+/// agent then ignores as a duplicate. The cost of never overriding is what this
+/// issue is: a queue that never moves and a pane a human has to kill. The design
+/// note argues this at length.
+///
+/// `0` disables the override (pre-#903 behaviour), the same convention
+/// [`hold_bound_elapsed`] gives every bound here, so a mis-set constant degrades
+/// to today's holding rather than to delivering into every dialog on screen.
+pub const QUESTION_HOLD_OVERRIDE_AFTER: Duration = Duration::from_secs(15 * 60);
+
+/// #903: how many CONSECUTIVE drainer polls must read an idle prompt before the
+/// override is allowed to fire.
+///
+/// The same reasoning as [`QUESTION_RELEASE_CONSECUTIVE_CLEAR_POLLS`], and the
+/// same number: one reading of a composed screen can catch a mid-redraw
+/// instant, and this reading licenses a WRITE. Two polls is four seconds
+/// against a bound measured in quarter-hours, so it costs nothing that matters.
+const QUESTION_OVERRIDE_CONSECUTIVE_READS: u32 = 2;
+
+/// #903: may this poll deliver despite the question gate saying no?
+///
+/// Pure, and every term is load-bearing:
+///
+/// - **`admission` must be `HoldQuestion`.** A box-occupied hold is never
+///   overridden — #510's absolute (human-typed content in the box outranks
+///   everything) is untouched by this, and `write_admission` checks the box
+///   first precisely so that a pane with both blockers reports the box one and
+///   lands here ineligible.
+/// - **`held_since_ms` is the PANE's hold-episode start** ([`HoldEpisode`]),
+///   never an entry's `enqueued_ms` — the same clock [`hold_bound_elapsed`]
+///   already measures the badge against, so "badged at 10, overridden at 15"
+///   describes one continuous thing a human watched rather than two unrelated
+///   timers. `None` — no open episode — is never eligible: nothing has been
+///   measured, so nothing can be overdue.
+/// - **`idle_streak` is a count of FRESH reads**, taken by the caller on the
+///   same polls that produced `admission`. Not a latched flag and not a
+///   historical one: the override re-proves the pane is idle every time it
+///   fires, which is the property #903 asks for and the reason this takes a
+///   streak rather than a bool the caller could have set minutes ago.
+///
+/// Every term must hold on the SAME poll. A pane that reads idle for ten
+/// minutes and then paints a dialog is ineligible on the very next poll, with no
+/// memory of having been eligible.
+#[doc(hidden)] // pub for integration tests
+pub fn question_override_admits(
+    admission: WriteAdmission,
+    held_since_ms: Option<u64>,
+    now_ms: u64,
+    bound_ms: u64,
+    idle_streak: u32,
+) -> bool {
+    if admission != WriteAdmission::HoldQuestion {
+        return false;
+    }
+    if idle_streak < QUESTION_OVERRIDE_CONSECUTIVE_READS {
+        return false;
+    }
+    held_since_ms.is_some_and(|since| hold_bound_elapsed(since, now_ms, bound_ms))
 }
 
 /// What the drainer should do about a pane it is not yet allowed to write to
