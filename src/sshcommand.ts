@@ -94,6 +94,28 @@ function cmdQuote(token: string): string {
   return `"${token.replace(/"/g, '""')}"`;
 }
 
+/** Escapes `remoteCwd` for the `cd /d` prefix. Same double-quote-doubling
+ *  convention as `cmdQuote`, but does NOT refuse a trailing backslash: `cd`
+ *  is one of cmd.exe's own INTERNAL commands, never spawned as a separate
+ *  process, so its argument is parsed entirely by cmd.exe's own tokenizer —
+ *  not by a spawned program's `CommandLineToArgvW` convention, which is the
+ *  thing a trailing backslash before a quote actually confuses (see
+ *  `cmdQuote`). Confirmed against a real `cmd.exe`: `cd /d
+ *  "C:\Windows\System32\"` (trailing backslash) changes to that directory
+ *  correctly. Still refuses a newline — that truncates the whole `/C`
+ *  command line regardless of which command consumes the truncated
+ *  remainder, cd included. */
+function cmdQuoteCwd(token: string): string {
+  if (token.includes("\n") || token.includes("\r")) {
+    throw new Error(
+      `cmd.exe quoting: refusing a remoteCwd containing a newline — cmd.exe /C reads only the first ` +
+        `line and silently drops the rest: ${JSON.stringify(token)}`,
+    );
+  }
+  if (token === "") return '""';
+  return `"${token.replace(/"/g, '""')}"`;
+}
+
 function buildPosixRemoteCommand(remoteCwd: string | undefined, remoteCommand: string[]): string {
   const cmd = remoteCommand.map(posixQuote).join(" ");
   return remoteCwd ? `cd ${posixQuote(remoteCwd)} && exec ${cmd}` : `exec ${cmd}`;
@@ -117,9 +139,16 @@ function buildPosixRemoteCommand(remoteCwd: string | undefined, remoteCommand: s
  *  Confirmed against a real `cmd.exe` in test/sshcommand.test.ts (this was
  *  the mechanism of the injection this module used to be vulnerable to). */
 function buildCmdRemoteCommand(remoteCwd: string | undefined, remoteCommand: string[]): string {
-  const cwd = remoteCwd ?? ".";
+  // `|| "."`, not `?? "."`: an empty-string remoteCwd is treated as absent,
+  // matching buildPosixRemoteCommand's `remoteCwd ? ... : ...` truthiness
+  // check. Nullish coalescing alone would quote `""` into `cd /d "" && ...`,
+  // which cmd.exe rejects outright — the `&&` short-circuits and the actual
+  // remote command never runs, while the posix path silently treats the
+  // same input as "no cwd" and proceeds. Same input, same meaning, on both
+  // shells.
+  const cwd = remoteCwd || ".";
   const cmd = remoteCommand.map(cmdQuote).join(" ");
-  return `cd /d ${cmdQuote(cwd)} && ${cmd}`;
+  return `cd /d ${cmdQuoteCwd(cwd)} && ${cmd}`;
 }
 
 function buildRemoteCommand(remoteShell: RemoteShell, remoteCwd: string | undefined, remoteCommand: string[]): string {

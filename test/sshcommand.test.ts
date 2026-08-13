@@ -22,6 +22,15 @@ import {
 
 const FAKE_SSH = "./fake-ssh.sh"; // the test/hand-validation program-injection seam
 
+// A stand-in for a real agent CLI name in the tests below that actually spawn
+// a real local shell to execute the built remote-command string (the
+// "real cmd.exe"/"real sh" sections). NEVER "claude" (or any other real agent
+// CLI) as the executed program there: if it resolves on PATH, cmd.exe/sh
+// launches the real thing, burning the user's paid credits (CLAUDE.md hard
+// constraint 3) — the argv-level tests above are fine using "claude" because
+// they only ever inspect the returned string[], nothing is spawned.
+const NOT_A_REAL_CLI = "loomux-test-nonexistent-cli-8f3c1";
+
 // ---------- login shell (no remote command) ----------
 
 test("no remote command: just program, options, destination — no -t, no --", () => {
@@ -255,17 +264,46 @@ test("cmd path: a trailing backslash in a remote-command token is refused, not s
   );
 });
 
-test("cmd path: a trailing backslash in remoteCwd is refused too", () => {
+test("cmd path: a trailing backslash in remoteCwd is NOT refused — cd is internal, not spawned", () => {
+  // Unlike a remote-command token, remoteCwd is only ever cmd.exe's own `cd`
+  // argument — never a spawned process's argv — so the CommandLineToArgvW
+  // backslash-before-quote hazard cmdQuote refuses for tokens doesn't apply
+  // here (verified against real cmd.exe in the "real cmd.exe" section
+  // below). Refusing it would be strictly more restrictive than necessary
+  // for something legitimate (`C:\repos\` is an ordinary Windows path).
+  const argv = buildSshArgv(FAKE_SSH, {
+    destination: "h",
+    remoteShell: "cmd",
+    remoteCwd: "C:\\repos\\",
+    remoteCommand: ["claude"],
+  });
+  assert.equal(argv[argv.length - 1], 'cd /d "C:\\repos\\" && "claude"');
+});
+
+test("cmd path: a newline in remoteCwd is still refused, not silently truncated", () => {
   assert.throws(
     () =>
       buildSshArgv(FAKE_SSH, {
         destination: "h",
         remoteShell: "cmd",
-        remoteCwd: "C:\\repos\\",
+        remoteCwd: "C:\\repos\nwhoami",
         remoteCommand: ["claude"],
       }),
-    /trailing/,
+    /newline/,
   );
+});
+
+test("cmd path: an empty-string remoteCwd is treated as absent, matching the posix path", () => {
+  const argv = buildSshArgv(FAKE_SSH, {
+    destination: "h",
+    remoteShell: "cmd",
+    remoteCwd: "",
+    remoteCommand: ["claude"],
+  });
+  // Same as remoteCwd being entirely unset: `cd /d "." && ...`, not
+  // `cd /d "" && ...` (which cmd.exe rejects, short-circuiting the `&&`
+  // before the actual command ever runs).
+  assert.equal(argv[argv.length - 1], 'cd /d "." && "claude"');
 });
 
 test("a destination starting with '-' is refused rather than reaching ssh as an option", () => {
@@ -307,8 +345,12 @@ function runRemoteStringInCmdExe(cmdString: string): { stdout: string; stderr: s
   // windowsVerbatimArguments: true is required here — without it Node
   // re-quotes the argv itself before CreateProcess, which would mask
   // exactly the leading-quote defect this suite exists to catch. This
-  // mirrors what an OpenSSH-for-Windows sshd does: pass the remote command
-  // string to `cmd.exe /c` as a single argument.
+  // directly exercises cmd.exe's own documented `/C` parsing rule (`cmd
+  // /?`), which is the mechanism buildCmdRemoteCommand's fix depends on.
+  // How an OpenSSH-for-Windows sshd itself invokes the remote command was
+  // NOT independently verified here (not sourced from OpenSSH's own code
+  // or docs) — this is `cmd.exe /c <string>` as an assumption, consistent
+  // with `src/sshcommand.ts`'s own module comment, not a cited fact.
   const result = spawnSync(process.env.ComSpec || "cmd.exe", ["/c", cmdString], {
     windowsVerbatimArguments: true,
     encoding: "utf8",
@@ -332,7 +374,7 @@ test(
       const argv = buildSshArgv(FAKE_SSH, {
         destination: "h",
         remoteShell: "cmd",
-        remoteCommand: ["claude", hostile],
+        remoteCommand: [NOT_A_REAL_CLI, hostile],
       });
       const cmdString = argv[argv.length - 1];
       runRemoteStringInCmdExe(cmdString);
@@ -379,7 +421,7 @@ test(
       const argv = buildSshArgv(FAKE_SSH, {
         destination: "h",
         remoteShell: "cmd",
-        remoteCommand: ["claude", "--append-system-prompt", hostile, "--session-id", "abc-123"],
+        remoteCommand: [NOT_A_REAL_CLI, "--append-system-prompt", hostile, "--session-id", "abc-123"],
       });
       const cmdString = argv[argv.length - 1];
       runRemoteStringInCmdExe(cmdString);
@@ -402,7 +444,7 @@ test(
         destination: "h",
         remoteShell: "cmd",
         remoteCwd: "C:\\Windows",
-        remoteCommand: ["claude", hostile],
+        remoteCommand: [NOT_A_REAL_CLI, hostile],
       });
       const cmdString = argv[argv.length - 1];
       runRemoteStringInCmdExe(cmdString);
@@ -423,6 +465,40 @@ test("real cmd.exe: a benign quoted argument is delivered to the child intact", 
   const result = runRemoteStringInCmdExe(cmdString);
   assert.ok(result.stdout.includes("hello world"), `expected literal echo, got stdout=${result.stdout}`);
 });
+
+test(
+  "real cmd.exe: a trailing-backslash remoteCwd is consumed correctly by cd (not mangled)",
+  { skip: !CMD_AVAILABLE },
+  () => {
+    // Positive control for the trailing-backslash relaxation above: `cd` is
+    // internal to cmd.exe, so a trailing backslash before the closing quote
+    // doesn't trigger the CommandLineToArgvW-style merge a spawned
+    // program's argv would suffer from cmdQuote (see the "benign quoted
+    // argument" test, which stays on the token path, not the cwd path).
+    // `dir`'s output is the observable: a directory listing that names
+    // something System32-specific (`notepad.exe`, always present) and NOT
+    // this repo's own directory contents proves the `cd /d` actually landed
+    // there. (A nested `cmd /c cd` was tried here first to read `%CD%`/the
+    // bare cd-with-no-args back directly, but ran into an unrelated cmd.exe
+    // quirk — a bare "cd" as a nested command's sole argument right after an
+    // outer `cd` intermittently fails to resolve as a command at all, on
+    // both trailing-backslash and plain cwds alike — so it says nothing
+    // about the backslash relaxation being tested here; `dir` sidesteps it.)
+    const argv = buildSshArgv(FAKE_SSH, {
+      destination: "h",
+      remoteShell: "cmd",
+      remoteCwd: "C:\\Windows\\System32\\",
+      remoteCommand: ["cmd", "/c", "dir"],
+    });
+    const cmdString = argv[argv.length - 1];
+    const result = runRemoteStringInCmdExe(cmdString);
+    assert.ok(
+      result.stdout.toLowerCase().includes("notepad.exe"),
+      `expected a System32 directory listing, got stdout=${result.stdout}`,
+    );
+    assert.ok(!result.stdout.includes("CLAUDE.md"), "cd did not actually leave the repo directory");
+  },
+);
 
 /** True if child_process can actually find/run `sh` here. */
 function shAvailable(): boolean {
