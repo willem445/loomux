@@ -132,7 +132,9 @@ use loomux_lib::orchestration::{
     // #865: done-row cap on list_tasks — the pure keep/drop rule and its default.
     filter_done_rows, LIST_TASKS_DONE_CAP,
     unconfirmed_delivery_notice, delivery_eaten_notice, watchdog_should_notify, worktree_cleanup_targets,
-    AgentEntry, AgentRecord, ApproveItem, AttentionItem, Caller, Containment, Delivery, DeliveryConfirmation, Guardrails, HeldReason, HumanInput, Launch, NameSource, OrchRegistry, PasteDecision, RetryGate,
+    AgentEntry, AgentRecord, ApproveItem, AttentionItem, Caller, Containment, Delivery, DeliveryConfirmation, Guardrails, HeldReason, HumanInput, KickoffOrigin, Launch, NameSource, OrchRegistry, PasteDecision, RetryGate,
+    // #407: promotion of a standalone pane to orchestrator.
+    promote_to_orchestrator_sync, PromoteConfig, SessionOrigin,
     PersonaInject, Task, TaskNote, TaskSummary,
     PasteGate, Role, TaskPatch, UsageSnapshot, CLAUDE_UNATTENDED_ALLOW, COPILOT_AUTOPILOT_CONFIRM_KEYS,
     COPILOT_GROUP_AUTOPILOT_FLAGS, COPILOT_UNATTENDED_FLAGS, MAX_ATTACHMENT_BYTES,
@@ -6136,8 +6138,7 @@ fn a_spawn_carries_the_deny_flags_of_the_class_it_spawned() {
         &reg2,
         &repo.path().to_string_lossy().replace('\\', "/"),
         rails(),
-        Launch::Fresh,
-        None,
+        SessionOrigin::Fresh,
         None,
         0,
     )
@@ -10672,7 +10673,7 @@ fn concurrent_same_repo_launches_get_distinct_groups() {
         let reg = reg.clone();
         let repo = repo_path.clone();
         handles.push(std::thread::spawn(move || {
-            create_orchestration_group(&reg, &repo, rails(), Launch::Fresh, None, None, 0).map(|r| r.group_id)
+            create_orchestration_group(&reg, &repo, rails(), SessionOrigin::Fresh, None, 0).map(|r| r.group_id)
         }));
     }
     let ids: Vec<String> = handles.into_iter().map(|h| h.join().unwrap().unwrap()).collect();
@@ -10685,7 +10686,7 @@ fn repo_paths_with_quotes_are_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let reg = Arc::new(relaunch_registry(dir.path()));
     reg.set_port(45999);
-    let err = create_orchestration_group(&reg, "/tmp/evil\" ; rm -rf /", rails(), Launch::Fresh, None, None, 0)
+    let err = create_orchestration_group(&reg, "/tmp/evil\" ; rm -rf /", rails(), SessionOrigin::Fresh, None, 0)
         .unwrap_err();
     assert!(err.contains("quote"), "the quote check must fire before anything else, got: {err}");
 }
@@ -32946,9 +32947,9 @@ fn create_orchestration_group_maps_resume_session_onto_the_workflow_pin() {
     reg.set_port(45999);
     let advanced = Guardrails { advanced_orchestrator: true, ..rails() };
 
-    // ── Launch::Fresh ⇒ the repo's file is read ──
+    // ── SessionOrigin::Fresh ⇒ the repo's file is read ──
     declare("rev-approved");
-    let launched = create_orchestration_group(&reg, &repo_path, advanced.clone(), Launch::Fresh, None, None, 0)
+    let launched = create_orchestration_group(&reg, &repo_path, advanced.clone(), SessionOrigin::Fresh, None, 0)
         .unwrap();
     let gid = launched.group_id.clone();
     assert!(
@@ -32961,15 +32962,14 @@ fn create_orchestration_group_maps_resume_session_onto_the_workflow_pin() {
     reg.end_group(&gid, false).unwrap();
     declare("rev-never-seen");
 
-    // ── Launch::Resume ⇒ the PERSISTED roster stands, whatever `resume_session` is
+    // ── SessionOrigin::Resume ⇒ the PERSISTED roster stands, whatever the session id is
     // (#412 rev-17: these used to be the same bool — `launch` is now independent) ──
     let (persisted_repo, persisted) = reg.load_group_file(&gid).expect("group.json");
     create_orchestration_group(
         &reg,
         &persisted_repo,
         persisted,
-        Launch::Resume,
-        Some("11111111-2222-3333-4444-555555555555".into()),
+        SessionOrigin::Resume("11111111-2222-3333-4444-555555555555".into()),
         Some(&gid),
         0,
     )
@@ -32992,7 +32992,7 @@ fn create_orchestration_group_maps_resume_session_onto_the_workflow_pin() {
     let reg2 = Arc::new(relaunch_registry(state2.path()));
     reg2.set_port(45999);
     let relaunched =
-        create_orchestration_group(&reg2, &repo_path, advanced, Launch::Fresh, None, None, 0).unwrap();
+        create_orchestration_group(&reg2, &repo_path, advanced, SessionOrigin::Fresh, None, 0).unwrap();
     assert!(
         reg2.group(&relaunched.group_id).unwrap().guardrails.block("rev-never-seen").is_some(),
         "editing the workflow and launching again must pick up the new roster"
@@ -33021,8 +33021,7 @@ fn start_fresh_on_an_orchestrator_does_not_re_read_the_workflow_file() {
         &reg,
         &repo_path,
         Guardrails { advanced_orchestrator: true, ..rails() },
-        Launch::Fresh,
-        None,
+        SessionOrigin::Fresh,
         None,
         0,
     )
@@ -33340,8 +33339,7 @@ fn a_resumed_session_re_checks_the_pinned_roster_against_the_live_cap_too() {
         &reg,
         &repo.path().to_string_lossy(),
         Guardrails { advanced_orchestrator: true, max_agents: 5, ..rails() },
-        Launch::Fresh,
-        None,
+        SessionOrigin::Fresh,
         None,
         0,
     )
@@ -33359,8 +33357,7 @@ fn a_resumed_session_re_checks_the_pinned_roster_against_the_live_cap_too() {
         &reg,
         &persisted_repo,
         persisted,
-        Launch::Resume,
-        Some("11111111-2222-3333-4444-555555555555".into()),
+        SessionOrigin::Resume("11111111-2222-3333-4444-555555555555".into()),
         Some(&gid),
         0,
     )
@@ -33395,8 +33392,7 @@ fn a_resumed_group_with_no_declared_workflow_gets_no_capacity_audit_either() {
         &reg,
         &repo.path().to_string_lossy(),
         Guardrails { advanced_orchestrator: true, max_agents: 2, ..rails() },
-        Launch::Fresh,
-        None,
+        SessionOrigin::Fresh,
         None,
         0,
     )
@@ -33415,8 +33411,7 @@ fn a_resumed_group_with_no_declared_workflow_gets_no_capacity_audit_either() {
         &reg,
         &persisted_repo,
         persisted,
-        Launch::Resume,
-        Some("11111111-2222-3333-4444-555555555555".into()),
+        SessionOrigin::Resume("11111111-2222-3333-4444-555555555555".into()),
         Some(&gid),
         0,
     )

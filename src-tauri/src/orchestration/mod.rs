@@ -3811,6 +3811,162 @@ pub enum Launch {
     Fresh,
     /// A recorded orchestrator session is being reopened (the session browser).
     Resume,
+    /// A standalone pane is being promoted to orchestrator (#407).
+    ///
+    /// A third value rather than either of the two above, because the consent
+    /// moment splits by case and only this function knows which case it is
+    /// (whether the group dir it resolved already holds a `group.json`):
+    ///
+    /// - **no group dir yet** — the promote modal IS the preview moment: the
+    ///   human is told the repo declares a workflow and ticks the advanced box,
+    ///   so the file is read exactly as at the launcher. Fresh semantics.
+    /// - **reattaching a dormant group** — that group's roster was approved by
+    ///   its own launcher preview, and its board, audit trail and backlog
+    ///   outlived the session that consented to them. Re-reading the file here
+    ///   would swap the approved roster under all of it on nothing but a
+    ///   right-click. Resume semantics: pinned roster, drift audited.
+    ///
+    /// See the `reads_workflow_file` decision in [`OrchRegistry::create_group_ex`].
+    Promote,
+}
+
+/// Where an orchestrator pane's CLI **session** comes from (#407) — the
+/// session-level question, of which [`Launch`] is the group-level half.
+///
+/// These two used to travel as a `(Launch, Option<String>)` pair threaded
+/// through `create_orchestration_group` → `register_orchestrator_pane`, and the
+/// pair could spell combinations that are not real starts (`Launch::Fresh` with
+/// a session id to resume; `Launch::Resume` with none). Worse, the session id's
+/// mere presence was overloaded to answer three *different* questions at once —
+/// which session flag the CLI gets, whether a session watcher is needed, and
+/// which kickoff is typed — so there was no way to express the one start that
+/// answers them differently: a promoted pane resumes its conversation (it is
+/// the POC context the feature exists to keep) but has never seen the
+/// orchestrator contract, so it needs the FULL kickoff a resume never gets.
+///
+/// | | `Fresh` | `Resume` | `StartFresh` | `Promote` |
+/// |---|---|---|---|---|
+/// | group semantics | fresh | pinned roster | pinned roster | fresh, or pinned on reattach |
+/// | session flag | `--session-id <minted>` | `--resume <id>` | `--session-id <minted>` | `--resume <id>` |
+/// | kickoff | full body | ledger notice | full body | full body + promote preamble |
+/// | session watcher | per CLI | none (id known) | per CLI | none (id known) |
+///
+/// `StartFresh` is not new behavior — it is #412's cold restart of an existing
+/// group's orchestrator, which the old pair spelled as the easily-misread
+/// `(Launch::Resume, None)`. Naming it is the point: the pair had four
+/// inhabited combinations and looked like it had two.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SessionOrigin {
+    /// A cold start of a new group: the CLI mints (or is handed) a brand-new
+    /// session.
+    Fresh,
+    /// A recorded orchestrator conversation is being reopened as itself.
+    Resume(String),
+    /// A previously-launched group's orchestrator, cold-started on a NEW
+    /// conversation (#412's `start_fresh`): the group is not being launched
+    /// again — its approved roster stands — but the session is brand new.
+    StartFresh,
+    /// A standalone pane's conversation is being re-roled into an orchestrator
+    /// (#407). The session is the human's own POC context — carried forward,
+    /// never restarted.
+    ///
+    /// Carries the pane's CLI as well as its session id, because a session
+    /// belongs to exactly one CLI and the roster this group ends up running is
+    /// resolved later (and, on a dormant reattach, off disk): the pair is what
+    /// lets `register_orchestrator_pane` refuse to hand a claude conversation
+    /// to a CLI that has never heard of it.
+    Promote { session_id: String, cli: String },
+}
+
+impl SessionOrigin {
+    /// The group-level half of this start — what `create_group_ex` needs.
+    pub fn launch(&self) -> Launch {
+        match self {
+            SessionOrigin::Fresh => Launch::Fresh,
+            // #412 rev-17: a fresh CONVERSATION on an existing group is not a
+            // fresh LAUNCH of it. Never re-derive a roster the human already
+            // consented to.
+            SessionOrigin::Resume(_) | SessionOrigin::StartFresh => Launch::Resume,
+            SessionOrigin::Promote { .. } => Launch::Promote,
+        }
+    }
+
+    /// The conversation to reopen, if any.
+    pub fn session_id(&self) -> Option<&str> {
+        match self {
+            SessionOrigin::Fresh | SessionOrigin::StartFresh => None,
+            SessionOrigin::Resume(s) | SessionOrigin::Promote { session_id: s, .. } => Some(s),
+        }
+    }
+
+    /// Does the CLI reopen an existing conversation (`--resume <id>`) instead
+    /// of starting one? True for a promote as much as a resume — and it is the
+    /// same fact that says there is no newly-minted session to go watching for
+    /// (the id is already known).
+    pub fn resumes_session(&self) -> bool {
+        !matches!(self, SessionOrigin::Fresh)
+    }
+
+    /// Does this orchestrator get the full kickoff contract (roster, lessons,
+    /// guardrails, delivery id) rather than the short re-sync notice?
+    ///
+    /// The one decision `Promote` splits away from [`Self::resumes_session`]:
+    /// a resumed orchestrator has the contract in its own transcript already,
+    /// a promoted one has never seen it in its life.
+    pub fn wants_full_kickoff(&self) -> bool {
+        !matches!(self, SessionOrigin::Resume(_))
+    }
+
+    /// Audit-log spelling. `resume: true/false` alone can no longer say which
+    /// of the four starts a pane was (a promote and a resume both resume).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SessionOrigin::Fresh => "fresh",
+            SessionOrigin::Resume(_) => "resume",
+            SessionOrigin::StartFresh => "start-fresh",
+            SessionOrigin::Promote { .. } => "promote",
+        }
+    }
+}
+
+/// Whether a kickoff is addressed to a pane that arrived by **promotion**
+/// (#407) or by being spawned as what it is.
+///
+/// Deliberately not [`SessionOrigin`] itself: this is the only distinction the
+/// kickoff text draws, it is asked of delegate panes too (which have no session
+/// origin at all — the answer there is always `Normal`), and keeping it a
+/// separate `Copy` value is what lets `kickoff_prompt`'s twenty existing call
+/// sites stay untouched.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KickoffOrigin {
+    /// Spawned as this role. Every kickoff before #407.
+    Normal,
+    /// Re-roled in place from a standalone pane, carrying its conversation.
+    Promoted,
+}
+
+impl KickoffOrigin {
+    /// The paragraph a promoted orchestrator's kickoff opens with, and the
+    /// empty string for every other kickoff — which is what keeps a launcher
+    /// or resume kickoff byte-identical to before promotion existed.
+    ///
+    /// It says three things, because a session that has been talking to a human
+    /// about a prototype for an hour needs all three: that the conversation
+    /// above is still its own (the entire point of promoting rather than
+    /// spawning), that its role and capabilities changed underneath it, and
+    /// that the contract below wins over however it had been working.
+    fn preamble(self) -> &'static str {
+        match self {
+            KickoffOrigin::Normal => "",
+            KickoffOrigin::Promoted => {
+                "Promoted to orchestrator: you were a standalone agent pane a moment ago, and \
+                 this same conversation has been reopened with an orchestrator's role contract, \
+                 MCP tools and group state attached. The work above is your own context — carry \
+                 it forward, it is why you were promoted rather than replaced. Everything below \
+                 is the role you now hold, and it supersedes how you were operating before.\n\n"
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -24695,6 +24851,27 @@ impl OrchRegistry {
         fs::create_dir_all(dir.join("configs")).map_err(|e| e.to_string())?;
         let resumed = dir.join("group.json").is_file();
 
+        // #407: a PROMOTE reattaching a dormant group brings the promote
+        // modal's defaults with it — a right-click is not the launcher, and
+        // there is no roster preview in it — so the ROSTER (and the toggle and
+        // intake profile that travel with it) has to come back off disk here,
+        // before every decision below reads them. A resume never needed this:
+        // its caller loads `group.json` itself and hands the persisted
+        // guardrails straight back in. Without it, promoting into a dormant
+        // advanced group would silently replace the roster its human approved
+        // with the built-in four — the same provenance violation the resume pin
+        // exists to prevent, arriving from the other direction — and would
+        // clear that group's merge gate on the way past (the toggle-off arm
+        // below). The live-adjustable knobs are re-hydrated further down, where
+        // both launch kinds share the same `resumed` gate.
+        if launch == Launch::Promote && resumed {
+            if let Some((_, persisted)) = self.load_group_file(&id) {
+                guardrails.blocks = persisted.blocks;
+                guardrails.advanced_orchestrator = persisted.advanced_orchestrator;
+                guardrails.intake = persisted.intake;
+            }
+        }
+
         // The repo's declared roster AND its merge gate (#222), read ONLY when the
         // human turned the advanced orchestrator on **and this is a fresh launch**.
         //
@@ -24716,7 +24893,16 @@ impl OrchRegistry {
         // Checked against the resolved `max_agents` once every guardrail
         // override below (including the resume-cap override) has landed.
         let mut capacity: Option<workflow::CapacityRecommendation> = None;
-        if guardrails.advanced_orchestrator && launch == Launch::Fresh {
+        // #407: the one place `Launch` is inspected, so it is the one place a
+        // promote's split consent moment can be decided — it needs `resumed`,
+        // which only this function knows (the caller cannot know which
+        // candidate id was free). See [`Launch::Promote`].
+        let reads_workflow_file = match launch {
+            Launch::Fresh => true,
+            Launch::Resume => false,
+            Launch::Promote => !resumed,
+        };
+        if guardrails.advanced_orchestrator && reads_workflow_file {
             // Three outcomes, and only the first changes anything:
             //   - a valid `.loomux/workflow.yml` → its blocks ARE the roster;
             //   - no file → the launcher's 4-block roster stands (turning the
@@ -36919,6 +37105,25 @@ impl OrchRegistry {
         branch_note: &str,
         persona: Option<&str>,
     ) -> String {
+        self.kickoff_prompt_ex(a, g, branch_note, persona, KickoffOrigin::Normal)
+    }
+
+    /// [`kickoff_prompt`](Self::kickoff_prompt), told whether the pane it is
+    /// addressed to arrived by promotion (#407) rather than by being spawned.
+    ///
+    /// Only the orchestrator arm reads it, and only to add a preamble — every
+    /// other word of the contract is the same text a launcher-spawned
+    /// orchestrator gets, which is the property that makes a promoted pane a
+    /// real orchestrator rather than a lookalike.
+    #[doc(hidden)] // pub for integration tests
+    pub fn kickoff_prompt_ex(
+        &self,
+        a: &AgentEntry,
+        g: &GroupInfo,
+        branch_note: &str,
+        persona: Option<&str>,
+        origin: KickoffOrigin,
+    ) -> String {
         // The block's own contract file (`worker.md` for the built-in roster,
         // `<block-id>.md` for a declared block). Falls back to the class file if
         // the block is gone from the roster — a rejoined session must still boot.
@@ -36939,7 +37144,7 @@ impl OrchRegistry {
             ),
             None => String::new(),
         };
-        let out = self.kickoff_body(a, g, branch_note, &instructions);
+        let out = self.kickoff_body(a, g, branch_note, &instructions, origin);
         format!("{out}{persona_note}")
     }
 
@@ -37033,10 +37238,12 @@ impl OrchRegistry {
         g: &GroupInfo,
         branch_note: &str,
         instructions: &Path,
+        origin: KickoffOrigin,
     ) -> String {
         match a.role {
             Role::Orchestrator => format!(
-                "You are the orchestrator of loomux agent group {gid} for the repository {repo}.\n\
+                "{promote}\
+                 You are the orchestrator of loomux agent group {gid} for the repository {repo}.\n\
                  First read your role instructions: {ins}\n\
                  Guardrails (enforced by loomux): max {max} live agents, worker model {wm}, reviewer model {rm}, planner model {pm}.\n\
                  Group config: auto-merge is {automerge}; auto-release is {autorelease}; supervised dangerous mode is {dangerous} (see the merge-gate section of your instructions); autonomous idle-tick mode is {autonomous}.{roster}{lessons}\n\
@@ -37044,6 +37251,13 @@ impl OrchRegistry {
                  Start by calling get_state, run `gh issue list --label agent-managed --state open`, call list_agents, \
                  reconcile them, then give the human a short status summary and wait for direction.",
                 gid = g.id, repo = g.repo, ins = instructions.display(),
+                // #407: empty for every orchestrator that was spawned as one —
+                // so a launcher/resume kickoff is byte-identical to before this
+                // existed — and the framing paragraph for one that used to be a
+                // standalone pane a moment ago. It goes FIRST because it is the
+                // sentence that explains why the conversation above it exists
+                // and why the contract below it has suddenly changed.
+                promote = origin.preamble(),
                 // #455: every kickoff — an orchestrator's included — carries the
                 // id a duplicate paste would repeat. A header on three roles out
                 // of four is the asymmetry that later reads as a bug.
@@ -42445,11 +42659,268 @@ fn create_orchestration_sync(
             // group.json to pin it to the base (no backoff).
             idle_tick_fallback_max_minutes: 0,
         },
-        Launch::Fresh,
-        None,
+        SessionOrigin::Fresh,
         None,
         initial_workers,
     )
+}
+
+/// The knobs a **promote** (#407) may set, as ONE optional payload object —
+/// same shape and same reasoning as [`RoleKnobs`] above, and absent means
+/// "every default", which is what makes the promote gesture one click.
+///
+/// This is deliberately a SUBSET of `create_orchestration`'s nineteen
+/// arguments rather than a second copy of them: a promote is a right-click on a
+/// pane, not the launcher, and the full knob surface stays where the human can
+/// actually see what they are choosing. Everything omitted resolves exactly as
+/// it would for a launcher group — an empty model string is the block's
+/// CLI-default model (`workflow::model_of`), a `0` minute/count field is
+/// `Guardrails::clamped`'s default — so a promoted group is configured like any
+/// other group, never like a special case.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct PromoteConfig {
+    /// Live-agent cap. 0 → the clamped default.
+    pub max_agents: u32,
+    /// Idle workers to open once the promoted orchestrator binds. 0 — the
+    /// default — because a promotion happens mid-conversation about a specific
+    /// piece of work: the orchestrator decides what it needs, the way a resumed
+    /// one does.
+    pub initial_workers: u32,
+    /// Run the repo's `.loomux/workflow.yml` roster (the promote modal's one
+    /// checkbox, offered only when the file exists). Subject to the same
+    /// consent rule as any other group — see [`Launch::Promote`].
+    pub advanced_orchestrator: bool,
+    pub auto_ops: bool,
+    pub idle_kill_minutes: u32,
+    pub max_spawns_per_hour: u32,
+    pub watchdog_stall_minutes: u32,
+    /// Per-role models. Empty (the default) = each block's CLI default.
+    pub orchestrator_model: String,
+    pub worker_model: String,
+    pub reviewer_model: String,
+    pub planner_model: String,
+    pub role_knobs: Option<RoleKnobs>,
+    /// The `__solo__` identity this pane currently holds (`solo_prepare`/
+    /// `solo_adopt` mint one on connect), if any. Retired as part of the
+    /// promotion — see the retirement below for why it cannot be left behind.
+    pub solo_agent_id: String,
+}
+
+/// Promote a standalone agent pane to the orchestrator of a real orchestration
+/// group (#407), reusing its CLI **session** so the human's prototype
+/// conversation becomes the orchestrator's own context instead of being
+/// hand-transferred into a fresh one.
+///
+/// Returns the same `SpawnRequest` shape every orchestrator launch returns; the
+/// frontend kills the pane's CLI and relaunches it in place from this spec (the
+/// old process must have exited before `--resume` reads its transcript).
+///
+/// **Every refusal is tagged `promote-<reason>:`**, mirroring `resume-<tag>:`
+/// (see `resumeerror.ts`), so the frontend can say precisely why one click did
+/// nothing rather than surfacing a sentence. Refusals happen BEFORE anything is
+/// created or retired — a refused promote leaves the running pane untouched,
+/// which is the whole safety story of a gesture that otherwise interrupts a
+/// live conversation.
+///
+/// **Trust posture.** Webview-supplied arguments, exactly like every other
+/// group-scoped command (CLAUDE.md constraint 6): `repo` is a path the human's
+/// own pane is already running in, `session_id` is shape-checked
+/// (`sanitize_session`) before it reaches a command line, and nothing here is
+/// reachable from MCP — no agent-controllable input arrives at this seam.
+#[tauri::command]
+pub async fn promote_to_orchestrator(
+    app: AppHandle,
+    repo: String,
+    session_id: String,
+    cli: String,
+    config: Option<PromoteConfig>,
+) -> Result<SpawnRequest, String> {
+    let reg = reg_of(&app);
+    run_blocking(move || {
+        promote_to_orchestrator_sync(&reg, &repo, &session_id, &cli, config.unwrap_or_default())
+    })
+    .await
+}
+
+/// The body of [`promote_to_orchestrator`], as a plain function — the same
+/// split `create_orchestration`/`create_orchestration_sync` uses, and what the
+/// integration tests drive (there is no `AppHandle` in test mode).
+#[doc(hidden)] // pub for integration tests
+pub fn promote_to_orchestrator_sync(
+    reg: &Arc<OrchRegistry>,
+    repo: &str,
+    session_id: &str,
+    cli: &str,
+    config: PromoteConfig,
+) -> Result<SpawnRequest, String> {
+    let session_id = session_id.trim();
+    let cli = cli.trim();
+    let repo = repo.trim();
+
+    // ── v1 scope: claude panes only ──────────────────────────────────────
+    // Not a capability limit so much as a validation one: the checks below
+    // (full-id shape, "does this session exist in the store") are asked of
+    // claude's store, and copilot/opencode panes reach loomux without a known
+    // session id at all today. The seam itself is CLI-generic — the plan's
+    // follow-up widens this arm, not the machinery under it.
+    if cli != "claude" {
+        return Err(format!(
+            "promote-unsupported-cli: promoting a {cli} pane is not supported yet — v1 covers \
+             Claude panes, whose session id loomux knows and can resume"
+        ));
+    }
+    // A full id, never a prefix: the frontend holds the pane's real session id,
+    // so anything shorter is a caller bug, and `--resume <prefix>` would fail
+    // inside the pane after the old process was already killed.
+    let Some(session_id) = sanitize_session(session_id).filter(|s| is_full_session_id(s)) else {
+        return Err(format!(
+            "promote-bad-session: {session_id:?} is not a full session id — promotion resumes an \
+             exact conversation and never resolves a prefix"
+        ));
+    };
+    // Same two path rules `create_orchestration_group` enforces, checked here
+    // so the failure carries a parseable tag (that one predates the convention
+    // and answers to the launcher, which has its own file picker).
+    if repo.is_empty() || repo.contains('"') || !Path::new(repo).is_dir() {
+        return Err(format!(
+            "promote-bad-repo: {repo:?} is not a usable repository directory — a promoted pane's \
+             own working directory becomes the group's repo"
+        ));
+    }
+    // ── never promote a pane that is already an orchestration member ─────
+    // A delegate's transcript carries a delegate contract (and a group
+    // membership loomux records); promoting it would seat two conflicting role
+    // contracts in one session, and — for a recorded ORCHESTRATOR — would mint
+    // a second orchestrator for a group that already has one. The frontend
+    // refuses this live (a pane in a group has no promote item at all); this is
+    // the recorded half, which also covers the pane that WAS a delegate in an
+    // earlier, now-dormant group.
+    if let Some(rec) = reg.session_roles().into_iter().find(|r| r.session_id == session_id) {
+        return Err(format!(
+            "promote-already-managed: session {session_id} is already recorded as the {} of \
+             orchestration group {} — resume it from the session browser instead of promoting it",
+            rec.role, rec.group_id
+        ));
+    }
+    // ── the session has to exist, and to have something in it ────────────
+    // The same existence pre-check the orchestrator resume path runs (#412
+    // review B1), for the same reason and with the same store router: a
+    // `--resume` against an id claude's history does not hold fails INSIDE the
+    // pane, after the promotion has already killed the conversation it was
+    // meant to preserve. It doubles as the guard against promoting an empty
+    // session (claude writes no transcript until the first exchange, so
+    // "never spoke to it" reads as "not found" here rather than as claude's
+    // opaque "No conversation found" a moment later).
+    match session_cwd_in_store(cli, &session_id, None) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return Err(format!(
+                "promote-not-found: session {session_id} is not in the {cli} session history on \
+                 this machine — an unused pane has no conversation to carry over yet"
+            ));
+        }
+        Err(e) => {
+            return Err(format!(
+                "promote-store-unreadable: could not read the {cli} session store: {e}"
+            ));
+        }
+    }
+
+    let k = config.role_knobs.unwrap_or_default();
+    // Every block inherits `agent_cli` (empty `cli:`) exactly as a launcher
+    // group's does — the promoted pane's CLI becomes the group default, so the
+    // delegates it spawns are the same CLI it is.
+    let blocks = workflow::default_roster_ex(&[
+        (
+            Role::Orchestrator,
+            "",
+            &config.orchestrator_model,
+            workflow::ModelKnobs { effort: &k.orchestrator_effort, context: &k.orchestrator_context },
+        ),
+        (
+            Role::Worker,
+            "",
+            &config.worker_model,
+            workflow::ModelKnobs { effort: &k.worker_effort, context: &k.worker_context },
+        ),
+        (
+            Role::Reviewer,
+            "",
+            &config.reviewer_model,
+            workflow::ModelKnobs { effort: &k.reviewer_effort, context: &k.reviewer_context },
+        ),
+        (
+            Role::Planner,
+            "",
+            &config.planner_model,
+            workflow::ModelKnobs { effort: &k.planner_effort, context: &k.planner_context },
+        ),
+    ]);
+    let request = create_orchestration_group(
+        reg,
+        repo,
+        Guardrails {
+            max_agents: config.max_agents,
+            agent_cli: cli.to_string(),
+            blocks,
+            advanced_orchestrator: config.advanced_orchestrator,
+            auto_ops: config.auto_ops,
+            idle_kill_minutes: config.idle_kill_minutes,
+            max_spawns_per_hour: config.max_spawns_per_hour,
+            watchdog_stall_minutes: config.watchdog_stall_minutes,
+            // Everything below is `create_orchestration`'s "not a launch-time
+            // knob" set, verbatim: 0/None → `clamped()`'s default, live-settable
+            // afterwards, and re-hydrated from `group.json` when this promote
+            // reattaches a dormant group (`create_group_ex`).
+            ..Guardrails::default()
+        },
+        SessionOrigin::Promote { session_id: session_id.clone(), cli: cli.to_string() },
+        // No `expect_group`: a promote does not know which group id it will
+        // land on — that IS the existing-group policy (new dir, dormant
+        // reattach, or live sibling), resolved by `create_group_ex`'s candidate
+        // scan under the creation lock.
+        None,
+        config.initial_workers,
+    )?;
+
+    // ── retire the pane's standalone identity ────────────────────────────
+    // The pane held a `__solo__` `AgentEntry` (minted by `solo_prepare` at
+    // launch or `solo_adopt` on connect) keyed to the pty it is about to
+    // relaunch as an orchestrator. Left alive it is a stale channel endpoint
+    // and a stale `by_pty` claim on a pane that is now something else — a
+    // `channel_send` would be delivered into an orchestrator that never joined
+    // that channel. `mark_dead` is the existing solo teardown (the same one a
+    // closed solo pane goes through), so this retires it exactly as closing the
+    // pane would have.
+    //
+    // AFTER the group creation, never before: a refusal above must leave the
+    // running pane whole, identity included.
+    //
+    // Scoped to `Role::Solo` deliberately: this argument comes from the
+    // webview, and a `solo_agent_id` naming a real orchestration agent must
+    // never be able to kill it through this door.
+    if !config.solo_agent_id.trim().is_empty() {
+        let solo = config.solo_agent_id.trim();
+        match reg.agent(solo) {
+            Some(a) if a.role == Role::Solo => {
+                reg.mark_dead(solo, None);
+                reg.audit(&request.group_id, "loomux", "solo-retired", json!({
+                    "agent": solo,
+                    "why": "promoted to orchestrator",
+                    "orchestrator": request.agent_id,
+                }));
+            }
+            // Not fatal either way: the group is already created and the pane
+            // spec is what the caller needs. A missing id is the ordinary
+            // never-connected pane; a non-solo id is a caller bug worth a trail.
+            Some(a) => reg.audit(&request.group_id, "loomux", "solo-retire-skipped", json!({
+                "agent": solo, "role": a.role, "why": "not a standalone pane identity",
+            })),
+            None => {}
+        }
+    }
+    Ok(request)
 }
 
 /// What turning the **advanced orchestrator** on for `repo` would actually run
@@ -43426,29 +43897,33 @@ pub async fn orch_end_group(
 /// registration must be atomic against concurrent launches.
 /// `expect_group` pins restores to their recorded group id.
 ///
-/// `launch` and `resume_session` are independent, deliberately (#412 rev-17):
-/// `launch` answers "may this read `.loomux/workflow.yml` and rebuild the
-/// roster/merge-gate from it" (see [`Launch`]) — `resume_session` answers
-/// "does the orchestrator pane `--resume` a specific conversation, or start a
-/// fresh one". These used to be the same bool (`resume_session.is_some()`
-/// derived `launch`), which was correct for the two cases that existed at the
-/// time — but `resume_recorded_session`'s `start_fresh` path (#412) added a
-/// THIRD: an existing, previously-launched group getting a fresh
-/// *conversation* on its orchestrator, which must still be `Launch::Resume`
-/// (never re-derive the roster/gate the human already consented to at the
-/// original launch — see `create_group_ex`'s "consent rule, not an
-/// optimization" comment) even though `resume_session` is `None`. Conflating
-/// them let a `start_fresh` on an orchestrator silently swap the group's
-/// roster to whatever the repo's workflow file currently says, and delete its
-/// merge-gate spec if the file no longer declares one — the exact provenance
-/// violation `create_group_ex`'s resume path exists to prevent, just reached
-/// through a caller that thought "no session id" meant "fresh launch".
+/// `origin` ([`SessionOrigin`]) says what kind of start this is — which group
+/// semantics apply, which session flag the pane gets, and which kickoff it is
+/// typed. It replaced a `(Launch, Option<String>)` pair (#407) whose two
+/// halves were independent, deliberately (#412 rev-17), but whose four real
+/// combinations looked like two: `Launch` answers "may this read
+/// `.loomux/workflow.yml` and rebuild the roster/merge-gate from it", and the
+/// session id answers "does the orchestrator pane `--resume` a specific
+/// conversation, or start a fresh one". These used to be the same bool
+/// (`resume_session.is_some()` derived `launch`), which was correct for the two
+/// cases that existed at the time — but `resume_recorded_session`'s
+/// `start_fresh` path (#412) added a THIRD: an existing, previously-launched
+/// group getting a fresh *conversation* on its orchestrator, which must still
+/// be `Launch::Resume` (never re-derive the roster/gate the human already
+/// consented to at the original launch — see `create_group_ex`'s "consent rule,
+/// not an optimization" comment) even though there is no session to resume.
+/// Conflating them let a `start_fresh` on an orchestrator silently swap the
+/// group's roster to whatever the repo's workflow file currently says, and
+/// delete its merge-gate spec if the file no longer declared one — the exact
+/// provenance violation `create_group_ex`'s resume path exists to prevent, just
+/// reached through a caller that thought "no session id" meant "fresh launch".
+/// #407's promote is the fourth, and the first one the pair could not spell at
+/// all: a session that IS resumed and still needs the full kickoff.
 pub fn create_orchestration_group(
     reg: &Arc<OrchRegistry>,
     repo: &str,
     guardrails: Guardrails,
-    launch: Launch,
-    resume_session: Option<String>,
+    origin: SessionOrigin,
     expect_group: Option<&str>,
     initial_workers: u32,
 ) -> Result<SpawnRequest, String> {
@@ -43462,7 +43937,7 @@ pub fn create_orchestration_group(
         return Err(format!("repository path does not exist: {repo}"));
     }
     let _creation = reg.creation.lock_safe();
-    let group = reg.create_group_ex(repo, guardrails, launch)?;
+    let group = reg.create_group_ex(repo, guardrails, origin.launch())?;
     if let Some(want) = expect_group {
         if group.id != want {
             return Err(format!(
@@ -43471,18 +43946,18 @@ pub fn create_orchestration_group(
             ));
         }
     }
-    register_orchestrator_pane(reg, &group, resume_session, initial_workers)
+    register_orchestrator_pane(reg, &group, &origin, initial_workers)
 }
 
 /// Register a group's orchestrator and hand back the pane spec the frontend
-/// opens. `resume_session` reopens a prior orchestrator conversation (with
-/// fresh MCP wiring) instead of starting cold. A background thread waits
-/// for the pane bind, types the kickoff/re-sync prompt, and brings up any
-/// initial idle workers.
+/// opens. `origin` decides whether the pane reopens a prior conversation (with
+/// fresh MCP wiring either way) or starts cold, and which kickoff it is typed —
+/// see [`SessionOrigin`]. A background thread waits for the pane bind, types
+/// the kickoff/re-sync prompt, and brings up any initial idle workers.
 fn register_orchestrator_pane(
     reg: &Arc<OrchRegistry>,
     group: &GroupInfo,
-    resume_session: Option<String>,
+    origin: &SessionOrigin,
     initial_workers: u32,
 ) -> Result<SpawnRequest, String> {
     // The orchestrator is a block like any other (#222) — it just isn't spawned
@@ -43506,14 +43981,34 @@ fn register_orchestrator_pane(
         ));
     }
     let cli = cli.to_string();
+    // #407, fail-closed: a promoted pane resumes a conversation that belongs to
+    // exactly ONE CLI, but the roster deciding which CLI this group's
+    // orchestrator runs is resolved here — and on a dormant reattach it comes
+    // off disk, from a workflow file the promoting human never picked. A
+    // mismatch would compose `<other-cli> --resume <claude uuid>`, which fails
+    // INSIDE the pane, after the promotion has already killed the process that
+    // held the context. Refuse before anything is spawned; the group state is
+    // durable, so the dormant-group Resume card is still the way back in.
+    if let SessionOrigin::Promote { cli: pane_cli, .. } = origin {
+        if &cli != pane_cli {
+            return Err(format!(
+                "promote-cli-mismatch: this group's orchestrator block runs {cli}, but the pane \
+                 being promoted is a {pane_cli} session — a conversation cannot be resumed under \
+                 another CLI"
+            ));
+        }
+    }
     let token = new_token();
     let agent_id = format!("orch-{}", reg.mint_agent_seq(&group.id));
     if cli == "copilot" {
         reg.pre_trust_copilot_folder(&group.repo, &group.repo);
     }
-    let resume = resume_session.is_some();
-    let session_id = match resume_session {
-        Some(s) => Some(sanitize_session(&s).ok_or("invalid resume session id")?),
+    // "Does the CLI get `--resume <id>`" — true for a promote as much as a
+    // resume (#407); what a promote does NOT inherit is the resume kickoff,
+    // which is `wants_full_kickoff` below, not this.
+    let resume = origin.resumes_session();
+    let session_id = match origin.session_id() {
+        Some(s) => Some(sanitize_session(s).ok_or("invalid resume session id")?),
         None => (cli == "claude").then(new_session_uuid),
     };
     // Copilot and opencode mint their own id on boot; snapshot existing
@@ -43671,7 +44166,10 @@ fn register_orchestrator_pane(
     reg.persist_agent_record(&entry, "running");
     reg.audit(&group.id, "loomux", "agent-spawn",
         json!({ "agent": agent_id, "role": "orchestrator", "model": model,
-                "session": entry.session_id, "resume": resume }));
+                // `resume` is kept (readers parse it) but is no longer the
+                // whole answer: a promote resumes too (#407). `origin` is.
+                "session": entry.session_id, "resume": resume,
+                "origin": origin.as_str() }));
 
     let request = SpawnRequest {
         group_id: group.id.clone(),
@@ -43699,7 +44197,11 @@ fn register_orchestrator_pane(
 
     crate::obs::breadcrumb(
         "agent-spawn",
-        &format!("group={} agent={agent_id} role=Orchestrator resume={resume}", group.id),
+        &format!(
+            "group={} agent={agent_id} role=Orchestrator resume={resume} origin={}",
+            group.id,
+            origin.as_str()
+        ),
     );
 
     if reg.app.lock_safe().is_none() {
@@ -43721,6 +44223,14 @@ fn register_orchestrator_pane(
     // orchestrator block whose persona can't ride on a native flag (copilot +
     // an inline `prompt:`). `None` for the built-in roster.
     let kickoff_persona = inject.kickoff.clone();
+    // The two kickoff decisions, resolved here (the thread outlives `origin`'s
+    // borrow) — and deliberately NOT the same bool: a promoted session resumes
+    // AND gets the full contract, because it has never seen one (#407).
+    let full_kickoff = origin.wants_full_kickoff();
+    let kickoff_origin = match origin {
+        SessionOrigin::Promote { .. } => KickoffOrigin::Promoted,
+        _ => KickoffOrigin::Normal,
+    };
     std::thread::spawn(move || {
         let Ok(pty_id) = rx.recv_timeout(BIND_TIMEOUT) else {
             reg2.pending_binds.lock_safe().remove(&agent_id);
@@ -43744,7 +44254,7 @@ fn register_orchestrator_pane(
         // notices) re-bind to — and it runs BEFORE the restore kickoff
         // below, so a pre-restart delivery still precedes it.
         reg2.readmit_recovered(&group2.id, &agent_id, pty_id);
-        let kickoff = if resume {
+        let kickoff = if !full_kickoff {
             // #411: an app restart is exactly the surprise discontinuity the
             // directive ledger exists to survive, but this fixed string used
             // to embed nothing from it — a directive noted before the
@@ -43759,11 +44269,20 @@ fn register_orchestrator_pane(
             resume_kickoff_notice(ledger_embed.as_deref())
         } else {
             match reg2.agent(&agent_id) {
-                Some(a) => reg2.kickoff_prompt(&a, &group2, "", kickoff_persona.as_deref()),
+                Some(a) => reg2.kickoff_prompt_ex(
+                    &a,
+                    &group2,
+                    "",
+                    kickoff_persona.as_deref(),
+                    kickoff_origin,
+                ),
                 None => return, // agent reaped before bind; nothing to kick off
             }
         };
-        let delivery = if resume { Delivery::ResumeKickoff } else { Delivery::FreshKickoff };
+        // A promoted pane's CLI has just booted for the first time under this
+        // contract, exactly like a fresh one — so it takes the FreshKickoff
+        // hold-until-painted treatment, not the mid-session one (#407).
+        let delivery = if full_kickoff { Delivery::FreshKickoff } else { Delivery::ResumeKickoff };
         let _ = reg2.deliver_prompt(&agent_id, &kickoff, "loomux", delivery);
         // Track the session this orchestrator just minted.
         if let Some(baseline) = session_baseline {
@@ -44038,23 +44557,27 @@ pub fn resume_recorded_session(
                 }
             }
         }
-        let resume_session = (!start_fresh).then(|| session_id.to_string());
-        // ALWAYS Launch::Resume here (#412 rev-17 blocker), regardless of
-        // `start_fresh`: this is reopening an EXISTING, previously-launched
-        // group either way — a fresh CONVERSATION on it (start_fresh) is not
-        // a fresh LAUNCH of it. `resume_session: None` used to make
-        // `create_orchestration_group` derive `Launch::Fresh` from that alone,
-        // which re-read `.loomux/workflow.yml` and silently swapped the
-        // group's roster (and could delete its merge-gate spec) to whatever
-        // the repo file currently says — the exact provenance violation the
-        // resume path exists to prevent. See `create_orchestration_group`'s
-        // doc comment.
+        // BOTH arms carry Resume GROUP semantics (#412 rev-17 blocker),
+        // regardless of `start_fresh`: this is reopening an EXISTING,
+        // previously-launched group either way — a fresh CONVERSATION on it
+        // (start_fresh) is not a fresh LAUNCH of it. Spelling that used to
+        // require remembering to pass `Launch::Resume` alongside a `None`
+        // session id, and a caller that read "no session id" as "fresh launch"
+        // would re-read `.loomux/workflow.yml` and silently swap the group's
+        // roster (and could delete its merge-gate spec) to whatever the repo
+        // file currently says — the exact provenance violation the resume path
+        // exists to prevent. `SessionOrigin::StartFresh` is that combination,
+        // named (#407), so it can no longer be spelled by omission.
+        let origin = if start_fresh {
+            SessionOrigin::StartFresh
+        } else {
+            SessionOrigin::Resume(session_id.to_string())
+        };
         return create_orchestration_group(
             reg,
             &repo,
             guardrails,
-            Launch::Resume,
-            resume_session,
+            origin,
             Some(&record.group_id),
             0,
         )
