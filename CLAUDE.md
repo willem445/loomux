@@ -158,9 +158,10 @@ narrow their ask back down to the original ticket on your own judgment.
   `docs/` (the README is a pitch, not a manual — only touch it when the pitch
   itself changes); substantial designs get a `doc/design/*.md` note.
 - **Correcting a false claim is a multi-surface edit.** A design rationale here
-  lives on three permanent surfaces at once — the code comment, the
-  `doc/design/*.md` note, and the PR body (which becomes the squash message) —
-  so a claim deleted from one survives on the others. Verify the purge by
+  lives on several permanent surfaces at once — the code comment, the
+  `doc/design/*.md` note, the PR body (which becomes the squash message), and
+  the `docs/` page when the claim is user-visible (the bullet above mandates
+  it) — so a claim deleted from one survives on the others. Verify the purge by
   grepping the *entity* the claim names, never the phrasing you rewrote.
   Signature: a re-review that clears a claim on two surfaces and finds it alive
   on the third (#878).
