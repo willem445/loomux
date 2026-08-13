@@ -2078,9 +2078,10 @@ export class Pane implements VoiceTargetPane {
     this.reconnectEl = null;
   }
 
-  /** The kind of a dormant placeholder ("agent" | "orch"), or null when not
-   *  dormant. Lets the grid/tab-bar tell a dormant Start pane from a dormant
-   *  group pane without re-reading the whole record. */
+  /** The kind of a dormant placeholder ("agent" | "orch" | "ssh"), or null when
+   *  not dormant. Lets the grid/tab-bar tell a dormant Start pane from a dormant
+   *  group pane — and from a dormant SSH Reconnect card (#887 S4) — without
+   *  re-reading the whole record. */
   get dormantKind(): PersistedPaneKind | null {
     return this.dormantRecord?.paneKind ?? null;
   }

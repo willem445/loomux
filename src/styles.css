@@ -3377,6 +3377,15 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   width: 300px;
   box-shadow: 0 6px 22px rgba(0, 0, 0, 0.45);
 }
+/* A secondary action that is NOT a recommendation — Dismiss sits beside
+   Reconnect and must not wear .dormant-btn-secondary's green "click me" accent. */
+.dormant-btn-quiet {
+  border-color: rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text-dim);
+  font-weight: 500;
+}
+.dormant-btn-quiet:hover { background: rgba(255, 255, 255, 0.1); color: var(--text); }
 
 /* Cold-boot restore splash: a centered card over a dimmed backdrop, before any
    tab exists. Pure overlay — no PTY, no layout change. */

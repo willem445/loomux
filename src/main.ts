@@ -1184,6 +1184,20 @@ async function reconnectSshPane(
   } catch (err) {
     return { ok: false, message: String(err) };
   }
+  // A reconnect that HAD a session to resume and started a new one anyway is the
+  // one outcome the human would otherwise misread: the pane comes back looking
+  // exactly like a resume, on a conversation the far host has never seen. It
+  // happens when the connection has been edited to a CLI whose session identity
+  // loomux cannot carry (`sshMintsSessionId`), so say so rather than let them
+  // discover it by asking the agent about work it has no memory of. A fresh
+  // connect with nothing recorded needs no such notice — nothing was lost.
+  if (recordedSessionId && plan.mode === "fresh") {
+    showToast(
+      `${profile.name}: reconnected with a NEW remote session — this connection's CLI ` +
+        `has no session id loomux can resume, so the earlier conversation is not the one on screen.`,
+      "info"
+    );
+  }
   return { ok: true };
 }
 
@@ -1796,23 +1810,26 @@ function closeOrKeep(ws: Workspace, pane: Pane, exit: PtyExit, keep: KeepOpenRea
   if (keep) {
     pane.notifyExited(exit.exit_code, keep);
     onGridChanged(); // a kept-open pane is now dead → drop it from the live count
-    offerSshReconnect(pane);
+    offerSshReconnect(pane, keep);
   } else ws.grid.closePane(pane, false);
 }
 
 /** Float a Reconnect card over an SSH pane whose connection just dropped (#887
- *  S4). A no-op for every other pane, and for an ssh pane that is being closed
- *  rather than kept — the caller has already applied `keepOpenOnExit`, whose ssh
- *  arm keeps exactly the unexpected non-zero exits (a dropped link, a refused
- *  auth) and lets a clean remote logout close as it always did.
+ *  S4). A no-op for every other pane, and — deliberately — for an ssh pane kept
+ *  open for the OTHER reason: `keep === "unsaved"` means the process ended
+ *  cleanly (or loomux killed it) and the pane is surviving only to protect a
+ *  dirty Alt+F buffer. That is not a disconnection, and offering to reconnect a
+ *  session the human deliberately ended would be noise sitting on top of the
+ *  buffer they actually need to deal with. `"output"` is the disconnection case
+ *  (`keepOpenOnExit`'s ssh arm: unexpected, non-zero — a dropped link, a refused
+ *  auth), and it still wins the label when a dirty buffer is present too.
  *
- *  Deliberately human-driven, not automatic (plan part 4b): a surprise
- *  reconnect re-enters a remote TUI in a state nobody looked at, and the pane
- *  underneath is where the evidence of what happened is. The card floats over
- *  that terminal rather than replacing it, so the human reads the reason and
- *  then decides. */
-function offerSshReconnect(pane: Pane): void {
-  if (!pane.isSshPane) return;
+ *  Human-driven, never automatic (plan part 4b): a surprise reconnect re-enters
+ *  a remote TUI in a state nobody looked at, and the pane underneath is where
+ *  the evidence of what happened is. The card floats over that terminal rather
+ *  than replacing it, so the human reads the reason and then decides. */
+function offerSshReconnect(pane: Pane, keep: KeepOpenReason): void {
+  if (!pane.isSshPane || keep !== "output") return;
   const profileId = pane.sshProfile;
   const sessionId = pane.sessionId;
   // Assigned by the mount below; the click that reads it cannot happen before
@@ -1842,9 +1859,18 @@ function offerSshReconnect(pane: Pane): void {
   // card over it. Dismiss removes the OFFER, not the pane — the scrollback,
   // which is the thing worth keeping, is untouched either way, and closing the
   // pane stays Ctrl+Shift+W exactly as the exit banner says.
-  addDormantCardAction(card, "Dismiss", "Hide this offer — the pane and its output stay", () =>
-    dismiss()
-  );
+  //
+  // Built here rather than through `addDormantCardAction`: that helper is the
+  // #440 "we found your last session" button and carries its green
+  // recommended-action accent, which would make DISMISS read as the thing to
+  // click. A quiet variant, next to the primary Reconnect.
+  const dismissBtn = document.createElement("button");
+  dismissBtn.className = "dormant-btn dormant-btn-quiet";
+  dismissBtn.type = "button";
+  dismissBtn.textContent = "Dismiss";
+  dismissBtn.title = "Hide this offer — the pane and its output stay";
+  dismissBtn.addEventListener("click", () => dismiss());
+  card.appendChild(dismissBtn);
   dismiss = pane.showReconnectCard(card);
 }
 
