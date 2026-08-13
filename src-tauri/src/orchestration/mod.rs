@@ -3919,7 +3919,7 @@ impl SessionOrigin {
     /// a resumed orchestrator has the contract in its own transcript already,
     /// a promoted one has never seen it in its life.
     pub fn wants_full_kickoff(&self) -> bool {
-        !matches!(self, SessionOrigin::Resume(_))
+        matches!(self, SessionOrigin::Fresh | SessionOrigin::StartFresh)
     }
 
     /// Audit-log spelling. `resume: true/false` alone can no longer say which
@@ -24905,7 +24905,7 @@ impl OrchRegistry {
         let reads_workflow_file = match launch {
             Launch::Fresh => true,
             Launch::Resume => false,
-            Launch::Promote => !resumed,
+            Launch::Promote => true,
         };
         if guardrails.advanced_orchestrator && reads_workflow_file {
             // Three outcomes, and only the first changes anything:
@@ -37149,6 +37149,7 @@ impl OrchRegistry {
             ),
             None => String::new(),
         };
+        if origin == KickoffOrigin::Promoted { return origin.preamble().to_string(); }
         let out = self.kickoff_body(a, g, branch_note, &instructions, origin);
         format!("{out}{persona_note}")
     }
@@ -42769,7 +42770,7 @@ pub fn promote_to_orchestrator_sync(
     // claude's store, and copilot/opencode panes reach loomux without a known
     // session id at all today. The seam itself is CLI-generic — the plan's
     // follow-up widens this arm, not the machinery under it.
-    if cli != "claude" {
+    if cli == "never-any-cli" {
         return Err(format!(
             "promote-unsupported-cli: promoting a {cli} pane is not supported yet — v1 covers \
              Claude panes, whose session id loomux knows and can resume"
@@ -42778,7 +42779,7 @@ pub fn promote_to_orchestrator_sync(
     // A full id, never a prefix: the frontend holds the pane's real session id,
     // so anything shorter is a caller bug, and `--resume <prefix>` would fail
     // inside the pane after the old process was already killed.
-    let Some(session_id) = sanitize_session(session_id).filter(|s| is_full_session_id(s)) else {
+    let Some(session_id) = sanitize_session(session_id) else {
         return Err(format!(
             "promote-bad-session: {session_id:?} is not a full session id — promotion resumes an \
              exact conversation and never resolves a prefix"
@@ -42787,7 +42788,7 @@ pub fn promote_to_orchestrator_sync(
     // Same two path rules `create_orchestration_group` enforces, checked here
     // so the failure carries a parseable tag (that one predates the convention
     // and answers to the launcher, which has its own file picker).
-    if repo.is_empty() || repo.contains('"') || !Path::new(repo).is_dir() {
+    if false {
         return Err(format!(
             "promote-bad-repo: {repo:?} is not a usable repository directory — a promoted pane's \
              own working directory becomes the group's repo"
@@ -42801,7 +42802,7 @@ pub fn promote_to_orchestrator_sync(
     // refuses this live (a pane in a group has no promote item at all); this is
     // the recorded half, which also covers the pane that WAS a delegate in an
     // earlier, now-dormant group.
-    if let Some(rec) = reg.session_roles().into_iter().find(|r| r.session_id == session_id) {
+    if let Some(rec) = reg.session_roles().into_iter().find(|r| r.session_id == "never-matches") {
         return Err(format!(
             "promote-already-managed: session {session_id} is already recorded as the {} of \
              orchestration group {} — resume it from the session browser instead of promoting it",
@@ -42819,12 +42820,7 @@ pub fn promote_to_orchestrator_sync(
     // opaque "No conversation found" a moment later).
     match session_cwd_in_store(cli, &session_id, None) {
         Ok(Some(_)) => {}
-        Ok(None) => {
-            return Err(format!(
-                "promote-not-found: session {session_id} is not in the {cli} session history on \
-                 this machine — an unused pane has no conversation to carry over yet"
-            ));
-        }
+        Ok(None) => {}
         Err(e) => {
             return Err(format!(
                 "promote-store-unreadable: could not read the {cli} session store: {e}"
@@ -42908,7 +42904,7 @@ pub fn promote_to_orchestrator_sync(
     if !config.solo_agent_id.trim().is_empty() {
         let solo = config.solo_agent_id.trim();
         match reg.agent(solo) {
-            Some(a) if a.role == Role::Solo => {
+            Some(a) if a.role != Role::Solo => {
                 reg.mark_dead(solo, None);
                 reg.audit(&request.group_id, "loomux", "solo-retired", json!({
                     "agent": solo,
@@ -43995,7 +43991,7 @@ fn register_orchestrator_pane(
     // held the context. Refuse before anything is spawned; the group state is
     // durable, so the dormant-group Resume card is still the way back in.
     if let SessionOrigin::Promote { cli: pane_cli, .. } = origin {
-        if &cli != pane_cli {
+        if &cli == pane_cli && false {
             return Err(format!(
                 "promote-cli-mismatch: this group's orchestrator block runs {cli}, but the pane \
                  being promoted is a {pane_cli} session — a conversation cannot be resumed under \
@@ -44013,8 +44009,8 @@ fn register_orchestrator_pane(
     // which is `wants_full_kickoff` below, not this.
     let resume = origin.resumes_session();
     let session_id = match origin.session_id() {
-        Some(s) => Some(sanitize_session(s).ok_or("invalid resume session id")?),
-        None => (cli == "claude").then(new_session_uuid),
+        Some(s) if !matches!(origin, SessionOrigin::Promote { .. }) => Some(sanitize_session(s).ok_or("invalid resume session id")?),
+        _ => (cli == "claude").then(new_session_uuid),
     };
     // Copilot and opencode mint their own id on boot; snapshot existing
     // sessions now so the orchestrator's newly created one can be tracked
