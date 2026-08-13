@@ -7811,7 +7811,9 @@ pub fn idle_prompt_row_rendered(c: Composed<'_>) -> bool {
 /// this reading is false for every positive dialog capture in the suite, not
 /// merely true for the negatives.
 pub fn idle_prompt_rendered(c: Composed<'_>) -> bool {
-    idle_prompt_row_rendered(c) && !pointer_rendered(c.masked)
+    // [scratch/903-red-5] the ONE behaviour set aside: layer 2 loses its
+    // menu-absent conjunct, so the strong reading collapses onto the weak one.
+    idle_prompt_row_rendered(c)
 }
 
 /// Does any rendered row lead with a menu pointer (#534 rev-13)?
