@@ -248,8 +248,7 @@ There is nothing left to reconnect *with*, because the pane records the
 *connection* and not a command line, and inventing one from a stale command line
 would connect you somewhere you removed on purpose. The one case that says so at
 mount, without a click, is a pane whose record carries no connection at all — an
-`ssh` entry hand-written into `tabs.json` without an `sshProfileId`, or one left
-behind when the connections file was reset.
+`ssh` entry hand-written into `tabs.json` without an `sshProfileId`.
 
 Two things Reconnect does not preserve: the **scrollback** of the dead session
 (the terminal is reset before the new client starts, so the old session's tail
