@@ -46050,7 +46050,7 @@ fn h8_the_pre_enter_checkpoint_releases_our_own_paste_and_still_holds_a_real_dia
         // The fix: the two views together say "the CLI is at its composer,
         // holding our own text" — which is a composer, not a dialog.
         assert!(
-            idle_prompt_rendered(Composed { masked: masked.as_str(), unmasked: composed.as_str() }),
+            idle_prompt_rendered(Composed { masked: masked.as_str(), with_paste: composed.as_str() }),
             "{name}: our own brief in the composer is still a composer"
         );
 
@@ -46145,4 +46145,265 @@ fn h9_the_override_keys_on_the_weak_reading_and_layer_two_on_the_strong_one() {
     let seen2 = w2.borrow().clone().expect("the ring matched here too");
     assert_eq!(seen2.grid, GridEvidence::IdlePrompt);
     assert!(seen2.idle_row, "and the weak reading agrees, as it must whenever the strong one does");
+}
+
+// ---------- #903 rev-433: the composer is whatever THAT CLI paints ----------
+//
+// rev-433's blocking finding, and the audit it asked for. `h8` proved the
+// pre-Enter release on Claude Code's chevron composer — with a reading that
+// required a **prompt glyph**, which is a fact about Claude Code, not about
+// composers. Copilot's 1.0.64+ prompt frame paints `┃ ` on every row it wrapped a
+// paste onto and **no** glyph at all, so on that pane class a multi-row brief read
+// as "not a composer", the pre-Enter gate re-asserted on still-rendered prose, and
+// the paste stranded — which then wedges the box gate, where the override refuses
+// to help. A regression introduced by THIS PR: before it, the pre-paste gate held
+// and nothing was ever pasted there.
+//
+// **The audit, across every composer render this repo has evidence for:**
+//
+// | CLI / composer | how it paints a held paste | glyph? | mask claims it? |
+// | --- | --- | --- | --- |
+// | Claude Code box | `❯ <text>` | yes | yes |
+// | copilot chevron | `❯ <text>` | yes | yes |
+// | copilot framed 1.0.64+ | `┃ <text>` every row | **no** | yes |
+// | copilot framed + scrollbar | `┃ <text>  ┃` | **no** | **no** (#821 residual) |
+// | opencode | **no capture exists in this repo** | unknown | yes, by construction |
+//
+// Two rows settle the design between them. **opencode** is sourced from upstream
+// docs under constraint 3 — no `opencode` process has ever been run by an agent
+// here — so its composer render is genuinely unknown and a shape-based reading
+// could only be guessed at. Authorship is not guessable: a row the paste mask
+// claimed is loomux's own text, whoever painted it and however. That is why the
+// general clause of `idle_prompt_row_rendered` asks nothing about shape, and why
+// this suite can make a claim about a CLI it has never seen.
+//
+// **The scrollbar row is the honest limit** and `h12` pins it: there the mask
+// itself cannot claim the rows (the trailing `┃` defeats reconstruct-to-end —
+// #821's stated residual), so authorship has nothing to key on either. Not a
+// regression, because nothing was ever pasted into that pane class before this PR
+// either; not fixed, and said so rather than left to be discovered.
+
+/// The composer captures whose rows `mask_own_paste` can actually claim, each
+/// with the brief it was given. Reused rather than invented — these are the exact
+/// renders #820/#821 already had to reason about.
+fn claimable_composer_cases() -> Vec<(&'static str, &'static str, &'static str)> {
+    vec![
+        ("copilot framed multi-row", FIX_BOX_GUTTER_MULTIROW, GUTTER_PASTE_TEXT),
+        ("copilot framed wrap", FIX_COPILOT_FRAMED_WRAP, FRAMED_PASTE_TEXT),
+        ("copilot chevron", FIX_COPILOT_COMPOSER_PASTE, COMPOSER_PASTE_TEXT),
+    ]
+}
+
+/// The tail window `idle_prompt_row_rendered` reads, spelled out here so the
+/// tests can assert reach as a precondition rather than trusting the constant.
+fn tail_rows_903(visible: &str) -> Vec<&str> {
+    let rows: Vec<&str> = visible.lines().filter(|l| !l.trim().is_empty()).collect();
+    rows[rows.len().saturating_sub(8)..].to_vec()
+}
+
+#[test]
+fn h10_a_composer_holding_our_paste_reads_idle_with_no_glyph_anywhere() {
+    for (name, fixture, brief) in claimable_composer_cases() {
+        let raw = pty_bytes_903(fixture);
+        let with_paste = loomux_lib::orchestration::termgrid::render_visible(&raw, 100, 12);
+        let masked = mask_own_paste(&with_paste, brief);
+
+        // Precondition 1 — the mask really does claim rows here. Without it the
+        // test asserts something about a screen the mask never touched, which is
+        // how a vacuous pass looks.
+        let survived: std::collections::HashSet<&str> = masked.lines().collect();
+        let claimed: Vec<&str> = with_paste
+            .lines()
+            .filter(|l| !l.trim().is_empty() && !survived.contains(l))
+            .collect();
+        assert!(
+            !claimed.is_empty(),
+            "{name}: precondition: `mask_own_paste` must claim at least one row"
+        );
+
+        // Precondition 2 — a claimed row is inside the tail window. This is
+        // `IDLE_PROMPT_TAIL_ROWS`'s reach asserted per fixture, so a CLI that
+        // grows its footer fails HERE, loudly, instead of silently reading "not a
+        // composer" in production (rev-433's second path).
+        assert!(
+            tail_rows_903(&with_paste).iter().any(|r| !survived.contains(*r)),
+            "{name}: precondition: a claimed row must be within the tail window — if this \
+             fails, IDLE_PROMPT_TAIL_ROWS is too small for this CLI's chrome"
+        );
+
+        // Precondition 3 — and for the framed shapes, there is genuinely no
+        // prompt glyph to key on. This is the finding, made executable: the old
+        // reading asked for one.
+        if name.starts_with("copilot framed") {
+            assert!(
+                !claimed.iter().any(|r| {
+                    let t = r.trim_start_matches(|c: char| {
+                        c == '│' || c == '┃' || c == '|' || c.is_whitespace()
+                    });
+                    t.starts_with('❯') || t.starts_with('›') || t.starts_with('>')
+                }),
+                "{name}: precondition: the framed composer paints NO prompt glyph — that is \
+                 why a glyph-keyed reading missed it: {claimed:?}"
+            );
+        }
+
+        assert!(
+            idle_prompt_row_rendered(Composed {
+                masked: masked.as_str(),
+                with_paste: with_paste.as_str()
+            }),
+            "{name}: a composer holding our own paste is a composer, glyph or no glyph"
+        );
+
+        // End to end at the checkpoint that strands: the pre-Enter shape.
+        let raw2 = raw.clone();
+        let pred = question_hold_predicate_sampled(
+            move || sample_from_raw(&raw2, 100, 12),
+            Some(brief.to_string()),
+            None,
+            Vec::new(),
+        );
+        assert!(
+            !pred(),
+            "{name}: the pre-Enter gate must not hold on a pane whose only occupant is our \
+             own brief — that aborts with the paste stranded"
+        );
+    }
+}
+
+#[test]
+fn h11_a_real_dialog_still_holds_on_every_cli_composer_shape() {
+    // The fail-safe half of the audit, and the one #518/#532 are about. Same
+    // composer shapes, each with a genuine numbered menu painted above them: the
+    // Enter would SELECT an option, so every one must hold.
+    //
+    // A numbered menu rather than a bare pointer on purpose — `❯ 1.` is read
+    // across the detector's whole 12-line window, so the assertion is about the
+    // composer reading and not about where the CLI's own hint bar happens to push
+    // a prose-tier signal.
+    for (name, fixture, brief) in claimable_composer_cases() {
+        let mut rows: Vec<String> = vec![
+            "● Allow the command to run?".into(),
+            "".into(),
+            "│ ❯ 1. Yes".into(),
+            "│   2. No, and tell me why".into(),
+            "".into(),
+        ];
+        rows.extend(fixture.replace("\r\n", "\n").lines().map(|l| l.to_string()));
+        let raw = pty_bytes_903(&rows.join("\n"));
+
+        let pred = question_hold_predicate_sampled(
+            move || sample_from_raw(&raw, 100, 18),
+            Some(brief.to_string()),
+            None,
+            Vec::new(),
+        );
+        assert!(
+            pred(),
+            "{name}: a live dialog above the composer must still withhold the Enter (#420/#532)"
+        );
+    }
+}
+
+#[test]
+fn h12_the_two_shapes_the_audit_does_not_close_are_pinned_as_limits() {
+    // **Where the audit stops, demonstrated rather than asserted.** Both of these
+    // are behaviours a future reader could mistake for bugs; both are decisions.
+
+    // 1. The copilot scrollbar shape. `mask_own_paste` cannot claim these rows at
+    //    all — the trailing `┃` defeats reconstruct-to-end, which is #821's own
+    //    stated residual — so authorship has nothing to key on and the composer
+    //    is not recognised. Not a regression (nothing was pasted into this pane
+    //    class before this PR either); not fixed.
+    let raw = pty_bytes_903(FIX_BOX_GUTTER_SCROLLBAR);
+    let with_paste = loomux_lib::orchestration::termgrid::render_visible(&raw, 100, 12);
+    let masked = mask_own_paste(&with_paste, GUTTER_PASTE_TEXT);
+    assert_eq!(
+        masked, with_paste,
+        "precondition: the mask claims NOTHING on the scrollbar shape (#821's residual) — if \
+         this ever starts claiming rows, the limit below is closed and should be deleted"
+    );
+    assert!(
+        !idle_prompt_row_rendered(Composed {
+            masked: masked.as_str(),
+            with_paste: with_paste.as_str()
+        }),
+        "known limit: authorship cannot see a composer the mask cannot claim"
+    );
+
+    // 2. The emptiness clause keeps its glyph requirement, and cannot drop it.
+    //    The tempting generalisation is "a row made of nothing but decoration",
+    //    which would finally cover a copilot framed composer sitting EMPTY (`┃`
+    //    alone, no glyph, no paste to key authorship on). It cannot be taken: a
+    //    dialog's own blank framed row is byte-identical to it, and one sits
+    //    inside the tail window of a REAL captured dialog.
+    let dialog = composed_903(FIX_CLAUDE_ASK);
+    assert!(
+        tail_rows_903(&dialog).iter().any(|r| {
+            let t = r.trim();
+            !t.is_empty() && t.chars().all(|c| c == '│' || c == '┃' || c.is_whitespace())
+        }),
+        "precondition: a real dialog capture has a decoration-only row in the tail window — \
+         exactly what a 'decoration means composer' rule would match"
+    );
+    assert!(
+        !idle_prompt_row_rendered(Composed::plain(&dialog)),
+        "…and today's clause refuses it, which is what keeps h3 green"
+    );
+
+    // The cost of that refusal, pinned so it is a known behaviour rather than a
+    // surprise: an empty, glyph-less composer reads as not idle, so layer 2
+    // cannot release it and the pane falls through to the bounded override. A
+    // degradation, not a wedge.
+    let empty_framed = "● Ready.\n\n┃\n  @ files · # issues";
+    assert!(
+        !idle_prompt_row_rendered(Composed::plain(empty_framed)),
+        "known limit (design note): an empty glyph-less composer is not recognised — the \
+         bounded override is the channel for that pane"
+    );
+}
+
+#[test]
+fn h13_a_pointerless_dialog_above_our_composer_still_holds() {
+    // The gap the CLI-agnostic widening would have opened, closed by widening the
+    // conjunct in the same change (rev-433).
+    //
+    // Making the composer reading glyph-free means it now recognises composers it
+    // never did — which exposes the conjunct to dialog shapes it was never asked
+    // about. Claude Code's `AskUserQuestion` is the one that matters: it
+    // highlights with reverse video, so `strip_ansi` leaves **no pointer at
+    // all**. Under the old `!pointer_rendered` conjunct, that dialog plus a
+    // composer holding our paste would have read idle and released an Enter into
+    // a live selection.
+    let brief = "Rebase onto main and re-read the findings.";
+    let screen = format!("{}\n┃ {brief}\n  @ files · # issues", FIX_CLAUDE_ASK.replace("\r\n", "\n"));
+    let raw = pty_bytes_903(&screen);
+    let with_paste = loomux_lib::orchestration::termgrid::render_visible(&raw, 100, 16);
+    let masked = mask_own_paste(&with_paste, brief);
+    let c = Composed { masked: masked.as_str(), with_paste: with_paste.as_str() };
+
+    // Precondition 1 — the composer IS recognised. Without this the test would
+    // pass because the widening failed, not because the conjunct held.
+    assert!(
+        idle_prompt_row_rendered(c),
+        "precondition: the framed composer holding our brief is recognised (the widening works)"
+    );
+    // Precondition 2 — and this dialog genuinely has no pointer, which is why the
+    // old conjunct could not see it.
+    assert!(
+        !loomux_lib::orchestration::prompt_wait_match(&masked)
+            .is_some_and(|m| m.needle == QuestionNeedle::LeadingPointer),
+        "precondition: reverse video leaves no pointer glyph on this capture"
+    );
+
+    // The conjunct: numbered options and a selection footer are menu STRUCTURE.
+    assert!(!idle_prompt_rendered(c), "a pointer-less dialog is still a dialog");
+
+    let pred = question_hold_predicate_sampled(
+        move || sample_from_raw(&raw, 100, 16),
+        Some(brief.to_string()),
+        None,
+        Vec::new(),
+    );
+    assert!(pred(), "…and the pre-Enter gate withholds the Enter (#420/#532)");
 }
