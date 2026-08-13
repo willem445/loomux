@@ -500,6 +500,37 @@ test(
   },
 );
 
+test(
+  "real cmd.exe: hostile remoteCwd (embedded quote + metacharacter) does not inject — pins cmdQuoteCwd's doubling",
+  { skip: !CMD_AVAILABLE },
+  () => {
+    // Regression pin: cmdQuoteCwd doubles an embedded `"` in remoteCwd the
+    // same way cmdQuote does for a remote-command token. Every OTHER
+    // cmd.exe test above puts its hostile character in the remote-command
+    // token, not remoteCwd, so none of them would catch a regression in
+    // cmdQuoteCwd's own doubling specifically — deleting the
+    // `.replace(/"/g, '""')` there leaves the rest of this suite green
+    // while the emitted string carries a live injection. Mirrors "real sh:
+    // remoteCwd break-out attempt fails closed" below, on the cmd.exe side.
+    const marker = markerPath("cmd-hostile-cwd");
+    cleanupMarker(marker);
+    try {
+      const hostileCwd = `x" & echo PWNED>${marker} & "y`;
+      const argv = buildSshArgv(FAKE_SSH, {
+        destination: "h",
+        remoteShell: "cmd",
+        remoteCwd: hostileCwd,
+        remoteCommand: ["cmd", "/c", "echo", "ok"],
+      });
+      const cmdString = argv[argv.length - 1];
+      runRemoteStringInCmdExe(cmdString);
+      assert.ok(!existsSync(marker), `injection marker was created via a hostile remoteCwd: ${cmdString}`);
+    } finally {
+      cleanupMarker(marker);
+    }
+  },
+);
+
 /** True if child_process can actually find/run `sh` here. */
 function shAvailable(): boolean {
   const probe = spawnSync("sh", ["-c", "exit 0"], { encoding: "utf8" });
