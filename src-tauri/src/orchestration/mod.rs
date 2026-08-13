@@ -2825,16 +2825,28 @@ const LATE_MONITOR_QUESTION_SCAN_BYTES: usize = 32 * 1024;
 /// never shown a question releases on its very first check, no extra delay.
 const QUESTION_RELEASE_CONSECUTIVE_CLEAR_POLLS: u32 = 2;
 /// How far up from the bottom of a composed screen [`idle_prompt_row_rendered`]
-/// looks for the CLI's own input prompt (#903).
+/// looks for the CLI's own composer (#903).
 ///
 /// A window, not the whole screen, because the reading has to mean "this is the
-/// pane's CURRENT input affordance" and not "an empty prompt was painted at some
-/// point in the scrollback". Six non-empty rows is what sits below a Claude Code
-/// box at rest (a separator, the box row, a separator, the mode footer) with room
-/// for a shortcut hint line or two — generous enough that no CLI's chrome pushes
-/// its own box out of range, small enough that a stale prompt row further up
-/// cannot license a release.
-const IDLE_PROMPT_TAIL_ROWS: usize = 6;
+/// pane's CURRENT input affordance" and not "a composer was painted at some point
+/// in the scrollback".
+///
+/// **Sized against the chrome BELOW the composer, not against a box at rest**
+/// (rev-433). Six was the latter and was the wrong measurement: at the pre-Enter
+/// checkpoint the composer is not one row, it is however many rows the brief
+/// wrapped onto, and only its LAST rows need to be in range — but everything the
+/// CLI paints underneath them does. The captures put that at one to three rows
+/// (Claude Code: separator + mode footer; copilot: `@ files · # issues`, plus a
+/// right-aligned session line and, on 1.0.71+, a scrollbar column), so eight
+/// leaves a clear margin for a CLI that adds one more hint bar without letting a
+/// stale composer row from further up license a release.
+///
+/// The authorship clause makes this far less load-bearing than it was: a
+/// multi-row paste puts a claimed row on *every* row of the composer, so the
+/// window only has to reach the bottom-most one. `h8` asserts that reach as a
+/// precondition on each fixture, so a CLI that grows its footer fails loudly here
+/// instead of silently reading "not a composer".
+const IDLE_PROMPT_TAIL_ROWS: usize = 8;
 
 // Kickoff readiness: a fixed boot delay loses the race on a loaded machine
 // (a CLI that boots slower than the delay flushes the pasted prompt along
@@ -7704,12 +7716,6 @@ fn is_empty_prompt_row(line: &str) -> bool {
         .any(|g| d.strip_prefix(*g).is_some_and(|rest| rest.trim_matches(is_frame_char).is_empty()))
 }
 
-/// Does this row lead with a prompt glyph at all, empty or not (#903 rev-427)?
-fn leads_with_prompt_glyph(line: &str) -> bool {
-    let d = deframe(line);
-    PROMPT_GLYPHS.iter().any(|g| d.starts_with(*g))
-}
-
 /// The last [`IDLE_PROMPT_TAIL_ROWS`] non-empty rendered rows — the pane's
 /// current chrome, as opposed to whatever is still sitting above it.
 fn bottom_rendered_rows(visible: &str, n: usize) -> Vec<&str> {
@@ -7740,26 +7746,33 @@ fn bottom_rendered_rows(visible: &str, n: usize) -> Vec<&str> {
 /// composer empty right this instant*. And it asks it **without a second copy of
 /// "is this row ours"**: the mask's own recognition (deframe, wrap
 /// reconstruction, the #820 pointer-strip and its short-line floor) is reused
-/// verbatim by comparing the two views, because a row present in `unmasked` and
-/// absent from `masked` is precisely a row the mask claimed.
+/// verbatim by comparing the two views, because a row present in `with_paste`
+/// and absent from `masked` is precisely a row [`mask_own_paste`] claimed.
+///
+/// **The two views differ by the PASTE mask only** (rev-433). Both have already
+/// had [`mask_loomux_notices_with_record`] applied, and that is not tidiness: the
+/// notice mask also removes rows, so diffing against a wholly unmasked screen
+/// would read one of loomux's own `[loomux] …` notice rows sitting near the
+/// bottom of a transcript as "the composer", and release on it. Authorship of the
+/// *composer* is the signal; authorship of anything loomux ever wrote is not.
 #[derive(Clone, Copy, Debug)]
 pub struct Composed<'a> {
-    /// Loomux's own notices and this delivery's paste removed. Everything that
+    /// Loomux's own notices AND this delivery's paste removed. Everything that
     /// asks "is a question displayed" reads THIS.
     pub masked: &'a str,
-    /// The screen as composed. Read for exactly one question: is the CLI's own
-    /// input prompt on screen at all.
-    pub unmasked: &'a str,
+    /// Notices removed, this delivery's paste still on it. Read for exactly one
+    /// question: is the CLI's composer on screen, holding our own text.
+    pub with_paste: &'a str,
 }
 
 impl<'a> Composed<'a> {
-    /// Both views the same — correct at every checkpoint that masks nothing of
-    /// its own (`pasted_text: None`), and the shape every test that has no paste
-    /// wants. With the two equal, `idle_prompt_row_rendered`'s "the mask claimed
-    /// this row" clause is vacuously false and the reading collapses to exactly
-    /// the pre-rev-427 one.
+    /// Both views the same — correct at every checkpoint that has no paste of its
+    /// own to mask (`pasted_text: None`), and the shape every test without a
+    /// paste wants. With the two equal, `idle_prompt_row_rendered`'s "the paste
+    /// mask claimed this row" clause is vacuously false and the reading collapses
+    /// to the empty-composer one.
     pub fn plain(s: &'a str) -> Self {
-        Composed { masked: s, unmasked: s }
+        Composed { masked: s, with_paste: s }
     }
 }
 
@@ -7773,21 +7786,43 @@ impl<'a> Composed<'a> {
 /// note's override-safety argument, for why the last resort is allowed the weaker
 /// bar and what actually stops it pressing Enter into a dialog.
 ///
-/// A row qualifies when it leads with a prompt glyph AND either has nothing after
-/// it but framing, or was claimed by the paste mask (present in `unmasked`,
-/// absent from `masked`). The second clause is rev-427 B1: our own brief sitting
-/// in the composer is a composer, not a dialog.
+/// **Two independent clauses, and only one of them knows what a prompt looks
+/// like** (rev-433). The split is the CLI-agnosticism argument, so it is written
+/// out rather than left to the code:
+///
+/// - **Authorship (the general clause).** A row present in `with_paste` and
+///   absent from `masked` is a row [`mask_own_paste`] claimed — loomux's own text
+///   rendered by the CLI. At a checkpoint holding a `pasted_text` that text is,
+///   by construction, sitting unsubmitted in the composer. **No glyph, no frame,
+///   no shape at all is required**, which is what makes this work on a composer
+///   nobody here has ever seen: opencode has no capture in this repo (design note
+///   `opencode.md`, constraint 3), and it does not need one.
+/// - **Emptiness (the shape clause).** With no paste there is nothing to key
+///   authorship on, so an empty composer has to be recognised by appearance, and
+///   the only marker generic enough to try is a prompt glyph with nothing after
+///   it. It is a genuine limit, not an oversight — see the design note: a
+///   decoration-only row cannot be told from a dialog's blank framed row on shape
+///   alone (`claude-askuserquestion.txt` contains exactly such a row inside this
+///   window), so widening this clause would release a live dialog. A CLI whose
+///   *empty* composer paints no glyph therefore gets no layer-2 release and falls
+///   through to the bounded override, which is what a last resort is for.
+///
+/// rev-433's blocking finding was the first clause carrying the second's glyph
+/// requirement: copilot's 1.0.64+ framed composer paints `┃ ` on every row and
+/// **no** prompt glyph, so a multi-row brief pasted into it read as "not a
+/// composer", the pre-Enter gate re-asserted on the still-rendered prose, and the
+/// paste stranded — a regression this PR introduced for that pane class, since
+/// before it nothing was ever pasted there at all.
 pub fn idle_prompt_row_rendered(c: Composed<'_>) -> bool {
-    // Rows the mask kept. `mask_own_paste`/`mask_loomux_notices_with_record` only
-    // ever DROP rows — never rewrite them — so surviving rows are byte-identical
-    // and set membership is an exact test rather than a fuzzy one. A duplicate
-    // row text of which only one copy was claimed still reads as "kept", which
-    // errs toward NOT idle: the conservative direction, and the one every
-    // reading here defaults to.
+    // Rows the paste mask kept. `mask_own_paste` only ever DROPS rows — never
+    // rewrites them — so surviving rows are byte-identical and set membership is
+    // an exact test rather than a fuzzy one. A duplicate row text of which only
+    // one copy was claimed still reads as "kept", which errs toward NOT idle: the
+    // conservative direction, and the one every reading here defaults to.
     let survived: std::collections::HashSet<&str> = c.masked.lines().collect();
-    bottom_rendered_rows(c.unmasked, IDLE_PROMPT_TAIL_ROWS).iter().any(|r| {
-        leads_with_prompt_glyph(r) && (is_empty_prompt_row(r) || !survived.contains(*r))
-    })
+    bottom_rendered_rows(c.with_paste, IDLE_PROMPT_TAIL_ROWS)
+        .iter()
+        .any(|r| !survived.contains(*r) || is_empty_prompt_row(r))
 }
 
 /// Is this pane sitting at an idle input prompt with no menu selection anywhere
@@ -7800,21 +7835,54 @@ pub fn idle_prompt_row_rendered(c: Composed<'_>) -> bool {
 /// highlighted choice anywhere, so a dialog cannot be sitting above one — is
 /// allowed to end a hold.
 ///
-/// The pointer clause reads the **masked** screen, and that is load-bearing
-/// rather than incidental: on the unmasked one, our own brief in a chevron
-/// composer (`❯ <our text>`) leads a pointer at content, which is #820's exact
-/// trap and would veto the release on evidence loomux itself wrote.
+/// The conjunct reads the **masked** screen, and that is load-bearing rather than
+/// incidental: on the `with_paste` view, our own brief in a chevron composer
+/// (`❯ <our text>`) leads a pointer at content, which is #820's exact trap and
+/// would veto the release on evidence loomux itself wrote.
+///
+/// **rev-433 widened the conjunct from "no pointer" to "no menu STRUCTURE",** and
+/// the two changes are one change: making the composer reading CLI-agnostic means
+/// it now recognises composers it never did (copilot's framed one), which in turn
+/// exposes the conjunct to dialog shapes it was never asked about. The shape that
+/// mattered is Claude Code's `AskUserQuestion` — reverse video, so `strip_ansi`
+/// leaves **no pointer at all**, only numbered options and a selection footer.
+/// With the old conjunct, that dialog plus a composer holding our paste would
+/// have read as idle and released. It is the fixture suite's own
+/// `claude-askuserquestion.txt`, so this was reachable, not theoretical.
 ///
 /// The assumption, stated so a future TUI change is a known break rather than a
 /// mystery (the same courtesy #727's note pays for its own): **a CLI does not
 /// paint a modal question and a free-text composer at the same time.** Every
 /// dialog the fixtures cover replaces the box while it is up. A CLI that asked a
 /// question *above* a live composer would read as idle here — which is why the
-/// pointer clause is a conjunct rather than a nicety, and why the fixtures assert
-/// this reading is false for every positive dialog capture in the suite, not
-/// merely true for the negatives.
+/// menu-structure clause is a conjunct rather than a nicety, and why the fixtures
+/// assert this reading is false for every positive dialog capture in the suite,
+/// not merely true for the negatives.
 pub fn idle_prompt_rendered(c: Composed<'_>) -> bool {
-    idle_prompt_row_rendered(c) && !pointer_rendered(c.masked)
+    idle_prompt_row_rendered(c) && !menu_structure_rendered(c.masked)
+}
+
+/// Does this composed screen carry menu STRUCTURE anywhere on it — a highlighted
+/// choice, a numbered option, or a selection footer (#903 rev-433)?
+///
+/// Deliberately the *structural* signals only, never the prose-shaped ones. The
+/// whole of #903 is that question-shaped **prose** must stop holding panes, so a
+/// conjunct that keyed on `prompt_wait_detected` would veto every release this PR
+/// exists to make — the prose is on the masked screen by definition. What this
+/// asks instead is whether the CLI has painted something a human could *select*,
+/// which no finished turn's report does.
+///
+/// **Spatially, over the whole screen**, like [`pointer_rendered`] and for the
+/// same reason: `prompt_wait_match`'s windows are chronological rules written for
+/// a stream, and a live menu can sit above rows of statusline and composer. A
+/// wrap-insensitive flatten, so a footer split across two rows still counts —
+/// erring toward "a menu is up", which costs a hold rather than a wrong release.
+fn menu_structure_rendered(visible: &str) -> bool {
+    if pointer_rendered(visible) {
+        return true;
+    }
+    let flat = flatten_rendered(visible);
+    NUMBERED_MENU_TOKENS.iter().chain(MENU_FOOTER_TOKENS).any(|t| flat.contains(t))
 }
 
 /// Does any rendered row lead with a menu pointer (#534 rev-13)?
@@ -21471,14 +21539,24 @@ where
         };
         let ring_match =
             s.ring.as_deref().and_then(|out| prompt_wait_match(&mask(&strip_ansi(out))));
-        // #903 rev-427 B1: BOTH views are kept, and the masked one is still the
-        // only thing "is a question displayed" is asked of. The unmasked one
-        // answers one narrow question the masked one structurally cannot — is
-        // the CLI's composer on screen — because `mask_own_paste` deletes the
-        // very row that proves it. See [`Composed`].
-        let masked = s.visible.as_deref().map(mask);
-        let composed = match (s.visible.as_deref(), masked.as_deref()) {
-            (Some(unmasked), Some(masked)) => Some(Composed { masked, unmasked }),
+        // #903 rev-427 B1: BOTH views are kept, and the fully-masked one is still
+        // the only thing "is a question displayed" is asked of. The other answers
+        // one narrow question the masked one structurally cannot — is the CLI's
+        // composer on screen — because `mask_own_paste` deletes the very row that
+        // proves it.
+        //
+        // rev-433: the pair differs by the PASTE mask ALONE. Both have had the
+        // notice mask applied first, so the authorship diff cannot mistake one of
+        // loomux's own `[loomux] …` notice rows near the bottom of a transcript
+        // for the composer. See [`Composed`].
+        let with_paste =
+            s.visible.as_deref().map(|v| mask_loomux_notices_with_record(v, &delivered));
+        let masked = with_paste.as_deref().map(|v| match &pasted_text {
+            Some(p) => mask_own_paste(v, p),
+            None => v.to_string(),
+        });
+        let composed = match (with_paste.as_deref(), masked.as_deref()) {
+            (Some(with_paste), Some(masked)) => Some(Composed { masked, with_paste }),
             _ => None,
         };
         let shown = question_shown(ring_match.as_ref(), composed);
