@@ -132,7 +132,7 @@ use loomux_lib::orchestration::{
     // #865: done-row cap on list_tasks — the pure keep/drop rule and its default.
     filter_done_rows, LIST_TASKS_DONE_CAP,
     unconfirmed_delivery_notice, delivery_eaten_notice, watchdog_should_notify, worktree_cleanup_targets,
-    AgentEntry, AgentRecord, ApproveItem, AttentionItem, Caller, Containment, Delivery, DeliveryConfirmation, Guardrails, HeldReason, HumanInput, KickoffOrigin, Launch, NameSource, OrchRegistry, PasteDecision, RetryGate,
+    AgentEntry, AgentRecord, AgentStatus, ApproveItem, AttentionItem, Caller, Containment, Delivery, DeliveryConfirmation, Guardrails, HeldReason, HumanInput, KickoffOrigin, Launch, NameSource, OrchRegistry, PasteDecision, RetryGate,
     // #407: promotion of a standalone pane to orchestrator.
     promote_to_orchestrator_sync, PromoteConfig, SessionOrigin,
     PersonaInject, Task, TaskNote, TaskSummary,
@@ -32996,6 +32996,507 @@ fn create_orchestration_group_maps_resume_session_onto_the_workflow_pin() {
     assert!(
         reg2.group(&relaunched.group_id).unwrap().guardrails.block("rev-never-seen").is_some(),
         "editing the workflow and launching again must pick up the new roster"
+    );
+}
+
+// ── #407: promoting a standalone pane to orchestrator ───────────────────────
+//
+// No real CLI is ever launched (CLAUDE.md constraint 3): the promote path is
+// driven through `promote_to_orchestrator_sync` and the composed `SpawnRequest`
+// is INSPECTED, never executed, exactly as every other spawn-composition test
+// in this file does. The claude session store the validation reads is a
+// fixtured temp directory (`fixture_claude_session` + the thread-local override
+// `set_claude_projects_root_for_test`), the same seam the orchestrator-resume
+// tests above use.
+
+/// A promotable pane: a real repo directory plus a claude session fixtured into
+/// the store `promote_to_orchestrator_sync`'s existence check reads. The
+/// override is thread-local to the calling test; the caller clears it with
+/// [`drop_claude_store`] once the promote under test has run.
+fn promotable_pane(tag: &str) -> (tempfile::TempDir, String, String, std::path::PathBuf) {
+    let repo = tempfile::tempdir().unwrap();
+    let repo_path = repo.path().to_string_lossy().replace('\\', "/");
+    let session_id = "aaaabbbb-cccc-4ddd-8eee-ffff00001111".to_string();
+    let store = scratch_dir(tag);
+    fixture_claude_session(&store, &session_id, &repo_path);
+    loomux_lib::sessions::set_claude_projects_root_for_test(Some(store.clone()));
+    (repo, repo_path, session_id, store)
+}
+
+fn drop_claude_store(store: &std::path::Path) {
+    loomux_lib::sessions::set_claude_projects_root_for_test(None);
+    let _ = fs::remove_dir_all(store);
+}
+
+/// Every group id with a `group.json` on disk — "did that refusal create
+/// anything?", which is the half of a refusal that is easy to get wrong.
+fn groups_on_disk(reg: &OrchRegistry) -> Vec<String> {
+    let mut out: Vec<String> = fs::read_dir(reg.state_root())
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| e.path().join("group.json").is_file())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    out.sort();
+    out
+}
+
+/// Declare a one-reviewer workflow file in `repo`.
+fn declare_workflow(repo: &std::path::Path, block_id: &str) {
+    let loomux = repo.join(".loomux");
+    fs::create_dir_all(&loomux).unwrap();
+    fs::write(
+        loomux.join("workflow.yml"),
+        format!("version: 1\nblocks:\n  - id: {block_id}\n    kind: reviewer\n"),
+    )
+    .unwrap();
+}
+
+#[test]
+fn session_origin_separates_resuming_a_session_from_needing_the_full_kickoff() {
+    // The decomposition #407 exists for, pinned as a table. The old
+    // `(Launch, Option<String>)` pair answered "does the CLI get `--resume`"
+    // and "which kickoff is typed" with the SAME bool, so the one start that
+    // answers them differently — a promote — could not be spelled at all.
+    // Invert either column below and a promoted orchestrator either loses the
+    // conversation it was promoted to keep, or is typed a three-line "you were
+    // restarted" notice as its entire role contract.
+    let sid = "11112222-3333-4444-8555-666677778888".to_string();
+    let cases = [
+        (SessionOrigin::Fresh, Launch::Fresh, None, false, true),
+        (SessionOrigin::Resume(sid.clone()), Launch::Resume, Some(sid.as_str()), true, false),
+        // #412's cold restart of an existing group, which the pair spelled as
+        // the easily-misread `(Launch::Resume, None)`.
+        (SessionOrigin::StartFresh, Launch::Resume, None, false, true),
+        (
+            SessionOrigin::Promote { session_id: sid.clone(), cli: "claude".into() },
+            Launch::Promote,
+            Some(sid.as_str()),
+            true,
+            true,
+        ),
+    ];
+    for (origin, launch, session, resumes, full) in cases {
+        let what = origin.as_str();
+        assert_eq!(origin.launch(), launch, "{what}: group semantics");
+        assert_eq!(origin.session_id(), session, "{what}: session to reopen");
+        assert_eq!(origin.resumes_session(), resumes, "{what}: `--resume` or a minted id");
+        assert_eq!(origin.wants_full_kickoff(), full, "{what}: full contract or resume notice");
+    }
+}
+
+#[test]
+fn a_promoted_pane_resumes_its_own_session_and_gets_orchestrator_wiring() {
+    use std::sync::Arc;
+    let (reg, _d) = test_registry();
+    let reg = Arc::new(reg);
+    let (_repo, repo_path, sid, store) = promotable_pane("promote-resume");
+    let req = promote_to_orchestrator_sync(&reg, &repo_path, &sid, "claude", PromoteConfig::default());
+    drop_claude_store(&store);
+    let req = req.expect("a promotable pane must promote");
+
+    assert_eq!(req.role, Role::Orchestrator);
+    // The whole feature: the POC conversation carries over. A minted
+    // `--session-id` here would be a fresh orchestrator wearing the gesture's
+    // name, with the context it exists to keep discarded.
+    assert!(
+        req.command.contains(&format!("--resume {sid}")),
+        "the promoted pane must reopen its own conversation: {}",
+        req.command
+    );
+    assert!(
+        !req.command.contains("--session-id"),
+        "a resumed session must never also be handed a minted id: {}",
+        req.command
+    );
+    // …with a real orchestrator's capabilities, which is what the relaunch is
+    // FOR (a prompt-only re-roling would have none of these).
+    assert!(req.command.contains("--mcp-config"), "MCP identity: {}", req.command);
+    assert!(req.command.contains("--strict-mcp-config"), "{}", req.command);
+    assert!(req.command.contains("--add-dir"), "group dir access: {}", req.command);
+    // The silent-failure trap named in the plan: a promoted pane spawned
+    // without env looks fine, and has no gh shim and no group dir.
+    let env: HashMap<&str, &str> = req.env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    assert_eq!(env.get("LOOMUX_AGENT_ID"), Some(&req.agent_id.as_str()), "env: {env:?}");
+    assert!(
+        env.get("LOOMUX_GROUP_DIR").is_some_and(|d| d.contains(&req.group_id)),
+        "env: {env:?}"
+    );
+    assert!(
+        env.get("PATH").is_some_and(|p| !p.is_empty()),
+        "the gh/git shim rides PATH — without it the merge gate is not enforced: {env:?}"
+    );
+
+    // Recorded as a real orchestrator of a real group, on that session.
+    let entry = reg.agent(&req.agent_id).expect("registered");
+    assert_eq!(entry.session_id.as_deref(), Some(sid.as_str()));
+    assert_eq!(entry.group, req.group_id);
+    assert_eq!(reg.group(&req.group_id).unwrap().repo, repo_path);
+    // The audit says WHICH of the four starts this was — `resume: true` alone
+    // can no longer tell a promote from a session-browser resume.
+    let spawn = reg
+        .audit_log(&req.group_id)
+        .into_iter()
+        .find(|e| e.action == "agent-spawn")
+        .expect("agent-spawn audited");
+    assert_eq!(spawn.detail["origin"], json!("promote"));
+    assert_eq!(spawn.detail["resume"], json!(true));
+}
+
+#[test]
+fn a_promoted_orchestrator_is_typed_the_full_contract_with_a_preamble() {
+    use std::sync::Arc;
+    let (reg, _d) = test_registry();
+    let reg = Arc::new(reg);
+    let (_repo, repo_path, sid, store) = promotable_pane("promote-kickoff");
+    let req = promote_to_orchestrator_sync(&reg, &repo_path, &sid, "claude", PromoteConfig::default());
+    drop_claude_store(&store);
+    let req = req.expect("promote");
+
+    let a = reg.agent(&req.agent_id).unwrap();
+    let g = reg.group(&req.group_id).unwrap();
+    let promoted = reg.kickoff_prompt_ex(&a, &g, "", None, KickoffOrigin::Promoted);
+    let normal = reg.kickoff_prompt_ex(&a, &g, "", None, KickoffOrigin::Normal);
+
+    // A promoted session has never seen the orchestrator contract in its life,
+    // so it gets the WHOLE thing — asserted as "the ordinary kickoff, with a
+    // preamble in front", which is stronger than a marker sweep: it fails if
+    // any part of the contract is dropped for a promoted pane, including parts
+    // added to the kickoff years from now.
+    assert!(
+        promoted.starts_with("Promoted to orchestrator"),
+        "the preamble explains why the conversation above exists; it must come first: {}",
+        &promoted[..promoted.len().min(120)]
+    );
+    assert!(
+        promoted.ends_with(&normal),
+        "a promoted orchestrator's kickoff must be the full contract, unmodified, after the preamble"
+    );
+    // …and the distinguishing markers of the full body, none of which the
+    // resume notice a resumed orchestrator gets carries.
+    for marker in ["First read your role instructions:", "Guardrails (enforced by loomux)", "Delivery id:"] {
+        assert!(promoted.contains(marker), "missing {marker:?} from a promoted kickoff");
+    }
+    let resume_notice = resume_kickoff_notice(None);
+    assert!(
+        !resume_notice.contains("First read your role instructions:"),
+        "test premise: the resume notice is NOT the contract — that is why a promote cannot use it"
+    );
+    // Every pane that was spawned as what it is keeps its pre-#407 kickoff,
+    // byte for byte.
+    assert!(!normal.contains("Promoted to orchestrator"));
+    assert_eq!(
+        normal,
+        reg.kickoff_prompt(&a, &g, "", None),
+        "the four-argument wrapper must stay the Normal path"
+    );
+}
+
+#[test]
+fn promote_refuses_a_non_claude_pane() {
+    use std::sync::Arc;
+    let (reg, _d) = test_registry();
+    let reg = Arc::new(reg);
+    let (_repo, repo_path, sid, store) = promotable_pane("promote-cli");
+    let err = promote_to_orchestrator_sync(&reg, &repo_path, &sid, "copilot", PromoteConfig::default())
+        .unwrap_err();
+    drop_claude_store(&store);
+    assert!(err.starts_with("promote-unsupported-cli:"), "got: {err}");
+    assert!(groups_on_disk(&reg).is_empty(), "a refused promote must create nothing");
+}
+
+#[test]
+fn promote_refuses_anything_short_of_a_full_session_id() {
+    use std::sync::Arc;
+    let (reg, _d) = test_registry();
+    let reg = Arc::new(reg);
+    let (_repo, repo_path, sid, store) = promotable_pane("promote-prefix");
+    // The 8-hex prefix a human copies out of a session row. `--resume <prefix>`
+    // fails INSIDE the pane — after the promotion already killed the process
+    // holding the context — so it is refused here instead of resolved.
+    let err = promote_to_orchestrator_sync(&reg, &repo_path, &sid[..8], "claude", PromoteConfig::default())
+        .unwrap_err();
+    let empty = promote_to_orchestrator_sync(&reg, &repo_path, "  ", "claude", PromoteConfig::default())
+        .unwrap_err();
+    drop_claude_store(&store);
+    assert!(err.starts_with("promote-bad-session:"), "got: {err}");
+    assert!(empty.starts_with("promote-bad-session:"), "got: {empty}");
+    assert!(groups_on_disk(&reg).is_empty(), "a refused promote must create nothing");
+}
+
+#[test]
+fn promote_refuses_a_repo_path_that_is_not_a_usable_directory() {
+    use std::sync::Arc;
+    let (reg, _d) = test_registry();
+    let reg = Arc::new(reg);
+    let (_repo, repo_path, sid, store) = promotable_pane("promote-repo");
+    let gone = format!("{repo_path}/does-not-exist");
+    let missing = promote_to_orchestrator_sync(&reg, &gone, &sid, "claude", PromoteConfig::default())
+        .unwrap_err();
+    // A quote would escape the quoting of the composed command line.
+    let quoted = promote_to_orchestrator_sync(
+        &reg,
+        "/tmp/evil\" ; rm -rf /",
+        &sid,
+        "claude",
+        PromoteConfig::default(),
+    )
+    .unwrap_err();
+    drop_claude_store(&store);
+    assert!(missing.starts_with("promote-bad-repo:"), "got: {missing}");
+    assert!(quoted.starts_with("promote-bad-repo:"), "got: {quoted}");
+    assert!(groups_on_disk(&reg).is_empty(), "a refused promote must create nothing");
+}
+
+#[test]
+fn promote_refuses_a_session_that_is_already_an_orchestration_member() {
+    use std::sync::Arc;
+    let (reg, _d) = test_registry();
+    let reg = Arc::new(reg);
+    let (_repo, repo_path, _sid, store) = promotable_pane("promote-member");
+    // A group whose worker recorded a session — a delegate's transcript carries
+    // a delegate contract, and promoting it would seat two conflicting role
+    // contracts in one conversation.
+    let g = reg.create_group(&repo_path, rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "", false, None).unwrap();
+    let member = reg.agent(&w.agent_id).unwrap().session_id.expect("claude worker has a session");
+    let before = groups_on_disk(&reg);
+    let err = promote_to_orchestrator_sync(&reg, &repo_path, &member, "claude", PromoteConfig::default())
+        .unwrap_err();
+    drop_claude_store(&store);
+    assert!(err.starts_with("promote-already-managed:"), "got: {err}");
+    assert!(err.contains(&g.id), "the refusal must name the group it is already in: {err}");
+    assert_eq!(groups_on_disk(&reg), before, "a refused promote must create no second group");
+}
+
+#[test]
+fn promote_refuses_a_session_the_cli_store_has_never_heard_of() {
+    use std::sync::Arc;
+    let (reg, _d) = test_registry();
+    let reg = Arc::new(reg);
+    let (_repo, repo_path, _sid, store) = promotable_pane("promote-unknown");
+    // A pane that has never been spoken to writes no transcript at all, and a
+    // cleared history looks the same: `--resume` would fail inside the pane
+    // with claude's own opaque "No conversation found", after the promotion had
+    // already killed it.
+    let err = promote_to_orchestrator_sync(
+        &reg,
+        &repo_path,
+        "99999999-8888-4777-8666-555544443333",
+        "claude",
+        PromoteConfig::default(),
+    )
+    .unwrap_err();
+    drop_claude_store(&store);
+    assert!(err.starts_with("promote-not-found:"), "got: {err}");
+    assert!(groups_on_disk(&reg).is_empty(), "a refused promote must create nothing");
+}
+
+#[test]
+fn promote_into_a_fresh_group_reads_the_repo_workflow_file() {
+    use std::sync::Arc;
+    let (reg, _d) = test_registry();
+    let reg = Arc::new(reg);
+    let (repo, repo_path, sid, store) = promotable_pane("promote-fresh-workflow");
+    declare_workflow(repo.path(), "rev-approved");
+    // Fresh GROUP semantics: there is no prior group.json, so the promote modal
+    // IS the moment the human is shown (and consents to) the repo's roster.
+    let req = promote_to_orchestrator_sync(
+        &reg,
+        &repo_path,
+        &sid,
+        "claude",
+        PromoteConfig { advanced_orchestrator: true, ..PromoteConfig::default() },
+    );
+    drop_claude_store(&store);
+    let req = req.expect("promote");
+    assert!(
+        reg.group(&req.group_id).unwrap().guardrails.block("rev-approved").is_some(),
+        "a promote with no group to inherit reads the workflow file, like any launch"
+    );
+    assert!(
+        reg.audit_log(&req.group_id).iter().any(|e| e.action == "group-create"),
+        "a brand-new group dir, not a reattach"
+    );
+}
+
+#[test]
+fn promote_reattaching_a_dormant_group_keeps_the_roster_that_group_was_launched_with() {
+    use std::sync::Arc;
+    let (reg, _d) = test_registry();
+    let reg = Arc::new(reg);
+    let (repo, repo_path, sid, store) = promotable_pane("promote-reattach");
+    declare_workflow(repo.path(), "rev-approved");
+
+    // A group the human launched, configured live (the cap), and ended.
+    let launched = create_orchestration_group(
+        &reg,
+        &repo_path,
+        Guardrails { advanced_orchestrator: true, max_agents: 7, ..rails() },
+        SessionOrigin::Fresh,
+        None,
+        0,
+    )
+    .unwrap();
+    let gid = launched.group_id.clone();
+    assert!(
+        reg.group(&gid).unwrap().guardrails.block("rev-approved").is_some(),
+        "setup: the launch read the workflow file"
+    );
+    reg.end_group(&gid, false).unwrap();
+    // …and the repo moves on underneath them: a `git pull` brings a reviewer
+    // block nobody in that group ever approved.
+    declare_workflow(repo.path(), "rev-never-seen");
+
+    // The promote modal's defaults — no advanced tick, no roster, cap 0 —
+    // because a right-click is not the launcher and carries no preview.
+    let req = promote_to_orchestrator_sync(&reg, &repo_path, &sid, "claude", PromoteConfig::default());
+    drop_claude_store(&store);
+    let req = req.expect("promote");
+
+    assert_eq!(req.group_id, gid, "a dormant group is reattached, not orphaned");
+    let rails_now = reg.group(&gid).unwrap().guardrails;
+    assert!(
+        rails_now.block("rev-approved").is_some(),
+        "the reattached group keeps the roster its human approved"
+    );
+    assert!(
+        rails_now.block("rev-never-seen").is_none(),
+        "a block the repo gained AFTER that launch must not join it through a right-click either"
+    );
+    assert!(rails_now.advanced_orchestrator, "the toggle travels with the roster it selected");
+    assert_eq!(
+        rails_now.max_agents, 7,
+        "live-adjustable knobs come back off disk — the dormant group's settings beat the modal's defaults"
+    );
+    assert!(
+        reg.audit_log(&gid).iter().any(|e| e.action == "workflow-changed-since-launch"),
+        "the drift is audited so the human can SEE the repo has moved on"
+    );
+    assert!(
+        reg.audit_log(&gid).iter().any(|e| e.action == "group-resume"),
+        "reattach, not create"
+    );
+}
+
+#[test]
+fn promote_beside_a_live_group_opens_a_sibling_rather_than_a_second_orchestrator() {
+    use std::sync::Arc;
+    let (reg, _d) = test_registry();
+    let reg = Arc::new(reg);
+    let (_repo, repo_path, sid, store) = promotable_pane("promote-sibling");
+    // A live orchestration on this repo. Joining it would seat a SECOND
+    // orchestrator in one group — refused everywhere else in loomux (a resume
+    // refuses while one is live; `spawn_agent` refuses `kind: orchestrator`),
+    // and promote must not become the loophole.
+    let live = create_orchestration_group(&reg, &repo_path, rails(), SessionOrigin::Fresh, None, 0)
+        .unwrap();
+    let req = promote_to_orchestrator_sync(&reg, &repo_path, &sid, "claude", PromoteConfig::default());
+    drop_claude_store(&store);
+    let req = req.expect("promote");
+
+    assert_ne!(req.group_id, live.group_id, "a live group is never joined");
+    assert_eq!(req.group_id, format!("{}-2", live.group_id), "the sibling id, same as a concurrent launch");
+    assert_eq!(
+        reg.agent(&live.agent_id).unwrap().group,
+        live.group_id,
+        "the live orchestration is untouched"
+    );
+}
+
+#[test]
+fn promote_refuses_when_the_reattached_roster_pins_another_cli() {
+    use std::sync::Arc;
+    let (reg, _d) = test_registry();
+    let reg = Arc::new(reg);
+    let (_repo, repo_path, sid, store) = promotable_pane("promote-cli-mismatch");
+    // A dormant group whose roster pins its orchestrator to a different CLI.
+    // The reattach inherits that roster (correctly — it is what its human
+    // approved), and the composed command would then be `copilot --resume
+    // <claude uuid>`: a failure INSIDE the pane, after the promotion has
+    // already killed the process holding the conversation. Fail closed instead.
+    let pinned = Guardrails {
+        blocks: workflow::default_roster(&[
+            (Role::Orchestrator, "copilot", "sonnet"),
+            (Role::Worker, "", "sonnet"),
+            (Role::Reviewer, "", "sonnet"),
+            (Role::Planner, "", "opus"),
+        ]),
+        ..rails()
+    };
+    reg.create_group_ex(&repo_path, pinned, Launch::Fresh).unwrap();
+    let err = promote_to_orchestrator_sync(&reg, &repo_path, &sid, "claude", PromoteConfig::default())
+        .unwrap_err();
+    drop_claude_store(&store);
+    assert!(err.starts_with("promote-cli-mismatch:"), "got: {err}");
+}
+
+#[test]
+fn promote_retires_the_panes_standalone_identity() {
+    use std::sync::Arc;
+    let (reg, _d) = test_registry();
+    let reg = Arc::new(reg);
+    let (_repo, repo_path, sid, store) = promotable_pane("promote-solo");
+    // The pane is usually already a `__solo__` member by the time the menu is
+    // built (`adoptIfEligible` mints one on right-click). Left alive after the
+    // promotion it is a stale channel endpoint keyed to a pty that is now an
+    // orchestrator: a peer's `channel_send` would be delivered into a session
+    // that never joined that channel.
+    let (solo_id, _token) = spawn_solo(&reg, "claude", 7001);
+    assert_eq!(reg.agent(&solo_id).unwrap().status, AgentStatus::Running);
+    let req = promote_to_orchestrator_sync(
+        &reg,
+        &repo_path,
+        &sid,
+        "claude",
+        PromoteConfig { solo_agent_id: solo_id.clone(), ..PromoteConfig::default() },
+    );
+    drop_claude_store(&store);
+    let req = req.expect("promote");
+    assert_eq!(
+        reg.agent(&solo_id).unwrap().status,
+        AgentStatus::Dead,
+        "the standalone identity is retired by the promotion that replaced it"
+    );
+    assert!(
+        reg.audit_log(&req.group_id).iter().any(|e| e.action == "solo-retired"),
+        "and says so in the trail"
+    );
+}
+
+#[test]
+fn promote_never_retires_an_agent_that_is_not_a_standalone_pane() {
+    use std::sync::Arc;
+    let (reg, _d) = test_registry();
+    let reg = Arc::new(reg);
+    let (_repo, repo_path, sid, store) = promotable_pane("promote-solo-guard");
+    // `solo_agent_id` arrives from the webview. Naming a real orchestration
+    // agent must never kill it through this door — that would be a one-click
+    // way to take out another group's orchestrator.
+    let other = tempfile::tempdir().unwrap();
+    let other_repo = other.path().to_string_lossy().replace('\\', "/");
+    let victim = create_orchestration_group(&reg, &other_repo, rails(), SessionOrigin::Fresh, None, 0)
+        .unwrap();
+    let req = promote_to_orchestrator_sync(
+        &reg,
+        &repo_path,
+        &sid,
+        "claude",
+        PromoteConfig { solo_agent_id: victim.agent_id.clone(), ..PromoteConfig::default() },
+    );
+    drop_claude_store(&store);
+    let req = req.expect("promote");
+    assert_eq!(
+        reg.agent(&victim.agent_id).unwrap().status,
+        AgentStatus::Running,
+        "an orchestration agent is never retired through the solo door"
+    );
+    assert!(
+        reg.audit_log(&req.group_id).iter().any(|e| e.action == "solo-retire-skipped"),
+        "and the attempt leaves a trail"
     );
 }
 

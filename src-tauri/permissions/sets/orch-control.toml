@@ -3,6 +3,7 @@ identifier = "orch-control"
 description = "Mutating orchestration operations: create/bind/steer/approve/grant-merge/grant-release, task and channel management, autonomy settings, group lifecycle, solo mode."
 permissions = [
     "allow-create-orchestration",
+    "allow-promote-to-orchestrator",
     "allow-bind-agent",
     "allow-orch-agent-renamed",
     "allow-resume-orch-session",
