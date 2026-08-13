@@ -3903,8 +3903,13 @@ impl SessionOrigin {
     /// of starting one? True for a promote as much as a resume — and it is the
     /// same fact that says there is no newly-minted session to go watching for
     /// (the id is already known).
+    ///
+    /// Spelled against the two variants that HAVE an id rather than as "not
+    /// Fresh": `StartFresh` is a cold conversation too, and reading it as a
+    /// resume would hand #412's restart `--resume <a uuid nothing has ever
+    /// written>` — a pane that boots and immediately fails to find itself.
     pub fn resumes_session(&self) -> bool {
-        !matches!(self, SessionOrigin::Fresh)
+        matches!(self, SessionOrigin::Resume(_) | SessionOrigin::Promote { .. })
     }
 
     /// Does this orchestrator get the full kickoff contract (roster, lessons,
