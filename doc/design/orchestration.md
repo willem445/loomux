@@ -7118,9 +7118,26 @@ exactly this and post-dates the incidents), so the tiering only moves phrases wh
 be argued from the string itself. Guessing more would be tuning against an unmeasured population.
 
 **2. An idle composer beats "still rendered".** New `GridEvidence::IdlePrompt`, checked **before**
-`StillRendered`: a composed screen showing an empty input prompt in its bottom
+`StillRendered`: a composed screen showing the CLI's own input prompt in its bottom
 `IDLE_PROMPT_TAIL_ROWS` rows, **and** no pointer-at-content anywhere on it, releases the hold — with
 the matched text plainly on screen.
+
+*"Its own input prompt"* means a prompt row holding either **nothing** or **nothing but text loomux
+itself pasted**, and the second half is rev-427's blocking finding rather than a generalization for
+its own sake. `mask_own_paste` REMOVES the rows it claims, so at `deliver_now`'s pre-Enter
+checkpoint — the one checkpoint that runs with a `pasted_text` — the mask deletes exactly the row
+that proves a composer is on screen. Reading idleness from the masked screen alone therefore
+answered "no composer" for a pane whose composer was not merely present but holding our own brief,
+and the pre-Enter gate re-asserted the very false positive the pre-paste gate had just released —
+aborting with the paste stranded in the box, which then wedges the stranded-submit path behind it.
+Strictly worse than the bug this section fixes.
+
+`Composed { masked, unmasked }` is the fix and it is deliberately not a second recognizer: a row
+present in `unmasked` and absent from `masked` is *precisely* a row the mask claimed, so the mask's
+own hard-won rules (deframe, wrap reconstruction, #820's pointer strip and its short-line floor) are
+reused verbatim rather than re-implemented somewhere they could drift. Everything that asks "is a
+question displayed" still reads the masked view only; the unmasked one answers one narrow question
+the masked one structurally cannot.
 
 That inverts #534's asymmetry for one case, on purpose. The asymmetry (weight everything toward
 holding; a false release is the expensive error) is right when the question is *"did the dialog go
@@ -7130,24 +7147,26 @@ empty free-text composer is not blocked on an answer. Read as evidence rather th
 is the same move #727 made — an empty prompt is the CLI's own statement that it is idle — one layer
 up from the pointer signal to the screen as a whole.
 
-The reading is deliberately hard to satisfy. An unreadable composition answers `false`, so the
-ring's word stands. A recognised empty prompt sitting under a live menu answers `false`, because the
-pointer clause is a conjunct. And the release still rides
-`QUESTION_RELEASE_CONSECUTIVE_CLEAR_POLLS` — two consecutive clear polls — like every other release
-in this guard.
+The reading is deliberately hard to satisfy — **for layer 2**; layer 3 relaxes exactly one clause of
+it, and the section below is where that is argued. An unreadable composition answers `false`, so the
+ring's word stands. A recognised prompt row sitting under a live menu answers `false`, because the
+pointer clause is a conjunct — and that clause reads the **masked** view, or our own brief in a
+chevron composer would veto the release on evidence loomux itself wrote (#820's trap). And the
+release still rides `QUESTION_RELEASE_CONSECUTIVE_CLEAR_POLLS` — two consecutive clear polls — like
+every other release in this guard.
 
 **The assumption it rests on, stated so a future TUI change is a known break and not a mystery: a
-CLI does not paint a modal question and an empty free-text composer at the same time.** Every
-dialog in the fixture suite replaces the box while it is up. If one ever paints a question *above* a
-live composer, the pointer clause is what still catches the menu-shaped ones, and `h3` is the test
-that would have to be widened — it asserts today that no positive dialog capture reads as idle.
+CLI does not paint a modal question and a free-text composer at the same time.** Every dialog in the
+fixture suite replaces the box while it is up. If one ever paints a question *above* a live
+composer, the pointer clause is what still catches the menu-shaped ones, and `h3` is the test that
+would have to be widened — it asserts today that no positive dialog capture reads as idle.
 
 **3. A bounded last-resort override.** Layers 1 and 2 fix the false positives we can *characterize*.
 The human's report is that the detector is flaky in general, so the third layer assumes the next one
 will be shaped differently: after `QUESTION_HOLD_OVERRIDE_AFTER` (15 min) held on the **question**
-gate, with two consecutive fresh reads showing an idle prompt row, the drainer delivers anyway —
-with the existing queued-flush header, and an audited `delivery-question-override` carrying the
-witness so the next narrowing has the evidence this one lacked.
+gate, with two consecutive fresh reads showing a prompt row, the drainer pastes anyway — with the
+existing queued-flush header, and an audited `delivery-question-override` carrying the witness so
+the next narrowing has the evidence this one lacked.
 
 Every term is re-proved on the poll that acts on it. `question_override_admits` is pure and takes a
 *streak of fresh reads*, not a latched flag: a pane that reads idle for ten minutes and then paints
@@ -7158,17 +7177,53 @@ badged and has five minutes to look before loomux acts on their behalf; shorter 
 `QUEUE_STILL_QUEUED_NOTICE_AFTER` (30 min), so the queue moves before the generic "still queued"
 notice is the first anyone hears of it. `h6` pins the ordering rather than the number.
 
-#### Why an override is safe: delivery-id dedup makes a rare wrong one cheap
+#### The override keys on the WEAK reading, and that is the design, not an oversight
+
+Layer 2 releases on `idle_prompt_rendered` — a prompt row **and** no highlighted choice anywhere.
+Layer 3 counts its streak on `idle_prompt_row_rendered` — the prompt row alone. rev-427 found the
+gap and asked which of the two was intended. The answer is the weak one, and the reason is
+structural rather than a preference:
+
+**The strong reading would make layer 3 dead code.** It is exactly what `grid_evidence_for` already
+answers `IdlePrompt` to, so a pane satisfying it is not holding — there would be no hold left for
+the override to override. The two readings differ on precisely one screen shape: a prompt row with a
+pointer-at-content somewhere above it. So the override is not "a second, sloppier idleness test"; it
+**is** the time-bounded downgrade of layer 2's own menu-absent conjunct, and describing it any other
+way hides what it does.
+
+Is that shape safe to act on? On the evidence available, it is the #727/#820 family rather than a
+dialog: every CLI in the fixture suite *replaces* its composer while a dialog is up, so a screen
+showing both a composer and a pointer-at-content row is a composer plus pointer-shaped **prose** —
+which is what `fp-leading-pointer-prose.txt`, `fp-fenced-pointer-block.txt` and #820's own composer
+captures all are. Requiring the conjunct would therefore disable the last resort against exactly the
+false-positive family it was built for. `h9` pins both readings on one screen so a future edit
+cannot flip the wiring silently.
+
+#### Why a wrong override is cheap — the pre-Enter gate first, dedup second
 
 The override can be wrong. The argument is not that it cannot be — it is that the two error
-directions are not remotely equal in cost.
+directions are not remotely equal in cost, and (rev-427 B2) that the *order* of the defences
+matters, because the earlier version of this section led with dedup and dedup does not cover the
+expensive failure.
 
-**A wrong override** delivers a brief into a pane with a live dialog on it. The paste lands in the
-dialog's lap; the human answers the dialog; and if the dialog ate the paste, the entry is still the
-drainer's to retry, under **the same delivery id**. Every kickoff carries one, and every receiving
-agent is instructed to treat a delivery id it has already acted on as a duplicate and stop. So the
-worst case is one messy pane and, at most, one redundant copy an agent is already required to
-discard — and it takes fifteen minutes of a *fresh, repeated* idle reading to get there at all.
+**The expensive failure is not a stray paste — it is a stray Enter.** A delivery into a live dialog
+does not merge text; the Enter *selects* whatever is highlighted, and no dedup rule can undo a
+selected option. What stops that is `deliver_now`'s **pre-Enter** `wait_for_question_clear`, which
+the override does **not** skip: it runs against the screen masked with this delivery's own paste,
+and on a genuinely live dialog it holds, caps, and returns `AbortedPreEnter` with the Enter
+withheld. The human then finds the brief sitting in the box — untidy, and recoverable.
+
+That defence is only real because of rev-427 B1's fix. Before it, the pre-Enter reading could not
+see a composer holding our own paste (the mask deletes the row), so it answered `StillRendered` for
+*prose as well as dialogs* and could not distinguish them. Now it can: `Composed` keeps both views,
+the composer-holding-our-text case releases, and a live menu above it still holds (`h8`, both
+directions). The safety argument and the blocking fix are the same change.
+
+**Then dedup covers the residue.** If the dialog ate the paste, the entry is still the drainer's to
+retry under **the same delivery id**; every receiving agent is instructed to treat a delivery id it
+has already acted on as a duplicate and stop. So the worst case is one messy pane and, at most, one
+redundant copy an agent is already required to discard — after fifteen minutes of a *fresh,
+repeated* reading, on a pane the human has been badged about for five of them.
 
 **A hold with no reachable bound** is what #903 is: a queue that never moves, work that silently
 does not happen, and a human who eventually kills the pane. That is not a bounded cost; it is the
@@ -7189,6 +7244,18 @@ absolute is untouched — a human's own typed line is never overridden, at any a
   it so it is a known limit rather than a surprise. The badge (#532) is still the channel for it.
 - **A CLI whose empty box is a *placeholder* (`❯ Try "fix the build"`)** does not read as idle —
   #727's residual, unchanged, and the same answer applies: a narrower signal, not a wider mask.
+- **The override can paste into a live menu; it cannot press Enter into one.** Layer 3's term has no
+  menu-absent conjunct (see the section above for why the strong reading would make it dead code),
+  so a CLI that paints a dialog *above* a live composer would satisfy it. What that costs is bounded
+  by the pre-Enter checkpoint, which is not overridden and which `h8` pins in both directions — not
+  by the idleness reading. Stated as a limit rather than left in the safety argument's shadow,
+  because a reader deciding whether to widen the override needs to know which gate is actually
+  holding the line.
+- **The idleness reading is a screen shape, not a fact about the CLI's state.** "The composer is on
+  screen holding only our own text" is inferred from the paste mask having claimed the row. A CLI
+  that echoed our text somewhere *other* than its composer, on a row that happens to lead with a
+  prompt glyph, would read the same. No capture in the suite does this; it is the assumption to
+  re-check on a TUI upgrade, alongside #727's.
 - **The override cannot fire while the drainer is inside `deliver_now`.** The bound is sampled by
   the same thread that blocks, so a pane that keeps entering `deliver_now` samples it late — the
   arithmetic `QUESTION_HOLD_STALE_AFTER`'s doc already spells out for the badge. For the shape #903
@@ -7204,13 +7271,22 @@ absolute is untouched — a human's own typed line is never overridden, at any a
 
 ### Tests
 
-`h1`–`h7` in `tests/orchestration.rs`, over two new fixtures. `h1` is the repro, and it asserts its
+`h1`–`h9` in `tests/orchestration.rs`, over two new fixtures. `h1` is the repro, and it asserts its
 own preconditions rather than assuming them: the ring still matches, by a wide-tier signal #903 did
 *not* demote, and the match is genuinely still rendered — so the release can only be the new
 reading. `h2` isolates the token re-tiering in both directions. `h3` is the fail-safe floor (every
 dialog fixture still holds, and none of them reads as idle) and `h4` is the conjunct that keeps an
 empty box beside a live menu from releasing it. `h5` is the override's truth table, `h6` its
 ordering against the two clocks it sits between, `h7` the unreadable-screen limit.
+
+`h8` and `h9` are rev-427's. `h8` covers the **pre-Enter** shape `h1` structurally cannot — the same
+fixtures with a brief in the composer and `pasted_text: Some(..)` — and asserts the mechanism as a
+precondition (the masked screen has no empty prompt row left, and the matched prose IS still on it)
+before asserting the release, so it cannot pass for `h1`'s reason. Its second half is the direction
+that must not regress: a live dialog *above* our own occupied composer still holds, which is the
+gate the whole override-safety argument rests on. `h9` pins which idleness reading feeds which
+layer, on one screen, through the production predicate's own witness — the term that licenses a
+write, previously untestable in either direction.
 
 The fixtures' chrome is byte-verbatim from #727's live capture — including the
 `⏵⏵ auto mode on (shift+tab to cycle) · ← for agents` footer #903's own comments quote as present on
