@@ -206,6 +206,29 @@ deliberately a human's choice rather than an automatic downgrade: silently
 starting a new conversation would abandon one that might just be behind a host
 still booting.
 
+A reconnect is **single-flight per pane**, and that is a correctness rule rather
+than a UI polish: the card carries two actions, a pane can bind only one pty, and
+two overlapping attempts leave the loser orphaned — output routed nowhere, an exit
+nobody claims, and no way to kill it, because a kill goes through the pane's own
+`ptyId`. An orphaned *local* process is a nuisance; an orphaned **remote agent CLI
+is an unaccountable agent running on someone else's machine**, which is the exact
+cost this whole restore policy is argued from. So every reconnect entry point
+funnels through one latched function (`withSubmitLatch`, reusing the `SubmitLatch`
+the welcome form's own double-submit fix introduced), and the card's two buttons
+share one pending state so neither stays live while the other is connecting. The
+latch releases on failure as well as success — a reconnect that failed must stay
+retryable, since retrying is what the card is for.
+
+**A minted id can outlive a spawn that never happened** — pre-existing, and named
+here because this is where a reader will meet it. `Pane.start` records
+`opts.sessionId` before `attachPty`, so a *fresh* connect whose spawn throws
+leaves the pane holding an id for a remote session that was never created; the
+next `capture()` persists it, and a later Reconnect resumes an id the far host has
+never seen. This is not specific to SSH — the local agent launch path has always
+recorded its minted id the same way — and it is not what this slice changed, so it
+is left for its own fix rather than folded in here. What S4 does contribute is the
+way out: the fresh escape above turns that state from a trap into one extra click.
+
 **A disconnect keeps the pane.** `keepOpenOnExit` gained an `isSshPane` input, and
 that is a fix as much as a feature: an SSH pane spawns through the *argv* path, so
 `launchedCommand` is false for it and the crash rule would have closed the pane

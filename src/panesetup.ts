@@ -227,8 +227,13 @@ export type PaneSetupResult =
   | { ok: true; plan: PaneSetupPlan }
   | { ok: false; error: string; focus?: PaneSetupFocus };
 
-/** A one-shot, re-entrancy-proof latch for the welcome form's async submit
- *  (#194 rev-74 HIGH-1). The form's `submit()` spans `await`s (CLI probe,
+/** A one-shot, re-entrancy-proof latch for an async action that spans `await`s
+ *  while its trigger stays on screen. Two users today: the welcome form's
+ *  `submit()` (#194 rev-74 HIGH-1, described below) and the SSH reconnect
+ *  (#887 S4 — see `withSubmitLatch`), which is the SAME defect one step
+ *  removed, so it reuses this rather than growing a second latch beside it.
+ *
+ *  The form's `submit()` spans `await`s (CLI probe,
  *  worktree creation, group launch) during which the form stays rendered and
  *  enabled; a double-click, Enter auto-repeat, or an impatient second click
  *  would otherwise run `submit()` again and spawn a duplicate group / a second
@@ -277,6 +282,46 @@ export class SubmitLatch {
   /** Whether a submit has already fired its result (one-shot spent). */
   get settled(): boolean {
     return this.done;
+  }
+}
+
+/** Run `attempt` only when `latch` is free, and hand every concurrent caller
+ *  `busy()` instead of a second run — the SINGLE-FLIGHT rule for an action that
+ *  must never overlap itself, however many buttons or code paths can trigger it
+ *  (#887 S4 / PR #926 review round 2 B1).
+ *
+ *  Why this exists as a function rather than three `begin()`/`release()` call
+ *  sites: the defect it closes was precisely a SECOND trigger that skipped the
+ *  first one's gate. The SSH reconnect card has two actions — Reconnect and
+ *  Reconnect fresh — and the second one was routed around the card's own pending
+ *  state, so a click on each spawned **two ssh clients and two remote agent CLIs**
+ *  while the pane could only bind one: the loser's output routes nowhere, its
+ *  exit lands unclaimed, and because a kill goes through the pane's `ptyId`
+ *  nothing in loomux can stop it — an unaccountable agent left running on someone
+ *  else's machine, in a feature whose whole restore policy is argued from not
+ *  spending remote credits unattended. Putting the gate at the one function every
+ *  reconnect already funnels through makes that structural: a future third
+ *  entry point (a menu item, a shortcut) is gated by construction rather than by
+ *  remembering.
+ *
+ *  `release()`, not `finish()`: a reconnect that FAILED must stay retryable — the
+ *  card's whole purpose is the retry — and a successful one takes its card with
+ *  it. This latch is therefore never permanently spent, which is why the one-shot
+ *  half of `SubmitLatch` is deliberately unused here.
+ *
+ *  Pure and DOM-free, so the concurrency rule is unit-tested rather than argued
+ *  about (`test/panesetup.test.ts`) — the buttons that call it are not testable,
+ *  but the rule that makes two of them safe is. */
+export async function withSubmitLatch<T>(
+  latch: SubmitLatch,
+  busy: () => T,
+  attempt: () => Promise<T>
+): Promise<T> {
+  if (!latch.begin()) return busy();
+  try {
+    return await attempt();
+  } finally {
+    latch.release();
   }
 }
 

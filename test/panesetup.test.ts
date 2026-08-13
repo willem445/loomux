@@ -18,6 +18,7 @@ import {
   sshMintsSessionId,
   sshOrchestrationRefusal,
   sshReconnectArgv,
+  withSubmitLatch,
   sshRemoteCliWarning,
   sshRemoteCwdWarning,
   type PaneSetupInput,
@@ -861,5 +862,75 @@ test("the fresh ESCAPE (a recorded session that can never be resumed) forces a n
     escape.argv.slice(0, -1),
     normal.argv.slice(0, -1),
     "everything before the remote command is identical"
+  );
+});
+
+// --- #887 S4 / PR #926 round 2 B1: a reconnect is SINGLE-FLIGHT ---
+
+test("two near-simultaneous reconnects spawn exactly ONE ssh client", () => {
+  // The defect this pins, concretely: the SSH reconnect card has two actions
+  // (Reconnect, Reconnect fresh). With them ungated, a click on each — the
+  // expected gesture, since the escape exists for someone who has just watched a
+  // resume fail — started TWO ssh clients and two remote agent CLIs against one
+  // pane. The pane binds whichever spawn resolves last; the loser's output routes
+  // nowhere, its exit lands unclaimed, and a kill goes through the pane's ptyId,
+  // so nothing in loomux can stop it — a remote agent left running, unaccountable,
+  // on someone else's machine, in a feature whose restore policy is argued from
+  // not spending remote credits unattended.
+  let spawns = 0;
+  let finish!: () => void;
+  const inFlight = new Promise<void>((resolve) => (finish = resolve));
+  const latch = new SubmitLatch();
+  const reconnect = (): Promise<{ ok: boolean; message?: string }> =>
+    withSubmitLatch(
+      latch,
+      () => ({ ok: false, message: "busy" }),
+      async () => {
+        spawns++;
+        await inFlight; // stand in for discoverSsh + loadSshProfiles + spawnPty
+        return { ok: true };
+      }
+    );
+
+  const first = reconnect(); // still in flight — nothing has resolved it
+  const second = reconnect(); // the second button, ~300ms later
+  return Promise.resolve()
+    .then(async () => {
+      assert.deepEqual(await second, { ok: false, message: "busy" }, "the second click is refused, not queued");
+      assert.equal(spawns, 1, "exactly one spawn while an attempt is in flight");
+      finish();
+      assert.deepEqual(await first, { ok: true }, "the first attempt is untouched by the refusal");
+      // …and the latch REOPENS: a reconnect that failed must stay retryable —
+      // the card's whole purpose is the retry — so this is never one-shot.
+      assert.deepEqual(await reconnect(), { ok: true });
+      assert.equal(spawns, 2, "a later attempt runs once the first has settled");
+    });
+});
+
+test("a reconnect that THROWS still releases the latch (a failure must stay retryable)", () => {
+  // The `finally` in `withSubmitLatch`, pinned: without it, one failed reconnect
+  // would wedge the card forever — every later click answered "already
+  // reconnecting" while nothing was, which is worse than the double-spawn it
+  // exists to prevent, because there is no way out of it at all.
+  const latch = new SubmitLatch();
+  let attempts = 0;
+  const boom = (): Promise<{ ok: boolean }> =>
+    withSubmitLatch(
+      latch,
+      () => ({ ok: false }),
+      async () => {
+        attempts++;
+        throw new Error("spawn failed");
+      }
+    );
+  return boom().then(
+    () => assert.fail("the rejection must propagate to the caller"),
+    async (err) => {
+      assert.match(String(err), /spawn failed/);
+      await boom().then(
+        () => assert.fail("still expected to reject"),
+        () => assert.equal(attempts, 2, "the second attempt ran — the latch reopened")
+      );
+    }
   );
 });
