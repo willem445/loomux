@@ -7783,7 +7783,12 @@ pub fn idle_prompt_row_rendered(c: Composed<'_>) -> bool {
     // reading here defaults to.
     let survived: std::collections::HashSet<&str> = c.masked.lines().collect();
     bottom_rendered_rows(c.unmasked, IDLE_PROMPT_TAIL_ROWS).iter().any(|r| {
-        leads_with_prompt_glyph(r) && (is_empty_prompt_row(r) || !survived.contains(*r))
+        // [scratch/903-red-6] the ONE behaviour set aside: a prompt row the paste
+        // mask CLAIMED no longer counts as the CLI's own composer, so the reading
+        // reverts to "the row must be literally empty" — the pre-rev-427 shape
+        // whose consequence at the pre-Enter checkpoint is rev-427's blocking 1.
+        let _ = &survived;
+        leads_with_prompt_glyph(r) && is_empty_prompt_row(r)
     })
 }
 
