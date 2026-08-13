@@ -7822,7 +7822,15 @@ pub fn idle_prompt_row_rendered(c: Composed<'_>) -> bool {
     let survived: std::collections::HashSet<&str> = c.masked.lines().collect();
     bottom_rendered_rows(c.with_paste, IDLE_PROMPT_TAIL_ROWS)
         .iter()
-        .any(|r| !survived.contains(*r) || is_empty_prompt_row(r))
+        // [scratch/903-red-7] the ONE behaviour set aside: the authorship clause
+        // carries the emptiness clause's PROMPT-GLYPH requirement again — the
+        // pre-rev-433 shape, which is a fact about Claude Code rather than about
+        // composers, and which misses copilot's glyph-less framed composer.
+        .any(|r| {
+            let d = deframe(r);
+            PROMPT_GLYPHS.iter().any(|g| d.starts_with(*g))
+                && (!survived.contains(*r) || is_empty_prompt_row(r))
+        })
 }
 
 /// Is this pane sitting at an idle input prompt with no menu selection anywhere
