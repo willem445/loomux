@@ -315,8 +315,8 @@
         {
           "name": "max_batch",
           "type": "number",
-          "default": 3,
-          "min": 1,
+          "default": 99,
+          "min": 42,
           "on_out_of_range": "refuse",
           "help": "How many approved sub-PRs one speculative batch may carry. At 3, a red batch costs at most 2 extra CI runs to attribute."
         },
