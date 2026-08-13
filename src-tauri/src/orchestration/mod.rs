@@ -7859,7 +7859,10 @@ pub fn idle_prompt_row_rendered(c: Composed<'_>) -> bool {
 /// assert this reading is false for every positive dialog capture in the suite,
 /// not merely true for the negatives.
 pub fn idle_prompt_rendered(c: Composed<'_>) -> bool {
-    idle_prompt_row_rendered(c) && !menu_structure_rendered(c.masked)
+    // [scratch/903-red-8] the ONE behaviour set aside: the conjunct is the
+    // pre-rev-433 pointer-only one, so a reverse-video dialog (no pointer
+    // survives strip_ansi) above a composer holding our paste reads as idle.
+    idle_prompt_row_rendered(c) && !pointer_rendered(c.masked)
 }
 
 /// Does this composed screen carry menu STRUCTURE anywhere on it — a highlighted
