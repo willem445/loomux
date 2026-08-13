@@ -293,6 +293,15 @@ test("#407: a planner pane offers neither promote nor connect — its single dis
   assert.match(items[0].reason ?? "", /planner/i);
 });
 
+test("#407: a command pane that is not an agent CLI has no promote item either (rev-1 N1)", () => {
+  // `isAgentPane` is "was launched with a command", which a `npm run dev` or
+  // `htop` pane satisfies too. Those have no recognized CLI, and a greyed row
+  // telling a build watcher that promotion is Claude-only is exactly the
+  // permanently-dead row the absent-vs-disabled rule exists to avoid.
+  const items = buildPaneMenu(free({ group: null, agentId: null, role: null, agentCli: null }), null);
+  assert.equal(promoteOf(items), undefined);
+});
+
 test("#407: a shell / content pane has no promote item — promotion is an AGENT-pane gesture", () => {
   const items = buildPaneMenu(
     free({ group: null, agentId: null, role: null, isAgentPane: false, agentCli: null, sessionId: null }),

@@ -1950,6 +1950,14 @@ void onPtyExit((exit) => {
   // which is exactly the shape `closeOrKeep` reads as "retire the pane" — so
   // without this the reaper would close the pane and take the conversation the
   // promotion exists to preserve with it.
+  //
+  // The flag stays up across the bind that follows the respawn, so this also
+  // swallows an exit of the NEW pty in those few milliseconds (a `--resume` that
+  // dies instantly) — no banner, and the pane still counts as live until the next
+  // exit. Deliberate, and the safer direction of the two: the alternative is
+  // `tryResumeFallback` respawning that pane FRESH, which is precisely the silent
+  // discard of the promoted conversation the whole flow refuses to do. A promotion
+  // that lands in that window reports through its own recovery note instead.
   if (pane.isRelaunching) return;
   if (tryResumeFallback(pane, exit)) return; // resume failed → fresh respawn in place
   closeOrKeep(ws, pane, exit, pane.keepOpenOnExit(exit));

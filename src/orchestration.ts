@@ -27,8 +27,10 @@ import { withDeadline } from "./dirtystate";
 import {
   promoteConfirmLines,
   promoteFailureText,
+  promoteOffersRoster,
   promotePaneOptions,
   promoteRecoveryNote,
+  type PromoteWorkflow,
 } from "./promote";
 
 export type { AutonomyState };
@@ -854,28 +856,31 @@ async function killAndAwaitExit(ptyId: number): Promise<void> {
  *  conversation: what becomes the repo, what happens to this pane, which group it
  *  may land in, and — only when the repo actually declares one — whether to run
  *  its workflow roster. Resolves to the chosen config, or null if cancelled. */
-async function confirmPromote(repo: string, workflowName: string | null): Promise<{ advanced: boolean } | null> {
-  // Default ON when a workflow exists, mirroring the plan: a repo that declares
-  // a roster almost always means it. The dormant-reattach case ignores this
-  // either way (that group's own roster stands) — said in the body, not silently.
-  let advanced = workflowName !== null;
+async function confirmPromote(repo: string, workflow: PromoteWorkflow | null): Promise<{ advanced: boolean } | null> {
+  // Default ON when the repo declares a roster that actually validates, mirroring
+  // the plan: a repo that declares one almost always means it. A broken file
+  // offers no box at all (`promoteOffersRoster`) — the group would run the
+  // built-in roles regardless, and a ticked box would promise otherwise. The
+  // dormant-reattach case ignores the box either way (that group's own roster
+  // stands) — said in the body, not silently.
+  const offersRoster = promoteOffersRoster(workflow);
+  let advanced = offersRoster;
   const ok = await modal<boolean>((resolve) => ({
     title: "Promote this pane to orchestrator?",
     body:
       "This pane's Claude session becomes the orchestrator of a real orchestration group — " +
       "same conversation, relaunched in place with the orchestrator's tools, task board and audit log.",
-    bodyLines: promoteConfirmLines(repo, workflowName),
-    checkbox:
-      workflowName === null
-        ? undefined
-        : {
-            label: "Run this repo's workflow roster (advanced)",
-            checked: advanced,
-            title: "Load .loomux/workflow.yml and run the blocks it declares, instead of the built-in four roles.",
-            onChange: (v) => {
-              advanced = v;
-            },
+    bodyLines: promoteConfirmLines(repo, workflow),
+    checkbox: !offersRoster
+      ? undefined
+      : {
+          label: "Run this repo's workflow roster (advanced)",
+          checked: advanced,
+          title: "Load .loomux/workflow.yml and run the blocks it declares, instead of the built-in four roles.",
+          onChange: (v) => {
+            advanced = v;
           },
+        },
     buttons: [
       { label: "Cancel", value: false },
       { label: "Promote", value: true, kind: "primary" },
@@ -934,15 +939,38 @@ async function promotePaneToOrchestrator(
   pane: Pane,
   action: Extract<PaneMenuAction, { kind: "promote" }>
 ): Promise<void> {
-  // Does the repo declare a workflow? Read at the moment of asking, not cached:
-  // this is a consent surface, and a stale answer on one is worse than a slow one
-  // (the launcher's roster preview takes the same line). A failed read means the
-  // checkbox simply isn't offered — promoting on the built-in roster is the
-  // conservative outcome, never a silently-ticked one.
-  const preview = await workflowPreview(action.repo, action.cli).catch(() => null);
-  const workflowName = preview?.present ? preview.name : null;
+  // A second gesture on a pane already being promoted would fire a second
+  // `promote_to_orchestrator` against the same session: bounded (the first
+  // promotion records the session's role, so the second is refused
+  // `promote-already-managed`) but only as a race, and the window is real —
+  // the confirm plus up to PROMOTE_EXIT_WAIT_MS of silence, throughout which the
+  // menu item stays live. Refusing re-entry closes it outright.
+  if (promotionsInFlight.has(pane)) return;
+  promotionsInFlight.add(pane);
+  try {
+    await runPromotion(pane, action);
+  } finally {
+    promotionsInFlight.delete(pane);
+  }
+}
 
-  const choice = await confirmPromote(action.repo, workflowName);
+/** Panes with a promotion in flight — see the re-entry guard above. A `Set` of
+ *  live panes, cleared in a `finally`, so a pane that is closed mid-promotion
+ *  leaves nothing behind but a reference the next promotion drops. */
+const promotionsInFlight = new Set<Pane>();
+
+async function runPromotion(pane: Pane, action: Extract<PaneMenuAction, { kind: "promote" }>): Promise<void> {
+  // Does the repo declare a workflow, and does it validate? Read at the moment of
+  // asking, not cached: this is a consent surface, and a stale answer on one is
+  // worse than a slow one (the launcher's roster preview takes the same line). A
+  // failed read means the checkbox simply isn't offered — promoting on the
+  // built-in roster is the conservative outcome, never a silently-ticked one.
+  const preview = await workflowPreview(action.repo, action.cli).catch(() => null);
+  const workflow: PromoteWorkflow | null = preview?.present
+    ? { name: preview.name, valid: preview.valid }
+    : null;
+
+  const choice = await confirmPromote(action.repo, workflow);
   if (!choice) return;
 
   let req: OrchSpawnRequest;

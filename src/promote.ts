@@ -36,13 +36,30 @@ export function promoteFailureText(message: string): string {
   return m ? text.slice(m[0].length) : text;
 }
 
+/** The repo's `.loomux/workflow.yml` as the confirm needs it: `null` when there
+ *  is no file at all, otherwise its `name` (`""` for a nameless one) and whether
+ *  it actually validated.
+ *
+ *  `valid` is carried rather than collapsed into "present" because the three
+ *  states need three different sentences — and, more importantly, only ONE of
+ *  them may offer the roster checkbox. A file that fails validation launches the
+ *  built-in roster (backend-side, `Launch::Promote`), so a ticked box promising
+ *  its roster would be a promise the promotion cannot keep. */
+export interface PromoteWorkflow {
+  name: string;
+  valid: boolean;
+}
+
+/** Whether the roster checkbox is offered at all — true only for a workflow file
+ *  that is present AND valid. The modal reads this instead of re-deriving the
+ *  condition beside `promoteConfirmLines`, so the line the human reads and the
+ *  control they can tick can never disagree about the same file. */
+export function promoteOffersRoster(workflow: PromoteWorkflow | null): boolean {
+  return workflow !== null && workflow.valid;
+}
+
 /** The confirm dialog's itemized body: what this one click is about to do, in
  *  the order the human needs to know it.
- *
- *  `workflowName` is the repo's `.loomux/workflow.yml` name when the file is
- *  present (`""` for a nameless-but-present file) and `null` when there is no
- *  file — which is also the whole condition for offering the roster checkbox, so
- *  the two answers come from one input rather than two that can disagree.
  *
  *  The group-case line states the POLICY rather than naming the resolved group,
  *  deliberately: which case applies is decided by the backend's candidate scan
@@ -51,7 +68,7 @@ export function promoteFailureText(message: string): string {
  *  be a second, partial implementation of a backend policy — so the modal states
  *  all three cases and the caller names the group the backend actually resolved
  *  once it has. */
-export function promoteConfirmLines(repo: string, workflowName: string | null): string[] {
+export function promoteConfirmLines(repo: string, workflow: PromoteWorkflow | null): string[] {
   const lines = [
     `Repository: ${repo} — this pane's own working directory becomes the group's repo.`,
     "This pane's Claude session is relaunched in place with the orchestrator contract: " +
@@ -60,12 +77,19 @@ export function promoteConfirmLines(repo: string, workflowName: string | null): 
       "dormant group is reattached (its board and audit history carry over), or a sibling " +
       "group beside a live one. loomux tells you which once it resolves.",
   ];
-  if (workflowName !== null) {
-    lines.push(
-      `This repo declares a workflow (${workflowName || ".loomux/workflow.yml"}). ` +
-        "Tick the box below to run its roster; a reattached dormant group keeps the roster it was launched with either way."
-    );
-  }
+  if (workflow === null) return lines;
+  const named = workflow.name || ".loomux/workflow.yml";
+  lines.push(
+    workflow.valid
+      ? `This repo declares a workflow (${named}). ` +
+          "Tick the box below to run its roster; a reattached dormant group keeps the roster it was launched with either way."
+      : // Present but broken: the group still launches, on the built-in four roles —
+        // the launcher says so inline for the same file, and this is the same
+        // consent moment, so it says so here rather than offering a box that
+        // would promise a roster nothing is going to run.
+        `This repo declares a workflow (${named}), but it doesn't validate — ` +
+          "the group runs the built-in four roles instead. Fix it in a workflow pane and relaunch if you wanted its roster."
+  );
   return lines;
 }
 

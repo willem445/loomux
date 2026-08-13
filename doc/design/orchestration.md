@@ -11915,10 +11915,19 @@ and a claude pane whose adopt-on-connect failed is exactly such a pane *and* a p
 promotable session. So the promote item is composed at the top level, from inputs
 (`isAgentPane`, `agentCli`, `sessionId`, `workdir`) that say nothing about channels, and
 appended to whatever the connect half produced. Absent for a pane the gesture is not about (a
-shell, or a pane already in a group — the backend's `promote-already-managed` covers the
-dormant membership the frontend cannot see); disabled *with the reason* for an agent pane that
-could plausibly be promoted but isn't eligible yet, because there the human is looking for the
-item and silence reads as a missing feature.
+shell; a pane running a command that is not a recognized agent CLI at all, since `isAgentPane`
+is only "was launched with a command" and `npm run dev` satisfies it; or a pane already in a
+group — the backend's `promote-already-managed` covers the dormant membership the frontend
+cannot see); disabled *with the reason* for an agent pane that could plausibly be promoted but
+isn't eligible yet, because there the human is looking for the item and silence reads as a
+missing feature. The line between the two is "would a reader of this row ever act on it": a
+copilot pane's human might promote it once v1 widens, a build watcher's never would.
+
+The roster checkbox follows the same rule one level down. It is offered only for a workflow file
+that is **present and valid**, because an invalid one launches the built-in roster regardless
+(`Launch::Promote`) — a ticked box would promise a roster nothing is going to run. The file is
+still named, with what will actually run instead: this is the consent moment `Launch::Promote`'s
+own argument turns on, and the launcher warns inline about the same file.
 
 **A promoted pane is never discarded.** `openAgentPane`'s failure arms all close the pane —
 correct for one it just opened against a config that has since been torn down (#106), and

@@ -166,15 +166,22 @@ const PROMOTE_NO_WORKDIR_REASON =
  *  missing on the panes it exists for.
  *
  *  `null` (no item) vs disabled-with-a-reason:
- *  - **no item** for a pane the gesture is not about — a shell/content pane, or
- *    one already in an orchestration group. A delegate's menu must not grow a
- *    permanently-dead row, and the backend refuses a recorded member anyway
- *    (`promote-already-managed`), including the dormant membership this can't see.
+ *  - **no item** for a pane the gesture is not about — a shell/content pane, one
+ *    running a command that is not an agent CLI at all, or one already in an
+ *    orchestration group. A delegate's menu must not grow a permanently-dead row,
+ *    and the backend refuses a recorded member anyway (`promote-already-managed`),
+ *    including the dormant membership this can't see.
  *  - **disabled + reason** for an AGENT pane that could plausibly be promoted but
  *    isn't eligible right now (wrong CLI, no session yet, no cwd). Here the human
  *    is looking for the item, so silence would read as a missing feature. */
 function promoteItem(p: PaneConnectState): PaneMenuItem | null {
-  if (!p.isAgentPane) return null;
+  // `isAgentPane` is `Pane.launchedCommand` — ANY command pane, not just an agent
+  // CLI (`npm run dev`, `htop`). A recognized CLI is what makes this a pane the
+  // gesture is about at all, so an unrecognized one gets no item rather than a
+  // permanently-dead row telling a build watcher that promotion is Claude-only.
+  // (`agentCli` is null for exactly that case; a copilot pane answers "copilot"
+  // and still gets the greyed row below, which is the case worth explaining.)
+  if (!p.isAgentPane || p.agentCli === null) return null;
   // An orchestration member has a group AND a real role; a standalone pane's
   // identity is the `__solo__` carrier, whose role is "solo". Keyed off the role
   // rather than the `"__solo__"` group sentinel so this module doesn't grow a

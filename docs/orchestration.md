@@ -141,16 +141,20 @@ What the confirm tells you before anything happens:
   board, audit history and the roster it was launched with; or a **sibling**
   group beside one that's already live (two orchestrators never share a group).
   A toast names the group once it resolves.
-- **The workflow checkbox** appears only when the repo declares
-  `.loomux/workflow.yml`, and runs that roster instead of the built-in four
-  roles. It doesn't apply to a reattached dormant group — that group keeps the
-  roster its own launch approved.
+- **The workflow checkbox** appears only when the repo declares a
+  `.loomux/workflow.yml` **that validates**, and runs that roster instead of the
+  built-in four roles. It doesn't apply to a reattached dormant group — that
+  group keeps the roster its own launch approved. If the file is there but
+  broken, you're told so and there's no checkbox: the group runs the built-in
+  roles, the same outcome the launcher warns about inline.
 
 The item is offered on standalone **Claude** agent panes. It's greyed with the
-reason on an agent pane that can't be promoted *yet* — a non-Claude CLI, or a
-pane loomux hasn't learned a session id for (send it a prompt first: an agent
-nobody has spoken to has no conversation to carry over) — and it isn't offered at
-all on a shell pane or on a pane that already belongs to an orchestration group.
+reason on an agent pane that can't be promoted *yet* — a non-Claude CLI, a pane
+loomux hasn't learned a session id for (send it a prompt first: an agent nobody
+has spoken to has no conversation to carry over), or a pane with no working
+directory to make the group's repo — and it isn't offered at all on a shell pane,
+a pane running something that isn't an agent CLI, or a pane that already belongs
+to an orchestration group.
 loomux also refuses a session that was *ever* a recorded member of a group, even
 a long-dormant one: a delegate's transcript carries a delegate's contract, and
 two role contracts in one session is not a thing to seat on purpose. Every

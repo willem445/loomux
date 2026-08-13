@@ -7,6 +7,7 @@ import assert from "node:assert/strict";
 import {
   promoteConfirmLines,
   promoteFailureText,
+  promoteOffersRoster,
   promotePaneOptions,
   promoteRecoveryNote,
 } from "../src/promote.ts";
@@ -118,6 +119,8 @@ test("the two post-kill stages are distinguishable — 'never started' and 'star
 
 // ---------- consent: what the modal has to say before one click interrupts a turn ----------
 
+const validWorkflow = (name = "loomux dev") => ({ name, valid: true });
+
 test("the confirm names the repo, warns the live turn is interrupted, and states all three group cases", () => {
   const lines = promoteConfirmLines("/repo/poc", null).join("\n");
   assert.match(lines, /\/repo\/poc/);
@@ -132,13 +135,35 @@ test("the workflow line appears only when the repo actually declares a workflow"
     !promoteConfirmLines("/repo/poc", null).some((l) => /workflow/i.test(l)),
     "no file → no roster line, and no checkbox to explain"
   );
-  const declared = promoteConfirmLines("/repo/poc", "loomux dev").join("\n");
+  const declared = promoteConfirmLines("/repo/poc", validWorkflow()).join("\n");
   assert.match(declared, /workflow/i);
   assert.match(declared, /loomux dev/, "the human is told WHICH workflow they'd be running");
   // A present-but-nameless file still gets a line, naming the file instead.
-  assert.match(promoteConfirmLines("/repo/poc", "").join("\n"), /workflow\.yml/);
+  assert.match(promoteConfirmLines("/repo/poc", validWorkflow("")).join("\n"), /workflow\.yml/);
 });
 
 test("the confirm says a reattached dormant group keeps its own roster — the checkbox does not override that consent", () => {
-  assert.match(promoteConfirmLines("/repo/poc", "wf").join("\n"), /dormant group keeps the roster/i);
+  assert.match(promoteConfirmLines("/repo/poc", validWorkflow("wf")).join("\n"), /dormant group keeps the roster/i);
+});
+
+// rev-1 N2: a workflow file that does not validate.
+
+test("#407 rev-1 N2: an INVALID workflow file offers no roster checkbox — the group would run the built-in roles regardless", () => {
+  assert.equal(promoteOffersRoster({ name: "broken", valid: false }), false);
+  assert.equal(promoteOffersRoster(null), false);
+  assert.equal(promoteOffersRoster({ name: "loomux dev", valid: true }), true);
+});
+
+test("#407 rev-1 N2: an INVALID workflow file is still NAMED, and says what will actually run instead", () => {
+  // Silence would be safe but misleading: this is the same consent moment the
+  // launcher warns inline at, for the same file.
+  const lines = promoteConfirmLines("/repo/poc", { name: "loomux dev", valid: false }).join("\n");
+  assert.match(lines, /loomux dev/, "the human is told which file is broken");
+  assert.match(lines, /doesn't validate|does not validate/i);
+  assert.match(lines, /built-in four roles/i, "…and what the group runs instead");
+  assert.doesNotMatch(
+    lines,
+    /Tick the box/i,
+    "a broken file must not be described as something a checkbox can run"
+  );
 });
