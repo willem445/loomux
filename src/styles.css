@@ -92,10 +92,12 @@
   --text-dim: var(--ink-dim);
   --accent: var(--state-working);
   --accent-dim: var(--line-strong);
-  /* The one bridge value with no token behind it: an alpha tint of --focus, which CSS
-     cannot derive from a hex custom property without color-mix. Slice B replaces its call
-     sites with a focus treatment that needs no glow. */
-  --accent-glow: rgba(226, 163, 60, 0.14);
+  /* The one bridge value with no token behind it: the alpha companion of --accent, which
+     CSS cannot derive from a hex custom property without color-mix. It carries indigo, not
+     the focus hue — its call sites are selected-row fills, and tinting those saffron would
+     make every selection read as "this needs you". Slice B splits the fills onto
+     --selection and drops the glows. */
+  --accent-glow: rgba(118, 135, 214, 0.14);
   --danger: var(--state-danger);
 }
 
