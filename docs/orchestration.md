@@ -500,6 +500,93 @@ nothing is taken down on a guess. Before this the repair was simply never attemp
 pane that filled up once could carry that chip until you restarted, with the prompt still
 sitting unsent in its box.
 
+## Lock resources (taking turns on something scarce)
+
+Some things on your machine only one agent can use at a time — a compile that saturates
+every core, a GPU, a device on a USB port, a fixed port number, a staging database. Without
+help, four workers will reach for it at once. **Lock resources** let you declare those things
+once, in your repo, and have agents take turns.
+
+Declare them in `.loomux/workflow.yml` (the same file that carries your roster, so this needs
+the **advanced orchestrator** on):
+
+```yaml
+resources:
+  build:
+    slots: 1              # how many agents may hold it at once — 1 is a mutex
+    max_hold_minutes: 45  # loomux takes it back after this, whatever happens
+  gpu:
+    slots: 2              # omitting max_hold_minutes means the default, 30
+```
+
+What a resource *means* is entirely yours — loomux never learns that `build` is a compiler.
+It knows the name, the slot count and the clock. Declare nothing and the feature is off:
+the agents in that group are not even offered the tools.
+
+**Both settings are optional, and the defaults are not what the example above shows.** Omit
+`slots` and you get **1**; omit `max_hold_minutes` and you get **30**, not the 45 written out in
+the example. A name may use letters, digits, `-` and `_` (up to 48 characters) — anything else is
+rejected rather than quietly rewritten, so the name you type is the name your agents call.
+
+**A value out of range fails the whole file, on purpose.** `slots: 0` or above 64,
+`max_hold_minutes: 0` or above 480, a name with an illegal character, an unrecognized key inside a
+resource, or more than 32 resources are all **hard errors that stop `.loomux/workflow.yml` from
+loading at all** — taking your roster and merge gate down with them, and the launcher will show you
+why. That is deliberate: a repo that wrote `slots: 0` believes its builds are serialized, and
+quietly substituting a default would leave that belief in place while the behaviour changed
+underneath it. If your workflow file suddenly stops loading after you add a `resources:` block,
+this is the first thing to check.
+
+**What the agents get.** Three tools, and only in a group whose repo declares resources:
+`acquire_lock(name, note?, wait_minutes?)`, `release_lock(name)`, and `list_locks()`. The
+names you declared are listed in the tool's own description, so an agent can see what exists
+rather than guessing. Your orchestrator is told to name the relevant lock in a brief; a
+worker's instructions tell it to take the lock before the work and release it as soon as
+that work is done.
+
+**Nothing blocks.** `acquire_lock` answers immediately — either the lock is yours, or you are
+queued at a stated position. A queued agent ends its turn and gets a
+`[loomux] lock 'build' is yours` notice typed into its pane when its turn comes, exactly like
+a CI watch resolving. That is not a convenience: a notice is *typed into a pane*, and a pane
+that sat blocking on its own lock could never receive the one telling it to proceed.
+
+**The queue is first-come, first-served**, and every wait is bounded: a queued request gives
+up after `wait_minutes` (default 60, 5–240) and the agent is told so, rather than waiting on
+a notice that will never arrive. An agent that changes its mind can call `release_lock` while
+queued to withdraw, so nobody sits behind a slot it no longer wants.
+
+**A lock always comes back.** Three things can end a hold: the holder releases it, the holder's
+pane dies (loomux reclaims it immediately and hands it to whoever is next), or the hold runs
+past `max_hold_minutes` (loomux reclaims it and tells the ex-holder its work is no longer
+serialized, so it can re-acquire). There is no state in which a resource is stuck forever
+because an agent forgot.
+
+Pausing a group freezes the **clocks**: nothing expires, nothing times out, and the paused span is
+credited back afterwards, so a long pause never costs a running build its lock. It does not freeze
+*you* — killing a holder's pane while the group is paused still reclaims that lock and still hands
+it to whoever is next, because that is your deliberate action rather than a timer firing. (The
+notice telling the new holder sits in its pane's queue until you resume, like every other delivery
+to a paused group.)
+
+**Where you see it.** The group lifecycle panel (`Alt+O`) grows a lock section: one line per
+declared resource with how many slots are taken, who holds each (with the note it gave, e.g.
+`w-3 (cargo test) 12m`) and how many agents are queued behind it. Hover for the full queue in
+order, with each agent's own clock. The line turns amber when somebody is waiting and red
+when a reclaim is imminent. The audit viewer (`Alt+A`) has a sentence for each lifecycle
+event — taken, queued, released, granted, reclaimed, timed out — so "why did that build take
+40 minutes" is answerable after the fact.
+
+Lock state lives in memory only. Closing loomux clears it, which is the right answer: every
+pane that could have been holding a lock died with it.
+
+**It is cooperative, and deliberately so.** A lock is taken because an agent asked for one —
+loomux does not intercept your build command, and an agent that never calls `acquire_lock` is
+not stopped. An earlier design tried to enforce this by shadowing the guarded program on
+`PATH`, and it was abandoned: a shim only catches the shells it shadows, so the guarantee it
+appeared to give was not one it could keep. Advisory locking that is honest about being
+advisory, with a full audit trail of who held what and for how long, is worth more than
+enforcement with a hole in it.
+
 ## Cross-workspace channels
 
 Every orchestration group is isolated by design — one group's agents never see another's

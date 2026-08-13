@@ -24,6 +24,16 @@ export function str(v: unknown): string | undefined {
   return typeof v === "string" ? v : undefined;
 }
 
+/** A `*_ms` duration as whole minutes, for the lock lifecycle lines (#858).
+ *  Rounds UP so a 40-second hold reads "1 min" rather than "0 min", which
+ *  would read as a bug in the mechanism rather than a short hold. Non-numeric
+ *  (a truncated or hand-edited record) reads "?" instead of "NaN min". */
+export function minutes(v: unknown): string {
+  return typeof v === "number" && Number.isFinite(v)
+    ? `${Math.max(0, Math.ceil(v / 60_000))} min`
+    : "? min";
+}
+
 /** Short one-line summary per action. Falls back to compact detail JSON so an
  *  unknown/new action is never opaque. */
 export function summarize(e: AuditEntry): string {
@@ -112,6 +122,35 @@ export function summarize(e: AuditEntry): string {
     case "watch-expired":
     case "watch-failed":
       return `→ ${str(d.agent) ?? "?"}: ${firstLine(str(d.text) ?? "")}`;
+    // Lock resources (#858): acquire/queue are agent-initiated (actor = the
+    // agent, so the sentence names the resource rather than repeating them);
+    // grant/expire/reclaim/timeout are loomux's own and DO name the agent,
+    // because the actor column reads "loomux" and the whole point of those
+    // lines is which agent lost or gained a slot.
+    case "lock-acquire":
+      return `took '${str(d.resource) ?? "?"}'${d.note ? ` — ${firstLine(str(d.note) ?? "")}` : ""}`;
+    case "lock-acquire-repeat":
+      return `already held '${str(d.resource) ?? "?"}' (no change)`;
+    case "lock-queued":
+      return `queued for '${str(d.resource) ?? "?"}' at position ${d.position ?? "?"}`;
+    case "lock-queued-repeat":
+      return `already queued for '${str(d.resource) ?? "?"}' at position ${d.position ?? "?"}`;
+    case "lock-release":
+      return `released '${str(d.resource) ?? "?"}'`;
+    case "lock-queue-cancel":
+      return `withdrew from the '${str(d.resource) ?? "?"}' queue (was position ${d.position ?? "?"})`;
+    case "lock-grant":
+      return `'${str(d.resource) ?? "?"}' → ${str(d.agent) ?? "?"} (waited ${minutes(d.waited_ms)})`;
+    case "lock-expired":
+      return `'${str(d.resource) ?? "?"}' reclaimed from ${str(d.agent) ?? "?"} — held ${minutes(d.held_ms)}, past its max hold`;
+    case "lock-reclaim":
+      return `'${str(d.resource) ?? "?"}' reclaimed from ${str(d.agent) ?? "?"} — its pane is gone (held ${minutes(d.held_ms)})`;
+    case "lock-wait-timeout":
+      return `${str(d.agent) ?? "?"} gave up waiting for '${str(d.resource) ?? "?"}' after ${minutes(d.waited_ms)}`;
+    case "lock-wait-cleanup":
+      return `${str(d.agent) ?? "?"} left the '${str(d.resource) ?? "?"}' queue — its pane is gone`;
+    case "lock-undeclared":
+      return `'${str(d.resource) ?? "?"}' is no longer declared in .loomux/workflow.yml — its holders and queue were dropped`;
     // Cross-workspace channels (#271): connect/disconnect are human-initiated (actor
     // "human", mirroring the watch-register/-cancel pattern above); channel-message is
     // agent-initiated. Written to BOTH endpoints' group logs, so each side's timeline

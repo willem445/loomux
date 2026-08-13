@@ -973,6 +973,58 @@ export interface GroupWatch {
 export const groupWatches = (groupId: string): Promise<GroupWatch[]> =>
   invoke<GroupWatch[]>("orch_group_watches", { groupId });
 
+// ---------- lock resources (#858): the group view's lock chrome ----------
+
+/** One agent holding one slot of a declared resource. */
+export interface LockHolder {
+  agent: string;
+  /** The holder's own label for what it's doing (may be empty). */
+  note: string;
+  acquired_ms: number;
+  /** When loomux reclaims it if it isn't released first. */
+  expires_ms: number;
+}
+
+/** One agent waiting in a resource's FIFO queue. */
+export interface LockWaiter {
+  agent: string;
+  note: string;
+  queued_ms: number;
+  /** When this agent gives up waiting and leaves the queue. */
+  expires_ms: number;
+}
+
+/** One resource the repo declares under `resources:` in `.loomux/workflow.yml`. */
+export interface LockResource {
+  name: string;
+  slots: number;
+  max_hold_minutes: number;
+  holders: LockHolder[];
+  /** In queue order — index 0 is next to be granted. */
+  queue: LockWaiter[];
+}
+
+export interface LockState {
+  now_ms: number;
+  resources: LockResource[];
+}
+
+/** Live lock state for a group — the SAME payload the `list_locks` MCP tool
+ *  returns, so the human's chrome and the agents' reads can never disagree.
+ *
+ *  Never throws, because this rides the group panel's ten-call `Promise.all`
+ *  and one rejection there costs every other field on the panel. But a
+ *  rejection is WARNED, not swallowed: an empty list is how "this repo
+ *  declares no resources" is spelled, so without the warning a command that
+ *  fell out of a permission set — exactly what a rebase drops — would make the
+ *  whole feature silently cease to exist, indistinguishable from never having
+ *  been configured. (rev-lead, PR #859 finding 9.) */
+export const lockState = (groupId: string): Promise<LockState> =>
+  invoke<LockState>("orch_lock_state", { groupId }).catch((err) => {
+    console.warn("orch_lock_state failed — lock chrome hidden, which is NOT the same as no resources declared:", err);
+    return { now_ms: Date.now(), resources: [] };
+  });
+
 // ---------- group lifecycle: summary + end-orchestration (#8) ----------
 
 /** One live agent in a group lifecycle summary. */

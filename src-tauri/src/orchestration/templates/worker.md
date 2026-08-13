@@ -61,7 +61,7 @@ of done**). Read them before you act, not instead of.
   and goes to the sender only, never another receiver. A peer may be **receive-only**
   (`channel_status` shows `can_send: false` for it) — it will never reply, by design.
 - `note_directive(text, replace?)` — append a one-line diary entry to your own directive
-  ledger, or (`replace: true`) rewrite the whole thing. See **Directive ledger** below.
+  ledger, or (`replace: true`) rewrite the whole thing. See **Directive ledger** below.{{LOCKS}}
 
 Report meaningfully but sparingly: on start (`progress`, one line restating the task),
 when blocked (the one fact that changes what the orchestrator does next), and when done

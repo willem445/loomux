@@ -143,7 +143,7 @@ memory of it — is the contract.
   sender messages them, and only to the sender). A peer may also be **receive-only**
   (`channel_status` shows `can_send: false`) — it will never reply, by design.
 - `note_directive(text, replace?)` — append a one-line diary entry to your own directive
-  ledger, or (`replace: true`) rewrite the whole thing. See **Durability rules**.
+  ledger, or (`replace: true`) rewrite the whole thing. See **Durability rules**.{{LOCKS_ORCH}}
 - `queue_orphans()` — deliveries nobody ever received, in two lists: `orphans` (a loomux
   restart caught them queued, and they could not be re-bound to a live pane) and `refused`
   (declined at the front door because the target pane's queue was already full). Lost work,

@@ -4362,14 +4362,14 @@ const LIVE: [(&str, &str, &[&str]); 4] = [
     (
         "orchestrator.md",
         loomux_lib::orchestration::ORCHESTRATOR_TPL,
-        &["{{WORKFLOW}}", "{{POST_MERGE_WORKFLOW_HOOK}}", "{{MERGE_QUEUE}}"],
+        &["{{WORKFLOW}}", "{{POST_MERGE_WORKFLOW_HOOK}}", "{{MERGE_QUEUE}}", "{{LOCKS_ORCH}}"],
     ),
     (
         "worker.md",
         loomux_lib::orchestration::WORKER_TPL,
-        &["{{BLOCK_NOTE}}{{ADVISOR_CONSULT_NOTE}}"],
+        &["{{BLOCK_NOTE}}{{ADVISOR_CONSULT_NOTE}}", "{{LOCKS}}"],
     ),
-    ("reviewer.md", loomux_lib::orchestration::REVIEWER_TPL, &["{{BLOCK_NOTE}}"]),
+    ("reviewer.md", loomux_lib::orchestration::REVIEWER_TPL, &["{{BLOCK_NOTE}}", "{{LOCKS}}"]),
     ("planner.md", loomux_lib::orchestration::PLANNER_TPL, &["{{BLOCK_NOTE}}"]),
 ];
 
@@ -6916,4 +6916,122 @@ fn a_group_json_predating_the_knobs_loads_with_none() {
     let deep = resolved.block("deep").unwrap();
     assert_eq!(deep.effort, "max", "a knob the resolved cli CAN honor survives the load");
     assert_eq!(deep.context, "", "a knob outside the vocabulary is dropped, not carried to argv");
+}
+
+// ───────── #858: the `resources:` block (named lock resources) ─────────
+//
+// What a repo declares as scarce, and what it may not declare. The engine is
+// `orchestration::locks`; this file only ever pins what the FILE means, which
+// is the half a repo author can get wrong.
+
+#[test]
+fn an_absent_resources_block_means_no_locks_at_all() {
+    // The reversal mechanism and the "byte-for-byte unchanged" claim in one:
+    // no block, no resources — and `mcp::tool_defs` keys the whole lock tool
+    // surface off exactly this emptiness.
+    let wf = workflow::parse_workflow("version: 1\nblocks:\n  - id: worker\n    kind: worker\n")
+        .unwrap();
+    assert!(wf.resources.is_empty());
+}
+
+#[test]
+fn a_declared_resource_fills_in_the_defaults_it_omits() {
+    // A repo that wants a mutex writes the name and nothing else — same shape
+    // as `intake:`'s per-label fallback and `merge_queue:`'s.
+    let wf = workflow::parse_workflow(
+        "version: 1\nblocks:\n  - id: worker\n    kind: worker\nresources:\n  build: {}\n",
+    )
+    .unwrap();
+    let p = wf.resources.get("build").expect("declared");
+    assert_eq!(p.slots, workflow::RESOURCE_SLOTS_DEFAULT);
+    assert_eq!(*p, workflow::ResourcePolicy::default());
+    assert_eq!(p.slots, 1, "the useful default is a mutex; a semaphore is opt-in");
+    assert_eq!(p.max_hold_minutes, workflow::RESOURCE_MAX_HOLD_MINUTES_DEFAULT);
+
+    let wf = workflow::parse_workflow(
+        "version: 1\nblocks:\n  - id: worker\n    kind: worker\n\
+         resources:\n  build:\n    slots: 1\n    max_hold_minutes: 45\n  gpu:\n    slots: 2\n",
+    )
+    .unwrap();
+    assert_eq!(wf.resources["build"].max_hold_minutes, 45);
+    assert_eq!(wf.resources["gpu"].slots, 2);
+    assert_eq!(
+        wf.resources["gpu"].max_hold_minutes,
+        workflow::RESOURCE_MAX_HOLD_MINUTES_DEFAULT,
+        "one resource's explicit policy does not become another's"
+    );
+}
+
+/// Every bad number is a hard ERROR, never a silent substitution — the
+/// `merge_queue.max_batch` posture. A repo that wrote `slots: 0` believes its
+/// builds are serialized; quietly handing it the default would leave that
+/// belief in place while the behaviour changed underneath it.
+#[test]
+fn an_unusable_resource_policy_is_refused_rather_than_defaulted() {
+    let cases: [(&str, &str, &str); 4] = [
+        ("slots: 0", "resources.build.slots", "at least 1"),
+        ("slots: 65", "resources.build.slots", "maximum of 64"),
+        ("max_hold_minutes: 0", "resources.build.max_hold_minutes", "at least 1"),
+        ("max_hold_minutes: 481", "resources.build.max_hold_minutes", "maximum of 480"),
+    ];
+    for (line, key, phrase) in cases {
+        let errs = workflow::parse_workflow(&format!(
+            "version: 1\nblocks:\n  - id: worker\n    kind: worker\nresources:\n  build:\n    {line}\n"
+        ))
+        .unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains(key) && e.contains(phrase)),
+            "{line} must be refused naming {key}/{phrase}, got {errs:?}"
+        );
+    }
+}
+
+/// A name is REJECTED, never rewritten — the `blocks[].id` rule. An author who
+/// wrote `heavy build` must not end up with a resource called `heavybuild`
+/// that the `acquire_lock` call in their own worker brief cannot name.
+#[test]
+fn a_resource_name_outside_the_identifier_alphabet_is_rejected_not_sanitized() {
+    let errs = workflow::parse_workflow(
+        "version: 1\nblocks:\n  - id: worker\n    kind: worker\nresources:\n  \"heavy build\": {}\n",
+    )
+    .unwrap_err();
+    assert!(
+        errs.iter().any(|e| e.contains("heavy build") && e.contains("not allowed")),
+        "{errs:?}"
+    );
+
+    let errs = workflow::parse_workflow(
+        "version: 1\nblocks:\n  - id: worker\n    kind: worker\nresources:\n  \"!!\": {}\n",
+    )
+    .unwrap_err();
+    assert!(errs.iter().any(|e| e.contains("no usable characters")), "{errs:?}");
+}
+
+/// `deny_unknown_fields` on `RawResource`: a repo cannot smuggle a key this
+/// build does not understand past the parse. Policy fails LOUD — the same
+/// asymmetry `merge_queue:` states against machine-authored state.
+#[test]
+fn an_unknown_key_inside_a_resource_fails_the_whole_parse() {
+    let errs = workflow::parse_workflow(
+        "version: 1\nblocks:\n  - id: worker\n    kind: worker\n\
+         resources:\n  build:\n    slots: 1\n    exclusive_to: orchestrator\n",
+    )
+    .unwrap_err();
+    assert!(errs.iter().any(|e| e.contains("exclusive_to")), "{errs:?}");
+}
+
+/// The cap on how many resources one repo may declare — every name is folded
+/// into the `acquire_lock` description that every agent in the group reads, so
+/// this bounds a per-agent context cost.
+#[test]
+fn more_resources_than_the_cap_are_refused() {
+    let mut body = String::from("version: 1\nblocks:\n  - id: worker\n    kind: worker\nresources:\n");
+    for i in 0..=workflow::RESOURCES_MAX {
+        body.push_str(&format!("  r{i}: {{}}\n"));
+    }
+    let errs = workflow::parse_workflow(&body).unwrap_err();
+    assert!(
+        errs.iter().any(|e| e.contains("resources:") && e.contains("at most")),
+        "{errs:?}"
+    );
 }

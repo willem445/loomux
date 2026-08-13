@@ -220,3 +220,97 @@ test("pause-race-nudge reads as a race the admission caught", () => {
   assert.match(s, /5690/);
   assert.match(s, /42/, "and the delivery id, so it joins to delivery-queued");
 });
+
+// #858: the lock lifecycle. Every one of these would fall to the raw-JSON
+// default arm without a case, and the audit log is where "why did that build
+// take 40 minutes" gets answered after the fact — a JSON blob per line is not
+// an answer a human reads.
+test("the lock lifecycle reads as sentences, not as detail JSON", () => {
+  const taken = summarize(entry("lock-acquire", { resource: "build", note: "cargo test" }));
+  assert.match(taken, /took 'build'/);
+  assert.match(taken, /cargo test/, "the holder's own note is what makes a long hold legible");
+
+  assert.match(
+    summarize(entry("lock-queued", { resource: "build", position: 2 })),
+    /queued for 'build' at position 2/
+  );
+  assert.match(summarize(entry("lock-release", { resource: "build" })), /released 'build'/);
+
+  // loomux's own lines name the AGENT: the actor column reads "loomux", so the
+  // whole point of these is which agent lost or gained a slot.
+  const granted = summarize(
+    entry("lock-grant", { resource: "build", agent: "w-4", waited_ms: 5 * 60_000 }, "loomux")
+  );
+  assert.match(granted, /'build' → w-4/);
+  assert.match(granted, /waited 5 min/);
+
+  const expired = summarize(
+    entry("lock-expired", { resource: "build", agent: "w-3", held_ms: 45 * 60_000 }, "loomux")
+  );
+  assert.match(expired, /reclaimed from w-3/);
+  assert.match(expired, /held 45 min/);
+  assert.match(expired, /past its max hold/, "an overrun must not read like a crash");
+
+  const dead = summarize(
+    entry("lock-reclaim", { resource: "build", agent: "w-3", held_ms: 60_000, why: "agent-gone" }, "loomux")
+  );
+  assert.match(dead, /its pane is gone/, "…and a crash must not read like an overrun");
+
+  assert.match(
+    summarize(entry("lock-wait-timeout", { resource: "build", agent: "w-5", waited_ms: 60 * 60_000 }, "loomux")),
+    /w-5 gave up waiting for 'build' after 60 min/
+  );
+});
+
+test("a lock duration rounds up, so a short hold never reads as zero", () => {
+  const s = summarize(entry("lock-expired", { resource: "b", agent: "w-1", held_ms: 40_000 }, "loomux"));
+  assert.match(s, /held 1 min/, "0 min would read as a bug in the mechanism, not a short hold");
+});
+
+test("a truncated lock record degrades to '?', never to NaN", () => {
+  const s = summarize(entry("lock-grant", { resource: "build", agent: "w-4" }, "loomux"));
+  assert.match(s, /waited \? min/);
+});
+
+// #859 finding 10(c): the five arms the first cut added without asserting.
+// Each would have fallen through to the raw-JSON default unnoticed if its
+// label were misspelled — and the audit log is where a human reconstructs a
+// contention after the fact, so a JSON blob per line is not an answer.
+test("the idempotent and withdrawal lock actions read as sentences too", () => {
+  assert.match(
+    summarize(entry("lock-acquire-repeat", { resource: "build" })),
+    /already held 'build' \(no change\)/
+  );
+  assert.match(
+    summarize(entry("lock-queued-repeat", { resource: "build", position: 3 })),
+    /already queued for 'build' at position 3/
+  );
+  assert.match(
+    summarize(entry("lock-queue-cancel", { resource: "build", position: 2 })),
+    /withdrew from the 'build' queue \(was position 2\)/
+  );
+  assert.match(
+    summarize(entry("lock-wait-cleanup", { resource: "build", agent: "w-7", why: "agent-gone" }, "loomux")),
+    /w-7 left the 'build' queue — its pane is gone/
+  );
+  assert.match(
+    summarize(entry("lock-undeclared", { resource: "build", holders: ["w-1"], queued: [] }, "loomux")),
+    /'build' is no longer declared in \.loomux\/workflow\.yml/
+  );
+});
+
+test("every lock action has its own case — none falls through to raw JSON", () => {
+  // The default arm dumps compact detail JSON, so a misspelled label is silent.
+  // This is the cheap tripwire for that: a rendered sentence never starts with
+  // the `{` the fallback would produce.
+  const actions = [
+    "lock-acquire", "lock-acquire-repeat", "lock-queued", "lock-queued-repeat",
+    "lock-release", "lock-queue-cancel", "lock-grant", "lock-expired",
+    "lock-reclaim", "lock-wait-timeout", "lock-wait-cleanup", "lock-undeclared",
+  ];
+  for (const action of actions) {
+    const s = summarize(entry(action, { resource: "build", agent: "w-1", position: 1, held_ms: 60_000, waited_ms: 60_000 }, "loomux"));
+    assert.ok(s.length > 0, `${action} rendered nothing`);
+    assert.ok(!s.startsWith("{"), `${action} fell through to the raw-JSON default: ${s}`);
+  }
+});

@@ -16,6 +16,7 @@ import {
   groupSummary,
   groupUsage,
   groupWatches,
+  lockState,
   notifyEnabled,
   pauseGroup,
   resumeGroup,
@@ -39,10 +40,12 @@ import {
   type GroupSummary,
   type GroupUsage,
   type GroupWatch,
+  type LockState,
   type MergeQueueStatus,
   type WorkflowStatus,
 } from "./orchestration";
 import { watchLine } from "./watchline";
+import { lockRows, lockSummary } from "./locklines";
 import {
   approvalControl,
   autoMergeFromApproval,
@@ -195,6 +198,12 @@ export class GroupView {
   private mqEntriesEl: HTMLElement;
   private mqNoteEl: HTMLElement;
   private mergeQueueStatus: MergeQueueStatus | null = null;
+  /** Lock-resource chrome (#858). A group whose repo declares no `resources:`
+   *  reads as an empty list and the whole row stays hidden. */
+  private lockRow: HTMLElement;
+  private lockLineEl: HTMLElement;
+  private lockEntriesEl: HTMLElement;
+  private locks: LockState | null = null;
   /** #260: toggles whether newly spawned worker/reviewer/planner panes open
    *  docked to the minimize tray (the default) or expanded into the split
    *  tree (the pre-#260 behavior) — backend-persisted per group. */
@@ -219,7 +228,7 @@ export class GroupView {
   private pollTimer: number | undefined;
   /** Window-visibility gate around that timer (#743 S6, pollgate.ts). Component
    *  scope (`show()`/`hide()`) and window visibility are different questions:
-   *  this panel was already scoped and still polled nine invokes every 2 s
+   *  this panel was already scoped and still polled ten invokes every 2 s
    *  behind a minimized window. */
   private pollGate: PollGate = new PollGate({
     arm: () => {
@@ -343,6 +352,16 @@ export class GroupView {
     this.mqNoteEl = el("div", "group-mq-note");
     this.mqNoteEl.hidden = true;
     this.mqRow.append(this.mqLineEl, this.mqEntriesEl, this.mqNoteEl);
+
+    // Lock-resource row (#858): which declared resource is held by whom, and
+    // how deep its queue is. Chrome inside the same floating overlay — no PTY
+    // resize on this path either (constraint 1), and `minChromeHeight()`
+    // measures it like every other row.
+    this.lockRow = el("div", "group-lock-row");
+    this.lockRow.hidden = true;
+    this.lockLineEl = el("span", "group-lock-line");
+    this.lockEntriesEl = el("div", "group-lock-entries");
+    this.lockRow.append(this.lockLineEl, this.lockEntriesEl);
 
     this.listEl = el("div", "group-list");
 
@@ -602,6 +621,7 @@ export class GroupView {
       maxRow,
       this.workflowRow,
       this.mqRow,
+      this.lockRow,
       autoRow,
       releaseRow,
       this.listEl,
@@ -677,6 +697,7 @@ export class GroupView {
         this.watches,
         this.workflow,
         this.mergeQueueStatus,
+        this.locks,
       ] = await Promise.all([
         groupSummary(this.groupId),
         groupUsage(this.groupId),
@@ -687,6 +708,7 @@ export class GroupView {
         groupWatches(this.groupId),
         workflowStatus(this.groupId),
         mergeQueue(this.groupId),
+        lockState(this.groupId),
       ]);
     } catch (err) {
       this.toast(String(err));
@@ -1171,6 +1193,7 @@ export class GroupView {
     this.renderAutonomy();
     this.renderWorkflow();
     this.renderMergeQueue();
+    this.renderLocks();
 
     // Content height may have changed (roster size, suspended banner) — let the
     // host re-clamp the overlay so no control is pushed under overflow:hidden.
@@ -1206,6 +1229,35 @@ export class GroupView {
     this.workflowToggleBtn.title = w.advanced
       ? "Turn off workflow mode — clears the merge gate and returns future spawns to the built-in roster"
       : "Turn on workflow mode — arms this repo's declared merge gate and swaps future spawns to its roster";
+  }
+
+  /** The lock-resource section (#858). Hidden entirely for a repo that
+   *  declares no `resources:` — the feature is invisible where it was never
+   *  asked for, matching the tool surface the agents get.
+   *
+   *  Note the deliberate contrast with `renderMergeQueue` below, which renders
+   *  LOUD rather than hiding when it cannot read its state: an unreadable
+   *  merge queue is a thing a human is about to make a merge decision on, and
+   *  an absent one is the product default. Here "no resources declared" IS the
+   *  product default and is the only state that hides the row; a read that
+   *  actually failed is reported by `lockState`'s own warning rather than
+   *  disguised as an empty list. */
+  private renderLocks(): void {
+    const resources = this.locks?.resources ?? [];
+    const summary = lockSummary(resources);
+    this.lockRow.hidden = summary === "";
+    if (summary === "") return;
+    // The backend stamps the clock it read its own state at, so a slow poll
+    // shows the ages that payload described rather than ages measured against
+    // a newer local clock.
+    const now = this.locks?.now_ms ?? Date.now();
+    this.lockLineEl.textContent = summary;
+    this.lockEntriesEl.replaceChildren();
+    for (const row of lockRows(resources, now)) {
+      const line = el("div", `group-lock-entry ${row.tone}`, row.text);
+      line.title = row.detail;
+      this.lockEntriesEl.append(line);
+    }
   }
 
   /** Merge-queue chrome (#581 slice F) — read-only, and every string comes

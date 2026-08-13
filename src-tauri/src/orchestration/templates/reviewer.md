@@ -53,7 +53,7 @@ Everything below is the detail — including **Never block a turn on CI** and th
   join a channel yourself. Channels are directional — if you're a **receiver**, `channel_send`
   only works once the **sender** has messaged you, and goes to the sender only.
 - `note_directive(text, replace?)` — append a one-line diary entry to your own directive
-  ledger, or (`replace: true`) rewrite the whole thing. See **Directive ledger** below.
+  ledger, or (`replace: true`) rewrite the whole thing. See **Directive ledger** below.{{LOCKS}}
 
 ## Directive ledger
 

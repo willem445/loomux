@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-orch-lock-state"
+description = "Enables the orch_lock_state command without any pre-configured scope."
+commands.allow = ["orch_lock_state"]
+
+[[permission]]
+identifier = "deny-orch-lock-state"
+description = "Denies the orch_lock_state command without any pre-configured scope."
+commands.deny = ["orch_lock_state"]
