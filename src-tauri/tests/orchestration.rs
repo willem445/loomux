@@ -8082,6 +8082,70 @@ fn a_workflow_file_may_declare_opencode_blocks() {
     assert_eq!(wf.blocks.iter().filter(|b| b.cli == "opencode").count(), 3, "{wf:?}");
 }
 
+/// **The GUI cannot edit a field it has never heard of** (#880). `allow:` has
+/// been a `RawBlock` field since #222 and the workflow pane never grew a
+/// control for it — or even a name for it — so a workflow that declared one
+/// looked, in the pane, exactly like a workflow that didn't. Nothing was
+/// broken on either side; the two sides simply had no way to disagree out
+/// loud.
+///
+/// `src/workflow-schema.json` is the shared statement of the wire schema, and
+/// this is the engine's half of enforcing it: every section's field set, as
+/// serde actually defines it (`workflow::workflow_schema_keys()`, derived from
+/// the `Raw*` types rather than hand-listed), against the same section in the
+/// committed manifest. **Both directions are errors** — a field added to a
+/// `Raw*` struct with no manifest entry is a field the GUI will never offer,
+/// and a manifest entry with no `Raw*` field is a control that would write a
+/// key the engine rejects the whole file over (`deny_unknown_fields`).
+///
+/// The frontend's half of the same contract is `test/workflowschema.test.ts`
+/// (the pane's parser must know each field, and its serializer must emit it).
+/// Deliberately two tests and not one: they pin different sides, and a repo
+/// where only one is green is a repo where the pane and the engine disagree
+/// about what a workflow file is — which is exactly what a human then gets lied
+/// to about.
+#[test]
+fn the_workflow_schema_manifest_matches_the_engines_raw_types() {
+    // Relative to THIS file: src-tauri/tests/ -> repo root -> src/.
+    const MANIFEST: &str = include_str!("../../src/workflow-schema.json");
+    let manifest: Value = serde_json::from_str(MANIFEST).expect("the manifest must be valid JSON");
+    let sections = manifest["sections"].as_object().expect("manifest.sections must be a mapping");
+
+    let engine = workflow::workflow_schema_keys();
+    assert_eq!(
+        sections.keys().cloned().collect::<std::collections::BTreeSet<String>>(),
+        engine.keys().cloned().collect::<std::collections::BTreeSet<String>>(),
+        "the manifest and the engine must describe the same set of sections"
+    );
+
+    for (section, fields) in &engine {
+        let declared: std::collections::BTreeSet<String> = sections[section.as_str()]["fields"]
+            .as_array()
+            .unwrap_or_else(|| panic!("manifest section {section:?} needs a fields array"))
+            .iter()
+            .map(|f| {
+                f["name"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("every field in {section:?} needs a name"))
+                    .to_string()
+            })
+            .collect();
+        let actual: std::collections::BTreeSet<String> = fields.iter().cloned().collect();
+        assert_eq!(
+            declared, actual,
+            "section {section:?}: src/workflow-schema.json and the engine's Raw* types disagree. \
+             A field the engine accepts but the manifest omits is one no GUI control will ever \
+             be generated for; a field the manifest declares but the engine refuses is a control \
+             that writes a key `deny_unknown_fields` rejects the whole file over."
+        );
+        // A section with no fields would satisfy the equality above only if the
+        // engine's type were empty too — impossible for these, but say so, so a
+        // future refactor that hands back an empty map fails loudly instead of
+        // passing vacuously.
+        assert!(!actual.is_empty(), "section {section:?} must have fields");
+    }
+}
+
 /// **The delivery seam.** opencode names no config file on argv: its MCP
 /// server, its containment and its persona all ride environment variables set
 /// on the pane loomux spawns. So this goes through the real spawn site and

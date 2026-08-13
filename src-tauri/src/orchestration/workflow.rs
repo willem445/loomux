@@ -785,7 +785,7 @@ pub fn resolve_profile_path(repo: &str, rel: &str) -> Result<PathBuf, String> {
 // the failure mode every surveyed workflow tool has (Dify will happily publish
 // a workflow whose plugin node isn't installed).
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RawWorkflow {
     version: u32,
@@ -835,7 +835,7 @@ struct RawWorkflow {
     resources: BTreeMap<String, RawResource>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RawResource {
     /// `Option` rather than a defaulted number so "omitted" and "written as 1"
@@ -848,7 +848,7 @@ struct RawResource {
     max_hold_minutes: Option<u32>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RawMergeQueue {
     #[serde(default)]
@@ -862,7 +862,7 @@ struct RawMergeQueue {
     checks_timeout_minutes: Option<u32>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RawIntake {
     #[serde(default)]
@@ -871,7 +871,7 @@ struct RawIntake {
     labels: RawIntakeLabels,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Serialize, Default)]
 #[serde(deny_unknown_fields)]
 struct RawIntakeLabels {
     #[serde(default)]
@@ -884,7 +884,7 @@ struct RawIntakeLabels {
     prototype: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RawBlock {
     id: String,
@@ -909,14 +909,14 @@ struct RawBlock {
     context: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RawEdge {
     from: String,
     to: OneOrMany,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RawGate {
     #[serde(default)]
@@ -931,7 +931,7 @@ struct RawGate {
 
 /// `to: worker` and `to: [rev-a, rev-b]` are both legal — a fan-out reads
 /// naturally as a list and a single hand-off reads naturally as a scalar.
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(untagged)]
 enum OneOrMany {
     One(String),
@@ -945,6 +945,91 @@ impl OneOrMany {
             OneOrMany::Many(v) => v,
         }
     }
+}
+
+/// Every field name this schema accepts, per section, **derived from the types
+/// that do the accepting** (#880). Section names match `src/workflow-schema.json`.
+///
+/// The GUI's failure mode this exists to kill: `allow:` has been a real
+/// `RawBlock` field since #222 and the workflow pane never grew a control for
+/// it — nor even knew the key — so a workflow that declared it looked, in the
+/// pane, like a workflow that didn't. Nothing was wrong with either side; the
+/// two simply had no way to disagree out loud. Now they do:
+/// `tests/orchestration.rs` compares this against the committed manifest, so a
+/// field added here without an editor is a red test rather than a hole nobody
+/// finds until a human wonders where their line went.
+///
+/// **Serialized, not hand-listed**, deliberately: a hand-written list is
+/// exactly the thing that drifts, and it would drift *silently* in the one
+/// direction that matters (a new field, forgotten). serde already knows every
+/// field name — `deny_unknown_fields` is that same knowledge pointed the other
+/// way — so asking it is the only spelling of this that cannot go stale. There
+/// is no `skip_serializing_if` anywhere on these types, so every field appears
+/// whatever it is set to; the values below are maximal anyway, so a future
+/// `skip_serializing_if(Option::is_none)` cannot quietly hide one either.
+///
+/// `#[doc(hidden)]` and `pub` only because the pin lives in an integration test
+/// (CLAUDE.md constraint 4) and the `Raw*` types themselves stay private: this
+/// is a test seam, not API.
+#[doc(hidden)]
+pub fn workflow_schema_keys() -> BTreeMap<String, Vec<String>> {
+    fn keys_of<T: Serialize>(section: &str, v: &T) -> Vec<String> {
+        match serde_json::to_value(v) {
+            Ok(serde_json::Value::Object(map)) => map.keys().cloned().collect(),
+            other => panic!("{section}: expected a mapping, got {other:?}"),
+        }
+    }
+    let block = RawBlock {
+        id: "b".into(),
+        name: "B".into(),
+        kind: "worker".into(),
+        cli: "claude".into(),
+        model: "opus".into(),
+        prompt: Some("p".into()),
+        profile: Some(".github/agents/b.md".into()),
+        allow: vec!["Bash(gh pr view)".into()],
+        role_hint: Some("process".into()),
+        effort: "high".into(),
+        context: "1m".into(),
+    };
+    let edge = RawEdge { from: "a".into(), to: OneOrMany::One("b".into()) };
+    let gate = RawGate {
+        require: Some("all-pass".into()),
+        threshold: Some(1),
+        reviewers: vec!["rev".into()],
+        also: vec!["ci-green".into()],
+    };
+    let labels = RawIntakeLabels {
+        ready: "agent-ready".into(),
+        investigate: "agent-investigation".into(),
+        owned: "agent-managed".into(),
+        prototype: "agent-prototype".into(),
+    };
+    let intake = RawIntake { source: "github-labels".into(), labels: RawIntakeLabels::default() };
+    let merge_queue =
+        RawMergeQueue { enabled: true, max_batch: Some(3), checks_timeout_minutes: Some(60) };
+    let resource = RawResource { slots: Some(1), max_hold_minutes: Some(30) };
+    let workflow = RawWorkflow {
+        version: SCHEMA_VERSION,
+        name: "w".into(),
+        authored_with: "loomux".into(),
+        blocks: vec![],
+        edges: vec![],
+        gates: BTreeMap::new(),
+        intake: None,
+        merge_queue: None,
+        resources: BTreeMap::new(),
+    };
+    let mut out = BTreeMap::new();
+    out.insert("workflow".to_string(), keys_of("workflow", &workflow));
+    out.insert("block".to_string(), keys_of("block", &block));
+    out.insert("edge".to_string(), keys_of("edge", &edge));
+    out.insert("gate".to_string(), keys_of("gate", &gate));
+    out.insert("intake".to_string(), keys_of("intake", &intake));
+    out.insert("intake.labels".to_string(), keys_of("intake.labels", &labels));
+    out.insert("merge_queue".to_string(), keys_of("merge_queue", &merge_queue));
+    out.insert("resource".to_string(), keys_of("resource", &resource));
+    out
 }
 
 /// Map a `kind:` string onto a capability class. **`None` for anything
