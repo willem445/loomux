@@ -3931,7 +3931,18 @@ export class Pane implements VoiceTargetPane {
   tabPaneInfo(): TabPaneInfo {
     if (this.isWelcome) return { kind: "terminal", live: false };
     if (this.dormantRecord) {
-      return { kind: this.dormantRecord.paneKind === "orch" ? "orch" : "agent", live: false };
+      // A dormant placeholder reports the kind it stands in for, not "some
+      // pane". `orch` and `ssh` say so; everything else collapses to "agent",
+      // which is the historical bucket for a Start card.
+      //
+      // #887 S4 / PR #926 review NB1: an SSH placeholder used to land in that
+      // bucket too. Nothing counts it today (`live: false`, and `dormantOrch`
+      // keys off `"orch"`), but tabcounts.ts now DOCUMENTS that an ssh pane is
+      // neither an agent nor an orchestration member — a property the dormant
+      // path didn't have, and the first consumer to count dormant panes would
+      // have counted Reconnect cards as agents.
+      const kind = this.dormantRecord.paneKind;
+      return { kind: kind === "orch" || kind === "ssh" ? kind : "agent", live: false };
     }
     // A content pane has no PTY by design, so `live` can't be derived from one; it is
     // fully functional the moment it exists.

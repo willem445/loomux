@@ -826,10 +826,40 @@ test("the reconnect surfaces a cmd.exe-unquotable value as a throw, exactly as a
     () =>
       sshReconnectArgv(
         "ssh",
-        sshProfile({ defaultCli: "claude", remoteShell: "cmd", remoteCwd: "C:\srv\nrm -rf" }),
+        // `\\` is a real backslash and `\n` a real newline: a Windows-looking
+        // remote folder with a line break smuggled into it. (Review NB5: written
+        // as `"C:\srv\n…"` this was `C:srv` + a newline — the backslash silently
+        // dropped by JS's unknown-escape rule — so it read as covering a
+        // backslash case it never exercised.) The NEWLINE is what the refusal is
+        // about: `cmd.exe /C` reads only the first line and drops the rest.
+        sshProfile({ defaultCli: "claude", remoteShell: "cmd", remoteCwd: "C:\\srv\nrm -rf" }),
         null,
         MINT
       ),
     /newline/
+  );
+});
+
+test("the fresh ESCAPE (a recorded session that can never be resumed) forces a new remote session", () => {
+  // PR #926 review NB3. A remote conversation can be gone while the id naming it
+  // is still recorded here — deleted on the far host, a cleared `~/.claude`, a
+  // rebuilt box — and then `--resume` fails every single time, so plain Reconnect
+  // loops. The card's escape hatch is this exact call with the recorded id
+  // withheld: same profile, same connection settings, a brand-new session.
+  const recorded = "remote-sess-1";
+  const profile = sshProfile({ defaultCli: "claude", remoteCwd: "/srv/app" });
+  const escape = sshReconnectArgv("ssh", profile, null, MINT);
+  assert.equal(escape.mode, "fresh");
+  assert.equal(escape.sessionId, "minted-id", "a NEW id, so the new conversation is itself resumable");
+  const remote = escape.argv[escape.argv.length - 1];
+  assert.ok(!remote.includes(recorded), `the unresumable id must not come back: ${remote}`);
+  assert.match(remote, /'claude' '--session-id' 'minted-id'/);
+  // …and it is the SAME connection otherwise — the escape changes the session,
+  // never where or how the pane connects.
+  const normal = sshReconnectArgv("ssh", profile, recorded, MINT);
+  assert.deepEqual(
+    escape.argv.slice(0, -1),
+    normal.argv.slice(0, -1),
+    "everything before the remote command is identical"
   );
 });

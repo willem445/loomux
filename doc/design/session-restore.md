@@ -84,7 +84,6 @@ resumed autonomous orchestrator (#83) can idle-tick and spawn a worker storm
 | **File explorer** (`files`, #214) | Re-open the listing at its recorded root — or, if that folder is gone, **fail soft to the welcome form** in that slot with a toast | Pure content: no process, no session, no credits, nothing to resume. The only thing that can rot under it is the *folder*, so the root is re-probed (`ftRootIsDir`) before the pane is built. Keyed on kind like the orch rule: a stray `sessionId` on a files leaf must never send it down an agent path. |
 | **File editor** (`editor`, #217) | Re-open the editor at its recorded root, **re-opening the file it was showing** (`file`, a root-relative path — read fresh from disk); same `ftRootIsDir` probe, same fail-soft | Same reasoning, plus one wrinkle: a pane opened from the file browser is *titled after its file*, so restoring a bare tree under that title would name a file the pane isn't showing. What is **not** restored is the BUFFER. Persisting unsaved text would make the layout file a second, silent copy of the user's work — the close guards are what ensure they were *asked* before it could be lost, and a snapshot that quietly preserves it undermines exactly that. A file deleted since just fails to open (a toast); the pane still comes back, rooted. |
 | **Git** (`git`, #217) | Re-open the git view over its recorded repo — probed with **`gitRepoRoot`**, not `ftRootIsDir`. A probe that *throws* (git not on `PATH`, unreadable path) keeps the pane; only git's own "not a repo" fails soft | A folder can still exist and no longer be a work tree (a pruned worktree, a deleted `.git`, a repo restored from backup as plain files), and a git pane over a non-repo can only tell you it isn't one. But a git that cannot be RUN is a fact about the environment, not the repo: failing soft on it would swap every git pane for a welcome form *and* drop the recorded path from the next save — losing it for good over a transient hiccup. Also **not** restored: the selected worktree and the read-only unlock (#208) — a restored pane opens on the primary, locked, like a fresh one. An unlock that survived a restart is the one piece of this pane's state that could quietly cost you something. |
-
 | **SSH** (`ssh`, #887 S4) | **Dormant** with a **Reconnect** button. Nothing connects until it is clicked, and the click rebuilds the command from the **saved profile**, resuming the recorded remote session when the profile still names a CLI loomux mints ids for | Two independent reasons, neither of which applies to a local shell. The CLI on the far end is an agent on *someone else's machine*, so an automatic reconnect spends **remote** credits with no human present — the orch-pane argument, one host removed. And a host that is down, asleep, or behind a VPN that isn't up yet would put a TCP connect (which may not fail for a minute) on the **boot path**. See the section below for what the leaf records and why it is not a command line. |
 
 None of the content kinds needed a **schema change**: each one's root rides in the
@@ -193,6 +192,20 @@ orchestration embed, and the placeholder record `main.ts` builds pins all three 
 ordinary dormant SSH card; `test/panerestore.test.ts` pins that, and goes red if a
 future edit copies the adjacent `dormant-group` arm's shape.
 
+**A resume that can never succeed has an escape.** The remote conversation lives
+on a machine loomux cannot see, so it can be gone (deleted on the far host, a
+cleared `~/.claude`, a rebuilt box) while the id naming it is still recorded here
+— and then `claude --resume <id>` fails every time and plain Reconnect loops. The
+card carries a second, quiet **Reconnect fresh** action whenever a session was
+recorded: the same connection, a new remote session. Deliberately *not* the local
+#194 BUG-1 machinery, which cannot serve here — that backstop triggers on a resume
+the frontend itself launched and can rewrite, whereas the failing `--resume` is a
+token inside a remote command string on a host we cannot inspect (a non-zero exit
+from `ssh` says only "something over there ended", never which). It is also
+deliberately a human's choice rather than an automatic downgrade: silently
+starting a new conversation would abandon one that might just be behind a host
+still booting.
+
 **A disconnect keeps the pane.** `keepOpenOnExit` gained an `isSshPane` input, and
 that is a fix as much as a feature: an SSH pane spawns through the *argv* path, so
 `launchedCommand` is false for it and the crash rule would have closed the pane
@@ -204,6 +217,29 @@ output is precisely what the human is deciding on; it is absolutely-positioned
 chrome, so nothing resizes the terminal or the ConPTY (CLAUDE.md constraint 1).
 Auto-reconnect was rejected outright: a surprise reconnect re-enters a remote TUI
 in a state nobody has looked at.
+
+**What a reconnect that fails AT SPAWN costs, stated rather than traded quietly.**
+Both relaunch paths tear the card down and (on the disconnect path)
+`term.reset()` *before* the spawn, so a spawn that then throws has already
+discarded the scrollback the card exists to sit over. The reset ordering is not
+this feature's to change: it is #720's, and deferring it until after a successful
+spawn would paint the dead session's tail over the new one's first bytes, because
+`reset()` clears synchronously while `term.write` parses asynchronously. What the
+failure *does* get back is a surface: the launch callback re-mounts a Reconnect
+card carrying the error, so the pane keeps a persistent reason and a one-click
+retry instead of an empty pane and a transient toast. The residual — a lost
+scrollback on a failed reconnect — is accepted, and the window is narrow (the ssh
+client is re-probed moments earlier; a host that is merely down fails seconds
+later, with the spawn long since succeeded).
+
+**Reaping a spawn that dies too early.** Both reconnect paths call
+`reapIfExited` after the relaunch, exactly as the fresh SSH launch always has. An
+`ssh` that exits before the frontend has finished wiring the pane parks its exit
+in `earlyExits`, keyed by a pty id no pane claims yet; nothing else would ever
+drain it, and the pane would sit looking alive over a dead PTY — no banner, no
+card, keystrokes into nothing. This is the one feature whose *expected* case is a
+connection that fails, so the reap is not left to the convention that every other
+dormant-card click path in `main.ts` still follows.
 
 ### #439 fix — a standalone agent's solo channel identity must be RE-MINTED, never replayed
 

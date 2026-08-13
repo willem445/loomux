@@ -824,6 +824,38 @@ async function openActionPane(
         embeds: [],
       };
       let pane: Pane;
+      /** One reconnect attempt. `useRecordedSession: false` forces the fresh
+       *  path — the "Reconnect fresh" escape (review NB3), for a remote
+       *  conversation that is gone and so can never be resumed. */
+      const attempt = (useRecordedSession: boolean): Promise<RestoreCardResult> =>
+        reconnectSshPane(
+          a.profileId,
+          useRecordedSession ? a.sessionId : null,
+          async (argv, sessionId, profileId) => {
+            try {
+              await pane.startFromDormant({
+                name: a.name,
+                argv,
+                sessionId: sessionId ?? undefined,
+                ssh: { profileId },
+              });
+            } catch (err) {
+              // Review NB4, the dormant half: `startFromDormant` has already
+              // torn the placeholder down by the time this lands, so put a
+              // floating card back — the pane keeps a persistent reason and a
+              // retry instead of turning into an empty pane with a toast.
+              // (`opts.ssh` is applied at the top of `Pane.start`, before the
+              // spawn that threw, so the pane is still recognizably an SSH one.)
+              mountSshReconnectCard(ws, pane, String(err));
+              throw err;
+            }
+            onGridChanged();
+            // Review NB2: drain a spawn that died before the frontend finished
+            // wiring this pane — otherwise its exit sits unclaimed in
+            // `earlyExits` and the pane looks alive over a dead PTY.
+            reapIfExited(ws, pane);
+          }
+        );
       const content = dormantCard({
         action: "Reconnect",
         pendingLabel: "Connecting…",
@@ -835,17 +867,9 @@ async function openActionPane(
         // already-know-it-has-nothing case the dormant-agent card uses `initial`
         // for.
         initial: a.profileId ? undefined : errorRestoreCardState(SSH_PROFILE_GONE),
-        onClick: () =>
-          reconnectSshPane(a.profileId, a.sessionId, async (argv, sessionId, profileId) => {
-            await pane.startFromDormant({
-              name: a.name,
-              argv,
-              sessionId: sessionId ?? undefined,
-              ssh: { profileId },
-            });
-            onGridChanged();
-          }),
+        onClick: () => attempt(true),
       });
+      addSshFreshEscape(content, a.sessionId, () => attempt(false));
       pane = ws.grid.openDormantPane(events, record, content, dir, anchor);
       return pane;
     }
@@ -1810,7 +1834,7 @@ function closeOrKeep(ws: Workspace, pane: Pane, exit: PtyExit, keep: KeepOpenRea
   if (keep) {
     pane.notifyExited(exit.exit_code, keep);
     onGridChanged(); // a kept-open pane is now dead → drop it from the live count
-    offerSshReconnect(pane, keep);
+    offerSshReconnect(ws, pane, keep);
   } else ws.grid.closePane(pane, false);
 }
 
@@ -1828,21 +1852,36 @@ function closeOrKeep(ws: Workspace, pane: Pane, exit: PtyExit, keep: KeepOpenRea
  *  a remote TUI in a state nobody looked at, and the pane underneath is where
  *  the evidence of what happened is. The card floats over that terminal rather
  *  than replacing it, so the human reads the reason and then decides. */
-function offerSshReconnect(pane: Pane, keep: KeepOpenReason): void {
+function offerSshReconnect(ws: Workspace, pane: Pane, keep: KeepOpenReason): void {
   if (!pane.isSshPane || keep !== "output") return;
+  mountSshReconnectCard(ws, pane);
+}
+
+/** Build and mount the floating Reconnect card. Split from the gate above so a
+ *  reconnect that FAILS AT SPAWN can put one back (PR #926 review NB4): both
+ *  relaunch paths tear their card down before spawning, so without this a failed
+ *  reconnect would leave the pane with no card at all and its only diagnosis in a
+ *  transient toast — on the one feature whose expected case is a connection that
+ *  fails. `initialError` is that failure, mounted straight into the card's error
+ *  state so the reason is persistent and the retry is one click.
+ *
+ *  What this does NOT recover is the scrollback: `respawnFresh` resets the
+ *  terminal before it spawns, and that ordering is deliberate and shared (#720 —
+ *  a reset deferred until after a successful spawn would paint the dead session's
+ *  tail over the new one's first bytes, because `reset()` clears synchronously
+ *  while `term.write` parses asynchronously). Stated rather than quietly traded:
+ *  see the design note. */
+function mountSshReconnectCard(ws: Workspace, pane: Pane, initialError?: string): void {
   const profileId = pane.sshProfile;
-  const sessionId = pane.sessionId;
+  const recordedSessionId = pane.sessionId;
   // Assigned by the mount below; the click that reads it cannot happen before
   // the card is on screen.
   let dismiss: () => void = () => {};
-  const card = dormantCard({
-    action: "Reconnect",
-    pendingLabel: "Connecting…",
-    errorTitle: "Couldn't reconnect",
-    title: pane.name,
-    body: "The SSH connection closed. Reconnect opens it again, resuming the remote session when one was recorded.",
-    onClick: () =>
-      reconnectSshPane(profileId, sessionId, async (argv, sessionId, profileId) => {
+  /** One reconnect attempt, in place. `sessionId` null forces the fresh path —
+   *  that is the whole of the "Reconnect fresh" escape below. */
+  const attempt = (useRecordedSession: boolean): Promise<RestoreCardResult> =>
+    reconnectSshPane(profileId, useRecordedSession ? recordedSessionId : null, async (argv, sessionId, profileId) => {
+      try {
         // In place, in the same pane: `respawnFresh` wipes the dead session's
         // output, clears this very card, and starts the new ssh client on the
         // terminal that is already mounted.
@@ -1852,26 +1891,105 @@ function offerSshReconnect(pane: Pane, keep: KeepOpenReason): void {
           sessionId: sessionId ?? undefined,
           ssh: { profileId },
         });
-        onGridChanged();
-      }),
+      } catch (err) {
+        // NB4: the card this click came from is already detached. Put a fresh
+        // one back, carrying the reason, so the failure has a persistent home
+        // and a retry. (The detached card's own toast fallback also fires — a
+        // duplicate notice on a rare path, which beats no persistent surface.)
+        mountSshReconnectCard(ws, pane, String(err));
+        throw err;
+      }
+      onGridChanged();
+      // NB2: an ssh client that died before the frontend finished wiring the
+      // pane parks its exit in `earlyExits`, where nothing else would ever drain
+      // it — leaving a pane that looks alive over a dead PTY. The fresh launch
+      // path (`handleWelcomeSubmit`) has always reaped here; both reconnect
+      // paths now do too.
+      reapIfExited(ws, pane);
+    });
+  const card = dormantCard({
+    action: "Reconnect",
+    pendingLabel: "Connecting…",
+    errorTitle: "Couldn't reconnect",
+    title: pane.name,
+    body: "The SSH connection closed. Reconnect opens it again, resuming the remote session when one was recorded.",
+    initial: initialError ? errorRestoreCardState(initialError) : undefined,
+    onClick: () => attempt(true),
   });
+  addSshFreshEscape(card, recordedSessionId, () => attempt(false));
   // A pane the human would rather just read (or close) shouldn't have to keep a
   // card over it. Dismiss removes the OFFER, not the pane — the scrollback,
   // which is the thing worth keeping, is untouched either way, and closing the
   // pane stays Ctrl+Shift+W exactly as the exit banner says.
-  //
-  // Built here rather than through `addDormantCardAction`: that helper is the
-  // #440 "we found your last session" button and carries its green
-  // recommended-action accent, which would make DISMISS read as the thing to
-  // click. A quiet variant, next to the primary Reconnect.
-  const dismissBtn = document.createElement("button");
-  dismissBtn.className = "dormant-btn dormant-btn-quiet";
-  dismissBtn.type = "button";
-  dismissBtn.textContent = "Dismiss";
-  dismissBtn.title = "Hide this offer — the pane and its output stay";
+  const dismissBtn = quietCardButton("Dismiss", "Hide this offer — the pane and its output stay");
   dismissBtn.addEventListener("click", () => dismiss());
   card.appendChild(dismissBtn);
   dismiss = pane.showReconnectCard(card);
+}
+
+/** A secondary card button that is NOT a recommendation. `addDormantCardAction`
+ *  is the #440 "we found your last session" button and carries its green
+ *  recommended-action accent; Dismiss and "Reconnect fresh" both sit beside a
+ *  primary Reconnect that IS the recommended click, so they get a quiet tone
+ *  instead of competing with it. */
+function quietCardButton(label: string, tooltip: string): HTMLButtonElement {
+  const btn = document.createElement("button");
+  btn.className = "dormant-btn dormant-btn-quiet";
+  btn.type = "button";
+  btn.textContent = label;
+  btn.title = tooltip;
+  return btn;
+}
+
+/** Append the "Reconnect fresh" escape to an SSH reconnect card (PR #926 review
+ *  NB3) — the way out of a resume that can never succeed.
+ *
+ *  A remote conversation can be gone while the id that names it is still
+ *  recorded here: deleted on the far host, a cleared `~/.claude`, a rebuilt box.
+ *  `claude --resume <id>` then exits non-zero every time, so plain Reconnect
+ *  loops — the pane dies, the card comes back, the human clicks it again. Locally
+ *  this exact failure earned its own machinery (#194 BUG-1's one-shot
+ *  fresh-respawn backstop), which cannot serve here: it triggers on a resume the
+ *  frontend itself launched and can rewrite, whereas the failing `--resume` is a
+ *  token inside a remote command string on a host loomux cannot inspect. A human
+ *  choosing "fresh" is the honest equivalent, and it stays a CHOICE — an
+ *  automatic downgrade to a new session would silently abandon a conversation
+ *  that might just be behind a host still booting.
+ *
+ *  Only offered when a session was actually recorded: without one the primary
+ *  Reconnect is already a fresh connect, and a second button doing the same
+ *  thing would be noise. Its own click is not routed through the card's state
+ *  machine (that machine drives the PRIMARY action) — same contract the #440
+ *  secondary button has — so it reports its own failure by toast and re-enables
+ *  itself for a retry. */
+function addSshFreshEscape(
+  card: HTMLElement,
+  recordedSessionId: string | null,
+  start: () => Promise<RestoreCardResult>
+): void {
+  if (!recordedSessionId) return;
+  const btn = quietCardButton(
+    "Reconnect fresh",
+    "Start a NEW remote session instead of resuming the recorded one — use this when the remote " +
+      "conversation is gone (deleted on the far host), which makes every resume fail"
+  );
+  btn.addEventListener("click", () => {
+    btn.disabled = true;
+    void Promise.resolve()
+      .then(start)
+      .then(
+        (result) => {
+          if (result.ok) return; // the pane is live again; this card is gone with it
+          showToast(`Couldn't reconnect: ${result.message}`, "error");
+          btn.disabled = false;
+        },
+        (err) => {
+          showToast(`Couldn't reconnect: ${String(err)}`, "error");
+          btn.disabled = false;
+        }
+      );
+  });
+  card.appendChild(btn);
 }
 
 function reapIfExited(ws: Workspace, pane: Pane): void {
