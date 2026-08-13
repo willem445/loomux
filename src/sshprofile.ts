@@ -53,10 +53,28 @@ export const SSH_PROFILES_SCHEMA_VERSION = 1;
  *  Guessing "posix because most hosts are" would also bake an assumption about
  *  the user's machines into product code (CLAUDE.md constraint 8). So the user
  *  says which it is, and "posix" is merely the DEFAULT for a profile that never
- *  says. */
-export type RemoteShell = "posix" | "windows";
+ *  says.
+ *
+ *  **`"cmd"` means cmd.exe, specifically — not "a Windows host".** The value
+ *  names the shell whose QUOTING RULES the remote command is built for, and
+ *  those rules are not shared across Windows shells: a PowerShell
+ *  `DefaultShell` host expands `$(…)` inside double quotes, so cmd.exe quoting
+ *  applied there is a different (and worse) surface than the one it was
+ *  written for. A value spelled "windows" would therefore be a promise this
+ *  schema cannot keep — it reads as covering every Windows host while the
+ *  quoting behind it covers exactly one shell. PowerShell and other Windows
+ *  shells are **not supported in v1**; a host running one is reachable as a
+ *  plain login shell (no remote command), and naming its own case is what
+ *  lets a later slice add it without redefining a value users already have on
+ *  disk.
+ *
+ *  No migration path is owed for the earlier "windows" spelling: this schema
+ *  has never been in a release, so no such file exists in the wild. One
+ *  hand-written today takes the ordinary unrecognized-value route below and
+ *  degrades to the default. */
+export type RemoteShell = "posix" | "cmd";
 
-export const REMOTE_SHELLS: readonly RemoteShell[] = ["posix", "windows"];
+export const REMOTE_SHELLS: readonly RemoteShell[] = ["posix", "cmd"];
 
 /** The default `remoteShell` for a profile that doesn't declare one. */
 export const DEFAULT_REMOTE_SHELL: RemoteShell = "posix";
@@ -168,12 +186,35 @@ function identityPathOrNull(v: unknown): string | null {
  *  through would hand the user's ssh an arbitrary flag from a stored file.
  *  Internal whitespace is refused for the same class of reason: a destination is
  *  one argv word, and a "host" containing a space is a mangled hand-edit rather
- *  than a target that could ever connect. */
+ *  than a target that could ever connect.
+ *
+ *  A failure here fails the WHOLE ENTRY (see `decodeProfile`) rather than
+ *  repairing the value — a destination we won't connect to is not a profile,
+ *  and silently stripping the dash would connect the user somewhere they never
+ *  asked for. Both directions enforce it: `encodeSshProfiles` runs the same
+ *  guard, so such a profile cannot be SAVED either, not merely ignored on
+ *  load. */
 function destinationOrNull(v: unknown): string | null {
   const dest = trimmedOrNull(v);
   if (dest === null) return null;
   if (dest.startsWith("-")) return null;
   if (/\s/.test(dest)) return null;
+  // …and the same check on the COMPONENTS, which the whole-word test above does
+  // not reach. `user@-oProxyCommand=calc.exe` starts with `u`, so it sails past
+  // a leading-dash test on the whole string — but the part after the `@` is the
+  // HOST, and a host is not inert data: ssh_config's ProxyCommand/LocalCommand
+  // expand `%h` into a command line, so a leading-dash host is option surface at
+  // best and local command execution at worst (the shape of OpenSSH's own
+  // CVE-2023-51385). ssh splits a destination on its LAST `@`, so this does too
+  // — anything else would check a different string than ssh will.
+  const at = dest.lastIndexOf("@");
+  if (at !== -1) {
+    const user = dest.slice(0, at);
+    const host = dest.slice(at + 1);
+    // An empty half (`@host`, `user@`) is a mangled hand-edit, not a target.
+    if (!user || !host) return null;
+    if (user.startsWith("-") || host.startsWith("-")) return null;
+  }
   return dest;
 }
 

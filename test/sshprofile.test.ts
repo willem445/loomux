@@ -188,6 +188,74 @@ test("a destination starting with '-' fails the whole entry", () => {
   assert.deepEqual(decoded, { schemaVersion: SSH_PROFILES_SCHEMA_VERSION, profiles: [] });
 });
 
+test("a HOST starting with '-' fails the entry even though the destination doesn't", () => {
+  // The gap a whole-string leading-dash test cannot see: `user@-oProxy…`
+  // starts with `u`. But the part after the `@` is the host, and a host is not
+  // inert data — ssh_config's ProxyCommand/LocalCommand expand `%h` into a
+  // command line, which is local command execution out of a stored file (the
+  // shape of OpenSSH's own CVE-2023-51385).
+  const decoded = decodeSshProfiles(
+    JSON.stringify({ profiles: [fullProfile({ destination: "user@-oProxyCommand=calc.exe" })] })
+  );
+  assert.deepEqual(decoded, { schemaVersion: SSH_PROFILES_SCHEMA_VERSION, profiles: [] });
+});
+
+test("a USER starting with '-' fails the entry", () => {
+  const decoded = decodeSshProfiles(
+    JSON.stringify({ profiles: [fullProfile({ destination: "-oProxyCommand=calc.exe@host" })] })
+  );
+  assert.equal(decoded?.profiles.length, 0);
+});
+
+test("a dashed host cannot be SAVED either, not merely ignored on load", () => {
+  // The other direction the finding asks for. Decode-side rejection alone would
+  // leave the value sitting in the file, one lenient future reader away from
+  // being honoured.
+  const written = encodeSshProfiles(
+    store(fullProfile({ id: "ok" }), fullProfile({ id: "bad", destination: "user@-oProxyCommand=calc.exe" }))
+  );
+  assert.equal(written.includes("ProxyCommand"), false, "the dashed host must not reach the file");
+  assert.deepEqual(
+    JSON.parse(written).profiles.map((p: { id: string }) => p.id),
+    ["ok"]
+  );
+});
+
+test("the component guard splits on the LAST '@', the way ssh does", () => {
+  // A user part may legitimately contain '@' (an ssh_config alias, a
+  // domain-shaped login). Splitting on the FIRST '@' would check "user" against
+  // the wrong half and let a dashed host through — so this pins the split
+  // point, not just the rejection.
+  const decoded = decodeSshProfiles(
+    JSON.stringify({ profiles: [fullProfile({ destination: "me@corp.example@-evil" })] })
+  );
+  assert.equal(decoded?.profiles.length, 0, "the real host is the part after the last @");
+});
+
+test("ordinary destinations survive — the guard must not reject the real cases", () => {
+  // Without this, "refuse anything with a dash in it" would pass every test
+  // above while breaking hostnames, which routinely contain dashes.
+  for (const ok of [
+    "dev@build-box.example.net", // dashes INSIDE a host are normal
+    "build-box",
+    "myalias",
+    "me@corp.example@host", // a '@' in the user part is legitimate
+    "ssh://dev@host",
+  ]) {
+    const p = decodeOne(JSON.stringify({ profiles: [fullProfile({ destination: ok })] }));
+    assert.equal(p.destination, ok, `destination ${ok} should be kept`);
+  }
+});
+
+test("a destination with an empty half is a mangled hand-edit, not a target", () => {
+  for (const bad of ["@host", "user@"]) {
+    const decoded = decodeSshProfiles(
+      JSON.stringify({ profiles: [fullProfile({ destination: bad })] })
+    );
+    assert.equal(decoded?.profiles.length, 0, `destination ${bad}`);
+  }
+});
+
 test("a destination with whitespace fails the entry", () => {
   const decoded = decodeSshProfiles(
     JSON.stringify({ profiles: [fullProfile({ destination: "host -oBatchMode=yes" })] })
@@ -326,13 +394,20 @@ test("keepaliveSeconds keeps a real value and rejects an implausible one", () =>
 });
 
 test("an unknown remoteShell falls back to the default instead of failing the entry", () => {
-  const p = decodeOne(JSON.stringify({ profiles: [{ ...fullProfile(), remoteShell: "fish" }] }));
-  assert.equal(p.remoteShell, DEFAULT_REMOTE_SHELL);
+  for (const unknown of ["fish", "powershell", "windows"]) {
+    // "windows" is in this list deliberately: it was this value's spelling
+    // before the rename to "cmd", and it is what a hand-written file copied
+    // from an early draft would say. It is NOT a supported alias — a host
+    // whose shell we can't name gets the default, not cmd.exe quoting chosen
+    // on its behalf. (No migration is owed: the schema has never shipped.)
+    const p = decodeOne(JSON.stringify({ profiles: [{ ...fullProfile(), remoteShell: unknown }] }));
+    assert.equal(p.remoteShell, DEFAULT_REMOTE_SHELL, `remoteShell ${unknown}`);
+  }
 });
 
-test("remoteShell 'windows' is preserved — the field must actually do something", () => {
-  const p = decodeOne(JSON.stringify({ profiles: [fullProfile({ remoteShell: "windows" })] }));
-  assert.equal(p.remoteShell, "windows");
+test("remoteShell 'cmd' is preserved — the field must actually do something", () => {
+  const p = decodeOne(JSON.stringify({ profiles: [fullProfile({ remoteShell: "cmd" })] }));
+  assert.equal(p.remoteShell, "cmd");
 });
 
 test("extraArgs keeps its string words and drops non-strings", () => {
