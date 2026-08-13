@@ -213,11 +213,27 @@ Honestly, up front:
   stays a human-demo-only surface until/unless a safe stand-in agent process
   exists.
 
+  **Partially reopened by event injection (#814).** A surface driven by a
+  backend *event* rather than by a bound orchestrator role does not need an
+  agent CLI at all: the spec emits that event from the page through
+  `plugin:event|emit` — the exact call the bundled `emit()` makes (see
+  `@tauri-apps/api`'s `event.js`/`core.js`), permitted by the shipped ACL
+  (`core:default` covers `core:event`), so it needs no capability widening and
+  no test-only build flag. It round-trips through the backend's real
+  broadcaster into the app's real `listen()` handler, so **the whole frontend
+  half is genuinely exercised** — handler, presentation module, DOM, CSS, and
+  any mirrored chrome — on ordinary plain shell panes. What it does *not*
+  exercise is the backend's decision to emit at all (what to send, and when),
+  which stays the unit/integration suite's job. State that split in any spec
+  that uses this technique, because the technique's whole risk is reading like
+  end-to-end proof of a feature whose producing half was never run. It is a
+  stand-in for a **human's DOM look**, not for the backend's own tests.
+
 ## The PoC
 
 `e2e/fixtures.ts` spawns the isolated-identifier build, waits for the CDP
 port, connects via `chromium.connectOverCDP`, and waits for `#tab-bar` plus a
-first pane to exist before handing the test a `Page`. Four specs:
+first pane to exist before handing the test a `Page`. Five specs:
 
 1. **`pane-reorder.spec.ts`** — splits a tab into two plain shell panes, drags
    one onto the other's center (`Grid.swap` in `src/grid.ts`), asserts their
@@ -242,7 +258,20 @@ first pane to exist before handing the test a `Page`. Four specs:
    fixes couldn't resolve. See "A native-HTML5-DnD lesson" immediately below
    — this spec is also why the tab-strip drag mechanism itself changed.
 
-All four were run locally against a real build (`npx tauri build --debug
+5. **`queue-badge.spec.ts`** (added #814) — pushes `orch-queue-depth` readings
+   into plain shell panes by event injection (see the "partially reopened"
+   note above) and asserts what a human's DOM look was going to: the header
+   chip renders with its count/cap/age in the label rather than in a tooltip,
+   a stalled queue paints *differently* (compared as computed style, so a rule
+   that never matched fails here instead of passing a selector check), a
+   minimized pane keeps the count on its dock chip, and — on a three-column
+   layout with two chips lit — the header degrades without spilling while the
+   pane's terminal box does not move a pixel (constraint 1, from the layout
+   side, the same way `sessions-panel.spec.ts` checks it). It is the first
+   spec to stand in for a human demo rather than for a bug class, which is why
+   its header states exactly which half of the feature it proves.
+
+Specs 1-4 were run locally against a real build (`npx tauri build --debug
 --no-bundle --config src-tauri/tauri.e2e.conf.json`) and pass, repeatedly.
 The `data_root_from` Rust helper backing the isolation env var has its own
 unit tests in `obs.rs`, verified red (assertion failure, not a compile error)
