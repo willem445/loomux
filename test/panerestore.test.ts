@@ -37,6 +37,7 @@ const pane = (over: Partial<PersistedPane>): PersistedPane => ({
   sessionId: null,
   groupId: null,
   file: null,
+  sshProfileId: null,
   embeds: [],
   ...over,
 });
@@ -1337,4 +1338,89 @@ test("shouldWatchCopilotOnRestore scans argv for --autopilot too — not just th
     shouldWatchCopilotOnRestore("", ["copilot", "--resume", "abc", "--autopilot"]),
     true
   );
+});
+
+// ---------- #887 S4: SSH panes restore dormant, never auto-reconnected ----------
+
+test("an ssh pane restores DORMANT with its connection + recorded session — never a spawn", () => {
+  // The policy, pinned: no arm of this function may auto-reconnect an ssh pane.
+  // Auto-reconnecting would spend credits on a REMOTE agent CLI with no human
+  // present, and would put a dead host / sleeping VPN on the boot path.
+  const action = planPaneRestore(
+    pane({ paneKind: "ssh", name: "build box", sshProfileId: "prof-7", sessionId: "remote-1" })
+  );
+  assert.deepEqual(action, {
+    type: "dormant-ssh",
+    name: "build box",
+    profileId: "prof-7",
+    sessionId: "remote-1",
+  });
+});
+
+test("an ssh pane with no recorded session still restores dormant (a login shell / non-claude CLI)", () => {
+  // Only claude's identity travels on the command line, so every other remote CLI
+  // — and a plain login shell — restores with no session to resume. That is a
+  // reconnect with a fresh conversation, not a pane that fails to come back.
+  const action = planPaneRestore(pane({ paneKind: "ssh", name: "box", sshProfileId: "p1" }));
+  assert.deepEqual(action, { type: "dormant-ssh", name: "box", profileId: "p1", sessionId: null });
+});
+
+test("an ssh pane whose profile was never recorded restores dormant with a null connection", () => {
+  // Nothing to reconnect WITH — but the pane still comes back and says so, rather
+  // than vanishing out of the restored layout.
+  const action = planPaneRestore(pane({ paneKind: "ssh", name: "box" }));
+  assert.equal(action.type, "dormant-ssh");
+  assert.equal(action.type === "dormant-ssh" ? action.profileId : "unreachable", null);
+});
+
+test("GUARDRAIL: a persisted ssh leaf can NEVER restore into an orchestration identity (#887/#888)", () => {
+  // tabs.json is a plain file a human can hand-edit, and restore is the one path
+  // that turns a file on disk into a spawn — so this is where an ssh pane could
+  // otherwise acquire a group. The record below carries every orchestration field
+  // the schema has room for; the restore action must carry none of them onward.
+  //
+  // If a future edit copies the dormant-GROUP arm's shape into the ssh arm (the
+  // plausible mistake — they are adjacent and look alike), this goes red.
+  const action = planPaneRestore(
+    pane({
+      paneKind: "ssh",
+      name: "remote box",
+      sshProfileId: "prof-1",
+      sessionId: "s-1",
+      role: "worker",
+      groupId: "loomux-deadbeef",
+    })
+  );
+  assert.equal(action.type, "dormant-ssh");
+  const serialized = JSON.stringify(action);
+  assert.ok(!serialized.includes("worker"), `no orchestration ROLE may survive restore: ${serialized}`);
+  assert.ok(
+    !serialized.includes("loomux-deadbeef"),
+    `no orchestration GROUP may survive restore: ${serialized}`
+  );
+  // Belt: the shape itself has no room for one, so a later reader can see the
+  // boundary is structural rather than a filter that has to be remembered.
+  assert.ok(!("role" in action) && !("groupId" in action) && !("embeds" in action));
+});
+
+test("a recorded ssh command line is NOT carried into the restore action", () => {
+  // The reconnect re-derives its argv from the saved PROFILE (sshprofile.ts's id
+  // contract), so an argv that somehow reached the record — a hand-edit, or an
+  // older shape — must not become the thing that gets spawned: a claude remote
+  // command carries `--session-id <id>`, which CREATES that session, and replaying
+  // it against a session the earlier run already made is an error, not a
+  // reconnect.
+  const action = planPaneRestore(
+    pane({
+      paneKind: "ssh",
+      name: "box",
+      sshProfileId: "p1",
+      command: "ssh host",
+      argv: ["ssh", "-t", "host", "--", "claude --session-id s-1"],
+    })
+  );
+  const serialized = JSON.stringify(action);
+  assert.ok(!serialized.includes("--session-id"), `no captured command line may ride along: ${serialized}`);
+  assert.ok(!serialized.includes("ssh host"), `…nor the captured command string: ${serialized}`);
+  assert.ok(!serialized.includes("\"-t\""), `…nor a captured argv token: ${serialized}`);
 });

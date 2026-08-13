@@ -136,6 +136,21 @@ divider positions you'd dragged. Each pane comes back by kind:
   since "nothing to resume" is worth noticing rather than looking identical to
   a group that's simply waiting for a click; the explanation of what happened
   stays visible underneath, and **Start** is still the prominent next action.
+- **SSH panes** come back **dormant**, with a **Reconnect** button. Nothing dials
+  out until you click it: the agent CLI at the far end runs on someone else's
+  machine and spends *their* credits, and a host that's asleep or behind a VPN
+  would otherwise stall startup on a connection that can take a minute to fail.
+  Reconnect rebuilds the connection from the **saved profile**, so a connection
+  you've edited since (a new port, a different remote folder) reconnects with the
+  edit — and if you deleted the saved connection, the card says so rather than
+  guessing at one. With Claude Code on the far end the reconnect **resumes the
+  remote session** it recorded; other CLIs come back on a new conversation,
+  because only Claude's session id travels on the command line where loomux can
+  put it. The same **Reconnect** offer appears if a live connection drops
+  mid-session — the pane stays open with the output that explains why (a timeout,
+  a closed connection, a refused key) and the offer floats over it, so you read
+  the reason before deciding. Ending the session yourself (`exit` on the far end)
+  closes the pane as usual.
 - **Orchestration panes** come back **dormant**, with a **Resume group** button —
   reviving a whole group can spawn workers and spend credits, so that stays a
   deliberate, human-triggered action. The tab keeps its group binding and shows

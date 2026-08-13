@@ -19,6 +19,17 @@
 //                 the ONE place a resume can actually burn credits — a resumed
 //                 autonomous orchestrator (#83) may idle-tick and spawn a worker
 //                 storm (#78) — so the credit-safety stance stays exactly here.
+//   - SSH       → NEVER auto-reconnected (#887 S4). An ssh pane restores DORMANT
+//                 with a Reconnect button, for two reasons that do not overlap:
+//                 the far end is an agent CLI on someone else's machine, so an
+//                 automatic reconnect spends REMOTE credits with no human present
+//                 (the orch-pane argument, one host removed); and a host that is
+//                 down, asleep, or behind a VPN that isn't up yet turns boot into
+//                 a wait on a TCP connect that may not fail for a minute. Neither
+//                 applies to a local shell, which is why "terminal" still comes
+//                 straight back. Reconnect rebuilds the command from the SAVED
+//                 PROFILE (not a captured argv — see PersistedPane.sshProfileId),
+//                 resuming the remote session when one was recorded.
 //   - Content   → re-open the pane at its recorded root: the file MANAGER (#214),
 //                 the file EDITOR, the GIT view (#217), or the WORKFLOW pane (#222).
 //                 No process, no session,
@@ -97,6 +108,34 @@ export type RestoreAction =
        *  pane via Pane.restoreEmbeds — the ONE place a captured UI
        *  preference is threaded through a whole-group resume today. */
       embeds: PersistedEmbed[];
+    }
+  | {
+      // An SSH pane (#887 S4), back as a dormant Reconnect card. Nothing spawns
+      // until the human clicks it (see the policy note at the top of this file).
+      //
+      // Carries the CONNECTION and the recorded session — never a command line.
+      // The caller resolves `profileId` against the live profile store and runs
+      // it back through the same builders a fresh launch uses, so a profile the
+      // human edited between boots reconnects with the edit, and a profile they
+      // DELETED reconnects with nothing: `profileId` may name a connection that
+      // no longer exists, and a null one (a pre-S4 or hand-mangled record) names
+      // none at all. Both land on the card's error state rather than on a guess.
+      //
+      // Deliberately NO orchestration fields — not `role`, not `groupId`, not an
+      // agent id — even though the persisted leaf they come from has room for
+      // all three. An SSH pane can never be an orchestration group member (the
+      // #887/#888 boundary, refused at the pane in `sshOrchestrationRefusal`),
+      // and restore is the one path that could smuggle one in, since it builds
+      // a spawn out of a file on disk that a human can hand-edit. The boundary
+      // holds here by construction: there is no field to carry it through.
+      type: "dormant-ssh";
+      name: string;
+      profileId: string | null;
+      /** The remote session id recorded at launch (claude only — see
+       *  `sshMintsSessionId`), so Reconnect can resume it instead of starting a
+       *  second conversation on the far host. Null for every other remote CLI
+       *  and for a plain login shell. */
+      sessionId: string | null;
     }
   | {
       // A file-explorer pane (#214), back at its recorded root. Nothing to spawn
@@ -179,6 +218,20 @@ export function planPaneRestore(pane: PersistedPane, resumable?: SessionResumabl
         role: pane.role,
         groupId: pane.groupId,
         embeds: pane.embeds,
+      };
+    case "ssh":
+      // Dormant, human-triggered Reconnect only (#887 S4) — the remote-credit and
+      // dead-host arguments are at the top of this file. Note what is NOT read
+      // off the record here: `role`, `groupId` and `command`/`argv` are all
+      // dropped on the floor. The first two are the #887/#888 boundary (a
+      // hand-edited tabs.json naming an ssh leaf with `role: "worker"` restores
+      // as an ordinary dormant SSH card, never as a group member); the last two
+      // are the profile-not-argv contract on `PersistedPane.sshProfileId`.
+      return {
+        type: "dormant-ssh",
+        name: pane.name,
+        profileId: pane.sshProfileId,
+        sessionId: pane.sessionId,
       };
     case "files":
       // Pure content: no process, no credits, no session — it just comes back at

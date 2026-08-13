@@ -3361,6 +3361,32 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 }
 .dormant-btn-secondary:hover { background: rgba(158, 206, 106, 0.28); }
 
+/* #887 S4: the Reconnect offer on an SSH pane whose connection dropped. Unlike
+   .pane-dormant above it does NOT cover the pane — the terminal underneath is
+   still mounted and still holds the output that explains the disconnect ("Connection
+   to host closed", a timeout, a rejected key), which is exactly what the human
+   needs while deciding whether to reconnect. So it floats in the lower-right
+   corner over the terminal: no PTY resize, no reflow, nothing the ConPTY can
+   observe (CLAUDE.md constraint 1). `max-width` keeps it inside a narrow split
+   rather than spilling out of one. */
+.pane-reconnect {
+  position: absolute; right: 12px; bottom: 12px; z-index: 6;
+  max-width: calc(100% - 24px);
+}
+.pane-reconnect .dormant-card {
+  width: 300px;
+  box-shadow: 0 6px 22px rgba(0, 0, 0, 0.45);
+}
+/* A secondary action that is NOT a recommendation — Dismiss sits beside
+   Reconnect and must not wear .dormant-btn-secondary's green "click me" accent. */
+.dormant-btn-quiet {
+  border-color: rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text-dim);
+  font-weight: 500;
+}
+.dormant-btn-quiet:hover { background: rgba(255, 255, 255, 0.1); color: var(--text); }
+
 /* Cold-boot restore splash: a centered card over a dimmed backdrop, before any
    tab exists. Pure overlay — no PTY, no layout change. */
 .restore-splash {

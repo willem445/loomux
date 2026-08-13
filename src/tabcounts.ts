@@ -20,8 +20,14 @@ export interface TabPaneInfo {
    *  contribute nothing to the count below, no matter what `live` says. The count
    *  keys off the KIND, not off `live`: a viewer that is fully functional (and so
    *  honestly reports live) must not thereby claim to be a running agent. The workflow
-   *  pane is the sharpest case of that: it is ABOUT agents without being one. */
-  kind: "terminal" | "agent" | "orch" | "files" | "editor" | "git" | "workflow";
+   *  pane is the sharpest case of that: it is ABOUT agents without being one.
+   *
+   *  "ssh" (#887) contributes nothing either, and for a reason worth stating rather
+   *  than filing under "not an agent": the CLI on the far end may well BE an agent,
+   *  but it is not one this loomux spawned, supervises, or can account for — the
+   *  counter reports what this app is running. It can never be an orchestration
+   *  member either (the #887/#888 boundary), so neither branch below is its. */
+  kind: "terminal" | "agent" | "orch" | "files" | "editor" | "git" | "workflow" | "ssh";
   /** True when the pane has a running PTY — a live terminal/agent. False for a
    *  setup (welcome) pane or a dormant restore placeholder (no process yet). A
    *  content pane has no process at all; it reports `live: true` because it is

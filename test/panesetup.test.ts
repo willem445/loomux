@@ -17,6 +17,8 @@ import {
   sshLaunchParams,
   sshMintsSessionId,
   sshOrchestrationRefusal,
+  sshReconnectArgv,
+  withSubmitLatch,
   sshRemoteCliWarning,
   sshRemoteCwdWarning,
   type PaneSetupInput,
@@ -717,4 +719,221 @@ test("SubmitLatch is one-shot once a submit finishes", () => {
   assert.equal(latch.begin(), false); // a late re-entry must never fire again
   latch.release(); // even an errant release can't reopen a finished latch
   assert.equal(latch.begin(), false);
+});
+
+// --- #887 S4: the reconnect a restored (or disconnected) SSH pane replays ---
+
+/** A mint that is obviously a mint — so a test can tell "loomux minted a new
+ *  remote session" from "loomux resumed the recorded one" by reading the argv. */
+const MINT = () => "minted-id";
+
+test("a recorded claude session reconnects in RESUME form, never a second --session-id", () => {
+  // The whole point of recording the id: the remote conversation comes back
+  // instead of a fresh one starting beside it. `--session-id` CREATES a session,
+  // so replaying it against one the earlier run already made is an error, not a
+  // reconnect — the rewrite is what keeps that from being the reconnect path.
+  const { argv, sessionId, mode } = sshReconnectArgv(
+    "C:/Windows/System32/OpenSSH/ssh.exe",
+    sshProfile({ defaultCli: "claude", remoteCwd: "/srv/app" }),
+    "remote-sess-1",
+    MINT
+  );
+  assert.equal(mode, "resume");
+  assert.equal(sessionId, "remote-sess-1", "the pane keeps the SAME identity across a reconnect");
+  const remote = argv[argv.length - 1];
+  assert.match(remote, /'claude' '--resume' 'remote-sess-1'/, `resume form expected, got: ${remote}`);
+  assert.ok(!remote.includes("--session-id"), `no create flag may survive: ${remote}`);
+  assert.ok(!remote.includes("minted-id"), "a recorded session is resumed, not replaced by a fresh mint");
+  // …and it is still a full, ordinary ssh command line: the connection's own
+  // settings are re-derived from the profile, not carried over from anywhere.
+  assert.match(remote, /cd '\/srv\/app'/);
+});
+
+test("no recorded session on a claude profile MINTS one, so the reconnect is resumable next time", () => {
+  // The parallel of `agentFreshCommand`'s local rule: a fresh start still gets an
+  // identity, or the pane would be unresumable forever after one lost id.
+  const { argv, sessionId, mode } = sshReconnectArgv(
+    "ssh",
+    sshProfile({ defaultCli: "claude" }),
+    null,
+    MINT
+  );
+  assert.equal(mode, "fresh");
+  assert.equal(sessionId, "minted-id");
+  const remote = argv[argv.length - 1];
+  assert.match(remote, /'claude' '--session-id' 'minted-id'/, `fresh form expected, got: ${remote}`);
+  assert.ok(!remote.includes("--resume"), `nothing to resume: ${remote}`);
+});
+
+test("a profile edited to a NON-minting CLI never receives the recorded claude id", () => {
+  // The profile as it is NOW decides, not the record. A session id minted for
+  // claude is meaningless to copilot — it names a conversation on the far host
+  // that copilot cannot read — and `--session-id` is not even a flag it would
+  // accept, so the pane would die on its first line.
+  const { argv, sessionId, mode } = sshReconnectArgv(
+    "ssh",
+    sshProfile({ defaultCli: "copilot" }),
+    "remote-sess-1",
+    MINT
+  );
+  assert.equal(mode, "fresh");
+  assert.equal(sessionId, null, "no id is recorded for a CLI whose identity loomux cannot mint");
+  const remote = argv[argv.length - 1];
+  assert.ok(!remote.includes("remote-sess-1"), `the stale id must not reach copilot: ${remote}`);
+  assert.ok(!remote.includes("--session-id") && !remote.includes("--resume"), remote);
+  assert.match(remote, /exec 'copilot'/);
+});
+
+test("a profile edited down to a plain login shell reconnects as a login shell", () => {
+  // No remote command at all — so no `-t`, no `--`, and certainly no session
+  // flag. The recorded id is simply not applicable any more, and inventing a
+  // remote command to hang it on would be the guess `remoteShell` exists to
+  // refuse.
+  const { argv, sessionId, mode } = sshReconnectArgv("ssh", sshProfile({ defaultCli: null }), "remote-sess-1", MINT);
+  assert.equal(mode, "fresh");
+  assert.equal(sessionId, null);
+  assert.deepEqual(argv, ["ssh", "dev@build.example.net"]);
+});
+
+test("a reconnect re-derives every connection setting from the profile AS IT IS NOW", () => {
+  // S1's `SshProfile.id` contract, made observable: a pane records the
+  // connection, not its contents, so an edit between boots is what reconnects.
+  // A captured argv could never do this — it would still be dialling last week's
+  // port.
+  const { argv } = sshReconnectArgv(
+    "ssh",
+    sshProfile({ defaultCli: "claude", port: 2222, identityFile: "C:/keys/id_ed25519", keepaliveSeconds: 30 }),
+    "remote-sess-1",
+    MINT
+  );
+  assert.deepEqual(argv.slice(0, 9), [
+    "ssh",
+    "-t",
+    "-p",
+    "2222",
+    "-i",
+    "C:/keys/id_ed25519",
+    "-o",
+    "ServerAliveInterval=30",
+    "dev@build.example.net",
+  ]);
+});
+
+test("the reconnect surfaces a cmd.exe-unquotable value as a throw, exactly as a fresh launch does", () => {
+  // Same refusal, same place (sshcommand.ts), so a reconnect can never be the
+  // path that silently ships a truncated `/C` command line the launch form would
+  // have refused.
+  assert.throws(
+    () =>
+      sshReconnectArgv(
+        "ssh",
+        // `\\` is a real backslash and `\n` a real newline: a Windows-looking
+        // remote folder with a line break smuggled into it. (Review NB5: written
+        // as `"C:\srv\n…"` this was `C:srv` + a newline — the backslash silently
+        // dropped by JS's unknown-escape rule — so it read as covering a
+        // backslash case it never exercised.) The NEWLINE is what the refusal is
+        // about: `cmd.exe /C` reads only the first line and drops the rest.
+        sshProfile({ defaultCli: "claude", remoteShell: "cmd", remoteCwd: "C:\\srv\nrm -rf" }),
+        null,
+        MINT
+      ),
+    /newline/
+  );
+});
+
+test("the fresh ESCAPE (a recorded session that can never be resumed) forces a new remote session", () => {
+  // PR #926 review NB3. A remote conversation can be gone while the id naming it
+  // is still recorded here — deleted on the far host, a cleared `~/.claude`, a
+  // rebuilt box — and then `--resume` fails every single time, so plain Reconnect
+  // loops. The card's escape hatch is this exact call with the recorded id
+  // withheld: same profile, same connection settings, a brand-new session.
+  const recorded = "remote-sess-1";
+  const profile = sshProfile({ defaultCli: "claude", remoteCwd: "/srv/app" });
+  const escape = sshReconnectArgv("ssh", profile, null, MINT);
+  assert.equal(escape.mode, "fresh");
+  assert.equal(escape.sessionId, "minted-id", "a NEW id, so the new conversation is itself resumable");
+  const remote = escape.argv[escape.argv.length - 1];
+  assert.ok(!remote.includes(recorded), `the unresumable id must not come back: ${remote}`);
+  assert.match(remote, /'claude' '--session-id' 'minted-id'/);
+  // …and it is the SAME connection otherwise — the escape changes the session,
+  // never where or how the pane connects.
+  const normal = sshReconnectArgv("ssh", profile, recorded, MINT);
+  assert.deepEqual(
+    escape.argv.slice(0, -1),
+    normal.argv.slice(0, -1),
+    "everything before the remote command is identical"
+  );
+});
+
+// --- #887 S4 / PR #926 round 2 B1: a reconnect is SINGLE-FLIGHT ---
+
+test("two near-simultaneous reconnects spawn exactly ONE ssh client", async () => {
+  // The defect this pins, concretely: the SSH reconnect card has two actions
+  // (Reconnect, Reconnect fresh). With them ungated, a click on each — the
+  // expected gesture, since the escape exists for someone who has just watched a
+  // resume fail — started TWO ssh clients and two remote agent CLIs against one
+  // pane. The pane binds whichever spawn resolves last; the loser's output routes
+  // nowhere, its exit lands unclaimed, and a kill goes through the pane's ptyId,
+  // so nothing in loomux can stop it — a remote agent left running, unaccountable,
+  // on someone else's machine, in a feature whose restore policy is argued from
+  // not spending remote credits unattended.
+  let spawns = 0;
+  let finish!: () => void;
+  const inFlight = new Promise<void>((resolve) => (finish = resolve));
+  const latch = new SubmitLatch();
+  const reconnect = (): Promise<{ ok: boolean; message?: string }> =>
+    withSubmitLatch(
+      latch,
+      () => ({ ok: false, message: "busy" }),
+      async () => {
+        spawns++;
+        await inFlight; // stand in for discoverSsh + loadSshProfiles + spawnPty
+        return { ok: true };
+      }
+    );
+
+  const first = reconnect(); // still in flight — nothing has resolved it
+  const second = reconnect(); // the second button, ~300ms later
+  // Checked BEFORE anything is awaited, and deliberately so: an async function
+  // runs synchronously up to its first `await`, so the spawn count is already
+  // final here. It also keeps this test from DEADLOCKING under the mutation it
+  // exists to catch — awaiting `second` first would hang forever once the gate
+  // is gone (an ungated second call waits on `inFlight`, which is released
+  // below), and a hang is not a red.
+  assert.equal(spawns, 1, "exactly one spawn while an attempt is in flight");
+  finish();
+  assert.deepEqual(await second, { ok: false, message: "busy" }, "the second click is refused, not queued");
+  assert.deepEqual(await first, { ok: true }, "the first attempt is untouched by the refusal");
+  // …and the latch REOPENS: a reconnect that failed must stay retryable — the
+  // card's whole purpose is the retry — so this is never one-shot.
+  assert.deepEqual(await reconnect(), { ok: true });
+  assert.equal(spawns, 2, "a later attempt runs once the first has settled");
+});
+
+test("a reconnect that THROWS still releases the latch (a failure must stay retryable)", () => {
+  // The `finally` in `withSubmitLatch`, pinned: without it, one failed reconnect
+  // would wedge the card forever — every later click answered "already
+  // reconnecting" while nothing was, which is worse than the double-spawn it
+  // exists to prevent, because there is no way out of it at all.
+  const latch = new SubmitLatch();
+  let attempts = 0;
+  const boom = (): Promise<{ ok: boolean }> =>
+    withSubmitLatch(
+      latch,
+      () => ({ ok: false }),
+      async () => {
+        attempts++;
+        throw new Error("spawn failed");
+      }
+    );
+  return boom().then(
+    () => assert.fail("the rejection must propagate to the caller"),
+    async (err) => {
+      assert.match(String(err), /spawn failed/);
+      await boom().then(
+        () => assert.fail("still expected to reject"),
+        () => assert.equal(attempts, 2, "the second attempt ran — the latch reopened")
+      );
+    }
+  );
 });

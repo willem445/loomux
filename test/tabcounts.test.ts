@@ -127,3 +127,20 @@ test("a content/terminal pane's connectedChannel (always null) never inflates th
   const c = tabCounts([p("files"), p("editor"), p("git"), p("terminal")], false);
   assert.equal(c.connectedChannels, 0);
 });
+
+test("SSH panes are NOT agents and never raise the ORCH marker — live or dormant (#887 S4)", () => {
+  // The property tabcounts.ts's own `kind` doc now states, pinned rather than
+  // just asserted in prose. The CLI at the far end may well be an agent, but it
+  // is not one this loomux spawned or supervises, and an SSH pane can never be
+  // an orchestration member (the #887/#888 boundary).
+  //
+  // Both liveness states are here on purpose (PR #926 review NB1): a LIVE ssh
+  // pane reports "ssh", and so does a DORMANT Reconnect card — which used to
+  // report "agent" instead, harmless only because nothing counts dormant panes
+  // yet. The first consumer that does would have counted Reconnect cards as
+  // running agents.
+  const c = tabCounts([p("ssh"), p("ssh", false), p("agent")], false);
+  assert.equal(c.agents, 1, "only the real local agent counts");
+  assert.equal(c.liveOrch, false);
+  assert.equal(c.dormantOrch, false);
+});

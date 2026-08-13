@@ -48,7 +48,22 @@ export type RestorePref = "ask" | "restore" | "fresh";
  *  rides in the existing `cwd`, exactly as `role` rode into the schema for orch panes,
  *  and the workflow pane's file rides in the `file` field the editor already added.
  *  Decode is shape-driven, so old files (which simply never carry these leaves) are
- *  unaffected and SCHEMA_VERSION stays at 2. */
+ *  unaffected and SCHEMA_VERSION stays at 2.
+ *
+ *  "ssh" (#887 S4) is a pane whose process is a local ssh client. It DOES need one
+ *  new field — `sshProfileId` — because unlike every kind above it, what the pane
+ *  needs on the way back is not a path or a command line but the saved CONNECTION
+ *  (see that field's own comment for why the argv is deliberately not what is
+ *  replayed). Still additive and still shape-driven, so SCHEMA_VERSION stays at 2
+ *  for the same reason the content kinds left it there: a v2 file that predates
+ *  this simply never carries an "ssh" leaf, and decodes exactly as it always did.
+ *  The DOWNGRADE direction is the one that costs something, and it costs more here
+ *  than a per-entry drop: an older build's `decodePane` rejects the unknown kind,
+ *  and `decodeLayout`'s whole-tree fail-safe then collapses THAT TAB's entire
+ *  layout to a single fresh shell (a docked ssh pane is the softer case — dropped
+ *  individually). Recorded in doc/design/session-restore.md rather than softened:
+ *  the alternative (persisting an ssh pane as some kind an old build recognizes)
+ *  means an old build spawning the wrong process under the right title. */
 export type PersistedPaneKind =
   | "terminal"
   | "agent"
@@ -56,7 +71,8 @@ export type PersistedPaneKind =
   | "files"
   | "editor"
   | "git"
-  | "workflow";
+  | "workflow"
+  | "ssh";
 
 /** The PTY-less content kinds, in one place — what `cwd` means for them is a ROOT,
  *  not a shell's directory. */
@@ -115,6 +131,32 @@ export interface PersistedPane {
    *  on from the file browser). Null for every other kind, and absent from any snapshot
    *  written before #217. */
   file: string | null;
+  /** The saved SSH connection (`sshprofile.ts`'s `SshProfile.id`) an "ssh" pane
+   *  (#887 S4) was launched from. Null for every other kind, and for any snapshot
+   *  written before S4.
+   *
+   *  This — with `sessionId` — is the WHOLE restore record for an ssh pane, and
+   *  the reconnect deliberately re-derives its command line from the profile
+   *  rather than replaying a captured `argv`. Two reasons, both concrete:
+   *
+   *   1. The profile is the user's declaration and it is what they edit. S1 states
+   *      the contract in `SshProfile.id`'s own comment — "a persisted pane records
+   *      this id, not the profile's contents, so renaming or re-editing a profile
+   *      keeps the panes that use it pointed at it". A pane that replayed a
+   *      captured argv would silently keep connecting on last week's port.
+   *   2. A captured argv could not be replayed as-is anyway. A claude remote
+   *      command carries `--session-id <id>`, which CREATES that session; replaying
+   *      it against a session the earlier run already created is an error, not a
+   *      reconnect — and it cannot simply be rewritten from out here, because the
+   *      whole remote command is ONE shell-quoted string inside that argv
+   *      (sshcommand.ts), so rewriting it would mean re-parsing a quoting scheme
+   *      that module exists to be the only implementation of.
+   *
+   *  So an "ssh" leaf persists `argv: null` (see `Pane.capture`), and reconnect
+   *  runs profile + recorded session id back through the same S2/S3 builders a
+   *  fresh launch uses (`sshReconnectArgv`). A profile deleted since is not
+   *  guessed at: the dormant card says so and offers nothing. */
+  sshProfileId: string | null;
   /** Every view CURRENTLY docked to this "orch" pane (#361) — up to three
    *  entries, one per occupied edge (left/right/bottom), each naming which
    *  view and its share of that edge's split. Empty = nothing docked, every
@@ -203,6 +245,7 @@ const PANE_KINDS: readonly PersistedPaneKind[] = [
   "agent",
   "orch",
   ...CONTENT_KINDS,
+  "ssh",
 ];
 const SHELL_KINDS: readonly ShellKind[] = ["powershell", "gitbash", "cmd"];
 const RESTORE_PREFS: readonly RestorePref[] = ["ask", "restore", "fresh"];
@@ -332,6 +375,13 @@ function decodePane(v: unknown): PersistedPane | null {
     // a group named "" — see groupresume.ts's normalization.
     groupId: typeof r.groupId === "string" && r.groupId.trim() ? r.groupId : null,
     file: typeof r.file === "string" ? r.file : null,
+    // #887 S4: absent (any pre-S4 snapshot, or any non-ssh leaf) or blank → null.
+    // Blank is treated as absent for the same reason `groupId` above does it: an
+    // id is looked up in a store, and "" matches no profile while reading as one.
+    // An ssh leaf that lands here with null is not dropped — the pane comes back
+    // as a dormant card that says it has no connection to reconnect to, which is
+    // legible; failing the entry would take the whole tab's layout with it.
+    sshProfileId: typeof r.sshProfileId === "string" && r.sshProfileId.trim() ? r.sshProfileId : null,
     embeds: decodeEmbeds(r.embeds, r.embed, r.taskEmbed),
   };
 }
