@@ -1442,7 +1442,7 @@ loomux's own roster, and `.github/agents/*.md` holds the five personas it points
 |---|---|---|---|
 | `worker-deep` | worker | opus | work with judgment in it: a design with more than one defensible shape, a security/compatibility argument that has to be *made*, an honestly incomplete brief |
 | `worker-quick` | worker | haiku | work whose shape is already decided: a rename, a version bump, applying a review finding that names the file and the fix. **Escalates instead of improvising** |
-| `rev-orch` | reviewer | opus | the Rust backend: gate/shim security, capability closure, the `group_id` webview-trust boundary, the no-getrandom rule, integration-test-only linking |
+| `rev-orch` | reviewer | opus | the Rust backend: gate/shim security, capability closure, the `group_id` path boundary (#904: one validated `GroupId`, one assembly point), the no-getrandom rule, integration-test-only linking |
 | `rev-ui` | reviewer | sonnet | the vanilla-TS frontend: no framework, panes/overlays, **never resize the PTY**, DOM-free pure-module tests, xterm quirks |
 | `rev-tests` | reviewer | sonnet | the tests *as tests*: intent vs implementation echo, the pin that cannot fail, cross-platform CI, the release path — and no live agent CLIs, ever |
 

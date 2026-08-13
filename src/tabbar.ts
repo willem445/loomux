@@ -525,6 +525,11 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
       seen.add(ws.id);
       try {
         const [summary, usage] = await Promise.all([groupSummary(groupId), groupUsage(groupId)]);
+        // #904: the backend answers `null` if it refuses the group id. A tab
+        // badge has no way to say "unknown", and a stale-but-true count beats
+        // a fabricated zero — so leave the previous status in place rather
+        // than writing one built from a refusal.
+        if (!summary || !usage) continue;
         const next: TabStatus = {
           agents: summary.live_agents,
           cost: usage.live_cost_usd,

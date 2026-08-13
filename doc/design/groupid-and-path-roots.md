@@ -6,15 +6,16 @@ internal refactor with no behavior change for valid input.
 
 ## The argument
 
-CLAUDE.md hard constraint 6 says orchestration commands **trust `group_id` as a
-path segment**. Read carefully, that sentence never claimed the id was safe — it
-claimed the *caller* was. `OrchRegistry::group_dir` is `self.root.join(group)`:
+CLAUDE.md hard constraint 6 **used to say** orchestration commands trust
+`group_id` as a path segment; this change is why it no longer does. Read
+carefully, that sentence never claimed the id was safe — it claimed the *caller*
+was. `OrchRegistry::group_dir` **was** `self.root.join(group)`:
 no validation, no canonicalization, and the single membership guard on that path
-lives in `save_attachment` alone, added as "cheap hardening on top of the
+lived in `save_attachment` alone, added as "cheap hardening on top of the
 pre-existing trusted-webview model".
 
-The trust is derived from **process locality**. The only thing that can invoke a
-`#[tauri::command]` today is our own webview, in this process. That is a fact
+That trust was derived from **process locality**. The only thing that can invoke
+a `#[tauri::command]` today is still our own webview, in this process. That is a fact
 about the transport, not a credential — nobody issued it, nothing checks it, and
 it cannot be revoked. Reproduce the same command surface over a socket, which is
 exactly what #888 proposes, and the fact evaporates: every peer that can open a
@@ -99,7 +100,8 @@ derives; it is something the backend *declares*, in one place, from a value that
 is already proof.
 
 There were four raw `root.join(group)` sites, plus a fifth interpolation that
-does not touch loomux's root at all:
+does not touch loomux's root at all. None of them survive — every one now routes
+through `group_dir_at`, and the source guard keeps it that way:
 
 1. `OrchRegistry::group_dir` — the main one, 78 call sites.
 2. `append_audit` — the audit log.
@@ -114,35 +116,91 @@ in the group id would not traverse within `%APPDATA%\loomux\orchestration`, it
 would write into the user's CLI configuration — and `end_group`'s reclaim then
 deletes by the same shape.
 
-Sites 2–5 are validated at the join and fail closed. What "closed" means is
-chosen per site rather than uniformly, because a refusal has to go somewhere:
+**The rest of this section is history, kept because the reasoning is still worth
+reading — but it describes the FIRST slice, not the shipped state.** In slice 1
+sites 2–5 validated at their own join and failed closed, each in a way suited to
+its call site, because a refusal has to go somewhere:
 
-- `append_audit` drops the record and leaves a breadcrumb. Auditing is
+- `append_audit` dropped the record and left a breadcrumb. Auditing is
   best-effort by contract — it must never take the orchestration down — and the
   function returns `()`, so there is no caller with anywhere to put an error.
   The breadcrumb names the `GroupIdError`, never the offending string: an id that
   reached here was chosen by the caller, and echoing it verbatim into a log file
   is how log injection starts.
-- `promptsubmit_marker_path` and `generated_agent_handle` return `None`. Their
-  callers already return `Option`, so the refusal is a `?`.
-- `sessions.rs` reads a refused id as "no group", which is the same answer it
+- `promptsubmit_marker_path` and `generated_agent_handle` returned `None`. Their
+  callers already return `Option`, so the refusal was a `?`.
+  (`promptsubmit_marker_path` takes a `GroupId` and is infallible again now;
+  `generated_agent_handle` still returns `Option` for its `?` ergonomics.)
+- `sessions.rs` read a refused id as "no group", which is the same answer it
   already gives for a session with no orchestration signature.
 
-Site 1, `group_dir`, is the one that cannot be validated locally: its return type
-is `PathBuf`, which has no refusal channel, and its 78 callers are spread across
-the registry. It is converted by threading the type instead — `group_dir` takes
-`&GroupId`, and the id is parsed once at the command boundary — which is the
-second half of #904 and lands separately. **Until that lands, constraint 6 still
-holds for `group_dir`**: the majority of group-scoped paths are still assembled
-from an id the process trusts because of who called it.
+Site 1, `group_dir`, could not be validated locally: its return type is
+`PathBuf`, which has no refusal channel, and its 78 callers are spread across the
+registry. It is converted by threading the type instead — and that is what the
+second slice did. `group_dir` now takes a `&GroupId`; the ~50 `orch_*` commands
+parse their `String` once, at the boundary, in `command_group`; and the id
+travels as a type from there.
 
-### Not `AsRef<Path>`
+Two consequences worth naming, because both were discovered by the compiler
+rather than designed:
+
+- **`AttentionItem.group` went back to `String`.** Its own doc says the field is
+  *empty* for a plain, non-orchestration pane — and a `GroupId` cannot be empty.
+  That is the type earning its keep: a slot whose empty value is meaningful is a
+  display slot, not a group id. It never reaches a path join.
+- **`QueuedDelivery.group` became `Option<GroupId>`** — the one field where the
+  newtype could not simply replace the `String`, and the one place this design
+  had to give ground rather than the code.
+
+  A pre-#468 snapshot has no `group` key, which is what its `#[serde(default)]`
+  was for. `GroupId` has no `Default`, so a bare `GroupId` here would make such
+  an entry fail to deserialize. The first attempt did exactly that, and argued
+  it was an improvement: the entry "was never replayable anyway", so letting
+  `read_snapshot`'s `Err(_) => skipped += 1` count it seemed strictly safer.
+
+  That argument was wrong, and the existing suite said so.
+  `an_entry_from_an_older_build_parses_but_has_no_durable_identity` pins that a
+  legacy entry still **parses**, and its doc comment gives the reason: *"so its
+  payload is surfaced as an orphan"*. Failing to parse would have turned a
+  recoverable, human-visible payload into an anonymous number — an observability
+  regression wearing a safety argument's clothes.
+
+  `Option<GroupId>` says exactly what the empty string used to mean, "no recorded
+  identity", but says it in the type: it cannot be confused with a group or
+  joined onto a path. Consumers filter with `as_ref() == Some(group)`, so such an
+  entry matches nothing and is never replayed into a pane it was not for — which
+  is the other half of that test's contract, unchanged.
+
+### Not `AsRef<Path>`, and a test that says so
 
 `GroupId` deliberately does not implement `AsRef<Path>`, so it cannot be passed
-to `Path::join` directly. Holding a validated id is not the same as being allowed
-to build a path from it wherever you like; a group path comes from the declared
-root helper, and only from there. The type makes the shortcut inexpressible
-rather than merely discouraged.
+to `Path::join` at all. Holding a validated id is not the same as being allowed
+to build a path from it wherever you like; a group path comes from
+`group_dir_at`, and only from there.
+
+That is half the guarantee. The missing impl stops a `GroupId` reaching a `join`
+— it says nothing about the *string* inside one, which would compile fine. So
+the other half is `the_orchestration_root_is_joined_with_a_group_in_exactly_one_place`,
+a source-scanning test that parses every `.join(` argument under `src-tauri/src`
+and flags any naming a group — structural, not a list of spellings, because the
+first version *was* a list of spellings and missed one. It states its own
+boundary: `PathBuf::push` is not scanned (it cannot be told from `Vec::push`
+textually) and appears nowhere in the tree, so the scan is complete for the code
+as it stands and would not catch the first one added.
+
+A sibling, `every_group_taking_command_parses_its_id_at_the_boundary`, watches
+the other end. That one is the more valuable of the two: the sink is a single
+function, the sources are fifty, and it was a missing *source* — one command
+that never parsed — that survived a whole slice of review.
+
+It exists for a specific reason. **This section's claim was false for the whole
+of the first slice** and nothing caught it but a reviewer: `append_audit` and
+`promptsubmit_marker_path` are free functions taking a bare `root`, reached from
+`deliver_now`, which has no registry — so neither went through
+`OrchRegistry::group_dir`, and "and only from there" was prose, not fact. The
+fix was to make it true rather than to soften the sentence: `group_dir_at` is now
+a free function all four seams delegate to, and the test is what keeps a fifth
+from growing back.
 
 `Deref<Target = str>`, `AsRef<str>`, `Borrow<str>` and the `PartialEq` bridges
 are implemented, and for a plain reason: they let a `&GroupId` stand in wherever
@@ -185,6 +243,20 @@ persisted file and no frontend payload changes shape.
 - It does not re-scope the `ft_*`/`fm_*`/git `repo` families, which take
   arbitrary absolute paths and are the other half of §0's "server-declared
   roots". Those are a larger surface with their own trust story.
-- It does not close constraint 6. `group_dir` is still `root.join(<trusted
-  string>)` until #904's second half threads the type through the command
-  surface.
+- It does not make a group id a *capability*. Membership — "is this caller
+  entitled to this group?" — is still a separate check, and only
+  `save_attachment` performs one today.
+
+## What it does close
+
+Constraint 6 as originally written — "orchestration commands trust `group_id` as
+a path segment, safe only because the webview is trusted" — no longer describes
+the code. Nothing about a group path now rests on who called: the id is parsed at
+the command boundary, travels as a type, and reaches the filesystem through one
+helper that will not accept anything else.
+
+What remains for #888 is the part this was always a *prerequisite* for rather
+than a substitute for: authenticating the display client (§0 layer 1) and
+re-scoping the path-taking `ft_*`/`fm_*`/git families to server-declared roots.
+A validated `GroupId` says the string is a usable path segment. It says nothing
+about whether the peer holding it should be talking to that group at all.

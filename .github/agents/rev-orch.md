@@ -49,11 +49,15 @@ credits. Tests fake the agent side instead.
    lowercase-strict because the shim's `case` is), and that a `pass` still dies on a
    re-push. A change that makes a gate quietly *laxer* is the worst defect in this
    codebase; treat it as blocking.
-3. **The `group_id` trust boundary.** Orchestration commands join `group_id` onto a
-   path with no traversal or membership check. That is safe *only* because the
-   webview is trusted. Any new route from agent-controllable input (MCP arguments,
-   a workflow file, a PR title) into a group-scoped command is a real defect — say
-   so with the path you traced.
+3. **The `group_id` trust boundary.** A group id is a validated `GroupId`, parsed
+   at the command boundary, and becomes a path only inside `group_dir_at`. Treat
+   as a real defect: a second join, a path-building function taking a `&str`
+   group, an `AsRef<Path>` impl on `GroupId`, or any new construction path that
+   bypasses `GroupId::parse` (including a `Default`, or a serde field that
+   defaults). Validity is **not** membership — "may this caller touch this group?"
+   is a separate check, and code that treats a parsed id as authorization is the
+   defect this boundary is most likely to grow next. Say so with the path you
+   traced.
 4. **Windows build constraints** (they are load-bearing, not trivia):
    - **No getrandom-based crates** in `src-tauri` (uuid v4, `rand`, default-feature
      `tempfile`). They import `bcryptprimitives.dll!ProcessPrng`, which the Windows

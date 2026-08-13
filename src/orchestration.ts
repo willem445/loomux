@@ -240,8 +240,8 @@ export const setAutonomyBudget = (groupId: string, tokens: number): Promise<numb
  *  enable-time anchor, the spend metered since enable (`null` when off),
  *  `suspended` (budget enforcer turned autonomy off), and the idle-tick
  *  observability (status, countdown, minutes/floor knobs). */
-export const autonomyState = (groupId: string): Promise<AutonomyState> =>
-  invoke<AutonomyState>("orch_autonomy", { groupId });
+export const autonomyState = (groupId: string): Promise<AutonomyState | null> =>
+  invoke<AutonomyState | null>("orch_autonomy", { groupId });
 
 /** Set a group's idle-tick window in minutes (0 → backend default 5; clamped
  *  1..1440; durable, audited). Resolves to the applied value. */
@@ -1226,8 +1226,8 @@ export const groupPaused = (groupId: string): Promise<boolean> =>
   invoke<boolean>("orch_group_paused", { groupId });
 
 /** Aggregate per-pane session cost into one group summary. */
-export const groupUsage = (groupId: string): Promise<GroupUsage> =>
-  invoke<GroupUsage>("orch_group_usage", { groupId });
+export const groupUsage = (groupId: string): Promise<GroupUsage | null> =>
+  invoke<GroupUsage | null>("orch_group_usage", { groupId });
 
 // ---------- CI watches (#243/#248): the group view's "⏳ waiting on …" indicator ----------
 
@@ -1252,8 +1252,8 @@ export interface GroupWatch {
 
 /** Every live watch for a group's agents, for the group view's per-agent
  *  indicator. */
-export const groupWatches = (groupId: string): Promise<GroupWatch[]> =>
-  invoke<GroupWatch[]>("orch_group_watches", { groupId });
+export const groupWatches = (groupId: string): Promise<GroupWatch[] | null> =>
+  invoke<GroupWatch[] | null>("orch_group_watches", { groupId });
 
 // ---------- lock resources (#858): the group view's lock chrome ----------
 
@@ -1301,8 +1301,8 @@ export interface LockState {
  *  fell out of a permission set — exactly what a rebase drops — would make the
  *  whole feature silently cease to exist, indistinguishable from never having
  *  been configured. (rev-lead, PR #859 finding 9.) */
-export const lockState = (groupId: string): Promise<LockState> =>
-  invoke<LockState>("orch_lock_state", { groupId }).catch((err) => {
+export const lockState = (groupId: string): Promise<LockState | null> =>
+  invoke<LockState | null>("orch_lock_state", { groupId }).catch((err) => {
     console.warn("orch_lock_state failed — lock chrome hidden, which is NOT the same as no resources declared:", err);
     return { now_ms: Date.now(), resources: [] };
   });
@@ -1382,8 +1382,8 @@ export interface EndGroupResult {
 }
 
 /** Live-agent count, role breakdown, and uptime for the lifecycle panel. */
-export const groupSummary = (groupId: string): Promise<GroupSummary> =>
-  invoke<GroupSummary>("orch_group_summary", { groupId });
+export const groupSummary = (groupId: string): Promise<GroupSummary | null> =>
+  invoke<GroupSummary | null>("orch_group_summary", { groupId });
 
 /** End a whole orchestration: kill all its agents and (optionally) remove
  *  their worktrees. Destructive and human-initiated — the caller confirms
@@ -1467,8 +1467,8 @@ export interface WorkflowStatus {
 /** The group's live workflow-mode status for the lifecycle UI (Slice C). A
  *  slower, separate read from `groupSummary` (polled hot) — fetch on group
  *  open/refresh and after the toggle notice, like `groupWatches`. */
-export const workflowStatus = (groupId: string): Promise<WorkflowStatus> =>
-  invoke<WorkflowStatus>("orch_workflow_status", { groupId });
+export const workflowStatus = (groupId: string): Promise<WorkflowStatus | null> =>
+  invoke<WorkflowStatus | null>("orch_workflow_status", { groupId });
 
 /** LIVE advanced-orchestrator toggle (#316), reached from the groupview
  *  button (Slice C) — human action, not agent-triggered. Arms/clears the
@@ -1558,8 +1558,8 @@ export interface MergeQueueStatus {
 
 /** The group's merge queue, read-only (#581 slice F). Fetched on the same
  *  group open/refresh cadence as `workflowStatus`, not polled hot. */
-export const mergeQueue = (groupId: string): Promise<MergeQueueStatus> =>
-  invoke<MergeQueueStatus>("orch_merge_queue", { groupId });
+export const mergeQueue = (groupId: string): Promise<MergeQueueStatus | null> =>
+  invoke<MergeQueueStatus | null>("orch_merge_queue", { groupId });
 
 // ---------- cross-workspace channels (#271): human-only connect/disconnect ----------
 //

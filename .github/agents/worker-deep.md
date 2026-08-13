@@ -94,8 +94,11 @@ tell the orchestrator, so the next one like it goes to `worker-quick`.
   typed wrapper in `src/pty.ts` (or a per-feature bridge), and the wrapper reaches
   the backend through `src/transport.ts`, the only module that may import
   `@tauri-apps/*`. `test/transport.test.ts` enforces it.
-- **A workflow file can never grant a capability**, and `group_id` is trusted as a
-  path segment only because the webview is trusted. If your change routes
+- **A workflow file can never grant a capability**, and a group id becomes a path
+  in exactly one place: `group_dir_at`, which takes a validated `GroupId`. Never
+  add a second join, and never give a path-building function a `&str` group
+  parameter. Holding a valid `GroupId` is not membership — "may this caller touch
+  this group?" is still a separate check. If your change routes
   agent-controllable input anywhere near either, that is a design question — raise
   it.
 - **Never commit to `main`, never merge.** Branch from `main`, PR to `main`, and

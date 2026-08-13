@@ -71,7 +71,7 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// A pane blocked for hours accumulates reports/kickoffs from at most a
 /// handful of agents — 8 is generous headroom, not a measured traffic
@@ -392,8 +392,35 @@ pub struct QueuedDelivery {
     /// an entry whose agent has already been reaped would silently fall out
     /// of every group's snapshot. Stamped at admission, where the group is
     /// never in doubt.
-    #[serde(default)]
-    pub group: String,
+    /// #904: `Option<GroupId>` rather than `GroupId`, and the `#[serde(default)]`
+    /// stays — this is the one field where the newtype could not simply replace
+    /// the `String`, and the reason is a real behavior the suite already pinned.
+    ///
+    /// A pre-#468 snapshot has no `group` key at all. `GroupId` has no `Default`
+    /// (deliberately — the default would be the empty string the constructor
+    /// exists to refuse), so making this a bare `GroupId` would have made such an
+    /// entry fail to deserialize, and `read_snapshot`'s per-entry
+    /// `Err(_) => skipped += 1` would have swallowed it into an anonymous count.
+    /// That is a REGRESSION, not hardening:
+    /// `an_entry_from_an_older_build_parses_but_has_no_durable_identity` exists
+    /// to pin that a legacy entry still *parses*, precisely so its payload is
+    /// surfaced as an orphan rather than vanishing.
+    ///
+    /// `None` says exactly what the old empty string meant — "no recorded
+    /// identity" — but says it in the type, so it cannot be confused with a group
+    /// or silently joined onto a path. Every consumer filters with
+    /// `as_ref() == Some(group)`, so an entry with `None` matches nothing and is
+    /// never replayed into a pane it wasn't for.
+    /// `deserialize_with` (rev-440 N3): `Option<GroupId>` handles the *absent*
+    /// key, but a plain derive would still hard-fail on a **present but
+    /// unparseable** one — a leading-dash id from the old minter, say — and
+    /// `read_snapshot`'s `Err(_) => skipped += 1` would swallow the whole entry
+    /// into an anonymous number. That is verbatim the regression this field's
+    /// doc argues is unacceptable, arriving through the other door. An id that
+    /// does not parse maps to `None`, which is exactly what `None` already means
+    /// here: no recorded identity, matches nothing, never joined onto a path.
+    #[serde(default, deserialize_with = "lenient_group_id")]
+    pub group: Option<super::GroupId>,
     /// #467: whether the target was this group's orchestrator — the one
     /// delivery target with an identity that outlives a restart.
     ///
@@ -455,6 +482,16 @@ pub struct QueuedDelivery {
     /// takes no action against a live pane.
     #[serde(default)]
     pub delivery_kind: super::Delivery,
+}
+
+/// A persisted group id that fails [`GroupId::parse`] reads as `None` rather
+/// than failing the whole entry (rev-440 N3). See [`QueuedDelivery::group`].
+fn lenient_group_id<'de, D>(de: D) -> Result<Option<super::GroupId>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = Option::<String>::deserialize(de)?;
+    Ok(raw.and_then(|s| super::GroupId::parse(&s).ok()))
 }
 
 /// The outcome of offering a new TEXT payload to a pane's queue. Pure — no
@@ -2034,7 +2071,7 @@ mod tests {
             reason: EnqueueReason::Question,
             enqueued_ms: 1_000,
             coalesced: 0,
-            group: "g-1".into(),
+            group: Some("g-1".try_into().unwrap()),
             to_orchestrator: false,
             session_id: None,
             delivery_kind: super::super::Delivery::MidSession,
@@ -2083,7 +2120,7 @@ mod tests {
             reason: EnqueueReason::Question,
             enqueued_ms: 1_000,
             coalesced: 0,
-            group: "g-1".into(),
+            group: Some("g-1".try_into().unwrap()),
             to_orchestrator: false,
             session_id: None,
             delivery_kind: super::super::Delivery::MidSession,
@@ -2289,7 +2326,7 @@ mod tests {
             reason: EnqueueReason::Question,
             enqueued_ms: 1_000,
             coalesced: 0,
-            group: "g-1".into(),
+            group: Some("g-1".try_into().unwrap()),
             to_orchestrator: false,
             session_id: None,
             delivery_kind: super::super::Delivery::MidSession,

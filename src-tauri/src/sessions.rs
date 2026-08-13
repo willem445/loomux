@@ -1382,10 +1382,15 @@ fn to_session_info(source: &str, e: &IndexEntry, intent: &LaunchIntentStore) -> 
         (Some(role), None) if !e.cwd.is_empty() => {
             let gid = crate::orchestration::group_id_for_repo(&e.cwd);
             let exists = crate::orchestration::GroupId::parse(&gid).is_ok_and(|g| {
-                crate::orchestration::OrchRegistry::default_root()
-                    .join(g.as_str())
-                    .join("group.json")
-                    .is_file()
+                // #904: through the one assembly point, not a local join —
+                // this file is outside `orchestration`, which is exactly the
+                // kind of distance a second opinion grows in.
+                crate::orchestration::group_dir_at(
+                    &crate::orchestration::OrchRegistry::default_root(),
+                    &g,
+                )
+                .join("group.json")
+                .is_file()
             });
             (Some(role.clone()), exists.then_some(gid))
         }

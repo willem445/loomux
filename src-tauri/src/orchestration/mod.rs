@@ -1666,8 +1666,8 @@ struct PendingMaxNotice {
 /// the deadline out; the first change of a burst seeds a fresh entry. Pure, so
 /// the coalescing is unit-testable without a clock or a live registry.
 fn record_max_notice(
-    pending: &mut HashMap<String, PendingMaxNotice>,
-    group: &str,
+    pending: &mut HashMap<GroupId, PendingMaxNotice>,
+    group: &GroupId,
     from: u32,
     to: u32,
     now: u64,
@@ -1675,7 +1675,7 @@ fn record_max_notice(
 ) {
     let due_ms = now.saturating_add(debounce.as_millis() as u64);
     pending
-        .entry(group.to_string())
+        .entry(group.clone())
         .and_modify(|p| {
             p.to = to;
             p.due_ms = due_ms;
@@ -1689,10 +1689,10 @@ fn record_max_notice(
 /// — no orchestrator tokens spent announcing a no-op. Pure, so the flush
 /// decision is unit-testable without sleeping out the debounce.
 fn take_due_max_notices(
-    pending: &mut HashMap<String, PendingMaxNotice>,
+    pending: &mut HashMap<GroupId, PendingMaxNotice>,
     now: u64,
-) -> Vec<(String, u32, u32)> {
-    let due: Vec<String> = pending
+) -> Vec<(GroupId, u32, u32)> {
+    let due: Vec<GroupId> = pending
         .iter()
         .filter(|(_, p)| p.due_ms <= now)
         .map(|(g, _)| g.clone())
@@ -3897,10 +3897,31 @@ pub fn cli_can_host(cli: &str, role: Role) -> Result<(), String> {
 /// Reserved, backend-minted pseudo-group id for standalone (non-orchestration)
 /// panes given a channel-scoped MCP identity (#271 W3 addendum, part A).
 /// Never produced by `group_id_for_repo` (which always emits `{slug}-{8hex}`)
-/// — a fixed constant, so CLAUDE.md constraint 6's path-segment safety holds
-/// by provenance exactly like every other group id. Registered lazily
+/// — a fixed constant, so its path-segment safety held by provenance even
+/// before #904; it now parses like every other id (`solo_group_id`). Registered
+/// lazily
 /// (`OrchRegistry::ensure_solo_group`) the first time a solo pane is created.
 pub const SOLO_GROUP: &str = "__solo__";
+
+/// [`SOLO_GROUP`] as a validated [`GroupId`] (#904).
+///
+/// A `GroupId` owns a `String`, so it cannot be a `const` — hence the
+/// `OnceLock`, parsed once and handed out by reference so the ~10 call sites
+/// read exactly as they did when the constant was a `&str`.
+///
+/// The `expect` is deliberate, and is the one place in #904 that can panic. It
+/// is an assertion about a **literal in this file**, not about anything a
+/// caller supplies: the only way to reach it is to edit `SOLO_GROUP` itself to
+/// something the alphabet refuses, and
+/// `parse_accepts_every_group_id_shape_the_codebase_actually_uses` asserts
+/// exactly that pairing — so the test goes red before this line can ever run.
+/// The alternative, an `Option` threaded through ten call sites with ten
+/// different return types, buys nothing: every one of them would be handling a
+/// case that cannot happen, and the handling would be the only untested code.
+pub fn solo_group_id() -> &'static GroupId {
+    static SOLO: std::sync::OnceLock<GroupId> = std::sync::OnceLock::new();
+    SOLO.get_or_init(|| GroupId::parse(SOLO_GROUP).expect("SOLO_GROUP must be a valid group id"))
+}
 
 /// Which kind of start a `create_group` call is (#222).
 ///
@@ -8635,7 +8656,10 @@ fn intake_json(p: &workflow::IntakeProfile) -> Value {
 
 #[derive(Clone)]
 pub struct GroupInfo {
-    pub id: String,
+    /// #904: a `GroupId`, not a `String` — this is the field the great majority
+    /// of group-scoped paths in the process are ultimately built from, so
+    /// making it carry its own proof is what lets `group_dir` demand one.
+    pub id: GroupId,
     pub repo: String,
     pub guardrails: Guardrails,
 }
@@ -8643,7 +8667,10 @@ pub struct GroupInfo {
 #[derive(Clone, Debug)]
 pub struct AgentEntry {
     pub id: String,
-    pub group: String,
+    /// #904: validated. An agent record is read back off disk (`agents.json`)
+    /// and fed straight into path joins, so this is a construction site as much
+    /// as a command parameter is.
+    pub group: GroupId,
     pub name: String,
     /// Who set `name` — the precedence tier for renames (#95r). See
     /// [`NameSource`] and [`OrchRegistry::rename_agent`].
@@ -9101,6 +9128,12 @@ pub struct AttentionItem {
     /// Empty for a plain (non-orchestration) pane, which is keyed only by
     /// `pty_id` — the human's hand-opened shells have no agent identity (#40).
     pub agent_id: String,
+    /// Deliberately a `String` and **not** a [`GroupId`] (#904): the doc above
+    /// is the reason — this field is legitimately EMPTY for a plain pane, and
+    /// a `GroupId` cannot be empty by construction. That is the type doing its
+    /// job: a slot whose empty value is meaningful is a display slot, not a
+    /// group id, and it never reaches a path join. Attention items are read by
+    /// the badge and the toast, nothing else.
     pub group: String,
     pub name: String,
     /// `None` for a plain pane (no orchestration role).
@@ -9643,7 +9676,7 @@ pub struct UsageSnapshot {
 #[derive(Clone, Serialize)]
 pub struct SessionRole {
     pub session_id: String,
-    pub group_id: String,
+    pub group_id: GroupId,
     pub role: String,
     pub agent_name: String,
     /// Whether that group currently has live agents in this app instance.
@@ -9678,7 +9711,11 @@ pub struct SessionRole {
 #[derive(Clone, Debug)]
 pub struct Caller {
     pub agent_id: String,
-    pub group: String,
+    /// #904: validated. The MCP seam never takes a group as a tool *argument* —
+    /// it resolves one from the caller's token — so this was already
+    /// registry-provenance; carrying the type makes that structural rather than
+    /// a fact you have to trace `resolve_token` to establish.
+    pub group: GroupId,
     pub role: Role,
     /// The spawning block's `role_hint` (#250/#324) — `advisor` | `process` |
     /// `None`. Inert everywhere except `session_digest`'s dispatch gate (the
@@ -10181,7 +10218,7 @@ const OPENCODE_AGENT_FILE_EXT: &str = ".md";
 /// `block` needs no check here: block ids come from `workflow::sanitize_id`
 /// and are pinned to the same alphabet at parse time.
 #[doc(hidden)] // pub for integration tests
-pub fn generated_agent_handle(group: &str, block: &str) -> Option<String> {
+pub fn generated_agent_handle(group: &GroupId, block: &str) -> Option<String> {
     let group = GroupId::parse(group).ok()?;
     Some(format!("{GENERATED_AGENT_PREFIX}{group}-{block}"))
 }
@@ -10228,7 +10265,7 @@ fn clamp_agent_description(s: &str) -> String {
 /// Its one caller, `end_group`'s `reclaim_group_agent_files`, takes its
 /// conservative direction from this: it deletes only what THIS group owns,
 /// so a stem a more specific live group claims is never touched.
-fn owning_group<'a>(stem: &str, groups: &'a [String]) -> Option<&'a str> {
+fn owning_group<'a>(stem: &str, groups: &'a [GroupId]) -> Option<&'a GroupId> {
     groups
         .iter()
         .filter(|g| {
@@ -10236,7 +10273,6 @@ fn owning_group<'a>(stem: &str, groups: &'a [String]) -> Option<&'a str> {
                 .is_some_and(|block| !block.is_empty())
         })
         .max_by_key(|g| g.len())
-        .map(String::as_str)
 }
 
 
@@ -10330,7 +10366,7 @@ fn copilot_agent_body(block: &workflow::Block, persona: Option<&ResolvedPersona>
 /// value of `create_orchestration` (the orchestrator's own pane).
 #[derive(Clone, Debug, Serialize)]
 pub struct SpawnRequest {
-    pub group_id: String,
+    pub group_id: GroupId,
     pub agent_id: String,
     pub role: Role,
     pub name: String,
@@ -10367,7 +10403,7 @@ pub struct OrchRegistry {
     root: PathBuf,
     /// Absent in unit tests: spawning then skips the pane round-trip.
     app: Mutex<Option<AppHandle>>,
-    groups: Mutex<HashMap<String, GroupInfo>>,
+    groups: Mutex<HashMap<GroupId, GroupInfo>>,
     agents: Mutex<HashMap<String, AgentEntry>>,
     by_token: Mutex<HashMap<String, String>>,
     by_pty: Mutex<HashMap<u32, String>>,
@@ -10535,7 +10571,7 @@ pub struct OrchRegistry {
     /// `queue_orphans` for the orchestrator to re-derive. Nothing expires
     /// them: an entry silently vanishing from here is the exact failure #445
     /// exists to prevent.
-    recovered_queue: Arc<Mutex<HashMap<String, Vec<queue::PersistedEntry>>>>,
+    recovered_queue: Arc<Mutex<HashMap<GroupId, Vec<queue::PersistedEntry>>>>,
     /// `StrandedSubmit` markers a restart made unreplayable (#467), kept
     /// separately from `recovered_queue` and never offered to
     /// `readmit_recovered`.
@@ -10548,18 +10584,18 @@ pub struct OrchRegistry {
     /// orchestrator pane is bound yet, and `deliver_to_orchestrator` is
     /// best-effort by design. "Never silently dropped" cannot rest on a
     /// delivery that is allowed to not happen.
-    recovered_markers: Arc<Mutex<HashMap<String, Vec<queue::PersistedEntry>>>>,
+    recovered_markers: Arc<Mutex<HashMap<GroupId, Vec<queue::PersistedEntry>>>>,
     /// Groups whose `queue.json` has already been read back this process
     /// (#467) — recovery is lazy (first touch by a bind or a
     /// `queue_orphans` call) and must happen exactly once, or a second pass
     /// would re-stage entries a first pass already re-admitted and deliver
     /// them twice.
-    recovered_groups: Arc<Mutex<HashSet<String>>>,
+    recovered_groups: Arc<Mutex<HashSet<GroupId>>>,
     /// Groups whose merge queue has already been reconciled this process
     /// (#581 §4). Separate from `recovered_groups` on purpose: the delivery
     /// queue and the merge queue recover independently, and sharing one mark
     /// would make whichever ran first silently suppress the other.
-    mq_reconciled_groups: Arc<Mutex<HashSet<String>>>,
+    mq_reconciled_groups: Arc<Mutex<HashSet<GroupId>>>,
     /// Serializes every read-modify-write of a `merge_queue.json` (#698).
     ///
     /// The driver tick and the three MCP tools are on different threads, and
@@ -10587,7 +10623,7 @@ pub struct OrchRegistry {
     /// condition is a fact about the world rather than about the queue. A
     /// persisted backoff would keep punishing a batch for a network that has
     /// since come back.
-    mq_service_ms: Arc<Mutex<HashMap<String, u64>>>,
+    mq_service_ms: Arc<Mutex<HashMap<GroupId, u64>>>,
     /// Test seam (#698), the merge-queue sibling of `pr_head_override`: when
     /// set, `mq_driver_tick` drives with this runner instead of building a
     /// [`mqdriver::ProcessRunner`] over the group's repo. `None` in the app,
@@ -10704,7 +10740,7 @@ pub struct OrchRegistry {
     /// turn*, not a durable record. The durable record is the
     /// `notice-suppressed` audit line, which since #578 carries the notice
     /// text — so a loomux restart loses the relay and not the information.
-    orch_notice_inbox: Arc<Mutex<HashMap<String, OrchNoticeInbox>>>,
+    orch_notice_inbox: Arc<Mutex<HashMap<GroupId, OrchNoticeInbox>>>,
 
     /// Serializes task-board read-modify-write cycles (MCP threads and the
     /// human UI mutate the same tasks.json).
@@ -10757,7 +10793,7 @@ pub struct OrchRegistry {
     ///
     /// **Bounded by LIVE groups**: `end_group` drops the entry, so the map does
     /// not accumulate one per group this process ever opened.
-    usage_memo: Mutex<HashMap<String, Arc<Mutex<Option<(std::time::Instant, Value)>>>>>,
+    usage_memo: Mutex<HashMap<GroupId, Arc<Mutex<Option<(std::time::Instant, Value)>>>>>,
     /// Per-REPO memo for the display-only default-branch name (#743 S4a),
     /// keyed by repo path so two groups on one repo share the answer.
     ///
@@ -10934,10 +10970,10 @@ pub struct OrchRegistry {
     /// queued. Neither alone is sufficient — see `deliver_prompt`'s pause
     /// branch for the restart case that reaches the drainer without passing
     /// the front door.
-    paused: Mutex<HashSet<String>>,
+    paused: Mutex<HashSet<GroupId>>,
     /// Per-group spawn timestamps (Unix-ms) for the spawn-rate guardrail;
     /// pruned to the trailing hour on each check.
-    spawn_times: Mutex<HashMap<String, Vec<u64>>>,
+    spawn_times: Mutex<HashMap<GroupId, Vec<u64>>>,
     /// Weak handle to our own `Arc`, set once at startup (`set_self_arc`), so
     /// `&self` methods can hand an owned registry to background threads (e.g.
     /// the copilot session watcher). `Weak` avoids a self-referential `Arc`
@@ -10972,33 +11008,33 @@ pub struct OrchRegistry {
     /// resolved, and pruned in `attention_tick` when the agent stops running.
     attn_stranded: Mutex<HashMap<String, StrandedNote>>,
     /// Groups with desktop notifications enabled (durable `notify` marker file).
-    notify_groups: Mutex<HashSet<String>>,
+    notify_groups: Mutex<HashSet<GroupId>>,
     /// Autonomous mode (#83): groups whose orchestrator is idle-ticked to run its
     /// monitoring/intake cadence unattended. Durable via an `autonomous` marker
     /// file whose *content* is the enable-time usage-token anchor (see
     /// `set_autonomous` / `autonomy_anchor`), so budget metering survives restarts.
-    autonomous_groups: Mutex<HashSet<String>>,
+    autonomous_groups: Mutex<HashSet<GroupId>>,
     /// Autonomous mode (#83): groups where the orchestrator may merge an
     /// adequately-tested PR itself instead of holding at the human merge gate.
     /// Default OFF (absent) = today's behavior (human merges). Durable
     /// `auto_merge` marker file, mirroring `notify`/`paused`. The behavior lives
     /// in the orchestrator template; the backend stores/exposes the flag and
     /// mirrors it into the orchestrator's kickoff config.
-    auto_merge_groups: Mutex<HashSet<String>>,
+    auto_merge_groups: Mutex<HashSet<GroupId>>,
     /// Autonomous mode (#83): groups where the orchestrator may publish a
     /// release/tag itself (`gh release …`, pushing a `v*` tag) instead of needing a
     /// per-tag human grant. **Independent of `auto_merge`** — the human can allow
     /// auto-merge while keeping releases manual, or opt into both. Default OFF
     /// (absent), so turning autonomous on never surprise-publishes. Durable
     /// `auto_release` marker; gated behind autonomous exactly like `auto_merge`.
-    auto_release_groups: Mutex<HashSet<String>>,
+    auto_release_groups: Mutex<HashSet<GroupId>>,
     /// Supervised dangerous mode (#83): groups where the human — present and
     /// supervising — has authorized the orchestrator to merge/release itself
     /// WITHOUT being autonomous. Default OFF. **Mutually exclusive with
     /// `autonomous`**: enabling autonomous force-clears this, and enabling this is
     /// rejected while autonomous. Durable `dangerous_mode` marker; the gate's single
     /// decision point allows a privileged action via `(dangerous && !autonomous)`.
-    dangerous_groups: Mutex<HashSet<String>>,
+    dangerous_groups: Mutex<HashSet<GroupId>>,
     /// Groups that opted BACK OUT of the #260 default (delegate panes open
     /// docked/minimized so a burst of spawns doesn't crowd the orchestrator
     /// out of focus) and want every spawned pane to open expanded into the
@@ -11007,21 +11043,21 @@ pub struct OrchRegistry {
     /// set's *meaning* is inverted from `notify_groups`/`autonomous_groups`
     /// (there, presence enables a default-off feature; here, presence
     /// disables a default-on one). Durable `spawn_expanded` marker file.
-    spawn_expanded_groups: Mutex<HashSet<String>>,
+    spawn_expanded_groups: Mutex<HashSet<GroupId>>,
     /// Autonomous mode (#83): per-group idle-tick delivery timestamps (Unix-ms)
     /// for the `MAX_IDLE_TICKS_PER_HOUR` backstop; pruned to the trailing hour on
     /// each check. The runaway analogue of `spawn_times`.
-    idle_tick_times: Mutex<HashMap<String, Vec<u64>>>,
+    idle_tick_times: Mutex<HashMap<GroupId, Vec<u64>>>,
     /// Compact-nudge (#287): per-group `/compact` nudge delivery timestamps
     /// (Unix-ms) for the `MAX_COMPACT_NUDGES_PER_HOUR` backstop; pruned to the
     /// trailing hour on each check. Mirrors `idle_tick_times`.
-    compact_nudge_times: Mutex<HashMap<String, Vec<u64>>>,
+    compact_nudge_times: Mutex<HashMap<GroupId, Vec<u64>>>,
     /// Debounced cap-change notices (#79): group → its pending, not-yet-
     /// delivered `PendingMaxNotice`. `set_max_agents` folds rapid stepper
     /// clicks in here (persist/enforce/audit stay per-click); the
     /// `start_max_notice_flusher` loop delivers one coalesced notice per burst
     /// once the group falls quiet.
-    pending_max_notice: Mutex<HashMap<String, PendingMaxNotice>>,
+    pending_max_notice: Mutex<HashMap<GroupId, PendingMaxNotice>>,
     /// Which opencode-store degrade (#722) has already been audited for a
     /// group, so a persistent one costs one line instead of one per poll.
     ///
@@ -11035,7 +11071,7 @@ pub struct OrchRegistry {
     /// `Unavailable::Absent` is deliberately never recorded here and never
     /// audited: a group whose opencode panes have not booted has no store yet,
     /// which is the ordinary state, not an incident.
-    opencode_db_degraded: Mutex<HashMap<String, &'static str>>,
+    opencode_db_degraded: Mutex<HashMap<GroupId, &'static str>>,
     /// Test-only override of the Claude transcript root (`~/.claude/projects`).
     /// `None` in production. Set via `set_claude_projects_dir` so the usage
     /// reader can be pointed at a fixture tree without touching global env —
@@ -11077,7 +11113,7 @@ pub struct OrchRegistry {
     /// carries torn lines — every log written before the append fix — would
     /// otherwise emit a breadcrumb per poll and flood out the crash-forensics
     /// history it shares the file with. Report only when the count *changes*.
-    audit_skips_notified: Mutex<HashMap<String, usize>>,
+    audit_skips_notified: Mutex<HashMap<GroupId, usize>>,
     /// Notification backend (#243): registered self-addressed CI/run watches,
     /// keyed by watch id. Same lifetime class as the `attn_*` maps —
     /// per-live-agent, in-memory only (see `notify.rs`'s module doc and the
@@ -11093,11 +11129,11 @@ pub struct OrchRegistry {
     /// class as `watches`/`idle_tick_times`: a restart re-fires once on
     /// whatever is currently labeled/terminal (harmless — see
     /// `intake::label_deltas`'s doc) rather than persisting across restarts.
-    intake_seen: Mutex<HashMap<String, intake::IntakeSeenState>>,
+    intake_seen: Mutex<HashMap<GroupId, intake::IntakeSeenState>>,
     /// Idle-tick intake gate (#332): Unix-ms this group's poller last actually
     /// called `gh` (not merely last considered) — `intake::due_intake_polls`'s
     /// per-group interval floor.
-    intake_last_poll_ms: Mutex<HashMap<String, u64>>,
+    intake_last_poll_ms: Mutex<HashMap<GroupId, u64>>,
     /// Unified `gh` poller (#406): Unix-ms the intake half last ran its
     /// due-group SCAN — process-wide, one entry, not per group. Distinct from
     /// `intake_last_poll_ms` above, which is the per-group `gh`-call floor:
@@ -11115,12 +11151,12 @@ pub struct OrchRegistry {
     /// accumulate many polls' worth before anything consumes it. Cleared the
     /// moment a tick consumes it — whether the fire was triggered BY this
     /// signal or a later fallback fire swept it up alongside something else.
-    intake_pending: Mutex<HashMap<String, intake::PendingIntake>>,
+    intake_pending: Mutex<HashMap<GroupId, intake::PendingIntake>>,
     /// Idle-tick intake gate (#332): Unix-ms this group's orchestrator was
     /// last actually woken by an idle tick (a gated fire, a fallback fire, or
     /// any fire while the gate is disabled) — `intake::idle_tick_fallback_due`'s
     /// reference point.
-    idle_tick_last_fired_ms: Mutex<HashMap<String, u64>>,
+    idle_tick_last_fired_ms: Mutex<HashMap<GroupId, u64>>,
     /// Idle-tick fallback backoff (#864): how many consecutive unconditional
     /// fallback wakes this group has taken that found NOTHING — no intake
     /// signal, no pending CI watch, no watchdog stall (the `heartbeat` fire in
@@ -11134,7 +11170,7 @@ pub struct OrchRegistry {
     /// safe direction (the group goes back to its BASE cadence and has to
     /// re-earn the backoff by observing quiet again) and is why nothing
     /// persists it.
-    idle_tick_empty_streak: Mutex<HashMap<String, u32>>,
+    idle_tick_empty_streak: Mutex<HashMap<GroupId, u32>>,
     /// Notification backend (#243): per-group "we last saw this group as
     /// paused at tick-time T" bookkeeping, used by `notify_tick` to freeze
     /// the TTL clock across a pause. A group appears here only while
@@ -11143,19 +11179,19 @@ pub struct OrchRegistry {
     /// first tick that observes it unpaused. See `notify_tick`'s doc for why
     /// this can't simply live on `pause_group`/`resume_group` (they use real
     /// wall-clock time, which isn't the `now` a test injects).
-    paused_watch_since: Mutex<HashMap<String, u64>>,
+    paused_watch_since: Mutex<HashMap<GroupId, u64>>,
     /// Named lock resources (#858): per-group live lock state, keyed by group
     /// id and built lazily from that group's declared `resources:` block. Same
     /// lifetime class as `watches` — **in-memory only, deliberately**: every
     /// pane that could have held a lock dies with the process, so a lock file
     /// surviving a restart could only ever describe holders that no longer
     /// exist.
-    locks: Mutex<HashMap<String, locks::LockTable>>,
+    locks: Mutex<HashMap<GroupId, locks::LockTable>>,
     /// The lock sweep's pause bookkeeping — `paused_watch_since` for holds and
     /// queued requests, and separate from it on purpose: two tick paths
     /// crediting the same map would charge one pause span twice. See
     /// `locks_tick`.
-    paused_locks_since: Mutex<HashMap<String, u64>>,
+    paused_locks_since: Mutex<HashMap<GroupId, u64>>,
     /// Cross-workspace channels (#271): human-connected sets of two-or-more
     /// agent panes that may span different groups, keyed by channel id. Same
     /// lifetime class as `watches` — in-memory only, no persistence across a
@@ -11182,7 +11218,7 @@ pub struct OrchRegistry {
     /// leaves that state (the file regains `gates.merge`, or the gate is
     /// actually cleared via the toggle), so a LATER re-entry — a fresh edit
     /// — audits again rather than staying silent forever after the first.
-    merge_gate_removal_warned: Mutex<HashSet<String>>,
+    merge_gate_removal_warned: Mutex<HashSet<GroupId>>,
 }
 
 /// One member of a [`Channel`]: which group/agent pane is connected. Cached
@@ -11190,7 +11226,7 @@ pub struct OrchRegistry {
 /// need a second `agent()` lookup for a peer that may since have died.
 #[derive(Clone, Debug)]
 pub struct ChannelMember {
-    pub group: String,
+    pub group: GroupId,
     pub agent_id: String,
     pub name: String,
     pub role: Role,
@@ -11536,7 +11572,7 @@ fn confirm_copilot_autopilot_dialog(
     ptys: &crate::pty::PtyManager,
     pty_id: u32,
     root: &Path,
-    group: &str,
+    group: &GroupId,
     agent: &str,
     max_wait: Duration,
 ) -> bool {
@@ -11915,7 +11951,7 @@ fn sanitize_agent_name(name: &str) -> String {
 /// than calling it, so an expectation derived from the code cannot move with the
 /// code — the same independence argument `tests/fixtures/pre222` makes about the
 /// golden templates.
-fn kickoff_delivery_id(group_id: &str, agent_id: &str) -> String {
+fn kickoff_delivery_id(group_id: &GroupId, agent_id: &str) -> String {
     format!("{group_id}/{agent_id}/k1")
 }
 
@@ -11923,7 +11959,7 @@ fn kickoff_delivery_id(group_id: &str, agent_id: &str) -> String {
 /// on purpose: an agent whose instructions file failed to read still gets the
 /// rule's gist, and the rule's full form (including why a re-delivery is not a
 /// duplicate) lives in the role templates.
-fn kickoff_delivery_note(group_id: &str, agent_id: &str) -> String {
+fn kickoff_delivery_note(group_id: &GroupId, agent_id: &str) -> String {
     format!(
         "Delivery id: {id} — if you have ALREADY ACTED ON this delivery id, this is a \
          duplicate paste of one delivery, not new work: say so and do nothing else (see \
@@ -12264,6 +12300,21 @@ fn pre_trust_copilot_folder_in(home: &Path, location: &str, folder: &str) {
     }
 }
 
+/// **The single place a group-scoped path is assembled** (#904) — the
+/// `group_dir(root, &GroupId)` the issue asked for, as a free function so that
+/// the callers holding a bare `root` (`append_audit` and
+/// `promptsubmit_marker_path`, both reached from `deliver_now`, which has no
+/// registry) share it rather than each writing their own join.
+/// [`OrchRegistry::group_dir`] is the `&self` convenience over this.
+///
+/// Because [`GroupId`] does not implement `AsRef<Path>`, a validated id cannot
+/// be joined onto anything except through this function — the shortcut is not
+/// merely discouraged, it is unspellable. `the_orchestration_root_is_joined_with_a_group_in_exactly_one_place`
+/// pins that no second join grows back.
+pub(crate) fn group_dir_at(root: &Path, group: &GroupId) -> PathBuf {
+    root.join(group.as_str())
+}
+
 /// Stable, filesystem-safe group id for a repo path, so relaunching an
 /// orchestrator on the same repo reattaches to the same state directory.
 ///
@@ -12486,28 +12537,19 @@ fn append_durable(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// Any shim audit line must stay a single `printf`; building a line across two
 /// redirections would reintroduce exactly this bug across processes.
 ///
-/// #904: the group id is **validated here**, at the join, not trusted from the
-/// caller. `root.join(group)` with an unvalidated segment is the shape #888 §0
-/// names — a `..` component writes the audit log outside the orchestration
-/// root entirely. Auditing is best-effort by contract (see the doc's opening
-/// line), so a refusal drops the record and leaves a breadcrumb rather than
-/// propagating an error to a caller that has nowhere to put one. The refusal
-/// is logged as the `GroupIdError`, never as the offending string: an id that
-/// got this far is caller-chosen, and echoing it verbatim into a log file is
-/// how log injection starts.
+/// #904: the group id arrives here **already validated** — the parameter is a
+/// [`GroupId`], and the path is built by [`group_dir_at`], the one assembly
+/// point. There is no check in this function and there is deliberately nothing
+/// to check: a caller cannot construct an id that would escape.
 ///
-/// The `&str` here is the last of the internal seam #904's second half
-/// converts to `&GroupId`; when that lands, this parse moves up to the
-/// boundary and this function takes a value that is already proof.
-fn append_audit(root: &Path, group: &str, actor: &str, action: &str, detail: Value) {
-    let group = match GroupId::parse(group) {
-        Ok(g) => g,
-        Err(e) => {
-            crate::obs::breadcrumb("groupid", &format!("audit refused: {e}"));
-            return;
-        }
-    };
-    let dir = root.join(group.as_str());
+/// It was worth the type. This function is `root.join(group)` plus
+/// `create_dir_all`, so before #904 a `..` component wrote the audit log
+/// outside the orchestration root entirely — demonstrated on CI, not
+/// theorized. Auditing is best-effort by contract (see the doc's opening
+/// line) and returns `()`, so there was nowhere to put a refusal even once one
+/// was possible; making the argument unforgeable is what removed the need.
+fn append_audit(root: &Path, group: &GroupId, actor: &str, action: &str, detail: Value) {
+    let dir = group_dir_at(root, group);
     let record = json!({ "ts_ms": now_ms(), "actor": actor, "action": action, "detail": detail });
     let mut line = record.to_string();
     line.push('\n'); // newline in the same buffer — a separate write could be split off
@@ -16936,18 +16978,16 @@ impl Tier1ScanCensus {
 /// since a per-delivery baseline OFFSET, so appending (never truncating) is
 /// required.
 ///
-/// `None` for a group id that is not a valid path segment (#904). This is the
-/// second of the three raw `root.join(group)` sites and it is validated the
-/// same way `append_audit` is — at the join, because that is the only place
-/// that can be sure.
+/// #904: takes a [`GroupId`] and builds through [`group_dir_at`], so it is
+/// infallible again — there is no id it can be handed that would escape the
+/// root. It briefly returned `Option` during the first slice, when it still
+/// took a `&str` and validated at its own join; that was one of the raw joins
+/// the second slice removed.
 #[doc(hidden)] // pub for integration tests
-pub fn promptsubmit_marker_path(root: &Path, group: &str, agent_id: &str) -> Option<PathBuf> {
-    let group = GroupId::parse(group).ok()?;
-    Some(
-        root.join(group.as_str())
-            .join("hooks")
-            .join(format!("{agent_id}.promptsubmit.jsonl")),
-    )
+pub fn promptsubmit_marker_path(root: &Path, group: &GroupId, agent_id: &str) -> PathBuf {
+    group_dir_at(root, group)
+        .join("hooks")
+        .join(format!("{agent_id}.promptsubmit.jsonl"))
 }
 
 /// This delivery's baseline byte length into the `promptsubmit` marker,
@@ -17003,7 +17043,7 @@ pub fn poll_promptsubmit_hook(path: &Path, offset: usize, pasted: &str) -> Promp
 fn run_late_confirmation_monitor(
     app: AppHandle,
     root: PathBuf,
-    group: String,
+    group: GroupId,
     agent: String,
     pty_id: u32,
     hook_marker_path: PathBuf,
@@ -17709,7 +17749,7 @@ enum DeliverOutcome {
 fn deliver_now(
     app: AppHandle,
     root: PathBuf,
-    group: String,
+    group: GroupId,
     agent: String,
     pty_id: u32,
     text: String,
@@ -18110,7 +18150,7 @@ fn deliver_now(
     // via `$LOOMUX_GROUP_DIR`. So an empty path simply means the hook channel
     // never confirms, and the delivery falls through to its other confirmation
     // evidence — fail-closed, and never a path this process would have written.
-    let hook_marker_path = promptsubmit_marker_path(&root, &group, &agent).unwrap_or_default();
+    let hook_marker_path = promptsubmit_marker_path(&root, &group, &agent);
     let hook_baseline = promptsubmit_marker_len(&hook_marker_path);
 
     // Echo-verified typing: paste, then require the TUI to emit
@@ -19218,7 +19258,7 @@ impl Drop for DrainerGuard {
 /// `persist_queues` stays the single place the lock order, the lazy
 /// recovery and the best-effort failure policy are reasoned about.
 impl queuestate::QueueSnapshotWriter for OrchRegistry {
-    fn write_queue_snapshot(&self, group: &str) {
+    fn write_queue_snapshot(&self, group: &GroupId) {
         self.persist_queues(group);
     }
 }
@@ -19282,7 +19322,7 @@ impl From<(u64, KickoffTreatment)> for FreshFirstAttempt {
 fn run_queue_drainer(
     reg: Arc<OrchRegistry>,
     app: AppHandle,
-    group: String,
+    group: GroupId,
     pty_id: u32,
     fresh_first: Option<FreshFirstAttempt>,
     // #470 B1 review round 2: the generation `ensure_drainer` minted for
@@ -23052,7 +23092,7 @@ pub fn delivery_held_detail(agent_id: &str, reason: HeldReason) -> String {
 /// Pure so the shape is unit-testable without a harness that can capture an
 /// actually-emitted Tauri event (see `channel_connected_event`'s doc for why
 /// this codebase always factors payload construction out this way).
-pub fn delivery_held_event(agent_id: &str, group: &str, pty_id: u32, reason: HeldReason) -> Value {
+pub fn delivery_held_event(agent_id: &str, group: &GroupId, pty_id: u32, reason: HeldReason) -> Value {
     json!({
         "agent_id": agent_id, "group": group, "pty_id": pty_id,
         "reason": reason.as_str(), "detail": delivery_held_detail(agent_id, reason),
@@ -23726,8 +23766,48 @@ impl OrchRegistry {
         self.port.load(Ordering::SeqCst)
     }
 
-    fn group_dir(&self, group: &str) -> PathBuf {
-        self.root.join(group)
+    /// **The one place a group-scoped path is assembled** (#904). Every
+    /// group-scoped path in the process descends from this join.
+    ///
+    /// It takes a [`GroupId`], not a `&str`, and that is the whole point:
+    /// CLAUDE.md hard constraint 6 used to say this join *trusts* its caller,
+    /// which was never a claim about the id but about the transport — only our
+    /// own in-process webview can invoke a `#[tauri::command]`. That is a fact
+    /// #888's remote engine dissolves. The proof now travels with the value, so
+    /// the join cannot be reached with anything unvalidated, from any caller,
+    /// over any transport.
+    ///
+    /// `GroupId` deliberately does not implement `AsRef<Path>`, so this is not
+    /// merely the conventional place to build a group path — it is the only
+    /// expressible one.
+    fn group_dir(&self, group: &GroupId) -> PathBuf {
+        group_dir_at(&self.root, group)
+    }
+
+    /// The group id a launch on `repo` gets: repo-derived so a relaunch resumes
+    /// the same state directory, plus a `-{n}` tail because one repo can host
+    /// several *concurrent* orchestrations and those must never share a group
+    /// (their orchestrators would receive each other's worker reports). Takes
+    /// the first candidate with no live agents.
+    ///
+    /// #904 folded the two byte-identical copies of this scan
+    /// (`create_group_ex` and `promote_orchestrator_cli`) into one definition
+    /// while giving it a validated return type — the same argument
+    /// `opencode_db_path`'s doc makes: two call sites deriving one identity
+    /// independently is a disagreement waiting to happen, and this one decides
+    /// which directory a group's whole state lives in.
+    ///
+    /// `None` is unreachable in practice — `group_id_for_repo`'s output is
+    /// pinned parseable by `the_minter_can_never_produce_an_id_its_own_validator_rejects`,
+    /// and a `-{n}` tail preserves the alphabet — but it is returned rather
+    /// than `expect`ed, because both callers already have an error path and a
+    /// panic here would take down a launch.
+    fn next_group_id(&self, repo: &str) -> Option<GroupId> {
+        let base = group_id_for_repo(repo);
+        let id = (1..)
+            .map(|n| if n == 1 { base.clone() } else { format!("{base}-{n}") })
+            .find(|candidate| !self.group_is_live(candidate))?;
+        GroupId::parse(&id).ok()
     }
 
     /// This group's OpenCode session store — the file `OPENCODE_DB` points
@@ -23738,14 +23818,14 @@ impl OrchRegistry {
     /// disagreeing would not fail loudly: the reader would simply find no
     /// database and report an agent as having spent nothing.
     #[doc(hidden)] // pub for integration tests
-    pub fn opencode_db_path(&self, group: &str) -> PathBuf {
+    pub fn opencode_db_path(&self, group: &GroupId) -> PathBuf {
         self.group_dir(group).join(OPENCODE_DB_SUBDIR).join(OPENCODE_DB_FILE)
     }
 
     /// Scratch dir holding images pasted/attached into the steering strip (#72).
     /// A subdir of the group state dir, so it's naturally per-group and swept
     /// on group end alongside the worktrees.
-    fn attachments_dir(&self, group: &str) -> PathBuf {
+    fn attachments_dir(&self, group: &GroupId) -> PathBuf {
         self.group_dir(group).join("attachments")
     }
 
@@ -23755,7 +23835,7 @@ impl OrchRegistry {
     /// (unlike the instructions files): a pane's own directives are its own
     /// regardless of which block it's running, and a resume should still see
     /// them. See `note_directive`, the sole writer.
-    fn ledger_path(&self, group: &str, agent_id: &str) -> PathBuf {
+    fn ledger_path(&self, group: &GroupId, agent_id: &str) -> PathBuf {
         self.group_dir(group).join(format!("ledger-{agent_id}.log"))
     }
 
@@ -23764,7 +23844,7 @@ impl OrchRegistry {
     /// way that CLI consumes them (#72). Falls back to the default `claude`
     /// wording if the group isn't loaded (a save always follows a live steer, so
     /// this is just a safety net).
-    pub fn orchestrator_cli(&self, group: &str) -> String {
+    pub fn orchestrator_cli(&self, group: &GroupId) -> String {
         self.group(group)
             .map(|g| g.guardrails.cli_for(Role::Orchestrator).to_string())
             .unwrap_or_else(|| "claude".into())
@@ -23778,12 +23858,13 @@ impl OrchRegistry {
     /// verbatim: the image arrives as a browser Blob and we never decode it
     /// (no image crate, no `getrandom` deps) — only size and extension are
     /// validated. Files are reclaimed when the group ends (see `end_group`).
-    pub fn save_attachment(&self, group: &str, ext: &str, bytes: &[u8]) -> Result<PathBuf, String> {
+    pub fn save_attachment(&self, group: &GroupId, ext: &str, bytes: &[u8]) -> Result<PathBuf, String> {
         // Membership guard: only ever write under a real, known group id (#72
-        // review). The dir is `root.join(group)`, so without this a caller could
-        // steer `group` to a traversal component; requiring the group to exist
-        // pins it to a generated group token. Cheap hardening on top of the
-        // pre-existing trusted-webview model (see the orch-command notes).
+        // review). This is NOT the traversal check any more — #904 made that the
+        // `GroupId` parameter's job, and a traversal id is no longer expressible
+        // here. What survives is the other half, and it is the half a type
+        // cannot state: a well-formed id is not the same as a group that EXISTS,
+        // and this writes bytes to disk. Validity is not membership.
         if self.group(group).is_none() {
             return Err("unknown group".into());
         }
@@ -23814,7 +23895,7 @@ impl OrchRegistry {
 
     /// Append one JSON line to the group's audit log. Best-effort: auditing
     /// must never take the orchestration down.
-    pub fn audit(&self, group: &str, actor: &str, action: &str, detail: Value) {
+    pub fn audit(&self, group: &GroupId, actor: &str, action: &str, detail: Value) {
         append_audit(&self.root, group, actor, action, detail);
     }
 
@@ -23828,7 +23909,7 @@ impl OrchRegistry {
     /// goes to the breadcrumb log (#240). A non-zero count now means a writer
     /// is not appending whole lines, which is a bug worth seeing rather than a
     /// timeline that quietly comes up short.
-    pub fn audit_log(&self, group: &str) -> Vec<AuditEntry> {
+    pub fn audit_log(&self, group: &GroupId) -> Vec<AuditEntry> {
         self.audit_log_windowed(group).0
     }
 
@@ -23852,7 +23933,7 @@ impl OrchRegistry {
     /// `PauseSuppression::window_start_seen` — say when the scan ran off the
     /// start of its own timeline — with an exact signal available here because
     /// this is where the cut happens.
-    pub fn audit_log_windowed(&self, group: &str) -> (Vec<AuditEntry>, bool) {
+    pub fn audit_log_windowed(&self, group: &GroupId) -> (Vec<AuditEntry>, bool) {
         let dir = self.group_dir(group);
         let mut text = String::new();
         for name in ["audit.1.jsonl", "audit.jsonl"] {
@@ -23864,7 +23945,7 @@ impl OrchRegistry {
             }
         }
         let (mut entries, skipped) = parse_audit_lines_counted(&text);
-        if skipped > 0 && self.audit_skips_notified.lock_safe().insert(group.to_string(), skipped) != Some(skipped) {
+        if skipped > 0 && self.audit_skips_notified.lock_safe().insert(group.clone(), skipped) != Some(skipped) {
             // Only on a change: follow mode re-polls this, and a pre-fix log
             // keeps its torn lines forever (see `audit_skips_notified`).
             crate::obs::breadcrumb("audit-lines-unreadable", &format!("group={group} skipped={skipped}"));
@@ -23878,12 +23959,12 @@ impl OrchRegistry {
 
     // ---------- durable state ----------
 
-    pub fn get_state(&self, group: &str) -> String {
+    pub fn get_state(&self, group: &GroupId) -> String {
         fs::read_to_string(self.group_dir(group).join("state.json"))
             .unwrap_or_else(|_| "{}".to_string())
     }
 
-    pub fn set_state(&self, group: &str, state: &str) -> Result<(), String> {
+    pub fn set_state(&self, group: &GroupId, state: &str) -> Result<(), String> {
         if state.len() > MAX_STATE_BYTES {
             return Err(format!("state too large ({} bytes, max {MAX_STATE_BYTES})", state.len()));
         }
@@ -23902,7 +23983,7 @@ impl OrchRegistry {
 
     // ---------- task board ----------
 
-    pub fn tasks(&self, group: &str) -> Vec<Task> {
+    pub fn tasks(&self, group: &GroupId) -> Vec<Task> {
         fs::read_to_string(self.group_dir(group).join("tasks.json"))
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
@@ -23916,7 +23997,7 @@ impl OrchRegistry {
     /// `task_summaries_for_list_tasks` instead — this one stays the plain
     /// full-board projection existing callers (tests included) already rely
     /// on returning every row.
-    pub fn task_summaries(&self, group: &str) -> Vec<TaskSummary> {
+    pub fn task_summaries(&self, group: &GroupId) -> Vec<TaskSummary> {
         board_summaries(&self.tasks(group))
     }
 
@@ -23925,7 +24006,7 @@ impl OrchRegistry {
     /// newest by `updated_ms` — with the omitted count returned alongside so
     /// the caller can say so rather than silently truncating. See
     /// `filter_done_rows` for the keep/drop rule.
-    pub fn task_summaries_for_list_tasks(&self, group: &str, include_all: bool) -> (Vec<TaskSummary>, usize) {
+    pub fn task_summaries_for_list_tasks(&self, group: &GroupId, include_all: bool) -> (Vec<TaskSummary>, usize) {
         let rows = self.task_summaries(group);
         if include_all {
             (rows, 0)
@@ -23936,7 +24017,7 @@ impl OrchRegistry {
 
     /// One full task (including its capped note history) by id — the detail
     /// view `list_tasks`'s compact rows point at (#245).
-    pub fn get_task(&self, group: &str, id: &str) -> Option<Task> {
+    pub fn get_task(&self, group: &GroupId, id: &str) -> Option<Task> {
         self.tasks(group).into_iter().find(|t| t.id == id)
     }
 
@@ -23954,7 +24035,7 @@ impl OrchRegistry {
     /// is very often already dead/reaped — a live-only lookup would return
     /// "unknown agent" for the exact case the process-pro persona spawns
     /// into (#324: "spawned at merge-gate resolution").
-    pub fn session_digest(&self, group: &str, lookup: DigestLookup) -> Result<digest::SessionDigest, String> {
+    pub fn session_digest(&self, group: &GroupId, lookup: DigestLookup) -> Result<digest::SessionDigest, String> {
         let (session_id, cli, final_diff_ref, outcome, title) = match lookup {
             DigestLookup::Agent(agent_id) => {
                 let rec = self
@@ -24035,7 +24116,7 @@ impl OrchRegistry {
     /// digest that must still be returned. `sessions_scanned` on the digest
     /// reports how many were ACTUALLY read, so a skip is visible as a smaller
     /// denominator rather than silently inflating confidence.
-    fn corroborating_session_keys(&self, group: &str, target_session: &str) -> (Vec<(String, Vec<String>)>, bool) {
+    fn corroborating_session_keys(&self, group: &GroupId, target_session: &str) -> (Vec<(String, Vec<String>)>, bool) {
         let mut recs = self.merged_records(group);
         recs.sort_by_key(|r| std::cmp::Reverse(r.updated_ms));
         let mut seen: HashSet<String> = HashSet::new();
@@ -24062,7 +24143,7 @@ impl OrchRegistry {
     /// The CLI a roster row's block/role resolves to, dead-agent-safe (unlike
     /// `cli_for_agent`, which needs a live `AgentEntry`). Mirrors its
     /// fallback: unresolvable role/group both fall back to `"claude"`.
-    fn cli_for_record(&self, group: &str, rec: &AgentRecord) -> String {
+    fn cli_for_record(&self, group: &GroupId, rec: &AgentRecord) -> String {
         let role = workflow::kind_from_str(&rec.role).unwrap_or(Role::Worker);
         self.group(group).map(|g| g.guardrails.cli_for(role).to_string()).unwrap_or_else(|| "claude".to_string())
     }
@@ -24088,7 +24169,7 @@ impl OrchRegistry {
     /// up on disk is not one to go looking for in a database either.
     fn read_session_transcript_events(
         &self,
-        group: &str,
+        group: &GroupId,
         cli: &str,
         session_id: &str,
     ) -> Result<Vec<digest::TranscriptEvent>, String> {
@@ -24149,7 +24230,7 @@ impl OrchRegistry {
         }
     }
 
-    fn write_tasks(&self, group: &str, tasks: &[Task]) -> Result<(), String> {
+    fn write_tasks(&self, group: &GroupId, tasks: &[Task]) -> Result<(), String> {
         let dir = self.group_dir(group);
         fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         // Atomic replace: the incident that filed #133 was a disk-full
@@ -24161,7 +24242,7 @@ impl OrchRegistry {
         Ok(())
     }
 
-    fn emit_tasks_changed(&self, group: &str) {
+    fn emit_tasks_changed(&self, group: &GroupId) {
         if let Some(app) = self.app.lock_safe().clone() {
             let _ = app.emit("orch-tasks-changed", json!({ "group_id": group }));
         }
@@ -24176,7 +24257,7 @@ impl OrchRegistry {
     /// exactly as it was, inside the one `tasks_lock` this method already held.
     pub fn upsert_task(
         &self,
-        group: &str,
+        group: &GroupId,
         actor: &str,
         id: Option<&str>,
         patch: TaskPatch,
@@ -24356,7 +24437,7 @@ impl OrchRegistry {
         Ok(snapshot)
     }
 
-    pub fn delete_task(&self, group: &str, actor: &str, id: &str) -> Result<(), String> {
+    pub fn delete_task(&self, group: &GroupId, actor: &str, id: &str) -> Result<(), String> {
         let _guard = self.tasks_lock.lock_safe();
         let mut tasks = self.tasks(group);
         let before = tasks.len();
@@ -24379,7 +24460,7 @@ impl OrchRegistry {
     /// coalesced notice is emitted here (best-effort), so callers must not fan
     /// out per-task notices. A no-op (nothing done) writes nothing and notifies
     /// nothing.
-    pub fn delete_done_tasks(&self, group: &str, actor: &str) -> Result<Vec<String>, String> {
+    pub fn delete_done_tasks(&self, group: &GroupId, actor: &str) -> Result<Vec<String>, String> {
         let removed = {
             let _guard = self.tasks_lock.lock_safe();
             let mut tasks = self.tasks(group);
@@ -24414,7 +24495,7 @@ impl OrchRegistry {
     /// orchestrator or a batch may have removed a row since they clicked) — and
     /// the skipped ids are recorded in the audit entry. An empty selection, or
     /// one matching nothing, writes nothing and notifies nothing.
-    pub fn delete_tasks(&self, group: &str, actor: &str, ids: &[String]) -> Result<Vec<String>, String> {
+    pub fn delete_tasks(&self, group: &GroupId, actor: &str, ids: &[String]) -> Result<Vec<String>, String> {
         let removed = {
             let _guard = self.tasks_lock.lock_safe();
             let mut tasks = self.tasks(group);
@@ -24453,7 +24534,7 @@ impl OrchRegistry {
 
     /// Reorder by explicit id list (board order = priority). Ids not
     /// mentioned keep their relative order after the mentioned ones.
-    pub fn reorder_tasks(&self, group: &str, actor: &str, ids: &[String]) -> Result<(), String> {
+    pub fn reorder_tasks(&self, group: &GroupId, actor: &str, ids: &[String]) -> Result<(), String> {
         let _guard = self.tasks_lock.lock_safe();
         let mut tasks = self.tasks(group);
         let mut ordered: Vec<Task> = Vec::with_capacity(tasks.len());
@@ -24472,7 +24553,7 @@ impl OrchRegistry {
     /// shows the buttons on `pr`/`human-testing` items, but the command surface
     /// is callable directly, so enforce it backend-side too — approving a
     /// `queued` item or requesting changes on a `done` one is meaningless.
-    fn ensure_at_merge_gate(&self, group: &str, id: &str) -> Result<(), String> {
+    fn ensure_at_merge_gate(&self, group: &GroupId, id: &str) -> Result<(), String> {
         let status = self
             .tasks(group)
             .into_iter()
@@ -24498,7 +24579,7 @@ impl OrchRegistry {
     /// the call returns `Err` with the item already flipped `done` and nothing
     /// announced. That is deliberate — an unannounced state the human sees an
     /// error for beats a confident notice that misdescribes what was authorized.
-    pub fn approve_task(&self, group: &str, id: &str, comment: Option<&str>) -> Result<Task, String> {
+    pub fn approve_task(&self, group: &GroupId, id: &str, comment: Option<&str>) -> Result<Task, String> {
         self.ensure_at_merge_gate(group, id)?;
         let task = self.upsert_task(
             group,
@@ -24576,7 +24657,7 @@ impl OrchRegistry {
     /// by whether a write succeeded (#507 review B1).
     ///
     /// An empty selection writes nothing and notifies nothing.
-    pub fn approve_tasks(&self, group: &str, items: &[ApproveItem]) -> Result<Vec<Task>, String> {
+    pub fn approve_tasks(&self, group: &GroupId, items: &[ApproveItem]) -> Result<Vec<Task>, String> {
         if items.is_empty() {
             return Ok(Vec::new());
         }
@@ -24677,7 +24758,7 @@ impl OrchRegistry {
     /// Merge-gate request-changes: record the findings as a note and deliver
     /// them to the orchestrator to route back to a worker. Status is left for
     /// the orchestrator to manage as it re-dispatches.
-    pub fn request_changes(&self, group: &str, id: &str, findings: &str) -> Result<Task, String> {
+    pub fn request_changes(&self, group: &GroupId, id: &str, findings: &str) -> Result<Task, String> {
         let findings = findings.trim();
         if findings.is_empty() {
             return Err("request changes needs a note describing what to fix".into());
@@ -24706,7 +24787,7 @@ impl OrchRegistry {
     /// shows the button on `queued` items, but the command surface is callable
     /// directly, so enforce it backend-side too — starting an in-progress or
     /// done item is meaningless.
-    fn ensure_queued(&self, group: &str, id: &str) -> Result<(), String> {
+    fn ensure_queued(&self, group: &GroupId, id: &str) -> Result<(), String> {
         let status = self
             .tasks(group)
             .into_iter()
@@ -24736,7 +24817,7 @@ impl OrchRegistry {
     /// apart to be worth a synchronous error instead of a silent guess. Reject
     /// before any mutation so no note is appended, and let the human resume
     /// first — the same call `steer_orchestrator` makes for the same reason.
-    pub fn start_task(&self, group: &str, id: &str) -> Result<Task, String> {
+    pub fn start_task(&self, group: &GroupId, id: &str) -> Result<Task, String> {
         self.ensure_queued(group, id)?;
         if self.is_paused(group) {
             return Err("group is paused — resume before starting tasks".into());
@@ -24765,7 +24846,7 @@ impl OrchRegistry {
     /// shows the button on prototype items, but the command surface is callable
     /// directly, so enforce it backend-side too (constraint 6) — "proceeding" a
     /// queued or done item is meaningless.
-    fn ensure_prototype(&self, group: &str, id: &str) -> Result<(), String> {
+    fn ensure_prototype(&self, group: &GroupId, id: &str) -> Result<(), String> {
         let status = self
             .tasks(group)
             .into_iter()
@@ -24790,7 +24871,7 @@ impl OrchRegistry {
     /// decision even if a paused group drops the notice — so this does NOT reject
     /// on pause (the orchestrator sees the flip + note on resume via list_tasks).
     /// The notice is best-effort (the board is the source of truth).
-    pub fn proceed_task(&self, group: &str, id: &str) -> Result<Task, String> {
+    pub fn proceed_task(&self, group: &GroupId, id: &str) -> Result<Task, String> {
         self.ensure_prototype(group, id)?;
         let task = self.upsert_task(
             group,
@@ -24820,7 +24901,7 @@ impl OrchRegistry {
 
     /// Tell the orchestrator the human touched the board (best-effort; the
     /// board itself is the source of truth via list_tasks).
-    fn notify_board_edit(&self, group: &str, summary: &str) {
+    fn notify_board_edit(&self, group: &GroupId, summary: &str) {
         let _ = self.deliver_to_orchestrator(
             group,
             &format!("[loomux] the human updated the task board: {summary}. Call list_tasks to sync."),
@@ -24944,7 +25025,7 @@ impl OrchRegistry {
     /// won't cut) leaves its id spent, which is unchanged from before this and
     /// deliberately not "fixed": returning an id to the pool is exactly the
     /// reuse this closes. The sequence has gaps; that is what a gap means.
-    fn mint_agent_seq(&self, group: &str) -> u32 {
+    fn mint_agent_seq(&self, group: &GroupId) -> u32 {
         let _writer = self.agent_seq_persist.lock_safe();
         self.seed_agent_seq_locked();
         // `saturating_add` under the lock, not `fetch_add` (rev-13 N1). A
@@ -25027,7 +25108,7 @@ impl OrchRegistry {
         let _ = atomic_write(&path, body.as_bytes());
     }
 
-    fn group_records(&self, group: &str) -> Vec<AgentRecord> {
+    fn group_records(&self, group: &GroupId) -> Vec<AgentRecord> {
         fs::read_to_string(self.group_dir(group).join("agents.json"))
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
@@ -25053,7 +25134,7 @@ impl OrchRegistry {
     pub fn capture_session_baseline(
         &self,
         cli: &str,
-        group: &str,
+        group: &GroupId,
     ) -> Option<SessionBaseline> {
         match cli {
             "copilot" => crate::sessions::copilot_session_state_root().map(|root| {
@@ -25093,7 +25174,7 @@ impl OrchRegistry {
     fn spawn_session_watcher(
         self: Arc<Self>,
         agent_id: String,
-        group_id: String,
+        group_id: GroupId,
         cwd: String,
         baseline: SessionBaseline,
     ) {
@@ -25147,7 +25228,7 @@ impl OrchRegistry {
     #[doc(hidden)] // pub for integration tests
     pub fn search_for_session(
         &self,
-        group_id: &str,
+        group_id: &GroupId,
         agent_id: &str,
         cwd: &str,
         baseline: &SessionBaseline,
@@ -25192,7 +25273,7 @@ impl OrchRegistry {
     /// spawned had its session created before the baseline snapshot, so the
     /// baseline already excludes it — reading `agents.json` every poll would
     /// buy nothing and put a file read on a polled path.
-    fn claimed_sessions(&self, group_id: &str, except_agent: &str) -> HashSet<String> {
+    fn claimed_sessions(&self, group_id: &GroupId, except_agent: &str) -> HashSet<String> {
         self.agents
             .lock_safe()
             .values()
@@ -25212,7 +25293,7 @@ impl OrchRegistry {
     /// formality: see the comment inside, and note that a caller which treats
     /// `false` as "done" turns a lost race into a permanently unidentified
     /// pane. The watcher keeps polling instead.
-    pub fn associate_session(&self, group_id: &str, agent_id: &str, session_id: &str) -> bool {
+    pub fn associate_session(&self, group_id: &GroupId, agent_id: &str, session_id: &str) -> bool {
         // The lock scope DECIDES; everything else happens after the guard
         // drops — same shape, and same reason, as `note_opencode_db_degrade`:
         // `audit` takes its own locks, and holding an unrelated one across it
@@ -25297,7 +25378,7 @@ impl OrchRegistry {
     /// Roster entries derived from `agent-spawn` audit lines. Backfill for
     /// groups created before agents.json existed — their session-to-role
     /// mapping lives only in the audit log.
-    fn records_from_audit(&self, group: &str) -> Vec<AgentRecord> {
+    fn records_from_audit(&self, group: &GroupId) -> Vec<AgentRecord> {
         // Oldest first so newer spawns win the (id, session) upsert; the
         // rotated generation holds the older entries.
         let mut text = String::new();
@@ -25360,7 +25441,7 @@ impl OrchRegistry {
     /// are the stable key: ids stopped recycling in #524, but rosters written
     /// before it are still on disk and do repeat them, so dedup by id would
     /// still merge two different agents' records on existing installs.
-    fn merged_records(&self, group: &str) -> Vec<AgentRecord> {
+    fn merged_records(&self, group: &GroupId) -> Vec<AgentRecord> {
         // One group's roster + full audit log read and parsed — the unit
         // `GROUP_RECORD_SCANS` counts, so a test can pin how MANY groups a
         // lookup touches instead of how long it took (#514).
@@ -25386,7 +25467,8 @@ impl OrchRegistry {
             return out;
         };
         for e in entries.flatten() {
-            let group_id = e.file_name().to_string_lossy().into_owned();
+            // #904: a directory name is an id from outside this process — parse it.
+            let Ok(group_id) = GroupId::parse(&e.file_name().to_string_lossy()) else { continue };
             if !e.path().join("group.json").is_file() {
                 continue;
             }
@@ -25469,7 +25551,7 @@ impl OrchRegistry {
     /// COUNT (`group_record_scans_for_test`) and only prints the durations,
     /// because the wall-clock margin went flaky on loaded CI runners while
     /// the count never can.
-    fn session_role_in_group(&self, group_id: &str, session_id: &str) -> Option<SessionRole> {
+    fn session_role_in_group(&self, group_id: &GroupId, session_id: &str) -> Option<SessionRole> {
         if !self.group_dir(group_id).join("group.json").is_file() {
             return None;
         }
@@ -25489,7 +25571,7 @@ impl OrchRegistry {
                 let pr = pr_by_session.get(&session).cloned();
                 SessionRole {
                     session_id: session,
-                    group_id: group_id.to_string(),
+                    group_id: group_id.clone(),
                     role: r.role,
                     agent_name: r.name,
                     group_live: live,
@@ -25506,7 +25588,7 @@ impl OrchRegistry {
     /// See [`read_blocks`] for how a pre-#222 group.json (flat per-role fields,
     /// no `blocks` array) is migrated to the block roster on read.
     #[doc(hidden)] // pub for integration tests (the #222 migration is asserted on this)
-    pub fn load_group_file(&self, group: &str) -> Option<(String, Guardrails)> {
+    pub fn load_group_file(&self, group: &GroupId) -> Option<(String, Guardrails)> {
         let v: Value =
             serde_json::from_str(&fs::read_to_string(self.group_dir(group).join("group.json")).ok()?).ok()?;
         let repo = v["repo"].as_str()?.to_string();
@@ -25591,7 +25673,7 @@ impl OrchRegistry {
     /// model filled in at launch doesn't read as drift. A file that has since been
     /// deleted or broken is drift too: the group is running blocks its repo no
     /// longer declares, which is exactly the thing worth being able to see.
-    fn audit_workflow_drift(&self, id: &str, repo: &str, g: &Guardrails) {
+    fn audit_workflow_drift(&self, id: &GroupId, repo: &str, g: &Guardrails) {
         let ids = |bs: &[workflow::Block]| -> Vec<String> { bs.iter().map(|b| b.id.clone()).collect() };
         // #382 NB2: intake drifts independently of the roster — a repo can
         // rename its label vocabulary without touching a single block, and
@@ -25677,11 +25759,7 @@ impl OrchRegistry {
     /// `None` when the roster declares no orchestrator block at all — that is
     /// `register_orchestrator_pane`'s error to raise, not this one's.
     fn promote_orchestrator_cli(&self, repo: &str, caller: &Guardrails) -> Option<String> {
-        let base = group_id_for_repo(repo);
-        let id = (1..)
-            .map(|n| if n == 1 { base.clone() } else { format!("{base}-{n}") })
-            .find(|candidate| !self.group_is_live(candidate))
-            .unwrap();
+        let id = self.next_group_id(repo)?;
         let mut rails = caller.clone();
         if self.group_dir(&id).join("group.json").is_file() {
             // Reattach: the roster, its inherited CLI and the toggle come off
@@ -25723,11 +25801,9 @@ impl OrchRegistry {
         // but a repo can host several *concurrent* orchestrations, and those
         // must never share a group (their orchestrators would receive each
         // other's worker reports). Take the first id without live agents.
-        let base = group_id_for_repo(repo);
-        let id = (1..)
-            .map(|n| if n == 1 { base.clone() } else { format!("{base}-{n}") })
-            .find(|candidate| !self.group_is_live(candidate))
-            .unwrap();
+        let id = self
+            .next_group_id(repo)
+            .ok_or_else(|| "could not derive a valid group id for this repo".to_string())?;
         let dir = self.group_dir(&id);
         fs::create_dir_all(dir.join("configs")).map_err(|e| e.to_string())?;
         let resumed = dir.join("group.json").is_file();
@@ -26197,7 +26273,7 @@ impl OrchRegistry {
     // ---------- cost containment: pause, idle-kill, spawn-rate, usage ----------
 
     /// Whether a group is currently paused (prompts/kickoffs suppressed).
-    pub fn is_paused(&self, group: &str) -> bool {
+    pub fn is_paused(&self, group: &GroupId) -> bool {
         self.paused.lock_safe().contains(group)
     }
 
@@ -26213,8 +26289,8 @@ impl OrchRegistry {
     /// the human signed off on: a pause that loses a worker's `report("done")`
     /// costs more than the tokens it saved, because the orchestrator then
     /// waits on a report that is never coming.
-    pub fn pause_group(&self, group: &str) -> Result<(), String> {
-        let newly = self.paused.lock_safe().insert(group.to_string());
+    pub fn pause_group(&self, group: &GroupId) -> Result<(), String> {
+        let newly = self.paused.lock_safe().insert(group.clone());
         if newly {
             let dir = self.group_dir(group);
             fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -26245,7 +26321,7 @@ impl OrchRegistry {
     /// weaker true one is that a pause no longer destroys deliveries *at the
     /// pause branch*, and the cap is where the remaining loss lives. See its
     /// doc.
-    pub fn resume_group(&self, group: &str) -> Result<(), String> {
+    pub fn resume_group(&self, group: &GroupId) -> Result<(), String> {
         let was = self.paused.lock_safe().remove(group);
         if was {
             let _ = fs::remove_file(self.group_dir(group).join("paused"));
@@ -26318,12 +26394,12 @@ impl OrchRegistry {
     /// double resume costs nothing. Best-effort in exactly one respect — with
     /// no `AppHandle` (a bare test registry) no thread can be spawned at all,
     /// the same limitation every other drainer-spawning site has.
-    fn flush_paused_queues(&self, group: &str) {
+    fn flush_paused_queues(&self, group: &GroupId) {
         let panes: Vec<u32> = {
             let queues = self.queues.read();
             let mut panes: Vec<u32> = queues
                 .iter()
-                .filter(|(_, q)| q.iter().any(|d| d.group == group))
+                .filter(|(_, q)| q.iter().any(|d| d.group.as_ref() == Some(group)))
                 .map(|(pty_id, _)| *pty_id)
                 .collect();
             // Ascending, so the audit line below reads the same on every run
@@ -26369,7 +26445,7 @@ impl OrchRegistry {
         if let (Some(app), Some(reg)) = (app, reg) {
             for (pty_id, treatment) in treatments {
                 reg.ensure_drainer(
-                    app.clone(), group.to_string(), pty_id,
+                    app.clone(), group.clone(), pty_id,
                     treatment.map(FreshFirstAttempt::from),
                 );
             }
@@ -26394,7 +26470,7 @@ impl OrchRegistry {
     /// real `AppHandle` to do anything observable, so a headless test — which
     /// is every test in this repo — cannot reach a decision made inside it.
     #[doc(hidden)] // pub for integration tests
-    pub fn paused_flush_kickoff(&self, group: &str, pty_id: u32) -> Option<(u64, KickoffTreatment)> {
+    pub fn paused_flush_kickoff(&self, group: &GroupId, pty_id: u32) -> Option<(u64, KickoffTreatment)> {
         let front = {
             let queues = self.queues.read();
             queues.get(&pty_id).and_then(|q| q.front()).cloned()
@@ -26403,7 +26479,7 @@ impl OrchRegistry {
         // can only fail if `flush_paused_queues`' own pane filter and this
         // read ever disagree. Cheap to state; the safe answer either way is
         // no treatment.
-        if front.group != group {
+        if front.group.as_ref() != Some(group) {
             return None;
         }
         let kind = front.delivery_kind;
@@ -26485,7 +26561,7 @@ impl OrchRegistry {
     /// (#563's argument). A pane already carrying somebody else's badge is
     /// left alone: that badge is telling the human to look at the same pane
     /// and it is not ours to overwrite, matching `note_queue_capacity`.
-    fn announce_pause_suppression(&self, group: &str, swallowed: &PauseSuppression) {
+    fn announce_pause_suppression(&self, group: &GroupId, swallowed: &PauseSuppression) {
         if swallowed.items.is_empty() {
             return;
         }
@@ -26547,7 +26623,7 @@ impl OrchRegistry {
     /// `idle_kill_minutes`. Pure selection (no killing) so the reaper policy
     /// is testable at a chosen `now`.
     pub fn idle_reap_candidates(&self, now: u64) -> Vec<String> {
-        let thresholds: HashMap<String, u32> = self
+        let thresholds: HashMap<GroupId, u32> = self
             .groups
             .lock_safe()
             .iter()
@@ -26763,7 +26839,7 @@ impl OrchRegistry {
         outputs: &HashMap<String, u64>,
         has_watch: &HashMap<String, Vec<String>>,
     ) -> Vec<String> {
-        let thresholds: HashMap<String, u32> = self
+        let thresholds: HashMap<GroupId, u32> = self
             .groups
             .lock_safe()
             .iter()
@@ -26774,8 +26850,8 @@ impl OrchRegistry {
         // First pass under the agents lock: refresh counters and pick who to
         // nudge or suppress. Delivery (which types into a pane and can block)
         // happens after the lock is released.
-        let mut to_notify: Vec<(String, String, String, u32)> = Vec::new();
-        let mut to_suppress: Vec<(String, String, String, u32, Vec<String>)> = Vec::new();
+        let mut to_notify: Vec<(String, GroupId, String, u32)> = Vec::new();
+        let mut to_suppress: Vec<(String, GroupId, String, u32, Vec<String>)> = Vec::new();
         {
             let mut agents = self.agents.lock_safe();
             for a in agents.values_mut() {
@@ -26889,7 +26965,7 @@ impl OrchRegistry {
     /// default it to.
     pub fn register_notification(
         &self,
-        group: &str,
+        group: &GroupId,
         agent: &str,
         condition: notify::Condition,
         note: String,
@@ -26919,7 +26995,7 @@ impl OrchRegistry {
         let id = format!("n-{seq}");
         let watch = notify::Watch {
             id: id.clone(),
-            group: group.to_string(),
+            group: group.clone(),
             agent: agent.to_string(),
             condition,
             note,
@@ -26964,7 +27040,7 @@ impl OrchRegistry {
     /// webview (CLAUDE.md constraint 5), so reading across the whole group's
     /// roster is fine. Oldest-registered first — `(registered_ms, seq)`,
     /// matching `list_notifications`'s tie-break.
-    pub fn group_watches(&self, group: &str) -> Value {
+    pub fn group_watches(&self, group: &GroupId) -> Value {
         let watches = self.watches.lock_safe();
         let mut mine: Vec<&notify::Watch> = watches.values().filter(|w| w.group == group).collect();
         mine.sort_by_key(|w| (w.registered_ms, w.seq));
@@ -27018,7 +27094,7 @@ impl OrchRegistry {
     /// pane a fired notice would land in is gone). Audits once, only if
     /// something was actually removed, so a routine mark_dead with no
     /// outstanding watches doesn't add audit noise.
-    fn cleanup_agent_watches(&self, agent_id: &str, group: &str) {
+    fn cleanup_agent_watches(&self, agent_id: &str, group: &GroupId) {
         let removed: Vec<String> = {
             let mut watches = self.watches.lock_safe();
             let ids: Vec<String> =
@@ -27058,7 +27134,7 @@ impl OrchRegistry {
     /// the table exactly as it is on `None`. (The parse error is surfaced
     /// loudly elsewhere, `workflow-invalid`; this is not the place to
     /// re-report it.)
-    fn lock_resources(&self, group: &str) -> Option<BTreeMap<String, workflow::ResourcePolicy>> {
+    fn lock_resources(&self, group: &GroupId) -> Option<BTreeMap<String, workflow::ResourcePolicy>> {
         let g = self.group(group)?;
         if !g.guardrails.advanced_orchestrator {
             // Authoritative, not unknown: with the toggle off this group has no
@@ -27078,11 +27154,11 @@ impl OrchRegistry {
     /// reconcile dropped are written **after** the table lock is released —
     /// `audit` touches the filesystem, and no registry mutex is ever held
     /// across file I/O.
-    fn with_locks<T>(&self, group: &str, f: impl FnOnce(&mut locks::LockTable) -> T) -> T {
+    fn with_locks<T>(&self, group: &GroupId, f: impl FnOnce(&mut locks::LockTable) -> T) -> T {
         let declared = self.lock_resources(group);
         let (out, dropped) = {
             let mut all = self.locks.lock_safe();
-            let table = all.entry(group.to_string()).or_default();
+            let table = all.entry(group.clone()).or_default();
             // `None` = the config could not be read this instant; reconciling
             // against a guess would drop live holds (see `lock_resources`).
             let dropped = match &declared {
@@ -27112,7 +27188,7 @@ impl OrchRegistry {
     /// A momentarily unreadable file falls back to what the live table already
     /// holds, so a mid-save `workflow.yml` cannot make an agent's tool listing
     /// blink out from under it.
-    pub fn lock_menu(&self, group: &str) -> Vec<(String, workflow::ResourcePolicy)> {
+    pub fn lock_menu(&self, group: &GroupId) -> Vec<(String, workflow::ResourcePolicy)> {
         if let Some(declared) = self.lock_resources(group) {
             return declared.into_iter().collect();
         }
@@ -27140,7 +27216,7 @@ impl OrchRegistry {
     /// to branch on.
     pub fn acquire_lock(
         &self,
-        group: &str,
+        group: &GroupId,
         agent: &str,
         name: &str,
         note: &str,
@@ -27185,7 +27261,7 @@ impl OrchRegistry {
 
     /// `release_lock`. Hands the slot straight to the head of the queue and
     /// tells that agent, in its own pane, that it is now the holder.
-    pub fn release_lock(&self, group: &str, agent: &str, name: &str) -> Result<String, String> {
+    pub fn release_lock(&self, group: &GroupId, agent: &str, name: &str) -> Result<String, String> {
         let now = now_ms();
         let outcome = self.with_locks(group, |t| t.release(name, agent, now))?;
         match outcome {
@@ -27218,7 +27294,7 @@ impl OrchRegistry {
     /// Audit a grant and type the notice into the new holder's pane. Shared by
     /// `release_lock` and the sweep so a grant is recorded identically however
     /// it was caused.
-    fn announce_lock_grant(&self, group: &str, g: &locks::Grant) {
+    fn announce_lock_grant(&self, group: &GroupId, g: &locks::Grant) {
         let now = now_ms();
         self.audit(
             group,
@@ -27242,7 +27318,7 @@ impl OrchRegistry {
 
     /// `list_locks` / the group view's lock chrome — one JSON shape for both,
     /// so what a human sees and what an agent reads can never disagree.
-    pub fn lock_state(&self, group: &str) -> Value {
+    pub fn lock_state(&self, group: &GroupId) -> Value {
         let now = now_ms();
         self.with_locks(group, |t| {
             json!({
@@ -27269,7 +27345,7 @@ impl OrchRegistry {
     /// holder-death reclaim's FAST path — the 30s sweep would catch it anyway,
     /// but a worker that finished its build and exited should not make the
     /// next one wait half a minute for a slot nobody is using.
-    fn cleanup_agent_locks(&self, agent_id: &str, group: &str) {
+    fn cleanup_agent_locks(&self, agent_id: &str, group: &GroupId) {
         let now = now_ms();
         let sweep = self.with_locks(group, |t| t.drop_agent(agent_id, now));
         self.apply_lock_sweep(group, sweep);
@@ -27278,7 +27354,7 @@ impl OrchRegistry {
     /// Audit everything a sweep did and deliver every grant it produced.
     /// Called with no registry lock held — `audit` and `deliver_prompt` both
     /// block (file I/O, a per-pane delivery mutex).
-    fn apply_lock_sweep(&self, group: &str, sweep: locks::Sweep) {
+    fn apply_lock_sweep(&self, group: &GroupId, sweep: locks::Sweep) {
         for r in &sweep.reclaimed {
             let (action, agent, detail) = match r {
                 locks::Reclaimed::HoldExpired { resource, agent, held_ms } => (
@@ -27337,14 +27413,14 @@ impl OrchRegistry {
     /// unpaused, so a long pause cannot silently evaporate every hold in the
     /// group while its panes sat frozen. Same shape, and the same reasoning,
     /// as `notify_tick`'s TTL freeze.
-    pub fn locks_tick(&self, now: u64) -> Vec<String> {
+    pub fn locks_tick(&self, now: u64) -> Vec<GroupId> {
         let paused = self.paused.lock_safe().clone();
-        let extend_by: HashMap<String, u64> = {
+        let extend_by: HashMap<GroupId, u64> = {
             let mut since = self.paused_locks_since.lock_safe();
             for g in paused.iter() {
                 since.entry(g.clone()).or_insert(now);
             }
-            let resumed: Vec<String> =
+            let resumed: Vec<GroupId> =
                 since.keys().filter(|g| !paused.contains(*g)).cloned().collect();
             let mut extend = HashMap::new();
             for g in resumed {
@@ -27365,7 +27441,7 @@ impl OrchRegistry {
                 .map(|a| a.id.clone())
                 .collect()
         };
-        let groups: Vec<String> = self.locks.lock_safe().keys().cloned().collect();
+        let groups: Vec<GroupId> = self.locks.lock_safe().keys().cloned().collect();
         let mut acted = Vec::new();
         for group in groups {
             let sweep = {
@@ -27392,8 +27468,8 @@ impl OrchRegistry {
     /// `Command::new("gh")` won't resolve a Windows `gh.cmd` shim-free — see
     /// `write_shim`'s note) and pins `CREATE_NO_WINDOW` so no console flashes
     /// on a Windows host. `repo` comes from the caller's group (resolved
-    /// server-side), never from an argument, so constraint 6 (group_id as a
-    /// trusted path segment) is never engaged here.
+    /// server-side), never from an argument, so the group-id path seam (#904)
+    /// is never engaged here at all.
     ///
     /// **This is the one place the backend spawns `gh`** (#791). It began as
     /// the notify poller's helper, with `pr_head`/`pr_body` keeping a second
@@ -27674,12 +27750,12 @@ impl OrchRegistry {
         // entry, and every group that WAS recorded paused but no longer is
         // gets reconciled, regardless of whether it currently owns any
         // watches at all.
-        let extend_by: HashMap<String, u64> = {
+        let extend_by: HashMap<GroupId, u64> = {
             let mut since = self.paused_watch_since.lock_safe();
             for g in paused.iter() {
                 since.entry(g.clone()).or_insert(now);
             }
-            let resumed: Vec<String> = since.keys().filter(|g| !paused.contains(*g)).cloned().collect();
+            let resumed: Vec<GroupId> = since.keys().filter(|g| !paused.contains(*g)).cloned().collect();
             let mut extend = HashMap::new();
             for g in resumed {
                 if let Some(started) = since.remove(&g) {
@@ -27867,7 +27943,7 @@ impl OrchRegistry {
     /// `intake_poll_minutes` (#429: smart-defaulted ON while autonomous unless
     /// explicitly opted out — see `intake::effective_intake_poll_minutes`) is
     /// nonzero, paired with its repo path for the `gh` call.
-    fn intake_poll_config(&self) -> (HashMap<String, u32>, HashMap<String, String>) {
+    fn intake_poll_config(&self) -> (HashMap<GroupId, u32>, HashMap<GroupId, String>) {
         let autonomous = self.autonomous_groups.lock_safe().clone();
         let mut minutes = HashMap::new();
         let mut repos = HashMap::new();
@@ -27987,18 +28063,18 @@ impl OrchRegistry {
     /// deleted. The same `#[doc(hidden)]` test seam as `seed_intake_pending`
     /// below, read-only.
     #[doc(hidden)] // pub for integration tests: observe that a scan ran, without shelling to `gh`
-    pub fn intake_last_poll_at(&self, group: &str) -> Option<u64> {
+    pub fn intake_last_poll_at(&self, group: &GroupId) -> Option<u64> {
         self.intake_last_poll_ms.lock_safe().get(group).copied()
     }
 
     #[doc(hidden)] // pub for integration tests: seed a pending intake signal without shelling to `gh`
-    pub fn seed_intake_pending(&self, group: &str, summary: &str) {
-        self.intake_pending.lock_safe().entry(group.to_string()).or_default().push(summary.to_string());
+    pub fn seed_intake_pending(&self, group: &GroupId, summary: &str) {
+        self.intake_pending.lock_safe().entry(group.clone()).or_default().push(summary.to_string());
     }
 
     #[doc(hidden)] // pub for integration tests: control the fallback-due reference point precisely
-    pub fn seed_idle_tick_last_fired(&self, group: &str, ms: u64) {
-        self.idle_tick_last_fired_ms.lock_safe().insert(group.to_string(), ms);
+    pub fn seed_idle_tick_last_fired(&self, group: &GroupId, ms: u64) {
+        self.idle_tick_last_fired_ms.lock_safe().insert(group.clone(), ms);
     }
 
     /// #864: this group's consecutive delta-free fallback-wake count.
@@ -28010,7 +28086,7 @@ impl OrchRegistry {
     /// make sharply — that a reset really cleared the counter rather than the
     /// cadence merely looking right for some other reason.
     #[doc(hidden)] // pub for integration tests
-    pub fn idle_tick_empty_streak_of(&self, group: &str) -> u32 {
+    pub fn idle_tick_empty_streak_of(&self, group: &GroupId) -> u32 {
         self.idle_tick_empty_streak.lock_safe().get(group).copied().unwrap_or(0)
     }
 
@@ -28154,9 +28230,9 @@ impl OrchRegistry {
     ///   gesture on ANY existing member, not only the sender itself.
     pub fn connect_agents(
         &self,
-        from_group: &str,
+        from_group: &GroupId,
         from_agent: &str,
-        to_group: &str,
+        to_group: &GroupId,
         to_agent: &str,
         sender_agent: &str,
     ) -> Result<Value, String> {
@@ -28359,7 +28435,7 @@ impl OrchRegistry {
     /// receiver→receiver is never allowed), so the channel is as dead as a
     /// 1-member one. There is no automatic promotion; a human must
     /// `set_sender` and (if desired) reconnect.
-    pub fn disconnect_agent(&self, group: &str, agent: &str) -> Result<Value, String> {
+    pub fn disconnect_agent(&self, group: &GroupId, agent: &str) -> Result<Value, String> {
         let mut channels = self.channels.lock_safe();
         let mut agent_channel = self.agent_channel.lock_safe();
         let chan_id = agent_channel
@@ -28431,7 +28507,7 @@ impl OrchRegistry {
     /// — the pane a channel message would land in is gone. Reuses
     /// `disconnect_agent`'s teardown-below-2 logic so a channel down to one
     /// live member closes exactly as it would from a human disconnect.
-    fn cleanup_agent_channel(&self, agent_id: &str, group: &str) {
+    fn cleanup_agent_channel(&self, agent_id: &str, group: &GroupId) {
         if self.agent_channel.lock_safe().contains_key(agent_id) {
             let _ = self.disconnect_agent(group, agent_id);
         }
@@ -28594,7 +28670,7 @@ impl OrchRegistry {
     /// for a single pane's header chip. `group` is checked against the
     /// agent's actual group so a stale frontend reference reads as
     /// disconnected rather than leaking another pane's channel.
-    pub fn channel_for_pane(&self, group: &str, agent: &str) -> Value {
+    pub fn channel_for_pane(&self, group: &GroupId, agent: &str) -> Value {
         match self.agent(agent) {
             Some(a) if a.group == group => {}
             _ => return Value::Null,
@@ -28693,13 +28769,17 @@ impl OrchRegistry {
         if self.groups.lock_safe().contains_key(SOLO_GROUP) {
             return;
         }
-        let _ = fs::create_dir_all(self.group_dir(SOLO_GROUP).join("configs"));
+        // #904: the reserved constant, validated like any other id rather than
+        // exempted for being ours. `None` is unreachable (pinned by the
+        // acceptance suite) and simply declines to register the pseudo-group.
+        let solo = solo_group_id().clone();
+        let _ = fs::create_dir_all(self.group_dir(solo_group_id()).join("configs"));
         let info = GroupInfo {
-            id: SOLO_GROUP.to_string(),
+            id: solo,
             repo: "(standalone)".to_string(),
             guardrails: Guardrails::default().clamped(),
         };
-        self.groups.lock_safe().insert(SOLO_GROUP.to_string(), info);
+        self.groups.lock_safe().insert(solo_group_id().clone(), info);
     }
 
     /// Human-only (the launcher's agent-pane spawn path, constraint 5): mint
@@ -28721,7 +28801,7 @@ impl OrchRegistry {
     /// (empty for a delivery-only CLI).
     pub fn solo_prepare(&self, cli: &str, cwd: &str, name: &str) -> Result<Value, String> {
         self.ensure_solo_group();
-        let seq = self.mint_agent_seq(SOLO_GROUP);
+        let seq = self.mint_agent_seq(solo_group_id());
         let agent_id = format!("solo-{seq}");
         let display = sanitize_agent_name(name);
         let display = if display.is_empty() { agent_id.clone() } else { display };
@@ -28743,7 +28823,7 @@ impl OrchRegistry {
             // of the last two arguments.
             let cfg = self
                 .write_mcp_config(
-                    SOLO_GROUP,
+                    solo_group_id(),
                     &agent_id,
                     &token,
                     cli,
@@ -28783,7 +28863,7 @@ impl OrchRegistry {
 
         let entry = AgentEntry {
             id: agent_id.clone(),
-            group: SOLO_GROUP.to_string(),
+            group: solo_group_id().clone(),
             name: display,
             name_source: NameSource::Default,
             block: "solo".to_string(),
@@ -28845,7 +28925,7 @@ impl OrchRegistry {
             self.by_token.lock_safe().insert(token, agent_id.clone());
         }
         self.audit(
-            SOLO_GROUP,
+            solo_group_id(),
             "human",
             "solo-prepare",
             json!({ "agent": agent_id, "cli": cli, "delivery_only": delivery_only }),
@@ -28903,7 +28983,7 @@ impl OrchRegistry {
         let root = self.root.clone();
         std::thread::spawn(move || {
             let ptys = app.state::<crate::pty::PtyManager>();
-            confirm_copilot_autopilot_dialog(&ptys, pty_id, &root, SOLO_GROUP, "solo", SOLO_AUTOPILOT_DIALOG_WAIT);
+            confirm_copilot_autopilot_dialog(&ptys, pty_id, &root, solo_group_id(), "solo", SOLO_AUTOPILOT_DIALOG_WAIT);
         });
         Ok(())
     }
@@ -28922,13 +29002,13 @@ impl OrchRegistry {
             return Ok(json!({ "agent_id": existing }));
         }
         self.ensure_solo_group();
-        let seq = self.mint_agent_seq(SOLO_GROUP);
+        let seq = self.mint_agent_seq(solo_group_id());
         let agent_id = format!("solo-{seq}");
         let display = sanitize_agent_name(name);
         let display = if display.is_empty() { agent_id.clone() } else { display };
         let entry = AgentEntry {
             id: agent_id.clone(),
-            group: SOLO_GROUP.to_string(),
+            group: solo_group_id().clone(),
             name: display,
             name_source: NameSource::Default,
             block: "solo".to_string(),
@@ -29002,7 +29082,7 @@ impl OrchRegistry {
             self.agents.lock_safe().remove(&agent_id);
             return Ok(json!({ "agent_id": winner }));
         }
-        self.audit(SOLO_GROUP, "human", "solo-adopt", json!({ "agent": agent_id, "pty_id": pty_id }));
+        self.audit(solo_group_id(), "human", "solo-adopt", json!({ "agent": agent_id, "pty_id": pty_id }));
         Ok(json!({ "agent_id": agent_id }))
     }
 
@@ -29106,7 +29186,7 @@ impl OrchRegistry {
         ///   that decays silently is a cadence nobody can debug.
         struct IdleTickFire {
             id: String,
-            group: String,
+            group: GroupId,
             gate_enabled: bool,
             heartbeat: bool,
             input_defer_bound: bool,
@@ -29121,7 +29201,7 @@ impl OrchRegistry {
         let tick_times = self.idle_tick_times.lock_safe().clone();
         // Per-group idle-tick window + activity floor (guardrails, live-adjustable).
         // Snapshot like `watchdog_tick` does its thresholds.
-        let cfg: HashMap<String, (u32, u64, u32, u32, u32, u32)> = self
+        let cfg: HashMap<GroupId, (u32, u64, u32, u32, u32, u32)> = self
             .groups
             .lock_safe()
             .iter()
@@ -29154,9 +29234,9 @@ impl OrchRegistry {
         // its own short-lived lock (a separate mutex for `watches`, a throwaway
         // immutable pass over `agents` for the watchdog signal) — never held
         // across the mutable loop, so there's no lock-ordering hazard.
-        let notification_pending_groups: HashSet<String> =
+        let notification_pending_groups: HashSet<GroupId> =
             self.watches.lock_safe().values().map(|w| w.group.clone()).collect();
-        let watchdog_stall_groups: HashSet<String> = self
+        let watchdog_stall_groups: HashSet<GroupId> = self
             .agents
             .lock_safe()
             .values()
@@ -29170,7 +29250,7 @@ impl OrchRegistry {
         // that went quiet without reporting. Taken on its own short-lived lock
         // in the same pass-shape as `watchdog_stall_groups` directly above,
         // before the mutable `agents` borrow below.
-        let live_delegate_groups: HashSet<String> = self
+        let live_delegate_groups: HashSet<GroupId> = self
             .agents
             .lock_safe()
             .values()
@@ -29182,12 +29262,12 @@ impl OrchRegistry {
         let empty_streak = self.idle_tick_empty_streak.lock_safe().clone();
 
         let mut to_notify: Vec<IdleTickFire> = Vec::new();
-        let mut skipped: Vec<(String, String)> = Vec::new();
+        let mut skipped: Vec<(GroupId, String)> = Vec::new();
         // #864: (group, new streak) for every group whose delta-free streak
         // this scan changed — collected here and applied after the `agents`
         // borrow drops, so no second lock is ever taken while holding it (the
         // same discipline the snapshots above follow in the other direction).
-        let mut streak_updates: Vec<(String, u32)> = Vec::new();
+        let mut streak_updates: Vec<(GroupId, u32)> = Vec::new();
         {
             let mut agents = self.agents.lock_safe();
             for a in agents.values_mut() {
@@ -29502,7 +29582,7 @@ impl OrchRegistry {
     /// deliver ONE `[loomux]` notice. Because suspension removes the group from
     /// the autonomous set, a later pass skips it, so the notice can't repeat.
     /// Returns the suspended group ids. Runs before the idle tick each cycle.
-    pub fn enforce_autonomy_budgets(&self, _now: u64) -> Vec<String> {
+    pub fn enforce_autonomy_budgets(&self, _now: u64) -> Vec<GroupId> {
         let autonomous = self.autonomous_groups.lock_safe().clone();
         if autonomous.is_empty() {
             return Vec::new();
@@ -29669,7 +29749,7 @@ impl OrchRegistry {
         // Snapshot per-group guardrails (Clone) rather than per-agent CLI
         // lookups while holding the agents lock — `Guardrails::cli_for` needs
         // the whole roster, and `cli_for_agent` would re-lock `self.groups`.
-        let groups: HashMap<String, Guardrails> = self
+        let groups: HashMap<GroupId, Guardrails> = self
             .groups
             .lock_safe()
             .iter()
@@ -29677,36 +29757,36 @@ impl OrchRegistry {
             .collect();
         let tick_times = self.compact_nudge_times.lock_safe().clone();
 
-        let mut to_fire: Vec<(String, String)> = Vec::new();
+        let mut to_fire: Vec<(String, GroupId)> = Vec::new();
         // `u32` is the 1-indexed attempt number (see `AgentEntry::
         // compact_reinject_attempts`) — carried through so the audit line
         // distinguishes a first fire from a retry.
-        let mut to_reinject: Vec<(String, String, PathBuf, PathBuf, u32, ContractCarrier)> = Vec::new();
-        let mut to_escalate: Vec<(String, String, u32)> = Vec::new();
+        let mut to_reinject: Vec<(String, GroupId, PathBuf, PathBuf, u32, ContractCarrier)> = Vec::new();
+        let mut to_escalate: Vec<(String, GroupId, u32)> = Vec::new();
         // Production bug fix (D2/D3): a resolved-but-unconfirmed pending
         // state — audited for visibility (this exact gap in observability is
         // why the live incident took real forensic work to root-cause: no
         // record existed of WHICH detector armed `compact_pending`, or that
         // it had been discarded rather than genuinely resolved).
-        let mut to_discard: Vec<(String, String, Option<u64>, Option<u64>)> = Vec::new();
+        let mut to_discard: Vec<(String, GroupId, Option<u64>, Option<u64>)> = Vec::new();
         // rev-42 delta (round 2): a reinjection whose delivery just confirmed
         // — audited for visibility, distinct from the initial fire above.
         // #535: the `&'static str` is the RESOLUTION SOURCE — `"delivery"` (our
         // own submit sampler saw it) or `"activity"` (the agent itself called a
         // loomux tool afterwards). Two different facts; a timeline that
         // conflated them could not show whether #535's fix is working.
-        let mut to_reinject_confirmed: Vec<(String, String, ReinjectAck)> = Vec::new();
+        let mut to_reinject_confirmed: Vec<(String, GroupId, ReinjectAck)> = Vec::new();
         // #535: an attempt whose retry window expired while the pane was still
         // mid-turn — deferred rather than spent. Audited (once per attempt, see
         // `compact_reinject_busy_deferred`) because "no retry fired" must read
         // as a deliberate choice, not a silently dropped one — the same reason
         // `to_hook_native_skip` exists.
-        let mut to_defer_busy: Vec<(String, String, u32)> = Vec::new();
+        let mut to_defer_busy: Vec<(String, GroupId, u32)> = Vec::new();
         // rev-42 delta (round 2): a reinjection stuck past `MAX_REINJECT_
         // ATTEMPTS` — the latch is released anyway (never wedge the state
         // machine), but this must be visible: it's a genuinely lost
         // re-grounding, not a harmless discard.
-        let mut to_abandon: Vec<(String, String, u32)> = Vec::new();
+        let mut to_abandon: Vec<(String, GroupId, u32)> = Vec::new();
         // #410 (round 6): an arm forced open past `ARM_PENDING_TIMEOUT_MS`
         // without ever reaching a busy-then-quiet resolution — audited
         // distinctly from `to_abandon` (which is specifically a stuck
@@ -29714,17 +29794,17 @@ impl OrchRegistry {
         // whether hook evidence was recorded for this arm before it timed
         // out — see the push site's own doc for why "no evidence" would
         // misreport a PreCompact-only arm that simply never went quiet.
-        let mut to_arm_timeout: Vec<(String, String, bool)> = Vec::new();
+        let mut to_arm_timeout: Vec<(String, GroupId, bool)> = Vec::new();
         // #417: audited separately from the pre-existing arm sites — visibility
         // for "this compaction's evidence came from a hook, not a guess" is the
         // whole point of the feature, not incidental.
-        let mut to_hook_armed: Vec<(String, String, &'static str)> = Vec::new();
+        let mut to_hook_armed: Vec<(String, GroupId, &'static str)> = Vec::new();
         // rev-4 review (N3): a confirmed arm whose native additionalContext
         // ALREADY delivered the re-grounding — loomux's own reinjection is
         // skipped for it (see `compact_hook_native_notice_delivered`'s doc),
         // audited distinctly so "no reinjection fired" reads as a deliberate
         // choice, not a silently dropped one.
-        let mut to_hook_native_skip: Vec<(String, String)> = Vec::new();
+        let mut to_hook_native_skip: Vec<(String, GroupId)> = Vec::new();
         // #428 (round 9): an arm resolved by Copilot's own compaction-
         // completion paint rather than a busy-then-quiet observation —
         // audited distinctly (`compact-resolved-copilot-marker`) so the
@@ -29732,7 +29812,7 @@ impl OrchRegistry {
         // "loomux inferred it from output going quiet", the same
         // provenance distinction `to_hook_armed` already draws for
         // marker-file evidence vs. inference.
-        let mut to_copilot_marker_resolved: Vec<(String, String)> = Vec::new();
+        let mut to_copilot_marker_resolved: Vec<(String, GroupId)> = Vec::new();
         {
             let mut agents = self.agents.lock_safe();
             for a in agents.values_mut() {
@@ -30890,14 +30970,14 @@ impl OrchRegistry {
         // lifecycle panel shows (see `effective_context_window_tokens`) —
         // no more flat 200K assumption that fires the escalation ~5x too
         // early for a larger-context agent.
-        let (thresholds, overrides): (HashMap<String, u32>, HashMap<String, Option<u64>>) = {
+        let (thresholds, overrides): (HashMap<GroupId, u32>, HashMap<GroupId, Option<u64>>) = {
             let groups = self.groups.lock_safe();
             (
                 groups.iter().map(|(id, g)| (id.clone(), g.guardrails.compact_context_threshold_percent)).collect(),
                 groups.iter().map(|(id, g)| (id.clone(), g.guardrails.context_window_tokens_override)).collect(),
             )
         };
-        let agent_groups: HashMap<String, String> = self
+        let agent_groups: HashMap<String, GroupId> = self
             .agents
             .lock_safe()
             .iter()
@@ -31218,7 +31298,7 @@ impl OrchRegistry {
     }
 
     /// Whether desktop notifications are enabled for a group.
-    pub fn notify_enabled(&self, group: &str) -> bool {
+    pub fn notify_enabled(&self, group: &GroupId) -> bool {
         self.notify_groups.lock_safe().contains(group)
     }
 
@@ -31244,11 +31324,11 @@ impl OrchRegistry {
     /// process AND across the next restart. See `marker_io`'s doc for why that
     /// is not left to the fact that both callers happen to be sync commands on
     /// the webview thread.
-    pub fn set_notify(&self, group: &str, on: bool) -> Result<(), String> {
+    pub fn set_notify(&self, group: &GroupId, on: bool) -> Result<(), String> {
         let _io = self.marker_io.lock_safe();
         let dir = self.group_dir(group);
         let changed = if on {
-            self.notify_groups.lock_safe().insert(group.to_string())
+            self.notify_groups.lock_safe().insert(group.clone())
         } else {
             self.notify_groups.lock_safe().remove(group)
         };
@@ -31269,7 +31349,7 @@ impl OrchRegistry {
     /// Whether this group has opted OUT of the #260 minimize-on-spawn default
     /// (i.e. wants delegate panes to keep opening expanded, the pre-#260
     /// behavior). Feeds `spawn_opens_minimized` at each delegate spawn.
-    pub fn spawn_expanded(&self, group: &str) -> bool {
+    pub fn spawn_expanded(&self, group: &GroupId) -> bool {
         self.spawn_expanded_groups.lock_safe().contains(group)
     }
 
@@ -31281,11 +31361,11 @@ impl OrchRegistry {
     /// transition decided under it, and the whole toggle ordered by
     /// [`Self::marker_io`] — [`Self::set_notify`]'s shape, for the reasons
     /// argued there (#743 S7).
-    pub fn set_spawn_expanded(&self, group: &str, on: bool) -> Result<(), String> {
+    pub fn set_spawn_expanded(&self, group: &GroupId, on: bool) -> Result<(), String> {
         let _io = self.marker_io.lock_safe();
         let dir = self.group_dir(group);
         let changed = if on {
-            self.spawn_expanded_groups.lock_safe().insert(group.to_string())
+            self.spawn_expanded_groups.lock_safe().insert(group.clone())
         } else {
             self.spawn_expanded_groups.lock_safe().remove(group)
         };
@@ -31307,7 +31387,7 @@ impl OrchRegistry {
 
     /// Whether autonomous idle-ticking is enabled for a group (drives the toggle
     /// button state and gates the idle-tick loop).
-    pub fn is_autonomous(&self, group: &str) -> bool {
+    pub fn is_autonomous(&self, group: &GroupId) -> bool {
         self.autonomous_groups.lock_safe().contains(group)
     }
 
@@ -31316,7 +31396,7 @@ impl OrchRegistry {
     /// content so it survives restarts. 0 when off or unstamped (legacy/empty
     /// marker → meters against 0, i.e. all history, which is the safe/conservative
     /// direction: it can only suspend *sooner*).
-    fn autonomy_anchor(&self, group: &str) -> u64 {
+    fn autonomy_anchor(&self, group: &GroupId) -> u64 {
         fs::read_to_string(self.group_dir(group).join("autonomous"))
             .ok()
             .and_then(|s| s.trim().parse::<u64>().ok())
@@ -31328,7 +31408,7 @@ impl OrchRegistry {
     /// `autonomy_suspended` marker written by `enforce_autonomy_budgets` and
     /// cleared on a genuine re-enable, so it survives restarts. Only meaningful
     /// while off — `autonomy_state` gates it on `!is_autonomous`.
-    fn autonomy_suspended(&self, group: &str) -> bool {
+    fn autonomy_suspended(&self, group: &GroupId) -> bool {
         self.group_dir(group).join("autonomy_suspended").is_file()
     }
 
@@ -31340,7 +31420,7 @@ impl OrchRegistry {
     /// budget suspension re-anchors, which is what "toggle to resume" means).
     /// Audited on every real state change (actor `human`). The budget-suspension
     /// path uses `suspend_autonomous` instead (different failure policy).
-    pub fn set_autonomous(&self, group: &str, on: bool) -> Result<(), String> {
+    pub fn set_autonomous(&self, group: &GroupId, on: bool) -> Result<(), String> {
         self.set_autonomous_as(group, on, "human")
     }
 
@@ -31353,7 +31433,7 @@ impl OrchRegistry {
     /// `autonomous` marker is then overridden at restart by the co-written
     /// `autonomy_suspended` marker (see the re-seed in `create_group`), so the group
     /// comes back OFF + suspended-visible, never silently ticking past its budget.
-    fn suspend_autonomous(&self, group: &str) {
+    fn suspend_autonomous(&self, group: &GroupId) {
         // Stop the spend first and unconditionally.
         self.autonomous_groups.lock_safe().remove(group);
         self.clear_idle_tick_latch(group);
@@ -31374,7 +31454,7 @@ impl OrchRegistry {
     /// the in-memory gate-decision set is authoritative and cleared even if the
     /// durable marker removal fails, so autonomous-off can never leave the merge
     /// gate open. Best-effort marker removal + audit/notify only when it was on.
-    fn force_disable_auto_merge(&self, group: &str, actor: &str, reason: &str) {
+    fn force_disable_auto_merge(&self, group: &GroupId, actor: &str, reason: &str) {
         if self.auto_merge_groups.lock_safe().remove(group) {
             let _ = remove_marker(&self.group_dir(group).join("auto_merge"));
             self.audit(group, actor, "auto-merge-off", json!({ "reason": reason }));
@@ -31386,7 +31466,7 @@ impl OrchRegistry {
     /// `force_disable_auto_merge`): auto-release without autonomous would leave the
     /// release gate open, so the in-memory gate set is authoritative and cleared
     /// even if the marker removal fails.
-    fn force_disable_auto_release(&self, group: &str, actor: &str, reason: &str) {
+    fn force_disable_auto_release(&self, group: &GroupId, actor: &str, reason: &str) {
         if self.auto_release_groups.lock_safe().remove(group) {
             let _ = remove_marker(&self.group_dir(group).join("auto_release"));
             self.audit(group, actor, "auto-release-off", json!({ "reason": reason }));
@@ -31398,7 +31478,7 @@ impl OrchRegistry {
     /// autonomous force-clears it — the two can never both be on). In-memory
     /// authoritative even if the marker's disk removal fails, with an audit entry
     /// and a human-visible notice. `by_autonomous` tailors the notice wording.
-    fn force_disable_dangerous_mode(&self, group: &str, actor: &str, reason: &str, by_autonomous: bool) {
+    fn force_disable_dangerous_mode(&self, group: &GroupId, actor: &str, reason: &str, by_autonomous: bool) {
         if self.dangerous_groups.lock_safe().remove(group) {
             let _ = remove_marker(&self.group_dir(group).join("dangerous_mode"));
             self.audit(group, actor, "dangerous-mode-off", json!({ "reason": reason }));
@@ -31408,7 +31488,7 @@ impl OrchRegistry {
 
     /// `set_autonomous` with an explicit actor so a loomux-initiated suspension
     /// (budget exhausted) audits honestly rather than as a human toggle.
-    fn set_autonomous_as(&self, group: &str, on: bool, actor: &str) -> Result<(), String> {
+    fn set_autonomous_as(&self, group: &GroupId, on: bool, actor: &str) -> Result<(), String> {
         let dir = self.group_dir(group);
         if on {
             {
@@ -31434,7 +31514,7 @@ impl OrchRegistry {
                 // proceeds, so a concurrent/duplicate enable can't double-anchor or
                 // race the marker write. Only the first caller (newly inserted) writes
                 // the anchor + marker; anyone else sees it already on and no-ops.
-                let newly = self.autonomous_groups.lock_safe().insert(group.to_string());
+                let newly = self.autonomous_groups.lock_safe().insert(group.clone());
                 if !newly {
                     return Ok(()); // already on — don't re-anchor
                 }
@@ -31504,7 +31584,7 @@ impl OrchRegistry {
     /// Whether the orchestrator may merge adequately-tested PRs itself for a group
     /// (auto-merge gate off = the default human merge gate). Drives the toggle
     /// state and is mirrored into the orchestrator's kickoff config.
-    pub fn is_auto_merge(&self, group: &str) -> bool {
+    pub fn is_auto_merge(&self, group: &GroupId) -> bool {
         self.auto_merge_groups.lock_safe().contains(group)
     }
 
@@ -31513,7 +31593,7 @@ impl OrchRegistry {
     /// lives in the orchestrator template, which reads the flag from its kickoff
     /// config; a live toggle both re-seeds that config for a restart and delivers
     /// one audited notice so the running orchestrator learns the new gate.
-    pub fn set_auto_merge(&self, group: &str, on: bool) -> Result<(), String> {
+    pub fn set_auto_merge(&self, group: &GroupId, on: bool) -> Result<(), String> {
         let dir = self.group_dir(group);
         // #762 rev-260 B1: `marker_io` makes the dependency check, the reserve and
         // the marker write one unit — see `set_autonomous_as` for the interleave
@@ -31537,7 +31617,7 @@ impl OrchRegistry {
             }
             // Atomic reserve (mirrors set_autonomous_as): only the newly-inserting
             // caller writes the marker; a duplicate enable no-ops.
-            let newly = self.auto_merge_groups.lock_safe().insert(group.to_string());
+            let newly = self.auto_merge_groups.lock_safe().insert(group.clone());
             if !newly {
                 return Ok(()); // no-op: don't re-notify
             }
@@ -31576,7 +31656,7 @@ impl OrchRegistry {
     /// Whether the orchestrator may publish releases/tags itself for a group
     /// (auto-release gate off = releases need a per-tag human grant). Independent
     /// of auto-merge. Drives the toggle state + mirrored into the kickoff config.
-    pub fn is_auto_release(&self, group: &str) -> bool {
+    pub fn is_auto_release(&self, group: &GroupId) -> bool {
         self.auto_release_groups.lock_safe().contains(group)
     }
 
@@ -31585,7 +31665,7 @@ impl OrchRegistry {
     /// `set_auto_merge` exactly (independent marker): gated behind autonomous mode
     /// (rejects enable unless autonomous is on), disk-first fail-loud disable, one
     /// audited notice to the orchestrator.
-    pub fn set_auto_release(&self, group: &str, on: bool) -> Result<(), String> {
+    pub fn set_auto_release(&self, group: &GroupId, on: bool) -> Result<(), String> {
         let dir = self.group_dir(group);
         // #762 rev-260 B1: same unit and same reason as `set_auto_merge` — this
         // marker carries release/tag authority, so the interleave that resurrects
@@ -31599,7 +31679,7 @@ impl OrchRegistry {
                     "auto-release requires autonomous mode — turn on Autonomous mode first".into(),
                 );
             }
-            let newly = self.auto_release_groups.lock_safe().insert(group.to_string());
+            let newly = self.auto_release_groups.lock_safe().insert(group.clone());
             if !newly {
                 return Ok(()); // no-op: don't re-notify
             }
@@ -31635,7 +31715,7 @@ impl OrchRegistry {
     /// Whether supervised dangerous mode is on for a group (the human is present and
     /// authorized manual merges/releases outside autonomous mode). Mutually
     /// exclusive with autonomous.
-    pub fn is_dangerous_mode(&self, group: &str) -> bool {
+    pub fn is_dangerous_mode(&self, group: &GroupId) -> bool {
         self.dangerous_groups.lock_safe().contains(group)
     }
 
@@ -31646,7 +31726,7 @@ impl OrchRegistry {
     /// Human-only (Tauri command; no MCP surface — an agent can no more enable this
     /// than it can mint a grant; the marker's FS-forgeability is the same documented
     /// bypass class as grant files, closed by a machine account).
-    pub fn set_dangerous_mode(&self, group: &str, on: bool) -> Result<(), String> {
+    pub fn set_dangerous_mode(&self, group: &GroupId, on: bool) -> Result<(), String> {
         let dir = self.group_dir(group);
         // #762 rev-260 B1/B2: same unit as the two gates above. This one is the
         // clearest case of the conversion CREATING the exposure rather than
@@ -31665,7 +31745,7 @@ impl OrchRegistry {
                      mutually exclusive; turn off Autonomous mode first".into(),
                 );
             }
-            let newly = self.dangerous_groups.lock_safe().insert(group.to_string());
+            let newly = self.dangerous_groups.lock_safe().insert(group.clone());
             if !newly {
                 return Ok(()); // no-op
             }
@@ -31707,7 +31787,7 @@ impl OrchRegistry {
     /// purpose and prompt delivery is suppressed there anyway. Returns the
     /// notified group ids. Free-bytes is injected so the latch/hysteresis logic
     /// is testable without a real disk.
-    pub fn disk_tick(&self, free: u64) -> Vec<String> {
+    pub fn disk_tick(&self, free: u64) -> Vec<GroupId> {
         let fire = {
             let mut latched = self.low_disk_notified.lock_safe();
             let (new_latched, fire) =
@@ -31721,7 +31801,7 @@ impl OrchRegistry {
         // Snapshot groups/paused, then deliver outside any lock (delivery types
         // into a pane and can block).
         let paused = self.paused.lock_safe().clone();
-        let groups: Vec<String> = self.groups.lock_safe().keys().cloned().collect();
+        let groups: Vec<GroupId> = self.groups.lock_safe().keys().cloned().collect();
         let notice = low_disk_notice(free);
         let mut notified = Vec::new();
         for group in groups {
@@ -31752,7 +31832,7 @@ impl OrchRegistry {
     /// move the enable-time anchor — the delta the budget meters is unaffected, so
     /// raising the budget after a suspension lets the human resume without losing
     /// the already-counted spend. Returns the applied value.
-    pub fn set_autonomy_budget(&self, group: &str, tokens: u64) -> Result<u64, String> {
+    pub fn set_autonomy_budget(&self, group: &GroupId, tokens: u64) -> Result<u64, String> {
         let _io = self.group_file_io.lock_safe();
         let old = self
             .group(group)
@@ -31782,7 +31862,7 @@ impl OrchRegistry {
     /// `MAX_IDLE_TICK_MINUTES`. Written to the in-memory guardrail (the idle-tick
     /// loop reads it fresh each pass) and persisted, then audited. Returns the
     /// applied (clamped) value — lets the human drop it to 1–2 min to verify.
-    pub fn set_idle_tick_minutes(&self, group: &str, minutes: u32) -> Result<u32, String> {
+    pub fn set_idle_tick_minutes(&self, group: &GroupId, minutes: u32) -> Result<u32, String> {
         let _io = self.group_file_io.lock_safe();
         let applied = if minutes == 0 {
             DEFAULT_IDLE_TICK_MINUTES
@@ -31812,7 +31892,7 @@ impl OrchRegistry {
     }
 
     /// Rewrite only `guardrails.idle_tick_minutes` in group.json (additive patch).
-    fn persist_idle_tick_minutes(&self, group: &str, minutes: u32) -> Result<(), String> {
+    fn persist_idle_tick_minutes(&self, group: &GroupId, minutes: u32) -> Result<(), String> {
         self.persist_guardrail_u64(group, "idle_tick_minutes", minutes as u64)
     }
 
@@ -31821,7 +31901,7 @@ impl OrchRegistry {
     /// Persisted + audited; the idle-tick loop reads it fresh each pass. Returns the
     /// applied (clamped) value — raise it if a chatty CLI's idle repaints starve the
     /// tick, lower it if real small outputs read as idle.
-    pub fn set_idle_activity_floor(&self, group: &str, bytes: u64) -> Result<u64, String> {
+    pub fn set_idle_activity_floor(&self, group: &GroupId, bytes: u64) -> Result<u64, String> {
         let _io = self.group_file_io.lock_safe();
         let applied = if bytes == 0 {
             DEFAULT_IDLE_ACTIVITY_FLOOR_BYTES
@@ -31851,7 +31931,7 @@ impl OrchRegistry {
     /// Rewrite only `guardrails.autonomy_budget_tokens` in group.json, preserving
     /// every other stored field (additive patch, same crash-safe write as
     /// `persist_max_agents`).
-    fn persist_autonomy_budget(&self, group: &str, tokens: u64) -> Result<(), String> {
+    fn persist_autonomy_budget(&self, group: &GroupId, tokens: u64) -> Result<(), String> {
         self.persist_guardrail_u64(group, "autonomy_budget_tokens", tokens)
     }
 
@@ -31859,7 +31939,7 @@ impl OrchRegistry {
     /// group.json. The shared body behind the live-settable numeric
     /// guardrails (budget, activity floor). Thin wrapper over
     /// `persist_guardrail_json`.
-    fn persist_guardrail_u64(&self, group: &str, key: &str, value: u64) -> Result<(), String> {
+    fn persist_guardrail_u64(&self, group: &GroupId, key: &str, value: u64) -> Result<(), String> {
         self.persist_guardrail_json(group, key, json!(value))
     }
 
@@ -31868,7 +31948,7 @@ impl OrchRegistry {
     /// the `persist_max_agents` pattern). `persist_guardrail_u64` covers the
     /// numeric guardrails; this is the general form, needed for
     /// `compact_nudge_roles` (a string array, not a number).
-    fn persist_guardrail_json(&self, group: &str, key: &str, value: Value) -> Result<(), String> {
+    fn persist_guardrail_json(&self, group: &GroupId, key: &str, value: Value) -> Result<(), String> {
         let dir = self.group_dir(group);
         let path = dir.join("group.json");
         let mut v: Value = serde_json::from_str(&fs::read_to_string(&path).map_err(|e| e.to_string())?)
@@ -31904,7 +31984,7 @@ impl OrchRegistry {
     /// max, never floored to a default. Written to the in-memory guardrail
     /// (the compact-nudge loop reads it fresh each pass) and persisted, then
     /// audited. Returns the applied (clamped) value.
-    pub fn set_compact_nudge_minutes(&self, group: &str, minutes: u32) -> Result<u32, String> {
+    pub fn set_compact_nudge_minutes(&self, group: &GroupId, minutes: u32) -> Result<u32, String> {
         let _io = self.group_file_io.lock_safe();
         let applied = minutes.min(MAX_COMPACT_NUDGE_MINUTES);
         let old = self
@@ -31932,7 +32012,7 @@ impl OrchRegistry {
     /// entries, case-normalizes survivors, dedupes/sorts, falls back to
     /// `["orchestrator"]` if empty) since a live setter bypasses `clamped()`.
     /// Persisted + audited. Returns the applied set.
-    pub fn set_compact_nudge_roles(&self, group: &str, roles: Vec<String>) -> Result<Vec<String>, String> {
+    pub fn set_compact_nudge_roles(&self, group: &GroupId, roles: Vec<String>) -> Result<Vec<String>, String> {
         let _io = self.group_file_io.lock_safe();
         let applied = canonicalize_compact_nudge_roles(roles);
         let old = self
@@ -31961,7 +32041,7 @@ impl OrchRegistry {
     /// capped at the max, never floored to a default — same "0 is a real off"
     /// shape as `compact_nudge_minutes`. Written to the in-memory guardrail
     /// and persisted, then audited. Returns the applied (clamped) value.
-    pub fn set_compact_context_threshold(&self, group: &str, percent: u32) -> Result<u32, String> {
+    pub fn set_compact_context_threshold(&self, group: &GroupId, percent: u32) -> Result<u32, String> {
         let _io = self.group_file_io.lock_safe();
         let applied = percent.min(MAX_COMPACT_CONTEXT_THRESHOLD_PERCENT);
         let old = self
@@ -31993,7 +32073,7 @@ impl OrchRegistry {
     /// in-memory guardrail and persisted, then audited. Returns the applied
     /// (clamped) value. Never gates `request_compact` itself — see
     /// `compact_nudge_context_floor_met`'s doc.
-    pub fn set_compact_nudge_min_context_percent(&self, group: &str, percent: u32) -> Result<u32, String> {
+    pub fn set_compact_nudge_min_context_percent(&self, group: &GroupId, percent: u32) -> Result<u32, String> {
         let _io = self.group_file_io.lock_safe();
         let applied = percent.min(100);
         let old = self
@@ -32020,7 +32100,7 @@ impl OrchRegistry {
     /// figure the autonomy budget meters against. Reuses the `group_usage`
     /// computation so the live-agent refresh and the exact-token summing live
     /// in one place.
-    fn group_token_total(&self, group: &str) -> u64 {
+    fn group_token_total(&self, group: &GroupId) -> u64 {
         self.group_token_total_within(group, Duration::ZERO)
     }
 
@@ -32030,7 +32110,7 @@ impl OrchRegistry {
     /// usage chain a second time inside the same 2 s tick the group view
     /// already ran it in; the anchor and the budget enforcer pass
     /// `Duration::ZERO` and keep an exact, live figure.
-    fn group_token_total_within(&self, group: &str, max_age: Duration) -> u64 {
+    fn group_token_total_within(&self, group: &GroupId, max_age: Duration) -> u64 {
         self.group_usage_within(group, max_age)
             .get("lifetime_tokens")
             .and_then(Value::as_u64)
@@ -32044,7 +32124,7 @@ impl OrchRegistry {
     /// idle-tick window, and — while on — how long the orchestrator has been
     /// output-quiet and how many seconds until the next tick is eligible (so the
     /// panel can show "next tick in ~Xm" instead of the tick being invisible).
-    pub fn autonomy_state(&self, group: &str) -> Value {
+    pub fn autonomy_state(&self, group: &GroupId) -> Value {
         self.autonomy_state_within(group, Duration::ZERO)
     }
 
@@ -32053,7 +32133,7 @@ impl OrchRegistry {
     /// `spend_since_enable_tokens`, which is derived from the group's lifetime
     /// token total. `Duration::ZERO` keeps a live read.
     #[doc(hidden)] // pub for integration tests
-    pub fn autonomy_state_within(&self, group: &str, usage_max_age: Duration) -> Value {
+    pub fn autonomy_state_within(&self, group: &GroupId, usage_max_age: Duration) -> Value {
         let on = self.is_autonomous(group);
         let rails = self.group(group).map(|g| g.guardrails);
         let budget = rails.as_ref().map(|g| g.autonomy_budget_tokens).unwrap_or(0);
@@ -32123,7 +32203,7 @@ impl OrchRegistry {
     /// status table. `now_ms` is read once here so the arithmetic is self-contained.
     fn idle_tick_observability(
         &self,
-        group: &str,
+        group: &GroupId,
         idle_tick_minutes: u32,
     ) -> (Option<u64>, Option<u64>, &'static str) {
         let now = now_ms();
@@ -32188,7 +32268,7 @@ impl OrchRegistry {
 
     /// Clear the orchestrator's idle-tick anti-nag latch for a group (e.g. on
     /// disable, so a later re-enable starts fresh).
-    fn clear_idle_tick_latch(&self, group: &str) {
+    fn clear_idle_tick_latch(&self, group: &GroupId) {
         for a in self.agents.lock_safe().values_mut() {
             if a.group == group && a.role == Role::Orchestrator {
                 a.idle_tick_notified = false;
@@ -32209,7 +32289,7 @@ impl OrchRegistry {
     /// Advisory only — never refuses or clamps `max_agents`.
     fn audit_capacity_shortfall(
         &self,
-        group: &str,
+        group: &GroupId,
         blocks: &[workflow::Block],
         max_agents: u32,
         rec: &workflow::CapacityRecommendation,
@@ -32259,7 +32339,7 @@ impl OrchRegistry {
     /// attrition brings the count back under the cap. Returns the new value.
     /// A no-op change (`n` already the current cap) short-circuits without a
     /// second write, audit, or notice. `actor` records who made the change.
-    pub fn set_max_agents(&self, group: &str, n: u32, actor: &str) -> Result<u32, String> {
+    pub fn set_max_agents(&self, group: &GroupId, n: u32, actor: &str) -> Result<u32, String> {
         if !(1..=MAX_AGENTS_CEILING).contains(&n) {
             return Err(format!("max agents must be between 1 and {MAX_AGENTS_CEILING}"));
         }
@@ -32315,7 +32395,7 @@ impl OrchRegistry {
     /// other stored field (created_ms, the other guardrails, and anything a
     /// later feature adds). Patching the parsed JSON in place — rather than
     /// reserializing a full GroupInfo — keeps this additive and rebase-clean.
-    fn persist_max_agents(&self, group: &str, n: u32) -> Result<(), String> {
+    fn persist_max_agents(&self, group: &GroupId, n: u32) -> Result<(), String> {
         let dir = self.group_dir(group);
         let path = dir.join("group.json");
         let mut v: Value = serde_json::from_str(&fs::read_to_string(&path).map_err(|e| e.to_string())?)
@@ -32350,7 +32430,7 @@ impl OrchRegistry {
     /// preserved on a flag-only change.
     fn persist_advanced_orchestrator(
         &self,
-        group: &str,
+        group: &GroupId,
         on: bool,
         blocks: &[workflow::Block],
     ) -> Result<(), String> {
@@ -32415,7 +32495,7 @@ impl OrchRegistry {
     /// Returns the resulting [`Self::workflow_status`] — the same shape
     /// `orch_workflow_status` reads, so the toggle's own confirm and a later
     /// status poll can never disagree.
-    pub fn set_advanced_orchestrator(&self, group: &str, on: bool, actor: &str) -> Result<Value, String> {
+    pub fn set_advanced_orchestrator(&self, group: &GroupId, on: bool, actor: &str) -> Result<Value, String> {
         // `group_file_io` covers the whole decide-persist-publish window (its
         // doc has the argument), so the flag this reads is the flag the write
         // below patches. Released before `workflow_status` on either exit:
@@ -32537,7 +32617,7 @@ impl OrchRegistry {
     /// is visible at the call site rather than implied by indentation.
     fn sync_merge_gate_locked(
         &self,
-        group: &str,
+        group: &GroupId,
         gate: Option<&workflow::Gate>,
         blocks: &[workflow::Block],
     ) {
@@ -32590,7 +32670,7 @@ impl OrchRegistry {
     /// enforcement input: the gate is enforced in the gh shim against the base
     /// ref it resolves live.
     #[doc(hidden)] // pub for integration tests
-    pub fn workflow_status(&self, group: &str) -> Value {
+    pub fn workflow_status(&self, group: &GroupId) -> Value {
         self.workflow_status_within(group, DEFAULT_BRANCH_MAX_AGE)
     }
 
@@ -32598,7 +32678,7 @@ impl OrchRegistry {
     /// window as a parameter (#743 S4a). `Duration::ZERO` forces a live
     /// resolution; see [`Self::default_branch_memo`].
     #[doc(hidden)] // pub for integration tests
-    pub fn workflow_status_within(&self, group: &str, default_branch_max_age: Duration) -> Value {
+    pub fn workflow_status_within(&self, group: &GroupId, default_branch_max_age: Duration) -> Value {
         let info = self.group(group);
         let guardrails = info.as_ref().map(|g| g.guardrails.clone()).unwrap_or_default();
         let name = if guardrails.advanced_orchestrator {
@@ -32825,7 +32905,7 @@ impl OrchRegistry {
     ) -> Vec<AttentionItem> {
         // Board-derived gate map: agent id → gate status, across every live
         // group. Read once per group (a small fs read) rather than per agent.
-        let groups: HashSet<String> =
+        let groups: HashSet<GroupId> =
             self.agents.lock_safe().values().map(|a| a.group.clone()).collect();
         let mut gate_of: HashMap<String, String> = HashMap::new();
         for g in &groups {
@@ -32926,7 +33006,7 @@ impl OrchRegistry {
             };
             out.push(AttentionItem {
                 agent_id: a.id.clone(),
-                group: a.group.clone(),
+                group: a.group.to_string(),
                 name: a.name.clone(),
                 role: Some(a.role),
                 pty_id: a.pty_id,
@@ -33025,7 +33105,7 @@ impl OrchRegistry {
         let mut fire = Vec::new();
         for i in items {
             let already = toasted.get(&i.agent_id).map(|p| p == i.reason).unwrap_or(false);
-            if !already && i.reason != "gate" && notify.contains(&i.group) {
+            if !already && i.reason != "gate" && notify.contains(i.group.as_str()) {
                 fire.push(i.agent_id.clone());
                 toasted.insert(i.agent_id.clone(), i.reason.to_string());
             }
@@ -33072,8 +33152,17 @@ impl OrchRegistry {
         );
         for id in self.attention_toast_targets(&items) {
             if let Some(i) = items.iter().find(|i| i.agent_id == id) {
-                self.audit(&i.group, "loomux", "attention-toast",
-                    json!({ "agent": i.agent_id, "reason": i.reason }));
+                // #904: `AttentionItem.group` is a display slot and is EMPTY
+                // for a plain pane. Parse rather than trust: an empty id used
+                // to resolve to `root.join("")` — the orchestration root
+                // itself — so a toast for a group-less pane would have
+                // appended to an `audit.jsonl` in the root. Unreachable today
+                // (only real groups are in `notify_groups`) and now
+                // unreachable by construction. The toast still fires.
+                if let Ok(g) = GroupId::parse(&i.group) {
+                    self.audit(&g, "loomux", "attention-toast",
+                        json!({ "agent": i.agent_id, "reason": i.reason }));
+                }
                 notify_desktop(&format!("loomux · {}", i.name), &i.detail);
             }
         }
@@ -33155,7 +33244,7 @@ impl OrchRegistry {
         // `attention_inputs` uses). A pane that changes in the gap is handled
         // where it is acted on — `clear_stranded` is a no-op on an absent
         // entry, and `reword_stranded` compares before it writes.
-        let panes: Vec<(String, String, u32, Option<StrandedBlocker>)> = {
+        let panes: Vec<(String, GroupId, u32, Option<StrandedBlocker>)> = {
             let notes = self.attn_stranded.lock_safe();
             // The common case by a wide margin: no chip anywhere, so the pass
             // costs one uncontended map lock and returns without ever looking
@@ -33277,7 +33366,7 @@ impl OrchRegistry {
         // here on purpose: `queuefull_readmit_gate` is the one place that names
         // the class, so a second copy of its domain cannot go stale against it
         // (`janitor_watches`' reason, reached the other way round).
-        let panes: Vec<(String, String, u32, Option<StrandedBlocker>)> = {
+        let panes: Vec<(String, GroupId, u32, Option<StrandedBlocker>)> = {
             let notes = self.attn_stranded.lock_safe();
             // The common case by a wide margin: no chip anywhere, so the pass
             // costs one uncontended map lock and returns.
@@ -33355,10 +33444,10 @@ impl OrchRegistry {
     /// Record a spawn against the group's rolling-hour window and report
     /// whether the spawn-rate guardrail is now exceeded. Checks and records
     /// under one lock so concurrent spawns can't both slip past the cap.
-    fn check_and_record_spawn(&self, group: &str, limit: u32) -> Result<(), String> {
+    fn check_and_record_spawn(&self, group: &GroupId, limit: u32) -> Result<(), String> {
         let now = now_ms();
         let mut all = self.spawn_times.lock_safe();
-        let times = all.entry(group.to_string()).or_default();
+        let times = all.entry(group.clone()).or_default();
         times.retain(|&t| now.saturating_sub(t) < SPAWN_RATE_WINDOW_MS);
         if spawn_rate_exceeded(times, now, limit, SPAWN_RATE_WINDOW_MS) {
             return Err(format!(
@@ -33511,7 +33600,7 @@ impl OrchRegistry {
     /// an opencode pane.
     fn note_opencode_db_degrade(
         &self,
-        group: &str,
+        group: &GroupId,
         db: &Path,
         err: Option<&crate::opencodedb::Unavailable>,
     ) {
@@ -33530,7 +33619,7 @@ impl OrchRegistry {
         if seen.get(group) == Some(&kind) {
             return; // already diagnosed this episode
         }
-        seen.insert(group.to_string(), kind);
+        seen.insert(group.clone(), kind);
         // Dropped before auditing: `audit` takes its own locks, and holding an
         // unrelated one across it is how lock-order bugs start.
         drop(seen);
@@ -33541,7 +33630,7 @@ impl OrchRegistry {
         }));
     }
 
-    fn load_usage_snapshots(&self, group: &str) -> Vec<UsageSnapshot> {
+    fn load_usage_snapshots(&self, group: &GroupId) -> Vec<UsageSnapshot> {
         let path = self.group_dir(group).join("usage.json");
         let Ok(text) = fs::read_to_string(&path) else {
             return Vec::new(); // absent is normal (no usage yet)
@@ -33618,7 +33707,7 @@ impl OrchRegistry {
     ///
     /// An empty `incoming` writes nothing — it is a plain read, which is what a
     /// group with no live agents does every tick.
-    fn merge_usage_snapshots(&self, group: &str, incoming: Vec<UsageSnapshot>) -> Vec<UsageSnapshot> {
+    fn merge_usage_snapshots(&self, group: &GroupId, incoming: Vec<UsageSnapshot>) -> Vec<UsageSnapshot> {
         let _guard = self.usage_lock.lock_safe();
         let mut list = self.load_usage_snapshots(group);
         if incoming.is_empty() {
@@ -33653,7 +33742,7 @@ impl OrchRegistry {
     /// computation, and a kill's captured spend must not wait out a poll window
     /// before the group view can see it.
     #[doc(hidden)]
-    pub fn upsert_usage_snapshot(&self, group: &str, snap: UsageSnapshot) {
+    pub fn upsert_usage_snapshot(&self, group: &GroupId, snap: UsageSnapshot) {
         self.merge_usage_snapshots(group, vec![snap]);
         self.invalidate_usage_memo(group);
     }
@@ -33663,7 +33752,7 @@ impl OrchRegistry {
     /// Removes the map entry rather than clearing the cell, and so takes only
     /// the outer map lock: an invalidation can never block on — or deadlock
     /// against — a computation holding the cell. See [`Self::usage_memo`].
-    fn invalidate_usage_memo(&self, group: &str) {
+    fn invalidate_usage_memo(&self, group: &GroupId) {
         self.usage_memo.lock_safe().remove(group);
     }
 
@@ -33672,7 +33761,7 @@ impl OrchRegistry {
     /// each call; killed/recycled agents keep the snapshot captured when they
     /// exited, so the lifetime total never forgets historical spend. Tokens are
     /// exact; dollar figures are estimates (labelled per agent).
-    pub fn group_usage(&self, group: &str) -> Value {
+    pub fn group_usage(&self, group: &GroupId) -> Value {
         // `ZERO` = never serve a stored value. Every existing caller (the MCP
         // `group_usage` tool, the autonomy anchor, the budget enforcer, the
         // tests) keeps exactly today's semantics; only the polled UI path opts
@@ -33691,12 +33780,12 @@ impl OrchRegistry {
     /// monotonic clock — a wall-clock jump cannot extend the window), and
     /// `Duration::ZERO` disables serving entirely.
     #[doc(hidden)] // pub for integration tests
-    pub fn group_usage_within(&self, group: &str, max_age: Duration) -> Value {
+    pub fn group_usage_within(&self, group: &GroupId, max_age: Duration) -> Value {
         // Map lock → release → per-group cell (pty.rs's rule): the outer lock is
         // held only to clone the cell's Arc out.
         let cell = {
             let mut memo = self.usage_memo.lock_safe();
-            memo.entry(group.to_string()).or_default().clone()
+            memo.entry(group.clone()).or_default().clone()
         };
         let mut slot = cell.lock_safe();
         if let Some((at, value)) = slot.as_ref() {
@@ -33714,7 +33803,7 @@ impl OrchRegistry {
     }
 
     /// The uncached usage computation behind [`Self::group_usage_within`].
-    fn compute_group_usage(&self, group: &str) -> Value {
+    fn compute_group_usage(&self, group: &GroupId) -> Value {
         let live_agents: Vec<AgentEntry> = self
             .agents
             .lock_safe()
@@ -33841,7 +33930,7 @@ impl OrchRegistry {
     /// group as a whole, measured from the earliest-started live agent — the
     /// orchestrator in practice). Also reports the paused flag so the panel can
     /// compose pause and end-orchestration sanely.
-    pub fn group_summary(&self, group: &str) -> Value {
+    pub fn group_summary(&self, group: &GroupId) -> Value {
         let now = now_ms();
         let live: Vec<AgentEntry> = self
             .agents
@@ -33937,7 +34026,7 @@ impl OrchRegistry {
     /// confirms before invoking. Composes with a paused group: killing works
     /// regardless of pause, and the pause marker is cleared so the teardown is
     /// total — a later relaunch on the same repo won't inherit a stale pause.
-    pub fn end_group(&self, group: &str, cleanup_worktrees: bool) -> Result<Value, String> {
+    pub fn end_group(&self, group: &GroupId, cleanup_worktrees: bool) -> Result<Value, String> {
         // Snapshot every member (all statuses): already-dead workers may still
         // have a worktree on disk that cleanup should reclaim.
         let members: Vec<AgentEntry> = self
@@ -34085,7 +34174,7 @@ impl OrchRegistry {
     /// resurrect it, not just the one path that does so today. `create_group`
     /// makes this directory before any spawn can reach a writer, so a live
     /// group always passes.
-    fn group_state_exists(&self, group: &str) -> bool {
+    fn group_state_exists(&self, group: &GroupId) -> bool {
         self.group_dir(group).is_dir()
     }
 
@@ -34101,13 +34190,30 @@ impl OrchRegistry {
     /// — which would dissolve the protection that stops `end_group("X")`
     /// deleting a live `X-extra` group's files. That is failing toward
     /// deletion, the one direction this must never fail in.
-    fn existing_group_ids(&self) -> Option<Vec<String>> {
+    fn existing_group_ids(&self) -> Option<Vec<GroupId>> {
         match fs::read_dir(&self.root) {
             Ok(entries) => Some(
                 entries
                     .flatten()
                     .filter(|e| e.path().is_dir())
-                    .filter_map(|e| e.file_name().to_str().map(str::to_string))
+                    // #904: a directory name is an id that arrives from OUTSIDE
+                    // this process — anything at all can create a directory
+                    // under the root — so it is parsed, not trusted, and an
+                    // unparseable one is skipped rather than fed back into a
+                    // join.
+                    //
+                    // Not "not a group loomux made" (rev-440 N3 corrected an
+                    // earlier version of this comment that said so): the minter
+                    // used to emit a leading-dash id for a repo directory named
+                    // `-…`, so such a directory IS one of ours. The consequence
+                    // is bounded and one-directional — the only consumer here is
+                    // `reclaim_group_agent_files`, which is per-group and whose
+                    // `None` path deletes nothing, so a skipped id loses its
+                    // reclaim, never someone else's files. The same skip in
+                    // `session_roles` costs such a group its rows in the session
+                    // browser. Both are preferable to joining an id the
+                    // validator refuses; neither is silent data loss.
+                    .filter_map(|e| GroupId::parse(e.file_name().to_str()?).ok())
                     .collect(),
             ),
             // Any failure at all, missing root included — #464's own review
@@ -34162,7 +34268,7 @@ impl OrchRegistry {
     /// Returns the filenames actually removed. Best-effort throughout: a
     /// reclaim failure must never fail a group teardown.
     #[doc(hidden)] // pub for integration tests (the enumeration-failure rule is pinned on this)
-    pub fn reclaim_group_agent_files(&self, group: &str) -> Vec<String> {
+    pub fn reclaim_group_agent_files(&self, group: &GroupId) -> Vec<String> {
         let Some(groups) = self.existing_group_ids() else { return Vec::new() };
         let mut removed = Vec::new();
         for (dir, ext) in [
@@ -34979,7 +35085,7 @@ impl OrchRegistry {
     /// these two vars — an acceptable joint fate today since every environment
     /// that installs Claude/Copilot for loomux-managed development is assumed
     /// to have git.
-    fn agent_pane_env(&self, group: &str, agent_id: &str) -> Vec<(String, String)> {
+    fn agent_pane_env(&self, group: &GroupId, agent_id: &str) -> Vec<(String, String)> {
         let Some(shim) = self.ensure_shims() else {
             return Vec::new();
         };
@@ -34997,7 +35103,7 @@ impl OrchRegistry {
 
     /// Grant directory for a kind (`merge_grants` | `release_grants`), under the
     /// group state dir. The shim reads these; only human Tauri commands write them.
-    fn grant_dir(&self, group: &str, kind: &str) -> PathBuf {
+    fn grant_dir(&self, group: &GroupId, kind: &str) -> PathBuf {
         self.group_dir(group).join(kind)
     }
 
@@ -35015,7 +35121,7 @@ impl OrchRegistry {
     /// run the shim and consume grants, they never mint them.
     pub fn grant_merge(
         &self,
-        group: &str,
+        group: &GroupId,
         pr: &str,
         comment: Option<&str>,
         actor: &str,
@@ -35040,7 +35146,7 @@ impl OrchRegistry {
     /// grant itself changes with batch size: bulk changes delivery, not
     /// authority, and there is deliberately no "bulk grant" object for the
     /// shim to honour.
-    fn mint_merge_grant(&self, group: &str, pr: &str, actor: &str) -> Result<u64, String> {
+    fn mint_merge_grant(&self, group: &GroupId, pr: &str, actor: &str) -> Result<u64, String> {
         if self.group(group).is_none() {
             return Err("unknown group".into());
         }
@@ -35070,7 +35176,7 @@ impl OrchRegistry {
     /// boundary as `grant_merge`.
     pub fn grant_release(
         &self,
-        group: &str,
+        group: &GroupId,
         tag: &str,
         comment: Option<&str>,
         actor: &str,
@@ -35119,7 +35225,7 @@ impl OrchRegistry {
 
     /// The group-dir spec file the `gh` shim reads to enforce `gates.merge`.
     /// Absent = no declared gate = the pre-#222 flow, exactly.
-    fn merge_gate_path(&self, group: &str) -> PathBuf {
+    fn merge_gate_path(&self, group: &GroupId) -> PathBuf {
         self.group_dir(group).join(workflow::MERGE_GATE_FILE)
     }
 
@@ -35130,12 +35236,12 @@ impl OrchRegistry {
     /// (in shell); this is for the Rust side — reporting gate status back to a
     /// reviewer that just recorded a verdict, and to the orchestrator that has to
     /// decide what to do next.
-    pub fn merge_gate(&self, group: &str) -> Option<workflow::Gate> {
+    pub fn merge_gate(&self, group: &GroupId) -> Option<workflow::Gate> {
         workflow::parse_gate_file(&fs::read_to_string(self.merge_gate_path(group)).ok()?)
     }
 
     /// Whether the group has a gate file at all — the shim's own precondition.
-    pub fn merge_gate_declared(&self, group: &str) -> bool {
+    pub fn merge_gate_declared(&self, group: &GroupId) -> bool {
         self.merge_gate_path(group).is_file()
     }
 
@@ -35148,7 +35254,7 @@ impl OrchRegistry {
     /// workflow file that fails to parse: `create_group` leaves an existing gate
     /// file alone there, because "I can't read your workflow" is not evidence that
     /// you stopped wanting the gate — see the call site.
-    fn sync_merge_gate(&self, group: &str, gate: Option<&workflow::Gate>) {
+    fn sync_merge_gate(&self, group: &GroupId, gate: Option<&workflow::Gate>) {
         let path = self.merge_gate_path(group);
         match gate {
             Some(g) => {
@@ -35276,7 +35382,7 @@ impl OrchRegistry {
     /// for delegates already spawned under it — reloading the roster live is a
     /// separate, larger-blast-radius change this issue is not scoped to.
     #[doc(hidden)] // pub for integration tests (#385/B1 toggle-off race + removal-audit pins)
-    pub fn reload_merge_gate_if_changed(&self, id: &str) {
+    pub fn reload_merge_gate_if_changed(&self, id: &GroupId) {
         let Some(info) = self.group(id) else { return };
         let Some(text) = Self::read_workflow_stably(&info.repo) else { return };
         let Ok(wf) = workflow::parse_workflow(&text) else { return };
@@ -35295,7 +35401,7 @@ impl OrchRegistry {
         // would be exactly the log-spam this feature already avoids for the
         // unchanged-file case.
         if fresh.is_none() && armed.is_some() {
-            if self.merge_gate_removal_warned.lock_safe().insert(id.to_string()) {
+            if self.merge_gate_removal_warned.lock_safe().insert(id.clone()) {
                 self.audit(id, "loomux", "merge-gate-removal-ignored", json!({
                     "reason": "gates.merge is absent from the current read, but a gate is \
                                already armed. The reload path never treats absence as removal \
@@ -35353,7 +35459,7 @@ impl OrchRegistry {
     /// follows). Called on a timer by `start_workflow_gate_reload`.
     pub fn run_workflow_gate_reload(&self) {
         let paused = self.paused.lock_safe().clone();
-        let ids: Vec<String> = self
+        let ids: Vec<GroupId> = self
             .groups
             .lock_safe()
             .iter()
@@ -35369,7 +35475,7 @@ impl OrchRegistry {
     /// block (`verdicts/pr-<N>/<block-id>`). Both segments are loomux-generated —
     /// `pr` is a parsed number and a block id is sanitized to `[A-Za-z0-9_-]` — so
     /// neither can walk out of the group dir.
-    fn verdict_dir(&self, group: &str, pr: u64) -> PathBuf {
+    fn verdict_dir(&self, group: &GroupId, pr: u64) -> PathBuf {
         self.group_dir(group).join(workflow::VERDICTS_DIR).join(format!("pr-{pr}"))
     }
 
@@ -35461,7 +35567,7 @@ impl OrchRegistry {
     /// The digest of the PR's body as it stands now — what a recorded verdict's
     /// `body_digest` is compared against. `Err` (carrying why) when the body
     /// can't be read.
-    fn pr_body_digest(&self, group: &str, pr: u64) -> Result<String, String> {
+    fn pr_body_digest(&self, group: &GroupId, pr: u64) -> Result<String, String> {
         let repo = self.group(group).map(|g| g.repo).unwrap_or_default();
         self.pr_body(&repo, pr).map(|b| workflow::body_digest(&b))
     }
@@ -35494,7 +35600,7 @@ impl OrchRegistry {
     /// here (#791). It is the same fact `list_verdicts` needs to answer
     /// `body_changed` per verdict, and fetching it twice per PR meant the no-arg
     /// fan-out spent three `gh` calls per PR on two facts.
-    fn body_drift(&self, group: &str, pr: u64, now: Option<&str>) -> (Vec<String>, Vec<String>) {
+    fn body_drift(&self, group: &GroupId, pr: u64, now: Option<&str>) -> (Vec<String>, Vec<String>) {
         let Some(now) = now else {
             return (Vec::new(), Vec::new());
         };
@@ -35531,7 +35637,7 @@ impl OrchRegistry {
     /// is in the trail even though only the latest verdict gates.
     pub fn record_verdict(
         &self,
-        group: &str,
+        group: &GroupId,
         agent_id: &str,
         pr: &str,
         verdict: &str,
@@ -35630,7 +35736,7 @@ impl OrchRegistry {
     }
 
     /// Every verdict recorded for a PR, by reviewer block (block order).
-    pub fn verdicts(&self, group: &str, pr: u64) -> Vec<workflow::ReviewVerdict> {
+    pub fn verdicts(&self, group: &GroupId, pr: u64) -> Vec<workflow::ReviewVerdict> {
         let mut out: Vec<workflow::ReviewVerdict> = fs::read_dir(self.verdict_dir(group, pr))
             .into_iter()
             .flatten()
@@ -35646,12 +35752,12 @@ impl OrchRegistry {
     }
 
     /// The verdicts a gate decision reads: reviewer block → its latest record.
-    fn verdict_map(&self, group: &str, pr: u64) -> BTreeMap<String, workflow::ReviewVerdict> {
+    fn verdict_map(&self, group: &GroupId, pr: u64) -> BTreeMap<String, workflow::ReviewVerdict> {
         self.verdicts(group, pr).into_iter().map(|v| (v.block.clone(), v)).collect()
     }
 
     /// PRs this group has any recorded verdict for (ascending).
-    pub fn verdict_prs(&self, group: &str) -> Vec<u64> {
+    pub fn verdict_prs(&self, group: &GroupId) -> Vec<u64> {
         let mut prs: Vec<u64> = fs::read_dir(self.group_dir(group).join(workflow::VERDICTS_DIR))
             .into_iter()
             .flatten()
@@ -35671,7 +35777,7 @@ impl OrchRegistry {
     /// merge: it reads the same files, resolves the same head, and fails closed on
     /// the same shapes. A status line that said SATISFIED while the shim refused
     /// would be worse than no status line at all.
-    pub fn gate_status_line(&self, group: &str, pr: u64) -> Option<String> {
+    pub fn gate_status_line(&self, group: &GroupId, pr: u64) -> Option<String> {
         // Sampled here for the callers that have no digest of their own. The
         // gate check comes FIRST: a group with no gate returns `None` without
         // spending a `gh` call on a line it will not print (#791).
@@ -35694,7 +35800,7 @@ impl OrchRegistry {
     /// bound instead of two.
     pub fn gate_status_line_with(
         &self,
-        group: &str,
+        group: &GroupId,
         pr: u64,
         body_digest: Option<&str>,
     ) -> Option<String> {
@@ -35836,7 +35942,7 @@ impl OrchRegistry {
             .unwrap_or_else(|| "claude".to_string())
     }
 
-    fn live_delegate_count(&self, group: &str) -> u32 {
+    fn live_delegate_count(&self, group: &GroupId) -> u32 {
         self.agents
             .lock_safe()
             .values()
@@ -35849,7 +35955,7 @@ impl OrchRegistry {
     /// guardrail message (#203). Locks `agents`; the race-safe cap check in
     /// `spawn_agent` already holds that lock, so it calls
     /// [`format_delegate_roster`] directly against its guard instead of this.
-    fn live_delegate_roster(&self, group: &str) -> String {
+    fn live_delegate_roster(&self, group: &GroupId) -> String {
         let rows = self
             .agents
             .lock_safe()
@@ -35883,7 +35989,7 @@ impl OrchRegistry {
     /// flag, at the cost of one extra `fs::write` per Claude spawn.
     fn write_mcp_config(
         &self,
-        group: &str,
+        group: &GroupId,
         agent_id: &str,
         token: &str,
         cli: &str,
@@ -36013,7 +36119,7 @@ impl OrchRegistry {
     /// displace the user's own.
     fn write_hook_settings_file(
         &self,
-        group: &str,
+        group: &GroupId,
         agent_id: &str,
         containment: Containment,
     ) -> Option<PathBuf> {
@@ -36138,7 +36244,7 @@ impl OrchRegistry {
     /// submission" — unlike `SessionStart` above, no `matcher` key is
     /// written at all (one was silently ignored anyway, per the docs; this
     /// mirrors reality rather than adding a key the CLI would discard).
-    fn compact_hook_settings(&self, group: &str, agent_id: &str) -> Option<Value> {
+    fn compact_hook_settings(&self, group: &GroupId, agent_id: &str) -> Option<Value> {
         let script = self.ensure_compact_hook_script()?;
         let sh = self.resolve_hook_sh()?;
         // Forward-slashed so the path is safe inside the POSIX script's own
@@ -36387,7 +36493,7 @@ impl OrchRegistry {
     /// Audit a repo-authored `allow:` that was refused because the block's class
     /// is read-only. Silently dropping it would leave an author wondering why
     /// their pattern does nothing; honoring it would break capability closure.
-    fn audit_allow_denied(&self, group: &str, block: &workflow::Block, allow: &[String]) {
+    fn audit_allow_denied(&self, group: &GroupId, block: &workflow::Block, allow: &[String]) {
         self.audit(group, "loomux", "workflow-allow-denied", json!({
             "block": block.id,
             "kind": block.kind.as_str(),
@@ -36438,7 +36544,7 @@ impl OrchRegistry {
     /// gets a composed, deliberately-slimmer text instead of this same
     /// `contract` value — a per-CLI decision the docs justify, not an
     /// oversight to reconcile.
-    fn write_claude_agent_file(&self, group: &str, block: &workflow::Block, contract: &str, description: &str) -> Option<String> {
+    fn write_claude_agent_file(&self, group: &GroupId, block: &workflow::Block, contract: &str, description: &str) -> Option<String> {
         if !self.group_state_exists(group) {
             return None;
         }
@@ -36508,7 +36614,7 @@ impl OrchRegistry {
     /// depend on the trailing newline.
     fn write_opencode_agent_file(
         &self,
-        group: &str,
+        group: &GroupId,
         block: &workflow::Block,
         contract: &str,
     ) -> Option<(String, PathBuf)> {
@@ -36607,7 +36713,7 @@ impl OrchRegistry {
     /// an unwritable directory already does.
     fn write_copilot_agent_file(
         &self,
-        group: &str,
+        group: &GroupId,
         block: &workflow::Block,
         persona: Option<&ResolvedPersona>,
         // #802: `true` only on the tools-gap repair path, where this file is a
@@ -36720,7 +36826,7 @@ impl OrchRegistry {
     #[doc(hidden)] // pub for integration tests
     pub fn persona_inject(
         &self,
-        group: &str,
+        group: &GroupId,
         block: &workflow::Block,
         cli: &str,
         persona: Option<&ResolvedPersona>,
@@ -37794,7 +37900,7 @@ impl OrchRegistry {
     /// `task` empty = idle agent awaiting assignment.
     pub fn spawn_agent(
         &self,
-        group_id: &str,
+        group_id: &GroupId,
         role: Role,
         name: &str,
         task: &str,
@@ -37814,7 +37920,7 @@ impl OrchRegistry {
     #[allow(clippy::too_many_arguments)]
     pub fn spawn_agent_ex(
         &self,
-        group_id: &str,
+        group_id: &GroupId,
         role: Role,
         block: Option<String>,
         name: &str,
@@ -38125,7 +38231,7 @@ impl OrchRegistry {
 
         let entry = AgentEntry {
             id: agent_id.clone(),
-            group: group_id.to_string(),
+            group: group_id.clone(),
             name: display.clone(),
             name_source,
             block: block.id.clone(),
@@ -38275,7 +38381,7 @@ impl OrchRegistry {
             e
         };
         let request = SpawnRequest {
-            group_id: group_id.to_string(),
+            group_id: group_id.clone(),
             agent_id: agent_id.clone(),
             role,
             name: display,
@@ -38359,7 +38465,7 @@ impl OrchRegistry {
                     if let Some(reg) = self.arc() {
                         reg.spawn_session_watcher(
                             agent_id.clone(),
-                            group_id.to_string(),
+                            group_id.clone(),
                             cwd.clone(),
                             baseline,
                         );
@@ -38876,7 +38982,7 @@ impl OrchRegistry {
     #[doc(hidden)] // pub for integration tests
     pub fn enqueue_text(
         &self,
-        group: &str,
+        group: &GroupId,
         agent_id: &str,
         from: &str,
         text: &str,
@@ -38912,7 +39018,7 @@ impl OrchRegistry {
     #[allow(clippy::too_many_arguments)]
     pub fn enqueue_text_as(
         &self,
-        group: &str,
+        group: &GroupId,
         agent_id: &str,
         from: &str,
         text: &str,
@@ -38992,7 +39098,7 @@ impl OrchRegistry {
                         id, agent_id: agent_id.to_string(), from: from.to_string(),
                         payload: queue::QueuedPayload::Text(text.to_string()),
                         reason, enqueued_ms: now_ms(), coalesced: 0,
-                        group: group.to_string(),
+                        group: Some(group.clone()),
                         to_orchestrator: target.is_orchestrator,
                         session_id: target.session_id,
                         delivery_kind: kind,
@@ -39068,7 +39174,7 @@ impl OrchRegistry {
     /// `deliver_prompt` HAS written the `prompt` line carrying the full text.
     fn withdraw_unprocessable(
         &self,
-        group: &str,
+        group: &GroupId,
         agent_id: &str,
         from: &str,
         text: &str,
@@ -39141,7 +39247,7 @@ impl OrchRegistry {
     /// not simply moved above these refusals instead.
     fn audit_delivery_refused(
         &self,
-        group: &str,
+        group: &GroupId,
         agent_id: &str,
         from: &str,
         text: &str,
@@ -39176,7 +39282,7 @@ impl OrchRegistry {
     #[doc(hidden)] // pub for integration tests
     pub fn enqueue_stranded_front(
         &self,
-        group: &str,
+        group: &GroupId,
         agent_id: &str,
         from: &str,
         pty_id: u32,
@@ -39240,7 +39346,7 @@ impl OrchRegistry {
         q: &mut VecDeque<queue::QueuedDelivery>,
         agent_id: &str,
         from: &str,
-        group: &str,
+        group: &GroupId,
         target: &DurableTarget,
         reason: queue::EnqueueReason,
     ) -> Result<(u64, usize), usize> {
@@ -39257,7 +39363,7 @@ impl OrchRegistry {
             // recovery path still has to name which group's snapshot it came
             // out of and which pane it was for, to audit and surface the
             // loss instead of dropping it quietly.
-            group: group.to_string(),
+            group: Some(group.clone()),
             to_orchestrator: target.is_orchestrator,
             session_id: target.session_id.clone(),
             // #620: a marker is an Enter press against text ALREADY in the
@@ -39284,7 +39390,7 @@ impl OrchRegistry {
     /// of that line needs.
     fn audit_stranded_push(
         &self,
-        group: &str,
+        group: &GroupId,
         agent_id: &str,
         pushed: Result<(u64, usize), usize>,
         reason: queue::EnqueueReason,
@@ -39351,7 +39457,7 @@ impl OrchRegistry {
     #[doc(hidden)] // pub for integration tests
     pub fn admit_stranded_selfheal(
         &self,
-        group: &str,
+        group: &GroupId,
         agent_id: &str,
         from: &str,
         pty_id: u32,
@@ -39431,7 +39537,7 @@ impl OrchRegistry {
     #[doc(hidden)] // pub for integration tests
     pub fn actuate_stranded(
         &self,
-        group: &str,
+        group: &GroupId,
         agent_id: &str,
         from: &str,
         pty_id: u32,
@@ -39458,7 +39564,7 @@ impl OrchRegistry {
                     // nothing can drain — the marker stays queued, which is
                     // the honest state, and the badge below still fires.
                     if let (Some(app), Some(reg)) = (self.app.lock_safe().clone(), self.arc()) {
-                        reg.ensure_drainer(app, group.to_string(), pty_id, None);
+                        reg.ensure_drainer(app, group.clone(), pty_id, None);
                     }
                     None
                 }
@@ -39506,7 +39612,7 @@ impl OrchRegistry {
     #[doc(hidden)] // pub for integration tests
     pub fn redeliver_lost_kickoff(
         &self,
-        group: &str,
+        group: &GroupId,
         agent_id: &str,
         from: &str,
         pty_id: u32,
@@ -39549,7 +39655,7 @@ impl OrchRegistry {
         // tests) nothing can drain — the entry stays queued, which is the
         // honest state, and the caller's badge still fires.
         if let (Some(app), Some(reg)) = (self.app.lock_safe().clone(), self.arc()) {
-            reg.ensure_drainer(app, group.to_string(), pty_id, treatment);
+            reg.ensure_drainer(app, group.clone(), pty_id, treatment);
         }
         true
     }
@@ -39559,7 +39665,7 @@ impl OrchRegistry {
     /// changes reason (heal in flight → blocked) still reports how long the
     /// pane has been stranded.
     #[doc(hidden)] // pub for integration tests
-    pub fn mark_stranded(&self, group: &str, agent_id: &str, blocker: Option<StrandedBlocker>) {
+    pub fn mark_stranded(&self, group: &GroupId, agent_id: &str, blocker: Option<StrandedBlocker>) {
         let since_ms = {
             let mut m = self.attn_stranded.lock_safe();
             let since_ms = m.get(agent_id).map(|n| n.since_ms).unwrap_or_else(now_ms);
@@ -39594,7 +39700,7 @@ impl OrchRegistry {
     #[doc(hidden)] // pub for integration tests
     pub fn reword_stranded(
         &self,
-        group: &str,
+        group: &GroupId,
         agent_id: &str,
         expected: Option<StrandedBlocker>,
         to: Option<StrandedBlocker>,
@@ -39631,7 +39737,7 @@ impl OrchRegistry {
     #[doc(hidden)] // pub for integration tests
     pub fn apply_stranded_verdict(
         &self,
-        group: &str,
+        group: &GroupId,
         agent_id: &str,
         judged: Option<StrandedBlocker>,
         verdict: BadgeRelease,
@@ -39654,7 +39760,7 @@ impl OrchRegistry {
     /// the same event (the reason `BoxReading::as_str` lives next to its enum).
     fn audit_stranded_attention(
         &self,
-        group: &str,
+        group: &GroupId,
         agent_id: &str,
         blocker: Option<StrandedBlocker>,
         since_ms: u64,
@@ -39670,7 +39776,7 @@ impl OrchRegistry {
     /// was actually up, so the log records state changes rather than every
     /// poll of a healthy pane.
     #[doc(hidden)] // pub for integration tests
-    pub fn clear_stranded(&self, group: &str, agent_id: &str, why: &str) {
+    pub fn clear_stranded(&self, group: &GroupId, agent_id: &str, why: &str) {
         let had = self.attn_stranded.lock_safe().remove(agent_id);
         if let Some(note) = had {
             self.audit(group, "loomux", "stranded-cleared", json!({
@@ -39726,9 +39832,9 @@ impl OrchRegistry {
     /// change to record.
     pub fn dismiss_stranded(&self, agent_id: &str) -> bool {
         // The group is loomux's own fact about the pane, so it is read from the
-        // registry rather than taken from the caller: constraint 6 would let a
-        // command accept it as a path segment, and not accepting one at all is
-        // strictly narrower. An id with no agent record cannot have a chip on
+        // registry rather than taken from the caller: a command COULD accept a
+        // group id and parse it (#904), but not accepting one at all is strictly
+        // narrower. An id with no agent record cannot have a chip on
         // screen either — `attention_tick` builds its items from `agents` — so
         // this rejects only ids that could never have been clicked.
         let Some(group) = self.agent(agent_id).map(|a| a.group) else { return false };
@@ -39787,7 +39893,7 @@ impl OrchRegistry {
     #[doc(hidden)] // pub for integration tests
     pub fn note_hold(
         &self,
-        group: &str,
+        group: &GroupId,
         agent_id: &str,
         pty_id: u32,
         observation: HoldObservation,
@@ -39990,7 +40096,7 @@ impl OrchRegistry {
     #[allow(clippy::too_many_arguments)]
     pub fn hold_escalation_step(
         &self,
-        group: &str,
+        group: &GroupId,
         agent_id: &str,
         pty_id: u32,
         admission: WriteAdmission,
@@ -40153,7 +40259,7 @@ impl OrchRegistry {
     /// re-asking on each poll costs a re-read, never a second report.
     fn note_undeliverable_notice(
         &self,
-        group: &str,
+        group: &GroupId,
         agent_id: &str,
         pty_id: u32,
         admission: WriteAdmission,
@@ -40307,7 +40413,7 @@ impl OrchRegistry {
     /// `false, false` on iteration 1. Purely theoretical for the reason
     /// `FreshFirstAttempt`'s doc gives: a fresh kickoff's pty has no other
     /// deliveries to race against yet.
-    fn ensure_drainer(self: &Arc<Self>, app: AppHandle, group: String, pty_id: u32, fresh_first: Option<FreshFirstAttempt>) {
+    fn ensure_drainer(self: &Arc<Self>, app: AppHandle, group: GroupId, pty_id: u32, fresh_first: Option<FreshFirstAttempt>) {
         // #470 B1 review round 2: mint a fresh generation for this spawn —
         // see `queue_draining`'s and `DrainerGuard`'s docs for why a bare
         // membership check isn't enough. `contains_key` (not `insert`)
@@ -40375,7 +40481,7 @@ impl OrchRegistry {
     /// non-empty at this exact instant — returns `None`, and the caller
     /// (`run_queue_drainer`) loops again to pick up whatever raced in,
     /// rather than exiting and relying on a NEW drainer to notice it.
-    fn commit_exit(&self, group: &str, pty_id: u32, generation: u64, force: bool) -> Option<Vec<queue::QueuedDelivery>> {
+    fn commit_exit(&self, group: &GroupId, pty_id: u32, generation: u64, force: bool) -> Option<Vec<queue::QueuedDelivery>> {
         self.queues.mutate(group, self, |queues| {
             let is_empty = queues.get(&pty_id).map(|q| q.is_empty()).unwrap_or(true);
             if !force && !is_empty {
@@ -40426,7 +40532,7 @@ impl OrchRegistry {
     /// batch of removed entries) and `commit_exit`'s force-exit callers in
     /// `run_queue_drainer`. Never touches `queues` or `queue_draining`
     /// itself — `entries` is always what a PRIOR removal already took out.
-    fn announce_dropped(&self, group: &str, entries: Vec<queue::QueuedDelivery>, reason: queue::DropReason) {
+    fn announce_dropped(&self, group: &GroupId, entries: Vec<queue::QueuedDelivery>, reason: queue::DropReason) {
         if entries.is_empty() {
             return;
         }
@@ -40455,7 +40561,7 @@ impl OrchRegistry {
     /// direct MCP-adjacent drop paths) with no drainer lifecycle to keep
     /// in sync.
     #[doc(hidden)] // pub for integration tests
-    pub fn drop_queue(&self, group: &str, pty_id: u32, reason: queue::DropReason) {
+    pub fn drop_queue(&self, group: &GroupId, pty_id: u32, reason: queue::DropReason) {
         let entries: Vec<queue::QueuedDelivery> = self.queues.mutate(group, self, |queues| {
             let entries: Vec<queue::QueuedDelivery> =
                 queues.remove(&pty_id).map(Vec::from).unwrap_or_default();
@@ -40501,11 +40607,11 @@ impl OrchRegistry {
     /// real, and the fix is a channel that is not a delivery, not a relaxed
     /// gate.
     #[doc(hidden)] // pub for integration tests
-    pub fn notify_queue(&self, group: &str, agent_id: &str, target_is_orchestrator: bool, text: &str) {
+    pub fn notify_queue(&self, group: &GroupId, agent_id: &str, target_is_orchestrator: bool, text: &str) {
         if target_is_orchestrator {
             self.orch_notice_inbox
                 .lock_safe()
-                .entry(group.to_string())
+                .entry(group.clone())
                 .or_default()
                 .park(text);
             self.audit(group, "loomux", "notice-suppressed",
@@ -40563,7 +40669,7 @@ impl OrchRegistry {
     /// written here, and every constituent notice is already in the log as a
     /// `notice-suppressed` line carrying its own text.
     #[doc(hidden)] // pub for integration tests
-    pub fn take_orchestrator_notices(&self, group: &str) -> Option<String> {
+    pub fn take_orchestrator_notices(&self, group: &GroupId) -> Option<String> {
         let inbox = self.orch_notice_inbox.lock_safe().remove(group)?;
         let text = orch_notice_relay_text(&inbox.notices, inbox.elided)?;
         self.audit(group, "loomux", "notice-relayed", json!({
@@ -40605,7 +40711,7 @@ impl OrchRegistry {
     /// every other caller passes `None` and the agent is resolved from the
     /// queue, then from the remembered pressure record, then from `by_pty`.
     #[doc(hidden)] // pub for integration tests
-    pub fn note_queue_capacity(&self, group: &str, pty_id: u32, hint: Option<&str>) {
+    pub fn note_queue_capacity(&self, group: &GroupId, pty_id: u32, hint: Option<&str>) {
         let (depth, front_agent) = {
             let queues = self.queues.read();
             let q = queues.get(&pty_id);
@@ -40758,7 +40864,7 @@ impl OrchRegistry {
     /// Reads the audit window rather than any in-memory tally — see
     /// [`refusal_roster`] for why the log is the record. That read happens on
     /// this edge only, never per delivery.
-    fn announce_refusal_roster(&self, group: &str, agent_id: &str) {
+    fn announce_refusal_roster(&self, group: &GroupId, agent_id: &str) {
         let (entries, window_truncated) = self.audit_log_windowed(group);
         let roster = refusal_roster(&entries, agent_id, window_truncated);
         // Nothing was refused since the last roster — the ordinary case, and
@@ -40770,7 +40876,7 @@ impl OrchRegistry {
         let outcome = if target_is_orchestrator {
             self.orch_notice_inbox
                 .lock_safe()
-                .entry(group.to_string())
+                .entry(group.clone())
                 .or_default()
                 .park(&text);
             Ok(())
@@ -40806,7 +40912,7 @@ impl OrchRegistry {
     /// it always is) and audit `delivery-dequeued`. Called by the drainer
     /// once an entry's delivery attempt reaches `DeliverOutcome::Done`.
     #[doc(hidden)] // pub for integration tests
-    pub fn pop_front_dequeued(&self, group: &str, pty_id: u32, id: u64, enqueued_ms: u64) {
+    pub fn pop_front_dequeued(&self, group: &GroupId, pty_id: u32, id: u64, enqueued_ms: u64) {
         self.queues.mutate(group, self, |queues| {
             if let Some(q) = queues.get_mut(&pty_id) {
                 if q.front().is_some_and(|f| f.id == id) {
@@ -40855,7 +40961,7 @@ impl OrchRegistry {
     /// pre-paste closes out nothing: every constituent stays exactly where
     /// it was, in order, for the next attempt.
     #[doc(hidden)] // pub for integration tests
-    pub fn pop_batch_dequeued(&self, group: &str, pty_id: u32, batch: &[(u64, u64)]) {
+    pub fn pop_batch_dequeued(&self, group: &GroupId, pty_id: u32, batch: &[(u64, u64)]) {
         if batch.len() == 1 {
             // Unchanged from pre-#533 for the uncontended case: one entry,
             // one plain `delivery-dequeued` line with no batch fields.
@@ -40923,7 +41029,7 @@ impl OrchRegistry {
     /// line is the record; `superseded_by` and `folded_coalesced` on it
     /// make the transfer reconstructible after the fact.
     #[doc(hidden)] // pub for integration tests
-    pub fn drop_superseded(&self, group: &str, pty_id: u32, superseded: &[queue::Superseded]) {
+    pub fn drop_superseded(&self, group: &GroupId, pty_id: u32, superseded: &[queue::Superseded]) {
         if superseded.is_empty() {
             return;
         }
@@ -41131,7 +41237,7 @@ impl OrchRegistry {
     /// `state.json`/`tasks.json`/`audit.jsonl` in the group dir, because it
     /// is the same kind of thing: state this group cannot afford to lose
     /// when the process does.
-    fn queue_snapshot_path(&self, group: &str) -> PathBuf {
+    fn queue_snapshot_path(&self, group: &GroupId) -> PathBuf {
         self.group_dir(group).join("queue.json")
     }
 
@@ -41140,7 +41246,7 @@ impl OrchRegistry {
     /// the hot write path. Named for what it holds rather than for the
     /// mechanism, because the human who opens it after a crash is looking for
     /// orphans, not for an archive.
-    fn queue_archive_path(&self, group: &str) -> PathBuf {
+    fn queue_archive_path(&self, group: &GroupId) -> PathBuf {
         self.group_dir(group).join("queue-orphans-archive.jsonl")
     }
 
@@ -41165,7 +41271,7 @@ impl OrchRegistry {
     /// rather than propagated, because the alternative — failing the
     /// delivery that triggered it — would turn a durability degradation
     /// into an outage of the thing being made durable.
-    fn persist_queues(&self, group: &str) {
+    fn persist_queues(&self, group: &GroupId) {
         // **Never overwrite a snapshot nobody has read yet.** Recovery is
         // lazy (see `recover_persisted_queue`), and the first thing that
         // touches a group after a restart is not guaranteed to be a bind or
@@ -41233,7 +41339,7 @@ impl OrchRegistry {
     /// `delivery-dequeued`/`-dropped`/`-recovered`, and an archived entry's
     /// disposition has not changed — writing a terminal line here would tell
     /// the one derivation that needs no snapshot that the work was resolved.
-    fn archive_staged_overflow(&self, group: &str) {
+    fn archive_staged_overflow(&self, group: &GroupId) {
         let now = now_ms();
         let policy = queue::ArchivePolicy::default();
         // Plan under the staging locks over a PROJECTION (id/age/bytes), not
@@ -41330,7 +41436,7 @@ impl OrchRegistry {
     /// call by design (see its tool description), so a file read there is
     /// cheaper than any structure kept live for it — which would put the cost
     /// back on the hot path this change exists to clear.
-    fn archived_orphans(&self, group: &str) -> Vec<queue::OrphanedQueueEntry> {
+    fn archived_orphans(&self, group: &GroupId) -> Vec<queue::OrphanedQueueEntry> {
         let Ok(text) = fs::read_to_string(self.queue_archive_path(group)) else {
             return Vec::new();
         };
@@ -41389,7 +41495,7 @@ impl OrchRegistry {
     /// into the recovery notice's age.
     fn readmit_archived(
         &self,
-        group: &str,
+        group: &GroupId,
         agent_id: &str,
         pty_id: u32,
         target: &DurableTarget,
@@ -41496,7 +41602,7 @@ impl OrchRegistry {
     /// only other site touching staging (`readmit_recovered`) takes and
     /// releases `recovered_queue` before it ever calls into `queues`, so the
     /// two never overlap in the opposite order.
-    fn group_queue_entries(&self, group: &str) -> Vec<queue::PersistedEntry> {
+    fn group_queue_entries(&self, group: &GroupId) -> Vec<queue::PersistedEntry> {
         let mut out = Vec::new();
         {
             let queues = self.queues.read();
@@ -41504,7 +41610,7 @@ impl OrchRegistry {
             ptys.sort_unstable();
             for pty_id in ptys {
                 let Some(q) = queues.get(&pty_id) else { continue };
-                for d in q.iter().filter(|d| d.group == group) {
+                for d in q.iter().filter(|d| d.group.as_ref() == Some(group)) {
                     out.push(queue::PersistedEntry { pty_id, delivery: d.clone() });
                 }
             }
@@ -41588,12 +41694,12 @@ impl OrchRegistry {
     /// The snapshot file is NOT deleted here, and `persist_queues` writes
     /// staged entries back out alongside the live ones — so recovery is
     /// re-runnable across any number of restarts (review round 1, finding 1).
-    fn recover_persisted_queue(&self, group: &str) {
+    fn recover_persisted_queue(&self, group: &GroupId) {
         // ---- phase 1: under the guard, everything another thread must not
         // observe half-done (the seed, and staging itself) ----
         let notices: Vec<String> = {
             let mut recovered = self.recovered_groups.lock_safe();
-            if !recovered.insert(group.to_string()) {
+            if !recovered.insert(group.clone()) {
                 return;
             }
             // Publishing the mark here rather than at the end is safe
@@ -41685,10 +41791,10 @@ impl OrchRegistry {
             }
             if !split.markers.is_empty() {
                 notices.push(queue::stranded_lost_notice(split.markers.len()));
-                self.recovered_markers.lock_safe().insert(group.to_string(), split.markers);
+                self.recovered_markers.lock_safe().insert(group.clone(), split.markers);
             }
             if !split.replayable.is_empty() {
-                self.recovered_queue.lock_safe().insert(group.to_string(), split.replayable);
+                self.recovered_queue.lock_safe().insert(group.clone(), split.replayable);
             }
             notices
         };
@@ -41718,7 +41824,7 @@ impl OrchRegistry {
     ///
     /// Returns how many were re-admitted.
     #[doc(hidden)] // pub for integration tests
-    pub fn readmit_recovered(&self, group: &str, agent_id: &str, pty_id: u32) -> usize {
+    pub fn readmit_recovered(&self, group: &GroupId, agent_id: &str, pty_id: u32) -> usize {
         self.recover_persisted_queue(group);
         // #581 §4: the merge queue's own restart reconcile, beside the delivery
         // queue's. Same shape (once-only guard, two phases), same reason for
@@ -41778,7 +41884,7 @@ impl OrchRegistry {
         // parked without holding the entry.
         let put_back = |entry: queue::PersistedEntry| -> u64 {
             let id = entry.delivery.id;
-            self.recovered_queue.lock_safe().entry(group.to_string()).or_default().push(entry);
+            self.recovered_queue.lock_safe().entry(group.clone()).or_default().push(entry);
             self.persist_queues(group);
             id
         };
@@ -41849,7 +41955,7 @@ impl OrchRegistry {
             // but nothing has spawned a drainer for a pane that was empty
             // until this moment.
             if let (Some(app), Some(reg)) = (self.app.lock_safe().clone(), self.arc()) {
-                reg.ensure_drainer(app, group.to_string(), pty_id, None);
+                reg.ensure_drainer(app, group.clone(), pty_id, None);
             }
             let minutes = now_ms().saturating_sub(oldest_ms) / 60_000;
             let target_is_orchestrator = target.is_orchestrator;
@@ -41878,7 +41984,7 @@ impl OrchRegistry {
     /// fresh id, then `delivery-dequeued` when it lands), so they do not
     /// appear here twice.
     #[doc(hidden)] // pub for integration tests
-    pub fn queue_orphans(&self, group: &str) -> Vec<queue::OrphanedQueueEntry> {
+    pub fn queue_orphans(&self, group: &GroupId) -> Vec<queue::OrphanedQueueEntry> {
         self.recover_persisted_queue(group);
         let row = |e: &queue::PersistedEntry, reason: String| queue::OrphanedQueueEntry {
             id: e.delivery.id,
@@ -41930,7 +42036,7 @@ impl OrchRegistry {
             .read()
             .values()
             .flat_map(|q| q.iter())
-            .filter(|d| d.group == group)
+            .filter(|d| d.group.as_ref() == Some(group))
             .map(|d| d.id)
             .collect();
         queue::merge_orphans(from_snapshot, self.audit_derived_orphans(group), &live)
@@ -41948,7 +42054,7 @@ impl OrchRegistry {
     /// declined an hour ago would reorder against everything the pane has
     /// accepted since.
     #[doc(hidden)] // pub for integration tests
-    pub fn front_door_refusals(&self, group: &str) -> FrontDoorRefusals {
+    pub fn front_door_refusals(&self, group: &GroupId) -> FrontDoorRefusals {
         // `audit_log_windowed`, not `audit_log`: the derivation has to know
         // whether its own timeline was cut, or a count over a partial window
         // reads as a count over all of history (#579 review NB1).
@@ -41984,7 +42090,7 @@ impl OrchRegistry {
     /// than widening `queue_orphans`'s signature to carry entries it does not
     /// otherwise need.
     #[doc(hidden)] // pub for integration tests
-    pub fn queue_orphans_json(&self, group: &str) -> Value {
+    pub fn queue_orphans_json(&self, group: &GroupId) -> Value {
         let orphans = self.queue_orphans(group);
         let now = now_ms();
         let rows: Vec<Value> = orphans
@@ -42071,7 +42177,7 @@ impl OrchRegistry {
     /// `delivery-dropped`. Split out of `queue_orphans` so the snapshot
     /// derivation can be merged over it (and so this one stays directly
     /// testable on its own).
-    fn audit_derived_orphans(&self, group: &str) -> Vec<queue::OrphanedQueueEntry> {
+    fn audit_derived_orphans(&self, group: &GroupId) -> Vec<queue::OrphanedQueueEntry> {
         let entries = self.audit_log(group);
         let lines: Vec<queue::QueueAuditLine> = entries
             .iter()
@@ -42100,7 +42206,7 @@ impl OrchRegistry {
     /// `start_task` rejects for the same reason. A dead/absent orchestrator
     /// surfaces as the "no live orchestrator" error from delivery.
     #[doc(hidden)] // pub for integration tests
-    pub fn steer_orchestrator(&self, group: &str, text: &str) -> Result<(), String> {
+    pub fn steer_orchestrator(&self, group: &GroupId, text: &str) -> Result<(), String> {
         if text.trim().is_empty() {
             return Err("empty steering message".into());
         }
@@ -42127,7 +42233,7 @@ impl OrchRegistry {
     /// is the same event described accurately (see `delivery_eaten_notice`).
     pub fn notify_unconfirmed_delivery(
         &self,
-        group: &str,
+        group: &GroupId,
         agent_id: &str,
         target_is_orchestrator: bool,
         confirmed: bool,
@@ -42173,7 +42279,7 @@ impl OrchRegistry {
             self.flush_unconfirmed_notices(group, agent_id, eaten);
             return;
         };
-        let (g, a) = (group.to_string(), agent_id.to_string());
+        let (g, a) = (group.clone(), agent_id.to_string());
         std::thread::spawn(move || {
             std::thread::sleep(UNCONFIRMED_NOTICE_COALESCE_WINDOW);
             me.flush_unconfirmed_notices(&g, &a, eaten);
@@ -42192,7 +42298,7 @@ impl OrchRegistry {
     /// pane-wide gate that can change during the window is re-checked at
     /// flush time per #532.
     #[doc(hidden)] // pub for integration tests
-    pub fn buffer_unconfirmed_delivery(&self, group: &str, agent_id: &str, eaten: bool, delivery_id: u64) -> bool {
+    pub fn buffer_unconfirmed_delivery(&self, group: &GroupId, agent_id: &str, eaten: bool, delivery_id: u64) -> bool {
         let opened = {
             let mut pending = self.unconfirmed_pending.lock_safe();
             let bucket =
@@ -42254,7 +42360,7 @@ impl OrchRegistry {
     /// Returns whether anything was actually withdrawn, so the audit can say
     /// so and a test can assert it.
     #[doc(hidden)] // pub for integration tests
-    pub fn retract_unconfirmed_delivery(&self, group: &str, agent_id: &str, delivery_id: u64) -> bool {
+    pub fn retract_unconfirmed_delivery(&self, group: &GroupId, agent_id: &str, delivery_id: u64) -> bool {
         // Both kinds: a correction resolves the DELIVERY, and which flavour
         // of alarm it happened to raise is not something the confirming tick
         // knows, or should have to.
@@ -42300,7 +42406,7 @@ impl OrchRegistry {
     /// holds. The suppression is audited with every id it swallowed, so the
     /// deliveries are still discoverable (#445).
     #[doc(hidden)] // pub for integration tests
-    pub fn flush_unconfirmed_notices(&self, group: &str, agent_id: &str, eaten: bool) {
+    pub fn flush_unconfirmed_notices(&self, group: &GroupId, agent_id: &str, eaten: bool) {
         let ids = self
             .unconfirmed_pending
             .lock_safe()
@@ -42356,7 +42462,7 @@ impl OrchRegistry {
     /// per delivery, from the late-confirmation monitor, only when a
     /// `failed` alarm had actually fired for this exact delivery.
     #[doc(hidden)] // pub for integration tests
-    pub fn notify_delivery_confirmed_late(&self, group: &str, agent_id: &str, target_is_orchestrator: bool) {
+    pub fn notify_delivery_confirmed_late(&self, group: &GroupId, agent_id: &str, target_is_orchestrator: bool) {
         if target_is_orchestrator {
             self.audit(group, "loomux", "notice-suppressed",
                 json!({ "kind": "delivery-confirmed-late", "to": agent_id, "reason": "target-is-orchestrator" }));
@@ -42391,7 +42497,7 @@ impl OrchRegistry {
     /// underneath it — visible, contradictory, and refusing everything as
     /// `gate-not-configured`. One toggle governs the file; the queue is part of
     /// the file.
-    fn merge_queue_enabled(&self, group: &str) -> bool {
+    fn merge_queue_enabled(&self, group: &GroupId) -> bool {
         self.merge_queue_policy(group).enabled
     }
 
@@ -42404,7 +42510,7 @@ impl OrchRegistry {
     /// per-tick bounds cannot come to different conclusions about whether this
     /// group runs a queue — the failure mode being a driver that batches for a
     /// group whose tools all refuse `queue-disabled`.
-    fn merge_queue_policy(&self, group: &str) -> workflow::MergeQueuePolicy {
+    fn merge_queue_policy(&self, group: &GroupId) -> workflow::MergeQueuePolicy {
         let Some(g) = self.group(group) else { return workflow::MergeQueuePolicy::default() };
         if !g.guardrails.advanced_orchestrator {
             return workflow::MergeQueuePolicy::default();
@@ -42427,7 +42533,7 @@ impl OrchRegistry {
     /// `gate-not-configured` (#681). The caller turns `Err` into
     /// `refusal::GATE_UNREADABLE`; `GateSpec::Malformed` (parseable file,
     /// unparseable contents) is unaffected and still refuses `gate-not-met`.
-    fn merge_queue_gate(&self, group: &str) -> Result<mergeq::GateSpec, std::io::Error> {
+    fn merge_queue_gate(&self, group: &GroupId) -> Result<mergeq::GateSpec, std::io::Error> {
         match fs::read_to_string(self.merge_gate_path(group)) {
             Ok(text) => Ok(mergeq::GateSpec::read(Some(&text))),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(mergeq::GateSpec::Absent),
@@ -42439,7 +42545,7 @@ impl OrchRegistry {
     /// gate and this PR's verdicts, hand them to `mqloop::enqueue`, audit, and
     /// persist. Every decision is the driver module's.
     #[doc(hidden)] // pub for integration tests
-    pub fn queue_merge(&self, group: &str, pr: u64, target: Option<&str>) -> Value {
+    pub fn queue_merge(&self, group: &GroupId, pr: u64, target: Option<&str>) -> Value {
         let runner = match self.group(group).map(|g| g.repo) {
             Some(repo) => mqdriver::runner_for(std::path::Path::new(&repo)),
             // A group loomux cannot resolve is a FAULT, not "the repo did not
@@ -42455,7 +42561,7 @@ impl OrchRegistry {
     #[doc(hidden)] // pub for integration tests
     pub fn queue_merge_with(
         &self,
-        group: &str,
+        group: &GroupId,
         pr: u64,
         target: Option<&str>,
         runner: &dyn mqdriver::MqRunner,
@@ -42544,7 +42650,7 @@ impl OrchRegistry {
     /// cannot conjure a `merge_queue.json` (which would collapse slice F's
     /// `absent` state, the same trap the reconcile write is gated against).
     #[doc(hidden)] // pub for integration tests
-    pub fn merge_queue_status(&self, group: &str) -> Value {
+    pub fn merge_queue_status(&self, group: &GroupId) -> Value {
         let enabled = self.merge_queue_enabled(group);
         match mqloop::load_state(&self.group_dir(group)) {
             Ok(s) => mqloop::status_view(&s, enabled, now_ms()),
@@ -42557,7 +42663,7 @@ impl OrchRegistry {
 
     /// `cancel_queued_merge(pr)` (§11.1).
     #[doc(hidden)] // pub for integration tests
-    pub fn cancel_queued_merge(&self, group: &str, pr: u64) -> Value {
+    pub fn cancel_queued_merge(&self, group: &GroupId, pr: u64) -> Value {
         let dir = self.group_dir(group);
         // Same species as `queue_merge`'s two, and not in rev-163's list because
         // it wears a different label: `not-queued` asserts the PR is not in the
@@ -42620,7 +42726,7 @@ impl OrchRegistry {
     /// Builds the real runner and delegates; see
     /// [`merge_queue_reconcile_with`](Self::merge_queue_reconcile_with) for the
     /// seam an integration test drives.
-    pub fn merge_queue_reconcile(&self, group: &str) {
+    pub fn merge_queue_reconcile(&self, group: &GroupId) {
         let repo = match self.group(group).map(|g| g.repo) {
             Some(r) => r,
             None => return,
@@ -42652,13 +42758,13 @@ impl OrchRegistry {
     #[doc(hidden)] // pub for integration tests
     pub fn merge_queue_reconcile_with(
         &self,
-        group: &str,
+        group: &GroupId,
         runner: &dyn mqdriver::MqRunner,
     ) -> Vec<String> {
         // ---- phase 1: under the guard ----
         let notices: Vec<String> = {
             let mut done = self.mq_reconciled_groups.lock_safe();
-            if !done.insert(group.to_string()) {
+            if !done.insert(group.clone()) {
                 return Vec::new();
             }
             // #698: every read-modify-write of this file is serialized, so a
@@ -42754,12 +42860,12 @@ impl OrchRegistry {
     ///
     /// Returns the group serviced, if any — for the audit-free assertion a test
     /// needs that the tick actually reached a group.
-    pub fn run_mq_driver_tick(&self) -> Option<String> {
+    pub fn run_mq_driver_tick(&self) -> Option<GroupId> {
         self.mq_driver_tick(now_ms())
     }
 
     /// [`run_mq_driver_tick`](Self::run_mq_driver_tick) with the clock injected.
-    pub fn mq_driver_tick(&self, now: u64) -> Option<String> {
+    pub fn mq_driver_tick(&self, now: u64) -> Option<GroupId> {
         let group = self.next_mq_group(now)?;
         // Cloned out and the guard dropped before driving: the override is a
         // one-line lookup and the drive below is a batch build.
@@ -42792,10 +42898,10 @@ impl OrchRegistry {
     /// §12 — and a *file check* rather than a parse, so an unreadable file still
     /// reaches the driver's own loud handling), and its repo must actually
     /// declare the queue.
-    fn next_mq_group(&self, now: u64) -> Option<String> {
-        let all: Vec<String> = self.groups.lock_safe().keys().cloned().collect();
+    fn next_mq_group(&self, now: u64) -> Option<GroupId> {
+        let all: Vec<GroupId> = self.groups.lock_safe().keys().cloned().collect();
         let service = self.mq_service_ms.lock_safe().clone();
-        let mut due: Vec<(u64, String)> = all
+        let mut due: Vec<(u64, GroupId)> = all
             .into_iter()
             .filter(|g| service.get(g).map(|t| now >= *t).unwrap_or(true))
             .filter(|g| mqloop::state_path(&self.group_dir(g)).exists())
@@ -42809,8 +42915,8 @@ impl OrchRegistry {
     }
 
     /// Hold `group` off until `at`.
-    fn mq_defer(&self, group: &str, at: u64) {
-        self.mq_service_ms.lock_safe().insert(group.to_string(), at);
+    fn mq_defer(&self, group: &GroupId, at: u64) {
+        self.mq_service_ms.lock_safe().insert(group.clone(), at);
     }
 
     /// Drive one group with the runner injected — the seam `tests/orchestration.rs`
@@ -42834,7 +42940,7 @@ impl OrchRegistry {
     #[doc(hidden)] // pub for integration tests
     pub fn mq_drive_group_with(
         &self,
-        group: &str,
+        group: &GroupId,
         runner: &dyn mqdriver::MqRunner,
         now: u64,
     ) -> mqloop::DriveReport {
@@ -42933,7 +43039,7 @@ impl OrchRegistry {
         report
     }
 
-    pub fn deliver_to_orchestrator(&self, group: &str, text: &str, from: &str) -> Result<(), String> {
+    pub fn deliver_to_orchestrator(&self, group: &GroupId, text: &str, from: &str) -> Result<(), String> {
         let orch = self
             .agents
             .lock_safe()
@@ -42974,7 +43080,7 @@ impl OrchRegistry {
     /// `message_orchestrator` refuses an orchestrator caller a layer up;
     /// `report` does not, which is why the check lives here rather than at
     /// either call site.
-    fn deliver_relayed_to_orchestrator(&self, group: &str, text: &str, from: &str) -> Result<(), String> {
+    fn deliver_relayed_to_orchestrator(&self, group: &GroupId, text: &str, from: &str) -> Result<(), String> {
         let orch = self
             .agents
             .lock_safe()
@@ -42993,7 +43099,7 @@ impl OrchRegistry {
     /// reason `deliver_prompt_as` is.
     fn deliver_to_orchestrator_as(
         &self,
-        group: &str,
+        group: &GroupId,
         text: &str,
         from: &str,
         reason: queue::EnqueueReason,
@@ -43008,7 +43114,7 @@ impl OrchRegistry {
         self.deliver_prompt_as(&orch, text, from, Delivery::MidSession, reason)
     }
 
-    pub fn list_agents(&self, group: &str) -> Value {
+    pub fn list_agents(&self, group: &GroupId) -> Value {
         let agents = self.agents.lock_safe();
         let mut list: Vec<Value> = agents
             .values()
@@ -43411,7 +43517,7 @@ impl OrchRegistry {
     /// wording, the initiator and the timestamp.
     fn audit_demoted_exit_notice(
         &self,
-        group: &str,
+        group: &GroupId,
         agent_id: &str,
         initiator: Option<ExitInitiator>,
         notice: &str,
@@ -43456,7 +43562,7 @@ impl OrchRegistry {
     /// happens; the deadline stamp (`spawn_request_expired`) and the frontend's
     /// bind-rejection handling are the belt-and-braces for the other orderings.
     /// Best-effort and a no-op in unit tests (no app handle).
-    fn emit_spawn_cancelled(&self, group_id: &str, agent_id: &str) {
+    fn emit_spawn_cancelled(&self, group_id: &GroupId, agent_id: &str) {
         if let Some(app) = self.app.lock_safe().clone() {
             let _ = app.emit(
                 "orch-spawn-cancelled",
@@ -43504,7 +43610,7 @@ pub struct GhPollTick {
     /// The group rather than a bool, because "one group per wake, oldest
     /// serviced first" is the tick's whole bound and a bool could not tell a
     /// rotation from a group monopolising every wake.
-    pub mq_serviced: Option<String>,
+    pub mq_serviced: Option<GroupId>,
 }
 
 /// Whether the unified poller's INTAKE half is due on a wake at `now`, given
@@ -43820,6 +43926,66 @@ where
 /// makes it safe to run before the first `.await`.
 fn reg_of(app: &AppHandle) -> Arc<OrchRegistry> {
     app.state::<Arc<OrchRegistry>>().inner().clone()
+}
+
+/// **The trust boundary** (#904): where a group id stops being a string the
+/// caller chose and becomes a [`GroupId`] the backend has checked.
+///
+/// Every `#[tauri::command]` taking a `group_id` starts here. Until #904 that
+/// string went straight to `root.join(...)` on the strength of CLAUDE.md hard
+/// constraint 6 — which was never a claim about the id, but about the caller:
+/// only our own in-process webview can invoke a Tauri command. #888 replaces
+/// that caller with a network peer, at which point "it connected" is all the
+/// identity there is. This function is the difference between the two worlds,
+/// and it is deliberately the *first* thing each command does, before any
+/// registry state is touched.
+///
+/// The error carries the `GroupIdError` but not the offending string: the
+/// message goes back over IPC to a caller that just supplied it, so echoing it
+/// tells an attacker nothing it doesn't know while giving a confused-deputy
+/// bug somewhere to hide.
+///
+/// # Commands with no error channel
+///
+/// Most commands return `Result` and simply propagate. Eleven do not — they
+/// return `Value`, `Vec<_>` or `bool` — and each has to answer a refused id
+/// with a *value*. **The rule is: return the shape that command's own caller
+/// already handles as "absent", checked against the frontend rather than
+/// assumed.** Not one uniform sentinel.
+///
+/// The first version of this change used `json!({})` everywhere and justified it
+/// with "`{}.x` is `undefined` where `null.x` throws". rev-440 took that apart:
+/// the reads are *nested*, so the one-level argument never held, and
+/// `groupview.ts` calls `render()` **outside** `load()`'s `try/catch` — so the
+/// throw was uncaught and left the panel half-drawn, which is precisely what the
+/// comment claimed to prevent. Verified per site, the shapes are:
+///
+/// - `orch_group_watches` -> `json!([])`. Success is an array; the panel calls
+///   `.filter` on it, and `{}` has no `.filter`.
+/// - `orch_group_summary`, `orch_group_usage`, `orch_autonomy`,
+///   `orch_lock_state`, `orch_workflow_status`, `orch_merge_queue`,
+///   `orch_channel_for_pane` -> `Value::Null`. Every consumer already guards
+///   with `?.`/`??`/`if (!x)`, and `null` takes those guards where `{}` walks
+///   straight past them. `orch_channel_for_pane`'s own absent sentinel is
+///   already `Value::Null`, and `{}` is truthy, so `{}` answered "yes, there is
+///   a channel".
+///
+/// What `null` buys for `orch_autonomy` is narrower than an earlier version of
+/// this comment claimed, and rev-450 (N10) traced it: with `{}` returned across
+/// the board `render()` threw at `s.roles.orchestrator` first, so
+/// `renderAutonomy` was never reached — the crash came before the wrong toggle.
+/// And `null` does not distinguish unknown from off either, since `autoBtn` is
+/// constructed reading "off". What it does do is stop a later failed poll from
+/// clobbering a previously-correct render, which is a real improvement and the
+/// honest size of it.
+/// - `orch_tasks`, `orch_audit` -> `Vec::new()`; the three `bool` commands ->
+///   `false` (see the note at those sites).
+///
+/// None of this is reachable from today's webview, which only ever sends ids the
+/// backend minted. It is reachable from the caller this whole change exists for
+/// — #888's remote client — which is why it is fixed now rather than filed.
+fn command_group(raw: &str) -> Result<GroupId, String> {
+    GroupId::parse(raw).map_err(|e| format!("invalid group id: {e}"))
 }
 
 /// The flags the single-pane launcher appends to a `program` command when its
@@ -44477,6 +44643,7 @@ pub fn orch_workflow_preview_sync(repo: String, agent_cli: String) -> Value {
 #[tauri::command]
 pub async fn orch_pause_group(app: AppHandle, group_id: String) -> Result<(), String> {
     let reg = reg_of(&app);
+    let group_id = command_group(&group_id)?;
     run_blocking(move || reg.pause_group(&group_id)).await
 }
 
@@ -44494,12 +44661,19 @@ pub async fn orch_pause_group(app: AppHandle, group_id: String) -> Result<(), St
 #[tauri::command]
 pub async fn orch_resume_group(app: AppHandle, group_id: String) -> Result<(), String> {
     let reg = reg_of(&app);
+    let group_id = command_group(&group_id)?;
     run_blocking(move || reg.resume_group(&group_id)).await
 }
 
 /// Whether a group is currently paused (drives the pause/resume button state).
 #[tauri::command]
 pub fn orch_group_paused(reg: tauri::State<Arc<OrchRegistry>>, group_id: String) -> bool {
+    // #904 / rev-440 N4: `false` is indistinguishable from the honest answer
+    // for an unknown group — deliberately, since a caller that cannot name a
+    // valid group has no business learning whether one exists. Every MUTATING
+    // twin of these three returns `Err` instead; only the read-only pair-state
+    // queries degrade silently. See `command_group`.
+    let Ok(group_id) = command_group(&group_id) else { return false };
     reg.is_paused(&group_id)
 }
 
@@ -44548,6 +44722,12 @@ pub async fn orch_dismiss_stranded(app: AppHandle, agent_id: String) -> bool {
 /// Whether desktop notifications are enabled for a group (toggle button state).
 #[tauri::command]
 pub fn orch_notify_enabled(reg: tauri::State<Arc<OrchRegistry>>, group_id: String) -> bool {
+    // #904 / rev-440 N4: `false` is indistinguishable from the honest answer
+    // for an unknown group — deliberately, since a caller that cannot name a
+    // valid group has no business learning whether one exists. Every MUTATING
+    // twin of these three returns `Err` instead; only the read-only pair-state
+    // queries degrade silently. See `command_group`.
+    let Ok(group_id) = command_group(&group_id) else { return false };
     reg.notify_enabled(&group_id)
 }
 
@@ -44571,6 +44751,7 @@ pub async fn orch_set_notify(
     enabled: bool,
 ) -> Result<(), String> {
     let reg = reg_of(&app);
+    let group_id = command_group(&group_id)?;
     run_blocking(move || reg.set_notify(&group_id, enabled)).await
 }
 
@@ -44579,6 +44760,12 @@ pub async fn orch_set_notify(
 /// the frontend negates this: see `spawnExpanded` in orchestration.ts).
 #[tauri::command]
 pub fn orch_spawn_expanded(reg: tauri::State<Arc<OrchRegistry>>, group_id: String) -> bool {
+    // #904 / rev-440 N4: `false` is indistinguishable from the honest answer
+    // for an unknown group — deliberately, since a caller that cannot name a
+    // valid group has no business learning whether one exists. Every MUTATING
+    // twin of these three returns `Err` instead; only the read-only pair-state
+    // queries degrade silently. See `command_group`.
+    let Ok(group_id) = command_group(&group_id) else { return false };
     reg.spawn_expanded(&group_id)
 }
 
@@ -44600,6 +44787,7 @@ pub async fn orch_set_spawn_expanded(
     expanded: bool,
 ) -> Result<(), String> {
     let reg = reg_of(&app);
+    let group_id = command_group(&group_id)?;
     run_blocking(move || reg.set_spawn_expanded(&group_id, expanded)).await
 }
 
@@ -44627,6 +44815,7 @@ pub async fn orch_set_max_agents(
     max_agents: u32,
 ) -> Result<u32, String> {
     let reg = reg_of(&app);
+    let group_id = command_group(&group_id)?;
     run_blocking(move || reg.set_max_agents(&group_id, max_agents, "human")).await
 }
 
@@ -44647,6 +44836,7 @@ pub async fn orch_set_max_agents(
 #[tauri::command]
 pub async fn orch_group_usage(app: AppHandle, group_id: String) -> Value {
     let reg = reg_of(&app);
+    let Ok(group_id) = command_group(&group_id) else { return Value::Null };
     run_blocking(move || reg.group_usage_within(&group_id, USAGE_POLL_MAX_AGE)).await
 }
 
@@ -44721,6 +44911,7 @@ pub async fn orch_set_autonomous(
     enabled: bool,
 ) -> Result<(), String> {
     let reg = reg_of(&app);
+    let group_id = command_group(&group_id)?;
     run_blocking(move || reg.set_autonomous(&group_id, enabled)).await
 }
 
@@ -44761,6 +44952,7 @@ pub async fn orch_set_auto_merge(
     enabled: bool,
 ) -> Result<(), String> {
     let reg = reg_of(&app);
+    let group_id = command_group(&group_id)?;
     run_blocking(move || reg.set_auto_merge(&group_id, enabled)).await
 }
 
@@ -44785,6 +44977,7 @@ pub async fn orch_set_auto_release(
     enabled: bool,
 ) -> Result<(), String> {
     let reg = reg_of(&app);
+    let group_id = command_group(&group_id)?;
     run_blocking(move || reg.set_auto_release(&group_id, enabled)).await
 }
 
@@ -44822,6 +45015,7 @@ pub async fn orch_set_dangerous_mode(
     enabled: bool,
 ) -> Result<(), String> {
     let reg = reg_of(&app);
+    let group_id = command_group(&group_id)?;
     run_blocking(move || reg.set_dangerous_mode(&group_id, enabled)).await
 }
 
@@ -44861,6 +45055,7 @@ pub async fn orch_set_autonomy_budget(
     tokens: u64,
 ) -> Result<u64, String> {
     let reg = reg_of(&app);
+    let group_id = command_group(&group_id)?;
     run_blocking(move || reg.set_autonomy_budget(&group_id, tokens)).await
 }
 
@@ -44883,6 +45078,7 @@ pub async fn orch_set_idle_tick_minutes(
     minutes: u32,
 ) -> Result<u32, String> {
     let reg = reg_of(&app);
+    let group_id = command_group(&group_id)?;
     run_blocking(move || reg.set_idle_tick_minutes(&group_id, minutes)).await
 }
 
@@ -44904,6 +45100,7 @@ pub async fn orch_set_idle_activity_floor(
     bytes: u64,
 ) -> Result<u64, String> {
     let reg = reg_of(&app);
+    let group_id = command_group(&group_id)?;
     run_blocking(move || reg.set_idle_activity_floor(&group_id, bytes)).await
 }
 
@@ -44925,6 +45122,7 @@ pub async fn orch_set_compact_nudge_minutes(
     minutes: u32,
 ) -> Result<u32, String> {
     let reg = reg_of(&app);
+    let group_id = command_group(&group_id)?;
     run_blocking(move || reg.set_compact_nudge_minutes(&group_id, minutes)).await
 }
 
@@ -44947,6 +45145,7 @@ pub async fn orch_set_compact_nudge_roles(
     roles: Vec<String>,
 ) -> Result<Vec<String>, String> {
     let reg = reg_of(&app);
+    let group_id = command_group(&group_id)?;
     run_blocking(move || reg.set_compact_nudge_roles(&group_id, roles)).await
 }
 
@@ -44967,6 +45166,7 @@ pub async fn orch_set_compact_context_threshold(
     percent: u32,
 ) -> Result<u32, String> {
     let reg = reg_of(&app);
+    let group_id = command_group(&group_id)?;
     run_blocking(move || reg.set_compact_context_threshold(&group_id, percent)).await
 }
 
@@ -44990,6 +45190,7 @@ pub async fn orch_set_compact_nudge_min_context_percent(
     percent: u32,
 ) -> Result<u32, String> {
     let reg = reg_of(&app);
+    let group_id = command_group(&group_id)?;
     run_blocking(move || reg.set_compact_nudge_min_context_percent(&group_id, percent)).await
 }
 
@@ -45008,12 +45209,14 @@ pub async fn orch_set_compact_nudge_min_context_percent(
 #[tauri::command]
 pub async fn orch_autonomy(app: AppHandle, group_id: String) -> Value {
     let reg = reg_of(&app);
+    let Ok(group_id) = command_group(&group_id) else { return Value::Null };
     run_blocking(move || reg.autonomy_state_within(&group_id, USAGE_POLL_MAX_AGE)).await
 }
 
 /// Live-agent count, role breakdown, and uptime for the lifecycle panel.
 #[tauri::command]
 pub fn orch_group_summary(reg: tauri::State<Arc<OrchRegistry>>, group_id: String) -> Value {
+    let Ok(group_id) = command_group(&group_id) else { return Value::Null };
     reg.group_summary(&group_id)
 }
 
@@ -45022,6 +45225,13 @@ pub fn orch_group_summary(reg: tauri::State<Arc<OrchRegistry>>, group_id: String
 /// `notify_when`/`list_notifications` MCP tools use.
 #[tauri::command]
 pub fn orch_group_watches(reg: tauri::State<Arc<OrchRegistry>>, group_id: String) -> Value {
+    // #904 / rev-440 B4: an ARRAY, because that is what success returns here and
+    // the panel calls `.filter` on it (`groupview.ts` `this.watches.filter`).
+    // The rule for these no-error-channel degrades is written out once, above
+    // `command_group` — the short version is: return the shape the caller's own
+    // absent-case handling already copes with, verified per site, never a
+    // uniform `{}`.
+    let Ok(group_id) = command_group(&group_id) else { return json!([]) };
     reg.group_watches(&group_id)
 }
 
@@ -45030,8 +45240,9 @@ pub fn orch_group_watches(reg: tauri::State<Arc<OrchRegistry>>, group_id: String
 /// deliberately: what the human sees beside the panes and what the agents read
 /// are one payload, so they can never disagree.
 ///
-/// `group_id` is a path segment this command trusts (CLAUDE.md constraint 6) —
-/// the webview is the only caller and this adds no agent-reachable input.
+/// #904: `group_id` is parsed at the boundary by `command_group` like every
+/// other group-taking command, so this no longer rests on the webview being the
+/// only caller. It adds no agent-reachable input either way.
 ///
 /// **Off-thread** (performance.md §2 P1), unlike its neighbours
 /// `orch_group_summary`/`orch_group_watches`: those are pure in-memory registry
@@ -45042,6 +45253,7 @@ pub fn orch_group_watches(reg: tauri::State<Arc<OrchRegistry>>, group_id: String
 #[tauri::command]
 pub async fn orch_lock_state(app: AppHandle, group_id: String) -> Value {
     let reg = reg_of(&app);
+    let Ok(group_id) = command_group(&group_id) else { return Value::Null };
     run_blocking(move || reg.lock_state(&group_id)).await
 }
 
@@ -45073,6 +45285,7 @@ pub async fn orch_set_advanced_orchestrator(
     on: bool,
 ) -> Result<Value, String> {
     let reg = reg_of(&app);
+    let group_id = command_group(&group_id)?;
     run_blocking(move || reg.set_advanced_orchestrator(&group_id, on, "human")).await
 }
 
@@ -45096,6 +45309,7 @@ pub async fn orch_set_advanced_orchestrator(
 #[tauri::command]
 pub async fn orch_workflow_status(app: AppHandle, group_id: String) -> Value {
     let reg = reg_of(&app);
+    let Ok(group_id) = command_group(&group_id) else { return Value::Null };
     run_blocking(move || reg.workflow_status(&group_id)).await
 }
 
@@ -45145,6 +45359,14 @@ pub async fn orch_channel_connect(
     sender_agent: String,
 ) -> Result<Value, String> {
     let reg = reg_of(&app);
+    // #904: both ids parse at the boundary like every other group-taking
+    // command. This one is not a traversal hole even unparsed — the raw values
+    // reach exactly one equality check against the roster's own validated ids —
+    // but "safe because of how the callee happens to use it" is the property
+    // this whole change exists to retire, and it also turns an invalid id into
+    // an honest error instead of a misleading "stale pane reference".
+    let from_group = command_group(&from_group)?;
+    let to_group = command_group(&to_group)?;
     run_blocking(move || {
         reg.connect_agents(&from_group, &from_agent, &to_group, &to_agent, &sender_agent)
     })
@@ -45173,6 +45395,7 @@ pub async fn orch_channel_disconnect(
     agent: String,
 ) -> Result<Value, String> {
     let reg = reg_of(&app);
+    let group = command_group(&group)?;
     run_blocking(move || reg.disconnect_agent(&group, &agent)).await
 }
 
@@ -45186,6 +45409,7 @@ pub fn orch_channel_list(reg: tauri::State<Arc<OrchRegistry>>) -> Value {
 /// chip on tab switch / reconnect.
 #[tauri::command]
 pub fn orch_channel_for_pane(reg: tauri::State<Arc<OrchRegistry>>, group: String, agent: String) -> Value {
+    let Ok(group) = command_group(&group) else { return Value::Null };
     reg.channel_for_pane(&group, &agent)
 }
 
@@ -45325,6 +45549,7 @@ pub async fn orch_end_group(
     cleanup_worktrees: bool,
 ) -> Result<Value, String> {
     let reg = reg_of(&app);
+    let group_id = command_group(&group_id)?;
     run_blocking(move || reg.end_group(&group_id, cleanup_worktrees)).await
 }
 
@@ -45845,7 +46070,10 @@ fn register_orchestrator_pane(
 pub fn resume_recorded_session(
     reg: &Arc<OrchRegistry>,
     session_id: &str,
-    hint: Option<(String, String)>, // (group_id, role) from transcript signatures
+    // #904: the group half is a `GroupId` — this hint originates in a
+    // TRANSCRIPT signature (`sessions::detect_orch_signature`), i.e. text an
+    // agent CLI wrote, and it is joined onto the orchestration root below.
+    hint: Option<(GroupId, String)>, // (group_id, role) from transcript signatures
     start_fresh: bool,
 ) -> Result<Option<SpawnRequest>, String> {
     // Kept before the resolution chain below consumes `hint`.
@@ -46278,7 +46506,9 @@ pub async fn resume_orch_session(
 ) -> Result<Option<SpawnRequest>, String> {
     let reg = reg_of(&app);
     run_blocking(move || {
-        let hint = group_hint.zip(role_hint);
+        // #904: an unparseable hint is simply no hint — the caller falls
+        // through to the full scan, exactly as it does for a stale one.
+        let hint = group_hint.and_then(|g| GroupId::parse(&g).ok()).zip(role_hint);
         resume_recorded_session(&reg, &session_id, hint, start_fresh)
     })
     .await
@@ -46472,6 +46702,9 @@ fn open_external_url(url: &str) -> Result<(), String> {
 #[tauri::command]
 pub async fn orch_tasks(app: AppHandle, group_id: String) -> Vec<Task> {
     let reg = reg_of(&app);
+    // #904: no error channel; an unvalidated id yields the same empty list
+    // a group with no rows does. See `command_group`.
+    let Ok(group_id) = command_group(&group_id) else { return Vec::new() };
     run_blocking(move || reg.tasks(&group_id)).await
 }
 
@@ -46492,6 +46725,9 @@ pub async fn orch_tasks(app: AppHandle, group_id: String) -> Vec<Task> {
 #[tauri::command]
 pub async fn orch_audit(app: AppHandle, group_id: String) -> Vec<AuditEntry> {
     let reg = reg_of(&app);
+    // #904: no error channel; an unvalidated id yields the same empty list
+    // a group with no rows does. See `command_group`.
+    let Ok(group_id) = command_group(&group_id) else { return Vec::new() };
     run_blocking(move || reg.audit_log(&group_id)).await
 }
 
@@ -46503,8 +46739,8 @@ pub async fn orch_audit(app: AppHandle, group_id: String) -> Vec<AuditEntry> {
 /// holds (no state renders blank, truncation is surfaced, an unknown schema is
 /// refused).
 ///
-/// `group_id` is trusted as a path segment exactly as every sibling `orch_*`
-/// command trusts it (CLAUDE.md constraint 6) — the webview is the only caller
+/// #904: `group_id` is parsed at the boundary by `command_group`, exactly as
+/// every sibling `orch_*` command parses it — the webview is still the only caller
 /// and this adds no agent-reachable input.
 ///
 /// Off-thread (#743 S4c): a `merge_queue.json` read on the group view's 2 s
@@ -46518,6 +46754,7 @@ pub async fn orch_audit(app: AppHandle, group_id: String) -> Vec<AuditEntry> {
 #[tauri::command]
 pub async fn orch_merge_queue(app: AppHandle, group_id: String) -> Value {
     let reg = reg_of(&app);
+    let Ok(group_id) = command_group(&group_id) else { return Value::Null };
     run_blocking(move || mergeqview::merge_queue_view(&reg.group_dir(&group_id))).await
 }
 
@@ -46547,6 +46784,7 @@ pub async fn orch_merge_queue(app: AppHandle, group_id: String) -> Value {
 #[tauri::command]
 pub async fn orch_steer(app: AppHandle, group_id: String, text: String) -> Result<(), String> {
     let reg = reg_of(&app);
+    let group_id = command_group(&group_id)?;
     run_blocking(move || reg.steer_orchestrator(&group_id, &text)).await
 }
 
@@ -46587,6 +46825,7 @@ pub async fn orch_save_attachment(
     data_b64: String,
 ) -> Result<SavedAttachment, String> {
     let reg = reg_of(&app);
+    let group_id = command_group(&group_id)?;
     run_blocking(move || {
         use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
         // Reject an oversize payload before decoding — see MAX_ATTACHMENT_B64_LEN.
@@ -46650,6 +46889,7 @@ pub async fn orch_upsert_task(
     deps: Option<Vec<String>>,
 ) -> Result<Task, String> {
     let reg = reg_of(&app);
+    let group_id = command_group(&group_id)?;
     run_blocking(move || {
         let task = reg.upsert_task(
             &group_id,
@@ -46679,6 +46919,7 @@ pub async fn orch_upsert_task(
 #[tauri::command]
 pub async fn orch_delete_task(app: AppHandle, group_id: String, id: String) -> Result<(), String> {
     let reg = reg_of(&app);
+    let group_id = command_group(&group_id)?;
     run_blocking(move || {
         reg.delete_task(&group_id, "human", &id)?;
         reg.notify_board_edit(&group_id, &format!("deleted task {id}"));
@@ -46706,6 +46947,7 @@ pub async fn orch_delete_done_tasks(
     group_id: String,
 ) -> Result<Vec<String>, String> {
     let reg = reg_of(&app);
+    let group_id = command_group(&group_id)?;
     run_blocking(move || reg.delete_done_tasks(&group_id, "human")).await
 }
 
@@ -46732,6 +46974,7 @@ pub async fn orch_delete_tasks(
     ids: Vec<String>,
 ) -> Result<Vec<String>, String> {
     let reg = reg_of(&app);
+    let group_id = command_group(&group_id)?;
     run_blocking(move || reg.delete_tasks(&group_id, "human", &ids)).await
 }
 
@@ -46759,6 +47002,7 @@ pub async fn orch_reorder_tasks(
     ids: Vec<String>,
 ) -> Result<(), String> {
     let reg = reg_of(&app);
+    let group_id = command_group(&group_id)?;
     // No typed notice: reorders come in bursts; board order is read via
     // list_tasks whenever the orchestrator plans.
     run_blocking(move || reg.reorder_tasks(&group_id, "human", &ids)).await
@@ -46793,6 +47037,7 @@ pub async fn orch_open_ref(
     value: String,
 ) -> Result<(), String> {
     let reg = reg_of(&app);
+    let group_id = command_group(&group_id)?;
     run_blocking(move || orch_open_ref_sync(&reg, &group_id, &kind, &value)).await
 }
 
@@ -46801,7 +47046,7 @@ pub async fn orch_open_ref(
 /// callable without a Tauri runtime.
 fn orch_open_ref_sync(
     reg: &OrchRegistry,
-    group_id: &str,
+    group_id: &GroupId,
     kind: &str,
     value: &str,
 ) -> Result<(), String> {
@@ -46854,6 +47099,7 @@ pub async fn orch_approve_task(
     comment: Option<String>,
 ) -> Result<Task, String> {
     let reg = reg_of(&app);
+    let group_id = command_group(&group_id)?;
     run_blocking(move || reg.approve_task(&group_id, &id, comment.as_deref())).await
 }
 
@@ -46892,6 +47138,7 @@ pub async fn orch_approve_tasks(
     items: Vec<ApproveItem>,
 ) -> Result<Vec<Task>, String> {
     let reg = reg_of(&app);
+    let group_id = command_group(&group_id)?;
     run_blocking(move || reg.approve_tasks(&group_id, &items)).await
 }
 
@@ -46917,6 +47164,7 @@ pub async fn orch_grant_merge(
     comment: Option<String>,
 ) -> Result<u64, String> {
     let reg = reg_of(&app);
+    let group_id = command_group(&group_id)?;
     run_blocking(move || reg.grant_merge(&group_id, &pr, comment.as_deref(), "human")).await
 }
 
@@ -46939,6 +47187,7 @@ pub async fn orch_grant_release(
     comment: Option<String>,
 ) -> Result<(), String> {
     let reg = reg_of(&app);
+    let group_id = command_group(&group_id)?;
     run_blocking(move || reg.grant_release(&group_id, &tag, comment.as_deref(), "human")).await
 }
 
@@ -46960,6 +47209,7 @@ pub async fn orch_request_changes(
     findings: String,
 ) -> Result<Task, String> {
     let reg = reg_of(&app);
+    let group_id = command_group(&group_id)?;
     run_blocking(move || reg.request_changes(&group_id, &id, &findings)).await
 }
 
@@ -46976,6 +47226,7 @@ pub async fn orch_request_changes(
 #[tauri::command]
 pub async fn orch_start_task(app: AppHandle, group_id: String, id: String) -> Result<Task, String> {
     let reg = reg_of(&app);
+    let group_id = command_group(&group_id)?;
     run_blocking(move || reg.start_task(&group_id, &id)).await
 }
 
@@ -46995,6 +47246,7 @@ pub async fn orch_start_task(app: AppHandle, group_id: String, id: String) -> Re
 #[tauri::command]
 pub async fn orch_proceed_task(app: AppHandle, group_id: String, id: String) -> Result<Task, String> {
     let reg = reg_of(&app);
+    let group_id = command_group(&group_id)?;
     run_blocking(move || reg.proceed_task(&group_id, &id)).await
 }
 
@@ -47052,20 +47304,26 @@ mod max_notice_tests {
 
     const DEB: Duration = Duration::from_secs(3);
 
+    /// #904: these tests drive the pure coalescer with literal ids; the one
+    /// constructor is the only way to make a `GroupId`, in tests as in prod.
+    fn gid(s: &str) -> GroupId {
+        GroupId::parse(s).unwrap()
+    }
+
     #[test]
     fn burst_coalesces_to_one_span() {
         // Three rapid clicks 4→3, 3→2, 2→1 inside the window: one pending entry
         // spanning the whole burst, its deadline riding the LAST click.
         let mut p = HashMap::new();
-        record_max_notice(&mut p, "g", 4, 3, 1_000, DEB);
-        record_max_notice(&mut p, "g", 3, 2, 1_500, DEB);
-        record_max_notice(&mut p, "g", 2, 1, 2_000, DEB);
+        record_max_notice(&mut p, &gid("g"), 4, 3, 1_000, DEB);
+        record_max_notice(&mut p, &gid("g"), 3, 2, 1_500, DEB);
+        record_max_notice(&mut p, &gid("g"), 2, 1, 2_000, DEB);
         assert_eq!(p.len(), 1, "a burst stays one pending notice");
         // Not yet due (last click at 2_000 → due 5_000): nothing flushes.
         assert!(take_due_max_notices(&mut p, 4_999).is_empty());
         // Past the window: exactly one notice, from the burst's first value to
         // its last — 4→1, never the intermediate 4→3 / 3→2.
-        assert_eq!(take_due_max_notices(&mut p, 5_000), vec![("g".to_string(), 4, 1)]);
+        assert_eq!(take_due_max_notices(&mut p, 5_000), vec![(gid("g"), 4, 1)]);
         assert!(p.is_empty(), "delivered notices are drained");
     }
 
@@ -47074,12 +47332,12 @@ mod max_notice_tests {
         // A click landing before the prior one's window elapses must reset the
         // deadline, or a long slow drag would fire mid-burst.
         let mut p = HashMap::new();
-        record_max_notice(&mut p, "g", 4, 3, 1_000, DEB); // due 4_000
-        record_max_notice(&mut p, "g", 3, 2, 3_900, DEB); // due 6_900
+        record_max_notice(&mut p, &gid("g"), 4, 3, 1_000, DEB); // due 4_000
+        record_max_notice(&mut p, &gid("g"), 3, 2, 3_900, DEB); // due 6_900
         // At 4_000 the first click's deadline has passed, but the second reset
         // it — so nothing is due yet.
         assert!(take_due_max_notices(&mut p, 4_000).is_empty());
-        assert_eq!(take_due_max_notices(&mut p, 6_900), vec![("g".to_string(), 4, 2)]);
+        assert_eq!(take_due_max_notices(&mut p, 6_900), vec![(gid("g"), 4, 2)]);
     }
 
     #[test]
@@ -47087,18 +47345,18 @@ mod max_notice_tests {
         // Two changes far enough apart that the first flushes before the second
         // arrives: two distinct notices, each its own span.
         let mut p = HashMap::new();
-        record_max_notice(&mut p, "g", 4, 3, 1_000, DEB);
-        assert_eq!(take_due_max_notices(&mut p, 4_000), vec![("g".to_string(), 4, 3)]);
-        record_max_notice(&mut p, "g", 3, 2, 10_000, DEB);
-        assert_eq!(take_due_max_notices(&mut p, 13_000), vec![("g".to_string(), 3, 2)]);
+        record_max_notice(&mut p, &gid("g"), 4, 3, 1_000, DEB);
+        assert_eq!(take_due_max_notices(&mut p, 4_000), vec![(gid("g"), 4, 3)]);
+        record_max_notice(&mut p, &gid("g"), 3, 2, 10_000, DEB);
+        assert_eq!(take_due_max_notices(&mut p, 13_000), vec![(gid("g"), 3, 2)]);
     }
 
     #[test]
     fn net_noop_burst_delivers_nothing() {
         // 4→3→4 nets to no change: no orchestrator tokens spent on a no-op.
         let mut p = HashMap::new();
-        record_max_notice(&mut p, "g", 4, 3, 1_000, DEB);
-        record_max_notice(&mut p, "g", 3, 4, 1_500, DEB);
+        record_max_notice(&mut p, &gid("g"), 4, 3, 1_000, DEB);
+        record_max_notice(&mut p, &gid("g"), 3, 4, 1_500, DEB);
         assert!(take_due_max_notices(&mut p, 5_000).is_empty());
         assert!(p.is_empty(), "the netted-out entry is still drained, not left pending");
     }
@@ -47107,12 +47365,12 @@ mod max_notice_tests {
     fn groups_debounce_independently() {
         // Two groups clicking at once don't share a deadline or a span.
         let mut p = HashMap::new();
-        record_max_notice(&mut p, "a", 4, 2, 1_000, DEB); // due 4_000
-        record_max_notice(&mut p, "b", 5, 6, 3_000, DEB); // due 6_000
+        record_max_notice(&mut p, &gid("a"), 4, 2, 1_000, DEB); // due 4_000
+        record_max_notice(&mut p, &gid("b"), 5, 6, 3_000, DEB); // due 6_000
         // Only group a is due at 4_000.
-        assert_eq!(take_due_max_notices(&mut p, 4_000), vec![("a".to_string(), 4, 2)]);
+        assert_eq!(take_due_max_notices(&mut p, 4_000), vec![(gid("a"), 4, 2)]);
         assert!(p.contains_key("b"), "b keeps waiting out its own window");
-        assert_eq!(take_due_max_notices(&mut p, 6_000), vec![("b".to_string(), 5, 6)]);
+        assert_eq!(take_due_max_notices(&mut p, 6_000), vec![(gid("b"), 5, 6)]);
     }
 }
 

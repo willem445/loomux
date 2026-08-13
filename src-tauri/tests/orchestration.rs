@@ -20,6 +20,7 @@ use loomux_lib::orchestration::mcp::dispatch;
 use loomux_lib::orchestration::notify;
 use loomux_lib::orchestration::queue;
 use loomux_lib::orchestration::workflow;
+use loomux_lib::orchestration::GroupId;
 use loomux_lib::orchestration::{
     add_trusted_folder, autonomy_budget_exhausted, bracketed_paste, box_occupancy_delta,
     set_copilot_trust_home_for_test,
@@ -141,7 +142,7 @@ use loomux_lib::orchestration::{
     PersonaInject, Task, TaskNote, TaskSummary,
     PasteGate, Role, TaskPatch, UsageSnapshot, CLAUDE_UNATTENDED_ALLOW, COPILOT_AUTOPILOT_CONFIRM_KEYS,
     COPILOT_GROUP_AUTOPILOT_FLAGS, COPILOT_UNATTENDED_FLAGS, MAX_ATTACHMENT_BYTES,
-    PLANNER_READONLY_NOTE, SOLO_GROUP, AUTOPILOT_DIALOG_WAIT, SOLO_AUTOPILOT_DIALOG_WAIT,
+    PLANNER_READONLY_NOTE, SOLO_GROUP, solo_group_id, AUTOPILOT_DIALOG_WAIT, SOLO_AUTOPILOT_DIALOG_WAIT,
     CLAUDE_EDIT_DENY_TOOLS, CLAUDE_READONLY_DENY_GIT, KNOWN_CLAUDE_TOOLS,
     COPILOT_EDIT_DENY_TOOLS, COPILOT_READONLY_DENY_GIT, KNOWN_COPILOT_DENY_CATEGORIES,
     SUPPORTED_CLIS,
@@ -248,8 +249,15 @@ fn test_registry() -> (OrchRegistry, tempfile::TempDir) {
 /// keyed by PANE, so the target needs a `pty_id` or the delivery fails with the
 /// same "agent has no terminal yet" error an unpaused one would get. The text
 /// is still recorded in full; it lands under the ordinary `prompt` action now,
+
+/// #904: the one constructor, in tests as in production — these suites drive
+/// the refusal paths with ids that are deliberately not live groups.
+fn parse_gid(s: &str) -> GroupId {
+    GroupId::parse(s).unwrap()
+}
+
 /// which is what [`delivered_texts`] reads.
-fn pause_with_pane(reg: &OrchRegistry, group: &str, agent_id: &str, pty_id: u32) {
+fn pause_with_pane(reg: &OrchRegistry, group: &GroupId, agent_id: &str, pty_id: u32) {
     reg.set_pty_for_test(agent_id, pty_id);
     reg.pause_group(group).unwrap();
 }
@@ -263,7 +271,7 @@ fn pause_with_pane(reg: &OrchRegistry, group: &str, agent_id: &str, pty_id: u32)
 /// `delivery-queued` line's `reason` (`group-paused`) and in the pane's queue.
 /// Pausing still does not touch anything that happens BEFORE delivery (merge
 /// grant minting, board writes), which is what makes it usable as a probe.
-fn delivered_texts(reg: &OrchRegistry, group: &str) -> Vec<String> {
+fn delivered_texts(reg: &OrchRegistry, group: &GroupId) -> Vec<String> {
     reg.audit_log(group)
         .into_iter()
         .filter(|e| e.action == "prompt")
@@ -506,7 +514,7 @@ fn the_merge_queue_note_reaches_only_a_group_that_actually_runs_the_queue() {
     let repo = repo_with_merge_queue("mq-on", true);
     let g = reg.create_group(repo.to_str().unwrap(), advanced_rails()).unwrap();
     let orch =
-        fs::read_to_string(reg.state_root().join(&g.id).join("orchestrator.md")).unwrap();
+        fs::read_to_string(reg.state_root().join(g.id.as_str()).join("orchestrator.md")).unwrap();
     assert!(
         orch.contains(note_marker),
         "a group whose repo enables the queue must be told the queue exists"
@@ -522,7 +530,7 @@ fn the_merge_queue_note_reaches_only_a_group_that_actually_runs_the_queue() {
     let repo = repo_with_merge_queue("mq-off", false);
     let g = reg.create_group(repo.to_str().unwrap(), advanced_rails()).unwrap();
     let orch =
-        fs::read_to_string(reg.state_root().join(&g.id).join("orchestrator.md")).unwrap();
+        fs::read_to_string(reg.state_root().join(g.id.as_str()).join("orchestrator.md")).unwrap();
     assert!(!orch.contains(note_marker), "enabled:false must read exactly like no block at all");
     assert!(!orch.contains("{{MERGE_QUEUE}}"), "the placeholder is substituted, not left raw");
 
@@ -532,7 +540,7 @@ fn the_merge_queue_note_reaches_only_a_group_that_actually_runs_the_queue() {
     let repo = repo_with_merge_queue("mq-toggle-off", true);
     let g = reg.create_group(repo.to_str().unwrap(), rails()).unwrap(); // toggle OFF
     let orch =
-        fs::read_to_string(reg.state_root().join(&g.id).join("orchestrator.md")).unwrap();
+        fs::read_to_string(reg.state_root().join(g.id.as_str()).join("orchestrator.md")).unwrap();
     assert!(
         !orch.contains(note_marker),
         "with the advanced orchestrator off the workflow file is not in force, so the queue \
@@ -566,7 +574,7 @@ fn the_queue_tools_refuse_queue_disabled_until_the_repo_opts_in() {
 
     // And the read did NOT create the state file — a status call that conjured
     // one would collapse slice F's `absent` state for every group.
-    assert!(!d.path().join(&co.group).join("merge_queue.json").exists());
+    assert!(!d.path().join(co.group.as_str()).join("merge_queue.json").exists());
 }
 
 /// **#710 (rev N2): a REFUSED enqueue still releases a stale target — on disk.**
@@ -617,7 +625,7 @@ fn a_refused_enqueue_releases_a_stale_target_without_conjuring_a_queue_file() {
     let (reg, d) = test_registry();
     let repo = repo_with_merge_queue("mq-stale-target", true);
     let g = reg.create_group(repo.to_str().unwrap(), advanced_rails()).unwrap();
-    let qfile = d.path().join(&g.id).join("merge_queue.json");
+    let qfile = d.path().join(g.id.as_str()).join("merge_queue.json");
 
     // The field state of #710: an empty queue still pointing at the branch a
     // cancelled batch left behind.
@@ -639,7 +647,7 @@ fn a_refused_enqueue_releases_a_stale_target_without_conjuring_a_queue_file() {
     // "empty queue", and an always-present file collapses the two.
     let repo2 = repo_with_merge_queue("mq-stale-target-absent", true);
     let g2 = reg.create_group(repo2.to_str().unwrap(), advanced_rails()).unwrap();
-    let qfile2 = d.path().join(&g2.id).join("merge_queue.json");
+    let qfile2 = d.path().join(g2.id.as_str()).join("merge_queue.json");
     assert!(!qfile2.exists(), "fixture precondition");
 
     let v = reg.queue_merge_with(&g2.id, 705, None, &BaseIsDefault);
@@ -679,7 +687,7 @@ fn cancelling_a_pr_that_is_not_queued_is_refused_not_silently_successful() {
 #[test]
 fn a_loomux_fault_is_labelled_as_one_and_never_as_a_policy_refusal() {
     let (reg, d, co, _cw) = setup_mcp();
-    let qfile = d.path().join(&co.group).join("merge_queue.json");
+    let qfile = d.path().join(co.group.as_str()).join("merge_queue.json");
 
     // (1) queue_merge with an unreadable state file.
     fs::write(&qfile, "{ this is not json").unwrap();
@@ -702,7 +710,7 @@ fn a_loomux_fault_is_labelled_as_one_and_never_as_a_policy_refusal() {
     //     registry directly: `dispatch` always uses `caller.group`, so there is
     //     no agent-reachable path that names another group (which is itself the
     //     reason there is no cross-group check to test).
-    let v = reg.queue_merge("no-such-group", 612, None);
+    let v = reg.queue_merge(&parse_gid("no-such-group"), 612, None);
     assert_eq!(v["refused"], json!("queue-unavailable"));
 
     // And all four are flagged as faults by the predicate the tool descriptions
@@ -748,7 +756,7 @@ fn a_loomux_fault_is_labelled_as_one_and_never_as_a_policy_refusal() {
 fn a_queue_change_that_cannot_be_persisted_is_reported_as_unwritable() {
     use std::os::unix::fs::PermissionsExt;
     let (reg, d, co, _cw) = setup_mcp();
-    let gdir = d.path().join(&co.group);
+    let gdir = d.path().join(co.group.as_str());
     fs::write(gdir.join("merge_queue.json"), IN_FLIGHT_QUEUE_JSON).unwrap();
 
     // Readable, so `load_state` succeeds; not writable, so `store_state` fails.
@@ -792,7 +800,7 @@ fn a_queue_change_that_cannot_be_persisted_is_reported_as_unwritable() {
 fn an_unreadable_gate_file_is_labelled_as_a_fault_never_a_policy_refusal() {
     use std::os::unix::fs::PermissionsExt;
     let (reg, d, co, _cw) = setup_mcp();
-    let gate_file = d.path().join(&co.group).join("merge_gate");
+    let gate_file = d.path().join(co.group.as_str()).join("merge_gate");
     fs::write(&gate_file, "require all-pass\nreviewer rev-a\n").unwrap();
 
     // Readable state (none written — `load_state` defaults cleanly), but the
@@ -848,7 +856,7 @@ fn merge_queue_reconcile_strands_a_batch_the_world_no_longer_matches() {
     let (reg, d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
     // The group state dir is the registry root plus the group id.
-    let qfile = d.path().join(&g.id).join("merge_queue.json");
+    let qfile = d.path().join(g.id.as_str()).join("merge_queue.json");
     fs::write(&qfile, IN_FLIGHT_QUEUE_JSON).unwrap();
 
     // `ls-remote --exit-code` exits 2 = the scratch ref is gone from the remote.
@@ -907,7 +915,7 @@ fn merge_queue_reconcile_is_a_silent_no_op_when_nothing_was_ever_queued() {
     let (reg, d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
     // The group state dir is the registry root plus the group id.
-    let qfile = d.path().join(&g.id).join("merge_queue.json");
+    let qfile = d.path().join(g.id.as_str()).join("merge_queue.json");
     assert!(!qfile.exists(), "precondition: nothing has ever been queued");
 
     // The real entry point — the one `readmit_recovered` calls.
@@ -1172,7 +1180,7 @@ fn set_max_agents_validates_bounds() {
     assert_eq!(reg.set_max_agents(&g.id, 1, "human").unwrap(), 1);
     assert_eq!(reg.set_max_agents(&g.id, 12, "human").unwrap(), 12);
     // An unknown group is an error, not a panic.
-    assert!(reg.set_max_agents("no-such-group", 3, "human").is_err());
+    assert!(reg.set_max_agents(&parse_gid("no-such-group"), 3, "human").is_err());
 }
 
 #[test]
@@ -1224,7 +1232,7 @@ fn max_agents_change_survives_launcher_relaunch() {
         reg.set_port(45999);
         let g = reg.create_group("C:/tmp/repo", rails()).unwrap(); // launcher cap 2
         gid = g.id.clone();
-        path = reg.state_root().join(&g.id).join("group.json");
+        path = reg.state_root().join(g.id.as_str()).join("group.json");
         reg.set_max_agents(&g.id, 9, "human").unwrap();
     }
     // group.json carries the new cap; unrelated fields are preserved (the
@@ -1254,7 +1262,7 @@ fn max_agents_change_survives_launcher_relaunch() {
     // ...and it's the value the resumed group actually holds + re-persists.
     assert_eq!(reg.group(&gid).unwrap().guardrails.max_agents, 9);
     let v: Value =
-        serde_json::from_str(&fs::read_to_string(reg.state_root().join(&gid).join("group.json")).unwrap()).unwrap();
+        serde_json::from_str(&fs::read_to_string(reg.state_root().join(gid.as_str()).join("group.json")).unwrap()).unwrap();
     assert_eq!(v["guardrails"]["max_agents"].as_u64().unwrap(), 9, "resume re-persists the honored cap");
 }
 
@@ -1346,7 +1354,7 @@ fn max_agents_change_audits_and_notifies_orchestrator() {
     // is delivered only when its window has elapsed — drive the flush past the
     // 3s debounce deterministically (no sleep) to observe the notice text.
     reg.flush_due_max_notices(now_ms() + 4_000);
-    let log = fs::read_to_string(reg.state_root().join(&g.id).join("audit.jsonl")).unwrap();
+    let log = fs::read_to_string(reg.state_root().join(g.id.as_str()).join("audit.jsonl")).unwrap();
     let events: Vec<Value> = log.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
     assert!(
         events.iter().any(|e|
@@ -1366,7 +1374,7 @@ fn max_agents_change_audits_and_notifies_orchestrator() {
 // Helper: read the audit log and count the coalesced re-plan notices (visible
 // as `prompt` entries — the group is paused in these tests, so #569 queues the
 // delivery rather than pasting it, and the text is audited either way).
-fn replan_notices(reg: &OrchRegistry, group: &str) -> Vec<String> {
+fn replan_notices(reg: &OrchRegistry, group: &GroupId) -> Vec<String> {
     delivered_texts(reg, group)
         .into_iter()
         .filter(|t| t.contains("max live agents changed"))
@@ -1389,7 +1397,7 @@ fn rapid_max_agents_clicks_coalesce_to_one_notice() {
     reg.flush_due_max_notices(now_ms());
     assert!(replan_notices(&reg, &g.id).is_empty(), "no notice fires mid-burst");
     // Every click is audited (enforcement/persist stay per-click).
-    let sets = fs::read_to_string(reg.state_root().join(&g.id).join("audit.jsonl"))
+    let sets = fs::read_to_string(reg.state_root().join(g.id.as_str()).join("audit.jsonl"))
         .unwrap()
         .lines()
         .filter(|l| l.contains("max-agents-set"))
@@ -1443,7 +1451,7 @@ fn setting_same_max_agents_is_a_noop() {
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap(); // cap 2
     assert_eq!(reg.set_max_agents(&g.id, 2, "human").unwrap(), 2);
-    let log = fs::read_to_string(reg.state_root().join(&g.id).join("audit.jsonl")).unwrap();
+    let log = fs::read_to_string(reg.state_root().join(g.id.as_str()).join("audit.jsonl")).unwrap();
     assert!(!log.contains("max-agents-set"), "a no-op change must not audit or notify");
 }
 
@@ -1453,7 +1461,7 @@ fn set_max_agents_fails_soft_on_corrupt_group_file() {
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
     // A valid-JSON but non-object root (e.g. from corruption) must error rather
     // than panic on the in-place field assignment.
-    fs::write(reg.state_root().join(&g.id).join("group.json"), "null").unwrap();
+    fs::write(reg.state_root().join(g.id.as_str()).join("group.json"), "null").unwrap();
     let err = reg.set_max_agents(&g.id, 5, "human").unwrap_err();
     assert!(err.contains("not a JSON object"), "non-object root must fail soft, got: {err}");
 }
@@ -1512,7 +1520,7 @@ fn agent_config_carries_token_and_server_url() {
     let g = reg.create_group("C:/tmp/repo2", rails()).unwrap();
     let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
     let cfg = fs::read_to_string(
-        reg.state_root().join(&g.id).join("configs").join(format!("{}.json", w.id)),
+        reg.state_root().join(g.id.as_str()).join("configs").join(format!("{}.json", w.id)),
     )
     .unwrap();
     assert!(cfg.contains(&w.token), "config must carry the agent token");
@@ -1530,7 +1538,7 @@ fn token_resolution_and_group_isolation() {
     assert_eq!(ca.group, ga.id);
     // Group A's roster never shows group B's agents.
     let roster = reg.list_agents(&ga.id).to_string();
-    assert!(roster.contains(&wa.id) && !roster.contains(&wb.id));
+    assert!(roster.contains(wa.id.as_str()) && !roster.contains(wb.id.as_str()));
     // Dead agents lose their token entirely.
     reg.mark_dead(&wa.id, Some(1));
     assert!(reg.resolve_token(&wa.token).is_none());
@@ -1582,7 +1590,7 @@ fn audit_log_records_lifecycle_as_json_lines() {
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
     reg.spawn_agent(&g.id, Role::Worker, "w", "do a thing", false, None).unwrap();
     reg.set_state(&g.id, "{}").unwrap();
-    let log = fs::read_to_string(reg.state_root().join(&g.id).join("audit.jsonl")).unwrap();
+    let log = fs::read_to_string(reg.state_root().join(g.id.as_str()).join("audit.jsonl")).unwrap();
     let events: Vec<Value> = log.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
     assert!(
         events.iter().any(|e| e["detail"]["task"] == "do a thing"),
@@ -3065,7 +3073,7 @@ fn queue_orphans_finds_an_enqueued_entry_with_no_terminal_event() {
 /// post-restart assertion needs. Kept as a helper because four tests need the
 /// identical "a process died with a non-empty queue" starting state and the
 /// interesting part of each is what happens AFTER.
-fn queued_then_crashed(dir: &Path, texts: &[&str]) -> (String, String, String) {
+fn queued_then_crashed(dir: &Path, texts: &[&str]) -> (GroupId, String, String) {
     let reg = relaunch_registry(dir);
     reg.set_port(45999);
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
@@ -3153,7 +3161,7 @@ fn recovery_reads_the_persisted_snapshot_not_the_audit_log() {
     let dir = tempfile::tempdir().unwrap();
     let (gid, _old, session) = queued_then_crashed(dir.path(), &["first", "second", "third"]);
 
-    let snapshot = dir.path().join(&gid).join("queue.json");
+    let snapshot = dir.path().join(gid.as_str()).join("queue.json");
     assert!(snapshot.exists(), "#468: every admission must leave a durable snapshot");
     let body = fs::read_to_string(&snapshot).unwrap();
     assert!(body.contains("\"first\"") && body.contains("\"third\""),
@@ -3370,7 +3378,7 @@ fn a_corrupt_snapshot_costs_only_the_entries_it_ate() {
     let dir = tempfile::tempdir().unwrap();
     let (gid, _old, session) = queued_then_crashed(dir.path(), &["keep me", "and me"]);
 
-    let path = dir.path().join(&gid).join("queue.json");
+    let path = dir.path().join(gid.as_str()).join("queue.json");
     let mut v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
     v["entries"].as_array_mut().unwrap().insert(1, json!({ "pty_id": "not-a-number" }));
     fs::write(&path, serde_json::to_string_pretty(&v).unwrap()).unwrap();
@@ -3401,7 +3409,7 @@ fn an_unknown_snapshot_version_recovers_nothing_rather_than_guessing() {
     // surfaces the loss, so refusing is not the same as losing.
     let dir = tempfile::tempdir().unwrap();
     let (gid, _old, session) = queued_then_crashed(dir.path(), &["one", "two"]);
-    let path = dir.path().join(&gid).join("queue.json");
+    let path = dir.path().join(gid.as_str()).join("queue.json");
     let mut v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
     v["version"] = json!(queue::SNAPSHOT_VERSION + 1);
     fs::write(&path, serde_json::to_string_pretty(&v).unwrap()).unwrap();
@@ -3428,7 +3436,7 @@ fn the_snapshot_tracks_the_live_queue_through_every_mutation() {
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
     let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
     let pty = 240u32;
-    let path = dir.path().join(&g.id).join("queue.json");
+    let path = dir.path().join(g.id.as_str()).join("queue.json");
 
     let on_disk = |label: &str| -> Vec<String> {
         let text = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{label}: no snapshot: {e}"));
@@ -3473,7 +3481,7 @@ fn the_snapshot_tracks_the_coalesced_flush_paths_too() {
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
     let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
     let pty = 260u32;
-    let path = dir.path().join(&g.id).join("queue.json");
+    let path = dir.path().join(g.id.as_str()).join("queue.json");
     let on_disk = || -> Vec<String> {
         let text = fs::read_to_string(&path).expect("a snapshot must exist");
         queue::parse_snapshot(&text).0.iter()
@@ -3523,7 +3531,7 @@ fn one_groups_snapshot_never_contains_another_groups_queue() {
     reg.enqueue_text(&b.id, &wb.id, "orch-1", "for group b", 251, queue::EnqueueReason::Arrival).unwrap();
 
     for (gid, mine, theirs) in [(&a.id, "for group a", "for group b"), (&b.id, "for group b", "for group a")] {
-        let body = fs::read_to_string(dir.path().join(gid).join("queue.json")).unwrap();
+        let body = fs::read_to_string(dir.path().join(gid.as_str()).join("queue.json")).unwrap();
         assert!(body.contains(mine), "{gid} must persist its own entry: {body}");
         assert!(!body.contains(theirs), "{gid} must NOT persist another group's entry: {body}");
     }
@@ -3561,7 +3569,7 @@ fn snapshot_order_survives_a_second_restart_when_staging_and_live_mix() {
 
     // The file must read oldest-first regardless of which store each entry
     // was in when it was written.
-    let body = fs::read_to_string(dir.path().join(&gid).join("queue.json")).unwrap();
+    let body = fs::read_to_string(dir.path().join(gid.as_str()).join("queue.json")).unwrap();
     let (entries, skipped) = queue::parse_snapshot(&body);
     assert_eq!(skipped, 0);
     let ids: Vec<u64> = entries.iter().map(|e| e.delivery.id).collect();
@@ -3661,7 +3669,7 @@ fn a_concurrent_first_touch_after_a_restart_cannot_re_mint_a_snapshot_id() {
     let recovered_ids: Vec<u64> = {
         // Read the ids straight off disk so the expectation does not depend
         // on the recovery path under test.
-        let body = fs::read_to_string(dir.path().join(&gid).join("queue.json")).unwrap();
+        let body = fs::read_to_string(dir.path().join(gid.as_str()).join("queue.json")).unwrap();
         queue::parse_snapshot(&body).0.iter().map(|e| e.delivery.id).collect()
     };
     assert_eq!(recovered_ids.len(), 6);
@@ -3822,7 +3830,7 @@ fn a_recovered_entry_that_cannot_be_re_admitted_stays_an_orphan() {
     // loop ended, a full pane would put all three outside both durable stores
     // at once and that claim would be false. Reading the snapshot straight
     // off disk is what distinguishes "back in memory" from "durable again".
-    let body = fs::read_to_string(dir.path().join(&gid).join("queue.json")).unwrap();
+    let body = fs::read_to_string(dir.path().join(gid.as_str()).join("queue.json")).unwrap();
     let (persisted, skipped) = queue::parse_snapshot(&body);
     assert_eq!(skipped, 0);
     let persisted_texts: Vec<Option<&str>> =
@@ -3851,8 +3859,8 @@ fn a_recovered_entry_that_cannot_be_re_admitted_stays_an_orphan() {
 
 /// Make every entry in `group`'s snapshot look `by_ms` older than it is —
 /// the only way to reach the age rule without a test that sleeps for a day.
-fn age_snapshot(dir: &Path, group: &str, by_ms: u64) {
-    let path = dir.join(group).join("queue.json");
+fn age_snapshot(dir: &Path, group: &GroupId, by_ms: u64) {
+    let path = dir.join(group.as_str()).join("queue.json");
     let mut v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
     for e in v["entries"].as_array_mut().unwrap() {
         let cur = e["enqueued_ms"].as_u64().unwrap();
@@ -3866,8 +3874,8 @@ fn age_snapshot(dir: &Path, group: &str, by_ms: u64) {
 /// backstops needs more entries than `QUEUE_MAX_PER_PANE` allows a fixture to
 /// queue for real, and their AGE must stay recent or the age rule would be
 /// what fired.
-fn fan_out_snapshot(dir: &Path, group: &str, n: usize, text: &str) -> Vec<u64> {
-    let path = dir.join(group).join("queue.json");
+fn fan_out_snapshot(dir: &Path, group: &GroupId, n: usize, text: &str) -> Vec<u64> {
+    let path = dir.join(group.as_str()).join("queue.json");
     let mut v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
     let template = v["entries"][0].clone();
     let base = template["id"].as_u64().unwrap();
@@ -3886,8 +3894,8 @@ fn fan_out_snapshot(dir: &Path, group: &str, n: usize, text: &str) -> Vec<u64> {
 }
 
 /// Every record currently in `group`'s archive file, in file order.
-fn archive_rows(dir: &Path, group: &str) -> Vec<Value> {
-    let path = dir.join(group).join("queue-orphans-archive.jsonl");
+fn archive_rows(dir: &Path, group: &GroupId) -> Vec<Value> {
+    let path = dir.join(group.as_str()).join("queue-orphans-archive.jsonl");
     match fs::read_to_string(&path) {
         Ok(t) => t
             .lines()
@@ -3899,8 +3907,8 @@ fn archive_rows(dir: &Path, group: &str) -> Vec<Value> {
 }
 
 /// Payload texts `group`'s snapshot currently holds.
-fn snapshot_texts(dir: &Path, group: &str) -> Vec<String> {
-    let body = fs::read_to_string(dir.join(group).join("queue.json")).unwrap();
+fn snapshot_texts(dir: &Path, group: &GroupId) -> Vec<String> {
+    let body = fs::read_to_string(dir.join(group.as_str()).join("queue.json")).unwrap();
     let (entries, skipped) = queue::parse_snapshot(&body);
     assert_eq!(skipped, 0, "the fixture must leave a readable snapshot");
     entries.iter().filter_map(|e| e.delivery.payload.text().map(str::to_string)).collect()
@@ -3910,7 +3918,7 @@ fn snapshot_texts(dir: &Path, group: &str) -> Vec<String> {
 /// that runs `persist_queues`, which is where recovery stages and where the
 /// roll happens. Returns the live registry so the caller can keep asking it
 /// questions.
-fn restart_and_admit(dir: &Path, gid: &str, pty: u32) -> OrchRegistry {
+fn restart_and_admit(dir: &Path, gid: &GroupId, pty: u32) -> OrchRegistry {
     let reg = relaunch_registry(dir);
     reg.set_port(45999);
     reg.create_group("C:/tmp/repo", rails()).unwrap();
@@ -4098,7 +4106,7 @@ fn archiving_the_whole_staged_set_still_cannot_let_a_fresh_id_collide_with_it() 
     // process 2 died, so what process 3 opens is an EMPTY snapshot beside a
     // non-empty archive. That is the state the seed's blind spot needs, and
     // it is the ordinary one: a delivered entry leaves the file.
-    let path = dir.path().join(&gid).join("queue.json");
+    let path = dir.path().join(gid.as_str()).join("queue.json");
     let mut v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
     v["entries"] = json!([]);
     fs::write(&path, serde_json::to_string_pretty(&v).unwrap()).unwrap();
@@ -4123,8 +4131,8 @@ fn archiving_the_whole_staged_set_still_cannot_let_a_fresh_id_collide_with_it() 
 /// Append one line to `group`'s archive exactly as given — the only way to put
 /// a record this build would NOT have written into the file, which is the
 /// whole point of the two tests below.
-fn append_archive_line(dir: &Path, group: &str, line: &str) {
-    let path = dir.join(group).join("queue-orphans-archive.jsonl");
+fn append_archive_line(dir: &Path, group: &GroupId, line: &str) {
+    let path = dir.join(group.as_str()).join("queue-orphans-archive.jsonl");
     let mut body = fs::read_to_string(&path).unwrap_or_default();
     if !body.is_empty() && !body.ends_with('\n') {
         body.push('\n');
@@ -4137,8 +4145,8 @@ fn append_archive_line(dir: &Path, group: &str, line: &str) {
 /// The archive as raw text lines. Deliberately NOT `archive_rows`, which
 /// parses every line and would panic on the unreadable one these tests
 /// deliberately plant.
-fn archive_raw_lines(dir: &Path, group: &str) -> Vec<String> {
-    let path = dir.join(group).join("queue-orphans-archive.jsonl");
+fn archive_raw_lines(dir: &Path, group: &GroupId) -> Vec<String> {
+    let path = dir.join(group.as_str()).join("queue-orphans-archive.jsonl");
     fs::read_to_string(&path)
         .map(|t| t.lines().filter(|l| !l.trim().is_empty()).map(str::to_string).collect())
         .unwrap_or_default()
@@ -4243,7 +4251,7 @@ fn the_per_admission_write_stops_growing_with_the_staged_backlog() {
     let payload = "z".repeat(2048);
     fan_out_snapshot(dir.path(), &gid, 500, &payload);
 
-    let path = dir.path().join(&gid).join("queue.json");
+    let path = dir.path().join(gid.as_str()).join("queue.json");
     let unbounded = fs::metadata(&path).unwrap().len();
 
     let reg = restart_and_admit(dir.path(), &gid, 954);
@@ -4383,7 +4391,7 @@ fn orphans_tool(reg: &OrchRegistry, caller: &Caller) -> Value {
 /// is about to lose a report to it — the case #579 is actually about, since a
 /// fleet's reports all converge on that one pane. Returns the group, the two
 /// agents and the orchestrator's pty.
-fn orch_pane_at_capacity(reg: &OrchRegistry, pty: u32) -> (String, AgentEntry, AgentEntry) {
+fn orch_pane_at_capacity(reg: &OrchRegistry, pty: u32) -> (GroupId, AgentEntry, AgentEntry) {
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
     let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
     let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
@@ -4717,7 +4725,7 @@ fn a_truncated_audit_window_is_reported_as_truncated_not_as_complete() {
     lines.push(audit_jsonl_line(&refusal_line(3_001, "w-2", &orch.id, recent, "arrival")));
     // Written last: `create_group`/`spawn_agent` audit lines of their own, and
     // this replaces the whole log with a timeline whose length is the point.
-    fs::write(d.path().join(&g.id).join("audit.jsonl"), lines.join("\n") + "\n").unwrap();
+    fs::write(d.path().join(g.id.as_str()).join("audit.jsonl"), lines.join("\n") + "\n").unwrap();
 
     let r = reg.front_door_refusals(&g.id);
     assert!(r.window_truncated,
@@ -5022,7 +5030,7 @@ fn a_missed_withdrawal_stays_an_orphan_and_is_never_listed_as_a_refusal() {
         }),
     };
     fs::write(
-        d.path().join(&g.id).join("audit.jsonl"),
+        d.path().join(g.id.as_str()).join("audit.jsonl"),
         [audit_jsonl_line(&queued), audit_jsonl_line(&missed)].join("\n") + "\n",
     )
     .unwrap();
@@ -5073,7 +5081,7 @@ fn a_pane_that_drains_below_its_cap_is_told_who_it_refused() {
         .expect("the drain must relay something to the orchestrator");
     assert!(relay.contains("REFUSED and never queued"),
         "the roster itself, not just a queue-state notice: {relay}");
-    assert!(relay.contains(&w.id),
+    assert!(relay.contains(w.id.as_str()),
         "it has to name the SENDER — the recipient's only way to ask for the work again: {relay}");
     assert!(relay.contains("PR #654"),
         "and enough of the payload to tell WHICH delivery was lost: {relay}");
@@ -5114,7 +5122,7 @@ fn a_worker_pane_that_drains_is_told_by_a_delivery_rather_than_a_relay() {
         .and_then(|e| e.payload.text())
         .expect("the drain must queue a roster for this pane");
     assert!(roster.contains("REFUSED and never queued"), "the roster, not a pressure notice: {roster}");
-    assert!(roster.contains(&orch.id), "naming the sender to ask: {roster}");
+    assert!(roster.contains(orch.id.as_str()), "naming the sender to ask: {roster}");
     assert!(roster.contains("PR #661"), "and which delivery it was: {roster}");
     assert!(roster.starts_with("[loomux]"),
         "one marker-led line, so the same string can also be parked in the relay block: {roster}");
@@ -5445,7 +5453,7 @@ fn the_roster_is_emitted_once_per_drain_and_never_recurses() {
     assert_eq!(rosters[0].detail["delivered"], json!(true));
     assert_eq!(rosters[0].detail["channel"], json!("orchestrator-inbox"),
         "an orchestrator's own pane is told by the #578 relay, never by a delivery");
-    assert!(rosters[0].detail["text"].as_str().unwrap().contains(&w.id),
+    assert!(rosters[0].detail["text"].as_str().unwrap().contains(w.id.as_str()),
         "the relay is held in memory, so the line carries what it relayed (#578's rule)");
 }
 
@@ -7141,7 +7149,7 @@ fn readonly_pane_settings_carry_permissions_allow() {
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
     let p = reg.spawn_agent(&g.id, Role::Planner, "p", "plan it", false, None).unwrap();
 
-    let path = reg.state_root().join(&g.id).join("configs").join(format!("{}-hooks.json", p.id));
+    let path = reg.state_root().join(g.id.as_str()).join("configs").join(format!("{}-hooks.json", p.id));
     let cfg: Value = serde_json::from_str(
         &fs::read_to_string(&path).unwrap_or_else(|e| panic!("#610: no settings file at {path:?}: {e}")),
     )
@@ -7287,7 +7295,7 @@ fn readonly_pane_gets_a_settings_file_even_when_hook_provisioning_fails() {
     let p = reg.spawn_agent(&g.id, Role::Planner, "p", "plan it", false, None).unwrap();
     let w = reg.spawn_agent(&g.id, Role::Worker, "w", "do it", false, None).unwrap();
 
-    let settings = |id: &str| reg.state_root().join(&g.id).join("configs").join(format!("{id}-hooks.json"));
+    let settings = |id: &str| reg.state_root().join(g.id.as_str()).join("configs").join(format!("{id}-hooks.json"));
     let cfg: Value = serde_json::from_str(
         &fs::read_to_string(settings(&p.id))
             .unwrap_or_else(|e| panic!("#610: a read-only pane must still get a settings file: {e}")),
@@ -8444,7 +8452,7 @@ fn an_opencode_spawn_delivers_its_config_and_containment_by_env() {
     let db = env.get("OPENCODE_DB").expect("the per-group db path must be set");
     assert!(Path::new(db).is_absolute(), "OPENCODE_DB must be absolute: {db}");
     assert!(
-        db.replace('\\', "/").contains(&g.id),
+        db.replace('\\', "/").contains(g.id.as_str()),
         "the database must live under THIS group's dir: {db}"
     );
 
@@ -8828,7 +8836,7 @@ fn copilot_mcp_config_includes_tools_allowlist() {
     let g = reg.create_group("C:/tmp/copilot-repo", rails).unwrap();
     let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
     let cfg = fs::read_to_string(
-        reg.state_root().join(&g.id).join("configs").join(format!("{}.json", w.id)),
+        reg.state_root().join(g.id.as_str()).join("configs").join(format!("{}.json", w.id)),
     )
     .unwrap();
     assert!(cfg.contains("\"tools\""), "copilot expects a tools allowlist in the server entry");
@@ -8858,12 +8866,12 @@ fn claude_agent_spawn_provisions_the_compact_lifecycle_hooks() {
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
     let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
 
-    let mcp_cfg_path = reg.state_root().join(&g.id).join("configs").join(format!("{}.json", w.id));
+    let mcp_cfg_path = reg.state_root().join(g.id.as_str()).join("configs").join(format!("{}.json", w.id));
     let mcp_cfg: Value = serde_json::from_str(&fs::read_to_string(&mcp_cfg_path).unwrap()).unwrap();
     assert!(mcp_cfg.get("hooks").is_none(), "the mcp-config file must carry no hooks key at all: {mcp_cfg}");
     assert!(mcp_cfg.get("mcpServers").is_some());
 
-    let hooks_path = reg.state_root().join(&g.id).join("configs").join(format!("{}-hooks.json", w.id));
+    let hooks_path = reg.state_root().join(g.id.as_str()).join("configs").join(format!("{}-hooks.json", w.id));
     let hooks_cfg: Value = serde_json::from_str(&fs::read_to_string(&hooks_path).unwrap()).unwrap();
     let precompact = hooks_cfg["hooks"]["PreCompact"][0]["hooks"][0]["command"].as_str().unwrap().to_string();
     let sessionstart = hooks_cfg["hooks"]["SessionStart"][0]["hooks"][0]["command"].as_str().unwrap().to_string();
@@ -8872,15 +8880,15 @@ fn claude_agent_spawn_provisions_the_compact_lifecycle_hooks() {
     assert_eq!(hooks_cfg["hooks"]["SessionStart"][0]["matcher"], json!("compact"), "only compact-sourced starts are hooked");
     // The command embeds this agent's group dir + id as literal argv — the
     // generic script itself carries none of it (constraint #8).
-    assert!(precompact.contains(&w.id), "{precompact}");
-    assert!(precompact.contains(&g.id), "{precompact}");
+    assert!(precompact.contains(w.id.as_str()), "{precompact}");
+    assert!(precompact.contains(g.id.as_str()), "{precompact}");
 
     // #112: the real prompt-landed signal rides the SAME `--settings` file,
     // one more entry alongside PreCompact/SessionStart.
     let promptsubmit_entry = &hooks_cfg["hooks"]["UserPromptSubmit"][0];
     let promptsubmit = promptsubmit_entry["hooks"][0]["command"].as_str().unwrap().to_string();
     assert!(promptsubmit.contains("promptsubmit"), "{promptsubmit}");
-    assert!(promptsubmit.contains(&w.id) && promptsubmit.contains(&g.id), "{promptsubmit}");
+    assert!(promptsubmit.contains(w.id.as_str()) && promptsubmit.contains(g.id.as_str()), "{promptsubmit}");
     // Per the hooks reference, `UserPromptSubmit` "does NOT support matchers
     // and always fires on every prompt submission" — no `matcher` key at all,
     // unlike `SessionStart` above (which needs one to scope to compact-only
@@ -8901,7 +8909,7 @@ fn claude_agent_spawn_provisions_the_compact_lifecycle_hooks() {
     let script = d.path().join("compacthook").join("compact-hook.sh");
     let script_text = fs::read_to_string(&script).expect("the hook script must be written");
     assert!(script_text.contains("precompact") && script_text.contains("sessionstart-compact") && script_text.contains("promptsubmit"));
-    assert!(!script_text.contains(&g.id), "the script itself must stay generic — group specifics ride on argv only");
+    assert!(!script_text.contains(g.id.as_str()), "the script itself must stay generic — group specifics ride on argv only");
 }
 
 fn copilot_rails() -> Guardrails {
@@ -9095,7 +9103,7 @@ fn resume_recorded_session_group_hint_avoids_scanning_every_other_group() {
                 "{{\"ts_ms\":{n},\"actor\":\"loomux\",\"action\":\"noise\",\"detail\":{{\"n\":{n}}}}}\n"
             ));
         }
-        fs::write(reg.state_root().join(&g.id).join("audit.jsonl"), audit).unwrap();
+        fs::write(reg.state_root().join(g.id.as_str()).join("audit.jsonl"), audit).unwrap();
     }
 
     // The target session, in its own group — fixtured into claude's store
@@ -9285,7 +9293,7 @@ fn per_block_cli_is_pinned_at_spawn_and_persisted() {
     assert!(worker.session_id.is_none(), "worker inherits the copilot group default (no pre-assigned session)");
     assert!(reviewer.session_id.is_some(), "the reviewer block's claude CLI pre-assigns a session id");
     // The roster is persisted to group.json as the block array.
-    let gj = fs::read_to_string(reg.state_root().join(&g.id).join("group.json")).unwrap();
+    let gj = fs::read_to_string(reg.state_root().join(g.id.as_str()).join("group.json")).unwrap();
     let v: Value = serde_json::from_str(&gj).unwrap();
     assert_eq!(v["guardrails"]["agent_cli"], "copilot");
     let blocks = v["guardrails"]["blocks"].as_array().expect("blocks array persisted");
@@ -9321,7 +9329,7 @@ fn unknown_block_cli_is_rejected_at_spawn() {
 fn instruction_files_rendered_with_group_facts() {
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/myrepo", rails()).unwrap();
-    let dir = reg.state_root().join(&g.id);
+    let dir = reg.state_root().join(g.id.as_str());
     let orch = fs::read_to_string(dir.join("orchestrator.md")).unwrap();
     assert!(orch.contains("C:/tmp/myrepo"));
     assert!(orch.contains("at most 2 live delegates"), "guardrails must be rendered into the doc");
@@ -9865,7 +9873,7 @@ fn linked(id: &str, status: &str, deps: &[&str], related: &[&str]) -> Task {
 }
 
 /// Seed `titles` as queued tasks and return the group.
-fn board_with(reg: &OrchRegistry, titles: &[&str]) -> String {
+fn board_with(reg: &OrchRegistry, titles: &[&str]) -> GroupId {
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
     for title in titles {
         reg.upsert_task(&g.id, "orch", None, patch(Some(title), None, None)).unwrap();
@@ -9883,7 +9891,7 @@ fn board_with(reg: &OrchRegistry, titles: &[&str]) -> String {
 fn pre_582_boards_load_unchanged_and_link_free_boards_stay_link_free() {
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
-    let path = reg.state_root().join(&g.id).join("tasks.json");
+    let path = reg.state_root().join(g.id.as_str()).join("tasks.json");
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     // Exactly what loomux wrote before #582 — no deps key, no related key.
     fs::write(
@@ -9926,7 +9934,7 @@ fn pre_582_boards_load_unchanged_and_link_free_boards_stay_link_free() {
 fn pre_581_boards_load_with_pr_base_absent() {
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
-    let path = reg.state_root().join(&g.id).join("tasks.json");
+    let path = reg.state_root().join(g.id.as_str()).join("tasks.json");
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     // Exactly what loomux wrote before #581 — a PR, and no pr_base key at all.
     fs::write(
@@ -9967,7 +9975,7 @@ fn pr_base_round_trips_through_the_board_and_clears_on_empty() {
     assert_eq!(saved.pr_base.as_deref(), Some("integration/581"));
 
     // Durable, not just in the returned snapshot: re-read from tasks.json.
-    let path = reg.state_root().join(&g.id).join("tasks.json");
+    let path = reg.state_root().join(g.id.as_str()).join("tasks.json");
     let text = fs::read_to_string(&path).unwrap();
     assert!(text.contains("integration/581"), "pr_base must reach the file:\n{text}");
     let reread = reg.tasks(&g.id);
@@ -10901,7 +10909,7 @@ fn start_is_rejected_up_front_when_the_group_is_paused() {
 /// The group is paused in these tests, so #569 QUEUES each delivery instead of
 /// pasting it — the text is audited under the ordinary `prompt` action either
 /// way, which is what makes a paused group a usable probe with no real PTY.
-fn suppressed_notices(reg: &OrchRegistry, group: &str, needle: &str) -> usize {
+fn suppressed_notices(reg: &OrchRegistry, group: &GroupId, needle: &str) -> usize {
     delivered_texts(reg, group).into_iter().filter(|t| t.contains(needle)).count()
 }
 
@@ -10984,7 +10992,7 @@ fn concurrent_same_repo_launches_get_distinct_groups() {
             create_orchestration_group(&reg, &repo, rails(), SessionOrigin::Fresh, None, 0).map(|r| r.group_id)
         }));
     }
-    let ids: Vec<String> = handles.into_iter().map(|h| h.join().unwrap().unwrap()).collect();
+    let ids: Vec<GroupId> = handles.into_iter().map(|h| h.join().unwrap().unwrap()).collect();
     assert_ne!(ids[0], ids[1], "concurrent launches on one repo must not share a group");
 }
 
@@ -11029,7 +11037,7 @@ fn audit_rotates_at_cap_and_backfill_reads_both_generations() {
     reg.set_port(45999);
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
     let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
-    let gdir = reg.state_root().join(&g.id);
+    let gdir = reg.state_root().join(g.id.as_str());
     // Force a rotation with a tiny cap: the spawn entry moves to audit.1.
     rotate_audit_if_needed(&gdir, 1);
     assert!(gdir.join("audit.1.jsonl").is_file(), "rotation must produce the old generation");
@@ -11111,7 +11119,7 @@ fn session_roles_backfills_task_and_branch_from_the_spawn_audit_for_pre_roster_g
     let reg = relaunch_registry(dir.path());
     reg.set_port(46011);
     let g = reg.create_group("C:/tmp/repo-legacy", rails()).unwrap();
-    let gdir = reg.state_root().join(&g.id);
+    let gdir = reg.state_root().join(g.id.as_str());
     let line = json!({
         "ts_ms": 5, "actor": "loomux", "action": "agent-spawn",
         "detail": {
@@ -11174,7 +11182,7 @@ fn parse_audit_lines_counts_what_it_skips() {
 fn audit_log_reads_both_generations_oldest_first() {
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
-    let gdir = reg.state_root().join(&g.id);
+    let gdir = reg.state_root().join(g.id.as_str());
     // Seed a group-create in the current log, then rotate it into audit.1 so
     // the two-generation read path is exercised.
     rotate_audit_if_needed(&gdir, 1);
@@ -11194,7 +11202,7 @@ fn audit_log_reads_both_generations_oldest_first() {
 #[test]
 fn audit_log_of_unknown_group_is_empty() {
     let (reg, _d) = test_registry();
-    assert!(reg.audit_log("no-such-group").is_empty());
+    assert!(reg.audit_log(&parse_gid("no-such-group")).is_empty());
 }
 
 /// A detail payload the size of a real one (agent-exit records carry summaries,
@@ -11241,7 +11249,7 @@ fn concurrent_audit_appends_land_as_whole_lines() {
     std::thread::scope(|s| {
         for t in 0..THREADS {
             let reg = &reg;
-            let gid = g.id.as_str();
+            let gid = &g.id;
             s.spawn(move || {
                 for i in 0..PER_THREAD {
                     reg.audit(gid, &format!("w-{t}"), "agent-exit", fat_detail(t, i));
@@ -11250,7 +11258,7 @@ fn concurrent_audit_appends_land_as_whole_lines() {
         }
     });
 
-    let text = fs::read_to_string(reg.state_root().join(&g.id).join("audit.jsonl")).unwrap();
+    let text = fs::read_to_string(reg.state_root().join(g.id.as_str()).join("audit.jsonl")).unwrap();
     let entries = assert_all_lines_parse(&text);
     let exits = entries.iter().filter(|v| v["action"] == "agent-exit").count();
     assert_eq!(exits, THREADS * PER_THREAD, "every concurrent append must survive as one record");
@@ -11265,7 +11273,7 @@ fn concurrent_audit_appends_land_as_whole_lines() {
 fn audit_rotation_racing_appends_loses_no_lines() {
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
-    let gdir = reg.state_root().join(&g.id);
+    let gdir = reg.state_root().join(g.id.as_str());
     const THREADS: usize = 6;
     const PER_THREAD: usize = 30;
     // Roughly a third of the total bytes the appenders will write, so the
@@ -11277,7 +11285,7 @@ fn audit_rotation_racing_appends_loses_no_lines() {
         let appenders: Vec<_> = (0..THREADS)
             .map(|t| {
                 let reg = &reg;
-                let gid = g.id.as_str();
+                let gid = &g.id;
                 s.spawn(move || {
                     for i in 0..PER_THREAD {
                         reg.audit(gid, &format!("w-{t}"), "agent-exit", fat_detail(t, i));
@@ -11348,7 +11356,7 @@ fn audit_rotation_racing_appends_loses_no_lines() {
 fn concurrent_rotations_keep_the_retained_generation() {
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
-    let gdir = reg.state_root().join(&g.id);
+    let gdir = reg.state_root().join(g.id.as_str());
     const SEEDED: usize = 50;
     // Staggered pauses, so the second rotator's rename lands well after the
     // first's — with appenders writing in between. Equal pauses would let both
@@ -11377,7 +11385,7 @@ fn concurrent_rotations_keep_the_retained_generation() {
         // details on purpose: they must not push the fresh log past `cap`.
         for t in 1..3 {
             let reg = &reg;
-            let gid = g.id.as_str();
+            let gid = &g.id;
             s.spawn(move || {
                 for i in 0..15 {
                     reg.audit(gid, &format!("w-{t}"), "agent-exit", json!({ "seq": i }));
@@ -11432,7 +11440,7 @@ fn sessions_backfill_from_audit_when_roster_predates_it() {
     let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
     let sid = orch.session_id.unwrap();
     // Simulate the pre-roster era: the roster file never existed.
-    fs::remove_file(reg.state_root().join(&g.id).join("agents.json")).unwrap();
+    fs::remove_file(reg.state_root().join(g.id.as_str()).join("agents.json")).unwrap();
     let roles = reg.session_roles();
     let o = roles
         .iter()
@@ -11474,7 +11482,7 @@ fn hint_restores_sessions_unknown_to_roster_and_audit() {
     // fixture is needed here.
     let reg2_dir = tempfile::tempdir().unwrap();
     let reg2 = Arc::new(relaunch_registry(reg2_dir.path()));
-    let bad = resume_recorded_session(&reg2, sid, Some(("ghost-1".into(), "orchestrator".into())), false);
+    let bad = resume_recorded_session(&reg2, sid, Some((parse_gid("ghost-1"), "orchestrator".into())), false);
     assert!(bad.is_err());
 }
 
@@ -11593,7 +11601,7 @@ fn rejoining_a_session_into_another_groups_id_is_refused_loudly() {
         err.starts_with("resume-group-mismatch:"),
         "must carry the structured tag the frontend classifies on, got: {err}"
     );
-    assert!(err.contains(&group_b), "must name the group the session DOES belong to, got: {err}");
+    assert!(err.contains(group_b.as_str()), "must name the group the session DOES belong to, got: {err}");
 
     // And it must be a refusal, not a slower path to the same contamination:
     // A's roster never sees the session id. (The rejoin spawn is backgrounded,
@@ -12872,7 +12880,7 @@ fn a_bare_resume_of_an_unparseable_recorded_role_refuses_instead_of_defaulting()
         branch: None,
     };
     fs::write(
-        reg.state_root().join(&g.id).join("agents.json"),
+        reg.state_root().join(g.id.as_str()).join("agents.json"),
         serde_json::to_string(&[record]).unwrap(),
     )
     .unwrap();
@@ -12912,7 +12920,7 @@ fn a_bare_resume_of_an_unparseable_recorded_role_refuses_instead_of_defaulting()
 /// Write a synthetic roster (`agents.json`) directly, bypassing spawn/kill —
 /// the prefix-resolution tests need FULL session ids that share a chosen
 /// prefix, which real (randomly-minted) session ids can't be made to do.
-fn write_roster(reg: &OrchRegistry, group: &str, sessions: &[&str]) {
+fn write_roster(reg: &OrchRegistry, group: &GroupId, sessions: &[&str]) {
     let records: Vec<AgentRecord> = sessions
         .iter()
         .enumerate()
@@ -12931,7 +12939,7 @@ fn write_roster(reg: &OrchRegistry, group: &str, sessions: &[&str]) {
         })
         .collect();
     fs::write(
-        reg.state_root().join(group).join("agents.json"),
+        reg.state_root().join(group.as_str()).join("agents.json"),
         serde_json::to_string(&records).unwrap(),
     )
     .unwrap();
@@ -13114,7 +13122,7 @@ fn cross_group_targets_are_invisible() {
     // And the foreign agent never appears in this group's roster.
     let roster = dispatch(&reg, &co, "tools/call",
         &json!({ "name": "list_agents", "arguments": {} })).unwrap();
-    assert!(!roster["content"][0]["text"].as_str().unwrap().contains(&foreign.id));
+    assert!(!roster["content"][0]["text"].as_str().unwrap().contains(foreign.id.as_str()));
 }
 
 #[test]
@@ -13397,7 +13405,7 @@ fn spawn_cap_rejection_lists_the_delegate_roster() {
 fn every_tool_call_is_audited() {
     let (reg, _d, co, _cw) = setup_mcp();
     dispatch(&reg, &co, "tools/call", &json!({ "name": "list_agents", "arguments": {} })).unwrap();
-    let log = fs::read_to_string(reg.state_root().join(&co.group).join("audit.jsonl")).unwrap();
+    let log = fs::read_to_string(reg.state_root().join(co.group.as_str()).join("audit.jsonl")).unwrap();
     let lines: Vec<Value> = log.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
     let call = lines
         .iter()
@@ -13452,7 +13460,7 @@ fn rename_agent_updates_roster_and_audits() {
     let row = roster.as_array().unwrap().iter().find(|a| a["id"] == cw.agent_id.as_str()).unwrap();
     assert_eq!(row["name"], "w-2: gitwatch fix", "roster name must follow the rename");
     // And it is audited.
-    let log = fs::read_to_string(reg.state_root().join(&co.group).join("audit.jsonl")).unwrap();
+    let log = fs::read_to_string(reg.state_root().join(co.group.as_str()).join("audit.jsonl")).unwrap();
     assert!(log.contains("agent-rename"), "rename must be audited");
 }
 
@@ -13552,7 +13560,7 @@ fn roster_persists_the_name_source_tier() {
     // rejoin can restore the "human wins" guarantee (#95r).
     reg.rename_agent(&w.id, "my parser work", NameSource::Human).unwrap();
     let roster: Value =
-        serde_json::from_str(&fs::read_to_string(reg.state_root().join(&g.id).join("agents.json")).unwrap())
+        serde_json::from_str(&fs::read_to_string(reg.state_root().join(g.id.as_str()).join("agents.json")).unwrap())
             .unwrap();
     let row = roster.as_array().unwrap().iter().find(|r| r["id"] == w.id.as_str()).unwrap();
     assert_eq!(row["name"], "my parser work");
@@ -13703,13 +13711,13 @@ fn pause_holds_delivery_and_persists_across_restart() {
         assert!(reg.is_paused(&g.id));
         reg.deliver_prompt(&w.id, "hello again", "loomux", Delivery::MidSession).unwrap();
         assert_eq!(reg.queue_depth(5698), 1, "a paused delivery is queued, never destroyed");
-        let log = fs::read_to_string(reg.state_root().join(&g.id).join("audit.jsonl")).unwrap();
+        let log = fs::read_to_string(reg.state_root().join(g.id.as_str()).join("audit.jsonl")).unwrap();
         assert!(
             !log.contains("prompt-suppressed-paused"),
             "the discard action must have no writer left: {log}"
         );
         assert!(log.contains("group-paused"), "and the admission names the pause: {log}");
-        assert!(reg.state_root().join(&g.id).join("paused").is_file(), "pause marker must be written");
+        assert!(reg.state_root().join(g.id.as_str()).join("paused").is_file(), "pause marker must be written");
     }
     // Restart: the pause survives (marker re-seeds the in-memory flag).
     let reg = relaunch_registry(dir.path());
@@ -13720,7 +13728,7 @@ fn pause_holds_delivery_and_persists_across_restart() {
     // Resume clears the flag and the marker.
     reg.resume_group(&g.id).unwrap();
     assert!(!reg.is_paused(&g.id));
-    assert!(!reg.state_root().join(&g.id).join("paused").is_file(), "resume must remove the marker");
+    assert!(!reg.state_root().join(g.id.as_str()).join("paused").is_file(), "resume must remove the marker");
 }
 
 #[test]
@@ -13790,7 +13798,7 @@ fn reaper_spares_a_worker_reactivated_before_the_kill() {
         "a re-activated worker must not be reaped");
     // And it is still alive in the roster.
     let roster = reg.list_agents(&g.id).to_string();
-    assert!(roster.contains(&idle.id));
+    assert!(roster.contains(idle.id.as_str()));
 }
 
 #[test]
@@ -13840,7 +13848,7 @@ const FAR: u64 = 1_000_000_000_000_000;
 
 /// Group with an orchestrator and one working (tasked) worker under a watchdog
 /// with the given stall window (minutes). Returns (reg, tempdir, group, worker).
-fn watchdog_setup(stall_min: u32) -> (OrchRegistry, tempfile::TempDir, String, String) {
+fn watchdog_setup(stall_min: u32) -> (OrchRegistry, tempfile::TempDir, GroupId, String) {
     let (reg, dir) = test_registry();
     let g = reg.create_group("C:/tmp/repo", watchdog_rails(stall_min)).unwrap();
     reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
@@ -13869,7 +13877,7 @@ fn watchdog_flags_a_silent_worker_once_per_stall() {
     // Long past the stall window with no output and no report → one notice.
     assert_eq!(reg.watchdog_tick(FAR, &no_output, &HashMap::new()), vec![wid.clone()],
         "a silent working agent must be flagged");
-    let log = fs::read_to_string(reg.state_root().join(&gid).join("audit.jsonl")).unwrap();
+    let log = fs::read_to_string(reg.state_root().join(gid.as_str()).join("audit.jsonl")).unwrap();
     assert!(log.contains("watchdog-stall"), "the stall must be audited, got: {log}");
     // Anti-nag: still silent, but already notified for this same stall.
     assert!(reg.watchdog_tick(FAR + 60_000, &no_output, &HashMap::new()).is_empty(),
@@ -13959,7 +13967,7 @@ fn watchdog_stall_resets_when_the_agent_reports_or_messages() {
 /// EVERY multi-tick test below would silently start exercising the intake
 /// gate too the moment #429's smart default shipped, since `rails()`'s
 /// unset `intake_poll_minutes` now means "on while autonomous," not "off".
-fn autonomous_setup() -> (OrchRegistry, tempfile::TempDir, String, String) {
+fn autonomous_setup() -> (OrchRegistry, tempfile::TempDir, GroupId, String) {
     let (reg, dir) = test_registry();
     let g = reg
         .create_group("C:/tmp/repo", Guardrails { intake_poll_minutes: Some(0), ..rails() })
@@ -13972,8 +13980,8 @@ fn autonomous_setup() -> (OrchRegistry, tempfile::TempDir, String, String) {
 /// Count audit entries whose action is exactly `action`. Matches the
 /// quote-delimited JSON value so a prefix action (`autonomous-off`) doesn't also
 /// count its superset (`autonomous-off-failed`).
-fn audit_count(reg: &OrchRegistry, group: &str, action: &str) -> usize {
-    fs::read_to_string(reg.state_root().join(group).join("audit.jsonl"))
+fn audit_count(reg: &OrchRegistry, group: &GroupId, action: &str) -> usize {
+    fs::read_to_string(reg.state_root().join(group.as_str()).join("audit.jsonl"))
         .unwrap_or_default()
         .matches(&format!("\"{action}\""))
         .count()
@@ -13981,8 +13989,8 @@ fn audit_count(reg: &OrchRegistry, group: &str, action: &str) -> usize {
 
 /// The parsed audit entries for one action, in order — for assertions about a
 /// line's `detail` payload rather than merely how many lines exist.
-fn audit_entries(reg: &OrchRegistry, group: &str, action: &str) -> Vec<Value> {
-    fs::read_to_string(reg.state_root().join(group).join("audit.jsonl"))
+fn audit_entries(reg: &OrchRegistry, group: &GroupId, action: &str) -> Vec<Value> {
+    fs::read_to_string(reg.state_root().join(group.as_str()).join("audit.jsonl"))
         .unwrap_or_default()
         .lines()
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
@@ -13992,7 +14000,7 @@ fn audit_entries(reg: &OrchRegistry, group: &str, action: &str) -> Vec<Value> {
 
 /// A durable usage snapshot carrying `tokens` input tokens under a unique key, to
 /// seed a group's lifetime spend without a real transcript.
-fn seed_usage(reg: &OrchRegistry, group: &str, key: &str, tokens: u64) {
+fn seed_usage(reg: &OrchRegistry, group: &GroupId, key: &str, tokens: u64) {
     reg.upsert_usage_snapshot(group, UsageSnapshot {
         key: key.to_string(),
         agent_id: format!("agent-{key}"),
@@ -14249,7 +14257,7 @@ fn idle_tick_minutes_is_configurable_persisted_and_surfaced() {
     // 0 coerces to the default (never "off" — the marker is the switch); huge clamps.
     assert_eq!(reg.set_idle_tick_minutes(&gid, 0).unwrap(), 5);
     assert_eq!(reg.set_idle_tick_minutes(&gid, 100_000).unwrap(), 1440);
-    assert!(reg.set_idle_tick_minutes("no-such-group", 5).is_err());
+    assert!(reg.set_idle_tick_minutes(&parse_gid("no-such-group"), 5).is_err());
     // Observability while ON: quiet_secs + eligible_in_secs are live, and the
     // countdown never exceeds the window.
     reg.set_idle_tick_minutes(&gid, 5).unwrap();
@@ -14296,7 +14304,7 @@ fn idle_tick_input_defer_bound_defaults_floors_caps_and_persists() {
         .create_group("C:/tmp/repo", Guardrails { idle_tick_input_defer_max_minutes: 45, ..rails() })
         .unwrap();
     assert_eq!(g.guardrails.idle_tick_input_defer_max_minutes, 45, "an explicit in-range value is honored, unclamped");
-    let body = fs::read_to_string(reg.state_root().join(&g.id).join("group.json")).unwrap();
+    let body = fs::read_to_string(reg.state_root().join(g.id.as_str()).join("group.json")).unwrap();
     let v: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(v["guardrails"]["idle_tick_input_defer_max_minutes"].as_u64().unwrap(), 45,
         "the field is written to group.json, not silently dropped");
@@ -14341,7 +14349,7 @@ fn idle_tick_input_defer_bound_floor_survives_launcher_relaunch() {
     // exercises the branch the bug was in — a test that passed with the key
     // still present passed for the wrong reason (confirmed: it stayed green
     // with the round-1 defect restored).
-    let path = dir.path().join(&gid).join("group.json");
+    let path = dir.path().join(gid.as_str()).join("group.json");
     let mut v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
     v["guardrails"].as_object_mut().unwrap().remove("idle_tick_input_defer_max_minutes");
     fs::write(&path, serde_json::to_string_pretty(&v).unwrap()).unwrap();
@@ -14373,7 +14381,7 @@ fn idle_activity_floor_is_configurable_persisted_and_surfaced() {
     // 0 → default; huge clamps to 1 MiB; unknown group errors.
     assert_eq!(reg.set_idle_activity_floor(&gid, 0).unwrap(), 2048);
     assert_eq!(reg.set_idle_activity_floor(&gid, 999_999_999).unwrap(), 1024 * 1024);
-    assert!(reg.set_idle_activity_floor("no-such-group", 4096).is_err());
+    assert!(reg.set_idle_activity_floor(&parse_gid("no-such-group"), 4096).is_err());
     // Persisted across restart (live value wins over the launch default).
     reg.set_idle_activity_floor(&gid, 4096).unwrap();
     let reg2 = relaunch_registry(dir.path());
@@ -14407,7 +14415,7 @@ fn a_higher_activity_floor_treats_bigger_growth_as_noise() {
 /// which resolves to `DEFAULT_INTAKE_POLL_MINUTES` since this helper always
 /// turns autonomous mode on) and a caller-chosen `fallback_minutes`. Returns
 /// (reg, tempdir, group id, orchestrator id) — the same shape as `autonomous_setup`.
-fn autonomous_setup_with_gate(intake_poll_minutes: Option<u32>, fallback_minutes: u32) -> (OrchRegistry, tempfile::TempDir, String, String) {
+fn autonomous_setup_with_gate(intake_poll_minutes: Option<u32>, fallback_minutes: u32) -> (OrchRegistry, tempfile::TempDir, GroupId, String) {
     let (reg, dir) = test_registry();
     let g = reg
         .create_group(
@@ -14424,8 +14432,8 @@ fn autonomous_setup_with_gate(intake_poll_minutes: Option<u32>, fallback_minutes
 /// contains `needle` — a coarser version of `audit_count` that lets a test
 /// assert on the SHAPE of one entry (e.g. the skip reason, the intake summary
 /// folded into an `idle-tick` entry) without parsing full JSON.
-fn audit_line_contains(reg: &OrchRegistry, group: &str, action: &str, needle: &str) -> bool {
-    fs::read_to_string(reg.state_root().join(group).join("audit.jsonl"))
+fn audit_line_contains(reg: &OrchRegistry, group: &GroupId, action: &str, needle: &str) -> bool {
+    fs::read_to_string(reg.state_root().join(group.as_str()).join("audit.jsonl"))
         .unwrap_or_default()
         .lines()
         .any(|l| l.contains(&format!("\"{action}\"")) && l.contains(needle))
@@ -14550,7 +14558,7 @@ fn autonomous_setup_with_backoff(
     intake_poll_minutes: Option<u32>,
     fallback_minutes: u32,
     fallback_max_minutes: u32,
-) -> (OrchRegistry, tempfile::TempDir, String, String) {
+) -> (OrchRegistry, tempfile::TempDir, GroupId, String) {
     let (reg, dir) = test_registry();
     let g = reg
         .create_group(
@@ -15119,7 +15127,7 @@ fn confirmed_delivery(agent_id: &str, submit_sent_ms: u64) -> HashMap<String, De
 /// Group with a live (Running, headless) orchestrator and compact-nudge
 /// enabled for `minutes` on the default (orchestrator-only) role set. Returns
 /// (reg, tempdir, group id, orchestrator id).
-fn compact_nudge_setup(minutes: u32) -> (OrchRegistry, tempfile::TempDir, String, String) {
+fn compact_nudge_setup(minutes: u32) -> (OrchRegistry, tempfile::TempDir, GroupId, String) {
     let (reg, dir) = test_registry();
     let g = reg.create_group("C:/tmp/repo", compact_rails(minutes, &["orchestrator"])).unwrap();
     let o = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
@@ -15269,7 +15277,7 @@ fn compact_nudge_tick_treats_a_precompact_hook_marker_as_trusted_evidence() {
     assert!(!reg.agent(&oid).unwrap().compact_pending);
 
     // Simulate the hook firing: write the marker the script would have.
-    let marker = reg.state_root().join(&gid).join("hooks").join(format!("{oid}.precompact.json"));
+    let marker = reg.state_root().join(gid.as_str()).join("hooks").join(format!("{oid}.precompact.json"));
     write_hook_marker(&marker, started_ms, 1_000);
 
     // The marker arms AND resolves in this one tick (loomux pasted nothing
@@ -15316,7 +15324,7 @@ fn compact_nudge_tick_treats_a_sessionstart_hook_marker_as_an_immediate_confirm(
     let started_ms = reg.agent(&oid).unwrap().started_ms;
     let empty = HashMap::new();
 
-    let marker = reg.state_root().join(&gid).join("hooks").join(format!("{oid}.sessionstart-compact.json"));
+    let marker = reg.state_root().join(gid.as_str()).join("hooks").join(format!("{oid}.sessionstart-compact.json"));
     write_hook_marker(&marker, started_ms, 1_000);
 
     assert!(reg.compact_nudge_tick(1_000, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()).is_empty());
@@ -15348,7 +15356,7 @@ fn compact_nudge_tick_sessionstart_evidence_resolves_even_while_the_pane_is_busy
     let (reg, _d, gid, oid) = compact_nudge_setup(20);
     let started_ms = reg.agent(&oid).unwrap().started_ms;
 
-    let marker = reg.state_root().join(&gid).join("hooks").join(format!("{oid}.sessionstart-compact.json"));
+    let marker = reg.state_root().join(gid.as_str()).join("hooks").join(format!("{oid}.sessionstart-compact.json"));
     write_hook_marker(&marker, started_ms, 1_000);
 
     // The pane is BUSY on this exact tick — real growth well past any
@@ -15382,8 +15390,8 @@ fn compact_nudge_tick_fast_compact_both_hook_events_in_one_poll_gap_resolves_not
     let (reg, _d, gid, oid) = compact_nudge_setup(20);
     let started_ms = reg.agent(&oid).unwrap().started_ms;
 
-    let precompact_marker = reg.state_root().join(&gid).join("hooks").join(format!("{oid}.precompact.json"));
-    let sessionstart_marker = reg.state_root().join(&gid).join("hooks").join(format!("{oid}.sessionstart-compact.json"));
+    let precompact_marker = reg.state_root().join(gid.as_str()).join("hooks").join(format!("{oid}.precompact.json"));
+    let sessionstart_marker = reg.state_root().join(gid.as_str()).join("hooks").join(format!("{oid}.sessionstart-compact.json"));
     write_hook_marker(&precompact_marker, started_ms, 1_000);
     write_hook_marker(&sessionstart_marker, started_ms, 1_000);
 
@@ -15420,7 +15428,7 @@ fn compact_nudge_tick_sessionstart_evidence_after_a_reinject_was_already_decided
     // Arm via PreCompact, quiet immediately — resolves into a DECIDED
     // loomux reinjection on this same tick (same shape as `compact_nudge_
     // tick_a_precompact_only_arm_still_gets_loomuxs_own_reinjection`).
-    let precompact_marker = reg.state_root().join(&gid).join("hooks").join(format!("{oid}.precompact.json"));
+    let precompact_marker = reg.state_root().join(gid.as_str()).join("hooks").join(format!("{oid}.precompact.json"));
     write_hook_marker(&precompact_marker, started_ms, 1_000);
     assert!(reg.compact_nudge_tick(1_000, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()).is_empty());
     let a = reg.agent(&oid).unwrap();
@@ -15430,7 +15438,7 @@ fn compact_nudge_tick_sessionstart_evidence_after_a_reinject_was_already_decided
 
     // SessionStart evidence lands later — the delivery-confirmation phase
     // is still live (no `confirmed` delivery map passed) when it does.
-    let sessionstart_marker = reg.state_root().join(&gid).join("hooks").join(format!("{oid}.sessionstart-compact.json"));
+    let sessionstart_marker = reg.state_root().join(gid.as_str()).join("hooks").join(format!("{oid}.sessionstart-compact.json"));
     write_hook_marker(&sessionstart_marker, started_ms, 120_000);
     assert!(reg.compact_nudge_tick(121_000, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()).is_empty());
     let a = reg.agent(&oid).unwrap();
@@ -15486,7 +15494,7 @@ fn compact_nudge_tick_a_precompact_only_arm_still_gets_loomuxs_own_reinjection()
     let started_ms = reg.agent(&oid).unwrap().started_ms;
     let empty = HashMap::new();
 
-    let marker = reg.state_root().join(&gid).join("hooks").join(format!("{oid}.precompact.json"));
+    let marker = reg.state_root().join(gid.as_str()).join("hooks").join(format!("{oid}.precompact.json"));
     write_hook_marker(&marker, started_ms, 1_000);
 
     assert!(reg.compact_nudge_tick(1_000, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()).is_empty());
@@ -15520,7 +15528,7 @@ fn compact_nudge_tick_ignores_a_hook_marker_older_than_the_agent_itself() {
     let (reg, _d, gid, oid) = compact_nudge_setup(20);
     let started_ms = reg.agent(&oid).unwrap().started_ms;
 
-    let marker = reg.state_root().join(&gid).join("hooks").join(format!("{oid}.precompact.json"));
+    let marker = reg.state_root().join(gid.as_str()).join("hooks").join(format!("{oid}.precompact.json"));
     fs::create_dir_all(marker.parent().unwrap()).unwrap();
     let f = fs::File::create(&marker).unwrap();
     // Backdate the marker to well before this agent's own `started_ms` —
@@ -15576,7 +15584,7 @@ fn compact_copilot_rails(minutes: u32, roles: &[&str]) -> Guardrails {
     }
 }
 
-fn compact_nudge_setup_copilot(minutes: u32) -> (OrchRegistry, tempfile::TempDir, String, String) {
+fn compact_nudge_setup_copilot(minutes: u32) -> (OrchRegistry, tempfile::TempDir, GroupId, String) {
     let (reg, dir) = test_registry();
     let g = reg.create_group("C:/tmp/copilot-repo", compact_copilot_rails(minutes, &["orchestrator"])).unwrap();
     let o = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
@@ -15598,7 +15606,7 @@ fn copilot_precompact_hook_marker_is_trusted_evidence_too() {
     assert!(reg.compact_nudge_tick(1_000, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()).is_empty());
     assert!(!reg.agent(&oid).unwrap().compact_pending);
 
-    let marker = reg.state_root().join(&gid).join("hooks").join(format!("{oid}.precompact.json"));
+    let marker = reg.state_root().join(gid.as_str()).join("hooks").join(format!("{oid}.precompact.json"));
     write_hook_marker(&marker, started_ms, 1_000);
 
     // Arms AND resolves into the delivery-confirmation phase on this one tick — a
@@ -15626,7 +15634,7 @@ fn copilot_precompact_marker_gets_the_same_b1_restart_protection() {
     let (reg, _d, gid, oid) = compact_nudge_setup_copilot(20);
     let started_ms = reg.agent(&oid).unwrap().started_ms;
 
-    let marker = reg.state_root().join(&gid).join("hooks").join(format!("{oid}.precompact.json"));
+    let marker = reg.state_root().join(gid.as_str()).join("hooks").join(format!("{oid}.precompact.json"));
     fs::create_dir_all(marker.parent().unwrap()).unwrap();
     let f = fs::File::create(&marker).unwrap();
     f.set_modified(UNIX_EPOCH + Duration::from_millis(started_ms.saturating_sub(60_000))).unwrap();
@@ -15651,7 +15659,7 @@ fn copilot_compaction_marker_resolves_the_arm_even_while_the_pane_stays_busy() {
     let started_ms = reg.agent(&oid).unwrap().started_ms;
     let empty_tail: HashMap<String, (String, u64)> = HashMap::new();
 
-    let marker = reg.state_root().join(&gid).join("hooks").join(format!("{oid}.precompact.json"));
+    let marker = reg.state_root().join(gid.as_str()).join("hooks").join(format!("{oid}.precompact.json"));
     write_hook_marker(&marker, started_ms, 1_000);
 
     // Arm: precompact evidence, pane already busy — matches the issue's
@@ -15732,7 +15740,7 @@ fn copilot_compaction_marker_while_a_reinjection_is_already_in_flight_is_a_no_op
     let empty_outputs: HashMap<String, u64> = HashMap::new();
     let empty_tail: HashMap<String, (String, u64)> = HashMap::new();
 
-    let marker = reg.state_root().join(&gid).join("hooks").join(format!("{oid}.precompact.json"));
+    let marker = reg.state_root().join(gid.as_str()).join("hooks").join(format!("{oid}.precompact.json"));
     write_hook_marker(&marker, started_ms, 1_000);
 
     // Arm + quiet resolves into the confirmation phase via ordinary
@@ -15770,7 +15778,7 @@ fn copilot_busy_then_quiet_still_resolves_when_the_marker_never_appears() {
     let started_ms = reg.agent(&oid).unwrap().started_ms;
     let empty_tail: HashMap<String, (String, u64)> = HashMap::new();
 
-    let marker = reg.state_root().join(&gid).join("hooks").join(format!("{oid}.precompact.json"));
+    let marker = reg.state_root().join(gid.as_str()).join("hooks").join(format!("{oid}.precompact.json"));
     write_hook_marker(&marker, started_ms, 1_000);
 
     let busy: HashMap<String, u64> = [(oid.clone(), 500_000u64)].into_iter().collect();
@@ -15855,7 +15863,7 @@ fn compact_nudge_tick_copilot_full_loop_paste_then_hook_confirms_then_reinjects(
     // the marker `ensure_copilot_compact_hook`'s script provisions — the
     // SAME marker-consumption path Claude's hook uses, CLI-agnostic by design.
     let started_ms = reg.agent(&oid).unwrap().started_ms;
-    let marker = reg.state_root().join(&gid).join("hooks").join(format!("{oid}.precompact.json"));
+    let marker = reg.state_root().join(gid.as_str()).join("hooks").join(format!("{oid}.precompact.json"));
     // The marker-arm gate only ever compares `ts` against `started_ms` and
     // the last-seen marker ts, never against `now` — so the mtime stays a
     // small, real offset from `started_ms` (matching every other marker
@@ -16936,7 +16944,7 @@ fn poll_promptsubmit_hook_respects_a_baseline_that_excludes_a_stale_record() {
 #[test]
 fn promptsubmit_marker_path_matches_the_hooks_dir_convention() {
     let root = Path::new("C:/state");
-    let path = promptsubmit_marker_path(root, "group-1", "agent-1").unwrap();
+    let path = promptsubmit_marker_path(root, &parse_gid("group-1"), "agent-1");
     assert_eq!(path, root.join("group-1").join("hooks").join("agent-1.promptsubmit.jsonl"));
 }
 
@@ -17030,7 +17038,7 @@ fn compact_nudge_minutes_and_roles_are_configurable_persisted_and_audited() {
     assert_eq!(audit_count(&reg, &gid, "compact-nudge-minutes-set"), 1);
     assert_eq!(reg.set_compact_nudge_minutes(&gid, 99_999).unwrap(), 1440, "clamps to the ceiling");
     assert_eq!(reg.set_compact_nudge_minutes(&gid, 0).unwrap(), 0, "0 stays off, never floored to a default");
-    assert!(reg.set_compact_nudge_minutes("no-such-group", 5).is_err());
+    assert!(reg.set_compact_nudge_minutes(&parse_gid("no-such-group"), 5).is_err());
     reg.set_compact_nudge_minutes(&gid, 15).unwrap();
 
     let roles = reg.set_compact_nudge_roles(&gid, vec!["orchestrator".into(), "worker".into()]).unwrap();
@@ -17039,7 +17047,7 @@ fn compact_nudge_minutes_and_roles_are_configurable_persisted_and_audited() {
     assert_eq!(audit_count(&reg, &gid, "compact-nudge-roles-set"), 1);
     // Unrecognized entries dropped; an empty result falls back to orchestrator-only.
     assert_eq!(reg.set_compact_nudge_roles(&gid, vec!["bogus".into()]).unwrap(), vec!["orchestrator".to_string()]);
-    assert!(reg.set_compact_nudge_roles("no-such-group", vec![]).is_err());
+    assert!(reg.set_compact_nudge_roles(&parse_gid("no-such-group"), vec![]).is_err());
 
     reg.set_compact_nudge_roles(&gid, vec!["orchestrator".into(), "worker".into()]).unwrap();
     // Persisted across restart (live-set values win over the launch default).
@@ -17609,7 +17617,7 @@ fn any_compact_pending_is_true_only_while_an_arm_is_actually_open() {
     assert!(!reg.any_compact_pending(), "nothing armed yet");
 
     let started_ms = reg.agent(&oid).unwrap().started_ms;
-    let marker = reg.state_root().join(&gid).join("hooks").join(format!("{oid}.precompact.json"));
+    let marker = reg.state_root().join(gid.as_str()).join("hooks").join(format!("{oid}.precompact.json"));
     write_hook_marker(&marker, started_ms, 1_000);
     let empty = HashMap::new();
     assert!(reg.compact_nudge_tick(1_000, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()).is_empty());
@@ -17885,11 +17893,11 @@ fn note_directive_appends_are_self_scoped_and_isolated_per_agent() {
     reg.note_directive(&o.id, "second directive", false).unwrap();
     reg.note_directive(&w.id, "worker-only note", false).unwrap();
 
-    let ledger_o = fs::read_to_string(reg.state_root().join(&g.id).join(format!("ledger-{}.log", o.id))).unwrap();
+    let ledger_o = fs::read_to_string(reg.state_root().join(g.id.as_str()).join(format!("ledger-{}.log", o.id))).unwrap();
     assert!(ledger_o.contains("scope to auth only") && ledger_o.contains("second directive"));
     assert!(!ledger_o.contains("worker-only note"), "one agent must never see another's ledger");
 
-    let ledger_w = fs::read_to_string(reg.state_root().join(&g.id).join(format!("ledger-{}.log", w.id))).unwrap();
+    let ledger_w = fs::read_to_string(reg.state_root().join(g.id.as_str()).join(format!("ledger-{}.log", w.id))).unwrap();
     assert!(ledger_w.contains("worker-only note"));
     assert!(!ledger_w.contains("scope to auth only"), "cross-pane isolation holds the other direction too");
 }
@@ -17910,7 +17918,7 @@ fn note_directive_replace_rewrites_the_whole_ledger() {
     let o = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
     reg.note_directive(&o.id, "stale entry to be curated away", false).unwrap();
     reg.note_directive(&o.id, "curated ledger — only this survives", true).unwrap();
-    let ledger = fs::read_to_string(reg.state_root().join(&g.id).join(format!("ledger-{}.log", o.id))).unwrap();
+    let ledger = fs::read_to_string(reg.state_root().join(g.id.as_str()).join(format!("ledger-{}.log", o.id))).unwrap();
     assert!(ledger.contains("curated ledger — only this survives"));
     assert!(!ledger.contains("stale entry to be curated away"), "replace must not just append the curation on top");
 }
@@ -17926,7 +17934,7 @@ fn note_directive_append_sanitizes_newlines_and_the_loomux_marker() {
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
     let o = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
     reg.note_directive(&o.id, "line one\nline two\r\nline three", false).unwrap();
-    let path = reg.state_root().join(&g.id).join(format!("ledger-{}.log", o.id));
+    let path = reg.state_root().join(g.id.as_str()).join(format!("ledger-{}.log", o.id));
     let ledger = fs::read_to_string(&path).unwrap();
     let entry_lines: Vec<&str> = ledger.lines().collect();
     assert_eq!(entry_lines.len(), 1, "one note_directive call must be exactly one physical ledger line, got: {ledger:?}");
@@ -17958,7 +17966,7 @@ fn note_directive_enforces_the_ledger_file_cap_and_names_the_drop() {
     assert!(oversized.len() > 64 * 1024, "test setup must actually exceed the cap");
     let msg = reg.note_directive(&o.id, &oversized, true).unwrap();
     assert!(msg.contains("dropped"), "an over-cap replace must report the trim: {msg}");
-    let path = reg.state_root().join(&g.id).join(format!("ledger-{}.log", o.id));
+    let path = reg.state_root().join(g.id.as_str()).join(format!("ledger-{}.log", o.id));
     let ledger = fs::read_to_string(&path).unwrap();
     assert!(ledger.len() <= 64 * 1024 + 200, "stored ledger must be capped (small slop for the last kept line): got {} bytes", ledger.len());
     assert!(ledger.contains("padding entry number 1999"), "must keep the NEWEST entries, not the oldest: {ledger:?}");
@@ -17990,13 +17998,13 @@ fn mcp_note_directive_dispatch_is_self_scoped() {
     assert_eq!(out["isError"], false);
     let text = out["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("recorded"), "got: {text}");
-    let ledger_o = fs::read_to_string(reg.state_root().join(&co.group).join(format!("ledger-{}.log", co.agent_id))).unwrap();
+    let ledger_o = fs::read_to_string(reg.state_root().join(co.group.as_str()).join(format!("ledger-{}.log", co.agent_id))).unwrap();
     assert!(ledger_o.contains("human said: focus on #42"));
 
     // Self-scoped: the worker's own call must never land in the orchestrator's ledger.
     dispatch(&reg, &cw, "tools/call",
         &json!({ "name": "note_directive", "arguments": { "text": "worker-only note" } })).unwrap();
-    let ledger_o_after = fs::read_to_string(reg.state_root().join(&co.group).join(format!("ledger-{}.log", co.agent_id))).unwrap();
+    let ledger_o_after = fs::read_to_string(reg.state_root().join(co.group.as_str()).join(format!("ledger-{}.log", co.agent_id))).unwrap();
     assert!(!ledger_o_after.contains("worker-only note"), "cross-pane leak via dispatch");
 }
 
@@ -19197,7 +19205,7 @@ fn compact_nudge_tick_precompact_only_arm_that_stalls_times_out_labeled_with_evi
     let (reg, _d, gid, oid) = compact_nudge_setup(20);
     let started_ms = reg.agent(&oid).unwrap().started_ms;
 
-    let marker = reg.state_root().join(&gid).join("hooks").join(format!("{oid}.precompact.json"));
+    let marker = reg.state_root().join(gid.as_str()).join("hooks").join(format!("{oid}.precompact.json"));
     write_hook_marker(&marker, started_ms, 1_000);
     // Busy on the arming tick too — otherwise a quiet first observation
     // would resolve it via reinjection immediately, same as `compact_nudge_
@@ -19603,7 +19611,7 @@ fn grant_merge_writes_a_consumable_grant_file_and_audits() {
     // A PR URL is normalized to the number; the grant is keyed pr-<N>.
     let num = reg.grant_merge(&g.id, "https://github.com/o/r/pull/42", Some("bump the changelog first"), "human").unwrap();
     assert_eq!(num, 42);
-    let grant = reg.state_root().join(&g.id).join("merge_grants").join("pr-42");
+    let grant = reg.state_root().join(g.id.as_str()).join("merge_grants").join("pr-42");
     assert!(grant.is_file(), "the grant file must exist for the shim to consult");
     // Line 1 is a future unix-seconds expiry.
     let body = std::fs::read_to_string(&grant).unwrap();
@@ -19625,7 +19633,7 @@ fn approve_task_writes_a_merge_grant_for_the_prs_number() {
     // Clicking Approve (with an optional comment) must mint the one-time grant for
     // that PR — otherwise the enforced gate leaves the orchestrator unable to merge.
     reg.approve_task(&g.id, &t.id, Some("also tag the release note")).unwrap();
-    assert!(reg.state_root().join(&g.id).join("merge_grants").join("pr-7").is_file(),
+    assert!(reg.state_root().join(g.id.as_str()).join("merge_grants").join("pr-7").is_file(),
         "Approve must write the merge grant for the task's PR");
     assert_eq!(audit_count(&reg, &g.id, "merge-grant-written"), 1);
 }
@@ -19633,7 +19641,7 @@ fn approve_task_writes_a_merge_grant_for_the_prs_number() {
 // --- bulk board approvals (#507) ---------------------------------------------------------------
 
 /// A merge-gate task with the given title and optional PR ref, ready to approve.
-fn gate_task(reg: &OrchRegistry, group: &str, title: &str, pr: Option<&str>) -> Task {
+fn gate_task(reg: &OrchRegistry, group: &GroupId, title: &str, pr: Option<&str>) -> Task {
     let t = reg.upsert_task(group, "orch-1", None, patch(Some(title), None, None)).unwrap();
     let mut p = patch(None, Some("pr"), None);
     p.pr = pr.map(String::from);
@@ -19642,9 +19650,9 @@ fn gate_task(reg: &OrchRegistry, group: &str, title: &str, pr: Option<&str>) -> 
 
 /// The grant file's nonce (line 2) — distinct per grant, so two grants written
 /// by one bulk approval are provably two grants, not one shared authorization.
-fn grant_nonce(reg: &OrchRegistry, group: &str, pr: u64) -> String {
+fn grant_nonce(reg: &OrchRegistry, group: &GroupId, pr: u64) -> String {
     let body = fs::read_to_string(
-        reg.state_root().join(group).join("merge_grants").join(format!("pr-{pr}")),
+        reg.state_root().join(group.as_str()).join("merge_grants").join(format!("pr-{pr}")),
     )
     .unwrap();
     body.lines().nth(1).unwrap().to_string()
@@ -19678,7 +19686,7 @@ fn bulk_approve_mints_a_grant_per_pr_and_delivers_one_consolidated_notice() {
 
     // Authority: one real, separately-nonced grant per PR — and none for the
     // item that had no PR to key one on.
-    let grants = reg.state_root().join(&g.id).join("merge_grants");
+    let grants = reg.state_root().join(g.id.as_str()).join("merge_grants");
     assert!(grants.join("pr-7").is_file() && grants.join("pr-9").is_file(),
         "each selected PR must get its own grant file (a PR URL normalized to its number)");
     assert_eq!(audit_count(&reg, &g.id, "merge-grant-written"), 2,
@@ -19772,7 +19780,7 @@ fn a_bulk_approval_is_all_or_nothing_and_mints_nothing_when_it_refuses() {
         )
         .unwrap_err();
     assert!(err.contains("merge gate"), "the refusal must name why: {err}");
-    assert!(!reg.state_root().join(&g.id).join("merge_grants").join("pr-7").exists(),
+    assert!(!reg.state_root().join(g.id.as_str()).join("merge_grants").join("pr-7").exists(),
         "a refused batch mints NO grant, not the ones that happened to be valid");
     assert_eq!(audit_count(&reg, &g.id, "merge-grant-written"), 0);
     assert!(delivered_texts(&reg, &g.id).is_empty(), "a refused batch tells the orchestrator nothing");
@@ -19834,7 +19842,7 @@ fn a_bulk_approval_with_no_prs_at_all_says_so_instead_of_naming_grants() {
             a.id, b.id
         )
     );
-    assert!(!reg.state_root().join(&g.id).join("merge_grants").exists(),
+    assert!(!reg.state_root().join(g.id.as_str()).join("merge_grants").exists(),
         "nothing to grant means no grant directory at all");
     assert_eq!(audit_count(&reg, &g.id, "task-approve-bulk"), 1);
 }
@@ -19855,7 +19863,7 @@ fn a_failed_grant_write_fails_the_call_instead_of_reclassifying_the_item() {
     let b = gate_task(&reg, &g.id, "Ship the writer", Some("#9"));
     // Injected I/O failure, portable and deterministic: a regular FILE where the
     // grant DIRECTORY has to go, so `atomic_write`'s `create_dir_all` fails.
-    fs::write(reg.state_root().join(&g.id).join("merge_grants"), b"not a directory").unwrap();
+    fs::write(reg.state_root().join(g.id.as_str()).join("merge_grants"), b"not a directory").unwrap();
     pause_with_pane(&reg, &g.id, &orch.id, 7005);
 
     let err = reg
@@ -19907,7 +19915,7 @@ fn two_selected_tasks_naming_the_same_pr_are_refused_not_double_granted() {
         )
         .unwrap_err();
     assert!(err.contains("PR #7 appears twice"), "the refusal must name the PR: {err}");
-    assert!(!reg.state_root().join(&g.id).join("merge_grants").exists(),
+    assert!(!reg.state_root().join(g.id.as_str()).join("merge_grants").exists(),
         "refused in pre-flight — nothing minted");
     assert!(delivered_texts(&reg, &g.id).is_empty());
     assert!(
@@ -19938,7 +19946,7 @@ fn grants_are_not_writable_by_any_mcp_tool() {
         &json!({ "name": "set_state", "arguments": { "state": "{\"x\":1}" } }));
     let _ = dispatch(&reg, &co, "tools/call",
         &json!({ "name": "upsert_task", "arguments": { "title": "t", "status": "pr" } }));
-    let gdir = reg.state_root().join(&co.group);
+    let gdir = reg.state_root().join(co.group.as_str());
     assert!(!gdir.join("merge_grants").exists(), "no MCP tool may create merge_grants");
     assert!(!gdir.join("release_grants").exists(), "no MCP tool may create release_grants");
     assert!(!gdir.join("dangerous_mode").exists(), "no MCP tool may create the dangerous_mode marker");
@@ -22080,7 +22088,7 @@ fn set_auto_merge_requires_autonomous_mode() {
 fn disabling_autonomous_force_disables_auto_merge() {
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
-    let am_marker = reg.state_root().join(&g.id).join("auto_merge");
+    let am_marker = reg.state_root().join(g.id.as_str()).join("auto_merge");
     reg.set_autonomous(&g.id, true).unwrap();
     reg.set_auto_merge(&g.id, true).unwrap();
     assert!(reg.is_auto_merge(&g.id) && am_marker.is_file());
@@ -22101,7 +22109,7 @@ fn stale_auto_merge_without_autonomous_is_reconciled_on_read() {
     // forbidden combo.
     let (reg, dir) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
-    let gdir = reg.state_root().join(&g.id);
+    let gdir = reg.state_root().join(g.id.as_str());
     // Simulate the stale on-disk combo directly.
     std::fs::write(gdir.join("auto_merge"), b"").unwrap();
     assert!(!gdir.join("autonomous").is_file());
@@ -22118,8 +22126,8 @@ fn stale_auto_merge_without_autonomous_is_reconciled_on_read() {
 fn set_auto_release_mirrors_auto_merge_dependency_and_is_independent() {
     let (reg, dir) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
-    let am = reg.state_root().join(&g.id).join("auto_merge");
-    let ar = reg.state_root().join(&g.id).join("auto_release");
+    let am = reg.state_root().join(g.id.as_str()).join("auto_merge");
+    let ar = reg.state_root().join(g.id.as_str()).join("auto_release");
     // Dependency: enabling auto-release without autonomous is rejected.
     let err = reg.set_auto_release(&g.id, true).unwrap_err();
     assert!(err.to_lowercase().contains("autonomous"), "must name the dependency, got: {err}");
@@ -22145,12 +22153,12 @@ fn set_auto_release_mirrors_auto_merge_dependency_and_is_independent() {
     // is reconciled off on read.
     reg.set_autonomous(&g.id, true).unwrap();
     reg.set_auto_release(&g.id, true).unwrap();
-    std::fs::remove_file(reg.state_root().join(&g.id).join("autonomous")).unwrap(); // hand-edit: drop autonomous, leave auto_release
+    std::fs::remove_file(reg.state_root().join(g.id.as_str()).join("autonomous")).unwrap(); // hand-edit: drop autonomous, leave auto_release
     let reg2 = relaunch_registry(dir.path());
     reg2.set_port(45999);
     reg2.create_group("C:/tmp/repo", rails()).unwrap();
     assert!(!reg2.is_auto_release(&g.id), "stale auto_release without autonomous reconciled off");
-    assert!(!reg2.state_root().join(&g.id).join("auto_release").is_file());
+    assert!(!reg2.state_root().join(g.id.as_str()).join("auto_release").is_file());
 }
 
 #[test]
@@ -22171,7 +22179,7 @@ fn budget_suspension_force_disables_auto_release() {
 fn dangerous_mode_setter_and_autonomous_are_mutually_exclusive() {
     let (reg, dir) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
-    let marker = reg.state_root().join(&g.id).join("dangerous_mode");
+    let marker = reg.state_root().join(g.id.as_str()).join("dangerous_mode");
     // Default OFF; enable works while NOT autonomous.
     assert!(!reg.is_dangerous_mode(&g.id));
     reg.set_dangerous_mode(&g.id, true).unwrap();
@@ -22199,7 +22207,7 @@ fn dangerous_mode_setter_and_autonomous_are_mutually_exclusive() {
     // Disable is disk-first + audited.
     reg2.set_dangerous_mode(&g.id, false).unwrap();
     assert!(!reg2.is_dangerous_mode(&g.id));
-    assert!(!reg2.state_root().join(&g.id).join("dangerous_mode").is_file());
+    assert!(!reg2.state_root().join(g.id.as_str()).join("dangerous_mode").is_file());
 }
 
 #[test]
@@ -22207,7 +22215,7 @@ fn stale_dangerous_mode_with_autonomous_is_reconciled_off_on_read() {
     // Hand-edited/impossible combo (both markers) → autonomous wins, dangerous cleared.
     let (reg, dir) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
-    let gdir = reg.state_root().join(&g.id);
+    let gdir = reg.state_root().join(g.id.as_str());
     std::fs::write(gdir.join("autonomous"), b"0").unwrap();
     std::fs::write(gdir.join("dangerous_mode"), b"").unwrap();
     let reg2 = relaunch_registry(dir.path());
@@ -22230,7 +22238,7 @@ fn budget_suspension_force_disables_auto_merge_even_if_marker_removal_fails() {
     reg.set_auto_merge(&g.id, true).unwrap();
     assert!(reg.is_auto_merge(&g.id));
     // Force the auto_merge marker removal to fail (swap the file for a directory).
-    let am = reg.state_root().join(&g.id).join("auto_merge");
+    let am = reg.state_root().join(g.id.as_str()).join("auto_merge");
     std::fs::remove_file(&am).unwrap();
     std::fs::create_dir(&am).unwrap();
     // Exhaust the budget so the enforcer suspends autonomous mode.
@@ -22802,7 +22810,7 @@ fn gh_shim_harness_gates_graphql_endpoint_variants_and_variable_ref() {
 fn autonomous_toggle_roundtrip_durable_and_audited() {
     let (reg, dir) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
-    let marker = reg.state_root().join(&g.id).join("autonomous");
+    let marker = reg.state_root().join(g.id.as_str()).join("autonomous");
     assert!(!reg.is_autonomous(&g.id), "default off");
     // Enable: marker written (content is the budget anchor), state on, audited.
     reg.set_autonomous(&g.id, true).unwrap();
@@ -22830,7 +22838,7 @@ fn autonomous_toggle_roundtrip_durable_and_audited() {
 fn auto_merge_toggle_roundtrip_durable_audited_and_in_kickoff() {
     let (reg, dir) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
-    let marker = reg.state_root().join(&g.id).join("auto_merge");
+    let marker = reg.state_root().join(g.id.as_str()).join("auto_merge");
     assert!(!reg.is_auto_merge(&g.id), "default off = human merge gate");
     // Auto-merge exists only in autonomous mode (#83 dependency) — enable it first.
     reg.set_autonomous(&g.id, true).unwrap();
@@ -22878,7 +22886,7 @@ fn autonomy_budget_set_persists_survives_restart_and_audits() {
     assert_eq!(reg2.group(&g2.id).unwrap().guardrails.autonomy_budget_tokens, 250_000,
         "a live-set budget must survive a restart, not revert to the launch default");
     // Unknown group errors.
-    assert!(reg.set_autonomy_budget("no-such-group", 1).is_err());
+    assert!(reg.set_autonomy_budget(&parse_gid("no-such-group"), 1).is_err());
 }
 
 #[test]
@@ -22958,7 +22966,7 @@ fn failed_disable_keeps_consent_on_and_is_audited() {
     // must error, leave state consistently ON, and audit the failure.
     let (reg, _d, gid, _oid) = autonomous_setup();
     assert!(reg.is_autonomous(&gid));
-    let marker = reg.state_root().join(&gid).join("autonomous");
+    let marker = reg.state_root().join(gid.as_str()).join("autonomous");
     // Force removal to fail deterministically: swap the marker file for a
     // directory of the same name (fs::remove_file refuses a directory) — standing
     // in for a real IO failure where the marker survives.
@@ -22985,7 +22993,7 @@ fn suspension_stops_ticking_even_if_marker_removal_fails() {
     // swapping the marker file for a directory (fs::remove_file refuses it).
     seed_usage(&reg, &gid, "spend", 5_000);
     reg.set_autonomy_budget(&gid, 100).unwrap();
-    let marker = reg.state_root().join(&gid).join("autonomous");
+    let marker = reg.state_root().join(gid.as_str()).join("autonomous");
     fs::remove_file(&marker).unwrap();
     fs::create_dir(&marker).unwrap();
     // Suspend: the durable disable fails (audited) but the money-stop still lands.
@@ -23007,7 +23015,7 @@ fn restart_treats_a_suspended_marker_as_authoritative_off() {
     // OFF + suspended-visible, never silently ticking past its spent budget.
     let (reg, dir) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
-    let gdir = reg.state_root().join(&g.id);
+    let gdir = reg.state_root().join(g.id.as_str());
     fs::write(gdir.join("autonomous"), "0").unwrap();          // stale enable marker survived
     fs::write(gdir.join("autonomy_suspended"), "{}").unwrap(); // suspension marker wins
     let reg2 = relaunch_registry(dir.path());
@@ -23055,7 +23063,7 @@ fn idle_tick_does_not_touch_worker_idle_clocks() {
 
 /// Group with an orchestrator and one working (tasked) worker; the watchdog is
 /// off (irrelevant here). Returns (reg, tempdir, group, worker id).
-fn attention_setup() -> (OrchRegistry, tempfile::TempDir, String, String) {
+fn attention_setup() -> (OrchRegistry, tempfile::TempDir, GroupId, String) {
     let (reg, dir) = test_registry();
     let g = reg.create_group("C:/tmp/repo", watchdog_rails(0)).unwrap();
     reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
@@ -26206,7 +26214,7 @@ fn the_notify_queue_hold_classes_gain_a_channel_that_reaches_the_orchestrator_ag
 /// substring-counting `audit_count` above on purpose: a churn assertion has to
 /// match the `action` FIELD exactly, or a detail value that happens to contain
 /// the same text would inflate it.
-fn hold_audit_count(reg: &OrchRegistry, group: &str, action: &str) -> usize {
+fn hold_audit_count(reg: &OrchRegistry, group: &GroupId, action: &str) -> usize {
     reg.audit_log(group).iter().filter(|e| e.action == action).count()
 }
 
@@ -27040,7 +27048,7 @@ fn an_orchestrators_own_stuck_pane_parks_its_notice_in_the_inbox() {
 
     let relay = reg.take_orchestrator_notices(&g.id).expect("the relay carries it");
     assert!(relay.contains("notice undeliverable"), "the diagnosis reaches the agent: {relay}");
-    assert!(relay.contains(&orch.id), "about its own pane: {relay}");
+    assert!(relay.contains(orch.id.as_str()), "about its own pane: {relay}");
     assert_eq!(
         mask_loomux_notices(&relay).trim(),
         "",
@@ -27087,7 +27095,7 @@ fn suppressed(from: &str, to: &str, text: &str) -> AuditEntry {
 /// line is the only place a headless test can see delivered wording: with no
 /// `AppHandle` the admission is withdrawn again and `deliver_prompt` returns
 /// `Err("no app handle")`, so nothing survives in the queue to read back.
-fn offered_prompts(reg: &OrchRegistry, group: &str) -> Vec<String> {
+fn offered_prompts(reg: &OrchRegistry, group: &GroupId) -> Vec<String> {
     reg.audit_log(group)
         .into_iter()
         .filter(|e| e.action == "prompt")
@@ -27477,7 +27485,7 @@ fn a_pause_held_delivery_survives_a_loomux_restart() {
         reg.deliver_prompt(&w.id, "held across the restart", "orch-1", Delivery::MidSession)
             .unwrap();
         assert_eq!(reg.queue_depth(5696), 1, "precondition: the pause queued it");
-        snap_path = reg.state_root().join(&g.id).join("queue.json");
+        snap_path = reg.state_root().join(g.id.as_str()).join("queue.json");
     }
     // The durable snapshot is what carries it, so it must name the payload.
     let snap = fs::read_to_string(&snap_path)
@@ -27597,7 +27605,7 @@ fn a_kickoff_held_through_a_pause_keeps_its_kickoff_treatment_at_resume() {
     // And it is DURABLE, spelled out rather than serde-shaped: this entry is
     // the on-disk record (#468), and a human reading `queue.json` after a
     // crash should see what the entry is.
-    let snap = fs::read_to_string(reg.state_root().join(&g.id).join("queue.json"))
+    let snap = fs::read_to_string(reg.state_root().join(g.id.as_str()).join("queue.json"))
         .expect("a pause-held kickoff is persisted like any other entry");
     assert!(snap.contains("fresh-kickoff"), "the kind is written out in full: {snap}");
 }
@@ -28363,7 +28371,7 @@ fn a_pause_held_admission_persists_exactly_like_any_other() {
     reg.deliver_prompt(&w.id, "held for the worker", "orch-1", Delivery::MidSession).unwrap();
     assert_eq!(reg.queue_depth(5695), 1, "precondition: the pause queued it");
 
-    let snap = reg.state_root().join(&g.id).join("queue.json");
+    let snap = reg.state_root().join(g.id.as_str()).join("queue.json");
     let before = fs::read_to_string(&snap).expect("the admission owes a snapshot, and paid it");
     assert!(before.contains("held for the worker"), "and the snapshot carries the payload: {before}");
 
@@ -28480,7 +28488,7 @@ fn a_queue_full_drop_names_what_it_dropped_and_badges_the_pane() {
     let err = reg
         .enqueue_text(&g.id, &w.id, "orchestrator", lost, pty, queue::EnqueueReason::Arrival)
         .expect_err("at cap, the newest arrival is rejected");
-    assert!(err.contains(&w.id), "the synchronous error still names the target: {err}");
+    assert!(err.contains(w.id.as_str()), "the synchronous error still names the target: {err}");
 
     let dropped = reg
         .audit_log(&g.id)
@@ -28601,7 +28609,7 @@ fn queued_at(id: u64, enqueued_ms: u64) -> queue::QueuedDelivery {
         reason: queue::EnqueueReason::Arrival,
         enqueued_ms,
         coalesced: 0,
-        group: "g1".to_string(),
+        group: Some(parse_gid("g1")),
         to_orchestrator: false,
         session_id: None,
         delivery_kind: Delivery::MidSession,
@@ -29721,7 +29729,7 @@ macro_rules! queuefull_pane {
 /// FIRST). So the pane bounces back to its cap once, and the second pop is the
 /// one that sticks. Bounded, so a queue that never comes down fails the test
 /// rather than hanging it.
-fn drain_to_depth(reg: &OrchRegistry, group: &str, pty: u32, target: usize) -> usize {
+fn drain_to_depth(reg: &OrchRegistry, group: &GroupId, pty: u32, target: usize) -> usize {
     for _ in 0..(queue::QUEUE_MAX_PER_PANE * 4) {
         let depth = reg.queue_depth(pty);
         if depth <= target {
@@ -29733,7 +29741,7 @@ fn drain_to_depth(reg: &OrchRegistry, group: &str, pty: u32, target: usize) -> u
     panic!("the pane's queue never came down to {target}");
 }
 
-fn drain_below_cap(reg: &OrchRegistry, group: &str, pty: u32) -> usize {
+fn drain_below_cap(reg: &OrchRegistry, group: &GroupId, pty: u32) -> usize {
     drain_to_depth(reg, group, pty, queue::QUEUE_MAX_PER_PANE - 1)
 }
 
@@ -30627,7 +30635,7 @@ fn attention_toasts_once_per_onset_only_for_optin_groups() {
     let (reg, _d, gid, wid) = attention_setup();
     let blocked = vec![AttentionItem {
         agent_id: wid.clone(),
-        group: gid.clone(),
+        group: gid.to_string(),
         name: "w".into(),
         role: Some(Role::Worker),
         pty_id: None,
@@ -31021,7 +31029,7 @@ fn rails_with_process_block() -> Guardrails {
 
 /// Spawn an agent against the `proc` (`role_hint: process`) block declared by
 /// [`rails_with_process_block`] and return its MCP caller.
-fn process_caller(reg: &OrchRegistry, group: &str) -> Caller {
+fn process_caller(reg: &OrchRegistry, group: &GroupId) -> Caller {
     let a = reg
         .spawn_agent_ex(group, Role::Worker, Some("proc".into()), "proc", "",
                         false, None, None, None, None, None)
@@ -31185,7 +31193,7 @@ fn session_digest_cross_group_agent_is_unknown_not_leaked() {
     assert_eq!(r["isError"], true);
     let text = r["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("unknown agent"));
-    assert!(!text.contains(&g2.id), "must not leak the foreign group's id: {text}");
+    assert!(!text.contains(g2.id.as_str()), "must not leak the foreign group's id: {text}");
 }
 
 #[test]
@@ -31292,7 +31300,7 @@ fn write_wall_transcript(proj: &std::path::Path, sid: &str, err: &str) {
 /// that produced them is gone, and the live-agent guardrail (`rails()` caps
 /// at 2) would otherwise make a multi-session fixture impossible to build at
 /// all.
-fn finished_session(reg: &OrchRegistry, g: &str, proj: &std::path::Path, name: &str, err: &str) -> String {
+fn finished_session(reg: &OrchRegistry, g: &GroupId, proj: &std::path::Path, name: &str, err: &str) -> String {
     let w = reg.spawn_agent(g, Role::Worker, name, "task", false, None).unwrap();
     write_wall_transcript(proj, w.session_id.as_ref().unwrap(), err);
     reg.mark_dead(&w.id, Some(0));
@@ -31420,7 +31428,7 @@ fn usage_json_write_is_atomic_and_leaves_no_temp() {
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
     reg.upsert_usage_snapshot(&g.id, usage_snap("sess-a", "w-1", 0.50, 100, 200));
 
-    let gdir = reg.state_root().join(&g.id);
+    let gdir = reg.state_root().join(g.id.as_str());
     let path = gdir.join("usage.json");
     assert!(path.is_file(), "usage.json must exist after upsert");
     // The atomic write renames its temp into place, so no `.tmp` scratch sibling
@@ -31442,7 +31450,7 @@ fn usage_json_write_is_atomic_and_leaves_no_temp() {
 fn corrupt_usage_json_is_preserved_not_silently_wiped() {
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
-    let gdir = reg.state_root().join(&g.id);
+    let gdir = reg.state_root().join(g.id.as_str());
     fs::create_dir_all(&gdir).unwrap();
     let path = gdir.join("usage.json");
     // Simulate a half-written / hand-mangled file.
@@ -31487,7 +31495,7 @@ fn group_json_records_cost_guardrails() {
     rails.watchdog_stall_minutes = 12;
     let g = reg.create_group("C:/tmp/repo", rails).unwrap();
     let gj: Value = serde_json::from_str(
-        &fs::read_to_string(reg.state_root().join(&g.id).join("group.json")).unwrap(),
+        &fs::read_to_string(reg.state_root().join(g.id.as_str()).join("group.json")).unwrap(),
     )
     .unwrap();
     assert_eq!(gj["guardrails"]["idle_kill_minutes"], 15);
@@ -31701,7 +31709,7 @@ fn end_group_kills_everyone_including_the_orchestrator() {
     }
     assert_eq!(reg.group_summary(&g.id)["live_agents"], 0);
     // The teardown is audited as a human action.
-    let log = fs::read_to_string(reg.state_root().join(&g.id).join("audit.jsonl")).unwrap();
+    let log = fs::read_to_string(reg.state_root().join(g.id.as_str()).join("audit.jsonl")).unwrap();
     let end = log
         .lines()
         .map(|l| serde_json::from_str::<Value>(l).unwrap())
@@ -31709,7 +31717,7 @@ fn end_group_kills_everyone_including_the_orchestrator() {
         .expect("end must be audited");
     assert_eq!(end["actor"], "human");
     // Unknown group: an error, not a silent success.
-    assert!(reg.end_group("ghost-group", false).is_err());
+    assert!(reg.end_group(&parse_gid("ghost-group"), false).is_err());
 }
 
 #[test]
@@ -31725,11 +31733,11 @@ fn end_group_clears_pause_so_relaunch_starts_clean() {
         // A paused group that gets ended: the pause marker must not outlive it,
         // or a relaunch on the same repo id would silently resume paused.
         reg.pause_group(&g.id).unwrap();
-        assert!(reg.state_root().join(&g.id).join("paused").is_file());
+        assert!(reg.state_root().join(g.id.as_str()).join("paused").is_file());
         reg.end_group(&g.id, false).unwrap();
         assert!(!reg.is_paused(&g.id), "ending must drop the in-memory pause");
         assert!(
-            !reg.state_root().join(&g.id).join("paused").is_file(),
+            !reg.state_root().join(g.id.as_str()).join("paused").is_file(),
             "ending must remove the pause marker"
         );
     }
@@ -32292,7 +32300,7 @@ fn steer_without_a_live_orchestrator_errors() {
     let err = reg.steer_orchestrator(&g.id, "steer me").unwrap_err();
     assert!(err.contains("no live orchestrator"), "got: {err}");
     // An unknown group is likewise not steerable.
-    let err = reg.steer_orchestrator("no-such-group", "steer me").unwrap_err();
+    let err = reg.steer_orchestrator(&parse_gid("no-such-group"), "steer me").unwrap_err();
     assert!(err.contains("no live orchestrator"), "got: {err}");
 }
 
@@ -32762,7 +32770,7 @@ fn save_attachment_writes_bytes_verbatim_under_the_group_dir() {
     assert_eq!(fs::read(p).unwrap(), bytes, "bytes must be stored verbatim");
     // It lives under <root>/<group>/attachments/ and carries the .png extension.
     assert_eq!(p.extension().and_then(|e| e.to_str()), Some("png"));
-    let attach_dir = dir.path().join(&g.id).join("attachments");
+    let attach_dir = dir.path().join(g.id.as_str()).join("attachments");
     assert!(p.starts_with(&attach_dir), "path {p:?} must be under {attach_dir:?}");
     // The save is audited so there's a human-attributed trail of what was sent.
     assert!(
@@ -32804,12 +32812,19 @@ fn save_attachment_gives_each_image_a_distinct_path_in_a_burst() {
 
 #[test]
 fn save_attachment_rejects_an_unknown_group() {
-    // Membership guard (#72 review): the dir is root.join(group), so a group id
-    // that was never created — including a traversal attempt — must be refused
-    // before anything is written.
+    // Membership guard (#72 review): a group id that was never created must be
+    // refused before anything is written.
     let (reg, dir) = test_registry();
-    assert!(reg.save_attachment("never-made", "png", &[1, 2, 3]).unwrap_err().contains("unknown"));
-    assert!(reg.save_attachment("../escape", "png", &[1, 2, 3]).unwrap_err().contains("unknown"));
+    assert!(reg.save_attachment(&parse_gid("never-made"), "png", &[1, 2, 3]).unwrap_err().contains("unknown"));
+    // #904 — the traversal half of this test is GONE, deliberately, and this is
+    // the record of it. It used to pass `"../escape"` here to prove the
+    // membership guard also stopped a traversal. `save_attachment` now takes a
+    // `GroupId`, so that line no longer COMPILES: a traversal id is not
+    // expressible at this call site. The property did not weaken, it moved —
+    // from a runtime assertion here to a type, pinned by
+    // `parse_refuses_every_path_shaped_group_id` in `tests/groupid.rs`. What
+    // remains below is what the type does NOT cover: a well-formed id that is
+    // not a live group.
     // Nothing was written anywhere under the root.
     assert!(!dir.path().join("never-made").exists());
     assert!(!dir.path().join("attachments").exists());
@@ -32825,7 +32840,7 @@ fn orchestrator_cli_resolves_the_groups_cli_for_reference_formatting() {
     assert_eq!(reg.orchestrator_cli(&claude.id), "claude");
     assert_eq!(reg.orchestrator_cli(&copilot.id), "copilot");
     // Unknown group → the safe default wording, never a panic.
-    assert_eq!(reg.orchestrator_cli("nope"), "claude");
+    assert_eq!(reg.orchestrator_cli(&parse_gid("nope")), "claude");
 }
 
 #[test]
@@ -32837,13 +32852,13 @@ fn end_group_sweeps_the_attachments_scratch_dir() {
     // dir but leaves the rest of the group state alone.
     reg.set_state(&g.id, "{\"k\":1}").unwrap();
     let att = reg.save_attachment(&g.id, "png", &[1, 2, 3]).unwrap();
-    let attach_dir = dir.path().join(&g.id).join("attachments");
+    let attach_dir = dir.path().join(g.id.as_str()).join("attachments");
     assert!(Path::new(&att).is_file() && attach_dir.is_dir());
 
     reg.end_group(&g.id, false).unwrap();
     assert!(!attach_dir.exists(), "attachments dir must be swept on group end");
     assert!(
-        dir.path().join(&g.id).join("state.json").is_file(),
+        dir.path().join(g.id.as_str()).join("state.json").is_file(),
         "non-attachment group state must survive teardown",
     );
 }
@@ -32899,7 +32914,7 @@ fn end_group_reclaims_generated_claude_agent_files() {
 // keeps the fixture honest if the generated shape ever changes.
 
 /// The Claude-side generated file a default-roster spawn just wrote.
-fn generated_claude_agent_file(dir: &tempfile::TempDir, group: &str, block: &str) -> std::path::PathBuf {
+fn generated_claude_agent_file(dir: &tempfile::TempDir, group: &GroupId, block: &str) -> std::path::PathBuf {
     let path = dir.path().join("claude-agents").join(format!("loomux-{group}-{block}.md"));
     assert!(path.is_file(), "the spawn must have generated {path:?}");
     path
@@ -33020,7 +33035,7 @@ fn a_dead_group_never_gets_its_agent_file_re_minted() {
 
     // The group's state is gone (ended, crashed, deleted out from under
     // loomux) and its file is reclaimed...
-    fs::remove_dir_all(dir.path().join(&g.id)).unwrap();
+    fs::remove_dir_all(dir.path().join(g.id.as_str())).unwrap();
     fs::remove_file(&generated).unwrap();
 
     // ...and a writer reached with that same dead id must NOT bring it back.
@@ -33462,7 +33477,7 @@ fn failed_task_write_leaves_board_intact() {
     let t1 = reg.upsert_task(&g.id, "orch", None, patch(Some("keep me"), None, None)).unwrap();
     reg.upsert_task(&g.id, "orch", None, patch(Some("keep me too"), None, None)).unwrap();
 
-    let board = d.path().join(&g.id).join("tasks.json");
+    let board = d.path().join(g.id.as_str()).join("tasks.json");
     let before = fs::read_to_string(&board).unwrap();
 
     let mut perms = fs::metadata(&board).unwrap().permissions();
@@ -33522,7 +33537,7 @@ fn disk_tick_notifies_once_per_episode_and_skips_paused() {
     let recovered = 9 * 1024 * 1024 * 1024; // above LOW_DISK_CLEAR_BYTES (7 GB)
 
     let count_low_disk = || {
-        fs::read_to_string(d.path().join(&g.id).join("audit.jsonl"))
+        fs::read_to_string(d.path().join(g.id.as_str()).join("audit.jsonl"))
             .unwrap_or_default()
             .lines()
             .filter(|l| l.contains("low-disk"))
@@ -33656,13 +33671,13 @@ fn drop_claude_store(store: &std::path::Path) {
 
 /// Every group id with a `group.json` on disk. The building block for
 /// [`group_fingerprints`], which is what the refusal tests actually assert on.
-fn groups_on_disk(reg: &OrchRegistry) -> Vec<String> {
-    let mut out: Vec<String> = fs::read_dir(reg.state_root())
+fn groups_on_disk(reg: &OrchRegistry) -> Vec<GroupId> {
+    let mut out: Vec<GroupId> = fs::read_dir(reg.state_root())
         .map(|entries| {
             entries
                 .flatten()
                 .filter(|e| e.path().join("group.json").is_file())
-                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter_map(|e| GroupId::parse(&e.file_name().to_string_lossy()).ok())
                 .collect()
         })
         .unwrap_or_default();
@@ -33682,11 +33697,11 @@ fn groups_on_disk(reg: &OrchRegistry) -> Vec<String> {
 /// against a state root with no groups at all, where it degrades to the same
 /// emptiness check a name list would give — uniform, and one less thing for the
 /// next person adding a refusal to have to choose between.
-fn group_fingerprints(reg: &OrchRegistry) -> Vec<(String, String, usize)> {
-    let mut out: Vec<(String, String, usize)> = groups_on_disk(reg)
+fn group_fingerprints(reg: &OrchRegistry) -> Vec<(GroupId, String, usize)> {
+    let mut out: Vec<(GroupId, String, usize)> = groups_on_disk(reg)
         .into_iter()
         .map(|id| {
-            let json = fs::read_to_string(reg.state_root().join(&id).join("group.json"))
+            let json = fs::read_to_string(reg.state_root().join(id.as_str()).join("group.json"))
                 .unwrap_or_default();
             let audit = reg.audit_log(&id).len();
             (id, json, audit)
@@ -33774,7 +33789,7 @@ fn a_promoted_pane_resumes_its_own_session_and_gets_orchestrator_wiring() {
     let env: HashMap<&str, &str> = req.env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
     assert_eq!(env.get("LOOMUX_AGENT_ID"), Some(&req.agent_id.as_str()), "env: {env:?}");
     assert!(
-        env.get("LOOMUX_GROUP_DIR").is_some_and(|d| d.contains(&req.group_id)),
+        env.get("LOOMUX_GROUP_DIR").is_some_and(|d| d.contains(req.group_id.as_str())),
         "env: {env:?}"
     );
     assert!(
@@ -33920,7 +33935,7 @@ fn promote_refuses_a_session_that_is_already_an_orchestration_member() {
         .unwrap_err();
     drop_claude_store(&store);
     assert!(err.starts_with("promote-already-managed:"), "got: {err}");
-    assert!(err.contains(&g.id), "the refusal must name the group it is already in: {err}");
+    assert!(err.contains(g.id.as_str()), "the refusal must name the group it is already in: {err}");
     // Fingerprints, not names: this refusal runs against an EXISTING group, so
     // "created no second group" is not the whole statement — it must not have
     // rewritten the live one either.
@@ -33988,7 +34003,7 @@ fn promote_into_a_fresh_group_reads_the_repo_workflow_file() {
 /// instead. Returns `(registry, repo_dir, repo_path, session_id, store, gid)`.
 fn dormant_group_and_a_promotable_pane(
     tag: &str,
-) -> (std::sync::Arc<OrchRegistry>, tempfile::TempDir, String, String, std::path::PathBuf, String, tempfile::TempDir)
+) -> (std::sync::Arc<OrchRegistry>, tempfile::TempDir, String, String, std::path::PathBuf, GroupId, tempfile::TempDir)
 {
     let (reg, state) = test_registry();
     let reg = std::sync::Arc::new(reg);
@@ -34798,7 +34813,7 @@ fn gated_repo(gate_extra: &str) -> tempfile::TempDir {
 /// workflow — and therefore its gate — is in play at all (#229): a gate exists
 /// exactly when the human turned the file on for that launch.
 /// `a_gate_exists_only_while_the_advanced_orchestrator_is_on` pins the other side.
-fn gated_group(gate_extra: &str) -> (OrchRegistry, tempfile::TempDir, tempfile::TempDir, String) {
+fn gated_group(gate_extra: &str) -> (OrchRegistry, tempfile::TempDir, tempfile::TempDir, GroupId) {
     let (reg, d) = test_registry();
     reg.set_pr_head_override(Some(HEAD.into()));
     let repo = gated_repo(gate_extra);
@@ -34813,7 +34828,7 @@ fn gated_group(gate_extra: &str) -> (OrchRegistry, tempfile::TempDir, tempfile::
 }
 
 /// Spawn a reviewer bound to `block` and return an MCP caller for it.
-fn reviewer_caller(reg: &OrchRegistry, group: &str, block: &str) -> Caller {
+fn reviewer_caller(reg: &OrchRegistry, group: &GroupId, block: &str) -> Caller {
     let a = reg
         .spawn_agent_ex(group, Role::Reviewer, Some(block.into()), block, "review #7",
                         false, None, None, None, None, None)
@@ -34887,7 +34902,7 @@ fn merge(shim: &Path, group_dir: &Path) -> (bool, String) {
 #[test]
 fn a_declared_gate_becomes_the_spec_file_the_shim_reads_and_a_deleted_one_is_cleared() {
     let (reg, d, repo, gid) = gated_group("    also: [ci-green]\n");
-    let gate_file = d.path().join(&gid).join("merge_gate");
+    let gate_file = d.path().join(gid.as_str()).join("merge_gate");
 
     let text = fs::read_to_string(&gate_file).expect("a declared gates.merge must be written out");
     assert!(text.contains("require all-pass"), "require: omitted defaults to all-pass");
@@ -34916,7 +34931,7 @@ fn a_reviewer_a_gate_names_is_told_its_verdict_is_the_gate() {
     // workflow-specific instructions live (#229 keeps the base templates byte-for-byte
     // pre-#222, and rightly: a group with no workflow has no gate to explain).
     let (reg, d, _repo, gid) = gated_group("");
-    let note = fs::read_to_string(d.path().join(&gid).join("rev-security.md")).unwrap();
+    let note = fs::read_to_string(d.path().join(gid.as_str()).join("rev-security.md")).unwrap();
     assert!(note.contains("review_verdict"), "the named reviewer is taught the tool");
     assert!(note.contains("rev-security") && note.contains("rev-tests"),
         "and told who else the gate is waiting on: {note}");
@@ -34936,7 +34951,7 @@ fn a_reviewer_a_gate_names_is_told_its_verdict_is_the_gate() {
     let (reg2, d2) = test_registry();
     let plain = tempfile::tempdir().unwrap();
     let g = reg2.create_group(&plain.path().to_string_lossy(), rails()).unwrap();
-    let reviewer = fs::read_to_string(d2.path().join(&g.id).join("reviewer.md")).unwrap();
+    let reviewer = fs::read_to_string(d2.path().join(g.id.as_str()).join("reviewer.md")).unwrap();
     assert!(!reviewer.contains("review_verdict"),
         "an ungated group's reviewer must not read gate prose that applies to nothing");
     let _ = &reg; // keep the gated registry alive for the temp dirs above
@@ -34959,7 +34974,7 @@ fn a_gate_exists_only_while_the_advanced_orchestrator_is_on() {
     let g = reg.create_group(&repo.path().to_string_lossy(), rails()).unwrap(); // toggle OFF
     assert!(!reg.merge_gate_declared(&g.id),
         "a workflow file the human never turned on must not gate anything");
-    let audit = fs::read_to_string(d.path().join(&g.id).join("audit.jsonl")).unwrap();
+    let audit = fs::read_to_string(d.path().join(g.id.as_str()).join("audit.jsonl")).unwrap();
     assert!(audit.contains("workflow-ignored"), "and the trail says the file did nothing: {audit}");
 
     // Turn it on: the gate appears.
@@ -34994,7 +35009,7 @@ fn a_resumed_group_keeps_the_gate_it_launched_with() {
     let g = reg.create_group_ex(&repo_path, persisted, Launch::Resume).unwrap();
     assert_eq!(reg.merge_gate(&g.id).unwrap().reviewers, vec!["rev-security", "rev-tests"],
         "a resume must not let a pulled workflow file weaken the gate the session is running under");
-    let audit = fs::read_to_string(d.path().join(&gid).join("audit.jsonl")).unwrap();
+    let audit = fs::read_to_string(d.path().join(gid.as_str()).join("audit.jsonl")).unwrap();
     assert!(audit.contains("workflow-changed-since-launch"),
         "and the human is told the repo has moved on: {audit}");
 }
@@ -35007,7 +35022,7 @@ fn a_broken_workflow_file_keeps_the_last_known_gate_instead_of_failing_open() {
     // quietly *widen* what the group's agents may do. A syntax error is not consent
     // to merge unreviewed code.
     let (reg, d, repo, gid) = gated_group("");
-    let gate_file = d.path().join(&gid).join("merge_gate");
+    let gate_file = d.path().join(gid.as_str()).join("merge_gate");
     assert!(gate_file.is_file());
 
     fs::write(repo.path().join(".loomux").join("workflow.yml"),
@@ -35018,7 +35033,7 @@ fn a_broken_workflow_file_keeps_the_last_known_gate_instead_of_failing_open() {
         Guardrails { advanced_orchestrator: true, ..rails() }).unwrap();
     assert!(gate_file.is_file(), "a broken workflow file must NOT drop the gate it can no longer read");
     assert_eq!(reg.merge_gate(&g2.id).unwrap().reviewers, vec!["rev-security", "rev-tests"]);
-    let audit = fs::read_to_string(d.path().join(&gid).join("audit.jsonl")).unwrap();
+    let audit = fs::read_to_string(d.path().join(gid.as_str()).join("audit.jsonl")).unwrap();
     assert!(audit.contains("merge-gate-retained"), "and it must say so, loudly: {audit}");
 }
 
@@ -35725,7 +35740,7 @@ fn the_rust_gate_status_never_reports_satisfied_when_the_shim_would_refuse() {
 
     // A gate file that doesn't parse reads as MALFORMED (every merge refused), never as
     // "no gate declared" — which is exactly what the shim does with it.
-    fs::write(d.path().join(&gid).join("merge_gate"), "require all-pass\nnonsense here\n").unwrap();
+    fs::write(d.path().join(gid.as_str()).join("merge_gate"), "require all-pass\nnonsense here\n").unwrap();
     assert!(reg.merge_gate(&gid).is_none(), "unparseable");
     assert!(reg.merge_gate_declared(&gid), "but present, so the shim WILL read it");
     let s = reg.gate_status_line(&gid, 7).unwrap();
@@ -35774,7 +35789,7 @@ fn gh_shim_harness_refuses_the_merge_until_every_named_reviewer_has_passed() {
         return;
     }
     let (reg, d, _repo, gid) = gated_group("    also: [ci-green]\n");
-    let group_dir = d.path().join(&gid);
+    let group_dir = d.path().join(gid.as_str());
     let bin = tempfile::tempdir().unwrap();
     let shim = shim_with_fake_gh(bin.path());
 
@@ -35874,7 +35889,7 @@ fn gh_shim_harness_refuses_a_merge_that_moved_past_the_reviewed_revision() {
     // satisfied to the letter and violated in spirit. (GitHub dismisses stale approvals
     // on new commits for exactly this reason.)
     let (reg, d, _repo, gid) = gated_group("");
-    let group_dir = d.path().join(&gid);
+    let group_dir = d.path().join(gid.as_str());
     let bin = tempfile::tempdir().unwrap();
     let shim = shim_with_fake_gh(bin.path());
 
@@ -35938,7 +35953,7 @@ fn gh_shim_harness_pins_the_gate_above_every_opening_that_could_merge() {
     // the REAL shim, with zero verdicts recorded. A source-order assertion would still
     // pass if someone hoisted a marker check above the gate; this cannot.
     let (reg, d, _repo, gid) = gated_group("");
-    let group_dir = d.path().join(&gid);
+    let group_dir = d.path().join(gid.as_str());
     let bin = tempfile::tempdir().unwrap();
     let shim = shim_with_fake_gh(bin.path());
     let marker = |name: &str, on: bool| {
@@ -35983,7 +35998,7 @@ fn gh_shim_harness_executes_the_threshold_arm() {
     // The pure spec and its shell mirror can only be *known* to agree if both are
     // executed. Only `evaluate_merge_gate` exercised thresholds; this runs the shell.
     let (reg, d, _repo, gid) = gated_group("    require: threshold\n    threshold: 1\n");
-    let group_dir = d.path().join(&gid);
+    let group_dir = d.path().join(gid.as_str());
     let bin = tempfile::tempdir().unwrap();
     let shim = shim_with_fake_gh(bin.path());
     assert!(fs::read_to_string(group_dir.join("merge_gate")).unwrap().contains("require threshold 1"));
@@ -36026,7 +36041,7 @@ fn gh_shim_harness_refuses_a_truncated_or_malformed_gate_file() {
     // `reviewer`/`also` line makes the gate WEAKER, the one direction this design says
     // must never happen. (`|| [ -n "$g_k" ]` is the fix; this executes it.)
     let (reg, d, _repo, gid) = gated_group("");
-    let group_dir = d.path().join(&gid);
+    let group_dir = d.path().join(gid.as_str());
     let gate_file = group_dir.join("merge_gate");
     let bin = tempfile::tempdir().unwrap();
     let shim = shim_with_fake_gh(bin.path());
@@ -36103,7 +36118,7 @@ fn an_unknown_also_condition_refuses_the_merge_rather_than_passing_it() {
     // (`no-live-agents-on-pr` is #197 Scope A's other condition; this build does not
     // implement it, so it fails closed and says so — see doc/design/workflows.md.)
     let (reg, d, _repo, gid) = gated_group("    also: [no-live-agents-on-pr]\n");
-    let group_dir = d.path().join(&gid);
+    let group_dir = d.path().join(gid.as_str());
     let bin = tempfile::tempdir().unwrap();
     let shim = shim_with_fake_gh(bin.path());
     for block in ["rev-security", "rev-tests"] {
@@ -36143,7 +36158,7 @@ fn the_shim_refuses_a_merge_whose_body_moved_after_the_pass_when_the_repo_opts_i
     const EDITED: &str = "## Summary  \r\n\r\nFixes `$HOME` handling — see §6d.\r\n\r\n";
 
     let (reg, d, _repo, gid) = gated_group("    also: [body-unchanged]\n");
-    let group_dir = d.path().join(&gid);
+    let group_dir = d.path().join(gid.as_str());
     let bin = tempfile::tempdir().unwrap();
     let shim = shim_with_fake_gh(bin.path());
     reg.set_pr_body_override(Some(REVIEWED.into()));
@@ -36214,7 +36229,7 @@ fn a_body_edit_after_a_pass_merges_where_the_repo_never_declared_body_unchanged(
         return;
     }
     let (reg, d, _repo, gid) = gated_group("    also: [ci-green]\n");
-    let group_dir = d.path().join(&gid);
+    let group_dir = d.path().join(gid.as_str());
     let bin = tempfile::tempdir().unwrap();
     let shim = shim_with_fake_gh(bin.path());
     reg.set_pr_body_override(Some("the body they reviewed\n".into()));
@@ -36252,7 +36267,7 @@ fn a_hand_edited_verdict_word_is_read_the_same_way_by_both_halves_of_the_gate() 
     // orchestrator (list_verdicts / gate_status_line) while the shim refused the merge —
     // the two halves of one gate disagreeing about what a verdict is.
     let (reg, d, _repo, gid) = gated_group("");
-    let group_dir = d.path().join(&gid);
+    let group_dir = d.path().join(gid.as_str());
     let bin = tempfile::tempdir().unwrap();
     let shim = shim_with_fake_gh(bin.path());
 
@@ -36304,7 +36319,7 @@ fn a_group_with_no_workflow_gate_merges_exactly_as_it_did_before() {
     let (reg, d) = test_registry();
     let plain = tempfile::tempdir().unwrap(); // a repo with no .loomux/workflow.yml
     let g = reg.create_group(&plain.path().to_string_lossy(), rails()).unwrap();
-    let group_dir = d.path().join(&g.id);
+    let group_dir = d.path().join(g.id.as_str());
     assert!(!group_dir.join("merge_gate").is_file(), "no workflow → no gate file at all");
     let bin = tempfile::tempdir().unwrap();
     let shim = shim_with_fake_gh(bin.path());
@@ -36360,7 +36375,7 @@ fn notify_register_tick_fires_once_and_delists() {
     let listed = reg.list_notifications(&cw.agent_id).to_string();
     assert!(!listed.contains(&id), "a fired watch must be delisted, got: {listed}");
 
-    let log = fs::read_to_string(reg.state_root().join(&cw.group).join("audit.jsonl")).unwrap();
+    let log = fs::read_to_string(reg.state_root().join(cw.group.as_str()).join("audit.jsonl")).unwrap();
     assert!(log.contains("watch-fired"), "the fire must be audited, got: {log}");
     assert!(log.contains("SUCCESS"), "the audit must carry the summary, got: {log}");
 
@@ -36398,7 +36413,7 @@ fn notify_fire_with_heads(
     );
     assert_eq!(reg.notify_tick(now_ms(), &met), vec![id.to_string()], "the Met poll must fire");
 
-    fs::read_to_string(reg.state_root().join(&cw.group).join("audit.jsonl")).unwrap()
+    fs::read_to_string(reg.state_root().join(cw.group.as_str()).join("audit.jsonl")).unwrap()
 }
 
 #[test]
@@ -36461,7 +36476,7 @@ fn notify_fire_without_an_observed_head_is_unchanged() {
     met.insert(id.clone(), notify::PollResult::Met { summary: "completed — conclusion: success".into() }.into());
     assert_eq!(reg.notify_tick(now_ms(), &met), vec![id.clone()]);
 
-    let log = fs::read_to_string(reg.state_root().join(&cw.group).join("audit.jsonl")).unwrap();
+    let log = fs::read_to_string(reg.state_root().join(cw.group.as_str()).join("audit.jsonl")).unwrap();
     assert!(log.contains("watch-fired"), "got: {log}");
     assert!(!log.contains("Head at this poll"), "no observed head means no head clause, got: {log}");
     assert!(!log.contains("MOVED"), "and no move marker, got: {log}");
@@ -36492,7 +36507,7 @@ fn notify_conflicting_fires_distinct_notice_promptly_and_delists() {
     let listed = reg.list_notifications(&cw.agent_id).to_string();
     assert!(!listed.contains(&id), "a conflicting watch must be delisted, got: {listed}");
 
-    let log = fs::read_to_string(reg.state_root().join(&cw.group).join("audit.jsonl")).unwrap();
+    let log = fs::read_to_string(reg.state_root().join(cw.group.as_str()).join("audit.jsonl")).unwrap();
     assert!(log.contains("watch-conflicting"), "the conflict must be audited distinctly, got: {log}");
     assert!(!log.contains("watch-fired"), "must not be recorded as a standard fire, got: {log}");
     assert!(log.contains("PR #329 is CONFLICTING"), "the notice must name the PR and the conflict, got: {log}");
@@ -36532,7 +36547,7 @@ fn notify_expires_after_ttl_with_injected_now_and_tells_the_owner() {
     let listed = reg.list_notifications(&cw.agent_id).to_string();
     assert!(!listed.contains(&id), "an expired watch must be delisted, got: {listed}");
 
-    let log = fs::read_to_string(reg.state_root().join(&cw.group).join("audit.jsonl")).unwrap();
+    let log = fs::read_to_string(reg.state_root().join(cw.group.as_str()).join("audit.jsonl")).unwrap();
     assert!(log.contains("watch-expired"), "expiry must be audited, got: {log}");
 }
 
@@ -37314,7 +37329,7 @@ fn watchdog_suppresses_the_stall_notice_for_an_agent_holding_a_live_watch() {
         "a live watch must SUPPRESS the stall notice (#852), not merely annotate a delivered one"
     );
 
-    let log = fs::read_to_string(reg.state_root().join(&gid).join("audit.jsonl")).unwrap();
+    let log = fs::read_to_string(reg.state_root().join(gid.as_str()).join("audit.jsonl")).unwrap();
     assert!(
         !log.lines().any(|l| l.contains("watchdog-stall")),
         "no stall notice may be audited while the watch is live, got: {log}"
@@ -37324,7 +37339,7 @@ fn watchdog_suppresses_the_stall_notice_for_an_agent_holding_a_live_watch() {
         .find(|l| l.contains("watchdog-suppressed"))
         .unwrap_or_else(|| panic!("the suppression itself must still be audited (diagnosable), got: {log}"));
     assert!(suppressed_line.contains(&wid), "must name the agent, got: {suppressed_line}");
-    assert!(suppressed_line.contains(&watch.id), "must name the watch id, got: {suppressed_line}");
+    assert!(suppressed_line.contains(watch.id.as_str()), "must name the watch id, got: {suppressed_line}");
 }
 
 #[test]
@@ -37334,7 +37349,7 @@ fn watchdog_stall_audit_does_not_flag_a_watchless_agent() {
     let (reg, _d, gid, wid) = watchdog_setup(5);
     assert_eq!(reg.run_watchdog(FAR), vec![wid.clone()]);
 
-    let log = fs::read_to_string(reg.state_root().join(&gid).join("audit.jsonl")).unwrap();
+    let log = fs::read_to_string(reg.state_root().join(gid.as_str()).join("audit.jsonl")).unwrap();
     let stall_line = log.lines().find(|l| l.contains("watchdog-stall")).unwrap();
     assert!(
         stall_line.contains(&wid),
@@ -37366,17 +37381,17 @@ fn watchdog_suppression_does_not_bleed_across_agents_in_the_same_group() {
         "only the watchless agent may be notified; the watching one is suppressed, got: {flagged:?}"
     );
 
-    let log = fs::read_to_string(reg.state_root().join(&g.id).join("audit.jsonl")).unwrap();
+    let log = fs::read_to_string(reg.state_root().join(g.id.as_str()).join("audit.jsonl")).unwrap();
     assert!(
-        log.lines().any(|l| l.contains(&watching.id) && l.contains("watchdog-suppressed")),
+        log.lines().any(|l| l.contains(watching.id.as_str()) && l.contains("watchdog-suppressed")),
         "got: {log}"
     );
     assert!(
-        !log.lines().any(|l| l.contains(&watching.id) && l.contains("watchdog-stall")),
+        !log.lines().any(|l| l.contains(watching.id.as_str()) && l.contains("watchdog-stall")),
         "the watching agent must never get a watchdog-stall line, got: {log}"
     );
     assert!(
-        log.lines().any(|l| l.contains(&plain.id) && l.contains("watchdog-stall")),
+        log.lines().any(|l| l.contains(plain.id.as_str()) && l.contains("watchdog-stall")),
         "the watchless agent must still be flagged, got: {log}"
     );
 }
@@ -37389,14 +37404,14 @@ fn watchdog_earns_a_fresh_stall_window_once_the_suppressing_watch_resolves() {
 
     // Stall trips while the watch is live: suppressed, not notified.
     assert!(reg.run_watchdog(FAR).is_empty(), "must suppress while the watch is live");
-    let log = fs::read_to_string(reg.state_root().join(&gid).join("audit.jsonl")).unwrap();
+    let log = fs::read_to_string(reg.state_root().join(gid.as_str()).join("audit.jsonl")).unwrap();
     assert!(log.contains("watchdog-suppressed"), "sanity: must have suppressed, got: {log}");
 
     // The watch expires — purely time-based (`notify_tick`'s own seam, #243),
     // so FAR (far past any real deadline_ms) expires it regardless of the
     // real wall-clock `register_notification` used to compute that deadline.
     assert_eq!(reg.notify_tick(FAR, &HashMap::new()), vec![watch.id.clone()], "the watch must expire");
-    let log = fs::read_to_string(reg.state_root().join(&gid).join("audit.jsonl")).unwrap();
+    let log = fs::read_to_string(reg.state_root().join(gid.as_str()).join("audit.jsonl")).unwrap();
     assert!(log.contains("watch-expired"), "expiry must be audited, got: {log}");
 
     // The very next watchdog tick observes the watch is gone: it must hand
@@ -37420,7 +37435,7 @@ fn watchdog_earns_a_fresh_stall_window_once_the_suppressing_watch_resolves() {
         vec![wid.clone()],
         "silent through a full fresh window after the watch resolved is a real stall"
     );
-    let log = fs::read_to_string(reg.state_root().join(&gid).join("audit.jsonl")).unwrap();
+    let log = fs::read_to_string(reg.state_root().join(gid.as_str()).join("audit.jsonl")).unwrap();
     let stall_line = log.lines().rev().find(|l| l.contains("watchdog-stall")).unwrap();
     assert!(stall_line.contains(&wid), "got: {stall_line}");
 }
@@ -37445,7 +37460,7 @@ fn watchdog_message_activity_clears_the_suppression_latch_too() {
 
     // Stall trips while the watch is live: suppressed (both latches set).
     assert!(reg.run_watchdog(FAR).is_empty(), "must suppress while the watch is live");
-    let log = fs::read_to_string(reg.state_root().join(&g.id).join("audit.jsonl")).unwrap();
+    let log = fs::read_to_string(reg.state_root().join(g.id.as_str()).join("audit.jsonl")).unwrap();
     assert!(log.contains("watchdog-suppressed"), "sanity: must have suppressed, got: {log}");
 
     // A free-form message — a real sign of life, nothing to do with the
@@ -37490,7 +37505,7 @@ fn notify_mark_dead_drops_the_watch_with_no_delivery_attempt() {
     results.insert(id.clone(), notify::PollResult::Met { summary: "SUCCESS".into() }.into());
     assert!(reg.notify_tick(now_ms(), &results).is_empty(), "a dead agent's watch must never fire");
 
-    let log = fs::read_to_string(reg.state_root().join(&cw.group).join("audit.jsonl")).unwrap();
+    let log = fs::read_to_string(reg.state_root().join(cw.group.as_str()).join("audit.jsonl")).unwrap();
     assert!(log.contains("watch-cleanup"), "mark_dead must audit the watch cleanup, got: {log}");
     assert!(!log.contains("watch-fired"), "no delivery/fire may be attempted, got: {log}");
 }
@@ -37508,7 +37523,7 @@ fn notify_fail_streak_of_three_consecutive_failures_cancels_the_watch() {
     assert!(reg.list_notifications(&cw.agent_id).to_string().contains(&id), "must survive two failures");
 
     assert_eq!(reg.notify_tick(now_ms(), &fail), vec![id.clone()], "the third consecutive failure must cancel");
-    let log = fs::read_to_string(reg.state_root().join(&cw.group).join("audit.jsonl")).unwrap();
+    let log = fs::read_to_string(reg.state_root().join(cw.group.as_str()).join("audit.jsonl")).unwrap();
     assert!(log.contains("watch-failed"), "the cancellation must be audited, got: {log}");
     assert!(log.contains("gh-not-found"), "the audit must carry the reason, got: {log}");
 }
@@ -37896,7 +37911,7 @@ fn channel_status(reg: &OrchRegistry, c: &Caller) -> Value {
 
 /// Two orchestration groups (different repos/workspaces), each with one
 /// worker pane — the minimal cross-group setup every channel test needs.
-fn two_group_setup() -> (OrchRegistry, tempfile::TempDir, String, String, Caller, Caller) {
+fn two_group_setup() -> (OrchRegistry, tempfile::TempDir, GroupId, GroupId, Caller, Caller) {
     let (reg, dir) = test_registry();
     let g1 = reg.create_group("C:/tmp/repo-a", rails()).unwrap();
     let g2 = reg.create_group("C:/tmp/repo-b", rails()).unwrap();
@@ -38020,14 +38035,14 @@ fn delivery_held_event_names_the_pane_and_the_reason() {
     // and the two reasons must produce genuinely different copy — a badge
     // that always said "held" with no distinction would fail the issue's
     // "naming what's held and why" bar just as much as no badge at all.
-    let typing = delivery_held_event("w-1", "g-1", 7, HeldReason::Typing);
+    let typing = delivery_held_event("w-1", &parse_gid("g-1"), 7, HeldReason::Typing);
     assert_eq!(typing["agent_id"], json!("w-1"), "got: {typing}");
     assert_eq!(typing["group"], json!("g-1"), "got: {typing}");
     assert_eq!(typing["pty_id"], json!(7), "got: {typing}");
     assert_eq!(typing["reason"], json!("typing"), "got: {typing}");
     assert!(typing["detail"].as_str().unwrap().contains("w-1"), "got: {typing}");
 
-    let occupied = delivery_held_event("w-1", "g-1", 7, HeldReason::BoxOccupied);
+    let occupied = delivery_held_event("w-1", &parse_gid("g-1"), 7, HeldReason::BoxOccupied);
     assert_eq!(occupied["reason"], json!("box-occupied"), "got: {occupied}");
     assert_ne!(
         delivery_held_detail("w-1", HeldReason::Typing),
@@ -38037,7 +38052,7 @@ fn delivery_held_event_names_the_pane_and_the_reason() {
 
     // #420: a third hold reason for a live interactive question, distinct from
     // both of the above.
-    let question = delivery_held_event("w-1", "g-1", 7, HeldReason::InteractiveQuestion);
+    let question = delivery_held_event("w-1", &parse_gid("g-1"), 7, HeldReason::InteractiveQuestion);
     assert_eq!(question["reason"], json!("question"), "got: {question}");
     assert!(
         delivery_held_detail("w-1", HeldReason::InteractiveQuestion).to_lowercase().contains("question"),
@@ -38107,9 +38122,9 @@ fn interleaved_actives_get_the_lowest_gap() {
     // must fill the gap at 2, not append at 4.
     let ch2_id = ch2["id"].as_str().unwrap();
     let member = ch2["members"][0]["agent_id"].as_str().unwrap();
-    let member_group = ch2["members"][0]["group"].as_str().unwrap();
-    reg.disconnect_agent(member_group, member).unwrap();
-    assert!(reg.channel_for_pane(member_group, member).is_null());
+    let member_group = parse_gid(ch2["members"][0]["group"].as_str().unwrap());
+    reg.disconnect_agent(&member_group, member).unwrap();
+    assert!(reg.channel_for_pane(&member_group, member).is_null());
     let _ = ch2_id;
 
     let ch4 = connect_fresh_pair(&reg, "gap4");
@@ -38373,9 +38388,9 @@ fn spawn_solo(reg: &OrchRegistry, cli: &str, pty_id: u32) -> (String, String) {
 #[test]
 fn solo_group_is_registered_lazily_with_a_standalone_label() {
     let (reg, _d) = test_registry();
-    assert!(reg.group(SOLO_GROUP).is_none(), "must not exist before any solo pane");
+    assert!(reg.group(solo_group_id()).is_none(), "must not exist before any solo pane");
     reg.solo_prepare("claude", "C:/tmp/x", "x").unwrap();
-    let info = reg.group(SOLO_GROUP).unwrap();
+    let info = reg.group(solo_group_id()).unwrap();
     assert_eq!(info.repo, "(standalone)");
 }
 
@@ -38476,11 +38491,11 @@ fn solo_pane_connects_across_tiers_and_channel_send_works_both_directions_under_
     let cs = reg.resolve_token(&solo_token).unwrap();
 
     // The worker is the designated sender.
-    reg.connect_agents(&g.id, &w.id, SOLO_GROUP, &solo_id, &w.id).unwrap();
+    reg.connect_agents(&g.id, &w.id, solo_group_id(), &solo_id, &w.id).unwrap();
     let sent = channel_send(&reg, &cw, "hello solo").unwrap();
     assert!(sent.contains("1 peer"), "got: {sent}");
     assert!(reg
-        .audit_log(SOLO_GROUP)
+        .audit_log(solo_group_id())
         .iter()
         .any(|e| e.action == "channel-message" && e.detail["to"] == json!(solo_id)));
     assert!(reg
@@ -38516,15 +38531,15 @@ fn delivery_only_solo_pane_receives_but_can_never_send_or_become_sender() {
     assert!(reg.resolve_token("").is_none(), "an empty token must never resolve to a caller");
 
     // Designating it as sender at connect time is rejected outright.
-    let err = reg.connect_agents(&g.id, &w.id, SOLO_GROUP, &solo_id, &solo_id).unwrap_err();
+    let err = reg.connect_agents(&g.id, &w.id, solo_group_id(), &solo_id, &solo_id).unwrap_err();
     assert!(err.contains("no token"), "got: {err}");
     assert!(reg.channel_for_pane(&g.id, &w.id).is_null(), "a rejected connect must not create a channel");
 
     // Connect for real, worker as sender — the delivery-only pane is a receiver.
-    reg.connect_agents(&g.id, &w.id, SOLO_GROUP, &solo_id, &w.id).unwrap();
+    reg.connect_agents(&g.id, &w.id, solo_group_id(), &solo_id, &w.id).unwrap();
     channel_send(&reg, &cw, "for the delivery-only pane").unwrap();
     assert!(reg
-        .audit_log(SOLO_GROUP)
+        .audit_log(solo_group_id())
         .iter()
         .any(|e| e.action == "channel-message" && e.detail["to"] == json!(solo_id)));
 
@@ -38729,7 +38744,7 @@ fn set_sender_rejects_a_delivery_only_candidate_and_leaves_the_sender_unchanged(
     let prepared = reg.solo_prepare("codex", "C:/tmp/solo", "solo").unwrap();
     let solo_id = prepared["agent_id"].as_str().unwrap().to_string();
     reg.solo_bind(&solo_id, 802).unwrap();
-    let ch = reg.connect_agents(&g.id, &w.id, SOLO_GROUP, &solo_id, &w.id).unwrap();
+    let ch = reg.connect_agents(&g.id, &w.id, solo_group_id(), &solo_id, &w.id).unwrap();
     let chan_id = ch["id"].as_str().unwrap().to_string();
 
     let err = reg.set_sender(&chan_id, &solo_id).unwrap_err();
@@ -38771,7 +38786,7 @@ fn mark_dead_of_a_solo_pane_tears_the_channel_down_via_the_pty_exit_path() {
     let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
     let cw = reg.resolve_token(&w.token).unwrap();
     let (solo_id, _token) = spawn_solo(&reg, "claude", 901);
-    reg.connect_agents(&g.id, &w.id, SOLO_GROUP, &solo_id, &w.id).unwrap();
+    reg.connect_agents(&g.id, &w.id, solo_group_id(), &solo_id, &w.id).unwrap();
 
     // `mark_dead` is what the real `by_pty -> mark_dead` pty-exit path funnels
     // into (constraint 3: no real pty exit to trigger here).
@@ -39193,7 +39208,7 @@ fn advanced_orchestrator_toggle_persists_and_preserves_other_guardrails() {
         reg.set_port(45999);
         let g = reg.create_group(&repo_path, Guardrails { max_agents: 5, ..rails() }).unwrap();
         gid = g.id.clone();
-        path = reg.state_root().join(&g.id).join("group.json");
+        path = reg.state_root().join(g.id.as_str()).join("group.json");
         reg.set_advanced_orchestrator(&g.id, true, "human").unwrap();
     }
     let v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
@@ -39226,7 +39241,7 @@ fn advanced_orchestrator_toggle_is_a_noop_when_already_at_target() {
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
     reg.set_advanced_orchestrator(&g.id, false, "human").unwrap();
-    let log = fs::read_to_string(reg.state_root().join(&g.id).join("audit.jsonl")).unwrap_or_default();
+    let log = fs::read_to_string(reg.state_root().join(g.id.as_str()).join("audit.jsonl")).unwrap_or_default();
     assert!(!log.contains("advanced-orchestrator"), "already-off must not audit a no-op toggle");
 }
 
@@ -39237,7 +39252,7 @@ fn advanced_orchestrator_toggle_fails_soft_on_corrupt_group_file() {
     let g = reg.create_group(&repo.path().to_string_lossy(), rails()).unwrap();
     // A valid-JSON but non-object root (e.g. from corruption) must error rather
     // than panic on the in-place field assignment.
-    fs::write(reg.state_root().join(&g.id).join("group.json"), "null").unwrap();
+    fs::write(reg.state_root().join(g.id.as_str()).join("group.json"), "null").unwrap();
     let err = reg.set_advanced_orchestrator(&g.id, true, "human").unwrap_err();
     assert!(err.contains("not a JSON object"), "non-object root must fail soft, got: {err}");
     assert!(!reg.merge_gate_declared(&g.id), "a failed persist must never arm a gate");
@@ -39295,7 +39310,7 @@ fn workflow_status_recomputes_satisfiability_live_against_drifted_gate_state() {
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap(); // built-in 4-block roster
     fs::write(
-        reg.state_root().join(&g.id).join("merge_gate"),
+        reg.state_root().join(g.id.as_str()).join("merge_gate"),
         "require all-pass\nreviewer rev-orch\nreviewer rev-ui\nreviewer rev-tests\n",
     )
     .unwrap();
@@ -44003,7 +44018,7 @@ fn the_gh_poll_tick_drives_the_merge_queue_and_cuts_a_batch() {
     let (reg, d) = test_registry();
     let repo = repo_with_merge_queue("mq-driver-tick", true);
     let g = reg.create_group(repo.to_str().unwrap(), advanced_rails()).unwrap();
-    let gdir = d.path().join(&g.id);
+    let gdir = d.path().join(g.id.as_str());
 
     // The gate the queue re-enforces (§6) — the same `merge_gate` file the shim
     // reads, never a second opinion — and one live pass against the PR's head.
@@ -44085,7 +44100,7 @@ fn the_driver_tick_skips_every_group_that_never_queued_anything() {
     let (reg, d) = test_registry();
     let repo = repo_with_merge_queue("mq-driver-idle", true);
     let g = reg.create_group(repo.to_str().unwrap(), advanced_rails()).unwrap();
-    assert!(!d.path().join(&g.id).join("merge_queue.json").exists());
+    assert!(!d.path().join(g.id.as_str()).join("merge_queue.json").exists());
 
     // A runner that panics on any call: reaching it at all would be the defect.
     struct Never;
@@ -44127,7 +44142,7 @@ fn the_driver_tick_skips_a_group_whose_repo_did_not_opt_in() {
     let repo = repo_with_merge_queue("mq-driver-optout", true);
     let g = reg.create_group(repo.to_str().unwrap(), rails()).unwrap();
     fs::write(
-        d.path().join(&g.id).join("merge_queue.json"),
+        d.path().join(g.id.as_str()).join("merge_queue.json"),
         r#"{"version":1,"target":"integration","entries":[
              {"pr":612,"head":"aaaaaaa","state":"queued","enqueued_ms":0}]}"#,
     )
@@ -44751,7 +44766,7 @@ fn concurrent_solo_adopts_of_one_pty_mint_exactly_one_identity() {
     // One `solo-adopt` audit line per pty, and no more. The loser of the claim
     // returns before it audits, so this counts WINNERS — the direct observable
     // for "exactly one identity was minted per pane".
-    let adopted = audit_count(&reg, SOLO_GROUP, "solo-adopt");
+    let adopted = audit_count(&reg, solo_group_id(), "solo-adopt");
     assert_eq!(
         adopted, 40,
         "expected one adoption per pty across 40 ptys, got {adopted} — a second identity for one \
@@ -44782,7 +44797,7 @@ fn concurrent_solo_adopts_of_one_pty_mint_exactly_one_identity() {
 #[test]
 fn concurrent_consent_toggles_leave_the_marker_and_memory_agreeing() {
     let (reg, _d, gid, _oid) = autonomous_setup();
-    let marker = reg.state_root().join(&gid).join("auto_merge");
+    let marker = reg.state_root().join(gid.as_str()).join("auto_merge");
     let reg = std::sync::Arc::new(reg);
 
     for round in 0..200 {
@@ -44999,7 +45014,7 @@ fn repo_with_resources(tag: &str, body: &str) -> std::path::PathBuf {
 }
 
 /// A group on a repo declaring `body`, plus two worker callers.
-fn setup_locks(tag: &str, body: &str) -> (OrchRegistry, tempfile::TempDir, String, Caller, Caller) {
+fn setup_locks(tag: &str, body: &str) -> (OrchRegistry, tempfile::TempDir, GroupId, Caller, Caller) {
     let (reg, dir) = test_registry();
     let repo = repo_with_resources(tag, body);
     let g = reg.create_group(repo.to_str().unwrap(), lock_rails()).unwrap();
@@ -45034,7 +45049,7 @@ fn lock_tool_names(reg: &OrchRegistry, c: &Caller) -> Vec<String> {
         .collect()
 }
 
-fn lock_audit_actions(reg: &OrchRegistry, group: &str) -> Vec<String> {
+fn lock_audit_actions(reg: &OrchRegistry, group: &GroupId) -> Vec<String> {
     reg.audit_log(group).into_iter().map(|e| e.action).collect()
 }
 

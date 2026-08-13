@@ -578,7 +578,7 @@ orchestrator a value system to match its operational one:
 - **Review lanes.** The default reviewer covered correctness, tests, requirement fit, docs and
   style — and nothing on **trust boundaries**, **dependency hygiene** or **algorithmic cost**, in a
   repo where a bad dependency bricks the binary (`getrandom`/`ProcessPrng`) and a trust boundary
-  holds only because the webview is trusted (`group_id`). Added to `reviewer.md` **and**
+  held only because the webview was trusted (`group_id`; closed by #904). Added to `reviewer.md` **and**
   `mechanics_core(Reviewer)` in lockstep, for the reason the findings duty is: a `mode: replace`
   persona never reads `reviewer.md`, and a lane nobody was assigned is a lane no verdict reflects —
   the gate cannot tell "reviewed and clean" from "never looked at".
@@ -2186,7 +2186,7 @@ rejected, because it moves the trust boundary rather than automating inside it:
   poll command is invisible in that sense (it runs on the poller thread, not in any pane),
   unshimmed, and **outlives the agent's turn** — repeating, unattended, until cancelled or
   expired. "Agents can already run `gh`" is not a license for that.
-- It also contradicts CLAUDE.md constraint 6 (the backend trusts the webview, not agent
+- It also contradicted CLAUDE.md constraint 6 as it stood then (the backend trusted the webview, not agent
   input) and the add-orch-tool design norm ("guardrails in the platform, judgment in the
   prompt") — a caller-supplied command moves judgment about what's safe to run into the
   prompt, exactly backwards.
@@ -2380,8 +2380,8 @@ documented limitation, not an oversight.
   no code path to violate. Stated here rather than left as an unearned "tested" claim.
 - **Security**: no new execution capability (the only subprocess is `gh`, backend-owned
   argv); no `group_id`-as-path-segment exposure (the poll cwd is resolved from the caller's
-  **group**, which comes from the MCP token, never from an argument — constraint 6 is never
-  engaged); every GitHub-derived string and the agent's own `note` is sanitized
+  **group**, which comes from the MCP token, never from an argument — the group-id path
+  seam (#904) is never engaged); every GitHub-derived string and the agent's own `note` is sanitized
   (`sanitize_gh_text`) before it enters a notice: control characters (including newlines) are
   stripped so an embedded newline can't forge a second `[loomux] …`-prefixed line that reads
   as its own, separate notice, AND `[`/`]` are mapped to `(`/`)` so the literal token
@@ -10618,7 +10618,7 @@ save-to-file + reference approach degrades gracefully (worst case the human sees
       and persist past send until the group-end sweep) — has no server-side batch to enforce it
       against. So it lives where the batch exists.
     - A **membership guard** on the backend refuses a save for any group id that isn't a known,
-      created group (the dir is `root.join(group)`), pinning `group_id` to a real group token.
+      created group (the dir is built by `group_dir_at` from a validated `GroupId`, #904), pinning `group_id` to a real group token.
   The save is audited (`attachment-save`, actor `human`).
 - *Cleanup policy.* Attachments are a per-group **scratch** dir with a deliberately cheap
   policy: nothing is deleted per-image (a removed chip or an abandoned draft just leaves its

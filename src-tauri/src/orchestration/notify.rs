@@ -97,7 +97,10 @@ impl Condition {
 #[derive(Clone, Debug)]
 pub struct Watch {
     pub id: String,
-    pub group: String,
+    /// #904: validated — a watch is registered from an agent-supplied
+    /// request but the group comes off the caller's own registry record, and
+    /// the fired notice audits against it (`self.audit(&w.group, ...)`).
+    pub group: super::GroupId,
     pub agent: String,
     pub condition: Condition,
     /// Echoed back (sanitized) in the fired/expired notice, so the agent
@@ -237,7 +240,7 @@ pub fn watch_expired(deadline_ms: u64, now_ms: u64) -> bool {
 /// Pure — this is the whole selection policy behind the `gh`-process DoS
 /// backstop, lifted out of `OrchRegistry::poll_watches` so it is
 /// unit-testable with no `gh`, no lock, and no registry.
-pub fn due_watches(now: u64, watches: &HashMap<String, Watch>, paused: &HashSet<String>) -> Vec<String> {
+pub fn due_watches(now: u64, watches: &HashMap<String, Watch>, paused: &HashSet<super::GroupId>) -> Vec<String> {
     let interval_ms = NOTIFY_POLL_INTERVAL.as_millis() as u64;
     let mut due: Vec<&Watch> = watches
         .values()
@@ -1154,7 +1157,7 @@ mod tests {
     fn watch(id: &str, group: &str, last_poll_ms: u64) -> Watch {
         Watch {
             id: id.to_string(),
-            group: group.to_string(),
+            group: super::super::GroupId::parse(group).unwrap(),
             agent: format!("agent-of-{group}"),
             condition: Condition::PrChecks { pr: 1 },
             note: String::new(),
@@ -1221,7 +1224,7 @@ mod tests {
         w.insert("n-paused".to_string(), watch("n-paused", "paused-group", 0));
         w.insert("n-live".to_string(), watch("n-live", "live-group", 0));
         let mut paused = HashSet::new();
-        paused.insert("paused-group".to_string());
+        paused.insert(super::super::GroupId::parse("paused-group").unwrap());
         let due = due_watches(1_000_000, &w, &paused);
         assert_eq!(due, vec!["n-live".to_string()], "a paused group's watch must never be selected for polling");
     }
