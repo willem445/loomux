@@ -121,9 +121,11 @@ compiles.
 - Backend: unit tests inline under `#[cfg(test)]` only if they don't link the
   full lib; otherwise integration tests (constraint 4). Orchestration logic is
   covered in `src-tauri/tests/orchestration.rs`.
-- **An edit to `src-tauri/src/orchestration/templates/*.md` re-blesses
+- **An edit to a role template (`orchestrator|worker|reviewer|planner.md` under
+  `src-tauri/src/orchestration/templates/`) re-blesses
   `src-tauri/tests/fixtures/pre222/` in the same commit** — the fixtures pin those
-  templates byte-for-byte. Signature: `a_workflow_placeholder_must_sit_at_the_end_of_a_line_it_shares`
+  four templates byte-for-byte (`block.md`/`workflow.md` are deliberately not
+  fixture-pinned). Signature: `a_workflow_placeholder_must_sit_at_the_end_of_a_line_it_shares`
   and `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was` go red
   alone, on a round where nothing else moved. Procedure and re-bless log:
   `src-tauri/tests/fixtures/pre222/README.md` (#867, #868, #874).
