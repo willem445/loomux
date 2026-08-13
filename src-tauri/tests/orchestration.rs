@@ -45705,10 +45705,26 @@ fn ending_a_group_releases_and_records_the_locks_its_agents_held() {
 //  h5-h7  the bounded last-resort override, for a false positive shaped in a way
 //         nobody has characterized yet.
 
+/// A fixture's bytes as a pty would actually have emitted them: CRLF, always.
+///
+/// **This is not tidying — it is the difference between a screen and a
+/// staircase, and it is platform-dependent.** `painted()`'s doc states the rule
+/// for synthetic fixtures: a bare LF is an INDEX (down one row, column
+/// untouched), so text written with LFs marches rightward across the grid and
+/// composes into something no terminal would ever show. A file-backed fixture is
+/// subject to the same rule *and* to `core.autocrlf`, which normalizes these
+/// files to LF in the git blob — so `include_str!` hands a Windows checkout CRLF
+/// and a Linux one bare LF, and the same test composes two different screens.
+/// It cost this PR a CI round: h1's rendered-precondition passed on Windows and
+/// failed on ubuntu/macos with the fixture's own text shredded across columns.
+fn pty_bytes_903(fixture: &str) -> Vec<u8> {
+    fixture.replace("\r\n", "\n").replace('\n', "\r\n").into_bytes()
+}
+
 /// The composed screen of a #903 fixture, at the geometry #727's tests use.
 fn composed_903(fixture: &str) -> String {
     trustworthy_composition(loomux_lib::orchestration::termgrid::render_visible(
-        fixture.as_bytes(),
+        &pty_bytes_903(fixture),
         100,
         12,
     ))
@@ -45756,7 +45772,7 @@ fn h1_the_repro_screens_match_the_detector_and_release_anyway() {
 
         // End to end, through the production predicate, on both readings taken
         // from the one raw stream exactly as `question_sample` takes them.
-        let raw = fixture.as_bytes().to_vec();
+        let raw = pty_bytes_903(fixture);
         let pred = question_hold_predicate_sampled(
             move || sample_from_raw(&raw, 100, 12),
             None,
@@ -45826,7 +45842,7 @@ fn h3_every_real_dialog_still_holds_and_none_of_them_reads_as_idle() {
             "{name}: a screen with a dialog on it must never read as an idle composer: \
              {visible:?}"
         );
-        let raw = fixture.as_bytes().to_vec();
+        let raw = pty_bytes_903(fixture);
         let pred = question_hold_predicate_sampled(
             move || sample_from_raw(&raw, 100, 12),
             None,
