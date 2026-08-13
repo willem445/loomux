@@ -742,6 +742,14 @@ export class Pane implements VoiceTargetPane {
    *  still offers the same restore next boot. Null for any live/welcome pane. */
   private dormantEl: HTMLElement | null = null;
   private dormantRecord: PersistedPane | null = null;
+  /** The Reconnect card floating over a DISCONNECTED ssh pane's terminal (#887
+   *  S4), or null. Distinct from `dormantEl` above in the one way that matters:
+   *  the terminal underneath stays mounted and readable, because the bytes it is
+   *  holding — "Connection to host closed", a timeout, a rejected key — are the
+   *  explanation for the card being there at all. It is chrome floating over the
+   *  pane, never a layout change: nothing here resizes the terminal or the ConPTY
+   *  (CLAUDE.md constraint 1). */
+  private reconnectEl: HTMLElement | null = null;
   /** CONTENT pane (#214 files, #217 editor + git): the pane's permanent content is a
    *  view — the file manager, the file editor, or the git view — rooted at
    *  `contentRoot`. No terminal is ever opened and no PTY ever spawns (the
@@ -1661,6 +1669,11 @@ export class Pane implements VoiceTargetPane {
     // describe the orchestrator it wants, not the pane it is rewriting.
     this.refuseSshOrchestration(opts);
     if (opts.ssh) this.sshProfileId = opts.ssh.profileId;
+    // #887 S4: this pane is coming back to life, so any floating Reconnect card
+    // is stale by definition — dropped here rather than at the (several) call
+    // sites, so no future relaunch path can forget it and leave a card offering
+    // to reconnect a pane that just did.
+    this.clearReconnectCard();
     this.exited = false;
     this.ptyId = null;
     if (opts.name) this.setName(opts.name);
@@ -2037,6 +2050,32 @@ export class Pane implements VoiceTargetPane {
   /** True while this pane is a dormant restore placeholder (no PTY yet). */
   get isDormant(): boolean {
     return this.dormantEl !== null;
+  }
+
+  /** Float a card over this pane's still-mounted terminal (#887 S4) — the
+   *  Reconnect offer on an ssh pane whose connection dropped. Returns a
+   *  disposer; mounting a second card replaces the first, so a pane can never
+   *  accumulate them (a reconnect that itself drops re-offers exactly one).
+   *
+   *  Deliberately additive-only: no fit, no resize, no reflow. The card is
+   *  positioned over the terminal by CSS, so the ConPTY never learns it exists
+   *  and the scrollback under it is untouched (CLAUDE.md constraint 1). */
+  showReconnectCard(el: HTMLElement): () => void {
+    this.clearReconnectCard();
+    const wrap = document.createElement("div");
+    wrap.className = "pane-reconnect";
+    wrap.appendChild(el);
+    this.reconnectEl = wrap;
+    this.el.appendChild(wrap);
+    return () => this.clearReconnectCard();
+  }
+
+  /** Remove the floating Reconnect card, if one is up. Idempotent — called both
+   *  by the disposer above and unconditionally by `respawnFresh`, so a pane that
+   *  comes back to life can never keep offering to reconnect. */
+  private clearReconnectCard(): void {
+    this.reconnectEl?.remove();
+    this.reconnectEl = null;
   }
 
   /** The kind of a dormant placeholder ("agent" | "orch"), or null when not
@@ -3783,14 +3822,6 @@ export class Pane implements VoiceTargetPane {
    *  panerestore.ts decides what each record becomes on restore. */
   capture(): PersistedPane | null {
     if (this.isWelcome) return null;
-    // An SSH pane has no persisted kind YET (#887 S4 adds `paneKind: "ssh"` plus
-    // the profile id and the reconnect policy). Until it does, this returns null
-    // — the pane is simply absent from the restored layout — rather than letting
-    // `liveKind()` classify it: it launched no `command`, so it would persist as
-    // a plain TERMINAL and come back next boot as a local PowerShell wearing the
-    // remote host's name. Dropping a pane is recoverable and legible; restoring
-    // the wrong process under the right title is neither.
-    if (this.isSshPane) return null;
     // A dormant restore placeholder persists exactly as it came in, so a session
     // closed without resuming offers the identical restore next boot.
     if (this.dormantRecord) return { ...this.dormantRecord };
@@ -3798,13 +3829,23 @@ export class Pane implements VoiceTargetPane {
     return {
       paneKind: kind,
       name: this.name,
-      cwd: this.cwdRaw,
+      // An SSH pane records NO cwd (#887 S4). Its local working directory is
+      // deliberately home (the repo is on the far end and no local path stands
+      // for it — plan part 4a), and its remote directory is the profile's, not a
+      // field of this record. A captured local cwd could only ever be a folder
+      // the human never picked, restored into a pane that hides it.
+      cwd: kind === "ssh" ? null : this.cwdRaw,
       command: kind === "agent" ? this.spawnCommand : null,
       argv: kind === "agent" ? this.spawnArgv : null,
       shellKind: kind === "terminal" ? this.spawnShellKind : null,
       // Capture the session id for orch panes too (#194.5) so a group resume
       // restores exactly the captured members from their own recorded sessions.
-      sessionId: kind === "agent" || kind === "orch" ? this.agentSessionId : null,
+      // …and for an SSH pane (#887 S4), where it is the id loomux minted for a
+      // REMOTE claude — the one session mechanism that survives the trip through
+      // ssh, because it travels on the command line rather than in a local store
+      // (`sshMintsSessionId`). A remote copilot/opencode pane captures null here
+      // and reconnects to a fresh conversation, honestly.
+      sessionId: kind === "agent" || kind === "orch" || kind === "ssh" ? this.agentSessionId : null,
       // The orchestration role distinguishes the orchestrator from its delegates.
       role: kind === "orch" ? this.orchRoleName : null,
       // …and the group says WHICH group's orchestrator/delegate it is (#485).
@@ -3824,6 +3865,11 @@ export class Pane implements VoiceTargetPane {
           : kind === "workflow"
             ? this.workflowPaneView?.openPathRel ?? null
             : null,
+      // The saved CONNECTION an ssh pane belongs to (#887 S4) — the whole of what
+      // a reconnect needs, alongside the session id above. Not a command line:
+      // see `PersistedPane.sshProfileId` for why the profile is what gets
+      // re-derived and a captured argv would be actively wrong to replay.
+      sshProfileId: kind === "ssh" ? this.sshProfileId : null,
       // Every view CURRENTLY docked (#361), and at what side + share of the
       // split — up to three entries, one per occupied slot. Empty = nothing
       // embedded — every view opens as its floating overlay (the default).
@@ -3858,12 +3904,20 @@ export class Pane implements VoiceTargetPane {
   }
 
   /** This pane's persisted kind from its live launch state: a CONTENT kind (#214/#217,
-   *  no PTY at all) > orch (any orchestration role) > agent (launched a command) >
-   *  plain terminal. `capture()`'s per-kind ternaries above then null every field a
-   *  content pane doesn't have (command, argv, shellKind, sessionId, role), leaving
-   *  exactly {paneKind, name, cwd:=root} — all it needs to come back. */
+   *  no PTY at all) > ssh (#887) > orch (any orchestration role) > agent (launched a
+   *  command) > plain terminal. `capture()`'s per-kind ternaries above then null every
+   *  field a content pane doesn't have (command, argv, shellKind, sessionId, role),
+   *  leaving exactly {paneKind, name, cwd:=root} — all it needs to come back.
+   *
+   *  ssh outranks the two below it because it is the only one of the three that a
+   *  FALLTHROUGH would get silently wrong: an ssh pane launches an argv rather than
+   *  a command string, so `launchedCommand` is false for it and it would persist as
+   *  a plain TERMINAL — coming back next boot as a local PowerShell wearing the
+   *  remote host's name. (It can never be `orch` — that combination is refused
+   *  before any process starts — so the ordering against that arm is belt only.) */
   private liveKind(): PersistedPaneKind {
     if (this.contentKind !== null) return this.contentKind;
+    if (this.isSshPane) return "ssh";
     return this.orchGroup ? "orch" : this.launchedCommand ? "agent" : "terminal";
   }
 
@@ -4036,6 +4090,11 @@ export class Pane implements VoiceTargetPane {
   keepOpenOnExit(exit: ExitInfo): KeepOpenReason | null {
     return keepOpenOnExit({
       launchedCommand: this.launchedCommand,
+      // #887 S4: an ssh pane is argv-spawned, so `launchedCommand` is false for
+      // it — without this the pane would vanish the instant the link dropped,
+      // taking the scrollback that says why with it. See the field's own comment
+      // in dirtystate.ts.
+      isSshPane: this.isSshPane,
       exit,
       hasUnsavedWork: this.hasUnsavedWork(),
     });

@@ -17,12 +17,20 @@ import {
   guardAppClose,
   recordCopilotLaunchPosture,
   recordClaudeLaunchPosture,
+  discoverSsh,
+  loadSshProfiles,
   type PtyExit,
   type SessionInfo,
 } from "./pty";
 import { decodeSettings, encodeSettings, setSettings, DEFAULT_SETTINGS } from "./settings";
 import { modal, confirmModal } from "./modal";
-import { SubmitLatch } from "./panesetup";
+import {
+  SubmitLatch,
+  sshReconnectArgv,
+  SSH_NO_CLIENT,
+  SSH_PROFILE_GONE,
+} from "./panesetup";
+import { decodeSshProfiles } from "./sshprofile";
 import {
   dirtyBuffers,
   dirtyBufferLines,
@@ -676,6 +684,7 @@ async function openActionPane(
         role: null,
         groupId: null, // an agent pane belongs to no orchestration group (#485)
         file: null,
+        sshProfileId: null, // …nor to an SSH connection (#887 S4)
         embeds: [],
       };
       let pane: Pane;
@@ -790,6 +799,56 @@ async function openActionPane(
       }
       return pane;
     }
+    case "dormant-ssh": {
+      // An SSH pane comes back as a card, never as a connection (#887 S4): the
+      // far end is an agent CLI on someone else's machine (remote credits, no
+      // human present) and a host that is down or behind a VPN would otherwise
+      // put a TCP connect on the boot path. One click, then it connects.
+      const record: PersistedPane = {
+        paneKind: "ssh",
+        name: a.name,
+        cwd: null,
+        command: null,
+        argv: null,
+        shellKind: null,
+        sessionId: a.sessionId,
+        // The #887/#888 boundary, restated where the placeholder is built: an
+        // SSH pane is never an orchestration member, so this record carries no
+        // role, no group, and no docked orchestration views. The restore ACTION
+        // has no field to carry one either (panerestore.ts) — this is the second
+        // half of the same guarantee, at the only other place a record is made.
+        role: null,
+        groupId: null,
+        file: null,
+        sshProfileId: a.profileId,
+        embeds: [],
+      };
+      let pane: Pane;
+      const content = dormantCard({
+        action: "Reconnect",
+        pendingLabel: "Connecting…",
+        errorTitle: "Couldn't reconnect",
+        title: a.name,
+        body: "SSH connection — dormant. Reconnect opens it again, resuming the remote session when one was recorded.",
+        // A profile-less record can never reconnect, and it can say so at MOUNT
+        // time rather than making the human click to find out — the same
+        // already-know-it-has-nothing case the dormant-agent card uses `initial`
+        // for.
+        initial: a.profileId ? undefined : errorRestoreCardState(SSH_PROFILE_GONE),
+        onClick: () =>
+          reconnectSshPane(a.profileId, a.sessionId, async (argv, sessionId, profileId) => {
+            await pane.startFromDormant({
+              name: a.name,
+              argv,
+              sessionId: sessionId ?? undefined,
+              ssh: { profileId },
+            });
+            onGridChanged();
+          }),
+      });
+      pane = ws.grid.openDormantPane(events, record, content, dir, anchor);
+      return pane;
+    }
     case "open-files":
     case "open-editor":
     case "open-workflow": {
@@ -889,6 +948,9 @@ async function openActionPane(
         // this placeholder's own group, not whatever group the tab is bound to.
         groupId: a.groupId,
         file: null,
+        // An orchestration pane is never an SSH pane — the #887/#888 boundary
+        // refuses that combination before any process starts.
+        sshProfileId: null,
         // The docked-view preferences (#361) ride along too, so re-capturing
         // a still-dormant tab (Resume never clicked) reproduces them byte
         // for byte, and resumeDormantGroup can reapply them once the pane
@@ -1066,6 +1128,63 @@ function addDormantCardAction(
   btn.title = tooltip;
   btn.addEventListener("click", () => onClick(btn));
   card.appendChild(btn);
+}
+
+/** Reconnect one SSH pane — the shared body of BOTH reconnect affordances (#887
+ *  S4): the dormant card a restored pane mounts, and the card that floats over a
+ *  pane whose connection dropped mid-session. One implementation, because the
+ *  two must not be able to reconnect differently; the caller supplies only how
+ *  the pane itself is (re)started, which is the one thing that genuinely differs
+ *  (a dormant placeholder has no terminal yet; a disconnected pane has one, full
+ *  of the output explaining why it is here).
+ *
+ *  Everything is resolved AT CLICK TIME, deliberately:
+ *   - the local ssh client is re-probed, so a machine that has gained (or lost)
+ *     one since boot is answered honestly rather than from a stale capture;
+ *   - the PROFILE is re-read from `sshprofiles.json`, so an edited connection
+ *     reconnects with the edit and a deleted one reconnects with nothing. That
+ *     is the contract `SshProfile.id` states: a pane records the connection, not
+ *     its contents.
+ *
+ *  Every failure returns a card-renderable message rather than throwing, so a
+ *  reconnect that cannot happen says which of the three reasons it is — no
+ *  client, no such connection, or a value the argv builder refuses — instead of
+ *  landing on a spinner or a bare stack string. */
+async function reconnectSshPane(
+  profileId: string | null,
+  recordedSessionId: string | null,
+  launch: (argv: string[], sessionId: string | null, profileId: string) => Promise<void>
+): Promise<RestoreCardResult> {
+  if (!profileId) return { ok: false, message: SSH_PROFILE_GONE };
+  const program = await discoverSsh().catch(() => null);
+  if (!program) return { ok: false, message: SSH_NO_CLIENT };
+  let profile;
+  try {
+    profile = decodeSshProfiles(await loadSshProfiles())?.profiles.find((p) => p.id === profileId);
+  } catch (err) {
+    // A store we could not READ is not a store that says the connection is gone
+    // — it is a different failure and it names itself, so the human can tell a
+    // deleted profile from an unreadable file.
+    return { ok: false, message: `Could not read your saved SSH connections: ${String(err)}` };
+  }
+  if (!profile) return { ok: false, message: SSH_PROFILE_GONE };
+  let plan;
+  try {
+    // Web Crypto — the webview's, never a getrandom crate (constraint 2 governs
+    // the Rust graph); the same mint the launch form makes for a fresh connect.
+    plan = sshReconnectArgv(program, profile, recordedSessionId, () => crypto.randomUUID());
+  } catch (err) {
+    // The one refusal the builder raises: a remote-command token cmd.exe cannot
+    // be handed safely (a newline, a trailing backslash). A fixable data problem
+    // in the saved connection, so it is shown as one.
+    return { ok: false, message: String(err instanceof Error ? err.message : err) };
+  }
+  try {
+    await launch(plan.argv, plan.sessionId, profile.id);
+  } catch (err) {
+    return { ok: false, message: String(err) };
+  }
+  return { ok: true };
 }
 
 /** Groups with a resume in flight (#194 P4). A restored group tab renders one
@@ -1677,7 +1796,56 @@ function closeOrKeep(ws: Workspace, pane: Pane, exit: PtyExit, keep: KeepOpenRea
   if (keep) {
     pane.notifyExited(exit.exit_code, keep);
     onGridChanged(); // a kept-open pane is now dead → drop it from the live count
+    offerSshReconnect(pane);
   } else ws.grid.closePane(pane, false);
+}
+
+/** Float a Reconnect card over an SSH pane whose connection just dropped (#887
+ *  S4). A no-op for every other pane, and for an ssh pane that is being closed
+ *  rather than kept — the caller has already applied `keepOpenOnExit`, whose ssh
+ *  arm keeps exactly the unexpected non-zero exits (a dropped link, a refused
+ *  auth) and lets a clean remote logout close as it always did.
+ *
+ *  Deliberately human-driven, not automatic (plan part 4b): a surprise
+ *  reconnect re-enters a remote TUI in a state nobody looked at, and the pane
+ *  underneath is where the evidence of what happened is. The card floats over
+ *  that terminal rather than replacing it, so the human reads the reason and
+ *  then decides. */
+function offerSshReconnect(pane: Pane): void {
+  if (!pane.isSshPane) return;
+  const profileId = pane.sshProfile;
+  const sessionId = pane.sessionId;
+  // Assigned by the mount below; the click that reads it cannot happen before
+  // the card is on screen.
+  let dismiss: () => void = () => {};
+  const card = dormantCard({
+    action: "Reconnect",
+    pendingLabel: "Connecting…",
+    errorTitle: "Couldn't reconnect",
+    title: pane.name,
+    body: "The SSH connection closed. Reconnect opens it again, resuming the remote session when one was recorded.",
+    onClick: () =>
+      reconnectSshPane(profileId, sessionId, async (argv, sessionId, profileId) => {
+        // In place, in the same pane: `respawnFresh` wipes the dead session's
+        // output, clears this very card, and starts the new ssh client on the
+        // terminal that is already mounted.
+        await pane.respawnFresh({
+          name: pane.name,
+          argv,
+          sessionId: sessionId ?? undefined,
+          ssh: { profileId },
+        });
+        onGridChanged();
+      }),
+  });
+  // A pane the human would rather just read (or close) shouldn't have to keep a
+  // card over it. Dismiss removes the OFFER, not the pane — the scrollback,
+  // which is the thing worth keeping, is untouched either way, and closing the
+  // pane stays Ctrl+Shift+W exactly as the exit banner says.
+  addDormantCardAction(card, "Dismiss", "Hide this offer — the pane and its output stay", () =>
+    dismiss()
+  );
+  dismiss = pane.showReconnectCard(card);
 }
 
 function reapIfExited(ws: Workspace, pane: Pane): void {
