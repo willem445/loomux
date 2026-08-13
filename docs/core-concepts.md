@@ -293,7 +293,8 @@ be rearranged in place:
   - drop on the **middle** to *swap* the two panes, or
   - drop on an **edge** (left/right/top/bottom half) to move the pane there,
     splitting the target — which, like any split, hands over half of *that*
-    pane's space and leaves the rest of the layout alone.
+    pane's space. (Dragging a pane *out* of a row re-shares that row's space
+    among the panes left behind.)
 
   Release to drop, or press `Esc` to cancel. Swapping two equally-sized slots
   never resizes their terminals, so no scrollback is disturbed.
