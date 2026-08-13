@@ -834,7 +834,14 @@ async function killAndAwaitExit(ptyId: number): Promise<void> {
     if (e.id === ptyId) seen();
   });
   try {
-    await killPty(ptyId);
+    // A kill that rejects is not a reason to abandon the promotion: the usual
+    // cause is a process that has already gone (the id is stale), which is the
+    // state the wait below is trying to reach anyway. Proceeding leaves the
+    // recovery paths in relaunchPaneAsOrchestrator to catch a genuinely stuck
+    // process; throwing here would strand the pane with no toast at all.
+    await killPty(ptyId).catch((err) => {
+      console.warn(`[loomux] promote: killing pty ${ptyId} failed (${String(err)}) — continuing`);
+    });
     if ((await withDeadline(exited, PROMOTE_EXIT_WAIT_MS)) === "timeout") {
       console.warn(`[loomux] promote: pty ${ptyId} did not report an exit within ${PROMOTE_EXIT_WAIT_MS}ms — resuming anyway`);
     }
@@ -957,7 +964,16 @@ async function promotePaneToOrchestrator(
   if (pane.channelId && action.soloAgentId) {
     await channelDisconnect(SOLO_GROUP, action.soloAgentId).catch(() => {});
   }
-  await relaunchPaneAsOrchestrator(pane, req, action.sessionId);
+  try {
+    await relaunchPaneAsOrchestrator(pane, req, action.sessionId);
+  } catch (err) {
+    // Past this point the old process is gone and the group exists, so there is
+    // no failure mode left where saying nothing is acceptable — including one
+    // nobody predicted. Every anticipated failure toasts inside the relaunch;
+    // this is the backstop for the rest.
+    console.error("[loomux] promote: relaunch failed", err);
+    showToast(promoteRecoveryNote(req.group_id, "spawn"), "error");
+  }
 }
 
 /** Best-effort rehydration of a pane's channel chip right after it (re)opens
