@@ -19653,7 +19653,9 @@ fn run_queue_drainer(
             // keeps showing an empty input prompt is not a question — it is the
             // detector being wrong about a pane nobody is being asked anything
             // by, and the human has already been badged about it for five
-            // minutes (`QUESTION_HOLD_STALE_AFTER`). Deliver.
+            // minutes (`QUESTION_HOLD_STALE_AFTER`). Paste — and only paste: the
+            // pre-Enter checkpoint below is not overridden, so a genuinely live
+            // dialog still gets the Enter withheld.
             //
             // The chip is NOT lowered here: the pane is still held as far as
             // every gate is concerned, and a successful delivery lowers it below
@@ -22024,7 +22026,12 @@ pub fn hold_bound_elapsed(held_since_ms: u64, now_ms: u64, bound_ms: u64) -> boo
 }
 
 /// #903: how long a pane's delivery may be held by the QUESTION gate alone
-/// before loomux stops believing its own detector and delivers anyway.
+/// before loomux stops believing its own detector and **pastes** anyway.
+///
+/// Pastes, not delivers, and the distinction is the override's whole safety
+/// argument rather than a nicety: the pre-Enter checkpoint is not overridden, so
+/// on a genuinely live dialog the Enter is still withheld and the brief is left
+/// in the box for a human. See [`question_override_admits`].
 ///
 /// **Sized between the two clocks that already exist**, which is the whole of
 /// the choice: longer than [`QUESTION_HOLD_STALE_AFTER`] (10 min), so the human

@@ -7198,10 +7198,17 @@ issue is about. The pointer has no such problem (a glyph leading content is not 
 produces) and keeps its whole-screen reach.
 
 So the split is #40's, not a new invention: **pointer whole-screen, tokens
-[`MENU_TOKEN_TAIL_ROWS`] bottom rows.** `h13`'s dialog sits directly above the composer, well inside
-that window, so the reverse-video safety case above survives unchanged — and the override's reachable
-set shrinks to genuine near-composer menu structure, which is what `docs/orchestration.md` already
-described.
+[`MENU_TOKEN_TAIL_ROWS`] bottom rows.** `h13`'s dialog sits directly above the composer, and its
+footer lands in the **last slot that window reaches — inside, with zero margin**: four rows up, on a
+screen whose remaining three are the dialog's closing border, a one-row composer and one row of
+chrome. So the reverse-video safety case above survives, but it survives *exactly*, not comfortably.
+One more row between the footer and the screen bottom — a second chrome line, or a composer holding
+two rows instead of one — and it falls out. That is the same fact the constant's own doc and the
+Limits bullet below state; anything here implying headroom would be the one of the three that is
+wrong. The gain is real and the margin is nil, and both halves have to be said together.
+
+The override's reachable set also shrinks to genuine near-composer menu structure, which is what
+`docs/orchestration.md` already described.
 
 Two details the change turns on:
 
@@ -7347,15 +7354,26 @@ absolute is untouched — a human's own typed line is never overridden, at any a
   that pane class before this PR either — and `h12` pins it, with an assertion that fails if the mask
   ever *starts* claiming those rows so the limit gets deleted rather than quietly outliving its
   cause.
-- **A dialog footer can fall out of the token window above a MULTI-row composer.** `MENU_TOKEN_TAIL_
-  ROWS` is four, and a composer holding a multi-row paste consumes those slots, so a footer sitting
-  above it can drop out of reach. The pointer clause is unwindowed and still catches every dialog
-  that paints a pointer at content — every capture in the suite except the reverse-video
-  `AskUserQuestion`, which is the one shape this residual is about. The refinement that would close
-  it is a window measured from the **composer's own top row** rather than from the screen bottom, and
-  it is not taken here for a concrete reason rather than for scope: on the masked view the composer's
-  rows are exactly what is missing, so there is no top row to measure from without threading a third
-  view through. Named here so the next reader starts from the reason and not from the number.
+- **A dialog footer can escape the token read, by either of TWO routes.** `MENU_TOKEN_TAIL_ROWS` is
+  four, and `h13` already spends the last of those four (see above), so the margin is nil in both
+  directions:
+  - **Vertically** — a composer holding a multi-row paste consumes window slots, so a footer sitting
+    above it drops out of reach.
+  - **Horizontally** — a footer that WRAPS in a narrow pane is two rows, neither of which contains
+    the whole token, and the read is row-wise. That is the price of the row-wise choice, taken
+    deliberately: flattening would catch the wrapped footer but would also manufacture `enter to
+    select` out of two unrelated lines, and inventing evidence that keeps a pane wedged is the
+    failure this issue *is*. Worth re-reading together, because the two clauses trade against each
+    other rather than stacking.
+
+  The pointer clause is unwindowed and still catches every dialog that paints a pointer at content —
+  every capture in the suite except the reverse-video `AskUserQuestion`, which is the one shape this
+  residual is about. The refinement that would close the vertical route is a window measured from the
+  **composer's own top row** rather than from the screen bottom, and it is not taken here for a
+  concrete reason rather than for scope: the **pre-paste** checkpoint has no paste at all, so there
+  are no claimed rows to anchor such a window on, and a refinement that only works at one of the two
+  checkpoints is a second rule rather than a better one. Named here so the next reader starts from
+  the reason and not from the number.
 - **An EMPTY composer that paints no prompt glyph is not recognised.** With no paste there is no
   authorship to key on, so this clause must read shape, and the obvious generalisation — "a row of
   nothing but decoration" — cannot be taken: a dialog's blank framed row is byte-identical to it, and
