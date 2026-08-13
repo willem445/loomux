@@ -7704,6 +7704,12 @@ fn is_empty_prompt_row(line: &str) -> bool {
         .any(|g| d.strip_prefix(*g).is_some_and(|rest| rest.trim_matches(is_frame_char).is_empty()))
 }
 
+/// Does this row lead with a prompt glyph at all, empty or not (#903 rev-427)?
+fn leads_with_prompt_glyph(line: &str) -> bool {
+    let d = deframe(line);
+    PROMPT_GLYPHS.iter().any(|g| d.starts_with(*g))
+}
+
 /// The last [`IDLE_PROMPT_TAIL_ROWS`] non-empty rendered rows — the pane's
 /// current chrome, as opposed to whatever is still sitting above it.
 fn bottom_rendered_rows(visible: &str, n: usize) -> Vec<&str> {
@@ -7711,36 +7717,104 @@ fn bottom_rendered_rows(visible: &str, n: usize) -> Vec<&str> {
     rows[rows.len().saturating_sub(n)..].to_vec()
 }
 
-/// Does the pane's current chrome include an EMPTY input prompt (#903)?
+/// A pane's composed screen in the TWO forms the question guard's readings need
+/// (#903, rev-427 B1).
 ///
-/// The weaker of this module's two idleness readings, and the one the
-/// last-resort override keys on: it says an empty composer is on screen, and
-/// says nothing about what else is. [`idle_prompt_rendered`] is the stronger
-/// one.
-pub fn idle_prompt_row_rendered(visible: &str) -> bool {
-    bottom_rendered_rows(visible, IDLE_PROMPT_TAIL_ROWS).iter().any(|l| is_empty_prompt_row(l))
+/// The guard has always read one screen: the masked one, because "is a question
+/// displayed" must not be answered by loomux's own notices or its own
+/// just-pasted text. The idleness reading added by #903 needs the other one too,
+/// and the reason is mechanical rather than stylistic:
+///
+/// **`mask_own_paste` REMOVES the rows it claims.** At the pre-Enter checkpoint —
+/// the one checkpoint that runs with a `pasted_text` — our brief is sitting in
+/// the CLI's composer, so the mask deletes exactly the row that proves a composer
+/// is on screen. Reading idleness from the masked screen alone therefore answers
+/// "no composer" for a pane whose composer is not merely present but holding our
+/// own text, and the pre-Enter gate re-asserts the very false positive the
+/// pre-paste gate just released — aborting with the paste stranded in the box.
+/// That is rev-427's blocking finding, and it is worse than the bug this PR
+/// fixes, because a stranded paste wedges a second gate behind it.
+///
+/// Keeping both views is what lets the idleness reading ask the right question —
+/// *is the CLI at its composer* — instead of the accidental one — *is the
+/// composer empty right this instant*. And it asks it **without a second copy of
+/// "is this row ours"**: the mask's own recognition (deframe, wrap
+/// reconstruction, the #820 pointer-strip and its short-line floor) is reused
+/// verbatim by comparing the two views, because a row present in `unmasked` and
+/// absent from `masked` is precisely a row the mask claimed.
+#[derive(Clone, Copy, Debug)]
+pub struct Composed<'a> {
+    /// Loomux's own notices and this delivery's paste removed. Everything that
+    /// asks "is a question displayed" reads THIS.
+    pub masked: &'a str,
+    /// The screen as composed. Read for exactly one question: is the CLI's own
+    /// input prompt on screen at all.
+    pub unmasked: &'a str,
 }
 
-/// Is this pane sitting at an idle, empty input prompt with no menu selection
-/// anywhere on screen (#903)?
+impl<'a> Composed<'a> {
+    /// Both views the same — correct at every checkpoint that masks nothing of
+    /// its own (`pasted_text: None`), and the shape every test that has no paste
+    /// wants. With the two equal, `idle_prompt_row_rendered`'s "the mask claimed
+    /// this row" clause is vacuously false and the reading collapses to exactly
+    /// the pre-rev-427 one.
+    pub fn plain(s: &'a str) -> Self {
+        Composed { masked: s, unmasked: s }
+    }
+}
+
+/// Is the CLI's own input prompt on screen, holding nothing but what loomux put
+/// there (#903)?
+///
+/// The weaker of this module's two idleness readings, and the one the last-resort
+/// override keys on: it says a composer is on screen and **says nothing about
+/// what else is**. [`idle_prompt_rendered`] is the stronger one, and the
+/// difference between them is deliberate — see that function, and the design
+/// note's override-safety argument, for why the last resort is allowed the weaker
+/// bar and what actually stops it pressing Enter into a dialog.
+///
+/// A row qualifies when it leads with a prompt glyph AND either has nothing after
+/// it but framing, or was claimed by the paste mask (present in `unmasked`,
+/// absent from `masked`). The second clause is rev-427 B1: our own brief sitting
+/// in the composer is a composer, not a dialog.
+pub fn idle_prompt_row_rendered(c: Composed<'_>) -> bool {
+    // Rows the mask kept. `mask_own_paste`/`mask_loomux_notices_with_record` only
+    // ever DROP rows — never rewrite them — so surviving rows are byte-identical
+    // and set membership is an exact test rather than a fuzzy one. A duplicate
+    // row text of which only one copy was claimed still reads as "kept", which
+    // errs toward NOT idle: the conservative direction, and the one every
+    // reading here defaults to.
+    let survived: std::collections::HashSet<&str> = c.masked.lines().collect();
+    bottom_rendered_rows(c.unmasked, IDLE_PROMPT_TAIL_ROWS).iter().any(|r| {
+        leads_with_prompt_glyph(r) && (is_empty_prompt_row(r) || !survived.contains(*r))
+    })
+}
+
+/// Is this pane sitting at an idle input prompt with no menu selection anywhere
+/// on screen (#903)?
 ///
 /// **Positive evidence of idleness, not the absence of evidence of a question.**
 /// The distinction is the safety argument: a screen loomux cannot read, or one
 /// whose CLI paints a box shape this does not recognise, answers `false` and the
-/// hold stands. Only a screen that actually shows an empty composer — and shows
-/// no highlighted choice anywhere, so a dialog cannot be sitting above one — is
+/// hold stands. Only a screen that actually shows a composer — and shows no
+/// highlighted choice anywhere, so a dialog cannot be sitting above one — is
 /// allowed to end a hold.
+///
+/// The pointer clause reads the **masked** screen, and that is load-bearing
+/// rather than incidental: on the unmasked one, our own brief in a chevron
+/// composer (`❯ <our text>`) leads a pointer at content, which is #820's exact
+/// trap and would veto the release on evidence loomux itself wrote.
 ///
 /// The assumption, stated so a future TUI change is a known break rather than a
 /// mystery (the same courtesy #727's note pays for its own): **a CLI does not
-/// paint a modal question and an empty free-text composer at the same time.**
-/// Every dialog the fixtures cover replaces the box while it is up. A CLI that
-/// asked a question *above* a live composer would read as idle here — which is
-/// why the pointer clause is a conjunct rather than a nicety, and why the
-/// fixtures assert this reading is false for every positive dialog capture in
-/// the suite, not merely true for the negatives.
-pub fn idle_prompt_rendered(visible: &str) -> bool {
-    idle_prompt_row_rendered(visible) && !pointer_rendered(visible)
+/// paint a modal question and a free-text composer at the same time.** Every
+/// dialog the fixtures cover replaces the box while it is up. A CLI that asked a
+/// question *above* a live composer would read as idle here — which is why the
+/// pointer clause is a conjunct rather than a nicety, and why the fixtures assert
+/// this reading is false for every positive dialog capture in the suite, not
+/// merely true for the negatives.
+pub fn idle_prompt_rendered(c: Composed<'_>) -> bool {
+    idle_prompt_row_rendered(c) && !pointer_rendered(c.masked)
 }
 
 /// Does any rendered row lead with a menu pointer (#534 rev-13)?
@@ -19172,6 +19246,11 @@ fn run_queue_drainer(
     // timestamp because what the override needs is "still idle now", proven
     // repeatedly, not "was idle at some point".
     let mut question_idle_streak = 0u32;
+    // #903 rev-427 NB4: the hold episode whose override has already been
+    // recorded, so the grant can repeat while the audit line does not. `None`
+    // until one fires; a new episode (the pane delivered, then wedged again) is
+    // a new line, which is what a reader wants.
+    let mut override_audited_since: Option<u64> = None;
     loop {
         iteration += 1;
         // #903: set by this iteration's own poll (below) when the last-resort
@@ -19474,9 +19553,21 @@ fn run_queue_drainer(
             if question_overridden {
                 // Reset so a delivery that goes on to abort for some OTHER
                 // reason cannot re-grant an override on every 2s poll: the pane
-                // has to re-prove itself idle from scratch. Bounds the audit
-                // volume too, which is the same thing said about the log.
+                // has to re-prove itself idle from scratch.
                 question_idle_streak = 0;
+            }
+            // #903 rev-427 NB4: the GRANT may repeat — an override whose
+            // delivery aborts for an unrelated reason must be able to try again,
+            // or one transient abort disables the last resort for the rest of a
+            // wedge, which is the failure mode this whole layer exists to end.
+            // The RECORD must not: re-granting every ~6s wrote hundreds of
+            // identical lines into an 8 MiB rotating log over a long hold, which
+            // is how a genuinely important line becomes noise. One per hold
+            // EPISODE — the same clock the bound and the badge are measured
+            // against, so the log reads as one event per thing the human
+            // experienced.
+            if question_overridden && override_audited_since != held_since {
+                override_audited_since = held_since;
                 reg.audit(&group, "loomux", "delivery-question-override", json!({
                     "to": &front.agent_id,
                     "held_ms": held_since.map(|s| override_now.saturating_sub(s)),
@@ -21203,11 +21294,15 @@ impl GridEvidence {
 /// empty free-text box is not blocked on an answer. #903's two lost panes had a
 /// matched line, still rendered, forever, on a pane nobody was being asked
 /// anything by — `StillRendered` was true and useless.
-pub fn grid_evidence_for(m: &QuestionMatch, visible: Option<&str>) -> GridEvidence {
+pub fn grid_evidence_for(m: &QuestionMatch, visible: Option<Composed<'_>>) -> GridEvidence {
     match visible {
         None => GridEvidence::Unreadable,
-        Some(v) if idle_prompt_rendered(v) => GridEvidence::IdlePrompt,
-        Some(v) if prompt_wait_detected(v) || match_still_rendered(v, m) => {
+        Some(c) if idle_prompt_rendered(c) => GridEvidence::IdlePrompt,
+        // Both of these read the MASKED view, unchanged: "is a question
+        // displayed" was never allowed to be answered by loomux's own rows.
+        // `Composed` widens what the guard can see, not what counts as a
+        // question.
+        Some(c) if prompt_wait_detected(c.masked) || match_still_rendered(c.masked, m) => {
             GridEvidence::StillRendered
         }
         Some(_) => GridEvidence::NotRendered,
@@ -21242,7 +21337,7 @@ pub fn grid_evidence_for(m: &QuestionMatch, visible: Option<&str>) -> GridEviden
 /// occupancy at the instant of the write (#532). "The question is gone AND the
 /// box is empty" is therefore a conjunction the caller already enforces — see
 /// the design note for why it is not re-derived here.
-pub fn question_shown(ring: Option<&QuestionMatch>, visible: Option<&str>) -> bool {
+pub fn question_shown(ring: Option<&QuestionMatch>, visible: Option<Composed<'_>>) -> bool {
     match ring {
         None => false,
         // Spelled as the two readings that HOLD rather than as `!= NotRendered`
@@ -21281,6 +21376,18 @@ pub struct QuestionWitnessed {
     pub matched: QuestionMatch,
     /// What the composed screen said about it on that same poll.
     pub grid: GridEvidence,
+    /// Did that same screen show the CLI's own input prompt — empty, or holding
+    /// nothing but loomux's paste ([`idle_prompt_row_rendered`], the WEAK
+    /// reading)? #903.
+    ///
+    /// It rides the witness rather than a fifth out-parameter for two reasons.
+    /// It is genuinely diagnostic — "the guard held while a composer was on
+    /// screen" is the #903 finding in one bit, and it is emitted by
+    /// [`witness_audit`] so the next narrowing has it. And it is only ever
+    /// *needed* when the ring matched, which is exactly when a witness exists:
+    /// the last-resort override is defined over a pane whose question gate is
+    /// holding, and a gate cannot hold without a match.
+    pub idle_row: bool,
 }
 
 /// Slot the hold predicate writes its last observed match into, so the abort
@@ -21298,12 +21405,15 @@ pub type QuestionWitness = std::rc::Rc<std::cell::RefCell<Option<QuestionWitness
 /// old records were indistinguishable from that case in every direction, which
 /// is why #513's live 27-minute incident is still unexplained.
 ///
-/// Three fields, each earning its place in a log that rotates at 8 MiB:
+/// Four fields, each earning its place in a log that rotates at 8 MiB:
 /// `signal` says which detector rule fired (the fastest way to spot a rule
 /// misfiring on prose), `line` says what it fired on (bounded by
-/// [`QuestionMatch::MAX_LINE`]), and `grid` says whether the composed screen
+/// [`QuestionMatch::MAX_LINE`]), `grid` says whether the composed screen
 /// agreed — the one that turns "the guard held" into "the guard held and the
-/// screen backed it up", or into the opposite.
+/// screen backed it up", or into the opposite — and `idle_row` (#903) says
+/// whether the CLI's own composer was on that screen, which is the term the
+/// last-resort override is decided on and therefore the one a human has to be
+/// able to audit after it fires.
 pub fn witness_audit(seen: Option<&QuestionWitnessed>) -> Value {
     match seen {
         None => Value::Null,
@@ -21311,6 +21421,7 @@ pub fn witness_audit(seen: Option<&QuestionWitnessed>) -> Value {
             "signal": w.matched.signal,
             "line": w.matched.line,
             "grid": w.grid.as_str(),
+            "idle_row": w.idle_row,
         }),
     }
 }
@@ -21360,8 +21471,17 @@ where
         };
         let ring_match =
             s.ring.as_deref().and_then(|out| prompt_wait_match(&mask(&strip_ansi(out))));
-        let visible = s.visible.as_deref().map(mask);
-        let shown = question_shown(ring_match.as_ref(), visible.as_deref());
+        // #903 rev-427 B1: BOTH views are kept, and the masked one is still the
+        // only thing "is a question displayed" is asked of. The unmasked one
+        // answers one narrow question the masked one structurally cannot — is
+        // the CLI's composer on screen — because `mask_own_paste` deletes the
+        // very row that proves it. See [`Composed`].
+        let masked = s.visible.as_deref().map(mask);
+        let composed = match (s.visible.as_deref(), masked.as_deref()) {
+            (Some(unmasked), Some(masked)) => Some(Composed { masked, unmasked }),
+            _ => None,
+        };
+        let shown = question_shown(ring_match.as_ref(), composed);
         if let (Some(w), Some(m)) = (&witness, ring_match) {
             // Recorded on every poll the ring matched, INCLUDING the polls
             // that read clear on the grid — the abort audit wants the last
@@ -21370,8 +21490,12 @@ where
             // have. Never cleared on a no-match poll: an abort is preceded by
             // whatever the hold was about, and blanking it would leave the
             // audit saying nothing again.
-            let grid = grid_evidence_for(&m, visible.as_deref());
-            *w.borrow_mut() = Some(QuestionWitnessed { matched: m, grid });
+            let grid = grid_evidence_for(&m, composed);
+            // #903: the override's own term, recorded on the SAME poll as the
+            // decision it will be used for — never re-read at the override site,
+            // for the reason this whole witness exists.
+            let idle_row = composed.is_some_and(idle_prompt_row_rendered);
+            *w.borrow_mut() = Some(QuestionWitnessed { matched: m, grid, idle_row });
         }
         if shown {
             ever_shown.set(true);
@@ -21492,7 +21616,7 @@ fn question_active_now(
 
 /// One one-shot reading of a pane's question gate (#903): the decision, the
 /// evidence, and — for the last-resort override — whether that same instant's
-/// composed screen showed an empty input prompt.
+/// composed screen showed the CLI's own input prompt.
 ///
 /// A struct rather than a widening tuple because the third field is easy to
 /// mistake for the second's negation and is not: `active` is the gate,
@@ -21504,9 +21628,20 @@ pub struct QuestionReading {
     pub active: bool,
     /// What the detector matched on this poll, for the audit.
     pub witnessed: Option<QuestionWitnessed>,
-    /// Did this poll's composed screen show an empty input prompt
-    /// ([`idle_prompt_row_rendered`])? `false` for an unreadable screen — no
-    /// composition, no idleness claim.
+    /// Did this poll's composed screen show the CLI's input prompt — empty, or
+    /// holding nothing but loomux's own paste ([`idle_prompt_row_rendered`], the
+    /// WEAK reading, without [`idle_prompt_rendered`]'s menu-absent conjunct)?
+    ///
+    /// **The weak one, deliberately, and it is the whole of the override's
+    /// design** (rev-427 B2). Feeding this from the strong reading would make the
+    /// override unreachable: the strong reading is what `grid_evidence_for`
+    /// already releases on, so a pane satisfying it is not holding, and there
+    /// would be nothing left to override. The override IS the time-bounded
+    /// downgrade of that one conjunct — see [`question_override_admits`] and the
+    /// design note for what stops it pressing Enter into a live menu.
+    ///
+    /// `false` for an unreadable screen, and `false` when the ring matched
+    /// nothing: no composition (or no hold) means no idleness claim.
     pub idle_prompt: bool,
 }
 
@@ -21533,34 +21668,22 @@ fn question_active_witnessed(
     delivered: Vec<String>,
 ) -> QuestionReading {
     let witness: QuestionWitness = Default::default();
-    // #903: captured from INSIDE the sample closure, so the idleness reading and
-    // the gate's decision are the same composed screen and not two reads
-    // microseconds apart — `question_sample`'s own doc gives the reason that
-    // distinction is correctness rather than cost.
-    //
-    // **Read UNMASKED, deliberately, and it is the conservative direction.** The
-    // masks (`mask_loomux_notices_with_record`, `mask_own_paste`) DELETE the rows
-    // they claim rather than blanking them, so a composer holding loomux's own
-    // unsubmitted paste — #820's exact screen — is a non-empty `❯ <our text>` row
-    // here and reads as NOT idle, which is the truth: that pane is holding
-    // something, and the override must not fire on it. The masked reading would
-    // simply have dropped the row, which happens to answer the same way; taking
-    // the unmasked one means it answers that way for the right reason and stays
-    // right if the masks ever start blanking instead of deleting.
-    let idle = std::rc::Rc::new(std::cell::Cell::new(false));
-    let idle_w = std::rc::Rc::clone(&idle);
     let active = question_hold_predicate_sampled(
-        move || {
-            let s = question_sample(ptys, pty_id);
-            idle_w.set(s.visible.as_deref().is_some_and(idle_prompt_row_rendered));
-            s
-        },
+        || question_sample(ptys, pty_id),
         pasted_text.map(str::to_string),
         Some(std::rc::Rc::clone(&witness)),
         delivered,
     )();
     let seen = witness.borrow().clone();
-    QuestionReading { active, witnessed: seen, idle_prompt: idle.get() }
+    // #903: taken off the witness rather than re-derived here, so the term the
+    // override is decided on and the record that explains it are the same poll's
+    // reading of the same screen — and so there is exactly ONE place
+    // (`question_hold_predicate_sampled`) that decides what "the composer is on
+    // screen" means. `None` — the ring matched nothing, so no witness — reads
+    // `false`, which is right twice over: there is no hold to override, and a
+    // streak must not be built out of polls that were never holding.
+    let idle_prompt = seen.as_ref().is_some_and(|w| w.idle_row);
+    QuestionReading { active, witnessed: seen, idle_prompt }
 }
 
 /// #532: the guards a delivery must find satisfied **at one instant**, on the
@@ -21778,14 +21901,26 @@ pub fn hold_bound_elapsed(held_since_ms: u64, now_ms: u64, bound_ms: u64) -> boo
 /// hand — the bound has to land inside a human's patience, not merely inside
 /// infinity.
 ///
-/// **Why an override is safe at all, in one line: a delivery carries a delivery
-/// id, and every receiver treats a re-seen id as a duplicate.** So the cost of a
-/// wrong override is a brief that arrives while a dialog is genuinely open — the
-/// paste lands in the dialog's lap, the human answers it, and if that paste was
-/// eaten the drainer's own recovery re-sends it under the same id, which the
-/// agent then ignores as a duplicate. The cost of never overriding is what this
-/// issue is: a queue that never moves and a pane a human has to kill. The design
-/// note argues this at length.
+/// **What a wrong override actually costs, in the right order** (rev-427 B2 —
+/// the earlier version of this paragraph led with delivery-id dedup, which is
+/// the *second* line of defence and does not cover the expensive failure):
+///
+/// 1. **The Enter is still gated.** An override skips the PRE-PASTE question
+///    checkpoint only. `deliver_now`'s pre-Enter `wait_for_question_clear` runs
+///    unskipped, against a screen masked with this delivery's own paste, and it
+///    is what withholds the Enter from a live dialog. That matters because the
+///    unrecoverable harm here is not a stray paste — it is an Enter *selecting*
+///    a highlighted option, which no dedup rule can undo.
+/// 2. **Then dedup covers the rest.** A paste that lands in an open dialog's lap
+///    is recoverable: the human answers the dialog, and if the paste was eaten
+///    the drainer re-sends under the same delivery id, which every receiver
+///    treats as a duplicate and drops.
+///
+/// The cost of never overriding is what this issue is: a queue that never moves
+/// and a pane a human has to kill. The design note argues both sides at length,
+/// including the residual this leaves — see `idle_prompt` on [`QuestionReading`]
+/// for why the term below is the WEAK idleness reading and why the strong one
+/// would make this function dead code.
 ///
 /// `0` disables the override (pre-#903 behaviour), the same convention
 /// [`hold_bound_elapsed`] gives every bound here, so a mis-set constant degrades
