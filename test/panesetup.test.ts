@@ -867,7 +867,7 @@ test("the fresh ESCAPE (a recorded session that can never be resumed) forces a n
 
 // --- #887 S4 / PR #926 round 2 B1: a reconnect is SINGLE-FLIGHT ---
 
-test("two near-simultaneous reconnects spawn exactly ONE ssh client", () => {
+test("two near-simultaneous reconnects spawn exactly ONE ssh client", async () => {
   // The defect this pins, concretely: the SSH reconnect card has two actions
   // (Reconnect, Reconnect fresh). With them ungated, a click on each — the
   // expected gesture, since the escape exists for someone who has just watched a
@@ -894,17 +894,20 @@ test("two near-simultaneous reconnects spawn exactly ONE ssh client", () => {
 
   const first = reconnect(); // still in flight — nothing has resolved it
   const second = reconnect(); // the second button, ~300ms later
-  return Promise.resolve()
-    .then(async () => {
-      assert.deepEqual(await second, { ok: false, message: "busy" }, "the second click is refused, not queued");
-      assert.equal(spawns, 1, "exactly one spawn while an attempt is in flight");
-      finish();
-      assert.deepEqual(await first, { ok: true }, "the first attempt is untouched by the refusal");
-      // …and the latch REOPENS: a reconnect that failed must stay retryable —
-      // the card's whole purpose is the retry — so this is never one-shot.
-      assert.deepEqual(await reconnect(), { ok: true });
-      assert.equal(spawns, 2, "a later attempt runs once the first has settled");
-    });
+  // Checked BEFORE anything is awaited, and deliberately so: an async function
+  // runs synchronously up to its first `await`, so the spawn count is already
+  // final here. It also keeps this test from DEADLOCKING under the mutation it
+  // exists to catch — awaiting `second` first would hang forever once the gate
+  // is gone (an ungated second call waits on `inFlight`, which is released
+  // below), and a hang is not a red.
+  assert.equal(spawns, 1, "exactly one spawn while an attempt is in flight");
+  finish();
+  assert.deepEqual(await second, { ok: false, message: "busy" }, "the second click is refused, not queued");
+  assert.deepEqual(await first, { ok: true }, "the first attempt is untouched by the refusal");
+  // …and the latch REOPENS: a reconnect that failed must stay retryable — the
+  // card's whole purpose is the retry — so this is never one-shot.
+  assert.deepEqual(await reconnect(), { ok: true });
+  assert.equal(spawns, 2, "a later attempt runs once the first has settled");
 });
 
 test("a reconnect that THROWS still releases the latch (a failure must stay retryable)", () => {
