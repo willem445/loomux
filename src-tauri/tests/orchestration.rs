@@ -33323,15 +33323,18 @@ fn promote_into_a_fresh_group_reads_the_repo_workflow_file() {
     );
 }
 
-#[test]
-fn promote_reattaching_a_dormant_group_keeps_the_roster_that_group_was_launched_with() {
-    use std::sync::Arc;
-    let (reg, _d) = test_registry();
-    let reg = Arc::new(reg);
-    let (repo, repo_path, sid, store) = promotable_pane("promote-reattach");
+/// The dormant group a promote reattaches to: launched advanced (roster
+/// `rev-approved`), its cap adjusted live to 7, ended — and then the repo moved
+/// on underneath it, so `.loomux/workflow.yml` now declares `rev-never-seen`
+/// instead. Returns `(registry, repo_dir, repo_path, session_id, store, gid)`.
+fn dormant_group_and_a_promotable_pane(
+    tag: &str,
+) -> (std::sync::Arc<OrchRegistry>, tempfile::TempDir, String, String, std::path::PathBuf, String, tempfile::TempDir)
+{
+    let (reg, state) = test_registry();
+    let reg = std::sync::Arc::new(reg);
+    let (repo, repo_path, sid, store) = promotable_pane(tag);
     declare_workflow(repo.path(), "rev-approved");
-
-    // A group the human launched, configured live (the cap), and ended.
     let launched = create_orchestration_group(
         &reg,
         &repo_path,
@@ -33350,6 +33353,13 @@ fn promote_reattaching_a_dormant_group_keeps_the_roster_that_group_was_launched_
     // …and the repo moves on underneath them: a `git pull` brings a reviewer
     // block nobody in that group ever approved.
     declare_workflow(repo.path(), "rev-never-seen");
+    (reg, repo, repo_path, sid, store, gid, state)
+}
+
+#[test]
+fn promote_reattaching_a_dormant_group_inherits_the_roster_and_knobs_it_ran_under() {
+    let (reg, _repo, repo_path, sid, store, gid, _state) =
+        dormant_group_and_a_promotable_pane("promote-reattach-inherit");
 
     // The promote modal's defaults — no advanced tick, no roster, cap 0 —
     // because a right-click is not the launcher and carries no preview.
@@ -33359,13 +33369,13 @@ fn promote_reattaching_a_dormant_group_keeps_the_roster_that_group_was_launched_
 
     assert_eq!(req.group_id, gid, "a dormant group is reattached, not orphaned");
     let rails_now = reg.group(&gid).unwrap().guardrails;
+    // A promote arrives with the MODAL's defaults, not the launcher's preview,
+    // so the roster has to come back off disk: without it, one right-click
+    // silently replaces the roster this group's human approved with the
+    // built-in four — and clears its merge gate on the way past.
     assert!(
         rails_now.block("rev-approved").is_some(),
         "the reattached group keeps the roster its human approved"
-    );
-    assert!(
-        rails_now.block("rev-never-seen").is_none(),
-        "a block the repo gained AFTER that launch must not join it through a right-click either"
     );
     assert!(rails_now.advanced_orchestrator, "the toggle travels with the roster it selected");
     assert_eq!(
@@ -33373,12 +33383,38 @@ fn promote_reattaching_a_dormant_group_keeps_the_roster_that_group_was_launched_
         "live-adjustable knobs come back off disk — the dormant group's settings beat the modal's defaults"
     );
     assert!(
-        reg.audit_log(&gid).iter().any(|e| e.action == "workflow-changed-since-launch"),
-        "the drift is audited so the human can SEE the repo has moved on"
-    );
-    assert!(
         reg.audit_log(&gid).iter().any(|e| e.action == "group-resume"),
         "reattach, not create"
+    );
+}
+
+#[test]
+fn promote_reattaching_a_dormant_group_does_not_re_read_the_workflow_file() {
+    let (reg, _repo, repo_path, sid, store, gid, _state) =
+        dormant_group_and_a_promotable_pane("promote-reattach-pin");
+    // Ticked ON deliberately, so this pins the CONSENT rule rather than the
+    // toggle being off: even asked for the advanced roster, a reattach runs the
+    // one its own human approved. The moment of consent was that group's
+    // launcher preview, and it outlived the session that gave it — the board,
+    // audit log and backlog it governs are all still there.
+    let req = promote_to_orchestrator_sync(
+        &reg,
+        &repo_path,
+        &sid,
+        "claude",
+        PromoteConfig { advanced_orchestrator: true, ..PromoteConfig::default() },
+    );
+    drop_claude_store(&store);
+    let req = req.expect("promote");
+
+    assert_eq!(req.group_id, gid);
+    assert!(
+        reg.group(&gid).unwrap().guardrails.block("rev-never-seen").is_none(),
+        "a block the repo gained AFTER that launch must not join it through a right-click either"
+    );
+    assert!(
+        reg.audit_log(&gid).iter().any(|e| e.action == "workflow-changed-since-launch"),
+        "the drift is audited so the human can SEE the repo has moved on — pinned, not stale"
     );
 }
 
