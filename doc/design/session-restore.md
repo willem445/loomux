@@ -127,7 +127,7 @@ every worker (the #78 storm). That contract lives on the `RestoreAction`
 
 ### #887 S4 — SSH panes: the leaf records a CONNECTION, not a command line
 
-An SSH pane's process is a local `ssh` client (see the feature's own note for the
+An SSH pane's process is a local `ssh` client (see `doc/design/ssh-panes.md` for the
 transport argument). Persisting it needed **one new field**, `sshProfileId`, and
 the choice of what *not* to persist is the whole of this design.
 
@@ -183,7 +183,7 @@ neither.
 
 **The #887/#888 boundary at the restore seam.** SSH panes are display-only in v1
 and can never be orchestration group members (the refusal lives in
-`sshOrchestrationRefusal`, and the reasons are in the feature's note). Restore is
+`sshOrchestrationRefusal`, and the reasons are in `doc/design/ssh-panes.md`). Restore is
 the one path that turns a **hand-editable file on disk** into a spawn, so the
 boundary is enforced there structurally rather than by filtering: the
 `dormant-ssh` action has **no field** that could carry `role`, `groupId` or an
