@@ -11749,6 +11749,15 @@ however it had been working. Without it a session is handed a role contract with
 where the last hour went, which invites exactly the wrong inference — that the prototype
 context is stale and should be set aside.
 
+`FreshKickoff` is also the right `Delivery` for a narrower, mechanical reason, and it is worth
+naming because the obvious ones do not distinguish it: both kickoff kinds hold the paste until
+the pane has painted, and both answer copilot's autopilot dialog. The single behavioral
+difference is `recovers_lost_kickoff` (#517) — a `ResumeKickoff` that never lands is *not*
+re-delivered, on the argument that its payload is a re-sync notice re-derivable from durable
+state. A promoted orchestrator's kickoff is the exact opposite of re-derivable: it exists
+nowhere else, nothing will re-send it, and a session that silently never received it is a pane
+holding an hour of context with no idea it is now an orchestrator.
+
 The delivery id rides a freshly minted agent id (#524, minted once ever), so the #455 duplicate
 paste discipline carries unchanged: the id cannot collide with anything already in the resumed
 transcript.
@@ -11781,31 +11790,54 @@ value rather than a synonym for either:
 
 Reattach needs one thing a resume does not. A resume's caller loads `group.json` and hands the
 persisted guardrails straight back in; a promote arrives from a right-click carrying the
-modal's *defaults*. So `create_group_ex` pulls the roster, the advanced toggle and the intake
-profile back off disk for a promote reattach, **before** any decision reads them — otherwise
-promoting into a dormant advanced group would replace the roster its human approved with the
-built-in four and clear that group's merge gate on the way past. The live-adjustable knobs (the
-agent cap, the autonomy budget, the idle-tick windows) come back through the same re-hydration
-both launch kinds already share: a dormant group's own settings beat a modal that has no field
-for them.
+modal's *defaults*. So `create_group_ex` pulls the roster, **the CLI that roster inherits**, the
+advanced toggle and the intake profile back off disk for a promote reattach, **before** any
+decision reads them — otherwise promoting into a dormant advanced group would replace the roster
+its human approved with the built-in four and clear that group's merge gate on the way past. The
+live-adjustable knobs (the agent cap, the autonomy budget, the idle-tick windows) come back
+through the same re-hydration both launch kinds already share: a dormant group's own settings
+beat a modal that has no field for them.
+
+`agent_cli` is in that set for a reason that is easy to miss: a built-in roster persists every
+block's `cli` as `""`, meaning *inherit the group default*, so the group's own CLI is not a
+separate setting from the roster — it is the half of it that says what those blocks run.
+Restoring `blocks` without it would hand a dormant copilot group's blocks a claude default and
+quietly re-CLI every delegate it spawns from then on, with nothing shown to the human: unlike
+the launcher, the promote modal has no CLI field. (The knobs that are *not* re-hydrated —
+`auto_ops`, `idle_kill_minutes`, `max_spawns_per_hour`, `watchdog_stall_minutes` — behave
+exactly as a launcher relaunch of the same group already does.)
 
 That inheritance creates the one case a promote must fail closed on. A session belongs to
-exactly one CLI, and the roster deciding which CLI *this group's orchestrator* runs is resolved
-after the promote is under way — on a reattach, from a workflow file the promoting human never
-picked. If they disagree, the composed command would be `<other-cli> --resume <claude uuid>`,
-which fails inside the pane *after* the promotion has killed the process that held the context.
-`register_orchestrator_pane` refuses instead (`promote-cli-mismatch:`); the group state is
-durable, so the dormant-group Resume card remains the way back in.
+exactly one CLI, and the roster deciding which CLI *this group's orchestrator* runs is not the
+promoting human's pick — on a reattach it is that group's own, and on a fresh advanced promote
+it is the repo's workflow file. If they disagree, the composed command would be `<other-cli>
+--resume <claude uuid>`, which fails inside the pane *after* the promotion has killed the
+process that held the context. So the promote is refused (`promote-cli-mismatch:`) — and,
+because that refusal is the only one needing a *resolved* roster, it is deliberately made twice:
+
+- **`promote_orchestrator_cli`, read-only, before `create_group_ex` runs.** It resolves the CLI
+  the launch would resolve, from the same primitives in the same order (the candidate-id scan,
+  `load_group_file` on a reattach, the `load_workflow` + `clamped()` pair the launcher's preview
+  already reuses, `workflow::cli_of`), under the caller's `creation` lock so the candidate it
+  peeks is the one the launch picks. This is what keeps the refusal contract below true for all
+  seven tags rather than six.
+- **The same check inside `register_orchestrator_pane`, against the roster that actually
+  resolved.** Reachable only by a lost race: liveness is not held by `creation`, so an agent
+  dying between the two candidate scans can move the launch onto an *earlier* group id than the
+  pre-check peeked. It is kept because the cost of being wrong is a dead pane holding the
+  context the gesture existed to preserve, and it is the one refusal that can leave a created or
+  reattached group behind — the group state is durable, so the dormant-group Resume card is the
+  way back in.
 
 ### Refusals are tagged, and happen before anything moves
 
 Promotion interrupts a live conversation: the frontend kills the pane's CLI before relaunching
 it, because `--resume` reads a transcript the old process must have finished flushing. That
 makes "was this refused?" a question with a deadline. Every validation therefore runs before
-anything is created, retired or killed — a refused promote leaves the running pane exactly as
-it was — and every refusal carries a `promote-<reason>:` tag, mirroring the `resume-<tag>:`
-convention `resumeerror.ts` already parses, so one click that does nothing can say precisely
-why:
+anything is created, retired or killed — a refused promote leaves the running pane exactly as it
+was, and leaves no group behind either — and every refusal carries a `promote-<reason>:` tag,
+mirroring the `resume-<tag>:` convention `resumeerror.ts` already parses, so one click that does
+nothing can say precisely why:
 
 | tag | what it means |
 |---|---|
@@ -11816,6 +11848,14 @@ why:
 | `promote-not-found` | the CLI's own store has no such session — including a pane never spoken to |
 | `promote-store-unreadable` | the store could not be read at all, which is not the same fact |
 | `promote-cli-mismatch` | the resolved orchestrator block runs a CLI this session does not belong to |
+
+Six of the seven are pure argument checks and refuse before anything is even resolved. The
+seventh needs a resolved roster, which is why it is made twice (above): the read-only pre-check
+is what lets "nothing is created" hold for it too, and its post-creation twin is a raced
+backstop rather than the refusal. `group_fingerprints` — each group's `group.json` text plus its
+audit length — is asserted unchanged across every refusal test, including that one, so
+"created nothing" is pinned rather than stated; `group.json` carries a `created_ms` stamped at
+each write, so even a rewrite that persisted identical guardrails would show up.
 
 `promote-already-managed` is the one that is about roles rather than inputs. A delegate's
 transcript carries a delegate contract and a recorded group membership; promoting it would seat

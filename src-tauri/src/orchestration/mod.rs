@@ -24830,6 +24830,54 @@ impl OrchRegistry {
         self.create_group_ex(repo, guardrails, Launch::Fresh)
     }
 
+    /// The CLI this promote's orchestrator block **would** resolve to (#407
+    /// rev-1 B1) — read-only, so a mismatch can be refused before any group
+    /// dir, `group.json`, instruction file, merge-gate spec, marker re-seed or
+    /// audit line exists. Without it the one refusal that needs a resolved
+    /// roster was also the one refusal that could only fire after
+    /// `create_group_ex` had already run to completion, which is not what
+    /// "a refused promote leaves the running pane untouched" means.
+    ///
+    /// Deliberately not a second implementation of the resolution. It reuses
+    /// the same primitives in the same order the launch itself will: the
+    /// candidate-id scan from [`create_group_ex`](Self::create_group_ex),
+    /// `load_group_file` for a reattach, the `load_workflow` + `clamped()` pair
+    /// the launcher's own preview (`orch_workflow_preview`) reuses for exactly
+    /// this reason, and `workflow::cli_of`. Callers hold `creation`, so the
+    /// candidate it peeks is the one `create_group_ex` picks a moment later.
+    ///
+    /// `None` when the roster declares no orchestrator block at all — that is
+    /// `register_orchestrator_pane`'s error to raise, not this one's.
+    fn promote_orchestrator_cli(&self, repo: &str, caller: &Guardrails) -> Option<String> {
+        let base = group_id_for_repo(repo);
+        let id = (1..)
+            .map(|n| if n == 1 { base.clone() } else { format!("{base}-{n}") })
+            .find(|candidate| !self.group_is_live(candidate))
+            .unwrap();
+        let mut rails = caller.clone();
+        if self.group_dir(&id).join("group.json").is_file() {
+            // Reattach: the roster, its inherited CLI and the toggle come off
+            // disk — the same three `create_group_ex` restores.
+            if let Some((_, persisted)) = self.load_group_file(&id) {
+                rails.blocks = persisted.blocks;
+                rails.agent_cli = persisted.agent_cli;
+                rails.advanced_orchestrator = persisted.advanced_orchestrator;
+            }
+        } else if caller.advanced_orchestrator {
+            // A fresh group dir with the advanced box ticked: the repo's file is
+            // what the launch will run, so it is what this must check. A broken
+            // or absent file falls back to the caller's roster, exactly as the
+            // launch does.
+            if let Ok(Some(wf)) = workflow::load_workflow(repo) {
+                rails.blocks = wf.blocks;
+            }
+        }
+        let rails = rails.clamped();
+        rails
+            .block_for(Role::Orchestrator)
+            .map(|b| workflow::cli_of(b, &rails.agent_cli).to_string())
+    }
+
     /// [`create_group`](Self::create_group), told which kind of start this is.
     ///
     /// The distinction only matters for the advanced orchestrator (#222), and it
@@ -24869,9 +24917,20 @@ impl OrchRegistry {
         // clear that group's merge gate on the way past (the toggle-off arm
         // below). The live-adjustable knobs are re-hydrated further down, where
         // both launch kinds share the same `resumed` gate.
+        //
+        // `agent_cli` travels with the roster (rev-1 N1). A built-in roster
+        // persists every block's `cli` as `""` — "inherit the group default" —
+        // so restoring `blocks` without it would hand a dormant copilot group's
+        // blocks a claude default and quietly re-CLI every delegate it spawns
+        // from then on, while the promote modal (which has no CLI field at all)
+        // showed the human nothing. Restoring it is also the fail-closed
+        // reading: a claude pane promoted into a copilot group now resolves an
+        // orchestrator CLI that is not its own, and `promote_orchestrator_cli`
+        // below refuses instead of composing `copilot --resume <claude uuid>`.
         if launch == Launch::Promote && resumed {
             if let Some((_, persisted)) = self.load_group_file(&id) {
                 guardrails.blocks = persisted.blocks;
+                guardrails.agent_cli = persisted.agent_cli;
                 guardrails.advanced_orchestrator = persisted.advanced_orchestrator;
                 guardrails.intake = persisted.intake;
             }
@@ -43942,6 +44001,27 @@ pub fn create_orchestration_group(
         return Err(format!("repository path does not exist: {repo}"));
     }
     let _creation = reg.creation.lock_safe();
+    // #407 rev-1 B1: the one refusal that needs a RESOLVED roster, hoisted
+    // above `create_group_ex` so that it, like the other six, runs before
+    // anything is created. It sits inside the creation lock rather than beside
+    // the argument checks in `promote_to_orchestrator_sync` precisely because
+    // it has to peek the candidate group id, and only under this lock is the id
+    // it peeks the id the launch below picks.
+    //
+    // The same check is re-derived inside `register_orchestrator_pane` against
+    // the roster that actually resolved — see the comment there for the one
+    // (racing) way the two can disagree.
+    if let SessionOrigin::Promote { cli: pane_cli, .. } = &origin {
+        if let Some(resolved) = reg.promote_orchestrator_cli(repo, &guardrails) {
+            if &resolved != pane_cli {
+                return Err(format!(
+                    "promote-cli-mismatch: this repo's orchestrator would run {resolved}, but the \
+                     pane being promoted is a {pane_cli} session — a conversation cannot be \
+                     resumed under another CLI, so nothing was created"
+                ));
+            }
+        }
+    }
     let group = reg.create_group_ex(repo, guardrails, origin.launch())?;
     if let Some(want) = expect_group {
         if group.id != want {
@@ -43987,13 +44067,23 @@ fn register_orchestrator_pane(
     }
     let cli = cli.to_string();
     // #407, fail-closed: a promoted pane resumes a conversation that belongs to
-    // exactly ONE CLI, but the roster deciding which CLI this group's
-    // orchestrator runs is resolved here — and on a dormant reattach it comes
-    // off disk, from a workflow file the promoting human never picked. A
-    // mismatch would compose `<other-cli> --resume <claude uuid>`, which fails
-    // INSIDE the pane, after the promotion has already killed the process that
-    // held the context. Refuse before anything is spawned; the group state is
-    // durable, so the dormant-group Resume card is still the way back in.
+    // exactly ONE CLI, and a mismatch would compose `<other-cli> --resume
+    // <claude uuid>` — a failure INSIDE the pane, after the promotion has
+    // already killed the process that held the context.
+    //
+    // THE BACKSTOP, not the refusal (#407 rev-1 B1). `create_orchestration_group`
+    // makes this same call read-only before `create_group_ex` runs, so in every
+    // ordinary case a mismatch is refused with nothing created. This one is
+    // re-derived against the roster that ACTUALLY resolved, and it can disagree
+    // with the pre-check in exactly one way: the pre-check picks the candidate
+    // group id by liveness, an agent can die between the two scans (liveness is
+    // not held by `creation`), and the launch can then land on an EARLIER
+    // candidate — a different group, with a different roster. Reaching this is
+    // therefore a lost race, not a normal path, and it is the one refusal that
+    // leaves a created/reattached group behind; the group state is durable, so
+    // the dormant-group Resume card is the way back in. Kept rather than
+    // trusting the pre-check alone, because the cost of being wrong here is a
+    // dead pane holding the context the gesture existed to preserve.
     if let SessionOrigin::Promote { cli: pane_cli, .. } = origin {
         if &cli != pane_cli {
             return Err(format!(
@@ -44284,9 +44374,16 @@ fn register_orchestrator_pane(
                 None => return, // agent reaped before bind; nothing to kick off
             }
         };
-        // A promoted pane's CLI has just booted for the first time under this
-        // contract, exactly like a fresh one — so it takes the FreshKickoff
-        // hold-until-painted treatment, not the mid-session one (#407).
+        // #407. `FreshKickoff` rather than `ResumeKickoff` for the one thing
+        // that actually separates them: `recovers_lost_kickoff` (#517). Both
+        // kickoff kinds hold until the pane has painted and both answer
+        // copilot's autopilot dialog, so neither of those picks between them —
+        // but a `ResumeKickoff` is not re-delivered when it turns out never to
+        // have landed, on the argument that its payload is a re-sync notice
+        // re-derivable from durable state. A promoted orchestrator's kickoff is
+        // the opposite: it exists nowhere else, nothing will re-send it, and a
+        // session that silently never received it is a pane holding an hour of
+        // context with no idea it is now an orchestrator.
         let delivery = if full_kickoff { Delivery::FreshKickoff } else { Delivery::ResumeKickoff };
         let _ = reg2.deliver_prompt(&agent_id, &kickoff, "loomux", delivery);
         // Track the session this orchestrator just minted.

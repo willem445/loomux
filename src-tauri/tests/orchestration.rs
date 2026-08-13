@@ -33044,6 +33044,25 @@ fn groups_on_disk(reg: &OrchRegistry) -> Vec<String> {
     out
 }
 
+/// Every group's `group.json` text and audit-log length, keyed by id — the
+/// stronger form of [`groups_on_disk`], for a refusal that could have REWRITTEN
+/// an existing group rather than created a new one. `group.json` carries a
+/// `created_ms` stamped at each write, so a rewrite shows up here even when it
+/// happens to persist identical guardrails.
+fn group_fingerprints(reg: &OrchRegistry) -> Vec<(String, String, usize)> {
+    let mut out: Vec<(String, String, usize)> = groups_on_disk(reg)
+        .into_iter()
+        .map(|id| {
+            let json = fs::read_to_string(reg.state_root().join(&id).join("group.json"))
+                .unwrap_or_default();
+            let audit = reg.audit_log(&id).len();
+            (id, json, audit)
+        })
+        .collect();
+    out.sort();
+    out
+}
+
 /// Declare a one-reviewer workflow file in `repo`.
 fn declare_workflow(repo: &std::path::Path, block_id: &str) {
     let loomux = repo.join(".loomux");
@@ -33463,11 +33482,95 @@ fn promote_refuses_when_the_reattached_roster_pins_another_cli() {
         ]),
         ..rails()
     };
-    reg.create_group_ex(&repo_path, pinned, Launch::Fresh).unwrap();
+    let dormant = reg.create_group_ex(&repo_path, pinned, Launch::Fresh).unwrap();
+    let before = group_fingerprints(&reg);
     let err = promote_to_orchestrator_sync(&reg, &repo_path, &sid, "claude", PromoteConfig::default())
         .unwrap_err();
     drop_claude_store(&store);
     assert!(err.starts_with("promote-cli-mismatch:"), "got: {err}");
+    // rev-1 B1: the side-effect half every other refusal test asserts, and the
+    // one this test used to be missing — which is exactly where it would have
+    // failed. This refusal needs a RESOLVED roster, so it is the one that could
+    // only fire after `create_group_ex` had already rewritten the dormant
+    // group's `group.json`, re-seeded its markers and audited a `group-resume`
+    // for a resume that never happened.
+    assert_eq!(
+        group_fingerprints(&reg),
+        before,
+        "a refused promote must not have touched the dormant group it was refused against"
+    );
+    assert!(
+        !reg.audit_log(&dormant.id).iter().any(|e| e.action == "group-resume"),
+        "…and must not have audited a reattach that did not happen"
+    );
+}
+
+#[test]
+fn promote_refuses_a_fresh_group_whose_workflow_file_pins_another_cli() {
+    use std::sync::Arc;
+    let (reg, _d) = test_registry();
+    let reg = Arc::new(reg);
+    let (repo, repo_path, sid, store) = promotable_pane("promote-cli-mismatch-fresh");
+    // The orphan-group path (rev-1 B1): no group exists yet, the human ticks
+    // the advanced box, and the repo's own workflow file pins the orchestrator
+    // to another CLI. The mismatch is just as real here — and there is no
+    // dormant group to fall back to, so a group created and then refused would
+    // be pure residue: a group.json, instruction files, an armed merge gate and
+    // a `group-create` audit for an orchestration the human never got.
+    fs::create_dir_all(repo.path().join(".loomux")).unwrap();
+    fs::write(
+        repo.path().join(".loomux").join("workflow.yml"),
+        "version: 1\nblocks:\n  - id: orchestrator\n    kind: orchestrator\n    cli: copilot\n",
+    )
+    .unwrap();
+    let err = promote_to_orchestrator_sync(
+        &reg,
+        &repo_path,
+        &sid,
+        "claude",
+        PromoteConfig { advanced_orchestrator: true, ..PromoteConfig::default() },
+    )
+    .unwrap_err();
+    drop_claude_store(&store);
+    assert!(err.starts_with("promote-cli-mismatch:"), "got: {err}");
+    assert!(
+        groups_on_disk(&reg).is_empty(),
+        "a refused promote must leave no orphan group behind — there is nothing to resume it with"
+    );
+}
+
+#[test]
+fn promote_refuses_a_dormant_group_whose_own_agent_cli_is_not_the_panes() {
+    use std::sync::Arc;
+    let (reg, _d) = test_registry();
+    let reg = Arc::new(reg);
+    let (_repo, repo_path, sid, store) = promotable_pane("promote-cli-inherited");
+    // rev-1 N1: the built-in roster persists every block's `cli` as `""` —
+    // "inherit the group default" — so a dormant group launched on copilot has
+    // no per-block CLI to mismatch on. Inheriting `blocks` without `agent_cli`
+    // would let a claude pane promote straight in, re-CLI every delegate that
+    // group ever spawns, and never say so: the promote modal has no CLI field.
+    let dormant = reg
+        .create_group_ex(&repo_path, Guardrails { agent_cli: "copilot".into(), ..rails() }, Launch::Fresh)
+        .unwrap();
+    let before = group_fingerprints(&reg);
+    let err = promote_to_orchestrator_sync(&reg, &repo_path, &sid, "claude", PromoteConfig::default())
+        .unwrap_err();
+    drop_claude_store(&store);
+    assert!(
+        err.starts_with("promote-cli-mismatch:"),
+        "the group's own CLI is part of the roster its human approved: {err}"
+    );
+    assert_eq!(
+        group_fingerprints(&reg),
+        before,
+        "and the refusal leaves the dormant group exactly as it was"
+    );
+    assert_eq!(
+        reg.load_group_file(&dormant.id).unwrap().1.agent_cli,
+        "copilot",
+        "its persisted CLI above all — that is the thing a silent promote would have rewritten"
+    );
 }
 
 #[test]
