@@ -7931,14 +7931,12 @@ fn menu_structure_rendered(c: Composed<'_>) -> bool {
     if pointer_rendered(c.masked) {
         return true;
     }
-    let survived: std::collections::HashSet<&str> = c.masked.lines().collect();
-    bottom_rendered_rows(c.with_paste, MENU_TOKEN_TAIL_ROWS)
-        .into_iter()
-        .filter(|r| survived.contains(*r))
-        .any(|r| {
-            let row = r.trim().to_lowercase();
-            NUMBERED_MENU_TOKENS.iter().chain(MENU_FOOTER_TOKENS).any(|t| row.contains(t))
-        })
+    // [scratch/903-red-9] the ONE behaviour set aside: the token lists are read
+    // over the WHOLE composed screen again — the pre-rev-438 shape, in which a
+    // finished turn that merely quotes "use arrow keys" carries menu structure
+    // forever and vetoes the #903 release.
+    let flat = flatten_rendered(c.masked);
+    NUMBERED_MENU_TOKENS.iter().chain(MENU_FOOTER_TOKENS).any(|t| flat.contains(t))
 }
 
 /// Does any rendered row lead with a menu pointer (#534 rev-13)?
