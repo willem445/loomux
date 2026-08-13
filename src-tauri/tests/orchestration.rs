@@ -32046,6 +32046,7 @@ fn no_registry_construction_bypasses_the_test_agent_dir_overrides() {
     // slashes), not bare filename, so a same-named file in a subdirectory
     // can never collide with a top-level one.
     let sanctioned: &[(&str, usize)] = &[
+        ("groupid.rs", 1),       // registry_at
         ("orchestration.rs", 1), // relaunch_registry
         ("workflow.rs", 1),      // relaunch_registry
         ("lessonsfile.rs", 1),   // test_registry

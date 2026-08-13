@@ -21,6 +21,27 @@ use loomux_lib::orchestration::{
 use loomux_lib::sessions::detect_orch_signature;
 use serde_json::json;
 
+/// This file's one sanctioned `OrchRegistry::new` (#464, pinned by
+/// `no_registry_construction_bypasses_the_test_agent_dir_overrides` in
+/// `tests/orchestration.rs`). Nothing here spawns an agent, but the guard is
+/// deliberately structural rather than case-by-case: a raw registry whose
+/// agent-dir overrides are unset writes generated custom-agent files into the
+/// developer's REAL `~/.claude/agents` on its first spawn, and "this test
+/// doesn't spawn one *yet*" is exactly the reasoning that filled a real agents
+/// dir with 1,111 stray files.
+///
+/// Takes the root rather than minting one, because these tests care about
+/// where the root IS: the point of the escape probes is that a path lands
+/// somewhere other than under it.
+fn registry_at(root: &std::path::Path, scratch: &std::path::Path) -> OrchRegistry {
+    let reg = OrchRegistry::new(root.to_path_buf());
+    reg.set_claude_agents_dir_override(scratch.join("claude-agents"));
+    reg.set_copilot_agents_dir_override(scratch.join("copilot-agents"));
+    reg.set_compact_hook_dir_override(scratch.join("compacthook"));
+    reg.set_copilot_hooks_dir_override(scratch.join("copilot-hooks"));
+    reg
+}
+
 // ─────────────────────────── 1. refusal ───────────────────────────
 
 /// The traversal alphabet, one shape per row. Each is a *distinct* way to name
@@ -221,7 +242,7 @@ fn a_traversal_group_id_must_not_write_outside_the_orchestration_root() {
     let root = tmp.path().join("orchestration");
     let escaped = tmp.path().join("escaped");
 
-    let reg = OrchRegistry::new(root.clone());
+    let reg = registry_at(&root, tmp.path());
     reg.audit("../escaped", "human", "probe", json!({ "probe": "#904" }));
 
     assert!(
