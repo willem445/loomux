@@ -45,3 +45,12 @@ Bundled in the Windows installer for clean terminal-resize behavior.
 - License: MIT (Copyright (c) Microsoft Corporation), full text in
   `src-tauri/resources/conhost/LICENSE`. Provenance notes in
   `src-tauri/resources/conhost/README.md`.
+
+## frontend-design agent skill — Apache-2.0 (shipped in-repo)
+
+`.claude/skills/frontend-design/` is vendored verbatim from
+[anthropics/skills](https://github.com/anthropics/skills)
+@ `2235be7c60b551f5de82ade908fd3816455afcda`
+(`skills/frontend-design/`: `SKILL.md` + `LICENSE.txt`). The license ships
+alongside the skill. Do not edit these files in place — re-vendor from
+upstream and update the pin here (see the sibling `README.md`).
