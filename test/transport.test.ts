@@ -188,25 +188,80 @@ test("setEngineTransport returns the transport it displaced, so a swap is revers
 // ---------- structure: one module speaks Tauri ----------
 
 const SRC = fileURLToPath(new URL("../src/", import.meta.url));
-const MODULES = readdirSync(SRC).filter((f) => f.endsWith(".ts"));
+
+/** Every `.ts` under `src/`, AT ANY DEPTH, with `/` separators.
+ *
+ *  Recursive for the reason `perfpolicy.test.ts` had to learn in review: a flat
+ *  read of a flat directory passes today and fails SILENTLY the day someone adds
+ *  `src/<subdir>/`. A module the scan never opens is not a violation it reports,
+ *  it is a file it cannot see — and this test's whole value is that it sees all
+ *  of them. */
+const MODULES = readdirSync(SRC, { recursive: true })
+  .map((entry) => String(entry).replace(/\\/g, "/"))
+  .filter((f) => f.endsWith(".ts"))
+  .sort();
 
 /** Every `@tauri-apps/*` a module actually imports.
  *
  *  Anchored at STATEMENT position (`^\s*import`) rather than matching the package
  *  string anywhere, because this file and the seam both discuss the import in
  *  prose — a scanner that reads comments would flag the argument for the rule as
- *  a violation of it. The three forms that exist: `import … from "…"` (the `[^;]`
+ *  a violation of it. The four forms that exist: `import … from "…"` (the `[^;]`
  *  run crosses newlines, so a multi-line named import is covered), a bare
- *  side-effect import, and a dynamic `import("…")` (which can sit mid-expression,
- *  so it is the one match that is not line-anchored). */
+ *  side-effect import, a dynamic `import("…")` (which can sit mid-expression, so it
+ *  is the one match that is not line-anchored), and `export … from "…"` — a
+ *  re-export is an import wearing a different keyword, and omitting it would leave
+ *  a one-line way to hand `invoke` to every module that asks for it. */
 function tauriImports(source: string): string[] {
   const patterns = [
     /^[ \t]*import\b[^;]*?from\s*["'](@tauri-apps\/[^"']+)["']/gm,
     /^[ \t]*import\s*["'](@tauri-apps\/[^"']+)["']/gm,
     /\bimport\s*\(\s*["'](@tauri-apps\/[^"']+)["']\s*\)/g,
+    /^[ \t]*export\b[^;]*?from\s*["'](@tauri-apps\/[^"']+)["']/gm,
   ];
   return patterns.flatMap((re) => [...source.matchAll(re)].map((m) => m[1]));
 }
+
+test("the scanner sees every way a module could reach Tauri, and ignores prose", () => {
+  // Anti-vacuity. The structural test below is worth exactly what this one is: a
+  // scanner that has quietly stopped matching reports an empty offender list,
+  // which is indistinguishable from a clean tree.
+  assert.deepEqual(
+    tauriImports(
+      [
+        `import { invoke } from "@tauri-apps/api/core";`,
+        `import {`,
+        `  listen,`,
+        `} from "@tauri-apps/api/event";`,
+        `import * as win from "@tauri-apps/api/window";`,
+        `import "@tauri-apps/plugin-dialog";`,
+        `export { invoke } from "@tauri-apps/api/core";`,
+        `const m = await import("@tauri-apps/api/app");`,
+      ].join("\n")
+    ).sort(),
+    [
+      "@tauri-apps/api/app",
+      "@tauri-apps/api/core",
+      "@tauri-apps/api/core",
+      "@tauri-apps/api/event",
+      "@tauri-apps/api/window",
+      "@tauri-apps/plugin-dialog",
+    ]
+  );
+
+  // ...and the false positive that would make the rule unstateable: this repo's
+  // comments explain WHY, which means they quote the import they forbid.
+  assert.deepEqual(
+    tauriImports(
+      [
+        `// Never write \`import { invoke } from "@tauri-apps/api/core"\` here.`,
+        `/** See @tauri-apps/api/event for the Event<T> this narrows. */`,
+        `import { invoke } from "./transport.ts";`,
+      ].join("\n")
+    ),
+    []
+  );
+});
 
 test("`src/transport.ts` is the ONLY module that imports @tauri-apps", () => {
   // The constraint, stated over the whole tree rather than the modules that
