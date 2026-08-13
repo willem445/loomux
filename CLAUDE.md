@@ -187,6 +187,7 @@ narrow their ask back down to the original ticket on your own judgment.
   comments (the "comments explain *why*" convention), the shipped
   agent-role templates (`src-tauri/src/orchestration/templates/`, governed
   by their design notes), and **vendored files** (any skill directory with
-  a "vendored — do not edit" README, e.g. `.claude/skills/frontend-design/`):
+  a "Vendored skill — do not edit in place" README, e.g.
+  `.claude/skills/frontend-design/`):
   editing those silently forks the vendor — re-vendor from upstream instead,
   per `THIRD_PARTY_NOTICES.md`.

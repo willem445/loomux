@@ -3,9 +3,9 @@
 Loomux ships one third-party component inside its Windows installer (the ConPTY
 host, below). It also documents an **opt-in** component — the whisper.cpp voice
 runtime — which loomux does **not** distribute: users install it themselves if
-they want voice input — and **shipped in-repo** content vendored verbatim into
-this repository (the frontend-design agent skill, below). Each component is
-used under its own license.
+they want voice input. A third class is **shipped in-repo**: content vendored
+verbatim into this repository (the frontend-design agent skill, below). Each
+component is used under its own license.
 
 ## whisper.cpp voice runtime — MIT (opt-in; not shipped)
 
