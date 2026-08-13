@@ -5,10 +5,13 @@
 // buffered and flushed on attach, so startup output (shell banners,
 // prompts) can never be lost to a listen/spawn race.
 
-import { invoke } from "@tauri-apps/api/core";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { getCurrentWindow } from "@tauri-apps/api/window";
-import { getVersion } from "@tauri-apps/api/app";
+import {
+  invoke,
+  listen,
+  hostVersion,
+  onCloseRequested,
+  type UnlistenFn,
+} from "./transport.ts";
 import type { ShellKind } from "./panesetup";
 import type { CliKnobs } from "./selectorknobs";
 
@@ -189,17 +192,17 @@ export const saveSshProfiles = (contents: string): Promise<void> =>
 
 /** This build's version, as declared in `tauri.conf.json` / `package.json`.
  *
- *  Here rather than imported where it is used, for the reason the rest of this module
- *  exists (CLAUDE.md constraint 5): the app's modules talk to ONE Tauri seam. The workflow
- *  pane (#222) stamps it into a workflow file it CREATES (`authored_with:`), so a file that
- *  later misbehaves can say which build wrote it.
+ *  A wrapper rather than a raw `hostVersion()` call at each site, for the reason the rest
+ *  of this module exists: callers get the SWALLOWING contract below, not just the seam. The
+ *  workflow pane (#222) stamps it into a workflow file it CREATES (`authored_with:`), so a
+ *  file that later misbehaves can say which build wrote it.
  *
  *  Never throws: a version we couldn't read is not worth failing a feature over, and the
  *  callers all treat "" as "don't write the key", which is the honest outcome — an absent
  *  key beats an `authored_with: unknown`. */
 export async function appVersion(): Promise<string> {
   try {
-    return await getVersion();
+    return await hostVersion();
   } catch {
     return "";
   }
@@ -225,11 +228,11 @@ export async function appVersion(): Promise<string> {
  *  the clean-exit sentinel (lib.rs) — so a permitted quit still tears everything down
  *  exactly as before. We put a question in front of the existing path, not a second path.
  *
- *  Lives HERE, with the rest of the Tauri surface, so the app's modules keep talking to
- *  one seam instead of importing the window API each (CLAUDE.md constraint 5). */
+ *  Lives HERE, as a named capability, so the app's modules keep talking to typed wrappers
+ *  rather than to window-lifecycle plumbing (CLAUDE.md constraint 5). The Tauri call
+ *  itself is `transport.ts`'s. */
 export async function guardAppClose(allow: () => Promise<boolean>): Promise<void> {
-  const win = getCurrentWindow();
-  await win.onCloseRequested(async (event) => {
+  await onCloseRequested(async (event) => {
     try {
       if (!(await allow())) event.preventDefault();
     } catch {

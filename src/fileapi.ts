@@ -8,8 +8,7 @@
 // Every command takes a `root` (the pane's live cwd) plus a `rel` path relative
 // to it; ALL path safety is enforced server-side (see fileedit.rs).
 
-import { invoke } from "@tauri-apps/api/core";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { invoke, listen, type UnlistenFn } from "./transport.ts";
 
 /** One entry in a directory listing. Symlinks are shown but never expanded. */
 export interface FtEntry {

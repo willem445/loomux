@@ -2,7 +2,7 @@
 // snapshot on the "system-metrics" event every couple of seconds; the status
 // bar just subscribes here.
 
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { listen, type UnlistenFn } from "./transport.ts";
 
 export interface GpuMetrics {
   /** Adapter name (tooltip). */

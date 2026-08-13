@@ -1,6 +1,5 @@
 import "./styles.css";
-import { getVersion } from "@tauri-apps/api/app";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, hostVersion } from "./transport.ts";
 import { showToast } from "./toast";
 import type { Grid } from "./grid";
 import { Workspace } from "./workspace";
@@ -2184,7 +2183,7 @@ window.addEventListener("keydown", (e) => {
 void (async () => {
   try {
     const el = document.getElementById("app-version");
-    if (el) el.textContent = `v${await getVersion()}`;
+    if (el) el.textContent = `v${await hostVersion()}`;
   } catch {
     /* version is cosmetic; ignore */
   }

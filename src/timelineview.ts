@@ -16,7 +16,7 @@
 // terminal — the chart's width comes from its own container via a
 // ResizeObserver, and the pure layout takes that width as a parameter.
 
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./transport.ts";
 // The orch_* reads are called here directly, exactly as AuditView and
 // TasksView call `orch_audit` / `orch_tasks`: an orchestration view is its own
 // bridge for the group-scoped read it renders. The gh half goes through

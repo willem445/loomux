@@ -18,7 +18,7 @@
 // the residual it leaves live with the backend, in `run_blocking`'s doc in
 // src-tauri/src/git.rs; don't restate it here, it drifted once already.
 
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./transport.ts";
 import { SerialQueue } from "./gitqueue";
 
 /** Serializes the mutating git commands in click order (#726). */

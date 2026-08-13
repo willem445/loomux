@@ -5,8 +5,7 @@
 // backend-side and (except reorders) surfaced to the orchestrator as a
 // typed notice.
 
-import { invoke } from "@tauri-apps/api/core";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { invoke, listen, type UnlistenFn } from "./transport.ts";
 import { swapIfConnected } from "./domutil";
 import {
   approvableSelection,

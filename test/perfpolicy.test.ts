@@ -740,12 +740,26 @@ test("every setInterval in src/ is declared in the timer manifest, at its real c
   }
 });
 
+/** The `listen(` shapes in `src/transport.ts` that are DECLARATIONS of the
+ *  primitive rather than subscriptions (#905): the interface member, the local
+ *  implementation's property, and the exported forwarder. Each takes an
+ *  `event: string` parameter, so none can produce a literal, and none registers
+ *  anything by existing.
+ *
+ *  Pinned as a COUNT rather than skipping the file, so a fourth `listen(` in the
+ *  seam fails here and has to be argued rather than inherited. The seam does not
+ *  blind the scan: every real subscription still reads `listen("event-name", cb)`
+ *  in its own module, with its own literal, and is extracted exactly as before —
+ *  #905 moved which module imports Tauri, not what this scanner can see. */
+const SEAM_LISTEN_DECLARATIONS: Record<string, number> = { "src/transport.ts": 3 };
+
 test("the scan still sees the code it is supposed to read", () => {
   // Anti-vacuity, both scanners, and the only thing standing between this file
   // and a test that passes because its regexes stopped matching anything. A
-  // `listen()` wrapper, a renamed helper, or a timer moved behind a utility
-  // would each make the scan quietly read an empty tree while the manifests
-  // still look authoritative.
+  // renamed helper, a timer moved behind a utility, or a wrapper that HID the
+  // event name (unlike the #905 seam, which passes it straight through at every
+  // call site) would each make the scan quietly read an empty tree while the
+  // manifests still look authoritative.
   const sources = realSources();
   assert.ok(sources.length > 0, "the src/ scan found no TypeScript files at all");
 
@@ -769,7 +783,7 @@ test("the scan still sees the code it is supposed to read", () => {
   // under-report and the manifest would pass over a real listener.
   for (const src of sources) {
     assert.equal(
-      listenHits(src).length,
+      listenHits(src).length + (SEAM_LISTEN_DECLARATIONS[src.path] ?? 0),
       countCalls(src.text, LISTEN_CALL_SRC),
       `${src.path}: a listen() call site produced no event name. If the name is not a string ` +
         `literal it needs a manifest decision (INV-3), and if this is prose in a comment, reword it`

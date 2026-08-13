@@ -5,7 +5,7 @@
 // Rotation is handled backend-side (orch_audit reads audit.1.jsonl before
 // audit.jsonl), so the viewer never has to know about it.
 
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./transport.ts";
 import { asObject, str, summarize, type AuditEntry } from "./auditsummary";
 import { nextWindowStart, backfillWindowStart } from "./auditwindow";
 import { PollGate } from "./pollgate";
