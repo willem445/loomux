@@ -24869,7 +24869,7 @@ impl OrchRegistry {
         // clear that group's merge gate on the way past (the toggle-off arm
         // below). The live-adjustable knobs are re-hydrated further down, where
         // both launch kinds share the same `resumed` gate.
-        if false && launch == Launch::Promote && resumed {
+        if launch == Launch::Promote && resumed {
             if let Some((_, persisted)) = self.load_group_file(&id) {
                 guardrails.blocks = persisted.blocks;
                 guardrails.advanced_orchestrator = persisted.advanced_orchestrator;
