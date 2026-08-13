@@ -33028,8 +33028,8 @@ fn drop_claude_store(store: &std::path::Path) {
     let _ = fs::remove_dir_all(store);
 }
 
-/// Every group id with a `group.json` on disk — "did that refusal create
-/// anything?", which is the half of a refusal that is easy to get wrong.
+/// Every group id with a `group.json` on disk. The building block for
+/// [`group_fingerprints`], which is what the refusal tests actually assert on.
 fn groups_on_disk(reg: &OrchRegistry) -> Vec<String> {
     let mut out: Vec<String> = fs::read_dir(reg.state_root())
         .map(|entries| {
@@ -33044,11 +33044,18 @@ fn groups_on_disk(reg: &OrchRegistry) -> Vec<String> {
     out
 }
 
-/// Every group's `group.json` text and audit-log length, keyed by id — the
-/// stronger form of [`groups_on_disk`], for a refusal that could have REWRITTEN
-/// an existing group rather than created a new one. `group.json` carries a
+/// Every group's `group.json` text and audit-log length, keyed by id — "what
+/// did that refusal touch?", which is the half of a refusal that is easy to get
+/// wrong, and the half that is only *half* answered by a list of ids: a promote
+/// can be refused after REWRITING an existing group rather than after creating
+/// a new one, and the id list is identical either way. `group.json` carries a
 /// `created_ms` stamped at each write, so a rewrite shows up here even when it
-/// happens to persist identical guardrails.
+/// persists byte-identical guardrails.
+///
+/// Every refusal test asserts on this (rev-2 N3), including the five that run
+/// against a state root with no groups at all, where it degrades to the same
+/// emptiness check a name list would give — uniform, and one less thing for the
+/// next person adding a refusal to have to choose between.
 fn group_fingerprints(reg: &OrchRegistry) -> Vec<(String, String, usize)> {
     let mut out: Vec<(String, String, usize)> = groups_on_disk(reg)
         .into_iter()
@@ -33224,7 +33231,7 @@ fn promote_refuses_a_non_claude_pane() {
         .unwrap_err();
     drop_claude_store(&store);
     assert!(err.starts_with("promote-unsupported-cli:"), "got: {err}");
-    assert!(groups_on_disk(&reg).is_empty(), "a refused promote must create nothing");
+    assert!(group_fingerprints(&reg).is_empty(), "a refused promote must create nothing");
 }
 
 #[test]
@@ -33243,7 +33250,7 @@ fn promote_refuses_anything_short_of_a_full_session_id() {
     drop_claude_store(&store);
     assert!(err.starts_with("promote-bad-session:"), "got: {err}");
     assert!(empty.starts_with("promote-bad-session:"), "got: {empty}");
-    assert!(groups_on_disk(&reg).is_empty(), "a refused promote must create nothing");
+    assert!(group_fingerprints(&reg).is_empty(), "a refused promote must create nothing");
 }
 
 #[test]
@@ -33267,7 +33274,7 @@ fn promote_refuses_a_repo_path_that_is_not_a_usable_directory() {
     drop_claude_store(&store);
     assert!(missing.starts_with("promote-bad-repo:"), "got: {missing}");
     assert!(quoted.starts_with("promote-bad-repo:"), "got: {quoted}");
-    assert!(groups_on_disk(&reg).is_empty(), "a refused promote must create nothing");
+    assert!(group_fingerprints(&reg).is_empty(), "a refused promote must create nothing");
 }
 
 #[test]
@@ -33282,13 +33289,20 @@ fn promote_refuses_a_session_that_is_already_an_orchestration_member() {
     let g = reg.create_group(&repo_path, rails()).unwrap();
     let w = reg.spawn_agent(&g.id, Role::Worker, "w", "", false, None).unwrap();
     let member = w.session_id.clone().expect("a claude worker records a session id");
-    let before = groups_on_disk(&reg);
+    let before = group_fingerprints(&reg);
     let err = promote_to_orchestrator_sync(&reg, &repo_path, &member, "claude", PromoteConfig::default())
         .unwrap_err();
     drop_claude_store(&store);
     assert!(err.starts_with("promote-already-managed:"), "got: {err}");
     assert!(err.contains(&g.id), "the refusal must name the group it is already in: {err}");
-    assert_eq!(groups_on_disk(&reg), before, "a refused promote must create no second group");
+    // Fingerprints, not names: this refusal runs against an EXISTING group, so
+    // "created no second group" is not the whole statement — it must not have
+    // rewritten the live one either.
+    assert_eq!(
+        group_fingerprints(&reg),
+        before,
+        "a refused promote must create no second group, and must not touch the one it refused against"
+    );
 }
 
 #[test]
@@ -33311,7 +33325,7 @@ fn promote_refuses_a_session_the_cli_store_has_never_heard_of() {
     .unwrap_err();
     drop_claude_store(&store);
     assert!(err.starts_with("promote-not-found:"), "got: {err}");
-    assert!(groups_on_disk(&reg).is_empty(), "a refused promote must create nothing");
+    assert!(group_fingerprints(&reg).is_empty(), "a refused promote must create nothing");
 }
 
 #[test]
@@ -33534,7 +33548,7 @@ fn promote_refuses_a_fresh_group_whose_workflow_file_pins_another_cli() {
     drop_claude_store(&store);
     assert!(err.starts_with("promote-cli-mismatch:"), "got: {err}");
     assert!(
-        groups_on_disk(&reg).is_empty(),
+        group_fingerprints(&reg).is_empty(),
         "a refused promote must leave no orphan group behind — there is nothing to resume it with"
     );
 }

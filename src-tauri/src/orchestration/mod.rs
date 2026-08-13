@@ -44074,16 +44074,36 @@ fn register_orchestrator_pane(
     // THE BACKSTOP, not the refusal (#407 rev-1 B1). `create_orchestration_group`
     // makes this same call read-only before `create_group_ex` runs, so in every
     // ordinary case a mismatch is refused with nothing created. This one is
-    // re-derived against the roster that ACTUALLY resolved, and it can disagree
-    // with the pre-check in exactly one way: the pre-check picks the candidate
-    // group id by liveness, an agent can die between the two scans (liveness is
-    // not held by `creation`), and the launch can then land on an EARLIER
-    // candidate — a different group, with a different roster. Reaching this is
-    // therefore a lost race, not a normal path, and it is the one refusal that
-    // leaves a created/reattached group behind; the group state is durable, so
-    // the dormant-group Resume card is the way back in. Kept rather than
-    // trusting the pre-check alone, because the cost of being wrong here is a
-    // dead pane holding the context the gesture existed to preserve.
+    // re-derived against the roster that ACTUALLY resolved.
+    //
+    // WHY THE TWO CAN DISAGREE, as a class rather than a list (rev-2 N4): the
+    // pre-check and the launch READ THE SAME INPUTS TWICE, and `creation` pins
+    // none of them — it serializes loomux's own group creations, and that is
+    // all. Every input that can change between the two reads is a way to
+    // disagree. Known instances, and the list is deliberately not closed:
+    //
+    //   - **liveness, either direction.** The candidate id is picked by
+    //     `group_is_live`, which is not under `creation`: an agent dying
+    //     between the scans moves the launch onto an EARLIER candidate, one
+    //     starting moves it onto a LATER one — a different group, so a
+    //     different roster.
+    //   - **`.loomux/workflow.yml`.** Read once here and once in
+    //     `create_group_ex`, with no lock on the file. A `git pull` or an agent
+    //     editing it in between resolves two different rosters — and this repo
+    //     already treats mid-session edits of that file as a live, accepted
+    //     reality (see #459 in `create_group_ex`'s resume arm), which makes
+    //     this likelier than the liveness race, not rarer.
+    //   - **the candidate's own `group.json`.** Likewise read twice. A live
+    //     toggle (`orch_set_advanced_orchestrator`, `set_max_agents`) rewrites
+    //     it, and an `end_group` can remove the state dir outright — turning a
+    //     reattach into a fresh launch between one read and the next.
+    //
+    // None of these is behavioral: this check covers all of them, which is the
+    // point of it existing. It is kept rather than trusting the pre-check alone
+    // because the cost of being wrong is a dead pane holding the context the
+    // whole gesture exists to preserve — and it stays the one refusal that can
+    // leave a created/reattached group behind, the group state being durable
+    // enough that the dormant-group Resume card is the way back in.
     if let SessionOrigin::Promote { cli: pane_cli, .. } = origin {
         if &cli != pane_cli {
             return Err(format!(

@@ -11822,12 +11822,24 @@ because that refusal is the only one needing a *resolved* roster, it is delibera
   peeks is the one the launch picks. This is what keeps the refusal contract below true for all
   seven tags rather than six.
 - **The same check inside `register_orchestrator_pane`, against the roster that actually
-  resolved.** Reachable only by a lost race: liveness is not held by `creation`, so an agent
-  dying between the two candidate scans can move the launch onto an *earlier* group id than the
-  pre-check peeked. It is kept because the cost of being wrong is a dead pane holding the
-  context the gesture existed to preserve, and it is the one refusal that can leave a created or
-  reattached group behind — the group state is durable, so the dormant-group Resume card is the
-  way back in.
+  resolved.** Reachable only by a lost race — but the honest statement of *which* race is a
+  class, not a list: the two checks **read the same inputs twice**, and `creation` pins none of
+  them (it serializes loomux's own group creations, and that is all). Known ways to disagree,
+  and the list is deliberately not closed: the candidate id is picked by liveness, which is not
+  under the lock, so an agent dying between the scans moves the launch onto an *earlier* id and
+  one starting moves it onto a *later* one; `.loomux/workflow.yml` is read once by each, with no
+  lock on the file, so a `git pull` or an agent editing it in between resolves two different
+  rosters — a case this repo already treats as live and accepted (#459), which makes it likelier
+  than the liveness race rather than rarer; and the candidate's own `group.json` is likewise
+  read twice, so a live toggle rewriting it, or an `end_group` removing the state dir, can turn
+  a reattach into a fresh launch between one read and the next.
+
+  None of that is behavioral — the backstop covers all of it. The enumeration matters because it
+  is what a future reader will weigh when deciding whether the backstop is still needed, and
+  "exactly one way" would invite deleting it after fixing one race. It is kept because the cost
+  of being wrong is a dead pane holding the context the gesture existed to preserve, and it is
+  the one refusal that can leave a created or reattached group behind — the group state is
+  durable, so the dormant-group Resume card is the way back in.
 
 ### Refusals are tagged, and happen before anything moves
 
@@ -11852,10 +11864,17 @@ nothing can say precisely why:
 Six of the seven are pure argument checks and refuse before anything is even resolved. The
 seventh needs a resolved roster, which is why it is made twice (above): the read-only pre-check
 is what lets "nothing is created" hold for it too, and its post-creation twin is a raced
-backstop rather than the refusal. `group_fingerprints` — each group's `group.json` text plus its
-audit length — is asserted unchanged across every refusal test, including that one, so
-"created nothing" is pinned rather than stated; `group.json` carries a `created_ms` stamped at
-each write, so even a rewrite that persisted identical guardrails would show up.
+backstop rather than the refusal.
+
+That "nothing is created" is pinned rather than stated. `group_fingerprints` — each group's
+`group.json` text plus its audit length — is asserted unchanged by **all eight** refusal tests.
+For the five that run against a state root with no groups at all it degrades to an emptiness
+check, which is the whole statement there; it earns its keep in the three that refuse against an
+*existing* group (the two CLI-mismatch reattaches and the already-managed refusal), where the
+failure mode is a **rewrite** and a list of group ids would be identical either way.
+`group.json` carries a `created_ms` stamped at every write, so a rewrite shows up even when it
+persists byte-identical guardrails — which is exactly how the pre-check's own red run printed
+the residue it was added to prevent.
 
 `promote-already-managed` is the one that is about roles rather than inputs. A delegate's
 transcript carries a delegate contract and a recorded group membership; promoting it would seat
