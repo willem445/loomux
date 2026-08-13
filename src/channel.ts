@@ -56,6 +56,20 @@ export function reduceConnect(
           ? { kind: "set-sender", channelId: action.pane.channelId, newSenderAgent: action.pane.agentId }
           : { kind: "none" },
       };
+    case "promote":
+      // #407: promotion is not a channel action — it has no effect here — but it
+      // does invalidate an arm pointing at THIS pane: the promotion retires the
+      // pane's `__solo__` identity (backend-side, `PromoteConfig.solo_agent_id`),
+      // so completing that arm afterwards would name a dead agent. Same rule
+      // `disconnect` already applies to its own source, and the same direction of
+      // error: an arm cleared once too often costs one right-click, while an arm
+      // that outlives its identity costs a failure the human can't read. Cleared
+      // on the GESTURE rather than on a successful promotion, because the reducer
+      // is pure — it sees the action, never the outcome.
+      return {
+        pending: pending && action.soloAgentId !== null && pending.agentId === action.soloAgentId ? null : pending,
+        effect: { kind: "none" },
+      };
   }
 }
 

@@ -173,3 +173,26 @@ test("channelBadge falls back to a receive-only receiver if selfAgentId isn't fo
   assert.equal(badge.canSend, false);
   assert.equal(badge.deliveryOnly, true);
 });
+
+// ---------- #407: promote is orthogonal to the connect machine, with one exception ----------
+
+const promoteAction = (soloAgentId: string | null) =>
+  ({ kind: "promote", repo: "/repo/poc", sessionId: "s-1", cli: "claude", soloAgentId }) as const;
+
+test("#407: promoting a pane makes no channel call and leaves an arm on a DIFFERENT pane alone", () => {
+  const { pending, effect } = reduceConnect(promoteAction("solo-9"), A);
+  assert.deepEqual(pending, A, "an unrelated armed source survives someone else's promotion");
+  assert.deepEqual(effect, { kind: "none" });
+});
+
+test("#407: promoting the ARMED pane clears the arm — its __solo__ identity is retired by the promotion", () => {
+  const armedSolo: PendingConnect = { ...A, agentId: "solo-7", name: "poc" };
+  const { pending, effect } = reduceConnect(promoteAction("solo-7"), armedSolo);
+  assert.equal(pending, null, "completing that arm afterwards would name an agent the promotion retired");
+  assert.deepEqual(effect, { kind: "none" });
+});
+
+test("#407: a promote with no solo identity to retire never clears an unrelated arm", () => {
+  const { pending } = reduceConnect(promoteAction(null), A);
+  assert.deepEqual(pending, A);
+});

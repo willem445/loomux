@@ -22,6 +22,13 @@ export interface ModalSpec<T> {
    *  moment the human must read it. A real list, so each path wraps as its own item and
    *  a long one scrolls instead of pushing the buttons off-screen. */
   bodyLines?: string[];
+  /** One optional checkbox between the body and the buttons (#407): the promote
+   *  confirm has a single knob (run the repo's workflow roster), and a whole
+   *  second dialog kit for one tick-box would be the drift this module was lifted
+   *  out of fileedit.ts to avoid. `onChange` reports the live value — the caller
+   *  reads it alongside the button's own resolved value, so the two answers
+   *  ("did they confirm" / "with the box ticked") stay separate. */
+  checkbox?: { label: string; checked: boolean; title?: string; onChange: (checked: boolean) => void };
 }
 
 /** Show a modal and resolve with the chosen button's value. The builder receives
@@ -53,6 +60,20 @@ export function modal<T>(build: (resolve: (v: T) => void) => ModalSpec<T>): Prom
       const list = el("ul", "dlg-list");
       for (const line of spec.bodyLines) list.appendChild(el("li", "", line));
       dlg.appendChild(list);
+    }
+    if (spec.checkbox) {
+      // Same markup the launcher's advanced-orchestrator toggle uses
+      // (`.dlg-toggle` label around a `.dlg-check` input), so this dialog's one
+      // knob looks like every other checkbox in the app.
+      const label = el("label", "dlg-toggle") as HTMLLabelElement;
+      const box = document.createElement("input");
+      box.type = "checkbox";
+      box.className = "dlg-check";
+      box.checked = spec.checkbox.checked;
+      box.addEventListener("change", () => spec.checkbox!.onChange(box.checked));
+      if (spec.checkbox.title) label.title = spec.checkbox.title;
+      label.append(box, el("span", "", spec.checkbox.label));
+      dlg.appendChild(label);
     }
     const actions = el("div", "dlg-actions");
     for (const b of spec.buttons) {

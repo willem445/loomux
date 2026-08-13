@@ -70,7 +70,26 @@ export type PaneMenuAction =
   | { kind: "disconnect"; pane: PaneIdentity }
   /** Human-only sender swap (B5) — "Make this pane the sender" on a
    *  token-holding receiver of an already-live channel. */
-  | { kind: "set-sender"; pane: PaneIdentity };
+  | { kind: "set-sender"; pane: PaneIdentity }
+  /** Promote this standalone agent pane to the orchestrator of a real group
+   *  (#407). Carries the whole `promote_to_orchestrator` argument list decided
+   *  HERE, at menu-build time — the same identity-vs-reference discipline the
+   *  connect actions follow: by the time the human clicks, the pane may have
+   *  re-bound or been typed into, and a promotion that resumes a DIFFERENT
+   *  session than the menu was built against is the one mistake this gesture
+   *  can't take back. */
+  | {
+      kind: "promote";
+      /** The pane's own working directory — becomes the group's repo. */
+      repo: string;
+      /** Full session id (never a prefix — the backend refuses one). */
+      sessionId: string;
+      cli: string;
+      /** The `__solo__` agent id the promotion retires, or null when this pane
+       *  never got a standalone channel identity (adopt-on-connect failed, or
+       *  the pane predates channel tools). Optional backend-side. */
+      soloAgentId: string | null;
+    };
 
 export type PaneMenuItem = MenuItem<PaneMenuAction>;
 
@@ -97,6 +116,25 @@ export interface PaneConnectState {
   /** This pane's current channel's sender, if connected — see `PaneIdentity`. */
   senderId: string | null;
   senderName: string | null;
+  // ── #407: what the PROMOTE gesture needs, and nothing else ──────────────
+  // These four are read off the pane exactly as `Pane.isAgentPane` /
+  // `Pane.agentCli` / `Pane.sessionId` / `Pane.workdir` report them. They carry
+  // the VALUES rather than the `hasSessionId`/`hasWorkdir` booleans the plan
+  // sketched, for the same reason `PaneIdentity` carries a whole identity: the
+  // fired action has to be a complete instruction, and a bool cannot fill one.
+  /** Whether this pane was launched with an agent CLI at all (vs a plain shell
+   *  or a content pane). Promotion is an agent-pane gesture; everything else
+   *  gets no item, not a disabled one. */
+  isAgentPane: boolean;
+  /** The normalized agent CLI this pane runs ("claude" | "copilot" | …), or
+   *  null for a plain shell or an unrecognized program. v1 promotes claude. */
+  agentCli: string | null;
+  /** The pane's recorded full session id, or null when loomux hasn't minted or
+   *  learned one yet (#440) — a pane nobody has prompted has no conversation to
+   *  carry over. */
+  sessionId: string | null;
+  /** The pane's working directory — becomes the promoted group's repo. */
+  workdir: string | null;
 }
 
 const NOT_CAPABLE_REASON =
@@ -105,6 +143,60 @@ const PLANNER_REASON =
   "A planner's pane closes as soon as it reports done, so it can never join a channel.";
 const CANT_BE_SENDER_REASON =
   "This pane is receive-only — it has no channel token, so it can't be the sender.";
+
+// ---------- promote to orchestrator (#407) ----------
+
+const PROMOTE_LABEL = "Promote to orchestrator…";
+const PROMOTE_CLI_REASON =
+  "Promoting is Claude-only for now — a promotion resumes this pane's own session, and loomux only knows a claude pane's session id well enough to reopen it.";
+const PROMOTE_NO_SESSION_REASON =
+  "loomux doesn't know this pane's conversation yet — a promotion resumes the session it already has, so send this agent a prompt first.";
+const PROMOTE_NO_WORKDIR_REASON =
+  "This pane has no working directory, and a promoted pane's own directory becomes the group's repository.";
+
+/** The promote item for this pane, or `null` when the gesture doesn't apply here
+ *  at all.
+ *
+ *  Deliberately decided OUTSIDE `buildPaneMenu`'s connect short-circuits and
+ *  independently of every connect input (`pending`, `channelId`, `canSend`):
+ *  promotion has nothing to do with channels, and a claude pane whose
+ *  adopt-on-connect failed — no `group`, no `agentId`, so the connect half is
+ *  `NOT_CAPABLE` — is still a perfectly promotable session. Ordering that
+ *  decision after the short-circuit is exactly how the item would silently go
+ *  missing on the panes it exists for.
+ *
+ *  `null` (no item) vs disabled-with-a-reason:
+ *  - **no item** for a pane the gesture is not about — a shell/content pane, or
+ *    one already in an orchestration group. A delegate's menu must not grow a
+ *    permanently-dead row, and the backend refuses a recorded member anyway
+ *    (`promote-already-managed`), including the dormant membership this can't see.
+ *  - **disabled + reason** for an AGENT pane that could plausibly be promoted but
+ *    isn't eligible right now (wrong CLI, no session yet, no cwd). Here the human
+ *    is looking for the item, so silence would read as a missing feature. */
+function promoteItem(p: PaneConnectState): PaneMenuItem | null {
+  if (!p.isAgentPane) return null;
+  // An orchestration member has a group AND a real role; a standalone pane's
+  // identity is the `__solo__` carrier, whose role is "solo". Keyed off the role
+  // rather than the `"__solo__"` group sentinel so this module doesn't grow a
+  // second spelling of a constant that lives in mod.rs (mirrored once, in
+  // orchestration.ts's `SOLO_GROUP`).
+  if (p.group !== null && p.role !== "solo") return null;
+
+  const refuse = (reason: string): PaneMenuItem => ({ label: PROMOTE_LABEL, disabled: true, reason });
+  if (p.agentCli !== "claude") return refuse(PROMOTE_CLI_REASON);
+  if (!p.sessionId) return refuse(PROMOTE_NO_SESSION_REASON);
+  if (!p.workdir) return refuse(PROMOTE_NO_WORKDIR_REASON);
+  return {
+    label: PROMOTE_LABEL,
+    action: {
+      kind: "promote",
+      repo: p.workdir,
+      sessionId: p.sessionId,
+      cli: p.agentCli,
+      soloAgentId: p.role === "solo" ? p.agentId : null,
+    },
+  };
+}
 
 function identity(p: PaneConnectState): PaneIdentity | null {
   return p.group !== null && p.agentId !== null
@@ -124,8 +216,23 @@ function identity(p: PaneConnectState): PaneIdentity | null {
  *
  *  `pending` is the currently-armed connect source (channel.ts's module-level state,
  *  threaded in by the caller), or null if no gesture is in progress. Every action this
- *  returns carries the full identity it needs — see the module header. */
+ *  returns carries the full identity it needs — see the module header.
+ *
+ *  The menu is TWO independent gestures: the connect model below, and #407's
+ *  promote item appended here. Composed at this level (rather than inside the
+ *  connect branches) so the promote item cannot be lost to a connect
+ *  short-circuit — see `promoteItem`. */
 export function buildPaneMenu(pane: PaneConnectState, pending: PendingConnect | null): PaneMenuItem[] {
+  const items = connectItems(pane, pending);
+  const promote = promoteItem(pane);
+  if (promote) {
+    if (items.length) items.push({ label: "", separator: true });
+    items.push(promote);
+  }
+  return items;
+}
+
+function connectItems(pane: PaneConnectState, pending: PendingConnect | null): PaneMenuItem[] {
   const id = identity(pane);
   if (!id) return [{ label: "Connect", disabled: true, reason: NOT_CAPABLE_REASON }];
   if (pane.role === "planner") return [{ label: "Connect", disabled: true, reason: PLANNER_REASON }];
