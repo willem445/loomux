@@ -11904,6 +11904,74 @@ the backend rather than accepted from the caller. No agent-controllable input re
 seam, and a workflow file still grants no capability — it selects among rosters the human
 approved, which is the whole reason the reattach case pins rather than re-reads.
 
+### The frontend half (#407, slice B): one pane, two processes, nothing discarded
+
+The backend composes a `SpawnRequest`; only the frontend can point an existing pane at it.
+Three things about that turned out to be decisions rather than transcription.
+
+**The item is decided outside the connect menu's short-circuits.** `buildPaneMenu` answers
+"can this pane join a channel" first and returns early for a pane with no channel identity —
+and a claude pane whose adopt-on-connect failed is exactly such a pane *and* a perfectly
+promotable session. So the promote item is composed at the top level, from inputs (`agentCli`,
+`sessionId`, `workdir`) that say nothing about channels, and appended to whatever the connect
+half produced. Absent for a pane the gesture is not about (a shell or content pane; a pane
+running a command that is not a recognized agent CLI at all, like `npm run dev`; or a pane
+already in a group — the backend's `promote-already-managed` covers the dormant membership the
+frontend cannot see); disabled *with the reason* for an agent pane that could plausibly be
+promoted but isn't eligible yet, because there the human is looking for the item and silence
+reads as a missing feature. The line between the two is "would a reader of this row ever act on
+it": a copilot pane's human might promote it once v1 widens, a build watcher's never would.
+
+Those first three cases are **one** condition, `agentCli === null`, and that is worth stating
+because the obvious spelling is two. `Pane.isAgentPane` ("was launched with a command") looks
+like the natural gate for an agent-pane gesture, but it is the weaker half of the same fact:
+both it and `agentCli` derive from `Pane.spawnCommand`, so a recognized CLI always implies a
+command, while `npm run dev` is a command with no CLI. Gating on it would put a permanently-dead
+"Claude-only" row on a build watcher's menu; gating on **both** would leave a condition that
+nothing — in production or in a fixture — can make fire on its own, which is a branch no test
+can witness and no reader can maintain. So the struct carries the CLI and not the weaker
+boolean.
+
+The roster checkbox follows the same rule one level down. It is offered only for a workflow file
+that is **present and valid**, because an invalid one launches the built-in roster regardless
+(`Launch::Promote`) — a ticked box would promise a roster nothing is going to run. The file is
+still named, with what will actually run instead: this is the consent moment `Launch::Promote`'s
+own argument turns on, and the launcher warns inline about the same file.
+
+Both arms of that sentence carry the reattach clause — *a reattached dormant group keeps the
+roster it was launched with either way* — because the question the human is actually asking is
+"which roster will this promotion run", and `Launch::Promote` answers it from the **group case**
+before it ever reads the file. A broken file therefore does not imply the built-in four: it
+implies them for a *new* group dir, while a dormant reattach still restores the roster its own
+launch approved. Saying that on only the valid arm would leave two humans with two different
+understandings of one promotion, decided by which line their repo happened to earn.
+
+**A promoted pane is never discarded.** `openAgentPane`'s failure arms all close the pane —
+correct for one it just opened against a config that has since been torn down (#106), and
+exactly wrong here: this pane holds the human's conversation, and the group is already durable
+on disk. So the relaunch is its own function rather than a flag through that one, and every
+failure after the kill keeps the pane and names the group's Resume card. Silently starting a
+fresh session is the one outcome ruled out entirely — it would look like success while
+discarding the thing being promoted.
+
+**The kill is loomux's own, and the exit reaper has to be told.** `kill_pty` marks the exit
+*expected*, which is precisely the signature `closeOrKeep` reads as "the process ended, retire
+the pane" — so, unguarded, the reaper closes the pane between the kill and the respawn.
+`Pane.isRelaunching` (set/cleared around the relaunch, in a `finally`) is that guard, and it
+sits beside the same handler's `tryResumeFallback` (#194 BUG-1) for the same structural reason:
+an exit loomux caused, on a pane it is mid-way through rebuilding, is not the event that
+handler exists for. The pane's orchestration chrome is applied *before* the new spawn, while it
+has no pty at all, so the steering strip's height change is folded into the first fit rather
+than reaching a live ConPTY as a resize (constraint 1).
+
+One gap is deliberate and visible in the UI: the confirm states the three-case group policy but
+cannot name *which* case will apply, because that is decided by `create_group_ex`'s candidate
+scan under the creation lock and no read-only command previews it. Re-deriving it frontend-side
+from `orch_session_roles` would be a second, partial implementation of a backend policy — so the
+modal states the policy and the success toast names the group the backend actually resolved. A
+preview command (the same read-only-mirror shape `promote_orchestrator_cli` already uses) is the
+follow-up if that trade stops being acceptable.
+
 ## Risks / limitations
 
 - Kickoff typing races CLI boot; a fixed delay (4s) + bracketed paste is used. If a

@@ -338,6 +338,15 @@ const orchWiring: OrchWiring = {
     found.pane.focus();
   },
   applyAttention,
+  bindGroupForPane(pane, groupId): void {
+    // #407: the promoted pane never moved, so its group belongs to the tab it is
+    // already in. Silent no-op if the pane isn't in any grid (it was closed
+    // mid-promotion) — there is no tab to bind, and the group is durable either way.
+    const ws = tabs.tabs.find((t) => t.grid.allPanes().includes(pane));
+    if (!ws) return;
+    tabs.bindGroup(groupId, ws.id);
+    persistTabs();
+  },
   refreshTabBar(): void {
     tabs.touch();
   },
@@ -1936,6 +1945,20 @@ void onPtyExit((exit) => {
     return;
   }
   const { ws, pane } = found;
+  // #407: loomux killed this process itself, mid-promotion, and is about to spawn
+  // its replacement in the same terminal. `kill_pty` marks the exit expected,
+  // which is exactly the shape `closeOrKeep` reads as "retire the pane" — so
+  // without this the reaper would close the pane and take the conversation the
+  // promotion exists to preserve with it.
+  //
+  // The flag stays up across the bind that follows the respawn, so this also
+  // swallows an exit of the NEW pty in those few milliseconds (a `--resume` that
+  // dies instantly) — no banner, and the pane still counts as live until the next
+  // exit. Deliberate, and the safer direction of the two: the alternative is
+  // `tryResumeFallback` respawning that pane FRESH, which is precisely the silent
+  // discard of the promoted conversation the whole flow refuses to do. A promotion
+  // that lands in that window reports through its own recovery note instead.
+  if (pane.isRelaunching) return;
   if (tryResumeFallback(pane, exit)) return; // resume failed → fresh respawn in place
   closeOrKeep(ws, pane, exit, pane.keepOpenOnExit(exit));
 });

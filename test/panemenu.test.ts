@@ -3,9 +3,14 @@
 // state: free, connected, planner, solo, delivery-only, non-capable, the armed source
 // itself, a fresh two-party directional completion, and a join onto an already-driven
 // channel.
+//
+// #407 adds the promote-to-orchestrator item and its eligibility matrix at the
+// bottom of this file — a SECOND, independent gesture on the same menu, which is
+// why its tests assert on the promote item alone rather than on `kinds()` of the
+// whole menu.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { buildPaneMenu, type PaneConnectState, type PendingConnect } from "../src/panemenu.ts";
+import { buildPaneMenu, type PaneConnectState, type PaneMenuItem, type PendingConnect } from "../src/panemenu.ts";
 
 const free = (overrides: Partial<PaneConnectState> = {}): PaneConnectState => ({
   group: "g1",
@@ -16,6 +21,11 @@ const free = (overrides: Partial<PaneConnectState> = {}): PaneConnectState => ({
   canSend: true,
   senderId: null,
   senderName: null,
+  // #407: an orchestration worker pane — an agent pane, but never promotable
+  // (it already belongs to a group). The promote fixtures below override these.
+  agentCli: "claude",
+  sessionId: "11111111-2222-3333-4444-555555555555",
+  workdir: "/repo/poc",
   ...overrides,
 });
 
@@ -38,7 +48,12 @@ test("a free, MCP-capable pane with no pending arm offers only Connect (arm)", (
 });
 
 test("a non-orchestration pane (shell/content) offers a single disabled item, never a live action", () => {
-  const items = buildPaneMenu(free({ group: null, agentId: null, role: null }), null);
+  // `agentCli: null` is what makes this a SHELL pane rather than an agent pane
+  // whose adopt-on-connect failed. Before #407 nothing in the state told those
+  // two apart, and this fixture meant both; now they diverge (an agent pane
+  // keeps a promote item — see the #407 block below), so the fixture has to say
+  // which one it is. The connect assertion itself is unchanged.
+  const items = buildPaneMenu(free({ group: null, agentId: null, role: null, agentCli: null }), null);
   assert.equal(items.length, 1);
   assert.equal(items[0].disabled, true);
   assert.ok(items[0].reason && items[0].reason.length > 0);
@@ -55,7 +70,10 @@ test("a planner pane offers a single disabled item naming why, even though it ha
 test("a standalone solo pane with a channel identity is capable — it offers Connect like any other agent pane", () => {
   const solo = free({ group: "__solo__", agentId: "solo-3", role: "solo", canSend: true });
   const items = buildPaneMenu(solo, null);
-  assert.deepEqual(kinds(items), ["connect-arm"]);
+  // Connect first, then #407's promote item — a claude standalone pane is
+  // exactly the shape both gestures apply to, so this is the one place the two
+  // halves of the menu appear together.
+  assert.deepEqual(kinds(items), ["connect-arm", "promote"]);
 });
 
 test("right-clicking the ARMED pane again offers Cancel, not a second arm (self-click cancels)", () => {
@@ -172,4 +190,129 @@ test("a delivery-only RECEIVER never gets 'Make this pane the sender' — it has
   const pane = free({ channelId: "chan-1", agentId: "rev-2", name: "rev-2", canSend: false, senderId: "w-1", senderName: "w-1" });
   const items = buildPaneMenu(pane, null);
   assert.deepEqual(kinds(items), ["disconnect"]);
+});
+
+// ---------- promote to orchestrator (#407 slice B, plan step 6) ----------
+//
+// The eligibility matrix. Promotion is a SECOND gesture on this menu, decided
+// independently of the connect state: a pane with no channel identity at all
+// (adopt-on-connect failed, or the pane predates channel tools) is still a
+// perfectly promotable claude session, so the promote item must be built OUTSIDE
+// the connect short-circuits rather than after them.
+
+/** A standalone claude agent pane that has been adopted as `__solo__` — the
+ *  common shape at menu-build time, since `adoptIfEligible` runs before every
+ *  right-click. */
+const soloPane = (overrides: Partial<PaneConnectState> = {}): PaneConnectState =>
+  free({ group: "__solo__", agentId: "solo-3", name: "poc", role: "solo", ...overrides });
+
+const promoteOf = (items: PaneMenuItem[]): PaneMenuItem | undefined =>
+  items.find((i) => /^Promote/.test(i.label));
+
+test("#407: a standalone claude pane with a session and a workdir offers Promote, carrying everything the backend call needs", () => {
+  const items = buildPaneMenu(soloPane(), null);
+  const promote = promoteOf(items);
+  assert.ok(promote, "a standalone claude pane must offer the promote item");
+  assert.equal(promote.disabled, undefined);
+  assert.match(promote.label, /orchestrator/i);
+  assert.deepEqual(promote.action, {
+    kind: "promote",
+    repo: "/repo/poc",
+    sessionId: "11111111-2222-3333-4444-555555555555",
+    cli: "claude",
+    // The `__solo__` identity the promotion retires (PromoteConfig.soloAgentId).
+    soloAgentId: "solo-3",
+  });
+});
+
+test("#407: an agent pane with NO channel identity yet still offers promote — the connect short-circuit must not swallow it", () => {
+  // `adoptIfEligible` is best-effort: when it fails, the pane has no group/agentId
+  // and `buildPaneMenu` returns the not-capable CONNECT item. Promotion does not
+  // need a channel identity at all (soloAgentId is optional backend-side), so the
+  // item has to survive that arm — this is the ordering trap the plan named.
+  const pane = free({ group: null, agentId: null, role: null, name: "poc" });
+  const items = buildPaneMenu(pane, null);
+  const promote = promoteOf(items);
+  assert.ok(promote, "an un-adopted claude agent pane is still promotable");
+  assert.equal(promote.disabled, undefined);
+  assert.deepEqual(promote.action, {
+    kind: "promote",
+    repo: "/repo/poc",
+    sessionId: "11111111-2222-3333-4444-555555555555",
+    cli: "claude",
+    soloAgentId: null, // nothing to retire — there is no solo identity
+  });
+  // …and the connect half is unchanged: still exactly one disabled Connect item.
+  const connect = items.filter((i) => !i.separator && i !== promote);
+  assert.equal(connect.length, 1);
+  assert.equal(connect[0].disabled, true);
+});
+
+test("#407: a non-claude agent pane offers promote DISABLED, naming the v1 limit rather than silently omitting it", () => {
+  const items = buildPaneMenu(soloPane({ agentCli: "copilot" }), null);
+  const promote = promoteOf(items);
+  assert.ok(promote);
+  assert.equal(promote.disabled, true);
+  assert.equal(promote.action, undefined, "a disabled item must never carry a fireable action");
+  assert.match(promote.reason ?? "", /claude/i);
+});
+
+test("#407: an agent pane whose session id loomux has not learned offers promote DISABLED — a promotion resumes a conversation", () => {
+  const items = buildPaneMenu(soloPane({ sessionId: null }), null);
+  const promote = promoteOf(items);
+  assert.ok(promote);
+  assert.equal(promote.disabled, true);
+  assert.equal(promote.action, undefined);
+  assert.match(promote.reason ?? "", /conversation|session/i);
+});
+
+test("#407: an agent pane with no working directory offers promote DISABLED — its cwd becomes the group's repo", () => {
+  const items = buildPaneMenu(soloPane({ workdir: null }), null);
+  const promote = promoteOf(items);
+  assert.ok(promote);
+  assert.equal(promote.disabled, true);
+  assert.equal(promote.action, undefined);
+  assert.match(promote.reason ?? "", /director|repositor/i);
+});
+
+test("#407: a pane that is already an orchestration member has NO promote item at all", () => {
+  // Two conflicting role contracts in one session is what the backend's
+  // `promote-already-managed` refuses; the frontend refuses it by never offering
+  // the gesture, so a delegate's menu doesn't grow a permanently-dead row.
+  for (const role of ["worker", "reviewer", "orchestrator"]) {
+    const items = buildPaneMenu(free({ role }), null);
+    assert.equal(promoteOf(items), undefined, `a ${role} pane must not offer promote`);
+  }
+});
+
+test("#407: a planner pane offers neither promote nor connect — its single disabled item is unchanged", () => {
+  const items = buildPaneMenu(free({ role: "planner" }), null);
+  assert.equal(promoteOf(items), undefined);
+  assert.equal(items.length, 1);
+  assert.match(items[0].reason ?? "", /planner/i);
+});
+
+test("#407: no recognized agent CLI, no promote item — a shell, a content pane, and a command that isn't an agent CLI are one case (rev-1 N1, rev-2 B1)", () => {
+  // One test because they are one predicate. `agentCli === null` is the whole
+  // gate: a shell and a content pane have no command at all, and a `npm run dev`
+  // or `htop` pane has one that resolves to no CLI — for all three, a greyed
+  // "promotion is Claude-only" row would be the permanently-dead row the
+  // absent-vs-disabled rule exists to avoid. (These used to be two tests split
+  // on `isAgentPane`, which `agentCli` subsumes — see promoteItem.)
+  const shell = free({ group: null, agentId: null, role: null, agentCli: null, sessionId: null });
+  const buildWatcher = free({ group: null, agentId: null, role: null, agentCli: null, name: "npm run dev" });
+  for (const pane of [shell, buildWatcher]) {
+    assert.equal(promoteOf(buildPaneMenu(pane, null)), undefined, pane.name);
+  }
+  const items = buildPaneMenu(shell, null);
+  assert.equal(items.length, 1, "a non-agent pane keeps its single not-capable item");
+  assert.equal(items[0].disabled, true);
+});
+
+test("#407: promote is offered alongside an in-progress connect gesture, not swallowed by it", () => {
+  // A pending arm rewrites the CONNECT half of the menu entirely (completion
+  // items instead of "Connect…"); promotion is orthogonal and must survive.
+  const items = buildPaneMenu(soloPane(), pendingFrom());
+  assert.ok(promoteOf(items), "an armed connect elsewhere must not hide promote");
+  assert.equal(kinds(items).filter((k) => k === "connect-complete").length, 2);
 });

@@ -740,6 +740,9 @@ export class Pane implements VoiceTargetPane {
    *  its output (notifyExited). The counter must not count a dead agent as live
    *  (#194 P4 LOW-7). */
   private exited = false;
+  /** #407: true between "loomux killed this pane's process on purpose" and "the
+   *  replacement is spawned" — see `isRelaunching`. */
+  private relaunching = false;
   /** Ordered input pipe to the PTY: serializes every keystroke/paste so the
    *  async IPC writes can't reorder (a bracketed-paste terminator overtaking
    *  its body wedges the target app — #65). Buffers input produced before the
@@ -1216,28 +1219,9 @@ export class Pane implements VoiceTargetPane {
     if (opts.badge) this.setBadge(opts.badge);
     if (opts.orchAgent) this.orchAgent = opts.orchAgent;
     if (opts.channelAgent) this.channelAgentInfo = opts.channelAgent;
-    if (opts.orchGroup) {
-      this.orchGroup = opts.orchGroup;
-      this.orchRoleName = opts.orchRole ?? null;
-      // The board lives on the orchestrator's pane; workers report there.
-      this.tasksBtn.hidden = opts.orchRole !== "orchestrator";
-      // The audit log is per-group and read-only, so it's useful from any
-      // agent pane in the group, not just the orchestrator's.
-      this.auditBtn.hidden = false;
-      // The progress timeline reads the same per-group log (plus gh), and is
-      // read-only in exactly the same sense — gated identically (#608).
-      this.timelineBtn.hidden = false;
-      // Group lifecycle controls (pause / end orchestration) live on the
-      // orchestrator's pane, alongside the task board.
-      this.groupBtn.hidden = opts.orchRole !== "orchestrator";
-      // Same for the fold-group toggle (#46): it acts on the orchestrator's
-      // own worker/reviewer panes.
-      this.groupMinBtn.hidden = opts.orchRole !== "orchestrator";
-      // Steering strip (#43): only the orchestrator pane gets one. Build it
-      // BEFORE term.open/fit below so the terminal sizes to the reduced
-      // height once, avoiding a later resize repaint into scrollback.
-      if (opts.orchRole === "orchestrator") this.buildComposeStrip();
-    }
+    // Build the steering strip BEFORE term.open/fit below, so the terminal sizes
+    // to the reduced height once instead of resizing into scrollback later.
+    this.applyOrchIdentity(opts);
     // Seed the toolbar from the startup directory. Interactive shells refine
     // this via OSC 7; command panes (agents) keep this initial value since
     // they have no prompt to report from.
@@ -1349,6 +1333,37 @@ export class Pane implements VoiceTargetPane {
     if (takeFocus) this.focus();
 
     await this.attachPty(opts);
+  }
+
+  /** Give this pane an orchestration identity and the group chrome that comes
+   *  with it. Split out of `start` so an IN-PLACE promotion (#407) can apply the
+   *  same identity to a pane that is already running — one definition of "what an
+   *  orchestration pane looks like", rather than a second copy in `respawnFresh`
+   *  that would drift the day a button is added here.
+   *
+   *  A no-op without `opts.orchGroup`, so both callers can call it unconditionally. */
+  private applyOrchIdentity(opts: PaneOptions): void {
+    if (!opts.orchGroup) return;
+    this.orchGroup = opts.orchGroup;
+    this.orchRoleName = opts.orchRole ?? null;
+    // The board lives on the orchestrator's pane; workers report there.
+    this.tasksBtn.hidden = opts.orchRole !== "orchestrator";
+    // The audit log is per-group and read-only, so it's useful from any
+    // agent pane in the group, not just the orchestrator's.
+    this.auditBtn.hidden = false;
+    // The progress timeline reads the same per-group log (plus gh), and is
+    // read-only in exactly the same sense — gated identically (#608).
+    this.timelineBtn.hidden = false;
+    // Group lifecycle controls (pause / end orchestration) live on the
+    // orchestrator's pane, alongside the task board.
+    this.groupBtn.hidden = opts.orchRole !== "orchestrator";
+    // Same for the fold-group toggle (#46): it acts on the orchestrator's
+    // own worker/reviewer panes.
+    this.groupMinBtn.hidden = opts.orchRole !== "orchestrator";
+    // Steering strip (#43): only the orchestrator pane gets one. Guarded so a
+    // second application (a promotion of a pane that somehow already had one)
+    // can't stack two strips.
+    if (opts.orchRole === "orchestrator" && !this.composeInput) this.buildComposeStrip();
   }
 
   /** Spawn (or respawn) the PTY for this already-open terminal and wire output /
@@ -1530,7 +1545,14 @@ export class Pane implements VoiceTargetPane {
    *  a missing/deleted conversation (#194 BUG-1). Same pane, position, and cwd;
    *  clears the dead error text and starts `opts`' command with a fresh ordered
    *  writer bound to the new PTY. Not itself a resume, so it can't re-trigger the
-   *  fallback (the caller also makes the fallback one-shot). */
+   *  fallback (the caller also makes the fallback one-shot).
+   *
+   *  #407 gave it a second caller: an in-place PROMOTION, where the pane keeps
+   *  its terminal but comes back as an orchestrator (`opts.orchGroup`/`orchRole`/
+   *  `orchAgent`/`badge`, and `opts.env` — a promoted pane's gh-shim PATH and
+   *  `LOOMUX_GROUP_DIR` are carried by `attachPty` below exactly as a spawned
+   *  agent pane's are). "Fresh" describes the PROCESS, not the conversation: the
+   *  command it is handed can perfectly well be `claude --resume <its own id>`. */
   async respawnFresh(opts: PaneOptions = {}): Promise<void> {
     if (this.disposed) return;
     this.exited = false;
@@ -1559,7 +1581,51 @@ export class Pane implements VoiceTargetPane {
     this.discardOutput();
     this.term.reset(); // wipe the "No conversation found …" error + resume banner
     this.writer = createOrderedWriter(); // a fresh input pipe for the new PTY
+    // #407: an in-place PROMOTION also changes what this pane IS. Applied here,
+    // before the spawn below, for two reasons: the badge/board chrome must be up
+    // when the orchestrator's first bytes arrive, and the steering strip changes
+    // the terminal's height — doing it now means the fit below is computed once,
+    // against a pane with NO live pty, so the geometry never reaches a ConPTY as
+    // a resize (CLAUDE.md constraint 1).
+    if (opts.orchGroup) {
+      if (opts.badge) this.setBadge(opts.badge);
+      if (opts.orchAgent) this.orchAgent = opts.orchAgent;
+      // The standalone channel identity does not survive: the promotion retired
+      // that `__solo__` agent backend-side, so leaving the carrier on would show
+      // a channel chip for an endpoint nothing can deliver to. Scoped to this
+      // arm — `respawnFresh` still ignores `opts.channelAgent` for every other
+      // caller (main.ts's BUG-1 fallback sets it explicitly afterwards).
+      //
+      // The CHIP goes with it, explicitly rather than by waiting for the
+      // `orch-channel` disconnect event: that event is matched to a pane by agent
+      // id, and this pane's id is about to become the orchestrator's — so an
+      // event landing a moment later would find nothing to clear and leave a live
+      // chip on a channel this pane is no longer in.
+      this.channelAgentInfo = null;
+      this.setConnected(null);
+      this.applyOrchIdentity(opts);
+      this.fit.fit();
+    }
     await this.attachPty(opts);
+  }
+
+  /** True while an in-place relaunch (#407's promotion) is deliberately tearing
+   *  this pane's process down and starting another in the same terminal.
+   *
+   *  The exit that follows the kill is loomux's OWN — `kill_pty` marks it
+   *  expected, which is precisely the shape main.ts's `onPtyExit` reaper reads as
+   *  "the human's process ended, retire the pane". Without this flag the reaper
+   *  would close the pane mid-promotion, taking the conversation the whole
+   *  gesture exists to preserve with it. */
+  get isRelaunching(): boolean {
+    return this.relaunching;
+  }
+
+  /** Mark the start/end of an in-place relaunch (#407). Always paired via
+   *  `try/finally` by the caller (orchestration.ts's promote flow) so a failed
+   *  promotion can't leave a pane permanently immune to its own exit. */
+  setRelaunching(active: boolean): void {
+    this.relaunching = active;
   }
 
   /** Render the welcome / pane-setup surface in this pane instead of a terminal

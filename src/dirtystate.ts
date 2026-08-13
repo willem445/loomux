@@ -129,7 +129,7 @@ export const QUIT_FLUSH_TIMEOUT_MS = 1500;
 /** Wait for `work`, but never longer than `ms` — "done" when it landed, "timeout" when
  *  the deadline won.
  *
- *  This exists for exactly one caller and one reason: the quit path AWAITS its final
+ *  It was written for one caller and one reason: the quit path AWAITS its final
  *  session save, and an await with no deadline is an unquittable app. Failing open on a
  *  throw (which the guard already does) does not cover a HANG — a promise that never
  *  settles never throws. So the last write is raced, and on expiry the close proceeds
@@ -138,7 +138,12 @@ export const QUIT_FLUSH_TIMEOUT_MS = 1500;
  *  is not recoverable at all. The trade is stated in doc/design/content-panes.md.
  *
  *  A rejection counts as "done" — not because the write succeeded, but because we are no
- *  longer WAITING on it, and the caller's job here is only to decide when to stop. */
+ *  longer WAITING on it, and the caller's job here is only to decide when to stop.
+ *
+ *  #407 gave it a second caller with the same shape: a promotion waits for the pty it
+ *  just killed to report its exit before spawning the `--resume`, and an exit event that
+ *  never arrives must not wedge the gesture. Same trade, same direction — proceed on
+ *  expiry rather than hang. */
 export function withDeadline(work: Promise<unknown>, ms: number): Promise<"done" | "timeout"> {
   return new Promise((resolve) => {
     let settled = false;

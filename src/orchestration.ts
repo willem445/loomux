@@ -21,6 +21,17 @@ import { showContextMenu } from "./contextmenu";
 import { buildPaneMenu, type PaneConnectState, type PaneMenuAction, type PendingConnect } from "./panemenu";
 import { reduceConnect, channelBadge, dropIfStale } from "./channel";
 import type { HeldReason } from "./heldbadge";
+import { modal } from "./modal";
+import { killPty, onPtyExit } from "./pty";
+import { withDeadline } from "./dirtystate";
+import {
+  promoteConfirmLines,
+  promoteFailureText,
+  promoteOffersRoster,
+  promotePaneOptions,
+  promoteRecoveryNote,
+  type PromoteWorkflow,
+} from "./promote";
 
 export type { AutonomyState };
 export type { WorkflowPreview };
@@ -433,6 +444,13 @@ export interface OrchWiring {
   /** Apply an attention scan across all tabs: badge each pane by its pty AND
    *  badge the tab-bar entry of any tab that owns a needs-attention pty. */
   applyAttention(items: AttentionItem[]): void;
+  /** Bind `groupId` to the tab `pane` already lives in (#407): a promoted pane
+   *  stays exactly where the human right-clicked it, so its group has to be
+   *  routed to THAT tab — otherwise `targetForGroup` sees an unknown group on the
+   *  first delegate spawn and opens a second tab for it, away from the
+   *  orchestrator that asked for the worker. The launched-group paths do the same
+   *  thing at the tab they create (`launchOrchestratorTab`). */
+  bindGroupForPane(pane: Pane, groupId: string): void;
   /** Force a tab-strip re-render (#271): channel membership is derived live from
    *  each pane's state (tabcounts.ts), not tracked in a maintained per-tab map the
    *  way attention is, so there is no setter that already triggers one. Called
@@ -441,9 +459,15 @@ export interface OrchWiring {
   refreshTabBar(): void;
 }
 
+/** The tab layer, kept for the paths that aren't backend events (#407's promote
+ *  binds its new group to the tab its pane is already in). Set once by
+ *  `initOrchestration`; null only before startup has run. */
+let orchWiring: OrchWiring | null = null;
+
 /** Wire backend→frontend orchestration events. Call once at startup,
  *  before any orchestrator can be launched. */
 export function initOrchestration(wiring: OrchWiring): void {
+  orchWiring = wiring;
   void listen<OrchSpawnRequest>("orch-spawn-request", ({ payload }) => {
     // Drop a request whose backend bind wait already elapsed while this
     // frontend was stalled (#106): servicing it now would open a zombie pane
@@ -627,6 +651,15 @@ function paneConnectState(pane: Pane): PaneConnectState {
     canSend,
     senderId: badge?.senderId ?? null,
     senderName: badge?.senderName ?? null,
+    // #407: the promote gesture's inputs, read straight off the pane. Not
+    // channel state — these decide a DIFFERENT item on the same menu.
+    // `pane.isAgentPane` is deliberately NOT among them: a recognized
+    // `agentCli` already implies a launched command (both derive from
+    // `spawnCommand`), so carrying it would be a second, weaker copy of the
+    // same fact — see `promoteItem`.
+    agentCli: pane.agentCli,
+    sessionId: pane.sessionId,
+    workdir: pane.workdir,
   };
 }
 
@@ -705,6 +738,14 @@ export function cancelPendingConnect(): void {
 
 async function handlePaneMenuAction(action: PaneMenuAction, pane: Pane): Promise<void> {
   const { pending, effect } = reduceConnect(action, pendingConnect);
+  // #407: promotion is not a connect action — `reduceConnect` only clears an arm
+  // pointing at the identity this promotion retires (see its `promote` case), and
+  // the gesture itself runs below.
+  if (action.kind === "promote") {
+    if (pending === null) setPending(null, null);
+    await promotePaneToOrchestrator(pane, action);
+    return;
+  }
   // Only "connect-arm" legitimately introduces a NEW pending source pane — every
   // other action either leaves `pending` exactly as it was (a disconnect of some
   // UNRELATED pane while a different one is armed elsewhere: `pane` here is the
@@ -743,6 +784,226 @@ async function handlePaneMenuAction(action: PaneMenuAction, pane: Pane): Promise
         showToast(`Making this pane the sender failed: ${String(err)}`, "error");
       }
       return;
+  }
+}
+
+// ---------- promote a standalone pane to orchestrator (#407) ----------
+
+/** The promote knobs the modal collects. A deliberate SUBSET of the launcher's
+ *  config — `PromoteConfig` backend-side, whose every other field defaults — and
+ *  camelCase because that's what its `#[serde(rename_all = "camelCase")]` reads.
+ *  Omitting a field means "the default", so this object stays the size of the
+ *  dialog rather than the size of the launcher. */
+interface PromoteRequest {
+  advancedOrchestrator: boolean;
+  /** The `__solo__` identity the promotion retires, or "" when the pane never
+   *  got one (the backend treats empty as "nothing to retire"). */
+  soloAgentId: string;
+}
+
+/** Promote a standalone claude pane to the orchestrator of a real group, reusing
+ *  its own CLI session (#407). Returns the same `SpawnRequest` every orchestrator
+ *  launch returns — the frontend relaunches the pane from it.
+ *
+ *  Refuses with a `promote-<tag>:`-prefixed message, BEFORE creating, retiring or
+ *  killing anything (see the design note): a refusal leaves the running pane
+ *  exactly as it was, which is what makes it safe to call this first. */
+const promoteToOrchestrator = (
+  repo: string,
+  sessionId: string,
+  cli: string,
+  config: PromoteRequest
+): Promise<OrchSpawnRequest> =>
+  invoke<OrchSpawnRequest>("promote_to_orchestrator", { repo, sessionId, cli, config });
+
+/** How long to wait for the promoted pane's OLD process to actually exit before
+ *  spawning the `--resume`. The CLI must have finished flushing its transcript
+ *  first — that transcript is the whole point of the gesture.
+ *
+ *  On expiry the promotion proceeds anyway rather than aborting: the group is
+ *  already created and the process already killed, so the only alternative is a
+ *  pane left dead holding nothing. A resume that reads a transcript missing its
+ *  final turn is recoverable; a pane with no session at all is not. */
+const PROMOTE_EXIT_WAIT_MS = 5000;
+
+/** Kill `ptyId` and wait (bounded) for its exit event. The listener is registered
+ *  BEFORE the kill — an exit that lands between the two would otherwise never be
+ *  seen and the wait would burn its whole deadline. Resolves either way; the
+ *  caller proceeds regardless (see `PROMOTE_EXIT_WAIT_MS`). */
+async function killAndAwaitExit(ptyId: number): Promise<void> {
+  let seen: () => void = () => {};
+  const exited = new Promise<void>((resolve) => {
+    seen = resolve;
+  });
+  const unlisten = await onPtyExit((e) => {
+    if (e.id === ptyId) seen();
+  });
+  try {
+    // A kill that rejects is not a reason to abandon the promotion: the usual
+    // cause is a process that has already gone (the id is stale), which is the
+    // state the wait below is trying to reach anyway. Proceeding leaves the
+    // recovery paths in relaunchPaneAsOrchestrator to catch a genuinely stuck
+    // process; throwing here would strand the pane with no toast at all.
+    await killPty(ptyId).catch((err) => {
+      console.warn(`[loomux] promote: killing pty ${ptyId} failed (${String(err)}) — continuing`);
+    });
+    if ((await withDeadline(exited, PROMOTE_EXIT_WAIT_MS)) === "timeout") {
+      console.warn(`[loomux] promote: pty ${ptyId} did not report an exit within ${PROMOTE_EXIT_WAIT_MS}ms — resuming anyway`);
+    }
+  } finally {
+    unlisten();
+  }
+}
+
+/** The confirm. One click's worth of consent for a gesture that interrupts a live
+ *  conversation: what becomes the repo, what happens to this pane, which group it
+ *  may land in, and — only when the repo actually declares one — whether to run
+ *  its workflow roster. Resolves to the chosen config, or null if cancelled. */
+async function confirmPromote(repo: string, workflow: PromoteWorkflow | null): Promise<{ advanced: boolean } | null> {
+  // Default ON when the repo declares a roster that actually validates, mirroring
+  // the plan: a repo that declares one almost always means it. A broken file
+  // offers no box at all (`promoteOffersRoster`) — the group would run the
+  // built-in roles regardless, and a ticked box would promise otherwise. The
+  // dormant-reattach case ignores the box either way (that group's own roster
+  // stands) — said in the body, not silently.
+  const offersRoster = promoteOffersRoster(workflow);
+  let advanced = offersRoster;
+  const ok = await modal<boolean>((resolve) => ({
+    title: "Promote this pane to orchestrator?",
+    body:
+      "This pane's Claude session becomes the orchestrator of a real orchestration group — " +
+      "same conversation, relaunched in place with the orchestrator's tools, task board and audit log.",
+    bodyLines: promoteConfirmLines(repo, workflow),
+    checkbox: !offersRoster
+      ? undefined
+      : {
+          label: "Run this repo's workflow roster (advanced)",
+          checked: advanced,
+          title: "Load .loomux/workflow.yml and run the blocks it declares, instead of the built-in four roles.",
+          onChange: (v) => {
+            advanced = v;
+          },
+        },
+    buttons: [
+      { label: "Cancel", value: false },
+      { label: "Promote", value: true, kind: "primary" },
+    ],
+    onKey: (k) => (k === "Escape" ? resolve(false) : undefined),
+  }));
+  return ok ? { advanced } : null;
+}
+
+/** Relaunch `pane` in place from a promote `SpawnRequest` and bind it.
+ *
+ *  Deliberately NOT a branch of `openAgentPane`: every failure arm is inverted
+ *  there. That path discards a pane whose spawn/bind went wrong — correct for a
+ *  pane it just opened, and catastrophic here, where the pane holds the human's
+ *  conversation and the group is already durable on disk. So a failure keeps the
+ *  pane and says how to get back in (`promoteRecoveryNote`); it never silently
+ *  starts a fresh session, which would look like success while discarding the one
+ *  thing the gesture exists to preserve. */
+async function relaunchPaneAsOrchestrator(pane: Pane, req: OrchSpawnRequest, sessionId: string): Promise<void> {
+  // The exit of the kill below is loomux's own — mark it so main.ts's reaper
+  // doesn't retire the pane mid-promotion. Cleared in `finally` so a throw can't
+  // leave a pane permanently immune to its own exit.
+  pane.setRelaunching(true);
+  try {
+    if (pane.ptyId !== null) await killAndAwaitExit(pane.ptyId);
+    await pane.respawnFresh(promotePaneOptions(req, sessionId));
+    if (pane.ptyId === null) {
+      showToast(promoteRecoveryNote(req.group_id, "spawn"), "error");
+      return;
+    }
+    try {
+      await invoke("bind_agent", { agentId: req.agent_id, ptyId: pane.ptyId });
+    } catch {
+      // Late/failed bind (#106's shape): the backend's bind wait has torn the
+      // pending bind down, so this pane's CLI is running unbound. It still holds
+      // the conversation, so it stays — see this function's doc comment.
+      showToast(promoteRecoveryNote(req.group_id, "bind"), "error");
+      return;
+    }
+    // Route the group's own spawns (its delegates) into THIS pane's tab, the way
+    // `launchOrchestratorTab` binds a launched group to the tab it created (#63).
+    // Without it the promoted orchestrator's first worker opens in a new tab of
+    // its own, away from the orchestrator that asked for it.
+    orchWiring?.bindGroupForPane(pane, req.group_id);
+    showToast(`Promoted — this pane is now the orchestrator of ${req.group_id}.`, "info");
+  } finally {
+    pane.setRelaunching(false);
+  }
+}
+
+/** The whole promote gesture, from the fired menu action to a bound orchestrator
+ *  pane. Ordered so that everything that can refuse does so BEFORE anything is
+ *  killed: preview → confirm → backend (which validates and creates the group) →
+ *  disconnect → kill → relaunch → bind. */
+async function promotePaneToOrchestrator(
+  pane: Pane,
+  action: Extract<PaneMenuAction, { kind: "promote" }>
+): Promise<void> {
+  // A second gesture on a pane already being promoted would fire a second
+  // `promote_to_orchestrator` against the same session: bounded (the first
+  // promotion records the session's role, so the second is refused
+  // `promote-already-managed`) but only as a race, and the window is real —
+  // the confirm plus up to PROMOTE_EXIT_WAIT_MS of silence, throughout which the
+  // menu item stays live. Refusing re-entry closes it outright.
+  if (promotionsInFlight.has(pane)) return;
+  promotionsInFlight.add(pane);
+  try {
+    await runPromotion(pane, action);
+  } finally {
+    promotionsInFlight.delete(pane);
+  }
+}
+
+/** Panes with a promotion in flight — see the re-entry guard above. A `Set` of
+ *  live panes, cleared in a `finally`, so a pane that is closed mid-promotion
+ *  leaves nothing behind but a reference the next promotion drops. */
+const promotionsInFlight = new Set<Pane>();
+
+async function runPromotion(pane: Pane, action: Extract<PaneMenuAction, { kind: "promote" }>): Promise<void> {
+  // Does the repo declare a workflow, and does it validate? Read at the moment of
+  // asking, not cached: this is a consent surface, and a stale answer on one is
+  // worse than a slow one (the launcher's roster preview takes the same line). A
+  // failed read means the checkbox simply isn't offered — promoting on the
+  // built-in roster is the conservative outcome, never a silently-ticked one.
+  const preview = await workflowPreview(action.repo, action.cli).catch(() => null);
+  const workflow: PromoteWorkflow | null = preview?.present
+    ? { name: preview.name, valid: preview.valid }
+    : null;
+
+  const choice = await confirmPromote(action.repo, workflow);
+  if (!choice) return;
+
+  let req: OrchSpawnRequest;
+  try {
+    req = await promoteToOrchestrator(action.repo, action.sessionId, action.cli, {
+      advancedOrchestrator: choice.advanced,
+      soloAgentId: action.soloAgentId ?? "",
+    });
+  } catch (err) {
+    // Refused before anything moved: the pane is untouched, so say why and stop.
+    showToast(`Can't promote this pane: ${promoteFailureText(String(err))}`, "error");
+    return;
+  }
+
+  // The `__solo__` identity this pane held is retired by the promotion, so an
+  // open channel on it is already an endpoint nothing can deliver to. Close it
+  // explicitly (best-effort) so the peer sees a disconnect rather than a chip
+  // that silently stops working.
+  if (pane.channelId && action.soloAgentId) {
+    await channelDisconnect(SOLO_GROUP, action.soloAgentId).catch(() => {});
+  }
+  try {
+    await relaunchPaneAsOrchestrator(pane, req, action.sessionId);
+  } catch (err) {
+    // Past this point the old process is gone and the group exists, so there is
+    // no failure mode left where saying nothing is acceptable — including one
+    // nobody predicted. Every anticipated failure toasts inside the relaunch;
+    // this is the backstop for the rest.
+    console.error("[loomux] promote: relaunch failed", err);
+    showToast(promoteRecoveryNote(req.group_id, "spawn"), "error");
   }
 }
 
