@@ -267,15 +267,15 @@ Neutering a lib function reddens the **lib** suite, and cargo then never runs
 the integration binary at all — so every integration-level assertion you meant
 to evidence produces no output, and the round is wasted. Split by target:
 
-- To redden a **unit test in `intake.rs`/`workflow.rs`**, neuter the pure
-  function. The lib suite is the first binary, so it is reached.
+- To redden a **unit test in `src/orchestration/intake.rs` /
+  `src/orchestration/workflow.rs`**, neuter the pure function. The lib suite is
+  the first binary, so it is reached.
 - To redden an **integration test in `src-tauri/tests/`**, neuter the
   **wiring** instead — the call site, or the gate's consumption of the value —
   and leave the lib function intact, so the lib suite stays green and the
   integration binary is actually reached.
 
-Precedent, including the mid-flight re-cut when the first shape hid the
-integration suite: #869 (scratch PRs #870, #872).
+Precedent: #869 (scratch PRs #870, #872).
 
 ## E2E (Playwright) is CI's job, same line
 
