@@ -1595,7 +1595,14 @@ export class Pane implements VoiceTargetPane {
       // a channel chip for an endpoint nothing can deliver to. Scoped to this
       // arm — `respawnFresh` still ignores `opts.channelAgent` for every other
       // caller (main.ts's BUG-1 fallback sets it explicitly afterwards).
+      //
+      // The CHIP goes with it, explicitly rather than by waiting for the
+      // `orch-channel` disconnect event: that event is matched to a pane by agent
+      // id, and this pane's id is about to become the orchestrator's — so an
+      // event landing a moment later would find nothing to clear and leave a live
+      // chip on a channel this pane is no longer in.
       this.channelAgentInfo = null;
+      this.setConnected(null);
       this.applyOrchIdentity(opts);
       this.fit.fit();
     }

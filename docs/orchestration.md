@@ -115,6 +115,58 @@ the same flags and the same dialog-answering watcher — see
 The launcher warns inline when any selected role's CLI isn't installed, and an
 agent pane that dies with an error stays open so you can read what happened.
 
+### Promoting a standalone agent
+
+Sometimes the group starts as a conversation. You open a plain **Agent** pane to
+try something out, spend an hour on it, and it turns into work worth
+orchestrating — at which point launching a *separate* orchestrator means
+hand-transferring everything you just worked out into a session that wasn't
+there for it.
+
+Instead: **right-click the pane's header → "Promote to orchestrator…"**. That
+pane's own Claude session is relaunched in place with the orchestrator's full
+contract — its tools, its task board and audit log, the git/gh shim, a real
+group on disk — while keeping the conversation it already has. The prototype
+context *is* the orchestrator's context; nothing is summarized or re-typed.
+
+What the confirm tells you before anything happens:
+
+- **The repository** is the pane's own working directory. A pane launched into a
+  worktree keys its group to that worktree, not to the main clone.
+- **This pane's current turn is interrupted.** Promotion has to stop the running
+  CLI to reopen the session under the new contract, so finish (or don't mind
+  losing) whatever it is mid-answer.
+- **Which group you land in** is decided when you confirm: a new group for the
+  repo; or the repo's existing **dormant** group *reattached*, inheriting its
+  board, audit history and the roster it was launched with; or a **sibling**
+  group beside one that's already live (two orchestrators never share a group).
+  A toast names the group once it resolves.
+- **The workflow checkbox** appears only when the repo declares
+  `.loomux/workflow.yml`, and runs that roster instead of the built-in four
+  roles. It doesn't apply to a reattached dormant group — that group keeps the
+  roster its own launch approved.
+
+The item is offered on standalone **Claude** agent panes. It's greyed with the
+reason on an agent pane that can't be promoted *yet* — a non-Claude CLI, or a
+pane loomux hasn't learned a session id for (send it a prompt first: an agent
+nobody has spoken to has no conversation to carry over) — and it isn't offered at
+all on a shell pane or on a pane that already belongs to an orchestration group.
+loomux also refuses a session that was *ever* a recorded member of a group, even
+a long-dormant one: a delegate's transcript carries a delegate's contract, and
+two role contracts in one session is not a thing to seat on purpose. Every
+refusal says which one it is, and a refused promotion changes nothing at all —
+the pane keeps running exactly as it was.
+
+If the relaunch itself fails after the old process was stopped (a spawn that
+doesn't come up, a bind that times out), loomux does **not** quietly start a new
+session in its place — that would look like success while discarding the very
+thing you promoted. The group is already durable on disk, so the toast names it
+and points you at its **Resume** card in the session browser, which brings the
+conversation back.
+
+Promotion is human-only, like every other gesture on this menu: no agent can
+promote a pane, its own or anyone else's.
+
 ## How it works
 
 Loomux hosts a local **MCP server**; every agent pane in a group connects with
@@ -596,6 +648,12 @@ agent to tell another "the API changed" or "I'm blocked on your PR" without rela
 message through you. A **channel** is that exception, and it is opt-in every time: **only
 you** can open, close, or redirect one. No agent can ever connect, join, disconnect, or
 redirect a channel itself.
+
+(The pane header's right-click menu carries one other gesture, below the channel
+items: **Promote to orchestrator…** on a standalone Claude pane — see
+[Promoting a standalone agent](#promoting-a-standalone-agent). Promoting a pane
+closes any channel it was in, since the promotion retires the standalone identity
+that channel was keyed to.)
 
 **Connecting.** Right-click an orchestrator, worker, reviewer, or standalone **agent**
 pane's header and choose **Connect…** — the pane arms (its header outlines with a pulsing
