@@ -7132,12 +7132,67 @@ and the pre-Enter gate re-asserted the very false positive the pre-paste gate ha
 aborting with the paste stranded in the box, which then wedges the stranded-submit path behind it.
 Strictly worse than the bug this section fixes.
 
-`Composed { masked, unmasked }` is the fix and it is deliberately not a second recognizer: a row
-present in `unmasked` and absent from `masked` is *precisely* a row the mask claimed, so the mask's
-own hard-won rules (deframe, wrap reconstruction, #820's pointer strip and its short-line floor) are
-reused verbatim rather than re-implemented somewhere they could drift. Everything that asks "is a
-question displayed" still reads the masked view only; the unmasked one answers one narrow question
-the masked one structurally cannot.
+`Composed { masked, with_paste }` is the fix and it is deliberately not a second recognizer: a row
+present in `with_paste` and absent from `masked` is *precisely* a row the paste mask claimed, so the
+mask's own hard-won rules (deframe, wrap reconstruction, #820's pointer strip and its short-line
+floor) are reused verbatim rather than re-implemented somewhere they could drift. Everything that
+asks "is a question displayed" still reads the masked view only; the other answers one narrow
+question the masked one structurally cannot.
+
+The two views differ by the **paste** mask alone — both have already had
+`mask_loomux_notices_with_record` applied. That is not tidiness: the notice mask also removes rows,
+so diffing against a wholly unmasked screen would read one of loomux's own `[loomux] …` notice rows
+near the bottom of a transcript as "the composer" and release on it. Authorship of the *composer* is
+the signal; authorship of anything loomux ever wrote is not.
+
+#### rev-433: the composer is whatever THAT CLI paints
+
+The reading above shipped with a clause that looked incidental and was not — it required a **prompt
+glyph** on every path, including the authorship one. That is a fact about Claude Code, not about
+composers, and it brushes constraint 8 in the most direct way available: the bug existed *because*
+one CLI has a glyph and another does not.
+
+Copilot's 1.0.64+ prompt frame paints `┃ ` on every row it wrapped a paste onto and **no glyph at
+all**. So on that pane class the pre-paste gate released, the brief pasted, the composer read as
+"not a composer", the pre-Enter gate re-asserted on the still-rendered prose, and the delivery
+aborted with the paste stranded — which then wedges the box gate, where the override refuses to
+help. A regression this PR introduced for that pane class, since before it the pre-paste gate held
+and nothing was ever pasted there.
+
+**The audit, across every composer render this repo has evidence for:**
+
+| CLI / composer | how it paints a held paste | glyph? | mask claims it? |
+| --- | --- | --- | --- |
+| Claude Code box | `❯ <text>` | yes | yes |
+| copilot chevron | `❯ <text>` | yes | yes |
+| copilot framed 1.0.64+ | `┃ <text>` on every row | **no** | yes |
+| copilot framed + scrollbar | `┃ <text>  ┃` | **no** | **no** (#821's residual) |
+| opencode | **no capture exists in this repo** | unknown | yes, by construction |
+
+Two rows settle the design between them. **opencode** is sourced from upstream docs under constraint
+3 — no `opencode` process has ever been run by an agent here — so its composer render is genuinely
+unknown, and any shape-based reading could only be guessed at. Authorship is not guessable: a row the
+paste mask claimed is loomux's own text, whoever painted it and however. So the general clause now
+asks nothing at all about shape, and only the **emptiness** clause — which has no paste to key
+authorship on — still recognises by appearance.
+
+**Widening the composer reading widened the conjunct, and the two are one change.** Recognising
+composers we never recognised before exposes the release conjunct to dialog shapes it was never
+asked about, and one of them is in the fixture suite: Claude Code's `AskUserQuestion` highlights with
+reverse video, so `strip_ansi` leaves **no pointer at all** — only numbered options and a selection
+footer. Under the old `!pointer_rendered` conjunct, that dialog above a composer holding our paste
+would have read idle and released an Enter into a live selection. The conjunct is now
+`!menu_structure_rendered`: pointer, numbered option, or selection footer, anywhere on the masked
+screen. Deliberately the *structural* signals only — a conjunct keyed on `prompt_wait_detected` would
+veto every release this PR exists to make, because the prose is on the masked screen by definition.
+`h13` pins it.
+
+`IDLE_PROMPT_TAIL_ROWS` went 6 → 8 in the same change, re-argued against the right thing: 6 was sized
+for a box *at rest*, but at the pre-Enter checkpoint the composer is however many rows the brief
+wrapped onto, and what has to fit in the window is its last rows plus everything the CLI paints
+underneath. The captures put that at one to three rows. `h10` asserts that reach as a precondition
+per fixture, so a CLI that grows its footer fails loudly in the suite instead of silently reading
+"not a composer" in production.
 
 That inverts #534's asymmetry for one case, on purpose. The asymmetry (weight everything toward
 holding; a false release is the expensive error) is right when the question is *"did the dialog go
@@ -7251,11 +7306,25 @@ absolute is untouched — a human's own typed line is never overridden, at any a
   by the idleness reading. Stated as a limit rather than left in the safety argument's shadow,
   because a reader deciding whether to widen the override needs to know which gate is actually
   holding the line.
-- **The idleness reading is a screen shape, not a fact about the CLI's state.** "The composer is on
-  screen holding only our own text" is inferred from the paste mask having claimed the row. A CLI
-  that echoed our text somewhere *other* than its composer, on a row that happens to lead with a
-  prompt glyph, would read the same. No capture in the suite does this; it is the assumption to
-  re-check on a TUI upgrade, alongside #727's.
+- **The idleness reading is inferred from authorship, not observed.** "The composer is on screen
+  holding only our own text" is inferred from the paste mask having claimed a row in the tail window.
+  A CLI that echoed our text somewhere *other* than its composer — a transcript echo low on the
+  screen — would read the same. No capture in the suite does this (#820's transcript echo carries a
+  trailing timestamp and is not claimed at all), and it is the assumption to re-check on a TUI
+  upgrade, alongside #727's.
+- **A composer the paste mask cannot claim is invisible to this reading.** Copilot's scrollbar shape
+  (`┃ <text>  ┃`) is the known case: the trailing bar defeats reconstruct-to-end, which is #821's own
+  stated residual, so authorship has nothing to key on. Not a regression — nothing was pasted into
+  that pane class before this PR either — and `h12` pins it, with an assertion that fails if the mask
+  ever *starts* claiming those rows so the limit gets deleted rather than quietly outliving its
+  cause.
+- **An EMPTY composer that paints no prompt glyph is not recognised.** With no paste there is no
+  authorship to key on, so this clause must read shape, and the obvious generalisation — "a row of
+  nothing but decoration" — cannot be taken: a dialog's blank framed row is byte-identical to it, and
+  `claude-askuserquestion.txt` has one inside the tail window. Widening it would release a live
+  dialog. The cost is that such a pane gets no layer-2 release and falls through to the bounded
+  override, which is what a last resort is for. `h12` demonstrates both halves rather than asserting
+  them.
 - **The override cannot fire while the drainer is inside `deliver_now`.** The bound is sampled by
   the same thread that blocks, so a pane that keeps entering `deliver_now` samples it late — the
   arithmetic `QUESTION_HOLD_STALE_AFTER`'s doc already spells out for the badge. For the shape #903
@@ -7271,13 +7340,22 @@ absolute is untouched — a human's own typed line is never overridden, at any a
 
 ### Tests
 
-`h1`–`h9` in `tests/orchestration.rs`, over two new fixtures. `h1` is the repro, and it asserts its
+`h1`–`h13` in `tests/orchestration.rs`, over two new fixtures and five reused composer captures. `h1` is the repro, and it asserts its
 own preconditions rather than assuming them: the ring still matches, by a wide-tier signal #903 did
 *not* demote, and the match is genuinely still rendered — so the release can only be the new
 reading. `h2` isolates the token re-tiering in both directions. `h3` is the fail-safe floor (every
 dialog fixture still holds, and none of them reads as idle) and `h4` is the conjunct that keeps an
 empty box beside a live menu from releasing it. `h5` is the override's truth table, `h6` its
 ordering against the two clocks it sits between, `h7` the unreadable-screen limit.
+
+`h10`–`h13` are rev-433's, and they are an audit rather than a regression net. `h10` runs the
+pre-Enter release across every composer capture whose rows the paste mask can claim, asserting for
+each that the mask claimed something, that a claimed row is inside the tail window, and — for the
+framed shapes — that there is genuinely no glyph to key on, so the finding is executable rather than
+narrated. `h11` is the same set with a real numbered menu painted above the composer: every one must
+hold. `h12` pins the two shapes the audit does *not* close, each with a precondition that fails when
+the limit's cause goes away. `h13` is the conjunct widening — a reverse-video dialog above a composer
+holding our paste.
 
 `h8` and `h9` are rev-427's. `h8` covers the **pre-Enter** shape `h1` structurally cannot — the same
 fixtures with a brief in the composer and `pasted_text: Some(..)` — and asserts the mechanism as a
