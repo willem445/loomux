@@ -33574,6 +33574,57 @@ fn promote_refuses_a_dormant_group_whose_own_agent_cli_is_not_the_panes() {
 }
 
 #[test]
+fn promote_reattaching_a_dormant_group_keeps_the_cli_its_other_blocks_inherit() {
+    use std::sync::Arc;
+    let (reg, _d) = test_registry();
+    let reg = Arc::new(reg);
+    let (_repo, repo_path, sid, store) = promotable_pane("promote-cli-inherit-keep");
+    // The other half of rev-1 N1, and the half a refusal cannot pin: a dormant
+    // group on copilot whose ORCHESTRATOR block is explicitly `cli: claude`.
+    // A claude pane is legitimately promotable into it — no mismatch — so the
+    // promote SUCCEEDS, and the question becomes what its delegates run. The
+    // group's `agent_cli` is not a setting beside the roster; it is the half of
+    // it that says what every `cli: ""` block runs, and letting the modal's
+    // default overwrite it silently re-CLIs every worker that group will ever
+    // spawn, with nothing shown to the human.
+    let mixed = Guardrails {
+        agent_cli: "copilot".into(),
+        blocks: workflow::default_roster(&[
+            (Role::Orchestrator, "claude", "opus"),
+            (Role::Worker, "", "sonnet"),
+            (Role::Reviewer, "", "sonnet"),
+            (Role::Planner, "", "opus"),
+        ]),
+        ..rails()
+    };
+    let dormant = reg.create_group_ex(&repo_path, mixed, Launch::Fresh).unwrap();
+    let req = promote_to_orchestrator_sync(&reg, &repo_path, &sid, "claude", PromoteConfig::default());
+    drop_claude_store(&store);
+    let req = req.expect("a claude pane promotes into a group whose orchestrator block is claude");
+
+    assert_eq!(req.group_id, dormant.id);
+    assert!(req.command.starts_with("claude "), "the promoted pane is still claude: {}", req.command);
+    let rails_now = reg.group(&dormant.id).unwrap().guardrails;
+    assert_eq!(
+        rails_now.agent_cli, "copilot",
+        "the group default its blocks inherit is part of the roster its human approved"
+    );
+    assert_eq!(rails_now.cli_for(Role::Worker), "copilot", "so a delegate still resolves to it");
+    assert_eq!(
+        reg.load_group_file(&dormant.id).unwrap().1.agent_cli,
+        "copilot",
+        "and it survives the group.json rewrite the reattach performs"
+    );
+    let w = reg.spawn_agent(&dormant.id, Role::Worker, "w", "", false, None).unwrap();
+    let spawned = reg.spawn_request_for_test(&w.id).expect("worker spawn request");
+    assert!(
+        spawned.command.starts_with("copilot "),
+        "the delegate a promoted orchestrator spawns runs the group's CLI, not the promoted pane's: {}",
+        spawned.command
+    );
+}
+
+#[test]
 fn promote_retires_the_panes_standalone_identity() {
     use std::sync::Arc;
     let (reg, _d) = test_registry();
