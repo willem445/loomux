@@ -23,9 +23,11 @@
 // MIGRATION CONTRACT: old files (schemaVersion absent, no per-tab layout) decode
 // exactly as before — shells-only. Every #194 field is optional and additive, and
 // a malformed layout node degrades that tab's whole layout to null (the tab then
-// restores as a single fresh shell) rather than throwing. `encodeTabs` accepts a
-// pre-#194 snapshot object (no restorePref/schemaVersion/layout) unchanged, so
-// main.ts's `tabs.snapshot()` needs no change to keep writing a valid blob.
+// restores as one empty pane on the WELCOME surface — main.ts's empty-tab fill;
+// nothing spawns until the human picks a kind) rather than throwing. `encodeTabs`
+// accepts a pre-#194 snapshot object (no restorePref/schemaVersion/layout)
+// unchanged, so main.ts's `tabs.snapshot()` needs no change to keep writing a
+// valid blob.
 
 import type { ShellKind } from "./panesetup";
 
@@ -60,7 +62,7 @@ export type RestorePref = "ask" | "restore" | "fresh";
  *  The DOWNGRADE direction is the one that costs something, and it costs more here
  *  than a per-entry drop: an older build's `decodePane` rejects the unknown kind,
  *  and `decodeLayout`'s whole-tree fail-safe then collapses THAT TAB's entire
- *  layout to a single fresh shell (a docked ssh pane is the softer case — dropped
+ *  layout to one empty welcome pane (a docked ssh pane is the softer case — dropped
  *  individually). Recorded in doc/design/session-restore.md rather than softened:
  *  the alternative (persisting an ssh pane as some kind an old build recognizes)
  *  means an old build spawning the wrong process under the right title. */
@@ -219,7 +221,8 @@ export interface PersistedTab {
    *  malformed value degrades the same way rather than failing the tab. */
   groupIds?: string[];
   /** Pane layout tree (#194). Absent/null = old file or a group-only tab →
-   *  restore falls back to a single fresh shell. */
+   *  restore falls back to one empty pane on the welcome surface (no process
+   *  until the human picks a kind). */
   layout?: PersistedLayoutNode | null;
   /** Minimized (docked) panes (#194 P4). These live OUTSIDE the layout tree, so
    *  they're captured separately and restored back into the dock — otherwise a
@@ -388,8 +391,9 @@ function decodePane(v: unknown): PersistedPane | null {
 
 /** Validate a layout tree. STRICT whole-tree fail-safe: any malformed node
  *  (bad pane, unknown kind, empty/invalid split) collapses the ENTIRE tab layout
- *  to null, so the tab restores as one fresh shell rather than a half-built,
- *  possibly-misleading tree. Never throws. */
+ *  to null, so the tab restores as one empty pane on the WELCOME surface (main.ts's
+ *  empty-tab fill — no PTY spawns until the human picks a kind) rather than a
+ *  half-built, possibly-misleading tree. Never throws. */
 function decodeLayout(v: unknown): PersistedLayoutNode | null {
   if (!v || typeof v !== "object") return null;
   const r = v as Record<string, unknown>;
@@ -466,7 +470,7 @@ export function decodeTabs(raw: string | null): PersistedTabs | null {
     };
     // Only attach `layout` when the source had one: an absent layout stays absent
     // (old-file shape, so the round-trip is exact), while a present-but-malformed
-    // layout degrades to null → the tab restores as a single fresh shell.
+    // layout degrades to null → the tab restores as one empty welcome pane.
     if (rec.layout !== undefined) tab.layout = decodeLayout(rec.layout);
     // Docked panes: drop any malformed entry rather than failing the whole tab
     // (a lost dock chip is a smaller degradation than a lost tab).

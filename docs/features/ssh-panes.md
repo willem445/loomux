@@ -88,8 +88,8 @@ reason, instead of being quietly discarded on the way to `ssh`:
 
 - a **Port** or **Keepalive** outside its range (1–65535 and 1–86400) — you are
   told, rather than connecting on port 22 and wondering;
-- an **Identity file** that is actually key material — refused, because loomux
-  never stores a key (see below).
+- an **Identity file** that is actually key material — refused: that field takes a
+  path, and loomux will not write a key into the connections file (see below).
 
 A **Remote folder** with **Remote CLI = None** is the one case that is neither
 refused nor honoured: there is no remote command for the `cd` to prefix, so the
@@ -113,15 +113,22 @@ GitHub: it stores no token and shells out to your authenticated `gh`.
 Saved connections live in **`%APPDATA%\loomux\sshprofiles.json`**, a plain,
 hand-editable JSON file next to `tabs.json` and `settings.json`. It holds
 hostnames, ports, the *path* of an identity file, a remote folder, a CLI name and
-your extra flags. **It never holds a password, a passphrase, or key material**,
-and two structural guards keep that true rather than merely stated:
+your extra flags. **loomux never writes a password or a passphrase into it**, and
+two structural guards keep that true rather than merely stated:
 
 1. **Read and write are both allowlists.** Only the declared fields are read in,
    and only those fields are written out — so a `password` key hand-added to the
    file cannot survive one load/save cycle.
 2. **The identity file is checked to be a path.** Paste a PEM blob into that field
-   and it is refused (every real key wraps its base64 body across lines), rather
-   than written into the JSON.
+   and it is refused, rather than written into the JSON.
+
+Guard 2 has one honest gap, stated here rather than left to be inferred: it is a
+**line-break test** (plus an armour-header test as a belt), because every real
+key wraps its base64 body across lines — so a key body pasted as a *single line
+with no header* looks exactly like a path and gets through. Nothing loomux does
+produces that shape, and the value is then handed to `ssh -i` as a filename that
+does not exist, which fails loudly rather than storing anything. The guard fails
+closed on everything a key actually looks like; it is not a content classifier.
 
 Editing the file by hand is fine. A malformed *entry* is dropped on load rather
 than taking the whole list with it; a file that won't parse as JSON at all is
@@ -230,10 +237,19 @@ letting you discover it by asking an agent about work it has no memory of.
 starts a new remote session instead of resuming, which is what you want when the
 remote conversation is gone (deleted on the far host) and every resume fails.
 
-If the saved connection has been **deleted**, the card says so and offers nothing
-else — the pane records the *connection*, not a command line, so there is nothing
-left to reconnect with, and inventing one from a stale command line would connect
-you somewhere you removed on purpose.
+If the saved connection has been **deleted**, the card looks exactly as it always
+does — Reconnect is live, and **Reconnect fresh** is still offered if a session was
+recorded — and the refusal arrives when you **click**:
+
+> This pane's saved SSH connection no longer exists — it was removed, or the
+> connections file was reset. Open a new SSH pane to connect again.
+
+There is nothing left to reconnect *with*, because the pane records the
+*connection* and not a command line, and inventing one from a stale command line
+would connect you somewhere you removed on purpose. The one case that says so at
+mount, without a click, is a pane whose record carries no connection at all — an
+`ssh` entry hand-written into `tabs.json` without an `sshProfileId`, or one left
+behind when the connections file was reset.
 
 Two things Reconnect does not preserve: the **scrollback** of the dead session
 (the terminal is reset before the new client starts, so the old session's tail
@@ -252,7 +268,7 @@ rather than left to produce a wrong answer:
 | --- | --- |
 | **Folder chip / folder picker** | Hidden. The pane's local working directory is home, and the directory the remote shell reports names a filesystem this machine cannot see. A picker would choose a *local* path and `cd` a shell on another machine into it. |
 | **Branch chip** | Never populates — same reason. |
-| **Git view** (`Alt+G`) | Opens, and stays blank. It has no local folder to read, and pointing it at whatever local path happened to match a remote one would be worse than showing nothing. |
+| **Git view** (`Alt+G`) | Opens, and never shows a repository. It has no local folder to read, so it sits on its placeholder — *"Waiting for the shell to report its folder…"* — which on an SSH pane is a wait that never ends, since the folder the remote shell reports is deliberately ignored. Misleading wording, but the alternative (pointing it at whatever local path happened to match a remote one) would be worse than showing nothing. |
 | **External git watching** | Never registered. A watch here would either resolve to nothing or report an unrelated *local* repo's changes as though they were the remote one's. |
 | **Session browser, usage meter, transcripts** | A remote session never appears. All three read stores on the machine the CLI ran on, and that machine isn't this one. |
 | **The tab's agent counter** | An SSH pane counts for nothing. The CLI on the far end may well be an agent — but not one this loomux spawned, supervises, or can account for. |

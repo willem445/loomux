@@ -47,7 +47,9 @@ also accepts a pre-#194 snapshot *object* (no `restorePref`/`schemaVersion`/
 
 A malformed `layout` is **fail-safe**: any invalid node (bad pane, unknown kind,
 empty or mis-directed split) collapses that tab's **whole** layout to `null`
-rather than throwing — the tab then restores as a single fresh shell. This is
+rather than throwing — the tab then restores as **one empty pane on the welcome
+surface** (`main.ts`'s empty-tab fill; no PTY spawns until the human picks a
+kind). This is
 the same "degrade, never crash boot" guard the tab decoder already applies to
 malformed tab entries. Malformed *scalar* fields inside an otherwise-valid leaf
 coerce to `null`/defaults (bad `cwd` → `null`, non-string `argv` element → whole

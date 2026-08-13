@@ -31,8 +31,12 @@ weight:
    inherits the user's entire `ssh_config`, agent, `ProxyJump` and known-hosts for
    free, which no library would.
 
-`discover_ssh` resolves **PATH first**, then the inbox `%SystemRoot%\…\OpenSSH`
-directory. PATH winning is not an ordering accident: a user who installed a newer
+`discover_ssh` resolves **PATH first**, then the inbox OpenSSH directory under
+`%SystemRoot%` — both `System32\OpenSSH` and `Sysnative\OpenSSH`, the same
+directory under the name a 32-bit process must use (for which `System32` is
+redirected to `SysWOW64`, which has no OpenSSH). One extra `is_file` on a path
+that simply doesn't exist for a 64-bit process, and the difference between "found"
+and "not installed" for one that isn't. PATH winning is not an ordering accident: a user who installed a newer
 OpenSSH or put a wrapper ahead of the inbox client has already said which `ssh`
 they mean, and every other program on the machine honours that. The candidate list
 exists for the stripped-PATH case, and it is derived from `SystemRoot` rather than
@@ -46,9 +50,11 @@ PATH snapshot and could silently be a different binary.
 `sshprofiles.json` (a sibling of `tabs.json`/`settings.json` under the loomux data
 root, written through `uistate.rs`'s existing atomic-write + corrupt-quarantine
 helpers, opaque to the backend) stores hostnames, ports, an identity-file **path**,
-a remote directory, a CLI name and extra ssh flags. It never stores key material.
+a remote directory, a CLI name and extra ssh flags. loomux never writes key
+material into it.
 
-Stating that would be worth little; two guards make it hold:
+Stating that would be worth little; two guards make it hold — and the second has a
+residual, stated with it rather than after it:
 
 - **Both directions are allowlists.** `normalizeSshProfile` reads only declared
   fields and `profileToWire` writes only declared fields, so a `password` key
@@ -162,12 +168,30 @@ that they are two declarations, because two identical string unions type-check
 happily against each other — which is exactly why ownership has to be *written
 down* rather than inferred.
 
-The drift is not left to a human to catch, though. `buildRemoteCommand`'s `switch`
-has a `default:` arm that **throws** on any value outside `"posix" | "cmd"`, which
-is reachable at runtime precisely because a profile comes off disk and bypasses
-the type system. So if S1's set ever grows a third member that S2 doesn't quote
-for, the failure is a loud refusal at build time, not a silent mis-quote under a
-scheme nobody wrote.
+The drift is not left to a human to catch, though — and it is worth being exact
+about *which* mechanism catches it, because there are two and they fire at
+different times.
+
+**The build-time catch is `tsc`, at the S1→S2 seam.** The two unions meet in
+exactly one place: `sshLaunchParams` (`panesetup.ts`) assigns
+`remoteShell: profile.remoteShell` — S1's type — into an `SshCommandParams` —
+S2's type. Grow S1's set by a third member that S2 doesn't declare and that
+assignment stops type-checking, so `npm run build`'s `tsc --noEmit` fails before
+anything runs. That is the real guarantee behind the paragraph above, and it is
+why the seam being a *single* assignment matters.
+
+**`buildRemoteCommand`'s `default:` arm is a runtime backstop, not that catch.**
+It throws on any value outside `"posix" | "cmd"` — deliberately as a runtime test
+(it casts, `remoteShell as string`, rather than using the `never`-exhaustiveness
+idiom that would be a compile-time check), because it is guarding against a
+*caller* that reaches the builder without S1's normalizer. **No shipped path can
+reach it.** Both the launch path (`planPaneSetup` → `normalizeSshProfile`) and the
+reconnect path (`decodeSshProfiles` → `normalizeSshProfile`) coerce an
+unrecognized `remoteShell` to `DEFAULT_REMOTE_SHELL` first. So hand-editing
+`"remoteShell": "powershell"` into `sshprofiles.json` does **not** produce a loud
+refusal: it silently reads as `"posix"`, which is the store's intended
+unrecognized-value degradation, not a hole. The arm exists for the next caller,
+not for the file.
 
 That third member is a real prospect, and the naming reflects it: the value is
 `"cmd"`, meaning **cmd.exe specifically** — not "a Windows host". A spelling of
@@ -223,9 +247,12 @@ Three properties, each deliberate:
 - **It cannot over-refuse.** With no ssh signal it returns null before reading the
   identity at all, so no existing orchestration flow changes behaviour.
 
-The test enumerates all four crossings of {which side says ssh} × {which side says
-orchestrated}, plus a negative control (orchestration on both sides, no ssh → null)
-so "refuse everything" would not pass.
+Coverage sits in two tests, not one: *the guardrail reads BOTH sides by the same
+rule* enumerates all four crossings of {which side says ssh} × {which side says
+orchestrated} and adds `orchRole`/`orchAgent` on the pane side, while *…and the
+guardrail refuses ONLY that combination* holds the negative controls (an ordinary
+orchestration pane; an ordinary ssh pane; orchestration on both sides with no ssh
+→ null) so "refuse everything" would not pass.
 
 The same rule is what makes the restore path safe by construction rather than by
 vigilance: the `dormant-ssh` action has **no field** that could carry `role`,
@@ -290,13 +317,29 @@ path. Autossh-style automatic reconnection was rejected for a third reason that
 applies mid-session too: a surprise reconnect re-enters a remote TUI in a state
 nobody has looked at.
 
-**The record is `{paneKind: "ssh", name, sshProfileId, sessionId}`** — no `cwd`
-(there is no meaningful local one) and deliberately **no argv**. Reconnect
+**The record's meaningful content is `{paneKind: "ssh", name, sshProfileId,
+sessionId}`** — no `cwd` (there is no meaningful local one) and deliberately **no
+argv**. That is the non-null *subset*, not the literal JSON: `Pane.capture()`
+returns a full `PersistedPane` and `encodeTabs` stringifies it wholesale, so the
+bytes on disk also carry `"cwd":null,"command":null,"argv":null,"shellKind":null,
+"role":null,"groupId":null,"file":null`. Worth the clause because the file is
+hand-editable and this note is presenting a shape: those keys are present and
+empty, not absent. "No `cwd`, no argv" is a statement about the **value**. Reconnect
 re-derives everything through the same builders a fresh launch uses, which is what
 makes an edit between boots apply, and what avoids re-parsing a quoting scheme
 `sshcommand.ts` exists to be the sole implementation of. A deleted profile
-therefore reconnects with *nothing* — the card says so — rather than replaying a
-stale command line into a host the human removed on purpose.
+therefore reconnects with *nothing* — the click refuses with `SSH_PROFILE_GONE` —
+rather than replaying a stale command line into a host the human removed on
+purpose.
+
+That refusal is **click-time**, and the distinction follows from what the card can
+know without doing I/O at boot. Its `initial` error state is gated on the *record*
+having no `profileId` at all, which is a different state from a profile that has
+since been deleted: the record still names its connection, so the card cannot know
+at mount whether that connection exists without reading the store, and it reads
+the store on the click anyway — as it must, since the whole point is that the
+profile is re-read at reconnect time rather than captured. A record that never had
+a connection needs no read to know it has nothing, so it says so up front.
 
 ### Schema forward-compat: `SCHEMA_VERSION` stays at 2
 
@@ -312,7 +355,10 @@ here than a per-entry drop, which is why it is recorded rather than softened:
   keeps everything else;
 - a **tiled** `ssh` pane is the sharp one — an older build's `decodePane` rejects
   the unknown kind, and `decodeLayout`'s whole-tree fail-safe then collapses
-  **that tab's entire layout** to a single fresh shell.
+  **that tab's entire layout** to `null`, so the tab comes back as **one empty
+  pane on the welcome surface** (`main.ts`'s empty-tab fill; nothing spawns until
+  the human picks a kind) — so that tab's *other* panes are lost with it, which is
+  what makes this the sharp case rather than merely an untidy one.
 
 Accepted, because the alternative is worse: persisting an SSH pane under a kind an
 old build *does* recognize means an old build spawning the wrong process under the
