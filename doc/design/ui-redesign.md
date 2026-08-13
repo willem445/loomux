@@ -410,9 +410,9 @@ Not shipped: any restyling — and the honest description of that is not "the ol
 wearing the new colours", because only the rules that went through a *token* moved. The
 eleven pre-redesign token names survive as an explicitly temporary **legacy bridge** aliasing
 onto the new layer, so everything that consumed one is now on the new palette and nothing
-breaks. Everything that hard-coded a colour instead is untouched: **387 colour literals** sit
-below the token block (243 hex, 144 `rgb()`/`rgba()`), **165 of them the retired Tokyo Night
-palette** this brief renounces — 57 of the old amber, 39 red, 33 blue, 21 green, 10 cyan, 5
+breaks. Everything that hard-coded a colour instead is untouched: **397 colour literals** sit
+below the token block (249 hex, 148 `rgb()`/`rgba()`), **169 of them the retired Tokyo Night
+palette** this brief renounces — 59 of the old amber, 39 red, 35 blue, 21 green, 10 cyan, 5
 magenta — concentrated in the task board, the audit log, the workflow pane and its mode
 chrome, project tabs, session restore, and the attention badge. Until slice B those surfaces
 stay visibly on the old palette while the rest moves, which is a transitional state, not the

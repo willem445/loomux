@@ -10,8 +10,8 @@
  * model, the roles, and the signature element they serve — is doc/design/ui-redesign.md.
  *
  * THE RULE THIS LAYER EXISTS TO ENFORCE: no raw colour outside this block. Surfaces
- * consume semantic tokens only. Slice A adds the layer; below it sit 387 colour literals
- * (243 hex + 144 rgb/rgba) that predate the rule, 165 of them the retired Tokyo Night
+ * consume semantic tokens only. Slice A adds the layer; below it sit 397 colour literals
+ * (249 hex + 148 rgb/rgba) that predate the rule, 169 of them the retired Tokyo Night
  * palette this design renounces. Slice B migrates them and deletes the LEGACY BRIDGE at
  * the end of this block. */
 :root {
