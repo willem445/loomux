@@ -215,19 +215,26 @@ instead of an empty listing — pick a new folder and carry on.
 
 ## The split grid
 
-Loomux arranges panes as a **matrix**, not a lopsided staircase:
-
 - **Split right** (`Ctrl+Shift+E`) adds a pane beside the current one.
 - **Split down** (`Ctrl+Shift+O`) adds one below.
 
-Splitting again *in the same direction* adds a sibling column or row, so
-repeated splits build an even grid instead of nesting ever-smaller boxes. The
-new pane arrives at an equal share: split four times and you have five panes of
-the same size, not one big pane and a row of slivers.
+**A split only ever spends the pane you are in.** The pane you split gives up
+half its space to the new one, and every other pane keeps its share of the tab —
+give or take the few pixels the new divider itself occupies. Nothing else
+re-flows and no other terminal is rearranged, so no other pane's output
+repaints. Splitting is a local edit, not a rearrangement of the tab.
 
-Drag the divider between two panes to **resize** them. A divider you moved
-stays where you put it — a later split or close re-shares the space around it
-rather than levelling it back out.
+Panes stay in a flat row or column as you split within one, so the dividers keep
+working the obvious way: dragging one trades space between its two neighbours
+only. Drag the divider between two panes to **resize** them, and a divider you
+moved stays where you put it.
+
+When you launch **several agents at once** from one welcome screen, they are
+placed differently on purpose: the fleet is spread evenly across the tab as a
+matrix, alternating rows and columns, rather than each new agent halving what is
+left of the last one (which would end in unreadable slivers). A pane rejoining
+the grid from the dock arrives the same way — it is the grid making room, not
+you spending a pane.
 
 **Closing a pane** hands its space back to the panes beside it in equal parts,
 so the smallest pane gains the most. Close one of five equal panes and the other
@@ -235,27 +242,34 @@ four are four equal panes again.
 
 ### Autosize
 
-Layouts still drift, even with the even-share splits above, and there are two
-reasons rather than one.
+Layouts drift, and after all of the above there are three reasons rather than
+one.
 
-**Nesting.** An even share is even *within one row or column*. Split *down*
+**Halving.** A split spends the pane you are in, so splitting again and again
+into the newest pane walks the sizes down — a half, a quarter, an eighth. That
+is the deliberate cost of a split being local, and it is also the fastest way to
+end up looking at slivers.
+
+**Nesting.** Even placement is even *within one row or column*. Split *down*
 inside a pane of a row and that pane's slot becomes a stacked pair: the row is
-now even between the panes beside it and the **pair**, so those come out as a
+now shared between the panes beside it and the **pair**, so those come out as a
 half and two quarters rather than three thirds. An orchestrator opening a pane
-per agent nests the same way, which is how a tab ends up with one big pane and a
-row of slivers. **And dividers you dragged stay dragged** — deliberately, since
-a position you chose is not drift.
+per agent nests the same way.
+
+**Dividers you dragged stay dragged** — deliberately, since a position you chose
+is not drift.
 
 **Autosize** (`Ctrl+Shift+A`, or the `▦` button in the top bar) gives every pane
 in the tab an equal share of the space, in one press — *across* nesting levels,
 which is the part a split's own arithmetic cannot do for you. That half and two
 quarters becomes three equal thirds.
 
-It happens only when you ask. A split or a close re-shares the row it happened
-in — that is the even-share behaviour above — but nothing levels the whole tab
-behind your back, and a divider you positioned deliberately stays where you put
-it until you press Autosize. Pressing it twice does nothing the second time, and
-the evened-out layout is what a restored session comes back to.
+It happens only when you ask. A split spends the pane you are in, and a close
+gives that pane's space to its neighbours — both stay inside the row or column
+they happened in — but nothing levels the whole tab behind your back, and a
+divider you positioned deliberately stays where you put it until you press
+Autosize. Pressing it twice does nothing the second time, and the evened-out
+layout is what a restored session comes back to.
 
 If a pane is maximized, Autosize **drops you out of fullscreen first** — unlike
 a background pane joining the grid, which deliberately leaves fullscreen alone.
@@ -275,7 +289,8 @@ be rearranged in place:
   another. A snap preview shows where it will land:
   - drop on the **middle** to *swap* the two panes, or
   - drop on an **edge** (left/right/top/bottom half) to move the pane there,
-    re-splitting the target.
+    splitting the target — which, like any split, hands over half of *that*
+    pane's space and leaves the rest of the layout alone.
 
   Release to drop, or press `Esc` to cancel. Swapping two equally-sized slots
   never resizes their terminals, so no scrollback is disturbed.
