@@ -37,9 +37,11 @@ There is no global mode — each pane declares its own kind:
 | **File editor** | The file tree + code editor (the `Alt+F` surface) as a pane, rooted at a folder you choose. |
 | **Git** | The git view (the `Alt+G` surface) as a pane, over a repo you choose. |
 | **Workflow** | The repo's agent workflow — which blocks a run may use, the path between them, the gate that must pass before a merge — as an editable pane over `.loomux/workflow.yml`. Point it at a repo that has no workflow file yet and the pane offers to create one. See [custom agent workflows](orchestration.html#custom-agent-workflows). |
+| **SSH** | A remote shell — or an agent CLI on a remote host — over *your own* ssh client, with saved connections that hold no credentials. A solo pane: it can never join an orchestration group, and every loomux feature that needs a local filesystem is switched off rather than left to guess. See [SSH panes](features/ssh-panes.html). |
 
-The last four are **content panes**: a pane that *is* a surface rather than a
-process. No shell, no CLI, no PTY — just the surface, in a pane. They split, dock,
+**File explorer**, **File editor**, **Git** and **Workflow** are **content
+panes**: a pane that *is* a surface rather than a process. No shell, no CLI, no
+PTY — just the surface, in a pane. They split, dock,
 drag, maximize and restore exactly like a terminal pane, and they never count
 toward a tab's agent badge, because a viewer is not an agent.
 

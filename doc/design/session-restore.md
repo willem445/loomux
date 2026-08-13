@@ -47,7 +47,9 @@ also accepts a pre-#194 snapshot *object* (no `restorePref`/`schemaVersion`/
 
 A malformed `layout` is **fail-safe**: any invalid node (bad pane, unknown kind,
 empty or mis-directed split) collapses that tab's **whole** layout to `null`
-rather than throwing — the tab then restores as a single fresh shell. This is
+rather than throwing — the tab then restores as **one empty pane on the welcome
+surface** (`main.ts`'s empty-tab fill; no PTY spawns until the human picks a
+kind). This is
 the same "degrade, never crash boot" guard the tab decoder already applies to
 malformed tab entries. Malformed *scalar* fields inside an otherwise-valid leaf
 coerce to `null`/defaults (bad `cwd` → `null`, non-string `argv` element → whole
@@ -127,7 +129,7 @@ every worker (the #78 storm). That contract lives on the `RestoreAction`
 
 ### #887 S4 — SSH panes: the leaf records a CONNECTION, not a command line
 
-An SSH pane's process is a local `ssh` client (see the feature's own note for the
+An SSH pane's process is a local `ssh` client (see `doc/design/ssh-panes.md` for the
 transport argument). Persisting it needed **one new field**, `sshProfileId`, and
 the choice of what *not* to persist is the whole of this design.
 
@@ -183,7 +185,7 @@ neither.
 
 **The #887/#888 boundary at the restore seam.** SSH panes are display-only in v1
 and can never be orchestration group members (the refusal lives in
-`sshOrchestrationRefusal`, and the reasons are in the feature's note). Restore is
+`sshOrchestrationRefusal`, and the reasons are in `doc/design/ssh-panes.md`). Restore is
 the one path that turns a **hand-editable file on disk** into a spawn, so the
 boundary is enforced there structurally rather than by filtering: the
 `dormant-ssh` action has **no field** that could carry `role`, `groupId` or an

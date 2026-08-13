@@ -29,3 +29,6 @@ return to the shell.
 - **[Progress timeline](progress-timeline.html)** — a read-only time axis of an
   orchestration group's work: agents, deliveries, reports, gates, and GitHub
   issue/PR lifecycle, with the coverage boundaries stated out loud (`Alt+W`).
+- **[SSH panes](ssh-panes.html)** — a remote shell or agent CLI over your own ssh
+  client, with saved connections that hold no credentials, dormant-until-you-click
+  reconnect, and an honest account of what a remote pane cannot do.

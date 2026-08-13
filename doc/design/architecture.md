@@ -93,7 +93,8 @@ src/
   tabroute.ts       pure tab routing + preview scale/sanitizer (unit-tested, DOM-free)
   tabstore.ts       pure encode/decode + schema validation of the persisted tab set (tabs + per-tab pane layout + restore pref, #194; a tab's group BINDINGS are a set and each orch pane records its own group, #485)
   settings.ts       durable app-wide settings (#370): pure encode/decode (DOM-free, unit-tested) + an in-memory singleton (getSettings/setSettings) for synchronous reads from pane.ts's keydown handler. Config-file-only -- no Settings UI exists yet
-  sshprofile.ts     SSH connection profiles (#887): pure encode/decode + per-entry validation of sshprofiles.json (DOM-free, unit-tested). Allowlist in BOTH directions and an identity-file path guard, so the no-secrets invariant is structural -- a credential cannot survive a load/save cycle
+  sshprofile.ts     SSH connection profiles (#887): pure encode/decode + per-entry validation of sshprofiles.json (DOM-free, unit-tested). Allowlist in BOTH directions and an identity-file path guard, so the no-secrets invariant is structural -- a credential cannot survive a load/save cycle. OWNS the `RemoteShell` value set (type + list + default). See doc/design/ssh-panes.md
+  sshcommand.ts     pure ssh argv builder for SSH panes (#887): option flags, the end-of-options separator, and ONE quoted remote-command string per declared remote shell (posix single-quoting / cmd.exe double-quote doubling, both adversarially unit-tested), plus the fresh->resume rewrite a reconnect uses. Takes flat primitives, never the profile type, and its `program` parameter is the fake-ssh test seam. DOM-free, unit-tested. See doc/design/ssh-panes.md
   restoredecision.ts pure restore-vs-fresh-vs-ask decision for the boot splash (DOM-free, unit-tested, #194)
   panerestore.ts    pure per-pane restore policy + layout-tree -> ordered rebuild plan + agent resume-command builder (DOM-free, unit-tested, #194)
   restoresplash.ts  cold-boot "restore last session?" overlay (thin DOM over restoredecision.ts, #194)
@@ -108,8 +109,8 @@ src/
   sessionmeta.ts    pure session-browser task/repo-branch/PR formatting + truncation (#1) (DOM-free, unit-tested)
   resumeerror.ts    pure classification of a resume failure's structured backend tag into a UI affordance -- start-fresh vs a plain error (#412) (DOM-free, unit-tested)
   restorecard.ts    pure dormant-card lifecycle state machine -- idle/pending/error, click acknowledged immediately, failure always lands on a persistent error state (#479) (DOM-free, unit-tested)
-  launcher.ts       in-pane welcome / pane-setup form (Agent / Orchestrator / Terminal / File-explorer / File-editor / Git kind picker)
-  panesetup.ts      pure kind-selection + validation core for the welcome screen (DOM-free, unit-tested)
+  launcher.ts       in-pane welcome / pane-setup form (Agent / Orchestrator / Terminal / File-explorer / File-editor / Git / Workflow / SSH kind picker; the SSH section is also the inline profile editor -- what it launches is what it saves)
+  panesetup.ts      pure kind-selection + validation core for the welcome screen (DOM-free, unit-tested). Also the SSH launch seam (#887): the S1->S2 compose, the refusals for values the profile store would silently discard, and `sshOrchestrationRefusal` -- the #887/#888 boundary, which reads the spawn options and the pane's own state by ONE union rule. See doc/design/ssh-panes.md
   orchestration.ts  frontend half of agent groups (panes, badges, focus); also the human-only cross-workspace channel commands (connect/disconnect/set-sender, standalone-pane prepare/bind/adopt) + `orch-channel` event routing (#271)
   shortcuts.ts      app-level keybindings (single source of truth)
   fileapi.ts        typed bridge to fileedit.rs (per-feature wrapper, like git.ts)
