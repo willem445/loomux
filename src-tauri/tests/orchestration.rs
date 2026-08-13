@@ -71,7 +71,7 @@ use loomux_lib::orchestration::{
     match_still_rendered, trustworthy_composition, witness_audit,
     GridEvidence, QuestionMatch, QuestionNeedle, QuestionSample, QuestionWitness, QuestionWitnessed,
     // #903: the idle-composer reading, and the bounded last-resort override.
-    idle_prompt_rendered, idle_prompt_row_rendered, question_override_admits,
+    idle_prompt_rendered, idle_prompt_row_rendered, question_override_admits, Composed,
     QUESTION_HOLD_OVERRIDE_AFTER,
     resume_kickoff_notice, rotate_audit_if_needed,
     ContractCarrier, ReinjectShape,
@@ -41842,11 +41842,15 @@ fn b4_witness_audit_says_null_rather_than_nothing_when_no_question_was_seen() {
     let seen = QuestionWitnessed {
         matched: prompt_wait_match("Overwrite? (y/n)").expect("matches"),
         grid: GridEvidence::NotRendered,
+        idle_row: false,
     };
     let v = witness_audit(Some(&seen));
     assert_eq!(v["signal"], "yes-no-token");
     assert_eq!(v["line"], "overwrite? (y/n)");
     assert_eq!(v["grid"], "not-rendered", "whether the screen agreed is the diagnostic half");
+    // #903: the override's own term, in the record. A `delivery-question-override`
+    // line a human cannot check the evidence of is not an audit.
+    assert_eq!(v["idle_row"], false, "and whether the CLI's composer was on that screen");
 }
 
 // ---- C. question_shown: the truth table, one row of which is new ----
@@ -41859,7 +41863,7 @@ fn c1_no_ring_match_never_consults_the_grid() {
     // class can enter through the grid.
     let live_dialog = "Do you want to run npm test? (y/n)\n> ";
     assert!(
-        !question_shown(None, Some(live_dialog)),
+        !question_shown(None, Some(Composed::plain(live_dialog))),
         "the ring is the trigger; the grid must not invent a hold"
     );
 }
@@ -41884,8 +41888,8 @@ fn c3_still_rendered_holds() {
     // the box back. `c3b` below pins what that screen now answers and why.
     // Here the prompt is the last thing painted, which is what a live one is.
     let screen = "some output\nOverwrite the file? (y/n)";
-    assert_eq!(grid_evidence_for(&m, Some(screen)), GridEvidence::StillRendered);
-    assert!(question_shown(Some(&m), Some(screen)), "still displayed -> still holding");
+    assert_eq!(grid_evidence_for(&m, Some(Composed::plain(screen))), GridEvidence::StillRendered);
+    assert!(question_shown(Some(&m), Some(Composed::plain(screen))), "still displayed -> still holding");
 }
 
 #[test]
@@ -41901,11 +41905,11 @@ fn c3b_still_rendered_loses_to_an_idle_composer_underneath_it() {
         "precondition: the match really is on this screen — the release is NOT 'it went away'"
     );
     assert_eq!(
-        grid_evidence_for(&m, Some(screen)),
+        grid_evidence_for(&m, Some(Composed::plain(screen))),
         GridEvidence::IdlePrompt,
         "an empty composer is positive evidence that nothing is being asked"
     );
-    assert!(!question_shown(Some(&m), Some(screen)), "idle at an empty box -> release");
+    assert!(!question_shown(Some(&m), Some(Composed::plain(screen))), "idle at an empty box -> release");
 }
 
 #[test]
@@ -41920,8 +41924,8 @@ fn c4_not_rendered_is_the_one_transition_this_change_adds() {
     // still has to pin #534's own transition on a screen where it is the only
     // reason to release.
     let screen = "running step 11\nrunning step 12\nrunning step 13";
-    assert_eq!(grid_evidence_for(&m, Some(screen)), GridEvidence::NotRendered);
-    assert!(!question_shown(Some(&m), Some(screen)), "no longer rendered -> answered -> release");
+    assert_eq!(grid_evidence_for(&m, Some(Composed::plain(screen))), GridEvidence::NotRendered);
+    assert!(!question_shown(Some(&m), Some(Composed::plain(screen))), "no longer rendered -> answered -> release");
 }
 
 #[test]
@@ -41940,8 +41944,8 @@ fn c5_a_dialog_outside_the_detectors_own_window_still_counts_as_rendered() {
         !prompt_wait_detected(&screen),
         "precondition: the detector's own window cannot see it — this is the gap being covered"
     );
-    assert_eq!(grid_evidence_for(&m, Some(&screen)), GridEvidence::StillRendered);
-    assert!(question_shown(Some(&m), Some(&screen)), "displayed is displayed, wherever on screen");
+    assert_eq!(grid_evidence_for(&m, Some(Composed::plain(&screen))), GridEvidence::StillRendered);
+    assert!(question_shown(Some(&m), Some(Composed::plain(&screen))), "displayed is displayed, wherever on screen");
 }
 
 #[test]
@@ -42038,9 +42042,9 @@ fn c9_a_live_pointer_menu_above_the_chrome_holds_though_every_other_reading_says
         match_still_rendered(screen, &m),
         "the pointer is re-read positionally across ALL rendered rows"
     );
-    assert_eq!(grid_evidence_for(&m, Some(screen)), GridEvidence::StillRendered);
+    assert_eq!(grid_evidence_for(&m, Some(Composed::plain(screen))), GridEvidence::StillRendered);
     assert!(
-        question_shown(Some(&m), Some(screen)),
+        question_shown(Some(&m), Some(Composed::plain(screen))),
         "a live menu must never release — this is the #420 harm the whole change is fenced against"
     );
 }
@@ -42057,8 +42061,8 @@ fn c10_a_pointer_menu_genuinely_gone_still_releases() {
     // specific of the two release readings. The behaviour under test — a pointer
     // menu that is genuinely gone still releases — is `question_shown` below,
     // and it is unchanged.
-    assert_eq!(grid_evidence_for(&m, Some(answered)), GridEvidence::IdlePrompt);
-    assert!(!question_shown(Some(&m), Some(answered)), "answered and gone -> release");
+    assert_eq!(grid_evidence_for(&m, Some(Composed::plain(answered))), GridEvidence::IdlePrompt);
+    assert!(!question_shown(Some(&m), Some(Composed::plain(answered))), "answered and gone -> release");
 }
 
 #[test]
@@ -43441,7 +43445,7 @@ fn f4_a_pointer_hold_releases_once_the_menu_gives_way_to_an_idle_prompt() {
     );
 
     assert_eq!(
-        grid_evidence_for(&m, Some(&idle)),
+        grid_evidence_for(&m, Some(Composed::plain(&idle))),
         // #903 refines the answer on this exact screen: the menu is not among
         // the rendered rows AND the pane is visibly idle at an empty box, which
         // is the more specific of the two release readings. #727's property —
@@ -43450,7 +43454,7 @@ fn f4_a_pointer_hold_releases_once_the_menu_gives_way_to_an_idle_prompt() {
         "the menu is not among the rendered rows, and an empty prompt is not a stand-in for it"
     );
     assert!(
-        !question_shown(Some(&m), Some(&idle)),
+        !question_shown(Some(&m), Some(Composed::plain(&idle))),
         "the dialog cleared — the hold must end without a human (#534's one transition, \
          which #727 had made unreachable)"
     );
@@ -43653,7 +43657,8 @@ fn g6_the_queue_polls_hold_record_names_what_the_question_gate_matched() {
     // vocabulary the detector actually emits.
     let matched = prompt_wait_match(&strip_ansi(FIX_COPILOT_ASK.as_bytes()))
         .expect("the captured copilot dialog matches");
-    let seen = QuestionWitnessed { matched: matched.clone(), grid: GridEvidence::StillRendered };
+    let seen =
+        QuestionWitnessed { matched: matched.clone(), grid: GridEvidence::StillRendered, idle_row: false };
 
     reg.hold_escalation_step(
         &g.id, &w.id, pty, WriteAdmission::HoldQuestion, 1, t0, bound, None, Some(&seen),
@@ -45760,11 +45765,11 @@ fn h1_the_repro_screens_match_the_detector_and_release_anyway() {
 
         // The fix: the pane's own bottom row says it is waiting for free text.
         assert!(
-            idle_prompt_rendered(&visible),
+            idle_prompt_rendered(Composed::plain(&visible)),
             "{name}: an empty composer is on screen and no menu selection is: {visible:?}"
         );
         assert_eq!(
-            grid_evidence_for(&m, Some(visible.as_str())),
+            grid_evidence_for(&m, Some(Composed::plain(visible.as_str()))),
             GridEvidence::IdlePrompt,
             "{name}: and that reading beats `StillRendered`"
         );
@@ -45837,7 +45842,7 @@ fn h3_every_real_dialog_still_holds_and_none_of_them_reads_as_idle() {
         );
         let visible = composed_903(fixture);
         assert!(
-            !idle_prompt_rendered(&visible),
+            !idle_prompt_rendered(Composed::plain(&visible)),
             "{name}: a screen with a dialog on it must never read as an idle composer: \
              {visible:?}"
         );
@@ -45854,25 +45859,30 @@ fn h3_every_real_dialog_still_holds_and_none_of_them_reads_as_idle() {
 
 #[test]
 fn h4_an_empty_box_beside_a_live_menu_does_not_release_it() {
-    // The conjunct, and the reason it is a conjunct. `idle_prompt_row_rendered`
-    // alone says "an empty composer is on screen somewhere"; a CLI that painted
-    // a dialog ABOVE a live composer would satisfy it while a human was very
-    // much being asked something. Requiring that NO row anywhere holds a
-    // highlighted choice is what closes that, and it is the stated assumption
-    // this reading rests on.
+    // The conjunct, and the reason it is a conjunct — **for layer 2**.
+    // `idle_prompt_row_rendered` alone says "a composer is on screen somewhere";
+    // a CLI that painted a dialog ABOVE a live composer would satisfy it while a
+    // human was very much being asked something. Requiring that NO row anywhere
+    // holds a highlighted choice is what closes that for the immediate release,
+    // and it is the stated assumption that reading rests on.
+    //
+    // **Layer 3 deliberately does NOT have this conjunct** (rev-427 B2), which is
+    // exactly why this screen matters twice: `h9` pins that the override's own
+    // term is the weak reading, and the design note argues why the strong one
+    // would make the override dead code and what withholds the Enter instead.
     let both = "❯ 1. Yes, allow once\n  2. No, and tell me why\n─────────\n❯\n─────────";
     assert!(
-        idle_prompt_row_rendered(both),
+        idle_prompt_row_rendered(Composed::plain(both)),
         "precondition: the weaker reading DOES fire here — that is the hazard"
     );
     assert!(
-        !idle_prompt_rendered(both),
+        !idle_prompt_rendered(Composed::plain(both)),
         "…and the highlighted choice is what stops it becoming a release"
     );
     let m = prompt_wait_match("❯ 1. Yes, allow once\n  2. No, and tell me why")
         .expect("a numbered menu with a pointer is a question");
-    assert_eq!(grid_evidence_for(&m, Some(both)), GridEvidence::StillRendered);
-    assert!(question_shown(Some(&m), Some(both)), "a live menu holds, empty box or not");
+    assert_eq!(grid_evidence_for(&m, Some(Composed::plain(both))), GridEvidence::StillRendered);
+    assert!(question_shown(Some(&m), Some(Composed::plain(both))), "a live menu holds, empty box or not");
 }
 
 #[test]
@@ -45960,4 +45970,178 @@ fn h7_an_unreadable_screen_still_holds_and_that_is_the_stated_limit() {
         ),
         "an unreadable screen never produces an idle streak, however long the hold runs"
     );
+}
+
+/// The repro fixture with a delivery sitting unsubmitted in its composer — the
+/// screen `deliver_now`'s PRE-ENTER checkpoint actually reads (#903 rev-427 B1).
+///
+/// Built by replacing the bare `❯` row with `❯ <brief>`, which is what the CLI
+/// paints once loomux's bracketed paste lands: same screen, same replayed prose,
+/// composer now occupied by our own text.
+fn with_paste_in_composer(fixture: &str, brief: &str) -> String {
+    let out: Vec<String> = fixture
+        .replace("\r\n", "\n")
+        .lines()
+        .map(|l| {
+            // The prompt row is the one whose only content is the glyph; the SGR
+            // wrapper around it is preserved so the fixture still exercises
+            // `strip_ansi` and the grid the way the untouched one does.
+            if l.replace("\u{1b}[38;5;153m", "").replace("\u{1b}[0m", "").trim() == "❯" {
+                l.replace('❯', &format!("❯ {brief}"))
+            } else {
+                l.to_string()
+            }
+        })
+        .collect();
+    out.join("\n")
+}
+
+#[test]
+fn h8_the_pre_enter_checkpoint_releases_our_own_paste_and_still_holds_a_real_dialog() {
+    // **rev-427's blocking finding, both directions.**
+    //
+    // Layer 2 releases the pre-paste gate and the paste lands. `deliver_now` then
+    // runs `wait_for_question_clear` again with `Some(&pasted_text)` — and
+    // `mask_own_paste` DELETES the composer row it claims, so the reading that
+    // just released ("an empty prompt is on screen") finds nothing, the replayed
+    // `(y/n)` prose is still rendered, and the gate re-asserts the very false
+    // positive it had released. The delivery then aborts `AbortedPreEnter` with
+    // the text stranded in the box, and the stranded-submit marker's own question
+    // check reads the same screen forever: #903's wedge, plus an unsubmitted
+    // paste, on a path the override does not cover.
+    //
+    // `h1` cannot see this — it passes `pasted_text: None`, which is the
+    // pre-PASTE shape only.
+    const BRIEF: &str = "Rebase onto main and re-read the review findings on PR #909.";
+
+    for (name, fixture) in [
+        ("resumed reviewer verdict", FIX_FP_RESUMED_VERDICT),
+        ("orchestrator relay", FIX_FP_ORCH_RELAY),
+    ] {
+        let screen = with_paste_in_composer(fixture, BRIEF);
+        // Precondition 1: the composer really is occupied by our text — the whole
+        // premise of the finding. If this row were still bare the test would pass
+        // for `h1`'s reason, not this one.
+        assert!(
+            screen.contains(&format!("❯ {BRIEF}")),
+            "{name}: precondition: the brief must be IN the composer row"
+        );
+        let raw = pty_bytes_903(&screen);
+
+        // Precondition 2: with the paste masked out, no EMPTY prompt row survives
+        // — this is the mechanism, asserted rather than assumed.
+        let composed = loomux_lib::orchestration::termgrid::render_visible(&raw, 100, 12);
+        let masked = mask_own_paste(&composed, BRIEF);
+        assert!(
+            !idle_prompt_row_rendered(Composed::plain(&masked)),
+            "{name}: precondition: the masked screen has no empty prompt row left — reading \
+             idleness from it alone is exactly what re-asserted the hold: {masked:?}"
+        );
+        // ...and the prose the ring matched IS still on that masked screen, so
+        // `NotRendered` cannot rescue it either.
+        let m = prompt_wait_match(&mask_own_paste(&strip_ansi(&raw), BRIEF))
+            .unwrap_or_else(|| panic!("{name}: precondition: the ring still matches"));
+        assert!(
+            match_still_rendered(&masked, &m),
+            "{name}: precondition: the matched prose is still rendered after masking"
+        );
+
+        // The fix: the two views together say "the CLI is at its composer,
+        // holding our own text" — which is a composer, not a dialog.
+        assert!(
+            idle_prompt_rendered(Composed { masked: masked.as_str(), unmasked: composed.as_str() }),
+            "{name}: our own brief in the composer is still a composer"
+        );
+
+        // End to end through the production predicate, in the pre-Enter shape.
+        let raw_for_pred = raw.clone();
+        let pred = question_hold_predicate_sampled(
+            move || sample_from_raw(&raw_for_pred, 100, 12),
+            Some(BRIEF.to_string()),
+            None,
+            Vec::new(),
+        );
+        assert!(
+            !pred(),
+            "{name}: the pre-Enter gate must not re-assert the hold layer 2 just released — \
+             that strands the paste and wedges a second gate behind it"
+        );
+    }
+
+    // **The other direction, and it is the one that must not regress.** A REAL
+    // dialog on screen while our paste sits in the composer still holds: the
+    // Enter would SELECT a highlighted option, which no dedup rule can undo, and
+    // this checkpoint is what withholds it (#518/#532, and the first line of the
+    // override's own safety argument).
+    let composer_row = format!("❯ {BRIEF}");
+    let live = painted(&[
+        "● Allow the command to run?",
+        "",
+        "│ ❯ Yes",
+        "│   No, and tell me why",
+        "",
+        composer_row.as_str(),
+    ]);
+    let pred = question_hold_predicate_sampled(
+        move || sample_from_raw(&live, 100, 12),
+        Some(BRIEF.to_string()),
+        None,
+        Vec::new(),
+    );
+    assert!(
+        pred(),
+        "a live dialog above our own occupied composer must still withhold the Enter (#420)"
+    );
+}
+
+#[test]
+fn h9_the_override_keys_on_the_weak_reading_and_layer_two_on_the_strong_one() {
+    // rev-427 non-blocking 1: nothing pinned WHICH idleness reading licenses the
+    // write, so flipping the wiring moved no test — on the one term that decides
+    // whether loomux types into a pane it was told not to.
+    //
+    // `h4`'s screen is the separator between the two readings: an empty composer
+    // under a highlighted menu choice. Layer 2 must hold (the conjunct); the
+    // override's term must be true (no conjunct). Both, on one screen, from the
+    // production predicate's own witness — not from calling the two helpers
+    // directly, which is what left the wiring untested.
+    let both = "❯ 1. Yes, allow once\n  2. No, and tell me why\n─────────\n❯\n─────────";
+    let raw = painted(&both.lines().collect::<Vec<_>>());
+
+    let witness: QuestionWitness = Default::default();
+    let pred = question_hold_predicate_sampled(
+        move || sample_from_raw(&raw, 100, 12),
+        None,
+        Some(std::rc::Rc::clone(&witness)),
+        Vec::new(),
+    );
+    assert!(pred(), "layer 2 holds: a highlighted choice is on screen");
+
+    let seen = witness.borrow().clone().expect("the ring matched, so a witness exists");
+    assert_eq!(
+        seen.grid,
+        GridEvidence::StillRendered,
+        "layer 2's reading — the menu-absent conjunct refuses to call this idle"
+    );
+    assert!(
+        seen.idle_row,
+        "layer 3's reading — the composer IS on screen, and this is the term \
+         `question_override_admits` counts a streak of. If this ever reads false, the override \
+         is dead code: the strong reading would already have released the hold."
+    );
+
+    // And the reverse pairing on the plain repro screen: both readings agree, so
+    // layer 2 releases and layer 3 never gets a hold to override.
+    let idle = pty_bytes_903(FIX_FP_RESUMED_VERDICT);
+    let w2: QuestionWitness = Default::default();
+    let pred2 = question_hold_predicate_sampled(
+        move || sample_from_raw(&idle, 100, 12),
+        None,
+        Some(std::rc::Rc::clone(&w2)),
+        Vec::new(),
+    );
+    assert!(!pred2(), "no menu anywhere: layer 2 releases on its own");
+    let seen2 = w2.borrow().clone().expect("the ring matched here too");
+    assert_eq!(seen2.grid, GridEvidence::IdlePrompt);
+    assert!(seen2.idle_row, "and the weak reading agrees, as it must whenever the strong one does");
 }
