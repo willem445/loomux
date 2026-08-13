@@ -7073,6 +7073,365 @@ rest of the floor, the latter because `deframe` is now shared across both gates.
   (constraint 3). The fix does not depend on which composer a pane gets: it is about *any* per-row
   decoration, not about `┃`.
 
+## #903: question-SHAPED text is not a question, and a hold owes a bound it can reach
+
+**Problem.** Deliveries were parked behind *"an interactive question is on screen"* on panes where
+nobody was being asked anything. Three resumed reviewer panes — all resumes of one session, and it
+reproduced on demand — then the **orchestrator's own** pane: 30+ minutes, four deliveries, ending
+with panes killed by hand. The human's report is the whole of the diagnosis: *"the question
+detection is very flaky, there were no interactive questions asked that I could tell."*
+
+**Cause: the detector matches text, and the grid confirms the same text.** Every signal
+`prompt_wait_match` keys on is a substring, and the *structured* tiers — justified by that
+function's own header as "these don't occur in ordinary prose" — read the last **twelve** painted
+lines. That is exactly where a finished turn's report sits. Half those tokens are ordinary English:
+
+| token | tier before #903 | what writes it |
+| --- | --- | --- |
+| `yes/no` | wide (12 lines) | "a yes/no confirmation", in any prose about a prompt |
+| `waiting for your` | wide | "waiting for your review", the *normal* orchestration-pane sentence |
+| `press enter to continue` | wide | quoted from docs; `fp-prose-arrow-keys.txt` has pinned that shape as a false positive since #40 |
+| `(y/n)`, `do you want to proceed` | wide | a reviewer quoting the detector it is reviewing |
+
+#534's composed-screen reading cannot save any of it, because that reading answers a *different*
+question. Its only release is `NotRendered` — "the dialog went away" — and the prose has not gone
+anywhere. So `StillRendered` was true, and useless.
+
+**Why it latched, and why one session did it every time.** #727 and #820's mechanism verbatim: a
+resumed pane's restored screen is static, so nothing ever repaints the prose away, and the queue
+drainer's poll — which is uncapped, unlike `deliver_now`'s own holds — re-reads the identical screen
+every two seconds forever. The deterministic session was a **rev-lead reviewing this detector**: its
+verdict text contains `(y/n)` because that is what the review was about.
+
+### The fix, in three layers, weakest evidence last
+
+**1. A quieter detector.** The three sentence-shaped phrases above move to a
+`prose-permission-phrase` tier read only from the **last painted lines** — the same two-tier rule
+the pointer and the menu footer have used since #40, finally applied to the tokens it never
+covered. A live prompt paints its phrase last (that is what "waiting" means); prose writes it
+mid-paragraph, above the CLI's redrawn box. Punctuated UI structure (`(y/n)`, `[y/n]`,
+`do you want to proceed`, `❯ 1.`, `1. yes`) stays wide, because it *is* structure.
+
+This is a narrowing of the **signal**, not of the guard, and it is deliberately small. Which token
+actually fired on the live panes is not in any record we have (#820's `matched` field exists for
+exactly this and post-dates the incidents), so the tiering only moves phrases whose prose-shape can
+be argued from the string itself. Guessing more would be tuning against an unmeasured population.
+
+**2. An idle composer beats "still rendered".** New `GridEvidence::IdlePrompt`, checked **before**
+`StillRendered`: a composed screen showing the CLI's own input prompt in its bottom
+`IDLE_PROMPT_TAIL_ROWS` rows, **and** no pointer-at-content anywhere on it, releases the hold — with
+the matched text plainly on screen.
+
+*"Its own input prompt"* means a prompt row holding either **nothing** or **nothing but text loomux
+itself pasted**, and the second half is rev-427's blocking finding rather than a generalization for
+its own sake. `mask_own_paste` REMOVES the rows it claims, so at `deliver_now`'s pre-Enter
+checkpoint — the one checkpoint that runs with a `pasted_text` — the mask deletes exactly the row
+that proves a composer is on screen. Reading idleness from the masked screen alone therefore
+answered "no composer" for a pane whose composer was not merely present but holding our own brief,
+and the pre-Enter gate re-asserted the very false positive the pre-paste gate had just released —
+aborting with the paste stranded in the box, which then wedges the stranded-submit path behind it.
+Strictly worse than the bug this section fixes.
+
+`Composed { masked, with_paste }` is the fix and it is deliberately not a second recognizer: a row
+present in `with_paste` and absent from `masked` is *precisely* a row the paste mask claimed, so the
+mask's own hard-won rules (deframe, wrap reconstruction, #820's pointer strip and its short-line
+floor) are reused verbatim rather than re-implemented somewhere they could drift. Everything that
+asks "is a question displayed" still reads the masked view only; the other answers one narrow
+question the masked one structurally cannot.
+
+The two views differ by the **paste** mask alone — both have already had
+`mask_loomux_notices_with_record` applied. That is not tidiness: the notice mask also removes rows,
+so diffing against a wholly unmasked screen would read one of loomux's own `[loomux] …` notice rows
+near the bottom of a transcript as "the composer" and release on it. Authorship of the *composer* is
+the signal; authorship of anything loomux ever wrote is not.
+
+#### rev-433: the composer is whatever THAT CLI paints
+
+The reading above shipped with a clause that looked incidental and was not — it required a **prompt
+glyph** on every path, including the authorship one. That is a fact about Claude Code, not about
+composers, and it brushes constraint 8 in the most direct way available: the bug existed *because*
+one CLI has a glyph and another does not.
+
+Copilot's 1.0.64+ prompt frame paints `┃ ` on every row it wrapped a paste onto and **no glyph at
+all**. So on that pane class the pre-paste gate released, the brief pasted, the composer read as
+"not a composer", the pre-Enter gate re-asserted on the still-rendered prose, and the delivery
+aborted with the paste stranded — which then wedges the box gate, where the override refuses to
+help. A regression this PR introduced for that pane class, since before it the pre-paste gate held
+and nothing was ever pasted there.
+
+**The audit, across every composer render this repo has evidence for:**
+
+| CLI / composer | how it paints a held paste | glyph? | mask claims it? |
+| --- | --- | --- | --- |
+| Claude Code box | `❯ <text>` | yes | yes |
+| copilot chevron | `❯ <text>` | yes | yes |
+| copilot framed 1.0.64+ | `┃ <text>` on every row | **no** | yes |
+| copilot framed + scrollbar | `┃ <text>  ┃` | **no** | **no** (#821's residual) |
+| opencode | **no capture exists in this repo** | unknown | yes, by construction |
+
+Two rows settle the design between them. **opencode** is sourced from upstream docs under constraint
+3 — no `opencode` process has ever been run by an agent here — so its composer render is genuinely
+unknown, and any shape-based reading could only be guessed at. Authorship is not guessable: a row the
+paste mask claimed is loomux's own text, whoever painted it and however. So the general clause now
+asks nothing at all about shape, and only the **emptiness** clause — which has no paste to key
+authorship on — still recognises by appearance.
+
+**Widening the composer reading widened the conjunct, and the two are one change.** Recognising
+composers we never recognised before exposes the release conjunct to dialog shapes it was never
+asked about, and one of them is in the fixture suite: Claude Code's `AskUserQuestion` highlights with
+reverse video, so `strip_ansi` leaves **no pointer at all** — only numbered options and a selection
+footer. Under the old `!pointer_rendered` conjunct, that dialog above a composer holding our paste
+would have read idle and released an Enter into a live selection. The conjunct is now
+`!menu_structure_rendered`: pointer, numbered option, or selection footer. Deliberately the
+*structural* signals only — a conjunct keyed on `prompt_wait_detected` would veto every release this
+PR exists to make, because the prose is on the masked screen by definition. `h13` pins it.
+
+#### rev-438: the same #40 split, applied to the conjunct's own tokens
+
+The conjunct shipped reading all three signals over the whole screen, and two of them cannot be read
+that way. `NUMBERED_MENU_TOKENS` and `MENU_FOOTER_TOKENS` are the lists `prompt_wait_match` has
+windowed to `last_painted` since #40, for a reason this note has already given twice: they occur in
+ordinary finished-turn output. `fp-prose-arrow-keys.txt` is that fixture — prose describing a file
+picker, "use arrow keys to move between entries". A transcript containing one such sentence carried
+"menu structure" forever, so the conjunct vetoed the #903 release for exactly the class of pane the
+issue is about. The pointer has no such problem (a glyph leading content is not something prose
+produces) and keeps its whole-screen reach.
+
+So the split is #40's, not a new invention: **pointer whole-screen, tokens
+[`MENU_TOKEN_TAIL_ROWS`] bottom rows.** `h13`'s dialog sits directly above the composer, and its
+footer lands in the **last slot that window reaches — inside, with zero margin**: four rows up, on a
+screen whose remaining three are the dialog's closing border, a one-row composer and one row of
+chrome. So the reverse-video safety case above survives, but it survives *exactly*, not comfortably.
+One more row between the footer and the screen bottom — a second chrome line, or a composer holding
+two rows instead of one — and it falls out. That is the same fact the constant's own doc and the
+Limits bullet below state; anything here implying headroom would be the one of the three that is
+wrong. The gain is real and the margin is nil, and both halves have to be said together.
+
+The override's reachable set also shrinks to genuine near-composer menu structure, which is what
+`docs/orchestration.md` already described.
+
+Two details the change turns on:
+
+- **Position from `with_paste`, evidence from `masked`.** Where a row *is* on screen is a fact about
+  the render, so the window is measured on the view that still has the composer in it. Measuring it
+  on the masked view would delete the composer's rows and pull transcript prose down into the window,
+  undoing the split entirely — on the framed-composer captures the masked screen is three rows, so
+  *any* bottom window would have included the prose. What may **count** as evidence is still only
+  what loomux did not write, so claimed rows are filtered out before a token is looked for.
+- **Row-wise, not flattened.** A flatten joins neighbours, so "…press Enter" ending one row and "to
+  select…" beginning the next would manufacture `enter to select` out of two unrelated lines. Erring
+  toward "a menu is up" is the cheap direction in general — but not when the invented evidence is
+  what keeps a pane wedged, which is the whole of #903.
+
+`IDLE_PROMPT_TAIL_ROWS` went 6 → 8 in the same change, re-argued against the right thing: 6 was sized
+for a box *at rest*, but at the pre-Enter checkpoint the composer is however many rows the brief
+wrapped onto, and what has to fit in the window is its last rows plus everything the CLI paints
+underneath. The captures put that at one to three rows. `h10` asserts that reach as a precondition
+per fixture, so a CLI that grows its footer fails loudly in the suite instead of silently reading
+"not a composer" in production.
+
+That inverts #534's asymmetry for one case, on purpose. The asymmetry (weight everything toward
+holding; a false release is the expensive error) is right when the question is *"did the dialog go
+away"*, where absence of evidence is all you have. It is wrong when the question is *"was this ever
+a dialog"*, because there the screen offers **positive** evidence that it was not: a CLI showing an
+empty free-text composer is not blocked on an answer. Read as evidence rather than as absence, this
+is the same move #727 made — an empty prompt is the CLI's own statement that it is idle — one layer
+up from the pointer signal to the screen as a whole.
+
+The reading is deliberately hard to satisfy — **for layer 2**; layer 3 relaxes exactly one clause of
+it, and the section below is where that is argued. An unreadable composition answers `false`, so the
+ring's word stands. A recognised prompt row sitting under a live menu answers `false`, because the
+pointer clause is a conjunct — and that clause reads the **masked** view, or our own brief in a
+chevron composer would veto the release on evidence loomux itself wrote (#820's trap). And the
+release still rides `QUESTION_RELEASE_CONSECUTIVE_CLEAR_POLLS` — two consecutive clear polls — like
+every other release in this guard.
+
+**The assumption it rests on, stated so a future TUI change is a known break and not a mystery: a
+CLI does not paint a modal question and a free-text composer at the same time.** Every dialog in the
+fixture suite replaces the box while it is up. If one ever paints a question *above* a live
+composer, the pointer clause is what still catches the menu-shaped ones, and `h3` is the test that
+would have to be widened — it asserts today that no positive dialog capture reads as idle.
+
+**3. A bounded last-resort override.** Layers 1 and 2 fix the false positives we can *characterize*.
+The human's report is that the detector is flaky in general, so the third layer assumes the next one
+will be shaped differently: after `QUESTION_HOLD_OVERRIDE_AFTER` (15 min) held on the **question**
+gate, with two consecutive fresh reads showing a prompt row, the drainer pastes anyway — with the
+existing queued-flush header, and an audited `delivery-question-override` carrying the witness so
+the next narrowing has the evidence this one lacked.
+
+Every term is re-proved on the poll that acts on it. `question_override_admits` is pure and takes a
+*streak of fresh reads*, not a latched flag: a pane that reads idle for ten minutes and then paints
+a dialog is ineligible on the very next poll, with no memory of having been eligible.
+
+*Where the bound sits, and why.* Longer than `QUESTION_HOLD_STALE_AFTER` (10 min), so the human is
+badged and has five minutes to look before loomux acts on their behalf; shorter than
+`QUEUE_STILL_QUEUED_NOTICE_AFTER` (30 min), so the queue moves before the generic "still queued"
+notice is the first anyone hears of it. `h6` pins the ordering rather than the number.
+
+#### The override keys on the WEAK reading, and that is the design, not an oversight
+
+Layer 2 releases on `idle_prompt_rendered` — a prompt row **and** no highlighted choice anywhere.
+Layer 3 counts its streak on `idle_prompt_row_rendered` — the prompt row alone. rev-427 found the
+gap and asked which of the two was intended. The answer is the weak one, and the reason is
+structural rather than a preference:
+
+**The strong reading would make layer 3 dead code.** It is exactly what `grid_evidence_for` already
+answers `IdlePrompt` to, so a pane satisfying it is not holding — there would be no hold left for
+the override to override. The two readings differ on precisely one screen shape: a prompt row with a
+pointer-at-content somewhere above it. So the override is not "a second, sloppier idleness test"; it
+**is** the time-bounded downgrade of layer 2's own menu-absent conjunct, and describing it any other
+way hides what it does.
+
+Is that shape safe to act on? On the evidence available, it is the #727/#820 family rather than a
+dialog: every CLI in the fixture suite *replaces* its composer while a dialog is up, so a screen
+showing both a composer and a pointer-at-content row is a composer plus pointer-shaped **prose** —
+which is what `fp-leading-pointer-prose.txt`, `fp-fenced-pointer-block.txt` and #820's own composer
+captures all are. Requiring the conjunct would therefore disable the last resort against exactly the
+false-positive family it was built for. `h9` pins both readings on one screen so a future edit
+cannot flip the wiring silently.
+
+#### Why a wrong override is cheap — the pre-Enter gate first, dedup second
+
+The override can be wrong. The argument is not that it cannot be — it is that the two error
+directions are not remotely equal in cost, and (rev-427 B2) that the *order* of the defences
+matters, because the earlier version of this section led with dedup and dedup does not cover the
+expensive failure.
+
+**The expensive failure is not a stray paste — it is a stray Enter.** A delivery into a live dialog
+does not merge text; the Enter *selects* whatever is highlighted, and no dedup rule can undo a
+selected option. What stops that is `deliver_now`'s **pre-Enter** `wait_for_question_clear`, which
+the override does **not** skip: it runs against the screen masked with this delivery's own paste,
+and on a genuinely live dialog it holds, caps, and returns `AbortedPreEnter` with the Enter
+withheld. The human then finds the brief sitting in the box — untidy, and recoverable.
+
+That defence is only real because of rev-427 B1's fix. Before it, the pre-Enter reading could not
+see a composer holding our own paste (the mask deletes the row), so it answered `StillRendered` for
+*prose as well as dialogs* and could not distinguish them. Now it can: `Composed` keeps both views,
+the composer-holding-our-text case releases, and a live menu above it still holds (`h8`, both
+directions). The safety argument and the blocking fix are the same change.
+
+**Then dedup covers the residue.** If the dialog ate the paste, the entry is still the drainer's to
+retry under **the same delivery id**; every receiving agent is instructed to treat a delivery id it
+has already acted on as a duplicate and stop. So the worst case is one messy pane and, at most, one
+redundant copy an agent is already required to discard — after fifteen minutes of a *fresh,
+repeated* reading, on a pane the human has been badged about for five of them.
+
+**A hold with no reachable bound** is what #903 is: a queue that never moves, work that silently
+does not happen, and a human who eventually kills the pane. That is not a bounded cost; it is the
+loss of the delivery *and* the pane *and* the human's trust in every future hold badge.
+
+This is the same trade `QUESTION_HOLD_STALE_AFTER` (#532) already made one notch weaker — it
+concluded that a byte ring could not justify *releasing a write*, only badging. #903's difference is
+that the evidence is no longer a byte ring: it is the pane's own composed screen, read fresh, twice,
+fifteen minutes into a hold the human has already been badged about. `write_admission` still checks
+the box first and `question_override_admits` refuses anything but `HoldQuestion`, so **#510's
+absolute is untouched — a human's own typed line is never overridden, at any age.**
+
+### Limits, stated
+
+- **An unreadable composition still holds forever.** No trustworthy grid means no idleness to
+  observe: the veto cannot fire and the override has nothing to count a streak of. Releasing on no
+  evidence at all is precisely what this guard must never do, so this is left as a hold; `h7` pins
+  it so it is a known limit rather than a surprise. The badge (#532) is still the channel for it.
+- **A CLI whose empty box is a *placeholder* (`❯ Try "fix the build"`)** does not read as idle —
+  #727's residual, unchanged, and the same answer applies: a narrower signal, not a wider mask.
+- **The override can paste into a live menu; it cannot press Enter into one.** Layer 3's term has no
+  menu-absent conjunct (see the section above for why the strong reading would make it dead code),
+  so a CLI that paints a dialog *above* a live composer would satisfy it. What that costs is bounded
+  by the pre-Enter checkpoint, which is not overridden and which `h8` pins in both directions — not
+  by the idleness reading. Stated as a limit rather than left in the safety argument's shadow,
+  because a reader deciding whether to widen the override needs to know which gate is actually
+  holding the line.
+- **The idleness reading is inferred from authorship, not observed.** "The composer is on screen
+  holding only our own text" is inferred from the paste mask having claimed a row in the tail window.
+  A CLI that echoed our text somewhere *other* than its composer — a transcript echo low on the
+  screen — would read the same. No capture in the suite does this (#820's transcript echo carries a
+  trailing timestamp and is not claimed at all), and it is the assumption to re-check on a TUI
+  upgrade, alongside #727's.
+- **A composer the paste mask cannot claim is invisible to this reading.** Copilot's scrollbar shape
+  (`┃ <text>  ┃`) is the known case: the trailing bar defeats reconstruct-to-end, which is #821's own
+  stated residual, so authorship has nothing to key on. Not a regression — nothing was pasted into
+  that pane class before this PR either — and `h12` pins it, with an assertion that fails if the mask
+  ever *starts* claiming those rows so the limit gets deleted rather than quietly outliving its
+  cause.
+- **A dialog footer can escape the token read, by either of TWO routes.** `MENU_TOKEN_TAIL_ROWS` is
+  four, and `h13` already spends the last of those four (see above), so the margin is nil in both
+  directions:
+  - **Vertically** — a composer holding a multi-row paste consumes window slots, so a footer sitting
+    above it drops out of reach.
+  - **Horizontally** — a footer that WRAPS in a narrow pane is two rows, neither of which contains
+    the whole token, and the read is row-wise. That is the price of the row-wise choice, taken
+    deliberately: flattening would catch the wrapped footer but would also manufacture `enter to
+    select` out of two unrelated lines, and inventing evidence that keeps a pane wedged is the
+    failure this issue *is*. Worth re-reading together, because the two clauses trade against each
+    other rather than stacking.
+
+  The pointer clause is unwindowed and still catches every dialog that paints a pointer at content —
+  every capture in the suite except the reverse-video `AskUserQuestion`, which is the one shape this
+  residual is about. The refinement that would close the vertical route is a window measured from the
+  **composer's own top row** rather than from the screen bottom, and it is not taken here for a
+  concrete reason rather than for scope: the **pre-paste** checkpoint has no paste at all, so there
+  are no claimed rows to anchor such a window on, and a refinement that only works at one of the two
+  checkpoints is a second rule rather than a better one. Named here so the next reader starts from
+  the reason and not from the number.
+- **An EMPTY composer that paints no prompt glyph is not recognised.** With no paste there is no
+  authorship to key on, so this clause must read shape, and the obvious generalisation — "a row of
+  nothing but decoration" — cannot be taken: a dialog's blank framed row is byte-identical to it, and
+  `claude-askuserquestion.txt` has one inside the tail window. Widening it would release a live
+  dialog. The cost is that such a pane gets no layer-2 release and falls through to the bounded
+  override, which is what a last resort is for. `h12` demonstrates both halves rather than asserting
+  them.
+- **The override cannot fire while the drainer is inside `deliver_now`.** The bound is sampled by
+  the same thread that blocks, so a pane that keeps entering `deliver_now` samples it late — the
+  arithmetic `QUESTION_HOLD_STALE_AFTER`'s doc already spells out for the badge. For the shape #903
+  reports it is moot: a permanently-false-positive gate never admits, so the drainer never enters
+  `deliver_now` at all and polls steadily at `QUEUE_DRAIN_POLL`.
+- **The release check rides the drainer, not the attention tick**, which is a deliberate departure
+  from the issue's groomed shape. The janitor pattern (#825 M2) exists because a raised chip
+  outlives `run_late_confirmation_monitor`'s four-hour lifetime and needs a reader afterwards; the
+  question hold has no such gap. Its reader is `run_queue_drainer`, which by construction lives
+  exactly as long as the queue is non-empty and re-reads the pane every two seconds with no cap. A
+  second pane reader on the attention tick would duplicate that read, on the same panes, for no
+  coverage — against performance.md §3 INV-4's rule that cadenced work owes a bound and a reason.
+
+### Tests
+
+`h1`–`h13` in `tests/orchestration.rs`, over two new fixtures and five reused composer captures. `h1` is the repro, and it asserts its
+own preconditions rather than assuming them: the ring still matches, by a wide-tier signal #903 did
+*not* demote, and the match is genuinely still rendered — so the release can only be the new
+reading. `h2` isolates the token re-tiering in both directions. `h3` is the fail-safe floor (every
+dialog fixture still holds, and none of them reads as idle) and `h4` is the conjunct that keeps an
+empty box beside a live menu from releasing it. `h5` is the override's truth table, `h6` its
+ordering against the two clocks it sits between, `h7` the unreadable-screen limit.
+
+`h10`–`h13` are rev-433's, and they are an audit rather than a regression net. `h10` runs the
+pre-Enter release across every composer capture whose rows the paste mask can claim, asserting for
+each that the mask claimed something, that a claimed row is inside the tail window, and — for the
+framed shapes — that there is genuinely no glyph to key on, so the finding is executable rather than
+narrated. `h11` is the same set with a real numbered menu painted above the composer: every one must
+hold. `h12` pins the two shapes the audit does *not* close, each with a precondition that fails when
+the limit's cause goes away. `h13` is the conjunct widening — a reverse-video dialog above a composer
+holding our paste.
+
+`h8` and `h9` are rev-427's. `h8` covers the **pre-Enter** shape `h1` structurally cannot — the same
+fixtures with a brief in the composer and `pasted_text: Some(..)` — and asserts the mechanism as a
+precondition (the masked screen has no empty prompt row left, and the matched prose IS still on it)
+before asserting the release, so it cannot pass for `h1`'s reason. Its second half is the direction
+that must not regress: a live dialog *above* our own occupied composer still holds, which is the
+gate the whole override-safety argument rests on. `h9` pins which idleness reading feeds which
+layer, on one screen, through the production predicate's own witness — the term that licenses a
+write, previously untestable in either direction.
+
+The fixtures' chrome is byte-verbatim from #727's live capture — including the
+`⏵⏵ auto mode on (shift+tab to cycle) · ← for agents` footer #903's own comments quote as present on
+both screens. The replayed turn text is **reconstructed**: the issue records the footer, the empty
+box and "no question anywhere on screen", not the body of the turn the resume replayed.
+
+`c3` changed, and the reason is worth recording: its screen was
+`"some output\nOverwrite the file? (y/n)\n> "` — an inline yes/no prompt above an empty composer,
+which is not a shape any TUI paints (an inline prompt takes the cursor; it does not hand the box
+back). It now pins the live shape, and `c3b` pins what the old, self-contradictory screen answers.
+
 ## Delivery queue (#445)
 
 **Problem.** `deliver_prompt` has three hold-cap seams — pre-paste box-occupied (#111,

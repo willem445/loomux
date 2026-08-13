@@ -442,7 +442,15 @@ These deserve their own detail — see:
   prompt instead of dropping it: nothing is lost, there's no timeout (you might
   be away for hours), and the queue drains automatically, in order, the moment
   the pane is free again — the first thing it delivers is a one-line summary of
-  what was waiting. You'll never see "held … re-send" — if a prompt is safely
+  what was waiting. One exception to "no timeout", and it only ever moves a queue
+  *forward*: if the hold is the interactive-question one, and after 15 minutes the
+  pane's own screen still shows its ordinary input box, loomux stops believing its
+  own question detection and pastes anyway (you'll have had the "stuck behind a
+  question" badge for five minutes by then). It does **not** stop checking before
+  it presses Enter — if a real dialog is up at that moment the Enter is still
+  withheld and the text is left in the box for you, rather than answering the
+  dialog for you. And a hold on your own typed input is never overridden, at any
+  age. You'll never see "held … re-send" — if a prompt is safely
   queued, the notice says so explicitly and tells you not to re-send it (that
   would just create a duplicate); a payload is only ever reported gone if the
   notice says **DROPPED** (the pane's queue was already full, or the agent's
