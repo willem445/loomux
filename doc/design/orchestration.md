@@ -7182,10 +7182,39 @@ asked about, and one of them is in the fixture suite: Claude Code's `AskUserQues
 reverse video, so `strip_ansi` leaves **no pointer at all** — only numbered options and a selection
 footer. Under the old `!pointer_rendered` conjunct, that dialog above a composer holding our paste
 would have read idle and released an Enter into a live selection. The conjunct is now
-`!menu_structure_rendered`: pointer, numbered option, or selection footer, anywhere on the masked
-screen. Deliberately the *structural* signals only — a conjunct keyed on `prompt_wait_detected` would
-veto every release this PR exists to make, because the prose is on the masked screen by definition.
-`h13` pins it.
+`!menu_structure_rendered`: pointer, numbered option, or selection footer. Deliberately the
+*structural* signals only — a conjunct keyed on `prompt_wait_detected` would veto every release this
+PR exists to make, because the prose is on the masked screen by definition. `h13` pins it.
+
+#### rev-438: the same #40 split, applied to the conjunct's own tokens
+
+The conjunct shipped reading all three signals over the whole screen, and two of them cannot be read
+that way. `NUMBERED_MENU_TOKENS` and `MENU_FOOTER_TOKENS` are the lists `prompt_wait_match` has
+windowed to `last_painted` since #40, for a reason this note has already given twice: they occur in
+ordinary finished-turn output. `fp-prose-arrow-keys.txt` is that fixture — prose describing a file
+picker, "use arrow keys to move between entries". A transcript containing one such sentence carried
+"menu structure" forever, so the conjunct vetoed the #903 release for exactly the class of pane the
+issue is about. The pointer has no such problem (a glyph leading content is not something prose
+produces) and keeps its whole-screen reach.
+
+So the split is #40's, not a new invention: **pointer whole-screen, tokens
+[`MENU_TOKEN_TAIL_ROWS`] bottom rows.** `h13`'s dialog sits directly above the composer, well inside
+that window, so the reverse-video safety case above survives unchanged — and the override's reachable
+set shrinks to genuine near-composer menu structure, which is what `docs/orchestration.md` already
+described.
+
+Two details the change turns on:
+
+- **Position from `with_paste`, evidence from `masked`.** Where a row *is* on screen is a fact about
+  the render, so the window is measured on the view that still has the composer in it. Measuring it
+  on the masked view would delete the composer's rows and pull transcript prose down into the window,
+  undoing the split entirely — on the framed-composer captures the masked screen is three rows, so
+  *any* bottom window would have included the prose. What may **count** as evidence is still only
+  what loomux did not write, so claimed rows are filtered out before a token is looked for.
+- **Row-wise, not flattened.** A flatten joins neighbours, so "…press Enter" ending one row and "to
+  select…" beginning the next would manufacture `enter to select` out of two unrelated lines. Erring
+  toward "a menu is up" is the cheap direction in general — but not when the invented evidence is
+  what keeps a pane wedged, which is the whole of #903.
 
 `IDLE_PROMPT_TAIL_ROWS` went 6 → 8 in the same change, re-argued against the right thing: 6 was sized
 for a box *at rest*, but at the pre-Enter checkpoint the composer is however many rows the brief
@@ -7318,6 +7347,15 @@ absolute is untouched — a human's own typed line is never overridden, at any a
   that pane class before this PR either — and `h12` pins it, with an assertion that fails if the mask
   ever *starts* claiming those rows so the limit gets deleted rather than quietly outliving its
   cause.
+- **A dialog footer can fall out of the token window above a MULTI-row composer.** `MENU_TOKEN_TAIL_
+  ROWS` is four, and a composer holding a multi-row paste consumes those slots, so a footer sitting
+  above it can drop out of reach. The pointer clause is unwindowed and still catches every dialog
+  that paints a pointer at content — every capture in the suite except the reverse-video
+  `AskUserQuestion`, which is the one shape this residual is about. The refinement that would close
+  it is a window measured from the **composer's own top row** rather than from the screen bottom, and
+  it is not taken here for a concrete reason rather than for scope: on the masked view the composer's
+  rows are exactly what is missing, so there is no top row to measure from without threading a third
+  view through. Named here so the next reader starts from the reason and not from the number.
 - **An EMPTY composer that paints no prompt glyph is not recognised.** With no paste there is no
   authorship to key on, so this clause must read shape, and the obvious generalisation — "a row of
   nothing but decoration" — cannot be taken: a dialog's blank framed row is byte-identical to it, and
