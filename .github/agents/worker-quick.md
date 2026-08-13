@@ -80,7 +80,7 @@ and costs the human a debugging session later.
   dependency is not a quick task — escalate.
 - **Never spawn `claude` or `copilot`** to test anything.
 - **The frontend never touches Tauri IPC directly** — go through the `src/pty.ts`
-  wrappers.
+  wrappers; only `src/transport.ts` may import `@tauri-apps/*`.
 - **Never commit to `main` and never merge.** Branch, PR, stop. Commit subject:
   `type(scope): imperative subject (#issue)`.
 

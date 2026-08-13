@@ -34,10 +34,13 @@ permanent in the user's buffer. So:
   reaches for React, a virtual DOM, a state library or a YAML package is answering
   the wrong question; the fix is nearly always a pure module plus a few
   `createElement` calls.
-- **The frontend never touches Tauri IPC directly.** Every backend capability is a
-  `#[tauri::command]` plus a typed wrapper in `src/pty.ts` (and the orchestration
-  wrappers); a module that calls `invoke` itself has broken the one boundary that
-  keeps the surface reviewable.
+- **The frontend never touches Tauri IPC directly.** `src/transport.ts` is the only
+  module that may import `@tauri-apps/*`; every backend capability is a
+  `#[tauri::command]` plus a typed wrapper (`src/pty.ts`, or a per-feature bridge like
+  `git.ts`/`orchestration.ts`) that goes through that seam. A new `@tauri-apps` import
+  anywhere else has broken the one boundary that keeps the surface reviewable — and
+  fails `test/transport.test.ts`, so a diff that also edits that test to make room is
+  the shape to look at hardest.
 - **Render repo/agent text as `textContent`, never HTML.** Workflow names, block
   names, personas, PR titles and branch names are attacker-adjacent strings. An
   `innerHTML` on any of them is a finding on sight.

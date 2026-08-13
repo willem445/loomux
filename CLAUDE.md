@@ -62,9 +62,14 @@ compiles.
    comctl32-v6 manifest that `build.rs` embeds via `-tests`-scoped link args.
    Those args require at least one integration-test target to exist — never
    delete `tests/smoke.rs`.
-5. **Frontend never touches Tauri IPC directly.** Every backend capability is
-   a `#[tauri::command]` plus a typed wrapper in `src/pty.ts`; all other
-   frontend modules go through those wrappers.
+5. **Frontend never touches Tauri IPC directly.** `src/transport.ts` is the
+   ONLY module that may import `@tauri-apps/*` — it owns the `EngineTransport`
+   seam (`invoke`/`listen` plus the host capabilities). Every backend
+   capability is a `#[tauri::command]` plus a typed wrapper in `src/pty.ts` or
+   a per-feature bridge (`git.ts`, `fileapi.ts`, `orchestration.ts`), and those
+   wrappers call the seam. `test/transport.test.ts` enforces this — a direct
+   `@tauri-apps` import anywhere else in `src/` fails the suite. See
+   doc/design/engine-transport.md.
 6. **Orchestration commands trust `group_id` as a path segment** — safe only
    because the webview is trusted. Never route agent-controllable input into
    group-scoped commands without a traversal/membership check.
