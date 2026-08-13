@@ -100,6 +100,7 @@ pub fn run() {
             pty::dir_info,
             pty::change_dir,
             pty::discover_git_bash,
+            pty::discover_ssh,
             sessions::list_sessions,
             sessions::record_copilot_launch_posture,
             sessions::record_claude_launch_posture,

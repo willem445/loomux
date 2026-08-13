@@ -1,8 +1,9 @@
 [[set]]
 identifier = "pty-read"
-description = "Read-only PTY/session info: backend info, git-bash discovery, directory info."
+description = "Read-only PTY/session info: backend info, git-bash and ssh-client discovery, directory info."
 permissions = [
     "allow-pty-backend-info",
     "allow-discover-git-bash",
+    "allow-discover-ssh",
     "allow-dir-info",
 ]

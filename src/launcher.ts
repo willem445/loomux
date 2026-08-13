@@ -53,8 +53,26 @@ import {
   shellKindOptions,
   resolveShellKind,
   isContentKind,
+  sshLaunchArgv,
+  sshMintsSessionId,
+  sshRemoteCliWarning,
+  sshRemoteCwdWarning,
 } from "./panesetup";
-import { agentCliKnobs, discoverGitBash } from "./pty";
+import {
+  decodeSshProfiles,
+  encodeSshProfiles,
+  emptySshProfileStore,
+  REMOTE_SHELLS,
+  DEFAULT_REMOTE_SHELL,
+  MAX_KEEPALIVE_SECONDS,
+  MAX_SSH_PORT,
+  MIN_KEEPALIVE_SECONDS,
+  MIN_SSH_PORT,
+  type RemoteShell,
+  type SshProfile,
+  type SshProfileStore,
+} from "./sshprofile";
+import { agentCliKnobs, discoverGitBash, discoverSsh, loadSshProfiles, saveSshProfiles } from "./pty";
 import { modelOptionLabel } from "./modelnames";
 import { ORCH_CLIS, orchCliFor } from "./orchclis";
 import { knobState, knobValue, type CliKnobs, type KnobState, type KnobStates } from "./selectorknobs";
@@ -141,7 +159,16 @@ export type WelcomeResult =
   /** A workflow pane (#222): `root` is the repo whose `.loomux/workflow.yml` the pane
    *  edits — a confirmed directory, like files/editor. The workflow FILE is not probed:
    *  a repo without one is the normal starting point, and the pane offers to create it. */
-  | { kind: "workflow"; name: string; root: string };
+  | { kind: "workflow"; name: string; root: string }
+  /** An SSH pane (#887 S3): `argv` is the fully-composed local ssh command line —
+   *  the resolved `ssh.exe` path, the profile's option flags, the destination, and
+   *  (for a remote CLI) one quoted remote-command string. Composed HERE rather than
+   *  by the caller because everything it needs — the resolved client, the saved
+   *  profile, the minted session id — is what this form just did.
+   *
+   *  No `cwd`: the pane's LOCAL directory stays home (the repo is on the far end).
+   *  `profileId` is what the pane records — the connection, not its contents. */
+  | { kind: "ssh"; name: string; argv: string[]; profileId: string; sessionId?: string };
 
 const basename = (p: string): string => p.split(/[\\/]/).filter(Boolean).pop() ?? "";
 
@@ -173,6 +200,41 @@ function select(options: [string, string][], value?: string): HTMLSelectElement 
   }
   if (value) sel.value = value;
   return sel;
+}
+
+/** A plain text input with a placeholder — the shape every SSH field takes
+ *  (#887 S3), where "unset" is a blank box and not a zero. */
+function textInput(placeholder: string): HTMLInputElement {
+  const input = document.createElement("input");
+  input.className = "dlg-input";
+  input.placeholder = placeholder;
+  input.spellcheck = false;
+  return input;
+}
+
+/** The SSH picker's "not a saved connection yet" option value. A sentinel rather
+ *  than the empty string so it can never collide with a profile id. */
+const SSH_NEW = "__new";
+
+/** Shown (and refused with) when no OpenSSH client can be found. Names the two
+ *  places loomux looked, so the human can fix it rather than wonder: PATH is the
+ *  one they control, and the inbox install is the one Windows ships. */
+const SSH_NO_CLIENT =
+  "No ssh client found — loomux looked on PATH and in the Windows OpenSSH install " +
+  "(System32\\OpenSSH). Install the OpenSSH Client optional feature, or put ssh.exe on PATH.";
+
+/** The number in an optional numeric field, or null when it is blank.
+ *
+ *  Deliberately does NOT clamp, round, or reject: a value that is out of range or
+ *  not a whole number is carried through EXACTLY as typed, so the launch seam can
+ *  see that the human typed something and refuse it by name
+ *  (`sshDiscardedFieldError`). Sanitizing here would turn `99999` into "no port"
+ *  before anything could notice a port had been asked for — which is precisely
+ *  the silent discard this shape exists to avoid. A blank field is the one case
+ *  that really does mean "unset". */
+function optionalNumber(el: HTMLInputElement): number | null {
+  const raw = el.value.trim();
+  return raw ? Number(raw) : null;
 }
 
 function numberInput(value: number, min: number, max: number): HTMLInputElement {
@@ -289,6 +351,38 @@ export class WelcomeForm {
    *  and is enabled once backend discovery resolves; PowerShell/cmd are always
    *  available on Windows. */
   private shellAvail: ShellKindAvailability = { gitBashPath: null };
+  // ── SSH pane (#887 S3) ────────────────────────────────────────────────────
+  // ONE section that is both the picker and the editor: choosing a saved
+  // connection fills the fields, and submitting saves whatever they say and
+  // launches it. Deliberately not a separate "edit" mode — there is no Settings
+  // UI in this app to put one in (settings.ts is config-file-only), and a form
+  // whose fields are what you launch cannot show you one connection while
+  // starting another.
+  private sshField: HTMLElement;
+  private sshProfileSel: HTMLSelectElement;
+  private sshNameInput: HTMLInputElement;
+  private sshDestInput: HTMLInputElement;
+  private sshPortInput: HTMLInputElement;
+  private sshIdentityInput: HTMLInputElement;
+  private sshRemoteShellSel: HTMLSelectElement;
+  private sshKeepaliveInput: HTMLInputElement;
+  private sshExtraInput: HTMLInputElement;
+  private sshCliSel: HTMLSelectElement;
+  private sshRemoteCwdInput: HTMLInputElement;
+  /** Inline warnings for the SSH section: no local ssh client, or a profile
+   *  naming a remote CLI this build doesn't know. Never a blocker on its own —
+   *  the missing-client case is refused at submit, where it can say so once. */
+  private sshWarn: HTMLElement;
+  /** The saved connections, as last loaded/saved. The store's `schemaVersion` is
+   *  carried in this object rather than re-stamped on save (sshprofile.ts). */
+  private sshStore: SshProfileStore = emptySshProfileStore();
+  /** The id a NEW connection will be saved under. Minted once when the human
+   *  switches the picker to "new" rather than per submit, so a validation bounce
+   *  and its retry save one profile, not two. */
+  private sshNewId: string | null = null;
+  /** The resolved local `ssh.exe`, or null when this machine has none / the
+   *  probe hasn't landed yet. Resolved once per form. */
+  private sshProgram: Promise<string | null> | null = null;
   private repoField: HTMLElement;
   /** The repo field's caption. The same control is the Agent/Orchestrator
    *  "Repository" and the File-explorer "Folder" (#214) — one path input, two
@@ -399,6 +493,7 @@ export class WelcomeForm {
       ["editor", "File editor — tree + code editor, rooted at a folder"],
       ["git", "Git — graph, status, diffs and worktrees for a repo"],
       ["workflow", "Workflow — agent blocks, edges and merge gates for a repo"],
+      ["ssh", "SSH — a remote shell or agent CLI over your own ssh client"],
     ]);
     this.kindSel.addEventListener("change", () => this.applyKind());
 
@@ -446,6 +541,70 @@ export class WelcomeForm {
     this.applyShellAvailability();
     // Discover Git Bash off the main path; enable its option when it resolves.
     void this.probeGitBash();
+
+    // SSH section (#887 S3). Built once; shown only for the ssh kind.
+    this.sshProfileSel = select([[SSH_NEW, "New connection…"]]);
+    this.sshProfileSel.addEventListener("change", () => this.applySshProfile());
+    this.sshNameInput = textInput("e.g. build box");
+    this.sshDestInput = textInput("user@host, host, or an ssh_config alias — required");
+    this.sshDestInput.addEventListener("input", () => this.updateName());
+    this.sshNameInput.addEventListener("input", () => this.updateName());
+    this.sshPortInput = textInput("22");
+    this.sshPortInput.type = "number";
+    this.sshPortInput.min = String(MIN_SSH_PORT);
+    this.sshPortInput.max = String(MAX_SSH_PORT);
+    this.sshPortInput.className = "dlg-input dlg-num";
+    this.sshIdentityInput = textInput("path to a private key — optional");
+    this.sshRemoteShellSel = select(
+      REMOTE_SHELLS.map((s) => [s, s === "posix" ? "POSIX (sh/bash/zsh)" : "cmd.exe"] as [string, string]),
+      DEFAULT_REMOTE_SHELL
+    );
+    this.sshKeepaliveInput = textInput("off");
+    this.sshKeepaliveInput.type = "number";
+    this.sshKeepaliveInput.min = String(MIN_KEEPALIVE_SECONDS);
+    this.sshKeepaliveInput.max = String(MAX_KEEPALIVE_SECONDS);
+    this.sshKeepaliveInput.className = "dlg-input dlg-num";
+    this.sshExtraInput = textInput("e.g. -J jump.example.net");
+    // The remote CLI list is the same catalog the Agent kind offers, minus
+    // "custom…" (whose command line is a LOCAL one the user owns — appending it
+    // to a remote command would run a machine's worth of assumptions on another
+    // machine), plus the entry that makes an SSH pane useful without any agent
+    // at all: a plain login shell.
+    this.sshCliSel = select([
+      ["", "None — a plain login shell"],
+      ...AGENTS.filter((a) => a.id !== "custom").map((a) => [a.id, a.label] as [string, string]),
+    ]);
+    this.sshCliSel.addEventListener("change", () => this.updateSshWarning());
+    this.sshRemoteCwdInput = textInput("directory on the REMOTE host — optional");
+    this.sshRemoteCwdInput.addEventListener("input", () => this.updateSshWarning());
+    this.sshWarn = document.createElement("div");
+    this.sshWarn.className = "dlg-error";
+    const sshRow = (...fields: HTMLElement[]): HTMLElement => {
+      const row = document.createElement("div");
+      row.className = "dlg-row";
+      row.append(...fields);
+      return row;
+    };
+    this.sshField = document.createElement("div");
+    this.sshField.className = "dlg-field";
+    this.sshField.append(
+      field("Connection", this.sshProfileSel, "saved connections live in sshprofiles.json — never a credential"),
+      sshRow(field("Name", this.sshNameInput), field("Destination", this.sshDestInput)),
+      sshRow(
+        field("Port", this.sshPortInput, "blank = your ssh config"),
+        field("Identity file", this.sshIdentityInput, "a path, never a key")
+      ),
+      sshRow(
+        field("Remote shell", this.sshRemoteShellSel, "how the remote command is quoted"),
+        field("Keepalive (s)", this.sshKeepaliveInput, "blank = your ssh config")
+      ),
+      field("Extra ssh flags", this.sshExtraInput, "space-separated argv words, passed through in order"),
+      sshRow(
+        field("Remote CLI", this.sshCliSel),
+        field("Remote folder", this.sshRemoteCwdInput, "cd'd into before the CLI starts")
+      ),
+      this.sshWarn
+    );
 
     this.repoInput = document.createElement("input");
     this.repoInput.className = "dlg-input";
@@ -692,6 +851,7 @@ export class WelcomeForm {
       this.customField,
       this.countField,
       this.shellField,
+      this.sshField,
       this.repoField,
       this.worktreeField,
       this.autopilotField,
@@ -740,17 +900,32 @@ export class WelcomeForm {
     const agent = k === "agent";
     const orch = k === "orchestrator";
     const term = k === "terminal";
+    const ssh = k === "ssh";
     const content = isContentKind(k);
     // A content pane picks no CLI and spawns nothing: its ONLY input is the folder /
     // repo (plus a name), so every other field is out (#214, #217).
-    this.agentField.hidden = term || content; // agent + orchestrator both pick a CLI
+    // An SSH pane (#887 S3) picks no LOCAL anything: its CLI, its folder and its
+    // shell are all on the far side of the connection, so the local Agent /
+    // Shell / Repository controls are out and its own section carries the
+    // remote equivalents.
+    this.agentField.hidden = term || content || ssh; // agent + orchestrator both pick a CLI
     this.customField.hidden = !agent || this.agentSel.value !== "custom";
     this.countField.hidden = !agent;
     this.shellField.hidden = !term;
+    this.sshField.hidden = !ssh;
+    this.repoField.hidden = ssh;
     this.worktreeField.hidden = !agent; // workers get worktrees on demand
     this.autopilotField.hidden = !agent;
     this.orchFields.hidden = !orch;
     this.nameField.hidden = orch; // orchestrator names its panes from the roles
+    if (ssh) {
+      // Both are cheap, memoized and idempotent, and both have to have happened
+      // before the human can submit — so they start the moment the kind is
+      // picked rather than at submit, where their latency would be a stall.
+      void this.loadSshProfilesOnce();
+      void this.resolveSshProgram();
+      this.updateSshWarning();
+    }
     // Same control, honest caption per kind: a folder to browse or edit, a repository
     // to view — not "a repository to work in".
     this.repoLabel.textContent = k === "files" || k === "editor" ? "Folder" : "Repository";
@@ -1111,9 +1286,12 @@ export class WelcomeForm {
   }
 
   /** The program a given launch would execute (first token of the command), or
-   *  null for a terminal / content pane (no CLI to probe — none of them runs one). */
+   *  null for a terminal / content / SSH pane (no LOCAL CLI to probe — a terminal
+   *  and a content pane run none, and an SSH pane's CLI runs on the far host,
+   *  where this machine's PATH says nothing about it; its own probe is for the
+   *  ssh client, `resolveSshProgram`). */
   private currentProgram(): string | null {
-    if (this.kind === "terminal" || isContentKind(this.kind)) return null;
+    if (this.kind === "terminal" || this.kind === "ssh" || isContentKind(this.kind)) return null;
     if (this.kind === "orchestrator") return orchCliFor(this.agentSel.value).id;
     const agent = AGENTS.find((a) => a.id === this.agentSel.value) ?? AGENTS[0];
     const command = agent.id === "custom" ? this.customInput.value.trim() : agent.command;
@@ -1132,7 +1310,10 @@ export class WelcomeForm {
    *  mode every role's CLI is checked; the first missing one is surfaced.
    *  Terminals have no CLI, so the warning is cleared. */
   private updateAgentWarning(): void {
-    if (this.kind === "terminal" || isContentKind(this.kind)) {
+    // The SSH kind sits with terminal/content here: its warnings are its own
+    // section's (`updateSshWarning`), and probing this machine's PATH for a CLI
+    // that will run on another machine would report a fact about the wrong host.
+    if (this.kind === "terminal" || this.kind === "ssh" || isContentKind(this.kind)) {
       this.agentWarn.classList.remove("visible"); // no CLI involved — nothing to warn about
       return;
     }
@@ -1172,6 +1353,13 @@ export class WelcomeForm {
     if (this.nameDirty) return;
     const where =
       this.worktreeInput.value.trim() || basename(this.repoInput.value.trim()) || "home";
+    if (this.kind === "ssh") {
+      // The connection's own name is the useful title (it is what the human
+      // chose to call that host); the destination is the honest fallback while
+      // they are still filling in a new one.
+      this.nameInput.value = this.sshNameInput.value.trim() || this.sshDestInput.value.trim() || "ssh";
+      return;
+    }
     if (isContentKind(this.kind)) {
       // The root's short name IS the useful title here — a "files · " prefix would
       // just eat width in the header for something the pane's content already says.
@@ -1223,6 +1411,183 @@ export class WelcomeForm {
     this.applyShellAvailability();
   }
 
+  // ---------- SSH connections (#887 S3) ----------
+
+  /** Load the saved connections once per form, and paint the picker. Failures
+   *  (or a first run) leave an empty store: a connection list we couldn't read is
+   *  a form with no saved entries, never a form that won't open. */
+  private loadSshProfilesOnce(): Promise<void> {
+    this.sshLoad ??= loadSshProfiles()
+      .then((raw) => decodeSshProfiles(raw) ?? emptySshProfileStore())
+      .catch(() => emptySshProfileStore())
+      .then((store) => {
+        this.sshStore = store;
+        this.paintSshProfiles();
+        // Seed the fields from the first saved connection — the overwhelmingly
+        // common case is reconnecting to a host you already use, and a form that
+        // opens on "New connection…" with a list of saved ones behind it makes
+        // the human pick twice.
+        if (store.profiles.length) {
+          this.sshProfileSel.value = store.profiles[0].id;
+          this.applySshProfile();
+        }
+      });
+    return this.sshLoad;
+  }
+  private sshLoad: Promise<void> | null = null;
+
+  /** Rebuild the picker: every saved connection, then the "new" entry. */
+  private paintSshProfiles(): void {
+    const current = this.sshProfileSel.value;
+    this.sshProfileSel.replaceChildren(
+      ...this.sshStore.profiles.map((p) => {
+        const o = document.createElement("option");
+        o.value = p.id;
+        o.textContent = `${p.name} — ${p.destination}`;
+        return o;
+      })
+    );
+    const fresh = document.createElement("option");
+    fresh.value = SSH_NEW;
+    fresh.textContent = "New connection…";
+    this.sshProfileSel.appendChild(fresh);
+    this.sshProfileSel.value = this.sshStore.profiles.some((p) => p.id === current) ? current : SSH_NEW;
+  }
+
+  /** Fill the editor fields from the picked connection — or clear them for a new
+   *  one. The fields ARE the profile, so this is the whole of "selecting" it. */
+  private applySshProfile(): void {
+    const picked = this.sshStore.profiles.find((p) => p.id === this.sshProfileSel.value) ?? null;
+    // A fresh id per switch INTO "new", not per submit: a validation bounce and
+    // the retry that follows it must save one connection, not two.
+    if (!picked) this.sshNewId = crypto.randomUUID();
+    this.sshNameInput.value = picked?.name ?? "";
+    this.sshDestInput.value = picked?.destination ?? "";
+    this.sshPortInput.value = picked?.port !== undefined && picked?.port !== null ? String(picked.port) : "";
+    this.sshIdentityInput.value = picked?.identityFile ?? "";
+    this.sshRemoteShellSel.value = picked?.remoteShell ?? DEFAULT_REMOTE_SHELL;
+    this.sshKeepaliveInput.value =
+      picked?.keepaliveSeconds !== undefined && picked?.keepaliveSeconds !== null
+        ? String(picked.keepaliveSeconds)
+        : "";
+    this.sshExtraInput.value = picked?.extraArgs.join(" ") ?? "";
+    this.sshRemoteCwdInput.value = picked?.remoteCwd ?? "";
+    this.setSshCli(picked?.defaultCli ?? null);
+    this.updateSshWarning();
+    this.updateName();
+  }
+
+  /** Select a remote CLI, keeping one this build doesn't know rather than
+   *  silently retargeting the connection at whatever happens to be first in the
+   *  list. A profile naming `aider` is a profile to warn about (S1's own
+   *  contract) — so the value survives round-tripping through this form, and
+   *  `updateSshWarning` says what it will and won't get. */
+  private setSshCli(cli: string | null): void {
+    const known = Array.from(this.sshCliSel.options).some((o) => o.value === (cli ?? ""));
+    if (!known && cli) {
+      const o = document.createElement("option");
+      o.value = cli;
+      o.textContent = `${cli} — not a CLI loomux knows`;
+      this.sshCliSel.appendChild(o);
+    }
+    this.sshCliSel.value = cli ?? "";
+  }
+
+  /** The SSH section's inline warnings. No ssh client at all replaces the rest —
+   *  it is the one that will refuse the launch, so it must not be one line among
+   *  several. Otherwise every applicable advisory shows: an unrecognized remote
+   *  CLI, and a remote folder that this launch cannot act on. Both are things the
+   *  human can act on BEFORE submitting, which is the whole point of saying them
+   *  here rather than discovering them afterwards. */
+  private updateSshWarning(): void {
+    if (this.kind !== "ssh") return;
+    const advisories = (): string =>
+      [
+        sshRemoteCliWarning(
+          this.sshCliSel.value || null,
+          AGENTS.map((a) => a.id)
+        ),
+        sshRemoteCwdWarning(this.sshCliSel.value || null, this.sshRemoteCwdInput.value.trim() || null),
+      ]
+        .filter(Boolean)
+        .join(" ");
+    const show = (text: string): void => {
+      this.sshWarn.textContent = text ? `⚠ ${text}` : "";
+      this.sshWarn.classList.toggle("visible", !!text);
+    };
+    show(advisories());
+    void this.resolveSshProgram().then((program) => {
+      if (this.kind !== "ssh") return;
+      show(program ? advisories() : SSH_NO_CLIENT);
+    });
+  }
+
+  /** Resolve the local ssh client once per form (PATH, then the inbox OpenSSH
+   *  install). A failed probe reads as "not found", which refuses the launch with
+   *  a reason rather than spawning a pane that dies on its first line. */
+  private resolveSshProgram(): Promise<string | null> {
+    this.sshProgram ??= discoverSsh().catch(() => null);
+    return this.sshProgram;
+  }
+
+  /** The connection the fields currently describe, or null when there isn't one
+   *  yet (no name, or no destination — the two fields without which there is
+   *  nothing to save and nothing to connect to).
+   *
+   *  Every value is passed through RAW, deliberately: `planPaneSetup` runs the
+   *  profile store's own normalizer over it, so the guards that decide what
+   *  reaches `sshprofiles.json` are the same ones that decide what reaches ssh —
+   *  and a destination this form refused locally could never produce the
+   *  specific refusal the human needs to read. */
+  private currentSshProfile(): SshProfile | null {
+    const name = this.sshNameInput.value.trim();
+    const destination = this.sshDestInput.value.trim();
+    if (!name || !destination) return null;
+    const picked = this.sshStore.profiles.find((p) => p.id === this.sshProfileSel.value);
+    return {
+      id: picked?.id ?? this.sshNewId ?? crypto.randomUUID(),
+      name,
+      destination,
+      port: optionalNumber(this.sshPortInput),
+      identityFile: this.sshIdentityInput.value.trim() || null,
+      remoteCwd: this.sshRemoteCwdInput.value.trim() || null,
+      defaultCli: this.sshCliSel.value || null,
+      remoteShell: this.sshRemoteShellSel.value as RemoteShell,
+      keepaliveSeconds: optionalNumber(this.sshKeepaliveInput),
+      // Whitespace-split argv words, as the field's hint says. No quoting is
+      // interpreted (a single flag value containing a space is not expressible
+      // here) — these reach ssh as argv, never through a shell, so there is no
+      // quoting layer to honour and inventing one would only create a second
+      // syntax to get wrong.
+      extraArgs: this.sshExtraInput.value.trim().split(/\s+/).filter(Boolean),
+    };
+  }
+
+  /** Save the launched connection back to `sshprofiles.json` — created or
+   *  updated in place, so the picker offers it next time.
+   *
+   *  Best-effort by design (the same contract `saveUiTabs` has): a connection
+   *  that started is worth more than the record of it, and failing the launch
+   *  because the store couldn't be written would be trading the thing the human
+   *  asked for against a convenience. */
+  private async persistSshProfile(profile: SshProfile): Promise<void> {
+    const others = this.sshStore.profiles.filter((p) => p.id !== profile.id);
+    const existing = this.sshStore.profiles.some((p) => p.id === profile.id);
+    // Keeps position on an edit, appends on a create — a picker that reorders
+    // itself under the human every time they launch is its own small bug.
+    this.sshStore = {
+      ...this.sshStore,
+      profiles: existing
+        ? this.sshStore.profiles.map((p) => (p.id === profile.id ? profile : p))
+        : [...others, profile],
+    };
+    try {
+      await saveSshProfiles(encodeSshProfiles(this.sshStore));
+    } catch {
+      /* best-effort — the pane still launches; the connection just isn't saved */
+    }
+  }
+
   private async pickRepo(): Promise<void> {
     const picked = await pickDirectory({
       title: "Choose repository or folder",
@@ -1250,6 +1615,7 @@ export class WelcomeForm {
       name: this.nameInput.value,
       autopilot: this.autopilotInput.checked,
       shellKind: this.shellSel.value as ShellKind,
+      sshProfile: this.currentSshProfile(),
     };
   }
 
@@ -1266,10 +1632,47 @@ export class WelcomeForm {
       if (res.focus === "repo") this.repoInput.focus();
       else if (res.focus === "custom") this.customInput.focus();
       else if (res.focus === "count") this.countInput.focus();
+      else if (res.focus === "ssh") this.sshDestInput.focus();
       this.latch.release();
       return;
     }
     const plan = res.plan;
+
+    if (plan.kind === "ssh") {
+      // #887 S3. Order matters and is the whole of this arm:
+      //  1. resolve the LOCAL ssh client — no client, no launch, said once and
+      //     legibly instead of a pane that flashes an error and dies;
+      //  2. mint a session id, but only for a CLI whose identity travels on the
+      //     command line (claude) — see `sshMintsSessionId`;
+      //  3. compose the argv, catching the one class of refusal the builder
+      //     raises (a remote-command token cmd.exe cannot be handed safely,
+      //     which is a fixable data problem, not a bug);
+      //  4. save the connection, best-effort, and fire.
+      this.setBusy(true, "Connecting…");
+      const program = await this.resolveSshProgram();
+      if (!program) {
+        this.showError(SSH_NO_CLIENT);
+        this.setBusy(false);
+        this.latch.release();
+        return;
+      }
+      // Web Crypto, NOT a getrandom crate — constraint 2 governs the src-tauri
+      // dependency graph, not the webview (same call the agent path makes).
+      const sessionId = sshMintsSessionId(plan.profile.defaultCli) ? crypto.randomUUID() : undefined;
+      let argv: string[];
+      try {
+        argv = sshLaunchArgv(program, plan.profile, sessionId ?? null);
+      } catch (err) {
+        this.showError(String(err instanceof Error ? err.message : err));
+        this.sshRemoteCwdInput.focus();
+        this.setBusy(false);
+        this.latch.release();
+        return;
+      }
+      await this.persistSshProfile(plan.profile);
+      this.fire({ kind: "ssh", name: plan.name, argv, profileId: plan.profile.id, sessionId });
+      return;
+    }
 
     if (plan.kind === "terminal") {
       // Resolve against discovered availability: an unavailable kind (a stale Git

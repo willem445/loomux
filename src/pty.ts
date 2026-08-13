@@ -111,6 +111,15 @@ export const dirInfo = (path: string): Promise<DirInfo> => invoke("dir_info", { 
 export const discoverGitBash = (): Promise<string | null> =>
   invoke<string | null>("discover_git_bash");
 
+/** Resolve the local OpenSSH client an SSH pane spawns (#887 S3) — PATH first,
+ *  then the inbox `System32\OpenSSH` install for a stripped PATH. `null` = this
+ *  machine has no ssh client, which the launcher refuses the launch with rather
+ *  than opening a pane that dies on its first line.
+ *
+ *  Returns the ABSOLUTE path, and that path is what the spawned argv carries:
+ *  resolving once means the binary that was probed is the binary that runs. */
+export const discoverSsh = (): Promise<string | null> => invoke<string | null>("discover_ssh");
+
 /** The model knobs loomux can actually set on an agent CLI (#687) — the CLI's
  *  `CLI_CAPS` row, reported verbatim by the backend so the launcher, the workflow
  *  parser and the spawn path can never disagree about what a CLI supports.

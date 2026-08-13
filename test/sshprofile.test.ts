@@ -92,6 +92,44 @@ test("encode stamps the schema version", () => {
   assert.equal(written.schemaVersion, SSH_PROFILES_SCHEMA_VERSION);
 });
 
+test("encode carries a FUTURE file's schemaVersion instead of downgrading it", () => {
+  // #907 review NB2, deferred to S3's opening commit. Decode already carries the
+  // file's own version into the store; an encode that re-stamped it made an
+  // unrelated edit (adding one profile) silently re-label the whole file. The
+  // scenario that made it worth fixing before S3 gave this file its first
+  // WRITER: a v2 build stamps 2, the user rolls back to a build like this one,
+  // and the first save both drops the v2 fields (the allowlist, deliberate) and
+  // claims the file was always v1.
+  const written = JSON.parse(
+    encodeSshProfiles({ schemaVersion: 2, profiles: [fullProfile()] })
+  );
+  assert.equal(written.schemaVersion, 2, "the store's own version must survive a save");
+  // …and a full load→save round trip of a v2 file is version-stable, which is
+  // the property a rollback actually depends on.
+  const raw = JSON.stringify({ schemaVersion: 2, profiles: [fullProfile()] });
+  const reloaded = decodeSshProfiles(encodeSshProfiles(decodeSshProfiles(raw)!));
+  assert.equal(reloaded?.schemaVersion, 2);
+});
+
+test("a nonsense schemaVersion falls back to this build's, matching decode", () => {
+  // The fallback must agree with `decodeSshProfiles`'s own reading of a mangled
+  // header, or a hand-edited file would mean one thing on load and another on
+  // save. Non-integers, zero and non-numbers all land on the same answer.
+  for (const bogus of [0, -3, 1.5, NaN, "2", null, undefined]) {
+    const written = JSON.parse(
+      encodeSshProfiles({
+        schemaVersion: bogus as unknown as number,
+        profiles: [fullProfile()],
+      })
+    );
+    assert.equal(
+      written.schemaVersion,
+      SSH_PROFILES_SCHEMA_VERSION,
+      `schemaVersion ${String(bogus)} must fall back, not be written through`
+    );
+  }
+});
+
 test("an empty store round-trips as an empty store, not as null", () => {
   // Distinct from first run: the user deleted their last profile, and that
   // deletion has to survive a save/load or it undoes itself.
@@ -168,6 +206,24 @@ test("a multi-line identityFile is refused even without PEM armour", () => {
   assert.equal(p.identityFile, null);
 });
 
+test("PEM armour with its newlines stripped is refused, in either case", () => {
+  // #907 review NB3, deferred here: the line-break test is what catches real key
+  // material (every key wraps its body), so the armour test only ever fires
+  // independently for a header pasted with its newlines already gone — and a
+  // paste mangled that far has no reason to have preserved case either. Both
+  // spellings of the one case the belt exists for.
+  for (const armoured of [
+    "-----BEGIN OPENSSH PRIVATE KEY----- b3BlbnNzaC1rZXktdjEA -----END OPENSSH PRIVATE KEY-----",
+    "-----begin openssh private key----- b3BlbnNzaC1rZXktdjEA -----end openssh private key-----",
+  ]) {
+    const p = decodeOne(
+      JSON.stringify({ profiles: [{ ...fullProfile(), identityFile: armoured }] })
+    );
+    assert.equal(p.identityFile, null, `armour must be refused: ${armoured.slice(0, 20)}…`);
+    assert.equal(p.destination, "dev@build.example.net", "the rest of the profile survives");
+  }
+});
+
 test("an ordinary identity PATH is kept — the guard must not reject the real case", () => {
   // Without this, "refuse everything" would pass every test above.
   assert.equal(
@@ -200,7 +256,13 @@ test("a HOST starting with '-' fails the entry even though the destination doesn
   assert.deepEqual(decoded, { schemaVersion: SSH_PROFILES_SCHEMA_VERSION, profiles: [] });
 });
 
-test("a USER starting with '-' fails the entry", () => {
+test("a USER starting with '-' fails the entry — via the WHOLE-WORD check", () => {
+  // Named for what it actually witnesses (#907 review NF1). A dashed user shares
+  // its first character with the whole destination, so `dest.startsWith("-")`
+  // has already rejected this before the `@` split runs: the component guard's
+  // user half could never fire, and has been removed rather than left standing
+  // as a protection that isn't one. The refusal itself is unchanged — which is
+  // the point of keeping this test.
   const decoded = decodeSshProfiles(
     JSON.stringify({ profiles: [fullProfile({ destination: "-oProxyCommand=calc.exe@host" })] })
   );

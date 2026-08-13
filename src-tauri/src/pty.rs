@@ -1154,6 +1154,88 @@ pub async fn discover_git_bash() -> Option<String> {
     .await
 }
 
+/// Candidate `ssh.exe` paths for the Windows inbox OpenSSH client, used only
+/// when PATH has no `ssh.exe` at all (#887 S3). Pure (builds paths, touches no
+/// filesystem) so the layout is unit-testable against fixed inputs, like
+/// `git_bash_candidates_from`.
+///
+/// Both entries are the SAME install seen through two names, in the order they
+/// should be tried:
+///  - `System32\OpenSSH` — where Windows 10 1809+ ships the client.
+///  - `Sysnative\OpenSSH` — the same directory as seen from a 32-bit process,
+///    for which `System32` is silently redirected to `SysWOW64` (which has no
+///    OpenSSH). Costs one extra `is_file` on a path that simply doesn't exist
+///    for a 64-bit process, and is the difference between "found" and "not
+///    installed" for one that isn't.
+///
+/// Driven entirely by `SystemRoot` rather than a literal `C:\Windows`: a machine
+/// is free to have Windows anywhere, and hardcoding one operator's layout into
+/// product code is what CLAUDE.md constraint 8 refuses. No `SystemRoot` at all
+/// means no candidates — an empty list, not a guess.
+#[cfg(target_os = "windows")]
+fn ssh_candidates_from(system_root: Option<&Path>) -> Vec<PathBuf> {
+    let Some(root) = system_root else {
+        return Vec::new();
+    };
+    ["System32", "Sysnative"]
+        .iter()
+        .map(|dir| root.join(dir).join("OpenSSH").join("ssh.exe"))
+        .collect()
+}
+
+/// Locate the local `ssh.exe` an SSH pane spawns (#887 S3): PATH first, then the
+/// inbox OpenSSH install directory.
+///
+/// PATH wins deliberately — a user who installed a newer OpenSSH, or who puts a
+/// wrapper on PATH ahead of the inbox client, has already expressed which ssh
+/// they mean, and every other program on the machine honours that. The candidate
+/// list below is the fallback for a STRIPPED PATH (a common enough shape in
+/// locked-down environments, and the one case where "ssh isn't installed" would
+/// otherwise be reported about a machine that ships it).
+///
+/// `None` means no ssh client was found: the launcher then refuses the launch
+/// with that reason instead of spawning a pane that dies on its first line.
+#[cfg(target_os = "windows")]
+fn find_ssh() -> Option<PathBuf> {
+    if let Some(ssh) = which_path("ssh.exe") {
+        return Some(ssh);
+    }
+    let system_root = std::env::var_os("SystemRoot").map(PathBuf::from);
+    ssh_candidates_from(system_root.as_deref())
+        .into_iter()
+        .find(|cand| cand.is_file())
+}
+
+/// Resolve the local OpenSSH client for an SSH pane (#887 S3), as an absolute
+/// path, or `None` when this machine has none. The launcher probes this before
+/// it will build an ssh command line, and hands the resolved path back as the
+/// spawned argv's program — resolving ONCE, here, so the path that was probed is
+/// the path that runs (a bare `"ssh"` would be re-resolved at spawn time against
+/// a different PATH snapshot, and could silently be a different binary, or none).
+///
+/// Off-thread (#746 — `crate::blocking::run_blocking`, P1 of
+/// `doc/design/performance.md`) for the same reason as `discover_git_bash`: it
+/// scans PATH and stats a small candidate list, at launcher time, on the thread
+/// that services paint. Always `None` off Windows — the pane kind is Windows-only
+/// like every other spawn path here.
+///
+/// **Reentrancy.** A pure read of the machine: no lock, no mutation, no cache for
+/// two concurrent probes to disagree about.
+#[tauri::command]
+pub async fn discover_ssh() -> Option<String> {
+    crate::blocking::run_blocking(|| {
+        #[cfg(target_os = "windows")]
+        {
+            find_ssh().map(|p| p.to_string_lossy().into_owned())
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            None
+        }
+    })
+    .await
+}
+
 /// Whether the direct-CLI spawn path (issue #78) is disabled by the escape
 /// hatch. Set `LOOMUX_NO_DIRECT_SPAWN` to any value other than empty/`0`/`false`
 /// to force every agent pane back through the shell wrapper (the pre-#78
@@ -2158,6 +2240,26 @@ mod tests {
                 PathBuf::from(r"C:\PF32\Git\bin\bash.exe"),
             ]
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ssh_candidates_follow_system_root_and_cover_the_wow64_view() {
+        // Pure helper over a fixed root (#887 S3), so this asserts the layout and
+        // the order rather than whatever this machine happens to have installed.
+        // A relocated Windows must resolve too — the paths are built from
+        // SystemRoot, never from a hardcoded C:\Windows.
+        let cands = ssh_candidates_from(Some(Path::new(r"D:\Win")));
+        assert_eq!(
+            cands,
+            vec![
+                PathBuf::from(r"D:\Win\System32\OpenSSH\ssh.exe"),
+                PathBuf::from(r"D:\Win\Sysnative\OpenSSH\ssh.exe"),
+            ]
+        );
+        // No SystemRoot → no candidates at all. The fallback must not invent a
+        // path to stat: "we don't know where Windows is" is not "try C:\Windows".
+        assert!(ssh_candidates_from(None).is_empty());
     }
 
     #[cfg(windows)]

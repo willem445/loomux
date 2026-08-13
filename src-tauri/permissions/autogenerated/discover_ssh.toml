@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-discover-ssh"
+description = "Enables the discover_ssh command without any pre-configured scope."
+commands.allow = ["discover_ssh"]
+
+[[permission]]
+identifier = "deny-discover-ssh"
+description = "Denies the discover_ssh command without any pre-configured scope."
+commands.deny = ["discover_ssh"]
