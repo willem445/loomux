@@ -631,8 +631,8 @@ pub const MAX_INTAKE_POLLS_PER_TICK: usize = 4;
 /// due set always yields the same selection: never-polled groups all share
 /// `last = 0`, and the round-robin can only be fair if the tiebreak is
 /// deterministic rather than the map's iteration order.
-pub fn due_intake_polls(now_ms: u64, groups: &HashMap<String, u32>, last_poll_ms: &HashMap<String, u64>) -> Vec<String> {
-    let mut due: Vec<(u64, &String)> = groups
+pub fn due_intake_polls(now_ms: u64, groups: &HashMap<super::GroupId, u32>, last_poll_ms: &HashMap<super::GroupId, u64>) -> Vec<super::GroupId> {
+    let mut due: Vec<(u64, &super::GroupId)> = groups
         .iter()
         .filter(|(_, &minutes)| minutes > 0)
         .filter_map(|(group, &minutes)| {
@@ -648,6 +648,12 @@ pub fn due_intake_polls(now_ms: u64, groups: &HashMap<String, u32>, last_poll_ms
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use super::super::GroupId;
+    /// #904: the one constructor, in tests as in production.
+    fn gid(s: &str) -> GroupId {
+        GroupId::parse(s).unwrap()
+    }
 
     fn issue(number: u64, title: &str, labels: &[&str]) -> RawIssue {
         RawIssue { number, title: title.to_string(), labels: labels.iter().map(|s| s.to_string()).collect() }
@@ -1073,23 +1079,23 @@ mod tests {
     #[test]
     fn due_intake_polls_skips_a_group_with_polling_off() {
         let mut groups = HashMap::new();
-        groups.insert("g1".to_string(), 0u32);
+        groups.insert(gid("g1"), 0u32);
         assert!(due_intake_polls(1_000_000, &groups, &HashMap::new()).is_empty());
     }
 
     #[test]
     fn due_intake_polls_never_polled_is_immediately_due() {
         let mut groups = HashMap::new();
-        groups.insert("g1".to_string(), 5u32);
+        groups.insert(gid("g1"), 5u32);
         assert_eq!(due_intake_polls(1_000_000, &groups, &HashMap::new()), vec!["g1".to_string()]);
     }
 
     #[test]
     fn due_intake_polls_respects_the_per_group_interval() {
         let mut groups = HashMap::new();
-        groups.insert("g1".to_string(), 5u32);
+        groups.insert(gid("g1"), 5u32);
         let mut last = HashMap::new();
-        last.insert("g1".to_string(), 1_000u64);
+        last.insert(gid("g1"), 1_000u64);
         assert!(due_intake_polls(1_000 + 4 * 60_000, &groups, &last).is_empty(), "under 5 min must not be due yet");
         assert_eq!(due_intake_polls(1_000 + 5 * 60_000, &groups, &last), vec!["g1".to_string()]);
     }
@@ -1104,11 +1110,11 @@ mod tests {
     fn due_intake_polls_caps_one_scan_however_many_are_due() {
         let mut groups = HashMap::new();
         for i in 0..(MAX_INTAKE_POLLS_PER_TICK + 6) {
-            groups.insert(format!("g{i:02}"), 5u32);
+            groups.insert(gid(&format!("g{i:02}")), 5u32);
         }
         let due = due_intake_polls(1_000_000, &groups, &HashMap::new());
         assert_eq!(due.len(), MAX_INTAKE_POLLS_PER_TICK, "an uncapped scan is 2 gh calls per due group");
-        let distinct: HashSet<&String> = due.iter().collect();
+        let distinct: HashSet<&GroupId> = due.iter().collect();
         assert_eq!(distinct.len(), due.len(), "the cap must select distinct groups, not repeat one");
     }
 
@@ -1120,7 +1126,7 @@ mod tests {
     fn due_intake_polls_defers_the_overflow_to_the_next_scan_instead_of_starving_it() {
         let mut groups = HashMap::new();
         for i in 0..(MAX_INTAKE_POLLS_PER_TICK * 2) {
-            groups.insert(format!("g{i:02}"), 5u32);
+            groups.insert(gid(&format!("g{i:02}")), 5u32);
         }
         let now = 1_000_000u64;
         let mut last = HashMap::new();
@@ -1134,10 +1140,10 @@ mod tests {
         // are not, which is what makes the next scan pick up exactly them.
         let second = due_intake_polls(now, &groups, &last);
         assert_eq!(second.len(), MAX_INTAKE_POLLS_PER_TICK, "the deferred groups must be due on the very next scan");
-        let overlap: Vec<&String> = second.iter().filter(|g| first.contains(g)).collect();
+        let overlap: Vec<&GroupId> = second.iter().filter(|g| first.contains(g)).collect();
         assert!(overlap.is_empty(), "a group already polled this floor must not be re-polled ahead of a deferred one: {overlap:?}");
 
-        let covered: HashSet<&String> = first.iter().chain(second.iter()).collect();
+        let covered: HashSet<&GroupId> = first.iter().chain(second.iter()).collect();
         assert_eq!(covered.len(), groups.len(), "two scans must cover every due group — the cap defers, it never starves");
     }
 
@@ -1152,8 +1158,8 @@ mod tests {
         // Staggered stamps, all far enough back to be due: g00 is the
         // stalest, g09 the freshest.
         for i in 0..10u64 {
-            groups.insert(format!("g{i:02}"), 5u32);
-            last.insert(format!("g{i:02}"), 1_000 + i * 1_000);
+            groups.insert(gid(&format!("g{i:02}")), 5u32);
+            last.insert(gid(&format!("g{i:02}")), 1_000 + i * 1_000);
         }
         let due = due_intake_polls(1_000 + 60 * 60_000, &groups, &last);
         let expected: Vec<String> = (0..MAX_INTAKE_POLLS_PER_TICK).map(|i| format!("g{i:02}")).collect();
@@ -1168,12 +1174,12 @@ mod tests {
     fn due_intake_polls_is_deterministic_among_never_polled_groups() {
         let mut groups = HashMap::new();
         for i in 0..(MAX_INTAKE_POLLS_PER_TICK + 6) {
-            groups.insert(format!("g{i:02}"), 5u32);
+            groups.insert(gid(&format!("g{i:02}")), 5u32);
         }
         let first = due_intake_polls(1_000_000, &groups, &HashMap::new());
         // Rebuilding the map changes its iteration order in general; the
         // selection must not move with it.
-        let rebuilt: HashMap<String, u32> = groups.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        let rebuilt: HashMap<GroupId, u32> = groups.iter().map(|(k, v)| (k.clone(), *v)).collect();
         assert_eq!(due_intake_polls(1_000_000, &rebuilt, &HashMap::new()), first);
         let expected: Vec<String> = (0..MAX_INTAKE_POLLS_PER_TICK).map(|i| format!("g{i:02}")).collect();
         assert_eq!(first, expected, "ties break on the group id, so the answer is stated, not hash-dependent");

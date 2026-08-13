@@ -240,7 +240,7 @@ fn the_notify_toggle_does_its_io_once_per_actual_transition() {
     // that changes nothing writes nothing and audits nothing.
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
-    let marker = reg.state_root().join(&g.id).join("notify");
+    let marker = reg.state_root().join(g.id.as_str()).join("notify");
 
     assert!(!reg.notify_enabled(&g.id), "off is the default");
     reg.set_notify(&g.id, true).unwrap();
@@ -281,7 +281,7 @@ fn concurrent_notify_toggles_never_leave_the_marker_disagreeing_with_memory() {
     // is what stops a future edit quietly removing it.
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
-    let marker = reg.state_root().join(&g.id).join("notify");
+    let marker = reg.state_root().join(g.id.as_str()).join("notify");
 
     let threads: Vec<_> = (0..8)
         .map(|t| {

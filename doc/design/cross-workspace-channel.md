@@ -323,7 +323,8 @@ reads/broadcasts against.
 
 **Identity — a reserved pseudo-group + `Role::Solo`.** A backend-minted, fixed constant
 `SOLO_GROUP = "__solo__"` (never produced by `group_id_for_repo`, which always emits
-`{slug}-{8hex}` — constraint 6's path-segment safety holds by provenance), registered
+`{slug}-{8hex}` — its path-segment safety held by provenance even before #904, and it now
+parses as a validated `GroupId` like every other id via `solo_group_id`), registered
 lazily (`OrchRegistry::ensure_solo_group`) the first time a solo pane is created, with repo
 label `"(standalone)"`. Each standalone pane is `AgentEntry{id: "solo-N", group:
 "__solo__", role: Role::Solo, ...}`. **`Role::Solo`'s entire MCP surface is `channel_send` +

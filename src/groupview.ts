@@ -705,7 +705,11 @@ export class GroupView {
         notifyEnabled(this.groupId),
         spawnExpanded(this.groupId),
         autonomyState(this.groupId),
-        groupWatches(this.groupId),
+        // #904: the backend answers `null` if it refuses the group id; the
+        // watch list is the one field here that is not nullable, and the row
+        // renderer calls `.filter` on it. Coalesce at the seam rather than
+        // pushing a guard into every reader.
+        groupWatches(this.groupId).then((w) => w ?? []),
         workflowStatus(this.groupId),
         mergeQueue(this.groupId),
         lockState(this.groupId),
@@ -1040,7 +1044,23 @@ export class GroupView {
   }
 
   private render(): void {
-    if (this.disposed || !this.summary) return;
+    if (this.disposed) return;
+    // #904 (rev-450 N11): a refused group id resolves every field to `null`,
+    // and `load()` has already passed its toast by the time we get here. Return
+    // silently and the panel freezes blank on a 2 s poll with nothing said —
+    // strictly better than the uncaught TypeError this replaced, but still
+    // indistinguishable from "this group has nothing in it". Say so instead,
+    // and hide the rows that would otherwise linger half-drawn.
+    if (!this.summary) {
+      this.summaryEl.replaceChildren(
+        el("div", "group-empty", "This group's state could not be read."),
+      );
+      this.listEl.replaceChildren();
+      this.workflowRow.hidden = true;
+      this.mqRow.hidden = true;
+      this.lockRow.hidden = true;
+      return;
+    }
     const s = this.summary;
 
     // Summary line: N agents · role breakdown · uptime · paused badge.
@@ -1241,7 +1261,12 @@ export class GroupView {
    *  an absent one is the product default. Here "no resources declared" IS the
    *  product default and is the only state that hides the row; a read that
    *  actually failed is reported by `lockState`'s own warning rather than
-   *  disguised as an empty list. */
+   *  disguised as an empty list.
+   *
+   *  #904 adds one more `null` source that is NOT a failed read: the backend
+   *  refusing the group id. That case never reaches this row — `render()`
+   *  stops at the summary and says so — so the sentence above still holds for
+   *  every state this renderer is actually asked to draw. */
   private renderLocks(): void {
     const resources = this.locks?.resources ?? [];
     const summary = lockSummary(resources);
@@ -1270,6 +1295,12 @@ export class GroupView {
    *  cannot be read renders LOUD instead — an unreadable queue and an empty
    *  one are the same picture to a human, and this panel is where they'd be
    *  confused.
+   *
+   *  #904 makes `null` also the answer when the backend refuses the group id,
+   *  which would have quietly become a second hiding case and inverted the
+   *  paragraph above. It does not, because `render()` now stops at the summary
+   *  for that state and reports it — so by the time this runs, `null` still
+   *  means exactly one thing: no `merge_queue.json`.
    *
    *  A state or status word this build doesn't know makes the model THROW
    *  (its rule 2). Caught here rather than left to `load()`'s toast: the

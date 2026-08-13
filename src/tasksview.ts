@@ -310,7 +310,10 @@ export class TasksView {
     }
     try {
       const summary = await groupSummary(this.groupId);
-      this.liveAgentIds = new Set(summary.agents.map((a) => a.id));
+      // #904: `null` when the backend refuses the group id — the same
+      // best-effort degrade the `catch` below already takes, since an empty
+      // live set reads every assignee as history rather than breaking the board.
+      this.liveAgentIds = new Set(summary?.agents.map((a) => a.id) ?? []);
     } catch {
       // Best-effort enrichment, not core data: the board still renders on
       // the tasks alone, just with every assignee reading as history until

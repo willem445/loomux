@@ -107,7 +107,7 @@ impl QueueDirty {
 /// reading as anything unusual.
 pub trait QueueSnapshotWriter {
     /// Write `group`'s live queues to disk. Called with no queue lock held.
-    fn write_queue_snapshot(&self, group: &str);
+    fn write_queue_snapshot(&self, group: &super::GroupId);
 }
 
 /// Read-only access to [`QueueMap`]'s contents.
@@ -162,7 +162,7 @@ impl QueueMap {
     /// that a hatch, once present, grows.
     pub fn mutate<R>(
         &self,
-        group: &str,
+        group: &super::GroupId,
         writer: &impl QueueSnapshotWriter,
         f: impl FnOnce(&mut QueueEntries) -> (R, QueueDirty),
     ) -> R {
@@ -288,7 +288,7 @@ mod tests {
             reason: super::super::queue::EnqueueReason::Arrival,
             enqueued_ms: 0,
             coalesced: 0,
-            group: "g1".to_string(),
+            group: Some("g1".try_into().unwrap()),
             to_orchestrator: false,
             session_id: None,
             delivery_kind: super::super::Delivery::MidSession,
@@ -310,7 +310,7 @@ mod tests {
     }
 
     impl QueueSnapshotWriter for SpyWriter<'_> {
-        fn write_queue_snapshot(&self, group: &str) {
+        fn write_queue_snapshot(&self, group: &super::super::GroupId) {
             self.writes.borrow_mut().push(group.to_string());
             // `try_lock`, never `lock`: asserting the lock is free must not
             // be able to HANG the suite if it ever stops being free.
@@ -322,7 +322,7 @@ mod tests {
     fn a_mutation_that_changed_the_snapshot_writes_it() {
         let map = QueueMap::new();
         let spy = SpyWriter::new(&map);
-        let depth = map.mutate("g1", &spy, |queues| {
+        let depth = map.mutate(&"g1".try_into().unwrap(), &spy, |queues| {
             queues.entry(7).or_default().push_back(entry(1));
             (queues[&7].len(), QueueDirty::snapshot())
         });
@@ -334,7 +334,7 @@ mod tests {
     fn a_mutation_that_changed_nothing_writes_nothing() {
         let map = QueueMap::new();
         let spy = SpyWriter::new(&map);
-        map.mutate("g1", &spy, |queues| {
+        map.mutate(&"g1".try_into().unwrap(), &spy, |queues| {
             // The `entry().or_default()` shape `enqueue_text`'s RejectFull
             // arm hits: the map grew an EMPTY deque, which no byte of
             // `queue.json` is derived from.
@@ -354,7 +354,7 @@ mod tests {
         // delivery in the registry behind a disk write.
         let map = QueueMap::new();
         let spy = SpyWriter::new(&map);
-        map.mutate("g1", &spy, |queues| {
+        map.mutate(&"g1".try_into().unwrap(), &spy, |queues| {
             queues.entry(7).or_default().push_back(entry(1));
             ((), QueueDirty::snapshot())
         });

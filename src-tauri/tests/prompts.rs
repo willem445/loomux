@@ -70,7 +70,7 @@ fn test_registry() -> (OrchRegistry, tempfile::TempDir) {
 fn instructions(file: &str) -> String {
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
-    let text = fs::read_to_string(reg.state_root().join(&g.id).join(file))
+    let text = fs::read_to_string(reg.state_root().join(g.id.as_str()).join(file))
         .unwrap_or_else(|e| panic!("{file} must be written to the group dir: {e}"));
     assert!(!text.contains("{{"), "{file} has an unsubstituted template variable:\n{text}");
     text
@@ -595,8 +595,8 @@ fn the_orchestrator_may_file_an_issue_it_may_never_start_and_it_distils_what_rec
 fn the_reviewer_has_the_lanes_and_classifies_every_finding() {
     // The reviewer's priorities were correctness, tests, requirement fit, docs and style — and
     // nothing on trust boundaries, dependencies or algorithmic cost, in a repo where a bad
-    // dependency BRICKS THE BINARY (the getrandom/ProcessPrng rule) and a trust boundary holds
-    // only because the webview is trusted (`group_id` as a path segment). A lane nobody was told
+    // dependency BRICKS THE BINARY (the getrandom/ProcessPrng rule) and a trust boundary held
+    // only because the webview was trusted (`group_id` as a path segment, closed by #904). A lane nobody was told
     // to cover is a lane nobody reviews, and the absence is invisible: the review comes back clean.
     let reviewer = instructions("reviewer.md");
     let r = flat(&reviewer);

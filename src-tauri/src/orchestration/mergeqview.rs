@@ -62,11 +62,11 @@ const MAX_DETAIL_CHARS: usize = 300;
 
 /// Read the group's `merge_queue.json` and project it for the chrome.
 ///
-/// `dir` is the group state dir. **Constraint 6 posture, unchanged:** the
-/// `group_id` that built this path is trusted as a path segment exactly as
-/// every sibling `orch_*` command trusts it — safe only because the webview is
-/// trusted, and this command adds no new agent-reachable input (it takes no
-/// argument but the group).
+/// `dir` is the group state dir, and it was built by `group_dir_at` from a
+/// `GroupId` its command parsed at the boundary (#904) — not trusted from the
+/// caller. This function takes the resolved directory rather than an id, so it
+/// is not a group-path seam at all; it adds no agent-reachable input either
+/// (it takes no argument but the group).
 pub fn merge_queue_view(dir: &Path) -> Value {
     match std::fs::read_to_string(dir.join(MERGE_QUEUE_FILE)) {
         Ok(text) => project(&text),

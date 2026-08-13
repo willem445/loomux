@@ -70,9 +70,21 @@ compiles.
    wrappers call the seam. `test/transport.test.ts` enforces this — a direct
    `@tauri-apps` import anywhere else in `src/` fails the suite. See
    doc/design/engine-transport.md.
-6. **Orchestration commands trust `group_id` as a path segment** — safe only
-   because the webview is trusted. Never route agent-controllable input into
-   group-scoped commands without a traversal/membership check.
+6. **A group id becomes a path in exactly one place.** `GroupId`
+   (`orchestration/groupid.rs`) has one validating constructor; `group_dir_at`
+   is the only function that joins one onto a root, and it takes a `GroupId`,
+   not a string. `#[tauri::command]`s parse their raw `group_id` at the
+   boundary (`command_group`) and thread the type from there. Never add a
+   second join, never implement `AsRef<Path>` for `GroupId`, and never
+   reintroduce a `&str` group parameter on anything that builds a path. Two
+   source-scanning tests in `tests/groupid.rs` enforce this: one that every
+   group-taking command parses at the boundary, one that `.join` is fed a group
+   in exactly one place — the latter also asserting no `AsRef<Path>` impl
+   exists, since nothing else can. Their one stated blind spot is
+   `PathBuf::push` (indistinguishable from `Vec::push`); it appears nowhere
+   today, so don't be the first.
+   Membership ("may this caller touch this group?") is a **separate** check and
+   is not implied by holding a valid id.
 7. **No agent ever merges a PR to the default branch.** Open the PR and stop;
    the human reviews and merges. This is the rule for *every* agent —
    workers, reviewers and planners have no merge authority at all, anywhere,

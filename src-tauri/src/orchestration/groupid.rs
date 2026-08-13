@@ -3,8 +3,9 @@
 //!
 //! # Why this type exists
 //!
-//! CLAUDE.md hard constraint 6 says orchestration commands *trust* `group_id` as
-//! a path segment. That trust was never a credential: it was derived from
+//! CLAUDE.md hard constraint 6 **used to say** orchestration commands trust
+//! `group_id` as a path segment; #904 is why it no longer does. That trust was
+//! never a credential: it was derived from
 //! **process locality** — the only caller able to invoke a `#[tauri::command]`
 //! is our own in-process webview. `group_dir()` was `self.root.join(group)`, no
 //! validation, no canonicalization, and the one membership guard on that path
@@ -23,8 +24,26 @@
 //!
 //! Deliberately **not** implemented: `AsRef<Path>`. A `GroupId` must not be
 //! joinable directly — it becomes a path only inside
-//! `OrchRegistry::group_dir`, the single declared assembly point (#904 scope
-//! item 2). See `doc/design/groupid-and-path-roots.md`.
+//! [`group_dir_at`](super::group_dir_at), the single declared assembly point
+//! (#904 scope item 2), which `OrchRegistry::group_dir` is the `&self`
+//! convenience over.
+//!
+//! Two independent things hold that up, because the missing `AsRef<Path>` only
+//! stops a `GroupId` reaching a `join` — it says nothing about the *string*
+//! inside one, which would compile fine. The second is a source-scanning test,
+//! `the_orchestration_root_is_joined_with_a_group_in_exactly_one_place`, which
+//! parses every `.join(` argument in production source and flags any naming a
+//! group. Its boundary is stated where it is implemented: `PathBuf::push` is
+//! not scanned, because it cannot be told from `Vec::push` textually — it
+//! appears nowhere in this tree, so the scan is complete for the code as it
+//! stands, and would not catch the first one added.
+//!
+//! It exists because this exact sentence was false for a whole slice: `#904`'s
+//! first half left `append_audit` and `promptsubmit_marker_path` each joining
+//! the root themselves, and only a reviewer noticed — then the first version of
+//! the guard was a fixed needle list that missed the very spelling the fix had
+//! deleted, and a reviewer noticed that too. See
+//! `doc/design/groupid-and-path-roots.md`.
 //!
 //! # The alphabet, and why it is this one
 //!
@@ -201,6 +220,21 @@ impl PartialEq<str> for GroupId {
 impl PartialEq<&str> for GroupId {
     fn eq(&self, other: &&str) -> bool {
         self.0 == *other
+    }
+}
+
+/// `id == group` where one side is a reference and the other is not. std does
+/// the same for `str`/`String`; without it every such comparison grows a `*`
+/// for no reader benefit.
+impl PartialEq<&GroupId> for GroupId {
+    fn eq(&self, other: &&GroupId) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl PartialEq<&GroupId> for String {
+    fn eq(&self, other: &&GroupId) -> bool {
+        self.as_str() == other.0.as_str()
     }
 }
 
