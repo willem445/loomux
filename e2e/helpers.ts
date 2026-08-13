@@ -32,6 +32,26 @@ export async function createTerminalPane(
   await form.waitFor({ state: "detached", timeout: 15_000 });
 }
 
+/** Fills out and submits the launcher form to turn a welcome pane into a WORKFLOW pane over
+ *  `repo` (#222, restructured by #880). A content pane — it spawns no process at all, let alone
+ *  an agent CLI, so it is safe for automated E2E by construction. */
+export async function createWorkflowPane(
+  page: Page,
+  opts: { name: string; repo: string }
+): Promise<void> {
+  const form = latestWelcomeForm(page);
+
+  await form.locator('.dlg-field:has(.dlg-label:has-text("Kind")) select').selectOption("workflow");
+  await form.locator('.dlg-field:has(.dlg-label:has-text("Pane name")) input').fill(opts.name);
+  // The repo field's LABEL changes per kind (launcher.ts `applyKind`): "Repository" for a
+  // workflow pane, "Folder" for files/editor. Match on the placeholder-independent label text
+  // this kind actually renders.
+  await form.locator('.dlg-field:has(.dlg-label:has-text("Repository")) input').fill(opts.repo);
+  await form.locator(".dlg-btn.primary").click();
+
+  await form.waitFor({ state: "detached", timeout: 15_000 });
+}
+
 /** The `.pane` ancestor of a pane whose header title matches `name`. */
 export function paneByName(page: Page, name: string) {
   return page.locator(".pane", { has: page.locator(".pane-title", { hasText: name }) });

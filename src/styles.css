@@ -3721,7 +3721,7 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   color: var(--ink); font-size: 12.5px;
 }
 /* The way out of the blocked state, in the blocked state: the raw file is where the fix is. */
-.wf-blocked .wf-btn { margin-top: 10px; }
+.wf-blocked .wf-btn { display: block; margin-top: 10px; }
 
 /* The raw YAML. A plain textarea, not the CodeMirror editor: this buffer is a few dozen
    lines of a closed schema, and the findings strip below already carries the diagnostics

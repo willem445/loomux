@@ -436,6 +436,11 @@ export class WorkflowView {
     // in the document has nothing to un-hide.
     this.el.append(head, this.errorEl, this.emptyEl, this.bodyEl, this.findingsEl);
 
+    // Which primary surface is showing, stated once BEFORE the first load resolves — otherwise
+    // both the canvas and the raw YAML sit un-hidden until `render()` first reaches its body
+    // surface, and a pane that opens on the error or start surface never gets there at all.
+    this.applySurface();
+
     // Ctrl+S saves from anywhere in the pane — including from inside the textarea, where
     // the browser would otherwise do nothing at all.
     this.el.addEventListener("keydown", (e) => {
@@ -2075,7 +2080,7 @@ export class WorkflowView {
         // gesture would only manufacture the dangling reference the validator then complains
         // about — the file would be describing a mistake the canvas talked you into.
         this.connecting = { from: block.id, at: pt };
-        root.setPointerCapture(e.pointerId);
+        capturePointer(root, e);
         this.renderGraph();
         return;
       }
@@ -2086,7 +2091,7 @@ export class WorkflowView {
         grab: { x: pt.x - rect.x, y: pt.y - rect.y },
         at: { x: rect.x, y: rect.y },
       };
-      root.setPointerCapture(e.pointerId);
+      capturePointer(root, e);
       // THE #880 GESTURE. This handler always did the selecting; what it never did was bring the
       // editor into view, because the editor was behind a tab and only the gate box remembered
       // to switch to it. There is no tab now and no second thing to remember: `selectItem`
@@ -2187,6 +2192,23 @@ export class WorkflowView {
 /** How close to a node's out-port a press must land to mean "draw an edge" rather than "move
  *  the node". Generous — the port is a 5px dot, and the two gestures start in the same place. */
 const PORT_HIT = 12;
+
+/** Take pointer capture, BEST EFFORT — never letting it abort the gesture it belongs to.
+ *
+ *  `setPointerCapture` throws (`NotFoundError`) for a pointer id the browser doesn't consider
+ *  active, and it is called from the handler that also SELECTS the block. An exception here
+ *  would therefore skip the selection and re-create, exactly, the dead click #880 exists to fix
+ *  — a click that changes nothing the human can see. That trade is never worth taking, because
+ *  the capture is close to decorative anyway: the very next thing every caller does is
+ *  `renderGraph()`, which replaces the SVG root the capture was taken on, so the capture is
+ *  released a line later regardless and the drag continues on the new root's own listeners. */
+function capturePointer(root: SVGElement, e: PointerEvent): void {
+  try {
+    root.setPointerCapture(e.pointerId);
+  } catch {
+    // See above: the gesture is worth more than the capture.
+  }
+}
 
 // ---------- SVG helpers ----------
 

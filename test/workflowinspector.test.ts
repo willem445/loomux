@@ -40,7 +40,7 @@ function fixture(): Workflow {
       "    to: rev-lead",
       "gates:",
       "  merge:",
-      "    require: all",
+      "    require: all-pass",
       "    reviewers: [rev-lead]",
       "",
     ].join("\n")

@@ -47,7 +47,7 @@ export interface WorkflowLayout {
  *  Not defensive theatre — a plain object literal here is a live bug (rev-15 F3). A block id
  *  is arbitrary text from the file: `id: constructor` is a perfectly legal, zero-findings
  *  workflow (`isValidBlockId("constructor")` is true, and it can arrive from a hand edit, the
- *  YAML tab, or an agent — nothing forces it through the +Block dialog). On a plain object,
+ *  raw YAML, or an agent — nothing forces it through the +Block dialog). On a plain object,
  *  `positions["constructor"]` returns the INHERITED `Object` function: truthy, so the caller
  *  takes the "it has a stored position" branch, and reads `{ x: undefined, y: undefined }` off
  *  it. That NaN then propagates into the SVG's width and height and the canvas does not render
@@ -191,7 +191,7 @@ export function hitTestEdges(
  *
  *  The two halves matter equally. Without the stored half a canvas is a toy — you arrange it
  *  and it springs back on reopen. Without the computed half, every block ever added by an
- *  agent, by a hand edit, or by the YAML tab lands at (0,0) on top of whatever is already
+ *  agent, by a hand edit, or by the raw YAML lands at (0,0) on top of whatever is already
  *  there, and a file you didn't author in the canvas opens as a pile. So: the file always has
  *  a sensible picture, and any node you have moved stays where you put it. */
 export function resolvePositions(
