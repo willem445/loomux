@@ -142,8 +142,18 @@ test("the workflow line appears only when the repo actually declares a workflow"
   assert.match(promoteConfirmLines("/repo/poc", validWorkflow("")).join("\n"), /workflow\.yml/);
 });
 
-test("the confirm says a reattached dormant group keeps its own roster — the checkbox does not override that consent", () => {
-  assert.match(promoteConfirmLines("/repo/poc", validWorkflow("wf")).join("\n"), /dormant group keeps the roster/i);
+test("the confirm says a reattached dormant group keeps its own roster — on BOTH workflow arms (rev-2 N9)", () => {
+  // The clause answers "which roster will this promotion actually run", and the
+  // answer turns on the group case whether or not the file validates. A human
+  // who happens to get the invalid line must not be left with a different
+  // understanding of the same promotion.
+  for (const workflow of [validWorkflow("wf"), { name: "wf", valid: false }]) {
+    assert.match(
+      promoteConfirmLines("/repo/poc", workflow).join("\n"),
+      /dormant group keeps the roster/i,
+      `valid=${workflow.valid}`
+    );
+  }
 });
 
 // rev-1 N2: a workflow file that does not validate.

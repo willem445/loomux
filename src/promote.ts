@@ -79,16 +79,27 @@ export function promoteConfirmLines(repo: string, workflow: PromoteWorkflow | nu
   ];
   if (workflow === null) return lines;
   const named = workflow.name || ".loomux/workflow.yml";
+  // The reattach clause is on BOTH arms, and that is not symmetry for its own
+  // sake: which roster a promote ends up running turns on the group case as much
+  // as on this file, and that stays true when the file is broken — a dormant
+  // group reattaches with the roster its own launch approved, so "this file is
+  // broken" does not imply "you get the built-in four". Dropping it from one arm
+  // would leave the human reading whichever line they happened to get with a
+  // different understanding of the same promotion (rev-2 N9).
+  const reattachNote =
+    " A reattached dormant group keeps the roster it was launched with either way.";
   lines.push(
     workflow.valid
       ? `This repo declares a workflow (${named}). ` +
-          "Tick the box below to run its roster; a reattached dormant group keeps the roster it was launched with either way."
-      : // Present but broken: the group still launches, on the built-in four roles —
+          "Tick the box below to run its roster." +
+          reattachNote
+      : // Present but broken: a NEW group launches on the built-in four roles —
         // the launcher says so inline for the same file, and this is the same
         // consent moment, so it says so here rather than offering a box that
         // would promise a roster nothing is going to run.
         `This repo declares a workflow (${named}), but it doesn't validate — ` +
-          "the group runs the built-in four roles instead. Fix it in a workflow pane and relaunch if you wanted its roster."
+          "a new group runs the built-in four roles instead. Fix it in a workflow pane and relaunch if you wanted its roster." +
+          reattachNote
   );
   return lines;
 }

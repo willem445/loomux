@@ -117,17 +117,16 @@ export interface PaneConnectState {
   senderId: string | null;
   senderName: string | null;
   // ── #407: what the PROMOTE gesture needs, and nothing else ──────────────
-  // These four are read off the pane exactly as `Pane.isAgentPane` /
-  // `Pane.agentCli` / `Pane.sessionId` / `Pane.workdir` report them. They carry
-  // the VALUES rather than the `hasSessionId`/`hasWorkdir` booleans the plan
-  // sketched, for the same reason `PaneIdentity` carries a whole identity: the
-  // fired action has to be a complete instruction, and a bool cannot fill one.
-  /** Whether this pane was launched with an agent CLI at all (vs a plain shell
-   *  or a content pane). Promotion is an agent-pane gesture; everything else
-   *  gets no item, not a disabled one. */
-  isAgentPane: boolean;
+  // These three are read off the pane exactly as `Pane.agentCli` /
+  // `Pane.sessionId` / `Pane.workdir` report them. They carry the VALUES rather
+  // than the `hasSessionId`/`hasWorkdir` booleans the plan sketched, for the
+  // same reason `PaneIdentity` carries a whole identity: the fired action has to
+  // be a complete instruction, and a bool cannot fill one.
   /** The normalized agent CLI this pane runs ("claude" | "copilot" | …), or
-   *  null for a plain shell or an unrecognized program. v1 promotes claude. */
+   *  null for a plain shell, a content pane, or a command that isn't an agent
+   *  CLI at all (`npm run dev`). Non-null is what makes a pane one this gesture
+   *  is about — see `promoteItem`, where it is the only such gate. v1 promotes
+   *  claude. */
   agentCli: string | null;
   /** The pane's recorded full session id, or null when loomux hasn't minted or
    *  learned one yet (#440) — a pane nobody has prompted has no conversation to
@@ -175,13 +174,16 @@ const PROMOTE_NO_WORKDIR_REASON =
  *    isn't eligible right now (wrong CLI, no session yet, no cwd). Here the human
  *    is looking for the item, so silence would read as a missing feature. */
 function promoteItem(p: PaneConnectState): PaneMenuItem | null {
-  // `isAgentPane` is `Pane.launchedCommand` — ANY command pane, not just an agent
-  // CLI (`npm run dev`, `htop`). A recognized CLI is what makes this a pane the
-  // gesture is about at all, so an unrecognized one gets no item rather than a
-  // permanently-dead row telling a build watcher that promotion is Claude-only.
-  // (`agentCli` is null for exactly that case; a copilot pane answers "copilot"
-  // and still gets the greyed row below, which is the case worth explaining.)
-  if (!p.isAgentPane || p.agentCli === null) return null;
+  // A recognized agent CLI is the whole gate, and it is deliberately the ONLY
+  // one: "was this pane launched with a command" (`Pane.isAgentPane`) is the
+  // weaker half of the same fact — both derive from `Pane.spawnCommand`, so a
+  // pane with a recognized CLI always had a command, while a `npm run dev` or
+  // `htop` pane has a command and no CLI. Gating on the command would put a
+  // permanently-dead "promotion is Claude-only" row on a build watcher's menu;
+  // gating on both would add a condition nothing — in production or in a
+  // fixture — can make fire on its own. (A copilot pane answers `"copilot"` and
+  // still gets the greyed row below: that is the case worth explaining.)
+  if (p.agentCli === null) return null;
   // An orchestration member has a group AND a real role; a standalone pane's
   // identity is the `__solo__` carrier, whose role is "solo". Keyed off the role
   // rather than the `"__solo__"` group sentinel so this module doesn't grow a

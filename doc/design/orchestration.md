@@ -11912,22 +11912,39 @@ Three things about that turned out to be decisions rather than transcription.
 **The item is decided outside the connect menu's short-circuits.** `buildPaneMenu` answers
 "can this pane join a channel" first and returns early for a pane with no channel identity —
 and a claude pane whose adopt-on-connect failed is exactly such a pane *and* a perfectly
-promotable session. So the promote item is composed at the top level, from inputs
-(`isAgentPane`, `agentCli`, `sessionId`, `workdir`) that say nothing about channels, and
-appended to whatever the connect half produced. Absent for a pane the gesture is not about (a
-shell; a pane running a command that is not a recognized agent CLI at all, since `isAgentPane`
-is only "was launched with a command" and `npm run dev` satisfies it; or a pane already in a
-group — the backend's `promote-already-managed` covers the dormant membership the frontend
-cannot see); disabled *with the reason* for an agent pane that could plausibly be promoted but
-isn't eligible yet, because there the human is looking for the item and silence reads as a
-missing feature. The line between the two is "would a reader of this row ever act on it": a
-copilot pane's human might promote it once v1 widens, a build watcher's never would.
+promotable session. So the promote item is composed at the top level, from inputs (`agentCli`,
+`sessionId`, `workdir`) that say nothing about channels, and appended to whatever the connect
+half produced. Absent for a pane the gesture is not about (a shell or content pane; a pane
+running a command that is not a recognized agent CLI at all, like `npm run dev`; or a pane
+already in a group — the backend's `promote-already-managed` covers the dormant membership the
+frontend cannot see); disabled *with the reason* for an agent pane that could plausibly be
+promoted but isn't eligible yet, because there the human is looking for the item and silence
+reads as a missing feature. The line between the two is "would a reader of this row ever act on
+it": a copilot pane's human might promote it once v1 widens, a build watcher's never would.
+
+Those first three cases are **one** condition, `agentCli === null`, and that is worth stating
+because the obvious spelling is two. `Pane.isAgentPane` ("was launched with a command") looks
+like the natural gate for an agent-pane gesture, but it is the weaker half of the same fact:
+both it and `agentCli` derive from `Pane.spawnCommand`, so a recognized CLI always implies a
+command, while `npm run dev` is a command with no CLI. Gating on it would put a permanently-dead
+"Claude-only" row on a build watcher's menu; gating on **both** would leave a condition that
+nothing — in production or in a fixture — can make fire on its own, which is a branch no test
+can witness and no reader can maintain. So the struct carries the CLI and not the weaker
+boolean.
 
 The roster checkbox follows the same rule one level down. It is offered only for a workflow file
 that is **present and valid**, because an invalid one launches the built-in roster regardless
 (`Launch::Promote`) — a ticked box would promise a roster nothing is going to run. The file is
 still named, with what will actually run instead: this is the consent moment `Launch::Promote`'s
 own argument turns on, and the launcher warns inline about the same file.
+
+Both arms of that sentence carry the reattach clause — *a reattached dormant group keeps the
+roster it was launched with either way* — because the question the human is actually asking is
+"which roster will this promotion run", and `Launch::Promote` answers it from the **group case**
+before it ever reads the file. A broken file therefore does not imply the built-in four: it
+implies them for a *new* group dir, while a dormant reattach still restores the roster its own
+launch approved. Saying that on only the valid arm would leave two humans with two different
+understandings of one promotion, decided by which line their repo happened to earn.
 
 **A promoted pane is never discarded.** `openAgentPane`'s failure arms all close the pane —
 correct for one it just opened against a config that has since been torn down (#106), and

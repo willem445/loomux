@@ -23,7 +23,6 @@ const free = (overrides: Partial<PaneConnectState> = {}): PaneConnectState => ({
   senderName: null,
   // #407: an orchestration worker pane — an agent pane, but never promotable
   // (it already belongs to a group). The promote fixtures below override these.
-  isAgentPane: true,
   agentCli: "claude",
   sessionId: "11111111-2222-3333-4444-555555555555",
   workdir: "/repo/poc",
@@ -49,12 +48,12 @@ test("a free, MCP-capable pane with no pending arm offers only Connect (arm)", (
 });
 
 test("a non-orchestration pane (shell/content) offers a single disabled item, never a live action", () => {
-  // `isAgentPane: false` is what makes this a SHELL pane rather than an agent
-  // pane whose adopt-on-connect failed. Before #407 nothing in the state told
-  // those two apart, and this fixture meant both; now they diverge (an agent
-  // pane keeps a promote item — see the #407 block below), so the fixture has
-  // to say which one it is. The connect assertion itself is unchanged.
-  const items = buildPaneMenu(free({ group: null, agentId: null, role: null, isAgentPane: false, agentCli: null }), null);
+  // `agentCli: null` is what makes this a SHELL pane rather than an agent pane
+  // whose adopt-on-connect failed. Before #407 nothing in the state told those
+  // two apart, and this fixture meant both; now they diverge (an agent pane
+  // keeps a promote item — see the #407 block below), so the fixture has to say
+  // which one it is. The connect assertion itself is unchanged.
+  const items = buildPaneMenu(free({ group: null, agentId: null, role: null, agentCli: null }), null);
   assert.equal(items.length, 1);
   assert.equal(items[0].disabled, true);
   assert.ok(items[0].reason && items[0].reason.length > 0);
@@ -293,21 +292,19 @@ test("#407: a planner pane offers neither promote nor connect — its single dis
   assert.match(items[0].reason ?? "", /planner/i);
 });
 
-test("#407: a command pane that is not an agent CLI has no promote item either (rev-1 N1)", () => {
-  // `isAgentPane` is "was launched with a command", which a `npm run dev` or
-  // `htop` pane satisfies too. Those have no recognized CLI, and a greyed row
-  // telling a build watcher that promotion is Claude-only is exactly the
-  // permanently-dead row the absent-vs-disabled rule exists to avoid.
-  const items = buildPaneMenu(free({ group: null, agentId: null, role: null, agentCli: null }), null);
-  assert.equal(promoteOf(items), undefined);
-});
-
-test("#407: a shell / content pane has no promote item — promotion is an AGENT-pane gesture", () => {
-  const items = buildPaneMenu(
-    free({ group: null, agentId: null, role: null, isAgentPane: false, agentCli: null, sessionId: null }),
-    null
-  );
-  assert.equal(promoteOf(items), undefined);
+test("#407: no recognized agent CLI, no promote item — a shell, a content pane, and a command that isn't an agent CLI are one case (rev-1 N1, rev-2 B1)", () => {
+  // One test because they are one predicate. `agentCli === null` is the whole
+  // gate: a shell and a content pane have no command at all, and a `npm run dev`
+  // or `htop` pane has one that resolves to no CLI — for all three, a greyed
+  // "promotion is Claude-only" row would be the permanently-dead row the
+  // absent-vs-disabled rule exists to avoid. (These used to be two tests split
+  // on `isAgentPane`, which `agentCli` subsumes — see promoteItem.)
+  const shell = free({ group: null, agentId: null, role: null, agentCli: null, sessionId: null });
+  const buildWatcher = free({ group: null, agentId: null, role: null, agentCli: null, name: "npm run dev" });
+  for (const pane of [shell, buildWatcher]) {
+    assert.equal(promoteOf(buildPaneMenu(pane, null)), undefined, pane.name);
+  }
+  const items = buildPaneMenu(shell, null);
   assert.equal(items.length, 1, "a non-agent pane keeps its single not-capable item");
   assert.equal(items[0].disabled, true);
 });

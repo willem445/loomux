@@ -653,7 +653,10 @@ function paneConnectState(pane: Pane): PaneConnectState {
     senderName: badge?.senderName ?? null,
     // #407: the promote gesture's inputs, read straight off the pane. Not
     // channel state — these decide a DIFFERENT item on the same menu.
-    isAgentPane: pane.isAgentPane,
+    // `pane.isAgentPane` is deliberately NOT among them: a recognized
+    // `agentCli` already implies a launched command (both derive from
+    // `spawnCommand`), so carrying it would be a second, weaker copy of the
+    // same fact — see `promoteItem`.
     agentCli: pane.agentCli,
     sessionId: pane.sessionId,
     workdir: pane.workdir,

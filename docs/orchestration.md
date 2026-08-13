@@ -143,10 +143,11 @@ What the confirm tells you before anything happens:
   A toast names the group once it resolves.
 - **The workflow checkbox** appears only when the repo declares a
   `.loomux/workflow.yml` **that validates**, and runs that roster instead of the
-  built-in four roles. It doesn't apply to a reattached dormant group — that
-  group keeps the roster its own launch approved. If the file is there but
-  broken, you're told so and there's no checkbox: the group runs the built-in
-  roles, the same outcome the launcher warns about inline.
+  built-in four roles. If the file is there but broken, you're told so and
+  there's no checkbox: a new group runs the built-in roles, the same outcome the
+  launcher warns about inline. Either way — valid file, broken file or no file —
+  a **reattached dormant group keeps the roster its own launch approved**; which
+  roster a promotion runs depends on the group case as much as on the file.
 
 The item is offered on standalone **Claude** agent panes. It's greyed with the
 reason on an agent pane that can't be promoted *yet* — a non-Claude CLI, a pane
