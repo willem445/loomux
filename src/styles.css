@@ -3602,8 +3602,13 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .wf-btn:disabled { opacity: 0.45; cursor: default; }
 /* A pressed toggle (the YAML surface switch) — it is a MODE, not an action, so it has to look
    different while it is on. It borrows --selection, the same fill the active roster row uses:
-   "this one is on" is one idea in this pane, so it gets one colour. */
+   "this one is on" is one idea in this pane, so it gets one colour. The `:hover` rule above is
+   (0,3,0) and this is (0,2,0), so without the second selector the plain hover background wins
+   ON SPECIFICITY, whatever the source order — and the toggle would drop its pressed look under
+   the pointer, i.e. exactly while the human is deciding whether it is on. Hover feedback moves
+   to the border instead, so both states can be true at once. */
 .wf-btn.active { border-color: var(--line-strong); background: var(--selection); color: var(--ink); }
+.wf-btn.active:hover:not(:disabled) { background: var(--selection); border-color: var(--accent); }
 .wf-btn-primary { border-color: var(--line-strong); background: color-mix(in srgb, var(--accent) 20%, transparent); }
 .wf-btn-danger { border-color: color-mix(in srgb, var(--state-danger) 50%, transparent); color: var(--state-danger); align-self: flex-start; }
 
@@ -3694,8 +3699,11 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 }
 
 .wf-form, .wf-yaml, .wf-graph { flex: 1; min-height: 0; overflow: auto; }
+/* No `.wf-form-title` any more (#880): each form used to open with its own <h3> naming the
+   thing being edited, which the docked inspector's header now says one line above it — the same
+   string, twice, 8px apart. The header is the one that stays, because it is the one that is
+   always there and the one that carries the block's id. */
 .wf-fields { display: flex; flex-direction: column; gap: 14px; padding: 14px 16px; max-width: 680px; }
-.wf-form-title { margin: 0; font-size: 14px; font-weight: 650; color: var(--ink); }
 .wf-field { display: flex; flex-direction: column; gap: 4px; }
 .wf-label { font-size: 11.5px; color: var(--ink-dim); }
 .wf-hint { font-size: 11px; color: var(--ink-dim); line-height: 1.5; }

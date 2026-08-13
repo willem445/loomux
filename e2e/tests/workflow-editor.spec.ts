@@ -47,6 +47,27 @@ gates:
     reviewers: [rev-lead]
 `;
 
+/** The same workflow with the LAST block gone — and, with it, the edge and the merge gate that
+ *  referenced it (removing a block without its references would be a different test: a file
+ *  full of dangling-reference findings). Written over the fixture to simulate the thing this
+ *  pane's conflict machinery exists for: something else editing the workflow under the pane. */
+const WORKFLOW_WITHOUT_REV_LEAD = `# The roster this repo's runs may use.
+version: 1
+name: e2e demo workflow
+blocks:
+  - id: planner
+    name: Planner
+    kind: planner
+    cli: claude
+  - id: worker-deep
+    name: Deep worker
+    kind: worker
+    cli: claude
+edges:
+  - from: planner
+    to: worker-deep
+`;
+
 /** A repo-shaped temp dir holding exactly one workflow file. */
 function makeRepo(): string {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "loomux-e2e-wf-"));
@@ -129,6 +150,11 @@ test("clicking a block on the canvas shows that block's editor, docked beside it
     await expect(canvas).toBeVisible();
     // …and the roster agrees with the inspector rather than lighting a stale row.
     await expect(pane.locator(".wf-row.active .wf-row-main")).toHaveText("Deep worker");
+    // The inspector names the selection ONCE. Each form used to open with its own <h3> saying
+    // the same words the docked header says one line above it (review finding 1 — visible in
+    // this spec's own first screenshot before the fix: "Deep worker" at 13px, then "Deep
+    // worker" again at 14px, 8px below). The header won; the four <h3>s went.
+    await expect(inspector.getByText("Deep worker", { exact: true })).toHaveCount(1);
 
     await testInfo.attach("workflow-pane-canvas-and-inspector.png", {
       body: await pane.screenshot(),
@@ -157,6 +183,50 @@ test("clicking a block on the canvas shows that block's editor, docked beside it
 
     // Nothing was saved: the pane edits a buffer, and this test only ever selected things.
     expect(fs.readFileSync(path.join(repo, ".loomux", "workflow.yml"), "utf8")).toBe(WORKFLOW);
+  } finally {
+    fs.rmSync(repo, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+  }
+});
+
+test("a selection whose block disappears leaves the roster and the inspector agreeing", async ({
+  appPage: page,
+}) => {
+  // Review finding 2, as the exact scenario it named. The inspector is the render that
+  // NORMALIZES the selection (`inspectorTarget` falls back when the selected block is gone);
+  // the roster only highlights whatever `this.selection` says. Render the roster first and a
+  // stale selection lights NOTHING, while the inspector quietly shows the workflow's own
+  // settings — two surfaces disagreeing about what is selected, until something else happens to
+  // re-render the roster.
+  //
+  // The trigger is real rather than contrived: an agent rewriting the workflow it is running
+  // under is the scenario this pane's conflict machinery exists for, and Reload is how you take
+  // its version.
+  const repo = makeRepo();
+  try {
+    await createWorkflowPane(page, { name: "Reload", repo });
+    const pane = paneByName(page, "Reload");
+    const inspector = pane.locator(".wf-inspector");
+
+    await expect(pane.locator(".wf-body")).toBeVisible({ timeout: 15_000 });
+    // Select the LAST block — the index that goes out of range when it is removed.
+    await pane
+      .locator(".wf-row")
+      .filter({ has: page.locator(".wf-row-main", { hasText: /^Review lead$/ }) })
+      .click();
+    await expect(inspector.locator(".wf-insp-title")).toHaveText("Review lead");
+
+    // Something else rewrites the file without that block, and the human takes its version.
+    // Spelled out rather than derived from WORKFLOW by regex: this file's own line endings
+    // depend on how git checked it out, and a `\n`-anchored substitution that silently matched
+    // nothing under CRLF would leave the file untouched and fail this test for the wrong reason.
+    fs.writeFileSync(path.join(repo, ".loomux", "workflow.yml"), WORKFLOW_WITHOUT_REV_LEAD, "utf8");
+    await pane.locator('.wf-btn:text-is("Reload")').click();
+
+    // Exactly one row is lit, and it is the one the inspector is showing. Before the fix this
+    // was ZERO lit rows beside an inspector reading "Workflow settings".
+    await expect(inspector.locator(".wf-insp-title")).toHaveText("Workflow settings");
+    await expect(pane.locator(".wf-row.active")).toHaveCount(1);
+    await expect(pane.locator(".wf-row.active .wf-row-main")).toHaveText("e2e demo workflow");
   } finally {
     fs.rmSync(repo, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
   }

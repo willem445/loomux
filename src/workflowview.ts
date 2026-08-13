@@ -398,10 +398,8 @@ export class WorkflowView {
       // eats a keystroke.
       this.text = this.yamlArea.value;
       this.reanalyze();
-      this.renderRoster();
-      this.renderInspector();
+      this.renderSelection();
       this.renderFindings();
-      this.renderGraph();
       this.updateDirty();
     });
     this.yamlPane.append(this.yamlArea);
@@ -999,10 +997,8 @@ export class WorkflowView {
       this.statusEl.className = "wf-status";
       return;
     }
-    this.renderRoster();
-    this.renderInspector();
+    this.renderSelection();
     this.renderFindings();
-    this.renderGraph();
     this.applySurface();
   }
 
@@ -1099,8 +1095,27 @@ export class WorkflowView {
    *  surfaces that show a selection are refreshed together or not at all. */
   private selectItem(sel: Selection): void {
     this.selection = sel;
-    this.renderRoster();
+    this.renderSelection();
+  }
+
+  /** Re-render the three surfaces that DISPLAY the selection, in the one order that keeps them
+   *  agreeing with each other.
+   *
+   *  THE INSPECTOR GOES FIRST, and that is the whole reason this is a method rather than three
+   *  calls at four call sites. `renderInspector` is the render that NORMALIZES the selection —
+   *  it asks `inspectorTarget` what is actually still there and adopts the answer — while the
+   *  roster and the canvas merely *highlight* whatever `this.selection` currently says. Render
+   *  them first and a stale selection lights nothing at all: select the last block, let an agent
+   *  rewrite `workflow.yml` without it, press Reload, and the roster draws with an index no row
+   *  answers to while the inspector then quietly falls back to the workflow's own settings. The
+   *  two disagree until something else re-renders the roster.
+   *
+   *  It was written correctly in `mutate` and open-coded the wrong way round in the other three
+   *  places, which is the argument for stating it once: an ordering rule that lives in a comment
+   *  next to one of its four call sites is a rule the next three call sites will get wrong. */
+  private renderSelection(): void {
     this.renderInspector();
+    this.renderRoster();
     this.renderGraph();
   }
 
@@ -1244,7 +1259,6 @@ export class WorkflowView {
 
   private workflowForm(w: Workflow): HTMLElement {
     const box = el("div", "wf-fields");
-    box.append(el("h3", "wf-form-title", "Workflow"));
     box.append(
       this.field(
         "Name",
@@ -1274,7 +1288,6 @@ export class WorkflowView {
 
   private blockForm(w: Workflow, b: WorkflowBlock, index: number): HTMLElement {
     const box = el("div", "wf-fields");
-    box.append(el("h3", "wf-form-title", b.name || b.id || `Block ${index + 1}`));
 
     /** Edit THIS row, by index. Never by id: the rows that most need editing are the ones
      *  whose id is missing or duplicated, and an id lookup would edit the wrong one. */
@@ -1520,7 +1533,6 @@ export class WorkflowView {
    *  a human clicks on an advisory edge, and it is where they should learn that it is advisory. */
   private edgeForm(from: string, to: string): HTMLElement {
     const box = el("div", "wf-fields");
-    box.append(el("h3", "wf-form-title", `${from} → ${to}`));
     box.append(
       el(
         "p",
@@ -1541,7 +1553,6 @@ export class WorkflowView {
 
   private gateForm(w: Workflow): HTMLElement {
     const box = el("div", "wf-fields");
-    box.append(el("h3", "wf-form-title", "Merge gate"));
     box.append(
       el(
         "p",
@@ -1674,14 +1685,17 @@ export class WorkflowView {
     const next: Workflow = structuredClone(this.analysis.workflow);
     edit(next);
     this.commit(next);
-    // The inspector goes FIRST, because it is the one that normalizes the selection: an edit
-    // that erased the selected edge or block leaves `this.selection` pointing at something that
-    // is no longer there, and `renderInspector` adopts the fallback. Rendering the roster (which
-    // highlights the selection) before that would light the wrong row until the next render.
-    if (rerenderForm) this.renderInspector();
-    this.renderRoster();
+    if (rerenderForm) {
+      this.renderSelection();
+    } else {
+      // The one path that may skip the inspector, and it is safe to: `rerenderForm` is false
+      // only for the free-text controls (a name, a model, a prompt body), and typing in one can
+      // never remove the block or edge that is selected. There is no stale selection for
+      // `renderSelection`'s ordering rule to protect against here — only a caret to protect.
+      this.renderRoster();
+      this.renderGraph();
+    }
     this.renderFindings();
-    this.renderGraph();
     this.updateDirty();
   }
 
