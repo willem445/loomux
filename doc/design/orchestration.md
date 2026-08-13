@@ -7073,6 +7073,155 @@ rest of the floor, the latter because `deframe` is now shared across both gates.
   (constraint 3). The fix does not depend on which composer a pane gets: it is about *any* per-row
   decoration, not about `┃`.
 
+## #903: question-SHAPED text is not a question, and a hold owes a bound it can reach
+
+**Problem.** Deliveries were parked behind *"an interactive question is on screen"* on panes where
+nobody was being asked anything. Three resumed reviewer panes — all resumes of one session, and it
+reproduced on demand — then the **orchestrator's own** pane: 30+ minutes, four deliveries, ending
+with panes killed by hand. The human's report is the whole of the diagnosis: *"the question
+detection is very flaky, there were no interactive questions asked that I could tell."*
+
+**Cause: the detector matches text, and the grid confirms the same text.** Every signal
+`prompt_wait_match` keys on is a substring, and the *structured* tiers — justified by that
+function's own header as "these don't occur in ordinary prose" — read the last **twelve** painted
+lines. That is exactly where a finished turn's report sits. Half those tokens are ordinary English:
+
+| token | tier before #903 | what writes it |
+| --- | --- | --- |
+| `yes/no` | wide (12 lines) | "a yes/no confirmation", in any prose about a prompt |
+| `waiting for your` | wide | "waiting for your review", the *normal* orchestration-pane sentence |
+| `press enter to continue` | wide | quoted from docs; `fp-prose-arrow-keys.txt` has pinned that shape as a false positive since #40 |
+| `(y/n)`, `do you want to proceed` | wide | a reviewer quoting the detector it is reviewing |
+
+#534's composed-screen reading cannot save any of it, because that reading answers a *different*
+question. Its only release is `NotRendered` — "the dialog went away" — and the prose has not gone
+anywhere. So `StillRendered` was true, and useless.
+
+**Why it latched, and why one session did it every time.** #727 and #820's mechanism verbatim: a
+resumed pane's restored screen is static, so nothing ever repaints the prose away, and the queue
+drainer's poll — which is uncapped, unlike `deliver_now`'s own holds — re-reads the identical screen
+every two seconds forever. The deterministic session was a **rev-lead reviewing this detector**: its
+verdict text contains `(y/n)` because that is what the review was about.
+
+### The fix, in three layers, weakest evidence last
+
+**1. A quieter detector.** The three sentence-shaped phrases above move to a
+`prose-permission-phrase` tier read only from the **last painted lines** — the same two-tier rule
+the pointer and the menu footer have used since #40, finally applied to the tokens it never
+covered. A live prompt paints its phrase last (that is what "waiting" means); prose writes it
+mid-paragraph, above the CLI's redrawn box. Punctuated UI structure (`(y/n)`, `[y/n]`,
+`do you want to proceed`, `❯ 1.`, `1. yes`) stays wide, because it *is* structure.
+
+This is a narrowing of the **signal**, not of the guard, and it is deliberately small. Which token
+actually fired on the live panes is not in any record we have (#820's `matched` field exists for
+exactly this and post-dates the incidents), so the tiering only moves phrases whose prose-shape can
+be argued from the string itself. Guessing more would be tuning against an unmeasured population.
+
+**2. An idle composer beats "still rendered".** New `GridEvidence::IdlePrompt`, checked **before**
+`StillRendered`: a composed screen showing an empty input prompt in its bottom
+`IDLE_PROMPT_TAIL_ROWS` rows, **and** no pointer-at-content anywhere on it, releases the hold — with
+the matched text plainly on screen.
+
+That inverts #534's asymmetry for one case, on purpose. The asymmetry (weight everything toward
+holding; a false release is the expensive error) is right when the question is *"did the dialog go
+away"*, where absence of evidence is all you have. It is wrong when the question is *"was this ever
+a dialog"*, because there the screen offers **positive** evidence that it was not: a CLI showing an
+empty free-text composer is not blocked on an answer. Read as evidence rather than as absence, this
+is the same move #727 made — an empty prompt is the CLI's own statement that it is idle — one layer
+up from the pointer signal to the screen as a whole.
+
+The reading is deliberately hard to satisfy. An unreadable composition answers `false`, so the
+ring's word stands. A recognised empty prompt sitting under a live menu answers `false`, because the
+pointer clause is a conjunct. And the release still rides
+`QUESTION_RELEASE_CONSECUTIVE_CLEAR_POLLS` — two consecutive clear polls — like every other release
+in this guard.
+
+**The assumption it rests on, stated so a future TUI change is a known break and not a mystery: a
+CLI does not paint a modal question and an empty free-text composer at the same time.** Every
+dialog in the fixture suite replaces the box while it is up. If one ever paints a question *above* a
+live composer, the pointer clause is what still catches the menu-shaped ones, and `h3` is the test
+that would have to be widened — it asserts today that no positive dialog capture reads as idle.
+
+**3. A bounded last-resort override.** Layers 1 and 2 fix the false positives we can *characterize*.
+The human's report is that the detector is flaky in general, so the third layer assumes the next one
+will be shaped differently: after `QUESTION_HOLD_OVERRIDE_AFTER` (15 min) held on the **question**
+gate, with two consecutive fresh reads showing an idle prompt row, the drainer delivers anyway —
+with the existing queued-flush header, and an audited `delivery-question-override` carrying the
+witness so the next narrowing has the evidence this one lacked.
+
+Every term is re-proved on the poll that acts on it. `question_override_admits` is pure and takes a
+*streak of fresh reads*, not a latched flag: a pane that reads idle for ten minutes and then paints
+a dialog is ineligible on the very next poll, with no memory of having been eligible.
+
+*Where the bound sits, and why.* Longer than `QUESTION_HOLD_STALE_AFTER` (10 min), so the human is
+badged and has five minutes to look before loomux acts on their behalf; shorter than
+`QUEUE_STILL_QUEUED_NOTICE_AFTER` (30 min), so the queue moves before the generic "still queued"
+notice is the first anyone hears of it. `h6` pins the ordering rather than the number.
+
+#### Why an override is safe: delivery-id dedup makes a rare wrong one cheap
+
+The override can be wrong. The argument is not that it cannot be — it is that the two error
+directions are not remotely equal in cost.
+
+**A wrong override** delivers a brief into a pane with a live dialog on it. The paste lands in the
+dialog's lap; the human answers the dialog; and if the dialog ate the paste, the entry is still the
+drainer's to retry, under **the same delivery id**. Every kickoff carries one, and every receiving
+agent is instructed to treat a delivery id it has already acted on as a duplicate and stop. So the
+worst case is one messy pane and, at most, one redundant copy an agent is already required to
+discard — and it takes fifteen minutes of a *fresh, repeated* idle reading to get there at all.
+
+**A hold with no reachable bound** is what #903 is: a queue that never moves, work that silently
+does not happen, and a human who eventually kills the pane. That is not a bounded cost; it is the
+loss of the delivery *and* the pane *and* the human's trust in every future hold badge.
+
+This is the same trade `QUESTION_HOLD_STALE_AFTER` (#532) already made one notch weaker — it
+concluded that a byte ring could not justify *releasing a write*, only badging. #903's difference is
+that the evidence is no longer a byte ring: it is the pane's own composed screen, read fresh, twice,
+fifteen minutes into a hold the human has already been badged about. `write_admission` still checks
+the box first and `question_override_admits` refuses anything but `HoldQuestion`, so **#510's
+absolute is untouched — a human's own typed line is never overridden, at any age.**
+
+### Limits, stated
+
+- **An unreadable composition still holds forever.** No trustworthy grid means no idleness to
+  observe: the veto cannot fire and the override has nothing to count a streak of. Releasing on no
+  evidence at all is precisely what this guard must never do, so this is left as a hold; `h7` pins
+  it so it is a known limit rather than a surprise. The badge (#532) is still the channel for it.
+- **A CLI whose empty box is a *placeholder* (`❯ Try "fix the build"`)** does not read as idle —
+  #727's residual, unchanged, and the same answer applies: a narrower signal, not a wider mask.
+- **The override cannot fire while the drainer is inside `deliver_now`.** The bound is sampled by
+  the same thread that blocks, so a pane that keeps entering `deliver_now` samples it late — the
+  arithmetic `QUESTION_HOLD_STALE_AFTER`'s doc already spells out for the badge. For the shape #903
+  reports it is moot: a permanently-false-positive gate never admits, so the drainer never enters
+  `deliver_now` at all and polls steadily at `QUEUE_DRAIN_POLL`.
+- **The release check rides the drainer, not the attention tick**, which is a deliberate departure
+  from the issue's groomed shape. The janitor pattern (#825 M2) exists because a raised chip
+  outlives `run_late_confirmation_monitor`'s four-hour lifetime and needs a reader afterwards; the
+  question hold has no such gap. Its reader is `run_queue_drainer`, which by construction lives
+  exactly as long as the queue is non-empty and re-reads the pane every two seconds with no cap. A
+  second pane reader on the attention tick would duplicate that read, on the same panes, for no
+  coverage — against performance.md §3 INV-4's rule that cadenced work owes a bound and a reason.
+
+### Tests
+
+`h1`–`h7` in `tests/orchestration.rs`, over two new fixtures. `h1` is the repro, and it asserts its
+own preconditions rather than assuming them: the ring still matches, by a wide-tier signal #903 did
+*not* demote, and the match is genuinely still rendered — so the release can only be the new
+reading. `h2` isolates the token re-tiering in both directions. `h3` is the fail-safe floor (every
+dialog fixture still holds, and none of them reads as idle) and `h4` is the conjunct that keeps an
+empty box beside a live menu from releasing it. `h5` is the override's truth table, `h6` its
+ordering against the two clocks it sits between, `h7` the unreadable-screen limit.
+
+The fixtures' chrome is byte-verbatim from #727's live capture — including the
+`⏵⏵ auto mode on (shift+tab to cycle) · ← for agents` footer #903's own comments quote as present on
+both screens. The replayed turn text is **reconstructed**: the issue records the footer, the empty
+box and "no question anywhere on screen", not the body of the turn the resume replayed.
+
+`c3` changed, and the reason is worth recording: its screen was
+`"some output\nOverwrite the file? (y/n)\n> "` — an inline yes/no prompt above an empty composer,
+which is not a shape any TUI paints (an inline prompt takes the cursor; it does not hand the box
+back). It now pins the live shape, and `c3b` pins what the old, self-contradictory screen answers.
+
 ## Delivery queue (#445)
 
 **Problem.** `deliver_prompt` has three hold-cap seams — pre-paste box-occupied (#111,
