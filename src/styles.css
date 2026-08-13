@@ -565,8 +565,19 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
    · 12s") what survives the cut is the fact the badge exists for; the age is the
    first thing lost, and the *stalled* cue is not lost at all, since that one is
    carried by color and the pulse below rather than by the trailing word. */
+/* `flex-shrink: 100`, not 1, and that number is the whole point (E2E round 4).
+   `.pane-title` is ALSO `flex: 0 1 auto; min-width: 0` — it is the other
+   shrinkable item in this header, and it is the pane's drag handle
+   (`Grid.onPointerDown` refuses to start a reorder from a button, so the title
+   is what a human grabs). At equal shrink factors flexbox splits the deficit
+   between the two in proportion to their base widths, so this chip was taking
+   its room out of the drag handle: measured at two columns, the title came out
+   at 9px, below the 10px `pane-reorder.spec.ts` calls unusable. A shrink factor
+   two orders of magnitude larger makes the solver take essentially everything
+   from this chip until its content is gone, and only then from the title —
+   which is what "the one chip allowed to shrink" was supposed to mean. */
 .pane-queue {
-  flex: 0 1 auto; min-width: 0;
+  flex: 0 100 auto; min-width: 0;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   font-size: 9px; font-weight: 600; letter-spacing: 0.3px;
   border: 1px solid #33405a; border-radius: 4px; padding: 1.5px 6px;

@@ -201,6 +201,7 @@ test("the queue badge yields its text rather than crowding a narrow header", asy
   await expect(pane.locator(".pane-held")).toBeVisible();
   const overflowHeld = await overflow();
   const overhangHeld = await closeOverhang();
+  const titleHeld = (await pane.locator(".pane-title").boundingBox())?.width ?? 0;
 
   await pushDepths(page, readings({ depth: 8, cap: 8, waiting_ms: 600_000, stalled: true }));
   await expect(pane.locator(".pane-queue")).toHaveCount(1);
@@ -227,15 +228,27 @@ test("the queue badge yields its text rather than crowding a narrow header", asy
     `at two columns the badge pushed the close button ${twoColOverhang}px further out ` +
       `(overhang was ${overhangHeld}px without it)`
   ).toBeLessThanOrEqual(MAX_BADGE_COST_PX);
-  // The absolute "still a usable drag source" guard belongs at THIS width, with
-  // the badge lit: two columns is a header with room, so a title collapsed here
-  // would be the badge's doing. (At three columns it is already collapsed by
-  // crowding this PR did not add — see the delta check below.)
-  const titleTwoCol = await pane.locator(".pane-title").boundingBox();
+  // The drag-handle guard, and the reason it is stated as a floor RELATIVE to
+  // the baseline rather than as a bare `> 10`. `.pane-title` is the other
+  // shrinkable item in this header and it is what a human grabs to reorder a
+  // pane (`Grid.onPointerDown` refuses to start a drag from a button), so a
+  // badge that takes its width instead of its own is a real defect — round 4
+  // caught exactly that, at 9.34px. But a title that was ALREADY below the
+  // usable width before the badge existed is #894's crowding, not this PR's, and
+  // an absolute floor would charge it here. So: the title must still be usable,
+  // or no worse than it already was. No conditional, no escape hatch.
+  const titleTwoCol = (await pane.locator(".pane-title").boundingBox())?.width ?? 0;
   expect(
-    titleTwoCol?.width,
-    "with the badge lit at two columns the title stopped being a usable drag source"
-  ).toBeGreaterThan(10);
+    titleTwoCol + 1,
+    `with the badge lit at two columns the title is ${titleTwoCol}px, ` +
+      `against ${titleHeld}px without it — the badge took the drag handle's room instead of its own`
+  ).toBeGreaterThanOrEqual(Math.min(10, titleHeld));
+  const titleTwoColCost = titleHeld - titleTwoCol;
+  expect(
+    titleTwoColCost,
+    `at two columns the badge took ${titleTwoColCost}px from the title ` +
+      `(${titleHeld}px without it, ${titleTwoCol}px with it)`
+  ).toBeLessThanOrEqual(MAX_BADGE_COST_PX);
 
   // 3. Three columns: the tight case. The badge's cost must stay bounded by the
   //    box it cannot shrink — i.e. its text yielded completely — and it must not
