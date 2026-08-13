@@ -901,6 +901,11 @@ struct RawBlock {
     profile: Option<String>,
     #[serde(default)]
     allow: Vec<String>,
+    /// [scratch] #880 red-before-green ONLY — a brand-new `Raw*` field with no
+    /// entry in `src/workflow-schema.json`, which is the exact drift the parity
+    /// test exists to refuse. Never merged.
+    #[serde(default)]
+    scratch_field: String,
     #[serde(default)]
     role_hint: Option<String>,
     #[serde(default)]
@@ -988,6 +993,7 @@ pub fn workflow_schema_keys() -> BTreeMap<String, Vec<String>> {
         prompt: Some("p".into()),
         profile: Some(".github/agents/b.md".into()),
         allow: vec!["Bash(gh pr view)".into()],
+        scratch_field: String::new(),
         role_hint: Some("process".into()),
         effort: "high".into(),
         context: "1m".into(),
