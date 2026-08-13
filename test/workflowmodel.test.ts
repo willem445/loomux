@@ -290,9 +290,16 @@ blocks:
   const w = parseWorkflow(text).workflow;
   assert.deepEqual(w.blocks[0]!.extra, {
     tools: ["fmt{x}", "Read"],
-    allow: ["Bash(gh pr view --json title,body)", "Bash(git status)"],
     limits: { cpu: 2, note: "a,b" },
   });
+  // `allow:` is a KNOWN field since #880 (it was a `RawBlock` field all along — the pane
+  // just never had a name for it), so it leaves `extra` and lands on the block. The quoted
+  // comma is why it was worth putting in this test at all, and that half is unchanged: the
+  // pattern has to survive as ONE entry, not two.
+  assert.deepEqual(w.blocks[0]!.allow, [
+    "Bash(gh pr view --json title,body)",
+    "Bash(git status)",
+  ]);
   const out = serializeWorkflow(w);
   const reread = parseWorkflow(out);
   assert.deepEqual(reread.findings, [], "the serialized form must re-read cleanly");
@@ -433,7 +440,10 @@ test("the scaffold is a valid workflow, and canonicalizes to the same one", () =
     { from: "worker", to: "reviewer" },
   ]);
   assert.deepEqual(workflow.gates.merge, { require: "all-pass", reviewers: ["reviewer"], also: [] });
-  assert.equal(workflow.extra?.authored_with, "0.9.0");
+  // A TYPED field since #880, not an unknown key riding `extra` — the pane knows this key
+  // now, which is also why the scaffold stays finding-free with unknown keys reported.
+  assert.equal(workflow.authored_with, "0.9.0");
+  assert.equal(workflow.extra, undefined);
   // It is the same workflow the model's starter describes — the commented file and the
   // programmatic one must not drift into being two different pipelines.
   const starter = starterWorkflow("0.9.0");
@@ -1272,7 +1282,8 @@ blocks:
     kind: worker
     cli: claude
 `).workflow;
-  assert.deepEqual(older.extra, { authored_with: "0.6.1" });
+  assert.equal(older.authored_with, "0.6.1");
+  assert.equal(older.extra, undefined, "a key loomux itself writes is never an unknown one");
   older.blocks[0]!.model = "opus"; // the ordinary form edit
   assert.match(serializeWorkflow(older), /^authored_with: 0\.6\.1$/m, "preserved, not restamped");
 });
@@ -1549,4 +1560,273 @@ test("an opencode block declaring effort: is a finding quoting opencode's own re
   const clean = starterWorkflow();
   clean.blocks[1]!.cli = "opencode";
   assert.deepEqual(codes(validateWorkflow(clean, lookupWithOpencode)), []);
+});
+
+// ---------- the full config surface: intake / merge_queue / resources / allow (#880) ----------
+//
+// `intake:` (#382), `merge_queue:` (#581), `resources:` (#858) and block `allow:` (#222)
+// are all real fields of the engine's wire schema that this model had no name for — they
+// landed in the unknown-key bag, so the pane rendered a file that declared them exactly
+// like a file that didn't, and a form edit re-emitted them as one flattened flow mapping.
+// These pin the whole surface: read into the model, emitted back, and — the part that
+// matters most for a hand-written file — left alone when the edit was somewhere else.
+
+const FULL_SURFACE = `# the whole schema, commented
+version: 1
+name: everything
+authored_with: 0.9.9
+
+# WHERE WORK COMES FROM (#382)
+intake:
+  source: github-labels
+  labels:
+    ready: go-build
+    investigate: go-look
+
+# THE QUEUE (#581)
+merge_queue:
+  enabled: true
+  max_batch: 5
+  checks_timeout_minutes: 90
+
+blocks:
+  - id: worker
+    name: Worker
+    kind: worker
+    cli: claude
+    allow: ["Bash(gh pr view --json title,body)"]
+
+  - id: rev
+    name: Reviewer
+    kind: reviewer
+    cli: claude
+
+edges:
+  - { from: worker, to: rev }
+
+gates:
+  merge:
+    require: all-pass
+    reviewers: [rev]
+
+# WHAT AGENTS TAKE TURNS ON (#858)
+resources:
+  build:
+    slots: 1
+    max_hold_minutes: 45
+`;
+
+test("every section of the wire schema reads into the model — none of them is an unknown key (#880)", () => {
+  const { workflow, findings } = analyzeWorkflow(FULL_SURFACE);
+  assert.deepEqual(codes(findings), [], "a file using the documented schema must be clean");
+  assert.equal(workflow.authored_with, "0.9.9");
+  assert.deepEqual(workflow.intake, {
+    source: "github-labels",
+    labels: { ready: "go-build", investigate: "go-look" },
+  });
+  assert.deepEqual(workflow.merge_queue, {
+    enabled: true,
+    max_batch: 5,
+    checks_timeout_minutes: 90,
+  });
+  assert.deepEqual(workflow.resources, { build: { slots: 1, max_hold_minutes: 45 } });
+  // The comma lives INSIDE the quoted pattern: one entry, not two. `allow:` is the field
+  // whose absence from this model was the whole reason the schema manifest exists.
+  assert.deepEqual(workflow.blocks[0]!.allow, ["Bash(gh pr view --json title,body)"]);
+  assert.equal(workflow.extra, undefined, "nothing at the top level is unknown any more");
+  assert.equal(workflow.blocks[0]!.extra, undefined);
+  // Absent stays absent: an undeclared label must not be filled in with its built-in
+  // default, or the next save silently PINS what the file meant to inherit.
+  assert.equal(workflow.intake!.labels!.owned, undefined);
+});
+
+test("the whole surface survives a canonical round-trip, twice", () => {
+  const { workflow } = parseWorkflow(FULL_SURFACE);
+  const out = serializeWorkflow(workflow);
+  const reread = parseWorkflow(out);
+  assert.deepEqual(reread.findings, []);
+  assert.deepEqual(reread.workflow, workflow, "a Format must not drop a section it can read");
+  assert.equal(serializeWorkflow(reread.workflow), out, "…and must be idempotent");
+});
+
+test("a commented file with intake: and merge_queue: survives an unrelated block edit byte-for-byte outside the edited block (#880)", () => {
+  const { workflow } = parseWorkflow(FULL_SURFACE);
+  const edited: Workflow = {
+    ...workflow,
+    blocks: workflow.blocks.map((b) => (b.id === "rev" ? { ...b, model: "opus" } : b)),
+  };
+  const out = serializeWorkflowPreserving(edited, FULL_SURFACE);
+  assert.deepEqual(parseWorkflow(out).workflow, edited, "the edit itself must round-trip");
+
+  // Cut the ONE item that changed out of both texts; what is left has to be identical —
+  // not "still has the comments", identical. That is the claim a human actually cares
+  // about when they open a file they hand-wrote and the pane saves it.
+  const cutEditedBlock = (text: string): string => {
+    const lines = text.split("\n");
+    const start = lines.findIndex((l) => l.includes("- id: rev"));
+    assert.ok(start > 0, "the fixture must contain the block being edited");
+    let end = start + 1;
+    while (end < lines.length && !/^\S/.test(lines[end]!)) end++;
+    return [...lines.slice(0, start), ...lines.slice(end)].join("\n");
+  };
+  assert.equal(
+    cutEditedBlock(out),
+    cutEditedBlock(FULL_SURFACE),
+    "everything outside the edited block must be the ORIGINAL text, byte for byte"
+  );
+});
+
+test("editing intake: rewrites intake: and nothing else, and no section is relocated (#880)", () => {
+  const { workflow } = parseWorkflow(FULL_SURFACE);
+  const edited: Workflow = {
+    ...workflow,
+    intake: { ...workflow.intake, labels: { ...workflow.intake!.labels, ready: "ready-now" } },
+  };
+  const out = serializeWorkflowPreserving(edited, FULL_SURFACE);
+  assert.deepEqual(parseWorkflow(out).workflow, edited);
+  assert.match(out, /ready: ready-now/);
+  // The comment ABOVE a section is about the section, not about the field that changed.
+  assert.match(out, /# WHERE WORK COMES FROM \(#382\)/);
+  assert.match(out, /# THE QUEUE \(#581\)/);
+  assert.match(out, /# WHAT AGENTS TAKE TURNS ON \(#858\)/);
+  assert.match(out, /# the whole schema, commented/);
+  // And the file's own ORDER is kept — this fixture, like the repo's own workflow, writes
+  // merge_queue: above blocks:, and an edit must not move it to the bottom.
+  assert.ok(
+    out.indexOf("merge_queue:") < out.indexOf("blocks:"),
+    `merge_queue: must stay where the file put it:\n${out}`
+  );
+});
+
+test("a typed section keeps the position the file gave it when an unrelated block is edited (#880)", () => {
+  const text = `version: 1
+
+# the queue, declared FIRST because that is the order this file reads in
+merge_queue:
+  enabled: true
+
+blocks:
+  - id: w
+    name: W
+    kind: worker
+    cli: claude
+`;
+  const { workflow } = parseWorkflow(text);
+  assert.deepEqual(workflow.merge_queue, { enabled: true }, "read as a section, not an unknown key");
+  const edited: Workflow = { ...workflow, blocks: [{ ...workflow.blocks[0]!, model: "opus" }] };
+  const out = serializeWorkflowPreserving(edited, text);
+  assert.ok(
+    out.indexOf("merge_queue:") < out.indexOf("blocks:"),
+    `a section is written where the FILE wrote it, not where the emitter would have:\n${out}`
+  );
+  assert.match(out, /# the queue, declared FIRST/);
+  assert.deepEqual(parseWorkflow(out).workflow, edited);
+});
+
+test("an unknown key is an error finding — and is still preserved verbatim (#880)", () => {
+  const text = `version: 1
+promt: whoops
+blocks:
+  - id: w
+    name: W
+    kind: worker
+    cli: claude
+    retires: 3
+`;
+  const { workflow, findings } = analyzeWorkflow(text);
+  const unknown = findings.filter((f) => f.code === "unknown-key");
+  assert.equal(unknown.length, 2, "one per key, wherever it sits");
+  assert.ok(unknown.every((f) => f.severity === "error"));
+  assert.match(unknown[0]!.message, /"promt"/);
+  assert.match(
+    unknown[0]!.message,
+    /will not load/,
+    "the finding must say what actually happens: this build's engine refuses the WHOLE file"
+  );
+  assert.equal(unknown[1]!.blockId, "w", "a block's unknown key is shown next to the block");
+
+  // Warned, never deleted. A newer loomux may have written the key, and silently dropping
+  // a human's line to make a warning go away is worse than the warning.
+  assert.equal(serializeWorkflowPreserving(workflow, text), text);
+  const canonical = serializeWorkflow(workflow);
+  assert.match(canonical, /promt: whoops/);
+  assert.match(canonical, /retires: 3/);
+});
+
+test("a gate loomux does not enforce is NOT an unknown key — gates: is a map, not a struct", () => {
+  // The engine reads `gates:` as `BTreeMap<String, RawGate>`, so a gate it has no
+  // machinery for still parses; only `merge` is enforced. Reporting it would be the pane
+  // inventing a refusal the engine never makes — the mirror image of the failure
+  // `unknown-key` exists for.
+  const text = `version: 1
+blocks:
+  - id: w
+    name: W
+    kind: worker
+    cli: claude
+gates:
+  release:
+    require: all-pass
+    reviewers: [w]
+`;
+  const { findings } = analyzeWorkflow(text);
+  assert.deepEqual(codes(findings).filter((c) => c === "unknown-key"), []);
+});
+
+test("a section written as something other than a mapping is a finding, not a silent drop", () => {
+  const { findings } = analyzeWorkflow(`version: 1
+intake: nope
+merge_queue: 3
+blocks:
+  - id: w
+    name: W
+    kind: worker
+    cli: claude
+`);
+  const shape = findings.filter((f) => f.code === "section-not-a-mapping");
+  assert.deepEqual(
+    shape.map((f) => f.message.split(":")[0]),
+    ["intake", "merge_queue"]
+  );
+});
+
+test("a wrongly-typed field is rejected, never coerced (#880)", () => {
+  // The engine's serde refuses each of these outright. A pane that read `soon` as "the
+  // default" would be describing a queue policy nobody wrote.
+  const { workflow, findings } = analyzeWorkflow(`version: 1
+merge_queue:
+  enabled: yep
+  max_batch: soon
+blocks:
+  - id: w
+    name: W
+    kind: worker
+    cli: claude
+    allow: Bash(git push)
+`);
+  assert.deepEqual(
+    findings.filter((f) => f.code === "section-bad-value").map((f) => f.message.split(":")[0]),
+    // Parse order: the roster is read before the policy sections.
+    ["blocks[0].allow", "merge_queue.enabled", "merge_queue.max_batch"]
+  );
+  assert.equal(workflow.merge_queue!.enabled, undefined, "not coerced to false");
+  assert.equal(workflow.merge_queue!.max_batch, undefined);
+  assert.equal(workflow.blocks[0]!.allow, undefined, "not coerced to a one-item list");
+});
+
+test("a section declared EMPTY stays declared — `intake: {}` is not the same as no intake:", () => {
+  // A bare `intake:` is YAML null, which the engine's `Option<RawIntake>` reads as absent —
+  // so emitting one back would delete a section someone deliberately wrote. `{}` is the
+  // spelling that means "declared, all defaults", and it is what this model emits.
+  const declared = parseWorkflow(
+    "version: 1\nintake: {}\nblocks:\n  - id: w\n    kind: worker\n"
+  ).workflow;
+  assert.deepEqual(declared.intake, {});
+  const out = serializeWorkflow(declared);
+  assert.match(out, /^intake: \{\}$/m);
+  assert.deepEqual(parseWorkflow(out).workflow.intake, {});
+
+  const absent = parseWorkflow("version: 1\nintake:\nblocks:\n  - id: w\n    kind: worker\n");
+  assert.equal(absent.workflow.intake, undefined, "a bare key means the section is not declared");
+  assert.doesNotMatch(serializeWorkflow(absent.workflow), /intake/);
 });

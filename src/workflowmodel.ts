@@ -99,9 +99,19 @@ export const WORKFLOW_VERSION = 1;
 export const WORKFLOW_FILE = ".loomux/workflow.yml";
 
 /** What a `merge` gate can require of its reviewers. `all-pass` = every named reviewer
- *  recorded PASS; `threshold` = at least N of them did. */
+ *  recorded PASS; `threshold` = at least N of them did. These are the CANONICAL
+ *  spellings — what the pane offers and what it writes. */
 export const GATE_REQUIRES = ["all-pass", "threshold"] as const;
 export type GateRequire = (typeof GATE_REQUIRES)[number];
+
+/** What the ENGINE accepts, which is a superset: `all` is a synonym for `all-pass` in
+ *  `parse_workflow`'s gate match (workflow.rs). Validation reads THIS list, so a
+ *  hand-written file using the synonym stops being flagged as an error it never was —
+ *  a pane that refuses a file the engine loads is telling the same class of lie as one
+ *  that blesses a file the engine refuses, just in the other direction (#880 review).
+ *  The picker still offers `GATE_REQUIRES` only: there is no reason to offer a human
+ *  two spellings of one thing. */
+export const GATE_REQUIRES_ACCEPTED = ["all-pass", "all", "threshold"] as const;
 
 /** A legal block id: lowercase-ish, human-meaningful, safe as a filename fragment and as
  *  a shell-adjacent token. Deliberately strict — the id ends up in agent ids, pane names
@@ -148,6 +158,13 @@ export interface WorkflowBlock {
    *  its matching `kind` (see {@link roleHintRequires}); absent is today's behavior,
    *  byte for byte. */
   role_hint?: string;
+  /** Extra pre-approved tool patterns (`--allowedTools` / `--allow-tool`), e.g.
+   *  `Bash(gh pr view --json title,body)`. A `RawBlock` field since #222 that this
+   *  model never knew about until #880 — so a workflow that declared one showed up
+   *  in the pane as a workflow that didn't. Quoted scalars matter here (the comma
+   *  inside that pattern is CONTENT, not a separator); `emitScalar` already quotes
+   *  for the flow context this emits into. */
+  allow?: string[];
   /** Thinking level (#687) — one of the CLI's own `effort` values, or "" for its
    *  default. Which values exist, and whether the CLI has any seam for them at
    *  all, is capability data the BACKEND owns (`agent_cli_knobs`); this field is
@@ -186,12 +203,67 @@ export interface WorkflowGates {
   extra?: Record<string, YamlValue>;
 }
 
+/** Where autonomous work comes from (#382 P1). Every field is OPTIONAL and absent
+ *  means "inherit loomux's built-in profile" — the engine resolves a partial block
+ *  against `builtin_intake_profile()`, so this model must keep "not declared" and
+ *  "declared empty" apart rather than filling defaults in on read (a save would
+ *  otherwise write four label lines nobody asked for).
+ *
+ *  There is deliberately no field here that can weaken the human merge gate — that
+ *  lives in the `gh` shim, and the engine's `deny_unknown_fields` makes an invented
+ *  one a hard parse error rather than an ignored line. This model preserves unknown
+ *  keys (`extra`) so a newer build's file survives a round-trip, and says so out
+ *  loud (`unknown-key`) because this build's engine would refuse the whole file. */
+export interface WorkflowIntake {
+  source?: string;
+  labels?: WorkflowIntakeLabels;
+  extra?: Record<string, YamlValue>;
+}
+
+/** The label vocabulary intake matches on. Declare one, inherit the other three. */
+export interface WorkflowIntakeLabels {
+  ready?: string;
+  investigate?: string;
+  owned?: string;
+  prototype?: string;
+  extra?: Record<string, YamlValue>;
+}
+
+/** The bisecting merge queue's policy (#581 §11.2). Absent block = the feature is
+ *  off; that is why every field is optional rather than defaulted here. */
+export interface WorkflowMergeQueue {
+  enabled?: boolean;
+  max_batch?: number;
+  checks_timeout_minutes?: number;
+  extra?: Record<string, YamlValue>;
+}
+
+/** One named lock resource (#858) — how many agents may hold it at once and for
+ *  how long. Two numbers, keyed by a name the repo chose; loomux never learns what
+ *  the name means (CLAUDE.md constraint 8 — this is policy, not mechanism). */
+export interface WorkflowResource {
+  slots?: number;
+  max_hold_minutes?: number;
+  extra?: Record<string, YamlValue>;
+}
+
 export interface Workflow {
   version: number;
   name: string;
+  /** The loomux version that CREATED this file (§4's Langflow `last_tested_version`
+   *  lesson). Written exactly once, at creation, and never restamped: it records who
+   *  authored the workflow, not who last looked at it. A typed field since #880 —
+   *  it used to ride the unknown-key bag, which round-tripped it correctly but left
+   *  it invisible to everything that asks "what fields does a workflow have?". */
+  authored_with?: string;
   blocks: WorkflowBlock[];
   edges: WorkflowEdge[];
   gates: WorkflowGates;
+  intake?: WorkflowIntake;
+  merge_queue?: WorkflowMergeQueue;
+  /** Keyed by a repo-chosen resource name, in the file's own order (the emitter
+   *  sorts, matching the engine's `BTreeMap`). */
+  resources?: Record<string, WorkflowResource>;
   extra?: Record<string, YamlValue>;
 }
 
@@ -225,7 +297,10 @@ export type FindingCode =
   | "gate-bad-threshold"
   | "isolated-block"
   | "unreachable-block"
-  | "no-entry-block";
+  | "no-entry-block"
+  | "unknown-key"
+  | "section-not-a-mapping"
+  | "section-bad-value";
 
 /** One thing wrong with the workflow. `blockId` lets the pane render the finding INLINE
  *  next to the block it is about (the whole reason the validation pass is worth having is
@@ -777,8 +852,82 @@ function emitFrontLines(w: Workflow): string[] {
   const out: string[] = [];
   out.push(`version: ${w.version}`);
   if (w.name) out.push(`name: ${emitScalar(w.name)}`);
+  // Only when the file HAS one: this key is stamped once, at creation, and a save
+  // must never invent it (see `AUTHORED_WITH_KEY`).
+  if (w.authored_with !== undefined) out.push(`authored_with: ${emitScalar(w.authored_with)}`);
   out.push(...extraLines(w.extra, ""));
   return out;
+}
+
+/** A nested mapping section (`intake:`, `merge_queue:`, one `resources:` entry).
+ *  A section with nothing under it emits `key: {}` rather than a bare `key:` — a
+ *  bare key is YAML *null*, which reads back as "not declared at all", so the
+ *  round-trip would silently delete a section someone deliberately wrote empty.
+ *  Exactly the `blocks: []` reasoning (rev-5 F4), one level down. */
+function emitMappingSection(key: string, indent: string, body: readonly string[]): string[] {
+  if (!body.length) return [`${indent}${key}: {}`];
+  return [`${indent}${key}:`, ...body];
+}
+
+/** The `intake:` section (#382 P1). Every field is emitted only when DECLARED:
+ *  the engine resolves an absent one against its built-in profile, so writing the
+ *  defaults out would turn "inherit" into "pin", silently, on the first save. */
+function emitIntakeLines(intake: WorkflowIntake, indent = ""): string[] {
+  const field = `${indent}  `;
+  const body: string[] = [];
+  if (intake.source !== undefined) body.push(`${field}source: ${emitScalar(intake.source)}`);
+  if (intake.labels) body.push(...emitIntakeLabelLines(intake.labels, field));
+  body.push(...extraLines(intake.extra, field));
+  return emitMappingSection("intake", indent, body);
+}
+
+const INTAKE_LABEL_KEYS = ["ready", "investigate", "owned", "prototype"] as const;
+
+function emitIntakeLabelLines(labels: WorkflowIntakeLabels, indent: string): string[] {
+  const field = `${indent}  `;
+  const body: string[] = [];
+  for (const key of INTAKE_LABEL_KEYS) {
+    const v = labels[key];
+    if (v !== undefined) body.push(`${field}${key}: ${emitScalar(v)}`);
+  }
+  body.push(...extraLines(labels.extra, field));
+  return emitMappingSection("labels", indent, body);
+}
+
+/** The `merge_queue:` section (#581 §11.2). Same declared-only rule as `intake:`,
+ *  and for a sharper reason: an absent block means the queue is OFF, so emitting
+ *  `enabled: false` where the file said nothing would be a policy statement the
+ *  human never made. */
+function emitMergeQueueLines(mq: WorkflowMergeQueue, indent = ""): string[] {
+  const field = `${indent}  `;
+  const body: string[] = [];
+  if (mq.enabled !== undefined) body.push(`${field}enabled: ${mq.enabled}`);
+  if (mq.max_batch !== undefined) body.push(`${field}max_batch: ${mq.max_batch}`);
+  if (mq.checks_timeout_minutes !== undefined) {
+    body.push(`${field}checks_timeout_minutes: ${mq.checks_timeout_minutes}`);
+  }
+  body.push(...extraLines(mq.extra, field));
+  return emitMappingSection("merge_queue", indent, body);
+}
+
+/** The `resources:` section (#858) — a mapping of repo-chosen names to two numbers.
+ *  Names are emitted in SORTED order, matching the engine's `BTreeMap`, because
+ *  unlike the roster (whose order is meaning — the first block of a class is the
+ *  default one) a resource map has no order to preserve. */
+function emitResourcesLines(resources: Record<string, WorkflowResource>, indent = ""): string[] {
+  const field = `${indent}  `;
+  const body: string[] = [];
+  for (const name of Object.keys(resources).sort()) {
+    const r = resources[name]!;
+    const inner: string[] = [];
+    if (r.slots !== undefined) inner.push(`${field}  slots: ${r.slots}`);
+    if (r.max_hold_minutes !== undefined) {
+      inner.push(`${field}  max_hold_minutes: ${r.max_hold_minutes}`);
+    }
+    inner.push(...extraLines(r.extra, `${field}  `));
+    body.push(...emitMappingSection(emitScalar(name), field, inner));
+  }
+  return emitMappingSection("resources", indent, body);
 }
 
 /** One block entry, canonical key order, no leading/trailing blank line. `markerIndent` is
@@ -802,6 +951,10 @@ function emitBlockLines(b: WorkflowBlock, markerIndent = 2): string[] {
   if (b.effort !== undefined) out.push(`${field}effort: ${emitScalar(b.effort)}`);
   if (b.context !== undefined) out.push(`${field}context: ${emitScalar(b.context)}`);
   if (b.profile !== undefined) out.push(`${field}profile: ${emitScalar(b.profile)}`);
+  // A flow list, like `reviewers:`/`also:` — and every entry goes through
+  // `emitScalar`, which quotes for flow context, so `Bash(gh pr view --json
+  // title,body)` survives instead of re-reading as two entries (rev-5 F1).
+  if (b.allow !== undefined) out.push(`${field}allow: [${b.allow.map(emitScalar).join(", ")}]`);
   out.push(...extraLines(b.extra, field));
   if (b.prompt !== undefined) out.push(...emitBlockScalar("prompt", b.prompt, field));
   return out;
@@ -861,6 +1014,17 @@ export function serializeWorkflow(w: Workflow): string {
 
   const gateLines = emitGatesLines(w, order);
   if (gateLines.length) out.push("", ...gateLines);
+
+  // The policy sections, in the engine's own `RawWorkflow` field order — one
+  // canonical shape means one order, and taking it from the type that defines the
+  // schema is the only choice that can't drift for a reason nobody can name.
+  for (const lines of [
+    w.intake ? emitIntakeLines(w.intake) : [],
+    w.merge_queue ? emitMergeQueueLines(w.merge_queue) : [],
+    w.resources ? emitResourcesLines(w.resources) : [],
+  ]) {
+    if (lines.length) out.push("", ...lines);
+  }
 
   return out.join("\n") + "\n";
 }
@@ -1171,7 +1335,31 @@ function splitBlockItems(content: string[]): BlockItems | null {
   return { items, indent: markerIndent };
 }
 
-const TOP_SECTION_KEYS = new Set(["blocks", "edges", "gates"]);
+/** The top-level keys that are each their own preservable SECTION, in the order they
+ *  take when the ORIGINAL document didn't declare them — which is the order
+ *  `serializeWorkflow` writes, which is the engine's own `RawWorkflow` field order. A
+ *  section the document DID declare keeps the position it already had (see the entry
+ *  walk in `serializeWorkflowPreserving`): a file that puts `merge_queue:` above
+ *  `blocks:` — as this repo's own does — must not have it relocated by an edit to
+ *  something else.
+ *
+ *  Everything else at the top level (`version:`, `name:`, `authored_with:`, any key
+ *  this build doesn't know) is one indivisible "front" piece, and membership here is
+ *  not cosmetic: a key listed here is reused, or regenerated, on its own, while a key
+ *  that isn't rides the front. Promoting `merge_queue:` out of the unknown-key bag
+ *  (where it sat until #880, re-emitted as a flattened flow mapping) into this list is
+ *  what lets an edit to it keep the comment lines above it, and what stops an unrelated
+ *  `name:` edit from flattening it.
+ *
+ *  This one list is the source of BOTH the membership test and the emitter table in
+ *  `serializeWorkflowPreserving` — a `Record` over exactly this union — so a section
+ *  added here without an emitter is a COMPILE error rather than a section that quietly
+ *  stops being written to the file at all. */
+const SECTION_ORDER = ["blocks", "edges", "gates", "intake", "merge_queue", "resources"] as const;
+
+type SectionKey = (typeof SECTION_ORDER)[number];
+
+const TOP_SECTION_KEYS: ReadonlySet<string> = new Set<string>(SECTION_ORDER);
 
 /** Render the workflow the way a form or canvas edit should: reusing the ORIGINAL text's own
  *  lines — comments, blank-line runs, key order, quoting style, all of it — for every top-level
@@ -1206,15 +1394,19 @@ export function serializeWorkflowPreserving(w: Workflow, originalText: string): 
   const order = blockOrder(w);
   const out: string[] = [...doc.preamble];
 
-  // ---- front: version, name, unknown top-level keys ----
+  // ---- front: version, name, authored_with, unknown top-level keys ----
   const frontEntries = doc.entries.filter((e) => !TOP_SECTION_KEYS.has(e.key));
   const frontUnchanged =
-    w.version === orig.version && w.name === orig.name && deepEqualValue(w.extra, orig.extra);
-  if (frontUnchanged && frontEntries.length) {
-    for (const e of frontEntries) out.push(...e.header, ...e.content);
-  } else {
-    out.push(...emitFrontLines(w));
-  }
+    w.version === orig.version &&
+    w.name === orig.name &&
+    w.authored_with === orig.authored_with &&
+    deepEqualValue(w.extra, orig.extra);
+  // Reused, the front pieces stay exactly where the file put them (the walk below emits
+  // each at its own position, interleaved with the sections). REGENERATED, they go to the
+  // top as one canonical group — which is where `emitFrontLines` has always put them, and
+  // the only position that reads right when the file didn't declare them at all.
+  const reuseFront = frontUnchanged && frontEntries.length > 0;
+  if (!reuseFront) out.push(...emitFrontLines(w));
 
   // ---- blocks, matched by id (the one thing about a block that never changes — see the
   // module comment at the top of this file) ----
@@ -1233,17 +1425,17 @@ export function serializeWorkflowPreserving(w: Workflow, originalText: string): 
   // a comment; it can just look unevenly spaced. Fixing that needs re-deriving spacing from the
   // NEW neighbor at every reuse, which is more machinery than the cosmetic cost justifies here,
   // and the pane's own UI has no "reorder" gesture — this only arises from a hand edit.
-  if (!w.blocks.length) {
-    // Same header/content split as `blocks:`'s own non-empty case just below (and edges/gates,
-    // further down): the comment introducing the ROSTER ("# BLOCKS — the agents a run may
-    // use…") is about the section, not about any one block, so it survives the roster being
-    // emptied out too — only the LAST line of the header (the `blocks:`/`blocks: […]` key line
-    // itself) is replaced with the canonical empty form.
-    const blocksEntry = doc.entries.find((e) => e.key === "blocks");
-    if (blocksEntry) out.push(...blocksEntry.header.slice(0, -1), "blocks: []");
-    else out.push("", "blocks: []");
-  } else {
-    const blocksEntry = doc.entries.find((e) => e.key === "blocks");
+  const pushBlocks = (blocksEntry: TopEntry | undefined): void => {
+    if (!w.blocks.length) {
+      // Same header/content split as the non-empty case below (and every other section): the
+      // comment introducing the ROSTER ("# BLOCKS — the agents a run may use…") is about the
+      // section, not about any one block, so it survives the roster being emptied out too —
+      // only the LAST line of the header (the `blocks:`/`blocks: […]` key line itself) is
+      // replaced with the canonical empty form.
+      if (blocksEntry) out.push(...blocksEntry.header.slice(0, -1), "blocks: []");
+      else out.push("", "blocks: []");
+      return;
+    }
     const split = blocksEntry ? splitBlockItems(blocksEntry.content) : null;
     const reusable = !!split && split.items.length === orig.blocks.length;
     const targetIndent = split?.indent ?? 2;
@@ -1268,35 +1460,92 @@ export function serializeWorkflowPreserving(w: Workflow, originalText: string): 
       }
       firstItem = false;
     }
-  }
+  };
 
-  // ---- edges: the SECTION HEADER (the `edges:` line and whatever comment introduces it, e.g.
-  // "# ADVISORY — the declared happy path") is reused whenever there is one, independent of
-  // whether the edge list itself changed — the same "header vs. content" split `blocks:` gets,
-  // above. Only the CONTENT (the fan-out entries) falls back to canonical when it changed;
-  // regenerating the whole section including its header (the old behavior) meant deleting one
-  // edge dropped a comment that was never about that edge (#233 non-blocking #1). ----
-  const edgesEntry = doc.entries.find((e) => e.key === "edges");
-  const edgesUnchanged = deepEqualValue(w.edges, orig.edges);
-  if (edgesEntry && (edgesUnchanged || w.edges.length)) {
-    const edgeContent = edgesUnchanged ? edgesEntry.content : emitEdgesLines(w.edges, order).slice(1);
-    out.push(...edgesEntry.header, ...edgeContent);
-  } else {
-    const edgeLines = emitEdgesLines(w.edges, order);
-    if (edgeLines.length) out.push("", ...edgeLines);
-  }
+  /** Every section that is not `blocks:` — one shape, because they all want the same one.
+   *
+   *  The SECTION HEADER (the `key:` line and whatever comment introduces it, e.g. "# ADVISORY
+   *  — the declared happy path") is reused whenever there is one, independent of whether the
+   *  content changed: regenerating the whole section including its header meant deleting one
+   *  edge dropped a comment that was never about that edge (#233 non-blocking #1). Only the
+   *  CONTENT falls back to canonical, and only when it changed.
+   *
+   *  `present` is "the model still has something to write here": with an entry that no longer
+   *  matches and nothing to write, the section is GONE, and falling through to the else-branch
+   *  (which emits nothing for empty `lines`) is what deletes it. */
+  const pushSection = (
+    entry: TopEntry | undefined,
+    unchanged: boolean,
+    present: boolean,
+    lines: string[]
+  ): void => {
+    if (entry && (unchanged || present)) {
+      out.push(...entry.header, ...(unchanged ? entry.content : lines.slice(1)));
+    } else if (lines.length) {
+      out.push("", ...lines);
+    }
+  };
 
-  // ---- gates: same header/content split as edges ----
-  const gatesEntry = doc.entries.find((e) => e.key === "gates");
-  const gatesUnchanged = deepEqualValue(w.gates, orig.gates);
-  const gatesPresent = !!w.gates.merge || !!w.gates.extra;
-  if (gatesEntry && (gatesUnchanged || gatesPresent)) {
-    const gateContent = gatesUnchanged ? gatesEntry.content : emitGatesLines(w, order).slice(1);
-    out.push(...gatesEntry.header, ...gateContent);
-  } else {
-    const gateLines = emitGatesLines(w, order);
-    if (gateLines.length) out.push("", ...gateLines);
+  // A Record over `SectionKey`, not a switch: TypeScript demands an entry for every
+  // member, so a section added to SECTION_ORDER with no emitter here fails the build
+  // instead of silently vanishing from every file it is written in.
+  const pushKey: Record<SectionKey, (entry: TopEntry | undefined) => void> = {
+    blocks: (entry) => pushBlocks(entry),
+    edges: (entry) =>
+      pushSection(
+        entry,
+        deepEqualValue(w.edges, orig.edges),
+        w.edges.length > 0,
+        emitEdgesLines(w.edges, order)
+      ),
+    gates: (entry) =>
+      pushSection(
+        entry,
+        deepEqualValue(w.gates, orig.gates),
+        !!w.gates.merge || !!w.gates.extra,
+        emitGatesLines(w, order)
+      ),
+    intake: (entry) =>
+      pushSection(
+        entry,
+        deepEqualValue(w.intake, orig.intake),
+        !!w.intake,
+        w.intake ? emitIntakeLines(w.intake) : []
+      ),
+    merge_queue: (entry) =>
+      pushSection(
+        entry,
+        deepEqualValue(w.merge_queue, orig.merge_queue),
+        !!w.merge_queue,
+        w.merge_queue ? emitMergeQueueLines(w.merge_queue) : []
+      ),
+    resources: (entry) =>
+      pushSection(
+        entry,
+        deepEqualValue(w.resources, orig.resources),
+        !!w.resources,
+        w.resources ? emitResourcesLines(w.resources) : []
+      ),
+  };
+
+  // The document's OWN order is the output's order (#880): walk the entries as the file
+  // wrote them, and only sections the file never declared get appended, in canonical order.
+  // A fixed emission order would have been fine while every known section happened to be
+  // declared in that order — and stopped being fine the moment `merge_queue:` became a
+  // section, because this repo's own workflow writes it ABOVE `blocks:`, so any edit would
+  // have relocated it (and the six comment lines that introduce it) to the bottom of the file.
+  const seen = new Set<SectionKey>();
+  for (const e of doc.entries) {
+    if (!TOP_SECTION_KEYS.has(e.key)) {
+      if (reuseFront) out.push(...e.header, ...e.content);
+      continue; // otherwise the canonical front group already went out, above
+    }
+    const key = e.key as SectionKey; // TOP_SECTION_KEYS is built from SECTION_ORDER
+    if (seen.has(key)) continue; // a duplicate top-level key: the reader kept one, so emit one
+    seen.add(key);
+    pushKey[key](e);
   }
+  for (const key of SECTION_ORDER) if (!seen.has(key)) pushKey[key](undefined);
 
   if (doc.trailer.length) out.push(...doc.trailer);
 
@@ -1318,7 +1567,24 @@ export interface ParseResult {
 const asString = (v: YamlValue): string | null =>
   typeof v === "string" ? v : typeof v === "number" || typeof v === "boolean" ? String(v) : null;
 
-const KNOWN_TOP = new Set(["version", "name", "blocks", "edges", "gates"]);
+// The keys this build knows, per section. They mirror the engine's `Raw*` structs
+// (`src-tauri/src/orchestration/workflow.rs`) — the same set `src/workflow-schema.json`
+// declares, which `test/workflowschema.test.ts` pins field for field. Hand-written
+// rather than read from the manifest on purpose: this module is pure and import-free
+// (see the header — its ONE import is a type), and a data file it had to load at
+// startup would be a second way for the pane to fail to open a file. The test is the
+// link between the two, and it is cheaper than the coupling would be.
+const KNOWN_TOP = new Set([
+  "version",
+  "name",
+  "authored_with",
+  "blocks",
+  "edges",
+  "gates",
+  "intake",
+  "merge_queue",
+  "resources",
+]);
 const KNOWN_BLOCK = new Set([
   "id",
   "name",
@@ -1327,11 +1593,20 @@ const KNOWN_BLOCK = new Set([
   "model",
   "prompt",
   "profile",
+  "allow",
   "role_hint",
   "effort",
   "context",
 ]);
+/** `gates:` is a MAP keyed by gate name, not a fixed struct: the engine reads it as
+ *  `BTreeMap<String, RawGate>`, so a `release:` gate parses fine — loomux simply
+ *  enforces none but `merge`. That is why a key here lands in `extra` WITHOUT an
+ *  `unknown-key` finding, unlike every other section's leftovers. */
 const KNOWN_GATE = new Set(["merge"]);
+const KNOWN_INTAKE = new Set(["source", "labels"]);
+const KNOWN_INTAKE_LABELS = new Set(INTAKE_LABEL_KEYS);
+const KNOWN_MERGE_QUEUE = new Set(["enabled", "max_batch", "checks_timeout_minutes"]);
+const KNOWN_RESOURCE = new Set(["slots", "max_hold_minutes"]);
 
 function collectExtra(
   obj: Record<string, YamlValue>,
@@ -1340,6 +1615,116 @@ function collectExtra(
   const extra: Record<string, YamlValue> = {};
   for (const k of Object.keys(obj)) if (!known.has(k)) extra[k] = obj[k]!;
   return Object.keys(extra).length ? extra : undefined;
+}
+
+/** A nested-mapping section's raw value, or `null` when there is nothing to read.
+ *
+ *  YAML null — `intake:` with nothing after it — means ABSENT, the same reading the
+ *  engine's `Option<RawIntake>` gives it, so it produces no section and no finding.
+ *  A scalar or a list where a mapping belongs is a shape finding: the engine would
+ *  refuse the whole file over it, and reporting nothing would leave the pane calling
+ *  a file valid that cannot load. */
+function readSection(
+  v: YamlValue | undefined,
+  where: string,
+  findings: Finding[]
+): Record<string, YamlValue> | null {
+  if (v === undefined || v === null) return null;
+  if (typeof v !== "object" || Array.isArray(v)) {
+    findings.push({
+      severity: "error",
+      code: "section-not-a-mapping",
+      message: `${where}: must be a mapping (found ${emitValue(v)}).`,
+    });
+    return null;
+  }
+  return v as Record<string, YamlValue>;
+}
+
+/** A field whose TYPE is wrong — `max_batch: soon`, `enabled: yes please`. Rejected,
+ *  never coerced: the engine's serde would refuse the file, and a pane that quietly
+ *  read `soon` as "the default" would be lying about what is going to run. */
+function badValue(where: string, want: string, got: YamlValue): Finding {
+  return {
+    severity: "error",
+    code: "section-bad-value",
+    message: `${where}: must be ${want} (found ${emitValue(got)}).`,
+  };
+}
+
+/** Read one declared-or-absent number field. Absent stays absent — the engine
+ *  resolves an omitted number against its own default, so writing one in here would
+ *  turn "inherit" into "pin" on the next save. */
+function readNumberField(
+  r: Record<string, YamlValue>,
+  key: string,
+  where: string,
+  findings: Finding[]
+): number | undefined {
+  const v = r[key];
+  if (v === undefined) return undefined;
+  if (typeof v === "number") return v;
+  findings.push(badValue(`${where}.${key}`, "a number", v));
+  return undefined;
+}
+
+function readIntake(r: Record<string, YamlValue>, findings: Finding[]): WorkflowIntake {
+  const intake: WorkflowIntake = {};
+  if (r.source !== undefined) intake.source = asString(r.source) ?? "";
+  const labels = readSection(r.labels, "intake.labels", findings);
+  if (labels) {
+    const out: WorkflowIntakeLabels = {};
+    for (const key of INTAKE_LABEL_KEYS) {
+      if (labels[key] !== undefined) out[key] = asString(labels[key]!) ?? "";
+    }
+    const extra = collectExtra(labels, KNOWN_INTAKE_LABELS);
+    if (extra) out.extra = extra;
+    intake.labels = out;
+  }
+  const extra = collectExtra(r, KNOWN_INTAKE);
+  if (extra) intake.extra = extra;
+  return intake;
+}
+
+function readMergeQueue(r: Record<string, YamlValue>, findings: Finding[]): WorkflowMergeQueue {
+  const mq: WorkflowMergeQueue = {};
+  if (r.enabled !== undefined) {
+    if (typeof r.enabled === "boolean") mq.enabled = r.enabled;
+    else findings.push(badValue("merge_queue.enabled", "true or false", r.enabled));
+  }
+  const batch = readNumberField(r, "max_batch", "merge_queue", findings);
+  if (batch !== undefined) mq.max_batch = batch;
+  const timeout = readNumberField(r, "checks_timeout_minutes", "merge_queue", findings);
+  if (timeout !== undefined) mq.checks_timeout_minutes = timeout;
+  const extra = collectExtra(r, KNOWN_MERGE_QUEUE);
+  if (extra) mq.extra = extra;
+  return mq;
+}
+
+/** `resources:` is a MAP of repo-chosen names, so every key here is a resource, never
+ *  an unknown one. A name written with nothing under it (`build:`) reads as a resource
+ *  DECLARED WITH DEFAULTS — that is what a human means by it — and re-emits as
+ *  `build: {}`, which is the spelling the engine's serde actually accepts. */
+function readResources(
+  r: Record<string, YamlValue>,
+  findings: Finding[]
+): Record<string, WorkflowResource> {
+  const out: Record<string, WorkflowResource> = {};
+  for (const name of Object.keys(r)) {
+    const where = `resources.${name}`;
+    const body = readSection(r[name], where, findings);
+    const res: WorkflowResource = {};
+    if (body) {
+      const slots = readNumberField(body, "slots", where, findings);
+      if (slots !== undefined) res.slots = slots;
+      const hold = readNumberField(body, "max_hold_minutes", where, findings);
+      if (hold !== undefined) res.max_hold_minutes = hold;
+      const extra = collectExtra(body, KNOWN_RESOURCE);
+      if (extra) res.extra = extra;
+    }
+    out[name] = res;
+  }
+  return out;
 }
 
 /** Read a workflow file. NEVER throws and NEVER refuses: a file it cannot fully
@@ -1393,6 +1778,9 @@ export function parseWorkflow(text: string): ParseResult {
   }
 
   w.name = asString(root.name ?? "") ?? "";
+  // Declared-or-absent, never defaulted: an empty `authored_with:` is a file that says
+  // it doesn't know, and a missing one is a file that never claimed to.
+  if (root.authored_with !== undefined) w.authored_with = asString(root.authored_with) ?? "";
   w.extra = collectExtra(root, KNOWN_TOP);
 
   // `blocks:` / `edges:` written with nothing after them are YAML null, and null here means
@@ -1434,6 +1822,15 @@ export function parseWorkflow(text: string): ParseResult {
     w.gates.extra = collectExtra(g, KNOWN_GATE);
   }
 
+  // The policy sections (#382 / #581 / #858). Each is optional and each is absent
+  // rather than defaulted when the file says nothing — see `WorkflowIntake`.
+  const intake = readSection(root.intake, "intake", findings);
+  if (intake) w.intake = readIntake(intake, findings);
+  const mergeQueue = readSection(root.merge_queue, "merge_queue", findings);
+  if (mergeQueue) w.merge_queue = readMergeQueue(mergeQueue, findings);
+  const resources = readSection(root.resources, "resources", findings);
+  if (resources) w.resources = readResources(resources, findings);
+
   return { workflow: w, findings };
 }
 
@@ -1460,6 +1857,13 @@ function readBlock(raw: YamlValue, index: number, findings: Finding[]): Workflow
   };
   if (r.prompt !== undefined) block.prompt = asString(r.prompt) ?? "";
   if (r.profile !== undefined) block.profile = asString(r.profile) ?? "";
+  // A list, or a finding — never a coerced scalar. `allow: Bash(git push)` (no
+  // brackets) is a file the engine refuses, and pretending it declared nothing would
+  // hide a line whose whole purpose is to pre-approve a tool.
+  if (r.allow !== undefined) {
+    if (Array.isArray(r.allow)) block.allow = r.allow.map((v) => asString(v) ?? "");
+    else findings.push(badValue(`blocks[${index}].allow`, "a list of tool patterns", r.allow));
+  }
   if (r.role_hint !== undefined) block.role_hint = asString(r.role_hint) ?? "";
   // #687. `undefined` (never declared) and `""` (declared empty) are kept apart
   // the way role_hint keeps them, so a save can't turn one into the other.
@@ -1698,7 +2102,7 @@ export function validateWorkflow(w: Workflow, knobs?: KnobLookup): Finding[] {
 
   const gate = w.gates.merge;
   if (gate) {
-    if (!(GATE_REQUIRES as readonly string[]).includes(gate.require)) {
+    if (!(GATE_REQUIRES_ACCEPTED as readonly string[]).includes(gate.require)) {
       findings.push({
         severity: "error",
         code: "gate-unknown-require",
@@ -1747,8 +2151,46 @@ export function validateWorkflow(w: Workflow, knobs?: KnobLookup): Finding[] {
     }
   }
 
+  findings.push(...unknownKeyFindings(w));
   findings.push(...reachabilityFindings(w, byId));
   return findings;
+}
+
+/** Every key this build doesn't know, wherever it sits (#880).
+ *
+ *  The pane PRESERVES unknown keys — a file written by a newer loomux must survive a
+ *  round-trip through an older pane rather than be quietly stripped by it (that is
+ *  what `extra` is for, and it stays). But preserving alone was a half-truth: this
+ *  build's engine is `deny_unknown_fields`, so a single typo (`promt:`) makes
+ *  `parse_workflow` refuse the WHOLE file — gates and all — down the loud
+ *  `workflow-invalid` path, while the pane cheerfully rendered "valid". Preserving and
+ *  warning is the honest pair; dropping is destructive and ignoring is a lie.
+ *
+ *  `gates:` is exempt, and that is not an oversight: it is a map keyed by gate NAME
+ *  (`BTreeMap<String, RawGate>`), so a gate loomux doesn't enforce still parses. See
+ *  `KNOWN_GATE`. */
+function unknownKeyFindings(w: Workflow): Finding[] {
+  const out: Finding[] = [];
+  const report = (where: string, extra: Record<string, YamlValue> | undefined, blockId?: string): void => {
+    for (const key of Object.keys(extra ?? {})) {
+      out.push({
+        severity: "error",
+        code: "unknown-key",
+        message:
+          `${where} declares "${key}", which is not part of the workflow schema — ` +
+          `this build's engine refuses unknown keys, so the file will not load. ` +
+          `(The pane keeps the line as written; check the spelling, or the file needs a newer loomux.)`,
+        blockId,
+      });
+    }
+  };
+  report("This workflow", w.extra);
+  for (const b of w.blocks) report(`Block "${b.id || b.name}"`, b.extra, b.id || undefined);
+  if (w.intake) report("intake:", w.intake.extra);
+  if (w.intake?.labels) report("intake.labels:", w.intake.labels.extra);
+  if (w.merge_queue) report("merge_queue:", w.merge_queue.extra);
+  for (const [name, r] of Object.entries(w.resources ?? {})) report(`resources.${name}:`, r.extra);
+  return out;
 }
 
 /** The two structural warnings — a block nothing points at, and a block nothing can
@@ -2101,12 +2543,16 @@ gates:
  *  misbehaves, the first question is always which build produced it).
  *
  *  It is written EXACTLY ONCE, when the pane creates a new workflow, and never touched
- *  again: on an existing file it rides the unknown-key bag and round-trips verbatim. That
- *  is deliberate — stamping it on every save would mean every human who opens the pane and
- *  changes a model name also produces a one-line diff nobody asked for, in a file whose
- *  whole point is a legible history. It records who authored the workflow, not who last
- *  looked at it. (Deliberately NOT in KNOWN_TOP: the preservation path already handles it,
- *  and the backend — sub-PR 1 — owns whatever meaning it ever grows.) */
+ *  again: on an existing file it round-trips verbatim. That is deliberate — stamping it
+ *  on every save would mean every human who opens the pane and changes a model name also
+ *  produces a one-line diff nobody asked for, in a file whose whole point is a legible
+ *  history. It records who authored the workflow, not who last looked at it.
+ *
+ *  A KNOWN key since #880 (`Workflow.authored_with`), where it used to ride the
+ *  unknown-key bag: that round-tripped it correctly but left it invisible to anything
+ *  asking what fields a workflow file has — and once an unknown key became a finding, it
+ *  would have had the pane report a key loomux itself writes. The behavior above is
+ *  unchanged; only its visibility is. */
 export const AUTHORED_WITH_KEY = "authored_with";
 
 /** The workflow loomux runs today, as a file: plan → work → review, with the reviewer's
@@ -2120,7 +2566,7 @@ export function starterWorkflow(authoredWith?: string): Workflow {
   return {
     version: WORKFLOW_VERSION,
     name: "default",
-    ...(authoredWith ? { extra: { [AUTHORED_WITH_KEY]: authoredWith } } : {}),
+    ...(authoredWith ? { [AUTHORED_WITH_KEY]: authoredWith } : {}),
     blocks: [
       { id: "planner", name: "Planner", kind: "planner", cli: "claude", model: "opus" },
       { id: "worker", name: "Worker", kind: "worker", cli: "claude", model: "" },

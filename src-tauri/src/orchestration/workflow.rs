@@ -103,7 +103,9 @@
 //! `.loomux/workflow.layout.json` (the GUI pane's file, sub-PR 2) so a canvas
 //! nudge never churns the semantic diff.
 
-use super::notify::{clamp_expires_minutes, NOTIFY_EXPIRES_DEFAULT_MIN};
+use super::notify::{
+    clamp_expires_minutes, NOTIFY_EXPIRES_DEFAULT_MIN, NOTIFY_EXPIRES_MAX, NOTIFY_EXPIRES_MIN,
+};
 use super::{cli_can_host, default_model, Role, SUPPORTED_CLIS};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -785,7 +787,7 @@ pub fn resolve_profile_path(repo: &str, rel: &str) -> Result<PathBuf, String> {
 // the failure mode every surveyed workflow tool has (Dify will happily publish
 // a workflow whose plugin node isn't installed).
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RawWorkflow {
     version: u32,
@@ -835,7 +837,7 @@ struct RawWorkflow {
     resources: BTreeMap<String, RawResource>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RawResource {
     /// `Option` rather than a defaulted number so "omitted" and "written as 1"
@@ -848,7 +850,7 @@ struct RawResource {
     max_hold_minutes: Option<u32>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RawMergeQueue {
     #[serde(default)]
@@ -862,7 +864,7 @@ struct RawMergeQueue {
     checks_timeout_minutes: Option<u32>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RawIntake {
     #[serde(default)]
@@ -871,7 +873,7 @@ struct RawIntake {
     labels: RawIntakeLabels,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Serialize, Default)]
 #[serde(deny_unknown_fields)]
 struct RawIntakeLabels {
     #[serde(default)]
@@ -884,7 +886,7 @@ struct RawIntakeLabels {
     prototype: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RawBlock {
     id: String,
@@ -909,14 +911,14 @@ struct RawBlock {
     context: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RawEdge {
     from: String,
     to: OneOrMany,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RawGate {
     #[serde(default)]
@@ -931,7 +933,7 @@ struct RawGate {
 
 /// `to: worker` and `to: [rev-a, rev-b]` are both legal — a fan-out reads
 /// naturally as a list and a single hand-off reads naturally as a scalar.
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(untagged)]
 enum OneOrMany {
     One(String),
@@ -945,6 +947,224 @@ impl OneOrMany {
             OneOrMany::Many(v) => v,
         }
     }
+}
+
+/// Every field name this schema accepts, per section, **derived from the types
+/// that do the accepting** (#880). Section names match `src/workflow-schema.json`.
+///
+/// The GUI's failure mode this exists to kill: `allow:` has been a real
+/// `RawBlock` field since #222 and the workflow pane never grew a control for
+/// it — nor even knew the key — so a workflow that declared it looked, in the
+/// pane, like a workflow that didn't. Nothing was wrong with either side; the
+/// two simply had no way to disagree out loud. Now they do:
+/// `tests/orchestration.rs` compares this against the committed manifest, so a
+/// field added here without an editor is a red test rather than a hole nobody
+/// finds until a human wonders where their line went.
+///
+/// **Serialized, not hand-listed**, deliberately: a hand-written list is
+/// exactly the thing that drifts, and it would drift *silently* in the one
+/// direction that matters (a new field, forgotten). serde already knows every
+/// field name — `deny_unknown_fields` is that same knowledge pointed the other
+/// way — so asking it is the only spelling of this that cannot go stale.
+///
+/// Every value below is populated rather than left at its zero — no `Option` is
+/// `None`, no collection is empty — so that the key sets do not depend on what
+/// the instances happen to hold. **What actually guarantees that is the parity
+/// test, not the population**: there is no `skip_serializing_if` on any of these
+/// types today, and one added tomorrow would turn that test RED (the manifest
+/// still declares the row) rather than quietly shrinking this map. Maximal
+/// values make the failure *impossible to reach by accident*; the test is what
+/// makes it impossible to reach at all.
+///
+/// `#[doc(hidden)]` and `pub` only because the pin lives in an integration test
+/// (CLAUDE.md constraint 4) and the `Raw*` types themselves stay private: this
+/// is a test seam, not API.
+#[doc(hidden)]
+pub fn workflow_schema_keys() -> BTreeMap<String, Vec<String>> {
+    fn keys_of<T: Serialize>(section: &str, v: &T) -> Vec<String> {
+        match serde_json::to_value(v) {
+            Ok(serde_json::Value::Object(map)) => map.keys().cloned().collect(),
+            other => panic!("{section}: expected a mapping, got {other:?}"),
+        }
+    }
+    let block = RawBlock {
+        id: "b".into(),
+        name: "B".into(),
+        kind: "worker".into(),
+        cli: "claude".into(),
+        model: "opus".into(),
+        prompt: Some("p".into()),
+        profile: Some(".github/agents/b.md".into()),
+        allow: vec!["Bash(gh pr view)".into()],
+        role_hint: Some("process".into()),
+        effort: "high".into(),
+        context: "1m".into(),
+    };
+    let edge = RawEdge { from: "a".into(), to: OneOrMany::One("b".into()) };
+    let gate = RawGate {
+        require: Some("all-pass".into()),
+        threshold: Some(1),
+        reviewers: vec!["rev".into()],
+        also: vec!["ci-green".into()],
+    };
+    let labels = RawIntakeLabels {
+        ready: "agent-ready".into(),
+        investigate: "agent-investigation".into(),
+        owned: "agent-managed".into(),
+        prototype: "agent-prototype".into(),
+    };
+    let intake = RawIntake { source: "github-labels".into(), labels: RawIntakeLabels::default() };
+    let merge_queue =
+        RawMergeQueue { enabled: true, max_batch: Some(3), checks_timeout_minutes: Some(60) };
+    let resource = RawResource { slots: Some(1), max_hold_minutes: Some(30) };
+    let mut out = BTreeMap::new();
+    // Read before `workflow` takes ownership of its own copies below — the point
+    // of populating them there is that no field of the top-level type is left at
+    // a zero value.
+    out.insert("block".to_string(), keys_of("block", &block));
+    out.insert("edge".to_string(), keys_of("edge", &edge));
+    out.insert("gate".to_string(), keys_of("gate", &gate));
+    out.insert("intake".to_string(), keys_of("intake", &intake));
+    out.insert("intake.labels".to_string(), keys_of("intake.labels", &labels));
+    out.insert("merge_queue".to_string(), keys_of("merge_queue", &merge_queue));
+    out.insert("resource".to_string(), keys_of("resource", &resource));
+    let workflow = RawWorkflow {
+        version: SCHEMA_VERSION,
+        name: "w".into(),
+        authored_with: "loomux".into(),
+        blocks: vec![block],
+        edges: vec![edge],
+        gates: BTreeMap::from([("merge".to_string(), gate)]),
+        intake: Some(intake),
+        merge_queue: Some(merge_queue),
+        resources: BTreeMap::from([("build".to_string(), resource)]),
+    };
+    out.insert("workflow".to_string(), keys_of("workflow", &workflow));
+    out
+}
+
+/// What the engine says a field may CONTAIN — the other half of
+/// [`workflow_schema_keys`] (#880 review finding 1), keyed `"section.field"`.
+///
+/// Names alone were never the whole manifest: `src/workflow-schema.json` also
+/// carries each field's closed value set, its default and its bounds, and slice
+/// C generates form controls from exactly those. A wrong enum row today is a
+/// wrong `<select>` later — a `block.cli` picker with no option for "inherit the
+/// group's CLI" cannot represent the state most blocks are actually in — so
+/// these are pinned against the engine the same way the field names are.
+///
+/// **Derived wherever the engine has an accessor**: `SUPPORTED_CLIS`,
+/// [`kind_names`], [`role_hint_names`], [`intake_source_names`],
+/// [`builtin_intake_profile`], `MergeQueuePolicy::default()`,
+/// `ResourcePolicy::default()`, and the `RESOURCE_*` / `NOTIFY_EXPIRES_*` /
+/// `RESOURCES_MAX` constants. Wire defaults for the plain `#[serde(default)]`
+/// fields are derived too — by deserializing a minimal document and serializing
+/// it back, so serde states them rather than this function guessing.
+///
+/// **One set is hand-listed and it is named as such**: `gate.require`, whose
+/// accepted spellings exist only as match arms in [`parse_workflow`] (there is
+/// no accessor to ask). Adding an arm without adding it here leaves the manifest
+/// stale with nothing red — the one hole left in this pin, stated out loud
+/// rather than papered over.
+#[doc(hidden)]
+pub fn workflow_schema_field_facts() -> BTreeMap<String, serde_json::Value> {
+    use serde_json::{json, Value};
+
+    /// The values serde fills in for a field the document omits — asked of
+    /// serde, not typed out here. `null` (an absent `Option`) is not a default:
+    /// it means the key simply isn't there, which is a different statement from
+    /// "it defaults to nothing".
+    fn wire_defaults<T>(minimal: &str, required: &[&str]) -> Vec<(String, Value)>
+    where
+        T: Serialize + serde::de::DeserializeOwned,
+    {
+        let parsed: T = serde_json::from_str(minimal)
+            .unwrap_or_else(|e| panic!("the minimal document must deserialize: {e}"));
+        match serde_json::to_value(&parsed) {
+            Ok(Value::Object(map)) => map
+                .into_iter()
+                .filter(|(k, v)| !v.is_null() && !required.contains(&k.as_str()))
+                .collect(),
+            other => panic!("expected a mapping, got {other:?}"),
+        }
+    }
+
+    let names = |csv: String| -> Vec<String> { csv.split(", ").map(str::to_string).collect() };
+    let mut out: BTreeMap<String, Value> = BTreeMap::new();
+    let mut fact = |key: &str, k: &str, v: Value| {
+        let entry = out.entry(key.to_string()).or_insert_with(|| json!({}));
+        entry[k] = v;
+    };
+
+    for (section, defaults) in [
+        ("workflow", wire_defaults::<RawWorkflow>(r#"{"version":1}"#, &["version"])),
+        ("block", wire_defaults::<RawBlock>(r#"{"id":"b","kind":"worker"}"#, &["id", "kind"])),
+        ("gate", wire_defaults::<RawGate>("{}", &[])),
+        ("intake", wire_defaults::<RawIntake>("{}", &[])),
+        ("intake.labels", wire_defaults::<RawIntakeLabels>("{}", &[])),
+        ("merge_queue", wire_defaults::<RawMergeQueue>("{}", &[])),
+        ("resource", wire_defaults::<RawResource>("{}", &[])),
+    ] {
+        for (field, value) in defaults {
+            // A nested section's own default is the section, not a value a form
+            // ever renders — `intake.labels` is described by its own rows.
+            if value.is_object() || (value.is_array() && section == "workflow") {
+                continue;
+            }
+            fact(&format!("{section}.{field}"), "default", value);
+        }
+    }
+
+    // Closed value sets, from the accessors that already state them for error
+    // messages — so a fifth entry in SUPPORTED_CLIS reddens this rather than
+    // leaving the manifest quietly stale.
+    let mut cli_values = vec![String::new()]; // an empty `cli:` inherits the group's
+    cli_values.extend(SUPPORTED_CLIS.iter().map(|c| c.to_string()));
+    fact("block.cli", "values", json!(cli_values));
+    fact("block.kind", "values", json!(names(kind_names())));
+    fact("block.role_hint", "values", json!(names(role_hint_names())));
+    let mut sources = vec![String::new()]; // `intake_source_from_str`: "" is the default source
+    sources.extend(names(intake_source_names()));
+    fact("intake.source", "values", json!(sources));
+    // HAND-LISTED — see this function's docblock. Mirrors `parse_workflow`'s gate
+    // match arms (`Some("all-pass") | Some("all")` and `Some("threshold")`).
+    fact("gate.require", "values", json!(["all-pass", "all", "threshold"]));
+
+    // Effective defaults: what the engine BEHAVES as when the key is omitted,
+    // which is what a form shows as its placeholder. Distinct from the wire
+    // defaults above — `merge_queue.max_batch` is `None` on the wire and 3 in
+    // effect — and taken from the same `Default` impls the parse resolves against.
+    fact("workflow.version", "default", json!(SCHEMA_VERSION));
+    fact("gate.require", "default", json!("all-pass"));
+    let intake = builtin_intake_profile();
+    fact("intake.source", "default", json!(intake.source.as_str()));
+    fact("intake.labels.ready", "default", json!(intake.ready));
+    fact("intake.labels.investigate", "default", json!(intake.investigate));
+    fact("intake.labels.owned", "default", json!(intake.owned));
+    fact("intake.labels.prototype", "default", json!(intake.prototype));
+    let mq = MergeQueuePolicy::default();
+    fact("merge_queue.enabled", "default", json!(mq.enabled));
+    fact("merge_queue.max_batch", "default", json!(mq.max_batch));
+    fact("merge_queue.checks_timeout_minutes", "default", json!(mq.checks_timeout_minutes));
+    let res = ResourcePolicy::default();
+    fact("resource.slots", "default", json!(res.slots));
+    fact("resource.max_hold_minutes", "default", json!(res.max_hold_minutes));
+
+    // Bounds. `min` with no `max` is a floor the parse refuses below and nothing
+    // above; the refuse-vs-clamp half is pinned behaviorally by the test, because
+    // it is a fact about what `parse_workflow` DOES, not one this file can assert.
+    fact("gate.threshold", "min", json!(1));
+    fact("merge_queue.max_batch", "min", json!(1));
+    fact("merge_queue.checks_timeout_minutes", "min", json!(NOTIFY_EXPIRES_MIN));
+    fact("merge_queue.checks_timeout_minutes", "max", json!(NOTIFY_EXPIRES_MAX));
+    fact("resource.slots", "min", json!(1));
+    fact("resource.slots", "max", json!(RESOURCE_SLOTS_MAX));
+    fact("resource.max_hold_minutes", "min", json!(1));
+    fact("resource.max_hold_minutes", "max", json!(RESOURCE_MAX_HOLD_MINUTES_MAX));
+    // Cardinality: the only section with a cap on how many entries it may hold.
+    fact("workflow.resources", "max_entries", json!(RESOURCES_MAX));
+
+    out
 }
 
 /// Map a `kind:` string onto a capability class. **`None` for anything
