@@ -70,6 +70,9 @@ use loomux_lib::orchestration::{
     prompt_wait_match, question_hold_predicate_sampled, question_shown, grid_evidence_for,
     match_still_rendered, trustworthy_composition, witness_audit,
     GridEvidence, QuestionMatch, QuestionNeedle, QuestionSample, QuestionWitness, QuestionWitnessed,
+    // #903: the idle-composer reading, and the bounded last-resort override.
+    idle_prompt_rendered, idle_prompt_row_rendered, question_override_admits,
+    QUESTION_HOLD_OVERRIDE_AFTER,
     resume_kickoff_notice, rotate_audit_if_needed,
     ContractCarrier, ReinjectShape,
     agent_acted_since, reinject_disposition, ReinjectAck, ReinjectDisposition,
@@ -23163,6 +23166,38 @@ const FIX_POS_PTR_LAST: &str = include_str!("fixtures/attention/pos-pointer-last
 // question gate held for 25 minutes.
 const FIX_FP_RESUMED_IDLE: &str =
     include_str!("fixtures/attention/fp-resumed-agent-idle-prompt.txt");
+// #903, the two screens the issue reports: a resumed reviewer pane and the
+// ORCHESTRATOR's own pane, both idling at an empty input box, both with a
+// delivery queue behind "an interactive question is on screen" that never
+// released (25 min / 30+ min, three panes killed by hand).
+//
+// **Provenance, split, because the two halves are not equally sourced.** The
+// CHROME — separator, the bare `❯` box, separator, and the
+// `⏵⏵ auto mode on (shift+tab to cycle) · ← for agents` footer — is byte-verbatim
+// from `fp-resumed-agent-idle-prompt.txt`, itself a real `get_output` capture of
+// #727's wedged pane; #903's own comments quote that footer line as present on
+// both of its screens, which is what makes the same chrome the right chrome. The
+// replayed TURN TEXT is reconstructed: the issue records the footer, the empty
+// box and "no question anywhere on screen", not the body of the turn the resume
+// replayed. So each fixture asserts its own preconditions (which detector signal
+// fires, on which line, inside which window) rather than assuming them — the
+// discipline `copilot-composer-holds-our-paste.txt` documents for the same
+// reason.
+//
+// They are deliberately not variations on one shape:
+//
+//  - `fp-resumed-review-verdict-idle`: a rev-lead's replayed verdict, quoting the
+//    detector it is reviewing. It carries THREE would-be signals — `(y/n)`
+//    (structured tier), `yes/no` and `waiting for your` (#903 demoted both to the
+//    last-painted tier) — so it exercises the token re-tiering AND the grid
+//    reading, and shows why the re-tiering alone was never going to be enough.
+//  - `fp-orchestrator-relay-idle`: the orchestrator relaying a worker's blocked
+//    report, which quotes a permission phrase (`do you want to proceed`) that
+//    stays in the wide structured tier on purpose. Nothing but the composed
+//    screen can save this one.
+const FIX_FP_RESUMED_VERDICT: &str =
+    include_str!("fixtures/attention/fp-resumed-review-verdict-idle.txt");
+const FIX_FP_ORCH_RELAY: &str = include_str!("fixtures/attention/fp-orchestrator-relay-idle.txt");
 // #820: copilot 1.0.7x holding a loomux delivery that has been pasted into its
 // composer and not yet submitted — the pane a human photographed for the issue
 // ("the chip reads the question-gate wording and the screen holds only loomux's
@@ -41842,9 +41877,35 @@ fn c2_an_unreadable_grid_leaves_the_ring_the_authority() {
 #[test]
 fn c3_still_rendered_holds() {
     let m = prompt_wait_match("Overwrite the file? (y/n)").expect("matches");
-    let screen = "some output\nOverwrite the file? (y/n)\n> ";
+    // #903 changed this screen, and the reason is that the old one contradicted
+    // itself. It was `"some output\nOverwrite the file? (y/n)\n> "` — an inline
+    // yes/no prompt sitting ABOVE the CLI's own empty composer, which is not a
+    // shape any TUI paints: an inline prompt takes the cursor, it does not hand
+    // the box back. `c3b` below pins what that screen now answers and why.
+    // Here the prompt is the last thing painted, which is what a live one is.
+    let screen = "some output\nOverwrite the file? (y/n)";
     assert_eq!(grid_evidence_for(&m, Some(screen)), GridEvidence::StillRendered);
     assert!(question_shown(Some(&m), Some(screen)), "still displayed -> still holding");
+}
+
+#[test]
+fn c3b_still_rendered_loses_to_an_idle_composer_underneath_it() {
+    // #903, at the seam: the matched text IS still rendered, and the hold ends
+    // anyway. `StillRendered` was true and useless on the panes this issue was
+    // filed for — question-shaped text on a screen whose own bottom row said the
+    // CLI was waiting for free text, not for an answer.
+    let m = prompt_wait_match("Overwrite the file? (y/n)").expect("matches");
+    let screen = "some output\nOverwrite the file? (y/n)\n> ";
+    assert!(
+        match_still_rendered(screen, &m),
+        "precondition: the match really is on this screen — the release is NOT 'it went away'"
+    );
+    assert_eq!(
+        grid_evidence_for(&m, Some(screen)),
+        GridEvidence::IdlePrompt,
+        "an empty composer is positive evidence that nothing is being asked"
+    );
+    assert!(!question_shown(Some(&m), Some(screen)), "idle at an empty box -> release");
 }
 
 #[test]
@@ -41853,7 +41914,12 @@ fn c4_not_rendered_is_the_one_transition_this_change_adds() {
     // other question shape is on it. Before #534 no reading could reach this
     // conclusion at all — which is why the hold could only ever be badged.
     let m = prompt_wait_match("Overwrite the file? (y/n)").expect("matches");
-    let screen = "running step 11\nrunning step 12\n> ";
+    // No trailing `> ` row: #903's idle-composer reading is checked FIRST and
+    // would answer `IdlePrompt` here, which is a true statement about the screen
+    // but not the one this test is about. `c3b` covers that reading; this one
+    // still has to pin #534's own transition on a screen where it is the only
+    // reason to release.
+    let screen = "running step 11\nrunning step 12\nrunning step 13";
     assert_eq!(grid_evidence_for(&m, Some(screen)), GridEvidence::NotRendered);
     assert!(!question_shown(Some(&m), Some(screen)), "no longer rendered -> answered -> release");
 }
@@ -41987,7 +42053,11 @@ fn c10_a_pointer_menu_genuinely_gone_still_releases() {
     let m = prompt_wait_match(&redraw_fragmented_pointer_tail()).expect("matches on the ring");
     let answered = "npm test running\nall good\n\n> \nready";
     assert!(!match_still_rendered(answered, &m));
-    assert_eq!(grid_evidence_for(&m, Some(answered)), GridEvidence::NotRendered);
+    // #903: `> ` is an empty composer, so this screen now answers with the more
+    // specific of the two release readings. The behaviour under test — a pointer
+    // menu that is genuinely gone still releases — is `question_shown` below,
+    // and it is unchanged.
+    assert_eq!(grid_evidence_for(&m, Some(answered)), GridEvidence::IdlePrompt);
     assert!(!question_shown(Some(&m), Some(answered)), "answered and gone -> release");
 }
 
@@ -43372,7 +43442,11 @@ fn f4_a_pointer_hold_releases_once_the_menu_gives_way_to_an_idle_prompt() {
 
     assert_eq!(
         grid_evidence_for(&m, Some(&idle)),
-        GridEvidence::NotRendered,
+        // #903 refines the answer on this exact screen: the menu is not among
+        // the rendered rows AND the pane is visibly idle at an empty box, which
+        // is the more specific of the two release readings. #727's property —
+        // an empty prompt is not a stand-in for a menu — is the assertion below.
+        GridEvidence::IdlePrompt,
         "the menu is not among the rendered rows, and an empty prompt is not a stand-in for it"
     );
     assert!(
@@ -45594,5 +45668,280 @@ fn ending_a_group_releases_and_records_the_locks_its_agents_held() {
     assert!(
         reclaims.iter().any(|d| d["agent"] == json!(c2.agent_id)),
         "…and so must the queued request behind it: {reclaims:?}"
+    );
+}
+
+// ---------- #903: question-SHAPED text is not a question ----------
+//
+// The live incidents: three resumed reviewer panes (all resumes of one session,
+// deterministic on demand) and the ORCHESTRATOR's own pane, each with deliveries
+// parked behind "an interactive question is on screen" that never released — 25
+// minutes, then 30+ minutes and four deliveries, ending with panes killed by
+// hand. The human's report is the whole characterization: *"there were no
+// interactive questions asked that I could tell."*
+//
+// **What non-question content satisfies the predicate.** Everything the detector
+// keys on is TEXT, and half of it is ordinary English:
+//
+//  - the wide (12-line) tiers match `(y/n)`, `do you want to proceed`, `yes/no`,
+//    `waiting for your` anywhere in the last twelve painted lines — which is
+//    exactly where a finished turn's report sits;
+//  - the grid then *agrees*, because that text really is rendered. #534's
+//    release is `NotRendered`, and the text has not gone anywhere.
+//
+// A resumed pane makes it permanent, the same way #727 and #820 did: the
+// restored screen is static, so nothing ever repaints the prose away, and the
+// drainer's uncapped poll re-reads the identical screen every two seconds
+// forever. An agent whose job is reviewing THIS detector writes `(y/n)` into its
+// own verdict, which is why one session tripped it every single time.
+//
+// Three layers, each with its own tests below:
+//  h1/h2  the detector is quieter — prose-shaped permission phrases join the
+//         last-painted tier, and a rendered empty composer overrides
+//         `StillRendered`;
+//  h3/h4  neither narrowing touches a real dialog (the #518/#532 hostage class
+//         this gate exists for);
+//  h5-h7  the bounded last-resort override, for a false positive shaped in a way
+//         nobody has characterized yet.
+
+/// The composed screen of a #903 fixture, at the geometry #727's tests use.
+fn composed_903(fixture: &str) -> String {
+    trustworthy_composition(loomux_lib::orchestration::termgrid::render_visible(
+        fixture.as_bytes(),
+        100,
+        12,
+    ))
+    .expect("precondition: these screens compose to a readable grid")
+}
+
+#[test]
+fn h1_the_repro_screens_match_the_detector_and_release_anyway() {
+    for (name, fixture, signal) in [
+        ("resumed reviewer verdict", FIX_FP_RESUMED_VERDICT, "yes-no-token"),
+        ("orchestrator relay", FIX_FP_ORCH_RELAY, "permission-phrase"),
+    ] {
+        // Precondition 1 — this IS the false positive, not a screen that passes
+        // for some unrelated reason. The ring matches, and by a WIDE-tier signal
+        // that #903 deliberately did not demote, so the release below can only
+        // be the composed-screen reading.
+        let m = prompt_wait_match(&strip_ansi(fixture.as_bytes()))
+            .unwrap_or_else(|| panic!("{name}: precondition: the ring must still match"));
+        assert_eq!(m.signal, signal, "{name}: and by the signal the incident is about");
+
+        // Precondition 2 — the matched text is still ON the screen. #534's
+        // release cannot fire here; if it could, this fixture would be testing
+        // the wrong thing.
+        let visible = composed_903(fixture);
+        assert!(
+            match_still_rendered(&visible, &m),
+            "{name}: precondition: the match is genuinely rendered — the release is NOT \
+             'the dialog went away': {visible:?}"
+        );
+        assert!(
+            visible.contains("auto mode on"),
+            "{name}: precondition: this is a live screen, not an absent one"
+        );
+
+        // The fix: the pane's own bottom row says it is waiting for free text.
+        assert!(
+            idle_prompt_rendered(&visible),
+            "{name}: an empty composer is on screen and no menu selection is: {visible:?}"
+        );
+        assert_eq!(
+            grid_evidence_for(&m, Some(visible.as_str())),
+            GridEvidence::IdlePrompt,
+            "{name}: and that reading beats `StillRendered`"
+        );
+
+        // End to end, through the production predicate, on both readings taken
+        // from the one raw stream exactly as `question_sample` takes them.
+        let raw = fixture.as_bytes().to_vec();
+        let pred = question_hold_predicate_sampled(
+            move || sample_from_raw(&raw, 100, 12),
+            None,
+            None,
+            Vec::new(),
+        );
+        assert!(!pred(), "{name}: a pane idling at an empty box must take its delivery");
+    }
+}
+
+#[test]
+fn h2_permission_phrasings_that_are_sentences_are_read_only_from_the_last_lines() {
+    // The token half of the fix, isolated from the grid half. These three were
+    // in the WIDE tiers, whose justification has always been "these don't occur
+    // in ordinary prose" — and all three are ordinary prose.
+    let prose = "the reviewer asked for a yes/no confirmation before merging\n\
+                 and is waiting for your call on the shape\n\
+                 press enter to continue past the pager, then re-run it\n\
+                 build finished\n\
+                 all tests pass\n\
+                 > ";
+    assert!(
+        prompt_wait_match(prose).is_none(),
+        "a paragraph mentioning three permission phrasings, with the CLI's box redrawn \
+         underneath it, is a finished turn: {:?}",
+        prompt_wait_match(prose)
+    );
+
+    // ...and a LIVE one still fires, because a live one is the last thing
+    // painted. That is the same rule the pointer and the menu footer have used
+    // since #40, and the reason demoting costs nothing a real prompt needs.
+    for (name, token) in [
+        ("yes/no", "Continue? yes/no"),
+        ("waiting for your", "Waiting for your answer"),
+        ("press enter to continue", "Press Enter to continue"),
+    ] {
+        let live = format!("running the migration\nit touched 4 tables\n{token}");
+        let m = prompt_wait_match(&live)
+            .unwrap_or_else(|| panic!("{name}: a live prompt paints its phrase LAST"));
+        assert_eq!(
+            m.signal, "prose-permission-phrase",
+            "{name}: and reports itself as the tier it now belongs to"
+        );
+    }
+}
+
+#[test]
+fn h3_every_real_dialog_still_holds_and_none_of_them_reads_as_idle() {
+    // The fail-SAFE direction, and the floor #727/#820 set: the captured and
+    // reconstructed dialogs must be untouched by both narrowings. #518/#532 are
+    // what a regression here costs — a delivery pasted into a live dialog does
+    // not merge text, it SELECTS whatever is highlighted.
+    for (name, fixture) in [
+        ("claude-askuserquestion", FIX_CLAUDE_ASK),
+        ("copilot-question", FIX_COPILOT_ASK),
+        ("copilot-multichoice", FIX_COPILOT_MULTICHOICE),
+        ("claude-mcp-approval", FIX_CLAUDE_MCP_APPROVAL),
+        ("pointer-last", FIX_POS_PTR_LAST),
+    ] {
+        assert!(
+            prompt_wait_match(&strip_ansi(fixture.as_bytes())).is_some(),
+            "{name}: the token re-tiering must not lose a real dialog"
+        );
+        let visible = composed_903(fixture);
+        assert!(
+            !idle_prompt_rendered(&visible),
+            "{name}: a screen with a dialog on it must never read as an idle composer: \
+             {visible:?}"
+        );
+        let raw = fixture.as_bytes().to_vec();
+        let pred = question_hold_predicate_sampled(
+            move || sample_from_raw(&raw, 100, 12),
+            None,
+            None,
+            Vec::new(),
+        );
+        assert!(pred(), "{name}: a real dialog must still hold the delivery (#420)");
+    }
+}
+
+#[test]
+fn h4_an_empty_box_beside_a_live_menu_does_not_release_it() {
+    // The conjunct, and the reason it is a conjunct. `idle_prompt_row_rendered`
+    // alone says "an empty composer is on screen somewhere"; a CLI that painted
+    // a dialog ABOVE a live composer would satisfy it while a human was very
+    // much being asked something. Requiring that NO row anywhere holds a
+    // highlighted choice is what closes that, and it is the stated assumption
+    // this reading rests on.
+    let both = "❯ 1. Yes, allow once\n  2. No, and tell me why\n─────────\n❯\n─────────";
+    assert!(
+        idle_prompt_row_rendered(both),
+        "precondition: the weaker reading DOES fire here — that is the hazard"
+    );
+    assert!(
+        !idle_prompt_rendered(both),
+        "…and the highlighted choice is what stops it becoming a release"
+    );
+    let m = prompt_wait_match("❯ 1. Yes, allow once\n  2. No, and tell me why")
+        .expect("a numbered menu with a pointer is a question");
+    assert_eq!(grid_evidence_for(&m, Some(both)), GridEvidence::StillRendered);
+    assert!(question_shown(Some(&m), Some(both)), "a live menu holds, empty box or not");
+}
+
+#[test]
+fn h5_the_last_resort_override_needs_every_term_on_the_same_poll() {
+    let bound = QUESTION_HOLD_OVERRIDE_AFTER.as_millis() as u64;
+    let t0 = 5_000_000u64;
+    let overdue = t0 + bound;
+
+    // All four terms — question hold, an open episode, the bound elapsed, and a
+    // fresh idle streak — and only then.
+    assert!(
+        question_override_admits(WriteAdmission::HoldQuestion, Some(t0), overdue, bound, 2),
+        "held past the bound with the pane's own screen reading idle: deliver"
+    );
+
+    // #510's absolute is untouched: a box with a human's line in it is never
+    // overridden, at any age.
+    assert!(
+        !question_override_admits(WriteAdmission::HoldBoxOccupied, Some(t0), overdue, bound, 9),
+        "a box-occupied hold is a person's half-typed line — never overridden"
+    );
+    assert!(
+        !question_override_admits(WriteAdmission::Go, Some(t0), overdue, bound, 9),
+        "nothing to override when the gates are already clear"
+    );
+
+    // One fresh read is not enough: this reading licenses a WRITE, and a single
+    // composition can catch a mid-redraw instant.
+    assert!(
+        !question_override_admits(WriteAdmission::HoldQuestion, Some(t0), overdue, bound, 1),
+        "one idle read is not a streak"
+    );
+    // Not yet overdue.
+    assert!(
+        !question_override_admits(WriteAdmission::HoldQuestion, Some(t0), overdue - 1, bound, 2),
+        "one millisecond short of the bound is still inside it"
+    );
+    // No open hold episode: nothing has been measured, so nothing is overdue.
+    assert!(
+        !question_override_admits(WriteAdmission::HoldQuestion, None, overdue, bound, 2),
+        "no episode, no clock, no override"
+    );
+    // The escape hatch's own escape hatch: a mis-set constant degrades to
+    // today's holding, never to delivering into every dialog on screen.
+    assert!(
+        !question_override_admits(WriteAdmission::HoldQuestion, Some(t0), overdue, 0, 9),
+        "bound 0 disables the override, the same convention every bound here uses"
+    );
+}
+
+#[test]
+fn h6_the_override_bound_sits_between_the_badge_and_the_still_queued_notice() {
+    // Not a restatement of the constant — an ORDERING, and the argument for the
+    // number. A human must be badged before loomux acts on their behalf, and the
+    // queue must move before the generic "still queued" notice is the first
+    // anyone hears of it. #903's incidents ran 25 and 30+ minutes, so the bound
+    // has to land inside a human's patience rather than merely inside infinity.
+    assert!(
+        QUESTION_HOLD_OVERRIDE_AFTER > QUESTION_HOLD_STALE_AFTER,
+        "the human is badged (and given time to look) before the override fires"
+    );
+    assert!(
+        QUESTION_HOLD_OVERRIDE_AFTER < queue::QUEUE_STILL_QUEUED_NOTICE_AFTER,
+        "…and the queue moves before the 'still queued' notice would report it stuck"
+    );
+}
+
+#[test]
+fn h7_an_unreadable_screen_still_holds_and_that_is_the_stated_limit() {
+    // The one class neither layer covers, pinned so it is a known limit rather
+    // than a surprise. With no trustworthy composition there is no idleness to
+    // observe: the ring's word stands, the veto cannot fire, and the override
+    // has nothing to count a streak of. Releasing on no evidence at all is
+    // precisely what this guard must never do — see the design note's limits.
+    let m = prompt_wait_match("Do you want to proceed? (y/n)").expect("matches");
+    assert!(question_shown(Some(&m), None), "no evidence either way -> the ring's word stands");
+    assert_eq!(grid_evidence_for(&m, None), GridEvidence::Unreadable);
+    assert!(
+        !question_override_admits(
+            WriteAdmission::HoldQuestion,
+            Some(0),
+            QUESTION_HOLD_OVERRIDE_AFTER.as_millis() as u64 * 10,
+            QUESTION_HOLD_OVERRIDE_AFTER.as_millis() as u64,
+            0,
+        ),
+        "an unreadable screen never produces an idle streak, however long the hold runs"
     );
 }

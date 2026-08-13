@@ -1,0 +1,12 @@
+● Verdict: request_changes on PR #895 (2 blocking, 1 non-blocking).
+
+  Finding 1 (blocking): the delivery gate reads any line carrying (y/n) as a
+  live prompt, so a review that merely quotes a yes/no confirmation is enough
+  to hold the queue. Waiting for your call on which layer to fix.
+
+✻ Crunched for 21s
+
+────────────────────── loomux-loomux-68435179-worker-deep ──
+[38;5;153m❯[0m
+─────────────────────────────────────────────────────────────
+  [2m⏵⏵ auto mode on (shift+tab to cycle) · ← for agents[0m
