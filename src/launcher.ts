@@ -57,6 +57,7 @@ import {
   sshMintsSessionId,
   sshRemoteCliWarning,
   sshRemoteCwdWarning,
+  SSH_NO_CLIENT,
 } from "./panesetup";
 import {
   decodeSshProfiles,
@@ -215,13 +216,6 @@ function textInput(placeholder: string): HTMLInputElement {
 /** The SSH picker's "not a saved connection yet" option value. A sentinel rather
  *  than the empty string so it can never collide with a profile id. */
 const SSH_NEW = "__new";
-
-/** Shown (and refused with) when no OpenSSH client can be found. Names the two
- *  places loomux looked, so the human can fix it rather than wonder: PATH is the
- *  one they control, and the inbox install is the one Windows ships. */
-const SSH_NO_CLIENT =
-  "No ssh client found — loomux looked on PATH and in the Windows OpenSSH install " +
-  "(System32\\OpenSSH). Install the OpenSSH Client optional feature, or put ssh.exe on PATH.";
 
 /** The number in an optional numeric field, or null when it is blank.
  *

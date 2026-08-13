@@ -52,7 +52,12 @@ import {
   MIN_SSH_PORT,
   type SshProfile,
 } from "./sshprofile.ts";
-import { buildSshArgv, claudeSessionArgs, type SshCommandParams } from "./sshcommand.ts";
+import {
+  buildSshArgv,
+  claudeSessionArgs,
+  sshResumeArgv,
+  type SshCommandParams,
+} from "./sshcommand.ts";
 
 export type PaneKind =
   | "agent"
@@ -503,6 +508,96 @@ export function sshLaunchParams(profile: SshProfile, sessionId: string | null): 
  *  (the remote folder, usually), not a bug. */
 export function sshLaunchArgv(program: string, profile: SshProfile, sessionId: string | null): string[] {
   return buildSshArgv(program, sshLaunchParams(profile, sessionId));
+}
+
+/** Shown (and refused with) when no OpenSSH client can be found. Names the two
+ *  places loomux looked and the feature that installs one, so the human can act
+ *  on it instead of just being told no.
+ *
+ *  Lives here rather than in launcher.ts because it now has TWO surfaces (#887
+ *  S4): the launch form and a restored pane's Reconnect card, which is not a
+ *  form at all. One message, in the module the other SSH refusals already live
+ *  in — a second copy in main.ts is how the two would come to say different
+ *  things about the same failure. */
+export const SSH_NO_CLIENT =
+  "No ssh client found — loomux looked on PATH and in the Windows OpenSSH install " +
+  "(System32\\OpenSSH). Install the OpenSSH Client optional feature, or put ssh.exe on PATH.";
+
+/** Shown on a restored SSH pane whose saved connection is no longer in the store
+ *  (#887 S4) — deleted since, or lost when a corrupt `sshprofiles.json` was
+ *  quarantined. Deliberately offers no fallback: the pane records the CONNECTION,
+ *  not a command line (see `PersistedPane.sshProfileId`), so there is nothing left
+ *  to reconnect WITH, and inventing a connection out of a stale command line is
+ *  how a pane would silently connect somewhere the human removed on purpose. */
+export const SSH_PROFILE_GONE =
+  "This pane's saved SSH connection no longer exists — it was removed, or the connections " +
+  "file was reset. Open a new SSH pane to connect again.";
+
+/** What one Reconnect click launches: the argv to spawn, and the session id the
+ *  pane should record for NEXT time (which is the recorded one on a resume, a
+ *  freshly minted one on a fresh claude connect, and null when the remote CLI
+ *  has no command-line identity at all). */
+export interface SshReconnect {
+  argv: string[];
+  sessionId: string | null;
+  /** Whether this reconnect resumes the recorded remote session or starts a new
+   *  one. The caller says which in the UI — "reconnected" and "reconnected, but
+   *  your previous conversation is not the one on screen" are different facts. */
+  mode: "resume" | "fresh";
+}
+
+/** Rebuild an SSH pane's launch from its SAVED PROFILE for a reconnect (#887 S4)
+ *  — the dormant restore card and the post-disconnect exit card both call this,
+ *  so the two can never drift into reconnecting differently.
+ *
+ *  The profile is re-read from the store at click time and everything is
+ *  re-derived from it. That is the point rather than an implementation detail: a
+ *  connection the human edited between boots (a new port, a different remote
+ *  folder) reconnects with the edit, exactly as S1's `SshProfile.id` contract
+ *  promises. Nothing here replays a captured command line.
+ *
+ *  Resume vs fresh is decided by the profile as it is NOW, not by the record:
+ *
+ *   - The recorded id is resumed only when this profile still launches a CLI
+ *     loomux mints ids for (`sshMintsSessionId`, i.e. claude). A profile switched
+ *     to copilot since, or to a plain login shell, must NOT be handed a claude
+ *     session id — copilot would reject the unknown flag and a login shell has
+ *     nowhere to put it, and in both cases the id names a conversation on the far
+ *     host that the new CLI cannot read anyway.
+ *   - With no recorded id (a remote copilot/opencode pane, a login shell, or a
+ *     claude pane whose id was never captured) it is a plain fresh connect. For a
+ *     claude profile that means minting a NEW id — so the reconnected session is
+ *     itself resumable next boot, the same way `agentFreshCommand` keeps a local
+ *     restore resumable.
+ *
+ *  `mintSessionId` is injected rather than called from here: minting is Web Crypto
+ *  (`crypto.randomUUID`, the webview's — never a getrandom crate; CLAUDE.md
+ *  constraint 2 governs the Rust graph), and taking it as a parameter is what
+ *  keeps this module pure and its fresh/resume split unit-testable.
+ *
+ *  Throws only what `buildSshArgv` throws (a remote-command token cmd.exe cannot
+ *  be handed safely — a newline, a trailing backslash), which the card surfaces
+ *  as its error state, the same way the launch form does. */
+export function sshReconnectArgv(
+  program: string,
+  profile: SshProfile,
+  recordedSessionId: string | null,
+  mintSessionId: () => string
+): SshReconnect {
+  const mints = sshMintsSessionId(profile.defaultCli);
+  if (mints && recordedSessionId) {
+    // `sshLaunchParams` composes the FRESH shape (`--session-id <id>`) and
+    // `sshResumeArgv` rewrites that one remote command into its resume shape
+    // (`--resume <id>`) — S2's own once-implemented rewrite, rather than a second
+    // "compose it in resume form" path here that would need its own coverage.
+    return {
+      argv: sshResumeArgv(program, sshLaunchParams(profile, recordedSessionId), recordedSessionId),
+      sessionId: recordedSessionId,
+      mode: "resume",
+    };
+  }
+  const sessionId = mints ? mintSessionId() : null;
+  return { argv: sshLaunchArgv(program, profile, sessionId), sessionId, mode: "fresh" };
 }
 
 /** One side's view of what a pane is about to be: the options a spawn was handed,

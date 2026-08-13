@@ -198,8 +198,9 @@ export type KeepOpenReason =
  *  Two independent reasons, composed here rather than in the pane, so the composition is
  *  testable and so the second one cannot be forgotten by the next path that reaps a pane:
  *
- *   - `output` (the original rule): a COMMAND pane that died unexpectedly stays open so
- *     the human can read the crash. A clean exit, or a loomux-initiated kill, closes.
+ *   - `output` (the original rule): a COMMAND pane — or, since #887 S4, an SSH pane —
+ *     that died unexpectedly stays open so the human can read the crash. A clean exit,
+ *     or a loomux-initiated kill, closes.
  *   - `unsaved` (#219): the pane holds a dirty Alt+F buffer. The process is already gone,
  *     so keeping the pane costs nothing — while disposing it costs the human their edits,
  *     with no prompt, on a path they never invoked. Every AUTOMATIC teardown (a PTY
@@ -211,10 +212,25 @@ export type KeepOpenReason =
 export function keepOpenOnExit(state: {
   /** True for agent/command panes (vs plain shells) — the original rule's gate. */
   launchedCommand: boolean;
+  /** True for an SSH pane (#887 S4), which widens the `output` gate above.
+   *
+   *  It has to, because that gate reads `launchedCommand`, which is set from a
+   *  spawn's `command` STRING — and an SSH pane is spawned through the argv path
+   *  (`buildSshArgv` produces an argv, deliberately: no shell, no quoting layer),
+   *  so it arrives here looking exactly like a plain shell. Without this, the one
+   *  failure the feature exists to handle — the link drops, ssh exits 255 — would
+   *  silently CLOSE the pane: the human loses the scrollback that says why, and
+   *  the Reconnect affordance that the exit is supposed to offer never mounts.
+   *
+   *  Same rule, not a laxer one: an EXPECTED exit (loomux killed it) and a clean
+   *  exit 0 (the human typed `exit` on the far end, or the remote CLI finished)
+   *  still close the pane, because those are not disconnections. */
+  isSshPane?: boolean;
   exit: ExitInfo;
   hasUnsavedWork: boolean;
 }): KeepOpenReason | null {
-  const crashed = state.launchedCommand && !state.exit.expected && state.exit.exit_code !== 0;
+  const crashed =
+    (state.launchedCommand || !!state.isSshPane) && !state.exit.expected && state.exit.exit_code !== 0;
   if (crashed) return "output";
   if (state.hasUnsavedWork) return "unsaved";
   return null;

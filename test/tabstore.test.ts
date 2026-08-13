@@ -93,6 +93,7 @@ test("docked panes round-trip (captured outside the layout tree, #194 P4)", () =
             role: null,
             groupId: null,
             file: null,
+            sshProfileId: null,
             embeds: [],
           },
         ],
@@ -212,6 +213,7 @@ const NESTED_LAYOUT: PersistedLayoutNode = {
         role: null,
         groupId: null,
         file: null,
+        sshProfileId: null,
         embeds: [],
       },
     },
@@ -234,6 +236,7 @@ const NESTED_LAYOUT: PersistedLayoutNode = {
             role: null,
             groupId: null,
             file: null,
+            sshProfileId: null,
             embeds: [],
           },
         },
@@ -251,6 +254,7 @@ const NESTED_LAYOUT: PersistedLayoutNode = {
             role: "orchestrator",
             groupId: null,
             file: null,
+            sshProfileId: null,
             embeds: [],
           },
         },
@@ -270,6 +274,7 @@ const NESTED_LAYOUT: PersistedLayoutNode = {
             role: null,
             groupId: null,
             file: null,
+            sshProfileId: null,
             embeds: [],
           },
         },
@@ -302,6 +307,7 @@ test("a files leaf round-trips its root — and needed NO new field or schema bu
     role: null,
     groupId: null,
     file: null,
+    sshProfileId: null,
     embeds: [],
   };
   const state: PersistedTabs = {
@@ -372,6 +378,7 @@ test("editor and git leaves round-trip their root — and the editor's open FILE
     role: null,
     groupId: null,
     file,
+    sshProfileId: null,
     embeds: [],
   });
   const state: PersistedTabs = {
@@ -508,6 +515,7 @@ test("malformed pane fields inside a valid leaf coerce to null, not a drop", () 
       role: null,
       groupId: null,
       file: null,
+      sshProfileId: null,
       embeds: [],
     },
   });
@@ -527,6 +535,7 @@ test("embed preferences ({view, side, share}), one per docked edge, round-trip t
     role: "orchestrator",
     groupId: null,
     file: null,
+    sshProfileId: null,
     embeds: [
       { view: "group", side: "bottom", share: 0.42 },
       { view: "tasks", side: "left", share: 0.3 },
@@ -559,6 +568,7 @@ test("git and editor are valid embed views too (#361 scope increase), round-trip
     role: "orchestrator",
     groupId: null,
     file: null,
+    sshProfileId: null,
     embeds: [
       { view: "git", side: "left", share: 0.35 },
       { view: "editor", side: "right", share: 0.4 },
@@ -591,6 +601,7 @@ test("the progress timeline (#608) is a valid embed view and round-trips like an
     role: "orchestrator",
     groupId: null,
     file: null,
+    sshProfileId: null,
     embeds: [{ view: "timeline", side: "bottom", share: 0.45 }],
   };
   const state: PersistedTabs = {
@@ -847,4 +858,109 @@ test("restorePref and schemaVersion coerce unknown values to safe defaults", () 
   assert.equal(mk({ restorePref: 7 })?.restorePref, "ask", "non-string pref → ask");
   assert.equal(mk({ schemaVersion: 2 })?.schemaVersion, 2, "valid version kept");
   assert.equal(mk({ schemaVersion: "two" })?.schemaVersion, 1, "non-number version → 1");
+});
+
+// ---------- #887 S4: SSH pane leaves ----------
+
+test("an ssh leaf round-trips its connection + recorded session, and carries NO command line", () => {
+  // The whole restore record for an SSH pane: which saved connection it belongs
+  // to, and the remote session id (claude only) a Reconnect can resume. The
+  // command line is deliberately absent — reconnect re-derives it from the
+  // profile, so a connection edited between boots reconnects with the edit and a
+  // recorded `--session-id` is never replayed into the session it already made.
+  const ssh: PersistedPane = {
+    paneKind: "ssh",
+    name: "build box",
+    cwd: null,
+    command: null,
+    argv: null,
+    shellKind: null,
+    sessionId: "remote-sess-1",
+    role: null,
+    groupId: null,
+    file: null,
+    sshProfileId: "prof-7",
+    embeds: [],
+  };
+  const state: PersistedTabs = {
+    tabs: [
+      { name: "t", color: null, groupId: null, layout: { kind: "leaf", weight: 1, pane: ssh } },
+    ],
+    activeIndex: 0,
+  };
+  const back = decodeTabs(encodeTabs(state));
+  const leaf = back?.tabs[0].layout;
+  assert.ok(leaf?.kind === "leaf", "the ssh leaf survives — an unknown kind would collapse the tab's layout");
+  assert.deepEqual(leaf.pane, ssh);
+  // Additive and shape-driven, exactly like the content kinds before it: a v2
+  // file that predates SSH panes simply never carries one, so the version does
+  // not move.
+  assert.equal(back?.schemaVersion, SCHEMA_VERSION);
+});
+
+test("an ssh leaf with no recorded profile decodes to null rather than failing its tab", () => {
+  // A hand-edited (or pre-S4) record naming no connection. Failing the ENTRY here
+  // would take the whole tab's layout down with it (decodeLayout's whole-tree
+  // fail-safe) — losing every other pane in the tab over one unreconnectable
+  // card. It decodes, and restore renders a card that says it has nothing to
+  // reconnect to.
+  const raw = JSON.stringify({
+    tabs: [
+      {
+        name: "t",
+        color: null,
+        groupId: null,
+        layout: { kind: "leaf", weight: 1, pane: { paneKind: "ssh", name: "box" } },
+      },
+    ],
+    activeIndex: 0,
+  });
+  const leaf = decodeTabs(raw)?.tabs[0].layout;
+  assert.ok(leaf?.kind === "leaf");
+  assert.equal(leaf.pane.paneKind, "ssh");
+  assert.equal(leaf.pane.sshProfileId, null);
+});
+
+test("a blank sshProfileId reads as absent, never as an id that matches no profile", () => {
+  // Same reason `groupId` treats blank as absent: the value is looked up in a
+  // store, and "" is not a lookup — it is a miss wearing the shape of a hit.
+  const raw = JSON.stringify({
+    tabs: [
+      {
+        name: "t",
+        color: null,
+        groupId: null,
+        layout: {
+          kind: "leaf",
+          weight: 1,
+          pane: { paneKind: "ssh", name: "box", sshProfileId: "   " },
+        },
+      },
+    ],
+    activeIndex: 0,
+  });
+  const leaf = decodeTabs(raw)?.tabs[0].layout;
+  assert.ok(leaf?.kind === "leaf");
+  assert.equal(leaf.pane.sshProfileId, null);
+});
+
+test("sshProfileId is null on every non-ssh leaf (nothing else grew a connection)", () => {
+  const raw = JSON.stringify({
+    tabs: [
+      {
+        name: "t",
+        color: null,
+        groupId: null,
+        layout: {
+          kind: "leaf",
+          weight: 1,
+          pane: { paneKind: "terminal", name: "shell", shellKind: "cmd" },
+        },
+      },
+    ],
+    activeIndex: 0,
+  });
+  const leaf = decodeTabs(raw)?.tabs[0].layout;
+  assert.ok(leaf?.kind === "leaf");
+  assert.equal(leaf.pane.sshProfileId, null);
 });

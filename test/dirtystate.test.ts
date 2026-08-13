@@ -182,6 +182,37 @@ test("keepOpenOnExit: a crashed command pane stays to show its output (the origi
   assert.equal(keepOpenOnExit({ launchedCommand: false, exit: exited(1), hasUnsavedWork: false }), null);
 });
 
+test("keepOpenOnExit: a DISCONNECTED ssh pane stays open (#887 S4)", () => {
+  // An SSH pane spawns through the argv path (buildSshArgv produces an argv — no
+  // shell, no quoting layer), so `launchedCommand` is false for it and the
+  // original rule would have CLOSED the pane the moment the link dropped: the
+  // human loses the scrollback saying why, and the Reconnect affordance that
+  // exit is supposed to offer never gets mounted. ssh exits 255 on a dropped
+  // connection.
+  assert.equal(
+    keepOpenOnExit({ launchedCommand: false, isSshPane: true, exit: exited(255), hasUnsavedWork: false }),
+    "output"
+  );
+  // Same rule as a command pane, not a laxer one: a clean logout on the far end
+  // (exit 0) and a loomux-initiated kill still close the pane — neither is a
+  // disconnection, and a card offering to reconnect to a session the human just
+  // ended would be noise.
+  assert.equal(
+    keepOpenOnExit({ launchedCommand: false, isSshPane: true, exit: exited(0), hasUnsavedWork: false }),
+    null
+  );
+  assert.equal(
+    keepOpenOnExit({ launchedCommand: false, isSshPane: true, exit: exited(255, true), hasUnsavedWork: false }),
+    null
+  );
+  // And the flag widens nothing for a pane that isn't one: an ordinary shell
+  // dying non-zero still closes, exactly as before.
+  assert.equal(
+    keepOpenOnExit({ launchedCommand: false, isSshPane: false, exit: exited(255), hasUnsavedWork: false }),
+    null
+  );
+});
+
 test("keepOpenOnExit: an UNSAVED buffer keeps the pane, however the process died", () => {
   // The point of #219: no automatic teardown may destroy work the human never agreed to
   // lose. A clean exit, an expected kill (a group ending kills its agents), a plain shell

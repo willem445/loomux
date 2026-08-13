@@ -17,6 +17,7 @@ import {
   sshLaunchParams,
   sshMintsSessionId,
   sshOrchestrationRefusal,
+  sshReconnectArgv,
   sshRemoteCliWarning,
   sshRemoteCwdWarning,
   type PaneSetupInput,
@@ -717,4 +718,118 @@ test("SubmitLatch is one-shot once a submit finishes", () => {
   assert.equal(latch.begin(), false); // a late re-entry must never fire again
   latch.release(); // even an errant release can't reopen a finished latch
   assert.equal(latch.begin(), false);
+});
+
+// --- #887 S4: the reconnect a restored (or disconnected) SSH pane replays ---
+
+/** A mint that is obviously a mint — so a test can tell "loomux minted a new
+ *  remote session" from "loomux resumed the recorded one" by reading the argv. */
+const MINT = () => "minted-id";
+
+test("a recorded claude session reconnects in RESUME form, never a second --session-id", () => {
+  // The whole point of recording the id: the remote conversation comes back
+  // instead of a fresh one starting beside it. `--session-id` CREATES a session,
+  // so replaying it against one the earlier run already made is an error, not a
+  // reconnect — the rewrite is what keeps that from being the reconnect path.
+  const { argv, sessionId, mode } = sshReconnectArgv(
+    "C:/Windows/System32/OpenSSH/ssh.exe",
+    sshProfile({ defaultCli: "claude", remoteCwd: "/srv/app" }),
+    "remote-sess-1",
+    MINT
+  );
+  assert.equal(mode, "resume");
+  assert.equal(sessionId, "remote-sess-1", "the pane keeps the SAME identity across a reconnect");
+  const remote = argv[argv.length - 1];
+  assert.match(remote, /'claude' '--resume' 'remote-sess-1'/, `resume form expected, got: ${remote}`);
+  assert.ok(!remote.includes("--session-id"), `no create flag may survive: ${remote}`);
+  assert.ok(!remote.includes("minted-id"), "a recorded session is resumed, not replaced by a fresh mint");
+  // …and it is still a full, ordinary ssh command line: the connection's own
+  // settings are re-derived from the profile, not carried over from anywhere.
+  assert.match(remote, /cd '\/srv\/app'/);
+});
+
+test("no recorded session on a claude profile MINTS one, so the reconnect is resumable next time", () => {
+  // The parallel of `agentFreshCommand`'s local rule: a fresh start still gets an
+  // identity, or the pane would be unresumable forever after one lost id.
+  const { argv, sessionId, mode } = sshReconnectArgv(
+    "ssh",
+    sshProfile({ defaultCli: "claude" }),
+    null,
+    MINT
+  );
+  assert.equal(mode, "fresh");
+  assert.equal(sessionId, "minted-id");
+  const remote = argv[argv.length - 1];
+  assert.match(remote, /'claude' '--session-id' 'minted-id'/, `fresh form expected, got: ${remote}`);
+  assert.ok(!remote.includes("--resume"), `nothing to resume: ${remote}`);
+});
+
+test("a profile edited to a NON-minting CLI never receives the recorded claude id", () => {
+  // The profile as it is NOW decides, not the record. A session id minted for
+  // claude is meaningless to copilot — it names a conversation on the far host
+  // that copilot cannot read — and `--session-id` is not even a flag it would
+  // accept, so the pane would die on its first line.
+  const { argv, sessionId, mode } = sshReconnectArgv(
+    "ssh",
+    sshProfile({ defaultCli: "copilot" }),
+    "remote-sess-1",
+    MINT
+  );
+  assert.equal(mode, "fresh");
+  assert.equal(sessionId, null, "no id is recorded for a CLI whose identity loomux cannot mint");
+  const remote = argv[argv.length - 1];
+  assert.ok(!remote.includes("remote-sess-1"), `the stale id must not reach copilot: ${remote}`);
+  assert.ok(!remote.includes("--session-id") && !remote.includes("--resume"), remote);
+  assert.match(remote, /exec 'copilot'/);
+});
+
+test("a profile edited down to a plain login shell reconnects as a login shell", () => {
+  // No remote command at all — so no `-t`, no `--`, and certainly no session
+  // flag. The recorded id is simply not applicable any more, and inventing a
+  // remote command to hang it on would be the guess `remoteShell` exists to
+  // refuse.
+  const { argv, sessionId, mode } = sshReconnectArgv("ssh", sshProfile({ defaultCli: null }), "remote-sess-1", MINT);
+  assert.equal(mode, "fresh");
+  assert.equal(sessionId, null);
+  assert.deepEqual(argv, ["ssh", "dev@build.example.net"]);
+});
+
+test("a reconnect re-derives every connection setting from the profile AS IT IS NOW", () => {
+  // S1's `SshProfile.id` contract, made observable: a pane records the
+  // connection, not its contents, so an edit between boots is what reconnects.
+  // A captured argv could never do this — it would still be dialling last week's
+  // port.
+  const { argv } = sshReconnectArgv(
+    "ssh",
+    sshProfile({ defaultCli: "claude", port: 2222, identityFile: "C:/keys/id_ed25519", keepaliveSeconds: 30 }),
+    "remote-sess-1",
+    MINT
+  );
+  assert.deepEqual(argv.slice(0, 9), [
+    "ssh",
+    "-t",
+    "-p",
+    "2222",
+    "-i",
+    "C:/keys/id_ed25519",
+    "-o",
+    "ServerAliveInterval=30",
+    "dev@build.example.net",
+  ]);
+});
+
+test("the reconnect surfaces a cmd.exe-unquotable value as a throw, exactly as a fresh launch does", () => {
+  // Same refusal, same place (sshcommand.ts), so a reconnect can never be the
+  // path that silently ships a truncated `/C` command line the launch form would
+  // have refused.
+  assert.throws(
+    () =>
+      sshReconnectArgv(
+        "ssh",
+        sshProfile({ defaultCli: "claude", remoteShell: "cmd", remoteCwd: "C:\srv\nrm -rf" }),
+        null,
+        MINT
+      ),
+    /newline/
+  );
 });
