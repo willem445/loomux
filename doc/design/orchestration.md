@@ -11664,6 +11664,187 @@ the press by `drain_stranded_submit`, against the pane as it is then. Nothing is
 inference, and nothing about *when* loomux presses Enter changes — which is what keeps the whole
 of #825 outside #813's blast radius.
 
+## Promoting a standalone pane to orchestrator (#407, backend)
+
+A prototype conversation is the most expensive thing in a loomux session and the only one that
+cannot be recreated. The gesture this exists for is the moment a proof-of-concept turns into
+work worth orchestrating: the human has spent an hour in a plain agent pane, and wants *that
+session* — its context, its false starts, its decisions — to become the orchestrator, rather
+than hand-transferring a summary into a fresh one over a channel. A summary is not the session.
+
+So promotion is a **relaunch of the same CLI session with a different contract**, not a new
+session told about an old one. Everything a launched orchestrator gets, a promoted one gets:
+the backend-composed command (MCP config, `--strict-mcp-config`, permission posture, `--add-dir
+<group dir>`, the hook `--settings`), the gh/git shim on `PATH`, `LOOMUX_GROUP_DIR`, a real
+group on disk with its board, audit log and instruction files — and `--resume <its own session
+id>` where a launch would carry a freshly minted one. The relaunch is what grants capability;
+that is why pasting the orchestrator contract into the running session was never an option (it
+would have no MCP tools, no shim, no permission posture — just text telling it that it does).
+
+On the CLI facts this rests on: the Claude Code
+[CLI reference](https://code.claude.com/docs/en/cli-reference) documents `--resume` as "Resume a
+specific session by ID or name… When you pass a session ID, Claude Code searches the current
+project directory and its git worktrees, then every other project on this machine" (before
+v2.1.223, "the ID search covered only the current project directory and its git worktrees") —
+which is why a pane launched into a worktree keys its group to *that* path rather than being
+silently resolved to the main clone, and why `--session-id` ("Use a specific session ID for the
+conversation") is the alternative to `--resume`, never a companion to it. The reference is
+**silent** on whether `--resume` composes with `--mcp-config`, `--strict-mcp-config`,
+`--settings`, `--add-dir` or `--permission-mode`: no row forbids it and no row permits it. That
+gap is closed by loomux's own production behavior rather than by inference — `resume_recorded_
+session` has composed exactly this flag set with `--resume` since #412, and delegate re-roling
+on resume (#254/#544) is the standing proof that a resumed claude session picks up the *new*
+role flags rather than its old ones. Promotion is that mechanism pointed at a session that was
+never a delegate, not a new claim about the CLI.
+
+### `SessionOrigin`: four starts, not a bool
+
+The backend used to thread a `(Launch, Option<String>)` pair from `create_orchestration_group`
+into `register_orchestrator_pane`. The pair had four inhabited combinations and read like it
+had two, because the session id's mere *presence* was overloaded to answer three separate
+questions: which session flag the CLI gets, whether a session watcher must be started, and
+which kickoff is typed. #412 had already been bitten by this once — its cold restart of an
+existing group's orchestrator is `(Launch::Resume, None)`, and a caller that read "no session
+id" as "fresh launch" re-read `.loomux/workflow.yml` and silently swapped a roster its human
+had approved.
+
+`SessionOrigin` names all four and decomposes the decisions:
+
+| | `Fresh` | `Resume` | `StartFresh` | `Promote` |
+|---|---|---|---|---|
+| group semantics | fresh launch | pinned roster | pinned roster | fresh, or pinned on reattach |
+| session flag | `--session-id <minted>` | `--resume <id>` | `--session-id <minted>` | `--resume <id>` |
+| kickoff | full contract | ledger notice | full contract | full contract + preamble |
+| session watcher | per CLI | none (id known) | per CLI | none (id known) |
+
+`StartFresh` is not new behavior; naming it is the point. `Promote` is the row the pair could
+not spell at all — the "session flag" and "kickoff" columns disagree, and one bool cannot hold
+two answers. `Launch` keeps the group-level question it always answered, and
+`SessionOrigin::launch()` is the only place the two layers meet.
+
+Fresh and Resume behavior is unchanged, deliberately and byte for byte: their arms are the same
+expressions, and the pins that already existed — `create_orchestration_group_maps_resume_
+session_onto_the_workflow_pin`, `start_fresh_on_an_orchestrator_does_not_re_read_the_workflow_
+file`, `orchestrator_session_restores_full_group_with_fresh_mcp_identity` — are the witness. A
+promoted pane's kickoff is asserted as *the ordinary kickoff with a preamble in front*, so
+anything dropped from the contract for a promoted session fails a test rather than shipping.
+
+### Why a resumed session gets the **fresh** kickoff
+
+Every other resume in loomux types a short re-sync notice: an orchestrator being reopened has
+the whole contract in its own transcript, so re-typing it would be noise, and #411's directive
+ledger fills the one real gap (what the human said that the restart interrupted).
+
+A promoted session has never seen that contract in its life. Its transcript is a prototype
+conversation with no orchestrator role, no roster, no guardrails, no delivery-id discipline —
+so `Delivery::FreshKickoff` and the full body are not an inconsistency with the resume path,
+they are the only correct reading of it: **the kickoff answers "has this session been told what
+it is", and the session flag answers "does this conversation already exist".** Those had been
+the same question only because no start had ever answered them differently.
+
+The preamble is the one addition, and it does the work no generic contract can: it says the
+conversation above is still the agent's own and is why it was promoted rather than replaced,
+that its role and capabilities changed underneath it, and that the contract below supersedes
+however it had been working. Without it a session is handed a role contract with no account of
+where the last hour went, which invites exactly the wrong inference — that the prototype
+context is stale and should be set aside.
+
+The delivery id rides a freshly minted agent id (#524, minted once ever), so the #455 duplicate
+paste discipline carries unchanged: the id cannot collide with anything already in the resumed
+transcript.
+
+### The existing-group policy, and the consent moment it turns on
+
+A promote resolves its group through `create_group_ex`'s ordinary candidate scan — first of
+`base`, `base-2`, … with no live agents — which yields three cases and no new code:
+
+- **No group for the repo** → a fresh group. The common case.
+- **A dormant group** → **reattach**. Its board, audit history and markers survive and the
+  promoted orchestrator inherits the backlog. One continuous board per repo is the right
+  default; orphaning it behind a `-2` would be a worse answer to a question nobody asked.
+- **A live group** → a **sibling** (`base-2`). Joining a live group would seat a second
+  orchestrator in it, which every other path already refuses (a resume refuses while one is
+  live; `spawn_agent` refuses `kind: orchestrator`). Promote must not become the loophole.
+
+The subtle half is the roster, and it splits on where consent lives. A group's roster is
+approved at a *moment* — the launcher preview the human was shown before hitting Create — and
+`Launch::Resume` exists so a `git pull` between launch and resume cannot swap it afterwards. A
+promote is both kinds of moment depending on the case, which is why `Launch::Promote` is a third
+value rather than a synonym for either:
+
+- **new group dir** → the promote modal *is* the preview moment (it is where the human is told
+  the repo declares a workflow and ticks the box), so the file is read exactly as at the
+  launcher;
+- **dormant reattach** → the roster that group was launched with stands, drift is audited and
+  not applied, and the modal's checkbox does not override a consent moment that already happened
+  for a board that outlived the session which consented to it.
+
+Reattach needs one thing a resume does not. A resume's caller loads `group.json` and hands the
+persisted guardrails straight back in; a promote arrives from a right-click carrying the
+modal's *defaults*. So `create_group_ex` pulls the roster, the advanced toggle and the intake
+profile back off disk for a promote reattach, **before** any decision reads them — otherwise
+promoting into a dormant advanced group would replace the roster its human approved with the
+built-in four and clear that group's merge gate on the way past. The live-adjustable knobs (the
+agent cap, the autonomy budget, the idle-tick windows) come back through the same re-hydration
+both launch kinds already share: a dormant group's own settings beat a modal that has no field
+for them.
+
+That inheritance creates the one case a promote must fail closed on. A session belongs to
+exactly one CLI, and the roster deciding which CLI *this group's orchestrator* runs is resolved
+after the promote is under way — on a reattach, from a workflow file the promoting human never
+picked. If they disagree, the composed command would be `<other-cli> --resume <claude uuid>`,
+which fails inside the pane *after* the promotion has killed the process that held the context.
+`register_orchestrator_pane` refuses instead (`promote-cli-mismatch:`); the group state is
+durable, so the dormant-group Resume card remains the way back in.
+
+### Refusals are tagged, and happen before anything moves
+
+Promotion interrupts a live conversation: the frontend kills the pane's CLI before relaunching
+it, because `--resume` reads a transcript the old process must have finished flushing. That
+makes "was this refused?" a question with a deadline. Every validation therefore runs before
+anything is created, retired or killed — a refused promote leaves the running pane exactly as
+it was — and every refusal carries a `promote-<reason>:` tag, mirroring the `resume-<tag>:`
+convention `resumeerror.ts` already parses, so one click that does nothing can say precisely
+why:
+
+| tag | what it means |
+|---|---|
+| `promote-unsupported-cli` | v1 promotes claude panes; the seam is CLI-generic, the validation is not |
+| `promote-bad-session` | not a full session id — a prefix would fail inside the pane, after the kill |
+| `promote-bad-repo` | not a usable directory (a promoted pane's own cwd becomes the group's repo) |
+| `promote-already-managed` | the session is a recorded member of an orchestration group |
+| `promote-not-found` | the CLI's own store has no such session — including a pane never spoken to |
+| `promote-store-unreadable` | the store could not be read at all, which is not the same fact |
+| `promote-cli-mismatch` | the resolved orchestrator block runs a CLI this session does not belong to |
+
+`promote-already-managed` is the one that is about roles rather than inputs. A delegate's
+transcript carries a delegate contract and a recorded group membership; promoting it would seat
+two conflicting role contracts in one session, and promoting a recorded orchestrator would mint
+a second orchestrator for a group that already has one. The frontend refuses this live (a pane
+in a group has no promote item at all); the backend refuses it *recorded*, which additionally
+covers the pane that was a delegate in an earlier, now-dormant group. The existence check
+(`promote-not-found`) doubles as the empty-session guard: claude writes no transcript until the
+first exchange, so a pane nobody has spoken to reads as "not found" here rather than as claude's
+opaque "No conversation found" a moment after the kill.
+
+The pane's `__solo__` identity is retired as part of the promotion, through the same
+`mark_dead` teardown closing the pane would have used. Left alive it is a stale channel
+endpoint keyed to a pty that is now something else — a peer's `channel_send` would be delivered
+into a session that never joined that channel. It is retired *after* the group exists (a
+refusal must leave the pane whole, identity included) and only when the id names a
+`Role::Solo` agent: the argument arrives from the webview, and naming a real orchestration
+agent there must never become a one-click way to kill it.
+
+### Trust posture
+
+`promote_to_orchestrator` is a human-only Tauri command, unreachable from MCP, and takes
+webview-supplied arguments under the same posture as every other group-scoped command
+(CLAUDE.md constraint 6): `repo` is the directory the human's own pane is already running in,
+the session id is shape-checked before it reaches a command line, and the group id is chosen by
+the backend rather than accepted from the caller. No agent-controllable input reaches this
+seam, and a workflow file still grants no capability — it selects among rosters the human
+approved, which is the whole reason the reattach case pins rather than re-reads.
+
 ## Risks / limitations
 
 - Kickoff typing races CLI boot; a fixed delay (4s) + bracketed paste is used. If a
