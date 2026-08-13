@@ -8146,6 +8146,247 @@ fn the_workflow_schema_manifest_matches_the_engines_raw_types() {
     }
 }
 
+/// **A manifest row is data slice C generates a control from, so a wrong row is
+/// a wrong form** (#880 review finding 1). The test above pins field NAMES; this
+/// one pins what those fields may CONTAIN — every `values`, `default`, `min`,
+/// `max` and `max_entries` in `src/workflow-schema.json` against
+/// `workflow::workflow_schema_field_facts()`, which derives them from the
+/// engine's own accessors and constants rather than from a second hand-written
+/// list.
+///
+/// **Both directions, like the name pin.** A fact the engine states and the
+/// manifest omits is a control generated without a bound the engine enforces; a
+/// fact the manifest states and the engine never did is decoration a reviewer
+/// cannot check — the falsification that motivated this test (a reviewer changed
+/// `block.cli`'s whole `values` to `["notacli", "alsofake"]` and `max_batch`'s
+/// default 3 → 99, and both suites stayed green) is the second kind.
+///
+/// What is deliberately NOT pinned here, so the manifest's own note can be
+/// trusted: `title`/`help` prose, and — named in `workflow_schema_field_facts`'s
+/// docblock — `gate.require`'s value set, which the engine states only as match
+/// arms.
+#[test]
+fn the_workflow_schema_manifest_matches_the_engines_values_defaults_and_bounds() {
+    const MANIFEST: &str = include_str!("../../src/workflow-schema.json");
+    const PINNED: [&str; 5] = ["values", "default", "min", "max", "max_entries"];
+
+    let manifest: Value = serde_json::from_str(MANIFEST).expect("the manifest must be valid JSON");
+    let sections = manifest["sections"].as_object().expect("manifest.sections must be a mapping");
+    let facts = workflow::workflow_schema_field_facts();
+
+    // Every fact the manifest declares must be one the engine states, and match.
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for (section, body) in sections {
+        for field in body["fields"].as_array().expect("fields must be an array") {
+            let name = field["name"].as_str().expect("a field needs a name");
+            let key = format!("{section}.{name}");
+            let stated = facts.get(&key);
+            for k in PINNED {
+                let declared = &field[k];
+                if declared.is_null() {
+                    continue;
+                }
+                seen.insert(format!("{key}.{k}"));
+                let engine = stated.map(|f| &f[k]).filter(|v| !v.is_null()).unwrap_or_else(|| {
+                    panic!(
+                        "{key}: the manifest declares {k} = {declared}, but the engine states no \
+                         {k} for this field. Either it is not a real constraint — in which case a \
+                         generated control would enforce something the engine never asked for — \
+                         or `workflow_schema_field_facts()` needs to say where it comes from."
+                    )
+                });
+                assert_eq!(
+                    declared, engine,
+                    "{key}: the manifest says {k} = {declared}, the engine says {engine}. \
+                     Slice C generates this field's control from the manifest, so this is the \
+                     difference between a form a human can use and one that writes a file the \
+                     engine refuses."
+                );
+            }
+        }
+    }
+
+    // …and every fact the engine states must be declared. This is the direction
+    // that catches a NEW bound (a `max` added to the parse, a fifth CLI) rather
+    // than a wrong one.
+    for (key, stated) in &facts {
+        for k in PINNED {
+            if stated[k].is_null() {
+                continue;
+            }
+            assert!(
+                seen.contains(&format!("{key}.{k}")),
+                "{key}: the engine enforces {k} = {}, and src/workflow-schema.json does not say \
+                 so — a control generated from this row would not know about it.",
+                stated[k]
+            );
+        }
+    }
+    assert!(!seen.is_empty(), "this test must actually compare something");
+}
+
+/// **`refuse` and `clamp` are not the same control** (#880 review finding 4): a
+/// bound the engine rejects the whole file over has to stop the submit, while
+/// one it silently pulls into range may accept and coerce. The manifest says
+/// which each field is; nothing but behavior can confirm it, so this drives the
+/// real `parse_workflow` with an out-of-range value and looks at what happened.
+///
+/// Cardinality (`max_entries` on `resources:`) is checked the same way, because
+/// it is the one bound a form can violate without any single field being wrong —
+/// slice C's "add a resource" affordance writing a 33rd entry.
+#[test]
+fn the_manifests_bounds_are_the_ones_parse_workflow_actually_enforces() {
+    let block = "blocks:\n  - id: w\n    kind: worker\n";
+
+    // refuse: the file does not load at all.
+    for (what, text) in [
+        ("gate.threshold", format!("version: 1\n{block}gates:\n  merge:\n    require: threshold\n    threshold: 0\n    reviewers: [w]\n")),
+        ("merge_queue.max_batch", format!("version: 1\n{block}merge_queue:\n  max_batch: 0\n")),
+        ("resource.slots", format!("version: 1\n{block}resources:\n  build:\n    slots: 0\n")),
+        ("resource.slots-above-max", format!("version: 1\n{block}resources:\n  build:\n    slots: 65\n")),
+        ("resource.max_hold_minutes", format!("version: 1\n{block}resources:\n  build:\n    max_hold_minutes: 0\n")),
+        ("resource.max_hold_minutes-above-max", format!("version: 1\n{block}resources:\n  build:\n    max_hold_minutes: 481\n")),
+    ] {
+        let err = workflow::parse_workflow(&text)
+            .err()
+            .unwrap_or_else(|| panic!("{what}: the manifest says on_out_of_range=refuse, but the engine accepted an out-of-range value"));
+        assert!(
+            !err.is_empty(),
+            "{what}: a refusal must say something — a generated control quotes this back to the human"
+        );
+    }
+
+    // clamp: the file loads, and the value is quietly pulled into range. Both
+    // ends, because a control that refuses one and coerces the other is wrong
+    // half the time.
+    for (given, want) in [(1_u32, 5_u32), (9999, 240)] {
+        let wf = workflow::parse_workflow(&format!(
+            "version: 1\n{block}merge_queue:\n  enabled: true\n  checks_timeout_minutes: {given}\n"
+        ))
+        .unwrap_or_else(|e| {
+            panic!("merge_queue.checks_timeout_minutes: the manifest says on_out_of_range=clamp, so {given} must LOAD: {e:?}")
+        });
+        assert_eq!(
+            wf.merge_queue.checks_timeout_minutes, want,
+            "merge_queue.checks_timeout_minutes: {given} must clamp to {want}"
+        );
+    }
+
+    // cardinality: RESOURCES_MAX + 1 entries is a load error, so the manifest's
+    // max_entries is a real ceiling and not a suggestion.
+    let mut many = format!("version: 1\n{block}resources:\n");
+    for i in 0..=32 {
+        many.push_str(&format!("  r{i}:\n    slots: 1\n"));
+    }
+    assert!(
+        workflow::parse_workflow(&many).is_err(),
+        "workflow.resources: the manifest declares max_entries, so one entry past it must refuse the file"
+    );
+    // …and exactly at the cap it still loads: a ceiling that refused its own
+    // limit would make the manifest's number wrong by one in the other direction.
+    let mut at_cap = format!("version: 1\n{block}resources:\n");
+    for i in 0..32 {
+        at_cap.push_str(&format!("  r{i}:\n    slots: 1\n"));
+    }
+    assert!(
+        workflow::parse_workflow(&at_cap).is_ok(),
+        "workflow.resources: max_entries entries must still load"
+    );
+}
+
+/// Every enum value the manifest declares must be one the ENGINE accepts —
+/// checked by feeding each through `parse_workflow` rather than by comparing two
+/// lists, because a list can be copied wrong in both places at once.
+///
+/// The empty values are the point: `block.cli: ""` (inherit the group's CLI) and
+/// `intake.source: ""` (the built-in source) are the states most files are
+/// actually in, and a manifest that omitted them — as this one did until the
+/// review — gives slice C a `<select>` that cannot represent a legal file.
+#[test]
+fn every_enum_value_the_manifest_declares_is_one_the_engine_accepts() {
+    const MANIFEST: &str = include_str!("../../src/workflow-schema.json");
+    let manifest: Value = serde_json::from_str(MANIFEST).expect("valid JSON");
+
+    let value_of = |section: &str, field: &str| -> Vec<String> {
+        manifest["sections"][section]["fields"]
+            .as_array()
+            .expect("fields")
+            .iter()
+            .find(|f| f["name"] == field)
+            .unwrap_or_else(|| panic!("{section}.{field} must exist"))["values"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{section}.{field} must declare values"))
+            .iter()
+            .map(|v| v.as_str().expect("an enum value is a string").to_string())
+            .collect()
+    };
+
+    for kind in value_of("block", "kind") {
+        // The four class names are reserved as ids for their own class, so the
+        // block is named for the kind under test rather than a fixed `w`.
+        let text = format!("version: 1\nblocks:\n  - id: {kind}\n    kind: {kind}\n");
+        assert!(
+            workflow::parse_workflow(&text).is_ok(),
+            "block.kind: the manifest declares {kind:?}, which the engine refuses"
+        );
+    }
+    for cli in value_of("block", "cli") {
+        let text = format!("version: 1\nblocks:\n  - id: w\n    kind: worker\n    cli: \"{cli}\"\n");
+        assert!(
+            workflow::parse_workflow(&text).is_ok(),
+            "block.cli: the manifest declares {cli:?}, which the engine refuses"
+        );
+    }
+    for hint in value_of("block", "role_hint") {
+        // A hint requires its own kind — that pairing is the hint's whole rule.
+        let kind = match hint.as_str() {
+            "advisor" => "planner",
+            "process" => "worker",
+            other => panic!("block.role_hint declares {other:?}, which this test has no pairing for — if the engine grew a hint, pair it here"),
+        };
+        let text =
+            format!("version: 1\nblocks:\n  - id: h\n    kind: {kind}\n    role_hint: {hint}\n");
+        assert!(
+            workflow::parse_workflow(&text).is_ok(),
+            "block.role_hint: the manifest declares {hint:?}, which the engine refuses on kind {kind}"
+        );
+    }
+    for source in value_of("intake", "source") {
+        let text = format!(
+            "version: 1\nblocks:\n  - id: w\n    kind: worker\nintake:\n  source: \"{source}\"\n"
+        );
+        assert!(
+            workflow::parse_workflow(&text).is_ok(),
+            "intake.source: the manifest declares {source:?}, which the engine refuses"
+        );
+    }
+    for require in value_of("gate", "require") {
+        let threshold = if require == "threshold" { "    threshold: 1\n" } else { "" };
+        let text = format!(
+            "version: 1\nblocks:\n  - id: rev\n    kind: reviewer\ngates:\n  merge:\n    require: {require}\n{threshold}    reviewers: [rev]\n"
+        );
+        assert!(
+            workflow::parse_workflow(&text).is_ok(),
+            "gate.require: the manifest declares {require:?}, which the engine refuses"
+        );
+    }
+
+    // And the sets are CLOSED: a value outside them is refused, so `enum` in the
+    // manifest means what its legend says it does.
+    for text in [
+        "version: 1\nblocks:\n  - id: w\n    kind: superuser\n",
+        "version: 1\nblocks:\n  - id: w\n    kind: worker\n    cli: notacli\n",
+        "version: 1\nblocks:\n  - id: w\n    kind: worker\n    role_hint: supervisor\n",
+        "version: 1\nblocks:\n  - id: w\n    kind: worker\nintake:\n  source: githublabels\n",
+        "version: 1\nblocks:\n  - id: rev\n    kind: reviewer\ngates:\n  merge:\n    require: most\n    reviewers: [rev]\n",
+    ] {
+        assert!(
+            workflow::parse_workflow(text).is_err(),
+            "a value outside a declared enum must be refused, never coerced:\n{text}"
+        );
+    }
+}
+
 /// **The delivery seam.** opencode names no config file on argv: its MCP
 /// server, its containment and its persona all ride environment variables set
 /// on the pane loomux spawns. So this goes through the real spawn site and

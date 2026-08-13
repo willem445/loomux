@@ -19,7 +19,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { parseWorkflow, serializeWorkflow, type Workflow } from "../src/workflowmodel.ts";
+import {
+  analyzeWorkflow,
+  parseWorkflow,
+  roleHintRequires,
+  serializeWorkflow,
+  type Workflow,
+} from "../src/workflowmodel.ts";
 
 interface SchemaField {
   name: string;
@@ -73,9 +79,13 @@ test("every manifest field declares a type this build knows and help a human can
       assert.ok(f.help, `${where}: needs help text`);
       if (f.type === "enum") {
         assert.ok(f.values?.length, `${where}: an enum with no values closes nothing`);
+        // `!f.default` would exempt exactly the case that was wrong (#880 review
+        // finding 1): `block.cli`'s default is the EMPTY STRING, which is falsy, so
+        // the one row whose default sat outside its own values slipped through the
+        // check meant to catch it. An absent default is `undefined`, and nothing else.
         assert.ok(
-          !f.default || f.values.includes(String(f.default)),
-          `${where}: the default must be one of the enum's own values`
+          f.default === undefined || f.values.includes(String(f.default)),
+          `${where}: the default ${JSON.stringify(f.default)} is not one of this enum's own values — a select generated from those values could never show it`
         );
       } else {
         assert.equal(f.values, undefined, `${where}: only an enum carries values`);
@@ -258,7 +268,15 @@ through this emitter, so a field it skips is a line the pane deletes:\n${text}`
 // added to the schema with no decision recorded about its editor is RED, and an entry
 // left behind after its control ships is RED too.
 
-/** Claimed by a form control today. Slice C fills this from its descriptor registry. */
+/** Claimed by a form control today. Slice C fills this from its descriptor registry.
+ *
+ *  Slice C also has two manifest keys to HONOR, not merely to render (#880 review
+ *  finding 4): `on_out_of_range` says whether a number's bound is refused by the engine
+ *  (stop the submit) or silently clamped (accept and coerce), and `max_entries` on
+ *  `workflow.resources` is a hard cap — an "add a resource" affordance that writes a
+ *  33rd entry produces a file the engine refuses whole. Both are pinned against the
+ *  engine in `src-tauri/tests/orchestration.rs`, so the data is trustworthy; consuming
+ *  it is the renderer's half. */
 const FIELDS_WITH_AN_EDITOR = new Set<string>([]);
 
 /** No control yet — every leaf field, as of slice A. */
@@ -316,5 +334,92 @@ test("every schema field is either editable in the pane or listed as not yet edi
     ids.filter((id) => !FIELDS_WITH_AN_EDITOR.has(id) && !FIELDS_WITHOUT_AN_EDITOR.has(id)),
     [],
     "a new schema field needs a decision: give it a form control, or list it as pending"
+  );
+});
+
+// ---------- (d) the enum rows are real, in the pane's own opinion ----------
+//
+// The engine half of this lives in `src-tauri/tests/orchestration.rs`
+// (`every_enum_value_the_manifest_declares_is_one_the_engine_accepts`, which feeds each
+// declared value through the real `parse_workflow`). This is the pane's half: a value
+// the manifest declares must not raise a finding here either, or the GUI would paint a
+// legal file red — the same lie as blessing an illegal one, pointed the other way.
+//
+// Only the fields the pane HAS a rule for are covered, and the gaps are named rather
+// than quietly skipped:
+//   - `intake.source`, `effort` and `context` have no validation rule in this model at
+//     all (the CLI knobs are capability data the backend owns, and intake's vocabulary
+//     is nobody's business until slice E's `workflow_check` asks the engine directly);
+//   - `block.cli: ""` is legal to the ENGINE (inherit the group's CLI) and the pane
+//     deliberately still asks for an explicit one. That asymmetry is left alone here on
+//     purpose: a pane stricter than the engine can annoy, but it cannot mislead someone
+//     into a file that will not load. Changing it is a product decision, not a manifest
+//     fix — carried, and named in the PR.
+
+/** Every finding the pane raises for a workflow whose text is otherwise clean. */
+const findingCodesFor = (text: string): string[] =>
+  analyzeWorkflow(text).findings.map((f) => f.code);
+
+const manifestValues = (section: string, field: string): string[] => {
+  const s = manifest.sections[section];
+  assert.ok(s, `${section} must exist in the manifest`);
+  const f = s.fields.find((x) => x.name === field);
+  assert.ok(f?.values?.length, `${section}.${field} must declare enum values`);
+  return f.values;
+};
+
+test("every enum value the manifest declares is one the PANE accepts too", () => {
+  for (const kind of manifestValues("block", "kind")) {
+    const codes = findingCodesFor(`version: 1\nblocks:\n  - id: b\n    kind: ${kind}\n    cli: claude\n`);
+    assert.ok(
+      !codes.includes("unknown-kind"),
+      `block.kind: the manifest declares ${JSON.stringify(kind)} and the pane calls it unknown`
+    );
+  }
+  // The empty value is the engine's, not the pane's — see the note above.
+  for (const cli of manifestValues("block", "cli").filter((v) => v !== "")) {
+    const codes = findingCodesFor(`version: 1\nblocks:\n  - id: b\n    kind: worker\n    cli: ${cli}\n`);
+    assert.ok(
+      !codes.includes("unknown-cli"),
+      `block.cli: the manifest declares ${JSON.stringify(cli)} and the pane calls it unspawnable`
+    );
+  }
+  for (const hint of manifestValues("block", "role_hint")) {
+    const required = roleHintRequires(hint);
+    assert.ok(required, `block.role_hint: the manifest declares ${JSON.stringify(hint)}, which the pane does not recognize`);
+    const codes = findingCodesFor(
+      `version: 1\nblocks:\n  - id: b\n    kind: ${required}\n    cli: claude\n    role_hint: ${hint}\n`
+    );
+    assert.ok(
+      !codes.some((c) => c.startsWith("role-hint")),
+      `block.role_hint: ${JSON.stringify(hint)} must pair cleanly with kind ${required}`
+    );
+  }
+  for (const require of manifestValues("gate", "require")) {
+    const threshold = require === "threshold" ? "    threshold: 1\n" : "";
+    const codes = findingCodesFor(
+      `version: 1\nblocks:\n  - id: rev\n    kind: reviewer\n    cli: claude\ngates:\n  merge:\n    require: ${require}\n${threshold}    reviewers: [rev]\n`
+    );
+    assert.ok(
+      !codes.includes("gate-unknown-require"),
+      `gate.require: the manifest declares ${JSON.stringify(require)} and the pane calls it unknown — the engine accepts it (\`all\` is its synonym for \`all-pass\`), so this is the pane painting a legal file red`
+    );
+  }
+});
+
+test("…and a value outside a declared enum is still refused by the pane", () => {
+  // The other half of "closed": without this, the test above would pass just as well
+  // against a validator that had stopped checking anything at all.
+  assert.ok(
+    findingCodesFor("version: 1\nblocks:\n  - id: b\n    kind: superuser\n    cli: claude\n").includes("unknown-kind")
+  );
+  assert.ok(
+    findingCodesFor("version: 1\nblocks:\n  - id: b\n    kind: worker\n    cli: notacli\n").includes("unknown-cli")
+  );
+  assert.equal(roleHintRequires("supervisor"), undefined);
+  assert.ok(
+    findingCodesFor(
+      "version: 1\nblocks:\n  - id: rev\n    kind: reviewer\n    cli: claude\ngates:\n  merge:\n    require: most\n    reviewers: [rev]\n"
+    ).includes("gate-unknown-require")
   );
 });
