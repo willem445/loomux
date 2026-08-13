@@ -149,10 +149,12 @@ A name loomux doesn't recognize warns and still runs:
 > written, with no session id and no autopilot flags.
 
 What actually reaches the far host, with **Remote CLI = Claude Code** and a
-**Remote folder** of `/srv/app` on a POSIX remote, is one quoted remote command:
+**Remote folder** of `/srv/app` on a POSIX remote, is **one** remote-command
+string — every token individually quoted, so nothing in it can be re-read as
+another argument:
 
 ```
-cd '/srv/app' && exec claude --session-id <uuid>
+cd '/srv/app' && exec 'claude' '--session-id' '<uuid>'
 ```
 
 **Claude Code is the only remote CLI that gets a session id**, and for a
