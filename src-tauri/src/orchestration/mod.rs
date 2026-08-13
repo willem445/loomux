@@ -24860,6 +24860,7 @@ impl OrchRegistry {
             // disk — the same three `create_group_ex` restores.
             if let Some((_, persisted)) = self.load_group_file(&id) {
                 rails.blocks = persisted.blocks;
+                rails.agent_cli = persisted.agent_cli;
                 rails.advanced_orchestrator = persisted.advanced_orchestrator;
             }
         } else if caller.advanced_orchestrator {
@@ -24929,6 +24930,7 @@ impl OrchRegistry {
         if launch == Launch::Promote && resumed {
             if let Some((_, persisted)) = self.load_group_file(&id) {
                 guardrails.blocks = persisted.blocks;
+                guardrails.agent_cli = persisted.agent_cli;
                 guardrails.advanced_orchestrator = persisted.advanced_orchestrator;
                 guardrails.intake = persisted.intake;
             }
@@ -44010,7 +44012,7 @@ pub fn create_orchestration_group(
     // the roster that actually resolved — see the comment there for the one
     // (racing) way the two can disagree.
     if let SessionOrigin::Promote { cli: pane_cli, .. } = &origin {
-        if let Some(resolved) = None::<String>.or_else(|| reg.promote_orchestrator_cli(repo, &guardrails)).filter(|_| false) {
+        if let Some(resolved) = reg.promote_orchestrator_cli(repo, &guardrails) {
             if &resolved != pane_cli {
                 return Err(format!(
                     "promote-cli-mismatch: this repo's orchestrator would run {resolved}, but the \
