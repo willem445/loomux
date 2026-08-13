@@ -10,8 +10,10 @@
 //      looking fine to a selector;
 //   3. a minimized pane keeps its count on the dock chip (delegate panes open
 //      minimized, so this is where agent queues are actually seen);
-//   4. on a narrow pane wearing several chips the header degrades gracefully
-//      and — constraint 1 — the terminal's geometry does not move.
+//   4. on a narrow pane wearing several chips the badge yields its own room
+//      first — it may cost the header no more than the box `flex-shrink`
+//      cannot touch, and may not take width from the pane's drag handle — and
+//      — constraint 1 — the terminal's geometry does not move.
 //
 // **How it drives the badge, and what that does and does not prove.** The spec
 // emits `orch-queue-depth` from the page through `plugin:event|emit`, which is
@@ -168,10 +170,12 @@ test("the queue badge yields its text rather than crowding a narrow header", asy
   // chrome this PR did not add — nine `flex: none` buttons, the title, and the
   // other chips — so an absolute assertion would charge the queue badge for
   // that, and would charge the next new button to it as well. What #814 owns is
-  // its own contribution: the badge is the one chip here that shrinks
-  // (`flex: 0 1 auto; min-width: 0`), so however tight the header gets it gives
-  // up its text before it costs anyone else room, and what remains is only the
-  // box it cannot shrink away.
+  // its own contribution: the badge is the one chip here that shrinks, and it
+  // shrinks FIRST (`flex: 0 100 auto; min-width: 0` — the weight matters, see
+  // that rule in styles.css: at an equal factor it took its room from the
+  // title instead), so however tight the header gets it gives up its own text
+  // before it costs anyone else room, and what remains is only the box it
+  // cannot shrink away.
   await createTerminalPane(page, { name: "Narrow A" });
   await page.locator("#btn-split-right").click();
   await createTerminalPane(page, { name: "Narrow B" });
@@ -237,12 +241,20 @@ test("the queue badge yields its text rather than crowding a narrow header", asy
   // usable width before the badge existed is #894's crowding, not this PR's, and
   // an absolute floor would charge it here. So: the title must still be usable,
   // or no worse than it already was. No conditional, no escape hatch.
+  //
+  // The floor is compared on whole pixels because `boundingBox()` reports
+  // fractional CSS pixels (round 4's red was 9.34375px) and the 10px number it
+  // is checked against comes from `pane-reorder.spec.ts`, which is about
+  // whether a pointer can land on the element — a sub-pixel sliver either side
+  // of 10 is not a different answer to that question. `Math.ceil` states that
+  // rounding once, rather than the bare `+ 1` an earlier cut used, which looked
+  // like slack chosen to make a number pass.
   const titleTwoCol = (await pane.locator(".pane-title").boundingBox())?.width ?? 0;
   expect(
-    titleTwoCol + 1,
+    Math.ceil(titleTwoCol),
     `with the badge lit at two columns the title is ${titleTwoCol}px, ` +
       `against ${titleHeld}px without it — the badge took the drag handle's room instead of its own`
-  ).toBeGreaterThanOrEqual(Math.min(10, titleHeld));
+  ).toBeGreaterThanOrEqual(Math.min(10, Math.ceil(titleHeld)));
   const titleTwoColCost = titleHeld - titleTwoCol;
   expect(
     titleTwoColCost,

@@ -264,10 +264,15 @@ first pane to exist before handing the test a `Page`. Five specs:
    chip renders with its count/cap/age in the label rather than in a tooltip,
    a stalled queue paints *differently* (compared as computed style, so a rule
    that never matched fails here instead of passing a selector check), a
-   minimized pane keeps the count on its dock chip, and — on a three-column
-   layout with two chips lit — the header degrades without spilling while the
-   pane's terminal box does not move a pixel (constraint 1, from the layout
-   side, the same way `sessions-panel.spec.ts` checks it). It is the first
+   minimized pane keeps the count on its dock chip, and — on two- and
+   three-column layouts with two chips lit — the badge's own crowding cost stays
+   within the box `flex-shrink` cannot touch and it never takes width from the
+   pane's drag handle, while the pane's terminal box does not move a pixel
+   (constraint 1, from the layout side, the same way `sessions-panel.spec.ts`
+   checks it). It asserts the badge's CONTRIBUTION, not the header's absolute
+   fit: that header is already over-subscribed by chrome the badge did not add
+   (#894), so an absolute assertion would charge this feature for it. It is the
+   first
    spec to stand in for a human demo rather than for a bug class, which is why
    its header states exactly which half of the feature it proves.
 
