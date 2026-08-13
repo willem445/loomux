@@ -34,11 +34,14 @@ import { createTerminalPane, paneByName } from "../helpers";
 const DIVIDER_FOOTPRINT_PX = 4;
 
 /** Slack on the pixel bounds only, for fractional flex widths rounding to
- *  device pixels. Deliberately small: with it, a sibling is allowed to move
- *  5px, which is still under one ~8.4px terminal cell — so this bound cannot
- *  hide a re-share (tens of px), and it does not pretend to exclude the
- *  one-column nudge described above, which the ratio assertion below is the
- *  real witness for. */
+ *  device pixels — measured at up to ~0.7px on the CI runner. Deliberately
+ *  small: with it, a sibling is allowed to move 5px, which is still under one
+ *  ~8.4px terminal cell — so this bound cannot hide a re-share (tens of px),
+ *  and it does not pretend to exclude the one-column nudge described above,
+ *  which the share assertions below are the real witness for. Nothing about
+ *  the guarantee rests on this number; every load-bearing assertion in this
+ *  spec is in the share domain, where rounding is three orders of magnitude
+ *  smaller than the effect. */
 const ROUNDING_PX = 1;
 const MOVE_BUDGET_PX = DIVIDER_FOOTPRINT_PX + ROUNDING_PX;
 
@@ -140,10 +143,19 @@ test("splitting a pane in a 3-wide row halves that pane and leaves its siblings'
     shareOf(after.a!.width, widthsAfter) + shareOf(after.fresh!.width, widthsAfter),
     "the split pane and the newcomer should hold exactly what the split pane held"
   ).toBeCloseTo(shareOf(before.a!.width, widthsBefore), 2);
-  expect(after.fresh!.width, "the two halves should be the same size").toBeCloseTo(
-    after.a!.width,
-    0
-  );
+  // Compared as SHARES, not as pixels. Two equal-weight flex siblings are not
+  // guaranteed equal *pixel* widths: the engine distributes fractional free
+  // space item by item and rounds, so they land up to about a pixel apart —
+  // this exact assertion, written as `toBeCloseTo(width, 0)`, failed on the
+  // CI runner at 249.31 vs 249.96 (0.66px) and passed on retry, which is a
+  // flaky spec, not a caught defect. The equality `halve` actually guarantees
+  // is on the weights, so assert it where it holds. SHARE_EPSILON is ~2px of
+  // a 1000px row here, and the nearest wrong policy (the newcomer taking 1/N
+  // instead of half) separates these two shares by ~0.09 — 45x this bound.
+  expect(
+    Math.abs(shareOf(after.fresh!.width, widthsAfter) - shareOf(after.a!.width, widthsAfter)),
+    "the split pane and the newcomer should be the same size"
+  ).toBeLessThan(SHARE_EPSILON);
 
   // 2. Nobody else's SHARE of the row moved — the exact property `halve`
   //    guarantees, and the one a re-share of the row cannot satisfy.
