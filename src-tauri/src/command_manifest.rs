@@ -18,7 +18,7 @@
 // the permission sets under `permissions/`) — otherwise it silently breaks
 // for every window, main included, per the #363 plan's all-or-nothing flip.
 pub const APP_COMMANDS: &[&str] = &[
-    // pty (8)
+    // pty (9)
     "spawn_pty",
     "pty_backend_info",
     "write_pty",
@@ -27,6 +27,7 @@ pub const APP_COMMANDS: &[&str] = &[
     "dir_info",
     "change_dir",
     "discover_git_bash",
+    "discover_ssh",
     // sessions (3)
     "list_sessions",
     "record_copilot_launch_posture",

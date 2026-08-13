@@ -24,7 +24,7 @@ import {
   ptyBackendInfo,
 } from "./pty";
 import { voiceController, type VoiceTargetPane, type VoicePhase } from "./voicecontrol";
-import { pathTail, type ShellKind } from "./panesetup";
+import { pathTail, sshOrchestrationRefusal, type ShellKind } from "./panesetup";
 import { invoke } from "./transport.ts";
 import { parseOsc52, writeClipboard, readClipboard } from "./clipboard";
 import { keyDisposition } from "./pasteflow";
@@ -249,6 +249,16 @@ export interface PaneOptions {
    *  orch-spawn-request path sets it. Grid.openPane resolves the actual
    *  decision — an empty grid still focuses regardless (see panefocus.ts). */
   background?: boolean;
+  /** #887 S3: present iff this pane's process is a local ssh client connected to
+   *  a saved SSH profile — `argv` above is the ssh command line the launcher
+   *  composed, and this names the connection it came from (never its contents:
+   *  the profile can be renamed or re-edited and the pane stays pointed at it).
+   *
+   *  Its presence is what suppresses this pane's LOCAL-filesystem affordances,
+   *  which is not cosmetic: an SSH pane's shell reports REMOTE paths over OSC 7,
+   *  and pointing a local git watch (or a local folder picker's `cd`) at
+   *  `/srv/app` is meaningless at best. See `start()`. */
+  ssh?: { profileId: string };
   /** Recorded resumable agent session id (#194): so a restored Agent pane can
    *  `--resume <id>` back into its prior context (resuming into an idle TUI
    *  costs nothing until a prompt is sent). Set by the launcher for
@@ -608,6 +618,11 @@ export class Pane implements VoiceTargetPane {
   private orchGroup: string | null = null;
   private orchRoleName: string | null = null;
   private orchAgent: string | null = null;
+  /** #887 S3: the SSH profile this pane's ssh client was launched from, or null
+   *  for every other pane. Non-null IS "this pane is an SSH pane" — the single
+   *  fact every local-filesystem suppression below reads, so a ninth pane kind
+   *  can't be added to one site and forgotten at another. */
+  private sshProfileId: string | null = null;
   /** Standalone pane's channel-scoped identity (#271 W3 addendum) — a carrier
    *  DELIBERATELY separate from orchGroup/orchAgent/orchRoleName (those gate
    *  the full orchestration chrome; a plain standalone pane must never show
@@ -1218,6 +1233,15 @@ export class Pane implements VoiceTargetPane {
 
   /** Open the terminal in the DOM and spawn its PTY. Call after `el` is attached. */
   async start(opts: PaneOptions = {}, takeFocus = true): Promise<void> {
+    // #887/#888 boundary, checked BEFORE anything is opened or spawned so a
+    // refusal costs no process: an SSH pane can never carry an orchestration
+    // identity. Fails closed and loudly (the caller's catch surfaces it) rather
+    // than quietly dropping the identity — a group member whose gh merge gate
+    // silently isn't enforced is precisely the outcome this refuses. See
+    // `sshOrchestrationRefusal` for why each of those mechanisms cannot follow a
+    // pane onto a remote host.
+    this.refuseSshOrchestration(opts);
+    this.sshProfileId = opts.ssh?.profileId ?? null;
     this.setName(opts.name ?? "shell");
     this.launchedCommand = !!opts.command?.trim();
     // Retain the launch inputs for a later capture() into the persisted layout
@@ -1243,7 +1267,15 @@ export class Pane implements VoiceTargetPane {
     // Seed the toolbar from the startup directory. Interactive shells refine
     // this via OSC 7; command panes (agents) keep this initial value since
     // they have no prompt to report from.
-    if (opts.cwd) {
+    //
+    // An SSH pane is neither: the directory its remote shell reports is a path
+    // on ANOTHER machine, so the folder chip (which resolves and `cd`s LOCAL
+    // paths) is hidden outright for it rather than left showing a local reading
+    // of a remote path (#887 S3, plan part 4a). `isSshPane` also stops
+    // `onCwdReported` from re-pointing the git watch at whatever the remote
+    // reports.
+    if (this.isSshPane) this.cwdEl.hidden = true;
+    if (opts.cwd && !this.isSshPane) {
       this.cwdRaw = opts.cwd;
       void this.refreshDir(opts.cwd);
     }
@@ -1353,6 +1385,33 @@ export class Pane implements VoiceTargetPane {
     await this.attachPty(opts);
   }
 
+  /** True when this pane's process is a local ssh client (#887 S3) — the one
+   *  fact every local-filesystem suppression in this file reads. */
+  get isSshPane(): boolean {
+    return this.sshProfileId !== null;
+  }
+
+  /** The SSH profile this pane was launched from, or null. */
+  get sshProfile(): string | null {
+    return this.sshProfileId;
+  }
+
+  /** Throw if `opts` would give an SSH pane an orchestration identity (#887 S3).
+   *  The decision itself is pure and unit-tested (`sshOrchestrationRefusal` in
+   *  panesetup.ts); this is only the two call sites that can reach it — a fresh
+   *  spawn and an in-place relaunch. `this.isSshPane` is part of the input
+   *  because a relaunch's options describe what the pane is BECOMING while the
+   *  boundary is about what it already IS. */
+  private refuseSshOrchestration(opts: PaneOptions): void {
+    const refusal = sshOrchestrationRefusal({
+      ssh: !!opts.ssh || this.isSshPane,
+      orchGroup: opts.orchGroup,
+      orchRole: opts.orchRole,
+      orchAgent: opts.orchAgent,
+    });
+    if (refusal) throw new Error(refusal);
+  }
+
   /** Give this pane an orchestration identity and the group chrome that comes
    *  with it. Split out of `start` so an IN-PLACE promotion (#407) can apply the
    *  same identity to a pane that is already running — one definition of "what an
@@ -1420,10 +1479,19 @@ export class Pane implements VoiceTargetPane {
       });
       // React to repo changes made outside this pane's shell (#36): the
       // backend watch is pointed at the repo on each cwd report below.
-      attachGitWatch(ptyId, () => this.onExternalGitChange());
-      if (this.cwdRaw) {
-        this.watchedPath = this.cwdRaw;
-        setGitWatch(ptyId, this.cwdRaw);
+      //
+      // Never for an SSH pane (#887 S3): the repo this pane works in is on the
+      // remote host, and every path it will ever report names a filesystem this
+      // machine cannot see. A watch registered here would either resolve to
+      // nothing or — worse, for a remote path that happens to also exist
+      // locally — report changes from a completely unrelated local repo as
+      // though they were the remote one's.
+      if (!this.isSshPane) {
+        attachGitWatch(ptyId, () => this.onExternalGitChange());
+        if (this.cwdRaw) {
+          this.watchedPath = this.cwdRaw;
+          setGitWatch(ptyId, this.cwdRaw);
+        }
       }
       // Bind the ordered writer to this PTY and flush anything typed/pasted
       // while it was starting, in arrival order.
@@ -1573,6 +1641,13 @@ export class Pane implements VoiceTargetPane {
    *  command it is handed can perfectly well be `claude --resume <its own id>`. */
   async respawnFresh(opts: PaneOptions = {}): Promise<void> {
     if (this.disposed) return;
+    // The promotion door onto the #887/#888 boundary (#407 relaunches a pane
+    // in place WITH an orchestration identity). It closes here rather than only
+    // in `start`, because a promotion never calls `start` — and it reads this
+    // pane's EXISTING ssh-ness, not just `opts`, since a promotion's options
+    // describe the orchestrator it wants, not the pane it is rewriting.
+    this.refuseSshOrchestration(opts);
+    if (opts.ssh) this.sshProfileId = opts.ssh.profileId;
     this.exited = false;
     this.ptyId = null;
     if (opts.name) this.setName(opts.name);
@@ -2511,6 +2586,12 @@ export class Pane implements VoiceTargetPane {
   /** Handle an OSC 7 working-directory report from the shell. Payloads are
    *  usually a raw path, but tolerate a `file://host/path` URL too. */
   private onCwdReported(payload: string): void {
+    // An SSH pane's OSC 7 comes from the REMOTE shell and names a remote path
+    // (#887 S3). Nothing local may act on it: not the git watch below, not the
+    // `dir_info` lookup, not the folder chip (already hidden in `start`). Return
+    // before the git view's prompt signal too — that view is over a LOCAL repo
+    // this pane has nothing to do with.
+    if (this.isSshPane) return;
     // Every prompt is a "something may have happened" signal for the git
     // view, even when the directory itself didn't change.
     this.gitView?.notifyPrompt();
@@ -3689,6 +3770,14 @@ export class Pane implements VoiceTargetPane {
    *  panerestore.ts decides what each record becomes on restore. */
   capture(): PersistedPane | null {
     if (this.isWelcome) return null;
+    // An SSH pane has no persisted kind YET (#887 S4 adds `paneKind: "ssh"` plus
+    // the profile id and the reconnect policy). Until it does, this returns null
+    // — the pane is simply absent from the restored layout — rather than letting
+    // `liveKind()` classify it: it launched no `command`, so it would persist as
+    // a plain TERMINAL and come back next boot as a local PowerShell wearing the
+    // remote host's name. Dropping a pane is recoverable and legible; restoring
+    // the wrong process under the right title is neither.
+    if (this.isSshPane) return null;
     // A dormant restore placeholder persists exactly as it came in, so a session
     // closed without resuming offers the identical restore next boot.
     if (this.dormantRecord) return { ...this.dormantRecord };
@@ -3844,6 +3933,10 @@ export class Pane implements VoiceTargetPane {
   /** Open a native folder picker and cd the shell into the chosen directory. */
   private async pickFolder(): Promise<void> {
     if (this.ptyId === null) return;
+    // The chip this hangs off is hidden for an SSH pane (`start`), so this is
+    // the belt on that suspender — a folder picker chooses a path on THIS
+    // machine, and `change_dir` would type it into a shell on another one.
+    if (this.isSshPane) return;
     const picked = await pickDirectory({
       title: "Change folder",
       defaultPath: this.cwdRaw ?? undefined,

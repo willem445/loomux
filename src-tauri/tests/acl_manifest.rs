@@ -5,16 +5,16 @@
 //! without an explicit grant silently unreachable for every window,
 //! including `main`. These tests turn that silent failure into a red test:
 //!
-//!   - `generate_handler_matches_app_commands` / `app_commands_len_is_140`:
+//!   - `generate_handler_matches_app_commands` / `app_commands_len_is_141`:
 //!     `src/lib.rs`'s `generate_handler!` and `command_manifest::APP_COMMANDS`
 //!     are the two hand-maintained lists this migration depends on staying
 //!     identical; this diffs them directly out of the `lib.rs` source rather
 //!     than trusting a hand count.
-//!   - `main_has_all_140_and_zero_permission_denies_dangerous_spread`: builds
+//!   - `main_has_all_141_and_zero_permission_denies_dangerous_spread`: builds
 //!     a real (headless) `tauri::test` mock app using the app's *actual*
 //!     `capabilities/`/`permissions/` on disk (via the same `generate_context!`
 //!     `build.rs` already feeds — not a reimplementation of ACL resolution),
-//!     invokes all 140 commands against the `main` window label, and invokes
+//!     invokes all 141 commands against the `main` window label, and invokes
 //!     a representative dangerous spread + a benign control against the
 //!     `plugin-zero-template` window label (see
 //!     `capabilities/plugin-zero-template.json`). This is both the coherence
@@ -23,7 +23,7 @@
 //!
 //! Red-before-green (cited in the PR): dropping `orch_grant_merge` from
 //! `permissions/sets/orch-control.toml` makes
-//! `main_has_all_140_and_zero_permission_denies_dangerous_spread` fail with
+//! `main_has_all_141_and_zero_permission_denies_dangerous_spread` fail with
 //! `main is missing a grant for: ["orch_grant_merge"]`.
 
 // Stub commands: same bare identifiers as the real commands in
@@ -51,7 +51,8 @@ macro_rules! stub_commands {
 }
 
 stub_commands!(
-    spawn_pty, pty_backend_info, write_pty, resize_pty, kill_pty, dir_info, change_dir, discover_git_bash,
+    spawn_pty, pty_backend_info, write_pty, resize_pty, kill_pty, dir_info, change_dir,
+    discover_git_bash, discover_ssh,
     list_sessions, record_copilot_launch_posture, record_claude_launch_posture,
     git_repo_root, git_log, git_status, git_diff, git_commit_files, git_stage, git_unstage, git_commit,
     git_checkout, git_discard, git_worktree_add, git_worktree_list, git_fetch, git_push, git_pull, git_tag,
@@ -157,11 +158,11 @@ fn generate_handler_matches_app_commands() {
 }
 
 #[test]
-fn app_commands_len_is_140() {
+fn app_commands_len_is_141() {
     assert_eq!(
         loomux_lib::command_manifest::APP_COMMANDS.len(),
-        140,
-        "APP_COMMANDS drifted from the expected count of 140 (120 per the #363 plan's audited \
+        141,
+        "APP_COMMANDS drifted from the expected count of 141 (120 per the #363 plan's audited \
          count, +1 for orch_confirm_solo_copilot_autopilot added in #364, +2 for \
          orch_set_advanced_orchestrator/orch_workflow_status added in #316/#355, +3 for \
          orch_set_compact_nudge_minutes/orch_set_compact_nudge_roles/ \
@@ -177,13 +178,15 @@ fn app_commands_len_is_140() {
          stuck-prompt chip dismiss added in #825, +1 for promote_to_orchestrator — promoting a \
          standalone pane to the orchestrator of a group, added in #407, +1 for orch_lock_state — \
          the lock-resource chrome read added in #858, +2 for \
-         load_ssh_profiles/save_ssh_profiles — the SSH connection-profile store added in #887) — \
+         load_ssh_profiles/save_ssh_profiles — the SSH connection-profile store added in #887, \
+         +1 for discover_ssh — the local OpenSSH-client resolution probe an SSH pane launches \
+         through, added in #887 slice S3) — \
          if this is an intentional addition/removal, update this tripwire's count too"
     );
 }
 
 #[test]
-fn main_has_all_140_and_zero_permission_denies_dangerous_spread() {
+fn main_has_all_141_and_zero_permission_denies_dangerous_spread() {
     // Catches drift in *this test file* before it can mask a real gap: the
     // stub list above must match APP_COMMANDS exactly.
     let mut stub_names: Vec<&str> = STUB_COMMAND_NAMES.to_vec();

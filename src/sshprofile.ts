@@ -23,7 +23,7 @@
 //
 // Two structural guards keep that true rather than merely stated:
 //
-//  1. **Encode and decode are both allowlists.** `decodeProfile` reads only the
+//  1. **Encode and decode are both allowlists.** `normalizeSshProfile` reads only the
 //     fields declared in `SshProfile`; `profileToWire` writes only those fields.
 //     A password, passphrase or private key hand-added to the file (or attached
 //     to a profile object by some future caller) is dropped on the way in and
@@ -206,13 +206,20 @@ function identityPathOrNull(v: unknown): string | null {
  *  one argv word, and a "host" containing a space is a mangled hand-edit rather
  *  than a target that could ever connect.
  *
- *  A failure here fails the WHOLE ENTRY (see `decodeProfile`) rather than
+ *  A failure here fails the WHOLE ENTRY (see `normalizeSshProfile`) rather than
  *  repairing the value — a destination we won't connect to is not a profile,
  *  and silently stripping the dash would connect the user somewhere they never
  *  asked for. Both directions enforce it: `encodeSshProfiles` runs the same
  *  guard, so such a profile cannot be SAVED either, not merely ignored on
- *  load. */
-function destinationOrNull(v: unknown): string | null {
+ *  load.
+ *
+ *  EXPORTED for the launch seam (#887 S3). A profile that reaches ssh does not
+ *  always come off disk: the launcher's inline create/edit form builds one out
+ *  of text the human just typed, which has never been through the store at all.
+ *  That form and `planPaneSetup` therefore run THIS function rather than a
+ *  second leading-dash test of their own — one implementation, so the store and
+ *  the launcher cannot drift into disagreeing about what a destination is. */
+export function sshDestinationOrNull(v: unknown): string | null {
   const dest = trimmedOrNull(v);
   if (dest === null) return null;
   if (dest.startsWith("-")) return null;
@@ -247,18 +254,26 @@ function isRemoteShell(v: unknown): v is RemoteShell {
   return typeof v === "string" && (REMOTE_SHELLS as readonly string[]).includes(v);
 }
 
-/** Validate one persisted profile, returning null on any malformation so the
- *  caller can drop THAT ENTRY and keep the rest (tabstore.ts's docked-pane
- *  tolerance, for the same reason: losing one profile beats losing the list).
- *  Only `id`, `name` and `destination` can fail an entry — without any one of
- *  them there is nothing to show, nothing to point a pane at, or nothing to
- *  connect to. Every other field degrades to null/default on its own. */
-function decodeProfile(v: unknown): SshProfile | null {
+/** Validate one profile, returning null on any malformation so the caller can
+ *  drop THAT ENTRY and keep the rest (tabstore.ts's docked-pane tolerance, for
+ *  the same reason: losing one profile beats losing the list). Only `id`, `name`
+ *  and `destination` can fail an entry — without any one of them there is
+ *  nothing to show, nothing to point a pane at, or nothing to connect to. Every
+ *  other field degrades to null/default on its own.
+ *
+ *  EXPORTED for the launch seam (#887 S3), where it is a NORMALIZER rather than
+ *  a decoder: the launcher's inline editor hands it an object built from raw
+ *  form text, and gets back exactly what this store would have kept. That is
+ *  what makes the profile a pane LAUNCHES and the profile that is SAVED the same
+ *  object — without it, an identity file carrying key material (dropped on save)
+ *  or an out-of-range port (dropped on save) would still have reached ssh on the
+ *  command line, and the file would then disagree with the pane it started. */
+export function normalizeSshProfile(v: unknown): SshProfile | null {
   if (!v || typeof v !== "object") return null;
   const r = v as Record<string, unknown>;
   const id = trimmedOrNull(r.id);
   const name = trimmedOrNull(r.name);
-  const destination = destinationOrNull(r.destination);
+  const destination = sshDestinationOrNull(r.destination);
   if (!id || !name || !destination) return null;
   return {
     id,
@@ -283,7 +298,7 @@ function decodeProfile(v: unknown): SshProfile | null {
  *  than written as `null`: this file is hand-editable, and an absent key is how
  *  "loomux passes nothing, your ssh_config decides" should look when read.
  *
- *  Takes an already-`decodeProfile`d value, which is what makes the two
+ *  Takes an already-`normalizeSshProfile`d value, which is what makes the two
  *  directions provably agree: there is ONE implementation of every field guard,
  *  not a write-side copy that can drift from the read-side one. */
 function profileToWire(p: SshProfile): Record<string, unknown> {
@@ -312,7 +327,7 @@ function profileToWire(p: SshProfile): Record<string, unknown> {
  *  load would silently discard. */
 export function encodeSshProfiles(store: SshProfileStore): string {
   const validated = (store.profiles ?? [])
-    .map(decodeProfile)
+    .map(normalizeSshProfile)
     .filter((p): p is SshProfile => p !== null);
   return JSON.stringify(
     { schemaVersion: stampedVersion(store.schemaVersion), profiles: dedupeById(validated).map(profileToWire) },
@@ -382,7 +397,7 @@ export function decodeSshProfiles(raw: string | null): SshProfileStore | null {
   // rather than inventing an empty store over whatever it actually is.
   if (!Array.isArray(obj.profiles)) return null;
   const profiles = dedupeById(
-    obj.profiles.map(decodeProfile).filter((p): p is SshProfile => p !== null)
+    obj.profiles.map(normalizeSshProfile).filter((p): p is SshProfile => p !== null)
   );
   const schemaVersion =
     typeof obj.schemaVersion === "number" && Number.isInteger(obj.schemaVersion)

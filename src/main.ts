@@ -1423,6 +1423,28 @@ async function handleWelcomeSubmit(
     return;
   }
 
+  if (result.kind === "ssh") {
+    // #887 S3: an SSH pane converts the setup pane in place exactly like a
+    // terminal, and spawns through the ordinary argv path — the local ssh.exe IS
+    // the pane's child process, so pty.rs needs no SSH anything (plan part 4a).
+    //
+    // No `cwd` and no `env`, both deliberate: the pane's LOCAL directory stays
+    // home (the repo is on the far end, and no local path stands for it), and the
+    // gh-shim/`LOOMUX_GROUP_DIR` env is an ORCHESTRATION pane's, which an SSH
+    // pane can never be (the #888 boundary, enforced in `Pane.start`).
+    await pane.startFromWelcome({
+      name: result.name,
+      argv: result.argv,
+      sessionId: result.sessionId,
+      ssh: { profileId: result.profileId },
+    });
+    reapIfExited(ws, pane);
+    // Converted in place — no grid open/close fired, so notify explicitly, same
+    // as the terminal arm above.
+    onGridChanged();
+    return;
+  }
+
   if (
     result.kind === "files" ||
     result.kind === "editor" ||

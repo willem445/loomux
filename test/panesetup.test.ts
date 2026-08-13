@@ -12,8 +12,14 @@ import {
   shellKindOptions,
   resolveShellKind,
   isContentKind,
+  sshLaunchArgv,
+  sshLaunchParams,
+  sshMintsSessionId,
+  sshOrchestrationRefusal,
+  sshRemoteCliWarning,
   type PaneSetupInput,
 } from "../src/panesetup.ts";
+import type { SshProfile } from "../src/sshprofile.ts";
 
 /** A fully-populated input; each test overrides only the fields it exercises. */
 function input(over: Partial<PaneSetupInput>): PaneSetupInput {
@@ -29,6 +35,24 @@ function input(over: Partial<PaneSetupInput>): PaneSetupInput {
     name: "",
     autopilot: true,
     shellKind: "powershell",
+    sshProfile: null,
+    ...over,
+  };
+}
+
+/** A saved SSH connection, as the launcher's fields describe one (#887 S3). */
+function sshProfile(over: Partial<SshProfile> = {}): SshProfile {
+  return {
+    id: "p1",
+    name: "build box",
+    destination: "dev@build.example.net",
+    port: null,
+    identityFile: null,
+    remoteCwd: null,
+    defaultCli: null,
+    remoteShell: "posix",
+    keepaliveSeconds: null,
+    extraArgs: [],
     ...over,
   };
 }
@@ -217,6 +241,226 @@ test("isContentKind names exactly the PTY-less kinds — the ones that spawn not
     (["agent", "orchestrator", "terminal", "files", "editor", "git"] as const).filter(isContentKind),
     ["files", "editor", "git"]
   );
+});
+
+// ---------- ssh (#887 S3) ----------
+
+test("an SSH pane needs a connection — a half-filled form is bounced, not launched", () => {
+  const res = planPaneSetup(input({ kind: "ssh", sshProfile: null }));
+  assert.equal(res.ok, false);
+  // Focused at the SSH section, not at the repo field: an SSH pane has no local
+  // repository, and sending the human to a hidden field is sending them nowhere.
+  assert.ok(!res.ok && res.focus === "ssh");
+  assert.match(res.ok ? "" : res.error, /connection/i);
+});
+
+test("an SSH pane plans the connection itself, plus a name — and no local cwd", () => {
+  const profile = sshProfile();
+  const res = planPaneSetup(input({ kind: "ssh", sshProfile: profile, name: " prod " }));
+  assert.ok(res.ok);
+  // Deep-equal, like the content kinds: an SSH pane's LOCAL cwd is deliberately
+  // home, so a `cwd`/`repo` sneaking into the plan would be a local directory
+  // nobody picked — feeding local chrome (git watch, the folder picker) that
+  // cannot mean anything for a pane whose files are on another machine.
+  assert.deepEqual(res.plan, { kind: "ssh", profile, name: "prod" });
+});
+
+test("an SSH pane's name defaults to the connection's own name, then its destination", () => {
+  const named = planPaneSetup(input({ kind: "ssh", sshProfile: sshProfile(), name: "" }));
+  assert.ok(named.ok && named.plan.kind === "ssh" && named.plan.name === "build box");
+  // A connection whose name is only whitespace still has to produce a title.
+  const blank = planPaneSetup(input({ kind: "ssh", sshProfile: sshProfile({ name: "  x  " }), name: "" }));
+  assert.ok(blank.ok && blank.plan.kind === "ssh");
+  assert.equal(blank.ok && blank.plan.kind === "ssh" ? blank.plan.name : "", "x");
+});
+
+test("the SSH kind is not a content kind — it spawns a process like a terminal", () => {
+  // The form hides its CLI/shell/worktree fields off `isContentKind`. An SSH pane
+  // is PTY-backed (a local ssh client IS its child process), so classifying it as
+  // content would hide the wrong fields and, worse, imply a pane with no process.
+  assert.equal(isContentKind("ssh"), false);
+});
+
+// --- the launch-seam destination guard: the belt on S1's profile-level refusal ---
+
+test("an SSH destination ssh would read as an OPTION is refused at the launch seam", () => {
+  // The case this exists for: `-oProxyCommand=<cmd>` makes ssh run <cmd> on the
+  // LOCAL machine. The profile store refuses such a destination on the way to and
+  // from disk — but a connection launched from this form may never have been near
+  // the disk (the inline editor builds one out of text typed seconds ago), so the
+  // refusal has to exist HERE too, before anything spawns.
+  for (const destination of ["-oProxyCommand=calc.exe", "user@-oProxyCommand=calc.exe"]) {
+    const res = planPaneSetup(input({ kind: "ssh", sshProfile: sshProfile({ destination }) }));
+    assert.equal(res.ok, false, `${destination} must not launch`);
+    assert.ok(!res.ok && res.focus === "ssh");
+    // Specific, not the generic "pick a connection" — the human has to be able to
+    // tell which field is wrong and why.
+    assert.match(res.ok ? "" : res.error, /leading "-"|isn't a destination/i);
+    assert.match(res.ok ? "" : res.error, /ProxyCommand/);
+  }
+});
+
+test("…and an ordinary destination still launches — the guard must not refuse the real case", () => {
+  // Without this, "refuse every destination" would pass the test above. All three
+  // shapes S1 documents: user@host, a bare host, and an ssh_config alias.
+  for (const destination of ["dev@build.example.net", "build.example.net", "buildbox"]) {
+    const res = planPaneSetup(input({ kind: "ssh", sshProfile: sshProfile({ destination }) }));
+    assert.ok(res.ok && res.plan.kind === "ssh", `${destination} must launch`);
+    assert.equal(res.ok && res.plan.kind === "ssh" ? res.plan.profile.destination : "", destination);
+  }
+});
+
+test("the planned connection is the NORMALIZED one — what launches is what gets saved", () => {
+  // The form hands over raw field text; the plan runs it through the profile
+  // store's own normalizer. Without that, an identity file carrying key material
+  // would still reach `ssh -i` on the command line while being dropped from
+  // sshprofiles.json — the launched pane and the saved connection disagreeing
+  // about what they are.
+  const pem = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEA\n-----END…";
+  const res = planPaneSetup(
+    input({ kind: "ssh", sshProfile: sshProfile({ identityFile: pem, port: 99_999 }) })
+  );
+  assert.ok(res.ok && res.plan.kind === "ssh");
+  if (res.ok && res.plan.kind === "ssh") {
+    assert.equal(res.plan.profile.identityFile, null, "key material must not reach the command line");
+    assert.equal(res.plan.profile.port, null, "an out-of-range port is dropped, not clamped");
+  }
+});
+
+// --- composing a profile (S1) into the builder's parameters (S2) ---
+
+test("a connection with no remote CLI composes a plain login shell", () => {
+  const params = sshLaunchParams(sshProfile({ remoteCwd: "/srv/app" }), null);
+  assert.equal(params.remoteCommand, undefined, "no CLI means no remote command at all");
+  // …and no remote cwd either: with nothing to run, there is nothing to `cd`
+  // before. ssh hands the human their own login shell, whose start directory is
+  // the remote's business.
+  assert.equal(params.remoteCwd, undefined);
+  assert.equal(params.destination, "dev@build.example.net");
+});
+
+test("claude gets a loomux-minted session id on the remote command line", () => {
+  // The one session-identity mechanism that survives the trip: it rides on the
+  // command line, where ssh carries it verbatim. Everything else loomux uses is a
+  // scan of a LOCAL store.
+  const params = sshLaunchParams(sshProfile({ defaultCli: "claude" }), "sess-1");
+  assert.deepEqual(params.remoteCommand, ["claude", "--session-id", "sess-1"]);
+});
+
+test("a non-claude remote CLI gets NO session flags, even when an id is handed over", () => {
+  // The failure this prevents: `--session-id` is not copilot's flag, so a pane
+  // that "helpfully" passed it would die on its first line instead of starting.
+  const params = sshLaunchParams(sshProfile({ defaultCli: "copilot" }), "sess-1");
+  assert.deepEqual(params.remoteCommand, ["copilot"]);
+  assert.equal(sshMintsSessionId("copilot"), false);
+  assert.equal(sshMintsSessionId("claude"), true);
+  assert.equal(sshMintsSessionId(null), false);
+});
+
+test("unset profile fields become ABSENT parameters, not zeroes", () => {
+  // The profile spells "unset" as null; the builder spells it as an absent key,
+  // and emits an option only for a key that is present. A null leaking through as
+  // `port: null` would emit `-p null`; as `keepaliveSeconds: 0` it would emit the
+  // ServerAlive option S1 refuses to let mean two things.
+  const bare = sshLaunchParams(sshProfile({ defaultCli: "claude" }), null);
+  assert.equal(bare.port, undefined);
+  assert.equal(bare.identityFile, undefined);
+  assert.equal(bare.keepaliveSeconds, undefined);
+  assert.equal(bare.extraArgs, undefined);
+  // …and a set one travels through unchanged.
+  const full = sshLaunchParams(
+    sshProfile({
+      defaultCli: "claude",
+      port: 2222,
+      identityFile: "~/.ssh/id_ed25519",
+      keepaliveSeconds: 30,
+      extraArgs: ["-J", "jump.example.net"],
+      remoteCwd: "/srv/app",
+      remoteShell: "posix",
+    }),
+    null
+  );
+  assert.equal(full.port, 2222);
+  assert.equal(full.identityFile, "~/.ssh/id_ed25519");
+  assert.equal(full.keepaliveSeconds, 30);
+  assert.deepEqual(full.extraArgs, ["-J", "jump.example.net"]);
+  assert.equal(full.remoteCwd, "/srv/app");
+});
+
+test("the composed argv is a real ssh command line, end to end", () => {
+  // The whole S1→S2 seam in one assertion, through the same `program` seam a
+  // fake-ssh stub substitutes for hand-validation. The shape that matters: `-t`
+  // (a remote TUI needs a pty), options BEFORE the destination, then `--` and
+  // exactly ONE quoted remote-command string — so nothing in the remote command
+  // can be re-read as another ssh option or another argv word.
+  const argv = sshLaunchArgv(
+    "C:\\Windows\\System32\\OpenSSH\\ssh.exe",
+    sshProfile({ defaultCli: "claude", port: 2222, remoteCwd: "/srv/app" }),
+    "sess-1"
+  );
+  assert.deepEqual(argv, [
+    "C:\\Windows\\System32\\OpenSSH\\ssh.exe",
+    "-t",
+    "-p",
+    "2222",
+    "dev@build.example.net",
+    "--",
+    "cd '/srv/app' && exec 'claude' '--session-id' 'sess-1'",
+  ]);
+});
+
+test("a login-shell connection composes an argv with no -t, no -- and no command", () => {
+  const argv = sshLaunchArgv("ssh.exe", sshProfile(), null);
+  assert.deepEqual(argv, ["ssh.exe", "dev@build.example.net"]);
+});
+
+test("an unknown remote CLI warns rather than refusing — it is a remote program, not ours", () => {
+  // S1's stated contract: a profile naming a CLI this build doesn't know "is a
+  // profile to warn about, not a profile to silently delete". What loomux's
+  // catalog decides is which CLIs it can add flags for — not what the remote
+  // machine is allowed to have installed.
+  const known = ["claude", "copilot"];
+  assert.match(sshRemoteCliWarning("aider", known), /aider/);
+  assert.match(sshRemoteCliWarning("aider", known), /no session id/i);
+  assert.equal(sshRemoteCliWarning("claude", known), "");
+  assert.equal(sshRemoteCliWarning(null, known), "", "a login shell is not an unknown CLI");
+  // And it stays a warning: the launch still plans.
+  const res = planPaneSetup(input({ kind: "ssh", sshProfile: sshProfile({ defaultCli: "aider" }) }));
+  assert.ok(res.ok);
+});
+
+// --- the #887/#888 boundary: SSH panes are never orchestration members ---
+
+test("an SSH pane can never be given an orchestration identity — the #888 boundary", () => {
+  // THE guardrail this slice owes. An SSH pane as a group member is not a feature
+  // that degrades, it is one that breaks silently: worktrees are local dirs made
+  // by local git, the MCP server is loopback-only, and the gh shim reaches only
+  // locally-spawned children — so a remote worker's `gh pr merge` would face NO
+  // merge gate at all. Refusal, not best-effort.
+  //
+  // Every marker refuses ON ITS OWN, so a spawn carrying half an identity is
+  // refused too: a group with no role, a role with no group, a bare agent id.
+  for (const orch of [
+    { orchGroup: "g1" },
+    { orchRole: "worker" },
+    { orchAgent: "a1" },
+    { orchGroup: "g1", orchRole: "worker", orchAgent: "a1" },
+  ]) {
+    const refusal = sshOrchestrationRefusal({ ssh: true, ...orch });
+    assert.ok(refusal, `an ssh pane carrying ${JSON.stringify(orch)} must be refused`);
+    assert.match(refusal ?? "", /#887|SSH panes are solo/);
+  }
+});
+
+test("…and the guardrail refuses ONLY that combination", () => {
+  // The other half: an ordinary orchestration pane (the overwhelmingly common
+  // case) and an ordinary SSH pane both have to keep working. A guard that
+  // refused either would have failed loudly in the app rather than quietly here,
+  // but it would also have made the test above vacuous.
+  assert.equal(sshOrchestrationRefusal({ ssh: false, orchGroup: "g1", orchRole: "worker" }), null);
+  assert.equal(sshOrchestrationRefusal({ ssh: true }), null);
+  assert.equal(sshOrchestrationRefusal({ ssh: true, orchGroup: null, orchRole: null, orchAgent: null }), null);
+  assert.equal(sshOrchestrationRefusal({ ssh: false }), null);
 });
 
 // ---------- SubmitLatch's second consumer: the app-quit confirm (#219) ----------

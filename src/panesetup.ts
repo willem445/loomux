@@ -31,6 +31,21 @@
 // exactly like its three siblings: the path is mandatory here, and whether it is a
 // readable directory is I/O the form probes.
 
+// #887 (slice S3) adds an EIGHTH kind: `ssh` — a pane whose process is a local
+// ssh.exe client connected to a remote host, optionally launching an agent CLI
+// there. Its declaration is an SSH PROFILE (sshprofile.ts, slice S1), and the
+// argv it spawns is built by the pure builder (sshcommand.ts, slice S2); this
+// module is the seam between them, so the whole compose path is unit-tested
+// without a DOM. What it validates is what only it can: that a profile was
+// chosen at all, and that the destination is still one ssh will read as a HOST
+// rather than as an option.
+
+// Explicit `.ts` on both (the convention promote.ts / sessionroute.ts document):
+// these are VALUE imports in a module `node --test` loads directly, so they have
+// to resolve without a bundler.
+import { normalizeSshProfile, sshDestinationOrNull, type SshProfile } from "./sshprofile.ts";
+import { buildSshArgv, claudeSessionArgs, type SshCommandParams } from "./sshcommand.ts";
+
 export type PaneKind =
   | "agent"
   | "orchestrator"
@@ -38,7 +53,8 @@ export type PaneKind =
   | "files"
   | "editor"
   | "git"
-  | "workflow";
+  | "workflow"
+  | "ssh";
 export type ShellKind = "powershell" | "gitbash" | "cmd";
 
 const AGENT_MIN = 1;
@@ -75,6 +91,12 @@ export interface PaneSetupInput {
   autopilot: boolean;
   /** Selected shell kind (terminal kind). */
   shellKind: ShellKind;
+  /** SSH kind (#887 S3): the connection this pane launches, as the form has it
+   *  RIGHT NOW — the picked profile with the inline editor's fields already
+   *  applied, since those fields ARE the profile's (the form is the profile
+   *  editor, and submitting saves what it launches). `null` when the human has
+   *  picked nothing yet, or has a half-filled new connection. */
+  sshProfile: SshProfile | null;
 }
 
 export interface TerminalPlan {
@@ -140,6 +162,25 @@ export interface WorkflowPlan {
   root: string;
   name: string;
 }
+/** An SSH pane (#887 S3): a local `ssh.exe` connected to the profile's host, with
+ *  the profile's `defaultCli` (if any) launched on the far end. The plan carries
+ *  the whole PROFILE rather than a copy of its fields — every consumer downstream
+ *  (the argv composer, the saved store, the pane's own record of which connection
+ *  it belongs to) wants the same object, and a flattened copy is how the launched
+ *  command and the saved profile come to disagree.
+ *
+ *  No `cwd`: an SSH pane's LOCAL working directory is deliberately home. The repo
+ *  lives on the remote host and no local path corresponds to it, so a local cwd
+ *  here would be a directory the human never picked, feeding local-filesystem
+ *  chrome (git watch, the folder picker) that cannot mean anything for this pane.
+ *  The REMOTE directory is `profile.remoteCwd`, quoted into the remote command by
+ *  sshcommand.ts. */
+export interface SshPlan {
+  kind: "ssh";
+  /** The connection to launch — validated here, saved by the form. */
+  profile: SshProfile;
+  name: string;
+}
 export type PaneSetupPlan =
   | TerminalPlan
   | AgentPlan
@@ -147,7 +188,8 @@ export type PaneSetupPlan =
   | FilesPlan
   | EditorPlan
   | GitPlan
-  | WorkflowPlan;
+  | WorkflowPlan
+  | SshPlan;
 
 /** The per-kind halves of the content-pane rule: what to call the missing path in
  *  the error, and what to fall back to when the human names the pane nothing. The
@@ -166,7 +208,7 @@ const CONTENT_SETUP: Record<
 };
 
 /** Which field to focus when validation fails, so the form can surface it. */
-export type PaneSetupFocus = "repo" | "custom" | "count";
+export type PaneSetupFocus = "repo" | "custom" | "count" | "ssh";
 
 export type PaneSetupResult =
   | { ok: true; plan: PaneSetupPlan }
@@ -289,6 +331,145 @@ export function resolveShellKind(requested: ShellKind, avail: ShellKindAvailabil
   return opt && opt.enabled ? requested : "powershell";
 }
 
+// ---------- SSH panes (#887 S3) ----------
+
+export const SSH_NO_PROFILE =
+  "Pick an SSH connection — or fill in a new one (a name and a destination) first.";
+
+/** The refusal for a destination ssh would read as an option rather than a host.
+ *  Quotes the value back: the human typed it, and a refusal that doesn't say
+ *  which of several fields it means is a refusal they have to guess at. */
+export function sshDestinationError(destination: string): string {
+  return (
+    `"${destination}" isn't a destination ssh can use — it must be a host, user@host, or an ` +
+    `ssh_config alias, with no leading "-" and no spaces (ssh reads a leading dash as one of ` +
+    `its own options, not as a host).`
+  );
+}
+
+/** Whether loomux mints a session id for a CLI launched on the REMOTE host.
+ *
+ *  Claude only, and for a structural reason rather than a preference: claude's
+ *  session identity is a value loomux puts ON THE COMMAND LINE (`--session-id`),
+ *  which survives the trip through ssh untouched. Every other CLI's id is
+ *  DISCOVERED by reading a local store afterwards (copilot's session-state dir,
+ *  opencode's SQLite) — mechanisms that reach the machine loomux runs on, not
+ *  the host the agent is running on. So a remote copilot/opencode pane gets no
+ *  recorded id, which is what makes its restore honest rather than a `--resume`
+ *  of an id nobody can look up (#887 plan part 4a). One implementation, called
+ *  by both the launcher (deciding whether to mint) and the composer below
+ *  (deciding whether to emit the flag), so those two can never disagree. */
+export function sshMintsSessionId(remoteCli: string | null): boolean {
+  return remoteCli === "claude";
+}
+
+/** A warning for a profile naming a remote CLI this build doesn't know, or `""`.
+ *
+ *  Deliberately a warning and not a refusal — S1's own contract: a profile
+ *  naming an unknown CLI "is a profile to warn about, not a profile to silently
+ *  delete on load". `defaultCli` is only ever a program name to run on the far
+ *  host; loomux's catalog decides what it can add flags for (see
+ *  `sshMintsSessionId`), not what the remote machine is allowed to have
+ *  installed. So the launch proceeds and the human is told what they will and
+ *  won't get. */
+export function sshRemoteCliWarning(remoteCli: string | null, known: readonly string[]): string {
+  if (!remoteCli || known.includes(remoteCli)) return "";
+  return (
+    `"${remoteCli}" isn't a CLI loomux knows — it will be run on the remote host exactly as ` +
+    `written, with no session id and no autopilot flags.`
+  );
+}
+
+/** Compose a validated SSH plan into the flat parameters sshcommand.ts (S2)
+ *  takes. This is the S1→S2 seam: the profile is the user's declaration, the
+ *  params are what one launch of it means.
+ *
+ *  `sessionId` is the loomux-minted claude session id (the launcher mints it
+ *  with the webview's Web Crypto), or null. It is emitted only when the remote
+ *  CLI is one loomux mints for — a `--session-id` handed to copilot would be an
+ *  unknown flag, and the pane would die on its first line of output.
+ *
+ *  Deliberately does NOT re-check the destination. It is checked exactly once
+ *  on the way in, at the launch seam (`planPaneSetup` above, which bounces it
+ *  back to the human legibly) and once at the far end as `buildSshArgv`'s own
+ *  backstop for callers that never planned. A third copy here would be a guard
+ *  no input can reach — the shape of dead code that reads as a live protection
+ *  (#907 review NF1's lesson, applied forward). */
+export function sshLaunchParams(profile: SshProfile, sessionId: string | null): SshCommandParams {
+  const remoteCli = profile.defaultCli;
+  const remoteCommand = remoteCli
+    ? sessionId && sshMintsSessionId(remoteCli)
+      ? [remoteCli, ...claudeSessionArgs(sessionId, "fresh")]
+      : [remoteCli]
+    : undefined;
+  return {
+    destination: profile.destination,
+    // `?? undefined` throughout: the profile spells "unset" as null, and S2
+    // spells it as an absent key — an explicit `port: undefined` would still be
+    // an own property, but `undefined` is what its `!== undefined` tests read as
+    // absent, so the two vocabularies meet here and nowhere else.
+    port: profile.port ?? undefined,
+    identityFile: profile.identityFile ?? undefined,
+    keepaliveSeconds: profile.keepaliveSeconds ?? undefined,
+    extraArgs: profile.extraArgs.length ? profile.extraArgs : undefined,
+    remoteShell: profile.remoteShell,
+    // Only meaningful with a remote command: `cd`ing and then handing the shell
+    // back is not something ssh can do for a login shell (that is the remote's
+    // own `~/.profile` territory), and S2 quotes this for the declared shell.
+    remoteCwd: remoteCommand ? profile.remoteCwd ?? undefined : undefined,
+    remoteCommand,
+  };
+}
+
+/** The full argv one SSH launch spawns: `program` is the RESOLVED local ssh.exe
+ *  (the launcher probes for it — PATH first, then the System32 OpenSSH install),
+ *  which is also the fake-ssh seam S2 documents.
+ *
+ *  Throws only what `buildSshArgv` throws — a remote-command token cmd.exe
+ *  cannot be given safely (a newline, a trailing backslash). The launcher
+ *  catches that and surfaces it inline, because it is a fixable data problem
+ *  (the remote folder, usually), not a bug. */
+export function sshLaunchArgv(program: string, profile: SshProfile, sessionId: string | null): string[] {
+  return buildSshArgv(program, sshLaunchParams(profile, sessionId));
+}
+
+/** The #887/#888 boundary, enforced rather than merely documented: an SSH pane
+ *  can never be a member of an orchestration group.
+ *
+ *  Returns the refusal to throw, or null when the spawn is legitimate. The
+ *  reasons are concrete and none of them degrade gracefully (plan part 4c):
+ *  worktrees are local dirs made by local git; the MCP server is loopback-only
+ *  and its per-agent config reaches only children loomux spawns itself; the gh
+ *  shim reaches only locally-spawned children, so a remote `gh` would face NO
+ *  merge gate at all — a security regression, and the reason this is a refusal
+ *  instead of a best-effort degradation; and every brief a local orchestrator
+ *  writes names local paths.
+ *
+ *  Nothing in the spawn path builds this combination today: the backend's spawn
+ *  requests carry a role and a command, never a pane kind or an SSH profile, and
+ *  the group surfaces never offer one. This exists so that stays true — a future
+ *  edit that wires an SSH profile into a delegate spawn fails loudly at the pane,
+ *  before any process starts, instead of quietly producing a group member whose
+ *  merge gate isn't enforced. Fail-closed by construction: it refuses on ANY
+ *  orchestration marker, so a spawn that carries only half an identity is
+ *  refused too. */
+export function sshOrchestrationRefusal(spawn: {
+  ssh: boolean;
+  orchGroup?: string | null;
+  orchRole?: string | null;
+  orchAgent?: string | null;
+}): string | null {
+  if (!spawn.ssh) return null;
+  const marker = spawn.orchGroup || spawn.orchRole || spawn.orchAgent;
+  if (!marker) return null;
+  return (
+    "refusing to give an SSH pane an orchestration identity: SSH panes are solo panes in v1 " +
+    "(#887) — worktrees, the loopback MCP server and the gh merge gate all reach only " +
+    "locally-spawned children, so a remote group member would run with the merge gate " +
+    "unenforced. Remote orchestration is #888."
+  );
+}
+
 /** Validate + shape the chosen pane setup. Pure — no probes, no worktree
  *  creation, no autopilot-flag lookup; those async side effects stay in the form
  *  and run only after this returns `ok`. */
@@ -310,6 +491,39 @@ export function planPaneSetup(input: PaneSetupInput): PaneSetupResult {
       };
     }
     return { ok: true, plan: { kind: "orchestrator", repo } };
+  }
+
+  // SSH (#887 S3). Two rules, and they are the only two this module can decide:
+  // a connection was chosen, and its destination is still something ssh will
+  // read as a HOST. Everything else about an SSH launch is either the profile's
+  // own business (validated by sshprofile.ts on the way to and from disk) or I/O
+  // the form does after this returns ok — resolving ssh.exe, saving the profile.
+  if (input.kind === "ssh") {
+    const raw = input.sshProfile;
+    if (!raw) return { ok: false, error: SSH_NO_PROFILE, focus: "ssh" };
+    // Through the STORE's own normalizer, not a second set of field rules here.
+    // A profile reaching this point may never have touched the disk — the
+    // launcher's inline editor builds one out of text typed seconds ago — so
+    // this is where it meets the same guards `sshprofiles.json` applies, and
+    // it is what makes the profile this pane LAUNCHES identical to the one the
+    // form SAVES (an identity file carrying key material, or an out-of-range
+    // port, is dropped from both or from neither).
+    const profile = normalizeSshProfile(raw);
+    if (!profile) {
+      // Normalization refuses an entry for exactly three fields, and only one of
+      // them can be wrong in a way the human should be told about specifically:
+      // a destination that isn't one. A leading `-` is the case that matters —
+      // it is an ssh OPTION rather than a host, and `-oProxyCommand=…` runs a
+      // command on the LOCAL machine — so it is refused here, legibly and before
+      // any spawn, rather than left to the exception `buildSshArgv` throws as
+      // its own backstop. (A blank id/name is the other route, and reads as the
+      // half-filled form it is.)
+      return sshDestinationOrNull(raw.destination) === null
+        ? { ok: false, error: sshDestinationError(raw.destination), focus: "ssh" }
+        : { ok: false, error: SSH_NO_PROFILE, focus: "ssh" };
+    }
+    const name = input.name.trim() || profile.name || profile.destination;
+    return { ok: true, plan: { kind: "ssh", profile, name } };
   }
 
   // The CONTENT kinds (#214 files, #217 editor + git, #222 workflow). ONE rule, because
