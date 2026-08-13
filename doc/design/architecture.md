@@ -68,7 +68,7 @@ src-tauri/src/
     digest.rs       session-digest friction extraction (#250/#324): one normalizer per agent CLI (Claude `.jsonl`, Copilot session-state, OpenCode `message`/`part` rows) turning a transcript into one event stream, then reduces it, deterministically and LLM-free, into "friction windows" (a tool error, a near-duplicate rerun, a test that went red-then-green, a reverted edit) — the `session_digest` MCP tool a `role_hint: process` block calls to mine a finished session cold. See doc/design/supervisor-skills.md
   obs.rs            crash observability: panic hook, breadcrumb log, unclean-exit notice; `data_root()` — the `<data dir>/loomux` root, overridable via `LOOMUX_DATA_DIR` (#394) for an isolated profile
   voice.rs          voice prompts (#58): mic capture (cpal) -> local whisper.cpp subprocess
-  uistate.rs        durable UI state: atomic tabs.json store (project tabs #63) + settings.json store (app settings #370) -- same atomic-write/corrupt-quarantine primitives, opaque JSON owned by the frontend schema
+  uistate.rs        durable UI state: atomic tabs.json store (project tabs #63) + settings.json store (app settings #370) + sshprofiles.json store (SSH connection profiles #887, hostnames/ports/identity-file PATHS only -- never a credential) -- same atomic-write/corrupt-quarantine primitives, opaque JSON owned by the frontend schema
   fileedit.rs       file-editor overlay (#174): lazy tree, read/write (atomic + hash conflict), streaming gitignore-aware search/replace (#207) + path-only name enumeration (#214); server-side path safety
   filemgr.rs        file-MANAGER pane (#214): list, new file/folder, rename, delete-to-Recycle-Bin, open-with-default-app, open-with chooser, reveal-in-OS-file-manager; reuses fileedit's path choke point. Shell APIs come from the `windows` dep we already have (ShellExecuteW + SHFileOperationW)
   filehash.rs       file hashing (#214): SHA-256/512, SHA-1, CRC-32/16/8 — streamed off-thread on a worker (never the main thread), cancellable via the #207 registry
@@ -91,6 +91,7 @@ src/
   tabroute.ts       pure tab routing + preview scale/sanitizer (unit-tested, DOM-free)
   tabstore.ts       pure encode/decode + schema validation of the persisted tab set (tabs + per-tab pane layout + restore pref, #194; a tab's group BINDINGS are a set and each orch pane records its own group, #485)
   settings.ts       durable app-wide settings (#370): pure encode/decode (DOM-free, unit-tested) + an in-memory singleton (getSettings/setSettings) for synchronous reads from pane.ts's keydown handler. Config-file-only -- no Settings UI exists yet
+  sshprofile.ts     SSH connection profiles (#887): pure encode/decode + per-entry validation of sshprofiles.json (DOM-free, unit-tested). Allowlist in BOTH directions and an identity-file path guard, so the no-secrets invariant is structural -- a credential cannot survive a load/save cycle
   restoredecision.ts pure restore-vs-fresh-vs-ask decision for the boot splash (DOM-free, unit-tested, #194)
   panerestore.ts    pure per-pane restore policy + layout-tree -> ordered rebuild plan + agent resume-command builder (DOM-free, unit-tested, #194)
   restoresplash.ts  cold-boot "restore last session?" overlay (thin DOM over restoredecision.ts, #194)

@@ -1,14 +1,17 @@
-//! Durable UI state persisted across launches — the project-tab set (#63) and,
-//! since #370, app-wide terminal settings. Both are app-global (not per-group),
-//! so they live directly under the app data dir as `tabs.json`/`settings.json`,
-//! siblings of `orchestration/` and `logs/` — the same `<data dir>/loomux/…`
-//! tree the rest of the app's durable state uses (see
-//! `OrchRegistry::default_root`, `obs::logs_dir`).
+//! Durable UI state persisted across launches — the project-tab set (#63),
+//! since #370 app-wide terminal settings, and since #887 the user's SSH
+//! connection profiles. All three are app-global (not per-group), so they live
+//! directly under the app data dir as
+//! `tabs.json`/`settings.json`/`sshprofiles.json`, siblings of
+//! `orchestration/` and `logs/` — the same `<data dir>/loomux/…` tree the rest
+//! of the app's durable state uses (see `OrchRegistry::default_root`,
+//! `obs::logs_dir`).
 //!
 //! Each blob is an OPAQUE JSON string the frontend owns the schema for
-//! (`src/tabstore.ts` / `src/settings.ts` encode/decode and validate their own
-//! shape — this file never parses either beyond "is it JSON at all"). The
-//! backend's job here is narrow but critical, and identical for both files:
+//! (`src/tabstore.ts` / `src/settings.ts` / `src/sshprofile.ts` encode/decode
+//! and validate their own shape — this file never parses any of them beyond
+//! "is it JSON at all"). The backend's job here is narrow but critical, and
+//! identical for all three:
 //!
 //!  1. **Atomic writes.** Serialize to a sibling temp file, then rename over the
 //!     target. A bare `fs::write` truncates the file in place, so a crash / kill
@@ -44,11 +47,11 @@ static STATE_DIR_OVERRIDE: Mutex<Option<PathBuf>> = Mutex::new(None);
 static WRITE_TICKET: AtomicU64 = AtomicU64::new(0);
 
 /// The newest ticket already durably written, per path — the high-water mark
-/// [`write_atomic_seq`] compares against. Keyed by path because `tabs.json` and
-/// `settings.json` are independent files with independent save gestures; a slow
-/// settings write must not make a tab save look stale. A `Vec` and not a
-/// `HashMap`: it holds two entries in production and three in a test, and a
-/// linear scan of two is not worth a hasher.
+/// [`write_atomic_seq`] compares against. Keyed by path because `tabs.json`,
+/// `settings.json` and `sshprofiles.json` are independent files with
+/// independent save gestures; a slow settings write must not make a tab save
+/// look stale. A `Vec` and not a `HashMap`: it holds three entries in
+/// production, and a linear scan of three is not worth a hasher.
 static WRITE_HIGH_WATER: Mutex<Vec<(PathBuf, u64)>> = Mutex::new(Vec::new());
 
 /// Take the next dispatch ticket. Called by a save command **before** its first
@@ -127,6 +130,22 @@ fn tabs_path() -> PathBuf {
 /// Absolute path of the persisted app settings (#370).
 fn settings_path() -> PathBuf {
     state_dir().join("settings.json")
+}
+
+/// Absolute path of the persisted SSH connection profiles (#887).
+///
+/// A sibling file rather than a key inside `settings.json`: this is a
+/// multi-entry LIST with its own lifecycle (add/edit/delete a profile) next to
+/// a flat bag of app-wide scalars, and keeping them separate keeps both schemas
+/// simple. It is deliberately not `localStorage` either — profiles must survive
+/// a webview data clear, the same argument that moved the tab set here in #63.
+///
+/// Nothing secret is ever stored in it: a profile holds hostnames, ports and
+/// the PATH of an identity file, never key material or a password (see
+/// `src/sshprofile.ts`, which owns and enforces that schema). Authentication is
+/// the user's ssh_config/ssh-agent's job, mirroring `gh.rs`'s no-token posture.
+fn ssh_profiles_path() -> PathBuf {
+    state_dir().join("sshprofiles.json")
 }
 
 /// Atomically write `contents` to `path`: create the parent dir, write a unique
@@ -240,6 +259,29 @@ pub async fn load_settings() -> Option<String> {
 pub async fn save_settings(contents: String) -> Result<(), String> {
     let ticket = next_write_ticket();
     crate::blocking::run_blocking(move || write_atomic_seq(&settings_path(), &contents, ticket))
+        .await
+}
+
+/// Read the persisted SSH connection profiles (#887) as an opaque JSON string,
+/// or `null` on first run / a quarantined corrupt file — `src/sshprofile.ts`
+/// degrades that to an empty profile list, exactly like
+/// `load_ui_tabs`/`tabstore.ts` and `load_settings`/`settings.ts`.
+///
+/// **Reentrancy.** Identical to [`load_ui_tabs`], on its own sibling file.
+#[tauri::command]
+pub async fn load_ssh_profiles() -> Option<String> {
+    crate::blocking::run_blocking(|| load_or_quarantine(&ssh_profiles_path())).await
+}
+
+/// Persist SSH connection profiles (an opaque JSON string produced by
+/// `sshprofile.ts`), atomically. Same best-effort contract as `save_ui_tabs`.
+///
+/// **Reentrancy.** Same ticket as [`save_ui_tabs`], against its own path's
+/// high-water mark — none of the three files gate each other.
+#[tauri::command]
+pub async fn save_ssh_profiles(contents: String) -> Result<(), String> {
+    let ticket = next_write_ticket();
+    crate::blocking::run_blocking(move || write_atomic_seq(&ssh_profiles_path(), &contents, ticket))
         .await
 }
 
@@ -377,6 +419,23 @@ mod tests {
             "a newer write that never landed gated an older one that could — leaving the file \
              with neither"
         );
+    }
+
+    #[test]
+    fn the_three_state_files_are_distinct_siblings() {
+        // The failure this catches is a copy-paste one, and it is destructive:
+        // `ssh_profiles_path` was written by duplicating `settings_path`, and a
+        // duplicate that kept the old file name would make every profile save
+        // silently overwrite the user's `settings.json` (atomically, durably,
+        // with no error anywhere). Pure path math — nothing is read or written.
+        let (tabs, settings, ssh) = (tabs_path(), settings_path(), ssh_profiles_path());
+        assert_eq!(ssh.file_name().unwrap(), "sshprofiles.json");
+        assert_ne!(ssh, tabs, "profiles must not write over the tab set");
+        assert_ne!(ssh, settings, "profiles must not write over app settings");
+        // All three are siblings in the one app-global state dir, which is what
+        // makes the per-path write ordering above the whole story for them.
+        assert_eq!(ssh.parent(), tabs.parent());
+        assert_eq!(ssh.parent(), settings.parent());
     }
 
     #[test]

@@ -173,6 +173,18 @@ export const loadSettings = (): Promise<string | null> => invoke<string | null>(
 export const saveSettings = (contents: string): Promise<void> =>
   invoke("save_settings", { contents });
 
+/** Load the persisted SSH connection profiles (#887), or null on first run /
+ *  after a corrupt file was quarantined backend-side (the caller then seeds an
+ *  empty profile list). Opaque JSON here too — `sshprofile.ts` owns the schema,
+ *  and the invariant that it never contains a credential. */
+export const loadSshProfiles = (): Promise<string | null> =>
+  invoke<string | null>("load_ssh_profiles");
+
+/** Persist SSH connection profiles atomically. Same best-effort contract as
+ *  `saveUiTabs`. */
+export const saveSshProfiles = (contents: string): Promise<void> =>
+  invoke("save_ssh_profiles", { contents });
+
 // ---------- window lifecycle (#219) ----------
 
 /** This build's version, as declared in `tauri.conf.json` / `package.json`.

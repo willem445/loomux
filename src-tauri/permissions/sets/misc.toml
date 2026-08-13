@@ -1,6 +1,6 @@
 [[set]]
 identifier = "misc"
-description = "Ungrouped single-module commands: session listing, copilot/claude autopilot launch-posture recording, agent CLI probing, external editor launch, file hashing, startup notice, durable UI tab state, durable app settings, voice capture."
+description = "Ungrouped single-module commands: session listing, copilot/claude autopilot launch-posture recording, agent CLI probing, external editor launch, file hashing, startup notice, durable UI tab state, durable app settings, durable SSH connection profiles, voice capture."
 permissions = [
     "allow-list-sessions",
     "allow-record-copilot-launch-posture",
@@ -13,6 +13,8 @@ permissions = [
     "allow-save-ui-tabs",
     "allow-load-settings",
     "allow-save-settings",
+    "allow-load-ssh-profiles",
+    "allow-save-ssh-profiles",
     "allow-voice-start",
     "allow-voice-stop",
     "allow-voice-cancel",
