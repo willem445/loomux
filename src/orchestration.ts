@@ -32,6 +32,7 @@ import {
   promoteRecoveryNote,
   type PromoteWorkflow,
 } from "./promote";
+import { readingsByPty, type QueueDepthReading } from "./queuebadge";
 
 export type { AutonomyState };
 export type { WorkflowPreview };
@@ -536,6 +537,27 @@ export function initOrchestration(wiring: OrchWiring): void {
   });
   void listen<{ pty_id: number }>("orch-delivery-held-cleared", ({ payload }) => {
     wiring.findByPty(payload.pty_id)?.setHeld(null);
+  });
+  // Delivery-queue depth (#814): the backend pushes the FULL set of panes that
+  // currently have something queued, so a pane's ABSENCE from the payload is
+  // how a drained queue is reported — there is no paired "cleared" event to
+  // miss, and a lost push self-corrects on the next one. Applied across all
+  // tabs for the same reason attention routing is: a hidden tab's stalled queue
+  // is still the thing the human needs to see, and a docked pane mirrors it onto
+  // its dock chip.
+  //
+  // No bound of its own here (see test/perfpolicy.test.ts's row): the backend
+  // does not emit an unchanged set, so this O(panes) sweep runs only when
+  // something actually moved, and `setQueueDepth` is idempotent on the reading
+  // besides.
+  void listen<QueueDepthReading[]>("orch-queue-depth", ({ payload }) => {
+    const byPty = readingsByPty(payload);
+    for (const grid of wiring.allGrids()) {
+      for (const pane of grid.allPanes()) {
+        const pty = pane.ptyId;
+        pane.setQueueDepth(pty === null ? null : byPty.get(pty) ?? null);
+      }
+    }
   });
   // End-orchestration: the backend has already killed the group's agents, so
   // close their (now-dead) panes across every tab rather than leaving a screen

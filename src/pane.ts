@@ -49,6 +49,7 @@ import { isAppShortcut } from "./shortcuts";
 import { attentionPresentation, attentionDismiss } from "./attention";
 import { dismissStranded } from "./orchestration";
 import { heldPresentation } from "./heldbadge";
+import { queuePresentation, type QueueDepthReading } from "./queuebadge";
 import { makeRenameCommit } from "./panerename";
 import { shouldResizePty } from "./panefit";
 import { swapEditor } from "./domutil";
@@ -654,6 +655,13 @@ export class Pane implements VoiceTargetPane {
    *  does). */
   private heldChip: HTMLElement;
   private heldReason: string | null = null;
+  /** "delivery queue depth" chip in the header (#814): how many prompts are
+   *  waiting for this pane and how long the oldest has waited, so a stuck
+   *  queue is visible without hovering anything. Informational like
+   *  `heldChip`; driven by the backend's `orch-queue-depth` push and cleared
+   *  by this pane's absence from it, never by a frontend timer. */
+  private queueChip: HTMLElement;
+  private queueReading: QueueDepthReading | null = null;
   /** Cross-workspace channel chip (#271): shown when this pane is a live channel
    *  member. Clicking it disconnects — the "easy close from the indicator itself"
    *  requirement — separate from the pane-menu Disconnect item, same destination. */
@@ -812,6 +820,16 @@ export class Pane implements VoiceTargetPane {
     this.heldChip.className = "pane-held";
     this.heldChip.hidden = true;
     header.appendChild(this.heldChip);
+
+    // "Queue depth" chip (#814): header chrome beside the held chip, floating
+    // over nothing — it never touches the terminal's geometry, so constraint 1
+    // (never resize the PTY for a UI feature) holds trivially. No click
+    // handler: the queue drains when the pane is free, and there is nothing a
+    // click here could truthfully do about it.
+    this.queueChip = document.createElement("span");
+    this.queueChip.className = "pane-queue";
+    this.queueChip.hidden = true;
+    header.appendChild(this.queueChip);
 
     // Cross-workspace channel chip (#271): shown only while this pane is a live
     // channel member. Clicking it disconnects directly — the "easy close from the
@@ -2306,6 +2324,55 @@ export class Pane implements VoiceTargetPane {
       this.heldChip.dataset.reason = reason;
       this.heldChip.hidden = false;
     }
+  }
+
+  /** Show (or clear) how deep this pane's delivery queue is (#814): the count,
+   *  the cap and how long the oldest queued prompt has been waiting, plus a
+   *  stalled cue once nothing has moved for the backend's stall threshold.
+   *  `null` clears it — which is how a drained queue is reported, since the
+   *  backend pushes the full set of panes that HAVE a queue and says nothing
+   *  about the rest.
+   *
+   *  Idempotent on the whole reading, not just the depth: this arrives on a 3 s
+   *  tick, so re-writing identical text would churn the DOM once per tick per
+   *  queued pane for as long as a pane is held. Header chrome only — never
+   *  touches the pane's size. */
+  setQueueDepth(reading: QueueDepthReading | null): void {
+    const same =
+      reading === null
+        ? this.queueReading === null
+        : this.queueReading !== null &&
+          this.queueReading.depth === reading.depth &&
+          this.queueReading.cap === reading.cap &&
+          this.queueReading.waiting_ms === reading.waiting_ms &&
+          this.queueReading.stalled === reading.stalled &&
+          this.queueReading.agent_id === reading.agent_id;
+    if (same) return;
+    this.queueReading = reading;
+    if (!reading) {
+      this.queueChip.hidden = true;
+      this.queueChip.textContent = "";
+      delete this.queueChip.dataset.stalled;
+    } else {
+      const { label, title, stalled } = queuePresentation(reading);
+      this.queueChip.textContent = label;
+      this.queueChip.title = title;
+      if (stalled) this.queueChip.dataset.stalled = "true";
+      else delete this.queueChip.dataset.stalled;
+      this.queueChip.hidden = false;
+    }
+    // A minimized pane's header is detached, so the chip above is invisible for
+    // exactly the panes that queue the most (delegate roles open minimized) —
+    // the grid mirrors this onto the dock chip. Same listener setAttention and
+    // setConnected use.
+    this.dockSyncListener?.();
+  }
+
+  /** This pane's current queue reading, or null. Lets the grid put an equivalent
+   *  marker on the dock chip while the pane is minimized (`dockChipQueue`), the
+   *  same shape as the `attention` and `channelBadge` getters. */
+  get queueDepth(): QueueDepthReading | null {
+    return this.queueReading;
   }
 
   /** Mark (or clear) this pane's cross-workspace channel membership (#271): a

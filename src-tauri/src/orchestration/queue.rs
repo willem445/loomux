@@ -1197,6 +1197,130 @@ pub fn should_fire_still_queued_notice(
         && now_ms.saturating_sub(undelivered_since_ms) >= QUEUE_STILL_QUEUED_NOTICE_AFTER.as_millis() as u64
 }
 
+/// #814: how long a pane's oldest queued delivery may sit before the header
+/// badge calls the queue **stalled** rather than merely busy.
+///
+/// One minute, and the two neighbours it sits between are what size it. Below:
+/// `QUEUE_DRAIN_POLL` is 2 s, so a healthy pane clears an entry within a few
+/// polls and an ordinary burst of worker reports is gone long before this — a
+/// threshold in the seconds would call normal traffic stalled and train the
+/// human to ignore the badge, which is the failure mode `ChipGuard` and
+/// `pressure_notice` both exist to avoid. Above: `QUEUE_STILL_QUEUED_NOTICE_AFTER`
+/// is 30 minutes, and that notice is the *agent-facing* channel of last resort;
+/// a human watching the window should not have to wait half an hour to be told
+/// what a glance could tell them, which is the whole complaint #814 was filed
+/// for. So: long enough that flowing traffic never trips it, short enough that
+/// a stuck prompt is visible while the human is still at the machine.
+///
+/// Measured against [`undelivered_since`], not against the queue front — see
+/// that function for why the front can be the *youngest* entry on exactly the
+/// pane that is most stuck.
+pub const QUEUE_STALLED_AFTER: Duration = Duration::from_secs(60);
+
+/// #814: the resolution the queue badge's age is reported at — 1 s while the
+/// wait is under a minute, 1 min once it is over.
+///
+/// **This is a rate bound, not cosmetics.** The badge is refreshed by re-pushing
+/// the reading on the attention tick (`OrchRegistry::queue_depth_push`), and that
+/// push is skipped when the new set is identical to the last one sent. A raw
+/// millisecond age is never identical, so every tick would emit — and a Tauri
+/// emit is a JS compile on the webview thread (`doc/design/performance.md` §1),
+/// paid whether or not the human could see any difference. Coarsening to what
+/// the badge can actually *render* differently makes the skip real: a pane stuck
+/// for an hour emits about once a minute instead of once every 3 s.
+///
+/// Flooring, never rounding: a badge must not claim a wait is longer than it is.
+pub fn coarsen_waiting_ms(waiting_ms: u64) -> u64 {
+    const MINUTE: u64 = 60_000;
+    if waiting_ms < MINUTE {
+        waiting_ms - waiting_ms % 1_000
+    } else {
+        waiting_ms - waiting_ms % MINUTE
+    }
+}
+
+/// #814: one pane's live delivery-queue reading, as the frontend's header badge
+/// shows it — an item of the `orch-queue-depth` event's payload.
+///
+/// **Why the wait is a duration and not a timestamp.** An `enqueued_ms` would be
+/// the more primitive fact, and it would also be a *frozen* one on screen: the
+/// frontend has no clock of its own here (#814 deliberately adds no timer — see
+/// `test/perfpolicy.test.ts`'s INV-4 manifest), so an age computed once at
+/// arrival would still read "2m" an hour later. The backend re-derives the wait
+/// on each attention tick instead, coarsened by [`coarsen_waiting_ms`], which is
+/// what keeps the number on screen true without a frontend cadence.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct QueueDepthItem {
+    /// The pane. Keyed by pty like `orch-delivery-held`, because the badge is a
+    /// property of a terminal and a plain pane has no agent id.
+    pub pty_id: u32,
+    /// Whose pane it is, for the tooltip; empty when nothing can name it.
+    pub agent_id: String,
+    /// Deliveries waiting right now, 1..=`QUEUE_MAX_PER_PANE` (a pane with an
+    /// empty queue has no item at all).
+    pub depth: usize,
+    /// `QUEUE_MAX_PER_PANE`, carried rather than duplicated frontend-side so
+    /// "3/8" cannot drift from the cap the backend actually enforces.
+    pub cap: usize,
+    /// How long the oldest undelivered work has been waiting, coarsened.
+    pub waiting_ms: u64,
+    /// Past [`QUEUE_STALLED_AFTER`] — "this is not flowing", the state #814's
+    /// incident needed at a glance.
+    pub stalled: bool,
+}
+
+/// #814/#560: the oldest stamp actually in this queue, or `None` if it is empty.
+///
+/// The **minimum**, never `front().enqueued_ms` — a `StrandedSubmit` marker is
+/// pushed to the front carrying a fresh stamp, so on exactly the pane whose
+/// prompt has been sitting unsubmitted the longest, the front is the *youngest*
+/// entry (see [`undelivered_since`], which fixed the same defect for the
+/// 30-minute notice). Named here so the badge and that notice read one rule
+/// rather than two copies of it.
+pub fn oldest_enqueued_ms(entries: &VecDeque<QueuedDelivery>) -> Option<u64> {
+    entries.iter().map(|e| e.enqueued_ms).min()
+}
+
+/// #814: build a pane's badge reading, or `None` when its queue is empty.
+///
+/// Pure over facts a caller can read out of the queue map cheaply — a count and
+/// a minimum stamp ([`oldest_enqueued_ms`]) — plus the pane's open hold episode,
+/// so the badge's clock is the SAME clock the 30-minute still-queued notice is
+/// measured from ([`undelivered_since`]): a human reading "12m" on the badge and
+/// an orchestrator reading that notice are then talking about one number, not two
+/// that happen to be near each other.
+///
+/// `hold_since_ms` is the pane's open hold episode (`hold_episode_since`), and it
+/// is the other half of making a stranded pane's badge honest — the entries left
+/// queued behind a pasted-but-unsubmitted delivery can all be young while the
+/// pane itself has been stuck for half an hour.
+pub fn queue_depth_item(
+    pty_id: u32,
+    agent_id: &str,
+    depth: usize,
+    oldest_entry_ms: u64,
+    hold_since_ms: Option<u64>,
+    now_ms: u64,
+) -> Option<QueueDepthItem> {
+    if depth == 0 {
+        return None;
+    }
+    let waiting_since = undelivered_since(oldest_entry_ms, hold_since_ms);
+    // `saturating_sub`, not a subtraction: `enqueued_ms` and `now_ms` come from
+    // the same wall clock, which can step BACKWARD (an NTP correction, a manual
+    // change), and the honest reading then is "no wait yet" rather than a wrap
+    // to ~584 million years and a badge that says the queue is stalled.
+    let waiting_ms = now_ms.saturating_sub(waiting_since);
+    Some(QueueDepthItem {
+        pty_id,
+        agent_id: agent_id.to_string(),
+        depth,
+        cap: QUEUE_MAX_PER_PANE,
+        waiting_ms: coarsen_waiting_ms(waiting_ms),
+        stalled: waiting_ms >= QUEUE_STALLED_AFTER.as_millis() as u64,
+    })
+}
+
 /// The on-disk snapshot format version (#468). Bumped only for a change a
 /// reader cannot absorb through `#[serde(default)]`; `parse_snapshot`
 /// refuses a version it does not know rather than guessing at the shape,
