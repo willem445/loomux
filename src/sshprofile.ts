@@ -138,7 +138,9 @@ export interface SshProfile {
 }
 
 export interface SshProfileStore {
-  /** Stamped by encode; an unversioned file decodes as v1. */
+  /** The version the file itself declares. An unversioned file decodes as v1,
+   *  and encode writes this value back rather than re-stamping it — see
+   *  `stampedVersion`. */
   schemaVersion: number;
   profiles: SshProfile[];
 }
@@ -167,16 +169,32 @@ function boundedInt(v: unknown, min: number, max: number): number | null {
   return v >= min && v <= max ? v : null;
 }
 
-/** The `identityFile` guard — see guard 2 of the invariant. A key PATH is a
- *  single-line string; a key ITSELF is multi-line and starts with PEM armour.
- *  Anything with a line break or a `-----BEGIN` header is therefore refused
- *  outright rather than written to disk. (A newline would also be nonsense in
- *  an argv word, so nothing legitimate is lost.) */
+/** The `identityFile` guard — see guard 2 of the invariant. What it actually
+ *  is, stated precisely (#907 review NB3, which found the earlier framing
+ *  overstated): **one line-break test, plus an armour test as a belt.** Real
+ *  key material is multi-line — every PEM/OpenSSH private key wraps its base64
+ *  body — so `/[\r\n]/` is what catches it, and the armour test fires
+ *  independently only for the narrow case of a header pasted with its newlines
+ *  already stripped. It is kept for exactly that case and matched
+ *  case-insensitively, since a hand-mangled paste has no reason to preserve
+ *  case either.
+ *
+ *  What still slips through, said plainly rather than left to be inferred: a
+ *  single-line base64 key BODY pasted with no armour at all is indistinguishable
+ *  from a path by shape, and this guard passes it. That is not a route by which
+ *  loomux itself writes a credential — every realistic paste of a key carries
+ *  its newlines — and the value would then be handed to `ssh -i` as a filename
+ *  that does not exist, which fails loudly rather than storing anything. The
+ *  guard fails closed on everything a key actually looks like; it is not a
+ *  content classifier and does not claim to be one.
+ *
+ *  (A newline would also be nonsense in an argv word, so nothing legitimate is
+ *  lost to the line-break test.) */
 function identityPathOrNull(v: unknown): string | null {
   const path = trimmedOrNull(v);
   if (path === null) return null;
   if (/[\r\n]/.test(path)) return null;
-  if (path.startsWith("-----BEGIN")) return null;
+  if (/^-----BEGIN/i.test(path)) return null;
   return path;
 }
 
@@ -199,21 +217,28 @@ function destinationOrNull(v: unknown): string | null {
   if (dest === null) return null;
   if (dest.startsWith("-")) return null;
   if (/\s/.test(dest)) return null;
-  // …and the same check on the COMPONENTS, which the whole-word test above does
-  // not reach. `user@-oProxyCommand=calc.exe` starts with `u`, so it sails past
-  // a leading-dash test on the whole string — but the part after the `@` is the
+  // …and the same check on the HOST, which the whole-word test above does not
+  // reach. `user@-oProxyCommand=calc.exe` starts with `u`, so it sails past a
+  // leading-dash test on the whole string — but the part after the `@` is the
   // HOST, and a host is not inert data: ssh_config's ProxyCommand/LocalCommand
   // expand `%h` into a command line, so a leading-dash host is option surface at
   // best and local command execution at worst (the shape of OpenSSH's own
   // CVE-2023-51385). ssh splits a destination on its LAST `@`, so this does too
   // — anything else would check a different string than ssh will.
+  //
+  // The USER half deliberately gets no dash test of its own (#907 review NF1):
+  // `user` is `dest.slice(0, at)`, so it shares its FIRST CHARACTER with `dest`,
+  // which the whole-word check two lines up has already rejected. A `user`
+  // disjunct here could never fire — it was dead code, and dead code in a
+  // security guard reads as a live protection that isn't one. A dashed user is
+  // still refused; it is refused by the whole-word test.
   const at = dest.lastIndexOf("@");
   if (at !== -1) {
     const user = dest.slice(0, at);
     const host = dest.slice(at + 1);
     // An empty half (`@host`, `user@`) is a mangled hand-edit, not a target.
     if (!user || !host) return null;
-    if (user.startsWith("-") || host.startsWith("-")) return null;
+    if (host.startsWith("-")) return null;
   }
   return dest;
 }
@@ -290,10 +315,38 @@ export function encodeSshProfiles(store: SshProfileStore): string {
     .map(decodeProfile)
     .filter((p): p is SshProfile => p !== null);
   return JSON.stringify(
-    { schemaVersion: SSH_PROFILES_SCHEMA_VERSION, profiles: dedupeById(validated).map(profileToWire) },
+    { schemaVersion: stampedVersion(store.schemaVersion), profiles: dedupeById(validated).map(profileToWire) },
     null,
     2
   );
+}
+
+/** The `schemaVersion` a save writes: the store's OWN, carried through rather
+ *  than re-stamped with this build's (#907 review NB2).
+ *
+ *  Decode already carries the file's version into the store, so an encode that
+ *  discarded it made the round trip lossy in the one field whose entire job is
+ *  to describe the file — an asymmetry decided by omission, in a module whose
+ *  argument for routing encode through decode is that the two directions
+ *  provably agree. The concrete case: a future v2 build stamps `2`; the user
+ *  rolls back to a build like this one; adding a single profile would otherwise
+ *  drop the v2-only fields (the allowlist — deliberate) AND rewrite the file's
+ *  identity to `1`, so an unrelated edit silently re-labels the file. This
+ *  build has no basis for that claim: the version it read is data, not a fact it
+ *  gets to invent. Carrying it is also strictly non-destructive in the only
+ *  direction that matters — a build can never RAISE a version it doesn't
+ *  understand, because it only ever writes back what it read.
+ *
+ *  What this does NOT do, so the comment doesn't overclaim: it does not record
+ *  that an older build edited a newer file. Nothing in the v1 shape can express
+ *  that (it would take a separate "last written by" marker), and this is not
+ *  one. It only stops a save from rewriting a version it knows nothing about.
+ *
+ *  Non-integer / absent / nonsensical values fall back to this build's version:
+ *  that is the same reading `decodeSshProfiles` gives them, so a hand-mangled
+ *  header lands on one answer rather than two. */
+function stampedVersion(v: unknown): number {
+  return typeof v === "number" && Number.isInteger(v) && v >= 1 ? v : SSH_PROFILES_SCHEMA_VERSION;
 }
 
 /** First occurrence of each id wins. Ids are what a persisted pane stores to
