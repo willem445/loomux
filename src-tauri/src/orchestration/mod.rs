@@ -7833,7 +7833,10 @@ pub fn prompt_wait_match(tail: &str) -> Option<QuestionMatch> {
     // live prompt paints these last; an agent's finished turn writes them in the
     // middle of a paragraph, above the CLI's redrawn box. See
     // `PROSE_PERMISSION_PHRASES` for why exactly these three and not the rest.
-    if let Some((token, line)) = token_in(last_painted, PROSE_PERMISSION_PHRASES) {
+    // [scratch/903-red-2] the ONE behaviour set aside: the prose-shaped
+    // permission phrasings are read from the WIDE 12-line window again, exactly
+    // as they were before #903. Everything else stays wired.
+    if let Some((token, line)) = token_in(recent, PROSE_PERMISSION_PHRASES) {
         return Some(QuestionMatch::token("prose-permission-phrase", token, line));
     }
     // Selection pointer marking the highlighted choice. A `❯`/`›`/`→` that
