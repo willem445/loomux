@@ -13,7 +13,7 @@
 // formatting, the inline-edit state machine) and `filematch.ts` (the Go-to-file
 // ranking) — and all path safety is enforced backend-side in `filemgr.rs`.
 
-import { open } from "@tauri-apps/plugin-dialog";
+import { pickDirectory } from "./transport.ts";
 import {
   fmList,
   fmNewFolder,
@@ -420,8 +420,7 @@ export class FileExplorerView {
   }
 
   private async pickRoot(): Promise<void> {
-    const picked = await open({
-      directory: true,
+    const picked = await pickDirectory({
       title: "Choose a folder to browse",
       defaultPath: this.host.getRoot(),
     });

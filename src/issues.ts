@@ -7,7 +7,7 @@
 // the repository ROOT — resolve it once with gitRepoRoot (from ./git), exactly
 // as the git view does.
 
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./transport.ts";
 
 /** A GitHub issue, as returned by `gh issue list --json`. `labels` is the flat
  *  list of label names (matched client-side — see issuesmodel.ts — because the

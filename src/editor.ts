@@ -8,7 +8,7 @@
 // a single argv element (no shell string), so nothing here needs to quote or
 // escape paths.
 
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./transport.ts";
 import { showToast } from "./toast";
 
 const KEY_EDITOR = "loomux.editorCommand";

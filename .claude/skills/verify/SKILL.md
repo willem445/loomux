@@ -43,8 +43,9 @@ cargo test --locked           # backend unit + integration tests
   creating a registry entry + calling tools with its `Caller`; never spawn a
   real CLI.
 - **New backend commands**: confirm the `#[tauri::command]` is registered in
-  `lib.rs` and has a typed wrapper in `src/pty.ts` — a missing registration
-  compiles fine and fails only at runtime.
+  `lib.rs` and has a typed wrapper in `src/pty.ts` (or the feature's own bridge)
+  that calls `src/transport.ts` — a missing registration compiles fine and fails
+  only at runtime.
 
 ## Never do
 

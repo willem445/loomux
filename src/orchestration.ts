@@ -6,8 +6,7 @@
 // the resulting pty id back (`bind_agent`), badge/color panes by group and
 // role, and focus panes on request.
 
-import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { invoke, listen } from "./transport.ts";
 import type { Grid } from "./grid";
 import type { Pane, PaneEvents } from "./pane";
 import { panesInGroup } from "./group";

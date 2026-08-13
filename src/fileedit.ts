@@ -8,7 +8,7 @@
 // backend (fileapi → fileedit.rs). DOM wiring is human-validated — there is no
 // DOM simulation in the tests, by house convention.
 
-import { open } from "@tauri-apps/plugin-dialog";
+import { pickDirectory } from "./transport.ts";
 import {
   ftListDir,
   ftReadFile,
@@ -522,7 +522,7 @@ export class FileEditView {
   }
 
   private async pickRoot(): Promise<void> {
-    const picked = await open({ directory: true, title: "Browse folder", defaultPath: this.root ?? undefined });
+    const picked = await pickDirectory({ title: "Browse folder", defaultPath: this.root ?? undefined });
     if (typeof picked !== "string" || picked === this.root) return;
 
     // A RE-ROOT ABANDONS THE OPEN FILE, and it must say so out loud.

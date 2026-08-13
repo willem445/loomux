@@ -91,7 +91,9 @@ tell the orchestrator, so the next one like it goes to `worker-quick`.
   it spends the human's money. Tests fake the agent side; live validation is the
   human's job.
 - **The frontend never touches Tauri IPC directly** — a `#[tauri::command]` plus a
-  typed wrapper in `src/pty.ts`, and everything else goes through the wrapper.
+  typed wrapper in `src/pty.ts` (or a per-feature bridge), and the wrapper reaches
+  the backend through `src/transport.ts`, the only module that may import
+  `@tauri-apps/*`. `test/transport.test.ts` enforces it.
 - **A workflow file can never grant a capability**, and `group_id` is trusted as a
   path segment only because the webview is trusted. If your change routes
   agent-controllable input anywhere near either, that is a design question — raise

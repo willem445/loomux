@@ -30,8 +30,7 @@
 // (unit-tested). The form owns worktree creation so a failure surfaces inline and
 // the user can fix the name and retry instead of losing their input.
 
-import { open } from "@tauri-apps/plugin-dialog";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, pickDirectory } from "./transport.ts";
 import { gitWorktreeAdd, gitRepoRoot } from "./git";
 import type { OrchestratorConfig, WorkflowPreview } from "./orchestration";
 import { workflowPreview } from "./orchestration";
@@ -1225,8 +1224,7 @@ export class WelcomeForm {
   }
 
   private async pickRepo(): Promise<void> {
-    const picked = await open({
-      directory: true,
+    const picked = await pickDirectory({
       title: "Choose repository or folder",
       defaultPath: this.repoInput.value.trim() || undefined,
     });

@@ -10,8 +10,7 @@
 // exist to answer the user WHILE THEY TYPE — they are a courtesy, never the
 // boundary.
 
-import { invoke } from "@tauri-apps/api/core";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { invoke, listen, type UnlistenFn } from "./transport.ts";
 import type { FmEntry } from "./fileexplorermodel";
 import type { FmCaps } from "./filemenu";
 import type { HashAlgo } from "./filehashmodel";

@@ -7,7 +7,7 @@ import { WebglAddon } from "@xterm/addon-webgl";
 import { SerializeAddon } from "@xterm/addon-serialize";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
-import { open } from "@tauri-apps/plugin-dialog";
+import { pickDirectory } from "./transport.ts";
 import {
   spawnPty,
   writePty,
@@ -25,7 +25,7 @@ import {
 } from "./pty";
 import { voiceController, type VoiceTargetPane, type VoicePhase } from "./voicecontrol";
 import { pathTail, type ShellKind } from "./panesetup";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./transport.ts";
 import { parseOsc52, writeClipboard, readClipboard } from "./clipboard";
 import { keyDisposition } from "./pasteflow";
 import { getSettings } from "./settings";
@@ -3844,8 +3844,7 @@ export class Pane implements VoiceTargetPane {
   /** Open a native folder picker and cd the shell into the chosen directory. */
   private async pickFolder(): Promise<void> {
     if (this.ptyId === null) return;
-    const picked = await open({
-      directory: true,
+    const picked = await pickDirectory({
       title: "Change folder",
       defaultPath: this.cwdRaw ?? undefined,
     });
