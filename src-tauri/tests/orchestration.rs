@@ -33262,7 +33262,7 @@ fn promote_refuses_a_session_that_is_already_an_orchestration_member() {
     // contracts in one conversation.
     let g = reg.create_group(&repo_path, rails()).unwrap();
     let w = reg.spawn_agent(&g.id, Role::Worker, "w", "", false, None).unwrap();
-    let member = reg.agent(&w.agent_id).unwrap().session_id.expect("claude worker has a session");
+    let member = w.session_id.clone().expect("a claude worker records a session id");
     let before = groups_on_disk(&reg);
     let err = promote_to_orchestrator_sync(&reg, &repo_path, &member, "claude", PromoteConfig::default())
         .unwrap_err();
