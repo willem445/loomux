@@ -124,8 +124,10 @@ compiles.
 - **An edit to a role template (`orchestrator|worker|reviewer|planner.md` under
   `src-tauri/src/orchestration/templates/`) re-blesses
   `src-tauri/tests/fixtures/pre222/` in the same commit** — the fixtures pin those
-  four templates byte-for-byte (`block.md`/`workflow.md` are deliberately not
-  fixture-pinned). Signature: `a_workflow_placeholder_must_sit_at_the_end_of_a_line_it_shares`
+  four templates byte-for-byte modulo registered placeholders
+  (`block.md`/`workflow.md` are deliberately not fixture-pinned; an edit whose
+  only change is a `{{...}}` placeholder registered in LIVE needs no re-bless —
+  the pin strips registered keys before comparing, precedent #859). Signature: `a_workflow_placeholder_must_sit_at_the_end_of_a_line_it_shares`
   and `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was` go red
   alone, on a round where nothing else moved. Procedure and re-bless log:
   `src-tauri/tests/fixtures/pre222/README.md` (#867, #868, #874).
