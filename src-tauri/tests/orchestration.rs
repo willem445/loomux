@@ -46203,10 +46203,25 @@ fn tail_rows_903(visible: &str) -> Vec<&str> {
 
 #[test]
 fn h10_a_composer_holding_our_paste_reads_idle_with_no_glyph_anywhere() {
+    // Each capture gets #903's own trigger painted above it — a finished turn's
+    // report quoting `(y/n)`. Without it these panes would release for the
+    // trivial reason that nothing matched at all, and the test would pass while
+    // saying nothing about the composer reading.
+    const PROSE: &str = "● Finding 1: the gate reads any line carrying (y/n) as a live prompt.";
+
     for (name, fixture, brief) in claimable_composer_cases() {
-        let raw = pty_bytes_903(fixture);
-        let with_paste = loomux_lib::orchestration::termgrid::render_visible(&raw, 100, 12);
+        let screen =
+            format!("{PROSE}\n{}", fixture.replace("\r\n", "\n"));
+        let raw = pty_bytes_903(&screen);
+        let with_paste = loomux_lib::orchestration::termgrid::render_visible(&raw, 100, 14);
         let masked = mask_own_paste(&with_paste, brief);
+
+        // Precondition 0 — the ring genuinely matches on the masked screen, so
+        // the release below is the composer reading and not an absence.
+        assert!(
+            prompt_wait_match(&mask_own_paste(&strip_ansi(&raw), brief)).is_some(),
+            "{name}: precondition: the ring must still match after masking our paste"
+        );
 
         // Precondition 1 — the mask really does claim rows here. Without it the
         // test asserts something about a screen the mask never touched, which is
@@ -46258,7 +46273,7 @@ fn h10_a_composer_holding_our_paste_reads_idle_with_no_glyph_anywhere() {
         // End to end at the checkpoint that strands: the pre-Enter shape.
         let raw2 = raw.clone();
         let pred = question_hold_predicate_sampled(
-            move || sample_from_raw(&raw2, 100, 12),
+            move || sample_from_raw(&raw2, 100, 14),
             Some(brief.to_string()),
             None,
             Vec::new(),
