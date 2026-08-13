@@ -21726,13 +21726,12 @@ pub fn question_override_admits(
     bound_ms: u64,
     idle_streak: u32,
 ) -> bool {
-    if admission != WriteAdmission::HoldQuestion {
-        return false;
-    }
-    if idle_streak < QUESTION_OVERRIDE_CONSECUTIVE_READS {
-        return false;
-    }
-    held_since_ms.is_some_and(|since| hold_bound_elapsed(since, now_ms, bound_ms))
+    // [scratch/903-red-3] the ONE behaviour set aside: there is no last-resort
+    // override at all — the pre-#903 answer, where a question hold has no bound
+    // it can reach. Every argument is still taken and every call site still
+    // wired, so nothing else moves.
+    let _ = (admission, held_since_ms, now_ms, bound_ms, idle_streak);
+    false
 }
 
 /// What the drainer should do about a pane it is not yet allowed to write to
