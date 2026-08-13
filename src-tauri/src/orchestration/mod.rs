@@ -2847,6 +2847,31 @@ const QUESTION_RELEASE_CONSECUTIVE_CLEAR_POLLS: u32 = 2;
 /// precondition on each fixture, so a CLI that grows its footer fails loudly here
 /// instead of silently reading "not a composer".
 const IDLE_PROMPT_TAIL_ROWS: usize = 8;
+/// How far up from the bottom of a composed screen [`menu_structure_rendered`]
+/// reads its TOKEN lists (#903 rev-438).
+///
+/// **Smaller than [`IDLE_PROMPT_TAIL_ROWS`], and the two measure different
+/// things.** That one has to *reach* the composer, so it is sized generously
+/// against everything painted below it. This one has to *exclude the transcript*,
+/// because the tokens it reads (`1. yes`, `use arrow keys`, `enter to select`)
+/// are the ones #40 already found in ordinary finished-turn prose — the whole
+/// reason `prompt_wait_match` windows them to `last_painted`.
+///
+/// Sized against what sits between the screen bottom and a dialog's own footer
+/// when that dialog is the thing the composer is waiting under: one or two rows
+/// of chrome below the composer (a hint bar, a right-aligned session line), the
+/// composer's own last row, and the footer itself. Four.
+///
+/// **The residual, stated because the number is tight.** A composer holding a
+/// MULTI-row paste consumes window slots, so a dialog footer above it can fall
+/// out of reach. The pointer clause is unwindowed and still catches every dialog
+/// that paints a pointer at content — every capture in the suite except Claude
+/// Code's reverse-video `AskUserQuestion`, which is the one shape this residual
+/// is about. The refinement that would close it is a window measured from the
+/// composer's own top row rather than from the screen bottom; it is not taken
+/// here because the composer's rows are exactly what the masked view no longer
+/// has (see the design note's limits).
+const MENU_TOKEN_TAIL_ROWS: usize = 4;
 
 // Kickoff readiness: a fixed boot delay loses the race on a loaded machine
 // (a CLI that boots slower than the delay flushes the pasted prompt along
@@ -7859,7 +7884,7 @@ pub fn idle_prompt_row_rendered(c: Composed<'_>) -> bool {
 /// assert this reading is false for every positive dialog capture in the suite,
 /// not merely true for the negatives.
 pub fn idle_prompt_rendered(c: Composed<'_>) -> bool {
-    idle_prompt_row_rendered(c) && !menu_structure_rendered(c.masked)
+    idle_prompt_row_rendered(c) && !menu_structure_rendered(c)
 }
 
 /// Does this composed screen carry menu STRUCTURE anywhere on it — a highlighted
@@ -7872,17 +7897,48 @@ pub fn idle_prompt_rendered(c: Composed<'_>) -> bool {
 /// asks instead is whether the CLI has painted something a human could *select*,
 /// which no finished turn's report does.
 ///
-/// **Spatially, over the whole screen**, like [`pointer_rendered`] and for the
-/// same reason: `prompt_wait_match`'s windows are chronological rules written for
-/// a stream, and a live menu can sit above rows of statusline and composer. A
-/// wrap-insensitive flatten, so a footer split across two rows still counts —
-/// erring toward "a menu is up", which costs a hold rather than a wrong release.
-fn menu_structure_rendered(visible: &str) -> bool {
-    if pointer_rendered(visible) {
+/// **Two reaches, and the split is #40's, not a new invention** (rev-438). The
+/// pointer keeps the whole screen; the TOKEN lists are read from the bottom rows
+/// only.
+///
+/// - **Pointer: whole screen**, like [`pointer_rendered`] and for its reason — a
+///   live menu can sit above rows of statusline and composer, and a leading
+///   glyph at content is not something prose produces.
+/// - **Tokens: [`MENU_TOKEN_TAIL_ROWS`] bottom rows.** `prompt_wait_match` has
+///   windowed exactly these two lists to `last_painted` since #40, because they
+///   *do* occur in ordinary finished-turn output — `fp-prose-arrow-keys.txt` is
+///   the fixture that pins it, and it is prose describing a file picker. Reading
+///   them over the whole screen made a pane that merely QUOTES "use arrow keys"
+///   or "1. yes" carry menu structure forever, which vetoed the #903 release for
+///   the exact class of transcript this issue is about. The conjunct now sees
+///   only structure sitting near the composer, which is also what
+///   `docs/orchestration.md` has always described.
+///
+/// **Position from `with_paste`, evidence from `masked`.** Where a row *is* on
+/// screen is a fact about the render, so the window is measured on the view that
+/// still has the composer in it — otherwise deleting the composer's rows pulls
+/// transcript prose down into the window and undoes the split. What may *count*
+/// as evidence is still only what loomux did not write, so rows the paste mask
+/// claimed are filtered out before any token is looked for.
+///
+/// **Row-wise, not flattened** (rev-438's option 2, folded in because the row
+/// filter above already gives us rows): a flatten joins neighbours, so
+/// "…press Enter" ending one row and "to select…" beginning the next would
+/// manufacture `enter to select` out of two unrelated lines. Erring toward "a
+/// menu is up" is the cheap direction in general, but not when the invented
+/// evidence is what keeps a pane wedged.
+fn menu_structure_rendered(c: Composed<'_>) -> bool {
+    if pointer_rendered(c.masked) {
         return true;
     }
-    let flat = flatten_rendered(visible);
-    NUMBERED_MENU_TOKENS.iter().chain(MENU_FOOTER_TOKENS).any(|t| flat.contains(t))
+    let survived: std::collections::HashSet<&str> = c.masked.lines().collect();
+    bottom_rendered_rows(c.with_paste, MENU_TOKEN_TAIL_ROWS)
+        .into_iter()
+        .filter(|r| survived.contains(*r))
+        .any(|r| {
+            let row = r.trim().to_lowercase();
+            NUMBERED_MENU_TOKENS.iter().chain(MENU_FOOTER_TOKENS).any(|t| row.contains(t))
+        })
 }
 
 /// Does any rendered row lead with a menu pointer (#534 rev-13)?

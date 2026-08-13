@@ -46207,7 +46207,16 @@ fn h10_a_composer_holding_our_paste_reads_idle_with_no_glyph_anywhere() {
     // report quoting `(y/n)`. Without it these panes would release for the
     // trivial reason that nothing matched at all, and the test would pass while
     // saying nothing about the composer reading.
-    const PROSE: &str = "● Finding 1: the gate reads any line carrying (y/n) as a live prompt.";
+    //
+    // **The second sentence is rev-438's** and it is not decoration. `use arrow
+    // keys` is a `MENU_FOOTER_TOKENS` member, and #40 put those tokens in the
+    // windowed tier precisely because agents write them in ordinary prose
+    // (`fp-prose-arrow-keys.txt` is that fixture). Read over the whole screen —
+    // which is what the rev-433 conjunct did — one such sentence anywhere in a
+    // transcript carried "menu structure" forever and vetoed the #903 release for
+    // exactly the class of pane this issue is about.
+    const PROSE: &str = "● Finding 1: the gate reads any line carrying (y/n) as a live prompt.\n\
+         ● It behaves like a picker where you use arrow keys to move between entries.";
 
     for (name, fixture, brief) in claimable_composer_cases() {
         let screen =
