@@ -140,6 +140,7 @@ pub fn run() {
             orchestration::agent_autopilot_flags,
             orchestration::agent_cli_knobs,
             orchestration::create_orchestration,
+            orchestration::promote_to_orchestrator,
             orchestration::bind_agent,
             orchestration::orch_agent_renamed,
             orchestration::orch_session_roles,

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-promote-to-orchestrator"
+description = "Enables the promote_to_orchestrator command without any pre-configured scope."
+commands.allow = ["promote_to_orchestrator"]
+
+[[permission]]
+identifier = "deny-promote-to-orchestrator"
+description = "Denies the promote_to_orchestrator command without any pre-configured scope."
+commands.deny = ["promote_to_orchestrator"]
