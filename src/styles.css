@@ -1,23 +1,102 @@
 @import "@xterm/xterm/css/xterm.css";
 
+/* ============================ THE TOKEN LAYER (#879) ============================
+ *
+ * Every colour below is PINNED to src/theme.ts by test/theme.test.ts, because the same
+ * decisions also have to exist in index.html's pre-paint block (which runs before this
+ * file loads) and in the xterm ITheme (terminals are a WebGL canvas — custom properties
+ * do not reach them). Change a colour in theme.ts and here in the same commit, or the
+ * test says so. The rationale for every value — the six named threads, the roles, and the
+ * signature element they serve — is doc/design/ui-redesign.md.
+ *
+ * THE RULE THIS LAYER EXISTS TO ENFORCE: no raw hex outside this block. Surfaces consume
+ * semantic tokens only. (Slice A adds the layer; slice B migrates the ~280 literals still
+ * scattered below it, and the LEGACY BRIDGE at the end of this block dies with them.) */
 :root {
   /* Dark-only app: keeps native widgets (select popups, scrollbars) dark too. */
   color-scheme: dark;
-  --bg-app: #131318;
-  --bg-term: #0b0b10;
-  --panel: #17171f;
-  --panel-2: #1e1e29;
-  --border: #262633;
-  --border-soft: #20202b;
-  --text: #ccd1de;
-  --text-dim: #7d8496;
-  --accent: #7aa2f7;
-  --accent-dim: #44578c;
-  --accent-glow: rgba(122, 162, 247, 0.14);
-  --danger: #f7768e;
+
+  /* --- surfaces: the undyed fibre. Steps are small on purpose — panels separate by a
+         hairline and by spacing, never by a contrast block. */
+  --surface-term: #0f0e0b;
+  --surface-0: #15140f;
+  --surface-1: #1c1a14;
+  --surface-2: #24211a;
+  --line: #2e2a20;
+  --line-strong: #3b352a;
+
+  /* --- ink. `--ink-faint` is below AA by design: non-essential meta and rules only.
+         Anything a user must read takes --ink-dim or better. */
+  --ink: #e4dfd2;
+  --ink-dim: #a49d8b;
+  --ink-faint: #767162;
+
+  /* --- agent state. These four dyes are the ONLY saturated colour in the app, and they
+         mean exactly one thing each. `held` and `idle` are achromatic: a stopped agent
+         carries no dye and is marked by form (a dashed thread), not by hue. */
+  --state-working: #7687d6;
+  --state-attention: #e2a33c;
+  --state-ok: #4fae94;
+  --state-danger: #dd665e;
+  --state-held: #767162;
+  --state-idle: #3b352a;
+
+  /* --- the human. Where you are and where you are wanted share one hue; form tells them
+         apart. Chrome carries no other colour. */
+  --focus: #e2a33c;
+  --selection: #2f3350;
+
+  /* --- type roles, not sizes. The chrome is monospace-forward: everything that is DATA
+         (pane names, branches, ids, counts, timings) is set in the terminal's own face, so
+         chrome and content read as one cloth. --font-ui is for prose.
+         --font-mono is byte-identical to the chain pane.ts passes to xterm; changing it
+         changes cell metrics and forces a refit. */
+  --font-mono: "Cascadia Code", "Cascadia Mono", Consolas, "Courier New", monospace;
+  --font-ui: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  --text-xs: 10.5px;
+  --text-s: 11.5px;
+  --text-m: 13px;
+  --text-l: 15px;
+
+  /* --- rhythm, shape, motion. --thread is the one width the signature element is allowed
+         (design note, §The warp) and it is CONSTANT: state changes its colour, never its
+         size, so no state change can ever move a terminal's cell grid. */
+  --space-1: 4px;
+  --space-2: 6px;
+  --space-3: 8px;
+  --space-4: 12px;
+  --space-5: 16px;
+  --space-6: 24px;
+  --radius-s: 3px;
+  --radius-m: 6px;
+  --radius-pill: 999px;
+  --thread: 2px;
   --header-h: 40px;
   --pane-header-h: 27px;
+  --dur-fast: 120ms;
+  --dur-base: 180ms;
   --ease: cubic-bezier(0.25, 0.8, 0.35, 1);
+
+  /* --- LEGACY BRIDGE — temporary, removed by slice B (#879).
+         The ~280 rules below this block still name the pre-redesign tokens. Aliasing them
+         onto the new layer moves the whole app onto the new palette in one step and keeps
+         every rule working; slice B replaces the call sites and deletes these nine lines.
+         Do not add a new use of any name in this group. */
+  --bg-app: var(--surface-0);
+  --bg-term: var(--surface-term);
+  --panel: var(--surface-1);
+  --panel-2: var(--surface-2);
+  --border: var(--line);
+  --border-soft: var(--surface-2);
+  --text: var(--ink);
+  --text-dim: var(--ink-dim);
+  --accent: var(--state-working);
+  --accent-dim: var(--line-strong);
+  /* The one bridge value with no token behind it: an alpha tint of --focus, which CSS
+     cannot derive from a hex custom property without color-mix. Slice B replaces its call
+     sites with a focus treatment that needs no glow. */
+  --accent-glow: rgba(226, 163, 60, 0.14);
+  --danger: var(--state-danger);
 }
 
 * { box-sizing: border-box; }
