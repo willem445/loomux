@@ -88,6 +88,13 @@ export const DEFAULT_REMOTE_SHELL: RemoteShell = "posix";
 export const MIN_KEEPALIVE_SECONDS = 1;
 export const MAX_KEEPALIVE_SECONDS = 86_400;
 
+/** Inclusive bound on `port` — TCP's own range. Exported so the launcher's input
+ *  attributes, the refusal the launch seam raises for an out-of-range value, and
+ *  the guard that would otherwise drop it all name ONE range. A bound spelled
+ *  three times is a bound that ends up meaning three things. */
+export const MIN_SSH_PORT = 1;
+export const MAX_SSH_PORT = 65_535;
+
 /** One saved SSH target. Every optional field is `null` when unset, and unset
  *  means "loomux passes nothing for this" — the user's own ssh_config then
  *  decides, which is the whole point of the no-credentials posture. */
@@ -279,7 +286,7 @@ export function normalizeSshProfile(v: unknown): SshProfile | null {
     id,
     name,
     destination,
-    port: boundedInt(r.port, 1, 65_535),
+    port: boundedInt(r.port, MIN_SSH_PORT, MAX_SSH_PORT),
     identityFile: identityPathOrNull(r.identityFile),
     remoteCwd: trimmedOrNull(r.remoteCwd),
     defaultCli: trimmedOrNull(r.defaultCli),

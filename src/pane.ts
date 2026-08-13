@@ -1396,19 +1396,32 @@ export class Pane implements VoiceTargetPane {
     return this.sshProfileId;
   }
 
-  /** Throw if `opts` would give an SSH pane an orchestration identity (#887 S3).
-   *  The decision itself is pure and unit-tested (`sshOrchestrationRefusal` in
-   *  panesetup.ts); this is only the two call sites that can reach it — a fresh
-   *  spawn and an in-place relaunch. `this.isSshPane` is part of the input
-   *  because a relaunch's options describe what the pane is BECOMING while the
-   *  boundary is about what it already IS. */
+  /** Throw if this spawn would give an SSH pane an orchestration identity
+   *  (#887 S3). The decision itself is pure and unit-tested
+   *  (`sshOrchestrationRefusal` in panesetup.ts); this is only the two call sites
+   *  that can reach it — a fresh spawn and an in-place relaunch.
+   *
+   *  Both sides are handed over WHOLE — the options describing what the pane is
+   *  about to become, and the state it already carries — because a relaunch's
+   *  options describe the former while the boundary is about the latter, and that
+   *  is true of the orchestration identity in exactly the same way it is true of
+   *  ssh-ness. The union rule lives in the pure function so these two call sites
+   *  cannot drift apart on it (PR #921 review, rev-441). */
   private refuseSshOrchestration(opts: PaneOptions): void {
-    const refusal = sshOrchestrationRefusal({
-      ssh: !!opts.ssh || this.isSshPane,
-      orchGroup: opts.orchGroup,
-      orchRole: opts.orchRole,
-      orchAgent: opts.orchAgent,
-    });
+    const refusal = sshOrchestrationRefusal(
+      {
+        ssh: !!opts.ssh,
+        orchGroup: opts.orchGroup,
+        orchRole: opts.orchRole,
+        orchAgent: opts.orchAgent,
+      },
+      {
+        ssh: this.isSshPane,
+        orchGroup: this.orchGroup,
+        orchRole: this.orchRoleName,
+        orchAgent: this.orchAgent,
+      }
+    );
     if (refusal) throw new Error(refusal);
   }
 

@@ -43,7 +43,15 @@
 // Explicit `.ts` on both (the convention promote.ts / sessionroute.ts document):
 // these are VALUE imports in a module `node --test` loads directly, so they have
 // to resolve without a bundler.
-import { normalizeSshProfile, sshDestinationOrNull, type SshProfile } from "./sshprofile.ts";
+import {
+  normalizeSshProfile,
+  sshDestinationOrNull,
+  MAX_KEEPALIVE_SECONDS,
+  MAX_SSH_PORT,
+  MIN_KEEPALIVE_SECONDS,
+  MIN_SSH_PORT,
+  type SshProfile,
+} from "./sshprofile.ts";
 import { buildSshArgv, claudeSessionArgs, type SshCommandParams } from "./sshcommand.ts";
 
 export type PaneKind =
@@ -363,6 +371,68 @@ export function sshMintsSessionId(remoteCli: string | null): boolean {
   return remoteCli === "claude";
 }
 
+/** The refusal for a value the human typed that the profile store would DISCARD
+ *  — or `""` when nothing was discarded.
+ *
+ *  Silently dropping a typed value is the defect this exists to prevent (PR #921
+ *  review, rev-441). Normalization has to drop an out-of-range port, an
+ *  out-of-range keepalive, or an "identity file" that is actually key material —
+ *  those are the store's own guards and they are right — but dropping them
+ *  QUIETLY means a human types `99999`, hits Create, connects on port 22, and is
+ *  never told. Worse for `identityFile`: the pane would connect with no `-i` at
+ *  all and the failure would surface as an authentication problem with no
+ *  visible cause.
+ *
+ *  So the launch seam compares what was typed against what survives and refuses
+ *  the difference, rather than launching something the human didn't ask for.
+ *  This is deliberately NOT a second copy of the bounds: it asks the store's own
+ *  normalizer what it kept, so a bound can only ever be changed in one place.
+ *
+ *  Only reachable for values typed into the form. A profile loaded from disk was
+ *  normalized on the way in, so `raw` and `kept` agree and nothing is refused —
+ *  which is why this cannot bounce a human's existing saved connections. */
+export function sshDiscardedFieldError(raw: SshProfile, kept: SshProfile): string {
+  if (raw.port !== null && kept.port === null) {
+    return `A port must be a whole number between ${MIN_SSH_PORT} and ${MAX_SSH_PORT} — leave it blank to let your ssh config decide.`;
+  }
+  if (raw.keepaliveSeconds !== null && kept.keepaliveSeconds === null) {
+    return (
+      `Keepalive must be a whole number of seconds between ${MIN_KEEPALIVE_SECONDS} and ` +
+      `${MAX_KEEPALIVE_SECONDS} — leave it blank to let your ssh config decide.`
+    );
+  }
+  if (raw.identityFile !== null && kept.identityFile === null) {
+    return (
+      "The identity file must be a PATH to a private key, not the key itself — loomux never " +
+      "stores key material, so a pasted key is refused rather than written to sshprofiles.json."
+    );
+  }
+  return "";
+}
+
+/** A warning for a remote folder that this launch cannot act on, or `""`.
+ *
+ *  `remoteCwd` is `cd`'d into as part of the REMOTE COMMAND, so with no remote
+ *  CLI there is no command to prefix and the value does nothing — S2's builder
+ *  has always worked this way, and the composer follows it rather than adding a
+ *  second mechanism.
+ *
+ *  Warned about rather than either honoured or refused, and both alternatives
+ *  are worse. Honouring it would mean synthesizing a login-shell command
+ *  (`cd … && exec $SHELL -l`), which is a GUESS about the remote's login shell —
+ *  the exact class of guess `remoteShell` exists to refuse (plan part 4a: the
+ *  remote's shell is unknowable from here, so the user declares it). Refusing to
+ *  SAVE it would throw away a setting that becomes correct the moment the human
+ *  picks a CLI. So the value is kept, and the human is told when it won't apply.
+ *  Not silent, not lost, not guessed at. */
+export function sshRemoteCwdWarning(remoteCli: string | null, remoteCwd: string | null): string {
+  if (!remoteCwd || remoteCli) return "";
+  return (
+    "Remote folder applies only when a remote CLI is set — a plain login shell starts wherever " +
+    "the remote host puts it. The folder stays saved on this connection."
+  );
+}
+
 /** A warning for a profile naming a remote CLI this build doesn't know, or `""`.
  *
  *  Deliberately a warning and not a refusal — S1's own contract: a profile
@@ -413,9 +483,11 @@ export function sshLaunchParams(profile: SshProfile, sessionId: string | null): 
     keepaliveSeconds: profile.keepaliveSeconds ?? undefined,
     extraArgs: profile.extraArgs.length ? profile.extraArgs : undefined,
     remoteShell: profile.remoteShell,
-    // Only meaningful with a remote command: `cd`ing and then handing the shell
-    // back is not something ssh can do for a login shell (that is the remote's
-    // own `~/.profile` territory), and S2 quotes this for the declared shell.
+    // Only meaningful with a remote command: the `cd` is a PREFIX to that
+    // command, so with no command there is nothing to prefix (S2's builder has
+    // the same shape — this makes it explicit rather than emergent). The value is
+    // not lost, and the human is not left guessing: it stays on the saved
+    // connection, and `sshRemoteCwdWarning` says so while the form is still open.
     remoteCwd: remoteCommand ? profile.remoteCwd ?? undefined : undefined,
     remoteCommand,
   };
@@ -433,6 +505,17 @@ export function sshLaunchArgv(program: string, profile: SshProfile, sessionId: s
   return buildSshArgv(program, sshLaunchParams(profile, sessionId));
 }
 
+/** One side's view of what a pane is about to be: the options a spawn was handed,
+ *  or the state the pane already carries. The two are the SAME SHAPE on purpose —
+ *  see `sshOrchestrationRefusal`, which reads every field of both by one rule. */
+export interface SshSpawnIdentity {
+  /** Whether this side says the pane's process is a local ssh client. */
+  ssh?: boolean;
+  orchGroup?: string | null;
+  orchRole?: string | null;
+  orchAgent?: string | null;
+}
+
 /** The #887/#888 boundary, enforced rather than merely documented: an SSH pane
  *  can never be a member of an orchestration group.
  *
@@ -445,23 +528,41 @@ export function sshLaunchArgv(program: string, profile: SshProfile, sessionId: s
  *  instead of a best-effort degradation; and every brief a local orchestrator
  *  writes names local paths.
  *
+ *  **Both inputs are read by one rule: the UNION of the two sides, field by
+ *  field.** A pane spawn has two sources of truth — the `opts` describing what it
+ *  is about to become, and the pane's own existing state — and a guard that read
+ *  ssh-ness from both while reading the orchestration identity from only one
+ *  would have a hole exactly the width of that asymmetry: an ALREADY-orchestrated
+ *  pane relaunched with `ssh` in its options carries its group on the pane and
+ *  nothing in the options, so an opts-only read of the identity would wave it
+ *  through and spawn an ssh client inside a live group member (PR #921 review,
+ *  rev-441). Neither side is authoritative alone, so neither is trusted alone.
+ *  Doing the merge HERE rather than at the call sites is the other half of that:
+ *  the rule is in the module that is unit-tested, not in two DOM call sites that
+ *  can drift apart.
+ *
  *  Nothing in the spawn path builds this combination today: the backend's spawn
  *  requests carry a role and a command, never a pane kind or an SSH profile, and
  *  the group surfaces never offer one. This exists so that stays true — a future
  *  edit that wires an SSH profile into a delegate spawn fails loudly at the pane,
  *  before any process starts, instead of quietly producing a group member whose
  *  merge gate isn't enforced. Fail-closed by construction: it refuses on ANY
- *  orchestration marker, so a spawn that carries only half an identity is
- *  refused too. */
-export function sshOrchestrationRefusal(spawn: {
-  ssh: boolean;
-  orchGroup?: string | null;
-  orchRole?: string | null;
-  orchAgent?: string | null;
-}): string | null {
-  if (!spawn.ssh) return null;
-  const marker = spawn.orchGroup || spawn.orchRole || spawn.orchAgent;
-  if (!marker) return null;
+ *  orchestration marker from EITHER side, so a spawn that carries only half an
+ *  identity, on only one side, is refused too. */
+export function sshOrchestrationRefusal(
+  opts: SshSpawnIdentity,
+  pane: SshSpawnIdentity = {}
+): string | null {
+  const ssh = !!opts.ssh || !!pane.ssh;
+  if (!ssh) return null;
+  const identity =
+    opts.orchGroup ||
+    pane.orchGroup ||
+    opts.orchRole ||
+    pane.orchRole ||
+    opts.orchAgent ||
+    pane.orchAgent;
+  if (!identity) return null;
   return (
     "refusing to give an SSH pane an orchestration identity: SSH panes are solo panes in v1 " +
     "(#887) — worktrees, the loopback MCP server and the gh merge gate all reach only " +
@@ -522,6 +623,12 @@ export function planPaneSetup(input: PaneSetupInput): PaneSetupResult {
         ? { ok: false, error: sshDestinationError(raw.destination), focus: "ssh" }
         : { ok: false, error: SSH_NO_PROFILE, focus: "ssh" };
     }
+    // A value that survived the entry but not the FIELD — an out-of-range port,
+    // an "identity file" that is key material. Normalization is right to drop
+    // those, but dropping them silently would launch a connection the human
+    // didn't describe and never told them so. Refuse the difference instead.
+    const discarded = sshDiscardedFieldError(raw, profile);
+    if (discarded) return { ok: false, error: discarded, focus: "ssh" };
     const name = input.name.trim() || profile.name || profile.destination;
     return { ok: true, plan: { kind: "ssh", profile, name } };
   }

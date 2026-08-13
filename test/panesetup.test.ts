@@ -12,11 +12,13 @@ import {
   shellKindOptions,
   resolveShellKind,
   isContentKind,
+  sshDiscardedFieldError,
   sshLaunchArgv,
   sshLaunchParams,
   sshMintsSessionId,
   sshOrchestrationRefusal,
   sshRemoteCliWarning,
+  sshRemoteCwdWarning,
   type PaneSetupInput,
 } from "../src/panesetup.ts";
 import type { SshProfile } from "../src/sshprofile.ts";
@@ -312,18 +314,34 @@ test("…and an ordinary destination still launches — the guard must not refus
 
 test("the planned connection is the NORMALIZED one — what launches is what gets saved", () => {
   // The form hands over raw field text; the plan runs it through the profile
-  // store's own normalizer. Without that, an identity file carrying key material
-  // would still reach `ssh -i` on the command line while being dropped from
-  // sshprofiles.json — the launched pane and the saved connection disagreeing
-  // about what they are.
-  const pem = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEA\n-----END…";
+  // store's own normalizer, so the connection a pane launches and the connection
+  // written to sshprofiles.json are one object rather than two that agree by
+  // coincidence.
+  //
+  // Witnessed on the normalizations that are SILENT BY DESIGN — whitespace, and
+  // an unrecognized remote shell falling back to the default. The other half of
+  // normalization (a value the human typed that the store would DISCARD: an
+  // out-of-range port, a pasted key) deliberately no longer reaches this test,
+  // because it is now a refusal rather than a quiet repair — see the
+  // no-silent-data-loss tests below. Asserting the old drop-through here would
+  // have been asserting the defect.
   const res = planPaneSetup(
-    input({ kind: "ssh", sshProfile: sshProfile({ identityFile: pem, port: 99_999 }) })
+    input({
+      kind: "ssh",
+      sshProfile: sshProfile({
+        destination: "  dev@build.example.net  ",
+        remoteCwd: "  /srv/app  ",
+        name: "  build box  ",
+        remoteShell: "fish" as never, // not a shell this schema knows
+      }),
+    })
   );
   assert.ok(res.ok && res.plan.kind === "ssh");
   if (res.ok && res.plan.kind === "ssh") {
-    assert.equal(res.plan.profile.identityFile, null, "key material must not reach the command line");
-    assert.equal(res.plan.profile.port, null, "an out-of-range port is dropped, not clamped");
+    assert.equal(res.plan.profile.destination, "dev@build.example.net", "trimmed, not raw");
+    assert.equal(res.plan.profile.remoteCwd, "/srv/app");
+    assert.equal(res.plan.profile.name, "build box");
+    assert.equal(res.plan.profile.remoteShell, "posix", "an unknown shell defaults, it doesn't launch");
   }
 });
 
@@ -461,6 +479,113 @@ test("…and the guardrail refuses ONLY that combination", () => {
   assert.equal(sshOrchestrationRefusal({ ssh: true }), null);
   assert.equal(sshOrchestrationRefusal({ ssh: true, orchGroup: null, orchRole: null, orchAgent: null }), null);
   assert.equal(sshOrchestrationRefusal({ ssh: false }), null);
+  // …including when the two sides are read together: an orchestration pane
+  // relaunched as an orchestration pane is still perfectly ordinary.
+  assert.equal(sshOrchestrationRefusal({ orchGroup: "g1" }, { orchGroup: "g1", orchRole: "worker" }), null);
+});
+
+test("the guardrail reads BOTH sides by the same rule — either signal, from either side", () => {
+  // PR #921 review (rev-441): the guard used to read ssh-ness from the options
+  // OR the pane, but the orchestration identity from the options ALONE. That
+  // asymmetry is a hole the width of one relaunch — an already-orchestrated pane
+  // relaunched with `ssh` in its options carries its group on the PANE and
+  // nothing in the options, so an opts-only read of the identity waves it through
+  // and starts an ssh client inside a live group member.
+  //
+  // All four crossings of {which side says ssh} × {which side says orchestrated}
+  // must refuse, or the rule isn't one rule.
+  const cases: [string, Parameters<typeof sshOrchestrationRefusal>][] = [
+    ["opts ssh + opts identity", [{ ssh: true, orchGroup: "g1" }, {}]],
+    ["opts ssh + PANE identity", [{ ssh: true }, { orchGroup: "g1" }]],
+    ["pane ssh + opts identity", [{ orchGroup: "g1" }, { ssh: true }]],
+    ["pane ssh + PANE identity", [{}, { ssh: true, orchGroup: "g1" }]],
+  ];
+  for (const [label, args] of cases) {
+    assert.ok(sshOrchestrationRefusal(...args), `${label} must be refused`);
+  }
+  // And per-field, not just for `orchGroup`: a role or a bare agent id on the
+  // pane is as much an orchestration identity as a group is.
+  assert.ok(sshOrchestrationRefusal({ ssh: true }, { orchRole: "worker" }));
+  assert.ok(sshOrchestrationRefusal({ ssh: true }, { orchAgent: "a1" }));
+});
+
+// --- no silent data loss: a typed value is honoured or refused, never dropped ---
+
+test("an out-of-range port is REFUSED, not silently dropped on the way to ssh", () => {
+  // The defect this pins (PR #921 review, rev-441): normalization is right to
+  // drop a port outside TCP's range, but dropping it quietly meant a human typed
+  // 99999, hit Create, connected on 22, and was never told. The refusal names the
+  // real bound rather than a second copy of it.
+  const res = planPaneSetup(input({ kind: "ssh", sshProfile: sshProfile({ port: 99_999 }) }));
+  assert.equal(res.ok, false);
+  assert.ok(!res.ok && res.focus === "ssh");
+  assert.match(res.ok ? "" : res.error, /port must be a whole number between 1 and 65535/i);
+  // A fractional port is the same defect wearing different clothes.
+  const fractional = planPaneSetup(input({ kind: "ssh", sshProfile: sshProfile({ port: 22.5 }) }));
+  assert.equal(fractional.ok, false);
+  // …while a real port, and no port at all, both still launch: the refusal must
+  // not have become "no port is ever acceptable".
+  const ok = planPaneSetup(input({ kind: "ssh", sshProfile: sshProfile({ port: 2222 }) }));
+  assert.ok(ok.ok && ok.plan.kind === "ssh" && ok.plan.profile.port === 2222);
+  const unset = planPaneSetup(input({ kind: "ssh", sshProfile: sshProfile({ port: null }) }));
+  assert.ok(unset.ok && unset.plan.kind === "ssh" && unset.plan.profile.port === null);
+});
+
+test("an out-of-range keepalive and a pasted KEY are refused for the same reason", () => {
+  // Same rule, the other two fields normalization can drop. The identity-file one
+  // matters most: silently dropping it means connecting with no `-i` at all, and
+  // the human sees an authentication failure with no visible cause.
+  const keepalive = planPaneSetup(
+    input({ kind: "ssh", sshProfile: sshProfile({ keepaliveSeconds: 0 }) })
+  );
+  assert.equal(keepalive.ok, false);
+  assert.match(keepalive.ok ? "" : keepalive.error, /keepalive/i);
+
+  const pasted = planPaneSetup(
+    input({
+      kind: "ssh",
+      sshProfile: sshProfile({
+        identityFile: "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEA\n-----END…",
+      }),
+    })
+  );
+  assert.equal(pasted.ok, false);
+  assert.match(pasted.ok ? "" : pasted.error, /must be a PATH/i);
+  // The real case still passes — a path is a path.
+  const path = planPaneSetup(
+    input({ kind: "ssh", sshProfile: sshProfile({ identityFile: "~/.ssh/id_ed25519", keepaliveSeconds: 30 }) })
+  );
+  assert.ok(path.ok && path.plan.kind === "ssh");
+  assert.equal(path.ok && path.plan.kind === "ssh" ? path.plan.profile.identityFile : "", "~/.ssh/id_ed25519");
+});
+
+test("a saved connection off disk is never bounced by that refusal", () => {
+  // The rule only ever fires on values a human just typed. Anything loaded from
+  // sshprofiles.json was normalized on the way in, so what was typed and what
+  // survived are the same object and nothing is refused — otherwise this would
+  // have turned an old saved connection into a pane that refuses to open.
+  const fromDisk = sshProfile({ port: 2222, keepaliveSeconds: 30, identityFile: "~/.ssh/id_ed25519" });
+  assert.equal(sshDiscardedFieldError(fromDisk, fromDisk), "");
+});
+
+test("a remote folder with no remote CLI warns — the value is kept, not dropped in silence", () => {
+  // `remoteCwd` is a prefix to the REMOTE COMMAND, so with no CLI there is
+  // nothing to prefix and it cannot apply (S2's builder has always worked this
+  // way). Honouring it would mean guessing the remote's login shell — the exact
+  // guess `remoteShell` exists to refuse — and refusing to save it would throw
+  // away a setting that becomes correct the moment a CLI is picked. So: warn.
+  assert.match(sshRemoteCwdWarning(null, "/srv/app"), /only when a remote CLI is set/i);
+  assert.match(sshRemoteCwdWarning(null, "/srv/app"), /stays saved/i);
+  // Silent in every case where it does apply, or where there is nothing to say.
+  assert.equal(sshRemoteCwdWarning("claude", "/srv/app"), "");
+  assert.equal(sshRemoteCwdWarning(null, null), "");
+  // And the warning is exactly that — the launch still plans, with the folder
+  // preserved on the connection that gets saved.
+  const res = planPaneSetup(
+    input({ kind: "ssh", sshProfile: sshProfile({ remoteCwd: "/srv/app", defaultCli: null }) })
+  );
+  assert.ok(res.ok && res.plan.kind === "ssh");
+  assert.equal(res.ok && res.plan.kind === "ssh" ? res.plan.profile.remoteCwd : "", "/srv/app");
 });
 
 // ---------- SubmitLatch's second consumer: the app-quit confirm (#219) ----------

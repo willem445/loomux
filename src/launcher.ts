@@ -56,6 +56,7 @@ import {
   sshLaunchArgv,
   sshMintsSessionId,
   sshRemoteCliWarning,
+  sshRemoteCwdWarning,
 } from "./panesetup";
 import {
   decodeSshProfiles,
@@ -64,7 +65,9 @@ import {
   REMOTE_SHELLS,
   DEFAULT_REMOTE_SHELL,
   MAX_KEEPALIVE_SECONDS,
+  MAX_SSH_PORT,
   MIN_KEEPALIVE_SECONDS,
+  MIN_SSH_PORT,
   type RemoteShell,
   type SshProfile,
   type SshProfileStore,
@@ -220,15 +223,18 @@ const SSH_NO_CLIENT =
   "No ssh client found — loomux looked on PATH and in the Windows OpenSSH install " +
   "(System32\\OpenSSH). Install the OpenSSH Client optional feature, or put ssh.exe on PATH.";
 
-/** A bounded integer from an optional numeric field, or null for blank/garbage.
- *  Deliberately does NOT clamp: the profile store applies the real bounds
- *  (`sshprofile.ts`), and clamping here would show the human one number while
- *  saving another. */
-function optionalInt(el: HTMLInputElement): number | null {
+/** The number in an optional numeric field, or null when it is blank.
+ *
+ *  Deliberately does NOT clamp, round, or reject: a value that is out of range or
+ *  not a whole number is carried through EXACTLY as typed, so the launch seam can
+ *  see that the human typed something and refuse it by name
+ *  (`sshDiscardedFieldError`). Sanitizing here would turn `99999` into "no port"
+ *  before anything could notice a port had been asked for — which is precisely
+ *  the silent discard this shape exists to avoid. A blank field is the one case
+ *  that really does mean "unset". */
+function optionalNumber(el: HTMLInputElement): number | null {
   const raw = el.value.trim();
-  if (!raw) return null;
-  const n = Number(raw);
-  return Number.isInteger(n) ? n : null;
+  return raw ? Number(raw) : null;
 }
 
 function numberInput(value: number, min: number, max: number): HTMLInputElement {
@@ -545,8 +551,8 @@ export class WelcomeForm {
     this.sshNameInput.addEventListener("input", () => this.updateName());
     this.sshPortInput = textInput("22");
     this.sshPortInput.type = "number";
-    this.sshPortInput.min = "1";
-    this.sshPortInput.max = "65535";
+    this.sshPortInput.min = String(MIN_SSH_PORT);
+    this.sshPortInput.max = String(MAX_SSH_PORT);
     this.sshPortInput.className = "dlg-input dlg-num";
     this.sshIdentityInput = textInput("path to a private key — optional");
     this.sshRemoteShellSel = select(
@@ -570,6 +576,7 @@ export class WelcomeForm {
     ]);
     this.sshCliSel.addEventListener("change", () => this.updateSshWarning());
     this.sshRemoteCwdInput = textInput("directory on the REMOTE host — optional");
+    this.sshRemoteCwdInput.addEventListener("input", () => this.updateSshWarning());
     this.sshWarn = document.createElement("div");
     this.sshWarn.className = "dlg-error";
     const sshRow = (...fields: HTMLElement[]): HTMLElement => {
@@ -1486,23 +1493,32 @@ export class WelcomeForm {
     this.sshCliSel.value = cli ?? "";
   }
 
-  /** The SSH section's inline warnings, in priority order: no ssh client at all
-   *  (which will refuse the launch), then an unrecognized remote CLI (which will
-   *  not). */
+  /** The SSH section's inline warnings. No ssh client at all replaces the rest —
+   *  it is the one that will refuse the launch, so it must not be one line among
+   *  several. Otherwise every applicable advisory shows: an unrecognized remote
+   *  CLI, and a remote folder that this launch cannot act on. Both are things the
+   *  human can act on BEFORE submitting, which is the whole point of saying them
+   *  here rather than discovering them afterwards. */
   private updateSshWarning(): void {
     if (this.kind !== "ssh") return;
-    const cliWarning = sshRemoteCliWarning(
-      this.sshCliSel.value || null,
-      AGENTS.map((a) => a.id)
-    );
+    const advisories = (): string =>
+      [
+        sshRemoteCliWarning(
+          this.sshCliSel.value || null,
+          AGENTS.map((a) => a.id)
+        ),
+        sshRemoteCwdWarning(this.sshCliSel.value || null, this.sshRemoteCwdInput.value.trim() || null),
+      ]
+        .filter(Boolean)
+        .join(" ");
     const show = (text: string): void => {
       this.sshWarn.textContent = text ? `⚠ ${text}` : "";
       this.sshWarn.classList.toggle("visible", !!text);
     };
-    show(cliWarning);
+    show(advisories());
     void this.resolveSshProgram().then((program) => {
       if (this.kind !== "ssh") return;
-      show(program ? cliWarning : SSH_NO_CLIENT);
+      show(program ? advisories() : SSH_NO_CLIENT);
     });
   }
 
@@ -1532,12 +1548,12 @@ export class WelcomeForm {
       id: picked?.id ?? this.sshNewId ?? crypto.randomUUID(),
       name,
       destination,
-      port: optionalInt(this.sshPortInput),
+      port: optionalNumber(this.sshPortInput),
       identityFile: this.sshIdentityInput.value.trim() || null,
       remoteCwd: this.sshRemoteCwdInput.value.trim() || null,
       defaultCli: this.sshCliSel.value || null,
       remoteShell: this.sshRemoteShellSel.value as RemoteShell,
-      keepaliveSeconds: optionalInt(this.sshKeepaliveInput),
+      keepaliveSeconds: optionalNumber(this.sshKeepaliveInput),
       // Whitespace-split argv words, as the field's hint says. No quoting is
       // interpreted (a single flag value containing a space is not expressible
       // here) — these reach ssh as argv, never through a shell, so there is no
