@@ -160,6 +160,15 @@ compiles.
   and `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was` go red
   alone, on a round where nothing else moved. Procedure and re-bless log:
   `src-tauri/tests/fixtures/pre222/README.md` (#867, #868, #874).
+- **A source-scanning guard must not decide from a binding's *name*** — a rename
+  steps over it, so it enforces nothing. Decide on name-independent axes and
+  default-deny: the receiver (anything building a path off a declared root is
+  denied unless it is on an allow-list carrying a reason per entry) plus a shape
+  that cannot compile any other way (`.join(x.as_str())`); a name heuristic is a
+  labelled supplement at best, and the residual blind spot is stated where the
+  scan is implemented. Precedents: `tests/groupid.rs`, `tests/perf_dispatch.rs`,
+  `test/perfpolicy.test.ts`. Signature: the guard's own doc quotes the line it
+  was written for, and that line still passes (#922).
 - `src-tauri/src/orchestration/mod.rs` is tens of thousands of lines — grep for
   the function/struct, don't read it top to bottom.
 - Comments in this codebase explain *why* (design constraints, Windows quirks,
@@ -203,7 +212,12 @@ narrow their ask back down to the original ticket on your own judgment.
   it) — so a claim deleted from one survives on the others. Verify the purge by
   grepping the *entity* the claim names, never the phrasing you rewrote.
   Signature: a re-review that clears a claim on two surfaces and finds it alive
-  on the third (#878).
+  on the third (#878). **Correct the twin, not just the named site**: one entity
+  grep clears the sites you thought of, while each line you rewrite still has a
+  paraphrase elsewhere (a comment and its design-note gloss), so grep each
+  corrected line's own distinctive noun (`by provenance`, `strictly narrower`)
+  across the tree in the same pass. Signature of the miss: the same finding
+  reopens a third round, on twins of lines an earlier round corrected (#922).
 - **Historical context lives in design notes, ADRs, and issue/PR history —
   never in user docs, this repo's own agent instruction files
   (`.github/agents/`, `.claude/skills/`, `.loomux/workflow.yml`), or this
