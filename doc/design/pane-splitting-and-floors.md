@@ -36,10 +36,12 @@ The cost of a split has to come out of somebody's pixels. Who should pay
 depends entirely on **who asked**, and loomux has two askers:
 
 - A **human** splitting the pane they are looking at means *"give this new
-  thing space out of THIS pane"*. Everything else on screen should sit
-  perfectly still. That is **`halve`**: the target and the newcomer each take
-  half of the target's weight, so the row's total is unchanged and every
-  other sibling keeps its exact pixel share.
+  thing space out of THIS pane"*. Everything else on screen should sit as
+  still as the layout can hold it. That is **`halve`**: the target and the
+  newcomer each take half of the target's weight, so the row's total is
+  unchanged and every other sibling keeps its exact **share** of the row.
+  (Its share, not its pixels — see *What "the siblings don't move" actually
+  means* below, which is the sharpest thing in this note.)
 - A **programmatic fan-out** — the multi-agent welcome form placing five
   agents in one pass — means *"lay these out as an even matrix"*. That is
   **`share`**, the pre-#885 policy, kept unchanged.
@@ -94,25 +96,52 @@ legitimately resized PTYs on split.
 This work does not merely stay on the legitimate side of that line — it
 **reduces** the cost:
 
-- `halve` resizes exactly **one** existing pane per split. The `1/N`
-  re-share resized **every** sibling in the row. Strictly fewer
-  `ResizePseudoConsole` calls per split than before.
+- `halve` guarantees **one** resize per split — the pane being split — and
+  leaves every sibling's share of the row untouched. `1/N` re-shared the row,
+  so it resized **every** sibling in it, every time. The next section is
+  precise about the residue `halve` does not eliminate; even counting that
+  residue at its worst, this is strictly and dramatically fewer
+  `ResizePseudoConsole` calls per split.
 - Drag paths keep the existing commit-on-release coalescing
   (`beginResizeHold` → one resize per pane per drag, #432). No live-drag PTY
   resizing existed and none is added.
 - No new resize *trigger* is introduced anywhere: the policy is evaluated
   inside structural operations that were already resizing.
 
-The untouched-sibling property is machine-checked rather than asserted:
-`e2e/tests/pane-split.spec.ts` splits the leftmost pane of a 3-wide row and
-requires the other two panes' bounding boxes to be unchanged. "Didn't move"
-is "was never resized", because `applyFit` skips a same-size fit
-(`panefit.ts`) — so that spec is the constraint-1 claim, tested. Its
-tolerance is one divider width (6px, `styles.css`): a divider is a real flex
-sibling, so a fourth pane in the row also inserts a third divider and takes
-those pixels out of the row's free space. That is the only legitimate
-movement, it is bounded by a single divider no matter how wide the row, and
-it is an order of magnitude below what a `1/N` re-share moves.
+### What "the siblings don't move" actually means
+
+`halve` preserves each sibling's `grow / total` **ratio**. It does not
+preserve each sibling's **pixels**, and the difference is not pedantry — it
+is the difference between a claim that is true and one that is not:
+
+- A pane's size is `grow / total × freeSpace`. `halve` holds the first factor
+  fixed. It cannot hold the second: a same-direction insert also adds a
+  **divider**, and a divider is a real flex sibling (`.split.row > .divider`
+  is `width: 6px` with `margin: 8px -1px` — a **4px** outer footprint) taken
+  off the top before free space is distributed.
+- So every sibling loses `ratio × 4px`. About **1px** each in a four-pane
+  row; about 3.6px for a sibling holding 90% of a row.
+- `shouldResizePty` (`panefit.ts`) skips only an identical `cols x rows`, and
+  a cell is ~8.4px wide at the default font — so a sibling whose width sat
+  within that 1px of a cell boundary **does** issue one real PTY resize. On
+  the order of one split in eight, per sibling, in a typical row; more for a
+  sibling holding a large share of a wide one.
+
+The honest claim, which is still the whole win: **one guaranteed resize (the
+pane being split), plus an occasional sub-cell nudge that costs a sibling one
+column** — against `share`, which moved every sibling by tens of pixels and
+resized all of them, every split. Do not let this get re-compressed into
+"never resizes its PTY" in a future edit; it is wrong, and the honest version
+loses nothing.
+
+`e2e/tests/pane-split.spec.ts` machine-checks exactly the true property: it
+splits the leftmost pane of a 3-wide row and asserts each untouched pane's
+**share of the row** is unchanged (measured with no magic numbers — the panes'
+widths sum to the row's distributable space by construction), plus a plain
+pixel bound of one divider's footprint. It is deliberately **not** labelled a
+proof that no sibling's PTY resized: a `cols` flip needs ~1px, so no
+bounding-box spec can exclude one. What it does exclude, by an order of
+magnitude, is a re-share of the row.
 
 ## What is NOT changed
 
@@ -125,6 +154,13 @@ it is an order of magnitude below what a `1/N` re-share moves.
   variants are a cheap follow-on if the demo asks for them.
 - **Cross-direction splits** — already halving; not touched.
 - **Dependencies** — none added, of any kind.
+- **The session browser's "resume this session" pane** (`main.ts`'s
+  `grid.openPane` for a hand-resumed session) keeps `share`. It is a human
+  click, but what it performs is a **restore** — bringing a recorded session
+  back into the layout — not "give this new thing space out of the pane I am
+  in", which is the sentence `halve` answers. Same reading as a dock restore
+  and a replayed layout. Flagged here because it is the one call site where a
+  reader will reasonably ask.
 
 ## Floors and deliberate overflow
 
@@ -136,6 +172,14 @@ deliberately still open:
   tuned with the human at the demo. Deliberately font-independent pixel
   approximations rather than live cell metrics — state-dependent geometry
   feeding layout decisions is the coupling constraint 1 distrusts.
+- **A floor below 60px would be inert**, and it also bounds slice A's
+  untouched-sibling property: `.pane` carries `min-width: 60px` /
+  `min-height: 60px` (`styles.css`). Flex clamps an item at its minimum and
+  redistributes the surplus to the *other* items, so once repeated halving
+  drives the target's computed width under 60px (roughly the 5th consecutive
+  halve of one pane in a 1600px row) the siblings **grow** and resize. Below
+  that point the ratio guarantee above stops holding, which is one more
+  reason the floors exist — and a reason to pick them well above 60.
 - A capacity predicate gates split gestures, drag-to-edge drops and dock
   restores. Floors gate **new growth** only.
 - A window shrink does **not** trigger relayout or eviction; panes degrade

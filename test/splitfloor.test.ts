@@ -11,10 +11,16 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { parseGrow, planRowSplit } from "../src/splitfloor.ts";
 
-/** Sum of a row's flex-grows — what decides each sibling's PIXEL share, since
- *  every child is `flex: <grow> 1 0` (basis 0). A sibling's on-screen size is
- *  `grow / total * freeSpace`, so "weight unchanged AND total unchanged" is
- *  exactly "this sibling did not move". */
+/** Sum of a row's flex-grows — what decides each sibling's SHARE of the row,
+ *  since every child is `flex: <grow> 1 0` (basis 0). A sibling's on-screen
+ *  size is `grow / total × freeSpace`, so "weight unchanged AND total
+ *  unchanged" is exactly "this sibling's share of the row did not move".
+ *
+ *  Deliberately not "did not move in pixels": `freeSpace` is the other factor,
+ *  and a same-direction insert also adds a divider, which is a real flex
+ *  sibling costing the row ~4px (see `planRowSplit`'s halve branch). This
+ *  module owns the ratio; the pixels are the ratio times a denominator this
+ *  module cannot see. */
 const total = (w: readonly number[]): number => w.reduce((a, b) => a + b, 0);
 
 const closeTo = (actual: number, expected: number, msg: string): void => {
@@ -46,7 +52,7 @@ function targetIndexAfter(targetIndex: number, insertedIndex: number): number {
   return insertedIndex <= targetIndex ? targetIndex + 1 : targetIndex;
 }
 
-test("halve: the row's total weight is unchanged, so every sibling keeps its exact pixel share", () => {
+test("halve: the row's total weight is unchanged, so every sibling keeps its exact share of the row", () => {
   for (const targetIndex of [0, 1, 2]) {
     const { weights } = planRowSplit(ROW, targetIndex, "halve");
     closeTo(total(weights), total(ROW), `splitting index ${targetIndex} changed the row's total`);
@@ -76,9 +82,12 @@ test("share: the newcomer takes an even 1/N slice and no existing weight is rewr
 test("the two policies part company exactly where the human feels it: share grows the row's total, halve does not", () => {
   const halved = planRowSplit(ROW, 0, "halve");
   const shared = planRowSplit(ROW, 0, "share");
-  // Growing the total is what shrinks EVERY sibling's pixels (grow/total), and
+  // Growing the total is what shrinks EVERY sibling's share (grow/total), and
   // is precisely the "the whole row re-flows when I split one pane" feel #885
-  // is about. Under halve the total is fixed, so only the target's pixels move.
+  // is about. Under halve the total is fixed, so the target's share is the
+  // only one that moves — the siblings' pixels still give up their slice of
+  // the new divider's ~4px (see planRowSplit), which is a different and much
+  // smaller thing.
   closeTo(total(halved.weights), total(ROW), "halve changed the row's total");
   assert.ok(
     total(shared.weights) > total(ROW) + 1e-9,

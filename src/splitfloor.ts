@@ -15,7 +15,8 @@
 //
 //   - A HUMAN splitting the pane they are looking at means "give this new
 //     thing space out of THIS pane" — every other pane on screen should sit
-//     perfectly still. That is `halve`, and it is what tmux/wezterm do.
+//     as still as the layout can hold it. That is `halve`, and it is what
+//     tmux/wezterm do.
 //   - A PROGRAMMATIC fan-out (the multi-agent welcome form placing five
 //     agents at once) means "lay these out as an even matrix". Halving
 //     repeatedly there would produce a 1/2, 1/4, 1/8, 1/16 sliver staircase.
@@ -35,8 +36,11 @@
  *
  *  - `halve` — the target pane alone: it and the newcomer each take half of
  *    the target's weight, so the row's TOTAL is unchanged and every other
- *    sibling keeps its exact pixel share (and therefore never resizes its
- *    PTY). Every human split gesture uses this.
+ *    sibling keeps its exact `grow / total` RATIO. Note what that does and
+ *    does not promise: a sibling's SHARE of the row is untouched, but the row
+ *    itself has one more divider in it, so its free space shrinks by that
+ *    divider's ~4px and each sibling loses its ratio's slice of them (~1px in
+ *    a typical row — see `planRowSplit`). Every human split gesture uses this.
  *  - `share` — the whole row: the newcomer takes an even 1/N slice on top of
  *    the existing weights, so the total grows and every sibling shrinks
  *    proportionally. Pre-#885 behaviour, kept for programmatic batch
@@ -97,8 +101,21 @@ export function planRowSplit(
   let newcomer: number;
   if (policy === "halve") {
     // The target pays alone: half stays, half goes to the newcomer. The sum is
-    // preserved exactly (halving a float is exact), so no sibling's
-    // grow/total ratio — and thus no sibling's pixel width — moves at all.
+    // preserved exactly (halving a float is exact), so no sibling's grow/total
+    // ratio moves at all.
+    //
+    // The ratio is the whole guarantee — it does NOT follow that a sibling's
+    // pixels are untouched, because the DENOMINATOR of `ratio × freeSpace`
+    // also moves: a same-direction insert adds a divider, and a divider is a
+    // real flex sibling (`.split.row > .divider`: 6px wide with -1px side
+    // margins, so a 4px outer footprint) taken off the top before free space
+    // is distributed. Each sibling therefore loses `ratio × 4px` — about 1px
+    // in a four-pane row, about 3.6px for a sibling holding 90% of it. That
+    // is usually zero terminal columns, but `shouldResizePty` (panefit.ts)
+    // compares a `cols x rows` string, so a sibling whose width sat within
+    // 1px of a cell boundary (~8.4px at the default font) does issue one real
+    // PTY resize. Fewer resizes than `share`, which moves every sibling by
+    // tens of px — not zero. Do not restore the stronger claim.
     const half = row[idx] / 2;
     row[idx] = half;
     newcomer = half;

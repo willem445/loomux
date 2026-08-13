@@ -219,10 +219,13 @@ instead of an empty listing — pick a new folder and carry on.
 - **Split down** (`Ctrl+Shift+O`) adds one below.
 
 **A split only ever spends the pane you are in.** The pane you split gives up
-half its space to the new one, and every other pane keeps its share of the tab —
-give or take the few pixels the new divider itself occupies. Nothing else
-re-flows and no other terminal is rearranged, so no other pane's output
-repaints. Splitting is a local edit, not a rearrangement of the tab.
+half its space to the new one, and every other pane keeps its share of the
+screen: the layout doesn't re-flow around the new pane. The only thing that
+shifts your other panes is the new divider itself, which takes a few pixels of
+row for its own — about one pixel per pane in a typical layout. So the pane you
+split repaints, and the rest normally don't: occasionally one sits close enough
+to a character-cell boundary that losing that pixel costs it a column, and it
+repaints too. Splitting is a local edit, not a rearrangement of the tab.
 
 Panes stay in a flat row or column as you split within one, so the dividers keep
 working the obvious way: dragging one trades space between its two neighbours

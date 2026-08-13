@@ -6,8 +6,14 @@
 // site and computed in the pure, DOM-free `splitfloor.ts`:
 //
 //   - `halve` — the target pane pays for the newcomer out of its OWN weight,
-//     so the row's total is unchanged and every other pane in it keeps its
-//     exact pixel size (and therefore never resizes its PTY). Every HUMAN
+//     so the row's total is unchanged and every other pane keeps its exact
+//     grow/total RATIO. That is a ratio guarantee, not a pixel one: the new
+//     divider is itself a flex sibling and takes ~4px off the row's free
+//     space, so each sibling loses its ratio's share of those 4px (~1px in a
+//     typical row) and drops a terminal column on the occasions when that
+//     lands across a cell boundary. So: ONE guaranteed PTY resize (the
+//     target) plus a rare sub-cell nudge per sibling — against `share`, which
+//     moves and resizes every sibling in the row, every time. Every HUMAN
 //     split gesture uses this: the pane you are standing in is the one that
 //     shrinks, which is what tmux/wezterm do and what a split "feels" like.
 //   - `share` — the newcomer takes an even 1/N slice on top of the existing
@@ -1179,8 +1185,19 @@ export class Grid {
    *  restructure, so affected panes may resize once.
    *
    *  `halve` (#885): drag-to-edge is one of the four human split gestures —
-   *  "put this pane HERE, in that pane's space" — so the drop target pays, and
-   *  the rest of the row is left where the human can see it didn't move. */
+   *  "put this pane HERE, in that pane's space" — so the DROP TARGET is what
+   *  pays for the arriving pane.
+   *
+   *  That is the only half of this operation the policy governs, and the other
+   *  half moves panes regardless of it: the pane also LEAVES a slot, and
+   *  `removeFromTree` splices it out without redistributing its weight, so its
+   *  old row's total drops and every pane still in that row grows to fill the
+   *  gap. When the drag stays inside one row, that is the same row — e.g.
+   *  [A=1, B=1, C=1] with C dropped on A's right edge ends as [A=.5, C=.5,
+   *  B=1] of a total of 2, so B goes from a third of the row to a half. That
+   *  is correct (a departing pane has to give its space back) and pre-dates
+   *  this policy; it just means "the rest of the layout doesn't move" is true
+   *  of a SPLIT and not of a MOVE. */
   moveToEdge(source: Pane, target: Pane, dir: Dir, before: boolean): void {
     if (source === target || this.maximized) return;
     const leaf = this.leaves.get(source);
