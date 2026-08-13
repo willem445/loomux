@@ -19456,10 +19456,18 @@ fn run_queue_drainer(
             // every gate is concerned, and a successful delivery lowers it below
             // on `Done` — the same place every other release does. Lowering it
             // on a provisional decision is #560's symptom 1.
+            //
+            // The clock is read ONCE and shared with the audit below. Two reads
+            // could disagree — `note_hold` on another thread can end the episode
+            // between them — and the record would then describe a hold the
+            // decision was not made about, the same "different instant" defect
+            // `question_seen` exists to avoid one line up.
+            let override_now = now_ms();
+            let held_since = reg.hold_episode_since(pty_id);
             question_overridden = question_override_admits(
                 admission,
-                reg.hold_episode_since(pty_id),
-                now_ms(),
+                held_since,
+                override_now,
                 QUESTION_HOLD_OVERRIDE_AFTER.as_millis() as u64,
                 question_idle_streak,
             );
@@ -19471,8 +19479,7 @@ fn run_queue_drainer(
                 question_idle_streak = 0;
                 reg.audit(&group, "loomux", "delivery-question-override", json!({
                     "to": &front.agent_id,
-                    "held_ms": reg.hold_episode_since(pty_id)
-                        .map(|s| now_ms().saturating_sub(s)),
+                    "held_ms": held_since.map(|s| override_now.saturating_sub(s)),
                     "bound_ms": QUESTION_HOLD_OVERRIDE_AFTER.as_millis() as u64,
                     "depth": depth,
                     // What the detector was holding for, so a human reading this
@@ -21530,6 +21537,16 @@ fn question_active_witnessed(
     // the gate's decision are the same composed screen and not two reads
     // microseconds apart — `question_sample`'s own doc gives the reason that
     // distinction is correctness rather than cost.
+    //
+    // **Read UNMASKED, deliberately, and it is the conservative direction.** The
+    // masks (`mask_loomux_notices_with_record`, `mask_own_paste`) DELETE the rows
+    // they claim rather than blanking them, so a composer holding loomux's own
+    // unsubmitted paste — #820's exact screen — is a non-empty `❯ <our text>` row
+    // here and reads as NOT idle, which is the truth: that pane is holding
+    // something, and the override must not fire on it. The masked reading would
+    // simply have dropped the row, which happens to answer the same way; taking
+    // the unmasked one means it answers that way for the right reason and stays
+    // right if the masks ever start blanking instead of deleting.
     let idle = std::rc::Rc::new(std::cell::Cell::new(false));
     let idle_w = std::rc::Rc::clone(&idle);
     let active = question_hold_predicate_sampled(
