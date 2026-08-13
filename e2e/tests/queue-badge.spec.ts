@@ -227,6 +227,15 @@ test("the queue badge yields its text rather than crowding a narrow header", asy
     `at two columns the badge pushed the close button ${twoColOverhang}px further out ` +
       `(overhang was ${overhangHeld}px without it)`
   ).toBeLessThanOrEqual(MAX_BADGE_COST_PX);
+  // The absolute "still a usable drag source" guard belongs at THIS width, with
+  // the badge lit: two columns is a header with room, so a title collapsed here
+  // would be the badge's doing. (At three columns it is already collapsed by
+  // crowding this PR did not add — see the delta check below.)
+  const titleTwoCol = await pane.locator(".pane-title").boundingBox();
+  expect(
+    titleTwoCol?.width,
+    "with the badge lit at two columns the title stopped being a usable drag source"
+  ).toBeGreaterThan(10);
 
   // 3. Three columns: the tight case. The badge's cost must stay bounded by the
   //    box it cannot shrink — i.e. its text yielded completely — and it must not
@@ -236,11 +245,13 @@ test("the queue badge yields its text rather than crowding a narrow header", asy
   await expect(pane.locator(".pane-queue")).toHaveCount(1);
   const tightOverflow = await overflow();
   const tightOverhang = await closeOverhang();
+  const tightTitle = (await pane.locator(".pane-title").boundingBox())?.width ?? 0;
 
   await pushDepths(page, []);
   await expect(pane.locator(".pane-queue")).toBeHidden();
   const withoutOverflow = await overflow();
   const withoutOverhang = await closeOverhang();
+  const withoutTitle = (await pane.locator(".pane-title").boundingBox())?.width ?? 0;
 
   const tightCost = tightOverflow - withoutOverflow;
   expect(
@@ -256,8 +267,16 @@ test("the queue badge yields its text rather than crowding a narrow header", asy
       `(${withoutOverhang}px without it, ${tightOverhang}px with it)`
   ).toBeLessThanOrEqual(MAX_BADGE_COST_PX);
 
-  // 4. The title stays a usable drag source — the guard pane-reorder.spec
-  //    learned to assert, now with more content beside it.
-  const titleBox = await pane.locator(".pane-title").boundingBox();
-  expect(titleBox?.width, "the title collapsed to an unusable drag source").toBeGreaterThan(10);
+  // 4. …and the title — which is the OTHER shrinkable thing in this header, so
+  //    the badge could in principle take its width rather than its own. At three
+  //    columns the title is already collapsed by crowding this PR did not add
+  //    (that is #894, and asserting an absolute floor here is what made round 3
+  //    red: the check ran with the badge switched OFF and still failed), so what
+  //    is this PR's to keep is the delta.
+  const titleCost = withoutTitle - tightTitle;
+  expect(
+    titleCost,
+    `the badge took ${titleCost}px from the pane title at three columns ` +
+      `(${withoutTitle}px without it, ${tightTitle}px with it)`
+  ).toBeLessThanOrEqual(MAX_BADGE_COST_PX);
 });
