@@ -1,9 +1,17 @@
 // Unit tests for the pure ssh argv builder (#887 plan, slice S2). Run with
 // `npm test` (Node's built-in test runner strips TS types natively — mirrors
-// test/layout.test.ts). No sshd, no network, no process spawn: every
-// assertion is on the plain string[] the builder returns.
+// test/layout.test.ts). Most assertions are on the plain string[] the
+// builder returns, with no sshd, no network, no process spawn — but the
+// adversarial cmd.exe/sh sections below DO spawn a real local shell
+// (permitted: frontend-only, no cargo/rustc involved) to execute the built
+// remote-command string and check for a marker side effect, because an
+// argv-level assertion alone previously certified a real cmd.exe injection
+// (#906 review) — see PR body for the repro this closes.
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, rmSync } from "node:fs";
+import path from "node:path";
 import {
   buildSshArgv,
   claudeSessionArgs,
@@ -70,10 +78,10 @@ test("remote command with cwd: posix cd-then-exec", () => {
   assert.equal(argv[argv.length - 1], "cd '/srv/app' && exec 'claude' '--session-id' 'abc-123'");
 });
 
-test("remote command with cwd: windows cd /d then bare command", () => {
+test("remote command with cwd: cmd.exe cd /d then bare command", () => {
   const params: SshCommandParams = {
     destination: "user@host",
-    remoteShell: "windows",
+    remoteShell: "cmd",
     remoteCwd: "C:\\repos\\app",
     remoteCommand: ["claude"],
   };
@@ -168,32 +176,310 @@ test("posix quoting: hostile remote-command token with quotes, semicolons and ba
   assert.equal(argv[2], "h"); // destination untouched by the hostile token
 });
 
-// ---------- adversarial quoting: windows ----------
+// ---------- adversarial quoting: cmd.exe ----------
+//
+// The cmd.exe path always prefixes the emitted string with `cd /d "." && `
+// (or `cd /d "<remoteCwd>" && `) even when the caller passed no remoteCwd —
+// see buildCmdRemoteCommand's doc comment for why the leading character
+// matters to cmd.exe's own /C parsing. These argv-level assertions pin the
+// string; the "real cmd.exe" section below proves what that string actually
+// does when a real cmd.exe parses it.
 
-test("windows quoting: embedded double quote is doubled, not left dangling", () => {
+test("cmd quoting: embedded double quote is doubled, not left dangling", () => {
   const argv = buildSshArgv(FAKE_SSH, {
     destination: "h",
-    remoteShell: "windows",
+    remoteShell: "cmd",
     remoteCommand: ["claude", 'arg-with-"quote'],
   });
   const cmdString = argv[argv.length - 1];
-  assert.equal(cmdString, '"claude" "arg-with-""quote"');
+  assert.equal(cmdString, 'cd /d "." && "claude" "arg-with-""quote"');
   assert.equal(argv.length, 5);
 });
 
-test("windows quoting: hostile token with metacharacters stays inside one quoted run", () => {
-  const hostile = 'x" & del /f /q C:\\ & "y';
+test("cmd quoting: hostile token with metacharacters stays inside one quoted run", () => {
+  const hostile = 'x" & echo PWNED & "y';
   const argv = buildSshArgv(FAKE_SSH, {
     destination: "h",
-    remoteShell: "windows",
+    remoteShell: "cmd",
     remoteCommand: ["claude", hostile],
   });
   const cmdString = argv[argv.length - 1];
-  assert.equal(cmdString, '"claude" "x"" & del /f /q C:\\ & ""y"');
+  assert.equal(cmdString, 'cd /d "." && "claude" "x"" & echo PWNED & ""y"');
   // [program, -t, destination, --, cmdString] regardless of embedded
   // metacharacters — one trailing argv element, destination untouched.
   assert.equal(argv.length, 5);
   assert.equal(argv[2], "h");
+});
+
+// ---------- refusals: unknown shell family, newline, trailing backslash, destination ----------
+
+test("unsupported remoteShell is refused, not silently mis-quoted (includes the old 'windows' literal)", () => {
+  const params = {
+    destination: "h",
+    remoteShell: "windows",
+    remoteCommand: ["claude"],
+  } as unknown as SshCommandParams;
+  assert.throws(() => buildSshArgv(FAKE_SSH, params), /unsupported remoteShell/);
+});
+
+test("unsupported remoteShell is refused for an arbitrary unrecognized value", () => {
+  const params = {
+    destination: "h",
+    remoteShell: "powershell",
+    remoteCommand: ["claude"],
+  } as unknown as SshCommandParams;
+  assert.throws(() => buildSshArgv(FAKE_SSH, params), /unsupported remoteShell/);
+});
+
+test("cmd path: a newline in a remote-command token is refused, not silently truncated", () => {
+  assert.throws(
+    () =>
+      buildSshArgv(FAKE_SSH, {
+        destination: "h",
+        remoteShell: "cmd",
+        remoteCommand: ["claude", "a\nwhoami"],
+      }),
+    /newline/,
+  );
+});
+
+test("cmd path: a trailing backslash in a remote-command token is refused, not silently merged", () => {
+  assert.throws(
+    () =>
+      buildSshArgv(FAKE_SSH, {
+        destination: "h",
+        remoteShell: "cmd",
+        remoteCommand: ["claude", "C:\\dir\\"],
+      }),
+    /trailing/,
+  );
+});
+
+test("cmd path: a trailing backslash in remoteCwd is refused too", () => {
+  assert.throws(
+    () =>
+      buildSshArgv(FAKE_SSH, {
+        destination: "h",
+        remoteShell: "cmd",
+        remoteCwd: "C:\\repos\\",
+        remoteCommand: ["claude"],
+      }),
+    /trailing/,
+  );
+});
+
+test("a destination starting with '-' is refused rather than reaching ssh as an option", () => {
+  assert.throws(
+    () => buildSshArgv(FAKE_SSH, { destination: "-oProxyCommand=calc", remoteShell: "posix" }),
+    /destination/,
+  );
+});
+
+// ---------- real-shell execution: does the built string actually inject? ----------
+//
+// Argv-level assertions above pin the *string* the builder returns; they
+// cannot see what a real shell does with it, which is exactly how the
+// previous cmd.exe scheme's leading-quote defect passed review undetected
+// (#906). These spawn a real local cmd.exe / sh with the built string and
+// check for a marker side effect, mirroring the reviewer's own repro
+// technique (adapted to a harmless marker write instead of `del`).
+
+const SCRATCH_DIR = path.join(process.cwd(), ".scratch");
+mkdirSync(SCRATCH_DIR, { recursive: true });
+
+function markerPath(name: string): string {
+  return path.join(SCRATCH_DIR, `injection-marker-${process.pid}-${name}.txt`);
+}
+
+function cleanupMarker(file: string): void {
+  if (existsSync(file)) rmSync(file, { force: true });
+}
+
+/** True if child_process can actually find/run `cmd.exe` here (skip, don't
+ *  fail, off Windows or in an environment with no ComSpec). */
+function cmdExeAvailable(): boolean {
+  if (process.platform !== "win32") return false;
+  const probe = spawnSync(process.env.ComSpec || "cmd.exe", ["/c", "exit 0"], { encoding: "utf8" });
+  return probe.error === undefined && probe.status === 0;
+}
+
+function runRemoteStringInCmdExe(cmdString: string): { stdout: string; stderr: string; status: number | null } {
+  // windowsVerbatimArguments: true is required here — without it Node
+  // re-quotes the argv itself before CreateProcess, which would mask
+  // exactly the leading-quote defect this suite exists to catch. This
+  // mirrors what an OpenSSH-for-Windows sshd does: pass the remote command
+  // string to `cmd.exe /c` as a single argument.
+  const result = spawnSync(process.env.ComSpec || "cmd.exe", ["/c", cmdString], {
+    windowsVerbatimArguments: true,
+    encoding: "utf8",
+  });
+  return { stdout: result.stdout ?? "", stderr: result.stderr ?? "", status: result.status };
+}
+
+const CMD_AVAILABLE = cmdExeAvailable();
+if (!CMD_AVAILABLE) {
+  test("real cmd.exe injection probes — SKIPPED (no cmd.exe on this platform)", { skip: true }, () => {});
+}
+
+test(
+  "real cmd.exe: reviewer's repro shape (embedded quote + '&') no longer injects when remoteCwd is unset",
+  { skip: !CMD_AVAILABLE },
+  () => {
+    const marker = markerPath("repro-embedded-quote");
+    cleanupMarker(marker);
+    try {
+      const hostile = `x" & echo PWNED>${marker} & "y`;
+      const argv = buildSshArgv(FAKE_SSH, {
+        destination: "h",
+        remoteShell: "cmd",
+        remoteCommand: ["claude", hostile],
+      });
+      const cmdString = argv[argv.length - 1];
+      runRemoteStringInCmdExe(cmdString);
+      assert.ok(
+        !existsSync(marker),
+        `injection marker was created — the embedded '&' ran as a separate command: ${cmdString}`,
+      );
+    } finally {
+      cleanupMarker(marker);
+    }
+  },
+);
+
+test(
+  "real cmd.exe: a bare metacharacter with no embedded quote does not inject (remoteCwd unset)",
+  { skip: !CMD_AVAILABLE },
+  () => {
+    const marker = markerPath("bare-metachar");
+    cleanupMarker(marker);
+    try {
+      const hostile = `a|echo PWNED>${marker}|b`;
+      const argv = buildSshArgv(FAKE_SSH, {
+        destination: "h",
+        remoteShell: "cmd",
+        remoteCommand: ["cmd", "/c", "echo", hostile],
+      });
+      const cmdString = argv[argv.length - 1];
+      runRemoteStringInCmdExe(cmdString);
+      assert.ok(!existsSync(marker), `injection marker was created via a bare '|': ${cmdString}`);
+    } finally {
+      cleanupMarker(marker);
+    }
+  },
+);
+
+test(
+  "real cmd.exe: a metacharacter in a middle token of a realistic claude line does not inject",
+  { skip: !CMD_AVAILABLE },
+  () => {
+    const marker = markerPath("middle-token");
+    cleanupMarker(marker);
+    try {
+      const hostile = `x" & echo PWNED>${marker} & "y`;
+      const argv = buildSshArgv(FAKE_SSH, {
+        destination: "h",
+        remoteShell: "cmd",
+        remoteCommand: ["claude", "--append-system-prompt", hostile, "--session-id", "abc-123"],
+      });
+      const cmdString = argv[argv.length - 1];
+      runRemoteStringInCmdExe(cmdString);
+      assert.ok(!existsSync(marker), `injection marker was created from a middle token: ${cmdString}`);
+    } finally {
+      cleanupMarker(marker);
+    }
+  },
+);
+
+test(
+  "real cmd.exe: remoteCwd-present form stays safe too (regression guard on the pre-fix-safe case)",
+  { skip: !CMD_AVAILABLE },
+  () => {
+    const marker = markerPath("cwd-present");
+    cleanupMarker(marker);
+    try {
+      const hostile = `x" & echo PWNED>${marker} & "y`;
+      const argv = buildSshArgv(FAKE_SSH, {
+        destination: "h",
+        remoteShell: "cmd",
+        remoteCwd: "C:\\Windows",
+        remoteCommand: ["claude", hostile],
+      });
+      const cmdString = argv[argv.length - 1];
+      runRemoteStringInCmdExe(cmdString);
+      assert.ok(!existsSync(marker), `injection marker was created with remoteCwd set: ${cmdString}`);
+    } finally {
+      cleanupMarker(marker);
+    }
+  },
+);
+
+test("real cmd.exe: a benign quoted argument is delivered to the child intact", { skip: !CMD_AVAILABLE }, () => {
+  const argv = buildSshArgv(FAKE_SSH, {
+    destination: "h",
+    remoteShell: "cmd",
+    remoteCommand: ["cmd", "/c", "echo", "hello world"],
+  });
+  const cmdString = argv[argv.length - 1];
+  const result = runRemoteStringInCmdExe(cmdString);
+  assert.ok(result.stdout.includes("hello world"), `expected literal echo, got stdout=${result.stdout}`);
+});
+
+/** True if child_process can actually find/run `sh` here. */
+function shAvailable(): boolean {
+  const probe = spawnSync("sh", ["-c", "exit 0"], { encoding: "utf8" });
+  return probe.error === undefined && probe.status === 0;
+}
+
+const SH_AVAILABLE = shAvailable();
+if (!SH_AVAILABLE) {
+  test("real sh injection probes — SKIPPED (no sh on PATH in this environment)", { skip: true }, () => {});
+}
+
+test("real sh: hostile token with quotes, semicolons and backticks does not inject", { skip: !SH_AVAILABLE }, () => {
+  const marker = markerPath("posix-hostile");
+  cleanupMarker(marker);
+  try {
+    const hostile = `'; touch ${marker}; echo \`whoami\``;
+    const argv = buildSshArgv(FAKE_SSH, {
+      destination: "h",
+      remoteShell: "posix",
+      remoteCommand: ["echo", hostile],
+    });
+    const cmdString = argv[argv.length - 1];
+    spawnSync("sh", ["-c", cmdString], { encoding: "utf8" });
+    assert.ok(!existsSync(marker), `injection marker was created via posix quoting: ${cmdString}`);
+  } finally {
+    cleanupMarker(marker);
+  }
+});
+
+test("real sh: remoteCwd break-out attempt fails closed, no marker", { skip: !SH_AVAILABLE }, () => {
+  const marker = markerPath("posix-cwd-breakout");
+  cleanupMarker(marker);
+  try {
+    const argv = buildSshArgv(FAKE_SSH, {
+      destination: "h",
+      remoteShell: "posix",
+      remoteCwd: `/nonexistent' && touch ${marker} && echo '`,
+      remoteCommand: ["echo", "hi"],
+    });
+    const cmdString = argv[argv.length - 1];
+    spawnSync("sh", ["-c", cmdString], { encoding: "utf8" });
+    assert.ok(!existsSync(marker), `injection marker was created via a hostile remoteCwd: ${cmdString}`);
+  } finally {
+    cleanupMarker(marker);
+  }
+});
+
+test("real sh: benign command's literal output is observable (positive control)", { skip: !SH_AVAILABLE }, () => {
+  const argv = buildSshArgv(FAKE_SSH, {
+    destination: "h",
+    remoteShell: "posix",
+    remoteCommand: ["echo", "hello world"],
+  });
+  const cmdString = argv[argv.length - 1];
+  const result = spawnSync("sh", ["-c", cmdString], { encoding: "utf8" });
+  assert.ok(result.stdout.includes("hello world"), `expected literal echo, got stdout=${result.stdout}`);
 });
 
 // ---------- program injection seam ----------
