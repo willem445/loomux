@@ -18144,12 +18144,11 @@ fn deliver_now(
     // human's own prompt, unable to satisfy THIS delivery's
     // confirmation by construction.
     //
-    // #904: `None` — a group id that isn't a valid path segment — degrades to
-    // the empty path. Every use of this value is a READ (`promptsubmit_marker_len`,
-    // `poll_promptsubmit_hook`); loomux never writes here, the hook script does,
-    // via `$LOOMUX_GROUP_DIR`. So an empty path simply means the hook channel
-    // never confirms, and the delivery falls through to its other confirmation
-    // evidence — fail-closed, and never a path this process would have written.
+    // #904: `group` is a validated `GroupId`, so `promptsubmit_marker_path`
+    // builds an infallible path under this group's `hooks/` dir via
+    // `group_dir_at` — no id it can be handed escapes the root. Every use of
+    // this value is a READ (`promptsubmit_marker_len`, `poll_promptsubmit_hook`);
+    // loomux never writes here, the hook script does, via `$LOOMUX_GROUP_DIR`.
     let hook_marker_path = promptsubmit_marker_path(&root, &group, &agent);
     let hook_baseline = promptsubmit_marker_len(&hook_marker_path);
 

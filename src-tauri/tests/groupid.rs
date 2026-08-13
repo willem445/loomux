@@ -329,7 +329,10 @@ fn the_generated_agent_handle_is_a_single_filename_component() {
 ///
 /// A third, weaker pass keeps the old name heuristic as a *supplement* for a
 /// group joined onto some already-derived directory. It is allowed to be
-/// incomplete; the two axes above are not.
+/// incomplete; the two axes above are near-total — the one shape that crosses
+/// neither is a [`ROOT_USES`]-sanctioned root alias feeding a path component
+/// built without `.as_str()`, which is exactly what this weaker pass is here to
+/// catch.
 ///
 /// Scope: every `.rs` under `src-tauri/src`. Tests are not scanned — they build
 /// expected paths from group ids constantly, which is their job.

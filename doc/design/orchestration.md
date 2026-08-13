@@ -11895,8 +11895,8 @@ retire a warning is only defensible while what they retired survives the retirin
 
 The command takes an agent id and nothing else; the group is read from the registry. A chip
 can only be on screen for an agent `attention_tick` emitted, so an id with no agent record
-could never have been clicked, and refusing to accept a group as a path segment (constraint
-6) is strictly narrower than trusting one.
+could never have been clicked, and — though a command could now accept a group id and parse
+it (constraint 6, #904) — not accepting one at all is strictly narrower.
 
 ### Not in this slice
 
