@@ -1703,6 +1703,76 @@ error**, not a silently passing test — forcing whoever adds the field to
 look at this file and confirm, in the same PR, that it cannot weaken the
 human gate before the inventory can be updated to accept it.
 
+## The schema manifest: one statement, two enforcers (#880)
+
+`src/workflow-schema.json` is a committed description of the wire format —
+every section (workflow, block, edge, gate, intake, intake.labels, merge_queue,
+resource) and every field, with its type, its closed value set where it has
+one, its default, its bounds and the help text a form renders beside it.
+
+It exists because of a failure mode that produced no error anywhere. `allow:`
+was a `RawBlock` field from the day this schema shipped, and the workflow pane
+never grew a control for it — nor even a *name* for it, so it fell into the
+pane's unknown-key bag. A workflow that declared `allow:` therefore rendered,
+in the GUI, exactly like a workflow that didn't. Nothing was wrong with the
+engine and nothing was wrong with the pane; the two simply had no shared
+statement of what a workflow file is, so they could not disagree out loud.
+`intake:`, `merge_queue:` and `resources:` each arrived the same way later.
+
+**The manifest is not documentation of the schema — it is the schema, and two
+tests hold each side to it.**
+
+- `src-tauri/tests/orchestration.rs` compares each section against the field
+  set serde actually accepts, derived from the `Raw*` types by *serializing*
+  maximally-populated values (`workflow::workflow_schema_keys()`) rather than
+  by hand-listing them. A hand-written list is precisely the thing that drifts,
+  and it would drift silently in the one direction that matters: a new field,
+  forgotten. Both directions fail: a `Raw*` field missing from the manifest is
+  a field no GUI control will ever be generated for; a manifest field the
+  engine doesn't have is a control that writes a key `deny_unknown_fields`
+  rejects the whole file over.
+- `test/workflowschema.test.ts` drives every manifest field through the pane's
+  real parser and serializer: the parser must read it (never into `extra`), the
+  canonical serializer must emit it, and it must be either claimed by a form
+  control or explicitly listed as not yet having one.
+
+Two tests and not one, deliberately. They pin different sides, and a repo where
+only one is green is a repo where the pane and the engine disagree about what a
+workflow file is — which is exactly the thing a human then gets lied to about.
+
+The pane's `KNOWN_*` sets stay hand-written and are *pinned* by that test rather
+than read from the manifest at runtime. `workflowmodel.ts` is pure and
+import-free by design (its one import is a type), and a data file it had to load
+before it could open a workflow would be a second way for the pane to fail at
+exactly the moment a human needs it to work. The test is the link between the
+two, and it is cheaper than the coupling would be.
+
+### Unknown keys: preserved *and* refused
+
+The pane keeps keys it doesn't know (`extra`) so a file written by a newer
+loomux survives a round-trip through an older pane instead of being quietly
+stripped by it. That is still true, and it is still right. But preserving alone
+was a half-truth: the engine is `deny_unknown_fields`, so one typo (`promt:`)
+makes `parse_workflow` refuse the **whole** file — gates and all — down the loud
+`workflow-invalid` path, while the pane cheerfully reported "valid". Preserving
+and *warning* is the honest pair; dropping the key is destructive and ignoring
+it is a lie.
+
+`gates:` is exempt, and that is not an oversight: the engine reads it as
+`BTreeMap<String, RawGate>`, so a gate loomux has no machinery for still parses
+— it is simply never enforced. Reporting it would be the pane inventing a
+refusal the engine never makes.
+
+### Section order belongs to the file
+
+`serializeWorkflowPreserving` emits each top-level section where the *document*
+put it, appending only sections the file never declared. It used to emit a fixed
+order (front, blocks, edges, gates), which was indistinguishable from
+document order while those three were the only sections — and stopped being so
+the moment `merge_queue:` became one, because this repo's own workflow file
+writes it above `blocks:`. A fixed order would have relocated it, and the
+comment block introducing it, on the first unrelated edit.
+
 ## Still to come
 
 - **`no-live-agents-on-pr`** (#197 Scope A.1) — "no agent tied to this PR is still
