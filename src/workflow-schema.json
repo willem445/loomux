@@ -1,0 +1,320 @@
+{
+  "note": [
+    "The wire schema of `.loomux/workflow.yml`, as data (#880 slice A).",
+    "",
+    "This file IS the contract, not a description of one. Two tests enforce it, one per side:",
+    "  - src-tauri/tests/orchestration.rs `workflow_schema_manifest_matches_the_engines_raw_types`",
+    "    compares every section below, key for key, against what the engine's `Raw*` serde",
+    "    mirrors actually accept (`workflow::workflow_schema_keys()`). A field added to or",
+    "    removed from a `Raw*` struct without editing this file is a RED test, not a silent",
+    "    gap in the GUI.",
+    "  - test/workflowschema.test.ts asserts the pane's own model round-trips every field",
+    "    below (the parser knows it — it never lands in `extra`; the canonical serializer",
+    "    emits it), and tracks which fields still have no editor.",
+    "",
+    "It describes loomux's OWN product schema — the shape of a workflow file, never any",
+    "particular repo's roster (CLAUDE.md constraint 8). `blocks:` is data; what is pinned",
+    "here is what a block IS.",
+    "",
+    "Adding a field: add it to the engine's `Raw*` struct, to this manifest, to the pane's",
+    "model (`src/workflowmodel.ts` — KNOWN_* + the emitters), and to a form descriptor. The",
+    "tests refuse to let you stop after the first step."
+  ],
+  "manifest_version": 1,
+  "types": {
+    "string": "single-line text",
+    "multiline": "free text over many lines (emitted as a YAML block scalar)",
+    "number": "an integer; `min`/`max` state the engine's own bounds where it has any",
+    "bool": "true / false",
+    "enum": "one of `values` — a closed set this build refuses to go outside of",
+    "path": "a repo-relative file path (never absolute, never escaping the repo)",
+    "string-list": "a list of free-text strings",
+    "block-ref": "the `id` of a block declared in this same file",
+    "block-ref-list": "a list of block ids",
+    "section": "a nested mapping whose shape is the section named in `section`",
+    "section-list": "a list of `section` mappings",
+    "section-map": "a mapping of author-chosen names to `section` mappings"
+  },
+  "sections": {
+    "workflow": {
+      "title": "Workflow",
+      "help": "The top level of the file: what this workflow is called, and the sections it declares.",
+      "fields": [
+        {
+          "name": "version",
+          "type": "number",
+          "default": 1,
+          "required": true,
+          "help": "The schema version this file speaks. This build reads and writes version 1; anything else is refused rather than guessed at."
+        },
+        {
+          "name": "name",
+          "type": "string",
+          "default": "",
+          "help": "Display name for the workflow. Cosmetic — nothing references it."
+        },
+        {
+          "name": "authored_with",
+          "type": "string",
+          "default": "",
+          "help": "The loomux version that CREATED the file. Informational, never a validation error, and never restamped on save — it records who authored the workflow, not who last looked at it."
+        },
+        {
+          "name": "blocks",
+          "type": "section-list",
+          "section": "block",
+          "help": "The agents a run may use. Order matters: the first block of a capability class is what an unrouted spawn of that class resolves to."
+        },
+        {
+          "name": "edges",
+          "type": "section-list",
+          "section": "edge",
+          "help": "The declared happy path. ADVISORY — the orchestrator still decides when to spawn what."
+        },
+        {
+          "name": "gates",
+          "type": "section-map",
+          "section": "gate",
+          "help": "What must be true before a merge. ENFORCED in the `gh` PATH shim, not in a prompt. Keyed by gate name; today the only gate is `merge`."
+        },
+        {
+          "name": "intake",
+          "type": "section",
+          "section": "intake",
+          "help": "Where autonomous work comes from, and what its label vocabulary is called. Absent = loomux's built-in profile."
+        },
+        {
+          "name": "merge_queue",
+          "type": "section",
+          "section": "merge_queue",
+          "help": "Policy for the bisecting merge queue on orchestrator-owned integration branches. Absent = off, and behavior is byte-for-byte unchanged."
+        },
+        {
+          "name": "resources",
+          "type": "section-map",
+          "section": "resource",
+          "help": "Named lock resources agents may acquire, keyed by a name this repo chooses (loomux never learns what it means). Absent = the lock tools are not offered at all."
+        }
+      ]
+    },
+    "block": {
+      "title": "Block",
+      "help": "One agent: who it is, what capability class it runs as, and what it runs on.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "string",
+          "required": true,
+          "help": "Immutable identity — edges and gates name THIS, never the display name. Lowercase letters, digits, '-' and '_'."
+        },
+        {
+          "name": "name",
+          "type": "string",
+          "default": "",
+          "help": "Display label. Renaming it can never break a reference; that is its whole point."
+        },
+        {
+          "name": "kind",
+          "type": "enum",
+          "values": ["orchestrator", "worker", "reviewer", "planner"],
+          "required": true,
+          "help": "The capability class. CLOSED: a workflow file may define any persona, but it can never invent a capability."
+        },
+        {
+          "name": "cli",
+          "type": "enum",
+          "values": ["claude", "copilot", "gemini", "opencode"],
+          "default": "",
+          "help": "The agent CLI this block spawns on. Empty inherits the group's CLI."
+        },
+        {
+          "name": "model",
+          "type": "string",
+          "default": "",
+          "help": "The model to pin for this block. Empty = the CLI's own default."
+        },
+        {
+          "name": "prompt",
+          "type": "multiline",
+          "help": "Inline persona, compiled to the CLI's native inline-agent flag. Mutually exclusive with `profile`."
+        },
+        {
+          "name": "profile",
+          "type": "path",
+          "help": "Persona FILE, repo-relative (e.g. .github/agents/worker.md). Mutually exclusive with `prompt`."
+        },
+        {
+          "name": "allow",
+          "type": "string-list",
+          "default": [],
+          "help": "Extra pre-approved tool patterns, e.g. \"Bash(gh pr view --json title,body)\". Refused on a read-only kind, and it can never re-grant a denied tool — deny beats allow on every CLI."
+        },
+        {
+          "name": "role_hint",
+          "type": "enum",
+          "values": ["advisor", "process"],
+          "help": "An INERT persona/template marker — never a capability. `advisor` requires kind: planner, `process` requires kind: worker."
+        },
+        {
+          "name": "effort",
+          "type": "string",
+          "default": "",
+          "help": "Thinking level, from the CLI's own vocabulary. Which values exist (and whether the CLI has the seam at all) is the backend's answer — `agent_cli_knobs` — never a list mirrored here. Empty = the CLI's default."
+        },
+        {
+          "name": "context",
+          "type": "string",
+          "default": "",
+          "help": "Context-window variant, e.g. \"1m\". Same ownership as `effort`: the backend states what is deliverable. Empty = the model's own window."
+        }
+      ]
+    },
+    "edge": {
+      "title": "Connection",
+      "help": "One advisory hand-off. The file may write `to:` as a list to fan out; each target reads as one connection.",
+      "fields": [
+        {
+          "name": "from",
+          "type": "block-ref",
+          "required": true,
+          "help": "The block this hand-off leaves."
+        },
+        {
+          "name": "to",
+          "type": "block-ref",
+          "required": true,
+          "help": "The block it points at. A list here (`to: [rev-a, rev-b]`) is a fan-out — one connection per target."
+        }
+      ]
+    },
+    "gate": {
+      "title": "Merge gate",
+      "help": "What must be recorded before loomux will let `gh pr merge` through.",
+      "fields": [
+        {
+          "name": "require",
+          "type": "enum",
+          "values": ["all-pass", "threshold"],
+          "default": "all-pass",
+          "help": "`all-pass` = every named reviewer recorded PASS. `threshold` = at least N of them did."
+        },
+        {
+          "name": "threshold",
+          "type": "number",
+          "min": 1,
+          "help": "How many passing reviews a `threshold` gate needs. Meaningless — and refused above the reviewer count — otherwise."
+        },
+        {
+          "name": "reviewers",
+          "type": "block-ref-list",
+          "default": [],
+          "help": "The blocks whose verdict the gate waits for. Each must be a reviewer-kind block, or the gate could never open."
+        },
+        {
+          "name": "also",
+          "type": "string-list",
+          "default": [],
+          "help": "Extra conditions, e.g. \"ci-green\", \"body-unchanged\". The backend owns what each one means."
+        }
+      ]
+    },
+    "intake": {
+      "title": "Intake",
+      "help": "Where autonomous work comes from. Inert vocabulary plus an adapter chosen from a fixed set — there is deliberately no spelling here that can weaken the human merge gate.",
+      "fields": [
+        {
+          "name": "source",
+          "type": "enum",
+          "values": ["github-labels", "board", "none"],
+          "default": "github-labels",
+          "help": "Which adapter supplies work. `github-labels` polls issues by label (today's wired behavior); `board` and `none` are schema-reserved."
+        },
+        {
+          "name": "labels",
+          "type": "section",
+          "section": "intake.labels",
+          "help": "This repo's label spellings. Declare one and the other three keep their built-in defaults."
+        }
+      ]
+    },
+    "intake.labels": {
+      "title": "Intake labels",
+      "help": "The label vocabulary intake matches on. Letters, digits, '-' and '_' — a label that would need rewriting is refused, never silently changed.",
+      "fields": [
+        {
+          "name": "ready",
+          "type": "string",
+          "default": "agent-ready",
+          "help": "\"Build this.\" — groomed, go."
+        },
+        {
+          "name": "investigate",
+          "type": "string",
+          "default": "agent-investigation",
+          "help": "\"Look, don't build.\" — research only; findings go on the issue."
+        },
+        {
+          "name": "owned",
+          "type": "string",
+          "default": "agent-managed",
+          "help": "\"Mine.\" — an orchestrator has taken this issue."
+        },
+        {
+          "name": "prototype",
+          "type": "string",
+          "default": "agent-prototype",
+          "help": "\"Build it for a demo.\" — feedback-gated work."
+        }
+      ]
+    },
+    "merge_queue": {
+      "title": "Merge queue",
+      "help": "Policy for the bisecting merge queue (#581). Policy, not mechanism: nothing here names a branch or a verification command — the queue observes the repo's own CI, and the target comes from the enqueued PR's live base.",
+      "fields": [
+        {
+          "name": "enabled",
+          "type": "bool",
+          "default": false,
+          "help": "Off by default. Off means every queue path is unreachable, not merely unused."
+        },
+        {
+          "name": "max_batch",
+          "type": "number",
+          "default": 3,
+          "min": 1,
+          "help": "How many approved sub-PRs one speculative batch may carry. At 3, a red batch costs at most 2 extra CI runs to attribute."
+        },
+        {
+          "name": "checks_timeout_minutes",
+          "type": "number",
+          "default": 60,
+          "min": 5,
+          "max": 240,
+          "help": "Backstop on waiting for a batch's checks, so a repo with no checks attached surfaces as unverifiable instead of pending in silence. Clamped into range rather than refused."
+        }
+      ]
+    },
+    "resource": {
+      "title": "Lock resource",
+      "help": "One named thing agents must take turns on. Restrict-only: the whole schema is two numbers, and the worst a declaration can do is make an agent wait.",
+      "fields": [
+        {
+          "name": "slots",
+          "type": "number",
+          "default": 1,
+          "min": 1,
+          "max": 64,
+          "help": "How many agents may hold it at once. 1 (the default) is a mutex; a repo that wants a semaphore says so."
+        },
+        {
+          "name": "max_hold_minutes",
+          "type": "number",
+          "default": 30,
+          "min": 1,
+          "max": 480,
+          "help": "How long one hold may last before the sweep reclaims it — the bound that keeps a crashed holder from parking the resource forever."
+        }
+      ]
+    }
+  }
+}
