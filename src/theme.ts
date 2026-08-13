@@ -30,9 +30,10 @@
  * state, never decoration.
  */
 export const PALETTE = {
-  // --- fibre: the undyed ground, darkest first. Steps are deliberately small
-  //     (~1.05-1.08:1 between neighbours) — surfaces separate by luminance and a
-  //     hairline, never by a heavy contrast block.
+  // --- fibre: the undyed ground, darkest first. The four SURFACE steps are deliberately
+  //     tiny — 1.047, 1.060, 1.083:1 between neighbours — because surfaces separate by a
+  //     hairline and by spacing, never by a heavy contrast block. The two BORDER steps
+  //     above them open up (1.123, 1.177:1): an edge has to be seen to do its job.
   fibre000: "#0f0e0b", // terminal ground — the deepest surface in the app
   fibre100: "#15140f", // app ground (html/body, and the pre-paint hex in index.html)
   fibre200: "#1c1a14", // panels, bars, headers
@@ -182,10 +183,11 @@ export const ANSI_SLOTS = [
 /**
  * The CSS custom properties styles.css MUST declare, and the value each MUST carry.
  *
- * This is the pin: styles.css is hand-written (it is a stylesheet, not a generated file),
- * and test/theme.test.ts reads its `:root` block and fails if any of these drifts. Add a
- * semantic colour token here when you add it to the stylesheet — an unpinned token is a
- * fourth place for the colours to disagree.
+ * This is the pin, and it runs BOTH ways: test/theme.test.ts reads the `:root` block and
+ * fails if any of these drifts, and it also fails on any raw colour declared in `:root`
+ * that is missing from this map. Add a semantic colour token here when you add it to the
+ * stylesheet — an unpinned token is a fourth place for the colours to disagree, and the
+ * test will not let you mint one.
  */
 export const CSS_TOKENS = {
   "--surface-term": SEMANTIC.surfaceTerm,

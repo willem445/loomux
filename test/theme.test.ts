@@ -104,6 +104,41 @@ test("the stylesheet declares every pinned token, with theme.ts's value", () => 
   }
 });
 
+// The pin above runs theme.ts -> stylesheet. On its own that is one-directional: a token
+// minted straight into `:root` with a literal value is a FOURTH copy of a colour, and it
+// stays green because nothing walks the stylesheet back into CSS_TOKENS. Slice B mints
+// tokens by the dozen while migrating ~387 literals, which is exactly when that hole gets
+// used. So walk it the other way too: every raw colour declared in `:root` must be pinned.
+//
+// A `var(...)` value is not a raw colour — it is an alias onto something already pinned,
+// which is what the legacy bridge is made of, so the bridge passes this without exception.
+const BRIDGE_LITERALS = new Set([
+  // The one bridge declaration that is a literal rather than an alias: an alpha companion
+  // to --accent, which CSS cannot derive from a hex custom property without color-mix.
+  // It dies with the bridge in slice B, and no new entry may be added to this set.
+  "--accent-glow",
+]);
+const RAW_COLOUR = /^(#|(rgba?|hsla?|hwb|lab|lch|oklab|oklch|color)\()/i;
+
+test("no colour enters :root without a pin in theme.ts", () => {
+  const css = stripCssComments(read("../src/styles.css"));
+  const root = css.match(/:root\s*\{([\s\S]*?)\n\}/);
+  assert.ok(root, "styles.css has no :root block");
+  const unpinned: string[] = [];
+  for (const [, name, value] of root[1].matchAll(/(--[a-z0-9-]+)\s*:\s*([^;]+);/g)) {
+    const v = value.trim();
+    if (!RAW_COLOUR.test(v)) continue;
+    if (name in CSS_TOKENS || BRIDGE_LITERALS.has(name)) continue;
+    unpinned.push(`${name}: ${v}`);
+  }
+  assert.deepEqual(
+    unpinned,
+    [],
+    "these :root colours exist nowhere in theme.ts, so nothing keeps them equal to the " +
+      `pre-paint block or the terminal: ${unpinned.join("; ")}`
+  );
+});
+
 test("index.html paints theme.ts's app ground before the bundle arrives", () => {
   const html = read("../index.html").replace(/<!--[\s\S]*?-->/g, "");
   const style = html.match(/<style>([\s\S]*?)<\/style>/);

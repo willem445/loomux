@@ -89,9 +89,11 @@ points above green above blue, at roughly 3% chroma. It is the colour of unbleac
 a dark room. Every agent tool, this one included until now, uses a blue-black or a neutral
 graphite; a warm near-black is immediately identifiable, it makes the ANSI blues and cyans
 in terminal output pop rather than sink, and at 6–14% lightness it reads as *warm*, not as
-brown and not as an amber CRT. The ramp steps are tiny on purpose — 1.05:1 to 1.08:1 between
-neighbours — because principle 1 says panels separate with a hairline, not a slab. The
-stylesheet test enforces that: a surface step above 1.3:1 fails.
+brown and not as an amber CRT. The four **surface** steps are tiny on purpose — 1.047,
+1.060 and 1.083:1 between neighbours — because principle 1 says panels separate with a
+hairline, not a slab; `test/theme.test.ts` fails a surface step above 1.3:1. The two
+**border** steps above them deliberately open up (1.123:1 and 1.177:1), because an edge
+that nobody can see is not doing the separating the surfaces are refusing to do.
 
 **Chrome carries no hue at all.** There is no "accent colour" in this design. Buttons,
 tabs, borders, headers, and the active-pane indicator are fibre and linen; the four dyes are
@@ -214,7 +216,8 @@ This is where the design spends its boldness, and everything else stays quiet so
 can. Three rules make it safe and one makes it honest:
 
 - **The thread's width is constant** (`--thread: 2px`) and only its colour changes. A state
-  change may never alter a size.
+  change may never alter a size. It is the *only* weight in the app that is not the hairline
+  (`--line-w: 1px`, the token every surface separates with) — two weights, and no third.
 - **It is drawn as a positioned pseudo-element, never as a border in the pane's box.** The
   frame's geometry is untouched, so the thread cannot cost a reflow or a ConPTY resize —
   the seam with #885 is a hard one and this stays on the chrome side of it.
@@ -298,7 +301,14 @@ loomux's colours have to exist in three places that cannot read each other:
 `src/theme.ts` is the one copy. It is DOM-free so `node --test` can import it directly, and
 `test/theme.test.ts` reads the other two surfaces off disk and fails if either drifts: the
 stylesheet must declare every pinned token with theme.ts's value, `index.html` must paint
-exactly `PRE_PAINT_BACKGROUND`, and `pane.ts` must contain no colour literal at all. The
+exactly `PRE_PAINT_BACKGROUND`, and `pane.ts` must contain no colour literal at all.
+
+The stylesheet pin runs **both ways**, which matters most on slice B: theme.ts → stylesheet
+catches a token that drifts, and stylesheet → theme.ts catches a token *minted* in `:root`
+with a literal value, which would be a fourth copy created by the very slice that is
+supposed to be removing copies. A `var(...)` value is an alias onto something already
+pinned, so the legacy bridge passes without exception; the one bridge declaration that is a
+literal (`--accent-glow`) is named in the test and dies with the bridge. The
 sixteen ANSI slots are additionally checked present, pairwise distinct, and legible against
 the terminal ground — sixteen near-identical hex strings is the exact shape a copy-paste
 typo hides in, and a collapsed slot would make some CLI's output invisible with no error
@@ -312,9 +322,15 @@ generated file to review, for one shared seam that a test and a comment already 
 Shipped: this note, `src/theme.ts`, the semantic token layer in `:root`, `TERM_THEME`
 derived from `theme.ts`, the `index.html` pre-paint sync, and `test/theme.test.ts`.
 
-Not shipped: any restyling. The ~280 rules below the token block still name the
-pre-redesign token names, which survive as an explicitly temporary **legacy bridge**
-aliasing them onto the new layer — so the app moves onto the new palette in one step and
-nothing breaks, while looking like the old design wearing the new colours. Slice B migrates
-the call sites and deletes the bridge; slices C through I restyle the surfaces to this
-brief.
+Not shipped: any restyling — and the honest description of that is not "the old design
+wearing the new colours", because only the rules that went through a *token* moved. The
+twelve pre-redesign token names survive as an explicitly temporary **legacy bridge**
+aliasing onto the new layer, so everything that consumed one is now on the new palette and
+nothing breaks. Everything that hard-coded a colour instead is untouched: **387 colour
+literals** sit below the token block (243 hex, 144 `rgb()`/`rgba()`), **165 of them the
+retired Tokyo Night palette** this brief renounces — 57 of the old amber, 39 red, 33 blue,
+21 green, 10 cyan, 5 magenta — concentrated in the task board, the audit log, the workflow
+pane and its mode chrome, project tabs, session restore, and the attention badge. Until
+slice B those surfaces stay visibly on the old palette while the rest moves, which is a
+transitional state, not the design. Slice B migrates the literals and deletes the bridge;
+slices C through I restyle the surfaces to this brief.
