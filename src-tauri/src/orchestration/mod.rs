@@ -14,6 +14,7 @@
 //! pane, and the audit log (`audit.jsonl`) records the full text.
 
 pub mod digest;
+pub mod groupid;
 pub mod intake;
 pub mod lessons;
 pub mod locks;
@@ -29,6 +30,8 @@ pub mod queuestate;
 pub mod report;
 pub mod termgrid;
 pub mod workflow;
+
+pub use groupid::{GroupId, GroupIdError};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -9858,8 +9861,25 @@ const COPILOT_AGENT_FILE_EXT: &str = ".agent.md";
 /// which is why it is out of `reclaim_group_agent_files`' scope entirely.
 const OPENCODE_AGENT_FILE_EXT: &str = ".md";
 
-fn generated_agent_handle(group: &str, block: &str) -> String {
-    format!("{GENERATED_AGENT_PREFIX}{group}-{block}")
+/// `loomux-<group>-<block>` — and the **most dangerous** group-id
+/// interpolation in the tree (#904), because unlike every other one it does not
+/// stay inside loomux's own root: the handle becomes a FILE NAME under the
+/// user's `~/.claude/agents` and `~/.copilot/agents` (see
+/// `write_claude_agent_file`, `write_copilot_agent_file`). A group id carrying
+/// a separator would not merely traverse loomux's state directory — it would
+/// write into an arbitrary location under the user's CLI configuration, and
+/// `end_group`'s reclaim would then delete by the same shape.
+///
+/// So the id is validated before it is interpolated, and `None` — never a
+/// sanitized rewrite — is the answer for one that isn't a path segment. All
+/// three callers already return `Option`, so the refusal is a `?`.
+///
+/// `block` needs no check here: block ids come from `workflow::sanitize_id`
+/// and are pinned to the same alphabet at parse time.
+#[doc(hidden)] // pub for integration tests
+pub fn generated_agent_handle(group: &str, block: &str) -> Option<String> {
+    let group = GroupId::parse(group).ok()?;
+    Some(format!("{GENERATED_AGENT_PREFIX}{group}-{block}"))
 }
 
 /// #502: upper bound on a generated agent file's `description:` value.
@@ -11942,7 +11962,19 @@ fn pre_trust_copilot_folder_in(home: &Path, location: &str, folder: &str) {
 
 /// Stable, filesystem-safe group id for a repo path, so relaunching an
 /// orchestrator on the same repo reattaches to the same state directory.
-pub(crate) fn group_id_for_repo(repo: &str) -> String {
+///
+/// #904: "filesystem-safe" is now a checkable claim rather than an assertion —
+/// the output of this function must always satisfy [`GroupId::parse`], which is
+/// what `the_minter_can_never_produce_an_id_its_own_validator_rejects` pins.
+/// The one shape that used to violate it was a repo *directory* whose name
+/// begins with `-`: the slug kept the dash and the id led with it, which
+/// `GroupId::parse` refuses (a bare `-foo` is an option to any command line the
+/// id reaches). Leading dashes are stripped here so the minter cannot mint
+/// something the validator would reject. The delta is confined to repo
+/// directories named `-…`, which get a different state directory than they
+/// would have before.
+#[doc(hidden)] // pub for integration tests
+pub fn group_id_for_repo(repo: &str) -> String {
     let norm = repo.replace('\\', "/").to_lowercase();
     let norm = norm.trim_end_matches('/');
     // FNV-1a 64
@@ -11959,7 +11991,8 @@ pub(crate) fn group_id_for_repo(repo: &str) -> String {
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
         .take(24)
         .collect();
-    let slug = if slug.is_empty() { "repo".into() } else { slug };
+    let slug = slug.trim_start_matches('-');
+    let slug = if slug.is_empty() { "repo" } else { slug };
     format!("{slug}-{:08x}", (h >> 32) as u32 ^ h as u32)
 }
 
@@ -12148,8 +12181,29 @@ fn append_durable(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// satisfy it the same way: one `printf` of one whole line, appended with `>>`.
 /// Any shim audit line must stay a single `printf`; building a line across two
 /// redirections would reintroduce exactly this bug across processes.
+///
+/// #904: the group id is **validated here**, at the join, not trusted from the
+/// caller. `root.join(group)` with an unvalidated segment is the shape #888 §0
+/// names — a `..` component writes the audit log outside the orchestration
+/// root entirely. Auditing is best-effort by contract (see the doc's opening
+/// line), so a refusal drops the record and leaves a breadcrumb rather than
+/// propagating an error to a caller that has nowhere to put one. The refusal
+/// is logged as the `GroupIdError`, never as the offending string: an id that
+/// got this far is caller-chosen, and echoing it verbatim into a log file is
+/// how log injection starts.
+///
+/// The `&str` here is the last of the internal seam #904's second half
+/// converts to `&GroupId`; when that lands, this parse moves up to the
+/// boundary and this function takes a value that is already proof.
 fn append_audit(root: &Path, group: &str, actor: &str, action: &str, detail: Value) {
-    let dir = root.join(group);
+    let group = match GroupId::parse(group) {
+        Ok(g) => g,
+        Err(e) => {
+            crate::obs::breadcrumb("groupid", &format!("audit refused: {e}"));
+            return;
+        }
+    };
+    let dir = root.join(group.as_str());
     let record = json!({ "ts_ms": now_ms(), "actor": actor, "action": action, "detail": detail });
     let mut line = record.to_string();
     line.push('\n'); // newline in the same buffer — a separate write could be split off
@@ -16577,9 +16631,19 @@ impl Tier1ScanCensus {
 /// firing's mtime matters), confirmation here needs to see every record
 /// since a per-delivery baseline OFFSET, so appending (never truncating) is
 /// required.
+///
+/// `None` for a group id that is not a valid path segment (#904). This is the
+/// second of the three raw `root.join(group)` sites and it is validated the
+/// same way `append_audit` is — at the join, because that is the only place
+/// that can be sure.
 #[doc(hidden)] // pub for integration tests
-pub fn promptsubmit_marker_path(root: &Path, group: &str, agent_id: &str) -> PathBuf {
-    root.join(group).join("hooks").join(format!("{agent_id}.promptsubmit.jsonl"))
+pub fn promptsubmit_marker_path(root: &Path, group: &str, agent_id: &str) -> Option<PathBuf> {
+    let group = GroupId::parse(group).ok()?;
+    Some(
+        root.join(group.as_str())
+            .join("hooks")
+            .join(format!("{agent_id}.promptsubmit.jsonl")),
+    )
 }
 
 /// This delivery's baseline byte length into the `promptsubmit` marker,
@@ -17710,7 +17774,14 @@ fn deliver_now(
     // a record from an EARLIER delivery to this same pane, or a
     // human's own prompt, unable to satisfy THIS delivery's
     // confirmation by construction.
-    let hook_marker_path = promptsubmit_marker_path(&root, &group, &agent);
+    //
+    // #904: `None` — a group id that isn't a valid path segment — degrades to
+    // the empty path. Every use of this value is a READ (`promptsubmit_marker_len`,
+    // `poll_promptsubmit_hook`); loomux never writes here, the hook script does,
+    // via `$LOOMUX_GROUP_DIR`. So an empty path simply means the hook channel
+    // never confirms, and the delivery falls through to its other confirmation
+    // evidence — fail-closed, and never a path this process would have written.
+    let hook_marker_path = promptsubmit_marker_path(&root, &group, &agent).unwrap_or_default();
     let hook_baseline = promptsubmit_marker_len(&hook_marker_path);
 
     // Echo-verified typing: paste, then require the TUI to emit
@@ -35752,7 +35823,7 @@ impl OrchRegistry {
         }
         let dir = self.claude_agents_dir()?;
         fs::create_dir_all(&dir).ok()?;
-        let handle = generated_agent_handle(group, &block.id);
+        let handle = generated_agent_handle(group, &block.id)?;
         // `contract` is already control-character-clean (any persona text
         // folded into it was already sanitized at resolution time — see
         // `resolve_persona`'s `sanitize_persona` call) — and unlike the
@@ -35825,7 +35896,7 @@ impl OrchRegistry {
         }
         let dir = self.group_dir(group).join("configs");
         fs::create_dir_all(&dir).ok()?;
-        let handle = generated_agent_handle(group, &block.id);
+        let handle = generated_agent_handle(group, &block.id)?;
         let path = dir.join(format!("{handle}{OPENCODE_AGENT_FILE_EXT}"));
         let instructions_path = self.group_dir(group).join(block.instructions_file());
         let body =
@@ -35937,7 +36008,7 @@ impl OrchRegistry {
         }
         let dir = self.copilot_agents_dir()?;
         fs::create_dir_all(&dir).ok()?;
-        let handle = generated_agent_handle(group, &block.id);
+        let handle = generated_agent_handle(group, &block.id)?;
         let instructions_path = self.group_dir(group).join(block.instructions_file());
         let body_text = copilot_agent_body(block, persona, &instructions_path);
         // `.chars().count()`, not `.len()`: the documented cap is in

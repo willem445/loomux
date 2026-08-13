@@ -16933,7 +16933,7 @@ fn poll_promptsubmit_hook_respects_a_baseline_that_excludes_a_stale_record() {
 #[test]
 fn promptsubmit_marker_path_matches_the_hooks_dir_convention() {
     let root = Path::new("C:/state");
-    let path = promptsubmit_marker_path(root, "group-1", "agent-1");
+    let path = promptsubmit_marker_path(root, "group-1", "agent-1").unwrap();
     assert_eq!(path, root.join("group-1").join("hooks").join("agent-1.promptsubmit.jsonl"));
 }
 
@@ -32046,6 +32046,7 @@ fn no_registry_construction_bypasses_the_test_agent_dir_overrides() {
     // slashes), not bare filename, so a same-named file in a subdirectory
     // can never collide with a top-level one.
     let sanctioned: &[(&str, usize)] = &[
+        ("groupid.rs", 1),       // registry_at
         ("orchestration.rs", 1), // relaunch_registry
         ("workflow.rs", 1),      // relaunch_registry
         ("lessonsfile.rs", 1),   // test_registry
