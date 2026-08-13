@@ -1325,24 +1325,31 @@ function splitBlockItems(content: string[]): BlockItems | null {
   return { items, indent: markerIndent };
 }
 
-/** The top-level keys that are their own preservable SECTION — everything else at the
- *  top level (`version:`, `name:`, `authored_with:`, any key this build doesn't know)
- *  is one indivisible "front" piece.
- *
- *  Membership is not cosmetic: a key listed here is reused, or regenerated, on its own,
- *  and a key NOT listed here rides the front piece — so promoting `merge_queue:` from
- *  an unknown key (where it sat until #880, inside `extra`, re-emitted as a flow
- *  mapping) to a section is what lets an edit to it keep the six comment lines above
- *  it, and what stops an unrelated `name:` edit from flattening it. */
-const TOP_SECTION_KEYS = new Set(["blocks", "edges", "gates", "intake", "merge_queue", "resources"]);
-
-/** Where a section goes when the ORIGINAL document didn't declare it — the order
+/** The top-level keys that are each their own preservable SECTION, in the order they
+ *  take when the ORIGINAL document didn't declare them — which is the order
  *  `serializeWorkflow` writes, which is the engine's own `RawWorkflow` field order. A
  *  section the document DID declare keeps the position it already had (see the entry
- *  walk in `serializeWorkflowPreserving`), because a file that puts `merge_queue:`
- *  above `blocks:` — as this repo's own does — must not have it silently relocated by
- *  an edit to something else. */
+ *  walk in `serializeWorkflowPreserving`): a file that puts `merge_queue:` above
+ *  `blocks:` — as this repo's own does — must not have it relocated by an edit to
+ *  something else.
+ *
+ *  Everything else at the top level (`version:`, `name:`, `authored_with:`, any key
+ *  this build doesn't know) is one indivisible "front" piece, and membership here is
+ *  not cosmetic: a key listed here is reused, or regenerated, on its own, while a key
+ *  that isn't rides the front. Promoting `merge_queue:` out of the unknown-key bag
+ *  (where it sat until #880, re-emitted as a flattened flow mapping) into this list is
+ *  what lets an edit to it keep the comment lines above it, and what stops an unrelated
+ *  `name:` edit from flattening it.
+ *
+ *  This one list is the source of BOTH the membership test and the emitter table in
+ *  `serializeWorkflowPreserving` — a `Record` over exactly this union — so a section
+ *  added here without an emitter is a COMPILE error rather than a section that quietly
+ *  stops being written to the file at all. */
 const SECTION_ORDER = ["blocks", "edges", "gates", "intake", "merge_queue", "resources"] as const;
+
+type SectionKey = (typeof SECTION_ORDER)[number];
+
+const TOP_SECTION_KEYS: ReadonlySet<string> = new Set<string>(SECTION_ORDER);
 
 /** Render the workflow the way a form or canvas edit should: reusing the ORIGINAL text's own
  *  lines — comments, blank-line runs, key order, quoting style, all of it — for every top-level
@@ -1469,46 +1476,46 @@ export function serializeWorkflowPreserving(w: Workflow, originalText: string): 
     }
   };
 
-  const pushKey = (key: string, entry: TopEntry | undefined): void => {
-    switch (key) {
-      case "blocks":
-        return pushBlocks(entry);
-      case "edges":
-        return pushSection(
-          entry,
-          deepEqualValue(w.edges, orig.edges),
-          w.edges.length > 0,
-          emitEdgesLines(w.edges, order)
-        );
-      case "gates":
-        return pushSection(
-          entry,
-          deepEqualValue(w.gates, orig.gates),
-          !!w.gates.merge || !!w.gates.extra,
-          emitGatesLines(w, order)
-        );
-      case "intake":
-        return pushSection(
-          entry,
-          deepEqualValue(w.intake, orig.intake),
-          !!w.intake,
-          w.intake ? emitIntakeLines(w.intake) : []
-        );
-      case "merge_queue":
-        return pushSection(
-          entry,
-          deepEqualValue(w.merge_queue, orig.merge_queue),
-          !!w.merge_queue,
-          w.merge_queue ? emitMergeQueueLines(w.merge_queue) : []
-        );
-      case "resources":
-        return pushSection(
-          entry,
-          deepEqualValue(w.resources, orig.resources),
-          !!w.resources,
-          w.resources ? emitResourcesLines(w.resources) : []
-        );
-    }
+  // A Record over `SectionKey`, not a switch: TypeScript demands an entry for every
+  // member, so a section added to SECTION_ORDER with no emitter here fails the build
+  // instead of silently vanishing from every file it is written in.
+  const pushKey: Record<SectionKey, (entry: TopEntry | undefined) => void> = {
+    blocks: (entry) => pushBlocks(entry),
+    edges: (entry) =>
+      pushSection(
+        entry,
+        deepEqualValue(w.edges, orig.edges),
+        w.edges.length > 0,
+        emitEdgesLines(w.edges, order)
+      ),
+    gates: (entry) =>
+      pushSection(
+        entry,
+        deepEqualValue(w.gates, orig.gates),
+        !!w.gates.merge || !!w.gates.extra,
+        emitGatesLines(w, order)
+      ),
+    intake: (entry) =>
+      pushSection(
+        entry,
+        deepEqualValue(w.intake, orig.intake),
+        !!w.intake,
+        w.intake ? emitIntakeLines(w.intake) : []
+      ),
+    merge_queue: (entry) =>
+      pushSection(
+        entry,
+        deepEqualValue(w.merge_queue, orig.merge_queue),
+        !!w.merge_queue,
+        w.merge_queue ? emitMergeQueueLines(w.merge_queue) : []
+      ),
+    resources: (entry) =>
+      pushSection(
+        entry,
+        deepEqualValue(w.resources, orig.resources),
+        !!w.resources,
+        w.resources ? emitResourcesLines(w.resources) : []
+      ),
   };
 
   // The document's OWN order is the output's order (#880): walk the entries as the file
@@ -1517,17 +1524,18 @@ export function serializeWorkflowPreserving(w: Workflow, originalText: string): 
   // declared in that order — and stopped being fine the moment `merge_queue:` became a
   // section, because this repo's own workflow writes it ABOVE `blocks:`, so any edit would
   // have relocated it (and the six comment lines that introduce it) to the bottom of the file.
-  const seen = new Set<string>();
+  const seen = new Set<SectionKey>();
   for (const e of doc.entries) {
     if (!TOP_SECTION_KEYS.has(e.key)) {
       if (reuseFront) out.push(...e.header, ...e.content);
       continue; // otherwise the canonical front group already went out, above
     }
-    if (seen.has(e.key)) continue; // a duplicate top-level key: the reader kept one, so emit one
-    seen.add(e.key);
-    pushKey(e.key, e);
+    const key = e.key as SectionKey; // TOP_SECTION_KEYS is built from SECTION_ORDER
+    if (seen.has(key)) continue; // a duplicate top-level key: the reader kept one, so emit one
+    seen.add(key);
+    pushKey[key](e);
   }
-  for (const key of SECTION_ORDER) if (!seen.has(key)) pushKey(key, undefined);
+  for (const key of SECTION_ORDER) if (!seen.has(key)) pushKey[key](undefined);
 
   if (doc.trailer.length) out.push(...doc.trailer);
 
