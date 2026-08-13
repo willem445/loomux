@@ -7915,7 +7915,7 @@ pub fn prompt_wait_match(tail: &str) -> Option<QuestionMatch> {
     // fired on the same dialog, prefer the one whose evidence survives
     // recomposition. This cannot change the boolean — that is a disjunction —
     // only which evidence gets recorded and re-read.
-    if let Some((token, line)) = token_in(last_painted, MENU_FOOTER_TOKENS) {
+    if let Some((token, line)) = token_in(&[], MENU_FOOTER_TOKENS) /* [scratch/903-red-4] the ONE behaviour set aside: the menu-footer tier never fires */ {
         return Some(QuestionMatch::token("menu-footer", token, line));
     }
     // #903: permission-shaped phrasings that are ALSO ordinary English, read
