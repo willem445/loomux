@@ -21099,7 +21099,8 @@ impl GridEvidence {
 pub fn grid_evidence_for(m: &QuestionMatch, visible: Option<&str>) -> GridEvidence {
     match visible {
         None => GridEvidence::Unreadable,
-        Some(v) if idle_prompt_rendered(v) => GridEvidence::IdlePrompt,
+        // [scratch/903-red-1] the ONE behaviour set aside: the idle-composer
+        // reading is not consulted. Everything else stays wired.
         Some(v) if prompt_wait_detected(v) || match_still_rendered(v, m) => {
             GridEvidence::StillRendered
         }
