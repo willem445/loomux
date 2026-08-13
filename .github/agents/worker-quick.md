@@ -48,8 +48,10 @@ and costs the human a debugging session later.
    that echo the implementation; no test that cannot fail. Backend tests that link the lib go
    in `src-tauri/tests/` (integration tests only). Frontend logic gets a DOM-free
    pure module + `test/*.test.ts`.
-   Then prove it: run the new test against the base branch (stash your change, keep the test),
-   watch it fail for the reason you expect, and paste that command + failure line into the PR
+   Then prove it: run the new test without your change — **never via `git stash`** (#299, #493:
+   commit your work first, then set the behaviour aside on a throwaway scratch branch; for Rust
+   that is a scratch draft PR read through CI, see the `ci-validate` skill).
+   Watch it fail for the reason you expect, and paste that command + failure line into the PR
    body beside the passing run. It costs a minute, and it is the difference between a test and a
    decoration.
 3. **Loop on CI until every check is green, not on the host.** Push early and open
