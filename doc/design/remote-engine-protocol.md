@@ -310,18 +310,31 @@ seam was cut for.
 default.** A new `#[tauri::command]` is unreachable remotely until someone
 writes down which class it is in and what role tier it needs — and that is
 enforced, not asked for: a test scans `command_manifest::APP_COMMANDS` and fails
-if any name lacks exactly one classification, the way `tests/acl_manifest.rs`
-already fails when a command has no ACL grant.
+if any name lacks exactly one classification.
 
-That mechanism is not optional bookkeeping, and the manifest itself is the
+This is not a new mechanism, which is the point — it is the third instance of
+one `tests/acl_manifest.rs` already runs three times over. That file pins that
+`generate_handler!` and `APP_COMMANDS` agree
+(`generate_handler_matches_app_commands`), pins the **total**
+(`app_commands_len_is_141`, carrying its per-delta provenance), and pins that
+every command is granted to `main`. A remote roster is the same shape of guard
+over the same list, and a reviewer already knows how to read it.
+
+That mechanism is not optional bookkeeping, and this repo's own artifacts are the
 evidence. The plan-408 census counted 134 commands; `APP_COMMANDS` today lists
 **141**. Seven arrived in the interval, and under a hand-maintained allowlist
 that nobody re-derived, every one would have been silently wire-reachable or
-silently broken. Worse: the file's own per-family count comments have already
-drifted — it says `// orchestration (64)` above **66** entries. A hand-kept
-number went stale inside the very file whose job is to be the single source of
-truth. Default-deny plus a failing test is the only version of this that
-survives contact with a year of feature work.
+silently broken.
+
+Two nearby numbers show what happens to the ones a test does *not* pin. The
+manifest's own per-family comment reads `// orchestration (64)` above **66**
+entries; `architecture.md` described the file as "the ACL manifest's 123
+app-command names" until this slice corrected it. Both went stale quietly, in
+the two places whose whole job is to describe that list — while
+`app_commands_len_is_141`, the number that *is* pinned, stayed correct through
+every one of those additions. Default-deny plus a failing test is the only
+version of this that survives contact with a year of feature work; a table
+maintained by good intentions is the version that does not.
 
 ### 5.2 Four classes
 
