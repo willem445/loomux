@@ -270,9 +270,10 @@ Neutering a lib function reddens the **lib** suite, and cargo then never runs
 the integration binary at all — so every integration-level assertion you meant
 to evidence produces no output, and the round is wasted. Split by target:
 
-- To redden a **unit test in `src/orchestration/intake.rs` /
-  `src/orchestration/workflow.rs`**, neuter the pure function. The lib suite is
-  the first binary, so it is reached.
+- To redden a **unit test in `src-tauri/src/orchestration/intake.rs` /
+  `crates/loomux-engine/src/workflow.rs`**, neuter the pure function. Note the
+  two crates run as separate targets and `src-tauri`'s go first, so a plant that
+  reddens anything there stops the run before the engine's own tests execute.
 - To redden an **integration test in `src-tauri/tests/`**, neuter the
   **wiring** instead — the call site, or the gate's consumption of the value —
   and leave the lib function intact, so the lib suite stays green and the

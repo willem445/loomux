@@ -18,7 +18,7 @@
 //! else.
 //!
 //! Be precise about what "the capability sense" buys, because the enum enforces
-//! less than the word suggests — [`Role::containment`](super::Role::containment)
+//! less than the word suggests — [`Role::containment`](crate::model::Role::containment)
 //! is the exact per-class answer. A **planner** is structurally read-only — its
 //! file-editing tools and `git commit`/`git push` are denied at the CLI level, so
 //! `is_read_only()` is a real, mechanical guarantee. A **reviewer** is denied the
@@ -103,10 +103,10 @@
 //! `.loomux/workflow.layout.json` (the GUI pane's file, sub-PR 2) so a canvas
 //! nudge never churns the semantic diff.
 
-use super::notify::{
+use crate::model::{cli_can_host, default_model, Role, SUPPORTED_CLIS};
+use crate::notify::{
     clamp_expires_minutes, NOTIFY_EXPIRES_DEFAULT_MIN, NOTIFY_EXPIRES_MAX, NOTIFY_EXPIRES_MIN,
 };
-use super::{cli_can_host, default_model, Role, SUPPORTED_CLIS};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
@@ -169,7 +169,7 @@ pub struct Block {
     /// `None` is today's behavior, byte for byte.
     pub role_hint: Option<String>,
     /// Thinking-effort level (the `effort:` key, #687) — one of
-    /// [`super::EFFORT_LEVELS`]. Empty means "the CLI's own default", which is
+    /// [`crate::model::EFFORT_LEVELS`]. Empty means "the CLI's own default", which is
     /// today's behavior byte for byte: nothing is emitted at all, so a group on
     /// a CLI build that predates the flag is unaffected unless a human opts in.
     ///
@@ -177,12 +177,12 @@ pub struct Block {
     /// no tool, so it adds nothing to what a repo file can influence. What is
     /// enforced is the `role_hint` shape, twice: the value must be in loomux's
     /// closed vocabulary, and the block's own `cli:` must be one loomux can
-    /// actually set effort on ([`CliCaps::effort_levels`](super::CliCaps)).
+    /// actually set effort on ([`CliCaps::effort_levels`](crate::model::CliCaps)).
     pub effort: String,
     /// Context-window variant (the `context:` key, #687) — one of
-    /// [`super::CONTEXT_VARIANTS`]. Empty = the model's own window.
+    /// [`crate::model::CONTEXT_VARIANTS`]. Empty = the model's own window.
     ///
-    /// Deliberately NOT part of `model`: [`super::sanitize_model_opt`] strips
+    /// Deliberately NOT part of `model`: [`crate::model::sanitize_model_opt`] strips
     /// brackets, so a `sonnet[1m]` written as a model id would silently become
     /// the broken `sonnet1m`, and widening that sanitizer to admit brackets
     /// would put a POSIX-shell glob pattern on the command line. The suffix is
@@ -208,7 +208,7 @@ impl Block {
     /// deliberately still *derived from* the capability class: agent ids are
     /// short, are parsed by the roster/badge conventions, and must stay
     /// byte-identical for the built-in roster. Block identity rides in
-    /// [`AgentEntry::block`](super::AgentEntry) and the pane name instead.
+    /// `orchestration::AgentEntry`'s `block` field and the pane name instead.
     pub fn prefix(&self) -> &'static str {
         self.kind.prefix()
     }
@@ -219,7 +219,7 @@ impl Block {
     /// is unchanged; a custom block gets `<id>.md`.
     pub fn instructions_file(&self) -> String {
         if BUILTIN_IDS.contains(&self.id.as_str()) {
-            super::role_instructions_file(self.kind).to_string()
+            crate::model::role_instructions_file(self.kind).to_string()
         } else {
             format!("{}.md", self.id)
         }
@@ -351,8 +351,8 @@ pub const MERGE_QUEUE_MAX_BATCH_DEFAULT: u32 = 3;
 
 /// The `merge_queue:` block — a sibling of [`Gate`]'s `gates:`, and the whole
 /// of what a repo declares about the queue. Design note:
-/// `doc/design/merge-queue.md` §11.2; the engine is
-/// [`mergeq`](super::mergeq).
+/// `doc/design/merge-queue.md` §11.2; the engine is `orchestration::mergeq`,
+/// which stays in `src-tauri` (it drives `gh` and the pane host).
 ///
 /// **Policy, not mechanism** (CLAUDE.md constraint 8). Nothing here names a
 /// branch, a toolchain, or a verification command: the queue *observes* the
@@ -1209,7 +1209,7 @@ pub fn role_hint_names() -> String {
 /// Two checks, in this order, and both are **loud**: the value must be in
 /// loomux's closed `vocabulary` (a typo is never coerced to a neighbouring
 /// level), and — when the block names an explicit `cli:` — that CLI must be one
-/// loomux can actually deliver the knob on, per its [`CliCaps`](super::CliCaps)
+/// loomux can actually deliver the knob on, per its [`CliCaps`](crate::model::CliCaps)
 /// row. A knob the CLI cannot honor is a parse error rather than a silent
 /// no-op: the author asked for a thinking level and would otherwise never
 /// learn they did not get one. `cli_supports` is `None` for a block that
@@ -1221,7 +1221,7 @@ pub fn role_hint_names() -> String {
 /// `.loomux/workflow.yml` has no launcher to grey the knob out for it, so the
 /// only rail it gets is this sentence — and "copilot cannot set effort" alone
 /// leaves it guessing between deleting the key and changing the block's CLI.
-/// The remedy is derived from [`CLI_CAPS`](super::CLI_CAPS) by asking every
+/// The remedy is derived from [`CLI_CAPS`](crate::model::CLI_CAPS) by asking every
 /// row loomux can actually spawn whether it carries THIS value, so a newly
 /// wired seam (gemini's `thinkingConfig`, say) changes the message with no
 /// edit here and no CLI named in this file — CLAUDE.md constraint 8.
@@ -1235,7 +1235,7 @@ fn validate_knob(
     vocabulary: &[&str],
     cli: &str,
     cli_supports: Option<(&[&str], &str)>,
-    knob_of: fn(&super::CliCaps) -> &'static [&'static str],
+    knob_of: fn(&crate::model::CliCaps) -> &'static [&'static str],
 ) -> Result<String, String> {
     let want = raw.trim().to_ascii_lowercase();
     if want.is_empty() {
@@ -1249,7 +1249,7 @@ fn validate_knob(
     }
     if let Some((supported, note)) = cli_supports {
         if !supported.contains(&want.as_str()) {
-            let alternatives: Vec<&str> = super::CLI_CAPS
+            let alternatives: Vec<&str> = crate::model::CLI_CAPS
                 .iter()
                 .filter(|c| c.orchestration && knob_of(c).contains(&want.as_str()))
                 .map(|c| c.cli)
@@ -1509,11 +1509,11 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
         // that check above, and `doc/design/workflows.md`). `validate_knob`
         // carries the whole rule; the CLI half is checked only for an explicit
         // `cli:`, exactly like `cli_can_host` above.
-        let caps = (!cli.is_empty()).then(|| super::cli_caps(&cli)).flatten();
+        let caps = (!cli.is_empty()).then(|| crate::model::cli_caps(&cli)).flatten();
         let effort = match validate_knob(
             "effort",
             &rb.effort,
-            super::EFFORT_LEVELS,
+            crate::model::EFFORT_LEVELS,
             &cli,
             caps.map(|c| (c.effort_levels, c.effort_note)),
             |c| c.effort_levels,
@@ -1527,7 +1527,7 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
         let context = match validate_knob(
             "context",
             &rb.context,
-            super::CONTEXT_VARIANTS,
+            crate::model::CONTEXT_VARIANTS,
             &cli,
             caps.map(|c| (c.context_variants, c.context_note)),
             |c| c.context_variants,
@@ -1544,10 +1544,10 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
             id,
             kind,
             cli,
-            model: super::sanitize_model_opt(&rb.model),
+            model: crate::model::sanitize_model_opt(&rb.model),
             prompt: rb.prompt.as_deref().map(sanitize_persona).filter(|s| !s.trim().is_empty()),
             profile: rb.profile.as_ref().map(|p| p.trim().to_string()),
-            allow: rb.allow.iter().filter_map(|a| super::profiles::sanitize_allow(a)).collect(),
+            allow: rb.allow.iter().filter_map(|a| crate::profiles::sanitize_allow(a)).collect(),
             role_hint,
             effort,
             context,
@@ -1884,7 +1884,7 @@ pub fn workflow_file_exists(repo: &str) -> bool {
 ///
 /// The orchestrator block is loomux-owned: a repo may pin its `cli`/`model`, never
 /// author its persona or pre-approve its tools. `parse_workflow` rejects that
-/// outright, and [`OrchRegistry::resolve_persona`](super::OrchRegistry::resolve_persona)
+/// outright, and `orchestration::OrchRegistry::resolve_persona` (in `src-tauri`)
 /// drops one that arrives from a hand-edited `group.json` — so the *only* honest
 /// answer about an orchestrator block's persona is "there isn't one".
 ///

@@ -15,9 +15,10 @@
 //! # What deliberately did NOT come with `Role`
 //!
 //! `Role::template()` and `Role::instructions_file()` were inherent methods on
-//! this enum, and they are now free functions (`role_template`,
-//! `role_instructions_file`) in `src-tauri/src/orchestration/mod.rs`, next to
-//! the `include_str!` templates they load.
+//! this enum. Batch 4 turned both into free functions (`role_template`,
+//! `role_instructions_file`) and left both in
+//! `src-tauri/src/orchestration/mod.rs`, next to the `include_str!` templates
+//! they load.
 //!
 //! An inherent impl has to live in the crate that defines the type, so keeping
 //! them as methods would have dragged `templates/*.md` — and with them the
@@ -32,6 +33,18 @@
 //! asked of `GroupId`'s tripwire, answered the other way round: there, the
 //! guard had to follow the type; here, the content must not.
 //!
+//! **Batch 5 split that pair, and the split is the sharper reading of the same
+//! rule.** `role_template` stays: it loads the fixture-pinned bytes, so it is
+//! the half the argument above is actually about. [`role_instructions_file`]
+//! came across, because it loads nothing — it maps a class onto the file name
+//! the *group directory* carries, and `workflow::Block::instructions_file`
+//! calls it from inside this crate. Batch 4 kept them together on the ground
+//! that "the name and the bytes are one mapping"; that pairing turned out to be
+//! the weaker half of its own argument. What must not travel silently is
+//! content and the procedure that blesses it, and a bare `"worker.md"` is
+//! neither. The pin is unmoved either way: see this function's own doc comment
+//! for the test that would redden.
+//!
 //! # Widened on the way in
 //!
 //! `Role::prefix`, `Role::as_str`, `default_model` and `sanitize_model_opt`
@@ -41,7 +54,10 @@
 //! question to ask of it: whether the item is one this crate is content to
 //! expose, not merely whether it compiles. All four are total functions over a
 //! closed enum or a `&str`, with no state and no invariant a caller could
-//! violate by holding them.
+//! violate by holding them. [`role_instructions_file`] joined them in batch 5
+//! on the same terms and for the same reason — `pub` here so `workflow` and
+//! `mod.rs` can both reach it, re-exported `pub(crate)` from `orchestration`
+//! so loomux's own public surface is unchanged.
 
 use serde::Serialize;
 
@@ -567,6 +583,33 @@ pub fn sanitize_model_opt(m: &str) -> String {
     m.chars()
         .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '/'))
         .collect()
+}
+
+/// The file name a capability class's instructions are written under **in the
+/// group dir**, and the half of batch 4's `Role::template()` split that came
+/// across in batch 5. See this module's header for why the other half did not.
+///
+/// This one names no template and loads no bytes: it is the group directory's
+/// own contract — the name a kickoff prompt tells an agent to read — and
+/// `workflow::Block::instructions_file` is a caller of it that now lives in
+/// this crate. The `include_str!` templates and the byte-golden fixture root
+/// that blesses them stayed in `src-tauri` with `role_template`, which is the
+/// thing batch 4's argument was actually protecting.
+///
+/// Its mapping is not a claim this crate makes on its own recognizance:
+/// `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was`
+/// writes a default group's four instruction files and byte-compares them
+/// against `src-tauri/tests/fixtures/pre222/`, which pins the name as well as
+/// the bytes for every class that has one. A mis-mapped name reddens there
+/// wherever this function is defined.
+pub fn role_instructions_file(role: Role) -> &'static str {
+    match role {
+        Role::Orchestrator => "orchestrator.md",
+        Role::Worker => "worker.md",
+        Role::Reviewer => "reviewer.md",
+        Role::Planner => "planner.md",
+        Role::Solo => unreachable!("solo panes have no instructions file"),
+    }
 }
 
 #[cfg(test)]

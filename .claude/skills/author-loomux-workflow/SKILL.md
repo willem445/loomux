@@ -11,7 +11,7 @@ cheap worker tier, a strict security reviewer, and a database expert on call")
 into a working `.loomux/workflow.yml` plus any persona files it references.
 
 **Ground every schema claim in the parser, not in this document's prose.**
-`src-tauri/src/orchestration/workflow.rs`'s `RawWorkflow`/`RawBlock`/`RawEdge`/`RawGate`
+`crates/loomux-engine/src/workflow.rs`'s `RawWorkflow`/`RawBlock`/`RawEdge`/`RawGate`
 struct definitions and `parse_workflow` are the actual contract — this file is
 a distillation of them as of the commit it was written against. If the repo
 you're working in has a newer `workflow.rs`, the parser wins; re-derive the

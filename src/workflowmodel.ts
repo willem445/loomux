@@ -1569,7 +1569,7 @@ const asString = (v: YamlValue): string | null =>
   typeof v === "string" ? v : typeof v === "number" || typeof v === "boolean" ? String(v) : null;
 
 // The keys this build knows, per section. They mirror the engine's `Raw*` structs
-// (`src-tauri/src/orchestration/workflow.rs`) — the same set `src/workflow-schema.json`
+// (`crates/loomux-engine/src/workflow.rs`) — the same set `src/workflow-schema.json`
 // declares, which `test/workflowschema.test.ts` pins field for field. Hand-written
 // rather than read from the manifest on purpose: this module is pure and import-free
 // (see the header — its ONE import is a type), and a data file it had to load at

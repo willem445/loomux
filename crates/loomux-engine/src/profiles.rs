@@ -81,18 +81,19 @@
 //!   top.
 //! - `mode: replace` — the persona replaces the built-in role *body*. loomux
 //!   still injects the **non-overridable mechanics core**
-//!   ([`mechanics_core`](super::mechanics_core)), so a replace persona that
+//!   (`orchestration::mechanics_core`, which stays in `src-tauri` next to the
+//!   role templates it renders), so a replace persona that
 //!   forgets to mention `report()` or the branch→PR discipline stays
 //!   functional. That is the invariant `replace_mode_persona_keeps_mechanics_core`
 //!   pins: replace can change *who the agent is*, never *what loomux guarantees*.
 //!
 //! A persona can never change what an agent is *allowed* to do — the capability
 //! class comes from the block's `kind`, which is a closed enum (see
-//! [`workflow`](super::workflow)). `allow:` can only add pre-approved tool
+//! [`workflow`](crate::workflow)). `allow:` can only add pre-approved tool
 //! patterns *within* what the class permits: deny rules beat allow rules on
 //! both CLIs, so a reviewer persona cannot allow itself back into `git push`.
 
-use super::Role;
+use crate::model::Role;
 use std::fs;
 use std::path::Path;
 
@@ -209,7 +210,7 @@ impl AgentProfile {
 }
 
 /// [`AgentProfile::grants_mcp_server`] over a bare list, so the same rule serves
-/// a parsed profile and a [`ResolvedPersona`](super::ResolvedPersona) (which
+/// a parsed profile and an `orchestration::ResolvedPersona` (which
 /// carries the list onward to the spawn) without either re-deciding it.
 pub fn tools_grant_mcp_server(tools: Option<&[String]>, server: &str) -> bool {
     let Some(tools) = tools else { return true };
@@ -332,7 +333,7 @@ fn sanitize_tool(s: &str) -> Option<String> {
 /// names none — the caller reports it rather than guessing (an unknown kind is
 /// never coerced to worker; see `workflow::kind_from_str`).
 pub fn kind_from_hint(hint: &str) -> Option<Role> {
-    super::workflow::kind_from_str(hint)
+    crate::workflow::kind_from_str(hint)
 }
 
 /// Tool patterns land inside double quotes on a shell line
@@ -514,13 +515,13 @@ pub fn find_named<'a>(profiles: &'a [AgentProfile], name: &str) -> Option<&'a Ag
 ///   in the file that disagrees with the block's is an **error**, not a
 ///   reassignment.
 ///
-/// [`resolve_profile_path`]: super::workflow::resolve_profile_path
+/// [`resolve_profile_path`]: crate::workflow::resolve_profile_path
 pub fn load_block_profile(
     repo: &str,
     rel: &str,
     block_kind: Role,
 ) -> Result<AgentProfile, String> {
-    let path = super::workflow::resolve_profile_path(repo, rel)?;
+    let path = crate::workflow::resolve_profile_path(repo, rel)?;
     let text = fs::read_to_string(&path)
         .map_err(|e| format!("persona file {} is unreadable: {e}", path.display()))?;
     let stem = path
