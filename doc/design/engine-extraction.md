@@ -79,10 +79,18 @@ extraction is what makes it load-bearing: the old trust in `group_id` was a fact
 about the **transport** (only our own webview can invoke a command), and a crate
 consumer — let alone a network client — does not inherit that fact.
 
-So `groupid.rs` moves into the engine unchanged, and the engine's public API
-takes `GroupId`, never `&str`, wherever a group is named. A caller that has not
-parsed cannot call. That is the property, and it survives the move because it
-lives in the type rather than in the caller.
+So `groupid.rs` moves into the engine (slice A2 batch 2) with its logic
+untouched, and the engine's public API takes `GroupId`, never `&str`, wherever a
+group is named. A caller that has not parsed cannot call. That is the property,
+and it survives the move because it lives in the type rather than in the caller.
+Every edit inside the module is a doc comment: three intra-doc links pointed at
+`src-tauri` items (`group_dir_at`, `mergeq::valid_id_component`, `SOLO_GROUP`)
+and would have dangled once `super::` named the engine crate root, so they are
+re-spelled as plain code text, and the module doc gains the tripwire argument §6
+spells out. No logic line moved. It is also what gives the
+engine its first dependency: `serde`, for the hand-written `Deserialize` that
+routes a persisted id back through `GroupId::parse` rather than trusting the
+file.
 
 What does **not** move with it: **membership is a separate check.** Holding a
 well-formed id says the string is safe to join onto a root; it says nothing
@@ -155,7 +163,8 @@ from a unit test of product code, agents are banned from running cargo locally
 - **A2 — the Tauri-free submodules.** Move the modules that already have no
   Tauri in them; `mod.rs` re-exports so no caller changes. Small batches, one
   PR each. Per-PR bar: CI green and `git diff --stat` showing moves plus import
-  lines only.
+  lines only — with one stated exception, batch 2, whose move changes what a
+  source-scanning test can see and therefore has to edit that test (below).
 
   **The batch order is a dependency order, not a size order**, and "Tauri-free"
   turned out to be the weaker of the two tests. Every module in the A2 set is
@@ -166,24 +175,40 @@ from a unit test of product code, agents are banned from running cargo locally
   - **Batch 1 — `report`, `termgrid`.** The only two with no outbound edge at
     all: both are `std`-only. They go first precisely because they test the
     move-and-re-export mechanism and nothing else.
+  - **Batch 2 — `groupid`. Code-clean but not free**, and its cost was a *test*
+    one worth stating here because nothing in the module itself showed it. The
+    single-assembly-point guard in `src-tauri/tests/groupid.rs` scanned
+    `CARGO_MANIFEST_DIR/src` and asserts, among other things, that no
+    `impl AsRef<Path> for GroupId` exists. After the move that impl can only
+    ever be written in `loomux-engine` (the orphan rule leaves nowhere else), so
+    a scan confined to `src-tauri/src` would have been watching a directory the
+    violation can no longer reach — green forever, enforcing nothing, while
+    CLAUDE.md constraint 6 cites it as the enforcement. So the scan now walks
+    **both** source roots, asserts per root that it found files, and asserts
+    that the file *defining* `GroupId` was in scope — the last one being what
+    survives the next move, since a file count cannot tell two roots from one
+    root counted twice.
+
+    Because that changes a tripwire's coverage, the batch did **not** take the
+    pure-relocation exemption the others take: it owed, and produced, real
+    red-before-green — a planted `impl AsRef<Path> for GroupId` and a planted
+    second assembly point, each in `crates/loomux-engine/src`, each reddening
+    the extended scan on CI. The generalizable rule, and the reason this
+    paragraph outlives the batch: **when a type moves, ask where the violation
+    can be spelled now, not where it used to live.** For a trait impl the orphan
+    rule answers that exactly.
+
+    `groupid` also brings the crate's first dependency, `serde` — `GroupId`'s
+    hand-written `Deserialize` is the gate a persisted or hand-edited id is
+    routed back through, so it travels with the type. No `derive` feature (both
+    impls are hand-written), and `serde` is already in the shipped binary's
+    linked graph, so the getrandom audit's ground is unchanged.
   - **`digest` is not a leaf** despite reading like one. It calls
     `crate::sessions::yaml_field` and takes a `crate::opencodedb::TranscriptRow`
     — two modules staying in `src-tauri` — so it cannot move until those edges
     are cut or followed.
   - **`locks` must travel with `workflow`**, on which it depends for
     `ResourcePolicy` in both its body and its tests.
-  - **`groupid` is code-clean but not free**, and its cost is a *test* one worth
-    stating here because nothing in the module itself shows it. The
-    single-assembly-point guard in `src-tauri/tests/groupid.rs` scans
-    `CARGO_MANIFEST_DIR/src` and asserts, among other things, that no
-    `impl AsRef<Path> for GroupId` exists. After the move that impl could only
-    ever be written in `loomux-engine` (the orphan rule leaves nowhere else), so
-    a scan confined to `src-tauri/src` would be watching a directory the
-    violation can no longer reach — green forever, enforcing nothing. Moving
-    `groupid` therefore *requires* extending that scan to both source roots, and
-    a batch that changes a tripwire's coverage owes evidence that the tripwire
-    still fires where the code now lives — a planted violation that reddens it —
-    rather than the pure-relocation exemption the other batches take.
 - **A3 — the traits.** `EventSink` + `PaneHost`, `OrchRegistry` drops
   `AppHandle`, `NullPaneHost` replaces the app-is-`None` branch. Per-PR bar: the
   integration suite green with **zero test edits**, plus one new crate-level

@@ -23,20 +23,31 @@
 //! through the same check, so a hand-edited state file cannot mint one either.
 //!
 //! Deliberately **not** implemented: `AsRef<Path>`. A `GroupId` must not be
-//! joinable directly — it becomes a path only inside
-//! [`group_dir_at`](super::group_dir_at), the single declared assembly point
-//! (#904 scope item 2), which `OrchRegistry::group_dir` is the `&self`
-//! convenience over.
+//! joinable directly — it becomes a path only inside `orchestration::group_dir_at`,
+//! the single declared assembly point (#904 scope item 2), which
+//! `OrchRegistry::group_dir` is the `&self` convenience over. That is plain
+//! text rather than an intra-doc link because it lives in `src-tauri`, the
+//! crate that depends on this one; the arrow never points back, so this module
+//! cannot name it in a path.
 //!
 //! Two independent things hold that up, because the missing `AsRef<Path>` only
 //! stops a `GroupId` reaching a `join` — it says nothing about the *string*
 //! inside one, which would compile fine. The second is a source-scanning test,
-//! `the_orchestration_root_is_joined_with_a_group_in_exactly_one_place`, which
-//! parses every `.join(` argument in production source and flags any naming a
-//! group. Its boundary is stated where it is implemented: `PathBuf::push` is
-//! not scanned, because it cannot be told from `Vec::push` textually — it
-//! appears nowhere in this tree, so the scan is complete for the code as it
-//! stands, and would not catch the first one added.
+//! `the_orchestration_root_is_joined_with_a_group_in_exactly_one_place` in
+//! `src-tauri/tests/groupid.rs`, which parses every `.join(` argument in
+//! production source and flags any naming a group.
+//!
+//! **That scan walks BOTH workspace source roots** — `src-tauri/src` and
+//! `crates/loomux-engine/src` — and the second root is not symmetry for its own
+//! sake. Once this module moved here (#888 slice A2), the orphan rule left
+//! nowhere else an `impl AsRef<Path> for GroupId` could legally be written: a
+//! scan confined to `src-tauri/src` would have been watching a directory the
+//! violation can no longer reach, i.e. green forever while enforcing nothing.
+//!
+//! Its boundary is stated where it is implemented: `PathBuf::push` is not
+//! scanned, because it cannot be told from `Vec::push` textually — it appears
+//! nowhere in this tree, so the scan is complete for the code as it stands, and
+//! would not catch the first one added.
 //!
 //! It exists because this exact sentence was false for a whole slice: `#904`'s
 //! first half left `append_audit` and `promptsubmit_marker_path` each joining
@@ -50,7 +61,7 @@
 //! Group ids are loomux-minted tokens, never user prose: `group_id_for_repo`
 //! emits `{slug}-{8hex}` (slug = ASCII alphanumerics/`-`/`_` from the repo
 //! directory name, ≤24 chars), `create_group_ex` may append `-{n}` to
-//! disambiguate concurrent groups on one repo, and [`SOLO_GROUP`] is the fixed
+//! disambiguate concurrent groups on one repo, and `SOLO_GROUP` is the fixed
 //! constant `__solo__`. A strict alphabet therefore costs nothing and rejects
 //! every path-shaped attack by construction rather than by enumeration:
 //! `/` and `\` (separators), `.` (so `..` and `.` are unspellable), `:` (drive
@@ -58,17 +69,16 @@
 //! whitespace, and every non-ASCII byte (which is where Unicode
 //! normalization/homoglyph confusion would otherwise live).
 //!
-//! Same reasoning as [`crate::orchestration::mergeq::valid_id_component`], which
-//! closed the same hole for merge-queue batch ids. Kept as a separate type
-//! rather than a shared predicate because a `bool` returned by a free function
-//! is a fact about a moment; a `GroupId` is a fact that travels with the value.
+//! Same reasoning as `orchestration::mergeq::valid_id_component` (also in
+//! `src-tauri`), which closed the same hole for merge-queue batch ids. Kept as
+//! a separate type rather than a shared predicate because a `bool` returned by
+//! a free function is a fact about a moment; a `GroupId` is a fact that travels
+//! with the value.
 //!
 //! **Rejected, never rewritten.** `parse` does not trim, lowercase, or sanitize:
 //! an id is either usable as-is or refused. Normalizing would let two distinct
 //! strings name one directory, which is how a membership check and a path join
 //! end up disagreeing.
-//!
-//! [`SOLO_GROUP`]: crate::orchestration::SOLO_GROUP
 
 use std::borrow::Borrow;
 use std::fmt;

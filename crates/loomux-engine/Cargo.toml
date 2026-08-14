@@ -1,9 +1,9 @@
 # The orchestration engine, as a crate that does not link Tauri (#888 slice A1
 # / #847 Phase 0). It landed empty and is filling up in batches: `report` and
-# `termgrid` live here as of slice A2 batch 1, re-exported from
-# `src-tauri/src/orchestration/mod.rs` under their original paths. See
-# src/lib.rs and doc/design/engine-extraction.md for what arrives next and in
-# what order.
+# `termgrid` live here as of slice A2 batch 1, `groupid` as of batch 2, all
+# re-exported from `src-tauri/src/orchestration/mod.rs` under their original
+# paths. See src/lib.rs and doc/design/engine-extraction.md for what arrives
+# next and in what order.
 [package]
 name = "loomux-engine"
 # NOT the loomux release version, and deliberately not part of the seven
@@ -17,8 +17,8 @@ edition = "2021"
 publish = false
 description = "loomux orchestration engine — the Tauri-free core (internal; not published)"
 
-# NO DEPENDENCIES YET, and the empty section is here to be read rather than
-# skipped: the crate's defining property is what it must NEVER depend on.
+# ONE DEPENDENCY, and this section is here to be read rather than skipped: the
+# crate's defining property is what it must NEVER depend on.
 #
 #   - `tauri` (and any tauri-* crate). The entire point is a core a headless
 #     Linux daemon can link without webkit2gtk. `src-tauri` depends on THIS
@@ -32,3 +32,18 @@ description = "loomux orchestration engine — the Tauri-free core (internal; no
 #     src-tauri/Cargo.toml, whose audit notes are the reference. A dependency
 #     that is fine for a Linux daemon is not automatically fine here.
 [dependencies]
+# `groupid` (slice A2 batch 2) is not std-only: `GroupId` hand-writes both
+# halves of its wire form, and the `Deserialize` half is load-bearing security
+# rather than convenience — it routes a persisted or hand-edited id back through
+# `GroupId::parse` instead of trusting the file.
+#
+# Clear under both bans above. `serde` is already in the shipped binary's linked
+# graph (src-tauri depends on it directly), so this adds no NEW crate to the
+# graph the getrandom audit reasons about — `serde` itself is `no_std`-capable,
+# pulls in `serde_derive` only via its `derive` feature, and reaches `getrandom`
+# by no path. Not requested with `derive`: this module writes both impls by
+# hand, and asking for a feature we do not use would widen the graph for
+# nothing. (Resolver-2 feature unification means `src-tauri`'s `derive` still
+# applies to the one compiled `serde`; that is unification, not a dependency of
+# this crate's own.)
+serde = "1"

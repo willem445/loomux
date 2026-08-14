@@ -1963,6 +1963,9 @@ dependencies = [
 [[package]]
 name = "loomux-engine"
 version = "0.0.0"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "mach2"

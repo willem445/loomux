@@ -14,7 +14,6 @@
 //! pane, and the audit log (`audit.jsonl`) records the full text.
 
 pub mod digest;
-pub mod groupid;
 pub mod humanq;
 pub mod intake;
 pub mod lessons;
@@ -32,15 +31,23 @@ pub mod workflow;
 
 // MOVED to the `loomux-engine` crate (#888 slice A2), re-exported here under
 // their original paths so every call site — `orchestration::report::…`,
-// `orchestration::termgrid::…`, in this crate and in the integration suite —
-// resolves exactly as before. The move is what makes a headless daemon able to
-// link the orchestration core without Tauri; the re-export is what makes it a
-// pure relocation rather than a rename of fifty call sites. Read the modules in
-// crates/loomux-engine/src/. See doc/design/engine-extraction.md.
+// `orchestration::termgrid::…`, `orchestration::GroupId`, in this crate and in
+// the integration suite — resolves exactly as before. The move is what makes a
+// headless daemon able to link the orchestration core without Tauri; the
+// re-export is what makes it a pure relocation rather than a rename of fifty
+// call sites. Read the modules in crates/loomux-engine/src/. See
+// doc/design/engine-extraction.md.
 pub use loomux_engine::report;
 pub use loomux_engine::termgrid;
 
-pub use groupid::{GroupId, GroupIdError};
+// `self` keeps the module path `orchestration::groupid` alive alongside the two
+// types, so nothing that spells either form has to move. `GroupId` living in
+// the engine is the point rather than a side effect: the engine's public API
+// takes a validated id and never a `&str`, so a crate consumer — a daemon, a
+// network peer — cannot call without having parsed. The trust that used to be a
+// fact about the transport (#904) is now a fact about the type, which is what
+// makes it survive leaving this crate at all.
+pub use loomux_engine::groupid::{self, GroupId, GroupIdError};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};

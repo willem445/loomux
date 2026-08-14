@@ -181,12 +181,26 @@ to build a path from it wherever you like; a group path comes from
 That is half the guarantee. The missing impl stops a `GroupId` reaching a `join`
 — it says nothing about the *string* inside one, which would compile fine. So
 the other half is `the_orchestration_root_is_joined_with_a_group_in_exactly_one_place`,
-a source-scanning test that parses every `.join(` argument under `src-tauri/src`
-and flags any naming a group — structural, not a list of spellings, because the
+a source-scanning test that parses every `.join(` argument under **both**
+production source roots — `src-tauri/src` and `crates/loomux-engine/src` — and
+flags any naming a group: structural, not a list of spellings, because the
 first version *was* a list of spellings and missed one. It states its own
 boundary: `PathBuf::push` is not scanned (it cannot be told from `Vec::push`
 textually) and appears nowhere in the tree, so the scan is complete for the code
 as it stands and would not catch the first one added.
+
+**Why two roots, and the rule it generalizes to.** `GroupId` itself now lives in
+`loomux-engine` (#888 slice A2). Rust's orphan rule means an
+`impl AsRef<Path> for GroupId` — a foreign trait on a foreign type — can be
+written in exactly one crate, the one that owns the type, so after that move the
+only directory the violation can be *spelled* in is `crates/loomux-engine/src`.
+A scan left pointing at `src-tauri/src` alone would have passed every run
+forever while watching a directory the defect could no longer reach: an inert
+tripwire, which is worse than no test, because CLAUDE.md constraint 6 cites this
+assertion as the enforcement. The rule for any later move: ask **where the
+violation can be spelled now**, not where it used to live. The test guards
+against its own staleness too — it asserts per root that files were found, and
+that the file *defining* `GroupId` was actually in scope.
 
 A sibling, `every_group_taking_command_parses_its_id_at_the_boundary`, watches
 the other end. That one is the more valuable of the two: the sink is a single

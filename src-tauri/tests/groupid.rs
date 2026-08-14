@@ -334,12 +334,34 @@ fn the_generated_agent_handle_is_a_single_filename_component() {
 /// built without `.as_str()`, which is exactly what this weaker pass is here to
 /// catch.
 ///
-/// Scope: every `.rs` under `src-tauri/src`. Tests are not scanned — they build
-/// expected paths from group ids constantly, which is their job.
+/// # Scope: both production source roots, and why the second one is required
+///
+/// Every `.rs` under `src-tauri/src` **and** under `crates/loomux-engine/src`.
+/// Tests are not scanned — they build expected paths from group ids constantly,
+/// which is their job.
 ///
 /// The compiler covers what no scan can: `GroupId` has no `AsRef<Path>`, so it
 /// cannot reach a `join` as a *value*. That absence is asserted here, since
 /// nothing else enforces it.
+///
+/// That assertion is what forces the second root, and it is a security
+/// property, not tidiness. `GroupId` is defined in `loomux-engine` (#888 slice
+/// A2), and Rust's orphan rule means a foreign impl of a foreign trait —
+/// `AsRef<Path>` for `GroupId` — can be written in **exactly one crate**: the
+/// one that owns the type. So the only directory where the violation can now be
+/// spelled at all is `crates/loomux-engine/src`. A scan confined to
+/// `src-tauri/src` would still pass every run, forever, while watching a
+/// directory the defect can no longer reach — an inert tripwire that reads as
+/// enforcement, which is worse than no test, because CLAUDE.md constraint 6
+/// cites this assertion as the enforcement of the whole `group_id` path-trust
+/// boundary.
+///
+/// The generalization for the batches still to come: when a type moves, the
+/// question is not "where did the violation used to live" but **"where can it
+/// be spelled now"** — and for a trait impl the orphan rule answers that
+/// exactly. `ROOTS` below asserts per root that it found files, and a further
+/// assertion pins that the file *defining* `GroupId` was actually in scope, so
+/// a stale root fails loudly instead of scanning nothing.
 #[test]
 fn the_orchestration_root_is_joined_with_a_group_in_exactly_one_place() {
     /// The ONE permitted group-path assembly, matched on its exact text.
@@ -431,18 +453,60 @@ fn the_orchestration_root_is_joined_with_a_group_in_exactly_one_place() {
         a.contains("group") || a.contains("gid") || a.contains("g.id") || a.contains("info.id")
     }
 
-    let src_dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src"));
-    let mut files = Vec::new();
-    collect_rs_files(src_dir, &mut files);
-    assert!(files.len() > 5, "the source scan found almost nothing — check the path");
+    /// Every PRODUCTION source root in the workspace, each with the crate label
+    /// an offender from it is reported under — two crates can hold a `mod.rs`,
+    /// and a bare file name would no longer say which one.
+    ///
+    /// The engine root is not symmetry; see this test's doc for why leaving it
+    /// out would make the `AsRef<Path>` assertion below unfalsifiable.
+    const ROOTS: &[(&str, &str)] = &[
+        ("src-tauri", concat!(env!("CARGO_MANIFEST_DIR"), "/src")),
+        (
+            "loomux-engine",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../crates/loomux-engine/src"),
+        ),
+    ];
+
+    let mut files: Vec<(&str, std::path::PathBuf)> = Vec::new();
+    for (label, root) in ROOTS {
+        let mut found = Vec::new();
+        collect_rs_files(std::path::Path::new(root), &mut found);
+        // Asserted PER ROOT rather than on the total: a mistyped or stale root
+        // contributes nothing and would hide behind the other root's file
+        // count. `collect_rs_files` returns silently on an unreadable dir, so
+        // without this a wrong path is indistinguishable from a clean scan.
+        assert!(
+            !found.is_empty(),
+            "no `.rs` found under the {label} source root ({root}) — a root that scans nothing \
+             is a tripwire that cannot fire"
+        );
+        files.extend(found.into_iter().map(|p| (*label, p)));
+    }
+    assert!(files.len() > 5, "the source scan found almost nothing — check the paths");
+
+    // The anchor, and the assertion that survives the NEXT move. A file count
+    // cannot tell "both roots scanned" from "one root scanned twice"; what has
+    // to be in scope is the file that DEFINES `GroupId`, because the orphan rule
+    // puts the only writable `impl AsRef<Path> for GroupId` there and nowhere
+    // else. Matched on content rather than on a path, so slice A3/A4 may
+    // relocate the module again and this fails loudly instead of quietly
+    // scanning past it.
+    assert!(
+        files.iter().any(|(_, p)| {
+            std::fs::read_to_string(p).is_ok_and(|s| s.contains("pub struct GroupId(String)"))
+        }),
+        "the scan never reached the file that DEFINES `GroupId`. Wherever that file lives is the \
+         one crate an `impl AsRef<Path> for GroupId` can legally be written in (orphan rule), so \
+         a scan that misses it enforces nothing — add its source root to `ROOTS`."
+    );
 
     let mut offenders: Vec<String> = Vec::new();
     let mut permitted_seen = 0usize;
     let mut has_asref_path_impl = false;
 
-    for path in &files {
+    for (label, path) in &files {
         let src = std::fs::read_to_string(path).unwrap();
-        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let name = format!("{label}/{}", path.file_name().unwrap().to_string_lossy());
         for (i, line) in src.lines().enumerate() {
             let trimmed = line.trim_start();
             // A comment may spell the construct literally — several do, to
