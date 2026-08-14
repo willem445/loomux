@@ -9,8 +9,15 @@
          module, so without these the static markup flashes unstyled (white
          background, raw text) at startup. Paint dark immediately and keep
          the UI skeleton hidden; styles.css sets `#app { display: flex }`,
-         which overrides the hide once it loads. */
-      html, body { margin: 0; height: 100%; background: #131318; }
+         which overrides the hide once it loads.
+
+         PINNED: this background is PRE_PAINT_BACKGROUND in src/theme.ts (the
+         app ground, --surface-0). It has to be a literal — this block paints
+         before any stylesheet or module exists — so test/theme.test.ts reads
+         it back out of this file and fails if the two ever drift. Change the
+         palette in theme.ts and here in the same commit; a stale value here
+         is a one-frame flash of the previous release's colour at startup. */
+      html, body { margin: 0; height: 100%; background: #0f1114; }
       #app { display: none; }
     </style>
   </head>

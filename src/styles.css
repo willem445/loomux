@@ -1,23 +1,157 @@
 @import "@xterm/xterm/css/xterm.css";
 
+/* ============================ THE TOKEN LAYER (#879) ============================
+ *
+ * Every colour below is PINNED to src/theme.ts by test/theme.test.ts, because the same
+ * decisions also have to exist in index.html's pre-paint block (which runs before this
+ * file loads) and in the xterm ITheme (terminals are a WebGL canvas — custom properties
+ * do not reach them). Change a colour in theme.ts and here in the same commit, or the
+ * test says so. The rationale for every value — the eight named hues, the three colour
+ * channels, the elevation model, and the signature element they serve — is
+ * doc/design/ui-redesign.md.
+ *
+ * THE RULE THIS LAYER EXISTS TO ENFORCE: no raw colour outside this block. Surfaces
+ * consume semantic tokens only. Slice A adds the layer; below it sit 397 colour literals
+ * (249 hex + 148 rgb/rgba) that predate the rule, 169 of them the retired Tokyo Night
+ * palette this design renounces. Slice B migrates them and deletes the LEGACY BRIDGE at
+ * the end of this block. */
 :root {
   /* Dark-only app: keeps native widgets (select popups, scrollbars) dark too. */
   color-scheme: dark;
-  --bg-app: #131318;
-  --bg-term: #0b0b10;
-  --panel: #17171f;
-  --panel-2: #1e1e29;
-  --border: #262633;
-  --border-soft: #20202b;
-  --text: #ccd1de;
-  --text-dim: #7d8496;
-  --accent: #7aa2f7;
-  --accent-dim: #44578c;
-  --accent-glow: rgba(122, 162, 247, 0.14);
-  --danger: #f7768e;
+
+  /* --- the elevation ladder: a deep, cool neutral ground and three steps above it.
+         Height means "closer to the human" — app ground, then panels and the rail, then
+         cards and popovers. The surface steps are tiny (1.04-1.09:1) because surfaces
+         separate by elevation and a hairline, never by a contrast block; the border steps
+         open up, because an edge has to be seen. */
+  --surface-term: #0a0b0d;
+  --surface-0: #0f1114;
+  --surface-1: #15171c;
+  --surface-2: #1c1f26;
+  --line: #262a32;
+  --line-strong: #343945;
+
+  /* --- ink. `--ink-faint` is below AA by design: non-essential meta and rules only.
+         Anything a user must read takes --ink-dim or better. */
+  --ink: #e7e9ee;
+  --ink-dim: #9ba3b1;
+  --ink-faint: #656d7b;
+
+  /* --- CHANNEL 1: agent state. These six values are the only things allowed in a STATE
+         POSITION — the warp thread, the status chip, the state dot. `held` and `idle` are
+         achromatic: a stopped agent carries no dye and is marked by form (a dashed thread),
+         not by hue. No --id-* token may appear in a state position; that rule is what keeps
+         the fleet readable to a supervisor with colour-vision deficiency, and
+         test/theme.test.ts measures it rather than trusting it. */
+  --state-working: #5590d9;
+  --state-attention: #e8a94a;
+  --state-ok: #45c08a;
+  --state-danger: #e8636f;
+  --state-held: #656d7b;
+  --state-idle: #343945;
+
+  /* --- CHANNEL 2: interaction. ONE accent, used sparingly: focus ring, caret, active tab,
+         primary action. It is the working dye, because the live agent and the thing the
+         human is acting on are the same idea; form separates them (state is an edge,
+         interaction is a fill or a ring). It stays one colour no matter how many hues the
+         identity channel holds. */
+  --accent: #5590d9;
+  --focus: #5590d9;
+  --selection: #24344a;
+
+  /* --- CHANNEL 3: identity. Hue that says WHICH thing this is — a surface, an action
+         family, a CLI, a git lane — never what state it is in. Consumers: coloured icons
+         and their role table, per-CLI marks, git-graph lanes, diff add/delete, task-board
+         columns, workflow-mode chrome, project tabs, resource meters, the syntax
+         sub-palette. Four of these carry the same pigment as a --state-* token above and
+         that is deliberate: loomux has one palette, and the token a surface NAMES is what
+         declares which question it is answering. An --id-* token may only be used through a
+         documented role mapping; "it needed a different blue" is still refused.
+         Reserved by slice A, consumed from slice B on — nothing paints one yet. */
+  --id-rose: #e8636f;
+  --id-amber: #e8a94a;
+  --id-lime: #a9cc5a;
+  --id-jade: #45c08a;
+  --id-cyan: #46bcd4;
+  --id-azure: #5590d9;
+  --id-violet: #a97fd6;
+  --id-orchid: #e767a8;
+
+  /* --- type roles. Sans carries labels and titles; mono is reserved for MACHINE
+         IDENTIFIERS — paths, branches, ids, counts, timings — so the mono face always
+         means "a literal string the machine gave you".
+         --font-mono is byte-identical to the chain pane.ts passes to xterm; changing it
+         changes cell metrics and forces a refit. */
+  --font-mono: "Cascadia Code", "Cascadia Mono", Consolas, "Courier New", monospace;
+  --font-ui: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  --text-eyebrow: 10px;
+  --text-xs: 10.5px;
+  --text-s: 11.5px;
+  --text-m: 13px;
+  --text-l: 15px;
+  --text-xl: 22px;
+  --tracking-eyebrow: 0.09em;
+
+  /* --- rhythm and shape. Radii are generous on the surfaces that float and tight on the
+         ones that tile: a card reads as an object, a row reads as part of a list.
+         --line-w is the hairline every surface separates with (a hairline, not a slab) —
+         a token so that C-I cannot each hand-write their own edge weight. --thread is the
+         one width the signature element is allowed (design note, §The warp) and it is
+         CONSTANT: state changes its colour, never its size, so no state change can ever
+         move a terminal's cell grid. */
+  --space-1: 4px;
+  --space-2: 6px;
+  --space-3: 8px;
+  --space-4: 12px;
+  --space-5: 16px;
+  --space-6: 24px;
+  --space-7: 32px;
+  --radius-s: 6px;
+  --radius-m: 10px;
+  --radius-l: 14px;
+  --radius-pill: 999px;
+  --line-w: 1px;
+  --thread: 2px;
   --header-h: 40px;
   --pane-header-h: 27px;
+  --rail-w: 200px;
+
+  /* --- elevation shadows. Alpha-black only, and ONLY on surfaces that actually float:
+         a shadow under permanent chrome is decoration, and a large soft shadow composited
+         over a terminal's WebGL canvas is the documented way to make this app slow. */
+  --shadow-card: 0 2px 8px rgba(0, 0, 0, 0.35);
+  --shadow-float: 0 16px 40px rgba(0, 0, 0, 0.55);
+
+  /* --- motion. State changes only, and nothing continuous except the one attention cue. */
+  --dur-fast: 120ms;
+  --dur-base: 180ms;
   --ease: cubic-bezier(0.25, 0.8, 0.35, 1);
+
+  /* --- LEGACY BRIDGE — temporary, removed by slice B (#879).
+         The rules below this block still name the pre-redesign tokens. Aliasing them onto
+         the new layer moves everything that USES a token onto the new palette in one step
+         and keeps every rule working; the literals that never used one do not move, which
+         is why the app still looks half-retired until B. Slice B replaces the call sites
+         and deletes the ELEVEN declarations in this group (--bg-app, --bg-term, --panel,
+         --panel-2, --border, --border-soft, --text, --text-dim, --accent-dim,
+         --accent-glow, --danger). `--accent` is NOT in this group any more: it is a
+         first-class semantic token above, declared once and pinned. Do not add a new use
+         of any name in this group. */
+  --bg-app: var(--surface-0);
+  --bg-term: var(--surface-term);
+  --panel: var(--surface-1);
+  --panel-2: var(--surface-2);
+  --border: var(--line);
+  --border-soft: var(--surface-2);
+  --text: var(--ink);
+  --text-dim: var(--ink-dim);
+  --accent-dim: var(--line-strong);
+  /* The one bridge declaration that is a literal rather than an alias: an alpha companion
+     to --accent, which CSS cannot derive from a hex custom property without color-mix. Its
+     call sites are selected-row fills, so it carries the accent. Slice B splits the fills
+     onto --selection and drops the glows. */
+  --accent-glow: rgba(85, 144, 217, 0.14);
+  --danger: var(--state-danger);
 }
 
 * { box-sizing: border-box; }

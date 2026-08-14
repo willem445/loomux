@@ -25,6 +25,7 @@ import {
 } from "./pty";
 import { voiceController, type VoiceTargetPane, type VoicePhase } from "./voicecontrol";
 import { pathTail, sshOrchestrationRefusal, type ShellKind } from "./panesetup";
+import { FONT, TERM_METRICS, TERMINAL_THEME } from "./theme";
 import { invoke } from "./transport.ts";
 import { parseOsc52, writeClipboard, readClipboard } from "./clipboard";
 import { keyDisposition } from "./pasteflow";
@@ -306,34 +307,13 @@ export interface ContentPaneOptions {
   background?: boolean;
 }
 
-const TERM_THEME = {
-  background: "#0b0b10",
-  foreground: "#c9d1e3",
-  cursor: "#7aa2f7",
-  cursorAccent: "#0b0b10",
-  selectionBackground: "#2d3450",
-  // xterm.js 6.0 replaced the native viewport scrollbar with its own widget
-  // (see styles.css); these are the only scrollbar knobs it exposes.
-  scrollbarSliderBackground: "#262634",
-  scrollbarSliderHoverBackground: "#333345",
-  scrollbarSliderActiveBackground: "#3d3d52",
-  black: "#15161e",
-  red: "#f7768e",
-  green: "#9ece6a",
-  yellow: "#e0af68",
-  blue: "#7aa2f7",
-  magenta: "#bb9af7",
-  cyan: "#7dcfff",
-  white: "#a9b1d6",
-  brightBlack: "#414868",
-  brightRed: "#ff899d",
-  brightGreen: "#b4e878",
-  brightYellow: "#faba4a",
-  brightBlue: "#8db0ff",
-  brightMagenta: "#c7a9ff",
-  brightCyan: "#a4daff",
-  brightWhite: "#c0caf5",
-};
+// The terminal's colours come from the app's one palette (src/theme.ts), not from a copy
+// kept here: xterm renders on a WebGL canvas, so CSS custom properties cannot reach it and
+// the values have to exist twice — in the stylesheet and in TypeScript. theme.ts is the
+// copy, and test/theme.test.ts holds this file to it (no hex literals, and the ITheme
+// imported rather than rebuilt). Colour-only ITheme changes are reflow-free; the FONT
+// metrics below are the ones that move the cell grid.
+const TERM_THEME = TERMINAL_THEME;
 
 export interface PaneEvents {
   onFocus: (pane: Pane) => void;
@@ -1062,9 +1042,9 @@ export class Pane implements VoiceTargetPane {
       allowProposedApi: true,
       cursorBlink: true,
       cursorStyle: "bar",
-      fontFamily: '"Cascadia Code", "Cascadia Mono", Consolas, "Courier New", monospace',
-      fontSize: 14,
-      lineHeight: 1.1,
+      fontFamily: FONT.mono,
+      fontSize: TERM_METRICS.fontSize,
+      lineHeight: TERM_METRICS.lineHeight,
       scrollback: 10000,
       theme: TERM_THEME,
     });
