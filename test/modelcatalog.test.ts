@@ -29,6 +29,7 @@ import assert from "node:assert/strict";
 import {
   CUSTOM_OPTION,
   ModelCatalog,
+  blockModelOptions,
   curatedModels,
   mergeModelOptions,
   modelOptions,
@@ -192,6 +193,54 @@ test("no current and no default falls to the first option, custom hidden", () =>
     custom: "",
     showCustom: false,
   });
+});
+
+// ── the block editor's list ─────────────────────────────────────────────────
+
+test("a block that declares no model opens on the blank row, not on the first suggestion (#935)", () => {
+  // `model:` is OPTIONAL in a workflow file, and leaving it out is a declared
+  // state — `model_of` (workflow.rs) resolves it to `default_model(cli, kind)`.
+  // The launcher has no equivalent (every role starts on a real default drawn
+  // from the curated row), so its list carries no blank row for claude. Handed
+  // that list unchanged, a block with no `model:` would open showing `sonnet` —
+  // a choice nobody made — and there would be no way back to "leave it to
+  // loomux" once anything was picked. That is a NARROWER field than the free
+  // text this replaces, which is the one thing #935 may not do.
+  const launcher = curatedModels("claude");
+  assert.equal(pickerSelection(launcher, "").selected, "sonnet", "the launcher's own list falls to first");
+
+  const block = blockModelOptions(launcher);
+  assert.deepEqual(block, [INHERIT_MODEL, ...launcher]);
+  assert.equal(pickerSelection(block, "").selected, INHERIT_MODEL);
+  assert.equal(pickerSelection(block, "").showCustom, false);
+});
+
+test("a CLI whose curated row already carries the blank row gets no second one", () => {
+  // opencode's row leads with INHERIT_MODEL (#722), and `mergeModelOptions` pins
+  // it first. Two "(unset)" rows in one menu is a menu that looks broken.
+  const opencode = curatedModels("opencode");
+  assert.equal(opencode[0], INHERIT_MODEL, "the fixture this test is about");
+  const block = blockModelOptions(opencode);
+  assert.deepEqual(block, opencode);
+  assert.equal(block.filter((m) => m === INHERIT_MODEL).length, 1);
+});
+
+test("a CLI with nothing to offer stays empty, so the picker opens on its custom input", () => {
+  // `gemini` is a WORKFLOW_CLIS member with no ORCH_CLIS row, and today's
+  // `--help` parser reports nothing for it either. A lone "(unset)" row in front
+  // of an empty menu would be a dropdown whose only purpose is to be escaped
+  // from; an empty custom box already means what the blank row means.
+  assert.deepEqual(blockModelOptions(modelOptions("gemini", null)), []);
+  assert.equal(pickerSelection(blockModelOptions([]), "").showCustom, true);
+  // …and the moment the machine reports something, the menu appears WITH the row.
+  const probed = modelOptions("gemini", probe(["pro", "flash"]));
+  assert.deepEqual(blockModelOptions(probed), [INHERIT_MODEL, "pro", "flash"]);
+});
+
+test("blockModelOptions copies — a caller that reorders it must not reorder the catalog", () => {
+  const opencode = curatedModels("opencode");
+  blockModelOptions(opencode).push("mutated");
+  assert.ok(!curatedModels("opencode").includes("mutated"));
 });
 
 // ── the probe seam ──────────────────────────────────────────────────────────

@@ -78,10 +78,10 @@ import {
   discoverGitBash,
   discoverSsh,
   loadSshProfiles,
-  probeAgentCli,
   saveSshProfiles,
 } from "./pty";
-import { ModelCatalog, type CliProbe } from "./modelcatalog";
+import { type CliProbe } from "./modelcatalog";
+import { modelCatalog } from "./modelprobe";
 import { ModelPicker } from "./modelpicker";
 import { ORCH_CLIS, orchCliFor } from "./orchclis";
 import { knobState, knobValue, type CliKnobs, type KnobState, type KnobStates } from "./selectorknobs";
@@ -378,8 +378,10 @@ export class WelcomeForm {
    *  backend caches too), and the one merge of curated suggestions with what the
    *  CLI reported. Owns the memo this form used to keep itself, so the models it
    *  offers and the models the workflow pane's block editor offers come from the
-   *  same code. */
-  private catalog = new ModelCatalog(probeAgentCli);
+   *  same code — and, being the app-wide instance (`modelprobe.ts`), from the same
+   *  memo: this pane BECOMES that editor when "Edit workflow…" is pressed, and a
+   *  per-form catalog would re-probe every CLI across that handover. */
+  private catalog = modelCatalog;
   /** Autopilot flags per program, memoized. Empty string = the CLI has no
    *  unattended flag surface, so the toggle is hidden/inert for it (#101). */
   private autopilotFlags = new Map<string, Promise<string>>();

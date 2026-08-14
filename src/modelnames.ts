@@ -178,6 +178,16 @@ export function modelLabel(cli: string, id: string): string {
  *  should read — which is why the two are separate. */
 export const INHERIT_MODEL_LABEL = "(none) — the model your own CLI config selects";
 
+/** What a WORKFLOW BLOCK's picker shows for the empty id (#935).
+ *
+ *  Deliberately NOT `INHERIT_MODEL_LABEL`: a block's missing `model:` is not
+ *  "send no `--model`" on every CLI. `model_of` (workflow.rs) resolves it to
+ *  `default_model(cli, kind)`, which is `sonnet`/`opus` on claude, `auto` on
+ *  copilot and `pro` on gemini — only on opencode is it genuinely nothing. So the
+ *  row names the RULE (whose default it is) rather than one CLI's outcome, which
+ *  is the only phrasing true of all four. */
+export const BLOCK_DEFAULT_MODEL_LABEL = "(unset) — loomux's default for this block's kind and CLI";
+
 /** The label for one row of a curated model list: `INHERIT_MODEL_LABEL` for the
  *  empty id, `modelLabel` for every real one. */
 export function modelOptionLabel(cli: string, id: string): string {

@@ -109,6 +109,32 @@ export function modelOptions(cli: string, probe: CliProbe | null): string[] {
   return mergeModelOptions(curatedModels(cli), probe?.models ?? []);
 }
 
+/** The options a WORKFLOW BLOCK's picker offers, given what {@link modelOptions}
+ *  merged for its CLI.
+ *
+ *  One rule on top of the launcher's list, and it is a property of the FILE
+ *  rather than of the CLI: a block's `model:` is optional, and leaving it out is
+ *  a declared state — `workflow.rs`'s `model_of` resolves it to
+ *  `default_model(cli, kind)`. The launcher has no equivalent, because every role
+ *  there starts on a real default drawn from the curated row. So the blank row is
+ *  offered on EVERY CLI here, not only on the one whose curated row carries it —
+ *  without it, a block that declares no model would open on whatever happens to
+ *  be first in the menu (`sonnet`, on claude), which reads as a choice somebody
+ *  made and takes away the only way to say "leave it to loomux" once a model has
+ *  been picked. That is a field NARROWER than the free text it replaces, which is
+ *  the one thing #935 may not do.
+ *
+ *  But only when there is a menu to put it in front of. A CLI with nothing
+ *  curated and nothing probed (`gemini`, today) has no dropdown at all —
+ *  `pickerSelection` opens such a picker straight onto its custom input, which IS
+ *  the field then, and a one-row menu reading "(unset)" in front of it would be a
+ *  menu whose only purpose is to be escaped from. An empty custom box already
+ *  means exactly what the blank row means. */
+export function blockModelOptions(models: readonly string[]): string[] {
+  if (!models.length) return [];
+  return models.includes(INHERIT_MODEL) ? [...models] : [INHERIT_MODEL, ...models];
+}
+
 /** The select value that means "let me type an id" — a sentinel, not a model, so
  *  it can never collide with one: every real id the pickers carry is either empty
  *  (inherit) or a vendor id, and none of them starts with `__`. */

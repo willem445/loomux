@@ -83,6 +83,60 @@ No vendor facts. Which models a CLI accepts is the CLI's to report and
 A model table here would be a third copy of the thing #329 says not to keep one
 of.
 
+## The block editor is the second host, and it is not a copy
+
+The workflow pane's block form renders the same `ModelPicker`, against the same
+catalog, styled with its own classes. Two rules are its own, and both come from
+what a *file* is as against what a *launch* is.
+
+**The blank row is offered on every CLI.** A block's `model:` is optional, and
+leaving it out is a declared state: `model_of` (workflow.rs) resolves it to
+`default_model(cli, kind)`. The launcher has no equivalent — every role there
+starts on a real default drawn from the curated row — so its list for claude
+carries no empty entry, and `pickerSelection` would fall a block with no `model:`
+through to `sonnet`. That is a choice nobody made, displayed as if they had, and
+it would leave no way back to "leave it to loomux" once anything was picked: a
+field *narrower* than the free text it replaced, which is the one thing this
+issue may not produce. `blockModelOptions` prepends `INHERIT_MODEL` — but only
+when there is a menu to put it in front of, since a CLI with nothing curated and
+nothing probed (`gemini`, today) opens straight onto the custom input, where an
+empty box already means what the blank row means.
+
+**And it reads differently.** `INHERIT_MODEL_LABEL` says "the model your own CLI
+config selects", which is true of an empty `--model` on a pane loomux launches
+and false of a blank `model:` on three of the four CLIs a block may name
+(`sonnet`/`opus` on claude, `auto` on copilot, `pro` on gemini — only opencode's
+`default_model` is genuinely empty). So the picker takes the blank row's text as
+an option, and the block editor passes one that names the *rule* rather than one
+CLI's outcome.
+
+## The knobs follow the model, keystroke by keystroke
+
+`context` is available only where the selected model has a documented `[1m]` form
+(#687/#709). The block form derives its controls once, at render, and its model
+control edits with the form re-render suppressed — it has to, because
+re-rendering rebuilds the input under the human's caret. Those two facts together
+were the bug: type `sonnet` over `haiku` and the context select stayed disabled,
+quoting a reason about a model that was no longer selected, until you clicked
+away from the block and back.
+
+The fix is not to re-render. `workflowknobs.ts` holds the model and re-derives on
+`setModel`, so the two rows can be **repainted in place** from a fresh
+`KnobFieldSpec` while everything else on the form stands still. `ModelPicker`
+already fires `onChange` for a dropdown pick *and* for every keystroke in its
+`custom…` box — the typed case a `change` listener on a `<select>` never sees,
+which is how the bug survived. The same repaint serves the other input that moves
+under a form which cannot re-render: the `agent_cli_knobs` reply, which lands
+whenever the IPC resolves and turns both rows from "reading this CLI's
+capabilities…" into real options with no model having moved at all.
+
+Two rules there are the editor's own, against the launcher's. A declared value
+the CLI cannot deliver still shows, marked — dropping it would rewrite the
+human's file the moment any other field was touched — and the control stays
+**enabled**, because a value you can see and cannot remove is worse than one that
+is merely wrong. The launcher resets such a value instead (`knobValue`): there
+the control's job is to decide a payload, and a stale pick must never reach it.
+
 ## Seams
 
 - The probe arrives as an **injected function** (`pty.ts`'s `probeAgentCli`), so
@@ -93,8 +147,18 @@ of.
 - `ModelCatalog.models(cli)` is **synchronous**: a form paints on its first frame
   and cannot await a probe whose worst case is the backend's 8s timeout. It
   re-paints when the probe resolves.
-- `ModelPicker` takes its CSS classes as options. A shared control that hardcoded
-  one host's classes would be unstyled in the other.
+- `ModelPicker` takes its CSS classes — and its blank row's text — as options. A
+  shared control that hardcoded one host's classes would be unstyled in the
+  other, and one that hardcoded the blank row's wording would state a vendor
+  outcome that is false on the other host's CLIs.
+- The catalog **instance** is app-wide (`modelprobe.ts`), not per-form. The memo
+  is the point: a launcher pane *becomes* a workflow pane when "Edit workflow…"
+  is pressed, and a per-form catalog would re-probe every CLI across that
+  handover. It lives in its own module because `modelcatalog.ts` must stay
+  reachable from `node --test`, and the instance has to be wired to `pty.ts`.
+- `workflowknobs.ts` takes the capability answer as an injected `KnobLookup` —
+  the same seam `analyzeWorkflow` takes — so the knob rules are testable with no
+  browser, no Tauri host and no backend.
 - Slice A's opencode enumerator (`opencode models`) plugs in with no change here:
   it only makes `CliProbe.models` non-empty for a CLI that reported nothing
   before, which is the case every rule above was written for.
