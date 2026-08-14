@@ -38,9 +38,13 @@ discussion, and a demo screenshot of ORCA the human supplied as the target:
 4. **Structure is labelled, quietly.** Tiny letterspaced uppercase eyebrows over grouped
    content, small status chips on rows, machine strings in mono. The structure does the
    explaining so the copy does not have to.
-5. **State is colour; colour is state.** Status reads as small consistent colour signals
-   rather than as boxy badge components — and the corollary most tools miss: if colour means
-   state, nothing that is *not* state may take colour. Accent usage is restrained.
+5. **Colour is meaning, and every colour declares which meaning.** Status reads as small
+   consistent colour signals rather than as boxy badge components. The first version of this
+   principle went further — *if colour means state, nothing that is not state may take
+   colour* — and that corollary is what made the result dull enough to be sent back. Colour
+   also says *which thing this is*, which is the ORCA quality the human was pointing at. What
+   is restrained is not the amount of colour but the discipline: three channels, each with
+   its own positions (§The three colour channels).
 6. **Supervision beats editing.** The question the UI answers is "what is happening, and
    where do I have to look", not "how do I edit this file".
 
@@ -53,56 +57,132 @@ the PR. "Look and feel like ORCA" means *speak the same visual language*, and th
 test of that is §The signature: the single most distinctive object in the reference is the
 one thing this design may not reach for.
 
+What this design takes from ORCA is one **principle**, stated so it can be checked: *colour
+density carries identity — a tool can be richly coloured and still legible, provided each
+colour is answering a declared question.* That principle is what §The three colour channels
+implements. No ORCA hex, icon, or component was consulted for a value; the eight hues were
+derived here and swept against the T3 Code source as above.
+
 The same discipline applies to *themes*: the palette this replaces was Tokyo Night's, hex
 for hex, in `TERM_THEME`. Borrowing a well-liked theme is how an app ends up with someone
 else's identity and no argument for any of it.
 
-## The palette — six named colours
+## The palette — a slate ground and eight hues
 
 Dark-only, and staying that way: `color-scheme: dark` on `:root` keeps native widgets
 (select popups, scrollbars) dark, and a light theme would double every demo surface for a
 product whose users work at night against terminals. The tokens make one *possible* later;
 this line does not build one.
 
+The ground is two neutral ramps, and it is **exactly what the direction gate approved** —
+not one value has moved:
+
 | Name | Value | Role |
 | --- | --- | --- |
 | **slate** | `#0a0b0d` → `#343945` | the ground and the elevation ladder; every surface and border |
 | **mist** | `#e7e9ee` / `#9ba3b1` / `#656d7b` | the ink: primary, secondary, faint |
-| **azure** | `#5590d9` | agent **working** — and the one interaction accent |
-| **amber** | `#e8a94a` | **attention** — this one needs you |
-| **jade** | `#45c08a` | **ok** — done, passing, additions |
-| **rose** | `#e8636f` | **danger** — failed, error, deletions |
 
 **The ground is a deep cool neutral.** Blue sits a few points above red at every step of the
 slate ramp (`B−R` = 3, 5, 7, 10, 12, 17 as it climbs), so the chrome reads cool and recedes
 behind terminal output instead of tinting it. This is the correction the direction gate
 asked for, and it is the *opposite* of the rejected proposal, which warmed the same channel
-in the other direction.
+in the other direction. **Colour enters this design through the foreground only.** Nothing
+below tints the ground, and that is the rule that lets the palette get much more colourful
+without touching the black the human approved.
+
+Above the ground sit eight named hues, warm to cool around the wheel:
+
+| Name | Value | Lit | Channels |
+| --- | --- | --- | --- |
+| **rose** | `#e8636f` | `#f4808a` | **state:** danger, error, deletions · identity |
+| **amber** | `#e8a94a` | `#f4c06a` | **state:** attention — this one needs you · identity |
+| **lime** | `#a9cc5a` | `#c0dd7f` | identity only |
+| **jade** | `#45c08a` | `#6fd3a6` | **state:** ok, done, additions · identity |
+| **cyan** | `#46bcd4` | `#74d3e5` | identity only · ANSI cyan |
+| **azure** | `#5590d9` | `#7fb0e8` | **state:** working · **interaction:** the one accent · identity |
+| **violet** | `#a97fd6` | `#c39ce8` | identity only · ANSI magenta |
+| **orchid** | `#e767a8` | `#f08cbd` | identity only |
+
+`cyan` and `violet` were terminal-only in the previous round — values that existed so the
+sixteen ANSI slots stayed coherent, which no UI surface was allowed to touch. They are now
+app hues, so the terminal and the chrome finally speak one palette instead of two. Only one
+terminal-only value survives: ANSI green (`#57bd77`), because the app's greens are a teal
+(jade) and a yellow-green (lime) and a CLI printing "green" means neither. `lime` and
+`orchid` have no ANSI slot at all — app-only hues, the reverse of the old arrangement.
+
+**Eight is a measurement, not a preference.** The revision's target was 8–10, and a ninth
+hue was tried in all three gaps the wheel still had. Every candidate landed closer to an
+existing hue than the eight-set's own closest pair (violet/orchid, 30.4 ΔE in CIE76): a
+tangerine came out 20–29 ΔE from amber, an indigo 13–23 from azure and violet, a fern 10–24
+from ANSI green. The warm arc is the crowded one because two *state* dyes already live there
+and neither may move, so a third warm hue costs exactly the state legibility the palette
+exists to protect. Ten hues would have been the padded answer; eight is the honest one.
+
+**The Lit step, and why there is no third value per hue.** Each hue carries one brighter
+companion, used for the ANSI bright slots, for hover emphasis, and for chip text. There is
+deliberately **no per-hue fill**: on a ground this dark a chip is the ground plus a hairline
+in its hue, not a tinted block, so a fill token would be a third value per hue that nothing
+paints. A slice that genuinely needs one mints it and pins it like everything else.
 
 **One accent, and it is the working dye.** `--accent` is azure — the same colour as an agent
 in flight — because in loomux the live thing and the thing the human is acting on are the
-same thing, and a fifth hue would be a fifth meaning to learn. Form keeps them apart: state
+same thing, and a ninth hue would be a ninth meaning to learn. Form keeps them apart: state
 is an *edge*, interaction is a *fill or a ring*. The accent appears on the focus ring, the
-caret, the active tab and the primary action, and nowhere else; everything else in the chrome
-is slate and mist.
+caret, the active tab and the primary action, and nowhere else. It stays **one** colour
+however many hues the identity channel holds — "what can I click" must never become a
+hue-matching exercise.
 
 **Stopped agents get no dye.** `held` is faint mist and `idle` is a slate hairline. A held
 agent is not running, so it carries no dye; it is marked by *form* — a dashed thread — not
-by hue. This also keeps the state set legible for red/green colour blindness: the two states
-a supervisor must never confuse are "needs you" (amber) and "working" (azure), which differ
-in hue, lightness and position.
-
-The terminal needs eight hues where the app needs four, so `theme.ts` carries three
-terminal-only dyes — **violet** (`#a97fd6`, ANSI magenta) and two pulls of jade toward green
-(`#57bd77`) and toward blue (`#42b3c9`) so ANSI green reads as green and ANSI cyan as cyan.
-These are not app tokens. No UI surface may use them.
+by hue.
 
 **Contrast is measured, not claimed.** `test/theme.test.ts` computes WCAG ratios over these
 values on every run: primary ink clears AAA (7:1) on all four grounds, dim ink clears AA,
-each of the four dyes clears AA (4.5:1) on every surface it can appear on — the worst case is
-azure at 5.01:1 on `--surface-2` — and faint mist is *held* between 3:1 and 4.5:1,
-deliberately below AA, because its role is non-essential meta. If a future edit makes faint
-ink readable, it has stopped being a separate role and the test says so.
+**every one of the eight hues clears AA (4.5:1) as text on every surface it can appear on** —
+the worst case is azure at 5.01:1 on `--surface-2` — and each hue and its Lit step clear the
+WCAG 1.4.11 non-text floor (3:1) on the terminal ground, where an icon or a badge can sit but
+a label never does. Faint mist is *held* between 3:1 and 4.5:1, deliberately below AA,
+because its role is non-essential meta. If a future edit makes faint ink readable, it has
+stopped being a separate role and the test says so.
+
+## The three colour channels
+
+Colour in this app answers three different questions, and a surface that mixes them up is
+the failure mode the whole token layer exists to prevent.
+
+| Channel | Question it answers | Where it may appear |
+| --- | --- | --- |
+| **state** | what is this agent doing? | the **state positions** only: the warp thread, the status chip, the state dot |
+| **interaction** | what can I act on? | focus ring, caret, active tab, primary action — one accent, nothing else |
+| **identity** | *which* thing is this? | icon strokes and their role table, per-CLI marks, git-graph lanes, diff add/delete, task-board columns, workflow-mode chrome, project tabs, resource meters, the syntax sub-palette |
+
+Identity is the channel this revision adds, and it is what makes the app colourful. It says
+which *thing* you are looking at — a surface, an action family, a CLI, a git lane — as
+opposed to what state that thing is in.
+
+**Four hues carry both a state role and an identity role, and that is deliberate.** loomux
+has one palette, not two. Minting a second near-identical blue so "identity blue" could
+differ from "working blue" is precisely the *"it needed a slightly different blue"* failure
+rule 2 refuses. What separates the channels is **position**, not pigment: the state dyes hold
+an exclusive claim to the state positions, and an identity hue may never enter one. Which
+token a surface *names* — `--state-working` or `--id-azure` — declares which question it is
+answering, so a reviewer can see a channel violation in the diff without knowing a hex.
+
+**The position rule is load-bearing, and here is the measurement that proves it.** Eight hues
+on one dark ground cannot all survive colour-vision deficiency, and this set does not: under
+simulation `azure` and `violet` are 2.9 ΔE apart to a protanope, and `rose` and `orchid` are
+*identical* to a tritanope. The design accepts that for identity — which thing this is, is
+always also carried by position, by a label, and by an icon's shape — and refuses it for
+state, which is the one thing a supervisor must read correctly at a glance across ten panes.
+The four state dyes stay at least **10.3 ΔE** apart under all three dichromacies (the worst
+case is tritan `attention`/`danger`, where amber and rose both lose their yellow axis).
+`test/theme.test.ts` asserts a floor of 9 on that, and separately refuses any identity-only
+hue in a state role. So a supervisor who genuinely cannot tell violet from azure still reads
+the fleet correctly — nothing they must act on was ever encoded in the channel that
+collapsed.
+
+That is also the answer to the risk this revision introduces: the control on fruit salad is
+not "use fewer colours", it is that the colourful channel is never the load-bearing one.
 
 ## Elevation — the model, not a decoration
 
@@ -336,28 +416,75 @@ identified in *its* first draft. The names are now plain (slate, mist, azure, am
 rose) and the loom idea survives only where it does structural work: the warp, which encodes
 the tiling geometry, and nothing else.
 
-**The nearest remaining risk, named honestly.** This palette is now inside the skill's
-default look #2 — near-black with an accent — which is where the app started. What keeps it
-from being the templated version of itself is not the hue: it is that the accent is rationed
-to one meaning, that depth rather than colour carries hierarchy, that the four dyes are
-reserved for agent state, and that the structure (eyebrows, chips, the warp) does the work
-decoration usually does. Those are checkable claims, and the maintainability rules below are
-what keep them true after slice B.
-
 The accessory removed at the end: the top-bar thread strip, which becomes a fallback rather
 than a second home for the signature the moment the rail exists.
+
+### Round 3 — the direction was right and the result was dull
+
+Round 2 passed the direction gate and came back with one word attached: **too dull**. That
+was correct, and the useful part is *why*, because it was not a mistake in any hex.
+
+**The dullness was a rule, not a palette.** Round 2's maintainability rule 3 read: chrome
+takes slate and mist, and a surface gets a dye only if it is reporting an agent state. With
+four dyes rationed to four states, that rule made near-monochrome the *only* legal outcome —
+there was no amount of taste that could add colour without breaking it. Round 2 had even
+written the corollary down as a principle and been pleased with it. So the rule changed, not
+the ground: the identity channel (§The three colour channels) is a third legitimate reason
+for a surface to take hue, and the palette grew from four app dyes to eight named hues.
+
+**This is round 1's lesson arriving a second time, in a new disguise.** Round 1 spent its
+originality on the axis the human had fixed (the palette family). Round 2 did something
+subtler and just as wrong: it took a *principle it had derived itself* — colour is state,
+therefore nothing else may have colour — and let it outrank the thing the human actually
+asked for, which was to look like ORCA. ORCA is colourful. A rule that forbids the reference's
+most obvious quality is a rule that has stopped serving the brief, and the tell was that
+round 2 could describe its own result as "restrained" instead of noticing it was drab.
+
+**The named risk flips: from dull to fruit salad.** Eight hues in a supervision tool can
+absolutely destroy the legibility this app exists for, and that is now the real danger. Three
+things answer it, and they are checkable rather than tasteful:
+
+- **Position, not pigment, separates the channels.** State positions are reserved; identity
+  may never enter one. So more colour cannot dilute the signal a supervisor reads.
+- **The collapse is measured, not hoped for.** The eight-hue set genuinely fails under
+  colour-vision deficiency, and the design places nothing load-bearing on it — the four state
+  dyes stay ≥ 10.3 ΔE apart under all three dichromacies and the test enforces a floor.
+- **Eight is where the measurements stopped, not where enthusiasm stopped.** Every candidate
+  ninth hue was closer to a neighbour than the set's own tightest pair, so it was refused.
+
+**The nearest remaining risk, named honestly.** The palette still sits inside the skill's
+default look #2 — a near-black ground with saturated accents — which is where the app
+started, and adding hues does not by itself buy an identity. What keeps it from being the
+templated version of itself is the *discipline*: three declared channels rather than one bag
+of accent colours, depth rather than colour carrying hierarchy, structure (eyebrows, chips,
+the warp) doing the work decoration usually does, and a signature the reference cannot have.
+A reviewer who wants to falsify that should look for an `--id-*` token in a state position;
+that is the single failure that would collapse the whole argument, and it is the one the
+tests refuse.
+
+**What is still unproven.** Every claim above is about eight values and their measured
+relationships. Whether the app *feels* more alive is a question about surfaces, and slice A
+paints none of them — the hues are reserved in the token layer and nothing consumes one yet.
+That is exactly what the human's look at this PR is for, and it is why the honest answer to
+"is it colourful now?" is: the rule that prevented it is gone, and slice B onward is where it
+becomes visible.
 
 ## Maintainability rules — binding on slices B through J
 
 1. **No raw colour outside the token block in `src/styles.css`.** Surfaces consume semantic
    tokens. Slice B migrates the literals that predate this rule and lists any documented
    exception in its PR.
-2. **No new colour without a role.** A colour that is not one of the six names, in one of the
-   declared roles, does not go in. "It needed a slightly different blue" is the failure mode
-   the token layer exists to prevent.
-3. **Colour is state; the accent is interaction.** Chrome takes slate and mist. If a surface
-   wants a dye, the question is which agent state it is reporting; if the answer is "none",
-   it does not get one.
+2. **No new colour without a role.** A colour that is not one of the eight names, in one of
+   the declared roles, does not go in. "It needed a slightly different blue" is the failure
+   mode the token layer exists to prevent.
+3. **Every coloured surface declares its channel.** Colour answers one of three questions —
+   state, interaction, or identity (§The three colour channels) — and the token a surface
+   names is how it says which. **The state positions** (the warp thread, the status chip, the
+   state dot) take `--state-*` and nothing else; **the accent** stays the one interaction
+   colour; **everything else** that wants hue takes an `--id-*` token *through a documented
+   role mapping*, never ad hoc. Structural chrome — surfaces, bars, rules, body text — is
+   still slate and mist: identity colours the things being *identified*, not the frame around
+   them.
 4. **State changes colour, never size.** No hover, focus, or attention style may change a
    pane's box, `.xterm` padding, or terminal font metrics — those move cell geometry
    (`doc/design/xterm-resize-reflow.md`) and belong to #885.
@@ -403,8 +530,16 @@ generated file to review, for one shared seam that a test and a comment already 
 
 ## What slice A shipped, and what it did not
 
-Shipped: this note, `src/theme.ts`, the semantic token layer in `:root`, `TERM_THEME` derived
-from `theme.ts`, the `index.html` pre-paint sync, and `test/theme.test.ts`.
+Shipped: this note, `src/theme.ts`, the semantic token layer in `:root` — including the eight
+`--id-*` identity tokens — `TERM_THEME` derived from `theme.ts`, the `index.html` pre-paint
+sync, and `test/theme.test.ts`.
+
+**The identity tokens are reserved, not consumed.** Nothing paints an `--id-*` token yet, the
+same way `--rail-w` is declared and unused: slice A's job is to make the decision once, in a
+place the later slices can point at. Slice K writes the icon role→dye table against them,
+slice B maps the surfaces below to them, and until then the identity channel is a promise the
+tests hold rather than something visible on screen. The honest read of this PR is that it
+removes the rule that kept the app grey and picks the colours — it does not yet apply them.
 
 Not shipped: any restyling — and the honest description of that is not "the old design
 wearing the new colours", because only the rules that went through a *token* moved. The
