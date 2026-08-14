@@ -163,24 +163,10 @@ fn strip_ansi(line: &str) -> String {
 /// alone. A CLI that listed bare ids instead would carry its own parser in its
 /// `ENUMERATORS` row.
 pub fn parse_models_from_list(out: &str) -> Vec<String> {
-    let mut models: Vec<String> = Vec::new();
-    for raw in out.lines() {
-        let line = strip_ansi(raw);
-        let line = line.trim().trim_start_matches(|c: char| matches!(c, '-' | '*' | '\u{2022}' | ' ' | '\t'));
-        let Some(token) = line.split_whitespace().next() else { continue };
-        if token.len() > 96 || !token.contains('/') {
-            continue;
-        }
-        // Every segment non-empty (so a URL's `https://` is rejected) and made
-        // of id characters only.
-        let is_id = token
-            .split('/')
-            .all(|seg| !seg.is_empty() && seg.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | ':')));
-        if is_id && !models.iter().any(|m| m == token) {
-            models.push(token.to_string());
-        }
-    }
-    models
+    // SCRATCH NEUTER (red evidence for #935 slice A, PR #939) — the id
+    // recognition is set aside and every non-empty line is taken as a model.
+    // DO NOT MERGE.
+    out.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect()
 }
 
 /// Run `<program> <args>` without a console window, bounded by a timeout.
