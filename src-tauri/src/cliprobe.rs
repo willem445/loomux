@@ -152,10 +152,14 @@ fn plain_line(line: &str) -> String {
                     break;
                 }
             }
-            out.push(' ');
             continue;
         }
-        out.push(if c.is_control() { ' ' } else { c });
+        // SCRATCH NEUTER (red evidence for #935 slice A, PR #939) — removals
+        // delete instead of separating, the pre-review behaviour that spliced a
+        // tab-columned row into a mangled id. DO NOT MERGE.
+        if !c.is_control() {
+            out.push(c);
+        }
     }
     out
 }
