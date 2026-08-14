@@ -288,7 +288,7 @@ fn eviction_order(blocks: &[Block<'_>]) -> Vec<usize> {
 /// boundary so the kept text opens at a whole line. `tail_snippet` does the
 /// char-boundary-safe part (never mid-UTF8).
 fn tail_body(text: &str) -> &str {
-    let tail = super::tail_snippet(text, LESSONS_BYTE_CAP);
+    let tail = crate::text::tail_snippet(text, LESSONS_BYTE_CAP);
     tail.find('\n').map(|i| &tail[i + 1..]).unwrap_or(tail)
 }
 
@@ -373,10 +373,15 @@ fn clip(s: &str, n: usize) -> String {
     format!("{}…", &s[..end])
 }
 
-// No inline `#[cfg(test)]` unit tests here: they'd link the full lib, and on
-// Windows that misses the comctl32-v6 manifest `build.rs` only embeds for
-// integration-test targets (repo constraint #4). Coverage for `cap`'s
-// behavior (under-cap no-op, whole-entry eviction, pin priority, the notice's
-// contents and its byte bound, the headingless byte-suffix fallback,
-// line-boundary and UTF-8 safety) lives in `tests/lessonsfile.rs`, exercised
-// through the public `load_lessons_note` against real files.
+// No inline `#[cfg(test)]` unit tests here, and the reason is coverage rather
+// than the old one. Until #888 slice A2 batch 3 this module lived in the Tauri
+// app's lib, where an inline unit test would have linked that lib and missed
+// the comctl32-v6 manifest `build.rs` embeds only for integration-test targets
+// (repo constraint #4); nothing in this crate links Tauri or that manifest, so
+// that bar no longer applies here. The tests stayed where they are anyway
+// because of what they test: `cap`'s behavior (under-cap no-op, whole-entry
+// eviction, pin priority, the notice's contents and its byte bound, the
+// headingless byte-suffix fallback, line-boundary and UTF-8 safety) is
+// exercised end to end through the kickoff that injects it, against real files
+// on disk, which is `src-tauri/tests/lessonsfile.rs`'s subject and not this
+// module's alone. Converting them to unit tests would narrow what they cover.

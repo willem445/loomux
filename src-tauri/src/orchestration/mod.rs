@@ -16,14 +16,12 @@
 pub mod digest;
 pub mod humanq;
 pub mod intake;
-pub mod lessons;
 pub mod locks;
 pub mod mcp;
 pub mod mergeq;
 pub mod mergeqview;
 pub mod mqdriver;
 pub mod mqloop;
-pub mod notify;
 pub mod profiles;
 pub mod queue;
 pub mod queuestate;
@@ -48,6 +46,28 @@ pub use loomux_engine::termgrid;
 // fact about the transport (#904) is now a fact about the type, which is what
 // makes it survive leaving this crate at all.
 pub use loomux_engine::groupid::{self, GroupId, GroupIdError};
+
+// #888 slice A2 batch 3. `lessons` and `notify` were leaves in everything but
+// one edge each — `lessons` reached back here for `tail_snippet`, `notify` for
+// `pr_number` — and both of those are pure string functions rather than
+// registry state. So the helpers moved into the engine ahead of their callers
+// (`loomux_engine::text`) and the modules followed, which is the cheaper answer
+// than inventing a trait to reach back for a `&str` cut. `humanq` and `intake`
+// stay in this crate and reach `notify` through the re-export below exactly as
+// they always did — `super::notify::sanitize_gh_text` still resolves, and
+// `humanq` in particular does not move: it is #946/#959 trust-boundary code
+// whose relocation is a decision of its own, not a side effect of this one.
+pub use loomux_engine::{lessons, notify};
+
+// The two helpers themselves, re-exported under the names they had while they
+// were defined in this file, so every call site here and in the integration
+// suite (`orchestration::pr_number`) resolves unchanged. `tail_snippet` keeps
+// its `pub(crate)` reach rather than following the engine's `pub`: the engine
+// has to expose it to be usable across the crate boundary at all, but nothing
+// outside this crate ever spelled it, and a re-export is the one place that
+// choice is still ours to make.
+pub use loomux_engine::text::pr_number;
+pub(crate) use loomux_engine::text::tail_snippet;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -11382,16 +11402,6 @@ pub fn grant_segment(target: &str) -> String {
     if s.is_empty() { "_".to_string() } else { s }
 }
 
-/// Extract the numeric PR id from a board task's `pr` field, which may be a bare
-/// number (`7`), a `#7`, or a full PR URL (`…/pull/7`). `None` if no number is
-/// found. Pure so the normalization is testable; the grant file is keyed `pr-<N>`.
-pub fn pr_number(pr: &str) -> Option<u64> {
-    // A PR URL ends in `/pull/<n>`; otherwise take the last run of digits.
-    let tail = pr.rsplit(['/', '#', ' ']).find(|s| !s.is_empty()).unwrap_or(pr);
-    let digits: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
-    digits.parse().ok()
-}
-
 /// The merge-gate guard's refusal for an item that is not at the gate. Shared
 /// by the single (`ensure_at_merge_gate`) and bulk (`approve_tasks`) paths so
 /// both refuse in the same words — bulk validates against one board snapshot
@@ -13683,19 +13693,6 @@ fn render_template(tpl: &str, vars: &[(&str, &str)]) -> String {
         out = out.replace(&format!("{{{{{k}}}}}"), v);
     }
     out
-}
-
-/// Last `n` bytes of `s`, cut on a char boundary (never mid-UTF8) — a short
-/// diagnostic snippet for an exit notice, never the whole captured tail.
-/// `pub(crate)` so `lessons::cap` (#268) can reuse the same char-safe cut
-/// instead of re-deriving it.
-pub(crate) fn tail_snippet(s: &str, n: usize) -> &str {
-    if s.len() <= n {
-        return s;
-    }
-    let start = s.len() - n;
-    let boundary = (start..=s.len()).find(|&i| s.is_char_boundary(i)).unwrap_or(s.len());
-    &s[boundary..]
 }
 
 /// Cap for the `task` field in a `list_agents` roster row (#851): a spawn

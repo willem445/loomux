@@ -3,10 +3,11 @@
 //! constants. No `gh`, no locks, no registry state — everything here is a
 //! plain function over plain data, so it is unit-testable with canned `gh
 //! --json` fixtures and no subprocess. See `OrchRegistry`'s `notify_*`
-//! methods (mod.rs) for the impure half (the poll thread, the registry
-//! state) and `doc/design/orchestration.md`'s "Notification backend"
-//! section for the design rationale — in particular why this is a fixed set
-//! of structured conditions and not a caller-supplied poll command.
+//! methods (`src-tauri`'s `orchestration/mod.rs` — the impure half, i.e. the
+//! poll thread and the registry state, which has not moved into this crate) and
+//! `doc/design/orchestration.md`'s "Notification backend" section for the
+//! design rationale — in particular why this is a fixed set of structured
+//! conditions and not a caller-supplied poll command.
 //!
 //! Three MCP tools sit on top of this (`mcp.rs`): `notify_when`,
 //! `list_notifications`, `cancel_notification`. All three are **self-
@@ -100,7 +101,7 @@ pub struct Watch {
     /// #904: validated — a watch is registered from an agent-supplied
     /// request but the group comes off the caller's own registry record, and
     /// the fired notice audits against it (`self.audit(&w.group, ...)`).
-    pub group: super::GroupId,
+    pub group: crate::groupid::GroupId,
     pub agent: String,
     pub condition: Condition,
     /// Echoed back (sanitized) in the fired/expired notice, so the agent
@@ -240,7 +241,11 @@ pub fn watch_expired(deadline_ms: u64, now_ms: u64) -> bool {
 /// Pure — this is the whole selection policy behind the `gh`-process DoS
 /// backstop, lifted out of `OrchRegistry::poll_watches` so it is
 /// unit-testable with no `gh`, no lock, and no registry.
-pub fn due_watches(now: u64, watches: &HashMap<String, Watch>, paused: &HashSet<super::GroupId>) -> Vec<String> {
+pub fn due_watches(
+    now: u64,
+    watches: &HashMap<String, Watch>,
+    paused: &HashSet<crate::groupid::GroupId>,
+) -> Vec<String> {
     let interval_ms = NOTIFY_POLL_INTERVAL.as_millis() as u64;
     let mut due: Vec<&Watch> = watches
         .values()
@@ -266,7 +271,7 @@ pub fn run_id_from(s: &str) -> Option<u64> {
         let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
         return digits.parse().ok();
     }
-    super::pr_number(s)
+    crate::text::pr_number(s)
 }
 
 // ---------- predicates over pinned `gh --json` fields (pure, tested) ----------
@@ -282,11 +287,16 @@ struct RawCheck {
 }
 
 /// `gh pr checks` states that mean "still running" — anything else (a
-/// non-empty array with none of these) is terminal. `pub(super)`: also used by
-/// `intake.rs`'s `gh pr list` rollup classification (#332), which needs the
-/// identical pending/failing vocabulary applied to a differently-shaped `gh`
-/// response — see that module's `rollup_entry_state`.
-pub(super) fn check_is_pending(state: &str) -> bool {
+/// non-empty array with none of these) is terminal.
+///
+/// `pub` because this and `check_is_failing` are the shared pending/failing
+/// vocabulary, not this module's private opinion: the `gh pr list` rollup
+/// classification (#332) and the merge queue's batch verdict apply the identical
+/// pair to differently-shaped `gh` responses. Both of those callers stayed in
+/// `src-tauri` when this module moved into the engine (#888 slice A2 batch 3),
+/// which puts them outside any narrower visibility this could carry — the
+/// widening is the crate boundary's doing, not a loosening of who may ask.
+pub fn check_is_pending(state: &str) -> bool {
     matches!(state, "PENDING" | "QUEUED" | "IN_PROGRESS")
 }
 
@@ -301,7 +311,7 @@ pub(super) fn check_is_pending(state: &str) -> bool {
 /// `CANCELLED`, `TIMED_OUT`, `ACTION_REQUIRED`, `STARTUP_FAILURE`, or a state
 /// `gh` hasn't documented yet — stays classified as failing: an unrecognized
 /// conclusion must never silently read as passing.
-pub(super) fn check_is_failing(state: &str) -> bool {
+pub fn check_is_failing(state: &str) -> bool {
     !matches!(state, "SUCCESS" | "SKIPPED" | "NEUTRAL")
 }
 
@@ -1157,7 +1167,7 @@ mod tests {
     fn watch(id: &str, group: &str, last_poll_ms: u64) -> Watch {
         Watch {
             id: id.to_string(),
-            group: super::super::GroupId::parse(group).unwrap(),
+            group: crate::groupid::GroupId::parse(group).unwrap(),
             agent: format!("agent-of-{group}"),
             condition: Condition::PrChecks { pr: 1 },
             note: String::new(),
@@ -1224,7 +1234,7 @@ mod tests {
         w.insert("n-paused".to_string(), watch("n-paused", "paused-group", 0));
         w.insert("n-live".to_string(), watch("n-live", "live-group", 0));
         let mut paused = HashSet::new();
-        paused.insert(super::super::GroupId::parse("paused-group").unwrap());
+        paused.insert(crate::groupid::GroupId::parse("paused-group").unwrap());
         let due = due_watches(1_000_000, &w, &paused);
         assert_eq!(due, vec!["n-live".to_string()], "a paused group's watch must never be selected for polling");
     }
