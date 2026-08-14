@@ -3,8 +3,8 @@
 Issue #847 (the investigation), #888 track A (the reason it is happening now).
 This note is the boundary argument: what `loomux-engine` is, what may cross into
 it, what must not, and the order the moves happen in. Slice A1 — the workspace
-scaffold — is the first step and the only one that has landed; the crate is
-empty on purpose.
+scaffold — landed first and landed empty on purpose; A2 is now moving modules
+into it in batches (§6).
 
 Related: `doc/design/architecture.md` (the module map), `doc/design/engine-transport.md`
 (#905 — the same cut line, on the frontend side), `doc/design/remote-engine-protocol.md`
@@ -156,6 +156,34 @@ from a unit test of product code, agents are banned from running cargo locally
   Tauri in them; `mod.rs` re-exports so no caller changes. Small batches, one
   PR each. Per-PR bar: CI green and `git diff --stat` showing moves plus import
   lines only.
+
+  **The batch order is a dependency order, not a size order**, and "Tauri-free"
+  turned out to be the weaker of the two tests. Every module in the A2 set is
+  free of `tauri::` — that was never the constraint that bit. What decides
+  whether a module can move *alone* is its outbound edges, because an edge that
+  still points into `src-tauri` would make the arrow point back:
+
+  - **Batch 1 — `report`, `termgrid`.** The only two with no outbound edge at
+    all: both are `std`-only. They go first precisely because they test the
+    move-and-re-export mechanism and nothing else.
+  - **`digest` is not a leaf** despite reading like one. It calls
+    `crate::sessions::yaml_field` and takes a `crate::opencodedb::TranscriptRow`
+    — two modules staying in `src-tauri` — so it cannot move until those edges
+    are cut or followed.
+  - **`locks` must travel with `workflow`**, on which it depends for
+    `ResourcePolicy` in both its body and its tests.
+  - **`groupid` is code-clean but not free**, and its cost is a *test* one worth
+    stating here because nothing in the module itself shows it. The
+    single-assembly-point guard in `src-tauri/tests/groupid.rs` scans
+    `CARGO_MANIFEST_DIR/src` and asserts, among other things, that no
+    `impl AsRef<Path> for GroupId` exists. After the move that impl could only
+    ever be written in `loomux-engine` (the orphan rule leaves nowhere else), so
+    a scan confined to `src-tauri/src` would be watching a directory the
+    violation can no longer reach — green forever, enforcing nothing. Moving
+    `groupid` therefore *requires* extending that scan to both source roots, and
+    a batch that changes a tripwire's coverage owes evidence that the tripwire
+    still fires where the code now lives — a planted violation that reddens it —
+    rather than the pure-relocation exemption the other batches take.
 - **A3 — the traits.** `EventSink` + `PaneHost`, `OrchRegistry` drops
   `AppHandle`, `NullPaneHost` replaces the app-is-`None` branch. Per-PR bar: the
   integration suite green with **zero test edits**, plus one new crate-level

@@ -4,9 +4,10 @@
 //!
 //! `get_output` used to hand the orchestrator `strip_ansi(raw_ring)` — the raw
 //! write stream with escape sequences deleted — and then collapse *consecutive
-//! identical* lines ([`super::collapse_repeated_frames`]). That works for a CLI
-//! whose animation redraws a whole line per tick. It does nothing at all for a
-//! modern TUI, and Claude Code v2.1.x is the worst case (#520, observed live):
+//! identical* lines (`orchestration::collapse_repeated_frames`). That works
+//! for a CLI whose animation redraws a whole line per tick. It does nothing at
+//! all for a modern TUI, and Claude Code v2.1.x is the worst case (#520,
+//! observed live):
 //!
 //! - it repaints **partial lines** by cursor address, so after stripping the
 //!   escapes the surviving text of two consecutive frames concatenates into
@@ -47,12 +48,12 @@
 //!   correctly; a relative move off the top edge clamps instead of reaching
 //!   content that scrolled out of the ring long ago.
 //! - **`get_output` reads [`render_screen`]; the question guard reads
-//!   [`render_visible`].** [`super::strip_ansi`] is unchanged and still serves
-//!   every other caller (`box_holds_paste`, the compact/menu detectors). #530
-//!   changed only what the orchestrator *reads*; #534 is the first place a
-//!   composed screen also informs what loomux *decides*, and it does so through
-//!   [`render_visible`] — see that function's doc for why the two must not be
-//!   confused.
+//!   [`render_visible`].** `orchestration::strip_ansi` is unchanged and still
+//!   serves every other caller (`box_holds_paste`, the compact/menu
+//!   detectors). #530 changed only what the orchestrator *reads*; #534 is the
+//!   first place a composed screen also informs what loomux *decides*, and it
+//!   does so through [`render_visible`] — see that function's doc for why the
+//!   two must not be confused.
 
 use std::collections::VecDeque;
 
@@ -375,13 +376,14 @@ pub fn render_screen(bytes: &[u8], cols: u16, rows: u16) -> String {
 /// ## Why this is a separate function and not a flag on the caller's side
 ///
 /// [`render_screen`] returns *history rows followed by on-screen rows, joined
-/// into one string*. Pointing `super::prompt_wait_detected` at that output
-/// would reproduce the exact bug #534 exists to fix: an answered question that
-/// scrolled off is still in the history half, so the detector keeps matching
-/// it — byte-ring behaviour with extra steps. The whole structural claim of
-/// #534 is *"a question that is no longer RENDERED is answered"*, and only a
-/// rendered-rows-only read can make it. Callers must not have to remember to
-/// slice the history off; there is nothing here to slice.
+/// into one string*. Pointing `orchestration::prompt_wait_detected` at that
+/// output would reproduce the exact bug #534 exists to fix: an answered
+/// question that scrolled off is still in the history half, so the detector
+/// keeps matching it — byte-ring behaviour with extra steps. The whole
+/// structural claim of #534 is *"a question that is no longer RENDERED is
+/// answered"*, and only a rendered-rows-only read can make it. Callers must
+/// not have to remember to slice the history off; there is nothing here to
+/// slice.
 ///
 /// ## What this can and cannot prove
 ///
@@ -391,7 +393,7 @@ pub fn render_screen(bytes: &[u8], cols: u16, rows: u16) -> String {
 /// against a blank grid (see *Deliberate limits* at the top of this module) —
 /// content painted before `bytes` begins and never repainted since is absent
 /// here and present there. A caller turning "absent" into an action owes that
-/// gap an argument; `super::question_shown` is the one that does.
+/// gap an argument; `orchestration::question_shown` is the one that does.
 pub fn render_visible(bytes: &[u8], cols: u16, rows: u16) -> String {
     replay(bytes, cols, rows, false).into_visible()
 }

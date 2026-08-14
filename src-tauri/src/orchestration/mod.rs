@@ -28,9 +28,17 @@ pub mod notify;
 pub mod profiles;
 pub mod queue;
 pub mod queuestate;
-pub mod report;
-pub mod termgrid;
 pub mod workflow;
+
+// MOVED to the `loomux-engine` crate (#888 slice A2), re-exported here under
+// their original paths so every call site — `orchestration::report::…`,
+// `orchestration::termgrid::…`, in this crate and in the integration suite —
+// resolves exactly as before. The move is what makes a headless daemon able to
+// link the orchestration core without Tauri; the re-export is what makes it a
+// pure relocation rather than a rename of fifty call sites. Read the modules in
+// crates/loomux-engine/src/. See doc/design/engine-extraction.md.
+pub use loomux_engine::report;
+pub use loomux_engine::termgrid;
 
 pub use groupid::{GroupId, GroupIdError};
 

@@ -1,6 +1,9 @@
 # The orchestration engine, as a crate that does not link Tauri (#888 slice A1
-# / #847 Phase 0). EMPTY on purpose at this slice — see src/lib.rs and
-# doc/design/engine-extraction.md for what arrives and in what order.
+# / #847 Phase 0). It landed empty and is filling up in batches: `report` and
+# `termgrid` live here as of slice A2 batch 1, re-exported from
+# `src-tauri/src/orchestration/mod.rs` under their original paths. See
+# src/lib.rs and doc/design/engine-extraction.md for what arrives next and in
+# what order.
 [package]
 name = "loomux-engine"
 # NOT the loomux release version, and deliberately not part of the seven
