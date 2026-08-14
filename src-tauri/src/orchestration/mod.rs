@@ -76,12 +76,21 @@ pub(crate) use loomux_engine::text::tail_snippet;
 // ahead of it. `self` keeps `orchestration::model::…` spellable alongside the
 // flat names every existing call site uses.
 //
-// `default_model`/`sanitize_model_opt` keep their `pub(crate)` reach rather than
-// following the engine's `pub`, the same choice `tail_snippet` got above: the
-// engine has to expose them to be callable across the crate boundary, and the
-// re-export is the one place that decision is still ours. `Role::prefix` and
-// `Role::as_str` had the same reach and cannot keep it — a method's visibility
-// is the defining crate's to set, and no re-export narrows it.
+// `default_model`/`sanitize_model_opt` were `pub(crate)` here, and the
+// `pub(crate) use` below keeps that reach for the FLAT spelling — the one every
+// call site in this crate uses. Say it that precisely, because the shorter
+// version ("the re-export keeps them `pub(crate)`") is wrong and was written
+// here first: the `self` on the line above re-exports the whole module
+// publicly, so every `pub` item in the engine's `model` is also reachable as
+// `orchestration::model::…`, these two included. That is forced — an item must
+// be `pub` in the engine to be callable from here at all — and harmless, since
+// `loomux-engine` is `publish = false` and "public" means reachable by a
+// sibling crate in this workspace, not a shipped API. Contrast `tail_snippet`
+// above, where the claim really is the narrow one: `text` has no module
+// re-export, only the single item, so no `orchestration::text::…` path exists.
+// `Role::prefix` and `Role::as_str` had the same reach and cannot keep even the
+// flat form — a method's visibility is the defining crate's to set, and no
+// re-export narrows it.
 pub use loomux_engine::model::{
     self, cli_can_host, cli_caps, CliCaps, Containment, Role, CLI_CAPS, CONTEXT_VARIANTS,
     EFFORT_LEVELS, SUPPORTED_CLIS,
@@ -114,8 +123,10 @@ pub use loomux_engine::{locks, profiles, workflow};
 // `workflow` method, so the function it calls had to be on the engine side or
 // the whole cluster stayed. `role_template` is unaffected — it loads the
 // fixture-pinned `templates/*.md` and stays. Re-exported `pub(crate)`, the same
-// choice `default_model` got: the engine has to expose it to be callable at
-// all, and this line is where the reach it has in THIS crate is still ours.
+// choice `default_model` got above — and carrying the same caveat stated there:
+// this line fixes the reach of the flat `orchestration::role_instructions_file`
+// spelling, not of the item, which the module re-export also exposes as
+// `orchestration::model::role_instructions_file`.
 pub(crate) use loomux_engine::model::role_instructions_file;
 
 use serde::{Deserialize, Serialize};

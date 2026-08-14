@@ -74,7 +74,6 @@
 //! have gone green forever while enforcing nothing. **Any future batch that
 //! moves a type a source-scanning test watches owes the same check**: ask where
 //! the violation can now be spelled, not where it used to be.
-
 //!
 //! A2 batch 3 — [`lessons`] (#268) and [`notify`] (#243), plus [`text`], which
 //! is what made them movable. Both modules were otherwise leaves; each had a
@@ -122,7 +121,16 @@
 //! rewrite that cost is one the compiler checks exhaustively. **Ask of every
 //! item on a moving type whether it is data or content**; the compiler will
 //! tell you about the rewrite, and nothing will tell you about the relocation.
-
+//!
+//! Batch 5 then split that pair, and the amendment belongs here rather than
+//! only in [`model`]: `role_template` stays (it loads the fixture-pinned bytes,
+//! which is what the paragraph above is actually about) and
+//! [`model::role_instructions_file`] came across (it loads nothing, and
+//! `workflow::Block` calls it from inside this crate). Read the rule as **ask
+//! it of each item, not of the pair** — batch 4 kept them together on the
+//! ground that "the name and the bytes are one mapping", and that pairing was
+//! the weaker half of its own argument.
+//!
 //! A2 batch 5 — the `workflow` CLUSTER: [`workflow`] (the
 //! `.loomux/workflow.yml` parser, its types, the merge-gate spec file and the
 //! capacity advice), [`profiles`] (the persona/profile loader and its
@@ -137,7 +145,10 @@
 //! joins because `LockTable::sync` is typed on `workflow::ResourcePolicy`.
 //!
 //! The line was drawn TIGHT. `mergeq` looked like a fourth member and is not:
-//! `workflow` names it once, in a doc link, and doc links do not make edges.
+//! every mention of it in `workflow` is prose — a doc link and two references
+//! in doc comments — and prose does not make an edge. What matters is that no
+//! `mergeq` path appears in a body, which is the thing to check; counting the
+//! mentions is neither necessary nor, as it turned out, easy to get right.
 //! `mqdriver` is `workflow`'s heaviest consumer and stays behind on purpose —
 //! it reaches the pane host (`capture_raw_with_timeout`), which is slice A3.
 //! **An inbound edge never blocks a move**, because the re-export answers it:

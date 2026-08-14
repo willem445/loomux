@@ -55,9 +55,29 @@
 //! expose, not merely whether it compiles. All four are total functions over a
 //! closed enum or a `&str`, with no state and no invariant a caller could
 //! violate by holding them. [`role_instructions_file`] joined them in batch 5
-//! on the same terms and for the same reason — `pub` here so `workflow` and
-//! `mod.rs` can both reach it, re-exported `pub(crate)` from `orchestration`
-//! so loomux's own public surface is unchanged.
+//! on the same terms and for the same reason — `pub` here so both `workflow`
+//! and `mod.rs` can reach it.
+//!
+//! **What a `pub(crate) use` on the other side does and does not buy**, because
+//! the convenient phrasing for this is wrong and was written twice before it
+//! was caught. `orchestration` re-exports these `pub(crate)`, which governs the
+//! FLAT spelling — `orchestration::default_model`,
+//! `orchestration::role_instructions_file`, the ones every existing call site
+//! uses — and nothing else. It does not narrow the item, because `mod.rs` also
+//! re-exports this whole module publicly (`pub use loomux_engine::model::{self,
+//! …}`), so every `pub` item here is reachable as `orchestration::model::…`
+//! too. `role_instructions_file` was `pub(crate)` before batch 5 and is
+//! publicly reachable by that path now. So the accurate claim is **"no existing
+//! spelling widened"**, not "the public surface is unchanged".
+//!
+//! That reachability change is forced and harmless, which is why the answer is
+//! to state it rather than to contort the re-export chasing a literal
+//! "unchanged". Forced: the function has to be `pub` here for `src-tauri`'s
+//! call sites to reach it at all, and `model::` was already a public re-export
+//! before this batch. Harmless: `loomux-engine` is `publish = false` — an
+//! internal workspace boundary, not a shipped library API — so "public" here
+//! means reachable by a sibling crate in this repo, not a compatibility promise
+//! to anyone outside it.
 
 use serde::Serialize;
 
@@ -126,10 +146,11 @@ impl Role {
         }
     }
     /// Lowercase wire/label name (matches the `Serialize` rename). Unlike
-    /// `role_template`/`role_instructions_file` (the two mappings that stayed in
-    /// `src-tauri`, see this module's doc), this one IS reached for a solo
-    /// member — `channel_member_label` formats it into the identity line every
-    /// channel message/notice carries.
+    /// `role_template` (which stayed in `src-tauri` with the templates it loads)
+    /// and [`role_instructions_file`] (which came here in batch 5 — see this
+    /// module's doc), this one IS reached for a solo member —
+    /// `channel_member_label` formats it into the identity line every channel
+    /// message/notice carries.
     pub fn as_str(self) -> &'static str {
         match self {
             Role::Orchestrator => "orchestrator",

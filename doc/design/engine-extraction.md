@@ -290,6 +290,11 @@ from a unit test of product code, agents are banned from running cargo locally
     mechanical failure the compiler enumerates and a silent one no test watches,
     take the loud one.
 
+    **Amended by batch 5** (below): `role_instructions_file` did not stay. It
+    loads no bytes, and `workflow::Block` calls it, so it followed `Role` into
+    the engine; `role_template` stays, and it is the one this section's argument
+    was ever about. The rule is asked of each item, not of the pair.
+
     Read this against batch 2 rather than instead of it — they are the same
     question answered in opposite directions. There, a source-scanning tripwire
     had to **follow** `GroupId` across the boundary, because the orphan rule
@@ -304,8 +309,23 @@ from a unit test of product code, agents are banned from running cargo locally
     `Role::prefix` and `Role::as_str` were `pub(crate)`; a method's visibility
     belongs to the crate defining the type, so no re-export narrows them back
     and they are public API now. `default_model` and `sanitize_model_opt` were
-    `pub(crate)` too, but they are free functions, so the re-export keeps them
-    `pub(crate)` on this side exactly as batch 3 did for `tail_snippet`.
+    `pub(crate)` too, but they are free functions, so the re-export keeps the
+    flat `orchestration::…` spelling `pub(crate)` on this side exactly as batch
+    3 did for `tail_snippet`.
+
+    **Corrected in batch 5, because the original wording here was wrong in a way
+    that would have compounded.** A `pub(crate) use` governs the *spelling it
+    re-exports*, not the item: `mod.rs` also re-exports the whole module
+    publicly (`pub use loomux_engine::model::{self, …}`), so every `pub` item in
+    the engine's `model` is reachable as `orchestration::model::…` regardless.
+    The claim that survives is **"no existing spelling widened"** — never "the
+    public surface is unchanged". The reachability change is forced (an item
+    must be `pub` in the engine to be callable from `src-tauri` at all) and
+    harmless (`loomux-engine` is `publish = false`, an internal workspace
+    boundary rather than a shipped API), and the right response to a forced,
+    harmless change is to state it, not to contort the re-export chasing a
+    literal "unchanged". Every batch after this one inherits the same shape, so
+    it is stated once, here.
 
     ### What it owed in evidence, and what it did not
 
@@ -367,8 +387,11 @@ from a unit test of product code, agents are banned from running cargo locally
     typed on `workflow::ResourcePolicy` in its body and its tests.
 
     The line was drawn tight, and the two near-misses are the useful part.
-    `mergeq` reads like a fourth member; `workflow` names it exactly once, in a
-    doc link, and **a doc link is not an edge**. `mqdriver` is `workflow`'s
+    `mergeq` reads like a fourth member; every mention of it in `workflow` is
+    prose — a doc link, and references inside doc comments — and **prose is not
+    an edge**. The check that decides the question is "does a `mergeq` path
+    appear in a body?", not "how many times is it named"; the first draft of
+    this paragraph asserted a count and got it wrong. `mqdriver` is `workflow`'s
     heaviest consumer and stays behind deliberately — it reaches
     `capture_raw_with_timeout`, i.e. the pane host, which is slice A3. That one
     is worth stating as a rule because it is the intuition that misleads:
