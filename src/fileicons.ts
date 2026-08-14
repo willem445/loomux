@@ -108,15 +108,18 @@ export function iconCategory(filename: string): IconCategory {
 // only way a tree of two hundred rows stays scannable.
 //
 // Lucide has no per-language marks, and inventing one per language is how an
-// icon set ends up carrying somebody else's brand: `rust` takes the gear (its
-// toolchain is the thing you actually interact with, and the glyph it replaces
-// was already a gear) and `python` takes the run glyph, which is what a script
-// is for. If that ever reads wrong, change the NAME here — never the artwork.
+// icon set ends up carrying somebody else's brand. So the languages take the
+// nearest honest metaphor instead: `rust` a crate, `python` the run glyph
+// (a script is a thing you run), `shell` a terminal. They were also chosen for
+// weight — a 14px row is roughly seven strokes' worth of legibility, which is
+// why the gear glyph this replaced lost: its tick marks go sub-pixel and the
+// whole mark turns to mud in a dense tree. If one ever reads wrong, change the
+// NAME here — never the artwork.
 export const CATEGORY_ICON: Record<IconCategory, IconName> = {
   folder: "folder",
   "folder-open": "folder-open",
   code: "file-code",
-  rust: "file-cog",
+  rust: "file-box",
   python: "file-play",
   json: "file-braces",
   markdown: "file-type",

@@ -117,7 +117,7 @@ export type IconName =
   | "arrow-up"
   | "paperclip"
   | "file-code"
-  | "file-cog"
+  | "file-box"
   | "file-play"
   | "file-terminal"
   | "globe"
@@ -163,7 +163,7 @@ export const ICON_ROLE: Record<IconName, IconRole> = {
   // source — the languages loomux's users actually run agents over, plus the two ways in.
   // `globe` is markup and `palette` is stylesheets: both are authored, so both are source.
   "file-code": "source",
-  "file-cog": "source",
+  "file-box": "source",
   "file-play": "source",
   "file-terminal": "source",
   globe: "source",
@@ -213,7 +213,7 @@ const BODY: Record<IconName, string> = {
   "arrow-up": `<path d="m5 12 7-7 7 7" /><path d="M12 19V5" />`,
   paperclip: `<path d="m16 6-8.414 8.586a2 2 0 0 0 2.829 2.829l8.414-8.586a4 4 0 1 0-5.657-5.657l-8.379 8.551a6 6 0 1 0 8.485 8.485l8.379-8.551" />`,
   "file-code": `<path d="M6 22a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.704.706l3.588 3.588A2.4 2.4 0 0 1 20 8v12a2 2 0 0 1-2 2z" /><path d="M14 2v5a1 1 0 0 0 1 1h5" /><path d="M10 12.5 8 15l2 2.5" /><path d="m14 12.5 2 2.5-2 2.5" />`,
-  "file-cog": `<path d="M15 8a1 1 0 0 1-1-1V2a2.4 2.4 0 0 1 1.704.706l3.588 3.588A2.4 2.4 0 0 1 20 8z" /><path d="M20 8v12a2 2 0 0 1-2 2h-4.182" /><path d="m3.305 19.53.923-.382" /><path d="M4 10.592V4a2 2 0 0 1 2-2h8" /><path d="m4.228 16.852-.924-.383" /><path d="m5.852 15.228-.383-.923" /><path d="m5.852 20.772-.383.924" /><path d="m8.148 15.228.383-.923" /><path d="m8.53 21.696-.382-.924" /><path d="m9.773 16.852.922-.383" /><path d="m9.773 19.148.922.383" /><circle cx="7" cy="18" r="3" />`,
+  "file-box": `<path d="M14 2v5a1 1 0 001 1h5" /><path d="M14.692 22H18a2 2 0 002-2V8a2.4 2.4 0 00-.706-1.706l-3.588-3.588A2.4 2.4 0 0014 2H6a2 2 0 00-2 2v3.804" /><path d="M2.264 13.752 7 16.5l4.737-2.748" /><path d="M2.995 13.014A2 2 0 002 14.744v3.516a2 2 0 00.996 1.73l3 1.74a2 2 0 002.008 0l3-1.74A2 2 0 0012 18.26v-3.517a2 2 0 00-.995-1.73l-3-1.742a2 2 0 00-1.892-.064z" /><path d="M7 16.5V22" />`,
   "file-play": `<path d="M6 22a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.704.706l3.588 3.588A2.4 2.4 0 0 1 20 8v12a2 2 0 0 1-2 2z" /><path d="M14 2v5a1 1 0 0 0 1 1h5" /><path d="M15.033 13.44a.647.647 0 0 1 0 1.12l-4.065 2.352a.645.645 0 0 1-.968-.56v-4.704a.645.645 0 0 1 .967-.56z" />`,
   "file-terminal": `<path d="M6 22a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.704.706l3.588 3.588A2.4 2.4 0 0 1 20 8v12a2 2 0 0 1-2 2z" /><path d="M14 2v5a1 1 0 0 0 1 1h5" /><path d="m8 16 2-2-2-2" /><path d="M12 18h4" />`,
   globe: `<circle cx="12" cy="12" r="10" /><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20" /><path d="M2 12h20" />`,
