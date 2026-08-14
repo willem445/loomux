@@ -142,7 +142,7 @@ impl Role {
             // structurally removed rather than merely discouraged. Its shell
             // stays whole: running the tests and `gh pr checkout <n> --detach`
             // ARE the job (see `Containment::NoEdits` for what that costs).
-            Role::Reviewer => Containment::NoEdits,
+            Role::Reviewer => Containment::None,
             Role::Planner => Containment::ReadOnly,
             // Solo panes never traverse `spawn_agent_ex`/`build_agent_command`
             // (see the variant's doc) — an arbitrary human-launched CLI loomux
