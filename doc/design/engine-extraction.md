@@ -320,19 +320,38 @@ from a unit test of product code, agents are banned from running cargo locally
       against `tests/fixtures/pre222/`, which covers the file *name* and the
       template *bytes* for every class that has them. The free-function rewrite
       cannot silently mis-map a role without reddening it.
-    - `Role`'s **serde form** was not, per variant. The integration suite reaches
-      it only through `list_agents`, and only for the three classes it happens to
-      spawn and read back — `Orchestrator` and `Solo` had no wire assertion
-      anywhere, so a rename on either would have changed what every future
-      `agents.json` records while the whole suite stayed green. Nor did anything
-      enforce `as_str`'s own claim to "match the `Serialize` rename", though
-      `session_roles` records a class through one producer and `list_agents`
-      emits it through the other.
+    - `Role`'s **serde form** was pinned for four of five variants, and the way
+      that got established is the part worth keeping. The first draft of this
+      batch asserted that `Orchestrator` had no wire coverage; a planted
+      `#[serde(rename)]` on it **disproved that** by reddening
+      `sessions_backfill_from_audit_when_roster_predates_it`, which deletes
+      `agents.json` and reads the class back out of the audit log — written
+      through the same `Serialize`. `list_agents` covers the other three.
+      **`Solo` is the only variant nothing reached**, and it is the one a
+      rename would hurt most quietly, since a solo pane never traverses a spawn.
+    - Nothing enforced `as_str`'s own claim to "match the `Serialize` rename",
+      though `session_roles` records a class through one producer while
+      `list_agents` emits it through the other.
 
-    So the gap got the test, not a paragraph: `model`'s inline unit tests pin
-    all five variants against a literal wire table (a third party to both
-    producers, since deriving either from the other pins nothing), and the
-    containment tier per class alongside them.
+    So the gap got the test and the rest did not: `model` pins all five variants
+    against a literal wire table (a third party to both producers, since
+    deriving either from the other pins nothing) and pins `as_str` against the
+    same table. A containment-tier table test was written and then **deleted** —
+    `every_capability_class_pins_its_deny_tier` already asserts that mapping,
+    and the plant that should have evidenced a new copy reddened it plus five
+    spawn-path tests instead.
+
+    Two process findings this batch paid for, both worth having:
+
+    1. **`cargo test` stops at the first failing target, and this crate's
+       targets run after `src-tauri`'s.** So a plant that reddens anything in
+       `src-tauri` prevents the engine's unit tests from running at all — the
+       red says nothing about them. Every plant meant to evidence an engine test
+       has to be one the rest of the suite does *not* catch, and the proof that
+       it was is the `src-tauri` targets passing in the same run.
+    2. **CI runs `npm test` before `cargo test`.** A batch that breaks a
+       frontend test therefore cannot produce Rust red evidence at all until
+       that is fixed, because the job never reaches the compiler.
   - **`digest` is not a leaf** despite reading like one. It calls
     `crate::sessions::yaml_field` and takes a `crate::opencodedb::TranscriptRow`
     — two modules staying in `src-tauri` — so it cannot move until those edges

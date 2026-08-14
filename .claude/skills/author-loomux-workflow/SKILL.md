@@ -176,7 +176,7 @@ hand there is no such rail, so this is it:
 | `gemini` | **none** | **none** | its thinking level is a settings-file key whose schema is unverified, so loomux does not write it; its window is model-determined |
 
 **This table is a snapshot; `CliCaps` is the truth.** The rows come from
-`CLI_CAPS` in `src-tauri/src/orchestration/mod.rs`, which the `agent_cli_knobs`
+`CLI_CAPS` in `crates/loomux-engine/src/model.rs`, which the `agent_cli_knobs`
 Tauri command serves to the launcher — same source, so the launcher's greyed-out
 select and `parse_workflow`'s refusal can never disagree. A knob gets wired on a
 new CLI by adding values to that row, and this table is then stale. If the two

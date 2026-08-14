@@ -591,17 +591,23 @@ mod tests {
         (Role::Solo, "solo"),
     ];
 
-    /// `Role`'s serde form is `rename_all = "lowercase"`, and this is what
-    /// makes that attribute load-bearing rather than decorative.
+    /// `Role`'s serde form is `rename_all = "lowercase"`, and this states it
+    /// per variant in one place instead of leaving it to whichever behavioural
+    /// test happens to round-trip a class.
     ///
-    /// The integration suite reaches this representation only through
-    /// `list_agents`, and only for the three classes it happens to spawn and
-    /// read back (`a["role"] == "worker" | "reviewer" | "planner"` in
-    /// `src-tauri/tests/orchestration.rs`). `Orchestrator` and `Solo` have no
-    /// such assertion anywhere: an `#[serde(rename = "…")]` on either variant
-    /// would change what every future `agents.json` records for it and the
-    /// whole suite would stay green. That gap is per-variant, so it needs a
-    /// per-variant pin.
+    /// Be precise about how much of this the integration suite already had,
+    /// because most of it did. `list_agents` assertions pin `worker`,
+    /// `reviewer` and `planner`, and `sessions_backfill_from_audit_when_roster_
+    /// predates_it` pins `orchestrator` — it deletes `agents.json` and reads the
+    /// class back out of the **audit log**, which is written through this same
+    /// `Serialize`. A planted `#[serde(rename)]` on `Orchestrator` reddens that
+    /// test, and it is not this one's to claim.
+    ///
+    /// `Solo` is the variant nothing reached, and the one this test is really
+    /// for. It is also the variant whose wire name is least likely to be
+    /// noticed: a solo pane is a `__solo__` pseudo-group member that never
+    /// traverses a spawn, so a rename on it would change what every future
+    /// `agents.json` records while every behavioural test stayed green.
     #[test]
     fn every_role_variant_serializes_to_its_documented_lowercase_wire_name() {
         for (role, want) in WIRE_NAMES {
@@ -637,30 +643,13 @@ mod tests {
         }
     }
 
-    /// The containment ladder, per class. `Role::containment` is the security
-    /// spine of #222 — a workflow file selects a class and can never select a
-    /// tier — so the mapping is asserted here as a table rather than left to
-    /// whichever spawn-path test happens to observe a deny flag.
-    ///
-    /// The `Solo` row is the one worth naming: it is `None`, and that is a
-    /// statement about reachability (a solo pane never traverses a loomux
-    /// spawn) rather than a grant. If `Solo` ever *does* reach a spawn path,
-    /// this row is where the decision has to be made deliberately.
-    #[test]
-    fn every_role_variant_maps_to_its_documented_containment_tier() {
-        let want = [
-            (Role::Orchestrator, Containment::None),
-            (Role::Worker, Containment::None),
-            (Role::Reviewer, Containment::NoEdits),
-            (Role::Planner, Containment::ReadOnly),
-            (Role::Solo, Containment::None),
-        ];
-        for (role, tier) in want {
-            assert_eq!(role.containment(), tier, "{role:?} changed containment tier");
-        }
-        // And the ladder the gate compares on is ordered, since `cli_can_host`
-        // is one `rank()` comparison and nothing else.
-        assert!(Containment::None.rank() < Containment::NoEdits.rank());
-        assert!(Containment::NoEdits.rank() < Containment::ReadOnly.rank());
-    }
+    // No containment-tier table test here, deliberately. One was written and
+    // then removed: `src-tauri/tests/orchestration.rs`'s
+    // `every_capability_class_pins_its_deny_tier` already asserts exactly that
+    // mapping, and a planted `Role::Reviewer => Containment::None` reddens it
+    // plus five spawn-path tests. A second copy in this crate would have been a
+    // duplicated mechanism whose only red is one another test already produces
+    // — and it can never be the FIRST thing to fail, since cargo runs the
+    // `src-tauri` targets before this crate's and stops at the first failing
+    // one.
 }
