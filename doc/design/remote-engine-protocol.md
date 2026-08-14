@@ -1,17 +1,35 @@
 # Remote engine: the wire protocol and its security model
 
-Issue #888, slice B1 of plan-463. **Status: PROPOSED — this note is a gate.**
-Nothing server-side (tracks C, D and E of that plan) starts until the human has
-answered §1 and approved this document.
+Issue #888, slice B1 of plan-463. **Status: RESOLVED — the human answered every
+open decision on 14 Aug. The prototype build is unblocked.**
 
-It ships *before* any listener code exists, deliberately. The protocol is a
-public wire contract, and — more to the point — the security argument here **is**
-the design rather than a hardening pass bolted on afterwards. A listener written
-first and secured second is a listener secured under schedule pressure, in the
-same PR as the thing that made it urgent.
+The shape that answer took matters more than any individual choice, so it goes
+first: **v1 is a prototype with no authentication layer at all.** Its trust
+boundary is not a credential but a deployment fact — an SSH tunnel to a local
+workstation. Authentication, TLS, multi-user identity and everything built on
+them move to a **documented hardening track** (§1.3) rather than gating the first
+end-to-end.
 
-Reading order: **§1 is the only part that needs an answer today.** §2 is the
-premise, and everything from §3 down follows from it.
+This note therefore does two jobs at once, and every section says which it is in:
+
+- **The v1 spec** — what the prototype builds now, including the parts of the
+  security model that stay in because they are cheap and still load-bearing
+  (server-declared path roots, the command roster, and the two controls in §1.2
+  that make "SSH to a workstation" an actual boundary instead of an assumption).
+- **The hardening spec** — the auth model (§6) and the threat model (§7) kept
+  whole, as the roadmap out of the prototype. They are not deleted and not
+  softened. §7.0 is the table that says, per threat, what v1 actually closes and
+  what it knowingly leaves open.
+
+It still ships *before* any listener code exists, and that is still deliberate:
+the protocol is a public wire contract. What changed is that the security
+argument is now a **staged** design rather than a precondition — with the stage
+written down, so nobody has to reconstruct later which risks were accepted on
+purpose.
+
+Reading order: **§1 is the decision record.** §2 is the premise the whole design
+rests on and is unchanged — read it before §1.3, because it is what the accepted
+risk is a risk *of*.
 
 Prior art this builds on rather than restates: the architecture proposal and the
 build plan on #888 itself, `doc/design/groupid-and-path-roots.md` (#904, layer 2
@@ -23,44 +41,117 @@ escape), `doc/design/lock-resources.md` (#858) and `doc/design/ssh-panes.md`
 
 ---
 
-## 1. Decisions this note needs from the human
+## 1. The decision record
 
-Nine decisions. Each is one the design cannot make for itself: it either sizes a
-slice, picks a dependency, or sets a policy that is the human's to set. The
-recommendation column is what this note would pick absent an answer, and the
-"blocks" column names what stays parked until the answer lands.
+### 1.1 What was decided
 
-They are numbered **H1–H9** — "H" for human — precisely so they never read as
-plan-463's track-D slice ids, which are also called D1 and D2. Anywhere below
-that a track-D slice is meant, it is written out as "track-D slice D1".
+Nine decisions, all answered 14 Aug. They keep their **H1–H9** numbering — "H"
+for human — because that numbering is what the PR, the issue thread and this
+note all refer to, and because it never reads as plan-463's track-D slice ids,
+which are also called D1 and D2. Anywhere a track-D slice is meant, it is written
+out as "track-D slice D1".
 
-| # | Decision | Options | Recommendation | Blocks |
-|---|---|---|---|---|
-| **H1** | **Auth mechanism** — where user identity comes from | (a) built-in store: loomux mints users, hashes passwords, issues connection sessions; (b) delegated identity: an identity-aware proxy (OIDC / SSO / Tailscale / Authelia) authenticates and loomux consumes a verified identity, mapping it to roles; (c) VPN + mTLS client certificates | **(b)** if the team already runs any IdP or identity proxy — loomux then stores **no credentials at all**, and SSO/MFA/offboarding are someone else's solved problem. **(a)** only if there is no IdP; it costs C1 roughly one to two extra weeks and gives loomux a permanent password-storage surface. §6.1 defines an `Identity` seam so this choice does not rewrite C1 either way | **C1** (server skeleton + auth) — cannot start |
-| **H2** | **TLS termination** | reverse proxy vs native TLS in the daemon | **Reverse proxy.** Battle-tested, zero TLS code and zero cert-rotation logic in loomux, and it is the same box that terminates H1(b). Native TLS is a v2 answer for a deployment with no proxy | C1 shape, E1 docs |
-| **H3** | **Remote filesystem exposure** (proposal §11 Q3) | server-declared roots only for `ft_*`/`fm_*` (registered repos, worktrees, group dirs) vs full server-FS browsing for an owner-tier caller | **Server-declared roots only.** An owner-tier escape hatch can be added later behind an explicit config opt-in; it cannot be *removed* later | #925 scope, C2 roster |
-| **H4** | **Reattach scrollback contract** (Q4) | live screen + 256 KiB ring tail vs persisted scrollback on disk | **Live screen + tail** for v1. Persisted scrollback changes the server's storage design (retention, disk budget, per-pane files) and is a feature in its own right | C5 |
-| **H5** | **One container per workspace session** | v1-blocking vs fast-follow after E1 (docker-ready packaging) | **Fast-follow.** Containers are defence in depth *over* §7's process-level validation, never a replacement for it (T8), so gating the first end-to-end on E2 buys no security and costs months | E2 scheduling |
-| **H6** | **Protocol sign-off** | confirm one authenticated WebSocket per client (§3) | **Confirm now**, so this note describes one protocol instead of three | C2, track-D slice D1 fixtures |
-| **H7** | **Hosting facts** (not guessable) | who administers the server; where it sits (cloud / on-prem / office LAN); expected concurrent users; the Pi testbed network's subnet, addressing and discovery story | — | E1 docs, §8 |
-| **H8** | **What a "session" is, plus its visibility default and lifecycle** | first: is a **workspace session** one orchestration group + its checkout, or something spanning several groups? then: is a new one **team** or **private** by default; may private be promoted to team; may team be demoted to private; who may do either? | **One group + its checkout** (§6.0 — it reuses the boundary that already carries membership, audit, MCP scoping and path scoping instead of adding a fourth). **Private by default, promote-only, the creator promotes.** Demotion cannot un-see what teammates already saw, so it is a lie unless it also ends the workspace session | §6.0, §6.4, C1 data model |
-| **H9** | **Whose credentials do server-side agents act as?** — `gh` auth, agent-CLI subscriptions, push rights | one shared service account for the daemon vs per-user credentials injected per session | **Decide before C3.** This is not a detail: today an agent pushes as *the human sitting at the machine*, and on a shared server every agent's commit, push and PR is attributable to whatever the daemon holds. A shared service account is simplest and makes the audit log the only per-user attribution there is; per-user credentials preserve attribution but need a secret store loomux does not have | C3, E2 |
+The "v1?" column is the one to read while building: it says whether the decision
+lands in the prototype or in the hardening track.
+
+| # | Decision | Resolved as | v1? |
+|---|---|---|---|
+| **H1** | **Auth mechanism** | **No authentication layer in v1.** The trust boundary is a deployment fact — SSH to a local workstation — not a credential. The whole identity design (§6) moves to the hardening track. §1.2 and §1.3 are the terms of that, and they are the most important paragraphs in this note | **deferred** |
+| **H2** | **TLS termination** | **Reverse proxy** when it lands — no TLS code or cert rotation in loomux, ever. Deferred alongside H1: an SSH tunnel already carries the transport encryption a local prototype needs, and terminating TLS in front of an unauthenticated socket would protect the wire while leaving the door open, which is theatre | **deferred** |
+| **H3** | **Remote filesystem exposure** (proposal Q3) | **Server-declared roots only.** `ft_*`/`fm_*` resolve against registered repos, worktrees and group dirs; an arbitrary client-supplied absolute root is refused. **Stays in v1** — an escape hatch can be added later, never removed later | **v1** |
+| **H4** | **Reattach scrollback contract** (Q4) | **Live screen + 256 KiB ring tail.** Persisted scrollback would change the server's storage design and is a feature in its own right | **v1** |
+| **H5** | **One container per workspace session** | **Fast-follow**, not v1-blocking. Containers are defence in depth *over* §7's process-level validation, never a replacement (T8) | fast-follow (E2) |
+| **H6** | **Protocol** | **Confirmed: one WebSocket per client**, three frame kinds (§3, §4). The prototype's socket is simply an *unauthenticated* one — the framing, the handshake and the roster are unchanged, so adding auth later is an additive change to the handshake, not a new protocol | **v1** |
+| **H7** | **Hosting facts** | **Still open, and deliberately not guessed.** Servers are local workstations to begin with, which is what makes §1.2's boundary hold. Administration, the eventual real host, and the Pi network's subnet/addressing/discovery remain TBD from the human — they are inputs to E1's deployment docs and §8.2, not to the prototype | TBD |
+| **H8** | **What a workspace session is** | **Confirmed: one orchestration group plus its checkout.** It reuses the boundary that already carries membership, audit, MCP token scoping and `GroupId` path scoping instead of inventing a fourth. The team/private *visibility* model (§6.4) needs identities to mean anything, so it defers with H1 | **v1** (the unit) / deferred (visibility) |
+| **H9** | **Whose credentials do server-side agents act as?** | **A bot/service account is the target direction** — possibly reached later through a web or desktop `gh`-CLI auth flow. **For now: one normal single user account**, which is the status quo and identical to today's behaviour. **Per-user own-GitHub credentials are explicitly not the direction** and are ruled out rather than deferred | status quo now, service account later |
 
 **#857 (repo split / licensing) stays HELD.** This design takes no dependency on
 it and blocks none of its outcomes; if the engine crate boundary later becomes a
 licensing boundary, `loomux-server` sits on the licensed side. Flagged, not
 depended on.
 
-Decisions already made by the human on #888, carried here so the note is
+Standing decisions from earlier on #888, carried here so the note is
 self-contained: **Linux-only daemon** (desktop client stays cross-platform);
-**multi-user connection-session auth from day one** (a team connects, dispatches and
-observes concurrently — the single-operator pairing-token envelope is off the
-table); **desktop client first, browser client eventually, same wire**;
+**desktop client first, browser client eventually, same wire**;
 **detach/reattach on the fly is a hard acceptance criterion**, not crash
 recovery; **docker-ready host** with eventual per-workspace-session isolation and
 **Pi-testbed egress**; **team vs private workspace sessions** as a first-class
-authorization dimension. (Those last two are the human's own words; §6.0 pins
-down which of the three meanings of "session" they carry.)
+authorization dimension. (The last two are the human's own words; §6.0 pins down
+which of the three meanings of "session" they carry.)
+
+One earlier decision is **superseded**, and is called out rather than quietly
+dropped: "multi-user connection-session auth from day one" was the answer to the
+proposal's Q2. H1 replaces it. Multi-user auth remains the *destination* — §6 is
+still written for a team — but it is no longer day one, and no slice waits on it.
+
+### 1.2 The v1 trust boundary, and the two controls that make it real
+
+The prototype's security rests on reachability rather than identity: the daemon
+runs on a local workstation and is reached through an SSH tunnel. That is a
+coherent boundary, and it is how a great many local dev services are run.
+
+It is only coherent if two things are actually true of the code, and neither is
+free-by-assumption — so both are **v1 requirements**, not recommendations:
+
+1. **The listener binds loopback (or a unix socket) and refuses a routable
+   interface** unless an explicit, loudly-named flag says otherwise. "We assume
+   people will tunnel" is not a boundary; a bind address is. A daemon that
+   defaults to `0.0.0.0` has no boundary at all the first time someone runs it on
+   a laptop in a café, and the failure is silent — it works exactly as well,
+   right up until it is catastrophic.
+2. **`Origin` is checked on the WebSocket upgrade, and browser-originated
+   connections are refused.** This is the hole the SSH boundary does **not**
+   close, and it is worth being precise about because it is easy to miss: the
+   tunnel keeps *network peers* out, but a web page the human visits in their own
+   browser, on that same workstation, can open a WebSocket to `localhost` — and
+   loopback-only binding does nothing against it. Against an unauthenticated
+   socket with `spawn_pty` on the roster (§2), that is drive-by remote code
+   execution from a malicious ad. The `Origin` check was already in this design
+   (§4.1) for the future browser client; it costs nothing and it is the one
+   control that must **not** defer with the rest of the auth work.
+
+Both are cheap, both belong to C2 (the listener slice), and together they are
+what makes "SSH to a workstation" a boundary rather than a hope.
+
+### 1.3 The accepted risk, stated plainly
+
+This note argues in §2 that a naive port of the command surface over a socket is
+"an unauthenticated remote-code-execution service that happens to also show
+terminals". That argument is not withdrawn, because it is correct: with no
+authentication, **anything that can reach the socket has the full wire surface,
+which includes `spawn_pty` (arbitrary command execution, by design), file read
+and write, and the grant files behind the merge gate.**
+
+The human has accepted that risk for a prototype whose reachability is bounded by
+§1.2. Recorded explicitly, because an accepted risk that is not written down
+becomes an unexamined one:
+
+- **What is accepted:** no authentication, no authorization tiers, no per-user
+  identity, no TLS, no revocation, no rate limiting, and an audit log that cannot
+  attribute an action to a person.
+- **On what basis:** the daemon is reachable only from the workstation it runs on,
+  plus whoever holds SSH access to that workstation — a set that today is one
+  person, and whose members already have shell on the box and therefore already
+  have everything the socket would give them. *This is the crux of why the risk is
+  acceptable: against that specific population the socket grants no privilege its
+  callers do not already hold.*
+- **What that basis depends on:** §1.2 exactly. The moment the daemon binds a
+  routable interface, or is reached by anything other than SSH from a trusted
+  workstation, this argument stops holding — not gradually, but immediately and
+  completely.
+- **What must therefore be true before the prototype outlives its boundary:**
+  the hardening track (§6, §7) lands *before* the first non-workstation
+  deployment, before the first additional user, and before any browser client.
+  §7.0 is the checklist.
+
+Two things stay in v1 despite the deferral, because they are cheap now and
+expensive to retrofit: **path-root validation** (#904, #925 — a connected client
+must not escape the server-declared roots even when it is trusted to connect) and
+**command-roster classification** (§5 — default-deny). Neither depends on knowing
+*who* is calling, which is precisely why neither needs to wait for auth. They are
+also the two that would be most tempting to skip "until auth lands", and the two
+whose absence would be hardest to notice.
 
 ---
 
@@ -115,11 +206,16 @@ for any of them.
 
 ---
 
-## 3. Transport: one authenticated WebSocket per client
+## 3. Transport: one WebSocket per client
 
-**Decision (pending H6): one authenticated WebSocket connection per client**,
-carrying three frame kinds — JSON RPC frames, JSON event frames, and **binary**
-PTY frames.
+**Decided (H6): one WebSocket connection per client**, carrying three frame
+kinds — JSON RPC frames, JSON event frames, and **binary** PTY frames.
+
+The design target is one *authenticated* connection, and §4/§6 are written that
+way. **v1's is unauthenticated** (H1): same framing, same handshake, same roster,
+minus the credential. That is deliberate and it is why the deferral is cheap —
+adding auth later adds a field to the hello exchange and a check in front of the
+dispatcher, not a new protocol and not a re-write of either side.
 
 WebSocket is very nearly forced rather than chosen:
 
@@ -154,26 +250,32 @@ Rejected, with reasons, so the question stays answered:
 ### 4.1 Connection lifecycle
 
 ```
-  TCP → TLS (terminated per H2)
-      → HTTP upgrade   ← Origin check, credential presented here
+  TCP (bound loopback / unix socket — v1, §1.2)
+      → TLS (terminated per H2 — hardening track, not v1)
+      → HTTP upgrade   ← Origin check [v1], credential presented here [hardening]
       → server hello   ← protocol version, capabilities, command roster, identity
       → ready          ← RPC / event / PTY frames, full duplex
 ```
 
-Two rules at the upgrade, both cheap now and load-bearing the day a browser
-client exists:
+Three rules at the upgrade. The first is v1 and non-negotiable; the other two
+describe the authenticated design:
 
+- **`Origin` is checked on upgrade, and browser-originated connections are
+  refused — in v1** (§1.2). A browser will happily let any page open a cross-site
+  WebSocket; `Origin` is the only defence. Against v1's *unauthenticated* socket
+  this stops being a future-proofing nicety and becomes the control that closes
+  the one hole an SSH tunnel leaves open — a page in the human's own browser
+  reaching `localhost`.
 - **Credentials travel in a header or the handshake body, never in the URL.**
-  Query strings land in proxy logs, browser history and `Referer`.
-- **`Origin` is checked on upgrade, from day one.** A browser will happily let
-  any page open a cross-site WebSocket carrying the user's cookies; `Origin` is
-  the only defence, and retrofitting it after the web client ships means
-  shipping the vulnerable window first.
-
-Authentication happens **at the upgrade, before the socket is considered
-established** — not on the first RPC frame. An unauthenticated peer must never
-reach a state where it can send a frame the dispatcher looks at (§7 T6: nothing
-expensive happens before authentication).
+  Query strings land in proxy logs, browser history and `Referer`. (Moot in v1;
+  there are no credentials.)
+- **Authentication happens at the upgrade, before the socket is considered
+  established** — not on the first RPC frame. An unauthenticated peer must never
+  reach a state where it can send a frame the dispatcher looks at (§7 T6: nothing
+  expensive happens before authentication). **Not in v1**: every peer that
+  connects is, by construction, unauthenticated and dispatches freely. That is
+  the accepted risk of §1.3, and the shape of the eventual check is stated here
+  so C2's dispatcher is built with the seam in the right place.
 
 ### 4.2 Frame kinds
 
@@ -226,18 +328,25 @@ caller's role and derives the `human` flag (§6.3), and no second place to forge
   "protocol": 1,
   "engine_id": "…",              // stable per daemon install
   "server_version": "0.9.3",
-  "identity": { "user": "…", "session": "…", "role": "operator" },
+  "identity": { "user": "…", "session": "…", "role": "operator" },  // OMITTED in v1
   "capabilities": { "reveal": false, "open_with": false, "delete_mode": "permanent",
                     "persisted_scrollback": false, "containers": false },
   "commands": [ "orch_tasks", "write_pty", … ]   // the caller's roster, role-filtered
 }
 ```
 
+**v1 omits `identity` entirely** rather than sending a placeholder. A field
+carrying `"user": "local"` would be a claim the daemon cannot support, and the
+client would grow code that reads it as though it meant something; an absent
+field makes "there is no identity here" unambiguous, and §4.4's ignore-what-you-
+do-not-know rule means adding it later is additive. `commands` is present in v1
+and unfiltered, since there are no roles to filter by.
+
 `commands` is the **authority for feature detection** — not the version number.
 A client asks "is `fm_reveal` in my roster?", never "am I talking to ≥ 0.9.3?".
 That is what makes additive evolution safe, and it is also why the roster is
-role-filtered: a viewer's client can grey out what it genuinely cannot do
-without a round trip that would just fail.
+role-filtered once roles exist: a viewer's client can grey out what it genuinely
+cannot do without a round trip that would just fail.
 
 `capabilities` generalizes the mechanism that already exists rather than
 inventing a second one: `fm_capabilities` returns `Caps { delete_mode, open_with,
@@ -275,16 +384,22 @@ One closed set of codes. The point of a closed set is that the client can branch
 on behaviour (reconnect? re-login? show the user?) without string-matching, and
 that a reviewer can check the dispatcher never invents a fall-through.
 
-| code | meaning | client behaviour |
-|---|---|---|
-| `unauthenticated` | no valid connection session (missing, invalid, expired, revoked) | drop to the login/connect screen |
-| `unauthorized` | authenticated, role too low for this command | surface; do not retry |
-| `not_found` | the named thing does not exist **or the caller may not know it does** | surface as absent |
-| `invalid_argument` | server-side validation refused (a `GroupId::parse` failure, an out-of-root path) | bug in the client or a hostile peer; log, do not retry |
-| `unsupported_command` | the command name is not on this caller's roster | bug in the client; do not retry |
-| `unsupported_version` | handshake only | tell the human to update |
-| `rate_limited` | connection or login throttle | back off |
-| `internal` | anything else | surface generically; details go to the server log, never the wire |
+The set is defined whole now and **kept whole in v1**, including the two codes a
+prototype can never emit. Adding a code later is an additive protocol change the
+client must already tolerate (§4.4), but a client written against a set that
+never mentioned `unauthenticated` is a client whose reconnect logic has nowhere
+to hang — and that logic is the expensive part, not the code.
+
+| code | meaning | client behaviour | v1 |
+|---|---|---|---|
+| `unauthenticated` | no valid connection session (missing, invalid, expired, revoked) | drop to the login/connect screen | never emitted |
+| `unauthorized` | authenticated, role too low for this command | surface; do not retry | never emitted |
+| `not_found` | the named thing does not exist **or the caller may not know it does** | surface as absent | emitted (existence only) |
+| `invalid_argument` | server-side validation refused (a `GroupId::parse` failure, an out-of-root path) | bug in the client or a hostile peer; log, do not retry | **emitted — this is T2 in v1** |
+| `unsupported_command` | the command name is not on this caller's roster | bug in the client; do not retry | **emitted — this is default-deny in v1** |
+| `unsupported_version` | handshake only | tell the human to update | emitted |
+| `rate_limited` | connection or login throttle | back off | never emitted |
+| `internal` | anything else | surface generically; details go to the server log, never the wire | emitted |
 
 The `not_found` row is a security decision, not tidiness. A private workspace
 session a caller may not see returns `not_found`, **never** `unauthorized` — otherwise the
@@ -346,6 +461,16 @@ maintained by good intentions is the version that does not.
 | **retargeted** | the server computes, the client acts (URLs) |
 
 ### 5.3 Role tiers
+
+> **Deferred with H1.** v1 has no tiers: with no identity there is nobody to
+> assign one to, so every wire command is reachable by whoever holds the socket.
+> The classification below is still written down now, and the tier column in §5.4
+> is still filled in, for a reason that is not bookkeeping: **the classification
+> is the cheap half and the enforcement is the expensive half.** Deciding
+> `orch_grant_merge` is owner-tier costs a table cell today; discovering it was
+> never marked, after a year of commands landing without anyone asking, costs an
+> audit of 141 of them. The roster ships in v1 (§5.1); the tier column is the
+> hardening track reading from a table that was kept current all along.
 
 Three tiers, ordered: **viewer** ⊂ **operator** ⊂ **owner**.
 
@@ -420,7 +545,17 @@ being two implementations.
 
 ---
 
-## 6. Identity, roles, and visibility
+## 6. Identity, roles, and visibility — the hardening spec
+
+> **Not in v1.** H1 defers this whole section: the prototype has no
+> authentication, no role tiers and no per-user identity. It is kept complete and
+> unedited because it is the destination, and because the parts of the protocol
+> that *are* in v1 were shaped to make it an additive change later — the roster is
+> already per-caller (§4.3), the error taxonomy already distinguishes
+> `unauthenticated` from `unauthorized` (§4.5), and §6.1's `Identity` seam means
+> the eventual mechanism choice does not rewrite the listener. Read it as the spec
+> for the track, not a description of the prototype.
+
 
 ### 6.0 Terminology, because "session" is already taken three ways
 
@@ -598,17 +733,78 @@ The model, subject to H8:
 Every wire-initiated action logs an **actor identity**: user, connection session and role,
 alongside the group and agent the audit already records. Two consequences:
 
-- The audit becomes the only per-user attribution that exists if H9 picks a
-  shared service account. That raises its integrity from "nice" to "the record".
 - Token values never appear (§6.2). Actor identity is a user id, not a
   credential.
+- The audit becomes **the only per-user attribution that exists** once H9's
+  service account lands. See §6.6 — this is the load-bearing consequence of that
+  decision, not a footnote to it.
+
+**v1 status: degraded, knowingly** (§7.0 T7). The audit still records what
+happened and against which group; it cannot record *who*, because there is no
+who. Under H9's single account that costs nothing today — one account, one
+person, no ambiguity to resolve. It stops being free the moment a second person
+connects, which is one of the four triggers in §7.0.
+
+### 6.6 Whose credentials the agents act as (H9)
+
+Resolved, and worth its own subsection because it is a standing product decision
+rather than a v1/deferred toggle:
+
+- **Now: one normal single user account.** Identical to today's behaviour — the
+  agents on the server use the machine's `gh` auth and agent-CLI subscriptions,
+  the same way agents on a laptop use the human's. No change, no new mechanism,
+  nothing to build.
+- **Target: a bot/service account**, possibly reached through a web or desktop
+  `gh`-CLI auth flow when that is built.
+- **Explicitly ruled out: per-user own-GitHub credentials.** Not deferred —
+  *rejected*. It is the option that would need a secret store loomux does not
+  have and does not want, and it is written down as closed so it does not get
+  re-proposed as the obvious answer every time attribution comes up.
+
+The consequence to carry forward: **a service account collapses GitHub-side
+attribution.** Once agents push, comment and label as one bot, GitHub can no
+longer tell you which person's work a change came from — every PR looks like the
+bot's. The loomux audit log is then the only place that mapping exists, which is
+why §6.5's actor identity is not optional once the service account lands: the two
+decisions are a pair, and shipping the service account without per-user identity
+would mean *nothing anywhere* records who asked for what. Not a v1 problem (one
+account, one person); a hard prerequisite for the service account.
 
 ---
 
-## 7. Threat model
+## 7. Threat model — the hardening roadmap
 
 Eight threats. Each names what it is, where it is answered, and — because a
 mitigation nobody can fail is a mitigation nobody has — how it is *tested*.
+
+**This section survives H1's deferral intact, and is the reason the deferral is
+safe to make.** A prototype that shipped without a threat model would have to
+grow one under pressure later, from a codebase already shaped by its absence.
+This one exists first, so the hardening track is a checklist rather than an
+investigation.
+
+### 7.0 What v1 actually closes, and what it knowingly leaves open
+
+Read this table before building anything. The "v1" column is the honest status of
+the prototype; the rest of §7 is the full specification each threat is eventually
+held to.
+
+| id | v1 status | why |
+|---|---|---|
+| **T1** RCE via unauthenticated peer | **OPEN — accepted** | §1.3. Mitigated only by reachability (§1.2: loopback bind + `Origin` refusal), never by identity. This is *the* accepted risk |
+| **T2** path & identifier injection | **CLOSED in v1** | #904 landed; #925 completes it. Cheap, independent of identity, and expensive to retrofit — so it stays in (§1.3) |
+| **T3** authority laundering (agent ⇒ human) | **structurally held** | Not by role tiers, which do not exist yet, but by the listeners staying separate (§6.3): MCP keeps its own token namespace, and the display socket adds no grant-writing path that the MCP roster lacks. The *tiering* half is deferred |
+| **T4** cross-user exposure | **N/A in v1** | One user, one account (H9). Nothing to expose across. Becomes live the moment a second person connects — which is the trigger for the hardening track, not a later nice-to-have |
+| **T5** transport attacks | **partially closed** | `Origin` refusal is **in v1** and non-negotiable (§1.2 — SSH does not close it). TLS defers to the reverse proxy; credentials-in-URLs and revocation are moot with no credentials |
+| **T6** resource exhaustion | **partially closed** | Bounded per-client send buffers with drop-and-resync are in v1 (C4) because they are a correctness property of streaming, not a security feature. Rate limiting defers with auth |
+| **T7** audit integrity | **DEGRADED — known** | The audit still records what happened; it cannot say *who*, because there is no who. Under H9's single account that is no loss today, and it is exactly what the service account plus per-user identity restores. Recorded so the gap is not discovered later as a surprise |
+| **T8** lateral movement | **deferred (E2)** | Containers are fast-follow (H5) and were always defence in depth over T2, never a replacement |
+
+The trigger to start the hardening track is not a date. It is any one of: **a
+second user**, **a non-workstation host**, **a routable bind**, or **a browser
+client**. Each of those individually invalidates §1.3's basis.
+
+### 7.1 The threats in full
 
 | id | threat | primary answer | lands in | test |
 |---|---|---|---|---|
@@ -629,6 +825,13 @@ things at once, and any one alone is insufficient: authentication before dispatc
 runs"), the default-deny roster (§5.1 — a command is reachable because someone
 classified it, never because it existed), and role tiers so that spawn/write is
 operator-and-above and grant-writing is owner-human-only.
+
+**In v1, exactly one of those three is present** — the roster. There is no
+authentication and there are no tiers, so what stands between a peer and
+`spawn_pty` is reachability alone (§1.2) and the human's acceptance of that
+(§1.3). Stated here, and not only in §1, because T1 is the paragraph someone
+will read when they are deciding whether it is safe to expose this daemon —
+and the answer, until the hardening track lands, is **no**.
 
 **T2 — path and identifier injection.** `GroupId` is closed: one `parse`, a
 strict `[A-Za-z0-9_-]` alphabet that makes `..`, `/`, `\`, `:`, NUL and every
@@ -659,7 +862,13 @@ unauthenticated peer can consume a handshake and nothing more. Per-client send
 buffers are bounded with drop-and-resync (§9), so a slow or hostile viewer cannot
 make the server grow memory on its behalf. Connection and login-attempt rate
 limits live in the listener — login throttling in particular, because a
-password-based H1(a) without it is an offline-speed online guessing oracle.
+password-based store without it is an offline-speed online guessing oracle.
+
+**v1:** the second sentence holds and the first does not. Bounded buffers are in
+(they are a streaming correctness property, not a security feature); the
+authentication gate is not, so a peer that reaches the socket can spend the
+server's resources freely. Bounded by §1.2's reachability, like everything else
+in §1.3.
 
 **T7 — audit integrity.** §6.5.
 
@@ -899,34 +1108,56 @@ same wire, not a second protocol.
 
 ---
 
-## 13. Sequencing, and what blocks what
+## 13. Sequencing — the prototype is unblocked
+
+H1's deferral removes what was the longest pole: C1 was "server skeleton **and
+auth**", gated on an auth-mechanism decision, and everything else in track C
+queued behind it. The prototype path is now:
 
 ```
   #904  GroupId + one path-assembly point         ── landed
-  #925  remaining identifier families             ── BLOCKER for any listener slice
-  A1-A4 engine crate extraction (#847 Ph. 0-2 +)  ── the crate boundary C1 consumes
-  B1    this note                                 ── GATE for all of C/D/E
-        └─ human answers §1 ──► C1 ► C2 ► C4 ► C5
-                                 C3 (parallel, waits A4)
-                                 D1 (waits B1 fixtures) ► D2
-                                 E1 (waits C2) ► E2 (waits H5)
+  #925  remaining identifier families             ── still a merge blocker for listener code
+  B1    this note                                 ── RESOLVED; gate lifted
+  A1    engine workspace scaffold                 ── start now, the serial chain's head
+  A2 ► A3 ► A4  engine extraction (#847 Ph. 0-2 +)── the crate boundary the daemon consumes
+
+  C1'   server skeleton, NO auth                  ── config + wiring only; loopback bind
+                                                     + Origin refusal (§1.2) are C2's
+  C2 ► C4 ► C5   listener, streams, replay
+  C3    headless PaneHost (parallel, waits A4)
+  D1 ► D2        remote client (D1 waits B1 fixtures — available now)
+  E1 ► E2        docker-ready, then containers (fast-follow, H5)
 
   A/B/C/D/E + digit = plan-463 build slices.  H<n> = the §1 human decisions.
 ```
 
-Two blockers stated as blockers, not preferences:
+**What shrank:** C1 loses the user store, the login flow, session issuance, role
+resolution and revocation. What remains is a daemon that starts, reads a config,
+owns a registry and serves nothing yet — days, not weeks.
 
-- **#925 is a merge blocker for listener code.** Not "should land first" —
-  a reviewer citing this section should treat a listener PR merging ahead of it
-  as a blocking finding (§7 T2).
-- **A command reachable over the wire without all three of authn, roster
-  classification and root scoping is a blocking review finding**, citable from
-  §2 and §5.1.
+**What did not shrink, and must not be quietly dropped along with auth:**
 
-And one thing that is *not* a blocker but is easy to mistake for one: the
-engine-crate extraction (track A) is a build-shape prerequisite — a headless
-Linux daemon cannot depend on a lib that links Tauri and wants webkit2gtk — not a
-security one. C1's auth work is gated on H1, not on A4 finishing.
+- **#925 remains a merge blocker for listener code.** This is the one to guard
+  hardest, because the temptation now is to read "no auth in v1" as "security
+  work defers". It does not: #925 is *path* validation, it does not depend on
+  knowing who is calling, and §1.3 keeps it explicitly in v1. A listener PR that
+  merges ahead of it is a blocking finding (§7 T2).
+- **The two §1.2 controls are v1 requirements** — loopback-or-unix-socket bind
+  with a routable interface refused by default, and `Origin` refusal on upgrade.
+  They belong to C2 and they are what the accepted risk in §1.3 is conditioned
+  on. A C2 that ships without them has not deferred security; it has removed the
+  boundary the deferral assumed.
+- **Roster classification lands with the dispatcher** (§5.1), default-deny, with
+  its test. Tiers defer (§5.3); classification does not.
+
+The revised blocking-finding rule for reviewers, replacing the pre-H1 one: **a
+command reachable over the wire without both roster classification and root
+scoping is a blocking finding**, citable from §2 and §5.1. Authentication drops
+out of that sentence for the prototype and returns with the hardening track.
+
+One thing that is *not* a blocker but is easy to mistake for one: the engine-crate
+extraction (track A) is a build-shape prerequisite — a headless Linux daemon
+cannot depend on a lib that links Tauri and wants webkit2gtk — not a security one.
 
 ---
 
@@ -960,3 +1191,28 @@ operating systems) but that belief is **unvalidated on Linux**, and the human
 validates it on a real Linux PTY once C3 exists. The same applies to the
 real-network behaviour of §9's resync path: a fake-slow-sink test pins the
 policy, and only a real WAN link tells you whether the policy feels right.
+
+---
+
+## 16. Status: the prototype is unblocked
+
+Every decision this note was written to surface has an answer (§1.1). Nothing
+here is waiting on the human except H7's hosting facts, which are inputs to E1's
+deployment documentation and §8.2's Pi topology — not to any prototype slice.
+
+Cleared to start:
+
+- **A1** — engine workspace scaffold, then the A2 → A3 → A4 extraction chain.
+- **C** — the daemon, without auth: skeleton, listener (carrying §1.2's two
+  controls and §5.1's roster), headless `PaneHost`, per-client streams,
+  replay-on-attach.
+- **track-D slices D1 → D2** — the remote client; D1 can begin immediately
+  against §4.6's contract fixtures, with no server in existence.
+- **E1** — docker-ready packaging, with **E2** containers as the fast-follow H5
+  chose.
+
+Still blocking, and unchanged by any of the above: **#925** for listener code
+(§13). Still true, and the thing this note exists to keep true: the prototype is
+a prototype *because of where it runs*, not because the security model was
+skipped. §7.0 is the way out, and its four triggers are what say when the way out
+stops being optional.
