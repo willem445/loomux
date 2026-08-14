@@ -54,6 +54,24 @@ function contrast(a: string, b: string): number {
   return (hi + 0.05) / (lo + 0.05);
 }
 
+/**
+ * The identity channel's hues, base and Lit, under distinct names.
+ *
+ * NOT `{ ...IDENTITY, ...IDENTITY_LIT }` — those two maps share their key names by design,
+ * so spreading them silently drops all eight base hues and leaves only the Lit steps. An
+ * earlier version of these tests did exactly that and consequently never checked a base hue
+ * for anything; it was caught by mutating `orchid` to violet's hex and watching the
+ * distinctness assertion stay green.
+ */
+function identityEntries(): [string, string][] {
+  return (Object.keys(IDENTITY) as (keyof typeof IDENTITY)[]).flatMap(
+    (name): [string, string][] => [
+      [name, IDENTITY[name]],
+      [`${name}Lit`, IDENTITY_LIT[name]],
+    ]
+  );
+}
+
 // --- perceptual distance, and what colour-vision deficiency does to it.
 //
 // The design note promises that the STATE channel survives colour blindness and that the
@@ -319,7 +337,7 @@ test("every identity hue is readable as text on every surface it can sit on", ()
   // WCAG 1.4.11: a non-text mark — an icon stroke, a lane, a meter fill — needs 3:1. The
   // terminal ground is included here and not above, because an identity mark can sit over a
   // terminal (a pane badge) where a label never does.
-  for (const [name, value] of Object.entries({ ...IDENTITY, ...IDENTITY_LIT })) {
+  for (const [name, value] of identityEntries()) {
     const ratio = contrast(value, SEMANTIC.surfaceTerm);
     assert.ok(
       ratio >= 3,
@@ -340,12 +358,19 @@ test("the identity channel is eight distinct hues, each with its Lit step", () =
     `the identity channel holds ${Object.keys(IDENTITY).length} hues; the brief argues for 8-10 ` +
       "— fewer reads as the near-monochrome look the direction gate rejected, more is fruit salad"
   );
-  const values = Object.values<string>({ ...IDENTITY, ...IDENTITY_LIT });
-  assert.equal(
-    new Set(values).size,
-    values.length,
-    "two identity tokens carry the same colour — one of them cannot say which thing it is"
-  );
+  const entries = identityEntries();
+  const byValue = new Map<string, string>();
+  for (const [name, value] of entries) {
+    const clash = byValue.get(value);
+    assert.equal(
+      clash,
+      undefined,
+      `identity tokens "${clash}" and "${name}" are both ${value} — one of them cannot say ` +
+        "which thing it is"
+    );
+    byValue.set(value, name);
+  }
+  assert.equal(byValue.size, entries.length, "the identity channel lost a distinct value");
   // Every Lit step must actually be lighter than its base, or "Lit" is a lie a consumer
   // reaching for emphasis would silently get wrong.
   for (const name of Object.keys(IDENTITY) as (keyof typeof IDENTITY)[]) {
@@ -395,29 +420,44 @@ test("no identity-only hue may fill a state role", () => {
   // contrast or a distance check can catch: `stateOk = cyan` measures perfectly fine and is
   // still wrong, because it spends a hue the identity channel was relying on and puts the
   // fleet's readability on a channel that collapses under CVD.
-  const stateRoles = Object.entries({
-    ...STATE_DYES,
-    held: SEMANTIC.stateHeld,
-    idle: SEMANTIC.stateIdle,
-  });
-  const identityOnly = new Map(
-    (Object.entries(IDENTITY) as [string, string][]).filter(
-      ([, hex]) => !Object.values<string>(STATE_DYES).includes(hex)
-    )
-  );
-  assert.ok(
-    identityOnly.size >= 3,
-    "the identity channel has stopped having hues of its own — every one of them now also " +
-      "means an agent state, which is the near-monochrome palette the direction gate rejected"
-  );
-  const byHex = new Map([...identityOnly].map(([name, hex]) => [hex, name]));
-  for (const [role, hex] of stateRoles) {
-    const clash = byHex.get(hex);
+  // The four names are written out HERE, as the design's own claim, and deliberately NOT
+  // derived by subtracting the state dyes from IDENTITY. A derived set redefines itself the
+  // moment the thing it is meant to catch happens: promote lime into `stateOk` and lime is
+  // no longer "identity-only", so a subtractive check exonerates the very edit it exists to
+  // refuse. That was the first version of this test, and mutating `stateOk := PALETTE.lime`
+  // left it green.
+  const IDENTITY_ONLY = ["lime", "cyan", "violet", "orchid"] as const;
+
+  const byHex = new Map<string, string>();
+  for (const name of IDENTITY_ONLY) {
+    const hex: string | undefined = IDENTITY[name];
+    assert.ok(
+      hex !== undefined,
+      `the identity channel has lost "${name}" — either it was renamed, in which case fix ` +
+        "this list, or the channel is shrinking back toward the near-monochrome palette"
+    );
+    byHex.set(hex, name);
+  }
+  // The list must also still be identity-ONLY: if one of these ever became a state dye by
+  // some other route, the whole premise above is void.
+  for (const [role, hex] of Object.entries(STATE_DYES)) {
     assert.equal(
-      clash,
+      byHex.get(hex),
       undefined,
-      `state role "${role}" is painted ${hex}, which is the identity-only hue "${clash}" — ` +
-        "an identity hue may never sit in a state position (design note, §The three colour channels)"
+      `state role "${role}" is painted ${hex}, which is the identity-only hue ` +
+        `"${byHex.get(hex)}" — an identity hue may never sit in a state position ` +
+        "(design note, §The three colour channels)"
+    );
+  }
+  for (const [role, hex] of [
+    ["held", SEMANTIC.stateHeld],
+    ["idle", SEMANTIC.stateIdle],
+  ] as const) {
+    assert.equal(
+      byHex.get(hex),
+      undefined,
+      `state role "${role}" is painted ${hex}, an identity hue — held and idle are achromatic ` +
+        "by design: a stopped agent is marked by form, not by hue"
     );
   }
 });
