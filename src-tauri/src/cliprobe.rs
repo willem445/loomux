@@ -118,7 +118,9 @@ struct Enumerator {
 /// the cached list is the one their own CLI would use anyway.
 const ENUMERATORS: &[Enumerator] = &[Enumerator {
     program: "opencode",
-    args: "models",
+    // SCRATCH NEUTER (red evidence for #935 slice A, PR #939) — the probe asks
+    // for a models.dev re-pull. DO NOT MERGE.
+    args: "models --refresh",
     parse: parse_models_from_list,
 }];
 
