@@ -73,8 +73,16 @@ import {
   type SshProfile,
   type SshProfileStore,
 } from "./sshprofile";
-import { agentCliKnobs, discoverGitBash, discoverSsh, loadSshProfiles, saveSshProfiles } from "./pty";
-import { modelOptionLabel } from "./modelnames";
+import {
+  agentCliKnobs,
+  discoverGitBash,
+  discoverSsh,
+  loadSshProfiles,
+  probeAgentCli,
+  saveSshProfiles,
+} from "./pty";
+import { ModelCatalog, type CliProbe } from "./modelcatalog";
+import { ModelPicker } from "./modelpicker";
 import { ORCH_CLIS, orchCliFor } from "./orchclis";
 import { knobState, knobValue, type CliKnobs, type KnobState, type KnobStates } from "./selectorknobs";
 import { ftRootIsDir } from "./fileapi";
@@ -246,86 +254,6 @@ const intVal = (el: HTMLInputElement, fallback: number): number => {
   return Number.isFinite(n) ? n : fallback;
 };
 
-/** Result of probing an agent CLI on this machine (backend, cached). */
-interface CliProbe {
-  available: boolean;
-  models: string[];
-  error: string | null;
-}
-
-/** Model dropdown with a "custom…" escape hatch. A plain datalist doesn't
- *  work here: browsers filter its suggestions by the input's current text,
- *  so a pre-filled default hides every other option. */
-class ModelPicker {
-  readonly root: HTMLElement;
-  private sel: HTMLSelectElement;
-  private custom: HTMLInputElement;
-  private static CUSTOM = "__custom";
-  /** Fired whenever the effective model changes (#687): the context-window knob
-   *  is only available on models whose `[1m]` form the vendor documents, so the
-   *  knob row has to re-derive when this moves — including when a custom id is
-   *  typed, which is the case a plain `change` listener on the select misses. */
-  onChange: (() => void) | null = null;
-
-  constructor() {
-    this.root = document.createElement("div");
-    this.root.className = "model-picker";
-    this.sel = document.createElement("select");
-    this.sel.className = "dlg-select";
-    this.custom = document.createElement("input");
-    this.custom.className = "dlg-input";
-    this.custom.placeholder = "model id…";
-    this.custom.spellcheck = false;
-    this.custom.hidden = true;
-    this.sel.addEventListener("change", () => {
-      this.custom.hidden = this.sel.value !== ModelPicker.CUSTOM;
-      if (!this.custom.hidden) this.custom.focus();
-      this.onChange?.();
-    });
-    this.custom.addEventListener("input", () => this.onChange?.());
-    this.root.append(this.sel, this.custom);
-  }
-
-  /** Rebuild the options, keeping the current choice when still valid. `cli` is
-   *  which CLI's vocabulary the ids belong to — an alias means what the CLI that
-   *  documents it says it means, and nothing on any other CLI (#687). */
-  setOptions(models: string[], fallback: string, cli = ""): void {
-    const current = this.value || fallback;
-    this.sel.replaceChildren(
-      ...models.map((m) => {
-        const o = document.createElement("option");
-        o.value = m;
-        // The VALUE stays the raw id — it is what `--model` receives, `/` and
-        // all (#722: opencode's ids are `provider_id/model_id`). Only the label
-        // is prettified, and only where the name says something the id doesn't
-        // (modelnames.ts). The empty id is a real entry — "send no --model" —
-        // and gets the one label that isn't derived from an id.
-        o.textContent = modelOptionLabel(cli, m);
-        return o;
-      })
-    );
-    const custom = document.createElement("option");
-    custom.value = ModelPicker.CUSTOM;
-    custom.textContent = "custom…";
-    this.sel.appendChild(custom);
-    if (models.includes(current)) {
-      this.sel.value = current;
-      this.custom.hidden = true;
-    } else if (current) {
-      this.sel.value = ModelPicker.CUSTOM;
-      this.custom.value = current;
-      this.custom.hidden = false;
-    } else {
-      this.sel.value = models[0] ?? ModelPicker.CUSTOM;
-    }
-  }
-
-  get value(): string {
-    if (!this.sel.options.length) return "";
-    return this.sel.value === ModelPicker.CUSTOM ? this.custom.value.trim() : this.sel.value;
-  }
-}
-
 export class WelcomeForm {
   /** The form root — mounted INSIDE a setup-state pane (not an overlay). */
   readonly el: HTMLElement;
@@ -446,8 +374,12 @@ export class WelcomeForm {
   private rosterTimer: number | null = null;
   private permsSel: HTMLSelectElement;
   private agentWarn: HTMLElement;
-  /** One probe per program per app run; backend caches too. */
-  private probes = new Map<string, Promise<CliProbe>>();
+  /** The shared model catalog (#935): one probe per program per app run (the
+   *  backend caches too), and the one merge of curated suggestions with what the
+   *  CLI reported. Owns the memo this form used to keep itself, so the models it
+   *  offers and the models the workflow pane's block editor offers come from the
+   *  same code. */
+  private catalog = new ModelCatalog(probeAgentCli);
   /** Autopilot flags per program, memoized. Empty string = the CLI has no
    *  unattended flag surface, so the toggle is hidden/inert for it (#101). */
   private autopilotFlags = new Map<string, Promise<string>>();
@@ -1021,14 +953,16 @@ export class WelcomeForm {
   private applyRoleModels(role: OrchRole): void {
     const rc = this.roleControls.find((r) => r.key === role)!;
     const cli = orchCliFor(rc.cli.value);
-    rc.model.setOptions(cli.models, cli.defaults[role], cli.id);
+    rc.model.setOptions(this.catalog.models(cli.id), cli.defaults[role], cli.id);
     this.applyRoleKnobs(role);
     void this.probe(cli.id).then((p) => {
       if (this.kind !== "orchestrator" || rc.cli.value !== cli.id) return;
+      // Nothing reported = nothing to merge, and re-setting an identical list
+      // would rebuild the menu under a human who may be mid-type in the custom
+      // box. The merge itself (order, dedupe, the pinned inherit row) is the
+      // catalog's — see `mergeModelOptions`.
       if (p.models.length) {
-        // CLI-reported models first, curated suggestions appended.
-        const merged = [...p.models, ...cli.models.filter((m) => !p.models.includes(m))];
-        rc.model.setOptions(merged, cli.defaults[role], cli.id);
+        rc.model.setOptions(this.catalog.models(cli.id), cli.defaults[role], cli.id);
         this.applyRoleKnobs(role);
       }
     });
@@ -1267,16 +1201,9 @@ export class WelcomeForm {
     this.fire({ kind: "workflow", name: basename(root) || "workflow", root });
   }
 
-  /** Probe an agent program (availability + models), memoized. */
+  /** Probe an agent program (availability + models), memoized by the catalog. */
   private probe(program: string): Promise<CliProbe> {
-    let p = this.probes.get(program);
-    if (!p) {
-      p = invoke<CliProbe>("probe_agent_cli", { program }).catch(
-        (e): CliProbe => ({ available: false, models: [], error: String(e) })
-      );
-      this.probes.set(program, p);
-    }
-    return p;
+    return this.catalog.probe(program);
   }
 
   /** The program a given launch would execute (first token of the command), or

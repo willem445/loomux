@@ -14,6 +14,7 @@ import {
 } from "./transport.ts";
 import type { ShellKind } from "./panesetup";
 import type { CliKnobs } from "./selectorknobs";
+import type { CliProbe } from "./modelcatalog";
 
 export interface SpawnOptions {
   cols: number;
@@ -133,6 +134,21 @@ export const discoverSsh = (): Promise<string | null> => invoke<string | null>("
  *  renders every knob disabled with a reason — the honest, and safe, direction. */
 export const agentCliKnobs = (cli: string): Promise<CliKnobs | null> =>
   invoke<CliKnobs>("agent_cli_knobs", { cli }).catch(() => null);
+
+/** Probe an agent CLI on this machine: is it on PATH, and which models does it
+ *  report (#935)? The backend runs the CLI's own help/list command hidden, with a
+ *  timeout, and caches per app run (`src-tauri/src/cliprobe.rs`).
+ *
+ *  A typed wrapper rather than the raw `invoke` the launcher used to make at its
+ *  call site — constraint 5: `transport.ts` is the only module that talks to Tauri,
+ *  and every backend capability reaches the UI through a named wrapper here.
+ *
+ *  Rejects like any other IPC call: the degradation ("we couldn't ask" reads as an
+ *  unavailable CLI with no models) belongs to `ModelCatalog.probe`, which is where
+ *  a test can watch it happen — a `catch` buried in this module is unreachable from
+ *  `node --test`. */
+export const probeAgentCli = (program: string): Promise<CliProbe> =>
+  invoke<CliProbe>("probe_agent_cli", { program });
 
 /** Drive a pane's shell to `cd` into `path`. */
 export const changeDir = (id: number, path: string): Promise<void> =>
