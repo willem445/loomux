@@ -26,9 +26,8 @@ The Rust half — CI runs it on every push; **for a human running this skill by
 hand**, it is:
 
 ```sh
-cd src-tauri
-cargo check --locked          # what CI gates on
-cargo test --locked           # backend unit + integration tests
+cargo check --locked --workspace   # what CI gates on — from the repo root
+cargo test --locked --workspace    # backend unit + integration tests
 ```
 
 ## Exercise the change itself, not just the suites

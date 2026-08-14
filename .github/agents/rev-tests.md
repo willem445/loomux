@@ -68,7 +68,7 @@ failure line is text, and text is not a red test.
   publish workflow or the tag flow has to keep the release gate honest — that gate
   is bypassable (#196). If a PR touches it and adds no test, that is your finding.
 - **Suites actually green on the head.** Run them and cite the numbers:
-  `cargo test --locked` in `src-tauri/`, `npm test`, `npm run build`. Check for
+  `cargo test --locked --workspace` from the repo root, `npm test`, `npm run build`. Check for
   skipped/ignored tests quietly not running — a harness that prints `SKIP` and exits
   0 is a suite that stopped testing.
 

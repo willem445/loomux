@@ -50,7 +50,8 @@ and publishing the list.
 
 ## `rustfmt --check` is the one local Rust check agents may run
 
-From `src-tauri/`: `rustfmt --check --edition 2021 <changed .rs> >/dev/null`. `--edition`
+From the repo root (`.rs` files now live in more than one crate): `rustfmt --check
+--edition 2021 <changed .rs> >/dev/null`. `--edition`
 is mandatory (default 2015 false-errors `async fn`); discard stdout (unenforced
 formatting diffs); exit code is ambiguous (1 = parse error OR formatting diff) — **stderr
 is the signal, don't grep for `error:`**. Parse check only: never run bare `rustfmt`,
