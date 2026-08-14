@@ -300,10 +300,10 @@ fn probe_with(program: &str, run: impl Fn(&str, &str) -> Result<String, String>)
     if let Some(en) = enumerator_for(program) {
         // A second subprocess, once per CLI per app run (the cache below), on
         // the blocking pool and under the same timeout as the help run.
-        let listed = run(program, en.args).map(|out| (en.parse)(&out)).unwrap_or_default();
-        if !listed.is_empty() {
-            models = listed;
-        }
+        // SCRATCH NEUTER (red evidence for #935 slice A, PR #939) — the
+        // enumeration replaces the help-parsed list even when it is empty, so
+        // a failed or unreadable `models` run wipes it. DO NOT MERGE.
+        models = run(program, en.args).map(|out| (en.parse)(&out)).unwrap_or_default();
     }
     CliProbe { available: true, models, error: None }
 }
