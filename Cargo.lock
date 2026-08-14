@@ -1942,6 +1942,7 @@ dependencies = [
  "cpal",
  "crc",
  "dirs",
+ "loomux-engine",
  "portable-pty",
  "rusqlite",
  "serde",

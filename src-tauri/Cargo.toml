@@ -12,6 +12,18 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+# The Tauri-free orchestration core (#888 slice A2). THE ARROW ONLY POINTS THIS
+# WAY: src-tauri depends on the engine, never the reverse — see
+# doc/design/engine-extraction.md. A workspace path dependency, not a version:
+# the crate is `publish = false` and both its consumers are in this repo.
+#
+# NO GETRANDOM AUDIT ENTRY IS NEEDED FOR IT, and that is a property to preserve
+# rather than a gap: the engine crate has no dependencies at all, so it adds
+# nothing to the linked graph the ban below reasons about. The day it gains one,
+# that dependency gets audited in crates/loomux-engine/Cargo.toml against the
+# same rule — the ban follows the shipped binary's imports, and this crate is
+# linked into it.
+loomux-engine = { path = "../crates/loomux-engine" }
 tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

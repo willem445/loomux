@@ -1,11 +1,11 @@
 //! The loomux orchestration engine — the part of loomux that has nothing to do
 //! with being a desktop app.
 //!
-//! **This crate is an empty scaffold right now** (#888 slice A1 / #847 Phase
-//! 0). It exists before it has contents on purpose: converting the repo to a
-//! Cargo workspace moves the lockfile, the `target/` directory and the release
-//! profile, and that is a release-plumbing change worth landing and proving on
-//! CI by itself, separately from thousands of moved lines.
+//! The crate landed empty (#888 slice A1 / #847 Phase 0) on purpose:
+//! converting the repo to a Cargo workspace moves the lockfile, the `target/`
+//! directory and the release profile, and that is a release-plumbing change
+//! worth landing and proving on CI by itself, separately from thousands of
+//! moved lines. Slice A2 fills it, in small batches.
 //!
 //! # Why it exists
 //!
@@ -29,3 +29,23 @@
 //! reviewable change, and the bar for all of them is behavioural silence — the
 //! existing suite green with no test edits. See
 //! `doc/design/engine-extraction.md`.
+//!
+//! # What is here so far
+//!
+//! A2 batch 1 — [`report`] (the decision-grade report protocol's pure core,
+//! #398) and [`termgrid`] (the dependency-free VT replay behind `get_output`,
+//! #520). They went first because they are the two submodules with no outbound
+//! dependency on anything else in `orchestration/` at all: both are `std`-only,
+//! so they prove the move-and-re-export mechanism end to end without also
+//! testing a dependency edge. `src-tauri/src/orchestration/mod.rs` re-exports
+//! each under its old path, so every existing call site resolves unchanged.
+//!
+//! Each module keeps its own `#[cfg(test)]` unit tests, which is only possible
+//! on this side of the boundary: CLAUDE.md constraint 4 forces `src-tauri`'s
+//! lib-linking tests to be integration tests because Windows test executables
+//! need the comctl32-v6 manifest `build.rs` embeds, and nothing here links
+//! Tauri or that manifest. `src-tauri/tests/smoke.rs` still has to exist for
+//! the app's own sake.
+
+pub mod report;
+pub mod termgrid;

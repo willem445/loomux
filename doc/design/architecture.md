@@ -17,7 +17,7 @@ The repo root is a Cargo workspace with two members, one `Cargo.lock` and one
 ```
 Cargo.toml               workspace root: members, resolver, and [profile.release] — cargo reads profiles from the ROOT manifest only and merely warns about one in a member, so this is where lto/codegen-units/debug/strip have to live (#888 slice A1)
 src-tauri/               the desktop app. Links Tauri; owns every #[tauri::command], the capability/ACL manifests, and the Windows desktop surface
-crates/loomux-engine/    the orchestration core as a crate that does not link Tauri. EMPTY scaffold today
+crates/loomux-engine/    the orchestration core as a crate that does not link Tauri. Filling up in stages (#888 slice A2): src/report.rs + src/termgrid.rs so far, re-exported under their old `orchestration::` paths so no call site moved with them
 ```
 
 `loomux-engine` exists because #888 needs a headless Linux daemon to drive
