@@ -320,7 +320,10 @@ pub fn next_id(existing: &[Question]) -> String {
 /// need no sanitizing; they are emitted BEFORE the answer so that the cap
 /// trims the answer's tail rather than swallowing the attribution.
 pub fn answer_notice(id: &str, source_tag: &str, answer: &str) -> String {
-    let body = sanitize_gh_text(answer, ANSWER_TEXT_MAX);
+    // [SCRATCH — #946 red-before-green round 3, NEVER MERGED] The exact defect
+    // sanitizing exists to prevent: the answer's brackets are no longer
+    // neutralized, so a literal `[loomux] …` in it reads as a trusted notice.
+    let body: String = answer.chars().take(ANSWER_TEXT_MAX).collect();
     let text = format!("[loomux] answer to {id} (via {source_tag}): {body}");
     text.chars().filter(|c| !c.is_control()).take(ANSWER_NOTICE_CAP).collect()
 }
