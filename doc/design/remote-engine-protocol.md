@@ -329,7 +329,8 @@ caller's role and derives the `human` flag (§6.3), and no second place to forge
   "engine_id": "…",              // stable per daemon install
   "server_version": "0.9.3",
   "identity": { "user": "…", "session": "…", "role": "operator" },  // OMITTED in v1
-  "capabilities": { "reveal": false, "open_with": false, "delete_mode": "permanent",
+  "capabilities": { "reveal": false, "reveal_selects": false, "open_with": false,
+                    "delete_mode": "permanent",
                     "persisted_scrollback": false, "containers": false },
   "commands": [ "orch_tasks", "write_pty", … ]   // the caller's roster, role-filtered
 }
@@ -353,10 +354,14 @@ inventing a second one: `fm_capabilities` returns `Caps { delete_mode, open_with
 reveal, reveal_selects }`, today computed from `cfg!(windows)` at compile time.
 In remote mode those must describe the machine that *does the thing*, and the
 two halves split: `delete_mode` is a property of the **server's** filesystem
-(the files are there), while `open_with` and `reveal` are **client-shell**
-operations and go `false` in remote mode regardless of what OS the server is.
-Answering all four from the server's `cfg!` would be a quietly wrong answer that
-shows the human a menu item that cannot work.
+(the files are there), while `open_with`, `reveal` and `reveal_selects` are
+**client-shell** operations and go `false` in remote mode regardless of what OS
+the server is. Answering all four from the server's `cfg!` would be a quietly
+wrong answer that shows the human a menu item that cannot work — and
+`reveal_selects` is the sharpest case, because it exists precisely to let the
+menu label itself honestly when reveal is approximate. All four appear in the
+example above; a capability map that silently omits one is a client defaulting
+to a guess.
 
 `engine_id` exists for tab persistence: `tabs.json` records pane `cwd`s with no
 notion of *which machine* they are on, and a restored layout must reattach to
@@ -634,9 +639,12 @@ directly-reachable port has no authentication at all, only the appearance of it.
 ### 6.2 Sessions and tokens
 
 - Login yields a **connection session** with an explicit expiry and a role tier.
-  Connection sessions are server-side records, so **revocation is a v1 feature, not v2** — a token
-  that cannot be revoked is a permanent credential that happens to have a date on
-  it.
+  Connection sessions are server-side records, so **revocation ships in the auth
+  layer's first release, never as a follow-up to it** — a token that cannot be
+  revoked is a permanent credential that happens to have a date on it. (Said that
+  way deliberately: "v1" in this note means the *prototype*, which has no tokens
+  at all, so calling revocation a v1 feature would name the one release it
+  provably is not in.)
 - Revocation takes effect **mid-connection**: an established socket re-checks its
   connection session on every RPC dispatch, not only at the upgrade. Otherwise revoking a
   departing teammate leaves their open laptop connected until they close it.
@@ -854,8 +862,12 @@ part of the mitigation, not a detail.
 
 **T5 — transport attacks.** TLS (H2). `Origin` checks from day one, because the
 browser client is a stated future and cross-site WebSocket hijacking is exactly
-what `Origin` exists for. Credentials in headers, never URLs. Revocation as a v1
-feature that takes effect mid-connection.
+what `Origin` exists for. Credentials in headers, never URLs. Revocation lands
+with the auth layer rather than after it, and takes effect mid-connection.
+
+**v1:** the `Origin` half is in and is load-bearing (§1.2); the rest describes
+the authenticated design. Note the asymmetry — "from day one" here means the
+prototype's day one, which is the *only* one of these that is true today.
 
 **T6 — resource exhaustion.** Authentication gates every expensive path, so an
 unauthenticated peer can consume a handshake and nothing more. Per-client send
