@@ -3,6 +3,12 @@
 // parent inserts a sibling (so repeated splits form an even matrix rather
 // than a lopsided staircase); splitting across creates a nested split.
 //
+// The weight arithmetic behind "even matrix" — what a newcomer joins at, and
+// what happens to a departing pane's weight — is the pure `paneequalize.ts`.
+// It used to live inline here and did not deliver the even matrix this comment
+// has always promised: see that module's header for what #936 reported and how
+// the two operations now keep an undragged layout even.
+//
 // On top of splitting, panes can be dragged by their header to reorder
 // (swap two slots) or re-dock to another pane's edge, maximized to cover the
 // grid, and minimized out of the tree into a restorable dock. The drag
@@ -17,6 +23,7 @@ import { dockChipQueue, queuePresentation } from "./queuebadge";
 import { planGroupMinimize } from "./group";
 import { shouldFocusNewPane, shouldRestoreFocus, shouldPreserveMaximize } from "./panefocus";
 import { startDragSession } from "./dragsession";
+import { planEvenInsert, planRemoval, readGrow } from "./paneequalize";
 
 type Dir = "row" | "column";
 
@@ -393,14 +400,24 @@ export class Grid {
   private insertBeside(at: LeafNode, leaf: LeafNode, dir: Dir, before = false): void {
     const parent = at.parent;
     if (parent && parent.dir === dir) {
-      // Same-direction split: add a sibling next to the target, giving it an
-      // equal share of the row/column.
+      // Same-direction split: add a sibling next to the target, at an equal
+      // share of the row/column. The weights come from `planEvenInsert`, which
+      // reads the row as it stands and hands back every child's grow — the
+      // newcomer at the mean, so a row that was even is even again (#936).
+      // Writing all of them back (not just the newcomer's) is what makes the
+      // module the single source of the row's arithmetic; the incumbents'
+      // numbers are unchanged, so this rewrite moves no existing pane.
       const idx = parent.children.indexOf(at);
-      parent.children.splice(before ? idx : idx + 1, 0, leaf);
+      const plan = planEvenInsert(
+        parent.children.map((c) => readGrow(nodeEl(c).style.flexGrow)),
+        idx,
+        before
+      );
+      parent.children.splice(plan.insertedIndex, 0, leaf);
       leaf.parent = parent;
-      const share = 1 / (parent.children.length - 1);
-      for (const c of parent.children) nodeEl(c).style.flex ||= "1 1 0";
-      nodeEl(leaf).style.flex = `${share} 1 0`;
+      parent.children.forEach((c, i) => {
+        nodeEl(c).style.flex = `${plan.weights[i]} 1 0`;
+      });
       this.renderSplit(parent);
     } else {
       // Cross-direction: replace the leaf with a new 2-way split.
@@ -466,16 +483,37 @@ export class Grid {
 
   /** Detach a leaf's element and unlink it from the tree, collapsing a
    *  now-single-child split. Does NOT dispose the pane — used by close (which
-   *  disposes after), minimize, and move. */
+   *  disposes after), minimize, and move.
+   *
+   *  The leaving pane's weight is handed to its surviving siblings in equal
+   *  parts (`planRemoval`) instead of being dropped on the floor. Dropping it
+   *  is not free even though flex always fills the split: flex re-shares the
+   *  freed space PROPORTIONALLY, so the pane that was already biggest takes
+   *  nearly all of it and a sliver stays a sliver — the "close a pane, get
+   *  dead unusable space back" of #936. */
   private removeFromTree(leaf: LeafNode): void {
     const parent = leaf.parent;
     leaf.pane.el.remove();
     if (!parent) {
       this.root = null;
     } else {
-      parent.children.splice(parent.children.indexOf(leaf), 1);
-      if (parent.children.length === 1) this.collapse(parent);
-      else this.renderSplit(parent);
+      const idx = parent.children.indexOf(leaf);
+      const weights = planRemoval(
+        parent.children.map((c) => readGrow(nodeEl(c).style.flexGrow)),
+        idx
+      );
+      parent.children.splice(idx, 1);
+      if (parent.children.length === 1) {
+        // A one-child split is about to be replaced by that child, which takes
+        // the SPLIT's own weight in the grandparent's slot — so there is no
+        // sibling to redistribute to and nothing `weights` could usefully say.
+        this.collapse(parent);
+      } else {
+        parent.children.forEach((c, i) => {
+          nodeEl(c).style.flex = `${weights[i]} 1 0`;
+        });
+        this.renderSplit(parent);
+      }
     }
     leaf.parent = null;
   }

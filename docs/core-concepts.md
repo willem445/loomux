@@ -221,9 +221,17 @@ Loomux arranges panes as a **matrix**, not a lopsided staircase:
 - **Split down** (`Ctrl+Shift+O`) adds one below.
 
 Splitting again *in the same direction* adds a sibling column or row, so
-repeated splits build an even grid instead of nesting ever-smaller boxes.
+repeated splits build an even grid instead of nesting ever-smaller boxes. The
+new pane arrives at an equal share: split four times and you have five panes of
+the same size, not one big pane and a row of slivers.
 
-Drag the divider between two panes to **resize** them.
+Drag the divider between two panes to **resize** them. A divider you moved
+stays where you put it — a later split or close re-shares the space around it
+rather than levelling it back out.
+
+**Closing a pane** hands its space back to the panes beside it in equal parts,
+so the smallest pane gains the most. Close one of five equal panes and the other
+four are four equal panes again.
 
 ### Rearranging without re-splitting
 
