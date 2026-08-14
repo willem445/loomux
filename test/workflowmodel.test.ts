@@ -1338,7 +1338,8 @@ test("deleting a broken block deletes THAT block — not everything shaped like 
 // ---------- model knobs: effort / context (#687) ----------
 
 /** The `agent_cli_knobs` replies the pane fetches per CLI, verbatim from
- *  `CLI_CAPS` (mod.rs) — the pane never mirrors a vendor fact, it asks. */
+ *  `CLI_CAPS` (crates/loomux-engine/src/model.rs) — the pane never mirrors a
+ *  vendor fact, it asks. */
 const KNOBS: Record<string, CliKnobs> = {
   claude: {
     cli: "claude",
@@ -1478,7 +1479,8 @@ test("with no capability data the knob checks DEFER — they never guess", () =>
 
 // ---------- opencode as a spawnable block cli (#722) ----------
 
-/** opencode's `agent_cli_knobs` reply, verbatim from `CLI_CAPS` (mod.rs). A
+/** opencode's `agent_cli_knobs` reply, verbatim from `CLI_CAPS`
+ *  (crates/loomux-engine/src/model.rs). A
  *  hand-copied literal, like every other fixture here — the note text's fidelity
  *  to the Rust source (including the `--variant` / `model-determined` substrings
  *  the assertions below match on) is pinned by `selectorknobs.test.ts`' last

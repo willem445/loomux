@@ -297,9 +297,14 @@ test("rev-237 finding 1: the opencode fixture's notes mirror the Rust source the
       .join(", ")}) — either the row's shape changed and this pattern needs updating, or the table was duplicated instead of moved`
   );
   const row = hits[0]!.m!;
+  // Report the file the scan actually matched, never a hardcoded name: the
+  // whole point of the two-root scan above is that this row's home moves, and
+  // an assertion message naming a fixed path is the same misdirection one
+  // relocation later.
+  const rowFile = hits[0]!.file;
   const declared = (key: string): string => {
     const m = row![0].match(new RegExp(`${key}: "([^"]*)"`));
-    assert.ok(m, `opencode's ${key} must be a plain string literal in mod.rs — update this reader if it stops being one`);
+    assert.ok(m, `opencode's ${key} must be a plain string literal in ${rowFile} — update this reader if it stops being one`);
     return m![1]!;
   };
   assert.equal(OPENCODE.effort.note, declared("effort_note"), "the effort note has drifted from CLI_CAPS");

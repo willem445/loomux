@@ -51,7 +51,8 @@ export function isBlockKind(v: string): v is BlockKind {
 }
 
 /** The agent CLIs a block may run. Mirrors the backend's `SUPPORTED_CLIS`
- *  (orchestration/mod.rs) — a block naming anything else is a finding, not a spawn.
+ *  (crates/loomux-engine/src/model.rs) — a block naming anything else is a
+ *  finding, not a spawn.
  *
  *  `gemini` (#267 stage 2) and `opencode` (#722) are what make "run one reviewer
  *  on a different CLI/model than the worker" buy a genuinely different model
