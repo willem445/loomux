@@ -99,9 +99,33 @@
 //! asks `serde` for `derive`. Both are argued in the manifest; the `derive`
 //! half in particular was declared unnecessary there until this batch, and
 //! is not any more.
+//!
+//! A2 batch 4 — [`model`], the shared data layer: [`model::Role`] (the closed
+//! capability class), [`model::Containment`] (the deny tier it selects), the
+//! per-CLI capability table and the pure functions over them. It is the first
+//! batch that moved something *because of what comes next* rather than because
+//! it had run out of edges: the `workflow` cluster is the batch after it, and
+//! every one of these symbols is something `workflow` reads. Moving `workflow`
+//! first would have left it reaching back into `src-tauri` for its own `kind:`
+//! type — the arrow pointing the wrong way, in the module that most needed it
+//! not to.
+//!
+//! Its finding is the mirror image of batch 2's, and worth having both. There,
+//! a source-scanning tripwire had to FOLLOW the type, because the orphan rule
+//! moved the only place its violation could be written. Here, `Role`'s
+//! `template()`/`instructions_file()` had to STAY BEHIND: an inherent impl must
+//! live in the crate defining its type, so keeping them as methods would have
+//! dragged `src-tauri/src/orchestration/templates/*.md` and the byte-golden
+//! fixture root that pins them into this crate — a *silent* relocation of
+//! product content and its blessing procedure, done as a side effect of moving
+//! an enum. They are free functions in `src-tauri` now, and the call-site
+//! rewrite that cost is one the compiler checks exhaustively. **Ask of every
+//! item on a moving type whether it is data or content**; the compiler will
+//! tell you about the rewrite, and nothing will tell you about the relocation.
 
 pub mod groupid;
 pub mod lessons;
+pub mod model;
 pub mod notify;
 pub mod report;
 pub mod termgrid;

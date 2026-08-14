@@ -219,7 +219,7 @@ impl Block {
     /// is unchanged; a custom block gets `<id>.md`.
     pub fn instructions_file(&self) -> String {
         if BUILTIN_IDS.contains(&self.id.as_str()) {
-            self.kind.instructions_file().to_string()
+            super::role_instructions_file(self.kind).to_string()
         } else {
             format!("{}.md", self.id)
         }
