@@ -217,6 +217,18 @@ impl AsRef<str> for GroupId {
     }
 }
 
+// SCRATCH PLANT — red-before-green evidence for PR #968 round 2, never merged.
+// The FULLY-QUALIFIED spelling: neither `AsRef` nor `Path` is imported in this
+// file, so this is what the violation actually looks like when written here —
+// and it is exactly what slipped through the previous shape match, which pinned
+// the trait position to the bare `AsRef`. It must redden
+// `the_orchestration_root_is_joined_with_a_group_in_exactly_one_place`.
+impl std::convert::AsRef<std::path::Path> for GroupId {
+    fn as_ref(&self) -> &std::path::Path {
+        std::path::Path::new(&self.0)
+    }
+}
+
 /// Lets a `HashMap<GroupId, _>` be probed with a `&str` without minting an id
 /// just to look one up.
 impl Borrow<str> for GroupId {
