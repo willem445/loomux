@@ -1,11 +1,21 @@
 // Pure filename → icon mapping for the file tree (issue #174). Two halves, both
 // DOM-free and node:test-covered: `iconCategory(filename)` classifies a name
-// into one of a dozen buckets, and `iconSvg(category)` returns an inline 16×16
-// SVG string. The SVGs use `stroke`/`fill="currentColor"` so they inherit the
-// pane's text colour and theme for free — no icon font, sprite sheet, or icon
-// package (keeps the feature "lightweight", and matches the FOLDER_ICON pattern
-// already in pane.ts). Classification never throws: an unknown name always
+// into one of a dozen buckets, and `iconSvg(category)` returns the inline SVG
+// string for that bucket. Classification never throws: an unknown name always
 // resolves to the generic "file" bucket.
+//
+// The ARTWORK half moved to src/icons.ts in #879 slice K — this module kept the
+// classification, which is the part with the decisions in it, and now names a
+// vendored glyph per category instead of hand-drawing one. That is also where a
+// tree row gets its colour: the registry dyes each glyph by its role, so a
+// listing separates code from data from folders at a glance rather than being
+// fifteen shapes in one grey.
+
+import { icon, type IconName } from "./icons.ts";
+
+/** The box every tree row's glyph renders in — unchanged from the hand-drawn set,
+ *  so the migration moves no row by a pixel. */
+const TREE_ICON_PX = 14;
 
 export type IconCategory =
   | "folder"
@@ -88,38 +98,41 @@ export function iconCategory(filename: string): IconCategory {
   return EXT_CATEGORY[ext] ?? "file";
 }
 
-// ---------- inline SVGs ----------
+// ---------- category → glyph ----------
 //
-// Each is a 16×16 glyph. Kept deliberately simple and monochrome; distinct
-// enough to scan a tree at a glance. currentColor means they follow the theme.
-
-const svg = (inner: string): string =>
-  `<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round">${inner}</svg>`;
-
-// A plain page outline reused as the base for text-like glyphs.
-const PAGE = `<path d="M4 1.6h5l3 3v9.8H4z"/><path d="M9 1.6v3h3"/>`;
-
-const ICONS: Record<IconCategory, string> = {
-  folder: svg(`<path d="M1.7 4c0-.6.5-1 1-1h3l1.3 1.4h6c.6 0 1 .4 1 1v6.2c0 .6-.4 1-1 1H2.7c-.5 0-1-.4-1-1z"/>`),
-  "folder-open": svg(`<path d="M1.7 4c0-.6.5-1 1-1h3l1.3 1.4h6c.6 0 1 .4 1 1v1H1.7z"/><path d="M1.7 6.4h12.6l-1.2 6c-.1.5-.5.8-1 .8H2.9c-.5 0-.9-.3-1-.8z"/>`),
-  code: svg(`${PAGE}<path d="M6.4 8.4 5 9.8l1.4 1.4"/><path d="M9.6 8.4 11 9.8l-1.4 1.4"/>`),
-  rust: svg(`${PAGE}<circle cx="8" cy="9.6" r="2.2"/><path d="M8 7.4v-1M8 12.8v-1M5.8 9.6h-1M11.2 9.6h-1"/>`),
-  python: svg(`${PAGE}<path d="M6.2 8.2h3.2c.5 0 .8.3.8.8v1c0 .5-.3.8-.8.8H7.8c-.5 0-.8.3-.8.8v1"/><circle cx="7" cy="7.6" r=".01"/>`),
-  json: svg(`${PAGE}<path d="M7 7.4c-1 0-1 .8-1 1.2s0 1.2-1 1.2c1 0 1 .8 1 1.2s0 1.2 1 1.2"/><path d="M9 7.4c1 0 1 .8 1 1.2s0 1.2 1 1.2c-1 0-1 .8-1 1.2s0 1.2-1 1.2"/>`),
-  markdown: svg(`${PAGE}<path d="M5.4 11.4V8.2l1.4 1.6 1.4-1.6v3.2"/><path d="M10.4 8.4v3M9.4 10.4l1 1 1-1"/>`),
-  web: svg(`${PAGE}<circle cx="8" cy="9.6" r="2.4"/><path d="M5.6 9.6h4.8M8 7.2v4.8M6.2 8.1c.7.6 2.9.6 3.6 0M6.2 11.1c.7-.6 2.9-.6 3.6 0"/>`),
-  style: svg(`${PAGE}<path d="M5.4 8h5.2M5.4 9.8h5.2M5.4 11.6h3"/>`),
-  shell: svg(`<rect x="1.6" y="2.6" width="12.8" height="10.8" rx="1.2"/><path d="M4 6l2 2-2 2M7.8 10.4h4"/>`),
-  image: svg(`<rect x="1.6" y="2.6" width="12.8" height="10.8" rx="1.2"/><circle cx="5.4" cy="6.4" r="1.2"/><path d="M2.4 12.4 6 9l2.4 2 2.2-2.6 3 3.6"/>`),
-  config: svg(`<circle cx="8" cy="8" r="2.1"/><path d="M8 1.8v2M8 12.2v2M1.8 8h2M12.2 8h2M3.5 3.5l1.4 1.4M11.1 11.1l1.4 1.4M12.5 3.5l-1.4 1.4M4.9 11.1l-1.4 1.4"/>`),
-  lock: svg(`<rect x="3.4" y="7" width="9.2" height="7" rx="1.1"/><path d="M5.4 7V5.2a2.6 2.6 0 0 1 5.2 0V7"/>`),
-  text: svg(`${PAGE}<path d="M5.6 8h4.8M5.6 9.8h4.8M5.6 11.6h3"/>`),
-  file: svg(PAGE),
+// Which vendored icon each bucket wears. The registry decides the COLOUR from
+// the glyph's role, so this table is also the tree's legend: folders read cyan
+// (workspace), authored code reads amber (source), and everything you read
+// rather than run reads jade (content). Three hues in a dense listing, not
+// fifteen — hue groups the kinds, shape distinguishes the members, which is the
+// only way a tree of two hundred rows stays scannable.
+//
+// Lucide has no per-language marks, and inventing one per language is how an
+// icon set ends up carrying somebody else's brand: `rust` takes the gear (its
+// toolchain is the thing you actually interact with, and the glyph it replaces
+// was already a gear) and `python` takes the run glyph, which is what a script
+// is for. If that ever reads wrong, change the NAME here — never the artwork.
+export const CATEGORY_ICON: Record<IconCategory, IconName> = {
+  folder: "folder",
+  "folder-open": "folder-open",
+  code: "file-code",
+  rust: "file-cog",
+  python: "file-play",
+  json: "file-braces",
+  markdown: "file-type",
+  web: "globe",
+  style: "palette",
+  shell: "file-terminal",
+  image: "file-image",
+  config: "file-sliders",
+  lock: "file-lock",
+  text: "file-text",
+  file: "file",
 };
 
-/** Inline SVG string for a category. */
+/** Inline SVG string for a category, dyed by the registry's role table. */
 export function iconSvg(category: IconCategory): string {
-  return ICONS[category];
+  return icon(CATEGORY_ICON[category], TREE_ICON_PX);
 }
 
 /** Convenience: the SVG for a filename in one call. */
@@ -129,5 +142,5 @@ export function fileIconSvg(filename: string): string {
 
 /** SVG for a directory row, picking the open or closed folder glyph. */
 export function folderIconSvg(open: boolean): string {
-  return open ? ICONS["folder-open"] : ICONS["folder"];
+  return iconSvg(open ? "folder-open" : "folder");
 }
