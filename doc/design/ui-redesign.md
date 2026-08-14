@@ -577,8 +577,10 @@ that disagreed with each other — the session browser painted a reviewer green 
 orchestrator violet, the group roster painted an orchestrator azure and a reviewer violet.
 They now share one table: **orchestrator azure, worker jade, reviewer violet, planner amber**,
 used by the session badges, the group roster, and the workflow pane's role chips and nodes
-alike. A role's colour is the same thing wherever it appears or it is not identity, it is
-decoration.
+alike — and `test/theme.test.ts` reads all four of those surfaces and fails on a role that
+disagrees with the table or is missing from a surface that renders every role. A role's colour
+is the same thing wherever it appears or it is not identity, it is decoration; that sentence
+is a claim, so it is measured rather than asserted.
 
 **Where the eight hues landed.** `lime` and `orchid` had no consumer at all before this
 slice: lime now marks a *human* actor in the audit log and the GitHub lane in the timeline
@@ -609,12 +611,13 @@ would be the opposite of the argument. The delivery-held badge deliberately keep
 attention dye it has always had (see its own comment in the stylesheet); the *thread* is where
 `held` becomes visible.
 
-**What changed on screen beyond the swap.** Four things, each a consequence of the design
+**What changed on screen beyond the swap.** Six things, each a consequence of the design
 rather than a preference:
 
-- The glows are gone (`--accent-glow` was the bridge's one literal). The active pane keeps an
-  accent **ring** instead, raised from 12% to 55% so it reads without the halo; two hover
-  glows go entirely.
+- The glows are gone (`--accent-glow` was the bridge's one literal). Three rules carried one:
+  the two hover glows go entirely, the drop indicator's 22px halo goes with them, and the
+  active pane keeps an accent **ring** instead, raised from 12% to 55% so it reads without
+  the halo.
 - Four hover backgrounds that used to be a hand-mixed value lighter than their rest surface
   now step `--surface-1` → `--surface-2`, so the hover lifts one rung of the ladder rather
   than landing on its own rest colour.
@@ -622,8 +625,35 @@ rather than a preference:
   which is the rationing §Elevation asks for.
 - A follow/live toggle is interaction, not a state, so `.audit-follow.on` and
   `.timeline-follow.on` take the accent instead of the old green.
+- Text and marks sitting **on** a filled hue take `--surface-0`. The eight hues are chosen to
+  be legible *as ink* on the dark grounds, so light-on-hue is the pairing that loses
+  contrast: the mic button, the voice overlay badge with its dot and spinner, and the
+  merged-PR chip move off white onto the dark ink every other filled chip already used.
+- The planner's session badge is coloured **at all**. `sessions.ts` emits a role chip for
+  every `OrchRole` and the stylesheet had rules for three of the four, so a planner session
+  rendered uncoloured — the one role whose colour was not the same wherever it appeared, on
+  the surface the role table names first.
 
-**The rule is now measured, not written down.** `test/theme.test.ts` fails on any hex or
-`rgb()`/`rgba()` below the token block, on any surviving value from the retired palette
-anywhere in `src/`, and on any reference to a deleted bridge name. Rule 1 was prose while 401
-literals contradicted it; it is a test now.
+**The rule is now measured, not written down.** `test/theme.test.ts` fails on any hex, any
+CSS colour function, or any named colour below the token block; on a hue buried inside a
+composite token value, where the theme.ts pin cannot see it (a shadow may embed alpha-black
+and nothing else); on any surviving value from the retired palette anywhere in `src/`; and on
+any reference to a deleted bridge name. Rule 1 was prose while 401 literals contradicted it;
+it is a test now.
+
+**Three of those tests measure the ROLE rather than the value, which is the harder half.**
+A migration that puts the right pigment in the wrong channel looks perfect and reads wrong,
+and no contrast or distinctness check can see it:
+
+- *One role table.* All four surfaces that name an agent role — session badges, the group
+  roster, the workflow pane's nodes and its chips — are read and compared against the table
+  written above, and the role list itself comes from the `OrchRole` union so a fifth role
+  cannot be added and silently skipped. A role missing from a surface that renders every
+  role fails too: that is how a planner badge went uncoloured for as long as it did.
+- *No position mixes channels.* A rule and its variants (`.x` and `.x.warn`) paint the same
+  element in the same property, so they are one position; if one answers "what is this
+  doing" and another "which thing is this", the position has two channels and one of them
+  is wrong. This is `styles.css`'s own "no `--id-*` in a state position" rule, computed.
+- *An overlay over live content stays translucent.* The drop indicator is a wash you read
+  the terminal *through*; painted opaque it stops being a preview and becomes an occluder.
+  The hue was never wrong there, which is precisely why nothing else would have caught it.

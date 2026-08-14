@@ -72,8 +72,9 @@
          sub-palette. Four of these carry the same pigment as a --state-* token above and
          that is deliberate: loomux has one palette, and the token a surface NAMES is what
          declares which question it is answering. An --id-* token may only be used through a
-         documented role mapping; "it needed a different blue" is still refused.
-         Reserved by slice A, consumed from slice B on — nothing paints one yet. */
+         documented role mapping; "it needed a different blue" is still refused. The map is
+         doc/design/ui-redesign.md, §What slice B migrated — which reserved these in slice A
+         and consumed all eight in slice B. */
   --id-rose: #e8636f;
   --id-amber: #e8a94a;
   --id-lime: #a9cc5a;
@@ -224,7 +225,10 @@ html, body {
 #tab-bar {
   flex: none; display: flex; align-items: stretch; gap: 4px;
   padding: 4px 8px 0 8px;
-  background: linear-gradient(180deg, var(--surface-2), var(--surface-1));
+  /* Flat, because it always was: the two stops of the gradient this replaced were one
+     step apart and read as a single value. The top bar's gradient is a real one and keeps
+     its two stops. */
+  background: var(--surface-1);
   border-bottom: 1px solid var(--line);
   overflow-x: auto;
 }
@@ -433,13 +437,18 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 
 /* Snap target preview: a translucent accent wash over the half (edge) or whole
    (swap) of the pane the drop would land on. Fixed-positioned in viewport
-   coords, set by Grid.positionIndicator; never intercepts the pointer. */
+   coords, set by Grid.positionIndicator; never intercepts the pointer.
+   TRANSLUCENT IS THE FEATURE, not a style: this sits over a live terminal, and
+   reading the pane underneath is how you tell which pane and which half you are
+   about to drop onto. --selection is the opaque fill the SELECTED-ROW rules take;
+   an overlay over live content is not a fill, so this keeps the 14% wash it has
+   always had, expressed over the accent. */
 .drop-indicator {
   position: fixed;
   z-index: 60;
   pointer-events: none;
   border-radius: 8px;
-  background: var(--selection);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
   border: 2px solid var(--accent);
   box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 25%, transparent);
   transition: left 0.08s var(--ease), top 0.08s var(--ease),
@@ -1182,9 +1191,16 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
    sit on the same row and mean something else entirely. A source with no rule
    here still renders as the base chip above: uncoloured, never unlabelled. */
 .session-badge.opencode { background: color-mix(in srgb, var(--id-jade) 16%, transparent); color: var(--id-jade); }
+/* The four agent roles, in the one role table this app has: orchestrator azure, worker
+   jade, reviewer violet, planner amber. Every surface that names a role uses it — this
+   list, .group-role.role-* and the workflow pane's .wf-node-* / .wf-chip-* — and
+   test/theme.test.ts reads all four surfaces and fails on a role that disagrees or is
+   missing. sessions.ts emits this chip for EVERY OrchRole, so a role with no rule here
+   renders uncoloured; planner did, until slice B. */
 .session-badge.orch-role.orchestrator { background: color-mix(in srgb, var(--id-azure) 16%, transparent); color: var(--id-azure); }
 .session-badge.orch-role.worker { background: color-mix(in srgb, var(--id-jade) 16%, transparent); color: var(--id-jade); }
 .session-badge.orch-role.reviewer { background: color-mix(in srgb, var(--id-violet) 16%, transparent); color: var(--id-violet); }
+.session-badge.orch-role.planner { background: color-mix(in srgb, var(--id-amber) 16%, transparent); color: var(--id-amber); }
 /* #1: the PR chip, shown only once the task board records one for this
    session's work — a distinct accent from the role chips so it reads as
    "external reference", not another identity badge. */
@@ -1727,7 +1743,10 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   padding: 8px 16px; font-size: 12px; cursor: pointer;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-.app-toast.info { background: color-mix(in srgb, var(--id-azure) 14%, transparent); color: var(--id-azure); border-color: color-mix(in srgb, var(--id-azure) 35%, transparent); }
+/* A toast reports what just happened, so both variants sit on the state channel: the base
+   is --state-danger and the informational one is --state-working (the same pigment the
+   identity azure carries — what differs is which question the token answers). */
+.app-toast.info { background: color-mix(in srgb, var(--state-working) 14%, transparent); color: var(--state-working); border-color: color-mix(in srgb, var(--state-working) 35%, transparent); }
 .app-toast.visible { display: block; }
 
 /* ---------- git view ---------- */
@@ -2718,8 +2737,12 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   flex: none; width: 60px; height: 5px; border-radius: 3px; overflow: hidden;
   background: var(--surface-2); border: 1px solid var(--surface-2);
 }
+/* The budget meter is a THREE-STEP STATE RAMP — healthy, warn, over — so all three
+   variants sit on the state channel. An --id-* base here would be a channel mixed inside
+   one position: retune the identity hue for lane separability and the healthy bar follows
+   while its own siblings do not. Same pigment either way; the token name is the decision. */
 .group-auto-fill {
-  height: 100%; width: 0%; background: var(--id-jade); border-radius: 3px;
+  height: 100%; width: 0%; background: var(--state-ok); border-radius: 3px;
   transition: width 0.3s ease;
 }
 .group-auto-fill.warn { background: var(--state-attention); }
@@ -2736,8 +2759,9 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 }
 .group-auto-binput.sm { width: 52px; }
 .group-auto-unit { color: var(--ink-dim); font-size: 10px; }
+/* The autonomous tick's LIVE state, not a label for which thing this is. */
 .group-auto-status {
-  font-size: 10.5px; color: var(--id-azure); white-space: nowrap;
+  font-size: 10.5px; color: var(--state-working); white-space: nowrap;
 }
 .group-auto-status[hidden] { display: none; }
 .group-auto-suspend {
@@ -3717,7 +3741,10 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .wf-node-g:hover .wf-port-out { fill: var(--accent); stroke: var(--accent); r: 6; }
 .wf-port-in { fill: var(--ink-faint); stroke: none; }
 .wf-node { fill: var(--surface-2); stroke: var(--line); stroke-width: 1; }
-.wf-node-orchestrator { stroke: var(--accent); }
+/* Identity, not interaction: a node's stroke says WHICH role it is. It was --accent, which
+   is token-identical to the selected-node stroke above, so the graph could not draw a
+   selected orchestrator at all. */
+.wf-node-orchestrator { stroke: var(--id-azure); }
 .wf-node-worker { stroke: var(--id-jade); }
 .wf-node-reviewer { stroke: var(--id-violet); }
 .wf-node-planner { stroke: var(--id-amber); }
