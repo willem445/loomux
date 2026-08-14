@@ -471,7 +471,14 @@ from a unit test of product code, agents are banned from running cargo locally
     and once it landed in the engine the edge pointed forward. Nothing in either
     file changed but the prefix on an import — `super::workflow::…` and
     `super::mergeq::…` became `crate::…`, and the two `#[cfg(test)]` modules'
-    `crate::orchestration::…` imports became `crate::…`.
+    `crate::orchestration::…` imports became `crate::…`. The re-export is the
+    plain module form — the two `pub mod` lines in `orchestration/mod.rs` become
+    `pub use loomux_engine::{mergeq, mergeqview};` — with no flat item
+    re-export beside it, because every consumer reaches these items through the
+    module (`super::mergeq::{GateSpec, …}`, `orchestration::mergeqview::project`)
+    rather than as a bare `orchestration::…` name. Batches 3 and 4 needed the
+    extra lines; this one does not, and that is a fact about the call sites
+    rather than a difference in policy.
 
     **A cycle decides a batch's contents; a chain only invites them.** That is
     the finding, and it is the counterweight to batch 5's. There, `workflow` and
