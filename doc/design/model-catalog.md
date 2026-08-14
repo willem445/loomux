@@ -98,8 +98,9 @@ through to `sonnet`. That is a choice nobody made, displayed as if they had, and
 it would leave no way back to "leave it to loomux" once anything was picked: a
 field *narrower* than the free text it replaced, which is the one thing this
 issue may not produce. `blockModelOptions` prepends `INHERIT_MODEL` — but only
-when there is a menu to put it in front of, since a CLI with nothing curated and
-nothing probed (`gemini`, today) opens straight onto the custom input, where an
+when there is a menu to put it in front of, since a CLI with no curated row and
+nothing back from its probe (`gemini`, today — it is probed like any other; the
+reply is what carries nothing) opens straight onto the custom input, where an
 empty box already means what the blank row means.
 
 **And it reads differently.** `INHERIT_MODEL_LABEL` says "the model your own CLI
@@ -156,9 +157,52 @@ the control's job is to decide a payload, and a stale pick must never reach it.
   is pressed, and a per-form catalog would re-probe every CLI across that
   handover. It lives in its own module because `modelcatalog.ts` must stay
   reachable from `node --test`, and the instance has to be wired to `pty.ts`.
+  What that promotion costs, and how it is paid, is the section below.
 - `workflowknobs.ts` takes the capability answer as an injected `KnobLookup` —
   the same seam `analyzeWorkflow` takes — so the knob rules are testable with no
   browser, no Tauri host and no backend.
-- Slice A's opencode enumerator (`opencode models`) plugs in with no change here:
-  it only makes `CliProbe.models` non-empty for a CLI that reported nothing
-  before, which is the case every rule above was written for.
+- Slice A's opencode enumerator (`opencode models`, shipped in #939) plugged in
+  with no change here: it only makes `CliProbe.models` non-empty for a CLI that
+  reported nothing before, which is the case every rule above was written for. It
+  did add one thing this note has to answer, and the section below is that answer.
+
+## A memo in front of the backend inherits the backend's caching rule
+
+`probe_agent_cli` (cliprobe.rs) caches **complete** probes for the app run and
+deliberately does not cache the rest:
+
+> failures and partial answers are NOT — a CLI installed while loomux is running
+> must become launchable on the next probe … and by the same argument an opencode
+> whose `models` run failed — a network blip, a provider configured or
+> `opencode auth login` completed a minute later — must be able to report its real
+> list without a restart.
+
+While `ModelCatalog` was a field on each `WelcomeForm` that rule was somebody
+else's problem: the front memo died with the pane, so "open a new pane" reached
+the backend again and the recovery worked. Promoting the instance to app scope
+removes that expiry — and a front memo with no expiry, holding an answer the
+backend refused to hold, does not *duplicate* the cache. It makes it
+**unreachable**. Install gemini mid-session and every surface goes on reporting it
+missing until loomux restarts.
+
+So the front memo keeps only what the backend would have kept. `worthKeeping` is
+that test, and it reads completeness off the reply because completeness is
+deliberately not a wire field ("a caching fact, not a wire field"): an answer that
+carries **no list** is exactly the answer a later probe might improve on. For an
+enumerator CLI that is the backend's own predicate verbatim (`complete =
+!listed.is_empty()`); for a help-parsed one it is stricter, and stricter in the
+safe direction — the cost of being wrong is one IPC to a backend holding the
+answer in a HashMap, against a session-long "this CLI has nothing".
+
+Freshness is then bounded from the caller's side, because "never cached" must not
+become "asked on every paint":
+
+| caller | asks | so recovery is |
+| --- | --- | --- |
+| launcher | per CLI change (`applyRoleModels`) | change the CLI select |
+| workflow pane | once per CLI per **pane** (`modelProbes`) | open a workflow pane |
+
+The block form re-renders on every knob edit, so probing from its render path
+would be a subprocess per paint for exactly the CLIs that have nothing to say.
+Per pane is also precisely the granularity the per-form memo used to give, which
+is what makes this a restoration rather than a new policy.

@@ -374,13 +374,17 @@ export class WelcomeForm {
   private rosterTimer: number | null = null;
   private permsSel: HTMLSelectElement;
   private agentWarn: HTMLElement;
-  /** The shared model catalog (#935): one probe per program per app run (the
-   *  backend caches too), and the one merge of curated suggestions with what the
-   *  CLI reported. Owns the memo this form used to keep itself, so the models it
+  /** The shared model catalog (#935): one probe per program for an answer worth
+   *  keeping, and the one merge of curated suggestions with what the CLI
+   *  reported. Owns the memo this form used to keep itself, so the models it
    *  offers and the models the workflow pane's block editor offers come from the
    *  same code — and, being the app-wide instance (`modelprobe.ts`), from the same
    *  memo: this pane BECOMES that editor when "Edit workflow…" is pressed, and a
-   *  per-form catalog would re-probe every CLI across that handover. */
+   *  per-form catalog would re-probe every CLI across that handover.
+   *
+   *  A probe that found nothing is NOT kept (`worthKeeping`), so this form asking
+   *  again — which it does on every CLI change — is what reaches a CLI installed
+   *  since the app started. */
   private catalog = modelCatalog;
   /** Autopilot flags per program, memoized. Empty string = the CLI has no
    *  unattended flag surface, so the toggle is hidden/inert for it (#101). */

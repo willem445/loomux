@@ -9,8 +9,20 @@
 // memo is the point: `ModelCatalog.probe` collapses repeated asks into one call
 // per program, and a per-form instance would restart that memo every time a form
 // opens — including when the launcher pane BECOMES a workflow pane, which is the
-// exact handover this slice adds a second consumer for. The backend caches too;
-// this keeps the IPC and its worst-case timeout off the second surface as well.
+// exact handover this slice adds a second consumer for.
+//
+// **What promoting a memo to app scope costs, and why it is safe to pay here.**
+// A per-form memo forgets everything when the form closes, so a stale answer had
+// a natural expiry: open a new pane and the machine is asked again. At app scope
+// there is no such moment, and an answer kept here is kept until loomux exits. So
+// the memo keeps only an answer worth keeping (`worthKeeping`), mirroring the
+// backend's own rule — `probe_agent_cli` caches complete probes and deliberately
+// does NOT cache failures or partial answers, "a CLI installed while loomux is
+// running must become launchable on the next probe". A front-memo that kept those
+// would not duplicate that cache, it would make it unreachable: install gemini
+// mid-session and every surface would go on reporting it missing until a restart.
+// Freshness is bounded from the other side by the callers, which ask per surface
+// rather than per paint.
 
 import { probeAgentCli } from "./pty";
 import { ModelCatalog } from "./modelcatalog";

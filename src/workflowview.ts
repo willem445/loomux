@@ -55,7 +55,7 @@ import {
 } from "./workflowmodel";
 import { agentCliKnobs } from "./pty";
 import { knobState, type CliKnobs, type KnobStates } from "./selectorknobs";
-import { blockModelOptions } from "./modelcatalog";
+import { blockModelOptions, type CliProbe } from "./modelcatalog";
 import { modelCatalog } from "./modelprobe";
 import { ModelPicker } from "./modelpicker";
 import { BLOCK_DEFAULT_MODEL_LABEL } from "./modelnames";
@@ -225,6 +225,22 @@ export class WorkflowView {
    *  keystroke. Separate from `cliKnobs` because "asked, still in flight" and
    *  "asked, failed" are different states and only one of them is answerable. */
   private knobsAsked = new Set<string>();
+  /** One model probe per CLI per PANE — deliberately not per paint, and not once
+   *  per app run either.
+   *
+   *  Not per paint: the block form re-renders on every knob edit, and the catalog
+   *  no longer keeps an answer that carried nothing (`worthKeeping`), so probing
+   *  from the render path would be a subprocess per paint for exactly the CLIs
+   *  that have no answer to give.
+   *
+   *  Not once per app run: per pane IS the recovery granularity the app-wide memo
+   *  would otherwise cost. Install a CLI mid-session, open a workflow pane, and it
+   *  is asked again — which is what the pre-#935 per-form memo gave for free.
+   *
+   *  The PROMISE is what's held, not an "already asked" flag, so a second block
+   *  form painted while the first probe is still in flight still gets its
+   *  re-set. */
+  private modelProbes = new Map<string, Promise<CliProbe>>();
   /** Redraws the block form's two knob rows in place, or `null` when no block
    *  form is on screen. The form deliberately does not re-render on a model edit
    *  (it would rebuild the input under the caret), so the rows that depend on the
@@ -837,6 +853,16 @@ export class WorkflowView {
     return caps === undefined ? null : knobState(caps, cli, model);
   };
 
+  /** Ask what models `cli` reports, at most once per pane — see {@link modelProbes}. */
+  private probeModels(cli: string): Promise<CliProbe> {
+    let p = this.modelProbes.get(cli);
+    if (!p) {
+      p = modelCatalog.probe(cli);
+      this.modelProbes.set(cli, p);
+    }
+    return p;
+  }
+
   /** Fetch `agent_cli_knobs` for every CLI the file names, once each (#687).
    *
    *  The pane mirrors no vendor capability of its own — which knobs a CLI has, and
@@ -1257,8 +1283,9 @@ export class WorkflowView {
     // dropdown, one catalog — the CLI's own reported models merged over this
     // repo's curated suggestions — with the `custom…` escape that keeps it a
     // wider field than the free-text box it replaces, not a narrower one. A CLI
-    // this repo has no curated row for (`gemini`) and no probe reply from offers
-    // nothing to pick, and the picker opens straight onto that custom input.
+    // this repo has no curated row for (`gemini`) is still probed like any
+    // other — it is the REPLY that carries nothing today — and with nothing on
+    // either side the picker opens straight onto that custom input.
     const cli = b.cli.trim();
     const picker = new ModelPicker({
       selectClass: "wf-input",
@@ -1324,13 +1351,20 @@ export class WorkflowView {
 
     // What the CLI on THIS machine reports, once it answers. Only re-set when it
     // reported something — re-setting an identical list would rebuild the menu
-    // under a human who may be mid-type — and only while this form is still the
-    // one on screen. The fallback is re-read from the MODEL rather than closed
-    // over from `b`: by the time this lands the human may have chosen the blank
-    // row, and a stale `b.model` would re-select the id they just cleared.
+    // for no gain — and only while this form is still the one on screen. The
+    // fallback is re-read from the MODEL rather than closed over from `b`: by the
+    // time this lands the human may have chosen the blank row, and a stale
+    // `b.model` would re-select the id they just cleared.
     if (cli) {
-      void modelCatalog.probe(cli).then((p) => {
+      void this.probeModels(cli).then((p) => {
         if (!p.models.length || !this.formPane.contains(picker.root)) return;
+        // Never under the caret. `setOptions` re-runs `pickerSelection`, and an
+        // id the probe turns out to carry resolves to the DROPDOWN branch —
+        // which hides the custom input being typed into, sending the rest of the
+        // keystrokes nowhere. The pane takes the same care with the capability
+        // reply (`ensureCliKnobs`), and for the same reason. The menu is not
+        // lost: the next form render paints it from the resolved catalog.
+        if (picker.root.contains(document.activeElement)) return;
         const now = this.analysis.workflow.blocks[index]?.model ?? "";
         picker.setOptions(blockModelOptions(modelCatalog.models(cli)), now, cli);
       });

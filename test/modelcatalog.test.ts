@@ -34,6 +34,8 @@ import {
   mergeModelOptions,
   modelOptions,
   pickerSelection,
+  probeFailure,
+  worthKeeping,
   type CliProbe,
 } from "../src/modelcatalog.ts";
 import { INHERIT_MODEL, ORCH_CLIS } from "../src/orchclis.ts";
@@ -281,6 +283,89 @@ test("a probe that rejects degrades to unavailable — it never rejects onwards"
   assert.deepEqual(p.models, []);
   assert.match(p.error ?? "", /ipc down/);
   assert.deepEqual(catalog.models("claude"), curatedModels("claude"), "and the menu still fills");
+});
+
+// ── what the memo may keep (#935 slice C review, rev-507 finding 1) ──────────
+//
+// The catalog is now ONE app-wide instance rather than a field on each welcome
+// form, so its memo has no natural expiry — a pane closing used to be one. A
+// front memo that outlives the backend's own rule does not duplicate the cache,
+// it makes it unreachable, and the rule it must not outlive is stated in
+// cliprobe.rs: complete probes are cached for the app run, "failures and partial
+// answers are NOT — a CLI installed while loomux is running must become
+// launchable on the next probe".
+
+test("a probe that failed is not kept: the next ask reaches a CLI installed since (#935)", async () => {
+  // The reported regression, as a sequence: loomux starts with gemini not on
+  // PATH, a surface probes, the human installs gemini. With the failure memoized
+  // there is no next probe, and every surface reports it missing until loomux
+  // restarts — the recovery cliprobe.rs goes out of its way to keep.
+  let calls = 0;
+  const catalog = new ModelCatalog(async () => {
+    calls++;
+    return calls === 1 ? probeFailure("'gemini' was not found on PATH") : probe(["pro", "flash"]);
+  });
+  const first = await catalog.probe("gemini");
+  assert.equal(first.available, false);
+  assert.equal(catalog.cached("gemini"), null, "a failure leaves nothing behind to serve");
+
+  const second = await catalog.probe("gemini");
+  assert.equal(second.available, true, "the retry must surface the success, not the cached failure");
+  assert.deepEqual(second.models, ["pro", "flash"]);
+  assert.equal(calls, 2, "and it must have actually re-asked the machine");
+});
+
+test("an available CLI that reported no list is not kept either — that is a PARTIAL answer", async () => {
+  // opencode's enumerator failing (a network blip, a provider configured or
+  // `opencode auth login` completed a minute later) returns available: true with
+  // an empty list, which the backend declines to cache for exactly the reason it
+  // declines to cache a failure. Completeness is deliberately not a wire field,
+  // so "carries no list" is how the front memo reads the same fact.
+  let calls = 0;
+  const catalog = new ModelCatalog(async () => {
+    calls++;
+    return calls === 1 ? probe([]) : probe(["opencode/deepseek-v4-flash-free"]);
+  });
+  assert.deepEqual((await catalog.probe("opencode")).models, []);
+  assert.equal(catalog.cached("opencode"), null);
+  assert.deepEqual((await catalog.probe("opencode")).models, ["opencode/deepseek-v4-flash-free"]);
+  assert.equal(calls, 2);
+});
+
+test("worthKeeping is the backend's rule, read off the reply", () => {
+  assert.equal(worthKeeping(probe(["sonnet"])), true);
+  assert.equal(worthKeeping(probe([])), false, "available but nothing to say is a partial answer");
+  assert.equal(worthKeeping(probeFailure("not found")), false);
+  // A failure can never carry models, but the predicate must not depend on that.
+  assert.equal(worthKeeping({ available: false, models: ["sonnet"], error: "x" }), false);
+});
+
+test("an answer worth keeping IS kept — the re-ask is bounded to the answers that aren't", async () => {
+  // The other half of the rule: a real list must not turn into an IPC per paint.
+  let calls = 0;
+  const catalog = new ModelCatalog(async () => {
+    calls++;
+    return probe(["sonnet"]);
+  });
+  await catalog.probe("claude");
+  await catalog.probe("claude");
+  await catalog.probe("claude");
+  assert.equal(calls, 1, "a complete probe is asked once for the app run");
+});
+
+test("concurrent askers share one probe even when the answer is not kept", async () => {
+  // Dropping the memo on a failure must not turn N surfaces opening at once into
+  // N subprocesses: the in-flight promise is still shared, and only a caller that
+  // asks AFTER it resolved pays for a fresh one.
+  let calls = 0;
+  const catalog = new ModelCatalog(async () => {
+    calls++;
+    return probeFailure("not found");
+  });
+  await Promise.all([catalog.probe("gemini"), catalog.probe("gemini"), catalog.probe("gemini")]);
+  assert.equal(calls, 1, "one flight, three askers");
+  await catalog.probe("gemini");
+  assert.equal(calls, 2, "and the ask after it resolved is the recovery path");
 });
 
 test("models() paints from curated before the probe lands, merged after", async () => {
