@@ -209,10 +209,16 @@ test("a block that declares no model opens on the blank row, not on the first su
   const launcher = curatedModels("claude");
   assert.equal(pickerSelection(launcher, "").selected, "sonnet", "the launcher's own list falls to first");
 
+  // The claim, asserted FIRST so a red lands on it rather than on the list shape
+  // that produces it: what a block with no `model:` OPENS ON.
   const block = blockModelOptions(launcher);
-  assert.deepEqual(block, [INHERIT_MODEL, ...launcher]);
-  assert.equal(pickerSelection(block, "").selected, INHERIT_MODEL);
+  assert.equal(
+    pickerSelection(block, "").selected,
+    INHERIT_MODEL,
+    "a block with no model: must open on the blank row, not on a suggestion"
+  );
   assert.equal(pickerSelection(block, "").showCustom, false);
+  assert.deepEqual(block, [INHERIT_MODEL, ...launcher]);
 });
 
 test("a CLI whose curated row already carries the blank row gets no second one", () => {
@@ -230,8 +236,13 @@ test("a CLI with nothing to offer stays empty, so the picker opens on its custom
   // `--help` parser reports nothing for it either. A lone "(unset)" row in front
   // of an empty menu would be a dropdown whose only purpose is to be escaped
   // from; an empty custom box already means what the blank row means.
-  assert.deepEqual(blockModelOptions(modelOptions("gemini", null)), []);
-  assert.equal(pickerSelection(blockModelOptions([]), "").showCustom, true);
+  const gemini = blockModelOptions(modelOptions("gemini", null));
+  assert.equal(
+    pickerSelection(gemini, "").showCustom,
+    true,
+    "a lone blank row would hide the free-text box behind a menu with one escape in it"
+  );
+  assert.deepEqual(gemini, []);
   // …and the moment the machine reports something, the menu appears WITH the row.
   const probed = modelOptions("gemini", probe(["pro", "flash"]));
   assert.deepEqual(blockModelOptions(probed), [INHERIT_MODEL, "pro", "flash"]);
