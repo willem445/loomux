@@ -10752,12 +10752,24 @@ pub struct OrchRegistry {
     /// a board row together as one unit — and the answer path takes this lock
     /// on a human's keystroke while the board's is held across MCP bursts.
     ///
-    /// **Lock order: takes no other registry lock while held**, except
-    /// `AUDIT_LOCK` on the refusal paths (which must record what was turned
-    /// away before returning) — the same nesting `tasks_lock` already has. The
-    /// answer path's success audit and its pane DELIVERY both happen after the
-    /// guard is dropped: an audit write is cheap, but a notice is a delivery,
-    /// and a delivery enqueues.
+    /// **Lock order: takes no other registry lock while held, with two stated
+    /// exceptions — both leaves, and both the same nesting `tasks_lock` already
+    /// has:**
+    ///
+    /// 1. `AUDIT_LOCK`, on the refusal paths, which must record what was turned
+    ///    away before returning.
+    /// 2. **The app-handle mutex, on every successful write.** `write_questions`
+    ///    emits `orch-questions-changed` while the guard is held, which takes
+    ///    `self.app` — exactly as `write_tasks` takes it via
+    ///    `emit_tasks_changed` under `tasks_lock`. It is a leaf (nothing takes a
+    ///    registry lock while holding the app handle), so it cannot cycle; it is
+    ///    named here because "no other registry lock" read as covering it, and a
+    ///    lock-order claim that omits a lock it actually takes is the kind of
+    ///    thing a future deadlock hides behind.
+    ///
+    /// The answer path's success audit and its pane DELIVERY both happen after
+    /// the guard is dropped: an audit write is cheap, but a notice is a
+    /// delivery, and a delivery enqueues.
     questions_lock: Mutex<()>,
     /// Serializes every read-modify-write of a group's `usage.json` (#743 S4b).
     ///

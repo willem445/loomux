@@ -44,6 +44,13 @@
 //!    and `orch_question_answer` hard-codes [`AnswerSource::Webview`] rather
 //!    than accepting a `source` string. There is no spelling of "answer as
 //!    someone else", so there is nothing to validate and nothing to forge.
+//!    **The closed SET is itself pinned**, not just the type's whereabouts:
+//!    `the_mcp_surface_has_no_path_to_the_answer_entry_point` reads the variant
+//!    list off this file's own declaration, so an `AnswerSource::Agent` added
+//!    here — a legitimate home for the type, and therefore invisible to a
+//!    "where may it be named" check — reddens a test. Every variant is a party
+//!    empowered to settle a question the human was asked; that list is the
+//!    boundary.
 //! 3. **Provenance is durable.** Every settle and every refusal is audited
 //!    (`question-answer`, `question-reject`) carrying the source tag, so
 //!    "who answered this, and what was turned away" is reconstructable from
@@ -330,7 +337,16 @@ pub fn answer_notice(id: &str, source_tag: &str, answer: &str) -> String {
     text.chars().filter(|c| !c.is_control()).take(ANSWER_NOTICE_CAP).collect()
 }
 
-/// Drop the oldest settled rows past `keep`, preserving every pending one.
+/// Drop the longest-ASKED settled rows past `keep`, preserving every pending
+/// one.
+///
+/// **Ask order, not settle order** — the distinction is real, not pedantry. The
+/// vector is append-ordered by when a question was *asked*, and nothing
+/// re-orders it when one is settled, so a question asked early and answered
+/// late sits ahead of one asked late and answered immediately. A forward scan
+/// therefore evicts by age-since-asking, which is the useful order anyway (the
+/// oldest exchange is the least likely to still be worth reading) and is not
+/// the same thing as evicting the longest-settled row.
 ///
 /// Pending rows are never pruned at any count: a question the human has not
 /// answered is the one thing this file exists to not lose. `PENDING_MAX`
@@ -342,8 +358,8 @@ pub fn prune(questions: &mut Vec<Question>, keep: usize) {
         return;
     }
     let mut to_drop = settled - keep;
-    // Oldest first: the vector is append-ordered, so a forward scan drops the
-    // longest-settled rows.
+    // Forward scan over an ask-ordered vector, so this evicts the rows asked
+    // longest ago. Not the longest-SETTLED ones — see the doc above.
     questions.retain(|q| {
         if to_drop > 0 && q.status.is_settled() {
             to_drop -= 1;

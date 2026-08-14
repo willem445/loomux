@@ -46735,17 +46735,65 @@ fn no_agent_token_can_answer_a_question_through_the_mcp_surface() {
     // Against a PENDING question, so "unknown tool" is the only reason left for
     // the call to fail: aimed at a settled one, a real answer tool would refuse
     // for its own reasons and read as absent when it is merely blocked.
+    //
+    // Both roles, not just the orchestrator: "this name does not exist" is a
+    // claim about the whole surface, and a tool listed for nobody is still
+    // callable by anybody.
     for name in ["answer_question", "answer_human", "orch_question_answer"] {
-        let id = ask_fresh(name);
-        let out = q_call(&reg, &co, name, json!({ "id": id, "answer": "x" }));
-        assert_eq!(out["isError"], true);
-        assert!(
-            q_text(&out).contains("unknown tool"),
-            "{name} must not exist at all on the MCP surface: {}",
-            q_text(&out)
-        );
-        let _ = reg.withdraw_question(&g, "sweep", &id);
+        for (caller, who) in [(&co, "the orchestrator"), (&cw, "a worker")] {
+            let id = ask_fresh(name);
+            let out = dispatch(
+                &reg,
+                caller,
+                "tools/call",
+                &json!({ "name": name, "arguments": { "id": id, "answer": "x" } }),
+            )
+            .unwrap();
+            assert_eq!(out["isError"], true, "{who} got a non-error from {name}");
+            assert!(
+                q_text(&out).contains("unknown tool"),
+                "{name} must not exist at all on the MCP surface, for {who}: {}",
+                q_text(&out)
+            );
+            let _ = reg.withdraw_question(&g, "sweep", &id);
+        }
     }
+
+    // ---- POSITIVE CONTROL: what de-shadows every assertion above ----
+    //
+    // A sweep that finds no answer proves the boundary held ONLY IF the check
+    // could have seen one. Every assertion above is satisfied trivially when a
+    // tool simply does not exist — dispatch returns "unknown tool", nothing
+    // happens, and the question is untouched — which is indistinguishable from
+    // a tool that exists and was properly refused. Left there, this test would
+    // keep passing even if `Question::status` stopped being written at all, or
+    // if `questions()` started returning stale rows: it would be asserting
+    // against a mechanism that can no longer report the thing it is watching
+    // for.
+    //
+    // So drive the ONE path that is allowed to answer, and confirm the very
+    // same observation fires. Green above now means "nothing answered it",
+    // not "nothing could have been observed".
+    let id = ask_fresh("positive control");
+    reg.answer_question(&g, &id, "the human decided", humanq::AnswerSource::Webview)
+        .expect("the trusted webview path must be able to answer");
+    let q = reg
+        .questions(&g)
+        .unwrap()
+        .into_iter()
+        .find(|q| q.id == id)
+        .expect("the control question exists");
+    assert_eq!(
+        q.status,
+        humanq::Status::Answered,
+        "the trusted path could not answer {id} — so the sweep above proves nothing: its \
+         assertions would pass whether or not an agent had answered"
+    );
+    assert_eq!(
+        q.answer.as_deref(),
+        Some("the human decided"),
+        "the answer text must land where the sweep above looks for it"
+    );
 }
 
 /// The source half of the same guarantee: `mcp.rs` — the whole of what an
@@ -46798,6 +46846,50 @@ fn the_mcp_surface_has_no_path_to_the_answer_entry_point() {
          orch_question_answer supplies it). A new file naming it is a new answering surface — \
          which may be right (#947's bridge is planned), but is never accidental: read \
          humanq.rs's trust-boundary section, then update this list deliberately."
+    );
+
+    // ---- The closed SET of answer sources ----
+    //
+    // The two assertions above pin WHERE the type may be named. Neither pins
+    // WHAT it can spell, and that is the boundary's actual load-bearing claim:
+    // "there is no variant for an agent, and adding one would defeat the
+    // feature rather than extend it." Without this, `AnswerSource::Agent` could
+    // be added inside `humanq.rs` — a legitimate home — and every check above
+    // would stay green while the trust boundary quietly acquired an
+    // agent-shaped source.
+    //
+    // Read off the declaration rather than matched in Rust on purpose: an
+    // exhaustive `match` would fail to COMPILE on a new variant, and a compile
+    // error is the one failure that tells a reader nothing about behaviour.
+    // This fails with a sentence instead.
+    let humanq_src =
+        fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/orchestration/humanq.rs"))
+            .expect("read humanq.rs");
+    let body = humanq_src
+        .split_once("pub enum AnswerSource {")
+        .and_then(|(_, rest)| rest.split_once('}'))
+        .map(|(body, _)| body.to_string())
+        .expect(
+            "AnswerSource's declaration is no longer findable — it was renamed, moved, or grew a \
+             struct variant with its own braces. Whichever it is, this pin must be re-aimed \
+             deliberately rather than left silently matching nothing.",
+        );
+    let mut variants: Vec<String> = body
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with("//"))
+        .map(|l| l.trim_end_matches(',').to_string())
+        .collect();
+    variants.sort();
+    assert_eq!(
+        variants,
+        vec!["Webview".to_string()],
+        "the set of spellable answer sources changed. EVERY variant of AnswerSource is a way an \
+         answer can enter the registry, so this list IS the trust boundary — adding one grants a \
+         new party the power to settle a question the human was asked. A trusted surface (#947's \
+         paired chat bridge) is a legitimate addition; anything an AGENT can reach is not, and \
+         no variant may ever be constructible from mcp.rs. Update this list only alongside \
+         humanq.rs's trust-boundary section."
     );
 }
 
@@ -47156,7 +47248,7 @@ fn retention_drops_old_settled_rows_and_never_a_pending_one() {
         "settled rows are capped in the file (the audit log still has them all)"
     );
     // Oldest settled first out: q-1 is gone, the newest settled one is not.
-    assert!(!qs.iter().any(|q| q.id == "q-1"), "the longest-settled row aged out");
+    assert!(!qs.iter().any(|q| q.id == "q-1"), "the longest-ASKED settled row aged out");
     assert!(qs.iter().any(|q| q.id == format!("q-{settled}")), "the newest settled row is kept");
 
     // Ids are never reused, even after their row is dropped.

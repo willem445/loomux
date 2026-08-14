@@ -65,12 +65,24 @@ Three layers hold it, and none of them is a convention a caller can opt out of:
    source tag, so who answered — and what was turned away — is reconstructable
    from the log.
 
-Two tests keep this true as the code grows:
-`no_agent_token_can_answer_a_question_through_the_mcp_surface` drives every tool
-both roles are offered, plus the names a future slice might plausibly give an
-answer tool, and asserts the question still carries no answer; and
-`the_mcp_surface_has_no_path_to_the_answer_entry_point` scans the source, so a
-slice that wires one in quietly trips a test rather than a review.
+Two tests keep this true as the code grows, and each carries a deliberate
+guard against proving nothing:
+
+- `no_agent_token_can_answer_a_question_through_the_mcp_surface` drives every
+  tool both roles are offered, plus the names a future slice might plausibly
+  give an answer tool, and asserts the question still carries no answer. It
+  ends with a **positive control**: an answer entered through the trusted path,
+  asserted to land. Without it the sweep would pass for two indistinguishable
+  reasons — the boundary held, or nothing was ever observable — and would keep
+  passing even if the status field stopped being written.
+- `the_mcp_surface_has_no_path_to_the_answer_entry_point` scans the source: no
+  call to the entry point and no mention of `AnswerSource` in `mcp.rs`, the
+  type confined to its two homes, and — the part that pins the boundary rather
+  than the filing — **the closed set of `AnswerSource` variants**, read off the
+  declaration itself. `AnswerSource::Agent` added inside `humanq.rs` is
+  invisible to a "where may it be named" check and would hand an agent the
+  power this whole section exists to withhold; the set assertion is what
+  catches it.
 
 **Adding an answering surface** (the #947 chat bridge is the planned one): add
 an `AnswerSource` variant and a trusted entry point that supplies it. Never a
@@ -180,13 +192,39 @@ reject line carries the reason (`unknown-question`, `already-settled`,
 `invalid-answer`) and the source, which is what makes a probe visible rather
 than merely refused.
 
-## What Q1 deliberately does not do
+## What Q1 does and does not reach — state at merge
 
-The tools ship **dormant**. No role template mentions them yet: that is Q3,
-which rewrites the orchestrator's open-question invariant and pays the golden
-re-bless the change requires. Q2 adds the inbox panel, the latched attention
-reason and the toast; Q4 adds the interactive-question tool to the
-orchestrator's CLI deny tier, so the blocking dialog becomes impossible rather
-than merely discouraged. Until Q3 lands, the registry is a mechanism nothing
-calls — which is the correct state for a foundation slice, and the reason the
-tests here drive `dispatch` directly rather than an agent.
+**The tools are live and advertised from the moment this merges.** `ask_human`,
+`list_questions` and `withdraw_question` are in `tool_defs`, so every
+orchestrator in every group is offered them, with descriptions written in the
+imperative ("USE THIS INSTEAD OF YOUR CLI'S OWN INTERACTIVE QUESTION DIALOG").
+An orchestrator reading its own tool list will find `ask_human` and may call it
+on day one. Nothing about this slice is inert, and it should not be described as
+though it were.
+
+What is **not** here is the human's half:
+
+- **No surface shows the human a pending question.** The inbox panel, the
+  latched attention reason and the opt-in toast are Q2. Until then a registered
+  question is visible only in `questions.json`, in the audit log, and to agents
+  through `list_questions` — the trusted answer command exists
+  (`orch_question_answer`) but nothing in the UI calls it.
+- **No role template teaches the protocol.** Q3 rewrites the orchestrator's
+  open-question invariant — mark the task blocked citing `q-N`, re-surface from
+  `list_questions`, un-block only that task on the answer. Until it lands, an
+  orchestrator's use of `ask_human` is guided by the tool description alone.
+- **The blocking dialog is still available.** Q4 adds it to the orchestrator's
+  CLI deny tier, which is what makes the original incident impossible rather
+  than merely discouraged.
+
+The answer *delivery* is wired here: `answer_question` sends the `[loomux]`
+notice through `deliver_to_orchestrator`, so an answer that is somehow entered
+does reach the pane. The gap is upstream of that — with no inbox, there is in
+practice **no human-answer path** for a question asked between this merge and
+Q2, and such a question will sit pending until Q2 surfaces it or the
+orchestrator withdraws it.
+
+That is acceptable only because of the property the whole design is built on:
+asking never blocks. A question with no answer path costs a pending row and an
+unresolved decision — not a stalled fleet. It is still the reason Q2 should
+follow closely rather than eventually.
