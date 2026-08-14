@@ -30,17 +30,21 @@ slice, picks a dependency, or sets a policy that is the human's to set. The
 recommendation column is what this note would pick absent an answer, and the
 "blocks" column names what stays parked until the answer lands.
 
+They are numbered **H1–H9** — "H" for human — precisely so they never read as
+plan-463's track-D slice ids, which are also called D1 and D2. Anywhere below
+that a track-D slice is meant, it is written out as "track-D slice D1".
+
 | # | Decision | Options | Recommendation | Blocks |
 |---|---|---|---|---|
-| **D1** | **Auth mechanism** — where user identity comes from | (a) built-in store: loomux mints users, hashes passwords, issues sessions; (b) delegated identity: an identity-aware proxy (OIDC / SSO / Tailscale / Authelia) authenticates and loomux consumes a verified identity, mapping it to roles; (c) VPN + mTLS client certificates | **(b)** if the team already runs any IdP or identity proxy — loomux then stores **no credentials at all**, and SSO/MFA/offboarding are someone else's solved problem. **(a)** only if there is no IdP; it costs C1 roughly one to two extra weeks and gives loomux a permanent password-storage surface. §6.1 defines an `Identity` seam so this choice does not rewrite C1 either way | **C1** (server skeleton + auth) — cannot start |
-| **D2** | **TLS termination** | reverse proxy vs native TLS in the daemon | **Reverse proxy.** Battle-tested, zero TLS code and zero cert-rotation logic in loomux, and it is the same box that terminates D1(b). Native TLS is a v2 answer for a deployment with no proxy | C1 shape, E1 docs |
-| **D3** | **Remote filesystem exposure** (proposal §11 Q3) | server-declared roots only for `ft_*`/`fm_*` (registered repos, worktrees, group dirs) vs full server-FS browsing for an owner-tier session | **Server-declared roots only.** An owner-tier escape hatch can be added later behind an explicit config opt-in; it cannot be *removed* later | #925 scope, C2 roster |
-| **D4** | **Reattach scrollback contract** (Q4) | live screen + 256 KiB ring tail vs persisted scrollback on disk | **Live screen + tail** for v1. Persisted scrollback changes the server's storage design (retention, disk budget, per-pane files) and is a feature in its own right | C5 |
-| **D5** | **Per-session containers** | v1-blocking vs fast-follow after E1 (docker-ready packaging) | **Fast-follow.** Containers are defence in depth *over* §7's process-level validation, never a replacement for it (T8), so gating the first end-to-end on E2 buys no security and costs months | E2 scheduling |
-| **D6** | **Protocol sign-off** | confirm one authenticated WebSocket per client (§3) | **Confirm now**, so this note describes one protocol instead of three | C2, D1-slice fixtures |
-| **D7** | **Hosting facts** (not guessable) | who administers the server; where it sits (cloud / on-prem / office LAN); expected concurrent users; the Pi testbed network's subnet, addressing and discovery story | — | E1 docs, §8 |
-| **D8** | **Session visibility default and lifecycle** | is a newly created session **team** or **private** by default? May a private session be promoted to team, and a team session demoted to private? Who may do either? | **Private by default, promote-only, owner of the session promotes.** A default of "team" leaks by accident; demotion after the fact cannot un-see what teammates already saw, so it is a lie unless it also ends the session | §6.4, C1 data model |
-| **D9** | **Whose credentials do server-side agents act as?** — `gh` auth, agent-CLI subscriptions, push rights | one shared service account for the daemon vs per-user credentials injected per session | **Decide before C3.** This is not a detail: today an agent pushes as *the human sitting at the machine*, and on a shared server every agent's commit, push and PR is attributable to whatever the daemon holds. A shared service account is simplest and makes the audit log the only per-user attribution there is; per-user credentials preserve attribution but need a secret store loomux does not have | C3, E2 |
+| **H1** | **Auth mechanism** — where user identity comes from | (a) built-in store: loomux mints users, hashes passwords, issues connection sessions; (b) delegated identity: an identity-aware proxy (OIDC / SSO / Tailscale / Authelia) authenticates and loomux consumes a verified identity, mapping it to roles; (c) VPN + mTLS client certificates | **(b)** if the team already runs any IdP or identity proxy — loomux then stores **no credentials at all**, and SSO/MFA/offboarding are someone else's solved problem. **(a)** only if there is no IdP; it costs C1 roughly one to two extra weeks and gives loomux a permanent password-storage surface. §6.1 defines an `Identity` seam so this choice does not rewrite C1 either way | **C1** (server skeleton + auth) — cannot start |
+| **H2** | **TLS termination** | reverse proxy vs native TLS in the daemon | **Reverse proxy.** Battle-tested, zero TLS code and zero cert-rotation logic in loomux, and it is the same box that terminates H1(b). Native TLS is a v2 answer for a deployment with no proxy | C1 shape, E1 docs |
+| **H3** | **Remote filesystem exposure** (proposal §11 Q3) | server-declared roots only for `ft_*`/`fm_*` (registered repos, worktrees, group dirs) vs full server-FS browsing for an owner-tier caller | **Server-declared roots only.** An owner-tier escape hatch can be added later behind an explicit config opt-in; it cannot be *removed* later | #925 scope, C2 roster |
+| **H4** | **Reattach scrollback contract** (Q4) | live screen + 256 KiB ring tail vs persisted scrollback on disk | **Live screen + tail** for v1. Persisted scrollback changes the server's storage design (retention, disk budget, per-pane files) and is a feature in its own right | C5 |
+| **H5** | **One container per workspace session** | v1-blocking vs fast-follow after E1 (docker-ready packaging) | **Fast-follow.** Containers are defence in depth *over* §7's process-level validation, never a replacement for it (T8), so gating the first end-to-end on E2 buys no security and costs months | E2 scheduling |
+| **H6** | **Protocol sign-off** | confirm one authenticated WebSocket per client (§3) | **Confirm now**, so this note describes one protocol instead of three | C2, track-D slice D1 fixtures |
+| **H7** | **Hosting facts** (not guessable) | who administers the server; where it sits (cloud / on-prem / office LAN); expected concurrent users; the Pi testbed network's subnet, addressing and discovery story | — | E1 docs, §8 |
+| **H8** | **What a "session" is, plus its visibility default and lifecycle** | first: is a **workspace session** one orchestration group + its checkout, or something spanning several groups? then: is a new one **team** or **private** by default; may private be promoted to team; may team be demoted to private; who may do either? | **One group + its checkout** (§6.0 — it reuses the boundary that already carries membership, audit, MCP scoping and path scoping instead of adding a fourth). **Private by default, promote-only, the creator promotes.** Demotion cannot un-see what teammates already saw, so it is a lie unless it also ends the workspace session | §6.0, §6.4, C1 data model |
+| **H9** | **Whose credentials do server-side agents act as?** — `gh` auth, agent-CLI subscriptions, push rights | one shared service account for the daemon vs per-user credentials injected per session | **Decide before C3.** This is not a detail: today an agent pushes as *the human sitting at the machine*, and on a shared server every agent's commit, push and PR is attributable to whatever the daemon holds. A shared service account is simplest and makes the audit log the only per-user attribution there is; per-user credentials preserve attribution but need a secret store loomux does not have | C3, E2 |
 
 **#857 (repo split / licensing) stays HELD.** This design takes no dependency on
 it and blocks none of its outcomes; if the engine crate boundary later becomes a
@@ -49,13 +53,14 @@ depended on.
 
 Decisions already made by the human on #888, carried here so the note is
 self-contained: **Linux-only daemon** (desktop client stays cross-platform);
-**multi-user session auth from day one** (a team connects, dispatches and
+**multi-user connection-session auth from day one** (a team connects, dispatches and
 observes concurrently — the single-operator pairing-token envelope is off the
 table); **desktop client first, browser client eventually, same wire**;
 **detach/reattach on the fly is a hard acceptance criterion**, not crash
-recovery; **docker-ready host** with eventual per-session isolation and
-**Pi-testbed egress**; **team vs private sessions** as a first-class
-authorization dimension.
+recovery; **docker-ready host** with eventual per-workspace-session isolation and
+**Pi-testbed egress**; **team vs private workspace sessions** as a first-class
+authorization dimension. (Those last two are the human's own words; §6.0 pins
+down which of the three meanings of "session" they carry.)
 
 ---
 
@@ -112,7 +117,7 @@ for any of them.
 
 ## 3. Transport: one authenticated WebSocket per client
 
-**Decision (pending D6): one authenticated WebSocket connection per client**,
+**Decision (pending H6): one authenticated WebSocket connection per client**,
 carrying three frame kinds — JSON RPC frames, JSON event frames, and **binary**
 PTY frames.
 
@@ -149,7 +154,7 @@ Rejected, with reasons, so the question stays answered:
 ### 4.1 Connection lifecycle
 
 ```
-  TCP → TLS (terminated per D2)
+  TCP → TLS (terminated per H2)
       → HTTP upgrade   ← Origin check, credential presented here
       → server hello   ← protocol version, capabilities, command roster, identity
       → ready          ← RPC / event / PTY frames, full duplex
@@ -172,7 +177,7 @@ expensive happens before authentication).
 
 ### 4.2 Frame kinds
 
-**RPC frames** mirror today's `invoke` shape, so the ~120 wire-reachable commands
+**RPC frames** mirror today's `invoke` shape, so the 128 wire-reachable commands
 port mechanically behind the existing `EngineTransport` seam:
 
 ```jsonc
@@ -246,8 +251,8 @@ shows the human a menu item that cannot work.
 
 `engine_id` exists for tab persistence: `tabs.json` records pane `cwd`s with no
 notion of *which machine* they are on, and a restored layout must reattach to
-the engine it came from instead of reading server paths as local ones (D1
-slice's engine binding).
+the engine it came from instead of reading server paths as local ones (track-D slice D1's
+engine binding).
 
 ### 4.4 Versioning and evolution
 
@@ -272,7 +277,7 @@ that a reviewer can check the dispatcher never invents a fall-through.
 
 | code | meaning | client behaviour |
 |---|---|---|
-| `unauthenticated` | no valid session (missing, invalid, expired, revoked) | drop to the login/connect screen |
+| `unauthenticated` | no valid connection session (missing, invalid, expired, revoked) | drop to the login/connect screen |
 | `unauthorized` | authenticated, role too low for this command | surface; do not retry |
 | `not_found` | the named thing does not exist **or the caller may not know it does** | surface as absent |
 | `invalid_argument` | server-side validation refused (a `GroupId::parse` failure, an out-of-root path) | bug in the client or a hostile peer; log, do not retry |
@@ -281,8 +286,8 @@ that a reviewer can check the dispatcher never invents a fall-through.
 | `rate_limited` | connection or login throttle | back off |
 | `internal` | anything else | surface generically; details go to the server log, never the wire |
 
-The `not_found` row is a security decision, not tidiness. A private session a
-caller may not see returns `not_found`, **never** `unauthorized` — otherwise the
+The `not_found` row is a security decision, not tidiness. A private workspace
+session a caller may not see returns `not_found`, **never** `unauthorized` — otherwise the
 error code is an oracle that confirms existence, and enumeration by guessing ids
 becomes a feature (§7 T4).
 
@@ -291,7 +296,7 @@ becomes a feature (§7 T4).
 The frame schemas ship as **JSON fixtures in the repo**, and both consumers read
 the same files: the server encodes/decodes them in Rust tests, the client decodes
 them in `node:test`. One contract, two implementations, and drift fails on
-whichever side drifted. This is what lets D1 (the remote transport) be built and
+whichever side drifted. This is what lets track-D slice D1 (the remote transport) be built and
 tested with **zero server code in existence** — the payoff the `EngineTransport`
 seam was cut for.
 
@@ -335,11 +340,11 @@ Three tiers, ordered: **viewer** ⊂ **operator** ⊂ **owner**.
   output. Cannot type into a pane, cannot dispatch, cannot write a file.
 - **operator** — everything a person doing the work needs: spawn and drive panes,
   write files, run git/gh writes, create and steer groups, manage tasks.
-- **owner** — **grant-writing only**, and human sessions only: task approval,
+- **owner** — **grant-writing only**, and human connection sessions only: task approval,
   merge and release grants, dangerous mode, autonomy raises and budget. These are
   the writes that *are* the enforcement behind constraints 7 and 9, so they are
   the tier that must never be reachable by anything but an authenticated human
-  session (§7 T3).
+  connection session (§7 T3).
 
 ### 5.4 The roster, by family
 
@@ -349,14 +354,14 @@ are where the 64-vs-66 drift above lives).
 | family | n | class | tier | notes |
 |---|---|---|---|---|
 | **pty** (9) | | | | |
-| `spawn_pty`, `kill_pty`, `write_pty`, `resize_pty` | 4 | wire | operator | `spawn_pty` executes by design — the single most dangerous name on the wire. `write_pty`'s `human` flag is **derived from the session class**, never read from the frame (§6.3) |
+| `spawn_pty`, `kill_pty`, `write_pty`, `resize_pty` | 4 | wire | operator | `spawn_pty` executes by design — the single most dangerous name on the wire. `write_pty`'s `human` flag is **derived from the connection session's caller class**, never read from the frame (§6.3) |
 | `dir_info`, `change_dir` | 2 | wire | viewer / operator | path arguments root-scoped (#925) |
 | `pty_backend_info`, `discover_git_bash`, `discover_ssh` | 3 | wire | viewer | answered with **server** facts; the client must not report its own shell discovery for a server pane |
 | **sessions** (3) | 3 | wire | viewer / operator | agent-CLI store scans are server-side; `record_*_launch_posture` is operator |
 | **git** (22) | 6 | wire | viewer | the reads: `git_repo_root`, `git_log`, `git_status`, `git_diff`, `git_branches`, `git_worktree_list` |
-| | 16 | wire | operator | every write: stage/unstage/commit/commit_files/checkout/discard/worktree_add/fetch/push/pull/tag/branch_create/cherry_pick/revert/merge/rebase. `repo` is root-scoped (#925). Note D9: these push as whoever the daemon is |
+| | 16 | wire | operator | every write: stage/unstage/commit/commit_files/checkout/discard/worktree_add/fetch/push/pull/tag/branch_create/cherry_pick/revert/merge/rebase. `repo` is root-scoped (#925). Note H9: these push as whoever the daemon is |
 | **gh** (10) | 6 | wire | viewer | `gh_auth_status`, `gh_issue_list`, `gh_issue_view`, `gh_pr_list`, `gh_pr_view`, `gh_activity` |
-| | 4 | wire | operator | `gh_issue_create`, `gh_issue_set_labels`, `gh_issue_comment`, `gh_pr_comment` — these write to GitHub as the daemon's credential (D9) |
+| | 4 | wire | operator | `gh_issue_create`, `gh_issue_set_labels`, `gh_issue_comment`, `gh_pr_comment` — these write to GitHub as the daemon's credential (H9) |
 | **gitwatch** (2) | 2 | wire | viewer | |
 | **orchestration** (66) | 18 | wire | viewer | reads: `orch_tasks`, `orch_audit`, `orch_merge_queue`, `orch_autonomy`, `orch_group_usage`, `orch_group_summary`, `orch_workflow_status`, `orch_workflow_preview`, `orch_group_watches`, `orch_lock_state`, `orch_group_paused`, `orch_notify_enabled`, `orch_spawn_expanded`, `orch_session_roles`, `orch_channel_list`, `orch_channel_for_pane`, `agent_autopilot_flags`, `agent_cli_knobs` — **all filtered by caller visibility** (§6.4) |
 | | 38 | wire | operator | group lifecycle, binding, steering, task CRUD, `orch_request_changes`, attention acks, spawn/solo flow, channel connect/disconnect/set-sender, and the `orch_set_*` knobs that are **not** autonomy raises |
@@ -364,7 +369,7 @@ are where the 64-vs-66 drift above lives).
 | | 1 | **retargeted** | viewer | `orch_open_ref` — the server resolves the ref to a URL (its `open_external_url` helper is the local half today) and returns it; the **client** opens it in the human's browser |
 | **cliprobe** (1) | 1 | wire | viewer | `probe_agent_cli` probes the **server's** CLIs |
 | **editor** (1) | 1 | **disabled** | — | `open_in_editor` spawns an editor on the machine holding the files; remotely that is either a no-op on a headless box or an arbitrary-process-spawn primitive. The file-editor pane is what covers this case |
-| **fileedit** (7) | 4 | wire | operator | `ft_list_dir`, `ft_read_file`, `ft_search_start`, `ft_files_start` — reads, but reads of **server** files, so operator not viewer (D3) |
+| **fileedit** (7) | 4 | wire | operator | `ft_list_dir`, `ft_read_file`, `ft_search_start`, `ft_files_start` — reads, but reads of **server** files, so operator not viewer (H3) |
 | | 3 | wire | operator | `ft_write_file`, `ft_replace`, `ft_search_cancel` |
 | **filemgr** (9) | 2 | wire | viewer / operator | `fm_list`, `fm_capabilities` (capabilities answered per §4.3's split) |
 | | 4 | wire | operator | `fm_new_folder`, `fm_new_file`, `fm_rename`, `fm_delete_start` |
@@ -389,7 +394,7 @@ Two families deserve a sentence they do not get from the table:
 
 **`ft_*`/`fm_*` are a server-filesystem browser** the moment they cross the wire.
 That is fine and intended — it is how a human edits a server file — but it means
-D3's answer is load-bearing, and #925 is what makes the answer enforceable
+H3's answer is load-bearing, and #925 is what makes the answer enforceable
 rather than aspirational.
 
 **The dialog plugin never crosses.** A folder picker picks *client* folders,
@@ -402,22 +407,50 @@ being two implementations.
 
 ---
 
-## 6. Identity, sessions, roles, visibility
+## 6. Identity, roles, and visibility
+
+### 6.0 Terminology, because "session" is already taken three ways
+
+This has to be settled before the model can be written down, and it is the kind
+of ambiguity that survives into an implementation as a bug. "Session" already
+means at least two things in this codebase, and the human's team/private
+requirement adds a third:
+
+| term used in this note | meaning | what it already is in the tree |
+|---|---|---|
+| **agent session** | one agent CLI's own conversation | `list_sessions`, `session_id`, `resume_orch_session`, `doc/design/session-restore.md` — **unchanged by this note** |
+| **connection session** | one authenticated client login: a token, an expiry, a role tier | new; what `Principal.session` names |
+| **workspace session** | the unit that is **team or private**, and the unit a container wraps | new |
+
+Below §6.0 the note always writes one of those three phrases and never a bare
+"session" — including in the frame schemas, where `Principal.session` is a
+connection session. The only unqualified uses are in §1, quoting the human's
+original requirement wording verbatim.
+
+**What a workspace session actually is** is itself part of H8, and this note's
+recommendation is: **one workspace session = one orchestration group plus the
+checkout it works in.** That mapping is not arbitrary — the group is already the
+unit of membership, of the audit trail, of MCP token scoping and of `GroupId`
+path scoping, so making it the unit of visibility and of container isolation
+adds no fourth boundary to reason about. The alternative (a workspace session
+spanning several groups, closer to a "project") is coherent but needs a new
+membership object that nothing today has, and the human should say so explicitly
+if that is what was meant.
 
 ### 6.1 Three questions, three mechanisms
 
 Authorization here is not one question but three, and conflating them is how
 systems grow holes:
 
-1. **Who are you?** — authentication (D1).
+1. **Who are you?** — authentication (H1).
 2. **What may you do?** — role tier (§5.3).
-3. **What may you see?** — session visibility (§6.4).
+3. **What may you see?** — workspace-session visibility (§6.4).
 
 (3) is not a special case of (2). A teammate with operator rights on their own
-work has *no* rights over someone's private session, including the right to know
-it exists.
+work has *no* rights over someone else's private workspace session, including the
+right to know it exists.
 
-**The `Identity` seam.** Whatever D1 picks, the daemon reduces it to one value
+**The `Identity` seam.** Whatever H1 picks, the daemon reduces it to one value
 before anything else runs:
 
 ```rust
@@ -428,11 +461,23 @@ enum CallerClass { Human, Agent }
 The **source** of `user` is the pluggable part: a built-in store's login, a
 verified header from an identity proxy, a client certificate subject. Everything
 downstream — roster filtering, visibility filtering, audit actor — reads
-`Principal` and never the mechanism. That is what keeps D1 a configuration
-decision rather than a rewrite of C1, and it is why C1 can begin the moment D1 is
+`Principal` and never the mechanism. That is what keeps H1 a configuration
+decision rather than a rewrite of C1, and it is why C1 can begin the moment H1 is
 answered rather than after an auth stack is chosen and built.
 
-One rule for D1(b) that is easy to get catastrophically wrong: **a proxy-supplied
+**`role` is global to the user; membership is what is per-workspace-session.**
+A user has one tier across the deployment, and which workspace sessions they can
+see or act in is the *separate* dimension of §6.4. The alternative — per-group
+role grants — is a full ACL system (grant tables, inheritance, delegation, an
+admin UI to manage it), and v1 does not need one: a team where everyone doing
+the work is an operator, a few people are owners, and stakeholders are viewers is
+the shape the human described. If per-group roles turn out to be wanted, they
+are an additive change: `Principal` grows a resolver, and every call site
+already asks "may this principal do this **here**" rather than "what is this
+principal's tier". Writing the check that way now costs nothing and keeps the
+door open — writing it as a bare tier comparison would nail it shut.
+
+One rule for H1(b) that is easy to get catastrophically wrong: **a proxy-supplied
 identity header is trusted only when the connection arrived through the proxy.**
 The daemon binds a loopback address or a unix socket and additionally requires a
 shared secret from the proxy; a daemon that trusts `X-Forwarded-User` on a
@@ -440,12 +485,12 @@ directly-reachable port has no authentication at all, only the appearance of it.
 
 ### 6.2 Sessions and tokens
 
-- Login yields a **session** with an explicit expiry and a role tier. Sessions
-  are server-side records, so **revocation is a v1 feature, not v2** — a token
+- Login yields a **connection session** with an explicit expiry and a role tier.
+  Connection sessions are server-side records, so **revocation is a v1 feature, not v2** — a token
   that cannot be revoked is a permanent credential that happens to have a date on
   it.
 - Revocation takes effect **mid-connection**: an established socket re-checks its
-  session on every RPC dispatch, not only at the upgrade. Otherwise revoking a
+  connection session on every RPC dispatch, not only at the upgrade. Otherwise revoking a
   departing teammate leaves their open laptop connected until they close it.
 - Tokens keep the existing minting pattern — 128-bit hex from std's OS-seeded
   `RandomState`, exactly as `new_token()` mints MCP tokens today. One fewer
@@ -467,8 +512,8 @@ That shape survives verbatim, and the reasons are worth stating because "one API
 for every caller" is the tempting simplification:
 
 - **Two listeners, two credential namespaces.** The display WebSocket and the MCP
-  server stay separate processes-of-thought: a display credential can never
-  authenticate an MCP call and vice versa.
+  server stay separate: a display credential can never authenticate an MCP call,
+  and an `X-Loomux-Agent` token can never authenticate a display connection.
 - **The MCP tool roster carries no grant-writing tool** — task approval, merge
   and release grants, dangerous mode and autonomy raises are all webview-side
   command writes. That invariant is load-bearing for constraints 7 and 9, and it
@@ -488,30 +533,46 @@ feeds delivery-hold decisions. Over the wire that must be **derived from
 `Principal.class`**, never read from the frame. A client-settable "I am a human"
 field is an authority claim with no check behind it.
 
-### 6.4 Team and private sessions
+### 6.4 Team and private workspace sessions
 
-A session is **team** (shared visibility and control across the team) or
-**private** (solo). This is an authorization dimension, not a UI toggle.
+A **workspace session** (§6.0) is **team** — shared visibility and control across
+the team — or **private** (solo). This is an authorization dimension, not a UI
+toggle.
 
-The model, subject to D8:
+One naming trap to disarm first: the user who created a workspace session is its
+**creator**, and that word is used throughout instead of "owner", because `owner`
+is already the top **role tier** (§5.3) and the two are independent. A viewer
+cannot create anything; an operator can create a workspace session and is its
+creator; an `owner`-tier user is not thereby the creator of everyone else's.
 
-- **Creation.** Any operator may create either. Default is **private** (D8) —
-  a default of "team" leaks by accident, and accidental sharing is not
+The model, subject to H8:
+
+- **Creation.** Any operator may create either kind. Default is **private**
+  (H8) — a default of "team" leaks by accident, and accidental sharing is not
   recoverable.
-- **Promotion.** The session's owner may promote private → team. **Demotion
+- **Promotion.** The **creator** may promote private → team. **Demotion
   team → private is not offered**: teammates who already observed it cannot
   un-observe it, so a demotion would advertise a privacy it cannot deliver. If
-  the intent is "stop sharing", the honest operation is to end the session.
-- **What a non-member sees of a private session: nothing.** Not a greyed-out
-  entry, not a count, not a name. Enumeration APIs — rosters, boards, pane lists,
-  audit reads, the merge queue — filter by `Principal` **server-side**, and a
-  direct request for a private session's id returns `not_found` (§4.5).
+  the intent is "stop sharing", the honest operation is to end the workspace
+  session.
+- **What a non-member sees of a private workspace session: nothing.** Not a
+  greyed-out entry, not a count, not a name. Enumeration APIs — rosters, boards,
+  pane lists, audit reads, the merge queue — filter by `Principal`
+  **server-side**, and a direct request for its id returns `not_found` (§4.5).
   Client-side filtering of a full list is not filtering; it is a UI convention
   over a data leak.
-- **Composition with containers (§8):** the container boundary is per session, so
-  a private session is *also* process- and filesystem-isolated once E2 lands.
-  Visibility filtering is what protects it before then, and remains the answer
-  for team sessions, which share a container by definition.
+- **An `owner`-tier user is not exempt from visibility filtering.** This is worth
+  stating because the instinct is to make the top tier see everything. It must
+  not: `owner` is defined in §5.3 as *grant-writing* authority, which is a
+  different axis from *whose work you may look at*. An owner who could read every
+  private workspace session would make "private" mean "private from peers", which
+  is not what the human asked for. Administrative access to a private workspace
+  session, if it is ever wanted, is a break-glass feature with its own audit
+  entry — not a silent property of a tier.
+- **Composition with containers (§8):** the container boundary is per workspace
+  session, so a private one is *also* process- and filesystem-isolated once E2
+  lands. Visibility filtering is what protects it before then, and remains the
+  answer for team workspace sessions, which share a container by definition.
 - **The cross-workspace channel rides unchanged.** `channel_send`/`channel_status`
   take no id arguments, membership is built by human-tier commands, and the
   `SOLO_GROUP` (`__solo__`) model is already a validated `GroupId` rather than a
@@ -521,10 +582,10 @@ The model, subject to D8:
 
 ### 6.5 Audit
 
-Every wire-initiated action logs an **actor identity**: user, session and role,
+Every wire-initiated action logs an **actor identity**: user, connection session and role,
 alongside the group and agent the audit already records. Two consequences:
 
-- The audit becomes the only per-user attribution that exists if D9 picks a
+- The audit becomes the only per-user attribution that exists if H9 picks a
   shared service account. That raises its integrity from "nice" to "the record".
 - Token values never appear (§6.2). Actor identity is a user id, not a
   credential.
@@ -541,11 +602,11 @@ mitigation nobody can fail is a mitigation nobody has — how it is *tested*.
 | **T1** | unauthenticated peer ⇒ remote code execution | authn before dispatch; default-deny roster; role tiers | C1, C2 | missing / invalid / expired / revoked credential each rejected **before registry state is touched** |
 | **T2** | path & identifier injection | validated newtypes + server-declared roots | #904 (done), **#925 (blocker)** | traversal / separator / absolute / empty cases per identifier family |
 | **T3** | authority laundering (agent ⇒ human) | two listeners, two namespaces; grant writes owner-human only; `human` derived | C1, C2 | an agent-namespace credential is rejected on the display listener; no grant-writing tool exists in the MCP roster |
-| **T4** | cross-user exposure (team vs private) | server-side visibility filtering; `not_found`, never `unauthorized` | C1 | a non-member's enumeration omits the private session; a direct fetch returns `not_found` |
-| **T5** | transport attacks | TLS; `Origin` check on upgrade; credentials never in URLs; revocation | C1, C2 | cross-origin upgrade refused; revoked session dies mid-connection |
+| **T4** | cross-user exposure (team vs private) | server-side visibility filtering; `not_found`, never `unauthorized` | C1 | a non-member's enumeration omits the private workspace session; a direct fetch returns `not_found` |
+| **T5** | transport attacks | TLS; `Origin` check on upgrade; credentials never in URLs; revocation | C1, C2 | cross-origin upgrade refused; a revoked connection session dies mid-connection |
 | **T6** | resource exhaustion | authn before expensive work; bounded per-client buffers; connection and login rate limits | C1, C4 | fake-slow-sink drops and resyncs rather than growing a queue |
-| **T7** | audit integrity | actor identity per entry; token values never logged | C1 | a wire action's audit entry names user+session+role; a rejection breadcrumb carries no token value |
-| **T8** | lateral movement between sessions | containers as defence **in depth over** T2, plus declared egress | E2 | (E2) container cannot reach another session's filesystem; egress reaches only the declared device network |
+| **T7** | audit integrity | actor identity per entry; token values never logged | C1 | a wire action's audit entry names user + connection session + role; a rejection breadcrumb carries no token value |
+| **T8** | lateral movement between workspace sessions | containers as defence **in depth over** T2, plus declared egress | E2 | (E2) container cannot reach another workspace session's filesystem; egress reaches only the declared device network |
 
 **T1 — unauthenticated peer means RCE.** This is the catastrophic one and the
 reason for everything in §2. `spawn_pty` executes arbitrary commands, `ft_write_file`
@@ -575,7 +636,7 @@ there is one API for humans and agents, the merge gate is decorative.
 implementing visibility in the client. See §6.4. The error-code choice in §4.5 is
 part of the mitigation, not a detail.
 
-**T5 — transport attacks.** TLS (D2). `Origin` checks from day one, because the
+**T5 — transport attacks.** TLS (H2). `Origin` checks from day one, because the
 browser client is a stated future and cross-site WebSocket hijacking is exactly
 what `Origin` exists for. Credentials in headers, never URLs. Revocation as a v1
 feature that takes effect mid-connection.
@@ -585,7 +646,7 @@ unauthenticated peer can consume a handshake and nothing more. Per-client send
 buffers are bounded with drop-and-resync (§9), so a slow or hostile viewer cannot
 make the server grow memory on its behalf. Connection and login-attempt rate
 limits live in the listener — login throttling in particular, because a
-password-based D1(a) without it is an offline-speed online guessing oracle.
+password-based H1(a) without it is an offline-speed online guessing oracle.
 
 **T7 — audit integrity.** §6.5.
 
@@ -598,32 +659,43 @@ password-based D1(a) without it is an offline-speed online guessing oracle.
 ### 8.1 Containers compose with the process-level model; they never replace it
 
 The human's requirement is a docker-ready host with the eventual goal of one
-container per session. The tempting reading is that a container makes §7 T2
-unnecessary — if each session is confined, who cares whether a path escapes its
-root?
+container per workspace session. The tempting reading is that a container makes
+§7 T2 unnecessary — if each workspace session is confined, who cares whether a
+path escapes its root?
 
-That reading is wrong in both directions and the design must say so:
+That reading is wrong in both directions, and the design must say so:
 
-- A container boundary does not help **inside** a session. Every group in that
-  session shares it. Path scoping is what keeps group A out of group B's state,
-  and #904's model is what makes that a property of a value rather than a
-  convention.
-- Path scoping does not help when the confinement itself is what you need — a
+- **Path scoping is what holds until E2 exists, and E2 is a fast-follow (H5).**
+  Between the first end-to-end and the day containers ship, one daemon serves
+  every workspace session out of one filesystem, and the *only* thing keeping
+  one group's caller out of another's state is T2's validation. A security
+  property whose enforcement arrives in a later slice is not a property.
+- **A container does not help where the daemon spans it.** Under §6.0's
+  recommended one-group-per-workspace-session mapping the container wraps a
+  single group — but the RPC dispatcher does not. A caller authenticated for
+  workspace session A and a path argument naming workspace session B's group dir
+  meet inside **one** daemon process, on the host side of every container
+  boundary that exists. The container confines the *agents*; only validation
+  confines the *caller*. (And under H8's alternative mapping — a workspace
+  session spanning several groups — a container does not even separate the
+  agents.)
+- **Path scoping does not help when the confinement itself is what you need** — a
   compromised agent process, a malicious dependency in a repo the team cloned, a
-  runaway that fills the disk. That is the container's job.
+  runaway that fills the disk. That is the container's job, and validation cannot
+  do it.
 
 They are **layers over the same asset**, and the sequencing follows: T2's
 validation lands first (it is cheap, desktop-side, and independently valuable);
-containers are defence in depth added over it (D5 — fast-follow). Neither is a
-reason to defer the other.
+containers are defence in depth added over it (H5 — fast-follow). Neither is a
+reason to defer the other, and neither is a reason to weaken the other.
 
 The remaining question containers raise, which E2 owes an answer to and this
 note explicitly does not guess: **does the engine spawn and manage containers, or
 does it run inside one that something else placed?** Both are coherent. The first
 makes loomux a container orchestrator, with all that implies about the daemon's
 own privileges — a daemon that can create containers can generally escape to the
-host. The second keeps the daemon unprivileged and pushes session-per-container
-into the deployment (one daemon per session, fronted by a router), which is more
+host. The second keeps the daemon unprivileged and pushes container-per-workspace-session
+into the deployment (one daemon per workspace session, fronted by a router), which is more
 boxes and less loomux code. This note's recommendation is the **second** for E2's
 starting hypothesis, precisely because the first requires giving the daemon the
 one privilege whose compromise makes every other layer here moot.
@@ -632,9 +704,9 @@ one privilege whose compromise makes every other layer here moot.
 
 The team runs hardware testers on Raspberry Pis, and agents need to reach them
 **from inside their container**. So the isolation model is not "isolated
-sessions" but:
+workspace sessions" but:
 
-> mutually isolated sessions, each with a **deliberate, declared, granted** hole
+> mutually isolated workspace sessions, each with a **deliberate, declared, granted** hole
 > to a shared device network.
 
 Two mechanisms, and the note's answer to the plan's open question ("consider
@@ -656,7 +728,7 @@ isolation** — they are different problems and need both:
   `doc/design/lock-resources.md` is emphatic that an advisory lock described as
   enforcement is a defect in its own right. The same honesty applies here.
 
-D7 asks for the topology because none of this can be written down as
+H7 asks for the topology because none of this can be written down as
 documentation without knowing the subnet, the addressing and how a Pi is
 discovered.
 
@@ -688,16 +760,34 @@ make the PTY reader park. This is not a property to preserve carefully; it is a
 property of the ordering already in the code, and the design note's job is to say
 that it must not be reordered.
 
-**Backpressure is the genuinely new invariant.** `performance.md` P6 says
-"backpressure, not queues", and its remote translation is:
+**Backpressure is the genuinely new invariant, and it does not translate
+literally.** `performance.md` P6 is "Backpressure, not queues, for pipes — a full
+pipe parks the writer; that is the bounded-memory answer." Note what it prescribes:
+*park the writer*. That is right for the input pipe P6 was written about, where
+the writer is a keystroke path and parking it costs one human a moment. It is
+exactly wrong here, where the "writer" is the PTY reader thread and parking it on
+a slow **viewer** would let one bad link stall the pane — and with it every
+detector reading that pane's ring.
+
+So the remote translation keeps P6's *principle* (bounded memory, never an
+unbounded queue) and deliberately inverts its *mechanism* (drop the reader's
+consumer instead of parking the reader):
 
 > Each client gets a **bounded** send buffer. On overflow the server **drops that
-> client's pty stream and sends a resync marker** (`0x02`), and the client
-> re-attaches via §10's replay. It never grows a queue.
+> client's pty stream and sends a resync marker** (`0x02`); the client
+> re-attaches via §10's replay. It never grows a queue, and it never parks the
+> producer.
 
-Bounded memory, and the viewer sees one clean resynced screen instead of
-unbounded lag with no way out. A queue would trade a visible glitch for an
-invisible, unbounded liability.
+That is affordable only because of the tee ordering above: the ring already has
+the bytes, so a dropped client loses its *stream position*, not data. Three
+options and why this is the one — park the producer: one slow viewer stalls
+orchestration, unacceptable. Grow a queue: unbounded memory, which is the failure
+P6 names. Drop and resync: bounded memory, and the viewer sees one clean resynced
+screen instead of unbounded lag with no way out. A queue trades a visible glitch
+for an invisible, unbounded liability.
+
+When P6 is next revised it should carry this second case, so the next reader does
+not have to re-derive that "park the writer" was scoped to input pipes.
 
 **Bandwidth, stated so nobody has to guess.** Worst case per pane is 60 × 64 KiB
 ≈ 3.8 MiB/s — that is a `cat` of a huge file, and it is the cap working as
@@ -712,7 +802,7 @@ A remote transport that delivers the same 19 streams through a different code
 path must not become a way for a stream to arrive undeclared — the manifest is
 keyed by event name, so the remote implementation inherits it as long as the
 client still subscribes by string literal, which the `EngineTransport` seam
-preserves. Say it out loud in the D1 slice's PR, and check it.
+preserves. Say it out loud in track-D slice D1's PR, and check it.
 
 *Not v1, noted so it is not re-invented:* per-pane stream subscription (stream
 only the panes a client is displaying). The ring keeps every engine feature
@@ -741,7 +831,7 @@ On (re)attach:
   and `last_exit_tail` is a corpse snapshot. v1's answer is the composed current
   screen via `termgrid` VT replay (which exists — #520, and is what `get_output`
   already uses) plus the raw ring tail, then the live stream.
-- **The honest contract, stated as a contract** (D4): reattach restores **the
+- **The honest contract, stated as a contract** (H4): reattach restores **the
   live screen and a recent tail (256 KiB per pane), not infinite scrollback.**
   Priced alternatives, neither in v1: a larger display-purpose ring (server RAM,
   a config knob) or persisted scrollback (disk, plus a retention policy).
@@ -783,8 +873,8 @@ forbids four things this design therefore does not do:
 
 1. A transport a browser cannot speak (§3 — this is most of why WebSocket wins).
 2. An auth mechanism that only a native client can perform (a keychain-bound
-   credential, an OS-level handshake). D1's options are all browser-reachable;
-   D1(c)'s mTLS is the one that would hurt, which is part of why it is not
+   credential, an OS-level handshake). H1's options are all browser-reachable;
+   H1(c)'s mTLS is the one that would hurt, which is part of why it is not
    recommended.
 3. Frames that assume a Tauri-shaped runtime — hence a plain binary frame for pty
    output rather than anything modelled on `emit`'s payload conventions.
@@ -806,7 +896,9 @@ same wire, not a second protocol.
         └─ human answers §1 ──► C1 ► C2 ► C4 ► C5
                                  C3 (parallel, waits A4)
                                  D1 (waits B1 fixtures) ► D2
-                                 E1 (waits C2) ► E2 (waits D5)
+                                 E1 (waits C2) ► E2 (waits H5)
+
+  A/B/C/D/E + digit = plan-463 build slices.  H<n> = the §1 human decisions.
 ```
 
 Two blockers stated as blockers, not preferences:
@@ -821,7 +913,7 @@ Two blockers stated as blockers, not preferences:
 And one thing that is *not* a blocker but is easy to mistake for one: the
 engine-crate extraction (track A) is a build-shape prerequisite — a headless
 Linux daemon cannot depend on a lib that links Tauri and wants webkit2gtk — not a
-security one. C1's auth work is gated on D1, not on A4 finishing.
+security one. C1's auth work is gated on H1, not on A4 finishing.
 
 ---
 
