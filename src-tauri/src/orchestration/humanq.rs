@@ -225,6 +225,10 @@ pub enum AnswerSource {
     /// merge-grant commands are: the webview is loomux's own UI, and the
     /// gesture is a human's.
     Webview,
+    /// [SCRATCH — #946 R5 red-before-green, NEVER MERGED] The boundary
+    /// bypassed: an agent-shaped source, added inside the type's own legitimate
+    /// home, where a "where may it be named" check cannot see it.
+    Agent,
 }
 
 impl AnswerSource {
@@ -236,6 +240,8 @@ impl AnswerSource {
     pub fn tag(&self) -> String {
         match self {
             AnswerSource::Webview => "webview".to_string(),
+            // [SCRATCH — #946 R5, NEVER MERGED]
+            AnswerSource::Agent => "agent".to_string(),
         }
     }
 }
