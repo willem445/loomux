@@ -83,6 +83,7 @@
 use std::borrow::Borrow;
 use std::fmt;
 use std::ops::Deref;
+use std::path::Path;
 use std::str::FromStr;
 
 use serde::de::{self, Deserialize, Deserializer};
@@ -210,6 +211,17 @@ impl Deref for GroupId {
 impl AsRef<str> for GroupId {
     fn as_ref(&self) -> &str {
         &self.0
+    }
+}
+
+// SCRATCH PLANT — red-before-green evidence for PR #968, never merged. The
+// BARE `Path` spelling, i.e. the exact needle the pre-#888 test matched, now
+// written in the crate the orphan rule confines it to. It must redden
+// `the_orchestration_root_is_joined_with_a_group_in_exactly_one_place` — and
+// on main's `src-tauri/src`-only scan it would not have.
+impl AsRef<Path> for GroupId {
+    fn as_ref(&self) -> &Path {
+        Path::new(&self.0)
     }
 }
 
