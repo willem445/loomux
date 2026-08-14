@@ -21,12 +21,12 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { knobState, knobValue, type CliKnobs } from "../src/selectorknobs.ts";
 
-/** The `agent_cli_knobs` reply for claude, verbatim from `CLI_CAPS` (mod.rs). */
+/** The `agent_cli_knobs` reply for claude, verbatim from `CLI_CAPS`. */
 const CLAUDE: CliKnobs = {
   cli: "claude",
   known: true,
@@ -177,7 +177,7 @@ test("knobValue: a disabled knob can never put a value on the wire", () => {
 
 // ---------- opencode (#722): both knobs off, with the real seam named ----------
 
-/** opencode's reply, verbatim from `CLI_CAPS` (mod.rs, slice A) — and *pinned*
+/** opencode's reply, verbatim from `CLI_CAPS` (slice A) — and *pinned*
  *  verbatim, not merely captioned so: the last test in this file reads both
  *  strings back out of the Rust source. Both value sets are empty and both notes
  *  are long, and that is the point: the effort note names a seam that genuinely
@@ -259,13 +259,44 @@ test("rev-237 finding 1: the opencode fixture's notes mirror the Rust source the
   // nothing at the type level ties a TS copy to a Rust literal, so read the Rust
   // back and fail loudly the day someone changes one without the other, rather
   // than trusting a caption to catch it.
+  // Both production Rust source roots, not one hardcoded path (#888 slice A2
+  // batch 4). `CLI_CAPS` moved from `src-tauri/src/orchestration/mod.rs` into
+  // `crates/loomux-engine/src/model.rs`, and a reader pinned to the old file
+  // does not fail with "the table moved" — `match` returns null and the assert
+  // below reads as "the row's SHAPE changed", which is a different and wrong
+  // diagnosis. The engine extraction has further batches to go, so scan every
+  // root the table could live in and assert it is findable in exactly one:
+  // that survives the next relocation, and it also catches the table being
+  // duplicated rather than moved.
   const here = dirname(fileURLToPath(import.meta.url));
-  const rustSrc = readFileSync(join(here, "..", "src-tauri", "src", "orchestration", "mod.rs"), "utf8");
-  const row = rustSrc.match(/CliCaps \{\s*\n\s*cli: "opencode",[\s\S]*?\n {4}\},/);
-  assert.ok(
-    row,
-    "mod.rs's opencode CLI_CAPS row must match this exact pattern — update it here too if that block's shape changes"
+  const ROOTS = [
+    join(here, "..", "src-tauri", "src"),
+    join(here, "..", "crates", "loomux-engine", "src"),
+  ];
+  const rsFiles = (dir: string): string[] =>
+    readdirSync(dir).flatMap((name) => {
+      const p = join(dir, name);
+      return statSync(p).isDirectory() ? rsFiles(p) : p.endsWith(".rs") ? [p] : [];
+    });
+  const ROW = /CliCaps \{\s*\n\s*cli: "opencode",[\s\S]*?\n {4}\},/;
+  const hits = ROOTS.flatMap((root) => {
+    const files = rsFiles(root);
+    // A mistyped or stale root reads as zero files and would otherwise hide
+    // behind the other root's hit — same per-root non-empty check
+    // `src-tauri/tests/groupid.rs` makes for the same reason.
+    assert.ok(files.length > 0, `no .rs files under ${root} — did the tree move?`);
+    return files
+      .map((f) => ({ file: f, m: readFileSync(f, "utf8").match(ROW) }))
+      .filter((h) => h.m);
+  });
+  assert.equal(
+    hits.length,
+    1,
+    `the opencode CLI_CAPS row must be findable in exactly one production source file, found ${hits.length} (${hits
+      .map((h) => h.file)
+      .join(", ")}) — either the row's shape changed and this pattern needs updating, or the table was duplicated instead of moved`
   );
+  const row = hits[0]!.m!;
   const declared = (key: string): string => {
     const m = row![0].match(new RegExp(`${key}: "([^"]*)"`));
     assert.ok(m, `opencode's ${key} must be a plain string literal in mod.rs — update this reader if it stops being one`);
