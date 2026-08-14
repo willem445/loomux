@@ -1,0 +1,31 @@
+# The orchestration engine, as a crate that does not link Tauri (#888 slice A1
+# / #847 Phase 0). EMPTY on purpose at this slice — see src/lib.rs and
+# doc/design/engine-extraction.md for what arrives and in what order.
+[package]
+name = "loomux-engine"
+# NOT the loomux release version, and deliberately not part of the seven
+# version fields `scripts/check-versions.js` keeps in lockstep. This crate is
+# `publish = false`: it is an internal boundary, not a shipped artifact, so a
+# version on it would be a number nobody reads and one more thing a release
+# bump could forget. If it is ever published, it joins that check in the same
+# commit that flips this flag.
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "loomux orchestration engine — the Tauri-free core (internal; not published)"
+
+# NO DEPENDENCIES YET, and the empty section is here to be read rather than
+# skipped: the crate's defining property is what it must NEVER depend on.
+#
+#   - `tauri` (and any tauri-* crate). The entire point is a core a headless
+#     Linux daemon can link without webkit2gtk. `src-tauri` depends on THIS
+#     crate; the arrow never points back. Plan-463 slice A4 adds the CI step
+#     that proves it from `cargo tree` once there is a real dependency graph
+#     to inspect; until then the manifest-level half is pinned by
+#     test/workspacelayout.test.ts.
+#   - getrandom-based crates. CLAUDE.md constraint 2 is about the shipped
+#     Windows binary's load-time imports, and this crate is linked INTO that
+#     binary — so the ban applies here exactly as it does in
+#     src-tauri/Cargo.toml, whose audit notes are the reference. A dependency
+#     that is fine for a Linux daemon is not automatically fine here.
+[dependencies]

@@ -9,6 +9,26 @@ Deeper *why* for any individual subsystem lives in its own note in this
 directory; the hard constraints (never resize the PTY, no getrandom crates on
 the Windows baseline, no live agent testing) live in [`CLAUDE.md`](../../CLAUDE.md).
 
+## The Cargo workspace
+
+The repo root is a Cargo workspace with two members, one `Cargo.lock` and one
+`target/`, both at the root:
+
+```
+Cargo.toml               workspace root: members, resolver, and [profile.release] — cargo reads profiles from the ROOT manifest only and merely warns about one in a member, so this is where lto/codegen-units/debug/strip have to live (#888 slice A1)
+src-tauri/               the desktop app. Links Tauri; owns every #[tauri::command], the capability/ACL manifests, and the Windows desktop surface
+crates/loomux-engine/    the orchestration core as a crate that does not link Tauri. EMPTY scaffold today
+```
+
+`loomux-engine` exists because #888 needs a headless Linux daemon to drive
+orchestration, and a server that must build webkit2gtk in order to run is not a
+deployment shape. One rule governs it: **`src-tauri` depends on the engine and
+the arrow never points back**, with everything the engine needs from its host
+arriving as a trait (`EventSink`, `PaneHost`) rather than an `AppHandle`. The
+modules below move into it in stages — see
+[`engine-extraction.md`](engine-extraction.md) for the boundary, the order, and
+the publish stance.
+
 ## The source tree
 
 ```

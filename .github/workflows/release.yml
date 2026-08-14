@@ -156,9 +156,11 @@ jobs:
         with:
           targets: ${{ matrix.targets }}
 
+      # `.` since #888 slice A1: the Cargo workspace root is the repo root, so
+      # Cargo.lock and target/ live there now, not under src-tauri.
       - uses: swatinem/rust-cache@v2
         with:
-          workspaces: src-tauri
+          workspaces: .
           key: ${{ matrix.args }}
 
       - name: Install frontend dependencies

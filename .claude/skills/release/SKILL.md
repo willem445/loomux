@@ -24,11 +24,11 @@ The version lives in **five** places that must stay in lockstep:
 | `package-lock.json` | `version` (both top-level and `packages[""].version`) |
 | `src-tauri/tauri.conf.json` | `version` |
 | `src-tauri/Cargo.toml` | `[package] version` |
-| `src-tauri/Cargo.lock` | the `loomux` package entry |
+| `Cargo.lock` | the `loomux` package entry (workspace root — **not** `src-tauri/`) |
 
 **The lockfiles are what get missed** (#90, #224). After editing Cargo.toml,
-run `cargo update --workspace` in
-`src-tauri/` to regenerate the lock — this is dependency resolution scoped to
+run `cargo update --workspace` at the **repo root** (the Cargo workspace root)
+to regenerate `Cargo.lock` — this is dependency resolution scoped to
 the workspace's own members, not a build: it doesn't invoke `rustc`, so it's
 the one exception the `ci-validate` skill carves out for agent workers (see
 that skill's "The Cargo.lock exception" section). Commit the lock

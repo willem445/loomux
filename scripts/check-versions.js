@@ -23,8 +23,14 @@ function readText(relPath) {
 }
 
 // Finds `version = "X.Y.Z"` on the first line at column 0 after a
-// `[package]` header — good enough for our single-crate Cargo.toml, and
-// avoids matching a dependency's `version = "..."` field.
+// `[package]` header — good enough for the one manifest this is ever pointed
+// at (src-tauri/Cargo.toml), and avoids matching a dependency's
+// `version = "..."` field.
+//
+// The repo became a Cargo workspace in #888 slice A1, so there are now other
+// package manifests in the tree. Only src-tauri's carries the loomux release
+// version: crates/loomux-engine is `publish = false` and pinned at 0.0.0 on
+// purpose (see its Cargo.toml), so it is deliberately NOT in this check.
 function cargoTomlVersion(relPath) {
   const text = readText(relPath);
   const lines = text.split(/\r?\n/);
@@ -44,6 +50,11 @@ function cargoTomlVersion(relPath) {
 
 // Finds the `version = "X.Y.Z"` line inside the `name = "loomux"` package
 // entry in Cargo.lock.
+//
+// The exact-equality test (not `startsWith`/`includes`) is load-bearing since
+// the workspace conversion: `name = "loomux-engine"` is a sibling entry in the
+// same file, and a looser match would read ITS version — a permanent 0.0.0 —
+// and report a mismatch on every correctly-bumped release.
 function cargoLockVersion(relPath) {
   const text = readText(relPath);
   const lines = text.split(/\r?\n/);
@@ -78,9 +89,14 @@ function collectVersions() {
       version: cargoTomlVersion('src-tauri/Cargo.toml'),
     },
     {
-      file: 'src-tauri/Cargo.lock',
+      // Workspace root since #888 slice A1 — cargo keeps ONE lockfile per
+      // workspace, and it lives next to the root manifest. A stale
+      // src-tauri/Cargo.lock left behind would be a file cargo never updates
+      // and this check would happily read; test/workspacelayout.test.ts
+      // asserts it is gone.
+      file: 'Cargo.lock',
       field: 'loomux package version',
-      version: cargoLockVersion('src-tauri/Cargo.lock'),
+      version: cargoLockVersion('Cargo.lock'),
     },
   ];
 }

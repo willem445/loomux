@@ -5,6 +5,11 @@ Tauri 2 desktop terminal multiplexer for AI agent management. Rust backend
 terminals, Vite. `doc/design/architecture.md` maps every module; deeper designs
 live in `doc/design/`.
 
+The repo root is a **Cargo workspace**: `src-tauri` (the desktop app, links
+Tauri) and `crates/loomux-engine` (the Tauri-free orchestration core — empty
+scaffold today). One `Cargo.lock` and one `target/`, both at the repo root.
+See `doc/design/engine-extraction.md`.
+
 ## Commands
 
 | What | Command |
@@ -12,9 +17,9 @@ live in `doc/design/`.
 | Typecheck + bundle frontend | `npm run build` (runs `tsc --noEmit` first — this is the typecheck) |
 | Frontend unit tests | `npm test` (Node 22 built-in runner, runs `test/**/*.test.ts` directly) |
 | One frontend test file | `node --test test/layout.test.ts` |
-| Backend check (what CI gates on) | `cargo check --locked` in `src-tauri/` |
-| Backend tests | `cargo test --locked` in `src-tauri/` |
-| One backend test | `cargo test --locked --test orchestration <name_filter>` in `src-tauri/` |
+| Backend check (what CI gates on) | `cargo check --locked --workspace` at the repo root |
+| Backend tests | `cargo test --locked --workspace` at the repo root |
+| One backend test | `cargo test --locked -p loomux --test orchestration <name_filter>` at the repo root |
 | Run the app | `npm run tauri dev` — opens a GUI window and never exits; don't run it unattended |
 
 There is no lint/format gate (no eslint/prettier; rustfmt is not enforced in
