@@ -24017,7 +24017,10 @@ impl OrchRegistry {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(format!("cannot read {}: {e}", humanq::QUESTIONS_FILE)),
         };
-        serde_json::from_str(&text).map_err(|e| format!("{} is malformed: {e}", humanq::QUESTIONS_FILE))
+        // [SCRATCH — #946 red-before-green round 2, NEVER MERGED] The exact
+        // defect the loud read exists to prevent: an unparseable file reads as
+        // an empty one, so the next ask overwrites a human's pending questions.
+        Ok(serde_json::from_str(&text).unwrap_or_default())
     }
 
     /// `list_questions`' read: pending first (oldest first — the order they
