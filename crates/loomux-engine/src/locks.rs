@@ -181,7 +181,7 @@ impl LockTable {
     ///   never revokes a hold: it stops *new* grants until the count falls
     ///   back under the new limit, which is the only reading that cannot
     ///   yank a resource out from under a build already running.
-    pub fn sync(&mut self, declared: &BTreeMap<String, super::workflow::ResourcePolicy>) -> Vec<Resource> {
+    pub fn sync(&mut self, declared: &BTreeMap<String, crate::workflow::ResourcePolicy>) -> Vec<Resource> {
         let dropped: Vec<Resource> = self
             .resources
             .keys()
@@ -509,7 +509,7 @@ pub fn unknown_resource_error(name: &str, declared: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::orchestration::workflow::ResourcePolicy;
+    use crate::workflow::ResourcePolicy;
 
     const MIN: u64 = 60_000;
 

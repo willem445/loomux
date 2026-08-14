@@ -1966,6 +1966,8 @@ version = "0.0.0"
 dependencies = [
  "serde",
  "serde_json",
+ "serde_norway",
+ "sha2",
 ]
 
 [[package]]

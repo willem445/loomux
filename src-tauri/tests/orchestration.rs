@@ -45008,7 +45008,8 @@ fn the_wired_declined_flush_leaves_the_pane_untouched_when_our_text_is_still_the
 // ── named lock resources (#858) ────────────────────────────────────────────
 //
 // The engine's own state machine is unit-tested in
-// `src/orchestration/locks.rs`; these drive the WIRED path — the real
+// `crates/loomux-engine/src/locks.rs` (#888 A2 batch 5 moved it there; it is
+// still reachable as `orchestration::locks`); these drive the WIRED path — the real
 // `dispatch()`, the real registry, the real audit log — because that is where
 // the parts that can silently do nothing live: the tool listing, the role
 // gate, the pane notice, the `mark_dead` reclaim, and the sweep folded into

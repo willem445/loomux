@@ -37,7 +37,7 @@ zero new capability. **Rejected.**
 ## The marker: `Block.role_hint`
 
 A new *optional* `role_hint: Option<String>` field on `Block`
-(`src-tauri/src/orchestration/workflow.rs`), values `advisor` | `process`,
+(`crates/loomux-engine/src/workflow.rs`), values `advisor` | `process`,
 **inert with respect to capability**. It is validated at parse time to
 *require* its matching class — `advisor` needs `kind: planner`, `process`
 needs `kind: worker` — and an unrecognized value or a mismatched pairing is a

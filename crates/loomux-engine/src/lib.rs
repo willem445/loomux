@@ -74,7 +74,6 @@
 //! have gone green forever while enforcing nothing. **Any future batch that
 //! moves a type a source-scanning test watches owes the same check**: ask where
 //! the violation can now be spelled, not where it used to be.
-
 //!
 //! A2 batch 3 — [`lessons`] (#268) and [`notify`] (#243), plus [`text`], which
 //! is what made them movable. Both modules were otherwise leaves; each had a
@@ -122,11 +121,67 @@
 //! rewrite that cost is one the compiler checks exhaustively. **Ask of every
 //! item on a moving type whether it is data or content**; the compiler will
 //! tell you about the rewrite, and nothing will tell you about the relocation.
+//!
+//! Batch 5 then split that pair, and the amendment belongs here rather than
+//! only in [`model`]: `role_template` stays (it loads the fixture-pinned bytes,
+//! which is what the paragraph above is actually about) and
+//! [`model::role_instructions_file`] came across (it loads nothing, and
+//! `workflow::Block` calls it from inside this crate). Read the rule as **ask
+//! it of each item, not of the pair** — batch 4 kept them together on the
+//! ground that "the name and the bytes are one mapping", and that pairing was
+//! the weaker half of its own argument.
+//!
+//! A2 batch 5 — the `workflow` CLUSTER: [`workflow`] (the
+//! `.loomux/workflow.yml` parser, its types, the merge-gate spec file and the
+//! capacity advice), [`profiles`] (the persona/profile loader and its
+//! sanitizers) and [`locks`] (the named-resource state machine). The first
+//! batch that had to move THREE modules at once, and the reason is a shape
+//! worth recognising rather than a size: `profiles` calls
+//! `workflow::{kind_from_str, resolve_profile_path}` while `parse_workflow`
+//! calls `profiles::sanitize_allow`. That cycle is unremarkable inside one
+//! crate and unrepresentable across two, so **a dependency cycle is a
+//! partition, not an ordering** — no batch order exists that moves either
+//! alone, and the only question was where to draw the line around it. `locks`
+//! joins because `LockTable::sync` is typed on `workflow::ResourcePolicy`.
+//!
+//! The line was drawn TIGHT. `mergeq` looked like a fourth member and is not:
+//! every mention of it in `workflow` is prose — a doc link and two references
+//! in doc comments — and prose does not make an edge. What matters is that no
+//! `mergeq` path appears in a body, which is the thing to check; counting the
+//! mentions is neither necessary nor, as it turned out, easy to get right.
+//! `mqdriver` is `workflow`'s heaviest consumer and stays behind on purpose —
+//! it reaches the pane host (`capture_raw_with_timeout`), which is slice A3.
+//! **An inbound edge never blocks a move**, because the re-export answers it:
+//! `mqdriver` still spells `super::workflow::…` and never learned anything
+//! changed. Only outbound edges decide what a batch has to contain.
+//!
+//! One outbound edge did not exist when this batch was planned, because batch 4
+//! created it. `Block::instructions_file` calls `role_instructions_file`, which
+//! batch 4 had deliberately left in `src-tauri` paired with `role_template`. So
+//! batch 5 split that pair — see [`model`]'s header for the argument. The
+//! finding generalises past this batch: **the batch that lifts a data layer
+//! ahead of its caller can leave a new edge pointing the wrong way**, because
+//! splitting a type's methods off it decides where those methods live, and the
+//! caller that forces the question may not have moved yet. Re-derive the edge
+//! set from the source at the start of every batch; a map drawn one batch ago
+//! is describing a tree that has since changed.
+//!
+//! It brings `serde_norway` (the YAML parser `parse_workflow` is built on) and
+//! `sha2` (`body_digest`, the hash the merge gate compares). Batch 3's rule
+//! held: **a dependency a module uses has to be declared, not inherited** —
+//! both are already in the shipped binary's graph via `src-tauri`, so no new
+//! package joins the lock, but resolver-2's feature unification is not
+//! crate-name unification and an undeclared crate does not compile at all. The
+//! manifest carries the argument for each, and `src-tauri`'s carries the
+//! getrandom audit both inherit.
 
 pub mod groupid;
 pub mod lessons;
+pub mod locks;
 pub mod model;
 pub mod notify;
+pub mod profiles;
 pub mod report;
 pub mod termgrid;
 pub mod text;
+pub mod workflow;

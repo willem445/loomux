@@ -16,16 +16,13 @@
 pub mod digest;
 pub mod humanq;
 pub mod intake;
-pub mod locks;
 pub mod mcp;
 pub mod mergeq;
 pub mod mergeqview;
 pub mod mqdriver;
 pub mod mqloop;
-pub mod profiles;
 pub mod queue;
 pub mod queuestate;
-pub mod workflow;
 
 // MOVED to the `loomux-engine` crate (#888 slice A2), re-exported here under
 // their original paths — whatever a call site in this crate or in the
@@ -79,17 +76,58 @@ pub(crate) use loomux_engine::text::tail_snippet;
 // ahead of it. `self` keeps `orchestration::model::…` spellable alongside the
 // flat names every existing call site uses.
 //
-// `default_model`/`sanitize_model_opt` keep their `pub(crate)` reach rather than
-// following the engine's `pub`, the same choice `tail_snippet` got above: the
-// engine has to expose them to be callable across the crate boundary, and the
-// re-export is the one place that decision is still ours. `Role::prefix` and
-// `Role::as_str` had the same reach and cannot keep it — a method's visibility
-// is the defining crate's to set, and no re-export narrows it.
+// `default_model`/`sanitize_model_opt` were `pub(crate)` here, and the
+// `pub(crate) use` below keeps that reach for the FLAT spelling — the one every
+// call site in this crate uses. Say it that precisely, because the shorter
+// version ("the re-export keeps them `pub(crate)`") is wrong and was written
+// here first: the `self` on the line above re-exports the whole module
+// publicly, so every `pub` item in the engine's `model` is also reachable as
+// `orchestration::model::…`, these two included. That is forced — an item must
+// be `pub` in the engine to be callable from here at all — and harmless, since
+// `loomux-engine` is `publish = false` and "public" means reachable by a
+// sibling crate in this workspace, not a shipped API. Contrast `tail_snippet`
+// above, where the claim really is the narrow one: `text` has no module
+// re-export, only the single item, so no `orchestration::text::…` path exists.
+// `Role::prefix` and `Role::as_str` had the same reach and cannot keep even the
+// flat form — a method's visibility is the defining crate's to set, and no
+// re-export narrows it.
 pub use loomux_engine::model::{
     self, cli_can_host, cli_caps, CliCaps, Containment, Role, CLI_CAPS, CONTEXT_VARIANTS,
     EFFORT_LEVELS, SUPPORTED_CLIS,
 };
 pub(crate) use loomux_engine::model::{default_model, sanitize_model_opt};
+
+// #888 slice A2 batch 5 — the `workflow` CLUSTER: the `.loomux/workflow.yml`
+// parser and its types, the persona/profile loader, and the named-lock state
+// machine. They move as one because they are one: `profiles` reads
+// `workflow::{kind_from_str, resolve_profile_path}` while `parse_workflow`
+// reads `profiles::sanitize_allow` — a cycle, which is legal inside a crate and
+// impossible across two, so neither could have gone alone. `locks` joins them
+// because `LockTable::sync` is typed on `workflow::ResourcePolicy` in its body
+// and its tests; on this side of the boundary that is an intra-crate edge.
+//
+// It rides batch 4 entirely: every symbol `workflow` used to reach back here
+// for — `Role`, `SUPPORTED_CLIS`, `CLI_CAPS`, `EFFORT_LEVELS`,
+// `CONTEXT_VARIANTS`, `cli_caps`, `cli_can_host`, `default_model`,
+// `sanitize_model_opt` — is already in `loomux_engine::model`, so the imports
+// inside the moved files became `crate::model::…` rather than a new dependency.
+//
+// What deliberately did NOT come: `mqdriver`, which is `workflow`'s biggest
+// consumer. It reaches `capture_raw_with_timeout`, i.e. the pane host, which is
+// slice A3's problem — and an INBOUND edge does not block a move. It stays here
+// and spells `super::workflow::…` exactly as it always did, through this line.
+pub use loomux_engine::{locks, profiles, workflow};
+
+// Batch 5's one revision to a batch-4 decision, and the reason it is here
+// rather than above with the templates: `Block::instructions_file` is a
+// `workflow` method, so the function it calls had to be on the engine side or
+// the whole cluster stayed. `role_template` is unaffected — it loads the
+// fixture-pinned `templates/*.md` and stays. Re-exported `pub(crate)`, the same
+// choice `default_model` got above — and carrying the same caveat stated there:
+// this line fixes the reach of the flat `orchestration::role_instructions_file`
+// spelling, not of the item, which the module re-export also exposes as
+// `orchestration::model::role_instructions_file`.
+pub(crate) use loomux_engine::model::role_instructions_file;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -247,9 +285,14 @@ const BLOCK_TPL: &str = include_str!("templates/block.md");
 /// its type, so a `Role::template()` would have pulled `templates/*.md` — and
 /// with them the byte-golden fixture root `tests/fixtures/pre222/` that pins
 /// those four files — across the crate boundary as a side effect of moving an
-/// enum. The mapping belongs next to the content it names and next to the
-/// fixture that blesses it, which is here. See
-/// `doc/design/engine-extraction.md` §6.
+/// enum. The template mapping belongs next to the content it names and next to
+/// the fixture that blesses it, which is here.
+///
+/// Its former partner did NOT stay: `role_instructions_file` moved to
+/// `loomux_engine::model` in batch 5 (re-exported below) because it loads no
+/// bytes — it names a file in the *group dir*, and `workflow::Block` calls it
+/// from inside the engine. Content stays; a name that happens to resemble one
+/// travels. See `doc/design/engine-extraction.md` §6.
 pub(crate) fn role_template(role: Role) -> &'static str {
     match role {
         Role::Orchestrator => ORCHESTRATOR_TPL,
@@ -262,19 +305,6 @@ pub(crate) fn role_template(role: Role) -> &'static str {
         // (the only caller of a role's template machinery) is never
         // invoked for `Role::Solo`.
         Role::Solo => unreachable!("solo panes have no role template"),
-    }
-}
-
-/// The file name a capability class's instructions are written under in the
-/// group dir. Split off `Role` for the same reason as [`role_template`] — the
-/// name and the bytes are one mapping and stay together.
-pub(crate) fn role_instructions_file(role: Role) -> &'static str {
-    match role {
-        Role::Orchestrator => "orchestrator.md",
-        Role::Worker => "worker.md",
-        Role::Reviewer => "reviewer.md",
-        Role::Planner => "planner.md",
-        Role::Solo => unreachable!("solo panes have no instructions file"),
     }
 }
 

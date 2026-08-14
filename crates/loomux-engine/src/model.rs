@@ -15,9 +15,10 @@
 //! # What deliberately did NOT come with `Role`
 //!
 //! `Role::template()` and `Role::instructions_file()` were inherent methods on
-//! this enum, and they are now free functions (`role_template`,
-//! `role_instructions_file`) in `src-tauri/src/orchestration/mod.rs`, next to
-//! the `include_str!` templates they load.
+//! this enum. Batch 4 turned both into free functions (`role_template`,
+//! `role_instructions_file`) and left both in
+//! `src-tauri/src/orchestration/mod.rs`, next to the `include_str!` templates
+//! they load.
 //!
 //! An inherent impl has to live in the crate that defines the type, so keeping
 //! them as methods would have dragged `templates/*.md` — and with them the
@@ -32,6 +33,18 @@
 //! asked of `GroupId`'s tripwire, answered the other way round: there, the
 //! guard had to follow the type; here, the content must not.
 //!
+//! **Batch 5 split that pair, and the split is the sharper reading of the same
+//! rule.** `role_template` stays: it loads the fixture-pinned bytes, so it is
+//! the half the argument above is actually about. [`role_instructions_file`]
+//! came across, because it loads nothing — it maps a class onto the file name
+//! the *group directory* carries, and `workflow::Block::instructions_file`
+//! calls it from inside this crate. Batch 4 kept them together on the ground
+//! that "the name and the bytes are one mapping"; that pairing turned out to be
+//! the weaker half of its own argument. What must not travel silently is
+//! content and the procedure that blesses it, and a bare `"worker.md"` is
+//! neither. The pin is unmoved either way: see this function's own doc comment
+//! for the test that would redden.
+//!
 //! # Widened on the way in
 //!
 //! `Role::prefix`, `Role::as_str`, `default_model` and `sanitize_model_opt`
@@ -41,7 +54,30 @@
 //! question to ask of it: whether the item is one this crate is content to
 //! expose, not merely whether it compiles. All four are total functions over a
 //! closed enum or a `&str`, with no state and no invariant a caller could
-//! violate by holding them.
+//! violate by holding them. [`role_instructions_file`] joined them in batch 5
+//! on the same terms and for the same reason — `pub` here so both `workflow`
+//! and `mod.rs` can reach it.
+//!
+//! **What a `pub(crate) use` on the other side does and does not buy**, because
+//! the convenient phrasing for this is wrong and was written twice before it
+//! was caught. `orchestration` re-exports these `pub(crate)`, which governs the
+//! FLAT spelling — `orchestration::default_model`,
+//! `orchestration::role_instructions_file`, the ones every existing call site
+//! uses — and nothing else. It does not narrow the item, because `mod.rs` also
+//! re-exports this whole module publicly (`pub use loomux_engine::model::{self,
+//! …}`), so every `pub` item here is reachable as `orchestration::model::…`
+//! too. `role_instructions_file` was `pub(crate)` before batch 5 and is
+//! publicly reachable by that path now. So the accurate claim is **"no existing
+//! spelling widened"**, not "the public surface is unchanged".
+//!
+//! That reachability change is forced and harmless, which is why the answer is
+//! to state it rather than to contort the re-export chasing a literal
+//! "unchanged". Forced: the function has to be `pub` here for `src-tauri`'s
+//! call sites to reach it at all, and `model::` was already a public re-export
+//! before this batch. Harmless: `loomux-engine` is `publish = false` — an
+//! internal workspace boundary, not a shipped library API — so "public" here
+//! means reachable by a sibling crate in this repo, not a compatibility promise
+//! to anyone outside it.
 
 use serde::Serialize;
 
@@ -110,10 +146,11 @@ impl Role {
         }
     }
     /// Lowercase wire/label name (matches the `Serialize` rename). Unlike
-    /// `role_template`/`role_instructions_file` (the two mappings that stayed in
-    /// `src-tauri`, see this module's doc), this one IS reached for a solo
-    /// member — `channel_member_label` formats it into the identity line every
-    /// channel message/notice carries.
+    /// `role_template` (which stayed in `src-tauri` with the templates it loads)
+    /// and [`role_instructions_file`] (which came here in batch 5 — see this
+    /// module's doc), this one IS reached for a solo member —
+    /// `channel_member_label` formats it into the identity line every channel
+    /// message/notice carries.
     pub fn as_str(self) -> &'static str {
         match self {
             Role::Orchestrator => "orchestrator",
@@ -567,6 +604,33 @@ pub fn sanitize_model_opt(m: &str) -> String {
     m.chars()
         .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '/'))
         .collect()
+}
+
+/// The file name a capability class's instructions are written under **in the
+/// group dir**, and the half of batch 4's `Role::template()` split that came
+/// across in batch 5. See this module's header for why the other half did not.
+///
+/// This one names no template and loads no bytes: it is the group directory's
+/// own contract — the name a kickoff prompt tells an agent to read — and
+/// `workflow::Block::instructions_file` is a caller of it that now lives in
+/// this crate. The `include_str!` templates and the byte-golden fixture root
+/// that blesses them stayed in `src-tauri` with `role_template`, which is the
+/// thing batch 4's argument was actually protecting.
+///
+/// Its mapping is not a claim this crate makes on its own recognizance:
+/// `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was`
+/// writes a default group's four instruction files and byte-compares them
+/// against `src-tauri/tests/fixtures/pre222/`, which pins the name as well as
+/// the bytes for every class that has one. A mis-mapped name reddens there
+/// wherever this function is defined.
+pub fn role_instructions_file(role: Role) -> &'static str {
+    match role {
+        Role::Orchestrator => "orchestrator.md",
+        Role::Worker => "worker.md",
+        Role::Reviewer => "reviewer.md",
+        Role::Planner => "planner.md",
+        Role::Solo => unreachable!("solo panes have no instructions file"),
+    }
 }
 
 #[cfg(test)]
