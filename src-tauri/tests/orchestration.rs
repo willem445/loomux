@@ -47105,6 +47105,25 @@ fn list_questions_shows_every_pending_row_and_says_how_many_settled_it_dropped()
         2,
         "every pending row is listed, always"
     );
+
+    // The WEBVIEW path is the uncapped one. `orch_questions_list` reads the
+    // whole file rather than this projection: its return type is a list, so
+    // there is nowhere to put an omitted count, and a cap whose size the caller
+    // cannot see is precisely the silent truncation this feature refuses
+    // everywhere else. Retention already bounds the file, so "everything" is a
+    // bounded answer by construction.
+    let whole_file = reg.questions(&g).unwrap();
+    assert_eq!(
+        whole_file.len(),
+        settled + 2,
+        "the command path must cap nothing — it returns the file as it stands"
+    );
+    assert!(
+        whole_file.len() > rows.len(),
+        "…and the MCP projection really is the narrower of the two ({} vs {})",
+        rows.len(),
+        whole_file.len()
+    );
 }
 
 /// The file's retention: settled rows age out, pending ones never do. The one

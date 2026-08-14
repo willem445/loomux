@@ -145,6 +145,12 @@ gate.
 `orch_questions_list(group_id)` (orch-read) and
 `orch_question_answer(group_id, id, answer)` (orch-control). Both parse
 `group_id` at the boundary through `command_group`, like every sibling command.
+
+`orch_questions_list` returns the **whole file**, deliberately not the capped
+`list_questions` projection: that cap buys an agent context economy, and this
+command's list-typed return has nowhere to carry the omitted count that keeps
+the cap honest. Retention already bounds the file, so uncapped is a bounded
+answer here.
 Membership is enforced by *which file was read*: each group's questions live in
 its own group dir, so another group's id is simply absent, and the refusal is the
 same one an id that never existed gets.

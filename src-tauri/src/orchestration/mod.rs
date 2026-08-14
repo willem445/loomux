@@ -46943,8 +46943,16 @@ fn open_external_url(url: &str) -> Result<(), String> {
 // and the gesture is a human's. No agent-reachable path exists to either — see
 // `humanq`'s module doc and `OrchRegistry::answer_question`.
 
-/// The group's questions, for the inbox panel: pending first, then the newest
-/// settled rows.
+/// The group's questions, for the inbox panel — **the whole file, uncapped**.
+///
+/// Deliberately NOT `question_list`, which is the MCP tool's projection: that
+/// one caps settled rows for an agent's context budget and returns the omitted
+/// count alongside so the agent can say so. Through this command there would be
+/// nowhere to put that count — the return type is a list — and a cap whose size
+/// the caller cannot see is exactly the silent truncation the rest of this
+/// feature refuses. The file needs no cap of its own here anyway: retention
+/// already bounds it (`SETTLED_RETAINED` settled rows, `PENDING_MAX` pending),
+/// so "everything" is a bounded answer by construction.
 ///
 /// Off-thread (#743 S4c), like every other fs-touching command. Read-only and
 /// takes no lock — writers replace `questions.json` through `atomic_write`, so
@@ -46963,7 +46971,7 @@ pub async fn orch_questions_list(app: AppHandle, group_id: String) -> Vec<humanq
     // #904: no error channel; an unvalidated id yields the same empty list a
     // group with no questions does. See `command_group`.
     let Ok(group_id) = command_group(&group_id) else { return Vec::new() };
-    run_blocking(move || reg.question_list(&group_id).map(|(rows, _)| rows).unwrap_or_default()).await
+    run_blocking(move || reg.questions(&group_id).unwrap_or_default()).await
 }
 
 /// The human answers a pending question, from the app's own webview.
