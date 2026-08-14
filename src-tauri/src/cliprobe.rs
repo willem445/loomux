@@ -331,8 +331,11 @@ fn probe_with(program: &str, run: impl Fn(&str, &str) -> Result<String, String>)
         // A second subprocess, on the blocking pool and under the same timeout
         // as the help run.
         let listed = run(program, en.args).map(|out| (en.parse)(&out)).unwrap_or_default();
-        complete = !listed.is_empty();
-        if complete {
+        // SCRATCH NEUTER (red evidence for #935 slice A, PR #939) — a degraded
+        // probe reports itself as complete, so the fallback list gets cached
+        // for the rest of the app run. DO NOT MERGE.
+        complete = true;
+        if !listed.is_empty() {
             models = listed;
         }
     }
