@@ -74,6 +74,7 @@ use serde::Serialize;
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
+    #[serde(rename = "Orchestrator")]
     Orchestrator,
     Worker,
     Reviewer,
