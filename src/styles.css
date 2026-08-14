@@ -72,9 +72,10 @@
          sub-palette. Four of these carry the same pigment as a --state-* token above and
          that is deliberate: loomux has one palette, and the token a surface NAMES is what
          declares which question it is answering. An --id-* token may only be used through a
-         documented role mapping; "it needed a different blue" is still refused. The map is
-         doc/design/ui-redesign.md, §What slice B migrated — which reserved these in slice A
-         and consumed all eight in slice B. */
+         documented role mapping; "it needed a different blue" is still refused. Reserved
+         by slice A; the icon role table directly below is the first consumer, and slice B
+         mapped the remaining surfaces. The full map is doc/design/ui-redesign.md, §What
+         slice B migrated. */
   --id-rose: #e8636f;
   --id-amber: #e8a94a;
   --id-lime: #a9cc5a;

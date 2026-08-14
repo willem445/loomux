@@ -184,6 +184,65 @@ collapsed.
 That is also the answer to the risk this revision introduces: the control on fruit salad is
 not "use fewer colours", it is that the colourful channel is never the load-bearing one.
 
+## The icon system — a role, never a hue
+
+The first surface to consume the identity channel, and the shape every later one should
+copy. `src/icons.ts` is one registry; `test/icons.test.ts` holds it to everything below.
+
+**Colour is assignment, not asset.** No icon carries a colour. The glyphs are `currentColor`
+line art, the registry stamps `.ic-<role>` onto the `<svg>` it renders, and the stylesheet
+maps each role to exactly one `var(--id-*)`. So recolouring the app never touches an SVG, and
+a consumer cannot pick a hue — it picks a **meaning** and the table picks the hue. There is
+deliberately no per-call override: rule 3 below allows an `--id-*` token only *through a
+documented role mapping*, and an argument at the call site is precisely the ad-hoc route it
+refuses.
+
+**Eight roles, eight hues, one claim each.**
+
+| Role | Token | The question it answers | Where it shows |
+| --- | --- | --- | --- |
+| `workspace` | `--id-cyan` | where the work lives | folders, the cwd chip, the file actions |
+| `source` | `--id-amber` | code you edit | source-file rows, the two ways into an editor |
+| `content` | `--id-jade` | data and documents you read | config, markup, images, lockfiles, text |
+| `vcs` | `--id-lime` | the repository's history | the branch chip, the git overlay |
+| `fleet` | `--id-violet` | the agents themselves | group view, fold-group |
+| `board` | `--id-orchid` | the group's work surfaces | tasks, issues, audit, timeline |
+| `danger` | `--id-rose` | destructive actions | delete |
+| `live` | `--id-azure` | capture in progress | push-to-talk |
+
+**The bijection is the discipline, and it is the answer to fruit salad at icon scale.** A hue
+claimed by two roles has stopped saying *which thing this is* — the user sees amber and has to
+work out whether it means source or tasks — and at that point the table has quietly become a
+palette of nice colours. So each identity hue is claimed by exactly one role, checked both
+ways. It also fixes the ceiling §The palette measured: a ninth icon family cannot arrive by
+minting a ninth colour. It has to displace one, and argue why.
+
+**No icon role may name a `--state-*` token.** An icon that reports agent state takes its
+colour from the *position* it sits in — the warp thread, the status chip, the state dot — not
+from this registry. That is the position rule doing its work one layer down: `--state-danger`
+and `--id-rose` are the same pigment, so the test checks the token a role *names*, never a
+hex, and an icon dyed with a state token would look right, measure right, and still have moved
+a fleet signal onto the channel that collapses under colour-vision deficiency.
+
+**Hue groups, shape distinguishes.** The file tree is the densest icon surface in the app and
+the one where this could most easily go wrong. Fifteen file categories share **three** roles —
+folders, code you run, content you read — so a listing separates the kinds at a glance while
+fifteen distinct glyphs separate the members. Fifteen hues down a two-hundred-row tree would
+be noise; three is a legend.
+
+**Vendored, not depended on.** The base set is [Lucide](https://github.com/lucide-icons/lucide)
+(ISC), copied verbatim as SVG-string constants at a pinned commit, with the licence and
+provenance in `src/vendor/lucide/` and an entry in `THIRD_PARTY_NOTICES.md`. Not an npm
+package: the plan's no-new-dependency line holds, nothing in the build has to resolve an icon
+package, and the copy stays small enough to audit — which is only true while **the set is
+limited to icons a surface actually renders**, so a test walks `src/` and fails on one that
+nothing asks for. The wrapper keeps Lucide's own `viewBox`, stroke weight, caps and joins, so
+a re-vendor is a diff a reviewer can read against upstream. The alternatives were considered
+and refused: hand-drawing fifty glyphs (the uneven set this replaced is the evidence), an icon
+font (a webfont, with the flash of the wrong face §Type already rejects), and per-file `.svg`
+assets through Vite (works, but string constants are what every consumer already takes and are
+what keeps the registry node-testable).
+
 ## Elevation — the model, not a decoration
 
 Four surfaces, one ladder, and the rule that governs it: **height means "closer to the
@@ -534,12 +593,12 @@ Shipped: this note, `src/theme.ts`, the semantic token layer in `:root` — incl
 `--id-*` identity tokens — `TERM_THEME` derived from `theme.ts`, the `index.html` pre-paint
 sync, and `test/theme.test.ts`.
 
-**The identity tokens are reserved, not consumed.** Nothing paints an `--id-*` token yet, the
-same way `--rail-w` is declared and unused: slice A's job is to make the decision once, in a
-place the later slices can point at. Slice K writes the icon role→dye table against them,
-slice B maps the surfaces below to them, and until then the identity channel is a promise the
-tests hold rather than something visible on screen. The honest read of this PR is that it
-removes the rule that kept the app grey and picks the colours — it does not yet apply them.
+**Slice A reserved the identity tokens rather than consuming them**, the same way `--rail-w`
+is declared and unused: its job was to make the decision once, in a place the later slices
+could point at. **Slice K is where the channel first reaches the screen** — the icon role→dye
+table (§The icon system) claims all eight hues and paints them across the pane headers, the
+file toolbars and every row of the file trees. Slice B maps the remaining surfaces below to
+them.
 
 Not shipped: any restyling — and the honest description of that is not "the old design
 wearing the new colours", because only the rules that went through a *token* moved. The

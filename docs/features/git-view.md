@@ -17,7 +17,7 @@ nav_order: 1
 
 ---
 
-Press **`Alt+G`** (or the ⑂ icon in a pane header) to overlay a git panel on the
+Press **`Alt+G`** (or the lime commit-graph icon in a pane header) to overlay a git panel on the
 pane, scoped to the repository the shell is currently in — a commit graph, a diff
 preview, and the working-tree changes with staging and commit. It floats over the
 terminal and never resizes it; press `Esc` (or ✕) to return.

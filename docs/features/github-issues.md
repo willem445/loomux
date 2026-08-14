@@ -17,7 +17,7 @@ nav_order: 2
 
 ---
 
-Press **`Alt+I`** (or the ◉ icon in a pane header) to overlay a GitHub **issues**
+Press **`Alt+I`** (or the orchid ◉ icon in a pane header) to overlay a GitHub **issues**
 panel on the pane, scoped to the repository the shell is currently in — the
 durable upstream work queue, alongside the [git view](git-view.html). Like the git
 view it floats over the terminal and **never resizes it**; press `Esc` (or ✕) to

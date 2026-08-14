@@ -246,11 +246,21 @@ be rearranged in place:
 - **Minimize** (`Alt+M` or the — button) parks a pane in the **dock** strip at
   the bottom of the grid — it keeps running. Click its chip to bring it back, or
   the chip's ✕ to close it for good.
-- **Fold a whole group** — an orchestrator pane has a fold toggle (the stacked
-  panes icon) that minimizes *every* worker/reviewer pane in its group to the
+- **Fold a whole group** — an orchestrator pane has a fold toggle (the collapsing
+  chevrons) that minimizes *every* worker/reviewer pane in its group to the
   dock at once, leaving just the orchestrator. Click again to restore them all.
   Handy once a big group has opened a pane per agent and you want the screen
   back. (More in the [orchestration guide](orchestration.html).)
+
+> **The icons are colour-coded, and the colour means something.** A mark's hue
+> says *which kind of thing* it is, not what state it's in: cyan for your
+> workspace (folders, paths, the file actions), amber for code you edit, jade
+> for data and documents you read, lime for git, violet for the agents
+> themselves, orchid for the group's boards (tasks, issues, audit, timeline),
+> rose for anything destructive, azure while the mic is capturing. Agent *state*
+> is deliberately never carried by an icon — it has its own signals, so the two
+> never compete for your attention. The file tree uses the same scheme, which is
+> why a listing separates folders from code from config at a glance.
 
 > **Why overlays, never re-splits, for the git/issues/board/audit panels:**
 > resizing a PTY forces the program inside it to repaint, which pollutes
@@ -366,8 +376,8 @@ this table mirrors it.
 | Minimize pane | `Alt+M` (or —); restore from the dock |
 | Session browser | `Ctrl+Shift+P` (or the *sessions* button) |
 | Open in editor | `Alt+E` (or the `</>` button in a pane header) |
-| Git view | `Alt+G` (or the ⑂ icon) |
-| GitHub issues view | `Alt+I` (or the ◉ icon) |
+| Git view | `Alt+G` (or the lime commit-graph icon) |
+| GitHub issues view | `Alt+I` (or the orchid ◉ icon) |
 | Voice prompt | `Alt+S` (push-to-talk; `Esc` cancels) |
 | Copy / paste | `Ctrl+C` (with a selection) / `Ctrl+Shift+C`, `Ctrl+Shift+V` (`Ctrl+V` also pastes by default — [Settings](#settings)) |
 
