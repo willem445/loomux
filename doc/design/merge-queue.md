@@ -565,7 +565,7 @@ On a culprit:
 
 - **A comment on the culprit PR** — the durable record, where a human or the owning worker
   will actually look: failing check name, run link, batch id, and the sibling set. All
-  gh-sourced text passes through `notify.rs::sanitize_gh_text:496`, the same sanitizer every
+  gh-sourced text passes through `notify::sanitize_gh_text`, the same sanitizer every
   crossing-text boundary in this codebase uses.
 - **One decision-grade notice to the orchestrator.** One fact that changes what it does next,
   plus the PR link — not a narration.
