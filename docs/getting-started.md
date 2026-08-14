@@ -33,8 +33,41 @@ npm install -g loomux-desktop # then run `loomux` anytime
 
 `loomux-desktop` is a small, dependency-free launcher: it fetches the matching
 release asset for your platform (Windows installer, macOS `.dmg`, or Linux
-`AppImage`), installs/caches it, and launches it. Pass `--reinstall` to force a
-fresh download.
+`AppImage`), installs/caches it, and launches it.
+
+```sh
+loomux            # launch the installed app (installs it first if missing)
+loomux update     # install/refresh the app from the newest release on your channel
+loomux version    # print the launcher's version
+loomux help       # full usage
+```
+
+Plain `loomux` **never** updates an existing install. Installing over a running
+Loomux closes it — and everything running inside it — so when you update is your
+call, not the launcher's.
+
+`loomux update` picks the newest release **on the channel you are already on**
+and never installs an older build over a newer one:
+
+| You have installed | `loomux update` gives you |
+| --- | --- |
+| a stable release (`1.0.0`) | the newest **stable** release |
+| a beta/RC (`1.1.0-beta11`) | the newest release of either kind |
+
+If the launcher cannot read the version of your installed Loomux, `loomux
+update` stops and says so rather than guessing — it has no way to tell an update
+from a downgrade, so it does neither. Installing your preferred build once from
+the releases page clears it.
+
+To move from stable onto the beta train (or back), install that build yourself
+from [the releases page](https://github.com/willem445/loomux/releases) — the
+launcher will not switch channels for you. On Linux the app is a cached
+AppImage, so `loomux update` refreshes the cache; quit the running AppImage
+first, since it cannot be overwritten while it is running.
+
+`loomux --reinstall` still works as a deprecated alias for `loomux update`, but
+its meaning changed in v1.1: it used to install the version matching the
+launcher itself, and now it installs the newest release on your channel.
 
 > The package is named `loomux-desktop` because the bare `loomux` name on npm
 > belongs to an unrelated tmux tool — but the command it installs is still
@@ -55,7 +88,8 @@ curl -fsSL https://raw.githubusercontent.com/willem445/loomux/main/install.sh | 
 ### Release assets (manual)
 
 Prefer to grab an installer yourself? Every build is published to
-[the latest GitHub release](https://github.com/willem445/loomux/releases/latest):
+[the GitHub releases page](https://github.com/willem445/loomux/releases) —
+beta/RC builds included, which the `latest` link does not show:
 
 | Platform | Asset |
 | --- | --- |

@@ -1565,13 +1565,12 @@ pub fn git_shim_cmd(real_git: &str, sh_path: Option<&str>) -> String {
 }
 
 /// The POSIX `loomux` shim (#815): refuse, always. `loomux` on an agent's PATH is
-/// the npm launcher, and that launcher is an INSTALLER — it reinstalls the desktop
-/// app whenever the installed version differs from its own (in either direction,
-/// so an older stable launcher "upgrades" a newer beta right back down), then runs
-/// the installer silently. Run from an agent pane, the install terminates the
-/// running `Loomux.exe` to replace it, killing the app and every agent in it
-/// mid-task — including the shell that invoked it, which is why the evidence is a
-/// process that vanishes with no shutdown path and no crash report.
+/// the npm launcher, and that launcher is an INSTALLER — plain `loomux` installs
+/// the desktop app when none is present and `loomux update` reinstalls it (#845),
+/// and either way the install runs silently. Run from an agent pane, that install
+/// terminates the running `Loomux.exe` to replace it, killing the app and every
+/// agent in it mid-task — including the shell that invoked it, which is why the
+/// evidence is a process that vanishes with no shutdown path and no crash report.
 ///
 /// Unlike the gh/git shims this is not a gate: there is no agent use of the
 /// launcher to authorize (agents reach loomux through its MCP tools), so there is
@@ -1597,7 +1596,7 @@ if [ -n "$LOOMUX_GROUP_DIR" ]; then
   printf '{"ts_ms":%s,"actor":"loomux-shim","action":"self-launch-blocked","detail":{"agent":"%s"}}\n' \
     "$ts" "$LOOMUX_AGENT_ID" >> "$LOOMUX_GROUP_DIR/audit.jsonl" 2>/dev/null || true
 fi
-printf '%s\n' "loomux: running the loomux launcher from an agent pane is blocked. It is an installer, not a window switcher: it reinstalls the desktop app whenever its version differs from its own, and the silent install kills the running Loomux — terminating this pane and every other agent mid-task. Loomux is reachable from here through its MCP tools only. If the app needs restarting, reinstalling or a version check, ask the human (message_orchestrator, or report blocked); never run it yourself." >&2
+printf '%s\n' "loomux: running the loomux launcher from an agent pane is blocked. It is an installer, not a window switcher: plain loomux installs the desktop app when it is missing and loomux update reinstalls it, and the silent install kills the running Loomux — terminating this pane and every other agent mid-task. Loomux is reachable from here through its MCP tools only. If the app needs restarting or updating, ask the human (message_orchestrator, or report blocked); never run it yourself." >&2
 exit 1
 "#;
     // Normalize to LF (see gh_shim_sh) — a CRLF POSIX script is broken.
@@ -1621,7 +1620,7 @@ pub fn loomux_shim_cmd() -> String {
      if defined LOOMUX_GROUP_DIR (\r\n\
      \x20 >>\"%LOOMUX_GROUP_DIR%\\audit.jsonl\" echo {\"ts_ms\":0,\"actor\":\"loomux-shim-cmd\",\"action\":\"self-launch-blocked\",\"detail\":{}} 2>nul\r\n\
      )\r\n\
-     >&2 echo loomux: running the loomux launcher from an agent pane is blocked. It is an installer, not a window switcher - it reinstalls the desktop app and the silent install kills the running Loomux, terminating this pane and every other agent mid-task. Use the loomux MCP tools; ask the human to restart, reinstall or version-check the app.\r\n\
+     >&2 echo loomux: running the loomux launcher from an agent pane is blocked. It is an installer, not a window switcher - plain loomux installs the app when it is missing and loomux update reinstalls it, and the silent install kills the running Loomux, terminating this pane and every other agent mid-task. Use the loomux MCP tools; ask the human to restart or update the app.\r\n\
      exit /b 1\r\n"
         .to_string()
 }
