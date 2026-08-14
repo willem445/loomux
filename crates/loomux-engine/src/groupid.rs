@@ -200,6 +200,15 @@ impl fmt::Display for GroupId {
     }
 }
 
+// SCRATCH PLANT — red-before-green evidence for PR #968, never merged. A SECOND
+// group-path assembly point, in the engine crate: exactly the "convenience
+// helper" a future slice would reach for, and exactly what `group_dir_at` is
+// meant to be the only instance of. It must redden the offenders half of
+// `the_orchestration_root_is_joined_with_a_group_in_exactly_one_place`.
+pub fn group_dir_shortcut(root: &std::path::Path, g: &GroupId) -> std::path::PathBuf {
+    root.join(g.as_str())
+}
+
 impl Deref for GroupId {
     type Target = str;
     fn deref(&self) -> &str {
