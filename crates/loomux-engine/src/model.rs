@@ -90,6 +90,7 @@ pub enum Role {
     /// against a live-agent cap (there is none for `__solo__`) and never
     /// traverses `spawn_agent_ex`/`build_agent_command` — it has no block, no
     /// persona, no role template.
+    #[serde(rename = "SOLO")]
     Solo,
 }
 
