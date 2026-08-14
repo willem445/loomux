@@ -393,7 +393,7 @@ sibling `opencode/deepseek-v4-flash`, and `opencode/gpt-5.1-codex` (the models
 reference's own example). The Zen free tier is broader and deliberately not
 enumerated — each row is another line of hardcoded model table to go stale
 (#329), against a `custom…` entry that already accepts any id and a merge with
-whatever the CLI's own `--help` reports.
+whatever the probe reports (`opencode models`, below).
 
 **The `/` survives every hop the frontend owns.** A curated id is the option's
 `value` verbatim; only the *label* is prettified, and the prettifier now names a
@@ -414,6 +414,59 @@ until a probe resolved would read as loomux having forgotten it — the same rul
 the disabled-with-a-reason knobs follow. The orchestrator-mode CLI id IS the
 program name probed, which `test/orchclis.test.ts` pins against the launchable
 agent catalog.
+
+## Model enumeration: `opencode models` (#935)
+
+opencode is the one CLI in the roster that can be *asked* what models it has:
+`opencode models` "[l]ist[s] all available models from configured providers" and
+"displays all models available across your configured providers in the form of
+`provider/model`" (`DOCS`, https://opencode.ai/docs/cli/). `cliprobe.rs` runs it
+as a second probe command and takes its output over the `--help` parse.
+
+**Why it wins over the help parse, categorically.** The help text is what the
+vendor wrote; the list command is what *this machine* is configured for. For
+opencode the gap is not a nicety: a valid id is `provider_id/model_id`, and the
+help parser's token filter admits no `/` at all — so the `--help` route can
+never produce an id an opencode pane could actually launch on: the most it can
+yield is a provider-less fragment, which is not a model opencode accepts. So
+until now the curated three carried opencode's picker on their own.
+
+**It lives in `ENUMERATORS`, a table, not in an `if`.** Same reason
+`CLI_CAPS` is a table (constraint 8): the next CLI that grows a list command is
+a row — program, argument, parser — and the probe keeps one code path. The
+argument string is pinned by test to exactly `models`: **never `--refresh`**,
+which "[r]efresh[es] the models cache from models.dev" (`DOCS`, same page) —
+a probe that fires while a human is filling in a launcher form must not re-pull
+a remote catalog on their behalf, and the cached list is the one their own
+opencode would use anyway.
+
+**Availability is decided by `--help` alone, and the list command can only
+add.** The launcher refuses an entire group launch on `available: false`, so an
+enumerator that failed, timed out, or printed a layout the parser doesn't
+recognise must leave that verdict untouched — and it does, structurally: the
+`models` run happens after availability is settled, and only a *non-empty*
+parse replaces the help-parsed list. The failure path is therefore exactly the
+behaviour that shipped before, not a degraded one.
+
+**The parser drops what it doesn't recognise.** The docs state the id format but
+not the surrounding layout, so `parse_models_from_list` keeps only lines that
+*are* an id (ANSI stripped, every `/`-segment non-empty and made of id
+characters — which is also what rejects a bare URL) and drops everything else,
+deduping while preserving the CLI's own order. An unfamiliar layout yields
+nothing and the fallback above takes over; the alternative — scraping words out
+of prose — would put ids into the picker that no pane can launch on.
+
+**Cost.** An opencode probe is now two subprocesses instead of one, each under
+the same 8s timeout, on the blocking pool, cached for the app run (#746). The
+list may also be long: it is a flat dropdown by design, and neither the backend
+nor the picker caps it — a silently truncated model list is worse than a long
+one.
+
+**Residual, for live validation.** The exact stdout layout of `opencode models`
+is not documented and was not observed (constraint 3 — no agent ran the CLI).
+The parser is written to tolerate that: worst case it recognises nothing and the
+picker degrades to today's curated list. A human running it once on a real
+install settles it.
 
 ## Usage and cost readback (#722 slice B)
 
