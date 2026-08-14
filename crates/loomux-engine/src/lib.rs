@@ -154,6 +154,15 @@
 //! caller that forces the question may not have moved yet. Re-derive the edge
 //! set from the source at the start of every batch; a map drawn one batch ago
 //! is describing a tree that has since changed.
+//!
+//! It brings `serde_norway` (the YAML parser `parse_workflow` is built on) and
+//! `sha2` (`body_digest`, the hash the merge gate compares). Batch 3's rule
+//! held: **a dependency a module uses has to be declared, not inherited** —
+//! both are already in the shipped binary's graph via `src-tauri`, so no new
+//! package joins the lock, but resolver-2's feature unification is not
+//! crate-name unification and an undeclared crate does not compile at all. The
+//! manifest carries the argument for each, and `src-tauri`'s carries the
+//! getrandom audit both inherit.
 
 pub mod groupid;
 pub mod lessons;

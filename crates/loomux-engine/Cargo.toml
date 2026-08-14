@@ -65,3 +65,29 @@ serde = { version = "1", features = ["derive"] }
 # getrandom audit reasons about, and its own dependencies (`itoa`, `memchr`,
 # `ryu`, `serde`) reach `getrandom` by no path.
 serde_json = "1"
+# `workflow` (slice A2 batch 5) parses `<repo>/.loomux/workflow.yml`. The parser
+# is the whole reason that module exists, so YAML travels with it.
+#
+# Clear under both bans, and on stronger ground than "no getrandom in its tree"
+# alone: `serde_norway` and its `unsafe-libyaml-norway` backend are ALREADY in
+# the shipped binary's linked graph via src-tauri, whose manifest carries the
+# full audit (run 2026-07-11, with the reproduction commands and the reasoning
+# for choosing the maintained fork over the archived `serde_yaml`). No new
+# package joins the lock and no fourth getrandom edge appears — this is the same
+# package, now also named by the crate that actually calls it.
+#
+# The attack-surface note over there applies here unchanged and is worth
+# repeating at the boundary it now crosses: this parses a file that comes from
+# the repo, so the parser's *output* is treated as untrusted (capability
+# closure, id/persona sanitization) rather than merely its input.
+serde_norway = "0.9.42"
+# `workflow::body_digest` — the sha256 a `review_verdict` records so the merge
+# gate can tell "this PR was approved" from "some earlier version of it was".
+# The digest and the gate-file format are one definition, so it moves with them.
+#
+# Clear under both bans, on the same ground as the YAML: `sha2` is already in
+# the shipped binary's graph (src-tauri's manifest carries that audit too, and
+# notes `sha2` was in `Cargo.lock` as a tauri transitive even before loomux
+# asked for it). Its chain is `cfg-if`, `cpufeatures` → `libc`, `digest` — no
+# getrandom by any path.
+sha2 = "0.10"

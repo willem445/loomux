@@ -352,12 +352,100 @@ from a unit test of product code, agents are banned from running cargo locally
     2. **CI runs `npm test` before `cargo test`.** A batch that breaks a
        frontend test therefore cannot produce Rust red evidence at all until
        that is fixed, because the job never reaches the compiler.
+  - **Batch 5 — the `workflow` cluster** (`workflow`, `profiles`, `locks`),
+    the batch every earlier one was clearing the way for. It is the first that
+    could not be a single module, and the reason is a shape rather than a size.
+
+    ### A cycle is a partition, not an ordering
+
+    `profiles` calls `workflow::{kind_from_str, resolve_profile_path}`;
+    `parse_workflow` calls `profiles::sanitize_allow`. That is a cycle —
+    unremarkable inside one crate, unrepresentable across two. So no batch
+    order exists that moves either alone: **once two modules are mutually
+    dependent, the only remaining question is where to draw the line around
+    them, not which goes first.** `locks` is in because `LockTable::sync` is
+    typed on `workflow::ResourcePolicy` in its body and its tests.
+
+    The line was drawn tight, and the two near-misses are the useful part.
+    `mergeq` reads like a fourth member; `workflow` names it exactly once, in a
+    doc link, and **a doc link is not an edge**. `mqdriver` is `workflow`'s
+    heaviest consumer and stays behind deliberately — it reaches
+    `capture_raw_with_timeout`, i.e. the pane host, which is slice A3. That one
+    is worth stating as a rule because it is the intuition that misleads:
+    **an inbound edge never blocks a move.** `mqdriver` still spells
+    `super::workflow::…` and never learned anything changed, because that is
+    what the re-export is. Only *outbound* edges decide what a batch contains.
+
+    ### The edge batch 4 created, and why the map was stale
+
+    Batch 4 split `Role::template()`/`Role::instructions_file()` into free
+    functions and left **both** in `src-tauri`. But `Block::instructions_file`
+    is a `workflow` method and calls `role_instructions_file` — so batch 4
+    handed batch 5 a fresh outbound edge into `mod.rs`, one that did not exist
+    when the cluster's edge map was drawn on #888. The generalizable finding:
+    **the batch that lifts a data layer ahead of its caller can leave a new
+    edge pointing the wrong way**, because splitting a type's methods off it
+    decides where those methods live, and the caller that forces the question
+    may not have moved yet. Re-derive the edge set from the source at the start
+    of every batch; a map drawn one batch ago describes a tree that has since
+    changed.
+
+    So batch 5 split batch 4's pair, and the split is the sharper reading of
+    batch 4's own rule rather than a reversal of it. `role_template` **stays**:
+    it loads `templates/*.md`, which `tests/fixtures/pre222/` byte-pins under a
+    human re-bless procedure, and that content plus its blessing procedure is
+    exactly what must not relocate as a side effect of a refactor.
+    `role_instructions_file` **travels**: it loads nothing and maps a class onto
+    the file name the *group directory* carries. Batch 4 kept the two together
+    on the ground that "the name and the bytes are one mapping", and that
+    pairing turned out to be the weaker half of its own argument — the argument
+    was about content, and a bare `"worker.md"` is not content. Its behaviour is
+    pinned identically either way; see below.
+
+    ### What it owed in evidence
+
+    This one **does** take the pure-relocation exemption, and unlike batch 2 and
+    batch 4 it is entitled to: nothing here changes a tripwire's coverage, and
+    every behaviour the move could break is already pinned by tests that did not
+    move and were not edited. Established per behaviour rather than asserted
+    wholesale, since that is the standard batch 4 set:
+
+    - the block parser's **closed vocabularies** and `kind_from_str`'s
+      reject-never-coerce shape — `src-tauri/tests/workflow.rs`, which drives
+      `parse_workflow` through `orchestration::workflow` (i.e. through the new
+      re-export) across its whole accept/reject surface;
+    - **`resolve_profile_path`'s traversal refusal** — the same file's escape
+      table (`..`, absolute, drive-letter, both separators), which is security
+      behaviour and the one this batch most wanted pinned by a third party;
+    - **`sanitize_allow`** — the same file's hostile-input table;
+    - **`ResourcePolicy`** and the lock table — `tests/workflow.rs`'s default
+      pin plus the wired multi-slot path in `tests/orchestration.rs`;
+    - the **`Role` → instructions-file name** mapping, the one item that
+      actually changed crates —
+      `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was`
+      writes a default group's four instruction files and byte-compares them
+      against `tests/fixtures/pre222/`, which pins the name as well as the
+      bytes. A mis-mapped name reddens there wherever the function is defined,
+      which is what makes the move safe rather than merely compiling.
+
+    The moved modules' inline `#[cfg(test)]` tests moved with them and are
+    engine unit tests now; nothing linking the lib changed target.
+
+    Two dependencies travel with `workflow`: `serde_norway` (the YAML parser
+    `parse_workflow` is built on) and `sha2` (`body_digest`, the hash the merge
+    gate compares). Both are already in the shipped binary's graph via
+    `src-tauri`, whose manifest carries the getrandom audit for each, so no new
+    package joins the lock and no new getrandom edge appears — but batch 3's
+    rule is why they are declared rather than assumed: feature unification is
+    not crate-name unification, and an undeclared crate does not compile at all.
+    Worth naming as the batch's one real process miss, since it cost a CI round:
+    the pre-move edge sweep grepped a *guessed list* of crate names and found
+    neither. Enumerating what the files actually import — rather than checking
+    for the imports you expect — is the version of that step that works.
   - **`digest` is not a leaf** despite reading like one. It calls
     `crate::sessions::yaml_field` and takes a `crate::opencodedb::TranscriptRow`
     — two modules staying in `src-tauri` — so it cannot move until those edges
     are cut or followed.
-  - **`locks` must travel with `workflow`**, on which it depends for
-    `ResourcePolicy` in both its body and its tests.
 - **A3 — the traits.** `EventSink` + `PaneHost`, `OrchRegistry` drops
   `AppHandle`, `NullPaneHost` replaces the app-is-`None` branch. Per-PR bar: the
   integration suite green with **zero test edits**, plus one new crate-level
