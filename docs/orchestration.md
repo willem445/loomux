@@ -34,9 +34,10 @@ in an audit log.
    and planner each get their own CLI (Claude Code or Copilot CLI) and model, so
    you can mix agent types in one group (e.g. a Claude orchestrator driving
    Copilot workers). The top *Agent* select is the group default that seeds every
-   role; override any role you like. Model dropdowns are populated by querying
-   the selected CLI's own help, so new models appear automatically, with a
-   custom-entry escape hatch.
+   role; override any role you like. Model dropdowns are populated by asking the
+   selected CLI what it offers — `opencode models`, which lists the models *your*
+   configured providers actually expose, for OpenCode; the CLI's own help for the
+   others — so new models appear automatically, with a custom-entry escape hatch.
 3. Set the repository, how many idle workers to start with, and the guardrails:
    **max live agents** and **permissions**.
 
