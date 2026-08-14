@@ -362,6 +362,12 @@ fn the_generated_agent_handle_is_a_single_filename_component() {
 /// exactly. `ROOTS` below asserts per root that it found files, and a further
 /// assertion pins that the file *defining* `GroupId` was actually in scope, so
 /// a stale root fails loudly instead of scanning nothing.
+///
+/// The same move is why the impl is now matched on its **shape** rather than on
+/// the single spelling `impl AsRef<Path> for GroupId`: the defining file no
+/// longer imports `Path`, so the qualified `std::path::Path` form is the
+/// likelier way the violation would really be written there, and a scan that
+/// only knew the bare form would report green on it.
 #[test]
 fn the_orchestration_root_is_joined_with_a_group_in_exactly_one_place() {
     /// The ONE permitted group-path assembly, matched on its exact text.
@@ -514,8 +520,23 @@ fn the_orchestration_root_is_joined_with_a_group_in_exactly_one_place() {
             if trimmed.starts_with("//") {
                 continue;
             }
-            if trimmed.replace(' ', "").contains("implAsRef<Path>forGroupId") {
-                has_asref_path_impl = true;
+            // The `AsRef<Path>` absence, matched on SHAPE rather than on one
+            // spelling of the type. `Path` is only spelled bare in a file that
+            // imports it, and the file that now DEFINES `GroupId` does not — so
+            // `impl AsRef<std::path::Path> for GroupId` is the likelier way
+            // this violation actually arrives, and a needle pinned to the bare
+            // form would step straight over it while reporting green. Two
+            // earlier versions of this test were defeated by exactly that class
+            // of rename (rev-440, rev-450); the fix is the same one they got.
+            // `AsRef<str>`/`Borrow<str>`, which GroupId legitimately has, do
+            // not end in `Path` and so do not match.
+            let n = trimmed.replace(' ', "");
+            if let Some((head, _)) = n.split_once(">forGroupId") {
+                if let Some((_, ty)) = head.rsplit_once("implAsRef<") {
+                    if ty == "Path" || ty.ends_with("::Path") {
+                        has_asref_path_impl = true;
+                    }
+                }
             }
             if line.contains(PERMITTED) {
                 permitted_seen += 1;
