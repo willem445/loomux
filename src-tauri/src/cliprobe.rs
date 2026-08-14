@@ -120,8 +120,11 @@ const ENUMERATORS: &[Enumerator] = &[Enumerator {
     parse: parse_models_from_list,
 }];
 
-fn enumerator_for(program: &str) -> Option<&'static Enumerator> {
-    ENUMERATORS.iter().find(|e| e.program == program)
+fn enumerator_for(_program: &str) -> Option<&'static Enumerator> {
+    // SCRATCH NEUTER (red evidence for #935 slice A, PR #939) — the lookup no
+    // longer keys on the program, so every CLI gets opencode's row.
+    // DO NOT MERGE.
+    ENUMERATORS.first()
 }
 
 /// Strip ANSI escape sequences and other control bytes from one line.
