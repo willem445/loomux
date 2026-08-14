@@ -24153,7 +24153,9 @@ impl OrchRegistry {
     /// match on tool names and no arm of it reaches here, so there is no name an
     /// agent can call. Two tests hold that shut —
     /// `no_agent_token_can_answer_a_question_through_the_mcp_surface` (every
-    /// tool the surface offers, dispatched, question still pending) and
+    /// tool the surface offers, dispatched, question still carrying no answer —
+    /// not "still pending", since `withdraw_question` is on that surface and
+    /// legitimately settles one as `withdrawn`) and
     /// `the_mcp_surface_has_no_path_to_the_answer_entry_point` (a source scan,
     /// so a future slice cannot wire one in quietly).
     ///

@@ -30,9 +30,14 @@
 //!
 //! 1. **No answer tool exists.** `mcp.rs`'s `call_tool` is a closed match on
 //!    tool names; none of its arms reaches [`super::OrchRegistry::answer_question`].
-//!    An agent cannot call what has no name. `no_agent_token_can_answer_a_question`
-//!    dispatches every tool the surface offers and asserts the question is
-//!    still pending; `the_mcp_surface_has_no_path_to_the_answer_entry_point`
+//!    An agent cannot call what has no name.
+//!    `no_agent_token_can_answer_a_question_through_the_mcp_surface` dispatches
+//!    every tool the surface offers and asserts the question still carries no
+//!    answer afterwards — *no answer*, deliberately, rather than *still
+//!    pending*: [`withdraw_question`](super::OrchRegistry::withdraw_question) is
+//!    on that surface and legitimately settles a question as `withdrawn`, and
+//!    the whole point is that taking your own question back is not the same
+//!    power as deciding it. `the_mcp_surface_has_no_path_to_the_answer_entry_point`
 //!    scans `mcp.rs`'s source so a future slice cannot wire one in quietly.
 //! 2. **The source is a property of the entry point, never an argument.**
 //!    [`AnswerSource`] is a closed enum whose variants are trusted surfaces,
