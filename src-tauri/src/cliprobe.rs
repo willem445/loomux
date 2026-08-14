@@ -29,7 +29,9 @@ const HELP_TIMEOUT: Duration = Duration::from_secs(8);
 pub struct CliProbe {
     /// The program ran and produced help output.
     pub available: bool,
-    /// Model ids parsed from the `--model` help section (may be empty).
+    /// Model ids the CLI reported: its own enumeration where it has one
+    /// (`ENUMERATORS`), otherwise parsed from the `--model` help section. May
+    /// be empty, and the launcher merges curated suggestions either way.
     pub models: Vec<String>,
     /// Human-readable failure reason when not available.
     pub error: Option<String>,
@@ -124,13 +126,21 @@ fn enumerator_for(program: &str) -> Option<&'static Enumerator> {
     ENUMERATORS.iter().find(|e| e.program == program)
 }
 
-/// Strip ANSI escape sequences and other control bytes from one line.
+/// Replace every ANSI escape sequence and control byte in one line with a
+/// SPACE, so what is left is printable text with the removals still acting as
+/// boundaries.
 ///
-/// Best-effort by design: the probe runs the CLI with pipes rather than a TTY,
-/// so styling should already be off, and the failure mode of getting this
-/// wrong is that a line stops looking like an id and is dropped — never that
-/// junk is admitted, since every surviving token is validated below.
-fn strip_ansi(line: &str) -> String {
+/// **Removing must never JOIN.** A tab is a control byte and a column
+/// separator at the same time: delete it and `id<TAB>Human Name` becomes
+/// `idHuman Name`, whose first token is `anthropic/claude-sonnet-4-5Claude` —
+/// id-SHAPED but not an id, non-empty, and therefore promoted over the
+/// help-parsed list and to the head of the human's picker (#939 review). The
+/// same hazard applies to an escape sequence sitting mid-token. Substituting a
+/// space instead makes one property structural: every id this module emits is a
+/// verbatim whitespace-delimited token of the CLI's own output, never a
+/// splice of two. The cost is the safe direction — a token interrupted by a
+/// sequence splits into two unrecognisable halves and the line yields nothing.
+fn plain_line(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
     let mut chars = line.chars();
     while let Some(c) = chars.next() {
@@ -142,11 +152,10 @@ fn strip_ansi(line: &str) -> String {
                     break;
                 }
             }
+            out.push(' ');
             continue;
         }
-        if !c.is_control() {
-            out.push(c);
-        }
+        out.push(if c.is_control() { ' ' } else { c });
     }
     out
 }
@@ -156,16 +165,29 @@ fn strip_ansi(line: &str) -> String {
 /// available across your configured providers in the form of
 /// `provider/model`" — <https://opencode.ai/docs/cli/>).
 ///
-/// The docs state the id format but not the surrounding layout, so this keeps
-/// only what *is* an id and drops every other line rather than modelling
-/// headings, spinners or progress chatter it has never seen: an unfamiliar
-/// layout yields nothing, and `probe_with` then leaves the help-parsed list
-/// alone. A CLI that listed bare ids instead would carry its own parser in its
+/// The docs state the id format but not the surrounding layout, so this models
+/// no layout at all: each line is reduced to printable text (`plain_line`), its
+/// first token is taken, and that token is kept only if it *is* an id.
+/// Headings, spinners and progress chatter it has never seen are dropped, and a
+/// wholly unfamiliar layout yields nothing — `probe_with` then leaves the
+/// help-parsed list alone.
+///
+/// What this guarantees, and what it does not: **every id returned is a
+/// verbatim whitespace-delimited token of the CLI's own output** — this cannot
+/// splice two fields together, invent characters, or repair a broken one. It is
+/// not a promise that every token it accepts is a model: a column header
+/// literally reading `provider/model` would be accepted as one, because at that
+/// point it is indistinguishable from an id, and the human sees it in a picker
+/// beside real ids with the `custom…` escape still there. Erring that way is
+/// deliberate — the parser is written against an unobserved layout, so it may
+/// under-recognise, but it must never manufacture.
+///
+/// A CLI that listed bare ids instead would carry its own parser in its
 /// `ENUMERATORS` row.
 pub fn parse_models_from_list(out: &str) -> Vec<String> {
     let mut models: Vec<String> = Vec::new();
     for raw in out.lines() {
-        let line = strip_ansi(raw);
+        let line = plain_line(raw);
         let line = line.trim().trim_start_matches(|c: char| matches!(c, '-' | '*' | '\u{2022}' | ' ' | '\t'));
         let Some(token) = line.split_whitespace().next() else { continue };
         if token.len() > 96 || !token.contains('/') {
@@ -281,11 +303,17 @@ fn run_cli(program: &str, args: &str) -> Result<String, String> {
 ///   false`.
 /// - **Only a non-empty enumeration replaces the help-parsed list.** So the
 ///   failure path is exactly today's behaviour, not a worse one.
-fn probe_with(program: &str, run: impl Fn(&str, &str) -> Result<String, String>) -> CliProbe {
+///
+/// Returns the probe and whether it is COMPLETE: false when a CLI that has an
+/// enumerator got nothing out of it, which is a degraded answer the caller
+/// declines to cache — see `probe_agent_cli`. The `CliProbe` handed to the
+/// frontend is unchanged either way; completeness is a caching fact, not a
+/// wire field.
+fn probe_with(program: &str, run: impl Fn(&str, &str) -> Result<String, String>) -> (CliProbe, bool) {
     let help = match run(program, "--help") {
         Ok(help) => help,
         Err(e) => {
-            return CliProbe {
+            let probe = CliProbe {
                 available: false,
                 models: vec![],
                 error: Some(if e.contains("cannot find") || e.contains("not found") || e.contains("os error 2") {
@@ -293,29 +321,41 @@ fn probe_with(program: &str, run: impl Fn(&str, &str) -> Result<String, String>)
                 } else {
                     e
                 }),
-            }
+            };
+            return (probe, false);
         }
     };
     let mut models = parse_models_from_help(&help);
+    let mut complete = true;
     if let Some(en) = enumerator_for(program) {
-        // A second subprocess, once per CLI per app run (the cache below), on
-        // the blocking pool and under the same timeout as the help run.
+        // A second subprocess, on the blocking pool and under the same timeout
+        // as the help run.
         let listed = run(program, en.args).map(|out| (en.parse)(&out)).unwrap_or_default();
-        if !listed.is_empty() {
+        complete = !listed.is_empty();
+        if complete {
             models = listed;
         }
     }
-    CliProbe { available: true, models, error: None }
+    (CliProbe { available: true, models, error: None }, complete)
 }
 
-fn probe_uncached(program: &str) -> CliProbe {
+fn probe_uncached(program: &str) -> (CliProbe, bool) {
     probe_with(program, run_cli)
 }
 
-/// Probe an agent CLI (availability + model list). Successful probes are
-/// cached for the app run; failures are NOT — a CLI installed while loomux
-/// is running must become launchable on the next probe (spawns already see
-/// it via fresh-PATH resolution).
+/// Probe an agent CLI (availability + model list). COMPLETE probes are cached
+/// for the app run; failures and partial answers are NOT — a CLI installed
+/// while loomux is running must become launchable on the next probe (spawns
+/// already see it via fresh-PATH resolution), and by the same argument an
+/// opencode whose `models` run failed — a network blip, a provider configured
+/// or `opencode auth login` completed a minute later — must be able to report
+/// its real list without a restart. Caching the degraded list would pin the
+/// worst moment of the session for the rest of it.
+///
+/// The cost of not caching it is one extra pair of subprocess runs per probe
+/// call for a CLI that keeps failing to enumerate — bounded by the same
+/// timeout, off-thread, and rare in practice because the launcher memoizes its
+/// own probes per app run too.
 ///
 /// Off-thread (#746 — `crate::blocking::run_blocking`, P1 of
 /// `doc/design/performance.md`). On a cache miss this spawns the agent CLI with
@@ -347,8 +387,8 @@ pub async fn probe_agent_cli(program: String) -> CliProbe {
         if let Some(hit) = cache().lock().unwrap().get(&program) {
             return hit.clone();
         }
-        let probe = probe_uncached(&program);
-        if probe.available {
+        let (probe, complete) = probe_uncached(&program);
+        if probe.available && complete {
             cache().lock().unwrap().insert(program, probe.clone());
         }
         probe
@@ -396,6 +436,15 @@ mod tests {
         "\u{1b}[32mopencode/gpt-5.1-codex\u{1b}[0m\n",
         "anthropic/claude-sonnet-4-5\n",
         "See https://models.dev for the full catalog.\n",
+    );
+
+    /// The same command, if its output were TAB-COLUMNED — a layout the docs
+    /// neither state nor rule out, and the one that broke the parser's
+    /// degrade-safety claim in review (#939). Also a fixture, not a transcript.
+    const OPENCODE_TABBED_LIST: &str = concat!(
+        "provider\tmodel\tcost\n",
+        "anthropic/claude-sonnet-4-5\tClaude Sonnet 4.5\t$3/$15\n",
+        "opencode/deepseek-v4-flash-free\tDeepSeek V4 Flash Free\tfree\n",
     );
 
     fn opencode_ids() -> Vec<String> {
@@ -453,15 +502,42 @@ mod tests {
     }
 
     #[test]
+    fn a_tab_columned_listing_yields_clean_ids_never_a_splice() {
+        // #939 review. A tab is a control byte AND a column separator: deleting
+        // it glues the id to the next column into `…-4-5Claude`, which is
+        // id-SHAPED, non-empty, and therefore promoted over the help-parsed
+        // list and to the head of the picker.
+        let models = parse_models_from_list(OPENCODE_TABBED_LIST);
+        assert_eq!(
+            models,
+            vec!["anthropic/claude-sonnet-4-5".to_string(), "opencode/deepseek-v4-flash-free".to_string()],
+            "the id extracts from its column; the rest of the row is not part of it"
+        );
+        for m in &models {
+            assert!(
+                !m.contains("Claude") && !m.contains("DeepSeek"),
+                "a display-name column was spliced onto an id: {m}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_sequence_inside_a_token_splits_it_rather_than_healing_it() {
+        // The same rule as the tab, for the other kind of removal: what is
+        // taken out has to separate. Yielding nothing is the safe direction;
+        // yielding a repaired-looking token is not.
+        assert!(
+            parse_models_from_list("anthro\u{1b}[0mpic/claude-sonnet-4-5\n").is_empty(),
+            "a token interrupted mid-way must not be stitched back together"
+        );
+    }
+
+    #[test]
     fn opencode_takes_its_models_from_the_models_subcommand() {
-        let calls = RefCell::new(Vec::new());
-        let probe = probe_with("opencode", |program, args| {
-            calls.borrow_mut().push(format!("{program} {args}"));
-            match args {
-                "--help" => Ok(OPENCODE_STYLE_HELP.to_string()),
-                "models" => Ok(OPENCODE_MODEL_LIST.to_string()),
-                other => panic!("probed an unexpected command: {other}"),
-            }
+        let (probe, complete) = probe_with("opencode", |_program, args| match args {
+            "--help" => Ok(OPENCODE_STYLE_HELP.to_string()),
+            "models" => Ok(OPENCODE_MODEL_LIST.to_string()),
+            other => panic!("probed an unexpected command: {other}"),
         });
         assert!(probe.available);
         assert_eq!(probe.models, opencode_ids());
@@ -470,41 +546,75 @@ mod tests {
             "what the CLI itself reports replaces what its help prose suggested: {:?}",
             probe.models
         );
-        // Exactly `models` — never `models --refresh`, which would re-pull a
-        // remote catalog behind the human's back.
+        assert!(complete, "an answer from the CLI's own enumerator is the complete one");
+    }
+
+    #[test]
+    fn a_tab_columned_listing_never_reaches_the_picker_as_a_splice() {
+        // The same fixture through the probe seam, because THIS is where a
+        // mangled id does its damage: a non-empty parse replaces the
+        // help-parsed list, so junk here outranks the honest fallback.
+        let (probe, complete) = probe_with("opencode", |_program, args| match args {
+            "--help" => Ok(OPENCODE_STYLE_HELP.to_string()),
+            _ => Ok(OPENCODE_TABBED_LIST.to_string()),
+        });
+        assert!(complete);
+        assert_eq!(
+            probe.models,
+            vec!["anthropic/claude-sonnet-4-5".to_string(), "opencode/deepseek-v4-flash-free".to_string()]
+        );
+    }
+
+    #[test]
+    fn the_opencode_enumerator_asks_for_models_and_nothing_else() {
+        // Its own test rather than a tail assertion on another one: a pin that
+        // only runs after several unrelated asserts have passed is a pin no
+        // red round ever reaches (#939 review).
+        let calls = RefCell::new(Vec::new());
+        let _ = probe_with("opencode", |program, args| {
+            calls.borrow_mut().push(format!("{program} {args}"));
+            Ok(String::new())
+        });
         let seen: Vec<String> = calls.borrow().clone();
-        assert_eq!(seen, vec!["opencode --help".to_string(), "opencode models".to_string()]);
+        assert_eq!(
+            seen,
+            vec!["opencode --help".to_string(), "opencode models".to_string()],
+            "exactly `models` — never `models --refresh`, which re-pulls models.dev behind the human's back"
+        );
     }
 
     #[test]
     fn a_failed_models_subcommand_falls_back_to_help_and_stays_available() {
-        let probe = probe_with("opencode", |_program, args| match args {
+        let (probe, complete) = probe_with("opencode", |_program, args| match args {
             "--help" => Ok(OPENCODE_STYLE_HELP.to_string()),
             _ => Err("`opencode models` timed out".into()),
         });
         assert!(probe.available, "an installed CLI whose list command failed is still installed");
         assert!(probe.error.is_none(), "and carries no error the launcher would refuse a launch on: {:?}", probe.error);
         assert_eq!(probe.models, vec!["gpt-5.1".to_string()], "falls back to the help-parsed list");
+        assert!(!complete, "a fallback list must not be cached for the rest of the app run");
     }
 
     #[test]
     fn an_unreadable_models_listing_leaves_the_help_parsed_list_alone() {
-        let probe = probe_with("opencode", |_program, args| match args {
+        let (probe, complete) = probe_with("opencode", |_program, args| match args {
             "--help" => Ok(OPENCODE_STYLE_HELP.to_string()),
             _ => Ok("No providers configured.\n".to_string()),
         });
         assert!(probe.available);
         assert_eq!(probe.models, vec!["gpt-5.1".to_string()], "an empty parse must not empty the list");
+        assert!(!complete, "nor may an empty enumeration be cached as the answer");
     }
 
     #[test]
     fn a_cli_without_an_enumerator_runs_only_help() {
         let calls = RefCell::new(Vec::new());
-        let probe = probe_with("claude", |program, args| {
+        let (probe, complete) = probe_with("claude", |program, args| {
             calls.borrow_mut().push(format!("{program} {args}"));
             Ok(if args == "--help" { CLAUDE_STYLE_HELP.to_string() } else { String::new() })
         });
         assert!(probe.models.contains(&"sonnet".to_string()));
+        assert!(complete, "a CLI with nothing to enumerate is answered in full by its help");
         let seen: Vec<String> = calls.borrow().clone();
         assert_eq!(seen, vec!["claude --help".to_string()], "claude has no list command; spawning one costs a subprocess for nothing");
     }
@@ -512,12 +622,13 @@ mod tests {
     #[test]
     fn a_missing_program_never_reaches_its_enumerator() {
         let calls = RefCell::new(Vec::new());
-        let probe = probe_with("opencode", |_program, args| {
+        let (probe, complete) = probe_with("opencode", |_program, args| {
             calls.borrow_mut().push(args.to_string());
             Err("'opencode' was not found on PATH".into())
         });
         assert!(!probe.available);
         assert!(probe.models.is_empty());
+        assert!(!complete, "and a missing CLI is never cached, so installing it mid-session works");
         assert_eq!(calls.borrow().len(), 1, "nothing to enumerate for a CLI that isn't installed");
     }
 }
