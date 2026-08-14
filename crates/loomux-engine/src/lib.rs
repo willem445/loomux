@@ -40,12 +40,21 @@
 //! testing a dependency edge. `src-tauri/src/orchestration/mod.rs` re-exports
 //! each under its old path, so every existing call site resolves unchanged.
 //!
-//! Each module keeps its own `#[cfg(test)]` unit tests, which is only possible
-//! on this side of the boundary: CLAUDE.md constraint 4 forces `src-tauri`'s
-//! lib-linking tests to be integration tests because Windows test executables
-//! need the comctl32-v6 manifest `build.rs` embeds, and nothing here links
-//! Tauri or that manifest. `src-tauri/tests/smoke.rs` still has to exist for
-//! the app's own sake.
+//! Their test coverage arrived in two different shapes, and the difference is
+//! worth knowing before the next module moves. [`report`] brought nine inline
+//! `#[cfg(test)]` unit tests with it. [`termgrid`] has **none** — it never had
+//! any; it is covered entirely from `src-tauri/tests/orchestration.rs`, which
+//! drives `render_screen`/`render_visible` from ~30 call sites and stayed
+//! untouched by the move.
+//!
+//! Inline unit tests are *possible* on this side of the boundary, which is the
+//! part that matters for what comes next: CLAUDE.md constraint 4 forces
+//! `src-tauri`'s lib-linking tests to be integration tests because Windows test
+//! executables need the comctl32-v6 manifest `build.rs` embeds, and nothing
+//! here links Tauri or that manifest. So a module arriving with inline tests
+//! keeps them, and a module whose coverage lives in the integration suite keeps
+//! that instead — neither is converted on the way in.
+//! `src-tauri/tests/smoke.rs` still has to exist for the app's own sake.
 
 pub mod report;
 pub mod termgrid;

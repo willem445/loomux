@@ -5,9 +5,10 @@
 # headless Linux daemon that drives the orchestration core, and a daemon that
 # must build webkit2gtk in order to exist is not a deployment shape — so the
 # core has to become a crate that does not link Tauri, and that crate needs a
-# workspace to live in. This is it. `crates/loomux-engine` is deliberately
-# EMPTY at this slice: the scaffold and the module moves are separate,
-# separately reviewable steps. See doc/design/engine-extraction.md.
+# workspace to live in. This is it. `crates/loomux-engine` landed deliberately
+# EMPTY — the scaffold and the module moves are separate, separately reviewable
+# steps — and is filling up from slice A2 onward, one small batch per PR. See
+# doc/design/engine-extraction.md.
 #
 # `resolver = "2"` is stated explicitly because a VIRTUAL manifest does not
 # inherit the resolver implied by a member's `edition = "2021"` — cargo warns
