@@ -334,12 +334,75 @@ fn the_generated_agent_handle_is_a_single_filename_component() {
 /// built without `.as_str()`, which is exactly what this weaker pass is here to
 /// catch.
 ///
-/// Scope: every `.rs` under `src-tauri/src`. Tests are not scanned — they build
-/// expected paths from group ids constantly, which is their job.
+/// # Scope: both production source roots, and why the second one is required
+///
+/// Every `.rs` under `src-tauri/src` **and** under `crates/loomux-engine/src`.
+/// Tests are not scanned — they build expected paths from group ids constantly,
+/// which is their job.
 ///
 /// The compiler covers what no scan can: `GroupId` has no `AsRef<Path>`, so it
 /// cannot reach a `join` as a *value*. That absence is asserted here, since
 /// nothing else enforces it.
+///
+/// That assertion is what forces the second root, and it is a security
+/// property, not tidiness. `GroupId` is defined in `loomux-engine` (#888 slice
+/// A2), and Rust's orphan rule means a foreign impl of a foreign trait —
+/// `AsRef<Path>` for `GroupId` — can be written in **exactly one crate**: the
+/// one that owns the type. So the only directory where the violation can now be
+/// spelled at all is `crates/loomux-engine/src`. A scan confined to
+/// `src-tauri/src` would still pass every run, forever, while watching a
+/// directory the defect can no longer reach — an inert tripwire that reads as
+/// enforcement, which is worse than no test, because CLAUDE.md constraint 6
+/// cites this assertion as the enforcement of the whole `group_id` path-trust
+/// boundary.
+///
+/// The generalization for the batches still to come: when a type moves, the
+/// question is not "where did the violation used to live" but **"where can it
+/// be spelled now"** — and for a trait impl the orphan rule answers that
+/// exactly. `ROOTS` below asserts per root that it found files, and a further
+/// assertion pins that the file *defining* `GroupId` was actually in scope, so
+/// a stale root fails loudly instead of scanning nothing.
+///
+/// The same move is why the impl is now matched on its **shape** rather than on
+/// the single spelling `impl AsRef<Path> for GroupId`: the defining file
+/// imports neither `Path` nor `AsRef` by a qualified path, so the qualified
+/// forms are the likely ones there, and a scan that only knew the bare form
+/// would report green on them.
+///
+/// # What this scan catches, and what it does not
+///
+/// Stated plainly, because a guard that implies completeness it does not have
+/// is how the *previous* two versions of this test came to be trusted while
+/// broken. This is a **textual** scan; the honest claim is "it catches the
+/// spellings anyone would actually write", not "it cannot be evaded".
+///
+/// Caught:
+///
+/// - both production source roots (`ROOTS`), i.e. every directory where the
+///   impl can legally be written at all;
+/// - the `AsRef<…Path>` impl with either position qualified or bare —
+///   `impl AsRef<Path>`, `impl AsRef<std::path::Path>`,
+///   `impl std::convert::AsRef<Path>`, and the mixed forms;
+/// - the two name-independent join axes (the root receiver, and the
+///   `.as_str()` path-component shape), whatever the binding is called.
+///
+/// **Not** caught, and no attempt is made to:
+///
+/// - an **aliased import** — `use std::path::Path as P;` then
+///   `impl AsRef<P> for GroupId`. The text simply is not there to match.
+/// - a **macro-generated** impl, for the same reason.
+/// - an impl **header split across lines**: this scan reads one line at a time.
+/// - **`PathBuf::push`**, which cannot be told from `Vec::push` textually. It
+///   appears nowhere in either crate today; it would not be caught if it were
+///   the first one added.
+/// - a `GroupId` reached through a **re-export alias** in the impl header.
+///
+/// That tail is unbounded, and chasing it with more pattern-matching buys less
+/// than it costs — a scan is not a type system. What actually holds the
+/// property is the **compiler**: with no `AsRef<Path>` in the tree, a `GroupId`
+/// cannot reach a `join` as a value at all. This scan is defence in depth over
+/// the *string* inside one, and over a second assembly point growing back; it
+/// is the cheaper half of the guarantee, not the load-bearing one.
 #[test]
 fn the_orchestration_root_is_joined_with_a_group_in_exactly_one_place() {
     /// The ONE permitted group-path assembly, matched on its exact text.
@@ -431,18 +494,60 @@ fn the_orchestration_root_is_joined_with_a_group_in_exactly_one_place() {
         a.contains("group") || a.contains("gid") || a.contains("g.id") || a.contains("info.id")
     }
 
-    let src_dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src"));
-    let mut files = Vec::new();
-    collect_rs_files(src_dir, &mut files);
-    assert!(files.len() > 5, "the source scan found almost nothing — check the path");
+    /// Every PRODUCTION source root in the workspace, each with the crate label
+    /// an offender from it is reported under — two crates can hold a `mod.rs`,
+    /// and a bare file name would no longer say which one.
+    ///
+    /// The engine root is not symmetry; see this test's doc for why leaving it
+    /// out would make the `AsRef<Path>` assertion below unfalsifiable.
+    const ROOTS: &[(&str, &str)] = &[
+        ("src-tauri", concat!(env!("CARGO_MANIFEST_DIR"), "/src")),
+        (
+            "loomux-engine",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../crates/loomux-engine/src"),
+        ),
+    ];
+
+    let mut files: Vec<(&str, std::path::PathBuf)> = Vec::new();
+    for (label, root) in ROOTS {
+        let mut found = Vec::new();
+        collect_rs_files(std::path::Path::new(root), &mut found);
+        // Asserted PER ROOT rather than on the total: a mistyped or stale root
+        // contributes nothing and would hide behind the other root's file
+        // count. `collect_rs_files` returns silently on an unreadable dir, so
+        // without this a wrong path is indistinguishable from a clean scan.
+        assert!(
+            !found.is_empty(),
+            "no `.rs` found under the {label} source root ({root}) — a root that scans nothing \
+             is a tripwire that cannot fire"
+        );
+        files.extend(found.into_iter().map(|p| (*label, p)));
+    }
+    assert!(files.len() > 5, "the source scan found almost nothing — check the paths");
+
+    // The anchor, and the assertion that survives the NEXT move. A file count
+    // cannot tell "both roots scanned" from "one root scanned twice"; what has
+    // to be in scope is the file that DEFINES `GroupId`, because the orphan rule
+    // puts the only writable `impl AsRef<Path> for GroupId` there and nowhere
+    // else. Matched on content rather than on a path, so slice A3/A4 may
+    // relocate the module again and this fails loudly instead of quietly
+    // scanning past it.
+    assert!(
+        files.iter().any(|(_, p)| {
+            std::fs::read_to_string(p).is_ok_and(|s| s.contains("pub struct GroupId(String)"))
+        }),
+        "the scan never reached the file that DEFINES `GroupId`. Wherever that file lives is the \
+         one crate an `impl AsRef<Path> for GroupId` can legally be written in (orphan rule), so \
+         a scan that misses it enforces nothing — add its source root to `ROOTS`."
+    );
 
     let mut offenders: Vec<String> = Vec::new();
     let mut permitted_seen = 0usize;
     let mut has_asref_path_impl = false;
 
-    for path in &files {
+    for (label, path) in &files {
         let src = std::fs::read_to_string(path).unwrap();
-        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let name = format!("{label}/{}", path.file_name().unwrap().to_string_lossy());
         for (i, line) in src.lines().enumerate() {
             let trimmed = line.trim_start();
             // A comment may spell the construct literally — several do, to
@@ -450,8 +555,39 @@ fn the_orchestration_root_is_joined_with_a_group_in_exactly_one_place() {
             if trimmed.starts_with("//") {
                 continue;
             }
-            if trimmed.replace(' ', "").contains("implAsRef<Path>forGroupId") {
-                has_asref_path_impl = true;
+            // The `AsRef<Path>` absence, matched on SHAPE rather than on one
+            // spelling — of the TYPE or of the TRAIT. Neither is spelled bare
+            // unless the file imports it, and the file that now DEFINES
+            // `GroupId` imports neither, so the qualified forms are the likely
+            // ones here and a needle pinned to `impl AsRef<Path>` would step
+            // over them while reporting green. Both positions are therefore
+            // matched by suffix:
+            //
+            //   impl AsRef<Path>                  for GroupId
+            //   impl AsRef<std::path::Path>       for GroupId
+            //   impl std::convert::AsRef<Path>    for GroupId
+            //   impl core::convert::AsRef<std::path::Path> for GroupId   (and mixed)
+            //
+            // Deliberately NOT chased further: an aliased import
+            // (`use std::path::Path as P`), a macro-generated impl, a header
+            // split across lines. Those are unbounded for a textual scan and
+            // more regex buys less than it costs — see this test's doc, which
+            // states the residual limits rather than claiming completeness.
+            // `AsRef<str>`/`Borrow<str>`, which `GroupId` legitimately has, do
+            // not end in `Path`, and `Borrow` is not in the trait position.
+            let n = trimmed.replace(' ', "");
+            if let Some((head, _)) = n.split_once(">forGroupId") {
+                if let Some((before_trait, ty)) = head.rsplit_once("AsRef<") {
+                    // `impl`, or `impl` + a module path ending in `convert::`.
+                    // Suffix-matched so an attribute or `pub` before it is fine.
+                    let in_trait_position = before_trait.ends_with("impl")
+                        || (before_trait.contains("impl")
+                            && before_trait.ends_with("convert::"));
+                    let names_path = ty == "Path" || ty.ends_with("::Path");
+                    if in_trait_position && names_path {
+                        has_asref_path_impl = true;
+                    }
+                }
             }
             if line.contains(PERMITTED) {
                 permitted_seen += 1;

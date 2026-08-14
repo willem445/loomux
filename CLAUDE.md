@@ -76,18 +76,25 @@ compiles.
    `@tauri-apps` import anywhere else in `src/` fails the suite. See
    doc/design/engine-transport.md.
 6. **A group id becomes a path in exactly one place.** `GroupId`
-   (`orchestration/groupid.rs`) has one validating constructor; `group_dir_at`
-   is the only function that joins one onto a root, and it takes a `GroupId`,
-   not a string. `#[tauri::command]`s parse their raw `group_id` at the
-   boundary (`command_group`) and thread the type from there. Never add a
-   second join, never implement `AsRef<Path>` for `GroupId`, and never
-   reintroduce a `&str` group parameter on anything that builds a path. Two
-   source-scanning tests in `tests/groupid.rs` enforce this: one that every
-   group-taking command parses at the boundary, one that `.join` is fed a group
-   in exactly one place — the latter also asserting no `AsRef<Path>` impl
-   exists, since nothing else can. Their one stated blind spot is
-   `PathBuf::push` (indistinguishable from `Vec::push`); it appears nowhere
-   today, so don't be the first.
+   (`crates/loomux-engine/src/groupid.rs`) has one validating constructor;
+   `group_dir_at` (`src-tauri`) is the only function that joins one onto a
+   root, and it takes a `GroupId`, not a string. `#[tauri::command]`s parse
+   their raw `group_id` at the boundary (`command_group`) and thread the type
+   from there. Never add a second join, never implement `AsRef<Path>` for
+   `GroupId`, and never reintroduce a `&str` group parameter on anything that
+   builds a path. Two source-scanning tests in `src-tauri/tests/groupid.rs`
+   enforce this: one that every group-taking command parses at the boundary,
+   one that `.join` is fed a group in exactly one place — the latter also
+   asserting no `AsRef<Path>` impl exists, since nothing else can. That one
+   scans **both** source roots (`src-tauri/src` and `crates/loomux-engine/src`)
+   because the orphan rule puts the only writable `AsRef<Path>` impl in
+   whichever crate owns the type; keep every root it must watch in its `ROOTS`
+   list. It is a textual scan and enumerates its own limits: qualified and bare
+   spellings of `AsRef`/`Path` are matched, but an aliased `Path` import, a
+   macro-generated impl, a multi-line impl header, and `PathBuf::push`
+   (indistinguishable from `Vec::push`) are not. None appears today — don't be
+   the first. The compiler, not the scan, is what makes a `GroupId` unable to
+   reach a `join` as a value.
    Membership ("may this caller touch this group?") is a **separate** check and
    is not implied by holding a valid id.
 7. **No agent ever merges a PR to the default branch.** Open the PR and stop;

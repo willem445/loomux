@@ -55,6 +55,26 @@
 //! keeps them, and a module whose coverage lives in the integration suite keeps
 //! that instead — neither is converted on the way in.
 //! `src-tauri/tests/smoke.rs` still has to exist for the app's own sake.
+//!
+//! A2 batch 2 — [`groupid`] (#904), the validated group identifier every
+//! group-scoped path is built from. It brings the crate's first dependency,
+//! `serde`: `GroupId`'s wire transparency is a hand-written
+//! `Serialize`/`Deserialize` pair, and the `Deserialize` half is load-bearing
+//! rather than convenience — it is what stops a hand-edited state file minting
+//! an id the constructor would have refused. See the manifest for why that
+//! dependency is safe under CLAUDE.md constraint 2.
+//!
+//! It also moved a **security tripwire's coverage**, which is the part worth
+//! knowing before the next batch. `GroupId` deliberately has no
+//! `AsRef<Path>`, and `src-tauri/tests/groupid.rs`'s
+//! `the_orchestration_root_is_joined_with_a_group_in_exactly_one_place`
+//! asserts that absence by scanning source. Once the type lives here, the
+//! orphan rule leaves nowhere else that impl could be written — so the scan now
+//! walks BOTH source roots, and a scan that only knew `src-tauri/src` would
+//! have gone green forever while enforcing nothing. **Any future batch that
+//! moves a type a source-scanning test watches owes the same check**: ask where
+//! the violation can now be spelled, not where it used to be.
 
+pub mod groupid;
 pub mod report;
 pub mod termgrid;
