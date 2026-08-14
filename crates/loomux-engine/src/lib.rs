@@ -174,10 +174,54 @@
 //! crate-name unification and an undeclared crate does not compile at all. The
 //! manifest carries the argument for each, and `src-tauri`'s carries the
 //! getrandom audit both inherit.
+//!
+//! A2 batch 6 — [`mergeq`] (the merge queue's pure core, #581 slice C) and
+//! [`mergeqview`] (the read-only projection the human's chrome renders, slice
+//! F). Batch 5 named `mergeq` as the member it deliberately left out, and the
+//! reason it could not go then is the reason it goes now: every symbol it
+//! imports comes from `workflow`, which batch 5 brought across. Nothing in
+//! either file changed but the prefix on an import.
+//!
+//! The two travel together on weaker ground than batch 5's cluster, and the
+//! difference is this batch's finding. `workflow` and `profiles` were a
+//! **cycle** — no batch order existed that moved either alone. `mergeq` and
+//! `mergeqview` are a **chain**: `mergeqview` reads `mergeq` and nothing else,
+//! and `mergeq` never reads back. So `mergeqview` *could* have stayed behind
+//! and reached the engine through the re-export, exactly as `mqdriver` does; it
+//! comes because it is a pure projection with no other edge and nothing in the
+//! Tauri half to be near, not because the compiler insisted. **A cycle decides
+//! a batch's contents; a chain only invites them** — and a batch that cannot
+//! say which of the two it is has not drawn its own line.
+//!
+//! It is also where batch 5's inbound-edge rule meets real code rather than
+//! prose. `mqdriver` and `mqloop` do not merely name `mergeq` in doc comments:
+//! they import from it in their bodies (`use super::mergeq::{new_batch_id,
+//! scratch_branch, …}`, `use super::mergeqview::MERGE_QUEUE_FILE`) and call
+//! `mergeq::recheck_gate`. Both stay in `src-tauri` — they reach the pane host,
+//! which is slice A3 — both spell `super::` exactly as before, and both compile
+//! against the re-export. Batch 5 established that prose is not an edge; the
+//! other half belongs beside it, because it is the half that misleads: **a
+//! body-level inbound edge is a genuine edge and still does not block a move.**
+//! Only outbound edges decide what a batch has to contain.
+//!
+//! No dependency joins the crate. That is the result of reading the moved
+//! files' own `use` lines — `serde` and `serde_json` in [`mergeq`],
+//! `serde_json` and `std` in [`mergeqview`], all declared here since batch 3 —
+//! rather than a check for the imports one expects: batch 5 failed CI on a
+//! guessed list of crate names, and enumerating what the files actually import
+//! is the cheap way not to repeat it.
+//!
+//! `mergeq::new_batch_id` seeds itself from std's `RandomState` rather than
+//! from a random crate, which is CLAUDE.md constraint 2. It travels unchanged,
+//! and it belongs here for the reason the manifest states: this crate is linked
+//! into the shipped Windows binary, so the getrandom ban applies on this side
+//! of the boundary exactly as it does in `src-tauri`.
 
 pub mod groupid;
 pub mod lessons;
 pub mod locks;
+pub mod mergeq;
+pub mod mergeqview;
 pub mod model;
 pub mod notify;
 pub mod profiles;

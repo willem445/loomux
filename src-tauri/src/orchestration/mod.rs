@@ -17,8 +17,6 @@ pub mod digest;
 pub mod humanq;
 pub mod intake;
 pub mod mcp;
-pub mod mergeq;
-pub mod mergeqview;
 pub mod mqdriver;
 pub mod mqloop;
 pub mod queue;
@@ -128,6 +126,24 @@ pub use loomux_engine::{locks, profiles, workflow};
 // spelling, not of the item, which the module re-export also exposes as
 // `orchestration::model::role_instructions_file`.
 pub(crate) use loomux_engine::model::role_instructions_file;
+
+// #888 slice A2 batch 6 — the merge queue's pure core (#581 slice C) and the
+// read-only projection the chrome renders (slice F). Batch 5 left `mergeq`
+// behind because every symbol it imports comes from `workflow`; that module is
+// in the engine now, so the edge points forward and the move is import-prefix
+// deep. `mergeqview` reads `mergeq` and nothing else, and comes with it.
+//
+// What stays HERE is the wiring, which is the whole point of the split: the
+// `#[tauri::command]` `orch_merge_queue` below still calls
+// `mergeqview::merge_queue_view`, and `mqdriver`/`mqloop` still spell
+// `super::mergeq::…` and `super::mergeqview::…` in their bodies — genuine
+// inbound edges, not doc-comment mentions, and this line is what answers them.
+// They stay because they reach the pane host (`capture_raw_with_timeout`),
+// which is slice A3; an inbound edge has never been what decides a batch.
+//
+// No visibility widened: neither module had a `pub(crate)` or `pub(super)` item
+// to widen, so unlike batches 3-5 there is no re-export choice to argue here.
+pub use loomux_engine::{mergeq, mergeqview};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};

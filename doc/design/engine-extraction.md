@@ -465,6 +465,58 @@ from a unit test of product code, agents are banned from running cargo locally
     the pre-move edge sweep grepped a *guessed list* of crate names and found
     neither. Enumerating what the files actually import — rather than checking
     for the imports you expect — is the version of that step that works.
+  - **Batch 6 — `mergeq`, `mergeqview`.** The batch 5 declined by name, taken
+    now for the reason it was declined then: `mergeq`'s every import comes from
+    `workflow`, so while `workflow` sat in `src-tauri` the edge pointed back,
+    and once it landed in the engine the edge pointed forward. Nothing in either
+    file changed but the prefix on an import — `super::workflow::…` and
+    `super::mergeq::…` became `crate::…`, and the two `#[cfg(test)]` modules'
+    `crate::orchestration::…` imports became `crate::…`.
+
+    **A cycle decides a batch's contents; a chain only invites them.** That is
+    the finding, and it is the counterweight to batch 5's. There, `workflow` and
+    `profiles` were mutually dependent, so no order existed that moved either
+    alone and the only question was where to draw the line. Here `mergeqview`
+    reads `mergeq` and nothing else, and `mergeq` never reads back — a chain, so
+    `mergeqview` *could* have stayed in `src-tauri` and reached the engine
+    through the re-export exactly as `mqdriver` does. It comes because it is a
+    pure projection with no other edge and nothing left in the Tauri half to be
+    near, which is a judgement rather than a constraint. A batch that cannot say
+    which of the two shapes it is has not drawn its own line.
+
+    It is also where the inbound-edge rule meets real code. Batch 5 established
+    that **prose is not an edge**, having found only doc mentions of `mergeq` in
+    `workflow`; the half that misleads is the other one, and this batch supplies
+    it. `mqdriver` and `mqloop` import from both moved modules in their *bodies*
+    (`use super::mergeq::{new_batch_id, scratch_branch, …}`,
+    `use super::mergeqview::MERGE_QUEUE_FILE`, a `super::mergeq::recheck_gate`
+    call) and stay behind, because they reach the pane host and that is A3. Both
+    spell `super::` unchanged and compile against the re-export: **a body-level
+    inbound edge is a genuine edge and still does not block a move.** The same
+    goes for the `#[tauri::command]` `orch_merge_queue`, which stays and calls
+    `mergeqview::merge_queue_view` through the same line.
+
+    Two costs earlier batches taught, both nil this time and both stated because
+    the *check* is the point rather than the answer. No visibility widened —
+    neither module has a `pub(crate)` or `pub(super)` item, so batch 3's
+    "a batch that leaves a caller behind converts that caller's `pub(super)`
+    into public API" had nothing to convert. No dependency joins: reading the
+    moved files' own `use` lines gives `serde` and `serde_json` (`mergeq`),
+    `serde_json` and `std` (`mergeqview`), all declared here since batch 3. That
+    is batch 5's process miss applied rather than repeated — enumerate what the
+    files import, never check for the imports you expect.
+
+    Batch 2's question ("where can the violation now be spelled?") is asked and
+    answered nil too: `tests/groupid.rs`'s scan already walks both source roots
+    and is line-content-based, so a file moving *between* two scanned roots
+    changes nothing it can see. `mergeqview`'s one `.join` takes a `&Path` and a
+    file-name constant, and it was in scope before the move as it is after.
+
+    The batch takes the pure-relocation exemption. Every behaviour it could
+    break is pinned by `src-tauri/tests/mergequeue.rs`, which reaches both
+    modules through `loomux_lib::orchestration::…` — the re-export — and was not
+    edited, plus the modules' own inline tests, which travel with them and are
+    engine unit tests now.
   - **`digest` is not a leaf** despite reading like one. It calls
     `crate::sessions::yaml_field` and takes a `crate::opencodedb::TranscriptRow`
     — two modules staying in `src-tauri` — so it cannot move until those edges
