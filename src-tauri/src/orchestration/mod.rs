@@ -15,6 +15,7 @@
 
 pub mod digest;
 pub mod groupid;
+pub mod humanq;
 pub mod intake;
 pub mod lessons;
 pub mod locks;
@@ -10744,6 +10745,20 @@ pub struct OrchRegistry {
     /// Serializes task-board read-modify-write cycles (MCP threads and the
     /// human UI mutate the same tasks.json).
     tasks_lock: Mutex<()>,
+    /// Serializes every read-modify-write of a group's `questions.json` (#946).
+    ///
+    /// **A leaf of its own, not `tasks_lock`.** The two files share no
+    /// invariant — a question names a task id, but nothing reads a question and
+    /// a board row together as one unit — and the answer path takes this lock
+    /// on a human's keystroke while the board's is held across MCP bursts.
+    ///
+    /// **Lock order: takes no other registry lock while held**, except
+    /// `AUDIT_LOCK` on the refusal paths (which must record what was turned
+    /// away before returning) — the same nesting `tasks_lock` already has. The
+    /// answer path's success audit and its pane DELIVERY both happen after the
+    /// guard is dropped: an audit write is cheap, but a notice is a delivery,
+    /// and a delivery enqueues.
+    questions_lock: Mutex<()>,
     /// Serializes every read-modify-write of a group's `usage.json` (#743 S4b).
     ///
     /// **A leaf of its own, split out of `tasks_lock`.** The usage store used to
@@ -23365,6 +23380,7 @@ impl OrchRegistry {
             unconfirmed_pending: Arc::new(Mutex::new(HashMap::new())),
             orch_notice_inbox: Arc::new(Mutex::new(HashMap::new())),
             tasks_lock: Mutex::new(()),
+            questions_lock: Mutex::new(()),
             usage_lock: Mutex::new(()),
             usage_memo: Mutex::new(HashMap::new()),
             default_branch_memo: Mutex::new(HashMap::new()),
@@ -23977,6 +23993,241 @@ impl OrchRegistry {
         atomic_write(&dir.join("state.json"), state.as_bytes()).map_err(|e| e.to_string())?;
         self.audit(group, "loomux", "state-write", json!({ "bytes": state.len() }));
         Ok(())
+    }
+
+    // ---------- human questions (#946) ----------
+
+    fn questions_path(&self, group: &GroupId) -> PathBuf {
+        self.group_dir(group).join(humanq::QUESTIONS_FILE)
+    }
+
+    /// Read a group's question file.
+    ///
+    /// **Absent is empty; malformed or unreadable is LOUD** — deliberately
+    /// unlike [`tasks`](Self::tasks), which collapses every failure to an empty
+    /// board. Every mutation below is a read-modify-write of the whole file, so
+    /// a read that answered "no questions" for a file it merely failed to parse
+    /// would let the very next `ask_human` overwrite it — silently destroying
+    /// pending questions a human has not answered yet, which is the one loss
+    /// this registry exists to prevent. `mqloop::load_state` takes the same
+    /// posture for the same reason.
+    pub fn questions(&self, group: &GroupId) -> Result<Vec<humanq::Question>, String> {
+        let text = match fs::read_to_string(self.questions_path(group)) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(format!("cannot read {}: {e}", humanq::QUESTIONS_FILE)),
+        };
+        serde_json::from_str(&text).map_err(|e| format!("{} is malformed: {e}", humanq::QUESTIONS_FILE))
+    }
+
+    /// `list_questions`' read: pending first (oldest first — the order they
+    /// should be answered in), then the newest settled rows, with the omitted
+    /// count alongside so a filtered list is never mistaken for the whole one.
+    pub fn question_list(&self, group: &GroupId) -> Result<(Vec<humanq::Question>, usize), String> {
+        Ok(humanq::project_list(&self.questions(group)?, humanq::LIST_SETTLED_CAP))
+    }
+
+    fn write_questions(&self, group: &GroupId, questions: &[humanq::Question]) -> Result<(), String> {
+        let dir = self.group_dir(group);
+        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let body = serde_json::to_string_pretty(questions).map_err(|e| e.to_string())?;
+        // Atomic replace, for #133's reason applied to a file whose loss is
+        // worse than a board's: a torn questions.json is a human's outstanding
+        // decisions gone. All callers hold `questions_lock`.
+        atomic_write(&dir.join(humanq::QUESTIONS_FILE), body.as_bytes()).map_err(|e| e.to_string())?;
+        // The single mutation point, so the single notification point — the
+        // `emit_tasks_changed` shape. Slice Q2's inbox panel is the listener;
+        // until then the event is inert, which is cheaper than a second visit
+        // to this function later.
+        if let Some(app) = self.app.lock_safe().clone() {
+            let _ = app.emit("orch-questions-changed", json!({ "group_id": group }));
+        }
+        Ok(())
+    }
+
+    /// Register a question for the human and return it **immediately** (#946).
+    ///
+    /// Nothing here blocks or waits: this is a file write and an audit line.
+    /// The asker gets an id back and goes on orchestrating; the answer arrives
+    /// later as a `[loomux]` notice through the ordinary delivery path. See
+    /// [`humanq`]'s module doc for why the pending record lives in the engine
+    /// rather than in a liaison agent's session.
+    pub fn ask_human(
+        &self,
+        group: &GroupId,
+        asker: &str,
+        req: humanq::AskRequest,
+    ) -> Result<humanq::Question, String> {
+        let req = humanq::validate_ask(req)?;
+        let question = {
+            let _guard = self.questions_lock.lock_safe();
+            let mut questions = self.questions(group)?;
+            let pending = questions.iter().filter(|q| !q.status.is_settled()).count();
+            if pending >= humanq::PENDING_MAX {
+                return Err(format!(
+                    "{pending} questions are already pending for this group (max {}) — no human is \
+                     working through a backlog that size; withdraw the ones overtaken by events \
+                     before asking another",
+                    humanq::PENDING_MAX
+                ));
+            }
+            let question = humanq::Question {
+                id: humanq::next_id(&questions),
+                asker: asker.to_string(),
+                text: req.text,
+                options: req.options,
+                task: req.task,
+                urgency: req.urgency,
+                status: humanq::Status::Pending,
+                created_ms: now_ms(),
+                answer: None,
+                settled_by: None,
+                settled_ms: None,
+            };
+            questions.push(question.clone());
+            humanq::prune(&mut questions, humanq::SETTLED_RETAINED);
+            self.write_questions(group, &questions)?;
+            question
+        };
+        self.audit(
+            group,
+            asker,
+            "question-open",
+            serde_json::to_value(&question).unwrap_or(Value::Null),
+        );
+        Ok(question)
+    }
+
+    /// Take back a pending question the asker no longer needs answered.
+    ///
+    /// Withdrawal is a settle, not a delete: the row stays, so a human who was
+    /// mid-answer can see what happened to it and the audit keeps the shape of
+    /// the exchange.
+    pub fn withdraw_question(
+        &self,
+        group: &GroupId,
+        actor: &str,
+        id: &str,
+    ) -> Result<humanq::Question, String> {
+        let question = {
+            let _guard = self.questions_lock.lock_safe();
+            let mut questions = self.questions(group)?;
+            let Some(idx) = questions.iter().position(|q| q.id == id) else {
+                self.audit(group, actor, "question-reject", json!({
+                    "id": id, "op": "withdraw", "reason": "unknown-question",
+                }));
+                return Err(format!("unknown question: {id}"));
+            };
+            if questions[idx].status.is_settled() {
+                let status = questions[idx].status.label();
+                self.audit(group, actor, "question-reject", json!({
+                    "id": id, "op": "withdraw", "reason": "already-settled", "status": status,
+                }));
+                return Err(format!("{id} is already {status} — a settled question cannot be withdrawn"));
+            }
+            questions[idx].status = humanq::Status::Withdrawn;
+            questions[idx].settled_by = Some(format!("withdrawn:{actor}"));
+            questions[idx].settled_ms = Some(now_ms());
+            let out = questions[idx].clone();
+            humanq::prune(&mut questions, humanq::SETTLED_RETAINED);
+            self.write_questions(group, &questions)?;
+            out
+        };
+        self.audit(group, actor, "question-withdraw", json!({
+            "id": question.id, "task": question.task, "text": question.text,
+        }));
+        Ok(question)
+    }
+
+    /// Settle a pending question with the human's decision, and tell the
+    /// orchestrator (#946).
+    ///
+    /// # TRUSTED CALLERS ONLY — this is the feature's security core
+    ///
+    /// **No agent may ever reach this method.** An answer settles a question
+    /// the *human* was asked and releases the work waiting on it; an agent that
+    /// could produce one would be answering its own gate. The whole mechanism
+    /// would be theatre.
+    ///
+    /// That is structural, not a convention: `mcp.rs`'s `call_tool` is a closed
+    /// match on tool names and no arm of it reaches here, so there is no name an
+    /// agent can call. Two tests hold that shut —
+    /// `no_agent_token_can_answer_a_question_through_the_mcp_surface` (every
+    /// tool the surface offers, dispatched, question still pending) and
+    /// `the_mcp_surface_has_no_path_to_the_answer_entry_point` (a source scan,
+    /// so a future slice cannot wire one in quietly).
+    ///
+    /// `source` is a **closed enum supplied by the entry point**, never a
+    /// caller-supplied string: `orch_question_answer` hard-codes
+    /// [`humanq::AnswerSource::Webview`] rather than taking a `source`
+    /// argument, so "answer as someone else" has no spelling. A new answering
+    /// surface adds a variant and its own trusted entry point — never a
+    /// parameter, and never an MCP tool.
+    pub fn answer_question(
+        &self,
+        group: &GroupId,
+        id: &str,
+        answer: &str,
+        source: humanq::AnswerSource,
+    ) -> Result<humanq::Question, String> {
+        let tag = source.tag();
+        let answer = match humanq::validate_answer(answer) {
+            Ok(a) => a,
+            Err(e) => {
+                self.audit(group, "human", "question-reject", json!({
+                    "id": id, "source": tag, "reason": "invalid-answer", "detail": e,
+                }));
+                return Err(e);
+            }
+        };
+        let question = {
+            let _guard = self.questions_lock.lock_safe();
+            let mut questions = self.questions(group)?;
+            let Some(idx) = questions.iter().position(|q| q.id == id) else {
+                // Group-scoped by construction: this read is the caller's own
+                // group's file, so a question belonging to another group is
+                // simply absent — the same refusal an id that never existed
+                // gets, leaking nothing about the other group. Membership is
+                // checked by WHICH FILE was read, not by comparing a field.
+                self.audit(group, "human", "question-reject", json!({
+                    "id": id, "source": tag, "reason": "unknown-question",
+                }));
+                return Err(format!("unknown question: {id}"));
+            };
+            if questions[idx].status.is_settled() {
+                let status = questions[idx].status.label();
+                self.audit(group, "human", "question-reject", json!({
+                    "id": id, "source": tag, "reason": "already-settled", "status": status,
+                }));
+                return Err(format!("{id} is already {status} — a settled question cannot be re-answered"));
+            }
+            questions[idx].status = humanq::Status::Answered;
+            questions[idx].answer = Some(answer.clone());
+            questions[idx].settled_by = Some(tag.clone());
+            questions[idx].settled_ms = Some(now_ms());
+            let out = questions[idx].clone();
+            humanq::prune(&mut questions, humanq::SETTLED_RETAINED);
+            self.write_questions(group, &questions)?;
+            out
+        };
+        // Audited before it is delivered, and both outside the lock: the
+        // durable record of a human's decision must not depend on a pane
+        // existing to receive it.
+        self.audit(group, "human", "question-answer", json!({
+            "id": question.id, "source": tag, "answer": answer,
+            "task": question.task, "asker": question.asker,
+        }));
+        // A delivery failure — no live orchestrator, a full pane queue, a
+        // restart mid-answer — never fails the answer. The question is settled
+        // durably either way and a cold orchestrator finds it through
+        // `list_questions`. That the registry is the record and the notice is
+        // only a notification is the entire point of this design.
+        let _ = self.deliver_to_orchestrator(
+            group,
+            &humanq::answer_notice(&question.id, &tag, &answer),
+            "human",
+        );
+        Ok(question)
     }
 
     // ---------- task board ----------
@@ -46682,6 +46933,57 @@ fn open_external_url(url: &str) -> Result<(), String> {
         c
     };
     cmd.spawn().map(|_| ()).map_err(|e| format!("could not open browser: {e}"))
+}
+
+// ---------- human questions (human side) ----------
+// The two TRUSTED surfaces onto the question registry (#946). Trusted in the
+// same sense as the merge-grant commands: the caller is loomux's own webview
+// and the gesture is a human's. No agent-reachable path exists to either — see
+// `humanq`'s module doc and `OrchRegistry::answer_question`.
+
+/// The group's questions, for the inbox panel: pending first, then the newest
+/// settled rows.
+///
+/// Off-thread (#743 S4c), like every other fs-touching command. Read-only and
+/// takes no lock — writers replace `questions.json` through `atomic_write`, so
+/// a concurrent reader sees the whole old file or the whole new one.
+///
+/// **A read failure reads as empty here, and only here.** The registry method
+/// is deliberately loud about a malformed file (see its doc: a read-modify-write
+/// that treats unparseable as empty destroys pending questions), but this
+/// command has no error channel and its caller renders a list — so the panel
+/// shows nothing rather than throwing, exactly as `orch_tasks` does for an
+/// unparseable board. Nothing WRITES through this path, so the loud read that
+/// protects the file is untouched.
+#[tauri::command]
+pub async fn orch_questions_list(app: AppHandle, group_id: String) -> Vec<humanq::Question> {
+    let reg = reg_of(&app);
+    // #904: no error channel; an unvalidated id yields the same empty list a
+    // group with no questions does. See `command_group`.
+    let Ok(group_id) = command_group(&group_id) else { return Vec::new() };
+    run_blocking(move || reg.question_list(&group_id).map(|(rows, _)| rows).unwrap_or_default()).await
+}
+
+/// The human answers a pending question, from the app's own webview.
+///
+/// **There is deliberately no `source` parameter.** The source is a property of
+/// this entry point — `AnswerSource::Webview`, hard-coded below — not something
+/// a caller states about itself. That is what makes "who answered" a fact
+/// loomux establishes rather than one it is told, and it is why no agent can
+/// impersonate a human even if some future path reached this command.
+#[tauri::command]
+pub async fn orch_question_answer(
+    app: AppHandle,
+    group_id: String,
+    id: String,
+    answer: String,
+) -> Result<(), String> {
+    let reg = reg_of(&app);
+    let group_id = command_group(&group_id)?;
+    run_blocking(move || {
+        reg.answer_question(&group_id, &id, &answer, humanq::AnswerSource::Webview).map(|_| ())
+    })
+    .await
 }
 
 // ---------- task board (human side) ----------

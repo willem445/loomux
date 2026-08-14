@@ -348,6 +348,16 @@ fn tool_defs(
                 "include_all": { "type": "boolean", "description": "true = return every row, bypassing the done-row cap (default false)." },
             }),
             &[]),
+        // The human-question registry's READ tier (#946). Shared, like
+        // `list_tasks`: the orchestrator reads it to re-find what it is waiting
+        // on after a compact, and a delegate reads it to see that a question it
+        // depends on is already outstanding rather than raising it again. Only
+        // the two WRITE tools below are orchestrator-only — and neither of
+        // them, nor any other tool on this surface, can ANSWER one. See
+        // `humanq`'s module doc for why no answer tool exists at all.
+        tool("list_questions",
+            "Read the questions this group has put to the human: `{ questions: [...], omitted_settled: N }`. Every PENDING question is always listed, oldest first — that is the order they should be answered in — followed by the newest settled ones (answered or withdrawn), with `omitted_settled` naming how many older settled rows were left off (0 when none were). Each row carries id, asker, text, options, task, urgency, status, created_ms, and — once settled — answer, settled_by and settled_ms. THIS IS YOUR DURABLE MEMORY OF WHAT YOU ARE WAITING ON: read it on session start and after a /compact instead of trying to recall which questions are outstanding, and re-surface a still-pending one in your status updates rather than stalling on it. Read-only.",
+            json!({}), &[]),
         tool("get_task",
             "Read ONE task's full record, including its note history (capped: only the newest notes are kept verbatim, older ones collapse into one placeholder — the full text of every note is always in this group's audit log regardless). Use this after list_tasks's compact row shows a note_count worth reading.",
             json!({ "id": { "type": "string", "description": "Task id, e.g. t-3" } }),
@@ -516,6 +526,26 @@ fn tool_defs(
                 &[]),
             tool("remove_task", "Delete a task from the shared board.",
                 json!({ "id": { "type": "string" } }), &["id"]),
+            // The human-question registry's WRITE tier (#946). Orchestrator-only
+            // and re-checked in `call_tool` — the listing is cosmetic, the
+            // dispatch check is the gate. A delegate that needs a human decision
+            // routes it through `message_orchestrator`, so there is one funnel
+            // and one authoring standard for what a human is asked.
+            tool("ask_human",
+                "Put a question to the human WITHOUT BLOCKING, and keep orchestrating. This returns a question id IMMEDIATELY — it does not wait for an answer and never can. USE THIS INSTEAD OF YOUR CLI'S OWN INTERACTIVE QUESTION DIALOG, always: while such a dialog is on your screen this pane cannot take ANY delivery, so every worker report, review verdict and merge request queues behind it — one question asked while the human is away has already stalled a whole fleet overnight, and that incident is why this tool exists. After calling it: mark the affected board task `blocked` citing the returned id, then GO DO OTHER WORK — review, dispatch, merge, everything not gated on this answer. The answer arrives later as a `[loomux] answer to q-N (via <source>): …` notice typed into this pane, at which point you un-block ONLY the task that was waiting on it. If nothing arrives, the question simply stays pending: read `list_questions` (it survives a /compact and an app restart, so it is your memory of what is outstanding, not your context), re-surface it in your next status update, and keep working. WHAT MAKES A GOOD QUESTION: self-contained — the human may read it away from the machine, with no pane in front of them. State the decision you need and what turns on it; cite the issue or PR by number for the detail rather than pasting diffs, file contents or logs; never include secrets. Give `options` when the decision really is a choice between named alternatives — it is what lets an answering surface offer buttons instead of prose. Give `task` so the answer can be tied back to the board row it releases. You cannot answer your own question, and neither can any other agent: answers only ever enter through surfaces the human controls.",
+                json!({
+                    "text": { "type": "string", "description": "The question, self-contained and standing on its own away from this machine. Max 2000 characters — this is a decision to ask, not a briefing to paste; cite issue/PR numbers for the context." },
+                    "options": { "type": "array", "items": { "type": "string" }, "description": "Named alternatives, when the decision is a choice between them (max 8, 200 characters each). Omit for an open question — do not invent options to fill the field." },
+                    "task": { "type": "string", "description": "The board task id this question is holding up, e.g. \"t-7\". Record it whenever there is one: it is what lets the answer release exactly one task instead of leaving you to work out which." },
+                    "urgency": { "type": "string", "enum": ["normal", "high"], "description": "How loudly this should reach the human. Default \"normal\". An unrecognized value is rejected, never treated as normal." },
+                }),
+                &["text"]),
+            tool("withdraw_question",
+                "Take back a pending question that has been overtaken by events — the decision made itself, the work was dropped, or you found the answer elsewhere. The question is marked withdrawn rather than deleted, so a human who was part-way through answering can see what became of it. Refuses a question that is already answered or already withdrawn (you are told which). Withdraw generously: a stale question in the human's inbox costs their attention and teaches them the inbox is noise.",
+                json!({
+                    "id": { "type": "string", "description": "Question id, e.g. q-3 — from ask_human's reply or list_questions." },
+                }),
+                &["id"]),
             tool("group_usage",
                 "Aggregate the group's token usage and estimated dollar cost into one summary, split live vs lifetime (killed/recycled agents still count). Tokens come from each agent's session transcript and are exact; dollars are estimated from a model price table (subscription/Max accounts show $0 in the CLI, so cite tokens). Fold it into your status updates so the human sees spend at a glance. Defaults to a SUMMARY sized for that: group + live totals, `agent_count` (the whole lifetime roster), `top_agents` (up to 10, by total tokens descending), and `rest` — `{count, tokens, cost_usd, cost_basis, live: {count, tokens}, historical: {count, tokens}}` for every agent folded out of `top_agents`. Top-N is picked by lifetime tokens, so a group with a long history can push every live agent out of `top_agents`; `rest.live` keeps their count/tokens visible instead of forcing `detail: true` just to see who's still running. `rest.cost_basis` labels whether `rest.cost_usd` is `estimated`, `reported`, or `mixed` (same rule as the top-level `*_cost_basis` fields), so a blended figure is never shown as one honest number. The `rest` count itself is what keeps this from being a silent truncation. Pass `detail: true` for the full per-agent `agents` table instead — on a large lifetime roster (654 agents measured at 173,245 chars) that is too big to fold into a status update, so ask for it only when you need a specific agent's row.",
                 json!({
@@ -672,6 +702,16 @@ fn arg_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
 /// link, and quietly leaving the old array in place would tell it the write
 /// succeeded while the board disagreed.
 fn arg_str_array(args: &Value, key: &str) -> Result<Option<Vec<String>>, String> {
+    arg_str_array_of(args, key, "task-id strings")
+}
+
+/// [`arg_str_array`] with the element noun spelled by the caller (#946).
+///
+/// Split out rather than generalized in place because the message is the
+/// useful half: `options must be an array of task-id strings` sends an agent
+/// looking for a board problem in a question it was asking. The `deps`/
+/// `related` wording is unchanged, byte for byte, by delegating above.
+fn arg_str_array_of(args: &Value, key: &str, noun: &str) -> Result<Option<Vec<String>>, String> {
     match args.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::Array(items)) => items
@@ -679,11 +719,11 @@ fn arg_str_array(args: &Value, key: &str) -> Result<Option<Vec<String>>, String>
             .map(|v| {
                 v.as_str()
                     .map(str::to_string)
-                    .ok_or_else(|| format!("{key} must be an array of task-id strings"))
+                    .ok_or_else(|| format!("{key} must be an array of {noun}"))
             })
             .collect::<Result<Vec<String>, String>>()
             .map(Some),
-        Some(_) => Err(format!("{key} must be an array of task-id strings")),
+        Some(_) => Err(format!("{key} must be an array of {noun}")),
     }
 }
 
@@ -819,6 +859,61 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             let id = arg_str(args, "id").ok_or("id required")?;
             let task = reg.get_task(&caller.group, id).ok_or_else(|| format!("unknown task: {id}"))?;
             Ok(serde_json::to_string(&task).unwrap_or_default())
+        }
+
+        // ---- the human-question registry (#946) ----
+        //
+        // Three tools, and there is deliberately NO FOURTH. Nothing on this
+        // surface can answer a question: `OrchRegistry::answer_question` is
+        // reachable only from the trusted `orch_question_answer` command, and
+        // an agent that could settle a question the human was asked would be
+        // answering its own gate. `no_agent_token_can_answer_a_question_through_the_mcp_surface`
+        // and `the_mcp_surface_has_no_path_to_the_answer_entry_point` are what
+        // keep that true as this file grows.
+        "list_questions" => {
+            let (rows, omitted_settled) = reg.question_list(&caller.group)?;
+            Ok(json!({ "questions": rows, "omitted_settled": omitted_settled }).to_string())
+        }
+        "ask_human" => {
+            // Orchestrator-only in v1: delegates already have
+            // `message_orchestrator`, so questions to the human have one funnel
+            // and one authoring standard. Re-checked here because the listing
+            // is cosmetic.
+            require_orchestrator(caller)?;
+            let text = arg_str(args, "text").ok_or("text required")?;
+            let urgency = match arg_str_strict(args, "urgency")? {
+                Some(u) => super::humanq::Urgency::parse(u)?,
+                None => super::humanq::Urgency::default(),
+            };
+            let options = arg_str_array_of(args, "options", "answer-option strings")?.unwrap_or_default();
+            let q = reg.ask_human(
+                &caller.group,
+                &caller.agent_id,
+                super::humanq::AskRequest {
+                    text: text.to_string(),
+                    options,
+                    task: arg_str_strict(args, "task")?.map(str::to_string),
+                    urgency,
+                },
+            )?;
+            // The reply leads with the id (it is what the board note cites) and
+            // then says the one thing that decides what this agent does next.
+            // Stated at the call site, not only in the tool description, because
+            // the description is read once at listing time and this is read at
+            // the moment the decision is being made.
+            Ok(format!(
+                "{} registered — the human will be asked. DO NOT WAIT FOR IT: go on reviewing, \
+                 dispatching and merging everything not gated on this answer. Mark the affected \
+                 task blocked citing {}, and expect a [loomux] answer notice in this pane later. \
+                 list_questions has it meanwhile, across a /compact and across a restart.",
+                q.id, q.id
+            ))
+        }
+        "withdraw_question" => {
+            require_orchestrator(caller)?;
+            let id = arg_str(args, "id").ok_or("id required")?;
+            let q = reg.withdraw_question(&caller.group, &caller.agent_id, id)?;
+            Ok(format!("{} withdrawn — it is no longer in the human's inbox", q.id))
         }
 
         "upsert_task" => {
