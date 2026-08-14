@@ -213,6 +213,16 @@ impl AsRef<str> for GroupId {
     }
 }
 
+// SCRATCH PLANT — red-before-green evidence for PR #968, never merged. The
+// exact violation the extended scan exists to catch, in the ONLY crate the
+// orphan rule allows it to be written in. It must redden
+// `the_orchestration_root_is_joined_with_a_group_in_exactly_one_place`.
+impl AsRef<std::path::Path> for GroupId {
+    fn as_ref(&self) -> &std::path::Path {
+        std::path::Path::new(&self.0)
+    }
+}
+
 /// Lets a `HashMap<GroupId, _>` be probed with a `&str` without minting an id
 /// just to look one up.
 impl Borrow<str> for GroupId {
