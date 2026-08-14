@@ -184,10 +184,16 @@ the other half is `the_orchestration_root_is_joined_with_a_group_in_exactly_one_
 a source-scanning test that parses every `.join(` argument under **both**
 production source roots — `src-tauri/src` and `crates/loomux-engine/src` — and
 flags any naming a group: structural, not a list of spellings, because the
-first version *was* a list of spellings and missed one. It states its own
-boundary: `PathBuf::push` is not scanned (it cannot be told from `Vec::push`
-textually) and appears nowhere in the tree, so the scan is complete for the code
-as it stands and would not catch the first one added.
+first version *was* a list of spellings and missed one. It enumerates its own
+limits rather than claiming completeness: the qualified and bare spellings of
+both `AsRef` and `Path` are matched, but an aliased `Path` import, a
+macro-generated impl, an impl header split across lines, and `PathBuf::push`
+(indistinguishable from `Vec::push`) are all outside a textual scan. None of
+them appears in the tree today, and none would be caught if it were the first
+one added. That tail is unbounded, and more pattern-matching buys less than it
+costs — what holds the property is the compiler: with no `AsRef<Path>` anywhere,
+a `GroupId` cannot reach a `join` as a value at all, and the scan is defence in
+depth over the *string* inside one.
 
 **Why two roots, and the rule it generalizes to.** `GroupId` itself now lives in
 `loomux-engine` (#888 slice A2). Rust's orphan rule means an

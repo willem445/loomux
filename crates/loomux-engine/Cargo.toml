@@ -17,8 +17,10 @@ edition = "2021"
 publish = false
 description = "loomux orchestration engine — the Tauri-free core (internal; not published)"
 
-# ONE DEPENDENCY, and this section is here to be read rather than skipped: the
-# crate's defining property is what it must NEVER depend on.
+# DEPENDENCIES — this section is here to be read rather than skipped, and it
+# states no count on purpose: the crate's defining property is what it must
+# NEVER depend on, and a number here would be one more thing the next batch has
+# to remember to update.
 #
 #   - `tauri` (and any tauri-* crate). The entire point is a core a headless
 #     Linux daemon can link without webkit2gtk. `src-tauri` depends on THIS

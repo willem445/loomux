@@ -364,10 +364,45 @@ fn the_generated_agent_handle_is_a_single_filename_component() {
 /// a stale root fails loudly instead of scanning nothing.
 ///
 /// The same move is why the impl is now matched on its **shape** rather than on
-/// the single spelling `impl AsRef<Path> for GroupId`: the defining file no
-/// longer imports `Path`, so the qualified `std::path::Path` form is the
-/// likelier way the violation would really be written there, and a scan that
-/// only knew the bare form would report green on it.
+/// the single spelling `impl AsRef<Path> for GroupId`: the defining file
+/// imports neither `Path` nor `AsRef` by a qualified path, so the qualified
+/// forms are the likely ones there, and a scan that only knew the bare form
+/// would report green on them.
+///
+/// # What this scan catches, and what it does not
+///
+/// Stated plainly, because a guard that implies completeness it does not have
+/// is how the *previous* two versions of this test came to be trusted while
+/// broken. This is a **textual** scan; the honest claim is "it catches the
+/// spellings anyone would actually write", not "it cannot be evaded".
+///
+/// Caught:
+///
+/// - both production source roots (`ROOTS`), i.e. every directory where the
+///   impl can legally be written at all;
+/// - the `AsRef<…Path>` impl with either position qualified or bare —
+///   `impl AsRef<Path>`, `impl AsRef<std::path::Path>`,
+///   `impl std::convert::AsRef<Path>`, and the mixed forms;
+/// - the two name-independent join axes (the root receiver, and the
+///   `.as_str()` path-component shape), whatever the binding is called.
+///
+/// **Not** caught, and no attempt is made to:
+///
+/// - an **aliased import** — `use std::path::Path as P;` then
+///   `impl AsRef<P> for GroupId`. The text simply is not there to match.
+/// - a **macro-generated** impl, for the same reason.
+/// - an impl **header split across lines**: this scan reads one line at a time.
+/// - **`PathBuf::push`**, which cannot be told from `Vec::push` textually. It
+///   appears nowhere in either crate today; it would not be caught if it were
+///   the first one added.
+/// - a `GroupId` reached through a **re-export alias** in the impl header.
+///
+/// That tail is unbounded, and chasing it with more pattern-matching buys less
+/// than it costs — a scan is not a type system. What actually holds the
+/// property is the **compiler**: with no `AsRef<Path>` in the tree, a `GroupId`
+/// cannot reach a `join` as a value at all. This scan is defence in depth over
+/// the *string* inside one, and over a second assembly point growing back; it
+/// is the cheaper half of the guarantee, not the load-bearing one.
 #[test]
 fn the_orchestration_root_is_joined_with_a_group_in_exactly_one_place() {
     /// The ONE permitted group-path assembly, matched on its exact text.
@@ -521,19 +556,35 @@ fn the_orchestration_root_is_joined_with_a_group_in_exactly_one_place() {
                 continue;
             }
             // The `AsRef<Path>` absence, matched on SHAPE rather than on one
-            // spelling of the type. `Path` is only spelled bare in a file that
-            // imports it, and the file that now DEFINES `GroupId` does not — so
-            // `impl AsRef<std::path::Path> for GroupId` is the likelier way
-            // this violation actually arrives, and a needle pinned to the bare
-            // form would step straight over it while reporting green. Two
-            // earlier versions of this test were defeated by exactly that class
-            // of rename (rev-440, rev-450); the fix is the same one they got.
-            // `AsRef<str>`/`Borrow<str>`, which GroupId legitimately has, do
-            // not end in `Path` and so do not match.
+            // spelling — of the TYPE or of the TRAIT. Neither is spelled bare
+            // unless the file imports it, and the file that now DEFINES
+            // `GroupId` imports neither, so the qualified forms are the likely
+            // ones here and a needle pinned to `impl AsRef<Path>` would step
+            // over them while reporting green. Both positions are therefore
+            // matched by suffix:
+            //
+            //   impl AsRef<Path>                  for GroupId
+            //   impl AsRef<std::path::Path>       for GroupId
+            //   impl std::convert::AsRef<Path>    for GroupId
+            //   impl core::convert::AsRef<std::path::Path> for GroupId   (and mixed)
+            //
+            // Deliberately NOT chased further: an aliased import
+            // (`use std::path::Path as P`), a macro-generated impl, a header
+            // split across lines. Those are unbounded for a textual scan and
+            // more regex buys less than it costs — see this test's doc, which
+            // states the residual limits rather than claiming completeness.
+            // `AsRef<str>`/`Borrow<str>`, which `GroupId` legitimately has, do
+            // not end in `Path`, and `Borrow` is not in the trait position.
             let n = trimmed.replace(' ', "");
             if let Some((head, _)) = n.split_once(">forGroupId") {
-                if let Some((_, ty)) = head.rsplit_once("implAsRef<") {
-                    if ty == "Path" || ty.ends_with("::Path") {
+                if let Some((before_trait, ty)) = head.rsplit_once("AsRef<") {
+                    // `impl`, or `impl` + a module path ending in `convert::`.
+                    // Suffix-matched so an attribute or `pub` before it is fine.
+                    let in_trait_position = before_trait.ends_with("impl")
+                        || (before_trait.contains("impl")
+                            && before_trait.ends_with("convert::"));
+                    let names_path = ty == "Path" || ty.ends_with("::Path");
+                    if in_trait_position && names_path {
                         has_asref_path_impl = true;
                     }
                 }

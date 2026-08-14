@@ -44,10 +44,14 @@
 //! scan confined to `src-tauri/src` would have been watching a directory the
 //! violation can no longer reach, i.e. green forever while enforcing nothing.
 //!
-//! Its boundary is stated where it is implemented: `PathBuf::push` is not
-//! scanned, because it cannot be told from `Vec::push` textually — it appears
-//! nowhere in this tree, so the scan is complete for the code as it stands, and
-//! would not catch the first one added.
+//! Its limits are enumerated where it is implemented, and they are limits
+//! rather than a single caveat: it matches the qualified and bare spellings of
+//! both `AsRef` and `Path`, but it is a textual scan, so an aliased import
+//! (`use std::path::Path as P`), a macro-generated impl, an impl header split
+//! across lines, and `PathBuf::push` (indistinguishable from `Vec::push`) all
+//! sit outside it. What actually holds the property is the compiler: with no
+//! `AsRef<Path>` in the tree, a `GroupId` cannot reach a `join` as a value at
+//! all. The scan is defence in depth over the *string* inside one.
 //!
 //! It exists because this exact sentence was false for a whole slice: `#904`'s
 //! first half left `append_audit` and `promptsubmit_marker_path` each joining
