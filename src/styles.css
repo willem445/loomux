@@ -6,8 +6,9 @@
  * decisions also have to exist in index.html's pre-paint block (which runs before this
  * file loads) and in the xterm ITheme (terminals are a WebGL canvas — custom properties
  * do not reach them). Change a colour in theme.ts and here in the same commit, or the
- * test says so. The rationale for every value — the six named colours, the elevation
- * model, the roles, and the signature element they serve — is doc/design/ui-redesign.md.
+ * test says so. The rationale for every value — the eight named hues, the three colour
+ * channels, the elevation model, and the signature element they serve — is
+ * doc/design/ui-redesign.md.
  *
  * THE RULE THIS LAYER EXISTS TO ENFORCE: no raw colour outside this block. Surfaces
  * consume semantic tokens only. Slice A adds the layer; below it sit 397 colour literals
@@ -36,9 +37,12 @@
   --ink-dim: #9ba3b1;
   --ink-faint: #656d7b;
 
-  /* --- agent state. These four dyes are the ONLY saturated colour in the app, and they
-         mean exactly one thing each. `held` and `idle` are achromatic: a stopped agent
-         carries no dye and is marked by form (a dashed thread), not by hue. */
+  /* --- CHANNEL 1: agent state. These six values are the only things allowed in a STATE
+         POSITION — the warp thread, the status chip, the state dot. `held` and `idle` are
+         achromatic: a stopped agent carries no dye and is marked by form (a dashed thread),
+         not by hue. No --id-* token may appear in a state position; that rule is what keeps
+         the fleet readable to a supervisor with colour-vision deficiency, and
+         test/theme.test.ts measures it rather than trusting it. */
   --state-working: #5590d9;
   --state-attention: #e8a94a;
   --state-ok: #45c08a;
@@ -46,13 +50,32 @@
   --state-held: #656d7b;
   --state-idle: #343945;
 
-  /* --- interaction. ONE accent, used sparingly: focus ring, caret, active tab, primary
-         action. It is the working dye, because the live agent and the thing the human is
-         acting on are the same idea; form separates them (state is an edge, interaction
-         is a fill or a ring). */
+  /* --- CHANNEL 2: interaction. ONE accent, used sparingly: focus ring, caret, active tab,
+         primary action. It is the working dye, because the live agent and the thing the
+         human is acting on are the same idea; form separates them (state is an edge,
+         interaction is a fill or a ring). It stays one colour no matter how many hues the
+         identity channel holds. */
   --accent: #5590d9;
   --focus: #5590d9;
   --selection: #24344a;
+
+  /* --- CHANNEL 3: identity. Hue that says WHICH thing this is — a surface, an action
+         family, a CLI, a git lane — never what state it is in. Consumers: coloured icons
+         and their role table, per-CLI marks, git-graph lanes, diff add/delete, task-board
+         columns, workflow-mode chrome, project tabs, resource meters, the syntax
+         sub-palette. Four of these carry the same pigment as a --state-* token above and
+         that is deliberate: loomux has one palette, and the token a surface NAMES is what
+         declares which question it is answering. An --id-* token may only be used through a
+         documented role mapping; "it needed a different blue" is still refused.
+         Reserved by slice A, consumed from slice B on — nothing paints one yet. */
+  --id-rose: #e8636f;
+  --id-amber: #e8a94a;
+  --id-lime: #a9cc5a;
+  --id-jade: #45c08a;
+  --id-cyan: #46bcd4;
+  --id-azure: #5590d9;
+  --id-violet: #a97fd6;
+  --id-orchid: #e767a8;
 
   /* --- type roles. Sans carries labels and titles; mono is reserved for MACHINE
          IDENTIFIERS — paths, branches, ids, counts, timings — so the mono face always

@@ -23,6 +23,8 @@ import { readFileSync } from "node:fs";
 import {
   ANSI_SLOTS,
   CSS_TOKENS,
+  IDENTITY,
+  IDENTITY_LIT,
   PALETTE,
   PRE_PAINT_BACKGROUND,
   SEMANTIC,
@@ -50,6 +52,76 @@ function luminance(hex: string): number {
 function contrast(a: string, b: string): number {
   const [hi, lo] = [luminance(a), luminance(b)].sort((x, y) => y - x);
   return (hi + 0.05) / (lo + 0.05);
+}
+
+// --- perceptual distance, and what colour-vision deficiency does to it.
+//
+// The design note promises that the STATE channel survives colour blindness and that the
+// IDENTITY channel is allowed not to. That is a measurable claim about eight hex values,
+// so it is measured here. CIE76 in Lab is coarse but monotone enough to rank "can these
+// two be told apart", which is the only question being asked.
+function linearRgb(hex: string): [number, number, number] {
+  const n = Number.parseInt(hex.slice(1), 16);
+  const ch = (c: number) => {
+    const s = c / 255;
+    return s <= 0.04045 ? s / 12.92 : ((s + 0.055) / 1.055) ** 2.4;
+  };
+  return [ch((n >> 16) & 255), ch((n >> 8) & 255), ch(n & 255)];
+}
+function lab(hex: string): [number, number, number] {
+  const [r, g, b] = linearRgb(hex);
+  const x = (0.4124 * r + 0.3576 * g + 0.1805 * b) / 0.95047;
+  const y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+  const z = (0.0193 * r + 0.1192 * g + 0.9505 * b) / 1.08883;
+  const f = (t: number) => (t > 0.008856 ? Math.cbrt(t) : 7.787 * t + 16 / 116);
+  return [116 * f(y) - 16, 500 * (f(x) - f(y)), 200 * (f(y) - f(z))];
+}
+function deltaE(a: string, b: string): number {
+  const [l1, a1, b1] = lab(a);
+  const [l2, a2, b2] = lab(b);
+  return Math.hypot(l1 - l2, a1 - a2, b1 - b2);
+}
+
+/** Dichromat simulation in LMS space (the standard Viénot/Brettel matrices). */
+type Cvd = "protan" | "deutan" | "tritan";
+const CVD_KINDS: readonly Cvd[] = ["protan", "deutan", "tritan"];
+function simulate(hex: string, kind: Cvd): string {
+  const [r, g, b] = linearRgb(hex);
+  const l = 17.8824 * r + 43.5161 * g + 4.11935 * b;
+  const m = 3.45565 * r + 27.1554 * g + 3.86714 * b;
+  const s = 0.0299566 * r + 0.184309 * g + 1.46709 * b;
+  const l2 = kind === "protan" ? 2.02344 * m - 2.52581 * s : l;
+  const m2 = kind === "deutan" ? 0.494207 * l + 1.24827 * s : m;
+  const s2 = kind === "tritan" ? -0.395913 * l + 0.801109 * m : s;
+  const out: [number, number, number] = [
+    0.080944 * l2 - 0.130504 * m2 + 0.116721 * s2,
+    -0.0102485 * l2 + 0.0540194 * m2 - 0.113615 * s2,
+    -0.000365294 * l2 - 0.00412163 * m2 + 0.693513 * s2,
+  ];
+  const enc = (v: number) => {
+    const c = Math.min(1, Math.max(0, v));
+    const srgb = c <= 0.0031308 ? 12.92 * c : 1.055 * c ** (1 / 2.4) - 0.055;
+    return Math.round(255 * srgb)
+      .toString(16)
+      .padStart(2, "0");
+  };
+  return `#${out.map(enc).join("")}`;
+}
+
+/** The closest pair in a set, after `view` is applied to every member. */
+function closestPair(
+  set: Record<string, string>,
+  view: (hex: string) => string
+): { distance: number; a: string; b: string } {
+  const names = Object.keys(set);
+  let best = { distance: Number.POSITIVE_INFINITY, a: "", b: "" };
+  for (let i = 0; i < names.length; i++) {
+    for (let j = i + 1; j < names.length; j++) {
+      const d = deltaE(view(set[names[i]]), view(set[names[j]]));
+      if (d < best.distance) best = { distance: d, a: names[i], b: names[j] };
+    }
+  }
+  return best;
 }
 
 test("every ANSI slot is present, and no two slots share a colour", () => {
@@ -226,6 +298,127 @@ test("the surface ramp climbs, quietly", () => {
     // and spacing, not from a contrast block. A step that grows past ~1.3:1 is the
     // heavy-panel look this design rejected.
     assert.ok(step < 1.3, `surface step ${i - 1}->${i} is ${step.toFixed(2)}:1 — too loud`);
+  }
+});
+
+test("every identity hue is readable as text on every surface it can sit on", () => {
+  // The identity channel puts hue on icons, lanes, tabs, meters and chips — surfaces that
+  // carry LABELS, not just marks. So the floor is AA (4.5:1) at text size on the three app
+  // grounds, not the 3:1 non-text floor: a hue that only cleared 3:1 would force every
+  // consumer to reason about whether its use was "text enough", and slice B through M would
+  // each answer differently.
+  for (const [name, value] of Object.entries(IDENTITY)) {
+    for (const ground of [SEMANTIC.surface0, SEMANTIC.surface1, SEMANTIC.surface2]) {
+      const ratio = contrast(value, ground);
+      assert.ok(
+        ratio >= 4.5,
+        `identity ${name} (${value}) on ${ground} is ${ratio.toFixed(2)}:1, below AA`
+      );
+    }
+  }
+  // WCAG 1.4.11: a non-text mark — an icon stroke, a lane, a meter fill — needs 3:1. The
+  // terminal ground is included here and not above, because an identity mark can sit over a
+  // terminal (a pane badge) where a label never does.
+  for (const [name, value] of Object.entries({ ...IDENTITY, ...IDENTITY_LIT })) {
+    const ratio = contrast(value, SEMANTIC.surfaceTerm);
+    assert.ok(
+      ratio >= 3,
+      `identity ${name} (${value}) on the terminal ground is ${ratio.toFixed(2)}:1, ` +
+        "below the WCAG 1.4.11 non-text floor"
+    );
+  }
+});
+
+test("the identity channel is eight distinct hues, each with its Lit step", () => {
+  assert.deepEqual(
+    Object.keys(IDENTITY),
+    Object.keys(IDENTITY_LIT),
+    "every identity hue needs its Lit companion, in the same order"
+  );
+  assert.ok(
+    Object.keys(IDENTITY).length >= 8 && Object.keys(IDENTITY).length <= 10,
+    `the identity channel holds ${Object.keys(IDENTITY).length} hues; the brief argues for 8-10 ` +
+      "— fewer reads as the near-monochrome look the direction gate rejected, more is fruit salad"
+  );
+  const values = Object.values<string>({ ...IDENTITY, ...IDENTITY_LIT });
+  assert.equal(
+    new Set(values).size,
+    values.length,
+    "two identity tokens carry the same colour — one of them cannot say which thing it is"
+  );
+  // Every Lit step must actually be lighter than its base, or "Lit" is a lie a consumer
+  // reaching for emphasis would silently get wrong.
+  for (const name of Object.keys(IDENTITY) as (keyof typeof IDENTITY)[]) {
+    assert.ok(
+      luminance(IDENTITY_LIT[name]) > luminance(IDENTITY[name]),
+      `${name}Lit is not lighter than ${name} — the emphasis step goes the wrong way`
+    );
+  }
+});
+
+const STATE_DYES = {
+  working: SEMANTIC.stateWorking,
+  attention: SEMANTIC.stateAttention,
+  ok: SEMANTIC.stateOk,
+  danger: SEMANTIC.stateDanger,
+};
+
+test("the four agent states stay separable under colour-vision deficiency", () => {
+  // THE LOAD-BEARING MEASUREMENT OF THE THREE-CHANNEL DESIGN.
+  //
+  // Eight hues on one dark ground cannot all survive CVD, and this set does not: azure and
+  // violet differ by 2.9 dE to a protanope, rose and orchid are identical to a tritanope.
+  // The design accepts that for IDENTITY — which thing this is, always also carried by
+  // position, label and icon shape — and refuses it for STATE, which is the one thing a
+  // supervisor has to read correctly at a glance across ten panes.
+  //
+  // Measured worst case for the shipped dyes is 10.3 dE (tritan, attention/danger, where
+  // amber and rose both lose their yellow axis). The floor is 9: low enough that a
+  // legitimate nudge to a dye does not trip it, high enough that two states merging does.
+  for (const kind of [null, ...CVD_KINDS]) {
+    const view = (hex: string) => (kind === null ? hex : simulate(hex, kind));
+    const { distance, a, b } = closestPair(STATE_DYES, view);
+    assert.ok(
+      distance >= 9,
+      `${kind ?? "normal vision"}: agent states "${a}" and "${b}" are ${distance.toFixed(1)} dE ` +
+        "apart — a supervisor cannot tell those two panes apart"
+    );
+  }
+});
+
+test("no identity-only hue may fill a state role", () => {
+  // The channel rule, enforced where a token could actually break it.
+  //
+  // Four of the eight hues carry a state role as well as an identity one; the other four —
+  // lime, cyan, violet, orchid — are identity ONLY. Promoting one into a state position is
+  // the specific regression the three-channel design fears, and it is not something a
+  // contrast or a distance check can catch: `stateOk = cyan` measures perfectly fine and is
+  // still wrong, because it spends a hue the identity channel was relying on and puts the
+  // fleet's readability on a channel that collapses under CVD.
+  const stateRoles = Object.entries({
+    ...STATE_DYES,
+    held: SEMANTIC.stateHeld,
+    idle: SEMANTIC.stateIdle,
+  });
+  const identityOnly = new Map(
+    (Object.entries(IDENTITY) as [string, string][]).filter(
+      ([, hex]) => !Object.values<string>(STATE_DYES).includes(hex)
+    )
+  );
+  assert.ok(
+    identityOnly.size >= 3,
+    "the identity channel has stopped having hues of its own — every one of them now also " +
+      "means an agent state, which is the near-monochrome palette the direction gate rejected"
+  );
+  const byHex = new Map([...identityOnly].map(([name, hex]) => [hex, name]));
+  for (const [role, hex] of stateRoles) {
+    const clash = byHex.get(hex);
+    assert.equal(
+      clash,
+      undefined,
+      `state role "${role}" is painted ${hex}, which is the identity-only hue "${clash}" — ` +
+        "an identity hue may never sit in a state position (design note, §The three colour channels)"
+    );
   }
 });
 

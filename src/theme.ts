@@ -13,20 +13,26 @@
 // pin is a test plus a comment, deliberately — build-time CSS codegen would be a build step
 // and a generated file to review for one shared seam (doc/design/ui-redesign.md, §Pinning).
 //
-// The design brief this implements — palette rationale, the elevation model, the signature
-// element, the type roles, and the maintainability rules every later slice is held to — is
-// doc/design/ui-redesign.md. Read it before changing a value here.
+// The design brief this implements — palette rationale, the three colour channels, the
+// elevation model, the signature element, the type roles, and the maintainability rules
+// every later slice is held to — is doc/design/ui-redesign.md. Read it before changing a
+// value here; in particular, a hue is not free to move between channels.
 //
 // DOM-free on purpose: node:test imports this directly (no jsdom, no bundler).
 
 /**
- * Six named colours: two neutral ramps and four dyes.
+ * Two neutral ramps and eight named hues.
  *
  * `slate` is a deep, cool neutral — blue sits a few points above red at every step, so the
  * ground reads cool and recedes behind terminal output rather than tinting it. `mist` is
- * the ink. The four dyes are the only saturated colour in the app and each means exactly
- * one thing; the accent is `azure`, the same dye as the working state, because in loomux
- * the live thing and the interactive thing are the same thing (design note, §Colour).
+ * the ink. Both are unchanged from the direction the human approved: **colour enters this
+ * palette through the foreground only, never by tinting the ground.**
+ *
+ * The eight hues serve THREE channels, not one (design note, §The three colour channels):
+ * *state* (what an agent is doing), *interaction* (what the human can act on), and
+ * *identity* (which thing this is — a surface, an action family, a CLI, a git lane). Four
+ * of the eight also carry a state role; that is one pigment answering two questions, and
+ * what keeps them apart is POSITION, not hue — see `IDENTITY` below.
  */
 export const PALETTE = {
   // --- slate: the ground and the elevation ladder, deepest first. The four SURFACE steps
@@ -46,28 +52,82 @@ export const PALETTE = {
   mist200: "#9ba3b1", // secondary ink          (7.4:1)
   mist400: "#656d7b", // faint meta / dividers  (3.2-3.8:1 — non-text use only)
 
-  // --- the four dyes. Each clears 4.5:1 on every slate ground up to slate300, so a dye is
-  //     legible as text on any surface without a per-surface tint rule.
-  azure: "#5590d9", //  working / live / the interaction accent
+  // --- the eight hues, warm to cool around the wheel. Every one clears AA (4.5:1) as text
+  //     on every slate ground including slate300, so a hue is legible on any surface
+  //     without a per-surface exception; the worst case is azure at 5.01:1. Each carries a
+  //     `Lit` step — the brighter companion used for ANSI bright, for hover emphasis, and
+  //     for chip text sitting on a hairline of the same hue. There is deliberately no
+  //     per-hue FILL: on this ground a chip is the ground plus a hairline, so a third
+  //     value per hue would be a token nothing paints (design note, §The Lit step).
+  rose: "#e8636f", //     state: danger / error / deletions
+  roseLit: "#f4808a",
+  amber: "#e8a94a", //    state: attention — this one needs you
+  amberLit: "#f4c06a",
+  lime: "#a9cc5a", //     identity only
+  limeLit: "#c0dd7f",
+  jade: "#45c08a", //     state: ok / done / additions
+  jadeLit: "#6fd3a6",
+  cyan: "#46bcd4", //     identity, and ANSI cyan
+  cyanLit: "#74d3e5",
+  azure: "#5590d9", //    state: working / live — and the one interaction accent
   azureLit: "#7fb0e8",
   azureDeep: "#24344a", // selection fill only — never text, never a border
-  amber: "#e8a94a", //  attention — this one needs you
-  amberLit: "#f4c06a",
-  jade: "#45c08a", //   ok / done / additions
-  jadeLit: "#6fd3a6",
-  rose: "#e8636f", //   danger / error / deletions
-  roseLit: "#f4808a",
-
-  // --- terminal-only dyes. ANSI needs eight hues; the app needs four. These exist so the
-  //     16-colour palette stays coherent with the app's, and are NOT app tokens: no UI
-  //     surface may use them (the design note's palette is six named colours, not nine).
-  violet: "#a97fd6", //     ANSI magenta
+  violet: "#a97fd6", //   identity, and ANSI magenta
   violetLit: "#c39ce8",
-  ansiGreen: "#57bd77", //  jade pulled toward green, so ANSI green reads as green
+  orchid: "#e767a8", //   identity only
+  orchidLit: "#f08cbd",
+
+  // --- terminal-only. ANSI wants a true green in a slot where the app's greens are a teal
+  //     (jade) and a yellow-green (lime); neither reads as "green" to a CLI, so ANSI green
+  //     keeps its own pull. It is NOT an app hue — no UI surface may use it. `cyan` and
+  //     `violet` used to live in this group and have been promoted to the identity channel,
+  //     which is why it is now three names rather than seven.
+  ansiGreen: "#57bd77",
   ansiGreenLit: "#74d190",
-  ansiCyan: "#42b3c9", //   jade pulled toward blue, so ANSI cyan reads as cyan
-  ansiCyanLit: "#6ecbdd",
   ansiBlack: "#1e222a", //  above slate300 — dim, but visible on the terminal ground
+} as const;
+
+/**
+ * The identity channel: hue used to say WHICH thing this is, not what state it is in.
+ *
+ * Surfaces that consume this: coloured icons and their role table, per-CLI marks, git-graph
+ * lanes, diff add/delete, task-board columns, workflow-mode chrome, project tabs, resource
+ * meters, and the syntax sub-palette. All eight hues are available to it, including the
+ * four that also carry a state role — loomux has ONE palette, not two, and minting a second
+ * near-identical blue so that "identity blue" could differ from "working blue" is exactly
+ * the failure the token layer exists to prevent.
+ *
+ * WHAT KEEPS THE TWO CHANNELS APART IS POSITION, AND IT IS LOAD-BEARING. The state dyes
+ * hold an exclusive claim to the state POSITIONS — the warp thread, the status chip, the
+ * state dot — and an identity hue may never appear in one. That is not tidiness: under
+ * simulated colour-vision deficiency this eight-hue set collapses (azure and violet differ
+ * by 2.9 ΔE to a protanope; rose and orchid are identical to a tritanope), while the four
+ * state dyes stay the most separable set under all three simulations. A supervisor who
+ * cannot tell violet from azure still reads the fleet correctly, because nothing they must
+ * act on was ever encoded in the channel that collapsed. `test/theme.test.ts` measures
+ * exactly that and fails if identity ever becomes the more robust of the two.
+ */
+export const IDENTITY = {
+  rose: PALETTE.rose,
+  amber: PALETTE.amber,
+  lime: PALETTE.lime,
+  jade: PALETTE.jade,
+  cyan: PALETTE.cyan,
+  azure: PALETTE.azure,
+  violet: PALETTE.violet,
+  orchid: PALETTE.orchid,
+} as const;
+
+/** The `Lit` companion of each identity hue, in the same key order. */
+export const IDENTITY_LIT = {
+  rose: PALETTE.roseLit,
+  amber: PALETTE.amberLit,
+  lime: PALETTE.limeLit,
+  jade: PALETTE.jadeLit,
+  cyan: PALETTE.cyanLit,
+  azure: PALETTE.azureLit,
+  violet: PALETTE.violetLit,
+  orchid: PALETTE.orchidLit,
 } as const;
 
 /**
@@ -90,8 +150,10 @@ export const SEMANTIC = {
   inkFaint: PALETTE.mist400,
 
   // Agent state. `held` and `idle` are ACHROMATIC on purpose: a held agent is not running,
-  // so it carries no dye — it is marked by form (a dashed thread), not by hue. That keeps
-  // saturated colour scarce and therefore meaningful.
+  // so it carries no dye — it is marked by form (a dashed thread), not by hue. With eight
+  // hues in the app, scarcity is no longer what makes these four mean something; POSITION
+  // is. These six values are the only things allowed in a state position, and no identity
+  // hue may enter one (see IDENTITY above).
   stateWorking: PALETTE.azure,
   stateAttention: PALETTE.amber,
   stateOk: PALETTE.jade,
@@ -101,8 +163,10 @@ export const SEMANTIC = {
 
   // Interaction. One accent, used sparingly: the focus ring, the caret, the active tab, the
   // primary action. It is `azure` — the working dye — because the live agent and the thing
-  // the human is acting on are the same idea, and a fifth hue would be a fifth meaning to
-  // learn. Form separates them: state is an edge, interaction is a fill or a ring.
+  // the human is acting on are the same idea, and a ninth hue would be a ninth meaning to
+  // learn. Form separates them: state is an edge, interaction is a fill or a ring. The
+  // accent stays ONE colour however many hues the identity channel gains: "what can I
+  // click" must never become a hue-matching exercise.
   accent: PALETTE.azure,
   focus: PALETTE.azure,
   selection: PALETTE.azureDeep,
@@ -145,13 +209,17 @@ export const TERMINAL_THEME = {
   scrollbarSliderBackground: PALETTE.slate300,
   scrollbarSliderHoverBackground: PALETTE.slate400,
   scrollbarSliderActiveBackground: PALETTE.slate500,
+  // Seven of the eight ANSI hues are now app hues rather than terminal-only inventions —
+  // the identity channel needed a cyan and a magenta anyway, so the terminal and the chrome
+  // finally speak the same palette. `lime` and `orchid` have no ANSI slot: they are app-only
+  // hues, which is the reverse of the arrangement this replaced.
   black: PALETTE.ansiBlack,
   red: PALETTE.rose,
   green: PALETTE.ansiGreen,
   yellow: PALETTE.amber,
   blue: PALETTE.azure,
   magenta: PALETTE.violet,
-  cyan: PALETTE.ansiCyan,
+  cyan: PALETTE.cyan,
   white: PALETTE.mist200,
   // ANSI bright-black is dimmed TEXT, so it is the faint ink, not a chrome edge — 3.8:1
   // on the terminal ground, which is the floor for something a CLI expects to be read.
@@ -161,7 +229,7 @@ export const TERMINAL_THEME = {
   brightYellow: PALETTE.amberLit,
   brightBlue: PALETTE.azureLit,
   brightMagenta: PALETTE.violetLit,
-  brightCyan: PALETTE.ansiCyanLit,
+  brightCyan: PALETTE.cyanLit,
   brightWhite: PALETTE.mist000,
 } as const;
 
@@ -213,6 +281,19 @@ export const CSS_TOKENS = {
   "--accent": SEMANTIC.accent,
   "--focus": SEMANTIC.focus,
   "--selection": SEMANTIC.selection,
+  // The identity channel. Four of these carry the same pigment as a `--state-*` token
+  // above, and that duplication is the point: which token a surface names declares which
+  // QUESTION it is answering, so a reviewer can see a channel violation in the diff without
+  // knowing the hex. The `Lit` steps stay in theme.ts until a slice paints one — `:root`
+  // carries what the stylesheet uses, not the whole palette.
+  "--id-rose": IDENTITY.rose,
+  "--id-amber": IDENTITY.amber,
+  "--id-lime": IDENTITY.lime,
+  "--id-jade": IDENTITY.jade,
+  "--id-cyan": IDENTITY.cyan,
+  "--id-azure": IDENTITY.azure,
+  "--id-violet": IDENTITY.violet,
+  "--id-orchid": IDENTITY.orchid,
   "--font-mono": FONT.mono,
   "--font-ui": FONT.ui,
 } as const;
