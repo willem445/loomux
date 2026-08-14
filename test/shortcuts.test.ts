@@ -58,6 +58,32 @@ test("Ctrl+Shift+W is still close-pane, not the timeline", () => {
   assert.equal(matchShortcut(evt({ ctrlKey: true, shiftKey: true, code: "KeyW" })), "close-pane");
 });
 
+// --- autosize (#936) -------------------------------------------------------
+
+test("Ctrl+Shift+A autosizes the panes", () => {
+  assert.equal(matchShortcut(evt({ ctrlKey: true, shiftKey: true, code: "KeyA" })), "autosize-panes");
+});
+
+test("plain Ctrl+A is NOT taken — it is the shell's and the agent's start-of-line", () => {
+  // Claude Code's interactive-mode reference documents `Ctrl+A` as "Move cursor
+  // to start of current line", and readline binds it the same way. Autosize
+  // rides the SHIFTED chord precisely so that one keeps reaching the pane; a
+  // guard that let Ctrl+A through to this action would be a silent regression
+  // inside every agent and shell pane.
+  assert.equal(matchShortcut(evt({ ctrlKey: true, code: "KeyA" })), null);
+  assert.equal(matchShortcut(evt({ code: "KeyA" })), null);
+});
+
+test("Alt+A still opens the audit log, and Ctrl+Shift+Alt+A is nobody's", () => {
+  // A is now bound under two modifier sets on the same panes — the same
+  // collision the timeline/audit pair above guards against.
+  assert.equal(matchShortcut(evt({ altKey: true, code: "KeyA" })), "toggle-audit");
+  assert.equal(
+    matchShortcut(evt({ ctrlKey: true, shiftKey: true, altKey: true, code: "KeyA" })),
+    null
+  );
+});
+
 test("plain W, Ctrl+W and Alt+Shift+W are not the timeline (Ctrl+W is the shell's kill-word)", () => {
   assert.equal(matchShortcut(evt({ code: "KeyW" })), null);
   // Ctrl+W must keep reaching the shell: it is readline's unix-word-rubout,

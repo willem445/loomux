@@ -2477,6 +2477,9 @@ document.addEventListener(
       case "split-down":
         openPane("column");
         break;
+      case "autosize-panes":
+        activeGrid().autosize();
+        break;
       case "close-pane": {
         // Through the pane's own close request, like the header ✕ and the dock chip:
         // one entry point for every human-initiated single-pane close (rev-100).
@@ -2570,6 +2573,10 @@ document.addEventListener(
 document.getElementById("btn-sessions")!.addEventListener("click", () => sessions.toggle());
 document.getElementById("btn-split-right")!.addEventListener("click", () => openPane("row"));
 document.getElementById("btn-split-down")!.addEventListener("click", () => openPane("column"));
+// Autosize (#936): even out every pane in the active tab. Same one-line call as
+// the Ctrl+Shift+A path — the button is an affordance for it, not a second
+// implementation of it.
+document.getElementById("btn-autosize")!.addEventListener("click", () => activeGrid().autosize());
 
 // Keep the browser from hijacking terminal-relevant defaults (Ctrl+F etc.
 // stays inside the shell; F5/F7 reach TUI apps instead of the webview).

@@ -5,6 +5,7 @@
 export type ShortcutAction =
   | "split-right"
   | "split-down"
+  | "autosize-panes"
   | "close-pane"
   | "new-tab"
   | "close-tab"
@@ -38,8 +39,20 @@ export function matchShortcut(e: KeyboardEvent): ShortcutAction | null {
       case "KeyO": return "split-down";
       case "KeyW": return "close-pane";
       case "KeyP": return "toggle-sessions";
-      // Ctrl+Shift+A is intentionally unbound: it toggled the removed agents
-      // mode (#194). Left free pending a repurpose decision.
+      // Ctrl+Shift+A (#936), the repurpose the removed agents mode (#194) left
+      // this key parked for: A for Autosize — even out every pane in the tab.
+      // It sits with the other layout gestures (E/O split, M maximize) rather
+      // than in the Alt+<key> space, which is overlays and focus.
+      //
+      // Verified free on the agent CLIs per the agent-cli-reference discipline,
+      // and stated as the three distinct things it is: Claude Code's
+      // interactive-mode reference DOES document `Ctrl+A` ("Move cursor to
+      // start of current line") and `Ctrl+_`/`Ctrl+Shift+-` (undo), and does
+      // NOT document Ctrl+Shift+A — the unshifted Ctrl+A a shell or agent
+      // actually uses is untouched by this. Copilot CLI's reference pages are
+      // SILENT on Ctrl+Shift+A (its CLI reference index carries no key table),
+      // so that one is unverified rather than confirmed free.
+      case "KeyA": return "autosize-panes";
       case "KeyM": return "maximize-pane";
       // Project tabs (#63). T=new, K=close; the bracket keys page between tabs
       // (VSCode-style) and stay clear of Alt+arrows (pane focus) and the browser

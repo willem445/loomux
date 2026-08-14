@@ -233,6 +233,28 @@ rather than levelling it back out.
 so the smallest pane gains the most. Close one of five equal panes and the other
 four are four equal panes again.
 
+### Autosize
+
+Layouts drift. A split hands the new pane half of the pane you split — which is
+what keeps the rest of the grid still — but split into the newest pane a few
+times, drag a divider or two, and you end up with one big pane and a row of
+slivers.
+
+**Autosize** (`Ctrl+Shift+A`, or the `▦` button in the top bar) gives every pane
+in the tab an equal share of the space, in one press. Panes nested inside a
+split are counted properly: one pane beside a stacked pair becomes three equal
+thirds, not a half and two quarters.
+
+It happens only when you ask. Splitting and closing never re-level the grid
+behind you, so a divider you positioned deliberately stays where you put it
+until you press Autosize. Pressing it twice does nothing the second time, and
+the evened-out layout is what a restored session comes back to.
+
+Two things it can't do: panes have a minimum size, so a tab holding more panes
+than fit at that minimum can't have them all equal; and panes end up with equal
+*area*, not identical shapes — Autosize re-sizes the grid you have, it never
+rearranges which panes sit beside which.
+
 ### Rearranging without re-splitting
 
 Panes get cramped fast once an orchestrator opens one per agent, so the grid can
