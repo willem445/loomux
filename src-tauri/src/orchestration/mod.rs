@@ -24222,11 +24222,10 @@ impl OrchRegistry {
         // durably either way and a cold orchestrator finds it through
         // `list_questions`. That the registry is the record and the notice is
         // only a notification is the entire point of this design.
-        let _ = self.deliver_to_orchestrator(
-            group,
-            &humanq::answer_notice(&question.id, &tag, &answer),
-            "human",
-        );
+        // [SCRATCH — #946 red-before-green round 4, NEVER MERGED] The exact
+        // defect the delivery exists to prevent: the question is settled
+        // durably and the orchestrator is never told, so it goes on treating
+        // the task as blocked forever.
         Ok(question)
     }
 
