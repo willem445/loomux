@@ -448,25 +448,53 @@ recognise must leave that verdict untouched — and it does, structurally: the
 parse replaces the help-parsed list. The failure path is therefore exactly the
 behaviour that shipped before, not a degraded one.
 
-**The parser drops what it doesn't recognise.** The docs state the id format but
-not the surrounding layout, so `parse_models_from_list` keeps only lines that
-*are* an id (ANSI stripped, every `/`-segment non-empty and made of id
-characters — which is also what rejects a bare URL) and drops everything else,
-deduping while preserving the CLI's own order. An unfamiliar layout yields
-nothing and the fallback above takes over; the alternative — scraping words out
-of prose — would put ids into the picker that no pane can launch on.
+**The parser drops what it doesn't recognise, and never manufactures.** The
+docs state the id format but not the surrounding layout, so
+`parse_models_from_list` models no layout: each line is reduced to printable
+text, its first token taken, and that token kept only if it *is* an id (every
+`/`-segment non-empty and made of id characters — which is also what rejects a
+bare URL), deduping while preserving the CLI's own order.
 
-**Cost.** An opencode probe is now two subprocesses instead of one, each under
-the same 8s timeout, on the blocking pool, cached for the app run (#746). The
-list may also be long: it is a flat dropdown by design, and neither the backend
-nor the picker caps it — a silently truncated model list is worse than a long
-one.
+The guarantee that makes this safe to ship against an unobserved layout is
+narrower than "it recognises nothing unfamiliar", and stating it that loosely
+was wrong (#939 review): **every id it emits is a verbatim whitespace-delimited
+token of the CLI's own output.** It cannot splice two fields together, invent
+characters, or repair a broken token. That property is what removals have to
+respect, and the review found it broken: the probe's escape-stripper *deleted*
+control bytes, and a tab is both a control byte and a column separator — so a
+tab-columned row collapsed `id<TAB>Claude Sonnet 4.5` into `…-4-5Claude`,
+id-SHAPED but not an id, non-empty, and therefore promoted over the help-parsed
+fallback and to the head of the picker. `plain_line` substitutes a SPACE for
+every escape sequence and control byte instead of deleting it, so a removal
+always separates: the id extracts from its column, or the line yields nothing.
+(It is deliberately *not* named `strip_ansi` — `orchestration::strip_ansi` is a
+different function with many callers, and deleting is right for its job of
+reading a pane's ring, where cursor addressing legitimately re-writes one row.)
+
+What it is NOT is a promise that everything accepted is a model. A column
+header literally reading `provider/model` would be taken as one, because at
+that point it is indistinguishable from an id. That is the deliberate direction
+of error: under-recognise, never manufacture — a stray literal the CLI itself
+printed sits in a picker beside real ids with the `custom…` escape intact,
+whereas a spliced token is a launch that fails on an id nothing ever offered.
+
+**Cost.** An opencode probe is two subprocesses instead of one, each under the
+same 8s timeout, on the blocking pool. Only a COMPLETE probe is cached for the
+app run: an installed opencode whose `models` run failed keeps its help-parsed
+fallback for that call but is not remembered, so a provider configured — or an
+`opencode auth login` finished — a minute later shows up without restarting
+loomux, the same argument that already keeps an unavailable probe out of the
+cache. The list may also be long: it is a flat dropdown by design, and neither
+the backend nor the picker caps it — a silently truncated model list is worse
+than a long one.
 
 **Residual, for live validation.** The exact stdout layout of `opencode models`
 is not documented and was not observed (constraint 3 — no agent ran the CLI).
-The parser is written to tolerate that: worst case it recognises nothing and the
-picker degrades to today's curated list. A human running it once on a real
-install settles it.
+Two layouts are covered by test — bare `provider/model` lines and tab-columned
+rows — and any layout at all is covered by the guarantee above: the ids offered
+are strings opencode itself printed, and a layout that yields none degrades to
+today's curated list. A human running it once on a real install settles what it
+actually prints.
 
 ## Usage and cost readback (#722 slice B)
 
