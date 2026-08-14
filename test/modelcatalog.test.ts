@@ -140,12 +140,25 @@ test("a CLI with no curated row suggests nothing rather than another CLI's alias
 test("inherit is a CHOICE, not an absence: an empty current selects the inherit row", () => {
   // The membership test must come before the "is it empty" test. With the order
   // reversed, a human's deliberate "inherit" reads as "nothing chosen" and falls
-  // through to whatever happens to be first — on a probed opencode list, a real
-  // model silently pinned over the one their own config selects (#722).
-  const models = [INHERIT_MODEL, "opencode/gpt-5.1-codex"];
+  // through to whatever happens to be first in the list — a real model silently
+  // pinned over the one their own config selects (#722).
+  //
+  // The witness has the inherit row NOT first, and that is the whole point: fed
+  // a merge's own output (where `mergeModelOptions` pins it at index 0) BOTH
+  // orders answer `INHERIT_MODEL` and the specimen witnesses nothing. This
+  // function is a general one over whatever list its caller hands it — including
+  // the block editor's, and any future list — so it is pinned on the input that
+  // can tell the two implementations apart.
+  const models = ["opencode/gpt-5.1-codex", INHERIT_MODEL];
   const s = pickerSelection(models, INHERIT_MODEL);
-  assert.equal(s.selected, INHERIT_MODEL);
+  assert.equal(
+    s.selected,
+    INHERIT_MODEL,
+    "an empty current that IS on the menu is the inherit row, not an unset field"
+  );
   assert.equal(s.showCustom, false);
+  // And the pinned-first list (what the launcher actually renders) agrees.
+  assert.equal(pickerSelection([INHERIT_MODEL, "opencode/gpt-5.1-codex"], INHERIT_MODEL).selected, INHERIT_MODEL);
 });
 
 test("a known id selects its row; an unknown one opens the custom branch carrying it", () => {
