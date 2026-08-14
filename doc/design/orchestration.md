@@ -11083,7 +11083,8 @@ Two related additions: a **planner** role, and **per-role** agent CLI + model.
   that ladder is enforced by the vendor's own permission engine, and vendors do
   not agree on what one can express.
 
-  That produced `CliCaps` / `CLI_CAPS` (`orchestration/mod.rs`): one row per agent
+  That produced `CliCaps` / `CLI_CAPS` (`crates/loomux-engine/src/model.rs` since
+  #888 slice A2 batch 4, re-exported as `orchestration::CLI_CAPS`): one row per agent
   CLI loomux has evaluated, recording three things that had been conflated into
   "is it in `SUPPORTED_CLIS`".
 
