@@ -36364,10 +36364,13 @@ fn a_group_with_no_workflow_gate_merges_exactly_as_it_did_before() {
 // (the `watchdog_tick` shape), so every test drives it with a synthetic
 // `PollResult` map. Pure predicate/notice-sanitation coverage (the "no
 // checks reported" → Pending regression, the SUCCESS/FAILURE/IN_PROGRESS
-// table, the forged-prefix/newline sanitation) lives inline in
-// `orchestration/notify.rs`'s own `#[cfg(test)]` module — those are pure
-// functions with no registry/Tauri dependency, exactly the `gh.rs` precedent
-// for keeping pure-fn tests out of this integration file.
+// table, the forged-prefix/newline sanitation) lives inline in the `notify`
+// module's own `#[cfg(test)]` module — those are pure functions with no
+// registry/Tauri dependency, exactly the `gh.rs` precedent for keeping pure-fn
+// tests out of this integration file. That module now lives in the
+// `loomux-engine` crate (#888 slice A2 batch 3) and is re-exported here under
+// its old `orchestration::notify` path, which is why the `use` above and every
+// test below are untouched by the move.
 
 /// Call `notify_when` through the real MCP dispatch and return the tool's
 /// text (Ok on success, Err on a rejection) — mirrors how an agent actually

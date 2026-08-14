@@ -75,6 +75,34 @@
 //! moves a type a source-scanning test watches owes the same check**: ask where
 //! the violation can now be spelled, not where it used to be.
 
+//!
+//! A2 batch 3 — [`lessons`] (#268) and [`notify`] (#243), plus [`text`], which
+//! is what made them movable. Both modules were otherwise leaves; each had a
+//! single edge left pointing at `orchestration/mod.rs`, and both of those edges
+//! were pure string helpers rather than registry state — so the helpers moved
+//! ahead of their callers into [`text`] instead of a trait being invented to
+//! reach back for them. Read that as the batch's actual finding: **an edge into
+//! `mod.rs` is not automatically an edge into the registry.** Some of what
+//! `mod.rs` holds is there because it is one large file, not because it is
+//! coupled to `AppHandle`, and that kind of edge is cut by moving the callee,
+//! not by abstracting the caller.
+//!
+//! This batch also widened two of [`notify`]'s functions from `pub(super)` to
+//! `pub`. That is the crate boundary's doing rather than a policy change: their
+//! callers (the `gh pr list` rollup, the merge queue's batch verdict) stayed in
+//! `src-tauri`, and no visibility narrower than `pub` still reaches them. Worth
+//! expecting again — a batch that leaves a caller behind converts that caller's
+//! `pub(super)` into public API, so the question each time is whether the item
+//! is one this crate is content to expose, not merely whether it compiles.
+//!
+//! It also brings `serde_json` ([`notify`] parses `gh --json` payloads) and
+//! asks `serde` for `derive`. Both are argued in the manifest; the `derive`
+//! half in particular was declared unnecessary there until this batch, and
+//! is not any more.
+
 pub mod groupid;
+pub mod lessons;
+pub mod notify;
 pub mod report;
 pub mod termgrid;
+pub mod text;

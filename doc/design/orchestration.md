@@ -2199,7 +2199,8 @@ pure function over pinned `--json` fields, testable with canned fixtures and no 
 
 ### Shape: mirrors the watchdog and `pr_head`, invents nothing new
 
-- **Pure core** (`orchestration/notify.rs`, ~350 lines including tests): `Condition`
+- **Pure core** (the `notify` module — `crates/loomux-engine/src/notify.rs` since #888
+  slice A2 batch 3, re-exported as `orchestration::notify`, tests included): `Condition`
   (`PrChecks { pr }` | `WorkflowRun { run }` — no `Default`, so an unrecognized wire `kind`
   has nothing to fall back to and is rejected outright), `Watch`, `PollResult`
   (`Pending`/`Met`/`Failed`), the two predicates (`pr_checks_result`, `workflow_run_result`),

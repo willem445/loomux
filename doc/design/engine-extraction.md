@@ -200,9 +200,52 @@ from a unit test of product code, agents are banned from running cargo locally
 
     `groupid` also brings the crate's first dependency, `serde` — `GroupId`'s
     hand-written `Deserialize` is the gate a persisted or hand-edited id is
-    routed back through, so it travels with the type. No `derive` feature (both
-    impls are hand-written), and `serde` is already in the shipped binary's
-    linked graph, so the getrandom audit's ground is unchanged.
+    routed back through, so it travels with the type. It took `serde` without
+    the `derive` feature, both impls being hand-written; batch 3 turned that on
+    (below). `serde` is already in the shipped binary's linked graph, so the
+    getrandom audit's ground is unchanged.
+  - **Batch 3 — `lessons`, `notify`, and the helper lift that made them
+    leaves.** Each had exactly one code edge left into `mod.rs`, and the useful
+    part is what those edges turned out to be: `lessons` reached back for
+    `tail_snippet` (a char-boundary-safe byte-suffix cut) and `notify` for
+    `pr_number` (a PR-ref parse). Neither is registry state, neither touches
+    `AppHandle`, and neither is a candidate for a host trait — they were
+    stranded in `mod.rs` because `mod.rs` is one very large file, not because
+    they are coupled to the desktop. So the two helpers moved into the engine
+    **ahead of their callers**, as `loomux-engine`'s `text` module, and the two
+    modules followed behind them.
+
+    The rule worth carrying forward: **an edge into `mod.rs` is not
+    automatically an edge into the registry.** Before a module gets held back
+    for A3, read what it actually reaches for — a pure callee is cut by moving
+    the callee, which costs a re-export, not by abstracting the caller, which
+    costs a trait. The coupling map on #968 applied that test to what remains,
+    and it is what makes the `workflow` cluster a "model batch" (shared data
+    types and const tables lifted out of `mod.rs`) rather than trait work.
+
+    `text` is deliberately its own module rather than filed beside either
+    caller: both helpers have consumers past the module that forced the lift
+    (`tail_snippet` also backs the pty exit notice; `pr_number` is reached from
+    the merge-grant path, the board's PR lookup and the MCP argument parsers),
+    and filing a shared helper inside one consumer makes every other consumer
+    depend on that consumer for a reason the code does not have.
+
+    Two costs this batch paid that the next one should expect. **A `pub(super)`
+    whose caller stays behind becomes public API**: `notify`'s
+    `check_is_pending`/`check_is_failing` are used by the `gh pr list` rollup
+    and the merge queue's batch verdict, both of which stayed in `src-tauri`, so
+    there is no visibility narrower than `pub` that still reaches them — worth
+    asking each time whether the item is one the engine is content to expose,
+    rather than only whether it compiles. And **a dependency a module derives on
+    has to be declared, not inherited**: `notify` derives `Deserialize`, so the
+    manifest now asks `serde` for `derive` (and adds `serde_json` for the `gh
+    --json` walk). Resolver-2 unifies features across the packages in one build,
+    so an undeclared `derive` would have compiled under CI's `--workspace` and
+    failed only for someone building the engine alone.
+
+    Pure relocation otherwise: no tripwire watches either helper, the moved
+    modules' inline tests moved with them, and the integration suite stayed
+    green with no test-logic edits — which is what the re-exports are for.
   - **`digest` is not a leaf** despite reading like one. It calls
     `crate::sessions::yaml_field` and takes a `crate::opencodedb::TranscriptRow`
     — two modules staying in `src-tauri` — so it cannot move until those edges

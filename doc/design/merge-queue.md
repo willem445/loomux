@@ -324,10 +324,11 @@ branch, and read its checks. Three reasons this shape and not another:
 3. It gives the human a URL to watch, which is most of what "observability" means here.
 
 **Reuse the existing classification — do not write a third.** Terminal-state logic exists
-twice already: `orchestration/notify.rs::pr_checks_result:312` (with `check_is_pending` at
-`notify.rs:286` — **not** `:301`, which is `check_is_failing`, the neighbouring predicate an
-implementer is most likely to grab by mistake given the subject here) and
-`orchestration/intake.rs::parse_pr_list:183`. Both already encode the property that
+twice already: `notify::pr_checks_result` (with `check_is_pending` — **not** its immediate
+neighbour `check_is_failing`, the predicate an implementer is most likely to grab by mistake
+given the subject here) and `intake::parse_pr_list`. The `notify` module lives in
+`crates/loomux-engine/src/notify.rs` as of #888 slice A2 batch 3 and is re-exported as
+`orchestration::notify`; `intake` is in `src-tauri/src/orchestration/`. Both already encode the property that
 matters most — **an empty check list is not success**, it is pending. `notify.rs` is the one
 to build on, since it also handles the `"no checks reported"` stderr case.
 
