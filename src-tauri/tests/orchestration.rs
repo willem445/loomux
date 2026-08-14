@@ -46660,16 +46660,44 @@ fn no_agent_token_can_answer_a_question_through_the_mcp_surface() {
         .map(str::to_string),
     );
 
-    // One bag carrying every argument name any of these tools takes, so each
-    // call gets as far into its own handler as it possibly can.
-    let payload = json!({
-        "id": "q-1", "question": "q-1", "answer": "ship it here", "text": "ship it here",
-        "source": "webview", "settled_by": "webview", "status": "answered",
-        "state": "{}", "title": "t", "name": "n", "note": "n", "kind": "pr_checks",
-    });
+    // EVERY swept tool gets its own FRESH PENDING question, and this is
+    // load-bearing rather than tidiness. The first version of this test aimed
+    // all ~60 calls at one `q-1`, and `withdraw_question` — which is in the
+    // sweep and legitimately settles a question as `withdrawn` — reached it
+    // early. Every later tool was then aimed at an ALREADY-SETTLED question,
+    // which `answer_question` refuses on its own account, so the headline
+    // assertion below could no longer observe the thing it exists to catch.
+    // The #946 R1 scratch round proved it: with an agent-callable answer tool
+    // deliberately wired in, this test went red on the "unknown tool" tail
+    // check rather than on `assert_ne!(status, Answered)` — a real defect
+    // caught by a weaker assertion than the one written for it.
+    //
+    // So: ask, drive the tool, assert, then take the question back out of
+    // `pending` (through the registry, not a tool) so the next iteration is
+    // not blocked by `PENDING_MAX`.
+    // The id comes from the REPLY (`"q-7 registered — …"`), not from scanning
+    // the file for a pending row: `ask_human` is itself one of the swept tools,
+    // so the sweep leaves pending questions of its own lying around and
+    // "the first pending row" would eventually name one of those instead.
+    let ask_fresh = |label: &str| -> String {
+        let out = q_call(&reg, &co, "ask_human", json!({ "text": format!("pending for {label}?") }));
+        assert_eq!(out["isError"], false, "the sweep needs a fresh question: {}", q_text(&out));
+        let reply = q_text(&out);
+        let id = reply.split_whitespace().next().unwrap_or_default().to_string();
+        assert!(id.starts_with("q-"), "ask_human's reply must lead with the id: {reply}");
+        id
+    };
 
     for (caller, who) in [(&co, "the orchestrator"), (&cw, "a worker")] {
         for name in &names {
+            let id = ask_fresh(name);
+            // One bag carrying every argument name any of these tools takes,
+            // so each call gets as far into its own handler as it possibly can.
+            let payload = json!({
+                "id": id, "question": id, "answer": "ship it here", "text": "ship it here",
+                "source": "webview", "settled_by": "webview", "status": "answered",
+                "state": "{}", "title": "t", "name": "n", "note": "n", "kind": "pr_checks",
+            });
             // The call may legitimately succeed, fail, or be unknown — none of
             // that is what is under test. What is under test is the state
             // afterwards.
@@ -46680,35 +46708,43 @@ fn no_agent_token_can_answer_a_question_through_the_mcp_surface() {
                 &json!({ "name": name, "arguments": payload }),
             );
             let qs = reg.questions(&g).expect("questions.json readable");
-            let q = qs.iter().find(|q| q.id == "q-1").expect("q-1 still exists");
-            // The forbidden act is ANSWERING, precisely. `withdraw_question`
-            // is in this sweep and legitimately settles q-1 as *withdrawn* —
-            // an orchestrator taking back its own question is not the same
-            // power as deciding it, and that difference is what these two
-            // assertions pin.
+            let q = qs.iter().find(|q| q.id == id).expect("the question still exists");
+            // The forbidden act is ANSWERING, precisely. A tool that settles
+            // this as `withdrawn` is fine — an orchestrator taking back its own
+            // question is not the same power as deciding it — and that
+            // difference is exactly what these two assertions pin.
             assert_ne!(
                 q.status,
                 humanq::Status::Answered,
-                "{who} marked q-1 ANSWERED by calling {name:?} — no agent may ever answer"
+                "{who} marked {id} ANSWERED by calling {name:?} — no agent may ever answer"
             );
             assert!(
                 q.answer.is_none(),
-                "{who} put an answer on q-1 by calling {name:?}: {:?}",
+                "{who} put an answer on {id} by calling {name:?}: {:?}",
                 q.answer
             );
+            // Clear the slot for the next tool. Through the registry, never a
+            // tool call, so the sweep's own housekeeping can never be mistaken
+            // for one of the calls under test. Already-settled is fine.
+            let _ = reg.withdraw_question(&g, "sweep", &id);
         }
     }
 
     // And the plausible names really are unknown, rather than existing and
     // merely refusing — the difference between a gate and a missing feature.
+    // Against a PENDING question, so "unknown tool" is the only reason left for
+    // the call to fail: aimed at a settled one, a real answer tool would refuse
+    // for its own reasons and read as absent when it is merely blocked.
     for name in ["answer_question", "answer_human", "orch_question_answer"] {
-        let out = q_call(&reg, &co, name, json!({ "id": "q-1", "answer": "x" }));
+        let id = ask_fresh(name);
+        let out = q_call(&reg, &co, name, json!({ "id": id, "answer": "x" }));
         assert_eq!(out["isError"], true);
         assert!(
             q_text(&out).contains("unknown tool"),
             "{name} must not exist at all on the MCP surface: {}",
             q_text(&out)
         );
+        let _ = reg.withdraw_question(&g, "sweep", &id);
     }
 }
 
