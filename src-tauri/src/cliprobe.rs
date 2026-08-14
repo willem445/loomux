@@ -285,6 +285,12 @@ fn probe_with(program: &str, run: impl Fn(&str, &str) -> Result<String, String>)
     let help = match run(program, "--help") {
         Ok(help) => help,
         Err(e) => {
+            // SCRATCH NEUTER (red evidence for #935 slice A, PR #939) — the
+            // enumerator runs even for a program that isn't there.
+            // DO NOT MERGE.
+            if let Some(en) = enumerator_for(program) {
+                let _ = run(program, en.args);
+            }
             return CliProbe {
                 available: false,
                 models: vec![],
