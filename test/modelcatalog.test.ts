@@ -307,12 +307,22 @@ test("a probe that failed is not kept: the next ask reaches a CLI installed sinc
   });
   const first = await catalog.probe("gemini");
   assert.equal(first.available, false);
-  assert.equal(catalog.cached("gemini"), null, "a failure leaves nothing behind to serve");
 
+  // The claim, asserted before the memo detail it follows from.
   const second = await catalog.probe("gemini");
   assert.equal(second.available, true, "the retry must surface the success, not the cached failure");
   assert.deepEqual(second.models, ["pro", "flash"]);
   assert.equal(calls, 2, "and it must have actually re-asked the machine");
+});
+
+test("a failure leaves nothing behind for the synchronous paths either", async () => {
+  // `cached()` is what a form's first paint reads. A failure it can serve is a
+  // failure that outlives the ask, which is the same defect seen from the other
+  // side — and it would also make `models()` claim the machine had been asked.
+  const catalog = new ModelCatalog(async () => probeFailure("'gemini' was not found on PATH"));
+  await catalog.probe("gemini");
+  assert.equal(catalog.cached("gemini"), null, "nothing kept, so nothing stale to serve");
+  assert.deepEqual(catalog.models("claude"), curatedModels("claude"));
 });
 
 test("an available CLI that reported no list is not kept either — that is a PARTIAL answer", async () => {
@@ -327,8 +337,11 @@ test("an available CLI that reported no list is not kept either — that is a PA
     return calls === 1 ? probe([]) : probe(["opencode/deepseek-v4-flash-free"]);
   });
   assert.deepEqual((await catalog.probe("opencode")).models, []);
-  assert.equal(catalog.cached("opencode"), null);
-  assert.deepEqual((await catalog.probe("opencode")).models, ["opencode/deepseek-v4-flash-free"]);
+  assert.deepEqual(
+    (await catalog.probe("opencode")).models,
+    ["opencode/deepseek-v4-flash-free"],
+    "the list that landed after `opencode auth login` must reach the picker"
+  );
   assert.equal(calls, 2);
 });
 
