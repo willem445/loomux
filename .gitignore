@@ -1,6 +1,9 @@
 node_modules/
 dist/
-src-tauri/target/
+# Cargo build output. At the WORKSPACE ROOT since #888 slice A1 — cargo keeps
+# one `target/` per workspace, next to the root manifest, not one per member.
+# Left unanchored so a member built in isolation is covered too.
+target/
 src-tauri/gen/schemas/
 *.log
 test-results/

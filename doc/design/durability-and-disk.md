@@ -15,7 +15,7 @@ free**. Two independent failures fell out of that one condition:
    existing task id read as `unknown task`. All 13 live tasks and their note
    threads were lost. A failed write was **destructive** instead of a no-op.
 2. **The disk filled in the first place** because every agent git-worktree that
-   runs `cargo check`/`cargo test` grows its own `src-tauri/target` cache at
+   runs `cargo check`/`cargo test` grows its own cargo `target/` cache at
    5–7 GB each. A day of orchestrated work left ~10 worktrees ≈ 50 GB of
    duplicate build caches, with nothing bounding or reclaiming them.
 

@@ -63,7 +63,13 @@ const execFileAsync = promisify(execFile);
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-const DEFAULT_EXE = path.resolve(__dirname, "../src-tauri/target/debug/loomux.exe");
+// Workspace-root `target/` since #888 slice A1 — the repo is a Cargo
+// workspace now, and cargo puts every member's output in the ROOT target dir,
+// so this is no longer under src-tauri/. ci.yml's LOOMUX_E2E_EXE says the same
+// thing for the CI run; test/workspacelayout.test.ts pins that the two agree,
+// because a drift here fails as "exe not found" long after the edit that
+// caused it.
+const DEFAULT_EXE = path.resolve(__dirname, "../target/debug/loomux.exe");
 const EXE_FROM_ENV = process.env.LOOMUX_E2E_EXE;
 const EXE = EXE_FROM_ENV ?? DEFAULT_EXE;
 

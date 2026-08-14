@@ -36,9 +36,13 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      # `.` since #888 slice A1: the Cargo workspace root is the repo root, so
+      # that is where Cargo.lock and target/ live. Pointing this at src-tauri
+      # would cache a directory that no longer holds either, i.e. cache
+      # nothing, silently and slowly.
       - uses: swatinem/rust-cache@v2
         with:
-          workspaces: src-tauri
+          workspaces: .
 
       - name: Install frontend dependencies
         run: npm ci
@@ -54,9 +58,12 @@ jobs:
       - name: Test frontend
         run: npm test
 
+      # `--workspace`, and run from the repo root, since #888 slice A1. Without
+      # the flag cargo would build only the package whose directory it was
+      # invoked in, so `crates/loomux-engine` would never be compiled by CI at
+      # all and a broken engine manifest could merge green.
       - name: Check backend
-        run: cargo check --locked
-        working-directory: src-tauri
+        run: cargo check --locked --workspace
 
       # #464: a whole-suite backstop the backend tests themselves can't
       # provide. A test can pin its OWN fixture's cleanup, but nothing
@@ -83,8 +90,7 @@ jobs:
           echo "LOOMUX_LEAK_BASELINE=$count" >> "$GITHUB_ENV"
 
       - name: Test backend
-        run: cargo test --locked
-        working-directory: src-tauri
+        run: cargo test --locked --workspace
 
       - name: Verify the backend test suite left no worktree fixtures behind (#464)
         if: always()
@@ -135,9 +141,10 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      # See the note on the build job's copy: workspace root is the repo root.
       - uses: swatinem/rust-cache@v2
         with:
-          workspaces: src-tauri
+          workspaces: .
 
       - name: Install frontend dependencies
         run: npm ci
@@ -178,7 +185,12 @@ jobs:
       - name: Run Playwright E2E suite
         run: npx playwright test
         env:
-          LOOMUX_E2E_EXE: ${{ github.workspace }}\src-tauri\target\debug\loomux.exe
+          # Workspace-root target/ since #888 slice A1 — cargo puts every
+          # member's build output in the ROOT target dir, so the exe is no
+          # longer under src-tauri/. Must stay in step with e2e/fixtures.ts's
+          # DEFAULT_EXE, which is what runs when this env var is unset;
+          # test/workspacelayout.test.ts pins that the two agree.
+          LOOMUX_E2E_EXE: ${{ github.workspace }}\target\debug\loomux.exe
 
       # If the suite above failed, surface a pointer to the debugging docs in
       # the job output itself — not just in a comment nobody reading the

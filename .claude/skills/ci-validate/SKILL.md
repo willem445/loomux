@@ -58,7 +58,9 @@ three build jobs before anything is learned. Bulk or script-generated edits
 are the usual source — a rewrite that cuts at the first `);` finds the one
 sitting inside a string literal (#558).
 
-**Run this before every push that touches `.rs` files**, from `src-tauri/`:
+**Run this before every push that touches `.rs` files**, from the repo root
+(paths are what matter to rustfmt, not the working directory, and `.rs` files
+now live in more than one crate):
 
 ```sh
 rustfmt --check --edition 2021 <changed .rs files> >/dev/null
@@ -69,8 +71,8 @@ dropped:
 
 - **`--edition 2021` is mandatory.** rustfmt's CLI defaults to edition 2015,
   where `async fn` is a hard parse error — without the flag you get
-  confident, wrong `error[E0670]`s on perfectly good code. The crate is
-  edition 2021 (`src-tauri/Cargo.toml`).
+  confident, wrong `error[E0670]`s on perfectly good code. Both crates are
+  edition 2021 (`src-tauri/Cargo.toml`, `crates/loomux-engine/Cargo.toml`).
 - **`>/dev/null` is deliberate — discard stdout, and the redirect is not
   optional.** `--check` prints a *formatting* diff (`Diff in …`) for anything
   not rustfmt-shaped, and this repo is deliberately not rustfmt-formatted:
@@ -139,8 +141,9 @@ have wasted. The definition of validated below is unchanged.
 ## The Cargo.lock exception
 
 One local command is permitted regardless of everything above: `cargo
-update --workspace` in `src-tauri/`, when the `release` skill has just
-bumped the version in `Cargo.toml`. CI's `cargo check --locked` only
+update --workspace` at the repo root (the Cargo workspace root), when the
+`release` skill has just bumped the version in `src-tauri/Cargo.toml`. CI's
+`cargo check --locked` only
 *verifies* the lock is consistent — `--locked` makes it fail rather than
 write anything back, so a stale lock can never self-heal from CI. Something
 has to regenerate the lockfile before it can be committed and pushed.

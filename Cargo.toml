@@ -1,0 +1,49 @@
+# Cargo workspace root (#888 slice A1 / #847 Phase 0).
+#
+# Until this file existed, `src-tauri` WAS the Rust build: one package, its own
+# `Cargo.lock`, its own `target/`. The remote-engine work (#888) needs a
+# headless Linux daemon that drives the orchestration core, and a daemon that
+# must build webkit2gtk in order to exist is not a deployment shape — so the
+# core has to become a crate that does not link Tauri, and that crate needs a
+# workspace to live in. This is it. `crates/loomux-engine` is deliberately
+# EMPTY at this slice: the scaffold and the module moves are separate,
+# separately reviewable steps. See doc/design/engine-extraction.md.
+#
+# `resolver = "2"` is stated explicitly because a VIRTUAL manifest does not
+# inherit the resolver implied by a member's `edition = "2021"` — cargo warns
+# and falls back to resolver 1, which unifies features across normal and
+# build dependencies differently. That is precisely the kind of change that
+# must not happen silently underneath the getrandom audit in
+# src-tauri/Cargo.toml, whose whole method is reasoning about which crates
+# reach the LINKED graph of the shipped binary.
+[workspace]
+resolver = "2"
+members = ["src-tauri", "crates/loomux-engine"]
+
+# THE RELEASE PROFILE HAS TO LIVE HERE, NOT IN src-tauri/Cargo.toml.
+#
+# Cargo reads `[profile.*]` from the workspace ROOT manifest only and ignores
+# it everywhere else ("profiles for the non root package will be ignored") —
+# a warning, not an error, so a release build would have gone on succeeding
+# while quietly dropping every setting below. That is a silent-downgrade trap
+# with real consequences: `lto`/`codegen-units` are the shipped binary's size
+# and speed, and `debug`/`strip` are what make a crash log's backtrace name
+# loomux's own functions (#53). test/workspacelayout.test.ts pins this so the
+# settings cannot drift back into the member manifest.
+#
+# Moved verbatim from src-tauri/Cargo.toml by #888 slice A1; the comment below
+# is the original rationale, unchanged.
+[profile.release]
+lto = true
+codegen-units = 1
+# Named backtrace frames in the panic hook's crash logs (issue #53). `debug` —
+# NOT `strip` — is what puts loomux's OWN functions in the debug info: without
+# it (release defaults to debug=false) the MSVC PDB carries only public symbols
+# and dbghelp resolves our frames as `__ImageBase`, even with the PDB adjacent.
+# `line-tables-only` adds function names + line numbers at a modest size cost;
+# `strip = "debuginfo"` then keeps the *exe* slim (debug info lives in the
+# standalone PDB / split debug, not the shipped binary). Net: build-tree and CI
+# backtraces are genuinely symbolicated; installed bundles stay address-only
+# until the PDB is shipped — see doc/design/crash-observability.md.
+debug = "line-tables-only"
+strip = "debuginfo"

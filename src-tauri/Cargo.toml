@@ -259,17 +259,9 @@ portable-pty = "0.9"
 # shipped binary. No new crate — tauri is already a normal dependency.
 tauri = { version = "2", features = ["test"] }
 
-[profile.release]
-lto = true
-codegen-units = 1
-# Named backtrace frames in the panic hook's crash logs (issue #53). `debug` —
-# NOT `strip` — is what puts loomux's OWN functions in the debug info: without
-# it (release defaults to debug=false) the MSVC PDB carries only public symbols
-# and dbghelp resolves our frames as `__ImageBase`, even with the PDB adjacent.
-# `line-tables-only` adds function names + line numbers at a modest size cost;
-# `strip = "debuginfo"` then keeps the *exe* slim (debug info lives in the
-# standalone PDB / split debug, not the shipped binary). Net: build-tree and CI
-# backtraces are genuinely symbolicated; installed bundles stay address-only
-# until the PDB is shipped — see doc/design/crash-observability.md.
-debug = "line-tables-only"
-strip = "debuginfo"
+# `[profile.release]` USED TO BE HERE and is now in the workspace-root
+# Cargo.toml (#888 slice A1). Cargo reads profiles from the root manifest only
+# and merely WARNS about a profile in a member, so leaving it here would have
+# silently dropped lto/codegen-units and the symbolicated-backtrace settings
+# (#53) from every release build. Don't move it back; see the root Cargo.toml
+# and doc/design/engine-extraction.md.

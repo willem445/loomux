@@ -1,0 +1,184 @@
+# Extracting the orchestration engine into its own crate
+
+Issue #847 (the investigation), #888 track A (the reason it is happening now).
+This note is the boundary argument: what `loomux-engine` is, what may cross into
+it, what must not, and the order the moves happen in. Slice A1 — the workspace
+scaffold — is the first step and the only one that has landed; the crate is
+empty on purpose.
+
+Related: `doc/design/architecture.md` (the module map), `doc/design/engine-transport.md`
+(#905 — the same cut line, on the frontend side), `doc/design/remote-engine-protocol.md`
+(#888 slice B1 — the wire contract the daemon will speak),
+`doc/design/groupid-and-path-roots.md` (#904).
+
+## 1. Why a crate, and why now
+
+`src-tauri` is one package whose library links Tauri. On Linux that means
+webkit2gtk. The remote-engine work needs a headless daemon that owns the PTYs,
+the registry, the board and the timers, and **a server that has to build a
+browser engine in order to exist is not a deployment shape** — it drags GUI
+system libraries onto a box that will never draw a pixel, and it makes the
+build's failure modes the desktop's failure modes.
+
+So the engine has to become something that compiles with no `tauri` in its
+dependency tree. That is the whole requirement, and it is the only one this
+extraction is trying to satisfy. It is worth saying what it is *not*: this is
+not a bid to publish a library, not a plugin API, and not an abstraction layer
+added because layering is tidy. #847 investigated it as a good idea in its own
+right and recommended holding at Phase 2 unless something needed Phase 3; #888
+is the something.
+
+The seams are already there, which is why this is a sequence of moves rather
+than a rewrite: the backend integration suite drives orchestration headless
+today, with `AppHandle` absent. The extraction makes that supported rather than
+incidental.
+
+## 2. The boundary
+
+**One rule, and everything else follows from it: `src-tauri` depends on
+`loomux-engine`; the arrow never points back.**
+
+In the engine:
+
+- the orchestration core — registry, task board, gates and verdicts, the
+  delivery/queue machinery, audit, the merge queue, workflow parsing, digests,
+  lessons, profiles, termgrid, notifications, the MCP server;
+- everything it needs from the host, expressed as a **trait the host
+  implements**.
+
+Staying in `src-tauri`:
+
+- every `#[tauri::command]`, the capability/ACL manifests, the webview;
+- the desktop implementations of those host traits;
+- the Windows-specific desktop surface (Job Objects, shell integration, PDH/DXGI
+  metrics, WASAPI voice).
+
+Two traits carry the whole relationship, and they arrive in slice A3 rather than
+here, because designing them against real call sites beats designing them
+against an empty crate:
+
+- **`EventSink`** — the engine emits typed events; the desktop implementation
+  forwards to `AppHandle::emit`, the daemon's serialises them onto the wire, and
+  the test one records them. This replaces ~27 direct `emit` sites.
+- **`PaneHost`** — the engine asks for a pane and writes to it; the desktop
+  implementation reaches the `PtyManager` in Tauri state, the daemon's owns the
+  PTYs directly. `NullPaneHost` replaces today's "if the app handle is `None`"
+  test branch, which is the same idea already, just spelled as an `Option`.
+
+The bar for both is **behavioural silence**: the existing integration suite
+green with no test edits. A trait swap that needs the tests rewritten to pass is
+a trait swap that changed behaviour.
+
+## 3. `GroupId` moves with the engine, and membership does not follow it
+
+#904 already did the hard part. `GroupId` is a validated newtype with one
+constructor, deserialisation routed through the same gate, and no
+`AsRef<Path>`; ids become paths in exactly one function. The reason that
+mattered was stated in that note and is worth restating here because the
+extraction is what makes it load-bearing: the old trust in `group_id` was a fact
+about the **transport** (only our own webview can invoke a command), and a crate
+consumer — let alone a network client — does not inherit that fact.
+
+So `groupid.rs` moves into the engine unchanged, and the engine's public API
+takes `GroupId`, never `&str`, wherever a group is named. A caller that has not
+parsed cannot call. That is the property, and it survives the move because it
+lives in the type rather than in the caller.
+
+What does **not** move with it: **membership is a separate check.** Holding a
+well-formed id says the string is safe to join onto a root; it says nothing
+about whether this caller may touch that group. Today the desktop answers that
+question by being the only caller. A daemon cannot, and #888's design note owns
+that answer — it is not smuggled in here as a side effect of the crate boundary.
+
+The remaining caller-supplied path identifiers (`ft_*`/`fm_*` roots, `repo`,
+`session_id`) are **#925**, not this work. They are a stated merge blocker for
+the listener slices. The extraction neither fixes nor worsens them; it just must
+not quietly move an unvalidated identifier into a place that looks more trusted
+than it is.
+
+## 4. Publish stance
+
+`publish = false`, version `0.0.0`, and deliberately **not** one of the seven
+version fields `scripts/check-versions.js` keeps in lockstep.
+
+The argument: a workspace-internal crate buys the entire architectural benefit —
+a compiler-enforced boundary, a dependency tree that can be audited, a daemon
+that can link it — with none of the crates.io stability tax. A published crate's
+API is a public contract with strangers and a semver obligation on every rename;
+this one's consumers are both in this repo. A version number on it would be a
+number nobody reads and one more thing a release bump could silently forget.
+
+If it is ever published, it joins the version check in the same commit that
+flips the flag. (Repo rules already make the crate's API a public contract for
+*this* repo's purposes, which is why this note exists at all.)
+
+Lint stances — `forbid(unsafe_code)` and friends — are deliberately **not** set
+yet. A blanket stance invented against an empty crate is a stance the module
+moves would have to fight or silently weaken; it belongs in the slice that can
+see the code it applies to.
+
+## 5. What slice A1 actually changed, and why the plumbing was the risk
+
+The code change is a virtual workspace manifest and an empty crate. The
+*interesting* change is that converting to a workspace moves three things that
+nothing in the Rust source mentions, each of which fails quietly:
+
+1. **The release profile.** Cargo reads `[profile.*]` from the workspace root
+   manifest and **ignores it in a member, with a warning rather than an error**.
+   Left in `src-tauri/Cargo.toml`, `lto`, `codegen-units` and the
+   `debug`/`strip` settings that make a crash backtrace name loomux's own
+   functions (#53) would have stopped applying to every release build while CI
+   stayed green. It moved to the root manifest.
+2. **The lockfile.** One `Cargo.lock` per workspace, at the root. A leftover
+   `src-tauri/Cargo.lock` would be a file cargo never updates again but which
+   still parses — and `check-versions.js` would have gone on reading a version
+   out of it. It moved, and the check follows it.
+3. **The build directory.** `target/` is at the workspace root now, which the
+   `.gitignore`, the rust-cache config in both workflows, ci.yml's
+   `LOOMUX_E2E_EXE` and `e2e/fixtures.ts`'s `DEFAULT_EXE` all had to learn. The
+   E2E pair is the nastiest of these: it is a `continue-on-error` job, so drift
+   surfaces as "exe not found" long after the edit that caused it.
+
+CI also gained `--workspace` on its cargo invocations. Without it cargo builds
+only the package in the invocation directory, so the engine crate would never
+have been compiled by CI at all and a broken manifest could merge green.
+
+`test/workspacelayout.test.ts` pins all of the above. It is a repo-file pin in
+the style of `releasepromote.test.ts`: none of these invariants is reachable
+from a unit test of product code, agents are banned from running cargo locally
+(#488), and every one of them fails silently rather than loudly.
+
+## 6. Order of the moves, and why it is strictly serial
+
+- **A1 — the scaffold** (this slice): workspace, empty crate, this note, the
+  plumbing above.
+- **A2 — the Tauri-free submodules.** Move the modules that already have no
+  Tauri in them; `mod.rs` re-exports so no caller changes. Small batches, one
+  PR each. Per-PR bar: CI green and `git diff --stat` showing moves plus import
+  lines only.
+- **A3 — the traits.** `EventSink` + `PaneHost`, `OrchRegistry` drops
+  `AppHandle`, `NullPaneHost` replaces the app-is-`None` branch. Per-PR bar: the
+  integration suite green with **zero test edits**, plus one new crate-level
+  test that drives a group headless end to end with nothing Tauri linked.
+- **A4 — the registry.** `OrchRegistry`, the decision layer, and a PTY
+  output-sink seam, so the crate compiles with no `tauri` anywhere in its tree.
+  A CI step proves that from `cargo tree` rather than from this paragraph. This
+  is the scoped subset of #847's Phase 3 the daemon needs, **not** the full
+  `mod.rs` split.
+
+They are serial because each rides the previous one's re-exports, and because
+`src-tauri/src/orchestration/mod.rs` is the highest-conflict file in the repo:
+two of these in flight at once is a merge-conflict machine, not parallelism.
+A2 and A4 in particular want a quiet board.
+
+Tests move with their modules. Note that inside the engine crate the
+comctl32-v6 manifest machinery does not apply — that constraint (CLAUDE.md #4)
+is about the Tauri app's Windows test executables, and
+`src-tauri/tests/smoke.rs` must keep existing for it regardless.
+
+## 7. Not in scope here
+
+No listener, no socket, no wire format, no authentication — those are #888
+tracks C and D, gated on the protocol note. The extraction is a pure refactor
+that makes them *possible*; it grants no new capability and opens no new surface
+by itself. If a slice of this work ever appears to, that is the bug.
