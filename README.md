@@ -202,8 +202,8 @@ npm run tauri build  # produce a distributable app / installer
 npm test             # frontend unit tests (Node's built-in runner)
 ```
 
-Backend checks (what CI gates on) run from `src-tauri/`: `cargo check --locked`
-and `cargo test --locked`.
+Backend checks (what CI gates on) run from the repo root: `cargo check --locked
+--workspace` and `cargo test --locked --workspace`.
 
 - **[`CLAUDE.md`](CLAUDE.md)** — hard constraints and code conventions. Read it
   before changing code.
