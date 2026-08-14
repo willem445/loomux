@@ -38,7 +38,10 @@ src-tauri/src/
   sessions.rs       agent session discovery (one collect_*_candidates fn per file-backed source, plus scan_opencode for the one that is a SQLite store); metadata-first + a persisted head-parse index (session-index.json) so a long history costs a stat, not a parse (#493). See doc/design/session-index.md
   orchestration/    agent groups: registry, guardrails, MCP server, audit. Four agent-CLI
     adapters (claude, copilot, gemini, opencode) whose per-CLI differences live as DATA in
-    `CLI_CAPS` rather than as `if cli == …` at a call site; opencode's whole seam — an
+    `CLI_CAPS` rather than as `if cli == …` at a call site — that table, the capability
+    class (`Role`) and the deny tier it selects (`Containment`) now live in
+    crates/loomux-engine (#888 slice A2 batch 4) and are re-exported here, so every
+    `orchestration::` spelling of them resolves unchanged; opencode's whole seam — an
     env-delivered config document, its permission-key containment and its per-group session
     store — is `doc/design/opencode.md`. Compact-survival is
     layered (#329, #416, #417): a durable role CONTRACT riding the CLI's own system-prompt layer

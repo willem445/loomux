@@ -519,7 +519,7 @@ pub fn cli_can_host(cli: &str, role: Role) -> Result<(), String> {
 /// best model ("auto"); on Claude the reasoning-heavy classes (orchestrator,
 /// planner) get the strong tier and the executing ones (worker, reviewer) the
 /// mid tier.
-pub(crate) fn default_model(cli: &str, role: Role) -> &'static str {
+pub fn default_model(cli: &str, role: Role) -> &'static str {
     if cli == "copilot" {
         return "auto";
     }
@@ -563,8 +563,104 @@ pub(crate) fn default_model(cli: &str, role: Role) -> &'static str {
 /// a block reads as "inherit the class default for my CLI" (`workflow::model_of`).
 /// The workflow parser needs this because a block's *effective* CLI isn't known
 /// until the group default is in hand.
-pub(crate) fn sanitize_model_opt(m: &str) -> String {
+pub fn sanitize_model_opt(m: &str) -> String {
     m.chars()
         .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '/'))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The wire/label name of every capability class, written out once as
+    /// literals rather than derived from either producer.
+    ///
+    /// Deriving the expectation from `as_str()` would pin `Serialize` to
+    /// whatever `as_str` happens to say, and vice versa — the table has to be a
+    /// third party or neither test means anything. These five strings are a
+    /// **persisted and cross-process contract**: they are what `agents.json`
+    /// carries between app launches, what `list_agents`/`session_roles` hand
+    /// the webview, and what the frontend matches on to decide a roster row's
+    /// badge. Changing one is a breaking change to a state file, not a rename.
+    const WIRE_NAMES: [(Role, &str); 5] = [
+        (Role::Orchestrator, "orchestrator"),
+        (Role::Worker, "worker"),
+        (Role::Reviewer, "reviewer"),
+        (Role::Planner, "planner"),
+        (Role::Solo, "solo"),
+    ];
+
+    /// `Role`'s serde form is `rename_all = "lowercase"`, and this is what
+    /// makes that attribute load-bearing rather than decorative.
+    ///
+    /// The integration suite reaches this representation only through
+    /// `list_agents`, and only for the three classes it happens to spawn and
+    /// read back (`a["role"] == "worker" | "reviewer" | "planner"` in
+    /// `src-tauri/tests/orchestration.rs`). `Orchestrator` and `Solo` have no
+    /// such assertion anywhere: an `#[serde(rename = "…")]` on either variant
+    /// would change what every future `agents.json` records for it and the
+    /// whole suite would stay green. That gap is per-variant, so it needs a
+    /// per-variant pin.
+    #[test]
+    fn every_role_variant_serializes_to_its_documented_lowercase_wire_name() {
+        for (role, want) in WIRE_NAMES {
+            let got = serde_json::to_value(role).expect("Role is Serialize");
+            assert_eq!(
+                got,
+                serde_json::Value::String(want.to_string()),
+                "{role:?} serializes to {got} — the wire name is persisted in agents.json and \
+                 matched by the frontend, so renaming a variant's serde form silently \
+                 reinterprets every group already on disk"
+            );
+        }
+    }
+
+    /// `as_str`'s own doc says it "matches the `Serialize` rename". Until this
+    /// test that was an unenforced claim in a comment, and the two producers
+    /// are genuinely independent — `as_str` is a hand-written `match`, the
+    /// serde form is an attribute — so nothing stopped one from drifting.
+    ///
+    /// They are not interchangeable in practice, which is why both matter:
+    /// `session_roles` records a roster row through `as_str`, while
+    /// `list_agents` emits the same agent's class through `Serialize`. A drift
+    /// between them is a session browser and a roster disagreeing about what
+    /// one agent is.
+    #[test]
+    fn as_str_returns_the_same_wire_name_serialization_does() {
+        for (role, want) in WIRE_NAMES {
+            assert_eq!(
+                role.as_str(),
+                want,
+                "{role:?}.as_str() drifted from the wire name its doc promises to match"
+            );
+        }
+    }
+
+    /// The containment ladder, per class. `Role::containment` is the security
+    /// spine of #222 — a workflow file selects a class and can never select a
+    /// tier — so the mapping is asserted here as a table rather than left to
+    /// whichever spawn-path test happens to observe a deny flag.
+    ///
+    /// The `Solo` row is the one worth naming: it is `None`, and that is a
+    /// statement about reachability (a solo pane never traverses a loomux
+    /// spawn) rather than a grant. If `Solo` ever *does* reach a spawn path,
+    /// this row is where the decision has to be made deliberately.
+    #[test]
+    fn every_role_variant_maps_to_its_documented_containment_tier() {
+        let want = [
+            (Role::Orchestrator, Containment::None),
+            (Role::Worker, Containment::None),
+            (Role::Reviewer, Containment::NoEdits),
+            (Role::Planner, Containment::ReadOnly),
+            (Role::Solo, Containment::None),
+        ];
+        for (role, tier) in want {
+            assert_eq!(role.containment(), tier, "{role:?} changed containment tier");
+        }
+        // And the ladder the gate compares on is ordered, since `cli_can_host`
+        // is one `rank()` comparison and nothing else.
+        assert!(Containment::None.rank() < Containment::NoEdits.rank());
+        assert!(Containment::NoEdits.rank() < Containment::ReadOnly.rank());
+    }
 }

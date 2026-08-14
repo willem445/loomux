@@ -163,8 +163,11 @@ from a unit test of product code, agents are banned from running cargo locally
 - **A2 — the Tauri-free submodules.** Move the modules that already have no
   Tauri in them; `mod.rs` re-exports so no caller changes. Small batches, one
   PR each. Per-PR bar: CI green and `git diff --stat` showing moves plus import
-  lines only — with one stated exception, batch 2, whose move changes what a
-  source-scanning test can see and therefore has to edit that test (below).
+  lines only — except where a batch states otherwise and argues it. Two have:
+  batch 2, whose move changed what a source-scanning test could see and so had
+  to edit that test, and batch 4, which found a wire contract the suite did not
+  pin per variant and added the test rather than claiming the exemption over it
+  (both below).
 
   **The batch order is a dependency order, not a size order**, and "Tauri-free"
   turned out to be the weaker of the two tests. Every module in the A2 set is
@@ -246,6 +249,90 @@ from a unit test of product code, agents are banned from running cargo locally
     Pure relocation otherwise: no tripwire watches either helper, the moved
     modules' inline tests moved with them, and the integration suite stayed
     green with no test-logic edits — which is what the re-exports are for.
+  - **Batch 4 — the shared data model** (`Role`, `Containment`, `CliCaps`,
+    `SUPPORTED_CLIS`, `CLI_CAPS`, `EFFORT_LEVELS`, `CONTEXT_VARIANTS`,
+    `cli_caps`, `cli_can_host`, `default_model`, `sanitize_model_opt`), lifted
+    out of `mod.rs` into `loomux-engine`'s `model` module.
+
+    **The first batch that moved something for the sake of what comes next**
+    rather than because it had run out of edges. Batches 1–3 asked "what can
+    move alone?"; this one asks "what has to be on the far side before
+    `workflow` can move at all?" — and the answer is every symbol above.
+    `Role` is a block's `kind:`; `CLI_CAPS` backs the knob remedies
+    `parse_workflow` puts in its error messages; `EFFORT_LEVELS` and
+    `CONTEXT_VARIANTS` are the closed vocabularies it rejects against;
+    `sanitize_model_opt` normalises a block's `model:`. Move `workflow` first
+    and all of that reaches back into `src-tauri` — the arrow pointing the
+    wrong way in the module that most needs it not to. Data before the code
+    that reads it is the ordering rule the rest of A2 should expect.
+
+    ### `Role::template()` stays behind, and that is the design decision
+
+    `Role` had two inherent methods welded to `include_str!("templates/*.md")`,
+    and those four files are byte-pinned by `src-tauri/tests/fixtures/pre222/`
+    with its own human re-bless procedure (see that directory's README).
+
+    An inherent impl must live in the crate that defines its type. So carrying
+    `template()`/`instructions_file()` along would have dragged `templates/*.md`
+    — **and the fixture root that blesses them** — into `loomux-engine` as a
+    side effect of moving an enum. Nothing would have failed. `cargo check` has
+    no opinion about where a fixture root lives, the fixtures would have gone on
+    passing from their new home, and the two surfaces that name the path (the
+    README's procedure, CLAUDE.md's role-template convention) would have become
+    quietly wrong. Product content and its blessing procedure are not something
+    a refactor gets to relocate silently.
+
+    So they are **free functions that stay in `src-tauri`**, next to the content
+    they load: `role_template(Role) -> &'static str` and
+    `role_instructions_file(Role) -> &'static str`. The price is a call-site
+    rewrite, and the price is the argument: every missed site is a **build
+    error**, on CI, before a human reads the diff. Given a choice between a
+    mechanical failure the compiler enumerates and a silent one no test watches,
+    take the loud one.
+
+    Read this against batch 2 rather than instead of it — they are the same
+    question answered in opposite directions. There, a source-scanning tripwire
+    had to **follow** `GroupId` across the boundary, because the orphan rule
+    moved the only place its violation could be written. Here, content had to
+    **stay**, because an inherent impl would have moved the only place its
+    mapping could be written. Neither "move everything with the type" nor "move
+    nothing but data" is the rule. The rule is: **for each item on a moving
+    type, ask whether it is the type's data or somebody else's content** — and
+    where the answer is content, ask what stops noticing if it travels.
+
+    Two smaller costs, both instances of things earlier batches already named.
+    `Role::prefix` and `Role::as_str` were `pub(crate)`; a method's visibility
+    belongs to the crate defining the type, so no re-export narrows them back
+    and they are public API now. `default_model` and `sanitize_model_opt` were
+    `pub(crate)` too, but they are free functions, so the re-export keeps them
+    `pub(crate)` on this side exactly as batch 3 did for `tail_snippet`.
+
+    ### What it owed in evidence, and what it did not
+
+    The batch is a relocation, but it does not take the pure-move exemption
+    whole, and the split above is why: the exemption is for a move *the existing
+    suite already pins*, so the honest move is to establish that separately for
+    each thing the move could break.
+
+    - The **`Role` → template/file mapping** is genuinely pinned.
+      `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was`
+      writes a default group's instruction files and byte-compares all four
+      against `tests/fixtures/pre222/`, which covers the file *name* and the
+      template *bytes* for every class that has them. The free-function rewrite
+      cannot silently mis-map a role without reddening it.
+    - `Role`'s **serde form** was not, per variant. The integration suite reaches
+      it only through `list_agents`, and only for the three classes it happens to
+      spawn and read back — `Orchestrator` and `Solo` had no wire assertion
+      anywhere, so a rename on either would have changed what every future
+      `agents.json` records while the whole suite stayed green. Nor did anything
+      enforce `as_str`'s own claim to "match the `Serialize` rename", though
+      `session_roles` records a class through one producer and `list_agents`
+      emits it through the other.
+
+    So the gap got the test, not a paragraph: `model`'s inline unit tests pin
+    all five variants against a literal wire table (a third party to both
+    producers, since deriving either from the other pins nothing), and the
+    containment tier per class alongside them.
   - **`digest` is not a leaf** despite reading like one. It calls
     `crate::sessions::yaml_field` and takes a `crate::opencodedb::TranscriptRow`
     — two modules staying in `src-tauri` — so it cannot move until those edges
