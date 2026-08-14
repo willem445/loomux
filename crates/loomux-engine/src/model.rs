@@ -120,7 +120,7 @@ impl Role {
             Role::Worker => "worker",
             Role::Reviewer => "reviewer",
             Role::Planner => "planner",
-            Role::Solo => "solo",
+            Role::Solo => "solo-pane",
         }
     }
     /// The **deny tier** this class launches its CLI under — the single place
