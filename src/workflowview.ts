@@ -96,6 +96,7 @@ import { appVersion } from "./pty";
 import { closeDecision, discardEdits, type ConflictChoice } from "./dirtystate";
 import { showToast } from "./toast";
 import { modal, promptModal } from "./modal";
+import { IDENTITY, SEMANTIC } from "./theme.ts";
 
 /** What the hosting pane provides. Only one host today (the workflow PANE — a workflow
  *  builder is a station you keep open beside an agent, never a glance-and-dismiss
@@ -1785,7 +1786,14 @@ export class WorkflowView {
     root.setAttribute("height", String(height));
 
     const defs = svg("defs");
-    defs.append(arrowMarker("wf-arrow", "#6b7394"), arrowMarker("wf-arrow-gate", "#e0af68"));
+    // An SVG <marker>'s fill is a presentation attribute on an element the stylesheet does
+    // not reach, so these two take their values from theme.ts directly rather than through a
+    // custom property (#879 slice B). They mirror `.wf-edge` / `.wf-edge-gate` in styles.css:
+    // a plain edge is a faint rule, a gate edge is the identity amber the gate lane uses.
+    defs.append(
+      arrowMarker("wf-arrow", SEMANTIC.inkFaint),
+      arrowMarker("wf-arrow-gate", IDENTITY.amber)
+    );
     root.append(defs);
 
     // ---- advisory edges: solid, selectable, erasable ----

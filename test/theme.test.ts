@@ -19,7 +19,7 @@
 // would notice. Run `npm test`.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import {
   ANSI_SLOTS,
   CSS_TOKENS,
@@ -34,6 +34,22 @@ import {
 const read = (rel: string) => readFileSync(new URL(rel, import.meta.url), "utf8");
 const stripCssComments = (s: string) => s.replace(/\/\*[\s\S]*?\*\//g, "");
 const HEX = /^#[0-9a-f]{6}$/;
+
+/**
+ * The body of the stylesheet's `:root` block, and the split point between the token layer
+ * and everything below it.
+ *
+ * ONE reader for both pins, anchored on a closing brace in COLUMN ZERO — the stylesheet's
+ * own convention for the end of a top-level rule. The two pins below used to carry a regex
+ * each, one of them ending at the first `}` it met anywhere; that one would have taken a
+ * nested block or a braced value as the end of the token layer and then happily reported
+ * every token after it "undeclared". Same text, one place, no second reading of it.
+ */
+function splitAtRoot(css: string): { tokens: string; below: string } {
+  const m = css.match(/^:root\s*\{([\s\S]*?)^\}/m);
+  assert.ok(m, "styles.css has no :root block — the token layer is the first thing in it");
+  return { tokens: m[1], below: css.slice(m.index! + m[0].length) };
+}
 
 // WCAG relative luminance / contrast. The design note (doc/design/ui-redesign.md) makes
 // contrast PROMISES about this palette; a promise nobody measures is prose.
@@ -179,10 +195,8 @@ test("no ANSI colour disappears into the terminal background", () => {
 
 test("the stylesheet declares every pinned token, with theme.ts's value", () => {
   const css = stripCssComments(read("../src/styles.css"));
-  const root = css.match(/:root\s*\{([\s\S]*?)\}/);
-  assert.ok(root, "styles.css has no :root block — the token layer is the first thing in it");
   const declared = new Map<string, string>();
-  for (const [, name, value] of root[1].matchAll(/(--[a-z0-9-]+)\s*:\s*([^;]+);/g)) {
+  for (const [, name, value] of splitAtRoot(css).tokens.matchAll(/(--[a-z0-9-]+)\s*:\s*([^;]+);/g)) {
     declared.set(name, value.trim());
   }
   for (const [name, expected] of Object.entries(CSS_TOKENS)) {
@@ -196,26 +210,21 @@ test("the stylesheet declares every pinned token, with theme.ts's value", () => 
 
 // The pin above runs theme.ts -> stylesheet. On its own that is one-directional: a token
 // minted straight into `:root` with a literal value is a FOURTH copy of a colour, and it
-// stays green because nothing walks the stylesheet back into CSS_TOKENS. Slice B mints
-// tokens by the dozen while migrating ~387 literals, which is exactly when that hole gets
-// used. So walk it the other way too: every raw colour declared in `:root` must be pinned.
+// stays green because nothing walks the stylesheet back into CSS_TOKENS. So walk it the
+// other way too: every raw colour declared in `:root` must be pinned.
 //
-// A `var(...)` value is not a raw colour — it is an alias onto something already pinned,
-// which is what the legacy bridge is made of, so the bridge passes this without exception.
-const BRIDGE_LITERALS = new Set([
-  // The one bridge declaration that is a literal rather than an alias: an alpha companion
-  // to --accent, which CSS cannot derive from a hex custom property without color-mix.
-  // It dies with the bridge in slice B, and no new entry may be added to this set.
-  "--accent-glow",
-]);
+// A `var(...)` value is not a raw colour — it is an alias onto something already pinned.
+// The set below is empty and stays empty: it held `--accent-glow`, the one alpha companion
+// the pre-token stylesheet could not express, and slice B retired it along with the rest of
+// the legacy bridge. An alpha step is now `color-mix(in srgb, var(--token) N%, transparent)`
+// at the call site, which is an expression over a pinned colour rather than a new one.
+const BRIDGE_LITERALS = new Set<string>([]);
 const RAW_COLOUR = /^(#|(rgba?|hsla?|hwb|lab|lch|oklab|oklch|color)\()/i;
 
 test("no colour enters :root without a pin in theme.ts", () => {
   const css = stripCssComments(read("../src/styles.css"));
-  const root = css.match(/:root\s*\{([\s\S]*?)\n\}/);
-  assert.ok(root, "styles.css has no :root block");
   const unpinned: string[] = [];
-  for (const [, name, value] of root[1].matchAll(/(--[a-z0-9-]+)\s*:\s*([^;]+);/g)) {
+  for (const [, name, value] of splitAtRoot(css).tokens.matchAll(/(--[a-z0-9-]+)\s*:\s*([^;]+);/g)) {
     const v = value.trim();
     if (!RAW_COLOUR.test(v)) continue;
     if (name in CSS_TOKENS || BRIDGE_LITERALS.has(name)) continue;
@@ -226,6 +235,95 @@ test("no colour enters :root without a pin in theme.ts", () => {
     [],
     "these :root colours exist nowhere in theme.ts, so nothing keeps them equal to the " +
       `pre-paint block or the terminal: ${unpinned.join("; ")}`
+  );
+});
+
+// --- the migration guard (#879 slice B) --------------------------------------------------
+//
+// Maintainability rule 1 of the design brief is "no raw colour outside the token block in
+// src/styles.css". Slice A could only WRITE that rule down; 401 literals below the block
+// were still painting the app in a palette the brief renounces, so the rule was prose. This
+// is the rule as a measurement.
+//
+// A literal is a hex (#rgb / #rgba / #rrggbb / #rrggbbaa) or an rgb()/rgba() function. A
+// `color-mix()` over a token is NOT a literal: it is an expression whose colour input is
+// already pinned, which is exactly how a surface reaches an alpha step without minting a
+// fourth copy of a hue.
+const CSS_LITERAL = /#[0-9a-fA-F]{3,8}\b|\brgba?\(\s*[0-9.]+\s*,\s*[0-9.]+\s*,\s*[0-9.]+/g;
+
+test("no raw colour survives below the token block in styles.css", () => {
+  const below = splitAtRoot(stripCssComments(read("../src/styles.css"))).below;
+  const found: string[] = [];
+  for (const line of below.split(/\r?\n/)) {
+    for (const m of line.matchAll(CSS_LITERAL)) {
+      // #194-style issue refs never reach here (comments are stripped), but a 5- or
+      // 7-character run of hex digits is not a colour either.
+      if (m[0].startsWith("#") && ![4, 5, 7, 9].includes(m[0].length)) continue;
+      found.push(`${m[0]}  in  ${line.trim().slice(0, 90)}`);
+    }
+  }
+  assert.deepEqual(
+    found,
+    [],
+    `${found.length} raw colour(s) below the token block — a surface that hard-codes a hue ` +
+      "is a surface the palette cannot move, and it declares no channel, so nobody can tell " +
+      `whether it means state, interaction or identity:\n${found.join("\n")}`
+  );
+});
+
+test("no value from the retired Tokyo Night palette survives anywhere in src/", () => {
+  // The brief renounces this palette by name: borrowing a well-liked theme is how an app
+  // ends up with someone else's identity and no argument for any of it. These eight values
+  // ARE that theme — the six the stylesheet used, plus the two extra git-graph lanes — and
+  // catching them by value is what makes "renounced" checkable. A migration that misses one
+  // leaves a surface speaking the old palette while everything around it moved, which is the
+  // half-retired look slice B exists to end, and which nothing else in this repo would see.
+  const RETIRED: Record<string, string> = {
+    "#7aa2f7": "blue", "#9ece6a": "green", "#e0af68": "amber", "#bb9af7": "magenta",
+    "#7dcfff": "cyan", "#f7768e": "red", "#73daca": "teal", "#ff9e64": "orange",
+  };
+  const rgbOf = (hex: string) =>
+    [1, 3, 5].map((i) => Number.parseInt(hex.slice(i, i + 2), 16)).join(", ");
+
+  const dir = new URL("../src/", import.meta.url);
+  const files = readdirSync(dir).filter((f) => f.endsWith(".ts") || f === "styles.css");
+  assert.ok(files.length > 40, "the src/ sweep found almost nothing — is the path still right?");
+
+  const survivors: string[] = [];
+  for (const file of files) {
+    const text = readFileSync(new URL(file, dir), "utf8");
+    text.split(/\r?\n/).forEach((line, i) => {
+      // A hex quoted in prose is a doc, not a paint: only lines that are code count. The
+      // stylesheet's comments are `/* */`, TypeScript's are `//` and `*`.
+      const code = line.replace(/\/\/.*$/, "").trim();
+      if (code.startsWith("*") || code.startsWith("/*")) return;
+      for (const [hex, name] of Object.entries(RETIRED)) {
+        if (code.toLowerCase().includes(hex) || code.includes(rgbOf(hex))) {
+          survivors.push(`src/${file}:${i + 1} — Tokyo Night ${name} (${hex}): ${code.slice(0, 80)}`);
+        }
+      }
+    });
+  }
+  assert.deepEqual(
+    survivors,
+    [],
+    `the retired palette is still painting ${survivors.length} place(s):\n${survivors.join("\n")}`
+  );
+});
+
+test("no rule names a token from the retired legacy bridge", () => {
+  // Slice A's eleven aliases were declared temporary in their own comment and deleted by
+  // slice B. A `var(--panel)` that survives the deletion resolves to NOTHING — CSS drops the
+  // whole declaration and the surface silently loses its background, with no error anywhere.
+  const css = stripCssComments(read("../src/styles.css"));
+  const bridge =
+    /var\(\s*--(bg-app|bg-term|panel|panel-2|border|border-soft|text|text-dim|accent-dim|accent-glow|danger)(?![-a-z0-9])/g;
+  const used = [...css.matchAll(bridge)].map((m) => `--${m[1]}`);
+  assert.deepEqual(
+    [...new Set(used)],
+    [],
+    "these retired bridge names are still referenced, and each one resolves to nothing: " +
+      [...new Set(used)].join(", ")
   );
 });
 
