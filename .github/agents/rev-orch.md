@@ -28,7 +28,8 @@ Every finding gets `file:line`, a concrete failure scenario (inputs/state → wr
 result), and a fix small enough to be obvious.
 
 **Run the suites on the head** and cite the counts:
-`cargo check --locked` and `cargo test --locked` in `src-tauri/`.
+`cargo check --locked --workspace` and `cargo test --locked --workspace`,
+from the repo root.
 Never spawn `claude` or `copilot` to check anything — that burns the human's paid
 credits. Tests fake the agent side instead.
 

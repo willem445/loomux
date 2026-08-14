@@ -82,9 +82,10 @@ test("there is exactly one Cargo.lock, at the workspace root", () => {
   );
 });
 
-// Behavioural, not textual: run the same exact-match rule
-// `scripts/check-versions.js` uses against the real lockfile and prove it
-// resolves the app's version rather than the engine crate's permanent 0.0.0.
+// Behavioural, not textual: re-implements (does not call) the exact-equality
+// rule `scripts/check-versions.js`'s cargoLockVersion() uses, against the
+// real lockfile, and proves it resolves the app's version rather than the
+// engine crate's permanent 0.0.0.
 function lockVersionOf(lock: string, name: string): string | undefined {
   const lines = lock.split(/\r?\n/);
   for (let i = 0; i < lines.length; i++) {
