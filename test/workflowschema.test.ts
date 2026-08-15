@@ -29,9 +29,7 @@ import {
   RESOURCE_MAX_HOLD_MINUTES_MIN,
   RESOURCE_MAX_HOLD_MINUTES_MAX,
   RESOURCES_MAX,
-  MERGE_QUEUE_MAX_BATCH_MIN,
-  MERGE_QUEUE_CHECKS_TIMEOUT_MIN,
-  MERGE_QUEUE_CHECKS_TIMEOUT_MAX,
+  POLICY_BOUNDS,
   type Workflow,
 } from "../src/workflowmodel.ts";
 import { DEFAULT_HOLD } from "../src/issuesmodel.ts";
@@ -280,9 +278,18 @@ through this emitter, so a field it skips is a line the pane deletes:\n${text}`
 //
 // Slice A owns this list; slice C (descriptor-driven config forms) empties it as each
 // control lands, replacing FIELDS_WITH_AN_EDITOR with the real descriptor registry it
-// builds. Until then the assertions still bite in the direction that matters: a field
-// added to the schema with no decision recorded about its editor is RED, and an entry
-// left behind after its control ships is RED too.
+// builds.
+//
+// **These two lists track the DESCRIPTOR REGISTRY, not hand-built forms** — worth saying
+// out loud, because the gap is now wide enough to mislead (#1020 review, finding 8). Most
+// of `FIELDS_WITHOUT_AN_EDITOR` has had a hand-written control in `workflowview.ts` for a
+// long time: `block.id`/`name`/`kind`/`cli`/`model` and `gate.require`/`reviewers`/`also`
+// since #222, and `intake.*`, `merge_queue.*`, `resource.*`, `block.allow` and
+// `block.role_hint` since #1020. Nothing here compares against an actual control, so an
+// entry left behind after its form ships does NOT redden — all four assertions below are
+// list hygiene (membership in the manifest, no overlap, no gaps). What still bites, and is
+// the reason to keep them: a field added to the schema with no decision recorded about its
+// editor is RED.
 
 /** Claimed by a form control today. Slice C fills this from its descriptor registry.
  *
@@ -507,21 +514,36 @@ const bound = (section: string, field: string): SchemaField => {
 };
 
 test("every bound the pane clamps to is the bound the manifest declares (#1020)", () => {
-  assert.deepEqual(
-    [bound("resource", "slots").min, bound("resource", "slots").max],
-    [RESOURCE_SLOTS_MIN, RESOURCE_SLOTS_MAX]
+  // Over the TABLE the forms actually read, not over a hand-written list of the fields I
+  // remembered to check — that distinction is the whole finding this test grew from
+  // (review finding 2): `merge_queue.max_batch` was clamped to a literal `64` in the form,
+  // a ceiling no engine constant and no manifest row declares, and the earlier version of
+  // this test could not see it because it asserted only the bounds it named.
+  for (const [id, bounds] of Object.entries(POLICY_BOUNDS)) {
+    const [section, field] = id.split(".") as [string, string];
+    const declared = bound(section, field);
+    assert.equal(bounds.min, declared.min, `${id}: min`);
+    // **`max` is compared including its ABSENCE.** A manifest row with no `max` means the
+    // engine imposes no ceiling, so a `max` in the table is a number the pane invented —
+    // and a form that clamps to an invented ceiling silently rewrites a legal file.
+    assert.equal(
+      bounds.max,
+      declared.max,
+      `${id}: max — the manifest ${declared.max === undefined ? "declares NO ceiling, so the pane must not clamp to one" : `declares ${declared.max}`}`
+    );
+  }
+  // The other direction: a manifest bound the forms don't read is a field whose form can
+  // write a value the engine refuses. Every numeric field carrying a bound must be in the
+  // table (`workflow.version` and the string fields carry none, so they are not expected).
+  const boundedFields = sections.flatMap(([section, s]) =>
+    s.fields
+      .filter((f) => f.type === "number" && (f.min !== undefined || f.max !== undefined))
+      .map((f) => `${section}.${f.name}`)
   );
   assert.deepEqual(
-    [bound("resource", "max_hold_minutes").min, bound("resource", "max_hold_minutes").max],
-    [RESOURCE_MAX_HOLD_MINUTES_MIN, RESOURCE_MAX_HOLD_MINUTES_MAX]
-  );
-  assert.equal(bound("merge_queue", "max_batch").min, MERGE_QUEUE_MAX_BATCH_MIN);
-  assert.deepEqual(
-    [
-      bound("merge_queue", "checks_timeout_minutes").min,
-      bound("merge_queue", "checks_timeout_minutes").max,
-    ],
-    [MERGE_QUEUE_CHECKS_TIMEOUT_MIN, MERGE_QUEUE_CHECKS_TIMEOUT_MAX]
+    boundedFields.filter((id) => !(id in POLICY_BOUNDS)),
+    [],
+    "a manifest field with a bound that no form reads — its form can write what the engine refuses"
   );
   // The one cardinality cap: an "add a resource" button that writes a 33rd entry produces a
   // file the engine refuses whole, so the form disables itself at exactly this number.

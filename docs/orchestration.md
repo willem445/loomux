@@ -926,12 +926,15 @@ whatever loomux defaults to for its kind on its CLI — `sonnet`/`opus` on
 Claude Code, `auto` on Copilot, `pro` on Gemini, and on OpenCode no `--model`
 at all, so your own config decides.
 
-**Everything in the file is editable in the pane.** Beside the roster's block
-rows and its merge-gate row sit three more: **Intake**, **Merge queue** and
-**Resources** — the same `intake:`, `merge_queue:` and `resources:` blocks
+**Every setting in the file is editable in the pane.** Beside the roster's
+block rows and its merge-gate row sit three more: **Intake**, **Merge queue**
+and **Resources** — the same `intake:`, `merge_queue:` and `resources:` blocks
 described elsewhere on this page, each with an enable-toggle and its fields.
 The block form covers the rest: `role_hint`, and `allow:` as a list of tool
-patterns (one row per pattern, because a real pattern contains commas).
+patterns (one row per pattern, because a real pattern contains commas). The one
+key with no control is `authored_with:`, and deliberately — it records which
+loomux *created* the file, is stamped once, and a save must never invent or
+restamp it.
 
 Two things those forms will not let you do, because loomux's engine would
 refuse the file: write a number outside a field's range (the inputs clamp —

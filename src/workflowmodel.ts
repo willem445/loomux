@@ -226,11 +226,55 @@ export const RESOURCE_MAX_HOLD_MINUTES_MIN = 1;
 export const RESOURCE_MAX_HOLD_MINUTES_MAX = 480;
 export const RESOURCES_MAX = 32;
 export const MERGE_QUEUE_MAX_BATCH_MIN = 1;
+/** A threshold gate needs at least one passing review — `fact("gate.threshold", "min", 1)`
+ *  on the engine, and the floor `validateWorkflow` has always enforced. */
+export const GATE_THRESHOLD_MIN = 1;
 /** `checks_timeout_minutes` is the one policy number the engine CLAMPS rather than
  *  refuses (`clamp_expires_minutes`), so a value outside this range is a warning here,
  *  not an error: the file loads, it just doesn't do what it says. */
 export const MERGE_QUEUE_CHECKS_TIMEOUT_MIN = 5;
 export const MERGE_QUEUE_CHECKS_TIMEOUT_MAX = 240;
+
+/** One numeric field's range. `max` is OPTIONAL and its absence is a statement: the
+ *  engine imposes no ceiling on that field, so neither may a form. */
+export interface FieldBounds {
+  min: number;
+  max?: number;
+}
+
+/** Every bounded number a policy form writes, keyed by its manifest field id.
+ *
+ *  This table exists because a bound that lives as a literal at the point of use is a
+ *  bound nothing can check (#1020 review, finding 2): `merge_queue.max_batch` was clamped
+ *  to a hand-typed `64` in the form — a ceiling the engine does not impose and the
+ *  manifest does not declare — so typing `100` silently wrote `64` into the file, and no
+ *  test in the tree could see it. The table is the fix in kind rather than in degree: the
+ *  forms read their bounds from HERE, `test/workflowschema.test.ts` pins every entry
+ *  against `src/workflow-schema.json` (whose own `min`/`max` the Rust side pins against
+ *  the engine's constants), and it pins in BOTH directions — a manifest bound missing from
+ *  this table, and a table bound the manifest does not declare, both redden.
+ *
+ *  So "engine → manifest → pane, with no step left to assumption" is now enforced for the
+ *  numbers rather than asserted about them: a `max` cannot enter a form without first
+ *  existing in the engine. */
+export const POLICY_BOUNDS: Readonly<Record<string, FieldBounds>> = {
+  // No ceiling here either: a gate may name any number of reviewers, so `threshold` is
+  // bounded above by the reviewer list rather than by a constant — which
+  // `validateWorkflow` checks against the list itself, where the real answer is.
+  "gate.threshold": { min: GATE_THRESHOLD_MIN },
+  // No ceiling, deliberately: `parse_workflow` refuses `max_batch: 0` and accepts every
+  // integer above it, so the form must too.
+  "merge_queue.max_batch": { min: MERGE_QUEUE_MAX_BATCH_MIN },
+  "merge_queue.checks_timeout_minutes": {
+    min: MERGE_QUEUE_CHECKS_TIMEOUT_MIN,
+    max: MERGE_QUEUE_CHECKS_TIMEOUT_MAX,
+  },
+  "resource.slots": { min: RESOURCE_SLOTS_MIN, max: RESOURCE_SLOTS_MAX },
+  "resource.max_hold_minutes": {
+    min: RESOURCE_MAX_HOLD_MINUTES_MIN,
+    max: RESOURCE_MAX_HOLD_MINUTES_MAX,
+  },
+};
 
 /** A legal block id: lowercase-ish, human-meaningful, safe as a filename fragment and as
  *  a shell-adjacent token. Deliberately strict — the id ends up in agent ids, pane names
@@ -2276,7 +2320,7 @@ export function validateWorkflow(w: Workflow, knobs?: KnobLookup): Finding[] {
     }
     if (gate.require === "threshold") {
       const t = gate.threshold;
-      if (t === undefined || !Number.isInteger(t) || t < 1) {
+      if (t === undefined || !Number.isInteger(t) || t < GATE_THRESHOLD_MIN) {
         findings.push({
           severity: "error",
           code: "gate-bad-threshold",

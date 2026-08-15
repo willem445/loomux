@@ -70,9 +70,10 @@ import {
   RESOURCE_SLOTS_MAX,
   RESOURCE_MAX_HOLD_MINUTES_MIN,
   RESOURCE_MAX_HOLD_MINUTES_MAX,
-  MERGE_QUEUE_MAX_BATCH_MIN,
   MERGE_QUEUE_CHECKS_TIMEOUT_MIN,
   MERGE_QUEUE_CHECKS_TIMEOUT_MAX,
+  POLICY_BOUNDS,
+  type FieldBounds,
   type Workflow,
   type WorkflowBlock,
   type WorkflowAnalysis,
@@ -1382,18 +1383,25 @@ export class WorkflowView {
    *  value still gets its finding — this stops the FORM from producing one. */
   private boundedNumber(
     value: number | undefined,
-    bounds: { min: number; max: number },
-    onChange: (v: number | undefined) => void
+    bounds: FieldBounds,
+    onChange: (v: number | undefined) => void,
+    placeholder = "loomux's default"
   ): HTMLInputElement {
     const i = document.createElement("input");
     i.className = "wf-input";
     i.type = "number";
     i.min = String(bounds.min);
-    i.max = String(bounds.max);
+    // NO `max` attribute where the schema declares no ceiling. An absent `max` in
+    // `POLICY_BOUNDS` is a statement — the engine accepts anything above the floor — and a
+    // form that invented one would rewrite a legal `max_batch: 100` to whatever it made up
+    // (#1020 review, finding 2). The floor is real everywhere, so it is always applied.
+    if (bounds.max !== undefined) i.max = String(bounds.max);
     i.value = value === undefined ? "" : String(value);
-    i.placeholder = "loomux's default";
-    const clamp = (n: number): number =>
-      Math.min(bounds.max, Math.max(bounds.min, Math.round(n)));
+    i.placeholder = placeholder;
+    const clamp = (n: number): number => {
+      const atLeast = Math.max(bounds.min, Math.round(n));
+      return bounds.max === undefined ? atLeast : Math.min(bounds.max, atLeast);
+    };
     i.addEventListener("input", () => {
       const raw = i.value.trim();
       if (!raw) {
@@ -1781,81 +1789,74 @@ export class WorkflowView {
     // pre-approves something the block could already have been asked to approve. That is why
     // the two kinds that may not declare it at all (the orchestrator, and the read-only class)
     // are refused rather than merely warned.
+    // THE ROWS ARE LOCAL; the FILE is what is left when the empty ones are dropped.
+    //
+    // That one rule replaces the draft-row special case the first cut had, and closes the
+    // hole it left (#1020 review, finding 5): a *committed* row cleared with select-all-
+    // delete wrote `allow: [""]` and then raised the "dropped, and pre-approves nothing"
+    // warning about it — the pane complaining about its own keystroke, which is exactly
+    // what the draft row existed to avoid, reached from the other direction. An empty row
+    // is now a row you are in the middle of typing, wherever it came from, and it reaches
+    // the file only once it has something in it.
     const denial = allowDenialReason(b.kind);
-    const patterns = b.allow ?? [];
+    const rows: string[] = [...(b.allow ?? [])];
     const allowList = el("div", "wf-checks");
-    let liveCount = patterns.length;
 
-    /** Drop entry `at`, and drop the key entirely with the last one — an empty `allow: []`
-     *  is a line that declares nothing, and the model emits only what is declared. */
-    const removeAt = (at: number): void =>
+    /** Write the non-empty rows, in order. The key goes entirely when nothing is left: an
+     *  `allow: []` is a line that declares nothing, and the model emits only what is
+     *  declared. `rerenderForm: false` — this runs on every keystroke. */
+    const commitRows = (): void =>
       edit((t) => {
-        const rest = (t.allow ?? []).filter((_, i) => i !== at);
-        if (rest.length) t.allow = rest;
+        const kept = rows.filter((p) => p.trim() !== "");
+        if (kept.length) t.allow = kept;
         else delete t.allow;
-      });
+      }, false);
 
-    const patternRow = (value: string, at: number, onRemove?: () => void): HTMLElement => {
-      const line = el("div", "wf-check");
-      line.append(
-        this.textInput(value, (v) => edit((t) => {
-          if (t.allow) t.allow[at] = v;
-        }, false), "Bash(npm test *)")
-      );
-      const del = document.createElement("button");
-      del.className = "wf-btn wf-btn-danger";
-      del.textContent = "✕";
-      del.title = "Remove this pattern";
-      del.addEventListener("click", () => (onRemove ? onRemove() : removeAt(at)));
-      line.append(del);
-      return line;
+    /** Rebuild the row DOM from `rows`. Only ever called from add/remove — deliberate
+     *  clicks, with no caret to protect — so the indices every row closure captures are
+     *  rebuilt at exactly the moments they would otherwise go stale. A keystroke mutates
+     *  `rows[i]` in place and repaints nothing. */
+    const paintRows = (): void => {
+      const built = rows.map((value, i) => {
+        const line = el("div", "wf-check");
+        const input = this.textInput(
+          value,
+          (v) => {
+            rows[i] = v;
+            commitRows();
+          },
+          "Bash(npm test *)"
+        );
+        const del = document.createElement("button");
+        del.className = "wf-btn wf-btn-danger";
+        del.textContent = "✕";
+        del.title = "Remove this pattern";
+        del.addEventListener("click", () => {
+          rows.splice(i, 1);
+          commitRows();
+          paintRows();
+        });
+        line.append(input, del);
+        return line;
+      });
+      const addPattern = el("button", "wf-add", "+ Add pattern") as HTMLButtonElement;
+      addPattern.disabled = !!denial;
+      addPattern.addEventListener("click", () => {
+        rows.push("");
+        paintRows();
+        // Focus the row just added — the point of pressing the button is to type in it.
+        const inputs = allowList.querySelectorAll<HTMLInputElement>("input.wf-input");
+        inputs[inputs.length - 1]?.focus();
+      });
+      const children: HTMLElement[] = [...built, addPattern];
+      if (!rows.length && !denial) {
+        children.push(
+          el("span", "wf-hint", "None — the block runs with its class's own tool surface.")
+        );
+      }
+      allowList.replaceChildren(...children);
     };
-
-    patterns.forEach((p, i) => allowList.append(patternRow(p, i)));
-
-    const addPattern = el("button", "wf-add", "+ Add pattern") as HTMLButtonElement;
-    addPattern.disabled = !!denial;
-    addPattern.addEventListener("click", () => {
-      // A DRAFT row: nothing reaches the file until it has something in it. Writing an empty
-      // entry first would put `allow: [""]` in the YAML the moment the button is pressed —
-      // and then flag it, which is the pane complaining about its own keystroke.
-      let index: number | null = null;
-      const row = el("div", "wf-check");
-      const input = this.textInput(
-        "",
-        (v) => {
-          if (index === null) {
-            if (!v.trim()) return;
-            index = liveCount++;
-            edit((t) => {
-              t.allow = [...(t.allow ?? []), v];
-            }, false);
-            return;
-          }
-          const at = index;
-          edit((t) => {
-            if (t.allow) t.allow[at] = v;
-          }, false);
-        },
-        "Bash(npm test *)"
-      );
-      const del = document.createElement("button");
-      del.className = "wf-btn wf-btn-danger";
-      del.textContent = "✕";
-      del.addEventListener("click", () => {
-        if (index === null) row.remove();
-        else removeAt(index);
-      });
-      row.append(input, del);
-      allowList.append(row);
-      input.focus();
-    });
-    allowList.append(addPattern);
-    if (!patterns.length && !denial) {
-      allowList.append(
-        el("span", "wf-hint", "None — the block runs with its class's own tool surface.")
-      );
-    }
+    paintRows();
     box.append(
       this.field(
         "Extra allowed tools",
@@ -1992,17 +1993,31 @@ export class WorkflowView {
     );
 
     if (gate.require === "threshold") {
-      const n = document.createElement("input");
-      n.className = "wf-input";
-      n.type = "number";
-      n.min = "1";
-      n.value = String(gate.threshold ?? 1);
-      n.addEventListener("input", () =>
-        this.mutate((next) => {
-          next.gates.merge!.threshold = Number(n.value) || 1;
-        }, false)
+      // Through the same bounded control, and the same `POLICY_BOUNDS` row, as every other
+      // number in this pane (#1020 review, finding 7). It used to hand-roll its own input
+      // whose floor was the string "1" and whose empty state wrote `Number("") || 1` — the
+      // pane inventing a threshold nobody typed, which is the same defect as the invented
+      // `max_batch` ceiling one finding earlier. Empty now means UNDECLARED, and a
+      // threshold gate with no threshold is exactly what `gate-bad-threshold` is for: the
+      // human is told what the gate needs instead of being given a number they didn't ask
+      // for.
+      box.append(
+        this.field(
+          "Threshold",
+          this.boundedNumber(
+            gate.threshold,
+            POLICY_BOUNDS["gate.threshold"]!,
+            (v) =>
+              this.mutate((next) => {
+                const g = next.gates.merge!;
+                if (v === undefined) delete g.threshold;
+                else g.threshold = v;
+              }, false),
+            "how many must pass"
+          ),
+          "How many of the named reviewers must record a PASS. There is no default — a threshold gate says the number."
+        )
       );
-      box.append(this.field("Threshold", n));
     }
 
     const reviewers = el("div", "wf-checks");
@@ -2184,22 +2199,42 @@ export class WorkflowView {
     );
     if (!mq) return box;
 
+    // A THREE-WAY control, because the file has three states and a checkbox has two
+    // (#1020 review, finding 4). The old checkbox claimed, in its own comment, never to
+    // invent `enabled: false` — and then did, across two clicks: ticking wrote `true`, and
+    // unticking found the key defined and wrote `false` onto a file that had never carried
+    // it. Every repair that keeps a checkbox loses a state instead: untick-always-deletes
+    // silently drops an explicit `enabled: false` a human wrote.
+    //
+    // So the control shows what the file says. Absent and `false` mean the same thing to
+    // the engine (`#[serde(default)]`), which is exactly why the pane must not silently
+    // convert between them — it is the human's line, not ours, and this is the one form in
+    // the pane whose entire subject is what the file declares.
     box.append(
-      this.sectionToggle("Enabled", mq.enabled === true, (on) =>
-        this.mutate((next) => {
-          const q = next.merge_queue!;
-          // Off writes `enabled: false` only where the file already said something. Absent
-          // already MEANS off, and inventing the line would be a policy statement nobody made.
-          if (on) q.enabled = true;
-          else if (q.enabled !== undefined) q.enabled = false;
-        })
+      this.field(
+        "Enabled",
+        this.labelledSelect(
+          [
+            { value: "", label: "not declared — off (loomux's default)" },
+            { value: "true", label: "true — run the queue" },
+            { value: "false", label: "false — declared off" },
+          ],
+          mq.enabled === undefined ? "" : String(mq.enabled),
+          (v) =>
+            this.mutate((next) => {
+              const q = next.merge_queue!;
+              if (v === "") delete q.enabled;
+              else q.enabled = v === "true";
+            })
+        ),
+        "An absent enabled: is off — the same thing the engine reads from enabled: false, kept apart here because the line is yours."
       )
     );
 
     box.append(
       this.field(
         "Max batch",
-        this.boundedNumber(mq.max_batch, { min: MERGE_QUEUE_MAX_BATCH_MIN, max: 64 }, (v) =>
+        this.boundedNumber(mq.max_batch, POLICY_BOUNDS["merge_queue.max_batch"]!, (v) =>
           this.mutate((next) => {
             const q = next.merge_queue!;
             if (v === undefined) delete q.max_batch;
@@ -2215,7 +2250,7 @@ export class WorkflowView {
         "Checks timeout (minutes)",
         this.boundedNumber(
           mq.checks_timeout_minutes,
-          { min: MERGE_QUEUE_CHECKS_TIMEOUT_MIN, max: MERGE_QUEUE_CHECKS_TIMEOUT_MAX },
+          POLICY_BOUNDS["merge_queue.checks_timeout_minutes"]!,
           (v) =>
             this.mutate((next) => {
               const q = next.merge_queue!;
@@ -2278,13 +2313,12 @@ export class WorkflowView {
       const num = (
         label: string,
         key: keyof Pick<WorkflowResource, "slots" | "max_hold_minutes">,
-        bounds: { min: number; max: number },
         hint: string
       ): void => {
         card.append(
           this.field(
             label,
-            this.boundedNumber(r[key], bounds, (v) =>
+            this.boundedNumber(r[key], POLICY_BOUNDS[`resource.${key}`]!, (v) =>
               this.mutate((next) => {
                 const target = next.resources?.[name];
                 if (!target) return;
@@ -2299,14 +2333,12 @@ export class WorkflowView {
       num(
         "Slots",
         "slots",
-        { min: RESOURCE_SLOTS_MIN, max: RESOURCE_SLOTS_MAX },
-        `How many agents may hold it at once (1–${RESOURCE_SLOTS_MAX}). Empty inherits loomux's default.`
+        `How many agents may hold it at once (${RESOURCE_SLOTS_MIN}–${RESOURCE_SLOTS_MAX}). Empty inherits loomux's default.`
       );
       num(
         "Max hold (minutes)",
         "max_hold_minutes",
-        { min: RESOURCE_MAX_HOLD_MINUTES_MIN, max: RESOURCE_MAX_HOLD_MINUTES_MAX },
-        `How long one hold may last before it expires (1–${RESOURCE_MAX_HOLD_MINUTES_MAX}). Empty inherits loomux's default.`
+        `How long one hold may last before it expires (${RESOURCE_MAX_HOLD_MINUTES_MIN}–${RESOURCE_MAX_HOLD_MINUTES_MAX}). Empty inherits loomux's default.`
       );
       box.append(card);
     }

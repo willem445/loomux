@@ -1789,6 +1789,32 @@ manifest → pane, with no step left to assumption. The manifest's
 "your file will not load" and "your file will not do what it says" send a human
 to different places.
 
+**A bound at its point of use is a bound nothing can check.** The first cut of
+those forms clamped `merge_queue.max_batch` to a hand-typed `64` — a ceiling no
+engine constant imposes and no manifest row declares — so typing `100` silently
+wrote `64`, and no test in the tree could see it, because the pin asserted only
+the bounds it happened to name. The fix is `POLICY_BOUNDS` in
+`workflowmodel.ts`: one table, keyed by manifest field id, that every bounded
+number in the pane reads, pinned against the manifest **in both directions** —
+a table bound the manifest does not declare fails, and a manifest bound no form
+reads fails too. `max` is compared *including its absence*, since a manifest row
+without one is the statement that the engine imposes no ceiling. That reverse
+direction immediately found `gate.threshold`, bounded in the manifest since #880
+and hand-wired in `gateForm` since #222 with no clamp at all; it now reads the
+same table, and its empty state means UNDECLARED (raising `gate-bad-threshold`)
+rather than silently writing `1` the human never typed.
+
+**Where the file has three states, the control has three.**
+`merge_queue.enabled` is absent, `true`, or `false`, and absent and `false` mean
+the same thing to the engine (`#[serde(default)]`) — which is exactly why the
+pane must not convert between them behind the human's back. A checkbox cannot
+hold three states: ticking then unticking one wrote `enabled: false` onto a file
+that never carried the key, and the repair that always deletes on untick drops an
+explicit `false` somebody wrote. So this one field is a three-way picker that
+shows what the file says. It is the only place in the pane where the distinction
+is visible, and it is the one form whose entire subject is what the file
+declares.
+
 **An empty value can be a real value.** `block.cli: ""` means "inherit the
 group's CLI, whatever the launcher picks" and `intake.source: ""` means the
 built-in source — both are what most files actually contain, so both are
