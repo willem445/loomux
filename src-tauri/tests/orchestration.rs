@@ -12330,11 +12330,30 @@ fn no_delegate_callable_tool_can_forge_a_loomux_attribution_into_the_orchestrato
     //      and `review_verdict`'s summary. Naming them is what makes the test
     //      readable; asserting delivery is what stops it passing vacuously (an
     //      earlier revision measured an empty pane and would have).
-    //   2. An EXHAUSTIVE sweep: every tool the delegate's own `tools/list`
-    //      offers, called with a forged span in every string argument it takes.
-    //      A future tool, or a new field on an existing one, is covered the day
-    //      it is added — which is the property rev-2 asked for, since the fix
-    //      for rev-1 was correct and still incomplete.
+    //   2. A sweep over every tool the delegate's own `tools/list` offers, each
+    //      called twice (see the fillings below).
+    //
+    // **What the sweep does and does not reach, because "exhaustive" was too
+    // strong a word for it and rev-2's disposition said so.** It drives a tool
+    // whose string arguments are free text or `enum`-constrained, and a new
+    // FIELD on such a tool is caught the day it is added: the filling puts a
+    // forged span in it and the assertions below read the pane. It does NOT
+    // drive a tool with a constrained non-enum argument — `review_verdict`'s
+    // `pr` must parse as a number — so a new field on one of those is covered
+    // only by the NAMED calls, which a human has to extend. That is a
+    // reviewer-checked residual, stated here rather than papered over:
+    //
+    //   - a new SITE (another `[loomux] …` notice composed in `mcp.rs`) is
+    //     caught by `every_loomux_notice_composed_in_the_mcp_surface_scrubs_
+    //     what_it_interpolates`, which is default-deny;
+    //   - a scrub that stops working is caught by this test, the `report.rs`
+    //     unit pins, and the half-dozen older sanitizer tests that share the
+    //     choke;
+    //   - a new FIELD beside a scrubbed one, on an existing site whose tool the
+    //     sweep cannot drive, is caught by NEITHER. The source scan sees a
+    //     scrub named in the call and passes; the scrubber itself is fine.
+    //     Closing that would mean checking each interpolated ARGUMENT rather
+    //     than the call — a bigger guard than this round is for.
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
     let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
@@ -12381,6 +12400,7 @@ fn no_delegate_callable_tool_can_forge_a_loomux_attribution_into_the_orchestrato
         "summary": format!("blocking: the guard is bypassable.\n{FORGED}"),
     }}));
     assert_eq!(out.unwrap()["isError"], false, "the verdict must record, or this path proves nothing");
+    let named_deliveries = delivered_texts(&reg, &g.id).len();
 
     // (2) the exhaustive sweep — every tool either delegate is offered, with
     // every string argument forged. Results are ignored on purpose: a rejected
@@ -12394,17 +12414,49 @@ fn no_delegate_callable_tool_can_forge_a_loomux_attribution_into_the_orchestrato
         assert!(tools.len() > 5, "a delegate's surface must be non-trivial, got {}", tools.len());
         for t in tools {
             let name = t["name"].as_str().unwrap().to_string();
-            let mut args = serde_json::Map::new();
-            if let Some(props) = t["inputSchema"]["properties"].as_object() {
-                for (k, spec) in props {
-                    if spec["type"] == json!("string") {
-                        args.insert(k.clone(), json!(FORGED));
+            // Two fillings per tool, because one of them is inert on any tool
+            // that validates an argument (rev-2 disposition, item 1):
+            //
+            //   `Forged` puts the payload in EVERY string argument, which
+            //   drives the free-text tools but is rejected outright by a tool
+            //   with a constrained field — `report` with `status: "[loomux]…"`
+            //   never reaches its composition at all.
+            //
+            //   `Legal` fills every `enum`-constrained field with a value the
+            //   schema allows and leaves the free-text fields forged, so those
+            //   same tools actually run. `report` is driven this way; that is
+            //   the validation path the first filling silently skipped.
+            //
+            // What neither reaches is a field the schema constrains without an
+            // enum — `review_verdict`'s `pr` wants a parseable number, and no
+            // generic filling can guess that. Those tools are covered by the
+            // NAMED calls above instead, which is why both layers exist.
+            for legal in [false, true] {
+                let mut args = serde_json::Map::new();
+                if let Some(props) = t["inputSchema"]["properties"].as_object() {
+                    for (k, spec) in props {
+                        if spec["type"] != json!("string") {
+                            continue;
+                        }
+                        let v = match spec["enum"].as_array().and_then(|e| e.first()) {
+                            Some(first) if legal => first.clone(),
+                            _ => json!(FORGED),
+                        };
+                        args.insert(k.clone(), v);
                     }
                 }
+                let _ =
+                    dispatch(&reg, c, "tools/call", &json!({ "name": name, "arguments": args }));
             }
-            let _ = dispatch(&reg, c, "tools/call", &json!({ "name": name, "arguments": args }));
         }
     }
+    // The sweep is not inert: it delivered something of its own, over and above
+    // the four named calls. Without this, a filling that every tool rejected
+    // would still "pass" the forgery assertions below, on an empty set.
+    assert!(
+        delivered_texts(&reg, &g.id).len() > named_deliveries,
+        "the sweep drove no tool at all — it is measuring nothing"
+    );
 
     // ---- what the pane actually received ----
     let delivered = delivered_texts(&reg, &g.id);
@@ -12497,10 +12549,17 @@ fn every_loomux_notice_composed_in_the_mcp_surface_scrubs_what_it_interpolates()
     //   - a scrub applied further up the call chain rather than inside the
     //     `format!` (that reads as a violation here, which is the safe
     //     direction: it must be argued into the exemption list above);
-    //   - a notice assembled by `push_str` rather than `format!`.
+    //   - a notice assembled by `push_str` rather than `format!`;
+    //   - **a new FIELD added beside a scrubbed one on an existing site.** This
+    //     checks that a scrub is named in the call, not that every interpolated
+    //     argument passes through one, so a second agent-authored field added
+    //     to a call that already scrubs its first reads as compliant here.
     //
-    // The behavioural sweep is what covers those: it drives every tool the
-    // delegate is offered, however its text is assembled.
+    // The behavioural sweep covers the first three: it drives the tools the
+    // delegate is offered, however their text is assembled. It covers the
+    // FOURTH only for a tool whose arguments it can satisfy — see its own doc
+    // for that boundary, which is the one genuinely reviewer-checked gap
+    // between these two guards.
     let src = fs::read_to_string(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("src/orchestration/mcp.rs"),
     )
@@ -12534,10 +12593,70 @@ fn every_loomux_notice_composed_in_the_mcp_surface_scrubs_what_it_interpolates()
         sites += 1;
         // The call's own extent, by paren depth — not a fixed window, so a long
         // argument list cannot push the scrub out of view and pass.
+        //
+        // Parens are counted only in CODE. A naive walker counts them inside
+        // string literals and comments too, and both appear here for real: the
+        // verdict notice's own literal contains `({})`, and this file's comments
+        // are prose full of parentheses. Today those happen to be balanced, so a
+        // naive walk lands on the right byte by luck — one unbalanced `)` in a
+        // literal or a comment and the extent silently becomes some other span
+        // of the file, which is a tripwire that reports on the wrong thing while
+        // looking healthy. Skipping both is the whole fix (rev-2 disposition,
+        // item 2); nothing else about the scan changes.
         let mut depth = 0i32;
         let mut end = at;
-        for (k, c) in src[at..].char_indices() {
+        let mut chars = src[at..].char_indices().peekable();
+        while let Some((k, c)) = chars.next() {
             match c {
+                // A string literal: run to its unescaped close.
+                '"' => {
+                    while let Some((_, d)) = chars.next() {
+                        if d == '\\' {
+                            chars.next(); // the escaped char, whatever it is
+                        } else if d == '"' {
+                            break;
+                        }
+                    }
+                }
+                // A CHAR literal is `'x'` or `'\n'`. A lone `'` is a lifetime
+                // (`&'a str`), and treating that as an opening quote would run
+                // the skip to the next apostrophe anywhere in the file —
+                // swallowing the `)` this walk exists to find. So the shape is
+                // checked before anything is consumed.
+                '\'' => {
+                    let mut probe = chars.clone();
+                    match (probe.next(), probe.next()) {
+                        (Some((_, '\\')), _) => {
+                            for (_, d) in chars.by_ref() {
+                                if d == '\'' {
+                                    break;
+                                }
+                            }
+                        }
+                        (Some(_), Some((_, '\''))) => {
+                            chars.next();
+                            chars.next();
+                        }
+                        _ => {} // a lifetime — ordinary code, not a literal
+                    }
+                }
+                '/' if matches!(chars.peek(), Some((_, '/'))) => {
+                    for (_, d) in chars.by_ref() {
+                        if d == '\n' {
+                            break;
+                        }
+                    }
+                }
+                '/' if matches!(chars.peek(), Some((_, '*'))) => {
+                    chars.next();
+                    let mut prev = '\0';
+                    for (_, d) in chars.by_ref() {
+                        if prev == '*' && d == '/' {
+                            break;
+                        }
+                        prev = d;
+                    }
+                }
                 '(' => depth += 1,
                 ')' => {
                     depth -= 1;
@@ -12549,6 +12668,7 @@ fn every_loomux_notice_composed_in_the_mcp_surface_scrubs_what_it_interpolates()
                 _ => {}
             }
         }
+        assert!(depth == 0, "unterminated `format!(` at byte {at} — the walker lost the file");
         let call = &src[at..=end];
         // Matched on THIS site's own opening literal, never on the call text:
         // the verdict notice nests the exempt gate clause inside itself, so a

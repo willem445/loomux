@@ -164,13 +164,26 @@ and unrelated to attribution. And no scrub can decide who *dictated* words a
 liaison genuinely relays; that is the fidelity problem the verbatim rule and
 the two ledgers address, not a trust-boundary one.
 
-**Why the sweep is a test rather than a promise.** The first fix here closed
-three fields and left a fourth — `review_verdict`'s summary — because it was
-written from the list of paths someone had thought of. What replaced that is a
-test that drives *every tool the delegate's own `tools/list` offers*, with a
-forged span in every string argument, plus a default-deny source scan over the
-notices `mcp.rs` composes. A new field is then a red on the day it is written,
-not a finding on the round after.
+**What the guards cover, stated at the size they are.** The first fix here
+closed three fields and left a fourth — `review_verdict`'s summary — because it
+was written from the list of paths someone had thought of, so what replaced that
+list is two guards. Their reach is worth writing down exactly, because the
+temptation is to describe them as "a new field can't get through" and that is
+not true:
+
+- **A new notice site** in `mcp.rs` — another `[loomux] …` composition — is a
+  red, from the default-deny source scan.
+- **A scrub that stops working** is a red, from the behavioural sweep, the
+  `report.rs` unit pins, and the half-dozen older sanitizer tests that share the
+  one choke.
+- **A new field on a tool the sweep can drive** (free-text or `enum`-constrained
+  arguments) is a red: the sweep fills it with a forged span and reads the pane.
+- **A new field on a tool the sweep cannot drive** — one with a constrained
+  non-enum argument, `review_verdict`'s `pr` being the example — is caught by
+  **neither** guard. The scan sees a scrub named somewhere in the call and
+  passes; the scrubber itself is unbroken. That one is reviewer-checked, and
+  closing it structurally would mean auditing each interpolated *argument*
+  rather than the call.
 
 **It presents; it is not the record.** The human-question registry (#946) landed
 between this feature's plan and its prose, and the two compose exactly as

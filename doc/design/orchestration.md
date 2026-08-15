@@ -6544,9 +6544,19 @@ the scrub removes.
 
 Two pins, because the first version of this fix was complete for the paths its author had listed
 and missed one: `no_delegate_callable_tool_can_forge_a_loomux_attribution_into_the_orchestrators_pane`
-drives **every tool a delegate's own `tools/list` offers** with a forged span in every string
-argument, and `every_loomux_notice_composed_in_the_mcp_surface_scrubs_what_it_interpolates` is a
-default-deny source scan with its blind spots enumerated in its own doc comment.
+names four relay shapes and then sweeps every tool a delegate's `tools/list` offers, and
+`every_loomux_notice_composed_in_the_mcp_surface_scrubs_what_it_interpolates` is a default-deny
+source scan whose paren walk skips string literals and comments (a naive one lands on the right
+byte only while every literal and comment in range happens to be balanced).
+
+**Their reach, at the size it actually is.** A new notice SITE is caught by the scan. A scrub that
+stops working is caught by the behavioural pins. A new FIELD on a tool the sweep can drive —
+free-text or `enum`-constrained arguments — is caught, because the sweep fills it and reads the
+pane. A new FIELD on a tool the sweep cannot drive (a constrained non-enum argument, like
+`review_verdict`'s `pr`) is caught by **neither**: the scan sees a scrub named in the call and
+passes, and the scrubber is unbroken. That residual is reviewer-checked; closing it structurally
+means auditing each interpolated argument rather than the call, which is a larger guard than the
+one this note describes.
 
 **"Called in by" is deliberately weaker than "authored by", and the gap is the accepted residual
 below.** What the check can see is which agent made the tool call. Who *dictated the words* is not
