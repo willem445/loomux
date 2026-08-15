@@ -845,17 +845,18 @@ fn cap_windows(mut windows: Vec<FrictionWindow>, max: usize) -> (Vec<FrictionWin
     (kept, dropped)
 }
 
-/// `session_id` is usually system-assigned (Claude's own session uuid), but
-/// `Task.session` can be set by an agent through `upsert_task`'s free-form
-/// `session` field, and it reaches a filesystem path join in
-/// `OrchRegistry::read_session_transcript_events`. Reject anything that
-/// isn't a plain path component before that ever happens (review finding
-/// NB4) — defense in depth: the join target is always under a fixed root
-/// (`~/.claude/projects/*` or `~/.copilot/session-state`), but a `..` or a
-/// separator in the id could still walk it outside that root.
-pub fn is_safe_session_id(id: &str) -> bool {
-    !id.is_empty() && !id.contains(['/', '\\']) && id != "." && id != ".."
-}
+// `is_safe_session_id` used to live here (review finding NB4). #925 deleted it
+// rather than strengthening it in place, and the deletion is the point: it was
+// a *predicate*, so its guarantee lasted exactly as long as the one call that
+// invoked it, and its rule set — reject `/`, `\`, `.` and `..`, nothing else —
+// admitted `"C:"`, `"CON"`, a leading `-`, an unbounded length, NUL and every
+// non-ASCII byte straight through to `Path::join`.
+//
+// The replacement is `loomux_engine::pathseg::PathSegment`, parsed once in
+// `OrchRegistry::read_session_transcript_events` and threaded to both path arms,
+// so the property now travels with the value instead of being re-asserted (or
+// forgotten) per call site. There is deliberately no `is_safe_session_id`
+// shim left behind for a future caller to reach for.
 
 /// The reduced signal handed to an agent (process-pro) in place of a raw
 /// transcript: the friction windows plus three anchors — what the worker was
@@ -1207,22 +1208,11 @@ mod tests {
         assert_eq!(digest.dropped_windows, 0);
     }
 
-    // ---- session id path-safety guard (review finding NB4) ----
-
-    #[test]
-    fn safe_session_ids_are_accepted() {
-        assert!(is_safe_session_id("64f4d4f6-5201-4da9-8ed9-e0827ffae7df"));
-    }
-
-    #[test]
-    fn session_ids_with_path_separators_or_traversal_are_rejected() {
-        assert!(!is_safe_session_id("../../../../etc/passwd"));
-        assert!(!is_safe_session_id("a/b"));
-        assert!(!is_safe_session_id("a\\b"));
-        assert!(!is_safe_session_id(".."));
-        assert!(!is_safe_session_id("."));
-        assert!(!is_safe_session_id(""));
-    }
+    // The session-id path-safety unit tests that lived here (review finding
+    // NB4) moved with the rule they covered: the family is now validated by
+    // `loomux_engine::pathseg::PathSegment`, and its refusal/acceptance suite —
+    // including every shape the old predicate let through — is in
+    // `src-tauri/tests/pathseg.rs` (#925).
 
     // ---- build_digest anchors ----
 

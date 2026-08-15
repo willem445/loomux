@@ -36,6 +36,7 @@ pub use loomux_engine::termgrid;
 // fact about the transport (#904) is now a fact about the type, which is what
 // makes it survive leaving this crate at all.
 pub use loomux_engine::groupid::{self, GroupId, GroupIdError};
+pub use loomux_engine::pathseg::{PathSegment, SegmentError};
 
 // #888 slice A2 batch 3. `lessons` and `notify` were leaves in everything but
 // one edge each — `lessons` reached back here for `tail_snippet`, `notify` for
@@ -11532,10 +11533,22 @@ fn new_session_uuid() -> String {
 /// whitespace, no quote, no shell or PowerShell metacharacter, no NUL. Every
 /// one of the 41 added characters is an ASCII letter, inert in a path
 /// component and inert on a command line, so everything downstream that treats
-/// a session id as a path component (`digest::is_safe_session_id`, and the
-/// `Path::join` in `read_session_transcript_events`) or interpolates it into a
-/// command line keeps every guarantee it had. Same deliberate-widening shape
-/// as `sanitize_model`'s `/`, and pinned the same way.
+/// a session id as a path component (the `Path::join` in
+/// `read_session_transcript_events`) or interpolates it into a command line
+/// keeps every guarantee it had. Same deliberate-widening shape as
+/// `sanitize_model`'s `/`, and pinned the same way.
+///
+/// **The rules now live in `loomux_engine::pathseg` (#925), and two arrive with
+/// them.** This was one of four near-identical copies of the same check; the
+/// weakest of the four (`digest::is_safe_session_id`, which this comment used to
+/// name as a downstream guarantee) was the one actually guarding the copilot
+/// digest's `Path::join`, and it is gone. Consolidating adds two rules here that
+/// were not written above: a **leading `-`** is refused (an id is interpolated
+/// into a command line, where `-foo` is an option), and a **Windows reserved
+/// device name** is refused. Neither can occur in a real session id — Claude
+/// mints hyphenated hex UUIDs, opencode mints `ses_…`, both far longer than any
+/// device name and neither starting with `-` — so the widening story above is
+/// untouched and nothing real is newly rejected.
 ///
 /// **This gate is global, not per-CLI, and that is a deliberate trade
 /// (rev-306 NB2).** A malformed *claude* id — one carrying `g`-`z` — now gets
@@ -11554,11 +11567,12 @@ fn new_session_uuid() -> String {
 /// by `is_full_session_id` and roster resolution, where being wrong yields a
 /// diagnosable "unknown session" rather than a flat refusal.
 fn sanitize_session(s: &str) -> Option<String> {
+    // The `trim()` is this function's own pre-existing contract, kept
+    // deliberately across the #925 consolidation; only the checks are shared.
     let t = s.trim();
-    (!t.is_empty()
-        && t.len() <= 64
-        && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'))
-    .then(|| t.to_string())
+    loomux_engine::pathseg::check_segment(t)
+        .ok()
+        .map(|()| t.to_string())
 }
 
 /// A Claude Code session id's full length: `8-4-4-4-12` hex hyphenated (see
@@ -16797,7 +16811,13 @@ impl Tier1ScanCensus {
 /// took a `&str` and validated at its own join; that was one of the raw joins
 /// the second slice removed.
 #[doc(hidden)] // pub for integration tests
-pub fn promptsubmit_marker_path(root: &Path, group: &GroupId, agent_id: &str) -> PathBuf {
+/// **Takes a validated agent id (#925), for the same reason it takes a
+/// `GroupId`.** The id becomes part of a FILE NAME under the group's `hooks`
+/// dir, so an unvalidated string here is a second path-assembly point wearing a
+/// `format!`. Infallible by construction rather than by trust: the caller has to
+/// hold the proof before it can call, which is what keeps this function's return
+/// type a plain `PathBuf` instead of reintroducing the `Option` #904 removed.
+pub fn promptsubmit_marker_path(root: &Path, group: &GroupId, agent_id: &PathSegment) -> PathBuf {
     group_dir_at(root, group)
         .join("hooks")
         .join(format!("{agent_id}.promptsubmit.jsonl"))
@@ -17962,7 +17982,15 @@ fn deliver_now(
     // `group_dir_at` — no id it can be handed escapes the root. Every use of
     // this value is a READ (`promptsubmit_marker_len`, `poll_promptsubmit_hook`);
     // loomux never writes here, the hook script does, via `$LOOMUX_GROUP_DIR`.
-    let hook_marker_path = promptsubmit_marker_path(&root, &group, &agent);
+    //
+    // #925 closed the other half: the AGENT id names the file inside that dir,
+    // and it used to arrive here as a bare `&str`. An id that cannot name a
+    // single component yields an empty path, whose reads degrade exactly as a
+    // marker no hook has written yet already does — `promptsubmit_marker_len`
+    // reports 0 and `poll_promptsubmit_hook` reports `None`.
+    let hook_marker_path = PathSegment::parse(&agent)
+        .map(|agent_seg| promptsubmit_marker_path(&root, &group, &agent_seg))
+        .unwrap_or_default();
     let hook_baseline = promptsubmit_marker_len(&hook_marker_path);
 
     // Echo-verified typing: paste, then require the TUI to emit
@@ -23630,7 +23658,9 @@ impl OrchRegistry {
     /// (unlike the instructions files): a pane's own directives are its own
     /// regardless of which block it's running, and a resume should still see
     /// them. See `note_directive`, the sole writer.
-    fn ledger_path(&self, group: &GroupId, agent_id: &str) -> PathBuf {
+    /// Takes a validated agent id (#925) — see `promptsubmit_marker_path` for
+    /// the argument; this is the same family and the same reasoning.
+    fn ledger_path(&self, group: &GroupId, agent_id: &PathSegment) -> PathBuf {
         self.group_dir(group).join(format!("ledger-{agent_id}.log"))
     }
 
@@ -24199,15 +24229,25 @@ impl OrchRegistry {
     /// parameter instead, so it is not a path there; the check runs first for
     /// all three regardless, because an id this registry would refuse to look
     /// up on disk is not one to go looking for in a database either.
+    ///
+    /// **#925 replaced the predicate that used to stand here with the type.**
+    /// It was `digest::is_safe_session_id`, which rejected `/`, `\`, `.` and
+    /// `..` and nothing else — so `"C:"`, `"CON"`, a leading `-`, a 5000-byte
+    /// id, a NUL byte and every non-ASCII byte all passed it and reached the
+    /// join. Parsing once here and threading a [`PathSegment`] to both path
+    /// arms means the refusal is no longer a check a future arm could forget to
+    /// call: neither `claude_transcript_path` nor `copilot_session_dir_at` will
+    /// accept anything else.
     fn read_session_transcript_events(
         &self,
         group: &GroupId,
         cli: &str,
         session_id: &str,
     ) -> Result<Vec<digest::TranscriptEvent>, String> {
-        if !digest::is_safe_session_id(session_id) {
-            return Err(format!("invalid session id: {session_id:?}"));
-        }
+        // Error text unchanged (`invalid session id: …`) — callers and the MCP
+        // surface match on it.
+        let session = PathSegment::parse(session_id)
+            .map_err(|e| format!("invalid session id: {session_id:?} ({e})"))?;
         match cli {
             "claude" => {
                 let root = self
@@ -24216,7 +24256,7 @@ impl OrchRegistry {
                     .clone()
                     .or_else(crate::usage::default_claude_projects_root)
                     .ok_or("cannot resolve the Claude projects root")?;
-                let path = crate::usage::claude_transcript_path(&root, session_id)
+                let path = crate::usage::claude_transcript_path(&root, &session)
                     .ok_or_else(|| format!("no Claude transcript found for session {session_id}"))?;
                 // Line-by-line via BufReader, not `fs::read_to_string` (review
                 // finding NB3): mirrors `usage::claude_session_usage_in`. A
@@ -24236,7 +24276,7 @@ impl OrchRegistry {
             "copilot" => {
                 let root = crate::sessions::copilot_session_state_root()
                     .ok_or("cannot resolve the Copilot session-state root")?;
-                let dir = root.join(session_id);
+                let dir = crate::sessions::copilot_session_dir_at(&root, &session);
                 let workspace = fs::read_to_string(dir.join("workspace.yaml")).unwrap_or_default();
                 let checkpoints = fs::read_to_string(dir.join("checkpoints").join("index.md")).unwrap_or_default();
                 Ok(digest::parse_copilot_session_events(&workspace, &checkpoints))
@@ -30416,11 +30456,19 @@ impl OrchRegistry {
                                     .map(|b| b.instructions_file())
                                     .unwrap_or_else(|| role_instructions_file(a.role).to_string()),
                             );
-                            let ledger = self.ledger_path(&a.group, &a.id);
-                            to_reinject.push((
-                                a.id.clone(), a.group.clone(), instructions, ledger,
-                                1, a.contract_carrier,
-                            ));
+                            // #925: the ledger is named after the agent, so the
+                            // id is proven a single path component before it
+                            // names a file. Unreachable for a minted `w-N`/
+                            // `orch` id — fail-closed rather than trusted, and
+                            // skipping is the safe direction: a path we cannot
+                            // name is a file we must not write.
+                            if let Ok(agent_seg) = PathSegment::parse(&a.id) {
+                                let ledger = self.ledger_path(&a.group, &agent_seg);
+                                to_reinject.push((
+                                    a.id.clone(), a.group.clone(), instructions, ledger,
+                                    1, a.contract_carrier,
+                                ));
+                            }
                             to_copilot_marker_resolved.push((a.id.clone(), a.group.clone()));
                         }
                     }
@@ -30560,11 +30608,14 @@ impl OrchRegistry {
                                         .map(|b| b.instructions_file())
                                         .unwrap_or_else(|| role_instructions_file(a.role).to_string()),
                                 );
-                                let ledger = self.ledger_path(&a.group, &a.id);
-                                to_reinject.push((
-                                    a.id.clone(), a.group.clone(), instructions, ledger,
-                                    a.compact_reinject_attempts, a.contract_carrier,
-                                ));
+                                // #925 — see the sibling site above.
+                                if let Ok(agent_seg) = PathSegment::parse(&a.id) {
+                                    let ledger = self.ledger_path(&a.group, &agent_seg);
+                                    to_reinject.push((
+                                        a.id.clone(), a.group.clone(), instructions, ledger,
+                                        a.compact_reinject_attempts, a.contract_carrier,
+                                    ));
+                                }
                             } else {
                                 to_abandon.push((a.id.clone(), a.group.clone(), a.compact_reinject_attempts));
                                 a.compact_pending = false;
@@ -30744,8 +30795,11 @@ impl OrchRegistry {
                                     .map(|b| b.instructions_file())
                                     .unwrap_or_else(|| role_instructions_file(a.role).to_string()),
                             );
-                            let ledger = self.ledger_path(&a.group, &a.id);
-                            to_reinject.push((a.id.clone(), a.group.clone(), instructions, ledger, 1, a.contract_carrier));
+                            // #925 — see the sibling sites above.
+                            if let Ok(agent_seg) = PathSegment::parse(&a.id) {
+                                let ledger = self.ledger_path(&a.group, &agent_seg);
+                                to_reinject.push((a.id.clone(), a.group.clone(), instructions, ledger, 1, a.contract_carrier));
+                            }
                         } else {
                             a.compact_pending = false;
                             a.compact_seen_busy = false;
@@ -31503,7 +31557,11 @@ impl OrchRegistry {
         if text.is_empty() {
             return Err("text must not be empty".into());
         }
-        let path = self.ledger_path(&a.group, agent_id);
+        // #925: `note_directive` is an MCP tool, so this id crossed a caller
+        // boundary. It has a real error channel, so it gets a real refusal.
+        let agent_seg = PathSegment::parse(agent_id)
+            .map_err(|e| format!("invalid agent id {agent_id:?}: {e}"))?;
+        let path = self.ledger_path(&a.group, &agent_seg);
         if replace {
             let mut body = text.to_string();
             if !body.ends_with('\n') {
@@ -36536,14 +36594,20 @@ impl OrchRegistry {
         if port == 0 {
             return Err("loomux MCP server is not running".into());
         }
+        // #925: the agent id becomes three file names below this point
+        // (`{id}.json`, `{id}-gemini-policy.toml`, `{id}-hooks.json`). Parse
+        // once, here, and thread the proof — the same parse-at-the-boundary
+        // shape `command_group` gives a group id.
+        let agent_seg = PathSegment::parse(agent_id)
+            .map_err(|e| format!("invalid agent id {agent_id:?}: {e}"))?;
         let dir = self.group_dir(group).join("configs");
         fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        let path = dir.join(format!("{agent_id}.json"));
+        let path = dir.join(format!("{agent_seg}.json"));
         // Gemini's file is a different schema entirely (its own settings.json,
         // not the claude/copilot MCP-config shape) and carries this agent's
         // containment as well as its MCP server — see `gemini_settings_json`.
         if cli == "gemini" {
-            let policy = self.write_gemini_policy(&dir, agent_id, containment)?;
+            let policy = self.write_gemini_policy(&dir, &agent_seg, containment)?;
             let cfg = gemini_settings_json(port, token, containment, policy.as_deref());
             fs::write(&path, cfg).map_err(|e| e.to_string())?;
             let env = cli_extra_env(cli, &path);
@@ -36605,7 +36669,7 @@ impl OrchRegistry {
     fn write_gemini_policy(
         &self,
         dir: &Path,
-        agent_id: &str,
+        agent_id: &PathSegment,
         containment: Containment,
     ) -> Result<Option<PathBuf>, String> {
         if !containment.denies_edits() {
@@ -36652,10 +36716,13 @@ impl OrchRegistry {
     /// files for this session" per the CLI reference, so an empty `hooks` key
     /// is not an inert placeholder — it is a claim about hooks that could
     /// displace the user's own.
+    /// `agent_id` is a [`PathSegment`] (#925): its `{agent_id}-hooks.json`
+    /// output is a file name, so the id must be proven a single component
+    /// before it gets there.
     fn write_hook_settings_file(
         &self,
         group: &GroupId,
-        agent_id: &str,
+        agent_id: &PathSegment,
         containment: Containment,
     ) -> Option<PathBuf> {
         let hooks = self.compact_hook_settings(group, agent_id);
@@ -38727,7 +38794,11 @@ impl OrchRegistry {
         // other CLI (Copilot's own hook wiring, below, needs no launch flag
         // at all — see `ensure_copilot_compact_hook`'s doc).
         let hook_settings = (cli == "claude")
-            .then(|| self.write_hook_settings_file(group_id, &agent_id, role.containment()))
+            .then(|| {
+                // #925: the settings file is named after the agent.
+                let agent_seg = PathSegment::parse(&agent_id).ok()?;
+                self.write_hook_settings_file(group_id, &agent_seg, role.containment())
+            })
             .flatten();
         // #417 (Copilot correction): Copilot auto-loads its user-level hooks
         // directory itself (no CLI flag needed, unlike Claude's `--settings`)
@@ -43993,9 +44064,15 @@ impl OrchRegistry {
         // gets it immediately; the sweep stays as the backstop for a holder
         // that dies without this path running at all.
         self.cleanup_agent_locks(agent_id, &snapshot.group);
-        let _ = fs::remove_file(
-            self.group_dir(&snapshot.group).join("configs").join(format!("{agent_id}.json")),
-        );
+        // #925: this is a `remove_file`, so the id reaching the file name is
+        // validated like every other member of the family. Fail-closed into the
+        // existing best-effort degrade — an id that could not name this file is
+        // an id that never wrote one, so there is nothing to reclaim.
+        if let Ok(agent_seg) = PathSegment::parse(agent_id) {
+            let _ = fs::remove_file(
+                self.group_dir(&snapshot.group).join("configs").join(format!("{agent_seg}.json")),
+            );
+        }
         self.audit(&snapshot.group, "loomux", "agent-exit",
             json!({ "agent": agent_id, "exit_code": exit_code }));
         crate::obs::breadcrumb(
@@ -46380,7 +46457,11 @@ fn register_orchestrator_pane(
     // #417, split from `cfg` per rev-4 review N2 — Claude's hook config rides
     // a per-agent `--settings` file; Copilot's own wiring needs no flag.
     let hook_settings = (cli == "claude")
-        .then(|| reg.write_hook_settings_file(&group.id, &agent_id, containment))
+        .then(|| {
+            // #925: the settings file is named after the agent.
+            let agent_seg = PathSegment::parse(&agent_id).ok()?;
+            reg.write_hook_settings_file(&group.id, &agent_seg, containment)
+        })
         .flatten();
     if cli == "copilot" {
         let _ = reg.ensure_copilot_compact_hook();
@@ -46583,7 +46664,12 @@ fn register_orchestrator_pane(
             // restart had no durable channel back in, even though the SAME
             // ledger file `compact_reinjection_notice` already reads back on
             // a real compaction sat right there on disk.
-            let ledger_path = reg2.ledger_path(&group2.id, &agent_id);
+            // #925: an id that cannot name a file yields an empty path, which
+            // `read_to_string` then fails on into the same `unwrap_or_default`
+            // degrade an absent ledger already takes.
+            let ledger_path = PathSegment::parse(&agent_id)
+                .map(|agent_seg| reg2.ledger_path(&group2.id, &agent_seg))
+                .unwrap_or_default();
             let ledger = fs::read_to_string(&ledger_path).unwrap_or_default();
             let ledger_embed = directive_ledger_embed(
                 &ledger, DIRECTIVE_LEDGER_EMBED_CAP_BYTES, &ledger_path.display().to_string(),
