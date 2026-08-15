@@ -67,6 +67,42 @@ insert takes the mean, so a total that drifts on every close makes every later
 newcomer drift with it. Preserving it is what makes the invariant hold across a
 whole session rather than a single operation.
 
+### Why the weights are re-based anyway (#954)
+
+The shares are stable across a whole session; the *numbers carrying them* are
+not. A close preserves the total across one fewer pane, so it multiplies the
+row by `(n+1)/n`, and an insert arrives at the mean, which leaves the mean
+exactly where it found it. Every open/close cycle therefore scales the whole row
+up — 4/3 of itself on a three-pane row — with the layout staying perfectly
+correct the entire time. Around 120 cycles of that and the `flex` attributes,
+and the saved layout, are in exponential notation; far enough and the total is
+`Infinity`, which is the one junk value the per-weight repair cannot catch,
+since every individual weight is still a finite positive number and only their
+*sum* is nonsense. The newcomer's mean is then `Infinity`, and so is every pane
+in the split.
+
+So `paneequalize.ts` re-bases a row whose largest weight has left `[1e-3, 1e3]`,
+putting that largest pane back at exactly 1 — the value a fresh pane is written
+at. Three things make this cheap rather than a second policy:
+
+- **It cannot move a pane.** Both operations commute with a uniform rescale
+  (the mean of `k·w` is `k·mean`; an equal absolute share of `k·freed` is
+  `k·each`), so magnitude carries no layout information at all. The test
+  compares an absurdly-scaled row's results against the same shape at 1x and
+  demands identical shares.
+- **It is measured on the largest weight, not the total,** because a total can
+  already be `Infinity` by the time anything looks at it, and catching that is
+  half the point.
+- **The band is wide, not tight.** Normalizing on every call would be simpler,
+  but the rescale — meaningless as it is to the layout — still rewrites numbers
+  a human may recognise in DevTools or in a persisted layout. Doing it only once
+  they have stopped being readable keeps the common path byte-for-byte what it
+  was, which is also why every assertion written for #936 still holds unchanged.
+
+It is self-healing in the direction that matters: a layout saved by a build
+without this comes back at whatever magnitude it drifted to and is re-based by
+the first split or close in it.
+
 ## Scope, and what this deliberately does not touch
 
 - **Cross-direction splits are unchanged.** Splitting *down* on a pane in a row

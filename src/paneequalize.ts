@@ -76,6 +76,50 @@ function sane(weights: readonly number[]): number[] {
   return weights.map((w) => (Number.isFinite(w) && w > 0 ? w : 1));
 }
 
+// THE MAGNITUDE, WHICH DRIFTS EVEN THOUGH THE LAYOUT DOES NOT (#954)
+//
+// Nothing about a split's layout depends on how BIG its weights are: a pane's
+// size is its share of the total, and both operations below commute with a
+// uniform rescale (insert takes the mean; removal adds an equal absolute part —
+// scale the row by k and both results scale by k). The magnitudes drift anyway,
+// and only ever upward. An insert arrives at the mean, which leaves the mean
+// exactly where it was; a removal preserves the total across one fewer pane,
+// which multiplies it by (n+1)/n. So every open/close cycle multiplies the whole
+// row by (n+1)/n — 4/3 on a three-pane row — with the ratios, and therefore the
+// layout, staying perfectly correct the entire time.
+//
+// That is invisible until it isn't: ~120 cycles of it reaches exponential
+// notation in the `flex` attributes and the persisted layout, and enough of it
+// reaches a total of Infinity, where `sane` above cannot help — every individual
+// weight is still a finite positive number and only their SUM is junk, so the
+// newcomer's mean, or the freed weight a close hands out, comes out Infinity and
+// lands on every pane in the split.
+//
+// Hence a re-base, on the largest weight rather than the total (a total can
+// already be Infinity by the time we look at it, and catching that is half the
+// point). It is deliberately a wide band rather than a normalize-every-call: the
+// rescale carries no layout meaning, but it does rewrite numbers a human may
+// recognise in DevTools or in a saved layout, so it happens only once they have
+// stopped being readable at all.
+const MAX_WEIGHT = 1e3;
+const MIN_WEIGHT = 1e-3;
+
+/** Bring a row back to a legible scale — largest pane at exactly 1, which is
+ *  also what a fresh pane is written at — preserving every pane's share, and so
+ *  moving nothing on screen. A row already in the band is handed straight back
+ *  untouched. */
+function rebase(row: number[]): number[] {
+  if (row.length === 0) return row;
+  // `sane` runs first at both call sites, so every entry — and this max — is
+  // finite and strictly positive.
+  const max = row.reduce((a, b) => (b > a ? b : a), 0);
+  if (max >= MIN_WEIGHT && max <= MAX_WEIGHT) return row;
+  // Repaired again on the way out: a row whose spread is wider than a float can
+  // represent underflows to zero here, and a zero-grow child in a flex-basis:0
+  // split is an invisible pane.
+  return sane(row.map((w) => w / max));
+}
+
 /** Plan a SAME-DIRECTION insert: a new pane joins `weights` as a flat sibling
  *  of the child at `targetIndex`, landing after it (or `before` it).
  *
@@ -98,7 +142,7 @@ export function planEvenInsert(
   targetIndex: number,
   before = false
 ): EvenInsertPlan {
-  const row = sane(weights);
+  const row = rebase(sane(weights));
   // An empty split has no target to insert beside and no mean to take; hand
   // back one usable weight so a caller in an impossible state still writes a
   // valid layout rather than `flex: NaN 1 0`.
@@ -118,8 +162,12 @@ export function planEvenInsert(
  *  The split's TOTAL weight is preserved exactly, which is the property that
  *  matters to everything outside this split: a nested split's own weight in
  *  its parent is a separate number, but a row whose total drifts on every
- *  close makes the next insert's mean drift with it. Preserving it means the
- *  arithmetic stays stable across any number of open/close cycles.
+ *  close makes the next insert's mean drift with it.
+ *
+ *  Preserved across one fewer pane, note, which is exactly why the row's
+ *  MAGNITUDE climbs on every open/close cycle and why `rebase` above exists —
+ *  the shares are stable across any number of cycles, the numbers carrying
+ *  them are not (#954).
  *
  *  Returns the survivors' weights in child order. A removal that empties the
  *  split returns an empty array, and one that leaves a single child returns
@@ -127,7 +175,7 @@ export function planEvenInsert(
  *  its parent's slot right after, overwriting that weight, so it is written
  *  for the caller that does not. */
 export function planRemoval(weights: readonly number[], removedIndex: number): number[] {
-  const row = sane(weights);
+  const row = rebase(sane(weights));
   if (row.length === 0) return [];
   const idx = Math.trunc(removedIndex);
   // Out of range: nothing left the split, so nothing is redistributed. Better
