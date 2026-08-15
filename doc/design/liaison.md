@@ -103,3 +103,20 @@ every exception enumerated*, and this is the enumeration:
   yet. The authoring skill's field table lists the value because that table is
   the *parse contract* and a parse contract that omits an accepted value is
   wrong; it deliberately carries no "how to build a liaison" recipe.
+
+### One known imprecision, left deliberately
+
+`recommend_capacity` and `extra_tiers` count reviewer blocks by `kind`, so a
+liaison counts as a reviewer in the launcher's capacity advisory. The **number
+is right** and stays right: a liaison is a live pane and does occupy a
+`max_agents` slot, which is the v1 position — exempting it is code the
+degradation story does not need. What is imprecise is only the **noun**: a
+roster carrying a liaison can read "1 more reviewer" where the extra slot is
+the liaison.
+
+`reviewers_needed` is unaffected in the case that matters, because a gated
+roster derives it from the gate's own reviewer list, which can never name a
+liaison. Naming the liaison separately in that advisory belongs with the
+`max_agents` question the lifecycle slice already owns, not here — a capacity
+refactor riding along in the slice that introduces the hint would make both
+harder to review.
