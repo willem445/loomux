@@ -593,14 +593,17 @@ so far:
   and INVARIANT 1 still forbids routing around it. The closing "sanctioned exceptions"
   parenthetical lists it with the others.
 
-  Both halves also state **where the authorization may come from**, and it is the narrower of the
-  two readings on purpose: the **kickoff config**, never a file in the repository. An earlier
-  draft said "your kickoff config or the group's declared workflow names the class", which invites
-  exactly the escalation the gate exists to stop — a workflow file is agent-editable, so a
-  config-named class would let an orchestrator mint its own merge authority by committing to it.
-  "You never grant yourself one, and no file in the repository grants you one either" is the
-  same rule as "a workflow file can never grant a capability", stated where an orchestrator
-  reading about a new merge opening will hit it.
+  Both halves also state **where the authorization comes from and why an orchestrator cannot mint
+  itself one** — the load-bearing half, since a workflow file *is* agent-editable and a
+  declaration in one is what makes the process-pro's class exist. The guarantee is not "no repo
+  file is involved", which would be false; it is the closed-set rule the liaison note states
+  (`doc/design/liaison.md`): a workflow file only **selects** a class from loomux's closed set and
+  **cannot author what the selection means**, which loomux's own code fixes — the same reason a
+  workflow file can never grant a capability. And a workflow block reaches a running config only
+  through a gate the orchestrator does not control: the kickoff, or the human merge gate on the
+  default branch. So the source is stated as "named by your kickoff config, or arising as a loomux
+  product default for a specific class of PR", and the anti-self-mint sentence argues the
+  mechanism rather than asserting a cleaner claim that would not survive contact with it (#1021).
 
   Deliberately generic, and that is the whole reason this re-bless is small: naming the
   process-pro here would fail
