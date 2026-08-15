@@ -876,8 +876,21 @@ from a unit test of product code, agents are banned from running cargo locally
     Every outbound edge was already across, which is why this batch is large in
     lines and small in argument. `queue` reaches `GroupId` (batch 2),
     `model::Delivery` (batch 8) and `text::LOOMUX_NOTICE_MARKER` (batch 8);
-    `queuestate` reaches those, `queue` itself, and `obs::LockExt` (batch 7).
-    Nothing had to be lifted ahead of them. Every edit inside the two files is
+    `queuestate` reaches `GroupId`, `queue` itself and `obs::LockExt` (batch 7),
+    with `model::Delivery` appearing only inside its inline tests. Nothing had to
+    be lifted ahead of them. (Corrected in batch 11, and the shape of the error
+    is the reusable part: this paragraph originally wrote `queuestate`'s set as
+    "**those**, `queue` itself, and `obs::LockExt`" — folding in `queue`'s three
+    by reference and thereby claiming a `LOOMUX_NOTICE_MARKER` edge `queuestate`
+    does not have. Only `queue.rs` references that constant. **An edge list
+    written as a delta against the previous module's is not an edge list**; it
+    reads as one, it is shorter, and it is how a module acquires an edge in the
+    prose that it never had in the source. Enumerate per module, from the
+    module's own `use` lines and bodies. `lib.rs`'s header and
+    `orchestration/mod.rs`'s batch-10 comment both stated the set correctly, so
+    this was the one surface carrying it — checked by grepping the *entity*
+    across the tree rather than assumed from the phrasing, which is the repo's
+    standing rule for a corrected claim.) Every edit inside the two files is
     the prefix on one of those paths — `super::GroupId` → `crate::groupid::
     GroupId`, `super::Delivery` → `crate::model::Delivery`,
     `super::LOOMUX_NOTICE_MARKER` → `crate::text::LOOMUX_NOTICE_MARKER` (the
@@ -933,6 +946,108 @@ from a unit test of product code, agents are banned from running cargo locally
     an inbound edge never blocks a move. What is genuinely still same-tier is
     `mqloop` → `mqdriver`, unchanged since batch 9 — two files at the same stage
     of the extraction, which move together in a later batch.
+  - **Batch 11 — `intake`, the idle-tick intake gate's pure core**
+    (#332/#429/#795/#864/#778): the host-side, zero-token diff of what changed
+    on GitHub since the last poll — label deltas, PR check-state transitions, PR
+    comment/review activity, and the full-autonomy eligible-unstarted set — plus
+    the bounded wake summary it composes, the poll-scheduling policy
+    (`due_intake_polls`), and the pure decision of whether a tick that has
+    cleared its quiet window should actually wake the orchestrator.
+
+    Small in argument, because batches 2, 3 and 8 had already cleared it: the
+    whole outbound set is `notify` (the check-state vocabulary and the #189
+    `gh`-text sanitizer), `model::DEFAULT_INTAKE_POLL_MINUTES` and
+    `groupid::GroupId`. Every edit inside the file is the prefix on one of those
+    three, in the body and in the moved `#[cfg(test)]` module alike. Batch 7's
+    macro sweep is clean, and no dependency joins (`serde`, `serde_json`, `std`,
+    declared since batch 3). The impure half stays behind and is unaffected:
+    `poll_intake` — the two `gh` calls, the allow-list in `src-tauri/src/gh.rs`
+    they go through, the audit records — and `idle_tick_tick` still spell
+    `intake::…` through the re-export.
+
+    The re-export is the plain **module** form, and batch 10's rule is applied
+    rather than restated: every consumer spells the module path
+    (`intake::due_intake_polls` and `intake::PendingIntake` in `mod.rs`,
+    `intake::eligible_deltas` in `tests/workflow.rs`,
+    `loomux_lib::orchestration::intake::MAX_INTAKE_POLLS_PER_TICK` in
+    `tests/orchestration.rs`), no flat `orchestration::<item>` spelling exists,
+    and #988's trap has nothing to catch — **not one `pub(super)` or
+    `pub(crate)` item in the file**, so the boundary force-widens nothing and
+    the private members (`RawLabel`, `RawIssueJson`, `RawRollupEntry`,
+    `RawCommentJson`, `RawReviewJson`, `RawPrJson`, `rollup_entry_state`,
+    `parse_task_issue_ref`, `PendingIntake::blocks`/`dropped`) stay private.
+    Scoped as batch 10 scopes it: no item widened, the `orchestration::intake::`
+    spelling reaches the identical set, and the new `loomux_engine::intake::`
+    spelling is inherent to crossing the boundary rather than to the shape.
+
+    ### A file a test names by path is an edge, and no `use` line shows it
+
+    This is the batch's finding, and it is batch 2's question — *where can the
+    violation be spelled now?* — asked of a **file** instead of a type. Eleven
+    batches have enumerated a module's edges from `super::`/`crate::` paths;
+    batch 7 added `env!` and its macro siblings, on the ground that they name
+    the crate a file is compiled in and no grep for `use` finds them. Here is a
+    third kind: `src-tauri/tests/orchestration.rs`'s
+    `poll_intake_still_asks_gh_for_comment_and_review_activity` opens
+    `intake.rs` **by literal path** and asserts the `createdAt`/`submittedAt`
+    serde renames are still there — because losing them degrades the #864
+    comment signal to permanent silence, with a positive test blessing the
+    degraded shape and every other test green.
+
+    So the batch does **not** claim zero test edits. It repoints that read at
+    `crates/loomux-engine/src`, spelled the way `tests/groupid.rs` already
+    spells its second source root, and changes nothing else about the test. The
+    failure direction is the mild one — a moved file makes the read fail loudly
+    on the first CI round, unlike batch 2's tripwire, which would have gone
+    green forever while watching a directory the violation could no longer
+    reach. That asymmetry is worth carrying: **a path-scanning test either
+    breaks loudly or goes silently blind when its subject moves, and which one
+    you get depends on whether it reads a file or walks a root.** Sweep a moving
+    file for who reads it *as a file*, alongside the `use` lines and the macros.
+
+    One consequence, easy to reintroduce and cheap to prevent: the same test's
+    other half scans `orchestration/mod.rs` for the *call* to `intake`'s `gh pr
+    list` argv builder, and that scan is `contains`-based. Spelling that call in
+    a **comment** — which the first draft of the batch-11 re-export block did,
+    twice — satisfies the pin from prose and leaves it green over a poller that
+    had stopped calling the builder at all. The comment now states the
+    prohibition where the next editor will read it.
+
+    ### The re-export it removed
+
+    Batch 8 lifted `DEFAULT_INTAKE_POLL_MINUTES` into `model` and gave it a flat
+    `pub(crate)` re-export in `orchestration/mod.rs` for its one caller,
+    `intake.rs`, which was still in `src-tauri`. That caller is in the engine
+    now and spells `crate::model::…`, so nothing in `src-tauri` names the const
+    in code at all. The line comes off. `mod.rs`'s own comment says those
+    `pub use` lines "are the list, so it cannot go stale", and a list is only
+    that if entries leave it when their reason does — a dead re-export is a
+    reader's re-derivation, deferred. The item is untouched: still `pub` in the
+    engine, still reachable as
+    `orchestration::model::DEFAULT_INTAKE_POLL_MINUTES` through the existing
+    module re-export. Two doc claims in `model.rs` that named `intake.rs` as a
+    `src-tauri` caller reaching the flat spelling through `super::` are
+    corrected in the same commit, since the move is what falsified them.
+
+    ### What it owed in evidence
+
+    A **pure relocation**, exemption taken whole — a `git mv`, five import
+    prefixes, the re-export lines, and prose. Every behaviour the move could
+    break is pinned by tests that neither moved nor changed an assertion:
+    `tests/orchestration.rs` drives the gate through the re-export across its
+    surface (the wake summary's four signal kinds and both PARTIAL caveats, the
+    fetch-bound argv pins, the smart default, `MAX_INTAKE_POLLS_PER_TICK`, the
+    fallback backoff and the idle-tick wiring), `tests/workflow.rs` drives
+    `eligible_deltas`/`OpenIssueList` (#778) through the same re-export, and the
+    file's own inline `#[cfg(test)]` module travels with it as engine unit tests.
+    Both suites reach the module by `use loomux_lib::orchestration::intake;`,
+    unchanged — the only edit under `src-tauri/tests/` is the literal path
+    above, which is why the exemption survives the test edit rather than being
+    voided by it: the edit repoints a read, and pins nothing new.
+
+    Batch 2's tripwire question is answered nil for `tests/groupid.rs` — its
+    scan already walks both source roots, and `intake.rs` joins no group id onto
+    a path; its one `GroupId` use is a `HashMap` key in `due_intake_polls`.
 - **A4 — the registry.** `OrchRegistry`, the decision layer, and a PTY
   output-sink seam, so the crate compiles with no `tauri` anywhere in its tree.
   A CI step proves that from `cargo tree` rather than from this paragraph. This
