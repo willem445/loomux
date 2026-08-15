@@ -66,7 +66,7 @@ Each is shipped, tested, and citable — prefer copying one to inventing a shape
   #719/#734), `PtyManager::output_tail_bounded` (~L453) and
   `orchestration/mod.rs` `ATTENTION_SCAN_BYTES` = 4096 (~L2367, #725), with
   `STATUSLINE_SCAN_BYTES` = 64 KiB (~L7007) the same shape on the app's
-  hottest poll (#743 S7). Also `orchestration/queuestate.rs` `QueueMap::mutate` (~L163),
+  hottest poll (#743 S7). Also `loomux-engine/src/queuestate.rs` `QueueMap::mutate` (~L163),
   `orchestration/mod.rs` `OrchRegistry::poll_watches` (~L22741) and
   `OrchRegistry::compact_signals_from` (~L25782), which snapshot then release.
   The last of those is pinned by a test rather than by review —

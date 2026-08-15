@@ -7569,9 +7569,9 @@ is the impure half.
   none, and the re-derivation itself dropped a row its own grep HAD returned. A rule enforced by
   remembering to read a document nine thousand lines from the code is not enforced.
 
-  **The two rules this table used to keep are now kept by the compiler** (`src-tauri/src/
-  orchestration/queuestate.rs`; see "Compile-time invariants (#562/#497)" below for the mechanism
-  and its exact limits):
+  **The two rules this table used to keep are now kept by the compiler** (`crates/loomux-engine/
+  src/queuestate.rs`, re-exported as `orchestration::queuestate`; see "Compile-time invariants
+  (#562/#497)" below for the mechanism and its exact limits):
 
   - *Every `queues` mutation persists.* `queues` is a `QueueMap`, in its OWN module, with a private
     inner map. The only `&mut` door is `QueueMap::mutate`, which takes the snapshot writer as an
@@ -7685,11 +7685,14 @@ is the impure half.
   above: the arithmetic and the shared-helper note stay (they still help a reader), but nothing
   durable now depends on either being noticed.
 - **Compile-time invariants (#562/#497) — where the two rules above actually live.**
-  `src-tauri/src/orchestration/queuestate.rs`, a module whose entire reason to exist is a
-  *privacy boundary*: Rust's privacy is per-module and `orchestration/mod.rs` is one 31k-line
-  module, so a field declared private there is still reachable from every line of it. Moving the
-  two maps into a file of their own is what makes "the only way in is the sanctioned way" a thing
-  `rustc` checks rather than a thing this document asserts.
+  `crates/loomux-engine/src/queuestate.rs` (#888 slice A3 batch 10 moved it there from
+  `src-tauri/src/orchestration/`; `orchestration::queuestate` still resolves, and the boundary
+  below is unaffected because it was never about which crate the module sits in), a module whose
+  entire reason to exist is a *privacy boundary*: Rust's privacy is per-module and
+  `orchestration/mod.rs` is one 31k-line module, so a field declared private there is still
+  reachable from every line of it. Moving the two maps into a file of their own is what makes
+  "the only way in is the sanctioned way" a thing `rustc` checks rather than a thing this
+  document asserts.
 
   - `QueueMap::read()` hands out a `QueueRead` that derefs only immutably — deliberately not the
     bare `MutexGuard`, which also derefs mutably and would reopen the door from a method called

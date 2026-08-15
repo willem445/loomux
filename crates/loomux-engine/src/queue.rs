@@ -420,7 +420,7 @@ pub struct QueuedDelivery {
     /// does not parse maps to `None`, which is exactly what `None` already means
     /// here: no recorded identity, matches nothing, never joined onto a path.
     #[serde(default, deserialize_with = "lenient_group_id")]
-    pub group: Option<super::GroupId>,
+    pub group: Option<crate::groupid::GroupId>,
     /// #467: whether the target was this group's orchestrator — the one
     /// delivery target with an identity that outlives a restart.
     ///
@@ -481,17 +481,17 @@ pub struct QueuedDelivery {
     /// snapshots and restarts land on one behavior, and it is the one that
     /// takes no action against a live pane.
     #[serde(default)]
-    pub delivery_kind: super::Delivery,
+    pub delivery_kind: crate::model::Delivery,
 }
 
 /// A persisted group id that fails [`GroupId::parse`] reads as `None` rather
 /// than failing the whole entry (rev-440 N3). See [`QueuedDelivery::group`].
-fn lenient_group_id<'de, D>(de: D) -> Result<Option<super::GroupId>, D::Error>
+fn lenient_group_id<'de, D>(de: D) -> Result<Option<crate::groupid::GroupId>, D::Error>
 where
     D: Deserializer<'de>,
 {
     let raw = Option::<String>::deserialize(de)?;
-    Ok(raw.and_then(|s| super::GroupId::parse(&s).ok()))
+    Ok(raw.and_then(|s| crate::groupid::GroupId::parse(&s).ok()))
 }
 
 /// The outcome of offering a new TEXT payload to a pane's queue. Pure — no
@@ -1014,7 +1014,7 @@ pub const LOOMUX_SENDER: &str = "loomux";
 ///   subject, with its own recovery, and counting it here would put a
 ///   deadlock diagnosis on an ordinary busy pane.
 /// - The marker alone UNDER-guards. Agent text is relayed verbatim, and
-///   [`super::LOOMUX_NOTICE_MARKER`]'s own doc states the limit in these
+///   [`crate::text::LOOMUX_NOTICE_MARKER`]'s own doc states the limit in these
 ///   words: a marker row is evidence that *someone wrote a notice-shaped
 ///   row*, never proof that loomux wrote this one. An agent that opens a
 ///   `message_agent` with `[loomux]` would otherwise be able to make loomux
@@ -1031,7 +1031,7 @@ pub fn is_loomux_notice(entry: &QueuedDelivery) -> bool {
             // "this row leads with the marker", and neither indentation nor a
             // re-cased prefix changes that. No de-framing, because this is a
             // payload loomux constructed, not a row read back off a pane.
-            t.trim_start().to_lowercase().starts_with(super::LOOMUX_NOTICE_MARKER)
+            t.trim_start().to_lowercase().starts_with(crate::text::LOOMUX_NOTICE_MARKER)
         })
 }
 
@@ -2074,7 +2074,7 @@ mod tests {
             group: Some("g-1".try_into().unwrap()),
             to_orchestrator: false,
             session_id: None,
-            delivery_kind: super::super::Delivery::MidSession,
+            delivery_kind: crate::model::Delivery::MidSession,
         }
     }
 
@@ -2123,7 +2123,7 @@ mod tests {
             group: Some("g-1".try_into().unwrap()),
             to_orchestrator: false,
             session_id: None,
-            delivery_kind: super::super::Delivery::MidSession,
+            delivery_kind: crate::model::Delivery::MidSession,
         });
         // Empty string would trivially "match" a bad comparison — pin the
         // marker is simply never a coalesce target at all.
@@ -2329,7 +2329,7 @@ mod tests {
             group: Some("g-1".try_into().unwrap()),
             to_orchestrator: false,
             session_id: None,
-            delivery_kind: super::super::Delivery::MidSession,
+            delivery_kind: crate::model::Delivery::MidSession,
         }
     }
 
