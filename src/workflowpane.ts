@@ -97,7 +97,13 @@ export type Selection =
   | { kind: "workflow" }
   | { kind: "block"; index: number }
   | { kind: "gate" }
-  | { kind: "edge"; from: string; to: string };
+  | { kind: "edge"; from: string; to: string }
+  /** The three OPTIONAL policy sections (#1020). They are addressed by nothing at all —
+   *  there is exactly one of each, and (unlike a block or an edge) selecting one that the
+   *  file does not declare is not a stale selection but the ordinary way to declare it. */
+  | { kind: "intake" }
+  | { kind: "merge_queue" }
+  | { kind: "resources" };
 
 /** What the inspector actually renders. `Selection` is what the human last pointed at;
  *  `InspectorTarget` is what is still *there* to show them — the two differ whenever the model
@@ -109,7 +115,10 @@ export type InspectorTarget =
   | { kind: "workflow" }
   | { kind: "block"; index: number }
   | { kind: "gate" }
-  | { kind: "edge"; from: string; to: string };
+  | { kind: "edge"; from: string; to: string }
+  | { kind: "intake" }
+  | { kind: "merge_queue" }
+  | { kind: "resources" };
 
 /** What the inspector shows for the current selection.
  *
@@ -179,6 +188,26 @@ export function inspectorHeading(
       return { title: "Merge gate", sub: "gate · merge" };
     case "edge":
       return { title: `${target.from} → ${target.to}`, sub: "edge · advisory" };
+    // The policy sections say, in the sub-line, whether the FILE declares them — because
+    // "declared" and "inheriting loomux's default" are the distinction those three forms
+    // exist to make visible, and it is invisible everywhere else in the pane.
+    case "intake":
+      return {
+        title: "Intake",
+        sub: w.intake ? "intake · declared" : "intake · not declared (inherited)",
+      };
+    case "merge_queue":
+      return {
+        title: "Merge queue",
+        sub: w.merge_queue ? "merge_queue · declared" : "merge_queue · not declared (off)",
+      };
+    case "resources": {
+      const n = Object.keys(w.resources ?? {}).length;
+      return {
+        title: "Resources",
+        sub: w.resources ? `resources · ${n} declared` : "resources · not declared (no locks)",
+      };
+    }
     case "workflow":
       return { title: "Workflow settings", sub: w.name || "(unnamed)" };
   }

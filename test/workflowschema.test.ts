@@ -24,6 +24,14 @@ import {
   parseWorkflow,
   roleHintRequires,
   serializeWorkflow,
+  RESOURCE_SLOTS_MIN,
+  RESOURCE_SLOTS_MAX,
+  RESOURCE_MAX_HOLD_MINUTES_MIN,
+  RESOURCE_MAX_HOLD_MINUTES_MAX,
+  RESOURCES_MAX,
+  MERGE_QUEUE_MAX_BATCH_MIN,
+  MERGE_QUEUE_CHECKS_TIMEOUT_MIN,
+  MERGE_QUEUE_CHECKS_TIMEOUT_MAX,
   type Workflow,
 } from "../src/workflowmodel.ts";
 import { DEFAULT_HOLD } from "../src/issuesmodel.ts";
@@ -39,6 +47,12 @@ interface SchemaField {
   required?: boolean;
   min?: number;
   max?: number;
+  /** How many entries a `section-map` may hold (`workflow.resources`). */
+  max_entries?: number;
+  /** What the ENGINE does with a value outside `min`/`max` — refuse the whole file, or
+   *  quietly pull it into range. Pinned behaviorally against `parse_workflow` on the Rust
+   *  side; the pane's half is that the two produce different severities (#1020). */
+  on_out_of_range?: "refuse" | "clamp";
 }
 interface SchemaSection {
   title: string;
@@ -380,9 +394,10 @@ label would otherwise be shown a veto that holds nothing"
 //
 // Only the fields the pane HAS a rule for are covered, and the gaps are named rather
 // than quietly skipped:
-//   - `intake.source`, `effort` and `context` have no validation rule in this model at
-//     all (the CLI knobs are capability data the backend owns, and intake's vocabulary
-//     is nobody's business until slice E's `workflow_check` asks the engine directly);
+//   - `effort` and `context` have no validation rule of their own in this model (they are
+//     capability data the backend owns, answered per CLI/model by `agent_cli_knobs`);
+//     `intake.source` grew one with #1020, when the pane gained the form that writes it —
+//     a picker offering a source the parser refuses is the failure the rule exists to stop;
 //   - `block.cli: ""` is legal to the ENGINE (inherit the group's CLI) and the pane
 //     deliberately still asks for an explicit one. That asymmetry is left alone here on
 //     purpose: a pane stricter than the engine can annoy, but it cannot mislead someone
@@ -428,6 +443,15 @@ test("every enum value the manifest declares is one the PANE accepts too", () =>
       `block.role_hint: ${JSON.stringify(hint)} must pair cleanly with kind ${required}`
     );
   }
+  for (const source of manifestValues("intake", "source")) {
+    const codes = findingCodesFor(
+      `version: 1\nblocks:\n  - id: b\n    kind: worker\n    cli: claude\nintake:\n  source: "${source}"\n`
+    );
+    assert.ok(
+      !codes.includes("intake-unknown-source"),
+      `intake.source: the manifest declares ${JSON.stringify(source)} and the pane calls it unknown — including "" , which means the built-in source`
+    );
+  }
   for (const require of manifestValues("gate", "require")) {
     const threshold = require === "threshold" ? "    threshold: 1\n" : "";
     const codes = findingCodesFor(
@@ -455,4 +479,91 @@ test("…and a value outside a declared enum is still refused by the pane", () =
       "version: 1\nblocks:\n  - id: rev\n    kind: reviewer\n    cli: claude\ngates:\n  merge:\n    require: most\n    reviewers: [rev]\n"
     ).includes("gate-unknown-require")
   );
+  assert.ok(
+    findingCodesFor(
+      "version: 1\nblocks:\n  - id: b\n    kind: worker\n    cli: claude\nintake:\n  source: jira\n"
+    ).includes("intake-unknown-source")
+  );
+});
+
+// ---------- (e) the pane's numeric bounds ARE the manifest's (#1020) ----------
+//
+// The forms for `merge_queue:` and `resources:` clamp what they write, and the validation
+// pass flags a hand-written value outside the same range. Both read constants in
+// `workflowmodel.ts` — a hand-written mirror, like `WORKFLOW_CLIS` and `GATE_REQUIRES`
+// before them, and hand-written for the same reason (that module is pure and import-free,
+// so it cannot read the manifest at runtime).
+//
+// This is the link that makes the mirror safe rather than merely convenient: the Rust side
+// pins the manifest's bounds against the engine's own constants
+// (`workflow_schema_field_facts`), and this pins the pane's constants against the manifest.
+// Engine → manifest → pane, with no step left to assumption. A `RESOURCE_SLOTS_MAX` bumped
+// to 128 in the engine reddens the Rust test; one bumped only in the pane reddens this.
+
+const bound = (section: string, field: string): SchemaField => {
+  const f = manifest.sections[section]?.fields.find((x) => x.name === field);
+  assert.ok(f, `${section}.${field} must exist in the manifest`);
+  return f;
+};
+
+test("every bound the pane clamps to is the bound the manifest declares (#1020)", () => {
+  assert.deepEqual(
+    [bound("resource", "slots").min, bound("resource", "slots").max],
+    [RESOURCE_SLOTS_MIN, RESOURCE_SLOTS_MAX]
+  );
+  assert.deepEqual(
+    [bound("resource", "max_hold_minutes").min, bound("resource", "max_hold_minutes").max],
+    [RESOURCE_MAX_HOLD_MINUTES_MIN, RESOURCE_MAX_HOLD_MINUTES_MAX]
+  );
+  assert.equal(bound("merge_queue", "max_batch").min, MERGE_QUEUE_MAX_BATCH_MIN);
+  assert.deepEqual(
+    [
+      bound("merge_queue", "checks_timeout_minutes").min,
+      bound("merge_queue", "checks_timeout_minutes").max,
+    ],
+    [MERGE_QUEUE_CHECKS_TIMEOUT_MIN, MERGE_QUEUE_CHECKS_TIMEOUT_MAX]
+  );
+  // The one cardinality cap: an "add a resource" button that writes a 33rd entry produces a
+  // file the engine refuses whole, so the form disables itself at exactly this number.
+  assert.equal(bound("workflow", "resources").max_entries, RESOURCES_MAX);
+});
+
+test("refuse-vs-clamp is the difference between an error and a warning in the pane (#1020)", () => {
+  // The manifest states which of the two the engine does; the pane must say the matching
+  // thing, because "your file will not load" and "your file will not do what it says" send a
+  // human to different places. A pane that called a clamped value an error would be crying
+  // wolf; one that called a refused value a warning would be blessing a file that never loads.
+  const cases: { section: string; field: string; text: string }[] = [
+    {
+      section: "merge_queue",
+      field: "max_batch",
+      text: "version: 1\nblocks:\n  - id: b\n    kind: worker\n    cli: claude\nmerge_queue:\n  max_batch: 0\n",
+    },
+    {
+      section: "merge_queue",
+      field: "checks_timeout_minutes",
+      text: "version: 1\nblocks:\n  - id: b\n    kind: worker\n    cli: claude\nmerge_queue:\n  checks_timeout_minutes: 9999\n",
+    },
+    {
+      section: "resource",
+      field: "slots",
+      text: "version: 1\nblocks:\n  - id: b\n    kind: worker\n    cli: claude\nresources:\n  ci:\n    slots: 9999\n",
+    },
+    {
+      section: "resource",
+      field: "max_hold_minutes",
+      text: "version: 1\nblocks:\n  - id: b\n    kind: worker\n    cli: claude\nresources:\n  ci:\n    max_hold_minutes: 9999\n",
+    },
+  ];
+  for (const c of cases) {
+    const declared = bound(c.section, c.field).on_out_of_range;
+    assert.ok(declared, `${c.section}.${c.field}: the manifest must say refuse or clamp`);
+    const found = analyzeWorkflow(c.text).findings.filter((f) => f.code === "section-out-of-range");
+    assert.equal(found.length, 1, `${c.section}.${c.field}: out of range and unreported`);
+    assert.equal(
+      found[0]!.severity,
+      declared === "refuse" ? "error" : "warning",
+      `${c.section}.${c.field}: the manifest says the engine will ${declared} it`
+    );
+  }
 });

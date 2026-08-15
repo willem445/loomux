@@ -153,6 +153,42 @@ test("every target names itself — an inspector with a blank header is a pane y
   );
 });
 
+// ---------- the policy sections (#1020) ----------
+
+test("the three policy sections are selections like any other — and survive not being declared", () => {
+  // `intake:`, `merge_queue:` and `resources:` are OPTIONAL sections: the common case is a file
+  // that declares none of them, and their forms are how you declare one. So — unlike a block or
+  // an edge — an undeclared section must NOT fall back to the workflow's own settings: falling
+  // back would make the row unclickable in exactly the state the human needs it (there is
+  // nothing there yet, and they want to add it).
+  const w = fixture();
+  assert.equal(w.intake, undefined, "the fixture declares none of them");
+  for (const sel of [
+    { kind: "intake" } as const,
+    { kind: "merge_queue" } as const,
+    { kind: "resources" } as const,
+  ]) {
+    assert.deepEqual(pane.inspectorTarget(sel, w, false), sel, `${sel.kind} must stay selected`);
+    // …and the one rule that has no exceptions: a buffer that doesn't parse blocks the editor,
+    // whatever is selected. These sections write the whole file back like every other form.
+    assert.deepEqual(pane.inspectorTarget(sel, w, true), { kind: "blocked" });
+  }
+});
+
+test("each policy section names itself in the header", () => {
+  const w = fixture();
+  const headings = (["intake", "merge_queue", "resources"] as const).map((kind) =>
+    pane.inspectorHeading({ kind }, w)
+  );
+  for (const h of headings) {
+    assert.ok(h.title.trim().length > 0, "a policy section with no title is an unreadable pane");
+    assert.ok(h.sub.trim().length > 0);
+  }
+  // Titles are distinct: three rows in one roster column that read the same are three rows the
+  // human cannot tell apart.
+  assert.equal(new Set(headings.map((h) => h.title)).size, 3);
+});
+
 // ---------- where a finding navigates ----------
 
 test("a finding that names a LINE goes to the YAML; one that names a BLOCK moves nothing", () => {

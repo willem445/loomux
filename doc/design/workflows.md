@@ -1765,10 +1765,29 @@ about.
 **What is deliberately not pinned**, so the claim above stays honest: `title`
 and `help` prose; `gate.require`'s accepted set, which the engine states only
 as match arms in `parse_workflow` and which is therefore hand-listed in
-`workflow_schema_field_facts()` with that caveat attached; and the enum fields
-the pane has no rule of its own for (`intake.source`, `effort`, `context`) —
-full engine parity for a live buffer is `workflow_check`'s job, not the
+`workflow_schema_field_facts()` with that caveat attached; and `effort` /
+`context`, which the pane has no rule of its own for because they are
+capability data the backend answers per CLI and model (`agent_cli_knobs`).
+Full engine parity for a live buffer remains `workflow_check`'s job, not the
 manifest's.
+
+**A field the pane can EDIT is a field the pane needs a rule for (#1020).**
+When the inspector grew forms for `intake:`, `merge_queue:` and `resources:`,
+each of those forms had to be able to answer "may I offer this value?" — and a
+picker that can spell what `parse_workflow` refuses is the same lie as a pane
+that blesses an illegal file, just earlier in the sequence. So `intake.source`,
+the intake label alphabet, the resource-name alphabet and the four numeric
+bounds joined the closed sets `workflowmodel.ts` already mirrors
+(`WORKFLOW_CLIS`, `BLOCK_KINDS`, `GATE_REQUIRES`, `roleHintRequires`), for the
+same reason and under the same discipline: hand-written because that module is
+pure and import-free, and *pinned* — `test/workflowschema.test.ts` now checks
+each constant against the manifest's own `min`/`max`/`max_entries`/`values`,
+which the Rust side already checks against the engine's constants. Engine →
+manifest → pane, with no step left to assumption. The manifest's
+`on_out_of_range` is honored rather than merely read: a bound the engine
+**refuses** is an error finding and a bound it **clamps** is a warning, because
+"your file will not load" and "your file will not do what it says" send a human
+to different places.
 
 **An empty value can be a real value.** `block.cli: ""` means "inherit the
 group's CLI, whatever the launcher picks" and `intake.source: ""` means the

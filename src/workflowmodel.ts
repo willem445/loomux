@@ -1018,7 +1018,10 @@ function emitIntakeLines(intake: WorkflowIntake, indent = ""): string[] {
   return emitMappingSection("intake", indent, body);
 }
 
-const INTAKE_LABEL_KEYS = ["ready", "investigate", "owned", "prototype", "hold"] as const;
+/** The five label fields, in the order the engine's own struct declares them — which is
+ *  therefore the order they are emitted in and the order a form should show them. */
+export const INTAKE_LABEL_KEYS = ["ready", "investigate", "owned", "prototype", "hold"] as const;
+export type IntakeLabelKey = (typeof INTAKE_LABEL_KEYS)[number];
 
 function emitIntakeLabelLines(labels: WorkflowIntakeLabels, indent: string): string[] {
   const field = `${indent}  `;
@@ -2211,6 +2214,7 @@ export function validateWorkflow(w: Workflow, knobs?: KnobLookup): Finding[] {
         });
       }
     }
+    findings.push(...allowFindings(b, where));
     findings.push(...knobFindings(b, where, knobs));
   }
 
@@ -2288,9 +2292,175 @@ export function validateWorkflow(w: Workflow, knobs?: KnobLookup): Finding[] {
     }
   }
 
+  findings.push(...sectionFindings(w));
   findings.push(...unknownKeyFindings(w));
   findings.push(...reachabilityFindings(w, byId));
   return findings;
+}
+
+/** The `allow:` half of the pre-run pass (#1020) — two rules, and they fail in opposite
+ *  directions, which is why they carry different severities.
+ *
+ *  A kind that may not declare `allow:` at all is a REFUSAL on the engine
+ *  (`parse_workflow`): the file does not load, so it is an error here. A pattern the
+ *  engine's `sanitize_allow` would REWRITE is the quieter one and arguably the worse: the
+ *  file loads, the agent spawns, and the tool pattern it was pre-approved for is not the
+ *  one anybody wrote — `Bash(echo "$X")` reaches the CLI as `Bash(echo X)`, which matches
+ *  nothing. Nothing downstream can tell the human that; this can. */
+function allowFindings(b: WorkflowBlock, where: string): Finding[] {
+  if (!b.allow?.length) return [];
+  const denial = allowDenialReason(b.kind);
+  if (denial) {
+    return [
+      {
+        severity: "error",
+        code: "allow-not-permitted",
+        message: `Block "${where}" declares allow:, which a ${b.kind} block may not — ${denial}.`,
+        blockId: b.id,
+      },
+    ];
+  }
+  const out: Finding[] = [];
+  for (const pattern of b.allow) {
+    const clean = sanitizeAllowPattern(pattern);
+    if (clean === null) {
+      out.push({
+        severity: "warning",
+        code: "allow-sanitized",
+        message:
+          `Block "${where}" declares the allow: pattern "${pattern}", which has no characters ` +
+          `loomux can pass to the CLI — it is dropped, and pre-approves nothing.`,
+        blockId: b.id,
+      });
+    } else if (clean !== pattern.trim()) {
+      out.push({
+        severity: "warning",
+        code: "allow-sanitized",
+        message:
+          `Block "${where}" declares the allow: pattern "${pattern}", but loomux passes only ` +
+          `letters, digits and ( ) : * _ - . / , and spaces — the CLI will be given "${clean}".`,
+        blockId: b.id,
+      });
+    }
+  }
+  return out;
+}
+
+/** The policy sections' half of the pre-run pass (#1020): `intake:`, `merge_queue:` and
+ *  `resources:`, checked against the same bounds and vocabularies `parse_workflow` uses.
+ *
+ *  All of these are things the pane can now WRITE, which is exactly why it must also be
+ *  able to say them: a form that offers a number the engine refuses turns a config screen
+ *  into a way to break your own workflow file, and the pane reporting "valid" over a file
+ *  that will not load is the failure mode this whole pass exists to prevent. Each finding
+ *  carries its `section`, so clicking it lands on the form that can fix it. */
+function sectionFindings(w: Workflow): Finding[] {
+  const out: Finding[] = [];
+  const err = (section: FindingSection, code: FindingCode, message: string): void => {
+    out.push({ severity: "error", code, message, section });
+  };
+
+  if (w.intake) {
+    if (w.intake.source !== undefined && !isIntakeSource(w.intake.source)) {
+      err(
+        "intake",
+        "intake-unknown-source",
+        `intake.source: "${w.intake.source}" is not a source loomux knows — use one of ${INTAKE_SOURCES.join(", ")} (or leave it out to inherit).`
+      );
+    }
+    for (const key of INTAKE_LABEL_KEYS) {
+      const v = w.intake.labels?.[key];
+      if (v !== undefined && !isValidIntakeLabel(v)) {
+        err(
+          "intake",
+          "intake-bad-label",
+          `intake.labels.${key}: "${v}" is not a usable label — letters, digits, - and _, no leading -, at most ${ID_MAX_CHARS} characters. ` +
+            `loomux rejects it rather than rewriting it, so your repo's own labels keep matching.`
+        );
+      }
+    }
+  }
+
+  const mq = w.merge_queue;
+  if (mq) {
+    if (
+      mq.max_batch !== undefined &&
+      (!Number.isInteger(mq.max_batch) || mq.max_batch < MERGE_QUEUE_MAX_BATCH_MIN)
+    ) {
+      err(
+        "merge_queue",
+        "section-out-of-range",
+        `merge_queue.max_batch: ${mq.max_batch} — a batch must carry at least ${MERGE_QUEUE_MAX_BATCH_MIN} PR, and a batch of none could never land anything.`
+      );
+    }
+    const timeout = mq.checks_timeout_minutes;
+    if (timeout !== undefined && Number.isInteger(timeout)) {
+      if (timeout < MERGE_QUEUE_CHECKS_TIMEOUT_MIN || timeout > MERGE_QUEUE_CHECKS_TIMEOUT_MAX) {
+        // CLAMPED by the engine, not refused — so this is a warning, and it says what will
+        // actually happen rather than implying the file is broken.
+        out.push({
+          severity: "warning",
+          code: "section-out-of-range",
+          message:
+            `merge_queue.checks_timeout_minutes: ${timeout} is outside ${MERGE_QUEUE_CHECKS_TIMEOUT_MIN}–${MERGE_QUEUE_CHECKS_TIMEOUT_MAX}, ` +
+            `so loomux will clamp it — the queue will not wait for the time this file names.`,
+          section: "merge_queue",
+        });
+      }
+    }
+  }
+
+  const resources = w.resources;
+  if (resources) {
+    const names = Object.keys(resources);
+    if (names.length > RESOURCES_MAX) {
+      err(
+        "resources",
+        "section-out-of-range",
+        `resources: ${names.length} declared — at most ${RESOURCES_MAX} are allowed (every name is listed in the acquire_lock tool description every agent in the group reads).`
+      );
+    }
+    for (const name of names) {
+      if (!isValidResourceName(name)) {
+        err(
+          "resources",
+          "resource-name-invalid",
+          `resources: "${name}" is not a usable resource name — letters, digits, - and _, at most ${ID_MAX_CHARS} characters. ` +
+            `loomux rejects it rather than rewriting it, so the name an agent's acquire_lock call uses is the name you wrote.`
+        );
+      }
+      const r = resources[name]!;
+      const bound = (
+        key: "slots" | "max_hold_minutes",
+        min: number,
+        max: number,
+        why: string
+      ): void => {
+        const v = r[key];
+        if (v === undefined) return;
+        if (!Number.isInteger(v) || v < min || v > max) {
+          err(
+            "resources",
+            "section-out-of-range",
+            `resources.${name}.${key}: ${v} is outside ${min}–${max} — ${why}.`
+          );
+        }
+      };
+      bound(
+        "slots",
+        RESOURCE_SLOTS_MIN,
+        RESOURCE_SLOTS_MAX,
+        "a resource with no slots could never be acquired, and past the maximum a declaration serializes nothing"
+      );
+      bound(
+        "max_hold_minutes",
+        RESOURCE_MAX_HOLD_MINUTES_MIN,
+        RESOURCE_MAX_HOLD_MINUTES_MAX,
+        "a hold that expires as it is granted serializes nothing, and one on a scarce resource has to be bounded by something a working session outlives"
+      );
+    }
+  }
+  return out;
 }
 
 /** Every key this build doesn't know, wherever it sits (#880).

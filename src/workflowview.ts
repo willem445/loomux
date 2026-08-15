@@ -54,15 +54,32 @@ import {
   isValidBlockId,
   isBlockKind,
   isWorkflowCli,
+  isValidResourceName,
+  roleHintsForKind,
+  allowDenialReason,
   hasErrors,
   BLOCK_KINDS,
   WORKFLOW_CLIS,
   GATE_REQUIRES,
   WORKFLOW_FILE,
+  INTAKE_SOURCES,
+  INTAKE_LABEL_KEYS,
+  ID_MAX_CHARS,
+  RESOURCES_MAX,
+  RESOURCE_SLOTS_MIN,
+  RESOURCE_SLOTS_MAX,
+  RESOURCE_MAX_HOLD_MINUTES_MIN,
+  RESOURCE_MAX_HOLD_MINUTES_MAX,
+  MERGE_QUEUE_MAX_BATCH_MIN,
+  MERGE_QUEUE_CHECKS_TIMEOUT_MIN,
+  MERGE_QUEUE_CHECKS_TIMEOUT_MAX,
   type Workflow,
   type WorkflowBlock,
   type WorkflowAnalysis,
+  type WorkflowResource,
+  type IntakeLabelKey,
   type Finding,
+  type FindingSection,
   type GraphNode,
 } from "./workflowmodel";
 import { agentCliKnobs } from "./pty";
@@ -1080,7 +1097,59 @@ export class WorkflowView {
       )
     );
 
+    // The three OPTIONAL policy sections (#1020), beside the gate for the same reason the gate
+    // is beside the blocks: they are edited the same way, and a second place to click would be
+    // a second place to look. Each sub-line answers the one question that matters about an
+    // optional section — does this FILE say anything, or is loomux's own default in force? —
+    // because a form full of empty fields cannot distinguish those two by itself.
+    rows.push(el("div", "wf-roster-head", "Policy"));
+    const intake = w.intake;
+    const declaredLabels = intake?.labels
+      ? Object.keys(intake.labels).filter((k) => k !== "extra").length
+      : 0;
+    rows.push(
+      row(
+        { kind: "intake" },
+        "Intake",
+        intake
+          ? `${intake.source || "inherited source"}${declaredLabels ? ` · ${declaredLabels} label(s)` : ""}`
+          : "not declared — loomux's default",
+        this.sectionBad("intake")
+      )
+    );
+    const mq = w.merge_queue;
+    rows.push(
+      row(
+        { kind: "merge_queue" },
+        "Merge queue",
+        mq
+          ? `${mq.enabled ? "on" : "off"}${mq.max_batch !== undefined ? ` · batch ${mq.max_batch}` : ""}`
+          : "not declared — off",
+        this.sectionBad("merge_queue")
+      )
+    );
+    const resourceCount = Object.keys(w.resources ?? {}).length;
+    rows.push(
+      row(
+        { kind: "resources" },
+        "Resources",
+        w.resources ? `${resourceCount} resource(s)` : "not declared — no locks",
+        this.sectionBad("resources")
+      )
+    );
+
     this.rosterEl.replaceChildren(...rows);
+  }
+
+  /** Does this policy section carry an ERROR? Routed by the finding's own `section` rather
+   *  than by matching its message, so a reworded message can never quietly stop marking the
+   *  row it is about. */
+  private sectionBad(section: FindingSection): boolean {
+    return this.sectionFindings(section).some((f) => f.severity === "error");
+  }
+
+  private sectionFindings(section: FindingSection): Finding[] {
+    return this.analysis.findings.filter((f) => f.section === section);
   }
 
   /** The findings about ONE block row. A finding names a block by ID, because that is what
@@ -1168,6 +1237,18 @@ export class WorkflowView {
     }
     if (target.kind === "edge") {
       this.formPane.replaceChildren(this.edgeForm(target.from, target.to));
+      return;
+    }
+    if (target.kind === "intake") {
+      this.formPane.replaceChildren(this.intakeForm(w));
+      return;
+    }
+    if (target.kind === "merge_queue") {
+      this.formPane.replaceChildren(this.mergeQueueForm(w));
+      return;
+    }
+    if (target.kind === "resources") {
+      this.formPane.replaceChildren(this.resourcesForm(w));
       return;
     }
     this.formPane.replaceChildren(target.kind === "gate" ? this.gateForm(w) : this.workflowForm(w));
@@ -1260,6 +1341,108 @@ export class WorkflowView {
     return s;
   }
 
+  /** A select whose options have a LABEL distinct from their value — the shape every
+   *  optional field here needs, because the empty value is a real choice ("inherit
+   *  loomux's default") that has to read as one rather than as a blank row. The plain
+   *  `select` above stays as it is: its values ARE their labels, which is right for a
+   *  closed enum like `kind`. */
+  private labelledSelect(
+    options: readonly { value: string; label: string }[],
+    value: string,
+    onChange: (v: string) => void
+  ): HTMLSelectElement {
+    const s = document.createElement("select");
+    s.className = "wf-input";
+    for (const o of options) {
+      const opt = document.createElement("option");
+      opt.value = o.value;
+      opt.textContent = o.label;
+      s.append(opt);
+    }
+    // Same rule as `select`: a value this build doesn't offer still SHOWS, marked, so that
+    // touching another field can never silently rewrite it to something nobody chose.
+    if (value && !options.some((o) => o.value === value)) {
+      const opt = document.createElement("option");
+      opt.value = value;
+      opt.textContent = `${value} (unknown)`;
+      s.append(opt);
+    }
+    s.value = value;
+    s.addEventListener("change", () => onChange(s.value));
+    return s;
+  }
+
+  /** A bounded whole-number field for the policy sections, or EMPTY for "loomux's default".
+   *
+   *  The bounds are the engine's own (`RESOURCE_SLOTS_MAX`, `RESOURCES_MAX`, … — mirrored in
+   *  workflowmodel.ts), and they are enforced on the way into the MODEL rather than only as
+   *  `min`/`max` attributes: a spinner's attributes are advisory, and a typed `9999` would
+   *  otherwise be written into a file the engine then refuses to load. The clamp is shown
+   *  back on blur, so it is never a value the human can't see. A hand-written out-of-range
+   *  value still gets its finding — this stops the FORM from producing one. */
+  private boundedNumber(
+    value: number | undefined,
+    bounds: { min: number; max: number },
+    onChange: (v: number | undefined) => void
+  ): HTMLInputElement {
+    const i = document.createElement("input");
+    i.className = "wf-input";
+    i.type = "number";
+    i.min = String(bounds.min);
+    i.max = String(bounds.max);
+    i.value = value === undefined ? "" : String(value);
+    i.placeholder = "loomux's default";
+    const clamp = (n: number): number =>
+      Math.min(bounds.max, Math.max(bounds.min, Math.round(n)));
+    i.addEventListener("input", () => {
+      const raw = i.value.trim();
+      if (!raw) {
+        onChange(undefined);
+        return;
+      }
+      const n = Number(raw);
+      if (!Number.isFinite(n)) return; // a half-typed "-" or "e" — wait for the rest
+      onChange(clamp(n));
+    });
+    // Show the clamp once they stop typing. Doing it on `input` would fight the caret of
+    // someone typing "480" one digit at a time (the "4" would become the minimum).
+    i.addEventListener("change", () => {
+      const raw = i.value.trim();
+      if (!raw) return;
+      const n = Number(raw);
+      if (Number.isFinite(n)) i.value = String(clamp(n));
+    });
+    return i;
+  }
+
+  /** The enable-toggle every optional section is edited through, and the reason all three
+   *  forms are shaped like `gateForm`: the checkbox IS the section's presence in the file.
+   *
+   *  Off writes nothing at all — not `enabled: false`, not a block of defaults — because the
+   *  model emits only what is declared, so an untouched (or re-untouched) section leaves the
+   *  file exactly as it found it. That is the property a human relies on when they open this
+   *  form to look rather than to change something. */
+  private sectionToggle(label: string, on: boolean, onChange: (on: boolean) => void): HTMLElement {
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.checked = on;
+    cb.addEventListener("change", () => onChange(cb.checked));
+    const line = el("label", "wf-check");
+    line.append(cb, el("span", "wf-check-label", label));
+    return line;
+  }
+
+  /** The findings for one policy section, rendered inline under its form — the same
+   *  treatment `blockForm` gives a block's own findings, and for the same reason: the
+   *  place to say what is wrong with a value is beside the field that sets it. */
+  private sectionFindingList(section: FindingSection): HTMLElement | null {
+    const found = this.sectionFindings(section);
+    if (!found.length) return null;
+    const list = el("ul", "wf-inline-findings");
+    for (const f of found) list.append(el("li", `wf-finding wf-${f.severity}`, f.message));
+    return list;
+  }
+
   private workflowForm(w: Workflow): HTMLElement {
     const box = el("div", "wf-fields");
     box.append(
@@ -1333,6 +1516,30 @@ export class WorkflowView {
         this.select(BLOCK_KINDS, b.kind, (v) => edit((t) => (t.kind = v))),
         "The capability class. A workflow defines personas, never capabilities: a planner is read-only, " +
           "a reviewer can never push, a worker gets a worktree."
+      )
+    );
+
+    // The role hint (#250/#324): a persona/template/badge MARKER, never a capability — and
+    // the offer is DERIVED from the same pairing rule the validator applies
+    // (`roleHintsForKind`), so this picker cannot spell a combination the parser rejects, and
+    // a hint added to the model shows up here without an edit. A block already declaring one
+    // its kind can't carry still shows it, marked, because that is the finding it needs to fix.
+    const hints = roleHintsForKind(b.kind);
+    box.append(
+      this.field(
+        "Role hint",
+        this.labelledSelect(
+          [{ value: "", label: "none" }, ...hints.map((h) => ({ value: h, label: h }))],
+          b.role_hint ?? "",
+          (v) =>
+            edit((t) => {
+              if (v) t.role_hint = v;
+              else delete t.role_hint;
+            })
+        ),
+        hints.length
+          ? "Optional and INERT: it picks a persona/template fragment and a badge. Capability still comes from kind alone."
+          : `No role hint applies to a ${b.kind || "block"} — each hint requires the one kind it is meaningless without.`
       )
     );
 
@@ -1564,6 +1771,103 @@ export class WorkflowView {
       );
     }
 
+    // `allow:` — extra pre-approved tool patterns (#222), a tag list rather than one
+    // comma-separated field for a reason that would otherwise corrupt the value: a real
+    // pattern CONTAINS commas (`Bash(gh pr view --json title,body)`), so a comma cannot also
+    // be the separator. One row per pattern, and the row is the whole editor for it.
+    //
+    // It is RESTRICT-ONLY, and the form says so out loud: deny beats allow on both CLIs, so a
+    // pattern here can never re-grant something loomux's containment took away — it only
+    // pre-approves something the block could already have been asked to approve. That is why
+    // the two kinds that may not declare it at all (the orchestrator, and the read-only class)
+    // are refused rather than merely warned.
+    const denial = allowDenialReason(b.kind);
+    const patterns = b.allow ?? [];
+    const allowList = el("div", "wf-checks");
+    let liveCount = patterns.length;
+
+    /** Drop entry `at`, and drop the key entirely with the last one — an empty `allow: []`
+     *  is a line that declares nothing, and the model emits only what is declared. */
+    const removeAt = (at: number): void =>
+      edit((t) => {
+        const rest = (t.allow ?? []).filter((_, i) => i !== at);
+        if (rest.length) t.allow = rest;
+        else delete t.allow;
+      });
+
+    const patternRow = (value: string, at: number, onRemove?: () => void): HTMLElement => {
+      const line = el("div", "wf-check");
+      line.append(
+        this.textInput(value, (v) => edit((t) => {
+          if (t.allow) t.allow[at] = v;
+        }, false), "Bash(npm test *)")
+      );
+      const del = document.createElement("button");
+      del.className = "wf-btn wf-btn-danger";
+      del.textContent = "✕";
+      del.title = "Remove this pattern";
+      del.addEventListener("click", () => (onRemove ? onRemove() : removeAt(at)));
+      line.append(del);
+      return line;
+    };
+
+    patterns.forEach((p, i) => allowList.append(patternRow(p, i)));
+
+    const addPattern = el("button", "wf-add", "+ Add pattern") as HTMLButtonElement;
+    addPattern.disabled = !!denial;
+    addPattern.addEventListener("click", () => {
+      // A DRAFT row: nothing reaches the file until it has something in it. Writing an empty
+      // entry first would put `allow: [""]` in the YAML the moment the button is pressed —
+      // and then flag it, which is the pane complaining about its own keystroke.
+      let index: number | null = null;
+      const row = el("div", "wf-check");
+      const input = this.textInput(
+        "",
+        (v) => {
+          if (index === null) {
+            if (!v.trim()) return;
+            index = liveCount++;
+            edit((t) => {
+              t.allow = [...(t.allow ?? []), v];
+            }, false);
+            return;
+          }
+          const at = index;
+          edit((t) => {
+            if (t.allow) t.allow[at] = v;
+          }, false);
+        },
+        "Bash(npm test *)"
+      );
+      const del = document.createElement("button");
+      del.className = "wf-btn wf-btn-danger";
+      del.textContent = "✕";
+      del.addEventListener("click", () => {
+        if (index === null) row.remove();
+        else removeAt(index);
+      });
+      row.append(input, del);
+      allowList.append(row);
+      input.focus();
+    });
+    allowList.append(addPattern);
+    if (!patterns.length && !denial) {
+      allowList.append(
+        el("span", "wf-hint", "None — the block runs with its class's own tool surface.")
+      );
+    }
+    box.append(
+      this.field(
+        "Extra allowed tools",
+        allowList,
+        denial
+          ? `A ${b.kind} block may not declare allow: — ${denial}.`
+          : "Pre-approved tool patterns, passed to the CLI's own --allowedTools/--allow-tool. " +
+              "RESTRICT-ONLY: deny beats allow on both CLIs, so this can never re-grant what the " +
+              "block's kind takes away. loomux passes only letters, digits and ( ) : * _ - . / , and spaces."
+      )
+    );
+
     // Outgoing edges, edited as "what runs after this" — the honest phrasing for an
     // advisory edge, and the only edge editing the form needs: every edge has a source.
     const targets = el("div", "wf-checks");
@@ -1760,6 +2064,300 @@ export class WorkflowView {
     return box;
   }
 
+  // ---------- the policy sections (#1020) ----------
+  //
+  // Three optional sections the file could always carry and the pane could never edit:
+  // `intake:` (#382 — where autonomous work comes from), `merge_queue:` (#581) and
+  // `resources:` (#858). All three are shaped like `gateForm` — an enable-toggle whose
+  // state IS the section's presence in the file, then the fields — and all three lean on
+  // the model's declared-only emission: a field left blank writes NO line, so opening a
+  // form to read it can never turn "inherit loomux's default" into a pin.
+
+  private intakeForm(w: Workflow): HTMLElement {
+    const box = el("div", "wf-fields");
+    box.append(
+      el(
+        "p",
+        "wf-note",
+        "Where autonomous work comes from: which source the orchestrator polls, and the label " +
+          "vocabulary it matches on. Every field is optional — an undeclared one inherits loomux's " +
+          "built-in profile, so a repo can override one label and keep the other four."
+      )
+    );
+
+    const intake = w.intake;
+    box.append(
+      this.sectionToggle("This repo declares its own intake", !!intake, (on) =>
+        this.mutate((next) => {
+          if (on) next.intake = {};
+          else delete next.intake;
+        })
+      )
+    );
+    if (!intake) return box;
+
+    box.append(
+      this.field(
+        "Source",
+        this.labelledSelect(
+          [
+            { value: "", label: "inherit loomux's default" },
+            ...INTAKE_SOURCES.map((s) => ({ value: s, label: s })),
+          ],
+          intake.source ?? "",
+          (v) =>
+            this.mutate((next) => {
+              const i = next.intake!;
+              if (v) i.source = v;
+              else delete i.source;
+            })
+        ),
+        "github-labels polls the repo's issues; board reads the task board; none disables autonomous intake."
+      )
+    );
+
+    const LABEL_HINTS: Record<IntakeLabelKey, string> = {
+      ready: "Groomed — an agent may start this.",
+      investigate: "Research only: post findings, write no code.",
+      owned: "An orchestrator has taken this issue.",
+      prototype: "Build for a demo, not for merge.",
+      hold: "The veto (#778): held by the human — do not start this, even under full autonomy.",
+    };
+    for (const key of INTAKE_LABEL_KEYS) {
+      const value = intake.labels?.[key];
+      box.append(
+        this.field(
+          `Label · ${key}`,
+          this.textInput(
+            value ?? "",
+            (v) =>
+              this.mutate((next) => {
+                const i = next.intake!;
+                const labels = i.labels ?? {};
+                if (v.trim()) labels[key] = v.trim();
+                else delete labels[key];
+                // An empty `labels:` mapping is a section nobody declared anything in — drop
+                // it rather than writing `labels: {}`, which would be a statement of its own.
+                if (Object.keys(labels).length) i.labels = labels;
+                else delete i.labels;
+              }, false),
+            "inherit"
+          ),
+          LABEL_HINTS[key]
+        )
+      );
+    }
+    box.append(
+      el(
+        "p",
+        "wf-note",
+        `A label is letters, digits, - and _ (no leading -, at most ${ID_MAX_CHARS} characters). ` +
+          "loomux rejects anything else rather than rewriting it, so the label it looks for stays " +
+          "the one your repo actually has."
+      )
+    );
+    const findings = this.sectionFindingList("intake");
+    if (findings) box.append(findings);
+    return box;
+  }
+
+  private mergeQueueForm(w: Workflow): HTMLElement {
+    const box = el("div", "wf-fields");
+    box.append(
+      el(
+        "p",
+        "wf-note",
+        "The bisecting merge queue: approved sub-PRs land as one batch, and a batch whose checks " +
+          "fail is bisected rather than dropped. An absent merge_queue: block means the feature is " +
+          "OFF — which is why unticking below removes the section instead of writing enabled: false."
+      )
+    );
+
+    const mq = w.merge_queue;
+    box.append(
+      this.sectionToggle("This repo declares a merge queue", !!mq, (on) =>
+        this.mutate((next) => {
+          if (on) next.merge_queue = { enabled: true };
+          else delete next.merge_queue;
+        })
+      )
+    );
+    if (!mq) return box;
+
+    box.append(
+      this.sectionToggle("Enabled", mq.enabled === true, (on) =>
+        this.mutate((next) => {
+          const q = next.merge_queue!;
+          // Off writes `enabled: false` only where the file already said something. Absent
+          // already MEANS off, and inventing the line would be a policy statement nobody made.
+          if (on) q.enabled = true;
+          else if (q.enabled !== undefined) q.enabled = false;
+        })
+      )
+    );
+
+    box.append(
+      this.field(
+        "Max batch",
+        this.boundedNumber(mq.max_batch, { min: MERGE_QUEUE_MAX_BATCH_MIN, max: 64 }, (v) =>
+          this.mutate((next) => {
+            const q = next.merge_queue!;
+            if (v === undefined) delete q.max_batch;
+            else q.max_batch = v;
+          }, false)
+        ),
+        "How many approved sub-PRs one batch may carry. Empty inherits loomux's default; a batch of none could never land anything."
+      )
+    );
+
+    box.append(
+      this.field(
+        "Checks timeout (minutes)",
+        this.boundedNumber(
+          mq.checks_timeout_minutes,
+          { min: MERGE_QUEUE_CHECKS_TIMEOUT_MIN, max: MERGE_QUEUE_CHECKS_TIMEOUT_MAX },
+          (v) =>
+            this.mutate((next) => {
+              const q = next.merge_queue!;
+              if (v === undefined) delete q.checks_timeout_minutes;
+              else q.checks_timeout_minutes = v;
+            }, false)
+        ),
+        `How long to wait for a batch's checks before calling it unverifiable. loomux clamps this to ${MERGE_QUEUE_CHECKS_TIMEOUT_MIN}–${MERGE_QUEUE_CHECKS_TIMEOUT_MAX}.`
+      )
+    );
+    const findings = this.sectionFindingList("merge_queue");
+    if (findings) box.append(findings);
+    return box;
+  }
+
+  private resourcesForm(w: Workflow): HTMLElement {
+    const box = el("div", "wf-fields");
+    box.append(
+      el(
+        "p",
+        "wf-note",
+        "Named locks agents take turns on — a build directory, a test database, anything two agents " +
+          "must not hold at once. loomux never learns what a name MEANS: it counts slots and bounds " +
+          "how long a hold may last, and the agents' own briefs say what to acquire."
+      )
+    );
+
+    const resources = w.resources;
+    box.append(
+      this.sectionToggle("This repo declares shared resources", !!resources, (on) =>
+        this.mutate((next) => {
+          if (on) next.resources = {};
+          else delete next.resources;
+        })
+      )
+    );
+    if (!resources) return box;
+
+    // Sorted, matching the emitter (and the engine's BTreeMap): a resource map has no
+    // authored order to preserve, unlike the roster, where the order is meaning.
+    const names = Object.keys(resources).sort();
+    for (const name of names) {
+      const r = resources[name]!;
+      const card = el("div", "wf-fields");
+      const head = el("div", "wf-check");
+      head.append(el("span", "wf-check-label", name));
+      const del = document.createElement("button");
+      del.className = "wf-btn wf-btn-danger";
+      del.textContent = "Remove";
+      del.addEventListener("click", () =>
+        this.mutate((next) => {
+          if (next.resources) delete next.resources[name];
+        })
+      );
+      head.append(del);
+      card.append(head);
+      const num = (
+        label: string,
+        key: keyof Pick<WorkflowResource, "slots" | "max_hold_minutes">,
+        bounds: { min: number; max: number },
+        hint: string
+      ): void => {
+        card.append(
+          this.field(
+            label,
+            this.boundedNumber(r[key], bounds, (v) =>
+              this.mutate((next) => {
+                const target = next.resources?.[name];
+                if (!target) return;
+                if (v === undefined) delete target[key];
+                else target[key] = v;
+              }, false)
+            ),
+            hint
+          )
+        );
+      };
+      num(
+        "Slots",
+        "slots",
+        { min: RESOURCE_SLOTS_MIN, max: RESOURCE_SLOTS_MAX },
+        `How many agents may hold it at once (1–${RESOURCE_SLOTS_MAX}). Empty inherits loomux's default.`
+      );
+      num(
+        "Max hold (minutes)",
+        "max_hold_minutes",
+        { min: RESOURCE_MAX_HOLD_MINUTES_MIN, max: RESOURCE_MAX_HOLD_MINUTES_MAX },
+        `How long one hold may last before it expires (1–${RESOURCE_MAX_HOLD_MINUTES_MAX}). Empty inherits loomux's default.`
+      );
+      box.append(this.field(`Resource · ${name}`, card));
+    }
+
+    const add = el("button", "wf-add", "+ Add resource") as HTMLButtonElement;
+    add.disabled = names.length >= RESOURCES_MAX;
+    add.addEventListener("click", () => void this.addResource(names));
+    box.append(add);
+    if (names.length >= RESOURCES_MAX) {
+      box.append(
+        el(
+          "span",
+          "wf-hint",
+          `${RESOURCES_MAX} is the maximum — every name is listed in the acquire_lock tool description every agent in the group reads.`
+        )
+      );
+    }
+    const findings = this.sectionFindingList("resources");
+    if (findings) box.append(findings);
+    return box;
+  }
+
+  /** Add a resource — ASKING for the name, the same commitment `createBlock` makes about a
+   *  block id and for the same reason: the name is what an agent's own `acquire_lock` call
+   *  spells, loomux rejects rather than rewrites anything outside its alphabet, and a name
+   *  validated as it is typed never becomes a finding to decode afterwards. */
+  private async addResource(existing: readonly string[]): Promise<void> {
+    const name = await promptModal({
+      title: "New resource",
+      body:
+        "The name is what an agent asks for by (acquire_lock \"build\"). Letters, digits, - and _; " +
+        `at most ${ID_MAX_CHARS} characters.`,
+      label: "Resource name",
+      placeholder: "build",
+      affirm: "Add",
+      validate: (v) => {
+        if (!v.trim()) return "A resource needs a name.";
+        if (!isValidResourceName(v)) {
+          return `Use letters, digits, - and _ (at most ${ID_MAX_CHARS} characters).`;
+        }
+        if (existing.includes(v.trim())) return `This workflow already declares "${v.trim()}".`;
+        return null;
+      },
+    });
+    if (!name) return;
+    this.mutate((next) => {
+      const resources = next.resources ?? {};
+      // `{}` — declared with loomux's defaults, which is what a human means by adding a name
+      // and setting nothing. It emits as `build: {}`, the spelling the engine's serde accepts.
+      resources[name.trim()] = {};
+      next.resources = resources;
+    });
+  }
+
   /** Apply an edit to the model and write it straight back into the YAML.
    *
    *  `rerenderForm` is false for the free-text controls: re-rendering the inspector on every
@@ -1874,7 +2472,7 @@ export class WorkflowView {
     }
     const rows = findings.map((f) => {
       const r = el("button", `wf-finding wf-${f.severity}`);
-      const where = f.line ? `line ${f.line}` : f.blockId || "";
+      const where = f.line ? `line ${f.line}` : f.blockId || f.section || "";
       if (where) r.append(el("span", "wf-finding-where", where));
       r.append(el("span", "wf-finding-msg", f.message));
       // Click a finding, land on the thing it is about — the whole value of a pre-run
@@ -1887,6 +2485,12 @@ export class WorkflowView {
         if (surface) this.setSurface(surface);
         if (f.line) {
           this.focusLine(f.line);
+          return;
+        }
+        // A policy-section finding names its own section, which IS a selection — so the
+        // click lands on the form that can fix it, exactly like a block finding does.
+        if (f.section) {
+          this.selectItem({ kind: f.section });
           return;
         }
         // A finding names a block by id; the inspector is keyed by ROW. Land on the first row
