@@ -248,6 +248,16 @@ export class WorkflowView {
    *  model — and on a capability reply that lands whenever the IPC happens to
    *  resolve — need a way to be refreshed without one (#935). */
   private repaintBlockKnobs: (() => void) | null = null;
+  /** Rebuilds the block form's model dropdown as soon as doing so stops being
+   *  destructive, or `null` when no block form is on screen (#1020).
+   *
+   *  The sibling of {@link repaintBlockKnobs}, and nulled by the same line for
+   *  the same reason. A detection reply now arrives on the sweep's schedule
+   *  rather than after a click, so "which picker is live, and is the human
+   *  inside its custom-id box right now" is knowledge only the form has —
+   *  it installs this, and `renderInspector` takes it away when those controls
+   *  are detached. */
+  private refreshBlockModels: (() => void) | null = null;
 
   // Canvas interaction state. All three are transient — none of them is ever serialized, and
   // the model never learns they existed.
@@ -264,6 +274,24 @@ export class WorkflowView {
     // Focusable like every other content view, so Alt+arrow nav / dock-restore / window
     // refocus land ON the surface without grabbing one of its inner controls.
     this.el.tabIndex = -1;
+
+    // Take the startup sweep's answers as they land (#1020) — the push half of
+    // detection, for a pane that was already open when one arrived. The pull
+    // half is in `blockForm`, for a form opened after the sweep finished.
+    //
+    // Not filtered by program, deliberately: only CLIs with a `PROTOCOLS` row
+    // are ever swept (one today), so this fires at most a handful of times in an
+    // app run, and deciding whether a report is "relevant" would mean deciding
+    // what a block with no `cli:` inherits — a question `analyzeWorkflow` is
+    // about to re-answer anyway.
+    //
+    // `disposed` is the liveness answer `onReport` asks for: a closed pane must
+    // stop being repainted, and this is the only teardown signal it has.
+    modelCatalog.onReport(() => {
+      if (this.disposed) return false;
+      this.applyDetection();
+      return true;
+    });
 
     // ---- header ----
     const head = el("div", "wf-head");
@@ -885,6 +913,44 @@ export class WorkflowView {
     return caps === undefined ? null : knobState(caps, cli, model, modelCatalog.detail(cli, model));
   };
 
+  /** Everything a list-models reply owes this pane (#993, #1020).
+   *
+   *  **A detection reply owes every surface `agent_cli_knobs` owes.** It is
+   *  precisely the answer that makes {@link knobLookup} respond differently, so
+   *  repainting only the dropdown leaves the Thinking-level row offering levels
+   *  this pane's own validator then rejects — the human picks `xhigh`, the next
+   *  mutation re-renders the row disabled, and the findings flag the block. The
+   *  treatment below is `ensureCliKnobs`'s, deliberately identical: same pass,
+   *  same three renders, same in-place knob repaint when the form must not be
+   *  rebuilt.
+   *
+   *  One method rather than one per route, because both routes owe the same
+   *  work: the lookup a block form fires when it paints, and the sweep's push
+   *  (`modelCatalog.onReport`) for a form that was already open when the answer
+   *  landed. A second copy is the second place a fix has to be remembered —
+   *  which is the bug #997 caught here in the first place.
+   *
+   *  **It never rebuilds the form unconditionally.** `replaceChildren` destroys
+   *  the input under the caret, so the pane's own rule holds: the form is
+   *  redrawn only when the human is not inside it, and repainted in place when
+   *  they are. The menu goes through {@link refreshBlockModels}, which is
+   *  `null` when no form is on screen and defers past the mid-type window when
+   *  one is. */
+  private applyDetection(): void {
+    // The findings are the pane's, not any one form's, so they are recomputed
+    // and repainted whatever happened to the form meanwhile — a reply that
+    // landed after the human moved on still corrects the file's analysis.
+    this.analysis = analyzeWorkflow(this.text, this.knobLookup);
+    this.renderRoster();
+    this.renderFindings();
+    this.renderGraph();
+    // Through the LIVE hooks, never a captured closure: `renderInspector()`
+    // nulls both precisely so a late reply cannot paint into a detached row.
+    this.refreshBlockModels?.();
+    if (this.formPane.contains(document.activeElement)) this.repaintBlockKnobs?.();
+    else this.renderInspector();
+  }
+
   /** Ask what models `cli` reports, at most once per pane — see {@link modelProbes}. */
   private probeModels(cli: string): Promise<CliProbe> {
     let p = this.modelProbes.get(cli);
@@ -1134,7 +1200,11 @@ export class WorkflowView {
     // Whatever the last form left here belongs to controls that are about to be
     // replaced. Cleared FIRST, so a late `agent_cli_knobs` reply can never paint
     // into a detached row (#935) — every path below ends in a `formPane` swap.
+    // Same for the model dropdown's deferred rebuild (#1020): a detection reply
+    // that lands after the human selected another block must not reach the
+    // picker they left behind.
     this.repaintBlockKnobs = null;
+    this.refreshBlockModels = null;
     const w = this.analysis.workflow;
     const target = inspectorTarget(this.selection, w, this.syntaxBroken());
     // Adopt the fallback so the roster and the canvas agree with the editor. Never while
@@ -1358,83 +1428,9 @@ export class WorkflowView {
       placeholder: "model id…",
       blankLabel: BLOCK_DEFAULT_MODEL_LABEL,
       // #993. The lookup is live rather than a snapshot: the catalog's answer
-      // arrives after a human clicks `detect`, and a picker holding a copy
+      // can arrive after this control was built, and a picker holding a copy
       // taken at construction would show the old one forever.
       detailFor: (id) => modelCatalog.detail(cli, id),
-      // The one path in this pane that spawns an agent CLI, and it is a click.
-      // Nothing on the render path may reach it (`src-tauri/src/modelwire.rs`).
-      //
-      // **A detection reply owes every surface `agent_cli_knobs` owes** (#997
-      // review). It is precisely the answer that makes `knobLookup` respond
-      // differently, so repainting only the dropdown leaves the Thinking-level
-      // row offering levels this pane's own validator then rejects — the human
-      // picks `xhigh`, the next mutation re-renders the row disabled and the
-      // findings flag the block. The treatment below is `ensureCliKnobs`'s,
-      // deliberately identical: same pass, same three renders, same in-place
-      // knob repaint when the form must not be rebuilt.
-      onDetect: () =>
-        modelCatalog.detect(cli).then(() => {
-          // The findings are the pane's, not this form's, so they are recomputed
-          // and repainted whatever happened to the form meanwhile — a detection
-          // that landed after the human moved on still corrected the file's
-          // analysis.
-          this.analysis = analyzeWorkflow(this.text, this.knobLookup);
-          this.renderRoster();
-          this.renderFindings();
-          this.renderGraph();
-
-          // Everything below touches THIS form's DOM, so it stops here if that
-          // form is gone (#997 review NB-1). An ask spawns a CLI and can be in
-          // flight for seconds — long enough for the human to select another
-          // block, at which point `renderInspector()` has detached these rows
-          // and nulled `repaintBlockKnobs`. The probe reply below takes the
-          // same early-out, for the same reason.
-          //
-          // **It refreshes whatever form IS on screen, by the safe method — it
-          // does not bare-`renderInspector()`** (#997 review NB3-1). The form
-          // the human moved to was rendered before this reply landed, so its
-          // knob rows are stale and do owe a repaint; but `renderInspector()`
-          // here would `replaceChildren` a form they may be typing in,
-          // destroying the input under their caret and dropping focus to
-          // `<body>`. That is the pane's own rule — "the form is redrawn only
-          // when the human isn't inside it" — and the first cut of this
-          // early-out broke it while its comment claimed to be following a
-          // sibling that does not. This IS the sibling's treatment now, which
-          // is what makes the claim above true.
-          if (!this.formPane.contains(picker.root)) {
-            if (this.formPane.contains(document.activeElement)) this.repaintBlockKnobs?.();
-            else this.renderInspector();
-            return;
-          }
-          // Mid-type guard: rebuilding the menu under a half-typed id hides the
-          // input the human is typing into. Deferred rather than dropped — see
-          // `runWhenNotEditing`.
-          picker.runWhenNotEditing(repaint);
-          // The menu may have moved under the selection, so the knobs re-derive
-          // from what the picker holds NOW — the same sync `picker.onChange`
-          // does, for the same reason.
-          knobs.setModel(picker.value);
-          // **Through the live method, never the captured `repaintKnobs`**
-          // (#997 review NB-1). `renderInspector()` clears `repaintBlockKnobs`
-          // before rebuilding precisely so a late reply cannot paint into a
-          // detached row; a closure holding this form's own repainter would
-          // walk around that guard. `?.` is what makes the treatment
-          // *actually* identical to `ensureCliKnobs`'s rather than only
-          // similar to it.
-          //
-          // Which branch runs: NOT the in-place one, in practice. The detect
-          // button disables itself before awaiting (`modelpicker.ts`), and a
-          // disabled element is not focusable — the browser blurs it, so
-          // `document.activeElement` is `<body>` and this is the
-          // `renderInspector()` branch. Both refresh the knobs, and
-          // rebuilding is safe with focus on `<body>`; the conditional stays
-          // because the human may have clicked into another field while the
-          // ask was in flight, and that case really does need the in-place
-          // repaint. (Corrected from a comment that asserted the opposite —
-          // #997 review NB-2.)
-          if (this.formPane.contains(document.activeElement)) this.repaintBlockKnobs?.();
-          else this.renderInspector();
-        }),
     });
     repaint();
     box.append(
@@ -1474,6 +1470,12 @@ export class WorkflowView {
       contextRow.paint(knobs.context);
     };
     this.repaintBlockKnobs = repaintKnobs;
+    // The menu's half of the same contract (#1020). Deferred past the mid-type
+    // window rather than dropped — rebuilding under a half-typed id resolves it
+    // to the dropdown branch and hides the input beneath the caret (#997 review
+    // NB-3) — and installed as a LIVE hook so `renderInspector` can take it
+    // away when these controls are detached.
+    this.refreshBlockModels = () => picker.runWhenNotEditing(repaint);
 
     // Fires for a dropdown pick AND for every keystroke in the `custom…` box.
     // The keystroke is the case that was broken: `context` is only offered where
@@ -1511,6 +1513,24 @@ export class WorkflowView {
         const now = this.analysis.workflow.blocks[index]?.model ?? "";
         picker.setOptions(blockModelOptions(modelCatalog.models(cli)), now, cli);
       });
+      // And the detection LOOKUP (#1020) — fired from this render path, which
+      // #993 forbade and this slice makes correct: it cannot spawn an agent CLI,
+      // because the backend swept them once at startup and this reads what it
+      // left (`src-tauri/src/modelwire.rs`).
+      //
+      // **Guarded on `report(cli)` being absent, and that guard is what makes it
+      // terminate.** `applyDetection` ends in `renderInspector()`, which rebuilds
+      // this form and re-runs this line: without the guard, every reply would
+      // re-enter the render it was answering. A reply worth having sets
+      // `report(cli)`, so the rebuilt form skips this; one that carries nothing
+      // returns below before refreshing anything. Both routes out are dead ends,
+      // which is the property to check if this ever grows a third.
+      if (!modelCatalog.report(cli)) {
+        void modelCatalog.detect(cli).then((r) => {
+          if (!r.models.length) return;
+          this.applyDetection();
+        });
+      }
     }
 
     // Persona: inline prompt, a profile file, or neither (the built-in role template).
