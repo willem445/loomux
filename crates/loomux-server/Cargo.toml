@@ -1,0 +1,70 @@
+# The remote-engine daemon (#888, plan-463 track C — slice C1a: the skeleton).
+#
+# This crate is the process that will host the orchestration engine on a
+# server. Today it starts, reads a config, decides which address a listener
+# would be ALLOWED to bind, and serves nothing — the listener itself is C2.
+# `doc/design/remote-engine-daemon.md` is the argument for that split and for
+# the config contract; `doc/design/remote-engine-protocol.md` is the wire
+# contract C2 implements.
+#
+# DEPLOYMENT TARGET IS LINUX (a standing #888 decision), but the crate is
+# written in portable `std` and is built and tested on all three CI platforms
+# on purpose: the config layer is pure logic, and a bind-refusal rule that only
+# compiles on the deployment host is a rule no Windows-based reviewer can run.
+[package]
+name = "loomux-server"
+# Not the loomux release version, for the same reason `loomux-engine` is not:
+# `publish = false` makes it an internal artifact, and a version here would be
+# an eighth field `scripts/check-versions.js` has to keep in lockstep for no
+# reader's benefit. Note what this DOES mean for the wire: the protocol's
+# `server_version` (remote-engine-protocol.md §4.3) is the loomux release
+# version, not this number — C2 must pass it in rather than reach for
+# `env!("CARGO_PKG_VERSION")`, exactly as `obs::install_panic_hook` already has
+# to (#888 A3 batch 7).
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "loomux remote-engine daemon (internal; not published)"
+
+# DEPENDENCIES — the same two bans the engine's manifest states, plus one more.
+#
+#   - `tauri` (and any tauri-* crate). A daemon that needs webkit2gtk to build
+#     is not a deployment shape; that is the whole reason `loomux-engine`
+#     exists. The arrow here is `loomux-server -> loomux-engine -> (no tauri)`,
+#     and test/workspacelayout.test.ts pins the manifest half of it.
+#   - getrandom-based crates. This crate is NOT linked into the shipped Windows
+#     binary, so CLAUDE.md constraint 2 does not bind it the way it binds the
+#     engine — but the daemon will mint connection-session tokens when the
+#     hardening track lands, and remote-engine-protocol.md §6.2 already commits
+#     those to std's OS-seeded `RandomState`, "one fewer divergence". Keeping
+#     the ban means that stays true by default rather than by remembering.
+#   - a web/async framework. C2 takes exactly one vetted WebSocket dependency
+#     (plan-463 C2); it is not this slice's to pick, and a runtime pulled in
+#     early "so it is ready" would be reviewed by nobody.
+[dependencies]
+# The daemon's state root defaults to the engine's own `obs::data_root()` —
+# `<user data dir>/loomux`, `LOOMUX_DATA_DIR`-overridable (#394). Defaulting to
+# anything else would give the daemon a second opinion about where
+# orchestration state lives, and the point of the extraction is that there is
+# one.
+loomux-engine = { path = "../loomux-engine" }
+# The config file is YAML for one reason: `.loomux/workflow.yml` already is, so
+# an operator hand-editing loomux config edits one format, and `serde_norway`
+# is already in the workspace's lock and in the shipped binary's graph (its
+# audit lives in src-tauri/Cargo.toml). Nothing new joins the lock for this
+# crate — deliberately, since a config format is exactly the place a daemon
+# grows its first gratuitous dependency.
+serde = { version = "1", features = ["derive"] }
+serde_norway = "0.9.42"
+
+[dev-dependencies]
+# The CLI tests write a real config file and point `--config` at it, because
+# "the operator's file said X" is the behaviour under test and a string passed
+# straight to the parser would skip the half of it that reads the file at all.
+#
+# `default-features = false` for the same reason src-tauri and loomux-engine
+# spell it that way: tempfile's defaults switch on `getrandom` for its random
+# names. Nothing in a dev-dependency graph reaches the shipped binary, so the
+# ban does not strictly bind here — matching the two manifests either side of
+# this one costs nothing and saves the next reader from re-deriving that.
+tempfile = { version = "3", default-features = false }
