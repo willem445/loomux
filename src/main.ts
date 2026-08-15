@@ -2,6 +2,7 @@ import "./styles.css";
 import { invoke, hostVersion } from "./transport.ts";
 import { showToast } from "./toast";
 import type { Grid } from "./grid";
+import type { SplitPolicy } from "./splitfloor";
 import { Workspace } from "./workspace";
 import { TabManager } from "./tabs";
 import { TabBar } from "./tabbar";
@@ -193,7 +194,9 @@ function eventsFor(ws: Workspace): PaneEvents {
     // close it. Every human-initiated single-pane close — header ✕, dock chip ✕,
     // Ctrl+Shift+W — arrives through that one path.
     onCloseRequest: (pane) => ws.grid.closePane(pane),
-    onSplit: (pane, dir) => openWelcomeIn(ws, dir, pane),
+    // A pane header's ◫/⬓ — a human split gesture, so the pane being split is
+    // the one that pays for the new one (#885 `halve`).
+    onSplit: (pane, dir) => openWelcomeIn(ws, dir, pane, "halve"),
     // The file browser's "Open in file editor pane" (#217): an editor pane beside the
     // browser, in the browser's own tab. Same call the welcome flow makes.
     onOpenEditorPane: (pane, opts) => {
@@ -1642,10 +1645,18 @@ function tryResumeFallback(pane: Pane, exit: PtyExit): boolean {
  *  file explorer (#214), which should open on the project you're looking at, not
  *  the last repo you happened to launch app-wide. Falls back to the recent-repo
  *  default when there's no context (an empty tab, a welcome pane). */
-function openWelcomeIn(ws: Workspace, dir: "row" | "column" = "row", relativeTo?: Pane): Pane {
+function openWelcomeIn(
+  ws: Workspace,
+  dir: "row" | "column" = "row",
+  relativeTo?: Pane,
+  // `share` by default because this function also serves restore fail-softs (a
+  // pane whose folder/repo is gone comes back as a welcome form) — programmatic
+  // placement. The human split gestures pass `halve` explicitly (#885).
+  policy: SplitPolicy = "share"
+): Pane {
   const context = relativeTo ?? ws.grid.activePane;
   const form = new WelcomeForm(context?.workdir ?? undefined);
-  const pane = ws.grid.openWelcomePane(eventsFor(ws), form.el, dir, relativeTo);
+  const pane = ws.grid.openWelcomePane(eventsFor(ws), form.el, dir, relativeTo, policy);
   form.onSubmit = (result) => void handleWelcomeSubmit(ws, pane, form, result);
   return pane;
 }
@@ -1816,7 +1827,13 @@ async function handleWelcomeSubmit(
       },
       eventsFor(ws),
       d,
-      prev
+      prev,
+      // Pinned to `share` (#885), not left to the default: this fan-out is THE
+      // reason the even-matrix policy is kept. It places a whole fleet in one
+      // pass, each pane beside the last — halving every time would deal out a
+      // 1/2, 1/4, 1/8, 1/16 sliver staircase instead of the matrix the
+      // alternating direction above is building.
+      "share"
     );
     await bindSoloIfNeeded(p, spec);
     watchCopilotAutopilotIfNeeded(p, spec);
@@ -1896,9 +1913,11 @@ function recordClaudePostureIfNeeded(spec: AgentLaunchSpec): void {
 }
 
 /** Open a welcome pane in the active tab — the entry point the toolbar/shortcuts
- *  use for a "new pane". */
+ *  use for a "new pane". `halve` (#885): Ctrl+Shift+E/O and the two top-bar
+ *  split buttons are human gestures, so the active pane pays for the new one
+ *  out of its own space and no other pane on screen moves. */
 const openPane = (dir: "row" | "column" = "row", relativeTo?: Pane): void => {
-  openWelcomeIn(tabs.activeWorkspace, dir, relativeTo);
+  openWelcomeIn(tabs.activeWorkspace, dir, relativeTo, "halve");
 };
 
 /** Dispose or keep a just-dead pane per `keepOpenOnExit`, with one override
