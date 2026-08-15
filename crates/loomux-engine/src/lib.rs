@@ -150,7 +150,9 @@
 //! `mergeq` path appears in a body, which is the thing to check; counting the
 //! mentions is neither necessary nor, as it turned out, easy to get right.
 //! `mqdriver` is `workflow`'s heaviest consumer and stays behind on purpose —
-//! it reaches the pane host (`capture_raw_with_timeout`), which is slice A3.
+//! it reaches `capture_raw_with_timeout` (glossed here at the time as "the pane
+//! host, which is slice A3"; batch 9 re-measured that call and found no host in
+//! it — see below).
 //! **An inbound edge never blocks a move**, because the re-export answers it:
 //! `mqdriver` still spells `super::workflow::…` and never learned anything
 //! changed. Only outbound edges decide what a batch has to contain.
@@ -197,9 +199,10 @@
 //! prose. `mqdriver` and `mqloop` do not merely name `mergeq` in doc comments:
 //! they import from it in their bodies (`use super::mergeq::{new_batch_id,
 //! scratch_branch, …}`, `use super::mergeqview::MERGE_QUEUE_FILE`) and call
-//! `mergeq::recheck_gate`. Both stay in `src-tauri` — they reach the pane host,
-//! which is slice A3 — both spell `super::` exactly as before, and both compile
-//! against the re-export. Batch 5 established that prose is not an edge; the
+//! `mergeq::recheck_gate`. Both stay in `src-tauri` — for the edges they had at
+//! the time, which batch 9 re-measured and found were not host edges at all
+//! (see its entry below) — both spell `super::` exactly as before, and both
+//! compile against the re-export. Batch 5 established that prose is not an edge; the
 //! other half belongs beside it, because it is the half that misleads: **a
 //! body-level inbound edge is a genuine edge and still does not block a move.**
 //! Only outbound edges decide what a batch has to contain.
@@ -234,12 +237,12 @@
 //! item-by-item so every `obs::…` call site over there resolves unchanged —
 //! the move cost no call-site edits at all, and the single one that did change
 //! belongs to the `env!` fix below, not to the move. Read the general form as
-//! **a module's author may have already
-//! drawn the boundary** — worth looking for a section marker before reaching
-//! for a trait, because the alternative here was a bad one: `LockExt` is an
-//! inline extension trait on `std::sync::Mutex` (`m.lock_safe()`), unreachable
-//! through a trait object as called, so abstracting it would have meant a
-//! second implementation of the one policy that must not have two.
+//! **a module's author may have already drawn the boundary** — worth looking
+//! for a section marker before reaching for a trait, because the alternative
+//! here was a bad one: `LockExt` is an inline extension trait on
+//! `std::sync::Mutex` (`m.lock_safe()`), unreachable through a trait object as
+//! called, so abstracting it would have meant a second implementation of the
+//! one policy that must not have two.
 //!
 //! Its finding is a kind of edge the previous six batches never met, because
 //! grep cannot see it. Every batch so far enumerated a module's outbound edges
@@ -261,7 +264,47 @@
 //! crate's first `[dev-dependencies]`, `tempfile` with default features off —
 //! the inline tests write into a temp tree. Both are argued in the manifest;
 //! neither adds a package to the shipped binary's graph.
+//!
+//! A3 batch 9 — the two HOST PRIMITIVES `orchestration/mod.rs` was still
+//! carrying: [`subproc`], the bounded child-process capture (#656, split out of
+//! `OrchRegistry::capture_with_timeout` by #698), and [`fsatomic`], the durable
+//! whole-file replace (#133). Both are `std` and nothing else —
+//! `std::process`/`std::thread` for one, `std::fs` for the other — so no
+//! dependency joins the crate and no manifest line changes.
+//!
+//! They arrive as **two modules, not one**, and that is the batch's finding.
+//! The tempting shape was a single `hostio`: both are "the primitives that
+//! touch the host", both were lifted in the same batch, and both are small. But
+//! they share no symbol, no design note and no failure mode — a bounded
+//! subprocess wait exists because a stalled child parks the single poll loop
+//! and every `notify_when` notice with it, while a temp-fsync-rename exists
+//! because a disk-full `fs::write` truncated tasks.json and destroyed a live
+//! board. **A batch is a unit of moving, not a unit of grouping**; batches 5
+//! and 6 argued which modules must travel together, and the mirror question is
+//! this one — items that travel together do not thereby belong together, and a
+//! module named for what its members have in common with the *batch* is a name
+//! that will not survive the next reader.
+//!
+//! The other half is what "host primitive" turned out NOT to mean. Both were
+//! called pane-host calls when A3 was planned — `mqdriver` stayed behind in
+//! batch 5 on the stated ground that it "reaches the pane host
+//! (`capture_raw_with_timeout`)" — and re-measuring the cluster at the start of
+//! this batch found no host edge in either: no `tauri`, no `AppHandle`, no pty,
+//! nothing that needs the trait work A3 is otherwise about. So they moved as
+//! ordinary `std` leaves, months of prose notwithstanding. Batch 5's rule holds
+//! and this is the sharpest instance of it yet: **re-derive the edge set from
+//! the source at the start of every batch** — including from the notes this
+//! crate's own header wrote down, which are describing a tree as it was.
+//!
+//! `subproc` has exactly one outward edge, [`obs::LockExt`] (`lock_safe` on the
+//! abandoned-reader backlog), which batch 7 brought across for precisely this;
+//! `fsatomic` has none. Both leave every caller in `src-tauri` —
+//! `OrchRegistry::capture_with_timeout`, `mqdriver`'s `ProcessRunner`, and
+//! every `atomic_write` call site — resolving through curated item-list
+//! re-exports in `orchestration/mod.rs`, which is why the integration suite
+//! needed no edit.
 
+pub mod fsatomic;
 pub mod groupid;
 pub mod lessons;
 pub mod locks;
@@ -272,6 +315,7 @@ pub mod notify;
 pub mod obs;
 pub mod profiles;
 pub mod report;
+pub mod subproc;
 pub mod termgrid;
 pub mod text;
 pub mod workflow;
