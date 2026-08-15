@@ -17,6 +17,7 @@
 //! asserted; nothing is executed.
 
 use loomux_lib::orchestration::GroupId;
+use loomux_lib::orchestration::intake;
 use loomux_lib::orchestration::mcp::dispatch;
 use loomux_lib::orchestration::profiles::{self, ProfileMode};
 use loomux_lib::orchestration::workflow::{self, GateRequire};
@@ -24,6 +25,7 @@ use loomux_lib::orchestration::{
     block_contract_text, cli_caps, command_line_length_guard, Caller, Containment, ContractCarrier, Guardrails, Launch, OrchRegistry, Role, CLI_CAPS, EFFORT_LEVELS,
 };
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -4374,16 +4376,27 @@ const LIVE: [(&str, &str, &[&str]); 4] = [
     ("planner.md", loomux_lib::orchestration::PLANNER_TPL, &["{{BLOCK_NOTE}}"]),
 ];
 
-/// Render a template with the six variables `render_template` had before #222 —
-/// the whole var list, for a group with no workflow.
+/// Render a template with the plain per-group VALUE variables `render_template`
+/// substitutes — the six it had before #222, plus `HOLD_LABEL` (#778).
+///
+/// `HOLD_LABEL` belongs in this list and NOT in `LIVE`'s strip list, and the
+/// distinction is the one this whole file turns on. `LIVE`'s keys are
+/// *workflow-conditional prose*: they resolve to the empty string for a default
+/// group, so stripping them from the live template is what makes it comparable
+/// to a golden that never had them. `HOLD_LABEL` resolves to a real value for
+/// every group (`agent-hold` by default) exactly like `MAX_AGENTS` — stripping
+/// it would compare against a golden with a hole where the veto's name goes.
+/// So the golden carries the literal `{{HOLD_LABEL}}` and this renders it, which
+/// keeps the pin biting on the prose AROUND it.
 fn render_with_legacy_vars(tpl: &str, g: &loomux_lib::orchestration::GroupInfo) -> String {
-    let vars: [(&str, String); 6] = [
+    let vars: [(&str, String); 7] = [
         ("REPO", g.repo.clone()),
         ("GROUP_ID", g.id.to_string()),
         ("MAX_AGENTS", g.guardrails.max_agents.to_string()),
         ("WORKER_MODEL", g.guardrails.model_for(Role::Worker).to_string()),
         ("REVIEWER_MODEL", g.guardrails.model_for(Role::Reviewer).to_string()),
         ("PLANNER_MODEL", g.guardrails.model_for(Role::Planner).to_string()),
+        ("HOLD_LABEL", g.guardrails.intake.hold.clone()),
     ];
     let mut out = tpl.to_string();
     for (k, v) in vars {
@@ -6254,6 +6267,87 @@ fn the_hold_label_round_trips_through_group_json() {
     let g2 = reg2.create_group(&repo.path(), rails()).unwrap();
     assert_eq!(g2.id, g.id, "the restart resumes the same group");
     assert_eq!(g2.guardrails.intake.hold, "custom-hold", "the veto spelling must survive a restart");
+}
+
+/// **The veto is only a veto if every surface that names it agrees (#778, rev
+/// round 1 B1).** The poller honoring `intake.labels.hold` while the contract
+/// and the UI hardcoded `agent-hold` was worse than not supporting the rename at
+/// all: the orchestrator's triage plan is built from its OWN sweep, and its only
+/// exclusion was a literal the repo no longer used — so a held issue landed in
+/// the plan, the human's "go" covered it, and a vetoed issue got started.
+///
+/// Three surfaces, one fixture repo that renamed the veto, asserted together
+/// because agreement is the property (any one of them alone still passes while
+/// the veto is broken):
+///
+/// 1. the **contract** the orchestrator reads names the repo's spelling, and
+///    does not mention the built-in anywhere;
+/// 2. the **poller** honors it (`eligible_deltas` via the resolved profile);
+/// 3. the **allow-list** permits writing it — the UI's one-click gesture.
+#[test]
+fn a_renamed_veto_reaches_the_contract_the_poller_and_the_allow_list_alike() {
+    let (reg, _d) = test_registry();
+    let repo = Repo::new().workflow(
+        "version: 1\nblocks:\n  - id: worker\n    kind: worker\n\
+         intake:\n  labels:\n    hold: do-not-touch\n",
+    );
+    let g = reg.create_group(&repo.path(), rails()).unwrap();
+    assert_eq!(g.guardrails.intake.hold, "do-not-touch", "fixture sanity");
+
+    // 1. The contract. `instructions_lf` reads the file the orchestrator is
+    //    actually pointed at, after substitution — not the template.
+    let contract = instructions_lf(&reg, &g.id, "orchestrator.md");
+    assert!(
+        contract.contains("do-not-touch"),
+        "the orchestrator contract must name THIS repo's veto: under full autonomy the contract \
+         is the consent boundary, and an exclusion it cannot name is one it will not apply"
+    );
+    assert!(
+        !contract.contains("agent-hold"),
+        "and it must not also name the built-in: two spellings in one contract is worse than \
+         one wrong spelling — the agent gets to choose which veto to believe"
+    );
+    assert!(!contract.contains("{{HOLD_LABEL}}"), "the placeholder must be substituted, not shipped");
+
+    // 2. The poller. An issue carrying the repo's veto is not eligible; one
+    //    carrying the BUILT-IN spelling is, because here that label means
+    //    nothing.
+    let raw_issue = |number: u64, title: &str, labels: &[&str]| intake::RawIssue {
+        number,
+        title: title.to_string(),
+        labels: labels.iter().map(|s| s.to_string()).collect(),
+    };
+    let mut seen = HashSet::new();
+    let issues = vec![
+        raw_issue(1, "held by the human", &["do-not-touch"]),
+        raw_issue(2, "not actually held", &["agent-hold"]),
+        raw_issue(3, "plain", &[]),
+    ];
+    let eligible = intake::eligible_deltas(
+        &mut seen,
+        true,
+        Some(intake::OpenIssueList { issues: &issues, complete: true }),
+        &g.guardrails.intake.hold,
+        &HashSet::new(),
+    );
+    let mut got: Vec<u64> = eligible.iter().map(|s| s.number).collect();
+    got.sort_unstable();
+    assert_eq!(got, vec![2, 3], "the repo's own spelling is the veto the poller honors");
+
+    // 3. The seam the write side stands on. `gh.rs` has no group — the issues
+    //    view is repo-scoped — so it resolves the spelling from the repo's own
+    //    workflow file via `load_workflow`, and its allow-list is only correct
+    //    if that resolution equals the group's. Pinned here because it is the
+    //    one link the two sides' own tests cannot see between them: gh.rs's
+    //    unit tests prove it reads the file, this proves the file is what the
+    //    poller and contract were built from. (The allow-list's own closed-ness
+    //    is `a_resolved_hold_spelling_widens_the_allow_list_by_exactly_one_value`.)
+    let from_file = workflow::load_workflow(&repo.path()).unwrap().unwrap().intake.hold;
+    assert_eq!(
+        from_file, g.guardrails.intake.hold,
+        "the repo-file resolution gh.rs uses must equal the group's — if these can differ, the \
+         UI writes one spelling while the poller honors another, which is the defect one layer over"
+    );
 }
 
 #[test]

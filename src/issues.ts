@@ -92,12 +92,28 @@ export const ghIssueCreate = (
   body: string
 ): Promise<GhCreated> => invoke("gh_issue_create", { repo, title, body });
 
+/** The label vocabulary this repo's issues view may write (#778). `ready` and
+ *  `investigate` are the built-in go-signals; `hold` is the veto, resolved from
+ *  the repo's own `.loomux/workflow.yml` — ask, never assume, because a repo can
+ *  rename it and a guessed spelling is a veto that silently does nothing. */
+export interface GhLabelVocabulary {
+  ready: string;
+  investigate: string;
+  hold: string;
+}
+
+/** Resolve this repo's writable label vocabulary. Reads the repo's workflow
+ *  config; spawns no `gh`, so it is cheap enough to call on every repo change. */
+export const ghLabelVocabulary = (repo: string): Promise<GhLabelVocabulary> =>
+  invoke("gh_label_vocabulary", { repo });
+
 /** Add and/or remove labels on issue `number`. The backend validates every
- *  label against a fixed allow-list (agent-ready / agent-investigation /
- *  agent-managed / agent-hold) and rejects anything else, so a malformed call
- *  fails loudly rather than attaching an arbitrary label. `agent-hold` (#778) is
- *  the human veto under full autonomy — writable from here because applying it
- *  IS the veto gesture. */
+ *  label against the allow-list it resolves for this repo — the three fixed
+ *  signals (agent-ready / agent-investigation / agent-managed) plus the repo's
+ *  own `hold` spelling — and rejects anything else, so a malformed call fails
+ *  loudly rather than attaching an arbitrary label. The veto (#778) is writable
+ *  from here because applying it IS the veto gesture; pass the spelling
+ *  `ghLabelVocabulary` returned, not a literal. */
 export const ghIssueSetLabels = (
   repo: string,
   number: number,

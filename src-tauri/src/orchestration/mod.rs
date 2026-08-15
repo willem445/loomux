@@ -3879,6 +3879,18 @@ pub struct Guardrails {
     /// started), and repeating the hardcoded-const gap on one of those would
     /// mean a repo that renamed the label gets its vetoes silently ignored.
     ///
+    /// **And "wired" means every surface that names the veto, not just this
+    /// one.** The first cut wired only the poller, which was worse than not
+    /// supporting the rename at all: the orchestrator builds its triage plan
+    /// from its own `gh issue list` sweep, so a contract still naming
+    /// `agent-hold` put a held issue into the plan the human then approved.
+    /// The spelling now also reaches the contract (the `{{HOLD_LABEL}}`
+    /// template variable, rendered from this field), and — resolved from the
+    /// repo's workflow file, since the issues view has no group — the
+    /// issues-view toggle and `gh.rs`'s label allow-list. See
+    /// `doc/design/orchestration.md`'s full-autonomy section for why the two
+    /// resolution paths agree.
+    ///
     /// Available regardless of the toggle: autonomous mode can run with the
     /// built-in roster, so a consumer must always have a profile to read, not
     /// just when the advanced orchestrator is in play.
@@ -31918,7 +31930,17 @@ impl OrchRegistry {
             // ordering nobody can observe and would put file IO under the set lock.
             let newly = self.full_autonomy_groups.lock_safe().insert(group.clone());
             let previous = if newly { None } else { self.full_autonomy_goal(group) };
-            if !newly && previous.as_deref().unwrap_or("") == goal {
+            // The no-op is gated on the marker being READABLE, not merely on the
+            // goal comparing equal (rev round 1 NB2). `full_autonomy_goal`
+            // answers `None` both for "on with no goal" and for "the marker is
+            // gone" — a marker a force-clear removed best-effort, or a hand
+            // delete — and treating those alike let a re-enable with an empty
+            // goal return early without rewriting it, leaving the mode ON in
+            // memory with nothing durable behind it and OFF after a restart.
+            // Asking the disk directly separates them: no marker means fall
+            // through and write one, whatever the goal says.
+            let marker_present = dir.join("full_autonomy").is_file();
+            if !newly && marker_present && previous.as_deref().unwrap_or("") == goal {
                 return Ok(()); // already on with this exact goal — don't re-notify
             }
             if let Err(e) = fs::create_dir_all(&dir)
@@ -34949,6 +34971,15 @@ impl OrchRegistry {
             ("WORKER_MODEL", g.guardrails.model_for(Role::Worker)),
             ("REVIEWER_MODEL", g.guardrails.model_for(Role::Reviewer)),
             ("PLANNER_MODEL", g.guardrails.model_for(Role::Planner)),
+            // #778: the veto's spelling, from the SAME resolved profile
+            // `poll_intake` reads. The contract is the consent boundary under
+            // full autonomy (nothing host-side blocks a start), so a template
+            // naming a label the poller does not honor would tell the
+            // orchestrator to build its triage plan around an exclusion that
+            // never fires. Threaded like MAX_AGENTS / WORKER_MODEL rather than
+            // conditionally injected: it is a per-group VALUE, not
+            // workflow-conditional prose, and it renders for every group.
+            ("HOLD_LABEL", g.guardrails.intake.hold.as_str()),
             ("WORKFLOW", workflow_section.as_str()),
             ("ADVISOR_CONSULT_NOTE", advisor_consult_note.as_str()),
             ("POST_MERGE_WORKFLOW_HOOK", post_merge_workflow_hook.as_str()),
@@ -38432,6 +38463,11 @@ impl OrchRegistry {
             ("WORKER_MODEL", group.guardrails.model_for(Role::Worker)),
             ("REVIEWER_MODEL", group.guardrails.model_for(Role::Reviewer)),
             ("PLANNER_MODEL", group.guardrails.model_for(Role::Planner)),
+            // #778, same value and same reason as the group-render list above:
+            // an orchestrator BLOCK re-renders its instruction file here on
+            // every spawn, so a var missing from this list would leave a live
+            // `{{HOLD_LABEL}}` in the file the agent actually reads.
+            ("HOLD_LABEL", group.guardrails.intake.hold.as_str()),
         ];
         // Audited, not swallowed: the kickoff below hands the agent this file's
         // path as "read your role instructions", so a failed write means an agent

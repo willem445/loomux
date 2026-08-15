@@ -962,10 +962,17 @@ fn the_scan_still_tells_async_from_sync() {
          either the exception was silently converted (delete its row and say so) or the sync \
          detection has drifted"
     );
+    // Both figures are DERIVED, not retyped (rev round 1 NB1). The previous
+    // wording carried a hand-maintained pair that had drifted from every census
+    // in the tree, and bumping a stale number by one only makes it stale
+    // differently — so the claim now counts what it is talking about.
+    let in_orchestration = sites.iter().filter(|s| s.file.contains("orchestration/")).count();
+    let total = loomux_lib::command_manifest::APP_COMMANDS.len();
     assert!(
-        sites.iter().any(|s| s.file.contains("orchestration/")),
-        "the walk did not descend into src/orchestration/ — 65 of the 137 commands live there, so \
-         a non-recursive walk would leave nearly half the surface undeclared rather than red"
+        in_orchestration > 0,
+        "the walk did not descend into src/orchestration/ — {in_orchestration} of the {total} \
+         commands were found there, so a non-recursive walk would leave nearly half the surface \
+         undeclared rather than red"
     );
 }
 

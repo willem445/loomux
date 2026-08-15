@@ -62,7 +62,9 @@ Toggle a label directly on the row:
   It's the veto under
   [full autonomy](../autonomous-mode.html#full-autonomy-the-orchestrator-picks-the-work),
   where every open issue is otherwise eligible, and it's rendered in red so it
-  never reads like a go signal.
+  never reads like a go signal. A repo that renamed it (`intake.labels.hold:` in
+  `.loomux/workflow.yml`) gets *its* spelling on this button — the label the
+  button writes is always the one that repo's agents actually honor.
 
 That's the whole handshake — a running orchestrator on this repo polls open
 issues and pulls any so-labelled onto its board. No orchestrator needs to be

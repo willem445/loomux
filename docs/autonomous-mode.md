@@ -186,11 +186,18 @@ created on demand with the description *"Held by the human — full-autonomy age
 must not start this"*, so it reads correctly on GitHub for anyone who's never seen
 loomux.
 
+**If your repo renamed it** (`intake.labels.hold:` in `.loomux/workflow.yml`),
+that spelling is the veto everywhere: the issues-view toggle writes it, the
+backend's label allow-list permits it and creates it on demand, and the
+orchestrator's own contract names it — so the hand-typed `gh` command above is
+`--add-label <your spelling>` too. A veto only some layers can see is not a veto,
+which is why the rename reaches all of them rather than the poller alone.
+
 - **loomux's half is host-side and zero-token:** a held issue is excluded from the
   eligible-work signal the intake poll produces, so the orchestrator is never even
   woken about it. Matching is case-insensitive, and a repo that renamed the label
-  in its workflow config (`intake.labels.hold:`) has *its* spelling honored — a
-  veto that silently didn't match would be the one failure this must not have.
+  has *its* spelling honored — a veto that silently didn't match would be the one
+  failure this must not have.
 - **The rest is policy** *(not enforced)*: the orchestrator's instructions make the
   label absolute — it may never remove it, argue with it, or start under it — but
   nothing structurally blocks a start the way the merge gate blocks a merge. It may
@@ -206,9 +213,10 @@ Enabling doesn't hand over the backlog; it starts a conversation about the backl
 2. **It posts one ranked triage plan** as a GitHub issue: every open issue, one row
    each, with value / risk / effort / proposed order, and each row naming the veto
    gesture.
-3. **You strike rows by labeling them `agent-hold`** — one click per row in the
-   issues view. There's no separate veto mechanism to learn, and nothing parses
-   your edits to the plan; the label *is* the strike.
+3. **You strike rows by labeling them `agent-hold`** (or your repo's own hold
+   spelling) — one click per row in the issues view. There's no separate veto
+   mechanism to learn, and nothing parses your edits to the plan; the label *is*
+   the strike.
 4. **You type "go" in the orchestrator's pane.** Until then the pre-existing
    backlog doesn't start. If you never say go, it never starts — that's a correct
    outcome, not a stall, and there's no timer that proceeds without you.

@@ -12504,7 +12504,40 @@ Five public-contract changes, all additive:
    the rationale-line duty, and the queue-empty rule.
 2. **`orch_autonomy` gains `full_autonomy` and `full_autonomy_goal`.**
 3. **`orch_set_full_autonomy(group_id, enabled, goal)`** — a new command.
-4. **`workflow.yml` gains optional `intake.labels.hold`** (default `agent-hold`).
+4. **`workflow.yml` gains optional `intake.labels.hold`** (default `agent-hold`), and the
+   resolved spelling reaches **every** surface that names the veto: the intake poller, the
+   orchestrator contract (a `{{HOLD_LABEL}}` template variable, threaded like `MAX_AGENTS`
+   from `guardrails.intake.hold`), the issues-view toggle, and `gh.rs`'s label allow-list.
+
+   **Why all four, rather than the poller alone.** A knob honored in one layer is worse than
+   no knob: the contract tells the orchestrator to build its triage plan from its *own*
+   sweep, so a contract naming a label the repo no longer uses produces a plan that includes
+   a held issue, which the human's "go" then covers — a vetoed issue started, with every
+   layer behaving as written. The design note's own rule against half-measures ("a boundary
+   that looks enforced while remaining advisory is strictly worse than an honest contract")
+   applies to its own knob. The UI half fails more loudly and less dangerously — the strike
+   button writes a label the poller ignores, so the issue keeps arriving as eligible — but it
+   is the same defect, and the same fix.
+
+   **Two resolution paths, and why they agree.** The poller and the contract read
+   `guardrails.intake.hold` (the group's resolved profile); `gh.rs` has no group — the issues
+   view is repo-scoped and can be open with no group at all — so it resolves from the repo's
+   own `.loomux/workflow.yml` through the same `workflow::load_workflow` `create_group` runs.
+   Guardrails are re-resolved from that file on every launch/resume, so the two can only
+   differ while a group is live and the file has been edited under it; the UI then writes the
+   *newly typed* spelling, which is the safe direction (the human's latest word), and the next
+   relaunch converges. An integration test pins that the two resolutions agree for a given
+   repo, because that agreement is what the allow-list's correctness rests on.
+
+   The allow-list stays an allow-list: exactly one resolved value joins the three fixed
+   signals, and `sanitize_intake_label` has already constrained it at parse time to the
+   `sanitize_id` alphabet, so nothing shell-ish or `--flag`-shaped can reach an argv. A repo
+   that declares no `hold:` gets the identical four-label set it had before.
+
+   The other four label fields (`ready`/`investigate`/`owned`/`prototype`) remain the uniform
+   #382 P2 gap — parsed, stored, honored nowhere — and `gh_label_vocabulary` deliberately
+   reports the built-ins for them rather than advertising a configurability nothing
+   implements.
 5. **The group dir gains a `full_autonomy` marker**, whose *content* is the goal.
 
 **Consent and its parameter are written together.** The goal lives in the marker's content —

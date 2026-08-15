@@ -22861,6 +22861,39 @@ fn a_goal_is_never_reported_for_a_mode_that_is_off() {
         "orch_autonomy must not surface a goal that is not in force");
 }
 
+/// rev round 1 NB2: the same-goal no-op must not skip a marker the disk no
+/// longer has. `full_autonomy_goal` reports `None` both for "on, no goal" and
+/// for "the marker is missing", so an early return keyed on the goal alone left
+/// the mode ON in memory with nothing durable behind it — and OFF after the next
+/// restart, silently.
+#[test]
+fn a_re_enable_rewrites_a_marker_that_went_missing_out_of_band() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let marker = reg.state_root().join(g.id.as_str()).join("full_autonomy");
+    reg.set_autonomous(&g.id, true).unwrap();
+    // Enabled with NO goal — the case where "no goal" and "no marker" both read
+    // as `None`, which is what made the two indistinguishable.
+    reg.set_full_autonomy(&g.id, true, "").unwrap();
+    assert!(reg.is_full_autonomy(&g.id) && marker.is_file());
+
+    // The marker disappears out of band (a best-effort force-clear whose remove
+    // failed, or a hand delete) while the in-memory flag stays set.
+    std::fs::remove_file(&marker).unwrap();
+    reg.set_full_autonomy(&g.id, true, "").unwrap();
+    assert!(
+        marker.is_file(),
+        "a re-enable must restore the durable marker rather than no-op on an equal goal — \
+         without it the mode is ON in memory and OFF after the next restart"
+    );
+
+    // And the ordinary no-op is intact: with the marker present and the goal
+    // unchanged, nothing is re-audited or re-notified.
+    let before = audit_count(&reg, &g.id, "full-autonomy-on");
+    reg.set_full_autonomy(&g.id, true, "").unwrap();
+    assert_eq!(audit_count(&reg, &g.id, "full-autonomy-on"), before, "still a no-op when durable");
+}
+
 #[test]
 fn disabling_autonomous_force_disables_full_autonomy() {
     let (reg, _d) = test_registry();

@@ -31,14 +31,32 @@ export const AGENT_MANAGED = "agent-managed";
 /** #778: the human's veto. Under full autonomy every open issue is eligible to be
  *  started EXCEPT a held one, so this label is the boundary — and applying it here
  *  is the gesture that draws it. Deliberately NOT a go-signal (see
- *  `AGENT_GO_LABELS`): holding an issue is the opposite instruction. */
-export const AGENT_HOLD = "agent-hold";
+ *  `AGENT_GO_LABELS`): holding an issue is the opposite instruction.
+ *
+ *  **This is the FALLBACK spelling, not the answer.** `intake.labels.hold` is
+ *  repo-configurable, so the live spelling comes from the backend
+ *  (`gh_label_vocabulary`, which resolves it from the repo's own
+ *  `.loomux/workflow.yml` and validates writes against the same value). A repo
+ *  that renamed the veto used to get a strike button writing `agent-hold` — a
+ *  label its own poller ignored, so the click did nothing and said it had worked.
+ *  Use this only until the vocabulary arrives, and never as a comparison against
+ *  a label that came from GitHub. */
+export const DEFAULT_HOLD = "agent-hold";
 
 /** The labels a human toggles from the issues view to hand an issue to the
  *  orchestrator (apply `agent-ready` to start work, `agent-investigate` to ask
- *  for a plan) — or, with `agent-hold`, to keep one away from it (#778). Order is
- *  the display order: the two go-signals, then the veto. */
-export const TOGGLEABLE_LABELS = [AGENT_READY, AGENT_INVESTIGATE, AGENT_HOLD] as const;
+ *  for a plan) — or, with the repo's `hold` spelling, to keep one away from it
+ *  (#778). Order is the display order: the two go-signals, then the veto.
+ *
+ *  Deduped, because nothing stops a repo declaring `hold: agent-ready`: the
+ *  parser only constrains the alphabet, not collisions with the fixed signals.
+ *  That config is a mistake either way, but rendering two identical buttons that
+ *  fight each other is a worse way to find out than one button that holds. */
+export function toggleableLabels(hold: string): string[] {
+  const out = [AGENT_READY, AGENT_INVESTIGATE];
+  if (!out.includes(hold) && hold.trim() !== "") out.push(hold);
+  return out;
+}
 
 /** Labels that mean "an orchestrator picks this up" — used to highlight rows
  *  already queued for agents. `agent-hold` is pointedly absent: it is a veto, and

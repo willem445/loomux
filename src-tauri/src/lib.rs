@@ -132,6 +132,7 @@ pub fn run() {
             git::git_rebase,
             git::git_branches,
             gh::gh_auth_status,
+            gh::gh_label_vocabulary,
             gh::gh_issue_list,
             gh::gh_issue_create,
             gh::gh_issue_set_labels,

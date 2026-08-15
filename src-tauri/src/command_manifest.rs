@@ -55,8 +55,9 @@ pub const APP_COMMANDS: &[&str] = &[
     "git_merge",
     "git_rebase",
     "git_branches",
-    // gh (10)
+    // gh (11)
     "gh_auth_status",
+    "gh_label_vocabulary",
     "gh_issue_list",
     "gh_issue_create",
     "gh_issue_set_labels",

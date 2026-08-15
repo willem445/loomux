@@ -304,7 +304,7 @@
           "name": "hold",
           "type": "string",
           "default": "agent-hold",
-          "help": "\"Held by the human — do not start this.\" The one veto in the vocabulary: under full autonomy every open issue is eligible except the ones carrying this label."
+          "help": "\"Held by the human — do not start this.\" The one veto in the vocabulary: under full autonomy every open issue is eligible except the ones carrying this label. Unlike the four fields above, renaming this one takes effect everywhere — the intake poller, the issues-view hold button, and the orchestrator's own contract all use the spelling you declare here."
         }
       ]
     },
