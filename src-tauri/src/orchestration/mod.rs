@@ -35138,8 +35138,7 @@ impl OrchRegistry {
                  scheduling** is not about it: never `kill_agent` `{id}` for looking idle. \
                  loomux's own idle-kill guardrail agrees and skips it — a human typing into a \
                  pane clears no idle clock, so a reaped liaison would be one killed \
-                 mid-conversation. Inside this group, that leaves nothing but your own \
-                 `kill_agent` able to end it. It does hold one live-delegate slot while it \
+                 mid-conversation. It does hold one live-delegate slot while it \
                  runs; pace the fleet around that instead of dropping it to make room.",
                 id = b.id,
             ),
