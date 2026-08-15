@@ -308,13 +308,16 @@ fn sweep_with(
     ask: impl Fn(&str) -> CliModelReply,
     emit: impl Fn(ModelsDetected),
 ) {
-    for cli in clis {
+    // `&cli` destructures the `&&str` the iterator yields, so every call below
+    // takes the `&str` its parameter is written as rather than leaning on a
+    // coercion through a closure's `Fn` bound.
+    for &cli in clis {
         probe(cli);
         if protocol_for(cli).is_none() {
             continue;
         }
         let reply = ask(cli);
-        emit(ModelsDetected { program: (*cli).to_string(), reply });
+        emit(ModelsDetected { program: cli.to_string(), reply });
     }
 }
 
@@ -366,15 +369,22 @@ pub fn start_startup_sweep(app: AppHandle) {
 /// whose sweep result has not landed yet answers [`NOT_YET_DETECTED`], and the
 /// webview learns the real answer on the `models-detected` event moments later.
 ///
-/// **Not delegated off-thread, unlike its #993 self and unlike
-/// `probe_agent_cli`.** `run_blocking` exists for command bodies that spawn a
-/// process or join a thread (#746, INV-2). This one takes a single uncontended
-/// mutex around a `HashMap` lookup — held by no other code path for longer than
-/// an insert — so handing it to the blocking pool would add a thread hop to
-/// something already shorter than the hop.
+/// **Still delegated off-thread, though its body no longer needs it** (#746 —
+/// `crate::blocking::run_blocking`, P1 of `doc/design/performance.md`). What is
+/// left here is one uncontended mutex around a `HashMap` lookup, which INV-1
+/// would happily let run on the webview thread as a `Class::Cheap` sync
+/// command. It stays async anyway, for two reasons that outlast this slice:
+/// it keeps the shape identical to `probe_agent_cli` beside it, and it means a
+/// future protocol row that makes this expensive again is a change to this
+/// module rather than a change to this module *plus* the `SYNC_COMMANDS`
+/// census. The cost is one thread hop, a handful of times per app run.
+///
+/// **Reentrancy.** Two webview calls for the same program can interleave
+/// freely, and there is nothing to protect: both only read, the map's single
+/// writer is the sweep thread, and the `Mutex` is what orders them.
 #[tauri::command]
 pub async fn list_cli_models(program: String) -> CliModelReply {
-    memo().read(program.trim().to_lowercase().as_str())
+    crate::blocking::run_blocking(move || memo().read(program.trim().to_lowercase().as_str())).await
 }
 
 #[cfg(test)]
@@ -550,19 +560,20 @@ mod tests {
             },
             |d| emitted.borrow_mut().push(d.program),
         );
+        let every: Vec<String> = SUPPORTED_CLIS.iter().map(|c| (*c).to_string()).collect();
         assert_eq!(
-            probed.borrow().as_slice(),
-            SUPPORTED_CLIS.map(str::to_string),
+            *probed.borrow(),
+            every,
             "every supported CLI's help probe is warmed, whether or not it can be asked for a list"
         );
         assert_eq!(
-            asked.borrow().as_slice(),
-            ["claude".to_string()],
+            *asked.borrow(),
+            vec!["claude".to_string()],
             "only a CLI with a PROTOCOLS row is spawned for a list — and exactly once"
         );
         assert_eq!(
-            emitted.borrow().as_slice(),
-            asked.borrow().as_slice(),
+            *emitted.borrow(),
+            *asked.borrow(),
             "one event per ask: a CLI that was never asked has no result to push, and an ask whose \
              result never reaches the webview is a spawn spent for nothing"
         );
