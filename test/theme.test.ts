@@ -19,7 +19,7 @@
 // would notice. Run `npm test`.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import {
   ANSI_SLOTS,
   CSS_TOKENS,
@@ -34,6 +34,22 @@ import {
 const read = (rel: string) => readFileSync(new URL(rel, import.meta.url), "utf8");
 const stripCssComments = (s: string) => s.replace(/\/\*[\s\S]*?\*\//g, "");
 const HEX = /^#[0-9a-f]{6}$/;
+
+/**
+ * The body of the stylesheet's `:root` block, and the split point between the token layer
+ * and everything below it.
+ *
+ * ONE reader for both pins, anchored on a closing brace in COLUMN ZERO — the stylesheet's
+ * own convention for the end of a top-level rule. The two pins below used to carry a regex
+ * each, one of them ending at the first `}` it met anywhere; that one would have taken a
+ * nested block or a braced value as the end of the token layer and then happily reported
+ * every token after it "undeclared". Same text, one place, no second reading of it.
+ */
+function splitAtRoot(css: string): { tokens: string; below: string } {
+  const m = css.match(/^:root\s*\{([\s\S]*?)^\}/m);
+  assert.ok(m, "styles.css has no :root block — the token layer is the first thing in it");
+  return { tokens: m[1], below: css.slice(m.index! + m[0].length) };
+}
 
 // WCAG relative luminance / contrast. The design note (doc/design/ui-redesign.md) makes
 // contrast PROMISES about this palette; a promise nobody measures is prose.
@@ -179,10 +195,8 @@ test("no ANSI colour disappears into the terminal background", () => {
 
 test("the stylesheet declares every pinned token, with theme.ts's value", () => {
   const css = stripCssComments(read("../src/styles.css"));
-  const root = css.match(/:root\s*\{([\s\S]*?)\}/);
-  assert.ok(root, "styles.css has no :root block — the token layer is the first thing in it");
   const declared = new Map<string, string>();
-  for (const [, name, value] of root[1].matchAll(/(--[a-z0-9-]+)\s*:\s*([^;]+);/g)) {
+  for (const [, name, value] of splitAtRoot(css).tokens.matchAll(/(--[a-z0-9-]+)\s*:\s*([^;]+);/g)) {
     declared.set(name, value.trim());
   }
   for (const [name, expected] of Object.entries(CSS_TOKENS)) {
@@ -196,26 +210,23 @@ test("the stylesheet declares every pinned token, with theme.ts's value", () => 
 
 // The pin above runs theme.ts -> stylesheet. On its own that is one-directional: a token
 // minted straight into `:root` with a literal value is a FOURTH copy of a colour, and it
-// stays green because nothing walks the stylesheet back into CSS_TOKENS. Slice B mints
-// tokens by the dozen while migrating ~387 literals, which is exactly when that hole gets
-// used. So walk it the other way too: every raw colour declared in `:root` must be pinned.
+// stays green because nothing walks the stylesheet back into CSS_TOKENS. So walk it the
+// other way too: every raw colour declared in `:root` must be pinned.
 //
-// A `var(...)` value is not a raw colour — it is an alias onto something already pinned,
-// which is what the legacy bridge is made of, so the bridge passes this without exception.
-const BRIDGE_LITERALS = new Set([
-  // The one bridge declaration that is a literal rather than an alias: an alpha companion
-  // to --accent, which CSS cannot derive from a hex custom property without color-mix.
-  // It dies with the bridge in slice B, and no new entry may be added to this set.
-  "--accent-glow",
-]);
-const RAW_COLOUR = /^(#|(rgba?|hsla?|hwb|lab|lch|oklab|oklch|color)\()/i;
+// A `var(...)` value is not a raw colour — it is an alias onto something already pinned.
+// The set below is empty and stays empty: it held `--accent-glow`, the one alpha companion
+// the pre-token stylesheet could not express, and slice B retired it along with the rest of
+// the legacy bridge. An alpha step is now `color-mix(in srgb, var(--token) N%, transparent)`
+// at the call site, which is an expression over a pinned colour rather than a new one.
+const BRIDGE_LITERALS = new Set<string>([]);
+/** The colour notations CSS gives you. Kept in one place so every guard here sees them all. */
+const COLOUR_FN = "rgba?|hsla?|hwb|lab|lch|oklab|oklch|color";
+const RAW_COLOUR = new RegExp(`^(#|(${COLOUR_FN})\\()`, "i");
 
 test("no colour enters :root without a pin in theme.ts", () => {
   const css = stripCssComments(read("../src/styles.css"));
-  const root = css.match(/:root\s*\{([\s\S]*?)\n\}/);
-  assert.ok(root, "styles.css has no :root block");
   const unpinned: string[] = [];
-  for (const [, name, value] of root[1].matchAll(/(--[a-z0-9-]+)\s*:\s*([^;]+);/g)) {
+  for (const [, name, value] of splitAtRoot(css).tokens.matchAll(/(--[a-z0-9-]+)\s*:\s*([^;]+);/g)) {
     const v = value.trim();
     if (!RAW_COLOUR.test(v)) continue;
     if (name in CSS_TOKENS || BRIDGE_LITERALS.has(name)) continue;
@@ -226,6 +237,317 @@ test("no colour enters :root without a pin in theme.ts", () => {
     [],
     "these :root colours exist nowhere in theme.ts, so nothing keeps them equal to the " +
       `pre-paint block or the terminal: ${unpinned.join("; ")}`
+  );
+});
+
+test("a colour buried inside a composite :root value is alpha-black or it is pinned", () => {
+  // The pin above is anchored at the START of the value, so it sees `--x: #abc` and misses
+  // `--shadow-card: 0 2px 8px rgba(0, 0, 0, 0.35)` — a colour it cannot reach. The design
+  // note answers that by RULE ("shadow tokens are alpha-black only, declared in this block
+  // where a reader can see all of them at once"), and slice B put eighteen call sites on
+  // those two tokens, so materially more now rides on a rule nothing measured. This is that
+  // rule, measured: a composite value may embed black at any alpha and nothing else.
+  //
+  // Alpha-black is exempt because it is not a HUE — it is the absence of one, the ink a
+  // shadow is made of, and it carries no channel to get wrong. Any other colour buried in a
+  // composite is a hue that no surface can restyle and no pin keeps equal to theme.ts.
+  const css = stripCssComments(read("../src/styles.css"));
+  const embedded = new RegExp(`(#[0-9a-fA-F]{3,8}\\b|\\b(?:${COLOUR_FN})\\([^)]*\\))`, "gi");
+  const ALPHA_BLACK = /^rgba?\(\s*0\s*,\s*0\s*,\s*0\s*(,\s*[0-9.]+\s*)?\)$/i;
+  const offenders: string[] = [];
+  for (const [, name, value] of splitAtRoot(css).tokens.matchAll(/(--[a-z0-9-]+)\s*:\s*([^;]+);/g)) {
+    const v = value.trim();
+    if (RAW_COLOUR.test(v)) continue; // the whole value is a colour — the pin above owns it
+    for (const m of v.matchAll(embedded)) {
+      if (ALPHA_BLACK.test(m[0])) continue;
+      offenders.push(`${name}: ${v}  (embedded ${m[0]})`);
+    }
+  }
+  assert.deepEqual(
+    offenders,
+    [],
+    "a hue is hiding inside a composite token value, where the theme.ts pin cannot see it: " +
+      offenders.join("; ")
+  );
+});
+
+// --- the migration guard (#879 slice B) --------------------------------------------------
+//
+// Maintainability rule 1 of the design brief is "no raw colour outside the token block in
+// src/styles.css". Slice A could only WRITE that rule down; 401 literals below the block
+// were still painting the app in a palette the brief renounces, so the rule was prose. This
+// is the rule as a measurement.
+//
+// A literal is a hex, ANY of CSS's colour functions, or a named colour. A `color-mix()` over
+// a token is NOT a literal: it is an expression whose colour input is already pinned, which
+// is exactly how a surface reaches an alpha step without minting a fourth copy of a hue.
+//
+// The function list and the name list are both wider than what the stylesheet contains
+// today, deliberately. A guard that only matches the two notations the migration happened to
+// meet — `#hex` and comma-form `rgb()` — enforces the rule against HISTORY rather than
+// against the next slice, which is free to reach for `oklch()` or plain `red` and sail past
+// it. Nothing here fires on the current tree; all of it is the rule, not a finding.
+const NAMED_COLOURS = [
+  "aqua", "azure", "beige", "black", "blue", "brown", "coral", "crimson", "cyan", "fuchsia",
+  "gold", "gray", "green", "grey", "indigo", "ivory", "khaki", "lavender", "lime", "linen",
+  "magenta", "maroon", "navy", "olive", "orange", "orchid", "pink", "plum", "purple", "red",
+  "salmon", "silver", "snow", "tan", "teal", "tomato", "turquoise", "violet", "wheat",
+  "white", "yellow",
+];
+// The name lookarounds exclude `--id-azure`, `white-space`, `--state-ok` and every other
+// place a colour word is part of a longer identifier rather than a value.
+const CSS_LITERAL = new RegExp(
+  `#[0-9a-fA-F]{3,8}\\b|\\b(?:${COLOUR_FN})\\(|(?<![-\\w])(?:${NAMED_COLOURS.join("|")})(?![-\\w])`,
+  "gi"
+);
+
+test("no raw colour survives below the token block in styles.css", () => {
+  const below = splitAtRoot(stripCssComments(read("../src/styles.css"))).below;
+  const found: string[] = [];
+  for (const line of below.split(/\r?\n/)) {
+    for (const m of line.matchAll(CSS_LITERAL)) {
+      // #194-style issue refs never reach here (comments are stripped), but a 5- or
+      // 7-character run of hex digits is not a colour either.
+      if (m[0].startsWith("#") && ![4, 5, 7, 9].includes(m[0].length)) continue;
+      // `color-mix(` is the sanctioned alpha step, and its `in srgb` interpolation keyword
+      // is not a colour; `color(` on its own still is.
+      if (/^color$/i.test(m[0].replace("(", "")) && line.includes("color-mix(")) continue;
+      found.push(`${m[0]}  in  ${line.trim().slice(0, 90)}`);
+    }
+  }
+  assert.deepEqual(
+    found,
+    [],
+    `${found.length} raw colour(s) below the token block — a surface that hard-codes a hue ` +
+      "is a surface the palette cannot move, and it declares no channel, so nobody can tell " +
+      `whether it means state, interaction or identity:\n${found.join("\n")}`
+  );
+});
+
+test("no value from the retired Tokyo Night palette survives anywhere in src/", () => {
+  // The brief renounces this palette by name: borrowing a well-liked theme is how an app
+  // ends up with someone else's identity and no argument for any of it. These eight values
+  // ARE that theme — the six the stylesheet used, plus the two extra git-graph lanes — and
+  // catching them by value is what makes "renounced" checkable. A migration that misses one
+  // leaves a surface speaking the old palette while everything around it moved, which is the
+  // half-retired look slice B exists to end, and which nothing else in this repo would see.
+  const RETIRED: Record<string, string> = {
+    "#7aa2f7": "blue", "#9ece6a": "green", "#e0af68": "amber", "#bb9af7": "magenta",
+    "#7dcfff": "cyan", "#f7768e": "red", "#73daca": "teal", "#ff9e64": "orange",
+  };
+  const rgbOf = (hex: string) =>
+    [1, 3, 5].map((i) => Number.parseInt(hex.slice(i, i + 2), 16)).join(", ");
+
+  const dir = new URL("../src/", import.meta.url);
+  const files = readdirSync(dir).filter((f) => f.endsWith(".ts") || f === "styles.css");
+  assert.ok(files.length > 40, "the src/ sweep found almost nothing — is the path still right?");
+
+  const survivors: string[] = [];
+  for (const file of files) {
+    const text = readFileSync(new URL(file, dir), "utf8");
+    text.split(/\r?\n/).forEach((line, i) => {
+      // A hex quoted in prose is a doc, not a paint: only lines that are code count. The
+      // stylesheet's comments are `/* */`, TypeScript's are `//` and `*`.
+      const code = line.replace(/\/\/.*$/, "").trim();
+      if (code.startsWith("*") || code.startsWith("/*")) return;
+      for (const [hex, name] of Object.entries(RETIRED)) {
+        if (code.toLowerCase().includes(hex) || code.includes(rgbOf(hex))) {
+          survivors.push(`src/${file}:${i + 1} — Tokyo Night ${name} (${hex}): ${code.slice(0, 80)}`);
+        }
+      }
+    });
+  }
+  assert.deepEqual(
+    survivors,
+    [],
+    `the retired palette is still painting ${survivors.length} place(s):\n${survivors.join("\n")}`
+  );
+});
+
+// --- the role table, and the channel a position sits on (#879 slice B) --------------------
+
+/** Every `--token` a rule body names, in source order. */
+function tokensIn(body: string): string[] {
+  return [...body.matchAll(/var\(\s*(--[a-z0-9-]+)/g)].map((m) => m[1]);
+}
+
+test("one role table: every surface that names an agent role paints it the same hue", () => {
+  // THE CLAIM THIS TEST EXISTS FOR. The design note says "a role colour is the same thing
+  // wherever it appears, or it is not identity, it is decoration", and three separate
+  // surfaces name a role: the session browser's badges, the group roster's chips, and the
+  // workflow pane's nodes and chips. Before slice B two of them disagreed with each other —
+  // the session browser painted a reviewer green and an orchestrator violet while the roster
+  // painted an orchestrator azure — and nothing anywhere noticed, because a role's colour is
+  // only ever WRONG relative to another file.
+  //
+  // The table is written out here as the design's own claim, and deliberately NOT derived
+  // from one of the surfaces: deriving it from the stylesheet would make any surface that
+  // drifted define the answer for the others, which is the exact failure being caught.
+  const TABLE: Record<string, string> = {
+    orchestrator: "--id-azure",
+    worker: "--id-jade",
+    reviewer: "--id-violet",
+    planner: "--id-amber",
+  };
+
+  // The role list comes from the TYPE, so a fifth role cannot be added to the app and
+  // silently skipped here.
+  const union = read("../src/orchbadge.ts").match(/export type OrchRole =([^;]+);/);
+  assert.ok(union, "orchbadge.ts no longer declares the OrchRole union");
+  const roles = [...union[1].matchAll(/"([a-z]+)"/g)].map((m) => m[1]);
+  assert.deepEqual(
+    [...roles].sort(),
+    Object.keys(TABLE).sort(),
+    "OrchRole and the role colour table have drifted apart — one of them gained a role"
+  );
+
+  const css = stripCssComments(read("../src/styles.css"));
+  // `complete: true` for the two surfaces that render a chip for EVERY role: a role with no
+  // rule there renders uncoloured, which is the planner bug this test was written for.
+  // The workflow chips only ever exist for the roles workflowview.ts emits, so that surface
+  // is checked for agreement, not for coverage.
+  const SURFACES = [
+    { what: "session badge", re: /\.session-badge\.orch-role\.([a-z]+)\s*\{([^}]*)\}/g, complete: true },
+    { what: "group roster", re: /\.group-role\.role-([a-z]+)\s*\{([^}]*)\}/g, complete: true },
+    { what: "workflow node", re: /\.wf-node-([a-z]+)\s*\{([^}]*)\}/g, complete: false },
+    { what: "workflow chip", re: /\.wf-chip-([a-z]+)\s*\{([^}]*)\}/g, complete: false },
+  ];
+
+  const wrong: string[] = [];
+  for (const { what, re, complete } of SURFACES) {
+    const seen = new Set<string>();
+    for (const [, role, body] of css.matchAll(re)) {
+      if (!(role in TABLE)) continue; // .wf-node-unknown, .wf-node-ghost, .wf-node-title …
+      seen.add(role);
+      const used = [...new Set(tokensIn(body))];
+      const off = used.filter((t) => t !== TABLE[role]);
+      if (off.length) {
+        wrong.push(`${what} "${role}" names ${off.join(", ")}, the table says ${TABLE[role]}`);
+      }
+    }
+    if (complete) {
+      for (const role of roles) {
+        if (!seen.has(role)) {
+          wrong.push(
+            `${what} has no rule for "${role}" — that badge renders uncoloured, so the one ` +
+              "role table is not what ships"
+          );
+        }
+      }
+    }
+  }
+  assert.deepEqual(wrong, [], `the role table is not honoured:\n${wrong.join("\n")}`);
+});
+
+test("an overlay that covers live content paints a translucent wash, never an opaque fill", () => {
+  // These six rules all sit OVER something the user still has to perceive: the drop
+  // indicator over the pane you are about to drop onto, and five scrims over the surface a
+  // dialog belongs to. For the drop indicator the translucency is not a style at all — it is
+  // the affordance, because reading the terminal underneath is how you tell WHICH pane and
+  // WHICH half the drop will land on. Paint it opaque and the preview becomes an occluder on
+  // the one interaction where seeing the target is the entire point.
+  //
+  // That is exactly what a token swap did here: `--accent-glow` (14% azure) became
+  // `--selection`, which is the right token for a selected ROW's fill and an opaque slab
+  // anywhere else. Nothing was wrong with the hue, so nothing else in this file would have
+  // caught it — which is why the list is written out rather than inferred. A new overlay
+  // over live content belongs on it.
+  const OVERLAYS = [
+    ".drop-indicator",
+    ".launcher-overlay",
+    ".git-modal-backdrop",
+    ".issues-form-backdrop",
+    ".tasks-dialog",
+    ".restore-splash",
+  ];
+  const css = stripCssComments(read("../src/styles.css"));
+  const opaque: string[] = [];
+  for (const sel of OVERLAYS) {
+    const rule = css.match(
+      new RegExp(`(^|[},])\\s*${sel.replace(".", "\\.")}\\s*\\{([^}]*)\\}`, "m")
+    );
+    assert.ok(rule, `${sel} has no rule — either it was renamed or the overlay is gone`);
+    const bg = rule[2].match(/(?:^|;)\s*background(?:-color)?\s*:\s*([^;]+)/);
+    assert.ok(bg, `${sel} paints no background — it cannot be a wash over anything`);
+    const value = bg[1].trim();
+    // A wash is a colour carried at partial alpha: `color-mix(..., transparent)` is the
+    // sanctioned form, and a bare `transparent` is trivially fine.
+    if (!/transparent\s*\)?$/.test(value)) opaque.push(`${sel} { background: ${value} }`);
+  }
+  assert.deepEqual(
+    opaque,
+    [],
+    "these overlays sit over content the user must still see, and now hide it:\n" +
+      opaque.join("\n")
+  );
+});
+
+test("no position mixes the state and identity channels across its own variants", () => {
+  // The rule `styles.css` states in its own token block: "No --id-* token may appear in a
+  // state position." Enforcing that needs a definition of "position" a test can compute, and
+  // this is the honest one: a rule and its VARIANTS (the same selector plus extra classes or
+  // attributes) paint the same element in the same property, so they are one position. If
+  // one variant answers "what is this doing" and another answers "which thing is this", the
+  // position has two channels and one of them is wrong.
+  //
+  // Failure this catches, and did: a three-step budget meter whose healthy step was
+  // `--id-jade` while its `.warn` and `.over` steps were `--state-*`. Nothing looked wrong —
+  // the pigment is identical — but retune the identity hue for git-lane separability, which
+  // is what the identity channel is FOR, and the healthy bar moves while its own siblings
+  // stay put. No diff, no failure, a silently desynced ramp.
+  const css = stripCssComments(read("../src/styles.css"));
+  const channelOf = (t: string) =>
+    t.startsWith("--state-") ? "state" : t.startsWith("--id-") ? "identity" : null;
+
+  // property -> selector -> channel, for every rule that paints a channel token.
+  const paints = new Map<string, Map<string, string>>();
+  for (const [, sel, body] of css.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+    const selector = sel.trim().replace(/\s+/g, " ");
+    if (selector.startsWith("@") || selector.includes(",")) continue;
+    for (const decl of body.split(";")) {
+      const i = decl.indexOf(":");
+      if (i < 0) continue;
+      const prop = decl.slice(0, i).trim();
+      for (const token of tokensIn(decl.slice(i + 1))) {
+        const ch = channelOf(token);
+        if (!ch) continue;
+        if (!paints.has(prop)) paints.set(prop, new Map());
+        paints.get(prop)!.set(selector, ch);
+      }
+    }
+  }
+
+  const mixed: string[] = [];
+  for (const [prop, bySel] of paints) {
+    for (const [a, chA] of bySel) {
+      for (const [b, chB] of bySel) {
+        // b is a variant of a: same selector, then more classes/attributes on the end.
+        if (a === b || !b.startsWith(a) || !/^[.:[]/.test(b.slice(a.length))) continue;
+        if (chA !== chB) mixed.push(`${prop}: "${a}" is ${chA}, its variant "${b}" is ${chB}`);
+      }
+    }
+  }
+  assert.deepEqual(
+    mixed,
+    [],
+    "these positions answer two different questions depending on the variant, so the token " +
+      `layer can move one of them without the others:\n${mixed.join("\n")}`
+  );
+});
+
+test("no rule names a token from the retired legacy bridge", () => {
+  // Slice A's eleven aliases were declared temporary in their own comment and deleted by
+  // slice B. A `var(--panel)` that survives the deletion resolves to NOTHING — CSS drops the
+  // whole declaration and the surface silently loses its background, with no error anywhere.
+  const css = stripCssComments(read("../src/styles.css"));
+  const bridge =
+    /var\(\s*--(bg-app|bg-term|panel|panel-2|border|border-soft|text|text-dim|accent-dim|accent-glow|danger)(?![-a-z0-9])/g;
+  const used = [...css.matchAll(bridge)].map((m) => `--${m[1]}`);
+  assert.deepEqual(
+    [...new Set(used)],
+    [],
+    "these retired bridge names are still referenced, and each one resolves to nothing: " +
+      [...new Set(used)].join(", ")
   );
 });
 

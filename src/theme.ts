@@ -5,8 +5,8 @@
 // in index.html (which must be right BEFORE the bundle loads, or the app flashes the wrong
 // colour at startup), and the xterm.js ITheme in pane.ts (terminals render on a WebGL
 // canvas — CSS custom properties are invisible to them). Before this module the three were
-// hand-kept in sync, which is to say they were not: the pre-paint hex and `--bg-app` agreed
-// only because nobody had changed one of them yet.
+// hand-kept in sync, which is to say they were not: the pre-paint hex and the stylesheet's
+// app ground agreed only because nobody had changed one of them yet.
 //
 // So: the values live here, in DOM-free TypeScript that a node:test can read, and the other
 // two surfaces are PINNED TO IT by test/theme.test.ts rather than by good intentions. The

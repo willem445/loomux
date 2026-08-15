@@ -6,6 +6,7 @@
 // board and roster show (issue #75) — never a per-group ordinal.
 
 import type { PaneBadge } from "./pane";
+import { IDENTITY } from "./theme.ts";
 
 export type OrchRole = "orchestrator" | "worker" | "reviewer" | "planner";
 
@@ -13,7 +14,17 @@ export type OrchRole = "orchestrator" | "worker" | "reviewer" | "planner";
 // appear. Color is the group-pairing cue ("this orchestrator ↔ its workers");
 // the per-agent id (below) is the cross-reference cue. Groups are few; palette
 // wrap collisions are fine because the id still disambiguates every agent.
-const GROUP_COLORS = ["#7aa2f7", "#9ece6a", "#e0af68", "#bb9af7", "#7dcfff", "#f7768e"];
+// Identity, not state: which GROUP this pane belongs to (#879 slice B). Six of the eight
+// hues, in wheel order — rose and amber lead the warm arc, and `lime`/`orchid` are held back
+// so the set stays the one the tab bar and the channel chips also draw from.
+const GROUP_COLORS = [
+  IDENTITY.azure,
+  IDENTITY.jade,
+  IDENTITY.amber,
+  IDENTITY.violet,
+  IDENTITY.cyan,
+  IDENTITY.rose,
+];
 
 interface GroupMeta {
   color: string;

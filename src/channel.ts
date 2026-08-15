@@ -10,6 +10,7 @@
 
 import type { PaneMenuAction, PendingConnect } from "./panemenu";
 import type { PaneChannelBadge } from "./pane";
+import { IDENTITY } from "./theme.ts";
 
 export type ConnectEffect =
   | { kind: "none" }
@@ -95,7 +96,14 @@ export function dropIfStale(pending: PendingConnect | null, isAlive: boolean): P
 // not an import: orchbadge.ts's palette is keyed by insertion-order group id, this one
 // by a channel's OWN numeric suffix — different indexing scheme, same visual set, and
 // importing would suggest a coupling that doesn't exist).
-const CHANNEL_COLORS = ["#7aa2f7", "#9ece6a", "#e0af68", "#bb9af7", "#7dcfff", "#f7768e"];
+const CHANNEL_COLORS = [
+  IDENTITY.azure,
+  IDENTITY.jade,
+  IDENTITY.amber,
+  IDENTITY.violet,
+  IDENTITY.cyan,
+  IDENTITY.rose,
+];
 
 /** The chip's number/color are a pure function of the backend-assigned
  *  `displayNumber` (mod.rs's `Channel.display_number`) — NOT the channel id's

@@ -543,15 +543,117 @@ removes the rule that kept the app grey and picks the colours — it does not ye
 
 Not shipped: any restyling — and the honest description of that is not "the old design
 wearing the new colours", because only the rules that went through a *token* moved. The
-eleven pre-redesign token names survive as an explicitly temporary **legacy bridge** aliasing
-onto the new layer, so everything that consumed one is now on the new palette and nothing
-breaks. Everything that hard-coded a colour instead is untouched: **397 colour literals** sit
-below the token block (249 hex, 148 `rgb()`/`rgba()`), **169 of them the retired Tokyo Night
-palette** this brief renounces — 59 of the old amber, 39 red, 35 blue, 21 green, 10 cyan, 5
+eleven pre-redesign token names survived as an explicitly temporary **legacy bridge** aliasing
+onto the new layer, so everything that consumed one moved to the new palette and nothing
+broke. Everything that hard-coded a colour instead was untouched: **401 colour literals** sat
+below the token block (249 hex, 152 `rgb()`/`rgba()`), **175 of them the retired Tokyo Night
+palette** this brief renounces — 59 of the old amber, 39 red, 35 blue, 21 green, 14 cyan, 7
 magenta — concentrated in the task board, the audit log, the workflow pane and its mode
 chrome, project tabs, session restore, and the attention badge. Until slice B those surfaces
-stay visibly on the old palette while the rest moves, which is a transitional state, not the
-design.
+stayed visibly on the old palette while the rest moved, which was a transitional state, not
+the design.
 
-Slice B migrates the literals and deletes the bridge; slices C through I restyle the surfaces
+Slice B migrated the literals and deleted the bridge; slices C through I restyle the surfaces
 to this brief; X9 and X10 need a plan decision before anyone starts them.
+
+## What slice B migrated, and the role map it migrated against
+
+Slice B is the slice that makes the palette visible. It moved all 401 literals onto the
+tokens, retired the bridge, and — because rule 3 requires it — wrote down the mapping it used
+rather than deciding hue by hue in the diff.
+
+**How a role was chosen.** The token a surface names declares which question its colour is
+answering, so the mapping is by role and never by nearest hex. Three questions, in the order
+they were asked of every literal:
+
+| If the colour means… | it takes | examples migrated |
+| --- | --- | --- |
+| something failed, needs you, finished, or is live | `--state-*` | error banners and toasts, the attention chip and its pulse, blocked findings, an awaiting-human task row, a running agent's row edge |
+| something the human can act on | `--accent` / `--selection` / `--focus` | the active pane's ring, primary buttons, keyboard-selected rows, on-state toggles, the drop indicator, editor search matches |
+| *which* thing this is | `--id-*` | git-graph lanes, per-CLI and per-role badges, task-board columns, timeline lanes, workflow node kinds, action families, project-tab and channel colours, diff add/delete, the git status letters |
+
+**One role table, applied everywhere.** The four agent roles were coloured by two surfaces
+that disagreed with each other — the session browser painted a reviewer green and an
+orchestrator violet, the group roster painted an orchestrator azure and a reviewer violet.
+They now share one table: **orchestrator azure, worker jade, reviewer violet, planner amber**,
+used by the session badges, the group roster, and the workflow pane's role chips and nodes
+alike — and `test/theme.test.ts` reads all four of those surfaces and fails on a role that
+disagrees with the table or is missing from a surface that renders every role. A role's colour
+is the same thing wherever it appears or it is not identity, it is decoration; that sentence
+is a claim, so it is measured rather than asserted.
+
+**Where the eight hues landed.** `lime` and `orchid` had no consumer at all before this
+slice: lime now marks a *human* actor in the audit log and the GitHub lane in the timeline
+(the two places the app distinguishes "a person did this" from "we did"), and orchid carries
+the prototype task column and its `proceed` action. `cyan` is the "ready / start / human
+testing" family, `violet` everything review- and PR-shaped.
+
+**Alpha steps are `color-mix`, not new tokens.** The old stylesheet reached a tint by writing
+`rgba(224, 175, 104, 0.16)` — the hue restated in a third notation, invisible to every pin.
+The migrated form is `color-mix(in srgb, var(--state-attention) 16%, transparent)`, which is
+an *expression over a pinned colour*: change the dye in `theme.ts` and every tint of it moves.
+The alternative — minting `--state-attention-16` and friends — would have put roughly forty
+new colour declarations in `:root`, which is the fourth-copy failure the token layer exists to
+prevent. `color-mix` is Baseline-2023 and this app ships against evergreen WebView2, so the
+support argument is the same one `:has()` and custom properties already rest on.
+
+**The `Lit` steps stay out of the stylesheet.** A chip whose text was a lightened hue
+(`#f2c66a` on an amber chip) now takes the base dye instead. Every hue clears AA on all three
+grounds, so the base is measurably legible where the lightened value was only assumed to be,
+and `:root` carries what the stylesheet uses rather than the whole palette. The first slice
+that genuinely needs a `Lit` step mints and pins it then.
+
+**Two state tokens are still unconsumed, and that is correct.** `--state-held` and
+`--state-idle` are achromatic *by design* — a stopped agent is marked by form, not hue — and
+the form that marks it is the warp thread, which does not exist until slices C and D. Nothing
+in the current chrome is the right home for them, and painting a chip grey to use up a token
+would be the opposite of the argument. The delivery-held badge deliberately keeps the
+attention dye it has always had (see its own comment in the stylesheet); the *thread* is where
+`held` becomes visible.
+
+**What changed on screen beyond the swap.** Six things, each a consequence of the design
+rather than a preference:
+
+- The glows are gone (`--accent-glow` was the bridge's one literal). Three rules carried one:
+  the two hover glows go entirely, the drop indicator's 22px halo goes with them, and the
+  active pane keeps an accent **ring** instead, raised from 12% to 55% so it reads without
+  the halo.
+- Four hover backgrounds that used to be a hand-mixed value lighter than their rest surface
+  now step `--surface-1` → `--surface-2`, so the hover lifts one rung of the ladder rather
+  than landing on its own rest colour.
+- Eighteen hand-rolled alpha-black shadows collapse onto `--shadow-card` and `--shadow-float`,
+  which is the rationing §Elevation asks for.
+- A follow/live toggle is interaction, not a state, so `.audit-follow.on` and
+  `.timeline-follow.on` take the accent instead of the old green.
+- Text and marks sitting **on** a filled hue take `--surface-0`. The eight hues are chosen to
+  be legible *as ink* on the dark grounds, so light-on-hue is the pairing that loses
+  contrast: the mic button, the voice overlay badge with its dot and spinner, and the
+  merged-PR chip move off white onto the dark ink every other filled chip already used.
+- The planner's session badge is coloured **at all**. `sessions.ts` emits a role chip for
+  every `OrchRole` and the stylesheet had rules for three of the four, so a planner session
+  rendered uncoloured — the one role whose colour was not the same wherever it appeared, on
+  the surface the role table names first.
+
+**The rule is now measured, not written down.** `test/theme.test.ts` fails on any hex, any
+CSS colour function, or any named colour below the token block; on a hue buried inside a
+composite token value, where the theme.ts pin cannot see it (a shadow may embed alpha-black
+and nothing else); on any surviving value from the retired palette anywhere in `src/`; and on
+any reference to a deleted bridge name. Rule 1 was prose while 401 literals contradicted it;
+it is a test now.
+
+**Three of those tests measure the ROLE rather than the value, which is the harder half.**
+A migration that puts the right pigment in the wrong channel looks perfect and reads wrong,
+and no contrast or distinctness check can see it:
+
+- *One role table.* All four surfaces that name an agent role — session badges, the group
+  roster, the workflow pane's nodes and its chips — are read and compared against the table
+  written above, and the role list itself comes from the `OrchRole` union so a fifth role
+  cannot be added and silently skipped. A role missing from a surface that renders every
+  role fails too: that is how a planner badge went uncoloured for as long as it did.
+- *No position mixes channels.* A rule and its variants (`.x` and `.x.warn`) paint the same
+  element in the same property, so they are one position; if one answers "what is this
+  doing" and another "which thing is this", the position has two channels and one of them
+  is wrong. This is `styles.css`'s own "no `--id-*` in a state position" rule, computed.
+- *An overlay over live content stays translucent.* The drop indicator is a wash you read
+  the terminal *through*; painted opaque it stops being a preview and becomes an occluder.
+  The hue was never wrong there, which is precisely why nothing else would have caught it.
