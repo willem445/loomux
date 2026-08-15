@@ -429,8 +429,21 @@ export class ModelCatalog {
    *  still leave `report()` null (a surface has to fall back to its seed) while
    *  bounding the ask. */
   private detectResolved = new Map<string, ModelReport>();
-  /** Live listeners for {@link onReport}. */
-  private reportListeners: ((program: string) => boolean)[] = [];
+  /** Subscribers to {@link onReport}: what to run, and how to ask whether the
+   *  thing that registered it is still there.
+   *
+   *  **The two are separate functions, and that separation is the whole fix for
+   *  the leak the first cut shipped.** When liveness was the delivery
+   *  callback's return value, the only way to ask "are you still alive?" was to
+   *  DELIVER — which repaints — so pruning could only ever happen when a report
+   *  actually changed something. The producer changes something at most once per
+   *  program per app run and sometimes never (if the pull wins the race,
+   *  `acceptReport` refuses before it ever reaches the listeners), so in the
+   *  ordinary case the prune ran zero times and every host built after the sweep
+   *  was retained for the life of the process. Asking is now free of side
+   *  effects, so it can happen on the one event that keeps recurring:
+   *  registration. */
+  private reportListeners: { handler: (program: string) => void; isAlive: () => boolean }[] = [];
 
   /** The injected backend call (`pty.ts`'s `listCliModels`, read through
    *  `modelwire.ts`). Optional: the launcher's own catalog is constructed
@@ -496,36 +509,79 @@ export class ModelCatalog {
    *  intended. A design that ever re-sweeps mid-run has to revisit the second
    *  refusal — it is a statement about the producer, not about reports. */
   acceptReport(program: string, report: ModelReport): boolean {
+    // FIRST, and outside both refusals below. Retention must not depend on
+    // whether this particular report happens to change anything, because in the
+    // ordinary case no report ever does: the producer emits once per program
+    // per app run, and if the pull won the race this returns at the second
+    // refusal every time. A prune behind those `return`s is a prune that never
+    // runs (rev-713 blocking 2).
+    this.pruneReportListeners();
     if (!reportWorthKeeping(report)) return false;
     if (this.detectResolved.has(program)) return false;
     this.detectResolved.set(program, report);
     // Also settles the pull side: a picker that opens later reads this instead
     // of issuing a lookup for an answer already in hand.
     this.detectAsked.set(program, Promise.resolve(report));
-    // A listener that reports itself gone is dropped here rather than needing
-    // its host to remember to unsubscribe — see `onReport`.
-    this.reportListeners = this.reportListeners.filter((cb) => cb(program));
+    for (const l of this.reportListeners) l.handler(program);
     return true;
+  }
+
+  /** Drop every subscriber whose host says it is gone.
+   *
+   *  Side-effect free by construction — it asks `isAlive`, never `handler` — so
+   *  it is safe to run on any event, which is what lets it run on one that
+   *  actually recurs. */
+  private pruneReportListeners(): void {
+    this.reportListeners = this.reportListeners.filter((l) => l.isAlive());
   }
 
   /** Be told when a pushed report lands, so a form already on screen can
    *  refresh (#1020).
    *
-   *  **The callback returns whether it is still alive**, and that is the whole
-   *  lifecycle contract: `false` drops it. A host with an explicit teardown can
-   *  use the returned unsubscribe instead, but neither surface here reliably
-   *  has one — the launcher form is discarded with its pane, and a subscription
-   *  that outlived it would repaint detached DOM forever. Liveness is a fact
-   *  only the host knows (`this.disposed`, `el.isConnected`), and this module
-   *  is DOM-free, so the host is asked rather than inspected.
+   *  `isAlive` is asked, never inferred: liveness is a fact only the host knows
+   *  (`this.disposed`, `el.isConnected`) and this module is DOM-free, so it
+   *  cannot look. It must be free of side effects — {@link pruneReportListeners}
+   *  calls it at times no repaint is wanted.
    *
-   *  Fired only for a report that CHANGED something ({@link acceptReport}), so
-   *  a listener never has to ask whether it has already seen this one. */
-  onReport(cb: (program: string) => boolean): () => void {
-    this.reportListeners.push(cb);
+   *  **Registration is what bounds retention**, and it is deliberately not the
+   *  only defence. Each host also holds the returned unsubscribe and calls it
+   *  from its own teardown, which releases immediately rather than at the next
+   *  registration; the prune here is the backstop for a host discarded without
+   *  one (a launcher form dropped with its pane never reaches a teardown at
+   *  all). Registration is the right event to hang it on because it is the only
+   *  one that keeps happening: every new host subscribes, so the list cannot
+   *  grow past the live hosts plus the one being added. Hanging it on delivery
+   *  instead is the bug this replaced — the producer delivers at most once per
+   *  program per app run, so hosts built afterwards were never asked.
+   *
+   *  Handlers fire only for a report that CHANGED something
+   *  ({@link acceptReport}), so one never has to ask whether it has already seen
+   *  this report. */
+  onReport(handler: (program: string) => void, isAlive: () => boolean): () => void {
+    this.pruneReportListeners();
+    const entry = { handler, isAlive };
+    this.reportListeners.push(entry);
     return () => {
-      this.reportListeners = this.reportListeners.filter((x) => x !== cb);
+      this.reportListeners = this.reportListeners.filter((l) => l !== entry);
     };
+  }
+
+  /** How many subscribers {@link onReport} is holding right now.
+   *
+   *  **A reader with no product caller, which this repo otherwise refuses**, and
+   *  the exception is argued rather than assumed: RETENTION is the property, and
+   *  it is invisible from every other angle. The first cut of this seam pruned
+   *  only when a report changed state — something the producer does at most once
+   *  per program per app run and often never — so every host built after the
+   *  sweep was retained for the life of the process, and the whole suite stayed
+   *  green because nothing could see the list. A leak no test can observe is a
+   *  leak that comes back.
+   *
+   *  Deliberately does NOT prune before answering: a getter that tidied up first
+   *  would report the list as healthy no matter when the tidying actually
+   *  happens, which is precisely the bug it exists to catch. */
+  get liveReportListeners(): number {
+    return this.reportListeners.length;
   }
 
   /** The list-models reply already in hand for `cli`, or `null`. */

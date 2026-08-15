@@ -258,6 +258,18 @@ export class WorkflowView {
    *  it installs this, and `renderInspector` takes it away when those controls
    *  are detached. */
   private refreshBlockModels: (() => void) | null = null;
+  /** Releases this pane's `modelCatalog.onReport` subscription. Held so
+   *  `dispose()` can call it — see the subscription itself. */
+  private unsubscribeReports: (() => void) | null = null;
+  /** CLIs a detection reply has already been applied to this pane for (#1020).
+   *
+   *  The push and the pull are two deliveries of ONE sweep answer and both can
+   *  land — the lookup's `.then` is already attached when the event arrives, and
+   *  neither call site can tell that the other got there first. Deduping in the
+   *  funnel they share, rather than at each call site, is what makes "the two
+   *  routes must not repaint a form twice" hold for BOTH orderings instead of
+   *  the one a guard captured at paint time covers (rev-713 non-blocking 3). */
+  private detectionsApplied = new Set<string>();
 
   // Canvas interaction state. All three are transient — none of them is ever serialized, and
   // the model never learns they existed.
@@ -287,11 +299,16 @@ export class WorkflowView {
     //
     // `disposed` is the liveness answer `onReport` asks for: a closed pane must
     // stop being repainted, and this is the only teardown signal it has.
-    modelCatalog.onReport(() => {
-      if (this.disposed) return false;
-      this.applyDetection();
-      return true;
-    });
+    // The unsubscribe is HELD and called from `dispose()`, not discarded: the
+    // catalog is app-scoped and this pane is not, so a subscription nobody
+    // releases retains the whole view — its analysis, its detached DOM — for the
+    // life of the process (rev-713 blocking 2). `disposed` is the same answer
+    // given to the catalog's own prune, for a pane that is closed some other
+    // way.
+    this.unsubscribeReports = modelCatalog.onReport(
+      (program) => this.applyDetection(program),
+      () => !this.disposed
+    );
 
     // ---- header ----
     const head = el("div", "wf-head");
@@ -510,6 +527,11 @@ export class WorkflowView {
 
   dispose(): void {
     this.disposed = true;
+    // Released here rather than left to the catalog's next prune: this is the
+    // moment the view becomes garbage, and the prune only runs when something
+    // else subscribes — which may be never.
+    this.unsubscribeReports?.();
+    this.unsubscribeReports = null;
     this.el.remove();
   }
 
@@ -935,8 +957,16 @@ export class WorkflowView {
    *  redrawn only when the human is not inside it, and repainted in place when
    *  they are. The menu goes through {@link refreshBlockModels}, which is
    *  `null` when no form is on screen and defers past the mid-type window when
-   *  one is. */
-  private applyDetection(): void {
+   *  one is.
+   *
+   *  **Idempotent per CLI**, which is where the two routes are reconciled: the
+   *  first delivery to arrive does the work and the second is a no-op, whichever
+   *  order they land in. A second application could only ever repeat the first —
+   *  the sweep asks each CLI once, so there is no later answer for the same one
+   *  to carry. */
+  private applyDetection(program: string): void {
+    if (this.detectionsApplied.has(program)) return;
+    this.detectionsApplied.add(program);
     // The findings are the pane's, not any one form's, so they are recomputed
     // and repainted whatever happened to the form meanwhile — a reply that
     // landed after the human moved on still corrects the file's analysis.
@@ -1528,7 +1558,7 @@ export class WorkflowView {
       if (!modelCatalog.report(cli)) {
         void modelCatalog.detect(cli).then((r) => {
           if (!r.models.length) return;
-          this.applyDetection();
+          this.applyDetection(cli);
         });
       }
     }

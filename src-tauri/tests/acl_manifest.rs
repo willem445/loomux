@@ -184,7 +184,8 @@ fn app_commands_len_is_146() {
          +1 for discover_ssh — the local OpenSSH-client resolution probe an SSH pane launches \
          through, added in #887 slice S3, +2 for orch_questions_list/orch_question_answer — the \
          trusted read and answer surfaces onto the human-question registry added in #946 slice \
-         Q1, +1 for list_cli_models — the human-asked list-models control probe added in #993, \
+         Q1, +1 for list_cli_models — the list-models lookup added in #993 and made a pure \
+         read of the startup sweep's memo in #1020, \
          +1 for orch_set_full_autonomy — the full-autonomy toggle added in #778, +1 for \
          gh_label_vocabulary — the repo-resolved intake label vocabulary the issues view asks \
          for instead of hardcoding, added in #778 review round 1) — \

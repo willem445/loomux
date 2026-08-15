@@ -356,18 +356,27 @@ test("both hosts take the startup sweep's push, and answer for their own livenes
   // `ModelCatalog` can rely on, so a subscription that never says it is gone
   // repaints detached DOM for the rest of the app run — one leak per discarded
   // form.
-  for (const file of ["workflowview.ts", "launcher.ts"]) {
+  // The liveness half is not decoration, and the shape it takes is the fix for
+  // the leak the first cut shipped (rev-713 blocking 2). Liveness is a SECOND
+  // argument — a side-effect-free predicate the catalog can ask at any time —
+  // rather than the delivery callback's return value. When it was the return
+  // value, asking meant delivering, so pruning could only happen when a report
+  // changed state; the producer does that at most once per program per app run
+  // and sometimes never, and every host built afterwards was retained forever.
+  const LIVENESS = { "workflowview.ts": /!this\.disposed/, "launcher.ts": /aliveForReports\(\)/ };
+  for (const file of ["workflowview.ts", "launcher.ts"] as const) {
     for (const body of onReportBodies(src(file), file)) {
       assert.match(
         body,
-        /return false/,
-        `${file}'s onReport handler must be able to report itself gone — a subscription with no route to \`false\` ` +
-          `outlives the DOM it repaints`
+        /onReport\(\s*[\s\S]*,[\s\S]*\)/,
+        `${file} must pass \`onReport\` a liveness predicate as its own argument, not fold liveness into the ` +
+          `delivery callback — the catalog has to be able to ask without repainting`
       );
       assert.match(
         body,
-        /return true/,
-        `${file}'s onReport handler must stay subscribed while it is alive, or it hears exactly one report`
+        LIVENESS[file],
+        `${file}'s subscription must hand the catalog its real liveness answer; without one the app-scoped ` +
+          `catalog retains this host, its state and its detached DOM for the life of the process`
       );
     }
   }
@@ -375,13 +384,33 @@ test("both hosts take the startup sweep's push, and answer for their own livenes
   // the lookup do the same work rather than merely similar work.
   assert.match(
     onReportBodies(src("workflowview.ts"), "workflowview.ts").join("\n"),
-    /this\.applyDetection\(\)/,
+    /this\.applyDetection\(/,
     "the workflow pane's push must go through the same refresh the lookup does"
   );
   assert.match(
     onReportBodies(src("launcher.ts"), "launcher.ts").join("\n"),
     /this\.refreshRoleFromDetection\(/,
     "the launcher's push must go through the same refresh the lookup does"
+  );
+});
+
+test("a host with a teardown releases its subscription there, rather than waiting to be pruned", () => {
+  // The other half of blocking 2. `WorkflowView` HAS a teardown, so it must not
+  // rely on the catalog's prune — that only runs when something else subscribes,
+  // which may be never. The launcher deliberately has no equivalent: `fire()`
+  // looks like one, but `reopenAfterLaunchFailure` revives the form afterwards,
+  // so releasing there would leave a live form deaf to the sweep. That asymmetry
+  // is why this names one file and not both, and it is argued at the launcher's
+  // own subscription rather than left for a reader to infer from the absence.
+  const wf = stripComments(src("workflowview.ts"));
+  const at = wf.indexOf("dispose(): void {");
+  assert.notEqual(at, -1, "`dispose` was renamed — the pane's release point is gone");
+  const body = wf.slice(at, wf.indexOf("\n  }", at));
+  assert.match(
+    body,
+    /unsubscribeReports\?\.\(\)/,
+    "a pane with a real teardown must release its `onReport` subscription there: the catalog's prune is a backstop " +
+      "for hosts that have no teardown, not a substitute for one that does"
   );
 });
 

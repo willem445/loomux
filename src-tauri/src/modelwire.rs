@@ -205,10 +205,20 @@ fn worth_keeping(reply: &CliModelReply) -> bool {
     reply.error.is_none() && !reply.output.trim().is_empty()
 }
 
-/// The error a lookup reports when the sweep has not answered for this program
-/// yet. Diagnostic only — every surface degrades to its seed either way — but
-/// deliberately distinct from the no-protocol message, because the two are
-/// different futures: this one is about to change, and that one never will.
+/// The error a lookup reports when the memo holds nothing for this program.
+///
+/// Diagnostic only — every surface degrades to its seed either way — but
+/// deliberately distinct from the no-protocol message, because the two say
+/// different things about WHY: "loomux has no way to ask this CLI at all"
+/// versus "loomux asked, or is about to, and has nothing to show yet".
+///
+/// **It does not promise the answer is coming** (rev-713 non-blocking 5). An
+/// earlier version of this comment claimed the two errors were "different
+/// futures — this one is about to change, and that one never will", and that is
+/// false in the case that matters: after a failed or empty ask the memo keeps
+/// nothing (`worth_keeping`), the sweep is over, and this answer is then just as
+/// permanent for the rest of the run. The distinction is the reason, not the
+/// forecast.
 const NOT_YET_DETECTED: &str = "no models detected for this CLI yet";
 
 /// What the startup sweep learned, by lower-cased program.
@@ -290,13 +300,27 @@ pub struct ModelsDetected {
 /// The sweep, with every effect injected so the ORDER and the COUNT of asks are
 /// testable without a process (constraint 3).
 ///
-/// Two passes per CLI, and they answer different questions. `probe` is
-/// `cliprobe`'s help/enumerator read — the thing every picker already merges,
-/// warmed here so the launcher's first paint does not wait eight seconds for
-/// it. `ask` is the control request, and it runs ONLY where a `PROTOCOLS` row
-/// exists: a CLI without one is never spawned for a list it has no way to
-/// give, which is the same safety property `a_cli_with_no_protocol_row_is_never_spawned`
-/// pins on the ask itself.
+/// Two passes, and they answer different questions. `ask` is the control
+/// request, and it runs ONLY where a `PROTOCOLS` row exists: a CLI without one
+/// is never spawned for a list it has no way to give, which is the same safety
+/// property `a_cli_with_no_protocol_row_is_never_spawned` pins on the ask
+/// itself. `probe` is `cliprobe`'s help/enumerator read — the thing every picker
+/// already merges, warmed here so the launcher's first paint does not wait eight
+/// seconds for it.
+///
+/// **The asks go first, as a group** (rev-713 non-blocking 6). Interleaved, a
+/// CLI's detection sat behind every help probe listed before it, and
+/// `probe_agent_cli`'s own comment allows eight seconds each — so on a machine
+/// where an earlier CLI is slow, the one answer the webview is actually waiting
+/// for arrived late for no reason. The asks are what `models-detected` delivers;
+/// the probe warm is an optimisation with nobody blocked on it, so it goes
+/// second.
+///
+/// Ordering *within* each pass is the caller's list order, untouched.
+/// Deliberately NOT reordered by "which CLIs the launcher offers": that is a
+/// claim about the product's UI and about what is installed on this machine,
+/// and constraint 8 keeps both out of here. "Has a `PROTOCOLS` row" is a fact
+/// about this table.
 ///
 /// Sequential, not parallel. Four CLIs times a bounded probe is seconds of
 /// background work on a thread nothing is waiting on, and spawning eight
@@ -312,12 +336,14 @@ fn sweep_with(
     // takes the `&str` its parameter is written as rather than leaning on a
     // coercion through a closure's `Fn` bound.
     for &cli in clis {
-        probe(cli);
         if protocol_for(cli).is_none() {
             continue;
         }
         let reply = ask(cli);
         emit(ModelsDetected { program: cli.to_string(), reply });
+    }
+    for &cli in clis {
+        probe(cli);
     }
 }
 
@@ -484,8 +510,9 @@ mod tests {
         // The race the design accepts: a picker can paint before the sweep has
         // reached its CLI. The honest answer is "nothing yet" — NOT a spawn,
         // which is the whole point, and not the no-protocol message either,
-        // because the two have different futures and a caller may want to tell
-        // them apart.
+        // because the two carry different REASONS and a caller may want to tell
+        // them apart. Not different futures: after a failed ask this answer is
+        // permanent for the run too (see `NOT_YET_DETECTED`).
         let memo = Memo::default();
         let reply = memo.read("claude");
         assert!(reply.output.is_empty());
@@ -576,6 +603,37 @@ mod tests {
             *asked.borrow(),
             "one event per ask: a CLI that was never asked has no result to push, and an ask whose \
              result never reaches the webview is a spawn spent for nothing"
+        );
+    }
+
+    #[test]
+    fn the_sweep_detects_before_it_warms_help_probes() {
+        // rev-713 non-blocking 6. The ask is the thing the webview is waiting
+        // on; the probe warm is an optimisation nobody is blocked on. Ordered
+        // the other way, a slow `--help` for an earlier CLI delayed the one
+        // answer a picker actually needs — up to eight seconds each, by
+        // `probe_agent_cli`'s own bound.
+        //
+        // Recorded into ONE log rather than two, because the property is the
+        // relative order of two different calls and two separate lists cannot
+        // express it.
+        let log = RefCell::new(Vec::new());
+        sweep_with(
+            &SUPPORTED_CLIS,
+            |cli| log.borrow_mut().push(format!("probe:{cli}")),
+            |cli| {
+                log.borrow_mut().push(format!("ask:{cli}"));
+                CliModelReply { output: REPLY.to_string(), request_id: REQUEST_ID.to_string(), error: None }
+            },
+            |_| {},
+        );
+        let seen = log.borrow();
+        let last_ask = seen.iter().rposition(|e| e.starts_with("ask:")).expect("something was asked");
+        let first_probe = seen.iter().position(|e| e.starts_with("probe:")).expect("something was probed");
+        assert!(
+            last_ask < first_probe,
+            "every list-models ask must precede every help probe, so detection is never queued behind a warm-up \
+             nobody is waiting for: {seen:?}"
         );
     }
 

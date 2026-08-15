@@ -410,11 +410,35 @@ and neither existed to be got wrong before:
   that carried nothing (which never sets `report()`, so the other guard would
   never fire), and a guard on `report()` being absent (which a good answer would
   otherwise pass on every repaint).
-- **A push subscription must be able to say it is dead.** Neither host has a
-  teardown `ModelCatalog` can rely on — a launcher form is discarded with its
-  pane — so `onReport`'s callback returns its own liveness and a `false` drops
-  it. Without that, every discarded form leaves a subscription repainting
-  detached DOM for the rest of the app run.
+- **A push subscription must be released, and asking whether it is dead must be
+  free.** The catalog is app-scoped and the hosts are not, so a subscription
+  nobody releases retains its whole host — a `WorkflowView`, its analysis, its
+  detached DOM — for the life of the process. `onReport` therefore takes
+  liveness as a **separate, side-effect-free predicate** rather than as the
+  delivery callback's return value, and prunes on **registration**.
+
+  Both halves are the fix for a leak that shipped in the first cut of this slice
+  and was caught in review, so the reasoning is recorded rather than the rule
+  alone. Liveness-as-return-value meant asking required *delivering*, so pruning
+  could only run when a report changed state — and the producer changes state at
+  most once per program per app run, and **zero** times in the ordering where the
+  pull wins the race (`acceptReport` refuses before reaching the listeners). The
+  prune therefore ran approximately never, and every host built after the sweep
+  was retained forever: precisely the leak the mechanism was introduced to
+  prevent. Registration is the right event to hang it on because it is the only
+  one that keeps recurring — every new host subscribes, so the list cannot grow
+  past the live hosts plus one.
+
+  A host that *has* a teardown still releases there (`WorkflowView.dispose`)
+  rather than waiting to be pruned. `WelcomeForm` deliberately does not: `fire()`
+  is the only candidate and `reopenAfterLaunchFailure` revives the form after it,
+  so a form released there would come back deaf to the sweep. The prune is what
+  covers it, which is the case the prune exists for.
+
+  `ModelCatalog.liveReportListeners` exists solely so a test can see retention,
+  and that is a deliberate exception to this repo's rule against readers with no
+  product caller: the leak above kept the whole suite green because nothing could
+  observe the list. A leak no test can see is a leak that comes back.
 
 The file's header enumerates what the instrument cannot do — reachability, not
 behaviour; source, not module graph — because a structural test that reads as
