@@ -46,15 +46,25 @@ const ROUNDING_PX = 1;
 const MOVE_BUDGET_PX = DIVIDER_FOOTPRINT_PX + ROUNDING_PX;
 
 /** How far a pane's absolute vertical geometry may move during a same-direction
- *  ROW split. In this module's own arithmetic the answer is zero — a row split
- *  cannot touch heights — but the number measured against the viewport also
- *  carries the chrome above the grid, and on this base adding a pane nudges the
- *  whole grid by a fraction of a pixel (0.55px and 0.84px on two CI attempts).
- *  Two device pixels is comfortably above that and three orders of magnitude
- *  below a real vertical re-flow, which is what these two bounds exist to
- *  catch. The property itself — B does not move WITHIN its row — is asserted
- *  exactly, relative to the row's own top edge. */
-const VERTICAL_JITTER_PX = 2;
+ *  ROW split. In the arithmetic the answer is zero — a row split cannot touch
+ *  heights — so this is a rounding budget, and it is deliberately one device
+ *  pixel rather than a number chosen to make a red run green.
+ *
+ *  Its history is worth keeping, because the first two values were both wrong
+ *  in instructive ways. It started as an exact `toBeCloseTo(y, 0)`, which broke
+ *  when this branch was rebased onto a base whose chrome moved the grid; it was
+ *  then set to 2px against measurements of 0.55px and 0.84px. Both readings
+ *  were of an UNSETTLED layout. With #992's per-agent pane marks present the
+ *  same measurement gave A 1.298px / B 0.565px / C 0.224px in one attempt and
+ *  different numbers in the next — panes in one row cannot really drift apart
+ *  from each other, so what was being measured was the layout still moving,
+ *  not the layout being wrong.
+ *
+ *  `settledBoxes` removes that at the source, and this budget covers only what
+ *  is left: genuine device-pixel rounding. If it ever needs raising again, the
+ *  `[pane-split]` log line below prints the measured drift on every run —
+ *  raise it from that number, and only after checking the settling is real. */
+const VERTICAL_JITTER_PX = 1;
 
 /** How far a pane's SHARE of the row may drift, as a fraction of the row.
  *  Zero in exact arithmetic — `halve` leaves both the sibling's weight and
@@ -71,6 +81,50 @@ const SHARE_EPSILON = 0.002;
  *  numbers at all. */
 const shareOf = (width: number, widths: number[]): number =>
   width / widths.reduce((a, b) => a + b, 0);
+
+/** Read several panes' boxes once the layout has stopped moving.
+ *
+ *  `await expect(pane).toBeVisible()` says an element EXISTS and is painted; it
+ *  does not say the layout around it has settled. On this base it demonstrably
+ *  has not: the pane header carries per-agent marks (#992) that arrive after
+ *  the pane does, and measuring straight after a split caught the grid
+ *  mid-settle — panes in the SAME ROW reading different `y` deltas (A 1.298px,
+ *  B 0.565px, C 0.224–0.362px) and different heights, varying between attempts
+ *  of the same run. Budgeting for that would have been budgeting for a race.
+ *
+ *  So: sample until two consecutive reads agree to within a twentieth of a
+ *  pixel, which is what "the layout has stopped" actually means. Everything
+ *  vertical this spec asserts is measured through here. */
+async function settledBoxes(
+  locators: Record<string, ReturnType<typeof paneByName>>
+): Promise<Record<string, { x: number; y: number; width: number; height: number }>> {
+  const read = async () => {
+    const out: Record<string, { x: number; y: number; width: number; height: number }> = {};
+    for (const [name, loc] of Object.entries(locators)) {
+      const box = await loc.boundingBox();
+      if (!box) throw new Error(`pane ${name} has no bounding box`);
+      out[name] = box;
+    }
+    return out;
+  };
+  const same = (a: Record<string, { y: number; height: number; x: number; width: number }>, b: typeof a) =>
+    Object.keys(a).every(
+      (k) =>
+        Math.abs(a[k].y - b[k].y) < 0.05 &&
+        Math.abs(a[k].height - b[k].height) < 0.05 &&
+        Math.abs(a[k].x - b[k].x) < 0.05 &&
+        Math.abs(a[k].width - b[k].width) < 0.05
+    );
+
+  let prev = await read();
+  for (let attempt = 0; attempt < 40; attempt++) {
+    await new Promise((r) => setTimeout(r, 100));
+    const next = await read();
+    if (same(prev, next)) return next;
+    prev = next;
+  }
+  throw new Error("the pane layout never settled: it was still moving after 4s");
+}
 
 test("splitting a pane in a 3-wide row halves that pane and leaves its siblings' share of the row untouched", async ({
   appPage: page,
@@ -92,23 +146,15 @@ test("splitting a pane in a 3-wide row halves that pane and leaves its siblings'
   // the main assertion below uses. Under `halve` A is not the target and keeps
   // its half of the row; under `share` the newcomer's 1/2 lands on top of a
   // total of 2, taking A from 1/2 of the row to 1/2.5.
-  const aBeforeToolbarSplit = await paneA.boundingBox();
-  const bBeforeToolbarSplit = await paneB.boundingBox();
-  expect(aBeforeToolbarSplit, "Pane A should have a bounding box").not.toBeNull();
-  expect(bBeforeToolbarSplit, "Pane B should have a bounding box").not.toBeNull();
+  const beforeToolbarSplit = await settledBoxes({ a: paneA, b: paneB });
+  const aBeforeToolbarSplit = beforeToolbarSplit.a;
+  const bBeforeToolbarSplit = beforeToolbarSplit.b;
   await page.locator("#btn-split-right").click();
   await createTerminalPane(page, { name: "Pane C" });
 
   const paneC = paneByName(page, "Pane C");
   await expect(paneC).toBeVisible();
-  const before = {
-    a: await paneA.boundingBox(),
-    b: await paneB.boundingBox(),
-    c: await paneC.boundingBox(),
-  };
-  for (const [name, box] of Object.entries(before)) {
-    expect(box, `pane ${name} should have a bounding box before the split`).not.toBeNull();
-  }
+  const before = await settledBoxes({ a: paneA, b: paneB, c: paneC });
 
   expect(
     shareOf(before.a!.width, [before.a!.width, before.b!.width, before.c!.width]),
@@ -135,15 +181,7 @@ test("splitting a pane in a 3-wide row halves that pane and leaves its siblings'
   const paneNew = page.locator(".pane", { has: page.locator(".welcome-form") });
   await expect(paneNew).toHaveCount(1);
 
-  const after = {
-    a: await paneA.boundingBox(),
-    b: await paneB.boundingBox(),
-    c: await paneC.boundingBox(),
-    fresh: await paneNew.boundingBox(),
-  };
-  for (const [name, box] of Object.entries(after)) {
-    expect(box, `pane ${name} should have a bounding box after the split`).not.toBeNull();
-  }
+  const after = await settledBoxes({ a: paneA, b: paneB, c: paneC, fresh: paneNew });
 
   const widthsBefore = [before.a!.width, before.b!.width, before.c!.width];
   const widthsAfter = [after.a!.width, after.fresh!.width, after.b!.width, after.c!.width];
@@ -200,17 +238,13 @@ test("splitting a pane in a 3-wide row halves that pane and leaves its siblings'
     // 3. And in plain pixels, what a human would see: nothing beyond the new
     //    divider's own footprint.
     //
-    //    Vertically, measured WITHIN THE ROW rather than against the viewport.
-    //    A same-direction split in a row cannot touch heights, and that is
-    //    still what is asserted — but a pane's absolute `y` also carries
-    //    whatever the chrome above the grid is doing, and on this base adding
-    //    a pane nudges the whole grid down by a fraction of a pixel (0.55px
-    //    and 0.84px on two CI attempts, against a 0.5px bound). That is not
-    //    this spec's property: it happens to every pane at once, including the
-    //    one being split, so comparing B's top edge to the ROW's top edge
-    //    isolates the claim instead of coupling it to the top bar's height.
-    //    See the PR body — the jitter itself is reported separately, not
-    //    silently absorbed here.
+    //    Vertically, measured WITHIN THE ROW rather than against the viewport:
+    //    a pane's absolute `y` also carries whatever the chrome above the grid
+    //    is doing, while the property this spec owns is that B does not move
+    //    relative to the row it is in. Both are asserted — this one exactly,
+    //    the absolute pair against the rounding budget above — and both are
+    //    read from `settledBoxes`, since the drift that used to defeat them
+    //    turned out to be a layout still settling rather than a layout moved.
     const rowTopBefore = before.a!.y;
     const rowTopAfter = after.a!.y;
     expect(
@@ -299,11 +333,7 @@ test("a pane rejoining the grid from the dock comes back at a fair slice, not as
   await expect(paneC).toBeVisible();
 
   // Guard the premise: one flat row, or "the runt of the row" means nothing.
-  const rowBefore = {
-    a: await paneA.boundingBox(),
-    b: await paneB.boundingBox(),
-    c: await paneC.boundingBox(),
-  };
+  const rowBefore = await settledBoxes({ a: paneA, b: paneB, c: paneC });
   expect(rowBefore.a!.y, "A and B should share a row").toBeCloseTo(rowBefore.b!.y, 0);
   expect(rowBefore.b!.y, "B and C should share a row").toBeCloseTo(rowBefore.c!.y, 0);
 
@@ -356,14 +386,7 @@ test("a pane rejoining the grid from the dock comes back at a fair slice, not as
   await chip2.click();
   await expect(paneC).toBeVisible();
 
-  const after = {
-    a: await paneA.boundingBox(),
-    b: await paneB.boundingBox(),
-    c: await paneC.boundingBox(),
-  };
-  for (const [name, box] of Object.entries(after)) {
-    expect(box, `pane ${name} should have a bounding box after the restore`).not.toBeNull();
-  }
+  const after = await settledBoxes({ a: paneA, b: paneB, c: paneC });
   const widths = [after.a!.width, after.b!.width, after.c!.width];
   const restored = shareOf(after.c!.width, widths);
   const siblings = [shareOf(after.a!.width, widths), shareOf(after.b!.width, widths)];
