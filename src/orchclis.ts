@@ -87,9 +87,16 @@ export const ORCH_CLIS: OrchCli[] = [
     // much shorter per-account "Supported models" set, which varies by plan and
     // subscription. That is a fact about one machine, and baking it in is the
     // host special-casing constraint 8 forbids — these are the models copilot
-    // offers as a product. An id a given account cannot use is refused at spawn,
-    // which is a truthful failure; hiding it here would make loomux wrong for
+    // offers as a product, and hiding one here would make loomux wrong for
     // everyone whose plan differs from the one that produced the list.
+    //
+    // So this list and any given account's DIVERGE BOTH WAYS, and neither
+    // direction is fixable from here. It offers ids a plan may not cover — those
+    // are refused at spawn, a truthful failure. It also OMITS ids a plan may
+    // cover: the capture behind this row named `claude-opus-4.6` and
+    // `claude-opus-4.5` as supported, and neither is in copilot's Available
+    // catalog. `custom…` is what answers both, which is why the user docs sell
+    // it as more than an escape from staleness.
     id: "copilot",
     models: [
       "auto",

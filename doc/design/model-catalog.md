@@ -42,9 +42,10 @@ silent by construction rather than by accident: the merge has nothing to lead
 with, and copilot's curated row is not a seed for a menu — it **is** the menu.
 
 So that row carries copilot's full catalog, against the #329 sizing every other
-row keeps. This is **human-directed**, recorded the way the #1002 flip above is
-and for the same reason: it trades a known staleness cost for a menu that is
-usable today, and that trade is not one an agent may re-derive, nor extend to
+row keeps. This is **human-directed**, recorded the way §*Credit safety: why
+detection was a human gesture, and why it is now automatic* records the #1002
+flip, and for the same reason: it trades a known staleness cost for a menu that
+is usable today, and that trade is not one an agent may re-derive, nor extend to
 another CLI on the same reasoning. A CLI that *can* be asked is asked.
 
 Three properties keep the exception from becoming the rule:
@@ -64,11 +65,21 @@ Three properties keep the exception from becoming the rule:
    much shorter per-account *Supported models* set, which varies by plan. That
    is a fact about one machine, and embedding it is the host special-casing
    constraint 8 forbids — it would make loomux wrong for every human whose plan
-   differs from the one that produced the list. An id an account cannot use is
-   refused at spawn, which is a truthful failure; a menu missing a model the
-   human is paying for is a silent one. This is `modelcontext.ts`'s rule 1 in
-   the other direction: loomux may state what a vendor offers, never what an
-   account is entitled to.
+   differs from the one that produced the list. This is `modelcontext.ts`'s rule
+   1 in the other direction: loomux may state what a vendor offers, never what
+   an account is entitled to.
+
+   **The two sets diverge in BOTH directions, and only one of them is
+   comfortable to write down.** The catalog is mostly the wider one, so it
+   offers ids a given plan cannot run — those are refused at spawn, which is a
+   truthful failure. But the capture this row was built from also names
+   `claude-opus-4.6` and `claude-opus-4.5` as *Supported* while the Available
+   catalog lists neither, so the reverse happens too: **a human can be entitled
+   to a model this menu does not show.** Neither direction is fixable from here
+   — an account's entitlements are exactly the fact this repo may not state —
+   which makes `custom…` the answer to both, and means the escape hatch must be
+   documented as more than a staleness valve. Claiming only the first direction
+   would make the argument above look tidier than it is.
 
 `orchclis.test.ts` pins the exception by the property that separates it from
 both failures — the menu spans the vendor families copilot resells — rather than
