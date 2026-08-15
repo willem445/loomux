@@ -35107,9 +35107,9 @@ impl OrchRegistry {
                  - **Don't reclaim its slot.** A liaison is a standing conversation, not a \
                  delegate between tasks, so \"never hold an idle one\" in **Planning & \
                  scheduling** is not about it: never `kill_agent` `{id}` for looking idle. \
-                 loomux's own idle-kill guardrail agrees and skips it — a human typing into a \
-                 pane clears no idle clock, so a reaped liaison would be one killed \
-                 mid-conversation — which leaves YOU the only thing that can end it. It does \
+                 loomux's own idle-kill guardrail is enforced and can still take it — if a \
+                 `[loomux] idle-kill` notice names `{id}`, start it again rather than leave the \
+                 human talking to a dead pane. It does \
                  hold one live-delegate slot while it runs; pace the fleet around that instead \
                  of dropping it to make room.",
                 id = b.id,
