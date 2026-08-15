@@ -17,7 +17,7 @@
 
 use loomux_lib::orchestration::{
     generated_agent_handle, group_id_for_repo, promptsubmit_marker_path, GroupId, GroupIdError,
-    OrchRegistry, SOLO_GROUP,
+    OrchRegistry, PathSegment, SOLO_GROUP,
 };
 use loomux_lib::sessions::detect_orch_signature;
 use serde_json::json;
@@ -264,7 +264,7 @@ fn every_group_scoped_path_lands_under_the_orchestration_root() {
 
     // The two free-function seams, which take a bare `root` and therefore used
     // to each own a join of their own.
-    let marker = promptsubmit_marker_path(&root, &g, "w-1");
+    let marker = promptsubmit_marker_path(&root, &g, &PathSegment::parse("w-1").unwrap());
     assert_eq!(marker, root.join("repo-1a2b3c4d").join("hooks").join("w-1.promptsubmit.jsonl"));
 
     let db = reg.opencode_db_path(&g);
@@ -405,8 +405,24 @@ fn the_generated_agent_handle_is_a_single_filename_component() {
 /// is the cheaper half of the guarantee, not the load-bearing one.
 #[test]
 fn the_orchestration_root_is_joined_with_a_group_in_exactly_one_place() {
-    /// The ONE permitted group-path assembly, matched on its exact text.
-    const PERMITTED: &str = "root.join(group.as_str())";
+    /// The declared path-assembly points, one per identifier family, each
+    /// matched on its exact text and each required to appear **exactly once**.
+    ///
+    /// #904 landed this as a single `&str` because there was a single family.
+    /// #925 added the second — `copilot_session_dir_at`, for the agent-session
+    /// id — and the shape generalizes rather than duplicating: a new family
+    /// adds a row here and inherits the exactly-once count, instead of growing
+    /// a parallel test that could drift from this one.
+    const PERMITTED: &[(&str, &str)] = &[
+        (
+            "root.join(group.as_str())",
+            "group_dir_at — the group family (#904)",
+        ),
+        (
+            "root.join(session.as_str())",
+            "copilot_session_dir_at — the agent-session family (#925)",
+        ),
+    ];
 
     /// Every sanctioned expression that builds a path from the orchestration
     /// root. Anything else that touches it is a finding until it is argued for
@@ -542,7 +558,7 @@ fn the_orchestration_root_is_joined_with_a_group_in_exactly_one_place() {
     );
 
     let mut offenders: Vec<String> = Vec::new();
-    let mut permitted_seen = 0usize;
+    let mut permitted_seen = vec![0usize; PERMITTED.len()];
     let mut has_asref_path_impl = false;
 
     for (label, path) in &files {
@@ -589,8 +605,8 @@ fn the_orchestration_root_is_joined_with_a_group_in_exactly_one_place() {
                     }
                 }
             }
-            if line.contains(PERMITTED) {
-                permitted_seen += 1;
+            if let Some(i) = PERMITTED.iter().position(|(text, _)| line.contains(text)) {
+                permitted_seen[i] += 1;
                 continue;
             }
             let mut flag = |why: &str| {
@@ -609,7 +625,7 @@ fn the_orchestration_root_is_joined_with_a_group_in_exactly_one_place() {
                 .iter()
                 .any(|a| is_as_str_component(a))
             {
-                flag("`.as_str()` path component outside `group_dir_at`");
+                flag("`.as_str()` path component outside a declared assembly point");
             } else if call_args(line, &[".join("]).iter().any(|a| names_a_group(a)) {
                 flag("argument names a group");
             }
@@ -625,10 +641,15 @@ fn the_orchestration_root_is_joined_with_a_group_in_exactly_one_place() {
         offenders.len(),
         offenders.join("\n")
     );
-    assert_eq!(
-        permitted_seen, 1,
-        "expected exactly one `{PERMITTED}` — `group_dir_at`'s own join — found {permitted_seen}"
-    );
+    for (i, (text, whose)) in PERMITTED.iter().enumerate() {
+        assert_eq!(
+            permitted_seen[i], 1,
+            "expected exactly one `{text}` — {whose} — found {}. Zero means the declared \
+             assembly point was renamed or deleted and this scan is now watching nothing; more \
+             than one means a second assembly point grew back.",
+            permitted_seen[i]
+        );
+    }
     assert!(
         !has_asref_path_impl,
         "`GroupId` must not implement `AsRef<Path>`: a validated id becomes a path only \
