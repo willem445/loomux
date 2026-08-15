@@ -299,6 +299,19 @@ export function withoutDep(deps: readonly string[] | null | undefined, id: strin
  *  board only ever *labels* a row with this — nothing here gates anything. */
 export const KINDS = ["epic", "feature", "story", "task"] as const;
 
+/** Whether this board uses containment at all (#958) — the gate for the
+ *  nesting chrome, exactly as `boardUsesDeps` gates the readiness mark.
+ *
+ *  On a board where nothing is nested, the collapse column is 13px of empty
+ *  gutter in front of every row and the indent rail can never appear, so the
+ *  affordances are suppressed and such a board keeps precisely the shape it
+ *  has today. A single nested row turns the column on for the whole board:
+ *  once nesting exists, a row sitting at the top level is saying something,
+ *  and it needs the same left edge as the rows that aren't. */
+export function boardUsesHierarchy<T extends HasParent>(board: readonly T[]): boolean {
+  return board.some((t) => !!t.parent);
+}
+
 /** A board row as far as the hierarchy helpers care. Both fields are optional
  *  on the wire for the same reason `deps` is: the backend skips them when
  *  absent, so every pre-#958 board arrives with no keys at all. */

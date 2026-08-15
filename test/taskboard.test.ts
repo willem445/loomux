@@ -7,6 +7,7 @@ import assert from "node:assert/strict";
 import {
   approvableSelection,
   boardUsesDeps,
+  boardUsesHierarchy,
   canApprove,
   canProceed,
   childCounts,
@@ -594,6 +595,20 @@ test("indent is clamped, so a hand-edited over-deep row still fits the overlay",
   assert.equal(indentLevel(0), 0);
   assert.equal(indentLevel(MAX_INDENT_DEPTH), MAX_INDENT_DEPTH);
   assert.equal(indentLevel(MAX_INDENT_DEPTH + 3), MAX_INDENT_DEPTH);
+});
+
+test("the nesting chrome stays off a board that nests nothing", () => {
+  // Same gate as boardUsesDeps: a board where nothing is nested must keep the
+  // exact row shape it has today, rather than growing an empty collapse gutter
+  // in front of every row for a feature it doesn't use.
+  assert.equal(boardUsesHierarchy([row("t-1"), row("t-2", "done")]), false);
+  assert.equal(boardUsesHierarchy([]), false);
+  // One nested row turns it on for the WHOLE board — a top-level row on a
+  // nested board is saying something, and needs the same left edge as the rest.
+  assert.equal(boardUsesHierarchy([row("t-1"), row("t-2", "queued", "t-1")]), true);
+  // A container naming nothing still counts: the row IS nested as far as the
+  // data goes, and the board has to be able to say so.
+  assert.equal(boardUsesHierarchy([row("t-1", "queued", "t-404")]), true);
 });
 
 test("the kind vocabulary mirrors the backend's TASK_KINDS, in order", () => {
