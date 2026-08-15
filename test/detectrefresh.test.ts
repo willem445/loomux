@@ -38,10 +38,14 @@
 //     actually defers is hand-validated like the rest of the DOM wiring.
 //   - It reads the SOURCE, not the module graph, so a refresher reached through
 //     an indirection it cannot see reads as absent. That is the safe direction:
-//     it under-recognises rather than over-claiming — but only because comments
-//     are stripped first. They were not, and prose naming a call satisfied the
-//     assertions, which made this exact sentence false (#997 review B-2). See
-//     `stripComments`.
+//     it under-recognises rather than over-claiming — but only because FULL-LINE
+//     comments are stripped first. A trailing comment after code is NOT
+//     stripped and could still satisfy an assertion; that is an accepted
+//     residual (stripping those safely needs a tokenizer, not a regex), with no
+//     live instance in either handler today (#997 review R4-2). Before this
+//     scan stripped anything, prose in a full-line comment satisfied the
+//     assertions too, which made this exact sentence false outright
+//     (#997 review B-2). See `stripComments`.
 //   - It assumes each `onDetect:` is an arrow function and asserts so, rather
 //     than silently scanning past a shape it does not understand.
 //
@@ -86,9 +90,14 @@ const src = (file: string): string =>
  *
  *  Full-line comments only, matching `test/workspacelayout.test.ts` (#991) —
  *  the repo already has this discipline and a second spelling of it would be a
- *  second thing to get right. Trailing comments after code are handled by the
- *  call-shape assertions below, which require the parentheses a prose mention
- *  does not carry. */
+ *  second thing to get right. A TRAILING comment after code is NOT stripped
+ *  and could still satisfy an assertion below — prose carries the same
+ *  parentheses a call does (`renderFindings()`, `repaintBlockKnobs?.()`, both
+ *  used in this very file's own comments), so the call-shape assertions do not
+ *  save it. That is an accepted residual: stripping a trailing comment safely
+ *  needs a tokenizer (a bare regex would mangle a `"https://…"` string
+ *  literal), the full-line form is the repo's existing discipline, and neither
+ *  `onDetect` handler contains a trailing comment today (#997 review R4-2). */
 const stripComments = (text: string): string => text.replace(/^[ \t]*\/\/.*$/gm, "");
 
 /** The source of the `onDetect:` handler starting at `at`.
@@ -207,6 +216,37 @@ test("a detection that outlives its form does not paint that form's rows", () =>
       /formPane\.contains\(picker\.root\)/,
       "the handler must check its own form is still on screen before repainting it — otherwise a reply that lands " +
         "after the human moved on paints a detached row, and the form they are actually looking at stays stale"
+    );
+  }
+});
+
+test("a detect reply never rebuilds the form unconditionally", () => {
+  // #997 review NB3-1, folded in during the S4b restack rather than left as a
+  // held finding. The detached-form early-out's own comment claims to take
+  // "the sibling's treatment" — in-place repaint if the human is inside the
+  // form now on screen, `renderInspector()` only if they are not — but the
+  // first cut of it called the rebuild unconditionally. `replaceChildren`
+  // destroys the input under the caret, so that early-out reintroduced NB-3's
+  // caret hazard on a wider surface (any field of the form, not just the
+  // custom-model box) three commits after NB-3 had already cost a round.
+  //
+  // Round 4 shipped the fix but not a pin for it: reverting the early-out back
+  // to a bare rebuild left the whole suite green (verified by mutation during
+  // this fold — the receipt is in the round-4 review, R4-1). This test closes
+  // that gap: every `renderInspector()` call in the handler must be the
+  // `else` of the `contains(document.activeElement)` test, never bare.
+  //
+  // (Written against `renderInspector` — the S4b restack landed on top of the
+  // #880 slice B docked-inspector rework, which renamed the method this
+  // handler calls from `renderForm`. The rebase's textual merge did not
+  // conflict on this rename — the hunks never overlap — so it had to be
+  // caught by hand: `tsc` on the restacked branch, not by reading the diff.)
+  for (const body of onDetectBodies(src("workflowview.ts"), "workflowview.ts")) {
+    assert.doesNotMatch(
+      body,
+      /(?<!else )this\.renderInspector\(\)/,
+      "a detect reply must never rebuild the form unconditionally: `replaceChildren` destroys the input under " +
+        "the caret. The rebuild is always the `else` of the `contains(document.activeElement)` test"
     );
   }
 });

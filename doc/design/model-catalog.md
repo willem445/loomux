@@ -371,8 +371,11 @@ checked:
 - **Matching inside comments.** These handlers are two-thirds comment by volume
   and the prose names every refresher, so deleting the real calls and leaving a
   comment kept the suite green — the round-1 blocking regression passing its own
-  pin. Comments are stripped before matching now (B-2), the discipline
-  `test/workspacelayout.test.ts` already uses.
+  pin. Full-line comments are stripped before matching now (B-2), the discipline
+  `test/workspacelayout.test.ts` already uses — a *trailing* comment after code
+  is not stripped and could still satisfy an assertion, an accepted residual
+  (stripping those safely needs a tokenizer, not a regex) with no live instance
+  in either handler today (#997 review R4-2).
 - **A positive match that stopped discriminating.** Once the handler reached the
   live knob hook in *two* places, asserting its presence survived a mutation of
   either. The pin now also asserts the form-local closure is absent — the
