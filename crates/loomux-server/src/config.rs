@@ -268,7 +268,17 @@ impl ServerConfig {
 /// bind, and a resolver that returns a routable address for a name the
 /// operator believed was local would launder §1.2's control into a lookup. So
 /// an IP literal is required, and a name is refused with that said out loud.
-pub fn classify_listen(value: &str) -> Result<ListenTarget, ConfigError> {
+///
+/// **Private — the tightest visibility that compiles**, and not merely tidiness.
+/// It is the one function that hands back a bare `ListenTarget::Routable`
+/// without consulting `allow_routable_bind`, so exporting it would leave "C2
+/// must not re-derive the address from the config text"
+/// (`remote-engine-protocol.md` §1.2) enforced by prose where the rest of this
+/// module is enforced by the compiler. Callers outside this module get a target
+/// only by going through [`ServerConfig::parse`], which is the gate. Making the
+/// variant payloads themselves unforgeable is a C2-slice decision, not this
+/// one's — but nothing here needs to be reachable for C2 to do that.
+fn classify_listen(value: &str) -> Result<ListenTarget, ConfigError> {
     let value = value.trim();
     if value.is_empty() {
         return Err(ConfigError::Listen {

@@ -88,10 +88,10 @@ where
                 let value = it
                     .next()
                     .ok_or_else(|| "--config needs a path".to_string())?;
-                config = Some(PathBuf::from(value.as_ref()));
+                set_config(&mut config, value.as_ref())?;
             }
             other if other.starts_with("--config=") => {
-                config = Some(PathBuf::from(&other["--config=".len()..]));
+                set_config(&mut config, &other["--config=".len()..])?;
             }
             // Fail closed on anything unrecognised. A daemon that ignores a
             // flag it does not know is a daemon that silently ignores
@@ -101,6 +101,25 @@ where
     }
 
     Ok(Invocation::Run { config, check_only })
+}
+
+/// Record `--config`, refusing a second one.
+///
+/// Last-one-wins would discard a path the operator wrote, without a word —
+/// the same silence `parse_args` already refuses for an unrecognised flag, one
+/// flag over, and worse here because the discarded file is the one naming the
+/// bind address. A repeated `--check-config` is deliberately still fine: it is
+/// a boolean, so a second one asks for exactly what the first did and nothing
+/// is thrown away.
+fn set_config(slot: &mut Option<PathBuf>, value: &str) -> Result<(), String> {
+    if let Some(first) = slot {
+        return Err(format!(
+            "--config given more than once ({} then {value}); pass exactly one config file",
+            first.display()
+        ));
+    }
+    *slot = Some(PathBuf::from(value));
+    Ok(())
 }
 
 /// Execute a parsed invocation.
@@ -216,6 +235,37 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn a_repeated_config_flag_is_refused_rather_than_last_wins() {
+        // Discarding a path the operator wrote, silently, is the same class of
+        // silence `an_unrecognized_argument_is_refused_rather_than_ignored`
+        // pins — and worse here, because the file thrown away is the one that
+        // names the bind address.
+        for args in [
+            vec!["--config", "a.yml", "--config", "b.yml"],
+            vec!["--config=a.yml", "--config=b.yml"],
+            vec!["--config", "a.yml", "--config=b.yml"],
+        ] {
+            let err = parse_args(args.iter().copied())
+                .expect_err(&format!("{args:?} must be refused"));
+            assert!(err.contains("more than once"), "{args:?}: {err}");
+            assert!(err.contains("a.yml") && err.contains("b.yml"), "{args:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_repeated_check_config_flag_is_still_fine() {
+        // A boolean discards nothing: the second one asks for what the first
+        // did. Pinned so the refusal above is not widened into "any repeat".
+        assert_eq!(
+            parse_args(["--check-config", "--check-config"]).expect("parses"),
+            Invocation::Run {
+                config: None,
+                check_only: true
+            }
+        );
     }
 
     #[test]

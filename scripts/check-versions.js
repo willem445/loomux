@@ -29,8 +29,11 @@ function readText(relPath) {
 //
 // The repo became a Cargo workspace in #888 slice A1, so there are now other
 // package manifests in the tree. Only src-tauri's carries the loomux release
-// version: crates/loomux-engine is `publish = false` and pinned at 0.0.0 on
-// purpose (see its Cargo.toml), so it is deliberately NOT in this check.
+// version: every `crates/loomux-*` member is `publish = false` and pinned at
+// 0.0.0 on purpose (see each Cargo.toml), so none of them is in this check.
+// Written as the rule rather than as a list of the members that exist today —
+// there were two at slice A1 and three from C1a, and a count here is one more
+// thing a new member has to remember to update.
 function cargoTomlVersion(relPath) {
   const text = readText(relPath);
   const lines = text.split(/\r?\n/);
@@ -52,9 +55,12 @@ function cargoTomlVersion(relPath) {
 // entry in Cargo.lock.
 //
 // The exact-equality test (not `startsWith`/`includes`) is load-bearing since
-// the workspace conversion: `name = "loomux-engine"` is a sibling entry in the
-// same file, and a looser match would read ITS version — a permanent 0.0.0 —
-// and report a mismatch on every correctly-bumped release.
+// the workspace conversion: `loomux` is a strict PREFIX of every sibling entry
+// in the same file (`loomux-engine`, `loomux-server`, and whatever joins next),
+// and a looser match would read ONE OF THEIR versions — a permanent 0.0.0 — and
+// report a mismatch on every correctly-bumped release. test/workspacelayout.test.ts
+// re-implements this rule and asserts it over each sibling, so the hazard grows
+// with the workspace instead of with this comment.
 function cargoLockVersion(relPath) {
   const text = readText(relPath);
   const lines = text.split(/\r?\n/);
