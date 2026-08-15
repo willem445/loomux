@@ -314,6 +314,26 @@ fn lock_menu_text(locks: &[(String, workflow::ResourcePolicy)]) -> String {
         .join(", ")
 }
 
+/// `group_usage`'s definition, written once because TWO tiers list it: the
+/// orchestrator's, and the liaison's one hint-keyed widening (#891 S2). Shared
+/// for the same reason [`channel_tool_defs`] is — two copies of a description
+/// this long drift, and a liaison reading a staler account of the same tool
+/// than the orchestrator does would be a difference nobody chose.
+///
+/// Deliberately placed ABOVE [`tool_defs`]'s doc comment rather than between it
+/// and its `fn`: consecutive `///` lines merge into one block that attaches to
+/// whatever item comes next, so sitting in that gap silently re-homes
+/// `tool_defs`'s documentation onto this helper — including a `locks` paragraph
+/// describing a parameter it does not take — and leaves `tool_defs` undocumented
+/// with nothing in the diff that looks wrong (rev-lead, PR #1086).
+fn group_usage_tool() -> Value {
+    tool("group_usage",
+        "Aggregate the group's token usage and estimated dollar cost into one summary, split live vs lifetime (killed/recycled agents still count). Tokens come from each agent's session transcript and are exact; dollars are estimated from a model price table (subscription/Max accounts show $0 in the CLI, so cite tokens). Fold it into your status updates so the human sees spend at a glance. Defaults to a SUMMARY sized for that: group + live totals, `agent_count` (the whole lifetime roster), `top_agents` (up to 10, by total tokens descending), and `rest` — `{count, tokens, cost_usd, cost_basis, live: {count, tokens}, historical: {count, tokens}}` for every agent folded out of `top_agents`. Top-N is picked by lifetime tokens, so a group with a long history can push every live agent out of `top_agents`; `rest.live` keeps their count/tokens visible instead of forcing `detail: true` just to see who's still running. `rest.cost_basis` labels whether `rest.cost_usd` is `estimated`, `reported`, or `mixed` (same rule as the top-level `*_cost_basis` fields), so a blended figure is never shown as one honest number. The `rest` count itself is what keeps this from being a silent truncation. Pass `detail: true` for the full per-agent `agents` table instead — on a large lifetime roster (654 agents measured at 173,245 chars) that is too big to fold into a status update, so ask for it only when you need a specific agent's row.",
+        json!({
+            "detail": { "type": "boolean", "description": "Return the full per-agent `agents` table instead of the top_agents/rest summary. Default false." },
+        }), &[])
+}
+
 /// The tool surface is role-filtered so workers never even see privileged
 /// tools; `call_tool` re-checks anyway (listing is cosmetic, not security).
 /// `role_hint` additionally scopes three tools, and NOT all in the same
@@ -332,19 +352,6 @@ fn lock_menu_text(locks: &[(String, workflow::ResourcePolicy)]) -> String {
 /// costs no context — everywhere it was not asked for. The names are folded
 /// into the descriptions because an agent that cannot see what exists guesses
 /// (`cargo`, `build-lock`, `ci`) and gets three refusals instead of one lock.
-/// `group_usage`'s definition, written once because TWO tiers list it: the
-/// orchestrator's, and the liaison's one hint-keyed widening (#891 S2). Shared
-/// for the same reason [`channel_tool_defs`] is — two copies of a description
-/// this long drift, and a liaison reading a staler account of the same tool
-/// than the orchestrator does would be a difference nobody chose.
-fn group_usage_tool() -> Value {
-    tool("group_usage",
-        "Aggregate the group's token usage and estimated dollar cost into one summary, split live vs lifetime (killed/recycled agents still count). Tokens come from each agent's session transcript and are exact; dollars are estimated from a model price table (subscription/Max accounts show $0 in the CLI, so cite tokens). Fold it into your status updates so the human sees spend at a glance. Defaults to a SUMMARY sized for that: group + live totals, `agent_count` (the whole lifetime roster), `top_agents` (up to 10, by total tokens descending), and `rest` — `{count, tokens, cost_usd, cost_basis, live: {count, tokens}, historical: {count, tokens}}` for every agent folded out of `top_agents`. Top-N is picked by lifetime tokens, so a group with a long history can push every live agent out of `top_agents`; `rest.live` keeps their count/tokens visible instead of forcing `detail: true` just to see who's still running. `rest.cost_basis` labels whether `rest.cost_usd` is `estimated`, `reported`, or `mixed` (same rule as the top-level `*_cost_basis` fields), so a blended figure is never shown as one honest number. The `rest` count itself is what keeps this from being a silent truncation. Pass `detail: true` for the full per-agent `agents` table instead — on a large lifetime roster (654 agents measured at 173,245 chars) that is too big to fold into a status update, so ask for it only when you need a specific agent's row.",
-        json!({
-            "detail": { "type": "boolean", "description": "Return the full per-agent `agents` table instead of the top_agents/rest summary. Default false." },
-        }), &[])
-}
-
 fn tool_defs(
     role: Role,
     role_hint: Option<&str>,
