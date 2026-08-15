@@ -183,3 +183,75 @@ test("splitting a pane in a 3-wide row halves that pane and leaves its siblings'
     ).toBeLessThanOrEqual(MOVE_BUDGET_PX);
   }
 });
+
+test("a pane rejoining the grid from the dock comes back at a fair slice, not as the runt of the row", async ({
+  appPage: page,
+}) => {
+  // The OTHER half of the policy, end to end. Every assertion above is about
+  // `halve`; this one is the only place the `share` arm is exercised in a real
+  // app, and it is the arm the three pane slices had to be reconciled over —
+  // grid.ts routes it to `paneequalize.planEvenInsert` (newcomer at the row's
+  // MEAN), not to splitfloor's own `share` branch (newcomer at 1/N on top of
+  // the row's total), which is the staircase #936 reported.
+  //
+  // A dock restore is the one `share` call site reachable without spawning an
+  // agent CLI — the multi-agent fan-out, the other one, is off limits to tests
+  // by CLAUDE.md constraint 3, and no bounding box would be worth a paid
+  // agent run anyway.
+  await createTerminalPane(page, { name: "Pane A" });
+  await page.locator("#btn-split-right").click();
+  await createTerminalPane(page, { name: "Pane B" });
+  await page.locator("#btn-split-right").click();
+  await createTerminalPane(page, { name: "Pane C" });
+
+  const [paneA, paneB, paneC] = ["Pane A", "Pane B", "Pane C"].map((n) => paneByName(page, n));
+  await expect(paneC).toBeVisible();
+
+  // Guard the premise: one flat row, or "the runt of the row" means nothing.
+  const rowBefore = {
+    a: await paneA.boundingBox(),
+    b: await paneB.boundingBox(),
+    c: await paneC.boundingBox(),
+  };
+  expect(rowBefore.a!.y, "A and B should share a row").toBeCloseTo(rowBefore.b!.y, 0);
+  expect(rowBefore.b!.y, "B and C should share a row").toBeCloseTo(rowBefore.c!.y, 0);
+
+  // Park C in the dock, then bring it back by clicking its chip.
+  await paneC.locator('button.pane-btn[title="Minimize to dock (Alt+M)"]').click();
+  const chip = page.locator(".dock-chip", { hasText: "Pane C" });
+  await expect(chip).toHaveCount(1);
+  await expect(paneC).toHaveCount(0);
+  await chip.click();
+  await expect(paneC).toBeVisible();
+
+  const after = {
+    a: await paneA.boundingBox(),
+    b: await paneB.boundingBox(),
+    c: await paneC.boundingBox(),
+  };
+  for (const [name, box] of Object.entries(after)) {
+    expect(box, `pane ${name} should have a bounding box after the restore`).not.toBeNull();
+  }
+  const widths = [after.a!.width, after.b!.width, after.c!.width];
+  const restored = shareOf(after.c!.width, widths);
+  const siblings = [shareOf(after.a!.width, widths), shareOf(after.b!.width, widths)];
+
+  // The intent, phrased so it holds for any even-matrix policy and fails for
+  // the 1/N-on-top one: a pane rejoining a row it used to be part of must not
+  // come back smaller than the pane that was already smallest. Under the
+  // routed policy it lands on the row's mean (~1/3 of this row against a
+  // smallest sibling of ~1/4); under 1/N-on-top it lands at ~1/5 against a
+  // smallest sibling of ~3/10, i.e. as the runt — an 8-point margin one way
+  // and a 10-point margin the other.
+  expect(
+    restored,
+    `the restored pane came back at ${restored} of the row, under its smallest sibling ${Math.min(
+      ...siblings
+    )} — the share arm is not the even-matrix one`
+  ).toBeGreaterThan(Math.min(...siblings) + SHARE_EPSILON);
+
+  // And it is a usable pane, not a sliver. 0.25 rather than the 1/N policy's
+  // exact 0.2, so this is a bound with margin on both sides (the routed policy
+  // lands at ~0.333) rather than an assertion sitting on the wrong answer.
+  expect(restored, `the restored pane is a sliver at ${restored} of the row`).toBeGreaterThan(0.25);
+});

@@ -9,7 +9,10 @@
 // just as happily with the two policies swapped.
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { parseGrow, planRowSplit } from "../src/splitfloor.ts";
+import { planEvenInsert } from "../src/paneequalize.ts";
 
 /** Sum of a row's flex-grows — what decides each sibling's SHARE of the row,
  *  since every child is `flex: <grow> 1 0` (basis 0). A sibling's on-screen
@@ -140,6 +143,89 @@ test("an empty row is a no-op that still hands back one usable weight", () => {
   const { weights, insertedIndex } = planRowSplit([], 0, "halve");
   assert.deepEqual(weights, [1]);
   assert.equal(insertedIndex, 0);
+});
+
+// ---------- the seam: which planner each policy is routed to ----------
+//
+// #885 and #936 both own a same-direction insert, and they disagree about the
+// `share` arm. `grid.ts` resolves it by policy: `halve` here, `share` through
+// `paneequalize.planEvenInsert`. That routing is the one decision this whole
+// slice exists to make, so it is pinned rather than left to a comment — the two
+// tests below cover its two halves, WHY it matters and THAT it holds.
+
+/** The band `paneequalize`'s clamp (#954) re-bases a runaway row into. Written
+ *  out here rather than imported because the module keeps it private, and a
+ *  test that read the constant from the code under test would agree with any
+ *  value it drifted to. */
+const IN_BAND = (w: number): boolean => w <= 1e3 && w >= 1e-3;
+
+test("the share arm re-bases a runaway row — the clamp is reached through the routing, not bypassed by it", () => {
+  // A row that arrived out of band: a layout persisted by a build before the
+  // #954 clamp, or one that drifted there. The share arm must bring it back,
+  // because the arm grid.ts routes to IS the clamped one.
+  const runaway = [2e9, 6e9, 4e9];
+  const routed = planEvenInsert(runaway, 1).weights;
+  for (const w of routed) {
+    assert.ok(IN_BAND(w), `share left a weight out of band: ${JSON.stringify(routed)}`);
+  }
+  // And the newcomer is a real pane, not a rounding error beside its siblings.
+  const share = routed[2] / total(routed);
+  assert.ok(share > 0.1, `the newcomer landed at ${share} of the row`);
+});
+
+test("splitfloor's own share branch would leave that row runaway, and its newcomer invisible", () => {
+  // The counterfactual, which is what makes the routing load-bearing rather
+  // than a stylistic preference. This branch is NOT what grid.ts calls for
+  // `share` (the test below pins that); it is kept because the module is the
+  // #885 slice's own API. On a row that has drifted, "an even 1/N slice on top
+  // of the existing weights" means 1/3 next to siblings holding billions — a
+  // pane the human cannot see, on top of no re-base at all.
+  const runaway = [2e9, 6e9, 4e9];
+  const bypassed = planRowSplit(runaway, 1, "share").weights;
+  assert.ok(
+    bypassed.some((w) => !IN_BAND(w)),
+    "this branch is expected to leave the row out of band; if it no longer does, the routing rationale needs rewriting"
+  );
+  const newcomerShare = bypassed[2] / total(bypassed);
+  assert.ok(
+    newcomerShare < 1e-9,
+    `the newcomer should be invisible on a drifted row, got ${newcomerShare} of it`
+  );
+});
+
+test("grid.ts routes `share` through paneequalize and never through splitfloor's share branch", () => {
+  // A structural pin, in the shape `test/transport.test.ts` established for
+  // CLAUDE.md constraint 5: the property is about which call site exists, and
+  // the next person to get it wrong will do so by copying a neighbouring line,
+  // not by reading a design note.
+  //
+  // Its limits, stated rather than implied: this is a TEXTUAL scan. A
+  // `planRowSplit` call whose policy arrives in a variable, an aliased import,
+  // or a call reformatted across lines in a way the pattern misses would evade
+  // it. It catches the realistic regression — someone "simplifying" the
+  // ternary to one planner — not a determined rewrite.
+  const src = readFileSync(fileURLToPath(new URL("../src/grid.ts", import.meta.url)), "utf8");
+
+  const calls = [...src.matchAll(/planRowSplit\(([\s\S]*?)\)/g)];
+  assert.ok(calls.length > 0, "grid.ts should still plan the halve arm through splitfloor");
+  for (const [, args] of calls) {
+    assert.match(
+      args,
+      /"halve"/,
+      `planRowSplit must only ever be called with the halve literal, got: planRowSplit(${args})`
+    );
+  }
+
+  assert.match(
+    src,
+    /planEvenInsert\(/,
+    "grid.ts must plan the share arm through paneequalize (that is what applies the #954 clamp)"
+  );
+  assert.match(
+    src,
+    /policy === "halve"/,
+    "the two arms should be selected by an explicit policy check, in one place"
+  );
 });
 
 test("parseGrow reads a live flex-grow and falls back to 1 on anything unusable", () => {

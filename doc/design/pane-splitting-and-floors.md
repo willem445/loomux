@@ -44,12 +44,73 @@ depends entirely on **who asked**, and loomux has two askers:
   means* below, which is the sharpest thing in this note.)
 - A **programmatic fan-out** — the multi-agent welcome form placing five
   agents in one pass — means *"lay these out as an even matrix"*. That is
-  **`share`**, the pre-#885 policy, kept unchanged.
+  **`share`**: the newcomer joins at the **mean** of the weights already in the
+  row, so a row that was even is even again at every pane count.
 
 `share` is not legacy debt to be migrated away; it is the right answer for
 batch placement. Halving repeatedly through a five-agent fan-out deals out a
 1/2, 1/4, 1/8, 1/16 sliver staircase — exactly the lopsided layout the
 even-matrix policy was written to avoid. Keeping both is the design.
+
+### Which module serves each policy (#885 + #936 + #954)
+
+The two policies are served by **two different modules**, and that split is
+load-bearing rather than incidental:
+
+| policy | planner | why |
+| --- | --- | --- |
+| `halve` | `splitfloor.planRowSplit` | this slice's own arithmetic, unchanged |
+| `share` | `paneequalize.planEvenInsert` | #936's even-matrix fix |
+
+`splitfloor` has a `share` branch of its own, and **`grid.ts` deliberately does
+not route to it.** That branch is the pre-#885 rule — *an even `1/N` slice on
+top of the existing weights* — which is precisely the staircase #936 reported
+and fixed: it gives the third pane in a row 20% against siblings holding 40%
+each. `planEvenInsert` gives the newcomer the row's mean instead, which is the
+even matrix both modules' comments have always promised.
+
+On a row whose weights have drifted, the difference stops being cosmetic. Feed
+`[2e9, 6e9, 4e9]` to each and the routed arm re-bases the row into
+`[0.33, 1, 0.67, 0.67]`; splitfloor's own arm returns
+`[2e9, 6e9, 0.33, 4e9]` — a newcomer holding roughly one part in ten billion,
+which is a pane the human cannot see. `test/splitfloor.test.ts` pins both
+halves of that: the counterfactual, and (as a source scan, in the shape
+`test/transport.test.ts` established) that `planRowSplit` is only ever called
+with the `halve` literal.
+
+The branch is kept rather than deleted because it is the #885 module's own API
+and its removal is a separate, reviewable change — but nothing calls it, and
+**deleting it is the obvious follow-up** now that the routing is settled. It is
+named here so the next reader does not "restore" it as a simplification.
+
+### Where the clamp sits, and why `halve` is not under it
+
+#954 added a magnitude clamp: `paneequalize` re-bases a row whose largest
+weight has left `[1e-3, 1e3]`, preserving every share exactly. It lives at that
+module's **entry points**, so the routing above composes with it unchanged —
+the `share` insert and every close (`planRemoval`) pass through it, and an
+out-of-band row comes back in band on the next one of either.
+
+**`halve` reaches no clamp, and that is deliberate.** The argument is that it
+cannot cause the problem the clamp exists for. #954's drift comes from the one
+operation that raises a row's magnitude: a close preserves the row's total
+across *one fewer pane*, so the mean climbs by `(n+1)/n` every open/close
+cycle. `halve` preserves the row's total **exactly** — that is the guarantee
+that makes a human split local — so it is magnitude-neutral by construction,
+and re-basing there would rewrite the very numbers the guarantee is about while
+buying nothing.
+
+Two consequences worth stating rather than discovering later:
+
+- A row that arrives out of band (a layout persisted by a pre-#954 build) and
+  is only ever *halve*-split stays out of band until a close or a programmatic
+  placement touches it. Nothing is visibly wrong — shares are exact at any
+  magnitude — and the first close re-bases it.
+- `halve` drives the *smallest* weight down geometrically (a half, a quarter,
+  an eighth), and the clamp keys on a row's **largest** weight, so it will not
+  fire on that. What bounds it is not arithmetic but the pane floor below:
+  long before a weight is small enough to matter, the pane is too small to
+  split. That is a floors question, not a clamp question.
 
 The arithmetic lives in the pure, DOM-free `src/splitfloor.ts`
 (`planRowSplit`), unit-tested under `node --test` like `layout.ts`,
@@ -191,3 +252,18 @@ deliberately still open:
   (zero PTY resizes — `openPaneMinimized` never fits) rather than being
   refused outright: the dock preserves the human's intent, and attention
   routing (#6) means a docked agent's ask is never lost.
+
+**Carried in from another review, for slice B to settle.** rev-645 (on the S3
+workflow-pane slice) deferred a geometry finding to "#885's floors decision",
+which is this note's slice B: a pane's **fixed chrome is far larger than the
+60px floor** — an inspector-bearing pane budgets on the order of 210px + 340px
+of non-negotiable furniture against a `MIN_PANE_PX` of 80 — so a pane can pass
+the floor and still have no usable content area at all. That is a real gap in
+"what is a usable pane", and it is the same question slice B has to answer when
+it picks its constants: a floor expressed as one number for every pane kind
+cannot be right when the kinds have order-of-magnitude different chrome.
+
+Recorded here rather than fixed: this slice sets **who pays** for a split, not
+**when a split is refused**, and no constant in it is the one that finding is
+about. Slice B owns it, with the human at the demo — which is also the only
+place the numbers can honestly be tuned.

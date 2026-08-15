@@ -16,23 +16,33 @@
 //     moves and resizes every sibling in the row, every time. Every HUMAN
 //     split gesture uses this: the pane you are standing in is the one that
 //     shrinks, which is what tmux/wezterm do and what a split "feels" like.
-//   - `share` — the newcomer takes an even 1/N slice on top of the existing
-//     weights, so the row's total grows and every sibling shrinks
-//     proportionally, and repeated splits form an even matrix rather than a
-//     lopsided staircase. The original (pre-#885) policy, kept for
-//     PROGRAMMATIC batch placement — the multi-agent welcome fan-out, where
-//     halving repeatedly would deal out a 1/2, 1/4, 1/8, 1/16 sliver
-//     staircase instead of a matrix.
+//   - `share` — the newcomer joins at the MEAN of the weights already in the
+//     row, so a row that was even is even again (N panes at 1/N) and repeated
+//     placements form a real even matrix rather than a lopsided staircase.
+//     Kept for PROGRAMMATIC batch placement — the multi-agent welcome fan-out,
+//     a pane rejoining from the dock, a restore replay — where halving
+//     repeatedly would deal out a 1/2, 1/4, 1/8, 1/16 sliver staircase.
 //
 // Cross-direction splits need no policy: nesting a two-way split inside the
 // target's slot already halves the target alone. See
 // doc/design/pane-splitting-and-floors.md.
 //
-// The weight arithmetic behind "even matrix" — what a newcomer joins at, and
-// what happens to a departing pane's weight — is the pure `paneequalize.ts`.
-// It used to live inline here and did not deliver the even matrix this comment
-// has always promised: see that module's header for what #936 reported and how
-// the two operations now keep an undragged layout even.
+// WHERE THE THREE PANE SLICES MEET. `halve` is #885's `splitfloor.planRowSplit`.
+// `share` is #936's `paneequalize.planEvenInsert` — NOT splitfloor's own
+// `share` branch, which is the pre-#885 "1/N on top of the existing total" and
+// is exactly the staircase #936 reported. Removal is #936's too: a closing
+// pane's weight goes to its survivors in equal absolute parts (`planRemoval`)
+// rather than being dropped for flex to re-share proportionally. Autosize
+// (`paneautosize.ts`) is the third, on-demand operation: it levels the WHOLE
+// tab across nesting when the human asks, and never by itself.
+//
+// That routing is also what keeps the #954 magnitude clamp in the path. It
+// lives at `paneequalize`'s entry points, so every operation that can inflate
+// a row's weights — the close, which preserves the total across one fewer
+// pane — re-bases an out-of-band row on the way in. `halve` reaches no clamp
+// and needs none: it preserves the row's total EXACTLY, which is both why it
+// cannot inflate anything and the guarantee a re-base would rewrite.
+// `test/splitfloor.test.ts` pins the routing; the design note argues it.
 //
 // On top of splitting, panes can be dragged by their header to reorder
 // (swap two slots) or re-dock to another pane's edge, maximized to cover the
@@ -1189,15 +1199,16 @@ export class Grid {
    *  pays for the arriving pane.
    *
    *  That is the only half of this operation the policy governs, and the other
-   *  half moves panes regardless of it: the pane also LEAVES a slot, and
-   *  `removeFromTree` splices it out without redistributing its weight, so its
-   *  old row's total drops and every pane still in that row grows to fill the
-   *  gap. When the drag stays inside one row, that is the same row — e.g.
-   *  [A=1, B=1, C=1] with C dropped on A's right edge ends as [A=.5, C=.5,
-   *  B=1] of a total of 2, so B goes from a third of the row to a half. That
-   *  is correct (a departing pane has to give its space back) and pre-dates
-   *  this policy; it just means "the rest of the layout doesn't move" is true
-   *  of a SPLIT and not of a MOVE. */
+   *  half moves panes regardless of it: the pane also LEAVES a slot, and since
+   *  #936 `removeFromTree` hands its weight to the surviving siblings in equal
+   *  absolute parts, so the old row's TOTAL is preserved and every survivor
+   *  grows by the same absolute amount. When the drag stays inside one row,
+   *  that is the same row — e.g. [A=1, B=1, C=1] with C dropped on A's right
+   *  edge becomes [A=1.5, B=1.5] on the way out and ends [A=.75, C=.75,
+   *  B=1.5], so B goes from a third of the row to a half. That is correct (a
+   *  departing pane has to give its space back) and is not what this policy
+   *  governs; it just means "the rest of the layout doesn't move" is a claim
+   *  about a SPLIT and not about a MOVE. */
   moveToEdge(source: Pane, target: Pane, dir: Dir, before: boolean): void {
     if (source === target || this.maximized) return;
     const leaf = this.leaves.get(source);
