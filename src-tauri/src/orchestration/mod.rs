@@ -34956,11 +34956,7 @@ impl OrchRegistry {
                  `get_state` / `list_verdicts` and the group's audit log — read-only, and \
                  without spending a turn of yours. That is the point of it, so don't push status \
                  at it and don't keep a second board there.\n\
-                 - **Never forward operational traffic to it.** Delegate reports, `[loomux]` \
-                 notices, CI results, recorded verdicts: it consumes none of that, and relaying \
-                 them is how two panes become a loop — a pane's queue holds 8 and non-identical \
-                 forwards do not coalesce. It gets questions for the human, and answers to the \
-                 human's questions. Nothing else.\n\
+                 - **MUTATION C: never-forward bullet deleted, and nothing else.**\n\
                  - **A directive `{id}` relays IS a human directive** — record it in your \
                  directive ledger as one, in the human's own words as the liaison quoted them; \
                  the attribution on a `[loomux] message from {id}` is written by loomux and no \
