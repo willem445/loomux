@@ -559,8 +559,10 @@ fn sanitize_intake_label(field: &str, raw_val: &str, fallback: &str, errs: &mut 
     if v.is_empty() {
         return fallback.to_string();
     }
+    // SCRATCH ONLY (#778 NB4 red-before-green): the pre-fix behaviour — the
+    // alphabet alone, which admits a leading dash. Never merged.
     match sanitize_id(v) {
-        Some(clean) if clean == v && !clean.starts_with('-') => clean,
+        Some(clean) if clean == v => clean,
         _ => {
             errs.push(format!(
                 "intake.labels.{field}: {v:?} is not a usable label (letters, digits, '-', '_'; \
