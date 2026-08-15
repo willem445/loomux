@@ -1267,6 +1267,57 @@ fn a_declared_liaison_gives_the_orchestrator_its_routing_note_with_the_block_id(
 }
 
 #[test]
+fn a_liaison_is_not_fanned_out_to_as_a_reviewer_on_either_surface() {
+    // #891 S3 coherence fix. A liaison is reviewer-KIND, so a bare
+    // `kind == Reviewer` filter put it in BOTH lists that mean "the blocks a PR is
+    // reviewed by": the orchestrator's `{{REVIEWERS}}` fan-out and a reviewer's
+    // "you are one of N reviewer blocks" lane. Either one alone contradicts the
+    // liaison note in the same document ("no PR is routed to it for a verdict") and
+    // sends a PR to a pane that is denied `review_verdict` and can satisfy no gate.
+    // The sibling of the `block_for` trap `doc/design/liaison.md` records; the
+    // merge-gate path is NOT this fix's business — `parse_workflow` already refuses
+    // a gate that names a liaison.
+    let (reg, _d) = test_registry();
+    let repo = Repo::new().workflow(
+        "version: 1\nblocks:\n\
+         \x20 - id: worker\n    kind: worker\n\
+         \x20 - id: rev-a\n    kind: reviewer\n\
+         \x20 - id: desk\n    kind: reviewer\n    role_hint: liaison\n\
+         \x20 - id: rev-b\n    kind: reviewer\n",
+    );
+    let g = reg.create_group(&repo.path(), rails()).unwrap();
+
+    // (1) the orchestrator's fan-out sentence.
+    let orch = instructions_lf(&reg, &g.id, "orchestrator.md");
+    let orch_flat = flat(&orch);
+    let fan_out = section(&orch_flat, "run every reviewer block on every pr", "gates are enforced");
+    assert!(
+        fan_out.contains("`rev-a`") && fan_out.contains("`rev-b`"),
+        "the real reviewers must still be fanned out to: {fan_out}"
+    );
+    assert!(
+        !fan_out.contains("desk"),
+        "the liaison must not be in the fan-out list — it is denied `review_verdict` and could \
+         never satisfy a gate, so a PR sent to it is a review that can never complete: {fan_out}"
+    );
+
+    // (2) a real reviewer's lane note counts its true peers, and only them.
+    let rev_a = instructions_lf(&reg, &g.id, "rev-a.md");
+    assert!(
+        rev_a.contains("**one of 2 reviewer blocks**") && rev_a.contains("`rev-b`"),
+        "rev-a is one of TWO reviewing blocks and its peer is rev-b: {rev_a}"
+    );
+    assert!(!rev_a.contains("desk"), "the liaison is not one of rev-a's lanes: {rev_a}");
+
+    // (3) ...and the liaison is not told it is one of the reviewers.
+    let desk = instructions_lf(&reg, &g.id, "desk.md");
+    assert!(
+        !desk.contains("reviewer blocks"),
+        "the liaison must not be handed a review lane: {desk}"
+    );
+}
+
+#[test]
 fn liaison_prose_stays_silent_unless_a_block_declares_the_hint() {
     // The sibling of `advisor_and_process_prose_stays_silent_...`, and the same rule
     // (rev-29 F1): prose about a mechanism the reader does not have sends them after
