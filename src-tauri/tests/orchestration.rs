@@ -37004,6 +37004,14 @@ fn a_liaison_block_may_read_the_groups_usage() {
     let names = listed_tools(&reg, &liaison);
     assert!(names.contains(&"group_usage".to_string()),
         "a liaison must be offered the tool, not just permitted it: {names:?}");
+    // EXACTLY once. `group_usage_tool()` has two call sites — the orchestrator
+    // tier and the liaison's push — and they are mutually exclusive only
+    // because the first is keyed on `role == Orchestrator` alone. A refactor
+    // that let a liaison reach both would advertise one tool twice under one
+    // name; the mutation probe in this PR's body produced exactly that listing,
+    // so the shape is reachable by a plausible edit rather than hypothetical.
+    assert_eq!(names.iter().filter(|n| *n == "group_usage").count(), 1,
+        "one definition, one listing per caller — never both call sites: {names:?}");
 
     // THE NEGATIVE CONTROL THAT MAKES THE PIN MEAN SOMETHING. The hint is the
     // only difference between these two blocks, so if a plain reviewer also had
