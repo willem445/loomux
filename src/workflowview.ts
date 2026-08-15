@@ -2259,9 +2259,12 @@ export class WorkflowView {
     const names = Object.keys(resources).sort();
     for (const name of names) {
       const r = resources[name]!;
+      // A plain div, not `this.field(...)`: the card holds several inputs and a button, and
+      // wrapping that in the `<label>` `field` produces would nest labels around controls
+      // that already have their own.
       const card = el("div", "wf-fields");
       const head = el("div", "wf-check");
-      head.append(el("span", "wf-check-label", name));
+      head.append(el("span", "wf-label", name));
       const del = document.createElement("button");
       del.className = "wf-btn wf-btn-danger";
       del.textContent = "Remove";
@@ -2305,7 +2308,7 @@ export class WorkflowView {
         { min: RESOURCE_MAX_HOLD_MINUTES_MIN, max: RESOURCE_MAX_HOLD_MINUTES_MAX },
         `How long one hold may last before it expires (1–${RESOURCE_MAX_HOLD_MINUTES_MAX}). Empty inherits loomux's default.`
       );
-      box.append(this.field(`Resource · ${name}`, card));
+      box.append(card);
     }
 
     const add = el("button", "wf-add", "+ Add resource") as HTMLButtonElement;

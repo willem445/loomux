@@ -3846,6 +3846,11 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .wf-checks { display: flex; flex-direction: column; gap: 4px; }
 .wf-check { display: flex; align-items: center; gap: 7px; cursor: pointer; font-size: 12.5px; }
 .wf-check-label.wf-bad { color: var(--state-danger); }
+/* A `.wf-check` row that carries a TEXT FIELD rather than a checkbox — one `allow:` tool
+   pattern and its ✕ (#1020). The input takes the row because the values are long
+   (`Bash(gh pr view --json title,body)`); `min-width: 0` is what lets it actually shrink
+   inside the flex row instead of forcing the inspector column wider. */
+.wf-check > .wf-input { flex: 1; min-width: 0; }
 .wf-blocked {
   margin: 12px; padding: 12px 14px; border-radius: 8px; line-height: 1.6;
   border: 1px solid color-mix(in srgb, var(--state-danger) 40%, transparent); background: color-mix(in srgb, var(--state-danger) 8%, transparent);

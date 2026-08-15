@@ -926,6 +926,26 @@ whatever loomux defaults to for its kind on its CLI — `sonnet`/`opus` on
 Claude Code, `auto` on Copilot, `pro` on Gemini, and on OpenCode no `--model`
 at all, so your own config decides.
 
+**Everything in the file is editable in the pane.** Beside the roster's block
+rows and its merge-gate row sit three more: **Intake**, **Merge queue** and
+**Resources** — the same `intake:`, `merge_queue:` and `resources:` blocks
+described elsewhere on this page, each with an enable-toggle and its fields.
+The block form covers the rest: `role_hint`, and `allow:` as a list of tool
+patterns (one row per pattern, because a real pattern contains commas).
+
+Two things those forms will not let you do, because loomux's engine would
+refuse the file: write a number outside a field's range (the inputs clamp —
+slots 1–64, max hold 1–480 minutes, at most 32 resources, a batch of at least
+1), and pair a `role_hint` with a kind that hint does not apply to. A value a
+*hand-edited* file already carries is shown as a finding instead, with the
+distinction that matters spelled out — a bound loomux **refuses** reads as an
+error, one it **clamps** (`checks_timeout_minutes`) as a warning.
+
+An untouched section is never rewritten. loomux writes only what the file
+declares, so opening these forms to look at them changes nothing, and a section
+you tick on and then off again leaves the file exactly as it was — including
+its comments.
+
 **Reviewer diversity across models.** A block's `cli`/`model` are set
 per-block, so nothing stops a reviewer lane from running on a different
 CLI/model than the one that wrote the code — a second model tends to catch a
