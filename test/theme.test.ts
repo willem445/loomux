@@ -193,6 +193,23 @@ test("no ANSI colour disappears into the terminal background", () => {
   }
 });
 
+test("ANSI brightWhite stays brighter than the terminal foreground", () => {
+  // brightWhite used to be PALETTE.mist000 — a surface-ladder token that moves whenever the
+  // ink ramp is retuned. mist000's #1020 item 11 tone-down did exactly that and pushed
+  // brightWhite (L 0.6437) BELOW the unrelated `foreground` literal (L 0.6921), inverting
+  // bright-white emphasis in every pane with no other test noticing (#1033 review). Pinning
+  // the ORDER, not a specific hex, is what survives the next ink-ramp edit: brightWhite is
+  // free to move, foreground is free to move, but bright-white must stay the brighter of the
+  // two or "bright" stops meaning anything.
+  assert.ok(
+    luminance(TERMINAL_THEME.brightWhite) > luminance(TERMINAL_THEME.foreground),
+    `brightWhite (${TERMINAL_THEME.brightWhite}, L ${luminance(TERMINAL_THEME.brightWhite).toFixed(4)}) ` +
+      `is not brighter than foreground (${TERMINAL_THEME.foreground}, L ` +
+      `${luminance(TERMINAL_THEME.foreground).toFixed(4)}) — ANSI bright-white would render ` +
+      "dimmer than plain terminal text"
+  );
+});
+
 test("the stylesheet declares every pinned token, with theme.ts's value", () => {
   const css = stripCssComments(read("../src/styles.css"));
   const declared = new Map<string, string>();
@@ -782,6 +799,25 @@ test("no identity-only hue may fill a state role", () => {
         "by design: a stopped agent is marked by form, not by hue"
     );
   }
+});
+
+test("the design note's mist row matches theme.ts", () => {
+  // doc/design/ui-redesign.md §The palette carries its own copy of the ink ramp as a table
+  // row — the third mirror alongside styles.css and index.html, but the only one nothing
+  // reads back. A slice that moves mist000/200/400 in theme.ts (as #1020 item 11 did) can
+  // drift the doc silently, which is exactly the kind of gap the other two pins exist to
+  // close for their own surfaces.
+  const doc = read("../doc/design/ui-redesign.md");
+  const row = doc.match(
+    /\|\s*\*\*mist\*\*\s*\|\s*`(#[0-9a-f]{6})`\s*\/\s*`(#[0-9a-f]{6})`\s*\/\s*`(#[0-9a-f]{6})`/i
+  );
+  assert.ok(row, "ui-redesign.md has no `**mist**` palette-table row to pin");
+  assert.deepEqual(
+    [row[1], row[2], row[3]],
+    [PALETTE.mist000, PALETTE.mist200, PALETTE.mist400],
+    `ui-redesign.md's mist row is ${row[1]} / ${row[2]} / ${row[3]}, theme.ts says ` +
+      `${PALETTE.mist000} / ${PALETTE.mist200} / ${PALETTE.mist400}`
+  );
 });
 
 test("every palette entry is a well-formed hex colour", () => {

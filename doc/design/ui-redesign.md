@@ -80,7 +80,7 @@ not one value has moved:
 | Name | Value | Role |
 | --- | --- | --- |
 | **slate** | `#0a0b0d` → `#343945` | the ground and the elevation ladder; every surface and border |
-| **mist** | `#e7e9ee` / `#9ba3b1` / `#656d7b` | the ink: primary, secondary, faint |
+| **mist** | `#cfd2d9` / `#9ba3b1` / `#656d7b` | the ink: primary, secondary, faint |
 
 **The ground is a deep cool neutral.** Blue sits a few points above red at every step of the
 slate ramp (`B−R` = 3, 5, 7, 10, 12, 17 as it climbs), so the chrome reads cool and recedes

@@ -48,7 +48,36 @@ export const PALETTE = {
 
   // --- mist: the ink. `mist400` is BELOW 4.5:1 on every ground by design — it is for
   //     non-essential meta and rules only. Anything a user must read uses mist200 or better.
-  mist000: "#e7e9ee", // primary ink            (15.6:1 on slate100)
+  //
+  //     mist000 was toned down from its original 15.6:1 (#e7e9ee) at the human's request —
+  //     "a little extreme" against the near-black grounds (#1020 item 11). The candidate
+  //     matrix considered, measured against slate100 (the app ground) with the identical
+  //     WCAG formula test/theme.test.ts runs, all comfortably clear the ramp's own AAA floor
+  //     (>=7:1 on every ground, test: "the ink ramp keeps the contrast the design note
+  //     promises") with room to spare even on slate300, the lightest ground it sits on:
+  //
+  //       candidate      hex        surface0   surface1   surface2   surfaceTerm
+  //       mild trim      #d7dae0    13.50:1    12.80:1    11.78:1    14.06:1
+  //       DEFAULT (mid)  #cfd2d9    12.49:1    11.85:1    10.90:1    13.01:1   <- shipped
+  //       strong trim    #c7cad2    11.53:1    10.94:1    10.06:1    12.01:1
+  //
+  //     Terminal consequence: none of these candidates touch TERMINAL_THEME.brightWhite
+  //     (below) — it is its own literal, not PALETTE.mist000, precisely so that swapping the
+  //     candidate here can never again silently re-paint the terminal's bright-white slot. It
+  //     did once: shipping DEFAULT while brightWhite aliased mist000 put brightWhite (L
+  //     0.6437) BELOW `foreground` (L 0.6921), inverting bright-white emphasis in every pane
+  //     (#1033 review) — see the brightWhite comment in TERMINAL_THEME.
+  //
+  //     DEFAULT was picked as the midpoint of the requested ~12-13:1 band. Which candidate
+  //     reads right is a human call at the demo (#1020 human input 4) — swap this one hex
+  //     to move the whole app; nothing else here needs to change (styles.css / index.html
+  //     stay pinned to whichever value lands here). The surface ladder itself (below) was
+  //     deliberately left untouched: its steps are already at the finest gap 8-bit hex can
+  //     express at this luminance (adjacent hex values differ by ~0.02:1 of contrast here),
+  //     so softening it further either does nothing visible or risks breaking the strictly-
+  //     increasing elevation order for no perceptible gain — a call for a design slice with
+  //     room to re-derive the whole ladder, not a same-day tone-down.
+  mist000: "#cfd2d9", // primary ink            (12.5:1 on slate100)
   mist200: "#9ba3b1", // secondary ink          (7.4:1)
   mist400: "#656d7b", // faint meta / dividers  (3.2-3.8:1 — non-text use only)
 
@@ -200,7 +229,7 @@ export const TERM_METRICS = { fontSize: 14, lineHeight: 1.1 } as const;
  */
 export const TERMINAL_THEME = {
   background: PALETTE.slate000,
-  foreground: "#d5d9e1", // mist000 held back a touch — this is read for hours at a time
+  foreground: "#d5d9e1", // independent literal, not derived from mist000 — read for hours at a time
   cursor: PALETTE.azure, // the caret is interaction, so it takes the accent (SEMANTIC.focus)
   cursorAccent: PALETTE.slate000,
   selectionBackground: PALETTE.azureDeep,
@@ -230,7 +259,13 @@ export const TERMINAL_THEME = {
   brightBlue: PALETTE.azureLit,
   brightMagenta: PALETTE.violetLit,
   brightCyan: PALETTE.cyanLit,
-  brightWhite: PALETTE.mist000,
+  // Independent literal, NOT PALETTE.mist000: the primary-ink tone-down (#1020 item 11) must
+  // never carry into ANSI bright-white, or a later mist000 edit silently dims the terminal's
+  // brightest slot below `foreground` (#d5d9e1, L 0.6921) — exactly what aliasing this to
+  // mist000 once did (L 0.6437 < 0.6921), inverting bright-white emphasis in every pane
+  // (#1033 review). Kept at mist000's pre-tone-down value so brightWhite stays the brightest
+  // thing a CLI can print.
+  brightWhite: "#e7e9ee",
 } as const;
 
 /** The 16 ANSI slot names, in wire order. Exported so the test names what it checks. */
