@@ -1765,10 +1765,55 @@ about.
 **What is deliberately not pinned**, so the claim above stays honest: `title`
 and `help` prose; `gate.require`'s accepted set, which the engine states only
 as match arms in `parse_workflow` and which is therefore hand-listed in
-`workflow_schema_field_facts()` with that caveat attached; and the enum fields
-the pane has no rule of its own for (`intake.source`, `effort`, `context`) —
-full engine parity for a live buffer is `workflow_check`'s job, not the
+`workflow_schema_field_facts()` with that caveat attached; and `effort` /
+`context`, which the pane has no rule of its own for because they are
+capability data the backend answers per CLI and model (`agent_cli_knobs`).
+Full engine parity for a live buffer remains `workflow_check`'s job, not the
 manifest's.
+
+**A field the pane can EDIT is a field the pane needs a rule for (#1020).**
+When the inspector grew forms for `intake:`, `merge_queue:` and `resources:`,
+each of those forms had to be able to answer "may I offer this value?" — and a
+picker that can spell what `parse_workflow` refuses is the same lie as a pane
+that blesses an illegal file, just earlier in the sequence. So `intake.source`,
+the intake label alphabet, the resource-name alphabet and the four numeric
+bounds joined the closed sets `workflowmodel.ts` already mirrors
+(`WORKFLOW_CLIS`, `BLOCK_KINDS`, `GATE_REQUIRES`, `roleHintRequires`), for the
+same reason and under the same discipline: hand-written because that module is
+pure and import-free, and *pinned* — `test/workflowschema.test.ts` now checks
+each constant against the manifest's own `min`/`max`/`max_entries`/`values`,
+which the Rust side already checks against the engine's constants. Engine →
+manifest → pane, with no step left to assumption. The manifest's
+`on_out_of_range` is honored rather than merely read: a bound the engine
+**refuses** is an error finding and a bound it **clamps** is a warning, because
+"your file will not load" and "your file will not do what it says" send a human
+to different places.
+
+**A bound at its point of use is a bound nothing can check.** The first cut of
+those forms clamped `merge_queue.max_batch` to a hand-typed `64` — a ceiling no
+engine constant imposes and no manifest row declares — so typing `100` silently
+wrote `64`, and no test in the tree could see it, because the pin asserted only
+the bounds it happened to name. The fix is `POLICY_BOUNDS` in
+`workflowmodel.ts`: one table, keyed by manifest field id, that every bounded
+number in the pane reads, pinned against the manifest **in both directions** —
+a table bound the manifest does not declare fails, and a manifest bound no form
+reads fails too. `max` is compared *including its absence*, since a manifest row
+without one is the statement that the engine imposes no ceiling. That reverse
+direction immediately found `gate.threshold`, bounded in the manifest since #880
+and hand-wired in `gateForm` since #222 with no clamp at all; it now reads the
+same table, and its empty state means UNDECLARED (raising `gate-bad-threshold`)
+rather than silently writing `1` the human never typed.
+
+**Where the file has three states, the control has three.**
+`merge_queue.enabled` is absent, `true`, or `false`, and absent and `false` mean
+the same thing to the engine (`#[serde(default)]`) — which is exactly why the
+pane must not convert between them behind the human's back. A checkbox cannot
+hold three states: ticking then unticking one wrote `enabled: false` onto a file
+that never carried the key, and the repair that always deletes on untick drops an
+explicit `false` somebody wrote. So this one field is a three-way picker that
+shows what the file says. It is the only place in the pane where the distinction
+is visible, and it is the one form whose entire subject is what the file
+declares.
 
 **An empty value can be a real value.** `block.cli: ""` means "inherit the
 group's CLI, whatever the launcher picks" and `intake.source: ""` means the

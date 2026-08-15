@@ -804,10 +804,13 @@ where the pane's other three decisions already live:
 | `surfaceForFinding` | Where a finding's click-to-navigate lands. A finding naming a LINE wants the caret, so it wants the YAML; a finding naming a BLOCK wants an editor that is **already on screen**, so it moves no surface at all. That is the old `setTab("form")`, restated as the fact that there is nothing left to remember. |
 | `canvasDeleteAllowed` | When a bare Delete may erase the canvas selection. Only on the canvas, and never inside a field — and the second half matters far more docked than it did under tabs, where "typing in a block's prompt" and "that block is selected on the canvas" could not co-occur. Now they always do. |
 
-**What is deliberately NOT here.** The forms themselves moved unchanged: the descriptor-driven
-rebuild, the model/profile pickers and the missing config surfaces (`intake:`, `merge_queue:`,
-`allow:`, `role_hint`) are #880's later slices, and mixing them into a structural move would have
-made the diff unreviewable. Connection UX (port hover, legal-target highlighting mid-drag) and
+**What was deliberately NOT here.** The forms themselves moved unchanged: the descriptor-driven
+rebuild and the model/profile pickers are #880's later slices, and mixing them into a structural
+move would have made the diff unreviewable. The config surfaces named alongside them —
+`intake:`, `merge_queue:`, `resources:`, `allow:` and `role_hint` — **shipped in #1020**: the
+roster grew a `Policy` group whose three rows each open a form shaped like `gateForm`, and the
+block form grew the other two. The descriptor-driven rebuild is still pending, and those forms
+are its natural first consumers. Connection UX (port hover, legal-target highlighting mid-drag) and
 autosave are likewise their own slices. The pane's split geometry — a resizable or auto-sized
 inspector — is #885, not this: the inspector is a fixed-width column so the canvas keeps every
 pixel that is left. And the CSS here is **structural only** (layout, docking, the pressed state of
@@ -859,7 +862,7 @@ construction, not by remembering.
 | `workflowview.ts` (#222, restructured #880) | the DOM: roster + **docked inspector**, the **editable canvas** as the primary surface with raw YAML as a toggle over it, findings strip, save/conflict, the start + error surfaces — and the same `dirty` / `canDiscard` / `bufferReport` contract the editor has |
 | `workflowlayout.ts` (#222 v2) | the canvas's pure half: `.loomux/workflow.layout.json`, placement, hit-testing, edge routing — all DOM-free, all node:tested |
 | `modal.ts` (#222 v2) | `promptModal` — one line of text, validated on every keystroke (the affirm button is disabled while the id is bad), so a new block can be ASKED for its id instead of being given a generated one |
-| `workflowpane.ts` (#222 v2) | the pane's pure DECISIONS — which surface it shows, how a save is allowed to write, what the layout file may forget. Three rules the view used to hold itself, and got wrong. Plus `createAllowed` (#222 live fix): a create is permitted on the **start surface and nowhere else**, so it can never be reached over a workflow that is already there. Plus the four #880 rules that used to be implicit in "which tab is on top": `inspectorTarget`, `inspectorHeading`, `surfaceForFinding`, `canvasDeleteAllowed` |
+| `workflowpane.ts` (#222 v2) | the pane's pure DECISIONS — which surface it shows, how a save is allowed to write, what the layout file may forget. Three rules the view used to hold itself, and got wrong. Plus `createAllowed` (#222 live fix): a create is permitted on the **start surface and nowhere else**, so it can never be reached over a workflow that is already there. Plus the four #880 rules that used to be implicit in "which tab is on top": `inspectorTarget`, `inspectorHeading`, `surfaceForFinding`, `canvasDeleteAllowed`. `Selection` gained `intake` / `merge_queue` / `resources` in #1020 — the three OPTIONAL policy sections, addressed by nothing at all, because there is one of each and selecting one the file does not declare is how you declare it (never a stale selection to fall back from) |
 | `test/workflowinspector.test.ts` (#880) | those four rules, node-tested: the fallbacks when a selection outlives its block or its edge, the unparseable-buffer refusal, the id in the header, and the finding that must NOT move a surface |
 | `e2e/tests/workflow-editor.spec.ts` (#880) | the assertion no DOM-free test can make: in the real app, clicking a node makes that block's editor appear beside it, named by its id — the dead click the issue was opened about |
 | `styles.css` → `[hidden] { display: none !important; }` (#222 live fix) | app-wide, one line: an author `display:` rule out-ranks the UA's `[hidden]` **by origin**, so `el.hidden = true` was silently ignored on all seven of the workflow pane's toggled elements — the pane drew its three exclusive surfaces at once, and the "Create workflow" button sat live over a loaded workflow. It also un-breaks the two elements *outside* the pane that had the same defect: the group view's budget meter (`Off ⇒ hidden`) and the tab bar's ✕ on a single tab (`never zero tabs`) |

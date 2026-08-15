@@ -28,8 +28,18 @@ import {
   newBlock,
   isValidBlockId,
   isWorkflowCli,
+  isValidIntakeLabel,
+  isValidResourceName,
+  sanitizeAllowPattern,
+  roleHintsForKind,
   hasErrors,
   BLOCK_KINDS,
+  ROLE_HINTS,
+  INTAKE_SOURCES,
+  ID_MAX_CHARS,
+  RESOURCES_MAX,
+  RESOURCE_SLOTS_MAX,
+  MERGE_QUEUE_MAX_BATCH_MIN,
   WORKFLOW_VERSION,
   roleHintRequires,
   type Workflow,
@@ -1831,4 +1841,298 @@ test("a section declared EMPTY stays declared — `intake: {}` is not the same a
   const absent = parseWorkflow("version: 1\nintake:\nblocks:\n  - id: w\n    kind: worker\n");
   assert.equal(absent.workflow.intake, undefined, "a bare key means the section is not declared");
   assert.doesNotMatch(serializeWorkflow(absent.workflow), /intake/);
+});
+
+// ---------- the config surface the PANE can now edit (#1020) ----------
+//
+// #880 gave the model a name for every field of the wire schema; the pane could still only
+// edit half of them. These pin the half that was missing — `allow:`, `role_hint:`, and the
+// three policy sections — as RULES rather than as form wiring, because the form is DOM and
+// the rules are what a form must not be able to break:
+//
+//   * what a picker may offer is derived from the same statement that validates it, so a new
+//     role hint cannot appear in one and not the other;
+//   * a value the engine REFUSES is a finding here (the pane must not bless a file that will
+//     not load), and one it silently REWRITES is a warning (the pane must not let a pattern
+//     reach an agent as something other than what the file says);
+//   * declaring a section and then undeclaring it leaves the file exactly as it was.
+
+const workflowWith = (body: string): string =>
+  `version: 1\nname: t\n\nblocks:\n  - id: w\n    name: W\n    kind: worker\n    cli: claude\n${body}`;
+
+test("the role_hint offer is DERIVED from the pairing rule, for every kind (#1020)", () => {
+  // The property, over the whole cross product rather than over today's two hints: a hint
+  // this function offers for a kind must validate clean on that kind, and one it withholds
+  // must be refused. A hardcoded picker passes this today and fails it the day a third hint
+  // lands — which is the day it would otherwise start lying.
+  for (const kind of BLOCK_KINDS) {
+    const offered = roleHintsForKind(kind);
+    for (const hint of ROLE_HINTS) {
+      const w = parseWorkflow(
+        `version: 1\nblocks:\n  - id: b\n    kind: ${kind}\n    cli: claude\n    role_hint: ${hint}\n`
+      ).workflow;
+      const roleFindings = validateWorkflow(w).filter((f) => f.code.startsWith("role-hint-"));
+      if (offered.includes(hint)) {
+        assert.deepEqual(roleFindings, [], `${kind} is offered ${hint} — it must validate`);
+      } else {
+        assert.deepEqual(
+          codes(roleFindings),
+          ["role-hint-wrong-kind"],
+          `${kind} is not offered ${hint} — the parser must refuse it`
+        );
+      }
+    }
+  }
+  // …and every hint is offered SOMEWHERE. A hint no kind can carry would be one the form can
+  // never spell, which is a different bug from the two above and just as silent.
+  for (const hint of ROLE_HINTS) {
+    assert.ok(
+      BLOCK_KINDS.some((k) => roleHintsForKind(k).includes(hint)),
+      `no kind offers ${hint}`
+    );
+  }
+});
+
+test("allow: is refused on the two kinds the engine refuses it on, and only those (#1020)", () => {
+  const on = (kind: string): Finding[] =>
+    validateWorkflow(
+      parseWorkflow(
+        `version: 1\nblocks:\n  - id: b\n    kind: ${kind}\n    cli: claude\n    allow: ["Bash(npm test)"]\n`
+      ).workflow
+    ).filter((f) => f.code === "allow-not-permitted");
+
+  // The trust root: a repo file may not pre-approve the tools of the one agent that runs
+  // unsupervised. The read-only class: `allow: Bash(python *)` is a shell that writes files.
+  assert.equal(on("orchestrator").length, 1);
+  assert.equal(on("planner").length, 1);
+  // A reviewer keeps its shell by design (running the tests IS the job) and a worker holds
+  // the whole surface anyway — the engine allows both, so the pane must not invent a rule.
+  assert.deepEqual(on("worker"), []);
+  assert.deepEqual(on("reviewer"), []);
+  // An unrecognized kind is already reported as one; a second finding explains nothing.
+  assert.deepEqual(on("superuser"), []);
+});
+
+test("an allow: pattern the engine would silently rewrite is a warning, not silence (#1020)", () => {
+  const { findings } = analyzeWorkflow(
+    workflowWith(`    allow: ["Bash(gh pr view --json title,body)", "Bash(echo $HOME)", "$$$"]\n`)
+  );
+  const sanitized = findings.filter((f) => f.code === "allow-sanitized");
+  // The first pattern is clean — commas and parens are in the engine's alphabet — so it must
+  // NOT be flagged, or the warning becomes noise on every real file.
+  assert.equal(sanitized.length, 2, sanitized.map((f) => f.message).join(" | "));
+  assert.match(sanitized[0]!.message, /Bash\(echo HOME\)/, "says what will actually be applied");
+  assert.match(sanitized[1]!.message, /dropped/, "a pattern with nothing left is dropped entirely");
+  assert.deepEqual(
+    sanitized.map((f) => f.severity),
+    ["warning", "warning"],
+    "the file still loads — the engine rewrites rather than refuses"
+  );
+  assert.deepEqual(
+    sanitized.map((f) => f.blockId),
+    ["w", "w"],
+    "reported on the block, so the pane can show it in that block's own form"
+  );
+});
+
+test("sanitizeAllowPattern mirrors the engine's alphabet, both ways (#1020)", () => {
+  // Kept, because a real tool pattern needs them: parens, colon, star, dot, slash, comma,
+  // interior spaces, dashes, underscores.
+  assert.equal(
+    sanitizeAllowPattern("Bash(gh pr view --json title,body)"),
+    "Bash(gh pr view --json title,body)"
+  );
+  assert.equal(sanitizeAllowPattern("mcp__loomux/report:*"), "mcp__loomux/report:*");
+  // Filtered — every one of these reaches the CLI's flag as something else.
+  assert.equal(sanitizeAllowPattern('Bash(echo "$X" | tee f)'), "Bash(echo X  tee f)");
+  assert.equal(sanitizeAllowPattern("  Bash(ls)  "), "Bash(ls)");
+  // Nothing usable left = the entry is dropped, not passed through empty.
+  assert.equal(sanitizeAllowPattern("!!!"), null);
+  assert.equal(sanitizeAllowPattern("   "), null);
+});
+
+test("an intake source the parser refuses is a finding, and the empty one is not (#1020)", () => {
+  const source = (v: string): Finding[] =>
+    analyzeWorkflow(
+      `version: 1\nintake:\n  source: ${v}\nblocks:\n  - id: w\n    kind: worker\n    cli: claude\n`
+    ).findings.filter((f) => f.code === "intake-unknown-source");
+  for (const ok of INTAKE_SOURCES) assert.deepEqual(source(ok), [], ok);
+  // The engine trims and lowercases before matching, so the pane must not disagree.
+  assert.deepEqual(source("GitHub-Labels"), []);
+  assert.deepEqual(source('""'), [], "an empty source means inherit, which is always legal");
+  const bad = source("jira");
+  assert.equal(bad.length, 1);
+  assert.equal(bad[0]!.section, "intake", "routed to the section that can fix it");
+  assert.match(bad[0]!.message, /github-labels/, "names the vocabulary");
+});
+
+test("an intake label the parser refuses is a finding — including the leading-dash one (#1020)", () => {
+  const { findings } = analyzeWorkflow(`version: 1
+intake:
+  labels:
+    ready: agent-ready
+    hold: -force
+    owned: "agent managed"
+blocks:
+  - id: w
+    kind: worker
+    cli: claude
+`);
+  const bad = findings.filter((f) => f.code === "intake-bad-label");
+  // `-force` is the one that is NOT obvious: the alphabet permits a dash freely, but the hold
+  // spelling becomes a positional argument to `gh label create`, where a leading dash is read
+  // as a flag. `agent-ready` (an interior dash) must stay clean.
+  assert.deepEqual(
+    bad.map((f) => f.message.split(":")[0]),
+    ["intake.labels.owned", "intake.labels.hold"]
+  );
+  assert.deepEqual(
+    bad.map((f) => f.section),
+    ["intake", "intake"]
+  );
+});
+
+test("a policy number outside the engine's bounds is a finding, not a clean bill of health (#1020)", () => {
+  const { findings } = analyzeWorkflow(`version: 1
+merge_queue:
+  max_batch: 0
+  checks_timeout_minutes: 999
+resources:
+  build:
+    slots: 65
+  lint:
+    max_hold_minutes: 481
+  "no good":
+    slots: 2
+blocks:
+  - id: w
+    kind: worker
+    cli: claude
+`);
+  const range = findings.filter((f) => f.code === "section-out-of-range");
+  assert.deepEqual(
+    range.map((f) => f.message.split(":").slice(0, 1).join(":")),
+    [
+      "merge_queue.max_batch",
+      "merge_queue.checks_timeout_minutes",
+      "resources.build.slots",
+      "resources.lint.max_hold_minutes",
+    ]
+  );
+  // `max_batch: 0` is a REFUSAL on the engine; `checks_timeout_minutes` is CLAMPED. The pane
+  // says which is which, because "your file will not load" and "your file will not do what it
+  // says" are different sentences.
+  assert.deepEqual(
+    range.map((f) => f.severity),
+    ["error", "warning", "error", "error"]
+  );
+  assert.deepEqual(
+    range.map((f) => f.section),
+    ["merge_queue", "merge_queue", "resources", "resources"]
+  );
+  const names = findings.filter((f) => f.code === "resource-name-invalid");
+  assert.equal(names.length, 1, "a name the engine rejects rather than rewrites");
+  assert.match(names[0]!.message, /no good/);
+});
+
+test("too many resources is the engine's own cap, mirrored (#1020)", () => {
+  const many = Object.fromEntries(
+    Array.from({ length: RESOURCES_MAX + 1 }, (_, i) => [`r${i}`, { slots: 1 }])
+  );
+  const w: Workflow = { ...starterWorkflow(), resources: many };
+  const over = validateWorkflow(w).filter((f) => f.code === "section-out-of-range");
+  assert.equal(over.length, 1);
+  assert.match(over[0]!.message, new RegExp(String(RESOURCES_MAX)));
+  // Exactly at the cap is fine — an off-by-one here would refuse a legal file.
+  const at: Workflow = {
+    ...starterWorkflow(),
+    resources: Object.fromEntries(Object.entries(many).slice(0, RESOURCES_MAX)),
+  };
+  assert.deepEqual(
+    validateWorkflow(at).filter((f) => f.code === "section-out-of-range"),
+    []
+  );
+});
+
+test("a clean policy surface stays clean — none of the new rules fires on the documented schema", () => {
+  const { findings } = analyzeWorkflow(FULL_SURFACE);
+  assert.deepEqual(codes(findings), [], "the #880 fixture uses every section, legally");
+});
+
+test("declaring a section and undeclaring it again leaves the file byte-for-byte (#1020)", () => {
+  // The edge case the form's enable-toggle has to get right: tick `merge_queue:` on, change
+  // your mind, untick it — and the file that never declared one still doesn't. Declared-only
+  // emission is what makes that true, and this is the round-trip that proves it rather than
+  // asserting it.
+  const original = `# a hand-written file
+version: 1
+name: t
+
+blocks:
+  - id: w
+    name: W
+    kind: worker
+    cli: claude
+`;
+  const { workflow } = parseWorkflow(original);
+  const on: Workflow = { ...workflow, merge_queue: { enabled: true } };
+  const withQueue = serializeWorkflowPreserving(on, original);
+  assert.match(withQueue, /^merge_queue:$/m, "the toggle really did write the section");
+  assert.match(withQueue, /^ {2}enabled: true$/m);
+
+  const off: Workflow = { ...workflow };
+  delete off.merge_queue;
+  assert.equal(
+    serializeWorkflowPreserving(off, original),
+    original,
+    "untick must leave an undeclared file undeclared, comments and all"
+  );
+  // …and the same for the other two sections, which get the same toggle.
+  for (const section of ["intake", "resources"] as const) {
+    const declared: Workflow = { ...workflow, [section]: {} };
+    const text = serializeWorkflowPreserving(declared, original);
+    assert.match(text, new RegExp(`^${section}: \\{\\}$`, "m"));
+    const undeclared: Workflow = { ...workflow };
+    delete undeclared[section];
+    assert.equal(serializeWorkflowPreserving(undeclared, original), original, section);
+  }
+});
+
+test("the three sections a form writes survive a round-trip through their own text (#1020)", () => {
+  // What the forms actually produce, read back: every field the pane can now set has to come
+  // back as itself, or the next render shows something the human didn't type.
+  const { workflow } = parseWorkflow(
+    "version: 1\nblocks:\n  - id: w\n    kind: worker\n    cli: claude\n"
+  );
+  const edited: Workflow = {
+    ...workflow,
+    intake: { source: "board", labels: { ready: "go", hold: "wait_here" } },
+    merge_queue: {
+      enabled: true,
+      max_batch: MERGE_QUEUE_MAX_BATCH_MIN,
+      checks_timeout_minutes: 45,
+    },
+    resources: { build: { slots: RESOURCE_SLOTS_MAX }, docs: { max_hold_minutes: 5 } },
+  };
+  const text = serializeWorkflow(edited);
+  const reread = parseWorkflow(text);
+  assert.deepEqual(reread.findings, []);
+  assert.deepEqual(reread.workflow, edited);
+  assert.deepEqual(
+    validateWorkflow(reread.workflow).filter((f) => f.severity === "error"),
+    []
+  );
+});
+
+test("the identifier rules accept exactly what the engine accepts (#1020)", () => {
+  assert.equal(isValidIntakeLabel("agent-ready"), true);
+  assert.equal(isValidIntakeLabel("Agent_Ready1"), true);
+  assert.equal(isValidIntakeLabel(""), true, "empty = inherit this one");
+  assert.equal(isValidIntakeLabel("-hold"), false, "a positional beginning with a dash reads as a flag");
+  assert.equal(isValidIntakeLabel("needs triage"), false);
+  assert.equal(isValidIntakeLabel("a".repeat(ID_MAX_CHARS + 1)), false, "rejected, never truncated");
+  assert.equal(isValidResourceName("-build"), true, "no argv carries a resource name");
+  assert.equal(isValidResourceName("heavy build"), false);
+  assert.equal(isValidResourceName(""), false);
+  assert.equal(isValidResourceName("a".repeat(ID_MAX_CHARS)), true);
 });
