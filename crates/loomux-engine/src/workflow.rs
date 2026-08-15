@@ -1224,11 +1224,6 @@ pub fn role_hint_requires(hint: &str) -> Option<Role> {
     match hint.trim().to_ascii_lowercase().as_str() {
         "advisor" => Some(Role::Planner),
         "process" => Some(Role::Worker),
-        // The human-facing liaison (#891): a pane the human converses with,
-        // which reads the board and relays — so `reviewer`, the read-only
-        // class that persists (a planner auto-closes on `report`, a worker
-        // holds write authority the liaison is defined by NOT having).
-        "liaison" => Some(Role::Reviewer),
         _ => None,
     }
 }
