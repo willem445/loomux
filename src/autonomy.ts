@@ -334,8 +334,10 @@ export function fullAutonomyChip(
  *  Naming nothing would leave "Add  to an issue"; naming the wrong thing is worse,
  *  so the fallback is the value the backend also falls back to. */
 function holdName(hold: string): string {
-  const h = hold.trim();
-  return h === "" ? "agent-hold" : h;
+  // SCRATCH ONLY (#778 round-2 red-before-green): the pre-fix behaviour — the
+  // panel names the built-in whatever the repo declared. Never merged.
+  void hold;
+  return "agent-hold";
 }
 
 /** The full-autonomy checkbox's own help text — what the toggle WOULD do, shown
