@@ -61,6 +61,13 @@ export const PALETTE = {
   //       DEFAULT (mid)  #cfd2d9    12.49:1    11.85:1    10.90:1    13.01:1   <- shipped
   //       strong trim    #c7cad2    11.53:1    10.94:1    10.06:1    12.01:1
   //
+  //     Terminal consequence: none of these candidates touch TERMINAL_THEME.brightWhite
+  //     (below) — it is its own literal, not PALETTE.mist000, precisely so that swapping the
+  //     candidate here can never again silently re-paint the terminal's bright-white slot. It
+  //     did once: shipping DEFAULT while brightWhite aliased mist000 put brightWhite (L
+  //     0.6437) BELOW `foreground` (L 0.6921), inverting bright-white emphasis in every pane
+  //     (#1033 review) — see the brightWhite comment in TERMINAL_THEME.
+  //
   //     DEFAULT was picked as the midpoint of the requested ~12-13:1 band. Which candidate
   //     reads right is a human call at the demo (#1020 human input 4) — swap this one hex
   //     to move the whole app; nothing else here needs to change (styles.css / index.html
@@ -222,7 +229,7 @@ export const TERM_METRICS = { fontSize: 14, lineHeight: 1.1 } as const;
  */
 export const TERMINAL_THEME = {
   background: PALETTE.slate000,
-  foreground: "#d5d9e1", // mist000 held back a touch — this is read for hours at a time
+  foreground: "#d5d9e1", // independent literal, not derived from mist000 — read for hours at a time
   cursor: PALETTE.azure, // the caret is interaction, so it takes the accent (SEMANTIC.focus)
   cursorAccent: PALETTE.slate000,
   selectionBackground: PALETTE.azureDeep,
@@ -252,7 +259,13 @@ export const TERMINAL_THEME = {
   brightBlue: PALETTE.azureLit,
   brightMagenta: PALETTE.violetLit,
   brightCyan: PALETTE.cyanLit,
-  brightWhite: PALETTE.mist000,
+  // Independent literal, NOT PALETTE.mist000: the primary-ink tone-down (#1020 item 11) must
+  // never carry into ANSI bright-white, or a later mist000 edit silently dims the terminal's
+  // brightest slot below `foreground` (#d5d9e1, L 0.6921) — exactly what aliasing this to
+  // mist000 once did (L 0.6437 < 0.6921), inverting bright-white emphasis in every pane
+  // (#1033 review). Kept at mist000's pre-tone-down value so brightWhite stays the brightest
+  // thing a CLI can print.
+  brightWhite: "#e7e9ee",
 } as const;
 
 /** The 16 ANSI slot names, in wire order. Exported so the test names what it checks. */
