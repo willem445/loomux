@@ -48,7 +48,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use crate::obs::LockExt;
 
-use super::queue::QueuedDelivery;
+use crate::queue::QueuedDelivery;
 
 /// Per-pane FIFO delivery queues, keyed by pty id — what [`QueueMap`]
 /// guards. Named because both the read guard and the mutation closure hand
@@ -107,7 +107,7 @@ impl QueueDirty {
 /// reading as anything unusual.
 pub trait QueueSnapshotWriter {
     /// Write `group`'s live queues to disk. Called with no queue lock held.
-    fn write_queue_snapshot(&self, group: &super::GroupId);
+    fn write_queue_snapshot(&self, group: &crate::groupid::GroupId);
 }
 
 /// Read-only access to [`QueueMap`]'s contents.
@@ -162,7 +162,7 @@ impl QueueMap {
     /// that a hatch, once present, grows.
     pub fn mutate<R>(
         &self,
-        group: &super::GroupId,
+        group: &crate::groupid::GroupId,
         writer: &impl QueueSnapshotWriter,
         f: impl FnOnce(&mut QueueEntries) -> (R, QueueDirty),
     ) -> R {
@@ -284,14 +284,14 @@ mod tests {
             id,
             agent_id: "w-1".to_string(),
             from: "orch-1".to_string(),
-            payload: super::super::queue::QueuedPayload::Text("hi".to_string()),
-            reason: super::super::queue::EnqueueReason::Arrival,
+            payload: crate::queue::QueuedPayload::Text("hi".to_string()),
+            reason: crate::queue::EnqueueReason::Arrival,
             enqueued_ms: 0,
             coalesced: 0,
             group: Some("g1".try_into().unwrap()),
             to_orchestrator: false,
             session_id: None,
-            delivery_kind: super::super::Delivery::MidSession,
+            delivery_kind: crate::model::Delivery::MidSession,
         }
     }
 
@@ -310,7 +310,7 @@ mod tests {
     }
 
     impl QueueSnapshotWriter for SpyWriter<'_> {
-        fn write_queue_snapshot(&self, group: &super::super::GroupId) {
+        fn write_queue_snapshot(&self, group: &crate::groupid::GroupId) {
             self.writes.borrow_mut().push(group.to_string());
             // `try_lock`, never `lock`: asserting the lock is free must not
             // be able to HANG the suite if it ever stops being free.

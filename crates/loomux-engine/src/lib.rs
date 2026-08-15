@@ -303,6 +303,48 @@
 //! every `atomic_write` call site — resolving through curated item-list
 //! re-exports in `orchestration/mod.rs`, which is why the integration suite
 //! needed no edit.
+//!
+//! A3 batch 10 — the DELIVERY QUEUE: [`queue`], the pure core of the per-pane
+//! FIFO (#445/#468/#467 — admission, coalescing, the flush plan, the
+//! `queue.json` snapshot and its recovery split, the archive, the orphan
+//! derivation), and [`queuestate`], the two mutable maps behind doors that
+//! cannot be opened without paying what opening them costs (#562's
+//! [`queuestate::QueueMap`], whose only `&mut` door writes the snapshot on the
+//! way out, and #497's [`queuestate::DrainerRegistry`], whose only removal is
+//! generation-checked).
+//!
+//! It is the largest module to cross so far and the cheapest to argue, which is
+//! the point worth recording: `queue`'s whole outbound set is `GroupId`,
+//! [`model::Delivery`] and [`text::LOOMUX_NOTICE_MARKER`], and `queuestate`'s is
+//! `GroupId`, `Delivery`, `queue` itself and [`obs::LockExt`] — every one of
+//! them landed here in batches 2, 7 and 8, so nothing had to be lifted ahead of
+//! them. The
+//! two are a **chain, not a cycle** in batch 6's sense (`queuestate` names
+//! `queue`; `queue` never names back), so `queue` could have gone alone; they
+//! travel together because `queuestate` has no other edge and nothing in the
+//! Tauri half to be near, and because splitting them would have put the maps
+//! one batch away from the type they hold.
+//!
+//! Its finding is about the RE-EXPORT rather than the move. Batch 9 re-exported
+//! its two modules as curated item lists (#988), and that was right *there*
+//! because every caller spelled the flat `orchestration::atomic_write`. Here
+//! every caller — `mod.rs` and `src-tauri/tests/orchestration.rs` alike —
+//! spells the MODULE path (`queue::QueuedDelivery`, `queuestate::QueueMap`), so
+//! an item list would not preserve a single call site; the plain module
+//! re-export batch 6 used is the shape that leaves the suite untouched.
+//! #988's trap does not bite, and the reason is measurable rather than
+//! stylistic: **neither file has one `pub(super)` or `pub(crate)` item**, so
+//! the move force-widens nothing. `pub mod queue` already sat under
+//! `pub mod orchestration`, which means `loomux_lib::orchestration::queue::…`
+//! reached exactly this set of items before the move and reaches exactly it
+//! after. The rule to carry: **pick the re-export shape from what the callers
+//! spell, and take the item list when it buys a narrowing that is real** —
+//! curating a list that widens nothing and preserves nothing is ceremony.
+//!
+//! No dependency joins: `serde` and `serde_json` (`queue`), `std` and
+//! [`obs::LockExt`] (`queuestate`), all declared here since batch 3. Both files
+//! are clean under batch 7's macro sweep — no `env!`, `option_env!`, `file!`,
+//! `module_path!` or `include_str!` anywhere in either.
 
 pub mod fsatomic;
 pub mod groupid;
@@ -314,6 +356,8 @@ pub mod model;
 pub mod notify;
 pub mod obs;
 pub mod profiles;
+pub mod queue;
+pub mod queuestate;
 pub mod report;
 pub mod subproc;
 pub mod termgrid;

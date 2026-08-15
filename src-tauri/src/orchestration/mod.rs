@@ -19,8 +19,6 @@ pub mod intake;
 pub mod mcp;
 pub mod mqdriver;
 pub mod mqloop;
-pub mod queue;
-pub mod queuestate;
 
 // MOVED to the `loomux-engine` crate (#888 slice A2), re-exported here under
 // their original paths — whatever a call site in this crate or in the
@@ -231,6 +229,56 @@ pub use loomux_engine::subproc::{
     gh_capture_parked_readers, seed_leaked_readers_for_test,
 };
 pub(super) use loomux_engine::fsatomic::atomic_write;
+
+// #888 slice A3 batch 10 — the delivery queue:
+// - `queue`, the pure core of the per-pane FIFO (#445/#468/#467): admission and
+//   coalescing, the flush plan, the `queue.json` snapshot and its recovery
+//   split, the archive, and the audit-derived orphan view.
+// - `queuestate`, the two mutable maps this file used to hold as plain fields
+//   (#562/#497): `QueueMap`, whose only `&mut` door writes the snapshot on the
+//   way out, and `DrainerRegistry`, whose only removal is generation-checked.
+//   Its module doc argues the file boundary IS the mechanism — the maps are
+//   private to a module rather than to this 30k-line one — and that argument
+//   survives the move unchanged, since it was never about which crate the
+//   module sits in.
+//
+// A chain, not a cycle (batch 6's distinction): `queuestate` names `queue`,
+// `queue` never names back, so `queue` could have moved alone. They travel
+// together because `queuestate`'s only other edges are `GroupId` and
+// `crate::obs::LockExt` — both across since batches 2 and 7 — and because the
+// maps have nothing left in the Tauri half to be near. `queue`'s own outbound
+// set is three items, all likewise already across: `GroupId` (batch 2),
+// `Delivery` and `LOOMUX_NOTICE_MARKER` (batch 8). The impure half stays here
+// and is unaffected: `enqueue_text`, `deliver_now`, `run_queue_drainer`,
+// `persist_queues`, `readmit_recovered` all still spell `queue::…` /
+// `queuestate::…` through the line below.
+//
+// The re-export is the plain MODULE form rather than batch 9's curated item
+// list, and the choice is measured rather than stylistic. Every consumer — this
+// file and `src-tauri/tests/orchestration.rs` alike — spells the module path
+// (`queue::QueuedDelivery`, `queuestate::QueueMap`), never a flat
+// `orchestration::…` name, so an item list would preserve no call site at all.
+// #988's visibility trap is what a curated list buys protection from, and there
+// is nothing here for it to catch: neither file has a single `pub(super)` or
+// `pub(crate)` item, so the crate boundary force-widens NOTHING, and the
+// private members of each (`lenient_group_id`, `flush_cause_clause`,
+// `constituent_banner`, `age_clause`, `archive_line_version`,
+// `FLUSH_ITEM_OVERHEAD`, `QueueDirty::write_needed`, and both maps' `inner`
+// fields) stay private in the engine. `pub mod queue` already sat under
+// `pub mod orchestration`, so `loomux_lib::orchestration::queue::…` reached
+// exactly this set before the move and reaches exactly it after.
+//
+// Stated precisely, because "unchanged" is the word model.rs:61-73 exists to
+// correct and it would be wrong here too if left bare: NO ITEM WIDENED — not
+// one visibility keyword in either file differs from what it was — and the
+// `orchestration::` spelling reaches the identical set. What IS new is a second
+// spelling, `loomux_engine::queue::…`, and that is inherent to crossing the
+// boundary at all rather than a consequence of the re-export shape: an item
+// must be `pub` in the engine to be callable from here, and every batch since
+// batch 2 has added the same. Harmless on the same terms — `loomux-engine` is
+// `publish = false`, so "public" means reachable by a sibling crate in this
+// workspace, not a shipped API.
+pub use loomux_engine::{queue, queuestate};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};

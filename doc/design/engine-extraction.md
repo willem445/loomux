@@ -796,6 +796,143 @@ from a unit test of product code, agents are banned from running cargo locally
     **`src-tauri/tests/` is untouched**, which is the proof the re-export surface is complete
     rather than a claim about it. The `#[doc(hidden)]` seams travel with their
     cluster; no test moved crate, since the cluster's coverage was never inline.
+  - **Batch 10 — the delivery queue: `queue`, `queuestate`.** The pure core of
+    the per-pane FIFO (#445/#468/#467 — admission and coalescing, the flush
+    plan, the `queue.json` snapshot and its recovery split, the archive, the
+    audit-derived orphan view) and the two mutable maps `orchestration/mod.rs`
+    used to hold as plain fields (#562's `QueueMap`, whose only `&mut` door
+    writes the snapshot on the way out; #497's `DrainerRegistry`, whose only
+    removal is generation-checked).
+
+    `queuestate`'s module doc argues that the **file boundary is the
+    mechanism** — Rust's privacy is per-module, and `mod.rs` is one 30k-line
+    module, so "the only way to mutate `queues` is through the sanctioned path"
+    became a claim `rustc` checks only once the maps lived in a module of their
+    own. That argument survives this move untouched, because it was never about
+    which *crate* the module sits in. Worth stating rather than assuming: a
+    refactor that relocates the thing an invariant is spelled in should say
+    whether the invariant still holds, and here it does, for the same reason it
+    did before.
+
+    A **chain, not a cycle**, in batch 6's sense: `queuestate` names `queue` and
+    `queue` never names back, so `queue` could have moved alone. They travel
+    together because `queuestate`'s only other edges are `GroupId` and
+    `obs::LockExt`, and because the maps have nothing left in the Tauri half to
+    be near — a judgement, not a constraint, and batch 6's rule is that a batch
+    which cannot say which of the two shapes it is has not drawn its own line.
+
+    ### The re-export shape is a call-site measurement, not a house style
+
+    Batch 9 re-exported as **curated item lists** (#988) and this batch uses the
+    plain **module** form batch 6 used — `pub use loomux_engine::{queue,
+    queuestate};` — and the difference between them is worth having, because
+    "always curate" reads like the safer rule and is not.
+
+    A curated item list buys exactly one thing: it stops a module's newly-`pub`
+    items from becoming reachable under an `orchestration::…` path they never
+    had. That was real in batch 9, whose `atomic_write` was `pub(super)` and had
+    to widen. Here it buys nothing and costs everything. **Neither `queue.rs`
+    nor `queuestate.rs` contains a single `pub(super)` or `pub(crate)` item**,
+    so the crate boundary force-widens nothing at all; each file's private
+    members — `lenient_group_id`, `flush_cause_clause`, `constituent_banner`,
+    `age_clause`, `archive_line_version`, `FLUSH_ITEM_OVERHEAD`,
+    `QueueDirty::write_needed`, and both maps' `inner` fields — stay private in
+    the engine exactly as they were. And `pub mod queue` already sat under
+    `pub mod orchestration`, so `loomux_lib::orchestration::queue::…` reached
+    precisely this set of items before the move and reaches precisely it after.
+
+    That last sentence is deliberately scoped, because the unscoped version of
+    it is the error `model.rs`'s standing correction is about and this batch is
+    the one most tempted by it. The two claims worth separating: **no item
+    widened** — not one visibility keyword in either file differs from what it
+    was, which is the strong claim earlier batches could not make and is true
+    here only because there was nothing to widen — and **the `orchestration::`
+    spelling reaches the identical set**. What is *not* claimed is that nothing
+    became reachable anywhere: `loomux_engine::queue::…` is a new spelling, as
+    `loomux_engine::model::…` and every predecessor was, because an item must be
+    `pub` in the engine to cross the boundary at all. That is inherent to the
+    move rather than to the re-export shape — a curated item list would not have
+    prevented it either — and it is harmless on the standing terms:
+    `loomux-engine` is `publish = false`, so "public" means reachable by a
+    sibling crate in this workspace, not a shipped API. **A batch that says
+    "reachability unchanged" without naming which spelling it means has
+    over-claimed**, and the item-list batches are not exempt from that either.
+
+    The cost side is what settles it. Every consumer — `mod.rs` and
+    `src-tauri/tests/orchestration.rs` alike — spells the MODULE path
+    (`queue::QueuedDelivery`, `queuestate::QueueMap`), never a flat
+    `orchestration::…` name, because these modules were always `pub mod`
+    rather than items lifted out of `mod.rs`. A flat item list would therefore
+    preserve **no** call site, and rewriting the integration suite to suit the
+    re-export style would forfeit the per-PR bar (zero test edits) that is the
+    evidence the move is behaviourally silent. The rule to carry into batches
+    11–12: **pick the re-export shape from what the callers spell, and take the
+    item list when it buys a narrowing that is real.** A curated list that
+    widens nothing and preserves nothing is ceremony, and ceremony that edits
+    the test suite is worse than none.
+
+    ### Edges, dependencies, macros
+
+    Every outbound edge was already across, which is why this batch is large in
+    lines and small in argument. `queue` reaches `GroupId` (batch 2),
+    `model::Delivery` (batch 8) and `text::LOOMUX_NOTICE_MARKER` (batch 8);
+    `queuestate` reaches those, `queue` itself, and `obs::LockExt` (batch 7).
+    Nothing had to be lifted ahead of them. Every edit inside the two files is
+    the prefix on one of those paths — `super::GroupId` → `crate::groupid::
+    GroupId`, `super::Delivery` → `crate::model::Delivery`,
+    `super::LOOMUX_NOTICE_MARKER` → `crate::text::LOOMUX_NOTICE_MARKER` (the
+    live check and its intra-doc link both), `super::queue::…` → `crate::queue::
+    …` — plus the same rewrite inside the moved `#[cfg(test)]` modules, whose
+    `super::super::` reached `orchestration` and now would reach the crate root.
+
+    No dependency joins: reading the files' own `use` lines gives `serde` and
+    `serde_json` for `queue`, `std` plus `obs::LockExt` for `queuestate`, all
+    declared since batch 3 — batch 5's process rule applied rather than
+    repeated. Batch 7's macro sweep is clean: no `env!`, `option_env!`, `file!`,
+    `module_path!` or `include_str!` appears anywhere in either file, which
+    matters because `queue`'s `SNAPSHOT_VERSION`/`ARCHIVE_LINE_VERSION` are
+    hand-written constants rather than anything derived from the crate's own
+    version — had either been an `env!`, the engine's placeholder `0.0.0` would
+    have silently re-versioned every snapshot on disk.
+
+    Batch 2's question — where can the violation be spelled now? — is asked and
+    answered nil. `tests/groupid.rs`'s scan already walks both source roots, so
+    a file moving between two scanned roots changes nothing it can see, and
+    neither file joins a group id onto a path: `queue`'s only `GroupId` uses are
+    a struct field and the lenient deserializer that routes a persisted string
+    back through `GroupId::parse`, which is the gate working as designed.
+
+    ### What it owed in evidence
+
+    A **pure relocation**, exemption taken whole. Nothing is added or changed;
+    every behaviour the move could break is pinned by tests that neither moved
+    nor were edited. `src-tauri/tests/orchestration.rs` drives the queue's whole
+    policy surface through the re-export — admission and the coalesce, the
+    capacity/pressure notices, the flush plan and its stranded-marker arm, the
+    `queue.json` snapshot round-trip and `split_recovered`'s marker/entry split,
+    the archive round-trip, and the orphan derivation — and the two files' own
+    inline `#[cfg(test)]` modules (including `queue`'s four property suites and
+    `queuestate`'s real-removal tests) travel with them and are engine unit
+    tests now. **`src-tauri/tests/` is untouched**, which is the proof the
+    re-export surface is complete rather than a claim about it.
+
+    ### Remaining same-tier edges
+
+    What stays in `src-tauri` and still reaches these modules, so the next batch
+    does not have to re-derive it: `mod.rs`'s impure half — `enqueue_text`,
+    `deliver_now`, `run_queue_drainer`, `persist_queues`,
+    `recover_persisted_queue`/`readmit_recovered`, the depth/pressure emitters
+    and the orphan command — spells `queue::…` and `queuestate::…` unchanged and
+    compiles against the re-export. That is a completed move seen from the
+    caller's seat, not a remaining problem (batch 9's correction, restated
+    because it is the sentence that keeps being written wrong).
+    `queuestate::QueueSnapshotWriter` is implemented for `OrchRegistry` in
+    `mod.rs` and for the module's own `SpyWriter` in the engine, and the
+    `src-tauri` half staying behind is fine — the trait *is* the seam, the impl
+    is a local type impling a foreign trait so the orphan rule is satisfied, and
+    an inbound edge never blocks a move. What is genuinely still same-tier is
+    `mqloop` → `mqdriver`, unchanged since batch 9 — two files at the same stage
+    of the extraction, which move together in a later batch.
 - **A4 — the registry.** `OrchRegistry`, the decision layer, and a PTY
   output-sink seam, so the crate compiles with no `tauri` anywhere in its tree.
   A CI step proves that from `cargo tree` rather than from this paragraph. This
