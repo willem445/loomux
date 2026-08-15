@@ -1710,7 +1710,14 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
    is what the flex row it replaced did and the behaviour the narrow case actually wants.
    Alignment survives the wrap: every row resolves the same track count at the same width,
    so the columns still agree down the card. `min()` guards the degenerate case where even
-   one minimum-width track does not fit. */
+   one minimum-width track does not fit.
+
+   THE BUDGET, because the headroom is thinner than it looks and nothing here is testable:
+   the card's content box is 580 − 36 padding − 2 border = 542px, and staying 4-up costs
+   4 × 9rem + 3 × 6px gap = 486px at 1rem = 13px. ~56px spare across four tracks. Raise this
+   minimum much past 9rem — or add card padding — and the row silently returns to 3-up with a
+   lone fourth field below it, which is the exact layout #1020 item 3 removed. Both numbers
+   are spent from the same 542px; move one and re-check the other. */
 .dlg-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 9rem), 1fr)); }
 /* #687: a per-role row is [cli] [model] [thinking level] [context]. It wrapped raggedly at
    the old 440px — four roles becoming eight lines whose fields never aligned, which is most
@@ -1727,7 +1734,11 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
    Uniform tracks are what let `auto-fit` wrap at all, and the picker degrades the best of
    the four — it ellipsizes a long id and still opens to full width, while a truncated
    `<select>` label is just unreadable. None of this reaches a terminal (constraint 1 — the
-   setup card is a form inside a pane, never a split). */
+   setup card is a form inside a pane, never a split).
+
+   Same budget as `.dlg-grid` above, with more room: 4 × 7.5rem + 18px = 408px of the card's
+   542px content box. The guardrail row is the tight one — check it first when either number
+   moves. */
 .role-row {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(min(100%, 7.5rem), 1fr));

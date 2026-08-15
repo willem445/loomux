@@ -406,3 +406,40 @@ export function capacityWarning(r: ResolvedRoster, maxAgents: number): string | 
     `live alongside a review round. Raise it to ${target}${overCeiling}.`
   );
 }
+
+/**
+ * The CLI the group's ORCHESTRATOR PANE will actually run — the one pane a launch opens
+ * (#1020 item 5 removed the starter workers), resolved from the roster rather than from any
+ * form control. `null` means "not answerable yet", and a caller must treat that as *say
+ * nothing* rather than as a default.
+ *
+ * **This exists so there is ONE answer to "which CLI does the launch run", not three.** The
+ * setup card's preview has now been wrong twice, both times for the same underlying reason:
+ * it derived the CLI from a control, while the launch derives it from the resolved roster.
+ * First it read the group-default picker (`agentSel`) while the pane launches on the
+ * per-role one; fixing that to read the role select left it wrong again the moment the
+ * advanced toggle is on, because `create_group_ex` then REPLACES the form's blocks with the
+ * declared file's (`guardrails.blocks = wf.blocks`) and the role select is ignored outright.
+ * Each fix was correct for the case it named and produced the next twin, because the
+ * mismatch was never in which control — it was in reading a control at all.
+ *
+ * So the resolution is the roster's, and the roster is already this module's job:
+ * {@link resolveRoster} is the frontend's mirror of what the backend will do (this file's
+ * header: "it has to say the same thing the backend will do"), and its `blocks` are the
+ * form's picks in the builtin/none/invalid cases and the FILE's in the declared one —
+ * exactly the substitution `create_group_ex` makes. Reading the orchestrator block out of
+ * *that* is the same two steps `register_orchestrator_pane` takes
+ * (`workflow::cli_of(block_for(Orchestrator), guardrails.agent_cli)`: the block's own `cli`,
+ * else the group default), so a future change to what a launch runs cannot desynchronize the
+ * two without also changing the roster box the human is reading directly beneath the badge.
+ *
+ * `null` for a roster with no orchestrator block. The backend guarantees one — the preview
+ * runs the same clamp, which synthesizes it — so this is unreachable today rather than a
+ * case with a right answer; it fails closed because the alternative is inventing a CLI for a
+ * roster that does not name one, which is the whole failure mode above.
+ */
+export function orchestratorCliOf(roster: ResolvedRoster, groupCli: string): string | null {
+  const block = roster.blocks.find((b) => b.kind === "orchestrator");
+  if (!block) return null;
+  return block.cli.trim() || groupCli.trim() || null;
+}

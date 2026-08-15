@@ -32,24 +32,24 @@ export interface SetupPreviewInput {
    *  which is a real choice rather than an unfilled field. */
   sshCli: string;
   /**
-   * The ORCHESTRATOR ROLE's own CLI select, in orchestrator mode. Ignored for every other
-   * kind, and `""` means "this role does not override the group default".
+   * In orchestrator mode: the CLI the orchestrator pane will actually run, ALREADY RESOLVED
+   * — `orchestratorCliOf(roster, groupCli)` (src/roster.ts). `null` means the answer is not
+   * available yet, and this module draws nothing for it. Ignored for every other kind.
    *
-   * Separate from `agentId` because in orchestrator mode the two are different controls
-   * answering different questions, and only this one describes the pane that opens (#1020
-   * rev-740 blocking 1). `agentId` is the GROUP DEFAULT — it seeds every role and is what a
-   * declared block with no `cli:` inherits — while the orchestrator pane is launched on
-   * `orchestratorCli` (`create_orchestration`'s per-role override, issue #4). Changing the
-   * role's select alone leaves them disagreeing, and the pane that appears wears the role's
-   * CLI. Previewing the group default there is the one thing this module refuses to do
-   * anywhere else: a confident wrong answer.
+   * **A resolved answer rather than a control, and that distinction is the fix** (#1020
+   * rev-740 blocking 1 and 1b). This preview was wrong twice, both times because it read a
+   * form control while the launch reads the resolved roster: first the group-default picker
+   * when the pane launches on the per-role one, then the per-role select when the advanced
+   * toggle makes `create_group_ex` discard the form's blocks for the declared file's
+   * entirely. Every such fix names a control and produces the next twin. Taking the roster's
+   * own answer ends the class — the two cannot disagree, because there is only one
+   * resolution and the human is already reading its output in the roster box below.
    *
-   * Empty inherits `agentId`, which is the backend's own rule for this field verbatim
-   * ("Per-role CLI overrides. Empty inherits `agent_cli`") rather than a second reading of
-   * it — the preview has to resolve the CLI the same way the spawn does or it is guessing
-   * again, one level down.
+   * Hence `null` is a real state rather than a defensive `?`: a roster resolves
+   * asynchronously (the backend reads the repo), and a badge drawn from the previous repo's
+   * answer would be the same confident-wrong-answer one refresh later.
    */
-  orchestratorCli: string;
+  orchestratorCli: string | null;
 }
 
 /** The Agent picker's escape hatch, whose command the human types themselves. */
@@ -88,12 +88,12 @@ export const ICON_SETUP_PREVIEW_PX = 20;
  *   * **`agent`, `custom…`, box filled** — read the command, exactly as a pane does. Which
  *     means a path-qualified or `.exe`-suffixed first token resolves (`programFromRestore`,
  *     via `agentMark`), a shell or transport lands neutral, and gibberish lands neutral.
- *   * **`orchestrator`** — the ORCHESTRATOR ROLE's CLI, falling back to the group default
- *     when that role overrides nothing. Not the group default itself: the launch opens
- *     exactly one pane (since #1020 removed the starter workers), that pane runs
- *     `orchestrator_cli`, and the two controls diverge the moment the role row is touched.
- *     `custom…` is not selectable there (the form re-picks a supported CLI), so it is
- *     refused here too rather than badged `C` for "custom".
+ *   * **`orchestrator`** — the CLI the RESOLVED ROSTER gives the orchestrator block, handed
+ *     in already worked out (`orchestratorCliOf`); no form control is read. That roster is
+ *     the form's per-role picks in the ordinary case and the declared workflow file's blocks
+ *     when the advanced toggle is on, which is exactly the substitution the backend makes —
+ *     so the badge cannot disagree with the pane, or with the roster box beneath it. Nothing
+ *     resolved yet ⇒ nothing drawn. `custom…` is refused, never badged `C`.
  *   * **`ssh`, a remote CLI chosen** — that CLI, as the AUTHORITATIVE answer, which is what
  *     `knownCli` means: the launch line will be the local ssh client, so reading it would
  *     name the transport. `remote` rides along for the same reason it does on a live pane.
@@ -113,15 +113,14 @@ export function setupPreviewMark(input: SetupPreviewInput, size?: number): Agent
   const agentId = input.agentId.trim();
 
   if (kind === "orchestrator") {
-    // The ROLE's CLI, not the group default — the pane this launch opens is the
-    // orchestrator, and `create_orchestration` spawns it on `orchestrator_cli`. Empty
-    // inherits the group default, which is the backend's own rule for the field, so the
-    // preview resolves the CLI by the same two steps the spawn does.
-    const cli = input.orchestratorCli.trim() || agentId;
+    // Whatever the roster resolved, and nothing else — no control is consulted here, which
+    // is the point (see `orchestratorCli`). `null` (not resolved yet, or a roster naming no
+    // orchestrator) draws nothing rather than falling back to a form value: a fallback is
+    // how this went wrong twice.
+    const cli = input.orchestratorCli?.trim();
     // Orchestrator mode never runs a hand-typed command line — the group's blocks are
-    // spawned from a supported CLI's adapter — so `custom` there is a transient value the
-    // form is about to overwrite, not a choice with a program behind it. Checked on the
-    // RESOLVED cli rather than on `agentId`, so it holds whichever of the two supplied it.
+    // spawned from a supported CLI's adapter — so `custom` is a transient value the form is
+    // about to overwrite, not a choice with a program behind it.
     return cli && cli !== CUSTOM ? agentMarkFor(cli, size) : null;
   }
 

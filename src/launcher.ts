@@ -40,6 +40,7 @@ import {
   capacityRaiseTarget,
   capacityWarning,
   describeBlock,
+  orchestratorCliOf,
   resolveRoster,
   type OrchRole,
   type ResolvedRoster,
@@ -378,6 +379,10 @@ export class WelcomeForm {
    *  whenever `maxAgentsInput` changes, so the #255 capacity warning tracks the
    *  cap live as the human types without waiting on a new preview. */
   private lastRoster: ResolvedRoster | null = null;
+  /** Whether {@link lastRoster} still describes the form's CURRENT inputs. False across a
+   *  re-resolve's async gap, so the card's CLI badge — which is derived from the roster
+   *  (#1020 rev-740 1b) — says nothing rather than describing the inputs it had before. */
+  private rosterFresh = false;
   /** One backend preview per (repo, group CLI), memoized for the form's life. */
   private previews = new Map<string, Promise<WorkflowPreview | null>>();
   /** Monotonic token: a preview that resolves after the human has moved on
@@ -981,20 +986,19 @@ export class WelcomeForm {
    *  is the one rule `agenticons` §Safety asks every consumer to keep (`src/pane.ts`'s
    *  `refreshAgentMark` is the same eight lines, deliberately). */
   private paintPreview(): void {
-    const orchRoleCli = this.roleControls.find((rc) => rc.key === "orchestrator");
+    // The RESOLVED roster's answer, never a control's (#1020 rev-740 1b). `rosterFresh` is
+    // false while a re-resolve is in flight, so the badge goes blank rather than describing
+    // the previous repo/toggle state for a beat — the same fail-closed rule the module
+    // applies to every other ambiguous state. `lastRoster` is null off the orchestrator
+    // kind, where nothing reads this field anyway.
+    const roster = this.rosterFresh ? this.lastRoster : null;
     const view = setupPreviewMark(
       {
         kind: this.kind,
         agentId: this.agentSel.value,
         customCommand: this.customInput.value,
         sshCli: this.sshCliSel.value,
-        // The control the ORCH pane is actually launched from (`orchestratorCli` in the
-        // submitted config), not the group default beside the title. Resolved through
-        // `orchCliFor` — the same call `rolePicks` makes for that field — so the preview and
-        // the submitted value cannot disagree even on a role select holding something the
-        // catalog does not know. That equality is the whole finding; deriving it a second,
-        // similar-looking way is how it would come back.
-        orchestratorCli: orchRoleCli ? orchCliFor(orchRoleCli.cli.value).id : "",
+        orchestratorCli: roster ? orchestratorCliOf(roster, orchCliFor(this.agentSel.value).id) : null,
       },
       ICON_SETUP_PREVIEW_PX
     );
@@ -1299,8 +1303,16 @@ export class WelcomeForm {
     if (this.kind !== "orchestrator") {
       this.rosterEl.replaceChildren();
       this.lastRoster = null;
+      this.rosterFresh = false;
       return;
     }
+    // Whatever `lastRoster` says describes the inputs as they were BEFORE this call, and
+    // the CLI badge is derived from it (#1020 rev-740 1b). Mark it stale for the whole of
+    // the async gap: a badge is a claim, and one made from the previous repo's workflow
+    // file is the same wrong answer this finding is about, just briefer. The roster BOX
+    // keeps its old contents deliberately — prose that lingers a beat reads as stale, a
+    // brand mark reads as an answer.
+    this.rosterFresh = false;
     const advanced = this.advancedInput.checked;
     const repo = this.repoInput.value.trim();
     const cli = orchCliFor(this.agentSel.value).id;
@@ -1337,6 +1349,11 @@ export class WelcomeForm {
    *  noise in the form's default state. */
   private paintRoster(r: ResolvedRoster, advanced: boolean): void {
     this.lastRoster = r;
+    this.rosterFresh = true;
+    // The roster IS the preview's source now, so the badge repaints wherever the roster
+    // lands — including the async arrival, which is the only route by which a declared
+    // workflow file's CLI ever reaches this form (#1020 rev-740 1b).
+    this.paintPreview();
     const rows: HTMLElement[] = [];
     const line = (cls: string, text: string): HTMLElement => {
       const el = document.createElement("div");
