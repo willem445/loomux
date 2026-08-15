@@ -243,9 +243,12 @@ same `mergeModelOptions` the probe reply does, so the machine's answer leads and
 the curated entries stay behind it — which keeps the property `orchclis.test.ts`
 names, that a role's default is still on the menu afterwards.
 
-## Why detection is a human gesture, not a paint
+## Credit safety: why detection was a human gesture, and why it is now automatic
 
-This is the load-bearing decision in the slice, and it is a constraint-3 call.
+This is the load-bearing decision in the feature, and it is a constraint-3 call.
+It was decided one way in #993 and the other way in #1002; both readings are
+recorded here, because the second is only defensible given what the first was
+waiting for.
 
 Anthropic **types the control envelope** (`SDKControlRequest`,
 `SDKControlListModelsRequest = { subtype: 'list_models' }`, `ModelInfo`) in
@@ -256,18 +259,62 @@ passes is documented at <https://code.claude.com/docs/en/cli-reference>.
 But the string `list_models` appears **nowhere** in Anthropic's documentation
 corpus. The claim that it is a metadata message which does **not consume
 completion credits** is third-party (`stablyai/orca`, MIT) and therefore
-UNVERIFIED — docs-are-silent, not docs-say-X.
+UNVERIFIED by the vendor — docs-are-silent, not docs-say-X. **That is still true
+and nothing below changes it.**
 
-If that claim is wrong, an automatic probe spends the human's money every time a
-model picker paints. So it is not automatic:
+#993 took the conservative reading: if the claim is wrong, an automatic probe
+spends the human's money every time a model picker paints, so `list_cli_models`
+was reachable only from a `detect` button, and the automatic model list stayed
+exactly what `cliprobe.rs` made it. The flip was left as a follow-up gated on the
+**human** live-validating the cost — that validation being theirs, never an
+agent's.
 
-- `list_cli_models` is reached **only** from a `detect` button in the picker;
-- the automatic model list is exactly what `cliprobe.rs` already made it;
-- the memo (`ModelCatalog.detect`) makes a second click read a cached answer
-  rather than spawn a second CLI.
+**#1002 is that validation, and the direction that followed it.** The human
+validated the cost themselves and directed that detection become automatic and
+interaction-free, with **no re-ask affordance** — a restart re-detects. This is
+recorded as **human-directed** rather than as an engineering conclusion, and the
+distinction matters: no agent may re-derive it, widen it to another CLI's control
+protocol, or restore a re-ask button on its own reasoning. A new protocol row is
+a new cost question, and it goes back to the human.
 
-Flipping detection to automatic-on-open is a follow-up, gated on the **human**
-live-validating the cost — that validation is theirs, never an agent's.
+### Why the command cannot spawn
+
+Making detection automatic is not the same as making the *command* automatic,
+and #1020 deliberately did the smaller thing. Two shapes were available:
+
+**A — keep `list_cli_models` an ASK, ration it with a memo.** The startup sweep
+primes the memo; a picker that opens before the sweep has answered starts its
+own ask, which the memo and a single-flight gate collapse. Its attraction is
+mid-run recovery: a CLI installed after boot is picked up on the next paint.
+
+**C — make `list_cli_models` a LOOKUP that cannot spawn at all.** The startup
+sweep is the only spawn site; a picker that opens early is told there is nothing
+yet, and the answer reaches it on the `models-detected` event moments later.
+
+**C shipped.** A puts a subprocess spawn back on a render path — precisely the
+boundary #993 drew — and then needs two separate guards to keep it safe (the
+gate, and a frontend once-per-program bound), each of which is a thing a later
+edit can quietly remove. C deletes the path instead, so the property "no render
+path can spend the human's money" is enforced by there being no code that could,
+not by a guard that has to keep being right. When the underlying claim is
+UNVERIFIED, the shape whose safety does not depend on a guard is the one to
+take.
+
+C's cost is A's attraction: **a CLI installed after loomux started is not
+detected until the next restart.** That is acceptable only because the human
+already accepted it in the same direction that asked for no re-ask affordance.
+It is not a general licence to trade recovery for simplicity elsewhere.
+
+### What still bounds it
+
+- One sweep per app run, started from Tauri `setup`, sequential
+  (`modelwire::start_startup_sweep`).
+- Only CLIs with a `PROTOCOLS` row — one today (`claude`). A CLI without one is
+  never spawned for a list it has no way to give.
+- Failures and empty replies are never memoized, so the memo cannot serve a bad
+  moment as this CLI's answer for the rest of the session.
+- `ModelCatalog.detect` issues at most one lookup per CLI per app run, so a form
+  that repaints costs no IPC — the bound that replaced the click.
 
 ## The backend transports; the frontend parses
 
@@ -345,10 +392,29 @@ validator rejects.** The launcher never had the bug (`applyRoleModels` →
 Because this is DOM wiring — which this repo validates by hand rather than by
 simulating a DOM — the pin is a **source scan** (`test/detectrefresh.test.ts`),
 in the tradition of `transport.test.ts`'s one-importer rule and `groupid.rs`'s
-two scans. It asserts that **every** `onDetect` handler in each host reaches the
+two scans. It asserts that **every** call site in each host reaches the
 refreshers by name, and carries a vacuity guard so a broken extraction fails
 loudly instead of passing. The next such handler will be written by copy-paste
 from a neighbour rather than by reading this note; a scan is what notices.
+
+Since #1020 the reply arrives on two routes rather than from one button — the
+lookup a picker fires when it paints, and the sweep's push
+(`ModelCatalog.onReport`) — so each host funnels **both** into one method
+(`applyDetection`, `refreshRoleFromDetection`) and the scan pins that funnel plus
+the two routes into it. Two properties are new with the automatic architecture,
+and neither existed to be got wrong before:
+
+- **The lookup fires from a render path and its refresh ends in a re-render**, so
+  an unguarded handler is an infinite loop rather than a stale row. Two
+  independent exits are required and both are pinned: an early-out on an answer
+  that carried nothing (which never sets `report()`, so the other guard would
+  never fire), and a guard on `report()` being absent (which a good answer would
+  otherwise pass on every repaint).
+- **A push subscription must be able to say it is dead.** Neither host has a
+  teardown `ModelCatalog` can rely on — a launcher form is discarded with its
+  pane — so `onReport`'s callback returns its own liveness and a `false` drops
+  it. Without that, every discarded form leaves a subscription repainting
+  detached DOM for the rest of the app run.
 
 The file's header enumerates what the instrument cannot do — reachability, not
 behaviour; source, not module graph — because a structural test that reads as
@@ -403,12 +469,16 @@ caret, so `ModelPicker.editingCustom` is the question both hosts ask. But
 launcher that was permanent — `applyRoleModels` is otherwise reachable only from
 the role's CLI `change` listener and the seed pass, so a detection landing
 mid-type never reached that role's dropdown again for the dialog's life, and the
-human saw a `detect` click do nothing (#997 review NB-3). `runWhenNotEditing`
+human saw detection do nothing (#997 review NB-3). `runWhenNotEditing`
 owns both halves now: run it, or run it on the input's next `blur`. The
-predicate stays deliberately narrower than "focus is somewhere in this picker" —
-a detection is *started* by clicking a button inside the control, so the broad
-test is true on every detect path and would suppress the very rebuild the click
-asked for.
+predicate stays deliberately narrower than "focus is somewhere in this picker":
+the hazard is the text input specifically, and a human whose focus is merely on
+the `<select>` loses nothing to a rebuild that re-selects the same value.
+
+#1020 **widens** this window rather than closing it. Under #993 the reply landed
+a second or two after a click the human had just made; now it arrives on the
+startup sweep's schedule, so they are more likely to be mid-type when it does,
+not less — which is why the deferral survived the button that motivated it.
 
 ## The context-window table, and why one exists at all
 
@@ -455,8 +525,10 @@ picked id is what gets asked. `test/modelnames.test.ts` pins both halves.
 
 | seam | shape | who calls it |
 | --- | --- | --- |
-| `list_cli_models` (`modelwire.rs`) | `{ output, request_id, error }` | `pty.ts`'s `listCliModels` |
+| `list_cli_models` (`modelwire.rs`) | `{ output, request_id, error }` — a LOOKUP since #1020, never a spawn | `pty.ts`'s `listCliModels` |
 | `parseListModelsReply` (`modelwire.ts`) | stdout + id to `ModelReport` | `readCliModelReply` |
-| `ModelCatalog.detect` | memoized, never rejects | the picker's `detect` button, only |
+| `ModelCatalog.detect` | one lookup per CLI per app run, never rejects | both hosts' picker paint path |
+| `ModelCatalog.acceptReport` / `onReport` | the sweep's push, and liveness-pruned listeners | `modelprobe.ts`, both hosts |
+| `models-detected` (event) | `{ program, reply }` | `pty.ts`'s `onModelsDetected` |
 | `ModelCatalog.detail` | `(cli, id)` to a `ModelDetail` or `null` | the picker's labels, `knobState` |
 | `knobState(caps, cli, model, detail?)` | optional 4th arg, defaults to today's behaviour | launcher + workflow pane |
