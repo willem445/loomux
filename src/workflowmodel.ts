@@ -93,6 +93,66 @@ export function roleHintRequires(hint: string): BlockKind | undefined {
   return undefined;
 }
 
+/** The role hints a block of THIS kind may legally declare — derived from
+ *  {@link ROLE_HINTS} and {@link roleHintRequires}, never listed a second time.
+ *
+ *  That derivation is the whole point (#1020): the form that offers these must not
+ *  be able to spell something the parser rejects, and the only way to guarantee it
+ *  is for the offer and the rule to be the SAME statement. A hint added to
+ *  `ROLE_HINTS` (with its pairing in `roleHintRequires`) shows up here — and so in
+ *  the pane — with no edit at all; a hardcoded picker would silently keep offering
+ *  the old two while `validateWorkflow` had moved on. */
+export function roleHintsForKind(kind: string): RoleHint[] {
+  return ROLE_HINTS.filter((h) => roleHintRequires(h) === kind);
+}
+
+/** Why a block of this kind may NOT declare `allow:`, or `null` when it may.
+ *
+ *  Mirrors the two REFUSALS in `parse_workflow` (workflow.rs), which are separate
+ *  rules with separate reasons and are stated here as one answer so the pane's form
+ *  and its validation pass cannot disagree about them:
+ *
+ *   - an ORCHESTRATOR block may not declare `prompt:`/`profile:`/`allow:` at all —
+ *     it is the group's trust root, and a repo file that could pre-approve its
+ *     tools would be a prompt-injection seam into the one agent running
+ *     unsupervised;
+ *   - a READ-ONLY class (today: `planner`, via `Role::containment`) may not, because
+ *     `allow: Bash(python *)` hands it a shell that writes files while naming
+ *     nothing on the deny list. Reviewers and workers keep `allow:` — a reviewer has
+ *     its shell by design (running the tests is the job).
+ *
+ *  An UNRECOGNIZED kind answers `null`: `unknown-kind` already says what is wrong
+ *  with that block, and stacking a second finding on top of it explains nothing. */
+export function allowDenialReason(kind: string): string | null {
+  if (kind === "orchestrator") {
+    return (
+      "the orchestrator is loomux's trust root, and a repo file may not pre-approve its tools — " +
+      "put personas and allow: patterns on the blocks it spawns"
+    );
+  }
+  if (kind === "planner") {
+    return (
+      "a planner's class is read-only, and a pre-approved tool pattern could hand it a shell " +
+      "that writes files — move the work to a worker block"
+    );
+  }
+  return null;
+}
+
+/** What the engine will actually apply for one `allow:` entry, or `null` when it
+ *  drops the entry entirely. Mirrors `sanitize_allow` (profiles.rs): everything
+ *  outside its alphabet is FILTERED OUT — silently, on the way to the CLI's
+ *  `--allowedTools` / `--allow-tool` flag — so a pattern carrying a `$`, a `|` or a
+ *  quote reaches the agent as a different pattern than the one in the file, and the
+ *  human never hears about it. The pane says so instead (`allow-sanitized`). */
+export function sanitizeAllowPattern(pattern: string): string | null {
+  const cleaned = pattern
+    .trim()
+    .replace(/[^A-Za-z0-9():*_\-. ,/]/g, "")
+    .trim();
+  return cleaned || null;
+}
+
 /** The schema version this build reads and writes. */
 export const WORKFLOW_VERSION = 1;
 
@@ -113,6 +173,64 @@ export type GateRequire = (typeof GATE_REQUIRES)[number];
  *  The picker still offers `GATE_REQUIRES` only: there is no reason to offer a human
  *  two spellings of one thing. */
 export const GATE_REQUIRES_ACCEPTED = ["all-pass", "all", "threshold"] as const;
+
+/** Where autonomous work comes from (#382 P1). Mirrors the engine's
+ *  `intake_source_from_str` (workflow.rs). An EMPTY `source:` is legal and means the
+ *  built-in default, which is why "" is accepted by {@link isIntakeSource} but is not
+ *  offered as a value: "inherit" is a different statement from "github-labels", and a
+ *  picker that spelled it out would PIN what the file meant to inherit. */
+export const INTAKE_SOURCES = ["github-labels", "board", "none"] as const;
+export type IntakeSourceName = (typeof INTAKE_SOURCES)[number];
+
+export function isIntakeSource(v: string): boolean {
+  const s = v.trim().toLowerCase();
+  return s === "" || (INTAKE_SOURCES as readonly string[]).includes(s);
+}
+
+/** How long an identifier the engine's `sanitize_id` will carry (`MAX_ID_CHARS`,
+ *  workflow.rs). Longer is not truncated — it is REJECTED, because a resource called
+ *  something the author didn't write is worse than one that fails to load. */
+export const ID_MAX_CHARS = 48;
+
+/** A label the intake profile may name. The engine rejects rather than rewrites
+ *  (`sanitize_intake_label`): a label the repo's own GitHub labels no longer match is
+ *  a silent no-op, so a space or a `#` is a hard error there and a finding here.
+ *  A LEADING `-` is banned on top of the id alphabet — the hold spelling becomes a
+ *  positional argument to `gh label create`, and a dash-leading positional is read as
+ *  a flag. Empty is not a rejection: it means "inherit this one". */
+export function isValidIntakeLabel(v: string): boolean {
+  const s = v.trim();
+  if (!s) return true;
+  return s.length <= ID_MAX_CHARS && /^[A-Za-z0-9_][A-Za-z0-9_-]*$/.test(s);
+}
+
+/** A resource name (#858). Same alphabet as a block id at the engine
+ *  (`sanitize_id`), and — like every other author-written identifier in that file —
+ *  rejected rather than rewritten, so `heavy build` never becomes a resource called
+ *  `heavybuild` that the author's own `acquire_lock` call cannot name. Unlike an
+ *  intake label, a leading `-` is fine: nothing puts a resource name in an argv. */
+export function isValidResourceName(v: string): boolean {
+  const s = v.trim();
+  return !!s && s.length <= ID_MAX_CHARS && /^[A-Za-z0-9_-]+$/.test(s);
+}
+
+/** The bounds `parse_workflow` enforces on the policy sections — mirrored here so the
+ *  pane's forms cannot write a file the engine then refuses to load, and so a
+ *  hand-written file that already carries one gets a finding rather than a clean bill
+ *  of health. Every one of these is a REFUSAL on the engine (`RESOURCE_SLOTS_MAX`,
+ *  `RESOURCE_MAX_HOLD_MINUTES_MAX`, `RESOURCES_MAX`, and `max_batch`'s floor of 1),
+ *  with the single exception noted on the checks-timeout pair below. */
+export const RESOURCE_SLOTS_MIN = 1;
+export const RESOURCE_SLOTS_MAX = 64;
+export const RESOURCE_MAX_HOLD_MINUTES_MIN = 1;
+export const RESOURCE_MAX_HOLD_MINUTES_MAX = 480;
+export const RESOURCES_MAX = 32;
+export const MERGE_QUEUE_MAX_BATCH_MIN = 1;
+/** `checks_timeout_minutes` is the one policy number the engine CLAMPS rather than
+ *  refuses (`clamp_expires_minutes`), so a value outside this range is a warning here,
+ *  not an error: the file loads, it just doesn't do what it says. */
+export const MERGE_QUEUE_CHECKS_TIMEOUT_MIN = 5;
+export const MERGE_QUEUE_CHECKS_TIMEOUT_MAX = 240;
 
 /** A legal block id: lowercase-ish, human-meaningful, safe as a filename fragment and as
  *  a shell-adjacent token. Deliberately strict — the id ends up in agent ids, pane names
@@ -304,16 +422,31 @@ export type FindingCode =
   | "no-entry-block"
   | "unknown-key"
   | "section-not-a-mapping"
-  | "section-bad-value";
+  | "section-bad-value"
+  | "section-out-of-range"
+  | "intake-unknown-source"
+  | "intake-bad-label"
+  | "resource-name-invalid"
+  | "allow-not-permitted"
+  | "allow-sanitized";
+
+/** The policy sections a finding can be ABOUT — the routing key for the three that are
+ *  neither a block nor a line (#1020). Same job `blockId` does for a block: the pane's
+ *  roster and its findings list land the human on the form that can fix it, and neither
+ *  has to match on the message text to work out which one that is. */
+export type FindingSection = "intake" | "merge_queue" | "resources";
 
 /** One thing wrong with the workflow. `blockId` lets the pane render the finding INLINE
  *  next to the block it is about (the whole reason the validation pass is worth having is
- *  that it tells you WHERE); `line` does the same for the raw-text view. */
+ *  that it tells you WHERE); `line` does the same for the raw-text view, and `section` for
+ *  the policy sections. */
 export interface Finding {
   severity: FindingSeverity;
   code: FindingCode;
   message: string;
   blockId?: string;
+  /** Which policy section this is about, when it is about one. */
+  section?: FindingSection;
   /** 1-based source line, when the finding came from reading the text. */
   line?: number;
 }
