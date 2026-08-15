@@ -44,14 +44,22 @@ export function matchShortcut(e: KeyboardEvent): ShortcutAction | null {
       // It sits with the other layout gestures (E/O split, M maximize) rather
       // than in the Alt+<key> space, which is overlays and focus.
       //
-      // Verified free on the agent CLIs per the agent-cli-reference discipline,
-      // and stated as the three distinct things it is: Claude Code's
-      // interactive-mode reference DOES document `Ctrl+A` ("Move cursor to
-      // start of current line") and `Ctrl+_`/`Ctrl+Shift+-` (undo), and does
-      // NOT document Ctrl+Shift+A — the unshifted Ctrl+A a shell or agent
-      // actually uses is untouched by this. Copilot CLI's reference pages are
-      // SILENT on Ctrl+Shift+A (its CLI reference index carries no key table),
-      // so that one is unverified rather than confirmed free.
+      // CHECKED against the agent CLIs' own references per the
+      // agent-cli-reference discipline — which is not the same as verified
+      // free, and keeping the two apart is the whole point of writing it out:
+      //   - Claude Code's interactive-mode reference DOES document `Ctrl+A`
+      //     ("Move cursor to start of current line") and `Ctrl+_` /
+      //     `Ctrl+Shift+-` (undo), and does NOT document Ctrl+Shift+A. The
+      //     unshifted Ctrl+A a shell or agent actually uses is untouched by
+      //     this, and test/shortcuts.test.ts pins that it stays untouched.
+      //   - Copilot CLI's reference pages are SILENT on it — its CLI reference
+      //     index carries no key table at all — so that one is UNVERIFIED, not
+      //     confirmed free. A reference that lists no bindings is not evidence
+      //     of no conflict.
+      // This chord is withheld from every terminal pane (isAppShortcut), so a
+      // CLI that does bind it loses it with no escape hatch. Settling that
+      // needs a human with Copilot running, not a doc read: it is a demo
+      // checklist item, open at the time of writing.
       case "KeyA": return "autosize-panes";
       case "KeyM": return "maximize-pane";
       // Project tabs (#63). T=new, K=close; the bracket keys page between tabs

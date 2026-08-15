@@ -30,9 +30,6 @@ Autosize is that gesture: one button (`▦` in the top bar) and one chord
 (`Ctrl+Shift+A`) that give every pane in the tab an equal share of the space,
 across every level of nesting.
 
-Autosize is that gesture: one button (`▦` in the top bar) and one chord
-(`Ctrl+Shift+A`) that give every pane in the tab an equal share of the space.
-
 ## On demand, and never automatic
 
 This is the part to not "improve" later. A split or a close re-shares **the row
@@ -134,4 +131,11 @@ cursor to start of current line") and `Ctrl+_`/`Ctrl+Shift+-` (undo), and
 actually uses is untouched, and `test/shortcuts.test.ts` pins that it stays
 untouched. Copilot CLI's reference pages are **silent** on `Ctrl+Shift+A` (its
 CLI reference index carries no key table), so that CLI is unverified rather
-than confirmed free.
+than confirmed free — a reference that lists no bindings is not evidence of no
+conflict.
+
+That distinction has a consequence worth stating rather than leaving implied:
+the chord is withheld from every terminal pane (`isAppShortcut`), so a CLI that
+*does* bind it loses it with no escape hatch. Settling it needs a human with
+Copilot running, not another doc read, so it is a demo-checklist item and open
+at the time of writing.
