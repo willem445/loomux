@@ -729,6 +729,12 @@ export class WelcomeForm {
         this.applyRoleModels(key);
         this.updateAgentWarning();
         this.refreshRoster();
+        // The orchestrator role's CLI is the one the launched pane actually runs, so the
+        // card's preview has to follow it (#1020 rev-740 blocking 1). Called for every
+        // role rather than only `orchestrator`: `paintPreview` re-reads the control it
+        // needs, and a listener that fired selectively would be one `key` comparison away
+        // from silently going stale if the preview ever widens.
+        this.paintPreview();
       });
       // The context knob depends on the MODEL, not just the CLI (`haiku[1m]` is
       // not an alias the vendor documents), so a model change re-derives it.
@@ -975,12 +981,20 @@ export class WelcomeForm {
    *  is the one rule `agenticons` §Safety asks every consumer to keep (`src/pane.ts`'s
    *  `refreshAgentMark` is the same eight lines, deliberately). */
   private paintPreview(): void {
+    const orchRoleCli = this.roleControls.find((rc) => rc.key === "orchestrator");
     const view = setupPreviewMark(
       {
         kind: this.kind,
         agentId: this.agentSel.value,
         customCommand: this.customInput.value,
         sshCli: this.sshCliSel.value,
+        // The control the ORCH pane is actually launched from (`orchestratorCli` in the
+        // submitted config), not the group default beside the title. Resolved through
+        // `orchCliFor` — the same call `rolePicks` makes for that field — so the preview and
+        // the submitted value cannot disagree even on a role select holding something the
+        // catalog does not know. That equality is the whole finding; deriving it a second,
+        // similar-looking way is how it would come back.
+        orchestratorCli: orchRoleCli ? orchCliFor(orchRoleCli.cli.value).id : "",
       },
       ICON_SETUP_PREVIEW_PX
     );

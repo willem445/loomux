@@ -15,7 +15,14 @@ import type { PaneKind } from "../src/panesetup.ts";
 
 /** A card with nothing filled in beyond the kind — every test states only what it varies. */
 function input(over: Partial<SetupPreviewInput> = {}): SetupPreviewInput {
-  return { kind: "agent", agentId: "claude", customCommand: "", sshCli: "", ...over };
+  return {
+    kind: "agent",
+    agentId: "claude",
+    customCommand: "",
+    sshCli: "",
+    orchestratorCli: "",
+    ...over,
+  };
 }
 
 test("a built-in agent shows that CLI's own mark", () => {
@@ -76,13 +83,50 @@ test("a hand-typed shell or transport is refused, not badged", () => {
   }
 });
 
-test("orchestrator mode previews the group's default CLI, and refuses custom…", () => {
-  const orch = setupPreviewMark(input({ kind: "orchestrator", agentId: "opencode" }));
-  assert.equal(orch?.program, "opencode");
+test("orchestrator mode previews the ORCHESTRATOR ROLE's CLI, not the group default", () => {
+  // rev-740 blocking 1. The card sits above two controls that answer different questions:
+  // the top Agent select is the GROUP DEFAULT (it seeds every role, and a declared block
+  // with no `cli:` inherits it), while the orchestrator ROLE row is what
+  // `create_orchestration` launches the ORCH pane on (`orchestrator_cli`, issue #4). They
+  // diverge the moment the role row is touched, and the pane that appears wears the role's
+  // CLI — so previewing the group default is exactly the confident-wrong-answer this
+  // module refuses everywhere else. Since #1020 removed the starter workers, that ORCH
+  // pane is the ONLY pane a launch opens, so this badge is a claim about all of it.
+  const overridden = setupPreviewMark(
+    input({ kind: "orchestrator", agentId: "claude", orchestratorCli: "copilot" })
+  );
+  assert.equal(overridden?.program, "copilot", "the role's CLI must win over the group default");
+  assert.equal(overridden?.kind, "mark");
+  // ...and it must genuinely differ from what the group default would have drawn, or the
+  // assertion above would pass for a build that still reads `agentId`.
+  assert.notEqual(overridden?.svg, setupPreviewMark(input({ kind: "orchestrator", agentId: "claude" }))?.svg);
+});
+
+test("an orchestrator role that overrides nothing inherits the group default", () => {
+  // The empty per-role value is not "unset, show nothing" — the backend reads it as "use
+  // `agent_cli`" (`create_orchestration`'s per-role override comment), so the preview has
+  // to resolve it the same way or it disagrees with the spawn one level down.
+  const inherited = setupPreviewMark(input({ kind: "orchestrator", agentId: "opencode", orchestratorCli: "" }));
+  assert.equal(inherited?.program, "opencode");
+  // The seeded case — `applyOrchCli` copies the group default into every role — must agree
+  // with the inherited one rather than being a second code path.
+  const seeded = setupPreviewMark(
+    input({ kind: "orchestrator", agentId: "opencode", orchestratorCli: "opencode" })
+  );
+  assert.deepEqual(seeded, inherited);
+});
+
+test("orchestrator mode refuses custom…, from whichever control supplies it", () => {
   // `custom` is not launchable as a group (no orchestration adapter behind a hand-typed
-  // command), so it is a value the form is about to replace — never a `C` badge.
+  // command), so it is a value the form is about to replace — never a `C` badge, and never
+  // one indistinguishable from Claude's. Checked on BOTH controls: the resolution above
+  // means either one can be the value that reaches the badge.
   assert.equal(
     setupPreviewMark(input({ kind: "orchestrator", agentId: "custom", customCommand: "aider" })),
+    null
+  );
+  assert.equal(
+    setupPreviewMark(input({ kind: "orchestrator", agentId: "claude", orchestratorCli: "custom" })),
     null
   );
 });

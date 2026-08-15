@@ -31,6 +31,25 @@ export interface SetupPreviewInput {
   /** The SSH section's remote-CLI id. `""` is its own "None — a plain login shell" entry,
    *  which is a real choice rather than an unfilled field. */
   sshCli: string;
+  /**
+   * The ORCHESTRATOR ROLE's own CLI select, in orchestrator mode. Ignored for every other
+   * kind, and `""` means "this role does not override the group default".
+   *
+   * Separate from `agentId` because in orchestrator mode the two are different controls
+   * answering different questions, and only this one describes the pane that opens (#1020
+   * rev-740 blocking 1). `agentId` is the GROUP DEFAULT — it seeds every role and is what a
+   * declared block with no `cli:` inherits — while the orchestrator pane is launched on
+   * `orchestratorCli` (`create_orchestration`'s per-role override, issue #4). Changing the
+   * role's select alone leaves them disagreeing, and the pane that appears wears the role's
+   * CLI. Previewing the group default there is the one thing this module refuses to do
+   * anywhere else: a confident wrong answer.
+   *
+   * Empty inherits `agentId`, which is the backend's own rule for this field verbatim
+   * ("Per-role CLI overrides. Empty inherits `agent_cli`") rather than a second reading of
+   * it — the preview has to resolve the CLI the same way the spawn does or it is guessing
+   * again, one level down.
+   */
+  orchestratorCli: string;
 }
 
 /** The Agent picker's escape hatch, whose command the human types themselves. */
@@ -69,9 +88,12 @@ export const ICON_SETUP_PREVIEW_PX = 20;
  *   * **`agent`, `custom…`, box filled** — read the command, exactly as a pane does. Which
  *     means a path-qualified or `.exe`-suffixed first token resolves (`programFromRestore`,
  *     via `agentMark`), a shell or transport lands neutral, and gibberish lands neutral.
- *   * **`orchestrator`** — the group's DEFAULT CLI, which is what the top Agent picker is in
- *     that mode. `custom…` is not selectable there (the form re-picks a supported CLI), so
- *     it is refused here too rather than badged `C` for "custom".
+ *   * **`orchestrator`** — the ORCHESTRATOR ROLE's CLI, falling back to the group default
+ *     when that role overrides nothing. Not the group default itself: the launch opens
+ *     exactly one pane (since #1020 removed the starter workers), that pane runs
+ *     `orchestrator_cli`, and the two controls diverge the moment the role row is touched.
+ *     `custom…` is not selectable there (the form re-picks a supported CLI), so it is
+ *     refused here too rather than badged `C` for "custom".
  *   * **`ssh`, a remote CLI chosen** — that CLI, as the AUTHORITATIVE answer, which is what
  *     `knownCli` means: the launch line will be the local ssh client, so reading it would
  *     name the transport. `remote` rides along for the same reason it does on a live pane.
@@ -89,11 +111,21 @@ export function setupPreviewMark(input: SetupPreviewInput, size?: number): Agent
   }
 
   const agentId = input.agentId.trim();
-  if (agentId === CUSTOM) {
+
+  if (kind === "orchestrator") {
+    // The ROLE's CLI, not the group default — the pane this launch opens is the
+    // orchestrator, and `create_orchestration` spawns it on `orchestrator_cli`. Empty
+    // inherits the group default, which is the backend's own rule for the field, so the
+    // preview resolves the CLI by the same two steps the spawn does.
+    const cli = input.orchestratorCli.trim() || agentId;
     // Orchestrator mode never runs a hand-typed command line — the group's blocks are
     // spawned from a supported CLI's adapter — so `custom` there is a transient value the
-    // form is about to overwrite, not a choice with a program behind it.
-    if (kind === "orchestrator") return null;
+    // form is about to overwrite, not a choice with a program behind it. Checked on the
+    // RESOLVED cli rather than on `agentId`, so it holds whichever of the two supplied it.
+    return cli && cli !== CUSTOM ? agentMarkFor(cli, size) : null;
+  }
+
+  if (agentId === CUSTOM) {
     const command = input.customCommand.trim();
     return command ? agentMark({ command }, size) : null;
   }

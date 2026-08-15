@@ -1701,22 +1701,36 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
    to its own content, so a 4-up row and a 3-up row of the same numeric guardrails started
    their fields in different places and read as two unrelated blocks — the "space consumed
    oddly" of the demo note. Grid makes the columns a property of the ROW, so every row in
-   the card lines up down the card. `minmax(0, 1fr)` rather than `1fr` because a grid track's
-   default `min-width: auto` refuses to shrink below its content and would overflow the card
-   in a narrow pane. */
-.dlg-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); }
-/* #687: a per-role row is [cli] [model] [thinking level] [context]. It used to wrap, which
-   is what a 440px card forced: four roles wrapped into eight ragged lines whose fields
-   never aligned. At 580px the four fit on one line, so the row is a grid with FIXED
-   proportions — the model picker takes the slack (it holds the longest values by far, and
-   it alone can grow a summary line beneath), the three selects hold steady, and all four
-   role rows agree on where each column starts. Proportional tracks rather than `em` widths
-   so a narrow pane compresses the row instead of overflowing it; nothing here wraps, so a
-   role is always one line, and none of it reaches a terminal (constraint 1 — the setup card
-   is a form inside a pane, never a split). */
+   the card lines up down the card.
+
+   `auto-fit` + a REAL minimum, rather than `repeat(4, minmax(0, 1fr))`: with a 0 minimum
+   the four tracks never wrap, they just get narrower, so a pane below the card's 580px
+   traded "ragged two lines" for four fields too narrow to read (#1020 rev-740 N3). A
+   minimum track makes the row drop to three columns, then two, then one — it WRAPS, which
+   is what the flex row it replaced did and the behaviour the narrow case actually wants.
+   Alignment survives the wrap: every row resolves the same track count at the same width,
+   so the columns still agree down the card. `min()` guards the degenerate case where even
+   one minimum-width track does not fit. */
+.dlg-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 9rem), 1fr)); }
+/* #687: a per-role row is [cli] [model] [thinking level] [context]. It wrapped raggedly at
+   the old 440px — four roles becoming eight lines whose fields never aligned, which is most
+   of what the demo note called weird spacing. At 580px the four fit on one line.
+
+   Grid rather than flex so the columns belong to the ROW and every role agrees on where
+   each column starts; `auto-fit` with a real minimum rather than fixed proportions so a
+   pane narrower than the card WRAPS to three columns, then two, rather than squeezing four
+   unreadable selects side by side (#1020 rev-740 N3). Wrapping is the correct narrow-pane
+   answer — it is what the flex row did — and the alignment this slice is for survives it,
+   because every row resolves the same track count at the same width.
+
+   The cost, stated: the model picker no longer gets a wider track than the knobs beside it.
+   Uniform tracks are what let `auto-fit` wrap at all, and the picker degrades the best of
+   the four — it ellipsizes a long id and still opens to full width, while a truncated
+   `<select>` label is just unreadable. None of this reaches a terminal (constraint 1 — the
+   setup card is a form inside a pane, never a split). */
 .role-row {
   display: grid;
-  grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.7fr) minmax(0, 1fr) minmax(0, 0.9fr);
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 7.5rem), 1fr));
   align-items: start;
 }
 .role-row > .model-picker { min-width: 0; }

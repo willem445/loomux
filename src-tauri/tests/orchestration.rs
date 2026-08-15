@@ -34662,6 +34662,97 @@ fn a_launch_that_asks_for_no_starter_workers_opens_none() {
 }
 
 #[test]
+fn a_bound_launch_opens_its_orchestrator_and_nothing_else() {
+    // #1020 item 5, at the seam where the behaviour actually happens (rev-740 N3).
+    //
+    // `starter_workers` is pinned four ways above, but a pure function is not the promise
+    // item 5 makes — the promise is that a LAUNCH opens no worker panes, and that happens
+    // in `register_orchestrator_pane`'s post-bind thread, which reads the resolved count and
+    // runs the spawn loop. Nothing pinned that, so a caller-side default coming back, or the
+    // `starters > 0` branch drifting, would leave the suite green.
+    //
+    // THE POSITIVE CONTROL IS THE POINT. The spawn loop only runs after the orchestrator
+    // pane binds, so a bare "no workers appeared" assertion is green even when the loop is
+    // dead or never reached — the classic vacuous negative. So group A asks for 2, binds,
+    // and is polled until both workers really appear; only once that has happened is group
+    // B's zero a statement about the DEFAULT rather than about the harness.
+    use std::sync::Arc;
+
+    fn workers(reg: &OrchRegistry, group: &GroupId) -> usize {
+        reg.list_agents(group)
+            .as_array()
+            .map(|rows| rows.iter().filter(|a| a["role"] == "worker").count())
+            .unwrap_or(0)
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let repo_asked = tempfile::tempdir().unwrap();
+    let repo_silent = tempfile::tempdir().unwrap();
+    let reg = Arc::new(relaunch_registry(dir.path()));
+    // Room for the orchestrator plus both starters; `rails()`'s cap of 2 would clamp the
+    // control group and make it prove less than it looks.
+    let rails4 = || Guardrails { max_agents: 4, ..rails() };
+
+    // ── A: a caller that DOES ask (the promote modal's shape) ──────────────────
+    let asked = create_orchestration_group(
+        &reg,
+        &repo_asked.path().to_string_lossy(),
+        rails4(),
+        SessionOrigin::Fresh,
+        None,
+        Some(2),
+    )
+    .unwrap();
+    let asked_group = asked.group_id.clone();
+    reg.bind(&asked.agent_id, 101).unwrap();
+
+    // ── B: a launcher launch, which since #1020 sends no count at all ──────────
+    let silent = create_orchestration_group(
+        &reg,
+        &repo_silent.path().to_string_lossy(),
+        rails4(),
+        SessionOrigin::Fresh,
+        None,
+        None,
+    )
+    .unwrap();
+    let silent_group = silent.group_id.clone();
+    reg.bind(&silent.agent_id, 102).unwrap();
+
+    // The control has to land first, and it is what proves the spawn path is live here.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if workers(&reg, &asked_group) == 2 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "setup: a launch asking for 2 starters never opened them, so this test could not \
+             tell a working default from a dead spawn path — roster: {}",
+            reg.list_agents(&asked_group)
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    // Both panes bound at the same time and B's thread has now had at least as long as A's,
+    // plus a settle window — so zero here is "none were ever asked for", not "not yet".
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        workers(&reg, &silent_group),
+        0,
+        "a launch that sends no starter count must open NO workers — roster: {}",
+        reg.list_agents(&silent_group)
+    );
+    // ...and what it DOES open is exactly the one orchestrator pane, so this is "opened
+    // nothing else", not "opened nothing" (a launch that silently failed would also have
+    // zero workers).
+    let rows = reg.list_agents(&silent_group);
+    let rows = rows.as_array().unwrap();
+    assert_eq!(rows.len(), 1, "a launch opens exactly one pane: {rows:?}");
+    assert_eq!(rows[0]["role"], "orchestrator");
+}
+
+#[test]
 fn create_orchestration_group_maps_resume_session_onto_the_workflow_pin() {
     use std::sync::Arc;
     // #222 rev-11 F2, at the entry point instead of one layer below it.
