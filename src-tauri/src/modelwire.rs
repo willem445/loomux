@@ -201,8 +201,8 @@ fn ask_with(
 /// in front of it does not keep such an answer either — so the surfaces still
 /// show their seed, and a restart re-detects (the human's stated model for
 /// #1002, there being no re-ask affordance any more).
-fn worth_keeping(reply: &CliModelReply) -> bool {
-    reply.error.is_none() && !reply.output.trim().is_empty()
+fn worth_keeping(_reply: &CliModelReply) -> bool {
+    true // RED-BEFORE-GREEN MUTATION A (#1020): keep everything, failures included.
 }
 
 /// The error a lookup reports when the sweep has not answered for this program
@@ -256,9 +256,7 @@ impl Memo {
     /// runner would be called, and passing one that panics is how this states
     /// that rather than trusting it.
     fn read(&self, program: &str) -> CliModelReply {
-        if protocol_for(program).is_none() {
-            return ask_with(program, |_, _, _| unreachable!("a lookup never runs a CLI"));
-        }
+        // RED-BEFORE-GREEN MUTATION C (#1020): the no-protocol branch removed.
         if let Some(hit) = self.kept.lock().unwrap().get(program) {
             return hit.clone();
         }
@@ -313,9 +311,7 @@ fn sweep_with(
     // coercion through a closure's `Fn` bound.
     for &cli in clis {
         probe(cli);
-        if protocol_for(cli).is_none() {
-            continue;
-        }
+        // RED-BEFORE-GREEN MUTATION B (#1020): the PROTOCOLS-row skip removed.
         let reply = ask(cli);
         emit(ModelsDetected { program: cli.to_string(), reply });
     }
