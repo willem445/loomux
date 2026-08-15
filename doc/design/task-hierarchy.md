@@ -2,9 +2,8 @@
 
 Status: backend **implemented and merged** (#994) — `Task::parent`/`Task::kind`, write-time
 validation, promote-on-delete, and the `TaskSummary`/MCP surface described below are shipped.
-Board nesting UI (#1027) is **in review, demo-gated, not yet merged** — §5 describes its
-agreed design and is marked provisional where noted. Line numbers cite `src-tauri/src/
-orchestration/mod.rs` and `mcp.rs` as of #994's merge; symbols are the durable reference.
+Board nesting UI (#1027) is **in review, demo-gated, not yet merged** — §9 describes its
+agreed design and is marked provisional where noted. Symbols are the durable reference.
 
 ## 1. Problem & thesis
 
@@ -20,7 +19,7 @@ hang concrete slices beneath it as ordinary child tasks, each with its own `deps
 "what's startable right now" into a real per-slice signal instead of something re-derived from
 notes after every restart, and it gives a human glancing at the board the feature's shape —
 children, progress, blockers — at once. It is also the data foundation a future kanban/
-swimlane view would need, though that view is explicitly out of scope here (§6).
+swimlane view would need, though that view is explicitly out of scope here (§10).
 
 ## 2. Model: containment is orthogonal to ordering
 
@@ -108,7 +107,9 @@ or cyclic `parent` is **display-only**, so the safe failure direction is to tole
 rather than hide or refuse to render. A hand-edited orphan, self-reference, or cycle in
 `tasks.json` blocks nothing backend-side, and the (provisional, #1027) board UI renders such a
 row flat at top level instead of vanishing it — the same tolerate-and-show philosophy the
-existing `⚠ missing` dependency chip already applies to a dangling `deps` id.
+existing `⚠ missing` dependency chip already applies to a dangling `deps` id, though the UI's own
+broken-container chip is narrower than that philosophy and fires only for the orphan case, not
+the self-reference or cycle one (§9 spells out the distinction).
 
 No migration and no repair pass exist or are planned: this is a deliberate consequence of the
 additive-serde, tolerant-read design, not a gap.
@@ -190,8 +191,10 @@ the PR lands, since a demo can still change layout details.
 - **Collapse.** A chevron appears on containers only (a leaf gets an inert spacer, so the
   affordance itself communicates "there is something inside here"). Collapsing hides the whole
   subtree, not just the direct children — leaving a grandchild rendered at the top level would
-  read as data loss. Collapse state is frontend-only, not persisted, pruned to currently-live
-  rows on each refresh (the same treatment the existing note-expansion state already gets).
+  read as data loss. Collapse state is frontend-only: not persisted, the same shape as the
+  existing `expanded` (note-expansion) state, and pruned to currently-live rows on each
+  refresh, the same way the existing `selected` (tick-box) state already is — two different
+  existing behaviours, not one.
 - **Kind badge.** The advisory Agile level, shown as a label and nothing more — no enforcement
   rides on it (§2). A value outside the four known kinds (only reachable by hand-editing
   `tasks.json`, since the backend refuses it on write) is designed to read as visibly broken
@@ -202,18 +205,25 @@ the PR lands, since a demo can still change layout details.
   **whole subtree** done, not just the direct children, because it makes an unqualified claim
   ("everything under here is finished") that direct-children-only could get wrong with an open
   grandchild. It is a prompt for the human to act on, never a status write (§6).
-- **Nest / un-nest.** A picker offers every other row as a possible container, plus a
-  "promote to top level" option that sends the `parent`-clearing empty string when the row is
-  already nested. This is deliberately a separate affordance from the existing dependency picker
-  — containment is not ordering (§2), and conflating the two pickers would blur that.
+- **Nest / un-nest.** A picker offers every other row **minus the row's current container** as
+  a possible new one — which is why a separate "promote to top level" option exists, sending the
+  `parent`-clearing empty string when the row is already nested. This is deliberately a separate
+  affordance from the existing dependency picker — containment is not ordering (§2), and
+  conflating the two pickers would blur that. Deliberately absent: any cycle/depth pre-filter on
+  the candidates offered. A row's own descendants are offered like any other row, exactly as the
+  dependency picker offers a cycle-closing dep — the rule lives once, inside the backend's lock
+  (§3), and its error names the path through this same picker's toast. A second, client-side copy
+  of that rule could only ever disagree with the one that actually decides.
 - **Sibling-scoped reorder.** Up/down move a row among its siblings only, carrying a
   container's whole subtree with it; the write is a full flattened permutation of the board's id
   array through the existing `orch_reorder_tasks`, since that command already expects the whole
   array and has no notion of siblings itself.
-- **Read tolerance in the UI.** As described in §5, an orphaned/self-referencing/cyclic
-  `parent` renders the row flat at top level with a broken-container chip, rather than dropping
-  the row or looping — every row is designed to appear exactly once regardless of what a
-  hand-edited pointer says.
+- **Read tolerance in the UI.** As described in §5, every row is designed to render flat at top
+  level rather than drop or loop, regardless of what a hand-edited `parent` says — whether it
+  names no task on the board, names the row itself, or sits in a cycle. The `⚠ in t-N`
+  broken-container chip is narrower than that: it fires only when the container names **no task
+  on the board**. A self-reference or a cycle still renders flat, but unchipped — both name only
+  live rows, so nothing about them is "missing" in the sense the chip reports.
 - **No nesting chrome on a board that nests nothing.** The collapse gutter and related chrome
   are gated the same way the existing dependency/readiness chrome is gated on `deps` usage, so a
   board that has never used hierarchy is designed to render exactly as it did before this
