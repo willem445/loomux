@@ -1254,6 +1254,13 @@ pub fn role_hint_requires(hint: &str) -> Option<Role> {
 /// PR to a pane that can neither record a verdict nor satisfy the gate it was
 /// spawned for.
 ///
+/// **`Guardrails::block_for` asks it too (#891 S4)**, for the neighbouring
+/// question "which block does a bare `spawn_agent(kind: \"reviewer\")` open" —
+/// a liaison declared first in roster order used to be that answer. Same
+/// predicate deliberately: *which blocks review* must not have two answers.
+/// The pane's own mirror is `isReviewingBlock` (`src/workflowmodel.ts`), which
+/// keeps the workflow editor from offering a liaison as a gate reviewer.
+///
 /// Not used for the *capacity* advisories (`recommend_capacity`/`extra_tiers`),
 /// which count live panes and are right to count a liaison as one — see
 /// `doc/design/liaison.md`.
