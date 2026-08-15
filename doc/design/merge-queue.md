@@ -761,8 +761,11 @@ the PTY-lifecycle/session bridge, and all ~50 `orch_*` wrappers already live in
   opt-in is reversible; it is not version-transparent.
 - **Ordering** (plan part 7): A ∥ B → C (gated on this note's sign-off) → D (also needs A;
   both touch `mod.rs`) → E; F after C, parallel with D/E. Slices A, D and E serialize on
-  `mod.rs`/`mcp.rs`; the queue engine is a new file (`orchestration/mergeq.rs` — `queue.rs` is
-  taken by the delivery queue) precisely so `mod.rs` touches stay wiring-only.
+  `mod.rs`/`mcp.rs`; the queue engine is a new file (`mergeq.rs` — `queue.rs` is
+  taken by the delivery queue) precisely so `mod.rs` touches stay wiring-only. That file lives
+  in `crates/loomux-engine/src/` as of #888 slice A2 batch 6, alongside `mergeqview.rs`;
+  `mod.rs` re-exports both, so `orchestration::mergeq` and `orchestration::mergeqview` still
+  name them and every path in this note holds.
 - **Dogfooding this repo is a proposal, not a consequence of this note.** A `merge_queue:`
   block for loomux itself is drafted in slice E for the human to accept or decline. Turning
   the queue on for the repo that develops the queue is a decision with its own risk, and it is

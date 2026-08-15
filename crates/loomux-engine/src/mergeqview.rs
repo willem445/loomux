@@ -37,7 +37,7 @@
 //!    mean what it thinks, and rendering them anyway would put a confident
 //!    wrong sentence in front of a human.
 
-use super::mergeq::{MergeQueueState, MAX_ENTRIES, MERGE_QUEUE_VERSION};
+use crate::mergeq::{MergeQueueState, MAX_ENTRIES, MERGE_QUEUE_VERSION};
 use serde_json::{json, Value};
 use std::path::Path;
 
@@ -191,7 +191,7 @@ fn clip(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::orchestration::mergeq::EntryState;
+    use crate::mergeq::EntryState;
     use std::path::PathBuf;
 
     /// Every state word the core defines, as it appears in the file.

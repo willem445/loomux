@@ -31,7 +31,7 @@
 //!    than re-deriving the decision — a third implementation of the gate
 //!    decision is a defect, not an optimization.
 
-use super::workflow::{
+use crate::workflow::{
     condition_supported, evaluate_merge_gate, parse_gate_file, BlockId, Gate, GateOutcome, ReviewVerdict,
 };
 use serde::{Deserialize, Serialize};
@@ -870,7 +870,7 @@ fn body_unchanged(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::orchestration::workflow::{body_digest, GateRequire, Verdict};
+    use crate::workflow::{body_digest, GateRequire, Verdict};
 
     // ── the state machine (§4) ──────────────────────────────────────────────
 
