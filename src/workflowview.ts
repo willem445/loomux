@@ -1374,26 +1374,50 @@ export class WorkflowView {
       // knob repaint when the form must not be rebuilt.
       onDetect: () =>
         modelCatalog.detect(cli).then(() => {
-          // Mid-type guard, the same one the async probe reply below takes and
-          // the launcher now takes too: an ask can be in flight for seconds,
-          // and rebuilding the menu under a half-typed id hides the input the
-          // human is typing into. The knobs and the findings are refreshed
-          // either way — they are what this reply is the answer for.
-          if (!picker.editingCustom) repaint();
-          // The menu may have moved under the selection, so the knobs re-derive
-          // from what the picker holds NOW — the same sync `picker.onChange`
-          // does, for the same reason.
-          knobs.setModel(picker.value);
+          // The findings are the pane's, not this form's, so they are recomputed
+          // and repainted whatever happened to the form meanwhile — a detection
+          // that landed after the human moved on still corrected the file's
+          // analysis.
           this.analysis = analyzeWorkflow(this.text, this.knobLookup);
           this.renderRoster();
           this.renderFindings();
           this.renderGraph();
-          // The click leaves focus on the detect button, which lives inside the
-          // form — so in practice this is always the in-place branch, and that
-          // is the point: `renderForm()` here would rebuild the control the
-          // human just pressed. Written as the same conditional as the sibling
-          // anyway, so neither path is a special case of the other.
-          if (this.formPane.contains(document.activeElement)) repaintKnobs();
+
+          // Everything below touches THIS form's DOM, so it stops here if that
+          // form is gone (#997 review NB-1). An ask spawns a CLI and can be in
+          // flight for seconds — long enough for the human to select another
+          // block, at which point `renderForm()` has detached these rows and
+          // nulled `repaintBlockKnobs`. The probe reply below takes the same
+          // early-out, for the same reason.
+          if (!this.formPane.contains(picker.root)) {
+            this.renderForm();
+            return;
+          }
+          // Mid-type guard: rebuilding the menu under a half-typed id hides the
+          // input the human is typing into. Deferred rather than dropped — see
+          // `runWhenNotEditing`.
+          picker.runWhenNotEditing(repaint);
+          // The menu may have moved under the selection, so the knobs re-derive
+          // from what the picker holds NOW — the same sync `picker.onChange`
+          // does, for the same reason.
+          knobs.setModel(picker.value);
+          // **Through the live method, never the captured `repaintKnobs`**
+          // (#997 review NB-1). `renderForm()` clears `repaintBlockKnobs` before
+          // rebuilding precisely so a late reply cannot paint into a detached
+          // row; a closure holding this form's own repainter would walk around
+          // that guard. `?.` is what makes the treatment *actually* identical to
+          // `ensureCliKnobs`'s rather than only similar to it.
+          //
+          // Which branch runs: NOT the in-place one, in practice. The detect
+          // button disables itself before awaiting (`modelpicker.ts`), and a
+          // disabled element is not focusable — the browser blurs it, so
+          // `document.activeElement` is `<body>` and this is the `renderForm()`
+          // branch. Both refresh the knobs, and rebuilding is safe with focus on
+          // `<body>`; the conditional stays because the human may have clicked
+          // into another field while the ask was in flight, and that case really
+          // does need the in-place repaint. (Corrected from a comment that
+          // asserted the opposite — #997 review NB-2.)
+          if (this.formPane.contains(document.activeElement)) this.repaintBlockKnobs?.();
           else this.renderForm();
         }),
     });

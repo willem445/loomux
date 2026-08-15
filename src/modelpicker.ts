@@ -194,6 +194,32 @@ export class ModelPicker {
     return !this.custom.hidden && document.activeElement === this.custom;
   }
 
+  /** Rebuild this control now, or as soon as doing so stops being destructive.
+   *
+   *  The mid-type hazard has two halves and the first cut only handled one
+   *  (#997 review NB-3). Refusing to rebuild while the human is typing is
+   *  right; *dropping* the rebuild is not, because nothing schedules another
+   *  one. On the launcher that was permanent — `applyRoleModels` is otherwise
+   *  reachable only from the role's CLI `change` listener and the seed pass, so
+   *  a detection that landed mid-type never reached that role's dropdown again
+   *  for the life of the dialog, and the human saw a `detect` click do nothing.
+   *
+   *  So the work is deferred to the input's next `blur`, which is the moment the
+   *  hazard ends. `once` per deferral: two asks landing mid-type queue two
+   *  rebuilds, which is harmless because a rebuild is idempotent, and cheaper to
+   *  reason about than a shared pending slot that has to decide which wins.
+   *
+   *  Owned here rather than by each host because the knowledge is this module's:
+   *  which element is the hazard, and which event ends it. Both surfaces ask the
+   *  same question through the same seam. */
+  runWhenNotEditing(rebuild: () => void): void {
+    if (!this.editingCustom) {
+      rebuild();
+      return;
+    }
+    this.custom.addEventListener("blur", () => rebuild(), { once: true });
+  }
+
   get value(): string {
     if (!this.sel.options.length) return "";
     return this.sel.value === CUSTOM_OPTION ? this.custom.value.trim() : this.sel.value;

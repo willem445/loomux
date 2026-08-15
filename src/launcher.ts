@@ -678,16 +678,25 @@ export class WelcomeForm {
             // row from a reply about a CLI it has moved off is exactly the
             // silent-wrong-answer the knob path refuses.
             if (orchCliFor(cli.value).id !== id) return;
-            // Mid-type guard, the same hazard `workflowview.ts` already takes
-            // care over on its own post-reply repaint (#997 review): an ask can
-            // be in flight for seconds, which is long enough for a human to
-            // click into the `custom…` box and start typing, and `setOptions`
-            // would then resolve the half-typed id to the dropdown branch and
-            // hide the input under their caret. The KNOBS are repainted either
-            // way — they are what this reply is the answer for, and repainting
-            // them touches nothing the human is inside.
-            if (model.editingCustom) this.applyRoleKnobs(key);
-            else this.applyRoleModels(key);
+            // The knobs are repainted immediately and unconditionally: they are
+            // what this reply is the answer for, and repainting them touches
+            // nothing the human could be inside.
+            this.applyRoleKnobs(key);
+            // The MENU is the destructive half — rebuilding it under a
+            // half-typed id resolves that id to the dropdown branch and hides
+            // the input beneath the caret — so it is deferred to the moment
+            // that stops being true, never dropped (#997 review NB-3).
+            //
+            // Dropping it was permanent here in a way it is not in the workflow
+            // pane: `applyRoleModels` is otherwise reached only from the role's
+            // CLI `change` listener and the seed pass, so a detection that
+            // landed mid-type never reached this role's dropdown again for the
+            // life of the dialog — a `detect` click that visibly did nothing.
+            // The re-check inside the callback is the same staleness guard as
+            // above, re-run because a deferral can outlive the CLI it was for.
+            model.runWhenNotEditing(() => {
+              if (orchCliFor(cli.value).id === id) this.applyRoleModels(key);
+            });
           });
         },
       });
