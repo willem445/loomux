@@ -1593,8 +1593,9 @@ from a unit test of product code, agents are banned from running cargo locally
     moved. `mod winpath;` in `src-tauri/src/lib.rs` was crate-private, and it
     becomes `pub use loomux_engine::winpath;` — a genuine widening, matching
     the `pub use loomux_engine::{…};` shape every other whole-module
-    re-export in this crate already uses (batches 6, 10, 12b) rather than the
-    plain `use` that would have preserved the old crate-only privacy.
+    re-export `src-tauri` already uses for its engine shims (batches 6, 10,
+    12b) rather than the plain `use` that would have preserved the old
+    crate-only privacy.
     `winpath` is reachable from `src-tauri/tests/`'s external
     integration-test binary for the first time as a result. It is the whole
     module rather than a local shim file, since (unlike `obs` in batch 7)
