@@ -121,14 +121,15 @@ pub fn run(inv: Invocation, version: &str) -> Outcome {
                 Some(path) => ServerConfig::load(path),
                 None => Ok(ServerConfig::default()),
             };
+            // One failure path, because there is one gate: a config that would
+            // bind a routable address without saying so does not load at all
+            // (config.rs), so there is no second check to perform here and no
+            // way to reach the summary below holding an unchecked target.
             let cfg = match loaded {
                 Ok(cfg) => cfg,
                 Err(e) => return config_failure(e),
             };
-            let target = match cfg.resolve_listen() {
-                Ok(target) => target,
-                Err(e) => return config_failure(e),
-            };
+            let target = cfg.listen();
 
             let mut out = String::new();
             out.push_str(&format!("loomux-server {version}\n"));
@@ -258,7 +259,7 @@ mod tests {
     }
 
     #[test]
-    fn a_refused_routable_bind_exits_config_and_serves_nothing() {
+    fn a_config_that_names_a_routable_bind_exits_config_and_serves_nothing() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("loomux-server.yml");
         std::fs::write(&path, "listen: \"0.0.0.0:8788\"\n").expect("write");

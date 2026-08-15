@@ -8,49 +8,62 @@
 //! > The listener binds loopback (or a unix socket) and **refuses a routable
 //! > interface** unless an explicit, loudly-named flag says otherwise.
 //!
-//! The refusal lives here, one slice ahead of the socket, because the config
-//! schema has to name the listen address anyway — and an address field that
-//! accepts `0.0.0.0` and leaves the refusal to a later slice is a half
-//! contract whose unsafe value is representable, spellable and silently
-//! honoured in the meantime. Deciding it at parse time also means C2 cannot
-//! forget: there is no second place where a `ListenTarget` can be produced.
+//! # Why the refusal is config-layer validation, not a piece of the listener
 //!
-//! Everything here is pure. No socket is opened, no name is resolved, no
-//! directory is created — [`ServerConfig::resolve_listen`] answers "would this
-//! be allowed?", and the answer is a value the caller has to look at.
+//! It is enforced **when the config is parsed**, not when a socket is opened:
+//! [`ServerConfig::parse`] returns [`ConfigError::RoutableBindRefused`] and no
+//! config exists at all. That is what makes it C1a's rather than a fragment of
+//! C2 smuggled forward — it is a statement about which files are valid, it
+//! needs no socket to decide, and every test below runs without one.
+//!
+//! The shape follows `GroupId`'s (#904), which is this repo's precedent for
+//! exactly this: **the unsafe state is unrepresentable rather than merely
+//! checked.** [`ServerConfig`] holds an already-classified [`ListenTarget`],
+//! and the only way to obtain one is through the gate. The `Deserialize` impl
+//! is on a *private* raw shape, so a config file cannot deserialize its way
+//! past the check either. C2 therefore receives a value the check has already
+//! passed rather than a string it must remember to check — the refusal cannot
+//! be forgotten by the slice that has the most else going on, and C2 must not
+//! re-implement it (recorded in `remote-engine-protocol.md` §1.2 and §13).
+//!
+//! Nothing here opens a socket, resolves a name or touches a directory.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+/// The default listen port. Unregistered and arbitrary — what is deliberate is
+/// the host below.
+pub const DEFAULT_PORT: u16 = 8788;
+
 /// The default listen address when the config file names none.
 ///
-/// The port is unregistered and arbitrary; what is deliberate is the *host*.
-/// A default of `0.0.0.0` is the café failure remote-engine-protocol.md §1.2
+/// A default of `0.0.0.0` is the café failure `remote-engine-protocol.md` §1.2
 /// describes: it works exactly as well as loopback right up until it is
 /// catastrophic, and nothing about the daemon's behaviour tells the operator
-/// which one they got.
+/// which one they got. Kept as a string because it is also what an operator
+/// copies into a config file; `default_config_matches_the_documented_default`
+/// pins it against the value [`ServerConfig::default`] actually uses.
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:8788";
 
 /// The scheme prefix that names a unix-domain socket in a `listen:` value.
 const UNIX_PREFIX: &str = "unix:";
 
-/// Where a listener would bind, once [`ServerConfig::resolve_listen`] has
-/// allowed it.
+/// Where a listener would bind — a value that has already passed the §1.2
+/// check, which is the only way one can be obtained from a config.
 ///
 /// `Routable` is a variant rather than an error case because the operator can
 /// legitimately ask for it (§1.2's "explicit, loudly-named flag") and the
-/// daemon then has to be able to say so loudly. A refusal is
-/// [`ConfigError::RoutableBindRefused`]; this type is the allowed set.
+/// daemon then has to be able to say so loudly, every time it starts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ListenTarget {
     /// A loopback IP literal — the v1 default and the shape §1.2 assumes.
     Loopback(SocketAddr),
-    /// A unix-domain socket path. Accepted by this layer on every platform:
-    /// classification is pure string work, and whether the host can actually
-    /// bind one is the listener's problem to report, not a reason for the
-    /// config parser to behave differently per OS.
+    /// A unix-domain socket path. Classified on every platform: classification
+    /// is pure string work, and whether the host can actually bind one is the
+    /// listener's error to report, not a reason for a config parser to behave
+    /// differently per OS.
     Unix(PathBuf),
     /// A non-loopback IP literal, including the wildcards `0.0.0.0` and `::`.
     /// Only reachable through `allow_routable_bind`.
@@ -74,8 +87,7 @@ impl ListenTarget {
     }
 }
 
-/// Everything that can go wrong between "the operator ran the daemon" and "a
-/// listener would be allowed to start".
+/// Everything that can make a config invalid.
 ///
 /// One closed enum rather than `String`s, because the CLI maps these onto exit
 /// codes and a caller that has to string-match a message is a caller that
@@ -119,51 +131,72 @@ impl std::fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
-/// The config file, as parsed.
+/// The config file as it is written on disk.
+///
+/// **Private on purpose.** It is the only `Deserialize` in this module, and
+/// keeping it unexported is what makes [`ServerConfig`] the sole public form —
+/// a validated one. A `Deserialize` on the public type would be a second door
+/// into the same state with no gate on it, which is precisely the shape #904
+/// closed for `GroupId` by routing its `Deserialize` back through `parse`.
 ///
 /// `deny_unknown_fields` is the same choice `workflow.rs` makes for
 /// `.loomux/workflow.yml`, and for the same reason: this is a hand-edited file
 /// on the machine, so a key nobody recognises is a typo, and a typo that is
 /// silently ignored is a setting the operator believes is in force. That is
-/// the OPPOSITE of the wire rule in remote-engine-protocol.md §4.4 ("both
+/// the OPPOSITE of the wire rule in `remote-engine-protocol.md` §4.4 ("both
 /// sides ignore what they do not know"), which is right for two independently
 /// updated peers and wrong for one local file — see
-/// doc/design/remote-engine-daemon.md for why the two rules do not conflict.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+/// `doc/design/remote-engine-daemon.md` for why the two do not conflict.
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ServerConfig {
+struct RawServerConfig {
     /// `127.0.0.1:8788`, `[::1]:8788`, or `unix:/run/loomux/engine.sock`.
     #[serde(default = "default_listen")]
-    pub listen: String,
+    listen: String,
     /// §1.2's "explicit, loudly-named flag". Default false, and the default is
-    /// the security property — see [`ServerConfig::resolve_listen`].
+    /// the security property.
     #[serde(default)]
-    pub allow_routable_bind: bool,
-    /// Overrides the engine's `obs::data_root()` for every piece of persisted
-    /// orchestration state. `None` means "wherever the desktop app would put
-    /// it on this machine", which is what makes a daemon on a workstation see
-    /// the groups that are already there.
+    allow_routable_bind: bool,
+    /// Overrides the engine's `obs::data_root()` for persisted state.
     #[serde(default)]
-    pub state_root: Option<PathBuf>,
+    state_root: Option<PathBuf>,
 }
 
 fn default_listen() -> String {
     DEFAULT_LISTEN.to_string()
 }
 
+/// A config that has been read AND validated: its listen target is one this
+/// daemon is allowed to bind, and there is no way to construct one for which
+/// that is untrue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerConfig {
+    listen: ListenTarget,
+    state_root: Option<PathBuf>,
+}
+
 impl Default for ServerConfig {
+    /// The config a daemon run with no `--config` uses: loopback, nothing
+    /// exposed. Built from the constant rather than by parsing, so `Default`
+    /// cannot fail and there is no `expect` in the no-config path.
     fn default() -> Self {
         ServerConfig {
-            listen: default_listen(),
-            allow_routable_bind: false,
+            listen: ListenTarget::Loopback(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                DEFAULT_PORT,
+            )),
             state_root: None,
         }
     }
 }
 
 impl ServerConfig {
-    /// Parse config text. `path` is carried only so the error can name the
-    /// file the operator has to go and edit.
+    /// Parse and validate config text. `path` is carried only so the error can
+    /// name the file the operator has to go and edit.
+    ///
+    /// This is the gate. A config naming a routable address without
+    /// `allow_routable_bind: true` does not load — it is not a config the
+    /// daemon holds and then declines to serve.
     pub fn parse(text: &str, path: &Path) -> Result<ServerConfig, ConfigError> {
         // An empty (or comments-only) file is a legitimate "everything
         // default" config, and YAML deserializes it as null rather than as an
@@ -173,13 +206,15 @@ impl ServerConfig {
         if text.trim().is_empty() {
             return Ok(ServerConfig::default());
         }
-        serde_norway::from_str(text).map_err(|e| ConfigError::Parse {
-            path: path.to_path_buf(),
-            msg: e.to_string(),
-        })
+        let raw: RawServerConfig =
+            serde_norway::from_str(text).map_err(|e| ConfigError::Parse {
+                path: path.to_path_buf(),
+                msg: e.to_string(),
+            })?;
+        ServerConfig::from_raw(raw)
     }
 
-    /// Read and parse a config file.
+    /// Read, parse and validate a config file.
     pub fn load(path: &Path) -> Result<ServerConfig, ConfigError> {
         let text = std::fs::read_to_string(path).map_err(|e| ConfigError::Read {
             path: path.to_path_buf(),
@@ -188,22 +223,28 @@ impl ServerConfig {
         ServerConfig::parse(&text, path)
     }
 
-    /// The listen target this config asks for, or the reason it is refused.
-    ///
-    /// This is §1.2's first control. Note which way it fails: a value that
-    /// cannot be classified is an error, never a fallback to the default —
-    /// silently binding loopback when the operator asked for something else
-    /// would be safe here but is the habit that makes the opposite mistake
-    /// somewhere else, and it would hide a typo in the one field where a typo
-    /// matters most.
-    pub fn resolve_listen(&self) -> Result<ListenTarget, ConfigError> {
-        let target = classify_listen(&self.listen)?;
-        match target {
-            ListenTarget::Routable(addr) if !self.allow_routable_bind => {
-                Err(ConfigError::RoutableBindRefused { addr })
+    /// §1.2's first control, and the only place it is applied.
+    fn from_raw(raw: RawServerConfig) -> Result<ServerConfig, ConfigError> {
+        // Note which way this fails: a value that cannot be classified is an
+        // error, never a fallback to the default. Silently binding loopback
+        // when the operator asked for something else would be safe here, but
+        // it is the habit that makes the opposite mistake somewhere else — and
+        // it would hide a typo in the one field where a typo matters most.
+        let listen = classify_listen(&raw.listen)?;
+        if let ListenTarget::Routable(addr) = listen {
+            if !raw.allow_routable_bind {
+                return Err(ConfigError::RoutableBindRefused { addr });
             }
-            other => Ok(other),
         }
+        Ok(ServerConfig {
+            listen,
+            state_root: raw.state_root,
+        })
+    }
+
+    /// Where a listener may bind. Already checked — see [`ServerConfig::parse`].
+    pub fn listen(&self) -> &ListenTarget {
+        &self.listen
     }
 
     /// Where persisted orchestration state lives for this daemon.
@@ -225,8 +266,8 @@ impl ServerConfig {
 /// **No DNS, deliberately.** A hostname would have to be resolved to know
 /// whether it is loopback, the answer could differ between the check and the
 /// bind, and a resolver that returns a routable address for a name the
-/// operator believed was local would launder §1.2's control into a lookup.
-/// So an IP literal is required, and a name is refused with that said out loud.
+/// operator believed was local would launder §1.2's control into a lookup. So
+/// an IP literal is required, and a name is refused with that said out loud.
 pub fn classify_listen(value: &str) -> Result<ListenTarget, ConfigError> {
     let value = value.trim();
     if value.is_empty() {
@@ -272,16 +313,22 @@ mod tests {
         ServerConfig::parse(yaml, Path::new("loomux-server.yml"))
     }
 
-    // ---- §1.2 control 1: a routable bind is refused unless asked for ----
+    // ---- §1.2 control 1: a routable bind is refused AT CONFIG LOAD ----
 
     #[test]
-    fn a_wildcard_bind_is_refused_without_the_flag() {
+    fn a_config_naming_a_routable_address_does_not_load() {
         // The café case from remote-engine-protocol.md §1.2, and the one an
         // operator is most likely to type because every other daemon accepts
-        // it: the daemon has NO authentication, so this is the whole boundary.
-        for value in ["0.0.0.0:8788", "[::]:8788", "192.168.1.5:8788", "10.0.0.7:22000"] {
-            let c = cfg(&format!("listen: \"{value}\"")).expect("parses");
-            match c.resolve_listen() {
+        // it. The daemon has NO authentication, so this is the whole boundary
+        // — and it is enforced here, with no socket in sight: the config is
+        // INVALID, not merely unserved.
+        for value in [
+            "0.0.0.0:8788",
+            "[::]:8788",
+            "192.168.1.5:8788",
+            "10.0.0.7:22000",
+        ] {
+            match cfg(&format!("listen: \"{value}\"")) {
                 Err(ConfigError::RoutableBindRefused { .. }) => {}
                 other => panic!("{value} must be refused without allow_routable_bind, got {other:?}"),
             }
@@ -290,8 +337,7 @@ mod tests {
 
     #[test]
     fn the_refusal_message_names_the_flag_that_lifts_it() {
-        let c = cfg("listen: \"0.0.0.0:8788\"").expect("parses");
-        let err = c.resolve_listen().expect_err("refused");
+        let err = cfg("listen: \"0.0.0.0:8788\"").expect_err("refused");
         let msg = err.to_string();
         assert!(
             msg.contains("allow_routable_bind"),
@@ -301,29 +347,26 @@ mod tests {
 
     #[test]
     fn the_flag_lifts_the_refusal_and_the_target_still_says_it_is_routable() {
-        let c = cfg("listen: \"0.0.0.0:8788\"\nallow_routable_bind: true").expect("parses");
-        let target = c.resolve_listen().expect("explicitly allowed");
+        let c = cfg("listen: \"0.0.0.0:8788\"\nallow_routable_bind: true").expect("explicitly allowed");
         assert!(
-            target.is_routable(),
+            c.listen().is_routable(),
             "an allowed routable bind must still be MARKED routable — the startup banner and \
              every later slice's warning key off this, not off the config flag"
         );
-        assert!(target.describe().contains("ROUTABLE"));
+        assert!(c.listen().describe().contains("ROUTABLE"));
     }
 
     #[test]
     fn loopback_and_unix_need_no_flag() {
-        for (value, expect_routable) in [
-            ("127.0.0.1:8788", false),
-            ("127.0.0.2:1", false),
-            ("[::1]:8788", false),
-            ("unix:/run/loomux/engine.sock", false),
+        for value in [
+            "127.0.0.1:8788",
+            "127.0.0.2:1",
+            "[::1]:8788",
+            "unix:/run/loomux/engine.sock",
         ] {
-            let target = cfg(&format!("listen: \"{value}\""))
-                .expect("parses")
-                .resolve_listen()
+            let c = cfg(&format!("listen: \"{value}\""))
                 .unwrap_or_else(|e| panic!("{value} must be allowed by default: {e}"));
-            assert_eq!(target.is_routable(), expect_routable, "{value}");
+            assert!(!c.listen().is_routable(), "{value}");
         }
     }
 
@@ -333,17 +376,27 @@ mod tests {
         // it removes a refusal, it does not select an address.
         let c = cfg("listen: \"127.0.0.1:8788\"\nallow_routable_bind: true").expect("parses");
         assert_eq!(
-            c.resolve_listen().expect("allowed"),
-            ListenTarget::Loopback("127.0.0.1:8788".parse().unwrap())
+            c.listen(),
+            &ListenTarget::Loopback("127.0.0.1:8788".parse().unwrap())
         );
     }
 
     #[test]
     fn the_default_config_binds_loopback() {
-        let target = ServerConfig::default().resolve_listen().expect("allowed");
         assert!(
-            !target.is_routable(),
+            !ServerConfig::default().listen().is_routable(),
             "a daemon run with no config at all must not be reachable from the network"
+        );
+    }
+
+    #[test]
+    fn default_config_matches_the_documented_default() {
+        // `Default` is built from the parts and `DEFAULT_LISTEN` is the string
+        // an operator copies into a file; nothing but this test stops the two
+        // from drifting apart.
+        assert_eq!(
+            ServerConfig::default().listen(),
+            &classify_listen(DEFAULT_LISTEN).expect("the documented default must classify")
         );
     }
 
@@ -355,7 +408,7 @@ mod tests {
         // differ between this check and the bind. Refusing is the fail-closed
         // reading; resolving would put §1.2's control behind a lookup.
         for value in ["localhost:8788", "my-server:8788", "example.com:80"] {
-            match classify_listen(value) {
+            match cfg(&format!("listen: \"{value}\"")) {
                 Err(ConfigError::Listen { .. }) => {}
                 other => panic!("{value} must be refused, got {other:?}"),
             }
@@ -411,15 +464,16 @@ mod tests {
     #[test]
     fn a_partial_config_keeps_the_defaults_for_what_it_omits() {
         let c = cfg("state_root: /var/lib/loomux").expect("parses");
-        assert_eq!(c.listen, DEFAULT_LISTEN);
-        assert!(!c.allow_routable_bind);
-        assert_eq!(c.state_root, Some(PathBuf::from("/var/lib/loomux")));
+        assert_eq!(c.listen(), ServerConfig::default().listen());
+        assert_eq!(c.state_root(), PathBuf::from("/var/lib/loomux"));
     }
 
     #[test]
     fn the_state_root_override_wins_over_the_engine_data_root() {
-        let c = cfg("state_root: /var/lib/loomux").expect("parses");
-        assert_eq!(c.state_root(), PathBuf::from("/var/lib/loomux"));
+        assert_eq!(
+            cfg("state_root: /var/lib/loomux").expect("parses").state_root(),
+            PathBuf::from("/var/lib/loomux")
+        );
         // And with no override the daemon defers to the engine rather than
         // inventing a second opinion about where state lives.
         assert_eq!(

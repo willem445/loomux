@@ -111,8 +111,24 @@ free-by-assumption — so both are **v1 requirements**, not recommendations:
    (§4.1) for the future browser client; it costs nothing and it is the one
    control that must **not** defer with the rest of the auth work.
 
-Both are cheap, both belong to C2 (the listener slice), and together they are
-what makes "SSH to a workstation" a boundary rather than a hope.
+Both are cheap, and together they are what makes "SSH to a workstation" a
+boundary rather than a hope. They land in **different slices**, which this note
+originally assigned both to C2 and now records otherwise:
+
+- **Control 1 landed in C1a**, the daemon skeleton, as **config-layer
+  validation**: a config naming a routable address without
+  `allow_routable_bind: true` does not load at all, and `ServerConfig` holds an
+  already-classified `ListenTarget` so an unchecked one is unrepresentable —
+  the `GroupId` shape (#904) applied to a bind address. It belongs there
+  because the config schema names the address anyway, and a field whose unsafe
+  value is spellable with the refusal deferred is a half contract; deciding it
+  at parse time also needs no socket, which is what makes it C1a's to test.
+  **C2 must not re-implement it**: it receives a checked value and binds it,
+  and it must not re-derive the address from the config text.
+- **Control 2 remains C2's** — there is no upgrade to check until a listener
+  exists.
+
+See `doc/design/remote-engine-daemon.md` §3 for the full argument.
 
 ### 1.3 The accepted risk, stated plainly
 
@@ -1133,9 +1149,11 @@ queued behind it. The prototype path is now:
   A1    engine workspace scaffold                 ── start now, the serial chain's head
   A2 ► A3 ► A4  engine extraction (#847 Ph. 0-2 +)── the crate boundary the daemon consumes
 
-  C1'   server skeleton, NO auth                  ── config + wiring only; loopback bind
-                                                     + Origin refusal (§1.2) are C2's
-  C2 ► C4 ► C5   listener, streams, replay
+  C1a   server skeleton, NO auth                  ── crate + config; CARRIES §1.2's bind
+                                                     refusal as config validation
+  C1b   engine hosting (waits A4)                 ── the daemon owns a registry
+  C2 ► C4 ► C5   listener, streams, replay        ── Origin refusal (§1.2) is C2's; the
+                                                     bind refusal is NOT C2's to repeat
   C3    headless PaneHost (parallel, waits A4)
   D1 ► D2        remote client (D1 waits B1 fixtures — available now)
   E1 ► E2        docker-ready, then containers (fast-follow, H5)
@@ -1156,9 +1174,10 @@ owns a registry and serves nothing yet — days, not weeks.
   merges ahead of it is a blocking finding (§7 T2).
 - **The two §1.2 controls are v1 requirements** — loopback-or-unix-socket bind
   with a routable interface refused by default, and `Origin` refusal on upgrade.
-  They belong to C2 and they are what the accepted risk in §1.3 is conditioned
-  on. A C2 that ships without them has not deferred security; it has removed the
-  boundary the deferral assumed.
+  They are what the accepted risk in §1.3 is conditioned on. A prototype that
+  ships without them has not deferred security; it has removed the boundary the
+  deferral assumed. **The first landed in C1a as config-layer validation and is
+  not C2's to repeat** (§1.2); the second is C2's, unchanged.
 - **Roster classification lands with the dispatcher** (§5.1), default-deny, with
   its test. Tiers defer (§5.3); classification does not.
 
@@ -1215,9 +1234,9 @@ deployment documentation and §8.2's Pi topology — not to any prototype slice.
 Cleared to start:
 
 - **A1** — engine workspace scaffold, then the A2 → A3 → A4 extraction chain.
-- **C** — the daemon, without auth: skeleton, listener (carrying §1.2's two
-  controls and §5.1's roster), headless `PaneHost`, per-client streams,
-  replay-on-attach.
+- **C** — the daemon, without auth: skeleton (carrying §1.2's bind refusal as
+  config validation), listener (carrying §1.2's `Origin` refusal and §5.1's
+  roster), headless `PaneHost`, per-client streams, replay-on-attach.
 - **track-D slices D1 → D2** — the remote client; D1 can begin immediately
   against §4.6's contract fixtures, with no server in existence.
 - **E1** — docker-ready packaging, with **E2** containers as the fast-follow H5
