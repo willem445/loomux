@@ -316,8 +316,11 @@ fn lock_menu_text(locks: &[(String, workflow::ResourcePolicy)]) -> String {
 
 /// The tool surface is role-filtered so workers never even see privileged
 /// tools; `call_tool` re-checks anyway (listing is cosmetic, not security).
-/// `role_hint` additionally scopes `session_digest` to `process`-hinted
-/// worker blocks (#250/#324 slice D) — every other tool ignores it.
+/// `role_hint` additionally scopes two tools, and in both cases it NARROWS the
+/// capability class rather than widening it: `session_digest` is listed only for
+/// `process`-hinted worker blocks (#250/#324 slice D), and `review_verdict` is
+/// withheld from a `liaison`-hinted reviewer block (#891). Every other tool
+/// ignores it.
 ///
 /// `locks` is the group's declared `resources:` block (#858). It is a
 /// LISTING input, not just a description input: a repo that declares no
@@ -601,7 +604,17 @@ fn tool_defs(
     // Reviewers only: the verdict is the gate. Listed for the capability class, and
     // re-checked in `call_tool` — the listing is cosmetic, the dispatch check is the
     // enforcement (a worker that could file its own PASS would make the gate a prop).
-    if role == Role::Reviewer {
+    //
+    // …EXCEPT the liaison (#891). It rides the reviewer capability class because it
+    // needs exactly that posture — persistent, read-only, board-reading — and not
+    // because it reviews anything: it converses with the human and relays. A pane
+    // that never reads a diff must not be able to record the durable, attributed
+    // PASS that opens a merge gate, so the one hint-keyed rule in this file NARROWS
+    // its class rather than widening it. Enforced at all three layers a verdict
+    // passes through (this listing, the `call_tool` dispatch arm, and
+    // `record_verdict` next to the write) — the same "never one check in a JSON
+    // shim" discipline the class check itself gets, for the same reason.
+    if role == Role::Reviewer && role_hint != Some("liaison") {
         tools.push(tool("review_verdict",
             "Record your REVIEW OUTCOME for a pull request. This is durable, attributed state — not a notification — and when this repo's .loomux/workflow.yml declares a merge gate, it is what loomux's gh interceptor reads before allowing `gh pr merge`. Call it once you have finished reviewing, after posting your review on the PR, and then report() to the orchestrator as usual. verdict: `pass` (reviewed, nothing blocking), `fail` (blocking findings — fix and re-review), `escalate` (you will not decide this one: ambiguous requirement, out of your depth, a risk you won't sign off on — a human must look). fail and escalate BOTH refuse the merge, and one blocking verdict beats any number of passes, so never record `pass` to be agreeable or to unblock the queue. Your verdict is bound to the PR's CURRENT HEAD COMMIT: if the author pushes anything afterwards, your pass goes STALE and the gate reopens until you review the new commits and record again — so review the head as it stands, and expect to be asked again after a fix. Re-recording replaces your own earlier verdict (that is how you upgrade a `fail` to a `pass`, and how you refresh a stale one). loomux ALSO records a digest of the PR body as it stands when you call this — you never pass it and cannot forget it — because on a squash-merging repo that body becomes the permanent commit message: it is reviewed content, so review it, and expect to be asked again if it is edited after you pass. The summary must stand on its own for a human reading it a week later: what you reviewed, and what decided the verdict. Verdict words are lowercase.",
             json!({
@@ -1657,6 +1670,16 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             if caller.role != Role::Reviewer {
                 return Err("permission denied: review_verdict is for reviewer-kind blocks — \
                             use report(status, summary)".into());
+            }
+            // The liaison rides the reviewer class for its posture, not to review
+            // (#891). It is denied the verdict at all three layers; see the note
+            // on the `tool_defs` listing for why this narrows rather than widens.
+            if caller.role_hint.as_deref() == Some("liaison") {
+                return Err("permission denied: a liaison block never records a verdict — \
+                            it presents the human's questions and relays their answers, and \
+                            a verdict is what opens this repo's merge gate. Relay what you \
+                            found with message_orchestrator or report(status, summary) \
+                            instead.".into());
             }
             let pr = arg_str(args, "pr").ok_or("pr required")?;
             let verdict = arg_str(args, "verdict").ok_or("verdict required")?;

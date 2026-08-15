@@ -8355,6 +8355,7 @@ fn every_enum_value_the_manifest_declares_is_one_the_engine_accepts() {
         let kind = match hint.as_str() {
             "advisor" => "planner",
             "process" => "worker",
+            "liaison" => "reviewer",
             other => panic!("block.role_hint declares {other:?}, which this test has no pairing for — if the engine grew a hint, pair it here"),
         };
         let text =
@@ -36261,6 +36262,92 @@ fn only_a_reviewer_block_can_record_a_verdict() {
     // Straight at the registry, bypassing the dispatch check entirely.
     assert!(reg.record_verdict(&cw.group, &cw.agent_id, "7", "pass", "sneaking one in").is_err(),
         "the authorization must not live only in the JSON shim");
+}
+
+/// A gated group whose roster ALSO carries a `role_hint: liaison` reviewer
+/// (#891). Deliberately the same shape as [`gated_repo`] with one block added,
+/// so the only thing that differs between the two callers under test is the
+/// hint. The liaison is NOT named in the gate — `parse_workflow` refuses that
+/// outright (`a_gate_may_not_name_a_liaison_as_one_of_its_reviewers`), which is
+/// itself why the block has to be declared this way.
+fn liaison_group() -> (OrchRegistry, tempfile::TempDir, tempfile::TempDir, GroupId) {
+    let (reg, d) = test_registry();
+    reg.set_pr_head_override(Some(HEAD.into()));
+    let td = tempfile::tempdir().unwrap();
+    let dir = td.path().join(".loomux");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("workflow.yml"),
+        "version: 1\nname: with-a-liaison\n\
+         blocks:\n\
+         \x20 - id: worker\n    kind: worker\n\
+         \x20 - id: rev-security\n    kind: reviewer\n    prompt: Security only.\n\
+         \x20 - id: human\n    kind: reviewer\n    role_hint: liaison\n    prompt: Talk to the human.\n\
+         gates:\n  merge:\n    reviewers: [rev-security]\n",
+    )
+    .unwrap();
+    let g = reg
+        .create_group(
+            &td.path().to_string_lossy(),
+            Guardrails { advanced_orchestrator: true, ..rails() },
+        )
+        .unwrap();
+    let id = g.id.clone();
+    (reg, d, td, id)
+}
+
+#[test]
+fn a_liaison_block_can_never_record_a_verdict() {
+    // #891. A liaison rides the REVIEWER capability class — it needs exactly
+    // that posture (read-only, persistent, board-reading) — and reviews
+    // nothing: it converses with the human and relays. A verdict is not a
+    // notification; it is the durable, attributed state this repo's gh shim
+    // reads before allowing `gh pr merge`. So the one thing the reviewer class
+    // grants that a liaison must not have is taken back, at every layer a
+    // verdict passes through.
+    let (reg, _d, _repo, gid) = liaison_group();
+    let liaison = reviewer_caller(&reg, &gid, "human");
+
+    // Layer 2 — the dispatch gate, which is the real enforcement.
+    let denied = record(&reg, &liaison, "7", "pass", "the human seemed happy with it");
+    assert_eq!(denied["isError"], true, "a liaison must not be able to record a verdict");
+    let text = denied["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("liaison"), "the refusal must name the rule, not just say no: {text}");
+
+    // Layer 1 — the listing agrees with it. Cosmetic, but a listing that
+    // disagreed with the gate would teach the agent to keep trying.
+    let names: Vec<String> = dispatch(&reg, &liaison, "tools/list", &Value::Null).unwrap()["tools"]
+        .as_array().unwrap().iter()
+        .map(|t| t["name"].as_str().unwrap_or("").to_string()).collect();
+    assert!(!names.contains(&"review_verdict".to_string()),
+        "a liaison must not even see the tool: {names:?}");
+    // ...and the rest of its reviewer surface is untouched: the hint NARROWS
+    // this one tool, it does not quietly re-tier the block. Without this the
+    // test above would also pass if the liaison had simply been given nothing.
+    assert!(names.contains(&"list_verdicts".to_string()),
+        "a liaison still READS verdicts — it answers 'how is it going': {names:?}");
+    assert!(names.contains(&"message_orchestrator".to_string()),
+        "…and still has the wire it relays the human's intent over: {names:?}");
+
+    // Layer 3 — straight at the registry, bypassing the JSON shim entirely.
+    let err = reg
+        .record_verdict(&liaison.group, &liaison.agent_id, "7", "pass", "sneaking one in")
+        .unwrap_err();
+    assert!(err.contains("liaison"), "the deepest layer must refuse it too: {err}");
+
+    // POSITIVE CONTROL. Every assertion above is satisfied just as well by a
+    // group where NOBODY can record a verdict — which would be a broken gate,
+    // not a guarded one. A plain reviewer in the SAME group must still be able
+    // to record, or "the liaison was refused" says nothing about the liaison.
+    let plain = reviewer_caller(&reg, &gid, "rev-security");
+    recorded(&reg, &plain, "7", "pass", "read the diff, nothing blocking");
+    let recorded_by: Vec<String> = reg
+        .verdicts(&gid, 7)
+        .into_iter()
+        .map(|v| v.block.to_string())
+        .collect();
+    assert_eq!(recorded_by, vec!["rev-security".to_string()],
+        "exactly one verdict exists, and it is the reviewer's — never the liaison's");
 }
 
 #[test]
