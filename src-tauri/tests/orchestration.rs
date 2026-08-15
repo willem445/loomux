@@ -14229,10 +14229,13 @@ fn closing_a_completed_planner_is_idempotent() {
 #[test]
 fn advisor_hinted_planner_auto_closes_on_report_done() {
     // #250/#324 slice D: the advisor is planner-kind (#203's "one plan → one
-    // report → exit" contract), and the LIFECYCLE path never reads role_hint —
+    // report → exit" contract), and the AUTO-CLOSE path never reads role_hint —
     // so `close_completed_planner`'s role gate (keyed on `Role::Planner` alone,
     // never on block id or role_hint) already covers an advisor-hinted block
-    // for free. This pins that claim directly: no idle pane, no standing
+    // for free. (Scoped to this path deliberately: since #891 S4 the idle
+    // reaper DOES read the hint, so "lifecycle never reads role_hint" is no
+    // longer true of lifecycle in general — see
+    // `a_liaison_is_never_taken_by_the_idle_reaper`.) This pins that claim directly: no idle pane, no standing
     // consult process, exactly the #203 precedent the plan cites.
     let (reg, _d) = test_registry();
     let mut g_rails = rails();
@@ -14690,6 +14693,94 @@ fn reaper_spares_a_worker_reactivated_before_the_kill() {
     // And it is still alive in the roster.
     let roster = reg.list_agents(&g.id).to_string();
     assert!(roster.contains(idle.id.as_str()));
+}
+
+#[test]
+fn a_liaison_is_never_taken_by_the_idle_reaper() {
+    // #891 S4, the lifecycle slice's open question answered. Every signal that
+    // clears the idle clock is machine-side — a task at spawn, `send_prompt` —
+    // and a HUMAN typing into a pane clears none of them. So the liaison's own
+    // `report` stamps the clock and the pane's next hour of conversation is
+    // invisible to the reaper, which then kills the human's correspondent and
+    // audits it as "a slot the orchestrator wasn't using was reclaimed" —
+    // sending its only notice to the other pane.
+    //
+    // Written through the REAL path that stamps the clock (a `report` over MCP
+    // dispatch), not by poking `idle_since_ms`: the stamp being genuine is what
+    // makes the exemption load-bearing rather than a skip of something that was
+    // never a candidate anyway — hence the assertion on the stamp itself, and
+    // the plain reviewer beside it as the control.
+    let (reg, _d) = test_registry();
+    let mut g_rails = costed_rails(5, 0);
+    g_rails.blocks.push(workflow::Block {
+        id: "desk".into(),
+        name: "desk".into(),
+        kind: Role::Reviewer,
+        cli: String::new(),
+        model: String::new(),
+        prompt: None,
+        profile: None,
+        allow: vec![],
+        role_hint: Some("liaison".into()),
+        effort: String::new(),
+        context: String::new(),
+    });
+    let g = reg.create_group("C:/tmp/repo", g_rails).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    // The control: a plain reviewer, idle exactly as the liaison is.
+    let rev = reg.spawn_agent(&g.id, Role::Reviewer, "rev", "review #900", false, None).unwrap();
+    // The liaison, spawned the way its own fragment tells the orchestrator to —
+    // by block id, with a task, so it starts with NO idle clock.
+    let desk = reg
+        .spawn_agent_ex(
+            &g.id, Role::Reviewer, Some("desk".into()), "desk", "the human is asking about #891",
+            false, None, None, None, None, None,
+        )
+        .unwrap();
+    assert_eq!(desk.block, "desk");
+    reg.set_pty_for_test(&orch.id, 984);
+    reg.set_pty_for_test(&rev.id, 985);
+    reg.set_pty_for_test(&desk.id, 986);
+
+    // Both report, both go idle. This is the trap in one line: for the liaison
+    // that is the moment the human's conversation starts, not the moment it ends.
+    for (agent, note) in [(&rev, "verdict recorded"), (&desk, "relayed the human's answer")] {
+        let c = reg.resolve_token(&agent.token).unwrap();
+        let r = dispatch(&reg, &c, "tools/call", &json!({ "name": "report",
+            "arguments": { "outcome": "done", "note": note } })).unwrap();
+        assert_eq!(r["isError"], false, "the report must land, or no idle clock was stamped: {r:?}");
+    }
+    let idle_stamped = |id: &str| {
+        reg.list_agents(&g.id)
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["id"] == json!(id))
+            .expect("a live roster row")["idle_since_ms"]
+            .as_u64()
+            .is_some()
+    };
+    assert!(idle_stamped(&desk.id), "the liaison really is idle by the reaper's own measure");
+    assert!(idle_stamped(&rev.id), "and so is the control reviewer");
+
+    let far_future = u64::MAX / 2;
+    assert_eq!(
+        reg.idle_reap_candidates(far_future),
+        vec![rev.id.clone()],
+        "only the plain reviewer is reclaimable — the liaison is a standing conversation"
+    );
+    // ...and the reaper itself, not just its selection. The audit is what is
+    // asserted on rather than the roster's `dead` flag: the kill's own
+    // `kill_agent_as` cannot complete in test mode (no `AppHandle` to reach
+    // `PtyManager`), which is the same boundary
+    // `the_idle_reaper_routes_both_of_its_notices_to_the_audit` states.
+    assert_eq!(reg.reap_idle_agents(far_future), vec![rev.id.clone()]);
+    let log = reg.audit_log(&g.id);
+    let killed = |id: &str| {
+        log.iter().any(|e| e.action == "idle-kill" && e.detail["agent"] == json!(id))
+    };
+    assert!(killed(&rev.id), "the control must really have been reaped, or the sweep did nothing");
+    assert!(!killed(&desk.id), "no idle-kill may ever name the liaison");
 }
 
 #[test]
