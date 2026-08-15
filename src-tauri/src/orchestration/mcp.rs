@@ -1265,13 +1265,22 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                                     owner_rec.role
                                 )
                             })?;
-                        reg.group(&caller.group)
+                        // #891 S4 / #1072 review N5: the same class-default
+                        // resolution `spawn_agent_ex` does, so it needs the same
+                        // refusal — `block_for` now skips a liaison, and a bare
+                        // resume into a liaison-only roster would otherwise be
+                        // told the file declares no reviewer block while it
+                        // plainly declares one.
+                        let group = reg.group(&caller.group);
+                        group
+                            .as_ref()
                             .and_then(|g| g.guardrails.block_for(owner_role).map(|b| b.id.clone()))
-                            .ok_or_else(|| {
-                                format!(
+                            .ok_or_else(|| match group.as_ref() {
+                                Some(g) => g.guardrails.no_default_block_message(owner_role),
+                                None => format!(
                                     "this group's workflow declares no {} block",
                                     owner_role.as_str()
-                                )
+                                ),
                             })?
                     } else {
                         owner_rec.block.clone()

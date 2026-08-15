@@ -1277,7 +1277,65 @@ fn a_declared_liaison_gives_the_orchestrator_its_routing_note_with_the_block_id(
     // it" would have the orchestrator watching for a notice that can no longer
     // arrive, and the sentence that replaced it is load-bearing in the other
     // direction — the orchestrator is now the ONLY thing that can end the pane.
-    pinned(at, note, "guardrail agrees and skips it", "S4's exemption is only safe to rely on if the orchestrator is told it holds — and told that killing the pane is therefore entirely its own doing");
+    pinned(at, note, "guardrail agrees and skips it", "S4's exemption is only safe to rely on if the orchestrator is told it holds");
+    // The second half of that rationale needs its own anchor, or it is not pinned
+    // at all (#1072 review N6). Demonstrated by this PR: the consequence clause was
+    // rewritten materially — "leaves YOU the only thing that can end it" narrowed to
+    // the group-scoped claim — with no test file touched and CI green, which is
+    // exactly what a pin covering only the first half permits.
+    pinned(at, note, "leaves nothing but your own", "with the reaper out of the picture the orchestrator IS the pane's mortality, and an orchestrator that is not told so will keep treating the liaison as something that lapses on its own");
+}
+
+#[test]
+fn the_liaison_note_never_says_the_pane_gets_idle_killed() {
+    // #1072 review B1. The fragment makes two claims about this pane's mortality,
+    // and S4 made one of them false: the questions bullet inherited the GENERAL
+    // agent-pane durability argument ("an agent pane compacts, dies and gets
+    // idle-killed"), which since the exemption contradicts the reaper sentence
+    // forty lines below it — in the same generated document, read by the
+    // orchestrator that has to act on it. The half that says the pane lapses is
+    // the half arguing against relying on it, which is the reliance S4 exists to
+    // make safe.
+    //
+    // Asserted as an ABSENCE on purpose. Every other pin here holds a sentence
+    // that must be PRESENT, and no anchor can catch a stale claim that a later
+    // edit re-imports from the general case — which is how this one survived a
+    // sweep that fixed both of its design-note twins. The two negative controls
+    // matter as much as the assertion: the fragment must still be there, and must
+    // still discuss the guardrail, or this passes by the subject vanishing.
+    //
+    // `idle-kill` itself is legitimate and expected here (the guardrail is named,
+    // and said to skip this pane). It is `idle-killed` — the past participle,
+    // asserting it happens to THIS pane — that must never come back.
+    let (reg, _d) = test_registry();
+    let repo = Repo::new().workflow(
+        "version: 1\nblocks:\n\
+         \x20 - id: worker\n    kind: worker\n\
+         \x20 - id: human-desk\n    kind: reviewer\n    role_hint: liaison\n",
+    );
+    let g = reg.create_group(&repo.path(), rails()).unwrap();
+    let flat_doc = flat(&instructions_lf(&reg, &g.id, "orchestrator.md"));
+    let note = section(
+        &flat_doc,
+        "you have a liaison",
+        "a custom workflow config is your group's roster",
+    );
+
+    assert!(
+        note.contains("idle-kill guardrail"),
+        "control: the fragment must still discuss the guardrail, or the absence below is \
+         satisfied by the whole subject being gone: {note}"
+    );
+    assert!(
+        note.contains("never the record of one"),
+        "control: the durability bullet the stale claim lived in must still be here: {note}"
+    );
+    assert!(
+        !note.contains("idle-killed"),
+        "the liaison note tells the orchestrator this pane gets idle-killed, which S4 made \
+         false — `idle_reap_candidates` skips a liaison-hinted block. The durability argument \
+         it supports still holds on `compacts, wedges and dies`: {note}"
+    );
 }
 
 #[test]
@@ -1406,6 +1464,23 @@ fn a_roster_whose_only_reviewer_is_the_liaison_refuses_a_bare_reviewer_spawn_and
     assert!(
         err.contains("desk") && err.contains("liaison"),
         "the refusal must name the block it skipped and why: {err}"
+    );
+    // ...and it is the SHARED wording, not a copy of it (#1072 review N5). There
+    // are two sites that resolve a class to its default and can come up empty —
+    // this one and `mcp.rs`'s pre-#222 bare resume — and the second was still
+    // emitting the flat "declares no reviewer block" this PR calls wrong. Both
+    // now call `no_default_block_message`; this equality is what keeps the spawn
+    // path from drifting away from it again.
+    assert_eq!(
+        err,
+        g.guardrails.no_default_block_message(Role::Reviewer),
+        "the spawn refusal must BE the shared message, so the two call sites cannot diverge"
+    );
+    // The un-shadowed case keeps the plain wording — the liaison clause must not
+    // start appearing on rosters that simply declare no such block.
+    assert_eq!(
+        g.guardrails.no_default_block_message(Role::Planner),
+        "this group's workflow declares no planner block"
     );
     // Fails closed: the refusal did not open the liaison's pane instead.
     let roster = reg.list_agents(&g.id);
