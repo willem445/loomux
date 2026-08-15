@@ -203,7 +203,9 @@ narrow their ask back down to the original ticket on your own judgment.
   it) — so a claim deleted from one survives on the others. Verify the purge by
   grepping the *entity* the claim names, never the phrasing you rewrote.
   Signature: a re-review that clears a claim on two surfaces and finds it alive
-  on the third (#878).
+  on the third (#878). An earlier **commit subject** superseded later in the same
+  PR is a surface too — the squash aggregates it and it cannot be edited in
+  place, so flag it in the body for whoever squashes (#909).
 - **Historical context lives in design notes, ADRs, and issue/PR history —
   never in user docs, this repo's own agent instruction files
   (`.github/agents/`, `.claude/skills/`, `.loomux/workflow.yml`), or this
