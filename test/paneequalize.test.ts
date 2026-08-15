@@ -18,6 +18,19 @@ const shares = (weights: readonly number[]): number[] => {
 
 const total = (weights: readonly number[]): number => weights.reduce((a, b) => a + b, 0);
 
+/** Assert two splits size their panes identically — the only comparison that
+ *  means anything across a rescale, since a pane's size is its share. */
+const assertSameShares = (got: readonly number[], want: readonly number[], what: string): void => {
+  assert.equal(got.length, want.length, `${what}: pane count changed`);
+  const [g, w] = [shares(got), shares(want)];
+  for (let i = 0; i < g.length; i++) {
+    assert.ok(
+      Math.abs(g[i] - w[i]) < 1e-9,
+      `${what}: pane ${i} moved from ${w[i]} to ${g[i]} (${JSON.stringify(got)} vs ${JSON.stringify(want)})`
+    );
+  }
+};
+
 /** Assert every pane in the split holds the same share, within float noise. */
 const assertEven = (weights: readonly number[], what: string): void => {
   const expected = 1 / weights.length;
@@ -177,6 +190,82 @@ test("readGrow falls back to 1 for anything a style attribute can hand it", () =
   assert.equal(readGrow("0"), 1); // would be an invisible pane
   assert.equal(readGrow("-1"), 1); // CSS drops it; we must not write it
   assert.equal(readGrow("banana"), 1);
+});
+
+// ---------- magnitude (#954) ----------
+
+/** A magnitude a human can still read out of a style attribute, and that a
+ *  float can keep multiplying without drama. Deliberately far looser than
+ *  anything the module aims for: the claim under test is "bounded", not
+ *  "bounded at exactly this number", so a policy that lands anywhere sane
+ *  passes and only a policy that grows without limit fails. */
+const LEGIBLE = 1e6;
+
+/** Assert a split's weights are numbers a human and a float can both live
+ *  with — the property that survives any number of open/close cycles. */
+const assertBounded = (weights: readonly number[], what: string): void => {
+  for (const w of weights) {
+    assert.ok(
+      w <= LEGIBLE && w >= 1 / LEGIBLE,
+      `${what}: weight ${w} is outside any legible range (${JSON.stringify(weights)})`
+    );
+  }
+};
+
+test("150 open/close cycles leave the weights bounded, not in exponential notation", () => {
+  // #954. Every close preserves the split's total while dropping a pane, so the
+  // MEAN of the row rises by (n+1)/n per cycle — 4/3 on a three-pane row — and
+  // an insert (which arrives at that mean) does nothing to bring it back down.
+  // The ratios stay right the whole way, which is why this is invisible until
+  // the weights themselves reach exponential notation in a style attribute
+  // (~1e18 by 150 cycles) and stop having float headroom above them.
+  let weights = [1, 1, 1];
+  for (let cycle = 0; cycle < 150; cycle++) {
+    weights = planEvenInsert(weights, 1).weights; // open a pane beside the middle one
+    weights = planRemoval(weights, 2); // close that same pane again
+    assert.equal(weights.length, 3, `cycle ${cycle} changed the pane count`);
+    assertEven(weights, `cycle ${cycle}`); // the layout must stay right, too
+  }
+  assertBounded(weights, "after 150 open/close cycles");
+});
+
+test("a split that arrives at an absurd scale is re-based, and no pane moves doing it", () => {
+  // Both directions of absurd: a layout persisted by a build without the clamp
+  // comes back at whatever magnitude it drifted to, and a hand-edited or
+  // long-shrunk one comes back near the denormals where ratios stop being
+  // representable. Either way the split's arithmetic is scale-free — the same
+  // shape at any magnitude sizes its panes identically — so re-basing one into
+  // range must be invisible: same shares, same layout, legible numbers.
+  const shape = [2, 6, 4];
+  for (const scale of [1e9, 1e-9]) {
+    const absurd = shape.map((w) => w * scale);
+
+    const inserted = planEvenInsert(absurd, 1).weights;
+    assertBounded(inserted, `insert into a row at ${scale}x`);
+    assertSameShares(inserted, planEvenInsert(shape, 1).weights, `insert at ${scale}x`);
+
+    const removed = planRemoval(absurd, 0);
+    assertBounded(removed, `removal from a row at ${scale}x`);
+    assertSameShares(removed, planRemoval(shape, 0), `removal at ${scale}x`);
+  }
+});
+
+test("a weight big enough to overflow the split's total still never reaches a style attribute", () => {
+  // Two panes at 1e308 sum to Infinity, so the mean the newcomer arrives at is
+  // Infinity and the freed weight a close shares out is Infinity/n — junk that
+  // the per-weight repair upstream cannot see, because every INPUT weight is a
+  // perfectly finite positive number. Re-basing before the arithmetic is what
+  // keeps the sum finite.
+  const overflowing = [1e308, 1e308, 1e308];
+  for (const [what, weights] of [
+    ["insert", planEvenInsert(overflowing, 0).weights],
+    ["removal", planRemoval(overflowing, 0)],
+  ] as const) {
+    for (const w of weights) {
+      assert.ok(Number.isFinite(w) && w > 0, `${what} leaked ${w} from an overflowing row`);
+    }
+    assertEven(weights, `${what} on an overflowing row`);
+  }
 });
 
 // ---------- the invariant that ties the two halves together ----------
