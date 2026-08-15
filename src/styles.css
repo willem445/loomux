@@ -70,7 +70,7 @@
 
   /* --- CHANNEL 3: identity. Hue that says WHICH thing this is — a surface, an action
          family, a CLI, a git lane — never what state it is in. Consumers: coloured icons
-         and their role table, per-CLI marks, git-graph lanes, diff add/delete, task-board
+         and their role table, git-graph lanes, diff add/delete, task-board
          columns, workflow-mode chrome, project tabs, resource meters, the syntax
          sub-palette. Four of these carry the same pigment as a --state-* token above and
          that is deliberate: loomux has one palette, and the token a surface NAMES is what
@@ -87,6 +87,30 @@
   --id-azure: #5590d9;
   --id-violet: #a97fd6;
   --id-orchid: #e767a8;
+
+  /* --- CHANNEL 3, the per-CLI sub-table: WHICH AGENT PROGRAM is this pane running. One
+         question, one closed roster, and exactly two positions — the agent-type mark in a
+         pane header / the setup card's preview, and the session list's CLI chip.
+
+         A SEPARATE PREFIX, NOT EIGHT MORE --id-* ENTRIES, and the reason is the bijection
+         directly below: each identity hue is claimed by exactly one ICON ROLE, both
+         directions pinned by test/icons.test.ts. Handing --id-jade to opencode would not add
+         a meaning, it would give jade a second one, and jade would stop resolving to
+         `content`. So a CLI hue needs a pigment no role has claimed — a new set, a new
+         prefix — and the prefix doubles as the reviewable signal that a rule is answering
+         "which program" rather than "which family".
+
+         Still the identity channel, not a fourth one: the state positions stay reserved and
+         no --cli-* token may enter one either. Values, provenance (evocation, never a
+         vendor's own hex) and the separation measurements are theme.ts §CLI_HUES and
+         doc/design/ui-redesign.md §The per-CLI hues. */
+  --cli-claude: #e08a5f;
+  --cli-codex: #3ec2a8;
+  --cli-copilot: #7fa8d8;
+  --cli-opencode: #5fc873;
+  --cli-gemini: #8b8ff0;
+  --cli-hermes: #e072c0;
+  --cli-ante: #c3c455;
 
   /* --- type roles. Sans carries labels and titles; mono is reserved for MACHINE
          IDENTIFIERS — paths, branches, ids, counts, timings — so the mono face always
@@ -169,6 +193,34 @@
 .ic-board     { color: var(--id-orchid); } /* tasks, issues, audit, timeline */
 .ic-danger    { color: var(--id-rose); }   /* destructive actions */
 .ic-live      { color: var(--id-azure); }  /* capture in progress */
+
+/* ===================== PER-CLI DYES — which program is this? (#1020 wave 2) ==============
+ *
+ * The same shape as the role table above, for the one question that table cannot answer.
+ * `.ic-fleet` says "this is an agent"; these say WHICH agent, and before them every agent
+ * pane in the app was the same violet — so a wall of ten panes running three CLIs came out
+ * one colour and the glyph had to be read rather than seen, which is the opposite of what
+ * an agent mark is for.
+ *
+ * EITHER/OR WITH `.ic-fleet`, NEVER BOTH, and that is deliberate rather than tidy.
+ * `src/agenticons.ts` stamps `cli-<program>` on a mark whose program has a hue here and
+ * `ic-fleet` on one that does not, so no rule below ever has to out-specify the role table.
+ * A mark that had to win a cascade fight against `.ic-fleet` would be a pin that holds only
+ * while the two blocks stay in this source order, and test/icons.test.ts's `.ic-*` scan
+ * states in its own comment that it cannot see an overriding selector. Nothing here is one.
+ *
+ * A CLI WITH NO HUE KEEPS THE FLEET VIOLET, which is the honest answer rather than a gap:
+ * loomux gains CLIs faster than it gains a considered pigment for each, and violet reads as
+ * "an agent loomux has no brand hue for" — the colour twin of the letter badge's own total
+ * fallback. The roster is theme.ts's CLI_HUES; test/agenticons.test.ts pins that list, this
+ * block and the renderer's stamping against each other in every direction. */
+.cli-claude   { color: var(--cli-claude); }
+.cli-codex    { color: var(--cli-codex); }
+.cli-copilot  { color: var(--cli-copilot); }
+.cli-opencode { color: var(--cli-opencode); }
+.cli-gemini   { color: var(--cli-gemini); }
+.cli-hermes   { color: var(--cli-hermes); }
+.cli-ante     { color: var(--cli-ante); }
 
 * { box-sizing: border-box; }
 
@@ -256,13 +308,32 @@ html, body {
 .grid-root { flex: 1; min-width: 0; min-height: 0; display: flex; padding: 8px; position: relative; }
 
 /* ---------- project tabs (#63) ---------- */
+/* THE STRIP READS BOTTOM-UP: ground, then chip, then the tab you are in (#1020 wave 2).
+ *
+ * It used to read the other way round, which is why the human's note was that the tabs were
+ * hard to tell apart. Three things were fighting:
+ *
+ *   1. the bar and an inactive tab were BOTH --surface-1, i.e. the same colour, so an
+ *      unselected tab had no body at all — only its hairline said a tab was there;
+ *   2. the active tab was --surface-term, the DEEPEST surface in the app — so the one tab
+ *      you are actually in was the darkest thing in the strip, which inverts the elevation
+ *      model's own rule that height means "closer to the human";
+ *   3. and it did not buy the browser-tab continuity that would have justified the
+ *      inversion, because #tab-bar's own bottom hairline runs straight across underneath
+ *      and the workspace below is --surface-0 anyway, not --surface-term.
+ *
+ * So: the BAR drops to the app ground, an inactive tab is an OUTLINE (transparent body, so
+ * the ground shows through and the hairline is doing a job rather than standing in for one),
+ * hover fills one step, and the ACTIVE tab is the raised surface with the strong border and
+ * the coloured top edge. Four legible steps out of the ladder that already exists — no new
+ * token, no contrast block, and the accent edge still carries the per-tab colour. */
 #tab-bar {
   flex: none; display: flex; align-items: stretch; gap: 4px;
   padding: 4px 8px 0 8px;
   /* Flat, because it always was: the two stops of the gradient this replaced were one
      step apart and read as a single value. The top bar's gradient is a real one and keeps
      its two stops. */
-  background: var(--surface-1);
+  background: var(--surface-0);
   border-bottom: 1px solid var(--line);
   overflow-x: auto;
 }
@@ -272,18 +343,25 @@ html, body {
   max-width: 220px;
   padding: 5px 8px 6px 8px;
   font-size: 12px; color: var(--ink-dim); cursor: pointer;
-  background: var(--surface-1);
+  /* Transparent, not --surface-0: an inactive tab is an outline on the bar, and painting
+     the bar's own colour back over it is what made the hairline the only thing visible. */
+  background: transparent;
   border: 1px solid var(--line);
   border-bottom: none;
   border-radius: 8px 8px 0 0;
   border-top: 2px solid transparent;
   transition: color 0.15s var(--ease), background 0.15s var(--ease);
 }
-.tab:hover { color: var(--ink); background: var(--surface-2); }
+.tab:hover { color: var(--ink); background: var(--surface-1); }
 .tab.active {
   color: var(--ink);
-  background: var(--surface-term);
-  /* The colored top edge is the tab's accent (falls back to --accent). */
+  /* The raised step — cards, inputs, popovers — because the tab you are in is the surface
+     closest to the human in this strip. Its border climbs the ramp with it: an edge that
+     has to be seen against a lit body needs the strong step, not the hairline. */
+  background: var(--surface-2);
+  border-color: var(--line-strong);
+  /* The colored top edge is the tab's accent (falls back to --accent). Declared after
+     `border-color` on purpose — this is the one edge that carries meaning. */
   border-top-color: var(--tab-color, var(--accent));
 }
 .tab-swatch {
@@ -635,9 +713,10 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 
 /* ---------- agent-type mark (#992) ---------- */
 /* Which CLI is running in this pane, as a glyph at the head of the header row.
-   It takes the fleet role's violet from .ic-fleet (src/icons.ts: "the agents
-   themselves") — this surface adds no colour of its own, which is what keeps the
-   identity channel's role→hue mapping the only way an icon reaches a colour.
+   It takes its CLI's own pigment from the .cli-* block at the top of this file, or
+   the fleet role's violet from .ic-fleet for a program with no hue of its own —
+   this surface adds no colour of its own, which is what keeps a documented
+   program→hue (or role→hue) mapping the only way an icon reaches a colour.
    `display: flex` so the inline SVG sits on the row's optical centre rather than
    on the text baseline; the letter-badge tier's <text> inherits the header's
    font-family from here, so the fallback is drawn in the app's own type. */
@@ -1242,13 +1321,17 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   flex: none; font-size: 9px; font-weight: 700; letter-spacing: 0.8px;
   border-radius: 4px; padding: 2px 6px;
 }
-.session-badge.claude { background: color-mix(in srgb, var(--id-amber) 16%, transparent); color: var(--id-amber); }
-.session-badge.copilot { background: color-mix(in srgb, var(--id-azure) 16%, transparent); color: var(--id-azure); }
-/* #722: a third session source. Teal, so it reads apart from copilot's blue
-   at a glance in a mixed list — and distinct from the role/PR chips, which
-   sit on the same row and mean something else entirely. A source with no rule
-   here still renders as the base chip above: uncoloured, never unlabelled. */
-.session-badge.opencode { background: color-mix(in srgb, var(--id-jade) 16%, transparent); color: var(--id-jade); }
+/* The session list's CLI chip — the app's OTHER "which program is this" position, and now
+   on the same table as the pane mark (#1020 wave 2). These three used to name --id-amber /
+   --id-azure / --id-jade, so loomux answered one question with two different colour tables:
+   a Copilot session chip was literally the same azure as the ORCHESTRATOR role chip beside
+   it on the same row. Naming --cli-* instead makes the CLI answer one answer app-wide (the
+   shape test/theme.test.ts already enforces for the four agent roles) and pulls the chip off
+   its neighbour's hue. A source with no rule here still renders as the base chip above:
+   uncoloured, never unlabelled. */
+.session-badge.claude { background: color-mix(in srgb, var(--cli-claude) 16%, transparent); color: var(--cli-claude); }
+.session-badge.copilot { background: color-mix(in srgb, var(--cli-copilot) 16%, transparent); color: var(--cli-copilot); }
+.session-badge.opencode { background: color-mix(in srgb, var(--cli-opencode) 16%, transparent); color: var(--cli-opencode); }
 /* The four agent roles, in the one role table this app has: orchestrator azure, worker
    jade, reviewer violet, planner amber. Every surface that names a role uses it — this
    list, .group-role.role-* and the workflow pane's .wf-node-* / .wf-chip-* — and

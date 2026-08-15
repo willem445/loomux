@@ -122,6 +122,60 @@ export const MARK_SOURCES: Record<string, string> = Object.fromEntries(
 );
 
 /**
+ * §The dye — which CLI, in colour, alongside which CLI in shape.
+ *
+ * Every mark used to be violet: it took the `fleet` icon role's dye, which answers *is this
+ * an agent* and says nothing about *which one* — the question this whole module exists for.
+ * With three CLIs on screen the shape was doing all the work, and the shape is a single
+ * letter for most of them.
+ *
+ * So a mark whose program is on this roster wears `cli-<program>` and takes that program's
+ * pigment; a mark whose program is not wears `ic-fleet` and keeps the violet, which reads as
+ * "an agent loomux has no brand hue for" — the colour twin of the letter badge's own total
+ * fallback, and the same refusal to guess (§the module header). EITHER, NEVER BOTH: a mark
+ * carrying both classes would need one CSS rule to out-specify the other, and that pin would
+ * hold only while the two blocks stayed in their current source order in styles.css.
+ *
+ * THE LIST, NOT THE HUES. This module still never learns a colour (§the header's "colour is
+ * assignment, not asset"): it knows only which programs HAVE one. The pigments live in
+ * theme.ts's `CLI_HUES` and reach the mark through `.cli-<program>` in styles.css, and
+ * test/agenticons.test.ts pins all three surfaces against each other so the roster cannot
+ * drift into a class nothing dyes or a token nothing stamps.
+ *
+ * A CLOSED ROSTER IS ALSO THE INJECTION ANSWER. `program` comes off a launch line, and this
+ * value lands in a `class` attribute inside an `innerHTML` string — the same untrusted byte
+ * the letter badge clamps to one character (§Safety). Interpolating it would put
+ * `"><img onerror=…>` straight into the markup. It cannot: only a name that MATCHES one of
+ * the literals below is ever interpolated, so what reaches the attribute is one of seven
+ * compile-time strings and there is nothing to escape. Same discipline as the clamp — make
+ * the hostile value unexpressible rather than escaped.
+ */
+export const CLI_DYE_PROGRAMS = [
+  "claude",
+  "codex",
+  "copilot",
+  "opencode",
+  "gemini",
+  "hermes",
+  "ante",
+] as const;
+
+/** Membership test for the roster above. A `Set`, so a program named after a prototype
+ *  member (`constructor`, `__proto__`) answers `false` like everything else — the same hole
+ *  `MARK`'s null prototype closes, closed the same way at the structure. */
+const CLI_DYED = new Set<string>(CLI_DYE_PROGRAMS);
+
+/**
+ * The ONE colour class a mark wears: its CLI's, or the fleet role's.
+ *
+ * Exported because the pane-setup preview and the header render the same view object, and a
+ * test that wants to ask "what dyes this mark" should not have to parse an SVG string.
+ */
+export function cliDyeClass(program: string | null): string {
+  return program !== null && CLI_DYED.has(program) ? `cli-${program}` : "ic-fleet";
+}
+
+/**
  * The letter badge's grid. Sixteen, not the registry's twenty-four, because the badge is
  * drawn to sit beside `copilot-16` — the two tiers have to look like one channel, and the
  * one thing that guarantees that is sharing a grid with the marks rather than with
@@ -207,7 +261,10 @@ const NOT_AN_AGENT = new Set([
 /** The neutral tier: "loomux does not know which agent this is", drawn as `?` and — the
  *  load-bearing part — captioned WITHOUT an "Agent CLI:" claim. */
 function neutralView(label: string, size: number): AgentMarkView {
-  return { program: null, kind: "unknown", label, svg: badgeSvg("?", size) };
+  // `null` program ⇒ the fleet dye. A neutral badge must not borrow a CLI's pigment for the
+  // same reason it must not borrow a CLI's caption: both would be answering a question this
+  // tier exists to decline.
+  return { program: null, kind: "unknown", label, svg: badgeSvg("?", size, cliDyeClass(null)) };
 }
 
 /** What a remote pane says when loomux holds no far-end CLI for it. */
@@ -215,9 +272,9 @@ export const REMOTE_UNKNOWN_LABEL = "Remote pane — agent CLI unknown";
 
 /** The generated badge. No `font-family`: SVG text inherits it from the header, so the
  *  letter is the app's own type rather than a second typeface nobody chose. */
-function badgeSvg(letter: string, size: number): string {
+function badgeSvg(letter: string, size: number, dye: string): string {
   return (
-    `<svg class="ic ic-fleet" viewBox="${AGENT_VIEWBOX}" width="${size}" height="${size}" ` +
+    `<svg class="ic ${dye}" viewBox="${AGENT_VIEWBOX}" width="${size}" height="${size}" ` +
     `aria-hidden="true">` +
     `<rect x="1.25" y="1.25" width="13.5" height="13.5" rx="4" fill="none" ` +
     `stroke="currentColor" stroke-width="1.5" />` +
@@ -250,7 +307,8 @@ export function agentMarkFor(program: string, size = ICON_AGENT_PX): AgentMarkVi
       kind: "mark",
       label,
       svg:
-        `<svg class="ic ic-fleet" viewBox="${mark.viewBox}" width="${size}" height="${size}" ` +
+        `<svg class="ic ${cliDyeClass(program)}" viewBox="${mark.viewBox}" ` +
+        `width="${size}" height="${size}" ` +
         `fill="currentColor" aria-hidden="true">${mark.body}</svg>`,
     };
   }
@@ -261,7 +319,7 @@ export function agentMarkFor(program: string, size = ICON_AGENT_PX): AgentMarkVi
   const letter = agentLetter(program);
   if (letter === "?") return neutralView("Agent CLI not identified", size);
 
-  return { program, kind: "letter", label, svg: badgeSvg(letter, size) };
+  return { program, kind: "letter", label, svg: badgeSvg(letter, size, cliDyeClass(program)) };
 }
 
 /** Everything the resolver is allowed to know about a pane. An object rather than

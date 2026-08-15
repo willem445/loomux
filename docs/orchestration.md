@@ -87,7 +87,8 @@ The card shows the **mark of the agent CLI** it is about to launch, beside the
 title: GitHub's own Copilot glyph for Copilot CLI, a lettered badge for the
 CLIs with no licensed mark, and nothing at all for a pane that runs no agent —
 a terminal, a file explorer, or an SSH connection with no remote CLI chosen.
-It is the same mark the pane header wears once the pane is running.
+It is drawn in that CLI's own colour, and it is the same mark the pane header
+wears once the pane is running.
 
 ### Thinking level and context window
 

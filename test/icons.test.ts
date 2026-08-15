@@ -187,6 +187,12 @@ test("the stylesheet dyes every role, with the registry's token, and dyes nothin
   // color: … }` rule, so a later, more specific selector (`.pane.active .ic-vcs { color: … }`)
   // would win the cascade and override the pin without this test ever seeing it. None exists
   // today — don't be the first.
+  //
+  // The `.cli-*` block beside this one in styles.css (the per-CLI dyes, theme.ts §CLI_HUES)
+  // is deliberately NOT such a selector: src/agenticons.ts stamps `cli-<program>` OR
+  // `ic-fleet` and never both, so the two tables never meet on one element and neither has to
+  // out-specify the other. That either/or is what keeps this scan honest, and
+  // test/agenticons.test.ts is where it is pinned.
   const css = stripCssComments(read("../src/styles.css"));
   const declared = new Map<string, string>();
   for (const [, role, value] of css.matchAll(/\.ic-([a-z0-9-]+)\s*\{\s*color:\s*([^;]+);/g)) {

@@ -22,6 +22,7 @@ import assert from "node:assert/strict";
 import { readdirSync, readFileSync } from "node:fs";
 import {
   ANSI_SLOTS,
+  CLI_HUES,
   CSS_TOKENS,
   IDENTITY,
   IDENTITY_LIT,
@@ -30,6 +31,7 @@ import {
   SEMANTIC,
   TERMINAL_THEME,
 } from "../src/theme.ts";
+import { agentMarkFor } from "../src/agenticons.ts";
 
 const read = (rel: string) => readFileSync(new URL(rel, import.meta.url), "utf8");
 const stripCssComments = (s: string) => s.replace(/\/\*[\s\S]*?\*\//g, "");
@@ -513,8 +515,12 @@ test("no position mixes the state and identity channels across its own variants"
   // is what the identity channel is FOR, and the healthy bar moves while its own siblings
   // stay put. No diff, no failure, a silently desynced ramp.
   const css = stripCssComments(read("../src/styles.css"));
+  // `--cli-*` counts as IDENTITY, not as a fourth channel: "which CLI is this" is the
+  // identity question by definition, and the sub-table exists only because `--id-*` is
+  // bijective with the icon roles (theme.ts §CLI_HUES). Counting it here is what makes that
+  // claim measured — a `--cli-*` token sharing a position with a `--state-*` one fails.
   const channelOf = (t: string) =>
-    t.startsWith("--state-") ? "state" : t.startsWith("--id-") ? "identity" : null;
+    t.startsWith("--state-") ? "state" : t.startsWith("--id-") || t.startsWith("--cli-") ? "identity" : null;
 
   // property -> selector -> channel, for every rule that paints a channel token.
   const paints = new Map<string, Map<string, string>>();
@@ -717,6 +723,172 @@ test("the identity channel is eight distinct hues, each with its Lit step", () =
       luminance(IDENTITY_LIT[name]) > luminance(IDENTITY[name]),
       `${name}Lit is not lighter than ${name} — the emphasis step goes the wrong way`
     );
+  }
+});
+
+// --- the per-CLI sub-table (#1020 wave 2) ------------------------------------------------
+//
+// Seven pigments that answer ONE question — which agent program is this pane running — in
+// two positions: the agent-type mark and the session list's CLI chip. The rationale for
+// their existence (and for why they could not be `--id-*` tokens) is theme.ts §CLI_HUES;
+// what is measured below is the part that would otherwise be prose.
+
+test("every per-CLI hue is readable wherever a mark or a chip can sit", () => {
+  // Same floor and same reasoning as the identity ramp above: the session chip carries a
+  // LABEL, so AA at text size on the three app grounds, not the 3:1 non-text floor. The
+  // pane mark can also sit over the terminal ground, where WCAG 1.4.11's 3:1 applies.
+  for (const [cli, value] of Object.entries(CLI_HUES)) {
+    for (const ground of [SEMANTIC.surface0, SEMANTIC.surface1, SEMANTIC.surface2]) {
+      const ratio = contrast(value, ground);
+      assert.ok(ratio >= 4.5, `${cli} (${value}) on ${ground} is ${ratio.toFixed(2)}:1, below AA`);
+    }
+    const term = contrast(value, SEMANTIC.surfaceTerm);
+    assert.ok(term >= 3, `${cli} (${value}) on the terminal ground is ${term.toFixed(2)}:1`);
+  }
+});
+
+test("the per-CLI hues are at least as separable as the eight they sit beside", () => {
+  // THE CEILING ARGUMENT, MEASURED. The design note's "eight is a measurement, not a
+  // preference" was about hues that must be told apart across the WHOLE app; these seven only
+  // ever meet each other, in one position. That is a licence to mint seven more pigments ONLY
+  // if the resulting set is genuinely legible on its own terms, so the bar is the eight-set's
+  // own closest pair — derived here rather than hard-coded, so retuning an identity hue
+  // re-derives the bar instead of silently lowering it.
+  //
+  // A hard-coded floor sits underneath as well: if a future edit ever loosened the identity
+  // set, "at least as good as the eight" would stop meaning anything.
+  const cliClosest = closestPair({ ...CLI_HUES }, (h) => h);
+  const idClosest = closestPair({ ...IDENTITY }, (h) => h);
+  assert.ok(
+    cliClosest.distance >= idClosest.distance,
+    `the CLI hues' closest pair (${cliClosest.a}/${cliClosest.b}, ` +
+      `${cliClosest.distance.toFixed(1)} ΔE) is tighter than the eight identity hues' own ` +
+      `(${idClosest.a}/${idClosest.b}, ${idClosest.distance.toFixed(1)} ΔE) — seven extra ` +
+      "pigments are only justified while they are the more legible set"
+  );
+  assert.ok(cliClosest.distance >= 30, `closest CLI pair is ${cliClosest.distance.toFixed(1)} ΔE`);
+  // Distinct VALUES too, not merely distant ones: two CLIs sharing a pigment would pass a
+  // distance floor trivially only if the pair were excluded, and would read as one CLI.
+  assert.equal(
+    new Set(Object.values(CLI_HUES)).size,
+    Object.keys(CLI_HUES).length,
+    "two CLIs are painted the same pigment"
+  );
+});
+
+test("two CLIs that draw the same glyph stay apart in colour, under every simulation", () => {
+  // THE OBLIGATION THIS TABLE CAN CARRY AND THE IDENTITY CHANNEL CANNOT.
+  //
+  // Seven hues on one ground do not survive colour-vision deficiency and these do not — the
+  // design accepts that for identity, because identity is always also carried by position,
+  // label and SHAPE. Here the shape is a single letter, and three of the roster's CLIs start
+  // with `C`: `claude` and `codex` both badge a plain `C` (copilot draws the vendored
+  // octicon, so it is shape-distinct). For that pair — and only that pair — colour is the
+  // ONLY channel left, so it has to survive what the others are excused from.
+  //
+  // The collision set is computed from the renderer, not listed here, so an eighth CLI whose
+  // name starts with `C` inherits this obligation the moment it is added rather than the day
+  // someone notices two identical badges in different colours that a deuteranope cannot tell
+  // apart. Floor of 15 ΔE: today's pair is at 25.1, low enough that a legitimate nudge does
+  // not trip it, high enough that a genuine collapse does.
+  const glyph = (program: string) => agentMarkFor(program).svg.replace(/class="[^"]*"/, "");
+  const collisions: [string, string][] = [];
+  const names = Object.keys(CLI_HUES);
+  for (let i = 0; i < names.length; i++) {
+    for (let j = i + 1; j < names.length; j++) {
+      if (glyph(names[i]) === glyph(names[j])) collisions.push([names[i], names[j]]);
+    }
+  }
+  assert.ok(
+    collisions.some(([a, b]) => (a === "claude" && b === "codex") || (a === "codex" && b === "claude")),
+    "claude and codex no longer draw the same badge — either a glyph landed (good, and this " +
+      "fixture needs updating) or the letter tier changed shape"
+  );
+  const hues = CLI_HUES as Record<string, string>;
+  for (const [a, b] of collisions) {
+    for (const kind of [null, ...CVD_KINDS]) {
+      const view = (hex: string) => (kind === null ? hex : simulate(hex, kind));
+      const d = deltaE(view(hues[a]), view(hues[b]));
+      assert.ok(
+        d >= 15,
+        `${kind ?? "normal vision"}: "${a}" and "${b}" draw the SAME glyph and are ` +
+          `${d.toFixed(1)} ΔE apart — nothing distinguishes those two panes`
+      );
+    }
+  }
+});
+
+test("no per-CLI hue can be mistaken for the ink it is drawn beside", () => {
+  // A NEAR-MISS, PINNED. The first candidate for copilot was a pewter (#93a8c4) chosen to
+  // evoke GitHub's monochrome mark — and it landed 9 ΔE from `--ink-dim`, which is the colour
+  // of the header text the mark sits next to. It would have measured perfectly: AA on every
+  // ground, well clear of all six other CLI hues. It would also have read as an UNDYED mark,
+  // i.e. as the bug this whole table exists to fix, on the one CLI most likely to be running.
+  //
+  // Distance from the other hues is not the property that matters here; distance from the
+  // NEUTRAL the mark is drawn against is. 20 ΔE at normal vision — the rejected pewter was at
+  // 9, the shipped set's worst is comfortably clear of it.
+  const INK = { ink: SEMANTIC.ink, inkDim: SEMANTIC.inkDim, inkFaint: SEMANTIC.inkFaint };
+  for (const [cli, value] of Object.entries(CLI_HUES)) {
+    for (const [name, neutral] of Object.entries(INK)) {
+      const d = deltaE(value, neutral);
+      assert.ok(
+        d >= 20,
+        `${cli} (${value}) is ${d.toFixed(1)} ΔE from ${name} (${neutral}) — it reads as ` +
+          "text colour, so the mark looks undyed rather than branded"
+      );
+    }
+  }
+});
+
+test("one CLI table: every surface that names a CLI paints it that CLI's own token", () => {
+  // The twin of "one role table" above, and it exists because loomux had TWO answers to this
+  // question. The session list dyed its claude / copilot / opencode chips `--id-amber` /
+  // `--id-azure` / `--id-jade` while the pane mark dyed every CLI the fleet violet, so the
+  // same program was three colours depending on where you looked — and a Copilot chip was
+  // the same azure as the ORCHESTRATOR role chip sitting beside it on the same row.
+  //
+  // Written out as the design's claim and checked against BOTH surfaces, rather than derived
+  // from one of them: deriving it would let whichever surface drifted define the answer for
+  // the other, which is exactly the failure being caught.
+  const css = stripCssComments(read("../src/styles.css"));
+  const SURFACES = [
+    // No leading delimiter in either pattern, deliberately: a `[},]` guard would be consumed
+    // by one match and then missing for the rule immediately after it, so a block of
+    // consecutive one-line rules would be read every OTHER line. (It was, at first.)
+    { what: "agent mark dye", re: /\.cli-([a-z0-9-]+)\s*\{([^}]*)\}/g },
+    { what: "session chip", re: /\.session-badge\.([a-z0-9-]+)\s*\{([^}]*)\}/g },
+  ];
+  const wrong: string[] = [];
+  let seenAny = 0;
+  for (const { what, re } of SURFACES) {
+    for (const [, cli, body] of css.matchAll(re)) {
+      if (!(cli in CLI_HUES)) continue; // .session-badge.orch-role, .session-badge.session-pr …
+      seenAny++;
+      const off = [...new Set(tokensIn(body))].filter((t) => t !== `--cli-${cli}`);
+      if (off.length) wrong.push(`${what} "${cli}" names ${off.join(", ")}, not --cli-${cli}`);
+    }
+  }
+  assert.deepEqual(wrong, [], `a CLI is painted two different ways:\n${wrong.join("\n")}`);
+  // Both surfaces still exist — a rename that made every rule above unmatchable would leave
+  // `wrong` empty and this test green while checking nothing.
+  assert.ok(seenAny >= Object.keys(CLI_HUES).length + 3, `only ${seenAny} CLI rules matched`);
+});
+
+test("the design note's per-CLI table matches theme.ts", () => {
+  // Same pin as the mist row below, for the same reason: doc/design/ui-redesign.md carries
+  // its own copy of these seven values as a table, and it is the one mirror nothing reads
+  // back. A demo that swaps a hue after the human looks at it would otherwise leave the note
+  // describing the palette that was rejected.
+  const doc = read("../doc/design/ui-redesign.md");
+  for (const [cli, value] of Object.entries(CLI_HUES)) {
+    // name | token | value — the token column is matched loosely so a later column edit
+    // does not break the pin, but the VALUE column is exact.
+    const row = doc.match(
+      new RegExp(`\\|\\s*\\*\\*${cli}\\*\\*\\s*\\|[^|]*\\|\\s*\`(#[0-9a-f]{6})\``, "i")
+    );
+    assert.ok(row, `ui-redesign.md has no per-CLI table row for ${cli}`);
+    assert.equal(row[1], value, `ui-redesign.md says ${cli} is ${row[1]}, theme.ts says ${value}`);
   }
 });
 

@@ -21,7 +21,8 @@
 // DOM-free on purpose: node:test imports this directly (no jsdom, no bundler).
 
 /**
- * Two neutral ramps and eight named hues.
+ * Two neutral ramps, eight named hues, and a seven-pigment per-CLI set that answers one
+ * closed question in one position (see `CLI_HUES`).
  *
  * `slate` is a deep, cool neutral — blue sits a few points above red at every step, so the
  * ground reads cool and recedes behind terminal output rather than tinting it. `mist` is
@@ -106,6 +107,33 @@ export const PALETTE = {
   orchid: "#e767a8", //   identity only
   orchidLit: "#f08cbd",
 
+  // --- the per-CLI brand hues (#1020 wave 2). Seven pigments that exist for ONE position —
+  //     the agent-type mark and the session list's CLI chip — and answer one closed
+  //     question: *which program is this pane running*. They are not a ninth..fifteenth
+  //     identity hue and they do not compete with the eight above; see `CLI_HUES` for why
+  //     they had to be their own set rather than borrowed `--id-*` tokens.
+  //
+  //     EVOCATION, NOT REPLICATION. Where a vendor has a well-known palette the pigment
+  //     leans toward it — clay for Anthropic's warm terracotta, teal for OpenAI's green,
+  //     steel for GitHub's blue, indigo for Gemini's blue-violet — but no value here is a
+  //     vendor's own hex, and none is presented as one. A trademark colour copied exactly
+  //     is a claim of affiliation loomux does not make and does not need: the same
+  //     nominative-use reasoning that lets agenticons.ts draw GitHub's own glyph (§Licensing
+  //     there) is why it may lean toward GitHub's blue without taking it. The three CLIs
+  //     whose vendors publish no colour identity at all (opencode, hermes, ante) get hues
+  //     loomux picked outright, for separation and nothing else.
+  //
+  //     No `Lit` step: unlike the eight, nothing paints an emphasis tier of a CLI hue — a
+  //     mark is one flat glyph and a chip is a 16% wash of the base. A step nothing paints
+  //     is a token the pin cannot check (design note, §The Lit step).
+  clay: "#e08a5f", //     claude   — warm terracotta
+  citron: "#c3c455", //   ante     — yellow-green
+  fern: "#5fc873", //     opencode — a true green
+  teal: "#3ec2a8", //     codex    — green-cyan
+  steel: "#7fa8d8", //    copilot  — a cool desaturated blue
+  indigo: "#8b8ff0", //   gemini   — blue-violet
+  fuchsia: "#e072c0", //  hermes   — magenta
+
   // --- terminal-only. ANSI wants a true green in a slot where the app's greens are a teal
   //     (jade) and a yellow-green (lime); neither reads as "green" to a CLI, so ANSI green
   //     keeps its own pull. It is NOT an app hue — no UI surface may use it. `cyan` and
@@ -157,6 +185,64 @@ export const IDENTITY_LIT = {
   azure: PALETTE.azureLit,
   violet: PALETTE.violetLit,
   orchid: PALETTE.orchidLit,
+} as const;
+
+/**
+ * §The per-CLI hues — program name → the pigment that says *which CLI this pane runs*.
+ *
+ * WHY THIS EXISTS AT ALL. Before this table every agent pane in the app was the same
+ * violet: the mark took the `fleet` icon role's dye (`--id-violet`, "the agents
+ * themselves"), which is the correct answer to *is this an agent?* and no answer at all to
+ * *which one?* — the question the mark was added to answer (#992). A wall of ten panes
+ * running three different CLIs came out one colour, so the glyph had to be read rather than
+ * seen, which is exactly what the mark exists to avoid.
+ *
+ * WHY IT COULD NOT REUSE `--id-*`, WHICH IS THE ONLY INTERESTING DECISION HERE. The eight
+ * identity hues are in BIJECTION with the eight icon roles — each hue claimed by exactly one
+ * role, enforced in both directions by test/icons.test.ts, and that bijection is what stops
+ * eight hues from decaying into a palette of nice colours. Handing `--id-jade` to opencode
+ * would not add a meaning, it would give jade a SECOND one, and "jade" would stop resolving
+ * to `content` — the failure the bijection was written to prevent. So a per-CLI hue needs a
+ * pigment no icon role has claimed, which means a new set, which means a new prefix. That
+ * prefix is also the reviewable signal: `--cli-*` in a diff says "this surface is answering
+ * *which program*", the same way `--state-*` vs `--id-*` already declares state vs identity.
+ *
+ * THEY ARE STILL THE IDENTITY CHANNEL, NOT A FOURTH ONE. "Which CLI is this" is the
+ * identity question by definition (design note, §The three colour channels, which already
+ * lists "per-CLI marks" as an identity consumer). `--cli-*` is a SUB-TABLE of that channel
+ * for one closed roster, not a new channel with new rules: an identity hue may still never
+ * enter a state position, and neither may one of these.
+ *
+ * WHY SEVEN MORE PIGMENTS DOES NOT BREAK "EIGHT IS A MEASUREMENT". That ceiling was measured
+ * for hues that must be told apart ACROSS THE WHOLE APP — a ninth would have landed closer to
+ * an existing hue than the eight-set's own closest pair (violet/orchid, 30.4 ΔE). These seven
+ * never have to survive that comparison, because they only ever appear in ONE position
+ * against each other: the agent mark and the session list's CLI chip. Measured on their own
+ * terms they are the tighter set — closest pair 31.5 ΔE (opencode/codex), better than the
+ * eight's own 30.4 — and test/theme.test.ts holds them to that floor.
+ *
+ * COLOUR-VISION DEFICIENCY, HONESTLY. Seven hues on one ground do not survive CVD, and these
+ * do not: to a deuteranope claude/opencode are 10.7 ΔE apart and copilot/hermes 12.6. That is
+ * the same trade the identity channel already makes and states (state dyes stay separable,
+ * identity does not have to) — with one extra obligation this table CAN carry, because the
+ * glyph is right there: any two CLIs that draw the SAME SHAPE must stay separable by colour
+ * under every simulation. Today that is exactly one pair — claude and codex both badge `C` —
+ * and they are 25.1 ΔE apart at worst. test/theme.test.ts computes the collision set from the
+ * renderer rather than hard-coding it, so an eighth CLI starting with `C` inherits the
+ * obligation automatically.
+ *
+ * Keys are program names as `normalizeAgentProgram` spells them, which is what lets
+ * src/agenticons.ts stamp `cli-<program>` without a second table to keep in step;
+ * test/agenticons.test.ts pins the two lists against each other in both directions.
+ */
+export const CLI_HUES = {
+  claude: PALETTE.clay,
+  codex: PALETTE.teal,
+  copilot: PALETTE.steel,
+  opencode: PALETTE.fern,
+  gemini: PALETTE.indigo,
+  hermes: PALETTE.fuchsia,
+  ante: PALETTE.citron,
 } as const;
 
 /**
@@ -329,6 +415,17 @@ export const CSS_TOKENS = {
   "--id-azure": IDENTITY.azure,
   "--id-violet": IDENTITY.violet,
   "--id-orchid": IDENTITY.orchid,
+  // The per-CLI sub-table (see CLI_HUES). A separate prefix rather than eight more `--id-*`
+  // entries, because `--id-*` is bijective with the icon role table and a CLI claiming one
+  // would give that hue a second meaning. Every key here is a program name, so the token a
+  // rule names IS the program it dyes — there is no third spelling to drift.
+  "--cli-claude": CLI_HUES.claude,
+  "--cli-codex": CLI_HUES.codex,
+  "--cli-copilot": CLI_HUES.copilot,
+  "--cli-opencode": CLI_HUES.opencode,
+  "--cli-gemini": CLI_HUES.gemini,
+  "--cli-hermes": CLI_HUES.hermes,
+  "--cli-ante": CLI_HUES.ante,
   "--font-mono": FONT.mono,
   "--font-ui": FONT.ui,
 } as const;
