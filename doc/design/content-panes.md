@@ -559,14 +559,28 @@ didn't touch, and falls back to the canonical emitters only for the piece that c
   own first rule (§ above) — is reused whole when it `deepEqual`s what parsing the original text
   produced for that id. An edited block, or a brand-new one, regenerates canonically; every
   *other* block keeps its own comment, blank-line spacing and field order untouched.
-- **`edges:`** and **`gates:`** each split their SECTION HEADER (the key line and whatever
-  comment introduces it, e.g. "# ADVISORY — the declared happy path") from their CONTENT (the
-  fan-out entries, or the gate itself). The header is reused whenever the section still exists
-  at all, whether or not its content changed; only the content falls back to canonical when it
-  did. Rewiring one edge, then, costs that section's content — not the paragraph explaining what
-  the section is *for*, which review found was the larger share of what a block-roster edit
-  used to cost (a deleted block that also drops its edges and its gate seat used to take the
-  `# ADVISORY` and `# ENFORCED` headers with it; now it doesn't).
+- **`edges:`**, **`gates:`**, **`intake:`**, **`merge_queue:`** and **`resources:`** each split
+  their SECTION HEADER (the key line and whatever comment introduces it, e.g. "# ADVISORY — the
+  declared happy path") from their CONTENT (the fan-out entries, the gate itself, the fields).
+  The introducing comment is reused whenever the section still exists at all, whether or not its
+  content changed; only the content falls back to canonical when it did. Rewiring one edge, then,
+  costs that section's content — not the paragraph explaining what the section is *for*, which
+  review found was the larger share of what a block-roster edit used to cost (a deleted block
+  that also drops its edges and its gate seat used to take the `# ADVISORY` and `# ENFORCED`
+  headers with it; now it doesn't).
+- **The `key:` line itself, though, is a function of the content that follows it** — it is the
+  one part of a header that cannot simply be reused. An empty section is written `resources: {}`
+  (and an empty roster `blocks: []`) rather than as a bare key, because a bare key is YAML *null*
+  and would re-read as "never declared", silently deleting a section a human deliberately left
+  empty. That spelling is also a dead end for block children: reusing it above a regenerated body
+  emitted `resources: {}` with `catfish: {}` indented under it — not YAML at all, so the pane
+  disabled the form over text it had just written itself the first time anyone added a resource
+  (#1090). So a regenerated body re-derives its key line (`sectionHeaderLines`): the original is
+  kept only when both it and the canonical one are bare block headers, and otherwise the
+  canonical line wins with the original's own trailing comment carried onto it. Same rule in both
+  directions, and the same rule for a hand-written one-line `resources: { build: { slots: 2 } }`,
+  whose inline value *is* the section's content — reusing that line under a regenerated body
+  would have written the content twice, or undone the deletion that emptied it.
 
 That granularity — whole section header, whole block by id, not per-field — is the deliberate
 boundary #233 draws: *comment-preserving for the parts an edit didn't touch*, not full-fidelity
