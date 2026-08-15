@@ -206,10 +206,12 @@ test("splitting a pane in a 3-wide row halves that pane and leaves its siblings'
     "the split pane and the newcomer should be the same size"
   ).toBeLessThan(SHARE_EPSILON);
 
-  // The measured vertical drift, reported on every run rather than only when
-  // it breaks a bound: VERTICAL_JITTER_PX is calibrated from these numbers, and
-  // the next person to re-calibrate it (after the next chrome change) should
-  // not have to make a spec fail first to find out what it is.
+  // The measured vertical drift, reported on every run rather than only when it
+  // breaks a bound: VERTICAL_JITTER_PX is calibrated from these numbers, and the
+  // next person to re-calibrate it (after the next chrome change) should not
+  // have to make a spec fail first to find out what it is. On a settled layout
+  // it reads 0.000 across the board — which is also the evidence that the drift
+  // this spec used to fight was a sampling race and not the grid moving.
   console.log(
     `[pane-split] vertical drift after the split — ` +
       `B dy ${(after.b!.y - before.b!.y).toFixed(3)} dh ${(after.b!.height - before.b!.height).toFixed(3)}, ` +
@@ -258,11 +260,11 @@ test("splitting a pane in a 3-wide row halves that pane and leaves its siblings'
     // vertically) is tens of pixels, not tenths.
     expect(
       Math.abs(now.height - was.height),
-      `${name} changed height by more than the grid's own sub-pixel jitter`
+      `${name} changed height by more than device-pixel rounding — a settled row split must not move it at all`
     ).toBeLessThanOrEqual(VERTICAL_JITTER_PX);
     expect(
       Math.abs(now.y - was.y),
-      `${name} moved vertically by more than the grid's own sub-pixel jitter`
+      `${name} moved vertically by more than device-pixel rounding — a settled row split must not move it at all`
     ).toBeLessThanOrEqual(VERTICAL_JITTER_PX);
     expect(
       Math.abs(now.x - was.x),
@@ -287,7 +289,7 @@ test("splitting a pane in a 3-wide row halves that pane and leaves its siblings'
   ).toBeCloseTo(after.b!.height, 0);
   expect(
     Math.abs(after.a!.y - before.a!.y),
-    "the split target moved vertically by more than the grid's own sub-pixel jitter"
+    "the split target moved vertically by more than device-pixel rounding"
   ).toBeLessThanOrEqual(VERTICAL_JITTER_PX);
 });
 
