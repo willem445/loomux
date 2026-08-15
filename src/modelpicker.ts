@@ -42,20 +42,14 @@ export interface ModelPickerOptions {
    *  label for both hosts would state a vendor outcome that is false on three of
    *  the four CLIs the block editor offers. */
   blankLabel?: string;
-  /** What the CLI itself reported about a model id, when a human has asked
-   *  (#993). Returning `null` for everything — the default — is exactly the
-   *  picker every caller had before detection existed.
+  /** What the CLI itself reported about a model id (#993). Returning `null` for
+   *  everything — the default — is exactly the picker every caller had before
+   *  detection existed.
    *
    *  A lookup rather than a snapshot because the host owns the catalog and the
    *  answer changes underneath the control: the picker asks at paint time and
    *  never caches, so the host re-renders instead of the picker going stale. */
   detailFor?: (id: string) => ModelDetail | null;
-  /** Runs the CLI's own list-models request, resolving when the answer (or the
-   *  failure) is in hand. Supplying it is what puts the "detect" affordance on
-   *  the control; omitting it leaves the picker with no way to spawn anything,
-   *  which is the point — see `src-tauri/src/modelwire.rs` for why that must be
-   *  a human gesture rather than a paint. */
-  onDetect?: () => Promise<void>;
 }
 
 export class ModelPicker {
@@ -69,21 +63,22 @@ export class ModelPicker {
   onChange: (() => void) | null = null;
   private readonly blankLabel: string;
   private readonly detailFor: (id: string) => ModelDetail | null;
-  private readonly onDetect: (() => Promise<void>) | null;
   /** The reported-facts line under the control. Absent from the DOM until it
-   *  has something to be — an empty line reserves height in every picker that
-   *  has never been detected. (#993, and the constraint 1 rule — this is chrome
+   *  has something to be — an empty line reserves height in every picker whose
+   *  CLI reported nothing. (#993, and the constraint 1 rule — this is chrome
    *  inside the form, never a PTY resize.)
    *
-   *  The detect button is deliberately NOT held as a field: nothing outside its
-   *  own click handler reads it, and the handler closes over it. */
+   *  It is the only thing detection puts on this control now. #1020 removed the
+   *  `detect` button that used to sit beside it: detection happens
+   *  automatically at startup (`src-tauri/src/modelwire.rs`), so there is
+   *  nothing left for a human to ask for, and a button that re-asked would be
+   *  an affordance for a spawn this picker can no longer make. */
   private summary: HTMLElement;
   private cli = "";
 
   constructor(opts: ModelPickerOptions = {}) {
     this.blankLabel = opts.blankLabel ?? INHERIT_MODEL_LABEL;
     this.detailFor = opts.detailFor ?? (() => null);
-    this.onDetect = opts.onDetect ?? null;
     this.root = document.createElement("div");
     this.root.className = "model-picker";
     this.sel = document.createElement("select");
@@ -107,31 +102,6 @@ export class ModelPicker {
     this.summary.className = "model-picker-summary";
     this.summary.hidden = true;
     this.root.append(this.sel, this.custom, this.summary);
-    if (this.onDetect) this.root.append(this.buildDetectButton());
-  }
-
-  /** The one gesture that may spawn an agent CLI. It disables itself for the
-   *  duration of the ask, which is not cosmetic: a second click while the first
-   *  is in flight would be a second spawn, and this control is the only thing
-   *  standing between a human's finger and that. */
-  private buildDetectButton(): HTMLButtonElement {
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = "model-picker-detect";
-    btn.textContent = "detect";
-    btn.title = "Ask this CLI which models it offers on this machine, and what each one supports.";
-    btn.addEventListener("click", () => {
-      const ask = this.onDetect;
-      if (!ask || btn.disabled) return;
-      btn.disabled = true;
-      btn.textContent = "asking…";
-      void ask().finally(() => {
-        btn.disabled = false;
-        btn.textContent = "detect";
-        this.paintSummary();
-      });
-    });
-    return btn;
   }
 
   /** Re-render the reported-facts line for whatever is selected right now.
@@ -185,11 +155,12 @@ export class ModelPicker {
    *  under the caret and sends the rest of the keystrokes nowhere.
    *
    *  Deliberately narrower than "focus is somewhere in this picker" (#997
-   *  review). A detection is started by clicking the button *inside* this
-   *  control, so the broad test is true on every detect path and would suppress
-   *  the very rebuild the click asked for. The hazard is the text input
-   *  specifically, and only while it is visible; the seconds an ask can be in
-   *  flight are long enough for a human to click into it and start typing. */
+   *  review). The hazard is the text input specifically, and only while it is
+   *  visible: a human editing a custom id must not have it yanked away, but one
+   *  whose focus is merely on the `<select>` loses nothing to a rebuild that
+   *  re-selects the same value. Under #1020 the reply that triggers the rebuild
+   *  arrives on its own schedule rather than after a click, which widens the
+   *  window this guards rather than closing it. */
   get editingCustom(): boolean {
     return !this.custom.hidden && document.activeElement === this.custom;
   }
@@ -202,10 +173,11 @@ export class ModelPicker {
    *  one. On the launcher that was permanent — `applyRoleModels` is otherwise
    *  reachable only from the role's CLI `change` listener and the seed pass, so
    *  a detection that landed mid-type never reached that role's dropdown again
-   *  for the life of the dialog, and the human saw a `detect` click do nothing.
+   *  for the life of the dialog, and the human saw the models they were told
+   *  about never appear.
    *
    *  So the work is deferred to the input's next `blur`, which is the moment the
-   *  hazard ends. `once` per deferral: two asks landing mid-type queue two
+   *  hazard ends. `once` per deferral: two replies landing mid-type queue two
    *  rebuilds, which is harmless because a rebuild is idempotent, and cheaper to
    *  reason about than a shared pending slot that has to decide which wins.
    *

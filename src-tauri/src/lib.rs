@@ -60,6 +60,13 @@ pub fn run() {
         .setup(|app| {
             // Start streaming CPU/mem/GPU snapshots to the status bar.
             metrics::start(app.handle().clone());
+            // #1020: detect each supported CLI's models once, in the
+            // background, so every model picker opens already knowing what
+            // this machine offers instead of waiting for a human to ask. This
+            // is the ONLY path in loomux that reaches an agent CLI unbidden —
+            // see `modelwire.rs`'s header for the #1002 direction behind it and
+            // the boundary that keeps it the only one.
+            modelwire::start_startup_sweep(app.handle().clone());
             // Poll open panes' repos for external checkout/commit/stage (#36).
             let watcher = app.state::<Arc<gitwatch::GitWatcher>>().inner().clone();
             gitwatch::start(app.handle().clone(), watcher);

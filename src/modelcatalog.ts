@@ -395,19 +395,55 @@ export class ModelCatalog {
     return detected ? mergeModelOptions(base, detected.models.map((m) => m.id)) : base;
   }
 
-  // ---- the list-models control probe (#993) --------------------------------
+  // ---- the list-models reply (#993, made automatic by #1020) ---------------
   //
-  // A SECOND seam rather than a widening of the first, because the two are
-  // spent differently. `probe` reads what a CLI prints unprompted and every
-  // surface fires it on open; `detect` spawns the CLI to ask it a question, and
-  // the claim that the question is free is a third party's, not the vendor's
-  // (`src-tauri/src/modelwire.rs`). Constraint 3 says loomux does not bet the
-  // human's money on that, so this one moves only when a human asks it to —
-  // which is a property of WHO CALLS IT, and folding it into `probe` would
-  // delete the distinction that makes it true.
+  // Still a SECOND seam rather than a widening of the first, but for a
+  // different reason than it had under #993. Then, `detect` SPAWNED the CLI and
+  // `probe` did not, so the two were kept apart by what they cost and this one
+  // moved only when a human clicked. Now neither spawns from here at all: the
+  // backend's startup sweep runs the control request once, unbidden, and
+  // `detect` is a lookup against what it left behind (`src-tauri/src/modelwire.rs`).
+  //
+  // What still separates them is the ANSWER, not the cost. `probe` reports what
+  // a CLI says it accepts; this reports what the CLI said about the models on
+  // this machine — ids, display names, per-model effort levels. Merging them
+  // would collapse two different kinds of claim into one map, which is the
+  // thing the header of this module is about.
 
-  private detectInflight = new Map<string, Promise<ModelReport>>();
+  /** Every program a lookup has been issued for, resolved or not.
+   *
+   *  **Kept forever, unlike {@link probe}'s, and the difference is the point.**
+   *  A probe memo drops an answer that was not worth keeping so the NEXT caller
+   *  re-asks and can be told the CLI has since appeared. That re-ask was
+   *  affordable because it was one IPC; here, under #993, it was affordable
+   *  because it cost a human gesture. #1020 removed the gesture — the callers
+   *  are paints now, and a form that re-renders would re-issue on every paint.
+   *
+   *  So the bound moved into the memo: one lookup per program per app run. It
+   *  costs nothing to be wrong about, because the lookup is not the only
+   *  delivery — {@link acceptReport} overwrites whatever this remembered when
+   *  the sweep's own answer arrives. */
+  private detectAsked = new Map<string, Promise<ModelReport>>();
+  /** Reports {@link reportWorthKeeping} judged keepable — what {@link report}
+   *  serves. Separate from {@link detectAsked} because a barren answer must
+   *  still leave `report()` null (a surface has to fall back to its seed) while
+   *  bounding the ask. */
   private detectResolved = new Map<string, ModelReport>();
+  /** Subscribers to {@link onReport}: what to run, and how to ask whether the
+   *  thing that registered it is still there.
+   *
+   *  **The two are separate functions, and that separation is the whole fix for
+   *  the leak the first cut shipped.** When liveness was the delivery
+   *  callback's return value, the only way to ask "are you still alive?" was to
+   *  DELIVER — which repaints — so pruning could only ever happen when a report
+   *  actually changed something. The producer changes something at most once per
+   *  program per app run and sometimes never (if the pull wins the race,
+   *  `acceptReport` refuses before it ever reaches the listeners), so in the
+   *  ordinary case the prune ran zero times and every host built after the sweep
+   *  was retained for the life of the process. Asking is now free of side
+   *  effects, so it can happen on the one event that keeps recurring:
+   *  registration. */
+  private reportListeners: { handler: (program: string) => void; isAlive: () => boolean }[] = [];
 
   /** The injected backend call (`pty.ts`'s `listCliModels`, read through
    *  `modelwire.ts`). Optional: the launcher's own catalog is constructed
@@ -415,43 +451,138 @@ export class ModelCatalog {
    *  reports nothing rather than failing. */
   private readonly detectFn: ((program: string) => Promise<ModelReport>) | null;
 
-  /** Ask `program` for its own model list. **Only ever from a human gesture.**
+  /** Look up what the backend's startup sweep found for `program`.
    *
-   *  Memoized exactly like {@link probe} and by the same argument, with one
-   *  extra edge to it: here the memo is not only saving an IPC, it is the thing
-   *  that stops a second click spawning a second agent CLI. A reply that
-   *  carried nothing is still not kept — a CLI installed or upgraded mid-session
-   *  must be able to answer on the next ask — but that re-ask costs another
-   *  gesture, never a repaint.
+   *  **Safe on a paint path, which is what #1020 changed.** The call it makes
+   *  cannot spawn an agent CLI — the sweep already did that, once, at startup —
+   *  so a picker fires this on open the way it fires {@link probe}. It resolves
+   *  from the backend memo, normally immediately.
    *
-   *  Never rejects: a detection that failed leaves every surface exactly as it
+   *  Issued at most once per program per app run (see {@link detectAsked}); a
+   *  form that repaints re-reads the resolved promise and issues nothing. An
+   *  answer that carried nothing is still not KEPT — {@link report} stays null
+   *  and surfaces show their seed — it is simply not asked for again, because
+   *  the sweep is what would have to change its mind, and the sweep pushes.
+   *
+   *  Never rejects: a lookup that failed leaves every surface exactly as it
    *  was. */
   detect(program: string): Promise<ModelReport> {
-    const kept = this.detectResolved.get(program);
-    if (kept) return Promise.resolve(kept);
+    const asked = this.detectAsked.get(program);
+    if (asked) return asked;
     const detect = this.detectFn;
     if (!detect) return Promise.resolve(reportFailure("this catalog has no list-models detector wired"));
-    let p = this.detectInflight.get(program);
-    if (!p) {
-      p = detect(program)
-        .catch((e: unknown) => reportFailure(String(e)))
-        .then((r) => {
-          if (reportWorthKeeping(r)) this.detectResolved.set(program, r);
-          this.detectInflight.delete(program);
-          return r;
-        });
-      this.detectInflight.set(program, p);
-    }
+    const p = detect(program)
+      .catch((e: unknown) => reportFailure(String(e)))
+      .then((r) => {
+        // Never downgrade: an event may have landed while this was in flight,
+        // and it carries the same memo this was reading. Whichever arrived with
+        // a real answer wins.
+        if (reportWorthKeeping(r)) this.detectResolved.set(program, r);
+        return this.detectResolved.get(program) ?? r;
+      });
+    this.detectAsked.set(program, p);
     return p;
   }
 
-  // No `detecting(program)` accessor here, and that is deliberate rather than
-  // an omission (#997 review): the detect button already owns its own in-flight
-  // state through `btn.disabled`, so a second reader of the same fact would be
-  // speculative API with no consumer and no test — and the memo, not a
-  // published flag, is what actually stops a second click becoming a second
-  // spawn. Add one when a surface genuinely needs it, with the test that says
-  // why.
+  /** Take a report the backend pushed, rather than one this catalog asked for
+   *  (#1020 — `models-detected`).
+   *
+   *  The push half of detection. A picker painted while the sweep was still
+   *  running has already read "nothing yet" and memoized that lookup, so
+   *  without this its dropdown would keep the seed for the life of the app.
+   *
+   *  Two reports are refused, and each refusal is a repaint somebody does not
+   *  owe:
+   *
+   *  - One that carries NOTHING. It says only that the sweep found nothing for
+   *    that CLI, which is what every surface already assumes — and storing it
+   *    would overwrite a real answer that arrived first.
+   *  - One for a CLI an answer is ALREADY held for. The sweep runs once per app
+   *    run and asks each CLI once, so a second answer for the same program is
+   *    not a new fact: it is this same answer arriving by the other route, and
+   *    the two routes racing is the ordinary case rather than the odd one. The
+   *    picker that already painted it must not be rebuilt a second time —
+   *    possibly under a caret, since a deferred rebuild fires on blur.
+   *
+   *  Returns whether anything changed, which is what makes "fired only for a
+   *  report that changed something" true of {@link onReport} rather than merely
+   *  intended. A design that ever re-sweeps mid-run has to revisit the second
+   *  refusal — it is a statement about the producer, not about reports. */
+  acceptReport(program: string, report: ModelReport): boolean {
+    // FIRST, and outside both refusals below. Retention must not depend on
+    // whether this particular report happens to change anything, because in the
+    // ordinary case no report ever does: the producer emits once per program
+    // per app run, and if the pull won the race this returns at the second
+    // refusal every time. A prune behind those `return`s is a prune that never
+    // runs (rev-713 blocking 2).
+    this.pruneReportListeners();
+    if (!reportWorthKeeping(report)) return false;
+    if (this.detectResolved.has(program)) return false;
+    this.detectResolved.set(program, report);
+    // Also settles the pull side: a picker that opens later reads this instead
+    // of issuing a lookup for an answer already in hand.
+    this.detectAsked.set(program, Promise.resolve(report));
+    for (const l of this.reportListeners) l.handler(program);
+    return true;
+  }
+
+  /** Drop every subscriber whose host says it is gone.
+   *
+   *  Side-effect free by construction — it asks `isAlive`, never `handler` — so
+   *  it is safe to run on any event, which is what lets it run on one that
+   *  actually recurs. */
+  private pruneReportListeners(): void {
+    this.reportListeners = this.reportListeners.filter((l) => l.isAlive());
+  }
+
+  /** Be told when a pushed report lands, so a form already on screen can
+   *  refresh (#1020).
+   *
+   *  `isAlive` is asked, never inferred: liveness is a fact only the host knows
+   *  (`this.disposed`, `el.isConnected`) and this module is DOM-free, so it
+   *  cannot look. It must be free of side effects — {@link pruneReportListeners}
+   *  calls it at times no repaint is wanted.
+   *
+   *  **Registration is what bounds retention**, and it is deliberately not the
+   *  only defence. Each host also holds the returned unsubscribe and calls it
+   *  from its own teardown, which releases immediately rather than at the next
+   *  registration; the prune here is the backstop for a host discarded without
+   *  one (a launcher form dropped with its pane never reaches a teardown at
+   *  all). Registration is the right event to hang it on because it is the only
+   *  one that keeps happening: every new host subscribes, so the list cannot
+   *  grow past the live hosts plus the one being added. Hanging it on delivery
+   *  instead is the bug this replaced — the producer delivers at most once per
+   *  program per app run, so hosts built afterwards were never asked.
+   *
+   *  Handlers fire only for a report that CHANGED something
+   *  ({@link acceptReport}), so one never has to ask whether it has already seen
+   *  this report. */
+  onReport(handler: (program: string) => void, isAlive: () => boolean): () => void {
+    this.pruneReportListeners();
+    const entry = { handler, isAlive };
+    this.reportListeners.push(entry);
+    return () => {
+      this.reportListeners = this.reportListeners.filter((l) => l !== entry);
+    };
+  }
+
+  /** How many subscribers {@link onReport} is holding right now.
+   *
+   *  **A reader with no product caller, which this repo otherwise refuses**, and
+   *  the exception is argued rather than assumed: RETENTION is the property, and
+   *  it is invisible from every other angle. The first cut of this seam pruned
+   *  only when a report changed state — something the producer does at most once
+   *  per program per app run and often never — so every host built after the
+   *  sweep was retained for the life of the process, and the whole suite stayed
+   *  green because nothing could see the list. A leak no test can observe is a
+   *  leak that comes back.
+   *
+   *  Deliberately does NOT prune before answering: a getter that tidied up first
+   *  would report the list as healthy no matter when the tidying actually
+   *  happens, which is precisely the bug it exists to catch. */
+  get liveReportListeners(): number {
+    return this.reportListeners.length;
+  }
 
   /** The list-models reply already in hand for `cli`, or `null`. */
   report(cli: string): ModelReport | null {

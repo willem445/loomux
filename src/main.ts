@@ -48,6 +48,7 @@ import { ftRootIsDir } from "./fileapi";
 import { gitRepoRoot } from "./git";
 import { voiceController } from "./voicecontrol";
 import { initStatusBar } from "./statusbar";
+import { startModelDetection } from "./modelprobe";
 import { initHintBar } from "./hintbar";
 import { WelcomeForm, type WelcomeResult, type AgentLaunchSpec } from "./launcher";
 import {
@@ -2656,6 +2657,12 @@ void (async () => {
 
 // Start streaming CPU/mem/GPU/VRAM into the bottom status bar.
 initStatusBar();
+
+// Take the backend's automatic model detection as it lands (#1020). The sweep
+// starts in Tauri's `setup`, so it is already running by now — subscribing
+// early is what decides whether an open picker learns its models by push or has
+// to pull for them. Neither loses the answer; the push is just sooner.
+startModelDetection();
 
 // Let the shortcut hint bar scroll horizontally on a vertical wheel when it
 // overflows a narrow window.

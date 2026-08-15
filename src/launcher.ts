@@ -398,6 +398,18 @@ export class WelcomeForm {
    *  again — which it does on every CLI change — is what reaches a CLI installed
    *  since the app started. */
   private catalog = modelCatalog;
+  /** Whether this form has ever been on screen — the "has it died yet?" half of
+   *  the `catalog.onReport` liveness test (#1020). A form that has not been
+   *  appended yet and one whose pane has been closed are both `isConnected ===
+   *  false`, and only the second is dead. */
+  private mounted = false;
+  /** `role:cli` pairs a detection reply has already been applied to (#1020).
+   *
+   *  The push and the pull are two deliveries of ONE sweep answer and both can
+   *  land, in either order. Deduping inside the funnel they share is what makes
+   *  the no-double-repaint property hold for both orderings, rather than only
+   *  the one a flag captured before the await can see (rev-713 non-blocking 3). */
+  private detectionsApplied = new Set<string>();
   /** Autopilot flags per program, memoized. Empty string = the CLI has no
    *  unattended flag surface, so the toggle is hidden/inert for it (#101). */
   private autopilotFlags = new Map<string, Promise<string>>();
@@ -668,37 +680,6 @@ export class WelcomeForm {
       // already refuses at the other end.
       const model = new ModelPicker({
         detailFor: (id) => this.catalog.detail(orchCliFor(cli.value).id, id),
-        // The only path in the launcher that spawns an agent CLI, and it is a
-        // click. See `src-tauri/src/modelwire.rs` for why no paint may reach it.
-        onDetect: () => {
-          const id = orchCliFor(cli.value).id;
-          return this.catalog.detect(id).then(() => {
-            // Re-derive rather than re-set blindly: the human may have changed
-            // the role's CLI while the ask was in flight, and repainting this
-            // row from a reply about a CLI it has moved off is exactly the
-            // silent-wrong-answer the knob path refuses.
-            if (orchCliFor(cli.value).id !== id) return;
-            // The knobs are repainted immediately and unconditionally: they are
-            // what this reply is the answer for, and repainting them touches
-            // nothing the human could be inside.
-            this.applyRoleKnobs(key);
-            // The MENU is the destructive half — rebuilding it under a
-            // half-typed id resolves that id to the dropdown branch and hides
-            // the input beneath the caret — so it is deferred to the moment
-            // that stops being true, never dropped (#997 review NB-3).
-            //
-            // Dropping it was permanent here in a way it is not in the workflow
-            // pane: `applyRoleModels` is otherwise reached only from the role's
-            // CLI `change` listener and the seed pass, so a detection that
-            // landed mid-type never reached this role's dropdown again for the
-            // life of the dialog — a `detect` click that visibly did nothing.
-            // The re-check inside the callback is the same staleness guard as
-            // above, re-run because a deferral can outlive the CLI it was for.
-            model.runWhenNotEditing(() => {
-              if (orchCliFor(cli.value).id === id) this.applyRoleModels(key);
-            });
-          });
-        },
       });
       // #687: thinking level + context window, per role. Both start empty ("CLI
       // default") and are populated from `agent_cli_knobs` — a CLI that has no
@@ -723,6 +704,29 @@ export class WelcomeForm {
       };
       return { key, cli, model, effort, context };
     });
+    // Take the startup sweep's answers as they land (#1020). This is the route
+    // that matters most on THIS form: loomux opens showing it, so the common
+    // case is a welcome card already on screen while the sweep is still running
+    // — the lookup in `applyRoleModels` was answered "nothing yet", and without
+    // this the role dropdowns would keep their curated seeds until the human
+    // closed and reopened the form.
+    // **This form's release is the catalog's prune, not an unsubscribe call,
+    // and that is deliberate rather than an omission** (rev-713 blocking 2).
+    // `WorkflowView` holds its unsubscribe and calls it from `dispose()`; this
+    // class has no equivalent moment. `fire()` looks like one and is not —
+    // `reopenAfterLaunchFailure` revives a still-mounted form after a downstream
+    // launch throws, and a form released at `fire()` would come back deaf to the
+    // sweep. So liveness is answered instead, and the catalog drops this
+    // subscription the next time anything subscribes. Holding an unsubscribe
+    // nobody could safely call would be worse than not holding one.
+    this.catalog.onReport(
+      (program) => {
+        for (const rc of this.roleControls) {
+          if (orchCliFor(rc.cli.value).id === program) this.refreshRoleFromDetection(rc.key, program);
+        }
+      },
+      () => this.aliveForReports()
+    );
     // Advanced orchestrator (#222). The checkbox is the whole opt-in; everything
     // below it is the human being shown what they are opting into, BEFORE the
     // group spawns — the roster the repo declares, each block's CLI/model, which
@@ -1005,12 +1009,28 @@ export class WelcomeForm {
   }
 
   /** Populate a role's model picker from its selected CLI: curated suggestions
-   *  first, merged with the CLI's own reported models once the probe returns. */
+   *  first, merged with the CLI's own reported models once the probe returns,
+   *  and with whatever the CLI itself reported to the startup sweep (#1020). */
   private applyRoleModels(role: OrchRole): void {
     const rc = this.roleControls.find((r) => r.key === role)!;
     const cli = orchCliFor(rc.cli.value);
     rc.model.setOptions(this.catalog.models(cli.id), cli.defaults[role], cli.id);
     this.applyRoleKnobs(role);
+    // The detection LOOKUP, fired from the paint path — which #993 forbade and
+    // #1020 makes correct: this cannot spawn an agent CLI, because the backend
+    // sweep already did that once at startup and this reads what it left
+    // (`src-tauri/src/modelwire.rs`). The catalog issues it at most once per CLI
+    // per app run, so a form that repaints costs nothing.
+    //
+    // The refresh below is skipped when the answer was ALREADY in hand: the
+    // `setOptions` two lines up has just painted it, so repainting would rebuild
+    // the menu for nothing — the same care the probe reply takes with its
+    // `p.models.length` guard, and the same reason.
+    const had = this.catalog.report(cli.id) !== null;
+    void this.catalog.detect(cli.id).then((r) => {
+      if (had || !r.models.length) return;
+      this.refreshRoleFromDetection(role, cli.id);
+    });
     void this.probe(cli.id).then((p) => {
       if (this.kind !== "orchestrator" || rc.cli.value !== cli.id) return;
       // Nothing reported = nothing to merge, and re-setting an identical list
@@ -1021,6 +1041,69 @@ export class WelcomeForm {
         rc.model.setOptions(this.catalog.models(cli.id), cli.defaults[role], cli.id);
         this.applyRoleKnobs(role);
       }
+    });
+  }
+
+  /** Whether this form is still something a pushed report should repaint. */
+  private aliveForReports(): boolean {
+    // "Not on screen yet" is not dead: the constructor runs before the caller
+    // appends `el`, and a report can land in that window. Dead is HAVING been on
+    // screen and no longer being there — the pane was closed, and repainting its
+    // detached controls forever is what an unreleased subscription does.
+    if (this.el.isConnected) {
+      this.mounted = true;
+      return true;
+    }
+    return !this.mounted;
+  }
+
+  /** Bring one role's controls up to date with a detection reply for `cliId`.
+   *
+   *  **A detection reply owes this row more than its dropdown** (#997 review):
+   *  it is precisely the answer that makes `roleKnobState` respond differently,
+   *  so repainting only the menu would leave the Thinking-level select offering
+   *  levels the payload then drops.
+   *
+   *  Shared by both routes a reply can arrive on — the lookup fired from
+   *  `applyRoleModels` and the sweep's push (`catalog.onReport`) — because the
+   *  work they owe is identical, and a second copy is the second place a fix
+   *  would have to be remembered.
+   *
+   *  **Idempotent per role+CLI**, which is where the two routes are reconciled:
+   *  whichever delivery of the sweep's one answer arrives first does the work
+   *  and the other is a no-op, in either order. A flag captured before the await
+   *  cannot do this — it only sees the ordering where the lookup went first
+   *  (rev-713 non-blocking 3).
+   *
+   *  Deliberately NOT a call to `applyRoleModels`: that would re-issue the
+   *  lookup this is the answer to, and re-enter itself on every reply. */
+  private refreshRoleFromDetection(role: OrchRole, cliId: string): void {
+    const rc = this.roleControls.find((r) => r.key === role);
+    // Re-derive rather than repaint blindly: the human may have changed this
+    // role's CLI since the reply was asked for, and painting a row from a reply
+    // about a CLI it has moved off is exactly the silent-wrong-answer the knob
+    // path refuses. Checked BEFORE the idempotence mark, so a delivery this row
+    // has moved away from does not consume the slot the right one needs.
+    if (!rc || this.kind !== "orchestrator" || orchCliFor(rc.cli.value).id !== cliId) return;
+    if (this.detectionsApplied.has(`${role}:${cliId}`)) return;
+    this.detectionsApplied.add(`${role}:${cliId}`);
+    const cli = orchCliFor(cliId);
+    // The knobs first, immediately and unconditionally: they are what this reply
+    // is the answer for, and repainting them touches nothing a human can be
+    // inside.
+    this.applyRoleKnobs(role);
+    // The MENU is the destructive half — rebuilding it under a half-typed id
+    // resolves that id to the dropdown branch and hides the input beneath the
+    // caret — so it is deferred to the moment that stops being true, never
+    // dropped (#997 review NB-3). Dropping it is permanent here in a way it is
+    // not in the workflow pane: `applyRoleModels` is otherwise reached only from
+    // the role's CLI `change` listener and the seed pass. The re-check inside
+    // the callback is the same staleness guard as above, re-run because a
+    // deferral can outlive the CLI it was for.
+    rc.model.runWhenNotEditing(() => {
+      if (orchCliFor(rc.cli.value).id !== cliId) return;
+      rc.model.setOptions(this.catalog.models(cliId), cli.defaults[role], cliId);
+      this.applyRoleKnobs(role);
     });
   }
 
