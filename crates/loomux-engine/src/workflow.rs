@@ -495,6 +495,13 @@ pub struct IntakeProfile {
     /// to the built-in default) — every label field works this way, see
     /// [`sanitize_intake_label`].
     pub prototype: String,
+    /// "Held by the human — do not start this" (#778). The one label whose
+    /// meaning is a *veto* rather than a selector: under full autonomy the
+    /// start default inverts (every open issue is eligible), and this is the
+    /// boundary that stays opt-**out**. Vocabulary only, like every field
+    /// here — it names which label the host poller must treat as a hold, and
+    /// can never grant anything.
+    pub hold: String,
 }
 
 impl Default for IntakeProfile {
@@ -521,6 +528,7 @@ pub fn builtin_intake_profile() -> IntakeProfile {
         investigate: "agent-investigation".to_string(),
         owned: "agent-managed".to_string(),
         prototype: "agent-prototype".to_string(),
+        hold: "agent-hold".to_string(),
     }
 }
 
@@ -534,17 +542,29 @@ pub fn builtin_intake_profile() -> IntakeProfile {
 ///
 /// Empty (omitted) is not a rejection — it falls back to `fallback` (the
 /// built-in default for that field), which is what lets a repo override
-/// `intake.labels.ready:` alone and inherit the other three.
+/// `intake.labels.ready:` alone and inherit the other four.
+///
+/// **A LEADING `-` is rejected on top of [`sanitize_id`]'s alphabet**, which
+/// permits `-` freely (rev-648 NB4). A label is not only compared against
+/// GitHub's — the hold spelling becomes a **positional** argument to
+/// `gh label create <name> …`, and a positional beginning with a dash is read
+/// by cobra as an unknown flag. That is not an injection (nothing is executed,
+/// and the create fails loudly), but it is a class of value that can never
+/// work, and rejecting it here is what lets `gh.rs` state — truthfully — that
+/// nothing flag-shaped reaches an argv. `--force` and `-x` are nonsense as
+/// label names for all five fields, so nothing legitimate is lost. Interior and
+/// trailing dashes (`agent-hold`, `do-not-touch`) are untouched.
 fn sanitize_intake_label(field: &str, raw_val: &str, fallback: &str, errs: &mut Vec<String>) -> String {
     let v = raw_val.trim();
     if v.is_empty() {
         return fallback.to_string();
     }
     match sanitize_id(v) {
-        Some(clean) if clean == v => clean,
+        Some(clean) if clean == v && !clean.starts_with('-') => clean,
         _ => {
             errs.push(format!(
-                "intake.labels.{field}: {v:?} is not a usable label (letters, digits, '-', '_')"
+                "intake.labels.{field}: {v:?} is not a usable label (letters, digits, '-', '_'; \
+                 and it may not begin with '-')"
             ));
             fallback.to_string()
         }
@@ -886,6 +906,8 @@ struct RawIntakeLabels {
     owned: String,
     #[serde(default)]
     prototype: String,
+    #[serde(default)]
+    hold: String,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -1014,6 +1036,7 @@ pub fn workflow_schema_keys() -> BTreeMap<String, Vec<String>> {
         investigate: "agent-investigation".into(),
         owned: "agent-managed".into(),
         prototype: "agent-prototype".into(),
+        hold: "agent-hold".into(),
     };
     let intake = RawIntake { source: "github-labels".into(), labels: RawIntakeLabels::default() };
     let merge_queue =
@@ -1144,6 +1167,7 @@ pub fn workflow_schema_field_facts() -> BTreeMap<String, serde_json::Value> {
     fact("intake.labels.investigate", "default", json!(intake.investigate));
     fact("intake.labels.owned", "default", json!(intake.owned));
     fact("intake.labels.prototype", "default", json!(intake.prototype));
+    fact("intake.labels.hold", "default", json!(intake.hold));
     let mq = MergeQueuePolicy::default();
     fact("merge_queue.enabled", "default", json!(mq.enabled));
     fact("merge_queue.max_batch", "default", json!(mq.max_batch));
@@ -1735,6 +1759,7 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
                     &default_intake.prototype,
                     &mut errs,
                 ),
+                hold: sanitize_intake_label("hold", &ri.labels.hold, &default_intake.hold, &mut errs),
             }
         }
     };
@@ -2671,7 +2696,7 @@ mod tests {
             let RawIntake { source: _, labels: _ } = v;
         }
         fn raw_intake_labels_fields(v: RawIntakeLabels) {
-            let RawIntakeLabels { ready: _, investigate: _, owned: _, prototype: _ } = v;
+            let RawIntakeLabels { ready: _, investigate: _, owned: _, prototype: _, hold: _ } = v;
         }
         // #581 §11.2: `merge_queue:` is policy for a host-run queue that pushes
         // refs on the backend's own authority, so the inventory rule matters

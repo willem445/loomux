@@ -599,6 +599,129 @@ pub fn auto_release_notice(on: bool) -> String {
     }
 }
 
+/// The cap, in characters, on a full-autonomy goal string (#778). The goal rides
+/// in two places that are *typed into a CLI pane* — the toggle notice and the
+/// orchestrator's kickoff config — so an unbounded paste would crowd out the
+/// instructions it is only meant to qualify.
+pub const MAX_FULL_AUTONOMY_GOAL_CHARS: usize = 500;
+
+/// Normalize a full-autonomy goal (#778) into the single-line, bounded, paste-safe
+/// form stored as the `full_autonomy` marker's content and echoed into the toggle
+/// notice and the kickoff config. Empty or all-whitespace = no goal (`""`), which
+/// every caller renders as "no goal set" rather than as an empty pair of quotes.
+///
+/// Loomux never *parses* the goal — what work is valuable is the orchestrator's
+/// documented judgment, not policy in product code — so the only work here is
+/// making the string safe to carry:
+///
+/// - every whitespace run collapses to ONE space, because both destinations are a
+///   typed paste into a CLI pane where a newline submits the prompt early and
+///   splits the instruction in half;
+/// - control characters are dropped outright (an escape sequence in a goal would
+///   reach a terminal verbatim);
+/// - `[`/`]` are neutralized exactly as every other untrusted field in a
+///   `[loomux] …` notice is ([`notify::sanitize_gh_text`]), so a goal can never
+///   forge a second notice row in the orchestrator's own pane;
+/// - the result is capped by CHARACTERS (never bytes — a multibyte goal must not
+///   truncate mid-codepoint) and never left ending in the space the cap landed on.
+///
+/// Idempotent, so re-sanitizing on read (the marker is a file a human can edit)
+/// cannot keep eating the goal.
+pub fn sanitize_full_autonomy_goal(raw: &str) -> String {
+    let mut out = String::new();
+    let mut chars = 0usize;
+    for ch in raw.chars() {
+        if chars == MAX_FULL_AUTONOMY_GOAL_CHARS {
+            break;
+        }
+        let c = if ch.is_whitespace() {
+            ' '
+        } else if ch.is_control() {
+            continue;
+        } else {
+            match ch {
+                '[' => '(',
+                ']' => ')',
+                other => other,
+            }
+        };
+        // Collapse runs, and drop the leading one entirely (that is the trim).
+        if c == ' ' && (out.is_empty() || out.ends_with(' ')) {
+            continue;
+        }
+        out.push(c);
+        chars += 1;
+    }
+    while out.ends_with(' ') {
+        out.pop();
+    }
+    out
+}
+
+/// Notice delivered to the orchestrator when full autonomy is toggled mid-session
+/// (#778), so it learns that the start default inverted without waiting to re-read
+/// its kickoff config. `goal` is normalized here rather than trusted from the
+/// caller, so this function is safe to call with anything and the "a goal cannot
+/// forge a notice row" property is a property of the *pure function*, testable on
+/// its own.
+///
+/// The ON text is the whole protocol because there is nowhere else for it to live
+/// at the moment the human flips the switch: what to do before touching the
+/// pre-existing backlog (post one ranked triage plan and wait for an explicit go),
+/// what the veto gesture is (`hold`, absolute), and — said out loud, because
+/// this is the notice a reader will most want to over-read — that nothing about
+/// merging, releasing, review or budgets moved. The toggle widens what may be
+/// STARTED, never what may be SHIPPED.
+///
+/// `hold` is the group's RESOLVED veto spelling, threaded for the same reason the
+/// template's `{{HOLD_LABEL}}` is (rev round 1 B1): this notice tells the
+/// orchestrator which label to tell the human to strike rows with, so a hardcoded
+/// `agent-hold` here would hand a renamed repo a veto gesture its own poller
+/// ignores — the defect one surface over. Sanitized on the way in like every
+/// other interpolated value: it is repo-authored text, and the parser's alphabet
+/// restriction is a different layer's guarantee, not this function's.
+pub fn full_autonomy_notice(on: bool, goal: &str, hold: &str) -> String {
+    if !on {
+        // OFF ignores whatever goal it is called with — off has none, by construction.
+        return "[loomux] full autonomy DISABLED for this group: the label funnel is opt-in \
+                again — start only agent-ready / agent-investigation work. Finish what is \
+                already in flight normally."
+            .to_string();
+    }
+    let hold = sanitize_full_autonomy_goal(hold);
+    let hold = if hold.is_empty() { builtin_hold_label() } else { hold };
+    format!(
+        "[loomux] FULL AUTONOMY ENABLED for this group ({goal_clause}). Before starting any \
+         pre-existing issue: post one ranked triage plan (value/risk/effort/order) over ALL \
+         open issues as a GitHub issue, tell the human to veto rows by adding {hold}, and \
+         wait for their go. After the go — and for any issue filed from now on that fits the \
+         goal — self-select the highest-value eligible issue on each idle tick and start it \
+         within your caps, announcing a one-line selection rationale per pickup. {hold} is \
+         absolute. Nothing about merging, releasing, review, or budgets changed.",
+        goal_clause = full_autonomy_goal_clause(goal),
+    )
+}
+
+/// The built-in veto spelling, for the paths that must name one when a group's
+/// own profile is unavailable or empty. One accessor rather than a literal
+/// repeated at each such site.
+fn builtin_hold_label() -> String {
+    workflow::builtin_intake_profile().hold
+}
+
+/// The parenthesized goal fragment shared by the toggle notice and the kickoff
+/// config clause, so the two can't drift: `goal: "…"` when there is one, and the
+/// honest `no goal set` when there isn't — never an empty pair of quotes, which
+/// reads as a goal that got lost rather than one that was never given.
+fn full_autonomy_goal_clause(goal: &str) -> String {
+    let goal = sanitize_full_autonomy_goal(goal);
+    if goal.is_empty() {
+        "no goal set".to_string()
+    } else {
+        format!("goal: \"{goal}\"")
+    }
+}
+
 /// Notice delivered to the orchestrator when supervised dangerous mode is toggled
 /// (#83), or force-cleared because autonomous mode was enabled (`by_autonomous`).
 pub fn dangerous_mode_notice(on: bool, by_autonomous: bool) -> String {
@@ -3754,18 +3877,36 @@ pub struct Guardrails {
     /// renderer, `gh.rs`'s label allow-list, `idle_tick_notice()` — reads the
     /// same value.
     ///
-    /// **NOT YET wired to the #332 host poller (rev-33 finding, #429):** the
-    /// P1 comment above once claimed the poller was a consumer too; it isn't
-    /// — `intake::INTAKE_LABELS` is a hardcoded `["agent-ready",
-    /// "agent-investigation"]` const, not read from this field. That was a
-    /// low-stakes gap while the gate shipped default-off (#429's smart
-    /// default hadn't landed, so almost no group actually engaged the
-    /// poller); it is a real one now that the gate is ON by default for
-    /// every autonomous group — a repo with a custom `intake:` profile
-    /// (different labels) gets a poller silently checking the WRONG ones,
-    /// never finding its own custom-labeled intake. TODO(#382 P2): wire
+    /// **Only PARTLY wired to the #332 host poller (rev-33 finding, #429):**
+    /// the P1 comment above once claimed the poller was a consumer; for the
+    /// intake labels it still isn't — `intake::INTAKE_LABELS` is a hardcoded
+    /// `["agent-ready", "agent-investigation"]` const, not read from this
+    /// field. That was a low-stakes gap while the gate shipped default-off
+    /// (#429's smart default hadn't landed, so almost no group actually
+    /// engaged the poller); it is a real one now that the gate is ON by
+    /// default for every autonomous group — a repo with a custom `intake:`
+    /// profile (different labels) gets a poller silently checking the WRONG
+    /// ones, never finding its own custom-labeled intake. TODO(#382 P2): wire
     /// `poll_intake`/`label_deltas` to read this field's resolved labels
     /// instead of the hardcoded const.
+    ///
+    /// `hold` is the exception, wired from the start (#778): `poll_intake`
+    /// reads it from here for every full-autonomy eligibility check. Deliberate
+    /// — it is a **consent boundary** (the human's veto over what may be
+    /// started), and repeating the hardcoded-const gap on one of those would
+    /// mean a repo that renamed the label gets its vetoes silently ignored.
+    ///
+    /// **And "wired" means every surface that names the veto, not just this
+    /// one.** The first cut wired only the poller, which was worse than not
+    /// supporting the rename at all: the orchestrator builds its triage plan
+    /// from its own `gh issue list` sweep, so a contract still naming
+    /// `agent-hold` put a held issue into the plan the human then approved.
+    /// The spelling now also reaches the contract (the `{{HOLD_LABEL}}`
+    /// template variable, rendered from this field), and — resolved from the
+    /// repo's workflow file, since the issues view has no group — the
+    /// issues-view toggle and `gh.rs`'s label allow-list. See
+    /// `doc/design/orchestration.md`'s full-autonomy section for why the two
+    /// resolution paths agree.
     ///
     /// Available regardless of the toggle: autonomous mode can run with the
     /// built-in roster, so a consumer must always have a profile to read, not
@@ -7995,6 +8136,7 @@ fn read_intake(g: &Value) -> workflow::IntakeProfile {
         investigate: label("investigate", &default.investigate),
         owned: label("owned", &default.owned),
         prototype: label("prototype", &default.prototype),
+        hold: label("hold", &default.hold),
     }
 }
 
@@ -8008,6 +8150,7 @@ fn intake_json(p: &workflow::IntakeProfile) -> Value {
             "investigate": p.investigate,
             "owned": p.owned,
             "prototype": p.prototype,
+            "hold": p.hold,
         },
     })
 }
@@ -10635,6 +10778,14 @@ pub struct OrchRegistry {
     /// (absent), so turning autonomous on never surprise-publishes. Durable
     /// `auto_release` marker; gated behind autonomous exactly like `auto_merge`.
     auto_release_groups: Mutex<HashSet<GroupId>>,
+    /// Full autonomy (#778): groups whose orchestrator self-selects eligible work
+    /// on its idle tick instead of waiting for the human's opt-in label funnel.
+    /// A dependent toggle of autonomous mode exactly like `auto_merge` /
+    /// `auto_release` — enabling requires autonomous ON, and autonomous-off or a
+    /// budget suspension force-clears it. Durable `full_autonomy` marker whose
+    /// *content* is the enable-time goal string (the autonomous marker's
+    /// anchor-in-content precedent: consent and its parameter captured together).
+    full_autonomy_groups: Mutex<HashSet<GroupId>>,
     /// Supervised dangerous mode (#83): groups where the human — present and
     /// supervising — has authorized the orchestrator to merge/release itself
     /// WITHOUT being autonomous. Default OFF. **Mutually exclusive with
@@ -22901,6 +23052,7 @@ impl OrchRegistry {
             autonomous_groups: Mutex::new(HashSet::new()),
             auto_merge_groups: Mutex::new(HashSet::new()),
             auto_release_groups: Mutex::new(HashSet::new()),
+            full_autonomy_groups: Mutex::new(HashSet::new()),
             dangerous_groups: Mutex::new(HashSet::new()),
             spawn_expanded_groups: Mutex::new(HashSet::new()),
             idle_tick_times: Mutex::new(HashMap::new()),
@@ -26111,6 +26263,24 @@ impl OrchRegistry {
                     json!({ "reason": "reconcile-autonomous-off" }));
             }
         }
+        // Full autonomy re-seed (#778) with the same dependency reconcile. It carries
+        // the sharper consequence of the three: a stale `full_autonomy` marker without
+        // a live `autonomous` one would come back with the start default INVERTED —
+        // every open issue eligible — on consent nobody renewed. So it is cleared and
+        // audited on read, and only re-seeded beside a live autonomous marker. The
+        // goal rides in the resume audit because it is the parameter that qualified
+        // the consent, and a resume that doesn't name it is not visible enough.
+        if dir.join("full_autonomy").is_file() {
+            if self.autonomous_groups.lock_safe().contains(&id) {
+                self.full_autonomy_groups.lock_safe().insert(id.clone());
+                self.audit(&id, "loomux", "full-autonomy-resumed",
+                    json!({ "from": "marker", "goal": self.full_autonomy_goal(&id) }));
+            } else {
+                let _ = remove_marker(&dir.join("full_autonomy"));
+                self.audit(&id, "loomux", "full-autonomy-off",
+                    json!({ "reason": "reconcile-autonomous-off" }));
+            }
+        }
         // Supervised dangerous mode re-seed (#83): valid only while NOT autonomous
         // (mutually exclusive). If both markers survived a hand-edit, autonomous
         // wins and the stale dangerous marker is cleared + audited.
@@ -27845,6 +28015,14 @@ impl OrchRegistry {
     /// is due (#406) — with the same `now` that tick's notify half used, so
     /// both halves of one wake stamp the same instant.
     ///
+    /// For a group in **full autonomy** (#778) the same `gh issue list`
+    /// response answers a second question — which open issues are eligible to
+    /// start and unstarted (`intake::eligible_deltas`) — so the self-select
+    /// signal costs zero extra `gh` calls and zero tokens. It rides
+    /// `has_intake_signal` like every other finding here: the idle-tick gate
+    /// gains no new parameter, and the one-notice latch, hourly cap and
+    /// bounded fallback all apply to it unchanged.
+    ///
     /// A `gh` failure for one call (auth, `gh` missing, rate-limited) simply
     /// skips that half of the diff for this scan — it still stamps the poll
     /// attempt (so a persistently-failing `gh` doesn't get retried every
@@ -27861,60 +28039,135 @@ impl OrchRegistry {
         let due = intake::due_intake_polls(now, &minutes, &last_poll);
         for group in due {
             let Some(repo) = repos.get(&group) else { continue };
-            let issues_raw =
-                self.gh_capture(repo, &["issue", "list", "--state", "open", "--json", "number,title,labels"]);
-            // #864: `comments,reviews` ride the PR call that was already being
-            // made — the newest-comment timestamp is the one delta the
-            // orchestrator still polled by hand on every tick, and folding it
-            // in here costs zero extra round-trips (the two calls per due group
-            // this poller is budgeted for are unchanged).
+            // The argv is built by `intake::issue_list_argv` rather than
+            // spelled inline so its `--limit` is pinned by a test: `gh issue
+            // list` defaults to the 30 NEWEST open issues, which silently hid
+            // most of a mid-sized repo's backlog from both diffs below
+            // (measured on loomux itself: 30 of 94). See
+            // `intake::MAX_INTAKE_ISSUES` for why 300, and why hitting the
+            // bound is reported rather than silently applied.
+            let issue_argv = intake::issue_list_argv();
+            let issue_args: Vec<&str> = issue_argv.iter().map(String::as_str).collect();
+            let issues_raw = self.gh_capture(repo, &issue_args);
+            // Same treatment for the PR half, and for a sharper reason (#795):
+            // `gh pr list` also defaults to the 30 NEWEST, and
+            // `pr_check_deltas`/`pr_comment_deltas` prune on absence — so past
+            // the default the window churns and a PR re-entering it re-fires a
+            // terminal check state, or a comment, it already reported. See
+            // `intake::MAX_INTAKE_PRS` for why 200 rather than the issue bound.
+            //
+            // That argv also carries `comments,reviews` (#864): the
+            // newest-comment timestamp is the one delta the orchestrator still
+            // polled by hand on every tick, and folding it into a call that was
+            // already being made costs zero extra round-trips (the two calls
+            // per due group this poller is budgeted for are unchanged).
             //
             // It DOES widen the response, and by a lot: `gh` has no sub-field
             // selection, so every comment and review BODY comes down whether or
             // not anything reads them. Measured on this repo at 14 open PRs
             // (rev-368 F3): 20,034 bytes without the two fields, 288,284 with —
             // 14.4x, ~1-2s either way, well inside `GH_CAPTURE_TIMEOUT`. The
-            // round-trip count is what stays flat, NOT the byte count: this
-            // grows linearly with total discussion volume across the (gh
-            // default) 30 most recent open PRs, so a busier repo pays
+            // round-trip count is what stays flat, NOT the byte count: it grows
+            // with total discussion volume across the (now `MAX_INTAKE_PRS`,
+            // not gh's 30) open PRs in the window, so a busier repo pays
             // proportionally more. `intake::parse_pr_list` skips the bodies
             // without allocating them, so the cost lands on one larger response
             // string per poll rather than per comment, and `capture_raw_inner`
             // reads to end with no cap — there is no truncation path that could
             // silently drop the check-state half of the same response.
-            let prs_raw = self.gh_capture(
-                repo,
-                &["pr", "list", "--state", "open", "--json", "number,title,statusCheckRollup,comments,reviews"],
-            );
+            let pr_argv = intake::pr_list_argv();
+            let pr_args: Vec<&str> = pr_argv.iter().map(String::as_str).collect();
+            let prs_raw = self.gh_capture(repo, &pr_args);
             self.intake_last_poll_ms.lock_safe().insert(group.clone(), now);
 
-            let (label_signals, pr_signals, comment_signals) = {
+            // Full-autonomy eligibility inputs (#778), resolved before the
+            // seen-state lock: this group's own hold-label spelling (a repo
+            // may rename it — the veto is a consent boundary, so the poller
+            // reads the resolved profile rather than a const), and the issue
+            // numbers the board already tracks. Both are cheap and neither is
+            // computed for a group that isn't in full autonomy. A group that
+            // opted OUT of intake polling entirely (`intake_poll_minutes:
+            // Some(0)`) is never due here at all, in this mode as in any
+            // other: its orchestrator still gets the bounded fallback
+            // heartbeat, and the contract has it sweep for eligible work
+            // itself — the gate stays a gate, not a second consent surface.
+            //
+            // Read outside the `intake_seen` lock that `eligible_deltas` later
+            // writes under, which leaves one narrow residual (rev-266 NB2): a
+            // re-aim landing between this read and that write has its
+            // `set_full_autonomy` re-arm overwritten, losing that one triage
+            // trigger. Left as-is deliberately — closing it means taking
+            // `full_autonomy_groups` while holding `intake_seen`, the exact
+            // reverse of the order `set_full_autonomy` uses, trading a
+            // microsecond window on a human-driven toggle for a lock-order
+            // inversion. The ON notice reaches the orchestrator either way, and
+            // the next poll re-announces anything genuinely new.
+            let full_autonomy = self.is_full_autonomy(&group);
+            let (hold_label, board_tracked) = if full_autonomy {
+                let hold = self
+                    .groups
+                    .lock_safe()
+                    .get(&group)
+                    .map(|g| g.guardrails.intake.hold.clone())
+                    .unwrap_or_else(|| workflow::builtin_intake_profile().hold);
+                let tasks = self.tasks(&group);
+                let refs: Vec<&str> = tasks.iter().filter_map(|t| t.issue.as_deref()).collect();
+                (hold, intake::board_tracked_issues(&refs))
+            } else {
+                (String::new(), HashSet::new())
+            };
+
+            let (label_signals, pr_signals, comment_signals, eligible_signals, truncated) = {
                 let mut seen = self.intake_seen.lock_safe();
                 let state = seen.entry(group.clone()).or_default();
-                let labels = issues_raw
-                    .as_deref()
-                    .ok()
-                    .and_then(intake::parse_issue_list)
-                    .map(|issues| intake::label_deltas(&mut state.labels, &issues))
+                // Parsed once and read by both diffs — the label delta and the
+                // eligibility delta are two questions about the same `gh issue
+                // list` response, not two fetches.
+                let issues = issues_raw.as_deref().ok().and_then(intake::parse_issue_list);
+                let listing = issues.as_deref().map(intake::OpenIssueList::from_fetch);
+                let labels = listing
+                    .map(|l| intake::label_deltas(&mut state.labels, l.issues))
                     .unwrap_or_default();
+                let eligible = intake::eligible_deltas(
+                    &mut state.eligible,
+                    full_autonomy,
+                    listing,
+                    &hold_label,
+                    &board_tracked,
+                );
                 // One parse feeds both PR diffs — check-state transitions and
                 // comment/review activity are two questions about the same
-                // `gh pr list` response, not two polls.
+                // `gh pr list` response, not two polls — and both read it
+                // through the same `OpenPrList`, so the completeness flag
+                // gating one prune gates the other.
                 let parsed_prs = prs_raw.as_deref().ok().and_then(intake::parse_pr_list);
-                let checks = parsed_prs
-                    .as_deref()
-                    .map(|prs| intake::pr_check_deltas(&mut state.pr_checks, prs))
+                let pr_listing = parsed_prs.as_deref().map(intake::OpenPrList::from_fetch);
+                let prs = pr_listing
+                    .map(|l| intake::pr_check_deltas(&mut state.pr_checks, l))
                     .unwrap_or_default();
-                let comments = parsed_prs
-                    .as_deref()
-                    .map(|prs| intake::pr_comment_deltas(&mut state.pr_comments, prs))
+                let comments = pr_listing
+                    .map(|l| intake::pr_comment_deltas(&mut state.pr_comments, l))
                     .unwrap_or_default();
-                (labels, checks, comments)
+                let truncated = intake::IntakeTruncation {
+                    issues: listing.is_some_and(|l| !l.complete),
+                    prs: pr_listing.is_some_and(|l| !l.complete),
+                };
+                (labels, prs, comments, eligible, truncated)
             };
-            if label_signals.is_empty() && pr_signals.is_empty() && comment_signals.is_empty() {
+            if label_signals.is_empty()
+                && pr_signals.is_empty()
+                && comment_signals.is_empty()
+                && eligible_signals.is_empty()
+            {
                 continue;
             }
-            let summary = intake::intake_wake_summary(&label_signals, &pr_signals, &comment_signals);
+            let summary = intake::intake_wake_summary(
+                &label_signals,
+                &pr_signals,
+                &comment_signals,
+                &eligible_signals,
+                truncated,
+            );
             self.audit(&group, "loomux", "intake-signal", json!({ "summary": summary }));
             // Fold into any not-yet-delivered pending summary rather than
             // clobbering it — two poll scans can each find something new
@@ -27938,6 +28191,29 @@ impl OrchRegistry {
     #[doc(hidden)] // pub for integration tests: observe that a scan ran, without shelling to `gh`
     pub fn intake_last_poll_at(&self, group: &GroupId) -> Option<u64> {
         self.intake_last_poll_ms.lock_safe().get(group).copied()
+    }
+
+    /// The issue numbers this group's intake poller last saw as
+    /// eligible-unstarted (#778), sorted.
+    ///
+    /// Same `#[doc(hidden)]` test-seam rationale as `intake_last_poll_at`
+    /// above: `poll_intake`'s own path needs a live `gh`, so without a seam
+    /// the one property that makes an enable a **triage trigger** — that
+    /// turning full autonomy on empties this set, so the next poll announces
+    /// the whole backlog — could only be asserted by re-implementing it in
+    /// the test.
+    #[doc(hidden)] // pub for integration tests: observe the eligible seen-set without shelling to `gh`
+    pub fn intake_eligible_seen(&self, group: &GroupId) -> Vec<u64> {
+        let seen = self.intake_seen.lock_safe();
+        let mut n: Vec<u64> = seen.get(group).map(|s| s.eligible.iter().copied().collect()).unwrap_or_default();
+        n.sort_unstable();
+        n
+    }
+
+    #[doc(hidden)] // pub for integration tests: seed the eligible seen-set without shelling to `gh`
+    pub fn seed_intake_eligible_seen(&self, group: &GroupId, numbers: &[u64]) {
+        self.intake_seen.lock_safe().entry(group.clone()).or_default().eligible =
+            numbers.iter().copied().collect();
     }
 
     #[doc(hidden)] // pub for integration tests: seed a pending intake signal without shelling to `gh`
@@ -31316,6 +31592,9 @@ impl OrchRegistry {
         // disk removal fails).
         self.force_disable_auto_merge(group, "loomux", "autonomous-suspended");
         self.force_disable_auto_release(group, "loomux", "autonomous-suspended");
+        // Full autonomy (#778) is the mode that STARTS work, so a spent budget must
+        // drop it for the same reason and by the same unconditional route.
+        self.force_disable_full_autonomy(group, "loomux", "autonomous-suspended");
         // Best-effort durable disable; failure is surfaced in the audit trail.
         match remove_marker(&self.group_dir(group).join("autonomous")) {
             Ok(()) => self.audit(group, "loomux", "autonomous-off", json!({})),
@@ -31450,6 +31729,10 @@ impl OrchRegistry {
             // deliver, so both stay outside the guard.
             self.force_disable_auto_merge(group, actor, "autonomous-disabled");
             self.force_disable_auto_release(group, actor, "autonomous-disabled");
+            // Same dependency for full autonomy (#778), for a stronger reason: without
+            // the idle tick there is nothing to self-select on, and an inverted start
+            // default outliving its consent is the one direction it must never have.
+            self.force_disable_full_autonomy(group, actor, "autonomous-disabled");
         }
         Ok(())
     }
@@ -31583,6 +31866,188 @@ impl OrchRegistry {
         drop(_io);
         let _ = self.deliver_to_orchestrator(group, &auto_release_notice(on), "loomux");
         Ok(())
+    }
+
+    /// This group's resolved veto spelling (#778) — `guardrails.intake.hold`,
+    /// falling back to the built-in for a group this registry no longer holds.
+    ///
+    /// One accessor, so every agent-facing surface that names the veto (the
+    /// contract's `{{HOLD_LABEL}}`, the kickoff clause, the toggle notice) reads
+    /// the same field the intake poller checks against. The whole B1 defect was
+    /// three surfaces each answering this question for themselves.
+    fn hold_label_of(&self, group: &GroupId) -> String {
+        self.groups
+            .lock_safe()
+            .get(group)
+            .map(|g| g.guardrails.intake.hold.clone())
+            .filter(|h| !h.trim().is_empty())
+            .unwrap_or_else(builtin_hold_label)
+    }
+
+    /// Whether full autonomy (#778) is on for a group: the orchestrator self-selects
+    /// eligible work on its idle tick instead of waiting for the opt-in label funnel.
+    pub fn is_full_autonomy(&self, group: &GroupId) -> bool {
+        self.full_autonomy_groups.lock_safe().contains(group)
+    }
+
+    /// The goal string qualifying full autonomy for a group — the `full_autonomy`
+    /// marker's *content*, the same anchor-in-content shape `set_autonomous` uses for
+    /// the budget anchor, so consent and the parameter that qualifies it are written
+    /// atomically and come back together across a restart. `None` when the mode is
+    /// on with no goal (empty marker), which renders as "no goal set" rather than as
+    /// a goal that got lost.
+    ///
+    /// **Gated on `is_full_autonomy`, and the gate is the point, not a formality.**
+    /// The marker's presence is NOT equivalent to the mode being on: the force-clear
+    /// paths are money-stops that drop the in-memory flag unconditionally and remove
+    /// the marker only best-effort (`force_disable_full_autonomy`'s `let _ =`), so a
+    /// disk failure genuinely leaves a marker — goal and all — behind while the mode
+    /// is off. In that window `full_autonomy_groups` is the authority, and reporting
+    /// the orphaned goal would have `orch_autonomy` claim consent that is not in
+    /// force. Gating here rather than at the one JSON call site makes that total: no
+    /// future caller can reintroduce it. (The orphaned marker itself is cleared by
+    /// the restart reconcile in `create_group`.)
+    ///
+    /// Re-sanitized on read: the marker is a file a human can hand-edit, and a
+    /// newline smuggled in there would reach a CLI paste. The sanitizer is
+    /// idempotent, so this costs nothing for the normal path.
+    pub fn full_autonomy_goal(&self, group: &GroupId) -> Option<String> {
+        if !self.is_full_autonomy(group) {
+            return None;
+        }
+        let goal = fs::read_to_string(self.group_dir(group).join("full_autonomy")).ok()?;
+        let goal = sanitize_full_autonomy_goal(&goal);
+        (!goal.is_empty()).then_some(goal)
+    }
+
+    /// Enable/disable full autonomy for a group, durably (a `full_autonomy` marker
+    /// whose content is the goal). Default OFF = today's opt-in label funnel.
+    ///
+    /// Mirrors `set_auto_merge`'s machinery — gated behind autonomous mode, atomic
+    /// in-memory reserve, disk-first fail-loud disable, one audited notice — for a
+    /// stronger reason than its siblings have: this toggle INVERTS the start
+    /// default, so it must never outlive the consent to run unattended at all.
+    ///
+    /// **One deliberate difference from the siblings.** They no-op on a duplicate
+    /// enable; here a duplicate enable carrying a DIFFERENT goal re-aims the mode
+    /// instead. The goal is the consent's parameter, not decoration: a human who
+    /// retypes it has changed what they are consenting to, and silently discarding
+    /// that would leave them believing they had re-aimed a fleet still running the
+    /// old goal. Same goal → true no-op (no re-audit, no re-notify).
+    pub fn set_full_autonomy(&self, group: &GroupId, on: bool, goal: &str) -> Result<(), String> {
+        let dir = self.group_dir(group);
+        if on {
+            // Dependency: full autonomy is a mode of autonomous idle-ticking, so it
+            // cannot be enabled without it — there would be no tick to self-select on,
+            // and the inverted start default would sit there as unrenewed consent.
+            if !self.is_autonomous(group) {
+                return Err(
+                    "full autonomy requires autonomous mode — turn on Autonomous mode first"
+                        .into(),
+                );
+            }
+            let goal = sanitize_full_autonomy_goal(goal);
+            // Atomic reserve for the FIRST enable (mirrors set_autonomous_as /
+            // set_auto_merge): a single `insert` decides who proceeds, so two
+            // concurrent first-enables can't both write the marker or double-audit.
+            //
+            // It deliberately does NOT serialize the re-aim path below, and saying so
+            // is the honest version of this comment: two concurrent re-aims carrying
+            // different goals both observe `!newly`, both pass the compare, and both
+            // write — last writer wins. That is acceptable rather than merely
+            // tolerated. The caller is a human operating one toggle in one panel, so
+            // the race needs two humans or two windows to exist at all; and neither
+            // outcome is a consent violation, because the mode is on either way and
+            // whichever goal lands is one a human typed, with BOTH re-aims in the
+            // audit trail. Holding a lock across the read-compare-write would buy
+            // ordering nobody can observe and would put file IO under the set lock.
+            let newly = self.full_autonomy_groups.lock_safe().insert(group.clone());
+            let previous = if newly { None } else { self.full_autonomy_goal(group) };
+            // The no-op is gated on the marker being READABLE, not merely on the
+            // goal comparing equal (rev round 1 NB2). `full_autonomy_goal`
+            // answers `None` both for "on with no goal" and for "the marker is
+            // gone" — a marker a force-clear removed best-effort, or a hand
+            // delete — and treating those alike let a re-enable with an empty
+            // goal return early without rewriting it, leaving the mode ON in
+            // memory with nothing durable behind it and OFF after a restart.
+            // Asking the disk directly separates them: no marker means fall
+            // through and write one, whatever the goal says.
+            let marker_present = dir.join("full_autonomy").is_file();
+            if !newly && marker_present && previous.as_deref().unwrap_or("") == goal {
+                return Ok(()); // already on with this exact goal — don't re-notify
+            }
+            if let Err(e) = fs::create_dir_all(&dir)
+                .and_then(|_| fs::write(dir.join("full_autonomy"), goal.as_bytes()))
+            {
+                // Roll back the reservation so memory never claims ON without a durable
+                // marker (failing OFF re-asks for consent — the safe direction). A
+                // failed RE-goal leaves the previous goal in force, which is likewise
+                // the conservative outcome.
+                if newly {
+                    self.full_autonomy_groups.lock_safe().remove(group);
+                }
+                return Err(format!("failed to enable full autonomy: {e}"));
+            }
+            // Re-arm the triage trigger (#778). `intake_seen[group].eligible` means
+            // "eligible at the last intake poll", and an empty one is what makes the
+            // next poll announce the whole eligible backlog once — precisely the
+            // triage pass the enable notice tells the orchestrator to post. The
+            // poller clears it while the mode is off, but only for groups it
+            // actually reaches, so an off→on flip inside one poll interval would
+            // otherwise inherit a set populated under different consent and announce
+            // nothing at all. A re-aim clears it too: the goal is what decides
+            // whether an eligible issue is worth starting, so a human who changes it
+            // is asking for the backlog to be judged again.
+            self.intake_seen.lock_safe().entry(group.clone()).or_default().eligible.clear();
+            if newly {
+                self.audit(group, "human", "full-autonomy-on", json!({ "goal": goal }));
+            } else {
+                // A re-aim, audited as its own action so the trail distinguishes "the
+                // human turned this on" from "the human changed what it is pointed at".
+                self.audit(group, "human", "full-autonomy-goal-set",
+                    json!({ "goal": goal, "previous": previous }));
+            }
+        } else {
+            if !self.full_autonomy_groups.lock_safe().contains(group) {
+                return Ok(()); // no-op: don't re-notify
+            }
+            // Disk first, then memory: a surviving `full_autonomy` marker would
+            // silently re-invert the start default on the next restart's re-seed
+            // without renewed consent, so a failed removal fails the toggle and leaves
+            // the mode consistently ON (matching the marker the human still sees).
+            if let Err(e) = remove_marker(&dir.join("full_autonomy")) {
+                self.audit(group, "human", "full-autonomy-off-failed", json!({ "error": e }));
+                return Err(
+                    "couldn't disable full autonomy: the consent marker could not be removed, \
+                     so it stays ON — retry or check disk/permissions"
+                        .to_string(),
+                );
+            }
+            self.full_autonomy_groups.lock_safe().remove(group);
+            self.audit(group, "human", "full-autonomy-off", json!({}));
+        }
+        // Tell the running orchestrator the start default moved (best-effort; a
+        // dead/paused orchestrator just misses it and re-reads its kickoff config on
+        // resume). A re-aim re-delivers the ON notice deliberately: the protocol it
+        // carries is scoped to the goal, so a new goal is a new instruction.
+        let hold = self.hold_label_of(group);
+        let _ = self.deliver_to_orchestrator(group, &full_autonomy_notice(on, goal, &hold), "loomux");
+        Ok(())
+    }
+
+    /// Drop full autonomy for a group UNCONDITIONALLY — the same money-stop shape as
+    /// [`OrchRegistry::force_disable_auto_merge`]. The in-memory set is authoritative
+    /// and cleared even if the marker removal fails, so autonomous-off or a spent
+    /// budget can never leave the one mode whose job is to START new work armed.
+    fn force_disable_full_autonomy(&self, group: &GroupId, actor: &str, reason: &str) {
+        if self.full_autonomy_groups.lock_safe().remove(group) {
+            let _ = remove_marker(&self.group_dir(group).join("full_autonomy"));
+            self.audit(group, actor, "full-autonomy-off", json!({ "reason": reason }));
+            // The OFF notice names no veto, so the spelling is irrelevant here —
+            // passed for signature reasons only.
+            let _ =
+                self.deliver_to_orchestrator(group, &full_autonomy_notice(false, "", ""), "loomux");
+        }
     }
 
     /// Whether supervised dangerous mode is on for a group (the human is present and
@@ -32056,6 +32521,17 @@ impl OrchRegistry {
             "autonomous": on,
             "auto_merge": self.is_auto_merge(group),
             "auto_release": self.is_auto_release(group),
+            // Full autonomy (#778) and its goal. The goal is null whenever the mode
+            // is off — the marker that holds it only exists while it is on — so the
+            // panel never renders a goal that isn't in force.
+            "full_autonomy": self.is_full_autonomy(group),
+            "full_autonomy_goal": self.full_autonomy_goal(group),
+            // The group's resolved veto spelling (#778), so the panel's own
+            // full-autonomy help and header chip name the label THIS group's
+            // poller honors. Reported unconditionally (not only while the mode
+            // is on, unlike the goal): the help text explains what the toggle
+            // WOULD do, and it has to be true before the human flips it.
+            "hold_label": self.hold_label_of(group),
             "dangerous_mode": self.is_dangerous_mode(group),
             "budget_tokens": budget,
             "budget_anchor_tokens": anchor,
@@ -34538,6 +35014,15 @@ impl OrchRegistry {
             ("WORKER_MODEL", g.guardrails.model_for(Role::Worker)),
             ("REVIEWER_MODEL", g.guardrails.model_for(Role::Reviewer)),
             ("PLANNER_MODEL", g.guardrails.model_for(Role::Planner)),
+            // #778: the veto's spelling, from the SAME resolved profile
+            // `poll_intake` reads. The contract is the consent boundary under
+            // full autonomy (nothing host-side blocks a start), so a template
+            // naming a label the poller does not honor would tell the
+            // orchestrator to build its triage plan around an exclusion that
+            // never fires. Threaded like MAX_AGENTS / WORKER_MODEL rather than
+            // conditionally injected: it is a per-group VALUE, not
+            // workflow-conditional prose, and it renders for every group.
+            ("HOLD_LABEL", g.guardrails.intake.hold.as_str()),
             ("WORKFLOW", workflow_section.as_str()),
             ("ADVISOR_CONSULT_NOTE", advisor_consult_note.as_str()),
             ("POST_MERGE_WORKFLOW_HOOK", post_merge_workflow_hook.as_str()),
@@ -38021,6 +38506,11 @@ impl OrchRegistry {
             ("WORKER_MODEL", group.guardrails.model_for(Role::Worker)),
             ("REVIEWER_MODEL", group.guardrails.model_for(Role::Reviewer)),
             ("PLANNER_MODEL", group.guardrails.model_for(Role::Planner)),
+            // #778, same value and same reason as the group-render list above:
+            // an orchestrator BLOCK re-renders its instruction file here on
+            // every spawn, so a var missing from this list would leave a live
+            // `{{HOLD_LABEL}}` in the file the agent actually reads.
+            ("HOLD_LABEL", group.guardrails.intake.hold.as_str()),
         ];
         // Audited, not swallowed: the kickoff below hands the agent this file's
         // path as "read your role instructions", so a failed write means an agent
@@ -38503,6 +38993,36 @@ impl OrchRegistry {
         }
     }
 
+    /// The value of the `autonomous idle-tick mode is {…}` clause in the
+    /// orchestrator's kickoff config. OFF and plain-autonomous are pinned
+    /// byte-for-byte by `orchestration.rs`: a kickoff is the contract a fresh boot
+    /// or resume reads, so a silent wording drift there changes what every existing
+    /// group is told, and the full-autonomy branch (#778) must be additive to it.
+    fn autonomous_kickoff_clause(&self, group: &GroupId) -> String {
+        if !self.is_autonomous(group) {
+            return "off".to_string();
+        }
+        if !self.is_full_autonomy(group) {
+            return "ON (you will get [loomux] idle tick wakes to run your cadence unattended)"
+                .to_string();
+        }
+        // A fresh boot or resume has no toggle notice to have seen, so the clause has
+        // to carry the three facts the inverted start default turns on: that it IS
+        // inverted, what constrains it, and that the veto is absolute.
+        //
+        // The veto is named from the group's resolved profile, not as a literal
+        // (rev round 1 B1): this clause is the contract a fresh boot reads, so a
+        // hardcoded `agent-hold` would tell a renamed repo's orchestrator that the
+        // absolute veto is a label nothing in that repo applies.
+        format!(
+            "ON — FULL AUTONOMY (self-select eligible work on idle ticks until none remains; \
+             {goal_clause}; {hold} is the absolute human veto — see INVARIANT 8)",
+            goal_clause =
+                full_autonomy_goal_clause(&self.full_autonomy_goal(group).unwrap_or_default()),
+            hold = self.hold_label_of(group),
+        )
+    }
+
     fn kickoff_body(
         &self,
         a: &AgentEntry,
@@ -38549,7 +39069,7 @@ impl OrchRegistry {
                 automerge = if self.is_auto_merge(&g.id) { "ENABLED (you may merge adequately-tested PRs yourself)" } else { "disabled (human merge gate is absolute — never merge)" },
                 autorelease = if self.is_auto_release(&g.id) { "ENABLED (you may publish releases/tags yourself while autonomous)" } else { "disabled (releases/tags need an explicit human grant — never publish)" },
                 dangerous = if self.is_dangerous_mode(&g.id) { "ON — the human is present and supervising, and has authorized you to merge to the default branch AND publish releases/tags yourself without a per-item grant (audit + announce each; still hold anything genuinely risky)" } else { "off" },
-                autonomous = if self.is_autonomous(&g.id) { "ON (you will get [loomux] idle tick wakes to run your cadence unattended)" } else { "off" },
+                autonomous = self.autonomous_kickoff_clause(&g.id),
             ),
             Role::Worker | Role::Reviewer | Role::Planner => {
                 let head = format!(
@@ -44723,6 +45243,12 @@ pub async fn orch_group_usage(app: AppHandle, group_id: String) -> Value {
 //   orch_set_auto_merge(group_id, enabled: bool) -> Result<(), String>
 //     Flip the merge gate. Default OFF = human approval required (today's
 //     behavior). ON lets the orchestrator merge adequately-tested PRs itself.
+//   orch_set_full_autonomy(group_id, enabled: bool, goal: String) -> Result<(), String>
+//     Flip full autonomy (#778): the orchestrator self-selects eligible work on its
+//     idle tick instead of waiting for the opt-in label funnel. Dependent on
+//     autonomous (rejects enable while off). `goal` is opaque, normalized to one
+//     bounded line; empty/whitespace = no goal. Re-enabling with a DIFFERENT goal
+//     re-aims the mode rather than no-opping — the goal is the consent's parameter.
 //   orch_set_autonomy_budget(group_id, tokens: u64) -> Result<u64, String>
 //     Per-group autonomous-era token budget; 0 = no cap. Returns the applied value.
 //   orch_set_idle_tick_minutes(group_id, minutes: u32) -> Result<u32, String>
@@ -44734,11 +45260,18 @@ pub async fn orch_group_usage(app: AppHandle, group_id: String) -> Value {
 //     The runtime remedy if a chatty CLI's idle repaints starve the tick.
 //   orch_autonomy(group_id) -> Value
 //     The whole panel state in one read:
-//       { autonomous: bool, auto_merge: bool, budget_tokens: u64,
+//       { autonomous: bool, auto_merge: bool, auto_release: bool,
+//         dangerous_mode: bool, full_autonomy: bool,
+//         full_autonomy_goal: string | null, hold_label: string,
+//         budget_tokens: u64,
 //         budget_anchor_tokens: u64, spend_since_enable_tokens: u64 | null,
 //         suspended: bool, idle_tick_minutes: u32, idle_activity_floor_bytes: u64,
 //         quiet_secs: u64 | null, eligible_in_secs: u64 | null,
 //         tick_status: "off"|"starting"|"paused"|"counting_down"|"eligible"|"waiting_for_activity"|"rate_capped" }
+//     `hold_label` (#778) is the group's RESOLVED veto spelling — the panel's
+//     full-autonomy help and mode chip name it, and both are instructions, so a
+//     stale one tells the human to apply a label that holds nothing. Reported
+//     whatever the mode's state, unlike `full_autonomy_goal`.
 //     `spend_since_enable_tokens` is null when autonomous is off (no live meter).
 //     `suspended` is true iff autonomous is off *because the budget enforcer
 //     flipped it* (durable `autonomy_suspended` marker), vs a plain user toggle-off
@@ -44852,6 +45385,31 @@ pub async fn orch_set_auto_release(
     let reg = reg_of(&app);
     let group_id = command_group(&group_id)?;
     run_blocking(move || reg.set_auto_release(&group_id, enabled)).await
+}
+
+/// Enable/disable full autonomy for a group (#778, durable, audited). A dependent
+/// toggle of autonomous mode like the two above: enabling is rejected unless
+/// autonomous is on, and autonomous-off or a budget suspension force-clears it.
+/// `goal` is opaque to loomux — it is captured, normalized and echoed, never
+/// parsed or scored (what work is valuable is the orchestrator's judgment, stated
+/// in its contract, not policy in product code). Empty/whitespace = no goal.
+///
+/// **Async + `run_blocking`, unlike its `orch_set_auto_merge` siblings.** Those are
+/// `SYNC_COMMANDS` rows in `tests/perf_dispatch.rs` — #743's census of *existing*
+/// debt, which #762 owns draining; the roadmap is deleting rows, so a command
+/// written today does the marker write, the audit append and the pane delivery off
+/// the webview thread (INV-1's §2 P1 shape) rather than adding a row to a list
+/// being emptied.
+#[tauri::command]
+pub async fn orch_set_full_autonomy(
+    app: AppHandle,
+    group_id: String,
+    enabled: bool,
+    goal: String,
+) -> Result<(), String> {
+    let reg = reg_of(&app);
+    let group_id = command_group(&group_id)?;
+    run_blocking(move || reg.set_full_autonomy(&group_id, enabled, &goal)).await
 }
 
 /// Enable/disable supervised dangerous mode for a group (#83, durable, audited).

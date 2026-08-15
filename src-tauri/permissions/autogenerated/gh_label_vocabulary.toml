@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-gh-label-vocabulary"
+description = "Enables the gh_label_vocabulary command without any pre-configured scope."
+commands.allow = ["gh_label_vocabulary"]
+
+[[permission]]
+identifier = "deny-gh-label-vocabulary"
+description = "Denies the gh_label_vocabulary command without any pre-configured scope."
+commands.deny = ["gh_label_vocabulary"]

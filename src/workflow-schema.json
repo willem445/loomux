@@ -268,13 +268,13 @@
           "name": "labels",
           "type": "section",
           "section": "intake.labels",
-          "help": "This repo's label spellings. Declare one and the other three keep their built-in defaults."
+          "help": "This repo's label spellings. Declare one and the other four keep their built-in defaults."
         }
       ]
     },
     "intake.labels": {
       "title": "Intake labels",
-      "help": "The label vocabulary intake matches on. Letters, digits, '-' and '_' — a label that would need rewriting is refused, never silently changed.",
+      "help": "The label vocabulary intake matches on. Letters, digits, '-' and '_', and it may not begin with '-' (a leading dash would be read as a flag where the label becomes a command argument) — a label that would need rewriting is refused, never silently changed.",
       "fields": [
         {
           "name": "ready",
@@ -299,6 +299,12 @@
           "type": "string",
           "default": "agent-prototype",
           "help": "\"Build it for a demo.\" — feedback-gated work."
+        },
+        {
+          "name": "hold",
+          "type": "string",
+          "default": "agent-hold",
+          "help": "\"Held by the human — do not start this.\" The one veto in the vocabulary: under full autonomy every open issue is eligible except the ones carrying this label. Unlike the four fields above, renaming this one takes effect everywhere — the intake poller, the issues-view hold button, and the orchestrator's own contract all use the spelling you declare here."
         }
       ]
     },

@@ -12,6 +12,7 @@
 import { gitRepoRoot } from "./git";
 import {
   ghAuthStatus,
+  ghLabelVocabulary,
   ghIssueList,
   ghIssueCreate,
   ghIssueSetLabels,
@@ -26,8 +27,9 @@ import {
   type GhAuth,
 } from "./issues";
 import {
-  TOGGLEABLE_LABELS,
+  toggleableLabels,
   AGENT_MANAGED,
+  DEFAULT_HOLD,
   isLabeledForAgents,
   filterAndSortIssues,
   labelDelta,
@@ -68,11 +70,20 @@ function el<K extends keyof HTMLElementTagNameMap>(
 }
 
 /** Short human label for a label chip. */
+// The veto is deliberately ABSENT: its spelling is repo-configurable, so it can
+// never be a key here. Both places that shorten it check the resolved
+// `this.holdLabel` first and render "hold" themselves (#778).
 const LABEL_SHORT: Record<string, string> = {
   "agent-ready": "ready",
   "agent-investigation": "investigate",
   "agent-managed": "managed",
 };
+
+/** Why the hold toggle exists, spelled out where the human clicks it (#778) —
+ *  under full autonomy this button is the whole consent boundary. */
+const HOLD_HELP =
+  "Hold: full-autonomy agents must not start this issue. Absolute — an agent may " +
+  "never remove it. Other labels are left as they are.";
 
 /** Relative "updated N ago" from an ISO timestamp; falls back to the raw
  *  string if it doesn't parse. */
@@ -117,6 +128,11 @@ export class IssuesView {
   readonly el: HTMLElement;
 
   private repoRoot: string | null = null;
+  /** This repo's veto spelling (#778), resolved by the backend from its workflow
+   *  config. Starts at the built-in and is replaced when the repo resolves —
+   *  never guessed from a label the list happened to contain. Re-resolved on
+   *  every repo change, because it is a property of the repo, not of the pane. */
+  private holdLabel: string = DEFAULT_HOLD;
   private issues: GhIssue[] = [];
   private prs: GhPr[] = [];
   /** Which list is showing — issues or pull requests. */
@@ -329,6 +345,18 @@ export class IssuesView {
         this.repoRoot = root;
         this.issues = [];
         this.prs = [];
+        // ...and re-resolve the veto spelling, which is this repo's config, not
+        // the last one's. Resolved BEFORE the gh auth gate below, deliberately:
+        // it reads a file rather than calling `gh`, so a repo with no gh auth
+        // still renders the right button — and a failure here falls back to the
+        // built-in rather than blanking the view, which is what the backend's
+        // allow-list would accept for a repo whose file it also could not read.
+        try {
+          this.holdLabel = (await ghLabelVocabulary(root)).hold || DEFAULT_HOLD;
+        } catch {
+          this.holdLabel = DEFAULT_HOLD;
+        }
+        if (this.disposed) return;
       }
 
       // gh presence/auth gates everything — one cheap check up front so a
@@ -479,12 +507,14 @@ export class IssuesView {
 
     const meta = el("div", "issues-row-meta");
     for (const label of item.labels) {
+      const hold = label === this.holdLabel;
       const known = label in LABEL_SHORT;
-      const chip = el(
-        "span",
-        `issues-label${known ? " agent" : ""}`,
-        known ? LABEL_SHORT[label] : label
-      );
+      // The veto gets its own (red) chip class rather than the agent one: it is
+      // the veto, and it must not read like the go-signals it overrides (#778).
+      // Checked against the RESOLVED spelling, so a repo that renamed it sees its
+      // own label in red rather than as an unknown grey chip.
+      const kind = hold ? " hold" : known ? " agent" : "";
+      const chip = el("span", `issues-label${kind}`, hold ? "hold" : known ? LABEL_SHORT[label] : label);
       chip.title = label;
       meta.appendChild(chip);
     }
@@ -515,15 +545,23 @@ export class IssuesView {
     const { row, actions } = this.rowShell(issue, "issues");
     if (isLabeledForAgents(issue)) row.classList.add("agent-labeled");
 
-    // Toggle buttons for the go-signal labels.
-    for (const label of TOGGLEABLE_LABELS) {
+    // Toggle buttons for the go-signal labels, plus this repo's veto (#778),
+    // which is styled apart from them because it means the opposite.
+    for (const label of toggleableLabels(this.holdLabel)) {
       const on = issue.labels.includes(label);
+      const hold = label === this.holdLabel;
       const btn = el(
         "button",
-        `issues-toggle${on ? " on" : ""}`,
-        LABEL_SHORT[label] ?? label
+        `issues-toggle${hold ? " hold" : ""}${on ? " on" : ""}`,
+        // A renamed veto still reads "hold" on the button — the gesture is what
+        // the human is choosing, and the repo's own spelling is in the tooltip.
+        hold ? "hold" : (LABEL_SHORT[label] ?? label)
       ) as HTMLButtonElement;
-      btn.title = on ? `Remove ${label}` : `Add ${label}`;
+      btn.title = hold
+        ? `${on ? "Remove" : "Add"} ${label} — ${HOLD_HELP}`
+        : on
+          ? `Remove ${label}`
+          : `Add ${label}`;
       btn.disabled = this.busy.has(issue.number);
       btn.addEventListener("click", (e) => {
         e.stopPropagation();

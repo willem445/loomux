@@ -50,6 +50,24 @@ export interface AutonomyState {
    *  merges/releases WITHOUT autonomous. Mutually exclusive with `autonomous`
    *  (enabling autonomous clears it; enabling this while autonomous is rejected). */
   dangerous_mode: boolean;
+  /** #778: whether the orchestrator self-selects eligible work on its idle tick
+   *  instead of waiting for the opt-in label funnel. A dependent toggle of
+   *  autonomous, like `auto_release`. */
+  full_autonomy: boolean;
+  /** #778: the opaque goal qualifying full autonomy, or null when there is none —
+   *  and always null while the mode is off, because the backend accessor is gated
+   *  on the live in-memory flag rather than on the marker file (a force-clear drops
+   *  the flag unconditionally but removes the marker only best-effort, so a goal
+   *  can outlive the consent it qualified). The panel therefore never renders a
+   *  goal that isn't in force. */
+  full_autonomy_goal: string | null;
+  /** #778: this group's resolved veto spelling — `intake.labels.hold` from its
+   *  workflow config, or `agent-hold`. The panel must NAME this rather than a
+   *  literal: it is the label the group's own poller honors, and telling the
+   *  human to apply any other one is telling them to do nothing. Reported
+   *  whatever the mode's state, because the help text describes what the toggle
+   *  would do and has to be true before it is flipped. */
+  hold_label: string;
   budget_tokens: number;
   budget_anchor_tokens: number;
   spend_since_enable_tokens: number | null;
@@ -145,6 +163,193 @@ export function dangerousControl(autonomous: boolean, dangerous: boolean): Toggl
     return { checked: false, disabled: true, tooltip: DANGEROUS_NEEDS_AUTONOMOUS_OFF };
   }
   return { checked: dangerous, disabled: false, tooltip: "" };
+}
+
+// ---------- full autonomy (#778) ----------
+
+export const FULL_AUTONOMY_REQUIRES_AUTONOMOUS = "full autonomy requires Autonomous mode";
+
+/** Full-autonomy checkbox (checked = `full_autonomy` ON, i.e. the orchestrator
+ *  self-selects eligible work on its idle tick instead of waiting for the opt-in
+ *  label funnel). The same dependency as auto-release, and for the same reason:
+ *  the backend rejects enabling it while autonomous is off and force-clears it
+ *  when autonomous goes off (or the budget suspends it), so with autonomous OFF
+ *  the box is unchecked + disabled with a tooltip rather than offering an enable
+ *  that would be refused. A stale flag is ignored while off — the backend
+ *  reconciles it away too. */
+export function fullAutonomyControl(autonomous: boolean, fullAutonomy: boolean): ToggleControl {
+  if (!autonomous) {
+    return { checked: false, disabled: true, tooltip: FULL_AUTONOMY_REQUIRES_AUTONOMOUS };
+  }
+  return { checked: fullAutonomy, disabled: false, tooltip: "" };
+}
+
+/** Cap, in code points, on a full-autonomy goal — mirrors the backend's
+ *  `MAX_FULL_AUTONOMY_GOAL_CHARS`. */
+export const MAX_GOAL_CHARS = 500;
+
+// Unicode property escapes, chosen so the two sides genuinely agree rather than
+// approximately: `\p{White_Space}` is exactly Rust's `char::is_whitespace` and
+// `\p{Cc}` is exactly its `char::is_control` (a plain `\s` would additionally
+// swallow U+FEFF, which Rust keeps).
+const GOAL_WHITESPACE = /\p{White_Space}/u;
+const GOAL_CONTROL = /\p{Cc}/u;
+
+/** Normalize a goal into the single-line, bounded, paste-safe form the backend
+ *  will store — a deliberate mirror of `sanitize_full_autonomy_goal` (mod.rs),
+ *  in the same spirit as `budgetMeter` mirroring `autonomy_budget_exhausted`.
+ *
+ *  The backend is authoritative and re-normalizes everything it is handed; this
+ *  copy exists because the UI needs the same answer *before* the round trip, for
+ *  two reasons that are both about honesty: the goal the panel shows (and puts in
+ *  the chip tooltip) must be the goal that is actually in force, and committing an
+ *  edit that normalizes to the value already stored must be recognizable as a
+ *  no-op — every enable delivers a `[loomux] …` notice into the orchestrator's
+ *  pane, so a blur that changed nothing must not fire one.
+ *
+ *  Same three rules, same order as the backend: whitespace runs (checked FIRST,
+ *  so `\n`/`\t` become a space rather than being dropped as control characters)
+ *  collapse to one space and the leading one is dropped; other control characters
+ *  are dropped outright; `[`/`]` become `(`/`)` so a goal echoed inside a
+ *  `[loomux] …` notice can never forge a second notice row. The cap counts CODE
+ *  POINTS (`for…of` iterates them, like Rust's `chars()`) so a multibyte goal
+ *  never truncates mid-character, and the result never ends on the space the cap
+ *  happened to land on. Idempotent — the marker is a file a human can edit, so it
+ *  is re-normalized on read and must not keep eating the goal. */
+export function normalizeGoal(raw: string): string {
+  let out = "";
+  let chars = 0;
+  for (const ch of raw) {
+    if (chars === MAX_GOAL_CHARS) break;
+    let c: string;
+    if (GOAL_WHITESPACE.test(ch)) {
+      c = " ";
+    } else if (GOAL_CONTROL.test(ch)) {
+      continue;
+    } else if (ch === "[") {
+      c = "(";
+    } else if (ch === "]") {
+      c = ")";
+    } else {
+      c = ch;
+    }
+    // Collapse runs, and drop the leading one entirely (that is the trim).
+    if (c === " " && (out === "" || out.endsWith(" "))) continue;
+    out += c;
+    chars += 1;
+  }
+  while (out.endsWith(" ")) out = out.slice(0, -1);
+  return out;
+}
+
+/** The goal fragment the backend puts in its notice and kickoff clause, rendered
+ *  the same way here so the panel and the orchestrator's pane say the same thing:
+ *  `goal: "…"` when there is one, and the honest `no goal set` when there isn't —
+ *  never an empty pair of quotes, which reads as a goal that got lost rather than
+ *  one that was never given. */
+export function goalClause(goal: string | null): string {
+  const g = normalizeGoal(goal ?? "");
+  return g === "" ? "no goal set" : `goal: "${g}"`;
+}
+
+/** What committing the goal field (blur/Enter) should do, given the live mode. */
+export interface GoalCommit {
+  /** Whether to call `setFullAutonomy` — i.e. whether this is a real change. */
+  send: boolean;
+  /** The normalized goal: what to send, and what the field should now read. */
+  goal: string;
+}
+
+/** Decide what a goal commit means.
+ *
+ *  - **Mode OFF → park it.** A goal only means anything as the parameter of a live
+ *    consent — the backend reports none while the mode is off, and there is no
+ *    "set the goal" command to call anyway; the enable itself carries it
+ *    (set-then-enable, exactly like the budget field).
+ *  - **Mode ON, unchanged after normalization → nothing.** Re-enabling would
+ *    deliver another full-autonomy notice into the orchestrator's pane for no
+ *    reason.
+ *  - **Mode ON, changed → send.** Re-enabling with a different goal re-aims the
+ *    mode rather than no-opping (the backend's documented behaviour) — including
+ *    clearing the goal, which is a real change to "no goal", not a no-op. */
+export function goalCommit(
+  fullAutonomy: boolean,
+  liveGoal: string | null,
+  raw: string
+): GoalCommit {
+  const goal = normalizeGoal(raw);
+  if (!fullAutonomy) return { send: false, goal };
+  return { send: goal !== normalizeGoal(liveGoal ?? ""), goal };
+}
+
+/** What a status poll should write into the goal field: the string to set, or
+ *  `null` for "leave it alone".
+ *
+ *  While the mode is ON the backend is authoritative (including "on with no
+ *  goal", which is `""`). While it is OFF the backend reports no goal at all, so
+ *  syncing from state would erase a goal the human just typed and is about to
+ *  enable with — the field is their pending input then, not a view of state. */
+export function goalFieldSync(fullAutonomy: boolean, liveGoal: string | null): string | null {
+  return fullAutonomy ? (liveGoal ?? "") : null;
+}
+
+/** The chip the "Autonomous mode" section header shows while full autonomy is on. */
+export interface ModeChip {
+  shown: boolean;
+  text: string;
+  tooltip: string;
+}
+
+/** Chip text — loud on purpose: this is the state in which the orchestrator picks
+ *  its own work, and the header is where the panel's mode reads at a glance. */
+export const FULL_AUTONOMY_CHIP_TEXT = "⚡ FULL AUTONOMY";
+
+/** The section-header chip announcing full autonomy, with the goal (normalized,
+ *  because a goal is untrusted text that has already travelled through a marker
+ *  file) as its tooltip. Hidden entirely while the mode is off — an always-present
+ *  chip that merely changes colour is not a state you notice. The tooltip names
+ *  the veto gesture too: the moment a human reads "it picks its own work" is the
+ *  moment they want to know how to stop it picking one.
+ *
+ *  `hold` is the group's RESOLVED spelling, never a literal: this tooltip is an
+ *  instruction ("add X to an issue"), and an instruction naming a label the
+ *  group's poller does not honor tells the human to do nothing. */
+export function fullAutonomyChip(
+  fullAutonomy: boolean,
+  goal: string | null,
+  hold: string
+): ModeChip {
+  if (!fullAutonomy) return { shown: false, text: "", tooltip: "" };
+  return {
+    shown: true,
+    text: FULL_AUTONOMY_CHIP_TEXT,
+    tooltip:
+      "Full autonomy is ON — the orchestrator self-selects eligible open issues on its " +
+      `idle tick (${goalClause(goal)}). Add ${holdName(hold)} to an issue to hold it back.`,
+  };
+}
+
+/** The veto label as a *sentence* names it, falling back to the built-in when the
+ *  panel has no resolved spelling yet (first paint, or a status read that failed).
+ *  Naming nothing would leave "Add  to an issue"; naming the wrong thing is worse,
+ *  so the fallback is the value the backend also falls back to. */
+function holdName(hold: string): string {
+  const h = hold.trim();
+  return h === "" ? "agent-hold" : h;
+}
+
+/** The full-autonomy checkbox's own help text — what the toggle WOULD do, shown
+ *  before it is flipped. Names this group's veto spelling for the same reason the
+ *  chip does: it tells the human how to hold an issue back, so it has to name the
+ *  label that actually holds one. */
+export function fullAutonomyHelp(hold: string): string {
+  return (
+    "Off (default): agents start only agent-ready / agent-investigation work. On: on each " +
+    "idle tick the orchestrator self-selects the highest-value eligible open issue and " +
+    `starts it — everything except issues you label ${holdName(hold)}, and (for the ` +
+    "pre-existing backlog) only after it posts a triage plan and you say go. Nothing about " +
+    "merging, releasing, review or budgets changes."
+  );
 }
 
 // ---------- budget meter math ----------

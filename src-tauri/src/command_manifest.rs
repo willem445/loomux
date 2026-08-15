@@ -55,8 +55,9 @@ pub const APP_COMMANDS: &[&str] = &[
     "git_merge",
     "git_rebase",
     "git_branches",
-    // gh (10)
+    // gh (11)
     "gh_auth_status",
+    "gh_label_vocabulary",
     "gh_issue_list",
     "gh_issue_create",
     "gh_issue_set_labels",
@@ -69,7 +70,7 @@ pub const APP_COMMANDS: &[&str] = &[
     // gitwatch (2)
     "git_watch",
     "git_unwatch",
-    // orchestration (66)
+    // orchestration (69)
     "agent_autopilot_flags",
     "agent_cli_knobs",
     "create_orchestration",
@@ -110,6 +111,7 @@ pub const APP_COMMANDS: &[&str] = &[
     "orch_set_autonomous",
     "orch_set_auto_merge",
     "orch_set_auto_release",
+    "orch_set_full_autonomy",
     "orch_set_dangerous_mode",
     "orch_set_autonomy_budget",
     "orch_set_idle_tick_minutes",

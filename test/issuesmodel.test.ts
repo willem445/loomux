@@ -6,6 +6,8 @@ import {
   AGENT_READY,
   AGENT_INVESTIGATE,
   AGENT_MANAGED,
+  DEFAULT_HOLD,
+  toggleableLabels,
   isLabeledForAgents,
   matchesQuery,
   filterAndSortIssues,
@@ -35,6 +37,75 @@ test("label constants match the backend allow-list exactly", () => {
   assert.equal(AGENT_READY, "agent-ready");
   assert.equal(AGENT_INVESTIGATE, "agent-investigation");
   assert.equal(AGENT_MANAGED, "agent-managed");
+});
+
+test("the veto label is toggleable from the issues view (#778)", () => {
+  // The hold label IS the veto gesture: under full autonomy every open issue is
+  // eligible EXCEPT a held one, so the human needs a one-click way to apply it.
+  assert.equal(DEFAULT_HOLD, "agent-hold");
+  assert.ok(
+    toggleableLabels(DEFAULT_HOLD).includes(DEFAULT_HOLD),
+    "the veto must be toggleable — it is the veto surface"
+  );
+  // Display order: the two go-signals first, then the veto.
+  assert.deepEqual(toggleableLabels(DEFAULT_HOLD), [AGENT_READY, AGENT_INVESTIGATE, DEFAULT_HOLD]);
+});
+
+test("a repo that renamed the veto gets ITS spelling in the toggle row (#778)", () => {
+  // The whole point of `intake.labels.hold`: the button must write the label the
+  // repo's own poller honors. Hardcoding `agent-hold` here is what made the
+  // strike button a no-op on a repo that renamed it — the click reported success
+  // and the issue kept arriving as eligible.
+  assert.deepEqual(toggleableLabels("do-not-touch"), [
+    AGENT_READY,
+    AGENT_INVESTIGATE,
+    "do-not-touch",
+  ]);
+  // The built-in spelling is NOT offered alongside it: it means nothing to that
+  // repo's poller, so a button writing it would be a veto that does nothing.
+  assert.ok(!toggleableLabels("do-not-touch").includes(DEFAULT_HOLD));
+});
+
+test("a veto colliding with a go-signal renders one button, not two", () => {
+  // Nothing stops a repo declaring `hold: agent-ready` — the parser constrains
+  // the alphabet, not collisions. That config is a mistake either way, but two
+  // identical buttons fighting each other is a worse way to discover it.
+  assert.deepEqual(toggleableLabels(AGENT_READY), [AGENT_READY, AGENT_INVESTIGATE]);
+  // An empty/unset spelling likewise never renders a nameless button.
+  assert.deepEqual(toggleableLabels(""), [AGENT_READY, AGENT_INVESTIGATE]);
+  assert.deepEqual(toggleableLabels("   "), [AGENT_READY, AGENT_INVESTIGATE]);
+});
+
+test("the veto is NOT a go-signal — holding an issue never reads as queueing it", () => {
+  // The row highlight means "an orchestrator will pull this on". A hold is the
+  // opposite instruction, so it must never light that up on its own.
+  assert.equal(isLabeledForAgents(issue({ labels: [DEFAULT_HOLD] })), false);
+  // Including under a repo's own spelling: the highlight is driven by the go
+  // set, which no rename can add to.
+  assert.equal(isLabeledForAgents(issue({ labels: ["do-not-touch"] })), false);
+});
+
+test("holding an issue that is already agent-ready touches only the hold label", () => {
+  // The two labels coexist deliberately: labelDelta only ever moves the label it
+  // was asked about, so vetoing an issue can never silently strip the go-signal a
+  // human (or an orchestrator) put there — the funnel resolution is contract-side.
+  const held = labelDelta([AGENT_READY, AGENT_MANAGED], DEFAULT_HOLD, true);
+  assert.deepEqual(held, { add: [DEFAULT_HOLD], remove: [] });
+  // Lifting the veto likewise leaves everything else alone.
+  const lifted = labelDelta([AGENT_READY, DEFAULT_HOLD], DEFAULT_HOLD, false);
+  assert.deepEqual(lifted, { add: [], remove: [DEFAULT_HOLD] });
+  // And re-applying a hold that is already there is a no-op (no backend call).
+  assert.deepEqual(labelDelta([DEFAULT_HOLD], DEFAULT_HOLD, true), { add: [], remove: [] });
+  // The same three properties under a renamed veto — `labelDelta` is spelling-
+  // agnostic by construction, and this is what says so.
+  assert.deepEqual(labelDelta([AGENT_READY], "do-not-touch", true), {
+    add: ["do-not-touch"],
+    remove: [],
+  });
+  assert.deepEqual(labelDelta([AGENT_READY, "do-not-touch"], "do-not-touch", false), {
+    add: [],
+    remove: ["do-not-touch"],
+  });
 });
 
 test("isLabeledForAgents is true only for go-signal labels", () => {
