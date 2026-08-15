@@ -169,6 +169,19 @@ test("every build-output path agrees on the workspace-root target/", () => {
     /"\.\.\/target\/debug\/loomux\.exe"/,
     `DEFAULT_EXE must resolve to the workspace-root target/ — it is what runs when LOOMUX_E2E_EXE is unset: ${defaultExe[0]}`
   );
+
+  // vite.config.ts is the fourth consumer of the workspace-root target/, and the one that
+  // broke: the dev-server watch-ignore must exclude it, or a fresh `tauri dev` races cargo
+  // writing a build script and dies with EBUSY (#989). The stale `**/src-tauri/**`-only
+  // ignore did not match the root target/ — exactly the silent drift this test exists to catch.
+  const vite = repoFile("vite.config.ts");
+  const viteIgnored = vite.match(/ignored:\s*\[([\s\S]*?)\]/);
+  assert.ok(viteIgnored, "vite.config.ts must set server.watch.ignored");
+  assert.match(
+    viteIgnored[1],
+    /["'`]\*\*\/target\/\*\*["'`]/,
+    `vite.config.ts's server.watch.ignored must exclude the workspace-root target/ (#989): ${viteIgnored[1].trim()}`
+  );
 });
 
 test("CI compiles the whole workspace and caches the right directory", () => {
