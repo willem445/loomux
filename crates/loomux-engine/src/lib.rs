@@ -216,6 +216,51 @@
 //! and it belongs here for the reason the manifest states: this crate is linked
 //! into the shipped Windows binary, so the getrandom ban applies on this side
 //! of the boundary exactly as it does in `src-tauri`.
+//!
+//! A3 batch 7 — [`obs`], the crash-observability core (#53): the panic hook and
+//! its crash logs, the breadcrumb log, `data_root`/`logs_dir` and the
+//! `LOOMUX_DATA_DIR` validation, the `running.lock` sentinel, and
+//! [`obs::LockExt`] — the poison-tolerant `Mutex::lock` that most of `src-tauri`
+//! locks through. A daemon needs the same crash trail a windowed app does, so
+//! none of it is desktop-specific; it is here because the batches that follow
+//! cannot move without `lock_safe` and `breadcrumb`, which every one of them
+//! reaches for.
+//!
+//! **The first batch that split a FILE instead of moving one**, and the split
+//! point was already written down: `obs.rs` fenced its two Tauri items off
+//! behind its own `next-launch notice (Tauri surface)` section marker long
+//! before this refactor existed. `StartupNotice` and the `take_startup_notice`
+//! command stay in `src-tauri/src/obs.rs`, which re-exports this module
+//! item-by-item so every `obs::…` call site over there resolves unchanged —
+//! the move cost no call-site edits at all, and the single one that did change
+//! belongs to the `env!` fix below, not to the move. Read the general form as
+//! **a module's author may have already
+//! drawn the boundary** — worth looking for a section marker before reaching
+//! for a trait, because the alternative here was a bad one: `LockExt` is an
+//! inline extension trait on `std::sync::Mutex` (`m.lock_safe()`), unreachable
+//! through a trait object as called, so abstracting it would have meant a
+//! second implementation of the one policy that must not have two.
+//!
+//! Its finding is a kind of edge the previous six batches never met, because
+//! grep cannot see it. Every batch so far enumerated a module's outbound edges
+//! by searching for `super::`/`crate::`; `obs.rs` has none — and it still had
+//! one, in `record_crash`'s `env!("CARGO_PKG_VERSION")`. **`env!` is an edge to
+//! the crate a file is compiled in**, and moving the file silently re-points it:
+//! this crate's version is deliberately `0.0.0` (see the manifest), so a
+//! verbatim move would have made every crash log read `version: 0.0.0` while
+//! `doc/design/crash-observability.md` goes on promising the loomux release
+//! version. Nothing fails to compile; nothing goes red. So
+//! [`obs::install_panic_hook`] takes the app version as an argument and the host
+//! passes `env!("CARGO_PKG_VERSION")` from `src-tauri/src/lib.rs`, where the
+//! macro means what it says. **Sweep a moving file for `env!`, `file!`,
+//! `include_str!` and `module_path!` alongside its `use` lines** — each is a
+//! compile-time reference to the crate the file happens to be in, and each one
+//! moves house without telling anybody.
+//!
+//! It brings `dirs` (`data_root` resolves the platform data dir) and the
+//! crate's first `[dev-dependencies]`, `tempfile` with default features off —
+//! the inline tests write into a temp tree. Both are argued in the manifest;
+//! neither adds a package to the shipped binary's graph.
 
 pub mod groupid;
 pub mod lessons;
@@ -224,6 +269,7 @@ pub mod mergeq;
 pub mod mergeqview;
 pub mod model;
 pub mod notify;
+pub mod obs;
 pub mod profiles;
 pub mod report;
 pub mod termgrid;

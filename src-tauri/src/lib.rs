@@ -28,7 +28,12 @@ pub fn run() {
     // Crash observability (issue #53): install the panic hook before anything
     // else so even a crash during setup leaves a log, then detect whether the
     // previous run exited uncleanly and arm this run's sentinel.
-    obs::install_panic_hook();
+    // The version is passed IN rather than read inside `obs`: that module lives
+    // in `loomux-engine` now (#888 slice A3 batch 7), whose crate version is a
+    // permanent `0.0.0` placeholder, and `env!("CARGO_PKG_VERSION")` names the
+    // crate it is written in. Here it names the release, which is what a crash
+    // log has to say.
+    obs::install_panic_hook(env!("CARGO_PKG_VERSION"));
     let startup = obs::check_and_arm();
     obs::breadcrumb(
         "startup",
