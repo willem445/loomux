@@ -113,6 +113,21 @@ compiles.
    reach a `join` as a value.
    Membership ("may this caller touch this group?") is a **separate** check and
    is not implied by holding a valid id.
+   **The same rule now covers every identifier that becomes a path component**
+   (#925). `loomux_engine::pathseg::PathSegment` is the one validating
+   constructor those families share — the agent-session id and the agent id
+   today — and `GroupId` delegates its *checks* to it while keeping its own
+   type. Never add a fifth private "is this a safe id" predicate; express the
+   family through `PathSegment`. The join scan's permitted-assembly-point list
+   is one row **per family** (each required exactly once, so a renamed one
+   fails loudly rather than watching nothing), and a sibling scan in
+   `src-tauri/tests/pathseg.rs` covers the shape it structurally cannot see: an
+   id interpolated into a **file name** (`format!("{id}.json")`), default-deny
+   with an argued allowlist that itself fails when a row goes stale.
+   Still open, and **not** closed by any of this: the `ft_*`/`fm_*`/git `repo`
+   **roots** are arbitrary caller-supplied absolute paths checked only by
+   `is_dir()`. That is a root-admission problem, not a segment one — no
+   predicate separates a repo from `~/.ssh` — and it is tracked on #1042.
 7. **No agent ever merges a PR to the default branch.** Open the PR and stop;
    the human reviews and merges. This is the rule for *every* agent —
    workers, reviewers and planners have no merge authority at all, anywhere,

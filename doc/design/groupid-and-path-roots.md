@@ -254,15 +254,105 @@ build — or edited by hand, or corrupted — cannot hand the process an id the
 constructor would have refused. `Serialize` is transparent (a bare string), so no
 persisted file and no frontend payload changes shape.
 
+## The second family, and the mechanism they now share (#925)
+
+`GroupId` was the first validated segment, not the only one. #925 found **four**
+near-identical answers to "is this string a usable path component" — this one,
+`mergeq::valid_id_component`, `orchestration::sanitize_session`, and
+`digest::is_safe_session_id` — and the problem was not the duplication but the
+**drift**. They were four points on a slope, and the weakest of them was the one
+guarding a live `Path::join`.
+
+`is_safe_session_id` was `!empty && !contains(['/','\\']) && != "." && != ".."`.
+It sat in front of `copilot_session_state_root().join(session_id)`, and `"C:"`
+passed it: on Windows that parses as a `Prefix` component, and `Path::join`
+**replaces** its receiver when the argument carries a prefix, so the session
+directory became `C:` and the read resolved drive-relative to the process's own
+cwd — outside the session-state root, with no separator anywhere in the id. A
+device name, a leading `-`, an unbounded length, a NUL and every non-ASCII byte
+passed it too.
+
+So the rules moved to one checker, `pathseg::check_segment`, and the families are
+expressed through it:
+
+- **`PathSegment`** — the shared newtype, same contract as `GroupId` (one gate,
+  `Deserialize` through it, refused-never-rewritten, no `AsRef<Path>`).
+- **`GroupId` keeps its own type.** A group id and a session id must not be
+  substitutable at a call site merely because both are path-safe. What it stopped
+  owning is a private copy of the rules — and its error *text* stays
+  group-specific, because `command_group` surfaces it and "group id is empty"
+  diagnoses better than "identifier is empty". Shared mechanism, local
+  diagnostics.
+- **The agent-session id** is a `PathSegment`, parsed once in
+  `read_session_transcript_events` and threaded to both path arms.
+  `usage::claude_transcript_path` and the new `sessions::copilot_session_dir_at`
+  — this family's declared assembly point, `group_dir_at`'s counterpart — take
+  the type at their signatures, so an unvalidated string cannot reach either.
+  Deliberately **not** named `SessionId`: `remote-engine-protocol.md` already
+  uses that for a *connection* session, and §6.0 forbids a bare "session"
+  precisely because three different things claim the word.
+- **The agent id** is a `PathSegment` wherever it becomes part of a file name
+  (`{id}.json`, `ledger-{id}.log`, `{id}-hooks.json`,
+  `{id}-gemini-policy.toml`, `{id}.promptsubmit.jsonl`).
+
+Two validators keep their `trim()`, deliberately: `valid_id_component` and
+`sanitize_session` accept a configured id with stray whitespace today, and
+removing that would be a behavior change wearing a refactor's clothes. Only the
+checks are shared, not the trimming. Both do gain the reserved-device-name
+refusal, which is a strengthening no real id notices.
+
+### The tripwires, generalized
+
+`the_orchestration_root_is_joined_with_a_group_in_exactly_one_place` grew from
+one permitted assembly point to **one row per identifier family**, each required
+to appear exactly once — so a new family adds a row and inherits the count
+instead of growing a parallel test that could drift from this one. Zero
+occurrences now fails as loudly as two: a renamed assembly point would otherwise
+leave the scan watching nothing.
+
+That scan is default-deny on the orchestration-root *receiver* and the
+`.as_str()` *shape*, and the filename family crosses neither —
+`claude_transcript_path` builds `format!("{session}.jsonl")` on one line and
+joins it on another; `ledger_path`'s receiver is a group dir, not the root. So it
+has its own guard, `no_raw_identifier_is_interpolated_into_a_file_name` in
+`tests/pathseg.rs`: a `format!` that interpolates a known raw-id binding **and**
+carries a file-extension literal is a finding unless its exact text is on an
+allowlist with the argument for why it is safe (in every current case: the
+binding is a `PathSegment` at that signature). The extension literal is what
+keeps it precise — `format!("agent={agent_id} pty={pty_id}")` is a breadcrumb,
+and there are dozens of those. It also fails if an allowlist row matches
+nothing, so a renamed site cannot quietly shrink what the test covers.
+
+Same honesty requirement as its sibling, and the same answer: it is textual, so a
+`const` extension, a `PathBuf::push`, a template split across lines, or a binding
+renamed out of the list all sit outside it. What holds the property is the
+**signature** — a function taking `&PathSegment` cannot be handed a `&str` at all
+— and the scan is defence in depth over a *new* site being added raw, which is
+how the guarantee would realistically erode.
+
 ## What this does not do
 
 - It does not authenticate anyone. That is #888 §0 layer 1, and a `GroupId` says
   nothing about whether the caller is entitled to *that* group — only that the
   string is a usable path segment. Membership remains a separate check
   (`save_attachment`'s, and whatever layer 3 adds).
-- It does not re-scope the `ft_*`/`fm_*`/git `repo` families, which take
-  arbitrary absolute paths and are the other half of §0's "server-declared
-  roots". Those are a larger surface with their own trust story.
+- **It does not re-scope the `ft_*`/`fm_*`/git `repo` roots.** This is the half
+  of §0's "server-declared roots" that neither #904 nor #925's segment slice
+  touches, and it is worth being exact about why, because the issue text once
+  described it as the same `root.join(caller_id)` shape and it is not.
+
+  Those commands take `(root, rel)`. The **`rel` half was already contained** —
+  `fileedit::safe_resolve` refuses an absolute or prefixed `rel`, folds `..`
+  lexically, bounds the result against the root and refuses a symlinked component
+  below it. The **`root` half is the hole**: an arbitrary caller-supplied
+  absolute path, checked only for `is_dir()`. That is not a segment problem and
+  no segment validator can express it — for a root, absolute is *required*, so no
+  string predicate separates `C:/Projects/loomux` from `C:/Users/me/.ssh`. It
+  needs the registry `remote-engine-protocol.md` §1.1 H3 specifies: resolve
+  against registered repos, worktrees and group dirs, and refuse anything else.
+
+  Tracked as **#1042**, which is the actual C2 merge blocker. A green segment
+  slice does not lift it.
 - It does not make a group id a *capability*. Membership — "is this caller
   entitled to this group?" — is still a separate check, and only
   `save_attachment` performs one today.
@@ -277,6 +367,8 @@ helper that will not accept anything else.
 
 What remains for #888 is the part this was always a *prerequisite* for rather
 than a substitute for: authenticating the display client (§0 layer 1) and
-re-scoping the path-taking `ft_*`/`fm_*`/git families to server-declared roots.
-A validated `GroupId` says the string is a usable path segment. It says nothing
-about whether the peer holding it should be talking to that group at all.
+re-scoping the path-taking `ft_*`/`fm_*`/git families to server-declared roots
+(**#1042**). A validated `GroupId` says the string is a usable path segment. It
+says nothing about whether the peer holding it should be talking to that group at
+all — and #925's segment work says the same of a session or agent id. The
+identifier half of §7.1's T2 is closed; the root half is not.

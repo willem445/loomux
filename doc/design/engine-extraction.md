@@ -98,9 +98,12 @@ about whether this caller may touch that group. Today the desktop answers that
 question by being the only caller. A daemon cannot, and #888's design note owns
 that answer — it is not smuggled in here as a side effect of the crate boundary.
 
-The remaining caller-supplied path identifiers (`ft_*`/`fm_*` roots, `repo`,
-`session_id`) are **#925**, not this work. They are a stated merge blocker for
-the listener slices. The extraction neither fixes nor worsens them; it just must
+The remaining caller-supplied path identifiers are not this work. They split in
+two: `session_id` and the agent id are **#925** (landed — they are validated
+segments now, sharing `pathseg::PathSegment` with `GroupId`), while the
+`ft_*`/`fm_*` roots and git `repo` are **#1042**, a root-admission registry
+rather than a segment check, and that one is the stated merge blocker for the
+listener slices. The extraction neither fixes nor worsens either; it just must
 not quietly move an unvalidated identifier into a place that looks more trusted
 than it is.
 
