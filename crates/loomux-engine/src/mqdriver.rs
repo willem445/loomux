@@ -67,7 +67,7 @@
 //! driver belongs with the core it drives rather than with the window.
 //!
 //! **Three items are `pub(crate)`, and that is the whole of their reach**:
-//! [`as_args`], [`landable`] and [`declares_ci_green`]. They were `pub(super)`
+//! `as_args`, `landable` and `declares_ci_green`. They were `pub(super)`
 //! in `src-tauri/src/orchestration/mqdriver.rs` — visible within
 //! `orchestration` — and batch 12a had to widen them to `pub` for exactly one
 //! reason: their only caller, `mqloop`, was still on the other side of the
@@ -78,7 +78,7 @@
 //! `orchestration` module" is now "this crate".
 //!
 //! It is also load-bearing, which is why it was worth reverting rather than
-//! leaving as harmless surplus. [`landable`] is **half** of the constraint-7
+//! leaving as harmless surplus. `landable` is **half** of the constraint-7
 //! refusal — the refspec-shape predicate — and [`validate_target`] is the whole
 //! of it, ordering the unverifiable / default-branch / target / assertion
 //! refusals so an unreadable answer can never *fail to match* the default and
@@ -500,7 +500,7 @@ pub(crate) fn landable(name: &str) -> bool {
 /// Whether a name is usable as the **right-hand side of a comparison** — the
 /// default branch, the recorded target, a caller's assertion.
 ///
-/// Deliberately looser than [`landable`] in exactly one way: it accepts a
+/// Deliberately looser than `landable` in exactly one way: it accepts a
 /// `refs/heads/`-qualified spelling, which [`same_branch`] then normalizes.
 /// **The asymmetry is the point, and it is a security property, not a
 /// convenience.** `base` becomes a refspec component, so it must be a plain
@@ -511,12 +511,12 @@ pub(crate) fn landable(name: &str) -> bool {
 /// instead. Fail-closed either way, but the first is a refusal that says the
 /// wrong thing, and #581's whole §7 rests on this comparison landing.
 ///
-/// Defined as [`landable`] applied after an optional `refs/heads/` is stripped,
+/// Defined as `landable` applied after an optional `refs/heads/` is stripped,
 /// rather than as its own looser list — so the `refs/heads/` allowance is the
 /// *only* difference between the two, provably, instead of being the difference
 /// a reader has to diff two predicates to find.
 ///
-/// Everything else [`landable`] refuses is still refused here, and that
+/// Everything else `landable` refuses is still refused here, and that
 /// direction matters: a `default` carrying a `:` or a `*` is not a branch git
 /// would let exist, so it is a **corrupt answer**, and a corrupt answer must
 /// refuse rather than merely fail to match the base — failing to match is
@@ -537,7 +537,7 @@ fn usable_for_comparison(name: &str) -> bool {
 ///
 /// Nothing is *rewritten* here; this only decides whether two strings name the
 /// same branch. Note where the normalization can actually bite: `base` has
-/// already been through [`landable`], which rejects a `refs/`-qualified name
+/// already been through `landable`, which rejects a `refs/`-qualified name
 /// outright, so the live-vs-live half is normalized on the **default's** side —
 /// see [`usable_for_comparison`] for why that side is deliberately looser.
 ///
@@ -602,7 +602,7 @@ fn same_branch(a: &str, b: &str) -> bool {
 /// # Order of refusals, and why it is this order
 ///
 /// 1. **Unverifiable first.** If either name is missing, or is a string the
-///    queue will not build a refspec from ([`landable`]), nothing downstream can
+///    queue will not build a refspec from (`landable`), nothing downstream can
 ///    be decided — including whether it is the default branch. Refusing here
 ///    means an unreadable answer can never *fail to match* the default and thus
 ///    read as safe.

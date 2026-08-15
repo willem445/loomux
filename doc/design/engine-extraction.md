@@ -763,13 +763,19 @@ from a unit test of product code, agents are banned from running cargo locally
     is the thing worth keeping, and rewriting it to the present tense would
     delete the evidence for it.)
 
-    What has NOT gone away, and is expected: `mqloop` reaches `super::mqdriver::`
-    throughout its body, and `mqdriver` is still in `src-tauri`, so those
-    resolve to `src-tauri`'s `mqdriver` and not to the engine. That is a
-    same-tier reference between two files at the same stage of the extraction,
-    not an unresolved dependency on the Tauri half — the pair moves together
-    (A3's later batches), which is what a chain looks like when neither end has
-    gone yet.
+    What had NOT gone away **as of batch 9**, and was expected: `mqloop` reached
+    `super::mqdriver::` throughout its body, and `mqdriver` was still in
+    `src-tauri`, so those resolved to `src-tauri`'s `mqdriver` and not to the
+    engine. That was a same-tier reference between two files at the same stage
+    of the extraction, not an unresolved dependency on the Tauri half — the pair
+    was expected to move in A3's later batches, which is what a chain looks like
+    while neither end has gone yet. (Both ends have gone now: `mqdriver` in
+    batch 12a, `mqloop` in 12b, and every one of those call sites is a
+    `crate::mqdriver::` path inside the engine. The paragraph is kept in the
+    past tense rather than deleted because the *distinction* it draws — a
+    same-tier reference is not a Tauri-half dependency — is what a future batch
+    facing a half-moved pair needs, and that outlives the pair it was written
+    about.)
 
     Both wrong drafts are worth keeping visible, because they are the two ways
     this particular sentence fails. The first said "everything resolves into the
@@ -1120,19 +1126,22 @@ from a unit test of product code, agents are banned from running cargo locally
     could satisfy the first clause and had nothing for the second to do, which is
     why the rule has been quoted as if the first clause were all of it.
 
-    Here the clauses point different ways. Every consumer spells the module path
-    — `mqdriver::runner_for` and `mqdriver::audit_action::…` in `mod.rs`,
+    Here the clauses pointed different ways. Every consumer spelled the module
+    path — `mqdriver::runner_for` and `mqdriver::audit_action::…` in `mod.rs`,
     `super::mqdriver::landable` in `mqloop.rs`,
     `loomux_lib::orchestration::mqdriver::{…}` in both
     `src-tauri/tests/mergequeue.rs` and `tests/orchestration.rs` — so a flat item
-    list would preserve **no** call site and would rewrite two integration test
-    files to suit a re-export style, which is the forfeit batch 10 calls worse
-    than no ceremony at all. And yet, unlike `queue`, `queuestate` and `intake`,
-    this module **does** have `pub(super)` items: `as_args`, `landable` and
-    `declares_ci_green`, whose only caller is `mqloop` — still in `src-tauri`
-    until batch 12b, so no visibility narrower than `pub` reaches it.
+    list would have preserved **no** call site and would have rewritten two
+    integration test files to suit a re-export style, which is the forfeit batch
+    10 calls worse than no ceremony at all. And yet, unlike `queue`, `queuestate`
+    and `intake`, this module **did** have `pub(super)` items: `as_args`,
+    `landable` and `declares_ci_green`, whose only caller was `mqloop` — still in
+    `src-tauri` at the time, so no visibility narrower than `pub` reached it.
+    (Batch 12b moved it; everything from here to the end of this entry is a
+    record of a shape that no longer exists, and its expiry is stated at the
+    close.)
 
-    So `src-tauri/src/orchestration/mqdriver.rs` stays as a **curated re-export
+    So `src-tauri/src/orchestration/mqdriver.rs` stayed as a **curated re-export
     module**, batch 7's `obs.rs` shape: `pub use` for every item that was `pub`,
     and `pub(super) use` for the three that were `pub(super)` — which, in
     a module whose `super` is `orchestration`, is the reach those three had as
@@ -1232,16 +1241,20 @@ from a unit test of product code, agents are banned from running cargo locally
 
     ### Remaining same-tier edges
 
-    `mqloop` is the only one, and it is now an ordinary re-export edge rather than
-    a same-tier reference: `use super::mqdriver::{as_args, classify_checks, …}`
-    and the `super::mqdriver::landable` / `declares_ci_green` /
-    `pr_ci_green_detailed` / `ResolveFailure` / `audit_action::…` call sites all
-    resolve through `orchestration/mqdriver.rs` into the engine, with no source
-    edit in `mqloop.rs`. Its own outbound set for batch 12b is therefore
+    `mqloop` was the only one **as of this batch**, and 12a left it an ordinary
+    re-export edge rather than a same-tier reference: `use
+    super::mqdriver::{as_args, classify_checks, …}` and the
+    `super::mqdriver::landable` / `declares_ci_green` / `pr_ci_green_detailed` /
+    `ResolveFailure` / `audit_action::…` call sites all resolved through
+    `orchestration/mqdriver.rs` into the engine, with no source edit in
+    `mqloop.rs`. Its own outbound set for batch 12b was therefore predicted as
     `mqdriver` (across), `mergeq`/`mergeqview` (batch 6), `notify` (batch 3),
     `workflow` (batch 5) and `atomic_write` (batch 9) — all of them already on the
     engine side, so 12b should be import prefixes too. Re-derive it from the
-    source anyway; that is this batch's whole finding.
+    source anyway; that is this batch's whole finding. (12b did, and it held —
+    see that entry. Every `super::mqdriver::` spelling named above is a
+    `crate::mqdriver::` path inside the engine now, and the file this paragraph
+    says they resolve through no longer exists.)
 
   - **Batch 12b — `mqloop`, the driver loop (#581 slices D2/D3). The tail of
     A3's module moves.** §8's batch construction and its temporary-worktree
@@ -1315,8 +1328,19 @@ from a unit test of product code, agents are banned from running cargo locally
 
     Note also what did **not** happen: `mqloop` has no `pub(super)` or
     `pub(crate)` item of its own, so its own move force-widened **nothing** — its
-    `pub` set is identical before and after, and its 35 private members stay
+    `pub` set is identical before and after, and its private members — the ones
+    enumerated in `crates/loomux-engine/src/lib.rs`'s batch-12b entry — stay
     private. The only visibility keywords this batch moved, moved down.
+
+    Deliberately no count here, and the omission is the point. A hand-maintained
+    tally of a set that grows is a claim with a built-in expiry: it is correct on
+    the day it is written and silently wrong the first time somebody adds a
+    private helper, with nothing in the diff to prompt the update — the same
+    shape as the superseded edge-set prose this batch's sibling caught, and the
+    drift #973 is about. The enumeration is the artifact; adding a member means
+    adding a name to it, which a reader can check against the file. A number is a
+    second, weaker copy of the same fact that no reader can check and no test
+    pins, so this note does not keep one.
 
     ### The re-export shape, one batch later
 
