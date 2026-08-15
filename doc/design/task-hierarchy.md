@@ -105,11 +105,14 @@ on the next-surviving ancestor, not on either deleted row.
 Unlike an unknown `deps` id, which reads as *unmet* because deps gate readiness (§6), an unknown
 or cyclic `parent` is **display-only**, so the safe failure direction is to tolerate and show
 rather than hide or refuse to render. A hand-edited orphan, self-reference, or cycle in
-`tasks.json` blocks nothing backend-side, and the (provisional, #1027) board UI renders such a
-row flat at top level instead of vanishing it — the same tolerate-and-show philosophy the
-existing `⚠ missing` dependency chip already applies to a dangling `deps` id, though the UI's own
-broken-container chip is narrower than that philosophy and fires only for the orphan case, not
-the self-reference or cycle one (§9 spells out the distinction).
+`tasks.json` blocks nothing backend-side, and the invariant the (provisional, #1027) board UI
+holds for all three is that **every row appears exactly once — never dropped, never looped** —
+the same tolerate-and-show philosophy the existing `⚠ missing` dependency chip already applies to
+a dangling `deps` id. It is *not* the same rendering for all three: an orphan or a self-reference
+renders at the top level, while a cycle's members render once each, with only the first one
+reached at the top level and the rest nested underneath it (§9 spells out both the render
+difference and the narrower chip). The chip itself is narrower still — it fires only for the
+orphan case.
 
 No migration and no repair pass exist or are planned: this is a deliberate consequence of the
 additive-serde, tolerant-read design, not a gap.
@@ -218,12 +221,15 @@ the PR lands, since a demo can still change layout details.
   container's whole subtree with it; the write is a full flattened permutation of the board's id
   array through the existing `orch_reorder_tasks`, since that command already expects the whole
   array and has no notion of siblings itself.
-- **Read tolerance in the UI.** As described in §5, every row is designed to render flat at top
-  level rather than drop or loop, regardless of what a hand-edited `parent` says — whether it
-  names no task on the board, names the row itself, or sits in a cycle. The `⚠ in t-N`
-  broken-container chip is narrower than that: it fires only when the container names **no task
-  on the board**. A self-reference or a cycle still renders flat, but unchipped — both name only
-  live rows, so nothing about them is "missing" in the sense the chip reports.
+- **Read tolerance in the UI.** As described in §5, every row is designed to appear **exactly
+  once — never dropped, never looped** — regardless of what a hand-edited `parent` says. The
+  *rendering* differs by case, though: an orphan (names no task on the board) or a self-reference
+  (names the row itself) renders at the top level, at depth 0. A cycle does not: `buildTree` lists
+  a cyclic row as both a root and a child, so the first member `visibleRows` reaches renders at
+  the top level and every other member of that cycle renders nested underneath it — a 3-cycle is
+  three levels deep, not flat. The `⚠ in t-N` broken-container chip is narrower again: it fires
+  only for the orphan case, never for a self-reference or a cycle, both of which name only live
+  rows, so nothing about them is "missing" in the sense the chip reports.
 - **No nesting chrome on a board that nests nothing.** The collapse gutter and related chrome
   are gated the same way the existing dependency/readiness chrome is gated on `deps` usage, so a
   board that has never used hierarchy is designed to render exactly as it did before this
