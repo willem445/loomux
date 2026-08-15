@@ -574,6 +574,36 @@ so far:
   sweep saw only the newest open PRs, so a PR outside that window finishing CI produces no wake,
   and the orchestrator must check it rather than read the silence as "still running".
 
+- **#1021, a standing class authorization** — `orchestrator.md` only (no other role merges
+  anything). A product directive needed a gate opening that did not exist: the process-pro's
+  proposed-lesson PRs are meant to be **orchestrator-owned** — reviewed and then merged or closed
+  by the orchestrator itself, never parked in the human's merge queue — because a learning loop
+  whose output is one more PR for the human to read stops running the week the human gets busy.
+  That authorization cannot live only in the workflow-conditional fragment that describes the
+  process-pro: INVARIANT 1 states the gate openings as a closed list, so a fragment granting a
+  fourth one reads as contradicting an invariant, and an orchestrator obeying its own instructions
+  would correctly refuse the merge. So the base template gains the **generic** half and nothing
+  process-pro-specific: INVARIANT 1 names a **standing class authorization** alongside
+  auto-merge / one-time grant / dangerous mode, and **The merge gate** ("exactly three ways" now)
+  gains a third bullet defining it — the human pre-authorizes a *class* of PR once instead of
+  clicking Approve on each, which changes **who dispositions those PRs** and nothing else. The
+  bullet is explicit that it buys the PR no leniency (the reviewer's pass, green CI, INVARIANT 2's
+  open-question hold, INVARIANT 3's findings, INVARIANT 6's red main all stand) and that it is
+  **not** a licence against the interceptor: where the host gate is closed the merge still fails
+  and INVARIANT 1 still forbids routing around it. The closing "sanctioned exceptions"
+  parenthetical lists it with the others.
+
+  Deliberately generic, and that is the whole reason this re-bless is small: naming the
+  process-pro here would fail
+  `advisor_and_process_prose_stays_silent_unless_a_block_declares_the_hint` (rev-29 F1's rule,
+  extended to `role_hint` — prose naming a mechanism the reader does not have), since a default
+  group has no process block. The specific instance is stated where only a group that HAS one can
+  read it: `process_note` behind `{{WORKFLOW}}`, and the non-overridable
+  `mechanics_core(Worker, Some("process"))` addendum, which is what a `mode: replace` persona
+  gets. Teaching the merge interceptor this PR class — so "never deferred to the human" also holds
+  in a group that is neither autonomous nor in dangerous mode — is a separate mechanism question
+  and is not here.
+
 `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was` renders
 **these** with the six pre-#222 template variables and asserts that a group launched
 with the advanced orchestrator **off** gets exactly that text. They are the

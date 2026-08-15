@@ -93,8 +93,14 @@ blocks:
   # `role_hint` is not cosmetic: a hint can change which MCP tools its block is
   # offered, from a list loomux enumerates (doc/design/liaison.md). process
   # is worker-kind: it mines the merged session via `session_digest`, opens a
-  # normal PR proposing a lessons/skill update, and stops there — the same
-  # merge gate as any worker; it never merges anything, including its own PR.
+  # normal PR proposing a lessons/skill update, and stops there; it never
+  # merges anything, including its own PR.
+  #
+  # Its PRs are ORCHESTRATOR-OWNED (#1021): the learning loop is self-managed,
+  # so the orchestrator reviews and then merges or closes them itself rather
+  # than adding them to the human's merge queue. Same bar as any merge —
+  # rev-lead's pass, green CI, findings dispositioned — only the disposition
+  # owner differs.
 
   - id: process
     name: Process-pro
