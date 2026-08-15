@@ -90,7 +90,7 @@ jobs:
           echo "LOOMUX_LEAK_BASELINE=$count" >> "$GITHUB_ENV"
 
       - name: Test backend
-        run: cargo test --locked --workspace
+        run: cargo test --locked --workspace --no-fail-fast
 
       - name: Verify the backend test suite left no worktree fixtures behind (#464)
         if: always()

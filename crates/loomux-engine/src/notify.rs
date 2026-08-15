@@ -541,15 +541,9 @@ pub enum Lines {
 /// a pane sees it" in this codebase routes here rather than reimplementing
 /// either half.
 pub fn sanitize_pane_text(s: &str, max_len: usize, lines: Lines) -> String {
-    s.chars()
-        .filter(|c| !c.is_control() || (lines == Lines::Keep && matches!(c, '\n' | '\t')))
-        .map(|c| match c {
-            '[' => '(',
-            ']' => ')',
-            other => other,
-        })
-        .take(max_len)
-        .collect()
+    // MUTATION F: scrub bypassed — identity, i.e. the code before the fix.
+    let _ = lines;
+    s.chars().take(max_len).collect()
 }
 
 /// Belt-and-braces pass over a fully-composed notice: re-strip control
