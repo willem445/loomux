@@ -892,6 +892,66 @@ test("the design note's per-CLI table matches theme.ts", () => {
   }
 });
 
+test("the tab strip climbs: no tab shares the bar's ground, and the active one is highest", () => {
+  // THE DEFECT CLASS, not the styling. The human's note was that the project tabs were hard
+  // to tell apart, and the stylesheet said exactly why: `#tab-bar` and an inactive `.tab`
+  // were BOTH `--surface-1` — the same colour, so an unselected tab had no body at all and
+  // its hairline was standing in for one — while `.tab.active` was `--surface-term`, the
+  // DEEPEST surface in the app, so the one tab you are in was the darkest thing in the strip.
+  // Both are invisible in a diff (each rule names a perfectly ordinary elevation token) and
+  // neither is visible to any other test here, which is why this one is written against the
+  // RELATIONSHIP between the four rules rather than against the four values.
+  //
+  // Deliberately not a pin on which token each rule names: raising the whole strip a step is
+  // a legitimate future edit, and "an inactive tab is not the bar" plus "the tab you are in
+  // is the highest surface in the strip" survives it. Only a regression to the flat or
+  // inverted strip fails.
+  const css = stripCssComments(read("../src/styles.css"));
+  const groundOf = (selector: string): string => {
+    const rule = css.match(
+      new RegExp(`(^|[},])\\s*${selector.replace(/[.#]/g, "\\$&")}\\s*\\{([^}]*)\\}`, "m")
+    );
+    assert.ok(rule, `${selector} has no rule — the tab strip was restructured`);
+    const bg = rule[2].match(/(?:^|;)\s*background(?:-color)?\s*:\s*([^;]+)/);
+    assert.ok(bg, `${selector} paints no background`);
+    return bg[1].trim();
+  };
+  // `transparent` means "whatever is behind me", which for a tab is the bar — so a tab
+  // painted transparent IS the bar's colour and fails the first assertion below, as it
+  // should: a tab with no body of its own is the flat strip this test exists to refuse.
+  const resolve = (value: string, behind: string): string => {
+    if (value === "transparent") return behind;
+    const token = value.match(/^var\(\s*(--[a-z0-9-]+)\s*\)$/);
+    assert.ok(token, `the tab strip paints ${value}, which is not a token or transparent`);
+    const hex: string | undefined = (CSS_TOKENS as Record<string, string>)[token[1]];
+    assert.ok(hex, `${token[1]} is not a pinned colour token`);
+    return hex;
+  };
+
+  const bar = resolve(groundOf("#tab-bar"), "");
+  const idle = resolve(groundOf(".tab"), bar);
+  const hover = resolve(groundOf(".tab:hover"), bar);
+  const active = resolve(groundOf(".tab.active"), bar);
+
+  assert.notEqual(
+    idle,
+    bar,
+    "an inactive tab is painted the bar's own colour, so it has no body — only its hairline " +
+      "says a tab is there"
+  );
+  assert.ok(
+    luminance(active) > luminance(bar),
+    `the active tab (${active}) is no lighter than the strip it sits in (${bar}) — the tab ` +
+      "you are in must be the surface CLOSEST to the human, which is what the elevation " +
+      "ladder means by height (§Elevation)"
+  );
+  assert.ok(
+    luminance(active) >= luminance(hover) && luminance(hover) >= luminance(idle),
+    `the strip does not climb: idle ${idle}, hover ${hover}, active ${active}`
+  );
+  assert.equal(new Set([bar, hover, active]).size, 3, "two of the tab states are one colour");
+});
+
 const STATE_DYES = {
   working: SEMANTIC.stateWorking,
   attention: SEMANTIC.stateAttention,

@@ -308,32 +308,35 @@ html, body {
 .grid-root { flex: 1; min-width: 0; min-height: 0; display: flex; padding: 8px; position: relative; }
 
 /* ---------- project tabs (#63) ---------- */
-/* THE STRIP READS BOTTOM-UP: ground, then chip, then the tab you are in (#1020 wave 2).
+/* THE STRIP IS A TROUGH, AND IT CLIMBS OUT OF IT (#1020 wave 2).
  *
- * It used to read the other way round, which is why the human's note was that the tabs were
- * hard to tell apart. Three things were fighting:
+ * It used to do neither, which is why the human's note was that the tabs were hard to tell
+ * apart. Two rules were fighting the elevation model and one was cancelling itself:
  *
- *   1. the bar and an inactive tab were BOTH --surface-1, i.e. the same colour, so an
- *      unselected tab had no body at all — only its hairline said a tab was there;
- *   2. the active tab was --surface-term, the DEEPEST surface in the app — so the one tab
- *      you are actually in was the darkest thing in the strip, which inverts the elevation
- *      model's own rule that height means "closer to the human";
- *   3. and it did not buy the browser-tab continuity that would have justified the
- *      inversion, because #tab-bar's own bottom hairline runs straight across underneath
- *      and the workspace below is --surface-0 anyway, not --surface-term.
+ *   1. #tab-bar and an inactive .tab were BOTH --surface-1 — the same colour — so an
+ *      unselected tab had no body at all and its hairline was standing in for one;
+ *   2. .tab.active was --surface-term, the DEEPEST surface in the app, so the one tab you
+ *      are actually in was the darkest thing on screen — the exact inverse of "height means
+ *      closer to the human";
+ *   3. and that inversion did not even buy the browser-tab continuity that would justify it:
+ *      #tab-bar's own bottom hairline runs straight across underneath, and the workspace
+ *      below is --surface-0, not --surface-term.
  *
- * So: the BAR drops to the app ground, an inactive tab is an OUTLINE (transparent body, so
- * the ground shows through and the hairline is doing a job rather than standing in for one),
- * hover fills one step, and the ACTIVE tab is the raised surface with the strong border and
- * the coloured top edge. Four legible steps out of the ladder that already exists — no new
- * token, no contrast block, and the accent edge still carries the per-tab colour. */
+ * So the strip now spends the whole ladder, one step per state: the BAR is the deepest
+ * surface (a recessed trough for the tabs to sit in, and a clean step down from #topbar's
+ * --surface-2/--surface-1 gradient directly above it), an idle tab is the app ground, hover
+ * is the panel step, and the ACTIVE tab is the raised step — cards, inputs, popovers — with
+ * the strong border and the coloured top edge. Four distinct grounds, strictly climbing, no
+ * new token and no contrast block; test/theme.test.ts pins the RELATIONSHIP (a tab is never
+ * the bar's colour, and the tab you are in is the highest) rather than the four values, so
+ * re-tuning the strip stays legal and re-flattening it does not. */
 #tab-bar {
   flex: none; display: flex; align-items: stretch; gap: 4px;
   padding: 4px 8px 0 8px;
   /* Flat, because it always was: the two stops of the gradient this replaced were one
      step apart and read as a single value. The top bar's gradient is a real one and keeps
      its two stops. */
-  background: var(--surface-0);
+  background: var(--surface-term);
   border-bottom: 1px solid var(--line);
   overflow-x: auto;
 }
@@ -343,9 +346,7 @@ html, body {
   max-width: 220px;
   padding: 5px 8px 6px 8px;
   font-size: 12px; color: var(--ink-dim); cursor: pointer;
-  /* Transparent, not --surface-0: an inactive tab is an outline on the bar, and painting
-     the bar's own colour back over it is what made the hairline the only thing visible. */
-  background: transparent;
+  background: var(--surface-0);
   border: 1px solid var(--line);
   border-bottom: none;
   border-radius: 8px 8px 0 0;
@@ -355,9 +356,9 @@ html, body {
 .tab:hover { color: var(--ink); background: var(--surface-1); }
 .tab.active {
   color: var(--ink);
-  /* The raised step — cards, inputs, popovers — because the tab you are in is the surface
-     closest to the human in this strip. Its border climbs the ramp with it: an edge that
-     has to be seen against a lit body needs the strong step, not the hairline. */
+  /* The raised step, because the tab you are in is the surface closest to the human in this
+     strip. Its border climbs with it: an edge that has to be seen against a lit body needs
+     the strong step, not the hairline. */
   background: var(--surface-2);
   border-color: var(--line-strong);
   /* The colored top edge is the tab's accent (falls back to --accent). Declared after

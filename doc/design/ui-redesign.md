@@ -434,6 +434,20 @@ principle 1 says surfaces separate by elevation and a hairline, not by a slab;
 deliberately open up (1.146:1 and 1.245:1), because an edge that nobody can see is not doing
 the separating the surfaces are refusing to do.
 
+**The project-tab strip is where the ladder had to be spent rather than named** (wave 2). The
+strip was flat and, in one place, inverted: `#tab-bar` and an inactive `.tab` were both
+`--surface-1`, so an unselected tab had no body at all and its hairline was standing in for
+one; and `.tab.active` was `--surface-term`, which made the tab you are actually in the
+darkest thing on screen. That is the model read backwards, and it did not buy the browser-tab
+continuity that would justify it — the bar's own bottom hairline runs straight across
+underneath, and the workspace below is `--surface-0`, not `--surface-term`. The strip now
+spends one step per state: the bar is the deepest surface (a recessed trough, and a clean
+step down from `#topbar`'s gradient above it), idle is the app ground, hover is the panel
+step, and the active tab is the raised step with the strong border and its accent edge. What
+`test/theme.test.ts` pins is the *relationship* — a tab is never the bar's own colour, and
+the tab you are in is the highest surface in the strip — so re-tuning stays legal and
+re-flattening does not.
+
 Shadows are the second half of the model and they are rationed: `--shadow-card` for a raised
 object, `--shadow-float` for one that genuinely floats over the work. **Neither may sit under
 permanent chrome** — a shadow under a bar that is always there is decoration — and **no large
