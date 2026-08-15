@@ -35035,9 +35035,11 @@ impl OrchRegistry {
         // `idle_reap_candidates` skips a liaison-hinted block, so the fragment
         // says the guardrail skips it rather than S3's "the guardrail can still
         // take it, restart it when it does". The two rules it states are now the
-        // whole of the pane's mortality — the orchestrator must not kill it, and
-        // nothing else will — which is why the sentence names that consequence
-        // instead of leaving the reader to infer it.
+        // whole of what anything IN THE GROUP will do to that pane — the
+        // orchestrator must not kill it, and no automatic path will — which is
+        // why the sentence names that consequence rather than leaving the reader
+        // to infer it. (Scoped to the group deliberately: the human can still
+        // close the pane, and a CLI can still die.)
         //
         // One thing it deliberately does NOT claim: it never lets a relayed
         // directive become a grant. The human's Approve
@@ -35109,9 +35111,9 @@ impl OrchRegistry {
                  scheduling** is not about it: never `kill_agent` `{id}` for looking idle. \
                  loomux's own idle-kill guardrail agrees and skips it — a human typing into a \
                  pane clears no idle clock, so a reaped liaison would be one killed \
-                 mid-conversation — which leaves YOU the only thing that can end it. It does \
-                 hold one live-delegate slot while it runs; pace the fleet around that instead \
-                 of dropping it to make room.",
+                 mid-conversation. Inside this group, that leaves nothing but your own \
+                 `kill_agent` able to end it. It does hold one live-delegate slot while it \
+                 runs; pace the fleet around that instead of dropping it to make room.",
                 id = b.id,
             ),
             None => String::new(),
