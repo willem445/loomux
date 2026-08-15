@@ -168,7 +168,7 @@ That is a fact about the transport. Nobody issued it, nothing checks it, and it
 cannot be revoked. Reproduce the same command surface over a socket and it
 evaporates: every peer that can open a connection becomes "the webview".
 
-And the surface is worse than one identifier. Today's 142 commands
+And the surface is worse than one identifier. Today's 146 commands
 (`src-tauri/src/command_manifest.rs`, the ACL manifest's single source of truth)
 include, by design:
 
@@ -436,23 +436,27 @@ This is not a new mechanism, which is the point — it is the third instance of
 one `tests/acl_manifest.rs` already runs three times over. That file pins that
 `generate_handler!` and `APP_COMMANDS` agree
 (`generate_handler_matches_app_commands`), pins the **total**
-(`app_commands_len_is_141`, carrying its per-delta provenance), and pins that
-every command is granted to `main`. A remote roster is the same shape of guard
+(`app_commands_len_is_<N>`, where N is the count itself and the assertion message
+carries its per-delta provenance), and pins that every command is granted to
+`main`. A remote roster is the same shape of guard
 over the same list, and a reviewer already knows how to read it.
 
 That mechanism is not optional bookkeeping, and this repo's own artifacts are the
 evidence. The plan-408 census counted 134 commands; `APP_COMMANDS` today lists
-**142**. Eight arrived in the interval, and under a hand-maintained allowlist
+**146**. Twelve arrived in the interval, and under a hand-maintained allowlist
 that nobody re-derived, every one would have been silently wire-reachable or
 silently broken.
 
-Two nearby numbers show what happens to the ones a test does *not* pin. The
-manifest's own per-family comment reads `// orchestration (64)` above **66**
-entries; `architecture.md` described the file as "the ACL manifest's 123
-app-command names" until this slice corrected it. Both went stale quietly, in
-the two places whose whole job is to describe that list — while
-`app_commands_len_is_141`, the number that *is* pinned, stayed correct through
-every one of those additions. Default-deny plus a failing test is the only
+Nearby numbers show what happens to the ones a test does *not* pin. When this
+section was written the manifest's own per-family comment read
+`// orchestration (64)` above **66** entries, and `architecture.md` described the
+file as "the ACL manifest's 123 app-command names"; both were corrected in that
+slice. Then it happened again, to this very passage: the three counts in these
+paragraphs were bumped by hand — *relatively*, +1 per command added, rather than
+re-derived from `APP_COMMANDS` — and drifted to 142 against a real 146 (#1018).
+An unpinned number does not stay right merely because the prose around it argues
+that unpinned numbers go wrong. Meanwhile `app_commands_len_is_<N>`, the number
+that *is* pinned, stayed correct through every one of those additions. Default-deny plus a failing test is the only
 version of this that survives contact with a year of feature work; a table
 maintained by good intentions is the version that does not.
 
@@ -474,7 +478,7 @@ maintained by good intentions is the version that does not.
 > is the cheap half and the enforcement is the expensive half.** Deciding
 > `orch_grant_merge` is owner-tier costs a table cell today; discovering it was
 > never marked, after a year of commands landing without anyone asking, costs an
-> audit of 142 of them. The roster ships in v1 (§5.1); the tier column is the
+> audit of all 146 of them. The roster ships in v1 (§5.1); the tier column is the
 > hardening track reading from a table that was kept current all along.
 
 Three tiers, ordered: **viewer** ⊂ **operator** ⊂ **owner**.

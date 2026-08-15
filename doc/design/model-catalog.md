@@ -385,7 +385,7 @@ checked:
 Two further rules follow from the reply being **slow**. An ask spawns a CLI, so
 it is in flight for seconds, and a human does things in seconds.
 
-**Repaint through the live hook, never a captured one.** `renderForm()` clears
+**Repaint through the live hook, never a captured one.** `renderInspector()` clears
 `repaintBlockKnobs` before rebuilding, precisely so a late `agent_cli_knobs`
 reply cannot paint into a row it has just detached — and `ensureCliKnobs` calls
 `this.repaintBlockKnobs?.()` for that reason. A detect handler holding its own

@@ -189,7 +189,7 @@ test("the workflow block editor refreshes the knobs and the findings after a det
       body,
       /repaintBlockKnobs\?\.\(\)/,
       "the knob repaint must go through the LIVE `this.repaintBlockKnobs?.()`, never a captured closure: " +
-        "`renderForm()` nulls it precisely so a late reply cannot paint into a row it has already detached"
+        "`renderInspector()` nulls it precisely so a late reply cannot paint into a row it has already detached"
     );
     // The NEGATIVE half, and it is the half that discriminates. The handler now
     // reaches the live hook twice (the detached-form early-out and the tail), so
@@ -207,7 +207,7 @@ test("the workflow block editor refreshes the knobs and the findings after a det
 
 test("a detection that outlives its form does not paint that form's rows", () => {
   // #997 review NB-1. An ask spawns a CLI and can be in flight for seconds —
-  // long enough to select another block, at which point `renderForm()` has
+  // long enough to select another block, at which point `renderInspector()` has
   // detached these rows. The handler has to notice before it touches any of
   // this form's DOM, the same way the probe reply eleven lines below it does.
   for (const body of onDetectBodies(src("workflowview.ts"), "workflowview.ts")) {

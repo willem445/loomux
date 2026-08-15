@@ -64,8 +64,12 @@ export const LUCIDE_PIN = {
  * a supervisor has to read across ten panes.
  *
  * THE BIJECTION IS THE DISCIPLINE. Each of the eight identity hues is claimed by exactly one
- * role, so a hue in the UI resolves to one meaning rather than to "one of the two or three
- * families that happen to be amber". It is also what stops the table from growing: a ninth
+ * role, so a hue IN AN ICON resolves to one meaning rather than to "one of the two or three
+ * families that happen to be amber". Scoped to icons on purpose, and the scope is not a
+ * hedge: the same four hues are claimed again by the agent-role table (azure/jade/violet/
+ * amber = orchestrator/worker/reviewer/planner, pinned by test/theme.test.ts), so a hue is
+ * one meaning per surface, not one meaning app-wide. docs/core-concepts.md says the same
+ * thing to users. It is also what stops the table from growing: a ninth
  * family cannot be added by minting a ninth colour (the brief measured eight as the ceiling)
  * — it has to argue its way into an existing role or displace one. test/icons.test.ts
  * enforces the bijection in both directions.

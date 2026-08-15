@@ -139,19 +139,22 @@ breaks main" into "CI is red." Three tests:
    (string search + bracket match, not a hand count) and diffs them against
    `command_manifest::APP_COMMANDS`. Fails if a command is registered in one
    list but not the other.
-2. **`app_commands_len_is_134`** — a drift tripwire against the current count,
-   so that adding a command is always a deliberate edit rather than a silent
-   one. The running tally of what each command past the #363 plan's original
-   audit of 120 was added for lives in that test's own assertion message,
-   which is the copy that cannot go stale; this note deliberately does not
-   duplicate it (it had drifted three commands behind by #608).
-3. **`main_has_all_134_and_zero_permission_denies_dangerous_spread`** — the
+2. **`app_commands_len_is_<N>`**, where N is the count itself — a drift tripwire
+   against the current total, so that adding a command is always a deliberate
+   edit rather than a silent one. The running tally of what each command past
+   the #363 plan's original audit of 120 was added for lives in that test's own
+   assertion message, which is the copy that cannot go stale; this note
+   deliberately does not duplicate it (it had drifted three commands behind by
+   #608). The N in the name is deliberately not written out here either: spelled
+   as a literal, this line and the next one went stale at 134 and were still
+   naming two nonexistent tests when the manifest held 146 (#1018).
+3. **`main_has_all_<N>_and_zero_permission_denies_dangerous_spread`** — the
    one that matters most. It builds a real (headless) `tauri::test` mock app
    — `tauri::test::mock_builder()` + `.build(tauri::generate_context!())` —
    using the app's **actual on-disk `capabilities/`/`permissions/`**, the
    same resolution `build.rs` feeds the shipped binary. This is not a
    reimplementation of ACL resolution; it exercises Tauri's real resolver.
-   It registers all 134 stub commands sharing the real commands' bare names
+   It registers a stub for every command in `APP_COMMANDS`, sharing the real commands' bare names
    (zero-arg no-ops — no PTYs, no git/gh calls, no orchestration side
    effects), invokes every one of them against the `main` window label and
    asserts none are denied, then invokes the plan's representative dangerous
