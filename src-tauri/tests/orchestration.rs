@@ -15296,20 +15296,40 @@ fn a_backed_off_wake_is_audited_with_the_cadence_that_produced_it() {
 /// 1: a parked group would decay to its 24h ceiling while blind to the one
 /// thing that happens to a parked group, a human commenting.
 ///
-/// Same source-parsing shape, and the same "no other test would notice"
-/// reason, as `app_setup_starts_exactly_one_gh_polling_loop` (#406). Verified
-/// against the real CLI at review time: `gh pr list --json
+/// Verified against the real CLI at review time: `gh pr list --json
 /// number,title,statusCheckRollup,comments,reviews` populates both arrays with
 /// `createdAt`/`submittedAt` keys.
+///
+/// **The first half is asked of the VALUE, not of the source text (#778
+/// landing).** #795 moved the argv out of `poll_intake` and into
+/// `intake::pr_list_argv()` so its `--limit` could be pinned, which left the
+/// original spelling of this assertion — a scan for the literal field string in
+/// `mod.rs` — red on a poller that was still perfectly correct. Calling the
+/// builder is the stronger claim anyway: it survives any reformatting of the
+/// list. What the source scan still owns is the second half, the link the value
+/// cannot see: that `poll_intake` reaches `gh` THROUGH that builder rather than
+/// hand-rolling an argv beside it, which is how the fields could go missing
+/// while `pr_list_argv` stayed green.
 #[test]
 fn poll_intake_still_asks_gh_for_comment_and_review_activity() {
+    let argv = intake::pr_list_argv();
+    for field in ["comments", "reviews"] {
+        assert!(
+            argv.iter().any(|a| a.split(',').any(|f| f == field)),
+            "the `gh pr list` argv must keep asking for `{field}` (#864): without those two fields \
+             every PR silently reads as having no discussion, and a parked group decays to its \
+             ceiling while blind to a human commenting — with no parse error and no other failing \
+             test. Got: {argv:?}"
+        );
+    }
+
     let src = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/orchestration/mod.rs"))
         .expect("read src/orchestration/mod.rs");
     assert!(
-        src.contains("\"number,title,statusCheckRollup,comments,reviews\""),
-        "poll_intake must keep asking `gh pr list` for comments+reviews (#864): without those two \
-         fields every PR silently reads as having no discussion, and a parked group decays to its \
-         ceiling while blind to a human commenting — with no parse error and no other failing test"
+        src.contains("intake::pr_list_argv()"),
+        "poll_intake must build its `gh pr list` argv through `intake::pr_list_argv` — an argv \
+         spelled inline beside it would bypass both this pin and the fetch bound (#795), with \
+         every other test still green"
     );
 
     let intake = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/orchestration/intake.rs"))
