@@ -36,8 +36,7 @@
 //! that ever builds a landing refspec; the [`BatchVerification`] adapter over
 //! `notify.rs`'s classification (§5); and namespace-exact cleanup (§10).
 //!
-//! Not here, and in `mqloop.rs` (D2 — still
-//! `src-tauri/src/orchestration/mqloop.rs`, until #888 batch 12b) instead: §8's
+//! Not here, and in [`crate::mqloop`] (D2) instead: §8's
 //! batch construction (the merge
 //! commits onto the scratch), the draft PR and its body builder, the bounded
 //! observation loop (`checks_timeout_minutes`), §9's bisect and culprit
@@ -67,25 +66,29 @@
 //! runs on the same single `gh` poll loop a headless daemon would run, so the
 //! driver belongs with the core it drives rather than with the window.
 //!
-//! **Three items the crate boundary forced from `pub(super)` to `pub`**:
-//! [`as_args`], [`landable`] and [`declares_ci_green`]. Their one caller,
-//! `mqloop`, is still in `src-tauri` (batch 12b), and no visibility narrower
-//! than `pub` reaches across a crate boundary — so they are this crate's public
-//! API now, forced rather than chosen. `src-tauri`'s `orchestration::mqdriver`
-//! is a curated re-export module rather than a `pub use` line precisely so that
-//! *that* spelling keeps their old `pub(super)` reach; see its header.
+//! **Three items are `pub(crate)`, and that is the whole of their reach**:
+//! [`as_args`], [`landable`] and [`declares_ci_green`]. They were `pub(super)`
+//! in `src-tauri/src/orchestration/mqdriver.rs` — visible within
+//! `orchestration` — and batch 12a had to widen them to `pub` for exactly one
+//! reason: their only caller, `mqloop`, was still on the other side of the
+//! crate boundary, and no visibility narrower than `pub` crosses one. Batch 12b
+//! moved `mqloop` here, so that reason expired and the keyword went back down.
+//! `pub(crate)` is the faithful translation of the old `pub(super)`, not a new
+//! narrowing invented for this batch: the scope that used to be "the
+//! `orchestration` module" is now "this crate".
 //!
-//! **What that does and does not buy, because the flattering version of this
-//! sentence is false.** It narrows the *habitual* path: nothing outside
-//! `orchestration` can reach these three as `orchestration::mqdriver::…`. It
-//! does **not** narrow the set of paths — `loomux_engine::mqdriver::landable`
-//! compiles from anywhere in `src-tauri`, which depends on this crate directly
-//! and already spells `loomux_engine::…` in `gh.rs` and `obs.rs`. No re-export
-//! can prevent that; an item must be `pub` here to be re-exported at all. So
-//! [`landable`] being **half** of the constraint-7 refusal — [`validate_target`]
-//! is the whole of it — is an argument for keeping the habitual path pointed at
-//! the whole check, not a claim that the half is out of reach. If you are
-//! writing a new branch-name guard: use [`validate_target`].
+//! It is also load-bearing, which is why it was worth reverting rather than
+//! leaving as harmless surplus. [`landable`] is **half** of the constraint-7
+//! refusal — the refspec-shape predicate — and [`validate_target`] is the whole
+//! of it, ordering the unverifiable / default-branch / target / assertion
+//! refusals so an unreadable answer can never *fail to match* the default and
+//! read as safe. While the item was `pub`, "reach the half instead" was
+//! reachable from anywhere in `src-tauri` (which depends on this crate directly
+//! and already spells `loomux_engine::…` in `gh.rs` and `obs.rs`), and no
+//! re-export shape could have prevented it — batch 12a's header said so
+//! explicitly and could do nothing about it. Now the compiler prevents it. If
+//! you are writing a new branch-name guard: [`validate_target`], and from
+//! inside this crate you have no other option.
 
 use crate::mergeq::{new_batch_id, scratch_branch, GateRecheck, GateSpec, PrObservation};
 use crate::notify::{self, PollResult};
@@ -325,7 +328,7 @@ struct RawPrFacts {
     body: String,
 }
 
-pub fn as_args(v: &[String]) -> Vec<&str> {
+pub(crate) fn as_args(v: &[String]) -> Vec<&str> {
     v.iter().map(|s| s.as_str()).collect()
 }
 
@@ -477,7 +480,7 @@ impl TargetRefusal {
 ///   `git::default_base_ref` falls through to when it cannot resolve anything,
 ///   and it is exactly the kind of plausible-looking string a security refusal
 ///   must not accept — see [`validate_target`].
-pub fn landable(name: &str) -> bool {
+pub(crate) fn landable(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 200
         && name.is_ascii()
@@ -1023,7 +1026,7 @@ pub fn land_push_argv(scratch_sha: &str, target: &str) -> Vec<String> {
 /// couples "did we look at CI" to "could we read the gate file", and a future
 /// edit that made an unreadable gate reachable would silently also have made it
 /// unobserved. The cheap direction is the safe one.
-pub fn declares_ci_green(spec: &GateSpec) -> bool {
+pub(crate) fn declares_ci_green(spec: &GateSpec) -> bool {
     match spec {
         GateSpec::Declared(g) => g.also.iter().any(|c| c == "ci-green"),
         GateSpec::Absent | GateSpec::Malformed => true,
