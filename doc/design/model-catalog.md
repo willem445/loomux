@@ -345,18 +345,45 @@ validator rejects.** The launcher never had the bug (`applyRoleModels` →
 Because this is DOM wiring — which this repo validates by hand rather than by
 simulating a DOM — the pin is a **source scan** (`test/detectrefresh.test.ts`),
 in the tradition of `transport.test.ts`'s one-importer rule and `groupid.rs`'s
-two scans. It asserts each `onDetect` handler reaches the refreshers by name, on
-both hosts, and carries a vacuity guard so a broken extraction fails loudly
-instead of passing. The next such handler will be written by copy-paste from a
-neighbour rather than by reading this note; a scan is what notices.
+two scans. It asserts that **every** `onDetect` handler in each host reaches the
+refreshers by name, and carries a vacuity guard so a broken extraction fails
+loudly instead of passing. The next such handler will be written by copy-paste
+from a neighbour rather than by reading this note; a scan is what notices.
 
-Both hosts also take the same **mid-type guard** now (`ModelPicker.editingCustom`).
-An ask can be in flight for seconds — long enough for a human to click into the
-`custom…` box — and rebuilding the menu under a half-typed id resolves it to the
-dropdown branch and hides the input beneath the caret. The guard is deliberately
-narrower than "focus is somewhere in this picker": a detection is *started* by
-clicking a button inside the control, so the broad test is true on every detect
-path and would suppress the very rebuild the click asked for.
+The file's header enumerates what the instrument cannot do — reachability, not
+behaviour; source, not module graph — because a structural test that reads as
+broader coverage than it has is worse than none. Scanning only the *first*
+`onDetect` was in that category and is fixed: one handler per host today, so it
+was sound as written, which is exactly why it was worth correcting before a
+second picker made it silently wrong (#997 review NB-4).
+
+Two further rules follow from the reply being **slow**. An ask spawns a CLI, so
+it is in flight for seconds, and a human does things in seconds.
+
+**Repaint through the live hook, never a captured one.** `renderForm()` clears
+`repaintBlockKnobs` before rebuilding, precisely so a late `agent_cli_knobs`
+reply cannot paint into a row it has just detached — and `ensureCliKnobs` calls
+`this.repaintBlockKnobs?.()` for that reason. A detect handler holding its own
+form's repainter in a closure walks straight around that guard: select another
+block while the ask is in flight and the reply paints the *previous* form's
+detached rows, leaving the one on screen stale (#997 review NB-1). The handler
+also takes the probe reply's `formPane.contains(picker.root)` early-out before
+touching any of this form's DOM. The findings are recomputed either way — they
+belong to the pane, not to the form.
+
+**Defer the mid-type rebuild; never drop it.** Rebuilding the menu under a
+half-typed id resolves it to the dropdown branch and hides the input beneath the
+caret, so `ModelPicker.editingCustom` is the question both hosts ask. But
+*refusing* is only half an answer: nothing schedules another attempt, and on the
+launcher that was permanent — `applyRoleModels` is otherwise reachable only from
+the role's CLI `change` listener and the seed pass, so a detection landing
+mid-type never reached that role's dropdown again for the dialog's life, and the
+human saw a `detect` click do nothing (#997 review NB-3). `runWhenNotEditing`
+owns both halves now: run it, or run it on the input's next `blur`. The
+predicate stays deliberately narrower than "focus is somewhere in this picker" —
+a detection is *started* by clicking a button inside the control, so the broad
+test is true on every detect path and would suppress the very rebuild the click
+asked for.
 
 ## The context-window table, and why one exists at all
 
