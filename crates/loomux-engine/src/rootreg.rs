@@ -204,6 +204,13 @@ impl DeclaredRoot {
 pub struct RootRegistry {
     /// Canonicalized keys. `BTreeSet` rather than `HashSet` so the eventual
     /// `roots_list` (deferred to the daemon work) enumerates deterministically.
+    ///
+    /// `self.roots` contains `self.root` as a substring, which is the needle
+    /// `tests/groupid.rs`'s one-join scan uses for the *orchestration* root. It
+    /// only flags a line that also carries `.join(`/`.push(`/`.clone()`/
+    /// `.to_path_buf()`/`.parent()`, and none of the three lines below does — so
+    /// if a later edit puts one of those on the same line as this field, expect
+    /// a confusing failure from an unrelated test rather than a real finding.
     roots: RwLock<BTreeSet<PathBuf>>,
 }
 
