@@ -86,6 +86,7 @@ import {
 } from "./dirtystate";
 import { FileEditView } from "./fileedit";
 import { FileExplorerView } from "./fileexplorer";
+import { icon } from "./icons.ts";
 import { WorkflowView } from "./workflowview";
 import { WORKFLOW_FILE } from "./workflowmodel";
 import type { PersistedPane, PersistedPaneKind } from "./tabstore";
@@ -96,32 +97,39 @@ import { adoptableSessionId, hasForkSession, sessionCliFromCommand } from "./pan
 // name the same CLIs by construction (#722).
 import type { Cli } from "./sessionreconcile";
 
-// Inline icons so the toolbar renders identically regardless of installed
-// fonts; they inherit color via `currentColor`.
-const FOLDER_ICON = `<svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"><path d="M1.9 4.3c0-.6.5-1.1 1.1-1.1h3l1.4 1.5h5.6c.6 0 1.1.5 1.1 1.1v5.4c0 .6-.5 1.1-1.1 1.1H3c-.6 0-1.1-.5-1.1-1.1z"/></svg>`;
-const BRANCH_ICON = `<svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><circle cx="4.5" cy="3.6" r="1.7"/><circle cx="4.5" cy="12.4" r="1.7"/><circle cx="11.5" cy="5.4" r="1.7"/><path d="M4.5 5.3v5.4M11.5 7.1c0 2.4-1.9 3.1-4 3.6"/></svg>`;
-const TASKS_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><path d="M5.5 4h8M5.5 8h8M5.5 12h8"/><circle cx="2.3" cy="4" r="0.9" fill="currentColor" stroke="none"/><circle cx="2.3" cy="8" r="0.9" fill="currentColor" stroke="none"/><circle cx="2.3" cy="12" r="0.9" fill="currentColor" stroke="none"/></svg>`;
-const GIT_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><circle cx="8" cy="2.8" r="1.6"/><circle cx="4" cy="13.2" r="1.6"/><circle cx="12" cy="13.2" r="1.6"/><path d="M8 4.4v2.2M8 6.6c0 2.6-4 2.4-4 5M8 6.6c0 2.6 4 2.4 4 5"/></svg>`;
+// The header's icons, from the registry (#879 slice K). They were hand-drawn
+// inline here — inline so the toolbar renders identically regardless of
+// installed fonts, which still holds — and the artwork now comes from
+// src/icons.ts, which also DYES each one by its role: the two meta chips read
+// as workspace and repo, the overlay buttons as the board they open, the group
+// controls as the fleet. The sizes below are the boxes these glyphs already
+// had, so nothing in the header moves.
+const ICON_META_PX = 12;
+const ICON_BTN_PX = 13;
+const FOLDER_ICON = icon("folder", ICON_META_PX);
+const BRANCH_ICON = icon("git-branch", ICON_META_PX);
+const TASKS_ICON = icon("list-checks", ICON_BTN_PX);
+const GIT_ICON = icon("git-graph", ICON_BTN_PX);
 // Issues view (Alt+I): a dot inside a circle — GitHub's open-issue glyph.
-const ISSUES_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3"><circle cx="8" cy="8" r="5.4"/><circle cx="8" cy="8" r="1.5" fill="currentColor" stroke="none"/></svg>`;
-// Progress timeline (#608): dots on an axis — the audit log's chart sibling.
-const TIMELINE_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><path d="M1.6 11.4h12.8"/><path d="M3.4 11.4v2M8 11.4v2M12.6 11.4v2"/><circle cx="4.2" cy="4" r="1.5" fill="currentColor" stroke="none"/><circle cx="8.6" cy="7.4" r="1.5" fill="currentColor" stroke="none"/><circle cx="12.2" cy="4" r="1.5" fill="currentColor" stroke="none"/></svg>`;
+const ISSUES_ICON = icon("circle-dot", ICON_BTN_PX);
+// Progress timeline (#608): the audit log's chart sibling.
+const TIMELINE_ICON = icon("chart-gantt", ICON_BTN_PX);
 // Audit viewer: a clock/history glyph for the group's audit-log timeline.
-const AUDIT_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M2.2 8a5.8 5.8 0 1 1 1.7 4.1"/><path d="M2.2 12.2V8.6H5.8"/><path d="M8 5.2V8l2 1.4"/></svg>`;
-const GROUP_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="3.4" r="1.7"/><circle cx="3.4" cy="11" r="1.7"/><circle cx="12.6" cy="11" r="1.7"/><path d="M8 5.1v3M6.7 9.6 4.5 9.9M9.3 9.6l2.2.3"/></svg>`;
-// Fold-group toggle (#46): stacked panes collapsing toward a baseline —
-// signals "minimize every worker/reviewer pane to the dock at once".
-const GROUP_MIN_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="2.4" width="10" height="3.2" rx="0.8"/><rect x="4.6" y="7" width="6.8" height="2.6" rx="0.7"/><path d="M4.2 13h7.6"/></svg>`;
+const AUDIT_ICON = icon("clock-fading", ICON_BTN_PX);
+const GROUP_ICON = icon("users", ICON_BTN_PX);
+// Fold-group toggle (#46): chevrons collapsing toward each other — signals
+// "minimize every worker/reviewer pane to the dock at once".
+const GROUP_MIN_ICON = icon("chevrons-down-up", ICON_BTN_PX);
 // "Open in editor": code-brackets glyph. Opens the pane's workspace folder in
 // the user's configured external editor (VS Code, Zed, …).
-const EDITOR_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M6 4.5 2.5 8 6 11.5M10 4.5 13.5 8 10 11.5"/></svg>`;
-// File-editor overlay (#174): a page with a fold + a small pencil, to read as
-// "edit files" distinct from the external-editor </> glyph above.
-const FILES_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 2.2h5l3.5 3.5v5.1"/><path d="M8.2 2.2v3.3h3.3"/><path d="M2.2 8.2h5.1v5.1H2.2z"/></svg>`;
+const EDITOR_ICON = icon("code-xml", ICON_BTN_PX);
+// File-editor overlay (#174): a page with a pencil, to read as "edit files"
+// distinct from the external-editor </> glyph above.
+const FILES_ICON = icon("file-pen", ICON_BTN_PX);
 // Attach affordance on the steering strip (#72): a paperclip.
-const PAPERCLIP_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M12.5 6.6 7.1 12a2.4 2.4 0 0 1-3.4-3.4l5.6-5.6a1.5 1.5 0 0 1 2.1 2.1l-5.4 5.4a.6.6 0 0 1-.9-.9l4.9-4.9"/></svg>`;
-// Voice-prompt push-to-talk button (#58): a simple microphone glyph.
-const MIC_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="1.8" width="4" height="7.4" rx="2"/><path d="M3.8 7.2a4.2 4.2 0 0 0 8.4 0M8 11.4v2.8M6 14.2h4"/></svg>`;
+const PAPERCLIP_ICON = icon("paperclip", ICON_BTN_PX);
+// Voice-prompt push-to-talk button (#58): a microphone.
+const MIC_ICON = icon("mic", ICON_BTN_PX);
 
 /** Pull image files out of a paste/drag `DataTransfer`. Returns only entries
  *  the browser tags as images, so a text or mixed paste yields []. */

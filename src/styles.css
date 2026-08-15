@@ -72,9 +72,10 @@
          sub-palette. Four of these carry the same pigment as a --state-* token above and
          that is deliberate: loomux has one palette, and the token a surface NAMES is what
          declares which question it is answering. An --id-* token may only be used through a
-         documented role mapping; "it needed a different blue" is still refused. The map is
-         doc/design/ui-redesign.md, §What slice B migrated — which reserved these in slice A
-         and consumed all eight in slice B. */
+         documented role mapping; "it needed a different blue" is still refused. Reserved
+         by slice A; slice B (#957) was the first consumer, mapping the bulk of surfaces, and
+         the icon role table directly below is a later one. The full map is
+         doc/design/ui-redesign.md, §What slice B migrated. */
   --id-rose: #e8636f;
   --id-amber: #e8a94a;
   --id-lime: #a9cc5a;
@@ -135,6 +136,36 @@
   --ease: cubic-bezier(0.25, 0.8, 0.35, 1);
 
 }
+
+/* ======================== ICON ROLES — the role→dye table (#879, slice K) ==================
+ *
+ * The first ICON surface to consume the identity channel — slice B (#957) already mapped the
+ * channel across roughly thirty non-icon surfaces — and the shape every later icon consumer
+ * should copy: a mark never names a hue, it names a ROLE, and the role names the token. `src/icons.ts`
+ * stamps `.ic-<role>` onto every `<svg>` it renders, so a consumer that wants an icon gets its
+ * meaning's colour automatically and cannot pick a different one — which is what
+ * doc/design/ui-redesign.md's rule 3 means by "through a documented role mapping, never ad hoc".
+ *
+ * EACH IDENTITY HUE IS CLAIMED BY EXACTLY ONE ROLE. That bijection is what keeps eight hues
+ * legible instead of decorative: a colour in the UI resolves to one meaning, not to whichever
+ * of three families happens to be amber. test/icons.test.ts pins this block to the registry in
+ * BOTH directions — a role with no rule here renders in plain ink, and a rule here for a role
+ * the registry dropped is a colour nothing can explain.
+ *
+ * NO --state-* TOKEN MAY APPEAR IN THIS BLOCK. An icon that reports agent state takes its
+ * colour from the POSITION it sits in — the warp thread, the status chip, the state dot — which
+ * belongs to the surfaces C-I paint. Dyeing a glyph with a state token here would put fleet
+ * legibility on the channel the brief measured as the one that collapses under colour-vision
+ * deficiency. */
+.ic { flex: none; }
+.ic-workspace { color: var(--id-cyan); }   /* where the work lives: folders, paths, file actions */
+.ic-source    { color: var(--id-amber); }  /* code you edit, and the two ways into an editor */
+.ic-content   { color: var(--id-jade); }   /* data and documents you read */
+.ic-vcs       { color: var(--id-lime); }   /* the repository's history */
+.ic-fleet     { color: var(--id-violet); } /* the agents themselves */
+.ic-board     { color: var(--id-orchid); } /* tasks, issues, audit, timeline */
+.ic-danger    { color: var(--id-rose); }   /* destructive actions */
+.ic-live      { color: var(--id-azure); }  /* capture in progress */
 
 * { box-sizing: border-box; }
 
@@ -804,7 +835,11 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .pane-cwd:hover { background: var(--surface-2); color: var(--ink); }
 .pane-cwd:focus-visible { outline: 1px solid var(--line-strong); }
 .pane-branch { flex: none; }
-.pane-meta-icon { flex: none; display: inline-flex; opacity: 0.7; }
+/* No opacity fade on a dyed mark (#879 slice K): the identity hues are measured against the
+   surfaces they sit on, and fading one to 0.7 quietly spends the contrast the design note
+   promises. De-emphasis here is the hue's job — cyan on a header reads as meta beside the
+   pane's title without being dimmed. */
+.pane-meta-icon { flex: none; display: inline-flex; }
 .pane-meta-text {
   min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
@@ -1468,8 +1503,13 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   .fileexp-row.busy,
   .fileexp-goto-item.busy { animation: none; opacity: 0.4; }
 }
+/* The container colour is the fallback for anything not carrying a role class; the file
+   glyphs dye themselves (#879 slice K). Selecting a row no longer recolours its icon: the
+   row fill already says "selected", and the icon is answering a different question — WHICH
+   KIND of file this is — which does not change when you click it. Switching it to the accent
+   would move a mark from the identity channel into the interaction one for as long as the
+   selection lasts. */
 .fileexp-icon { flex: none; display: inline-flex; color: var(--ink-dim); }
-.fileexp-row.sel .fileexp-icon { color: var(--accent); }
 .fileexp-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 /* Size and time are reference columns — fixed width so they line up down the
    listing, and dim so the names stay the thing you scan. */
@@ -3320,8 +3360,9 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .fileedit-row:hover { background: var(--surface-2); }
 .fileedit-row.open { background: var(--selection); }
 .fileedit-row.symlink .fileedit-name { color: var(--ink-dim); font-style: italic; }
+/* Same as `.fileexp-icon` (#879 slice K): the open row is marked by its fill, and the glyph
+   keeps saying which kind of file it is. */
 .fileedit-icon { flex: none; display: inline-flex; color: var(--ink-dim); }
-.fileedit-row.open .fileedit-icon { color: var(--accent); }
 .fileedit-name { overflow: hidden; text-overflow: ellipsis; }
 
 /* Search-hit highlight + per-file count badge in the tree. */
