@@ -60,11 +60,11 @@ export interface RosterBlock {
    *  value here, before the toggle that reads the file at all. */
   effort?: string;
   context?: string;
-  /** OPTIONAL, INERT persona/template marker (#250/#324) — `"advisor"` |
-   *  `"process"` | absent. Backend-resolved, so it is never a value the
-   *  backend's own `role_hint_requires` wouldn't accept: capability still
-   *  keys off `kind` alone, this only ever drives {@link describeBlock}'s
-   *  cosmetic chip. */
+  /** OPTIONAL persona/template marker (#250/#324/#891) — `"advisor"` |
+   *  `"process"` | `"liaison"` | absent. Backend-resolved, so it is never a
+   *  value the backend's own `role_hint_requires` wouldn't accept. In THIS
+   *  module it only ever drives {@link describeBlock}'s cosmetic chip; the hint
+   *  is not capability-inert in general (see `doc/design/liaison.md`). */
   role_hint?: string | null;
 }
 

@@ -582,7 +582,7 @@ fn an_authored_with_stamp_is_tolerated_and_preserved() {
     assert!(g.guardrails.block("rev-sec").is_some(), "the roster must load, not fall back");
 }
 
-// ───────────── role_hint: an inert marker, not a fifth capability (#250/#324) ─
+// ──── role_hint: a marker that is never a fifth capability CLASS (#250/#324) ──
 
 #[test]
 fn role_hint_requires_its_matching_capability_class() {

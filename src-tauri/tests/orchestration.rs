@@ -13845,8 +13845,8 @@ fn closing_a_completed_planner_is_idempotent() {
 #[test]
 fn advisor_hinted_planner_auto_closes_on_report_done() {
     // #250/#324 slice D: the advisor is planner-kind (#203's "one plan → one
-    // report → exit" contract), and role_hint is capability-inert — so
-    // `close_completed_planner`'s role gate (keyed on `Role::Planner` alone,
+    // report → exit" contract), and the LIFECYCLE path never reads role_hint —
+    // so `close_completed_planner`'s role gate (keyed on `Role::Planner` alone,
     // never on block id or role_hint) already covers an advisor-hinted block
     // for free. This pins that claim directly: no idle pane, no standing
     // consult process, exactly the #203 precedent the plan cites.
@@ -23411,8 +23411,8 @@ fn gh_shim_shell_harness_executes_the_gate() {
 #[test]
 fn gh_shim_allows_pr_create_and_blocks_merge_for_the_process_pane() {
     // #250/#324 slice D item 2: the process-pro is worker-kind, so it gets
-    // the exact same PATH-injected gh/git shim as any worker — role_hint is
-    // capability-inert (the closure proof lives in
+    // the exact same PATH-injected gh/git shim as any worker — the CONTAINMENT
+    // path never reads role_hint (the closure proof lives in
     // `role_hint_grants_no_capability_to_its_block`, workflow.rs), and the
     // shim script itself has no concept of role_hint at all. This pins the
     // specific claim the plan's demo depends on: the process-pro's `gh pr

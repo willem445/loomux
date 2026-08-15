@@ -69,14 +69,15 @@ export function isWorkflowCli(v: string): v is WorkflowCli {
 }
 
 /** The role hints a block may declare (#250/#324, #891) — an OPTIONAL persona/
- *  template/badge marker that never WIDENS a capability: `kind` alone still
- *  decides deny-flags, cwd rule and MCP tool scope, and the one hint-keyed rule
- *  that exists (`liaison` is denied `review_verdict`) only narrows. Mirrors the
- *  backend's `role_hint_requires` (workflow.rs) so this pane's pre-run pass
- *  agrees with what the real parser would say. Each hint REQUIRES a specific
- *  `kind` — `advisor` needs `planner`, `process` needs `worker`, `liaison` needs
- *  `reviewer` — so a workflow can't spell a combination nothing downstream would
- *  honor. */
+ *  template/badge marker. `kind` alone decides the deny-flags and the cwd rule;
+ *  the MCP tool scope has a short enumerated list of hint-keyed exceptions
+ *  (`doc/design/liaison.md`), today both narrowing — `session_digest` to
+ *  `process`, `review_verdict` away from `liaison` — with a widening planned.
+ *  Mirrors the backend's `role_hint_requires` (workflow.rs) so this pane's
+ *  pre-run pass agrees with what the real parser would say. Each hint REQUIRES a
+ *  specific `kind` — `advisor` needs `planner`, `process` needs `worker`,
+ *  `liaison` needs `reviewer` — so a workflow can't spell a combination nothing
+ *  downstream would honor. */
 export const ROLE_HINTS = ["advisor", "process", "liaison"] as const;
 export type RoleHint = (typeof ROLE_HINTS)[number];
 

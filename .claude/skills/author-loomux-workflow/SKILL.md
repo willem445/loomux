@@ -57,7 +57,8 @@ Read the human's description and extract, explicitly, before writing YAML:
   `kind: planner` block with `role_hint: advisor` — read-only, spawned only
   when the orchestrator is stuck on a question), or a process/lessons role
   that runs after a merge (→ `kind: worker` with `role_hint: process`). Both
-  hints are optional and purely cosmetic — see Invariant 3.
+  hints are optional; neither is purely cosmetic — a hint can change which MCP
+  tools its block is offered, within the enumerated list. See Invariant 4.
 - **What stays default.** If the human didn't ask for something (a planner,
   a second worker tier, a merge gate at all), don't invent it. A workflow
   file that declares only what it's for is easier to read and easier for the
@@ -99,14 +100,18 @@ soft warning:
 3. **No agent ever merges a PR** — not a worker, not a `process`-hinted
    worker, not a reviewer. Every block opens a PR and stops; a human merges.
    This isn't configurable per block either.
-4. **`role_hint` never widens a capability.** It mostly selects a persona
+4. **You cannot author what a `role_hint` means.** It mostly selects a persona
    addendum, a template fragment, and a roster badge. Capability comes from
-   `kind` alone — `kind_from_str` and `role_hint_requires` both *reject*
-   unrecognized or mismatched values rather than coercing them, so you cannot
-   spell a fifth capability class by combining hint + kind cleverly. The two
-   rules that do read the hint only ever NARROW the class it sits on:
-   `session_digest` is offered to `process`-hinted workers alone, and
-   `review_verdict` is withheld from a `liaison`-hinted reviewer.
+   `kind` — `kind_from_str` and `role_hint_requires` both *reject* unrecognized
+   or mismatched values rather than coercing them, so you cannot spell a fifth
+   capability class by combining hint + kind cleverly. A few MCP tools do read
+   the hint, and today both such rules NARROW the class it sits on
+   (`session_digest` offered to `process`-hinted workers alone;
+   `review_verdict` withheld from a `liaison`-hinted reviewer) — but that is a
+   fact about the current list, not a guarantee, and a hint-keyed widening is
+   planned. Every exception is enumerated in `doc/design/liaison.md`. What you
+   cannot do from a workflow file is invent one: you pick from a closed set and
+   loomux's code decides the effect.
 5. **The orchestrator block is loomux-owned.** A workflow file may pin its
    `cli:`/`model:`/`effort:`/`context:` and nothing else — `prompt:`,
    `profile:`, and `allow:` on an `orchestrator`-kind block are a parse

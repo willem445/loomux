@@ -29,11 +29,30 @@ belongs to. Each of the other three is wrong for a reason, not by elimination:
   all; a workflow file may pin its `cli:`/`model:` and nothing more.
 
 `reviewer` is what remains once those are ruled out, and it is a positive fit
-rather than a residue: read-only containment (a read shell plus `git`/`gh`, so
-it can read the audit log and the board without poking the orchestrator),
-persistent (no auto-close), channel-eligible, and already able to
+rather than a residue: `Containment::NoEdits` (the editing tools — Edit, Write,
+NotebookEdit — denied at the CLI, while the shell and `git`/`gh` stay, so it can
+read the audit log and the board without poking the orchestrator), persistent
+(no auto-close), channel-eligible, and already able to
 `report`/`message_orchestrator` — which is the whole downward wire. Nothing new
 is invented for it: no dependency, no MCP tool, no persisted state.
+
+**Be exact about the size of that tier, because the argument leans on it.**
+A reviewer is contained but **not read-only** — `is_read_only()` is false for
+it, matching only `Containment::ReadOnly` (the planner's tier), and
+`doc/design/orchestration.md` states the same: *"a reviewer row is contained but
+NOT read-only, and keeps its shell git."* `NoEdits` removes the frictionless,
+default path to editing a file and leaves the shell path (`sed -i`, a heredoc,
+`python -c`) reachable, because denying that would mean denying `Bash`. It is
+containment of the accident, not of the adversary.
+
+The residual that follows, stated rather than absorbed: a verdict is a file
+under `verdict_dir(group, pr)`, and a shell can write a file. So the guarantee
+this note describes — the liaison cannot record a verdict — is exactly true of
+**the MCP path**, which is the whole reachable graph for an agent using its
+tools. It is no weaker than any other reviewer's, since a plain reviewer could
+write a sibling's verdict file the same way; it is simply not the stronger
+"cannot write" property, and a later slice must not build on the belief that it
+is.
 
 A fifth first-class `Role::Liaison` was rejected for the same reason the
 advisor's was (`supervisor-skills.md` §13): it would touch ~60 sites across
@@ -74,20 +93,37 @@ ask and no agent answer (`human-questions.md`).
 
 `role_hint` was introduced as **inert with respect to capability**, and this is
 the second rule to read it (after `session_digest`, which is offered to
-`process`-hinted workers alone). Both narrow; neither grants. The invariant
-that matters — *a workflow file can never grant a capability* — is untouched,
-because the strongest thing a repo can achieve by writing `role_hint: liaison`
-is to receive **less** than the class it named would otherwise give it. There
-is no combination of `kind` and `role_hint` that yields more than `kind` alone.
+`process`-hinted workers alone). Both of the rules that exist **today** narrow;
+neither grants. So the strongest thing a repo achieves right now by writing
+`role_hint: liaison` is to receive **less** than the class it named would
+otherwise give it.
 
-The accurate statement of the doctrine is therefore *inert by default, with
-every exception enumerated*, and this is the enumeration:
+**That is a statement about today, not an invariant, and it must not be written
+as one.** The liaison track's own next slice plans a hint-keyed *grant*:
+`group_usage` is `require_orchestrator`-only, so offering it to a liaison would
+be the first `role_hint` that yields **more** than its `kind` alone. Whether
+that is the right trade is that slice's argument to make — but a note claiming
+no such combination can exist would force that slice to retract this page
+before it could even open the question, which is precisely how a doctrine
+hardens into an obstacle instead of a rail.
 
-| Hint | Class | Effect on capability |
-|---|---|---|
-| `advisor` | `planner` | none |
-| `process` | `worker` | narrows: `session_digest` is offered to this hint only |
-| `liaison` | `reviewer` | narrows: `review_verdict` is withheld from this hint |
+The accurate statement is therefore *inert by default, with **every** exception
+enumerated here — narrowing and widening alike*. The invariant that genuinely
+does hold is the one about the file, not about the hint: **a workflow file can
+never grant a capability**, because a repo cannot author these rules. It
+selects a hint from a closed set; loomux decides what each one means, in code
+that ships with the binary.
+
+| Hint | Class | Effect on capability | Status |
+|---|---|---|---|
+| `advisor` | `planner` | none | shipped |
+| `process` | `worker` | **narrows**: `session_digest` offered to this hint only | shipped |
+| `liaison` | `reviewer` | **narrows**: `review_verdict` withheld from this hint | shipped |
+| `liaison` | `reviewer` | **widens**: `group_usage`, otherwise orchestrator-only | *planned, not shipped* |
+
+Keep the last row until the slice that lands it turns it into a shipped one, or
+until it is decided against and the row is deleted. A planned widening that is
+invisible here is exactly the surprise this table exists to prevent.
 
 ## What this slice deliberately does not ship
 
@@ -103,6 +139,27 @@ every exception enumerated*, and this is the enumeration:
   yet. The authoring skill's field table lists the value because that table is
   the *parse contract* and a parse contract that omits an accepted value is
   wrong; it deliberately carries no "how to build a liaison" recipe.
+
+### A bare `kind: reviewer` spawn can resolve to the liaison
+
+`spawn_agent` may name a `kind` instead of a `block`, and with no block
+`spawn_agent_ex` falls to `block_for(role)` — "the first block of that kind in
+roster order". A roster that declares its liaison before its reviewers, with a
+gate naming a real reviewer, parses completely clean and still answers
+`spawn_agent(kind: "reviewer")` with **the liaison**: a pane holding a
+reviewer's instructions, no `review_verdict`, and no way to satisfy the gate it
+was spawned for.
+
+It fails **closed** — no verdict is forged and the gate simply stays shut — so
+this is a usability trap, not a security one. `advisor` and `process` share the
+same default-block shape harmlessly, because neither takes anything away; the
+liaison is the first hint that can make "the first block of that kind" a pane
+structurally unable to do the job its class was asked for.
+
+The fix is a `block_for` skip, and it belongs with the lifecycle slice that
+already owns how a liaison is spawned — not here, where it would be a behaviour
+change smuggled into the slice that introduces the hint. Until then: name the
+block explicitly when spawning a reviewer into a roster that declares a liaison.
 
 ### One known imprecision, left deliberately
 

@@ -316,11 +316,13 @@ fn lock_menu_text(locks: &[(String, workflow::ResourcePolicy)]) -> String {
 
 /// The tool surface is role-filtered so workers never even see privileged
 /// tools; `call_tool` re-checks anyway (listing is cosmetic, not security).
-/// `role_hint` additionally scopes two tools, and in both cases it NARROWS the
+/// `role_hint` additionally scopes two tools, and today both rules NARROW the
 /// capability class rather than widening it: `session_digest` is listed only for
 /// `process`-hinted worker blocks (#250/#324 slice D), and `review_verdict` is
 /// withheld from a `liaison`-hinted reviewer block (#891). Every other tool
-/// ignores it.
+/// ignores it. "Both narrow" is a fact about the current list and not a rule
+/// this function enforces — a hint-keyed widening is planned (`group_usage` for
+/// the liaison); `doc/design/liaison.md` enumerates every exception.
 ///
 /// `locks` is the group's declared `resources:` block (#858). It is a
 /// LISTING input, not just a description input: a repo that declares no
@@ -606,11 +608,12 @@ fn tool_defs(
     // enforcement (a worker that could file its own PASS would make the gate a prop).
     //
     // …EXCEPT the liaison (#891). It rides the reviewer capability class because it
-    // needs exactly that posture — persistent, read-only, board-reading — and not
-    // because it reviews anything: it converses with the human and relays. A pane
-    // that never reads a diff must not be able to record the durable, attributed
-    // PASS that opens a merge gate, so the one hint-keyed rule in this file NARROWS
-    // its class rather than widening it. Enforced at all three layers a verdict
+    // needs exactly that posture — persistent, contained (`Containment::NoEdits`,
+    // NOT read-only: the shell stays), board-reading — and not because it reviews
+    // anything: it converses with the human and relays. A pane that never reads a
+    // diff must not be able to record the durable, attributed PASS that opens a
+    // merge gate, so this hint-keyed rule NARROWS its class rather than widening
+    // it. Enforced at all three layers a verdict
     // passes through (this listing, the `call_tool` dispatch arm, and
     // `record_verdict` next to the write) — the same "never one check in a JSON
     // shim" discipline the class check itself gets, for the same reason.

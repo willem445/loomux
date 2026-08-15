@@ -9564,13 +9564,15 @@ pub struct Caller {
     pub group: GroupId,
     pub role: Role,
     /// The spawning block's `role_hint` (#250/#324, #891) — `advisor` |
-    /// `process` | `liaison` | `None`. Every capability check keys off `role`
-    /// alone, per the closure argument `role_hint` was built on, with exactly
-    /// two hint-keyed exceptions and neither of them widens a class:
-    /// `session_digest`'s dispatch gate NARROWS the worker tier to
-    /// `role_hint == process`, and `review_verdict`'s NARROWS the reviewer tier
-    /// by denying `role_hint == liaison` (a liaison rides the reviewer class for
-    /// its read-only, persistent posture and reviews nothing).
+    /// `process` | `liaison` | `None`. The structural containment keys off
+    /// `role` alone; the MCP tier has exactly two hint-keyed exceptions today,
+    /// both narrowing: `session_digest`'s dispatch gate NARROWS the worker tier
+    /// to `role_hint == process`, and `review_verdict`'s NARROWS the reviewer
+    /// tier by denying `role_hint == liaison` (a liaison rides the reviewer
+    /// class for its contained — `NoEdits`, not read-only — and persistent
+    /// posture, and reviews nothing). Both-narrowing is the current list, not a
+    /// rule: a widening is planned (`group_usage` for the liaison). The full
+    /// enumeration lives in `doc/design/liaison.md`.
     pub role_hint: Option<String>,
 }
 
@@ -45132,9 +45134,10 @@ pub fn orch_workflow_preview_sync(repo: String, agent_cli: String) -> Value {
             "kind": b.kind.as_str(),
             "cli": workflow::cli_of(b, &agent_cli),
             "model": workflow::model_of(b, &agent_cli),
-            // #250/#324: surfaced so the launcher preview can badge an
-            // advisor/process block — cosmetic only, never a capability (see
-            // `workflow::Block::role_hint`).
+            // #250/#324/#891: surfaced so the launcher preview can badge an
+            // advisor/process/liaison block. Cosmetic HERE — this row feeds a
+            // badge, not a gate — though the hint itself is not capability-inert
+            // in general (see `workflow::Block::role_hint`).
             "role_hint": b.role_hint,
             // #687: the block's RESOLVED knobs (these rows have been through
             // `clamped()` above), because the preview's job is to state the whole
