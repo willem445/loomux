@@ -341,8 +341,14 @@ adding a liaison to an existing group.
 
 The launcher's advisory already does most of that arithmetic: `recommend_capacity`
 counts every reviewer-kind block, liaison included, so the **recommended** cap has
-the slot in it. `minimum` does not, and correctly — it budgets the merge gate's
-requirement, and a gate can never name a liaison.
+the slot in it. `minimum` depends on whether a gate is declared, and the
+distinction is worth stating rather than rounding off: it budgets
+`reviewers_needed`, which is the **gate's** requirement when a merge gate exists —
+and a gate can never name a liaison, so the slot is excluded — but falls back to
+the raw reviewer-kind count on a **gateless** roster, where it is therefore
+included. Both answers are defensible (a gateless roster has no smaller number to
+give), and neither changes the +1 guidance above, which is about the cap a human
+sets rather than about the advisory.
 
 What is left is a **noun**, not a number: `extra_tiers` can render the liaison's
 slot as "1 more reviewer". Settled here rather than deferred again: **no change.**

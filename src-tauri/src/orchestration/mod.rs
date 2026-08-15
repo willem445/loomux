@@ -4350,6 +4350,28 @@ impl Guardrails {
             .flatten()
     }
 
+    /// The refusal for "this class has no default block", naming the liaison
+    /// when [`liaison_shadowing`](Self::liaison_shadowing) is why (#891 S4).
+    ///
+    /// One function because there are two call sites that resolve a class to
+    /// its default and can come up empty — `spawn_agent_ex`, and `mcp.rs`'s
+    /// pre-#222 bare-resume path — and a message that told the author "your
+    /// workflow declares no reviewer block" while they are looking at
+    /// `kind: reviewer` in their own file is wrong at either of them. Written
+    /// once so the two cannot drift (#1072 review, N5).
+    pub fn no_default_block_message(&self, kind: Role) -> String {
+        match self.liaison_shadowing(kind) {
+            Some(l) => format!(
+                "this group's workflow declares no {} block that reviews — {:?} is \
+                 reviewer-kind but is the human-facing liaison, which records no verdict \
+                 and is never a class's default. Name a block explicitly to spawn it.",
+                kind.as_str(),
+                l.id
+            ),
+            None => format!("this group's workflow declares no {} block", kind.as_str()),
+        }
+    }
+
     /// The agent CLI a capability class's default block runs: the block's own
     /// `cli`, else the group default `agent_cli`. May return an unsupported
     /// value (a block CLI is not coerced in `clamped`); the spawn paths validate
@@ -5802,6 +5824,11 @@ pub fn single_pane_autopilot_flags(program: &str) -> String {
 /// loop lives in `start_idle_reaper`. `idle_since_ms` is `None` for an agent
 /// that currently has work (never idle-killed); a `threshold_min` of 0
 /// disables the guardrail entirely.
+///
+/// **This is the threshold, not the policy.** Who is eligible at all — the
+/// orchestrator is not, and since #891 S4 neither is a liaison block — is
+/// decided by `idle_reap_candidates` before it ever asks this function, so a
+/// `true` here does not mean "will be killed".
 pub fn idle_should_kill(idle_since_ms: Option<u64>, now_ms: u64, threshold_min: u32) -> bool {
     match (threshold_min, idle_since_ms) {
         (0, _) | (_, None) => false,
@@ -35067,7 +35094,7 @@ impl OrchRegistry {
                  still re-raise it once per **Monitoring open PRs** sweep. Only the pane you ask \
                  in moved.\n\
                  - **`{id}` presents a question; it is never the RECORD of one.** An agent pane \
-                 compacts, dies and gets idle-killed, so a question that must outlive this turn \
+                 compacts, wedges and dies, so a question that must outlive this turn \
                  belongs somewhere durable — the board task you mark `blocked`, and the question \
                  registry when you opened one with `ask_human` (whose `q-N` is worth sending the \
                  liaison, since `list_questions` is readable from its pane too). The two \
@@ -38771,23 +38798,15 @@ impl OrchRegistry {
                     group.guardrails.blocks.iter().map(|b| b.id.as_str()).collect();
                 format!("unknown block {id:?}. Blocks in this group: {}", known.join(", "))
             })?,
-            None => group.guardrails.block_for(role).cloned().ok_or_else(|| {
+            None => group
+                .guardrails
+                .block_for(role)
+                .cloned()
                 // #891 S4: "declares no reviewer block" is a lie when the roster
                 // declares exactly one and it is the liaison — the class
-                // resolution skipped it. Say which block was skipped and how to
-                // reach it, or the author reads a message about a block they can
-                // see in their own file.
-                match group.guardrails.liaison_shadowing(role) {
-                    Some(l) => format!(
-                        "this group's workflow declares no {} block that reviews — {:?} is \
-                         reviewer-kind but is the human-facing liaison, which records no verdict \
-                         and is never a class's default. Name a block explicitly to spawn it.",
-                        role.as_str(),
-                        l.id
-                    ),
-                    None => format!("this group's workflow declares no {} block", role.as_str()),
-                }
-            })?,
+                // resolution skipped it. The wording is shared with the
+                // bare-resume path in `mcp.rs`; see `no_default_block_message`.
+                .ok_or_else(|| group.guardrails.no_default_block_message(role))?,
         };
         // A workflow file must not be able to hand an agent a second
         // orchestrator: an orchestrator-kind spawn is exempt from the live-agent
@@ -44459,9 +44478,10 @@ impl OrchRegistry {
 }
 
 /// Background loop that enforces the idle-worker auto-kill guardrail: every
-/// `IDLE_REAP_INTERVAL` it kills any worker/reviewer whose idle time has
+/// `IDLE_REAP_INTERVAL` it kills each worker/reviewer whose idle time has
 /// crossed its group's `idle_kill_minutes` (groups with the guardrail off
-/// are skipped inside `reap_idle_agents`). Started once at app setup.
+/// are skipped inside `reap_idle_agents`, and so is a **liaison** block —
+/// `idle_reap_candidates` owns both exclusions). Started once at app setup.
 pub fn start_idle_reaper(reg: Arc<OrchRegistry>) {
     std::thread::spawn(move || loop {
         std::thread::sleep(IDLE_REAP_INTERVAL);
