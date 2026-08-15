@@ -394,6 +394,52 @@ loop (`t-1 → t-3 → t-2 → t-1`) — you'll see it in the board's toast, and
 is written. Deleting a task strips it from every remaining task's links in the
 same write, so a delete never leaves a dangling dependency behind.
 
+### Parent tasks and subtasks
+
+A task can sit *inside* another task — an Epic or Feature the orchestrator created to hang
+concrete slices under, following the same shape as Agile hierarchies (Epic → Feature → Story →
+Task). This is **containment**, and it's a different relationship from the **dependencies**
+above: a subtask's container says where it belongs on the board, a dependency says what must
+finish before it can start. A subtask of a container that's still `blocked` is not itself
+blocked by that — express ordering with a dependency, not by nesting.
+
+Each task can carry an advisory **kind** label — `epic`, `feature`, `story`, or `task` — set by
+the orchestrator to show the level a container sits at. It's a label only: nothing enforces that
+a `story` sits under a `feature` rather than straight under an `epic`, and a container is
+ordinary claimable work like any other task, not a special row.
+
+Two rules about nesting are backend behavior, live today regardless of which board UI you're
+running:
+
+- Deleting a container **promotes** its subtasks rather than deleting or orphaning them: they
+  move up to the nearest container still on the board (or to the top level, if the whole chain
+  above them was deleted in the same action). Nothing under a container you delete disappears
+  with it.
+- Nesting can run at most 4 levels deep; a write that would go deeper is refused with an error
+  explaining why, the same way an invalid dependency write is.
+
+Board controls for nesting (design shown here; the nesting UI (#1027) is currently in review, so
+treat the details below as what's coming rather than shipped — this caveat is owed to come out
+once #1027 merges):
+
+- A **⤵ nest** picker on a row lets you choose which other task it sits inside, or promote it
+  back to the top level.
+- Rows nest visually under their container, indented one step per level, with a **collapse
+  chevron** on any row that has subtasks — collapsing hides the whole subtree, not just its
+  direct children, so a grandchild is never left stranded above its own container.
+- A container shows a **done/total** chip counting its *direct* subtasks — the same count you'd
+  see if you asked the orchestrator for the board. A container whose entire subtree is done but
+  whose own status hasn't caught up gets a nudge badge — it's a prompt for you, never something
+  that flips the container's status on its own; only you or the orchestrator ever change a
+  task's status.
+- A subtask whose container was removed by hand-editing the board file, or that otherwise points
+  at nothing valid, renders at the top level with a broken-container marker rather than
+  vanishing — the nesting equivalent of the `⚠` missing-dependency chip above.
+
+Like dependencies, nesting is board metadata: it never affects whether a merge is allowed, and
+it doesn't change how `ready` is computed — a subtask of a blocked container can still be marked
+ready to start.
+
 ## Steering, attention, and audit
 
 These deserve their own detail — see:
