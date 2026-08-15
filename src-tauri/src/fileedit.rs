@@ -878,7 +878,8 @@ pub fn search_planned(
     cancelled: &dyn Fn() -> bool,
     on_batch: &mut dyn FnMut(Vec<Match>),
 ) -> Result<bool, String> {
-    safe_resolve(root, "")?;
+    // SCRATCH NEUTER (#925 red evidence, do not merge): the pre-fix ordering,
+    // with the root check left to `run_search` — which tests the query first.
     let enumeration = plan_enumeration(root, opts.include_ignored);
     run_search(root, query, opts, enumeration, cancelled, on_batch)
 }
