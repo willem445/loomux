@@ -1101,15 +1101,29 @@ pub(crate) fn newest_new_copilot_session(
 /// per session directory. Still one directory listing plus a bounded number
 /// of small reads — never a scan of every session's full content the way
 /// `list_sessions` pays for its title/role extraction.
+/// **The parse happens here, once, for both halves (#925).** The claude half
+/// interpolates the id into a file name (`{session_id}.jsonl`) and joins it onto
+/// each project directory, so an id that is not a single path component walks
+/// that join out of the projects root. Refusing reads as `Ok(None)` — the same
+/// answer this function already gives for an id no store has heard of, which is
+/// exactly what an unusable id is.
+///
+/// This site was found by `no_raw_identifier_is_interpolated_into_a_file_name`
+/// rather than by reading the code, which is the argument for having that scan:
+/// it is one `format!` in a different module from the digest arm everyone was
+/// looking at.
 pub fn find_session_cwd(source: &str, session_id: &str) -> Result<Option<String>, String> {
+    let Ok(session) = PathSegment::parse(session_id) else {
+        return Ok(None);
+    };
     if source == "copilot" {
         return match copilot_session_state_root() {
-            Some(root) => find_copilot_session_cwd(&root, session_id),
+            Some(root) => find_copilot_session_cwd(&root, &session),
             None => Ok(None),
         };
     }
     match claude_projects_root() {
-        Some(root) => find_claude_session_cwd(&root, session_id),
+        Some(root) => find_claude_session_cwd(&root, &session),
         None => Ok(None),
     }
 }
@@ -1154,12 +1168,14 @@ fn claude_projects_root() -> Option<PathBuf> {
 /// caller (`resolve_resume_cwd`) already has a tag for exactly that —
 /// `resume-workspace-missing`, since an empty string is never a real
 /// directory — rather than the misleading `resume-not-found`.
-fn find_claude_session_cwd(root: &Path, session_id: &str) -> Result<Option<String>, String> {
+fn find_claude_session_cwd(root: &Path, session_id: &PathSegment) -> Result<Option<String>, String> {
     if !root.exists() {
         return Ok(None); // no ~/.claude/projects yet — nothing recorded, not an error
     }
     let entries = fs::read_dir(root).map_err(|e| format!("cannot read {}: {e}", root.display()))?;
     for project in entries.flatten() {
+        // Takes a `PathSegment` (#925): this `format!` becomes a file name that
+        // is then joined onto a directory this process did not choose.
         let candidate = project.path().join(format!("{session_id}.jsonl"));
         if candidate.is_file() {
             let (_, cwd, _) = scan_claude_jsonl(&candidate);
@@ -1196,14 +1212,17 @@ pub fn set_copilot_session_state_root_for_test(root: Option<PathBuf>) {
 /// authoritative — see `scan_copilot`), so this matches on the PARSED id,
 /// not the directory name. Same `Ok(Some(""))` vs `Ok(None)` distinction as
 /// the claude half, for the same reason.
-fn find_copilot_session_cwd(root: &Path, session_id: &str) -> Result<Option<String>, String> {
+fn find_copilot_session_cwd(root: &Path, session_id: &PathSegment) -> Result<Option<String>, String> {
     if !root.exists() {
         return Ok(None);
     }
     let entries = fs::read_dir(root).map_err(|e| format!("cannot read {}: {e}", root.display()))?;
     for entry in entries.flatten() {
         if let Some(s) = read_copilot_session(&entry.path()) {
-            if s.id == session_id {
+            // Compared, never joined — this half matches on the PARSED id, not
+            // the directory name — but it takes the validated type anyway so
+            // the two halves cannot disagree about what a session id may be.
+            if s.id == session_id.as_str() {
                 return Ok(Some(s.cwd));
             }
         }
@@ -1707,10 +1726,17 @@ mod orch_signature_tests {
 mod resume_store_tests {
     use super::{
         find_claude_session_cwd, find_copilot_session_cwd, find_session_cwd,
-        set_claude_projects_root_for_test, set_copilot_session_state_root_for_test,
+        set_claude_projects_root_for_test, set_copilot_session_state_root_for_test, PathSegment,
     };
     use std::fs;
     use std::path::PathBuf;
+
+    /// The two store-lookup halves take a validated session id (#925). These
+    /// fixtures all use ids that are valid segments already, so this is a
+    /// spelling convenience, not a change of what they assert.
+    fn seg(s: &str) -> PathSegment {
+        PathSegment::parse(s).expect("test fixture ids must be valid segments")
+    }
 
     /// Per-test scratch dir under the OS temp root: std-based, no `tempfile`
     /// (deliberately, for this PR's new tests — matches the pattern
@@ -1738,7 +1764,7 @@ mod resume_store_tests {
             "{\"type\":\"user\",\"cwd\":\"C:\\\\Projects\\\\loomux-worktrees\\\\fix\\\\360-sessions-occlusion\",\"message\":{\"content\":\"hi\"}}\n",
         )
         .unwrap();
-        let found = find_claude_session_cwd(&root, id).unwrap();
+        let found = find_claude_session_cwd(&root, &seg(id)).unwrap();
         assert_eq!(
             found.as_deref(),
             Some("C:\\Projects\\loomux-worktrees\\fix\\360-sessions-occlusion"),
@@ -1751,14 +1777,14 @@ mod resume_store_tests {
     fn claude_session_not_in_store_is_none_not_an_error() {
         let root = scratch_dir("claude-missing");
         fs::create_dir_all(root.join("C--Projects-other")).unwrap();
-        assert_eq!(find_claude_session_cwd(&root, "nope-not-here").unwrap(), None);
+        assert_eq!(find_claude_session_cwd(&root, &seg("nope-not-here")).unwrap(), None);
         let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
     fn claude_missing_projects_root_is_none_not_an_error() {
         let root = scratch_dir("claude-no-root").join("does-not-exist");
-        assert_eq!(find_claude_session_cwd(&root, "any-id").unwrap(), None);
+        assert_eq!(find_claude_session_cwd(&root, &seg("any-id")).unwrap(), None);
     }
 
     #[test]
@@ -1769,7 +1795,7 @@ mod resume_store_tests {
         let root = scratch_dir("claude-unreadable");
         let not_a_dir = root.join("not-a-dir");
         fs::write(&not_a_dir, b"nope").unwrap();
-        assert!(find_claude_session_cwd(&not_a_dir, "any-id").is_err());
+        assert!(find_claude_session_cwd(&not_a_dir, &seg("any-id")).is_err());
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -1781,7 +1807,7 @@ mod resume_store_tests {
         let dir = root.join("some-unrelated-dirname");
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("workspace.yaml"), "id: abcd-1234\nname: work\ncwd: C:/work/x\n").unwrap();
-        let found = find_copilot_session_cwd(&root, "abcd-1234").unwrap();
+        let found = find_copilot_session_cwd(&root, &seg("abcd-1234")).unwrap();
         assert_eq!(found.as_deref(), Some("C:/work/x"));
         let _ = fs::remove_dir_all(&root);
     }
@@ -1789,8 +1815,63 @@ mod resume_store_tests {
     #[test]
     fn copilot_session_not_found_is_none() {
         let root = scratch_dir("copilot-missing");
-        assert_eq!(find_copilot_session_cwd(&root, "nope").unwrap(), None);
+        assert_eq!(find_copilot_session_cwd(&root, &seg("nope")).unwrap(), None);
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// **A session id must not walk the store lookup out of the projects root**
+    /// (#925).
+    ///
+    /// The claude half joins `{session_id}.jsonl` onto *each project directory*,
+    /// so a `..` in the id climbs out of the projects root entirely. This test
+    /// builds the escape rather than asserting a refusal in the abstract: the
+    /// decoy transcript is placed OUTSIDE the projects root, and reached by a
+    /// relative id, so before the fix the lookup found it and returned its
+    /// recorded cwd.
+    ///
+    /// A version of this test that only checked "a traversal id returns None"
+    /// would have been vacuous — a traversal id that resolves to nothing
+    /// returns `None` either way. The decoy is what makes the assertion mean
+    /// "did not reach", and the positive control below is what tells
+    /// "refused" apart from "this fixture never resolved anything".
+    #[test]
+    fn a_traversal_session_id_cannot_reach_a_transcript_outside_the_projects_root() {
+        let base = scratch_dir("claude-escape");
+        let projects = base.join("projects");
+        let proj = projects.join("C--some-project");
+        fs::create_dir_all(&proj).unwrap();
+
+        // The decoy, one level ABOVE the projects root.
+        fs::write(
+            base.join("outside.jsonl"),
+            "{\"type\":\"user\",\"cwd\":\"C:/ESCAPED\",\"message\":{\"content\":\"hi\"}}\n",
+        )
+        .unwrap();
+
+        set_claude_projects_root_for_test(Some(projects.clone()));
+
+        // `<projects>/C--some-project/../../outside.jsonl` == `<base>/outside.jsonl`.
+        assert_eq!(
+            find_session_cwd("claude", "../../outside").unwrap(),
+            None,
+            "a traversal session id must not resolve to a transcript outside the projects root"
+        );
+
+        // Positive control: an ordinary id in the same fixture DOES resolve, so
+        // the refusal above is containment rather than a dead lookup.
+        fs::write(
+            proj.join("real-session-1.jsonl"),
+            "{\"type\":\"user\",\"cwd\":\"C:/legit\",\"message\":{\"content\":\"hi\"}}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            find_session_cwd("claude", "real-session-1").unwrap().as_deref(),
+            Some("C:/legit"),
+            "a well-formed session id must still resolve normally"
+        );
+
+        set_claude_projects_root_for_test(None);
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -1805,7 +1886,7 @@ mod resume_store_tests {
         let id = "no-cwd-here";
         fs::write(proj.join(format!("{id}.jsonl")), "{\"type\":\"summary\",\"summary\":\"hi\"}\n").unwrap();
         assert_eq!(
-            find_claude_session_cwd(&root, id).unwrap(),
+            find_claude_session_cwd(&root, &seg(id)).unwrap(),
             Some(String::new()),
             "found the session, but it has no cwd — Some(\"\"), never None"
         );
@@ -1816,7 +1897,7 @@ mod resume_store_tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("workspace.yaml"), "id: no-cwd-copilot\nname: x\n").unwrap();
         assert_eq!(
-            find_copilot_session_cwd(&root2, "no-cwd-copilot").unwrap(),
+            find_copilot_session_cwd(&root2, &seg("no-cwd-copilot")).unwrap(),
             Some(String::new())
         );
         let _ = fs::remove_dir_all(&root2);
