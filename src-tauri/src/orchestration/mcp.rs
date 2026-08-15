@@ -934,6 +934,12 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                     note: arg_str(args, "note").map(str::to_string),
                     deps: arg_str_array(args, "deps")?,
                     related: arg_str_array(args, "related")?,
+                    // #958 — NOT THREADED YET: this literal is exhaustive, so
+                    // the fields have to be named here for the declarations to
+                    // compile at all. Hard-coded None is what keeps the shim
+                    // round-trip test red until the implementation lands.
+                    parent: None,
+                    kind: None,
                     claim,
                 },
             )?;

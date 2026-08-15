@@ -8524,6 +8524,24 @@ pub const MERGE_GATE_STATUSES: [&str; 2] = ["pr", "human-testing"];
 /// is **Proceed** (not the merge-gate approve/changes) — see `proceed_task`.
 pub const PROTOTYPE_STATUS: &str = "prototype";
 
+/// Agile levels for `Task::kind` (#958), kept as strings for the same reason
+/// `TASK_STATUSES` is — the wire/JSON form stays obvious — and validated on
+/// every write the same way.
+///
+/// The levels are ADVISORY: nothing enforces that a `story` sits under a
+/// `feature` rather than straight under an `epic`. Enforcement would buy no
+/// data integrity (every reader needs the tree, not ladder discipline), fight
+/// the dominant real shape (a feature plus its slices), and make reparenting
+/// and kind-less migrated rows harder — and it stays one write-time check to
+/// add later if the discipline is ever wanted, which is the cheap direction.
+pub const TASK_KINDS: [&str; 4] = ["epic", "feature", "story", "task"];
+
+/// How deep the container chain may run (#958) — the epic → feature → story →
+/// task ceiling. A hard cap where the levels themselves are advisory, because
+/// this is what bounds every rollup and render walk over the tree; without it
+/// a hand-built chain could make an O(depth) walk arbitrarily expensive.
+pub const MAX_TASK_DEPTH: usize = 4;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TaskNote {
     pub ts_ms: u64,
@@ -8588,6 +8606,39 @@ pub struct Task {
     /// dependency cycle is always a bug.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub related: Vec<String>,
+    /// The id of the task this one sits INSIDE (#958) — containment, where
+    /// `deps` is ordering. Orthogonal on purpose: a dep may cross subtrees or
+    /// link two containers, and none of the #582 link machinery consults this.
+    ///
+    /// Stored on the pointing side only (no `children` array), the way a dep
+    /// edge is: two sources of truth would mean two delete-strip bookkeepings.
+    /// Validated on write like a link id — names a live task, never itself,
+    /// never closing a cycle, never deeper than `MAX_TASK_DEPTH` — and when the
+    /// container is deleted its children are PROMOTED to the nearest surviving
+    /// ancestor in the same locked write, so "a parent names a live task" holds
+    /// without a repair pass.
+    ///
+    /// Reading is deliberately TOLERANT where writing is strict: a hand-edited
+    /// orphan or over-deep pointer blocks nothing and renders flat at top
+    /// level. Unlike an unknown dep — which reads as unmet because deps gate
+    /// readiness — an unknown container is display-only, so tolerate-and-show
+    /// is the safe failure direction.
+    ///
+    /// **DISPLAY AND QUEUE-HINT METADATA ONLY — NOTHING MAY GATE ON IT**, the
+    /// `pr_base` argument above applied to hierarchy: the board is
+    /// agent-writable, so a check that trusted this would be a check the thing
+    /// being checked gets to answer.
+    ///
+    /// Additive and skipped when absent: a pre-#958 `tasks.json` loads with no
+    /// hierarchy, and a board that uses none rewrites without gaining the key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    /// Advisory Agile level — one of `TASK_KINDS` (#958), absent meaning "a
+    /// plain task", which is what every row written before this existed is.
+    /// Same additive/skipped-when-absent contract as `parent`, and the same
+    /// metadata-only stance: it labels a row, it never authorizes anything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
     #[serde(default)]
     pub updated_ms: u64,
 }
@@ -8622,11 +8673,39 @@ pub struct TaskSummary {
     pub deps: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub related: Vec<String>,
+    /// This row's container and advisory level (#958), skipped when absent so
+    /// a board with no hierarchy pays nothing for the fields — the same
+    /// pay-for-what-you-use rule the link arrays follow.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// DIRECT children of this row, and how many of them are `done` (#958) —
+    /// derived at read time in `board_summaries`, never stored. Counts ONLY,
+    /// and only one level: a nested child list is exactly the expansion #245
+    /// exists to prevent, and the tree itself is one client-side pass over
+    /// `parent` on a board `list_tasks` already returned whole. Skipped when
+    /// zero, so a leaf row carries neither key.
+    #[serde(skip_serializing_if = "count_is_zero")]
+    pub children: usize,
+    #[serde(skip_serializing_if = "count_is_zero")]
+    pub children_done: usize,
     /// Derived at read time, never stored and never written back into
     /// `status` (#582): `queued` with every dep `done`. One `list_tasks` call
     /// therefore answers "what is startable right now" without the
     /// orchestrator re-deriving it from prose after a compact.
+    ///
+    /// Hierarchy does NOT participate in v1 (#958): a child of a `blocked`
+    /// container is still ready. Folding ancestors in is a semantics decision
+    /// the human has to make, so it is left visible-but-unenforced rather than
+    /// quietly changing what every existing board means.
     pub ready: bool,
+}
+
+/// `skip_serializing_if` for the derived child counts (#958) — a row with no
+/// children omits the keys entirely, the way an empty link array does.
+fn count_is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 /// The only status that satisfies a dependency edge (#582). Merged/accepted is
@@ -8678,6 +8757,12 @@ pub fn task_summary(t: &Task, ready: bool) -> TaskSummary {
         note_count: t.notes.len(),
         deps: t.deps.clone(),
         related: t.related.clone(),
+        // #958 — NOT WIRED YET (this commit declares the shape the tests pin;
+        // the projection and the counts land with the implementation).
+        parent: None,
+        kind: None,
+        children: 0,
+        children_done: 0,
         ready,
     }
 }
@@ -8940,6 +9025,15 @@ pub struct TaskPatch {
     pub deps: Option<Vec<String>>,
     /// Non-blocking links (#582); same replace-or-untouched rule as `deps`.
     pub related: Option<Vec<String>>,
+    /// This task's container (#958). `None` leaves it untouched; an EMPTY
+    /// string clears it (promoting the row to top level) — the `pr` rule, so
+    /// "no longer inside anything" is expressible without hand-editing the
+    /// board. Any other value is validated against the whole board before
+    /// anything is written.
+    pub parent: Option<String>,
+    /// Advisory Agile level (#958) — one of `TASK_KINDS`, with the same
+    /// untouched/empty-clears rule as `parent`.
+    pub kind: Option<String>,
     /// Atomic claim (#582): guard this write on the task still being
     /// unclaimed, `queued`, and dep-satisfied, then set assignee + status in
     /// the same locked write. A plain (non-claim) upsert keeps its historic
@@ -23843,6 +23937,8 @@ impl OrchRegistry {
                     notes: vec![],
                     deps: vec![],
                     related: vec![],
+                    parent: None,
+                    kind: None,
                     updated_ms: 0,
                 });
                 tasks.len() - 1
