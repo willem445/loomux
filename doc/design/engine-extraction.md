@@ -1563,6 +1563,38 @@ from a unit test of product code, agents are banned from running cargo locally
   A CI step proves that from `cargo tree` rather than from this paragraph. This
   is the scoped subset of #847's Phase 3 the daemon needs, **not** the full
   `mod.rs` split.
+  - **Batch 13 — `winpath`** (#78/#335/#509), taken first as the smallest safe
+    A4 increment: the registry-merged fresh-PATH resolver and the
+    `which`-style program/`sh`/coreutils resolution "open in editor" and
+    direct-CLI pane spawn share. Planned as
+    `src-tauri/src/orchestration/winpath.rs`, std-only. Both wrong: the file
+    is `src-tauri/src/winpath.rs`, a top-level module never under
+    `orchestration/`, and `fresh_path` has an inline
+    `use winreg::{RegKey, enums::…}` gated behind
+    `#[cfg(target_os = "windows")]` — invisible to a top-of-file `use`-line
+    grep. The generalizable finding sits beside batch 7's `env!` one: **a
+    cfg-gated `use` inside a function body is an edge too**, and neither the
+    file's header prose nor its top-level imports show it.
+
+    So the batch takes the dependency rather than splitting the file:
+    `winreg` joins the engine manifest under a target-gated
+    `[target.'cfg(windows)'.dependencies]` table mirroring
+    `src-tauri/Cargo.toml`'s identical section, same `0.55`. Clear under both
+    manifest-header bans — already a direct `src-tauri` dependency and already
+    in `Cargo.lock`, so no new package joins it, and `winreg` 0.55's own chain
+    is `cfg-if` + `windows-sys`, no `getrandom` by any path. `winpath` is
+    used throughout `orchestration/mod.rs` (`resolve_program`, `launch_path`,
+    `resolve_sh`, `resolve_utils_dir`, `to_msys_dir`), so the engine is its
+    correct home regardless of the std-only premise being wrong.
+
+    Otherwise a pure relocation, exemption taken whole: no logic line changed,
+    every item was already `pub` so nothing widened, and the moved inline
+    `#[cfg(test)]` tests are engine unit tests now. `mod winpath;` in
+    `src-tauri/src/lib.rs` becomes `pub use loomux_engine::winpath;` — the
+    whole module, not a local shim file, since (unlike `obs` in batch 7)
+    nothing Tauri-shaped stays behind. `src-tauri/tests/` is untouched, which
+    is the proof the re-export is complete rather than a claim about it.
+    `OrchRegistry` itself is still ahead.
 
 They are serial because each rides the previous one's re-exports, and because
 `src-tauri/src/orchestration/mod.rs` is the highest-conflict file in the repo:
