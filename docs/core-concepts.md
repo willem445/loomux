@@ -233,6 +233,39 @@ rather than levelling it back out.
 so the smallest pane gains the most. Close one of five equal panes and the other
 four are four equal panes again.
 
+### Autosize
+
+Layouts still drift, even with the even-share splits above, and there are two
+reasons rather than one.
+
+**Nesting.** An even share is even *within one row or column*. Split *down*
+inside a pane of a row and that pane's slot becomes a stacked pair: the row is
+now even between the panes beside it and the **pair**, so those come out as a
+half and two quarters rather than three thirds. An orchestrator opening a pane
+per agent nests the same way, which is how a tab ends up with one big pane and a
+row of slivers. **And dividers you dragged stay dragged** — deliberately, since
+a position you chose is not drift.
+
+**Autosize** (`Ctrl+Shift+A`, or the `▦` button in the top bar) gives every pane
+in the tab an equal share of the space, in one press — *across* nesting levels,
+which is the part a split's own arithmetic cannot do for you. That half and two
+quarters becomes three equal thirds.
+
+It happens only when you ask. A split or a close re-shares the row it happened
+in — that is the even-share behaviour above — but nothing levels the whole tab
+behind your back, and a divider you positioned deliberately stays where you put
+it until you press Autosize. Pressing it twice does nothing the second time, and
+the evened-out layout is what a restored session comes back to.
+
+If a pane is maximized, Autosize **drops you out of fullscreen first** — unlike
+a background pane joining the grid, which deliberately leaves fullscreen alone.
+Evening out a grid you cannot see would look like the button did nothing.
+
+Two things it can't do: panes have a minimum size, so a tab holding more panes
+than fit at that minimum can't have them all equal; and panes end up with equal
+*area*, not identical shapes — Autosize re-sizes the grid you have, it never
+rearranges which panes sit beside which.
+
 ### Rearranging without re-splitting
 
 Panes get cramped fast once an orchestrator opens one per agent, so the grid can
@@ -384,6 +417,7 @@ this table mirrors it.
 | Move focus | `Alt+←/→/↑/↓` (or click) |
 | Resize panes | drag the divider between them |
 | Reorder / move panes | drag a pane by its header |
+| Autosize panes | `Ctrl+Shift+A` (or ▦ in the top bar) |
 | Maximize pane | `Ctrl+Shift+M` (or ⤢); same keys restore |
 | Minimize pane | `Alt+M` (or —); restore from the dock |
 | Session browser | `Ctrl+Shift+P` (or the *sessions* button) |

@@ -24,6 +24,7 @@ import { planGroupMinimize } from "./group";
 import { shouldFocusNewPane, shouldRestoreFocus, shouldPreserveMaximize } from "./panefocus";
 import { startDragSession } from "./dragsession";
 import { planEvenInsert, planRemoval, readGrow } from "./paneequalize";
+import { equalizeWeights, type SplitShape } from "./paneautosize";
 
 type Dir = "row" | "column";
 
@@ -330,6 +331,58 @@ export class Grid {
       }
     };
     walk(this.root, weights);
+  }
+
+  /** Autosize (#936): give every pane in this tab an equal share of the space,
+   *  on demand. The human's answer to a layout that has drifted — a nested
+   *  staircase from the agent fan-out, a row where one pane ended up holding
+   *  most of the width — without having to drag each divider back by hand.
+   *
+   *  What it adds over the even-share split policy (#945, `paneequalize.ts`):
+   *  that policy keeps a row even WITHIN one split — a newcomer at the mean, a
+   *  closing pane's weight shared out in equal absolute parts — and each of its
+   *  operations touches only the row it happened in. Equality across NESTING is
+   *  a different property: a pane beside a stacked pair is a half and two
+   *  quarters however even each split is on its own, because a pane's size is
+   *  the product of its share at every level. That product is what this levels,
+   *  and it is why the gesture is not made redundant by #945.
+   *
+   *  On demand is the whole design: nothing levels the tab by itself, and a
+   *  divider the human dragged stays where they put it until they ask. It is
+   *  also indifferent to which policy a split gesture ends up with (#900's
+   *  halve or #945's even share) — it reads the tree's SHAPE, never its
+   *  weights.
+   *
+   *  The weights come from the pure `equalizeWeights` — each node weighted by
+   *  the number of panes under it, which is what makes the LEAVES equal rather
+   *  than each split's children (see paneautosize.ts). Applied through the same
+   *  `applyLayoutWeights` a session restore uses, so there is one place that
+   *  writes a whole tree's weights.
+   *
+   *  Fullscreen exits first: autosize is a request to see the layout, and
+   *  silently re-weighting a tree the human cannot see (with one pane covering
+   *  it) would look like the button did nothing.
+   *
+   *  Constraint 1: a discrete, human-initiated layout operation, the same class
+   *  as a split or a divider drag — one resize for each pane whose size actually
+   *  changes, and `shouldResizePty` (panefit.ts) drops the ones whose `cols x
+   *  rows` did not move. Nothing continuous, nothing chrome-driven. Docked panes
+   *  are untouched: they are outside the tree and hold no space to even out. */
+  autosize(): void {
+    if (!this.root) return;
+    if (this.maximized) this.exitMaximize();
+    // Hand the module the SHAPE and nothing else — no panes, no elements. It is
+    // a parallel tree of empty objects, a few dozen at the very most, and it is
+    // what keeps `paneautosize.ts` honestly DOM-free rather than DOM-free by
+    // convention. (Passing the live nodes would also trip TS's weak-type check:
+    // `SplitShape`'s only field is optional, so a LeafNode shares no property
+    // with it.)
+    const shape = (n: TreeNode): SplitShape =>
+      n.kind === "leaf" ? {} : { children: n.children.map(shape) };
+    this.applyLayoutWeights(equalizeWeights(shape(this.root)));
+    // The new weights are what a restore must reproduce (#194 P4) — persist
+    // them, exactly as a finished divider drag does.
+    this.onChange();
   }
 
   /** Insert a freshly-constructed pane's leaf into the tree and settle focus.
