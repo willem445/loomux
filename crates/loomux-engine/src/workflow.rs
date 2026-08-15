@@ -1241,26 +1241,6 @@ pub fn role_hint_requires(hint: &str) -> Option<Role> {
     }
 }
 
-/// Does this block actually REVIEW PRs? — reviewer-kind, minus the liaison
-/// (#891).
-///
-/// `kind == Reviewer` answers "which capability class does it ride", which is
-/// not the same question once a hint subtracts from its class: a liaison rides
-/// the reviewer posture and reviews nothing, is denied `review_verdict`, and
-/// cannot be named by a merge gate (`parse_workflow` refuses that outright).
-/// Every place that means "the blocks a PR is fanned out to" — the
-/// orchestrator's `{{REVIEWERS}}` list, a reviewer's "you are one of N" lane —
-/// asks THIS, so both surfaces answer the same way; asking `kind` there sends a
-/// PR to a pane that can neither record a verdict nor satisfy the gate it was
-/// spawned for.
-///
-/// Not used for the *capacity* advisories (`recommend_capacity`/`extra_tiers`),
-/// which count live panes and are right to count a liaison as one — see
-/// `doc/design/liaison.md`.
-pub fn is_reviewing_block(b: &Block) -> bool {
-    b.kind == Role::Reviewer && b.role_hint.as_deref() != Some("liaison")
-}
-
 /// The role hints a workflow file may name, for error messages.
 pub fn role_hint_names() -> String {
     "advisor, process, liaison".to_string()
