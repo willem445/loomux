@@ -174,7 +174,10 @@ test("every build-output path agrees on the workspace-root target/", () => {
   // broke: the dev-server watch-ignore must exclude it, or a fresh `tauri dev` races cargo
   // writing a build script and dies with EBUSY (#989). The stale `**/src-tauri/**`-only
   // ignore did not match the root target/ — exactly the silent drift this test exists to catch.
-  const vite = repoFile("vite.config.ts");
+  // Strip line comments before matching, so a commented-out config can't satisfy the
+  // pin — the same discipline the LOOMUX_E2E_EXE/DEFAULT_EXE assertions above already use
+  // by scoping to the live assignment line rather than the whole file (#989 review).
+  const vite = repoFile("vite.config.ts").replace(/^[ \t]*\/\/.*$/gm, "");
   const viteIgnored = vite.match(/ignored:\s*\[([\s\S]*?)\]/);
   assert.ok(viteIgnored, "vite.config.ts must set server.watch.ignored");
   assert.match(
