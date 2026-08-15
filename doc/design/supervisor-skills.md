@@ -99,13 +99,60 @@ so the consent moment can name it.
   not instruction-backed. An advisor block interjects advice; it can never
   merge, spawn, or record a verdict, whatever its persona says.
 - **The process-pro proposes, never disposes.** Worker-kind means the `gh`
-  shim refuses `gh pr merge` from that pane; it opens a PR and stops, riding
-  the same human merge gate every other worker does.
+  shim refuses `gh pr merge` from that pane; it opens a PR and stops. What
+  disposes of that PR is the **orchestrator**, not the human: process-pro PRs
+  are a standing-authorized merge class, reviewed and then merged or closed by
+  the orchestrator itself (#1021). See *Who disposes of a process-pro PR*
+  below for the bar that still applies and what the authorization does not
+  buy.
 - **The toggle already exists.** `Guardrails.advanced_orchestrator` gates
   whether a repo's `.loomux/workflow.yml` blocks run at all; a role-hinted
   block exists only when that toggle is on for the launch *and* the repo
   declares it. The launcher roster preview is the consent moment — no new
   global switch.
+
+### Who disposes of a process-pro PR (#1021)
+
+The process-pro opens a PR and stops — that has never changed. What changed is
+**who closes it out**: the orchestrator, not the human. Process-pro PRs are a
+**standing-authorized merge class**, so the orchestrator reviews one and then
+merges or closes it itself instead of parking it in the human's merge queue.
+
+The argument is that a learning loop whose every output is one more PR for the
+human to read costs more attention than the lessons are worth, and stops
+running the week the human gets busy. A loop nobody closes out is a loop that
+has stopped.
+
+**What the authorization does not buy.** Only the disposition owner changes.
+The bar is the group's ordinary one — the reviewer's pass, green CI, findings
+dispositioned — and the open-question hold covers the *close* as well as the
+merge. It is explicitly not a licence against the `gh` interceptor: in a group
+that is neither autonomous nor in supervised dangerous mode the host gate still
+refuses an orchestrator merge to the default branch, and routing around that
+refusal stays forbidden. Making "never deferred to the human" hold in that case
+too is an open mechanism question, not something this shipped.
+
+**Why it is not `role_hint` growing a capability.** The authorization is
+*prose*, rendered into the orchestrator's own instructions; it grants the
+process-pro block nothing (that pane's `gh pr merge` is refused exactly as
+before). The hint still only *selects* from loomux's closed set — the meaning
+of the selection is fixed in loomux's code, which is why a repo declaring
+`role_hint: process` cannot author a new authorization, only opt into the one
+loomux defines. The capability table in `doc/design/liaison.md` is unaffected:
+it enumerates MCP-tool effects, and this is not one.
+
+**The residual, stated where the next decision will read it.** Under this
+change `.loomux/lessons.md` — inlined into every future agent's kickoff — can
+be authored, reviewed and merged without a human in the path. That is a real
+loosening of the trust posture *Who may write* in `doc/design/lessons.md`
+leaned on, and it is deliberate. What backstops it instead: the recurrence
+evidence is derived on read rather than self-reported (an agent cannot
+manufacture its own corroboration — see *Deviation: derived-on-read*), every
+such merge is audit-announced and recorded on its board task, the 4 KB kickoff
+injection bounds the blast radius of a bad entry, and a lesson the human
+disagrees with is one curation PR from gone. If that trade ever stops holding,
+the lever is to drop the class from the standing authorization — not to add an
+`append_lesson` tool, which `lessons.md` rules out on separate grounds.
 
 ## Personas + template fragments (slice C)
 
@@ -120,7 +167,7 @@ per the module docs in `profiles.rs`):
   B's internals), filters findings through "would a fresh worker on a
   different task hit the same wall?", and categorizes each durable learning
   into the four destinations from the table below. Opens a normal PR and
-  stops — the same human merge gate as any other worker.
+  stops; the orchestrator dispositions it (#1021).
 
 Neither file is loaded automatically by `role_hint` — a block still opts in
 via `profile: .github/agents/advisor.md` in `workflow.yml`, exactly like any
@@ -131,9 +178,10 @@ file (if any) a block uses*:
    replace` persona always gets now carries a role_hint-keyed addendum: an
    advisor-hinted planner still hears "you hold NO authority… you never
    merge, spawn, or record a verdict" even if its own replace persona forgot
-   to say so; a process-hinted worker still hears "that PR rides the same
-   human merge gate… you never merge it." Mirrors how the reviewer's verdict
-   duty already rides in the core so a replace persona can't drop it.
+   to say so; a process-hinted worker still hears "You open it and stop — you
+   never merge it… What closes it out is the ORCHESTRATOR, not the human."
+   Mirrors how the reviewer's verdict duty already rides in the core so a
+   replace persona can't drop it.
 2. **`ADVISOR_NOTE` / `PROCESS_NOTE`** (`templates/workflow.md`, rendered into
    the orchestrator's `{{WORKFLOW}}`) — line-final fragments, present only
    when the roster declares the matching `role_hint`, teaching the
@@ -440,7 +488,8 @@ Why derived-on-read won:
    now.
 3. **The eager/deliberate split the sketch buys is already there.** Extraction
    *is* eager and local — it happens on every `session_digest` call. Promotion
-   *is* deliberate — it is the human merge gate on the process-pro's PR. The
+   *is* deliberate — it is the review-and-disposition step on the process-pro's
+   PR, which the orchestrator owns rather than the human (#1021). The
    sketch's two phases map onto machinery that already exists; the ledger was
    the sketch's way of getting the recurrence *count* between them, and that
    count is exactly what is now computed directly.

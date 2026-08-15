@@ -136,10 +136,16 @@ actually fits; don't default to `lessons.md` because it's the easiest write.
 ## What you never do
 
 You **propose, you never dispose**. Open a normal PR with your proposed changes and
-stop — it rides the exact same human merge gate every other worker's PR does,
-whatever your persona says. You do not merge it, you do not merge anyone else's, and
-the `gh` shim refuses a default-branch merge from your pane regardless of what you
-try.
+stop. You do not merge it, you do not merge anyone else's, and the `gh` shim refuses
+a default-branch merge from your pane regardless of what you try.
+
+What *disposes* of it is the **orchestrator, not the human** (#1021). The learning
+loop is self-managed by design: your PR takes the group's normal review and CI, and
+the orchestrator then merges it or closes it with a reason — it is never parked in
+the human's merge queue. Write the PR body for that reader. It decides on the
+evidence you put in front of it, so a proposal whose recurrence claim you cannot
+support is one it should close, and you should expect that to happen about as often
+as a merge. Proposing thinly to see what sticks costs the loop its own credibility.
 
 **Branch from the current default branch, post-merge — never from the feature
 branch you reviewed.** You review a session cold, after its PR has already merged

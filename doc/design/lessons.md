@@ -32,15 +32,36 @@ The brief asks this to be weighed on three axes:
   Forcing structure on "don't touch X, here's why" would fight the content,
   not help it.
 - **Who may write.** A convention file's write path is "open a PR" — gated by
-  branch protection and the human merge gate (orchestrator invariant #1:
-  "never merge to the default branch unless a gate opened for you"), the same
-  boundary every other change in this repo crosses. An `append_lesson` tool
-  would need its *own* authz story (orchestrator only? workers via report?)
-  layered in front of an identical git write — a redundant boundary bolted
-  onto one that already exists and is already trusted. It would also dodge
-  the merge gate: an in-process tool call can land text in the file with no
-  review at all, which is a strictly worse trust posture than "goes through a
-  PR like everything else."
+  branch protection and orchestrator invariant #1 ("never merge to the default
+  branch unless a gate opened for you"), the same boundary every other change
+  in this repo crosses. An `append_lesson` tool would need its *own* authz
+  story (orchestrator only? workers via report?) layered in front of an
+  identical git write — a redundant boundary bolted onto one that already
+  exists and is already trusted. It would also dodge review entirely: an
+  in-process tool call can land text in the file with no review at all, which
+  is a strictly worse trust posture than "goes through a PR like everything
+  else."
+
+  **This argument no longer rests on a *human* being in that path, and saying
+  so is the point** (#1021). A process-pro's proposed-lesson PR is a
+  standing-authorized merge class: the orchestrator reviews it and then merges
+  or closes it itself. So for the commonest writer of this file, the boundary
+  is now agent-authored → agent-reviewed → agent-merged, with no human
+  required.
+
+  That does **not** revive `append_lesson`, and the reason is the half of the
+  argument above that never depended on who holds the gate: a PR is a
+  *reviewed, audited, revertable* write, and a tool call is none of those. What
+  the standing authorization removes is the human's attention, not the review,
+  the audit trail, or `git revert`. An `append_lesson` tool would still be a
+  second write path with a weaker posture than the one already here.
+
+  What the change does cost is the human backstop on content that reaches every
+  future kickoff, and that residual is argued where the mechanism lives —
+  `doc/design/supervisor-skills.md` → *Who disposes of a process-pro PR*. If
+  the trade stops holding, the lever is to drop the class from the standing
+  authorization, restoring the human gate on exactly these PRs; it is not to
+  build the tool this section rejects.
 
 Net: the convention path gets a stronger audit trail, no format tax, and a
 write boundary already enforced elsewhere, for zero new code surface. Building

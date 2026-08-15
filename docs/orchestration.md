@@ -1011,11 +1011,26 @@ restoring them).
 A workflow can declare a **process-pro** block — a worker that runs after a
 PR merges, reads that session's record cold, and opens a normal PR proposing
 a durable lesson (an entry in `.loomux/lessons.md`, a `.claude/skills/` entry,
-a `CLAUDE.md` rule). Like every other agent it proposes and stops: you review
-and merge, or you don't.
+a `CLAUDE.md` rule). Like every other agent it proposes and stops; it never
+merges anything, its own PR included.
 
-The thing worth knowing when one of those PRs lands in front of you is what
-it is allowed to claim. Anything the process-pro writes into those files is
+**Unlike every other agent's PR, though, this one does not come to you.** The
+learning loop is meant to be self-managed, so a process-pro PR is *orchestrator-
+owned*: the orchestrator reviews it and then merges or closes it itself, rather
+than parking it in your merge queue. That is deliberate — a loop whose whole
+output is "here is another PR for the human to read" costs you more attention
+than the lessons are worth, and stops running the week you get busy. The bar it
+merges on is the ordinary one, not a lower one: the group's review passed, CI
+green, findings settled. Only the *owner of the decision* changes.
+
+Two things that follow. Closing is a normal outcome — most sessions produce no
+durable lesson, and an orchestrator that merges every proposal is not filtering.
+And you are not out of the loop: each merge is audit-announced and recorded on
+its board task, so the lessons that landed while you were elsewhere are there to
+read back, and a lesson you disagree with is a curation PR away from being gone.
+
+The thing worth knowing when you *do* read one is what it is allowed to claim.
+Anything the process-pro writes into those files is
 inlined into every future session's context, so a wrong or trivial lesson is
 a cost you keep paying — which makes "was this actually a recurring problem,
 or did one agent have one bad afternoon?" the question the review turns on.
@@ -1026,8 +1041,10 @@ how many *other* sessions in the group hit the same wall, and which ones.
 So a proposal should read like *"three sessions hit this — `w-2`, `w-7`,
 `w-9`"*, and you can go look at those sessions. A proposal from a wall only
 one session ever hit is supposed to say so and argue why it will recur anyway
-(a documented rule somebody missed, say) — if it doesn't, that is your cue to
-push back rather than merge a lesson built on one bad afternoon.
+(a documented rule somebody missed, say) — if it doesn't, that is the cue to
+close it rather than merge a lesson built on one bad afternoon. The orchestrator
+is the one holding that cue on a normal run; it is also what you check for if
+you go back over what the loop merged.
 
 Two caveats the proposal should carry when they apply, because they change
 what the number is worth: a brand-new group has no earlier sessions to
