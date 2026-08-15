@@ -1,13 +1,14 @@
-// A detection reply refreshes every surface it invalidates — on BOTH hosts
-// (#993, #997 review blocking 1).
+// A detection reply refreshes every surface it invalidates — on BOTH hosts, by
+// BOTH routes (#993, #997 review blocking 1, reshaped by #1020).
 //
-// STRUCTURAL, and read off the source tree on purpose. `detect` is a DOM-wiring
-// path, and this repo validates DOM wiring by hand rather than by simulating a
-// DOM (CLAUDE.md, code conventions) — so the thing that went wrong here cannot
-// be reached by a behavioural test at all. What went wrong was a *missing call*:
-// the workflow block editor repainted the model dropdown and nothing else, while
-// its sibling reply handler four hundred lines up re-ran the analysis pass and
-// repainted the knob rows. The data was fresh the whole time; the DOM was stale.
+// STRUCTURAL, and read off the source tree on purpose. This is DOM-wiring, and
+// this repo validates DOM wiring by hand rather than by simulating a DOM
+// (CLAUDE.md, code conventions) — so the thing that went wrong here cannot be
+// reached by a behavioural test at all. What went wrong was a *missing call*:
+// the workflow block editor repainted the model dropdown and nothing else,
+// while its sibling reply handler four hundred lines up re-ran the analysis pass
+// and repainted the knob rows. The data was fresh the whole time; the DOM was
+// stale.
 //
 // The failure that produces is not cosmetic. `knobLookup` answers differently
 // once a reply lands, so the Thinking-level row goes on offering `xhigh` for a
@@ -15,6 +16,18 @@
 // mutation re-renders the row disabled, and the findings pane flags the block.
 // The editor offered a value its own validator rejects, which is the exact thing
 // `workflowview.ts`'s own comment claims cannot happen.
+//
+// **What #1020 changed about the subject, and what it did not.** The reply used
+// to arrive from an `onDetect:` button hook; the button is gone, and a reply now
+// arrives on two routes instead — the LOOKUP a picker fires when it paints, and
+// the PUSH from the backend's startup sweep (`modelCatalog.onReport`). The
+// refresh each one owes is identical, so each host funnels both into ONE
+// method, and this file's job moved accordingly: it pins that the funnel exists,
+// that it does the work, and that the routes reach it.
+//
+// It also pins something the button architecture did not need: the lookup fires
+// from a RENDER path, and its own refresh ends in a re-render, so an unguarded
+// handler is an infinite loop rather than a stale row. See the re-entry test.
 //
 // So this is a source scan, in the tradition of `transport.test.ts`'s
 // one-module-imports-@tauri-apps rule and `tests/groupid.rs`'s two scans: the
@@ -28,32 +41,33 @@
 //
 //   - It asserts REACHABILITY BY NAME, not behaviour. A handler that calls
 //     `renderFindings()` on a path that never runs still passes.
-//   - **NOTHING in this file is a behaviour test, including the two
+//   - **NOTHING in this file is a behaviour test, including the
 //     `runWhenNotEditing` pins at the bottom.** Those are source scans of a
-//     second file, one level down. An earlier version of this header said the
-//     opposite — that `runWhenNotEditing` was "pinned on behaviour" — and it was
-//     never true (#997 review B-1). A behaviour pin genuinely is not available:
+//     second file, one level down. A behaviour pin genuinely is not available:
 //     the method reads `document.activeElement` and attaches a listener, and
 //     this repo forbids simulating a DOM (CLAUDE.md), so whether a deferral
-//     actually defers is hand-validated like the rest of the DOM wiring.
+//     actually defers is hand-validated like the rest of the DOM wiring. An
+//     earlier version of this header said the opposite and it was never true
+//     (#997 review B-1).
 //   - It reads the SOURCE, not the module graph, so a refresher reached through
 //     an indirection it cannot see reads as absent. That is the safe direction:
 //     it under-recognises rather than over-claiming — but only because FULL-LINE
 //     comments are stripped first. A trailing comment after code is NOT
 //     stripped and could still satisfy an assertion; that is an accepted
-//     residual (stripping those safely needs a tokenizer, not a regex), with no
-//     live instance in either handler today (#997 review R4-2). Before this
-//     scan stripped anything, prose in a full-line comment satisfied the
-//     assertions too, which made this exact sentence false outright
+//     residual (stripping those safely needs a tokenizer, not a regex).
+//     Before this scan stripped anything, prose in a full-line comment satisfied
+//     the assertions too, which made this exact sentence false outright
 //     (#997 review B-2). See `stripComments`.
-//   - It assumes each `onDetect:` is an arrow function and asserts so, rather
-//     than silently scanning past a shape it does not understand.
+//   - The re-entry guard is checked in a WINDOW of source before the call, not
+//     by parsing the enclosing `if`. A guard written far above its call, or
+//     spelled through a helper, reads as absent. Safe direction again, and the
+//     window is generous enough for a comment-free rewrite.
 //
-// It covers EVERY `onDetect:` in each file, not just the first (#997 review
-// NB-4). There is one per host today, so first-only was sound as written — which
-// is exactly why it was worth fixing: a second picker would have gone unchecked
-// while the suite stayed green, and a scan that silently covers a subset is
-// worse than no scan, because it reads as coverage.
+// It covers EVERY call site in each file, not just the first (#997 review
+// NB-4). There is one per host today, so first-only would be sound as written —
+// which is exactly why it is worth not doing: a second picker would go
+// unchecked while the suite stayed green, and a scan that silently covers a
+// subset is worse than no scan, because it reads as coverage.
 //
 // The vacuity guards below are load-bearing, not decoration: they fail if the
 // region this thinks it is scanning stops being one. They caught two bugs in the
@@ -96,213 +110,294 @@ const src = (file: string): string =>
  *  used in this very file's own comments), so the call-shape assertions do not
  *  save it. That is an accepted residual: stripping a trailing comment safely
  *  needs a tokenizer (a bare regex would mangle a `"https://…"` string
- *  literal), the full-line form is the repo's existing discipline, and neither
- *  `onDetect` handler contains a trailing comment today (#997 review R4-2). */
+ *  literal), and the full-line form is the repo's existing discipline. */
 const stripComments = (text: string): string => text.replace(/^[ \t]*\/\/.*$/gm, "");
 
-/** The source of the `onDetect:` handler starting at `at`.
+/** The source of the statement containing the `.detect(` call at `at`.
  *
- *  Balanced-delimiter scan rather than a line count or a regex: the handler is a
- *  multi-line arrow inside an object literal, and either of the cheap
- *  alternatives would quietly capture the wrong region the moment somebody
- *  reformats — which is the failure mode that makes a structural test worse than
- *  no test. Throws rather than returning `""` if the marker is missing, so a
- *  renamed hook fails loudly instead of passing vacuously. */
-function onDetectBodyAt(text: string, at: number, where: string): string {
-  // Start counting AFTER the arrow's parameter list: `() =>` opens and closes a
-  // pair immediately, so a scan that began at `onDetect:` would decide the
-  // handler ended before its body began. (It did, on the first run of this
-  // test — the vacuity guard below is what caught it, which is the argument for
-  // having one.)
-  const arrow = text.indexOf("=>", at);
-  assert.notEqual(arrow, -1, `${where}: \`onDetect:\` is not an arrow function — this scan assumes it is`);
-  // Run to the end of the object-literal PROPERTY, not to the first balanced
-  // pair: one host's handler is a chained expression
-  // (`detect(cli).then(...)`), whose `(cli)` returns the depth to zero long
-  // before the body is over. The property ends at a top-level `,`, or at the
-  // `}` that closes the object it sits in.
+ *  Runs to the `;` that ends the statement rather than to a balanced pair: the
+ *  call is a chained expression (`detect(cli).then(...)`), whose `(cli)` returns
+ *  the depth to zero long before the handler body is over. Throws rather than
+ *  returning `""` if the statement never ends, so a shape this scan does not
+ *  understand fails loudly instead of passing vacuously. */
+function detectStatementAt(text: string, at: number, where: string): string {
   let depth = 0;
-  for (let i = arrow; i < text.length; i += 1) {
+  for (let i = at; i < text.length; i += 1) {
     const c = text[i];
-    if (c === "(" || c === "{" || c === "[") {
-      depth += 1;
-    } else if (c === ")" || c === "}" || c === "]") {
-      if (depth === 0) return text.slice(at, i);
-      depth -= 1;
-    } else if (c === "," && depth === 0) {
-      return text.slice(at, i);
-    }
+    if (c === "(" || c === "{" || c === "[") depth += 1;
+    else if (c === ")" || c === "}" || c === "]") depth -= 1;
+    else if (c === ";" && depth === 0) return text.slice(at, i);
   }
-  throw new Error(`${where}: unbalanced delimiters after \`onDetect:\` — the scan could not find the end of the handler`);
+  throw new Error(`${where}: the \`.detect(\` call at ${at} has no statement end — this scan cannot read it`);
 }
 
-/** EVERY `onDetect:` handler in `text`, not just the first (#997 review NB-4).
+/** Every `<catalog>.detect(` call site in `text`, as (statement, offset) pairs.
  *
- *  There is exactly one per host today, so scanning only the first was sound as
- *  written — and that is precisely the reason to fix it rather than note it: a
- *  second picker on either surface would go entirely unchecked while the suite
- *  stayed green, which is the failure mode a structural test has to be honest
- *  about. A scan that silently covers a subset is worse than one that covers
- *  nothing, because it reads as coverage.
+ *  Matches both spellings the two hosts use — `modelCatalog.detect(` in the
+ *  workflow pane, `this.catalog.detect(` in the launcher — rather than a bare
+ *  `.detect(`, which would also catch an unrelated method some future module
+ *  happens to name that way.
  *
- *  Asserts at least one, so a renamed hook fails loudly instead of vacuously
+ *  Asserts at least one, so a renamed seam fails loudly instead of vacuously
  *  passing over an empty list — the same reason every assertion here has a
  *  vacuity guard. */
-function onDetectBodies(rawText: string, where: string): string[] {
-  // Stripped BEFORE extraction, not after, so the delimiter scan is comment-blind
-  // too: a commented-out `onDetect:` is not a handler, and prose in a comment can
-  // no longer satisfy an assertion downstream (#997 review B-2).
+function detectCallSites(rawText: string, where: string): { body: string; at: number }[] {
+  // Stripped BEFORE extraction, not after, so the statement scan is
+  // comment-blind too: a commented-out call is not a call, and prose in a
+  // comment can no longer satisfy an assertion downstream (#997 review B-2).
+  const text = stripComments(rawText);
+  const sites: { body: string; at: number }[] = [];
+  const marker = /(?:modelCatalog|this\.catalog)\.detect\(/g;
+  for (let m = marker.exec(text); m !== null; m = marker.exec(text)) {
+    sites.push({ body: detectStatementAt(text, m.index, where), at: m.index });
+  }
+  assert.notEqual(
+    sites.length,
+    0,
+    `${where} no longer calls \`.detect(\` — this scan is looking at the wrong thing`
+  );
+  return sites;
+}
+
+/** Every `<catalog>.onReport(` subscription body in `text`. The push route's
+ *  half of the same contract; same extraction rule, same vacuity guard. */
+function onReportBodies(rawText: string, where: string): string[] {
   const text = stripComments(rawText);
   const bodies: string[] = [];
-  for (let at = text.indexOf("onDetect:"); at !== -1; at = text.indexOf("onDetect:", at + 1)) {
-    bodies.push(onDetectBodyAt(text, at, where));
+  const marker = /(?:modelCatalog|this\.catalog)\.onReport\(/g;
+  for (let m = marker.exec(text); m !== null; m = marker.exec(text)) {
+    bodies.push(detectStatementAt(text, m.index, where));
   }
   assert.notEqual(
     bodies.length,
     0,
-    `${where} no longer has an \`onDetect:\` hook — this scan is looking at the wrong thing`
+    `${where} no longer subscribes to \`onReport\` — a form already open when the startup sweep answers ` +
+      `would keep its curated seed for the life of the app, and nothing else would notice`
   );
   return bodies;
 }
 
-test("the workflow block editor refreshes the knobs and the findings after a detection", () => {
-  for (const body of onDetectBodies(src("workflowview.ts"), "workflowview.ts")) {
-    // Vacuity guard, and it is the `detect(` match that does the work: if the
-    // scan ever extracts the wrong region, every assertion below would pass or
-    // fail for reasons that have nothing to do with the rule. Deliberately NOT a
-    // generous length threshold — the buggy handler this test exists to catch was
-    // a single short line, so a length gate tuned to reject it would fire first
-    // and report "the scan is broken" instead of the finding.
-    assert.match(body, /modelCatalog\.detect\(/, "the handler under test must be the one that asks the CLI");
-    assert.ok(body.length > 40, `the extracted handler is implausibly short, so this test is not reading it: ${body}`);
-
-    // The three the sibling `agent_cli_knobs` handler does, and the ones the first
-    // cut of this handler did none of.
-    assert.match(
-      body,
-      /analyzeWorkflow\(/,
-      "a detection changes what `knobLookup` answers, so the analysis pass owes a re-run — otherwise the findings " +
-        "pane disagrees with the controls until an unrelated edit happens to re-run it"
-    );
-    assert.match(body, /renderFindings\(/, "…and the findings it just recomputed have to be painted");
-    assert.match(
-      body,
-      /repaintBlockKnobs\?\.\(\)/,
-      "the knob repaint must go through the LIVE `this.repaintBlockKnobs?.()`, never a captured closure: " +
-        "`renderInspector()` nulls it precisely so a late reply cannot paint into a row it has already detached"
-    );
-    // The NEGATIVE half, and it is the half that discriminates. The handler now
-    // reaches the live hook twice (the detached-form early-out and the tail), so
-    // the positive match above survives a mutation of either one — which it did,
-    // silently, until re-deriving the red table caught it. Naming the captured
-    // closure directly is what makes reverting *either* call site redden.
-    assert.doesNotMatch(
-      body,
-      /repaintKnobs\(\)/,
-      "the handler must not call the form-local `repaintKnobs()` closure at all — it walks around the null-clearing " +
-        "that stops a late reply painting a detached row"
-    );
-  }
-});
-
-test("a detection that outlives its form does not paint that form's rows", () => {
-  // #997 review NB-1. An ask spawns a CLI and can be in flight for seconds —
-  // long enough to select another block, at which point `renderInspector()` has
-  // detached these rows. The handler has to notice before it touches any of
-  // this form's DOM, the same way the probe reply eleven lines below it does.
-  for (const body of onDetectBodies(src("workflowview.ts"), "workflowview.ts")) {
-    assert.match(
-      body,
-      /formPane\.contains\(picker\.root\)/,
-      "the handler must check its own form is still on screen before repainting it — otherwise a reply that lands " +
-        "after the human moved on paints a detached row, and the form they are actually looking at stays stale"
-    );
-  }
-});
-
-test("a detect reply never rebuilds the form unconditionally", () => {
-  // #997 review NB3-1, folded in during the S4b restack rather than left as a
-  // held finding. The detached-form early-out's own comment claims to take
-  // "the sibling's treatment" — in-place repaint if the human is inside the
-  // form now on screen, `renderInspector()` only if they are not — but the
-  // first cut of it called the rebuild unconditionally. `replaceChildren`
-  // destroys the input under the caret, so that early-out reintroduced NB-3's
-  // caret hazard on a wider surface (any field of the form, not just the
-  // custom-model box) three commits after NB-3 had already cost a round.
-  //
-  // Round 4 shipped the fix but not a pin for it: reverting the early-out back
-  // to a bare rebuild left the whole suite green (verified by mutation during
-  // this fold — the receipt is in the round-4 review, R4-1). This test closes
-  // that gap: every `renderInspector()` call in the handler must be the
-  // `else` of the `contains(document.activeElement)` test, never bare.
-  //
-  // (Written against `renderInspector` — the S4b restack landed on top of the
-  // #880 slice B docked-inspector rework, which renamed the method this
-  // handler calls from `renderForm`. The rebase's textual merge did not
-  // conflict on this rename — the hunks never overlap — so it had to be
-  // caught by hand: `tsc` on the restacked branch, not by reading the diff.)
-  for (const body of onDetectBodies(src("workflowview.ts"), "workflowview.ts")) {
-    assert.doesNotMatch(
-      body,
-      /(?<!else )this\.renderInspector\(\)/,
-      "a detect reply must never rebuild the form unconditionally: `replaceChildren` destroys the input under " +
-        "the caret. The rebuild is always the `else` of the `contains(document.activeElement)` test"
-    );
-  }
-});
-
-test("the launcher refreshes its knob row after a detection, by either branch", () => {
-  for (const body of onDetectBodies(src("launcher.ts"), "launcher.ts")) {
-    assert.match(body, /catalog\.detect\(/, "the handler under test must be the one that asks the CLI");
-    assert.ok(body.length > 40, `the extracted handler is implausibly short, so this test is not reading it: ${body}`);
-
-    // The launcher reaches the knobs either directly (when a mid-type guard stops
-    // it rebuilding the menu) or through `applyRoleModels`. Both are acceptable;
-    // reaching NEITHER is the bug.
-    assert.match(
-      body,
-      /applyRoleKnobs\(|applyRoleModels\(/,
-      "a launcher detection must reach the knob repaint by one branch or the other"
-    );
-  }
-});
-
-test("the launcher's model repaint really does carry the knob repaint with it", () => {
-  // The half of the chain the scan above takes on trust. Pinned here rather than
-  // assumed, because `applyRoleModels` is what makes the launcher's shorter
-  // handler equivalent to the workflow pane's longer one — if that call were
-  // ever dropped, the launcher test above would still pass while the launcher
-  // had the workflow pane's bug.
-  const text = src("launcher.ts");
-  const at = text.indexOf("private applyRoleModels(");
-  assert.notEqual(at, -1, "`applyRoleModels` was renamed — the launcher scan's assumption needs revisiting");
+test("the workflow pane's detection refresh reaches the knobs, the findings and the menu", () => {
+  const text = stripComments(src("workflowview.ts"));
+  const at = text.indexOf("private applyDetection(");
+  assert.notEqual(at, -1, "`applyDetection` was renamed — both routes' refresh has lost the thing they funnel into");
   const body = text.slice(at, text.indexOf("\n  }", at));
-  assert.match(body, /applyRoleKnobs\(/, "applyRoleModels is only a valid knob-refresh route while it calls one");
+  assert.ok(body.length > 40, `the extracted method is implausibly short, so this test is not reading it: ${body}`);
+
+  // The three the sibling `agent_cli_knobs` handler does, and the ones the first
+  // cut of the old button handler did none of.
+  assert.match(
+    body,
+    /analyzeWorkflow\(/,
+    "a detection changes what `knobLookup` answers, so the analysis pass owes a re-run — otherwise the findings " +
+      "pane disagrees with the controls until an unrelated edit happens to re-run it"
+  );
+  assert.match(body, /renderFindings\(/, "…and the findings it just recomputed have to be painted");
+  assert.match(
+    body,
+    /repaintBlockKnobs\?\.\(\)/,
+    "the knob repaint must go through the LIVE `this.repaintBlockKnobs?.()`, never a captured closure: " +
+      "`renderInspector()` nulls it precisely so a late reply cannot paint into a row it has already detached"
+  );
+  assert.match(
+    body,
+    /refreshBlockModels\?\.\(\)/,
+    "and the MENU through the live `this.refreshBlockModels?.()` — same argument, same null-clearing. Without it " +
+      "a reply that lands while the human is inside the form repaints the knobs and leaves the dropdown stale"
+  );
+  // The NEGATIVE half, and it is the half that discriminates: naming the
+  // form-local closure directly is what makes reverting either live hook redden.
+  assert.doesNotMatch(
+    body,
+    /repaintKnobs\(\)/,
+    "the refresh must not call the form-local `repaintKnobs()` closure at all — it walks around the null-clearing " +
+      "that stops a late reply painting a detached row"
+  );
+});
+
+test("the workflow pane's detection refresh never rebuilds the form unconditionally", () => {
+  // #997 review NB3-1. `replaceChildren` destroys the input under the caret, so
+  // the pane's own rule — "the form is redrawn only when the human isn't inside
+  // it" — has to hold here too. Round 4 of #997 shipped the fix but not a pin
+  // for it: reverting the early-out to a bare rebuild left the whole suite
+  // green. This closes that gap: every `renderInspector()` in the refresh must
+  // be the `else` of the `contains(document.activeElement)` test, never bare.
+  const text = stripComments(src("workflowview.ts"));
+  const at = text.indexOf("private applyDetection(");
+  const body = text.slice(at, text.indexOf("\n  }", at));
+  assert.match(
+    body,
+    /contains\(document\.activeElement\)/,
+    "the refresh has to ASK whether the human is inside the form before it decides how to repaint"
+  );
+  assert.doesNotMatch(
+    body,
+    /(?<!else )this\.renderInspector\(\)/,
+    "a detection reply must never rebuild the form unconditionally: `replaceChildren` destroys the input under " +
+      "the caret. The rebuild is always the `else` of the `contains(document.activeElement)` test"
+  );
+});
+
+test("the launcher's detection refresh reaches the knob row and defers the menu", () => {
+  const text = stripComments(src("launcher.ts"));
+  const at = text.indexOf("private refreshRoleFromDetection(");
+  assert.notEqual(at, -1, "`refreshRoleFromDetection` was renamed — both routes' refresh has lost its funnel");
+  const body = text.slice(at, text.indexOf("\n  }", at));
+  assert.ok(body.length > 40, `the extracted method is implausibly short, so this test is not reading it: ${body}`);
+
+  assert.match(
+    body,
+    /applyRoleKnobs\(/,
+    "a detection narrows which effort levels this role's model can take, so the knob row owes a repaint — " +
+      "otherwise the form offers a level the payload then drops"
+  );
+  assert.match(
+    body,
+    /setOptions\(/,
+    "…and the dropdown owes one too: the reply is where the CLI's real per-host ids come from"
+  );
+  // Not `applyRoleModels`, and this is the re-entry guard's launcher half:
+  // `applyRoleModels` is what ISSUES the lookup, so calling it from the lookup's
+  // own answer would re-enter it on every reply.
+  assert.doesNotMatch(
+    body,
+    /this\.applyRoleModels\(/,
+    "the refresh must not go through `applyRoleModels` — that method issues the lookup this is the answer to, " +
+      "so reaching it here makes every reply re-enter the path that produced it"
+  );
 });
 
 test("both hosts DEFER the mid-type menu rebuild rather than dropping it", () => {
-  // #997 review NB-3 (round 2), then NB-3 again (round 3). Round 2 got the first
-  // half: an ask can be in flight for seconds — long enough for a human to click
-  // into the `custom…` box — and rebuilding the menu under a half-typed id hides
-  // the input beneath the caret. Round 2 got the second half WRONG: it dropped
-  // the rebuild instead of postponing it, which on the launcher was permanent —
-  // `applyRoleModels` is otherwise reachable only from the CLI `change` listener
-  // and the seed pass, so the human saw a `detect` click do nothing at all for
-  // the rest of the dialog's life.
+  // #997 review NB-3 (round 2), then NB-3 again (round 3). An answer can land
+  // while a human is mid-type in the `custom…` box, and rebuilding the menu
+  // under a half-typed id hides the input beneath the caret. Round 2 got the
+  // second half WRONG: it dropped the rebuild instead of postponing it, which on
+  // the launcher was permanent — `applyRoleModels` is otherwise reachable only
+  // from the CLI `change` listener and the seed pass, so the human saw detection
+  // do nothing at all for the rest of the dialog's life.
   //
-  // So the pin is on `runWhenNotEditing`, not on `editingCustom`: guarding is
+  // #1020 widens the window this guards rather than closing it: the reply now
+  // arrives on the sweep's schedule instead of a click's, so the human is more
+  // likely to be typing when it does, not less.
+  //
+  // The pin is on `runWhenNotEditing`, not on `editingCustom`: guarding is
   // necessary but not sufficient, and the bare predicate is what the dropped
   // version also used.
+  const launcher = stripComments(src("launcher.ts"));
+  const at = launcher.indexOf("private refreshRoleFromDetection(");
+  const body = launcher.slice(at, launcher.indexOf("\n  }", at));
+  assert.match(
+    body,
+    /runWhenNotEditing\(/,
+    "the launcher's refresh must DEFER the menu rebuild past the mid-type window, not drop it — a guard that " +
+      "only refuses is a detection that silently does nothing"
+  );
+
+  // The workflow pane routes its rebuild through the live hook, so the deferral
+  // lives where the hook is INSTALLED — in the form that owns the picker. There
+  // are two assignments to that field and they are different statements: the
+  // null-clearing in `renderInspector`, which is what stops a late reply
+  // painting a detached row, and the install. Both are required, so both are
+  // read out rather than whichever `indexOf` happens to reach first.
+  const wf = stripComments(src("workflowview.ts"));
+  const assignments: string[] = [];
+  const marker = /this\.refreshBlockModels = /g;
+  for (let m = marker.exec(wf); m !== null; m = marker.exec(wf)) {
+    assignments.push(wf.slice(m.index, wf.indexOf("\n", m.index)));
+  }
+  assert.notEqual(assignments.length, 0, "the pane no longer has a `refreshBlockModels` hook — its menu refresh is dead");
+  assert.ok(
+    assignments.some((a) => a.includes("= null")),
+    `no assignment clears \`refreshBlockModels\` — without one, a reply landing after the human selected another ` +
+      `block rebuilds the picker they left behind: ${assignments.join(" | ")}`
+  );
+  assert.ok(
+    assignments.some((a) => /runWhenNotEditing\(/.test(a)),
+    `the workflow pane's menu hook must defer past the mid-type window too — it is the same picker and the same ` +
+      `hazard: ${assignments.join(" | ")}`
+  );
+});
+
+test("a detection lookup fired from a render path cannot re-enter that render", () => {
+  // **New with #1020, and the hazard the button architecture did not have.**
+  // The lookup fires when a picker paints, and the refresh it triggers ends in
+  // `renderInspector()` — which repaints the picker, which fires the lookup. The
+  // memo makes the second call free but NOT a no-op: it resolves with the same
+  // report, and an unguarded handler refreshes again, forever.
+  //
+  // Two independent exits, and both are required. The `models.length` early-out
+  // stops a barren answer looping (it never sets `report()`, so the other guard
+  // would not fire); the `report()` guard stops a good one (it would pass the
+  // `models.length` test every time).
+  for (const { body, at } of detectCallSites(src("workflowview.ts"), "workflowview.ts")) {
+    assert.match(
+      body,
+      /\.models\.length/,
+      "the handler must return early on an answer that carried nothing — it never sets `report()`, so it would " +
+        "otherwise re-enter the render on every repaint"
+    );
+    const before = stripComments(src("workflowview.ts")).slice(Math.max(0, at - 400), at);
+    assert.match(
+      before,
+      /!\s*modelCatalog\.report\(/,
+      "the lookup must be guarded on there being no report in hand yet: its own refresh re-renders this form, " +
+        "which re-runs this line, and a good answer passes the `models.length` test every time"
+    );
+  }
+});
+
+test("both hosts take the startup sweep's push, and answer for their own liveness", () => {
+  // The route that matters most at boot: loomux opens showing the launcher, so
+  // the common case is a form already on screen while the sweep is still
+  // running. Its lookup was answered "nothing yet"; without this subscription
+  // its dropdowns keep the curated seeds until the human closes and reopens.
+  //
+  // The liveness half is not decoration. Neither host has a teardown
+  // `ModelCatalog` can rely on, so a subscription that never says it is gone
+  // repaints detached DOM for the rest of the app run — one leak per discarded
+  // form.
   for (const file of ["workflowview.ts", "launcher.ts"]) {
-    for (const body of onDetectBodies(src(file), file)) {
+    for (const body of onReportBodies(src(file), file)) {
       assert.match(
         body,
-        /runWhenNotEditing\(/,
-        `${file}'s detect handler must DEFER the menu rebuild past the mid-type window, not drop it — a guard that ` +
-          `only refuses is a detect click that silently does nothing`
+        /return false/,
+        `${file}'s onReport handler must be able to report itself gone — a subscription with no route to \`false\` ` +
+          `outlives the DOM it repaints`
+      );
+      assert.match(
+        body,
+        /return true/,
+        `${file}'s onReport handler must stay subscribed while it is alive, or it hears exactly one report`
       );
     }
   }
+  // …and each one reaches its host's funnel, which is what makes the push and
+  // the lookup do the same work rather than merely similar work.
+  assert.match(
+    onReportBodies(src("workflowview.ts"), "workflowview.ts").join("\n"),
+    /this\.applyDetection\(\)/,
+    "the workflow pane's push must go through the same refresh the lookup does"
+  );
+  assert.match(
+    onReportBodies(src("launcher.ts"), "launcher.ts").join("\n"),
+    /this\.refreshRoleFromDetection\(/,
+    "the launcher's push must go through the same refresh the lookup does"
+  );
+});
+
+test("nothing in the picker can ask for a detection any more", () => {
+  // #1020's deletion, pinned rather than assumed. Detection is automatic and the
+  // backend sweep is the only thing that spawns an agent CLI; a `detect` button
+  // would be an affordance for a spawn this control can no longer make, and its
+  // presence is how the old architecture would grow back.
+  const picker = stripComments(src("modelpicker.ts"));
+  assert.doesNotMatch(picker, /onDetect/, "the `onDetect` hook is gone — the picker asks for nothing");
+  assert.doesNotMatch(picker, /model-picker-detect/, "…and so is the button that carried it");
+  assert.doesNotMatch(
+    stripComments(src("styles.css")),
+    /\.model-picker-detect/,
+    "the button's CSS outlived the button — dead rules in the token layer read as a control somebody forgot to wire"
+  );
 });
 
 test("the deferral schedules the rebuild rather than returning without it", () => {

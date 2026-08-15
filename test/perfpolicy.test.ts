@@ -148,6 +148,20 @@ const STREAMS: StreamRow[] = [
     debt: null,
   },
   {
+    event: "models-detected",
+    rate: "lifecycle",
+    bound: "argued-none",
+    cite: "src-tauri/src/modelwire.rs",
+    reason:
+      "The startup model sweep (#1020), which runs ONCE per app run and emits at most one event " +
+      "per CLI that has a PROTOCOLS row — one today (claude), four if every SUPPORTED_CLIS entry " +
+      "ever gained one. There is no rate to bound: the producer is a single sequential pass that " +
+      "then exits. The per-event cost is bounded on the other side too — `acceptReport` drops a " +
+      "report that changed nothing before any listener is called, so an empty sweep result " +
+      "repaints nothing at all.",
+    debt: null,
+  },
+  {
     event: "ft-files",
     rate: "producer",
     bound: "rAF-gated",
