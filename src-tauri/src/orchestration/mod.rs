@@ -24267,18 +24267,24 @@ impl OrchRegistry {
 
     pub fn delete_task(&self, group: &GroupId, actor: &str, id: &str) -> Result<(), String> {
         let _guard = self.tasks_lock.lock_safe();
-        let mut tasks = self.tasks(group);
-        let Some(pos) = tasks.iter().position(|t| t.id == id) else {
+        // Partitioned rather than retained, because promotion needs the removed
+        // row's OWN `parent` to find its children's next container. Splitting
+        // (not `position` + `remove`) keeps the historic "every row with this id
+        // goes" semantics of the `retain` this replaced: ids are minted unique,
+        // so a duplicate can only come from a hand-edited `tasks.json`, and
+        // leaving one of a pair behind after reporting success is not an
+        // improvement on removing both.
+        let (removed, mut tasks): (Vec<Task>, Vec<Task>) =
+            self.tasks(group).into_iter().partition(|t| t.id == id);
+        if removed.is_empty() {
             return Err(format!("unknown task: {id}"));
-        };
-        // Kept, not just dropped: promotion needs the removed row's OWN parent.
-        let removed = tasks.remove(pos);
+        }
         // Same locked write (#582): a deleted task's id must not survive on
         // anyone's links, or it would block its dependent forever.
         let relinked = strip_deleted_links(&mut tasks, &HashSet::from([id]));
         // ...nor on anyone's `parent` (#958) — its children are promoted rather
         // than orphaned or cascaded away.
-        let reparented = promote_orphans(&mut tasks, std::slice::from_ref(&removed));
+        let reparented = promote_orphans(&mut tasks, &removed);
         self.write_tasks(group, &tasks)?;
         self.audit(
             group,
@@ -24299,15 +24305,16 @@ impl OrchRegistry {
     pub fn delete_done_tasks(&self, group: &GroupId, actor: &str) -> Result<Vec<String>, String> {
         let removed = {
             let _guard = self.tasks_lock.lock_safe();
-            let mut tasks = self.tasks(group);
-            // The rows, not just the ids: promotion reads their own `parent`
-            // pointers to find each survivor's nearest surviving ancestor.
-            let removed_rows: Vec<Task> = tasks.iter().filter(|t| t.status == "done").cloned().collect();
+            // Split rather than filtered-then-retained: promotion reads the
+            // removed rows' own `parent` pointers to find each survivor's
+            // nearest surviving ancestor, and `partition` is stable, so both
+            // halves keep the board's priority order.
+            let (removed_rows, mut tasks): (Vec<Task>, Vec<Task>) =
+                self.tasks(group).into_iter().partition(|t| t.status == "done");
             let removed: Vec<String> = removed_rows.iter().map(|t| t.id.clone()).collect();
             if removed.is_empty() {
                 return Ok(removed);
             }
-            tasks.retain(|t| t.status != "done");
             let gone: HashSet<&str> = removed.iter().map(String::as_str).collect();
             let relinked = strip_deleted_links(&mut tasks, &gone);
             let reparented = promote_orphans(&mut tasks, &removed_rows);
@@ -24342,12 +24349,13 @@ impl OrchRegistry {
     pub fn delete_tasks(&self, group: &GroupId, actor: &str, ids: &[String]) -> Result<Vec<String>, String> {
         let removed = {
             let _guard = self.tasks_lock.lock_safe();
-            let mut tasks = self.tasks(group);
             let wanted: HashSet<&str> = ids.iter().map(String::as_str).collect();
-            // The rows, not just the ids (#958): a batch can remove a parent
-            // AND its grandparent, so promotion has to climb the removed chain.
-            let removed_rows: Vec<Task> =
-                tasks.iter().filter(|t| wanted.contains(t.id.as_str())).cloned().collect();
+            // Split, not filtered-then-retained (#958): a batch can remove a
+            // parent AND its grandparent, so promotion has to climb the removed
+            // rows' own `parent` chain, and it needs those rows to do it.
+            // `partition` is stable, so both halves keep board order.
+            let (removed_rows, mut tasks): (Vec<Task>, Vec<Task>) =
+                self.tasks(group).into_iter().partition(|t| wanted.contains(t.id.as_str()));
             let removed: Vec<String> = removed_rows.iter().map(|t| t.id.clone()).collect();
             if removed.is_empty() {
                 return Ok(removed);
@@ -24356,7 +24364,6 @@ impl OrchRegistry {
             // not fatal — but audited, so the divergence is traceable.
             let present: HashSet<&str> = removed.iter().map(String::as_str).collect();
             let skipped: Vec<&str> = ids.iter().map(String::as_str).filter(|id| !present.contains(id)).collect();
-            tasks.retain(|t| !wanted.contains(t.id.as_str()));
             // Strip by what was actually removed, not by what was asked for:
             // an id that named no row can still name a hand-edited dangling
             // link, and that link is not this delete's business (#582).
