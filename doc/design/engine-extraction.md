@@ -603,10 +603,18 @@ from a unit test of product code, agents are banned from running cargo locally
       workspace, not a shipped API promise.
     - `LOOMUX_NOTICE_MARKER` was already `pub` in `src-tauri`, so nothing
       widens there.
-  - **`digest` is not a leaf** despite reading like one. It calls
+  - **`digest` is not a leaf** despite reading like one. It called
     `crate::sessions::yaml_field` and takes a `crate::opencodedb::TranscriptRow`
-    — two modules staying in `src-tauri` — so it cannot move until those edges
-    are cut or followed.
+    — two modules staying in `src-tauri` at the time — so it could not move
+    until those edges were cut or followed. **Batch 14 cut the first of them**:
+    `yaml_field` is `loomux_engine::sessions::yaml_field` now, and `digest`'s
+    call site reaches it through the re-export unchanged, so the only remaining
+    blocker is `opencodedb::TranscriptRow`. Corrected here rather than left to
+    the next batch to rediscover, because a paragraph naming two blockers when
+    one has gone is exactly the superseded-reason failure batch 12a spent six
+    batches' prose on — and the *shape* it records still holds: an edge into a
+    module is cut by moving the callee, not by abstracting the caller (batch
+    3's rule).
 - **A3 — the host-edge tier.** Planned in detail on #888 (plan-558): the
   measured edge map found that five of the six remaining orchestration modules
   are blocked not by `AppHandle` but by six pure `mod.rs` items plus

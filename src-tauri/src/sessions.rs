@@ -601,7 +601,8 @@ fn cap_and_evict(store: &mut LaunchIntentStore) {
 }
 
 /// Normalize a cwd into the posture store's PERMISSION key (review B2).
-/// Deliberately DIFFERENT from `norm_path` above, which is right for
+/// Deliberately DIFFERENT from `norm_path` (`loomux_engine::sessions`,
+/// re-exported above), which is right for
 /// SESSION-CWD MATCHING (a miss there just falls back to "newest session
 /// wins" — low-stakes) but wrong reused as a permission key: `norm_path`
 /// unconditionally case-folds, which is correct on Windows (the filesystem
