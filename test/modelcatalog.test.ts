@@ -544,6 +544,32 @@ test("a pushed report that carries nothing never overwrites one that does", asyn
   );
 });
 
+test("the two routes racing does not repaint a form twice", async () => {
+  // The ordinary case, not the odd one: the lookup and the push are two
+  // deliveries of ONE sweep answer, and both can land. The second must not
+  // rebuild a dropdown that already shows it — a deferred rebuild fires on
+  // blur, so a redundant one can land under a caret the human has moved into.
+  //
+  // The rule is a statement about the PRODUCER: the sweep asks each CLI once
+  // per app run, so a second answer for the same CLI is never new information.
+  let fired = 0;
+  const catalog = new ModelCatalog(
+    async () => probe([]),
+    async () => ({ models: [detail({ id: "opus" })], error: null })
+  );
+  catalog.onReport(() => {
+    fired += 1;
+    return true;
+  });
+  // The lookup wins the race…
+  await catalog.detect("claude");
+  assert.deepEqual(catalog.report("claude")?.models.map((m) => m.id), ["opus"]);
+  // …and the event arrives afterwards carrying the same answer.
+  const changed = catalog.acceptReport("claude", { models: [detail({ id: "opus" })], error: null });
+  assert.equal(changed, false, "the same answer by the other route is not a change");
+  assert.equal(fired, 0, "so nothing is asked to repaint what it already painted");
+});
+
 test("a listener that reports itself gone is dropped rather than kept forever", async () => {
   // The lifecycle contract of `onReport`, and why the callback returns a
   // boolean. Neither host has a teardown this module can rely on — a launcher
