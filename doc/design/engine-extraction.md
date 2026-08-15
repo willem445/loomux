@@ -524,6 +524,39 @@ from a unit test of product code, agents are banned from running cargo locally
     modules through `loomux_lib::orchestration::…` — the re-export — and was not
     edited, plus the modules' own inline tests, which travel with them and are
     engine unit tests now.
+  - **A3 batch 8 — four small pure items, item-lifts into `model` and `text`
+    rather than a whole-file move** (plan-558). `Delivery` (the
+    `deliver_prompt`-lifecycle enum) joins `model`; `LOOMUX_NOTICE_MARKER`
+    joins `text` beside `pr_number`; `DEFAULT_IDLE_TICK_MINUTES` and
+    `DEFAULT_INTAKE_POLL_MINUTES` join `model` too, because the latter is
+    defined *in terms of* the former and the two have to travel together.
+    Batch 7 (`obs`, run in parallel by another worker) is the other half of
+    this tranche; this entry covers only batch 8's four items.
+
+    Takes the pure-relocation exemption: `Delivery`'s kebab-case
+    `#[serde(rename…)]` attrs move verbatim, so its wire/persisted shape
+    (`queue.json`'s `delivery_kind`) is byte-identical, and the queue snapshot
+    round-trip tests that pin that shape do NOT move with it. The integration
+    suite needed zero edits — every `Delivery::…` call site (over a hundred,
+    across `mod.rs`, `queue.rs`, `queuestate.rs`, `mcp.rs` and the integration
+    suite), the 15 `mod.rs` uses of `LOOMUX_NOTICE_MARKER` plus 5
+    integration-test uses, and the two consts' `mod.rs`/`intake.rs` uses all
+    reach the moved items through the flat `orchestration::…` re-export,
+    unchanged.
+
+    **Visibility widened, batch-3 precedent — three items, one item unchanged:**
+    - `Delivery::wait_ready` was bare module-private in `src-tauri`. It is
+      `pub` in the engine now, forced by the crate boundary (`mod.rs`'s own
+      callers are a different crate), with no re-export able to narrow it back
+      — a method's visibility is the defining crate's to set, the same fact
+      batch 4 states for `Role::prefix`/`Role::as_str`.
+    - `DEFAULT_IDLE_TICK_MINUTES` and `DEFAULT_INTAKE_POLL_MINUTES` were both
+      bare module-private consts. They are `pub` in the engine (forced, same
+      reason) and re-exported `pub(crate)` from `mod.rs`, which narrows the
+      reach back to "this crate" — the closest a cross-crate re-export can get
+      to the original "this module and its descendants" reach.
+    - `LOOMUX_NOTICE_MARKER` was already `pub` in `src-tauri`, so nothing
+      widens there.
   - **`digest` is not a leaf** despite reading like one. It calls
     `crate::sessions::yaml_field` and takes a `crate::opencodedb::TranscriptRow`
     — two modules staying in `src-tauri` — so it cannot move until those edges

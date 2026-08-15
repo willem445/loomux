@@ -145,6 +145,30 @@ pub(crate) use loomux_engine::model::role_instructions_file;
 // to widen, so unlike batches 3-5 there is no re-export choice to argue here.
 pub use loomux_engine::{mergeq, mergeqview};
 
+// #888 slice A3 batch 8 — four small pure items lifted out of this file:
+// `Delivery` (a serde enum whose kebab-case wire form travels verbatim — the
+// queue.json compatibility it decides is pinned by the queue snapshot
+// round-trip tests, which do NOT move this batch), `LOOMUX_NOTICE_MARKER`
+// (joins `pr_number` in `text` — batch 3's precedent for a shared pure string
+// item), and `DEFAULT_IDLE_TICK_MINUTES` + `DEFAULT_INTAKE_POLL_MINUTES`
+// (join `model`, since the latter is defined IN TERMS OF the former and the
+// two travel together).
+//
+// Visibility widened, batch-3 precedent (state it, don't only imply it):
+// - `Delivery::wait_ready` was bare module-private in `src-tauri`; it is
+//   `pub` in the engine now, forced by the crate boundary, with no
+//   re-export to narrow it back — a method's visibility is the defining
+//   crate's to set, same fact batch 4 states for `Role::prefix`/`as_str`.
+// - `DEFAULT_IDLE_TICK_MINUTES` and `DEFAULT_INTAKE_POLL_MINUTES` were both
+//   bare module-private consts; they are `pub` in the engine (forced, same
+//   reason) and re-exported `pub(crate)` below, which narrows the reach
+//   back to "this crate" — the closest a cross-crate re-export can get to
+//   the original "this module and its descendants" reach.
+// - `LOOMUX_NOTICE_MARKER` was already `pub`, so nothing widens there.
+pub use loomux_engine::model::Delivery;
+pub(crate) use loomux_engine::model::{DEFAULT_IDLE_TICK_MINUTES, DEFAULT_INTAKE_POLL_MINUTES};
+pub use loomux_engine::text::LOOMUX_NOTICE_MARKER;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::cell::Cell;
@@ -2252,13 +2276,6 @@ const USAGE_POLL_MAX_AGE: Duration = Duration::from_millis(1000);
 /// until something happens to fetch, with no bound at all. Display-only — no
 /// gate reads it (see that function's doc).
 const DEFAULT_BRANCH_MAX_AGE: Duration = Duration::from_secs(5 * 60);
-/// Autonomous mode (#83): default output-quiet window before an idle tick fires,
-/// when the group's `idle_tick_minutes` guardrail isn't set. Lowered from the
-/// original 15 to **5** after a live test: a human who turns autonomous mode on
-/// expects action within a few minutes, and a 15-minute default simply never fired
-/// in an 8-minute session. Per-group tunable (`set_idle_tick_minutes`) so the human
-/// can drop it to 1–2 min to verify quickly. See `idle_tick_should_fire`.
-const DEFAULT_IDLE_TICK_MINUTES: u32 = 5;
 /// Upper bound on the idle-tick quiet window (24h); a floor of 1 min is enforced in
 /// `clamped()` (0 is treated as "unset" → default, not "disabled": the `autonomous`
 /// marker is the on/off switch, so a 0 here must never silently stop ticking).
@@ -2573,12 +2590,6 @@ const DIRECTIVE_LEDGER_MAX_BYTES: usize = 64 * 1024;
 /// closer to a message than to a terse notification field, hence this and
 /// not the smaller `notify::NOTICE_FIELD_CAP`).
 const DIRECTIVE_ENTRY_MAX_CHARS: usize = 2000;
-/// Idle-tick intake gate (#332/#429): the smart default `intake_poll_minutes`
-/// resolves to whenever a group is autonomous and hasn't set an explicit
-/// value — matches `DEFAULT_IDLE_TICK_MINUTES` (the idle tick's own
-/// quiet-window default) rather than inventing a new cadence: the poller
-/// need not run more often than the tick it feeds ever fires anyway.
-const DEFAULT_INTAKE_POLL_MINUTES: u32 = DEFAULT_IDLE_TICK_MINUTES;
 /// Idle-tick intake gate (#332): upper bound on `intake_poll_minutes` when a
 /// group sets an explicit value — mirrors `MAX_IDLE_TICK_MINUTES`. See
 /// `Guardrails::intake_poll_minutes`'s doc for its tri-state semantics
@@ -7867,73 +7878,6 @@ pub fn match_still_rendered(visible: &str, m: &QuestionMatch) -> bool {
 pub fn copilot_autopilot_prompt_detected(tail: &str) -> bool {
     let t = tail.to_lowercase();
     t.contains("enable autopilot mode") && t.contains("enable all permissions")
-}
-
-/// How a `deliver_prompt` call relates to the pane's lifecycle. Governs the boot
-/// readiness wait AND the one-time copilot autopilot-consent confirm (#101).
-///
-/// **#620: also a PERSISTED fact** (`queue::QueuedDelivery::delivery_kind`).
-/// A delivery held through a pause is drained minutes or hours later by
-/// `flush_paused_queues`, long after the `deliver_prompt` call that knew what
-/// kind it was returned — so the kind rides on the queue entry rather than
-/// living only on the calling thread's stack. Serialized kebab-case
-/// (`"fresh-kickoff"`) for the reason `QueuedPayload` spells its own tag out:
-/// a human reading a group's `queue.json` after a crash should not need
-/// serde's conventions to know what an entry is. `MidSession` is the `Default`
-/// — see the field's doc for why that is the conservative reading of both an
-/// older build's record and a restart.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum Delivery {
-    /// First prompt to a freshly *booted* pane (a fresh spawn's kickoff): wait
-    /// for the CLI to paint, and — for an autopilot copilot agent — answer the
-    /// "Enable autopilot mode" consent dialog before pasting.
-    FreshKickoff,
-    /// First prompt to a *resumed* pane: still wait for the CLI to paint AND
-    /// (#364) still answer the autopilot consent dialog. Resume was assumed to
-    /// restore allow-all/autopilot from the session event log so the dialog
-    /// would never reappear — the human's #364 report is that this assumption
-    /// is false (the dialog does reappear, or autopilot isn't restored), so
-    /// this delivery confirms exactly like `FreshKickoff` does.
-    ResumeKickoff,
-    /// A mid-session delivery to an already-running pane (a follow-up / steer):
-    /// no readiness wait, no dialog — long past boot, nothing to confirm.
-    ///
-    /// The `Default`, and deliberately the conservative one (#620): every
-    /// treatment this enum can switch ON — a boot wait, a stray Enter into a
-    /// consent dialog, arming #517's re-delivery — is an ACTION taken against
-    /// a live pane, so a record that cannot say what it was must fall through
-    /// to the kind that takes none of them.
-    #[default]
-    MidSession,
-}
-
-impl Delivery {
-    /// Whether to hold the paste until the CLI has painted its UI — true for
-    /// either kickoff (the CLI has just been launched), false mid-session.
-    fn wait_ready(self) -> bool {
-        matches!(self, Delivery::FreshKickoff | Delivery::ResumeKickoff)
-    }
-    /// Whether this delivery should watch for and answer copilot's "Enable
-    /// autopilot mode" consent dialog (#364): true for EITHER kickoff — a
-    /// fresh boot or a resume — since both can show the dialog; false
-    /// mid-session, which is long past boot and has nothing to confirm.
-    pub fn confirms_autopilot_dialog(self) -> bool {
-        matches!(self, Delivery::FreshKickoff | Delivery::ResumeKickoff)
-    }
-    /// Whether a delivery of this kind may be RE-DELIVERED by the late
-    /// monitor when it turns out never to have reached the pane (#517).
-    ///
-    /// `FreshKickoff` only — deliberately narrower than the two predicates
-    /// above, which both include a resume. A fresh spawn's brief exists
-    /// nowhere else: nothing will re-send it, and the agent has no other way
-    /// to learn what it was spawned to do. A `ResumeKickoff` payload is a
-    /// re-sync notice re-derived from durable state (see
-    /// `resume_kickoff_notice`), and a `MidSession` prompt has a sender who
-    /// is still around — both keep the pre-#517 badge-and-stop behavior.
-    pub fn recovers_lost_kickoff(self) -> bool {
-        matches!(self, Delivery::FreshKickoff)
-    }
 }
 
 /// Whether a delivery should attempt the copilot autopilot-consent confirm.
@@ -20414,25 +20358,6 @@ fn dialog_header_above(rows: &[&str], norm: &[String], keep: &[bool], from: usiz
     }
     false
 }
-
-/// The marker every notice loomux writes into a pane opens with, and the whole
-/// basis of [`mask_loomux_notices`] (#576).
-///
-/// It is trustworthy for that job because it **cannot be forged from outside**:
-/// `notify::sanitize_gh_text` rewrites `[`→`(` and `]`→`)` in every untrusted
-/// field before it is formatted into a notice, and `intake`'s own test pins
-/// that a third-party issue title can never produce this string. So a rendered
-/// row opening with it was written by loomux.
-///
-/// **Unforgeable only in the delivery direction, and that asymmetry is the
-/// whole design constraint here.** Nothing an agent sends *through* loomux can
-/// carry it. But an agent's pane output is not sanitized at all, so an agent
-/// can print these bytes itself — echoing a notice back, quoting one in a
-/// summary, or induced to by a hostile prompt. A marker row is therefore
-/// evidence that *someone wrote a notice-shaped row*, never proof that loomux
-/// wrote this one, and [`mask_loomux_notices`] is scoped to exactly what that
-/// weaker claim can support.
-pub const LOOMUX_NOTICE_MARKER: &str = "[loomux]";
 
 /// Remove the rows loomux itself wrote into this pane before the question
 /// detector ever sees them (#576).

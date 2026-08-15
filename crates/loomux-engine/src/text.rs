@@ -42,3 +42,28 @@ pub fn pr_number(pr: &str) -> Option<u64> {
     let digits: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
     digits.parse().ok()
 }
+
+/// The marker every notice loomux writes into a pane opens with, and the whole
+/// basis of `mask_loomux_notices` (#576).
+///
+/// It is trustworthy for that job because it **cannot be forged from outside**:
+/// `notify::sanitize_gh_text` rewrites `[`→`(` and `]`→`)` in every untrusted
+/// field before it is formatted into a notice, and `intake`'s own test pins
+/// that a third-party issue title can never produce this string. So a rendered
+/// row opening with it was written by loomux.
+///
+/// **Unforgeable only in the delivery direction, and that asymmetry is the
+/// whole design constraint here.** Nothing an agent sends *through* loomux can
+/// carry it. But an agent's pane output is not sanitized at all, so an agent
+/// can print these bytes itself — echoing a notice back, quoting one in a
+/// summary, or induced to by a hostile prompt. A marker row is therefore
+/// evidence that *someone wrote a notice-shaped row*, never proof that loomux
+/// wrote this one, and `mask_loomux_notices` is scoped to exactly what that
+/// weaker claim can support.
+///
+/// #888 slice A3 batch 8: moved here (unchanged, still `pub`) alongside
+/// `pr_number` above — same shape, a pure string constant with consumers
+/// beyond the module that forced its lift. `mod.rs` re-exports it under its
+/// original name, so all 15 `mod.rs` uses and the 5 integration-test uses
+/// keep resolving via `orchestration::LOOMUX_NOTICE_MARKER`.
+pub const LOOMUX_NOTICE_MARKER: &str = "[loomux]";
