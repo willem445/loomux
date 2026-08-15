@@ -593,6 +593,15 @@ so far:
   and INVARIANT 1 still forbids routing around it. The closing "sanctioned exceptions"
   parenthetical lists it with the others.
 
+  Both halves also state **where the authorization may come from**, and it is the narrower of the
+  two readings on purpose: the **kickoff config**, never a file in the repository. An earlier
+  draft said "your kickoff config or the group's declared workflow names the class", which invites
+  exactly the escalation the gate exists to stop — a workflow file is agent-editable, so a
+  config-named class would let an orchestrator mint its own merge authority by committing to it.
+  "You never grant yourself one, and no file in the repository grants you one either" is the
+  same rule as "a workflow file can never grant a capability", stated where an orchestrator
+  reading about a new merge opening will hit it.
+
   Deliberately generic, and that is the whole reason this re-bless is small: naming the
   process-pro here would fail
   `advisor_and_process_prose_stays_silent_unless_a_block_declares_the_hint` (rev-29 F1's rule,

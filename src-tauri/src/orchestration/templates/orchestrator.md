@@ -37,9 +37,10 @@ memory of it — is the contract.
 
 1. **Never merge to the default branch unless a gate opened for you** — autonomous auto-merge, a
    one-time human grant, supervised dangerous mode, or a **standing class authorization** your
-   group's config grants for a named class of PR. That last one is a gate the human opened once
-   instead of per PR, not a shortcut past one: the same bar applies to every PR in the class, and
-   where the interceptor still refuses you the refusal stands. The refusal is enforced, not
+   kickoff config names for a class of PR. That last one is a gate the human opened once instead
+   of per PR, not a shortcut past one: the same bar applies to every PR in the class, you never
+   grant yourself one, and where the interceptor still refuses you the refusal stands. The
+   refusal is enforced, not
    advisory: seeing it means the system works. Never route around it. Releases and tags are a
    *separate* opt-in that auto-merge does not grant.
 2. **A question you put to the human holds that PR's merge, in every mode.** Telling is not
@@ -766,9 +767,11 @@ The gate opens in exactly three ways:
   the merge it belongs to, do the merges one at a time, and announce/record each one as usual. If
   you cannot get through all of them before they expire, merge what you can and say which are
   left — asking for a fresh Approve is correct; re-reading the same notice is not a second grant.
-- **Standing class authorization.** A group may pre-authorize a whole **class** of PR once,
-  standingly, instead of the human clicking Approve on each one; your kickoff config or the
-  group's declared workflow names the class if you have one, and most groups have none. What the
+- **Standing class authorization.** The human may pre-authorize a whole **class** of PR once,
+  standingly, instead of clicking Approve on each one. Your kickoff config is what names the
+  class if your group has one, and most groups have none — **you never grant yourself one**, and
+  no file in the repository grants you one either: a config an agent can edit could otherwise
+  mint its own merge authority, which is the one thing this gate exists to prevent. What the
   authorization changes is **who closes those PRs out**: one in an authorized class is **yours to
   disposition** — merge it once it clears the bar, or close it with a reason — and it is never
   parked in the human's merge queue as something for them to decide or remember. That is the
