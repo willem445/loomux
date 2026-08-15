@@ -194,11 +194,18 @@ will remain one after C2.
 
 ## 6. What this slice does not touch, and why that is not an omission
 
-- **#925 (path-root validation for the remaining caller-supplied identifiers)
-  remains a merge blocker for listener code**, and C1a is not listener code:
-  nothing here accepts input from a peer. The config file is operator-authored
-  local state, in the same trust position as `.loomux/workflow.yml`. C2 is the
-  slice that inherits the blocker, and #925 must land before it.
+- **#1042 (the server-declared root registry) remains a merge blocker for
+  listener code**, and C1a is not listener code: nothing here accepts input from
+  a peer. The config file is operator-authored local state, in the same trust
+  position as `.loomux/workflow.yml`. C2 is the slice that inherits the blocker,
+  and #1042 must land before it.
+
+  The blocker was #925 until that issue's two halves separated. #925 closed the
+  **identifier** half — `session_id` and the agent id are validated segments now
+  — but H3 asks that an arbitrary client-supplied absolute **root** be refused,
+  which is a different mechanism (a root must *be* absolute, so no segment
+  predicate distinguishes a repo from `~/.ssh`). Do not read a green #925 as
+  clearance for C2.
 - **No authentication, no roster, no tiers.** H1 defers the first (see §1.3 of
   the protocol note for the accepted risk, stated plainly); the roster and the
   dispatcher that enforces it are C2's, where the commands actually arrive.
