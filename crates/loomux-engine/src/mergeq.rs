@@ -549,7 +549,7 @@ pub fn scratch_branch(group: &str, batch_id: &str) -> Option<String> {
 /// other two interpolations were not, and this is the predicate that closes
 /// them (the guard at the top of `mqloop::drive`).
 ///
-/// Deliberately much stricter than `mqdriver::landable`, which governs a
+/// Deliberately much stricter than [`crate::mqdriver::landable`], which governs a
 /// *branch* the queue lands on and therefore has to accept the shapes a real
 /// branch name takes (`feat/integration-batch-2`). An id is loomux's own
 /// generated or configured token, so it gets the narrower alphabet: a `/` that

@@ -110,10 +110,12 @@ pub(crate) use loomux_engine::model::{default_model, sanitize_model_opt};
 //
 // What deliberately did NOT come: `mqdriver`, which is `workflow`'s biggest
 // consumer. It reaches `capture_raw_with_timeout` — and an INBOUND edge does
-// not block a move. It stays here and spells `super::workflow::…` exactly as it
-// always did, through this line. (This comment used to gloss that call as "i.e.
-// the pane host, which is slice A3's problem"; batch 9 re-measured it and there
-// is no host in it — see that batch's block below.)
+// not block a move. It stayed here and spelled `super::workflow::…` exactly as
+// it always had, through this line. (This comment used to gloss that call as
+// "i.e. the pane host, which is slice A3's problem"; batch 9 re-measured it and
+// there is no host in it — see that batch's block below. `mqdriver` itself
+// crossed in batch 12a and imports `crate::workflow::…` now; `mqloop` is 12b and
+// still reaches this line.)
 pub use loomux_engine::{locks, profiles, workflow};
 
 // Batch 5's one revision to a batch-4 decision, and the reason it is here
@@ -135,12 +137,13 @@ pub(crate) use loomux_engine::model::role_instructions_file;
 //
 // What stays HERE is the wiring, which is the whole point of the split: the
 // `#[tauri::command]` `orch_merge_queue` below still calls
-// `mergeqview::merge_queue_view`, and `mqdriver`/`mqloop` still spell
-// `super::mergeq::…` and `super::mergeqview::…` in their bodies — genuine
-// inbound edges, not doc-comment mentions, and this line is what answers them.
-// They stay because of the edges they had at the time (`capture_raw_with_timeout`,
+// `mergeqview::merge_queue_view`, and `mqloop` still spells `super::mergeq::…`
+// and `super::mergeqview::…` in its body — a genuine inbound edge, not a
+// doc-comment mention, and this line is what answers it. Both it and `mqdriver`
+// stayed for the edges they had at the time (`capture_raw_with_timeout`,
 // `atomic_write` — both in the engine as of batch 9, and neither a host call
-// after all); an inbound edge has never been what decides a batch.
+// after all); an inbound edge has never been what decides a batch. `mqdriver`
+// crossed in batch 12a and reaches `mergeq` as `crate::mergeq::…` now.
 //
 // No visibility widened: neither module had a `pub(crate)` or `pub(super)` item
 // to widen, so unlike batches 3-5 there is no re-export choice to argue here.
@@ -302,7 +305,8 @@ pub use loomux_engine::{queue, queuestate};
 // (batch 2). The impure half stays HERE and is unaffected — `poll_intake` (the
 // two `gh` calls, the `gh` allow-list they go through, the audit records) and
 // `idle_tick_tick` still spell `intake::…` through the line below, exactly as
-// `mqdriver`/`mqloop` do for batches 5/6/9.
+// `mqdriver`/`mqloop` did for batches 5/6/9 (`mqdriver` has since crossed
+// itself, in batch 12a).
 //
 // The re-export is the plain MODULE form, and — as in batch 10 — that is
 // measured rather than stylistic. EVERY consumer spells the module path:
@@ -341,6 +345,29 @@ pub use loomux_engine::{queue, queuestate};
 // leave it green over a poller that had stopped calling the builder at all.)
 pub use loomux_engine::intake;
 
+// #888 slice A3 batch 12a — `mqdriver`, the merge queue's write primitives
+// (#581 slice D1). There is NO `pub use` line for it here, and that is the one
+// thing about this batch worth reading before the `pub mod mqdriver;` at the top
+// of this file misleads somebody: that module declaration is still there, and it
+// now names a curated re-export MODULE (`orchestration/mqdriver.rs`) rather than
+// the implementation, which is `crates/loomux-engine/src/mqdriver.rs`. Batch 7
+// did the same for `obs.rs`; the argument for choosing that shape over the plain
+// `pub use loomux_engine::mqdriver;` batches 10 and 11 would have written lives
+// in that file's header, because it is about three items' visibility and belongs
+// next to the lines that fix it. Short form: every consumer spells the module
+// path, so the shape follows the callers as always — but this is the first
+// moving module with `pub(super)` items (`as_args`, `landable`,
+// `declares_ci_green`, all reached from `mqloop`, which is batch 12b), so the
+// re-export also has a narrowing to buy, and #988's trap has something real to
+// catch for the first time since batch 9.
+//
+// Everything outbound was already across — `mergeq` (batch 6), `notify` (batch
+// 3), `workflow` (batch 5), `capture_raw_with_timeout` (batch 9) — so the moved
+// file's edits are four import prefixes and the three visibility keywords. What
+// stays HERE is the wiring it always was: `queue_merge_with`,
+// `mq_drive_group_with` and the `mq_runner_override` still spell
+// `mqdriver::MqRunner`, `mqdriver::runner_for` and `mqdriver::audit_action::…`,
+// unchanged, through `orchestration/mqdriver.rs`.
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::cell::Cell;

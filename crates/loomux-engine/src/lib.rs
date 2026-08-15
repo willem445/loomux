@@ -149,13 +149,15 @@
 //! in doc comments — and prose does not make an edge. What matters is that no
 //! `mergeq` path appears in a body, which is the thing to check; counting the
 //! mentions is neither necessary nor, as it turned out, easy to get right.
-//! `mqdriver` is `workflow`'s heaviest consumer and stays behind on purpose —
+//! [`mqdriver`] is `workflow`'s heaviest consumer and stayed behind on purpose —
 //! it reaches `capture_raw_with_timeout` (glossed here at the time as "the pane
 //! host, which is slice A3"; batch 9 re-measured that call and found no host in
 //! it — see below).
 //! **An inbound edge never blocks a move**, because the re-export answers it:
-//! `mqdriver` still spells `super::workflow::…` and never learned anything
-//! changed. Only outbound edges decide what a batch has to contain.
+//! for six batches `mqdriver` went on spelling `super::workflow::…` and never
+//! learned anything had changed. Only outbound edges decide what a batch has to
+//! contain. (It crossed in batch 12a; those imports are `crate::workflow::…`
+//! now. The rule is what survives, not the example.)
 //!
 //! One outbound edge did not exist when this batch was planned, because batch 4
 //! created it. `Block::instructions_file` calls `role_instructions_file`, which
@@ -189,7 +191,8 @@
 //! **cycle** — no batch order existed that moved either alone. `mergeq` and
 //! `mergeqview` are a **chain**: `mergeqview` reads `mergeq` and nothing else,
 //! and `mergeq` never reads back. So `mergeqview` *could* have stayed behind
-//! and reached the engine through the re-export, exactly as `mqdriver` does; it
+//! and reached the engine through the re-export, exactly as `mqdriver` then did
+//! for six batches; it
 //! comes because it is a pure projection with no other edge and nothing in the
 //! Tauri half to be near, not because the compiler insisted. **A cycle decides
 //! a batch's contents; a chain only invites them** — and a batch that cannot
@@ -199,10 +202,12 @@
 //! prose. `mqdriver` and `mqloop` do not merely name `mergeq` in doc comments:
 //! they import from it in their bodies (`use super::mergeq::{new_batch_id,
 //! scratch_branch, …}`, `use super::mergeqview::MERGE_QUEUE_FILE`) and call
-//! `mergeq::recheck_gate`. Both stay in `src-tauri` — for the edges they had at
-//! the time, which batch 9 re-measured and found were not host edges at all
-//! (see its entry below) — both spell `super::` exactly as before, and both
-//! compile against the re-export. Batch 5 established that prose is not an edge; the
+//! `mergeq::recheck_gate`. Both stayed in `src-tauri` — for the edges they had
+//! at the time, which batch 9 re-measured and found were not host edges at all
+//! (see its entry below) — both spelled `super::` exactly as before, and both
+//! compiled against the re-export. (`mqdriver` crossed in batch 12a and `mqloop`
+//! is batch 12b; what the pair demonstrated here is unaffected by their having
+//! since moved.) Batch 5 established that prose is not an edge; the
 //! other half belongs beside it, because it is the half that misleads: **a
 //! body-level inbound edge is a genuine edge and still does not block a move.**
 //! Only outbound edges decide what a batch has to contain.
@@ -286,7 +291,7 @@
 //! that will not survive the next reader.
 //!
 //! The other half is what "host primitive" turned out NOT to mean. Both were
-//! called pane-host calls when A3 was planned — `mqdriver` stayed behind in
+//! called pane-host calls when A3 was planned — [`mqdriver`] stayed behind in
 //! batch 5 on the stated ground that it "reaches the pane host
 //! (`capture_raw_with_timeout`)" — and re-measuring the cluster at the start of
 //! this batch found no host edge in either: no `tauri`, no `AppHandle`, no pty,
@@ -298,11 +303,13 @@
 //!
 //! `subproc` has exactly one outward edge, [`obs::LockExt`] (`lock_safe` on the
 //! abandoned-reader backlog), which batch 7 brought across for precisely this;
-//! `fsatomic` has none. Both leave every caller in `src-tauri` —
+//! `fsatomic` has none. Both left every caller of the day in `src-tauri` —
 //! `OrchRegistry::capture_with_timeout`, `mqdriver`'s `ProcessRunner`, and
 //! every `atomic_write` call site — resolving through curated item-list
 //! re-exports in `orchestration/mod.rs`, which is why the integration suite
-//! needed no edit.
+//! needed no edit. (`mqdriver` is [`mqdriver`] here as of batch 12a and calls
+//! [`subproc::capture_raw_with_timeout`] directly; `atomic_write`'s callers are
+//! unaffected.)
 //!
 //! A3 batch 10 — the DELIVERY QUEUE: [`queue`], the pure core of the per-pane
 //! FIFO (#445/#468/#467 — admission, coalescing, the flush plan, the
@@ -379,6 +386,48 @@
 //! in `src-tauri`. That caller is here now, so the line has no consumer left and
 //! comes off the list — `orchestration/mod.rs`'s re-exports are meant to read as
 //! the live list, and a dead one makes the next reader re-derive it.
+//!
+//! A3 batch 12a — [`mqdriver`], the merge queue's **write primitives** (#581
+//! slice D1): the [`mqdriver::MqRunner`] seam and its process implementation,
+//! the live default-branch and PR lookups, the [`mqdriver::validate_target`]
+//! refusal core all three §7 enforcement points funnel through, scratch minting
+//! with its remote collision check, the create-only scratch push, the landing
+//! push, the [`mqdriver::BatchVerification`] adapter over [`notify`]'s
+//! classification, and namespace-exact cleanup.
+//!
+//! The module every batch since 5 named as the one staying behind, and it turned
+//! out to owe nothing further: its whole outbound set — [`mergeq`] (batch 6),
+//! [`notify`] (batch 3), [`workflow`] (batch 5) and
+//! [`subproc::capture_raw_with_timeout`] (batch 9) — was already across, so the
+//! move is import prefixes and a re-export. Batch 5 left it behind for a host
+//! edge batch 9 then measured away; batches 6, 9 and 10 each restated it as the
+//! standing example of an inbound edge answered by a re-export. **Six batches of
+//! prose about why a module could not move, and the reason had expired three
+//! batches earlier** — batch 9's rule, sharpened: re-derive the edge set from the
+//! source, and treat this crate's own header as the *least* reliable place to
+//! read it, because it is where a superseded reason survives best.
+//!
+//! No dependency joins (`serde`, `serde_json`, `std`, all declared since batch 3)
+//! and the file is clean under batch 7's macro sweep. No test reads it by path,
+//! so batch 11's finding does not bite either.
+//!
+//! Its own finding is the **re-export shape**, and it is the case batches 10 and
+//! 11 had not met. Both established that the shape follows what the callers
+//! spell, and every consumer here spells the module path — so the plain
+//! `pub use loomux_engine::mqdriver;` is where that rule points. It is not what
+//! `src-tauri` got, because the rule's second clause decides it: take the item
+//! list **when it buys a narrowing that is real** (#988). Unlike `queue`,
+//! `queuestate` and `intake`, this module had three `pub(super)` items —
+//! [`mqdriver::as_args`], [`mqdriver::landable`] and
+//! [`mqdriver::declares_ci_green`] — whose only caller, `mqloop`, is still in
+//! `src-tauri` until batch 12b. So `orchestration::mqdriver` is a curated
+//! re-export **module** (batch 7's `obs.rs` shape): the module path every call
+//! site spells is preserved, and the three keep their `pub(super)` reach under
+//! it. The items themselves widen here and no re-export can stop that, exactly
+//! as [`fsatomic::atomic_write`] did in batch 9. **The two shapes are not
+//! alternatives ordered by taste** — a `pub use` line answers "what spelling do
+//! callers use", a re-export module answers that *and* "what reach did each item
+//! have", and only the second question was live before this batch.
 
 pub mod fsatomic;
 pub mod groupid;
@@ -388,6 +437,7 @@ pub mod locks;
 pub mod mergeq;
 pub mod mergeqview;
 pub mod model;
+pub mod mqdriver;
 pub mod notify;
 pub mod obs;
 pub mod profiles;

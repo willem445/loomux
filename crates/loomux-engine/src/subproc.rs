@@ -120,7 +120,7 @@ pub fn wait_bounded(
 /// into `Err`, which is right for a `gh` read whose only question is "did it
 /// work". The merge queue cannot: `git ls-remote --exit-code` answers "does
 /// this ref exist" as `0` vs `2`, so for it a non-zero exit is **data**
-/// (`mqdriver::CmdOut`). Writing that a second time would be a second
+/// ([`crate::mqdriver::CmdOut`]). Writing that a second time would be a second
 /// implementation of the one primitive here that must not have two —
 /// every arm of it exists because of a specific way an unbounded wait bites.
 ///
