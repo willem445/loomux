@@ -537,24 +537,40 @@ from a unit test of product code, agents are banned from running cargo locally
     `#[serde(rename…)]` attrs move verbatim, so its wire/persisted shape
     (`queue.json`'s `delivery_kind`) is byte-identical, and the queue snapshot
     round-trip tests that pin that shape do NOT move with it. The integration
-    suite needed zero edits — every `Delivery::…` call site (over a hundred,
-    across `mod.rs`, `queue.rs`, `queuestate.rs`, `mcp.rs` and the integration
-    suite), the 15 `mod.rs` uses of `LOOMUX_NOTICE_MARKER` plus 5
-    integration-test uses, and the two consts' `mod.rs`/`intake.rs` uses all
-    reach the moved items through the flat `orchestration::…` re-export,
-    unchanged.
+    suite needed zero edits — every `Delivery::…` call site across `mod.rs`,
+    `queue.rs`, `queuestate.rs`, `mcp.rs` and the integration suite reaches the
+    moved enum through the flat `orchestration::…` re-export unchanged, and the
+    same is true of every `LOOMUX_NOTICE_MARKER` use — `mod.rs`'s own (both
+    code and doc-comment), `queue.rs`'s live check at `queue.rs:1034`, and the
+    integration suite's — and of the two consts' `mod.rs`/`intake.rs` uses.
+    (Per #973: state that fact, not a count of it — a grep-derived number rots
+    the moment either file gains or loses a use, and is only worth stating
+    where the point is the number itself, e.g. counting toward a cap.)
 
-    **Visibility widened, batch-3 precedent — three items, one item unchanged:**
+    **Visibility widened, batch-3 precedent — three items, one item unchanged.
+    State the reachability precisely rather than reach for "unchanged" or
+    "narrowed" — model.rs:61-73 is the standing correction for this exact
+    phrasing, and it applies here too:**
     - `Delivery::wait_ready` was bare module-private in `src-tauri`. It is
       `pub` in the engine now, forced by the crate boundary (`mod.rs`'s own
       callers are a different crate), with no re-export able to narrow it back
       — a method's visibility is the defining crate's to set, the same fact
       batch 4 states for `Role::prefix`/`Role::as_str`.
     - `DEFAULT_IDLE_TICK_MINUTES` and `DEFAULT_INTAKE_POLL_MINUTES` were both
-      bare module-private consts. They are `pub` in the engine (forced, same
-      reason) and re-exported `pub(crate)` from `mod.rs`, which narrows the
-      reach back to "this crate" — the closest a cross-crate re-export can get
-      to the original "this module and its descendants" reach.
+      bare module-private consts. They are `pub` in the engine now (forced,
+      same reason). `mod.rs`'s `pub(crate) use` narrows only the FLAT spelling
+      (`orchestration::DEFAULT_IDLE_TICK_MINUTES`, the one `mod.rs`/`intake.rs`
+      actually call) back to "this crate". It does NOT narrow the item overall:
+      `mod.rs` already re-exports the whole `model` module publicly (`pub use
+      loomux_engine::model::{self, …}`), so both consts are also reachable as
+      `orchestration::model::DEFAULT_IDLE_TICK_MINUTES` — and, since that path
+      crosses no crate-private boundary, as
+      `loomux_lib::orchestration::model::DEFAULT_IDLE_TICK_MINUTES` from
+      outside the crate too. Forced and harmless, on the same terms `model.rs`
+      states for `default_model`/`sanitize_model_opt`: an item must be `pub`
+      here to cross the boundary at all, and `loomux-engine` is
+      `publish = false` — "public" means reachable by a sibling crate in this
+      workspace, not a shipped API promise.
     - `LOOMUX_NOTICE_MARKER` was already `pub` in `src-tauri`, so nothing
       widens there.
   - **`digest` is not a leaf** despite reading like one. It calls

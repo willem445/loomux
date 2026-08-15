@@ -154,16 +154,25 @@ pub use loomux_engine::{mergeq, mergeqview};
 // (join `model`, since the latter is defined IN TERMS OF the former and the
 // two travel together).
 //
-// Visibility widened, batch-3 precedent (state it, don't only imply it):
+// Visibility widened, batch-3 precedent (state it, don't only imply it — and
+// state it precisely: model.rs:61-73 is the standing correction for the
+// convenient-but-wrong phrasing here, and it applies again below):
 // - `Delivery::wait_ready` was bare module-private in `src-tauri`; it is
 //   `pub` in the engine now, forced by the crate boundary, with no
 //   re-export to narrow it back — a method's visibility is the defining
 //   crate's to set, same fact batch 4 states for `Role::prefix`/`as_str`.
 // - `DEFAULT_IDLE_TICK_MINUTES` and `DEFAULT_INTAKE_POLL_MINUTES` were both
-//   bare module-private consts; they are `pub` in the engine (forced, same
-//   reason) and re-exported `pub(crate)` below, which narrows the reach
-//   back to "this crate" — the closest a cross-crate re-export can get to
-//   the original "this module and its descendants" reach.
+//   bare module-private consts; they are `pub` in the engine now (forced,
+//   same reason). The `pub(crate) use` below narrows only the FLAT spelling
+//   (`orchestration::DEFAULT_IDLE_TICK_MINUTES`, the one this file and
+//   `intake.rs` actually call) back to "this crate". It does NOT narrow the
+//   item overall: line 92's `self` already re-exports the whole `model`
+//   module publicly, so both consts are also reachable as
+//   `orchestration::model::DEFAULT_IDLE_TICK_MINUTES` — and, since that path
+//   crosses no crate-private boundary, as
+//   `loomux_lib::orchestration::model::DEFAULT_IDLE_TICK_MINUTES` from
+//   outside this crate too. Forced and harmless, same terms as `model.rs`'s
+//   own header states for `default_model`/`sanitize_model_opt`.
 // - `LOOMUX_NOTICE_MARKER` was already `pub`, so nothing widens there.
 pub use loomux_engine::model::Delivery;
 pub(crate) use loomux_engine::model::{DEFAULT_IDLE_TICK_MINUTES, DEFAULT_INTAKE_POLL_MINUTES};

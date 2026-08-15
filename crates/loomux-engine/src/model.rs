@@ -720,10 +720,23 @@ impl Delivery {
 /// in an 8-minute session. Per-group tunable (`set_idle_tick_minutes`) so the human
 /// can drop it to 1–2 min to verify quickly. See `idle_tick_should_fire`.
 ///
-/// `pub` here though it was bare-private in `src-tauri` — batch 8's second
-/// forced widening. `mod.rs` re-exports it `pub(crate)`, which narrows the
-/// reach back to "this crate" — the closest a cross-crate re-export can get
-/// to the original bare-private reach of "this module and its descendants".
+/// `pub` here though it was bare module-private in `src-tauri` — batch 8's
+/// forced widening, the same shape this module's "Widened on the way in"
+/// section (above) argues for `default_model`/`sanitize_model_opt`. State the
+/// reachability precisely rather than reach for "unchanged": `mod.rs`'s
+/// `pub(crate) use` narrows only the FLAT spelling
+/// (`orchestration::DEFAULT_IDLE_TICK_MINUTES`, the one `mod.rs`/`intake.rs`
+/// actually call) back to "this crate". It does NOT narrow the item overall —
+/// `mod.rs` already re-exports the whole `model` module publicly (`pub use
+/// loomux_engine::model::{self, …}`), so this const is also reachable as
+/// `orchestration::model::DEFAULT_IDLE_TICK_MINUTES`, and since that path
+/// crosses no crate-private boundary, as
+/// `loomux_lib::orchestration::model::DEFAULT_IDLE_TICK_MINUTES` from outside
+/// the crate too. Forced (an item must be `pub` here to cross the crate
+/// boundary at all) and harmless (`loomux-engine` is `publish = false`; the
+/// module was already a public re-export before this batch, and "public"
+/// here means reachable by a sibling crate in this workspace, not a shipped
+/// API promise).
 pub const DEFAULT_IDLE_TICK_MINUTES: u32 = 5;
 
 /// Idle-tick intake gate (#332/#429): the smart default `intake_poll_minutes`
@@ -732,10 +745,11 @@ pub const DEFAULT_IDLE_TICK_MINUTES: u32 = 5;
 /// quiet-window default) rather than inventing a new cadence: the poller
 /// need not run more often than the tick it feeds ever fires anyway.
 ///
-/// Same forced-`pub`-then-`pub(crate)`-re-exported shape as
-/// [`DEFAULT_IDLE_TICK_MINUTES`] above, for the same reason: `intake.rs`
-/// reaches it through `super::DEFAULT_INTAKE_POLL_MINUTES` from the other
-/// side of the crate boundary now.
+/// Same forced-and-not-narrowed shape as [`DEFAULT_IDLE_TICK_MINUTES`] above:
+/// `mod.rs`'s `pub(crate) use` narrows only the flat
+/// `orchestration::DEFAULT_INTAKE_POLL_MINUTES` spelling `intake.rs` reaches
+/// it through (`super::DEFAULT_INTAKE_POLL_MINUTES`); the module-qualified
+/// path is publicly reachable, for the same forced-and-harmless reason.
 pub const DEFAULT_INTAKE_POLL_MINUTES: u32 = DEFAULT_IDLE_TICK_MINUTES;
 
 #[cfg(test)]

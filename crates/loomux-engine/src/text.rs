@@ -63,7 +63,16 @@ pub fn pr_number(pr: &str) -> Option<u64> {
 ///
 /// #888 slice A3 batch 8: moved here (unchanged, still `pub`) alongside
 /// `pr_number` above — same shape, a pure string constant with consumers
-/// beyond the module that forced its lift. `mod.rs` re-exports it under its
-/// original name, so all 15 `mod.rs` uses and the 5 integration-test uses
-/// keep resolving via `orchestration::LOOMUX_NOTICE_MARKER`.
+/// beyond the module that forced its lift (`mod.rs`, `queue.rs`'s
+/// `is_loomux_notice` check, and the integration suite, all reached through
+/// `mod.rs`'s re-export under this const's original name).
+///
+/// **Demoted, deliberately: the two `[mask_loomux_notices]` intra-doc links
+/// the original `src-tauri` doc above used are now plain backtick-quoted
+/// code text (`mask_loomux_notices`).** `mask_loomux_notices` stayed behind
+/// in `mod.rs` — this is `text`, a leaf with no edge back into `src-tauri` —
+/// so a real intra-doc link here would not resolve (its target is a
+/// different crate) and would either dead-link or need an external URL this
+/// crate has no business hardcoding. Plain code text says the same thing
+/// without promising a link rustdoc cannot make good on.
 pub const LOOMUX_NOTICE_MARKER: &str = "[loomux]";
