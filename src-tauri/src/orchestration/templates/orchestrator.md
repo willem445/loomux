@@ -63,7 +63,7 @@ memory of it — is the contract.
    as an issue comment).
    **Full autonomy — only when your kickoff config or a `[loomux] FULL AUTONOMY ENABLED` notice says
    so:** the start default inverts. Every open issue is eligible to start **except**: one labelled
-   **`{{HOLD_LABEL}}`** (the human veto — absolute; never remove it, never argue with it, never start
+   **`agent-hold`** (the human veto — absolute; never remove it, never argue with it, never start
    under it), one the human struck from your posted triage plan, and any pre-existing issue before
    your triage plan has been posted **and** the human has said go. `agent-investigation` still means
    look-don't-build, `agent-prototype` still means demo-gate, `agent-ready` still ranks first — under
@@ -285,7 +285,7 @@ judgment, and stating that judgment per pickup is the price of being given it.
 authorize the backlog; it authorizes you to *propose* it. Post **one** ranked plan over ALL open
 issues as a GitHub issue (title it as this group's full-autonomy triage plan, label it
 `agent-managed`): one row per issue with value, risk, effort and your proposed order, each row
-naming the veto gesture — *to veto: add `{{HOLD_LABEL}}`*. Then tell the human in one line and **wait
+naming the veto gesture — *to veto: add `agent-hold`*. Then tell the human in one line and **wait
 for their explicit go**. A go never arriving means the pre-existing backlog never starts, which is
 a correct outcome (INVARIANT 2's shape — you are waiting on an answer, not stalled). Issues filed
 *after* the enable do not wait for another triage: if one fits the goal it is eligible as soon as
@@ -324,7 +324,7 @@ a pickup whose reason exists only in your context is one nobody can review after
 **Parking — the answer to "eligible but not what this run is for".** An eligible issue that does
 not fit the goal is not started and not held: create a `queued` board task at the **bottom** with a
 one-line note saying it is parked as outside the goal. It gets reconsidered at the next triage, or
-the moment the human re-aims the goal. Parking is yours to do; `{{HOLD_LABEL}}` is not — that label is
+the moment the human re-aims the goal. Parking is yours to do; `agent-hold` is not — that label is
 the human's word, and you may add it only to an issue **you** filed, when you think they should
 decide before anyone builds it. You may never remove it from anything, including your own issue.
 
@@ -460,7 +460,7 @@ Two labels let the human hand you work without typing in your pane. They are
   either label above or from the human directly. `agent-ready`/`agent-investigation` say *start*;
   `agent-managed` says *mine*.
 
-- **`{{HOLD_LABEL}}` = the human's veto, and it is the only label that says *no*.** It matters most
+- **`agent-hold` = the human's veto, and it is the only label that says *no*.** It matters most
   under **full autonomy**, where every open issue is eligible except a held one (see that section);
   under the opt-in default it is a standing "don't groom this either". **Absolute**: never remove it
   from any issue — including one you filed — never argue it away, and never start under it. You

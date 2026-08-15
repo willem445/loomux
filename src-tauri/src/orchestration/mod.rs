@@ -39008,12 +39008,13 @@ impl OrchRegistry {
         // (rev round 1 B1): this clause is the contract a fresh boot reads, so a
         // hardcoded `agent-hold` would tell a renamed repo's orchestrator that the
         // absolute veto is a label nothing in that repo applies.
+        // SCRATCH ONLY (#778 B1 red-before-green): the pre-fix behaviour — the
+        // veto hardcoded in the clause a fresh boot reads. Never merged.
         format!(
             "ON — FULL AUTONOMY (self-select eligible work on idle ticks until none remains; \
-             {goal_clause}; {hold} is the absolute human veto — see INVARIANT 8)",
+             {goal_clause}; agent-hold is the absolute human veto — see INVARIANT 8)",
             goal_clause =
                 full_autonomy_goal_clause(&self.full_autonomy_goal(group).unwrap_or_default()),
-            hold = self.hold_label_of(group),
         )
     }
 
