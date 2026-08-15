@@ -146,6 +146,34 @@ export async function ftRootIsDir(root: string): Promise<boolean> {
   }
 }
 
+/** Declare `path` a filesystem root this engine may be asked to work under (#1042).
+ *
+ *  The local webview is a trusted source and may declare anything — it already owns
+ *  the disk. What it is declaring is that a HUMAN chose this folder (a native picker,
+ *  a typed path, a recorded root being restored), which is the distinction the whole
+ *  design rests on: a gesture admits, an agent-controlled byte stream (a pane's OSC-7
+ *  cwd report) never does. The backend command is off the wire roster, so a remote
+ *  peer can use declared roots and can never mint one.
+ *
+ *  **Await it before the first use of that root**, not after: once slice C wires
+ *  boundary `resolve`, an `ft_list_dir` racing ahead of the declaration is refused.
+ *  Today nothing resolves, so ordering is free — which is exactly why getting it
+ *  right now costs nothing and getting it wrong would be invisible.
+ *
+ *  Never throws. `true` means the path is a directory and is now declared; `false`
+ *  means it was refused (missing, not a directory, not absolute) — the same shape of
+ *  answer `ftRootIsDir` gives, so a caller may use it as the probe. Callers that only
+ *  need the declaration ignore the result. */
+export async function admitRoot(path: string): Promise<boolean> {
+  if (!path.trim()) return false;
+  try {
+    await invoke("admit_root", { path });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export const ftReadFile = (root: string, rel: string): Promise<FileRead> =>
   invoke("ft_read_file", { root, rel });
 
