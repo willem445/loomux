@@ -38,8 +38,11 @@
   --line-strong: #343945;
 
   /* --- ink. `--ink-faint` is below AA by design: non-essential meta and rules only.
-         Anything a user must read takes --ink-dim or better. */
-  --ink: #e7e9ee;
+         Anything a user must read takes --ink-dim or better. `--ink` was toned down from
+         15.6:1 to ~12.5:1 on the app ground at the human's request (#1020 item 11) — the
+         candidate matrix and the value's provenance live on PALETTE.mist000 in theme.ts,
+         the source of truth this token is pinned to. */
+  --ink: #cfd2d9;
   --ink-dim: #9ba3b1;
   --ink-faint: #656d7b;
 

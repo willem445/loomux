@@ -48,7 +48,29 @@ export const PALETTE = {
 
   // --- mist: the ink. `mist400` is BELOW 4.5:1 on every ground by design — it is for
   //     non-essential meta and rules only. Anything a user must read uses mist200 or better.
-  mist000: "#e7e9ee", // primary ink            (15.6:1 on slate100)
+  //
+  //     mist000 was toned down from its original 15.6:1 (#e7e9ee) at the human's request —
+  //     "a little extreme" against the near-black grounds (#1020 item 11). The candidate
+  //     matrix considered, measured against slate100 (the app ground) with the identical
+  //     WCAG formula test/theme.test.ts runs, all comfortably clear the ramp's own AAA floor
+  //     (>=7:1 on every ground, test: "the ink ramp keeps the contrast the design note
+  //     promises") with room to spare even on slate300, the lightest ground it sits on:
+  //
+  //       candidate      hex        surface0   surface1   surface2   surfaceTerm
+  //       mild trim      #d7dae0    13.50:1    12.80:1    11.78:1    14.06:1
+  //       DEFAULT (mid)  #cfd2d9    12.49:1    11.85:1    10.90:1    13.01:1   <- shipped
+  //       strong trim    #c7cad2    11.53:1    10.94:1    10.06:1    12.01:1
+  //
+  //     DEFAULT was picked as the midpoint of the requested ~12-13:1 band. Which candidate
+  //     reads right is a human call at the demo (#1020 human input 4) — swap this one hex
+  //     to move the whole app; nothing else here needs to change (styles.css / index.html
+  //     stay pinned to whichever value lands here). The surface ladder itself (below) was
+  //     deliberately left untouched: its steps are already at the finest gap 8-bit hex can
+  //     express at this luminance (adjacent hex values differ by ~0.02:1 of contrast here),
+  //     so softening it further either does nothing visible or risks breaking the strictly-
+  //     increasing elevation order for no perceptible gain — a call for a design slice with
+  //     room to re-derive the whole ladder, not a same-day tone-down.
+  mist000: "#cfd2d9", // primary ink            (12.5:1 on slate100)
   mist200: "#9ba3b1", // secondary ink          (7.4:1)
   mist400: "#656d7b", // faint meta / dividers  (3.2-3.8:1 — non-text use only)
 
