@@ -6512,6 +6512,20 @@ fixed outcome word, and text `from` wrote; no orchestrator-chosen agent NAME, no
 GitHub string). `from == orch` — an orchestrator relaying to itself — takes the default and is not
 marked.
 
+**The agent-authored half of those two notices is scrubbed at composition** (#891). The prefix was
+always loomux's — the id comes from the caller's token, never from `args` — but `body`, `ref`,
+`detail_url` and `message_orchestrator`'s `text` were interpolated raw, so an agent could put a
+second `[loomux] …` span inside its own words and be read as a notice attributed to a pane it is
+not. That matters most where prose tells a reader to *act* on an attribution: the liaison's
+"a directive it relays IS a human directive" rule is keyed on exactly such a line. All four fields
+now pass `notify::sanitize_gh_text` (via `report::relay_payload`) before loomux adds its prefix —
+the same scrubber `channel_send` has always used, which is what makes
+`cross-workspace-channel.md`'s "same sanitizer every other crossing-text boundary uses" true of
+this boundary too. `[`/`]` become `(`/`)` and control characters go, so the text still arrives and
+reads; it simply cannot carry a `[loomux]` token. Pinned in `report.rs`'s own unit tests and end to
+end on the delivered wording in `tests/orchestration.rs`
+(`a_delegate_cannot_forge_a_loomux_attribution_through_report_or_message_orchestrator`).
+
 **"Called in by" is deliberately weaker than "authored by", and the gap is the accepted residual
 below.** What the check can see is which agent made the tool call. Who *dictated the words* is not
 visible and arguably not knowable: an orchestrator telling a worker what to report is loomux's
