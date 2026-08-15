@@ -35008,11 +35008,25 @@ impl OrchRegistry {
                 )
             })
             .collect();
+        // The fan-out list — and a liaison is NOT in it (#891 S3). A liaison block
+        // is reviewer-KIND (it rides the class for its posture and reviews nothing),
+        // so a bare `kind == Reviewer` filter fans PRs out to a pane that is denied
+        // `review_verdict` and can satisfy no gate. It fails closed, like the
+        // `block_for` trap `doc/design/liaison.md` records, but it also puts a flat
+        // contradiction in one document: the liaison note two paragraphs above says
+        // no PR is routed to it for a verdict.
+        //
+        // `is_reviewing_block` rather than a local closure because `block_note`'s
+        // "you are one of N reviewer blocks" lane needs exactly the same answer —
+        // one of those two surfaces fixed alone leaves the contradiction live on the
+        // other. This is deliberately NOT the merge-gate path: `parse_workflow`
+        // already refuses a gate that names a liaison, and that refusal is the S1
+        // rule this one sits beside, not a rule this one replaces.
         let reviewers: Vec<String> = g
             .guardrails
             .blocks
             .iter()
-            .filter(|b| b.kind == Role::Reviewer)
+            .filter(|b| workflow::is_reviewing_block(b))
             .map(|b| format!("`{}`", b.id))
             .collect();
         // Leading blank line, and the fragment's own trailing one trimmed: the
@@ -35065,14 +35079,20 @@ impl OrchRegistry {
     /// voice, and "everything else in this document still holds" would be
     /// pointing at a document that isn't there.
     fn block_note(&self, g: &GroupInfo, b: &workflow::Block) -> String {
+        // The blocks that actually review, not merely the reviewer-kind ones
+        // (#891 S3) — a liaison in this list would tell a real reviewer it shares
+        // its lanes with a pane that reviews nothing, and would tell the LIAISON it
+        // is one of N reviewers, which is the opposite of everything its own
+        // mechanics say. Same predicate as `workflow_section`'s fan-out list, so
+        // the two surfaces cannot disagree.
         let reviewers: Vec<&str> = g
             .guardrails
             .blocks
             .iter()
-            .filter(|x| x.kind == Role::Reviewer)
+            .filter(|x| workflow::is_reviewing_block(x))
             .map(|x| x.id.as_str())
             .collect();
-        let multi_reviewer = b.kind == Role::Reviewer && reviewers.len() > 1;
+        let multi_reviewer = workflow::is_reviewing_block(b) && reviewers.len() > 1;
         // A reviewer the group's merge gate NAMES is told so, whatever else is true of
         // it (#222/#197). This has to be part of the early-return test, not just an
         // extra paragraph: a gate can name a plain built-in `reviewer` block with no
