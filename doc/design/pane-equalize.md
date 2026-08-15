@@ -81,15 +81,43 @@ since every individual weight is still a finite positive number and only their
 *sum* is nonsense. The newcomer's mean is then `Infinity`, and so is every pane
 in the split.
 
+**What the exponential form does and does not cost, since it is the number
+people notice first.** The threshold is exact and it is JavaScript's, not
+CSS's: `String(n)` switches to exponential at 1e21, and 1.5^120 is
+`1.3519202917880824e+21` — so a two-pane row reaches it at almost exactly the
+120 cycles above, and `style.flex` is then written as
+`"1.3519202917880824e+21 1 0"`. It is tempting to call that a parse failure and
+make it the case for the band. **It is not one.** CSS `<number>` has permitted
+scientific notation since css-values-3 ("optionally, it can be concluded by the
+letter `e` or `E` followed by an integer indicating the base-ten exponent"), it
+has been available across browsers since 2015, and `JSON.parse` round-trips the
+same literal, so neither the style attribute nor `tabs.json` is damaged by the
+notation itself. What the exponential form actually costs is that the numbers
+stop being readable, diffable or hand-editable — in DevTools, in a saved layout,
+in a bug report — while the *real* cliff, `Infinity`, keeps approaching behind
+it. The band is worth having for the cliff; the exponential notation is the
+early warning that the row is heading for it, and is worth writing down mainly
+so nobody re-derives the dropped-declaration story and fixes this for a reason
+that isn't true.
+
 So `paneequalize.ts` re-bases a row whose largest weight has left `[1e-3, 1e3]`,
 putting that largest pane back at exactly 1 — the value a fresh pane is written
 at. Three things make this cheap rather than a second policy:
 
-- **It cannot move a pane.** Both operations commute with a uniform rescale
-  (the mean of `k·w` is `k·mean`; an equal absolute share of `k·freed` is
-  `k·each`), so magnitude carries no layout information at all. The test
-  compares an absurdly-scaled row's results against the same shape at 1x and
-  demands identical shares.
+- **It cannot move a pane** — with one pathological exception, which is why the
+  code applies the per-weight repair twice. Both operations commute with a
+  uniform rescale (the mean of `k·w` is `k·mean`; an equal absolute share of
+  `k·freed` is `k·each`), so magnitude carries no layout information at all; the
+  test compares an absurdly-scaled row's results against the same shape at 1x
+  and demands identical shares. The exception is a row whose *spread* is already
+  wider than a float can hold: `[1e-320, 1e300]` re-bases **through zero** —
+  `1e-320 / 1e300` underflows — and the repair then lifts that zero back to 1,
+  so a pane holding ~1e-620 of the row comes out holding half of it. That is a
+  real share change, and it is the one the heading would otherwise deny. It is
+  also unreachable by anything the app itself does: drift is a uniform rescale,
+  which never widens spread, and a divider drag is bounded by the pixels on
+  screen. Only a hand-edited `tabs.json` gets there — and the alternative,
+  writing the zero through, is a pane that cannot be seen or clicked at all.
 - **It is measured on the largest weight, not the total,** because a total can
   already be `Infinity` by the time anything looks at it, and catching that is
   half the point.
@@ -98,6 +126,10 @@ at. Three things make this cheap rather than a second policy:
   a human may recognise in DevTools or in a persisted layout. Doing it only once
   they have stopped being readable keeps the common path byte-for-byte what it
   was, which is also why every assertion written for #936 still holds unchanged.
+  `1e3` also leaves the whole approach to `Infinity` on the far side of the
+  band: a re-based row is bounded by ~1.5e3 after any single operation, which is
+  305 decimal orders of headroom, so the overflow case is not being defended
+  against by a narrow margin.
 
 It is self-healing in the direction that matters: a layout saved by a build
 without this comes back at whatever magnitude it drifted to and is re-based by
