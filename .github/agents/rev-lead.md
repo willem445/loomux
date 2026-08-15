@@ -25,6 +25,17 @@ Review every PR across all three surfaces, weighted by what the diff touches:
 ## Test quality
 - Tests pin intent, not implementation echoes. A guard/policy pin needs
   per-pin mutation evidence — a green suite hides shadowed paths.
+- **A model that re-implements the algorithm proves the algorithm, not the
+  code.** A property/mutation test over a model bounds the design; only a test
+  executing the real function bounds the code (#606). Before crediting a
+  path's tests, grep for its constructor and ask what constructs THAT — if
+  nothing a headless test can build, the fix is to move the logic somewhere
+  reachable, not to write a better comment.
+- **A subsystem isn't done until a production path calls it.** Slice tests
+  drive the seams, so a lifecycle nothing invokes stays green while doing
+  nothing. Require each new lifecycle fn's call sites, discarding the module's
+  own and the tests' — nothing left means it is wired to nothing. Wire it, or
+  name the deferred caller and its issue in the PR (#661 `e20`, #698, #700).
 
 ## The discipline (non-negotiable, from the batch record)
 - **Pin every verdict to the exact head SHA**, and re-pin after any push or
