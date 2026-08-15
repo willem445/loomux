@@ -15332,8 +15332,14 @@ fn poll_intake_still_asks_gh_for_comment_and_review_activity() {
          every other test still green"
     );
 
-    let intake = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/orchestration/intake.rs"))
-        .expect("read src/orchestration/intake.rs");
+    // #888 A3 batch 11 moved `intake.rs` into `loomux-engine`; the scan follows
+    // the file, because what it pins is a serde rename inside THAT file and no
+    // other. Spelled the way `tests/groupid.rs` spells its second source root.
+    let intake = fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../crates/loomux-engine/src/intake.rs"
+    ))
+    .expect("read crates/loomux-engine/src/intake.rs");
     for field in ["createdAt", "submittedAt"] {
         assert!(
             intake.contains(&format!("rename = \"{field}\"")),

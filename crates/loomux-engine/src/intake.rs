@@ -5,11 +5,12 @@
 //! `notify.rs`'s split exactly: no `gh`, no lock, everything here is a plain
 //! function over plain data (most of it over `gh --json` output already
 //! captured as a string), so it is unit-testable with canned fixtures. See
-//! `OrchRegistry::poll_intake`/`idle_tick_tick` (mod.rs) for the impure half
-//! and `doc/design/orchestration.md`'s "Idle-tick intake gate" section for
+//! `OrchRegistry::poll_intake`/`idle_tick_tick` (`src-tauri`'s
+//! `orchestration/mod.rs`) for the impure half and
+//! `doc/design/orchestration.md`'s "Idle-tick intake gate" section for
 //! the design rationale.
 
-use super::notify;
+use crate::notify;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 
@@ -911,7 +912,7 @@ impl PendingIntake {
 ///   `autonomous` — a value a human bothered to set is never second-guessed.
 pub fn effective_intake_poll_minutes(config: Option<u32>, autonomous: bool) -> u32 {
     match config {
-        None if autonomous => super::DEFAULT_INTAKE_POLL_MINUTES,
+        None if autonomous => crate::model::DEFAULT_INTAKE_POLL_MINUTES,
         None => 0,
         Some(explicit) => explicit,
     }
@@ -1043,8 +1044,12 @@ pub const MAX_INTAKE_POLLS_PER_TICK: usize = 4;
 /// due set always yields the same selection: never-polled groups all share
 /// `last = 0`, and the round-robin can only be fair if the tiebreak is
 /// deterministic rather than the map's iteration order.
-pub fn due_intake_polls(now_ms: u64, groups: &HashMap<super::GroupId, u32>, last_poll_ms: &HashMap<super::GroupId, u64>) -> Vec<super::GroupId> {
-    let mut due: Vec<(u64, &super::GroupId)> = groups
+pub fn due_intake_polls(
+    now_ms: u64,
+    groups: &HashMap<crate::groupid::GroupId, u32>,
+    last_poll_ms: &HashMap<crate::groupid::GroupId, u64>,
+) -> Vec<crate::groupid::GroupId> {
+    let mut due: Vec<(u64, &crate::groupid::GroupId)> = groups
         .iter()
         .filter(|(_, &minutes)| minutes > 0)
         .filter_map(|(group, &minutes)| {
@@ -1061,7 +1066,7 @@ pub fn due_intake_polls(now_ms: u64, groups: &HashMap<super::GroupId, u32>, last
 mod tests {
     use super::*;
 
-    use super::super::GroupId;
+    use crate::groupid::GroupId;
     /// #904: the one constructor, in tests as in production.
     fn gid(s: &str) -> GroupId {
         GroupId::parse(s).unwrap()
@@ -2250,7 +2255,7 @@ mod tests {
 
     #[test]
     fn unset_config_smart_defaults_on_while_autonomous() {
-        assert_eq!(effective_intake_poll_minutes(None, true), super::super::DEFAULT_INTAKE_POLL_MINUTES,
+        assert_eq!(effective_intake_poll_minutes(None, true), crate::model::DEFAULT_INTAKE_POLL_MINUTES,
             "the dead-default trap (autonomous ON, gate silently off) must be structurally \
              impossible without an explicit opt-out");
     }

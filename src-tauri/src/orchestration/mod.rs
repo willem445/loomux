@@ -15,7 +15,6 @@
 
 pub mod digest;
 pub mod humanq;
-pub mod intake;
 pub mod mcp;
 pub mod mqdriver;
 pub mod mqloop;
@@ -45,11 +44,12 @@ pub use loomux_engine::groupid::{self, GroupId, GroupIdError};
 // `pr_number` — and both of those are pure string functions rather than
 // registry state. So the helpers moved into the engine ahead of their callers
 // (`loomux_engine::text`) and the modules followed, which is the cheaper answer
-// than inventing a trait to reach back for a `&str` cut. `humanq` and `intake`
-// stay in this crate and reach `notify` through the re-export below exactly as
-// they always did — `super::notify::sanitize_gh_text` still resolves, and
-// `humanq` in particular does not move: it is #946/#959 trust-boundary code
-// whose relocation is a decision of its own, not a side effect of this one.
+// than inventing a trait to reach back for a `&str` cut. `humanq` stays in this
+// crate and reaches `notify` through the re-export below exactly as it always
+// did — `super::notify::sanitize_gh_text` still resolves — and it does not move:
+// it is #946/#959 trust-boundary code whose relocation is a decision of its own,
+// not a side effect of this one. (`intake` was the other module named here; it
+// crossed in batch 11 below and reaches `notify` as `crate::notify` now.)
 pub use loomux_engine::{lessons, notify};
 
 // The two helpers themselves, re-exported under the names they had while they
@@ -165,18 +165,26 @@ pub use loomux_engine::{mergeq, mergeqview};
 // - `DEFAULT_IDLE_TICK_MINUTES` and `DEFAULT_INTAKE_POLL_MINUTES` were both
 //   bare module-private consts; they are `pub` in the engine now (forced,
 //   same reason). The `pub(crate) use` below narrows only the FLAT spelling
-//   (`orchestration::DEFAULT_IDLE_TICK_MINUTES`, the one this file and
-//   `intake.rs` actually call) back to "this crate". It does NOT narrow the
-//   item overall: line 92's `self` already re-exports the whole `model`
-//   module publicly, so both consts are also reachable as
-//   `orchestration::model::DEFAULT_IDLE_TICK_MINUTES` — and, since that path
-//   crosses no crate-private boundary, as
+//   (`orchestration::DEFAULT_IDLE_TICK_MINUTES`, the one this file actually
+//   calls) back to "this crate". It does NOT narrow the item overall: line 92's
+//   `self` already re-exports the whole `model` module publicly, so the const is
+//   also reachable as `orchestration::model::DEFAULT_IDLE_TICK_MINUTES` — and,
+//   since that path crosses no crate-private boundary, as
 //   `loomux_lib::orchestration::model::DEFAULT_IDLE_TICK_MINUTES` from
 //   outside this crate too. Forced and harmless, same terms as `model.rs`'s
 //   own header states for `default_model`/`sanitize_model_opt`.
 // - `LOOMUX_NOTICE_MARKER` was already `pub`, so nothing widens there.
+//
+// Batch 11 amendment: `DEFAULT_INTAKE_POLL_MINUTES` was on the `pub(crate) use`
+// line above for exactly one caller, `intake.rs`, which was still in this crate.
+// It crossed in batch 11 (below) and spells `crate::model::…` now, so no code in
+// this crate names the const at all and the flat spelling has no consumer left.
+// These `pub use` lines are meant to read as the live list of what moved, so a
+// dead entry comes off rather than sitting here for the next reader to re-derive.
+// The item itself is untouched — still `pub` in the engine, still reachable as
+// `orchestration::model::DEFAULT_INTAKE_POLL_MINUTES` through line 92's `self`.
 pub use loomux_engine::model::Delivery;
-pub(crate) use loomux_engine::model::{DEFAULT_IDLE_TICK_MINUTES, DEFAULT_INTAKE_POLL_MINUTES};
+pub(crate) use loomux_engine::model::DEFAULT_IDLE_TICK_MINUTES;
 pub use loomux_engine::text::LOOMUX_NOTICE_MARKER;
 
 // #888 slice A3 batch 9 — the two HOST PRIMITIVES this file was still carrying,
@@ -279,6 +287,59 @@ pub(super) use loomux_engine::fsatomic::atomic_write;
 // `publish = false`, so "public" means reachable by a sibling crate in this
 // workspace, not a shipped API.
 pub use loomux_engine::{queue, queuestate};
+
+// #888 slice A3 batch 11 — `intake`, the pure core of the idle-tick intake gate
+// (#332/#429/#795/#864/#778): the host-side, zero-token diff of what changed on
+// GitHub since the last poll (label deltas, PR check transitions, PR
+// comment/review activity, the full-autonomy eligible-unstarted set), the
+// bounded wake summary it composes, the poll-scheduling policy, and the pure
+// decision of whether a tick that cleared its quiet window should actually wake
+// the orchestrator.
+//
+// One import prefix deep, because every outbound edge was already across:
+// `super::notify` → `crate::notify` (batch 3), `super::DEFAULT_INTAKE_POLL_MINUTES`
+// → `crate::model::…` (batch 8), `super::GroupId` → `crate::groupid::GroupId`
+// (batch 2). The impure half stays HERE and is unaffected — `poll_intake` (the
+// two `gh` calls, the `gh` allow-list they go through, the audit records) and
+// `idle_tick_tick` still spell `intake::…` through the line below, exactly as
+// `mqdriver`/`mqloop` do for batches 5/6/9.
+//
+// The re-export is the plain MODULE form, and — as in batch 10 — that is
+// measured rather than stylistic. EVERY consumer spells the module path:
+// `intake::due_intake_polls`, `intake::PendingIntake`, `intake::pr_list_argv`
+// here, `intake::eligible_deltas` in `tests/workflow.rs`, and
+// `loomux_lib::orchestration::intake::MAX_INTAKE_POLLS_PER_TICK` in
+// `tests/orchestration.rs`. Not one flat `orchestration::<item>` spelling
+// exists, so a curated item list (#988) would preserve no call site at all.
+// #988's trap is what a curated list buys protection from, and there is nothing
+// here to catch: `intake.rs` contains not a single `pub(super)` or `pub(crate)`
+// item, so the crate boundary force-widens NOTHING and the file's private
+// members (`RawLabel`, `RawIssueJson`, `RawRollupEntry`, `RawCommentJson`,
+// `RawReviewJson`, `RawPrJson`, `rollup_entry_state`, `parse_task_issue_ref`,
+// and `PendingIntake`'s `blocks`/`dropped` fields) stay private in the engine.
+// `pub mod intake` already sat under `pub mod orchestration`, so
+// `loomux_lib::orchestration::intake::…` reached exactly this set before the
+// move and reaches exactly it after.
+//
+// What this batch does NOT claim is zero test edits, and the reason is a kind of
+// edge no grep for `super::` finds — batch 2's "where can the violation be
+// spelled now?" asked of a FILE rather than a type.
+// `poll_intake_still_asks_gh_for_comment_and_review_activity` reads `intake.rs`
+// **by literal path** to pin that the `createdAt`/`submittedAt` serde renames
+// survive, because losing them degrades the #864 comment signal to permanent
+// silence with every other test still green. Moving the file breaks that read
+// outright, so the test's path is repointed at `crates/loomux-engine/src` (the
+// spelling `tests/groupid.rs` already uses for its second root) and nothing else
+// about it changes. Its OTHER half — the scan asserting THIS file reaches `gh`
+// through the `intake` argv builder rather than hand-rolling an argv beside it —
+// is untouched and still true, which is one more thing the module re-export buys
+// that an item list would have broken. (Note for anyone editing this comment:
+// that scan is textual and `contains`-based, so the call spelling it looks for —
+// the builder name followed by an empty argument list — is deliberately NOT
+// written out anywhere in this file except at the real call site in
+// `poll_intake`. Spelling it in prose would satisfy the pin from a comment and
+// leave it green over a poller that had stopped calling the builder at all.)
+pub use loomux_engine::intake;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
