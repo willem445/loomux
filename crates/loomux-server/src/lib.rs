@@ -25,11 +25,13 @@
 //!
 //! # The one thing it does decide
 //!
-//! [`config::ServerConfig::resolve_listen`] refuses a routable bind address
-//! unless the config explicitly allows it. That is v1 requirement 1 of
-//! `remote-engine-protocol.md` §1.2, and it is here rather than in C2 because
-//! the config schema names the address anyway — see
-//! `doc/design/remote-engine-daemon.md`.
+//! [`config::ServerConfig::parse`] **refuses to load a config** that names a
+//! routable bind address unless it also says `allow_routable_bind: true`. That
+//! is v1 requirement 1 of `remote-engine-protocol.md` §1.2, and it is here
+//! rather than in C2 because it is a statement about which config files are
+//! valid: it needs no socket to decide, and a `ServerConfig` that has not
+//! passed it does not exist. C2 must not re-implement it — see
+//! `doc/design/remote-engine-daemon.md` §3.
 //!
 //! **Read §1.3 of the protocol note before running this anywhere.** The v1
 //! daemon has no authentication by deliberate decision (H1), and its entire

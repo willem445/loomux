@@ -21,9 +21,9 @@ this daemon anywhere) and §13 (the slice ordering this note sits inside).
 **binary**. Today it:
 
 - parses a command line,
-- loads a YAML config file (or runs with defaults),
-- decides whether a listener would be **allowed** to bind the address it was
-  given — §3, the one real contract in this slice —
+- loads a YAML config file (or runs with defaults), **refusing to load one that
+  names a bind address this daemon may not use** — §3, the one real contract in
+  this slice —
 - prints what it resolved, and exits.
 
 It is **not** a listener (that is C2: the socket, the `Origin` refusal on
@@ -75,21 +75,39 @@ boundary instead of a hope:
 2. `Origin` is checked on the WebSocket upgrade.
 
 The second is C2's — there is no upgrade to check. The first lands **here**,
-one slice ahead of the socket, and the argument is worth stating because it
-moves a control out of the slice the protocol note assigned it to:
+one slice ahead of the socket, and because that moves a control out of the
+slice the protocol note assigned it to, the argument has to be made rather than
+assumed. It rests on this being **config-layer validation** and not a fragment
+of the listener smuggled forward:
 
+- **It is a statement about which config files are valid**, decided when the
+  file is parsed. A config naming a routable address without
+  `allow_routable_bind: true` **does not load**: `ServerConfig::parse` returns
+  `RoutableBindRefused` and no config comes into existence. The daemon never
+  holds a config it then declines to serve.
+- **It needs no socket to decide, which is the test of whether it belongs
+  here.** Every assertion behind it is a plain unit test that runs on all three
+  CI platforms — no listener, no port, no network. A control that could only be
+  exercised against a bound socket would be C2's by that same test, and should
+  have waited for it.
 - **The config schema has to name the listen address anyway.** Config is the
-  entirety of C1a's content; the address is its most important field.
-- **A field that accepts `0.0.0.0` with the refusal deferred is a half
-  contract.** The unsafe value would be spellable, documented and silently
-  honoured in the interval, and "the listener will refuse it later" is not a
-  property of anything that exists.
-- **One place produces a `ListenTarget`.** C2 receives a value that has already
-  passed the check rather than a string it must remember to check, so the
-  control cannot be forgotten by the slice that has the most else going on.
+  entirety of C1a's content and the address is its most important field. A
+  field that accepts `0.0.0.0` with the refusal deferred is a half contract:
+  the unsafe value would be spellable, documented and silently honoured in the
+  interval, and "the listener will refuse it later" is not a property of
+  anything that exists.
+- **The unsafe state is unrepresentable, not merely checked.** `ServerConfig`
+  holds an already-classified `ListenTarget`, the `Deserialize` impl is on a
+  *private* raw shape, and the only public constructor is the gate — so no
+  config file can deserialize its way past it. That is `GroupId`'s shape (#904)
+  applied to a bind address, and it is the difference between a check and an
+  invariant.
 
-What C2 still owes: the `Origin` refusal, and actually binding what it is
-handed. It must not re-derive the address from the config text.
+**What C2 owes, and what it must not do.** It owes the `Origin` refusal and
+binding the `ListenTarget` it is handed. It must **not** re-implement the bind
+refusal, and must not re-derive the address from the config text. That is
+recorded in `remote-engine-protocol.md` §1.2 and §13 as well as here, so the
+slice that needs to know reads it in the note it is working from.
 
 ### The rule, precisely
 
