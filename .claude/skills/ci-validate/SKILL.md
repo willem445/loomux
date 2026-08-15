@@ -264,6 +264,13 @@ own draft PR**, and CI's log is the failure line you quote.
 and the failures stop being attributable to the behaviour they evidence — a
 compile error proves nothing. Several rounds on one scratch branch is normal.
 
+**A red only counts against a banked green.** Keep the unmutated tree's passing
+run for the same tests: a test that has never passed reddens for its own bug,
+not for your mutation, and the red then evidences nothing about the property.
+And a mutation that **hangs** the suite is a timeout, not a red — the job dies
+without naming an assertion, so there is no failure line to quote. Race a
+watchdog inside the test so the failure arrives as an assertion instead (#744).
+
 ### The trap: `cargo test` stops at the first failing test *binary*
 
 Neutering a lib function reddens the **lib** suite, and cargo then never runs
