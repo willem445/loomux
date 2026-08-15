@@ -1644,8 +1644,17 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                     let body = note.map(report::truncate_note).unwrap_or_else(|| summary.unwrap_or("").to_string());
                     report::structured_notice(&caller.agent_id, o, &body, arg_str(args, "ref"), arg_str(args, "detail_url"))
                 }
-                // Legacy path: byte-for-byte the pre-#398 message, uncapped.
-                None => format!("[loomux] {} reports {status}: {}", caller.agent_id, note.or(summary).unwrap()),
+                // Legacy path: the pre-#398 message, still uncapped — but its
+                // agent-authored half goes through the same scrub the
+                // structured path now applies inside `structured_notice`
+                // (#891 rev-1 F1). A check present on one shape of a tool and
+                // absent from the other is a bypass exactly the width of that
+                // asymmetry, and both shapes land in the same pane.
+                None => format!(
+                    "[loomux] {} reports {status}: {}",
+                    caller.agent_id,
+                    report::relay_payload(note.or(summary).unwrap())
+                ),
             };
             // #576 residual: the relay variant, which opts this notice into the
             // question gate's delivery record — the note is the CALLER's words
@@ -1909,9 +1918,22 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             // (report already does this via set_agent_idle).
             reg.note_agent_activity(&caller.agent_id);
             // #576 residual: same relay variant, same reason as `report` above.
+            //
+            // #891 rev-1 F1: the id in the prefix is loomux's — resolved from
+            // the caller's token, never from `args` — but everything after the
+            // colon is the agent's, and this line is the one a liaison's relay
+            // is recognized BY. Raw, a delegate could put a second
+            // `[loomux] message from <liaison>:` span inside its own text and
+            // speak into the orchestrator's directive ledger with the human's
+            // standing. Same scrub as `channel_send` and `report`, one hop
+            // before loomux adds its own prefix.
             reg.deliver_relayed_to_orchestrator(
                 &caller.group,
-                &format!("[loomux] message from {}: {text}", caller.agent_id),
+                &format!(
+                    "[loomux] message from {}: {}",
+                    caller.agent_id,
+                    report::relay_payload(text)
+                ),
                 &caller.agent_id,
             )?;
             Ok("message delivered".into())
