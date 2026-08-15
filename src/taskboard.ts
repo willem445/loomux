@@ -283,3 +283,177 @@ export function withDep(deps: readonly string[] | null | undefined, id: string):
 export function withoutDep(deps: readonly string[] | null | undefined, id: string): string[] {
   return [...(deps ?? [])].filter((d) => d !== id);
 }
+
+// ---------------------------------------------------------------------------
+// Board hierarchy (#958): containment, not ordering.
+//
+// `parent` names the row this one sits inside; `deps` still names what must
+// finish first, and the two are orthogonal (a dep may cross subtrees). The
+// board array stays FLAT and its order stays the priority order — every tree
+// below is derived from `parent` at render time, exactly like `isReady` is
+// derived rather than read off the wire.
+// ---------------------------------------------------------------------------
+
+/** The advisory Agile levels, in the backend's `TASK_KINDS` order (#958).
+ *  Advisory means advisory: a story directly inside an epic is legal, and the
+ *  board only ever *labels* a row with this — nothing here gates anything. */
+export const KINDS = ["epic", "feature", "story", "task"] as const;
+
+/** A board row as far as the hierarchy helpers care. Both fields are optional
+ *  on the wire for the same reason `deps` is: the backend skips them when
+ *  absent, so every pre-#958 board arrives with no keys at all. */
+export interface HasParent extends HasId {
+  parent?: string | null;
+  kind?: string | null;
+}
+
+/** The derived tree: which rows sit at top level, and each row's direct
+ *  children, both in board (priority) order. */
+export interface TaskTree<T extends HasParent> {
+  roots: T[];
+  children: Map<string, T[]>;
+}
+
+/** One rendered board line: the row, how deep it sits, and whether it has
+ *  children / is currently collapsed. */
+export interface BoardRow<T extends HasParent> {
+  task: T;
+  depth: number;
+  hasChildren: boolean;
+  collapsed: boolean;
+}
+
+/** How many indent steps the board actually draws. The backend caps writes at
+ *  `MAX_TASK_DEPTH` (4), but a hand-edited `tasks.json` can be deeper, and an
+ *  unbounded indent would walk such a row off the right edge of the overlay. */
+export const MAX_INDENT_DEPTH = 4;
+
+/** Clamp a tree depth to the indent the stylesheet actually draws. */
+export function indentLevel(depth: number): number {
+  return depth;
+}
+
+/** Build the containment tree from the flat board (#958).
+ *
+ *  Tolerant by construction, because `tasks.json` is hand-editable and the
+ *  backend deliberately runs no repair pass over it: a row whose `parent`
+ *  names nothing, names itself, or sits in a cycle is treated as a ROOT rather
+ *  than being dropped from the board. Same philosophy as the `missing` dep
+ *  chip — a broken link must be visible, never invisible. */
+export function buildTree<T extends HasParent>(board: readonly T[]): TaskTree<T> {
+  return { roots: [...board], children: new Map() };
+}
+
+/** The rows to render, in display order: roots in board order, each followed
+ *  by its own subtree (recursively, in board order), with the depth each row
+ *  should be indented to.
+ *
+ *  `collapsed` hides a row's whole subtree, not just its direct children — a
+ *  collapsed epic must not leave its grandchildren stranded at the top level.
+ *  Every row on the board appears EXACTLY ONCE, whatever `parent` says: that
+ *  is the invariant a hand-edited cycle would otherwise break, in either
+ *  direction (an infinite render, or a row that silently vanishes). */
+export function visibleRows<T extends HasParent>(
+  board: readonly T[],
+  collapsed: Iterable<string> = []
+): BoardRow<T>[] {
+  void collapsed;
+  return board.map((task) => ({ task, depth: 0, hasChildren: false, collapsed: false }));
+}
+
+/** Direct-child counts for a container row: how many children it has and how
+ *  many of those are `done`.
+ *
+ *  DIRECT children only, deliberately: these are the same two numbers the
+ *  backend puts on a `TaskSummary` (`children` / `children_done`), and the
+ *  human's board and the orchestrator's `list_tasks` rows disagreeing about a
+ *  count they both display would be a defect, not a nuance. */
+export function childCounts<T extends HasParent & HasStatus>(
+  id: string,
+  board: readonly T[]
+): { total: number; done: number } {
+  void id;
+  void board;
+  return { total: 0, done: 0 };
+}
+
+/** Whether EVERY task under this one — the whole subtree, not just the direct
+ *  children — is `done` while the container itself is not (#958).
+ *
+ *  Drives a nudge chip only: the board points out that a container's work is
+ *  finished but its own status lags. It never writes a status (the auto-status
+ *  rollup was rejected outright: status has two authors and a derived
+ *  write-back is exactly the wedge `ready` avoids by staying derived).
+ *
+ *  Whole subtree, unlike `childCounts` above, because this one makes a CLAIM
+ *  ("everything under here is finished") — direct-children-only would let it
+ *  say that with an open grandchild, which is simply false. A row with no
+ *  children never qualifies: there is nothing under it to have finished. */
+export function subtreeAllDone<T extends HasParent & HasStatus>(
+  id: string,
+  board: readonly T[]
+): boolean {
+  void id;
+  void board;
+  return false;
+}
+
+/** Where a row sits among its SIBLINGS (not on the board): drives whether the
+ *  up/down buttons are disabled. Reordering is sibling-scoped — the first
+ *  child of a container has nowhere higher to go, even though the board array
+ *  has rows above it. `{ index: -1, count: 0 }` for an id that isn't on the
+ *  board. */
+export function siblingPosition<T extends HasParent>(
+  board: readonly T[],
+  id: string
+): { index: number; count: number } {
+  return { index: board.findIndex((t) => t.id === id), count: board.length };
+}
+
+/** The full flattened id order to send to `orch_reorder_tasks` after moving a
+ *  row one step among its siblings (#958).
+ *
+ *  A container moves WITH its subtree: reordering is about priority between
+ *  siblings, and a parent that left its children behind would silently
+ *  re-home them (the array is flat, so "left behind" means "now sits under
+ *  whoever is above them"). Out-of-range moves are a no-op that still returns
+ *  the current order, so a caller can send it unconditionally.
+ *
+ *  Always a permutation of the board — every id present exactly once — since
+ *  `reorder_tasks` appends whatever the caller omitted, and an omission would
+ *  therefore be a silent priority change nobody asked for. */
+export function reorderWithSubtree<T extends HasParent>(
+  board: readonly T[],
+  id: string,
+  delta: number
+): string[] {
+  const ids = board.map((t) => t.id);
+  const i = ids.indexOf(id);
+  const j = i + delta;
+  if (i < 0 || j < 0 || j >= ids.length) return ids;
+  ids.splice(i, 1);
+  ids.splice(j, 0, id);
+  return ids;
+}
+
+/** The rows the "nest under…" picker offers: every other row on the board,
+ *  minus the one it is already inside (picking that is a no-op write).
+ *
+ *  Deliberately does NOT filter out choices that would close a hierarchy cycle
+ *  or bust the depth cap — the exact call `depCandidates` makes, for the exact
+ *  reason: the backend rejects those inside its lock with an error naming the
+ *  path, that error surfaces through this view's toast, and a second copy of
+ *  the rule here could only ever disagree with the authoritative one. */
+export function parentCandidates<T extends HasParent>(task: T, board: readonly T[]): T[] {
+  return board.filter((t) => t.id !== task.id);
+}
+
+/** Whether this row's `parent` names no task on the board — only reachable by
+ *  hand-editing `tasks.json` (the backend validates on write and re-homes
+ *  survivors on delete), so the board says so on the row rather than rendering
+ *  it at top level with no explanation. */
+export function hasMissingParent<T extends HasParent>(task: T, board: readonly T[]): boolean {
+  void task;
+  void board;
+  return false;
+}

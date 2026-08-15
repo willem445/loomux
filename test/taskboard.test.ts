@@ -9,12 +9,22 @@ import {
   boardUsesDeps,
   canApprove,
   canProceed,
+  childCounts,
   depCandidates,
   depState,
   doneCount,
   grantableCount,
+  hasMissingParent,
+  indentLevel,
   isAwaitingHuman,
   isReady,
+  KINDS,
+  MAX_INDENT_DEPTH,
+  parentCandidates,
+  reorderWithSubtree,
+  siblingPosition,
+  subtreeAllDone,
+  visibleRows,
   PROTOTYPE_STATUS,
   REQUEST_CHANGES_STATUS,
   retainExisting,
@@ -407,6 +417,188 @@ test("dep edits build the whole array — add is idempotent, remove can empty it
   assert.deepEqual(withoutDep(undefined, "t-1"), []);
   // Removing an id that isn't there leaves the array alone.
   assert.deepEqual(withoutDep(["t-1"], "t-9"), ["t-1"]);
+});
+
+// --- board hierarchy: containment, derived from the flat array (#958) ---
+
+/** A board row for the hierarchy helpers — id, status, and the two #958
+ *  fields, which are absent on every pre-#958 board. */
+const row = (id: string, status = "queued", parent?: string, kind?: string) => ({
+  id,
+  status,
+  ...(parent === undefined ? {} : { parent }),
+  ...(kind === undefined ? {} : { kind }),
+});
+
+test("a board with no hierarchy renders exactly as it does today", () => {
+  // The regression pin that matters most: every existing board arrives with no
+  // `parent` key at all, and must come out of visibleRows in board order, flat,
+  // with no collapse affordance anywhere.
+  const board = [row("t-1"), row("t-2", "done"), row("t-3")];
+  assert.deepEqual(
+    visibleRows(board).map((r) => [r.task.id, r.depth, r.hasChildren]),
+    [["t-1", 0, false], ["t-2", 0, false], ["t-3", 0, false]]
+  );
+});
+
+test("children render under their container, at depth, in board order", () => {
+  const board = [
+    row("t-1", "queued", undefined, "epic"),
+    row("t-2", "queued", "t-1", "feature"),
+    row("t-3", "queued", "t-2", "story"),
+    row("t-4", "queued", "t-1"),
+    row("t-5"),
+  ];
+  assert.deepEqual(
+    visibleRows(board).map((r) => [r.task.id, r.depth]),
+    [["t-1", 0], ["t-2", 1], ["t-3", 2], ["t-4", 1], ["t-5", 0]]
+  );
+  assert.equal(visibleRows(board)[0].hasChildren, true);
+  assert.equal(visibleRows(board)[2].hasChildren, false);
+});
+
+test("display order is derived, so a child stored above its container still nests", () => {
+  // tasks.json order is PRIORITY order and the orchestrator writes rows in
+  // whatever order work arrives — a child added before its epic must not
+  // render detached above it.
+  const board = [row("t-9", "queued", "t-1"), row("t-1"), row("t-2")];
+  assert.deepEqual(
+    visibleRows(board).map((r) => [r.task.id, r.depth]),
+    [["t-1", 0], ["t-9", 1], ["t-2", 0]]
+  );
+});
+
+test("collapsing a container hides its WHOLE subtree, not just its children", () => {
+  const board = [row("t-1"), row("t-2", "queued", "t-1"), row("t-3", "queued", "t-2"), row("t-4")];
+  const rows = visibleRows(board, ["t-1"]);
+  // A grandchild left behind by a shallow hide would render stranded at the
+  // top level, reading as unrelated work.
+  assert.deepEqual(rows.map((r) => r.task.id), ["t-1", "t-4"]);
+  assert.equal(rows[0].collapsed, true);
+  assert.equal(rows[0].hasChildren, true);
+  // Collapsing a leaf is inert — there is nothing under it to hide.
+  assert.deepEqual(visibleRows(board, ["t-4"]).map((r) => r.task.id), ["t-1", "t-2", "t-3", "t-4"]);
+  assert.equal(visibleRows(board, ["t-4"])[3].collapsed, false);
+});
+
+test("a container naming nothing, or itself, renders at top level instead of vanishing", () => {
+  // Only reachable by hand-editing tasks.json (the backend validates on write
+  // and re-homes survivors on delete), and the board must show such a row —
+  // same reasoning as the `missing` dep chip.
+  const board = [row("t-1", "queued", "t-404"), row("t-2", "queued", "t-2"), row("t-3")];
+  assert.deepEqual(
+    visibleRows(board).map((r) => [r.task.id, r.depth]),
+    [["t-1", 0], ["t-2", 0], ["t-3", 0]]
+  );
+  assert.equal(hasMissingParent(board[0], board), true);
+  assert.equal(hasMissingParent(board[1], board), false); // names a live row (itself)
+  assert.equal(hasMissingParent(board[2], board), false); // no container at all
+});
+
+test("a hand-edited hierarchy cycle renders every row exactly once", () => {
+  // The failure this pins is bidirectional: a naive walk either recurses
+  // forever or drops both rows off the board entirely.
+  const board = [row("t-1", "queued", "t-2"), row("t-2", "queued", "t-1"), row("t-3")];
+  const ids = visibleRows(board).map((r) => r.task.id);
+  assert.equal(ids.length, 3);
+  assert.deepEqual([...ids].sort(), ["t-1", "t-2", "t-3"]);
+});
+
+test("child counts are DIRECT children only, matching the backend's summary row", () => {
+  // `children` / `children_done` on a TaskSummary are direct-only; the human's
+  // board computing something else would put two different numbers for the
+  // same thing in front of two different readers.
+  const board = [
+    row("t-1"),
+    row("t-2", "done", "t-1"),
+    row("t-3", "queued", "t-1"),
+    row("t-4", "done", "t-2"),
+  ];
+  assert.deepEqual(childCounts("t-1", board), { total: 2, done: 1 });
+  assert.deepEqual(childCounts("t-2", board), { total: 1, done: 1 });
+  assert.deepEqual(childCounts("t-3", board), { total: 0, done: 0 });
+  assert.deepEqual(childCounts("t-404", board), { total: 0, done: 0 });
+});
+
+test("the all-done nudge waits for the whole subtree, and never fires on a leaf", () => {
+  const open = [row("t-1"), row("t-2", "done", "t-1"), row("t-3", "queued", "t-2")];
+  // A direct-children-only reading would claim "everything under here is
+  // finished" with t-3 still queued — a false statement on the human's board.
+  assert.equal(subtreeAllDone("t-1", open), false);
+  const finished = [row("t-1"), row("t-2", "done", "t-1"), row("t-3", "done", "t-2")];
+  assert.equal(subtreeAllDone("t-1", finished), true);
+  // A row with no children has nothing under it to have finished.
+  assert.equal(subtreeAllDone("t-3", finished), false);
+  assert.equal(subtreeAllDone("t-404", finished), false);
+});
+
+test("reordering moves a container together with its subtree", () => {
+  const board = [row("t-1"), row("t-2", "queued", "t-1"), row("t-3", "queued", "t-2"), row("t-4")];
+  // t-1 down one sibling step: its children ride along, or they would silently
+  // re-home under whatever ends up above them in the flat array.
+  assert.deepEqual(reorderWithSubtree(board, "t-1", 1), ["t-4", "t-1", "t-2", "t-3"]);
+  assert.deepEqual(reorderWithSubtree(board, "t-4", -1), ["t-4", "t-1", "t-2", "t-3"]);
+});
+
+test("reordering is sibling-scoped and never leaves a row out of the order", () => {
+  const board = [
+    row("t-1"),
+    row("t-2", "queued", "t-1"),
+    row("t-3", "queued", "t-1"),
+    row("t-4"),
+    row("t-5", "queued", "t-4"),
+  ];
+  // Swapping two children rewrites only their own container's order.
+  assert.deepEqual(reorderWithSubtree(board, "t-3", -1), ["t-1", "t-3", "t-2", "t-4", "t-5"]);
+  // The last child has nowhere lower to go: it must NOT fall out of its
+  // container into the next one's list — orch_reorder_tasks would take that
+  // literally and the row would silently change container on the next render.
+  assert.deepEqual(reorderWithSubtree(board, "t-3", 1), ["t-1", "t-2", "t-3", "t-4", "t-5"]);
+  assert.deepEqual(reorderWithSubtree(board, "t-2", -1), ["t-1", "t-2", "t-3", "t-4", "t-5"]);
+  // Unknown id: still the full current order, never a short array.
+  assert.deepEqual(reorderWithSubtree(board, "t-404", 1), ["t-1", "t-2", "t-3", "t-4", "t-5"]);
+});
+
+test("the order sent is always a permutation of the board, even on a cyclic one", () => {
+  // reorder_tasks appends whatever the caller omitted, so a dropped id is a
+  // silent priority change nobody asked for.
+  const board = [row("t-1", "queued", "t-2"), row("t-2", "queued", "t-1"), row("t-3")];
+  const sent = reorderWithSubtree(board, "t-3", -1);
+  assert.deepEqual([...sent].sort(), ["t-1", "t-2", "t-3"]);
+  assert.equal(new Set(sent).size, 3);
+});
+
+test("sibling position counts siblings, not board rows", () => {
+  // This is what disables the up/down buttons: the first child of a container
+  // has nowhere higher to go, however many rows sit above it on the board.
+  const board = [row("t-1"), row("t-2", "queued", "t-1"), row("t-3", "queued", "t-1"), row("t-4")];
+  assert.deepEqual(siblingPosition(board, "t-2"), { index: 0, count: 2 });
+  assert.deepEqual(siblingPosition(board, "t-3"), { index: 1, count: 2 });
+  assert.deepEqual(siblingPosition(board, "t-4"), { index: 1, count: 2 }); // roots are siblings too
+  assert.deepEqual(siblingPosition(board, "t-404"), { index: -1, count: 0 });
+});
+
+test("the nest-under picker offers every other row, minus the current container", () => {
+  const board = [row("t-1"), row("t-2", "queued", "t-1"), row("t-3")];
+  // t-1 is already t-2's container — offering it again would send a no-op write.
+  assert.deepEqual(parentCandidates(board[1], board).map((t) => t.id), ["t-3"]);
+  assert.deepEqual(parentCandidates(board[2], board).map((t) => t.id), ["t-1", "t-2"]);
+  // Its own descendant IS offered, deliberately: the backend rejects the cycle
+  // inside its lock with an error naming the path, and a second copy of that
+  // rule here could only ever disagree with the authoritative one — the same
+  // call depCandidates makes.
+  assert.deepEqual(parentCandidates(board[0], board).map((t) => t.id), ["t-2", "t-3"]);
+});
+
+test("indent is clamped, so a hand-edited over-deep row still fits the overlay", () => {
+  assert.equal(indentLevel(0), 0);
+  assert.equal(indentLevel(MAX_INDENT_DEPTH), MAX_INDENT_DEPTH);
+  assert.equal(indentLevel(MAX_INDENT_DEPTH + 3), MAX_INDENT_DEPTH);
+});
+
+test("the kind vocabulary mirrors the backend's TASK_KINDS, in order", () => {
+  // The picker offers exactly these; anything else is refused on write.
+  assert.deepEqual([...KINDS], ["epic", "feature", "story", "task"]);
 });
 
 test("a PR ref the backend cannot resolve is still counted as linked", () => {
