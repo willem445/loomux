@@ -542,7 +542,7 @@ pub fn builtin_intake_profile() -> IntakeProfile {
 ///
 /// Empty (omitted) is not a rejection — it falls back to `fallback` (the
 /// built-in default for that field), which is what lets a repo override
-/// `intake.labels.ready:` alone and inherit the other three.
+/// `intake.labels.ready:` alone and inherit the other four.
 fn sanitize_intake_label(field: &str, raw_val: &str, fallback: &str, errs: &mut Vec<String>) -> String {
     let v = raw_val.trim();
     if v.is_empty() {
@@ -1024,6 +1024,7 @@ pub fn workflow_schema_keys() -> BTreeMap<String, Vec<String>> {
         investigate: "agent-investigation".into(),
         owned: "agent-managed".into(),
         prototype: "agent-prototype".into(),
+        hold: "agent-hold".into(),
     };
     let intake = RawIntake { source: "github-labels".into(), labels: RawIntakeLabels::default() };
     let merge_queue =
@@ -1154,6 +1155,7 @@ pub fn workflow_schema_field_facts() -> BTreeMap<String, serde_json::Value> {
     fact("intake.labels.investigate", "default", json!(intake.investigate));
     fact("intake.labels.owned", "default", json!(intake.owned));
     fact("intake.labels.prototype", "default", json!(intake.prototype));
+    fact("intake.labels.hold", "default", json!(intake.hold));
     let mq = MergeQueuePolicy::default();
     fact("merge_queue.enabled", "default", json!(mq.enabled));
     fact("merge_queue.max_batch", "default", json!(mq.max_batch));

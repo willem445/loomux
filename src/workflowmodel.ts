@@ -221,12 +221,15 @@ export interface WorkflowIntake {
   extra?: Record<string, YamlValue>;
 }
 
-/** The label vocabulary intake matches on. Declare one, inherit the other three. */
+/** The label vocabulary intake matches on. Declare one, inherit the other four. */
 export interface WorkflowIntakeLabels {
   ready?: string;
   investigate?: string;
   owned?: string;
   prototype?: string;
+  /** The veto (#778): "held by the human — do not start this". The only label here
+   *  whose meaning is opt-OUT, and the boundary full autonomy leaves standing. */
+  hold?: string;
   extra?: Record<string, YamlValue>;
 }
 
@@ -882,7 +885,7 @@ function emitIntakeLines(intake: WorkflowIntake, indent = ""): string[] {
   return emitMappingSection("intake", indent, body);
 }
 
-const INTAKE_LABEL_KEYS = ["ready", "investigate", "owned", "prototype"] as const;
+const INTAKE_LABEL_KEYS = ["ready", "investigate", "owned", "prototype", "hold"] as const;
 
 function emitIntakeLabelLines(labels: WorkflowIntakeLabels, indent: string): string[] {
   const field = `${indent}  `;

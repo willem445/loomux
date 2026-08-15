@@ -268,7 +268,7 @@
           "name": "labels",
           "type": "section",
           "section": "intake.labels",
-          "help": "This repo's label spellings. Declare one and the other three keep their built-in defaults."
+          "help": "This repo's label spellings. Declare one and the other four keep their built-in defaults."
         }
       ]
     },
@@ -299,6 +299,12 @@
           "type": "string",
           "default": "agent-prototype",
           "help": "\"Build it for a demo.\" — feedback-gated work."
+        },
+        {
+          "name": "hold",
+          "type": "string",
+          "default": "agent-hold",
+          "help": "\"Held by the human — do not start this.\" The one veto in the vocabulary: under full autonomy every open issue is eligible except the ones carrying this label."
         }
       ]
     },
