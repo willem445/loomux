@@ -478,13 +478,26 @@ export class ModelCatalog {
    *  running has already read "nothing yet" and memoized that lookup, so
    *  without this its dropdown would keep the seed for the life of the app.
    *
-   *  A report that carries nothing is DROPPED rather than stored: it says only
-   *  that the sweep found nothing for that CLI, which is what every surface
-   *  already assumes, and storing it would overwrite a real answer that arrived
-   *  first. Returns whether anything changed, so a caller can skip a repaint
-   *  it does not owe. */
+   *  Two reports are refused, and each refusal is a repaint somebody does not
+   *  owe:
+   *
+   *  - One that carries NOTHING. It says only that the sweep found nothing for
+   *    that CLI, which is what every surface already assumes — and storing it
+   *    would overwrite a real answer that arrived first.
+   *  - One for a CLI an answer is ALREADY held for. The sweep runs once per app
+   *    run and asks each CLI once, so a second answer for the same program is
+   *    not a new fact: it is this same answer arriving by the other route, and
+   *    the two routes racing is the ordinary case rather than the odd one. The
+   *    picker that already painted it must not be rebuilt a second time —
+   *    possibly under a caret, since a deferred rebuild fires on blur.
+   *
+   *  Returns whether anything changed, which is what makes "fired only for a
+   *  report that changed something" true of {@link onReport} rather than merely
+   *  intended. A design that ever re-sweeps mid-run has to revisit the second
+   *  refusal — it is a statement about the producer, not about reports. */
   acceptReport(program: string, report: ModelReport): boolean {
     if (!reportWorthKeeping(report)) return false;
+    if (this.detectResolved.has(program)) return false;
     this.detectResolved.set(program, report);
     // Also settles the pull side: a picker that opens later reads this instead
     // of issuing a lookup for an answer already in hand.
