@@ -281,15 +281,10 @@ impl RootRegistry {
 /// filesystem, and `is_dir` answers before `canonicalize` so a missing root
 /// reports `not-found` exactly as it does today rather than as an io error kind.
 fn canonical_dir(path: &Path) -> Result<PathBuf, RootError> {
-    if !path.is_absolute() {
-        return Err(RootError::NotAbsolute);
-    }
-    if path.components().any(|c| c == Component::ParentDir) {
-        return Err(RootError::ParentTraversal);
-    }
-    if !path.is_dir() {
-        return Err(RootError::NotADirectory);
-    }
+    // SCRATCH MUTATION (#1042 red-before-green, never merged): all three
+    // structural pre-checks removed — absolute, no `..`, is-a-directory — so
+    // canonicalize is the only thing standing.
+    let _ = Component::ParentDir;
     std::fs::canonicalize(path).map_err(|e| RootError::Unresolvable(e.kind()))
 }
 
