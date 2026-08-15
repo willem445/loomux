@@ -29,7 +29,7 @@ A comment, design note, audit label or PR body claiming something the code doesn
 a defect (#461, #490) — delete it, don't soften it. Quote raw fetched text for CLI/API
 facts (#453). Prose written against a plan stays dated to it: before marking ready,
 re-read every doc and `SKILL.md` claim against what the sibling slice actually SHIPPED,
-not the plan both were written from (#715, #721).
+not the plan (#715, #721).
 
 ## Commit real work BEFORE capturing red evidence [pinned]
 
@@ -47,16 +47,16 @@ elapsed time.
 ## `rustfmt --check` is the one local Rust check agents may run
 
 From the repo root: `rustfmt --check --edition 2021 <changed .rs> >/dev/null`.
-`--edition` is mandatory (2015 false-errors `async fn`); discard stdout (~15k lines of
-unenforced diff); the exit code is ambiguous — **stderr is the signal**. Never run bare
+`--edition` is mandatory (2015 false-errors `async fn`); discard stdout (~15k lines); the
+exit code is ambiguous — **stderr is the signal**. Never run bare
 `rustfmt` or cite a clean run as validation. `cargo check` stays banned (#488, #558).
 
 ## Never block a turn waiting on CI
 
 A `[loomux]` notice arrives by typing into a pane, and a mid-turn pane can't take
-delivery — waiting on CI queues the answer behind the turn itself (#590). Register the
-watch, END the turn, act on the notice. Same for any pane-delivered answer: reading once
-is fine, waiting is the defect.
+delivery — waiting on CI queues the answer behind the turn (#590). Register the watch,
+END the turn, act on the notice. Same for any pane-delivered answer: reading once is
+fine, waiting is the defect.
 
 ## What a green run actually evidences
 
@@ -70,11 +70,9 @@ is fine, waiting is the defect.
   distinguishes — never relax the assertion (#689). Same drift outside tests: a
   hand-derived value a claim rests on (a line cite, a count) is valid only at the commit
   it was derived on — your own next commit invalidates it as silently as a rebase. Cite a
-  SYMBOL (#763); a position that must be recorded is swept in the LAST commit touching
-  its source (#752).
+  SYMBOL (#763); a recorded position is swept in the LAST commit touching it (#752).
 
 ## A multi-line shell script is a file, not a `-c` argument
 
-Inline Bash dies on Git Bash quoting (`unexpected EOF ... matching '`, reported far
-from the quote). Write it to `./.scratch/` and run the file; pipe prose via
-`--body-file -`.
+Inline Bash dies on Git Bash quoting (`unexpected EOF ... matching '`, reported far off).
+Write it to `./.scratch/` and run the file; pipe prose via `--body-file -`.
