@@ -31,6 +31,49 @@ them, and `pickerSelection` falls to its `custom…` branch for a value outside 
 list: a dropped default would open the form on a hand-typed id, looking exactly
 like a choice the human made themselves.
 
+## The exception: a CLI nothing answers for (#1020)
+
+The hierarchy above assumes something on the machine will eventually answer, so
+a curated row only has to carry the defaults and hold the fort until it does.
+**Copilot breaks that assumption structurally.** It has no `ENUMERATORS` row and
+no `PROTOCOLS` row, and its `--help` no longer enumerates models under
+`--model`, so `parse_models_from_help` returns nothing. Both machine sources are
+silent by construction rather than by accident: the merge has nothing to lead
+with, and copilot's curated row is not a seed for a menu — it **is** the menu.
+
+So that row carries copilot's full catalog, against the #329 sizing every other
+row keeps. This is **human-directed**, recorded the way the #1002 flip above is
+and for the same reason: it trades a known staleness cost for a menu that is
+usable today, and that trade is not one an agent may re-derive, nor extend to
+another CLI on the same reasoning. A CLI that *can* be asked is asked.
+
+Three properties keep the exception from becoming the rule:
+
+1. **It is written to be retired, not maintained.** The moment copilot gains a
+   supported way to enumerate models, it gets the row every other CLI has and
+   this list shrinks back to the defaults. No code changes for that —
+   `mergeModelOptions` already puts a machine's answer in front of the curated
+   entries, which `modelcatalog.test.ts` pins with a probed copilot id leading
+   the catalog.
+2. **The error path is not a source.** `copilot … model list` is rejected as
+   unsupported and happens to spill a catalog while failing. Parsing that would
+   make loomux depend on the shape of an error message the vendor never
+   promised — the same "never manufacture" rule the parsers already carry,
+   applied to where an answer comes from rather than to what is done with it.
+3. **The catalog is the product's, not the account's.** Copilot also reports a
+   much shorter per-account *Supported models* set, which varies by plan. That
+   is a fact about one machine, and embedding it is the host special-casing
+   constraint 8 forbids — it would make loomux wrong for every human whose plan
+   differs from the one that produced the list. An id an account cannot use is
+   refused at spawn, which is a truthful failure; a menu missing a model the
+   human is paying for is a silent one. This is `modelcontext.ts`'s rule 1 in
+   the other direction: loomux may state what a vendor offers, never what an
+   account is entitled to.
+
+`orchclis.test.ts` pins the exception by the property that separates it from
+both failures — the menu spans the vendor families copilot resells — rather than
+by the list's contents, which the human may reissue at any time.
+
 ## The inherit row is pinned first
 
 `INHERIT_MODEL` is the empty id — the "send no `--model` at all" row, which on

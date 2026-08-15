@@ -54,6 +54,18 @@ in an audit log.
    list as the answer arrives. A CLI you install *while loomux is running* is
    not detected until you restart it.
 
+   **Copilot CLI is the exception on both counts.** It has no supported way to
+   list its models — its help no longer enumerates them, and it answers neither
+   of the questions above — so its dropdown is a built-in catalog of the models
+   Copilot offers, kept in loomux rather than read from your machine. Two things
+   follow. It can go out of date between loomux releases, so the custom-entry
+   escape hatch is the way to reach a model newer than your build. And because
+   the list is Copilot's product catalog rather than your account's, it may offer
+   a model your plan does not include; picking one fails at launch rather than
+   being hidden, which is deliberate — loomux would otherwise have to guess your
+   entitlements. Every other CLI keeps the automatic behaviour described above,
+   and Copilot will too once it gains a way to be asked.
+
 3. Set the repository, how many idle workers to start with, and the guardrails:
    **max live agents** and **permissions**.
 
