@@ -190,6 +190,14 @@ compiles.
   `== "claude"`, `"claude" =>` (match-arm dispatch the first two patterns
   miss) and the `!= "claude"` polarity across `src/` and `src-tauri/src/`,
   and classifying every hit as behavior or mistype (#722, #841).
+- **A guard reads every one of its inputs by one rule.** Taking one signal from
+  "the options OR the existing state" and the next from the options alone is a
+  bypass exactly the width of that asymmetry; so is a check present at one call
+  site and absent from its sibling. Union every field on one side *inside* the
+  pure guard — never at the DOM call sites, which drift — and pin all four
+  crossings of {which side says X} × {which side says Y} plus the negative
+  control, so "refuse everything" cannot pass either. Worked example:
+  `sshOrchestrationRefusal` and `doc/design/ssh-panes.md` (#859, #906, #921).
 
 ## Refinements & scope increases from the user
 
@@ -228,6 +236,11 @@ narrow their ask back down to the original ticket on your own judgment.
 - User-visible behavior changes must update the matching user-docs page under
   `docs/` (the README is a pitch, not a manual — only touch it when the pitch
   itself changes); substantial designs get a `doc/design/*.md` note.
+- **Every number in a PR body is measured at the base AND at the head** — never
+  derived by arithmetic, remembered, or carried from a mid-branch run. Counts,
+  deltas, diffstats and run ids all go stale on the next commit. Read both
+  totals out of the two runs' own logs, and check that the per-file deltas sum
+  to the total you are claiming (#859, #862, #889, #907, #914, #921).
 - **Correcting a false claim is a multi-surface edit.** A design rationale here
   lives on several permanent surfaces at once — the code comment, the
   `doc/design/*.md` note, the PR body (which becomes the squash message), and
