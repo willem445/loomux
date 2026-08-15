@@ -147,8 +147,9 @@ impl std::error::Error for ConfigError {}
 /// sides ignore what they do not know"), which is right for two independently
 /// updated peers and wrong for one local file — see
 /// `doc/design/remote-engine-daemon.md` for why the two do not conflict.
+// [scratch] R2: `deny_unknown_fields` removed, so an unrecognised key in the
+// config file is silently ignored. Nothing else is touched.
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RawServerConfig {
     /// `127.0.0.1:8788`, `[::1]:8788`, or `unix:/run/loomux/engine.sock`.
     #[serde(default = "default_listen")]
