@@ -1513,6 +1513,105 @@ mod tests {
         assert!(diff.contains("+one\n+two\n"));
     }
 
+    // ---------- path containment for the caller-supplied `rel` (#925) ----------
+
+    /// **`git_diff(mode: "untracked")` must not read outside the repo.**
+    ///
+    /// Before #925 this function was `repo.join(rel)` with no validation of
+    /// `rel` at all — and `Path::join` DISCARDS its receiver when the argument
+    /// is absolute, so `repo` was not even a weak bound. An absolute `rel` named
+    /// any file the process could reach and up to 1 MiB of it came back as a
+    /// synthesized diff.
+    ///
+    /// The secret file is written OUTSIDE the repo and its content asserted
+    /// absent from the result, not merely "an error came back": an
+    /// implementation that refused for some unrelated reason would pass a bare
+    /// `is_err()`, where this cannot.
+    #[test]
+    fn synth_untracked_refuses_to_read_outside_the_repo() {
+        let base = std::env::temp_dir().join("loomux-925-diff-escape");
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let secret = base.join("secret.txt");
+        std::fs::write(&secret, "SUPER-SECRET-KEY-MATERIAL\n").unwrap();
+
+        // 1. absolute path — the shape that discarded `repo` entirely.
+        let abs = synth_untracked_diff(&repo, &secret.to_string_lossy());
+        assert!(
+            abs.as_ref().is_err_and(|e| !e.contains("SUPER-SECRET")),
+            "an absolute rel must be refused, got: {abs:?}"
+        );
+
+        // 2. plain `..` traversal to the same file.
+        let up = synth_untracked_diff(&repo, "../secret.txt");
+        assert!(
+            up.as_ref().is_err_and(|e| !e.contains("SUPER-SECRET")),
+            "a traversal rel must be refused, got: {up:?}"
+        );
+
+        // Positive control: an ordinary in-repo file still previews, so the two
+        // refusals above mean "contained", not "this function stopped working".
+        std::fs::write(repo.join("ok.txt"), "hello\n").unwrap();
+        let ok = synth_untracked_diff(&repo, "ok.txt").unwrap();
+        assert!(ok.contains("+hello"), "an in-repo untracked file must still preview: {ok}");
+    }
+
+    /// **`git_discard(untracked)` must not delete outside the repo.**
+    ///
+    /// Its previous guard rejected `is_absolute()` and any `ParentDir`, which
+    /// covers those two shapes — so the interesting case is the one that guard
+    /// MISSED, and it is Windows-only by nature: `Path::new("C:foo")` is not
+    /// absolute (a `Prefix` with no `RootDir`) and has no `ParentDir`, so it
+    /// passed both checks, and `join` then replaced the receiver because the
+    /// argument carries a prefix.
+    ///
+    /// Gated on Windows deliberately and disclosed as such: on Unix `"C:foo"` is
+    /// an ordinary relative file name that never escaped anything, so a
+    /// cross-platform version of this test would be green before the fix and
+    /// prove nothing.
+    #[cfg(windows)]
+    #[test]
+    fn git_discard_refuses_a_windows_drive_relative_path() {
+        let repo = std::env::temp_dir().join("loomux-925-discard");
+        std::fs::create_dir_all(&repo).unwrap();
+
+        let err = git_discard_sync(repo.to_string_lossy().to_string(), "C:foo".into(), true)
+            .expect_err("a drive-relative path must be refused, not resolved against the CWD");
+        assert!(
+            err.starts_with("invalid-path"),
+            "must be `safe_resolve`'s typed refusal, got: {err}"
+        );
+    }
+
+    /// The containment property `git_discard` shares with every other consumer
+    /// of the choke point, pinned cross-platform: an in-repo file really is
+    /// deleted (so the refusals are not a dead function), and an absolute path
+    /// pointing outside is refused with the file still on disk afterwards.
+    #[test]
+    fn git_discard_deletes_inside_the_repo_and_refuses_outside_it() {
+        let base = std::env::temp_dir().join("loomux-925-discard-scope");
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let inside = repo.join("scratch.txt");
+        std::fs::write(&inside, "x").unwrap();
+        let outside = base.join("keep.txt");
+        std::fs::write(&outside, "x").unwrap();
+
+        // Positive control first: without it, the refusal below could pass on a
+        // function that deleted nothing at all.
+        git_discard_sync(repo.to_string_lossy().to_string(), "scratch.txt".into(), true).unwrap();
+        assert!(!inside.exists(), "an in-repo untracked file must still be deletable");
+
+        let err = git_discard_sync(
+            repo.to_string_lossy().to_string(),
+            outside.to_string_lossy().to_string(),
+            true,
+        )
+        .expect_err("an absolute path outside the repo must be refused");
+        assert!(err.starts_with("invalid-path"), "typed refusal expected, got: {err}");
+        assert!(outside.exists(), "the refused delete must not have happened");
+    }
+
     // ---------- git-op integration tests (spawn the real git CLI) ----------
     //
     // Each exercises one command's success path plus the failure paths called
