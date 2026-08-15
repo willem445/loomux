@@ -262,6 +262,22 @@ test("every vendored mark's licence paperwork names it, in all three places", ()
   assert.match(read("../src/vendor/octicons/LICENSE"), /MIT License/);
 });
 
+test("the mark's own rule adds no colour — the role class is still the only dye", () => {
+  // The channel rule, checked on the surface rather than in the registry. `.ic-fleet` is
+  // what makes these marks violet; if `.pane-cli-icon` grew a `color` of its own it would
+  // silently win for the letter tier (whose <text> and <rect> both say `currentColor`) and
+  // the mark would stop reaching its hue through a documented role — the one thing
+  // doc/design/ui-redesign.md's maintainability rule 3 forbids.
+  const css = read("../src/styles.css").replace(/\/\*[\s\S]*?\*\//g, "");
+  const rule = css.match(/\.pane-cli-icon\s*\{([^}]*)\}/);
+  assert.ok(rule, "styles.css has no .pane-cli-icon rule — the header mark is unstyled");
+  assert.equal(
+    /(^|;)\s*color\s*:/.test(rule[1]),
+    false,
+    ".pane-cli-icon paints a colour; the mark must take .ic-fleet's dye and nothing else"
+  );
+});
+
 test("the pane header actually renders the mark", () => {
   // A resolver nothing calls is a unit test with a UI ticket attached. The DOM wiring is
   // hand-validated (this repo does not simulate a DOM), so what is checkable here is that

@@ -642,6 +642,12 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   flex: none; display: flex; align-items: center;
   opacity: 0.85;
 }
+/* `display: flex` here would normally defeat the element's `hidden` attribute — an author
+   `display` outranks the UA's `[hidden]` rule — which would leave every non-agent pane with
+   an empty flex box spending one of the header row's 6px gaps. It doesn't, because the
+   global `[hidden] { display: none !important; }` near the top of this file wins over both.
+   Noted rather than re-guarded: a local `.pane-cli-icon[hidden]` override would be dead
+   code that reads like it is doing the work. */
 .pane.active .pane-cli-icon { opacity: 1; }
 
 /* ---------- orchestration group badges ---------- */
