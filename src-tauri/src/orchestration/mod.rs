@@ -26954,7 +26954,8 @@ impl OrchRegistry {
             .filter(|a| a.role != Role::Orchestrator && a.status == AgentStatus::Running)
             .filter(|a| {
                 let Some((t, standing)) = policy.get(&a.group) else { return false };
-                !standing.contains(&a.block) && idle_should_kill(a.idle_since_ms, now, *t)
+                let _ = standing;
+                idle_should_kill(a.idle_since_ms, now, *t)
             })
             .map(|a| a.id.clone())
             .collect()
