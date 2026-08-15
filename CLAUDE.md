@@ -30,6 +30,18 @@ CI) — match the surrounding style instead of reformatting. (Agents may still
 run `rustfmt --check` as a *syntax* check, discarding its formatting
 opinions — see the `ci-validate` skill.)
 
+### Running these in an agent worktree
+
+- **`npm ci` before any `npm`/`node` command.** `node_modules/` is gitignored
+  and not shared between worktrees, so a freshly-cut one has none. A
+  missing-package error is *you never installed*, never a red suite — the
+  `ci-validate` skill has the trap in full.
+- **Anchor every `cd` at an absolute path.** The Bash tool's cwd persists
+  between calls, so a second relative `cd src-tauri/src/...` resolves against
+  the previous `cd` and fails with `No such file or directory`.
+- **There is no `python3`** — the `WindowsApps` alias stub exits 126
+  (`Permission denied`). Use `node -e` for ad-hoc scripting.
+
 ### Agent workers: NO local Rust builds — CI is the only build/test path
 
 The Commands table above is for humans. For agent workers, **local
@@ -43,8 +55,9 @@ How workers validate instead: push early, open a draft PR immediately,
 and read CI (`ci-validate` skill's draft-PR-early flow). Iterate by
 reasoning + pushing; CI is both the proof and the compiler.
 Frontend-only commands that never invoke `rustc` (`npm run build`/`tsc`,
-`npm test`/`node --test`) remain fine locally, as does `rustfmt --check
---edition 2021 <changed .rs>` — a parser, not a build, and the one pre-push
+`npm test`/`node --test`) remain fine locally once `npm ci` has run in the
+worktree (see above), as does `rustfmt --check --edition 2021 <changed .rs>`
+— a parser, not a build, and the one pre-push
 syntax check for Rust (#558; see the skill for the read-stderr recipe and why
 `cargo check` is not covered). The one `cargo` exception: `cargo update
 --workspace` for release lockfile bumps — dependency resolution only, never
@@ -223,6 +236,11 @@ narrow their ask back down to the original ticket on your own judgment.
   grepping the *entity* the claim names, never the phrasing you rewrote.
   Signature: a re-review that clears a claim on two surfaces and finds it alive
   on the third (#878).
+- **A doc naming a file or test that hasn't landed must say so in its tense
+  and name the slice** — `` `tests/perf_dispatch.rs` *will* enforce … (#743
+  S2/S3) `` — or the pointer waits for that slice. Present tense beside a
+  shipped guarantee in the same construction reads as shipped, and the reader
+  who acts on it gets silent green (#750).
 - **Historical context lives in design notes, ADRs, and issue/PR history —
   never in user docs, this repo's own agent instruction files
   (`.github/agents/`, `.claude/skills/`, `.loomux/workflow.yml`), or this

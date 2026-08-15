@@ -1,6 +1,6 @@
 ---
 name: ci-validate
-description: Why agent workers never build or test Rust locally (hard ban — CI is the only cargo path) and how to validate through the draft-PR-early CI flow; the one permitted local check on `.rs` files is `rustfmt --check` as a parser; frontend node-only commands stay local.
+description: Why agent workers never build or test Rust locally (hard ban — CI is the only cargo path) and how to validate through the draft-PR-early CI flow; the one permitted local check on `.rs` files is `rustfmt --check` as a parser; frontend node-only commands stay local, after the `npm ci` a freshly-cut worktree needs first.
 ---
 
 # Local iteration vs. CI proof
