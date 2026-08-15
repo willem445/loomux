@@ -2161,6 +2161,11 @@ mod tests {
             "gh_issue_list",
             "gh_issue_set_labels",
             "gh_issue_view",
+            // #778: reads the repo's workflow file rather than spawning `gh`,
+            // and is still async over `run_blocking` — a file read on the paint
+            // thread is the same freeze in miniature, and the module's rule is
+            // about the thread, not about which subprocess is involved.
+            "gh_label_vocabulary",
             "gh_pr_comment",
             "gh_pr_list",
             "gh_pr_view",
