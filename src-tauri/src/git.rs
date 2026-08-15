@@ -1347,7 +1347,8 @@ fn parse_name_status_z(out: &str) -> Vec<FileEntry> {
 /// it later.
 fn synth_untracked_diff(repo: &Path, rel: &str) -> Result<String, String> {
     const MAX_BYTES: u64 = 1024 * 1024;
-    let full = crate::fileedit::safe_resolve(&repo.to_string_lossy(), rel)?;
+    // SCRATCH NEUTER (#925 red evidence, do not merge): the pre-fix body.
+    let full = repo.join(rel);
     let meta = std::fs::metadata(&full).map_err(|e| e.to_string())?;
     if meta.len() > MAX_BYTES {
         return Ok(format!(
