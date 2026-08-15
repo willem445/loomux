@@ -365,6 +365,72 @@ the other. Group ids are unaffected: they stay identifiers joined at
 `group_dir_at`, and the registry receives group-derived *values* only, so the
 one-join guarantee above is untouched.
 
+### The admit tier: who may mint a declared root
+
+The rules above say a root is usable iff a trusted source declared it. This is
+what that sentence costs in code, and the reason it is a *tier* rather than a
+function is that the sources are not one thing.
+
+**`admit_root` (`src-tauri/src/rootreg.rs`) is the display-side door**, and its
+classification is the enforcement: **class `disabled`** (§5.2 of
+`remote-engine-protocol.md`) — absent from the wire roster and advertised as
+absent, exactly like `open_in_editor` and `fm_open`. It is deliberately *not*
+`client-local`, which means "runs in the desktop client's own Rust and never
+crosses"; this one has to reach the engine's registry. It has no tier, because
+it is never on the wire to have one. That single classification is the whole
+teeth of #1042: a remote peer can **use** declared roots and can never **mint**
+one. If an authenticated remote admit path is ever wanted it re-enters the
+roster as `wire`/**owner** behind auth — a capability *added* later, which is
+H3's rule and the opposite of one removed later.
+
+**The frontend calls it at every source the ruling above makes an admit path**,
+and only there: the four `pickDirectory` results (a native dialog the backend
+never sees, which is why the door has to exist at all — enforcing
+server-declared roots without it would break desktop browsing outright), the
+launcher's submit for every kind that carries a root or a cwd, and session
+restore for every recorded one. Restore is the trusted webview re-declaring its
+*own* persisted state, which is the same authority that admitted it originally;
+a remote client replaying a tabs file gets the declaration refused and lands on
+the fail-soft welcome form that arm already opens for a deleted folder.
+
+**A human gesture on a pane's live cwd admits; the cwd's own arrival does not.**
+Opening the git, issues or editor view on a pane declares that pane's cwd, and
+`onCwdReported` — the OSC-7 handler, fed by whatever process is running in the
+pane — declares nothing. That is the untrusted-source ruling made concrete, and
+it is why an agent that `cd`s to `~/.ssh` gets a quiet folder chip rather than a
+rooted file browser. Never for an SSH pane, whose cwd names a directory on the
+remote machine.
+
+**Two engine-derived sources declare without any webview at all**, because they
+are values the engine computed rather than strings a caller supplied: a group's
+checkout, as orchestration creates *or resumes* the group, and a worktree the
+engine cut. Worktrees need their own declaration and are easy to forget: loomux
+puts them at `<repo>-worktrees/<name>`, a **sibling** of the checkout, so the
+descendant rule does not reach them and an agent could not browse its own
+workspace.
+
+The registry is therefore owned by `OrchRegistry` and `manage`d from `lib.rs` as
+the same `Arc`, rather than created in `lib.rs` and handed over. The reason is
+that one of its two populators *is* that registry: a populator wired by a
+`set_roots` call is a populator that can be forgotten, and forgetting it would
+be invisible until slice C turned it into a desktop regression.
+
+Deliberately **not** admit paths, each argued: `spawn_pty`'s cwd (widening the
+filesystem surface as a side effect of spawning would be an admit path the
+roster cannot see, and tiers will later narrow spawn without wanting fs access
+widened along with it), the merge queue's temporary worktrees (built and torn
+down inside one batch, never a caller's root), and the `git_repo_root` ancestor
+the launcher resolves when opening a git pane on a subdirectory — an ancestor
+grants strictly more than the human named, and nothing uses it as a root.
+
+One consequence of landing admits before refusals is worth naming rather than
+discovering later. A group's checkout arrives, on the *create* path, as a caller
+argument, so until the orchestration `repo` boundaries resolve it, `create_group`
+is on paper a way to launder an undeclared root into the registry. It is inert —
+nothing enforces and no wire exists — and the rule that closes it is one line:
+**any command that would cause a root to become registered from a caller
+argument must itself take an already-declared root.**
+
 ### What has landed, and what has not
 
 Slice A — this section's mechanism — is `crates/loomux-engine/src/rootreg.rs`:
@@ -372,13 +438,23 @@ Slice A — this section's mechanism — is `crates/loomux-engine/src/rootreg.rs
 Tauri-free core so the daemon can link them. It is std-only and mints no ids, so
 CLAUDE.md constraint 2 holds trivially.
 
-**Nothing consumes it yet, and no command refuses anything it did not refuse
-before.** The `admit_root` command, the engine-derived registration at group
-create/load, and the frontend admit-at-source wiring are slice B; boundary
-`resolve` on every root-taking family — with the choke functions changing
-signature so the compiler holds the property — is slice C, and it is slice C
-that introduces the `root-not-declared` error code to a caller. Until then the
-code exists on `RootError` and is returned to nobody.
+Slice B is the admit tier above: the `admit_root` command and the `Arc` that
+holds the registry, the two engine-derived declarations, and the frontend
+admit-at-source wiring. `src-tauri/tests/rootreg.rs` pins it — including two
+source scans, one refusing an `AsRef<Path>` on `DeclaredRoot` (the sibling of
+`GroupId`'s own refusal) and one holding this note's claim that the sites listed
+above are *all* the ways a root gets declared.
+
+**Nothing resolves yet, and no command refuses anything it did not refuse
+before.** The registry fills; that is all it does. Boundary `resolve` on every
+root-taking family — with the choke functions changing signature so the compiler
+holds the property — is slice C, and it is slice C that introduces the
+`root-not-declared` error code to a caller. Until then the code exists on
+`RootError` and is returned to nobody. Slice C also owes the §5.4 roster row for
+`admit_root` (the classification is argued here and in the command's own doc
+comment; the roster table is where C2's test will read it from), the
+`git_repo_root`/ancestor question if it ever needs a root of its own, and the
+TOCTOU reasoning for a symlink swapped after `resolve` canonicalized it.
 
 Deferred past all three, and recorded so the absence is deliberate: a
 `roots_list` wire command and a daemon config's seeded roots (there is no wire
@@ -497,7 +573,9 @@ rows are "the binding is a `PathSegment` at this signature", but others are "the
 value is a literal at every call site", "it is a minted roster id", "it is a
 timestamp, not an identifier", or "the builder refuses the id itself". One row is
 the known non-member — a workflow block id, validated by the weaker
-`workflow::sanitize_id` (see below).
+`workflow::sanitize_id`, which is operator-authored config rather than caller
+input and is therefore argued as an allowlist row rather than closed (the full
+argument is CLAUDE.md constraint 6).
 
 **Why the trigger names nothing, stated because the first version did.** The
 guard originally keyed on a list of binding names, and that is not a limitation
