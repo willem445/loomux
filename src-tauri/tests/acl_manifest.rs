@@ -5,16 +5,16 @@
 //! without an explicit grant silently unreachable for every window,
 //! including `main`. These tests turn that silent failure into a red test:
 //!
-//!   - `generate_handler_matches_app_commands` / `app_commands_len_is_145`:
+//!   - `generate_handler_matches_app_commands` / `app_commands_len_is_146`:
 //!     `src/lib.rs`'s `generate_handler!` and `command_manifest::APP_COMMANDS`
 //!     are the two hand-maintained lists this migration depends on staying
 //!     identical; this diffs them directly out of the `lib.rs` source rather
 //!     than trusting a hand count.
-//!   - `main_has_all_145_and_zero_permission_denies_dangerous_spread`: builds
+//!   - `main_has_all_146_and_zero_permission_denies_dangerous_spread`: builds
 //!     a real (headless) `tauri::test` mock app using the app's *actual*
 //!     `capabilities/`/`permissions/` on disk (via the same `generate_context!`
 //!     `build.rs` already feeds — not a reimplementation of ACL resolution),
-//!     invokes all 145 commands against the `main` window label, and invokes
+//!     invokes all 146 commands against the `main` window label, and invokes
 //!     a representative dangerous spread + a benign control against the
 //!     `plugin-zero-template` window label (see
 //!     `capabilities/plugin-zero-template.json`). This is both the coherence
@@ -23,7 +23,7 @@
 //!
 //! Red-before-green (cited in the PR): dropping `orch_grant_merge` from
 //! `permissions/sets/orch-control.toml` makes
-//! `main_has_all_145_and_zero_permission_denies_dangerous_spread` fail with
+//! `main_has_all_146_and_zero_permission_denies_dangerous_spread` fail with
 //! `main is missing a grant for: ["orch_grant_merge"]`.
 
 // Stub commands: same bare identifiers as the real commands in
@@ -83,6 +83,7 @@ stub_commands!(
     fm_list, fm_new_folder, fm_new_file, fm_rename, fm_delete_start, fm_capabilities, fm_open, fm_open_with,
     fm_reveal,
     fm_hash_start,
+    admit_root,
     take_startup_notice,
     load_ui_tabs, save_ui_tabs, load_settings, save_settings, load_ssh_profiles, save_ssh_profiles,
     voice_start, voice_stop, voice_cancel,
@@ -159,11 +160,11 @@ fn generate_handler_matches_app_commands() {
 }
 
 #[test]
-fn app_commands_len_is_145() {
+fn app_commands_len_is_146() {
     assert_eq!(
         loomux_lib::command_manifest::APP_COMMANDS.len(),
-        145,
-        "APP_COMMANDS drifted from the expected count of 145 (120 per the #363 plan's audited \
+        146,
+        "APP_COMMANDS drifted from the expected count of 146 (120 per the #363 plan's audited \
          count, +1 for orch_confirm_solo_copilot_autopilot added in #364, +2 for \
          orch_set_advanced_orchestrator/orch_workflow_status added in #316/#355, +3 for \
          orch_set_compact_nudge_minutes/orch_set_compact_nudge_roles/ \
@@ -185,13 +186,14 @@ fn app_commands_len_is_145() {
          trusted read and answer surfaces onto the human-question registry added in #946 slice \
          Q1, +1 for orch_set_full_autonomy — the full-autonomy toggle added in #778, +1 for \
          gh_label_vocabulary — the repo-resolved intake label vocabulary the issues view asks \
-         for instead of hardcoding, added in #778 review round 1) — \
+         for instead of hardcoding, added in #778 review round 1, +1 for admit_root — the \
+         trusted local webview's declaration of a filesystem root, added in #1042 slice B) — \
          if this is an intentional addition/removal, update this tripwire's count too"
     );
 }
 
 #[test]
-fn main_has_all_145_and_zero_permission_denies_dangerous_spread() {
+fn main_has_all_146_and_zero_permission_denies_dangerous_spread() {
     // Catches drift in *this test file* before it can mask a real gap: the
     // stub list above must match APP_COMMANDS exactly.
     let mut stub_names: Vec<&str> = STUB_COMMAND_NAMES.to_vec();

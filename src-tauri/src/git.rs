@@ -1093,11 +1093,29 @@ pub fn git_worktree_add_sync(
 
 #[tauri::command]
 pub async fn git_worktree_add(
+    roots: tauri::State<'_, std::sync::Arc<loomux_engine::rootreg::RootRegistry>>,
     repo: String,
     name: String,
     base: Option<String>,
 ) -> Result<String, String> {
-    run_blocking(move || git_worktree_add_sync(repo, name, base)).await
+    // #1042 slice B: the worktree this cuts is a SIBLING of the repo
+    // (`<repo>-worktrees/<name>`), so no descendant rule reaches it — a pane
+    // opened in it needs it declared in its own right. Declared here rather
+    // than inside `git_worktree_add_sync` because the other caller of that
+    // function (`spawn_agent_ex`) holds the registry directly and declares it
+    // there; a free function has no state to reach.
+    //
+    // Same slice-C obligation as the group checkout: `repo` is still an
+    // unvalidated caller argument here, so until slice C resolves it this
+    // registers a child of whatever the caller named. Inert — nothing enforces
+    // yet — and closed by the same rule (`crate::rootreg` module docs).
+    let roots = std::sync::Arc::clone(&roots);
+    run_blocking(move || {
+        let dest = git_worktree_add_sync(repo, name, base)?;
+        crate::rootreg::admit_derived(&roots, &dest);
+        Ok(dest)
+    })
+    .await
 }
 
 /// List every worktree of this repo as raw `git worktree list --porcelain`
