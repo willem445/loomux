@@ -330,7 +330,7 @@ export const MAX_INDENT_DEPTH = 4;
 
 /** Clamp a tree depth to the indent the stylesheet actually draws. */
 export function indentLevel(depth: number): number {
-  return depth;
+  return Math.max(0, Math.min(depth, MAX_INDENT_DEPTH));
 }
 
 /** Build the containment tree from the flat board (#958).
@@ -341,7 +341,37 @@ export function indentLevel(depth: number): number {
  *  than being dropped from the board. Same philosophy as the `missing` dep
  *  chip — a broken link must be visible, never invisible. */
 export function buildTree<T extends HasParent>(board: readonly T[]): TaskTree<T> {
-  return { roots: [...board], children: new Map() };
+  const byId = new Map(board.map((t) => [t.id, t]));
+  /** Does walking up from this row ever come back to something it already
+   *  passed? Bounded by the visited set, so it terminates on any board — the
+   *  one thing a walk over hand-editable data must guarantee. */
+  const cyclic = (t: T): boolean => {
+    const seen = new Set([t.id]);
+    let cur = t.parent ?? null;
+    while (cur) {
+      if (seen.has(cur)) return true;
+      seen.add(cur);
+      cur = byId.get(cur)?.parent ?? null;
+    }
+    return false;
+  };
+  const roots: T[] = [];
+  const children = new Map<string, T[]>();
+  for (const t of board) {
+    const parent = t.parent ?? null;
+    // Registered under its container whenever that container exists at all —
+    // including for a cyclic row, which is ALSO listed as a root below. That
+    // double listing is what lets `visibleRows` show both halves of a cycle
+    // once each: whichever it reaches first renders, and the other is skipped
+    // as already seen rather than recursed into.
+    if (parent && parent !== t.id && byId.has(parent)) {
+      const kids = children.get(parent);
+      if (kids) kids.push(t);
+      else children.set(parent, [t]);
+    }
+    if (!parent || parent === t.id || !byId.has(parent) || cyclic(t)) roots.push(t);
+  }
+  return { roots, children };
 }
 
 /** The rows to render, in display order: roots in board order, each followed
@@ -357,8 +387,27 @@ export function visibleRows<T extends HasParent>(
   board: readonly T[],
   collapsed: Iterable<string> = []
 ): BoardRow<T>[] {
-  void collapsed;
-  return board.map((task) => ({ task, depth: 0, hasChildren: false, collapsed: false }));
+  const hidden = new Set(collapsed);
+  const { roots, children } = buildTree(board);
+  const rows: BoardRow<T>[] = [];
+  const seen = new Set<string>();
+  // `visible` is threaded down rather than returning early on a collapsed row:
+  // the hidden subtree still has to be WALKED, so its rows are marked seen and
+  // can't be picked up again by the fallback below as stray top-level rows.
+  const walk = (task: T, depth: number, visible: boolean): void => {
+    if (seen.has(task.id)) return;
+    seen.add(task.id);
+    const kids = children.get(task.id) ?? [];
+    const isCollapsed = kids.length > 0 && hidden.has(task.id);
+    if (visible) rows.push({ task, depth, hasChildren: kids.length > 0, collapsed: isCollapsed });
+    for (const k of kids) walk(k, depth + 1, visible && !isCollapsed);
+  };
+  for (const r of roots) walk(r, 0, true);
+  // Nothing should reach this — `buildTree` makes every unreachable row a root
+  // — but a row that fell out of the board would be work made invisible, so it
+  // renders at top level instead of being trusted away.
+  for (const t of board) walk(t, 0, true);
+  return rows;
 }
 
 /** Direct-child counts for a container row: how many children it has and how
@@ -372,9 +421,11 @@ export function childCounts<T extends HasParent & HasStatus>(
   id: string,
   board: readonly T[]
 ): { total: number; done: number } {
-  void id;
-  void board;
-  return { total: 0, done: 0 };
+  const kids = buildTree(board).children.get(id) ?? [];
+  return {
+    total: kids.length,
+    done: kids.reduce((n, k) => (k.status === DONE_STATUS ? n + 1 : n), 0),
+  };
 }
 
 /** Whether EVERY task under this one — the whole subtree, not just the direct
@@ -393,9 +444,19 @@ export function subtreeAllDone<T extends HasParent & HasStatus>(
   id: string,
   board: readonly T[]
 ): boolean {
-  void id;
-  void board;
-  return false;
+  const { children } = buildTree(board);
+  const seen = new Set([id]); // visited set: a hand-edited cycle must terminate
+  const queue = [...(children.get(id) ?? [])];
+  let any = false;
+  while (queue.length > 0) {
+    const t = queue.shift() as T;
+    if (seen.has(t.id)) continue;
+    seen.add(t.id);
+    any = true;
+    if (t.status !== DONE_STATUS) return false;
+    queue.push(...(children.get(t.id) ?? []));
+  }
+  return any;
 }
 
 /** Where a row sits among its SIBLINGS (not on the board): drives whether the
@@ -407,7 +468,21 @@ export function siblingPosition<T extends HasParent>(
   board: readonly T[],
   id: string
 ): { index: number; count: number } {
-  return { index: board.findIndex((t) => t.id === id), count: board.length };
+  const siblings = siblingIds(buildTree(board), id);
+  const index = siblings.indexOf(id);
+  return index < 0 ? { index: -1, count: 0 } : { index, count: siblings.length };
+}
+
+/** The id list this row is ordered within (a copy): its container's children,
+ *  or the top-level rows. A row that is both (a hand-edited cycle) is ordered
+ *  as a root, matching where `visibleRows` puts it first. */
+function siblingIds<T extends HasParent>(tree: TaskTree<T>, id: string): string[] {
+  const root = tree.roots.find((t) => t.id === id);
+  if (root) return tree.roots.map((t) => t.id);
+  for (const kids of tree.children.values()) {
+    if (kids.some((k) => k.id === id)) return kids.map((k) => k.id);
+  }
+  return [];
 }
 
 /** The full flattened id order to send to `orch_reorder_tasks` after moving a
@@ -427,13 +502,40 @@ export function reorderWithSubtree<T extends HasParent>(
   id: string,
   delta: number
 ): string[] {
-  const ids = board.map((t) => t.id);
-  const i = ids.indexOf(id);
+  const tree = buildTree(board);
+  const rootIds = tree.roots.map((t) => t.id);
+  const childIds = new Map<string, string[]>();
+  for (const [parent, kids] of tree.children) childIds.set(parent, kids.map((k) => k.id));
+
+  /** Depth-first over the (possibly just-reordered) sibling lists: a container
+   *  is immediately followed by its own subtree, which is what makes the move
+   *  carry the children with it. Visited-guarded for the cyclic board. */
+  const flatten = (): string[] => {
+    const out: string[] = [];
+    const seen = new Set<string>();
+    const walk = (rowId: string): void => {
+      if (seen.has(rowId)) return;
+      seen.add(rowId);
+      out.push(rowId);
+      for (const k of childIds.get(rowId) ?? []) walk(k);
+    };
+    for (const r of rootIds) walk(r);
+    for (const t of board) walk(t.id); // never omit a row — see the doc above
+    return out;
+  };
+
+  // The live sibling array (inside rootIds/childIds, so splicing it is what
+  // `flatten` then reads) — reordering is scoped to it and to nothing else.
+  const siblings = rootIds.includes(id)
+    ? rootIds
+    : [...childIds.values()].find((kids) => kids.includes(id));
+  if (!siblings) return flatten();
+  const i = siblings.indexOf(id);
   const j = i + delta;
-  if (i < 0 || j < 0 || j >= ids.length) return ids;
-  ids.splice(i, 1);
-  ids.splice(j, 0, id);
-  return ids;
+  if (i < 0 || j < 0 || j >= siblings.length) return flatten();
+  siblings.splice(i, 1);
+  siblings.splice(j, 0, id);
+  return flatten();
 }
 
 /** The rows the "nest under…" picker offers: every other row on the board,
@@ -445,7 +547,7 @@ export function reorderWithSubtree<T extends HasParent>(
  *  path, that error surfaces through this view's toast, and a second copy of
  *  the rule here could only ever disagree with the authoritative one. */
 export function parentCandidates<T extends HasParent>(task: T, board: readonly T[]): T[] {
-  return board.filter((t) => t.id !== task.id);
+  return board.filter((t) => t.id !== task.id && t.id !== task.parent);
 }
 
 /** Whether this row's `parent` names no task on the board — only reachable by
@@ -453,7 +555,5 @@ export function parentCandidates<T extends HasParent>(task: T, board: readonly T
  *  survivors on delete), so the board says so on the row rather than rendering
  *  it at top level with no explanation. */
 export function hasMissingParent<T extends HasParent>(task: T, board: readonly T[]): boolean {
-  void task;
-  void board;
-  return false;
+  return !!task.parent && !board.some((t) => t.id === task.parent);
 }
