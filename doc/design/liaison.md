@@ -7,9 +7,9 @@ holds no orchestration authority of its own.
 
 This note covers the `role_hint: liaison` value itself — the public
 `.loomux/workflow.yml` surface it adds — the one capability rule keyed to it,
-and the prose that makes a declared liaison do anything (**The prose**, below).
-Its lifecycle and the user-facing documentation are separate slices and are
-**not** described here as though they shipped.
+the prose that makes a declared liaison do anything (**The prose**), and how the
+pane starts, is skipped and ends (**Lifecycle**). The user-facing documentation
+is a separate slice and is **not** described here as though it shipped.
 
 ## Why `kind: reviewer`
 
@@ -125,6 +125,28 @@ Keep the last row until the slice that lands it turns it into a shipped one, or
 until it is decided against and the row is deleted. A planned widening that is
 invisible here is exactly the surprise this table exists to prevent.
 
+**Capability is not the only thing a hint can key on, so the enumeration owes a
+second table.** These rules change no tool surface at all — the liaison's tokens
+answer exactly as before — but they are read from the hint in loomux's own code
+and a reader looking for "everything `liaison` does" would otherwise stop one
+table too early:
+
+| Rule | Where | Why |
+|---|---|---|
+| A merge gate may not name a liaison | `parse_workflow`, and the pane's validator | It records no verdict, so the gate could never open — refused at parse rather than discovered at merge time |
+| A liaison is not in the PR fan-out | `is_reviewing_block` → `{{REVIEWERS}}`, a reviewer's "one of N" lane | A PR routed to it is a review that can never complete |
+| A liaison is not a class's default block | `block_for` (**Lifecycle**, below) | A bare `spawn_agent(kind: "reviewer")` must not open the human's pane |
+| A liaison is never idle-reaped | `idle_reap_candidates` (**Lifecycle**, below) | The reaper cannot see a human typing, so "idle" there means "mid-conversation" |
+
+Four rules and one capability rule is more than the "couple of entries" that
+paragraph above named as the trigger to revisit a first-class `Role::Liaison` —
+so, deliberately: **the count is not the trigger, the ROOT is.** All five follow
+from one fact stated once — a liaison rides `reviewer` and reviews nothing — and
+each is the same three-word predicate at a different site. What would argue for a
+fifth kind is a rule that does *not* reduce to that sentence: a liaison needing a
+capability no class has, a containment no class expresses, a template of its own.
+None exists today.
+
 ## The prose
 
 Nothing about this feature is mechanical. No notice is rerouted, no report
@@ -199,12 +221,15 @@ through an answering surface. Nothing here makes the liaison the holder of a
 question, which is the shape #946 rejected on the grounds that a wedged liaison
 is a deaf fleet.
 
-That last rule is about the **orchestrator's own** kill-idle-panes discipline
-and deliberately claims nothing about loomux's reaper: `idle_reap_candidates`
-takes any non-orchestrator pane past its group's timeout, and whether a liaison
-needs a hint-keyed exemption is the lifecycle slice's open question. What the
-fragment says instead is what to do when the guardrail does fire — start it
-again.
+That last rule is about the **orchestrator's own** kill-idle-panes discipline,
+and it now sits beside a matching promise about loomux's reaper rather than a
+warning about it: `idle_reap_candidates` skips the hint (**Lifecycle**), so the
+fragment says the guardrail skips it too. The two rules together are the whole
+of what anything inside the group will do to that pane, which is why the
+fragment says so out loud — with the reaper out of the picture, the
+orchestrator's own `kill_agent` is the only thing left in the group that can end
+it. (Outside it, the human can always close the pane, and a CLI can always die;
+the degradation rule above is what covers both.)
 
 **The liaison's own addendum** — `mechanics_core(Role::Reviewer,
 Some("liaison"))`, in the non-overridable core for the reason the advisor's and
@@ -228,52 +253,114 @@ therefore reads the built-in `reviewer.md` — the addendum is its floor against
 persona that forgets, not a substitute for having one. A liaison persona for
 loomux's own workflow file is a separate change.
 
-## What is still not shipped
+## Lifecycle
 
-- **No lifecycle code.** A declared liaison is started because the fragment
-  tells the orchestrator to start one — prose, not machinery — and whether a
-  pane that never calls `report` survives the idle reaper is still an open
-  question, not an answered one. So is the `block_for` skip below.
-- **No user-docs page.** `docs/` documents what a human operates, and what a
-  human operates is not settled until the lifecycle questions above are.
-  The authoring skill's field table lists the value because that table is
-  the *parse contract* and a parse contract that omits an accepted value is
-  wrong; it deliberately carries no "how to build a liaison" recipe.
+A liaison pane is **started by prose and ended by nothing but the orchestrator's
+own decision.** There is no spawner, no supervisor loop and no restart policy;
+the two pieces of machinery here are both *subtractions* — a resolution that
+skips it, and a reaper that skips it.
 
-### A bare `kind: reviewer` spawn can resolve to the liaison
+### Starting it: the fragment, not a spawner
+
+`{{LIAISON_NOTE}}` tells the orchestrator to open the pane on its first turn if
+`list_agents` shows none running, by block id and with a task. That is the whole
+spawn path, and it is deliberate: a code path that spawned a liaison would be a
+second way to open a pane, would need its own answer for "what if the human
+killed it on purpose", and would be the first thing in the group whose existence
+did not trace back to an orchestrator decision.
+
+Spawning it by **id** matters — see the skip below — and so does spawning it with
+a **task**, which is what keeps it off the idle clock at birth (a pane spawned
+with an empty task starts that clock immediately).
+
+### A bare `kind: reviewer` spawn never resolves to it
 
 `spawn_agent` may name a `kind` instead of a `block`, and with no block
 `spawn_agent_ex` falls to `block_for(role)` — "the first block of that kind in
-roster order". A roster that declares its liaison before its reviewers, with a
-gate naming a real reviewer, parses completely clean and still answers
+roster order". A liaison is reviewer-KIND, so a roster that declared it before
+its reviewers parsed completely clean and still answered
 `spawn_agent(kind: "reviewer")` with **the liaison**: a pane holding a
 reviewer's instructions, no `review_verdict`, and no way to satisfy the gate it
-was spawned for.
+was spawned for. It failed **closed** — no verdict is forged and the gate simply
+stays shut — which is what made it a usability trap rather than a security one,
+and what made it safe to leave to this slice instead of smuggling a behaviour
+change into the one that introduced the hint.
 
-It fails **closed** — no verdict is forged and the gate simply stays shut — so
-this is a usability trap, not a security one. `advisor` and `process` share the
-same default-block shape harmlessly, because neither takes anything away; the
-liaison is the first hint that can make "the first block of that kind" a pane
-structurally unable to do the job its class was asked for.
+`block_for` now asks `is_reviewing_block` for a reviewer-kind resolution: the
+same predicate the `{{REVIEWERS}}` fan-out and a reviewer's "one of N" lane ask,
+so *which blocks review* has one answer across every surface that means it.
+`advisor` and `process` need nothing of the sort, because neither takes anything
+away from its class; the liaison is the first hint that can make "the first block
+of that kind" a pane structurally unable to do the job the class was asked for.
 
-The fix is a `block_for` skip, and it belongs with the lifecycle slice that
-already owns how a liaison is spawned — not here, where it would be a behaviour
-change smuggled into the slice that introduces the hint. Until then: name the
-block explicitly when spawning a reviewer into a roster that declares a liaison.
+Two consequences, both intended:
 
-### One known imprecision, left deliberately
+- A roster whose **only** reviewer-kind block is the liaison has no default
+  reviewer at all, so a bare reviewer spawn is refused rather than redirected —
+  and the refusal names the block it skipped, because "this group's workflow
+  declares no reviewer block" is flatly wrong to an author looking at
+  `kind: reviewer` in their own file.
+- Naming the block explicitly is untouched. This resolves a **class** to its
+  default; the liaison is simply never a class's default.
 
-`recommend_capacity` and `extra_tiers` count reviewer blocks by `kind`, so a
-liaison counts as a reviewer in the launcher's capacity advisory. The **number
-is right** and stays right: a liaison is a live pane and does occupy a
-`max_agents` slot, which is the v1 position — exempting it is code the
-degradation story does not need. What is imprecise is only the **noun**: a
-roster carrying a liaison can read "1 more reviewer" where the extra slot is
-the liaison.
+### It is never idle-reaped
 
-`reviewers_needed` is unaffected in the case that matters, because a gated
-roster derives it from the gate's own reviewer list, which can never name a
-liaison. Naming the liaison separately in that advisory belongs with the
-`max_agents` question the lifecycle slice already owns, not here — a capacity
-refactor riding along in the slice that introduces the hint would make both
-harder to review.
+`idle_reap_candidates` skips a liaison-hinted block. The reaper's premise —
+which it audits, in as many words, as *a slot the orchestrator wasn't using was
+reclaimed* — is false for the one pane whose user is not the orchestrator.
+
+Everything that clears an idle clock is machine-side: a task at spawn,
+`send_prompt` from the orchestrator. **A human typing into a pane clears
+nothing**, and there is no signal that it could clear — the raw PTY path the
+human types on is not instrumented, and instrumenting it would mean treating
+keystrokes as orchestration events. So a liaison stamps its own clock the moment
+it `report`s `done` or `blocked` — which for this pane is the moment the
+conversation *starts*, not the moment it ends — and everything after that is
+invisible. The pane would be killed mid-sentence, and the notice would go to the
+other pane.
+
+The cost argument the reaper exists to serve does not carry it either: an idle
+pane spends nothing, and the slot it holds is the deliberate v1 position below.
+The hint is read from the group's own roster via the agent's recorded block —
+never from anything the agent supplied — which is the same source
+`record_verdict`'s deny layer reads.
+
+This is the reaper's second exemption, and the two are the same shape: the
+orchestrator is exempt because it is the group's root, the liaison because it is
+the human's. Nothing else is, and a hint-keyed exemption is not a precedent for
+one — the argument here is specifically that *the idle signal cannot see this
+pane's user*, which is true of no other block.
+
+### The slot it holds, and the cap
+
+**A liaison occupies a `max_agents` slot, and that is the v1 position rather
+than an oversight.** Exempting it from the cap is code the degradation story does
+not need, and a cap that silently admitted one more pane than it says would be a
+worse trade than a roster sized for what it declares. Size the roster **+1** when
+adding a liaison to an existing group.
+
+The launcher's advisory already does most of that arithmetic: `recommend_capacity`
+counts every reviewer-kind block, liaison included, so the **recommended** cap has
+the slot in it. `minimum` depends on whether a gate is declared, and the
+distinction is worth stating rather than rounding off: it budgets
+`reviewers_needed`, which is the **gate's** requirement when a merge gate exists —
+and a gate can never name a liaison, so the slot is excluded — but falls back to
+the raw reviewer-kind count on a **gateless** roster, where it is therefore
+included. Both answers are defensible (a gateless roster has no smaller number to
+give), and neither changes the +1 guidance above, which is about the cap a human
+sets rather than about the advisory.
+
+What is left is a **noun**, not a number: `extra_tiers` can render the liaison's
+slot as "1 more reviewer". Settled here rather than deferred again: **no change.**
+The count a human sizes their cap from is right, the word is cosmetic, and
+teaching the capacity advisory a per-hint vocabulary would put liaison-specific
+copy in the launcher to fix a sentence that is off by one word. If it ever
+misleads someone, it is a launcher-copy fix and not a capacity one.
+
+## What is still not shipped
+
+- **No user-docs page.** `docs/` documents what a human operates; that page is
+  its own slice, now that the lifecycle it would describe is settled. The
+  authoring skill's field table lists the value because that table is the *parse
+  contract* and a parse contract that omits an accepted value is wrong; it
+  deliberately carries no "how to build a liaison" recipe.

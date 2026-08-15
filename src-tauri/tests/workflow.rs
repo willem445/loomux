@@ -1271,6 +1271,71 @@ fn a_declared_liaison_gives_the_orchestrator_its_routing_note_with_the_block_id(
     pinned(at, note, "`review_verdict`", "the claim must name the tools it covers: a universal 'every field' is what shipped a false claim twice, once per path nobody had listed");
     pinned(at, note, "nothing here depends on the liaison being alive", "degradation: the direct escape hatch is what makes this feature safe to add");
     pinned(at, note, "for looking idle", "the standing pane must not be reaped by the orchestrator's own kill-idle-panes rule");
+    // #891 S4 turned this half of the bullet from a warning into a claim about
+    // code (`idle_reap_candidates` skips the hint). The pin moves with the prose
+    // in the same commit: a fragment still saying the guardrail "can still take
+    // it" would have the orchestrator watching for a notice that can no longer
+    // arrive, and the sentence that replaced it is load-bearing in the other
+    // direction — the orchestrator is now the ONLY thing that can end the pane.
+    pinned(at, note, "guardrail agrees and skips it", "S4's exemption is only safe to rely on if the orchestrator is told it holds");
+    // The second half of that rationale needs its own anchor, or it is not pinned
+    // at all (#1072 review N6). Demonstrated by this PR: the consequence clause was
+    // rewritten materially — "leaves YOU the only thing that can end it" narrowed to
+    // the group-scoped claim — with no test file touched and CI green, which is
+    // exactly what a pin covering only the first half permits.
+    pinned(at, note, "leaves nothing but your own", "with the reaper out of the picture the orchestrator IS the pane's mortality, and an orchestrator that is not told so will keep treating the liaison as something that lapses on its own");
+}
+
+#[test]
+fn the_liaison_note_never_says_the_pane_gets_idle_killed() {
+    // #1072 review B1. The fragment makes two claims about this pane's mortality,
+    // and S4 made one of them false: the questions bullet inherited the GENERAL
+    // agent-pane durability argument ("an agent pane compacts, dies and gets
+    // idle-killed"), which since the exemption contradicts the reaper sentence
+    // forty lines below it — in the same generated document, read by the
+    // orchestrator that has to act on it. The half that says the pane lapses is
+    // the half arguing against relying on it, which is the reliance S4 exists to
+    // make safe.
+    //
+    // Asserted as an ABSENCE on purpose. Every other pin here holds a sentence
+    // that must be PRESENT, and no anchor can catch a stale claim that a later
+    // edit re-imports from the general case — which is how this one survived a
+    // sweep that fixed both of its design-note twins. The two negative controls
+    // matter as much as the assertion: the fragment must still be there, and must
+    // still discuss the guardrail, or this passes by the subject vanishing.
+    //
+    // `idle-kill` itself is legitimate and expected here (the guardrail is named,
+    // and said to skip this pane). It is `idle-killed` — the past participle,
+    // asserting it happens to THIS pane — that must never come back.
+    let (reg, _d) = test_registry();
+    let repo = Repo::new().workflow(
+        "version: 1\nblocks:\n\
+         \x20 - id: worker\n    kind: worker\n\
+         \x20 - id: human-desk\n    kind: reviewer\n    role_hint: liaison\n",
+    );
+    let g = reg.create_group(&repo.path(), rails()).unwrap();
+    let flat_doc = flat(&instructions_lf(&reg, &g.id, "orchestrator.md"));
+    let note = section(
+        &flat_doc,
+        "you have a liaison",
+        "a custom workflow config is your group's roster",
+    );
+
+    assert!(
+        note.contains("idle-kill guardrail"),
+        "control: the fragment must still discuss the guardrail, or the absence below is \
+         satisfied by the whole subject being gone: {note}"
+    );
+    assert!(
+        note.contains("never the record of one"),
+        "control: the durability bullet the stale claim lived in must still be here: {note}"
+    );
+    assert!(
+        !note.contains("idle-killed"),
+        "the liaison note tells the orchestrator this pane gets idle-killed, which S4 made \
+         false — `idle_reap_candidates` skips a liaison-hinted block. The durability argument \
+         it supports still holds on `compacts, wedges and dies`: {note}"
+    );
 }
 
 #[test]
@@ -1281,7 +1346,8 @@ fn a_liaison_is_not_fanned_out_to_as_a_reviewer_on_either_surface() {
     // "you are one of N reviewer blocks" lane. Either one alone contradicts the
     // liaison note in the same document ("no PR is routed to it for a verdict") and
     // sends a PR to a pane that is denied `review_verdict` and can satisfy no gate.
-    // The sibling of the `block_for` trap `doc/design/liaison.md` records; the
+    // The sibling of the `block_for` default-block rule S4 shipped
+    // (`a_plain_reviewer_kind_spawn_never_resolves_to_the_liaison`); the
     // merge-gate path is NOT this fix's business — `parse_workflow` already refuses
     // a gate that names a liaison.
     let (reg, _d) = test_registry();
@@ -1321,6 +1387,106 @@ fn a_liaison_is_not_fanned_out_to_as_a_reviewer_on_either_surface() {
     assert!(
         !desk.contains("reviewer blocks"),
         "the liaison must not be handed a review lane: {desk}"
+    );
+}
+
+#[test]
+fn a_plain_reviewer_kind_spawn_never_resolves_to_the_liaison() {
+    // #891 S4, closing the trap S1 shipped and `doc/design/liaison.md` recorded.
+    // `spawn_agent` may name a `kind` instead of a `block`, and a block-less
+    // spawn falls to `block_for(role)` — "the first block of that kind in roster
+    // order". A liaison is reviewer-KIND, so a roster that declares it FIRST
+    // answered a plain reviewer spawn with the human's pane: reviewer
+    // instructions, no `review_verdict`, no way to satisfy the gate it was
+    // spawned for. It failed closed (no verdict is forged), which is why it was
+    // a usability trap rather than a hole — and why it was safe to leave to this
+    // slice rather than smuggle a behavior change into S1.
+    //
+    // Roster ORDER is the whole point, so it is written as a real workflow file:
+    // `desk` before `rev-a`, which is the arrangement that used to lose.
+    let (reg, _d) = test_registry();
+    let repo = Repo::new().workflow(
+        "version: 1\nblocks:\n\
+         \x20 - id: worker\n    kind: worker\n\
+         \x20 - id: desk\n    kind: reviewer\n    role_hint: liaison\n\
+         \x20 - id: rev-a\n    kind: reviewer\n\
+         \x20 - id: rev-b\n    kind: reviewer\n",
+    );
+    let g = reg.create_group(&repo.path(), rails()).unwrap();
+
+    // The resolution itself, and then the pane it actually opens — the second is
+    // the one that matters, since `spawn_agent_ex` is what an orchestrator's
+    // `spawn_agent(kind: "reviewer")` reaches.
+    assert_eq!(
+        g.guardrails.block_for(Role::Reviewer).map(|b| b.id.as_str()),
+        Some("rev-a"),
+        "the class default must be the first block that REVIEWS, not the first reviewer-kind one"
+    );
+    let spawned = reg.spawn_agent(&g.id, Role::Reviewer, "rev", "review #900", false, None).unwrap();
+    assert_eq!(
+        spawned.block, "rev-a",
+        "a plain reviewer-kind spawn opened the liaison's block — the pane is denied \
+         `review_verdict` and can satisfy no gate"
+    );
+
+    // The rule is about a CLASS's default, not a ban: the liaison is still
+    // spawnable — by name, which is how the orchestrator's own fragment spawns
+    // it (`spawn_agent(block: "desk")`).
+    let desk = reg
+        .spawn_agent_ex(
+            &g.id, Role::Reviewer, Some("desk".into()), "desk", "the human is here", false,
+            None, None, None, None, None,
+        )
+        .unwrap();
+    assert_eq!(desk.block, "desk", "naming the block explicitly must still reach the liaison");
+}
+
+#[test]
+fn a_roster_whose_only_reviewer_is_the_liaison_refuses_a_bare_reviewer_spawn_and_names_it() {
+    // The other side of the skip (#891 S4). With no reviewing block left, the
+    // class has no default and the spawn fails CLOSED — and the refusal has to
+    // name the block it skipped, because "this group's workflow declares no
+    // reviewer block" is flatly wrong to an author looking at a reviewer-kind
+    // block in their own file.
+    let (reg, _d) = test_registry();
+    let repo = Repo::new().workflow(
+        "version: 1\nblocks:\n\
+         \x20 - id: worker\n    kind: worker\n\
+         \x20 - id: desk\n    kind: reviewer\n    role_hint: liaison\n",
+    );
+    let g = reg.create_group(&repo.path(), rails()).unwrap();
+    assert!(
+        g.guardrails.block("desk").is_some(),
+        "the fixture must really declare a reviewer-KIND block, or this proves nothing"
+    );
+
+    let err = reg.spawn_agent(&g.id, Role::Reviewer, "rev", "review #900", false, None).unwrap_err();
+    assert!(
+        err.contains("desk") && err.contains("liaison"),
+        "the refusal must name the block it skipped and why: {err}"
+    );
+    // ...and it is the SHARED wording, not a copy of it (#1072 review N5). There
+    // are two sites that resolve a class to its default and can come up empty —
+    // this one and `mcp.rs`'s pre-#222 bare resume — and the second was still
+    // emitting the flat "declares no reviewer block" this PR calls wrong. Both
+    // now call `no_default_block_message`; this equality is what keeps the spawn
+    // path from drifting away from it again.
+    assert_eq!(
+        err,
+        g.guardrails.no_default_block_message(Role::Reviewer),
+        "the spawn refusal must BE the shared message, so the two call sites cannot diverge"
+    );
+    // The un-shadowed case keeps the plain wording — the liaison clause must not
+    // start appearing on rosters that simply declare no such block.
+    assert_eq!(
+        g.guardrails.no_default_block_message(Role::Planner),
+        "this group's workflow declares no planner block"
+    );
+    // Fails closed: the refusal did not open the liaison's pane instead.
+    let roster = reg.list_agents(&g.id);
+    assert!(
+        !roster.as_array().unwrap().iter().any(|a| a["block"] == json!("desk")),
+        "a refused reviewer spawn must not have opened the liaison's block: {roster}"
     );
 }
 

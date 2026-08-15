@@ -97,6 +97,22 @@ export function roleHintRequires(hint: string): BlockKind | undefined {
   return undefined;
 }
 
+/** Does this block actually REVIEW PRs? — reviewer-kind, minus the liaison
+ *  (#891). Mirrors the backend's `is_reviewing_block` (workflow.rs), which the
+ *  `{{REVIEWERS}}` fan-out, a reviewer's "one of N" lane and the class-default
+ *  block resolution all ask.
+ *
+ *  `kind === "reviewer"` answers "which capability class does it ride", and that
+ *  stops being the same question once a hint SUBTRACTS from its class: a liaison
+ *  rides the reviewer posture and reviews nothing, is denied `review_verdict`,
+ *  and is refused outright by `validateWorkflow` when a merge gate names it. So
+ *  anywhere this pane means "the blocks that can satisfy a gate" — offering the
+ *  gate's reviewer checkboxes, filling them in when the gate is switched on —
+ *  asks THIS, or the editor writes a file its own validator immediately flags. */
+export function isReviewingBlock(b: { kind?: string; role_hint?: string }): boolean {
+  return b.kind === "reviewer" && b.role_hint?.trim().toLowerCase() !== "liaison";
+}
+
 /** The schema version this build reads and writes. */
 export const WORKFLOW_VERSION = 1;
 

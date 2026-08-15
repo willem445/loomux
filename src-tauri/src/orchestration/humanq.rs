@@ -11,7 +11,7 @@
 //!
 //! The obvious shape is a dedicated liaison agent that holds the pending
 //! question and relays it. That re-creates the incident one level up: an agent
-//! pane is an LLM session, and it compacts, dies and gets idle-killed. So the
+//! pane is an LLM session, and it compacts, wedges and dies. So the
 //! pending question is **engine state** — a per-group file, `questions.json`,
 //! beside `tasks.json` — and any presenter (the webview inbox, a liaison pane,
 //! a chat bridge) is a client of that record, never the record itself.

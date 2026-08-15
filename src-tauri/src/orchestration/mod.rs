@@ -4315,8 +4315,61 @@ impl Guardrails {
     /// spawns `kind: reviewer` without naming a block — the others are opt-in by
     /// id, which is deliberate: a roster must not silently change what a plain
     /// `spawn_agent(kind: reviewer)` does.
+    ///
+    /// **A liaison is skipped for a reviewer-kind resolution (#891 S4).** It is
+    /// reviewer-KIND and reviews nothing, so "the first block of that kind"
+    /// answered a plain `spawn_agent(kind: "reviewer")` with the human's pane
+    /// whenever a roster happened to declare its liaison first — a reviewer-
+    /// instructed pane denied `review_verdict`, unable to satisfy the gate it
+    /// was spawned for. The predicate is `workflow::is_reviewing_block`, the
+    /// same one the `{{REVIEWERS}}` fan-out and a reviewer's "one of N" lane
+    /// ask (S3), so "which blocks review" has ONE answer across the surfaces
+    /// that mean it.
+    ///
+    /// A roster whose only reviewer-kind block IS the liaison therefore
+    /// resolves to `None` rather than to the liaison, and every caller here
+    /// fails closed on that: the spawn paths refuse with a message naming the
+    /// liaison, `cli_for`/`model_for` fall back to the group defaults. Naming
+    /// the block explicitly (`spawn_agent(block: …)`) is unaffected — this
+    /// resolves a CLASS to its default, and the liaison is never a class's
+    /// default.
     pub fn block_for(&self, kind: Role) -> Option<&workflow::Block> {
-        self.blocks.iter().find(|b| b.kind == kind)
+        self.blocks.iter().find(|b| match kind {
+            Role::Reviewer => workflow::is_reviewing_block(b),
+            _ => b.kind == kind,
+        })
+    }
+
+    /// The reviewer-kind block a [`block_for`](Self::block_for) resolution
+    /// SKIPPED, if that skip is why it came up empty (#891 S4) — so a refusal
+    /// can say "your roster's only reviewer is the liaison" instead of the flatly
+    /// wrong "this group's workflow declares no reviewer block".
+    pub fn liaison_shadowing(&self, kind: Role) -> Option<&workflow::Block> {
+        (kind == Role::Reviewer)
+            .then(|| self.blocks.iter().find(|b| b.kind == kind && !workflow::is_reviewing_block(b)))
+            .flatten()
+    }
+
+    /// The refusal for "this class has no default block", naming the liaison
+    /// when [`liaison_shadowing`](Self::liaison_shadowing) is why (#891 S4).
+    ///
+    /// One function because there are two call sites that resolve a class to
+    /// its default and can come up empty — `spawn_agent_ex`, and `mcp.rs`'s
+    /// pre-#222 bare-resume path — and a message that told the author "your
+    /// workflow declares no reviewer block" while they are looking at
+    /// `kind: reviewer` in their own file is wrong at either of them. Written
+    /// once so the two cannot drift (#1072 review, N5).
+    pub fn no_default_block_message(&self, kind: Role) -> String {
+        match self.liaison_shadowing(kind) {
+            Some(l) => format!(
+                "this group's workflow declares no {} block that reviews — {:?} is \
+                 reviewer-kind but is the human-facing liaison, which records no verdict \
+                 and is never a class's default. Name a block explicitly to spawn it.",
+                kind.as_str(),
+                l.id
+            ),
+            None => format!("this group's workflow declares no {} block", kind.as_str()),
+        }
     }
 
     /// The agent CLI a capability class's default block runs: the block's own
@@ -5771,6 +5824,11 @@ pub fn single_pane_autopilot_flags(program: &str) -> String {
 /// loop lives in `start_idle_reaper`. `idle_since_ms` is `None` for an agent
 /// that currently has work (never idle-killed); a `threshold_min` of 0
 /// disables the guardrail entirely.
+///
+/// **This is the threshold, not the policy.** Who is eligible at all — the
+/// orchestrator is not, and since #891 S4 neither is a liaison block — is
+/// decided by `idle_reap_candidates` before it ever asks this function, so a
+/// `true` here does not mean "will be killed".
 pub fn idle_should_kill(idle_since_ms: Option<u64>, now_ms: u64, threshold_min: u32) -> bool {
     match (threshold_min, idle_since_ms) {
         (0, _) | (_, None) => false,
@@ -26882,20 +26940,48 @@ impl OrchRegistry {
     /// Ids of workers/reviewers whose idle time has crossed their group's
     /// `idle_kill_minutes`. Pure selection (no killing) so the reaper policy
     /// is testable at a chosen `now`.
+    ///
+    /// **A liaison block is exempt (#891 S4)**, and it is the only hint that is.
+    /// The reaper's premise — audited as "a slot the orchestrator wasn't using
+    /// was reclaimed" — is false for the one pane the orchestrator is not the
+    /// user of. Every signal that clears the idle clock is machine-side
+    /// (`send_prompt`, a fresh task at spawn) and a human typing into a pane
+    /// touches none of them, so a liaison in mid-conversation is indistinguishable
+    /// from an abandoned one: it stamps its own clock the moment it
+    /// `report`s `done`/`blocked` and is then reaped out from under the human,
+    /// whose only notice of it goes to the OTHER pane. The cost argument does not
+    /// carry it either — an idle pane spends nothing, and the slot it holds is
+    /// deliberate (`doc/design/liaison.md`: size the roster +1).
+    ///
+    /// The hint is read from the group's own roster via the agent's recorded
+    /// block, never from anything the agent supplied — the same source
+    /// `record_verdict`'s deny layer reads.
     pub fn idle_reap_candidates(&self, now: u64) -> Vec<String> {
-        let thresholds: HashMap<GroupId, u32> = self
+        // One pass, under one lock: the threshold and the group's liaison block
+        // ids (plural — a roster may declare more than one, and every one of
+        // them is a standing pane).
+        let policy: HashMap<GroupId, (u32, HashSet<String>)> = self
             .groups
             .lock_safe()
             .iter()
-            .map(|(id, g)| (id.clone(), g.guardrails.idle_kill_minutes))
+            .map(|(id, g)| {
+                let standing: HashSet<String> = g
+                    .guardrails
+                    .blocks
+                    .iter()
+                    .filter(|b| b.role_hint.as_deref() == Some("liaison"))
+                    .map(|b| b.id.clone())
+                    .collect();
+                (id.clone(), (g.guardrails.idle_kill_minutes, standing))
+            })
             .collect();
         self.agents
             .lock_safe()
             .values()
             .filter(|a| a.role != Role::Orchestrator && a.status == AgentStatus::Running)
             .filter(|a| {
-                let t = thresholds.get(&a.group).copied().unwrap_or(0);
-                idle_should_kill(a.idle_since_ms, now, t)
+                let Some((t, standing)) = policy.get(&a.group) else { return false };
+                !standing.contains(&a.block) && idle_should_kill(a.idle_since_ms, now, *t)
             })
             .map(|a| a.id.clone())
             .collect()
@@ -34972,13 +35058,18 @@ impl OrchRegistry {
         // `advisor_and_process_prose_stays_silent_unless_a_block_declares_the_hint`
         // enforces: a group with no liaison must not read one word about one.
         //
-        // Two things it deliberately does NOT claim. It never says the liaison is
-        // exempt from loomux's idle reaper — `idle_reap_candidates` takes any
-        // non-orchestrator pane past its group's timeout, and whether that needs a
-        // hint-keyed exemption is the lifecycle slice's open question — so the rule
-        // written here is the one the orchestrator itself controls (don't kill it,
-        // restart it if the guardrail does) rather than a promise about the reaper.
-        // And it never lets a relayed directive become a grant: the human's Approve
+        // The reaper sentence is a claim about code, and #891 S4 made it true:
+        // `idle_reap_candidates` skips a liaison-hinted block, so the fragment
+        // says the guardrail skips it rather than S3's "the guardrail can still
+        // take it, restart it when it does". The two rules it states are now the
+        // whole of what anything IN THE GROUP will do to that pane — the
+        // orchestrator must not kill it, and no automatic path will — which is
+        // why the sentence names that consequence rather than leaving the reader
+        // to infer it. (Scoped to the group deliberately: the human can still
+        // close the pane, and a CLI can still die.)
+        //
+        // One thing it deliberately does NOT claim: it never lets a relayed
+        // directive become a grant. The human's Approve
         // is minted in the trusted webview, so a liaison carries the human's WORDS
         // and never their AUTHORITY.
         let liaison_note = match role_hint_block(&g.guardrails.blocks, "liaison") {
@@ -35003,7 +35094,7 @@ impl OrchRegistry {
                  still re-raise it once per **Monitoring open PRs** sweep. Only the pane you ask \
                  in moved.\n\
                  - **`{id}` presents a question; it is never the RECORD of one.** An agent pane \
-                 compacts, dies and gets idle-killed, so a question that must outlive this turn \
+                 compacts, wedges and dies, so a question that must outlive this turn \
                  belongs somewhere durable — the board task you mark `blocked`, and the question \
                  registry when you opened one with `ask_human` (whose `q-N` is worth sending the \
                  liaison, since `list_questions` is readable from its pane too). The two \
@@ -35045,9 +35136,10 @@ impl OrchRegistry {
                  - **Don't reclaim its slot.** A liaison is a standing conversation, not a \
                  delegate between tasks, so \"never hold an idle one\" in **Planning & \
                  scheduling** is not about it: never `kill_agent` `{id}` for looking idle. \
-                 loomux's own idle-kill guardrail is enforced and can still take it — if a \
-                 `[loomux] idle-kill` notice names `{id}`, start it again rather than leave the \
-                 human talking to a dead pane. It does hold one live-delegate slot while it \
+                 loomux's own idle-kill guardrail agrees and skips it — a human typing into a \
+                 pane clears no idle clock, so a reaped liaison would be one killed \
+                 mid-conversation. Inside this group, that leaves nothing but your own \
+                 `kill_agent` able to end it. It does hold one live-delegate slot while it \
                  runs; pace the fleet around that instead of dropping it to make room.",
                 id = b.id,
             ),
@@ -35075,7 +35167,7 @@ impl OrchRegistry {
         // is reviewer-KIND (it rides the class for its posture and reviews nothing),
         // so a bare `kind == Reviewer` filter fans PRs out to a pane that is denied
         // `review_verdict` and can satisfy no gate. It fails closed, like the
-        // `block_for` trap `doc/design/liaison.md` records, but it also puts a flat
+        // `block_for` resolution S4 closed with the same predicate, but it also puts a flat
         // contradiction in one document: the liaison note two paragraphs above says
         // no PR is routed to it for a verdict.
         //
@@ -38706,9 +38798,15 @@ impl OrchRegistry {
                     group.guardrails.blocks.iter().map(|b| b.id.as_str()).collect();
                 format!("unknown block {id:?}. Blocks in this group: {}", known.join(", "))
             })?,
-            None => group.guardrails.block_for(role).cloned().ok_or_else(|| {
-                format!("this group's workflow declares no {} block", role.as_str())
-            })?,
+            None => group
+                .guardrails
+                .block_for(role)
+                .cloned()
+                // #891 S4: "declares no reviewer block" is a lie when the roster
+                // declares exactly one and it is the liaison — the class
+                // resolution skipped it. The wording is shared with the
+                // bare-resume path in `mcp.rs`; see `no_default_block_message`.
+                .ok_or_else(|| group.guardrails.no_default_block_message(role))?,
         };
         // A workflow file must not be able to hand an agent a second
         // orchestrator: an orchestrator-kind spawn is exempt from the live-agent
@@ -44380,9 +44478,10 @@ impl OrchRegistry {
 }
 
 /// Background loop that enforces the idle-worker auto-kill guardrail: every
-/// `IDLE_REAP_INTERVAL` it kills any worker/reviewer whose idle time has
+/// `IDLE_REAP_INTERVAL` it kills each worker/reviewer whose idle time has
 /// crossed its group's `idle_kill_minutes` (groups with the guardrail off
-/// are skipped inside `reap_idle_agents`). Started once at app setup.
+/// are skipped inside `reap_idle_agents`, and so is a **liaison** block —
+/// `idle_reap_candidates` owns both exclusions). Started once at app setup.
 pub fn start_idle_reaper(reg: Arc<OrchRegistry>) {
     std::thread::spawn(move || loop {
         std::thread::sleep(IDLE_REAP_INTERVAL);

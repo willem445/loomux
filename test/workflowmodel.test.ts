@@ -27,6 +27,7 @@ import {
   addBlock,
   newBlock,
   isValidBlockId,
+  isReviewingBlock,
   isWorkflowCli,
   hasErrors,
   BLOCK_KINDS,
@@ -1172,6 +1173,36 @@ test("a merge gate may not name a liaison as one of its reviewers (#891)", () =>
   // The control: the same document without the hint is clean, so the finding
   // above is attributable to the liaison rule and not to the fixture.
   assert.ok(!has(validateWorkflow(starterWorkflow()), "gate-not-a-reviewer"));
+});
+
+test("isReviewingBlock separates the blocks that review from the class they ride (#891)", () => {
+  // The pane's mirror of the backend's `is_reviewing_block`. It is what the
+  // merge-gate reviewer list offers and what switching the gate ON fills in —
+  // and the pairing that matters is the last two: a liaison is reviewer-KIND,
+  // so a `kind` filter cannot tell them apart and the editor would author a
+  // file `validateWorkflow` flags `gate-not-a-reviewer` on the same keystroke.
+  assert.equal(isReviewingBlock({ kind: "reviewer" }), true);
+  assert.equal(isReviewingBlock({ kind: "worker" }), false);
+  assert.equal(isReviewingBlock({ kind: "reviewer", role_hint: "process" }), true,
+    "another hint on a reviewer subtracts nothing — only the liaison does");
+  assert.equal(isReviewingBlock({ kind: "reviewer", role_hint: "liaison" }), false);
+  // Trimmed and case-folded, like `roleHintRequires` and the backend parser: a
+  // file the real engine reads as a liaison must not read as a reviewer here.
+  assert.equal(isReviewingBlock({ kind: "reviewer", role_hint: " Liaison " }), false);
+
+  // The property the two call sites depend on, asserted directly rather than
+  // through the DOM they live in: filtering a real roster leaves exactly the
+  // blocks a merge gate may name.
+  const w = starterWorkflow();
+  w.blocks[2]!.role_hint = "liaison";
+  const gateable = w.blocks.filter(isReviewingBlock).map((b) => b.id);
+  assert.ok(!gateable.includes(w.blocks[2]!.id), `the liaison must not be offered: ${gateable}`);
+  assert.deepEqual(
+    validateWorkflow({ ...w, gates: { merge: { require: "all-pass", reviewers: gateable, also: [] } } })
+      .filter((f) => f.code === "gate-not-a-reviewer"),
+    [],
+    "a gate filled from this predicate must validate clean — that is the whole point of it"
+  );
 });
 
 test("role_hint round-trips through serialize/parse unchanged", () => {

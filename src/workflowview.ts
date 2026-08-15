@@ -41,6 +41,7 @@ import {
   connectionError,
   isValidBlockId,
   isBlockKind,
+  isReviewingBlock,
   isWorkflowCli,
   hasErrors,
   BLOCK_KINDS,
@@ -1420,7 +1421,11 @@ export class WorkflowView {
           merge: on.checked
             ? {
                 require: "all-pass",
-                reviewers: next.blocks.filter((b) => b.kind === "reviewer").map((b) => b.id),
+                // Reviewer-kind minus the liaison (#891 S4): filling this with a
+                // bare `kind` filter made ticking the gate on author a file the
+                // pane's own validator flags `gate-not-a-reviewer` in the same
+                // breath — the human never named the liaison, the checkbox did.
+                reviewers: next.blocks.filter(isReviewingBlock).map((b) => b.id),
                 also: [],
               }
             : undefined,
@@ -1463,7 +1468,11 @@ export class WorkflowView {
     }
 
     const reviewers = el("div", "wf-checks");
-    const reviewerBlocks = w.blocks.filter((b) => b.kind === "reviewer" && b.id);
+    // Same predicate as the fill-in above, so the offer list and what it fills
+    // in agree. A liaison already NAMED by a hand-edited file is not hidden by
+    // this — it falls through to the `wf-bad` row below, labelled and
+    // untickable, which is where the file's own finding can be acted on.
+    const reviewerBlocks = w.blocks.filter((b) => isReviewingBlock(b) && b.id);
     for (const b of reviewerBlocks) {
       const line = el("label", "wf-check");
       const cb = document.createElement("input");
@@ -1493,7 +1502,14 @@ export class WorkflowView {
           g.reviewers = g.reviewers.filter((r) => r !== id);
         })
       );
-      line.append(cb, el("span", "wf-check-label wf-bad", `${id} — not a reviewer block`));
+      // A liaison lands here too, and "not a reviewer block" would be wrong
+      // about it in a way the author can see is wrong (their file says
+      // `kind: reviewer`) — so say the thing that is actually true of it.
+      const why =
+        !!id && w.blocks.some((b) => b.id === id && b.kind === "reviewer" && !isReviewingBlock(b))
+          ? "a liaison, which records no verdict"
+          : "not a reviewer block";
+      line.append(cb, el("span", "wf-check-label wf-bad", `${id} — ${why}`));
       reviewers.append(line);
     }
     if (!reviewers.children.length) {

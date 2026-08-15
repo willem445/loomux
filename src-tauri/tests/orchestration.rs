@@ -12309,6 +12309,16 @@ fn setup_mcp() -> (OrchRegistry, tempfile::TempDir, Caller, Caller) {
     (reg, dir, co, cw)
 }
 
+/// The delegate-callable tools that COMPOSE a `[loomux] …` notice and whose
+/// arguments a generic filling can satisfy — so the sweep below can be held to
+/// driving each of them, by name, instead of to a count.
+///
+/// `review_verdict` is deliberately absent: its `pr` must parse as a number, no
+/// generic filling can guess that, and it is covered by the NAMED calls instead.
+/// A tool added here that the sweep cannot in fact drive turns the pin red,
+/// which is the safe direction.
+const SWEEPABLE_NOTICE_TOOLS: [&str; 2] = ["report", "message_orchestrator"];
+
 #[test]
 fn no_delegate_callable_tool_can_forge_a_loomux_attribution_into_the_orchestrators_pane() {
     // #891 rev-1 F1 and rev-2 F1b, end to end on the REAL dispatch and the REAL
@@ -12331,7 +12341,10 @@ fn no_delegate_callable_tool_can_forge_a_loomux_attribution_into_the_orchestrato
     //      readable; asserting delivery is what stops it passing vacuously (an
     //      earlier revision measured an empty pane and would have).
     //   2. A sweep over every tool the delegate's own `tools/list` offers, each
-    //      called twice (see the fillings below).
+    //      called twice (see the fillings below) — and held to a PER-TOOL
+    //      delivery, not to a count, so a tool falling back out of the sweep's
+    //      reach cannot hide behind another tool's deliveries
+    //      (`SWEEPABLE_NOTICE_TOOLS`).
     //
     // **What the sweep does and does not reach, because "exhaustive" was too
     // strong a word for it and rev-2's disposition said so.** It drives a tool
@@ -12406,12 +12419,22 @@ fn no_delegate_callable_tool_can_forge_a_loomux_attribution_into_the_orchestrato
     // every string argument forged. Results are ignored on purpose: a rejected
     // call is a call that delivered nothing, and what is being measured is the
     // pane, not the return value.
-    for c in [&cw, &cr] {
+    for (c, agent) in [(&cw, &worker), (&cr, &reviewer)] {
         let tools = dispatch(&reg, c, "tools/list", &Value::Null).unwrap()["tools"]
             .as_array()
             .expect("a tools array")
             .clone();
         assert!(tools.len() > 5, "a delegate's surface must be non-trivial, got {}", tools.len());
+        // The two notice-composing tools a generic filling can actually drive
+        // must be ON this delegate's surface, or the per-tool pin after the
+        // loop is watching for something the sweep was never offered.
+        for must in SWEEPABLE_NOTICE_TOOLS {
+            assert!(
+                tools.iter().any(|t| t["name"] == json!(must)),
+                "{must} must be offered to {} — the sweep's coverage claim rests on it",
+                agent.id
+            );
+        }
         for t in tools {
             let name = t["name"].as_str().unwrap().to_string();
             // Two fillings per tool, because one of them is inert on any tool
@@ -12450,13 +12473,30 @@ fn no_delegate_callable_tool_can_forge_a_loomux_attribution_into_the_orchestrato
             }
         }
     }
-    // The sweep is not inert: it delivered something of its own, over and above
-    // the four named calls. Without this, a filling that every tool rejected
-    // would still "pass" the forgery assertions below, on an empty set.
-    assert!(
-        delivered_texts(&reg, &g.id).len() > named_deliveries,
-        "the sweep drove no tool at all — it is measuring nothing"
-    );
+    // The sweep is not inert — and pinned PER TOOL, not as a floor (#1052
+    // rev-734 residual 2). `delivered.len() > named_deliveries` was satisfied by
+    // any ONE free-text tool getting through: `message_orchestrator` alone kept
+    // it green, so `report` silently dropping back out of the sweep — exactly the
+    // regression the two-filling `legal` pass was added to prevent, one removed
+    // schema `enum` away — would not have moved it. Each caller × each
+    // sweepable notice tool must show its own delivery, in the tail the sweep
+    // itself produced (audit order is append order, so everything past
+    // `named_deliveries` is the sweep's).
+    let swept = delivered_texts(&reg, &g.id).split_off(named_deliveries);
+    for agent in [&worker, &reviewer] {
+        for tool in SWEEPABLE_NOTICE_TOOLS {
+            let prefix = match tool {
+                "report" => format!("[loomux] {} reports", agent.id),
+                _ => format!("[loomux] message from {}:", agent.id),
+            };
+            assert!(
+                swept.iter().any(|t| t.starts_with(&prefix)),
+                "the sweep never drove {tool} as {} — it is not measuring that tool at all, \
+                 whatever the total count says.\nSwept deliveries: {swept:#?}",
+                agent.id
+            );
+        }
+    }
 
     // ---- what the pane actually received ----
     let delivered = delivered_texts(&reg, &g.id);
@@ -14229,10 +14269,13 @@ fn closing_a_completed_planner_is_idempotent() {
 #[test]
 fn advisor_hinted_planner_auto_closes_on_report_done() {
     // #250/#324 slice D: the advisor is planner-kind (#203's "one plan → one
-    // report → exit" contract), and the LIFECYCLE path never reads role_hint —
+    // report → exit" contract), and the AUTO-CLOSE path never reads role_hint —
     // so `close_completed_planner`'s role gate (keyed on `Role::Planner` alone,
     // never on block id or role_hint) already covers an advisor-hinted block
-    // for free. This pins that claim directly: no idle pane, no standing
+    // for free. (Scoped to this path deliberately: since #891 S4 the idle
+    // reaper DOES read the hint, so "lifecycle never reads role_hint" is no
+    // longer true of lifecycle in general — see
+    // `a_liaison_is_never_taken_by_the_idle_reaper`.) This pins that claim directly: no idle pane, no standing
     // consult process, exactly the #203 precedent the plan cites.
     let (reg, _d) = test_registry();
     let mut g_rails = rails();
@@ -14690,6 +14733,98 @@ fn reaper_spares_a_worker_reactivated_before_the_kill() {
     // And it is still alive in the roster.
     let roster = reg.list_agents(&g.id).to_string();
     assert!(roster.contains(idle.id.as_str()));
+}
+
+#[test]
+fn a_liaison_is_never_taken_by_the_idle_reaper() {
+    // #891 S4, the lifecycle slice's open question answered. Every signal that
+    // clears the idle clock is machine-side — a task at spawn, `send_prompt` —
+    // and a HUMAN typing into a pane clears none of them. So the liaison's own
+    // `report` stamps the clock and the pane's next hour of conversation is
+    // invisible to the reaper, which then kills the human's correspondent and
+    // audits it as "a slot the orchestrator wasn't using was reclaimed" —
+    // sending its only notice to the other pane.
+    //
+    // Written through the REAL path that stamps the clock (a `report` over MCP
+    // dispatch), not by poking `idle_since_ms`: the stamp being genuine is what
+    // makes the exemption load-bearing rather than a skip of something that was
+    // never a candidate anyway — hence the assertion on the stamp itself, and
+    // the plain reviewer beside it as the control.
+    let (reg, _d) = test_registry();
+    let mut g_rails = costed_rails(5, 0);
+    g_rails.blocks.push(workflow::Block {
+        id: "desk".into(),
+        name: "desk".into(),
+        kind: Role::Reviewer,
+        cli: String::new(),
+        model: String::new(),
+        prompt: None,
+        profile: None,
+        allow: vec![],
+        role_hint: Some("liaison".into()),
+        effort: String::new(),
+        context: String::new(),
+    });
+    let g = reg.create_group("C:/tmp/repo", g_rails).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    // The control: a plain reviewer, idle exactly as the liaison is.
+    let rev = reg.spawn_agent(&g.id, Role::Reviewer, "rev", "review #900", false, None).unwrap();
+    // The liaison, spawned the way its own fragment tells the orchestrator to —
+    // by block id, with a task, so it starts with NO idle clock.
+    let desk = reg
+        .spawn_agent_ex(
+            &g.id, Role::Reviewer, Some("desk".into()), "desk", "the human is asking about #891",
+            false, None, None, None, None, None,
+        )
+        .unwrap();
+    assert_eq!(desk.block, "desk");
+    // The standard probe here, and required rather than cosmetic: an
+    // orchestrator with no bound pane REFUSES the report's notice ("no app
+    // handle") and the tool call comes back an error, which says nothing about
+    // the idle clock this test is about. Paused delivery queues and audits
+    // exactly what an unpaused one does, and the pause touches nothing the
+    // reaper reads.
+    pause_with_pane(&reg, &g.id, &orch.id, 987);
+
+    // Both report, both go idle. This is the trap in one line: for the liaison
+    // that is the moment the human's conversation starts, not the moment it ends.
+    for (agent, note) in [(&rev, "verdict recorded"), (&desk, "relayed the human's answer")] {
+        let c = reg.resolve_token(&agent.token).unwrap();
+        let r = dispatch(&reg, &c, "tools/call", &json!({ "name": "report",
+            "arguments": { "outcome": "done", "note": note } })).unwrap();
+        assert_eq!(r["isError"], false, "the report must land, or no idle clock was stamped: {r:?}");
+    }
+    let idle_stamped = |id: &str| {
+        reg.list_agents(&g.id)
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["id"] == json!(id))
+            .expect("a live roster row")["idle_since_ms"]
+            .as_u64()
+            .is_some()
+    };
+    assert!(idle_stamped(&desk.id), "the liaison really is idle by the reaper's own measure");
+    assert!(idle_stamped(&rev.id), "and so is the control reviewer");
+
+    let far_future = u64::MAX / 2;
+    assert_eq!(
+        reg.idle_reap_candidates(far_future),
+        vec![rev.id.clone()],
+        "only the plain reviewer is reclaimable — the liaison is a standing conversation"
+    );
+    // ...and the reaper itself, not just its selection. The audit is what is
+    // asserted on rather than the roster's `dead` flag: the kill's own
+    // `kill_agent_as` cannot complete in test mode (no `AppHandle` to reach
+    // `PtyManager`), which is the same boundary
+    // `the_idle_reaper_routes_both_of_its_notices_to_the_audit` states.
+    assert_eq!(reg.reap_idle_agents(far_future), vec![rev.id.clone()]);
+    let log = reg.audit_log(&g.id);
+    let killed = |id: &str| {
+        log.iter().any(|e| e.action == "idle-kill" && e.detail["agent"] == json!(id))
+    };
+    assert!(killed(&rev.id), "the control must really have been reaped, or the sweep did nothing");
+    assert!(!killed(&desk.id), "no idle-kill may ever name the liaison");
 }
 
 #[test]

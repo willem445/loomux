@@ -1025,7 +1025,9 @@ persisted in `group.json`, and clamped in `clamped()`.
   it a prompt (`send_prompt`). A background reaper (`start_idle_reaper`, 30s tick) kills any
   whose idle time crosses the group's `idle_kill_minutes` and notifies the orchestrator so it
   can respawn on demand. The threshold logic is the pure `idle_should_kill`; the orchestrator
-  is never a candidate. Off by default (0) — the human opts in, since auto-killing is
+  is never a candidate, and neither is a **liaison** block (#891 S4 — the one pane whose user
+  is the human, whose typing clears no idle clock, so "idle" there means "mid-conversation";
+  see doc/design/liaison.md). Off by default (0) — the human opts in, since auto-killing is
   destructive-ish.
 - **Per-group cost aggregation.** `group_usage` sums each live pane's session cost into one
   summary (total + per-agent). Cost is parsed best-effort from the pane's in-pane statusline
