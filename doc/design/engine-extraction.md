@@ -1588,13 +1588,22 @@ from a unit test of product code, agents are banned from running cargo locally
     correct home regardless of the std-only premise being wrong.
 
     Otherwise a pure relocation, exemption taken whole: no logic line changed,
-    every item was already `pub` so nothing widened, and the moved inline
-    `#[cfg(test)]` tests are engine unit tests now. `mod winpath;` in
-    `src-tauri/src/lib.rs` becomes `pub use loomux_engine::winpath;` — the
-    whole module, not a local shim file, since (unlike `obs` in batch 7)
-    nothing Tauri-shaped stays behind. `src-tauri/tests/` is untouched, which
-    is the proof the re-export is complete rather than a claim about it.
-    `OrchRegistry` itself is still ahead.
+    and every item in `winpath.rs` was already `pub`. That is not the same
+    claim as "nothing widened", though — the module's own visibility is what
+    moved. `mod winpath;` in `src-tauri/src/lib.rs` was crate-private, and it
+    becomes `pub use loomux_engine::winpath;` — a genuine widening, matching
+    the `pub use loomux_engine::{…};` shape every other whole-module
+    re-export in this crate already uses (batches 6, 10, 12b) rather than the
+    plain `use` that would have preserved the old crate-only privacy.
+    `winpath` is reachable from `src-tauri/tests/`'s external
+    integration-test binary for the first time as a result. It is the whole
+    module rather than a local shim file, since (unlike `obs` in batch 7)
+    nothing Tauri-shaped stays behind. The 19 moved inline `#[cfg(test)]`
+    tests are engine unit tests now. `src-tauri/tests/` carries no call-site
+    edit — the one change there is a doc comment on `msys_dir_for_fixture`
+    that had asserted `winpath` was unreachable from an integration test,
+    which the widening above made false. `OrchRegistry` itself is still
+    ahead.
 
 They are serial because each rides the previous one's re-exports, and because
 `src-tauri/src/orchestration/mod.rs` is the highest-conflict file in the repo:
