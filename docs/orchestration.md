@@ -74,8 +74,20 @@ in an audit log.
    Every other CLI keeps the automatic behaviour described above, and Copilot
    will too once it gains a way to be asked.
 
-3. Set the repository, how many idle workers to start with, and the guardrails:
-   **max live agents** and **permissions**.
+3. Set the repository and the guardrails: **max live agents**, the cost and
+   recovery limits (idle-kill, max spawns/hour, watchdog stall), and
+   **permissions**.
+
+   A group starts with **no workers**, and there is no setting for it. The
+   orchestrator opens the ones the work needs once it has read the issue —
+   before that, any number would be a guess, and idle agents cost tokens. Ask
+   it for more (or fewer) at any time by typing into its pane.
+
+The card shows the **mark of the agent CLI** it is about to launch, beside the
+title: GitHub's own Copilot glyph for Copilot CLI, a lettered badge for the
+CLIs with no licensed mark, and nothing at all for a pane that runs no agent —
+a terminal, a file explorer, or an SSH connection with no remote CLI chosen.
+It is the same mark the pane header wears once the pane is running.
 
 ### Thinking level and context window
 

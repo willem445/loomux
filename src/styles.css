@@ -1654,8 +1654,15 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 }
 .welcome-form { width: 100%; display: flex; justify-content: center; }
 
+/* #1020 item 3. The card was 440px, which is a width the orchestrator section could not
+   live at: four role rows of [cli][model][effort][context] wrapped inside it, so each role
+   became two ragged lines and the "weird spacing" the demo called out was mostly that wrap.
+   580px is the narrowest width at which a role row fits on one line with the model picker
+   still wider than the three selects beside it — wide enough to stop wrapping, not so wide
+   that the agent kind (four short fields) reads as a mostly-empty sheet. `max-width` still
+   yields to a narrow pane, where wrapping is the correct answer rather than an overflow. */
 .welcome-card {
-  width: 440px; max-width: calc(100% - 16px);
+  width: 580px; max-width: calc(100% - 16px);
   background: var(--surface-1);
   border: 1px solid var(--line); border-radius: 12px;
   box-shadow: var(--shadow-float);
@@ -1663,6 +1670,12 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   display: flex; flex-direction: column; gap: 11px;
   animation: dlg-in 0.16s var(--ease);
 }
+/* The card's own header: the title block, and the CLI preview opposite it (#1020 item 4).
+   `align-items: start` keeps the mark on the title's line rather than centred against a
+   two-line heading, and the preview is `flex: none` chrome — nothing here sizes a pane. */
+.welcome-head { display: flex; align-items: start; justify-content: space-between; gap: var(--space-4); }
+.welcome-heading { min-width: 0; }
+.welcome-preview { flex: none; display: flex; align-items: center; opacity: 0.9; }
 .welcome-card h2 {
   margin: 0; font-size: 11.5px; font-weight: 600;
   letter-spacing: 1.5px; text-transform: uppercase; color: var(--ink-dim);
@@ -1684,11 +1697,29 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .dlg-row > .dlg-field { flex: 1; min-width: 0; }
 .dlg-num { width: 100%; }
 .model-picker { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
-/* #687: a per-role row is [cli] [model] [thinking level] [context]. The model
-   picker takes the slack; the knob selects keep their content width and the row
-   wraps rather than overflowing a narrow setup pane. */
-.role-row { flex-wrap: wrap; align-items: start; }
-.role-row > .model-picker { flex: 1 1 140px; }
+/* A row of equal columns rather than flex-sized ones (#1020 item 3). Flex sizes each field
+   to its own content, so a 4-up row and a 3-up row of the same numeric guardrails started
+   their fields in different places and read as two unrelated blocks — the "space consumed
+   oddly" of the demo note. Grid makes the columns a property of the ROW, so every row in
+   the card lines up down the card. `minmax(0, 1fr)` rather than `1fr` because a grid track's
+   default `min-width: auto` refuses to shrink below its content and would overflow the card
+   in a narrow pane. */
+.dlg-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); }
+/* #687: a per-role row is [cli] [model] [thinking level] [context]. It used to wrap, which
+   is what a 440px card forced: four roles wrapped into eight ragged lines whose fields
+   never aligned. At 580px the four fit on one line, so the row is a grid with FIXED
+   proportions — the model picker takes the slack (it holds the longest values by far, and
+   it alone can grow a summary line beneath), the three selects hold steady, and all four
+   role rows agree on where each column starts. Proportional tracks rather than `em` widths
+   so a narrow pane compresses the row instead of overflowing it; nothing here wraps, so a
+   role is always one line, and none of it reaches a terminal (constraint 1 — the setup card
+   is a form inside a pane, never a split). */
+.role-row {
+  display: grid;
+  grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.7fr) minmax(0, 1fr) minmax(0, 0.9fr);
+  align-items: start;
+}
+.role-row > .model-picker { min-width: 0; }
 .role-row > .dlg-select { min-width: 0; }
 .role-row > .dlg-select:disabled { opacity: 0.55; cursor: not-allowed; }
 .model-picker select, .model-picker input { width: 100%; }

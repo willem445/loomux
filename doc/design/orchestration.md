@@ -427,12 +427,18 @@ with the pane's `W <seq>` badge (issue #75), never disagree with it. Two rules:
 - **Single pane** — unchanged.
 - **Multiple panes (N)** — spawns N identical agent panes; a worktree name becomes
   `name-1 … name-N` so each agent gets an isolated worktree. (Secondary request.)
-- **Orchestrator + workers** — requires a repository; fields: initial workers (0–6),
-  max live agents (1–12), a **per-role CLI + model** row for each of orchestrator /
-  worker / reviewer / planner (the top *Agent* select is the group default that seeds
-  every role; each role can override it — issue #4), and permissions. Spawns one
-  orchestrator pane (badged `ORCH`) plus N idle workers (badged `W`), all sharing a
-  group color shown as a header dot + pane accent. Reviewers get `REV`, planners `PLAN`.
+- **Orchestrator + workers** — requires a repository; fields: max live agents (1–12),
+  a **per-role CLI + model** row for each of orchestrator / worker / reviewer /
+  planner (the top *Agent* select is the group default that seeds every role; each
+  role can override it — issue #4), and permissions. Spawns one orchestrator pane
+  (badged `ORCH`) and **no workers**: the form collects no starter count and the
+  command's `initial_workers` argument is optional, so an absent one resolves to 0
+  (`starter_workers`, #1020). Opening idle workers at launch pre-decides a question
+  only the orchestrator can answer, and it answers it after reading the issue — the
+  rule `PromoteConfig::initial_workers` already carried. A caller that *does* ask
+  (the promote modal) still gets what it asked for, clamped by the live-agent cap.
+  Every pane shares a group color shown as a header dot + pane accent. Workers are
+  badged `W`, reviewers `REV`, planners `PLAN`.
   Changing a role's CLI re-populates its model suggestions; every distinct role CLI is
   PATH-checked before launch so a missing CLI fails fast and legibly.
 

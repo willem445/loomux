@@ -477,10 +477,13 @@ first draft rather than by design:
   It is the only block loomux adds on the repo's behalf.
 - **A class the file didn't declare has no block.** `spawn_agent(kind: planner)`
   against a roster with no planner says so plainly rather than guessing. The one
-  place that would have been a silent failure is the launcher's *initial workers*
+  place that would have been a silent failure is a launch's *starter workers*
   count: a review-only workflow has no worker block, so those spawns would each
   have failed and the human would have gotten zero panes with only an audit line
-  to explain it. The orchestrator is now told, in its pane.
+  to explain it. The orchestrator is now told, in its pane. (Since #1020 the
+  launcher asks for no starters at all, so the only caller that can still reach
+  this is the promote modal — the notice is unchanged and still earns its place,
+  because the count that reaches it is a human's either way.)
 - **The four class names are reserved ids.** `- id: planner, kind: reviewer` is a
   validation error, because a block's contract file is `<id>.md` and that block
   would write `reviewer.md` — the real reviewer's file. (It also breaks the

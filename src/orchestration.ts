@@ -80,7 +80,6 @@ export interface OrchestratorConfig {
   workerCli: string;
   reviewerCli: string;
   plannerCli: string;
-  initialWorkers: number;
   maxAgents: number;
   workerModel: string;
   reviewerModel: string;
@@ -1142,7 +1141,12 @@ export async function launchOrchestrator(
     workerCli: config.workerCli,
     reviewerCli: config.reviewerCli,
     plannerCli: config.plannerCli,
-    initialWorkers: config.initialWorkers,
+    // #1020 item 5: no `initialWorkers` key at all, and the OMISSION is the message. The
+    // backend argument is optional and an absent one resolves to 0 (`starter_workers`), so
+    // a launched group opens no idle workers and the orchestrator opens what the work
+    // actually needs — the rule a promoted group has always followed. Sending an explicit
+    // `0` would say the same thing today and would quietly re-pin the launcher to a number
+    // if that default ever moved; the honest wire shape is silence.
     maxAgents: config.maxAgents,
     workerModel: config.workerModel,
     reviewerModel: config.reviewerModel,
