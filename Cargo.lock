@@ -1973,6 +1973,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "loomux-server"
+version = "0.0.0"
+dependencies = [
+ "loomux-engine",
+ "serde",
+ "serde_norway",
+ "tempfile",
+]
+
+[[package]]
 name = "mach2"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

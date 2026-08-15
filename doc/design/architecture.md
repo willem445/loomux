@@ -11,20 +11,23 @@ the Windows baseline, no live agent testing) live in [`CLAUDE.md`](../../CLAUDE.
 
 ## The Cargo workspace
 
-The repo root is a Cargo workspace with two members, one `Cargo.lock` and one
+The repo root is a Cargo workspace with three members, one `Cargo.lock` and one
 `target/`, both at the root:
 
 ```
 Cargo.toml               workspace root: members, resolver, and [profile.release] — cargo reads profiles from the ROOT manifest only and merely warns about one in a member, so this is where lto/codegen-units/debug/strip have to live (#888 slice A1)
 src-tauri/               the desktop app. Links Tauri; owns every #[tauri::command], the capability/ACL manifests, and the Windows desktop surface
 crates/loomux-engine/    the orchestration core as a crate that does not link Tauri. Filling up in batches (#888 slice A2), each module re-exported under its old `orchestration::` path so no call site moved with it. Deliberately not enumerated here — it would go stale every batch: `crates/loomux-engine/src/lib.rs` is the running account of what has arrived and what each move cost, and the manifest argues every dependency the crate has taken on
+crates/loomux-server/    the remote-engine daemon (#888 slice C1a): the process that will HOST that core on a server. A binary, not a library the desktop links — and a leaf, so nothing in the shipped Windows binary's dependency graph reaches it. Today it is a skeleton: command line, YAML config, and the one decision it makes fail-closed — a config naming a routable bind address does not LOAD unless it also says `allow_routable_bind: true` (remote-engine-protocol.md §1.2's first v1 control, landed a slice ahead of the socket as config-layer validation: `ServerConfig` holds an already-classified `ListenTarget` and its `Deserialize` is on a private raw shape, so C2 receives a checked value instead of a string it must remember to check — the `GroupId` shape applied to a bind address). Linux is the deployment target; the crate builds and tests on all three CI platforms because a security rule that only compiles on the deployment host is one no reviewer can run. No listener (C2), no engine hosting (waits A4). See doc/design/remote-engine-daemon.md
 ```
 
 `loomux-engine` exists because #888 needs a headless Linux daemon to drive
 orchestration, and a server that must build webkit2gtk in order to run is not a
-deployment shape. One rule governs it: **`src-tauri` depends on the engine and
-the arrow never points back**, with everything the engine needs from its host
-arriving as a trait (`EventSink`, `PaneHost`) rather than an `AppHandle`. The
+deployment shape. `loomux-server` is that daemon. One rule governs the three:
+**the arrow runs `loomux-server` → `loomux-engine` and `src-tauri` →
+`loomux-engine`, and never points back**, with everything the engine needs from
+its host arriving as a trait (`EventSink`, `PaneHost`) rather than an
+`AppHandle`. The
 modules below move into it in stages — see
 [`engine-extraction.md`](engine-extraction.md) for the boundary, the order, and
 the publish stance.
