@@ -113,17 +113,32 @@ compiles.
    reach a `join` as a value.
    Membership ("may this caller touch this group?") is a **separate** check and
    is not implied by holding a valid id.
-   **The same rule now covers every identifier that becomes a path component**
-   (#925). `loomux_engine::pathseg::PathSegment` is the one validating
-   constructor those families share — the agent-session id and the agent id
-   today — and `GroupId` delegates its *checks* to it while keeping its own
-   type. Never add a fifth private "is this a safe id" predicate; express the
-   family through `PathSegment`. The join scan's permitted-assembly-point list
-   is one row **per family** (each required exactly once, so a renamed one
-   fails loudly rather than watching nothing), and a sibling scan in
-   `src-tauri/tests/pathseg.rs` covers the shape it structurally cannot see: an
-   id interpolated into a **file name** (`format!("{id}.json")`), default-deny
-   with an argued allowlist that itself fails when a row goes stale.
+   **Four identifier families share one validating constructor** (#925):
+   `loomux_engine::pathseg::PathSegment`. The group id (via `GroupId`, which
+   keeps its own type and delegates only its *checks*), the agent-session id,
+   the agent id, and merge-queue batch ids (via `mergeq::valid_id_component`)
+   all run the same `check_segment`. Express a **new** family through
+   `PathSegment` rather than writing another private "is this a safe id"
+   predicate — the reason the consolidation happened is that four had drifted
+   apart and the weakest was the one guarding a live `Path::join`.
+   **One family is deliberately outside it**, and it is named here so nobody
+   concludes the rule is decorative on finding it: workflow **block ids** are
+   validated by `workflow::sanitize_id`, which is weaker than `check_segment`
+   on exactly the two rules the alphabet does not give you — it permits a
+   leading `-` and a Windows reserved device name, and a block id becomes
+   `<id>.md` in the group dir. That is operator-authored config rather than
+   caller input, so it is not a containment breach and #925 left it alone; the
+   filename scan below carries it as an argued allowlist row rather than being
+   blind to it.
+   The join scan's permitted-assembly-point list is one row **per family**
+   (each required exactly once, so a renamed one fails loudly rather than
+   watching nothing), and a sibling scan in `src-tauri/tests/pathseg.rs` covers
+   the shape it structurally cannot see: a value interpolated into a **file
+   name** (`format!("{x}.json")`). Its trigger is the *shape* — an
+   interpolation plus a file-extension literal, matched inside the `format!`
+   template — never a binding's name, per the source-scanning-guard convention
+   below; default-deny, with an argued allowlist whose rows each name a proof
+   that is re-checked, and which fails when a row goes stale.
    Still open, and **not** closed by any of this: the `ft_*`/`fm_*`/git `repo`
    **roots** are arbitrary caller-supplied absolute paths checked only by
    `is_dir()`. That is a root-admission problem, not a segment one — no

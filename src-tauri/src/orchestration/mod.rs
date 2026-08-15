@@ -24244,8 +24244,10 @@ impl OrchRegistry {
         cli: &str,
         session_id: &str,
     ) -> Result<Vec<digest::TranscriptEvent>, String> {
-        // Error text unchanged (`invalid session id: …`) — callers and the MCP
-        // surface match on it.
+        // Error PREFIX unchanged (`invalid session id: …`) — that prefix is
+        // what callers and both tests match on. The message itself now appends
+        // the `SegmentError`, so the refusal is diagnosable from a log line
+        // without echoing the id twice.
         let session = PathSegment::parse(session_id)
             .map_err(|e| format!("invalid session id: {session_id:?} ({e})"))?;
         match cli {

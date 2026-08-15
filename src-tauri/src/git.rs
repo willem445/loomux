@@ -785,6 +785,21 @@ pub async fn git_branches(repo: String) -> Result<Vec<BranchInfo>, String> {
 /// Both close by routing through the same choke point the file manager uses,
 /// which is also why the error is now `safe_resolve`'s typed, coded string
 /// rather than a bare `"invalid path"`.
+///
+/// # What the symlink guard also closes, which is a working case (#925, rev-lead N2)
+///
+/// `ensure_no_symlink` walks **every** component below the root including the
+/// final one, so an untracked *symlink* inside the repo — which `remove_file`
+/// previously deleted correctly, since it removes the link and does not follow
+/// it — is now refused with `symlink: refusing to traverse symlink: …`.
+///
+/// Stated rather than left as a surprise: this is a genuine behavior loss, not
+/// only a hole being closed. It is accepted because it makes `git_discard`
+/// agree with `fm_delete`, which has always answered this way, and because the
+/// alternative — a bespoke "symlinks are fine if they are the leaf" rule — is a
+/// second opinion about path safety in a family that just finished collapsing
+/// four of those into one. `synth_untracked_diff` inherits the same refusal for
+/// previewing an untracked symlink.
 fn git_discard_sync(repo: String, path: String, untracked: bool) -> Result<(), String> {
     if untracked {
         let full = crate::fileedit::safe_resolve(&repo, &path)?;
@@ -1347,6 +1362,11 @@ fn parse_name_status_z(out: &str) -> Vec<FileEntry> {
 /// it later.
 fn synth_untracked_diff(repo: &Path, rel: &str) -> Result<String, String> {
     const MAX_BYTES: u64 = 1024 * 1024;
+    // `to_string_lossy` because `safe_resolve` takes `&str` (rev-lead N5). A
+    // non-UTF-8 repo path would be lossily rewritten here and then fail
+    // `safe_resolve`'s own `is_dir()` — a refusal, not a wrong path, so the
+    // seam fails closed. Noted because the conversion is new, not because it is
+    // reachable: every caller's `repo` came from `git_repo_root`'s stdout.
     let full = crate::fileedit::safe_resolve(&repo.to_string_lossy(), rel)?;
     let meta = std::fs::metadata(&full).map_err(|e| e.to_string())?;
     if meta.len() > MAX_BYTES {
