@@ -44535,7 +44535,13 @@ pub struct RoleKnobs {
 pub async fn create_orchestration(
     app: AppHandle,
     repo: String,
-    initial_workers: u32,
+    // #1020 item 5: OPTIONAL, and the launcher stops sending it. An absent
+    // value deserializes to `None`, which `starter_workers` resolves to 0 — no
+    // idle workers at launch, the orchestrator opens what the work needs.
+    // Optional rather than deleted because this argument is still the only way
+    // a caller CAN ask, and a wire shape that could no longer express "open
+    // two" would be a capability removal dressed up as a default change.
+    initial_workers: Option<u32>,
     max_agents: u32,
     agent_cli: String,
     // Per-role CLI overrides (issue #4). Empty inherits `agent_cli`; the
@@ -44577,7 +44583,7 @@ pub async fn create_orchestration(
 fn create_orchestration_sync(
     reg: &Arc<OrchRegistry>,
     repo: String,
-    initial_workers: u32,
+    initial_workers: Option<u32>,
     max_agents: u32,
     agent_cli: String,
     orchestrator_cli: String,
@@ -44918,7 +44924,12 @@ pub fn promote_to_orchestrator_sync(
         // reattach, or live sibling), resolved by `create_group_ex`'s candidate
         // scan under the creation lock.
         None,
-        config.initial_workers,
+        // `Some`, not `None`: a promote's count is a real, defaulted field of
+        // its own payload (`PromoteConfig`, 0 unless the modal says otherwise),
+        // so this caller HAS an answer — it just usually says zero. `None` means
+        // "nobody was asked", which after #1020 is the launcher and only the
+        // launcher.
+        Some(config.initial_workers),
     )?;
 
     // ── retire the pane's standalone identity ────────────────────────────
@@ -46045,6 +46056,28 @@ pub async fn orch_end_group(
     run_blocking(move || reg.end_group(&group_id, cleanup_worktrees)).await
 }
 
+/// Idle workers a group opens the moment its orchestrator binds, given what the
+/// caller asked for and the group's own live-agent cap.
+///
+/// **`None` is zero, and that is the whole of #1020 item 5.** The launcher used
+/// to collect an "initial workers" count (defaulting to 2) and now collects
+/// nothing at all, so an absent value is not a missing field to fill in with a
+/// sensible number — it is the human declining to pre-decide. Any N chosen here
+/// is chosen before the orchestrator has read the issue, so it is a guess, and a
+/// wrong guess costs either panes nobody asked for or spend nobody chose. Zero
+/// is the rule [`PromoteConfig::initial_workers`] has always carried, for the
+/// same stated reason: the orchestrator decides what it needs.
+///
+/// The clamp is unchanged and lives here rather than at the caller because the
+/// two are one answer — "how many does this launch open" — and splitting them
+/// would leave the default in a command's argument list and the cap three
+/// functions away, with neither reading as the other's neighbour. A cap of 0
+/// therefore still yields 0 however many were asked for, which is the existing
+/// behaviour written down rather than a new rule.
+pub fn starter_workers(requested: Option<u32>, max_agents: u32) -> u32 {
+    requested.unwrap_or(0).min(max_agents)
+}
+
 /// Create (or reattach to) a group and register its orchestrator, under the
 /// creation lock: the group id is picked by liveness, and a group only
 /// becomes live once its orchestrator is registered, so id selection and
@@ -46079,7 +46112,7 @@ pub fn create_orchestration_group(
     guardrails: Guardrails,
     origin: SessionOrigin,
     expect_group: Option<&str>,
-    initial_workers: u32,
+    initial_workers: Option<u32>,
 ) -> Result<SpawnRequest, String> {
     // Paths are interpolated into a quoted shell line; a quote inside one
     // would escape it. (Windows filesystems forbid `"` in names; this
@@ -46133,7 +46166,7 @@ fn register_orchestrator_pane(
     reg: &Arc<OrchRegistry>,
     group: &GroupInfo,
     origin: &SessionOrigin,
-    initial_workers: u32,
+    initial_workers: Option<u32>,
 ) -> Result<SpawnRequest, String> {
     // The orchestrator is a block like any other (#222) — it just isn't spawned
     // through `spawn_agent_ex`, because a group has exactly one and it is minted
@@ -46505,13 +46538,18 @@ fn register_orchestrator_pane(
                 baseline,
             );
         }
-        // The launcher's "initial workers" count assumes the group HAS a worker
-        // block. A repo whose `.loomux/workflow.yml` declares only reviewers
-        // (a review-only workflow) has none (#222) — and then every spawn below
-        // would fail with "declares no worker block", the human would get zero
-        // panes, and the only trace would be an audit line they'd have to go
-        // looking for. Say it out loud in the orchestrator's pane instead.
-        let starters = initial_workers.min(group2.guardrails.max_agents);
+        // A starter-worker count assumes the group HAS a worker block. A repo
+        // whose `.loomux/workflow.yml` declares only reviewers (a review-only
+        // workflow) has none (#222) — and then every spawn below would fail
+        // with "declares no worker block", the human would get zero panes, and
+        // the only trace would be an audit line they'd have to go looking for.
+        // Say it out loud in the orchestrator's pane instead.
+        //
+        // Reachable only from a caller that ASKS for starters, which since
+        // #1020 is the promote modal and not the launcher — the launcher sends
+        // no count and `starter_workers` resolves that to 0, so this branch
+        // sits under `starters > 0` and simply never fires for a launch.
+        let starters = starter_workers(initial_workers, group2.guardrails.max_agents);
         if starters > 0 && group2.guardrails.block_for(Role::Worker).is_none() {
             reg2.audit(&group2.id, "loomux", "initial-workers-skipped", json!({
                 "requested": starters,
@@ -46520,7 +46558,7 @@ fn register_orchestrator_pane(
             let _ = reg2.deliver_to_orchestrator(
                 &group2.id,
                 &format!(
-                    "[loomux] the launcher asked for {starters} initial worker(s), but this repo's \
+                    "[loomux] this launch asked for {starters} initial worker(s), but this repo's \
                      {} declares no worker block — none were opened. Spawn the blocks it does \
                      declare instead (they are listed above).",
                     workflow::WORKFLOW_PATH
@@ -46794,7 +46832,10 @@ pub fn resume_recorded_session(
             guardrails,
             origin,
             Some(&record.group_id),
-            0,
+            // A restore re-opens a group that already has whatever workers it
+            // had; nobody is asking for starters, which is what `None` says.
+            // (`Some(0)` would have been the same number and the wrong claim.)
+            None,
         )
         .map(Some);
     }

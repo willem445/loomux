@@ -45,6 +45,9 @@ use loomux_lib::orchestration::{
     CompactionStatus,
     auto_compact_banner_detected, compact_nudge_poll_interval, compaction_confirmed, copilot_compaction_marker_detected, directive_ledger_embed, ledger_capped,
     human_typed_compact_detected, copilot_autopilot_prompt_detected, create_orchestration_group,
+    // #1020 item 5: how many idle workers a launch opens, and what an unasked
+    // count resolves to.
+    starter_workers,
     delivery_held_cleared_event, delivery_held_detail, delivery_held_event,
     exit_cause, exit_diagnostic, exit_notice_route, ExitInitiator, ExitNoticeRoute,
     resolve_output_text, format_output_tail, OUTPUT_TAIL_MAX_BYTES,
@@ -6153,7 +6156,7 @@ fn a_spawn_carries_the_deny_flags_of_the_class_it_spawned() {
         rails(),
         SessionOrigin::Fresh,
         None,
-        0,
+        None,
     )
     .unwrap();
     assert_eq!(orch.role, Role::Orchestrator);
@@ -11495,7 +11498,7 @@ fn concurrent_same_repo_launches_get_distinct_groups() {
         let reg = reg.clone();
         let repo = repo_path.clone();
         handles.push(std::thread::spawn(move || {
-            create_orchestration_group(&reg, &repo, rails(), SessionOrigin::Fresh, None, 0).map(|r| r.group_id)
+            create_orchestration_group(&reg, &repo, rails(), SessionOrigin::Fresh, None, None).map(|r| r.group_id)
         }));
     }
     let ids: Vec<GroupId> = handles.into_iter().map(|h| h.join().unwrap().unwrap()).collect();
@@ -11508,7 +11511,7 @@ fn repo_paths_with_quotes_are_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let reg = Arc::new(relaunch_registry(dir.path()));
     reg.set_port(45999);
-    let err = create_orchestration_group(&reg, "/tmp/evil\" ; rm -rf /", rails(), SessionOrigin::Fresh, None, 0)
+    let err = create_orchestration_group(&reg, "/tmp/evil\" ; rm -rf /", rails(), SessionOrigin::Fresh, None, None)
         .unwrap_err();
     assert!(err.contains("quote"), "the quote check must fire before anything else, got: {err}");
 }
@@ -34627,6 +34630,38 @@ fn disk_tick_notifies_once_per_episode_and_skips_paused() {
 }
 
 #[test]
+fn a_launch_that_asks_for_no_starter_workers_opens_none() {
+    // #1020 item 5. The launcher's "Initial workers" field is gone, so a launch now sends
+    // NO count at all — and the whole point of the change is what that absence resolves to.
+    // Before this, the form defaulted to 2 and every group came up with two idle workers
+    // sitting on a repo nobody had briefed them about; the human's instruction was that
+    // spawning workers at startup makes no sense, so the orchestrator opens what the work
+    // needs instead.
+    assert_eq!(
+        starter_workers(None, 4),
+        0,
+        "an unasked-for count must be 0 — the orchestrator decides what it needs"
+    );
+
+    // A caller that DOES ask still gets what it asked for. `PromoteConfig` is that caller,
+    // and it carries its own defaulted field, so making `None` mean 0 must not quietly mean
+    // "0 for everyone" — the distinction between "nobody asked" and "asked for two" is the
+    // reason this takes an `Option` rather than a `u32` the launcher passes 0 in.
+    assert_eq!(starter_workers(Some(2), 4), 2);
+
+    // The cap wins over the request, unchanged: a group may never open more starters than
+    // its own live-agent guardrail allows, or the launch itself would breach the ceiling the
+    // human set on the same form.
+    assert_eq!(starter_workers(Some(9), 4), 4, "a request above the cap is clamped to it");
+    assert_eq!(starter_workers(Some(1), 0), 0, "a zero cap admits nothing, however small the ask");
+
+    // An explicit zero and an absent value agree on the NUMBER while meaning different
+    // things — pinned so a future reader does not "simplify" the Option away on the grounds
+    // that both come out 0 today. They are the same only while the default is 0.
+    assert_eq!(starter_workers(Some(0), 4), starter_workers(None, 4));
+}
+
+#[test]
 fn create_orchestration_group_maps_resume_session_onto_the_workflow_pin() {
     use std::sync::Arc;
     // #222 rev-11 F2, at the entry point instead of one layer below it.
@@ -34657,7 +34692,7 @@ fn create_orchestration_group_maps_resume_session_onto_the_workflow_pin() {
 
     // ── SessionOrigin::Fresh ⇒ the repo's file is read ──
     declare("rev-approved");
-    let launched = create_orchestration_group(&reg, &repo_path, advanced.clone(), SessionOrigin::Fresh, None, 0)
+    let launched = create_orchestration_group(&reg, &repo_path, advanced.clone(), SessionOrigin::Fresh, None, None)
         .unwrap();
     let gid = launched.group_id.clone();
     assert!(
@@ -34679,7 +34714,7 @@ fn create_orchestration_group_maps_resume_session_onto_the_workflow_pin() {
         persisted,
         SessionOrigin::Resume("11111111-2222-3333-4444-555555555555".into()),
         Some(&gid),
-        0,
+        None,
     )
     .expect("a resume must not fail");
 
@@ -34700,7 +34735,7 @@ fn create_orchestration_group_maps_resume_session_onto_the_workflow_pin() {
     let reg2 = Arc::new(relaunch_registry(state2.path()));
     reg2.set_port(45999);
     let relaunched =
-        create_orchestration_group(&reg2, &repo_path, advanced, SessionOrigin::Fresh, None, 0).unwrap();
+        create_orchestration_group(&reg2, &repo_path, advanced, SessionOrigin::Fresh, None, None).unwrap();
     assert!(
         reg2.group(&relaunched.group_id).unwrap().guardrails.block("rev-never-seen").is_some(),
         "editing the workflow and launching again must pick up the new roster"
@@ -35082,7 +35117,7 @@ fn dormant_group_and_a_promotable_pane(
         Guardrails { advanced_orchestrator: true, max_agents: 7, ..rails() },
         SessionOrigin::Fresh,
         None,
-        0,
+        None,
     )
     .unwrap();
     let gid = launched.group_id.clone();
@@ -35169,7 +35204,7 @@ fn promote_beside_a_live_group_opens_a_sibling_rather_than_a_second_orchestrator
     // orchestrator in one group — refused everywhere else in loomux (a resume
     // refuses while one is live; `spawn_agent` refuses `kind: orchestrator`),
     // and promote must not become the loophole.
-    let live = create_orchestration_group(&reg, &repo_path, rails(), SessionOrigin::Fresh, None, 0)
+    let live = create_orchestration_group(&reg, &repo_path, rails(), SessionOrigin::Fresh, None, None)
         .unwrap();
     let req = promote_to_orchestrator_sync(&reg, &repo_path, &sid, "claude", PromoteConfig::default());
     drop_claude_store(&store);
@@ -35390,7 +35425,7 @@ fn promote_never_retires_an_agent_that_is_not_a_standalone_pane() {
     // way to take out another group's orchestrator.
     let other = tempfile::tempdir().unwrap();
     let other_repo = other.path().to_string_lossy().replace('\\', "/");
-    let victim = create_orchestration_group(&reg, &other_repo, rails(), SessionOrigin::Fresh, None, 0)
+    let victim = create_orchestration_group(&reg, &other_repo, rails(), SessionOrigin::Fresh, None, None)
         .unwrap();
     let req = promote_to_orchestrator_sync(
         &reg,
@@ -35436,7 +35471,7 @@ fn start_fresh_on_an_orchestrator_does_not_re_read_the_workflow_file() {
         Guardrails { advanced_orchestrator: true, ..rails() },
         SessionOrigin::Fresh,
         None,
-        0,
+        None,
     )
     .unwrap();
     let gid = launched.group_id.clone();
@@ -35754,7 +35789,7 @@ fn a_resumed_session_re_checks_the_pinned_roster_against_the_live_cap_too() {
         Guardrails { advanced_orchestrator: true, max_agents: 5, ..rails() },
         SessionOrigin::Fresh,
         None,
-        0,
+        None,
     )
     .unwrap();
     let gid = launched.group_id.clone();
@@ -35772,7 +35807,7 @@ fn a_resumed_session_re_checks_the_pinned_roster_against_the_live_cap_too() {
         persisted,
         SessionOrigin::Resume("11111111-2222-3333-4444-555555555555".into()),
         Some(&gid),
-        0,
+        None,
     )
     .expect("a resume must not fail");
 
@@ -35807,7 +35842,7 @@ fn a_resumed_group_with_no_declared_workflow_gets_no_capacity_audit_either() {
         Guardrails { advanced_orchestrator: true, max_agents: 2, ..rails() },
         SessionOrigin::Fresh,
         None,
-        0,
+        None,
     )
     .unwrap();
     let gid = launched.group_id.clone();
@@ -35826,7 +35861,7 @@ fn a_resumed_group_with_no_declared_workflow_gets_no_capacity_audit_either() {
         persisted,
         SessionOrigin::Resume("11111111-2222-3333-4444-555555555555".into()),
         Some(&gid),
-        0,
+        None,
     )
     .expect("a resume must not fail");
 

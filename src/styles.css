@@ -1654,8 +1654,15 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 }
 .welcome-form { width: 100%; display: flex; justify-content: center; }
 
+/* #1020 item 3. The card was 440px, which is a width the orchestrator section could not
+   live at: four role rows of [cli][model][effort][context] wrapped inside it, so each role
+   became two ragged lines and the "weird spacing" the demo called out was mostly that wrap.
+   580px is the narrowest width at which a role row fits on one line with the model picker
+   still wider than the three selects beside it — wide enough to stop wrapping, not so wide
+   that the agent kind (four short fields) reads as a mostly-empty sheet. `max-width` still
+   yields to a narrow pane, where wrapping is the correct answer rather than an overflow. */
 .welcome-card {
-  width: 440px; max-width: calc(100% - 16px);
+  width: 580px; max-width: calc(100% - 16px);
   background: var(--surface-1);
   border: 1px solid var(--line); border-radius: 12px;
   box-shadow: var(--shadow-float);
@@ -1663,6 +1670,12 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   display: flex; flex-direction: column; gap: 11px;
   animation: dlg-in 0.16s var(--ease);
 }
+/* The card's own header: the title block, and the CLI preview opposite it (#1020 item 4).
+   `align-items: start` keeps the mark on the title's line rather than centred against a
+   two-line heading, and the preview is `flex: none` chrome — nothing here sizes a pane. */
+.welcome-head { display: flex; align-items: start; justify-content: space-between; gap: var(--space-4); }
+.welcome-heading { min-width: 0; }
+.welcome-preview { flex: none; display: flex; align-items: center; opacity: 0.9; }
 .welcome-card h2 {
   margin: 0; font-size: 11.5px; font-weight: 600;
   letter-spacing: 1.5px; text-transform: uppercase; color: var(--ink-dim);
@@ -1684,11 +1697,54 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .dlg-row > .dlg-field { flex: 1; min-width: 0; }
 .dlg-num { width: 100%; }
 .model-picker { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
-/* #687: a per-role row is [cli] [model] [thinking level] [context]. The model
-   picker takes the slack; the knob selects keep their content width and the row
-   wraps rather than overflowing a narrow setup pane. */
-.role-row { flex-wrap: wrap; align-items: start; }
-.role-row > .model-picker { flex: 1 1 140px; }
+/* A row of equal columns rather than flex-sized ones (#1020 item 3). Flex sizes each field
+   to its own content, so a 4-up row and a 3-up row of the same numeric guardrails started
+   their fields in different places and read as two unrelated blocks — the "space consumed
+   oddly" of the demo note. Grid makes the columns a property of the ROW, so every row in
+   the card lines up down the card.
+
+   `auto-fit` + a REAL minimum, rather than `repeat(4, minmax(0, 1fr))`: with a 0 minimum
+   the four tracks never wrap, they just get narrower, so a pane below the card's 580px
+   traded "ragged two lines" for four fields too narrow to read (#1020 rev-740 N3). A
+   minimum track makes the row drop to three columns, then two, then one — it WRAPS, which
+   is what the flex row it replaced did and the behaviour the narrow case actually wants.
+   Alignment survives the wrap: every row resolves the same track count at the same width,
+   so the columns still agree down the card. `min()` guards the degenerate case where even
+   one minimum-width track does not fit.
+
+   THE BUDGET, because the headroom is thinner than it looks and nothing here is testable:
+   the card's content box is 580 − 36 padding − 2 border = 542px, and staying 4-up costs
+   4 × 9rem + 3 × 6px gap = 486px at 1rem = 13px. ~56px spare across four tracks. Raise this
+   minimum much past 9rem — or add card padding — and the row silently returns to 3-up with a
+   lone fourth field below it, which is the exact layout #1020 item 3 removed. Both numbers
+   are spent from the same 542px; move one and re-check the other. */
+.dlg-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 9rem), 1fr)); }
+/* #687: a per-role row is [cli] [model] [thinking level] [context]. It wrapped raggedly at
+   the old 440px — four roles becoming eight lines whose fields never aligned, which is most
+   of what the demo note called weird spacing. At 580px the four fit on one line.
+
+   Grid rather than flex so the columns belong to the ROW and every role agrees on where
+   each column starts; `auto-fit` with a real minimum rather than fixed proportions so a
+   pane narrower than the card WRAPS to three columns, then two, rather than squeezing four
+   unreadable selects side by side (#1020 rev-740 N3). Wrapping is the correct narrow-pane
+   answer — it is what the flex row did — and the alignment this slice is for survives it,
+   because every row resolves the same track count at the same width.
+
+   The cost, stated: the model picker no longer gets a wider track than the knobs beside it.
+   Uniform tracks are what let `auto-fit` wrap at all, and the picker degrades the best of
+   the four — it ellipsizes a long id and still opens to full width, while a truncated
+   `<select>` label is just unreadable. None of this reaches a terminal (constraint 1 — the
+   setup card is a form inside a pane, never a split).
+
+   Same budget as `.dlg-grid` above, with more room: 4 × 7.5rem + 18px = 408px of the card's
+   542px content box. The guardrail row is the tight one — check it first when either number
+   moves. */
+.role-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 7.5rem), 1fr));
+  align-items: start;
+}
+.role-row > .model-picker { min-width: 0; }
 .role-row > .dlg-select { min-width: 0; }
 .role-row > .dlg-select:disabled { opacity: 0.55; cursor: not-allowed; }
 .model-picker select, .model-picker input { width: 100%; }
