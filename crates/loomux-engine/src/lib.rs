@@ -480,6 +480,73 @@
 //! `set_batch_tag`, `set_blocked`, `set_head`, `moves_json`, `teardown`,
 //! `body_file_path`, `with_body_file`, `open_draft_pr`, `post_comment`,
 //! `land_refusal_text`) stay private.
+//!
+//! A4 batch 14 — [`sessions`], the **pure discovery core** of
+//! `src-tauri/src/sessions.rs`: where a CLI keeps its session store
+//! ([`sessions::claude_projects_root`], [`sessions::copilot_session_state_root`]
+//! and its `COPILOT_HOME` precedence), how one session's record is read out of
+//! it ([`sessions::scan_claude_jsonl`], [`sessions::read_copilot_session`],
+//! [`sessions::yaml_field`]), the #925 assembly point
+//! [`sessions::copilot_session_dir_at`], the copilot spawn-watcher's
+//! baseline/newest pair, the #722 path comparison [`sessions::norm_path`], the
+//! #412 by-id cwd lookup [`sessions::find_session_cwd`] with both store halves
+//! behind it, and the transcript scrape [`sessions::detect_orch_signature`] —
+//! the one group id in the codebase whose source is agent-writable, which is
+//! why it ends at [`groupid::GroupId::parse`].
+//!
+//! **An item lift, not a file split**, and the first batch shaped that way
+//! since batch 8. `src-tauri/src/sessions.rs` keeps its three
+//! `#[tauri::command]`s and everything reaching `crate::uistate`,
+//! `crate::opencodedb`, `crate::blocking` or `crate::obs::breadcrumb`: the
+//! launch-intent posture store (#456/#457), the `session-index.json` cache
+//! (#493), the candidate machinery and the opencode scanner. So the file is
+//! *both* a caller of this module and the home of the half that stayed, and
+//! its re-export is a curated item list (#988) that copies each item's OLD
+//! visibility keyword — `pub use` / `pub(crate) use` / bare `use` — so no
+//! existing spelling widened. Batch 12a's rule is what makes that worth doing
+//! rather than writing `pub use loomux_engine::sessions;`: **a curated
+//! re-export answers "what can a caller spell without thinking", not "what can
+//! a caller spell"** — every item below is `pub` here and therefore reachable
+//! as `loomux_engine::sessions::…` from any sibling crate in this workspace,
+//! which is forced (nothing crosses the boundary otherwise) and harmless
+//! (`publish = false`).
+//!
+//! Eleven items widened for that reason, and the split is the reviewable part.
+//! Six were `pub(crate)` in `src-tauri` — [`sessions::norm_path`],
+//! [`sessions::yaml_field`], [`sessions::copilot_session_state_root`],
+//! [`sessions::copilot_session_dir_at`], [`sessions::copilot_session_ids`],
+//! [`sessions::newest_new_copilot_session`] — and five were bare
+//! module-private, each because a caller stayed behind:
+//! [`sessions::claude_projects_root`] (`collect_claude_candidates`),
+//! [`sessions::scan_claude_jsonl`] and [`sessions::read_copilot_session`]
+//! (`parse_candidate`), [`sessions::tidy_title`] (`parse_candidate` and
+//! `scan_opencode`), and [`sessions::CopilotSession`] because
+//! `read_copilot_session` returns it. That struct's field table is the
+//! narrowest that compiles — `id`/`title`/`cwd` are read by `parse_candidate`
+//! and are `pub`; `modified_ms` has no consumer outside this module and stays
+//! private, so nothing outside can construct one either. Four items were `pub`
+//! already and are unchanged ([`sessions::find_session_cwd`],
+//! [`sessions::detect_orch_signature`], and the two `set_*_for_test` seams),
+//! and what did **not** widen is the rest: `content_text`, `mtime_ms`,
+//! `find_claude_session_cwd`, `find_copilot_session_cwd` and the two
+//! thread-local root overrides stay private here, because every caller of each
+//! crossed with it.
+//!
+//! No dependency joins (`serde_json`, `dirs`, `std`; `tempfile` for the moved
+//! inline tests — all declared since batches 2/3/7). Batch 7's macro sweep is
+//! clean, and it is not a formality on this file: `src-tauri/src/sessions.rs`
+//! is a `#[tauri::command]` module, so an `env!`/`include_str!` in the moved
+//! region would have re-pointed at this crate's placeholder `0.0.0` — there is
+//! none in either half. Batch 11's read-by-path sweep is clean (nothing under
+//! `src-tauri/tests/` opens `sessions.rs` as a file). Batch 2's tripwire
+//! question — *where can the violation be spelled now?* — is answered nil
+//! twice over, and both answers are checked rather than assumed: the join scan
+//! in `src-tauri/tests/groupid.rs` and the file-name scan in
+//! `src-tauri/tests/pathseg.rs` already walk **both** source roots, they match
+//! on line content rather than on a path, and the `pathseg` allowlist row whose
+//! proof is `fn find_claude_session_cwd(root: &Path, session_id: &PathSegment)`
+//! is file-scoped — the flagged `format!` and its proof travel in the same file,
+//! so the row stays proven.
 
 pub mod fsatomic;
 pub mod groupid;
@@ -499,6 +566,7 @@ pub mod queue;
 pub mod queuestate;
 pub mod report;
 pub mod rootreg;
+pub mod sessions;
 pub mod subproc;
 pub mod termgrid;
 pub mod text;
