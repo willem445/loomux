@@ -593,7 +593,7 @@ fn tool_defs(
                 json!({
                     "status": { "type": "string", "enum": ["progress", "done", "blocked"], "description": "Legacy — soft-deprecated. Prefer `outcome`." },
                     "summary": { "type": "string", "description": "Legacy free text, uncapped — soft-deprecated. Prefer `note`." },
-                    "outcome": { "type": "string", "enum": ["done", "blocked", "approved", "request_changes", "progress"], "description": "Structured decision-grade outcome. approved/request_changes are a reviewer's report after review_verdict." },
+                    "outcome": { "type": "string", "description": "Structured decision-grade outcome. approved/request_changes are a reviewer's report after review_verdict." },
                     "ref": { "type": "string", "description": "The PR/issue this report is about, e.g. \"#123\"." },
                     "detail_url": { "type": "string", "description": "URL of the GitHub PR/issue comment carrying the full detail — the system of record." },
                     "note": { "type": "string", "description": "Short pointer, hard-capped at ~500 chars (truncated with a stated marker if longer)." },
