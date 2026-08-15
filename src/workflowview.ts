@@ -1363,7 +1363,39 @@ export class WorkflowView {
       detailFor: (id) => modelCatalog.detail(cli, id),
       // The one path in this pane that spawns an agent CLI, and it is a click.
       // Nothing on the render path may reach it (`src-tauri/src/modelwire.rs`).
-      onDetect: () => modelCatalog.detect(cli).then(repaint),
+      //
+      // **A detection reply owes every surface `agent_cli_knobs` owes** (#997
+      // review). It is precisely the answer that makes `knobLookup` respond
+      // differently, so repainting only the dropdown leaves the Thinking-level
+      // row offering levels this pane's own validator then rejects — the human
+      // picks `xhigh`, the next mutation re-renders the row disabled and the
+      // findings flag the block. The treatment below is `ensureCliKnobs`'s,
+      // deliberately identical: same pass, same three renders, same in-place
+      // knob repaint when the form must not be rebuilt.
+      onDetect: () =>
+        modelCatalog.detect(cli).then(() => {
+          // Mid-type guard, the same one the async probe reply below takes and
+          // the launcher now takes too: an ask can be in flight for seconds,
+          // and rebuilding the menu under a half-typed id hides the input the
+          // human is typing into. The knobs and the findings are refreshed
+          // either way — they are what this reply is the answer for.
+          if (!picker.editingCustom) repaint();
+          // The menu may have moved under the selection, so the knobs re-derive
+          // from what the picker holds NOW — the same sync `picker.onChange`
+          // does, for the same reason.
+          knobs.setModel(picker.value);
+          this.analysis = analyzeWorkflow(this.text, this.knobLookup);
+          this.renderRoster();
+          this.renderFindings();
+          this.renderGraph();
+          // The click leaves focus on the detect button, which lives inside the
+          // form — so in practice this is always the in-place branch, and that
+          // is the point: `renderForm()` here would rebuild the control the
+          // human just pressed. Written as the same conditional as the sibling
+          // anyway, so neither path is a special case of the other.
+          if (this.formPane.contains(document.activeElement)) repaintKnobs();
+          else this.renderForm();
+        }),
     });
     repaint();
     box.append(

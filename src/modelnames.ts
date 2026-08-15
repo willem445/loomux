@@ -230,19 +230,36 @@ export function detectedModelOptionLabel(cli: string, id: string, detail: ModelD
  *    the effort levels it listed only when the reply listed them.
  *    the context window          from `modelcontext.ts`, which cites a page.
  *
- *  **The window is looked up against `resolvedModel` first.** That field is the
+ *  **The window is looked up against `resolvedModel` when the CLI reported one,
+ *  and against the picked id otherwise — never both.** `resolvedModel` is the
  *  canonical wire id an alias resolves to on *this* install (`ModelInfo`), so
  *  `sonnet` → `claude-sonnet-5` turns a moving alias into the exact model the
- *  account is being served — the one id a static table can be sure about. It
- *  falls back to the picked id, because the field is documented as requiring
- *  Claude Code v2.1.197 or later and is simply absent on an older install. */
+ *  account is being served: the one id a static table can be sure about. When
+ *  the field is absent — Anthropic documents it as requiring Claude Code
+ *  v2.1.197 or later, so an older install simply omits it — there is nothing
+ *  more specific than the picked id, and that is what gets looked up.
+ *
+ *  **Which condition is tested matters, and getting it wrong re-opened the hole
+ *  the table exists to close (#997 review).** The first cut branched on the
+ *  *label* being empty rather than on the *field* being absent, so a reported
+ *  `resolvedModel` that the table has no row for fell through to the alias and
+ *  printed the alias's number for it: `sonnet` resolving to `claude-sonnet-4-5`
+ *  showed "1M context", which is precisely the inheritance
+ *  `modelcontext.ts` rule 3 forbids and `test/modelcontext.test.ts` pins
+ *  ("an undocumented version must not inherit its family's number"). A Bedrock
+ *  or gateway `resolvedModel` did the same. Absent and unknown are different
+ *  states: absent means "ask the id instead", unknown means "say nothing", and
+ *  a resolved id loomux cannot place is the *more specific* statement, so its
+ *  silence is the honest answer rather than a reason to consult a vaguer one. */
 export function modelSummaryLine(cli: string, id: string, detail: ModelDetail | null): string {
   const parts: string[] = [];
   const described = detail?.description.trim() ?? "";
   if (described) parts.push(described);
   if (detail?.effortLevels.length) parts.push(`effort: ${detail.effortLevels.join(", ")}`);
   const resolved = detail?.resolvedId.trim() ?? "";
-  const window = (resolved && contextWindowLabel(cli, resolved)) || contextWindowLabel(cli, id);
+  // Ternary, not `||`: the fallback is for an ABSENT field, never for an
+  // unknown model.
+  const window = resolved ? contextWindowLabel(cli, resolved) : contextWindowLabel(cli, id);
   if (window) parts.push(window);
   return parts.join(" · ");
 }

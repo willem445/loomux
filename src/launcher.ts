@@ -677,7 +677,17 @@ export class WelcomeForm {
             // the role's CLI while the ask was in flight, and repainting this
             // row from a reply about a CLI it has moved off is exactly the
             // silent-wrong-answer the knob path refuses.
-            if (orchCliFor(cli.value).id === id) this.applyRoleModels(key);
+            if (orchCliFor(cli.value).id !== id) return;
+            // Mid-type guard, the same hazard `workflowview.ts` already takes
+            // care over on its own post-reply repaint (#997 review): an ask can
+            // be in flight for seconds, which is long enough for a human to
+            // click into the `custom…` box and start typing, and `setOptions`
+            // would then resolve the half-typed id to the dropdown branch and
+            // hide the input under their caret. The KNOBS are repainted either
+            // way — they are what this reply is the answer for, and repainting
+            // them touches nothing the human is inside.
+            if (model.editingCustom) this.applyRoleKnobs(key);
+            else this.applyRoleModels(key);
           });
         },
       });

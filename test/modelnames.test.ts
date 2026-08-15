@@ -19,6 +19,10 @@ import {
   modelSummaryLine,
   prettyModelId,
 } from "../src/modelnames.ts";
+// The table itself, so the composed-path tests can assert the layer below them
+// agrees — a pin that only checked the composed answer could not tell "the
+// table refused" from "the table has a row I forgot about".
+import { contextWindowFor } from "../src/modelcontext.ts";
 import type { ModelDetail } from "../src/modelcatalog.ts";
 
 test("a documented Claude Code alias carries the vendor's own description", () => {
@@ -222,18 +226,69 @@ test("the summary line states only what has a source", () => {
 
 test("the window is looked up against the id the CLI resolved the alias to", () => {
   // `sonnet` happens to have its own row, so the case that proves the
-  // precedence is one where only the RESOLVED id does. A pinned version this
-  // build has never heard of resolves through the alias it was reported under.
+  // precedence is one where only the RESOLVED id does — an alias this build has
+  // no row for, resolving to a model it does.
   assert.equal(modelSummaryLine("claude", "sonnet", null), "1M context");
   assert.equal(
     modelSummaryLine("claude", "latest", detail({ id: "latest", resolvedId: "claude-haiku-4-5" })),
     "200K context",
     "the canonical id the install resolved to is the one a static table can be sure about"
   );
+});
+
+test("a resolved model with no table row says nothing — it never inherits its family's window", () => {
+  // #997 review, blocking 2. The first cut branched on the LABEL being empty
+  // instead of the FIELD being absent, so a reported `resolvedModel` the table
+  // has no row for fell through to the alias and printed the alias's number.
+  //
+  // `claude-sonnet-4-5` is the exact case `modelcontext.ts` rule 3 names and
+  // `test/modelcontext.test.ts` already pins one layer down — this is the
+  // composed path re-opening the hole the table was built to close, and it only
+  // opened once detection was on.
+  assert.equal(contextWindowFor("claude", "claude-sonnet-4-5"), null, "the table itself refuses to answer…");
   assert.equal(
-    modelSummaryLine("claude", "haiku", detail({ id: "haiku", resolvedId: "claude-something-unheard-of" })),
+    modelSummaryLine("claude", "sonnet", detail({ id: "sonnet", resolvedId: "claude-sonnet-4-5" })),
+    "",
+    "…so the line composed from it must refuse too, rather than borrowing `sonnet`'s 1M"
+  );
+});
+
+test("a resolved id an enterprise install really produces does not inherit one either", () => {
+  // The same defect on the id shapes a Bedrock or gateway deployment reports —
+  // a fresh fixture rather than a re-run of the alias case, because these are
+  // what an install that never sees a bare `claude-*` id actually resolves to.
+  for (const resolvedId of [
+    "us.anthropic.claude-sonnet-4-5-v1:0",
+    "arn:aws:bedrock:us-east-1:1:inference-profile/anthropic.claude-opus",
+    "my-gateway-deployment",
+  ]) {
+    assert.equal(
+      modelSummaryLine("claude", "sonnet", detail({ id: "sonnet", resolvedId })),
+      "",
+      `${resolvedId} has no row, so nothing may be claimed for it`
+    );
+  }
+});
+
+test("an absent resolvedModel is a different state from an unknown one", () => {
+  // The fallback is for the field being MISSING — an install older than Claude
+  // Code v2.1.197, which simply omits it. There the picked id is the most
+  // specific thing loomux has, so it is what gets looked up. This is the half
+  // the fix must keep, and the half the original test pinned correctly.
+  assert.equal(
+    modelSummaryLine("claude", "haiku", detail({ id: "haiku", resolvedId: "" })),
     "200K context",
-    "an unresolvable resolvedModel falls back to the picked id rather than yielding nothing"
+    "absent means `ask the id instead`"
+  );
+  assert.equal(
+    modelSummaryLine("claude", "haiku", detail({ id: "haiku", resolvedId: "   " })),
+    "200K context",
+    "and whitespace is absent, not a model name"
+  );
+  assert.equal(
+    modelSummaryLine("claude", "haiku", detail({ id: "haiku", resolvedId: "claude-haiku-4-5" })),
+    "200K context",
+    "a resolved id the table DOES place answers from that row"
   );
 });
 

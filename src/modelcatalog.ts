@@ -445,11 +445,13 @@ export class ModelCatalog {
     return p;
   }
 
-  /** Whether a detection for `program` is in flight — for a control that should
-   *  read "asking…" rather than invite a second spawn. */
-  detecting(program: string): boolean {
-    return this.detectInflight.has(program);
-  }
+  // No `detecting(program)` accessor here, and that is deliberate rather than
+  // an omission (#997 review): the detect button already owns its own in-flight
+  // state through `btn.disabled`, so a second reader of the same fact would be
+  // speculative API with no consumer and no test — and the memo, not a
+  // published flag, is what actually stops a second click becoming a second
+  // spawn. Add one when a surface genuinely needs it, with the test that says
+  // why.
 
   /** The list-models reply already in hand for `cli`, or `null`. */
   report(cli: string): ModelReport | null {

@@ -70,13 +70,14 @@ export class ModelPicker {
   private readonly blankLabel: string;
   private readonly detailFor: (id: string) => ModelDetail | null;
   private readonly onDetect: (() => Promise<void>) | null;
-  /** The reported-facts line under the control, and the button that asks for
-   *  them. Both are absent from the DOM until they have something to be: a
-   *  disabled button with nothing behind it reads as a broken feature.
-   *  (#993, and the constraint 1 rule — this is chrome inside the form, never
-   *  a PTY resize.) */
+  /** The reported-facts line under the control. Absent from the DOM until it
+   *  has something to be — an empty line reserves height in every picker that
+   *  has never been detected. (#993, and the constraint 1 rule — this is chrome
+   *  inside the form, never a PTY resize.)
+   *
+   *  The detect button is deliberately NOT held as a field: nothing outside its
+   *  own click handler reads it, and the handler closes over it. */
   private summary: HTMLElement;
-  private detectBtn: HTMLButtonElement | null = null;
   private cli = "";
 
   constructor(opts: ModelPickerOptions = {}) {
@@ -130,7 +131,6 @@ export class ModelPicker {
         this.paintSummary();
       });
     });
-    this.detectBtn = btn;
     return btn;
   }
 
@@ -177,10 +177,21 @@ export class ModelPicker {
     this.paintSummary();
   }
 
-  /** Whether a detection is in flight, for a host that wants to reflect it
-   *  elsewhere. */
-  get detecting(): boolean {
-    return this.detectBtn?.disabled === true;
+  /** Whether the human is typing an id into the `custom…` box RIGHT NOW.
+   *
+   *  The one question a host has to ask before rebuilding this control from a
+   *  reply that landed asynchronously: `setOptions` re-runs `pickerSelection`,
+   *  and a half-typed id resolves to the DROPDOWN branch — which hides the input
+   *  under the caret and sends the rest of the keystrokes nowhere.
+   *
+   *  Deliberately narrower than "focus is somewhere in this picker" (#997
+   *  review). A detection is started by clicking the button *inside* this
+   *  control, so the broad test is true on every detect path and would suppress
+   *  the very rebuild the click asked for. The hazard is the text input
+   *  specifically, and only while it is visible; the seconds an ask can be in
+   *  flight are long enough for a human to click into it and start typing. */
+  get editingCustom(): boolean {
+    return !this.custom.hidden && document.activeElement === this.custom;
   }
 
   get value(): string {
