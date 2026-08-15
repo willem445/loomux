@@ -136,7 +136,7 @@ pane stays open showing the status).
 | `rename_agent(agent_id, name)` | ✓ | ✗ |
 | `get_state()` | ✓ | ✓ |
 | `set_state(state)` | ✓ | ✗ |
-| `group_usage(detail?)` | ✓ | ✗ |
+| `group_usage(detail?)` | ✓ | `liaison`-hinted reviewer blocks only (✗ plain reviewer, ✗ worker, ✗ planner) |
 | `notify_when(kind, pr?, run?, note?, expires_minutes?)` | ✓ | worker/reviewer only (✗ planner) |
 | `list_notifications()` | ✓ | worker/reviewer only (✗ planner) |
 | `cancel_notification(id)` | ✓ | worker/reviewer only (✗ planner) |
@@ -1034,6 +1034,10 @@ persisted in `group.json`, and clamped in `clamped()`.
   (`parse_session_cost` scans the ANSI-stripped tail bottom-up for the freshest `$` figure);
   panes without a visible cost contribute `null` and are excluded from the total. Surfaced
   both to the orchestrator (MCP tool, for status summaries) and the UI (`orch_group_usage`).
+  The MCP tool is also the one hint-keyed WIDENING on that surface: a `liaison`-hinted
+  reviewer block gets it too (#891 S2), since the pane the human talks to is where "what is
+  this costing" is asked — argued in doc/design/liaison.md, which enumerates every
+  hint-keyed exception.
   The registry-level value is always the full per-agent table; the MCP `group_usage` tool
   (#866) defaults to summarizing it instead — group/live totals, the top 10 agents by total
   tokens, and a `rest` rollup (split live vs historical) for everyone else — with

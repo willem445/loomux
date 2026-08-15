@@ -111,13 +111,13 @@ soft warning:
    `kind` — `kind_from_str` and `role_hint_requires` both *reject* unrecognized
    or mismatched values rather than coercing them, so you cannot spell a fifth
    capability class by combining hint + kind cleverly. A few MCP tools do read
-   the hint, and today both such rules NARROW the class it sits on
-   (`session_digest` offered to `process`-hinted workers alone;
-   `review_verdict` withheld from a `liaison`-hinted reviewer) — but that is a
-   fact about the current list, not a guarantee, and a hint-keyed widening is
-   planned. Every exception is enumerated in `doc/design/liaison.md`. What you
-   cannot do from a workflow file is invent one: you pick from a closed set and
-   loomux's code decides the effect.
+   the hint, and the rules do not all point the same way: two NARROW the class
+   the hint sits on (`session_digest` offered to `process`-hinted workers alone;
+   `review_verdict` withheld from a `liaison`-hinted reviewer) and one WIDENS it
+   (`group_usage`, otherwise orchestrator-only, offered to that same liaison).
+   Every exception is enumerated in `doc/design/liaison.md`. What you cannot do
+   from a workflow file is invent one: you pick from a closed set and loomux's
+   code decides the effect.
 5. **The orchestrator block is loomux-owned.** A workflow file may pin its
    `cli:`/`model:`/`effort:`/`context:` and nothing else — `prompt:`,
    `profile:`, and `allow:` on an `orchestrator`-kind block are a parse
