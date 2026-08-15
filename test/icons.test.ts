@@ -182,6 +182,11 @@ test("the stylesheet dyes every role, with the registry's token, and dyes nothin
   // in the surrounding ink, which looks deliberate and is not. CSS → registry catches a
   // `.ic-*` rule left behind by a role that was renamed or dropped: a hue in the stylesheet
   // that nothing in the app can produce, and no way to tell by reading either file alone.
+  //
+  // It is a textual scan and enumerates its own limit: it only sees the bare `.ic-<role> {
+  // color: … }` rule, so a later, more specific selector (`.pane.active .ic-vcs { color: … }`)
+  // would win the cascade and override the pin without this test ever seeing it. None exists
+  // today — don't be the first.
   const css = stripCssComments(read("../src/styles.css"));
   const declared = new Map<string, string>();
   for (const [, role, value] of css.matchAll(/\.ic-([a-z0-9-]+)\s*\{\s*color:\s*([^;]+);/g)) {
@@ -207,12 +212,24 @@ test("nothing is vendored that no surface renders", () => {
   // dependency: the copy stays small enough to audit. Nothing enforces that by itself —
   // adding a glyph "while I'm in here" is free and invisible — so the set is checked against
   // the consumers. A vendored glyph nobody renders is a licence obligation buying nothing.
+  //
+  // A bare substring search is too loose: a generic name like "file" or "folder" turns up in
+  // comments, type names and unrelated strings across these files whether or not anything
+  // actually renders that glyph — so the two real call shapes are matched instead of the raw
+  // text. A direct `icon("<name>", …)` call is one; the other is a value in `CATEGORY_ICON`
+  // (fileicons.ts), the only place a call site names a glyph indirectly (`icon(CATEGORY_ICON
+  // [category], …)`).
   const dir = new URL("../src/", import.meta.url);
   const consumers = readdirSync(dir)
     .filter((f) => f.endsWith(".ts") && f !== "icons.ts")
     .map((f) => readFileSync(new URL(f, dir), "utf8"))
     .join("\n");
-  const unused = ICON_NAMES.filter((n) => !consumers.includes(`"${n}"`));
+  const used = new Set<string>();
+  for (const [, name] of consumers.matchAll(/\bicon\(\s*"([a-z0-9-]+)"/g)) used.add(name);
+  const categoryIcon = consumers.match(/CATEGORY_ICON[^=]*=\s*\{([\s\S]*?)\}/);
+  assert.ok(categoryIcon, "CATEGORY_ICON's own definition moved or was renamed");
+  for (const [, name] of categoryIcon[1].matchAll(/:\s*"([a-z0-9-]+)"/g)) used.add(name);
+  const unused = ICON_NAMES.filter((n) => !used.has(n));
   assert.deepEqual(
     unused,
     [],

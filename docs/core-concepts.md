@@ -259,7 +259,11 @@ be rearranged in place:
 > themselves, orchid for the group's boards (tasks, issues, audit, timeline),
 > rose for anything destructive, azure while the mic is capturing. Agent *state*
 > is deliberately never carried by an icon — it has its own signals, so the two
-> never compete for your attention. The file tree uses the same scheme, which is
+> never compete for your attention. This legend is about **icon** marks
+> specifically; the same hue can mean something else elsewhere on screen — lime
+> also marks a human actor in the audit log and GitHub timeline, for instance,
+> and orchid also colours the prototype task column — as the rest of the
+> interface adopts this palette. The file tree uses the same scheme, which is
 > why a listing separates folders from code from config at a glance.
 
 > **Why overlays, never re-splits, for the git/issues/board/audit panels:**

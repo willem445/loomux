@@ -73,9 +73,9 @@
          that is deliberate: loomux has one palette, and the token a surface NAMES is what
          declares which question it is answering. An --id-* token may only be used through a
          documented role mapping; "it needed a different blue" is still refused. Reserved
-         by slice A; the icon role table directly below is the first consumer, and slice B
-         mapped the remaining surfaces. The full map is doc/design/ui-redesign.md, §What
-         slice B migrated. */
+         by slice A; slice B (#957) was the first consumer, mapping the bulk of surfaces, and
+         the icon role table directly below is a later one. The full map is
+         doc/design/ui-redesign.md, §What slice B migrated. */
   --id-rose: #e8636f;
   --id-amber: #e8a94a;
   --id-lime: #a9cc5a;
@@ -139,8 +139,9 @@
 
 /* ======================== ICON ROLES — the role→dye table (#879, slice K) ==================
  *
- * The first surface to consume the identity channel, and the shape every later one should
- * copy: a mark never names a hue, it names a ROLE, and the role names the token. `src/icons.ts`
+ * The first ICON surface to consume the identity channel — slice B (#957) already mapped the
+ * channel across roughly thirty non-icon surfaces — and the shape every later icon consumer
+ * should copy: a mark never names a hue, it names a ROLE, and the role names the token. `src/icons.ts`
  * stamps `.ic-<role>` onto every `<svg>` it renders, so a consumer that wants an icon gets its
  * meaning's colour automatically and cannot pick a different one — which is what
  * doc/design/ui-redesign.md's rule 3 means by "through a documented role mapping, never ad hoc".

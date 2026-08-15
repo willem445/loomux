@@ -186,8 +186,9 @@ not "use fewer colours", it is that the colourful channel is never the load-bear
 
 ## The icon system — a role, never a hue
 
-The first surface to consume the identity channel, and the shape every later one should
-copy. `src/icons.ts` is one registry; `test/icons.test.ts` holds it to everything below.
+The first *icon* surface to consume the identity channel — slice B (below) mapped the bulk
+of the channel's other surfaces first — and the shape every later icon consumer should copy.
+`src/icons.ts` is one registry; `test/icons.test.ts` holds it to everything below.
 
 **Colour is assignment, not asset.** No icon carries a colour. The glyphs are `currentColor`
 line art, the registry stamps `.ic-<role>` onto the `<svg>` it renders, and the stylesheet
@@ -595,10 +596,11 @@ sync, and `test/theme.test.ts`.
 
 **Slice A reserved the identity tokens rather than consuming them**, the same way `--rail-w`
 is declared and unused: its job was to make the decision once, in a place the later slices
-could point at. **Slice K is where the channel first reaches the screen** — the icon role→dye
-table (§The icon system) claims all eight hues and paints them across the pane headers, the
-file toolbars and every row of the file trees. Slice B maps the remaining surfaces below to
-them.
+could point at. **Slice B is the first surface to consume the channel** — it maps the bulk of
+the app's surfaces onto the eight `--id-*` tokens (§What slice B migrated, below). Slice K adds
+the icon role→dye table (§The icon system) on top of that map — claiming all eight hues again,
+this time across the pane headers, the file toolbars and every row of the file trees — the
+channel's first *icon* consumer, not its first consumer.
 
 Not shipped: any restyling — and the honest description of that is not "the old design
 wearing the new colours", because only the rules that went through a *token* moved. The
