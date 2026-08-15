@@ -73,11 +73,18 @@
 //! whitespace, and every non-ASCII byte (which is where Unicode
 //! normalization/homoglyph confusion would otherwise live).
 //!
-//! Same reasoning as `orchestration::mergeq::valid_id_component` (also in
-//! `src-tauri`), which closed the same hole for merge-queue batch ids. Kept as
-//! a separate type rather than a shared predicate because a `bool` returned by
-//! a free function is a fact about a moment; a `GroupId` is a fact that travels
-//! with the value.
+//! The rules themselves are no longer written here. #925 found four
+//! near-identical copies of them across the tree — this one,
+//! `mergeq::valid_id_component`, `orchestration::sanitize_session` and
+//! `digest::is_safe_session_id` — which were not four copies so much as four
+//! points on a slope, the weakest of them guarding a live `Path::join`. They now
+//! share one checker, [`pathseg::check_segment`](crate::pathseg::check_segment).
+//!
+//! `GroupId` nevertheless stays a distinct **type**, and that is the part worth
+//! keeping separate: a `bool` returned by a free function is a fact about a
+//! moment, where a `GroupId` is a fact that travels with the value — and a group
+//! id and a session id must not be substitutable for one another at a call site
+//! merely because both are path-safe. Shared checks, distinct types.
 //!
 //! **Rejected, never rewritten.** `parse` does not trim, lowercase, or sanitize:
 //! an id is either usable as-is or refused. Normalizing would let two distinct
@@ -91,6 +98,8 @@ use std::str::FromStr;
 
 use serde::de::{self, Deserialize, Deserializer};
 use serde::{Serialize, Serializer};
+
+use crate::pathseg::SegmentError;
 
 /// Why a candidate string is not a usable group id.
 ///
@@ -135,13 +144,27 @@ impl fmt::Display for GroupIdError {
 
 impl std::error::Error for GroupIdError {}
 
-/// Windows device names. Reserved with *any* extension and case-insensitively,
-/// but the alphabet already bans `.`, so a plain stem comparison is complete
-/// here.
-const RESERVED_DEVICE_NAMES: &[&str] = &[
-    "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
-    "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
-];
+/// The rules live once, in [`pathseg`](crate::pathseg) (#925), and every
+/// identifier family that becomes a path component is checked by that one
+/// function. `GroupId` was the first of them and keeps its own *type* — a group
+/// id and a session id must not be interchangeable at a call site — but it no
+/// longer owns a private copy of the *checks*.
+///
+/// What stays family-specific is the error text: `command_group` surfaces this
+/// error to a caller, and "group id is empty" diagnoses better than the generic
+/// "identifier is empty" the shared checker would produce. Shared mechanism,
+/// local diagnostics.
+impl From<SegmentError> for GroupIdError {
+    fn from(e: SegmentError) -> Self {
+        match e {
+            SegmentError::Empty => GroupIdError::Empty,
+            SegmentError::TooLong(n) => GroupIdError::TooLong(n),
+            SegmentError::IllegalChar(c) => GroupIdError::IllegalChar(c),
+            SegmentError::LeadingDash => GroupIdError::LeadingDash,
+            SegmentError::ReservedDeviceName => GroupIdError::ReservedDeviceName,
+        }
+    }
+}
 
 /// A validated orchestration group identifier.
 ///
@@ -156,33 +179,16 @@ impl GroupId {
     /// Longest accepted id. Minted ids are ≤ ~36 bytes (`{slug≤24}-{8hex}` plus
     /// an optional `-{n}`), so this is headroom, not a fit — it exists to keep
     /// a hostile id from pushing a path past a filesystem limit.
-    pub const MAX_LEN: usize = 64;
+    pub const MAX_LEN: usize = crate::pathseg::MAX_SEGMENT_LEN;
 
     /// The one gate. Every `GroupId` in the process came through here.
+    ///
+    /// The checks themselves are [`pathseg::check_segment`](crate::pathseg::check_segment)'s
+    /// (#925) — this function is the family's *constructor*, not a second copy
+    /// of the rules. `?` converts through the `From` impl above, so the error
+    /// variants and their group-specific wording are unchanged.
     pub fn parse(s: &str) -> Result<Self, GroupIdError> {
-        if s.is_empty() {
-            return Err(GroupIdError::Empty);
-        }
-        if s.len() > Self::MAX_LEN {
-            return Err(GroupIdError::TooLong(s.len()));
-        }
-        if let Some(c) = s
-            .chars()
-            .find(|c| !(c.is_ascii_alphanumeric() || *c == '-' || *c == '_'))
-        {
-            return Err(GroupIdError::IllegalChar(c));
-        }
-        if s.starts_with('-') {
-            return Err(GroupIdError::LeadingDash);
-        }
-        // `eq_ignore_ascii_case` rather than allocating a lowercase copy: the
-        // alphabet is ASCII by the check above, so case folding is byte-local.
-        if RESERVED_DEVICE_NAMES
-            .iter()
-            .any(|r| s.eq_ignore_ascii_case(r))
-        {
-            return Err(GroupIdError::ReservedDeviceName);
-        }
+        crate::pathseg::check_segment(s)?;
         Ok(GroupId(s.to_string()))
     }
 

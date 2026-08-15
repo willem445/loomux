@@ -35,6 +35,7 @@
 //! (`parse_claude_transcript`) takes text and is exercised by fixture tests,
 //! never a live CLI.
 
+use loomux_engine::pathseg::PathSegment;
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashSet;
@@ -364,8 +365,18 @@ pub fn default_claude_projects_root() -> Option<PathBuf> {
 ///
 /// `pub(crate)`: `orchestration::digest` reuses this resolver rather than
 /// re-deriving the same project-folder scan (#250/#324 slice B).
-pub(crate) fn claude_transcript_path(root: &Path, session_id: &str) -> Option<PathBuf> {
-    let name = format!("{session_id}.jsonl");
+///
+/// **The single declared assembly point for a claude transcript path (#925),
+/// and it takes a [`PathSegment`] rather than a `&str` for the same reason
+/// `group_dir_at` takes a `GroupId`.** The id is interpolated into a file name
+/// that is then joined onto a directory this process did not choose, so a caller
+/// holding an unvalidated string has no business reaching here: `..`, a
+/// separator, or a Windows drive prefix in that id walks the join out of the
+/// projects root. Requiring proof at the signature is what makes "validated
+/// exactly once, at the boundary" a fact the compiler keeps rather than a
+/// convention every future caller has to remember.
+pub(crate) fn claude_transcript_path(root: &Path, session: &PathSegment) -> Option<PathBuf> {
+    let name = format!("{session}.jsonl");
     let projects = fs::read_dir(root).ok()?;
     for project in projects.flatten() {
         let candidate = project.path().join(&name);
@@ -386,9 +397,18 @@ pub fn claude_session_usage(session_id: &str) -> Option<SessionUsage> {
 
 /// Read and sum a Claude session's usage from a transcript under an explicit
 /// projects `root`. Lets the orchestration layer (and its tests) point at any
-/// tree. `None` when the transcript can't be found or opened.
+/// tree. `None` when the transcript can't be found or opened — or when
+/// `session_id` is not a usable path component (#925).
+///
+/// The refusal shares the existing `None` channel deliberately. This is a
+/// polled usage meter reading an id off a persisted index entry; an entry
+/// written by an older build is not evidence of anything, and "no usage for
+/// that id" is the same answer it already gives for a transcript that has not
+/// been written yet. Same fail-closed-into-an-existing-degrade shape #904 used
+/// for `promptsubmit_marker_path`.
 pub fn claude_session_usage_in(root: &Path, session_id: &str) -> Option<SessionUsage> {
-    let path = claude_transcript_path(root, session_id)?;
+    let session = PathSegment::parse(session_id).ok()?;
+    let path = claude_transcript_path(root, &session)?;
     let file = fs::File::open(&path).ok()?;
     // Read the whole file line by line rather than into one big string: these
     // transcripts can be large, and we only keep running totals.
@@ -494,7 +514,10 @@ pub fn claude_context_tokens_in(root: &Path, session_id: &str) -> Option<u64> {
 /// reports 0 in that case rather than failing the whole read, since a
 /// boundary marker's absence is itself a meaningful, distinct fact.
 pub fn compaction_signal_in(root: &Path, session_id: &str) -> Option<CompactionSignal> {
-    let path = claude_transcript_path(root, session_id)?;
+    // Same refusal-into-the-existing-`None` channel as `claude_session_usage_in`
+    // (#925): an id that is not a usable path component never reaches the join.
+    let session = PathSegment::parse(session_id).ok()?;
+    let path = claude_transcript_path(root, &session)?;
     let text = read_transcript_tail(&path)?;
     Some(CompactionSignal {
         tokens: latest_context_tokens(&text),

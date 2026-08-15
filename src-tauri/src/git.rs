@@ -8,7 +8,7 @@
 //! `repo` to every other command.
 
 use serde::Serialize;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Run a git-backed computation off the webview main thread (issues #399, #726).
@@ -764,13 +764,30 @@ pub async fn git_branches(repo: String) -> Result<Vec<BranchInfo>, String> {
 }
 
 /// Throw away changes to one file: restore tracked files, delete untracked.
+///
+/// # The untracked arm deletes, so it resolves rather than joins (#925)
+///
+/// Its previous guard was lexical and local — reject `is_absolute()` or any
+/// `ParentDir` component, then `join` — and it had two gaps against the standard
+/// this repo already holds for `fm_delete`:
+///
+/// - **A Windows drive-relative path passed both checks.**
+///   `Path::new("C:foo").is_absolute()` is `false` (a `Prefix` with no
+///   `RootDir`) and it has no `ParentDir`, so `"C:foo"` walked through — and
+///   `join` then *replaced* the receiver, because the argument carries a
+///   prefix, resolving relative to the process's own current directory on that
+///   drive. `safe_resolve` refuses a `Component::Prefix` explicitly. This one is
+///   a plain correctness bug on Windows, independent of any transport.
+/// - **No symlink guard.** `fm_delete` reaches `remove_file` through
+///   `safe_resolve` → `ensure_no_symlink`; this path did not, so a symlinked
+///   component below the repo could redirect the delete outside it.
+///
+/// Both close by routing through the same choke point the file manager uses,
+/// which is also why the error is now `safe_resolve`'s typed, coded string
+/// rather than a bare `"invalid path"`.
 fn git_discard_sync(repo: String, path: String, untracked: bool) -> Result<(), String> {
     if untracked {
-        let rel = Path::new(&path);
-        if rel.is_absolute() || rel.components().any(|c| matches!(c, Component::ParentDir)) {
-            return Err("invalid path".to_string());
-        }
-        let full: PathBuf = Path::new(&repo).join(rel);
+        let full = crate::fileedit::safe_resolve(&repo, &path)?;
         std::fs::remove_file(&full).map_err(|e| e.to_string())
     } else {
         run_git(&repo, &["restore", "--", &path]).map(|_| ())
@@ -1307,9 +1324,30 @@ fn parse_name_status_z(out: &str) -> Vec<FileEntry> {
 
 /// Synthesize an all-added unified diff for an untracked file, so the diff
 /// panel can preview it like any other change.
+///
+/// # `rel` is resolved, not joined (#925)
+///
+/// This function used to be `repo.join(rel)` with **no validation of `rel` at
+/// all** — not absolute-checked, not `..`-checked, not containment-checked, not
+/// symlink-checked. `Path::join` discards its receiver when the argument is
+/// absolute, so `repo` was not even a weak bound: an absolute `rel` named any
+/// file on the machine, and the function returned up to 1 MiB of it as a
+/// synthesized diff. There was no guard to bypass; the guard was simply absent.
+///
+/// The fix routes through [`safe_resolve`] — the choke point every `ft_*`/`fm_*`
+/// command already uses — rather than adding a fifth private opinion about path
+/// safety. That buys the absolute/prefix refusal, the lexical `..` fold, the
+/// `starts_with(root)` containment check and the per-component symlink refusal
+/// in one call, and keeps this family's answer identical to the file pane's.
+///
+/// Reachability, stated precisely rather than dramatically: this is a
+/// `#[tauri::command]` argument, so it is reachable by whatever the command
+/// surface is exposed to — today the trusted webview, and #888's wire once that
+/// lands. Closing it at the choke point now is what keeps the wire from arming
+/// it later.
 fn synth_untracked_diff(repo: &Path, rel: &str) -> Result<String, String> {
     const MAX_BYTES: u64 = 1024 * 1024;
-    let full = repo.join(rel);
+    let full = crate::fileedit::safe_resolve(&repo.to_string_lossy(), rel)?;
     let meta = std::fs::metadata(&full).map_err(|e| e.to_string())?;
     if meta.len() > MAX_BYTES {
         return Ok(format!(

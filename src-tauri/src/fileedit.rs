@@ -860,6 +860,17 @@ pub fn search(root: &str, query: &str, opts: SearchOpts) -> Result<SearchOutcome
 /// found, polling `cancelled` between files. Returns whether results were
 /// truncated. Testable without a Tauri runtime; the `ft_search_start` command
 /// wires `on_batch` to event emission and `cancelled` to a per-search flag.
+///
+/// # Validate the root BEFORE planning, not after (#925)
+///
+/// `plan_enumeration` shells out to `git ls-files` with
+/// `Command::current_dir(root)`, and `run_search` is what validates the root —
+/// so calling them in the other order spawned a subprocess in a directory that
+/// had not been checked yet, and the refusal arrived only after the process had
+/// already run. `list_files` (below) always had these two steps the right way
+/// round; this is the same ordering, and the reason the check is spelled here
+/// rather than left to `run_search` is that a validation which happens *after*
+/// the side effect is not a validation.
 pub fn search_planned(
     root: &str,
     query: &str,
@@ -867,6 +878,7 @@ pub fn search_planned(
     cancelled: &dyn Fn() -> bool,
     on_batch: &mut dyn FnMut(Vec<Match>),
 ) -> Result<bool, String> {
+    safe_resolve(root, "")?;
     let enumeration = plan_enumeration(root, opts.include_ignored);
     run_search(root, query, opts, enumeration, cancelled, on_batch)
 }

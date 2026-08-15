@@ -15,6 +15,7 @@
 //! changed, which is a cost opencode's store simply doesn't have — see
 //! `scan_opencode`.
 
+use loomux_engine::pathseg::PathSegment;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -332,6 +333,29 @@ pub(crate) fn copilot_session_state_root() -> Option<PathBuf> {
         .or_else(|| dirs::home_dir().map(|h| h.join(".copilot")))
         .filter(|p| !p.as_os_str().is_empty())
         .map(|p| p.join("session-state"))
+}
+
+/// **The single declared assembly point for a copilot session directory**
+/// (#925), and the only place a session id is joined onto the session-state
+/// root. `group_dir_at`'s counterpart for this family, and it takes a
+/// [`PathSegment`] for the same reason: holding one is proof the id names
+/// exactly one child of `root`.
+///
+/// # What it replaced, and why a predicate was not enough
+///
+/// This join used to be a bare `root.join(session_id)` guarded, at a distance,
+/// by `digest::is_safe_session_id` — a predicate that rejected `/`, `\`, `.`
+/// and `..` and nothing else. `"C:"` passed it, and on Windows `Path::join`
+/// **replaces** the receiver when the argument carries a `Prefix` component, so
+/// the "session directory" became `C:` and every read below it resolved
+/// drive-relative to the process's own current directory, outside the
+/// session-state root entirely. No separator was needed, which is exactly the
+/// class of hole an enumerated blocklist keeps leaving open and an alphabet
+/// closes by construction.
+///
+/// The refusal now lives in the type, so it cannot be reached from here at all.
+pub(crate) fn copilot_session_dir_at(root: &Path, session: &PathSegment) -> PathBuf {
+    root.join(session.as_str())
 }
 
 /// One copilot session read from its `session-state/<dir>/workspace.yaml`.

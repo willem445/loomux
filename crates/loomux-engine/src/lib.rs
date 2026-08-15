@@ -493,6 +493,7 @@ pub mod mqdriver;
 pub mod mqloop;
 pub mod notify;
 pub mod obs;
+pub mod pathseg;
 pub mod profiles;
 pub mod queue;
 pub mod queuestate;
