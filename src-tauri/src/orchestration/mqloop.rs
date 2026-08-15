@@ -16,6 +16,11 @@
 //!   persist every step — plus [`drive`], the one-step-per-call tick that
 //!   decides which of those happens next (§13, #698).
 //!
+//! The first two are in `crates/loomux-engine/src/` now (#888 batches 6 and
+//! 12a); this file reaches them through `orchestration/mod.rs`'s re-export and
+//! `orchestration/mqdriver.rs`'s, which is why its `super::` imports below read
+//! exactly as they did when all three sat in this directory. It is batch 12b.
+//!
 //! `mod.rs` gets registry wiring only — a module declaration, three fields, the
 //! two `merge_queue_reconcile*` methods and the `mq_drive_group_with` /
 //! `mq_driver_tick` pair, all of which resolve paths and delegate. No decision
