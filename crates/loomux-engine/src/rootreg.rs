@@ -290,7 +290,9 @@ fn canonical_dir(path: &Path) -> Result<PathBuf, RootError> {
     if !path.is_dir() {
         return Err(RootError::NotADirectory);
     }
-    std::fs::canonicalize(path).map_err(|e| RootError::Unresolvable(e.kind()))
+    // SCRATCH MUTATION (#1042 red-before-green, never merged): the key is the
+    // LEXICAL form instead of the canonical one, so nothing resolves a link.
+    Ok(lexical_normalize(path))
 }
 
 /// Fold `.` away without touching the filesystem, preserving verbatim/UNC
