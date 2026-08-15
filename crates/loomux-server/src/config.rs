@@ -230,12 +230,10 @@ impl ServerConfig {
         // when the operator asked for something else would be safe here, but
         // it is the habit that makes the opposite mistake somewhere else — and
         // it would hide a typo in the one field where a typo matters most.
+        // [scratch] R1: the §1.2 refusal neutered — the config loads whatever
+        // address it names, flag or no flag. Nothing else is touched.
         let listen = classify_listen(&raw.listen)?;
-        if let ListenTarget::Routable(addr) = listen {
-            if !raw.allow_routable_bind {
-                return Err(ConfigError::RoutableBindRefused { addr });
-            }
-        }
+        let _ = raw.allow_routable_bind;
         Ok(ServerConfig {
             listen,
             state_root: raw.state_root,
