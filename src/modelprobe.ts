@@ -29,11 +29,39 @@
 // split that way on purpose: `readCliModelReply` correlates the reply against
 // the id the backend says it sent, so neither side has to spell that id twice,
 // and the whole reader stays inside `node --test`'s reach.
+//
+// Since #1020 that detector arrives on TWO routes, and this file wires both to
+// the same reader so they cannot disagree:
+//
+//   pull  `listCliModels` — a lookup against what the backend's startup sweep
+//         already found. Fired by a picker opening. Cannot spawn anything.
+//   push  `onModelsDetected` — the sweep's own result, as it lands, for the
+//         forms that were already open when it did.
+//
+// Neither is redundant: the pull covers a form that opens after the event
+// fired (or a webview that registered its listener too late to catch it), and
+// the push covers a form that opened before the answer existed. `acceptReport`
+// is what makes the second one safe to apply late.
 
-import { listCliModels, probeAgentCli } from "./pty";
+import { listCliModels, onModelsDetected, probeAgentCli } from "./pty";
 import { ModelCatalog } from "./modelcatalog";
 import { readCliModelReply } from "./modelwire";
 
 export const modelCatalog = new ModelCatalog(probeAgentCli, (program) =>
   listCliModels(program).then(readCliModelReply)
 );
+
+/** Start taking the startup sweep's pushed results (#1020). Called once, from
+ *  `main.ts`'s boot — as early as possible, because the sweep is already
+ *  running by the time the webview exists and an event that arrives before this
+ *  listener does is one a picker has to pull for instead.
+ *
+ *  Never rejects onward: a subscription loomux could not register costs the
+ *  push route, and the pull route still answers. */
+export function startModelDetection(): void {
+  void onModelsDetected(({ program, reply }) => {
+    modelCatalog.acceptReport(program, readCliModelReply(reply));
+  }).catch(() => {
+    /* the pull route (`ModelCatalog.detect`) remains */
+  });
+}

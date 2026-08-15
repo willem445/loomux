@@ -414,18 +414,27 @@ fn probe_uncached(program: &str) -> (CliProbe, bool) {
 /// conversion exists to remove, moved rather than deleted.
 #[tauri::command]
 pub async fn probe_agent_cli(program: String) -> CliProbe {
-    crate::blocking::run_blocking(move || {
-        let program = program.trim().to_lowercase();
-        if let Some(hit) = cache().lock().unwrap().get(&program) {
-            return hit.clone();
-        }
-        let (probe, complete) = probe_uncached(&program);
-        if probe.available && complete {
-            cache().lock().unwrap().insert(program, probe.clone());
-        }
-        probe
-    })
-    .await
+    crate::blocking::run_blocking(move || probe_cached(&program)).await
+}
+
+/// The body of [`probe_agent_cli`], callable from a thread that is not serving
+/// a command — the #1020 startup sweep warms this cache so the launcher's first
+/// paint does not wait eight seconds for a `--help` run it could have had
+/// already. Every rule above (what is cached, what is not, the accepted
+/// interleaving) is this function's; the command is the delegation wrapper.
+///
+/// Blocking: never call it from the webview thread. `probe_agent_cli` is the
+/// path that owns that concern.
+pub(crate) fn probe_cached(program: &str) -> CliProbe {
+    let program = program.trim().to_lowercase();
+    if let Some(hit) = cache().lock().unwrap().get(&program) {
+        return hit.clone();
+    }
+    let (probe, complete) = probe_uncached(&program);
+    if probe.available && complete {
+        cache().lock().unwrap().insert(program, probe.clone());
+    }
+    probe
 }
 
 #[cfg(test)]
