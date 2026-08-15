@@ -2309,14 +2309,22 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .task-depth-3 { margin-left: 42px; }
 .task-depth-4 { margin-left: 56px; }
 /* Collapse chevron, and the same-width inert spacer a leaf gets so every row's
-   text starts on the same column whether or not it contains anything. */
+   text starts on the same column whether or not it contains anything.
+   Sized up from the first cut after the demo — at 13px/8px in --text-dim it
+   was there but easy to miss, and it is the control the whole nesting feature
+   is operated through. It reads at rest now (its own faint chip, --text rather
+   than --text-dim) instead of only on hover. The two widths move TOGETHER or
+   containers and leaves stop sharing a left edge; the row itself is unchanged,
+   so nothing about the indent steps above shifts. */
 .task-collapse {
-  flex: none; width: 13px; height: 15px; padding: 0;
-  background: none; border: none; border-radius: 3px;
-  color: var(--text-dim); font-size: 8px; line-height: 1; cursor: pointer;
+  flex: none; width: 18px; height: 18px; padding: 0;
+  background: var(--panel-2); border: none; border-radius: 4px;
+  color: var(--text); font-size: 11px; line-height: 1; cursor: pointer;
 }
-.task-collapse:hover { background: var(--panel-2); color: var(--text); }
-.task-collapse-spacer { flex: none; width: 13px; }
+/* --border-soft resolves to the same surface as --panel-2, so hovering to it
+   would be a no-op; --accent-dim is the next step up the same ramp. */
+.task-collapse:hover { background: var(--accent-dim); color: var(--text); }
+.task-collapse-spacer { flex: none; width: 18px; }
 /* Advisory Agile level: a label only. Purple → blue → cyan → dim reads as
    epic → feature → story → task, reusing the palette the status chips already
    established rather than introducing a second colour language. */
