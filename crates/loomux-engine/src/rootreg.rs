@@ -56,15 +56,17 @@
 //! about — and exactly wrong as a **working path**: MSYS git does not want one
 //! as a subprocess `current_dir`, and no user wants to read one. So
 //! [`DeclaredRoot`] carries both, and [`DeclaredRoot::as_path`] hands back
-//! `plain` — the caller's own path, lexically normalized the way
-//! `fileedit::safe_resolve` already normalizes a root. Commands therefore go on
-//! feeding git/gh/the filesystem the same shape of path they do today.
+//! `plain` — the caller's own path with `.` folded away, and only `.` (see
+//! [`lexical_normalize`], which is deliberately *not* a copy of
+//! `fileedit::safe_resolve`'s fold). Commands therefore go on feeding
+//! git/gh/the filesystem the same shape of path they do today.
 //!
 //! For that split to be safe the two must never name *different* directories,
-//! which is the entire reason a `..` component is refused: `plain` folds `..`
-//! lexically while the OS resolves it after following symlinks, so one crafted
-//! candidate can canonicalize inside a declared root while its lexical fold
-//! lands outside every root. See [`RootError::ParentTraversal`].
+//! which is the entire reason a `..` component is refused rather than folded: a
+//! `..` after a symlink resolves one way through the filesystem and another way
+//! under a lexical fold, and the consumers of `plain` — `fileedit::safe_resolve`
+//! first among them — fold. See [`RootError::ParentTraversal`], which carries
+//! the measured case.
 //!
 //! # Not `AsRef<Path>`
 //!
@@ -100,21 +102,27 @@ pub enum RootError {
     /// resolve against a *process* current directory, which is nobody's
     /// declaration — and in a daemon is not even a meaningful location.
     NotAbsolute,
-    /// Contains a `..` component. Refused rather than folded, because `plain`
-    /// folds it lexically while **Unix** resolves it after following symlinks.
+    /// Contains a `..` component. Refused rather than folded, because such a
+    /// path **does not name one directory**: `..` after a symlink resolves one
+    /// way through the filesystem and another way under a lexical fold, and both
+    /// rules are in play here.
     ///
-    /// Those two answers differ whenever a symlink precedes the `..`, and the
-    /// difference is exploitable in the direction that matters: a candidate can
-    /// canonicalize *inside* a declared root — so the containment check passes —
-    /// while its lexical fold names a directory outside every declared root,
-    /// which is then what [`DeclaredRoot::as_path`] hands to `current_dir`. A
-    /// root or cwd argument has no legitimate `..` in it, so refusing is free.
+    /// This is not theoretical, and the measurement is the reason the refusal is
+    /// worded this way rather than the way it first was. Take
+    /// `<root>/link/../../../../x`, where `link` points four levels deep inside
+    /// `<root>`. Unix follows the link and lands on `<root>/x` — *inside* the
+    /// declared root, so a containment check would pass. Windows folds the `..`
+    /// lexically in Win32 normalization *before* the filesystem sees the path
+    /// and lands three levels above the temp directory, where nothing exists.
+    /// One string, two directories, decided by the platform.
     ///
-    /// Windows is not exposed to that divergence: Win32 path normalization folds
-    /// `..` lexically before the filesystem sees the path, so the two agree
-    /// there. The refusal is uniform anyway — this crate is the core a Linux
-    /// daemon links (#888), and a rule that holds on one platform's path
-    /// semantics only is a rule the next reader has to re-derive.
+    /// `fileedit::safe_resolve`'s own `lexical_normalize` folds `..` that same
+    /// lexical way on **every** platform, and it is the next thing a declared
+    /// root is handed. So a `..`-bearing root approved against the directory
+    /// this module canonicalized would then be *used* against a different one.
+    /// A root or cwd argument has no legitimate `..` in it, so refusing costs
+    /// nothing and is the only answer that does not require picking a winner
+    /// between two disagreeing resolution rules.
     ParentTraversal,
     /// Not a directory (or does not exist). A root names a directory; this is
     /// the same probe every root-taking command performs today, moved inside the
@@ -294,10 +302,16 @@ fn canonical_dir(path: &Path) -> Result<PathBuf, RootError> {
 }
 
 /// Fold `.` away without touching the filesystem, preserving verbatim/UNC
-/// prefixes and the root. `..` never reaches here — [`canonical_dir`] refuses it
-/// — so this is a normalization with no security opinion, which is the only
-/// thing a lexical pass over a path containing symlinks can honestly be. This
-/// helper is intentionally duplicated per module in this codebase — house style.
+/// prefixes and the root.
+///
+/// **`.` only, and deliberately.** `fileedit::safe_resolve`'s copy of this
+/// helper also folds `..`, by popping the preceding component; this one does
+/// not, because [`canonical_dir`] refuses a `..` before anything reaches here.
+/// That is the honest division: a lexical pass cannot fold `..` correctly over a
+/// path containing symlinks — it can only pick an answer and hope the OS agrees
+/// — so this module refuses the input rather than minting an opinion about it.
+/// The helper is intentionally duplicated per module in this codebase — house
+/// style — and the difference between the two copies is the point, not drift.
 fn lexical_normalize(p: &Path) -> PathBuf {
     let mut out = Vec::new();
     for comp in p.components() {
@@ -534,7 +548,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_refuses_a_parent_component_that_would_split_plain_from_canonical() {
+    fn resolve_refuses_a_parent_component_because_one_string_names_two_directories() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("repo");
         // Four levels, matched by the four `..` below, so the canonical form
@@ -548,19 +562,26 @@ mod tests {
         let reg = RootRegistry::new();
         reg.admit(&root).unwrap();
 
-        // On Unix, `<root>/link/../../../../x` canonicalizes to `<root>/x` —
-        // INSIDE the declared root, so containment would pass — while the
-        // lexical fold that produces `plain` pops `link` and then three
-        // components of `<root>` itself, landing outside every declared root.
-        // `as_path()` would then hand a caller that escaped path. The `..`
-        // refusal is what stops the two from ever disagreeing.
+        // `<root>/link/../../../../x` is the specimen: one string that names two
+        // different directories depending on who resolves it. Measured on the
+        // scratch branch that removed this refusal (#1042 red-before-green 3/3),
+        // where it resolved instead of being refused:
         //
-        // On Windows the same string is refused by the same check, but the
-        // escape it forecloses does not exist there: Win32 normalization folds
-        // `..` lexically before the filesystem sees it, so without the check
-        // this candidate fails as `NotADirectory` rather than resolving. Stated
-        // rather than glossed — the assertion is identical on all three
-        // platforms, the hazard it closes is not.
+        //   ubuntu/macOS  Ok(DeclaredRoot { plain: "…/repo/link/../../../../x",
+        //                                   canonical: "…/repo/x" })
+        //   windows       Err(Unresolvable(NotFound))
+        //
+        // Unix followed the link and landed INSIDE the declared root, so
+        // containment passed. Win32 folded the `..` lexically before the
+        // filesystem saw the path, landing three levels above the temp dir where
+        // nothing exists. `fileedit::safe_resolve`'s `lexical_normalize` folds
+        // the same lexical way on every platform and is the next thing a
+        // declared root is handed — so an approved `..` root would be *used*
+        // against a directory this module never approved. Refusing is the only
+        // answer that does not pick a winner between the two rules.
+        //
+        // The assertion is identical on all three platforms; what it forecloses
+        // differs per platform, which is stated rather than glossed.
         let candidate = format!("{}/link/../../../../x", s(&root));
         match reg.resolve(&candidate) {
             Err(RootError::ParentTraversal) => {}

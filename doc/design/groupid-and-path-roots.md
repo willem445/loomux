@@ -318,26 +318,35 @@ That is the right **comparison key** — it resolves links and junctions and
 normalizes the case Windows does not care about — and the wrong **working
 path**: MSYS git does not want one as a subprocess cwd, and nobody wants to read
 one. So a `DeclaredRoot` carries both, and its one accessor `as_path()` hands
-back `plain`, the caller's own path lexically normalized the way
-`fileedit::safe_resolve` already normalizes a root. Commands keep feeding
+back `plain`, the caller's own path with `.` folded away. Commands keep feeding
 git/gh/the filesystem the same shape of path they do today, which is what makes
 the eventual enforcement behaviourally silent for an admitted root.
 
-Carrying two forms is only safe if they can never name two different
-directories, and one shape makes them: a `..` component. `plain` folds `..`
-lexically; Unix resolves it after following symlinks. Those answers diverge
-whenever a link precedes the `..`, and they diverge in the direction that
-matters — a crafted candidate can canonicalize *inside* a declared root, so the
-containment check passes, while its lexical fold lands outside every declared
-root and is then what `as_path()` hands to `current_dir`. `resolve` therefore
-refuses a `..` outright: a root or cwd argument has no legitimate one, so the
-refusal is free, and it is refused rather than folded for the same reason
-`GroupId::parse` refuses rather than sanitizes.
+`.` folded away, and **not** `..` — which is where this design nearly went wrong,
+so the reasoning is worth having in full. `fileedit::safe_resolve` normalizes a
+root by folding both, popping the preceding component for each `..`. Copying that
+here looks like consistency and is not, because a lexical fold and the filesystem
+disagree about what `..` means the moment a symlink precedes it — and both rules
+are in play.
 
-(Windows is not exposed to that particular divergence — Win32 normalization
-folds `..` lexically before the filesystem sees the path — but the refusal is
-uniform. This core is what a Linux daemon links, and a rule that holds only
-under one platform's path semantics is one the next reader has to re-derive.)
+The specimen is `<root>/link/../../../../x`, where `link` points four levels deep
+inside `<root>`. Unix follows the link and lands on `<root>/x`, *inside* the
+declared root, so a containment check passes. Windows folds the `..` lexically in
+Win32 normalization before the filesystem sees the path, landing three levels
+above the temp directory, where nothing exists. One string, two directories,
+decided by the platform — both observed, on the scratch branch that removed the
+refusal.
+
+That is why `resolve` **refuses** a `..` rather than folding one. Not because
+`plain` would escape on its own — it would not; with the `..` left verbatim the
+OS resolves `plain` to exactly what was canonicalized — but because the *next*
+layer folds: `safe_resolve`'s `lexical_normalize` does it on every platform, and
+it is what slice C hands a declared root to. A root approved against one
+directory would then be used against another. A root or cwd argument has no
+legitimate `..` in it, so the refusal costs nothing, and it is a refusal rather
+than a rewrite for the same reason `GroupId::parse` refuses rather than
+sanitizes: normalizing lets two strings name one directory, and that is how a
+check and a use end up disagreeing.
 
 ### Not `AsRef<Path>`, on the same grounds as `GroupId`
 
