@@ -54,7 +54,12 @@ import {
   type GraphNode,
 } from "./workflowmodel";
 import { agentCliKnobs } from "./pty";
-import { knobState, type CliKnobs, type KnobState, type KnobStates } from "./selectorknobs";
+import { knobState, type CliKnobs, type KnobStates } from "./selectorknobs";
+import { blockModelOptions, type CliProbe } from "./modelcatalog";
+import { modelCatalog } from "./modelprobe";
+import { ModelPicker } from "./modelpicker";
+import { BLOCK_DEFAULT_MODEL_LABEL } from "./modelnames";
+import { BlockKnobFields, type KnobFieldSpec } from "./workflowknobs";
 import {
   LAYOUT_FILE,
   parseLayout,
@@ -220,6 +225,28 @@ export class WorkflowView {
    *  keystroke. Separate from `cliKnobs` because "asked, still in flight" and
    *  "asked, failed" are different states and only one of them is answerable. */
   private knobsAsked = new Set<string>();
+  /** One model probe per CLI per PANE — deliberately not per paint, and not once
+   *  per app run either.
+   *
+   *  Not per paint: the block form re-renders on every knob edit, and the catalog
+   *  no longer keeps an answer that carried nothing (`worthKeeping`), so probing
+   *  from the render path would be a subprocess per paint for exactly the CLIs
+   *  that have no answer to give.
+   *
+   *  Not once per app run: per pane IS the recovery granularity the app-wide memo
+   *  would otherwise cost. Install a CLI mid-session, open a workflow pane, and it
+   *  is asked again — which is what the pre-#935 per-form memo gave for free.
+   *
+   *  The PROMISE is what's held, not an "already asked" flag, so a second block
+   *  form painted while the first probe is still in flight still gets its
+   *  re-set. */
+  private modelProbes = new Map<string, Promise<CliProbe>>();
+  /** Redraws the block form's two knob rows in place, or `null` when no block
+   *  form is on screen. The form deliberately does not re-render on a model edit
+   *  (it would rebuild the input under the caret), so the rows that depend on the
+   *  model — and on a capability reply that lands whenever the IPC happens to
+   *  resolve — need a way to be refreshed without one (#935). */
+  private repaintBlockKnobs: (() => void) | null = null;
 
   // Canvas interaction state. All three are transient — none of them is ever serialized, and
   // the model never learns they existed.
@@ -826,6 +853,16 @@ export class WorkflowView {
     return caps === undefined ? null : knobState(caps, cli, model);
   };
 
+  /** Ask what models `cli` reports, at most once per pane — see {@link modelProbes}. */
+  private probeModels(cli: string): Promise<CliProbe> {
+    let p = this.modelProbes.get(cli);
+    if (!p) {
+      p = modelCatalog.probe(cli);
+      this.modelProbes.set(cli, p);
+    }
+    return p;
+  }
+
   /** Fetch `agent_cli_knobs` for every CLI the file names, once each (#687).
    *
    *  The pane mirrors no vendor capability of its own — which knobs a CLI has, and
@@ -851,7 +888,12 @@ export class WorkflowView {
         this.renderRoster();
         this.renderFindings();
         this.renderGraph();
-        if (!this.formPane.contains(document.activeElement)) this.renderForm();
+        // …but the knob rows are exactly what this reply is the answer for, so
+        // when the form can't be redrawn they are repainted in place instead of
+        // being left saying "reading this CLI's capabilities…" until the human
+        // clicks elsewhere and back (#935).
+        if (this.formPane.contains(document.activeElement)) this.repaintBlockKnobs?.();
+        else this.renderForm();
       });
     }
   }
@@ -1025,6 +1067,10 @@ export class WorkflowView {
   }
 
   private renderForm(): void {
+    // Whatever the last form left here belongs to controls that are about to be
+    // replaced. Cleared FIRST, so a late `agent_cli_knobs` reply can never paint
+    // into a detached row.
+    this.repaintBlockKnobs = null;
     if (this.syntaxBroken()) {
       const warn = el(
         "div",
@@ -1086,42 +1132,42 @@ export class WorkflowView {
     return i;
   }
 
-  /** One model-knob control (#687): the CLI's own values plus "the CLI's default",
-   *  disabled with the vendor's reason where loomux cannot deliver the knob.
+  /** One model-knob field (#687): the label, the select, and the hint that
+   *  carries the vendor's reason where loomux cannot deliver the knob — plus the
+   *  `paint` that redraws all three from a fresh spec.
    *
-   *  `state` is `undefined` while the capability lookup is in flight — the control
-   *  is inert then, because offering values before knowing whether they exist is
-   *  how a form promises something the spawn won't do. A DECLARED value the state
-   *  doesn't offer still shows, marked: this is an editor, and silently dropping
-   *  what the file says would rewrite it the moment any other field is touched. */
-  private knobSelect(
-    state: KnobState | undefined,
-    value: string | undefined,
+   *  It is repaintable rather than rebuilt because the answer moves under a form
+   *  that must not re-render: `context` is only available where the SELECTED
+   *  model has a documented `[1m]` form, so it changes as the human types a model
+   *  id, and re-rendering the form on a keystroke would rebuild the input under
+   *  their caret. What to show is `workflowknobs.ts`' (`KnobFieldSpec`); this is
+   *  the DOM half. */
+  private knobRow(
+    label: string,
+    spec: KnobFieldSpec,
     onChange: (v: string) => void
-  ): HTMLSelectElement {
+  ): { field: HTMLElement; paint: (next: KnobFieldSpec) => void } {
     const s = document.createElement("select");
     s.className = "wf-input";
-    const current = (value ?? "").trim();
-    const add = (v: string, label: string): void => {
-      const opt = document.createElement("option");
-      opt.value = v;
-      opt.textContent = label;
-      s.append(opt);
-    };
-    add("", "(the CLI's default)");
-    for (const v of state?.values ?? []) add(v, v);
-    if (current && !(state?.values ?? []).includes(current)) add(current, `${current} (not delivered)`);
-    s.value = current;
-    s.disabled = !state?.enabled && !current;
     s.addEventListener("change", () => onChange(s.value));
-    return s;
-  }
-
-  /** The hint under a knob control: the vendor's reason when it is unavailable,
-   *  the plain description when it is not. */
-  private knobHint(state: KnobState | undefined, key: string, what: string): string {
-    if (!state) return `${key} — reading this CLI's capabilities…`;
-    return state.enabled ? `${key} — ${what}. Blank leaves the CLI's default.` : state.reason;
+    const hint = el("span", "wf-hint");
+    const field = el("label", "wf-field");
+    field.append(el("span", "wf-label", label), s, hint);
+    const paint = (next: KnobFieldSpec): void => {
+      s.replaceChildren(
+        ...next.options.map((o) => {
+          const opt = document.createElement("option");
+          opt.value = o.value;
+          opt.textContent = o.label;
+          return opt;
+        })
+      );
+      s.value = next.selected;
+      s.disabled = next.disabled;
+      hint.textContent = next.hint;
+    };
+    paint(spec);
+    return { field, paint };
   }
 
   private select(
@@ -1233,11 +1279,27 @@ export class WorkflowView {
       this.field("Agent CLI", this.select(WORKFLOW_CLIS, b.cli, (v) => edit((t) => (t.cli = v))))
     );
 
+    // The model field is the SAME control the launcher renders (#935): one
+    // dropdown, one catalog — the CLI's own reported models merged over this
+    // repo's curated suggestions — with the `custom…` escape that keeps it a
+    // wider field than the free-text box it replaces, not a narrower one. A CLI
+    // this repo has no curated row for (`gemini`) is still probed like any
+    // other — it is the REPLY that carries nothing today — and with nothing on
+    // either side the picker opens straight onto that custom input.
+    const cli = b.cli.trim();
+    const picker = new ModelPicker({
+      selectClass: "wf-input",
+      inputClass: "wf-input",
+      placeholder: "model id…",
+      blankLabel: BLOCK_DEFAULT_MODEL_LABEL,
+    });
+    picker.setOptions(blockModelOptions(modelCatalog.models(cli)), b.model, cli);
     box.append(
       this.field(
         "Model",
-        this.textInput(b.model, (v) => edit((t) => (t.model = v), false), "(the CLI's default)"),
-        "e.g. opus, sonnet, auto. Blank leaves the CLI's default."
+        picker.root,
+        "The CLI's own list, merged over loomux's suggestions — or type any id (a Bedrock " +
+          "profile, a gateway deployment, a model newer than this build). Unset leaves it to loomux."
       )
     );
 
@@ -1247,31 +1309,66 @@ export class WorkflowView {
     // can carry. A knob this CLI/model cannot take renders disabled with that
     // reason as the hint, which is also the finding the validation pass raises if
     // the file declares one anyway.
-    const states = this.knobLookup(b.cli.trim(), b.model);
-    box.append(
-      this.field(
-        "Thinking level",
-        this.knobSelect(states?.effort, b.effort, (v) =>
-          edit((t) => {
-            if (v) t.effort = v;
-            else delete t.effort;
-          })
-        ),
-        this.knobHint(states?.effort, "effort:", "how hard this block's agent thinks")
-      )
+    const knobs = new BlockKnobFields(this.knobLookup, cli, b.model, b);
+    const effortRow = this.knobRow("Thinking level", knobs.effort, (v) =>
+      edit((t) => {
+        if (v) t.effort = v;
+        else delete t.effort;
+      })
     );
-    box.append(
-      this.field(
-        "Context window",
-        this.knobSelect(states?.context, b.context, (v) =>
-          edit((t) => {
-            if (v) t.context = v;
-            else delete t.context;
-          })
-        ),
-        this.knobHint(states?.context, "context:", "the model's context window")
-      )
+    const contextRow = this.knobRow("Context window", knobs.context, (v) =>
+      edit((t) => {
+        if (v) t.context = v;
+        else delete t.context;
+      })
     );
+    box.append(effortRow.field, contextRow.field);
+
+    /** Redraw the knob rows from whatever the model and the capability record now
+     *  say — the repaint that a form which must not re-render still owes them. */
+    const repaintKnobs = (): void => {
+      effortRow.paint(knobs.effort);
+      contextRow.paint(knobs.context);
+    };
+    this.repaintBlockKnobs = repaintKnobs;
+
+    // Fires for a dropdown pick AND for every keystroke in the `custom…` box.
+    // The keystroke is the case that was broken: `context` is only offered where
+    // the selected model has a documented `[1m]` form, so typing a model over one
+    // that has none (or vice versa) has to re-derive the knob — and a `change`
+    // listener on the select alone never sees a typed id at all.
+    //
+    // `rerenderForm: false`, like every other free-text control here: rebuilding
+    // the form on a keystroke would rebuild the input the human is typing into
+    // and drop the caret at its end. That suppression is exactly why the repaint
+    // has to be explicit.
+    picker.onChange = () => {
+      const model = picker.value;
+      edit((t) => (t.model = model), false);
+      knobs.setModel(model);
+      repaintKnobs();
+    };
+
+    // What the CLI on THIS machine reports, once it answers. Only re-set when it
+    // reported something — re-setting an identical list would rebuild the menu
+    // for no gain — and only while this form is still the one on screen. The
+    // fallback is re-read from the MODEL rather than closed over from `b`: by the
+    // time this lands the human may have chosen the blank row, and a stale
+    // `b.model` would re-select the id they just cleared.
+    if (cli) {
+      void this.probeModels(cli).then((p) => {
+        if (!p.models.length || !this.formPane.contains(picker.root)) return;
+        // Never under the caret. `setOptions` re-runs `pickerSelection`, and an
+        // id the probe turns out to carry resolves to the DROPDOWN branch —
+        // which hides the custom input being typed into, sending the rest of the
+        // keystrokes nowhere. The pane takes the same care with the capability
+        // reply (`ensureCliKnobs`), and for the same reason. The menu is not
+        // lost: the next form render paints it from the resolved catalog.
+        if (picker.root.contains(document.activeElement)) return;
+        const now = this.analysis.workflow.blocks[index]?.model ?? "";
+        picker.setOptions(blockModelOptions(modelCatalog.models(cli)), now, cli);
+      });
+    }
 
     // Persona: inline prompt, a profile file, or neither (the built-in role template).
     // Exactly one, enforced here rather than only reported: the two compile to different

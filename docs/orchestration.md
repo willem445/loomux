@@ -97,7 +97,11 @@ enforces the closed vocabulary and the per-CLI rule above; the workflow pane
 goes further and also validates `context:` against the block's `model:`,
 raising a per-block finding when the two disagree (e.g. `model: haiku` with
 `context: 1m`) — the same model-gate rule the launcher's select uses, so a
-hand-edited file can't drift from what the launcher would show. See
+hand-edited file can't drift from what the launcher would show. In the
+pane's block form the two controls follow the model **as you change it**,
+including a model id you type by hand: pick `sonnet` over `haiku` and the
+context window becomes selectable in the same keystroke, with no need to
+click away from the block and back. See
 [`doc/design/workflows.md`](https://github.com/willem445/loomux/blob/main/doc/design/workflows.md)
 and the `author-loomux-workflow` skill.
 
@@ -894,6 +898,17 @@ rather than something you forgot. It says so, and the fix is yours:
   "nothing except loomux";
 - the list already names loomux per-tool (`loomux/report`) — loomux won't widen a
   scope you set on purpose.
+
+**Picking a block's model.** The workflow pane's block form offers the same
+model dropdown the launcher does, filled the same way: the CLI's own reported
+models first, backed by loomux's suggestions, plus a **custom…** entry for any
+id neither list carries (a Bedrock inference profile, a gateway deployment
+name, a model newer than your build). A CLI loomux has no suggestions for and
+can't get a list out of gives you that free-text box directly. Leaving the
+model **unset** is a real choice with its own row: the block then runs
+whatever loomux defaults to for its kind on its CLI — `sonnet`/`opus` on
+Claude Code, `auto` on Copilot, `pro` on Gemini, and on OpenCode no `--model`
+at all, so your own config decides.
 
 **Reviewer diversity across models.** A block's `cli`/`model` are set
 per-block, so nothing stops a reviewer lane from running on a different

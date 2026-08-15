@@ -109,6 +109,33 @@ export function modelOptions(cli: string, probe: CliProbe | null): string[] {
   return mergeModelOptions(curatedModels(cli), probe?.models ?? []);
 }
 
+/** The options a WORKFLOW BLOCK's picker offers, given what {@link modelOptions}
+ *  merged for its CLI.
+ *
+ *  One rule on top of the launcher's list, and it is a property of the FILE
+ *  rather than of the CLI: a block's `model:` is optional, and leaving it out is
+ *  a declared state — `workflow.rs`'s `model_of` resolves it to
+ *  `default_model(cli, kind)`. The launcher has no equivalent, because every role
+ *  there starts on a real default drawn from the curated row. So the blank row is
+ *  offered on EVERY CLI here, not only on the one whose curated row carries it —
+ *  without it, a block that declares no model would open on whatever happens to
+ *  be first in the menu (`sonnet`, on claude), which reads as a choice somebody
+ *  made and takes away the only way to say "leave it to loomux" once a model has
+ *  been picked. That is a field NARROWER than the free text it replaces, which is
+ *  the one thing #935 may not do.
+ *
+ *  But only when there is a menu to put it in front of. A CLI with no curated
+ *  row and nothing back from its probe (`gemini`, today — it is probed like any
+ *  other, the reply is what carries nothing) has no dropdown at all —
+ *  `pickerSelection` opens such a picker straight onto its custom input, which IS
+ *  the field then, and a one-row menu reading "(unset)" in front of it would be a
+ *  menu whose only purpose is to be escaped from. An empty custom box already
+ *  means exactly what the blank row means. */
+export function blockModelOptions(models: readonly string[]): string[] {
+  if (!models.length) return [];
+  return models.includes(INHERIT_MODEL) ? [...models] : [INHERIT_MODEL, ...models];
+}
+
 /** The select value that means "let me type an id" — a sentinel, not a model, so
  *  it can never collide with one: every real id the pickers carry is either empty
  *  (inherit) or a vendor id, and none of them starts with `__`. */
@@ -150,11 +177,37 @@ export function pickerSelection(models: readonly string[], current: string): Pic
     : { selected: first, custom: "", showCustom: false };
 }
 
-/** The probe seam: one call per program per app run, shared by every surface.
+/** Whether a probe reply is worth remembering for the rest of the app run.
+ *
+ *  **This mirrors the backend's own caching rule, and it has to.**
+ *  `probe_agent_cli` (cliprobe.rs) caches only a COMPLETE probe: "failures and
+ *  partial answers are NOT [cached] — a CLI installed while loomux is running
+ *  must become launchable on the next probe … and by the same argument an
+ *  opencode whose `models` run failed — a network blip, a provider configured or
+ *  `opencode auth login` completed a minute later — must be able to report its
+ *  real list without a restart." A memo in FRONT of that backend which keeps
+ *  those answers anyway does not merely duplicate the cache; it deletes the
+ *  recovery, because there is then no next probe to reach it.
+ *
+ *  Completeness is deliberately not a wire field ("a caching fact, not a wire
+ *  field", cliprobe.rs), so this reads the same fact off the reply itself: an
+ *  answer that carries no list is exactly the answer a later probe might improve
+ *  on. For an enumerator CLI that is completeness verbatim (`complete =
+ *  !listed.is_empty()`); for a help-parsed one it is stricter, and stricter in
+ *  the safe direction — the cost is an extra IPC to a backend that has the answer
+ *  in a HashMap, against a stale "this CLI has nothing" that would last the
+ *  session. */
+export function worthKeeping(probe: CliProbe): boolean {
+  return probe.available && probe.models.length > 0;
+}
+
+/** The probe seam, shared by every surface: one call per program per app run for
+ *  an answer worth keeping, and a fresh ask for one that is not.
  *
  *  Memoized on the PROMISE, not the result, so two forms opening at once make one
- *  backend call rather than two (the backend caches too — this keeps the IPC and
- *  the 8s worst case off the second caller as well).
+ *  backend call rather than two — which is also what bounds the re-ask: an answer
+ *  that was not worth keeping costs one probe per *caller that asks again*, never
+ *  a stampede, and callers ask per surface rather than per paint.
  *
  *  Never rejects. A probe is loomux asking the machine a question it can live
  *  without an answer to: the surfaces all render curated suggestions plus a
@@ -175,12 +228,21 @@ export class ModelCatalog {
   }
 
   probe(program: string): Promise<CliProbe> {
+    const kept = this.resolved.get(program);
+    if (kept) return Promise.resolve(kept);
     let p = this.inflight.get(program);
     if (!p) {
       p = this.probeFn(program)
         .catch((e: unknown) => probeFailure(String(e)))
         .then((r) => {
-          this.resolved.set(program, r);
+          // Kept only if {@link worthKeeping}. The `inflight` entry is dropped
+          // either way, and that is the whole fix: an answer this memo does not
+          // keep leaves nothing behind, so the NEXT caller reaches the backend
+          // and can be told that the CLI has since been installed, or that
+          // opencode can enumerate now. Deleting it here rather than never
+          // memoizing at all keeps concurrent callers on one call.
+          if (worthKeeping(r)) this.resolved.set(program, r);
+          this.inflight.delete(program);
           return r;
         });
       this.inflight.set(program, p);
@@ -188,9 +250,11 @@ export class ModelCatalog {
     return p;
   }
 
-  /** The probe reply already in hand, or `null` while one is still in flight —
-   *  for the synchronous paths (a form's first paint) that must render before
-   *  awaiting anything. */
+  /** The probe reply already in hand, or `null` when there is none worth having
+   *  — one still in flight, or one that carried nothing — for the synchronous
+   *  paths (a form's first paint) that must render before awaiting anything.
+   *  Both `null` cases mean the same thing to a caller: render the curated
+   *  suggestions, and re-paint if something better lands. */
   cached(program: string): CliProbe | null {
     return this.resolved.get(program) ?? null;
   }

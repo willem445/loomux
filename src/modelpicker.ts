@@ -18,12 +18,12 @@
 // picker fails open, exactly like `selectorknobs.ts` does on an id it cannot
 // place.
 
-import { modelOptionLabel } from "./modelnames.ts";
+import { INHERIT_MODEL_LABEL, modelOptionLabel } from "./modelnames.ts";
 import { CUSTOM_OPTION, pickerSelection } from "./modelcatalog.ts";
 
 export interface ModelPickerOptions {
   /** Class for the `<select>`. Defaults to the launcher's dialog styling; the
-   *  workflow pane passes its own (`wf-select`), which is the whole reason this
+   *  workflow pane passes its own (`wf-input`), which is the whole reason this
    *  is a parameter — a shared control that hardcoded one host's class would be
    *  unstyled in the other. */
   selectClass?: string;
@@ -31,6 +31,17 @@ export interface ModelPickerOptions {
   inputClass?: string;
   /** Placeholder for the custom-id input. */
   placeholder?: string;
+  /** What the EMPTY id's row reads, when the option list carries one. Defaults to
+   *  the launcher's `INHERIT_MODEL_LABEL` — "the model your own CLI config
+   *  selects", which is what an empty `--model` means for a pane loomux launches.
+   *
+   *  A parameter because the same empty id means something else in a workflow
+   *  file: `model_of` (workflow.rs) resolves a block's missing `model:` to
+   *  `default_model(cli, kind)` — `sonnet`/`opus` on claude, `auto` on copilot,
+   *  `pro` on gemini — and only on opencode is it genuinely "send nothing". One
+   *  label for both hosts would state a vendor outcome that is false on three of
+   *  the four CLIs the block editor offers. */
+  blankLabel?: string;
 }
 
 export class ModelPicker {
@@ -42,8 +53,10 @@ export class ModelPicker {
    *  knob row has to re-derive when this moves — including when a custom id is
    *  typed, which is the case a plain `change` listener on the select misses. */
   onChange: (() => void) | null = null;
+  private readonly blankLabel: string;
 
   constructor(opts: ModelPickerOptions = {}) {
+    this.blankLabel = opts.blankLabel ?? INHERIT_MODEL_LABEL;
     this.root = document.createElement("div");
     this.root.className = "model-picker";
     this.sel = document.createElement("select");
@@ -75,8 +88,10 @@ export class ModelPicker {
         // all (#722: opencode's ids are `provider_id/model_id`). Only the label
         // is prettified, and only where the name says something the id doesn't
         // (modelnames.ts). The empty id is a real entry — "send no --model" —
-        // and gets the one label that isn't derived from an id.
-        o.textContent = modelOptionLabel(cli, m);
+        // and gets the one label that isn't derived from an id, which is the
+        // host's to word (`blankLabel`) because the two hosts' empty ids resolve
+        // differently.
+        o.textContent = m.trim() === "" ? this.blankLabel : modelOptionLabel(cli, m);
         return o;
       })
     );
