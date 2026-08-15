@@ -73,10 +73,19 @@
 //! than `pub` reaches across a crate boundary — so they are this crate's public
 //! API now, forced rather than chosen. `src-tauri`'s `orchestration::mqdriver`
 //! is a curated re-export module rather than a `pub use` line precisely so that
-//! *that* spelling keeps their old `pub(super)` reach; see its header. The
-//! narrowing is worth the lines for [`landable`] in particular, which is **half**
-//! of the constraint-7 refusal — [`validate_target`] is the whole of it, and a
-//! publicly reachable half is an invitation to check the wrong one.
+//! *that* spelling keeps their old `pub(super)` reach; see its header.
+//!
+//! **What that does and does not buy, because the flattering version of this
+//! sentence is false.** It narrows the *habitual* path: nothing outside
+//! `orchestration` can reach these three as `orchestration::mqdriver::…`. It
+//! does **not** narrow the set of paths — `loomux_engine::mqdriver::landable`
+//! compiles from anywhere in `src-tauri`, which depends on this crate directly
+//! and already spells `loomux_engine::…` in `gh.rs` and `obs.rs`. No re-export
+//! can prevent that; an item must be `pub` here to be re-exported at all. So
+//! [`landable`] being **half** of the constraint-7 refusal — [`validate_target`]
+//! is the whole of it — is an argument for keeping the habitual path pointed at
+//! the whole check, not a claim that the half is out of reach. If you are
+//! writing a new branch-name guard: use [`validate_target`].
 
 use crate::mergeq::{new_batch_id, scratch_branch, GateRecheck, GateSpec, PrObservation};
 use crate::notify::{self, PollResult};

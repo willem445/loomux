@@ -28,9 +28,23 @@
 //!
 //! `landable` is why the lines are worth paying. It is **half** of the
 //! constraint-7 refusal — the refspec-shape predicate — and `validate_target` is
-//! the whole of it. Leaving a half-check publicly reachable under the path
-//! everything in this crate already spells is an invitation to build the next
-//! branch-name guard on the wrong one. `as_args` and `declares_ci_green` ride
+//! the whole of it, ordering the unverifiable / default-branch / target /
+//! assertion refusals so an unreadable answer can never *fail to match* the
+//! default and read as safe. Leaving the half under the path this crate spells
+//! habitually is an invitation to build the next branch-name guard on it.
+//!
+//! **What this file cannot do, stated because the omission would read as a
+//! stronger claim than the code supports.** It does not put `landable` out of
+//! reach from `src-tauri`. This crate depends on `loomux-engine` directly and
+//! already spells `loomux_engine::…` in `gh.rs`, `obs.rs` and
+//! `orchestration/mod.rs`, so `loomux_engine::mqdriver::landable(name)` compiles
+//! from any module here and always will — an item must be `pub` in the engine to
+//! be re-exported at all, so no shape of this file changes that. What is bought
+//! is the habitual spelling and nothing more: someone reaching the half-check now
+//! has to type a cross-crate path that says what they are doing. **Writing a new
+//! branch-name guard? `validate_target`, not `landable`.**
+//!
+//! `as_args` and `declares_ci_green` ride
 //! along because the honest form of this file is "the visibility table, copied":
 //! every item that was `pub` is `pub`, every item that was `pub(super)` is
 //! `pub(super)`, and nothing that was private appears at all.

@@ -1156,11 +1156,35 @@ from a unit test of product code, agents are banned from running cargo locally
     decides whether a name may become a refspec component — and `validate_target`
     is the whole of it, ordering the unverifiable, default-branch, target and
     assertion refusals so that an unreadable answer can never fail to match the
-    default and read as safe. A publicly reachable half is an invitation to build
-    the next branch-name guard on the wrong one, and the whole of §7's argument is
-    that the three enforcement points must not drift into three slightly different
-    opinions. `as_args` and `declares_ci_green` ride along because the defensible
-    form of that file is the table copied, not a judgement made item by item.
+    default and read as safe. §7's argument is that the three enforcement points
+    must not drift into three slightly different opinions, so the habitual path
+    should point at the whole check. `as_args` and `declares_ci_green` ride along
+    because the defensible form of that file is the table copied, not a judgement
+    made item by item.
+
+    **What a re-export narrows is a spelling, never a reachability — and the
+    first draft of this entry got that wrong in the direction that flatters the
+    work.** It claimed a "publicly reachable half is an invitation to build the
+    next guard on the wrong one", which reads as though the re-export module put
+    `landable` out of reach. It does not, and cannot: `src-tauri` depends on
+    `loomux-engine` directly and already spells `loomux_engine::…` in `gh.rs`,
+    `obs.rs` and `orchestration/mod.rs`, so `loomux_engine::mqdriver::landable`
+    compiles from any module in `src-tauri` and no shape of the re-export changes
+    that — an item must be `pub` in the engine to be re-exported at all. The
+    honest account of the benefit is **legibility, not access control**: the
+    habitual `orchestration::mqdriver::…` path reaches only the whole check, and
+    someone reaching the half now has to type a cross-crate path that says so.
+
+    That is worth carrying past this batch, because every batch from here on has
+    the same sentence available to write. **A curated re-export answers "what can
+    a caller spell without thinking", not "what can a caller spell."** The second
+    question has one answer for every item any batch has moved — `pub` in the
+    engine, reachable by any sibling crate in this workspace — and it is harmless
+    for the standing reason (`publish = false`), which is exactly why the
+    temptation is to describe the first question as if it were the second. Batch
+    10's rule already says to name the spelling a claim is about; this is what it
+    costs when you do not, and rev-lead caught it in the PR body where it would
+    have become the squash message.
 
     Two things about the re-export module, stated so the next batch does not have
     to re-derive them. It is **not automatic** — an item added to the engine

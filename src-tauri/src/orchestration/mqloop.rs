@@ -10,16 +10,16 @@
 //! - `mqdriver.rs` (slice D1) — the **write primitives and their gates**. The
 //!   `MqRunner` seam, the live lookups, the constraint-7 refusal core, the
 //!   create-only scratch push, the landing function, cleanup.
-//!
-//! Both of those are in `crates/loomux-engine/src/` now (#888 batches 6 and
-//! 12a); this file reaches them through `orchestration/mod.rs`'s re-export and
-//! `orchestration/mqdriver.rs`'s, which is why its `super::` imports below read
-//! exactly as they did when all three sat in this directory. It is batch 12b.
 //! - this file (slices D2 and D3) — the **loop that sequences them**: build the
 //!   scratch, open the draft PR, observe the checks under a bound, bisect a red
 //!   batch and attribute it, requeue the survivors, reconcile after a crash, and
 //!   persist every step — plus [`drive`], the one-step-per-call tick that
 //!   decides which of those happens next (§13, #698).
+//!
+//! The first two are in `crates/loomux-engine/src/` now (#888 batches 6 and
+//! 12a); this file reaches them through `orchestration/mod.rs`'s re-export and
+//! `orchestration/mqdriver.rs`'s, which is why its `super::` imports below read
+//! exactly as they did when all three sat in this directory. It is batch 12b.
 //!
 //! `mod.rs` gets registry wiring only — a module declaration, three fields, the
 //! two `merge_queue_reconcile*` methods and the `mq_drive_group_with` /
