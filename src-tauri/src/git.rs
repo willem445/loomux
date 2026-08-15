@@ -8,7 +8,7 @@
 //! `repo` to every other command.
 
 use serde::Serialize;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Run a git-backed computation off the webview main thread (issues #399, #726).
@@ -764,13 +764,45 @@ pub async fn git_branches(repo: String) -> Result<Vec<BranchInfo>, String> {
 }
 
 /// Throw away changes to one file: restore tracked files, delete untracked.
+///
+/// # The untracked arm deletes, so it resolves rather than joins (#925)
+///
+/// Its previous guard was lexical and local — reject `is_absolute()` or any
+/// `ParentDir` component, then `join` — and it had two gaps against the standard
+/// this repo already holds for `fm_delete`:
+///
+/// - **A Windows drive-relative path passed both checks.**
+///   `Path::new("C:foo").is_absolute()` is `false` (a `Prefix` with no
+///   `RootDir`) and it has no `ParentDir`, so `"C:foo"` walked through — and
+///   `join` then *replaced* the receiver, because the argument carries a
+///   prefix, resolving relative to the process's own current directory on that
+///   drive. `safe_resolve` refuses a `Component::Prefix` explicitly. This one is
+///   a plain correctness bug on Windows, independent of any transport.
+/// - **No symlink guard.** `fm_delete` reaches `remove_file` through
+///   `safe_resolve` → `ensure_no_symlink`; this path did not, so a symlinked
+///   component below the repo could redirect the delete outside it.
+///
+/// Both close by routing through the same choke point the file manager uses,
+/// which is also why the error is now `safe_resolve`'s typed, coded string
+/// rather than a bare `"invalid path"`.
+///
+/// # What the symlink guard also closes, which is a working case (#925, rev-lead N2)
+///
+/// `ensure_no_symlink` walks **every** component below the root including the
+/// final one, so an untracked *symlink* inside the repo — which `remove_file`
+/// previously deleted correctly, since it removes the link and does not follow
+/// it — is now refused with `symlink: refusing to traverse symlink: …`.
+///
+/// Stated rather than left as a surprise: this is a genuine behavior loss, not
+/// only a hole being closed. It is accepted because it makes `git_discard`
+/// agree with `fm_delete`, which has always answered this way, and because the
+/// alternative — a bespoke "symlinks are fine if they are the leaf" rule — is a
+/// second opinion about path safety in a family that just finished collapsing
+/// four of those into one. `synth_untracked_diff` inherits the same refusal for
+/// previewing an untracked symlink.
 fn git_discard_sync(repo: String, path: String, untracked: bool) -> Result<(), String> {
     if untracked {
-        let rel = Path::new(&path);
-        if rel.is_absolute() || rel.components().any(|c| matches!(c, Component::ParentDir)) {
-            return Err("invalid path".to_string());
-        }
-        let full: PathBuf = Path::new(&repo).join(rel);
+        let full = crate::fileedit::safe_resolve(&repo, &path)?;
         std::fs::remove_file(&full).map_err(|e| e.to_string())
     } else {
         run_git(&repo, &["restore", "--", &path]).map(|_| ())
@@ -1307,9 +1339,35 @@ fn parse_name_status_z(out: &str) -> Vec<FileEntry> {
 
 /// Synthesize an all-added unified diff for an untracked file, so the diff
 /// panel can preview it like any other change.
+///
+/// # `rel` is resolved, not joined (#925)
+///
+/// This function used to be `repo.join(rel)` with **no validation of `rel` at
+/// all** — not absolute-checked, not `..`-checked, not containment-checked, not
+/// symlink-checked. `Path::join` discards its receiver when the argument is
+/// absolute, so `repo` was not even a weak bound: an absolute `rel` named any
+/// file on the machine, and the function returned up to 1 MiB of it as a
+/// synthesized diff. There was no guard to bypass; the guard was simply absent.
+///
+/// The fix routes through [`safe_resolve`] — the choke point every `ft_*`/`fm_*`
+/// command already uses — rather than adding a fifth private opinion about path
+/// safety. That buys the absolute/prefix refusal, the lexical `..` fold, the
+/// `starts_with(root)` containment check and the per-component symlink refusal
+/// in one call, and keeps this family's answer identical to the file pane's.
+///
+/// Reachability, stated precisely rather than dramatically: this is a
+/// `#[tauri::command]` argument, so it is reachable by whatever the command
+/// surface is exposed to — today the trusted webview, and #888's wire once that
+/// lands. Closing it at the choke point now is what keeps the wire from arming
+/// it later.
 fn synth_untracked_diff(repo: &Path, rel: &str) -> Result<String, String> {
     const MAX_BYTES: u64 = 1024 * 1024;
-    let full = repo.join(rel);
+    // `to_string_lossy` because `safe_resolve` takes `&str` (rev-lead N5). A
+    // non-UTF-8 repo path would be lossily rewritten here and then fail
+    // `safe_resolve`'s own `is_dir()` — a refusal, not a wrong path, so the
+    // seam fails closed. Noted because the conversion is new, not because it is
+    // reachable: every caller's `repo` came from `git_repo_root`'s stdout.
+    let full = crate::fileedit::safe_resolve(&repo.to_string_lossy(), rel)?;
     let meta = std::fs::metadata(&full).map_err(|e| e.to_string())?;
     if meta.len() > MAX_BYTES {
         return Ok(format!(
@@ -1473,6 +1531,105 @@ mod tests {
         let diff = synth_untracked_diff(&dir, "t.txt").unwrap();
         assert!(diff.contains("@@ -0,0 +1,2 @@"));
         assert!(diff.contains("+one\n+two\n"));
+    }
+
+    // ---------- path containment for the caller-supplied `rel` (#925) ----------
+
+    /// **`git_diff(mode: "untracked")` must not read outside the repo.**
+    ///
+    /// Before #925 this function was `repo.join(rel)` with no validation of
+    /// `rel` at all — and `Path::join` DISCARDS its receiver when the argument
+    /// is absolute, so `repo` was not even a weak bound. An absolute `rel` named
+    /// any file the process could reach and up to 1 MiB of it came back as a
+    /// synthesized diff.
+    ///
+    /// The secret file is written OUTSIDE the repo and its content asserted
+    /// absent from the result, not merely "an error came back": an
+    /// implementation that refused for some unrelated reason would pass a bare
+    /// `is_err()`, where this cannot.
+    #[test]
+    fn synth_untracked_refuses_to_read_outside_the_repo() {
+        let base = std::env::temp_dir().join("loomux-925-diff-escape");
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let secret = base.join("secret.txt");
+        std::fs::write(&secret, "SUPER-SECRET-KEY-MATERIAL\n").unwrap();
+
+        // 1. absolute path — the shape that discarded `repo` entirely.
+        let abs = synth_untracked_diff(&repo, &secret.to_string_lossy());
+        assert!(
+            abs.as_ref().is_err_and(|e| !e.contains("SUPER-SECRET")),
+            "an absolute rel must be refused, got: {abs:?}"
+        );
+
+        // 2. plain `..` traversal to the same file.
+        let up = synth_untracked_diff(&repo, "../secret.txt");
+        assert!(
+            up.as_ref().is_err_and(|e| !e.contains("SUPER-SECRET")),
+            "a traversal rel must be refused, got: {up:?}"
+        );
+
+        // Positive control: an ordinary in-repo file still previews, so the two
+        // refusals above mean "contained", not "this function stopped working".
+        std::fs::write(repo.join("ok.txt"), "hello\n").unwrap();
+        let ok = synth_untracked_diff(&repo, "ok.txt").unwrap();
+        assert!(ok.contains("+hello"), "an in-repo untracked file must still preview: {ok}");
+    }
+
+    /// **`git_discard(untracked)` must not delete outside the repo.**
+    ///
+    /// Its previous guard rejected `is_absolute()` and any `ParentDir`, which
+    /// covers those two shapes — so the interesting case is the one that guard
+    /// MISSED, and it is Windows-only by nature: `Path::new("C:foo")` is not
+    /// absolute (a `Prefix` with no `RootDir`) and has no `ParentDir`, so it
+    /// passed both checks, and `join` then replaced the receiver because the
+    /// argument carries a prefix.
+    ///
+    /// Gated on Windows deliberately and disclosed as such: on Unix `"C:foo"` is
+    /// an ordinary relative file name that never escaped anything, so a
+    /// cross-platform version of this test would be green before the fix and
+    /// prove nothing.
+    #[cfg(windows)]
+    #[test]
+    fn git_discard_refuses_a_windows_drive_relative_path() {
+        let repo = std::env::temp_dir().join("loomux-925-discard");
+        std::fs::create_dir_all(&repo).unwrap();
+
+        let err = git_discard_sync(repo.to_string_lossy().to_string(), "C:foo".into(), true)
+            .expect_err("a drive-relative path must be refused, not resolved against the CWD");
+        assert!(
+            err.starts_with("invalid-path"),
+            "must be `safe_resolve`'s typed refusal, got: {err}"
+        );
+    }
+
+    /// The containment property `git_discard` shares with every other consumer
+    /// of the choke point, pinned cross-platform: an in-repo file really is
+    /// deleted (so the refusals are not a dead function), and an absolute path
+    /// pointing outside is refused with the file still on disk afterwards.
+    #[test]
+    fn git_discard_deletes_inside_the_repo_and_refuses_outside_it() {
+        let base = std::env::temp_dir().join("loomux-925-discard-scope");
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let inside = repo.join("scratch.txt");
+        std::fs::write(&inside, "x").unwrap();
+        let outside = base.join("keep.txt");
+        std::fs::write(&outside, "x").unwrap();
+
+        // Positive control first: without it, the refusal below could pass on a
+        // function that deleted nothing at all.
+        git_discard_sync(repo.to_string_lossy().to_string(), "scratch.txt".into(), true).unwrap();
+        assert!(!inside.exists(), "an in-repo untracked file must still be deletable");
+
+        let err = git_discard_sync(
+            repo.to_string_lossy().to_string(),
+            outside.to_string_lossy().to_string(),
+            true,
+        )
+        .expect_err("an absolute path outside the repo must be refused");
+        assert!(err.starts_with("invalid-path"), "typed refusal expected, got: {err}");
+        assert!(outside.exists(), "the refused delete must not have happened");
     }
 
     // ---------- git-op integration tests (spawn the real git CLI) ----------

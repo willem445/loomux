@@ -683,3 +683,59 @@ fn list_files_is_cancellable_and_reports_truncation_rather_than_cutting_silently
     assert_eq!(all.len(), 40);
     assert!(!truncated, "40 files is nowhere near the ceiling");
 }
+
+/// **The root is validated before anything else happens** (#925).
+///
+/// `search_planned` hands `root` to `plan_enumeration`, which spawns `git
+/// ls-files` with `Command::current_dir(root)`. Before #925 the validation lived
+/// in `run_search`, *after* that spawn — so a subprocess ran in a directory
+/// nothing had checked, and the refusal arrived only once it had already run.
+///
+/// # Why this is a behavior change and not just a reordering
+///
+/// `run_search` checks the query first and the root second (`fileedit.rs:746`,
+/// `:749`), so hoisting the root check ahead of it swaps which of two competing
+/// errors wins when *both* inputs are bad. That is observable at this very
+/// function boundary, which is what makes the property testable at all — the
+/// PR body originally claimed there was no observable and was wrong.
+///
+/// Both halves are asserted, because either alone is compatible with a broken
+/// implementation: the first would pass if root validation had simply swallowed
+/// the empty-query check, and the second would pass if nothing had moved.
+#[test]
+fn search_planned_validates_the_root_before_the_query() {
+    let missing = std::env::temp_dir().join("loomux-925-no-such-root-for-search");
+    let _ = fs::remove_dir_all(&missing);
+
+    // Both inputs are bad. The ROOT is the one that must be reported, because
+    // the root is what would otherwise reach a subprocess unchecked.
+    let err = search_planned(
+        &missing.to_string_lossy(),
+        "",
+        opts(false, false),
+        &|| false,
+        &mut |_| {},
+    )
+    .expect_err("a root that is not a directory must be refused");
+    assert!(
+        err.starts_with("not-found"),
+        "the root must be refused before the query is even looked at, got: {err}"
+    );
+
+    // Positive control: with a REAL root, the empty-query error is still
+    // reached and still reported. The hoist reorders the checks; it does not
+    // delete one.
+    let real = tempfile::tempdir().unwrap();
+    let err = search_planned(
+        real.path().to_str().unwrap(),
+        "",
+        opts(false, false),
+        &|| false,
+        &mut |_| {},
+    )
+    .expect_err("an empty query must still be refused");
+    assert!(
+        err.starts_with("empty-query"),
+        "a valid root must still surface the empty-query error, got: {err}"
+    );
+}

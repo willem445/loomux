@@ -17477,7 +17477,11 @@ fn poll_promptsubmit_hook_respects_a_baseline_that_excludes_a_stale_record() {
 #[test]
 fn promptsubmit_marker_path_matches_the_hooks_dir_convention() {
     let root = Path::new("C:/state");
-    let path = promptsubmit_marker_path(root, &parse_gid("group-1"), "agent-1");
+    let path = promptsubmit_marker_path(
+        root,
+        &parse_gid("group-1"),
+        &loomux_lib::orchestration::PathSegment::parse("agent-1").unwrap(),
+    );
     assert_eq!(path, root.join("group-1").join("hooks").join("agent-1.promptsubmit.jsonl"));
 }
 
@@ -32334,6 +32338,83 @@ fn session_digest_rejects_a_path_traversal_session_id() {
         &json!({ "name": "session_digest", "arguments": { "task": task_id } })).unwrap();
     assert_eq!(r["isError"], true);
     assert!(r["content"][0]["text"].as_str().unwrap().contains("invalid session id"), "{r}");
+}
+
+/// **The shapes the old predicate let through, refused end to end** (#925 N8).
+///
+/// The sibling test above pins the separator/traversal case, which
+/// `digest::is_safe_session_id` already caught. This one pins the shapes it did
+/// **not**: it was `!empty && !contains(['/','\\']) && != "." && != ".."`, so a
+/// Windows drive prefix, a device name, a leading dash, an unbounded length, a
+/// NUL and every non-ASCII byte all satisfied it and travelled on to
+/// `Path::join`.
+///
+/// # What "refused" is asserted as, and why it is not just `isError`
+///
+/// Both before and after the fix these return an error, so `isError` alone
+/// cannot tell the two apart — before, the id reached the filesystem and the
+/// error was the *lookup* failing ("no Claude transcript found for session …");
+/// after, it is refused at the gate and never reaches a path at all. The
+/// message is therefore the observable that distinguishes "never became a path"
+/// from "became a path that happened to miss", which is exactly the property
+/// #925 is about. Same idiom as the sibling test above.
+#[test]
+fn session_digest_refuses_every_id_shape_the_old_predicate_admitted() {
+    let long = "a".repeat(65);
+    let hostile: &[(&str, &str)] = &[
+        // The sharpest one: on Windows a `Prefix` component makes `Path::join`
+        // REPLACE its receiver, so this walked out of the session-state root
+        // with no separator anywhere in it.
+        ("C:", "a Windows drive prefix"),
+        ("C:stream", "a drive-relative path"),
+        ("sess:ads", "an NTFS alternate data stream"),
+        // Opens a device rather than naming a file.
+        ("CON", "a reserved device name"),
+        ("nul", "a reserved device name, lowercased"),
+        // An option to any command line the id is interpolated into.
+        ("-rf", "a leading dash"),
+        // The old predicate had no length cap at all.
+        (long.as_str(), "an over-length id"),
+        // Truncates at the syscall.
+        ("sess\0evil", "an embedded NUL"),
+        // Where normalization and homoglyph confusion live.
+        ("sessiön", "a non-ASCII byte"),
+        // Still refused, and still by the alphabet rather than a special case.
+        ("..", "the bare traversal"),
+        // The empty id is deliberately NOT here, and finding out why was worth
+        // the round: `upsert_task` records `session: ""` as *no session at
+        // all*, so `session_digest` refuses it upstream with "task … has no
+        // recorded session" and it never reaches the path layer to be refused
+        // by the gate this test is about. Asserting the gate's message for it
+        // would have been asserting the wrong guard. `SegmentError::Empty` is
+        // pinned directly in `tests/pathseg.rs` instead.
+    ];
+
+    for (bad, why) in hostile {
+        let (reg, _d) = test_registry();
+        let g = reg.create_group("C:/tmp/repo", rails_with_process_block()).unwrap();
+        let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+        let co = reg.resolve_token(&orch.token).unwrap();
+        let worker = reg.spawn_agent(&g.id, Role::Worker, "w", "task", false, None).unwrap();
+
+        let up = dispatch(&reg, &co, "tools/call", &json!({
+            "name": "upsert_task",
+            "arguments": { "title": "t", "assignee": worker.id, "session": bad },
+        })).unwrap();
+        assert_eq!(up["isError"], false, "upsert_task should store {why} verbatim: {up}");
+        let task_id = reg.task_summaries(&g.id)[0].id.clone();
+
+        let cp = process_caller(&reg, &g.id);
+        let r = dispatch(&reg, &cp, "tools/call",
+            &json!({ "name": "session_digest", "arguments": { "task": task_id } })).unwrap();
+
+        assert_eq!(r["isError"], true, "{why} ({bad:?}) must be refused: {r}");
+        let msg = r["content"][0]["text"].as_str().unwrap();
+        assert!(
+            msg.contains("invalid session id"),
+            "{why} ({bad:?}) must be refused AT THE GATE, not looked up on disk — got: {msg}"
+        );
+    }
 }
 
 // ---------- session_digest recurrence (#324) ----------
