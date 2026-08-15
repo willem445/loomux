@@ -408,8 +408,8 @@ the orchestrator to show the level a container sits at. It's a label only: nothi
 a `story` sits under a `feature` rather than straight under an `epic`, and a container is
 ordinary claimable work like any other task, not a special row.
 
-Two rules about nesting are backend behavior, live today regardless of which board UI you're
-running:
+Two rules about nesting are backend behavior — they hold however the board reaches you, the UI
+below included:
 
 - Deleting a container **promotes** its subtasks rather than deleting or orphaning them: they
   move up to the nearest container still on the board (or to the top level, if the whole chain
@@ -418,9 +418,7 @@ running:
 - Nesting can run at most 4 levels deep; a write that would go deeper is refused with an error
   explaining why, the same way an invalid dependency write is.
 
-Board controls for nesting (design shown here; the nesting UI (#1027) is currently in review, so
-treat the details below as what's coming rather than shipped — this caveat is owed to come out
-once #1027 merges):
+Board controls for nesting:
 
 - A **⤵ nest** picker on a row lets you choose which other task it sits inside, or promote it
   back to the top level.
