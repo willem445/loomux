@@ -35,6 +35,7 @@ import {
   modelOptions,
   pickerSelection,
   probeFailure,
+  reportFailure,
   worthKeeping,
   type CliProbe,
 } from "../src/modelcatalog.ts";
@@ -725,4 +726,50 @@ test("an id the CLI itself reported with a suffix still matches verbatim first",
   const models = [detail({ id: "opus[1m]", name: "Opus (1M context)" }), detail({ id: "opus", name: "Opus" })];
   assert.equal(detailFor(models, "opus[1m]")?.name, "Opus (1M context)", "the exact row wins before any widening");
   assert.equal(detailFor(models, "opus")?.name, "Opus");
+});
+
+// ── the CLI nothing answers for (#1020) ─────────────────────────────────────
+
+test("copilot's dropdown fills from the curated catalog when nothing answers for it (#1020)", async () => {
+  // The end-to-end shape of the redesigned pane-setup's copilot bug. Copilot has
+  // no `ENUMERATORS` row and no `PROTOCOLS` row, so BOTH machine sources are
+  // silent by construction: its `--help` no longer enumerates models, so the
+  // probe reports an empty list, and the startup sweep never spawns it, so no
+  // report ever lands. Every other CLI degrades to its curated suggestions in
+  // that state; copilot LIVES there, which is why its curated list has to be a
+  // real menu rather than a seed for one.
+  const catalog = new ModelCatalog(
+    async () => probe([]), // available, but with nothing to say — copilot's real reply
+    async () => reportFailure("copilot has no list-models protocol row")
+  );
+  await catalog.probe("copilot");
+  await catalog.detect("copilot");
+  assert.equal(catalog.report("copilot"), null, "a barren detection is not an answer, so the seed has to carry it");
+
+  const menu = catalog.models("copilot");
+  assert.equal(menu[0], "auto", "the pick-for-me row still leads after the merge");
+  // The bug this pins is "the dropdown shows no real copilot models". A menu
+  // covering one or two vendor families is that bug wearing a longer list's
+  // clothes — copilot resells several, and the account-specific subset it also
+  // reports covers one.
+  const families = new Set(menu.filter((m) => m !== "auto").map((m) => /^[a-z]+/.exec(m)?.[0] ?? ""));
+  families.delete("");
+  assert.ok(families.size >= 5, `copilot's dropdown offers only ${[...families].join(", ")}`);
+  assert.deepEqual(menu, curatedModels("copilot"), "with both sources silent the menu IS the curated row, in its order");
+});
+
+test("a copilot model the machine DOES report still leads the curated catalog (#1020)", async () => {
+  // The interim list must not become a ceiling. It is written down only because
+  // nothing answers today; the moment copilot gains an enumerator or a protocol
+  // row, that answer has to sort in front of these without anyone editing the
+  // row — and the curated ids have to survive behind it, because the role
+  // defaults are drawn from them.
+  const catalog = new ModelCatalog(async () => probe(["gpt-6-unreleased", "auto"]));
+  await catalog.probe("copilot");
+  const menu = catalog.models("copilot");
+  assert.equal(menu[0], "gpt-6-unreleased", "the machine's own answer leads the suggestion");
+  assert.equal(menu.indexOf("auto"), 1, "and an id both sources name appears once, in the probe's position");
+  for (const id of curatedModels("copilot")) {
+    assert.ok(menu.includes(id), `the merge dropped the curated id ${id} — a role default could land off-menu`);
+  }
 });
