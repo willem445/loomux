@@ -45260,12 +45260,18 @@ pub async fn orch_group_usage(app: AppHandle, group_id: String) -> Value {
 //     The runtime remedy if a chatty CLI's idle repaints starve the tick.
 //   orch_autonomy(group_id) -> Value
 //     The whole panel state in one read:
-//       { autonomous: bool, auto_merge: bool, full_autonomy: bool,
-//         full_autonomy_goal: string | null, budget_tokens: u64,
+//       { autonomous: bool, auto_merge: bool, auto_release: bool,
+//         dangerous_mode: bool, full_autonomy: bool,
+//         full_autonomy_goal: string | null, hold_label: string,
+//         budget_tokens: u64,
 //         budget_anchor_tokens: u64, spend_since_enable_tokens: u64 | null,
 //         suspended: bool, idle_tick_minutes: u32, idle_activity_floor_bytes: u64,
 //         quiet_secs: u64 | null, eligible_in_secs: u64 | null,
 //         tick_status: "off"|"starting"|"paused"|"counting_down"|"eligible"|"waiting_for_activity"|"rate_capped" }
+//     `hold_label` (#778) is the group's RESOLVED veto spelling — the panel's
+//     full-autonomy help and mode chip name it, and both are instructions, so a
+//     stale one tells the human to apply a label that holds nothing. Reported
+//     whatever the mode's state, unlike `full_autonomy_goal`.
 //     `spend_since_enable_tokens` is null when autonomous is off (no live meter).
 //     `suspended` is true iff autonomous is off *because the budget enforcer
 //     flipped it* (durable `autonomy_suspended` marker), vs a plain user toggle-off

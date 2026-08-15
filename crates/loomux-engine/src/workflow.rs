@@ -543,16 +543,28 @@ pub fn builtin_intake_profile() -> IntakeProfile {
 /// Empty (omitted) is not a rejection — it falls back to `fallback` (the
 /// built-in default for that field), which is what lets a repo override
 /// `intake.labels.ready:` alone and inherit the other four.
+///
+/// **A LEADING `-` is rejected on top of [`sanitize_id`]'s alphabet**, which
+/// permits `-` freely (rev-648 NB4). A label is not only compared against
+/// GitHub's — the hold spelling becomes a **positional** argument to
+/// `gh label create <name> …`, and a positional beginning with a dash is read
+/// by cobra as an unknown flag. That is not an injection (nothing is executed,
+/// and the create fails loudly), but it is a class of value that can never
+/// work, and rejecting it here is what lets `gh.rs` state — truthfully — that
+/// nothing flag-shaped reaches an argv. `--force` and `-x` are nonsense as
+/// label names for all five fields, so nothing legitimate is lost. Interior and
+/// trailing dashes (`agent-hold`, `do-not-touch`) are untouched.
 fn sanitize_intake_label(field: &str, raw_val: &str, fallback: &str, errs: &mut Vec<String>) -> String {
     let v = raw_val.trim();
     if v.is_empty() {
         return fallback.to_string();
     }
     match sanitize_id(v) {
-        Some(clean) if clean == v => clean,
+        Some(clean) if clean == v && !clean.starts_with('-') => clean,
         _ => {
             errs.push(format!(
-                "intake.labels.{field}: {v:?} is not a usable label (letters, digits, '-', '_')"
+                "intake.labels.{field}: {v:?} is not a usable label (letters, digits, '-', '_'; \
+                 and it may not begin with '-')"
             ));
             fallback.to_string()
         }

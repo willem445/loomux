@@ -104,12 +104,26 @@ fn hold_label(repo: &str) -> String {
 ///
 /// **Still an allow-list, and that is the load-bearing part.** The hold entry is
 /// ONE value resolved from the repo's own committed config — not a wildcard, not
-/// a pattern, and never a string the frontend supplied. `sanitize_intake_label`
-/// has already constrained it at parse time to the `sanitize_id` alphabet
-/// (letters, digits, `-`, `_`), and a label that would need rewriting is rejected
-/// by the parser rather than coerced, so nothing shell-ish or `--flag`-shaped can
-/// reach an argv through this door. A repo that declares no `hold:` gets exactly
-/// the previous four-label set.
+/// a pattern, and never a string the frontend supplied. A repo that declares no
+/// `hold:` gets exactly the previous four-label set.
+///
+/// What the sanitizer guarantees about that one value, stated as what it
+/// actually enforces (rev-648 NB4 corrected an earlier version of this comment
+/// that over-claimed): `sanitize_intake_label` constrains it at parse time to
+/// the `sanitize_id` alphabet — letters, digits, `-`, `_` — **and** refuses a
+/// leading `-`, rejecting rather than coercing anything else. So the value is
+/// not shell-ish (no spaces, quotes, `$`, or path separators can survive) and
+/// not flag-shaped (nothing reaching `gh label create <name>` as a positional
+/// can be read as an option). Note the two are different claims: the alphabet
+/// alone would have permitted `--force`, because `-` is in it.
+///
+/// **And the guarantee is about this path specifically.** The value here is
+/// resolved from the repo's `.loomux/workflow.yml` through `parse_workflow`, so
+/// the sanitizer is always in front of it; a file that fails to parse falls back
+/// to the built-in. A hand-edited `group.json` can carry an unsanitized label
+/// into `guardrails.intake.hold`, but that field feeds prose surfaces (the
+/// contract, the notice, the panel) and never an argv — `gh.rs` does not read
+/// group state at all.
 fn allowed_labels(repo: &str) -> Vec<String> {
     let mut out: Vec<String> = FIXED_LABELS.iter().map(|s| s.to_string()).collect();
     let hold = hold_label(repo);

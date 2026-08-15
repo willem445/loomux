@@ -6442,6 +6442,63 @@ fn an_intake_label_with_unusable_characters_is_rejected_not_rewritten() {
     );
 }
 
+/// **A flag-shaped label is refused, which is what makes the argv claim true**
+/// (rev-648 NB4). `sanitize_id`'s alphabet allows `-` freely, so `--force` and
+/// `-x` passed it unchanged and became a resolved label — and the hold spelling
+/// reaches `gh label create <name> …` as a POSITIONAL argument, where cobra
+/// reads a leading dash as an unknown flag.
+///
+/// That was never an injection: nothing is executed and the create fails loudly.
+/// But `gh.rs` justified its allow-list with "nothing shell-ish or `--flag`-shaped
+/// can reach an argv through this door", and a safety claim that isn't true is
+/// worth less than no claim — a later reader relies on it. Refusing the class
+/// here is what makes it true at the boundary that states it.
+#[test]
+fn an_intake_label_may_not_begin_with_a_dash() {
+    for bad in ["--force", "-x", "--", "-agent-hold"] {
+        let yaml = format!(
+            "version: 1\nblocks:\n  - id: worker\n    kind: worker\n\
+             intake:\n  labels:\n    hold: \"{bad}\"\n"
+        );
+        let errs = workflow::parse_workflow(&yaml).unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains("intake.labels.hold")),
+            "{bad:?} must be refused, naming the field: {errs:?}"
+        );
+        assert!(
+            errs.iter().any(|e| e.contains("may not begin with")),
+            "the error must say WHY, so an author can fix it: {errs:?}"
+        );
+    }
+
+    // The rule is a LEADING dash only: the built-in vocabulary and every
+    // plausible rename are interior-dashed, and refusing those would break the
+    // default install.
+    for good in ["agent-hold", "do-not-touch", "hold_me", "HOLD2", "a-"] {
+        let yaml = format!(
+            "version: 1\nblocks:\n  - id: worker\n    kind: worker\n\
+             intake:\n  labels:\n    hold: \"{good}\"\n"
+        );
+        let wf = workflow::parse_workflow(&yaml)
+            .unwrap_or_else(|e| panic!("{good:?} must still parse: {e:?}"));
+        assert_eq!(wf.intake.hold, good);
+    }
+
+    // Every label field, not just the veto — a leading dash is nonsense for all
+    // five, and the one that reaches an argv is not the only one that would.
+    for field in ["ready", "investigate", "owned", "prototype"] {
+        let yaml = format!(
+            "version: 1\nblocks:\n  - id: worker\n    kind: worker\n\
+             intake:\n  labels:\n    {field}: \"--force\"\n"
+        );
+        let errs = workflow::parse_workflow(&yaml).unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains(&format!("intake.labels.{field}"))),
+            "{field} must refuse a flag-shaped label too: {errs:?}"
+        );
+    }
+}
+
 #[test]
 fn intake_human_gate_spelling_is_a_deny_unknown_fields_error() {
     // THE CRITICAL invariant. There is no spelling under `intake:` that

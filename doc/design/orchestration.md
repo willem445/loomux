@@ -12543,9 +12543,23 @@ Five public-contract changes, all additive:
    repo, because that agreement is what the allow-list's correctness rests on.
 
    The allow-list stays an allow-list: exactly one resolved value joins the three fixed
-   signals, and `sanitize_intake_label` has already constrained it at parse time to the
-   `sanitize_id` alphabet, so nothing shell-ish or `--flag`-shaped can reach an argv. A repo
-   that declares no `hold:` gets the identical four-label set it had before.
+   signals. A repo that declares no `hold:` gets the identical four-label set it had before.
+
+   **Two separate properties of that value, because the first does not imply the second.**
+   `sanitize_intake_label` constrains it at parse time to `sanitize_id`'s alphabet — letters,
+   digits, `-`, `_`, rejecting rather than coercing — which is what makes it non-shell-ish:
+   no space, quote, `$` or path separator survives. It does *not* follow that the value is
+   non-flag-shaped, because `-` is in that alphabet: `hold: --force` parsed unchanged and
+   reached `gh label create <name>` as a positional that cobra reads as an unknown flag (no
+   injection, a loud failure — but not the property the comment claimed). So the sanitizer
+   **also refuses a leading `-`**, on all five label fields, which is what makes the argv
+   claim true rather than merely stated. A label beginning with a dash is nonsense for every
+   field; interior dashes are untouched.
+
+   The guarantee is scoped to the path that states it: `gh.rs` resolves from the workflow
+   file through `parse_workflow`, so the sanitizer is always in front of it. A hand-edited
+   `group.json` can put an unsanitized label in `guardrails.intake.hold`, but that field
+   feeds prose surfaces and never an argv.
 
    The other four label fields (`ready`/`investigate`/`owned`/`prototype`) remain the uniform
    #382 P2 gap — parsed, stored, honored nowhere — and `gh_label_vocabulary` deliberately

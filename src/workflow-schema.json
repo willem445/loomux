@@ -274,7 +274,7 @@
     },
     "intake.labels": {
       "title": "Intake labels",
-      "help": "The label vocabulary intake matches on. Letters, digits, '-' and '_' — a label that would need rewriting is refused, never silently changed.",
+      "help": "The label vocabulary intake matches on. Letters, digits, '-' and '_', and it may not begin with '-' (a leading dash would be read as a flag where the label becomes a command argument) — a label that would need rewriting is refused, never silently changed.",
       "fields": [
         {
           "name": "ready",
