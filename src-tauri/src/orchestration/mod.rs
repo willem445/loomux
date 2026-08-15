@@ -4334,10 +4334,7 @@ impl Guardrails {
     /// resolves a CLASS to its default, and the liaison is never a class's
     /// default.
     pub fn block_for(&self, kind: Role) -> Option<&workflow::Block> {
-        self.blocks.iter().find(|b| match kind {
-            Role::Reviewer => workflow::is_reviewing_block(b),
-            _ => b.kind == kind,
-        })
+        self.blocks.iter().find(|b| b.kind == kind)
     }
 
     /// The reviewer-kind block a [`block_for`](Self::block_for) resolution
