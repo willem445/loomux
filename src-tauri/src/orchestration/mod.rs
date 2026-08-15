@@ -668,11 +668,19 @@ pub fn sanitize_full_autonomy_goal(raw: &str) -> String {
 /// The ON text is the whole protocol because there is nowhere else for it to live
 /// at the moment the human flips the switch: what to do before touching the
 /// pre-existing backlog (post one ranked triage plan and wait for an explicit go),
-/// what the veto gesture is (`agent-hold`, absolute), and — said out loud, because
+/// what the veto gesture is (`hold`, absolute), and — said out loud, because
 /// this is the notice a reader will most want to over-read — that nothing about
 /// merging, releasing, review or budgets moved. The toggle widens what may be
 /// STARTED, never what may be SHIPPED.
-pub fn full_autonomy_notice(on: bool, goal: &str) -> String {
+///
+/// `hold` is the group's RESOLVED veto spelling, threaded for the same reason the
+/// template's `{{HOLD_LABEL}}` is (rev round 1 B1): this notice tells the
+/// orchestrator which label to tell the human to strike rows with, so a hardcoded
+/// `agent-hold` here would hand a renamed repo a veto gesture its own poller
+/// ignores — the defect one surface over. Sanitized on the way in like every
+/// other interpolated value: it is repo-authored text, and the parser's alphabet
+/// restriction is a different layer's guarantee, not this function's.
+pub fn full_autonomy_notice(on: bool, goal: &str, hold: &str) -> String {
     if !on {
         // OFF ignores whatever goal it is called with — off has none, by construction.
         return "[loomux] full autonomy DISABLED for this group: the label funnel is opt-in \
@@ -680,16 +688,25 @@ pub fn full_autonomy_notice(on: bool, goal: &str) -> String {
                 already in flight normally."
             .to_string();
     }
+    let hold = sanitize_full_autonomy_goal(hold);
+    let hold = if hold.is_empty() { builtin_hold_label() } else { hold };
     format!(
         "[loomux] FULL AUTONOMY ENABLED for this group ({goal_clause}). Before starting any \
          pre-existing issue: post one ranked triage plan (value/risk/effort/order) over ALL \
-         open issues as a GitHub issue, tell the human to veto rows by adding agent-hold, and \
+         open issues as a GitHub issue, tell the human to veto rows by adding {hold}, and \
          wait for their go. After the go — and for any issue filed from now on that fits the \
          goal — self-select the highest-value eligible issue on each idle tick and start it \
-         within your caps, announcing a one-line selection rationale per pickup. agent-hold is \
+         within your caps, announcing a one-line selection rationale per pickup. {hold} is \
          absolute. Nothing about merging, releasing, review, or budgets changed.",
         goal_clause = full_autonomy_goal_clause(goal),
     )
+}
+
+/// The built-in veto spelling, for the paths that must name one when a group's
+/// own profile is unavailable or empty. One accessor rather than a literal
+/// repeated at each such site.
+fn builtin_hold_label() -> String {
+    workflow::builtin_intake_profile().hold
 }
 
 /// The parenthesized goal fragment shared by the toggle notice and the kickoff
@@ -31851,6 +31868,22 @@ impl OrchRegistry {
         Ok(())
     }
 
+    /// This group's resolved veto spelling (#778) — `guardrails.intake.hold`,
+    /// falling back to the built-in for a group this registry no longer holds.
+    ///
+    /// One accessor, so every agent-facing surface that names the veto (the
+    /// contract's `{{HOLD_LABEL}}`, the kickoff clause, the toggle notice) reads
+    /// the same field the intake poller checks against. The whole B1 defect was
+    /// three surfaces each answering this question for themselves.
+    fn hold_label_of(&self, group: &GroupId) -> String {
+        self.groups
+            .lock_safe()
+            .get(group)
+            .map(|g| g.guardrails.intake.hold.clone())
+            .filter(|h| !h.trim().is_empty())
+            .unwrap_or_else(builtin_hold_label)
+    }
+
     /// Whether full autonomy (#778) is on for a group: the orchestrator self-selects
     /// eligible work on its idle tick instead of waiting for the opt-in label funnel.
     pub fn is_full_autonomy(&self, group: &GroupId) -> bool {
@@ -31997,7 +32030,8 @@ impl OrchRegistry {
         // dead/paused orchestrator just misses it and re-reads its kickoff config on
         // resume). A re-aim re-delivers the ON notice deliberately: the protocol it
         // carries is scoped to the goal, so a new goal is a new instruction.
-        let _ = self.deliver_to_orchestrator(group, &full_autonomy_notice(on, goal), "loomux");
+        let hold = self.hold_label_of(group);
+        let _ = self.deliver_to_orchestrator(group, &full_autonomy_notice(on, goal, &hold), "loomux");
         Ok(())
     }
 
@@ -32009,7 +32043,10 @@ impl OrchRegistry {
         if self.full_autonomy_groups.lock_safe().remove(group) {
             let _ = remove_marker(&self.group_dir(group).join("full_autonomy"));
             self.audit(group, actor, "full-autonomy-off", json!({ "reason": reason }));
-            let _ = self.deliver_to_orchestrator(group, &full_autonomy_notice(false, ""), "loomux");
+            // The OFF notice names no veto, so the spelling is irrelevant here —
+            // passed for signature reasons only.
+            let _ =
+                self.deliver_to_orchestrator(group, &full_autonomy_notice(false, "", ""), "loomux");
         }
     }
 
@@ -38966,11 +39003,17 @@ impl OrchRegistry {
         // A fresh boot or resume has no toggle notice to have seen, so the clause has
         // to carry the three facts the inverted start default turns on: that it IS
         // inverted, what constrains it, and that the veto is absolute.
+        //
+        // The veto is named from the group's resolved profile, not as a literal
+        // (rev round 1 B1): this clause is the contract a fresh boot reads, so a
+        // hardcoded `agent-hold` would tell a renamed repo's orchestrator that the
+        // absolute veto is a label nothing in that repo applies.
         format!(
             "ON — FULL AUTONOMY (self-select eligible work on idle ticks until none remains; \
-             {goal_clause}; agent-hold is the absolute human veto — see INVARIANT 8)",
+             {goal_clause}; {hold} is the absolute human veto — see INVARIANT 8)",
             goal_clause =
                 full_autonomy_goal_clause(&self.full_autonomy_goal(group).unwrap_or_default()),
+            hold = self.hold_label_of(group),
         )
     }
 

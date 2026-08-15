@@ -6334,6 +6334,24 @@ fn a_renamed_veto_reaches_the_contract_the_poller_and_the_allow_list_alike() {
     got.sort_unstable();
     assert_eq!(got, vec![2, 3], "the repo's own spelling is the veto the poller honors");
 
+    // 1b. The kickoff clause, which is the OTHER half of the contract: a fresh
+    //     boot or resume has no toggle notice to have seen, so this clause is
+    //     where it learns the veto's name. Same hardcode, same consequence.
+    reg.set_autonomous(&g.id, true).unwrap();
+    reg.set_full_autonomy(&g.id, true, "harden any bugs").unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let entry = reg.agent(&orch.id).unwrap();
+    let info = reg.group(&g.id).unwrap();
+    let kickoff = reg.kickoff_prompt(&entry, &info, "", None);
+    assert!(
+        kickoff.contains("do-not-touch is the absolute human veto"),
+        "the kickoff clause must name THIS repo's veto: {kickoff}"
+    );
+    assert!(
+        !kickoff.contains("agent-hold"),
+        "and must not also name the built-in: {kickoff}"
+    );
+
     // 3. The seam the write side stands on. `gh.rs` has no group — the issues
     //    view is repo-scoped — so it resolves the spelling from the repo's own
     //    workflow file via `load_workflow`, and its allow-list is only correct
