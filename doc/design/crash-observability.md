@@ -33,12 +33,18 @@ orchestration state (`<data>/loomux/orchestration/`).
 
 ### 1. Panic hook → crash log
 
-`install_panic_hook()` runs first thing in `run()`, before any other setup, so
+`install_panic_hook(app_version)` runs first thing in `run()`, before any other
+setup, so
 even a panic during startup is captured. It **wraps** the existing hook (chains
 to it, preserving dev-build console output) and, before chaining, writes
 `<data>/loomux/logs/crash-<YYYYMMDD-HHMMSS>.log` containing:
 
-- loomux version, UTC timestamp, and **thread name**;
+- loomux version, UTC timestamp, and **thread name**. The version is the
+  argument, not an `env!("CARGO_PKG_VERSION")` inside the hook: `obs` lives in
+  `loomux-engine` since #888 slice A3 batch 7, and that macro names the crate a
+  file is *compiled in*, so reading it there would report the engine's permanent
+  `0.0.0` placeholder instead of the release that crashed. `src-tauri`'s `run()`
+  passes its own, where the macro means what it says;
 - the panic message and source location (`file:line:col`);
 - a backtrace from `std::backtrace::Backtrace::force_capture()` — `force_capture`
   ignores `RUST_BACKTRACE`, so a crash log always carries one.

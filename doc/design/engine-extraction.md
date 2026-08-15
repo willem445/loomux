@@ -596,8 +596,11 @@ from a unit test of product code, agents are banned from running cargo locally
     validation, the `running.lock` sentinel, `LockExt`) is `std` + `dirs` and is
     now `loomux_engine::obs`; `StartupNotice` and the `#[tauri::command]`
     `take_startup_notice` stay, in a `src-tauri/src/obs.rs` that is otherwise a
-    `pub use` of the engine module. All ~45 `crate::obs::…` call sites across
-    eleven files spell what they always did. The re-export is written out item
+    `pub use` of the engine module. The move itself cost no call-site edits at
+    all: every `obs::…` path in `src-tauri` spells what it always did and
+    resolves through the shim. One call site did change, and it belongs to the
+    `env!` fix below rather than to the move — `lib.rs` now passes the app
+    version to `install_panic_hook`. The re-export is written out item
     by item rather than as a glob — what `src-tauri` re-exports should be a list
     somebody chose, not whatever the engine module makes public next.
 

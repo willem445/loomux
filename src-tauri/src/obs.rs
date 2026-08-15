@@ -15,11 +15,16 @@
 //! state cell plus one `#[tauri::command]`. Moving it would have meant the
 //! engine linking Tauri, which is the one thing that crate exists not to do.
 //!
-//! The `pub use` below is why nothing else in `src-tauri` changed: all ~45
-//! `crate::obs::…` call sites across eleven files spell the same paths they
-//! always did. It is written out item by item rather than as a glob so that
+//! The `pub use` below is why the move cost no call-site edits: every
+//! `obs::…` path in this crate spells what it always did and resolves through
+//! this module. It is written out item by item rather than as a glob so that
 //! what this crate re-exports is a list somebody chose, not whatever the engine
 //! module happens to make public next.
+//!
+//! Exactly one call site in `src-tauri` did change, and it is not the move's
+//! doing: `lib.rs` passes `env!("CARGO_PKG_VERSION")` to `install_panic_hook`,
+//! because that macro would otherwise name the engine crate now that the hook
+//! compiles there. See that function's doc comment for the argument.
 
 pub use loomux_engine::obs::{
     breadcrumb, check_and_arm, data_root, install_panic_hook, logs_dir, mark_clean_exit, LockExt,

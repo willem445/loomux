@@ -231,8 +231,10 @@
 //! behind its own `next-launch notice (Tauri surface)` section marker long
 //! before this refactor existed. `StartupNotice` and the `take_startup_notice`
 //! command stay in `src-tauri/src/obs.rs`, which re-exports this module
-//! item-by-item so all ~45 `crate::obs::…` call sites over there resolve
-//! unchanged. Read the general form as **a module's author may have already
+//! item-by-item so every `obs::…` call site over there resolves unchanged —
+//! the move cost no call-site edits at all, and the single one that did change
+//! belongs to the `env!` fix below, not to the move. Read the general form as
+//! **a module's author may have already
 //! drawn the boundary** — worth looking for a section marker before reaching
 //! for a trait, because the alternative here was a bad one: `LockExt` is an
 //! inline extension trait on `std::sync::Mutex` (`m.lock_safe()`), unreachable
