@@ -717,9 +717,9 @@ pub fn pr_comment_deltas(last_seen: &mut HashMap<u64, String>, current: OpenPrLi
         }
         last_seen.insert(pr.number, at.clone());
     }
-    if current.complete {
-        last_seen.retain(|n, _| still_open.contains(n));
-    }
+    // SCRATCH ONLY (#807 red-before-green): the pre-landing behaviour — prune on
+    // absence unconditionally, ignoring completeness. Never merged.
+    last_seen.retain(|n, _| still_open.contains(n));
     signals
 }
 
