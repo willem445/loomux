@@ -71,8 +71,9 @@ dropped:
 
 - **`--edition 2021` is mandatory.** rustfmt's CLI defaults to edition 2015,
   where `async fn` is a hard parse error — without the flag you get
-  confident, wrong `error[E0670]`s on perfectly good code. Both crates are
-  edition 2021 (`src-tauri/Cargo.toml`, `crates/loomux-engine/Cargo.toml`).
+  confident, wrong `error[E0670]`s on perfectly good code. Every crate in the
+  workspace is edition 2021 (`src-tauri/Cargo.toml`,
+  `crates/loomux-engine/Cargo.toml`, `crates/loomux-server/Cargo.toml`).
 - **`>/dev/null` is deliberate — discard stdout, and the redirect is not
   optional.** `--check` prints a *formatting* diff (`Diff in …`) for anything
   not rustfmt-shaped, and this repo is deliberately not rustfmt-formatted:
@@ -277,16 +278,18 @@ to evidence produces no output, and the round is wasted. Split by target:
   one batch at a time, and a file that moved is governed by the next bullet,
   not this one.
 - To redden a **unit test in `crates/loomux-engine/src/`** (e.g.
-  `workflow.rs`), the same move works but the ordering is against you. The
-  observed order of a `cargo test --locked --workspace` run is: `loomux_lib`
-  unit tests → `loomux` bin → **every** `src-tauri/tests/*` integration binary
-  → `loomux_engine` unit tests → doc-tests. So the engine's unit tests are
-  nearly **last**, and a plant that reddens anything in `src-tauri` — lib or
-  integration — stops the run before they execute at all, which means the red
-  says nothing about them. Pick a plant the rest of the suite does not catch,
-  and read the `src-tauri` targets passing in the same run as part of the
+  `workflow.rs`) **or in `crates/loomux-server/src/`**, the same move works but
+  the ordering is against you. The observed order of a `cargo test --locked
+  --workspace` run is: `loomux_lib` unit tests → `loomux` bin → **every**
+  `src-tauri/tests/*` integration binary → `loomux_engine` unit tests →
+  `loomux_server` lib unit tests → `loomux_server` bin unit tests → doc-tests.
+  So the two `crates/` members run **last**, with `loomux-server` last of all,
+  and a plant that reddens anything earlier — `src-tauri` lib, any integration
+  binary, or the engine — stops the run before they execute, which means the
+  red says nothing about them. Pick a plant the rest of the suite does not
+  catch, and read the earlier targets passing in the same run as part of the
   evidence. (Order read off a real green run's log, not inferred: run
-  31842698574 on PR #984. Re-read it rather than trusting this line if cargo's
+  31888299216 on PR #1023. Re-read it rather than trusting this line if cargo's
   scheduling ever looks different.)
 - To redden an **integration test in `src-tauri/tests/`**, neuter the
   **wiring** instead — the call site, or the gate's consumption of the value —
