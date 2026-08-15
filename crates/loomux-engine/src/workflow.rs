@@ -1526,14 +1526,7 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
                     ));
                     continue;
                 };
-                if required != kind {
-                    errs.push(format!(
-                        "blocks[{i}] ({id}): role_hint {hint:?} requires kind: {} (this block is kind: {})",
-                        required.as_str(),
-                        kind.as_str()
-                    ));
-                    continue;
-                }
+                let _ = required;
                 Some(hint)
             }
         };
