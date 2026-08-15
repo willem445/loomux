@@ -22036,9 +22036,9 @@ fn pin_could_not_arm(test: &str, why: &str) {
     );
 }
 
-/// The MSYS form of a path, for baking into a shim fixture. Mirrors
-/// `winpath::to_msys_dir`, which an integration test cannot reach (`winpath` is
-/// a private module); the product's own conversion is pinned by
+/// The MSYS form of a path, for baking into a shim fixture. A separate
+/// implementation from `winpath::to_msys_dir`, not a call to it — the product's
+/// own conversion is pinned independently by
 /// `winpath::tests::msys_dir_rewrites_a_drive_letter_and_leaves_posix_paths_alone`.
 fn msys_dir_for_fixture(p: &std::path::Path) -> String {
     let s = p.to_string_lossy().replace('\\', "/");

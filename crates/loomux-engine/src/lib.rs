@@ -481,6 +481,46 @@
 //! `body_file_path`, `with_body_file`, `open_draft_pr`, `post_comment`,
 //! `land_refusal_text`) stay private.
 //!
+//! A4 batch 13 — [`winpath`] (#78/#335/#509), the fresh-PATH-from-registry
+//! resolver and the `which`-style program/`sh`/coreutils resolution it shares
+//! with "open in editor" and direct-CLI pane spawn. It was planned as
+//! `src-tauri/src/orchestration/winpath.rs`, std-only, "its one import is
+//! std::path" — both wrong. The file lives at `src-tauri/src/winpath.rs` (a
+//! top-level module, never under `orchestration/`), and [`winpath::fresh_path`]
+//! has an inline `use winreg::{RegKey, enums::…}` gated behind
+//! `#[cfg(target_os = "windows")]`, invisible to a top-of-file `use`-line grep.
+//! Worth carrying forward alongside batch 7's `env!` finding: **a cfg-gated
+//! `use` inside a function body is an edge too**, and neither the file's own
+//! header nor its top-level imports show it.
+//!
+//! So this batch takes the dependency rather than splitting the file: `winreg`
+//! is target-gated (`[target.'cfg(windows)'.dependencies]`, mirroring
+//! `src-tauri/Cargo.toml`'s identical section) at the same `0.55` src-tauri
+//! already pins, so no new package joins the lock, and its own dependency
+//! chain is `cfg-if` + `windows-sys` — no `getrandom` by any path (CLAUDE.md
+//! constraint 2 is clear; the manifest carries the audit note). `winpath` is
+//! used throughout `orchestration/mod.rs` (`resolve_program`, `launch_path`,
+//! `resolve_sh`, `resolve_utils_dir`, `to_msys_dir`), so the engine is its
+//! correct home regardless.
+//!
+//! Otherwise a pure relocation: no logic line changed, and every item in
+//! `winpath.rs` was already `pub`. That is not the same claim as "nothing
+//! widened", though, and it is the module's own visibility that moved:
+//! `mod winpath;` in `src-tauri/src/lib.rs` was crate-private, and it becomes
+//! `pub use loomux_engine::winpath;` — a genuine widening, matching the
+//! `pub use loomux_engine::{…};` shape every other whole-module re-export
+//! `src-tauri` already uses for its engine shims (batches 6, 10, 12b) rather
+//! than the plain `use` that would have preserved the old crate-only
+//! privacy. [`winpath`] is
+//! reachable from `src-tauri/tests/`'s external integration-test binary for
+//! the first time as a result. It is the whole module rather than a local
+//! shim file, since nothing Tauri-shaped stays behind to need one the way
+//! `obs` did in batch 7. The 19 inline `#[cfg(test)]` tests moved with the
+//! file and are engine unit tests now. `src-tauri/tests/` carries no
+//! call-site edit — the one change there is a doc comment on
+//! `msys_dir_for_fixture` that had asserted `winpath` was unreachable from an
+//! integration test, which the widening above made false.
+//!
 //! A4 batch 14 — [`sessions`], the **pure discovery core** of
 //! `src-tauri/src/sessions.rs`: where a CLI keeps its session store
 //! ([`sessions::claude_projects_root`], [`sessions::copilot_session_state_root`]
@@ -570,4 +610,5 @@ pub mod sessions;
 pub mod subproc;
 pub mod termgrid;
 pub mod text;
+pub mod winpath;
 pub mod workflow;
