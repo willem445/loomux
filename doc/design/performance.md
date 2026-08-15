@@ -48,8 +48,9 @@ Each is shipped, tested, and citable — prefer copying one to inventing a shape
   `pty.rs` `write_pty` (~L1580) and `change_dir` (~L1685), both #734. `git.rs`
   is the one to copy: it is the largest instance, and the only one whose
   conversion had to give something up — the freeze it removed was also an
-  accidental mutual exclusion, so it carries the worked example of restoring
-  the ordering (`src/gitqueue.ts`) and of the residual left behind (#754).
+  accidental mutual exclusion (INV-7), so it carries the worked example of
+  restoring the ordering (`src/gitqueue.ts`) and of the residual left
+  behind (#754).
   The delegation helper for a NEW conversion is `blocking.rs` `run_blocking`
   (#746, shared by the nine gesture modules); `git.rs`, `gh.rs` and
   `orchestration/mod.rs` keep their own older private copies, which is history,
@@ -188,6 +189,18 @@ scan pins the shape.
   ladder, and any suppression driven by a fallible signal has a release that
   does not depend on that signal. See P4. *Enforced: review* + the pure-module
   unit tests each policy already carries.
+- **INV-7 — A conversion that deletes an exclusion argues it, per command.**
+  P1 removes an accidental mutual exclusion along with the freeze; **P7**
+  carries the shape and the ticket remedy. What this invariant adds is *who
+  owes the argument and where*: it is owed **in code, above each converted
+  command** whose body touches state another command also touches (an index, a
+  file, a remote ref), and it is one of three — something else already
+  serializes it (a lock the body itself takes; #752's per-command
+  `Reentrancy` docs are the worked set), the ordering is restored at the one
+  choke point every caller already passes (`src/gitqueue.ts`, bounded per
+  INV-6), or the body is stateless. Per command, never per module: the
+  stateless argument that carries `gh.rs` (#724) does not carry `git.rs`
+  (#726/#744, residual #754). *Enforced: review.*
 
 ## 4. Argued exceptions
 
