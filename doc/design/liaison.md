@@ -5,11 +5,11 @@ reads the group's board and state to answer "how is it going", presents the
 orchestrator's questions for the human, and relays the human's intent back. It
 holds no orchestration authority of its own.
 
-This note covers the foundation: the `role_hint: liaison` value itself — the
-public `.loomux/workflow.yml` surface it adds — and the one capability rule
-keyed to it. The liaison's prose (its mechanics addendum and the orchestrator's
-`workflow.md` fragment), its lifecycle, and the user-facing documentation are
-separate slices and are **not** described here as though they shipped.
+This note covers the `role_hint: liaison` value itself — the public
+`.loomux/workflow.yml` surface it adds — the one capability rule keyed to it,
+and the prose that makes a declared liaison do anything (**The prose**, below).
+Its lifecycle and the user-facing documentation are separate slices and are
+**not** described here as though they shipped.
 
 ## Why `kind: reviewer`
 
@@ -125,18 +125,77 @@ Keep the last row until the slice that lands it turns it into a shipped one, or
 until it is decided against and the row is deleted. A planned widening that is
 invisible here is exactly the surprise this table exists to prevent.
 
-## What this slice deliberately does not ship
+## The prose
 
-- **No prose.** There is no liaison `mechanics_core` addendum and no
-  `{{LIAISON_NOTE}}` fragment teaching the orchestrator to route questions to
-  it. A liaison block declared today spawns a reviewer-class pane with a
-  reviewer's instructions, a LIAISON badge, and no verdict tool.
-- **No lifecycle work.** Nothing spawns a liaison automatically, and whether a
-  pane that never calls `report` survives the idle reaper is an open question,
-  not an answered one.
-- **No user-docs page.** `docs/` documents what a human operates, and the
-  operable feature is the prose plus the lifecycle, neither of which exists
-  yet. The authoring skill's field table lists the value because that table is
+Nothing about this feature is mechanical. No notice is rerouted, no report
+changes destination, no board write moves — which is what makes the degradation
+argument structural instead of a promise: kill the pane and the group behaves
+byte-for-byte as it did. The feature is therefore two pieces of prose, and the
+reason no goldened role template is touched by either.
+
+**The orchestrator's fragment** — `{{LIAISON_NOTE}}` in `templates/workflow.md`,
+produced in `workflow_section` behind `role_hint_block(blocks, "liaison")`, so a
+group that declares no liaison reads not one word about one. It carries: start
+the pane on the first turn; put questions for the human to it with `send_prompt`
+(INVARIANT 2's hold semantics are untouched — only the pane the question is
+*asked in* moves); let it serve status itself rather than briefing it; never
+forward operational traffic to it; record a directive it relays as a **human**
+directive, while never reading a relay as a grant, because it carries the
+human's words and not their authority; ask the human directly whenever it is not
+alive; and never kill it for looking idle.
+
+**It presents; it is not the record.** The human-question registry (#946) landed
+between this feature's plan and its prose, and the two compose exactly as
+`human-questions.md` says they should: `questions.json` is the durable memory of
+what the human was asked — it survives a compact, a dead pane and a restart —
+while the liaison is a *client* of that record, one of the surfaces that puts a
+pending question in front of a human. `list_questions` is on the shared read
+tier, so the liaison's own pane can read it. The fragment therefore tells the
+orchestrator to keep the durable half durable (the blocked board task, and the
+`q-N` where it opened one) and to settle the row itself —
+`withdraw_question` — when the answer comes back through the liaison instead of
+through an answering surface. Nothing here makes the liaison the holder of a
+question, which is the shape #946 rejected on the grounds that a wedged liaison
+is a deaf fleet.
+
+That last rule is about the **orchestrator's own** kill-idle-panes discipline
+and deliberately claims nothing about loomux's reaper: `idle_reap_candidates`
+takes any non-orchestrator pane past its group's timeout, and whether a liaison
+needs a hint-keyed exemption is the lifecycle slice's open question. What the
+fragment says instead is what to do when the guardrail does fire — start it
+again.
+
+**The liaison's own addendum** — `mechanics_core(Role::Reviewer,
+Some("liaison"))`, in the non-overridable core for the reason the advisor's and
+the process-pro's addenda are: a repo's liaison persona is `mode: replace`-able
+and is exactly the half that can forget to say "you hold no authority". The
+liaison is also the first hint whose class is wrong about its job — it rides
+`reviewer` and reviews nothing — so the addendum says that outright, then
+carries: no orchestration authority (never spawn, merge, release, write the
+board, or record a verdict; you present questions, the human decides), verbatim
+relay with the agent's own commentary kept separate from the quote,
+`note_directive` at the moment of receipt, the duplicate-delivery rule, the
+read-only tools to answer "how is it going" from, and the half of #946's trust
+boundary that lands on this pane in particular — it is the one most likely to be
+handed an answer, and it may present a question but never settle one.
+
+**Where that addendum actually appears** is the same rule as for every other
+hint, and it is worth being exact about: a block's instructions file is the core
+only when a `mode: replace` persona has dropped the built-in body, and Copilot's
+slim system-prompt body always carries it. A liaison block with **no** persona
+therefore reads the built-in `reviewer.md` — the addendum is its floor against a
+persona that forgets, not a substitute for having one. A liaison persona for
+loomux's own workflow file is a separate change.
+
+## What is still not shipped
+
+- **No lifecycle code.** A declared liaison is started because the fragment
+  tells the orchestrator to start one — prose, not machinery — and whether a
+  pane that never calls `report` survives the idle reaper is still an open
+  question, not an answered one. So is the `block_for` skip below.
+- **No user-docs page.** `docs/` documents what a human operates, and what a
+  human operates is not settled until the lifecycle questions above are.
+  The authoring skill's field table lists the value because that table is
   the *parse contract* and a parse contract that omits an accepted value is
   wrong; it deliberately carries no "how to build a liaison" recipe.
 
