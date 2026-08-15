@@ -833,13 +833,13 @@ async function openActionPane(
           pane,
           a.profileId,
           useRecordedSession ? a.sessionId : null,
-          async (argv, sessionId, profileId) => {
+          async (argv, sessionId, profileId, defaultCli) => {
             try {
               await pane.startFromDormant({
                 name: a.name,
                 argv,
                 sessionId: sessionId ?? undefined,
-                ssh: { profileId },
+                ssh: { profileId, defaultCli },
               });
             } catch (err) {
               // Review NB4, the dormant half: `startFromDormant` has already
@@ -1243,7 +1243,12 @@ async function reconnectSshPane(
   pane: Pane,
   profileId: string | null,
   recordedSessionId: string | null,
-  launch: (argv: string[], sessionId: string | null, profileId: string) => Promise<void>
+  launch: (
+    argv: string[],
+    sessionId: string | null,
+    profileId: string,
+    defaultCli: string | null
+  ) => Promise<void>
 ): Promise<RestoreCardResult> {
   return withSubmitLatch(
     sshReconnectLatch(pane),
@@ -1258,7 +1263,12 @@ async function reconnectSshPane(
 async function reconnectSshPaneOnce(
   profileId: string | null,
   recordedSessionId: string | null,
-  launch: (argv: string[], sessionId: string | null, profileId: string) => Promise<void>
+  launch: (
+    argv: string[],
+    sessionId: string | null,
+    profileId: string,
+    defaultCli: string | null
+  ) => Promise<void>
 ): Promise<RestoreCardResult> {
   if (!profileId) return { ok: false, message: SSH_PROFILE_GONE };
   const program = await discoverSsh().catch(() => null);
@@ -1285,7 +1295,10 @@ async function reconnectSshPaneOnce(
     return { ok: false, message: String(err instanceof Error ? err.message : err) };
   }
   try {
-    await launch(plan.argv, plan.sessionId, profile.id);
+    // The profile is in hand right here and nowhere downstream — the pane only records a
+    // profile ID, and resolving it back costs an async store read the header mark cannot
+    // wait for. So the far-end CLI travels with the argv (#992 review B1).
+    await launch(plan.argv, plan.sessionId, profile.id, profile.defaultCli);
   } catch (err) {
     return { ok: false, message: String(err) };
   }
@@ -1674,7 +1687,9 @@ async function handleWelcomeSubmit(
       name: result.name,
       argv: result.argv,
       sessionId: result.sessionId,
-      ssh: { profileId: result.profileId },
+      // `defaultCli` rides along so the pane's header mark can name the agent running on
+      // the far end rather than the ssh client carrying it (#992 review B1).
+      ssh: { profileId: result.profileId, defaultCli: result.defaultCli },
     });
     reapIfExited(ws, pane);
     // Converted in place — no grid open/close fired, so notify explicitly, same
@@ -1961,7 +1976,7 @@ function mountSshReconnectCard(ws: Workspace, pane: Pane, initialError?: string)
   /** One reconnect attempt, in place. `sessionId` null forces the fresh path —
    *  that is the whole of the "Reconnect fresh" escape below. */
   const attempt = (useRecordedSession: boolean): Promise<RestoreCardResult> =>
-    reconnectSshPane(pane, profileId, useRecordedSession ? recordedSessionId : null, async (argv, sessionId, profileId) => {
+    reconnectSshPane(pane, profileId, useRecordedSession ? recordedSessionId : null, async (argv, sessionId, profileId, defaultCli) => {
       try {
         // In place, in the same pane: `respawnFresh` wipes the dead session's
         // output, clears this very card, and starts the new ssh client on the
@@ -1970,7 +1985,7 @@ function mountSshReconnectCard(ws: Workspace, pane: Pane, initialError?: string)
           name: pane.name,
           argv,
           sessionId: sessionId ?? undefined,
-          ssh: { profileId },
+          ssh: { profileId, defaultCli },
         });
       } catch (err) {
         // NB4: the card this click came from is already detached. Put a fresh

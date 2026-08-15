@@ -87,6 +87,7 @@ import {
 import { FileEditView } from "./fileedit";
 import { FileExplorerView } from "./fileexplorer";
 import { icon } from "./icons.ts";
+import { agentMark } from "./agenticons.ts";
 import { WorkflowView } from "./workflowview";
 import { WORKFLOW_FILE } from "./workflowmodel";
 import type { PersistedPane, PersistedPaneKind } from "./tabstore";
@@ -266,8 +267,16 @@ export interface PaneOptions {
    *  Its presence is what suppresses this pane's LOCAL-filesystem affordances,
    *  which is not cosmetic: an SSH pane's shell reports REMOTE paths over OSC 7,
    *  and pointing a local git watch (or a local folder picker's `cd`) at
-   *  `/srv/app` is meaningless at best. See `start()`. */
-  ssh?: { profileId: string };
+   *  `/srv/app` is meaningless at best. See `start()`.
+   *
+   *  `defaultCli` is the profile's far-end CLI (`SshProfile.defaultCli`) — the program
+   *  `sshLaunchParams` actually composed the remote command from, so it is the pane's
+   *  REAL agent while `argv[0]` is only the transport that carries it. Passed here by
+   *  the callers that already hold the profile, because the store read that resolves it
+   *  is async and the header mark is drawn synchronously. Optional and nullable: a
+   *  profile with no default CLI is a plain remote shell, and a caller that cannot cheaply
+   *  supply it degrades to the neutral badge rather than to a wrong one (#992 review B1). */
+  ssh?: { profileId: string; defaultCli?: string | null };
   /** Recorded resumable agent session id (#194): so a restored Agent pane can
    *  `--resume <id>` back into its prior context (resuming into an idle TUI
    *  costs nothing until a prompt is sent). Set by the launcher for
@@ -492,6 +501,10 @@ export class Pane implements VoiceTargetPane {
   name = "shell";
 
   private titleEl: HTMLElement;
+  /** The agent-type mark (#992): which CLI is running in this pane, as a glyph. Sits at
+   *  the head of the header row, before the group role badge, and stays hidden until a
+   *  launch line names a program — a plain shell has no agent type to report. */
+  private agentMarkEl: HTMLElement;
   private termEl: HTMLElement;
   private cwdEl: HTMLElement;
   private cwdTextEl: HTMLElement;
@@ -611,6 +624,10 @@ export class Pane implements VoiceTargetPane {
    *  fact every local-filesystem suppression below reads, so a ninth pane kind
    *  can't be added to one site and forgotten at another. */
   private sshProfileId: string | null = null;
+  /** The far-end CLI of this pane's SSH profile, when a caller supplied it — the pane's
+   *  real agent, which `spawnArgv` (the local ssh client) cannot report. Only the header
+   *  mark reads it (#992). */
+  private sshDefaultCli: string | null = null;
   /** Standalone pane's channel-scoped identity (#271 W3 addendum) — a carrier
    *  DELIBERATELY separate from orchGroup/orchAgent/orchRoleName (those gate
    *  the full orchestration chrome; a plain standalone pane must never show
@@ -788,6 +805,18 @@ export class Pane implements VoiceTargetPane {
 
     const header = document.createElement("div");
     header.className = "pane-header";
+
+    // The agent-type mark (#992). Appended BEFORE the title so that `setBadge`, which
+    // inserts the role chip immediately before the title, lands between the two: the
+    // header reads mark → role → name, i.e. what program, which agent, what it's called.
+    // Pure header chrome — it floats in the header row and never touches the terminal's
+    // geometry, so CLAUDE.md constraint 1 (never resize the PTY for a UI feature) holds
+    // trivially.
+    this.agentMarkEl = document.createElement("span");
+    this.agentMarkEl.className = "pane-cli-icon";
+    this.agentMarkEl.hidden = true;
+    header.appendChild(this.agentMarkEl);
+
     this.titleEl = document.createElement("span");
     this.titleEl.className = "pane-title";
     this.titleEl.title = "Double-click to rename (F2)";
@@ -1238,6 +1267,7 @@ export class Pane implements VoiceTargetPane {
     // pane onto a remote host.
     this.refuseSshOrchestration(opts);
     this.sshProfileId = opts.ssh?.profileId ?? null;
+    this.sshDefaultCli = opts.ssh?.defaultCli ?? null;
     this.setName(opts.name ?? "shell");
     this.launchedCommand = !!opts.command?.trim();
     // Retain the launch inputs for a later capture() into the persisted layout
@@ -1245,6 +1275,7 @@ export class Pane implements VoiceTargetPane {
     this.spawnCommand = opts.command ?? null;
     this.spawnArgv = opts.argv ?? null;
     this.spawnShellKind = opts.shellKind ?? null;
+    this.refreshAgentMark();
     // #440: a caller (the launcher, an orch spawn) that already knows the id
     // wins outright. Otherwise, learn it from the command/argv line itself —
     // a human-typed `claude --resume <id>` / `--session-id <id>` custom
@@ -1656,7 +1687,10 @@ export class Pane implements VoiceTargetPane {
     // pane's EXISTING ssh-ness, not just `opts`, since a promotion's options
     // describe the orchestrator it wants, not the pane it is rewriting.
     this.refuseSshOrchestration(opts);
-    if (opts.ssh) this.sshProfileId = opts.ssh.profileId;
+    if (opts.ssh) {
+      this.sshProfileId = opts.ssh.profileId;
+      this.sshDefaultCli = opts.ssh.defaultCli ?? null;
+    }
     // #887 S4: this pane is coming back to life, so any floating Reconnect card
     // is stale by definition — dropped here rather than at the (several) call
     // sites, so no future relaunch path can forget it and leave a card offering
@@ -1669,6 +1703,10 @@ export class Pane implements VoiceTargetPane {
     this.spawnCommand = opts.command ?? null;
     this.spawnArgv = opts.argv ?? null;
     this.spawnShellKind = opts.shellKind ?? null;
+    // A respawn can change the program outright — a dormant shell Started with a
+    // recorded agent command, or a welcome pane promoted to an orchestrator — so the
+    // mark is re-derived here rather than only at first start.
+    this.refreshAgentMark();
     // Same learn-it-from-the-line fallback as start() (#440) — a fresh respawn
     // (BUG-1 backstop, or a dormant Start with a recorded command) can equally
     // carry a self-naming --resume/--session-id.
@@ -2375,6 +2413,51 @@ export class Pane implements VoiceTargetPane {
     // A docked pane's header is detached, so refresh its dock chip too — else an
     // orchestrator/human rename leaves the chip showing the stale name (#95r).
     this.dockSyncListener?.();
+  }
+
+  /** Draw (or clear) the agent-type mark from this pane's launch line (#992).
+   *
+   *  Reads `spawnCommand`/`spawnArgv` rather than taking an argument, so every path
+   *  that changes what this pane is running — first start, respawn, promotion —
+   *  reports the same answer by calling this after it has set them. The resolver
+   *  returns `null` for a pane with no command, which is how a plain shell ends up
+   *  wearing no mark instead of a neutral one.
+   *
+   *  `innerHTML` is the same injection the header's other glyphs use; what makes it
+   *  safe is on the other side (`src/agenticons.ts` §Safety) — the fallback badge
+   *  clamps the program name to a single `[A-Z0-9]` character, so no part of a launch
+   *  command can be expressed as markup here. The label is set as TEXT (`.title`, and an
+   *  `aria-label` ATTRIBUTE) precisely because that clamp does not apply to it — it is the
+   *  one place a raw program name survives, so it must never reach markup.
+   *
+   *  `sshDefaultCli` is passed as the AUTHORITATIVE answer and `isSshPane` as the flag
+   *  meaning "the launch line is a transport": an SSH pane's `spawnArgv[0]` is the local
+   *  ssh client, not the agent, and reading it captioned panes "Agent CLI: ssh" while they
+   *  ran Claude on the far end (#992 review B1).
+   *
+   *  The wrapper carries `role="img"` + `aria-label` rather than leaving the name in a
+   *  `title` alone: this glyph is the only thing in the header that reports which CLI the
+   *  pane runs, so unlike the app's decorative icons it needs an accessible name. The
+   *  `<svg>` inside stays `aria-hidden` — it is the labelled element's artwork, and
+   *  announcing both would read the name twice. */
+  private refreshAgentMark(): void {
+    const view = agentMark({
+      command: this.spawnCommand,
+      argv: this.spawnArgv,
+      knownCli: this.sshDefaultCli,
+      remote: this.isSshPane,
+    });
+    this.agentMarkEl.hidden = !view;
+    this.agentMarkEl.innerHTML = view?.svg ?? "";
+    if (view) {
+      this.agentMarkEl.title = view.label;
+      this.agentMarkEl.setAttribute("role", "img");
+      this.agentMarkEl.setAttribute("aria-label", view.label);
+    } else {
+      this.agentMarkEl.removeAttribute("title");
+      this.agentMarkEl.removeAttribute("role");
+      this.agentMarkEl.removeAttribute("aria-label");
+    }
   }
 
   /** Mark this pane as part of an orchestration group: role chip before the

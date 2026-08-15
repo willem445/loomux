@@ -206,7 +206,7 @@ refuses.
 | `source` | `--id-amber` | code you edit | source-file rows, the two ways into an editor |
 | `content` | `--id-jade` | data and documents you read | config, markup, images, lockfiles, text |
 | `vcs` | `--id-lime` | the repository's history | the branch chip, the git overlay |
-| `fleet` | `--id-violet` | the agents themselves | group view, fold-group |
+| `fleet` | `--id-violet` | the agents themselves | group view, fold-group, the per-pane agent mark |
 | `board` | `--id-orchid` | the group's work surfaces | tasks, issues, audit, timeline |
 | `danger` | `--id-rose` | destructive actions | delete |
 | `live` | `--id-azure` | capture in progress | push-to-talk |
@@ -243,6 +243,81 @@ and refused: hand-drawing fifty glyphs (the uneven set this replaced is the evid
 font (a webfont, with the flash of the wrong face §Type already rejects), and per-file `.svg`
 assets through Vite (works, but string constants are what every consumer already takes and are
 what keeps the registry node-testable).
+
+### The second tier — brand marks, and the licence that decides whether one exists
+
+One surface asks the registry a question it cannot answer: **which agent CLI is running in
+this pane** (#992). The mark has to be a *brand*, because recognising Copilot is the entire
+value — an abstract glyph loomux invented would say nothing a supervisor could read. That
+puts it outside `src/icons.ts` on two counts, and `src/agenticons.ts` is where it lands.
+
+**Why a second module rather than more rows.** `icon()` pins every body to `ICON_VIEWBOX` —
+Lucide's 24 grid, stroked — and a vendored brand mark arrives on the grid its vendor drew it
+on (`copilot-16` is a filled 16). Rescaling one onto the registry's grid would be exactly the
+"do not restyle" rule above, broken; admitting a second grid into `icon()` would dissolve the
+uniformity that makes a vendored set worth having. Two modules, one grid each, is the honest
+shape.
+
+**It borrows `fleet` rather than minting a hue.** An agent-type glyph is the most literal
+possible member of *"the agents themselves"*, so it wears `.ic-fleet` and the bijection above
+survives untouched — no ninth colour, no ad-hoc override, and the both-directions CSS pin in
+`test/icons.test.ts` covers these marks for free. Hue groups, shape distinguishes, one layer
+up from the file tree: violet says *this is an agent*, the glyph says *which CLI*.
+
+**Two tiers, because a licence is not always available.** A vendored mark needs **two**
+permissions, and only one of them is what an OSS licence talks about:
+
+- **Copyright in the artwork**, which a project can grant over its own glyph. Primer Octicons
+  is MIT, from GitHub, over GitHub's `copilot-16` — granted outright.
+- **Trademark in the mark**, which no OSS licence grants and which is not needed for
+  *nominative* use: drawing the Copilot mark on a pane that is running Copilot is the mark
+  identifying the thing it names. That permission survives only while the artwork is
+  **unmodified** and no affiliation is implied, which is why the vendoring rules here are the
+  strictest in the codebase.
+
+A CLI whose vendor grants neither — Claude and opencode today — therefore gets tier two: a
+**generated letter badge**, a rounded rect around the program's first character. This is a
+refusal, not a gap. A hand-traced lookalike is a derivative of a mark with no grant behind it,
+and a third-party icon aggregator's CC0 covers the aggregator's *tracing*, not the trademark
+it traces; neither is a permission, and shipping one would be the practice #992 was written to
+avoid.
+
+**The fallback is total, and that is the design.** loomux gains CLIs faster than vendors
+publish brand kits, so the resolver never asks *"is this one of ours"* — a fixed roster would
+make the next CLI a user launches the one pane with no mark, which is the pane they most need
+to find. It asks *"does this program have a mark, and if not, what letter is it"*. Adding a
+CLI is a table row when a licensed glyph exists and **no change at all** when it doesn't.
+
+**It refuses to guess, which is the other half.** No launch command resolves to *nothing
+drawn* — a plain shell is not an agent, and a neutral badge on every terminal is noise dressed
+as information. An unreadable program name resolves to `?`, which reads as "loomux does not
+know" and is true. The prior art #992 cites coerced unidentified panes to a default brand and
+had to undo it: a wrong mark is strictly worse than no mark, because a reader takes it as an
+answer.
+
+**The launch line is not always evidence, which is where that principle nearly died.** An
+#887 SSH pane's child process is the local ssh client, so its `argv[0]` is `ssh` — and the
+agent, if any, runs on the far end where argv cannot reach it. Read naively, that produced a
+confident, specific, wrong caption ("Agent CLI: ssh") on panes that were running Claude:
+exactly the failure the paragraph above claims does not happen, arrived at through a route
+nobody had thought to check. Two rules came out of it, and both generalise past SSH:
+
+- **Prefer what loomux already knows over what it can infer.** The pane's SSH profile names
+  the far-end CLI (`defaultCli`), and that is the program the remote command was actually
+  composed from — an authoritative answer sitting one field away from a guessed one. It is
+  threaded to the pane by the callers that hold the profile, because resolving it later
+  costs an async store read the header cannot wait for.
+- **A caption is a claim, so the neutral tier must not carry one.** Where nothing
+  authoritative exists, the mark degrades to `?` labelled *"agent CLI unknown"* — never to
+  the transport's own initial, and never to an "Agent CLI:" caption. The denylist that
+  enforces this is a list of *transports and shells*, never an allowlist of agents: an
+  allowlist would quietly undo the total fallback above.
+
+**The generated tier is a clamp, not an escape.** Its one variable byte comes from a launch
+command — human-typed, or supplied by a workflow file — and the result is injected with
+`innerHTML` in a webview that can reach the IPC bridge. So the badge admits one character and
+only if it is `[A-Z0-9]`, else `?`. Nothing else is expressible, so there is nothing to
+escape, and the rule cannot decay into "we escaped the characters we thought of".
 
 ## Elevation — the model, not a decoration
 
