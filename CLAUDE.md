@@ -271,6 +271,11 @@ narrow their ask back down to the original ticket on your own judgment.
   S2/S3) `` — or the pointer waits for that slice. Present tense beside a
   shipped guarantee in the same construction reads as shipped, and the reader
   who acts on it gets silent green (#750).
+- **A claim about how markdown RENDERS is measured, never read off the
+  source.** Put the text through GitHub's own GFM endpoint before claiming a PR
+  body, issue comment or `docs/` page renders a certain way — `gh api -X POST
+  markdown -f mode=gfm -f text="$(cat file.md)"`. A blank line silently ends a
+  table, and the row you claimed becomes a paragraph of literal pipes (#926).
 - **Historical context lives in design notes, ADRs, and issue/PR history —
   never in user docs, this repo's own agent instruction files
   (`.github/agents/`, `.claude/skills/`, `.loomux/workflow.yml`), or this
