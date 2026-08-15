@@ -787,7 +787,16 @@ pub async fn git_branches(repo: String) -> Result<Vec<BranchInfo>, String> {
 /// rather than a bare `"invalid path"`.
 fn git_discard_sync(repo: String, path: String, untracked: bool) -> Result<(), String> {
     if untracked {
-        let full = crate::fileedit::safe_resolve(&repo, &path)?;
+        // SCRATCH NEUTER (#925 red evidence, do not merge): the pre-fix guard.
+        let rel = Path::new(&path);
+        if rel.is_absolute()
+            || rel
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err("invalid path".to_string());
+        }
+        let full: PathBuf = Path::new(&repo).join(rel);
         std::fs::remove_file(&full).map_err(|e| e.to_string())
     } else {
         run_git(&repo, &["restore", "--", &path]).map(|_| ())
