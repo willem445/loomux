@@ -215,16 +215,30 @@ fn breadcrumb_in(dir: &Path, event: &str, detail: &str) {
 /// Works for panics on *any* thread — the background PTY reader/waiter threads,
 /// the MCP request threads, delivery threads, and the watchers all route
 /// through the process-wide hook, not just the main thread.
-pub fn install_panic_hook() {
+///
+/// `app_version` is the version stamped into every crash log, and it is a
+/// PARAMETER rather than an `env!("CARGO_PKG_VERSION")` down in `record_crash`
+/// because of where this code now lives (#888 slice A3 batch 7). That macro
+/// names the crate a file is *compiled in*, so once `obs` moved into the engine
+/// it would have resolved to this crate's permanent `0.0.0` placeholder — see
+/// the manifest — and every crash log would have quietly stopped naming the
+/// loomux release that crashed, which is the field
+/// `doc/design/crash-observability.md` promises a human reading one. Nothing
+/// about that fails to compile, so the identity is injected at the single
+/// startup entry point instead: `src-tauri/src/lib.rs` passes its own
+/// `env!("CARGO_PKG_VERSION")`, where the macro means what it says.
+pub fn install_panic_hook(app_version: &'static str) {
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         // Never let the hook itself unwind and mask the real panic.
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| write_crash_log(info)));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            write_crash_log(app_version, info)
+        }));
         default(info);
     }));
 }
 
-fn write_crash_log(info: &std::panic::PanicHookInfo<'_>) {
+fn write_crash_log(app_version: &str, info: &std::panic::PanicHookInfo<'_>) {
     let thread = std::thread::current();
     let tname = thread.name().unwrap_or("<unnamed>").to_string();
     let payload = info.payload();
@@ -241,7 +255,7 @@ fn write_crash_log(info: &std::panic::PanicHookInfo<'_>) {
     // backtrace. Frame *symbols* depend on the release profile keeping a
     // symbol table (see the design note); the addresses are always useful.
     let bt = std::backtrace::Backtrace::force_capture().to_string();
-    record_crash(&logs_dir(), &tname, &msg, &loc, &bt);
+    record_crash(&logs_dir(), app_version, &tname, &msg, &loc, &bt);
     breadcrumb(
         "panic",
         &format!("thread={tname} at {}", loc.replace(' ', "_")),
@@ -249,8 +263,17 @@ fn write_crash_log(info: &std::panic::PanicHookInfo<'_>) {
 }
 
 /// Write one crash log. Split from `write_crash_log` so the file format is
-/// testable without a live `PanicHookInfo` (which can't be constructed).
-fn record_crash(dir: &Path, thread: &str, msg: &str, loc: &str, backtrace: &str) {
+/// testable without a live `PanicHookInfo` (which can't be constructed) — and,
+/// since the version arrives as an argument, so the `version:` line is testable
+/// too rather than being whatever crate the test happens to compile in.
+fn record_crash(
+    dir: &Path,
+    app_version: &str,
+    thread: &str,
+    msg: &str,
+    loc: &str,
+    backtrace: &str,
+) {
     let _ = fs::create_dir_all(dir);
     let now = now_ms();
     let path = dir.join(format!("crash-{}.log", stamp(now)));
@@ -262,7 +285,7 @@ fn record_crash(dir: &Path, thread: &str, msg: &str, loc: &str, backtrace: &str)
          panic:   {msg}\n\
          at:      {loc}\n\n\
          backtrace:\n{backtrace}\n",
-        ver = env!("CARGO_PKG_VERSION"),
+        ver = app_version,
         ts = stamp(now),
     );
     // Append rather than truncate: two threads panicking into the same-second
@@ -428,7 +451,14 @@ mod tests {
     #[test]
     fn records_crash_file_with_context() {
         let tmp = tempfile::tempdir().unwrap();
-        record_crash(tmp.path(), "worker-3", "boom", "src/pty.rs:42:9", "0: frame\n1: frame");
+        record_crash(
+            tmp.path(),
+            "9.9.9-test",
+            "worker-3",
+            "boom",
+            "src/pty.rs:42:9",
+            "0: frame\n1: frame",
+        );
         let files: Vec<_> = fs::read_dir(tmp.path())
             .unwrap()
             .flatten()
@@ -437,15 +467,18 @@ mod tests {
             .collect();
         assert_eq!(files.len(), 1, "exactly one crash log written");
         let body = fs::read_to_string(tmp.path().join(&files[0])).unwrap();
-        // The `version:` line must name the loomux RELEASE version — the field
-        // doc/design/crash-observability.md promises a human reading a crash
-        // log. `0.0.0` is this crate's deliberate placeholder version (see the
-        // manifest), so finding it here means the log is naming the crate the
-        // code compiles in rather than the app that crashed.
+        // The `version:` line must be the version the CALLER supplied — the
+        // loomux release, which is the field doc/design/crash-observability.md
+        // promises a human reading a crash log. Pinned against a value no crate
+        // in this workspace carries on purpose: an `env!("CARGO_PKG_VERSION")`
+        // that crept back in would report this crate's `0.0.0` placeholder (or
+        // the app's real version, if it crept back into `src-tauri`), and
+        // either way this assertion is what notices. Nothing else would — that
+        // regression compiles clean and reddens no other test.
         assert!(
-            !body.contains("version: 0.0.0"),
-            "crash log must carry the loomux release version, not the engine \
-             crate's placeholder — got:\n{body}"
+            body.contains("version: 9.9.9-test"),
+            "crash log must carry the version the host passed in, not the \
+             version of whichever crate this code compiles in — got:\n{body}"
         );
         assert!(body.contains("thread:  worker-3"));
         assert!(body.contains("panic:   boom"));
@@ -459,7 +492,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         with_log_dir(tmp.path(), || {
             let prev = std::panic::take_hook();
-            install_panic_hook();
+            install_panic_hook("9.9.9-test");
             // Panic on a *named background* thread — the acceptance criterion.
             let h = std::thread::Builder::new()
                 .name("crash-test-worker".into())
@@ -481,6 +514,12 @@ mod tests {
             let body = fs::read_to_string(&crash).unwrap();
             assert!(body.contains("crash-test-worker"), "captures the thread name");
             assert!(body.contains("synthetic background crash"), "captures the message");
+            // The version the host handed `install_panic_hook` survives the
+            // whole path — closure capture, `catch_unwind`, `write_crash_log`,
+            // `record_crash` — and lands in the file. `records_crash_file_with
+            // _context` pins the format; this pins that the hook is what
+            // carries the value there.
+            assert!(body.contains("version: 9.9.9-test"), "carries the host's app version");
             // The panic also drops a breadcrumb.
             let crumbs = fs::read_to_string(tmp.path().join("breadcrumbs.log")).unwrap();
             assert!(crumbs.contains("panic"));
