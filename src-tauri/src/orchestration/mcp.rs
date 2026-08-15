@@ -484,7 +484,7 @@ fn tool_defs(
             ]);
         }
     }
-    if role == Role::Orchestrator {
+    if role == Role::Orchestrator || (role == Role::Reviewer && role_hint == Some("liaison")) {
         tools.extend([
             tool("spawn_agent",
                 "Open a new worker, reviewer, or planner agent pane in this group. A FRESH SPAWN MUST NAME ITS CAPABILITY CLASS: pass kind (worker | reviewer | planner) or block (a block id from this group's roster). Omitting both is REFUSED — there is no default class (#544). Before that refusal existed, forgetting `kind` handed you the MOST-privileged class: three reviewer-shaped briefs (\"review PR #536\", \"record your verdict\") were spawned as read-write worker panes, with edit tools and git commit/push, and nothing objected. A capability class is only ever acquired deliberately; the only spawn that may omit both is a resume_session, which INHERITS the resumed session's own block (see below) rather than defaulting to anything. Guardrails apply: live-agent cap and per-role pinned CLI + model. Give branch a meaningful name. Empty task spawns an idle agent awaiting prompts. A planner explores the codebase read-only and writes an implementation plan as a GitHub issue comment, then reports and exits. Its read-only contract is enforced structurally where the CLI allows it — it never gets a worktree, and its file-editing tools plus git commit/push are denied at the CLI level — so it cannot edit files or push code; not opening PRs is asked of it in its instructions (gh stays available so it can post the plan comment). WORKTREE DEFAULTS ON FOR WORKERS AND REVIEWERS AND CANNOT BE TURNED OFF (#338/#359): the main clone is the human's environment, and neither a worker (branching/committing there) nor a reviewer (contending on its checkout state with another reviewer or your own fetch/merge traffic — two concurrent reviewers colliding in the shared clone is the incident #359 names) may conflict with it — passing worktree=false for either (or a worker-/reviewer-kind block) is rejected outright, not silently coerced. A reviewer's own worktree is scratch space cut from the default branch, not a checkout of the PR it's reviewing (that branch may already be checked out in the worker's own worktree) — its kickoff note and reviewer.md cover the `gh pr checkout <n> --detach` convention for inspecting the PR's actual code locally. A planner is unaffected: it never gets one under any circumstance. For your OWN mechanical work (rebases, conflict fixes) that would otherwise mean checking out a branch in the main clone, use a staging worktree of your own instead of spawning a worker or reviewer just to get one. THE SAME GUARANTEE COVERS A FRESH SPAWN'S cwd, not just worktree: passing cwd on a worker or reviewer spawn with no resume_session is rejected too (it would override the worktree exactly like worktree=false would) — cwd only has a role once resume_session is set; a planner still honors an explicit cwd on a fresh spawn, unchanged. For a FOLLOW-UP on a finished task, pass resume_session (from list_agents/the task board) plus cwd (where that work happened) — the pane reopens that conversation with its context instead of cold-starting, and the worktree default/guard above does not apply (the resume's cwd is what governs its workspace). cwd is optional on a resume: omit it and loomux INHERITS the session's recorded workspace from this group's roster (the same last-touched-record lookup the block inheritance below uses) rather than guessing — but if nothing is recorded for that session AND the resumed agent is a worker or reviewer, the spawn is a hard error rather than a silent fall-back into the main clone (#338/#359 again: neither's workspace is ever the human's own checkout). A planner is unaffected by that guard; pass cwd explicitly whenever you have it, which you almost always will. A resume with no kind/block INHERITS the resumed session's original block (and therefore its persona, model and capability class) from this group's roster — it never re-derives a default from `kind`, so a reviewer resumed bare comes back a reviewer, not a worker. An unrecognized session id with no block is a hard error, never a silent worker spawn. To deliberately re-role a resumed session into a different capability class, pass `block` explicitly — same as any other spawn, and audited the same way (the agent-spawn record always carries block + session + resume).",
@@ -660,7 +660,7 @@ fn tool_defs(
     //
     // `call_tool`'s `group_usage` arm re-checks the same conjunction and is the
     // real gate; this listing is cosmetic, as everywhere else on this surface.
-    if role_hint == Some("liaison") {
+    if role == Role::Reviewer && role_hint == Some("liaison") {
         tools.push(group_usage_tool());
     }
     // `process`-hinted worker blocks only (#250/#324 slice D binding rider):
@@ -712,7 +712,8 @@ fn require_orchestrator(caller: &Caller) -> Result<(), String> {
 /// `idle_reap_candidates` make. Nothing an agent can put in a tool argument, a
 /// pane title, or its own prompt reaches this decision.
 fn require_orchestrator_or_liaison(caller: &Caller) -> Result<(), String> {
-    let liaison = caller.role_hint.as_deref() == Some("liaison");
+    let liaison =
+        caller.role == Role::Reviewer && caller.role_hint.as_deref() == Some("liaison");
     if caller.role == Role::Orchestrator || liaison {
         Ok(())
     } else {
