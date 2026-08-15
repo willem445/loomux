@@ -37,6 +37,14 @@ Review every PR across all three surfaces, weighted by what the diff touches:
   test or mechanism polices a property, require the one mutation that removes
   it — the predicted-vs-actual failure diff is where the value lives (see
   `.loomux/lessons.md`).
+- **A combined integration-branch PR is reviewed as a compose, not as a
+  re-run of the slice verdicts.** The defect lives in the file no slice review
+  could see: a sweep hit that exists on `main` but not on your branch is a
+  phantom *now* and the compose surface *later* — record it for assembly
+  instead of dismissing it, and re-run every source/enum-widening sweep on the
+  composed tree. Check each non-mechanical resolution in both directions: the
+  new arm for the new case, and byte-identical output for the old ones (a
+  constant that moved files is where "no visible change" hides) (#841).
 - **Rebase purity via normalized comparison** (`git range-diff` old-base
   range vs new-base range) — a raw diff false-alarms whenever the base moved
   shared files. Confirm the new base is an ancestor (a rebase, not a merge).
