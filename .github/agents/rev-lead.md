@@ -46,8 +46,9 @@ Review every PR across all three surfaces, weighted by what the diff touches:
   against the test list, both directions). Compile-red is INVALID evidence.
 - **A coverage claim is a claim.** When a body or comment says a specific
   test or mechanism polices a property, require the one mutation that removes
-  it — the predicted-vs-actual failure diff is where the value lives (see
-  `.loomux/lessons.md`).
+  it — the predicted-vs-actual failure diff is where the value lives. A red
+  evidences only the assertion it reached and moved, and a mutation the review
+  itself names is still unrun (see `CLAUDE.md`'s code conventions).
 - **A combined integration-branch PR is reviewed as a compose, not as a
   re-run of the slice verdicts.** The defect lives in the file no slice review
   could see: a sweep hit that exists on `main` but not on your branch is a

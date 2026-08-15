@@ -190,6 +190,24 @@ compiles.
 - Comments in this codebase explain *why* (design constraints, Windows quirks,
   issue numbers) — keep that density and style.
 - Write tests that test intent, not implementation echoes.
+- **A coverage claim is a claim.** When a PR body or comment says a test or mechanism
+  polices a property, run the one mutation that removes it and watch WHICH tests
+  redden — a match is evidence, a mismatch is a correction; disclose it (#664, #673,
+  #682). A red evidences only the assertion it REACHED and MOVED: a panic before it,
+  a split test's already-green half, or a companion that also passed broken prove
+  nothing — split the test, or say which half moved (#710, #712, #727). A mutation a
+  *reviewer* names is still unrun; run it before quoting it into the body, which
+  becomes the squash message (#868).
+- **A test's specimen must stay a member of the class it witnesses.** When a directive
+  moves a real specimen out of that class (a declared value converging with the
+  default, a file gaining its "absent" block, a concrete list going stale), relocate
+  the property onto a witness that still distinguishes — never relax the assertion to
+  fit today's specimen. If the converged case still deserves coverage, give it its own
+  strictly-weaker, explicitly-labelled assertion (#689). The same drift bites outside
+  tests: a hand-derived value a claim rests on (a line cite, a count) is valid only at
+  the commit it was derived on, and your own next commit invalidates it as silently as
+  a rebase. Cite a SYMBOL (#763); a position that must be recorded is swept in the
+  LAST commit touching its source (#752).
 - **A per-CLI identity string is read off the source, never branched on it.**
   `source === "claude" ? "claude" : "copilot"` is right only while there are
   exactly two CLIs; a third silently inherits the else-branch and the pane
