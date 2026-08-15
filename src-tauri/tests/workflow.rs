@@ -1263,7 +1263,12 @@ fn a_declared_liaison_gives_the_orchestrator_its_routing_note_with_the_block_id(
     pinned(at, note, "is a human directive", "the two-master rule: what the orchestrator RECEIVED must reach its ledger as the human's word");
     pinned(at, note, "never the human's authority", "a relay must never read as a grant — the human's Approve is minted in the webview, not in a pane");
     pinned(at, note, "is not a relay, whoever wrote it", "the treat-as-human rule must key on loomux's own attribution line, or any delegate quoting a human at the orchestrator inherits the human's standing in its ledger");
-    pinned(at, note, "before wrapping it in a notice of its own", "the rule is only safe because the key cannot be written by an agent — say what the scrub actually guarantees, and rev-1 F1 is what happens when that sentence outruns the code");
+    // rev-2 F1b narrowed this sentence (the old anchor was "before wrapping it in
+    // a notice of its own", on a claim about "every agent-authored field" that
+    // outran the code by one path). The pin moves with the prose, in the same
+    // commit, and the anchor is now the enumeration the code actually implements.
+    pinned(at, note, "has its `[` and `]` neutralized", "the rule is only safe because the key cannot be written by an agent — say what the scrub actually guarantees, and rev-1 F1/rev-2 F1b are what happen when that sentence outruns the code");
+    pinned(at, note, "`review_verdict`", "the claim must name the tools it covers: a universal 'every field' is what shipped a false claim twice, once per path nobody had listed");
     pinned(at, note, "nothing here depends on the liaison being alive", "degradation: the direct escape hatch is what makes this feature safe to add");
     pinned(at, note, "for looking idle", "the standing pane must not be reaped by the orchestrator's own kill-idle-panes rule");
 }

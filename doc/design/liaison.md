@@ -147,15 +147,30 @@ alive; and never kill it for looking idle.
 **The rule that a relayed directive counts as the human's is keyed on the one
 line an agent cannot write.** loomux mints the `[loomux] message from <id>:`
 prefix from the caller's own token; the agent supplies what follows. That half
-used to be interpolated raw, which made the key forgeable by any delegate — so
-this slice also scrubs the agent-authored fields of `report` and
-`message_orchestrator` with `notify::sanitize_gh_text` before the prefix goes
-on, exactly as `channel_send` always has (`orchestration.md`, *#576: loomux's
-own notices are not questions*, carries the mechanism). The prose says only what
-that scrub delivers: a delegate's text cannot carry a `[loomux] …` span, so it
-cannot be read as a relay it is not. What no scrub can decide is who *dictated*
-words a liaison genuinely relays — that residual is the fidelity problem the
-verbatim rule and the two ledgers address, not a trust-boundary one.
+was interpolated raw, which made the key forgeable by any delegate — so this
+slice scrubs it at **every tool a delegate can call to put text in the
+orchestrator's pane**: `report` (both shapes, and `ref`/`detail_url` as well as
+the note), `message_orchestrator`, and `review_verdict`'s summary. The
+mechanism is `notify::sanitize_pane_text`, the function `sanitize_gh_text` has
+always been, and `channel_send` has always used it (`orchestration.md`, *#576:
+loomux's own notices are not questions*, carries the enumeration).
+
+The claim is scoped to what that buys and no further: a **delegate's** text
+reaches the pane carrying no `[loomux] …` span of its own, so it cannot be read
+as a relay it is not. Two things it deliberately does not claim. Text the
+*orchestrator* dictates to a delegate is still that delegate's call to make —
+the proxy-authorship residual `deliver_relayed_to_orchestrator` already argues,
+and unrelated to attribution. And no scrub can decide who *dictated* words a
+liaison genuinely relays; that is the fidelity problem the verbatim rule and
+the two ledgers address, not a trust-boundary one.
+
+**Why the sweep is a test rather than a promise.** The first fix here closed
+three fields and left a fourth — `review_verdict`'s summary — because it was
+written from the list of paths someone had thought of. What replaced that is a
+test that drives *every tool the delegate's own `tools/list` offers*, with a
+forged span in every string argument, plus a default-deny source scan over the
+notices `mcp.rs` composes. A new field is then a red on the day it is written,
+not a finding on the round after.
 
 **It presents; it is not the record.** The human-question registry (#946) landed
 between this feature's plan and its prose, and the two compose exactly as
