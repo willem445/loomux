@@ -239,11 +239,9 @@ impl Memo {
         program: &str,
         run: impl Fn(&str, &str, Option<&str>) -> Result<String, String>,
     ) -> CliModelReply {
-        let reply = ask_with(program, run);
-        if worth_keeping(&reply) {
-            self.kept.lock().unwrap().insert(program.to_string(), reply.clone());
-        }
-        reply
+        // RED-BEFORE-GREEN MUTATION D (#1020): the store removed, so the sweep's
+        // answer never reaches the lookup.
+        ask_with(program, run)
     }
 
     /// What is known about `program` right now. Never spawns, never blocks on
@@ -316,8 +314,10 @@ fn sweep_with(
         if protocol_for(cli).is_none() {
             continue;
         }
-        let reply = ask(cli);
-        emit(ModelsDetected { program: cli.to_string(), reply });
+        // RED-BEFORE-GREEN MUTATION E (#1020): the emit removed, so nothing the
+        // sweep learns ever reaches a form that is already open.
+        let _reply = ask(cli);
+        let _ = &emit;
     }
 }
 
