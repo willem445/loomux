@@ -83,6 +83,13 @@ and its removal is a separate, reviewable change — but nothing calls it, and
 **deleting it is the obvious follow-up** now that the routing is settled. It is
 named here so the next reader does not "restore" it as a simplification.
 
+`parseGrow` is in exactly the same position and belongs in the same follow-up:
+`grid.ts` reads the row's weights with `paneequalize.readGrow` — one reader for
+both policies, since the two functions are byte-for-byte the same repair — so
+`parseGrow` now has no production caller either, only `test/splitfloor.test.ts`.
+Both are named here together so the next reader deletes the whole dead surface
+rather than half of it, leaving the other half looking deliberate.
+
 ### Where the clamp sits, and why `halve` is not under it
 
 #954 added a magnitude clamp: `paneequalize` re-bases a row whose largest

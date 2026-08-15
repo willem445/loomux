@@ -168,8 +168,26 @@ test("splitting a pane in a 3-wide row halves that pane and leaves its siblings'
     "the split pane and the newcomer should be the same size"
   ).toBeLessThan(SHARE_EPSILON);
 
+  // The measured vertical drift, reported on every run rather than only when
+  // it breaks a bound: VERTICAL_JITTER_PX is calibrated from these numbers, and
+  // the next person to re-calibrate it (after the next chrome change) should
+  // not have to make a spec fail first to find out what it is.
+  console.log(
+    `[pane-split] vertical drift after the split — ` +
+      `B dy ${(after.b!.y - before.b!.y).toFixed(3)} dh ${(after.b!.height - before.b!.height).toFixed(3)}, ` +
+      `C dy ${(after.c!.y - before.c!.y).toFixed(3)} dh ${(after.c!.height - before.c!.height).toFixed(3)}, ` +
+      `A dy ${(after.a!.y - before.a!.y).toFixed(3)} dh ${(after.a!.height - before.a!.height).toFixed(3)} ` +
+      `(budget ${VERTICAL_JITTER_PX}px)`
+  );
+
   // 2. Nobody else's SHARE of the row moved — the exact property `halve`
   //    guarantees, and the one a re-share of the row cannot satisfy.
+  //
+  //    Pane A — the split TARGET — is in this loop for its VERTICAL geometry
+  //    only (rev-lead N3): its width is supposed to halve, but a same-direction
+  //    row split must not move it vertically either, and a regression that
+  //    nested A into a column would otherwise leave every assertion here green.
+  //    Its share is asserted separately above.
   for (const [name, was, now] of [
     ["Pane B", before.b!, after.b!],
     ["Pane C", before.c!, after.c!],
@@ -221,6 +239,22 @@ test("splitting a pane in a 3-wide row halves that pane and leaves its siblings'
       `${name} resized further than one divider's worth`
     ).toBeLessThanOrEqual(MOVE_BUDGET_PX);
   }
+
+  // 4. The split TARGET's vertical geometry (rev-lead N3). A's width is meant
+  //    to halve, so it is not in the loop above — but a same-direction row
+  //    split must leave it in the same row, at the same height as its
+  //    siblings. A regression that nested A into a column instead of inserting
+  //    a flat sibling would satisfy every assertion above (B and C would keep
+  //    their shares and their row) and be caught only here.
+  expect(after.a!.y, "the split target left its row vertically").toBeCloseTo(after.b!.y, 0);
+  expect(
+    after.a!.height,
+    "the split target's height stopped matching its row — nested, not split flat"
+  ).toBeCloseTo(after.b!.height, 0);
+  expect(
+    Math.abs(after.a!.y - before.a!.y),
+    "the split target moved vertically by more than the grid's own sub-pixel jitter"
+  ).toBeLessThanOrEqual(VERTICAL_JITTER_PX);
 });
 
 test("a pane rejoining the grid from the dock comes back at a fair slice, not as the runt of the row", async ({
@@ -237,6 +271,24 @@ test("a pane rejoining the grid from the dock comes back at a fair slice, not as
   // agent CLI — the multi-agent fan-out, the other one, is off limits to tests
   // by CLAUDE.md constraint 3, and no bounding box would be worth a paid
   // agent run anyway.
+  //
+  // WHY THIS SPEC PROVES ITS OWN DISCRIMINATING POWER BEFORE IT ASSERTS
+  // ANYTHING (rev-lead B1). The two policies coincide EXACTLY when the row's
+  // total weight is 1: `planEvenInsert` gives the newcomer `total/n`, the
+  // unrouted branch gives `1/n`. So a spec that lands on a total-1 row asserts
+  // something both policies satisfy and silently proves nothing — and no
+  // measurement it takes can tell you that has happened. The row this builds
+  // has a total of 2 today (the FIRST split is cross-direction, and that path
+  // resets both children to `1 1 0` — grid.ts's cross-direction branch), so it
+  // does discriminate; but that is an incidental property of a code path this
+  // spec never mentions, which is exactly the kind of thing a later change
+  // breaks silently.
+  //
+  // So the spec no longer depends on that derivation being right. It takes a
+  // SECOND dock/restore cycle (which moves the total further off 1), reads the
+  // row's actual flex weights out of the DOM, computes what each policy would
+  // put the restored pane at, and FAILS if those two predictions are too close
+  // to tell apart. The discriminating power is asserted, not assumed.
   await createTerminalPane(page, { name: "Pane A" });
   await page.locator("#btn-split-right").click();
   await createTerminalPane(page, { name: "Pane B" });
@@ -255,12 +307,53 @@ test("a pane rejoining the grid from the dock comes back at a fair slice, not as
   expect(rowBefore.a!.y, "A and B should share a row").toBeCloseTo(rowBefore.b!.y, 0);
   expect(rowBefore.b!.y, "B and C should share a row").toBeCloseTo(rowBefore.c!.y, 0);
 
-  // Park C in the dock, then bring it back by clicking its chip.
+  /** Park C in the dock and bring it straight back — one `share` insert. */
+  const dockAndRestore = async (): Promise<void> => {
+    await paneC.locator('button.pane-btn[title="Minimize to dock (Alt+M)"]').click();
+    const chip = page.locator(".dock-chip", { hasText: "Pane C" });
+    await expect(chip).toHaveCount(1);
+    await expect(paneC).toHaveCount(0);
+    await chip.click();
+    await expect(paneC).toBeVisible();
+  };
+
+  // Cycle 1 — moves the row's total off whatever the split policy left it at.
+  await dockAndRestore();
+
+  // Park C again, and read the row as the planner will see it: the live
+  // `flex-grow` of every pane still in the row. This is the one place the spec
+  // looks at weights rather than pixels, and it is what lets it check its own
+  // discriminating power.
   await paneC.locator('button.pane-btn[title="Minimize to dock (Alt+M)"]').click();
-  const chip = page.locator(".dock-chip", { hasText: "Pane C" });
-  await expect(chip).toHaveCount(1);
   await expect(paneC).toHaveCount(0);
-  await chip.click();
+  const grows = await page
+    .locator(".pane")
+    .evaluateAll((els) => els.map((el) => parseFloat((el as HTMLElement).style.flexGrow || "1")));
+  const rowTotal = grows.reduce((a, b) => a + b, 0);
+  const n = grows.length;
+
+  // What each policy would give the returning pane, as a share of the row it
+  // creates: `planEvenInsert` inserts the mean (total/n), the unrouted branch
+  // inserts 1/n, and both land in a row whose total grows by that amount.
+  const routedShare = rowTotal / n / (rowTotal + rowTotal / n);
+  const unroutedShare = 1 / n / (rowTotal + 1 / n);
+
+  // THE ANTI-VACUITY GUARD. If the two predictions are within noise of each
+  // other, every assertion below passes under either policy and this spec is
+  // decoration. That happens exactly at rowTotal === 1, and it is a real
+  // possibility — a different split policy, or a change to the cross-direction
+  // branch's `1 1 0` reset, gets there without touching this file.
+  expect(
+    Math.abs(routedShare - unroutedShare),
+    `the two share policies would both put the restored pane at ~${routedShare.toFixed(4)} of ` +
+      `this row (total ${rowTotal}, ${n} panes), so this spec cannot tell them apart — ` +
+      `rebuild the layout so the row's total is not 1`
+  ).toBeGreaterThan(0.05);
+
+  // Cycle 2 — the one that is measured.
+  const chip2 = page.locator(".dock-chip", { hasText: "Pane C" });
+  await expect(chip2).toHaveCount(1);
+  await chip2.click();
   await expect(paneC).toBeVisible();
 
   const after = {
@@ -275,22 +368,22 @@ test("a pane rejoining the grid from the dock comes back at a fair slice, not as
   const restored = shareOf(after.c!.width, widths);
   const siblings = [shareOf(after.a!.width, widths), shareOf(after.b!.width, widths)];
 
-  // The intent, phrased so it holds for any even-matrix policy and fails for
-  // the 1/N-on-top one: a pane rejoining a row it used to be part of must not
-  // come back smaller than the pane that was already smallest. Under the
-  // routed policy it lands on the row's mean (~1/3 of this row against a
-  // smallest sibling of ~1/4); under 1/N-on-top it lands at ~1/5 against a
-  // smallest sibling of ~3/10, i.e. as the runt — an 8-point margin one way
-  // and a 10-point margin the other.
+  // 1. The routed policy's actual guarantee, which is sharper than "not the
+  //    runt": a pane inserted at the row's MEAN comes back holding exactly
+  //    1/(n+1) of the row — an equal share — whatever the row's total or skew.
+  //    The unrouted branch cannot satisfy this off a total-1 row, and the
+  //    guard above has already established that this row is not one.
   expect(
     restored,
-    `the restored pane came back at ${restored} of the row, under its smallest sibling ${Math.min(
-      ...siblings
-    )} — the share arm is not the even-matrix one`
-  ).toBeGreaterThan(Math.min(...siblings) + SHARE_EPSILON);
+    `the restored pane holds ${restored.toFixed(4)} of the row; the routed policy predicts ` +
+      `${routedShare.toFixed(4)} and the unrouted 1/N branch predicts ${unroutedShare.toFixed(4)}`
+  ).toBeCloseTo(routedShare, 2);
 
-  // And it is a usable pane, not a sliver. 0.25 rather than the 1/N policy's
-  // exact 0.2, so this is a bound with margin on both sides (the routed policy
-  // lands at ~0.333) rather than an assertion sitting on the wrong answer.
-  expect(restored, `the restored pane is a sliver at ${restored} of the row`).toBeGreaterThan(0.25);
+  // 2. And the plain-language version, which is what a human notices: it did
+  //    not come back as the smallest pane in the row.
+  expect(
+    restored,
+    `the restored pane came back at ${restored.toFixed(4)} of the row, under its smallest ` +
+      `sibling ${Math.min(...siblings).toFixed(4)} — the share arm is not the even-matrix one`
+  ).toBeGreaterThan(Math.min(...siblings) + SHARE_EPSILON);
 });

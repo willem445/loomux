@@ -204,7 +204,17 @@ test("grid.ts routes `share` through paneequalize and never through splitfloor's
   // or a call reformatted across lines in a way the pattern misses would evade
   // it. It catches the realistic regression — someone "simplifying" the
   // ternary to one planner — not a determined rewrite.
-  const src = readFileSync(fileURLToPath(new URL("../src/grid.ts", import.meta.url)), "utf8");
+  //
+  // COMMENTS ARE STRIPPED FIRST (rev-lead N1). Without that, the two positive
+  // assertions below can be satisfied by prose: grid.ts's own module header
+  // discusses `planEvenInsert` and the policy check by name, so a scan of the
+  // raw text would stay green after the real call site was deleted. Only
+  // executable text is searched, which is what the assertions are about.
+  const raw = readFileSync(fileURLToPath(new URL("../src/grid.ts", import.meta.url)), "utf8");
+  const src = raw
+    .replace(/\/\*[\s\S]*?\*\//g, "") // block and JSDoc comments
+    .replace(/^\s*\/\/.*$/gm, "") // whole-line // comments
+    .replace(/\s\/\/.*$/gm, ""); // trailing // comments
 
   const calls = [...src.matchAll(/planRowSplit\(([\s\S]*?)\)/g)];
   assert.ok(calls.length > 0, "grid.ts should still plan the halve arm through splitfloor");
