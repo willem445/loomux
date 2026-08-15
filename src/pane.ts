@@ -23,6 +23,7 @@ import {
   detachGitWatch,
   ptyBackendInfo,
 } from "./pty";
+import { admitRoot } from "./fileapi";
 import { voiceController, type VoiceTargetPane, type VoicePhase } from "./voicecontrol";
 import { pathTail, sshOrchestrationRefusal, type ShellKind } from "./panesetup";
 import { FONT, TERM_METRICS, TERMINAL_THEME } from "./theme";
@@ -2716,6 +2717,42 @@ export class Pane implements VoiceTargetPane {
     return true;
   }
 
+  /** #1042: declare this pane's live cwd as a root, because a HUMAN just asked
+   *  for a view at it.
+   *
+   *  This is the one place the distinction the whole design rests on becomes
+   *  code. The cwd itself arrived on an agent-controllable channel — the pane's
+   *  OSC-7 report, emitted by whatever process is running in it — and that
+   *  stream is resolve-only: it never declares anything, which is why an agent
+   *  that `cd`s to `~/.ssh` gets a quiet folder chip rather than a rooted file
+   *  browser. A human clicking the branch chip, or pressing Alt+G, is not that
+   *  stream. It is the trusted local webview acting on a human gesture, and it
+   *  declares.
+   *
+   *  Normally there is nothing new to declare: a pane's spawn cwd was declared
+   *  by the launcher (or by restore), and the descendant rule already covers
+   *  everything the shell `cd`s into below it. This matters exactly when the cwd
+   *  has left every declared root — which is the case the gesture is for.
+   *
+   *  Fire-and-forget, and slice C owes it one look. The declaration is *issued*
+   *  before the view is even constructed, but two Tauri commands in flight are
+   *  not ordered against each other, so once slice C root-scopes the view's own
+   *  reads there is a race here in principle. Bounded rather than ignored: every
+   *  one of these views re-reads on its own (a shell prompt, an external git
+   *  change, a manual ↻), so losing that race costs one empty render, not the
+   *  feature. If slice C wants it airtight, these gestures become `async` and
+   *  await this — a change this helper is shaped to make one line.
+   *
+   *  Never for an SSH pane: its cwd names a directory on the REMOTE machine, and
+   *  declaring that string here would declare whatever happens to sit at the
+   *  same path locally. `onCwdReported` already refuses to act on an SSH pane's
+   *  report for the same reason; this is the belt on that suspender. */
+  private declareCwdForGesture(): void {
+    if (this.isSshPane) return;
+    const cwd = this.cwdRaw;
+    if (cwd) void admitRoot(cwd);
+  }
+
   /** Toggle the git view. It FLOATS over the top of the terminal — the
    *  terminal keeps its full size and PTY dimensions, so toggling never
    *  triggers a resize repaint (which would push duplicate TUI frames into
@@ -2729,6 +2766,7 @@ export class Pane implements VoiceTargetPane {
       return;
     }
     if (this.refuseOverlay("The git view")) return;
+    this.declareCwdForGesture();
     this.ensureGitView();
     this.toggleView("git");
   }
@@ -2954,6 +2992,7 @@ export class Pane implements VoiceTargetPane {
    *  the PTY; only one overlay is open at a time. */
   toggleIssuesView(): void {
     if (this.refuseOverlay("The issues view")) return;
+    this.declareCwdForGesture();
     this.ensureIssuesView();
     this.toggleView("issues");
   }
@@ -3623,6 +3662,7 @@ export class Pane implements VoiceTargetPane {
       return;
     }
     if (this.refuseOverlay("The file editor")) return;
+    this.declareCwdForGesture();
     this.ensureFileEditView();
     this.toggleView("editor");
   }
@@ -4001,6 +4041,9 @@ export class Pane implements VoiceTargetPane {
       defaultPath: this.cwdRaw ?? undefined,
     });
     if (typeof picked === "string" && this.ptyId !== null) {
+      // #1042: a human chose this folder in a native dialog the backend never
+      // sees, and `change_dir` takes it as a root argument (slice C scopes it).
+      await admitRoot(picked);
       await changeDir(this.ptyId, picked);
       this.focus(); // return focus to the terminal after the dialog
     }

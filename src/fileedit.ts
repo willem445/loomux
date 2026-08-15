@@ -20,6 +20,7 @@ import {
   ftFilesStart,
   onFilesBatch,
   ftReplace,
+  admitRoot,
   errorCode,
   errorMessage,
   type SearchOpts,
@@ -524,6 +525,10 @@ export class FileEditView {
   private async pickRoot(): Promise<void> {
     const picked = await pickDirectory({ title: "Browse folder", defaultPath: this.root ?? undefined });
     if (typeof picked !== "string" || picked === this.root) return;
+    // #1042: a human chose this folder in a native dialog the backend never sees
+    // (`pickDirectory` is a display-side seam member), so the trusted webview
+    // declares it before anything reads under it.
+    await admitRoot(picked);
 
     // A RE-ROOT ABANDONS THE OPEN FILE, and it must say so out loud.
     //

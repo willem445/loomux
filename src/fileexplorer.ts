@@ -78,6 +78,7 @@ import {
   onFilesBatch,
   ftSearchCancel,
   nextSearchId,
+  admitRoot,
   errorCode,
   errorMessage,
   type FilesBatch,
@@ -425,6 +426,10 @@ export class FileExplorerView {
       defaultPath: this.host.getRoot(),
     });
     if (typeof picked !== "string") return;
+    // #1042: a human chose this folder in a native dialog the backend never sees
+    // (`pickDirectory` is a display-side seam member), so the trusted webview
+    // declares it before the first listing under it.
+    await admitRoot(picked);
     this.host.onRootChanged?.(picked);
     this.invalidateIndex();
     await this.navigate("");
