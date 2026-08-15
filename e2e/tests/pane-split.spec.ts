@@ -45,6 +45,17 @@ const DIVIDER_FOOTPRINT_PX = 4;
 const ROUNDING_PX = 1;
 const MOVE_BUDGET_PX = DIVIDER_FOOTPRINT_PX + ROUNDING_PX;
 
+/** How far a pane's absolute vertical geometry may move during a same-direction
+ *  ROW split. In this module's own arithmetic the answer is zero — a row split
+ *  cannot touch heights — but the number measured against the viewport also
+ *  carries the chrome above the grid, and on this base adding a pane nudges the
+ *  whole grid by a fraction of a pixel (0.55px and 0.84px on two CI attempts).
+ *  Two device pixels is comfortably above that and three orders of magnitude
+ *  below a real vertical re-flow, which is what these two bounds exist to
+ *  catch. The property itself — B does not move WITHIN its row — is asserted
+ *  exactly, relative to the row's own top edge. */
+const VERTICAL_JITTER_PX = 2;
+
 /** How far a pane's SHARE of the row may drift, as a fraction of the row.
  *  Zero in exact arithmetic — `halve` leaves both the sibling's weight and
  *  the row's total untouched — so this is pure measurement rounding. For
@@ -169,10 +180,38 @@ test("splitting a pane in a 3-wide row halves that pane and leaves its siblings'
     );
 
     // 3. And in plain pixels, what a human would see: nothing beyond the new
-    //    divider's own footprint. Vertical geometry is exact — a
-    //    same-direction split in a row cannot touch heights at all.
-    expect(now.y, `${name} moved vertically`).toBeCloseTo(was.y, 0);
-    expect(now.height, `${name} changed height`).toBeCloseTo(was.height, 0);
+    //    divider's own footprint.
+    //
+    //    Vertically, measured WITHIN THE ROW rather than against the viewport.
+    //    A same-direction split in a row cannot touch heights, and that is
+    //    still what is asserted — but a pane's absolute `y` also carries
+    //    whatever the chrome above the grid is doing, and on this base adding
+    //    a pane nudges the whole grid down by a fraction of a pixel (0.55px
+    //    and 0.84px on two CI attempts, against a 0.5px bound). That is not
+    //    this spec's property: it happens to every pane at once, including the
+    //    one being split, so comparing B's top edge to the ROW's top edge
+    //    isolates the claim instead of coupling it to the top bar's height.
+    //    See the PR body — the jitter itself is reported separately, not
+    //    silently absorbed here.
+    const rowTopBefore = before.a!.y;
+    const rowTopAfter = after.a!.y;
+    expect(
+      now.y - rowTopAfter,
+      `${name} moved vertically within its row`
+    ).toBeCloseTo(was.y - rowTopBefore, 0);
+    // Height gets the same treatment for the same reason: if the chrome above
+    // the grid grows by a fraction of a pixel, the grid — and every pane in it
+    // — loses that fraction of height. Budgeted rather than exact, because the
+    // regression this is here to catch (a split that re-flows the layout
+    // vertically) is tens of pixels, not tenths.
+    expect(
+      Math.abs(now.height - was.height),
+      `${name} changed height by more than the grid's own sub-pixel jitter`
+    ).toBeLessThanOrEqual(VERTICAL_JITTER_PX);
+    expect(
+      Math.abs(now.y - was.y),
+      `${name} moved vertically by more than the grid's own sub-pixel jitter`
+    ).toBeLessThanOrEqual(VERTICAL_JITTER_PX);
     expect(
       Math.abs(now.x - was.x),
       `${name} moved further than one divider's worth`
