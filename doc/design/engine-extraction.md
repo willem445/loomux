@@ -393,7 +393,8 @@ from a unit test of product code, agents are banned from running cargo locally
     appear in a body?", not "how many times is it named"; the first draft of
     this paragraph asserted a count and got it wrong. `mqdriver` is `workflow`'s
     heaviest consumer and stays behind deliberately — it reaches
-    `capture_raw_with_timeout`, i.e. the pane host, which is slice A3. That one
+    `capture_raw_with_timeout`, glossed here at the time as "i.e. the pane host,
+    which is slice A3" and retracted in the amendment below. That one
     is worth stating as a rule because it is the intuition that misleads:
     **an inbound edge never blocks a move.** `mqdriver` still spells
     `super::workflow::…` and never learned anything changed, because that is
@@ -505,7 +506,8 @@ from a unit test of product code, agents are banned from running cargo locally
     it. `mqdriver` and `mqloop` import from both moved modules in their *bodies*
     (`use super::mergeq::{new_batch_id, scratch_branch, …}`,
     `use super::mergeqview::MERGE_QUEUE_FILE`, a `super::mergeq::recheck_gate`
-    call) and stay behind, because they reach the pane host and that is A3. Both
+    call) and stay behind, for the edges they had at the time — batch 9
+    re-measured those and none of them is a host edge; see its entry below. Both
     spell `super::` unchanged and compile against the re-export: **a body-level
     inbound edge is a genuine edge and still does not block a move.** The same
     goes for the `#[tauri::command]` `orch_merge_queue`, which stays and calls
@@ -728,12 +730,22 @@ from a unit test of product code, agents are banned from running cargo locally
     tree as it is.
 
     A consequence worth carrying into the next batch, stated as what it is (a
-    grep over the source, not a compiler's verdict): after this batch every
-    `super::`/`crate::` path in `mqdriver.rs` and `mqloop.rs` resolves into the
-    engine — `mergeq`, `mergeqview`, `notify`, `workflow`,
-    `capture_raw_with_timeout`, `atomic_write` — so the edge that pinned both in
-    `src-tauri` is gone. Whether they move next is still a batch's own question
-    to re-derive, on the same terms the paragraph above insists on.
+    grep over the source, not a compiler's verdict), and stated narrowly because
+    the first draft of this paragraph overclaimed it: after this batch **neither
+    `mqdriver.rs` nor `mqloop.rs` has a remaining edge into the moved capture
+    cluster or `atomic_write`** — `super::capture_raw_with_timeout` and
+    `super::atomic_write` still resolve, now through the re-export, and every
+    other module they name (`mergeq`, `mergeqview`, `notify`, `workflow`) has
+    been in the engine since batch 6.
+
+    What has NOT gone away, and is expected: `mqloop` reaches `super::mqdriver::`
+    throughout its body, and `mqdriver` is still in `src-tauri`, so those
+    resolve to `src-tauri`'s `mqdriver` and not to the engine. That is a
+    same-tier reference between two files at the same stage of the extraction,
+    not an unresolved dependency on the Tauri half — the pair moves together
+    (A3's later batches), which is what a chain looks like when neither end has
+    gone yet. "No edge into the moved cluster" is the claim; "everything
+    resolves into the engine" is not, and was false when it was written.
 
     ### Edges and visibility
 

@@ -351,8 +351,10 @@ pub const MERGE_QUEUE_MAX_BATCH_DEFAULT: u32 = 3;
 
 /// The `merge_queue:` block — a sibling of [`Gate`]'s `gates:`, and the whole
 /// of what a repo declares about the queue. Design note:
-/// `doc/design/merge-queue.md` §11.2; the engine is `orchestration::mergeq`,
-/// which stays in `src-tauri` (it drives `gh` and the pane host).
+/// `doc/design/merge-queue.md` §11.2; the queue's own core is [`crate::mergeq`]
+/// (here since #888 batch 6), and the wiring that drives `gh` — `mqdriver`,
+/// `mqloop` — is still `src-tauri`'s. That wiring reaches no pane host: this
+/// line used to say it did, and batch 9 re-measured it.
 ///
 /// **Policy, not mechanism** (CLAUDE.md constraint 8). Nothing here names a
 /// branch, a toolchain, or a verification command: the queue *observes* the

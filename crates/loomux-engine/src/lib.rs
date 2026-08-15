@@ -199,9 +199,10 @@
 //! prose. `mqdriver` and `mqloop` do not merely name `mergeq` in doc comments:
 //! they import from it in their bodies (`use super::mergeq::{new_batch_id,
 //! scratch_branch, …}`, `use super::mergeqview::MERGE_QUEUE_FILE`) and call
-//! `mergeq::recheck_gate`. Both stay in `src-tauri` — they reach the pane host,
-//! which is slice A3 — both spell `super::` exactly as before, and both compile
-//! against the re-export. Batch 5 established that prose is not an edge; the
+//! `mergeq::recheck_gate`. Both stay in `src-tauri` — for the edges they had at
+//! the time, which batch 9 re-measured and found were not host edges at all
+//! (see its entry below) — both spell `super::` exactly as before, and both
+//! compile against the re-export. Batch 5 established that prose is not an edge; the
 //! other half belongs beside it, because it is the half that misleads: **a
 //! body-level inbound edge is a genuine edge and still does not block a move.**
 //! Only outbound edges decide what a batch has to contain.
