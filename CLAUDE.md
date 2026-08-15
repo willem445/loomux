@@ -6,9 +6,12 @@ terminals, Vite. `doc/design/architecture.md` maps every module; deeper designs
 live in `doc/design/`.
 
 The repo root is a **Cargo workspace**: `src-tauri` (the desktop app, links
-Tauri) and `crates/loomux-engine` (the Tauri-free orchestration core, filling
-up one batch at a time as #888 moves modules into it). One `Cargo.lock` and one
-`target/`, both at the repo root. See `doc/design/engine-extraction.md`.
+Tauri), `crates/loomux-engine` (the Tauri-free orchestration core, filling up
+one batch at a time as #888 moves modules into it) and `crates/loomux-server`
+(the remote-engine daemon that will host that core — a binary, and a leaf
+nothing else depends on). One `Cargo.lock` and one `target/`, both at the repo
+root. See `doc/design/engine-extraction.md` and
+`doc/design/remote-engine-daemon.md`.
 
 ## Commands
 
