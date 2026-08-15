@@ -324,6 +324,40 @@ seam for the knob — copilot's effort lives in `~/.copilot/settings.json`, not 
 a flag — has none regardless of what a model reports about itself, or loomux
 would put a flag on the wire that the CLI cannot take.
 
+## A detection reply owes every surface `agent_cli_knobs` owes
+
+Detection is not just another source for the dropdown — it is the reply that
+makes `knobLookup` answer differently. So the surfaces it invalidates are the
+same ones the sibling `agent_cli_knobs` reply invalidates, and both hosts owe
+them all: the model menu, the knob rows, and (in the workflow pane) the analysis
+pass and its findings.
+
+Repainting only the dropdown is a real defect rather than a cosmetic one, and it
+shipped in the first cut on one of the two surfaces (#997 review). The block
+editor gained its rows and its summary line — so the human had every reason to
+believe detection had landed — while *Thinking level* went on offering
+`low/medium/high/xhigh/max` for a model whose reply said it had no effort
+setting. Picking `xhigh` wrote it, the next render brought the row back disabled,
+and the findings pane flagged the block: **the editor offered a value its own
+validator rejects.** The launcher never had the bug (`applyRoleModels` →
+`applyRoleKnobs`), and that asymmetry is what identified it as an oversight.
+
+Because this is DOM wiring — which this repo validates by hand rather than by
+simulating a DOM — the pin is a **source scan** (`test/detectrefresh.test.ts`),
+in the tradition of `transport.test.ts`'s one-importer rule and `groupid.rs`'s
+two scans. It asserts each `onDetect` handler reaches the refreshers by name, on
+both hosts, and carries a vacuity guard so a broken extraction fails loudly
+instead of passing. The next such handler will be written by copy-paste from a
+neighbour rather than by reading this note; a scan is what notices.
+
+Both hosts also take the same **mid-type guard** now (`ModelPicker.editingCustom`).
+An ask can be in flight for seconds — long enough for a human to click into the
+`custom…` box — and rebuilding the menu under a half-typed id resolves it to the
+dropdown branch and hides the input beneath the caret. The guard is deliberately
+narrower than "focus is somewhere in this picker": a detection is *started* by
+clicking a button inside the control, so the broad test is true on every detect
+path and would suppress the very rebuild the click asked for.
+
 ## The context-window table, and why one exists at all
 
 `src/modelcontext.ts` is the one model fact loomux states on its own authority.
@@ -346,11 +380,24 @@ Three rules keep it from aging the way #329 warns about:
    applied to a version that may not share it. `claude-sonnet-4-5` is the case
    that rule is for.
 
-The lookup prefers `ModelInfo.resolvedModel` when the reply carried one: it is
-the canonical wire id an alias resolves to on *this* install, which turns a
-moving alias into the exact model the account is being served — the one id a
-static table can be sure about. It falls back to the picked id, because the
-field is documented as requiring Claude Code v2.1.197 or later.
+The lookup uses `ModelInfo.resolvedModel` when the reply carried one: it is the
+canonical wire id an alias resolves to on *this* install, which turns a moving
+alias into the exact model the account is being served — the one id a static
+table can be sure about. It falls back to the picked id only when that field is
+**absent**, which Anthropic documents as the case on any install older than
+Claude Code v2.1.197.
+
+**Absent and unknown are different states, and conflating them re-opened the
+hole rule 3 exists to close (#997 review).** The first cut branched on the
+resulting *label* being empty rather than on the *field* being absent, so a
+reported `resolvedModel` with no row — `claude-sonnet-4-5`, or the
+`us.anthropic.…` / ARN / gateway forms an enterprise install really produces —
+fell through to the alias and printed the alias's number for it. Rule 3 held one
+layer down and the composed path inherited the figure anyway, and only once
+detection was on: the feature's own path re-opening the hole the table was built
+to close. A resolved id loomux cannot place is the *more specific* statement, so
+its silence is the answer; a missing field is not a statement at all, so the
+picked id is what gets asked. `test/modelnames.test.ts` pins both halves.
 
 ## Seams added
 

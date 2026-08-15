@@ -73,10 +73,14 @@ function onDetectBody(text: string, where: string): string {
 test("the workflow block editor refreshes the knobs and the findings after a detection", () => {
   const body = onDetectBody(src("workflowview.ts"), "workflowview.ts");
 
-  // Vacuity guard: if the extraction ever collapses to a stub, every `includes`
-  // below would pass or fail for reasons that have nothing to do with the rule.
-  assert.ok(body.length > 120, `the extracted handler is implausibly short, so this test is not reading it: ${body}`);
+  // Vacuity guard, and it is the `detect(` match that does the work: if the
+  // scan ever extracts the wrong region, every assertion below would pass or
+  // fail for reasons that have nothing to do with the rule. Deliberately NOT a
+  // generous length threshold — the buggy handler this test exists to catch was
+  // a single short line, so a length gate tuned to reject it would fire first
+  // and report "the scan is broken" instead of the finding.
   assert.match(body, /modelCatalog\.detect\(/, "the handler under test must be the one that asks the CLI");
+  assert.ok(body.length > 40, `the extracted handler is implausibly short, so this test is not reading it: ${body}`);
 
   // The three the sibling `agent_cli_knobs` handler does, and the ones the first
   // cut of this handler did none of.
@@ -98,8 +102,8 @@ test("the workflow block editor refreshes the knobs and the findings after a det
 test("the launcher refreshes its knob row after a detection, by either branch", () => {
   const body = onDetectBody(src("launcher.ts"), "launcher.ts");
 
-  assert.ok(body.length > 120, `the extracted handler is implausibly short, so this test is not reading it: ${body}`);
   assert.match(body, /catalog\.detect\(/, "the handler under test must be the one that asks the CLI");
+  assert.ok(body.length > 40, `the extracted handler is implausibly short, so this test is not reading it: ${body}`);
 
   // The launcher reaches the knobs either directly (when a mid-type guard stops
   // it rebuilding the menu) or through `applyRoleModels`. Both are acceptable;
