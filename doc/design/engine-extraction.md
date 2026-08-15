@@ -556,6 +556,9 @@ from a unit test of product code, agents are banned from running cargo locally
     (Per #973: state that fact, not a count of it — a grep-derived number rots
     the moment either file gains or loses a use, and is only worth stating
     where the point is the number itself, e.g. counting toward a cap.)
+    **Amended by batch 11:** `intake.rs` is in the engine now and reaches both
+    consts as `crate::model::…`, so it is no longer one of the callers this
+    paragraph counts on the `src-tauri` side.
 
     **Visibility widened, batch-3 precedent — three items, one item unchanged.
     State the reachability precisely rather than reach for "unchanged" or
@@ -576,7 +579,19 @@ from a unit test of product code, agents are banned from running cargo locally
       `orchestration::model::DEFAULT_IDLE_TICK_MINUTES` — and, since that path
       crosses no crate-private boundary, as
       `loomux_lib::orchestration::model::DEFAULT_IDLE_TICK_MINUTES` from
-      outside the crate too. Forced and harmless, on the same terms `model.rs`
+      outside the crate too.
+      **Amended by batch 11**, which is where this sentence stopped being
+      true and is worth flagging as a pattern rather than a typo: the flat
+      re-export of `DEFAULT_INTAKE_POLL_MINUTES` existed for exactly one
+      caller, `intake.rs`, and that caller moved into the engine — so the
+      line has no consumer left and comes off, leaving `mod.rs`'s
+      `pub(crate) use` covering `DEFAULT_IDLE_TICK_MINUTES` alone (which
+      `intake.rs` never called in the first place). The identical claim was
+      written on three surfaces — here, `model.rs`'s two const docs, and
+      `mod.rs`'s batch-8 comment — and batch 11 initially corrected two of
+      them and missed this one. That is the #878 signature exactly: grep the
+      **entity** a claim names, never the phrasing you just rewrote.
+      Forced and harmless otherwise, on the same terms `model.rs`
       states for `default_model`/`sanitize_model_opt`: an item must be `pub`
       here to cross the boundary at all, and `loomux-engine` is
       `publish = false` — "public" means reachable by a sibling crate in this
