@@ -36116,17 +36116,6 @@ impl OrchRegistry {
         // Read from the group's own roster rather than from anything the caller
         // carried in — the same lookup `resolve_token` makes — so this layer is
         // not a second copy of the one the dispatch arm already consulted.
-        let caller_hint = self
-            .group(group)
-            .and_then(|g| g.guardrails.block(&a.block).and_then(|b| b.role_hint.clone()));
-        if caller_hint.as_deref() == Some("liaison") {
-            return Err(format!(
-                "permission denied: block {:?} is a liaison — it presents the human's \
-                 questions and relays their answers, and never records the verdict that \
-                 opens a merge gate. Use report(status, summary) instead.",
-                a.block
-            ));
-        }
         let num = pr_number(pr)
             .ok_or_else(|| format!("no PR number found in {pr:?} — pass the number, #n, or the PR URL"))?;
         let verdict = workflow::Verdict::parse(verdict).ok_or_else(|| {
