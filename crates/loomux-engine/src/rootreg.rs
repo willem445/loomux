@@ -258,7 +258,15 @@ impl RootRegistry {
         // one call is the whole "equals or is a descendant" rule. A string
         // prefix test would additionally accept a *sibling* whose name merely
         // extends a declared root's (`…/repo-evil` under `…/repo`).
-        if declared.iter().any(|root| canonical.starts_with(root)) {
+        // SCRATCH MUTATION (#1042 red-before-green, never merged). Two
+        // independent weakenings of the containment rule:
+        //   1. a STRING prefix instead of the component-wise `Path::starts_with`
+        //   2. containment in EITHER direction, so an ancestor passes too
+        if declared.iter().any(|root| {
+            let c = canonical.to_string_lossy().to_string();
+            let r = root.to_string_lossy().to_string();
+            c.starts_with(&r) || r.starts_with(&c)
+        }) {
             Ok(DeclaredRoot {
                 plain: lexical_normalize(plain),
                 canonical,
