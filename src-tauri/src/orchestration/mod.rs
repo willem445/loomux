@@ -35094,7 +35094,7 @@ impl OrchRegistry {
                  still re-raise it once per **Monitoring open PRs** sweep. Only the pane you ask \
                  in moved.\n\
                  - **`{id}` presents a question; it is never the RECORD of one.** An agent pane \
-                 compacts, wedges and dies, so a question that must outlive this turn \
+                 compacts, dies and gets idle-killed, so a question that must outlive this turn \
                  belongs somewhere durable — the board task you mark `blocked`, and the question \
                  registry when you opened one with `ask_human` (whose `q-N` is worth sending the \
                  liaison, since `list_questions` is readable from its pane too). The two \
