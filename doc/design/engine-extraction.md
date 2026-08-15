@@ -603,10 +603,18 @@ from a unit test of product code, agents are banned from running cargo locally
       workspace, not a shipped API promise.
     - `LOOMUX_NOTICE_MARKER` was already `pub` in `src-tauri`, so nothing
       widens there.
-  - **`digest` is not a leaf** despite reading like one. It calls
+  - **`digest` is not a leaf** despite reading like one. It called
     `crate::sessions::yaml_field` and takes a `crate::opencodedb::TranscriptRow`
-    — two modules staying in `src-tauri` — so it cannot move until those edges
-    are cut or followed.
+    — two modules staying in `src-tauri` at the time — so it could not move
+    until those edges were cut or followed. **Batch 14 cut the first of them**:
+    `yaml_field` is `loomux_engine::sessions::yaml_field` now, and `digest`'s
+    call site reaches it through the re-export unchanged, so the only remaining
+    blocker is `opencodedb::TranscriptRow`. Corrected here rather than left to
+    the next batch to rediscover, because a paragraph naming two blockers when
+    one has gone is exactly the superseded-reason failure batch 12a spent six
+    batches' prose on — and the *shape* it records still holds: an edge into a
+    module is cut by moving the callee, not by abstracting the caller (batch
+    3's rule).
 - **A3 — the host-edge tier.** Planned in detail on #888 (plan-558): the
   measured edge map found that five of the six remaining orchestration modules
   are blocked not by `AppHandle` but by six pure `mod.rs` items plus
@@ -1390,6 +1398,166 @@ from a unit test of product code, agents are banned from running cargo locally
     and `mcp`. What remains of A3 is the trait work its own header names —
     `EventSink` + `PaneHost`, and `NullPaneHost` replacing the app-is-`None`
     branch — followed by A4.
+- **A4 batch 14 — the session-discovery core, item-lifted out of
+  `src-tauri/src/sessions.rs`.** Where a CLI keeps its session store
+  (`claude_projects_root`, `copilot_session_state_root` with its `COPILOT_HOME`
+  precedence and both thread-local test seams), how one session's record is
+  read out of it (`scan_claude_jsonl`, `read_copilot_session`, `yaml_field`,
+  `tidy_title`, `content_text`, `mtime_ms`, the `CopilotSession` row), #925's
+  declared assembly point `copilot_session_dir_at`, the copilot spawn
+  watcher's `copilot_session_ids`/`newest_new_copilot_session` pair, #722's
+  path comparison `norm_path`, #412's by-id lookup `find_session_cwd` with
+  both store halves behind it, and `detect_orch_signature` — the one group id
+  in the codebase whose source is agent-writable, which is why it ends at
+  `GroupId::parse`. Moves to `crates/loomux-engine/src/sessions.rs`.
+
+  ### An item lift into a file that stays, which is a shape batch 7 only half met
+
+  Batch 7 split `obs.rs` at its own section marker and left behind a file that
+  is *nothing but* a `pub use` plus the two Tauri items. Batch 8 lifted four
+  items and left their file untouched. This batch is the first where the
+  source file keeps a large, live half **and** becomes a consumer of the lifted
+  one: `src-tauri/src/sessions.rs` still owns three `#[tauri::command]`s
+  (`list_sessions`, `record_{claude,copilot}_launch_posture`), the
+  launch-intent posture store (#456/#457), the `session-index.json` cache
+  (#493), the candidate machinery and the opencode scanner — every one of
+  which reaches `crate::uistate`, `crate::opencodedb`, `crate::blocking`,
+  `crate::obs::breadcrumb` or `tauri` itself.
+
+  The cut is therefore not "the pure things" in the abstract; it is the
+  **reachability closure of the seven items the batch was scoped to**, and
+  five items nobody named came with it because the compiler says so rather
+  than because they looked tidy. `find_session_cwd` → `find_claude_session_cwd`
+  → `scan_claude_jsonl` → `content_text`, `tidy_title`,
+  `detect_orch_signature`; `find_copilot_session_cwd` →
+  `read_copilot_session` → `yaml_field`, `mtime_ms`, `CopilotSession`. An
+  engine function cannot call back into `src-tauri`, so each of those either
+  crosses or the item that names it does not. The rule to carry: **a batch
+  scoped by naming items is scoped by their callee closure, and the closure is
+  computed, not judged.** Widening the batch to that closure is not scope
+  creep; refusing it would have meant redesigning `find_claude_session_cwd` to
+  take a callback, which is the redesign a relocation batch must not do.
+
+  ### The re-export copies the visibility table
+
+  A **curated item list** (#988), and this is the case batch 10 said to reach
+  for it in: unlike `queue`/`queuestate`/`intake`, this lift force-widens
+  eleven items, five of them from bare module-private. Every consumer already
+  spells a flat `sessions::<item>` name (`crate::sessions::norm_path`,
+  `loomux_lib::sessions::find_session_cwd`), so both clauses of the shape rule
+  point the same way — the item list preserves every call site *and* buys a
+  narrowing that is real.
+
+  The narrowing is written as batch 12a's `mqdriver.rs` wrote it, one keyword
+  per old reach: `pub use` for the four that were already `pub`
+  (`find_session_cwd`, `detect_orch_signature`, and the two `set_*_for_test`
+  seams), `pub(crate) use` for the six that were `pub(crate)` (`norm_path`,
+  `yaml_field`, `copilot_session_state_root`, `copilot_session_dir_at`,
+  `copilot_session_ids`, `newest_new_copilot_session`), and a **bare `use`**
+  for the four that were module-private and whose only callers stayed in this
+  file (`claude_projects_root`, `scan_claude_jsonl`, `read_copilot_session`,
+  `tidy_title`). That third row is the one worth naming: a module-private item
+  whose caller stays behind has no re-export keyword narrower than "import it
+  where it is used", and a bare `use` is exactly that — so **no existing
+  spelling widened**, which is the strong form of the claim batch 10 could
+  only make by having nothing to widen.
+
+  Stated with batch 12a's precision, because the loose version flatters the
+  work: **a curated re-export answers "what can a caller spell without
+  thinking", not "what can a caller spell".** All eleven are `pub` in
+  `loomux-engine` now and reachable as `loomux_engine::sessions::…` from any
+  sibling crate in this workspace. That is forced (nothing crosses the
+  boundary otherwise) and harmless (`publish = false`), and no shape of
+  re-export could have prevented it. What did **not** widen is the rest of the
+  closure: `content_text`, `mtime_ms`, `find_claude_session_cwd`,
+  `find_copilot_session_cwd` and the two thread-local root overrides are
+  private in the engine, because every caller of each crossed with it —
+  batch 12b's "a forced widening is a debt" read forwards instead of
+  backwards.
+
+  `CopilotSession` is the one item where the table is finer than
+  per-item. It must be `pub` (a `pub fn` cannot return a private type), but
+  `parse_candidate` — the caller that stayed — reads only `id`, `title` and
+  `cwd`, so `modified_ms` stays private and nothing outside the module can
+  construct one. Reach for the narrowest table that compiles, per field as
+  well as per item.
+
+  ### Sweeps
+
+  No dependency joins: reading the moved region's own imports gives
+  `serde_json`, `dirs` and `std`, plus `tempfile` for the three inline test
+  modules that travel — all declared since batches 2/3/7. Batch 5's rule
+  applied, not repeated.
+
+  Batch 7's macro sweep is clean, and it is not a formality on this file:
+  `src-tauri/src/sessions.rs` is a Tauri command module, so an `env!` or
+  `include_str!` in the moved region would have silently re-pointed at the
+  engine's placeholder `0.0.0`. There is none — checked by grep over both
+  halves for `env!`, `option_env!`, `file!`, `module_path!`, `include_str!`.
+
+  Batch 11's read-by-path sweep is clean: nothing under `src-tauri/tests/`
+  opens `sessions.rs` as a file.
+
+  Batch 2's question — *where can the violation be spelled now?* — has **two**
+  answers here, and both are checked rather than assumed, because this is the
+  first batch to move a file that two different source-scanning tripwires
+  point at by content.
+
+  - `src-tauri/tests/groupid.rs`'s single-assembly-point scan carries
+    `root.join(session.as_str())` as a `PERMITTED` row required **exactly
+    once**. `copilot_session_dir_at` is that row's only site and it moves whole;
+    the scan already walks both source roots and matches line text, not paths,
+    so the count is unchanged.
+  - `src-tauri/tests/pathseg.rs`'s file-name scan carries the
+    `{session_id}.jsonl` interpolation as a sanctioned row whose third field —
+    the proof — is `fn find_claude_session_cwd(root: &Path, session_id:
+    &PathSegment)`. That proof is **file-scoped**, so it survives only because
+    the flagged `format!` and the signature it depends on travel in the *same*
+    file. They do. A batch that split them would have stranded the row and
+    reddened the scan, which is the row working as designed.
+
+  The generalizable half: **a path-scanning tripwire is neutral to a move only
+  when its subject is line content and its roots already include the
+  destination.** Both conditions held here; neither is a property of this batch,
+  and the next one is owed the same two checks rather than a citation of this
+  paragraph (batch 12a's finding).
+
+  ### What it owed in evidence
+
+  A **pure relocation**, exemption taken whole: no behaviour is added or
+  changed, so no new test, and the existing suites are the pin. Stated per
+  moved item rather than wholesale, and separated by *how* each suite reaches
+  it, since "covered" via a production call site is a weaker claim than a
+  direct call and the two should not be blurred:
+
+  - **Called directly through the re-export.** `tests/sessionindex.rs` calls
+    `find_session_cwd` and binds both root seams around a real two-CLI store;
+    `tests/groupid.rs` calls `detect_orch_signature` across its kickoff,
+    notice and hostile-id table.
+  - **Driven through the production call sites**, fixtured by the two root
+    seams. `tests/sessionindex.rs` and `tests/opencodebrowse.rs` drive
+    `claude_projects_root`, `copilot_session_state_root`, `scan_claude_jsonl`,
+    `read_copilot_session`, `yaml_field` and `tidy_title` through
+    `list_sessions_for_test` — the #493 index's parsed/reused split is exactly
+    an assertion about those parsers' output surviving a round trip;
+    `tests/orchestration.rs` drives `find_session_cwd` through the resume-cwd
+    router and `copilot_session_ids`/`newest_new_copilot_session` through the
+    copilot spawn watcher; `tests/opencodesessions.rs` drives `norm_path`
+    through `opencodedb::identify_session`, including the
+    case/slash/trailing-separator variant that is the whole of what it
+    normalizes.
+  - **Pinned as source, not behaviour.** `tests/pathseg.rs` and
+    `tests/groupid.rs`'s two scans, per the sweeps above. They say the
+    assembly points are still the ones argued for; they assert nothing about
+    what the functions return, which is why the two bullets above carry the
+    behavioural claim.
+
+  **`src-tauri/tests/` is untouched**,
+  which is the proof the re-export surface is complete rather than a claim
+  about it. The three inline `#[cfg(test)]` modules that cover only moved items
+  (`orch_signature_tests`, `resume_store_tests`, `copilot_session_tests`)
+  travel with them and are engine unit tests now; `launch_intent_tests` stays,
+  and reaches the two root seams through the `pub use` above.
 - **A4 — the registry.** `OrchRegistry`, the decision layer, and a PTY
   output-sink seam, so the crate compiles with no `tauri` anywhere in its tree.
   A CI step proves that from `cargo tree` rather than from this paragraph. This

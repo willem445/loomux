@@ -815,8 +815,9 @@ sticky-`Conflicted` state genuinely holds for as long as the cwd's entry
 survives; this is a statement about what happens once it doesn't.
 
 **Review round 1, B2 — the permission key must not case-fold on a
-case-sensitive filesystem.** The first cut reused `norm_path` (defined
-above, for SESSION-CWD MATCHING) as the posture store's key. That function
+case-sensitive filesystem.** The first cut reused `norm_path` (the
+SESSION-CWD MATCHING normalizer — `loomux_engine::sessions::norm_path`,
+re-exported as `crate::sessions::norm_path`) as the posture store's key. That function
 unconditionally lowercases: correct for Windows, where the filesystem
 itself is case-insensitive, but wrong on Linux/macOS, where `/foo` and
 `/Foo` are genuinely different directories — folding them onto one
