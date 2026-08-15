@@ -225,9 +225,11 @@ That last rule is about the **orchestrator's own** kill-idle-panes discipline,
 and it now sits beside a matching promise about loomux's reaper rather than a
 warning about it: `idle_reap_candidates` skips the hint (**Lifecycle**), so the
 fragment says the guardrail skips it too. The two rules together are the whole
-of the pane's mortality, which is why the fragment says that out loud — with the
-reaper out of the picture, the orchestrator is the only thing left that can end
-it.
+of what anything inside the group will do to that pane, which is why the
+fragment says so out loud — with the reaper out of the picture, the
+orchestrator's own `kill_agent` is the only thing left in the group that can end
+it. (Outside it, the human can always close the pane, and a CLI can always die;
+the degradation rule above is what covers both.)
 
 **The liaison's own addendum** — `mechanics_core(Role::Reviewer,
 Some("liaison"))`, in the non-overridable core for the reason the advisor's and
