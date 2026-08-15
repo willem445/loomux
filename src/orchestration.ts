@@ -222,6 +222,23 @@ export const setAutoMerge = (groupId: string, enabled: boolean): Promise<void> =
 export const setAutoRelease = (groupId: string, enabled: boolean): Promise<void> =>
   invoke("orch_set_auto_release", { groupId, enabled });
 
+/** Enable/disable full autonomy for a group (#778): the orchestrator self-selects
+ *  eligible work on its idle tick instead of waiting for the opt-in label funnel.
+ *  A dependent toggle of autonomous like auto-release — enabling is rejected while
+ *  autonomous is off, and autonomous-off or a budget suspension force-clears it.
+ *
+ *  `goal` is opaque: loomux captures, normalizes and echoes it (into the toggle
+ *  notice and the orchestrator's kickoff config), never parses or scores it. Pass
+ *  "" for no goal. Enabling again with a DIFFERENT goal re-aims the mode rather
+ *  than no-opping, so callers send it on every enable — and only when it actually
+ *  changed (see `goalCommit`), since each call delivers a notice into the
+ *  orchestrator's pane. */
+export const setFullAutonomy = (
+  groupId: string,
+  enabled: boolean,
+  goal: string
+): Promise<void> => invoke("orch_set_full_autonomy", { groupId, enabled, goal });
+
 /** Enable/disable supervised dangerous mode (#83): the human, present and
  *  supervising, authorizes the orchestrator to merge/release itself WITHOUT
  *  autonomous mode. Mutually exclusive with autonomous — rejects enable while
