@@ -27,12 +27,21 @@
 // spots:
 //
 //   - It asserts REACHABILITY BY NAME, not behaviour. A handler that calls
-//     `renderFindings()` on a path that never runs still passes. The one piece
-//     of this feature with real logic in it — `runWhenNotEditing` — is pinned on
-//     behaviour instead, at the bottom of this file.
+//     `renderFindings()` on a path that never runs still passes.
+//   - **NOTHING in this file is a behaviour test, including the two
+//     `runWhenNotEditing` pins at the bottom.** Those are source scans of a
+//     second file, one level down. An earlier version of this header said the
+//     opposite — that `runWhenNotEditing` was "pinned on behaviour" — and it was
+//     never true (#997 review B-1). A behaviour pin genuinely is not available:
+//     the method reads `document.activeElement` and attaches a listener, and
+//     this repo forbids simulating a DOM (CLAUDE.md), so whether a deferral
+//     actually defers is hand-validated like the rest of the DOM wiring.
 //   - It reads the SOURCE, not the module graph, so a refresher reached through
 //     an indirection it cannot see reads as absent. That is the safe direction:
-//     it under-recognises rather than over-claiming.
+//     it under-recognises rather than over-claiming — but only because comments
+//     are stripped first. They were not, and prose naming a call satisfied the
+//     assertions, which made this exact sentence false (#997 review B-2). See
+//     `stripComments`.
 //   - It assumes each `onDetect:` is an arrow function and asserts so, rather
 //     than silently scanning past a shape it does not understand.
 //
@@ -45,6 +54,11 @@
 // The vacuity guards below are load-bearing, not decoration: they fail if the
 // region this thinks it is scanning stops being one. They caught two bugs in the
 // scanner itself before this file was correct.
+//
+// **Every limit above was found by somebody mutating this file's subject and
+// watching it stay green.** That is the only way a structural test's claims get
+// checked, and it is the standard this file is held to precisely because it
+// reads as broader coverage than it has.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -53,6 +67,29 @@ import { fileURLToPath } from "node:url";
 
 const src = (file: string): string =>
   readFileSync(fileURLToPath(new URL(`../src/${file}`, import.meta.url)), "utf8");
+
+/** Source with line comments removed, which is what every assertion here
+ *  matches against (#997 review B-2).
+ *
+ *  **Without this the scan over-claims, and the header's stated safety direction
+ *  is simply false.** These handlers are roughly two-thirds comment by volume,
+ *  and those comments name every refresher in prose — so deleting the real
+ *  `analyzeWorkflow(...)` / `renderFindings()` calls while leaving a comment
+ *  that mentions them kept the whole suite green. That is the round-1 blocking
+ *  regression passing the pin written for it.
+ *
+ *  The realistic path there is not a synthetic edit: it is somebody lifting
+ *  these refreshers into a helper and leaving the explanatory comments in place.
+ *  This file promises that an indirection it cannot see reads as **absent**; a
+ *  comment that names the call made it read as present, which is the one
+ *  direction a structural test must never fail in.
+ *
+ *  Full-line comments only, matching `test/workspacelayout.test.ts` (#991) —
+ *  the repo already has this discipline and a second spelling of it would be a
+ *  second thing to get right. Trailing comments after code are handled by the
+ *  call-shape assertions below, which require the parentheses a prose mention
+ *  does not carry. */
+const stripComments = (text: string): string => text.replace(/^[ \t]*\/\/.*$/gm, "");
 
 /** The source of the `onDetect:` handler starting at `at`.
  *
@@ -102,7 +139,11 @@ function onDetectBodyAt(text: string, at: number, where: string): string {
  *  Asserts at least one, so a renamed hook fails loudly instead of vacuously
  *  passing over an empty list — the same reason every assertion here has a
  *  vacuity guard. */
-function onDetectBodies(text: string, where: string): string[] {
+function onDetectBodies(rawText: string, where: string): string[] {
+  // Stripped BEFORE extraction, not after, so the delimiter scan is comment-blind
+  // too: a commented-out `onDetect:` is not a handler, and prose in a comment can
+  // no longer satisfy an assertion downstream (#997 review B-2).
+  const text = stripComments(rawText);
   const bodies: string[] = [];
   for (let at = text.indexOf("onDetect:"); at !== -1; at = text.indexOf("onDetect:", at + 1)) {
     bodies.push(onDetectBodyAt(text, at, where));
@@ -213,13 +254,14 @@ test("both hosts DEFER the mid-type menu rebuild rather than dropping it", () =>
   }
 });
 
-test("the deferral really is a deferral — it runs the rebuild, not just a guard", () => {
-  // The half the source scans above cannot see. `runWhenNotEditing` is the one
-  // piece of this fix with real logic in it, so it is pinned on behaviour rather
-  // than on reachability: it must invoke the rebuild in both states, and the
-  // whole point of round 3 is that the mid-type state defers rather than
-  // swallows.
-  const text = src("modelpicker.ts");
+test("the deferral schedules the rebuild rather than returning without it", () => {
+  // **This is a source scan, one level down — NOT a behaviour test**, and saying
+  // so is the whole point of #997 review B-1. `runWhenNotEditing` reads
+  // `document.activeElement` and attaches a listener, and this repo forbids
+  // simulating a DOM (CLAUDE.md), so whether a deferral actually defers is
+  // hand-validated like the rest of the DOM wiring. An earlier version of this
+  // comment claimed behaviour coverage; it never had any.
+  const text = stripComments(src("modelpicker.ts"));
   const at = text.indexOf("runWhenNotEditing(");
   assert.notEqual(at, -1, "`runWhenNotEditing` was renamed — the host scans above are asserting a name that is gone");
   const body = text.slice(at, text.indexOf("\n  }", at));
@@ -230,4 +272,37 @@ test("the deferral really is a deferral — it runs the rebuild, not just a guar
     "and the editing path must schedule it for when the hazard ends, rather than returning without it"
   );
   assert.match(body, /once: true/, "one deferral, one rebuild — a listener left attached would fire on every later blur");
+});
+
+test("the deferral listens on the same element the edit guard reads", () => {
+  // The mutation that exposed the false claim above (#997 review B-1): move the
+  // listener from the custom input to the `<select>` and the suite stayed fully
+  // green, while the user-visible NB-3 bug came straight back — `blur` does not
+  // bubble, so the custom box's blur is then observed by nobody and the deferred
+  // rebuild never runs at all.
+  //
+  // A behaviour pin for that is genuinely unavailable here (see the note above),
+  // so this closes the hole the only way that is left: the guard and the
+  // deferral are read out of the source SEPARATELY and required to name the same
+  // field. It cannot prove the listener fires; it can prove the two halves have
+  // not drifted apart, which is exactly the drift the mutation performed.
+  const text = stripComments(src("modelpicker.ts"));
+
+  const guardAt = text.indexOf("get editingCustom(");
+  assert.notEqual(guardAt, -1, "`editingCustom` was renamed — this consistency check has lost one of its two halves");
+  const guard = text.slice(guardAt, text.indexOf("\n  }", guardAt));
+  const guarded = /this\.(\w+)\.hidden/.exec(guard);
+  assert.notEqual(guarded, null, `the edit guard no longer reads a \`this.<field>.hidden\`, so this check cannot pair it: ${guard}`);
+
+  const deferAt = text.indexOf("runWhenNotEditing(");
+  const defer = text.slice(deferAt, text.indexOf("\n  }", deferAt));
+  const listened = /this\.(\w+)\.addEventListener\("blur"/.exec(defer);
+  assert.notEqual(listened, null, `the deferral no longer attaches a blur listener to a \`this.<field>\`: ${defer}`);
+
+  assert.equal(
+    listened?.[1],
+    guarded?.[1],
+    `the deferral waits on \`this.${listened?.[1]}\` but the guard watches \`this.${guarded?.[1]}\` — ` +
+      `\`blur\` does not bubble, so the element the human is actually typing in would never release the deferred rebuild`
+  );
 });

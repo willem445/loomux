@@ -1389,8 +1389,20 @@ export class WorkflowView {
           // block, at which point `renderForm()` has detached these rows and
           // nulled `repaintBlockKnobs`. The probe reply below takes the same
           // early-out, for the same reason.
+          //
+          // **It refreshes whatever form IS on screen, by the safe method — it
+          // does not bare-`renderForm()`** (#997 review NB3-1). The form the
+          // human moved to was rendered before this reply landed, so its knob
+          // rows are stale and do owe a repaint; but `renderForm()` here would
+          // `replaceChildren` a form they may be typing in, destroying the input
+          // under their caret and dropping focus to `<body>`. That is the pane's
+          // own rule — "the form is redrawn only when the human isn't inside it"
+          // — and the first cut of this early-out broke it while its comment
+          // claimed to be following a sibling that does not. This IS the
+          // sibling's treatment now, which is what makes the claim above true.
           if (!this.formPane.contains(picker.root)) {
-            this.renderForm();
+            if (this.formPane.contains(document.activeElement)) this.repaintBlockKnobs?.();
+            else this.renderForm();
             return;
           }
           // Mid-type guard: rebuilding the menu under a half-typed id hides the
