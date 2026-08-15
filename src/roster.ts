@@ -288,14 +288,16 @@ export function describeRoster(blocks: readonly RosterBlock[]): string {
   return parts.length ? parts.join(", ") : "no delegates";
 }
 
-/** Uppercase badge text for a resolved block's `role_hint` (#250/#324) —
+/** Uppercase badge text for a resolved block's `role_hint` (#250/#324, #891) —
  *  cosmetic only, the launcher-preview mirror of the backend's
  *  `role_hint_requires`. Never widens the roster row's meaning: a block with
  *  `role_hint: "advisor"` is a planner first, badged ADVISOR second. Anything
  *  the backend wouldn't itself resolve renders no chip at all, rather than
  *  guessing at a label for a value that could never legitimately reach here. */
 function roleHintChip(hint: string | null | undefined): string | null {
-  return hint === "advisor" || hint === "process" ? hint.toUpperCase() : null;
+  return hint === "advisor" || hint === "process" || hint === "liaison"
+    ? hint.toUpperCase()
+    : null;
 }
 
 /** The one-line description of a block for the roster table: what it is and what

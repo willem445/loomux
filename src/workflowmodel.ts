@@ -68,14 +68,16 @@ export function isWorkflowCli(v: string): v is WorkflowCli {
   return (WORKFLOW_CLIS as readonly string[]).includes(v);
 }
 
-/** The two role hints a block may declare (#250/#324) — an OPTIONAL, INERT
- *  persona/template/badge marker, never a capability: `kind` alone still decides
- *  deny-flags, cwd rule and MCP tool scope. Mirrors the backend's
- *  `role_hint_requires` (workflow.rs) so this pane's pre-run pass agrees with what
- *  the real parser would say. Each hint REQUIRES a specific `kind` — `advisor`
- *  needs `planner`, `process` needs `worker` — so a workflow can't spell a
- *  combination nothing downstream would honor. */
-export const ROLE_HINTS = ["advisor", "process"] as const;
+/** The role hints a block may declare (#250/#324, #891) — an OPTIONAL persona/
+ *  template/badge marker that never WIDENS a capability: `kind` alone still
+ *  decides deny-flags, cwd rule and MCP tool scope, and the one hint-keyed rule
+ *  that exists (`liaison` is denied `review_verdict`) only narrows. Mirrors the
+ *  backend's `role_hint_requires` (workflow.rs) so this pane's pre-run pass
+ *  agrees with what the real parser would say. Each hint REQUIRES a specific
+ *  `kind` — `advisor` needs `planner`, `process` needs `worker`, `liaison` needs
+ *  `reviewer` — so a workflow can't spell a combination nothing downstream would
+ *  honor. */
+export const ROLE_HINTS = ["advisor", "process", "liaison"] as const;
 export type RoleHint = (typeof ROLE_HINTS)[number];
 
 /** The capability class a role_hint REQUIRES, or `undefined` for an unrecognized
@@ -90,6 +92,7 @@ export function roleHintRequires(hint: string): BlockKind | undefined {
   const h = hint.trim().toLowerCase();
   if (h === "advisor") return "planner";
   if (h === "process") return "worker";
+  if (h === "liaison") return "reviewer";
   return undefined;
 }
 
@@ -154,7 +157,7 @@ export interface WorkflowBlock {
   /** Persona file — compiled to `copilot --agent <name>` against `.github/agents/`.
    *  Mutually exclusive with `prompt` (a block with both is a finding). */
   profile?: string;
-  /** OPTIONAL, INERT persona/template marker (#250/#324) — one of {@link ROLE_HINTS},
+  /** OPTIONAL persona/template marker (#250/#324, #891) — one of {@link ROLE_HINTS},
    *  or anything else (a finding + a stub, same as an unrecognized `kind`). Requires
    *  its matching `kind` (see {@link roleHintRequires}); absent is today's behavior,
    *  byte for byte. */
@@ -2133,6 +2136,17 @@ export function validateWorkflow(w: Workflow, knobs?: KnobLookup): Finding[] {
           severity: "error",
           code: "gate-not-a-reviewer",
           message: `The merge gate names "${id}" as a reviewer, but that block's kind is "${b.kind || "(none)"}" — only a reviewer records a verdict.`,
+          blockId: id,
+        });
+      } else if (b.role_hint?.trim().toLowerCase() === "liaison") {
+        // Reviewer-KIND, but a liaison never records a verdict (#891) — so a
+        // gate naming one waits on something no code path can produce. Same
+        // unsatisfiable-gate finding as the arm above, one kind further in;
+        // mirrors the backend's own refusal in `parse_workflow`.
+        findings.push({
+          severity: "error",
+          code: "gate-not-a-reviewer",
+          message: `The merge gate names "${id}" as a reviewer, but that block is a liaison — it presents the human's questions and never records a verdict, so the gate could never open.`,
           blockId: id,
         });
       }

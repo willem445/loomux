@@ -9563,11 +9563,14 @@ pub struct Caller {
     /// a fact you have to trace `resolve_token` to establish.
     pub group: GroupId,
     pub role: Role,
-    /// The spawning block's `role_hint` (#250/#324) — `advisor` | `process` |
-    /// `None`. Inert everywhere except `session_digest`'s dispatch gate (the
-    /// slice D binding rider tightening slice B's interim worker-wide gate
-    /// to `role_hint == process`); every other capability check keys off
-    /// `role` alone, per the closure argument `role_hint` was built on.
+    /// The spawning block's `role_hint` (#250/#324, #891) — `advisor` |
+    /// `process` | `liaison` | `None`. Every capability check keys off `role`
+    /// alone, per the closure argument `role_hint` was built on, with exactly
+    /// two hint-keyed exceptions and neither of them widens a class:
+    /// `session_digest`'s dispatch gate NARROWS the worker tier to
+    /// `role_hint == process`, and `review_verdict`'s NARROWS the reviewer tier
+    /// by denying `role_hint == liaison` (a liaison rides the reviewer class for
+    /// its read-only, persistent posture and reviews nothing).
     pub role_hint: Option<String>,
 }
 
@@ -36134,6 +36137,27 @@ impl OrchRegistry {
                  report(status, summary) instead.",
                 a.block,
                 a.role.as_str()
+            ));
+        }
+        // The deepest of the three layers guarding the verdict against a liaison
+        // (#891) — the other two are `mcp::tool_defs`'s listing and `call_tool`'s
+        // dispatch arm. A liaison is reviewer-KIND for its posture (persistent,
+        // read-only, board-reading) and reviews nothing; the check lives here too,
+        // next to the write, for the same reason the class check does: what opens
+        // a merge gate must not depend on a single check in a JSON shim.
+        //
+        // Read from the group's own roster rather than from anything the caller
+        // carried in — the same lookup `resolve_token` makes — so this layer is
+        // not a second copy of the one the dispatch arm already consulted.
+        let caller_hint = self
+            .group(group)
+            .and_then(|g| g.guardrails.block(&a.block).and_then(|b| b.role_hint.clone()));
+        if caller_hint.as_deref() == Some("liaison") {
+            return Err(format!(
+                "permission denied: block {:?} is a liaison — it presents the human's \
+                 questions and relays their answers, and never records the verdict that \
+                 opens a merge gate. Use report(status, summary) instead.",
+                a.block
             ));
         }
         let num = pr_number(pr)

@@ -186,8 +186,8 @@
         {
           "name": "role_hint",
           "type": "enum",
-          "values": ["advisor", "process"],
-          "help": "An INERT persona/template marker — never a capability. `advisor` requires kind: planner, `process` requires kind: worker."
+          "values": ["advisor", "process", "liaison"],
+          "help": "An INERT persona/template marker — never a capability. `advisor` requires kind: planner, `process` requires kind: worker, `liaison` requires kind: reviewer."
         },
         {
           "name": "effort",
