@@ -6,7 +6,7 @@ orchestrator's questions for the human, and relays the human's intent back. It
 holds no orchestration authority of its own.
 
 This note covers the `role_hint: liaison` value itself — the public
-`.loomux/workflow.yml` surface it adds — the one capability rule keyed to it,
+`.loomux/workflow.yml` surface it adds — the two capability rules keyed to it,
 the prose that makes a declared liaison do anything (**The prose**), and how the
 pane starts, is skipped and ends (**Lifecycle**). The user-facing documentation
 is a separate slice and is **not** described here as though it shipped.
@@ -57,11 +57,19 @@ is.
 A fifth first-class `Role::Liaison` was rejected for the same reason the
 advisor's was (`supervisor-skills.md` §13): it would touch ~60 sites across
 `mod.rs`, `workflow.rs`, `mcp.rs`, the TypeScript mirror, a new template file
-and four golden fixtures, and buy no capability the reviewer class plus one
-narrowing rule cannot already express. If the exception list below ever grows
+and four golden fixtures, and buy no capability the reviewer class plus two
+hint-keyed rules cannot already express. If the exception list below ever grows
 past a couple of entries, *that* is the trigger to revisit — not aesthetics.
 
-## The one hint-keyed rule: `review_verdict` is withheld
+## Two hint-keyed capability rules, in opposite directions
+
+`review_verdict` is **withheld** from the liaison, and `group_usage` — otherwise
+orchestrator-only — is **offered** to it. They are argued separately below
+because they are separate arguments: closing a fail-open window and widening a
+capability answer to different bars, and a note that presented them as one list
+would let the second borrow the first's obviousness.
+
+### `review_verdict` is withheld
 
 A reviewer may record a verdict, and a verdict is not a notification: it is
 durable, attributed state that this repo's `gh` interceptor reads before
@@ -89,41 +97,86 @@ The liaison is not thereby mute: it relays what it found with
 the same boundary the human-question registry draws when it lets every agent
 ask and no agent answer (`human-questions.md`).
 
-## Why a narrowing exception is not a hole in the doctrine
+### `group_usage` is offered
 
-`role_hint` was introduced as **inert with respect to capability**, and this is
-the second rule to read it (after `session_digest`, which is offered to
-`process`-hinted workers alone). Both of the rules that exist **today** narrow;
-neither grants. So the strongest thing a repo achieves right now by writing
-`role_hint: liaison` is to receive **less** than the class it named would
-otherwise give it.
+"How is it going" is the question this pane exists to answer, and "what is this
+costing" is that question with a number in it. `group_usage` aggregates the
+group's tokens and estimated dollars — the figure a human actually asks for
+mid-session — and it was `require_orchestrator`-only, so without this rule the
+human's own pane has to ask the orchestrator to interrupt its dispatch loop and
+relay a number the registry already holds. That round trip is the noise this
+whole feature exists to remove.
 
-**That is a statement about today, not an invariant, and it must not be written
-as one.** The liaison track's own next slice plans a hint-keyed *grant*:
-`group_usage` is `require_orchestrator`-only, so offering it to a liaison would
-be the first `role_hint` that yields **more** than its `kind` alone. Whether
-that is the right trade is that slice's argument to make — but a note claiming
-no such combination can exist would force that slice to retract this page
-before it could even open the question, which is precisely how a doctrine
-hardens into an obstacle instead of a rail.
+**What makes it grantable is what the tool is, not who wants it.** It is a READ
+of an aggregate scoped to the caller's own group — `caller.group` is resolved
+from the token and is never a tool argument — so it reaches nothing outside the
+group the pane is already in, settles nothing, and writes nothing. The same
+paragraph is the reason no other orchestrator-only tool follows it: `send_prompt`
+and `spawn_agent` are orchestration authority, and board writes are durable
+state. A widening argued from "the liaison would find it useful" would have
+taken those too.
 
-The accurate statement is therefore *inert by default, with **every** exception
-enumerated here — narrowing and widening alike*. The invariant that genuinely
-does hold is the one about the file, not about the hint: **a workflow file can
-never grant a capability**, because a repo cannot author these rules. It
-selects a hint from a closed set; loomux decides what each one means, in code
-that ships with the binary.
+Granted at the two layers this tool has, and keyed on the **conjunction**
+`kind: reviewer` **and** `role_hint: liaison`:
+
+1. `mcp::tool_defs` — listed for a liaison-hinted reviewer. Cosmetic, but a
+   pane that is never shown a tool never calls it.
+2. `mcp::call_tool`'s `group_usage` arm — `require_orchestrator_or_liaison`,
+   a function of its own rather than a hint arm inside `require_orchestrator`.
+   That one gates roughly twenty tools, including `spawn_agent`, `send_prompt`
+   and every board write; a widening written there would widen all of them at
+   once, and this widening's blast radius is exactly one tool.
+
+There is no third layer, and the absence is structural rather than an omission:
+`OrchRegistry::group_usage` takes a group and no caller, because the only
+identity it could check is a group the caller is already in. `record_verdict`
+has a deepest layer because it is a durable, attributed *write*.
+
+**The conjunction is the fail-closed half, and its asymmetry with the deny above
+is deliberate.** A DENY keyed on the hint alone fails closed for every class that
+could ever carry it; a GRANT must name the one class it is granting from.
+`parse_workflow` already refuses `liaison` on any kind but `reviewer`, so the
+class costs a real liaison nothing — it is there for the future producer of a
+`Caller` that does not inherit that guarantee.
+
+**Neither rule reads anything the agent supplied.** `Caller::role_hint` is
+resolved in `resolve_token` from the group's own roster, via the block recorded
+on the agent at spawn — the same lookup `record_verdict`'s deny layer and
+`idle_reap_candidates` make. There is no tool argument, pane title or prompt
+text that reaches either decision.
+
+## Why the exceptions are not a hole in the doctrine
+
+`role_hint` was introduced as **inert with respect to capability**, and three
+rules read it today: `session_digest` is offered to `process`-hinted workers
+alone, `review_verdict` is withheld from a liaison, and `group_usage` is offered
+to one. The third is the first `role_hint` in loomux that yields **more** than
+its `kind` alone.
+
+So the doctrine is not *hints never grant*. It is **inert by default, with
+every exception enumerated here — narrowing and widening alike**, and the table
+below is that enumeration. A rule invisible here is the surprise it exists to
+prevent.
+
+What a widening does change is the **bar**, not the doctrine. A narrowing needs
+only to be safe; a grant has to argue the tool, and the argument that carried
+`group_usage` — a caller-group-scoped read that settles and writes nothing — is
+the reason it did not carry `send_prompt` or a board write alongside it. Reuse
+that argument, not this precedent.
+
+The invariant that genuinely does hold is the one about the **file**, not about
+the hint: **a workflow file can never grant a capability**, because a repo
+cannot author these rules. It selects a hint from a closed set; loomux decides
+what each one means, in code that ships with the binary. That is untouched by a
+widening — a repo writing `role_hint: liaison` gets whatever loomux's code says
+a liaison is, and cannot add to it.
 
 | Hint | Class | Effect on capability | Status |
 |---|---|---|---|
 | `advisor` | `planner` | none | shipped |
 | `process` | `worker` | **narrows**: `session_digest` offered to this hint only | shipped |
 | `liaison` | `reviewer` | **narrows**: `review_verdict` withheld from this hint | shipped |
-| `liaison` | `reviewer` | **widens**: `group_usage`, otherwise orchestrator-only | *planned, not shipped* |
-
-Keep the last row until the slice that lands it turns it into a shipped one, or
-until it is decided against and the row is deleted. A planned widening that is
-invisible here is exactly the surprise this table exists to prevent.
+| `liaison` | `reviewer` | **widens**: `group_usage`, otherwise orchestrator-only | shipped |
 
 **Capability is not the only thing a hint can key on, so the enumeration owes a
 second table.** These rules change no tool surface at all — the liaison's tokens
@@ -138,14 +191,26 @@ table too early:
 | A liaison is not a class's default block | `block_for` (**Lifecycle**, below) | A bare `spawn_agent(kind: "reviewer")` must not open the human's pane |
 | A liaison is never idle-reaped | `idle_reap_candidates` (**Lifecycle**, below) | The reaper cannot see a human typing, so "idle" there means "mid-conversation" |
 
-Four rules and one capability rule is more than the "couple of entries" that
+Four rules and two capability rules is more than the "couple of entries" that
 paragraph above named as the trigger to revisit a first-class `Role::Liaison` —
-so, deliberately: **the count is not the trigger, the ROOT is.** All five follow
-from one fact stated once — a liaison rides `reviewer` and reviews nothing — and
-each is the same three-word predicate at a different site. What would argue for a
-fifth kind is a rule that does *not* reduce to that sentence: a liaison needing a
-capability no class has, a containment no class expresses, a template of its own.
-None exists today.
+so, deliberately: **the count is not the trigger, the ROOT is.** Five of the six
+follow from one fact stated once — a liaison rides `reviewer` and reviews
+nothing — and each is the same three-word predicate at a different site.
+
+**The `group_usage` grant is the one that does not**, and this note says so
+rather than filing it under the same root. It follows from a second fact — a
+liaison faces the human, and a human asks what this is costing — which is the
+first thing about a liaison that is not a consequence of the class it borrows.
+That is worth watching, because "a rule that does not reduce to the root
+sentence" is exactly the test named above.
+
+It is still not a fifth kind, for a reason of size rather than of principle: the
+second root has bought exactly one tool, that tool is a caller-group-scoped
+read, and a `Role::Liaison` would cost ~60 sites, a template and four golden
+fixtures to express it. **The trip-wire is the second root accreting**, not the
+first: a third and a fourth tool granted because the human's pane wants them is
+a class-shaped need being paid for one hint-keyed exception at a time, and the
+answer then is the fifth kind, deliberately, not a longer table.
 
 ## The prose
 

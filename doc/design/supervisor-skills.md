@@ -65,17 +65,18 @@ short, enumerated list of MCP-tier exceptions (next paragraph). The structural
 containment never reads it: `Role::is_read_only()` and the CLI-level deny-flags
 take a `Role`, not a `Block`, and never see `role_hint` at all.
 
-`mcp::tool_defs` is the one function that reads the hint. Both of today's rules
-NARROW what its `Role` already allows: `session_digest` is listed for
-`process`-hinted workers alone (slice D's binding rider, below), and
-`review_verdict` is withheld from a `liaison`-hinted reviewer (#891). Narrowing
-is not a guarantee of the mechanism, though — a hint-keyed *widening* is planned
-for the liaison (`group_usage`, otherwise orchestrator-only). The doctrine is
+`mcp::tool_defs` and the matching `mcp::call_tool` arms are what read the hint,
+and the three rules do not all point the same way. Two NARROW what the caller's
+`Role` already allows: `session_digest` is listed for `process`-hinted workers
+alone (slice D's binding rider, below), and `review_verdict` is withheld from a
+`liaison`-hinted reviewer (#891). One WIDENS: `group_usage`, otherwise
+orchestrator-only, is offered to that same liaison (#891 S2). The doctrine is
 therefore *inert by default, with **every** exception enumerated — narrowing and
-widening alike*; that table lives in `doc/design/liaison.md`. What stays true
-either way is the claim about the **file**: a repo selects a hint from a closed
-set and loomux's code decides what it means, so a workflow file still cannot
-grant a capability.
+widening alike*; that table lives in `doc/design/liaison.md`, which also carries
+the argument a grant owes and a narrowing does not. What stays true either way
+is the claim about the **file**: a repo selects a hint from a closed set and
+loomux's code decides what it means, so a workflow file still cannot grant a
+capability.
 
 **Persistence.** `role_hint` round-trips through both wire formats: parsed
 `.loomux/workflow.yml` (`parse_workflow`) and the persisted `group.json`

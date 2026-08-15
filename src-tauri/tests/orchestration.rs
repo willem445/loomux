@@ -32333,7 +32333,10 @@ fn group_usage_summarizes_agents_with_null_cost_without_panes() {
     // Workers cannot pull the group-wide usage summary.
     let denied = dispatch(&reg, &_cw, "tools/call",
         &json!({ "name": "group_usage", "arguments": {} })).unwrap();
-    assert_eq!(denied["isError"], true, "usage aggregation is orchestrator-only");
+    assert_eq!(denied["isError"], true,
+        "usage aggregation is orchestrator-only — the one other tier that has it is a \
+         declared liaison block (#891 S2, `a_liaison_block_may_read_the_groups_usage`), \
+         never a worker");
 }
 
 #[test]
@@ -36948,6 +36951,123 @@ fn a_liaison_block_can_never_record_a_verdict() {
         .collect();
     assert_eq!(recorded_by, vec!["rev-security".to_string()],
         "exactly one verdict exists, and it is the reviewer's — never the liaison's");
+}
+
+/// Every tool name a caller is offered, in listing order.
+fn listed_tools(reg: &OrchRegistry, c: &Caller) -> Vec<String> {
+    dispatch(reg, c, "tools/list", &Value::Null).unwrap()["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap_or("").to_string())
+        .collect()
+}
+
+#[test]
+fn a_liaison_block_may_read_the_groups_usage() {
+    // #891 S2, and the OTHER direction from the verdict test above: this is the
+    // first `role_hint` rule on the MCP surface that yields MORE than the
+    // caller's `kind` alone. `group_usage` is `require_orchestrator`-only for
+    // every other tier; a liaison exists to answer "how is it going", and "what
+    // is this costing" is that question with a number in it. The alternative it
+    // replaces is the human asking the orchestrator to interrupt its dispatch
+    // loop and relay a figure the registry already holds.
+    //
+    // A widening is not a narrowing, so it is pinned BOTH ways: the liaison
+    // gets it, and a plain reviewer in the SAME group — same class, same
+    // registry, differing only in the hint — does not.
+    let (reg, _d, _repo, gid) = liaison_group();
+    let liaison = reviewer_caller(&reg, &gid, "human");
+    let plain = reviewer_caller(&reg, &gid, "rev-security");
+    let orch = reg.spawn_agent(&gid, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let orch = reg.resolve_token(&orch.token).unwrap();
+
+    // Layer 2 — the dispatch gate, which is the real enforcement.
+    let out = dispatch(&reg, &liaison, "tools/call",
+        &json!({ "name": "group_usage", "arguments": {} })).unwrap();
+    assert_eq!(out["isError"], false, "the liaison must be able to read group usage: {out:?}");
+    let body = out["content"][0]["text"].as_str().unwrap();
+
+    // …and it is the SAME answer, not a redacted stub for the human's pane. An
+    // assertion that merely parsed as JSON would pass on an empty object.
+    let via_orch = dispatch(&reg, &orch, "tools/call",
+        &json!({ "name": "group_usage", "arguments": {} })).unwrap();
+    assert_eq!(via_orch["isError"], false, "sanity: the orchestrator still has it");
+    assert_eq!(body, via_orch["content"][0]["text"].as_str().unwrap(),
+        "the liaison reads the group's usage, not a lesser view of it");
+    let parsed: Value = serde_json::from_str(body).expect("group_usage returns JSON");
+    assert!(parsed.get("lifetime_cost_usd").is_some() && parsed.get("live_tokens").is_some(),
+        "…and it is the usage summary itself: {body}");
+
+    // Layer 1 — the listing agrees. Cosmetic, but a liaison that had to guess a
+    // tool name it was never shown would never call this at all.
+    let names = listed_tools(&reg, &liaison);
+    assert!(names.contains(&"group_usage".to_string()),
+        "a liaison must be offered the tool, not just permitted it: {names:?}");
+    // EXACTLY once. `group_usage_tool()` has two call sites — the orchestrator
+    // tier and the liaison's push — and they are mutually exclusive only
+    // because the first is keyed on `role == Orchestrator` alone. A refactor
+    // that let a liaison reach both would advertise one tool twice under one
+    // name; the mutation probe in this PR's body produced exactly that listing,
+    // so the shape is reachable by a plausible edit rather than hypothetical.
+    assert_eq!(names.iter().filter(|n| *n == "group_usage").count(), 1,
+        "one definition, one listing per caller — never both call sites: {names:?}");
+
+    // THE NEGATIVE CONTROL THAT MAKES THE PIN MEAN SOMETHING. The hint is the
+    // only difference between these two blocks, so if a plain reviewer also had
+    // `group_usage` this test would be pinning nothing about `liaison`.
+    let plain_names = listed_tools(&reg, &plain);
+    assert!(!plain_names.contains(&"group_usage".to_string()),
+        "a plain reviewer must not even see the tool: {plain_names:?}");
+    let denied = dispatch(&reg, &plain, "tools/call",
+        &json!({ "name": "group_usage", "arguments": {} })).unwrap();
+    assert_eq!(denied["isError"], true, "…and must be refused at the gate, not only unlisted");
+    let text = denied["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("liaison"),
+        "the refusal must name the rule it is applying, not just say no: {text}");
+
+    // THE WIDENING IS ONE TOOL WIDE. Every assertion above would also hold if
+    // the hint had promoted the liaison into the orchestrator tier wholesale —
+    // which would hand the human's pane `spawn_agent` and `send_prompt`, the
+    // two tools the whole no-orchestration-authority argument rests on.
+    for orchestrator_only in
+        ["spawn_agent", "send_prompt", "kill_agent", "set_state", "ask_human", "queue_orphans"]
+    {
+        assert!(!names.contains(&orchestrator_only.to_string()),
+            "the liaison holds no orchestration authority — {orchestrator_only} leaked: {names:?}");
+        let out = dispatch(&reg, &liaison, "tools/call",
+            &json!({ "name": orchestrator_only, "arguments": {} })).unwrap();
+        assert_eq!(out["isError"], true,
+            "…and the gate agrees with the listing on {orchestrator_only}: {out:?}");
+    }
+    // …and the reviewer surface it rides is otherwise intact: the hint adds one
+    // tool, it does not re-tier the block in either direction.
+    assert!(names.contains(&"list_verdicts".to_string()) &&
+            names.contains(&"message_orchestrator".to_string()),
+        "the liaison keeps the class it rides: {names:?}");
+
+    // THE GRANT IS KEYED ON THE CONJUNCTION (class AND hint), not on the hint
+    // alone — the fail-closed half of a widening, and the asymmetry with the
+    // verdict DENY above is deliberate: a deny keyed on the hint alone fails
+    // closed for every class that could ever carry it, while a grant must name
+    // the one class it grants from.
+    //
+    // No spawn can reach this state today — `spawn_agent_ex` takes the class
+    // from the roster block (`let role = block.kind`), so a `liaison` block
+    // always yields a reviewer, and `parse_workflow` refuses the hint on any
+    // other kind. The caller is therefore built by hand: what is pinned is the
+    // GATE's shape, against a future producer of a `Caller` (the remote-engine
+    // daemon is one being built) that does not inherit those two guarantees.
+    let smuggled = Caller {
+        agent_id: liaison.agent_id.clone(),
+        group: gid.clone(),
+        role: Role::Worker,
+        role_hint: Some("liaison".into()),
+    };
+    let refused = dispatch(&reg, &smuggled, "tools/call",
+        &json!({ "name": "group_usage", "arguments": {} })).unwrap();
+    assert_eq!(refused["isError"], true,
+        "the hint alone must never open this — the reviewer class is half the key");
 }
 
 #[test]

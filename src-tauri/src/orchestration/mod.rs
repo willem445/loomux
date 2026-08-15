@@ -9672,14 +9672,20 @@ pub struct Caller {
     pub role: Role,
     /// The spawning block's `role_hint` (#250/#324, #891) — `advisor` |
     /// `process` | `liaison` | `None`. The structural containment keys off
-    /// `role` alone; the MCP tier has exactly two hint-keyed exceptions today,
-    /// both narrowing: `session_digest`'s dispatch gate NARROWS the worker tier
-    /// to `role_hint == process`, and `review_verdict`'s NARROWS the reviewer
-    /// tier by denying `role_hint == liaison` (a liaison rides the reviewer
-    /// class for its contained — `NoEdits`, not read-only — and persistent
-    /// posture, and reviews nothing). Both-narrowing is the current list, not a
-    /// rule: a widening is planned (`group_usage` for the liaison). The full
-    /// enumeration lives in `doc/design/liaison.md`.
+    /// `role` alone; the MCP tier has exactly three hint-keyed exceptions, and
+    /// they do not all point the same way. Two NARROW: `session_digest`'s
+    /// dispatch gate narrows the worker tier to `role_hint == process`, and
+    /// `review_verdict`'s narrows the reviewer tier by denying `role_hint ==
+    /// liaison` (a liaison rides the reviewer class for its contained —
+    /// `NoEdits`, not read-only — and persistent posture, and reviews nothing).
+    /// One WIDENS: `group_usage`, `require_orchestrator`-only for every other
+    /// tier, is granted to a caller that is BOTH `Role::Reviewer` and
+    /// `role_hint == liaison` (#891 S2). The full enumeration, and why a grant
+    /// owes an argument a narrowing does not, lives in `doc/design/liaison.md`.
+    ///
+    /// **This field is roster-derived, never caller-supplied**, and the gates
+    /// above depend on that: [`OrchRegistry::resolve_token`] reads it from the
+    /// group's own blocks via the block recorded on the agent at spawn.
     pub role_hint: Option<String>,
 }
 

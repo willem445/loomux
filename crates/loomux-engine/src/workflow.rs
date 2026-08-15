@@ -170,10 +170,11 @@ pub struct Block {
     /// The STRUCTURAL containment never reads it: `kind.containment()` and the
     /// CLI deny-flags take a `Role`, not a `Block`. `mcp::tool_defs` does read
     /// it, for a short list of exceptions enumerated in
-    /// `doc/design/liaison.md` — today both narrow (`session_digest` to
-    /// `process`, `review_verdict` away from `liaison`), and a widening is
-    /// planned. A repo still cannot grant itself anything by writing one: it
-    /// picks from a closed set and loomux's code decides the effect.
+    /// `doc/design/liaison.md` — two narrow (`session_digest` to `process`,
+    /// `review_verdict` away from `liaison`) and one widens (`group_usage`,
+    /// otherwise orchestrator-only, toward that same `liaison`). A repo still
+    /// cannot grant itself anything by writing one: it picks from a closed set
+    /// and loomux's code decides the effect.
     /// `None` is today's behavior, byte for byte.
     pub role_hint: Option<String>,
     /// Thinking-effort level (the `effort:` key, #687) — one of
