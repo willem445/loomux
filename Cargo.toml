@@ -10,6 +10,13 @@
 # steps — and is filling up from slice A2 onward, one small batch per PR. See
 # doc/design/engine-extraction.md.
 #
+# `crates/loomux-server` (slice C1a) is the daemon that will host that core:
+# the third member, and the only one that is a binary rather than a library
+# the desktop app links. It is built and tested on all three CI platforms even
+# though it deploys to Linux only — its config layer is pure logic, and a
+# security rule that compiles nowhere a reviewer works is a rule nobody runs.
+# See doc/design/remote-engine-daemon.md.
+#
 # `resolver = "2"` is stated explicitly because a VIRTUAL manifest does not
 # inherit the resolver implied by a member's `edition = "2021"` — cargo warns
 # and falls back to resolver 1, which unifies features across normal and
@@ -19,7 +26,7 @@
 # reach the LINKED graph of the shipped binary.
 [workspace]
 resolver = "2"
-members = ["src-tauri", "crates/loomux-engine"]
+members = ["src-tauri", "crates/loomux-engine", "crates/loomux-server"]
 
 # THE RELEASE PROFILE HAS TO LIVE HERE, NOT IN src-tauri/Cargo.toml.
 #
