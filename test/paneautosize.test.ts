@@ -114,12 +114,44 @@ test("paneCount counts leaves, not nodes", () => {
   assert.equal(paneCount({ children: [] }), 1); // degenerate: never zero
 });
 
-test("autosize is idempotent — running it on an already-even layout changes nothing", () => {
-  // The button is the kind a human presses twice. The second press must not
-  // drift the layout, or repeated presses would walk it somewhere new.
-  const tree = split(leaf(), split(leaf(), leaf()));
-  const once = equalizeWeights(tree);
-  const twice = equalizeWeights(tree);
-  assert.deepEqual(twice, once);
-  assertAllEqual(leafShares(twice), "twice");
+/** A node as the real callers carry it: the shape, plus the weight this module
+ *  must ignore. Both of `grid.ts`'s trees have one — the live tree reads its
+ *  panes' `flexGrow`, and a `PersistedLayoutNode` stores it — so "the weights
+ *  are not an input" is a claim about actual inputs, not a hypothetical. */
+interface WeightedShape extends SplitShape {
+  weight: number;
+  children?: WeightedShape[];
+}
+
+test("the weights already on the tree are not an input — the shape is the whole input", () => {
+  // This replaces an idempotence test that could not fail: it called
+  // equalizeWeights twice on one input and compared, which is a tautology for
+  // any deterministic pure function of the shape, whatever the function does.
+  //
+  // The property a human actually depends on is structural. Autosize reads the
+  // tree's SHAPE and never its current weights, so it lands on the same answer
+  // from any layout with that shape — dragged to a sliver, evened out a moment
+  // ago, or restored from a session file. That is also what makes it
+  // indifferent to whichever split policy ships underneath it.
+  const shape = split(leaf(), split(leaf(), leaf()));
+  const expected = equalizeWeights(shape);
+
+  // Dragged hard: a near-invisible pane beside a giant, at both levels.
+  const dragged: WeightedShape = {
+    weight: 97,
+    children: [
+      { weight: 0.01 },
+      { weight: 1e6, children: [{ weight: 3 }, { weight: 400 }] },
+    ],
+  };
+  assert.deepEqual(
+    equalizeWeights(dragged),
+    expected,
+    "a dragged layout must land on the weights its bare shape would get"
+  );
+  assertAllEqual(leafShares(equalizeWeights(dragged)), "a dragged layout, evened");
+
+  // The second press, as it really happens: the tree grid.ts walks now carries
+  // the FIRST press's weights, so the round trip is the honest idempotence test.
+  assert.deepEqual(equalizeWeights(expected), expected, "pressing it twice must not drift the layout");
 });

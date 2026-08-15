@@ -334,14 +334,24 @@ export class Grid {
   }
 
   /** Autosize (#936): give every pane in this tab an equal share of the space,
-   *  on demand. The human's answer to a layout that has drifted — a staircase of
-   *  halved splits, a row where one pane ended up holding most of the width —
-   *  without having to drag each divider back by hand.
+   *  on demand. The human's answer to a layout that has drifted — a nested
+   *  staircase from the agent fan-out, a row where one pane ended up holding
+   *  most of the width — without having to drag each divider back by hand.
    *
-   *  On demand is the whole design. Splitting keeps paying for a new pane out of
-   *  the pane you split (#885 slice A), which is what makes a split feel local
-   *  and leaves the rest of the layout alone; this is the deliberate, explicit
-   *  gesture that levels everything, and it never fires by itself.
+   *  What it adds over the even-share split policy (#945, `paneequalize.ts`):
+   *  that policy keeps a row even WITHIN one split — a newcomer at the mean, a
+   *  closing pane's weight shared out in equal absolute parts — and each of its
+   *  operations touches only the row it happened in. Equality across NESTING is
+   *  a different property: a pane beside a stacked pair is a half and two
+   *  quarters however even each split is on its own, because a pane's size is
+   *  the product of its share at every level. That product is what this levels,
+   *  and it is why the gesture is not made redundant by #945.
+   *
+   *  On demand is the whole design: nothing levels the tab by itself, and a
+   *  divider the human dragged stays where they put it until they ask. It is
+   *  also indifferent to which policy a split gesture ends up with (#900's
+   *  halve or #945's even share) — it reads the tree's SHAPE, never its
+   *  weights.
    *
    *  The weights come from the pure `equalizeWeights` — each node weighted by
    *  the number of panes under it, which is what makes the LEAVES equal rather

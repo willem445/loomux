@@ -235,20 +235,31 @@ four are four equal panes again.
 
 ### Autosize
 
-Layouts drift. A split hands the new pane half of the pane you split — which is
-what keeps the rest of the grid still — but split into the newest pane a few
-times, drag a divider or two, and you end up with one big pane and a row of
-slivers.
+Layouts still drift, even with the even-share splits above, and there are two
+reasons rather than one.
+
+**Nesting.** An even share is even *within one row or column*. Split *down*
+inside a pane of a row and that pane's slot becomes a stacked pair: the row is
+now even between the panes beside it and the **pair**, so those come out as a
+half and two quarters rather than three thirds. An orchestrator opening a pane
+per agent nests the same way, which is how a tab ends up with one big pane and a
+row of slivers. **And dividers you dragged stay dragged** — deliberately, since
+a position you chose is not drift.
 
 **Autosize** (`Ctrl+Shift+A`, or the `▦` button in the top bar) gives every pane
-in the tab an equal share of the space, in one press. Panes nested inside a
-split are counted properly: one pane beside a stacked pair becomes three equal
-thirds, not a half and two quarters.
+in the tab an equal share of the space, in one press — *across* nesting levels,
+which is the part a split's own arithmetic cannot do for you. That half and two
+quarters becomes three equal thirds.
 
-It happens only when you ask. Splitting and closing never re-level the grid
-behind you, so a divider you positioned deliberately stays where you put it
-until you press Autosize. Pressing it twice does nothing the second time, and
+It happens only when you ask. A split or a close re-shares the row it happened
+in — that is the even-share behaviour above — but nothing levels the whole tab
+behind your back, and a divider you positioned deliberately stays where you put
+it until you press Autosize. Pressing it twice does nothing the second time, and
 the evened-out layout is what a restored session comes back to.
+
+If a pane is maximized, Autosize **drops you out of fullscreen first** — unlike
+a background pane joining the grid, which deliberately leaves fullscreen alone.
+Evening out a grid you cannot see would look like the button did nothing.
 
 Two things it can't do: panes have a minimum size, so a tab holding more panes
 than fit at that minimum can't have them all equal; and panes end up with equal
@@ -392,6 +403,7 @@ this table mirrors it.
 | Move focus | `Alt+←/→/↑/↓` (or click) |
 | Resize panes | drag the divider between them |
 | Reorder / move panes | drag a pane by its header |
+| Autosize panes | `Ctrl+Shift+A` (or ▦ in the top bar) |
 | Maximize pane | `Ctrl+Shift+M` (or ⤢); same keys restore |
 | Minimize pane | `Alt+M` (or —); restore from the dock |
 | Session browser | `Ctrl+Shift+P` (or the *sessions* button) |

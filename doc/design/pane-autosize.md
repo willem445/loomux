@@ -1,25 +1,59 @@
 # Autosize: even out every pane, on demand (#936)
 
-A layout drifts. Splitting pays for a new pane out of the pane you split (#885
-slice A), which is what makes a split feel local — every other pane sits still —
-but repeat it into the newest pane and the sizes walk: 1/2, 1/4, 1/8, 1/16. Drag
-a divider or two and it walks further. Getting back to "just make them all the
-same" meant dragging every divider by hand, and there was no gesture for it.
+A layout drifts, and it still drifts after #945 made splits and closes even —
+which is the thing to be precise about, because the shape of the drift is what
+this gesture is answering.
+
+What #945 gives, exactly: a same-direction split lands the newcomer at the
+**mean** of the weights already in that row, and a close hands the departing
+pane's weight to its survivors in **equal absolute parts**. Both are confined to
+the one row or column that changed; no other split in the tab moves. So a row
+nobody has dragged is even at every pane count, and a row somebody has dragged
+keeps the ratio they dragged (an insert leaves the incumbents' weights untouched
+and takes the newcomer's share out of all of them uniformly; a close narrows the
+skew rather than discarding it).
+
+What that leaves — and what Autosize is for:
+
+- **Nesting.** Even is a property *within* a split. A cross-direction split
+  replaces one leaf's slot with a nested two-way split, and the outer row is
+  then even between the panes beside it and that **pair** — a half and two
+  quarters, not three thirds. The agent fan-out alternates direction per pane
+  and so nests every time: 1/2, 1/4, 1/8, 1/16. Nothing in the even-share
+  arithmetic can fix this, because it is not a fact about any one split; it is
+  the product of shares down a path.
+- **Deliberate drags.** A divider the human moved stays moved, by design. When
+  they want it gone, they want it gone in one gesture, not by dragging every
+  divider back by hand.
+
+Autosize is that gesture: one button (`▦` in the top bar) and one chord
+(`Ctrl+Shift+A`) that give every pane in the tab an equal share of the space,
+across every level of nesting.
 
 Autosize is that gesture: one button (`▦` in the top bar) and one chord
 (`Ctrl+Shift+A`) that give every pane in the tab an equal share of the space.
 
 ## On demand, and never automatic
 
-This is the part to not "improve" later. Splits keep their local, halve-the-
-target behaviour; nothing re-levels a layout behind the human's back. A layout
-that re-evened itself on every open and close would move panes the human
-deliberately sized, and would make a split's cost unpredictable — the thing
-slice A's policy exists to make predictable. One explicit gesture, one explicit
-result.
+This is the part to not "improve" later. A split or a close re-shares **the row
+it happened in** and nothing else; no operation levels the whole tab, and none
+of them crosses a nesting boundary. A layout that re-evened itself across every
+level on every open and close would move panes the human deliberately sized, at
+moments they did not choose — the drift this gesture removes would become a
+thing that happens *to* them. One explicit gesture, one explicit result.
 
-It follows that Autosize is also *idempotent*: pressing it twice is pressing it
-once. It is a button people press twice.
+Which policy a human's split gesture ends up with is also not this note's
+business. Autosize reads the tree's **shape** and never its weights, so it lands
+on the same answer whether a split halved the target (#900 slice A) or handed
+the newcomer an even share (#945) — the two are a call-site choice in `grid.ts`,
+and this gesture is compatible with either by construction rather than by
+agreement.
+
+It follows that Autosize is *idempotent*, and in the way that actually matters:
+not "the same pure call twice" — true of any deterministic function, and
+unfalsifiable — but that the weights already on the tree are **not an input**.
+Press it on a layout dragged anywhere at all and it lands on the same weights it
+would give the bare shape. It is a button people press twice.
 
 ## The rule: weight each node by the panes under it
 
