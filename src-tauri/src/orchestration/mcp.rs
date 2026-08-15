@@ -1742,7 +1742,7 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                     // verdict summary is multi-line prose the reviewer meant, and
                     // `verdict_notice_summary`'s own marker carries brackets that
                     // a later scrub would neutralize.
-                    report::verdict_notice_summary(&report::relay_payload_keeping_lines(&rec.summary)),
+                    report::verdict_notice_summary(&rec.summary), // MUTATION G: scrub call removed
                     gate.as_deref().map(|g| format!("\n[loomux] {g}")).unwrap_or_default(),
                 ),
                 &caller.agent_id,
