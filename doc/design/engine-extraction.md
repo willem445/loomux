@@ -399,6 +399,14 @@ from a unit test of product code, agents are banned from running cargo locally
     `super::workflow::…` and never learned anything changed, because that is
     what the re-export is. Only *outbound* edges decide what a batch contains.
 
+    (Amended by batch 9: "`capture_raw_with_timeout`, i.e. the pane host" was
+    wrong on the second half. Re-measuring the cluster found no host edge in it
+    at all — it is `std::process` + `std::thread`, and it moved as an ordinary
+    leaf. The batch-5 conclusion is unaffected, since `mqdriver` had other
+    reasons to stay and an inbound edge was never the question; what the
+    correction costs is the *reason*, which is why batch 9's entry restates it
+    rather than only fixing the phrase.)
+
     ### The edge batch 4 created, and why the map was stale
 
     Batch 4 split `Role::template()`/`Role::instructions_file()` into free
@@ -673,6 +681,96 @@ from a unit test of product code, agents are banned from running cargo locally
     re-bless is owed, no visibility narrows or widens beyond `pub` items staying
     `pub`, and `src-tauri/tests/` is untouched — which is the proof that the
     re-export surface is complete rather than a claim about it.
+  - **Batch 9 — `subproc`, `fsatomic`: the two "host primitives" that were not
+    host calls.** Two clusters lifted out of `orchestration/mod.rs` into two new
+    engine modules:
+
+    - **`subproc`** — bounded child-process capture (#656, split out of
+      `OrchRegistry::capture_with_timeout` by #698): `GH_CAPTURE_TIMEOUT` and
+      its three sibling constants, `wait_bounded`, `capture_raw_with_timeout`
+      and the injected-wait `capture_raw_inner` behind it,
+      `abandon_child_and_readers`, and the process-wide
+      `GH_CAPTURE_LEAKED_READERS` backlog with its sweep, its ceiling and its
+      `#[doc(hidden)]` test seams.
+    - **`fsatomic`** — durable whole-file replace (#133): `atomic_write` and the
+      `ATOMIC_WRITE_SEQ` counter that keeps two concurrent writers' `.tmp`
+      siblings apart. (The identically-shaped `atomic_write`s in
+      `src-tauri/src/fileedit.rs` and `src-tauri/src/uistate.rs` are separate
+      copies serving the editor and the UI-state file; consolidating them is a
+      question of its own and is **not** this batch.)
+
+    ### Why two modules and not one `hostio`
+
+    They were lifted in one batch and belong in none. They share no symbol, no
+    design note and no failure mode: `subproc` exists because a child parked on
+    a stalled connection stops the single poll loop and every `notify_when`
+    notice with it; `fsatomic` exists because a disk-full `fs::write` truncated
+    `tasks.json` and destroyed a live board. The only thing they have in common
+    is the batch that moved them. **A batch is a unit of moving, not a unit of
+    grouping** — batches 5 and 6 argued which modules *must* travel together,
+    and this is the mirror question: items that travel together do not thereby
+    belong together, and a module named for what its members share with the
+    batch is a name the next reader cannot use.
+
+    ### "Host primitive" was a label, not a measurement
+
+    Both were called pane-host calls before anyone re-read them. Batch 5 left
+    `mqdriver` behind on the stated ground that it "reaches the pane host
+    (`capture_raw_with_timeout`)", and §6's batch-5 entry said so in this file.
+    Re-deriving the edge set at the start of this batch found no host edge in
+    either cluster: no `tauri`, no `AppHandle`, no pty, no pane — `std::process`
+    + `std::thread` for one, `std::fs` for the other. They moved as ordinary
+    `std` leaves, and the A3 trait work they were supposedly waiting on was
+    never theirs to wait for. Batch 5's rule survives its own counter-example
+    and this is the sharpest instance of it: **re-derive the edge set from the
+    source at the start of every batch** — including from the notes this repo
+    wrote down, which describe a tree as it was and are not evidence about the
+    tree as it is.
+
+    A consequence worth carrying into the next batch, stated as what it is (a
+    grep over the source, not a compiler's verdict): after this batch every
+    `super::`/`crate::` path in `mqdriver.rs` and `mqloop.rs` resolves into the
+    engine — `mergeq`, `mergeqview`, `notify`, `workflow`,
+    `capture_raw_with_timeout`, `atomic_write` — so the edge that pinned both in
+    `src-tauri` is gone. Whether they move next is still a batch's own question
+    to re-derive, on the same terms the paragraph above insists on.
+
+    ### Edges and visibility
+
+    `subproc`'s single outward edge is `lock_safe` (the backlog `Mutex`), which
+    is `crate::obs::LockExt` here since batch 7 — the dependency batch 7 named
+    as its reason for going first, now discharged. `fsatomic` has no outward
+    edge at all. Neither pulls a dependency: both are `std`, so no manifest and
+    no lockfile line changes, and CLAUDE.md constraint 2 is satisfied the way
+    `fsatomic`'s own header states — a std atomic for unique temp names,
+    deliberately no `tempfile`.
+
+    `mod.rs` re-exports both as **curated item lists** (#988), never
+    `pub use module::{self}`, so no `orchestration::subproc::…` or
+    `orchestration::fsatomic::…` path exists and the private members of each
+    cluster stayed private in the engine rather than being widened to make a
+    move compile. One item's visibility is forced wider: `atomic_write` was
+    `pub(super)` in `mod.rs` and must be `pub` in the engine to be callable
+    across the crate boundary, so `loomux_engine::fsatomic::atomic_write` is
+    that crate's public API now. The `pub(super) use` in `mod.rs` fixes the
+    reach of the flat `orchestration::atomic_write` spelling and does **not**
+    narrow the item — the same correction `model.rs` carries, restated rather
+    than assumed. Harmless because `loomux-engine` is `publish = false`: public
+    means reachable by a sibling crate in this workspace.
+
+    ### What it owed in evidence
+
+    A **pure relocation**, exemption taken whole: no behaviour is added or
+    changed, and every behaviour the move could break is pinned by tests that
+    neither moved nor were edited. `src-tauri/tests/orchestration.rs` drives the
+    capture cluster through the flat re-export from ~20 call sites — the ceiling
+    (`gh_capture_admitted` against `GH_CAPTURE_MAX_LEAKED_READERS`), the bounded
+    wait's both verdicts, the non-zero-exit-as-data contract, the forced
+    wait-failure arm and the parked-reader accounting — and `atomic_write` is
+    exercised by every state-file round-trip in the same suite.
+    **`src-tauri/tests/` is untouched**, which is the proof the re-export surface is complete
+    rather than a claim about it. The `#[doc(hidden)]` seams travel with their
+    cluster; no test moved crate, since the cluster's coverage was never inline.
 - **A4 — the registry.** `OrchRegistry`, the decision layer, and a PTY
   output-sink seam, so the crate compiles with no `tauri` anywhere in its tree.
   A CI step proves that from `cargo tree` rather than from this paragraph. This

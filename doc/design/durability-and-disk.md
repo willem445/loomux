@@ -28,7 +28,9 @@ and special-cased cargo, so it was removed — #263.)
 
 ### The pattern
 
-`atomic_write(path, bytes)` in `orchestration/mod.rs` replaces a file durably:
+`atomic_write(path, bytes)` in `crates/loomux-engine/src/fsatomic.rs` (#888
+slice A3 batch 9; re-exported as `orchestration::atomic_write`, which is what
+every call site still spells) replaces a file durably:
 
 1. Write the new contents to a **same-directory** temp sibling
    (`.<name>.<pid>.<seq>.tmp`).

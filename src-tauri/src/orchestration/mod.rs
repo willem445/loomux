@@ -111,9 +111,11 @@ pub(crate) use loomux_engine::model::{default_model, sanitize_model_opt};
 // inside the moved files became `crate::model::…` rather than a new dependency.
 //
 // What deliberately did NOT come: `mqdriver`, which is `workflow`'s biggest
-// consumer. It reaches `capture_raw_with_timeout`, i.e. the pane host, which is
-// slice A3's problem — and an INBOUND edge does not block a move. It stays here
-// and spells `super::workflow::…` exactly as it always did, through this line.
+// consumer. It reaches `capture_raw_with_timeout` — and an INBOUND edge does
+// not block a move. It stays here and spells `super::workflow::…` exactly as it
+// always did, through this line. (This comment used to gloss that call as "i.e.
+// the pane host, which is slice A3's problem"; batch 9 re-measured it and there
+// is no host in it — see that batch's block below.)
 pub use loomux_engine::{locks, profiles, workflow};
 
 // Batch 5's one revision to a batch-4 decision, and the reason it is here
@@ -138,8 +140,9 @@ pub(crate) use loomux_engine::model::role_instructions_file;
 // `mergeqview::merge_queue_view`, and `mqdriver`/`mqloop` still spell
 // `super::mergeq::…` and `super::mergeqview::…` in their bodies — genuine
 // inbound edges, not doc-comment mentions, and this line is what answers them.
-// They stay because they reach the pane host (`capture_raw_with_timeout`),
-// which is slice A3; an inbound edge has never been what decides a batch.
+// They stay because of the edges they had at the time (`capture_raw_with_timeout`,
+// `atomic_write` — both in the engine as of batch 9, and neither a host call
+// after all); an inbound edge has never been what decides a batch.
 //
 // No visibility widened: neither module had a `pub(crate)` or `pub(super)` item
 // to widen, so unlike batches 3-5 there is no re-export choice to argue here.
@@ -177,6 +180,57 @@ pub use loomux_engine::{mergeq, mergeqview};
 pub use loomux_engine::model::Delivery;
 pub(crate) use loomux_engine::model::{DEFAULT_IDLE_TICK_MINUTES, DEFAULT_INTAKE_POLL_MINUTES};
 pub use loomux_engine::text::LOOMUX_NOTICE_MARKER;
+
+// #888 slice A3 batch 9 — the two HOST PRIMITIVES this file was still carrying,
+// into two modules on purpose:
+// - `subproc`, the bounded child-process capture (#656/#698): the timeout
+//   constants, `wait_bounded`, the two-pipe drain, and the process-wide ceiling
+//   on readers abandoned by a capture that gave up.
+// - `fsatomic`, the durable whole-file replace (#133): `atomic_write` and the
+//   sequence counter that keeps two concurrent writers' temp names apart.
+//
+// They are NOT combined into one `hostio` module, and the reason is that they
+// share nothing but the word "host": a bounded subprocess wait and a crash-safe
+// file replace answer different failure modes, cite different design notes, and
+// have no symbol in common. Neither is a pane-host call — both are pure `std`
+// (`std::process`/`std::thread` and `std::fs`), which is what let them move as
+// ordinary leaves without waiting on the host traits A3 otherwise introduces.
+// The comments above at the batch-5 and batch-6 lines called
+// `capture_raw_with_timeout` a pane-host call; re-measuring it for this batch
+// found no host in it, and both of those comments are corrected in place.
+//
+// `subproc`'s one outward edge is `lock_safe` (the backlog list's `Mutex`),
+// which is `crate::obs::LockExt` in the engine since batch 7 — that ordering
+// was batch 7's whole reason to go first. `fsatomic` has no outward edge at all.
+//
+// Visibility, stated precisely (the correction at model.rs:61-73 applies here
+// too): every item below was already `pub` in this file except `atomic_write`,
+// which was `pub(super)`. It has to be `pub` in the engine to be callable from
+// here at all, so `loomux_engine::fsatomic::atomic_write` IS public API of that
+// crate now — forced, not chosen. The `pub(super) use` below fixes only the
+// reach of the FLAT `orchestration::atomic_write` spelling (the one this file
+// and `mqloop.rs` call); it does not narrow the item, and nothing here claims
+// it does. Harmless because `loomux-engine` is `publish = false`: "public"
+// means reachable by a sibling crate in this workspace, not a shipped API.
+// Unlike `model`/`groupid`, neither line re-exports its module (`{self}`), so
+// no `orchestration::subproc::…` / `orchestration::fsatomic::…` path exists —
+// the items below are the whole surface, and the private members of each
+// cluster (`GH_CAPTURE_POLL_STEP`, `GH_CAPTURE_REAP_TIMEOUT`,
+// `GH_CAPTURE_LEAKED_READERS`, `sweep_leaked_readers`,
+// `abandon_child_and_readers`, `capture_raw_inner`, `ATOMIC_WRITE_SEQ`) stayed
+// private in the engine rather than being widened to make a move compile.
+pub use loomux_engine::subproc::{
+    capture_raw_with_timeout, gh_capture_admitted, wait_bounded, GH_CAPTURE_MAX_LEAKED_READERS,
+    GH_CAPTURE_TIMEOUT,
+};
+// The `#[doc(hidden)]` test seams (#699), kept hidden on the re-export too so
+// the flat spelling documents exactly as the items do.
+#[doc(hidden)]
+pub use loomux_engine::subproc::{
+    capture_raw_with_failing_wait_for_test, drain_parked_readers_for_test, gh_capture_live_readers,
+    gh_capture_parked_readers, seed_leaked_readers_for_test,
+};
+pub(super) use loomux_engine::fsatomic::atomic_write;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -1940,298 +1994,6 @@ const COMPACT_NUDGE_FAST_POLL_INTERVAL: Duration = Duration::from_secs(10);
 /// cadence is the finer `notify::NOTIFY_POLL_INTERVAL`. Same cadence, one
 /// fewer thread.
 const INTAKE_POLL_SCAN_INTERVAL: Duration = Duration::from_secs(60);
-/// Bound on ONE `gh` subprocess run by the poller (#656). `gh_capture` was a
-/// bare `Command::output()`, which waits forever; since #406 folded both
-/// pollers into a single loop, one child parked on a stalled connection stops
-/// every `notify_when` notice in the process — and the fleet's whole
-/// anti-deadlock discipline ("register the watch, end the turn") rests on
-/// those notices arriving.
-///
-/// Sized well above any healthy call rather than tight: a live `gh` list or
-/// `pr checks` lands in ~1s, and a false timeout is not free — `poll_watches`
-/// counts one as a failed poll, so three slow-but-live ticks in a row would
-/// cancel a watch that was about to resolve. A genuinely stalled connection
-/// hangs for minutes or forever, so anything in this band separates the two
-/// cases equally well; erring long only costs a slower tick. The bound is
-/// per-call, and with the per-tick caps on both halves
-/// (`notify::MAX_POLLS_PER_TICK`, `intake::MAX_INTAKE_POLLS_PER_TICK`) one
-/// tick is bounded too — generously, but bounded, which is the property that
-/// was missing.
-pub const GH_CAPTURE_TIMEOUT: Duration = Duration::from_secs(20);
-/// How often `capture_with_timeout` re-checks a still-running child. Fine
-/// enough to add no perceptible latency to a ~1s call, coarse enough that the
-/// wait costs nothing measurable on a loop that wakes every 30s.
-const GH_CAPTURE_POLL_STEP: Duration = Duration::from_millis(25);
-/// How long the timeout path waits to reap the child it just killed (#656,
-/// rev-lead finding 2). Reaping a killed process is normally instantaneous;
-/// this exists only so the tail of a bounded wait is itself bounded, for the
-/// one case where the kill cannot land immediately (a child in
-/// uninterruptible sleep). Short, because waiting longer buys nothing: if it
-/// hasn't been reaped by now it is not the sleep that is slow.
-const GH_CAPTURE_REAP_TIMEOUT: Duration = Duration::from_secs(2);
-/// Ceiling on reader threads left blocked on children `capture_with_timeout`
-/// abandoned (#656, rev-lead finding 1). Two per timed-out call, and a tick
-/// makes at most `notify::MAX_POLLS_PER_TICK` × 2 + `intake::
-/// MAX_INTAKE_POLLS_PER_TICK` × 2 = 24 calls, so this engages well inside a
-/// single pathological tick rather than after many — the point is to stop
-/// accumulation across ticks, which is where an unbounded leak would actually
-/// come from.
-pub const GH_CAPTURE_MAX_LEAKED_READERS: usize = 16;
-
-/// Reader threads abandoned by a timed-out `capture_with_timeout`, held so
-/// they can be counted rather than forgotten. Process-wide because the leak
-/// is: the bound has to survive across ticks, and there is one poll loop.
-static GH_CAPTURE_LEAKED_READERS: Mutex<Vec<std::thread::JoinHandle<Vec<u8>>>> = Mutex::new(Vec::new());
-
-/// Drop the handles of readers that have since ended and report how many are
-/// still blocked. A reader ends as soon as its pipe closes, which in the
-/// ordinary stall is the moment its child is killed — so this normally
-/// returns 0 and the ceiling below is never approached.
-fn sweep_leaked_readers() -> usize {
-    let mut leaked = GH_CAPTURE_LEAKED_READERS.lock_safe();
-    leaked.retain(|reader| !reader.is_finished());
-    leaked.len()
-}
-
-/// Whether a capture may spawn a child, given how many abandoned readers are
-/// still blocked. Pure, so the ceiling policy is testable without arranging a
-/// real leak — the `due_watches`/`due_intake_polls` idiom applied to the one
-/// other unbounded resource this poller can grow.
-pub fn gh_capture_admitted(live_readers: usize) -> bool {
-    live_readers < GH_CAPTURE_MAX_LEAKED_READERS
-}
-
-/// Bounded `Child::wait` (#656): poll until the child reports exit or
-/// `timeout` elapses. `Ok(None)` means it was still running at the deadline —
-/// the caller decides whether that is a kill or a give-up. Every wait on a
-/// child in this file goes through here, so there is no arm left that can
-/// block without a deadline.
-///
-/// `pub` for the same reason as `capture_with_timeout`: pinning "still
-/// running at the deadline" needs a real child, not a mock.
-pub fn wait_bounded(
-    child: &mut std::process::Child,
-    timeout: Duration,
-) -> Result<Option<std::process::ExitStatus>, String> {
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return Ok(Some(status)),
-            Ok(None) => {}
-            Err(e) => return Err(e.to_string()),
-        }
-        if std::time::Instant::now() >= deadline {
-            return Ok(None);
-        }
-        std::thread::sleep(GH_CAPTURE_POLL_STEP);
-    }
-}
-
-/// Spawn a child under a deadline and return **what it did**, not a verdict on
-/// it: its exit status, its stdout and its stderr (#656; split out of
-/// `OrchRegistry::capture_with_timeout` by #698).
-///
-/// Both callers need the same delicate machinery — null stdin, concurrent
-/// drains of both pipes, a bounded wait, a kill with its own bounded reap, and
-/// the process-wide abandoned-reader ceiling — and they differ only in what
-/// they do with the result. `capture_with_timeout` collapses a non-zero exit
-/// into `Err`, which is right for a `gh` read whose only question is "did it
-/// work". The merge queue cannot: `git ls-remote --exit-code` answers "does
-/// this ref exist" as `0` vs `2`, so for it a non-zero exit is **data**
-/// (`mqdriver::CmdOut`). Writing that a second time would be a second
-/// implementation of the one primitive in this file that must not have two —
-/// every arm of it exists because of a specific way an unbounded wait bites.
-///
-/// # Why the merge queue is in scope for the bound at all
-///
-/// Its `git`/`gh` calls run inside the same single poll loop (#406/#652), so a
-/// `git fetch` parked on a stalled connection would stop every `notify_when`
-/// notice in the fleet from firing — precisely the failure #656 closed, and the
-/// one the fleet's "register the watch, end the turn" discipline rests on.
-///
-/// See [`OrchRegistry::capture_with_timeout`]'s comment for the argument behind
-/// each step; it is not repeated here.
-pub fn capture_raw_with_timeout(
-    cmd: std::process::Command,
-    timeout: Duration,
-) -> Result<(std::process::ExitStatus, String, String), String> {
-    capture_raw_inner(cmd, timeout, wait_bounded)
-}
-
-/// The same capture with its **main wait forced to fail** — the one arm of
-/// `capture_raw_inner` that a test cannot otherwise reach (#699).
-///
-/// Reaching it for real needs `Child::try_wait` itself to error, which no
-/// supported platform does on demand, and the arm is precisely where the
-/// reader accounting used to be dropped. So the wait is injected rather than
-/// mocked away: the production entry point above hands in `wait_bounded` and
-/// this one hands in a closure that errors, and every other step — the spawn,
-/// the two readers, the abandon accounting, the post-kill reap — is the same
-/// code in both. Same `#[doc(hidden)] pub` idiom as
-/// `seed_leaked_readers_for_test`: a seam, not a second implementation.
-#[doc(hidden)] // pub for integration tests: force the wait-error early return
-pub fn capture_raw_with_failing_wait_for_test(
-    cmd: std::process::Command,
-    timeout: Duration,
-) -> Result<(std::process::ExitStatus, String, String), String> {
-    capture_raw_inner(cmd, timeout, |_child, _timeout| Err("forced wait failure (test seam)".to_string()))
-}
-
-/// Give up on a child mid-capture: kill it, reap it on its own deadline, and
-/// park **both** readers where the ceiling can see them — the one accounting
-/// step every abandonment arm goes through (#699). Returns `reason` so a call
-/// site is a single `return Err(abandon_child_and_readers(…))` and cannot
-/// account for one reader, or neither, by omission.
-///
-/// The reap goes through `wait_bounded` for the reason `GH_CAPTURE_REAP_TIMEOUT`
-/// exists: a bound whose last act is an unbounded `wait()` is not a bound. On
-/// the wait-error arm that reap will normally fail immediately too (whatever
-/// broke `try_wait` is still broken), which costs nothing — it is an `Err`,
-/// which is already bounded, and the kill above is what the readers need.
-fn abandon_child_and_readers(
-    child: &mut std::process::Child,
-    out_reader: std::thread::JoinHandle<Vec<u8>>,
-    err_reader: std::thread::JoinHandle<Vec<u8>>,
-    reason: String,
-) -> String {
-    let _ = child.kill();
-    let _ = wait_bounded(child, GH_CAPTURE_REAP_TIMEOUT);
-    let mut leaked = GH_CAPTURE_LEAKED_READERS.lock_safe();
-    leaked.push(out_reader);
-    leaked.push(err_reader);
-    reason
-}
-
-/// The body of the capture, with the main wait injected so the wait-error arm
-/// is reachable from a test (see `capture_raw_with_failing_wait_for_test`).
-/// `wait` is `wait_bounded` in production and nothing else.
-fn capture_raw_inner(
-    mut cmd: std::process::Command,
-    timeout: Duration,
-    wait: impl Fn(&mut std::process::Child, Duration) -> Result<Option<std::process::ExitStatus>, String>,
-) -> Result<(std::process::ExitStatus, String, String), String> {
-    use std::io::Read as _;
-    use std::process::Stdio;
-
-    let live = sweep_leaked_readers();
-    if !gh_capture_admitted(live) {
-        return Err(format!("gh capture backlog: {live} readers still blocked on abandoned children"));
-    }
-
-    // stdin: `output()` nulls it implicitly, `spawn()` does not — and an
-    // inherited stdin is how a `gh` that decides to prompt hangs forever. It
-    // matters at least as much for `git`, whose credential helpers prompt on a
-    // terminal the backend does not have anyone watching.
-    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = cmd.spawn().map_err(|e| e.to_string())?;
-    let mut child_out = child.stdout.take().expect("stdout piped just above");
-    let mut child_err = child.stderr.take().expect("stderr piped just above");
-    let out_reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = child_out.read_to_end(&mut buf);
-        buf
-    });
-    let err_reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = child_err.read_to_end(&mut buf);
-        buf
-    });
-
-    // From here on both readers exist, and every exit accounts for both of
-    // them exactly once: the arm below joins them, and every arm that gives up
-    // on a live child parks them via `abandon_child_and_readers` (kill, bounded
-    // reap, park). Nothing between the two `spawn`s above and this point can
-    // return, and the two returns that precede them — the backlog refusal and a
-    // failed `Command::spawn` — have no readers to account for. (A panic in the
-    // second `std::thread::spawn` would unwind past all of this rather than
-    // return through it; out of scope, and the design note records why.)
-    //
-    // #699: the wait-error arm used to be a bare `?`. Uncounted is worse than
-    // parked, not better — the ceiling admits on "how many readers are still
-    // blocked", so readers the sweep can never see make the bound understate
-    // the process it exists to bound, and the child stayed alive too (dropping
-    // a `Child` does not kill it), which is precisely what keeps those readers
-    // blocked forever.
-    let waited = match wait(&mut child, timeout) {
-        Ok(waited) => waited,
-        Err(e) => return Err(abandon_child_and_readers(&mut child, out_reader, err_reader, e)),
-    };
-    let Some(status) = waited else {
-        return Err(abandon_child_and_readers(
-            &mut child,
-            out_reader,
-            err_reader,
-            format!("timed out after {}s", timeout.as_secs()),
-        ));
-    };
-
-    // Exited on its own: both pipes are at EOF (or about to be), so these joins
-    // are the bounded tail of a wait that already finished.
-    let stdout = out_reader.join().unwrap_or_default();
-    let stderr = err_reader.join().unwrap_or_default();
-    Ok((
-        status,
-        String::from_utf8_lossy(&stdout).into_owned(),
-        String::from_utf8_lossy(&stderr).into_owned(),
-    ))
-}
-
-#[doc(hidden)] // pub for integration tests: observe the process-wide reader backlog
-pub fn gh_capture_live_readers() -> usize {
-    sweep_leaked_readers()
-}
-
-/// The backlog list itself, **unswept**: how many reader handles are parked,
-/// whether or not their reader has since ended (#699).
-///
-/// `gh_capture_live_readers` answers the question the ceiling asks and is
-/// therefore the wrong instrument for pinning the accounting: on an ordinary
-/// abandonment the kill closes both pipes and the readers end within
-/// milliseconds, so a swept count cannot tell "parked, then ended" from "never
-/// parked at all" — it reads the same either way, and which one a test sees is
-/// a race it loses on some platforms and not others. Counting the list itself
-/// makes "both handles were handed to the ceiling" observable on its own terms.
-#[doc(hidden)] // pub for integration tests
-pub fn gh_capture_parked_readers() -> usize {
-    GH_CAPTURE_LEAKED_READERS.lock_safe().len()
-}
-
-/// Empty the backlog and hand back what was parked, so a test can start from a
-/// known-zero baseline (#699).
-///
-/// The list is process-wide and every capture test contributes to it, so "this
-/// call parked exactly two" is not observable as a before/after delta: the
-/// confound is not merely what earlier tests left behind, it is that the next
-/// capture's own opening sweep *removes* the ones that have since ended, moving
-/// the count down underneath the baseline while the two new handles push it up
-/// (measured on CI: before 4, after 4, with both readers correctly parked).
-///
-/// Dropping a `JoinHandle` does not stop its thread — the handles simply stop
-/// being tracked, which is the same residue the ceiling already tolerates for
-/// a reader that ended, and it is confined to a test process.
-#[doc(hidden)] // pub for integration tests
-pub fn drain_parked_readers_for_test() -> Vec<std::thread::JoinHandle<Vec<u8>>> {
-    std::mem::take(&mut *GH_CAPTURE_LEAKED_READERS.lock_safe())
-}
-
-/// Park `n` controllable blocked readers in the backlog, as a real abandoned
-/// reader would be. Dropping the returned senders releases them, so a test
-/// can drive both the refusal and the drain without arranging a grandchild
-/// that holds a pipe — which is neither portable nor deterministic.
-#[doc(hidden)] // pub for integration tests
-pub fn seed_leaked_readers_for_test(n: usize) -> Vec<mpsc::Sender<()>> {
-    let mut holds = Vec::new();
-    let mut leaked = GH_CAPTURE_LEAKED_READERS.lock_safe();
-    for _ in 0..n {
-        let (tx, rx) = mpsc::channel::<()>();
-        holds.push(tx);
-        leaked.push(std::thread::spawn(move || {
-            let _ = rx.recv(); // ends when the test drops its sender
-            Vec::new()
-        }));
-    }
-    holds
-}
 /// Merge-gate hot-reload (#385): how often `run_workflow_gate_reload` re-checks
 /// every advanced-orchestrator group's `.loomux/workflow.yml` against its
 /// currently-armed gate. A human edit reading the workflow file wants to feel
@@ -11988,58 +11750,6 @@ fn rotate_audit_locked(dir: &Path, cap: u64) {
             std::thread::sleep(pause);
         }
         let _ = fs::rename(&path, dir.join("audit.1.jsonl")); // replaces the old generation
-    }
-}
-
-/// Monotonic counter that makes every temp filename unique, so two concurrent
-/// writers to the same durable file never share a `.tmp` sibling. Some of the
-/// files written through `atomic_write` (state.json, group.json) are not
-/// serialized under a lock, so distinct temp names are what keeps a concurrent
-/// pair from corrupting each other's scratch file. A std atomic keeps us clear
-/// of the getrandom-based crates the Windows 10 baseline can't load (see the
-/// Cargo.toml notes) — no `tempfile` needed for a unique name.
-static ATOMIC_WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
-
-/// Durably replace `path` with `bytes`: write a same-directory temp file, flush
-/// it to disk, then atomically rename it over the destination. A failure or
-/// crash mid-write leaves the previous good file intact (at worst an orphaned
-/// `.tmp` sibling) — never the truncated/empty destination that plain
-/// `fs::write` produces. This is the #133 fix: a disk-full `fs::write` had
-/// truncated tasks.json and destroyed the live board.
-///
-/// Same-directory temp is required for rename atomicity on Windows — a rename
-/// across volumes falls back to a non-atomic copy. `fs::rename` on Windows maps
-/// to `MoveFileExW` with `REPLACE_EXISTING`, which atomically replaces the
-/// destination on the same volume, so the primary path already does the right
-/// thing; the fallback only covers the rare case where the destination is
-/// briefly locked (antivirus, an open reader). The temp is fsync'd before the
-/// rename so a rename can't expose a metadata-only file whose data blocks never
-/// reached disk — exactly the disk-full failure mode.
-pub(super) fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    // Ensure the destination dir exists — group state dirs always do, but the #83
-    // grant subdirs (`merge_grants/`, `release_grants/`) may be fresh.
-    fs::create_dir_all(dir)?;
-    let stem = path.file_name().and_then(|n| n.to_str()).unwrap_or("state");
-    let seq = ATOMIC_WRITE_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp = dir.join(format!(".{stem}.{}.{seq}.tmp", std::process::id()));
-    {
-        let mut f = fs::File::create(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?; // durable before the rename — the disk-full guard
-    }
-    match fs::rename(&tmp, path) {
-        Ok(()) => Ok(()),
-        Err(_) => {
-            // Rename can fail if the destination is momentarily locked. Fall
-            // back to a direct write so the update isn't lost; keep the temp on
-            // failure so the new contents remain recoverable.
-            let r = fs::write(path, bytes);
-            if r.is_ok() {
-                let _ = fs::remove_file(&tmp);
-            }
-            r
-        }
     }
 }
 
