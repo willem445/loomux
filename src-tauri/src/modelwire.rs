@@ -335,15 +335,15 @@ fn sweep_with(
     // `&cli` destructures the `&&str` the iterator yields, so every call below
     // takes the `&str` its parameter is written as rather than leaning on a
     // coercion through a closure's `Fn` bound.
+    // RED-BEFORE-GREEN MUTATION F (#1020 rev-713 nb6): back to interleaved, so
+    // detection sits behind every earlier CLI's help probe again.
     for &cli in clis {
+        probe(cli);
         if protocol_for(cli).is_none() {
             continue;
         }
         let reply = ask(cli);
         emit(ModelsDetected { program: cli.to_string(), reply });
-    }
-    for &cli in clis {
-        probe(cli);
     }
 }
 
