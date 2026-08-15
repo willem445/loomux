@@ -14778,9 +14778,13 @@ fn a_liaison_is_never_taken_by_the_idle_reaper() {
         )
         .unwrap();
     assert_eq!(desk.block, "desk");
-    reg.set_pty_for_test(&orch.id, 984);
-    reg.set_pty_for_test(&rev.id, 985);
-    reg.set_pty_for_test(&desk.id, 986);
+    // The standard probe here, and required rather than cosmetic: an
+    // orchestrator with no bound pane REFUSES the report's notice ("no app
+    // handle") and the tool call comes back an error, which says nothing about
+    // the idle clock this test is about. Paused delivery queues and audits
+    // exactly what an unpaused one does, and the pause touches nothing the
+    // reaper reads.
+    pause_with_pane(&reg, &g.id, &orch.id, 987);
 
     // Both report, both go idle. This is the trap in one line: for the liaison
     // that is the moment the human's conversation starts, not the moment it ends.
