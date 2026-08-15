@@ -193,12 +193,21 @@ fn parse_accepts_every_real_shape_the_families_actually_use() {
         // the mixed-case tail are exactly what the pre-#722 hex-only alphabet
         // rejected, so they are the regression this row guards.
         "ses_03bd2d53dffeiBvu9PvuCPjxT7",
-        // agent ids, as minted (`w-N`, `rev-N`, the orchestrator, solo panes)
-        "orch",
+        // Agent ids, as actually minted: `Role::prefix()` (a `&'static str`)
+        // plus a counter, so always `^(orch|w|rev|plan|solo)-[0-9]{1,10}$`.
+        "orch-1",
         "w-1",
         "w-711",
+        "rev-2",
+        "plan-1",
+        "solo-1",
+        // BLOCK ids, which are a different family and were mislabelled as agent
+        // ids here (rev-lead N3). A block id rides in `AgentEntry.block`, never
+        // in `.id` — but it does become `<id>.md` in the group dir, so it
+        // belongs in this suite on its own merits, under its own name.
         "rev-lead",
         "process",
+        "worker-deep",
         // merge-queue batch ids
         "mq-7f3a0000",
         "mq-1",
@@ -287,29 +296,43 @@ fn the_group_id_and_segment_validators_cannot_drift_apart() {
 /// different question — so the gap needed its own guard rather than a fifth
 /// heuristic bolted onto that one.
 ///
-/// # What it flags
+/// # What it flags, and why the trigger names nothing
 ///
-/// A `format!` template that interpolates a known raw-id binding **and**
-/// carries a file-extension literal is a file name being built out of an
-/// identifier. That is a finding unless its exact normalized text is on
-/// [`SANCTIONED`] with the reason it is safe — which, in every current case, is
-/// that the binding is a `PathSegment` at that function's signature and so
-/// carries its own proof.
+/// **A `format!` whose template both interpolates something and carries a
+/// file-extension literal is a file name being built out of a value.** That is
+/// the whole trigger. It does not ask what the binding is *called*.
 ///
-/// The extension literal is what keeps this precise: `format!("agent={agent_id}
-/// pty={pty_id}")` is a breadcrumb, not a path, and there are dozens of those.
+/// The first version of this scan did ask, and CLAUDE.md's source-scanning-guard
+/// convention says not to: *"a rename steps over it, so it enforces nothing … a
+/// name heuristic is a labelled supplement at best"*. That was not theoretical
+/// here. This PR renamed `claude_transcript_path`'s parameter `session_id` →
+/// `session` as ordinary tidying, and that rename alone moved
+/// `format!("{session}.jsonl")` — the declared assembly point for claude
+/// transcript paths — out of the name list and clean out of this scan's view.
+/// A reviewer found it, not the guard. The name list is gone; the trigger is now
+/// the shape.
+///
+/// Two things keep the shape precise:
+///
+/// - **The extension is matched inside the `format!` string literal, not
+///   anywhere on the line.** `json!({ "reason": "unusable merge_queue.json",
+///   "detail": format!("{e:?}") })` has `.json` on the line and builds no path;
+///   scoping to the literal drops it and two like it.
+/// - **`#[cfg(test)]` regions are skipped**, the same exclusion the sibling scan
+///   makes for `tests/`: fixtures build file names from ids constantly, which is
+///   their job. Tracked by brace depth from the attribute, so it is the region
+///   that is skipped, not a guessed line range.
 ///
 /// # Limits, stated rather than implied
 ///
 /// Textual, like its sibling, and it inherits the same honesty requirement.
-/// Not caught, and no attempt is made to: an extension held in a `const` or
-/// pushed with `PathBuf::push`; a template split across lines; an id renamed to
-/// a binding outside [`ID_BINDINGS`]; a file name assembled by `String`
-/// concatenation instead of `format!`. What actually holds the property is the
+/// Not caught, and no attempt is made to: an extension held in a `const`
+/// (`{handle}{CLAUDE_AGENT_FILE_EXT}` is real and invisible here); a name built
+/// by `String` concatenation or `PathBuf::push` rather than `format!`; a
+/// template split across lines. What actually holds the property is the
 /// **signature** — a function taking `&PathSegment` cannot be handed a raw
 /// `&str` at all — and this scan is defence in depth over a *new* site being
-/// added with a raw binding, which is the way the guarantee would realistically
-/// erode.
+/// added raw, which is how the guarantee would realistically erode.
 ///
 /// The allowlist's third field is what stops that honesty from being a slogan:
 /// each exemption names the signature it depends on, and the scan re-checks it
@@ -319,24 +342,11 @@ fn the_group_id_and_segment_validators_cannot_drift_apart() {
 /// would leave the flagged line byte-identical and every check green.
 #[test]
 fn no_raw_identifier_is_interpolated_into_a_file_name() {
-    /// Binding names that carry an identifier into a file name.
-    ///
-    /// `agent_seg` is deliberately on this list even though the name already
-    /// implies a parsed segment, and the reason is worth stating: the first
-    /// version of this test left it off, which made the two `{agent_seg}` rows
-    /// in [`SANCTIONED`] unreachable — the scan filtered those lines out before
-    /// ever consulting the allowlist, so the rows sat there looking like
-    /// coverage while asserting nothing. (The stale-row guard at the bottom is
-    /// what caught it.)
-    ///
-    /// Listing it converts "trust the variable name" into a checked claim: the
-    /// line is flagged, the allowlist row answers for it, and that row's proof
-    /// field pins that `agent_seg` is still *derived from a `PathSegment::parse`*
-    /// rather than being some other local that happens to share the name.
-    const ID_BINDINGS: &[&str] = &["session_id", "agent_id", "agent_seg", "sid", "group_id"];
-
-    /// File-extension literals that mark a `format!` as building a file name.
-    const EXTENSIONS: &[&str] = &[".json", ".jsonl", ".log", ".toml", ".yaml", ".md", ".txt"];
+    /// File-extension literals that mark a `format!` template as building a file
+    /// name. Matched inside the template only — see this test's doc.
+    const EXTENSIONS: &[&str] = &[
+        ".json", ".jsonl", ".log", ".toml", ".yaml", ".md", ".txt", ".cmd", ".ps1", ".sh",
+    ];
 
     /// Every sanctioned identifier-into-file-name site: the line text, the
     /// argument for why it is safe, and — third field — **the text that has to
@@ -389,17 +399,85 @@ fn no_raw_identifier_is_interpolated_into_a_file_name() {
             "write_hook_settings_file(&GroupId, &PathSegment, _)",
             "agent_id: &PathSegment,",
         ),
-        // Same argument, for the site this scan itself found (#925): the
-        // parameter is `session_id: &PathSegment` on `find_claude_session_cwd`,
-        // and `find_session_cwd` is the one place that parses. The binding kept
-        // the name `session_id` deliberately — renaming it to something outside
-        // `ID_BINDINGS` would silence this scan by evasion, which is the exact
-        // failure mode the sibling guard in `groupid.rs` was rewritten twice to
-        // avoid. Writing the argument down is the honest way past it.
+        // The site this scan itself found (#925): parsed once in
+        // `find_session_cwd`, threaded as a type from there.
         (
             "let candidate = project.path().join(format!(\"{session_id}.jsonl\"));",
             "find_claude_session_cwd(root, &PathSegment) — parsed in find_session_cwd",
             "fn find_claude_session_cwd(root: &Path, session_id: &PathSegment)",
+        ),
+        // The site the NAME-BASED version of this scan could not see, because
+        // this PR renamed the parameter `session_id` -> `session` (rev-lead B2).
+        // It is the declared assembly point for a claude transcript path, so a
+        // guard blind to it was guarding nothing that mattered. The trigger no
+        // longer consults names, so it is caught by shape now — this row exists
+        // to answer for it, and its proof pins the parameter's type.
+        (
+            "let name = format!(\"{session}.jsonl\");",
+            "claude_transcript_path(root, &PathSegment) — the declared assembly point",
+            "fn claude_transcript_path(root: &Path, session: &PathSegment)",
+        ),
+        // Not an identifier family at all: `write_shim`/`write_refusal_shim`
+        // take `program: &str`, and every call site passes a string LITERAL —
+        // the proofs below are those call sites, so a future caller threading a
+        // caller-supplied name through here would strand the row and fail the
+        // stale-row check. Listed because a trigger that does not consult names
+        // cannot tell a fixed internal name from an id by looking; that is the
+        // honest cost of dropping the name heuristic, and an argued row is the
+        // price.
+        (
+            "let _ = fs::write(dir.join(format!(\"{program}.cmd\")), cmd(&real_fwd, sh_path).as_bytes());",
+            "write_shim — `program` is a literal at every call site, not a caller id",
+            "self.write_shim(&dir, \"gh\", gh_shim_sh, gh_shim_cmd, sh_path.as_deref(), &shim_paths);",
+        ),
+        (
+            "let _ = fs::write(dir.join(format!(\"{program}.cmd\")), cmd.as_bytes());",
+            "write_refusal_shim — `program` is a literal at its call site",
+            "self.write_refusal_shim(&dir, \"loomux\", loomux_shim_sh(), loomux_shim_cmd());",
+        ),
+        // Guarded by the predicate that now delegates to `check_segment`, and
+        // guarded in the BUILDER rather than by the caller — the structural
+        // form, per that function's own rev-183 note.
+        (
+            "Some(std::env::temp_dir().join(format!(\"loomux-mq-{}-{kind}.md\", batch_id.trim())))",
+            "body_file_path refuses the id itself via valid_id_component",
+            "if !valid_id_component(batch_id) {",
+        ),
+        // A roster agent id, which is minted rather than supplied: `Role::prefix()`
+        // is a `&'static str` and the numeric suffix comes from a counter, so
+        // `AgentEntry.id` is always `^(orch|w|rev|plan|solo)-[0-9]+$`. These two
+        // are reads of a hook marker; the id never leaves the roster.
+        (
+            "let precompact_marker = hooks_dir.join(format!(\"{}.precompact.json\", a.id));",
+            "a.id is a minted roster id, never caller-supplied",
+            "let agent_id = format!(\"{}-{seq}\", block.prefix());",
+        ),
+        (
+            "let sessionstart_marker = hooks_dir.join(format!(\"{}.sessionstart-compact.json\", a.id));",
+            "a.id is a minted roster id, never caller-supplied",
+            "let agent_id = format!(\"{}-{seq}\", block.prefix());",
+        ),
+        // Not an identifier at all — a formatted timestamp.
+        (
+            "let path = dir.join(format!(\"crash-{}.log\", stamp(now)));",
+            "crash-log name is a timestamp, not an id",
+            "fn stamp(",
+        ),
+        // **The known non-member of this family, and the reason it is listed
+        // rather than fixed here.** A workflow block id becomes `<id>.md` in the
+        // group dir, and it is validated by `workflow::sanitize_id` — a FIFTH
+        // predicate, weaker than `check_segment` on exactly the two rules
+        // `pathseg.rs` says the alphabet does not give you: it permits a leading
+        // `-` and a reserved device name. Converting it is out of #925's scope
+        // (block ids come from operator-authored `.loomux/workflow.yml`, not
+        // from a caller, so it is not a containment breach) — but the guard
+        // should SAY so rather than be silently blind to it, which is the whole
+        // of rev-lead's B3. CLAUDE.md constraint 6 names it too.
+        (
+            "format!(\"{}.md\", self.id)",
+            "block ids are validated by workflow::sanitize_id — a separate, weaker predicate, \
+             deliberately not converted by #925",
+            "fn sanitize_id(",
         ),
         // These two interpolate a locally-parsed `PathSegment` rather than the
         // raw parameter. The binding name is a hint, not the evidence — the
@@ -418,6 +496,42 @@ fn no_raw_identifier_is_interpolated_into_a_file_name() {
 
     fn normalize(line: &str) -> String {
         line.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// The `format!` string literal on this line, if any — from `format!("` to
+    /// the closing quote, honouring `\"`. Scoping the extension match to THIS
+    /// rather than to the whole line is what keeps `json!({ "…merge_queue.json",
+    /// "detail": format!("{e:?}") })` from reading as a path build.
+    fn format_template(line: &str) -> Option<&str> {
+        let start = line.find("format!(\"")? + "format!(\"".len();
+        let rest = &line[start..];
+        let mut prev_backslash = false;
+        for (i, c) in rest.char_indices() {
+            match c {
+                '\\' => prev_backslash = !prev_backslash,
+                '"' if !prev_backslash => return Some(&rest[..i]),
+                _ => prev_backslash = false,
+            }
+        }
+        None
+    }
+
+    /// Does the template interpolate anything at all? `{{` is an escaped brace,
+    /// not a hole.
+    fn interpolates(template: &str) -> bool {
+        let b: Vec<char> = template.chars().collect();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == '{' {
+                if b.get(i + 1) == Some(&'{') {
+                    i += 2;
+                    continue;
+                }
+                return true;
+            }
+            i += 1;
+        }
+        false
     }
 
     const ROOTS: &[(&str, &str)] = &[
@@ -449,21 +563,42 @@ fn no_raw_identifier_is_interpolated_into_a_file_name() {
     for (label, path) in &files {
         let src = std::fs::read_to_string(path).unwrap();
         let name = format!("{label}/{}", path.file_name().unwrap().to_string_lossy());
+        // `#[cfg(test)]` region tracking: `pending` arms on the attribute, the
+        // region opens on the next `{` and closes when brace depth returns to
+        // zero. Fixtures build file names from ids constantly — that is their
+        // job — and the sibling scan excludes `tests/` for the same reason.
+        let mut pending_cfg_test = false;
+        let mut test_depth: i32 = -1;
+        let mut depth: i32 = 0;
         for (i, line) in src.lines().enumerate() {
             let trimmed = line.trim_start();
+            let opens = line.matches('{').count() as i32;
+            let closes = line.matches('}').count() as i32;
+            let depth_before = depth;
+            depth += opens - closes;
+            if test_depth >= 0 {
+                if depth <= test_depth {
+                    test_depth = -1; // left the `#[cfg(test)]` region
+                }
+                continue;
+            }
+            if pending_cfg_test && opens > 0 {
+                pending_cfg_test = false;
+                test_depth = depth_before;
+                continue;
+            }
+            if trimmed.starts_with("#[cfg(test)]") {
+                pending_cfg_test = true;
+                continue;
+            }
             if trimmed.starts_with("//") {
                 continue;
             }
-            let Some(fmt_at) = trimmed.find("format!(\"") else { continue };
-            let template = &trimmed[fmt_at..];
-            let builds_a_file_name = EXTENSIONS.iter().any(|e| template.contains(e));
-            if !builds_a_file_name {
-                continue;
-            }
-            let interpolates_an_id = ID_BINDINGS
-                .iter()
-                .any(|b| template.contains(&format!("{{{b}}}")));
-            if !interpolates_an_id {
+            let Some(template) = format_template(trimmed) else { continue };
+            // Both halves are required, and each drops a distinct false
+            // positive: without the extension every breadcrumb `format!`
+            // qualifies, and without the interpolation every literal path does.
+            if !EXTENSIONS.iter().any(|e| template.contains(e)) || !interpolates(template) {
                 continue;
             }
             let norm = normalize(trimmed);
