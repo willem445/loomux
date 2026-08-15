@@ -199,9 +199,9 @@
 //! say which of the two it is has not drawn its own line.
 //!
 //! It is also where batch 5's inbound-edge rule meets real code rather than
-//! prose. `mqdriver` and `mqloop` do not merely name `mergeq` in doc comments:
-//! they import from it in their bodies (`use super::mergeq::{new_batch_id,
-//! scratch_branch, …}`, `use super::mergeqview::MERGE_QUEUE_FILE`) and call
+//! prose. `mqdriver` and `mqloop` did not merely name `mergeq` in doc comments:
+//! they imported from it in their bodies (`use super::mergeq::{new_batch_id,
+//! scratch_branch, …}`, `use super::mergeqview::MERGE_QUEUE_FILE`) and called
 //! `mergeq::recheck_gate`. Both stayed in `src-tauri` — for the edges they had
 //! at the time, which batch 9 re-measured and found were not host edges at all
 //! (see its entry below) — both spelled `super::` exactly as before, and both
@@ -307,9 +307,13 @@
 //! `OrchRegistry::capture_with_timeout`, `mqdriver`'s `ProcessRunner`, and
 //! every `atomic_write` call site — resolving through curated item-list
 //! re-exports in `orchestration/mod.rs`, which is why the integration suite
-//! needed no edit. (`mqdriver` is [`mqdriver`] here as of batch 12a and calls
-//! [`subproc::capture_raw_with_timeout`] directly; `atomic_write`'s callers are
-//! unaffected.)
+//! needed no edit. (Both of those callers have since crossed: `mqdriver` is
+//! [`mqdriver`] here as of batch 12a and calls
+//! [`subproc::capture_raw_with_timeout`] directly, and `mqloop` — one of the
+//! `atomic_write` call sites — is [`mqloop`] here as of 12b and calls
+//! [`fsatomic::atomic_write`] directly. Every remaining `atomic_write` caller is
+//! in `src-tauri`'s `orchestration/mod.rs` and still reaches it through the
+//! `pub(super) use` there, unaffected.)
 //!
 //! A3 batch 10 — the DELIVERY QUEUE: [`queue`], the pure core of the per-pane
 //! FIFO (#445/#468/#467 — admission, coalescing, the flush plan, the
