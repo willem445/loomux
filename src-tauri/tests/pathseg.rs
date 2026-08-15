@@ -319,8 +319,21 @@ fn the_group_id_and_segment_validators_cannot_drift_apart() {
 /// would leave the flagged line byte-identical and every check green.
 #[test]
 fn no_raw_identifier_is_interpolated_into_a_file_name() {
-    /// Bindings that are raw `&str` identifiers somewhere in this codebase.
-    const ID_BINDINGS: &[&str] = &["session_id", "agent_id", "sid", "group_id"];
+    /// Binding names that carry an identifier into a file name.
+    ///
+    /// `agent_seg` is deliberately on this list even though the name already
+    /// implies a parsed segment, and the reason is worth stating: the first
+    /// version of this test left it off, which made the two `{agent_seg}` rows
+    /// in [`SANCTIONED`] unreachable — the scan filtered those lines out before
+    /// ever consulting the allowlist, so the rows sat there looking like
+    /// coverage while asserting nothing. (The stale-row guard at the bottom is
+    /// what caught it.)
+    ///
+    /// Listing it converts "trust the variable name" into a checked claim: the
+    /// line is flagged, the allowlist row answers for it, and that row's proof
+    /// field pins that `agent_seg` is still *derived from a `PathSegment::parse`*
+    /// rather than being some other local that happens to share the name.
+    const ID_BINDINGS: &[&str] = &["session_id", "agent_id", "agent_seg", "sid", "group_id"];
 
     /// File-extension literals that mark a `format!` as building a file name.
     const EXTENSIONS: &[&str] = &[".json", ".jsonl", ".log", ".toml", ".yaml", ".md", ".txt"];
@@ -338,6 +351,16 @@ fn no_raw_identifier_is_interpolated_into_a_file_name() {
     /// both types, so the compiler would not object either. Requiring the
     /// signature to still be present is what makes each row a checked claim
     /// rather than a promise.
+    ///
+    /// **The proof is file-scoped, not function-scoped**, and that limit is
+    /// stated rather than glossed: it asserts the text is somewhere in the same
+    /// file, so where two sites share a proof string (the four `agent_id:
+    /// &PathSegment` parameters all live in `mod.rs`) reverting *one* of them
+    /// would not trip it. It raises the cost of a silent revert; it does not
+    /// make one impossible. Binding a proof to its enclosing function would mean
+    /// parsing Rust, which is the line this scan deliberately does not cross —
+    /// the compiler is what actually holds the type, and this is defence in
+    /// depth over the allowlist rotting.
     ///
     /// Anything not listed is a finding until it is argued for and added — that
     /// is what makes this default-deny rather than a blocklist. Normalized
@@ -359,12 +382,12 @@ fn no_raw_identifier_is_interpolated_into_a_file_name() {
         (
             "let path = dir.join(format!(\"{agent_id}-gemini-policy.toml\"));",
             "write_gemini_policy(dir, &PathSegment, _)",
-            "fn write_gemini_policy(",
+            "agent_id: &PathSegment,",
         ),
         (
             "let path = dir.join(format!(\"{agent_id}-hooks.json\"));",
             "write_hook_settings_file(&GroupId, &PathSegment, _)",
-            "fn write_hook_settings_file(",
+            "agent_id: &PathSegment,",
         ),
         // Same argument, for the site this scan itself found (#925): the
         // parameter is `session_id: &PathSegment` on `find_claude_session_cwd`,
@@ -378,8 +401,9 @@ fn no_raw_identifier_is_interpolated_into_a_file_name() {
             "find_claude_session_cwd(root, &PathSegment) — parsed in find_session_cwd",
             "fn find_claude_session_cwd(root: &Path, session_id: &PathSegment)",
         ),
-        // These two interpolate a locally-parsed `PathSegment`, not the raw
-        // parameter — the binding name itself is the evidence.
+        // These two interpolate a locally-parsed `PathSegment` rather than the
+        // raw parameter. The binding name is a hint, not the evidence — the
+        // proof field is, and it pins the parse itself still being there.
         (
             "let path = dir.join(format!(\"{agent_seg}.json\"));",
             "write_mcp_config parses `agent_id` into `agent_seg` at entry",
