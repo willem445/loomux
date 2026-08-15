@@ -306,6 +306,7 @@ const FIELDS_WITHOUT_AN_EDITOR = new Set<string>([
   "intake.labels.investigate",
   "intake.labels.owned",
   "intake.labels.prototype",
+  "intake.labels.hold",
   "merge_queue.enabled",
   "merge_queue.max_batch",
   "merge_queue.checks_timeout_minutes",
