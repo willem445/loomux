@@ -1386,23 +1386,24 @@ export class WorkflowView {
           // Everything below touches THIS form's DOM, so it stops here if that
           // form is gone (#997 review NB-1). An ask spawns a CLI and can be in
           // flight for seconds — long enough for the human to select another
-          // block, at which point `renderForm()` has detached these rows and
-          // nulled `repaintBlockKnobs`. The probe reply below takes the same
-          // early-out, for the same reason.
+          // block, at which point `renderInspector()` has detached these rows
+          // and nulled `repaintBlockKnobs`. The probe reply below takes the
+          // same early-out, for the same reason.
           //
           // **It refreshes whatever form IS on screen, by the safe method — it
-          // does not bare-`renderForm()`** (#997 review NB3-1). The form the
-          // human moved to was rendered before this reply landed, so its knob
-          // rows are stale and do owe a repaint; but `renderForm()` here would
-          // `replaceChildren` a form they may be typing in, destroying the input
-          // under their caret and dropping focus to `<body>`. That is the pane's
-          // own rule — "the form is redrawn only when the human isn't inside it"
-          // — and the first cut of this early-out broke it while its comment
-          // claimed to be following a sibling that does not. This IS the
-          // sibling's treatment now, which is what makes the claim above true.
+          // does not bare-`renderInspector()`** (#997 review NB3-1). The form
+          // the human moved to was rendered before this reply landed, so its
+          // knob rows are stale and do owe a repaint; but `renderInspector()`
+          // here would `replaceChildren` a form they may be typing in,
+          // destroying the input under their caret and dropping focus to
+          // `<body>`. That is the pane's own rule — "the form is redrawn only
+          // when the human isn't inside it" — and the first cut of this
+          // early-out broke it while its comment claimed to be following a
+          // sibling that does not. This IS the sibling's treatment now, which
+          // is what makes the claim above true.
           if (!this.formPane.contains(picker.root)) {
             if (this.formPane.contains(document.activeElement)) this.repaintBlockKnobs?.();
-            else this.renderForm();
+            else this.renderInspector();
             return;
           }
           // Mid-type guard: rebuilding the menu under a half-typed id hides the
@@ -1414,23 +1415,25 @@ export class WorkflowView {
           // does, for the same reason.
           knobs.setModel(picker.value);
           // **Through the live method, never the captured `repaintKnobs`**
-          // (#997 review NB-1). `renderForm()` clears `repaintBlockKnobs` before
-          // rebuilding precisely so a late reply cannot paint into a detached
-          // row; a closure holding this form's own repainter would walk around
-          // that guard. `?.` is what makes the treatment *actually* identical to
-          // `ensureCliKnobs`'s rather than only similar to it.
+          // (#997 review NB-1). `renderInspector()` clears `repaintBlockKnobs`
+          // before rebuilding precisely so a late reply cannot paint into a
+          // detached row; a closure holding this form's own repainter would
+          // walk around that guard. `?.` is what makes the treatment
+          // *actually* identical to `ensureCliKnobs`'s rather than only
+          // similar to it.
           //
           // Which branch runs: NOT the in-place one, in practice. The detect
           // button disables itself before awaiting (`modelpicker.ts`), and a
           // disabled element is not focusable — the browser blurs it, so
-          // `document.activeElement` is `<body>` and this is the `renderForm()`
-          // branch. Both refresh the knobs, and rebuilding is safe with focus on
-          // `<body>`; the conditional stays because the human may have clicked
-          // into another field while the ask was in flight, and that case really
-          // does need the in-place repaint. (Corrected from a comment that
-          // asserted the opposite — #997 review NB-2.)
+          // `document.activeElement` is `<body>` and this is the
+          // `renderInspector()` branch. Both refresh the knobs, and
+          // rebuilding is safe with focus on `<body>`; the conditional stays
+          // because the human may have clicked into another field while the
+          // ask was in flight, and that case really does need the in-place
+          // repaint. (Corrected from a comment that asserted the opposite —
+          // #997 review NB-2.)
           if (this.formPane.contains(document.activeElement)) this.repaintBlockKnobs?.();
-          else this.renderForm();
+          else this.renderInspector();
         }),
     });
     repaint();
