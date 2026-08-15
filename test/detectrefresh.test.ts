@@ -159,6 +159,44 @@ function detectCallSites(rawText: string, where: string): { body: string; at: nu
   return sites;
 }
 
+/** The top-level arguments of the `marker` call inside `text`, each trimmed.
+ *
+ *  Split at depth-zero commas rather than by regex, because the thing being
+ *  asserted IS the arity: a pattern that merely correlates with two arguments is
+ *  satisfied by any comma in a nested call, which is exactly the near-vacuous
+ *  assertion this replaced (rev-721 NB-9).
+ *
+ *  Limits, stated rather than left to be discovered: it counts delimiters, not
+ *  tokens, so a comma inside a string literal or a template placeholder would
+ *  split an argument in two. Neither subscription contains one today, and the
+ *  arity assertion that follows would fail LOUDLY rather than silently pass if
+ *  one appeared — the safe direction, and the same trade the rest of this file
+ *  makes. Throws if the call has no balanced argument list, so a shape this
+ *  cannot read is never mistaken for a shape that passes. */
+function callArguments(text: string, marker: string, where: string): string[] {
+  const at = text.indexOf(marker);
+  assert.notEqual(at, -1, `${where}: \`${marker}\` is not in the extracted region — this scan is reading the wrong thing`);
+  const open = at + marker.length;
+  const args: string[] = [];
+  let depth = 0;
+  let start = open;
+  for (let i = open; i < text.length; i += 1) {
+    const c = text[i];
+    if (c === "(" || c === "{" || c === "[") depth += 1;
+    else if (c === ")" || c === "}" || c === "]") {
+      if (depth === 0) {
+        args.push(text.slice(start, i).trim());
+        return args.filter((a) => a !== "");
+      }
+      depth -= 1;
+    } else if (c === "," && depth === 0) {
+      args.push(text.slice(start, i).trim());
+      start = i + 1;
+    }
+  }
+  throw new Error(`${where}: the argument list after \`${marker}\` is unbalanced — this scan could not read it`);
+}
+
 /** Every `<catalog>.onReport(` subscription body in `text`. The push route's
  *  half of the same contract; same extraction rule, same vacuity guard. */
 function onReportBodies(rawText: string, where: string): string[] {
@@ -213,6 +251,46 @@ test("the workflow pane's detection refresh reaches the knobs, the findings and 
     "the refresh must not call the form-local `repaintKnobs()` closure at all — it walks around the null-clearing " +
       "that stops a late reply painting a detached row"
   );
+});
+
+test("each host's refresh funnel is idempotent per CLI, so the two routes cannot both apply", () => {
+  // **rev-721 NB-8.** The push and the pull are two deliveries of ONE sweep
+  // answer and both can land. The catalog-level test (*the two routes racing
+  // does not repaint a form twice*) pins `acceptReport`'s refusal, which only
+  // covers the PULL-FIRST ordering — the one that already worked. The
+  // push-first ordering is guarded solely by these host-side marks, and rev-721
+  // verified that deleting BOTH left the whole suite green: a fix whose removal
+  // nothing notices is a fix that comes back out.
+  //
+  // Both halves are asserted because either one alone is inert. Without the
+  // `has(...)` early-return the mark is written and never read; without the
+  // `add(...)` the guard is read and never true. The `applyDetection` /
+  // `refreshRoleFromDetection` scans above already prove these funnels are what
+  // BOTH routes call, which is what makes a mark inside them sufficient.
+  //
+  // Reachability by name, like everything else in this file — see the header.
+  const FUNNELS = [
+    { file: "workflowview.ts", fn: "private applyDetection(" },
+    { file: "launcher.ts", fn: "private refreshRoleFromDetection(" },
+  ] as const;
+  for (const { file, fn } of FUNNELS) {
+    const text = stripComments(src(file));
+    const at = text.indexOf(fn);
+    assert.notEqual(at, -1, `${file}: \`${fn}\` was renamed — this scan is asserting a name that is gone`);
+    const body = text.slice(at, text.indexOf("\n  }", at));
+    assert.match(
+      body,
+      /if \(this\.detectionsApplied\.has\([^)]*\)\) return;/,
+      `${file}'s funnel must refuse a delivery it has already applied — otherwise the push-first ordering repaints ` +
+        `twice, and the second rebuild can land under a caret because a deferred one fires on blur`
+    );
+    assert.match(
+      body,
+      /this\.detectionsApplied\.add\(/,
+      `${file}'s funnel must RECORD the delivery it just applied — a guard that is never made true is a guard that ` +
+        `never fires, and the suite would stay green either way`
+    );
+  }
 });
 
 test("the workflow pane's detection refresh never rebuilds the form unconditionally", () => {
@@ -366,11 +444,25 @@ test("both hosts take the startup sweep's push, and answer for their own livenes
   const LIVENESS = { "workflowview.ts": /!this\.disposed/, "launcher.ts": /aliveForReports\(\)/ };
   for (const file of ["workflowview.ts", "launcher.ts"] as const) {
     for (const body of onReportBodies(src(file), file)) {
+      // rev-721 NB-9. This was `/onReport\(\s*[\s\S]*,[\s\S]*\)/`, which any
+      // comma anywhere in the statement satisfies — including one inside an
+      // argument list in the handler body — so it could not fail for the reason
+      // its message gave. Split the argument list at depth instead: the shape
+      // being asserted is genuinely arity, so count it rather than pattern-match
+      // something that correlates with it.
+      const args = callArguments(body, "onReport(", `${file}'s onReport`);
+      assert.equal(
+        args.length,
+        2,
+        `${file} must pass \`onReport\` a liveness predicate as its OWN argument, not fold liveness into the ` +
+          `delivery callback: the catalog has to be able to ask "are you still there?" without repainting, which ` +
+          `is the whole fix for the retention leak. Got ${args.length} argument(s): ${JSON.stringify(args)}`
+      );
       assert.match(
-        body,
-        /onReport\(\s*[\s\S]*,[\s\S]*\)/,
-        `${file} must pass \`onReport\` a liveness predicate as its own argument, not fold liveness into the ` +
-          `delivery callback — the catalog has to be able to ask without repainting`
+        args[1],
+        /^\(\s*\)\s*=>/,
+        `${file}'s liveness argument must be a zero-argument predicate the catalog can call at any time — it is ` +
+          `invoked when no repaint is wanted, so it must not be the delivery callback wearing a second hat: ${args[1]}`
       );
       assert.match(
         body,
