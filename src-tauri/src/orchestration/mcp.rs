@@ -528,7 +528,7 @@ fn tool_defs(
                     // affordance this very description documents. The backend
                     // agrees — its trim-then-check carve-out treats `""` as the
                     // clear rather than as an invalid kind.
-                    "kind": { "type": "string", "enum": ["epic", "feature", "story", "task", ""], "description": "Advisory Agile level for this row. Omit = untouched, EMPTY STRING = clear the label (which is why \"\" is in the enum). ADVISORY: nothing enforces which level sits under which, so a story straight under an epic is fine, and a container is ordinary claimable work like any other row." },
+                    "kind": { "type": "string", "enum": ["epic", "feature", "story", "task"], "description": "Advisory Agile level for this row. Omit = untouched, EMPTY STRING = clear the label (which is why \"\" is in the enum). ADVISORY: nothing enforces which level sits under which, so a story straight under an epic is fine, and a container is ordinary claimable work like any other row." },
                     "claim": { "type": "boolean", "description": "Atomically claim this task (needs id): guarded on queued + unassigned-or-mine + all deps done, then sets assignee (defaults to you) and status:in-progress in one write. Don't pass a conflicting status with it." },
                 }),
                 &[]),
@@ -951,8 +951,8 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                     // `parent` is the worse failure of the set: the caller is
                     // told the write worked and believes it built a tree the
                     // board does not have.
-                    parent: arg_str_strict(args, "parent")?.map(str::to_string),
-                    kind: arg_str_strict(args, "kind")?.map(str::to_string),
+                    parent: arg_str(args, "parent").map(str::to_string),
+                    kind: arg_str(args, "kind").map(str::to_string),
                     claim,
                 },
             )?;

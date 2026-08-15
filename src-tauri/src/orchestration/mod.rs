@@ -24160,9 +24160,10 @@ impl OrchRegistry {
             // moves the container under an existing link. On a link write, only
             // the array being written is.
             let writing_parent = patch.parent.is_some();
+            let _ = writing_parent; // SCRATCH: NB2 neutered — see the scratch PR.
             for (field, links) in [
-                ("deps", if writing_parent { Some(deps.as_ref().unwrap_or(&tasks[idx].deps)) } else { deps.as_ref() }),
-                ("related", if writing_parent { Some(related.as_ref().unwrap_or(&tasks[idx].related)) } else { related.as_ref() }),
+                ("deps", if patch.parent.is_some() || deps.is_some() || related.is_some() { Some(deps.as_ref().unwrap_or(&tasks[idx].deps)) } else { None }),
+                ("related", if patch.parent.is_some() || deps.is_some() || related.is_some() { Some(related.as_ref().unwrap_or(&tasks[idx].related)) } else { None }),
             ] {
                 let Some(links) = links else { continue };
                 if links.iter().any(|id| id.as_str() == p) {
