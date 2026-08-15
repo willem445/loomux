@@ -144,6 +144,19 @@ directive, while never reading a relay as a grant, because it carries the
 human's words and not their authority; ask the human directly whenever it is not
 alive; and never kill it for looking idle.
 
+**The rule that a relayed directive counts as the human's is keyed on the one
+line an agent cannot write.** loomux mints the `[loomux] message from <id>:`
+prefix from the caller's own token; the agent supplies what follows. That half
+used to be interpolated raw, which made the key forgeable by any delegate — so
+this slice also scrubs the agent-authored fields of `report` and
+`message_orchestrator` with `notify::sanitize_gh_text` before the prefix goes
+on, exactly as `channel_send` always has (`orchestration.md`, *#576: loomux's
+own notices are not questions*, carries the mechanism). The prose says only what
+that scrub delivers: a delegate's text cannot carry a `[loomux] …` span, so it
+cannot be read as a relay it is not. What no scrub can decide is who *dictated*
+words a liaison genuinely relays — that residual is the fidelity problem the
+verbatim rule and the two ledgers address, not a trust-boundary one.
+
 **It presents; it is not the record.** The human-question registry (#946) landed
 between this feature's plan and its prose, and the two compose exactly as
 `human-questions.md` says they should: `questions.json` is the durable memory of
