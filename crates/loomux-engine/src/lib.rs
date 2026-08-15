@@ -497,6 +497,7 @@ pub mod profiles;
 pub mod queue;
 pub mod queuestate;
 pub mod report;
+pub mod rootreg;
 pub mod subproc;
 pub mod termgrid;
 pub mod text;
