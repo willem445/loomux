@@ -164,6 +164,37 @@ test("copilot draws the vendored mark, and the other first-class CLIs draw lette
   assert.notEqual(agentMark({ command: "claude" })!.svg, agentMark({ command: "opencode" })!.svg);
 });
 
+test("a program named after a prototype member is not a licensed mark", () => {
+  // REVIEW NB2. `MARK[program]` is a dictionary lookup keyed by a name taken off a launch
+  // line, so with an ordinary object literal `MARK["constructor"]` and `MARK["__proto__"]`
+  // came back TRUTHY — inherited members — and took the "this program has a licensed brand
+  // mark" branch with `viewBox` and `body` undefined. The pane drew an empty box asserting
+  // loomux holds a mark it does not hold, and the claim that the letter tier is TOTAL had a
+  // hole in it for exactly two inputs.
+  //
+  // Not a security hole (the interpolated value is the literal string "undefined", and the
+  // clamp is untouched), which is why it is pinned as correctness rather than as safety.
+  for (const name of ["constructor", "__proto__", "valueof", "tostring", "hasownproperty"]) {
+    const view = agentMarkFor(name);
+    assert.notEqual(
+      view.kind,
+      "mark",
+      `${name} resolved to a licensed mark; the lookup is reading the prototype chain`
+    );
+    assert.equal(view.svg.includes("undefined"), false, `${name} rendered an undefined field`);
+    assert.match(view.svg, /viewBox="0 0 16 16"/, `${name} lost its grid`);
+  }
+
+  // And the same names arriving the way a user would actually deliver them.
+  assert.notEqual(agentMark({ command: "constructor --go" })?.kind, "mark");
+  assert.notEqual(agentMark({ command: "C:\\bin\\constructor.exe" })?.kind, "mark");
+  assert.notEqual(agentMark({ knownCli: "__proto__", remote: true })?.kind, "mark");
+
+  // The real entry still resolves — a fix that broke the table would pass everything above.
+  assert.equal(agentMarkFor("copilot").kind, "mark");
+  assert.deepEqual(MARK_PROGRAMS, ["copilot"], "the vendored set changed without its paperwork");
+});
+
 test("the program name is read the same way the rest of the app reads it", () => {
   // Not a re-test of `normalizeAgentProgram` — a test that this module went through it
   // (#452's single derivation) instead of parsing the first token privately. A private
@@ -369,4 +400,42 @@ test("the pane header actually renders the mark", () => {
   const pane = read("../src/pane.ts");
   assert.match(pane, /from "\.\/agenticons\.ts"/, "src/pane.ts does not import the resolver");
   assert.match(pane, /agentMark\(/, "src/pane.ts never calls agentMark");
+});
+
+/** The body of `Pane.refreshAgentMark`, on its own. Scoped to the ONE method rather than
+ *  scanning all of pane.ts, so an unrelated mention of `sshDefaultCli` elsewhere in a
+ *  ten-thousand-line file cannot satisfy the assertions below — a consumer scan that can be
+ *  satisfied by the wrong line is a pin that reads like coverage and isn't. */
+function refreshAgentMarkBody(): string {
+  const pane = read("../src/pane.ts");
+  const m = pane.match(/private refreshAgentMark\(\): void \{([\s\S]*?)\n {2}\}/);
+  assert.ok(m, "Pane.refreshAgentMark is gone or no longer matches the expected shape");
+  return m[1];
+}
+
+test("the pane feeds its SSH state to the resolver, not just its launch line", () => {
+  // REVIEW NB1. The round-1 blocker (an SSH pane captioned "Agent CLI: ssh") was fixed in
+  // TWO places, and only one of them was pinned: the resolver's own logic is covered by the
+  // SSH test above, but nothing checked that pane.ts still HANDS it the ssh state. Deleting
+  // these two lines from `refreshAgentMark` left the whole suite green — the resolver stayed
+  // correct and became unreachable, which is the exact regression this round exists for and
+  // the one a reader would be least likely to spot in a refactor.
+  //
+  // `knownCli` and `remote` are asserted separately because they answer different questions
+  // and can be lost independently: without `knownCli` a remote Claude pane degrades to the
+  // neutral badge (wrong but honest), while without `remote` it falls through to the launch
+  // line and wears the transport again (the original defect).
+  const body = refreshAgentMarkBody();
+  assert.match(
+    body,
+    /knownCli:\s*this\.sshDefaultCli/,
+    "refreshAgentMark no longer passes the SSH profile's far-end CLI — a remote agent pane " +
+      "cannot name its agent, however correct the resolver is"
+  );
+  assert.match(
+    body,
+    /remote:\s*this\.isSshPane/,
+    "refreshAgentMark no longer marks SSH panes as remote — the resolver will read argv[0] " +
+      'and caption the pane "Agent CLI: ssh" again (#992 review B1)'
+  );
 });
