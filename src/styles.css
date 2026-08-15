@@ -1689,6 +1689,24 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .role-row > .dlg-select { min-width: 0; }
 .role-row > .dlg-select:disabled { opacity: 0.55; cursor: not-allowed; }
 .model-picker select, .model-picker input { width: 100%; }
+/* #993: the facts the CLI itself reported about the selected model, plus the
+   context window. Hidden outright when there is nothing to say — an empty line
+   would reserve height in every picker that has never been detected. */
+.model-picker-summary {
+  font-size: 11px; line-height: 1.4; color: #565c6d;
+  overflow-wrap: anywhere;
+}
+/* The one control in a picker that spawns an agent CLI. Deliberately quiet and
+   self-aligned rather than full width: it is an occasional ask, not the field. */
+.model-picker-detect {
+  align-self: start;
+  background: transparent; color: var(--text-dim, #565c6d);
+  border: 1px solid var(--border); border-radius: 7px;
+  padding: 2px 8px; font: inherit; font-size: 11px; cursor: pointer;
+  transition: border-color 0.15s var(--ease), color 0.15s var(--ease);
+}
+.model-picker-detect:hover:not(:disabled) { color: var(--text); border-color: var(--accent, #6b7cff); }
+.model-picker-detect:disabled { opacity: 0.55; cursor: progress; }
 .dlg-input, .dlg-select {
   background: var(--surface-0); color: var(--ink);
   border: 1px solid var(--line); border-radius: 7px;

@@ -25,6 +25,7 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { knobState, knobValue, type CliKnobs } from "../src/selectorknobs.ts";
+import type { ModelDetail } from "../src/modelcatalog.ts";
 
 /** The `agent_cli_knobs` reply for claude, verbatim from `CLI_CAPS`. */
 const CLAUDE: CliKnobs = {
@@ -327,4 +328,82 @@ test("rev-237 finding 1: the opencode fixture's notes mirror the Rust source the
     );
   }
   assert.ok(declared("context_note").includes("model-determined"), "tests match on 'model-determined'");
+});
+
+// ---- narrowing the effort knob by what the CLI reported (#993) -------------
+//
+// `CLI_CAPS` says what a CLI can deliver in general; a `list_models` reply says
+// what THIS model on THIS machine actually offers. The reply wins where it
+// speaks — and, critically, must be silent where it says nothing, because the
+// vendor's own `ModelInfo` marks every capability field optional and a real
+// `haiku` row omits them all.
+
+const detail = (over: Partial<ModelDetail> & { id: string }): ModelDetail => ({
+  resolvedId: "",
+  name: "",
+  description: "",
+  supportsEffort: null,
+  effortLevels: [],
+  ...over,
+});
+
+test("with nothing detected the effort knob is exactly what it always was", () => {
+  // The default, and every caller that predates #993 takes it. Passing no
+  // detail must not change one byte of the old behaviour.
+  const before = knobState(CLAUDE, "claude", "sonnet");
+  const after = knobState(CLAUDE, "claude", "sonnet", null);
+  assert.deepEqual(after, before);
+  assert.deepEqual(after.effort.values, ["low", "medium", "high", "xhigh", "max"]);
+});
+
+test("the levels a CLI reported for a model replace the general set", () => {
+  const state = knobState(CLAUDE, "claude", "opus", detail({ id: "opus", supportsEffort: true, effortLevels: ["low", "high"] }));
+  assert.deepEqual(state.effort.values, ["low", "high"], "the machine's answer outranks the written-down set");
+  assert.equal(state.effort.enabled, true);
+  assert.equal(state.effort.reason, "");
+});
+
+test("a model that reports no effort setting turns the knob off, with its own name in the reason", () => {
+  const state = knobState(
+    CLAUDE,
+    "claude",
+    "auto",
+    detail({ id: "auto", name: "Auto", supportsEffort: false })
+  );
+  assert.equal(state.effort.enabled, false);
+  assert.deepEqual(state.effort.values, [], "a disabled knob offers nothing — knobValue would refuse it anyway");
+  assert.match(state.effort.reason, /Auto/, "a disabled knob has to say why (the #687 rule)");
+});
+
+test("an omitted capability field is silence, not a denial", () => {
+  // The failure this test exists for: a real `haiku` row carries no
+  // `supportsEffort` at all. Reading absent as `false` would turn the effort
+  // knob OFF for a model whose CLI never raised the subject — a capability
+  // removed on no evidence.
+  const state = knobState(CLAUDE, "claude", "haiku", detail({ id: "haiku", name: "Haiku" }));
+  assert.equal(state.effort.enabled, true, "absent must not disable");
+  assert.deepEqual(state.effort.values, ["low", "medium", "high", "xhigh", "max"]);
+});
+
+test("a detected model cannot resurrect a knob the CLI has no seam for", () => {
+  // Narrowing only ever narrows. `caps` is still the outer bound: copilot's
+  // effort lives in its settings file, so no reply about a model may make
+  // loomux offer a flag it cannot put on the wire.
+  const noSeam: CliKnobs = { ...CLAUDE, cli: "copilot", effort: { values: [], note: "copilot has no effort flag" } };
+  const state = knobState(noSeam, "copilot", "auto", detail({ id: "auto", supportsEffort: true, effortLevels: ["low", "high"] }));
+  assert.equal(state.effort.enabled, false);
+  assert.equal(state.effort.reason, "copilot has no effort flag");
+});
+
+test("a detected model does not loosen the context gate either", () => {
+  // The `[1m]` gate is a documented vendor fact about aliases, not something a
+  // list-models reply speaks to. Detection must leave it exactly alone.
+  const state = knobState(CLAUDE, "claude", "haiku", detail({ id: "haiku", supportsEffort: true, effortLevels: ["low"] }));
+  assert.equal(state.context.enabled, false);
+  assert.match(state.context.reason, /haiku\[1m\] is not a Claude model alias/);
+});
+
+test("a stale reply for another CLI is still refused before any narrowing", () => {
+  const state = knobState(CLAUDE, "copilot", "auto", detail({ id: "auto", supportsEffort: true, effortLevels: ["low"] }));
+  assert.equal(state.effort.enabled, false, "the cli mismatch outranks everything, detection included");
 });

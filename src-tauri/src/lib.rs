@@ -10,6 +10,7 @@ mod git;
 mod gitwatch;
 mod winpath;
 mod metrics;
+mod modelwire; // the list-models control probe (#993)
 mod obs;
 pub mod opencodedb; // pub: the #722 usage-readback integration tests link its reader
 pub mod orchestration; // pub: integration smoke test links through it
@@ -212,6 +213,7 @@ pub fn run() {
             orchestration::orch_confirm_solo_copilot_autopilot,
             orchestration::orch_solo_adopt,
             cliprobe::probe_agent_cli,
+            modelwire::list_cli_models,
             editor::open_in_editor,
             fileedit::ft_list_dir,
             fileedit::ft_read_file,

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-list-cli-models"
+description = "Enables the list_cli_models command without any pre-configured scope."
+commands.allow = ["list_cli_models"]
+
+[[permission]]
+identifier = "deny-list-cli-models"
+description = "Denies the list_cli_models command without any pre-configured scope."
+commands.deny = ["list_cli_models"]

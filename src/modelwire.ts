@@ -61,6 +61,31 @@
 
 import type { ModelDetail, ModelReport } from "./modelcatalog.ts";
 
+/** The raw reply from a CLI's own list-models control request — the wire shape
+ *  of the backend's `list_cli_models` (`src-tauri/src/modelwire.rs`), owned here
+ *  rather than in `pty.ts` for the reason `CliProbe` is owned by
+ *  `modelcatalog.ts`: the pure module that reasons about the reply is the one a
+ *  test can import. */
+export interface CliModelReply {
+  /** The CLI's stdout, verbatim and capped by the backend. */
+  output: string;
+  /** The correlation id the backend put on the request it sent, or `""`. */
+  request_id: string;
+  /** Human-readable reason nothing could be asked, or `null`. */
+  error: string | null;
+}
+
+/** Turn a backend reply into a report, correlating on the id the backend says
+ *  it actually sent. The single call site every surface should use — it is what
+ *  keeps "which id did we send" from being a fact stated twice. */
+export function readCliModelReply(reply: CliModelReply): ModelReport {
+  const report = parseListModelsReply(reply.output, reply.request_id);
+  // A backend error only survives when the reply itself said nothing useful: a
+  // CLI that answered is not failing, whatever the exit code implied.
+  if (report.models.length) return report;
+  return { models: [], error: report.error ?? reply.error };
+}
+
 /** A `Record`-shaped value, or `null` for anything else. Narrowing helper: the
  *  reply is untrusted JSON, so every hop is checked rather than asserted. */
 function obj(v: unknown): Record<string, unknown> | null {

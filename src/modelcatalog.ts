@@ -338,8 +338,12 @@ export class ModelCatalog {
    *  shorthand would put this module out of reach of its own tests. */
   private readonly probeFn: (program: string) => Promise<CliProbe>;
 
-  constructor(probeFn: (program: string) => Promise<CliProbe>) {
+  constructor(
+    probeFn: (program: string) => Promise<CliProbe>,
+    detectFn: ((program: string) => Promise<ModelReport>) | null = null
+  ) {
     this.probeFn = probeFn;
+    this.detectFn = detectFn;
   }
 
   probe(program: string): Promise<CliProbe> {
@@ -375,9 +379,88 @@ export class ModelCatalog {
   }
 
   /** The options to offer for `cli` RIGHT NOW: curated, merged with the probe
-   *  reply if one has landed. Synchronous by design — a form paints immediately
-   *  and re-paints when {@link probe} resolves. */
+   *  reply if one has landed, then with anything the CLI's own list-models reply
+   *  named. Synchronous by design — a form paints immediately and re-paints when
+   *  {@link probe} or {@link detect} resolves.
+   *
+   *  The list-models ids go through the same {@link mergeModelOptions} the probe
+   *  reply does, and for the same reason: a machine's own answer beats a
+   *  suggestion, so they lead, and the curated entries stay behind them rather
+   *  than being replaced. Detection therefore only ever ADDS rows and re-orders
+   *  them — a role's default is still on the menu afterwards, which is the
+   *  property `orchclis.test.ts` names. */
   models(cli: string): string[] {
-    return modelOptions(cli, this.cached(cli));
+    const base = modelOptions(cli, this.cached(cli));
+    const detected = this.report(cli);
+    return detected ? mergeModelOptions(base, detected.models.map((m) => m.id)) : base;
+  }
+
+  // ---- the list-models control probe (#993) --------------------------------
+  //
+  // A SECOND seam rather than a widening of the first, because the two are
+  // spent differently. `probe` reads what a CLI prints unprompted and every
+  // surface fires it on open; `detect` spawns the CLI to ask it a question, and
+  // the claim that the question is free is a third party's, not the vendor's
+  // (`src-tauri/src/modelwire.rs`). Constraint 3 says loomux does not bet the
+  // human's money on that, so this one moves only when a human asks it to —
+  // which is a property of WHO CALLS IT, and folding it into `probe` would
+  // delete the distinction that makes it true.
+
+  private detectInflight = new Map<string, Promise<ModelReport>>();
+  private detectResolved = new Map<string, ModelReport>();
+
+  /** The injected backend call (`pty.ts`'s `listCliModels`, read through
+   *  `modelwire.ts`). Optional: the launcher's own catalog is constructed
+   *  before this slice existed in it, and a catalog with no detector simply
+   *  reports nothing rather than failing. */
+  private readonly detectFn: ((program: string) => Promise<ModelReport>) | null;
+
+  /** Ask `program` for its own model list. **Only ever from a human gesture.**
+   *
+   *  Memoized exactly like {@link probe} and by the same argument, with one
+   *  extra edge to it: here the memo is not only saving an IPC, it is the thing
+   *  that stops a second click spawning a second agent CLI. A reply that
+   *  carried nothing is still not kept — a CLI installed or upgraded mid-session
+   *  must be able to answer on the next ask — but that re-ask costs another
+   *  gesture, never a repaint.
+   *
+   *  Never rejects: a detection that failed leaves every surface exactly as it
+   *  was. */
+  detect(program: string): Promise<ModelReport> {
+    const kept = this.detectResolved.get(program);
+    if (kept) return Promise.resolve(kept);
+    const detect = this.detectFn;
+    if (!detect) return Promise.resolve(reportFailure("this catalog has no list-models detector wired"));
+    let p = this.detectInflight.get(program);
+    if (!p) {
+      p = detect(program)
+        .catch((e: unknown) => reportFailure(String(e)))
+        .then((r) => {
+          if (reportWorthKeeping(r)) this.detectResolved.set(program, r);
+          this.detectInflight.delete(program);
+          return r;
+        });
+      this.detectInflight.set(program, p);
+    }
+    return p;
+  }
+
+  /** Whether a detection for `program` is in flight — for a control that should
+   *  read "asking…" rather than invite a second spawn. */
+  detecting(program: string): boolean {
+    return this.detectInflight.has(program);
+  }
+
+  /** The list-models reply already in hand for `cli`, or `null`. */
+  report(cli: string): ModelReport | null {
+    return this.detectResolved.get(cli) ?? null;
+  }
+
+  /** What the CLI reported about one model, or `null` when it has not been
+   *  asked, or asked and said nothing about this id. All three are the same
+   *  thing to a surface: show what you already knew. */
+  detail(cli: string, id: string): ModelDetail | null {
+    const report = this.report(cli);
+    return report ? detailFor(report.models, id) : null;
   }
 }

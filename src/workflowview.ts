@@ -879,7 +879,10 @@ export class WorkflowView {
    *  and the call failed, which `knobState` renders as disabled-with-a-reason. */
   private knobLookup = (cli: string, model: string): KnobStates | null => {
     const caps = this.cliKnobs.get(cli);
-    return caps === undefined ? null : knobState(caps, cli, model);
+    // #993: the detected per-model levels narrow the CLI's general set. The
+    // validation pass reads the same lookup the editor's controls do, so a
+    // block cannot be flagged for a level the picker was still offering.
+    return caps === undefined ? null : knobState(caps, cli, model, modelCatalog.detail(cli, model));
   };
 
   /** Ask what models `cli` reports, at most once per pane — see {@link modelProbes}. */
@@ -1345,13 +1348,24 @@ export class WorkflowView {
     // other — it is the REPLY that carries nothing today — and with nothing on
     // either side the picker opens straight onto that custom input.
     const cli = b.cli.trim();
+    const repaint = (): void => {
+      const now = this.analysis.workflow.blocks[index]?.model ?? picker.value;
+      picker.setOptions(blockModelOptions(modelCatalog.models(cli)), now, cli);
+    };
     const picker = new ModelPicker({
       selectClass: "wf-input",
       inputClass: "wf-input",
       placeholder: "model id…",
       blankLabel: BLOCK_DEFAULT_MODEL_LABEL,
+      // #993. The lookup is live rather than a snapshot: the catalog's answer
+      // arrives after a human clicks `detect`, and a picker holding a copy
+      // taken at construction would show the old one forever.
+      detailFor: (id) => modelCatalog.detail(cli, id),
+      // The one path in this pane that spawns an agent CLI, and it is a click.
+      // Nothing on the render path may reach it (`src-tauri/src/modelwire.rs`).
+      onDetect: () => modelCatalog.detect(cli).then(repaint),
     });
-    picker.setOptions(blockModelOptions(modelCatalog.models(cli)), b.model, cli);
+    repaint();
     box.append(
       this.field(
         "Model",

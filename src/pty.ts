@@ -15,6 +15,7 @@ import {
 import type { ShellKind } from "./panesetup";
 import type { CliKnobs } from "./selectorknobs";
 import type { CliProbe } from "./modelcatalog";
+import type { CliModelReply } from "./modelwire";
 
 export interface SpawnOptions {
   cols: number;
@@ -149,6 +150,15 @@ export const agentCliKnobs = (cli: string): Promise<CliKnobs | null> =>
  *  `node --test`. */
 export const probeAgentCli = (program: string): Promise<CliProbe> =>
   invoke<CliProbe>("probe_agent_cli", { program });
+
+/** Ask a CLI, in its own control protocol, which models this host offers (#993).
+ *
+ *  Spawns the agent CLI, so it is only ever reached from an explicit human
+ *  gesture — never a paint, never a background refresh. See
+ *  `src-tauri/src/modelwire.rs` for why that restraint is load-bearing rather
+ *  than cautious. The reply is bytes; `modelwire.ts` reads them. */
+export const listCliModels = (program: string): Promise<CliModelReply> =>
+  invoke<CliModelReply>("list_cli_models", { program });
 
 /** Drive a pane's shell to `cd` into `path`. */
 export const changeDir = (id: number, path: string): Promise<void> =>
