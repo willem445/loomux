@@ -227,6 +227,168 @@ are implemented, and for a plain reason: they let a `&GroupId` stand in wherever
 a `&str` group id stands today, which is what keeps the second half a signature
 change rather than a rewrite of every body.
 
+## The root registry
+
+#904 closed the *segment* half of this note's title. This is the *root* half —
+#1042, and the mechanism §1.1 H3 of the remote-engine protocol names as the
+listener's merge blocker.
+
+The families #904 left alone (`ft_*`, `fm_*`, the 22 `git_*`, the 10 `gh_*`,
+`git_watch`, `dir_info`/`change_dir`, and the orchestration boundaries taking a
+`repo`) do not take an identifier that becomes a path component. They take an
+**absolute root** and check it with `is_dir()`. No segment validator can help
+there, and neither can any other predicate over the string: nothing about the
+shape of a path separates a repo from `~/.ssh`. The difference is not in the
+path — it is in whether anybody ever declared it.
+
+So the answer is server-held state rather than a stronger check. A root is
+usable iff it is in a registry, and only sources the engine itself trusts can
+put one there.
+
+### It is wire enforcement, not a local sandbox
+
+This is the crux, and it is what keeps the desktop from regressing.
+
+The registry does not exist to constrain the local webview. That webview already
+owns the disk — it can open a file picker anywhere — so a rule stopping it from
+declaring a root buys nothing and costs real behaviour (a folder chip that goes
+dead after an agent `cd`s, a restore that will not restore). Locally, it may
+admit anything.
+
+The teeth are in what *cannot* admit. `admit_root` is classified off-roster, so
+when the listener's default-deny dispatcher lands, a remote peer can **use**
+declared roots and can never **mint** one. Desktop UX therefore survives by
+construction, and the enforcement is entirely on the wire — the same shape as
+the listener's `ListenTarget`: classify once at a boundary, and make the
+unchecked form unrepresentable downstream.
+
+The sources, and the ruling for each, come from a survey of where roots actually
+originate — which is emphatically *not* the file picker. A pane's OSC-7 report
+is emitted by the process running in that pane, so it is agent-controllable; the
+launcher's free-text field and its `localStorage` recents are client state; and
+the persisted tabs JSON is replayed on every launch. The organizing rule is that
+**a source is an admit path only if it is the local trusted webview acting on
+its own state or on a human gesture; everything else is resolve-only.** An
+agent that `cd`s to `~/.ssh` gets a quiet folder chip, not a rooted file
+browser — while a human clicking "open git view here" on that same pane has
+declared something, and that gesture admits.
+
+### Never persisted
+
+The registry is in-memory and rebuilt from its trusted sources on every boot,
+and neither type carries a `Serialize` or a `Deserialize`. That absence is
+load-bearing rather than an omission.
+
+A registry file would be exactly the replay-poisonable artifact the persisted-tabs
+analysis warns about: an entry admitted once — or injected into the file — would
+survive every reason it was admitted for, and a client replaying its own tabs
+file would be re-asserting authority rather than re-requesting it.
+Rebuilt-from-trusted-sources makes replay poisoning structurally impossible at
+this layer, which is a stronger guarantee than any validation on the way in.
+
+Note the contrast with `GroupId`, whose `Deserialize` is load-bearing in the
+opposite direction: an id has to survive a state file, so the constructor must
+guard the way back in. A declared root must not survive one at all.
+
+### The descendant rule
+
+`RootRegistry::resolve` accepts a candidate whose canonical form **equals or is
+a descendant of** a declared root, and refuses everything else.
+
+The direction is the whole point. A subdirectory grants strictly *less* than the
+root that was declared, so a pane that `cd`s around inside an admitted repo goes
+on working with nothing new declared — which is what keeps the OSC-7 consumers
+alive without giving an agent-controlled byte stream an admit path. An
+**ancestor** grants strictly *more* than was declared, so it is refused, and so
+is a sibling whose name merely extends a declared root's (`…/repo-evil` under
+`…/repo`) — the reason containment is a component-wise `Path::starts_with` and
+never a string prefix.
+
+Refused too: a relative or Windows drive-relative candidate (`C:foo` resolves
+against whatever the process happens to have as drive C's current directory,
+which nobody declared), and a link whose target leaves every declared root.
+Containment is compared canonical-against-canonical, which makes it
+symlink-sound in both directions: a link *into* a declared root resolves inside
+and grants nothing new; a link *out of* one resolves outside and is refused.
+
+### `plain` and `canonical`, and the `..` that would have split them
+
+`std::fs::canonicalize` on Windows returns an extended-length `\\?\C:\…` path.
+That is the right **comparison key** — it resolves links and junctions and
+normalizes the case Windows does not care about — and the wrong **working
+path**: MSYS git does not want one as a subprocess cwd, and nobody wants to read
+one. So a `DeclaredRoot` carries both, and its one accessor `as_path()` hands
+back `plain`, the caller's own path with `.` folded away. Commands keep feeding
+git/gh/the filesystem the same shape of path they do today, which is what makes
+the eventual enforcement behaviourally silent for an admitted root.
+
+`.` folded away, and **not** `..` — which is where this design nearly went wrong,
+so the reasoning is worth having in full. `fileedit::safe_resolve` normalizes a
+root by folding both, popping the preceding component for each `..`. Copying that
+here looks like consistency and is not, because a lexical fold and the filesystem
+disagree about what `..` means the moment a symlink precedes it — and both rules
+are in play.
+
+The specimen is `<root>/link/../../../../x`, where `link` points four levels deep
+inside `<root>`. Unix follows the link and lands on `<root>/x`, *inside* the
+declared root, so a containment check passes. Windows folds the `..` lexically in
+Win32 normalization before the filesystem sees the path, landing three levels
+above the temp directory, where nothing exists. One string, two directories,
+decided by the platform — both observed, on the scratch branch that removed the
+refusal.
+
+That is why `resolve` **refuses** a `..` rather than folding one. Not because
+`plain` would escape on its own — it would not; with the `..` left verbatim the
+OS resolves `plain` to exactly what was canonicalized — but because the *next*
+layer folds: `safe_resolve`'s `lexical_normalize` does it on every platform, and
+it is what slice C hands a declared root to. A root approved against one
+directory would then be used against another. A root or cwd argument has no
+legitimate `..` in it, so the refusal costs nothing, and it is a refusal rather
+than a rewrite for the same reason `GroupId::parse` refuses rather than
+sanitizes: normalizing lets two strings name one directory, and that is how a
+check and a use end up disagreeing.
+
+### Not `AsRef<Path>`, on the same grounds as `GroupId`
+
+A `DeclaredRoot` has no public constructor, no `From<String>`, no
+`Deserialize` and no `AsRef<Path>`. The only way to mint one is
+`RootRegistry::resolve`, so holding one is proof that some trusted source
+declared a root containing it; and `as_path()` being a named method rather than
+a blanket impl is what keeps every place a declared root becomes a working path
+greppable. Holding one is not membership, exactly as holding a `GroupId` is not.
+
+The two mechanisms compose without overlapping, and it is worth stating as one
+sentence: **a validated segment answers "is this string safe to join under a
+root?", a declared root answers "is this root yours to use?"**. They meet at
+`safe_resolve(root, rel)`, one parameter each, and neither is a second copy of
+the other. Group ids are unaffected: they stay identifiers joined at
+`group_dir_at`, and the registry receives group-derived *values* only, so the
+one-join guarantee above is untouched.
+
+### What has landed, and what has not
+
+Slice A — this section's mechanism — is `crates/loomux-engine/src/rootreg.rs`:
+`RootRegistry`, `DeclaredRoot`, `RootError` and their unit tests, in the
+Tauri-free core so the daemon can link them. It is std-only and mints no ids, so
+CLAUDE.md constraint 2 holds trivially.
+
+**Nothing consumes it yet, and no command refuses anything it did not refuse
+before.** The `admit_root` command, the engine-derived registration at group
+create/load, and the frontend admit-at-source wiring are slice B; boundary
+`resolve` on every root-taking family — with the choke functions changing
+signature so the compiler holds the property — is slice C, and it is slice C
+that introduces the `root-not-declared` error code to a caller. Until then the
+code exists on `RootError` and is returned to nobody.
+
+Deferred past all three, and recorded so the absence is deliberate: a
+`roots_list` wire command and a daemon config's seeded roots (there is no wire
+to serve them over yet), an authenticated remote admit path (an escape hatch to
+be *added* later, never one removed later), and eviction — the registry is
+unbounded because a session declares a handful of roots at a few hundred bytes
+each, and an eviction rule needs an answer to "is this root still in use by an
+open pane, a watcher, a queued delivery?" whose wrong answer is a live
+regression.
+
 ## The one agent-writable source
 
 Every group id above is loomux-minted or read back from loomux's own state, with
@@ -262,7 +424,10 @@ persisted file and no frontend payload changes shape.
   (`save_attachment`'s, and whatever layer 3 adds).
 - It does not re-scope the `ft_*`/`fm_*`/git `repo` families, which take
   arbitrary absolute paths and are the other half of §0's "server-declared
-  roots". Those are a larger surface with their own trust story.
+  roots". Those are a larger surface with their own trust story — the section
+  above is that story, and #1042 slice A has landed its *mechanism*. The
+  re-scoping itself is slice C and **has not landed**: as of this sentence those
+  families still take any absolute path an `is_dir()` accepts.
 - It does not make a group id a *capability*. Membership — "is this caller
   entitled to this group?" — is still a separate check, and only
   `save_attachment` performs one today.
@@ -280,3 +445,8 @@ than a substitute for: authenticating the display client (§0 layer 1) and
 re-scoping the path-taking `ft_*`/`fm_*`/git families to server-declared roots.
 A validated `GroupId` says the string is a usable path segment. It says nothing
 about whether the peer holding it should be talking to that group at all.
+
+The second of those two now has a mechanism — `RootRegistry` (#1042 slice A) —
+and does not yet have its enforcement, which is slice C. Read the root
+registry's own "What has landed, and what has not" for the line between them
+before citing this note as evidence that a root-taking command is scoped.
