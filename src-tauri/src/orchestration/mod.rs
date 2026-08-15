@@ -8740,10 +8740,11 @@ pub fn task_ready(task: &Task, board: &[Task]) -> bool {
 }
 
 /// Project a full `Task` down to its `list_tasks` row (#245). Pure so the
-/// field mapping is unit-testable without a registry. `ready` is passed in
-/// rather than computed here because a task ALONE cannot know it — it needs
-/// its dependencies' statuses, i.e. board context (see `board_summaries`).
-pub fn task_summary(t: &Task, ready: bool) -> TaskSummary {
+/// field mapping is unit-testable without a registry. `ready` and the child
+/// counts are passed in rather than computed here because a task ALONE cannot
+/// know either — both need its neighbours, i.e. board context (see
+/// `board_summaries`).
+pub fn task_summary(t: &Task, ready: bool, children: usize, children_done: usize) -> TaskSummary {
     TaskSummary {
         id: t.id.clone(),
         title: t.title.clone(),
@@ -8757,12 +8758,10 @@ pub fn task_summary(t: &Task, ready: bool) -> TaskSummary {
         note_count: t.notes.len(),
         deps: t.deps.clone(),
         related: t.related.clone(),
-        // #958 — NOT WIRED YET (this commit declares the shape the tests pin;
-        // the projection and the counts land with the implementation).
-        parent: None,
-        kind: None,
-        children: 0,
-        children_done: 0,
+        parent: t.parent.clone(),
+        kind: t.kind.clone(),
+        children,
+        children_done,
         ready,
     }
 }
@@ -8771,9 +8770,27 @@ pub fn task_summary(t: &Task, ready: bool) -> TaskSummary {
 /// companion `task_summary` needs, since readiness is a property of a task
 /// *plus its board*. Quadratic in board size in the worst case (a board is
 /// 10–100 tasks with a handful of links each, and this runs once per
-/// `list_tasks` call), so it stays a straight scan rather than an index.
+/// `list_tasks` call), so it stays a straight scan rather than an index. The
+/// #958 child counts ride that same scan for the same reason.
 pub fn board_summaries(tasks: &[Task]) -> Vec<TaskSummary> {
-    tasks.iter().map(|t| task_summary(t, task_ready(t, tasks))).collect()
+    tasks
+        .iter()
+        .map(|t| {
+            // DIRECT children only, and a plain scan rather than a walk: this
+            // is a chip on one row, and a subtree rollup would have to answer
+            // what a hand-edited parent cycle rolls up to. A count of the rows
+            // that point HERE has no such question (#958).
+            let mut children = 0usize;
+            let mut children_done = 0usize;
+            for c in tasks.iter().filter(|c| c.parent.as_deref() == Some(t.id.as_str())) {
+                children += 1;
+                if c.status == "done" {
+                    children_done += 1;
+                }
+            }
+            task_summary(t, task_ready(t, tasks), children, children_done)
+        })
+        .collect()
 }
 
 /// Default cap on `done` rows a `list_tasks` call returns when the caller
@@ -8915,6 +8932,113 @@ fn strip_deleted_links(tasks: &mut [Task], removed: &HashSet<&str>) -> Vec<Strin
         }
     }
     rewritten
+}
+
+/// The container chain above `start`, nearest LAST — `start` itself, then its
+/// parent, then its parent, up to a root (#958). `parent_of` is the board's
+/// parent pointers with the edited row's NEW parent already substituted, so
+/// this answers "what would the chain be after this write", exactly the
+/// contract `find_dep_cycle`'s substituted `edges` map has.
+///
+/// `Err` is the loop as a path (`t-1 → t-3 → t-2 → t-1`) so a rejection can
+/// name it rather than just refusing. Containment is a functional graph (at
+/// most one parent per row), so a plain walk with a repeat check is enough —
+/// no DFS needed — and the repeat check is also what makes the walk terminate
+/// on the one board that can be cyclic: a hand-edited `tasks.json`.
+fn find_parent_cycle(start: &str, parent_of: &HashMap<&str, &str>) -> Result<Vec<String>, Vec<String>> {
+    let mut path = vec![start.to_string()];
+    let mut cur = parent_of.get(start).copied();
+    while let Some(next) = cur {
+        let repeat = path.iter().any(|p| p == next);
+        path.push(next.to_string());
+        if repeat {
+            return Err(path);
+        }
+        cur = parent_of.get(next).copied();
+    }
+    Ok(path)
+}
+
+/// How many levels `root`'s own subtree spans, itself included — 1 for a leaf
+/// (#958). Read off the board as it stands, because a reparent MOVES a subtree
+/// wholesale rather than reshaping it, so the height the mover carries with it
+/// is the height it has now.
+///
+/// This is what stops a reparent smuggling an over-deep chain in from BELOW:
+/// checking only the new ancestor chain would let a two-level subtree land at
+/// depth 4 and put its own children at 5. Breadth-first with a visited set, so
+/// a hand-edited parent cycle underneath terminates instead of spinning.
+fn subtree_height(root: &str, tasks: &[Task]) -> usize {
+    let mut height = 0usize;
+    let mut level: Vec<&str> = vec![root];
+    let mut seen: HashSet<&str> = HashSet::from([root]);
+    while !level.is_empty() {
+        height += 1;
+        let mut next: Vec<&str> = Vec::new();
+        for t in tasks {
+            let Some(p) = t.parent.as_deref() else { continue };
+            if level.contains(&p) && seen.insert(t.id.as_str()) {
+                next.push(t.id.as_str());
+            }
+        }
+        level = next;
+    }
+    height
+}
+
+/// Reparent the survivors of a delete whose container was just removed, in the
+/// same locked write as the delete itself (#958). Returns the ids actually
+/// rewritten, so the audit row says whose container moved.
+///
+/// PROMOTE, not cascade and not refuse — `strip_deleted_links`' reasoning
+/// applied to containment. Refusing fights the human's authority over a board
+/// they hand-edit; cascading silently destroys work items along with their
+/// PR/session refs, which is the worst failure direction available. Promotion
+/// loses only the grouping.
+///
+/// It walks the removed chain rather than reading one pointer because a BATCH
+/// delete can take a parent and its grandparent together: reading one pointer
+/// would land the child on a row this very write just deleted. `removed` is
+/// therefore the removed ROWS (their own `parent` values are the chain), and a
+/// chain that leaves the board entirely lands the survivor at top level.
+fn promote_orphans(tasks: &mut [Task], removed: &[Task]) -> Vec<String> {
+    let gone: HashMap<&str, Option<&str>> =
+        removed.iter().map(|t| (t.id.as_str(), t.parent.as_deref())).collect();
+    let survivors: HashSet<String> = tasks.iter().map(|t| t.id.clone()).collect();
+    let mut promoted = Vec::new();
+    for t in tasks.iter_mut() {
+        // Owned, not a borrow of `t`: the walk below outlives the read, and the
+        // row is written at the end of it.
+        let Some(p) = t.parent.clone() else { continue };
+        let Some(start) = gone.get_key_value(p.as_str()).map(|(k, _)| *k) else { continue };
+        // Climb through the removed rows to the nearest survivor. `seen` bounds
+        // the climb: a hand-edited cycle among the deleted rows would otherwise
+        // never reach a survivor, and top level is the right answer for it.
+        let mut cur = Some(start);
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut landed: Option<String> = None;
+        while let Some(id) = cur {
+            if !seen.insert(id) {
+                break;
+            }
+            match gone.get(id) {
+                // Still one of the rows this write removed — keep climbing.
+                Some(next) => cur = *next,
+                // Not removed: a survivor if it names a live row, and otherwise
+                // a pointer that was already dangling before this delete, which
+                // is not this delete's business to invent a target for.
+                None => {
+                    if survivors.contains(id) {
+                        landed = Some(id.to_string());
+                    }
+                    break;
+                }
+            }
+        }
+        t.parent = landed;
+        promoted.push(t.id.clone());
+    }
+    promoted
 }
 
 /// Max notes kept verbatim on a task's LIVE copy (#245) — beyond this, the
@@ -23888,6 +24012,14 @@ impl OrchRegistry {
                 return Err(format!("invalid status {s:?} — use one of {}", TASK_STATUSES.join(" | ")));
             }
         }
+        // The advisory level is validated like the status (#958). The EMPTY
+        // string is not an invalid kind, it is the clear — the `pr` rule — so
+        // it has to pass here to reach the apply below.
+        if let Some(k) = patch.kind.as_deref().map(str::trim) {
+            if !k.is_empty() && !TASK_KINDS.contains(&k) {
+                return Err(format!("invalid kind {k:?} — use one of {}", TASK_KINDS.join(" | ")));
+            }
+        }
         if patch.claim {
             // A claim is a guarded transition on an EXISTING row: the guards
             // (queued, unclaimed-or-mine, deps met) are the whole point, and a
@@ -23955,6 +24087,66 @@ impl OrchRegistry {
             edges.insert(this_id.clone(), new_deps.clone());
             if let Some(cycle) = find_dep_cycle(&this_id, &edges) {
                 return Err(format!("deps: dependency cycle {}", cycle.join(" → ")));
+            }
+        }
+        // ---- hierarchy (#958): the link contract above, applied to
+        // containment. Same placement and same reason — every check reads the
+        // board BEFORE the mutable borrow below, so a refusal leaves the board
+        // exactly as it was. `Some(None)` is the explicit clear; the outer
+        // `None` means the patch never mentioned `parent` at all.
+        let parent: Option<Option<String>> = match patch.parent.as_deref().map(str::trim) {
+            None => None,
+            Some("") => Some(None),
+            Some(p) => {
+                if p == this_id {
+                    return Err(format!("parent: a task cannot contain itself ({this_id})"));
+                }
+                if !tasks.iter().any(|t| t.id == p) {
+                    return Err(format!("parent: unknown task: {p}"));
+                }
+                let mut parent_of: HashMap<&str, &str> = tasks
+                    .iter()
+                    .filter_map(|t| t.parent.as_deref().map(|par| (t.id.as_str(), par)))
+                    .collect();
+                parent_of.insert(&this_id, p);
+                // Reparenting a row under its OWN DESCENDANT is the cycle case,
+                // and it is the one an agent actually writes by accident.
+                let chain = find_parent_cycle(&this_id, &parent_of)
+                    .map_err(|cycle| format!("parent: hierarchy cycle {}", cycle.join(" → ")))?;
+                // The cap is on the DEEPEST resulting row, not on the mover:
+                // its new chain, plus whatever it carries below it. `- 1`
+                // because the mover is counted by both.
+                let deepest = chain.len() + subtree_height(&this_id, &tasks) - 1;
+                if deepest > MAX_TASK_DEPTH {
+                    return Err(format!(
+                        "parent: hierarchy depth cap is {MAX_TASK_DEPTH} — putting {this_id} under {p} \
+                         would make its deepest row {deepest} levels deep"
+                    ));
+                }
+                Some(Some(p.to_string()))
+            }
+        };
+        // A link to your own container is always a mistake, whichever of the
+        // two fields the write happens to be setting — so it is checked on the
+        // POST-write values of all three, not just when `parent` moves. Only
+        // when this write touches one of them, though: a hand-edited board must
+        // not have its unrelated status edits refused (the read-tolerance rule).
+        if patch.parent.is_some() || deps.is_some() || related.is_some() {
+            let effective_parent = match parent.as_ref() {
+                Some(p) => p.as_deref(),
+                None => tasks[idx].parent.as_deref(),
+            };
+            if let Some(p) = effective_parent {
+                for (field, links) in [
+                    ("deps", deps.as_ref().unwrap_or(&tasks[idx].deps)),
+                    ("related", related.as_ref().unwrap_or(&tasks[idx].related)),
+                ] {
+                    if links.iter().any(|id| id.as_str() == p) {
+                        return Err(format!(
+                            "parent: {p} is this task's container — it cannot also be a {field} link"
+                        ));
+                    }
+                }
             }
         }
         // ---- claim guards (#582). Read the row and the board BEFORE the
@@ -24044,6 +24236,14 @@ impl OrchRegistry {
         if let Some(r) = related {
             task.related = r;
         }
+        // Already validated (and already trimmed, since a container id is
+        // looked up by exact match rather than displayed).
+        if let Some(p) = parent {
+            task.parent = p;
+        }
+        if patch.kind.is_some() {
+            task.kind = patch.kind.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        }
         // Last, so the claim's own two fields are what the guards above
         // approved — never a leftover from the generic patch application.
         if claim {
@@ -24063,16 +24263,24 @@ impl OrchRegistry {
     pub fn delete_task(&self, group: &GroupId, actor: &str, id: &str) -> Result<(), String> {
         let _guard = self.tasks_lock.lock_safe();
         let mut tasks = self.tasks(group);
-        let before = tasks.len();
-        tasks.retain(|t| t.id != id);
-        if tasks.len() == before {
+        let Some(pos) = tasks.iter().position(|t| t.id == id) else {
             return Err(format!("unknown task: {id}"));
-        }
+        };
+        // Kept, not just dropped: promotion needs the removed row's OWN parent.
+        let removed = tasks.remove(pos);
         // Same locked write (#582): a deleted task's id must not survive on
         // anyone's links, or it would block its dependent forever.
         let relinked = strip_deleted_links(&mut tasks, &HashSet::from([id]));
+        // ...nor on anyone's `parent` (#958) — its children are promoted rather
+        // than orphaned or cascaded away.
+        let reparented = promote_orphans(&mut tasks, std::slice::from_ref(&removed));
         self.write_tasks(group, &tasks)?;
-        self.audit(group, actor, "task-delete", json!({ "id": id, "relinked": relinked }));
+        self.audit(
+            group,
+            actor,
+            "task-delete",
+            json!({ "id": id, "relinked": relinked, "reparented": reparented }),
+        );
         Ok(())
     }
 
@@ -24087,16 +24295,24 @@ impl OrchRegistry {
         let removed = {
             let _guard = self.tasks_lock.lock_safe();
             let mut tasks = self.tasks(group);
-            let removed: Vec<String> =
-                tasks.iter().filter(|t| t.status == "done").map(|t| t.id.clone()).collect();
+            // The rows, not just the ids: promotion reads their own `parent`
+            // pointers to find each survivor's nearest surviving ancestor.
+            let removed_rows: Vec<Task> = tasks.iter().filter(|t| t.status == "done").cloned().collect();
+            let removed: Vec<String> = removed_rows.iter().map(|t| t.id.clone()).collect();
             if removed.is_empty() {
                 return Ok(removed);
             }
             tasks.retain(|t| t.status != "done");
             let gone: HashSet<&str> = removed.iter().map(String::as_str).collect();
             let relinked = strip_deleted_links(&mut tasks, &gone);
+            let reparented = promote_orphans(&mut tasks, &removed_rows);
             self.write_tasks(group, &tasks)?;
-            self.audit(group, actor, "task-delete-done", json!({ "ids": removed, "relinked": relinked }));
+            self.audit(
+                group,
+                actor,
+                "task-delete-done",
+                json!({ "ids": removed, "relinked": relinked, "reparented": reparented }),
+            );
             removed
         };
         // Outside the tasks lock: notify is best-effort and can block on delivery.
@@ -24123,8 +24339,11 @@ impl OrchRegistry {
             let _guard = self.tasks_lock.lock_safe();
             let mut tasks = self.tasks(group);
             let wanted: HashSet<&str> = ids.iter().map(String::as_str).collect();
-            let removed: Vec<String> =
-                tasks.iter().filter(|t| wanted.contains(t.id.as_str())).map(|t| t.id.clone()).collect();
+            // The rows, not just the ids (#958): a batch can remove a parent
+            // AND its grandparent, so promotion has to climb the removed chain.
+            let removed_rows: Vec<Task> =
+                tasks.iter().filter(|t| wanted.contains(t.id.as_str())).cloned().collect();
+            let removed: Vec<String> = removed_rows.iter().map(|t| t.id.clone()).collect();
             if removed.is_empty() {
                 return Ok(removed);
             }
@@ -24137,12 +24356,13 @@ impl OrchRegistry {
             // an id that named no row can still name a hand-edited dangling
             // link, and that link is not this delete's business (#582).
             let relinked = strip_deleted_links(&mut tasks, &present);
+            let reparented = promote_orphans(&mut tasks, &removed_rows);
             self.write_tasks(group, &tasks)?;
             self.audit(
                 group,
                 actor,
                 "task-delete-selected",
-                json!({ "ids": removed, "skipped": skipped, "relinked": relinked }),
+                json!({ "ids": removed, "skipped": skipped, "relinked": relinked, "reparented": reparented }),
             );
             removed
         };
@@ -46569,6 +46789,10 @@ pub async fn orch_upsert_task(
     status: Option<String>,
     note: Option<String>,
     deps: Option<Vec<String>>,
+    // #958: additive, so every existing caller keeps working — an absent field
+    // deserializes to `None`, which is "leave it alone" in `TaskPatch`.
+    parent: Option<String>,
+    kind: Option<String>,
 ) -> Result<Task, String> {
     let reg = reg_of(&app);
     let group_id = command_group(&group_id)?;
@@ -46577,7 +46801,7 @@ pub async fn orch_upsert_task(
             &group_id,
             "human",
             id.as_deref(),
-            TaskPatch { title, status, note, deps, ..Default::default() },
+            TaskPatch { title, status, note, deps, parent, kind, ..Default::default() },
         )?;
         reg.notify_board_edit(&group_id, &format!("{} \"{}\" is now {}", task.id, task.title, task.status));
         Ok(task)

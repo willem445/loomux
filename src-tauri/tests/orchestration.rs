@@ -9417,7 +9417,7 @@ fn task_summary_drops_notes_but_counts_them() {
         kind: None,
         updated_ms: 42,
     };
-    let s = task_summary(&t, false);
+    let s = task_summary(&t, false, 0, 0);
     assert_eq!(s.id, "t-1");
     assert_eq!(s.title, "Fix parser");
     assert_eq!(s.status, "in-progress");
