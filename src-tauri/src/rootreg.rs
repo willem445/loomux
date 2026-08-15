@@ -46,11 +46,12 @@
 //! working after every merge.
 //!
 //! One consequence of that ordering is worth naming rather than discovering in
-//! slice C. [`admit_group_root`]'s caller registers a group checkout that, on
-//! the create path, came from a caller argument. Until slice C makes
-//! `create_orchestration` (and the rest of the orchestration `repo` boundaries)
-//! resolve their `repo` against the registry first, that is a laundering path on
-//! paper — a wire `create_group("C:/Users/me/.ssh")` would mint a declared root.
+//! slice C. [`admit_derived`]'s caller in `create_group_ex` registers a group
+//! checkout that, on the create path, came from a caller argument. Until slice C
+//! makes `create_orchestration` (and the rest of the orchestration `repo`
+//! boundaries) resolve their `repo` against the registry first, that is a
+//! laundering path on paper — a wire `create_group("C:/Users/me/.ssh")` would
+//! mint a declared root.
 //! It is inert today because no wire exists and nothing enforces, and slice C
 //! closes it by the rule the design states in one line: **any command that would
 //! cause a root to become registered from a caller argument must itself take an
