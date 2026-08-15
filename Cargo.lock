@@ -1964,10 +1964,12 @@ dependencies = [
 name = "loomux-engine"
 version = "0.0.0"
 dependencies = [
+ "dirs",
  "serde",
  "serde_json",
  "serde_norway",
  "sha2",
+ "tempfile",
 ]
 
 [[package]]

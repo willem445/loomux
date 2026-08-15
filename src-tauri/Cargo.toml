@@ -17,12 +17,16 @@ tauri-build = { version = "2", features = [] }
 # doc/design/engine-extraction.md. A workspace path dependency, not a version:
 # the crate is `publish = false` and both its consumers are in this repo.
 #
-# NO GETRANDOM AUDIT ENTRY IS NEEDED FOR IT, and that is a property to preserve
-# rather than a gap: the engine crate has no dependencies at all, so it adds
-# nothing to the linked graph the ban below reasons about. The day it gains one,
-# that dependency gets audited in crates/loomux-engine/Cargo.toml against the
-# same rule — the ban follows the shipped binary's imports, and this crate is
-# linked into it.
+# NO GETRANDOM AUDIT ENTRY IS NEEDED FOR IT HERE, and that is a property to
+# preserve rather than a gap. The engine's dependencies are audited in
+# crates/loomux-engine/Cargo.toml, against this same rule and for the same
+# reason — the ban follows the shipped binary's load-time imports, and that
+# crate is linked into it. Every one it has taken so far (serde, serde_json,
+# serde_norway, sha2, dirs) is a crate THIS manifest already depends on
+# directly, so the linked graph the ban reasons about is unchanged by the
+# extraction and the audits below remain the reference for all of them. The day
+# the engine takes one that is not already here, that is the day this line stops
+# being true and the audit has to be written over there.
 loomux-engine = { path = "../crates/loomux-engine" }
 tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }

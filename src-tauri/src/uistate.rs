@@ -39,7 +39,8 @@ static ATOMIC_WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Test-only override for the state dir, so the atomic-write / quarantine logic
 /// is exercised against a tempdir without touching the real user data dir
-/// (mirrors `obs::LOG_DIR_OVERRIDE`). `None` in production.
+/// (mirrors `loomux_engine::obs::LOG_DIR_OVERRIDE`, which moved there with the
+/// rest of `obs` in #888 slice A3 batch 7). `None` in production.
 static STATE_DIR_OVERRIDE: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 /// Hands out the dispatch tickets [`write_atomic_seq`] orders writes by. See

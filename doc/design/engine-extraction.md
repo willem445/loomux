@@ -577,10 +577,99 @@ from a unit test of product code, agents are banned from running cargo locally
     `crate::sessions::yaml_field` and takes a `crate::opencodedb::TranscriptRow`
     — two modules staying in `src-tauri` — so it cannot move until those edges
     are cut or followed.
-- **A3 — the traits.** `EventSink` + `PaneHost`, `OrchRegistry` drops
-  `AppHandle`, `NullPaneHost` replaces the app-is-`None` branch. Per-PR bar: the
-  integration suite green with **zero test edits**, plus one new crate-level
-  test that drives a group headless end to end with nothing Tauri linked.
+- **A3 — the host-edge tier.** Planned in detail on #888 (plan-558): the
+  measured edge map found that five of the six remaining orchestration modules
+  are blocked not by `AppHandle` but by six pure `mod.rs` items plus
+  `crate::obs`, so A3 opens with batches that close those edges and continues
+  the A2 numbering. `EventSink` + `PaneHost`, `OrchRegistry` dropping
+  `AppHandle` and `NullPaneHost` replacing the app-is-`None` branch land at the
+  end of it, against the real Tauri edges rather than ahead of them. Per-PR bar
+  is unchanged: the integration suite green with **zero test edits**, plus —
+  for the trait work — one new crate-level test that drives a group headless end
+  to end with nothing Tauri linked.
+  - **Batch 7 — `obs`, split at its own section marker.** The first batch that
+    moved *part* of a file, and the cut was not invented for the occasion:
+    `obs.rs` had fenced its Tauri items off behind a
+    `// ---------- next-launch notice (Tauri surface) ----------` comment since
+    #53. Everything above it (the panic hook, breadcrumbs and rotation,
+    `stamp`/`civil_from_days`, `data_root`/`logs_dir` and the `LOOMUX_DATA_DIR`
+    validation, the `running.lock` sentinel, `LockExt`) is `std` + `dirs` and is
+    now `loomux_engine::obs`; `StartupNotice` and the `#[tauri::command]`
+    `take_startup_notice` stay, in a `src-tauri/src/obs.rs` that is otherwise a
+    `pub use` of the engine module. All ~45 `crate::obs::…` call sites across
+    eleven files spell what they always did. The re-export is written out item
+    by item rather than as a glob — what `src-tauri` re-exports should be a list
+    somebody chose, not whatever the engine module makes public next.
+
+    It goes first in A3 because the rest of the tier waits on it: batch 9's
+    capture cluster locks through `lock_safe`, and without that batch there is
+    no `mqdriver` and no `mqloop`. The two alternatives were measured on #888
+    and both lose to the cut. Moving the file **wholesale** is dead on arrival —
+    `take_startup_notice` takes a `tauri::State`, so it means the engine links
+    Tauri. Leaving `obs` in `src-tauri` **behind a host trait** costs the
+    largest trait surface of the three options for two helpers, and cannot
+    actually be paid: `LockExt` is an inline extension trait on
+    `std::sync::Mutex` (`m.lock_safe()`), not reachable through a trait object
+    as called, so every engine consumer would need a threaded `&dyn` through
+    signatures that take none today, a global registration hook, or its own copy
+    of the poison-recovery policy — a second implementation of the one thing
+    that must not have two. **Look for the boundary the module's author already
+    drew before reaching for a trait.**
+
+    ### `env!` is an edge, and no grep for `super::` finds it
+
+    This is the batch's real finding and it generalises past `obs`. Every batch
+    so far enumerated a module's outbound edges by searching for
+    `super::`/`crate::`. `obs.rs` has none — and it still had one:
+    `record_crash` builds the crash log's `version:` line from
+    `env!("CARGO_PKG_VERSION")`. That macro names *the crate the file is
+    compiled in*, so the move re-points it, and this crate's version is
+    deliberately `0.0.0` (a placeholder, not the release number — see its
+    manifest). A verbatim move would have made every crash log read
+    `version: 0.0.0` while `doc/design/crash-observability.md` goes on promising
+    the loomux version. Nothing fails to compile. Nothing goes red.
+
+    So `install_panic_hook` takes `app_version: &'static str` and
+    `src-tauri/src/lib.rs` passes `env!("CARGO_PKG_VERSION")` from the crate
+    where the macro means what it says — the identity is injected at the one
+    startup entry point rather than read from the ambient crate, and every call
+    site is compiler-checked. The rule to carry into batches 8–12: **sweep a
+    moving file for `env!`, `option_env!`, `file!`, `module_path!` and
+    `include_str!` alongside its `use` lines.** Each is a compile-time reference
+    to the crate the file happens to live in, and each moves house silently.
+    (`obs.rs` had exactly one, checked by grep over the whole moved region.)
+
+    That one item is a **behaviour change and does not take the pure-relocation
+    exemption** the rest of the batch takes. It was evidenced red-before-green on
+    CI rather than asserted: the first commit is the naive move carrying an
+    assertion that the crash log does not name the engine's placeholder version,
+    red on all three platforms; the second threads the version and turns it
+    green, with the assertion restated against an explicitly passed version so
+    it stops depending on the release number. Local `cargo` is banned (#488), so
+    CI is where red-before-green happens — which works, and is worth knowing for
+    any later batch that finds a real defect on the way through.
+
+    Two dependencies. `dirs` (what `data_root` calls) is already in the shipped
+    binary's linked graph via `src-tauri`, so no package joins the lock — but it
+    is the first engine dependency that appears in a getrandom query at all, and
+    the engine manifest now says why that is fine in the one place an auditor
+    will look: the edge is `getrandom → redox_users → dirs-sys → dirs`, gated to
+    `cfg(target_os = "redox")`, compiled on none of the three platforms loomux
+    ships or tests on. `tempfile` (default features off, so no `getrandom`
+    feature) is the crate's first `[dev-dependencies]` entry, for the inline
+    tests' temp trees; dev-dependencies are never built for a downstream crate,
+    so they cannot reach the shipped binary regardless. `src-tauri`'s own note
+    on the engine dependency said "the engine crate has no dependencies at all",
+    which stopped being true at batch 2 and would have been actively misleading
+    here; it now states the invariant that is actually load-bearing — every
+    engine dependency so far is one `src-tauri` already depends on directly, so
+    the linked graph is unchanged by the extraction.
+
+    Nothing else moves. No tripwire relocates (the `tests/groupid.rs` scan
+    already lists both source roots), no role template is touched so no pre222
+    re-bless is owed, no visibility narrows or widens beyond `pub` items staying
+    `pub`, and `src-tauri/tests/` is untouched — which is the proof that the
+    re-export surface is complete rather than a claim about it.
 - **A4 — the registry.** `OrchRegistry`, the decision layer, and a PTY
   output-sink seam, so the crate compiles with no `tauri` anywhere in its tree.
   A CI step proves that from `cargo tree` rather than from this paragraph. This
