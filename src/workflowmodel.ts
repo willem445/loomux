@@ -1419,7 +1419,7 @@ export function serializeWorkflowPreserving(w: Workflow, originalText: string): 
   // it didn't have.
   //
   // NOTE (reorder): a block is matched by id, not by position, so its own comment travels WITH
-  // it if the roster gets reordered by hand (in the YAML tab) — a deliberate property, not a
+  // it if the roster gets reordered by hand (in the raw YAML) — a deliberate property, not a
   // bug. What is NOT preserved across a reorder is the blank-line spacing BETWEEN items: each
   // item's leading trivia was captured relative to its ORIGINAL neighbor, so after a reorder it
   // separates a different pair than it used to. The result is still valid YAML and never loses

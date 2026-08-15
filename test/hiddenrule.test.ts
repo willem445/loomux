@@ -183,10 +183,12 @@ test("the workflow pane's surfaces are mutually exclusive ON SCREEN, not just in
     );
   }
 
-  // Same for the tabs, which had the same defect and would have shown the YAML and the graph stacked
-  // under the form: `applyTab()` hides two of the three the same way.
+  // Same for the pane's two PRIMARY surfaces, which had the same defect and would have shown the raw
+  // YAML stacked on top of the canvas: `applySurface()` hides whichever one the YAML toggle is not
+  // currently on, the same way. (These were three tabs until #880 killed the tab split; the toggle
+  // inherited the mechanism, so it inherited the hazard.)
   for (const cls of ["wf-yaml", "wf-graph"]) {
-    assert.equal(computedDisplay([cls], true), "none", `.${cls} is a tab pane`);
+    assert.equal(computedDisplay([cls], true), "none", `.${cls} is a primary surface`);
   }
 
   // …and the view's own root, which is how `hide()` is supposed to work at all.

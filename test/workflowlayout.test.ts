@@ -87,7 +87,7 @@ const own = (positions: Record<string, Point>): Record<string, Point> => ({ ...p
 
 test("a block whose id names an Object.prototype member is still just a block (rev-15 F3)", () => {
   // `id: constructor` is a LEGAL workflow — `isValidBlockId` says yes and the validator reports
-  // zero findings — and it can arrive from a hand edit, the YAML tab, or an agent, so tightening
+  // zero findings — and it can arrive from a hand edit, the raw YAML, or an agent, so tightening
   // the +Block dialog would not have closed this. On a plain object literal,
   // `positions["constructor"]` returned the INHERITED Object function: truthy, so the caller took
   // the "it has a stored position" branch and read `{x: undefined, y: undefined}` off it. The NaN
