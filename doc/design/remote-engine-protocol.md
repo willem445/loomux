@@ -168,7 +168,7 @@ That is a fact about the transport. Nobody issued it, nothing checks it, and it
 cannot be revoked. Reproduce the same command surface over a socket and it
 evaporates: every peer that can open a connection becomes "the webview".
 
-And the surface is worse than one identifier. Today's 141 commands
+And the surface is worse than one identifier. Today's 142 commands
 (`src-tauri/src/command_manifest.rs`, the ACL manifest's single source of truth)
 include, by design:
 
@@ -442,7 +442,7 @@ over the same list, and a reviewer already knows how to read it.
 
 That mechanism is not optional bookkeeping, and this repo's own artifacts are the
 evidence. The plan-408 census counted 134 commands; `APP_COMMANDS` today lists
-**141**. Seven arrived in the interval, and under a hand-maintained allowlist
+**142**. Eight arrived in the interval, and under a hand-maintained allowlist
 that nobody re-derived, every one would have been silently wire-reachable or
 silently broken.
 
@@ -474,7 +474,7 @@ maintained by good intentions is the version that does not.
 > is the cheap half and the enforcement is the expensive half.** Deciding
 > `orch_grant_merge` is owner-tier costs a table cell today; discovering it was
 > never marked, after a year of commands landing without anyone asking, costs an
-> audit of 141 of them. The roster ships in v1 (§5.1); the tier column is the
+> audit of 142 of them. The roster ships in v1 (§5.1); the tier column is the
 > hardening track reading from a table that was kept current all along.
 
 Three tiers, ordered: **viewer** ⊂ **operator** ⊂ **owner**.
@@ -511,6 +511,7 @@ are where the 64-vs-66 drift above lives).
 | | 9 | wire | **owner** | `orch_approve_task`, `orch_approve_tasks`, `orch_grant_merge`, `orch_grant_release`, `orch_set_autonomous`, `orch_set_auto_merge`, `orch_set_auto_release`, `orch_set_dangerous_mode`, `orch_set_autonomy_budget` |
 | | 1 | **retargeted** | viewer | `orch_open_ref` — the server resolves the ref to a URL (its `open_external_url` helper is the local half today) and returns it; the **client** opens it in the human's browser |
 | **cliprobe** (1) | 1 | wire | viewer | `probe_agent_cli` probes the **server's** CLIs |
+| **modelwire** (1) | 1 | wire | **operator** | `list_cli_models` (#993) asks the **server's** CLI for its model list. Operator, not viewer, even though the answer is a read: it starts an agent CLI on the server, and the claim that a `list_models` control request costs nothing is the vendor's-docs-are-silent kind (see doc/design/model-catalog.md). A viewer able to spend the operator's credits by clicking `detect` is the wrong default until that is verified |
 | **editor** (1) | 1 | **disabled** | — | `open_in_editor` spawns an editor on the machine holding the files; remotely that is either a no-op on a headless box or an arbitrary-process-spawn primitive. The file-editor pane is what covers this case |
 | **fileedit** (7) | 4 | wire | operator | `ft_list_dir`, `ft_read_file`, `ft_search_start`, `ft_files_start` — reads, but reads of **server** files, so operator not viewer (H3) |
 | | 3 | wire | operator | `ft_write_file`, `ft_replace`, `ft_search_cancel` |
@@ -523,10 +524,10 @@ are where the 64-vs-66 drift above lives).
 | | 2 | wire | operator | `load/save_ssh_profiles` — **named consequence:** in remote mode an SSH pane is opened *by the engine*, so the hosts it can reach and the identity files it names are the server's, not the client's. The profile store follows the panes. The no-secrets invariant of `sshprofile.ts` is what makes this survivable |
 | **voice** (3) | 3 | **client-local** | — | mic capture and whisper are client hardware; the transcript rides `write_pty` like any other keystrokes |
 
-Totals, and they add up to the manifest exactly: **128 wire**, **8 client-local**
+Totals, and they add up to the manifest exactly: **129 wire**, **8 client-local**
 (`take_startup_notice`, the four `uistate` UI-state commands, the three
 `voice_*`), **4 disabled** (`open_in_editor`, `fm_open`, `fm_open_with`,
-`fm_reveal`), **1 retargeted** (`orch_open_ref`) = 141.
+`fm_reveal`), **1 retargeted** (`orch_open_ref`) = 142.
 
 The authoritative per-command list is the generated roster the C2 test pins —
 this table is the *argument* for it, not a second copy to drift. Which is the

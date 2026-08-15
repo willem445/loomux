@@ -879,7 +879,10 @@ export class WorkflowView {
    *  and the call failed, which `knobState` renders as disabled-with-a-reason. */
   private knobLookup = (cli: string, model: string): KnobStates | null => {
     const caps = this.cliKnobs.get(cli);
-    return caps === undefined ? null : knobState(caps, cli, model);
+    // #993: the detected per-model levels narrow the CLI's general set. The
+    // validation pass reads the same lookup the editor's controls do, so a
+    // block cannot be flagged for a level the picker was still offering.
+    return caps === undefined ? null : knobState(caps, cli, model, modelCatalog.detail(cli, model));
   };
 
   /** Ask what models `cli` reports, at most once per pane — see {@link modelProbes}. */
@@ -1345,13 +1348,95 @@ export class WorkflowView {
     // other — it is the REPLY that carries nothing today — and with nothing on
     // either side the picker opens straight onto that custom input.
     const cli = b.cli.trim();
+    const repaint = (): void => {
+      const now = this.analysis.workflow.blocks[index]?.model ?? picker.value;
+      picker.setOptions(blockModelOptions(modelCatalog.models(cli)), now, cli);
+    };
     const picker = new ModelPicker({
       selectClass: "wf-input",
       inputClass: "wf-input",
       placeholder: "model id…",
       blankLabel: BLOCK_DEFAULT_MODEL_LABEL,
+      // #993. The lookup is live rather than a snapshot: the catalog's answer
+      // arrives after a human clicks `detect`, and a picker holding a copy
+      // taken at construction would show the old one forever.
+      detailFor: (id) => modelCatalog.detail(cli, id),
+      // The one path in this pane that spawns an agent CLI, and it is a click.
+      // Nothing on the render path may reach it (`src-tauri/src/modelwire.rs`).
+      //
+      // **A detection reply owes every surface `agent_cli_knobs` owes** (#997
+      // review). It is precisely the answer that makes `knobLookup` respond
+      // differently, so repainting only the dropdown leaves the Thinking-level
+      // row offering levels this pane's own validator then rejects — the human
+      // picks `xhigh`, the next mutation re-renders the row disabled and the
+      // findings flag the block. The treatment below is `ensureCliKnobs`'s,
+      // deliberately identical: same pass, same three renders, same in-place
+      // knob repaint when the form must not be rebuilt.
+      onDetect: () =>
+        modelCatalog.detect(cli).then(() => {
+          // The findings are the pane's, not this form's, so they are recomputed
+          // and repainted whatever happened to the form meanwhile — a detection
+          // that landed after the human moved on still corrected the file's
+          // analysis.
+          this.analysis = analyzeWorkflow(this.text, this.knobLookup);
+          this.renderRoster();
+          this.renderFindings();
+          this.renderGraph();
+
+          // Everything below touches THIS form's DOM, so it stops here if that
+          // form is gone (#997 review NB-1). An ask spawns a CLI and can be in
+          // flight for seconds — long enough for the human to select another
+          // block, at which point `renderInspector()` has detached these rows
+          // and nulled `repaintBlockKnobs`. The probe reply below takes the
+          // same early-out, for the same reason.
+          //
+          // **It refreshes whatever form IS on screen, by the safe method — it
+          // does not bare-`renderInspector()`** (#997 review NB3-1). The form
+          // the human moved to was rendered before this reply landed, so its
+          // knob rows are stale and do owe a repaint; but `renderInspector()`
+          // here would `replaceChildren` a form they may be typing in,
+          // destroying the input under their caret and dropping focus to
+          // `<body>`. That is the pane's own rule — "the form is redrawn only
+          // when the human isn't inside it" — and the first cut of this
+          // early-out broke it while its comment claimed to be following a
+          // sibling that does not. This IS the sibling's treatment now, which
+          // is what makes the claim above true.
+          if (!this.formPane.contains(picker.root)) {
+            if (this.formPane.contains(document.activeElement)) this.repaintBlockKnobs?.();
+            else this.renderInspector();
+            return;
+          }
+          // Mid-type guard: rebuilding the menu under a half-typed id hides the
+          // input the human is typing into. Deferred rather than dropped — see
+          // `runWhenNotEditing`.
+          picker.runWhenNotEditing(repaint);
+          // The menu may have moved under the selection, so the knobs re-derive
+          // from what the picker holds NOW — the same sync `picker.onChange`
+          // does, for the same reason.
+          knobs.setModel(picker.value);
+          // **Through the live method, never the captured `repaintKnobs`**
+          // (#997 review NB-1). `renderInspector()` clears `repaintBlockKnobs`
+          // before rebuilding precisely so a late reply cannot paint into a
+          // detached row; a closure holding this form's own repainter would
+          // walk around that guard. `?.` is what makes the treatment
+          // *actually* identical to `ensureCliKnobs`'s rather than only
+          // similar to it.
+          //
+          // Which branch runs: NOT the in-place one, in practice. The detect
+          // button disables itself before awaiting (`modelpicker.ts`), and a
+          // disabled element is not focusable — the browser blurs it, so
+          // `document.activeElement` is `<body>` and this is the
+          // `renderInspector()` branch. Both refresh the knobs, and
+          // rebuilding is safe with focus on `<body>`; the conditional stays
+          // because the human may have clicked into another field while the
+          // ask was in flight, and that case really does need the in-place
+          // repaint. (Corrected from a comment that asserted the opposite —
+          // #997 review NB-2.)
+          if (this.formPane.contains(document.activeElement)) this.repaintBlockKnobs?.();
+          else this.renderInspector();
+        }),
     });
-    picker.setOptions(blockModelOptions(modelCatalog.models(cli)), b.model, cli);
+    repaint();
     box.append(
       this.field(
         "Model",

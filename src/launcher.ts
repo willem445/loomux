@@ -661,7 +661,45 @@ export class WelcomeForm {
     // CLI's suggestions (issue #4).
     this.roleControls = ORCH_ROLES.map(({ key }) => {
       const cli = select(ORCH_CLIS.map((c) => [c.id, c.id]));
-      const model = new ModelPicker();
+      // #993. Both hooks read `cli.value` at call time rather than closing over
+      // a snapshot: a role's CLI is a live select, and a picker that had bound
+      // the CLI it was constructed with would report gemini's models on a
+      // copilot row after one change — the stale-reply failure `knobState`
+      // already refuses at the other end.
+      const model = new ModelPicker({
+        detailFor: (id) => this.catalog.detail(orchCliFor(cli.value).id, id),
+        // The only path in the launcher that spawns an agent CLI, and it is a
+        // click. See `src-tauri/src/modelwire.rs` for why no paint may reach it.
+        onDetect: () => {
+          const id = orchCliFor(cli.value).id;
+          return this.catalog.detect(id).then(() => {
+            // Re-derive rather than re-set blindly: the human may have changed
+            // the role's CLI while the ask was in flight, and repainting this
+            // row from a reply about a CLI it has moved off is exactly the
+            // silent-wrong-answer the knob path refuses.
+            if (orchCliFor(cli.value).id !== id) return;
+            // The knobs are repainted immediately and unconditionally: they are
+            // what this reply is the answer for, and repainting them touches
+            // nothing the human could be inside.
+            this.applyRoleKnobs(key);
+            // The MENU is the destructive half — rebuilding it under a
+            // half-typed id resolves that id to the dropdown branch and hides
+            // the input beneath the caret — so it is deferred to the moment
+            // that stops being true, never dropped (#997 review NB-3).
+            //
+            // Dropping it was permanent here in a way it is not in the workflow
+            // pane: `applyRoleModels` is otherwise reached only from the role's
+            // CLI `change` listener and the seed pass, so a detection that
+            // landed mid-type never reached this role's dropdown again for the
+            // life of the dialog — a `detect` click that visibly did nothing.
+            // The re-check inside the callback is the same staleness guard as
+            // above, re-run because a deferral can outlive the CLI it was for.
+            model.runWhenNotEditing(() => {
+              if (orchCliFor(cli.value).id === id) this.applyRoleModels(key);
+            });
+          });
+        },
+      });
       // #687: thinking level + context window, per role. Both start empty ("CLI
       // default") and are populated from `agent_cli_knobs` — a CLI that has no
       // seam for one renders it disabled carrying the vendor's own reason, never
@@ -1009,7 +1047,10 @@ export class WelcomeForm {
     const rc = this.roleControls.find((r) => r.key === role)!;
     const cli = orchCliFor(rc.cli.value);
     const model = rc.model.value || cli.defaults[role];
-    return knobState(this.knownKnobs.get(cli.id) ?? null, cli.id, model);
+    // #993: what the CLI itself reported about THIS model narrows the levels
+    // `CLI_CAPS` offers in general — `null` (nobody detected) leaves the knob
+    // exactly as it was.
+    return knobState(this.knownKnobs.get(cli.id) ?? null, cli.id, model, this.catalog.detail(cli.id, model));
   }
 
   /** Repopulate a role's two knob selects from its CLI's capability record and

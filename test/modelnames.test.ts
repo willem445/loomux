@@ -11,7 +11,19 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { modelLabel, modelOptionLabel, prettyModelId, INHERIT_MODEL_LABEL } from "../src/modelnames.ts";
+import {
+  INHERIT_MODEL_LABEL,
+  detectedModelOptionLabel,
+  modelLabel,
+  modelOptionLabel,
+  modelSummaryLine,
+  prettyModelId,
+} from "../src/modelnames.ts";
+// The table itself, so the composed-path tests can assert the layer below them
+// agrees — a pin that only checked the composed answer could not tell "the
+// table refused" from "the table has a row I forgot about".
+import { contextWindowFor } from "../src/modelcontext.ts";
+import type { ModelDetail } from "../src/modelcatalog.ts";
 
 test("a documented Claude Code alias carries the vendor's own description", () => {
   assert.equal(modelLabel("claude", "sonnet"), "sonnet — latest Sonnet, for daily coding tasks");
@@ -150,4 +162,142 @@ test("the empty curated id renders as a real row, not a blank one (#722)", () =>
   }
   // `modelLabel` itself keeps its own contract: an empty id has no NAME.
   assert.equal(modelLabel("opencode", ""), "");
+});
+
+// ---- labels that prefer what the CLI itself reported (#993) ----------------
+
+const detail = (over: Partial<ModelDetail> & { id: string }): ModelDetail => ({
+  resolvedId: "",
+  name: "",
+  description: "",
+  supportsEffort: null,
+  effortLevels: [],
+  ...over,
+});
+
+test("with nothing detected a row reads exactly as it always did", () => {
+  // Every caller that predates detection passes `null`, so this is the whole
+  // no-regression surface for the label path.
+  for (const id of ["sonnet", "claude-sonnet-4.6", "auto", ""]) {
+    assert.equal(detectedModelOptionLabel("claude", id, null), modelOptionLabel("claude", id));
+  }
+});
+
+test("a name the human's own install printed outranks the table and the prettifier", () => {
+  // `sonnet` has a quoted alias description and `claude-opus-4-8` prettifies
+  // cleanly — a reported name has to beat both, because it is what their CLI's
+  // own /model picker shows them.
+  assert.equal(
+    detectedModelOptionLabel("claude", "sonnet", detail({ id: "sonnet", name: "Sonnet 5" })),
+    "sonnet — Sonnet 5"
+  );
+  assert.equal(
+    detectedModelOptionLabel("claude", "opus[1m]", detail({ id: "opus[1m]", name: "Opus (1M context)" })),
+    "opus[1m] — Opus (1M context)"
+  );
+});
+
+test("the raw id is never lost, and a name that only re-cases it earns no space", () => {
+  const label = detectedModelOptionLabel("copilot", "gpt-5.2", detail({ id: "gpt-5.2", name: "GPT-5.2" }));
+  assert.ok(label.startsWith("gpt-5.2"), `the id leads: ${label}`);
+  assert.equal(
+    detectedModelOptionLabel("copilot", "auto", detail({ id: "auto", name: "Auto" })),
+    modelOptionLabel("copilot", "auto"),
+    "`auto — Auto` is width spent on nothing (the #687 rule, unchanged)"
+  );
+});
+
+test("the inherit row keeps its own wording whatever a reply says", () => {
+  assert.equal(detectedModelOptionLabel("claude", "", detail({ id: "", name: "Default" })), INHERIT_MODEL_LABEL);
+});
+
+test("the summary line states only what has a source", () => {
+  assert.equal(modelSummaryLine("claude", "sonnet", null), "1M context", "the table alone still has something to say");
+  assert.equal(modelSummaryLine("copilot", "gpt-5.2", null), "", "nothing known means nothing shown, not an empty frame");
+  assert.equal(
+    modelSummaryLine(
+      "claude",
+      "opus",
+      detail({ id: "opus", description: "Best for everyday, complex tasks", supportsEffort: true, effortLevels: ["low", "max"] })
+    ),
+    "Best for everyday, complex tasks · effort: low, max · 1M context"
+  );
+});
+
+test("the window is looked up against the id the CLI resolved the alias to", () => {
+  // `sonnet` happens to have its own row, so the case that proves the
+  // precedence is one where only the RESOLVED id does — an alias this build has
+  // no row for, resolving to a model it does.
+  assert.equal(modelSummaryLine("claude", "sonnet", null), "1M context");
+  assert.equal(
+    modelSummaryLine("claude", "latest", detail({ id: "latest", resolvedId: "claude-haiku-4-5" })),
+    "200K context",
+    "the canonical id the install resolved to is the one a static table can be sure about"
+  );
+});
+
+test("a resolved model with no table row says nothing — it never inherits its family's window", () => {
+  // #997 review, blocking 2. The first cut branched on the LABEL being empty
+  // instead of the FIELD being absent, so a reported `resolvedModel` the table
+  // has no row for fell through to the alias and printed the alias's number.
+  //
+  // `claude-sonnet-4-5` is the exact case `modelcontext.ts` rule 3 names and
+  // `test/modelcontext.test.ts` already pins one layer down — this is the
+  // composed path re-opening the hole the table was built to close, and it only
+  // opened once detection was on.
+  assert.equal(contextWindowFor("claude", "claude-sonnet-4-5"), null, "the table itself refuses to answer…");
+  assert.equal(
+    modelSummaryLine("claude", "sonnet", detail({ id: "sonnet", resolvedId: "claude-sonnet-4-5" })),
+    "",
+    "…so the line composed from it must refuse too, rather than borrowing `sonnet`'s 1M"
+  );
+});
+
+test("a resolved id an enterprise install really produces does not inherit one either", () => {
+  // The same defect on the id shapes a Bedrock or gateway deployment reports —
+  // a fresh fixture rather than a re-run of the alias case, because these are
+  // what an install that never sees a bare `claude-*` id actually resolves to.
+  for (const resolvedId of [
+    "us.anthropic.claude-sonnet-4-5-v1:0",
+    "arn:aws:bedrock:us-east-1:1:inference-profile/anthropic.claude-opus",
+    "my-gateway-deployment",
+  ]) {
+    assert.equal(
+      modelSummaryLine("claude", "sonnet", detail({ id: "sonnet", resolvedId })),
+      "",
+      `${resolvedId} has no row, so nothing may be claimed for it`
+    );
+  }
+});
+
+test("an absent resolvedModel is a different state from an unknown one", () => {
+  // The fallback is for the field being MISSING — an install older than Claude
+  // Code v2.1.197, which simply omits it. There the picked id is the most
+  // specific thing loomux has, so it is what gets looked up. This is the half
+  // the fix must keep, and the half the original test pinned correctly.
+  assert.equal(
+    modelSummaryLine("claude", "haiku", detail({ id: "haiku", resolvedId: "" })),
+    "200K context",
+    "absent means `ask the id instead`"
+  );
+  assert.equal(
+    modelSummaryLine("claude", "haiku", detail({ id: "haiku", resolvedId: "   " })),
+    "200K context",
+    "and whitespace is absent, not a model name"
+  );
+  assert.equal(
+    modelSummaryLine("claude", "haiku", detail({ id: "haiku", resolvedId: "claude-haiku-4-5" })),
+    "200K context",
+    "a resolved id the table DOES place answers from that row"
+  );
+});
+
+test("a context window is never scraped out of the reported prose", () => {
+  // The description really does read "Opus 5 with 1M context". Parsing a number
+  // out of a sentence is the manufacture `modelwire.ts` forbids, so on a CLI
+  // whose windows loomux does not document, the prose is shown and no number is
+  // claimed.
+  const line = modelSummaryLine("copilot", "some-model", detail({ id: "some-model", description: "Runs with 1M context" }));
+  assert.equal(line, "Runs with 1M context");
+  assert.ok(!line.includes("1M context ·") && !line.endsWith("· 1M context"), `no window was invented: ${line}`);
 });

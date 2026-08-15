@@ -206,3 +206,257 @@ The block form re-renders on every knob edit, so probing from its render path
 would be a subprocess per paint for exactly the CLIs that have nothing to say.
 Per pane is also precisely the granularity the per-form memo used to give, which
 is what makes this a restoration rather than a new policy.
+
+---
+
+# Asking the CLI itself: per-agent model detection (#993)
+
+Everything above answers "which model strings may this CLI be given?" from what
+a CLI prints *unprompted* — its `--help` prose, or a list subcommand where one
+exists. Three things a human needs are not in that answer, and cannot be:
+
+- **which models this host actually offers** — an account's entitlements, a
+  provider the human configured, a plan tier;
+- **each model's reasoning-effort levels** — per model and per account, so a
+  table in this repo would be a third copy of the thing #329 says not to keep
+  one of;
+- **the numeric context window** — which the CLIs emit only as banner prose.
+
+#993 closes the first two by asking the CLI in its own control protocol, and the
+third with a small table that cites a page.
+
+## The live probe is a third kind of claim
+
+| source | what it is | how it ages |
+| --- | --- | --- |
+| curated (`orchclis.ts`) | a suggestion written down in this repo | badly (#329) |
+| probed (`probe_agent_cli`) | what the CLI advertises it *accepts* | current by construction |
+| **detected (`list_cli_models`)** | **what the CLI reports about this host** | **current, and specific to the account** |
+
+Claude Code has no list subcommand (`claude models` opens a chat), but it speaks
+a control protocol on its `stream-json` input stream. One `list_models` control
+request returns the model picker the human's own install would show — real ids,
+plus each model's `supportsEffort` / `supportedEffortLevels`.
+
+Detection **adds rows and re-orders them; it never removes one.** It feeds the
+same `mergeModelOptions` the probe reply does, so the machine's answer leads and
+the curated entries stay behind it — which keeps the property `orchclis.test.ts`
+names, that a role's default is still on the menu afterwards.
+
+## Why detection is a human gesture, not a paint
+
+This is the load-bearing decision in the slice, and it is a constraint-3 call.
+
+Anthropic **types the control envelope** (`SDKControlRequest`,
+`SDKControlListModelsRequest = { subtype: 'list_models' }`, `ModelInfo`) in
+`@anthropic-ai/claude-agent-sdk`'s `sdk.d.ts`, and publishes `ModelInfo` at
+<https://docs.claude.com/en/api/agent-sdk/typescript>. Every CLI flag loomux
+passes is documented at <https://code.claude.com/docs/en/cli-reference>.
+
+But the string `list_models` appears **nowhere** in Anthropic's documentation
+corpus. The claim that it is a metadata message which does **not consume
+completion credits** is third-party (`stablyai/orca`, MIT) and therefore
+UNVERIFIED — docs-are-silent, not docs-say-X.
+
+If that claim is wrong, an automatic probe spends the human's money every time a
+model picker paints. So it is not automatic:
+
+- `list_cli_models` is reached **only** from a `detect` button in the picker;
+- the automatic model list is exactly what `cliprobe.rs` already made it;
+- the memo (`ModelCatalog.detect`) makes a second click read a cached answer
+  rather than spawn a second CLI.
+
+Flipping detection to automatic-on-open is a follow-up, gated on the **human**
+live-validating the cost — that validation is theirs, never an agent's.
+
+## The backend transports; the frontend parses
+
+`src-tauri/src/modelwire.rs` writes one request line to the CLI's stdin, reads
+stdout, and hands the bytes over IPC. It understands nothing about the reply.
+`src/modelwire.ts` parses it.
+
+That split is deliberate on two counts. The parsing is the fragile part — it is
+written against a payload key (`response.response.models`) that the vendor does
+not document — so it belongs where a `node --test` round costs a second rather
+than a CI build. And the backend stays a few dozen lines: per-CLI differences
+live in a `PROTOCOLS` table as DATA, the `ENUMERATORS`/`CLI_CAPS` pattern this
+repo already uses, so adding Copilot or opencode is a row, not a branch.
+
+The subprocess plumbing is **shared, not copied**: `cliprobe.rs`'s `run_cli`
+gained an optional stdin payload rather than being duplicated, because the
+fresh-PATH resolution, the hidden-window flag, the two drain threads and the
+deadline poll are the parts that are easy to get subtly wrong on Windows.
+
+The correlation id travels **on the reply** rather than being spelled in both
+languages. A `control_response` to some other control request must not be read
+as the answer to this one, and an id that drifted between sender and reader
+would silently stop correlating with nothing looking wrong.
+
+## Never manufacture
+
+`modelwire.ts` inherits the rule `cliprobe.rs`'s parsers already carry: **it may
+under-recognise, but it must never manufacture.** Every id it returns is a
+verbatim `value` string from the CLI's own JSON. It does not repair a truncated
+line, does not infer an id from a display name, and — the tempting one — does
+not read a context window out of the description prose, which really does say
+"Opus 5 with 1M context".
+
+A payload it does not recognise yields no models, which looks exactly like a CLI
+too old for the request: every surface keeps its seed list.
+
+## Three states, not two
+
+`ModelInfo` marks every capability field optional, and a real `haiku` row comes
+back carrying none of them. So `supportsEffort` is `boolean | null`:
+
+| value | meaning | what the effort knob does |
+| --- | --- | --- |
+| `null` | the CLI did not raise the subject | **unchanged** — `CLI_CAPS`'s levels |
+| `false` | the CLI says this model has no effort setting | disabled, quoting the model |
+| `true` + levels | the CLI listed them | offers exactly those, in its order |
+
+Collapsing `null` into `false` would remove a capability on no evidence. This is
+the docs-say-X / docs-are-silent / docs-say-NOT-X rule (`agent-cli-reference`)
+applied to a reply instead of a page.
+
+**Narrowing only ever narrows.** `caps` stays the outer bound: a CLI with no
+seam for the knob — copilot's effort lives in `~/.copilot/settings.json`, not on
+a flag — has none regardless of what a model reports about itself, or loomux
+would put a flag on the wire that the CLI cannot take.
+
+## A detection reply owes every surface `agent_cli_knobs` owes
+
+Detection is not just another source for the dropdown — it is the reply that
+makes `knobLookup` answer differently. So the surfaces it invalidates are the
+same ones the sibling `agent_cli_knobs` reply invalidates, and both hosts owe
+them all: the model menu, the knob rows, and (in the workflow pane) the analysis
+pass and its findings.
+
+Repainting only the dropdown is a real defect rather than a cosmetic one, and it
+shipped in the first cut on one of the two surfaces (#997 review). The block
+editor gained its rows and its summary line — so the human had every reason to
+believe detection had landed — while *Thinking level* went on offering
+`low/medium/high/xhigh/max` for a model whose reply said it had no effort
+setting. Picking `xhigh` wrote it, the next render brought the row back disabled,
+and the findings pane flagged the block: **the editor offered a value its own
+validator rejects.** The launcher never had the bug (`applyRoleModels` →
+`applyRoleKnobs`), and that asymmetry is what identified it as an oversight.
+
+Because this is DOM wiring — which this repo validates by hand rather than by
+simulating a DOM — the pin is a **source scan** (`test/detectrefresh.test.ts`),
+in the tradition of `transport.test.ts`'s one-importer rule and `groupid.rs`'s
+two scans. It asserts that **every** `onDetect` handler in each host reaches the
+refreshers by name, and carries a vacuity guard so a broken extraction fails
+loudly instead of passing. The next such handler will be written by copy-paste
+from a neighbour rather than by reading this note; a scan is what notices.
+
+The file's header enumerates what the instrument cannot do — reachability, not
+behaviour; source, not module graph — because a structural test that reads as
+broader coverage than it has is worse than none.
+
+**Nothing in that file is a behaviour test, `runWhenNotEditing` included.** An
+earlier round claimed otherwise on three surfaces, and the claim was false: the
+`runWhenNotEditing` pins are source scans of a second file, one level down. A
+behaviour pin genuinely is not available — the method reads
+`document.activeElement` and attaches a listener, and this repo forbids
+simulating a DOM — so whether a deferral actually defers is hand-validated like
+the rest of the DOM wiring (#997 review B-1).
+
+Three limits found the same way, by somebody mutating the subject and watching
+the suite stay green — which is the only way a structural test's claims ever get
+checked:
+
+- **Scanning only the first `onDetect`.** One handler per host today, so it was
+  sound as written; fixed before a second picker made it silently wrong (NB-4).
+- **Matching inside comments.** These handlers are two-thirds comment by volume
+  and the prose names every refresher, so deleting the real calls and leaving a
+  comment kept the suite green — the round-1 blocking regression passing its own
+  pin. Full-line comments are stripped before matching now (B-2), the discipline
+  `test/workspacelayout.test.ts` already uses — a *trailing* comment after code
+  is not stripped and could still satisfy an assertion, an accepted residual
+  (stripping those safely needs a tokenizer, not a regex) with no live instance
+  in either handler today (#997 review R4-2).
+- **A positive match that stopped discriminating.** Once the handler reached the
+  live knob hook in *two* places, asserting its presence survived a mutation of
+  either. The pin now also asserts the form-local closure is absent — the
+  negative half is the half that discriminates. Re-deriving the red table after
+  an unrelated fix is what caught it.
+
+Two further rules follow from the reply being **slow**. An ask spawns a CLI, so
+it is in flight for seconds, and a human does things in seconds.
+
+**Repaint through the live hook, never a captured one.** `renderForm()` clears
+`repaintBlockKnobs` before rebuilding, precisely so a late `agent_cli_knobs`
+reply cannot paint into a row it has just detached — and `ensureCliKnobs` calls
+`this.repaintBlockKnobs?.()` for that reason. A detect handler holding its own
+form's repainter in a closure walks straight around that guard: select another
+block while the ask is in flight and the reply paints the *previous* form's
+detached rows, leaving the one on screen stale (#997 review NB-1). The handler
+also takes the probe reply's `formPane.contains(picker.root)` early-out before
+touching any of this form's DOM. The findings are recomputed either way — they
+belong to the pane, not to the form.
+
+**Defer the mid-type rebuild; never drop it.** Rebuilding the menu under a
+half-typed id resolves it to the dropdown branch and hides the input beneath the
+caret, so `ModelPicker.editingCustom` is the question both hosts ask. But
+*refusing* is only half an answer: nothing schedules another attempt, and on the
+launcher that was permanent — `applyRoleModels` is otherwise reachable only from
+the role's CLI `change` listener and the seed pass, so a detection landing
+mid-type never reached that role's dropdown again for the dialog's life, and the
+human saw a `detect` click do nothing (#997 review NB-3). `runWhenNotEditing`
+owns both halves now: run it, or run it on the input's next `blur`. The
+predicate stays deliberately narrower than "focus is somewhere in this picker" —
+a detection is *started* by clicking a button inside the control, so the broad
+test is true on every detect path and would suppress the very rebuild the click
+asked for.
+
+## The context-window table, and why one exists at all
+
+`src/modelcontext.ts` is the one model fact loomux states on its own authority.
+It is there because no artifact carries the number: the CLIs emit it as prose,
+and the one machine-readable source — Anthropic's Models API `max_input_tokens`
+— needs an API key loomux does not have, and wiring one vendor's API into a
+generic tool is the host special-casing constraint 8 forbids.
+
+Three rules keep it from aging the way #329 warns about:
+
+1. **Keyed by CLI, then by id.** `sonnet` on a copilot row gets no window:
+   GitHub's reference does not say which Sonnet it serves or with what window,
+   and borrowing Anthropic's number would be loomux inventing a vendor fact
+   (#687's rule, applied to a number instead of a description).
+2. **Family aliases first.** `sonnet` means "the latest Sonnet model", so its
+   row stays right across a release that a pinned version row would not.
+   Versioned ids get rows only where the vendor documents that exact model
+   today.
+3. **Silence is an answer.** No row means no number — never a family's figure
+   applied to a version that may not share it. `claude-sonnet-4-5` is the case
+   that rule is for.
+
+The lookup uses `ModelInfo.resolvedModel` when the reply carried one: it is the
+canonical wire id an alias resolves to on *this* install, which turns a moving
+alias into the exact model the account is being served — the one id a static
+table can be sure about. It falls back to the picked id only when that field is
+**absent**, which Anthropic documents as the case on any install older than
+Claude Code v2.1.197.
+
+**Absent and unknown are different states, and conflating them re-opened the
+hole rule 3 exists to close (#997 review).** The first cut branched on the
+resulting *label* being empty rather than on the *field* being absent, so a
+reported `resolvedModel` with no row — `claude-sonnet-4-5`, or the
+`us.anthropic.…` / ARN / gateway forms an enterprise install really produces —
+fell through to the alias and printed the alias's number for it. Rule 3 held one
+layer down and the composed path inherited the figure anyway, and only once
+detection was on: the feature's own path re-opening the hole the table was built
+to close. A resolved id loomux cannot place is the *more specific* statement, so
+its silence is the answer; a missing field is not a statement at all, so the
+picked id is what gets asked. `test/modelnames.test.ts` pins both halves.
+
+## Seams added
+
+| seam | shape | who calls it |
+| --- | --- | --- |
+| `list_cli_models` (`modelwire.rs`) | `{ output, request_id, error }` | `pty.ts`'s `listCliModels` |
+| `parseListModelsReply` (`modelwire.ts`) | stdout + id to `ModelReport` | `readCliModelReply` |
+| `ModelCatalog.detect` | memoized, never rejects | the picker's `detect` button, only |
+| `ModelCatalog.detail` | `(cli, id)` to a `ModelDetail` or `null` | the picker's labels, `knobState` |
+| `knobState(caps, cli, model, detail?)` | optional 4th arg, defaults to today's behaviour | launcher + workflow pane |

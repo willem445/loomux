@@ -38,6 +38,7 @@ import {
   worthKeeping,
   type CliProbe,
 } from "../src/modelcatalog.ts";
+import { detailFor, type ModelDetail } from "../src/modelcatalog.ts";
 import { INHERIT_MODEL, ORCH_CLIS } from "../src/orchclis.ts";
 import { ORCH_ROLES } from "../src/roster.ts";
 
@@ -398,4 +399,145 @@ test("models() paints from curated before the probe lands, merged after", async 
     "claude-sonnet-4.6",
     ...curatedModels("claude"),
   ]);
+});
+
+// ---- the list-models control probe (#993) ----------------------------------
+//
+// A second seam beside the probe, and the tests below defend the reason it is
+// separate rather than folded in. `probe` reads what a CLI prints unprompted and
+// every form fires it on open; `detect` SPAWNS the CLI to ask it a question, on
+// a claim (that the question is free) that the vendor does not document. So the
+// properties worth pinning are about restraint — nothing runs unasked, a second
+// gesture does not become a second spawn — and about the answer never being
+// allowed to narrow what the human can already pick.
+
+const detail = (over: Partial<ModelDetail> & { id: string }): ModelDetail => ({
+  resolvedId: "",
+  name: "",
+  description: "",
+  supportsEffort: null,
+  effortLevels: [],
+  ...over,
+});
+
+test("a catalog with no detector wired reports nothing rather than failing", async () => {
+  // The launcher's catalog predates this slice. A surface that asks a catalog
+  // that cannot answer has to get a report, not a rejected promise reaching its
+  // render path.
+  const catalog = new ModelCatalog(async () => probe([]));
+  const report = await catalog.detect("claude");
+  assert.deepEqual(report.models, []);
+  assert.match(report.error ?? "", /detector/);
+  assert.equal(catalog.report("claude"), null);
+});
+
+test("detection never runs unasked", async () => {
+  // The load-bearing restraint: spawning an agent CLI may spend the human's
+  // money, so nothing on a paint path may reach it. `models()`, `cached()` and
+  // `probe()` are the paths a form touches on open — none of them may detect.
+  let detects = 0;
+  const catalog = new ModelCatalog(
+    async () => probe(["claude-sonnet-4.6"]),
+    async () => {
+      detects += 1;
+      return { models: [detail({ id: "opus" })], error: null };
+    }
+  );
+  catalog.models("claude");
+  catalog.detail("claude", "opus");
+  catalog.report("claude");
+  await catalog.probe("claude");
+  catalog.models("claude");
+  assert.equal(detects, 0, "no paint, and no ordinary probe, may spawn the CLI");
+  await catalog.detect("claude");
+  assert.equal(detects, 1, "only the explicit ask does");
+});
+
+test("a second ask for an answer already in hand spawns nothing", async () => {
+  let detects = 0;
+  const catalog = new ModelCatalog(
+    async () => probe([]),
+    async () => {
+      detects += 1;
+      return { models: [detail({ id: "opus" })], error: null };
+    }
+  );
+  await Promise.all([catalog.detect("claude"), catalog.detect("claude")]);
+  assert.equal(detects, 1, "concurrent gestures share one flight");
+  await catalog.detect("claude");
+  assert.equal(detects, 1, "and a later gesture reads the memo — a click must not be a spawn");
+});
+
+test("an empty answer is not kept, so an upgrade can still be detected", async () => {
+  // The same rule the probe memo follows, and it matters more here: a CLI too
+  // old for the control request today may be upgraded mid-session, and a memo
+  // that kept the refusal would make that unreachable without a restart.
+  let detects = 0;
+  const catalog = new ModelCatalog(
+    async () => probe([]),
+    async () => {
+      detects += 1;
+      return detects === 1 ? { models: [], error: "Unsupported control request subtype" } : { models: [detail({ id: "opus" })], error: null };
+    }
+  );
+  const first = await catalog.detect("claude");
+  assert.deepEqual(first.models, []);
+  assert.equal(catalog.report("claude"), null, "a barren answer leaves nothing behind");
+  const second = await catalog.detect("claude");
+  assert.deepEqual(second.models.map((m) => m.id), ["opus"]);
+  assert.equal(catalog.report("claude")?.models.length, 1, "a real answer is kept for the app run");
+});
+
+test("a rejected detection degrades instead of reaching a render path", async () => {
+  const catalog = new ModelCatalog(async () => probe([]), async () => {
+    throw new Error("ipc exploded");
+  });
+  const report = await catalog.detect("claude");
+  assert.deepEqual(report.models, []);
+  assert.match(report.error ?? "", /ipc exploded/);
+});
+
+test("detection adds rows to the menu and never removes one", async () => {
+  // The property `orchclis.test.ts` names, carried to the new source: a role's
+  // default is drawn from the curated list, and a default that fell off the menu
+  // opens the picker on its `custom…` branch — which reads as a human's typing.
+  const catalog = new ModelCatalog(
+    async () => probe([]),
+    async () => ({ models: [detail({ id: "opus[1m]" }), detail({ id: "haiku" })], error: null })
+  );
+  const before = catalog.models("claude");
+  await catalog.detect("claude");
+  const after = catalog.models("claude");
+  for (const id of before) assert.ok(after.includes(id), `${id} fell off the menu`);
+  assert.ok(after.includes("opus[1m]"), "the CLI's own row is offered");
+  assert.equal(after[0], "opus[1m]", "what the machine reported leads what this repo suggested");
+});
+
+test("detail() answers only about the model the CLI actually named", async () => {
+  const catalog = new ModelCatalog(
+    async () => probe([]),
+    async () => ({ models: [detail({ id: "opus", supportsEffort: true, effortLevels: ["low", "max"] })], error: null })
+  );
+  assert.equal(catalog.detail("claude", "opus"), null, "nothing until a human asks");
+  await catalog.detect("claude");
+  assert.deepEqual(catalog.detail("claude", "opus")?.effortLevels, ["low", "max"]);
+  assert.equal(catalog.detail("claude", "sonnet"), null, "a model the reply did not mention stays unknown");
+  assert.equal(catalog.detail("copilot", "opus"), null, "and a CLI nobody detected stays unknown too");
+});
+
+test("a [1m] pick finds the base model's reported row", () => {
+  // The suffix selects a context window, not a different model, and the CLI
+  // enumerates base ids. Missing here would silently drop the effort levels the
+  // plain variant shows, which reads as the suffix having disabled something.
+  const models = [detail({ id: "sonnet", supportsEffort: true, effortLevels: ["low", "high"] })];
+  assert.equal(detailFor(models, "sonnet[1m]")?.id, "sonnet");
+  assert.equal(detailFor(models, "SONNET")?.id, "sonnet");
+  assert.equal(detailFor(models, "claude-sonnet-4-5"), null, "never widened to a family — that is a different model");
+  assert.equal(detailFor(models, ""), null);
+});
+
+test("an id the CLI itself reported with a suffix still matches verbatim first", () => {
+  const models = [detail({ id: "opus[1m]", name: "Opus (1M context)" }), detail({ id: "opus", name: "Opus" })];
+  assert.equal(detailFor(models, "opus[1m]")?.name, "Opus (1M context)", "the exact row wins before any widening");
+  assert.equal(detailFor(models, "opus")?.name, "Opus");
 });

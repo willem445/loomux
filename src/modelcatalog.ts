@@ -201,6 +201,121 @@ export function worthKeeping(probe: CliProbe): boolean {
   return probe.available && probe.models.length > 0;
 }
 
+/** What a CLI's own list-models reply said about ONE model (#993).
+ *
+ *  A different kind of claim from the two above it. `curated` is a suggestion
+ *  this repo wrote down, and `probed` (`--help`, `opencode models`) is what the
+ *  CLI advertises it *accepts*. This is what the CLI reports about a model's own
+ *  capabilities **on the machine in front of the human** — which nothing else
+ *  can answer, because an effort level is per-model and per-account. A table of
+ *  them here would be the third copy of the thing #329 says not to keep one of.
+ *
+ *  The fields mirror Claude Code's own `ModelInfo`, which Anthropic types in
+ *  `@anthropic-ai/claude-agent-sdk`'s `sdk.d.ts` and publishes at
+ *  <https://docs.claude.com/en/api/agent-sdk/typescript> §ModelInfo (read
+ *  2026-08-14 per the `agent-cli-reference` discipline):
+ *
+ *      value: string;                 // Model identifier to use in API calls
+ *      resolvedModel?: string;        // Canonical wire model id this row's `value` resolves to
+ *      displayName: string;           // Human-readable display name
+ *      description: string;           // Description of the model's capabilities
+ *      supportsEffort?: boolean;      // Whether this model supports effort levels
+ *      supportedEffortLevels?: ('low' | 'medium' | 'high' | 'xhigh' | 'max')[];
+ *
+ *  Renamed rather than mirrored verbatim because this is loomux's own shape, not
+ *  one vendor's: a Copilot or opencode probe will fill the same fields from
+ *  whatever its own reply calls them. Every capability field on that type is
+ *  OPTIONAL, and a real reply exercises that — `haiku` comes back carrying no
+ *  effort fields at all — so absent has to stay distinguishable from false. */
+export interface ModelDetail {
+  /** The id VERBATIM as the CLI reported it (`ModelInfo.value`) — what `--model`
+   *  would receive. May itself carry a `[1m]` suffix: `opus[1m]` is a row the
+   *  CLI lists, not something loomux composes. */
+  id: string;
+  /** The canonical wire id `id` resolves to (`ModelInfo.resolvedModel`), or `""`
+   *  when the CLI did not say. Anthropic documents it as requiring Claude Code
+   *  v2.1.197 or later, so `""` is the ordinary answer from an older install and
+   *  never an error. Worth carrying because it turns an alias into the exact
+   *  model the account is really being served — the one id a context-window
+   *  lookup can be sure about. */
+  resolvedId: string;
+  /** The CLI's own display name (`ModelInfo.displayName`), or `""`. */
+  name: string;
+  /** The CLI's own description (`ModelInfo.description`), or `""`. Reported
+   *  prose, shown verbatim: loomux never parses a number out of it. */
+  description: string;
+  /** Whether the CLI said this model takes a reasoning-effort setting.
+   *
+   *  **`null` is a third state, not a synonym for `false`.** The docs-say-X /
+   *  docs-are-silent / docs-say-NOT-X rule (`agent-cli-reference`) applied to a
+   *  reply instead of a page: `false` is the CLI saying this model has no effort
+   *  knob, and `null` is the CLI not raising the subject — an older build, a
+   *  field that moved, a row like `haiku` that simply omits it. They must not
+   *  collapse, because `false` turns the knob OFF and `null` has to leave it
+   *  exactly as it was. */
+  supportsEffort: boolean | null;
+  /** The effort levels the CLI listed for this model, in its own order. Empty
+   *  when it listed none — which, paired with `supportsEffort: null`, is simply
+   *  "nothing was said". */
+  effortLevels: string[];
+}
+
+/** A whole list-models reply. `models` empty is the ordinary failure: the CLI is
+ *  not installed, is an older build without the control request, or answered in
+ *  a shape this build does not recognise. Every one of those degrades to the
+ *  seed rather than to an error a form has to render. */
+export interface ModelReport {
+  models: ModelDetail[];
+  /** Human-readable reason the reply carried nothing, or `null`. Diagnostic
+   *  only — no surface refuses anything on it. */
+  error: string | null;
+}
+
+/** The report for a CLI loomux could not ask at all. */
+export const reportFailure = (error: string): ModelReport => ({ models: [], error });
+
+/** Strip the `[1m]` context suffix from an id, if it carries one.
+ *
+ *  The suffix selects a context window on an existing model (model-config
+ *  §Extended context); it does not name a different model, and a CLI enumerating
+ *  its models reports the base ids. So `sonnet[1m]` has to find `sonnet`'s row —
+ *  otherwise a human who picked the 1M variant would silently lose the effort
+ *  levels the plain variant shows, which reads as the suffix having disabled
+ *  something. */
+function withoutContextSuffix(id: string): string {
+  const raw = id.trim();
+  return raw.toLowerCase().endsWith("[1m]") ? raw.slice(0, -4) : raw;
+}
+
+/** The reported detail for `id`, or `null` when the reply said nothing about it.
+ *
+ *  Matching widens in one direction only, and each step is a statement loomux
+ *  can defend: verbatim (the ids are the same string), then case-insensitively
+ *  (a vendor id is not case-significant, and `modelnames.ts` already compares
+ *  this way), then with `[1m]` stripped (the suffix is a context window, not a
+ *  model). It never widens to a FAMILY: `claude-sonnet-4-5` must not pick up
+ *  `sonnet`'s reported effort levels, because they are a different model's. */
+export function detailFor(models: readonly ModelDetail[], id: string): ModelDetail | null {
+  const raw = id.trim();
+  if (!raw) return null;
+  const exact = models.find((m) => m.id === raw);
+  if (exact) return exact;
+  const want = withoutContextSuffix(raw).toLowerCase();
+  if (!want) return null;
+  return models.find((m) => withoutContextSuffix(m.id).toLowerCase() === want) ?? null;
+}
+
+/** Whether a list-models reply is worth remembering for the rest of the app run.
+ *
+ *  The same rule as {@link worthKeeping} and for the same reason: a reply that
+ *  carried nothing is exactly the reply a later ask might improve on — the CLI
+ *  was installed a minute later, an upgrade added the control request, a login
+ *  completed. Keeping it would delete the recovery rather than duplicate a
+ *  cache. */
+export function reportWorthKeeping(report: ModelReport): boolean {
+  return report.models.length > 0;
+}
+
 /** The probe seam, shared by every surface: one call per program per app run for
  *  an answer worth keeping, and a fresh ask for one that is not.
  *
@@ -223,8 +338,12 @@ export class ModelCatalog {
    *  shorthand would put this module out of reach of its own tests. */
   private readonly probeFn: (program: string) => Promise<CliProbe>;
 
-  constructor(probeFn: (program: string) => Promise<CliProbe>) {
+  constructor(
+    probeFn: (program: string) => Promise<CliProbe>,
+    detectFn: ((program: string) => Promise<ModelReport>) | null = null
+  ) {
     this.probeFn = probeFn;
+    this.detectFn = detectFn;
   }
 
   probe(program: string): Promise<CliProbe> {
@@ -260,9 +379,90 @@ export class ModelCatalog {
   }
 
   /** The options to offer for `cli` RIGHT NOW: curated, merged with the probe
-   *  reply if one has landed. Synchronous by design — a form paints immediately
-   *  and re-paints when {@link probe} resolves. */
+   *  reply if one has landed, then with anything the CLI's own list-models reply
+   *  named. Synchronous by design — a form paints immediately and re-paints when
+   *  {@link probe} or {@link detect} resolves.
+   *
+   *  The list-models ids go through the same {@link mergeModelOptions} the probe
+   *  reply does, and for the same reason: a machine's own answer beats a
+   *  suggestion, so they lead, and the curated entries stay behind them rather
+   *  than being replaced. Detection therefore only ever ADDS rows and re-orders
+   *  them — a role's default is still on the menu afterwards, which is the
+   *  property `orchclis.test.ts` names. */
   models(cli: string): string[] {
-    return modelOptions(cli, this.cached(cli));
+    const base = modelOptions(cli, this.cached(cli));
+    const detected = this.report(cli);
+    return detected ? mergeModelOptions(base, detected.models.map((m) => m.id)) : base;
+  }
+
+  // ---- the list-models control probe (#993) --------------------------------
+  //
+  // A SECOND seam rather than a widening of the first, because the two are
+  // spent differently. `probe` reads what a CLI prints unprompted and every
+  // surface fires it on open; `detect` spawns the CLI to ask it a question, and
+  // the claim that the question is free is a third party's, not the vendor's
+  // (`src-tauri/src/modelwire.rs`). Constraint 3 says loomux does not bet the
+  // human's money on that, so this one moves only when a human asks it to —
+  // which is a property of WHO CALLS IT, and folding it into `probe` would
+  // delete the distinction that makes it true.
+
+  private detectInflight = new Map<string, Promise<ModelReport>>();
+  private detectResolved = new Map<string, ModelReport>();
+
+  /** The injected backend call (`pty.ts`'s `listCliModels`, read through
+   *  `modelwire.ts`). Optional: the launcher's own catalog is constructed
+   *  before this slice existed in it, and a catalog with no detector simply
+   *  reports nothing rather than failing. */
+  private readonly detectFn: ((program: string) => Promise<ModelReport>) | null;
+
+  /** Ask `program` for its own model list. **Only ever from a human gesture.**
+   *
+   *  Memoized exactly like {@link probe} and by the same argument, with one
+   *  extra edge to it: here the memo is not only saving an IPC, it is the thing
+   *  that stops a second click spawning a second agent CLI. A reply that
+   *  carried nothing is still not kept — a CLI installed or upgraded mid-session
+   *  must be able to answer on the next ask — but that re-ask costs another
+   *  gesture, never a repaint.
+   *
+   *  Never rejects: a detection that failed leaves every surface exactly as it
+   *  was. */
+  detect(program: string): Promise<ModelReport> {
+    const kept = this.detectResolved.get(program);
+    if (kept) return Promise.resolve(kept);
+    const detect = this.detectFn;
+    if (!detect) return Promise.resolve(reportFailure("this catalog has no list-models detector wired"));
+    let p = this.detectInflight.get(program);
+    if (!p) {
+      p = detect(program)
+        .catch((e: unknown) => reportFailure(String(e)))
+        .then((r) => {
+          if (reportWorthKeeping(r)) this.detectResolved.set(program, r);
+          this.detectInflight.delete(program);
+          return r;
+        });
+      this.detectInflight.set(program, p);
+    }
+    return p;
+  }
+
+  // No `detecting(program)` accessor here, and that is deliberate rather than
+  // an omission (#997 review): the detect button already owns its own in-flight
+  // state through `btn.disabled`, so a second reader of the same fact would be
+  // speculative API with no consumer and no test — and the memo, not a
+  // published flag, is what actually stops a second click becoming a second
+  // spawn. Add one when a surface genuinely needs it, with the test that says
+  // why.
+
+  /** The list-models reply already in hand for `cli`, or `null`. */
+  report(cli: string): ModelReport | null {
+    return this.detectResolved.get(cli) ?? null;
+  }
+
+  /** What the CLI reported about one model, or `null` when it has not been
+   *  asked, or asked and said nothing about this id. All three are the same
+   *  thing to a surface: show what you already knew. */
+  detail(cli: string, id: string): ModelDetail | null {
+    const report = this.report(cli);
+    return report ? detailFor(report.models, id) : null;
   }
 }

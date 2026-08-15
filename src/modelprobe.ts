@@ -24,7 +24,16 @@
 // Freshness is bounded from the other side by the callers, which ask per surface
 // rather than per paint.
 
-import { probeAgentCli } from "./pty";
-import { ModelCatalog } from "./modelcatalog";
+// The list-models detector (#993) is wired in here too, and its second half —
+// reading the bytes the backend hands back — is `modelwire.ts`'s. The seam is
+// split that way on purpose: `readCliModelReply` correlates the reply against
+// the id the backend says it sent, so neither side has to spell that id twice,
+// and the whole reader stays inside `node --test`'s reach.
 
-export const modelCatalog = new ModelCatalog(probeAgentCli);
+import { listCliModels, probeAgentCli } from "./pty";
+import { ModelCatalog } from "./modelcatalog";
+import { readCliModelReply } from "./modelwire";
+
+export const modelCatalog = new ModelCatalog(probeAgentCli, (program) =>
+  listCliModels(program).then(readCliModelReply)
+);
