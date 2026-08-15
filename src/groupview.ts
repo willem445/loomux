@@ -28,6 +28,7 @@ import {
   setAutonomous,
   setAutonomyBudget,
   setDangerousMode,
+  setFullAutonomy,
   setIdleActivityFloor,
   setIdleTickMinutes,
   setMaxAgents,
@@ -51,6 +52,11 @@ import {
   autoMergeFromApproval,
   autoReleaseControl,
   dangerousControl,
+  fullAutonomyControl,
+  fullAutonomyChip,
+  goalCommit,
+  goalFieldSync,
+  normalizeGoal,
   budgetMeter,
   formatTokens,
   isValidReleaseTag,
@@ -145,6 +151,11 @@ export class GroupView {
   private approvalChk: HTMLInputElement;
   private autoReleaseChk: HTMLInputElement;
   private dangerousChk: HTMLInputElement;
+  // Full autonomy (#778): its own row, plus a header chip while it is live.
+  private fullAutoChk: HTMLInputElement;
+  private goalInput: HTMLInputElement;
+  private goalErrEl: HTMLElement;
+  private fullAutoChipEl: HTMLElement;
   private budgetInput: HTMLInputElement;
   private budgetErrEl: HTMLElement;
   private meterEl: HTMLElement;
@@ -381,6 +392,12 @@ export class GroupView {
     this.autoBtn = el("button", "group-btn sm", "🤖 Off") as HTMLButtonElement;
     this.autoBtn.addEventListener("click", () => void this.toggleAutonomous());
     autoHead.append(this.autoBtn);
+    // Full-autonomy chip (#778): shown ONLY while the mode is live, so the state
+    // in which the orchestrator picks its own work reads at a glance from the
+    // section header. The goal rides in its tooltip.
+    this.fullAutoChipEl = el("span", "group-auto-chip");
+    this.fullAutoChipEl.hidden = true;
+    autoHead.append(this.fullAutoChipEl);
 
     // Row B: merge gate + budget + inline meter, wrapping if the panel is narrow.
     const ctlRow = el("div", "group-auto-controls");
@@ -463,6 +480,47 @@ export class GroupView {
 
     ctlRow.append(approvalLbl, releaseLbl, dangerLbl, budgetWrap, this.meterEl);
 
+    // Row B2 — full autonomy (#778): its own line rather than another item on the
+    // gate row, because it is the one control that changes what the orchestrator
+    // may START (the gates above all govern what it may SHIP) and it carries a
+    // free-text field of its own. Gated exactly like auto-release.
+    const fullRow = el("div", "group-auto-full");
+    const fullLbl = el("label", "group-auto-check full") as HTMLLabelElement;
+    this.fullAutoChk = document.createElement("input");
+    this.fullAutoChk.type = "checkbox";
+    this.fullAutoChk.checked = false; // safe default: opt-in label funnel
+    this.fullAutoChk.disabled = true; // until a status read shows autonomous on
+    this.fullAutoChk.addEventListener("change", () => void this.toggleFullAutonomy());
+    fullLbl.append(this.fullAutoChk, document.createTextNode(" ⚡ Full autonomy"));
+    fullLbl.title =
+      "Off (default): agents start only agent-ready / agent-investigation work. On: on each " +
+      "idle tick the orchestrator self-selects the highest-value eligible open issue and " +
+      "starts it — everything except issues you label agent-hold, and (for the pre-existing " +
+      "backlog) only after it posts a triage plan and you say go. Nothing about merging, " +
+      "releasing, review or budgets changes.";
+
+    // Goal: opaque to loomux (captured, echoed, never parsed). Editable whenever —
+    // set-then-enable, like the budget field — because the goal is a parameter of
+    // the consent and travels with the enable itself.
+    const goalWrap = el("div", "group-auto-goal");
+    goalWrap.append(el("span", "group-auto-blabel", "Goal"));
+    this.goalInput = document.createElement("input");
+    this.goalInput.className = "group-auto-binput goal";
+    this.goalInput.type = "text";
+    this.goalInput.placeholder = "no goal set";
+    this.goalInput.title =
+      "Optional: what this autonomous run is FOR (e.g. \"harden any bugs, close out new " +
+      "issues identified as you work\"). The orchestrator ranks candidates against it and " +
+      "states a one-line rationale per pickup. Set it before enabling; editing it while on " +
+      "re-aims the mode.";
+    this.goalInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") void this.applyGoal();
+    });
+    this.goalInput.addEventListener("blur", () => void this.applyGoal());
+    this.goalErrEl = el("span", "group-auto-berr");
+    goalWrap.append(this.goalInput, this.goalErrEl);
+    fullRow.append(fullLbl, goalWrap);
+
     // Row C (slim): idle-tick cadence knob + a power-user activity-floor knob +
     // the live tick-status line. The knobs configure the tick even while off
     // (set-then-enable); the status text only appears once autonomous is on.
@@ -511,7 +569,7 @@ export class GroupView {
     this.suspendEl = el("div", "group-auto-suspend");
     this.suspendEl.hidden = true;
 
-    autoRow.append(autoHead, ctlRow, tickRow, this.suspendEl);
+    autoRow.append(autoHead, ctlRow, fullRow, tickRow, this.suspendEl);
 
     // Release-grant control (#83): a collapsed power action — releases have no
     // board task, so this is the human path to authorize one. Kept collapsed by
@@ -891,6 +949,50 @@ export class GroupView {
       await setDangerousMode(this.groupId, this.dangerousChk.checked);
     } catch (err) {
       this.toast(String(err));
+    }
+    await this.load();
+  }
+
+  /** Commit the full-autonomy toggle (#778). The enable carries whatever goal is
+   *  in the field (set-then-enable — the enable IS how a goal reaches the backend;
+   *  there is no separate set-goal command), normalized the same way the backend
+   *  will normalize it. A rejected write (e.g.
+   *  autonomous off) toasts and the poll re-syncs the real state. */
+  private async toggleFullAutonomy(): Promise<void> {
+    this.goalErrEl.textContent = "";
+    const on = this.fullAutoChk.checked;
+    // Normalized here rather than left to the backend so the field shows the human
+    // exactly the goal their click is about to put in force. (A disable ignores it:
+    // "off" has no goal, by construction.)
+    const goal = normalizeGoal(this.goalInput.value);
+    this.goalInput.value = goal;
+    try {
+      await setFullAutonomy(this.groupId, on, goal);
+    } catch (err) {
+      this.toast(String(err));
+    }
+    await this.load();
+  }
+
+  /** Commit a goal edit. While the mode is OFF this is a no-op by design (the
+   *  value is parked in the field until the enable carries it); while it is ON, a
+   *  genuinely changed goal re-aims the mode — and an unchanged one sends nothing,
+   *  because every enable delivers a notice into the orchestrator's pane. */
+  private async applyGoal(): Promise<void> {
+    this.goalErrEl.textContent = "";
+    const live = this.autonomy?.full_autonomy_goal ?? null;
+    const { send, goal } = goalCommit(
+      this.autonomy?.full_autonomy ?? false,
+      live,
+      this.goalInput.value
+    );
+    // Show the human the normalized string they actually committed.
+    if (document.activeElement !== this.goalInput) this.goalInput.value = goal;
+    if (!send) return;
+    try {
+      await setFullAutonomy(this.groupId, true, goal);
+    } catch (err) {
+      this.goalErrEl.textContent = String(err);
     }
     await this.load();
   }
@@ -1404,6 +1506,30 @@ export class GroupView {
     // DANGER affordance: highlight only when actually engaged.
     (this.dangerousChk.closest(".group-auto-check") as HTMLElement | null)
       ?.classList.toggle("on", danger.checked);
+
+    // Full autonomy (#778): same dependency as auto-release, plus the header chip.
+    const full = fullAutonomyControl(a.autonomous, a.full_autonomy);
+    this.fullAutoChk.checked = full.checked;
+    this.fullAutoChk.disabled = full.disabled;
+    // Assigned unconditionally (not `if (tooltip)` like the two above): an empty
+    // title clears the disabled explanation once the control becomes editable, so
+    // the box can't keep claiming it "requires Autonomous mode" while autonomous
+    // is on. The label's own title carries the real help either way.
+    this.fullAutoChk.title = full.tooltip;
+    (this.fullAutoChk.closest(".group-auto-check") as HTMLElement | null)
+      ?.classList.toggle("on", full.checked);
+    const chip = fullAutonomyChip(full.checked, a.full_autonomy_goal);
+    this.fullAutoChipEl.hidden = !chip.shown;
+    this.fullAutoChipEl.textContent = chip.text;
+    this.fullAutoChipEl.title = chip.tooltip;
+
+    // Goal field: authoritative from the backend while the mode is on; while it is
+    // off the field holds the human's pending goal (set-then-enable), so a poll
+    // must leave it alone rather than erase what they are about to enable with.
+    const goalValue = goalFieldSync(a.full_autonomy, a.full_autonomy_goal);
+    if (goalValue !== null && document.activeElement !== this.goalInput) {
+      this.goalInput.value = goalValue;
+    }
 
     // Budget input: don't clobber while the human is editing it.
     if (document.activeElement !== this.budgetInput) {

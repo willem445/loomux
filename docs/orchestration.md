@@ -251,10 +251,11 @@ next starts on that repo.
 | `agent-ready` | Groomed — start work. The issue is driven to a PR through the normal branch → implement → test → PR flow. |
 | `agent-investigation` | Research only. A planner (or the orchestrator itself, for small questions) researches options/feasibility and posts findings or a plan as an issue comment — **no code**. |
 | `agent-managed` | Set *by* an orchestrator to mark "I own this issue." Shown read-only in the UI. |
+| `agent-hold` | The opposite of a go signal: agents must not start this issue. It's the veto that matters under [full autonomy](autonomous-mode.html#full-autonomy-the-orchestrator-picks-the-work), where every open issue is otherwise eligible. |
 
-You can apply `agent-ready` / `agent-investigation` straight from the
-[GitHub issues view](features/github-issues.html) — toggle the **ready** or
-**investigate** control on an issue row. If the repo doesn't have these labels
+You can apply `agent-ready` / `agent-investigation` / `agent-hold` straight from
+the [GitHub issues view](features/github-issues.html) — toggle the **ready**,
+**investigate** or **hold** control on an issue row. If the repo doesn't have these labels
 yet, loomux creates the one you toggle on first use (only these allow-listed
 labels are ever created).
 

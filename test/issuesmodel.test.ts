@@ -6,6 +6,8 @@ import {
   AGENT_READY,
   AGENT_INVESTIGATE,
   AGENT_MANAGED,
+  AGENT_HOLD,
+  TOGGLEABLE_LABELS,
   isLabeledForAgents,
   matchesQuery,
   filterAndSortIssues,
@@ -35,6 +37,37 @@ test("label constants match the backend allow-list exactly", () => {
   assert.equal(AGENT_READY, "agent-ready");
   assert.equal(AGENT_INVESTIGATE, "agent-investigation");
   assert.equal(AGENT_MANAGED, "agent-managed");
+});
+
+test("agent-hold is the veto label and it is toggleable from the issues view (#778)", () => {
+  // The hold label IS the veto gesture: under full autonomy every open issue is
+  // eligible EXCEPT a held one, so the human needs a one-click way to apply it.
+  assert.equal(AGENT_HOLD, "agent-hold");
+  assert.ok(
+    (TOGGLEABLE_LABELS as readonly string[]).includes(AGENT_HOLD),
+    "agent-hold must be toggleable — it is the veto surface"
+  );
+  // Display order: the two go-signals first, then the veto.
+  assert.deepEqual([...TOGGLEABLE_LABELS], [AGENT_READY, AGENT_INVESTIGATE, AGENT_HOLD]);
+});
+
+test("agent-hold is NOT a go-signal — holding an issue never reads as queueing it", () => {
+  // The row highlight means "an orchestrator will pull this on". A hold is the
+  // opposite instruction, so it must never light that up on its own.
+  assert.equal(isLabeledForAgents(issue({ labels: [AGENT_HOLD] })), false);
+});
+
+test("holding an issue that is already agent-ready touches only the hold label", () => {
+  // The two labels coexist deliberately: labelDelta only ever moves the label it
+  // was asked about, so vetoing an issue can never silently strip the go-signal a
+  // human (or an orchestrator) put there — the funnel resolution is contract-side.
+  const held = labelDelta([AGENT_READY, AGENT_MANAGED], AGENT_HOLD, true);
+  assert.deepEqual(held, { add: [AGENT_HOLD], remove: [] });
+  // Lifting the veto likewise leaves everything else alone.
+  const lifted = labelDelta([AGENT_READY, AGENT_HOLD], AGENT_HOLD, false);
+  assert.deepEqual(lifted, { add: [], remove: [AGENT_HOLD] });
+  // And re-applying a hold that is already there is a no-op (no backend call).
+  assert.deepEqual(labelDelta([AGENT_HOLD], AGENT_HOLD, true), { add: [], remove: [] });
 });
 
 test("isLabeledForAgents is true only for go-signal labels", () => {

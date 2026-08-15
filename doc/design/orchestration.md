@@ -2576,10 +2576,11 @@ check-state transitions, and (#864) new comment/review activity on an open PR.
   nonzero and due (`intake::due_intake_polls`, the `notify::due_watches` per-group-interval
   idiom, plus that idiom's per-tick cap and oldest-polled-first ordering — see "Bounding one
   tick") — shells out
-  to `gh issue list --json number,title,labels` and `gh pr list --json
-  number,title,statusCheckRollup,comments,reviews` (via the existing `gh_capture` helper
-  `poll_watches` already uses; no new subprocess plumbing) and diffs the result against that
-  group's last-seen state
+  to `gh issue list --limit N --json number,title,labels` and `gh pr list --limit N --json
+  number,title,statusCheckRollup,comments,reviews` (argv built by
+  `intake::issue_list_argv`/`intake::pr_list_argv` — see "A bounded listing is only half the fix"
+  below; via the existing `gh_capture` helper `poll_watches` already uses; no new subprocess
+  plumbing) and diffs the result against that group's last-seen state
   (`OrchRegistry.intake_seen`, in-memory only — the `watches`/`idle_tick_times` lifetime class).
   Two calls per due group regardless of how many issues/PRs exist — the API-budget discipline
   `notify.rs`'s round-robin/per-tick cap defends, applied here as "one list call, not one per
@@ -2619,6 +2620,32 @@ check-state transitions, and (#864) new comment/review activity on an open PR.
   `notify::sanitize_gh_text` exactly like every other GitHub-derived field reaching a `[loomux]`
   notice (issue titles are third-party text — the #189 threat model applies here too), capped at
   `MAX_SIGNALS_IN_SUMMARY` with a stated "+N more" rather than growing unboundedly.
+- **A bounded listing is only half the fix (#785 for issues, #795 for PRs).** Both `gh`
+  subcommands default to **30, newest first**, so both halves of the sweep were silently reading
+  a window rather than a repo. Adding `--limit` alone would not have been enough, because two of
+  the three diffs infer *absence means gone* — `eligible_deltas` ("no longer eligible") and
+  `pr_check_deltas` ("merged or closed"). Under any bound the window **churns**: filing an issue
+  or opening a PR evicts the oldest in the window, and closing something above it lets that item
+  back in, where a forgotten entry re-announces itself. For `pr_check_deltas` that reads as a
+  "checks SUCCESS" wake for a PR that has been green for days. So each listing carries its own
+  completeness (`OpenIssueList`/`OpenPrList`, `from_fetch`: *fewer than the bound came back ⇒ we
+  saw the whole list*; *exactly the bound ⇒ assume there are more*, since `gh` reports no total),
+  an entry is dropped only on **evidence** — present-and-changed, or absent from a **complete**
+  listing — and hitting a bound is stated in the wake summary as a `PARTIAL:` caveat rather than
+  applied silently. `label_deltas` never needed any of this: it only touches items present in the
+  response and never removes an absent one's entry, so a churning window is invisible to it.
+  Two consequences are accepted rather than fixed: an item that closes **while beyond the bound**
+  keeps its entry, so a later reopen reads as unchanged and produces no wake (reopen-is-news
+  survives only inside the window); and `last_seen` grows while listings stay truncated, at one
+  small entry per number ever seen, which a single complete listing prunes at once. Both are the
+  cheap side of the trade — a missed wake for a rare out-of-window reopen against a spurious one
+  on every churn — and are why the bounds (`MAX_INTAKE_ISSUES` 300, `MAX_INTAKE_PRS` 200) are
+  sized to make truncation rare rather than routine. The two bounds differ deliberately: open
+  issues are a backlog that accumulates, open PRs are in-flight work capped by review capacity,
+  and the PR call is the heavier per item (a nested `statusCheckRollup` per PR against a flat
+  label list). Each argv is built by a function rather than spelled inline **so the bound is
+  pinnable** — inline, `--limit` is one deletable word whose removal restores the defect with
+  every behavioural test still green, since they all hand the diffs a listing directly.
 - **The gate itself (`intake::idle_tick_gate`).** Once `idle_tick_should_fire`'s quiet-window
   threshold clears (unchanged from #83), a group with the gate ON consults **four** signals
   before actually notifying: a pending intake signal from the poller above; an outstanding
@@ -12419,6 +12446,141 @@ from `orch_session_roles` would be a second, partial implementation of a backend
 modal states the policy and the success toast names the group the backend actually resolved. A
 preview command (the same read-only-mirror shape `promote_orchestrator_cli` already uses) is the
 follow-up if that trade stops being acceptable.
+
+## Full autonomy: inverting the consent boundary (#778)
+
+Autonomous mode (#316) gave the orchestrator a **tick**; it never gave it a **queue**. The
+label funnel stayed opt-in, so an unattended fleet drained the batch it was handed and then
+idled while new issues piled up behind a label nobody was there to apply. Full autonomy is
+one group-level toggle that inverts that default: every open issue is eligible to start
+**except** the ones the human held.
+
+Inverting a consent boundary is the whole feature, so the shape of the *new* boundary is the
+design, not the toggle plumbing.
+
+### The boundary is a contract, and the enforced one deliberately stays ship-side
+
+Nothing in loomux has ever blocked an agent from *starting* an unlabelled issue. There is no
+spawn-to-issue binding — an agent is spawned onto a worktree with a brief, and the issue it
+names is prose — so a host-side start gate would have nothing to check. What loomux enforces
+is the **ship** side: the `gh`/`git` shim refuses a default-branch merge or a release publish
+unless a gate opened. That asymmetry predates this feature, and #778 keeps it: the toggle
+widens what may be *started*, never what may be *shipped*, and every gate, the review
+discipline, the budget money-stop and the delegate cap are untouched by it.
+
+The consequence is that under full autonomy the **template text is the consent boundary**.
+That is why the contract wording is a reviewed artifact in its own right, why the change to
+`INVARIANT 8` is byte-pinned by `tests/fixtures/pre222/orchestrator.md`, and why the prose
+slice merged last: the instructions describe shipped behaviour rather than the plan's
+intentions (the #715/#721 failure mode).
+
+Two things the host half *does* contribute, and neither is a consent gate:
+
+- **`agent-hold` suppresses the wake.** `poll_intake` excludes held issues from the
+  eligible-unstarted signal, so an orchestrator is never even told a held issue exists.
+  Suppressing a wake is the safe direction of a mistake; blocking a start it could not
+  actually block would be theatre.
+- **Board-tracked issues are suppressed too** — a duplicate-wake filter, explicitly *not* a
+  consent gate, because the board is agent-writable (the `Task.pr_base` "nothing may gate on
+  it" posture applies unchanged).
+
+Host-side start blocking is named here as the future hardening it is, not as a gap this slice
+skipped: it needs a spawn-to-issue binding that does not exist yet, and adding a half-binding
+that some spawns could route around would make the boundary *look* enforced while remaining
+advisory — strictly worse than an honest contract.
+
+### The exact contract
+
+Five public-contract changes, all additive:
+
+1. **`INVARIANT 8` / the orchestrator template.** The invariant now states both directions
+   (opt-in by default, inverted only under full autonomy) and names the three exceptions to
+   eligibility: `agent-hold`, a struck triage row, and any pre-existing issue before the plan
+   is posted **and** the human has said go. A **Full autonomy** subsection carries the
+   operational half — the triage protocol, the selection priority order, the parking rule,
+   the rationale-line duty, and the queue-empty rule.
+2. **`orch_autonomy` gains `full_autonomy` and `full_autonomy_goal`.**
+3. **`orch_set_full_autonomy(group_id, enabled, goal)`** — a new command.
+4. **`workflow.yml` gains optional `intake.labels.hold`** (default `agent-hold`).
+5. **The group dir gains a `full_autonomy` marker**, whose *content* is the goal.
+
+**Consent and its parameter are written together.** The goal lives in the marker's content —
+the same anchor-in-content shape `set_autonomous` uses for the budget anchor — so an enable is
+one atomic act and a restart brings back both halves or neither. It is also why a re-enable
+carrying a *different* goal **re-aims** the mode rather than no-opping the way its `auto_merge`
+siblings do: the goal is what the consent was qualified by, and silently discarding a retyped
+one would leave a human believing they had re-pointed a fleet still running the old goal.
+
+**The goal is opaque to loomux.** It is captured, normalized (one line, control characters
+dropped, brackets neutralized, 500 characters — it is typed into a CLI pane) and echoed into
+the kickoff config and the toggle notice. It is never parsed or scored. Ranking work against
+it is the orchestrator's documented judgment, which keeps "what work is valuable" policy out
+of product code entirely — constraint 8's generic-tool rule applied to the one field most
+tempting to interpret.
+
+**Why the reported goal is null whenever the mode is off**, and why the accessor rather than
+the marker is the reason: `full_autonomy_goal` is gated on `is_full_autonomy`. The force-clear
+paths (autonomous-off, the budget money-stop) are money-stops — they drop the in-memory flag
+unconditionally and remove the marker only best-effort — so a disk failure genuinely leaves a
+marker, goal and all, behind while the mode is off. In that window the in-memory set is the
+authority, and reporting the orphaned goal would have `orch_autonomy` claim consent that is
+not in force. Gating in the accessor rather than at the one JSON call site makes that total:
+no future caller can reintroduce it. (The orphan itself is cleared by the restart reconcile.)
+
+**The dependency chain runs one way.** Enabling requires autonomous ON; autonomous-off and a
+budget suspension force-clear full autonomy; a `full_autonomy` marker found without a live
+`autonomous` one is cleared and audited rather than resumed. The asymmetry is deliberate:
+an inverted start default outliving the consent to run unattended at all is the one direction
+this feature must never have.
+
+### The eligibility signal is a wake producer, not a new gate
+
+The zero-token half rides the existing `has_intake_signal` pipeline: the same `gh issue list`
+response that feeds the label diff also answers "which open issues are eligible and
+unstarted", so the idle-tick gate gains **no new parameter**, and the one-notice latch, hourly
+cap and bounded fallback all apply unchanged. An empty last-seen set is what makes the first
+poll after an enable announce the whole eligible backlog at once — the enable *is* the triage
+trigger, with no separate mechanism.
+
+Two properties of that signal reach the contract because an orchestrator that doesn't know
+them will misread its own wake:
+
+- **The fetch is bounded** (`MAX_INTAKE_ISSUES`), and exceeding the bound is never silent. A
+  truncated response marks itself incomplete, which both suppresses the "this issue stopped
+  being eligible" inference (absence from a churning 300-newest window is not evidence) and
+  adds a stated `PARTIAL` caveat to the wake summary. The contract says what that caveat
+  obliges: list the rest before posting a triage plan, or state in the plan that it is
+  partial — a human's go given over a list known to be short is consent obtained under a
+  wrong premise.
+- **Absence is never permission.** A board-tracked issue is suppressed, so "no wake" carries
+  no authorization either way.
+
+### Alternatives considered
+
+- **Goal in `group.json` guardrails** — rejected. Consent and its parameters travel together;
+  the marker-content precedent already exists; and the `gh` shim, which reads guardrails, must
+  never need the goal.
+- **Parsing struck rows out of the triage comment** — rejected. Human-edited markdown is
+  fragile, and it would create a *second* exclusion mechanism that could disagree with the
+  first. The label **is** the strike: one mechanism, already backed by a one-click UI
+  (`TOGGLEABLE_LABELS` → `gh_issue_set_labels` → `ALLOWED_LABELS`).
+- **A new `idle_tick_gate` parameter, or a separate full-autonomy tick** — rejected. The
+  eligibility finding is a *producer* of an existing signal, so the gate surface stays
+  exactly as wide as it was.
+- **Loomux-enforced start blocking of held issues** — rejected for now; see the boundary
+  argument above.
+- **The board as the veto surface** — rejected. Deleting a board task makes its issue read as
+  unstarted again, so a veto expressed there would evaporate; labels are durable on GitHub and
+  survive with no orchestrator running.
+- **Auto-proceeding after a veto window expires** — rejected outright. Consent by timeout is
+  not consent. No go means the pre-existing backlog never starts, which is a correct outcome
+  and the same shape as INVARIANT 2's open-question hold.
+- **Label-only vs triage-only exclusion** — the issue left this undecided; the answer is both,
+  because they solve different problems. The label is the *durable, machine-checked* boundary
+  for the steady state; the triage plan is the *bulk onboarding* path for a pre-existing
+  backlog the human never vetted issue-by-issue. Triage alone would leave no way to hold
+  something later; the label alone would demand one click per backlog issue before the mode
+  could be trusted at all.
 
 ## Risks / limitations
 
