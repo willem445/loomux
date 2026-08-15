@@ -79,7 +79,7 @@
 //! means reachable by a sibling crate in this repo, not a compatibility promise
 //! to anyone outside it.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// An agent's **capability class** — the closed enum (#222).
 ///
@@ -632,6 +632,125 @@ pub fn role_instructions_file(role: Role) -> &'static str {
         Role::Solo => unreachable!("solo panes have no instructions file"),
     }
 }
+
+// #888 slice A3 batch 8 — four small pure items lifted out of
+// `src-tauri/src/orchestration/mod.rs`, joining this module because each is
+// data (a wire-form enum, two tunable defaults) rather than registry state.
+// `mod.rs` re-exports all four under their original names, so every existing
+// call site — in this crate and the integration suite — resolves unchanged.
+// See doc/design/engine-extraction.md §6 for the batch record.
+
+/// How a `deliver_prompt` call relates to the pane's lifecycle. Governs the boot
+/// readiness wait AND the one-time copilot autopilot-consent confirm (#101).
+///
+/// **#620: also a PERSISTED fact** (`queue::QueuedDelivery::delivery_kind`).
+/// A delivery held through a pause is drained minutes or hours later by
+/// `flush_paused_queues`, long after the `deliver_prompt` call that knew what
+/// kind it was returned — so the kind rides on the queue entry rather than
+/// living only on the calling thread's stack. Serialized kebab-case
+/// (`"fresh-kickoff"`) for the reason `QueuedPayload` spells its own tag out:
+/// a human reading a group's `queue.json` after a crash should not need
+/// serde's conventions to know what an entry is. `MidSession` is the `Default`
+/// — see the field's doc for why that is the conservative reading of both an
+/// older build's record and a restart.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Delivery {
+    /// First prompt to a freshly *booted* pane (a fresh spawn's kickoff): wait
+    /// for the CLI to paint, and — for an autopilot copilot agent — answer the
+    /// "Enable autopilot mode" consent dialog before pasting.
+    FreshKickoff,
+    /// First prompt to a *resumed* pane: still wait for the CLI to paint AND
+    /// (#364) still answer the autopilot consent dialog. Resume was assumed to
+    /// restore allow-all/autopilot from the session event log so the dialog
+    /// would never reappear — the human's #364 report is that this assumption
+    /// is false (the dialog does reappear, or autopilot isn't restored), so
+    /// this delivery confirms exactly like `FreshKickoff` does.
+    ResumeKickoff,
+    /// A mid-session delivery to an already-running pane (a follow-up / steer):
+    /// no readiness wait, no dialog — long past boot, nothing to confirm.
+    ///
+    /// The `Default`, and deliberately the conservative one (#620): every
+    /// treatment this enum can switch ON — a boot wait, a stray Enter into a
+    /// consent dialog, arming #517's re-delivery — is an ACTION taken against
+    /// a live pane, so a record that cannot say what it was must fall through
+    /// to the kind that takes none of them.
+    #[default]
+    MidSession,
+}
+
+impl Delivery {
+    /// Whether to hold the paste until the CLI has painted its UI — true for
+    /// either kickoff (the CLI has just been launched), false mid-session.
+    ///
+    /// `pub` here though it was bare module-private in `src-tauri` — batch 8's
+    /// forced widening (same shape as this module's "Widened on the way in"
+    /// section above): `mod.rs`'s own callers (`kind.wait_ready()`,
+    /// `delivery.wait_ready()`) are on the other side of the crate boundary
+    /// now, so nothing narrower than `pub` still reaches them.
+    pub fn wait_ready(self) -> bool {
+        matches!(self, Delivery::FreshKickoff | Delivery::ResumeKickoff)
+    }
+    /// Whether this delivery should watch for and answer copilot's "Enable
+    /// autopilot mode" consent dialog (#364): true for EITHER kickoff — a
+    /// fresh boot or a resume — since both can show the dialog; false
+    /// mid-session, which is long past boot and has nothing to confirm.
+    pub fn confirms_autopilot_dialog(self) -> bool {
+        matches!(self, Delivery::FreshKickoff | Delivery::ResumeKickoff)
+    }
+    /// Whether a delivery of this kind may be RE-DELIVERED by the late
+    /// monitor when it turns out never to have reached the pane (#517).
+    ///
+    /// `FreshKickoff` only — deliberately narrower than the two predicates
+    /// above, which both include a resume. A fresh spawn's brief exists
+    /// nowhere else: nothing will re-send it, and the agent has no other way
+    /// to learn what it was spawned to do. A `ResumeKickoff` payload is a
+    /// re-sync notice re-derived from durable state (see
+    /// `resume_kickoff_notice`), and a `MidSession` prompt has a sender who
+    /// is still around — both keep the pre-#517 badge-and-stop behavior.
+    pub fn recovers_lost_kickoff(self) -> bool {
+        matches!(self, Delivery::FreshKickoff)
+    }
+}
+
+/// Autonomous mode (#83): default output-quiet window before an idle tick fires,
+/// when the group's `idle_tick_minutes` guardrail isn't set. Lowered from the
+/// original 15 to **5** after a live test: a human who turns autonomous mode on
+/// expects action within a few minutes, and a 15-minute default simply never fired
+/// in an 8-minute session. Per-group tunable (`set_idle_tick_minutes`) so the human
+/// can drop it to 1–2 min to verify quickly. See `idle_tick_should_fire`.
+///
+/// `pub` here though it was bare module-private in `src-tauri` — batch 8's
+/// forced widening, the same shape this module's "Widened on the way in"
+/// section (above) argues for `default_model`/`sanitize_model_opt`. State the
+/// reachability precisely rather than reach for "unchanged": `mod.rs`'s
+/// `pub(crate) use` narrows only the FLAT spelling
+/// (`orchestration::DEFAULT_IDLE_TICK_MINUTES`, the one `mod.rs`/`intake.rs`
+/// actually call) back to "this crate". It does NOT narrow the item overall —
+/// `mod.rs` already re-exports the whole `model` module publicly (`pub use
+/// loomux_engine::model::{self, …}`), so this const is also reachable as
+/// `orchestration::model::DEFAULT_IDLE_TICK_MINUTES`, and since that path
+/// crosses no crate-private boundary, as
+/// `loomux_lib::orchestration::model::DEFAULT_IDLE_TICK_MINUTES` from outside
+/// the crate too. Forced (an item must be `pub` here to cross the crate
+/// boundary at all) and harmless (`loomux-engine` is `publish = false`; the
+/// module was already a public re-export before this batch, and "public"
+/// here means reachable by a sibling crate in this workspace, not a shipped
+/// API promise).
+pub const DEFAULT_IDLE_TICK_MINUTES: u32 = 5;
+
+/// Idle-tick intake gate (#332/#429): the smart default `intake_poll_minutes`
+/// resolves to whenever a group is autonomous and hasn't set an explicit
+/// value — matches `DEFAULT_IDLE_TICK_MINUTES` (the idle tick's own
+/// quiet-window default) rather than inventing a new cadence: the poller
+/// need not run more often than the tick it feeds ever fires anyway.
+///
+/// Same forced-and-not-narrowed shape as [`DEFAULT_IDLE_TICK_MINUTES`] above:
+/// `mod.rs`'s `pub(crate) use` narrows only the flat
+/// `orchestration::DEFAULT_INTAKE_POLL_MINUTES` spelling `intake.rs` reaches
+/// it through (`super::DEFAULT_INTAKE_POLL_MINUTES`); the module-qualified
+/// path is publicly reachable, for the same forced-and-harmless reason.
+pub const DEFAULT_INTAKE_POLL_MINUTES: u32 = DEFAULT_IDLE_TICK_MINUTES;
 
 #[cfg(test)]
 mod tests {

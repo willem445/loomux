@@ -1327,7 +1327,7 @@ fn intake_gate_absent_config_still_smart_defaults_after_relaunch() {
     reg.set_autonomous(&gid, true).unwrap();
     assert_eq!(
         intake::effective_intake_poll_minutes(reg.group(&gid).unwrap().guardrails.intake_poll_minutes, true),
-        5, // DEFAULT_INTAKE_POLL_MINUTES — private to the lib, so pinned by value here
+        5, // DEFAULT_INTAKE_POLL_MINUTES's current value, pinned by literal here rather than imported
         "the smart default must still apply post-relaunch once autonomous mode is on"
     );
 }
