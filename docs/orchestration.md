@@ -38,6 +38,21 @@ in an audit log.
    selected CLI what it offers — `opencode models`, which lists the models *your*
    configured providers actually expose, for OpenCode; the CLI's own help for the
    others — so new models appear automatically, with a custom-entry escape hatch.
+
+   Beside the model dropdown there is a **detect** button. It asks the CLI
+   itself which models *this machine and this account* can actually run, and
+   what each one supports — the same list your CLI's own model picker would
+   show. What comes back adds rows to the dropdown (nothing is ever removed),
+   labels each with the CLI's own name for it, and fills in a line under the
+   control with the model's description, its reasoning-effort levels, and its
+   context-window size. The effort levels the CLI reports for the selected
+   model then become the ones the **thinking level** knob offers.
+
+   Detection runs **only when you click it** — never on its own. It starts the
+   agent CLI to ask the question, and while that request is a metadata call
+   rather than a prompt, loomux does not run it for you unprompted. The answer
+   is remembered for the rest of the session, so clicking again is free.
+
 3. Set the repository, how many idle workers to start with, and the guardrails:
    **max live agents** and **permissions**.
 
