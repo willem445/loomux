@@ -310,6 +310,13 @@ fn the_group_id_and_segment_validators_cannot_drift_apart() {
 /// `&str` at all — and this scan is defence in depth over a *new* site being
 /// added with a raw binding, which is the way the guarantee would realistically
 /// erode.
+///
+/// The allowlist's third field is what stops that honesty from being a slogan:
+/// each exemption names the signature it depends on, and the scan re-checks it
+/// is still there. Otherwise the list would be the weakest part of the guard —
+/// every row says "safe, because this is a `PathSegment`", a textual scan cannot
+/// see types, and `format!` accepts both, so a signature reverting to `&str`
+/// would leave the flagged line byte-identical and every check green.
 #[test]
 fn no_raw_identifier_is_interpolated_into_a_file_name() {
     /// Bindings that are raw `&str` identifiers somewhere in this codebase.
@@ -318,39 +325,70 @@ fn no_raw_identifier_is_interpolated_into_a_file_name() {
     /// File-extension literals that mark a `format!` as building a file name.
     const EXTENSIONS: &[&str] = &[".json", ".jsonl", ".log", ".toml", ".yaml", ".md", ".txt"];
 
-    /// Every sanctioned identifier-into-file-name site, with the argument for
-    /// why it is safe. Anything else is a finding until it is argued for and
-    /// added here — that is what makes this default-deny rather than a
-    /// blocklist. Normalized (whitespace collapsed) before comparison.
-    const SANCTIONED: &[(&str, &str)] = &[
+    /// Every sanctioned identifier-into-file-name site: the line text, the
+    /// argument for why it is safe, and — third field — **the text that has to
+    /// still be in the same file for that argument to hold**.
+    ///
+    /// The third field is not bookkeeping. Without it this allowlist would be
+    /// pure trust: every entry here says "safe, because the binding is a
+    /// `PathSegment` at that signature", and a textual scan cannot see types.
+    /// Change `find_claude_session_cwd`'s parameter back to `&str` and the
+    /// flagged *line* is character-for-character identical, so the scan would
+    /// keep passing while the property it names had gone — and `format!` accepts
+    /// both types, so the compiler would not object either. Requiring the
+    /// signature to still be present is what makes each row a checked claim
+    /// rather than a promise.
+    ///
+    /// Anything not listed is a finding until it is argued for and added — that
+    /// is what makes this default-deny rather than a blocklist. Normalized
+    /// (whitespace collapsed) before comparison.
+    const SANCTIONED: &[(&str, &str, &str)] = &[
         // Each of these five sits in a function whose `agent_id` parameter is
         // typed `&PathSegment` (#925), so the binding is already proof and the
         // interpolation cannot be handed a raw string.
         (
             ".join(format!(\"{agent_id}.promptsubmit.jsonl\"))",
             "promptsubmit_marker_path(root, &GroupId, &PathSegment)",
+            "agent_id: &PathSegment) -> PathBuf {",
         ),
         (
             "self.group_dir(group).join(format!(\"ledger-{agent_id}.log\"))",
             "OrchRegistry::ledger_path(&GroupId, &PathSegment)",
+            "fn ledger_path(&self, group: &GroupId, agent_id: &PathSegment)",
         ),
         (
             "let path = dir.join(format!(\"{agent_id}-gemini-policy.toml\"));",
             "write_gemini_policy(dir, &PathSegment, _)",
+            "fn write_gemini_policy(",
         ),
         (
             "let path = dir.join(format!(\"{agent_id}-hooks.json\"));",
             "write_hook_settings_file(&GroupId, &PathSegment, _)",
+            "fn write_hook_settings_file(",
+        ),
+        // Same argument, for the site this scan itself found (#925): the
+        // parameter is `session_id: &PathSegment` on `find_claude_session_cwd`,
+        // and `find_session_cwd` is the one place that parses. The binding kept
+        // the name `session_id` deliberately — renaming it to something outside
+        // `ID_BINDINGS` would silence this scan by evasion, which is the exact
+        // failure mode the sibling guard in `groupid.rs` was rewritten twice to
+        // avoid. Writing the argument down is the honest way past it.
+        (
+            "let candidate = project.path().join(format!(\"{session_id}.jsonl\"));",
+            "find_claude_session_cwd(root, &PathSegment) — parsed in find_session_cwd",
+            "fn find_claude_session_cwd(root: &Path, session_id: &PathSegment)",
         ),
         // These two interpolate a locally-parsed `PathSegment`, not the raw
         // parameter — the binding name itself is the evidence.
         (
             "let path = dir.join(format!(\"{agent_seg}.json\"));",
             "write_mcp_config parses `agent_id` into `agent_seg` at entry",
+            "let agent_seg = PathSegment::parse(agent_id)",
         ),
         (
             "self.group_dir(&snapshot.group).join(\"configs\").join(format!(\"{agent_seg}.json\")),",
             "the reap path parses into `agent_seg` before removing",
+            "if let Ok(agent_seg) = PathSegment::parse(agent_id) {",
         ),
     ];
 
@@ -380,6 +418,9 @@ fn no_raw_identifier_is_interpolated_into_a_file_name() {
 
     let mut offenders = Vec::new();
     let mut sanctioned_seen = vec![0usize; SANCTIONED.len()];
+    // A sanctioned row whose signature-proof is no longer in the file the site
+    // lives in: the argument for allowing that line has evaporated.
+    let mut unproven: Vec<String> = Vec::new();
 
     for (label, path) in &files {
         let src = std::fs::read_to_string(path).unwrap();
@@ -402,8 +443,23 @@ fn no_raw_identifier_is_interpolated_into_a_file_name() {
                 continue;
             }
             let norm = normalize(trimmed);
-            match SANCTIONED.iter().position(|(text, _)| norm.contains(text)) {
-                Some(j) => sanctioned_seen[j] += 1,
+            match SANCTIONED.iter().position(|(text, _, _)| norm.contains(text)) {
+                Some(j) => {
+                    sanctioned_seen[j] += 1;
+                    // The row's argument, re-checked against the file rather
+                    // than taken on trust. `format!` accepts a `&str` and a
+                    // `PathSegment` alike, so reverting the signature would
+                    // leave this line byte-identical and the compiler silent —
+                    // this assertion is the only thing that would notice.
+                    let (_, whose, proof) = SANCTIONED[j];
+                    if !src.contains(proof) {
+                        unproven.push(format!(
+                            "{name}:{}: allowlisted as `{whose}`, but its proof `{proof}` is no \
+                             longer in this file",
+                            i + 1
+                        ));
+                    }
+                }
                 None => offenders.push(format!("{name}:{}: {trimmed}", i + 1)),
             }
         }
@@ -419,11 +475,21 @@ fn no_raw_identifier_is_interpolated_into_a_file_name() {
         offenders.join("\n")
     );
 
+    assert!(
+        unproven.is_empty(),
+        "an allowlisted site is allowed ONLY because its binding is a validated `PathSegment` at \
+         that signature (#925), and that argument no longer holds. Found {} site(s):\n{}\n\nEither \
+         restore the signature or remove the row — a row whose proof is gone is an exemption \
+         granted for a reason that stopped being true.",
+        unproven.len(),
+        unproven.join("\n")
+    );
+
     // A sanctioned entry that matches nothing means the site was renamed or
     // deleted and this list is now stale — the same self-staleness guard the
     // sibling scan applies to its assembly points. A stale allowlist quietly
     // shrinks what the test covers.
-    for (j, (text, whose)) in SANCTIONED.iter().enumerate() {
+    for (j, (text, whose, _)) in SANCTIONED.iter().enumerate() {
         assert!(
             sanctioned_seen[j] > 0,
             "`SANCTIONED` entry `{text}` ({whose}) matched nothing — the site moved or was \
