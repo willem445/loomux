@@ -39,19 +39,20 @@ in an audit log.
    configured providers actually expose, for OpenCode; the CLI's own help for the
    others — so new models appear automatically, with a custom-entry escape hatch.
 
-   Beside the model dropdown there is a **detect** button. It asks the CLI
-   itself which models *this machine and this account* can actually run, and
-   what each one supports — the same list your CLI's own model picker would
-   show. What comes back adds rows to the dropdown (nothing is ever removed),
-   labels each with the CLI's own name for it, and fills in a line under the
-   control with the model's description, its reasoning-effort levels, and its
-   context-window size. The effort levels the CLI reports for the selected
-   model then become the ones the **thinking level** knob offers.
+   Loomux also asks each CLI directly which models *this machine and this
+   account* can actually run, and what each one supports — the same list your
+   CLI's own model picker would show. What comes back adds rows to the dropdown
+   (nothing is ever removed), labels each with the CLI's own name for it, and
+   fills in a line under the control with the model's description, its
+   reasoning-effort levels, and its context-window size. The effort levels the
+   CLI reports for the selected model then become the ones the **thinking
+   level** knob offers.
 
-   Detection runs **only when you click it** — never on its own. It starts the
-   agent CLI to ask the question, and while that request is a metadata call
-   rather than a prompt, loomux does not run it for you unprompted. The answer
-   is remembered for the rest of the session, so clicking again is free.
+   This happens **automatically, once, when loomux starts** — there is nothing
+   to click. Detection runs in the background, so a picker you open in the first
+   seconds may show its built-in suggestions for a moment and fill in the real
+   list as the answer arrives. A CLI you install *while loomux is running* is
+   not detected until you restart it.
 
 3. Set the repository, how many idle workers to start with, and the guardrails:
    **max live agents** and **permissions**.
