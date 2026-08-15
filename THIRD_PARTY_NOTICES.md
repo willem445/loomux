@@ -4,8 +4,8 @@ Loomux ships one third-party component inside its Windows installer (the ConPTY
 host, below). It also documents an **opt-in** component — the whisper.cpp voice
 runtime — which loomux does **not** distribute: users install it themselves if
 they want voice input. A third class is **shipped in-repo**: content vendored
-verbatim into this repository (the Lucide icon artwork and the frontend-design
-agent skill, below). Each component is used under its own license.
+verbatim into this repository (the Lucide and Primer Octicons icon artwork and the
+frontend-design agent skill, below). Each component is used under its own license.
 
 ## whisper.cpp voice runtime — MIT (opt-in; not shipped)
 
@@ -67,6 +67,24 @@ frontend bundle, so the notice belongs here rather than in the opt-in class.
 - **Two of the vendored glyphs are Feather-derived and additionally carry the
   MIT license** (Copyright (c) 2013-present Cole Bemis, text in the same
   `LICENSE` file): `arrow-up` and `trash-2`.
+
+## Primer Octicons — MIT (shipped in-repo)
+
+`src/agenticons.ts` carries the per-agent pane marks — the glyphs that say which agent CLI
+is running in a pane (#992) — as inline SVG string constants. Like the Lucide artwork above
+it is a vendored copy, not an npm dependency, and it ships inside the frontend bundle.
+
+- Upstream: https://github.com/primer/octicons, version **19.33.0**
+  @ [`cc4e12df6ff8292447ba9141eaa2a6f6e1c59a85`](https://github.com/primer/octicons/commit/cc4e12df6ff8292447ba9141eaa2a6f6e1c59a85)
+- Vendored files: one glyph — `copilot-16` — the inner markup of the upstream
+  `icons/copilot-16.svg` at that commit, copied verbatim. `test/agenticons.test.ts` fails if
+  this notice stops naming a glyph the table vendors.
+- License: **MIT** (Copyright (c) 2026 GitHub Inc.), full text in
+  `src/vendor/octicons/LICENSE`. Provenance, the re-vendoring procedure, and the
+  trademark position (nominative use of an unmodified mark; no affiliation implied) are in
+  the sibling `src/vendor/octicons/README.md`.
+- Agent CLIs whose vendors publish no such grant are drawn as generated letter badges
+  instead — loomux redistributes no brand mark it has not been licensed for.
 
 ## frontend-design agent skill — Apache-2.0 (shipped in-repo)
 

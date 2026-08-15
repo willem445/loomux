@@ -630,6 +630,20 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   cursor: default; letter-spacing: 0.2px;
 }
 
+/* ---------- agent-type mark (#992) ---------- */
+/* Which CLI is running in this pane, as a glyph at the head of the header row.
+   It takes the fleet role's violet from .ic-fleet (src/icons.ts: "the agents
+   themselves") — this surface adds no colour of its own, which is what keeps the
+   identity channel's role→hue mapping the only way an icon reaches a colour.
+   `display: flex` so the inline SVG sits on the row's optical centre rather than
+   on the text baseline; the letter-badge tier's <text> inherits the header's
+   font-family from here, so the fallback is drawn in the app's own type. */
+.pane-cli-icon {
+  flex: none; display: flex; align-items: center;
+  opacity: 0.85;
+}
+.pane.active .pane-cli-icon { opacity: 1; }
+
 /* ---------- orchestration group badges ---------- */
 /* Panes in an orchestration group carry a role chip (ORCH / W / REV) and a
    shared accent color so the orchestrator and its workers read as one set. */
