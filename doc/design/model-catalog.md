@@ -352,10 +352,32 @@ from a neighbour rather than by reading this note; a scan is what notices.
 
 The file's header enumerates what the instrument cannot do — reachability, not
 behaviour; source, not module graph — because a structural test that reads as
-broader coverage than it has is worse than none. Scanning only the *first*
-`onDetect` was in that category and is fixed: one handler per host today, so it
-was sound as written, which is exactly why it was worth correcting before a
-second picker made it silently wrong (#997 review NB-4).
+broader coverage than it has is worse than none.
+
+**Nothing in that file is a behaviour test, `runWhenNotEditing` included.** An
+earlier round claimed otherwise on three surfaces, and the claim was false: the
+`runWhenNotEditing` pins are source scans of a second file, one level down. A
+behaviour pin genuinely is not available — the method reads
+`document.activeElement` and attaches a listener, and this repo forbids
+simulating a DOM — so whether a deferral actually defers is hand-validated like
+the rest of the DOM wiring (#997 review B-1).
+
+Three limits found the same way, by somebody mutating the subject and watching
+the suite stay green — which is the only way a structural test's claims ever get
+checked:
+
+- **Scanning only the first `onDetect`.** One handler per host today, so it was
+  sound as written; fixed before a second picker made it silently wrong (NB-4).
+- **Matching inside comments.** These handlers are two-thirds comment by volume
+  and the prose names every refresher, so deleting the real calls and leaving a
+  comment kept the suite green — the round-1 blocking regression passing its own
+  pin. Comments are stripped before matching now (B-2), the discipline
+  `test/workspacelayout.test.ts` already uses.
+- **A positive match that stopped discriminating.** Once the handler reached the
+  live knob hook in *two* places, asserting its presence survived a mutation of
+  either. The pin now also asserts the form-local closure is absent — the
+  negative half is the half that discriminates. Re-deriving the red table after
+  an unrelated fix is what caught it.
 
 Two further rules follow from the reply being **slow**. An ask spawns a CLI, so
 it is in flight for seconds, and a human does things in seconds.

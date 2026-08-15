@@ -182,6 +182,17 @@ test("the workflow block editor refreshes the knobs and the findings after a det
       "the knob repaint must go through the LIVE `this.repaintBlockKnobs?.()`, never a captured closure: " +
         "`renderForm()` nulls it precisely so a late reply cannot paint into a row it has already detached"
     );
+    // The NEGATIVE half, and it is the half that discriminates. The handler now
+    // reaches the live hook twice (the detached-form early-out and the tail), so
+    // the positive match above survives a mutation of either one — which it did,
+    // silently, until re-deriving the red table caught it. Naming the captured
+    // closure directly is what makes reverting *either* call site redden.
+    assert.doesNotMatch(
+      body,
+      /repaintKnobs\(\)/,
+      "the handler must not call the form-local `repaintKnobs()` closure at all — it walks around the null-clearing " +
+        "that stops a late reply painting a detached row"
+    );
   }
 });
 
