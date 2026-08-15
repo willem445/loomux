@@ -186,8 +186,8 @@
         {
           "name": "role_hint",
           "type": "enum",
-          "values": ["advisor", "process"],
-          "help": "An INERT persona/template marker — never a capability. `advisor` requires kind: planner, `process` requires kind: worker."
+          "values": ["advisor", "process", "liaison"],
+          "help": "A persona/template marker. It cannot change the block's capability CLASS — that is `kind` — but it can change which MCP tools the block is offered, from a list loomux enumerates. `advisor` requires kind: planner, `process` requires kind: worker, `liaison` requires kind: reviewer."
         },
         {
           "name": "effort",

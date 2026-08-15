@@ -77,11 +77,14 @@
 //!     prompt: |            # -> generated ~/.claude/agents/*.md + claude --agent
 //!       Review ONLY for security defects: injection, authz, secrets.
 //!
-//!   - id: advisor            # role_hint: OPTIONAL, INERT (#250/#324) — picks
-//!     kind: planner           # only a persona addendum/template/badge; the
-//!     role_hint: advisor      # capability is `kind` alone, always. advisor
-//!                             # requires kind: planner, process requires
-//!                             # kind: worker — anything else is a parse error.
+//!   - id: advisor            # role_hint: OPTIONAL (#250/#324/#891) — picks a
+//!     kind: planner           # persona addendum/template/badge, plus a short
+//!     role_hint: advisor      # enumerated list of MCP-tool exceptions; the
+//!                             # CAPABILITY CLASS is `kind` alone, always.
+//!                             # advisor requires kind: planner, process
+//!                             # requires kind: worker, liaison requires
+//!                             # kind: reviewer — anything else is a parse
+//!                             # error.
 //!
 //! edges:                   # ADVISORY: the declared happy path. The
 //!   - { from: worker, to: [rev-security] }   # orchestrator still schedules.
@@ -158,14 +161,19 @@ pub struct Block {
     /// Sanitized; may never re-grant what the capability class denies (deny
     /// rules beat allow rules on both CLIs).
     pub allow: Vec<String>,
-    /// An optional, INERT persona/template marker (`advisor` | `process`,
-    /// #250/#324) — never a capability. `parse_workflow` requires it to
-    /// pair with a specific `kind` (`advisor` needs `planner`, `process`
-    /// needs `worker`; see [`role_hint_requires`]) so a workflow file cannot
-    /// spell a combination nothing downstream will honor. Everything that
-    /// keys capability — `kind.containment()`, `mcp::tool_defs`, the CLI
-    /// deny-flags — reads `kind` alone; `role_hint` selects only a persona
-    /// addendum, a template fragment and a roster badge (#250/#324 slice C).
+    /// An optional persona/template marker (`advisor` | `process` |
+    /// `liaison`, #250/#324/#891). `parse_workflow` requires it to pair with a
+    /// specific `kind` (`advisor` needs `planner`, `process` needs `worker`,
+    /// `liaison` needs `reviewer`; see [`role_hint_requires`]) so a workflow
+    /// file cannot spell a combination nothing downstream will honor.
+    ///
+    /// The STRUCTURAL containment never reads it: `kind.containment()` and the
+    /// CLI deny-flags take a `Role`, not a `Block`. `mcp::tool_defs` does read
+    /// it, for a short list of exceptions enumerated in
+    /// `doc/design/liaison.md` — today both narrow (`session_digest` to
+    /// `process`, `review_verdict` away from `liaison`), and a widening is
+    /// planned. A repo still cannot grant itself anything by writing one: it
+    /// picks from a closed set and loomux's code decides the effect.
     /// `None` is today's behavior, byte for byte.
     pub role_hint: Option<String>,
     /// Thinking-effort level (the `effort:` key, #687) — one of
@@ -1215,20 +1223,27 @@ pub fn kind_names() -> String {
 
 /// The capability class a `role_hint` REQUIRES — `None` for anything
 /// unrecognized, the same "reject, never coerce" shape as [`kind_from_str`].
-/// This is the whole enforcement of "role_hint is inert w.r.t. capability":
-/// it only ever narrows which *existing* kind a hint may sit on, never
-/// widens what that kind can do.
+/// This function is the whole enforcement of the part that IS invariant: a
+/// hint may only sit on an existing kind, so a workflow file can never spell a
+/// fifth capability class. What a hint then MEANS is decided elsewhere, in
+/// loomux's own code — see `doc/design/liaison.md` for the enumerated list of
+/// MCP-tier exceptions, which today all narrow but are not guaranteed to.
 pub fn role_hint_requires(hint: &str) -> Option<Role> {
     match hint.trim().to_ascii_lowercase().as_str() {
         "advisor" => Some(Role::Planner),
         "process" => Some(Role::Worker),
+        // The human-facing liaison (#891): a pane the human converses with,
+        // which reads the board and relays — so `reviewer`, the read-only
+        // class that persists (a planner auto-closes on `report`, a worker
+        // holds write authority the liaison is defined by NOT having).
+        "liaison" => Some(Role::Reviewer),
         _ => None,
     }
 }
 
 /// The role hints a workflow file may name, for error messages.
 pub fn role_hint_names() -> String {
-    "advisor, process".to_string()
+    "advisor, process, liaison".to_string()
 }
 
 /// Validate one block model knob — `effort:` or `context:` (#687).
@@ -1672,6 +1687,24 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
                         "gates.{name}: reviewer {:?} is a {} block, not a reviewer — a gate can only require reviewer verdicts",
                         b.id,
                         b.kind.as_str()
+                    ));
+                    bad = true;
+                }
+                // The same unsatisfiable gate, one kind further in (#891). A
+                // liaison IS reviewer-kind — it rides that class for its
+                // read-only, persistent posture — but it is denied
+                // `review_verdict` at every layer precisely because it reviews
+                // nothing. Naming one here would therefore wait forever for a
+                // verdict no code path can produce, which is exactly the
+                // failure the arm above refuses; caught at parse rather than
+                // discovered as a merge gate that never opens.
+                Some(b) if b.role_hint.as_deref() == Some("liaison") => {
+                    errs.push(format!(
+                        "gates.{name}: reviewer {:?} is a liaison — it is reviewer-kind, but a \
+                         liaison never records a verdict (it presents the human's questions and \
+                         relays their answers), so a gate naming it could never open. Name a \
+                         reviewer that reviews.",
+                        b.id
                     ));
                     bad = true;
                 }

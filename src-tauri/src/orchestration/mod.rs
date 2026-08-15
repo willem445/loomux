@@ -9563,11 +9563,16 @@ pub struct Caller {
     /// a fact you have to trace `resolve_token` to establish.
     pub group: GroupId,
     pub role: Role,
-    /// The spawning block's `role_hint` (#250/#324) — `advisor` | `process` |
-    /// `None`. Inert everywhere except `session_digest`'s dispatch gate (the
-    /// slice D binding rider tightening slice B's interim worker-wide gate
-    /// to `role_hint == process`); every other capability check keys off
-    /// `role` alone, per the closure argument `role_hint` was built on.
+    /// The spawning block's `role_hint` (#250/#324, #891) — `advisor` |
+    /// `process` | `liaison` | `None`. The structural containment keys off
+    /// `role` alone; the MCP tier has exactly two hint-keyed exceptions today,
+    /// both narrowing: `session_digest`'s dispatch gate NARROWS the worker tier
+    /// to `role_hint == process`, and `review_verdict`'s NARROWS the reviewer
+    /// tier by denying `role_hint == liaison` (a liaison rides the reviewer
+    /// class for its contained — `NoEdits`, not read-only — and persistent
+    /// posture, and reviews nothing). Both-narrowing is the current list, not a
+    /// rule: a widening is planned (`group_usage` for the liaison). The full
+    /// enumeration lives in `doc/design/liaison.md`.
     pub role_hint: Option<String>,
 }
 
@@ -36136,6 +36141,27 @@ impl OrchRegistry {
                 a.role.as_str()
             ));
         }
+        // The deepest of the three layers guarding the verdict against a liaison
+        // (#891) — the other two are `mcp::tool_defs`'s listing and `call_tool`'s
+        // dispatch arm. A liaison is reviewer-KIND for its posture (persistent,
+        // read-only, board-reading) and reviews nothing; the check lives here too,
+        // next to the write, for the same reason the class check does: what opens
+        // a merge gate must not depend on a single check in a JSON shim.
+        //
+        // Read from the group's own roster rather than from anything the caller
+        // carried in — the same lookup `resolve_token` makes — so this layer is
+        // not a second copy of the one the dispatch arm already consulted.
+        let caller_hint = self
+            .group(group)
+            .and_then(|g| g.guardrails.block(&a.block).and_then(|b| b.role_hint.clone()));
+        if caller_hint.as_deref() == Some("liaison") {
+            return Err(format!(
+                "permission denied: block {:?} is a liaison — it presents the human's \
+                 questions and relays their answers, and never records the verdict that \
+                 opens a merge gate. Use report(status, summary) instead.",
+                a.block
+            ));
+        }
         let num = pr_number(pr)
             .ok_or_else(|| format!("no PR number found in {pr:?} — pass the number, #n, or the PR URL"))?;
         let verdict = workflow::Verdict::parse(verdict).ok_or_else(|| {
@@ -45108,9 +45134,10 @@ pub fn orch_workflow_preview_sync(repo: String, agent_cli: String) -> Value {
             "kind": b.kind.as_str(),
             "cli": workflow::cli_of(b, &agent_cli),
             "model": workflow::model_of(b, &agent_cli),
-            // #250/#324: surfaced so the launcher preview can badge an
-            // advisor/process block — cosmetic only, never a capability (see
-            // `workflow::Block::role_hint`).
+            // #250/#324/#891: surfaced so the launcher preview can badge an
+            // advisor/process/liaison block. Cosmetic HERE — this row feeds a
+            // badge, not a gate — though the hint itself is not capability-inert
+            // in general (see `workflow::Block::role_hint`).
             "role_hint": b.role_hint,
             // #687: the block's RESOLVED knobs (these rows have been through
             // `clamped()` above), because the preview's job is to state the whole

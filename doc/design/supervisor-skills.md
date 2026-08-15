@@ -37,8 +37,11 @@ zero new capability. **Rejected.**
 ## The marker: `Block.role_hint`
 
 A new *optional* `role_hint: Option<String>` field on `Block`
-(`crates/loomux-engine/src/workflow.rs`), values `advisor` | `process`,
-**inert with respect to capability**. It is validated at parse time to
+(`crates/loomux-engine/src/workflow.rs`), values `advisor` | `process` (and,
+since #891, `liaison` — see `doc/design/liaison.md`). A repo can never author
+what a hint MEANS: it picks from a closed set and loomux's own code decides the
+effect, which is what keeps *a workflow file can never grant a capability* true
+regardless of what any individual hint does. It is validated at parse time to
 *require* its matching class — `advisor` needs `kind: planner`, `process`
 needs `kind: worker` — and an unrecognized value or a mismatched pairing is a
 loud, named parse error, never a silent fallback or a coerced kind (the same
@@ -54,16 +57,25 @@ blocks:
     role_hint: process     # requires kind: worker
 ```
 
-`role_hint` drives **only** persona/template/badge selection — which
+`role_hint` drives persona/template/badge selection — which
 `.github/agents/*.md` addendum a block's mechanics core gets, which template
 fragment renders in `templates/orchestrator.md`/`worker.md`, and which
-ADVISOR/PROCESS chip the launcher preview and roster show. Capability and
-trust continue to key **exclusively** off `kind`: `Role::is_read_only()`,
-`mcp::tool_defs(Role)`, and the CLI-level deny-flags never see `role_hint` at
-all — the functions that decide them take a `Role`, not a `Block`, and adding
-the field did not change a single one of their call sites. A workflow file
-still cannot grant a capability; `role_hint` can only *select a kind that
-already grants nothing new*.
+ADVISOR/PROCESS/LIAISON chip the launcher preview and roster show — plus a
+short, enumerated list of MCP-tier exceptions (next paragraph). The structural
+containment never reads it: `Role::is_read_only()` and the CLI-level deny-flags
+take a `Role`, not a `Block`, and never see `role_hint` at all.
+
+`mcp::tool_defs` is the one function that reads the hint. Both of today's rules
+NARROW what its `Role` already allows: `session_digest` is listed for
+`process`-hinted workers alone (slice D's binding rider, below), and
+`review_verdict` is withheld from a `liaison`-hinted reviewer (#891). Narrowing
+is not a guarantee of the mechanism, though — a hint-keyed *widening* is planned
+for the liaison (`group_usage`, otherwise orchestrator-only). The doctrine is
+therefore *inert by default, with **every** exception enumerated — narrowing and
+widening alike*; that table lives in `doc/design/liaison.md`. What stays true
+either way is the claim about the **file**: a repo selects a hint from a closed
+set and loomux's code decides what it means, so a workflow file still cannot
+grant a capability.
 
 **Persistence.** `role_hint` round-trips through both wire formats: parsed
 `.loomux/workflow.yml` (`parse_workflow`) and the persisted `group.json`

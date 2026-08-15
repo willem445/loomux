@@ -582,7 +582,7 @@ fn an_authored_with_stamp_is_tolerated_and_preserved() {
     assert!(g.guardrails.block("rev-sec").is_some(), "the roster must load, not fall back");
 }
 
-// ───────────── role_hint: an inert marker, not a fifth capability (#250/#324) ─
+// ──── role_hint: a marker that is never a fifth capability CLASS (#250/#324) ──
 
 #[test]
 fn role_hint_requires_its_matching_capability_class() {
@@ -620,6 +620,39 @@ fn role_hint_requires_its_matching_capability_class() {
         errs.iter().any(|e| e.contains("role_hint") && e.contains("process") && e.contains("worker")),
         "process on a planner block must name the required kind: {errs:?}"
     );
+
+    // liaison -> reviewer (#891). The human-facing pane rides the reviewer
+    // class for its posture: read-only, persistent, board-reading.
+    let wf = workflow::parse_workflow(
+        "version: 1\nblocks:\n  - id: human\n    kind: reviewer\n    role_hint: liaison\n",
+    )
+    .expect("liaison on a reviewer-kind block must parse");
+    assert_eq!(wf.block("human").unwrap().role_hint.as_deref(), Some("liaison"));
+
+    // ...and on every OTHER kind it is the same named refusal, not a silent
+    // drop. Checked on all three rather than one, because "requires reviewer"
+    // is a claim about the whole set of kinds it is NOT allowed on.
+    for wrong in ["worker", "planner", "orchestrator"] {
+        let errs = workflow::parse_workflow(&format!(
+            "version: 1\nblocks:\n  - id: bad\n    kind: {wrong}\n    role_hint: liaison\n"
+        ))
+        .unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains("role_hint")
+                && e.contains("liaison")
+                && e.contains("reviewer")),
+            "liaison on a {wrong} block must name the required kind: {errs:?}"
+        );
+    }
+
+    // Case and surrounding space are normalized exactly like the other hints —
+    // the TypeScript mirror (`roleHintRequires`) pins the same rule, and the
+    // two must not disagree about what the real parser accepts.
+    let wf = workflow::parse_workflow(
+        "version: 1\nblocks:\n  - id: human\n    kind: reviewer\n    role_hint: \" Liaison \"\n",
+    )
+    .expect("a capitalized, padded liaison hint must parse like advisor/process do");
+    assert_eq!(wf.block("human").unwrap().role_hint.as_deref(), Some("liaison"));
 
     // An unrecognized value is rejected exactly like an unrecognized `kind` —
     // never coerced to the nearest valid one.
@@ -695,6 +728,86 @@ fn role_hint_grants_no_capability_to_its_block() {
         "the only difference between an advisor(planner) and a plain planner's command line \
          must be the block id itself:\n  plain:   {cmd_plain}\n  advisor: {cmd_advisor}"
     );
+}
+
+#[test]
+fn the_liaison_hint_grants_its_reviewer_block_nothing_extra() {
+    // #891's half of `role_hint_grants_no_capability_to_its_block`. The liaison
+    // is the first hint whose whole point is a capability RULE, so "the hint
+    // still grants nothing" needs proving here, not assuming: what the rule does
+    // is take `review_verdict` AWAY (pinned in tests/orchestration.rs), and
+    // everything structural must be identical to a plain reviewer's.
+    //
+    // Note the block ids are deliberately NOT the hint string: normalizing
+    // "liaison" out of the command line would hide the very leak this test
+    // exists to detect.
+    let (reg, _d) = test_registry();
+    let repo = Repo::new().workflow(
+        "version: 1\nblocks:\n\
+         \x20 - id: plain\n    kind: reviewer\n    prompt: Same prompt, no hint.\n\
+         \x20 - id: hinted\n    kind: reviewer\n    role_hint: liaison\n    prompt: Same prompt, no hint.\n",
+    );
+    let g = reg.create_group(&repo.path(), rails()).unwrap();
+    let plain = g.guardrails.block("plain").unwrap();
+    let hinted = g.guardrails.block("hinted").unwrap();
+    assert_eq!(hinted.role_hint.as_deref(), Some("liaison"));
+    assert_eq!(plain.role_hint, None);
+    assert_eq!(plain.kind, hinted.kind);
+
+    // The resolved persona's SECURITY-relevant fields are identical: the hint
+    // cannot widen the allow list or change the injection mode.
+    let plain_persona = reg.resolve_persona(&g, plain).unwrap().expect("plain persona resolves");
+    let hinted_persona = reg.resolve_persona(&g, hinted).unwrap().expect("hinted persona resolves");
+    assert_eq!(plain_persona.text, hinted_persona.text);
+    assert_eq!(plain_persona.allow, hinted_persona.allow);
+    assert_eq!(plain_persona.mode, hinted_persona.mode);
+    assert_eq!(plain_persona.copilot_native, hinted_persona.copilot_native);
+
+    // ...and the compiled command lines carry the identical deny-tool surface.
+    let (cmd_plain, _argv_plain, _k) = compile(&reg, &g, "plain");
+    let (cmd_hinted, _argv_hinted, _k2) = compile(&reg, &g, "hinted");
+    assert!(
+        cmd_plain.contains("--disallowedTools"),
+        "a reviewer IS denied write tools — the comparison must not be vacuously equal: {cmd_plain}"
+    );
+    let norm = |s: &str| s.replace("hinted", "BLOCK-ID").replace("plain", "BLOCK-ID");
+    assert_eq!(
+        norm(&cmd_plain),
+        norm(&cmd_hinted),
+        "the only difference between a liaison-hinted reviewer and a plain one's command line \
+         must be the block id itself:\n  plain:  {cmd_plain}\n  hinted: {cmd_hinted}"
+    );
+}
+
+#[test]
+fn a_gate_may_not_name_a_liaison_as_one_of_its_reviewers() {
+    // A liaison is reviewer-KIND, so it slips past the "not a reviewer" check —
+    // but it can never record a verdict (#891), so a gate naming one would wait
+    // forever on something no code path produces. That is the same permanently
+    // unsatisfiable gate the worker case refuses, and it is refused at PARSE
+    // rather than discovered later as a merge gate that never opens.
+    let errs = workflow::parse_workflow(
+        "version: 1\nblocks:\n\
+         \x20 - id: worker\n    kind: worker\n\
+         \x20 - id: human\n    kind: reviewer\n    role_hint: liaison\n\
+         gates:\n  merge:\n    reviewers: [human]\n",
+    )
+    .unwrap_err();
+    assert!(
+        errs.iter().any(|e| e.contains("liaison") && e.contains("could never open")),
+        "a gate naming a liaison must be refused, and say why: {errs:?}"
+    );
+
+    // The control: the SAME file with the hint removed parses clean. Without
+    // this, the assertion above could be passing on any unrelated error in the
+    // document rather than on the liaison rule.
+    workflow::parse_workflow(
+        "version: 1\nblocks:\n\
+         \x20 - id: worker\n    kind: worker\n\
+         \x20 - id: human\n    kind: reviewer\n\
+         gates:\n  merge:\n    reviewers: [human]\n",
+    )
+    .expect("the same roster without the hint is a perfectly ordinary gated workflow");
 }
 
 // ───────── role_hint drives persona/template selection (slice C, #250/#324) ──
