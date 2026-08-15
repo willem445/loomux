@@ -31,7 +31,8 @@ branch instead. If you must stash: `git stash push -m "<your agent id>: ..."` an
 A comment, design note, audit label or PR body claiming something the code doesn't do is
 a defect (#461, #490) — delete it, don't soften it. Quote raw fetched text for CLI/API
 facts (#453). Prose written against a plan stays dated to it: before marking ready,
-re-read every doc and `SKILL.md` claim against what the sibling slice SHIPPED (#715).
+re-read every doc and `SKILL.md` claim against what the sibling slice actually SHIPPED,
+not the plan both were written from (#715, #721).
 
 ## Commit real work BEFORE capturing red evidence [pinned]
 
