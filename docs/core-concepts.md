@@ -292,6 +292,13 @@ be rearranged in place:
   dock at once, leaving just the orchestrator. Click again to restore them all.
   Handy once a big group has opened a pane per agent and you want the screen
   back. (More in the [orchestration guide](orchestration.html).)
+- **Which agent CLI is this?** A pane launched with an agent wears a small violet
+  mark at the far left of its header, before the role badge — so you can tell a
+  Copilot pane from a Claude one across a wall of terminals without reading the
+  titles. Agents with a recognisable mark show it; everything else shows a
+  lettered badge with the program's initial (`C` for Claude, `O` for opencode),
+  and `?` if loomux couldn't make out what was launched. Hover it for the program
+  name. A plain shell pane has no agent, so it carries no mark at all.
 
 > **The icons are colour-coded, and the colour means something.** A mark's hue
 > says *which kind of thing* it is, not what state it's in: cyan for your
