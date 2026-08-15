@@ -216,6 +216,15 @@ impl PathSegment {
     pub fn into_string(self) -> String {
         self.0
     }
+
+    /// SCRATCH ONLY (#925 red evidence, do not merge). Exists so the wiring
+    /// neuter on this throwaway branch keeps the signatures — and therefore the
+    /// whole suite — compiling, since a compile error would prove nothing about
+    /// behaviour. Never present on the real branch.
+    #[doc(hidden)]
+    pub fn scratch_unchecked(s: &str) -> Self {
+        PathSegment(s.to_string())
+    }
 }
 
 impl fmt::Display for PathSegment {

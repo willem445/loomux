@@ -24241,10 +24241,17 @@ impl OrchRegistry {
         cli: &str,
         session_id: &str,
     ) -> Result<Vec<digest::TranscriptEvent>, String> {
-        // Error text unchanged (`invalid session id: …`) — callers and the MCP
-        // surface match on it.
-        let session = PathSegment::parse(session_id)
-            .map_err(|e| format!("invalid session id: {session_id:?} ({e})"))?;
+        // SCRATCH NEUTER (#925 red evidence, do not merge): the pre-fix gate,
+        // `digest::is_safe_session_id` restored inline. The id then travels on
+        // to the path builders exactly as it used to.
+        if !(!session_id.is_empty()
+            && !session_id.contains(['/', '\\'])
+            && session_id != "."
+            && session_id != "..")
+        {
+            return Err(format!("invalid session id: {session_id:?}"));
+        }
+        let session = PathSegment::scratch_unchecked(session_id);
         match cli {
             "claude" => {
                 let root = self
