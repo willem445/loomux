@@ -38806,7 +38806,9 @@ impl OrchRegistry {
                 // declares exactly one and it is the liaison — the class
                 // resolution skipped it. The wording is shared with the
                 // bare-resume path in `mcp.rs`; see `no_default_block_message`.
-                .ok_or_else(|| group.guardrails.no_default_block_message(role))?,
+                .ok_or_else(|| {
+                    format!("this group's workflow declares no {} block", role.as_str())
+                })?,
         };
         // A workflow file must not be able to hand an agent a second
         // orchestrator: an orchestrator-kind spawn is exempt from the live-agent
