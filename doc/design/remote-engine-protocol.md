@@ -279,8 +279,9 @@ describe the authenticated design:
 
 ### 4.2 Frame kinds
 
-**RPC frames** mirror today's `invoke` shape, so the 128 wire-reachable commands
-port mechanically behind the existing `EngineTransport` seam:
+**RPC frames** mirror today's `invoke` shape, so the wire-reachable commands
+(§5.4 counts them, and is the only place that should) port mechanically behind
+the existing `EngineTransport` seam:
 
 ```jsonc
 // client → server
@@ -507,12 +508,12 @@ are where the 64-vs-66 drift above lives).
 | **sessions** (3) | 3 | wire | viewer / operator | agent-CLI store scans are server-side; `record_*_launch_posture` is operator |
 | **git** (22) | 6 | wire | viewer | the reads: `git_repo_root`, `git_log`, `git_status`, `git_diff`, `git_branches`, `git_worktree_list` |
 | | 16 | wire | operator | every write: stage/unstage/commit/commit_files/checkout/discard/worktree_add/fetch/push/pull/tag/branch_create/cherry_pick/revert/merge/rebase. `repo` is root-scoped (#925). Note H9: these push as whoever the daemon is |
-| **gh** (10) | 6 | wire | viewer | `gh_auth_status`, `gh_issue_list`, `gh_issue_view`, `gh_pr_list`, `gh_pr_view`, `gh_activity` |
+| **gh** (11) | 7 | wire | viewer | `gh_auth_status`, `gh_label_vocabulary`, `gh_issue_list`, `gh_issue_view`, `gh_pr_list`, `gh_pr_view`, `gh_activity`. `gh_label_vocabulary` reads the repo's label set (it is what stops the issues view hardcoding a vocabulary), so it is a read of the **server's** repo like the rest of this row |
 | | 4 | wire | operator | `gh_issue_create`, `gh_issue_set_labels`, `gh_issue_comment`, `gh_pr_comment` — these write to GitHub as the daemon's credential (H9) |
 | **gitwatch** (2) | 2 | wire | viewer | |
-| **orchestration** (66) | 18 | wire | viewer | reads: `orch_tasks`, `orch_audit`, `orch_merge_queue`, `orch_autonomy`, `orch_group_usage`, `orch_group_summary`, `orch_workflow_status`, `orch_workflow_preview`, `orch_group_watches`, `orch_lock_state`, `orch_group_paused`, `orch_notify_enabled`, `orch_spawn_expanded`, `orch_session_roles`, `orch_channel_list`, `orch_channel_for_pane`, `agent_autopilot_flags`, `agent_cli_knobs` — **all filtered by caller visibility** (§6.4) |
+| **orchestration** (69) | 19 | wire | viewer | reads: `orch_tasks`, `orch_audit`, `orch_merge_queue`, `orch_autonomy`, `orch_group_usage`, `orch_group_summary`, `orch_workflow_status`, `orch_workflow_preview`, `orch_group_watches`, `orch_lock_state`, `orch_group_paused`, `orch_notify_enabled`, `orch_spawn_expanded`, `orch_session_roles`, `orch_channel_list`, `orch_channel_for_pane`, `orch_questions_list`, `agent_autopilot_flags`, `agent_cli_knobs` — **all filtered by caller visibility** (§6.4) |
 | | 38 | wire | operator | group lifecycle, binding, steering, task CRUD, `orch_request_changes`, attention acks, spawn/solo flow, channel connect/disconnect/set-sender, and the `orch_set_*` knobs that are **not** autonomy raises |
-| | 9 | wire | **owner** | `orch_approve_task`, `orch_approve_tasks`, `orch_grant_merge`, `orch_grant_release`, `orch_set_autonomous`, `orch_set_auto_merge`, `orch_set_auto_release`, `orch_set_dangerous_mode`, `orch_set_autonomy_budget` |
+| | 11 | wire | **owner** | `orch_approve_task`, `orch_approve_tasks`, `orch_grant_merge`, `orch_grant_release`, `orch_set_autonomous`, `orch_set_auto_merge`, `orch_set_auto_release`, `orch_set_full_autonomy`, `orch_set_dangerous_mode`, `orch_set_autonomy_budget`, `orch_question_answer` |
 | | 1 | **retargeted** | viewer | `orch_open_ref` — the server resolves the ref to a URL (its `open_external_url` helper is the local half today) and returns it; the **client** opens it in the human's browser |
 | **cliprobe** (1) | 1 | wire | viewer | `probe_agent_cli` probes the **server's** CLIs |
 | **modelwire** (1) | 1 | wire | **operator** | `list_cli_models` (#993) asks the **server's** CLI for its model list. Operator, not viewer, even though the answer is a read: it starts an agent CLI on the server, and the claim that a `list_models` control request costs nothing is the vendor's-docs-are-silent kind (see doc/design/model-catalog.md). A viewer able to spend the operator's credits by clicking `detect` is the wrong default until that is verified |
@@ -528,15 +529,42 @@ are where the 64-vs-66 drift above lives).
 | | 2 | wire | operator | `load/save_ssh_profiles` — **named consequence:** in remote mode an SSH pane is opened *by the engine*, so the hosts it can reach and the identity files it names are the server's, not the client's. The profile store follows the panes. The no-secrets invariant of `sshprofile.ts` is what makes this survivable |
 | **voice** (3) | 3 | **client-local** | — | mic capture and whisper are client hardware; the transcript rides `write_pty` like any other keystrokes |
 
-Totals, and they add up to the manifest exactly: **129 wire**, **8 client-local**
-(`take_startup_notice`, the four `uistate` UI-state commands, the three
-`voice_*`), **4 disabled** (`open_in_editor`, `fm_open`, `fm_open_with`,
-`fm_reveal`), **1 retargeted** (`orch_open_ref`) = 142.
+Totals: **133 wire**, **8 client-local** (`take_startup_notice`, the four
+`uistate` UI-state commands, the three `voice_*`), **4 disabled**
+(`open_in_editor`, `fm_open`, `fm_open_with`, `fm_reveal`), **1 retargeted**
+(`orch_open_ref`) = **146**, which is `APP_COMMANDS.len()` at the time of
+writing. Every command has exactly one disposition, and the four buckets
+partition the manifest — that is the property this table exists to assert.
 
 The authoritative per-command list is the generated roster the C2 test pins —
 this table is the *argument* for it, not a second copy to drift. Which is the
 whole point of §5.1: a table in a design note is exactly the artifact that goes
 stale, so the note argues and the test enforces.
+
+**And until C2 ships, nothing enforces it, which is why this table has now gone
+stale three times** (#1018 rounds 1–2). "The note argues and the test enforces"
+describes the end state, not today: the roster test is part of C2, so between now
+and then these numbers are exactly the unpinned kind §5's own opening paragraphs
+warn about. A command added to `APP_COMMANDS` in the meantime does not fail
+anything here — it silently leaves a name with no disposition, which is how
+`gh_label_vocabulary`, `orch_set_full_autonomy`, `orch_questions_list` and
+`orch_question_answer` all reached this file unplaced. **Re-derive these counts
+from `APP_COMMANDS` when you touch them; never bump them relatively.** A relative
+bump is what carried the error through two separate reviews.
+
+**`orch_question_answer` is owner-tier for a different reason than the rest of
+that row, and the difference matters.** The other ten are grant-writes — the
+enforcement behind constraints 7 and 9. This one is not; it qualifies on the
+*other* half of the owner definition, "human connection sessions only". The
+command hard-codes `AnswerSource::Webview` rather than taking a `source`
+parameter, precisely so that who answered is a fact loomux establishes rather
+than one a caller asserts about itself (see its doc comment). Cross the wire at
+any lower tier and that guarantee inverts: a remote peer's answer gets stamped as
+a human's, and the registry can no longer distinguish the human it was waiting on
+from anything else holding a socket. Owner is therefore the fail-closed reading,
+not a comfortable one — if the tiers are ever restructured so that "grant-write"
+and "human-session-only" stop travelling together, this command follows the
+second, not the first.
 
 Two families deserve a sentence they do not get from the table:
 

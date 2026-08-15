@@ -778,8 +778,10 @@ fn names(sites: &[Site]) -> BTreeSet<String> {
 fn the_body_extractor_survives_nested_braces_strings_and_comments() {
     // The specimen for why this file does not reuse gh.rs's "first line that is
     // exactly `}`" heuristic: that works for ten one-expression wrappers and
-    // ends the body two lines into the first `if` block anywhere else. 63 of
-    // the 135 commands have nested blocks.
+    // ends the body two lines into the first `if` block anywhere else. Close to
+    // half the commands have nested blocks — a ratio deliberately not written as
+    // a literal here, since nothing pins it and the point is only that the naive
+    // heuristic fails on a large fraction, not on a stated count (#1018).
     let src = format!(
         r##"
 {ATTR}

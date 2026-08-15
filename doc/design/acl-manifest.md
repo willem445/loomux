@@ -36,8 +36,8 @@ tauri_build::try_build(
 This one flip makes `has_app_acl_manifest` true. **From that instant, every
 command in `APP_COMMANDS` that isn't explicitly granted in `capabilities/` is
 denied for every window — main included.** There is no partial state: the
-flip, the full 120-command grant to `main`, and the coherence test that keeps
-it that way all had to land in one PR (this one).
+flip, the full grant to `main` — 120 commands, the count at the time — and the
+coherence test that keeps it that way all had to land in one PR (this one).
 
 ### The command list — single source of truth
 
