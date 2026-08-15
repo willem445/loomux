@@ -239,10 +239,10 @@
 //! belongs to the `env!` fix below, not to the move. Read the general form as
 //! **a module's author may have already drawn the boundary** — worth looking
 //! for a section marker before reaching for a trait, because the alternative
-//! here was a bad one: `LockExt` is an
-//! inline extension trait on `std::sync::Mutex` (`m.lock_safe()`), unreachable
-//! through a trait object as called, so abstracting it would have meant a
-//! second implementation of the one policy that must not have two.
+//! here was a bad one: `LockExt` is an inline extension trait on
+//! `std::sync::Mutex` (`m.lock_safe()`), unreachable through a trait object as
+//! called, so abstracting it would have meant a second implementation of the
+//! one policy that must not have two.
 //!
 //! Its finding is a kind of edge the previous six batches never met, because
 //! grep cannot see it. Every batch so far enumerated a module's outbound edges
@@ -299,8 +299,8 @@
 //! `subproc` has exactly one outward edge, [`obs::LockExt`] (`lock_safe` on the
 //! abandoned-reader backlog), which batch 7 brought across for precisely this;
 //! `fsatomic` has none. Both leave every caller in `src-tauri` —
-//! `OrchRegistry::capture_with_timeout`, `mqdriver`'s `ProcessRunner`, and the
-//! ~20 `atomic_write` call sites — resolving through curated item-list
+//! `OrchRegistry::capture_with_timeout`, `mqdriver`'s `ProcessRunner`, and
+//! every `atomic_write` call site — resolving through curated item-list
 //! re-exports in `orchestration/mod.rs`, which is why the integration suite
 //! needed no edit.
 

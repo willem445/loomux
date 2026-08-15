@@ -775,11 +775,13 @@ from a unit test of product code, agents are banned from running cargo locally
     A **pure relocation**, exemption taken whole: no behaviour is added or
     changed, and every behaviour the move could break is pinned by tests that
     neither moved nor were edited. `src-tauri/tests/orchestration.rs` drives the
-    capture cluster through the flat re-export from ~20 call sites — the ceiling
-    (`gh_capture_admitted` against `GH_CAPTURE_MAX_LEAKED_READERS`), the bounded
-    wait's both verdicts, the non-zero-exit-as-data contract, the forced
+    capture cluster through the flat re-export across every arm of it — the
+    ceiling (`gh_capture_admitted` against `GH_CAPTURE_MAX_LEAKED_READERS`), the
+    bounded wait's both verdicts, the non-zero-exit-as-data contract, the forced
     wait-failure arm and the parked-reader accounting — and `atomic_write` is
-    exercised by every state-file round-trip in the same suite.
+    exercised by every state-file round-trip in the same suite. (No call-site
+    count is given: it rots the moment either file gains or loses a use, and the
+    arms are what the coverage claim is about — #973.)
     **`src-tauri/tests/` is untouched**, which is the proof the re-export surface is complete
     rather than a claim about it. The `#[doc(hidden)]` seams travel with their
     cluster; no test moved crate, since the cluster's coverage was never inline.
