@@ -56,12 +56,24 @@ export const modelCatalog = new ModelCatalog(probeAgentCli, (program) =>
  *  running by the time the webview exists and an event that arrives before this
  *  listener does is one a picker has to pull for instead.
  *
- *  Never rejects onward: a subscription loomux could not register costs the
- *  push route, and the pull route still answers. */
+ *  **Never rejects onward, and what survives if it fails is less than it
+ *  looks** (rev-713 non-blocking 4). The obvious claim — "the pull route still
+ *  answers" — is only true for a CLI no picker has pulled for yet.
+ *  `ModelCatalog.detect` keeps its answer forever *including a barren one*
+ *  (that is the bound that replaced the click), and the only thing that can
+ *  replace it is `acceptReport`, i.e. this route. So a picker that opened
+ *  before the sweep finished, was told "nothing yet", and then lost this
+ *  subscription is stuck with its seed for the rest of the app run, with no
+ *  re-ask affordance by design.
+ *
+ *  Still not worth failing boot over — `listen` failing means the webview's
+ *  event bridge is broken and detection is the least of it — but the honest
+ *  degradation is "detection may be dead until restart", not "the other route
+ *  covers it". */
 export function startModelDetection(): void {
   void onModelsDetected(({ program, reply }) => {
     modelCatalog.acceptReport(program, readCliModelReply(reply));
   }).catch(() => {
-    /* the pull route (`ModelCatalog.detect`) remains */
+    /* detection degrades to the curated seeds until the next restart */
   });
 }

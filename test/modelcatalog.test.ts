@@ -401,15 +401,33 @@ test("models() paints from curated before the probe lands, merged after", async 
   ]);
 });
 
-// ---- the list-models control probe (#993) ----------------------------------
+// ---- the list-models reply (#993, made automatic by #1020) -----------------
 //
 // A second seam beside the probe, and the tests below defend the reason it is
-// separate rather than folded in. `probe` reads what a CLI prints unprompted and
-// every form fires it on open; `detect` SPAWNS the CLI to ask it a question, on
-// a claim (that the question is free) that the vendor does not document. So the
-// properties worth pinning are about restraint — nothing runs unasked, a second
-// gesture does not become a second spawn — and about the answer never being
-// allowed to narrow what the human can already pick.
+// separate rather than folded in.
+//
+// **The credit-safety property, stated the way it actually holds now.** Under
+// #993 `detect` SPAWNED the CLI, so the restraint was that nothing ran unasked
+// and a second gesture did not become a second spawn. #1002 reversed that by
+// the human's own direction and #1020 implemented it, so both halves of the old
+// sentence are now false and the truth is:
+//
+//   - `detect` cannot spawn ANYTHING. It is a lookup against a memo the backend
+//     filled (`src-tauri/src/modelwire.rs`), and a paint may call it precisely
+//     because there is no longer any code behind it that could start a process.
+//   - Something DOES run unasked, deliberately: the backend's startup sweep,
+//     which is now the only thing in loomux that runs `list_cli_models`, once
+//     per CLI per app run, and the only place a control request is spawned.
+//
+// So the properties worth pinning here are no longer about refusing to spend.
+// They are about the BOUND that replaced the click — one lookup per CLI per app
+// run, because the callers are paints now and nothing else limits them — about
+// the push route that corrects a form which looked too early, and about the
+// answer never being allowed to narrow what the human can already pick.
+//
+// If you are auditing constraint-3 compliance, the spawn you are looking for is
+// in `modelwire.rs`'s `start_startup_sweep`, not here. `doc/design/model-catalog.md`
+// §Credit safety carries the decision and what remains unverified about it.
 
 const detail = (over: Partial<ModelDetail> & { id: string }): ModelDetail => ({
   resolvedId: "",
@@ -557,10 +575,7 @@ test("the two routes racing does not repaint a form twice", async () => {
     async () => probe([]),
     async () => ({ models: [detail({ id: "opus" })], error: null })
   );
-  catalog.onReport(() => {
-    fired += 1;
-    return true;
-  });
+  catalog.onReport(() => (fired += 1), () => true);
   // The lookup wins the race…
   await catalog.detect("claude");
   assert.deepEqual(catalog.report("claude")?.models.map((m) => m.id), ["opus"]);
@@ -570,47 +585,92 @@ test("the two routes racing does not repaint a form twice", async () => {
   assert.equal(fired, 0, "so nothing is asked to repaint what it already painted");
 });
 
-test("a listener that reports itself gone is dropped rather than kept forever", async () => {
-  // The lifecycle contract of `onReport`, and why the callback returns a
-  // boolean. Neither host has a teardown this module can rely on — a launcher
-  // form is discarded with its pane — so a subscription that outlived its DOM
-  // would repaint detached controls for the rest of the app run.
+test("a listener whose host is gone is neither called nor retained", async () => {
+  // The lifecycle contract of `onReport`. Neither host has a teardown this
+  // module can rely on — a launcher form is discarded with its pane and has no
+  // safe release point at all — so a subscription that outlived its DOM would
+  // repaint detached controls for the rest of the app run.
   const catalog = new ModelCatalog(async () => probe([]));
   const alive: string[] = [];
   const dead: string[] = [];
-  catalog.onReport((p) => {
-    alive.push(p);
-    return true;
-  });
-  catalog.onReport((p) => {
-    dead.push(p);
-    return false;
-  });
-  const unsubscribe = catalog.onReport(() => {
-    assert.fail("an explicitly unsubscribed listener must never fire");
-  });
+  let deadHostIsAlive = true;
+  catalog.onReport((p) => alive.push(p), () => true);
+  catalog.onReport((p) => dead.push(p), () => deadHostIsAlive);
+  const unsubscribe = catalog.onReport(
+    () => assert.fail("an explicitly unsubscribed listener must never fire"),
+    () => true
+  );
   unsubscribe();
+  deadHostIsAlive = false;
 
   catalog.acceptReport("claude", { models: [detail({ id: "opus" })], error: null });
   catalog.acceptReport("copilot", { models: [detail({ id: "gpt-5.2" })], error: null });
   assert.deepEqual(alive, ["claude", "copilot"], "a live listener hears every report");
-  assert.deepEqual(dead, ["claude"], "one that said it was gone hears exactly one and is then dropped");
+  assert.deepEqual(dead, [], "a dead one is not called even once — liveness is asked before delivery, not by it");
+  assert.equal(catalog.liveReportListeners, 1, "and it is not still being held");
 });
 
-test("a listener never fires for a report that changed nothing", async () => {
-  // Otherwise every host would have to re-derive "have I already seen this?"
-  // before repainting — and repainting on an empty report is how a form rebuilds
-  // itself under a human's caret for no reason at all.
+test("a host that registers after the sweep is released when the next one registers", async () => {
+  // **rev-713 blocking 2, and the leak this seam shipped with.** The first cut
+  // pruned only when a report CHANGED state, which the producer does at most
+  // once per program per app run — and zero times in the ordering where the pull
+  // wins the race, because `acceptReport` then refuses before reaching the
+  // listeners at all. So in the ordinary case nothing was ever pruned, and every
+  // WorkflowView and WelcomeForm built after the sweep was retained by the
+  // app-scoped catalog for the life of the process, holding its analysis and its
+  // detached DOM with it.
+  //
+  // The fix hangs pruning on REGISTRATION, which is the one event that keeps
+  // recurring: every new host subscribes, so the list cannot grow past the live
+  // hosts plus the one being added.
+  const catalog = new ModelCatalog(async () => probe([]));
+  // The sweep lands and is fully delivered — after this, nothing will ever
+  // change state again for `claude`.
+  catalog.onReport(() => {}, () => true);
+  catalog.acceptReport("claude", { models: [detail({ id: "opus" })], error: null });
+
+  // Now open and close ten panes, exactly as the review's repro describes. The
+  // assertion is on the PEAK, not the final count, because that is the property:
+  // retention is bounded by how many hosts are ALIVE, never by how many have
+  // ever been built. Under the shipped bug this climbs to 11 and stays there.
+  let peak = catalog.liveReportListeners;
+  for (let i = 0; i < 10; i += 1) {
+    let open = true;
+    catalog.onReport(() => {}, () => open);
+    open = false;
+    peak = Math.max(peak, catalog.liveReportListeners);
+  }
+  assert.ok(
+    peak <= 2,
+    `retention grew to ${peak} while never more than two hosts were alive at once — every closed pane is still ` +
+      `held by the app-scoped catalog, with its analysis and its detached DOM`
+  );
+
+  // One more opens: registering releases the last corpse too, so the steady
+  // state really is "the live ones", not "the live ones plus one".
+  catalog.onReport(() => {}, () => true);
+  assert.equal(catalog.liveReportListeners, 2, "the surviving original, and the newcomer");
+});
+
+test("a report that changes nothing still prunes, and still repaints nobody", async () => {
+  // Two properties that have to coexist, and the first cut got them backwards by
+  // tying one to the other. Delivery is conditional on a state change — otherwise
+  // a form rebuilds itself under a human's caret for no reason. RETENTION must
+  // not be: a refusal is the common case, so a prune behind it never runs.
   const catalog = new ModelCatalog(async () => probe([]));
   let fired = 0;
-  catalog.onReport(() => {
-    fired += 1;
-    return true;
-  });
-  catalog.acceptReport("claude", { models: [], error: "not installed" });
-  assert.equal(fired, 0, "nothing changed, so nobody is asked to repaint");
-  catalog.acceptReport("claude", { models: [detail({ id: "opus" })], error: null });
-  assert.equal(fired, 1);
+  let hostAlive = true;
+  catalog.onReport(() => (fired += 1), () => hostAlive);
+  hostAlive = false;
+
+  const changed = catalog.acceptReport("claude", { models: [], error: "not installed" });
+  assert.equal(changed, false, "nothing changed, so nobody is asked to repaint");
+  assert.equal(fired, 0);
+  assert.equal(
+    catalog.liveReportListeners,
+    0,
+    "…but the dead host is released anyway — a refused report is exactly the case that must still prune"
+  );
 });
 
 test("a rejected detection degrades instead of reaching a render path", async () => {

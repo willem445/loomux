@@ -403,6 +403,13 @@ export class WelcomeForm {
    *  appended yet and one whose pane has been closed are both `isConnected ===
    *  false`, and only the second is dead. */
   private mounted = false;
+  /** `role:cli` pairs a detection reply has already been applied to (#1020).
+   *
+   *  The push and the pull are two deliveries of ONE sweep answer and both can
+   *  land, in either order. Deduping inside the funnel they share is what makes
+   *  the no-double-repaint property hold for both orderings, rather than only
+   *  the one a flag captured before the await can see (rev-713 non-blocking 3). */
+  private detectionsApplied = new Set<string>();
   /** Autopilot flags per program, memoized. Empty string = the CLI has no
    *  unattended flag surface, so the toggle is hidden/inert for it (#101). */
   private autopilotFlags = new Map<string, Promise<string>>();
@@ -703,19 +710,23 @@ export class WelcomeForm {
     // — the lookup in `applyRoleModels` was answered "nothing yet", and without
     // this the role dropdowns would keep their curated seeds until the human
     // closed and reopened the form.
-    this.catalog.onReport((program) => {
-      // Liveness, as `onReport` asks for it. "Not on screen yet" is not dead:
-      // this constructor runs before the caller appends `el`, and a reply can
-      // land in that window. Dead is HAVING been on screen and no longer being
-      // there — the pane was closed, and repainting its detached controls
-      // forever is what a subscription without a teardown does.
-      if (this.el.isConnected) this.mounted = true;
-      else if (this.mounted) return false;
-      for (const rc of this.roleControls) {
-        if (orchCliFor(rc.cli.value).id === program) this.refreshRoleFromDetection(rc.key, program);
-      }
-      return true;
-    });
+    // **This form's release is the catalog's prune, not an unsubscribe call,
+    // and that is deliberate rather than an omission** (rev-713 blocking 2).
+    // `WorkflowView` holds its unsubscribe and calls it from `dispose()`; this
+    // class has no equivalent moment. `fire()` looks like one and is not —
+    // `reopenAfterLaunchFailure` revives a still-mounted form after a downstream
+    // launch throws, and a form released at `fire()` would come back deaf to the
+    // sweep. So liveness is answered instead, and the catalog drops this
+    // subscription the next time anything subscribes. Holding an unsubscribe
+    // nobody could safely call would be worse than not holding one.
+    this.catalog.onReport(
+      (program) => {
+        for (const rc of this.roleControls) {
+          if (orchCliFor(rc.cli.value).id === program) this.refreshRoleFromDetection(rc.key, program);
+        }
+      },
+      () => this.aliveForReports()
+    );
     // Advanced orchestrator (#222). The checkbox is the whole opt-in; everything
     // below it is the human being shown what they are opting into, BEFORE the
     // group spawns — the roster the repo declares, each block's CLI/model, which
@@ -1033,6 +1044,19 @@ export class WelcomeForm {
     });
   }
 
+  /** Whether this form is still something a pushed report should repaint. */
+  private aliveForReports(): boolean {
+    // "Not on screen yet" is not dead: the constructor runs before the caller
+    // appends `el`, and a report can land in that window. Dead is HAVING been on
+    // screen and no longer being there — the pane was closed, and repainting its
+    // detached controls forever is what an unreleased subscription does.
+    if (this.el.isConnected) {
+      this.mounted = true;
+      return true;
+    }
+    return !this.mounted;
+  }
+
   /** Bring one role's controls up to date with a detection reply for `cliId`.
    *
    *  **A detection reply owes this row more than its dropdown** (#997 review):
@@ -1045,6 +1069,12 @@ export class WelcomeForm {
    *  work they owe is identical, and a second copy is the second place a fix
    *  would have to be remembered.
    *
+   *  **Idempotent per role+CLI**, which is where the two routes are reconciled:
+   *  whichever delivery of the sweep's one answer arrives first does the work
+   *  and the other is a no-op, in either order. A flag captured before the await
+   *  cannot do this — it only sees the ordering where the lookup went first
+   *  (rev-713 non-blocking 3).
+   *
    *  Deliberately NOT a call to `applyRoleModels`: that would re-issue the
    *  lookup this is the answer to, and re-enter itself on every reply. */
   private refreshRoleFromDetection(role: OrchRole, cliId: string): void {
@@ -1052,8 +1082,11 @@ export class WelcomeForm {
     // Re-derive rather than repaint blindly: the human may have changed this
     // role's CLI since the reply was asked for, and painting a row from a reply
     // about a CLI it has moved off is exactly the silent-wrong-answer the knob
-    // path refuses.
+    // path refuses. Checked BEFORE the idempotence mark, so a delivery this row
+    // has moved away from does not consume the slot the right one needs.
     if (!rc || this.kind !== "orchestrator" || orchCliFor(rc.cli.value).id !== cliId) return;
+    if (this.detectionsApplied.has(`${role}:${cliId}`)) return;
+    this.detectionsApplied.add(`${role}:${cliId}`);
     const cli = orchCliFor(cliId);
     // The knobs first, immediately and unconditionally: they are what this reply
     // is the answer for, and repainting them touches nothing a human can be
