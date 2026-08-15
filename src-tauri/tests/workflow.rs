@@ -1213,6 +1213,192 @@ fn advisor_and_process_notes_render_exactly_once_when_declared_and_line_final() 
 }
 
 #[test]
+fn a_declared_liaison_gives_the_orchestrator_its_routing_note_with_the_block_id() {
+    // #891 S3. The liaison feature reroutes NOTHING mechanically — every notice
+    // producer, every delegate report and the board keep their destination — so this
+    // fragment IS the orchestrator-side behavior change, and it is the whole reason
+    // no goldened role template is touched (`the_toggle_off_...` and
+    // `a_workflow_placeholder_...` staying green untouched is the proof).
+    let (reg, _d) = test_registry();
+    let repo = Repo::new().workflow(
+        "version: 1\nblocks:\n\
+         \x20 - id: worker\n    kind: worker\n\
+         \x20 - id: rev\n    kind: reviewer\n\
+         \x20 - id: human-desk\n    kind: reviewer\n    role_hint: liaison\n",
+    );
+    let g = reg.create_group(&repo.path(), rails()).unwrap();
+
+    let orch = instructions_lf(&reg, &g.id, "orchestrator.md");
+    assert!(!orch.contains("{{"), "an unsubstituted variable: {orch}");
+    assert_eq!(orch.matches("You have a liaison").count(), 1, "exactly once: {orch}");
+    // The block's OWN id, not a generic "your liaison" — a `send_prompt`/`spawn_agent`
+    // the orchestrator can actually issue is the entire point of interpolating it.
+    assert!(
+        orch.contains("spawn_agent(block: \"human-desk\""),
+        "the spawn instruction must name the declared block: {orch}"
+    );
+    assert!(orch.contains("`human-desk` is the pane the HUMAN talks to"), "{orch}");
+    // Placement, like the advisor/process pins above: the placeholder is line-final,
+    // so the fragment has to bring its own blank line or the `**…**` lands mid-sentence.
+    assert!(
+        orch.contains("workaround in your head.\n\n**You have a liaison.**"),
+        "the fragment must bring its own blank line, not land mid-paragraph: {orch}"
+    );
+
+    // Substance, scoped to the fragment's own region — a whole-document `contains`
+    // would be rescued by the base template's prose about half of these.
+    let flat_doc = flat(&orch);
+    let note = section(
+        &flat_doc,
+        "you have a liaison",
+        "a custom workflow config is your group's roster",
+    );
+    let at = "the liaison note";
+    pinned(at, note, "start it on your first turn", "the note routes questions to a pane nobody was told to open unless it says how to open one");
+    pinned(at, note, "questions for the human go to", "the whole feature is where the human's questions are asked");
+    pinned(at, note, "still holds that pr's merge", "INVARIANT 2 must survive the indirection — the hold is prose, and this is the prose");
+    pinned(at, note, "never the record of one", "#946's registry is what survives a compact — the liaison presents, and prose that let it hold the question would re-create the outage #946 exists to prevent");
+    pinned(at, note, "status is its job", "self-served status is the latency requirement #891 states");
+    pinned(at, note, "never forward operational traffic to it", "forwarding reports/notices is the loop this fragment exists to forbid");
+    pinned(at, note, "is a human directive", "the two-master rule: what the orchestrator RECEIVED must reach its ledger as the human's word");
+    pinned(at, note, "never the human's authority", "a relay must never read as a grant — the human's Approve is minted in the webview, not in a pane");
+    pinned(at, note, "is not a relay, whoever wrote it", "the treat-as-human rule must key on loomux's own attribution line, or any delegate quoting a human at the orchestrator inherits the human's standing in its ledger");
+    // rev-2 F1b narrowed this sentence (the old anchor was "before wrapping it in
+    // a notice of its own", on a claim about "every agent-authored field" that
+    // outran the code by one path). The pin moves with the prose, in the same
+    // commit, and the anchor is now the enumeration the code actually implements.
+    pinned(at, note, "has its `[` and `]` neutralized", "the rule is only safe because the key cannot be written by an agent — say what the scrub actually guarantees, and rev-1 F1/rev-2 F1b are what happen when that sentence outruns the code");
+    pinned(at, note, "`review_verdict`", "the claim must name the tools it covers: a universal 'every field' is what shipped a false claim twice, once per path nobody had listed");
+    pinned(at, note, "nothing here depends on the liaison being alive", "degradation: the direct escape hatch is what makes this feature safe to add");
+    pinned(at, note, "for looking idle", "the standing pane must not be reaped by the orchestrator's own kill-idle-panes rule");
+}
+
+#[test]
+fn a_liaison_is_not_fanned_out_to_as_a_reviewer_on_either_surface() {
+    // #891 S3 coherence fix. A liaison is reviewer-KIND, so a bare
+    // `kind == Reviewer` filter put it in BOTH lists that mean "the blocks a PR is
+    // reviewed by": the orchestrator's `{{REVIEWERS}}` fan-out and a reviewer's
+    // "you are one of N reviewer blocks" lane. Either one alone contradicts the
+    // liaison note in the same document ("no PR is routed to it for a verdict") and
+    // sends a PR to a pane that is denied `review_verdict` and can satisfy no gate.
+    // The sibling of the `block_for` trap `doc/design/liaison.md` records; the
+    // merge-gate path is NOT this fix's business — `parse_workflow` already refuses
+    // a gate that names a liaison.
+    let (reg, _d) = test_registry();
+    let repo = Repo::new().workflow(
+        "version: 1\nblocks:\n\
+         \x20 - id: worker\n    kind: worker\n\
+         \x20 - id: rev-a\n    kind: reviewer\n\
+         \x20 - id: desk\n    kind: reviewer\n    role_hint: liaison\n\
+         \x20 - id: rev-b\n    kind: reviewer\n",
+    );
+    let g = reg.create_group(&repo.path(), rails()).unwrap();
+
+    // (1) the orchestrator's fan-out sentence.
+    let orch = instructions_lf(&reg, &g.id, "orchestrator.md");
+    let orch_flat = flat(&orch);
+    let fan_out = section(&orch_flat, "run every reviewer block on every pr", "gates are enforced");
+    assert!(
+        fan_out.contains("`rev-a`") && fan_out.contains("`rev-b`"),
+        "the real reviewers must still be fanned out to: {fan_out}"
+    );
+    assert!(
+        !fan_out.contains("desk"),
+        "the liaison must not be in the fan-out list — it is denied `review_verdict` and could \
+         never satisfy a gate, so a PR sent to it is a review that can never complete: {fan_out}"
+    );
+
+    // (2) a real reviewer's lane note counts its true peers, and only them.
+    let rev_a = instructions_lf(&reg, &g.id, "rev-a.md");
+    assert!(
+        rev_a.contains("**one of 2 reviewer blocks**") && rev_a.contains("`rev-b`"),
+        "rev-a is one of TWO reviewing blocks and its peer is rev-b: {rev_a}"
+    );
+    assert!(!rev_a.contains("desk"), "the liaison is not one of rev-a's lanes: {rev_a}");
+
+    // (3) ...and the liaison is not told it is one of the reviewers.
+    let desk = instructions_lf(&reg, &g.id, "desk.md");
+    assert!(
+        !desk.contains("reviewer blocks"),
+        "the liaison must not be handed a review lane: {desk}"
+    );
+}
+
+#[test]
+fn liaison_prose_stays_silent_unless_a_block_declares_the_hint() {
+    // The sibling of `advisor_and_process_prose_stays_silent_...`, and the same rule
+    // (rev-29 F1): prose about a mechanism the reader does not have sends them after
+    // something that does not exist for them. A group with no liaison — custom roster
+    // or default — must not read the word.
+    let (reg, _d) = test_registry();
+    let custom = Repo::new().workflow(FOCUSED_REVIEW); // custom roster, no role_hint
+    let g = reg.create_group(&custom.path(), rails()).unwrap();
+    for file in ["orchestrator.md", "worker.md", "rev-security.md", "rev-tests.md", "planner.md"] {
+        let doc = instructions_lf(&reg, &g.id, file);
+        assert!(
+            !doc.to_lowercase().contains("liaison"),
+            "{file} leaked a liaison mechanism nobody declared: {doc}"
+        );
+        assert!(!doc.contains("{{"), "{file} has an unsubstituted variable: {doc}");
+    }
+
+    // ...and the true default: no workflow file at all.
+    let plain = Repo::new();
+    let g2 = reg.create_group(&plain.path(), plain_rails()).unwrap();
+    for file in ["orchestrator.md", "worker.md", "reviewer.md", "planner.md"] {
+        let doc = instructions_lf(&reg, &g2.id, file);
+        assert!(!doc.to_lowercase().contains("liaison"), "{file}: {doc}");
+    }
+}
+
+#[test]
+fn a_replace_mode_liaison_persona_still_gets_its_no_authority_mechanics() {
+    // #891 S3, the non-overridable half — and the reason it lives in `mechanics_core`
+    // rather than in the workflow fragment or a persona file. A repo's own liaison
+    // persona is `mode: replace`-able and is the half that can forget to say any of
+    // this; the liaison is also the first hint whose CLASS is wrong about its job (it
+    // rides `reviewer` and reviews nothing), so without this addendum a replace-persona
+    // liaison's only loomux instructions would be a reviewer's duties.
+    let (reg, _d) = test_registry();
+    let repo = Repo::new()
+        .workflow(
+            "version: 1\nblocks:\n\
+             \x20 - id: desk\n    kind: reviewer\n    role_hint: liaison\n    profile: .github/agents/desk.agent.md\n\
+             \x20 - id: rev\n    kind: reviewer\n",
+        )
+        .agent_file(
+            "desk.agent.md",
+            "---\nname: desk\nmode: replace\ndescription: Custom liaison.\n---\nBe warm about it.",
+        );
+    let g = reg.create_group(&repo.path(), rails()).unwrap();
+
+    let doc = instructions_lf(&reg, &g.id, "desk.md");
+    assert!(doc.contains("NOT optional"), "the mechanics core must be written: {doc}");
+    assert!(
+        !doc.contains("Be warm about it"),
+        "the persona body belongs on the CLI's persona flag, not in the loomux contract file: {doc}"
+    );
+    let flat_doc = flat(&doc);
+    let at = "mechanics_core(Reviewer, liaison)";
+    pinned(at, &flat_doc, "you review nothing", "riding the reviewer class must not read as being a reviewer");
+    pinned(at, &flat_doc, "you hold no orchestration authority", "the persona is swappable; this floor is not");
+    pinned(at, &flat_doc, "you present questions, the human decides", "the liaison delegates the human's attention, never their authority");
+    pinned(at, &flat_doc, "relay verbatim", "fidelity is the reason the pane exists — a paraphrase is a directive the human never gave");
+    pinned(at, &flat_doc, "at the moment of receipt", "a ledger written from memory after a compact is the fidelity loss this prevents");
+    pinned(at, &flat_doc, "already acted on is a duplicate", "a re-delivered kickoff must not become a second relay of one directive");
+    pinned(at, &flat_doc, "serve status yourself", "answering 'how is it going' without costing the orchestrator a turn is the point");
+    pinned(at, &flat_doc, "you never answer one", "every agent may ask and none may answer (#946) — the liaison is the pane most likely to be handed one and must know it presents, never settles");
+
+    // The other half of the selection: a plain reviewer block in the SAME group, with
+    // no hint, must read none of it — this is keyed on `role_hint`, not on the class.
+    let plain = instructions_lf(&reg, &g.id, "rev.md");
+    assert!(
+        !plain.to_lowercase().contains("liaison") && !plain.contains("Relay VERBATIM"),
+        "a hintless reviewer must not pick up the liaison addendum: {plain}"
+    );
+}
+
+#[test]
 fn a_default_groups_post_merge_routine_names_no_process_pro() {
     // #358 fold-in, the other half of the pin above: `{{POST_MERGE_WORKFLOW_HOOK}}`
     // sits inside the base "Re-sync the fleet" section that EVERY group reads,
