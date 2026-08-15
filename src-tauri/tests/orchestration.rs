@@ -32381,7 +32381,13 @@ fn session_digest_refuses_every_id_shape_the_old_predicate_admitted() {
         ("sessiön", "a non-ASCII byte"),
         // Still refused, and still by the alphabet rather than a special case.
         ("..", "the bare traversal"),
-        ("", "the empty id"),
+        // The empty id is deliberately NOT here, and finding out why was worth
+        // the round: `upsert_task` records `session: ""` as *no session at
+        // all*, so `session_digest` refuses it upstream with "task … has no
+        // recorded session" and it never reaches the path layer to be refused
+        // by the gate this test is about. Asserting the gate's message for it
+        // would have been asserting the wrong guard. `SegmentError::Empty` is
+        // pinned directly in `tests/pathseg.rs` instead.
     ];
 
     for (bad, why) in hostile {
