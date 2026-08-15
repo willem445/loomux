@@ -152,7 +152,7 @@ pub fn structured_notice(agent_id: &str, outcome: &str, body: &str, ref_: Option
 /// body has never been capped at all. Whether that second one should be is a
 /// question of its own, on its own evidence.
 pub fn relay_payload(s: &str) -> String {
-    crate::notify::sanitize_gh_text(s, usize::MAX)
+    s.to_string() // MUTATION E: scrubber bypassed
 }
 
 #[cfg(test)]
