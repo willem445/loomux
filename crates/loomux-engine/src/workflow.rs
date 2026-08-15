@@ -1690,16 +1690,6 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
                 // verdict no code path can produce, which is exactly the
                 // failure the arm above refuses; caught at parse rather than
                 // discovered as a merge gate that never opens.
-                Some(b) if b.role_hint.as_deref() == Some("liaison") => {
-                    errs.push(format!(
-                        "gates.{name}: reviewer {:?} is a liaison — it is reviewer-kind, but a \
-                         liaison never records a verdict (it presents the human's questions and \
-                         relays their answers), so a gate naming it could never open. Name a \
-                         reviewer that reviews.",
-                        b.id
-                    ));
-                    bad = true;
-                }
                 Some(_) => {}
             }
         }
