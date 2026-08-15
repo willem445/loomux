@@ -201,6 +201,121 @@ export function worthKeeping(probe: CliProbe): boolean {
   return probe.available && probe.models.length > 0;
 }
 
+/** What a CLI's own list-models reply said about ONE model (#993).
+ *
+ *  A different kind of claim from the two above it. `curated` is a suggestion
+ *  this repo wrote down, and `probed` (`--help`, `opencode models`) is what the
+ *  CLI advertises it *accepts*. This is what the CLI reports about a model's own
+ *  capabilities **on the machine in front of the human** — which nothing else
+ *  can answer, because an effort level is per-model and per-account. A table of
+ *  them here would be the third copy of the thing #329 says not to keep one of.
+ *
+ *  The fields mirror Claude Code's own `ModelInfo`, which Anthropic types in
+ *  `@anthropic-ai/claude-agent-sdk`'s `sdk.d.ts` and publishes at
+ *  <https://docs.claude.com/en/api/agent-sdk/typescript> §ModelInfo (read
+ *  2026-08-14 per the `agent-cli-reference` discipline):
+ *
+ *      value: string;                 // Model identifier to use in API calls
+ *      resolvedModel?: string;        // Canonical wire model id this row's `value` resolves to
+ *      displayName: string;           // Human-readable display name
+ *      description: string;           // Description of the model's capabilities
+ *      supportsEffort?: boolean;      // Whether this model supports effort levels
+ *      supportedEffortLevels?: ('low' | 'medium' | 'high' | 'xhigh' | 'max')[];
+ *
+ *  Renamed rather than mirrored verbatim because this is loomux's own shape, not
+ *  one vendor's: a Copilot or opencode probe will fill the same fields from
+ *  whatever its own reply calls them. Every capability field on that type is
+ *  OPTIONAL, and a real reply exercises that — `haiku` comes back carrying no
+ *  effort fields at all — so absent has to stay distinguishable from false. */
+export interface ModelDetail {
+  /** The id VERBATIM as the CLI reported it (`ModelInfo.value`) — what `--model`
+   *  would receive. May itself carry a `[1m]` suffix: `opus[1m]` is a row the
+   *  CLI lists, not something loomux composes. */
+  id: string;
+  /** The canonical wire id `id` resolves to (`ModelInfo.resolvedModel`), or `""`
+   *  when the CLI did not say. Anthropic documents it as requiring Claude Code
+   *  v2.1.197 or later, so `""` is the ordinary answer from an older install and
+   *  never an error. Worth carrying because it turns an alias into the exact
+   *  model the account is really being served — the one id a context-window
+   *  lookup can be sure about. */
+  resolvedId: string;
+  /** The CLI's own display name (`ModelInfo.displayName`), or `""`. */
+  name: string;
+  /** The CLI's own description (`ModelInfo.description`), or `""`. Reported
+   *  prose, shown verbatim: loomux never parses a number out of it. */
+  description: string;
+  /** Whether the CLI said this model takes a reasoning-effort setting.
+   *
+   *  **`null` is a third state, not a synonym for `false`.** The docs-say-X /
+   *  docs-are-silent / docs-say-NOT-X rule (`agent-cli-reference`) applied to a
+   *  reply instead of a page: `false` is the CLI saying this model has no effort
+   *  knob, and `null` is the CLI not raising the subject — an older build, a
+   *  field that moved, a row like `haiku` that simply omits it. They must not
+   *  collapse, because `false` turns the knob OFF and `null` has to leave it
+   *  exactly as it was. */
+  supportsEffort: boolean | null;
+  /** The effort levels the CLI listed for this model, in its own order. Empty
+   *  when it listed none — which, paired with `supportsEffort: null`, is simply
+   *  "nothing was said". */
+  effortLevels: string[];
+}
+
+/** A whole list-models reply. `models` empty is the ordinary failure: the CLI is
+ *  not installed, is an older build without the control request, or answered in
+ *  a shape this build does not recognise. Every one of those degrades to the
+ *  seed rather than to an error a form has to render. */
+export interface ModelReport {
+  models: ModelDetail[];
+  /** Human-readable reason the reply carried nothing, or `null`. Diagnostic
+   *  only — no surface refuses anything on it. */
+  error: string | null;
+}
+
+/** The report for a CLI loomux could not ask at all. */
+export const reportFailure = (error: string): ModelReport => ({ models: [], error });
+
+/** Strip the `[1m]` context suffix from an id, if it carries one.
+ *
+ *  The suffix selects a context window on an existing model (model-config
+ *  §Extended context); it does not name a different model, and a CLI enumerating
+ *  its models reports the base ids. So `sonnet[1m]` has to find `sonnet`'s row —
+ *  otherwise a human who picked the 1M variant would silently lose the effort
+ *  levels the plain variant shows, which reads as the suffix having disabled
+ *  something. */
+function withoutContextSuffix(id: string): string {
+  const raw = id.trim();
+  return raw.toLowerCase().endsWith("[1m]") ? raw.slice(0, -4) : raw;
+}
+
+/** The reported detail for `id`, or `null` when the reply said nothing about it.
+ *
+ *  Matching widens in one direction only, and each step is a statement loomux
+ *  can defend: verbatim (the ids are the same string), then case-insensitively
+ *  (a vendor id is not case-significant, and `modelnames.ts` already compares
+ *  this way), then with `[1m]` stripped (the suffix is a context window, not a
+ *  model). It never widens to a FAMILY: `claude-sonnet-4-5` must not pick up
+ *  `sonnet`'s reported effort levels, because they are a different model's. */
+export function detailFor(models: readonly ModelDetail[], id: string): ModelDetail | null {
+  const raw = id.trim();
+  if (!raw) return null;
+  const exact = models.find((m) => m.id === raw);
+  if (exact) return exact;
+  const want = withoutContextSuffix(raw).toLowerCase();
+  if (!want) return null;
+  return models.find((m) => withoutContextSuffix(m.id).toLowerCase() === want) ?? null;
+}
+
+/** Whether a list-models reply is worth remembering for the rest of the app run.
+ *
+ *  The same rule as {@link worthKeeping} and for the same reason: a reply that
+ *  carried nothing is exactly the reply a later ask might improve on — the CLI
+ *  was installed a minute later, an upgrade added the control request, a login
+ *  completed. Keeping it would delete the recovery rather than duplicate a
+ *  cache. */
+export function reportWorthKeeping(report: ModelReport): boolean {
+  return report.models.length > 0;
+}
+
 /** The probe seam, shared by every surface: one call per program per app run for
  *  an answer worth keeping, and a fresh ask for one that is not.
  *
