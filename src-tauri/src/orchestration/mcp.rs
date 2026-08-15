@@ -1728,7 +1728,21 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                     rec.block,
                     rec.verdict.as_str().to_uppercase(),
                     rec.pr,
-                    report::verdict_notice_summary(&rec.summary),
+                    // #891 rev-2 F1b: the summary is the third delegate-authored
+                    // field that reaches this pane, and it was the one left raw —
+                    // `sanitize_summary` (at the durable write) keeps newlines by
+                    // design and never touched brackets, so a reviewer's summary
+                    // could carry a forged `[loomux] …` line into the pane that
+                    // `{{LIAISON_NOTE}}` tells to read such lines as the human.
+                    // The gate clause beside it has been scrubbed at source since
+                    // #791 (`gh_failure_text`), which is what made this asymmetry
+                    // two arguments of one `format!`.
+                    //
+                    // `_keeping_lines`, and scrubbed BEFORE the truncation: a
+                    // verdict summary is multi-line prose the reviewer meant, and
+                    // `verdict_notice_summary`'s own marker carries brackets that
+                    // a later scrub would neutralize.
+                    report::verdict_notice_summary(&report::relay_payload_keeping_lines(&rec.summary)),
                     gate.as_deref().map(|g| format!("\n[loomux] {g}")).unwrap_or_default(),
                 ),
                 &caller.agent_id,

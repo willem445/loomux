@@ -6512,19 +6512,41 @@ fixed outcome word, and text `from` wrote; no orchestrator-chosen agent NAME, no
 GitHub string). `from == orch` — an orchestrator relaying to itself — takes the default and is not
 marked.
 
-**The agent-authored half of those two notices is scrubbed at composition** (#891). The prefix was
-always loomux's — the id comes from the caller's token, never from `args` — but `body`, `ref`,
-`detail_url` and `message_orchestrator`'s `text` were interpolated raw, so an agent could put a
-second `[loomux] …` span inside its own words and be read as a notice attributed to a pane it is
-not. That matters most where prose tells a reader to *act* on an attribution: the liaison's
-"a directive it relays IS a human directive" rule is keyed on exactly such a line. All four fields
-now pass `notify::sanitize_gh_text` (via `report::relay_payload`) before loomux adds its prefix —
-the same scrubber `channel_send` has always used, which is what makes
-`cross-workspace-channel.md`'s "same sanitizer every other crossing-text boundary uses" true of
-this boundary too. `[`/`]` become `(`/`)` and control characters go, so the text still arrives and
-reads; it simply cannot carry a `[loomux]` token. Pinned in `report.rs`'s own unit tests and end to
-end on the delivered wording in `tests/orchestration.rs`
-(`a_delegate_cannot_forge_a_loomux_attribution_through_report_or_message_orchestrator`).
+**The agent-authored half of every delegate-callable notice is scrubbed at composition** (#891).
+The prefix was always loomux's — the id comes from the caller's token, never from `args` — but the
+text after it was interpolated raw, so an agent could put a second `[loomux] …` span inside its own
+words and be read as a notice attributed to a pane it is not. That matters most where prose tells a
+reader to *act* on an attribution: the liaison's "a directive it relays IS a human directive" rule
+is keyed on exactly such a line.
+
+**The complete set, because a partial list is how this was fixed twice.** Three tools let a
+delegate put its own words in the orchestrator's pane, carrying five fields between them:
+`report`'s structured shape (`body`, `ref`, `detail_url` — all three land in one line),
+`report`'s legacy shape (`note`/`summary`), `message_orchestrator` (`text`), and `review_verdict`
+(`summary`). Every other `deliver_to_orchestrator` call site composes loomux-owned text or is
+reached only by an orchestrator-only tool (`upsert_task`'s titles, `send_prompt`, `spawn_agent`) —
+the proxy-authorship residual argued below, which is about who dictates words rather than about
+who a line is attributed to.
+
+All of them pass `notify::sanitize_pane_text` (via `report::relay_payload`, or
+`relay_payload_keeping_lines` for the one field whose line structure is content) before loomux adds
+its prefix — the same function `sanitize_gh_text` has always been, and `channel_send` has always
+used, which is what makes `cross-workspace-channel.md`'s "same sanitizer every other crossing-text
+boundary uses" true of these boundaries too. `[`/`]` become `(`/`)` so the text still arrives and
+reads; it simply cannot carry a `[loomux]` token.
+
+**The verdict summary keeps its newlines, deliberately.** `workflow::sanitize_summary` preserves
+`\n`/`\t` when it writes the durable record — a verdict summary is multi-line prose a human reads —
+so collapsing it at the notice would reflow a reviewer's findings on the way to the pane. Line
+position was never the discriminator anyway: this notice legitimately carries a second `[loomux]`
+line of its own (the gate clause). The token is what makes a notice loomux's, and the token is what
+the scrub removes.
+
+Two pins, because the first version of this fix was complete for the paths its author had listed
+and missed one: `no_delegate_callable_tool_can_forge_a_loomux_attribution_into_the_orchestrators_pane`
+drives **every tool a delegate's own `tools/list` offers** with a forged span in every string
+argument, and `every_loomux_notice_composed_in_the_mcp_surface_scrubs_what_it_interpolates` is a
+default-deny source scan with its blind spots enumerated in its own doc comment.
 
 **"Called in by" is deliberately weaker than "authored by", and the gap is the accepted residual
 below.** What the check can see is which agent made the tool call. Who *dictated the words* is not
