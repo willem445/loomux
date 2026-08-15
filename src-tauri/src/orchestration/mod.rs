@@ -46075,7 +46075,9 @@ pub async fn orch_end_group(
 /// therefore still yields 0 however many were asked for, which is the existing
 /// behaviour written down rather than a new rule.
 pub fn starter_workers(requested: Option<u32>, max_agents: u32) -> u32 {
-    requested.unwrap_or(0).min(max_agents)
+    // SCRATCH ONLY - the pre-#1020 default (the launcher's old field value),
+    // restored so the new test can be seen to fail. Never merged.
+    requested.unwrap_or(2).min(max_agents)
 }
 
 /// Create (or reattach to) a group and register its orchestrator, under the
