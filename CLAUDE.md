@@ -168,6 +168,15 @@ compiles.
 - Comments in this codebase explain *why* (design constraints, Windows quirks,
   issue numbers) — keep that density and style.
 - Write tests that test intent, not implementation echoes.
+- **A per-CLI identity string is read off the source, never branched on it.**
+  `source === "claude" ? "claude" : "copilot"` is right only while there are
+  exactly two CLIs; a third silently inherits the else-branch and the pane
+  name, badge or resume command asserts the wrong CLI. Gating *behavior* a CLI
+  genuinely has (`cli == "claude"` for hook settings) is fine — producing a
+  *name* that way is a defect. Adding a CLI means grepping `"claude" ?`,
+  `== "claude"`, `"claude" =>` (match-arm dispatch the first two patterns
+  miss) and the `!= "claude"` polarity across `src/` and `src-tauri/src/`,
+  and classifying every hit as behavior or mistype (#722, #841).
 
 ## Refinements & scope increases from the user
 
@@ -192,6 +201,13 @@ narrow their ask back down to the original ticket on your own judgment.
   the branch — after cleaning the worktree, verify with
   `git ls-remote --heads origin <branch>` and `git push origin --delete
   <branch>` if it survived. Whoever performs the merge owns this step (#662).
+- **Git Bash mangles a `<ref>:<path>` argument when the path starts with a
+  dot.** `git rev-parse origin/main:.github/x` is rewritten to
+  `origin\main;.github\x` and errors, while `origin/main:src/x` works — so a
+  blob-by-blob sweep silently reports exactly the dot-directory files
+  (`.claude/`, `.github/`, `.loomux/`) as mismatched, and an error string
+  compared as a blob reads as a real difference. Prefix `MSYS_NO_PATHCONV=1`
+  on any `git`/`gh` invocation whose argument carries a ref-colon-path (#841).
 - GitHub issues are the work queue. Labels the orchestration workflow uses:
   `agent-managed` (an orchestrator owns it), `agent-ready` (groomed — go),
   `agent-investigation` (research only — post findings as an issue comment,
