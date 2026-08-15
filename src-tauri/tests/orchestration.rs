@@ -9413,9 +9413,11 @@ fn task_summary_drops_notes_but_counts_them() {
         notes: vec![note(1, "a"), note(2, "b"), note(3, "c")],
         deps: vec![],
         related: vec![],
+        parent: None,
+        kind: None,
         updated_ms: 42,
     };
-    let s = task_summary(&t, false);
+    let s = task_summary(&t, false, 0, 0);
     assert_eq!(s.id, "t-1");
     assert_eq!(s.title, "Fix parser");
     assert_eq!(s.status, "in-progress");
@@ -9723,6 +9725,10 @@ fn done_row(id: &str, status: &str, updated_ms: u64) -> TaskSummary {
         note_count: 0,
         deps: vec![],
         related: vec![],
+        parent: None,
+        kind: None,
+        children: 0,
+        children_done: 0,
         ready: false,
     }
 }
@@ -9868,6 +9874,8 @@ fn linked(id: &str, status: &str, deps: &[&str], related: &[&str]) -> Task {
         notes: vec![],
         deps: deps.iter().map(|s| s.to_string()).collect(),
         related: related.iter().map(|s| s.to_string()).collect(),
+        parent: None,
+        kind: None,
         updated_ms: 0,
     }
 }
@@ -10267,6 +10275,502 @@ fn link_and_claim_args_round_trip_through_the_mcp_shim() {
     assert_eq!(call(&co, json!({ "id": "t-2", "deps": [] }))["isError"], false);
     assert!(reg.get_task(&co.group, "t-2").unwrap().deps.is_empty());
     assert_eq!(call(&cw, json!({ "id": "t-2", "deps": ["t-1"] }))["isError"], true, "the board stays orchestrator-write");
+}
+
+// ---------- #958 slice A: task hierarchy (parent + advisory kind) ----------
+
+/// A `parent`-only patch — the shape a reparent takes.
+fn parent_patch(parent: &str) -> TaskPatch {
+    TaskPatch { parent: Some(parent.into()), ..Default::default() }
+}
+
+/// A `Task` literal WITH hierarchy, for the pure board projections — no
+/// registry, no files (the `linked` helper's companion).
+fn kinded(id: &str, status: &str, kind: &str, parent: Option<&str>) -> Task {
+    Task {
+        kind: Some(kind.into()),
+        parent: parent.map(String::from),
+        ..linked(id, status, &[], &[])
+    }
+}
+
+/// The write-time contract for `parent` (#958), which is the #582 link
+/// contract applied to containment: every rejection names what it refused and
+/// leaves the board byte-for-byte as it was, because a container that names no
+/// live task — or a chain that loops or runs past the cap — is a state no
+/// reader should have to have an answer for.
+#[test]
+fn parent_writes_are_validated_against_the_whole_board() {
+    let (reg, _d) = test_registry();
+    let gid = board_with(&reg, &["a", "b", "c", "d", "e", "f"]);
+
+    // An id naming no task on the board is refused, and the error says which.
+    let err = reg.upsert_task(&gid, "orch", Some("t-2"), parent_patch("t-99")).unwrap_err();
+    assert!(err.contains("t-99"), "the rejection names the unknown id: {err}");
+    // A task cannot contain itself.
+    let err = reg.upsert_task(&gid, "orch", Some("t-2"), parent_patch("t-2")).unwrap_err();
+    assert!(err.contains("t-2"), "the self-parent rejection names the row: {err}");
+    assert!(
+        reg.get_task(&gid, "t-2").unwrap().parent.is_none(),
+        "a refused hierarchy write must leave the board exactly as it was"
+    );
+
+    // A legal chain: t-1 → t-2 → t-3.
+    reg.upsert_task(&gid, "orch", Some("t-2"), parent_patch("t-1")).unwrap();
+    reg.upsert_task(&gid, "orch", Some("t-3"), parent_patch("t-2")).unwrap();
+
+    // Reparenting a row under its OWN DESCENDANT is the cycle case, and the
+    // refusal names the path rather than just saying no (`find_dep_cycle`'s
+    // contract, on the container graph).
+    let err = reg.upsert_task(&gid, "orch", Some("t-1"), parent_patch("t-3")).unwrap_err();
+    assert!(err.contains("cycle"), "the refusal says what it is: {err}");
+    assert!(err.contains("t-1 → t-3 → t-2 → t-1"), "the error names the whole chain, in order: {err}");
+    assert!(reg.get_task(&gid, "t-1").unwrap().parent.is_none(), "the rejected edge is not written");
+
+    // The depth cap. t-4 under t-3 is the fourth and last legal level; a fifth
+    // is refused.
+    reg.upsert_task(&gid, "orch", Some("t-4"), parent_patch("t-3")).unwrap();
+    let err = reg.upsert_task(&gid, "orch", Some("t-5"), parent_patch("t-4")).unwrap_err();
+    assert!(err.contains("depth"), "the refusal says what the limit is: {err}");
+    assert!(reg.get_task(&gid, "t-5").unwrap().parent.is_none(), "nothing written");
+
+    // The cap counts the moving row's OWN SUBTREE too, not just its new chain:
+    // t-5 holds t-6, so t-5 is two levels tall and cannot fit under t-3 (which
+    // is already three deep) even though t-5 ALONE would have.
+    reg.upsert_task(&gid, "orch", Some("t-6"), parent_patch("t-5")).unwrap();
+    let err = reg.upsert_task(&gid, "orch", Some("t-5"), parent_patch("t-3")).unwrap_err();
+    assert!(
+        err.contains("depth"),
+        "a reparent must not smuggle an over-deep chain in from BELOW the moving row: {err}"
+    );
+    assert_eq!(
+        reg.get_task(&gid, "t-6").unwrap().parent.as_deref(),
+        Some("t-5"),
+        "the subtree is untouched by the refusal"
+    );
+
+    // ...and the same move one level higher, where the subtree DOES fit, is
+    // allowed — the cap is on the deepest resulting row, not on the mover.
+    reg.upsert_task(&gid, "orch", Some("t-5"), parent_patch("t-2")).unwrap();
+
+    // A link to your own container is a mistake in either direction — writing
+    // the link under an existing container, or moving the container under an
+    // existing link.
+    let err = reg.upsert_task(&gid, "orch", Some("t-4"), deps_patch(&["t-3"])).unwrap_err();
+    assert!(err.contains("deps") && err.contains("t-3"), "a dep on your own container is refused: {err}");
+    let rel = TaskPatch { related: Some(vec!["t-3".into()]), ..Default::default() };
+    let err = reg.upsert_task(&gid, "orch", Some("t-4"), rel).unwrap_err();
+    assert!(err.contains("related"), "...and so is a see-also on it: {err}");
+    assert!(reg.get_task(&gid, "t-4").unwrap().deps.is_empty(), "nothing written");
+
+    // The parent-write direction: t-6 already deps on t-1, so moving t-6 INTO
+    // t-1 is the same mistake arriving from the other side.
+    reg.upsert_task(&gid, "orch", Some("t-6"), deps_patch(&["t-1"])).unwrap();
+    let err = reg.upsert_task(&gid, "orch", Some("t-6"), parent_patch("t-1")).unwrap_err();
+    assert!(
+        err.contains("deps") && err.contains("t-1"),
+        "reparenting under a task you already depend on is refused too: {err}"
+    );
+    assert_eq!(reg.get_task(&gid, "t-6").unwrap().parent.as_deref(), Some("t-5"), "nothing written");
+
+    // The kind is validated like the status, and the error names the vocabulary.
+    let bad = TaskPatch { kind: Some("saga".into()), ..Default::default() };
+    let err = reg.upsert_task(&gid, "orch", Some("t-2"), bad).unwrap_err();
+    assert!(err.contains("saga") && err.contains("epic"), "an unknown kind is refused by name: {err}");
+    assert!(reg.get_task(&gid, "t-2").unwrap().kind.is_none(), "nothing written");
+}
+
+/// Levels are ADVISORY (#958): skipping one is legal, and a container is an
+/// ordinary work item that can still be claimed. Pinning this is the point —
+/// it is the decision the investigation made, and the cheap direction is to be
+/// able to add enforcement later, not to discover it was assumed.
+#[test]
+fn levels_are_advisory_and_a_container_is_still_ordinary_work() {
+    let (reg, _d) = test_registry();
+    let gid = board_with(&reg, &["the epic", "a slice"]);
+    let epic = TaskPatch { kind: Some("epic".into()), ..Default::default() };
+    reg.upsert_task(&gid, "orch", Some("t-1"), epic).unwrap();
+    assert_eq!(reg.get_task(&gid, "t-1").unwrap().kind.as_deref(), Some("epic"));
+
+    // A story straight under an epic, with no feature between them: accepted,
+    // and RECORDED as written — a validator that silently dropped the level it
+    // disapproved of would pass a rejection test while still enforcing.
+    let mut p = parent_patch("t-1");
+    p.kind = Some("story".into());
+    let story = reg.upsert_task(&gid, "orch", Some("t-2"), p).unwrap();
+    assert_eq!(
+        (story.parent.as_deref(), story.kind.as_deref()),
+        (Some("t-1"), Some("story")),
+        "skipping a level is legal, and the skip is stored rather than quietly normalized away"
+    );
+
+    // And the epic itself is claimable — hierarchy is not a work/container
+    // split, so nothing about having children changes the claim guards.
+    let t = reg.upsert_task(&gid, "orch", Some("t-1"), claim_patch("w-3")).unwrap();
+    assert_eq!(t.status, "in-progress", "a container with children is still claimable work");
+    assert_eq!(t.assignee.as_deref(), Some("w-3"));
+}
+
+/// `parent`/`kind` follow the `pr` rule (#958): omitted leaves them alone, an
+/// empty string clears. Without the clear, "this is no longer inside anything"
+/// would need a hand-edited `tasks.json`.
+#[test]
+fn parent_and_kind_clear_on_empty_and_stay_untouched_when_omitted() {
+    let (reg, _d) = test_registry();
+    let gid = board_with(&reg, &["the epic", "a slice"]);
+
+    let mut p = parent_patch("t-1");
+    p.kind = Some("story".into());
+    let t = reg.upsert_task(&gid, "orch", Some("t-2"), p).unwrap();
+    assert_eq!(t.parent.as_deref(), Some("t-1"));
+    assert_eq!(t.kind.as_deref(), Some("story"));
+    // Durable, not just in the returned snapshot.
+    assert_eq!(reg.tasks(&gid)[1].parent.as_deref(), Some("t-1"));
+
+    // A create can name its container in the SAME call — the orchestrator's
+    // actual pattern is "make the epic, then hang each slice under it".
+    let mut create = patch(Some("nested at birth"), None, None);
+    create.parent = Some("t-1".into());
+    create.kind = Some("task".into());
+    let born = reg.upsert_task(&gid, "orch", None, create).unwrap();
+    assert_eq!(born.parent.as_deref(), Some("t-1"), "a new row can be created already inside its container");
+
+    // Omitted = untouched: an ordinary status/note edit must never orphan a row.
+    let t = reg.upsert_task(&gid, "orch", Some("t-2"), patch(None, None, Some("unrelated edit"))).unwrap();
+    assert_eq!(t.parent.as_deref(), Some("t-1"), "a patch that omits parent must not clear it");
+    assert_eq!(t.kind.as_deref(), Some("story"));
+
+    // Empty (or blank) clears rather than storing whitespace.
+    let clear = TaskPatch { parent: Some("  ".into()), kind: Some("".into()), ..Default::default() };
+    let t = reg.upsert_task(&gid, "orch", Some("t-2"), clear).unwrap();
+    assert_eq!(t.parent, None, "a blank parent promotes the row to top level");
+    assert_eq!(t.kind, None, "...and a blank kind clears the label, it is not an invalid kind");
+}
+
+/// Promote-on-delete (#958), the `strip_deleted_links` reasoning applied to
+/// containment: refusing the delete would fight the human's authority over
+/// their own board, and cascading would silently destroy work items along with
+/// their PR/session refs — the worst failure direction. So the children are
+/// promoted, in the SAME locked write, on all three delete paths.
+#[test]
+fn deleting_a_container_promotes_its_children_to_the_nearest_surviving_ancestor() {
+    let (reg, _d) = test_registry();
+
+    // --- single delete: the child lands on the deleted row's own container.
+    let gid = board_with(&reg, &["epic", "feature", "story", "bystander"]);
+    reg.upsert_task(&gid, "orch", Some("t-2"), parent_patch("t-1")).unwrap();
+    reg.upsert_task(&gid, "orch", Some("t-3"), parent_patch("t-2")).unwrap();
+    reg.delete_task(&gid, "human", "t-2").unwrap();
+    assert!(reg.get_task(&gid, "t-3").is_some(), "the child SURVIVES — a delete never cascades");
+    assert_eq!(
+        reg.get_task(&gid, "t-3").unwrap().parent.as_deref(),
+        Some("t-1"),
+        "promoted one level, not left pointing at a row nobody can resolve"
+    );
+    let del = reg.audit_log(&gid).into_iter().find(|e| e.action == "task-delete").unwrap();
+    assert_eq!(del.detail["reparented"], json!(["t-3"]), "the audit names whose container moved: {}", del.detail);
+
+    // --- batch delete taking a parent AND its grandparent in ONE write: the
+    // survivor must land on the NEAREST SURVIVING ancestor. This is the whole
+    // reason the promotion walks the removed chain instead of reading one
+    // pointer — reading one would leave t-4 pointing at the already-deleted t-2.
+    //
+    // A FRESH registry per scenario, not just a fresh `board_with`: the helper
+    // creates its group from the same repo path every time, so a second call on
+    // one registry lands on the same board and mints ids from t-5 up.
+    let (reg, _d2) = test_registry();
+    let gid = board_with(&reg, &["epic", "feature", "story", "task"]);
+    reg.upsert_task(&gid, "orch", Some("t-2"), parent_patch("t-1")).unwrap();
+    reg.upsert_task(&gid, "orch", Some("t-3"), parent_patch("t-2")).unwrap();
+    reg.upsert_task(&gid, "orch", Some("t-4"), parent_patch("t-3")).unwrap();
+    reg.delete_tasks(&gid, "human", &["t-2".to_string(), "t-3".to_string()]).unwrap();
+    assert_eq!(
+        reg.get_task(&gid, "t-4").unwrap().parent.as_deref(),
+        Some("t-1"),
+        "two levels went in one write — the child lands on the nearest SURVIVOR, not at top level"
+    );
+    let sel = reg.audit_log(&gid).into_iter().find(|e| e.action == "task-delete-selected").unwrap();
+    assert_eq!(sel.detail["reparented"], json!(["t-4"]));
+
+    // When the WHOLE chain goes, the survivor lands at top level rather than
+    // keeping a dangling pointer.
+    reg.delete_tasks(&gid, "human", &["t-1".to_string()]).unwrap();
+    assert_eq!(reg.get_task(&gid, "t-4").unwrap().parent, None, "no surviving ancestor = top level");
+
+    // --- delete-all-done, the likeliest way a container disappears.
+    let (reg, _d3) = test_registry();
+    let gid = board_with(&reg, &["epic", "slice"]);
+    reg.upsert_task(&gid, "orch", Some("t-2"), parent_patch("t-1")).unwrap();
+    reg.upsert_task(&gid, "orch", Some("t-1"), patch(None, Some("done"), None)).unwrap();
+    reg.delete_done_tasks(&gid, "human").unwrap();
+    assert!(reg.get_task(&gid, "t-2").is_some(), "a done container's unfinished child is not swept with it");
+    assert_eq!(reg.get_task(&gid, "t-2").unwrap().parent, None, "delete-all-done promotes too");
+    let done = reg.audit_log(&gid).into_iter().find(|e| e.action == "task-delete-done").unwrap();
+    assert_eq!(done.detail["reparented"], json!(["t-2"]));
+}
+
+/// rev-611 NB2: promotion can hand a row a container it already links to, and
+/// that state must not wedge the row's other fields — nor be "fixed" by
+/// silently dropping the link.
+///
+/// Depending on your GRANDparent is not a mistake, so it is accepted; deleting
+/// the row in between is what turns that grandparent into a parent. The overlap
+/// therefore arrives from the system, not from a hand-edit, which is the one
+/// case the read-tolerance argument has to cover rather than assume away.
+#[test]
+fn promotion_may_hand_a_row_a_container_it_already_deps_on_without_wedging_it() {
+    let (reg, _d) = test_registry();
+    let gid = board_with(&reg, &["epic", "feature", "slice"]);
+    reg.upsert_task(&gid, "orch", Some("t-2"), parent_patch("t-1")).unwrap();
+    // Legal at write time: t-3's container is t-2, and t-1 is merely its
+    // grandparent — "finish the epic's other half before starting this" is an
+    // ordinary thing to record.
+    let mut nested = parent_patch("t-2");
+    nested.deps = Some(vec!["t-1".into()]);
+    reg.upsert_task(&gid, "orch", Some("t-3"), nested).unwrap();
+
+    // Deleting the middle row promotes t-3 onto t-1 — which it also deps on.
+    reg.delete_task(&gid, "human", "t-2").unwrap();
+    let t3 = reg.get_task(&gid, "t-3").unwrap();
+    assert_eq!(t3.parent.as_deref(), Some("t-1"), "promoted to the nearest survivor as usual");
+    assert_eq!(
+        t3.deps,
+        ["t-1"],
+        "the dep SURVIVES: t-1 is still live and unfinished, and dropping it here would unblock \
+         work whose blocker never went away — the one thing a delete of an unrelated row must not do"
+    );
+    assert!(
+        !reg.task_summaries(&gid).iter().find(|r| r.id == "t-3").unwrap().ready,
+        "so readiness is unchanged by the promotion — still blocked by t-1"
+    );
+
+    // And the row is not wedged: a write that does not re-assert the overlap
+    // goes through, instead of being refused over a field it never touched.
+    reg.upsert_task(&gid, "orch", Some("t-3"), patch(None, Some("in-progress"), None)).unwrap();
+    let rel = TaskPatch { related: Some(vec!["t-1".into()]), ..Default::default() };
+    let err = reg.upsert_task(&gid, "orch", Some("t-3"), rel).unwrap_err();
+    assert!(err.contains("related"), "a `related` write IS judged on `related`: {err}");
+    let other = TaskPatch { related: Some(vec![]), ..Default::default() };
+    reg.upsert_task(&gid, "orch", Some("t-3"), other)
+        .expect("a related-only write must not be refused for a deps overlap it never touched");
+
+    // Re-asserting the overlap on the field being written is still refused —
+    // the rule is intact, it is just scoped to the write that makes it.
+    let err = reg.upsert_task(&gid, "orch", Some("t-3"), deps_patch(&["t-1"])).unwrap_err();
+    assert!(err.contains("deps"), "writing the container back into deps is still a mistake: {err}");
+}
+
+/// The compat guarantee (#958), the same one #582 and #581 shipped: a board
+/// written before hierarchy existed loads unchanged, and a board that uses no
+/// hierarchy never grows the keys on rewrite. `tasks()` reports a parse failure
+/// as an EMPTY board, so a non-defaulted field would silently erase every live
+/// board on upgrade rather than error.
+#[test]
+fn pre_958_boards_load_and_a_flat_board_never_gains_the_hierarchy_keys() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let path = reg.state_root().join(g.id.as_str()).join("tasks.json");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    // Exactly what loomux wrote before #958 — no parent key, no kind key.
+    fs::write(
+        &path,
+        r##"[
+  {"id":"t-1","title":"Ship the parser","status":"queued","issue":"#7","pr":null,"assignee":null,"session":null,"notes":[],"updated_ms":11}
+]"##,
+    )
+    .unwrap();
+
+    let tasks = reg.tasks(&g.id);
+    assert_eq!(tasks.len(), 1, "a pre-#958 board must still load — a parse failure reads as an EMPTY board");
+    assert_eq!(tasks[0].parent, None, "an absent parent deserializes to None, never an error");
+    assert_eq!(tasks[0].kind, None);
+
+    // A rewrite must not GAIN the keys: that is what keeps an older loomux (and
+    // a human reading the file) seeing exactly what it saw before.
+    reg.upsert_task(&g.id, "orch", Some("t-1"), patch(None, Some("in-progress"), None)).unwrap();
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(text.contains("in-progress"), "the edit itself landed");
+    assert!(!text.contains("\"parent\""), "a flat board must not gain a parent key:\n{text}");
+    assert!(!text.contains("\"kind\""), "...nor a kind key:\n{text}");
+
+    // The compact row an orchestrator reads says the same thing — and carries
+    // no zero counts either: absent IS "this board has no hierarchy" (#245's
+    // pay-nothing-for-what-you-don't-use rule).
+    let row = serde_json::to_value(&reg.task_summaries(&g.id)[0]).unwrap();
+    assert!(row.get("parent").is_none() && row.get("kind").is_none(), "flat rows carry neither: {row}");
+    assert!(row.get("children").is_none() && row.get("children_done").is_none(), "nor a zero count: {row}");
+}
+
+/// The `list_tasks` row projection (#958): container, level, and DIRECT child
+/// counts derived in the same per-call board scan `ready` already uses — counts
+/// only, never the child rows (#245).
+#[test]
+fn list_rows_carry_the_container_and_derived_child_counts() {
+    let board = vec![
+        kinded("t-1", "queued", "epic", None),
+        kinded("t-2", "done", "story", Some("t-1")),
+        kinded("t-3", "queued", "task", Some("t-1")),
+        kinded("t-4", "queued", "task", Some("t-2")),
+    ];
+    let rows = board_summaries(&board);
+    assert_eq!(rows[0].children, 2, "DIRECT children only — t-4 is a grandchild, not the epic's child");
+    assert_eq!(rows[0].children_done, 1);
+
+    let v = serde_json::to_value(&rows[0]).unwrap();
+    assert_eq!(v["kind"], json!("epic"));
+    assert_eq!(v["children"], json!(2));
+    assert_eq!(v["children_done"], json!(1));
+    assert!(v.get("parent").is_none(), "a root pays nothing for the field: {v}");
+    // A count must never expand into the child row itself (#245's size rule,
+    // which a tree shape is exactly what tempts an expansion of).
+    assert!(!v.to_string().contains("task t-2"), "counts only, never the child's title: {v}");
+
+    let leaf = serde_json::to_value(&rows[3]).unwrap();
+    assert_eq!(leaf["parent"], json!("t-2"));
+    assert!(leaf.get("children").is_none(), "a childless row pays nothing for the counts: {leaf}");
+
+    // A container whose own status lags its children keeps its own status —
+    // nothing here ever rolls up INTO `status` (the `ready` precedent: derived
+    // at read time, never written back).
+    assert_eq!(rows[1].status, "done");
+    assert_eq!(rows[1].children, 1);
+    assert_eq!(rows[1].children_done, 0, "a done container with an unfinished child says so");
+}
+
+/// v1 leaves readiness exactly as #582 defined it (#958). Folding ancestors in
+/// — "a child is not ready while its container is blocked" — is a semantics
+/// decision for the human, so this pins it as DEFERRED rather than letting it
+/// arrive by accident with the data model.
+#[test]
+fn hierarchy_does_not_change_the_readiness_truth_table() {
+    let board = vec![
+        kinded("t-1", "blocked", "epic", None),
+        kinded("t-2", "queued", "story", Some("t-1")),
+        kinded("t-3", "queued", "feature", None),
+        Task { parent: Some("t-3".into()), ..linked("t-4", "queued", &["t-2"], &[]) },
+    ];
+    assert!(
+        task_ready(&board[1], &board),
+        "v1 readiness is the task's OWN deps: a child of a BLOCKED container is still startable (#958 defers the change)"
+    );
+    assert!(unmet_deps(&board[1], &board).is_empty(), "a container is not a dependency");
+    assert!(
+        !task_ready(&board[3], &board),
+        "and a child's OWN dep still blocks it — containment and ordering stay orthogonal"
+    );
+    assert_eq!(unmet_deps(&board[3], &board), ["t-2"]);
+
+    // A hand-edited orphan/cycle is TOLERATED on read: display-only metadata
+    // must never wedge the queue the way an unknown dep deliberately does.
+    let hand_edited = vec![
+        kinded("t-1", "queued", "task", Some("t-404")),
+        kinded("t-2", "queued", "task", Some("t-3")),
+        kinded("t-3", "queued", "task", Some("t-2")),
+    ];
+    let rows = board_summaries(&hand_edited);
+    assert!(rows[0].ready, "an orphan parent blocks nothing — it is display metadata, not a gate");
+    assert!(rows[1].ready && rows[2].ready, "nor does a hand-edited container cycle");
+    assert_eq!(rows[1].children, 1, "the counts still answer, without walking into the loop");
+}
+
+#[test]
+fn hierarchy_args_round_trip_through_the_mcp_shim() {
+    let (reg, _d, co, cw) = setup_mcp();
+    let call = |c: &Caller, args: Value| {
+        dispatch(&reg, c, "tools/call", &json!({ "name": "upsert_task", "arguments": args })).unwrap()
+    };
+    let text_of = |r: &Value| r["content"][0]["text"].as_str().unwrap_or_default().to_string();
+    call(&co, json!({ "title": "the epic", "kind": "epic" }));
+    call(&co, json!({ "title": "slice A" }));
+
+    // Both fields parse and land.
+    assert_eq!(call(&co, json!({ "id": "t-2", "parent": "t-1", "kind": "story" }))["isError"], false);
+    let t2 = reg.get_task(&co.group, "t-2").unwrap();
+    assert_eq!((t2.parent.as_deref(), t2.kind.as_deref()), (Some("t-1"), Some("story")));
+    assert_eq!(reg.get_task(&co.group, "t-1").unwrap().kind.as_deref(), Some("epic"), "kind lands on a CREATE too");
+
+    // list_tasks — readable by ANY role — carries the container and the count.
+    let listed = dispatch(&reg, &cw, "tools/call", &json!({ "name": "list_tasks", "arguments": {} })).unwrap();
+    let rows = text_of(&listed);
+    assert!(rows.contains(r#""parent":"t-1""#), "compact rows carry the container id: {rows}");
+    assert!(rows.contains(r#""children":1"#), "...and the derived child count: {rows}");
+
+    // Registry rejections surface as tool errors WITH the reason — a caller
+    // must be able to tell a cycle from a permission problem.
+    let cyc = call(&co, json!({ "id": "t-1", "parent": "t-2" }));
+    assert_eq!(cyc["isError"], true);
+    assert!(text_of(&cyc).contains("cycle"), "the cycle reason survives the shim: {}", text_of(&cyc));
+    let bad_kind = call(&co, json!({ "id": "t-2", "kind": "saga" }));
+    assert_eq!(bad_kind["isError"], true);
+    assert!(text_of(&bad_kind).contains("epic"), "the vocabulary is named back: {}", text_of(&bad_kind));
+
+    // Empty string clears through this same shim, the way `pr` does — for BOTH
+    // fields.
+    assert_eq!(call(&co, json!({ "id": "t-2", "parent": "" }))["isError"], false);
+    assert_eq!(reg.get_task(&co.group, "t-2").unwrap().parent, None);
+    assert_eq!(call(&co, json!({ "id": "t-2", "kind": "" }))["isError"], false);
+    assert_eq!(reg.get_task(&co.group, "t-2").unwrap().kind, None, "\"\" clears the level, it is not an invalid kind");
+
+    // And the board stays orchestrator-write.
+    assert_eq!(call(&cw, json!({ "id": "t-2", "parent": "t-1" }))["isError"], true);
+}
+
+/// rev-611 NB1: the advertised schema must admit the clear its own description
+/// documents. `kind` carries a JSON-schema `enum`, so a client that enforces
+/// the enum — which is the point of publishing one — could otherwise never
+/// send the `""` the same property's description calls the clear. `parent`
+/// has no enum, so its clear was always reachable; this is `kind`'s problem
+/// alone, and it is a contract defect rather than a backend one (the backend's
+/// trim-then-check carve-out has always treated `""` as the clear).
+#[test]
+fn the_upsert_task_schema_admits_the_kind_clear_it_documents() {
+    let (reg, _d, co, _cw) = setup_mcp();
+    let listed = dispatch(&reg, &co, "tools/list", &json!({})).unwrap();
+    let upsert = listed["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "upsert_task")
+        .expect("upsert_task is listed for an orchestrator");
+    let kind = &upsert["inputSchema"]["properties"]["kind"];
+    assert_eq!(
+        kind["enum"],
+        json!(["epic", "feature", "story", "task", ""]),
+        "the four levels PLUS the empty-string clear: {kind}"
+    );
+    let described = kind["description"].as_str().unwrap_or_default();
+    assert!(
+        described.contains("clear"),
+        "and the description still says so, so the two cannot drift apart silently: {described}"
+    );
+}
+
+/// rev-611 NB3: a wrong-typed hierarchy arg is REFUSED, never silently
+/// dropped — the rule `deps` already states in this same tool. Reporting
+/// success for a `parent` that never landed is the worst failure of the set:
+/// the caller believes it hung a slice under an epic and the board never heard
+/// about it, which is a wrong TREE rather than one wrong field.
+#[test]
+fn wrong_typed_hierarchy_args_are_refused_not_silently_dropped() {
+    let (reg, _d, co, _cw) = setup_mcp();
+    let call = |args: Value| {
+        dispatch(&reg, &co, "tools/call", &json!({ "name": "upsert_task", "arguments": args })).unwrap()
+    };
+    call(json!({ "title": "the epic" }));
+    call(json!({ "title": "slice A" }));
+
+    assert_eq!(call(json!({ "id": "t-2", "parent": 5 }))["isError"], true, "a number is not a task id");
+    assert_eq!(call(json!({ "id": "t-2", "kind": ["epic"] }))["isError"], true, "nor is an array a level");
+    assert_eq!(call(json!({ "id": "t-2", "parent": true }))["isError"], true);
+    let t2 = reg.get_task(&co.group, "t-2").unwrap();
+    assert_eq!((t2.parent, t2.kind), (None, None), "a refused arg parse changes nothing");
+
+    // null is still "leave it alone", not a type error — that is what keeps an
+    // omitted-vs-explicitly-null caller working the way every other field does.
+    assert_eq!(call(json!({ "id": "t-2", "parent": "t-1", "kind": "epic" }))["isError"], false);
+    assert_eq!(call(json!({ "id": "t-2", "parent": null, "kind": null }))["isError"], false);
+    let t2 = reg.get_task(&co.group, "t-2").unwrap();
+    assert_eq!((t2.parent.as_deref(), t2.kind.as_deref()), (Some("t-1"), Some("epic")), "null left both alone");
 }
 
 #[test]

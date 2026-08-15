@@ -8524,6 +8524,24 @@ pub const MERGE_GATE_STATUSES: [&str; 2] = ["pr", "human-testing"];
 /// is **Proceed** (not the merge-gate approve/changes) — see `proceed_task`.
 pub const PROTOTYPE_STATUS: &str = "prototype";
 
+/// Agile levels for `Task::kind` (#958), kept as strings for the same reason
+/// `TASK_STATUSES` is — the wire/JSON form stays obvious — and validated on
+/// every write the same way.
+///
+/// The levels are ADVISORY: nothing enforces that a `story` sits under a
+/// `feature` rather than straight under an `epic`. Enforcement would buy no
+/// data integrity (every reader needs the tree, not ladder discipline), fight
+/// the dominant real shape (a feature plus its slices), and make reparenting
+/// and kind-less migrated rows harder — and it stays one write-time check to
+/// add later if the discipline is ever wanted, which is the cheap direction.
+pub const TASK_KINDS: [&str; 4] = ["epic", "feature", "story", "task"];
+
+/// How deep the container chain may run (#958) — the epic → feature → story →
+/// task ceiling. A hard cap where the levels themselves are advisory, because
+/// this is what bounds every rollup and render walk over the tree; without it
+/// a hand-built chain could make an O(depth) walk arbitrarily expensive.
+pub const MAX_TASK_DEPTH: usize = 4;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TaskNote {
     pub ts_ms: u64,
@@ -8588,6 +8606,39 @@ pub struct Task {
     /// dependency cycle is always a bug.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub related: Vec<String>,
+    /// The id of the task this one sits INSIDE (#958) — containment, where
+    /// `deps` is ordering. Orthogonal on purpose: a dep may cross subtrees or
+    /// link two containers, and none of the #582 link machinery consults this.
+    ///
+    /// Stored on the pointing side only (no `children` array), the way a dep
+    /// edge is: two sources of truth would mean two delete-strip bookkeepings.
+    /// Validated on write like a link id — names a live task, never itself,
+    /// never closing a cycle, never deeper than `MAX_TASK_DEPTH` — and when the
+    /// container is deleted its children are PROMOTED to the nearest surviving
+    /// ancestor in the same locked write, so "a parent names a live task" holds
+    /// without a repair pass.
+    ///
+    /// Reading is deliberately TOLERANT where writing is strict: a hand-edited
+    /// orphan or over-deep pointer blocks nothing and renders flat at top
+    /// level. Unlike an unknown dep — which reads as unmet because deps gate
+    /// readiness — an unknown container is display-only, so tolerate-and-show
+    /// is the safe failure direction.
+    ///
+    /// **DISPLAY AND QUEUE-HINT METADATA ONLY — NOTHING MAY GATE ON IT**, the
+    /// `pr_base` argument above applied to hierarchy: the board is
+    /// agent-writable, so a check that trusted this would be a check the thing
+    /// being checked gets to answer.
+    ///
+    /// Additive and skipped when absent: a pre-#958 `tasks.json` loads with no
+    /// hierarchy, and a board that uses none rewrites without gaining the key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    /// Advisory Agile level — one of `TASK_KINDS` (#958), absent meaning "a
+    /// plain task", which is what every row written before this existed is.
+    /// Same additive/skipped-when-absent contract as `parent`, and the same
+    /// metadata-only stance: it labels a row, it never authorizes anything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
     #[serde(default)]
     pub updated_ms: u64,
 }
@@ -8622,11 +8673,39 @@ pub struct TaskSummary {
     pub deps: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub related: Vec<String>,
+    /// This row's container and advisory level (#958), skipped when absent so
+    /// a board with no hierarchy pays nothing for the fields — the same
+    /// pay-for-what-you-use rule the link arrays follow.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// DIRECT children of this row, and how many of them are `done` (#958) —
+    /// derived at read time in `board_summaries`, never stored. Counts ONLY,
+    /// and only one level: a nested child list is exactly the expansion #245
+    /// exists to prevent, and the tree itself is one client-side pass over
+    /// `parent` on a board `list_tasks` already returned whole. Skipped when
+    /// zero, so a leaf row carries neither key.
+    #[serde(skip_serializing_if = "count_is_zero")]
+    pub children: usize,
+    #[serde(skip_serializing_if = "count_is_zero")]
+    pub children_done: usize,
     /// Derived at read time, never stored and never written back into
     /// `status` (#582): `queued` with every dep `done`. One `list_tasks` call
     /// therefore answers "what is startable right now" without the
     /// orchestrator re-deriving it from prose after a compact.
+    ///
+    /// Hierarchy does NOT participate in v1 (#958): a child of a `blocked`
+    /// container is still ready. Folding ancestors in is a semantics decision
+    /// the human has to make, so it is left visible-but-unenforced rather than
+    /// quietly changing what every existing board means.
     pub ready: bool,
+}
+
+/// `skip_serializing_if` for the derived child counts (#958) — a row with no
+/// children omits the keys entirely, the way an empty link array does.
+fn count_is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 /// The only status that satisfies a dependency edge (#582). Merged/accepted is
@@ -8661,10 +8740,11 @@ pub fn task_ready(task: &Task, board: &[Task]) -> bool {
 }
 
 /// Project a full `Task` down to its `list_tasks` row (#245). Pure so the
-/// field mapping is unit-testable without a registry. `ready` is passed in
-/// rather than computed here because a task ALONE cannot know it — it needs
-/// its dependencies' statuses, i.e. board context (see `board_summaries`).
-pub fn task_summary(t: &Task, ready: bool) -> TaskSummary {
+/// field mapping is unit-testable without a registry. `ready` and the child
+/// counts are passed in rather than computed here because a task ALONE cannot
+/// know either — both need its neighbours, i.e. board context (see
+/// `board_summaries`).
+pub fn task_summary(t: &Task, ready: bool, children: usize, children_done: usize) -> TaskSummary {
     TaskSummary {
         id: t.id.clone(),
         title: t.title.clone(),
@@ -8678,6 +8758,10 @@ pub fn task_summary(t: &Task, ready: bool) -> TaskSummary {
         note_count: t.notes.len(),
         deps: t.deps.clone(),
         related: t.related.clone(),
+        parent: t.parent.clone(),
+        kind: t.kind.clone(),
+        children,
+        children_done,
         ready,
     }
 }
@@ -8686,9 +8770,27 @@ pub fn task_summary(t: &Task, ready: bool) -> TaskSummary {
 /// companion `task_summary` needs, since readiness is a property of a task
 /// *plus its board*. Quadratic in board size in the worst case (a board is
 /// 10–100 tasks with a handful of links each, and this runs once per
-/// `list_tasks` call), so it stays a straight scan rather than an index.
+/// `list_tasks` call), so it stays a straight scan rather than an index. The
+/// #958 child counts ride that same scan for the same reason.
 pub fn board_summaries(tasks: &[Task]) -> Vec<TaskSummary> {
-    tasks.iter().map(|t| task_summary(t, task_ready(t, tasks))).collect()
+    tasks
+        .iter()
+        .map(|t| {
+            // DIRECT children only, and a plain scan rather than a walk: this
+            // is a chip on one row, and a subtree rollup would have to answer
+            // what a hand-edited parent cycle rolls up to. A count of the rows
+            // that point HERE has no such question (#958).
+            let mut children = 0usize;
+            let mut children_done = 0usize;
+            for c in tasks.iter().filter(|c| c.parent.as_deref() == Some(t.id.as_str())) {
+                children += 1;
+                if c.status == "done" {
+                    children_done += 1;
+                }
+            }
+            task_summary(t, task_ready(t, tasks), children, children_done)
+        })
+        .collect()
 }
 
 /// Default cap on `done` rows a `list_tasks` call returns when the caller
@@ -8832,6 +8934,118 @@ fn strip_deleted_links(tasks: &mut [Task], removed: &HashSet<&str>) -> Vec<Strin
     rewritten
 }
 
+/// The container chain above `start`, nearest LAST — `start` itself, then its
+/// parent, then its parent, up to a root (#958). `parent_of` is the board's
+/// parent pointers with the edited row's NEW parent already substituted, so
+/// this answers "what would the chain be after this write", exactly the
+/// contract `find_dep_cycle`'s substituted `edges` map has.
+///
+/// `Err` is the loop as a path (`t-1 → t-3 → t-2 → t-1`) so a rejection can
+/// name it rather than just refusing. Containment is a functional graph (at
+/// most one parent per row), so a plain walk with a repeat check is enough —
+/// no DFS needed — and the repeat check is also what makes the walk terminate
+/// on the one board that can be cyclic: a hand-edited `tasks.json`.
+fn find_parent_cycle(start: &str, parent_of: &HashMap<&str, &str>) -> Result<Vec<String>, Vec<String>> {
+    let mut path = vec![start.to_string()];
+    let mut cur = parent_of.get(start).copied();
+    while let Some(next) = cur {
+        let repeat = path.iter().any(|p| p == next);
+        path.push(next.to_string());
+        if repeat {
+            return Err(path);
+        }
+        cur = parent_of.get(next).copied();
+    }
+    Ok(path)
+}
+
+/// How many levels `root`'s own subtree spans, itself included — 1 for a leaf
+/// (#958). Read off the board as it stands, because a reparent MOVES a subtree
+/// wholesale rather than reshaping it, so the height the mover carries with it
+/// is the height it has now.
+///
+/// This is what stops a reparent smuggling an over-deep chain in from BELOW:
+/// checking only the new ancestor chain would let a two-level subtree land at
+/// depth 4 and put its own children at 5. Breadth-first with a visited set, so
+/// a hand-edited parent cycle underneath terminates instead of spinning.
+fn subtree_height(root: &str, tasks: &[Task]) -> usize {
+    let mut height = 0usize;
+    let mut level: Vec<&str> = vec![root];
+    let mut seen: HashSet<&str> = HashSet::from([root]);
+    while !level.is_empty() {
+        height += 1;
+        // Collected, deliberately not pushed. `push(x.as_str())` is the shape
+        // constraint 6's source scan reads as a path build — its premise is
+        // that `Vec<String>::push(x.as_str())` cannot compile, which is true of
+        // the receiver it is aimed at and not of this `Vec<&str>`. A security
+        // scan should not be widened to accommodate a local style choice that
+        // has a free alternative, so this takes the alternative.
+        let next: Vec<&str> = tasks
+            .iter()
+            .filter(|t| t.parent.as_deref().map_or(false, |p| level.contains(&p)))
+            .map(|t| t.id.as_str())
+            .filter(|id| seen.insert(*id))
+            .collect();
+        level = next;
+    }
+    height
+}
+
+/// Reparent the survivors of a delete whose container was just removed, in the
+/// same locked write as the delete itself (#958). Returns the ids actually
+/// rewritten, so the audit row says whose container moved.
+///
+/// PROMOTE, not cascade and not refuse — `strip_deleted_links`' reasoning
+/// applied to containment. Refusing fights the human's authority over a board
+/// they hand-edit; cascading silently destroys work items along with their
+/// PR/session refs, which is the worst failure direction available. Promotion
+/// loses only the grouping.
+///
+/// It walks the removed chain rather than reading one pointer because a BATCH
+/// delete can take a parent and its grandparent together: reading one pointer
+/// would land the child on a row this very write just deleted. `removed` is
+/// therefore the removed ROWS (their own `parent` values are the chain), and a
+/// chain that leaves the board entirely lands the survivor at top level.
+fn promote_orphans(tasks: &mut [Task], removed: &[Task]) -> Vec<String> {
+    let gone: HashMap<&str, Option<&str>> =
+        removed.iter().map(|t| (t.id.as_str(), t.parent.as_deref())).collect();
+    let survivors: HashSet<String> = tasks.iter().map(|t| t.id.clone()).collect();
+    let mut promoted = Vec::new();
+    for t in tasks.iter_mut() {
+        // Owned, not a borrow of `t`: the walk below outlives the read, and the
+        // row is written at the end of it.
+        let Some(p) = t.parent.clone() else { continue };
+        let Some(start) = gone.get_key_value(p.as_str()).map(|(k, _)| *k) else { continue };
+        // Climb through the removed rows to the nearest survivor. `seen` bounds
+        // the climb: a hand-edited cycle among the deleted rows would otherwise
+        // never reach a survivor, and top level is the right answer for it.
+        let mut cur = Some(start);
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut landed: Option<String> = None;
+        while let Some(id) = cur {
+            if !seen.insert(id) {
+                break;
+            }
+            match gone.get(id) {
+                // Still one of the rows this write removed — keep climbing.
+                Some(next) => cur = *next,
+                // Not removed: a survivor if it names a live row, and otherwise
+                // a pointer that was already dangling before this delete, which
+                // is not this delete's business to invent a target for.
+                None => {
+                    if survivors.contains(id) {
+                        landed = Some(id.to_string());
+                    }
+                    break;
+                }
+            }
+        }
+        t.parent = landed;
+        promoted.push(t.id.clone());
+    }
+    promoted
+}
+
 /// Max notes kept verbatim on a task's LIVE copy (#245) — beyond this, the
 /// oldest excess collapses into one placeholder note so `tasks.json` (and
 /// therefore `get_task`) stays bounded even for a task with weeks of
@@ -8940,6 +9154,15 @@ pub struct TaskPatch {
     pub deps: Option<Vec<String>>,
     /// Non-blocking links (#582); same replace-or-untouched rule as `deps`.
     pub related: Option<Vec<String>>,
+    /// This task's container (#958). `None` leaves it untouched; an EMPTY
+    /// string clears it (promoting the row to top level) — the `pr` rule, so
+    /// "no longer inside anything" is expressible without hand-editing the
+    /// board. Any other value is validated against the whole board before
+    /// anything is written.
+    pub parent: Option<String>,
+    /// Advisory Agile level (#958) — one of `TASK_KINDS`, with the same
+    /// untouched/empty-clears rule as `parent`.
+    pub kind: Option<String>,
     /// Atomic claim (#582): guard this write on the task still being
     /// unclaimed, `queued`, and dep-satisfied, then set assignee + status in
     /// the same locked write. A plain (non-claim) upsert keeps its historic
@@ -23794,6 +24017,14 @@ impl OrchRegistry {
                 return Err(format!("invalid status {s:?} — use one of {}", TASK_STATUSES.join(" | ")));
             }
         }
+        // The advisory level is validated like the status (#958). The EMPTY
+        // string is not an invalid kind, it is the clear — the `pr` rule — so
+        // it has to pass here to reach the apply below.
+        if let Some(k) = patch.kind.as_deref().map(str::trim) {
+            if !k.is_empty() && !TASK_KINDS.contains(&k) {
+                return Err(format!("invalid kind {k:?} — use one of {}", TASK_KINDS.join(" | ")));
+            }
+        }
         if patch.claim {
             // A claim is a guarded transition on an EXISTING row: the guards
             // (queued, unclaimed-or-mine, deps met) are the whole point, and a
@@ -23843,6 +24074,8 @@ impl OrchRegistry {
                     notes: vec![],
                     deps: vec![],
                     related: vec![],
+                    parent: None,
+                    kind: None,
                     updated_ms: 0,
                 });
                 tasks.len() - 1
@@ -23859,6 +24092,84 @@ impl OrchRegistry {
             edges.insert(this_id.clone(), new_deps.clone());
             if let Some(cycle) = find_dep_cycle(&this_id, &edges) {
                 return Err(format!("deps: dependency cycle {}", cycle.join(" → ")));
+            }
+        }
+        // ---- hierarchy (#958): the link contract above, applied to
+        // containment. Same placement and same reason — every check reads the
+        // board BEFORE the mutable borrow below, so a refusal leaves the board
+        // exactly as it was. `Some(None)` is the explicit clear; the outer
+        // `None` means the patch never mentioned `parent` at all.
+        let parent: Option<Option<String>> = match patch.parent.as_deref().map(str::trim) {
+            None => None,
+            Some("") => Some(None),
+            Some(p) => {
+                if p == this_id {
+                    return Err(format!("parent: a task cannot contain itself ({this_id})"));
+                }
+                if !tasks.iter().any(|t| t.id == p) {
+                    return Err(format!("parent: unknown task: {p}"));
+                }
+                let mut parent_of: HashMap<&str, &str> = tasks
+                    .iter()
+                    .filter_map(|t| t.parent.as_deref().map(|par| (t.id.as_str(), par)))
+                    .collect();
+                parent_of.insert(&this_id, p);
+                // Reparenting a row under its OWN DESCENDANT is the cycle case,
+                // and it is the one an agent actually writes by accident.
+                let chain = find_parent_cycle(&this_id, &parent_of)
+                    .map_err(|cycle| format!("parent: hierarchy cycle {}", cycle.join(" → ")))?;
+                // The cap is on the DEEPEST resulting row, not on the mover:
+                // its new chain, plus whatever it carries below it. `- 1`
+                // because the mover is counted by both.
+                let deepest = chain.len() + subtree_height(&this_id, &tasks) - 1;
+                if deepest > MAX_TASK_DEPTH {
+                    return Err(format!(
+                        "parent: hierarchy depth cap is {MAX_TASK_DEPTH} — putting {this_id} under {p} \
+                         would make its deepest row {deepest} levels deep"
+                    ));
+                }
+                Some(Some(p.to_string()))
+            }
+        };
+        // A link to your own container is a mistake, and this refuses the write
+        // that MAKES one — scoped, deliberately, to the fields this call is
+        // actually setting (rev-611 NB2).
+        //
+        // The wider reading (check both link arrays whenever any of the three
+        // moves) refused writes that had not created the problem and named a
+        // field the caller never touched. It has a reachable trigger that is not
+        // a hand-edit: a row may legitimately dep on its GRANDparent, and
+        // `promote_orphans` turns that grandparent into its parent when the
+        // middle row is deleted. From then on the wider check refused even a
+        // `related`-only patch, citing `deps`.
+        //
+        // Promotion is deliberately NOT made to strip that link instead. A
+        // delete of one row would then change a DIFFERENT row's readiness while
+        // its actual blocker is still alive and unfinished — silently unblocking
+        // work, which is the failure direction #582 exists to prevent, and a far
+        // bigger claim than the overlap is worth. `strip_deleted_links` unblocks
+        // only by removing links to rows that are GONE. So the residual state
+        // (container also named in `deps`) is tolerated on read like every other
+        // hierarchy oddity, and only a write that re-asserts it is refused.
+        let effective_parent = match parent.as_ref() {
+            Some(p) => p.as_deref(),
+            None => tasks[idx].parent.as_deref(),
+        };
+        if let Some(p) = effective_parent {
+            // On a `parent` write, both arrays are in scope: the write is what
+            // moves the container under an existing link. On a link write, only
+            // the array being written is.
+            let writing_parent = patch.parent.is_some();
+            for (field, links) in [
+                ("deps", if writing_parent { Some(deps.as_ref().unwrap_or(&tasks[idx].deps)) } else { deps.as_ref() }),
+                ("related", if writing_parent { Some(related.as_ref().unwrap_or(&tasks[idx].related)) } else { related.as_ref() }),
+            ] {
+                let Some(links) = links else { continue };
+                if links.iter().any(|id| id.as_str() == p) {
+                    return Err(format!(
+                        "parent: {p} is this task's container — it cannot also be a {field} link"
+                    ));
+                }
             }
         }
         // ---- claim guards (#582). Read the row and the board BEFORE the
@@ -23948,6 +24259,14 @@ impl OrchRegistry {
         if let Some(r) = related {
             task.related = r;
         }
+        // Already validated (and already trimmed, since a container id is
+        // looked up by exact match rather than displayed).
+        if let Some(p) = parent {
+            task.parent = p;
+        }
+        if patch.kind.is_some() {
+            task.kind = patch.kind.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        }
         // Last, so the claim's own two fields are what the guards above
         // approved — never a leftover from the generic patch application.
         if claim {
@@ -23966,17 +24285,31 @@ impl OrchRegistry {
 
     pub fn delete_task(&self, group: &GroupId, actor: &str, id: &str) -> Result<(), String> {
         let _guard = self.tasks_lock.lock_safe();
-        let mut tasks = self.tasks(group);
-        let before = tasks.len();
-        tasks.retain(|t| t.id != id);
-        if tasks.len() == before {
+        // Partitioned rather than retained, because promotion needs the removed
+        // row's OWN `parent` to find its children's next container. Splitting
+        // (not `position` + `remove`) keeps the historic "every row with this id
+        // goes" semantics of the `retain` this replaced: ids are minted unique,
+        // so a duplicate can only come from a hand-edited `tasks.json`, and
+        // leaving one of a pair behind after reporting success is not an
+        // improvement on removing both.
+        let (removed, mut tasks): (Vec<Task>, Vec<Task>) =
+            self.tasks(group).into_iter().partition(|t| t.id == id);
+        if removed.is_empty() {
             return Err(format!("unknown task: {id}"));
         }
         // Same locked write (#582): a deleted task's id must not survive on
         // anyone's links, or it would block its dependent forever.
         let relinked = strip_deleted_links(&mut tasks, &HashSet::from([id]));
+        // ...nor on anyone's `parent` (#958) — its children are promoted rather
+        // than orphaned or cascaded away.
+        let reparented = promote_orphans(&mut tasks, &removed);
         self.write_tasks(group, &tasks)?;
-        self.audit(group, actor, "task-delete", json!({ "id": id, "relinked": relinked }));
+        self.audit(
+            group,
+            actor,
+            "task-delete",
+            json!({ "id": id, "relinked": relinked, "reparented": reparented }),
+        );
         Ok(())
     }
 
@@ -23990,17 +24323,26 @@ impl OrchRegistry {
     pub fn delete_done_tasks(&self, group: &GroupId, actor: &str) -> Result<Vec<String>, String> {
         let removed = {
             let _guard = self.tasks_lock.lock_safe();
-            let mut tasks = self.tasks(group);
-            let removed: Vec<String> =
-                tasks.iter().filter(|t| t.status == "done").map(|t| t.id.clone()).collect();
+            // Split rather than filtered-then-retained: promotion reads the
+            // removed rows' own `parent` pointers to find each survivor's
+            // nearest surviving ancestor, and `partition` is stable, so both
+            // halves keep the board's priority order.
+            let (removed_rows, mut tasks): (Vec<Task>, Vec<Task>) =
+                self.tasks(group).into_iter().partition(|t| t.status == "done");
+            let removed: Vec<String> = removed_rows.iter().map(|t| t.id.clone()).collect();
             if removed.is_empty() {
                 return Ok(removed);
             }
-            tasks.retain(|t| t.status != "done");
             let gone: HashSet<&str> = removed.iter().map(String::as_str).collect();
             let relinked = strip_deleted_links(&mut tasks, &gone);
+            let reparented = promote_orphans(&mut tasks, &removed_rows);
             self.write_tasks(group, &tasks)?;
-            self.audit(group, actor, "task-delete-done", json!({ "ids": removed, "relinked": relinked }));
+            self.audit(
+                group,
+                actor,
+                "task-delete-done",
+                json!({ "ids": removed, "relinked": relinked, "reparented": reparented }),
+            );
             removed
         };
         // Outside the tasks lock: notify is best-effort and can block on delivery.
@@ -24025,10 +24367,14 @@ impl OrchRegistry {
     pub fn delete_tasks(&self, group: &GroupId, actor: &str, ids: &[String]) -> Result<Vec<String>, String> {
         let removed = {
             let _guard = self.tasks_lock.lock_safe();
-            let mut tasks = self.tasks(group);
             let wanted: HashSet<&str> = ids.iter().map(String::as_str).collect();
-            let removed: Vec<String> =
-                tasks.iter().filter(|t| wanted.contains(t.id.as_str())).map(|t| t.id.clone()).collect();
+            // Split, not filtered-then-retained (#958): a batch can remove a
+            // parent AND its grandparent, so promotion has to climb the removed
+            // rows' own `parent` chain, and it needs those rows to do it.
+            // `partition` is stable, so both halves keep board order.
+            let (removed_rows, mut tasks): (Vec<Task>, Vec<Task>) =
+                self.tasks(group).into_iter().partition(|t| wanted.contains(t.id.as_str()));
+            let removed: Vec<String> = removed_rows.iter().map(|t| t.id.clone()).collect();
             if removed.is_empty() {
                 return Ok(removed);
             }
@@ -24036,17 +24382,17 @@ impl OrchRegistry {
             // not fatal — but audited, so the divergence is traceable.
             let present: HashSet<&str> = removed.iter().map(String::as_str).collect();
             let skipped: Vec<&str> = ids.iter().map(String::as_str).filter(|id| !present.contains(id)).collect();
-            tasks.retain(|t| !wanted.contains(t.id.as_str()));
             // Strip by what was actually removed, not by what was asked for:
             // an id that named no row can still name a hand-edited dangling
             // link, and that link is not this delete's business (#582).
             let relinked = strip_deleted_links(&mut tasks, &present);
+            let reparented = promote_orphans(&mut tasks, &removed_rows);
             self.write_tasks(group, &tasks)?;
             self.audit(
                 group,
                 actor,
                 "task-delete-selected",
-                json!({ "ids": removed, "skipped": skipped, "relinked": relinked }),
+                json!({ "ids": removed, "skipped": skipped, "relinked": relinked, "reparented": reparented }),
             );
             removed
         };
@@ -46473,6 +46819,10 @@ pub async fn orch_upsert_task(
     status: Option<String>,
     note: Option<String>,
     deps: Option<Vec<String>>,
+    // #958: additive, so every existing caller keeps working — an absent field
+    // deserializes to `None`, which is "leave it alone" in `TaskPatch`.
+    parent: Option<String>,
+    kind: Option<String>,
 ) -> Result<Task, String> {
     let reg = reg_of(&app);
     let group_id = command_group(&group_id)?;
@@ -46481,7 +46831,7 @@ pub async fn orch_upsert_task(
             &group_id,
             "human",
             id.as_deref(),
-            TaskPatch { title, status, note, deps, ..Default::default() },
+            TaskPatch { title, status, note, deps, parent, kind, ..Default::default() },
         )?;
         reg.notify_board_edit(&group_id, &format!("{} \"{}\" is now {}", task.id, task.title, task.status));
         Ok(task)
