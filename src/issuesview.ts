@@ -28,6 +28,7 @@ import {
 import {
   TOGGLEABLE_LABELS,
   AGENT_MANAGED,
+  AGENT_HOLD,
   isLabeledForAgents,
   filterAndSortIssues,
   labelDelta,
@@ -72,7 +73,14 @@ const LABEL_SHORT: Record<string, string> = {
   "agent-ready": "ready",
   "agent-investigation": "investigate",
   "agent-managed": "managed",
+  "agent-hold": "hold",
 };
+
+/** Why the hold toggle exists, spelled out where the human clicks it (#778) —
+ *  under full autonomy this button is the whole consent boundary. */
+const HOLD_HELP =
+  "Hold: full-autonomy agents must not start this issue. Absolute — an agent may " +
+  "never remove it. Other labels are left as they are.";
 
 /** Relative "updated N ago" from an ISO timestamp; falls back to the raw
  *  string if it doesn't parse. */
@@ -480,11 +488,10 @@ export class IssuesView {
     const meta = el("div", "issues-row-meta");
     for (const label of item.labels) {
       const known = label in LABEL_SHORT;
-      const chip = el(
-        "span",
-        `issues-label${known ? " agent" : ""}`,
-        known ? LABEL_SHORT[label] : label
-      );
+      // agent-hold gets its own (red) chip class rather than the agent one: it is
+      // the veto, and it must not read like the go-signals it overrides (#778).
+      const kind = label === AGENT_HOLD ? " hold" : known ? " agent" : "";
+      const chip = el("span", `issues-label${kind}`, known ? LABEL_SHORT[label] : label);
       chip.title = label;
       meta.appendChild(chip);
     }
@@ -515,15 +522,21 @@ export class IssuesView {
     const { row, actions } = this.rowShell(issue, "issues");
     if (isLabeledForAgents(issue)) row.classList.add("agent-labeled");
 
-    // Toggle buttons for the go-signal labels.
+    // Toggle buttons for the go-signal labels, plus the agent-hold veto (#778),
+    // which is styled apart from them because it means the opposite.
     for (const label of TOGGLEABLE_LABELS) {
       const on = issue.labels.includes(label);
+      const hold = label === AGENT_HOLD;
       const btn = el(
         "button",
-        `issues-toggle${on ? " on" : ""}`,
+        `issues-toggle${hold ? " hold" : ""}${on ? " on" : ""}`,
         LABEL_SHORT[label] ?? label
       ) as HTMLButtonElement;
-      btn.title = on ? `Remove ${label}` : `Add ${label}`;
+      btn.title = hold
+        ? `${on ? "Remove" : "Add"} ${label} — ${HOLD_HELP}`
+        : on
+          ? `Remove ${label}`
+          : `Add ${label}`;
       btn.disabled = this.busy.has(issue.number);
       btn.addEventListener("click", (e) => {
         e.stopPropagation();

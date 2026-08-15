@@ -93,9 +93,11 @@ export const ghIssueCreate = (
 ): Promise<GhCreated> => invoke("gh_issue_create", { repo, title, body });
 
 /** Add and/or remove labels on issue `number`. The backend validates every
- *  label against a fixed allow-list (agent-ready / agent-investigate /
- *  agent-managed) and rejects anything else, so a malformed call fails loudly
- *  rather than attaching an arbitrary label. */
+ *  label against a fixed allow-list (agent-ready / agent-investigation /
+ *  agent-managed / agent-hold) and rejects anything else, so a malformed call
+ *  fails loudly rather than attaching an arbitrary label. `agent-hold` (#778) is
+ *  the human veto under full autonomy — writable from here because applying it
+ *  IS the veto gesture. */
 export const ghIssueSetLabels = (
   repo: string,
   number: number,

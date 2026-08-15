@@ -6191,6 +6191,90 @@ fn builtin_intake_profile_matches_todays_github_label_vocabulary() {
     assert_eq!(p.investigate, "agent-investigation");
     assert_eq!(p.owned, "agent-managed");
     assert_eq!(p.prototype, "agent-prototype");
+    assert_eq!(p.hold, "agent-hold", "the full-autonomy veto label (#778) is part of the built-in vocabulary");
+}
+
+// ── the hold label: the full-autonomy veto's spelling (#778) ───────────────
+//
+// Additive to the #382 P1 schema and defaulted, so every existing file and
+// every existing group.json keeps working untouched — but it is the one label
+// whose spelling is a **consent boundary** (the host poller excludes
+// hold-labeled issues from full-autonomy eligibility), so a repo that renames
+// it must have ITS spelling honored rather than a hardcoded const's.
+
+#[test]
+fn the_hold_label_can_be_overridden_and_is_inherited_when_omitted() {
+    let yaml = "version: 1\nblocks:\n  - id: worker\n    kind: worker\n\
+                intake:\n  labels:\n    hold: do-not-touch\n";
+    let wf = workflow::parse_workflow(yaml).unwrap();
+    assert_eq!(wf.intake.hold, "do-not-touch", "a repo's own veto-label spelling must take effect");
+    assert_eq!(wf.intake.ready, workflow::builtin_intake_profile().ready, "the other labels still inherit");
+
+    let plain = workflow::parse_workflow("version: 1\nblocks:\n  - id: worker\n    kind: worker\nintake:\n  labels:\n    ready: build-me\n").unwrap();
+    assert_eq!(
+        plain.intake.hold,
+        workflow::builtin_intake_profile().hold,
+        "an omitted hold: inherits the built-in default, like every other label field"
+    );
+}
+
+#[test]
+fn an_unusable_hold_label_is_rejected_not_rewritten() {
+    // Same "reject, don't rewrite" rule the other label fields get — and it
+    // matters more here: a silently-rewritten veto label would match nothing
+    // in the repo, so every held issue would read as eligible.
+    let yaml = "version: 1\nblocks:\n  - id: worker\n    kind: worker\n\
+                intake:\n  labels:\n    hold: \"not a label\"\n";
+    let errs = workflow::parse_workflow(yaml).unwrap_err();
+    assert!(
+        errs.iter().any(|e| e.contains("intake.labels.hold")),
+        "the error must name the offending field: {errs:?}"
+    );
+}
+
+#[test]
+fn the_hold_label_round_trips_through_group_json() {
+    let (reg, dir) = test_registry();
+    let yaml = "version: 1\nblocks:\n  - id: worker\n    kind: worker\n\
+                intake:\n  labels:\n    hold: custom-hold\n";
+    let repo = Repo::new().workflow(yaml);
+    let g = reg.create_group(&repo.path(), rails()).unwrap();
+    assert_eq!(g.guardrails.intake.hold, "custom-hold");
+
+    let gj: Value = serde_json::from_str(
+        &fs::read_to_string(reg.state_root().join(g.id.as_str()).join("group.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(gj["guardrails"]["intake"]["labels"]["hold"], "custom-hold");
+
+    // A restart must resume on the same veto spelling — a poller that fell
+    // back to `agent-hold` here would ignore every hold the human applied.
+    let reg2 = relaunch_registry(dir.path());
+    reg2.set_port(45999); // fake port, as everywhere in these tests
+    let g2 = reg2.create_group(&repo.path(), rails()).unwrap();
+    assert_eq!(g2.id, g.id, "the restart resumes the same group");
+    assert_eq!(g2.guardrails.intake.hold, "custom-hold", "the veto spelling must survive a restart");
+}
+
+#[test]
+fn a_group_json_predating_the_hold_label_resolves_to_the_builtin_veto() {
+    // Migration guarantee, the same one `absent_intake_key_in_group_json_…`
+    // gives the whole block: a group.json written before this field existed
+    // has `intake.labels` with no `hold` key at all, and must resolve to
+    // `agent-hold` rather than to an empty string that would match nothing.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group(&Repo::new().path(), rails()).unwrap();
+    let path = reg.state_root().join(g.id.as_str()).join("group.json");
+    let mut gj: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    gj["guardrails"]["intake"]["labels"].as_object_mut().unwrap().remove("hold");
+    fs::write(&path, serde_json::to_string_pretty(&gj).unwrap()).unwrap();
+
+    let (_, persisted) = reg.load_group_file(&g.id).unwrap();
+    assert_eq!(
+        persisted.intake.hold,
+        workflow::builtin_intake_profile().hold,
+        "an absent hold key must resolve to the built-in veto label, never to nothing"
+    );
 }
 
 #[test]

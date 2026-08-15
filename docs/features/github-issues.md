@@ -56,8 +56,13 @@ approves them (do that on GitHub or in the git view).
 
 Toggle a label directly on the row:
 
-- **ready** applies `agent-ready` (start work), and
-- **investigate** applies `agent-investigation` (research + a plan).
+- **ready** applies `agent-ready` (start work),
+- **investigate** applies `agent-investigation` (research + a plan), and
+- **hold** applies `agent-hold` — the opposite instruction: *don't start this*.
+  It's the veto under
+  [full autonomy](../autonomous-mode.html#full-autonomy-the-orchestrator-picks-the-work),
+  where every open issue is otherwise eligible, and it's rendered in red so it
+  never reads like a go signal.
 
 That's the whole handshake — a running orchestrator on this repo polls open
 issues and pulls any so-labelled onto its board. No orchestrator needs to be
