@@ -28,7 +28,7 @@
 // bundler), exactly like src/icons.ts. The strings are injected with `innerHTML` by
 // src/pane.ts; the `label` is NOT — it is text for a `title` property and must never be
 // interpolated into markup (see §Safety).
-import { programFromRestore } from "./panerestore.ts";
+import { normalizeAgentProgram, programFromRestore } from "./panerestore.ts";
 
 /**
  * §Licensing — why the table has one row and a fallback rather than one row per CLI.
@@ -138,13 +138,17 @@ export function agentLetter(program: string): string {
 
 /** What a pane header needs in order to draw the mark. */
 export interface AgentMarkView {
-  /** The normalized program name the command named, e.g. `claude`, `copilot`, `aider`. */
-  program: string;
-  /** `mark` = a vendored licensed glyph; `letter` = the generated fallback. */
-  kind: "mark" | "letter";
+  /** The normalized program name this mark NAMES, e.g. `claude`, `copilot`, `aider` — and
+   *  `null` on the neutral tier, where the whole point is that there is no name to give. */
+  program: string | null;
+  /** `mark` = a vendored licensed glyph; `letter` = the generated fallback;
+   *  `unknown` = the neutral badge, which asserts nothing about which CLI this is. */
+  kind: "mark" | "letter" | "unknown";
   /** Inline SVG, `currentColor`, safe for `innerHTML`. */
   svg: string;
-  /** Tooltip TEXT — assign it to `.title`, never interpolate it into markup. */
+  /** Tooltip TEXT — assign it to `.title`/`aria-label`, never interpolate it into markup.
+   *  Only a `mark`/`letter` view captions itself "Agent CLI: …"; a neutral one must not,
+   *  because that caption is a claim. */
   label: string;
 }
 
@@ -154,14 +158,73 @@ export interface AgentMarkView {
 const LABEL_MAX = 24;
 
 /**
+ * §Not every program in a launch line is an agent.
+ *
+ * A **denylist of transports and shells**, and the direction matters: an allowlist of
+ * known agents would destroy the total fallback that makes the letter tier worth having
+ * (§the module header), so this only ever removes things that definitionally cannot be an
+ * agent CLI, whatever they were launched by.
+ *
+ * `ssh` is the one that had to exist. An #887 SSH pane spawns the LOCAL ssh client as the
+ * pane's child, so `argv[0]` is the transport — and the agent, if any, is running on the
+ * far end where argv cannot see it. Reading `ssh` as the pane's CLI produced a confident,
+ * specific, wrong answer ("Agent CLI: ssh") on a pane that may well have been running
+ * Claude, which is the exact failure this module's header claims it does not have. The
+ * shells are here for the same reason one step down: a pane launched with `bash` is a
+ * shell someone opened, not an agent that happens to be named bash.
+ */
+const NOT_AN_AGENT = new Set([
+  "ssh",
+  "mosh",
+  "bash",
+  "sh",
+  "zsh",
+  "fish",
+  "dash",
+  "cmd",
+  "powershell",
+  "pwsh",
+  "wsl",
+  "tmux",
+  "screen",
+]);
+
+/** The neutral tier: "loomux does not know which agent this is", drawn as `?` and — the
+ *  load-bearing part — captioned WITHOUT an "Agent CLI:" claim. */
+function neutralView(label: string, size: number): AgentMarkView {
+  return { program: null, kind: "unknown", label, svg: badgeSvg("?", size) };
+}
+
+/** What a remote pane says when loomux holds no far-end CLI for it. */
+export const REMOTE_UNKNOWN_LABEL = "Remote pane — agent CLI unknown";
+
+/** The generated badge. No `font-family`: SVG text inherits it from the header, so the
+ *  letter is the app's own type rather than a second typeface nobody chose. */
+function badgeSvg(letter: string, size: number): string {
+  return (
+    `<svg class="ic ic-fleet" viewBox="${AGENT_VIEWBOX}" width="${size}" height="${size}" ` +
+    `aria-hidden="true">` +
+    `<rect x="1.25" y="1.25" width="13.5" height="13.5" rx="4" fill="none" ` +
+    `stroke="currentColor" stroke-width="1.5" />` +
+    `<text x="8" y="11.4" text-anchor="middle" font-size="9" font-weight="700" ` +
+    `fill="currentColor">${letter}</text>` +
+    `</svg>`
+  );
+}
+
+/**
  * Resolve a program name to its mark. Total — every string gets a view, because the
  * fallback is the whole point (see the module header).
  */
 export function agentMarkFor(program: string, size = ICON_AGENT_PX): AgentMarkView {
+  // Transports and shells fall out here rather than at the call site, so EVERY route into
+  // this function — a launch line, an SSH profile's `defaultCli`, anything later — gets the
+  // same refusal. A caption is a claim; these have nothing to claim.
+  if (NOT_AN_AGENT.has(program)) {
+    return neutralView(`${program.slice(0, LABEL_MAX)} — a transport or shell, not an agent`, size);
+  }
+
   const label = `Agent CLI: ${program.slice(0, LABEL_MAX)}`;
-  const open =
-    `<svg class="ic ic-fleet" viewBox="${AGENT_VIEWBOX}" width="${size}" height="${size}" ` +
-    `aria-hidden="true">`;
 
   const mark = MARK[program];
   if (mark) {
@@ -177,29 +240,58 @@ export function agentMarkFor(program: string, size = ICON_AGENT_PX): AgentMarkVi
     };
   }
 
-  // The generated badge. No `font-family`: SVG text inherits it from the header, so the
-  // letter is the app's own type rather than a second typeface nobody chose.
+  // A name whose first character cannot be badged is a name loomux could not read, so it
+  // resolves to the neutral tier rather than to a `?` wearing an "Agent CLI:" caption —
+  // the caption would be asserting exactly what the `?` is admitting it does not know.
   const letter = agentLetter(program);
-  return {
-    program,
-    kind: "letter",
-    label,
-    svg:
-      open +
-      `<rect x="1.25" y="1.25" width="13.5" height="13.5" rx="4" fill="none" ` +
-      `stroke="currentColor" stroke-width="1.5" />` +
-      `<text x="8" y="11.4" text-anchor="middle" font-size="9" font-weight="700" ` +
-      `fill="currentColor">${letter}</text>` +
-      `</svg>`,
-  };
+  if (letter === "?") return neutralView("Agent CLI not identified", size);
+
+  return { program, kind: "letter", label, svg: badgeSvg(letter, size) };
+}
+
+/** Everything the resolver is allowed to know about a pane. An object rather than
+ *  positional arguments because the two new fields are the interesting ones and a
+ *  `agentMark(cmd, argv, cli, true)` call site would hide which is which. */
+export interface AgentMarkInput {
+  /** The pane's launch command string, if it has one. */
+  command?: string | null;
+  /** The pane's launch argv, if it has one. */
+  argv?: string[] | null;
+  /**
+   * The CLI loomux ALREADY KNOWS this pane runs, from somewhere better than the launch
+   * line — today an SSH profile's `defaultCli` (`src/sshprofile.ts`), which is the name
+   * `sshLaunchParams` actually composed the remote command from.
+   *
+   * **Authoritative: it beats anything inferable from `command`/`argv`.** For an SSH pane
+   * the launch line describes the TRANSPORT and this describes the AGENT, so preferring
+   * the launch line would be preferring the answer we know to be about something else.
+   */
+  knownCli?: string | null;
+  /**
+   * True when the launch line is a transport rather than the agent — an #887 SSH pane.
+   *
+   * Separate from `knownCli` because the two absences mean different things: no `knownCli`
+   * on a local pane means "read the launch line", and no `knownCli` on a REMOTE pane means
+   * "the answer is on the far end and loomux does not have it" — which must not fall
+   * through to reading the transport's own name.
+   */
+  remote?: boolean;
 }
 
 /**
- * The pane's question: what mark does this launch line deserve?
+ * The pane's question: what mark does this pane deserve?
  *
- * `null` means DRAW NOTHING — a pane with no command is a shell, not an agent, and a row of
- * `?` badges over every plain terminal would be noise dressed as information. Everything
- * else gets a view, including a program loomux has never heard of.
+ * Resolution order, and each step exists because the one below it would otherwise lie:
+ *
+ *   1. `knownCli` — the authoritative answer, when loomux holds one.
+ *   2. `remote` with no `knownCli` — the neutral badge. NOT the launch line: `argv[0]` of an
+ *      SSH pane is the local ssh client, and captioning a pane "Agent CLI: ssh" while it
+ *      runs Claude on the far end is precisely the confident-wrong-answer this module's
+ *      header claims it does not produce.
+ *   3. no launch line at all — `null`, DRAW NOTHING. A plain shell is not an agent, and a
+ *      row of `?` badges over every terminal is noise dressed as information.
+ *   4. otherwise the launch line, through `agentMarkFor` (which still refuses transports
+ *      and shells, so a hand-typed `ssh …` command pane lands neutral too).
  *
  * The program name comes from `programFromRestore`, deliberately rather than from a second
  * first-token parse here: that function is the one place that answers "what program does
@@ -207,11 +299,10 @@ export function agentMarkFor(program: string, size = ICON_AGENT_PX): AgentMarkVi
  * argv-only command. A private copy would be a fourth derivation, and it would be the one
  * that quietly disagrees on Windows.
  */
-export function agentMark(
-  command: string | null | undefined,
-  argv: string[] | null | undefined,
-  size = ICON_AGENT_PX
-): AgentMarkView | null {
-  const program = programFromRestore(command ?? null, argv ?? null);
+export function agentMark(input: AgentMarkInput, size = ICON_AGENT_PX): AgentMarkView | null {
+  const known = input.knownCli?.trim();
+  if (known) return agentMarkFor(normalizeAgentProgram(known), size);
+  if (input.remote) return neutralView(REMOTE_UNKNOWN_LABEL, size);
+  const program = programFromRestore(input.command ?? null, input.argv ?? null);
   return program ? agentMarkFor(program, size) : null;
 }

@@ -298,7 +298,10 @@ be rearranged in place:
   titles. Agents with a recognisable mark show it; everything else shows a
   lettered badge with the program's initial (`C` for Claude, `O` for opencode),
   and `?` if loomux couldn't make out what was launched. Hover it for the program
-  name. A plain shell pane has no agent, so it carries no mark at all.
+  name. A plain shell pane has no agent, so it carries no mark at all. An **SSH
+  pane** shows the CLI its saved connection runs on the far end — not `ssh`,
+  which is only the transport getting you there; if the connection doesn't name
+  a CLI, you get the neutral `?` rather than a guess.
 
 > **The icons are colour-coded, and the colour means something.** A mark's hue
 > says *which kind of thing* it is, not what state it's in: cyan for your

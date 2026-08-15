@@ -24,10 +24,12 @@ import {
   MARK_PROGRAMS,
   MARK_SOURCES,
   OCTICONS_PIN,
+  REMOTE_UNKNOWN_LABEL,
   agentLetter,
   agentMark,
   agentMarkFor,
 } from "../src/agenticons.ts";
+import { buildSshArgv } from "../src/sshcommand.ts";
 import { ROLE_TOKEN } from "../src/icons.ts";
 
 const read = (rel: string) => readFileSync(new URL(rel, import.meta.url), "utf8");
@@ -51,11 +53,68 @@ test("a pane with no launch command gets no mark at all", () => {
     [null, []],
   ] as const) {
     assert.equal(
-      agentMark(command, argv as string[] | null),
+      agentMark({ command, argv: argv as string[] | null }),
       null,
       `agentMark(${JSON.stringify(command)}, ${JSON.stringify(argv)}) drew something`
     );
   }
+  // A commandless pane stays blank even when it is remote-flagged with nothing known —
+  // `remote` is about where the agent RUNS, not a licence to invent one.
+  assert.equal(agentMark({ command: null, argv: null, remote: false }), null);
+});
+
+/** The real #887 launch line for an SSH pane, composed by the app's own argv builder
+ *  rather than hand-written here — a hand-written `["ssh", ...]` would pass this test while
+ *  the shipped composer changed underneath it. `remoteCommand` is what `sshLaunchParams`
+ *  builds from `profile.defaultCli`. */
+function sshPaneArgv(remoteCli: string | null): string[] {
+  return buildSshArgv("C:\\Windows\\System32\\OpenSSH\\ssh.exe", {
+    destination: "dev@box",
+    remoteShell: "posix",
+    remoteCwd: "/srv/app",
+    ...(remoteCli ? { remoteCommand: [remoteCli, "--session-id", "abc"] } : {}),
+  });
+}
+
+test("an SSH pane never wears the transport as its agent", () => {
+  // REVIEW B1. An #887 SSH pane's child process is the LOCAL ssh client, so `argv[0]` is
+  // `ssh` — and the agent, if there is one, runs on the far end where argv cannot see it.
+  // Reading argv[0] gave a confident, specific, WRONG answer: a violet `S` captioned
+  // "Agent CLI: ssh" on a pane that may well have been running Claude. That is exactly the
+  // failure this module's header claims it does not have ("a wrong mark is strictly worse
+  // than no mark, because a reader takes it as an answer"), so it is pinned here.
+  const argv = sshPaneArgv("claude");
+  assert.equal(argv[0], "C:\\Windows\\System32\\OpenSSH\\ssh.exe", "fixture drifted");
+
+  // 1. With the profile's far-end CLI in hand, the mark names the REAL agent.
+  const known = agentMark({ argv, knownCli: "claude", remote: true });
+  assert.ok(known);
+  assert.equal(known.program, "claude");
+  assert.equal(known.kind, "letter"); // Claude has no licensed mark — see §Licensing
+  assert.match(known.label, /claude/);
+  assert.doesNotMatch(known.label, /ssh/, "the transport leaked into the caption");
+
+  // 2. Without it, the pane goes NEUTRAL — never captioned as an agent, and never `S`.
+  for (const view of [
+    agentMark({ argv, remote: true }),
+    agentMark({ argv, knownCli: null, remote: true }),
+    agentMark({ argv, knownCli: "   ", remote: true }),
+    agentMark({ argv: sshPaneArgv(null), remote: true }), // a plain remote login shell
+  ]) {
+    assert.ok(view, "an SSH pane drew nothing at all");
+    assert.equal(view.kind, "unknown", `SSH pane resolved to ${view.kind}, not the neutral tier`);
+    assert.equal(view.program, null, "the neutral tier must not name a program");
+    assert.equal(view.label, REMOTE_UNKNOWN_LABEL);
+    assert.doesNotMatch(view.label, /Agent CLI:/, "a neutral badge must not caption a claim");
+    assert.ok(view.svg.includes(">?</text>"), "the neutral badge is `?`, never a letter");
+    assert.equal(view.svg.includes(">S</text>"), false, "the transport's initial is showing");
+  }
+
+  // 3. And the same refusal for a hand-typed `ssh …` command pane, which carries no
+  //    `remote` flag at all — the denylist catches it on the launch-line path too.
+  const typed = agentMark({ command: "ssh dev@box" });
+  assert.equal(typed?.kind, "unknown");
+  assert.doesNotMatch(typed!.label, /Agent CLI:/);
 });
 
 test("a CLI loomux has never heard of still gets a mark", () => {
@@ -69,7 +128,7 @@ test("a CLI loomux has never heard of still gets a mark", () => {
     ["codex exec", "C"],
     ["zed-agent", "Z"],
   ] as const) {
-    const view = agentMark(command, null);
+    const view = agentMark({ command });
     assert.ok(view, `${command} drew nothing`);
     assert.equal(view.kind, "letter", `${command} should fall back to a letter badge`);
     assert.ok(
@@ -85,13 +144,13 @@ test("copilot draws the vendored mark, and the other first-class CLIs draw lette
   // own glyph and Anthropic publishes none (see §Licensing in the module). If a future
   // commit hand-traces a lookalike into the table, the `letter` assertions below go red and
   // the licence question gets asked out loud instead of being decided by a paste.
-  const copilot = agentMark("copilot --autopilot", null);
+  const copilot = agentMark({ command: "copilot --autopilot" });
   assert.ok(copilot);
   assert.equal(copilot.kind, "mark");
   assert.equal(copilot.program, "copilot");
 
   for (const program of ["claude", "opencode"]) {
-    const view = agentMark(program, null);
+    const view = agentMark({ command: program });
     assert.ok(view);
     assert.equal(
       view.kind,
@@ -102,7 +161,7 @@ test("copilot draws the vendored mark, and the other first-class CLIs draw lette
 
   // And the two letter badges are distinguishable from each other, which is the entire
   // point of drawing anything.
-  assert.notEqual(agentMark("claude", null)!.svg, agentMark("opencode", null)!.svg);
+  assert.notEqual(agentMark({ command: "claude" })!.svg, agentMark({ command: "opencode" })!.svg);
 });
 
 test("the program name is read the same way the rest of the app reads it", () => {
@@ -119,12 +178,12 @@ test("the program name is read the same way the rest of the app reads it", () =>
     "/usr/local/bin/copilot",
   ];
   for (const command of forms) {
-    const view = agentMark(command, null);
+    const view = agentMark({ command });
     assert.ok(view, `${command} drew nothing`);
     assert.equal(view.kind, "mark", `${command} did not resolve to the copilot mark`);
   }
   // argv-only launches (a restored pane records argv, not a command string) resolve too.
-  const fromArgv = agentMark(null, ["copilot", "--autopilot"]);
+  const fromArgv = agentMark({ argv: ["copilot", "--autopilot"] });
   assert.equal(fromArgv?.kind, "mark");
 
   // THE INHERITED LIMIT, pinned rather than papered over. `programFromRestore` splits the
@@ -135,7 +194,7 @@ test("the program name is read the same way the rest of the app reads it", () =>
   // already mis-read the same line today. The mark degrades to a letter badge, which is
   // the right failure — a wrong glyph would be worse — and this assertion is here so a
   // future fix to that grammar shows up as a test to update rather than as a surprise.
-  const spaced = agentMark(`C:\\Program Files\\gh\\copilot.exe --banner`, null);
+  const spaced = agentMark({ command: `C:\\Program Files\\gh\\copilot.exe --banner` });
   assert.equal(spaced?.kind, "letter");
   assert.equal(spaced?.program, "program");
 });
@@ -161,8 +220,12 @@ test("the letter badge is a clamp, not an escape", () => {
     `&lt;b&gt;`,
     `a" onmouseover="alert(1)`,
   ]) {
-    const view = agentMark(hostile, null);
-    if (!view) continue;
+    // No `if (!view) continue` — a hostile command that resolved to nothing would make
+    // every assertion below vacuous and this test would still pass while checking
+    // NOTHING. Each of these launch lines does name a program, so each must produce a
+    // view, and that is asserted rather than assumed.
+    const view = agentMark({ command: hostile });
+    assert.ok(view, `${hostile} drew nothing — the assertions below would be vacuous`);
     const inner = body(view.svg);
     assert.equal(/<script|<foreignObject|javascript:/i.test(view.svg), false, hostile);
     assert.equal(/\son[a-z]+\s*=/i.test(view.svg), false, `${hostile} carries an event handler`);
@@ -276,6 +339,27 @@ test("the mark's own rule adds no colour — the role class is still the only dy
     false,
     ".pane-cli-icon paints a colour; the mark must take .ic-fleet's dye and nothing else"
   );
+});
+
+test("the label never reaches the markup — it is the accessible name, set as text", () => {
+  // REVIEW N2's other half. The mark is the only thing in the header that reports which
+  // CLI a pane runs, so it carries an accessible name (`role="img"` + `aria-label` on the
+  // wrapper) rather than being purely decorative like the app's other icons. That name is
+  // the label — the ONE value that still holds an unclamped program name — so it must be
+  // set as an ATTRIBUTE by pane.ts and never interpolated into an SVG string here. If it
+  // ever were, the clamp that makes this module injection-proof would be moot.
+  for (const hostile of [`<img src=x onerror=alert(1)>`, `" onload="alert(1)`, `</svg><script>`]) {
+    const view = agentMark({ command: hostile });
+    assert.ok(view);
+    assert.equal(
+      view.svg.includes(view.label),
+      false,
+      `${hostile}: the label was interpolated into the SVG`
+    );
+  }
+  const pane = read("../src/pane.ts");
+  assert.match(pane, /setAttribute\("aria-label", view\.label\)/, "no accessible name is set");
+  assert.match(pane, /setAttribute\("role", "img"\)/, "the labelled wrapper is not a role=img");
 });
 
 test("the pane header actually renders the mark", () => {

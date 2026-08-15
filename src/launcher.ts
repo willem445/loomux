@@ -176,8 +176,20 @@ export type WelcomeResult =
    *  profile, the minted session id — is what this form just did.
    *
    *  No `cwd`: the pane's LOCAL directory stays home (the repo is on the far end).
-   *  `profileId` is what the pane records — the connection, not its contents. */
-  | { kind: "ssh"; name: string; argv: string[]; profileId: string; sessionId?: string };
+   *  `profileId` is what the pane records — the connection, not its contents.
+   *
+   *  `defaultCli` is the profile's far-end CLI, carried alongside the argv because the
+   *  argv cannot express it: `argv[0]` is the local ssh client and the remote command is
+   *  one opaque quoted string after `--`. The pane's header mark needs the real agent, and
+   *  this is the only place on the launch path that still holds the profile (#992). */
+  | {
+      kind: "ssh";
+      name: string;
+      argv: string[];
+      profileId: string;
+      defaultCli: string | null;
+      sessionId?: string;
+    };
 
 const basename = (p: string): string => p.split(/[\\/]/).filter(Boolean).pop() ?? "";
 
@@ -1597,7 +1609,14 @@ export class WelcomeForm {
         return;
       }
       await this.persistSshProfile(plan.profile);
-      this.fire({ kind: "ssh", name: plan.name, argv, profileId: plan.profile.id, sessionId });
+      this.fire({
+        kind: "ssh",
+        name: plan.name,
+        argv,
+        profileId: plan.profile.id,
+        defaultCli: plan.profile.defaultCli,
+        sessionId,
+      });
       return;
     }
 

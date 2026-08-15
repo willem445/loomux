@@ -295,6 +295,24 @@ know" and is true. The prior art #992 cites coerced unidentified panes to a defa
 had to undo it: a wrong mark is strictly worse than no mark, because a reader takes it as an
 answer.
 
+**The launch line is not always evidence, which is where that principle nearly died.** An
+#887 SSH pane's child process is the local ssh client, so its `argv[0]` is `ssh` — and the
+agent, if any, runs on the far end where argv cannot reach it. Read naively, that produced a
+confident, specific, wrong caption ("Agent CLI: ssh") on panes that were running Claude:
+exactly the failure the paragraph above claims does not happen, arrived at through a route
+nobody had thought to check. Two rules came out of it, and both generalise past SSH:
+
+- **Prefer what loomux already knows over what it can infer.** The pane's SSH profile names
+  the far-end CLI (`defaultCli`), and that is the program the remote command was actually
+  composed from — an authoritative answer sitting one field away from a guessed one. It is
+  threaded to the pane by the callers that hold the profile, because resolving it later
+  costs an async store read the header cannot wait for.
+- **A caption is a claim, so the neutral tier must not carry one.** Where nothing
+  authoritative exists, the mark degrades to `?` labelled *"agent CLI unknown"* — never to
+  the transport's own initial, and never to an "Agent CLI:" caption. The denylist that
+  enforces this is a list of *transports and shells*, never an allowlist of agents: an
+  allowlist would quietly undo the total fallback above.
+
 **The generated tier is a clamp, not an escape.** Its one variable byte comes from a launch
 command — human-typed, or supplied by a workflow file — and the result is injected with
 `innerHTML` in a webview that can reach the IPC bridge. So the badge admits one character and

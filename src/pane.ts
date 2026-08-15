@@ -267,8 +267,16 @@ export interface PaneOptions {
    *  Its presence is what suppresses this pane's LOCAL-filesystem affordances,
    *  which is not cosmetic: an SSH pane's shell reports REMOTE paths over OSC 7,
    *  and pointing a local git watch (or a local folder picker's `cd`) at
-   *  `/srv/app` is meaningless at best. See `start()`. */
-  ssh?: { profileId: string };
+   *  `/srv/app` is meaningless at best. See `start()`.
+   *
+   *  `defaultCli` is the profile's far-end CLI (`SshProfile.defaultCli`) — the program
+   *  `sshLaunchParams` actually composed the remote command from, so it is the pane's
+   *  REAL agent while `argv[0]` is only the transport that carries it. Passed here by
+   *  the callers that already hold the profile, because the store read that resolves it
+   *  is async and the header mark is drawn synchronously. Optional and nullable: a
+   *  profile with no default CLI is a plain remote shell, and a caller that cannot cheaply
+   *  supply it degrades to the neutral badge rather than to a wrong one (#992 review B1). */
+  ssh?: { profileId: string; defaultCli?: string | null };
   /** Recorded resumable agent session id (#194): so a restored Agent pane can
    *  `--resume <id>` back into its prior context (resuming into an idle TUI
    *  costs nothing until a prompt is sent). Set by the launcher for
@@ -616,6 +624,10 @@ export class Pane implements VoiceTargetPane {
    *  fact every local-filesystem suppression below reads, so a ninth pane kind
    *  can't be added to one site and forgotten at another. */
   private sshProfileId: string | null = null;
+  /** The far-end CLI of this pane's SSH profile, when a caller supplied it — the pane's
+   *  real agent, which `spawnArgv` (the local ssh client) cannot report. Only the header
+   *  mark reads it (#992). */
+  private sshDefaultCli: string | null = null;
   /** Standalone pane's channel-scoped identity (#271 W3 addendum) — a carrier
    *  DELIBERATELY separate from orchGroup/orchAgent/orchRoleName (those gate
    *  the full orchestration chrome; a plain standalone pane must never show
@@ -1255,6 +1267,7 @@ export class Pane implements VoiceTargetPane {
     // pane onto a remote host.
     this.refuseSshOrchestration(opts);
     this.sshProfileId = opts.ssh?.profileId ?? null;
+    this.sshDefaultCli = opts.ssh?.defaultCli ?? null;
     this.setName(opts.name ?? "shell");
     this.launchedCommand = !!opts.command?.trim();
     // Retain the launch inputs for a later capture() into the persisted layout
@@ -1674,7 +1687,10 @@ export class Pane implements VoiceTargetPane {
     // pane's EXISTING ssh-ness, not just `opts`, since a promotion's options
     // describe the orchestrator it wants, not the pane it is rewriting.
     this.refuseSshOrchestration(opts);
-    if (opts.ssh) this.sshProfileId = opts.ssh.profileId;
+    if (opts.ssh) {
+      this.sshProfileId = opts.ssh.profileId;
+      this.sshDefaultCli = opts.ssh.defaultCli ?? null;
+    }
     // #887 S4: this pane is coming back to life, so any floating Reconnect card
     // is stale by definition — dropped here rather than at the (several) call
     // sites, so no future relaunch path can forget it and leave a card offering
@@ -2410,14 +2426,38 @@ export class Pane implements VoiceTargetPane {
    *  `innerHTML` is the same injection the header's other glyphs use; what makes it
    *  safe is on the other side (`src/agenticons.ts` §Safety) — the fallback badge
    *  clamps the program name to a single `[A-Z0-9]` character, so no part of a launch
-   *  command can be expressed as markup here. The tooltip is set as TEXT via `.title`
-   *  precisely because that clamp does not apply to it. */
+   *  command can be expressed as markup here. The label is set as TEXT (`.title`, and an
+   *  `aria-label` ATTRIBUTE) precisely because that clamp does not apply to it — it is the
+   *  one place a raw program name survives, so it must never reach markup.
+   *
+   *  `sshDefaultCli` is passed as the AUTHORITATIVE answer and `isSshPane` as the flag
+   *  meaning "the launch line is a transport": an SSH pane's `spawnArgv[0]` is the local
+   *  ssh client, not the agent, and reading it captioned panes "Agent CLI: ssh" while they
+   *  ran Claude on the far end (#992 review B1).
+   *
+   *  The wrapper carries `role="img"` + `aria-label` rather than leaving the name in a
+   *  `title` alone: this glyph is the only thing in the header that reports which CLI the
+   *  pane runs, so unlike the app's decorative icons it needs an accessible name. The
+   *  `<svg>` inside stays `aria-hidden` — it is the labelled element's artwork, and
+   *  announcing both would read the name twice. */
   private refreshAgentMark(): void {
-    const view = agentMark(this.spawnCommand, this.spawnArgv);
+    const view = agentMark({
+      command: this.spawnCommand,
+      argv: this.spawnArgv,
+      knownCli: this.sshDefaultCli,
+      remote: this.isSshPane,
+    });
     this.agentMarkEl.hidden = !view;
     this.agentMarkEl.innerHTML = view?.svg ?? "";
-    if (view) this.agentMarkEl.title = view.label;
-    else this.agentMarkEl.removeAttribute("title");
+    if (view) {
+      this.agentMarkEl.title = view.label;
+      this.agentMarkEl.setAttribute("role", "img");
+      this.agentMarkEl.setAttribute("aria-label", view.label);
+    } else {
+      this.agentMarkEl.removeAttribute("title");
+      this.agentMarkEl.removeAttribute("role");
+      this.agentMarkEl.removeAttribute("aria-label");
+    }
   }
 
   /** Mark this pane as part of an orchestration group: role chip before the
