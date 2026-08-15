@@ -5,10 +5,10 @@
 //!
 //! # The three layers, and why this is the third file
 //!
-//! - `mergeq.rs` (slice C) — the **pure core**. Which entries batch, which half
-//!   bisects next, whether the gate holds. No I/O at all.
-//! - `mqdriver.rs` (slice D1) — the **write primitives and their gates**. The
-//!   `MqRunner` seam, the live lookups, the constraint-7 refusal core, the
+//! - [`crate::mergeq`] (slice C) — the **pure core**. Which entries batch, which
+//!   half bisects next, whether the gate holds. No I/O at all.
+//! - [`crate::mqdriver`] (slice D1) — the **write primitives and their gates**.
+//!   The `MqRunner` seam, the live lookups, the constraint-7 refusal core, the
 //!   create-only scratch push, the landing function, cleanup.
 //! - this file (slices D2 and D3) — the **loop that sequences them**: build the
 //!   scratch, open the draft PR, observe the checks under a bound, bisect a red
@@ -16,13 +16,14 @@
 //!   persist every step — plus [`drive`], the one-step-per-call tick that
 //!   decides which of those happens next (§13, #698).
 //!
-//! The first two are in `crates/loomux-engine/src/` now (#888 batches 6 and
-//! 12a); this file reaches them through `orchestration/mod.rs`'s re-export and
-//! `orchestration/mqdriver.rs`'s, which is why its `super::` imports below read
-//! exactly as they did when all three sat in this directory. It is batch 12b.
+//! All three are in this crate now — `mergeq`/`mergeqview` arrived in #888
+//! batch 6, `mqdriver` in batch 12a, and this file is batch 12b, the last of
+//! them. Every import below is a `crate::` path because every edge it had was
+//! already on this side; nothing was lifted ahead of it.
 //!
-//! `mod.rs` gets registry wiring only — a module declaration, three fields, the
-//! two `merge_queue_reconcile*` methods and the `mq_drive_group_with` /
+//! `src-tauri`'s `orchestration/mod.rs` gets registry wiring only — the
+//! `pub use loomux_engine::{mqdriver, mqloop};` re-export, three fields, the two
+//! `merge_queue_reconcile*` methods and the `mq_drive_group_with` /
 //! `mq_driver_tick` pair, all of which resolve paths and delegate. No decision
 //! in this feature lives there.
 //!
@@ -50,19 +51,19 @@
 //! already has. Reversing to squash replay is still a rewrite of this one
 //! function **plus the landing verb**, exactly as §8 warns.
 
-use super::mergeq::{
+use crate::mergeq::{
     bisect_step, plan_batch, recheck_gate, scratch_branch, valid_id_component, BatchPlan,
     BatchRecord, BisectSearch, BisectStep, EntryState, GateSpec, InvalidTransition,
     MergeQueueState, PrObservation, QueueEntry, MAX_ENTRIES,
 };
-use super::mergeqview::MERGE_QUEUE_FILE;
-use super::mqdriver::{
+use crate::mergeqview::MERGE_QUEUE_FILE;
+use crate::mqdriver::{
     as_args, classify_checks, cleanup_scratch, land_batch, mint_scratch, pr_checks_argv,
     pr_ci_green, push_scratch, resolve_and_validate_target, resolve_and_validate_target_detailed,
     scratch_exists, BatchVerification, LandRefusal, MintError, MqRunner, REMOTE,
 };
-use super::notify::sanitize_gh_text;
-use super::workflow::{body_digest, BlockId, ReviewVerdict};
+use crate::notify::sanitize_gh_text;
+use crate::workflow::{body_digest, BlockId, ReviewVerdict};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -127,9 +128,9 @@ pub fn load_state(group_dir: &Path) -> Result<MergeQueueState, StateError> {
     Ok(state)
 }
 
-/// Write the queue state atomically, reusing `mod.rs`'s `atomic_write` — the
-/// #133-hardened writer (same-directory temp, `sync_all` before the rename, a
-/// fallback that keeps the temp on failure).
+/// Write the queue state atomically, reusing [`crate::fsatomic::atomic_write`]
+/// — the #133-hardened writer (same-directory temp, `sync_all` before the
+/// rename, a fallback that keeps the temp on failure).
 ///
 /// Deliberately not a fresh `fs::write` here: a disk-full `fs::write` is what
 /// truncated `tasks.json` and destroyed a live board in #133, and this file has
@@ -137,7 +138,7 @@ pub fn load_state(group_dir: &Path) -> Result<MergeQueueState, StateError> {
 /// not two.
 pub fn store_state(group_dir: &Path, state: &MergeQueueState) -> Result<(), String> {
     let bytes = serde_json::to_vec_pretty(state).map_err(|e| e.to_string())?;
-    super::atomic_write(&state_path(group_dir), &bytes).map_err(|e| e.to_string())
+    crate::fsatomic::atomic_write(&state_path(group_dir), &bytes).map_err(|e| e.to_string())
 }
 
 // ── batch construction (§8) — THE REVERSAL SEAM ─────────────────────────────
@@ -859,7 +860,7 @@ fn release_if_drained(state: &mut MergeQueueState) {
 ///   *which* PR bounced out of the campaign they are watching, and dropping it
 ///   the instant it goes terminal would leave the pane silently one row shorter.
 /// - **Not unbounded** — `mergeqview::project` renders the first
-///   [`VIEW_ENTRY_LIMIT`](super::mergeqview::VIEW_ENTRY_LIMIT) entries **in file
+///   [`VIEW_ENTRY_LIMIT`](crate::mergeqview::VIEW_ENTRY_LIMIT) entries **in file
 ///   order**, and corpses sit at the front. Enough of them and the live entries
 ///   are pushed out of the window: a pane showing a full page of cancelled work
 ///   and none of the queued work, which is the reported symptom made worse
@@ -1555,7 +1556,8 @@ pub const MAX_EXAMINED_PER_BUILD: usize = 8;
 ///
 /// Returned rather than emitted here for the same reason
 /// [`ReconcileReport::notices`] is: this module owns no registry, and a driver
-/// that reached for one would put the queue's decisions back inside `mod.rs`.
+/// that reached for one would put the queue's decisions back inside
+/// `src-tauri`'s `orchestration/mod.rs`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DriveAudit {
     /// One of §11.5's actions — always a constant from [`audit_action`] or
@@ -1682,7 +1684,7 @@ pub fn drive(
     // batch was. It audits every time and backs off, which is a durable, loud,
     // rate-bounded "a human has to look at this file".
     let live = state.entries.iter().any(|e| !e.state().is_terminal());
-    let unusable = if live && !super::mqdriver::landable(state.target.trim()) {
+    let unusable = if live && !crate::mqdriver::landable(state.target.trim()) {
         Some(("target", quote(&state.target)))
     } else {
         state
@@ -1871,7 +1873,7 @@ fn land(
             finish_batch(state);
             prune_terminal(state);
             rep.audit(
-                super::mqdriver::audit_action::LANDED,
+                crate::mqdriver::audit_action::LANDED,
                 json!({ "batch": batch.id, "target": landed.target,
                         "scratch_sha": landed.scratch_sha, "prs": batch.prs,
                         "transitions": moves_json(&moves) }),
@@ -1905,7 +1907,7 @@ fn land(
             // the first should slow the group down.
             rep.backoff = culprit.is_none();
             rep.audit(
-                super::mqdriver::audit_action::LAND_REFUSED,
+                crate::mqdriver::audit_action::LAND_REFUSED,
                 json!({ "batch": batch.id, "target": target, "why": why, "pr": culprit,
                         "transitions": moves_json(&moves) }),
             );
@@ -2063,7 +2065,7 @@ fn attribute(
     let posted = post_comment(r, &batch.id, culprit, &comment);
     if let Err(why) = &posted {
         rep.audit(
-            super::mqdriver::audit_action::CLEANUP_FAILED,
+            crate::mqdriver::audit_action::CLEANUP_FAILED,
             json!({ "batch": batch.id, "step": "culprit-comment", "pr": culprit,
                     "detail": quote(why) }),
         );
@@ -2269,8 +2271,8 @@ fn refresh_and_select(
                 // must not disagree about when the sub-PR's own CI matters, and
                 // because this runs once per examined entry inside a shared
                 // poll tick.
-                let ci_green = if super::mqdriver::declares_ci_green(gate) {
-                    match super::mqdriver::pr_ci_green_detailed(r, *pr) {
+                let ci_green = if crate::mqdriver::declares_ci_green(gate) {
+                    match crate::mqdriver::pr_ci_green_detailed(r, *pr) {
                         // Same reasoning as the target lookup, one call later: a
                         // seam that could not run is the world, and handling it
                         // here is why the bound holds whichever of the two
@@ -2281,7 +2283,7 @@ fn refresh_and_select(
                                 examined,
                                 truncated,
                                 *pr,
-                                &super::mqdriver::ResolveFailure::Runner(e),
+                                &crate::mqdriver::ResolveFailure::Runner(e),
                             )
                         }
                         Ok(v) => v,
@@ -2327,10 +2329,10 @@ fn stall(
     examined: usize,
     truncated: bool,
     pr: u64,
-    why: &super::mqdriver::ResolveFailure,
+    why: &crate::mqdriver::ResolveFailure,
 ) -> (Vec<u64>, usize, bool) {
     let detail = match why {
-        super::mqdriver::ResolveFailure::Runner(e) => quote(e),
+        crate::mqdriver::ResolveFailure::Runner(e) => quote(e),
         // Unreachable — `stall` is only called on a runner failure — and still
         // rendered rather than unwrapped, because an audit line that says
         // nothing is worse than one that says something unexpected.
@@ -2406,7 +2408,7 @@ fn construct(
                 true,
             );
             rep.audit(
-                super::mqdriver::audit_action::SCRATCH_COLLISION,
+                crate::mqdriver::audit_action::SCRATCH_COLLISION,
                 json!({ "prs": prs, "attempts": attempts }),
             );
             rep.notices.push(batch_aborted_notice(&prs, &why));
@@ -2435,7 +2437,7 @@ fn construct(
     if let Some(why) = build.cleanup_failed {
         // §10: cleanup failure never fails a batch. Audited, not acted on.
         rep.audit(
-            super::mqdriver::audit_action::CLEANUP_FAILED,
+            crate::mqdriver::audit_action::CLEANUP_FAILED,
             json!({ "batch": minted.batch_id, "step": "remove-worktree", "detail": quote(&why) }),
         );
     }
@@ -2484,14 +2486,14 @@ fn construct(
     if let Err(e) = push_scratch(r, &scratch.sha, &minted.branch) {
         let why = abort(state, rep, format!("the scratch push was rejected: {e}"), true);
         rep.audit(
-            super::mqdriver::audit_action::SCRATCH_COLLISION,
+            crate::mqdriver::audit_action::SCRATCH_COLLISION,
             json!({ "batch": minted.batch_id, "branch": minted.branch, "detail": quote(&e) }),
         );
         rep.notices.push(batch_aborted_notice(&prs, &why));
         return None;
     }
     rep.audit(
-        super::mqdriver::audit_action::BATCH_PUSHED,
+        crate::mqdriver::audit_action::BATCH_PUSHED,
         json!({ "batch": minted.batch_id, "branch": minted.branch, "sha": scratch.sha,
                 "target_head": scratch.target_head, "mint_attempts": minted.attempts }),
     );
@@ -2521,7 +2523,7 @@ fn construct(
             // than leaving a stray draft PR nobody knows about.
             for f in cleanup_scratch(r, cfg.group, &minted.batch_id, None) {
                 rep.audit(
-                    super::mqdriver::audit_action::CLEANUP_FAILED,
+                    crate::mqdriver::audit_action::CLEANUP_FAILED,
                     json!({ "batch": minted.batch_id, "step": f.step, "detail": quote(&f.why) }),
                 );
             }
@@ -2653,13 +2655,13 @@ fn moves_json(moves: &[Transition]) -> Value {
 fn teardown(r: &dyn MqRunner, group: &str, batch: &BatchRecord, rep: &mut DriveReport) {
     for f in cleanup_scratch(r, group, &batch.id, batch.draft_pr) {
         rep.audit(
-            super::mqdriver::audit_action::CLEANUP_FAILED,
+            crate::mqdriver::audit_action::CLEANUP_FAILED,
             json!({ "batch": batch.id, "step": f.step, "detail": quote(&f.why) }),
         );
     }
     if let Some(why) = cleanup_worktree(r, &batch.id) {
         rep.audit(
-            super::mqdriver::audit_action::CLEANUP_FAILED,
+            crate::mqdriver::audit_action::CLEANUP_FAILED,
             json!({ "batch": batch.id, "step": "remove-worktree", "detail": quote(&why) }),
         );
     }

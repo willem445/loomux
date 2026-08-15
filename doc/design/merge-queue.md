@@ -510,7 +510,8 @@ merge-commit noise lives only on an ephemeral integration branch that is deleted
 squash.
 
 **The reversal seam.** The choice is isolated in **one function**, `build_scratch`
-in `orchestration/mqloop.rs` (slice D2). It is *not* in `mergeq.rs`, as this note
+in `crates/loomux-engine/src/mqloop.rs` (slice D2; #888 batch 12b moved it out of
+`orchestration/`). It is *not* in `mergeq.rs`, as this note
 originally said: `mergeq.rs` is the no-I/O pure core, and building a scratch needs
 a runner, so the seam belongs in the driver layer. Corrected here because §8 is
 precisely the artifact a future reverser follows.

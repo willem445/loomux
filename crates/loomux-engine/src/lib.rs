@@ -199,15 +199,15 @@
 //! say which of the two it is has not drawn its own line.
 //!
 //! It is also where batch 5's inbound-edge rule meets real code rather than
-//! prose. `mqdriver` and `mqloop` do not merely name `mergeq` in doc comments:
-//! they import from it in their bodies (`use super::mergeq::{new_batch_id,
-//! scratch_branch, …}`, `use super::mergeqview::MERGE_QUEUE_FILE`) and call
+//! prose. `mqdriver` and `mqloop` did not merely name `mergeq` in doc comments:
+//! they imported from it in their bodies (`use super::mergeq::{new_batch_id,
+//! scratch_branch, …}`, `use super::mergeqview::MERGE_QUEUE_FILE`) and called
 //! `mergeq::recheck_gate`. Both stayed in `src-tauri` — for the edges they had
 //! at the time, which batch 9 re-measured and found were not host edges at all
 //! (see its entry below) — both spelled `super::` exactly as before, and both
-//! compiled against the re-export. (`mqdriver` crossed in batch 12a and `mqloop`
-//! is batch 12b; what the pair demonstrated here is unaffected by their having
-//! since moved.) Batch 5 established that prose is not an edge; the
+//! compiled against the re-export. (`mqdriver` crossed in batch 12a and
+//! `mqloop` in 12b; what the pair demonstrated here is unaffected by their
+//! having since moved.) Batch 5 established that prose is not an edge; the
 //! other half belongs beside it, because it is the half that misleads: **a
 //! body-level inbound edge is a genuine edge and still does not block a move.**
 //! Only outbound edges decide what a batch has to contain.
@@ -307,9 +307,13 @@
 //! `OrchRegistry::capture_with_timeout`, `mqdriver`'s `ProcessRunner`, and
 //! every `atomic_write` call site — resolving through curated item-list
 //! re-exports in `orchestration/mod.rs`, which is why the integration suite
-//! needed no edit. (`mqdriver` is [`mqdriver`] here as of batch 12a and calls
-//! [`subproc::capture_raw_with_timeout`] directly; `atomic_write`'s callers are
-//! unaffected.)
+//! needed no edit. (Both of those callers have since crossed: `mqdriver` is
+//! [`mqdriver`] here as of batch 12a and calls
+//! [`subproc::capture_raw_with_timeout`] directly, and `mqloop` — one of the
+//! `atomic_write` call sites — is [`mqloop`] here as of 12b and calls
+//! [`fsatomic::atomic_write`] directly. Every remaining `atomic_write` caller is
+//! in `src-tauri`'s `orchestration/mod.rs` and still reaches it through the
+//! `pub(super) use` there, unaffected.)
 //!
 //! A3 batch 10 — the DELIVERY QUEUE: [`queue`], the pure core of the per-pane
 //! FIFO (#445/#468/#467 — admission, coalescing, the flush plan, the
@@ -418,16 +422,64 @@
 //! `src-tauri` got, because the rule's second clause decides it: take the item
 //! list **when it buys a narrowing that is real** (#988). Unlike `queue`,
 //! `queuestate` and `intake`, this module had three `pub(super)` items —
-//! [`mqdriver::as_args`], [`mqdriver::landable`] and
-//! [`mqdriver::declares_ci_green`] — whose only caller, `mqloop`, is still in
-//! `src-tauri` until batch 12b. So `orchestration::mqdriver` is a curated
+//! `mqdriver::as_args`, `mqdriver::landable` and `mqdriver::declares_ci_green`
+//! — whose only caller, `mqloop`, was still in `src-tauri` until batch 12b. So
+//! `orchestration::mqdriver` was a curated
 //! re-export **module** (batch 7's `obs.rs` shape): the module path every call
-//! site spells is preserved, and the three keep their `pub(super)` reach under
-//! it. The items themselves widen here and no re-export can stop that, exactly
-//! as [`fsatomic::atomic_write`] did in batch 9. **The two shapes are not
-//! alternatives ordered by taste** — a `pub use` line answers "what spelling do
-//! callers use", a re-export module answers that *and* "what reach did each item
-//! have", and only the second question was live before this batch.
+//! site spells is preserved, and the three kept their `pub(super)` reach under
+//! it. The items themselves widened here and no re-export could stop that,
+//! exactly as [`fsatomic::atomic_write`] did in batch 9. **The two shapes are
+//! not alternatives ordered by taste** — a `pub use` line answers "what spelling
+//! do callers use", a re-export module answers that *and* "what reach did each
+//! item have", and only the second question was live before this batch. (Both
+//! halves of that finding expired one batch later; batch 12b's entry says how,
+//! and it is the reason this paragraph is in the past tense.)
+//!
+//! A3 batch 12b — [`mqloop`], the merge queue's **driver loop** (#581 slices D2
+//! and D3) and the last of A3's module moves: §8's batch construction and its
+//! temporary-worktree mechanism, the draft PR and its body builder, the bounded
+//! check observation, §9's bisect and culprit attribution, §4's crash reconcile,
+//! `merge_queue.json` persistence, and [`mqloop::drive`], the one-step-per-call
+//! tick the unified `gh` poll loop calls.
+//!
+//! Batch 9's rule was applied to it rather than assumed, which is the only
+//! reason this entry can be short: the outbound set was re-derived **from the
+//! source**, not from the prose above, and every edge was already across —
+//! [`mergeq`] and [`mergeqview`] (batch 6), [`mqdriver`] (12a), [`notify`]
+//! (batch 3), [`workflow`] (batch 5), [`fsatomic::atomic_write`] (batch 9).
+//! Nothing was lifted ahead of it and no dependency joins. Clean under batch 7's
+//! macro sweep (the file contains no macro invocation at all) and under batch
+//! 11's read-by-path sweep (nothing under `src-tauri/tests/` opens it as a
+//! file); batch 2's `GroupId` tripwire is unaffected, since both source roots it
+//! scans are unchanged and `mqloop` joins no group id onto a path — it is handed
+//! an already-resolved `group_dir: &Path` and takes `group: &str` only as audit
+//! and notice text.
+//!
+//! Its finding is what happens to 12a's finding. `mqloop` was the *only* caller
+//! of the three items that made `orchestration::mqdriver` a curated re-export
+//! module, so moving it here retired both: the three went back to `pub(crate)`
+//! — the faithful translation of their old `pub(super)`, since the scope that
+//! was "the `orchestration` module" is now "this crate" — and the curated file,
+//! left with nothing to narrow, collapsed into the plain
+//! `pub use loomux_engine::{mqdriver, mqloop};` batches 10 and 11 would have
+//! written. **A forced widening is a debt with a due date, and the batch that
+//! moves the last caller is when it comes due.** Nothing here is stylistic:
+//! while the items were `pub`, [`mqdriver::validate_target`]'s refspec-shape
+//! half was reachable from anywhere in `src-tauri` and batch 12a's header
+//! recorded that it could do nothing about it. It is not reachable now, and the
+//! compiler is what says so.
+//!
+//! `mqloop` itself force-widened nothing — it has no `pub(super)` or
+//! `pub(crate)` item, so its `pub` set is identical before and after, and its
+//! private members (`MAX_QUOTED`, `MAX_SIBLINGS_LISTED`, `worktree_dir_name`,
+//! `remove_worktree`, `build_in_worktree`, `same_object`,
+//! `rev_parse`, `quote`, `drained`, `release_if_drained`, `trim_terminal`,
+//! `RawPrState`, `draft_pr_open`, `strand`, `advance_in_flight`, `land`,
+//! `narrow_search`, `search_set`, `attribute`, `build_probe`, `start_batch`,
+//! `refresh_and_select`, `stall`, `construct`, `kick_back_one`, `mv`, `requeue`,
+//! `set_batch_tag`, `set_blocked`, `set_head`, `moves_json`, `teardown`,
+//! `body_file_path`, `with_body_file`, `open_draft_pr`, `post_comment`,
+//! `land_refusal_text`) stay private.
 
 pub mod fsatomic;
 pub mod groupid;
@@ -438,6 +490,7 @@ pub mod mergeq;
 pub mod mergeqview;
 pub mod model;
 pub mod mqdriver;
+pub mod mqloop;
 pub mod notify;
 pub mod obs;
 pub mod profiles;

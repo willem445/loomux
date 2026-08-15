@@ -391,13 +391,13 @@ from a unit test of product code, agents are banned from running cargo locally
     prose — a doc link, and references inside doc comments — and **prose is not
     an edge**. The check that decides the question is "does a `mergeq` path
     appear in a body?", not "how many times is it named"; the first draft of
-    this paragraph asserted a count and got it wrong. `mqdriver` is `workflow`'s
-    heaviest consumer and stays behind deliberately — it reaches
+    this paragraph asserted a count and got it wrong. `mqdriver` was `workflow`'s
+    heaviest consumer, and **batch 5 left it behind** deliberately — it reached
     `capture_raw_with_timeout`, glossed here at the time as "i.e. the pane host,
     which is slice A3" and retracted in the amendment below. That one
     is worth stating as a rule because it is the intuition that misleads:
-    **an inbound edge never blocks a move.** `mqdriver` still spells
-    `super::workflow::…` and never learned anything changed, because that is
+    **an inbound edge never blocks a move.** `mqdriver` went on spelling
+    `super::workflow::…` and never learned anything had changed, because that is
     what the re-export is. Only *outbound* edges decide what a batch contains.
 
     (Amended by batch 9: "`capture_raw_with_timeout`, i.e. the pane host" was
@@ -504,13 +504,14 @@ from a unit test of product code, agents are banned from running cargo locally
     It is also where the inbound-edge rule meets real code. Batch 5 established
     that **prose is not an edge**, having found only doc mentions of `mergeq` in
     `workflow`; the half that misleads is the other one, and this batch supplies
-    it. `mqdriver` and `mqloop` import from both moved modules in their *bodies*
-    (`use super::mergeq::{new_batch_id, scratch_branch, …}`,
+    it. `mqdriver` and `mqloop` imported from both moved modules in their
+    *bodies* (`use super::mergeq::{new_batch_id, scratch_branch, …}`,
     `use super::mergeqview::MERGE_QUEUE_FILE`, a `super::mergeq::recheck_gate`
-    call) and stay behind, for the edges they had at the time — batch 9
-    re-measured those and none of them is a host edge; see its entry below. Both
-    spell `super::` unchanged and compile against the re-export: **a body-level
-    inbound edge is a genuine edge and still does not block a move.** The same
+    call), and **batch 6 left both behind**, for the edges they had at the
+    time — batch 9 re-measured those and none of them was a host edge; see its
+    entry below. Both went on spelling `super::` unchanged and compiled against
+    the re-export: **a body-level inbound edge is a genuine edge and still does
+    not block a move.** The same
     goes for the `#[tauri::command]` `orch_merge_queue`, which stays and calls
     `mergeqview::merge_queue_view` through the same line.
 
@@ -748,27 +749,36 @@ from a unit test of product code, agents are banned from running cargo locally
     A consequence worth carrying into the next batch, stated as what it is (a
     grep over the source, not a compiler's verdict), and stated carefully
     because two earlier drafts of this paragraph got it wrong in opposite
-    directions: **`mqdriver.rs` and `mqloop.rs` keep their `super::` call sites
-    into the moved items — `super::capture_raw_with_timeout` (`mqdriver.rs:173`)
-    and `super::atomic_write` (`mqloop.rs:135`) — and those now resolve through
-    the re-export into the engine, with no source edit on either side.** That is
+    directions: **batch 9 left `mqdriver.rs` and `mqloop.rs` keeping their
+    `super::` call sites into the moved items — `super::capture_raw_with_timeout`
+    (`mqdriver.rs:173`) and `super::atomic_write` (`mqloop.rs:135`) — and those
+    resolved through the re-export into the engine, with no source edit on either
+    side.** That is
     what a completed move looks like from the caller's seat, not a remaining
-    problem: the call site is unchanged *because* the re-export is doing its job.
+    problem: the call site was unchanged *because* the re-export was doing its
+    job.
     The other modules they name were already across — `notify` since batch 3,
     `workflow` since batch 5, `mergeq`/`mergeqview` since batch 6. (`mqdriver`
     crossed in batch 12a and spells `crate::subproc::capture_raw_with_timeout`
-    now; `mqloop`'s `super::atomic_write` is untouched and is batch 12b's. The
-    sentence is left standing because what it is about — a caller not noticing —
-    is the thing worth keeping, and rewriting it to the present tense would
-    delete the evidence for it.)
+    now; `mqloop` crossed in batch 12b and spells `crate::fsatomic::atomic_write`
+    now. The sentence is left standing, in the past tense that describes what
+    batch 9 did, because what it is about — a caller not noticing — is the thing
+    worth keeping, and rewriting it to describe today's tree would delete the
+    evidence for it *and* go stale again at the next batch.)
 
-    What has NOT gone away, and is expected: `mqloop` reaches `super::mqdriver::`
-    throughout its body, and `mqdriver` is still in `src-tauri`, so those
-    resolve to `src-tauri`'s `mqdriver` and not to the engine. That is a
-    same-tier reference between two files at the same stage of the extraction,
-    not an unresolved dependency on the Tauri half — the pair moves together
-    (A3's later batches), which is what a chain looks like when neither end has
-    gone yet.
+    What had NOT gone away **as of batch 9**, and was expected: `mqloop` reached
+    `super::mqdriver::` throughout its body, and `mqdriver` was still in
+    `src-tauri`, so those resolved to `src-tauri`'s `mqdriver` and not to the
+    engine. That was a same-tier reference between two files at the same stage
+    of the extraction, not an unresolved dependency on the Tauri half — the pair
+    was expected to move in A3's later batches, which is what a chain looks like
+    while neither end has gone yet. (Both ends have gone now: `mqdriver` in
+    batch 12a, `mqloop` in 12b, and every one of those call sites is a
+    `crate::mqdriver::` path inside the engine. The paragraph is kept in the
+    past tense rather than deleted because the *distinction* it draws — a
+    same-tier reference is not a Tauri-half dependency — is what a future batch
+    facing a half-moved pair needs, and that outlives the pair it was written
+    about.)
 
     Both wrong drafts are worth keeping visible, because they are the two ways
     this particular sentence fails. The first said "everything resolves into the
@@ -967,9 +977,9 @@ from a unit test of product code, agents are banned from running cargo locally
     an inbound edge never blocks a move. What is genuinely still same-tier is
     `mqloop` → `mqdriver`, unchanged since batch 9 — two files at the same stage
     of the extraction, which move together in a later batch. (They did not, in
-    the end, move together: batch 12a took `mqdriver` alone and 12b takes
-    `mqloop`. Splitting them costs the re-export module batch 12a's entry argues
-    for, and buys two reviewable diffs instead of one across the two largest
+    the end, move together: batch 12a took `mqdriver` alone and 12b took
+    `mqloop`. Splitting them cost the re-export module batch 12a's entry argues
+    for, and bought two reviewable diffs instead of one across the two largest
     files in the feature.)
   - **Batch 11 — `intake`, the idle-tick intake gate's pure core**
     (#332/#429/#795/#864/#778): the host-side, zero-token diff of what changed
@@ -1119,19 +1129,22 @@ from a unit test of product code, agents are banned from running cargo locally
     could satisfy the first clause and had nothing for the second to do, which is
     why the rule has been quoted as if the first clause were all of it.
 
-    Here the clauses point different ways. Every consumer spells the module path
-    — `mqdriver::runner_for` and `mqdriver::audit_action::…` in `mod.rs`,
+    Here the clauses pointed different ways. Every consumer spelled the module
+    path — `mqdriver::runner_for` and `mqdriver::audit_action::…` in `mod.rs`,
     `super::mqdriver::landable` in `mqloop.rs`,
     `loomux_lib::orchestration::mqdriver::{…}` in both
     `src-tauri/tests/mergequeue.rs` and `tests/orchestration.rs` — so a flat item
-    list would preserve **no** call site and would rewrite two integration test
-    files to suit a re-export style, which is the forfeit batch 10 calls worse
-    than no ceremony at all. And yet, unlike `queue`, `queuestate` and `intake`,
-    this module **does** have `pub(super)` items: `as_args`, `landable` and
-    `declares_ci_green`, whose only caller is `mqloop` — still in `src-tauri`
-    until batch 12b, so no visibility narrower than `pub` reaches it.
+    list would have preserved **no** call site and would have rewritten two
+    integration test files to suit a re-export style, which is the forfeit batch
+    10 calls worse than no ceremony at all. And yet, unlike `queue`, `queuestate`
+    and `intake`, this module **did** have `pub(super)` items: `as_args`,
+    `landable` and `declares_ci_green`, whose only caller was `mqloop` — still in
+    `src-tauri` at the time, so no visibility narrower than `pub` reached it.
+    (Batch 12b moved it; everything from here to the end of this entry is a
+    record of a shape that no longer exists, and its expiry is stated at the
+    close.)
 
-    So `src-tauri/src/orchestration/mqdriver.rs` stays as a **curated re-export
+    So `src-tauri/src/orchestration/mqdriver.rs` stayed as a **curated re-export
     module**, batch 7's `obs.rs` shape: `pub use` for every item that was `pub`,
     and `pub(super) use` for the three that were `pub(super)` — which, in
     a module whose `super` is `orchestration`, is the reach those three had as
@@ -1142,11 +1155,11 @@ from a unit test of product code, agents are banned from running cargo locally
     question was live before this batch.
 
     Stated with batch 10's precision, because the loose version would be wrong in
-    both directions here. **The `orchestration::mqdriver::…` spelling reaches
-    exactly the set it reached before**, item for item and reach for reach.
-    **Three items did widen**, and no re-export can undo it:
-    `loomux_engine::mqdriver::{as_args, landable, declares_ci_green}` are that
-    crate's public API now, forced by the boundary exactly as
+    both directions here. **The `orchestration::mqdriver::…` spelling reached
+    exactly the set it had reached before**, item for item and reach for reach.
+    **Three items did widen**, and no re-export could undo it:
+    `loomux_engine::mqdriver::{as_args, landable, declares_ci_green}` became that
+    crate's public API, forced by the boundary exactly as
     `fsatomic::atomic_write` was in batch 9, and harmless on the standing terms
     (`publish = false`; "public" means reachable by a sibling crate in this
     workspace). What is *not* claimed is that nothing became reachable anywhere.
@@ -1166,14 +1179,17 @@ from a unit test of product code, agents are banned from running cargo locally
     first draft of this entry got that wrong in the direction that flatters the
     work.** It claimed a "publicly reachable half is an invitation to build the
     next guard on the wrong one", which reads as though the re-export module put
-    `landable` out of reach. It does not, and cannot: `src-tauri` depends on
-    `loomux-engine` directly and already spells `loomux_engine::…` in `gh.rs`,
+    `landable` out of reach. It did not, and could not: `src-tauri` depends on
+    `loomux-engine` directly and already spelled `loomux_engine::…` in `gh.rs`,
     `obs.rs` and `orchestration/mod.rs`, so `loomux_engine::mqdriver::landable`
-    compiles from any module in `src-tauri` and no shape of the re-export changes
+    compiled from any module in `src-tauri` and no shape of the re-export changed
     that — an item must be `pub` in the engine to be re-exported at all. The
-    honest account of the benefit is **legibility, not access control**: the
-    habitual `orchestration::mqdriver::…` path reaches only the whole check, and
-    someone reaching the half now has to type a cross-crate path that says so.
+    honest account of the benefit was **legibility, not access control**: the
+    habitual `orchestration::mqdriver::…` path reached only the whole check, and
+    someone reaching the half had to type a cross-crate path that said so.
+    (Batch 12b took the three back to `pub(crate)`, which is the access control
+    this paragraph correctly says a re-export could not buy — the gap named here
+    is closed, by the compiler rather than by a spelling.)
 
     That is worth carrying past this batch, because every batch from here on has
     the same sentence available to write. **A curated re-export answers "what can
@@ -1194,7 +1210,9 @@ from a unit test of product code, agents are banned from running cargo locally
     `crate::mqdriver::…`, the three narrow lines have no consumer left and the
     file should become the one `pub use loomux_engine::mqdriver;` that batches 10
     and 11 would have written. The shape is transitional on purpose, which is the
-    honest reading of a pair split across two batches.
+    honest reading of a pair split across two batches. (That is what batch 12b
+    did — and it went one step further than this paragraph predicted, by taking
+    the three items themselves back down to `pub(crate)`. See that entry.)
 
     ### Why the pair split at all
 
@@ -1206,9 +1224,9 @@ from a unit test of product code, agents are banned from running cargo locally
     the two files are the largest in the feature, `mqloop` carries the batch
     construction, the bisect and the persistence, and `orchestration/mod.rs` is
     the highest-conflict file in the repo. Two reviewable diffs beat one, and the
-    cost of splitting is precisely the re-export module above — which is a cost
-    this batch would have paid anyway, since `mqloop` is not the only consumer of
-    those three items' narrow reach so much as the only one that exists yet.
+    cost of splitting was precisely the re-export module above — which is a cost
+    this batch would have paid anyway, since `mqloop` was not the only consumer
+    of those three items' narrow reach so much as the only one that existed yet.
 
     ### What it owed in evidence
 
@@ -1229,16 +1247,146 @@ from a unit test of product code, agents are banned from running cargo locally
 
     ### Remaining same-tier edges
 
-    `mqloop` is the only one, and it is now an ordinary re-export edge rather than
-    a same-tier reference: `use super::mqdriver::{as_args, classify_checks, …}`
-    and the `super::mqdriver::landable` / `declares_ci_green` /
-    `pr_ci_green_detailed` / `ResolveFailure` / `audit_action::…` call sites all
-    resolve through `orchestration/mqdriver.rs` into the engine, with no source
-    edit in `mqloop.rs`. Its own outbound set for batch 12b is therefore
+    `mqloop` was the only one **as of this batch**, and 12a left it an ordinary
+    re-export edge rather than a same-tier reference: `use
+    super::mqdriver::{as_args, classify_checks, …}` and the
+    `super::mqdriver::landable` / `declares_ci_green` / `pr_ci_green_detailed` /
+    `ResolveFailure` / `audit_action::…` call sites all resolved through
+    `orchestration/mqdriver.rs` into the engine, with no source edit in
+    `mqloop.rs`. Its own outbound set for batch 12b was therefore predicted as
     `mqdriver` (across), `mergeq`/`mergeqview` (batch 6), `notify` (batch 3),
     `workflow` (batch 5) and `atomic_write` (batch 9) — all of them already on the
     engine side, so 12b should be import prefixes too. Re-derive it from the
-    source anyway; that is this batch's whole finding.
+    source anyway; that is this batch's whole finding. (12b did, and it held —
+    see that entry. Every `super::mqdriver::` spelling named above is a
+    `crate::mqdriver::` path inside the engine now, and the file this paragraph
+    says they resolve through no longer exists.)
+
+  - **Batch 12b — `mqloop`, the driver loop (#581 slices D2/D3). The tail of
+    A3's module moves.** §8's batch construction and its temporary-worktree
+    mechanism, the draft PR and its body builder, the bounded check observation,
+    §9's bisect and culprit attribution, §4's crash reconcile,
+    `merge_queue.json` persistence, and `drive` — the one-step-per-call tick the
+    unified `gh` poll loop calls (#698). Moves to
+    `crates/loomux-engine/src/mqloop.rs`.
+
+    The prediction above was taken as a hypothesis, not as a finding, which is
+    what batch 12a's own lesson demands: the outbound set was **re-derived from
+    the source** — a grep of every `super::`/`crate::` occurrence in the file,
+    resolved against the crate list — rather than read out of the paragraph that
+    predicted it. It came back identical: `mergeq`/`mergeqview` (batch 6),
+    `mqdriver` (12a), `notify` (batch 3), `workflow` (batch 5),
+    `fsatomic::atomic_write` (batch 9). All already across, nothing lifted ahead
+    of it, and the diff inside the moved file is import prefixes and nothing
+    else. **That the prediction held is not evidence the prediction was
+    trustworthy** — batch 12a's finding was about a prediction that had been
+    wrong for six batches while reading exactly as confidently as this one.
+
+    No dependency joins (`serde`, `serde_json`, `std`, declared since batch 3;
+    `Cargo.toml` and `Cargo.lock` are untouched). Batch 7's macro sweep is clean
+    in the strongest sense available — the file contains **no macro invocation at
+    all**, so there is nothing for `env!`/`include_str!`/`file!`/`module_path!`
+    to have hidden in. Batch 11's sweep is clean: nothing under
+    `src-tauri/tests/` opens `mqloop.rs` as a file. Batch 2's tripwire is nil —
+    `tests/groupid.rs` already walks both source roots, and `mqloop` never joins
+    a group id onto a path: it is handed an already-resolved `group_dir: &Path`
+    and takes `group: &str` only as audit and notice text.
+
+    ### The batch that pays batch 12a's debt
+
+    12a's re-export module existed for one reason and one caller. `mqloop` was
+    the only thing in `src-tauri` that reached `as_args`, `landable` or
+    `declares_ci_green` — verified for this batch by grepping the **entity**
+    across `src-tauri/src`, `src-tauri/tests` and `crates/`, not by trusting the
+    12a entry that says so: outside `mqdriver.rs` itself, every code reference
+    was in `mqloop.rs`, and `tests/mergequeue.rs` names `landable` in three
+    comments and calls it nowhere. So moving `mqloop` retired the whole
+    construction at once:
+
+    - the three items go back to **`pub(crate)`** in the engine, and
+    - `src-tauri/src/orchestration/mqdriver.rs` is deleted, replaced by the
+      single `pub use loomux_engine::{mqdriver, mqloop};` in `mod.rs` that
+      batches 10 and 11 would have written.
+
+    `pub(crate)` is the **faithful translation** of the old `pub(super)`, not a
+    new narrowing invented here: the scope those items had was "the
+    `orchestration` module", and the module's contents are now this crate. Batch
+    12a could not write it, because a `pub(super)` does not reach across a crate
+    boundary and its only caller was on the other side.
+
+    Why it was worth doing rather than leaving as harmless surplus `pub`: 12a's
+    entry above spends several paragraphs establishing, correctly, that **a
+    re-export narrows a spelling and never a reachability** — while `landable`
+    was `pub`, `loomux_engine::mqdriver::landable` compiled from anywhere in
+    `src-tauri` and no shape of the re-export could stop it. That mattered
+    because `landable` is only *half* of the constraint-7 refusal and
+    `validate_target` is the whole of it. 12a recorded the gap and could do
+    nothing about it. 12b closes it, and the compiler — not a header comment —
+    is what holds it closed now.
+
+    The rule to carry forward: **a forced widening is a debt with a due date.**
+    A batch that widens an item to `pub` because its last caller has not crossed
+    yet should name the batch that will move that caller, and the batch that
+    moves it owes the reversion in the same diff. Left undone, the widening
+    outlives its reason silently and the next reader has no way to tell a forced
+    `pub` from a chosen one — the same failure mode as the superseded edge-set
+    prose 12a caught, in the visibility table instead of the notes.
+
+    Note also what did **not** happen: `mqloop` has no `pub(super)` or
+    `pub(crate)` item of its own, so its own move force-widened **nothing** — its
+    `pub` set is identical before and after, and its private members — the ones
+    enumerated in `crates/loomux-engine/src/lib.rs`'s batch-12b entry — stay
+    private. The only visibility keywords this batch moved, moved down.
+
+    Deliberately no count here, and the omission is the point. A hand-maintained
+    tally of a set that grows is a claim with a built-in expiry: it is correct on
+    the day it is written and silently wrong the first time somebody adds a
+    private helper, with nothing in the diff to prompt the update — the same
+    shape as the superseded edge-set prose this batch's sibling caught, and the
+    drift #973 is about. The enumeration is the artifact; adding a member means
+    adding a name to it, which a reader can check against the file. A number is a
+    second, weaker copy of the same fact that no reader can check and no test
+    pins, so this note does not keep one.
+
+    ### The re-export shape, one batch later
+
+    12a's finding was that the two clauses of the shape rule ("follow what the
+    callers spell"; "take the item list when it buys a narrowing that is real")
+    could point in different directions. Here they point the same way again, and
+    it is worth saying *why* rather than just recording the plain module form:
+    every consumer of both modules spells the module path (`mqdriver::MqRunner`,
+    `mqloop::drive`, `mqloop::refusal::…` in `mod.rs`;
+    `loomux_lib::orchestration::{mqdriver,mqloop}::…` in
+    `src-tauri/tests/mergequeue.rs` and `tests/orchestration.rs`), so the first
+    clause points at the module form as always — and after the `pub(crate)`
+    reversion the second clause has nothing left to buy, because there is no item
+    whose reach a curated list could still narrow. The curated module was never a
+    style preference; it was an answer to a question that has stopped being live.
+
+    ### What it owed in evidence
+
+    A **pure relocation**, exemption taken whole: no behaviour added or changed,
+    so no new test, and the existing suite is the pin.
+    `src-tauri/tests/mergequeue.rs` drives the entire moved surface — the batch
+    plan and its worktree build, the bisect walk and culprit attribution, the
+    enqueue/cancel refusals, the reconcile paths, the `drive` tick — and
+    `tests/orchestration.rs` drives `refusal::is_loomux_fault` and the registry
+    wiring above it. **Both are untouched by this batch**, which is the proof the
+    re-export surface is complete rather than a claim about it: had any item or
+    spelling failed to survive the move, they would not compile. The file has no
+    inline `#[cfg(test)]` module, so no test changed crate.
+
+    ### Remaining same-tier edges
+
+    None for the merge queue: all four of its files (`mergeq`, `mergeqview`,
+    `mqdriver`, `mqloop`) are in the engine, and no module in `src-tauri`
+    reaches into another that is mid-move. `src-tauri/src/orchestration/` is now
+    `mod.rs`, `templates/`, and three modules that are not merge-queue work and
+    are not this batch's to place: `digest`, `humanq` (#946/#959 trust-boundary
+    code, whose relocation batch 3 already recorded as a decision of its own)
+    and `mcp`. What remains of A3 is the trait work its own header names —
+    `EventSink` + `PaneHost`, and `NullPaneHost` replacing the app-is-`None`
+    branch — followed by A4.
 - **A4 — the registry.** `OrchRegistry`, the decision layer, and a PTY
   output-sink seam, so the crate compiles with no `tauri` anywhere in its tree.
   A CI step proves that from `cargo tree` rather than from this paragraph. This

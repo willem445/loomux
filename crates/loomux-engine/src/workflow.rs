@@ -353,9 +353,9 @@ pub const MERGE_QUEUE_MAX_BATCH_DEFAULT: u32 = 3;
 /// of what a repo declares about the queue. Design note:
 /// `doc/design/merge-queue.md` §11.2; the queue's own core is [`crate::mergeq`]
 /// (here since #888 batch 6), its write primitives are [`crate::mqdriver`]
-/// (batch 12a), and the loop that sequences them — `mqloop` — is still
-/// `src-tauri`'s until batch 12b. None of that wiring reaches a pane host: this
-/// line used to say it did, and batch 9 re-measured it.
+/// (batch 12a), and the loop that sequences them is [`crate::mqloop`] (batch
+/// 12b). None of that wiring reaches a pane host: this line used to say it did,
+/// and batch 9 re-measured it.
 ///
 /// **Policy, not mechanism** (CLAUDE.md constraint 8). Nothing here names a
 /// branch, a toolchain, or a verification command: the queue *observes* the
