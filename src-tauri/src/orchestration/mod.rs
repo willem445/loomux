@@ -24131,26 +24131,44 @@ impl OrchRegistry {
                 Some(Some(p.to_string()))
             }
         };
-        // A link to your own container is always a mistake, whichever of the
-        // two fields the write happens to be setting — so it is checked on the
-        // POST-write values of all three, not just when `parent` moves. Only
-        // when this write touches one of them, though: a hand-edited board must
-        // not have its unrelated status edits refused (the read-tolerance rule).
-        if patch.parent.is_some() || deps.is_some() || related.is_some() {
-            let effective_parent = match parent.as_ref() {
-                Some(p) => p.as_deref(),
-                None => tasks[idx].parent.as_deref(),
-            };
-            if let Some(p) = effective_parent {
-                for (field, links) in [
-                    ("deps", deps.as_ref().unwrap_or(&tasks[idx].deps)),
-                    ("related", related.as_ref().unwrap_or(&tasks[idx].related)),
-                ] {
-                    if links.iter().any(|id| id.as_str() == p) {
-                        return Err(format!(
-                            "parent: {p} is this task's container — it cannot also be a {field} link"
-                        ));
-                    }
+        // A link to your own container is a mistake, and this refuses the write
+        // that MAKES one — scoped, deliberately, to the fields this call is
+        // actually setting (rev-611 NB2).
+        //
+        // The wider reading (check both link arrays whenever any of the three
+        // moves) refused writes that had not created the problem and named a
+        // field the caller never touched. It has a reachable trigger that is not
+        // a hand-edit: a row may legitimately dep on its GRANDparent, and
+        // `promote_orphans` turns that grandparent into its parent when the
+        // middle row is deleted. From then on the wider check refused even a
+        // `related`-only patch, citing `deps`.
+        //
+        // Promotion is deliberately NOT made to strip that link instead. A
+        // delete of one row would then change a DIFFERENT row's readiness while
+        // its actual blocker is still alive and unfinished — silently unblocking
+        // work, which is the failure direction #582 exists to prevent, and a far
+        // bigger claim than the overlap is worth. `strip_deleted_links` unblocks
+        // only by removing links to rows that are GONE. So the residual state
+        // (container also named in `deps`) is tolerated on read like every other
+        // hierarchy oddity, and only a write that re-asserts it is refused.
+        let effective_parent = match parent.as_ref() {
+            Some(p) => p.as_deref(),
+            None => tasks[idx].parent.as_deref(),
+        };
+        if let Some(p) = effective_parent {
+            // On a `parent` write, both arrays are in scope: the write is what
+            // moves the container under an existing link. On a link write, only
+            // the array being written is.
+            let writing_parent = patch.parent.is_some();
+            for (field, links) in [
+                ("deps", if writing_parent { Some(deps.as_ref().unwrap_or(&tasks[idx].deps)) } else { deps.as_ref() }),
+                ("related", if writing_parent { Some(related.as_ref().unwrap_or(&tasks[idx].related)) } else { related.as_ref() }),
+            ] {
+                let Some(links) = links else { continue };
+                if links.iter().any(|id| id.as_str() == p) {
+                    return Err(format!(
+                        "parent: {p} is this task's container — it cannot also be a {field} link"
+                    ));
                 }
             }
         }

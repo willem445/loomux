@@ -522,7 +522,13 @@ fn tool_defs(
                     "deps": { "type": "array", "items": { "type": "string" }, "description": "Task ids this task is BLOCKED ON, e.g. [\"t-3\",\"t-5\"]. Replaces the whole array; omit = untouched, [] = clear. Must name live tasks on this board; cycles are rejected." },
                     "related": { "type": "array", "items": { "type": "string" }, "description": "Non-blocking see-also task ids. Same replace/untouched/clear rule as deps; never affects readiness." },
                     "parent": { "type": "string", "description": "Task id this one sits INSIDE — its epic/feature/container. Omit = untouched, EMPTY STRING = clear (promote to top level), same rule as pr. Must name a live task on this board; a self-parent, a chain that would loop (reparenting under your own descendant), a chain deeper than 4 levels counting whatever this row already carries below it, and a parent that also appears in this row's deps/related are all rejected outright, with the error naming the path. Containment is NOT ordering: it does not affect `ready`, and a child of a blocked container is still startable — express ordering with `deps`." },
-                    "kind": { "type": "string", "enum": ["epic", "feature", "story", "task"], "description": "Advisory Agile level for this row. Omit = untouched, empty string = clear. ADVISORY: nothing enforces which level sits under which, so a story straight under an epic is fine, and a container is ordinary claimable work like any other row." },
+                    // `""` is in the enum on purpose (rev-611 NB1): it is the
+                    // CLEAR, the same rule `pr`/`parent` use, and a client that
+                    // enforces the enum could otherwise never reach the
+                    // affordance this very description documents. The backend
+                    // agrees — its trim-then-check carve-out treats `""` as the
+                    // clear rather than as an invalid kind.
+                    "kind": { "type": "string", "enum": ["epic", "feature", "story", "task", ""], "description": "Advisory Agile level for this row. Omit = untouched, EMPTY STRING = clear the label (which is why \"\" is in the enum). ADVISORY: nothing enforces which level sits under which, so a story straight under an epic is fine, and a container is ordinary claimable work like any other row." },
                     "claim": { "type": "boolean", "description": "Atomically claim this task (needs id): guarded on queued + unassigned-or-mine + all deps done, then sets assignee (defaults to you) and status:in-progress in one write. Don't pass a conflicting status with it." },
                 }),
                 &[]),
@@ -936,8 +942,17 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                     note: arg_str(args, "note").map(str::to_string),
                     deps: arg_str_array(args, "deps")?,
                     related: arg_str_array(args, "related")?,
-                    parent: arg_str(args, "parent").map(str::to_string),
-                    kind: arg_str(args, "kind").map(str::to_string),
+                    // STRICT on both, unlike the eight lax `arg_str` fields
+                    // above (rev-611 NB3). Not an inconsistency for its own
+                    // sake: those eight have live callers, so tightening them
+                    // is a behavior change that belongs in its own PR, while
+                    // these two are new here and have none — strictness costs
+                    // nothing and breaks nothing. And a silently-dropped
+                    // `parent` is the worse failure of the set: the caller is
+                    // told the write worked and believes it built a tree the
+                    // board does not have.
+                    parent: arg_str_strict(args, "parent")?.map(str::to_string),
+                    kind: arg_str_strict(args, "kind")?.map(str::to_string),
                     claim,
                 },
             )?;
