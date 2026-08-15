@@ -725,8 +725,8 @@ impl Delivery {
 /// section (above) argues for `default_model`/`sanitize_model_opt`. State the
 /// reachability precisely rather than reach for "unchanged": `mod.rs`'s
 /// `pub(crate) use` narrows only the FLAT spelling
-/// (`orchestration::DEFAULT_IDLE_TICK_MINUTES`, the one `mod.rs`/`intake.rs`
-/// actually call) back to "this crate". It does NOT narrow the item overall —
+/// (`orchestration::DEFAULT_IDLE_TICK_MINUTES`, the one `mod.rs` actually
+/// calls) back to "this crate". It does NOT narrow the item overall —
 /// `mod.rs` already re-exports the whole `model` module publicly (`pub use
 /// loomux_engine::model::{self, …}`), so this const is also reachable as
 /// `orchestration::model::DEFAULT_IDLE_TICK_MINUTES`, and since that path
@@ -745,11 +745,17 @@ pub const DEFAULT_IDLE_TICK_MINUTES: u32 = 5;
 /// quiet-window default) rather than inventing a new cadence: the poller
 /// need not run more often than the tick it feeds ever fires anyway.
 ///
-/// Same forced-and-not-narrowed shape as [`DEFAULT_IDLE_TICK_MINUTES`] above:
-/// `mod.rs`'s `pub(crate) use` narrows only the flat
-/// `orchestration::DEFAULT_INTAKE_POLL_MINUTES` spelling `intake.rs` reaches
-/// it through (`super::DEFAULT_INTAKE_POLL_MINUTES`); the module-qualified
-/// path is publicly reachable, for the same forced-and-harmless reason.
+/// Unlike [`DEFAULT_IDLE_TICK_MINUTES`] above, this one has **no flat
+/// `orchestration::` re-export left**, and the reason is worth stating rather
+/// than leaving as an asymmetry the next reader has to re-derive: batch 8 added
+/// one because `intake.rs` was the sole caller and was still in `src-tauri`.
+/// Batch 11 moved [`crate::intake`] into this crate, so its call is
+/// `crate::model::DEFAULT_INTAKE_POLL_MINUTES` and nothing in `src-tauri`
+/// spells the const in code at all. The re-export list in
+/// `orchestration/mod.rs` is meant to be readable as the live list, so a line
+/// with no consumer left comes off it. The item stays `pub` here — forced, and
+/// reachable as `orchestration::model::DEFAULT_INTAKE_POLL_MINUTES` through
+/// that file's module re-export, on the same harmless terms.
 pub const DEFAULT_INTAKE_POLL_MINUTES: u32 = DEFAULT_IDLE_TICK_MINUTES;
 
 #[cfg(test)]

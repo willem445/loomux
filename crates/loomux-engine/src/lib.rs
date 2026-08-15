@@ -345,9 +345,44 @@
 //! [`obs::LockExt`] (`queuestate`), all declared here since batch 3. Both files
 //! are clean under batch 7's macro sweep — no `env!`, `option_env!`, `file!`,
 //! `module_path!` or `include_str!` anywhere in either.
+//!
+//! A3 batch 11 — [`intake`], the pure core of the idle-tick intake gate
+//! (#332/#429/#795/#864/#778): the host-side, zero-token diff of what changed
+//! on GitHub since the last poll (label deltas, PR check transitions, PR
+//! comment/review activity, and the full-autonomy eligible-unstarted set), the
+//! bounded wake summary it composes, the poll-scheduling policy, and the pure
+//! decision of whether an idle tick that has cleared its quiet window should
+//! actually wake the orchestrator.
+//!
+//! Every outbound edge was already across, so the batch is one import prefix
+//! deep: [`notify`] (batch 3) for the check-state vocabulary and the #189
+//! `gh`-text sanitizer, [`model::DEFAULT_INTAKE_POLL_MINUTES`] (batch 8) for the
+//! smart default, and [`groupid::GroupId`] (batch 2) for the due-poll selection.
+//! No dependency joins — `serde`, `serde_json` and `std`, all declared since
+//! batch 3 — and the file is clean under batch 7's macro sweep.
+//!
+//! Its finding is about a **source-scanning test**, which is batch 2's question
+//! asked of a file rather than of a type. `intake.rs` is one of only two files
+//! `src-tauri/tests/orchestration.rs` reads by literal path, to pin that the
+//! `createdAt`/`submittedAt` serde renames survive (a rename degrades the #864
+//! comment signal to permanent silence with every other test still green). A
+//! verbatim move breaks that read outright — a loud failure, unlike batch 2's
+//! silent one — so the batch does not claim zero test edits: it repoints the
+//! path at `crates/loomux-engine/src`, exactly as `tests/groupid.rs` already
+//! spells its second root. **A file a test names by path is an edge that no
+//! grep for `super::` or `use` will find**, and it belongs in batch 7's macro
+//! sweep as a sibling: sweep a moving file for who reads it *as a file*.
+//!
+//! It also removes a re-export rather than adding one. Batch 8 lifted
+//! [`model::DEFAULT_INTAKE_POLL_MINUTES`] and gave it a flat
+//! `orchestration::` spelling for its one caller, `intake.rs`, which was still
+//! in `src-tauri`. That caller is here now, so the line has no consumer left and
+//! comes off the list — `orchestration/mod.rs`'s re-exports are meant to read as
+//! the live list, and a dead one makes the next reader re-derive it.
 
 pub mod fsatomic;
 pub mod groupid;
+pub mod intake;
 pub mod lessons;
 pub mod locks;
 pub mod mergeq;
