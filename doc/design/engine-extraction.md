@@ -730,13 +730,16 @@ from a unit test of product code, agents are banned from running cargo locally
     tree as it is.
 
     A consequence worth carrying into the next batch, stated as what it is (a
-    grep over the source, not a compiler's verdict), and stated narrowly because
-    the first draft of this paragraph overclaimed it: after this batch **neither
-    `mqdriver.rs` nor `mqloop.rs` has a remaining edge into the moved capture
-    cluster or `atomic_write`** — `super::capture_raw_with_timeout` and
-    `super::atomic_write` still resolve, now through the re-export, and every
-    other module they name (`mergeq`, `mergeqview`, `notify`, `workflow`) has
-    been in the engine since batch 6.
+    grep over the source, not a compiler's verdict), and stated carefully
+    because two earlier drafts of this paragraph got it wrong in opposite
+    directions: **`mqdriver.rs` and `mqloop.rs` keep their `super::` call sites
+    into the moved items — `super::capture_raw_with_timeout` (`mqdriver.rs:173`)
+    and `super::atomic_write` (`mqloop.rs:135`) — and those now resolve through
+    the re-export into the engine, with no source edit on either side.** That is
+    what a completed move looks like from the caller's seat, not a remaining
+    problem: the call site is unchanged *because* the re-export is doing its job.
+    The other modules they name were already across — `notify` since batch 3,
+    `workflow` since batch 5, `mergeq`/`mergeqview` since batch 6.
 
     What has NOT gone away, and is expected: `mqloop` reaches `super::mqdriver::`
     throughout its body, and `mqdriver` is still in `src-tauri`, so those
@@ -744,8 +747,16 @@ from a unit test of product code, agents are banned from running cargo locally
     same-tier reference between two files at the same stage of the extraction,
     not an unresolved dependency on the Tauri half — the pair moves together
     (A3's later batches), which is what a chain looks like when neither end has
-    gone yet. "No edge into the moved cluster" is the claim; "everything
-    resolves into the engine" is not, and was false when it was written.
+    gone yet.
+
+    Both wrong drafts are worth keeping visible, because they are the two ways
+    this particular sentence fails. The first said "everything resolves into the
+    engine", which ignored the `super::mqdriver::` references entirely. The
+    second said "no remaining edge into the moved capture cluster", which is
+    refuted by the two call sites named above — and by its own next clause,
+    which listed them. **A sentence whose following clause contradicts it is not
+    a wording problem**; it means the claim was written to sound narrow rather
+    than derived from what the grep returned.
 
     ### Edges and visibility
 
