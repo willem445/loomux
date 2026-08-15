@@ -266,8 +266,18 @@ pub(super) use loomux_engine::fsatomic::atomic_write;
 // `FLUSH_ITEM_OVERHEAD`, `QueueDirty::write_needed`, and both maps' `inner`
 // fields) stay private in the engine. `pub mod queue` already sat under
 // `pub mod orchestration`, so `loomux_lib::orchestration::queue::…` reached
-// exactly this set before the move and reaches exactly it after — the
-// reachability is unchanged, not merely "no existing spelling widened".
+// exactly this set before the move and reaches exactly it after.
+//
+// Stated precisely, because "unchanged" is the word model.rs:61-73 exists to
+// correct and it would be wrong here too if left bare: NO ITEM WIDENED — not
+// one visibility keyword in either file differs from what it was — and the
+// `orchestration::` spelling reaches the identical set. What IS new is a second
+// spelling, `loomux_engine::queue::…`, and that is inherent to crossing the
+// boundary at all rather than a consequence of the re-export shape: an item
+// must be `pub` in the engine to be callable from here, and every batch since
+// batch 2 has added the same. Harmless on the same terms — `loomux-engine` is
+// `publish = false`, so "public" means reachable by a sibling crate in this
+// workspace, not a shipped API.
 pub use loomux_engine::{queue, queuestate};
 
 use serde::{Deserialize, Serialize};

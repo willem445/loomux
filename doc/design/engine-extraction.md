@@ -839,10 +839,24 @@ from a unit test of product code, agents are banned from running cargo locally
     `QueueDirty::write_needed`, and both maps' `inner` fields — stay private in
     the engine exactly as they were. And `pub mod queue` already sat under
     `pub mod orchestration`, so `loomux_lib::orchestration::queue::…` reached
-    precisely this set of items before the move and reaches precisely it after:
-    the reachability is **unchanged**, which is a stronger claim than the "no
-    existing spelling widened" the earlier batches could make, and it is true
-    here only because there was nothing to widen.
+    precisely this set of items before the move and reaches precisely it after.
+
+    That last sentence is deliberately scoped, because the unscoped version of
+    it is the error `model.rs`'s standing correction is about and this batch is
+    the one most tempted by it. The two claims worth separating: **no item
+    widened** — not one visibility keyword in either file differs from what it
+    was, which is the strong claim earlier batches could not make and is true
+    here only because there was nothing to widen — and **the `orchestration::`
+    spelling reaches the identical set**. What is *not* claimed is that nothing
+    became reachable anywhere: `loomux_engine::queue::…` is a new spelling, as
+    `loomux_engine::model::…` and every predecessor was, because an item must be
+    `pub` in the engine to cross the boundary at all. That is inherent to the
+    move rather than to the re-export shape — a curated item list would not have
+    prevented it either — and it is harmless on the standing terms:
+    `loomux-engine` is `publish = false`, so "public" means reachable by a
+    sibling crate in this workspace, not a shipped API. **A batch that says
+    "reachability unchanged" without naming which spelling it means has
+    over-claimed**, and the item-list batches are not exempt from that either.
 
     The cost side is what settles it. Every consumer — `mod.rs` and
     `src-tauri/tests/orchestration.rs` alike — spells the MODULE path
