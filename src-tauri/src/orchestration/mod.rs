@@ -37,6 +37,7 @@ pub use loomux_engine::termgrid;
 // makes it survive leaving this crate at all.
 pub use loomux_engine::groupid::{self, GroupId, GroupIdError};
 pub use loomux_engine::pathseg::{PathSegment, SegmentError};
+pub use loomux_engine::rootreg::{RootError, RootRegistry};
 
 // #888 slice A2 batch 3. `lessons` and `notify` were leaves in everything but
 // one edge each — `lessons` reached back here for `tail_snippet`, `notify` for
@@ -10365,6 +10366,21 @@ pub struct SpawnRequest {
 pub struct OrchRegistry {
     /// Root of persistent state: `<root>/<group>/{group.json,state.json,audit.jsonl,configs/}`.
     root: PathBuf,
+    /// The process's declared-root registry (#1042 slice B).
+    ///
+    /// Owned here rather than injected because this registry is one of its two
+    /// populators — a group's checkout is declared as the group is created or
+    /// resumed, and an agent's worktree as it is cut — and a populator wired by
+    /// a `set_*` call is a populator that can be forgotten. Constructing it in
+    /// [`OrchRegistry::new`] means there is no `Option` to be `None` in a
+    /// shipped build and every integration test that builds a registry has a
+    /// live one. `lib.rs` `manage`s the same `Arc` (via [`OrchRegistry::roots`])
+    /// so `#[tauri::command]`s reach it as `State<Arc<RootRegistry>>`; slice C's
+    /// boundary `resolve` calls read this same instance.
+    ///
+    /// Not `Mutex`-wrapped: `RootRegistry`'s own interior `RwLock` is the
+    /// synchronization, and `&self` is all its methods need.
+    roots: Arc<RootRegistry>,
     /// Absent in unit tests: spawning then skips the pane round-trip.
     app: Mutex<Option<AppHandle>>,
     groups: Mutex<HashMap<GroupId, GroupInfo>>,
@@ -23262,6 +23278,7 @@ impl OrchRegistry {
         let _ = fs::create_dir_all(&root);
         Self {
             root,
+            roots: Arc::new(RootRegistry::new()),
             app: Mutex::new(None),
             groups: Mutex::new(HashMap::new()),
             agents: Mutex::new(HashMap::new()),
@@ -23688,6 +23705,13 @@ impl OrchRegistry {
 
     pub fn set_app(&self, app: AppHandle) {
         *self.app.lock_safe() = Some(app);
+    }
+
+    /// The process's declared-root registry (#1042). `lib.rs` `manage`s this
+    /// `Arc` so commands reach the same instance this registry populates; the
+    /// integration tests call it to assert what a group create declared.
+    pub fn roots(&self) -> Arc<RootRegistry> {
+        Arc::clone(&self.roots)
     }
 
     pub fn set_port(&self, port: u16) {
@@ -26576,6 +26600,19 @@ impl OrchRegistry {
             }
         }
         self.groups.lock_safe().insert(id.clone(), info.clone());
+        // #1042 slice B — engine-derived declaration, on BOTH the create and the
+        // resume path (this function is both), because a resumed group's panes
+        // browse the same checkout a fresh one's do. Best-effort: the group
+        // exists either way, and a checkout that has since been deleted or
+        // renamed is a root the later command should refuse, not a reason to
+        // fail the resume.
+        //
+        // On the create path `info.repo` originated as a caller argument, which
+        // is the laundering shape slice C closes by making the orchestration
+        // `repo` boundaries resolve before they reach here — see the note in
+        // `crate::rootreg`'s module docs. Inert until then: nothing enforces and
+        // no wire exists.
+        crate::rootreg::admit_derived(&self.roots, &info.repo);
         self.audit(&id, "loomux", if resumed { "group-resume" } else { "group-create" },
             json!({ "repo": repo, "max_agents": info.guardrails.max_agents,
                     "blocks": blocks_json(&info.guardrails.blocks) }));
@@ -38953,6 +38990,12 @@ impl OrchRegistry {
             // the caller's own thread, never the webview main thread, so it
             // wants the plain function rather than the `async` #726 wrapper.
             let wt = crate::git::git_worktree_add_sync(group.repo.clone(), branch_name.clone(), base.clone())?;
+            // #1042 slice B — engine-derived declaration. An agent worktree is
+            // a SIBLING of the checkout (`<repo>-worktrees/<name>`), never a
+            // descendant, so the group's own declaration does not cover it and
+            // the descendant rule cannot reach it. Without this the agent's own
+            // pane could not browse its own workspace once slice C enforces.
+            crate::rootreg::admit_derived(&self.roots, &wt);
             // #359: a reviewer's worktree is scratch space, not a checkout of
             // the PR it's reviewing — that branch may already be checked out
             // in the worker's own worktree, and git refuses the same branch

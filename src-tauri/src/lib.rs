@@ -18,6 +18,7 @@ pub mod opencodedb; // pub: the #722 usage-readback integration tests link its r
 pub mod orchestration; // pub: integration smoke test links through it
 pub mod pty; // pub: Job-Object integration test links `assign_kill_on_close_job`
 pub mod ptyout; // pub: the #712 output-coalescing integration test drives `pty_output_pump`
+pub mod rootreg; // pub: the #1042 declared-root integration tests link its admit helpers
 pub mod sessions; // pub: the #412 resume-hardening integration tests fixture its store-lookup test seams
 mod uistate; // durable UI state (project tabs, #63) — atomic tabs.json store
 pub mod usage; // pub: exercised by orchestration integration tests
@@ -49,6 +50,20 @@ pub fn run() {
     );
     let startup_notice = obs::StartupNotice(std::sync::Mutex::new(startup.notice()));
 
+    // #1042 slice B. The declared-root registry is process-wide state with
+    // exactly two populators: `admit_root` (the trusted webview) and the engine
+    // itself, as it creates or resumes a group and as it cuts a worktree. It is
+    // therefore CONSTRUCTED BY the orchestration registry — the engine-side
+    // populator — rather than here and handed over: there is no `set_roots` to
+    // forget, no `Option` to be `None` in a shipped build, and every
+    // `OrchRegistry` (including every integration test's) has a live one. The
+    // same `Arc` is `manage`d below so `#[tauri::command]`s reach it as
+    // `State<Arc<RootRegistry>>`.
+    let orch = Arc::new(orchestration::OrchRegistry::new(
+        orchestration::OrchRegistry::default_root(),
+    ));
+    let roots = orch.roots();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(startup_notice)
@@ -56,9 +71,8 @@ pub fn run() {
         .manage(voice::VoiceState::default())
         .manage(Arc::new(gitwatch::GitWatcher::new()))
         .manage(Arc::new(fileedit::SearchRegistry::default()))
-        .manage(Arc::new(orchestration::OrchRegistry::new(
-            orchestration::OrchRegistry::default_root(),
-        )))
+        .manage(roots)
+        .manage(orch)
         .setup(|app| {
             // Start streaming CPU/mem/GPU snapshots to the status bar.
             metrics::start(app.handle().clone());
@@ -235,6 +249,7 @@ pub fn run() {
             filemgr::fm_open_with,
             filemgr::fm_reveal,
             filehash::fm_hash_start,
+            rootreg::admit_root,
             obs::take_startup_notice,
             uistate::load_ui_tabs,
             uistate::save_ui_tabs,
