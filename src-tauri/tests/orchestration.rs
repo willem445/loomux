@@ -10463,6 +10463,11 @@ fn deleting_a_container_promotes_its_children_to_the_nearest_surviving_ancestor(
     // survivor must land on the NEAREST SURVIVING ancestor. This is the whole
     // reason the promotion walks the removed chain instead of reading one
     // pointer — reading one would leave t-4 pointing at the already-deleted t-2.
+    //
+    // A FRESH registry per scenario, not just a fresh `board_with`: the helper
+    // creates its group from the same repo path every time, so a second call on
+    // one registry lands on the same board and mints ids from t-5 up.
+    let (reg, _d2) = test_registry();
     let gid = board_with(&reg, &["epic", "feature", "story", "task"]);
     reg.upsert_task(&gid, "orch", Some("t-2"), parent_patch("t-1")).unwrap();
     reg.upsert_task(&gid, "orch", Some("t-3"), parent_patch("t-2")).unwrap();
@@ -10482,6 +10487,7 @@ fn deleting_a_container_promotes_its_children_to_the_nearest_surviving_ancestor(
     assert_eq!(reg.get_task(&gid, "t-4").unwrap().parent, None, "no surviving ancestor = top level");
 
     // --- delete-all-done, the likeliest way a container disappears.
+    let (reg, _d3) = test_registry();
     let gid = board_with(&reg, &["epic", "slice"]);
     reg.upsert_task(&gid, "orch", Some("t-2"), parent_patch("t-1")).unwrap();
     reg.upsert_task(&gid, "orch", Some("t-1"), patch(None, Some("done"), None)).unwrap();
