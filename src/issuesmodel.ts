@@ -53,9 +53,10 @@ export const DEFAULT_HOLD = "agent-hold";
  *  That config is a mistake either way, but rendering two identical buttons that
  *  fight each other is a worse way to find out than one button that holds. */
 export function toggleableLabels(hold: string): string[] {
-  const out = [AGENT_READY, AGENT_INVESTIGATE];
-  if (!out.includes(hold) && hold.trim() !== "") out.push(hold);
-  return out;
+  // SCRATCH ONLY (#778 B1 red-before-green): the pre-fix behaviour — the veto
+  // hardcoded, whatever the repo declared. Never merged.
+  void hold;
+  return [AGENT_READY, AGENT_INVESTIGATE, DEFAULT_HOLD];
 }
 
 /** Labels that mean "an orchestrator picks this up" — used to highlight rows

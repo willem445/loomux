@@ -90,13 +90,10 @@ const FIXED_LABELS: [&str; 3] = ["agent-ready", "agent-investigation", "agent-ma
 /// so its poller is watching `agent-hold`, and the UI must write what the poller
 /// watches. Failing closed (refusing every hold write) would take away the veto
 /// gesture over a typo elsewhere in the file.
-fn hold_label(repo: &str) -> String {
-    loomux_engine::workflow::load_workflow(repo)
-        .ok()
-        .flatten()
-        .map(|wf| wf.intake.hold)
-        .filter(|h| !h.trim().is_empty())
-        .unwrap_or_else(|| loomux_engine::workflow::builtin_intake_profile().hold)
+fn hold_label(_repo: &str) -> String {
+    // SCRATCH ONLY (#778 B1 red-before-green): the pre-fix behaviour — the const,
+    // never the repo's declaration. Never merged.
+    "agent-hold".to_string()
 }
 
 /// The full set of labels writable for `repo`: the three fixed signals plus this
@@ -110,12 +107,11 @@ fn hold_label(repo: &str) -> String {
 /// by the parser rather than coerced, so nothing shell-ish or `--flag`-shaped can
 /// reach an argv through this door. A repo that declares no `hold:` gets exactly
 /// the previous four-label set.
-fn allowed_labels(repo: &str) -> Vec<String> {
+fn allowed_labels(_repo: &str) -> Vec<String> {
+    // SCRATCH ONLY (#778 B1 red-before-green): the pre-fix behaviour — the veto
+    // hardcoded, whatever the repo declared. Never merged.
     let mut out: Vec<String> = FIXED_LABELS.iter().map(|s| s.to_string()).collect();
-    let hold = hold_label(repo);
-    if !out.contains(&hold) {
-        out.push(hold);
-    }
+    out.push("agent-hold".to_string());
     out
 }
 
