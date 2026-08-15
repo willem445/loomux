@@ -3,6 +3,7 @@ identifier = "gh-read"
 description = "Read-only GitHub CLI queries: auth status, issue/PR list and view, lifecycle activity."
 permissions = [
     "allow-gh-auth-status",
+    "allow-gh-label-vocabulary",
     "allow-gh-issue-list",
     "allow-gh-issue-view",
     "allow-gh-pr-list",

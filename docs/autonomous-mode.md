@@ -46,9 +46,10 @@ that violates them is *blocked*, regardless of what it's instructed to do:
 Other behaviors on this page are **policy the orchestrator is *instructed* to
 follow**, not a hard wall — they're delivered to it as prompt text, so they hold
 as long as the orchestrator obeys its instructions, not as a boundary loomux
-enforces. Each is flagged where it appears (the labeled-work-only intake, and the
-"adequately tested" bar the orchestrator applies before self-merging). Treat those
-as convention, the enforced items as guarantees.
+enforces. Each is flagged where it appears (the labeled-work-only intake, the
+`agent-hold` veto under [full autonomy](#full-autonomy-the-orchestrator-picks-the-work),
+and the "adequately tested" bar the orchestrator applies before self-merging).
+Treat those as convention, the enforced items as guarantees.
 
 ## Where the controls live
 
@@ -61,15 +62,17 @@ section alongside pause, end-orchestration, and the max-agents stepper:
   Unchecking it lets the orchestrator merge on its own while autonomous;
 - **Auto-release** — a checkbox letting the orchestrator publish releases/tags
   itself while autonomous;
+- **⚡ Full autonomy** — a checkbox (with a **Goal** field beside it) letting the
+  orchestrator pick its own work instead of waiting for labels, while autonomous;
 - **⚠ Dangerous mode** — a danger-styled toggle for supervised merges/releases
   while you're present (and *not* autonomous);
 - a **Budget** input (tokens) with a live spend meter that appears while
   autonomous.
 
-The controls grey out when they don't apply — auto-merge and auto-release are
-locked off with a tooltip while autonomous is off; dangerous mode is locked off
-with a tooltip while autonomous is on — so you're never offered a switch the
-backend would reject.
+The controls grey out when they don't apply — auto-merge, auto-release and full
+autonomy are locked off with a tooltip while autonomous is off; dangerous mode is
+locked off with a tooltip while autonomous is on — so you're never offered a
+switch the backend would reject.
 
 ## Autonomous mode
 
@@ -89,7 +92,9 @@ PRs) simply never runs. Autonomous mode adds the missing **tick source**.
   convention the orchestrator is *instructed* to follow, not a gate loomux enforces:
   the label funnel is your consent boundary as long as the orchestrator obeys it,
   but nothing structurally blocks an unlabeled issue the way the merge gate blocks a
-  merge. (Merging/publishing what it produces is still gated regardless.)
+  merge. (Merging/publishing what it produces is still gated regardless.) This is the
+  default; [full autonomy](#full-autonomy-the-orchestrator-picks-the-work) inverts it
+  for a group that opts in.
 - **The window is tunable.** The default idle-tick window is **5 minutes**
   (adjustable per group, down to a minute or two if you want to watch it fire
   sooner). The autonomy panel shows a live countdown to the next eligible tick, and
@@ -148,6 +153,115 @@ PRs) simply never runs. Autonomous mode adds the missing **tick source**.
 Autonomous mode is generic: loomux's own orchestration group is just another
 group, so turning it on for the repo loomux itself is developed in would idle-tick
 that orchestrator like any other.
+
+## Full autonomy: the orchestrator picks the work
+
+Autonomous mode keeps the **label funnel**: the orchestrator wakes itself, but it
+still starts only what you labeled `agent-ready` / `agent-investigation`. Full
+autonomy inverts that default for the group — on each idle tick the orchestrator
+selects the highest-value **eligible** open issue and starts it, until nothing
+eligible is left. It's a sub-mode of autonomous (the checkbox is locked off while
+autonomous is off, and turning autonomous off turns this off too).
+
+- **What "eligible" means.** Open, **not** labeled `agent-hold` (or your repo's
+  own hold spelling — see [the veto](#the-hold-label-is-your-veto)), and not
+  already tracked by a board task. Everything else is fair game — that's the
+  inversion.
+- **The goal.** The optional **Goal** field is one line describing what this run
+  is *for* ("harden any bugs, close out new issues identified as you work"). It
+  travels with the enable and is echoed into the orchestrator's kickoff config and
+  its toggle notice. **loomux never interprets it** — ranking candidates against
+  the goal, and stating a one-line rationale per pickup, is the orchestrator's
+  job, not policy in loomux. It's normalized to a single bounded line (whitespace
+  collapsed, 500 characters) because it's typed into a CLI pane. Edit it while the
+  mode is on and you **re-aim** the run: the orchestrator is re-notified and
+  re-triages.
+- **Set the goal, then enable.** There's no separate "save goal" action — the
+  enable is what carries it, exactly like the budget field.
+
+### The hold label is your veto
+
+`agent-hold` marks an issue **agents must not start**. In the issues view
+(`Alt+I`) it's a third toggle beside ready/investigate, rendered as a red **hold**
+chip; `gh issue edit <n> --add-label agent-hold` does the same thing. The label is
+created on demand with the description *"Held by the human — full-autonomy agents
+must not start this"*, so it reads correctly on GitHub for anyone who's never seen
+loomux.
+
+**If your repo renamed it** (`intake.labels.hold:` in `.loomux/workflow.yml`),
+`agent-hold` above is simply not your veto — substitute your own spelling
+throughout this page, including in the hand-typed `gh` command.
+
+The rule, rather than a list of places: **nothing in loomux names the veto by a
+built-in literal.** Every surface that mentions it — what the poller excludes,
+what the hold button writes, what the label allow-list permits and creates, what
+the orchestrator's contract, kickoff config and toggle notice say, and what the
+group panel's help and mode chip tell you to apply — reads one resolved value.
+`agent-hold` is what that resolution returns when your repo declares no `hold:`,
+which is why it is the name used everywhere in this documentation. A veto only
+some layers can see is not a veto, so the resolution is the mechanism rather
+than a set of places that has to be kept in sync.
+
+- **loomux's half is host-side and zero-token:** a held issue is excluded from the
+  eligible-work signal the intake poll produces, so the orchestrator is never even
+  woken about it. Matching is case-insensitive, and a repo that renamed the label
+  has *its* spelling honored — a veto that silently didn't match would be the one
+  failure this must not have.
+- **The rest is policy** *(not enforced)*: the orchestrator's instructions make the
+  label absolute — it may never remove it, argue with it, or start under it — but
+  nothing structurally blocks a start the way the merge gate blocks a merge. It may
+  *add* the label to issues it files itself.
+
+### Turning it on: triage, then veto
+
+Enabling doesn't hand over the backlog; it starts a conversation about the backlog.
+
+1. **You flip ⚡ Full autonomy** (optionally with a goal). The orchestrator gets a
+   notice stating the protocol and — deliberately — that nothing about merging,
+   releasing, review or budgets changed.
+2. **It posts one ranked triage plan** as a GitHub issue: every open issue, one row
+   each, with value / risk / effort / proposed order, and each row naming the veto
+   gesture.
+3. **You strike rows by labeling them `agent-hold`** (or your repo's own hold
+   spelling) — one click per row in the issues view. There's no separate veto
+   mechanism to learn, and nothing parses your edits to the plan; the label *is*
+   the strike.
+4. **You type "go" in the orchestrator's pane.** Until then the pre-existing
+   backlog doesn't start. If you never say go, it never starts — that's a correct
+   outcome, not a stall, and there's no timer that proceeds without you.
+5. **From then on it self-selects**, announcing each pickup with a one-line
+   rationale in its pane and on the board task. Issues filed *after* the enable
+   don't wait for another triage round: if one fits the goal, it's eligible when
+   it appears.
+
+Priority order for what it picks: your board order first, then a milestone or
+priority label, then `agent-ready`, then its own stated judgment against the goal.
+An eligible issue that doesn't fit the goal is **parked** at the bottom of the
+board with a note rather than started — it comes back at the next triage or when
+you re-aim the goal.
+
+### What full autonomy does NOT change
+
+This toggle widens what may be **started**, never what may be **shipped**:
+
+- the **merge gate** and **release gate** are untouched — a default-branch merge or
+  a release still needs auto-merge / auto-release / a per-item grant, and the shim
+  still enforces that regardless of this toggle;
+- **review discipline** is unchanged: every PR still goes through review and the
+  orchestrator's findings-disposition rules;
+- the **token budget** still meters and still money-stops — and because full
+  autonomy is the mode that *starts* work, a budget suspension force-clears it
+  along with autonomous mode (you'll see both notices);
+- the **agent cap** and spawn-rate limits are unchanged.
+
+Turning it off restores the opt-in funnel immediately (the orchestrator is
+notified, and finishes what's already in flight normally). The setting is durable
+across restarts, but only *with* autonomous mode: a full-autonomy marker found
+without a live autonomous one is cleared and audited on startup rather than
+resumed, so the inverted default can never come back on consent nobody renewed.
+Enables, re-aims and every disable — including the forced ones — land in
+`audit.jsonl` as `full-autonomy-on` / `full-autonomy-goal-set` / `full-autonomy-off`
+(with the goal, and with the reason for a forced clear).
 
 ## Cost guardrail: the token budget
 
@@ -326,6 +440,7 @@ row.
 | **Token budget** | no cap | autonomous | hard-stops autonomous-era spend, then suspends |
 | **Auto-merge** | off (approval required) | autonomous | orchestrator may self-merge default-branch PRs (instructed to require adequate testing) |
 | **Auto-release** | off | autonomous | orchestrator publishes releases/tags |
+| **Full autonomy** | off (label funnel) | autonomous | orchestrator self-selects any open issue except `agent-hold`ed ones — starting only, never shipping |
 | **Dangerous mode** | off | supervised (*not* autonomous) | manual merges/releases without per-item approval |
 | **Per-item grant** | — | any time | one merge (single-use, 30-min TTL) or one tag's whole release (90-min TTL) |
 

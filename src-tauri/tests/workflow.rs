@@ -17,6 +17,7 @@
 //! asserted; nothing is executed.
 
 use loomux_lib::orchestration::GroupId;
+use loomux_lib::orchestration::intake;
 use loomux_lib::orchestration::mcp::dispatch;
 use loomux_lib::orchestration::profiles::{self, ProfileMode};
 use loomux_lib::orchestration::workflow::{self, GateRequire};
@@ -24,6 +25,7 @@ use loomux_lib::orchestration::{
     block_contract_text, cli_caps, command_line_length_guard, Caller, Containment, ContractCarrier, Guardrails, Launch, OrchRegistry, Role, CLI_CAPS, EFFORT_LEVELS,
 };
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -4374,16 +4376,27 @@ const LIVE: [(&str, &str, &[&str]); 4] = [
     ("planner.md", loomux_lib::orchestration::PLANNER_TPL, &["{{BLOCK_NOTE}}"]),
 ];
 
-/// Render a template with the six variables `render_template` had before #222 —
-/// the whole var list, for a group with no workflow.
+/// Render a template with the plain per-group VALUE variables `render_template`
+/// substitutes — the six it had before #222, plus `HOLD_LABEL` (#778).
+///
+/// `HOLD_LABEL` belongs in this list and NOT in `LIVE`'s strip list, and the
+/// distinction is the one this whole file turns on. `LIVE`'s keys are
+/// *workflow-conditional prose*: they resolve to the empty string for a default
+/// group, so stripping them from the live template is what makes it comparable
+/// to a golden that never had them. `HOLD_LABEL` resolves to a real value for
+/// every group (`agent-hold` by default) exactly like `MAX_AGENTS` — stripping
+/// it would compare against a golden with a hole where the veto's name goes.
+/// So the golden carries the literal `{{HOLD_LABEL}}` and this renders it, which
+/// keeps the pin biting on the prose AROUND it.
 fn render_with_legacy_vars(tpl: &str, g: &loomux_lib::orchestration::GroupInfo) -> String {
-    let vars: [(&str, String); 6] = [
+    let vars: [(&str, String); 7] = [
         ("REPO", g.repo.clone()),
         ("GROUP_ID", g.id.to_string()),
         ("MAX_AGENTS", g.guardrails.max_agents.to_string()),
         ("WORKER_MODEL", g.guardrails.model_for(Role::Worker).to_string()),
         ("REVIEWER_MODEL", g.guardrails.model_for(Role::Reviewer).to_string()),
         ("PLANNER_MODEL", g.guardrails.model_for(Role::Planner).to_string()),
+        ("HOLD_LABEL", g.guardrails.intake.hold.clone()),
     ];
     let mut out = tpl.to_string();
     for (k, v) in vars {
@@ -6191,6 +6204,202 @@ fn builtin_intake_profile_matches_todays_github_label_vocabulary() {
     assert_eq!(p.investigate, "agent-investigation");
     assert_eq!(p.owned, "agent-managed");
     assert_eq!(p.prototype, "agent-prototype");
+    assert_eq!(p.hold, "agent-hold", "the full-autonomy veto label (#778) is part of the built-in vocabulary");
+}
+
+// ── the hold label: the full-autonomy veto's spelling (#778) ───────────────
+//
+// Additive to the #382 P1 schema and defaulted, so every existing file and
+// every existing group.json keeps working untouched — but it is the one label
+// whose spelling is a **consent boundary** (the host poller excludes
+// hold-labeled issues from full-autonomy eligibility), so a repo that renames
+// it must have ITS spelling honored rather than a hardcoded const's.
+
+#[test]
+fn the_hold_label_can_be_overridden_and_is_inherited_when_omitted() {
+    let yaml = "version: 1\nblocks:\n  - id: worker\n    kind: worker\n\
+                intake:\n  labels:\n    hold: do-not-touch\n";
+    let wf = workflow::parse_workflow(yaml).unwrap();
+    assert_eq!(wf.intake.hold, "do-not-touch", "a repo's own veto-label spelling must take effect");
+    assert_eq!(wf.intake.ready, workflow::builtin_intake_profile().ready, "the other labels still inherit");
+
+    let plain = workflow::parse_workflow("version: 1\nblocks:\n  - id: worker\n    kind: worker\nintake:\n  labels:\n    ready: build-me\n").unwrap();
+    assert_eq!(
+        plain.intake.hold,
+        workflow::builtin_intake_profile().hold,
+        "an omitted hold: inherits the built-in default, like every other label field"
+    );
+}
+
+#[test]
+fn an_unusable_hold_label_is_rejected_not_rewritten() {
+    // Same "reject, don't rewrite" rule the other label fields get — and it
+    // matters more here: a silently-rewritten veto label would match nothing
+    // in the repo, so every held issue would read as eligible.
+    let yaml = "version: 1\nblocks:\n  - id: worker\n    kind: worker\n\
+                intake:\n  labels:\n    hold: \"not a label\"\n";
+    let errs = workflow::parse_workflow(yaml).unwrap_err();
+    assert!(
+        errs.iter().any(|e| e.contains("intake.labels.hold")),
+        "the error must name the offending field: {errs:?}"
+    );
+}
+
+#[test]
+fn the_hold_label_round_trips_through_group_json() {
+    let (reg, dir) = test_registry();
+    let yaml = "version: 1\nblocks:\n  - id: worker\n    kind: worker\n\
+                intake:\n  labels:\n    hold: custom-hold\n";
+    let repo = Repo::new().workflow(yaml);
+    let g = reg.create_group(&repo.path(), rails()).unwrap();
+    assert_eq!(g.guardrails.intake.hold, "custom-hold");
+
+    let gj: Value = serde_json::from_str(
+        &fs::read_to_string(reg.state_root().join(g.id.as_str()).join("group.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(gj["guardrails"]["intake"]["labels"]["hold"], "custom-hold");
+
+    // A restart must resume on the same veto spelling — a poller that fell
+    // back to `agent-hold` here would ignore every hold the human applied.
+    let reg2 = relaunch_registry(dir.path());
+    reg2.set_port(45999); // fake port, as everywhere in these tests
+    let g2 = reg2.create_group(&repo.path(), rails()).unwrap();
+    assert_eq!(g2.id, g.id, "the restart resumes the same group");
+    assert_eq!(g2.guardrails.intake.hold, "custom-hold", "the veto spelling must survive a restart");
+}
+
+/// **The veto is only a veto if every surface that names it agrees (#778, rev
+/// round 1 B1).** The poller honoring `intake.labels.hold` while the contract
+/// and the UI hardcoded `agent-hold` was worse than not supporting the rename at
+/// all: the orchestrator's triage plan is built from its OWN sweep, and its only
+/// exclusion was a literal the repo no longer used — so a held issue landed in
+/// the plan, the human's "go" covered it, and a vetoed issue got started.
+///
+/// Three surfaces, one fixture repo that renamed the veto, asserted together
+/// because agreement is the property (any one of them alone still passes while
+/// the veto is broken):
+///
+/// 1. the **contract** the orchestrator reads names the repo's spelling, and
+///    does not mention the built-in anywhere;
+/// 2. the **poller** honors it (`eligible_deltas` via the resolved profile);
+/// 3. the **allow-list** permits writing it — the UI's one-click gesture.
+#[test]
+fn a_renamed_veto_reaches_the_contract_the_poller_and_the_allow_list_alike() {
+    let (reg, _d) = test_registry();
+    let repo = Repo::new().workflow(
+        "version: 1\nblocks:\n  - id: worker\n    kind: worker\n\
+         intake:\n  labels:\n    hold: do-not-touch\n",
+    );
+    let g = reg.create_group(&repo.path(), rails()).unwrap();
+    assert_eq!(g.guardrails.intake.hold, "do-not-touch", "fixture sanity");
+
+    // 1. The contract. `instructions_lf` reads the file the orchestrator is
+    //    actually pointed at, after substitution — not the template.
+    let contract = instructions_lf(&reg, &g.id, "orchestrator.md");
+    assert!(
+        contract.contains("do-not-touch"),
+        "the orchestrator contract must name THIS repo's veto: under full autonomy the contract \
+         is the consent boundary, and an exclusion it cannot name is one it will not apply"
+    );
+    assert!(
+        !contract.contains("agent-hold"),
+        "and it must not also name the built-in: two spellings in one contract is worse than \
+         one wrong spelling — the agent gets to choose which veto to believe"
+    );
+    assert!(!contract.contains("{{HOLD_LABEL}}"), "the placeholder must be substituted, not shipped");
+
+    // 2. The poller. An issue carrying the repo's veto is not eligible; one
+    //    carrying the BUILT-IN spelling is, because here that label means
+    //    nothing.
+    let raw_issue = |number: u64, title: &str, labels: &[&str]| intake::RawIssue {
+        number,
+        title: title.to_string(),
+        labels: labels.iter().map(|s| s.to_string()).collect(),
+    };
+    let mut seen = HashSet::new();
+    let issues = vec![
+        raw_issue(1, "held by the human", &["do-not-touch"]),
+        raw_issue(2, "not actually held", &["agent-hold"]),
+        raw_issue(3, "plain", &[]),
+    ];
+    let eligible = intake::eligible_deltas(
+        &mut seen,
+        true,
+        Some(intake::OpenIssueList { issues: &issues, complete: true }),
+        &g.guardrails.intake.hold,
+        &HashSet::new(),
+    );
+    let mut got: Vec<u64> = eligible.iter().map(|s| s.number).collect();
+    got.sort_unstable();
+    assert_eq!(got, vec![2, 3], "the repo's own spelling is the veto the poller honors");
+
+    // 1b. The kickoff clause, which is the OTHER half of the contract: a fresh
+    //     boot or resume has no toggle notice to have seen, so this clause is
+    //     where it learns the veto's name. Same hardcode, same consequence.
+    reg.set_autonomous(&g.id, true).unwrap();
+    reg.set_full_autonomy(&g.id, true, "harden any bugs").unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let entry = reg.agent(&orch.id).unwrap();
+    let info = reg.group(&g.id).unwrap();
+    let kickoff = reg.kickoff_prompt(&entry, &info, "", None);
+    assert!(
+        kickoff.contains("do-not-touch is the absolute human veto"),
+        "the kickoff clause must name THIS repo's veto: {kickoff}"
+    );
+    assert!(
+        !kickoff.contains("agent-hold"),
+        "and must not also name the built-in: {kickoff}"
+    );
+
+    // 1c. The group panel, via `orch_autonomy` (rev round 2). Its full-autonomy
+    //     help and mode chip both INSTRUCT — "label X to hold it back" — so a
+    //     panel naming the built-in tells the human of this repo to apply a
+    //     label its own poller ignores. The panel has no workflow parser; it
+    //     renders what this field says.
+    let state = reg.autonomy_state(&g.id);
+    assert_eq!(
+        state["hold_label"].as_str(),
+        Some("do-not-touch"),
+        "orch_autonomy must report THIS group's veto spelling, or the panel instructs the human \
+         to apply a label that holds nothing: {state}"
+    );
+
+    // 3. The seam the write side stands on. `gh.rs` has no group — the issues
+    //    view is repo-scoped — so it resolves the spelling from the repo's own
+    //    workflow file via `load_workflow`, and its allow-list is only correct
+    //    if that resolution equals the group's. Pinned here because it is the
+    //    one link the two sides' own tests cannot see between them: gh.rs's
+    //    unit tests prove it reads the file, this proves the file is what the
+    //    poller and contract were built from. (The allow-list's own closed-ness
+    //    is `a_resolved_hold_spelling_widens_the_allow_list_by_exactly_one_value`.)
+    let from_file = workflow::load_workflow(&repo.path()).unwrap().unwrap().intake.hold;
+    assert_eq!(
+        from_file, g.guardrails.intake.hold,
+        "the repo-file resolution gh.rs uses must equal the group's — if these can differ, the \
+         UI writes one spelling while the poller honors another, which is the defect one layer over"
+    );
+}
+
+#[test]
+fn a_group_json_predating_the_hold_label_resolves_to_the_builtin_veto() {
+    // Migration guarantee, the same one `absent_intake_key_in_group_json_…`
+    // gives the whole block: a group.json written before this field existed
+    // has `intake.labels` with no `hold` key at all, and must resolve to
+    // `agent-hold` rather than to an empty string that would match nothing.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group(&Repo::new().path(), rails()).unwrap();
+    let path = reg.state_root().join(g.id.as_str()).join("group.json");
+    let mut gj: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    gj["guardrails"]["intake"]["labels"].as_object_mut().unwrap().remove("hold");
+    fs::write(&path, serde_json::to_string_pretty(&gj).unwrap()).unwrap();
+
+    let (_, persisted) = reg.load_group_file(&g.id).unwrap();
+    assert_eq!(
+        persisted.intake.hold,
+        workflow::builtin_intake_profile().hold,
+        "an absent hold key must resolve to the built-in veto label, never to nothing"
+    );
 }
 
 #[test]
@@ -6231,6 +6440,63 @@ fn an_intake_label_with_unusable_characters_is_rejected_not_rewritten() {
         errs.iter().any(|e| e.contains("intake.labels.ready")),
         "the error must name the offending field: {errs:?}"
     );
+}
+
+/// **A flag-shaped label is refused, which is what makes the argv claim true**
+/// (rev-648 NB4). `sanitize_id`'s alphabet allows `-` freely, so `--force` and
+/// `-x` passed it unchanged and became a resolved label — and the hold spelling
+/// reaches `gh label create <name> …` as a POSITIONAL argument, where cobra
+/// reads a leading dash as an unknown flag.
+///
+/// That was never an injection: nothing is executed and the create fails loudly.
+/// But `gh.rs` justified its allow-list with "nothing shell-ish or `--flag`-shaped
+/// can reach an argv through this door", and a safety claim that isn't true is
+/// worth less than no claim — a later reader relies on it. Refusing the class
+/// here is what makes it true at the boundary that states it.
+#[test]
+fn an_intake_label_may_not_begin_with_a_dash() {
+    for bad in ["--force", "-x", "--", "-agent-hold"] {
+        let yaml = format!(
+            "version: 1\nblocks:\n  - id: worker\n    kind: worker\n\
+             intake:\n  labels:\n    hold: \"{bad}\"\n"
+        );
+        let errs = workflow::parse_workflow(&yaml).unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains("intake.labels.hold")),
+            "{bad:?} must be refused, naming the field: {errs:?}"
+        );
+        assert!(
+            errs.iter().any(|e| e.contains("may not begin with")),
+            "the error must say WHY, so an author can fix it: {errs:?}"
+        );
+    }
+
+    // The rule is a LEADING dash only: the built-in vocabulary and every
+    // plausible rename are interior-dashed, and refusing those would break the
+    // default install.
+    for good in ["agent-hold", "do-not-touch", "hold_me", "HOLD2", "a-"] {
+        let yaml = format!(
+            "version: 1\nblocks:\n  - id: worker\n    kind: worker\n\
+             intake:\n  labels:\n    hold: \"{good}\"\n"
+        );
+        let wf = workflow::parse_workflow(&yaml)
+            .unwrap_or_else(|e| panic!("{good:?} must still parse: {e:?}"));
+        assert_eq!(wf.intake.hold, good);
+    }
+
+    // Every label field, not just the veto — a leading dash is nonsense for all
+    // five, and the one that reaches an argv is not the only one that would.
+    for field in ["ready", "investigate", "owned", "prototype"] {
+        let yaml = format!(
+            "version: 1\nblocks:\n  - id: worker\n    kind: worker\n\
+             intake:\n  labels:\n    {field}: \"--force\"\n"
+        );
+        let errs = workflow::parse_workflow(&yaml).unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains(&format!("intake.labels.{field}"))),
+            "{field} must refuse a flag-shaped label too: {errs:?}"
+        );
+    }
 }
 
 #[test]

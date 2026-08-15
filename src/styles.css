@@ -2008,6 +2008,15 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .issues-label.agent {
   background: var(--line-strong); border-color: var(--accent); color: var(--ink);
 }
+/* agent-hold (#778): the human veto reads RED, never in the accent that means
+   "queued for agents" — a held issue must be distinguishable at a glance. The
+   red is --state-danger because "held by a human" is a STATE of the issue, not
+   an identity; the tint is the sanctioned color-mix alpha step over it. */
+.issues-label.hold {
+  background: color-mix(in srgb, var(--state-danger) 16%, transparent);
+  border-color: color-mix(in srgb, var(--state-danger) 50%, transparent);
+  color: var(--state-danger);
+}
 .issues-when { font-size: 10.5px; color: var(--ink-dim); }
 
 .issues-row-actions { flex: none; display: flex; align-items: center; gap: 5px; }
@@ -2020,6 +2029,15 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .issues-toggle:disabled { opacity: 0.5; cursor: default; }
 .issues-toggle.on {
   background: var(--accent); border-color: var(--accent); color: var(--surface-0); font-weight: 600;
+}
+/* The agent-hold veto toggle (#778): red on hover and when engaged, so the
+   button that stops agents never looks like the buttons that start them. */
+.issues-toggle.hold:hover:not(:disabled) {
+  border-color: var(--state-danger); color: var(--state-danger);
+}
+.issues-toggle.hold.on {
+  background: var(--state-danger); border-color: var(--state-danger);
+  color: var(--surface-0); font-weight: 600;
 }
 /* Read-only orchestrator-owned marker. */
 .issues-toggle.managed {
@@ -2800,6 +2818,32 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   background: color-mix(in srgb, var(--state-danger) 16%, transparent);
   border-radius: 5px; padding: 1px 6px; margin: -1px -2px;
 }
+/* Row B2 (#778): full autonomy + its goal. Amber like the other "this widens what
+   agents may do" affordances, and solid once engaged so the mode in which the
+   orchestrator picks its own work is unmissable. The amber is --state-attention,
+   not --id-amber: this position's sibling variant (.danger, directly above) sits
+   on the state channel, and "how wide the orchestrator's leash is right now" is a
+   state of the group, not which thing it is. Same pigment either way; the token
+   name is the decision. */
+.group-auto-full { display: flex; align-items: center; gap: 8px 14px; flex-wrap: wrap; }
+.group-auto-check.full { color: var(--state-attention); font-weight: 600; }
+.group-auto-check.full input { accent-color: var(--state-attention); }
+.group-auto-check.full.on {
+  background: color-mix(in srgb, var(--state-attention) 16%, transparent);
+  border-radius: 5px; padding: 1px 6px; margin: -1px -2px;
+}
+.group-auto-goal { display: flex; align-items: center; gap: 6px; flex: 1 1 220px; min-width: 0; }
+.group-auto-binput.goal { flex: 1 1 auto; width: auto; min-width: 0; }
+/* Header chip: only rendered while the mode is live (the element is hidden
+   otherwise), so it never becomes background furniture. */
+.group-auto-chip {
+  font-size: 9.5px; font-weight: 600; letter-spacing: 0.03em;
+  border-radius: 4px; padding: 1px 7px; white-space: nowrap;
+  background: color-mix(in srgb, var(--state-attention) 18%, transparent);
+  color: var(--state-attention);
+  border: 1px solid color-mix(in srgb, var(--state-attention) 45%, transparent);
+}
+.group-auto-chip[hidden] { display: none; }
 .group-auto-budget { display: flex; align-items: center; gap: 6px; }
 .group-auto-blabel { color: var(--ink-dim); font-size: 11px; }
 .group-auto-binput {

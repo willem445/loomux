@@ -271,8 +271,11 @@ the integration binary at all — so every integration-level assertion you meant
 to evidence produces no output, and the round is wasted. Split by target:
 
 - To redden a **unit test in `src-tauri`'s own lib** (e.g.
-  `src/orchestration/intake.rs`), neuter the pure function. That lib suite is
-  the first binary, so it is reached.
+  `src/orchestration/digest.rs`), neuter the pure function. That lib suite is
+  the first binary, so it is reached. Check where the file lives before
+  picking it: #888 is moving `orchestration/` modules into the engine crate
+  one batch at a time, and a file that moved is governed by the next bullet,
+  not this one.
 - To redden a **unit test in `crates/loomux-engine/src/`** (e.g.
   `workflow.rs`), the same move works but the ordering is against you. The
   observed order of a `cargo test --locked --workspace` run is: `loomux_lib`

@@ -26,6 +26,8 @@ import {
   serializeWorkflow,
   type Workflow,
 } from "../src/workflowmodel.ts";
+import { DEFAULT_HOLD } from "../src/issuesmodel.ts";
+import { fullAutonomyHelp } from "../src/autonomy.ts";
 
 interface SchemaField {
   name: string;
@@ -306,6 +308,7 @@ const FIELDS_WITHOUT_AN_EDITOR = new Set<string>([
   "intake.labels.investigate",
   "intake.labels.owned",
   "intake.labels.prototype",
+  "intake.labels.hold",
   "merge_queue.enabled",
   "merge_queue.max_batch",
   "merge_queue.checks_timeout_minutes",
@@ -334,6 +337,36 @@ test("every schema field is either editable in the pane or listed as not yet edi
     ids.filter((id) => !FIELDS_WITH_AN_EDITOR.has(id) && !FIELDS_WITHOUT_AN_EDITOR.has(id)),
     [],
     "a new schema field needs a decision: give it a form control, or list it as pending"
+  );
+});
+
+// ---------- (c2) the frontend's veto fallback agrees with the engine ----------
+
+test("the pane's hold-label fallback is the engine's built-in veto (#778)", () => {
+  // `DEFAULT_HOLD` and `autonomy.ts`'s `holdName` fallback are the only two
+  // places the frontend may name the veto by literal: everything user-facing
+  // reads the resolved spelling from the backend, and these are what render
+  // before the first status read resolves it.
+  //
+  // A literal that DRIFTS from the engine's built-in would show the wrong veto
+  // to every repo that never renamed it — the same defect as the hardcodes this
+  // replaced, just with a longer fuse. So it is pinned against the manifest's
+  // declared default, which `workflow_schema_field_facts()` pins against
+  // `builtin_intake_profile()` on the Rust side: engine → manifest → pane, with
+  // no link left to assumption.
+  const hold = manifest.sections["intake.labels"]?.fields.find((f) => f.name === "hold");
+  assert.ok(hold, "the manifest must declare intake.labels.hold");
+  assert.equal(
+    DEFAULT_HOLD,
+    hold.default,
+    "the pane's fallback veto must equal the engine's built-in — a repo that never renamed the \
+label would otherwise be shown a veto that holds nothing"
+  );
+  // The same value must survive the sentence-building fallback in autonomy.ts,
+  // which is what actually reaches the panel's help and mode chip.
+  assert.ok(
+    fullAutonomyHelp("").includes(`you label ${hold.default}`),
+    "an unresolved spelling must fall back to the engine's built-in"
   );
 });
 
