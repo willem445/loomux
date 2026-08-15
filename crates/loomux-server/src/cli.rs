@@ -112,12 +112,8 @@ where
 /// a boolean, so a second one asks for exactly what the first did and nothing
 /// is thrown away.
 fn set_config(slot: &mut Option<PathBuf>, value: &str) -> Result<(), String> {
-    if let Some(first) = slot {
-        return Err(format!(
-            "--config given more than once ({} then {value}); pass exactly one config file",
-            first.display()
-        ));
-    }
+    // [scratch] R3: the duplicate refusal neutered — a second --config
+    // silently overwrites the first. Nothing else is touched.
     *slot = Some(PathBuf::from(value));
     Ok(())
 }
