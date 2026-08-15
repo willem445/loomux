@@ -520,7 +520,7 @@ are where the 64-vs-66 drift above lives).
 | `pty_backend_info`, `discover_git_bash`, `discover_ssh` | 3 | wire | viewer | answered with **server** facts; the client must not report its own shell discovery for a server pane |
 | **sessions** (3) | 3 | wire | viewer / operator | agent-CLI store scans are server-side; `record_*_launch_posture` is operator |
 | **git** (22) | 6 | wire | viewer | the reads: `git_repo_root`, `git_log`, `git_status`, `git_diff`, `git_branches`, `git_worktree_list` |
-| | 16 | wire | operator | every write: stage/unstage/commit/commit_files/checkout/discard/worktree_add/fetch/push/pull/tag/branch_create/cherry_pick/revert/merge/rebase. `repo` is root-scoped (#1042); its `rel`-shaped arguments are validated (#925). Note H9: these push as whoever the daemon is |
+| | 16 | wire | operator | every write: stage/unstage/commit/commit_files/checkout/discard/worktree_add/fetch/push/pull/tag/branch_create/cherry_pick/revert/merge/rebase. `repo` is root-scoped (#1042). #925 routed exactly two arms through `safe_resolve` — `git_discard(untracked)` and `git_diff(untracked)`; `git_stage`/`git_unstage` `paths` still reach the git CLI directly and are contained by git own outside-repository refusal, not by #925. Note H9: these push as whoever the daemon is |
 | **gh** (10) | 6 | wire | viewer | `gh_auth_status`, `gh_issue_list`, `gh_issue_view`, `gh_pr_list`, `gh_pr_view`, `gh_activity` |
 | | 4 | wire | operator | `gh_issue_create`, `gh_issue_set_labels`, `gh_issue_comment`, `gh_pr_comment` — these write to GitHub as the daemon's credential (H9) |
 | **gitwatch** (2) | 2 | wire | viewer | |

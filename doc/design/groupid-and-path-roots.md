@@ -477,20 +477,50 @@ That scan is default-deny on the orchestration-root *receiver* and the
 `claude_transcript_path` builds `format!("{session}.jsonl")` on one line and
 joins it on another; `ledger_path`'s receiver is a group dir, not the root. So it
 has its own guard, `no_raw_identifier_is_interpolated_into_a_file_name` in
-`tests/pathseg.rs`: a `format!` that interpolates a known raw-id binding **and**
-carries a file-extension literal is a finding unless its exact text is on an
-allowlist with the argument for why it is safe (in every current case: the
-binding is a `PathSegment` at that signature). The extension literal is what
-keeps it precise — `format!("agent={agent_id} pty={pty_id}")` is a breadcrumb,
-and there are dozens of those. It also fails if an allowlist row matches
-nothing, so a renamed site cannot quietly shrink what the test covers.
+`tests/pathseg.rs`.
+
+**Its trigger is a shape, and deliberately names nothing.** A `format!` whose
+template both interpolates something *and* carries a file-extension literal is a
+file name being built out of a value — that is the whole test. It does not ask
+what the binding is called, and the extension is matched **inside the `format!`
+string literal** rather than anywhere on the line, so a `json!` carrying a
+`.json` in a sibling string is not mistaken for a path build. `#[cfg(test)]`
+regions are skipped by brace depth, the same exclusion the sibling scan makes for
+`tests/`. Anything flagged is a finding unless its exact text is on an allowlist
+with the argument for why it is safe, and each row also names a **proof** — text
+that must still be present for that argument to hold — which the scan re-checks.
+A row matching nothing fails too, so a renamed site cannot quietly shrink what
+the test covers.
+
+The arguments differ by row, and that is the point of writing them down: some
+rows are "the binding is a `PathSegment` at this signature", but others are "the
+value is a literal at every call site", "it is a minted roster id", "it is a
+timestamp, not an identifier", or "the builder refuses the id itself". One row is
+the known non-member — a workflow block id, validated by the weaker
+`workflow::sanitize_id` (see below).
+
+**Why the trigger names nothing, stated because the first version did.** The
+guard originally keyed on a list of binding names, and that is not a limitation
+it happened to have — it is a defect that fired. The same change that introduced
+the guard also renamed `claude_transcript_path`'s parameter `session_id` →
+`session` as ordinary tidying, and that rename alone moved the declared assembly
+point for claude transcript paths out of the list and clean out of the scan's
+view. A reviewer caught it; the guard could not. CLAUDE.md's
+source-scanning-guard convention says exactly this — *a rename steps over a name
+heuristic, so it enforces nothing* — and the trigger was rewritten to the shape
+in response. Dropping the name list did not merely close that hole: it surfaced
+sites the name version had never been able to see, among them the `{program}.cmd`
+shim writers, `mqloop`'s body-file name, a crash-log timestamp, and the block-id
+`<id>.md` site named above.
 
 Same honesty requirement as its sibling, and the same answer: it is textual, so a
-`const` extension, a `PathBuf::push`, a template split across lines, or a binding
-renamed out of the list all sit outside it. What holds the property is the
-**signature** — a function taking `&PathSegment` cannot be handed a `&str` at all
-— and the scan is defence in depth over a *new* site being added raw, which is
-how the guarantee would realistically erode.
+`const` extension (`{handle}{CLAUDE_AGENT_FILE_EXT}` is real and invisible to
+it), a name built by `String` concatenation or `PathBuf::push` rather than
+`format!`, a template split across lines, and a second `format!` on the same line
+as a first all sit outside it. What holds the property is the **signature** — a
+function taking `&PathSegment` cannot be handed a `&str` at all — and the scan is
+defence in depth over a *new* site being added raw, which is how the guarantee
+would realistically erode.
 
 ## What this does not do
 

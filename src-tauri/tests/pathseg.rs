@@ -317,7 +317,9 @@ fn the_group_id_and_segment_validators_cannot_drift_apart() {
 /// - **The extension is matched inside the `format!` string literal, not
 ///   anywhere on the line.** `json!({ "reason": "unusable merge_queue.json",
 ///   "detail": format!("{e:?}") })` has `.json` on the line and builds no path;
-///   scoping to the literal drops it and two like it.
+///   scoping to the literal drops that shape. (Deliberately not stated as a
+///   count: how many such lines exist is a fact about today's tree, and a
+///   number here would be wrong on the next commit that adds or removes one.)
 /// - **`#[cfg(test)]` regions are skipped**, the same exclusion the sibling scan
 ///   makes for `tests/`: fixtures build file names from ids constantly, which is
 ///   their job. Tracked by brace depth from the attribute, so it is the region
@@ -329,7 +331,13 @@ fn the_group_id_and_segment_validators_cannot_drift_apart() {
 /// Not caught, and no attempt is made to: an extension held in a `const`
 /// (`{handle}{CLAUDE_AGENT_FILE_EXT}` is real and invisible here); a name built
 /// by `String` concatenation or `PathBuf::push` rather than `format!`; a
-/// template split across lines. What actually holds the property is the
+/// template split across lines; and — because [`format_template`] returns the
+/// **first** `format!("` on a line — a second `format!` sharing that line with a
+/// first. That last one changes nothing in the tree today (replaying with
+/// every-template-per-line finds the same set), which is why it is a stated
+/// limit rather than a fix: a scan whose doc enumerates the others and omits
+/// this one is implying a completeness it does not have. What actually holds
+/// the property is the
 /// **signature** — a function taking `&PathSegment` cannot be handed a raw
 /// `&str` at all — and this scan is defence in depth over a *new* site being
 /// added raw, which is how the guarantee would realistically erode.
@@ -461,7 +469,7 @@ fn no_raw_identifier_is_interpolated_into_a_file_name() {
         (
             "let path = dir.join(format!(\"crash-{}.log\", stamp(now)));",
             "crash-log name is a timestamp, not an id",
-            "fn stamp(",
+            "format!(\"{y:04}{m:02}{d:02}-{hh:02}{mm:02}{ss:02}\")",
         ),
         // **The known non-member of this family, and the reason it is listed
         // rather than fixed here.** A workflow block id becomes `<id>.md` in the
@@ -477,7 +485,7 @@ fn no_raw_identifier_is_interpolated_into_a_file_name() {
             "format!(\"{}.md\", self.id)",
             "block ids are validated by workflow::sanitize_id — a separate, weaker predicate, \
              deliberately not converted by #925",
-            "fn sanitize_id(",
+            "let Some(id) = sanitize_id(&rb.id) else {",
         ),
         // These two interpolate a locally-parsed `PathSegment` rather than the
         // raw parameter. The binding name is a hint, not the evidence — the

@@ -125,11 +125,14 @@ compiles.
    concludes the rule is decorative on finding it: workflow **block ids** are
    validated by `workflow::sanitize_id`, which is weaker than `check_segment`
    on exactly the two rules the alphabet does not give you — it permits a
-   leading `-` and a Windows reserved device name, and a block id becomes
-   `<id>.md` in the group dir. That is operator-authored config rather than
-   caller input, so it is not a containment breach and #925 left it alone; the
-   filename scan below carries it as an argued allowlist row rather than being
-   blind to it.
+   leading `-` and a Windows reserved device name — and it **rewrites rather
+   than refuses** (`sanitize_id("../x")` yields `x`), which is the
+   two-strings-name-one-directory hazard `pathseg` exists to avoid; bounded
+   only because `parse_workflow` rejects an id `sanitize_id` had to change. A
+   block id becomes `<id>.md` in the group dir. That is operator-authored
+   config rather than caller input, so it is not a containment breach and #925
+   left it alone; the filename scan below carries it as an argued allowlist row
+   rather than being blind to it.
    The join scan's permitted-assembly-point list is one row **per family**
    (each required exactly once, so a renamed one fails loudly rather than
    watching nothing), and a sibling scan in `src-tauri/tests/pathseg.rs` covers
