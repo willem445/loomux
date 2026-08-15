@@ -12309,6 +12309,16 @@ fn setup_mcp() -> (OrchRegistry, tempfile::TempDir, Caller, Caller) {
     (reg, dir, co, cw)
 }
 
+/// The delegate-callable tools that COMPOSE a `[loomux] …` notice and whose
+/// arguments a generic filling can satisfy — so the sweep below can be held to
+/// driving each of them, by name, instead of to a count.
+///
+/// `review_verdict` is deliberately absent: its `pr` must parse as a number, no
+/// generic filling can guess that, and it is covered by the NAMED calls instead.
+/// A tool added here that the sweep cannot in fact drive turns the pin red,
+/// which is the safe direction.
+const SWEEPABLE_NOTICE_TOOLS: [&str; 2] = ["report", "message_orchestrator"];
+
 #[test]
 fn no_delegate_callable_tool_can_forge_a_loomux_attribution_into_the_orchestrators_pane() {
     // #891 rev-1 F1 and rev-2 F1b, end to end on the REAL dispatch and the REAL
@@ -12331,7 +12341,10 @@ fn no_delegate_callable_tool_can_forge_a_loomux_attribution_into_the_orchestrato
     //      readable; asserting delivery is what stops it passing vacuously (an
     //      earlier revision measured an empty pane and would have).
     //   2. A sweep over every tool the delegate's own `tools/list` offers, each
-    //      called twice (see the fillings below).
+    //      called twice (see the fillings below) — and held to a PER-TOOL
+    //      delivery, not to a count, so a tool falling back out of the sweep's
+    //      reach cannot hide behind another tool's deliveries
+    //      (`SWEEPABLE_NOTICE_TOOLS`).
     //
     // **What the sweep does and does not reach, because "exhaustive" was too
     // strong a word for it and rev-2's disposition said so.** It drives a tool
@@ -12406,12 +12419,22 @@ fn no_delegate_callable_tool_can_forge_a_loomux_attribution_into_the_orchestrato
     // every string argument forged. Results are ignored on purpose: a rejected
     // call is a call that delivered nothing, and what is being measured is the
     // pane, not the return value.
-    for c in [&cw, &cr] {
+    for (c, agent) in [(&cw, &worker), (&cr, &reviewer)] {
         let tools = dispatch(&reg, c, "tools/list", &Value::Null).unwrap()["tools"]
             .as_array()
             .expect("a tools array")
             .clone();
         assert!(tools.len() > 5, "a delegate's surface must be non-trivial, got {}", tools.len());
+        // The two notice-composing tools a generic filling can actually drive
+        // must be ON this delegate's surface, or the per-tool pin after the
+        // loop is watching for something the sweep was never offered.
+        for must in SWEEPABLE_NOTICE_TOOLS {
+            assert!(
+                tools.iter().any(|t| t["name"] == json!(must)),
+                "{must} must be offered to {} — the sweep's coverage claim rests on it",
+                agent.id
+            );
+        }
         for t in tools {
             let name = t["name"].as_str().unwrap().to_string();
             // Two fillings per tool, because one of them is inert on any tool
@@ -12450,13 +12473,30 @@ fn no_delegate_callable_tool_can_forge_a_loomux_attribution_into_the_orchestrato
             }
         }
     }
-    // The sweep is not inert: it delivered something of its own, over and above
-    // the four named calls. Without this, a filling that every tool rejected
-    // would still "pass" the forgery assertions below, on an empty set.
-    assert!(
-        delivered_texts(&reg, &g.id).len() > named_deliveries,
-        "the sweep drove no tool at all — it is measuring nothing"
-    );
+    // The sweep is not inert — and pinned PER TOOL, not as a floor (#1052
+    // rev-734 residual 2). `delivered.len() > named_deliveries` was satisfied by
+    // any ONE free-text tool getting through: `message_orchestrator` alone kept
+    // it green, so `report` silently dropping back out of the sweep — exactly the
+    // regression the two-filling `legal` pass was added to prevent, one removed
+    // schema `enum` away — would not have moved it. Each caller × each
+    // sweepable notice tool must show its own delivery, in the tail the sweep
+    // itself produced (audit order is append order, so everything past
+    // `named_deliveries` is the sweep's).
+    let swept = delivered_texts(&reg, &g.id).split_off(named_deliveries);
+    for agent in [&worker, &reviewer] {
+        for tool in SWEEPABLE_NOTICE_TOOLS {
+            let prefix = match tool {
+                "report" => format!("[loomux] {} reports", agent.id),
+                _ => format!("[loomux] message from {}:", agent.id),
+            };
+            assert!(
+                swept.iter().any(|t| t.starts_with(&prefix)),
+                "the sweep never drove {tool} as {} — it is not measuring that tool at all, \
+                 whatever the total count says.\nSwept deliveries: {swept:#?}",
+                agent.id
+            );
+        }
+    }
 
     // ---- what the pane actually received ----
     let delivered = delivered_texts(&reg, &g.id);
