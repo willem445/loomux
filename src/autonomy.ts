@@ -61,6 +61,13 @@ export interface AutonomyState {
    *  can outlive the consent it qualified). The panel therefore never renders a
    *  goal that isn't in force. */
   full_autonomy_goal: string | null;
+  /** #778: this group's resolved veto spelling — `intake.labels.hold` from its
+   *  workflow config, or `agent-hold`. The panel must NAME this rather than a
+   *  literal: it is the label the group's own poller honors, and telling the
+   *  human to apply any other one is telling them to do nothing. Reported
+   *  whatever the mode's state, because the help text describes what the toggle
+   *  would do and has to be true before it is flipped. */
+  hold_label: string;
   budget_tokens: number;
   budget_anchor_tokens: number;
   spend_since_enable_tokens: number | null;
@@ -302,16 +309,47 @@ export const FULL_AUTONOMY_CHIP_TEXT = "⚡ FULL AUTONOMY";
  *  file) as its tooltip. Hidden entirely while the mode is off — an always-present
  *  chip that merely changes colour is not a state you notice. The tooltip names
  *  the veto gesture too: the moment a human reads "it picks its own work" is the
- *  moment they want to know how to stop it picking one. */
-export function fullAutonomyChip(fullAutonomy: boolean, goal: string | null): ModeChip {
+ *  moment they want to know how to stop it picking one.
+ *
+ *  `hold` is the group's RESOLVED spelling, never a literal: this tooltip is an
+ *  instruction ("add X to an issue"), and an instruction naming a label the
+ *  group's poller does not honor tells the human to do nothing. */
+export function fullAutonomyChip(
+  fullAutonomy: boolean,
+  goal: string | null,
+  hold: string
+): ModeChip {
   if (!fullAutonomy) return { shown: false, text: "", tooltip: "" };
   return {
     shown: true,
     text: FULL_AUTONOMY_CHIP_TEXT,
     tooltip:
       "Full autonomy is ON — the orchestrator self-selects eligible open issues on its " +
-      `idle tick (${goalClause(goal)}). Add agent-hold to an issue to hold it back.`,
+      `idle tick (${goalClause(goal)}). Add ${holdName(hold)} to an issue to hold it back.`,
   };
+}
+
+/** The veto label as a *sentence* names it, falling back to the built-in when the
+ *  panel has no resolved spelling yet (first paint, or a status read that failed).
+ *  Naming nothing would leave "Add  to an issue"; naming the wrong thing is worse,
+ *  so the fallback is the value the backend also falls back to. */
+function holdName(hold: string): string {
+  const h = hold.trim();
+  return h === "" ? "agent-hold" : h;
+}
+
+/** The full-autonomy checkbox's own help text — what the toggle WOULD do, shown
+ *  before it is flipped. Names this group's veto spelling for the same reason the
+ *  chip does: it tells the human how to hold an issue back, so it has to name the
+ *  label that actually holds one. */
+export function fullAutonomyHelp(hold: string): string {
+  return (
+    "Off (default): agents start only agent-ready / agent-investigation work. On: on each " +
+    "idle tick the orchestrator self-selects the highest-value eligible open issue and " +
+    `starts it — everything except issues you label ${holdName(hold)}, and (for the ` +
+    "pre-existing backlog) only after it posts a triage plan and you say go. Nothing about " +
+    "merging, releasing, review or budgets changes."
+  );
 }
 
 // ---------- budget meter math ----------

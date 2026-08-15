@@ -12505,11 +12505,24 @@ Five public-contract changes, all additive:
 2. **`orch_autonomy` gains `full_autonomy` and `full_autonomy_goal`.**
 3. **`orch_set_full_autonomy(group_id, enabled, goal)`** — a new command.
 4. **`workflow.yml` gains optional `intake.labels.hold`** (default `agent-hold`), and the
-   resolved spelling reaches **every** surface that names the veto: the intake poller, the
-   orchestrator contract (a `{{HOLD_LABEL}}` template variable, threaded like `MAX_AGENTS`
-   from `guardrails.intake.hold`), the issues-view toggle, and `gh.rs`'s label allow-list.
+   resolved spelling reaches **every** surface that names the veto.
 
-   **Why all four, rather than the poller alone.** A knob honored in one layer is worse than
+   **The rule, not a list.** *Nothing in loomux names the veto by a built-in literal.* Two
+   fallbacks exist and are the only exceptions — the frontend's `DEFAULT_HOLD` and
+   `autonomy.ts`'s `holdName`, which render before the first status read resolves the real
+   spelling, and are pinned against the manifest default (itself pinned against
+   `builtin_intake_profile()`) so they cannot drift from what a non-renaming repo gets.
+   Stating the rule rather than enumerating places is deliberate: the enumeration was written
+   twice and was wrong twice, each time because a surface nobody had listed still carried the
+   literal. A rule is checkable by `grep`; a list of six is a claim that decays.
+
+   Concretely, the resolution reaches: the intake poller; the orchestrator contract (a
+   `{{HOLD_LABEL}}` template variable threaded like `MAX_AGENTS` from
+   `guardrails.intake.hold`); the kickoff clause and the toggle notice; the group panel's
+   full-autonomy help and mode chip (via `hold_label` on `orch_autonomy`); the issues-view
+   toggle, its chip and its label-shortening; and `gh.rs`'s label allow-list and create-spec.
+
+   **Why every one of them, rather than the poller alone.** A knob honored in one layer is worse than
    no knob: the contract tells the orchestrator to build its triage plan from its *own*
    sweep, so a contract naming a label the repo no longer uses produces a plan that includes
    a held issue, which the human's "go" then covers — a vetoed issue started, with every

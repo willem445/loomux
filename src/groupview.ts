@@ -54,6 +54,7 @@ import {
   dangerousControl,
   fullAutonomyControl,
   fullAutonomyChip,
+  fullAutonomyHelp,
   goalCommit,
   goalFieldSync,
   normalizeGoal,
@@ -153,6 +154,9 @@ export class GroupView {
   private dangerousChk: HTMLInputElement;
   // Full autonomy (#778): its own row, plus a header chip while it is live.
   private fullAutoChk: HTMLInputElement;
+  /** The full-autonomy checkbox's label — held because its help text names the
+   *  group's resolved veto spelling and is re-rendered on every status read. */
+  private fullAutoLbl!: HTMLLabelElement;
   private goalInput: HTMLInputElement;
   private goalErrEl: HTMLElement;
   private fullAutoChipEl: HTMLElement;
@@ -492,12 +496,11 @@ export class GroupView {
     this.fullAutoChk.disabled = true; // until a status read shows autonomous on
     this.fullAutoChk.addEventListener("change", () => void this.toggleFullAutonomy());
     fullLbl.append(this.fullAutoChk, document.createTextNode(" ⚡ Full autonomy"));
-    fullLbl.title =
-      "Off (default): agents start only agent-ready / agent-investigation work. On: on each " +
-      "idle tick the orchestrator self-selects the highest-value eligible open issue and " +
-      "starts it — everything except issues you label agent-hold, and (for the pre-existing " +
-      "backlog) only after it posts a triage plan and you say go. Nothing about merging, " +
-      "releasing, review or budgets changes.";
+    // The help names this group's veto spelling, so it is re-rendered from the
+    // live status (`renderAutonomy`) rather than frozen here — the built-in is
+    // only what it says until the first status read resolves the real one.
+    this.fullAutoLbl = fullLbl;
+    fullLbl.title = fullAutonomyHelp("");
 
     // Goal: opaque to loomux (captured, echoed, never parsed). Editable whenever —
     // set-then-enable, like the budget field — because the goal is a parameter of
@@ -1518,7 +1521,10 @@ export class GroupView {
     this.fullAutoChk.title = full.tooltip;
     (this.fullAutoChk.closest(".group-auto-check") as HTMLElement | null)
       ?.classList.toggle("on", full.checked);
-    const chip = fullAutonomyChip(full.checked, a.full_autonomy_goal);
+    // #778: the help and the chip both INSTRUCT ("label X to hold it back"), so
+    // both name this group's resolved veto rather than the built-in literal.
+    this.fullAutoLbl.title = fullAutonomyHelp(a.hold_label);
+    const chip = fullAutonomyChip(full.checked, a.full_autonomy_goal, a.hold_label);
     this.fullAutoChipEl.hidden = !chip.shown;
     this.fullAutoChipEl.textContent = chip.text;
     this.fullAutoChipEl.title = chip.tooltip;

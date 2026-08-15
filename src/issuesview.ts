@@ -70,11 +70,13 @@ function el<K extends keyof HTMLElementTagNameMap>(
 }
 
 /** Short human label for a label chip. */
+// The veto is deliberately ABSENT: its spelling is repo-configurable, so it can
+// never be a key here. Both places that shorten it check the resolved
+// `this.holdLabel` first and render "hold" themselves (#778).
 const LABEL_SHORT: Record<string, string> = {
   "agent-ready": "ready",
   "agent-investigation": "investigate",
   "agent-managed": "managed",
-  "agent-hold": "hold",
 };
 
 /** Why the hold toggle exists, spelled out where the human clicks it (#778) —

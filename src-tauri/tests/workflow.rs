@@ -6352,6 +6352,19 @@ fn a_renamed_veto_reaches_the_contract_the_poller_and_the_allow_list_alike() {
         "and must not also name the built-in: {kickoff}"
     );
 
+    // 1c. The group panel, via `orch_autonomy` (rev round 2). Its full-autonomy
+    //     help and mode chip both INSTRUCT — "label X to hold it back" — so a
+    //     panel naming the built-in tells the human of this repo to apply a
+    //     label its own poller ignores. The panel has no workflow parser; it
+    //     renders what this field says.
+    let state = reg.autonomy_state(&g.id);
+    assert_eq!(
+        state["hold_label"].as_str(),
+        Some("do-not-touch"),
+        "orch_autonomy must report THIS group's veto spelling, or the panel instructs the human \
+         to apply a label that holds nothing: {state}"
+    );
+
     // 3. The seam the write side stands on. `gh.rs` has no group — the issues
     //    view is repo-scoped — so it resolves the spelling from the repo's own
     //    workflow file via `load_workflow`, and its allow-list is only correct

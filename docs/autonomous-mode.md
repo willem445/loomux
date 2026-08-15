@@ -163,8 +163,10 @@ selects the highest-value **eligible** open issue and starts it, until nothing
 eligible is left. It's a sub-mode of autonomous (the checkbox is locked off while
 autonomous is off, and turning autonomous off turns this off too).
 
-- **What "eligible" means.** Open, **not** labeled `agent-hold`, and not already
-  tracked by a board task. Everything else is fair game — that's the inversion.
+- **What "eligible" means.** Open, **not** labeled `agent-hold` (or your repo's
+  own hold spelling — see [the veto](#the-hold-label-is-your-veto)), and not
+  already tracked by a board task. Everything else is fair game — that's the
+  inversion.
 - **The goal.** The optional **Goal** field is one line describing what this run
   is *for* ("harden any bugs, close out new issues identified as you work"). It
   travels with the enable and is echoed into the orchestrator's kickoff config and
@@ -187,11 +189,18 @@ must not start this"*, so it reads correctly on GitHub for anyone who's never se
 loomux.
 
 **If your repo renamed it** (`intake.labels.hold:` in `.loomux/workflow.yml`),
-that spelling is the veto everywhere: the issues-view toggle writes it, the
-backend's label allow-list permits it and creates it on demand, and the
-orchestrator's own contract names it — so the hand-typed `gh` command above is
-`--add-label <your spelling>` too. A veto only some layers can see is not a veto,
-which is why the rename reaches all of them rather than the poller alone.
+`agent-hold` above is simply not your veto — substitute your own spelling
+throughout this page, including in the hand-typed `gh` command.
+
+The rule, rather than a list of places: **nothing in loomux names the veto by a
+built-in literal.** Every surface that mentions it — what the poller excludes,
+what the hold button writes, what the label allow-list permits and creates, what
+the orchestrator's contract, kickoff config and toggle notice say, and what the
+group panel's help and mode chip tell you to apply — reads one resolved value.
+`agent-hold` is what that resolution returns when your repo declares no `hold:`,
+which is why it is the name used everywhere in this documentation. A veto only
+some layers can see is not a veto, so the resolution is the mechanism rather
+than a set of places that has to be kept in sync.
 
 - **loomux's half is host-side and zero-token:** a held issue is excluded from the
   eligible-work signal the intake poll produces, so the orchestrator is never even

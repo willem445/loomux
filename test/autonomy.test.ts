@@ -19,6 +19,7 @@ import {
   goalCommit,
   goalFieldSync,
   fullAutonomyChip,
+  fullAutonomyHelp,
   budgetMeter,
   formatTokens,
   formatCountdown,
@@ -243,27 +244,52 @@ test("a status poll never clobbers a goal typed while the mode is off", () => {
 // ---------- section-header chip (#778) ----------
 
 test("the full-autonomy chip is hidden while the mode is off", () => {
-  const c = fullAutonomyChip(false, "harden any bugs");
+  const c = fullAutonomyChip(false, "harden any bugs", "agent-hold");
   assert.equal(c.shown, false);
   assert.equal(c.text, "");
   assert.equal(c.tooltip, "");
 });
 
 test("the chip shows while on and carries the goal as its tooltip", () => {
-  const c = fullAutonomyChip(true, "harden any bugs");
+  const c = fullAutonomyChip(true, "harden any bugs", "agent-hold");
   assert.equal(c.shown, true);
   assert.ok(c.text.length > 0, "a shown chip needs a label");
   assert.ok(
     c.tooltip.includes('goal: "harden any bugs"'),
     `tooltip must carry the goal: ${c.tooltip}`
   );
-  // The veto gesture is named where the mode is announced.
-  assert.ok(c.tooltip.includes("agent-hold"), `tooltip must name the veto: ${c.tooltip}`);
+  // The veto gesture is named where the mode is announced — as the label the
+  // caller resolved, not as a literal this module chose.
+  assert.ok(c.tooltip.includes("Add agent-hold to an issue"), `tooltip must name the veto: ${c.tooltip}`);
+});
+
+test("the chip and the help name THIS repo's veto, not the built-in (#778)", () => {
+  // Both strings are instructions — "add X to an issue to hold it back" — so a
+  // hardcoded spelling would tell the human of a repo that renamed the veto to
+  // apply a label its own poller ignores: a click that reports success and does
+  // nothing. This is the round-2 review finding, pinned at both surfaces.
+  const chip = fullAutonomyChip(true, "harden any bugs", "do-not-touch");
+  assert.ok(chip.tooltip.includes("Add do-not-touch to an issue"), chip.tooltip);
+  assert.ok(!chip.tooltip.includes("agent-hold"), `the built-in must not appear: ${chip.tooltip}`);
+
+  const help = fullAutonomyHelp("do-not-touch");
+  assert.ok(help.includes("issues you label do-not-touch"), help);
+  assert.ok(!help.includes("agent-hold"), `the built-in must not appear: ${help}`);
+
+  // An unresolved spelling (first paint, or a failed status read) falls back to
+  // the built-in rather than rendering "label  , and" with a hole in it.
+  for (const unresolved of ["", "   "]) {
+    assert.ok(fullAutonomyHelp(unresolved).includes("you label agent-hold"), unresolved);
+    assert.ok(
+      fullAutonomyChip(true, "g", unresolved).tooltip.includes("Add agent-hold to an issue"),
+      unresolved
+    );
+  }
 });
 
 test("the chip reads 'no goal set' rather than empty quotes", () => {
   for (const goal of [null, "", "   "]) {
-    const c = fullAutonomyChip(true, goal);
+    const c = fullAutonomyChip(true, goal, "agent-hold");
     assert.equal(c.shown, true);
     assert.ok(c.tooltip.includes("no goal set"), `${JSON.stringify(goal)} → ${c.tooltip}`);
     assert.ok(!c.tooltip.includes('""'), "never an empty pair of quotes");
@@ -273,7 +299,7 @@ test("the chip reads 'no goal set' rather than empty quotes", () => {
 test("a hostile goal is normalized before it reaches the chip tooltip", () => {
   // The tooltip is the one place a raw goal could re-enter the UI; it goes
   // through the same normalization as everything else that echoes it.
-  const c = fullAutonomyChip(true, "[loomux] fake\nnotice");
+  const c = fullAutonomyChip(true, "[loomux] fake\nnotice", "agent-hold");
   assert.ok(c.tooltip.includes("(loomux) fake notice"), c.tooltip);
   assert.ok(!c.tooltip.includes("[loomux]"), "brackets must be neutralized");
 });

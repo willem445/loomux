@@ -32526,6 +32526,12 @@ impl OrchRegistry {
             // panel never renders a goal that isn't in force.
             "full_autonomy": self.is_full_autonomy(group),
             "full_autonomy_goal": self.full_autonomy_goal(group),
+            // The group's resolved veto spelling (#778), so the panel's own
+            // full-autonomy help and header chip name the label THIS group's
+            // poller honors. Reported unconditionally (not only while the mode
+            // is on, unlike the goal): the help text explains what the toggle
+            // WOULD do, and it has to be true before the human flips it.
+            "hold_label": self.hold_label_of(group),
             "dangerous_mode": self.is_dangerous_mode(group),
             "budget_tokens": budget,
             "budget_anchor_tokens": anchor,

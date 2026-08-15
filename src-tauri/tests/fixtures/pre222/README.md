@@ -543,7 +543,7 @@ so far:
   mode the template text **is** the consent boundary, which is why the re-bless is the review
   surface for the whole feature. **INVARIANT 8** is rewritten to state both directions: opt-in is
   still the default (including plain autonomous mode), and full autonomy applies only when the
-  kickoff config or a `[loomux] FULL AUTONOMY ENABLED` notice says so, with `agent-hold`, a struck
+  kickoff config or a `[loomux] FULL AUTONOMY ENABLED` notice says so, with `{{HOLD_LABEL}}`, a struck
   triage row, and an untriaged pre-existing issue as the three exceptions to eligibility — closing
   on the sentence the rest of the feature hangs off: it widens what may be **started**, never what
   may be **shipped**. A new **Full autonomy** subsection under **Autonomous mode (idle-tick)**
@@ -555,8 +555,16 @@ so far:
   rationale per pickup in the pane and as the board task's first note; park an out-of-goal issue
   at the bottom of the board rather than starting or holding it; stop when the queue empties; and
   start nothing new once a disable, an autonomous-off or the budget money-stop ends the mode. A
-  fourth **Label signals** row states `agent-hold` itself: absolute, never removed by an agent,
+  fourth **Label signals** row states the veto itself: absolute, never removed by an agent,
   addable only to an issue the agent filed.
+
+  The veto's spelling is a **registered template variable**, `{{HOLD_LABEL}}`, not a literal:
+  `intake.labels.hold` is repo-configurable, so the golden carries the placeholder and the
+  toggle-off pin renders it from `guardrails.intake.hold` (the same field the intake poller
+  checks) — the `MAX_AGENTS` / `WORKER_MODEL` shape, a per-group value rather than
+  workflow-conditional prose. It is deliberately NOT one of `LIVE`'s strip keys: those resolve
+  to the empty string for a default group, and stripping this one would compare against a
+  golden with a hole where the veto's name goes.
 
 - **#795, `PARTIAL` names which fetch was short** — `orchestrator.md` only, one bullet. The
   intake poll bounds two listings, not one, so a `PARTIAL` caveat can now come from either the
