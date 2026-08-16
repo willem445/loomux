@@ -2450,7 +2450,7 @@ pub fn condition_supported(c: &str) -> bool {
 ///
 /// Green is an ALLOW-list of conclusions (`success`, `neutral`, `skipped`), so
 /// a conclusion GitHub adds tomorrow reads as red rather than as green.
-pub const BASE_CHECK_RUNS_JQ: &str = "if any(.check_runs[]; .status == \"completed\" and .conclusion != \"success\" and .conclusion != \"neutral\" and .conclusion != \"skipped\") then \"red\" elif (.total_count > (.check_runs|length)) then \"truncated\" elif any(.check_runs[]; .status != \"completed\") then \"pending\" elif (.check_runs|length) == 0 then \"none\" else \"green\" end";
+pub const BASE_CHECK_RUNS_JQ: &str = "if any(.check_runs[]; .status == \"completed\" and .conclusion != \"success\" and .conclusion != \"neutral\" and .conclusion != \"skipped\") then \"red\" elif any(.check_runs[]; .status != \"completed\") then \"pending\" elif (.check_runs|length) == 0 then \"none\" else \"green\" end";
 
 /// The combined-status reduction — see [`BASE_CHECK_RUNS_JQ`] for the shared
 /// contract and for why this one needs no truncation clause.
