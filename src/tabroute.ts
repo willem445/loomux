@@ -25,13 +25,16 @@ const isUrgentReason = (reason: string): boolean =>
 
 // Priority when several panes in one tab need attention: show the most urgent
 // reason on the tab chip. Mirrors the backend's own ordering in
-// `attention_tick` (blocked > stranded > waiting > gate/report).
+// `attention_tick` (blocked > stranded > waiting > report > question > gate).
 const REASON_PRIORITY: Record<string, number> = {
-  blocked: 5,
-  stranded: 4,
-  waiting: 3,
-  gate: 2,
-  report: 1,
+  blocked: 6,
+  stranded: 5,
+  waiting: 4,
+  report: 3,
+  // #1091 slice D: ranked with the other board/registry-derived reasons,
+  // just above `gate` — see attention_tick's own ordering.
+  question: 2,
+  gate: 1,
 };
 const reasonRank = (reason: string): number => REASON_PRIORITY[reason] ?? 0;
 
@@ -66,7 +69,7 @@ export function tabAttention(
     const wsId = ptyToWs.get(it.pty_id);
     if (!wsId) continue;
     const prev = out.get(wsId);
-    // Keep whichever reason ranks highest (blocked > waiting > gate > report).
+    // Keep whichever reason ranks highest (blocked > waiting > report > question > gate).
     if (!prev || reasonRank(it.reason) > reasonRank(prev.reason)) {
       out.set(wsId, { urgent: isUrgentReason(it.reason), reason: it.reason });
     }

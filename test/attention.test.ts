@@ -9,6 +9,8 @@ test("each known reason maps to its label", () => {
   assert.equal(attentionPresentation("stranded").label, "⚠ stuck prompt");
   assert.equal(attentionPresentation("waiting").label, "⚠ waiting");
   assert.equal(attentionPresentation("report").label, "✓ reported");
+  // #1091 slice D: a pending `ask_human` row on this pane's own asker.
+  assert.equal(attentionPresentation("question").label, "❓ question");
   assert.equal(attentionPresentation("gate").label, "⚑ your call");
 });
 
@@ -18,7 +20,7 @@ test("'blocked' and 'stranded' are the urgent reasons", () => {
   // pane until an Enter lands — red, not the amber of a pane that is merely
   // parked on a question it is happy to keep asking.
   assert.equal(attentionPresentation("stranded").urgent, true);
-  for (const reason of ["waiting", "report", "gate"]) {
+  for (const reason of ["waiting", "report", "question", "gate"]) {
     assert.equal(attentionPresentation(reason).urgent, false, `${reason} not urgent`);
   }
 });
@@ -94,7 +96,7 @@ test("the live-recomputed reasons offer no dismiss control", () => {
   // them would be a button that visibly does nothing — the chip is back on the
   // next tick — which teaches the human that dismissing does not work, the
   // exact complaint #825 exists to fix.
-  for (const reason of ["waiting", "report", "gate", "blocked"]) {
+  for (const reason of ["waiting", "report", "question", "gate", "blocked"]) {
     assert.equal(
       attentionDismiss(reason, "w-3").dismissible,
       false,

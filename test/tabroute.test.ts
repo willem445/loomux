@@ -64,8 +64,40 @@ test("tabAttention keeps the highest-priority reason when a tab has several", ()
   assert.deepEqual(out.get("ws-a"), { urgent: false, reason: "waiting" }, "waiting outranks report");
 });
 
+test("'question' ranks between 'report' and 'gate', mirroring attention_tick", () => {
+  // #1091 slice D: a pending ask_human question is board/registry-derived
+  // like `gate`, but is still an actionable ask — rank it just above `gate`.
+  const overGate = tabAttention(
+    [
+      { pty_id: 1, reason: "gate" },
+      { pty_id: 2, reason: "question" },
+    ],
+    ptyMap([
+      [1, "ws-a"],
+      [2, "ws-a"],
+    ])
+  );
+  assert.deepEqual(overGate.get("ws-a"), { urgent: false, reason: "question" }, "question outranks gate");
+
+  const underReport = tabAttention(
+    [
+      { pty_id: 1, reason: "question" },
+      { pty_id: 2, reason: "report" },
+    ],
+    ptyMap([
+      [1, "ws-a"],
+      [2, "ws-a"],
+    ])
+  );
+  assert.deepEqual(
+    underReport.get("ws-a"),
+    { urgent: false, reason: "report" },
+    "report outranks question"
+  );
+});
+
 test("every attention class badges the tab, urgent for blocked and stranded", () => {
-  for (const reason of ["blocked", "stranded", "waiting", "report", "gate"]) {
+  for (const reason of ["blocked", "stranded", "waiting", "report", "question", "gate"]) {
     const out = tabAttention([{ pty_id: 1, reason }], ptyMap([[1, "ws-a"]]));
     assert.deepEqual(
       out.get("ws-a"),
