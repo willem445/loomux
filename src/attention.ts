@@ -4,7 +4,13 @@
 // so the mapping is unit-testable.
 
 /** Reasons the backend attention scan emits (see the Rust `AttentionItem`). */
-export type AttentionReason = "blocked" | "stranded" | "waiting" | "report" | "gate";
+export type AttentionReason =
+  | "blocked"
+  | "stranded"
+  | "waiting"
+  | "report"
+  | "question"
+  | "gate";
 
 export interface AttentionPresentation {
   /** Short glyph+word label shown in the header chip / dock chip tooltip. */
@@ -22,6 +28,10 @@ const LABELS: Record<string, string> = {
   stranded: "⚠ stuck prompt",
   waiting: "⚠ waiting",
   report: "✓ reported",
+  // #1091 slice D: a pending `ask_human` row this pane (orchestrator-only
+  // today) is waiting on. Amber like `gate`, not urgent — it's a decision on
+  // the human's own pace, not a wedged pane.
+  question: "❓ question",
   gate: "⚑ your call",
 };
 

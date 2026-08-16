@@ -506,9 +506,11 @@ These deserve their own detail — see:
   message.
 - **Attention routing** — a pane earns a pulsing **needs-attention** chip when an
   agent is parked on a prompt only you can answer, when a worker reports done or
-  blocked, or when a task hits a human merge gate. An optional per-group
-  **desktop notification** toggle (🔔 in the lifecycle panel) raises an OS toast
-  for those events (off by default).
+  blocked, when a task hits a human merge gate, or when the orchestrator has a
+  question pending your answer (`ask_human`, not yet surfaced by a dedicated
+  panel — see the pane chip and `list_questions` meanwhile). An optional
+  per-group **desktop notification** toggle (🔔 in the lifecycle panel) raises
+  an OS toast for those events (off by default).
   - Most chips clear themselves: they're recomputed every few seconds, and
     clicking one focuses the pane and acknowledges it.
   - The red **⚠ stuck prompt** chip is the exception. It means a prompt loomux

@@ -32253,6 +32253,65 @@ fn attention_toasts_once_per_onset_only_for_optin_groups() {
     assert!(reg.attention_toast_targets(&gate).is_empty(), "gate is not a toastable event");
 }
 
+/// #1091 slice D: a pending `ask_human` question DERIVES a `question`
+/// attention item on the asker's own pane (orchestrator-only today), and it
+/// clears the instant the row is settled — no separate dismiss, because the
+/// `questions.json` registry itself is the latch. RED on base: `question` is
+/// not a reason `attention_tick` ever emits there, so the first assertion's
+/// `count` is 0, not 1 — a real behavioral miss, not a compile error.
+#[test]
+fn attention_flags_the_asker_with_a_pending_question_and_clears_on_settle() {
+    let (reg, _d, g, co, _cw, orch_id) = setup_questions();
+    let now = 1_000_000_000_000u64;
+    let empty = HashMap::new();
+
+    // No pending question yet — no badge.
+    assert!(
+        reg.attention_tick(now, &empty, &no_tails(), &empty).iter().all(|i| i.agent_id != orch_id),
+        "nothing pending, nothing to flag"
+    );
+
+    let out = q_call(&reg, &co, "ask_human", json!({ "text": "ship it here or split it?" }));
+    assert_eq!(out["isError"], false, "{}", q_text(&out));
+
+    let flagged = reg.attention_tick(now, &empty, &no_tails(), &empty);
+    let item = flagged
+        .iter()
+        .find(|i| i.agent_id == orch_id && i.reason == "question")
+        .expect("a pending question must flag the asker's pane");
+    assert!(item.detail.contains('1'), "detail should say how many are pending: {}", item.detail);
+
+    // A second pending question bumps the count on the same item.
+    let out2 = q_call(&reg, &co, "ask_human", json!({ "text": "another one?" }));
+    assert_eq!(out2["isError"], false, "{}", q_text(&out2));
+    let flagged2 = reg.attention_tick(now, &empty, &no_tails(), &empty);
+    let item2 = flagged2.iter().find(|i| i.agent_id == orch_id && i.reason == "question").unwrap();
+    assert!(item2.detail.contains('2'), "two pending: {}", item2.detail);
+
+    // Withdrawing both settles them — the badge clears with no separate ack.
+    q_call(&reg, &co, "withdraw_question", json!({ "id": "q-1" }));
+    q_call(&reg, &co, "withdraw_question", json!({ "id": "q-2" }));
+    assert!(
+        reg.attention_tick(now, &empty, &no_tails(), &empty).iter().all(|i| i.agent_id != orch_id),
+        "settling every pending question must clear the badge with nothing latched"
+    );
+
+    // A `question` item is a fresh event exactly like `blocked`/`report` — it
+    // toasts once opted in, unlike the persistent `gate` state.
+    let pending = vec![AttentionItem {
+        agent_id: orch_id.clone(),
+        group: g.to_string(),
+        name: "orch".into(),
+        role: Some(Role::Orchestrator),
+        pty_id: None,
+        reason: "question",
+        detail: "1 pending question — needs your answer".into(),
+    }];
+    assert!(reg.attention_toast_targets(&pending).is_empty(), "no toasts until opted in");
+    reg.set_notify(&g, true).unwrap();
+    assert_eq!(reg.attention_toast_targets(&pending), vec![orch_id.clone()]);
+}
+
 #[test]
 fn notify_optin_is_durable_across_restart() {
     let dir = tempfile::tempdir().unwrap();
