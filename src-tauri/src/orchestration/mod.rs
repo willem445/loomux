@@ -24871,13 +24871,24 @@ impl OrchRegistry {
                     return;
                 }
             };
-            let Some(idx) = items.iter().position(|i| i.is_open_demo_for(&task.id)) else {
+            // EVERY open demo row for this task, not the first one found.
+            // `admit`'s dedupe makes one the normal case and a second one
+            // unreachable through any code path — but a hand-edited file can
+            // hold two, and settling one of a pair would leave the other on the
+            // human's queue for a task that has moved on, forever, with nothing
+            // left to trigger a resolve. The board is the authority on whether
+            // the ask is still live; it answers for all of them.
+            let now = now_ms();
+            let mut settled: Vec<needsyou::Item> = Vec::new();
+            for item in items.iter_mut().filter(|i| i.is_open_demo_for(&task.id)) {
+                item.status = needsyou::Status::Resolved;
+                item.resolved_by = Some(format!("board:{}", task.status));
+                item.resolved_ms = Some(now);
+                settled.push(item.clone());
+            }
+            if settled.is_empty() {
                 return;
-            };
-            items[idx].status = needsyou::Status::Resolved;
-            items[idx].resolved_by = Some(format!("board:{}", task.status));
-            items[idx].resolved_ms = Some(now_ms());
-            let out = items[idx].clone();
+            }
             needsyou::prune(&mut items, needsyou::RESOLVED_RETAINED);
             if let Err(e) = self.write_needs_you(group, &items) {
                 self.audit(group, "board", "needs-you-reject", json!({
@@ -24885,12 +24896,14 @@ impl OrchRegistry {
                 }));
                 return;
             }
-            out
+            settled
         };
-        self.audit(group, "board", "needs-you-resolve", json!({
-            "id": settled.id, "source": settled.resolved_by, "kind": settled.kind.label(),
-            "task": settled.task, "raiser": settled.raiser,
-        }));
+        for item in &settled {
+            self.audit(group, "board", "needs-you-resolve", json!({
+                "id": item.id, "source": item.resolved_by, "kind": item.kind.label(),
+                "task": item.task, "raiser": item.raiser,
+            }));
+        }
     }
 
     // ---------- task board ----------

@@ -50904,7 +50904,13 @@ fn the_list_projection_caps_the_resolved_tail_and_reports_what_it_omitted() {
     );
     // The webview's read is uncapped by design — retention already bounds the
     // file, so "everything" is a bounded answer and no count can go unreported.
-    assert_eq!(reg.needs_you_view(&g).unwrap().items.len(), 2 + needsyou::RESOLVED_RETAINED);
+    // Every row raised is still there: 14 resolved is under `RESOLVED_RETAINED`,
+    // so nothing was pruned and the difference from the list above is the LIST
+    // cap alone.
+    assert_eq!(
+        reg.needs_you_view(&g).unwrap().items.len(),
+        2 + needsyou::LIST_RESOLVED_CAP + 4
+    );
 }
 
 /// The backend's demo-gate set is a MIRROR of the board's, and this is what
