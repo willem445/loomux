@@ -9421,6 +9421,7 @@ fn task_summary_drops_notes_but_counts_them() {
         related: vec![],
         parent: None,
         kind: None,
+        demo_path: None,
         updated_ms: 42,
     };
     let s = task_summary(&t, false, 0, 0);
@@ -9882,6 +9883,7 @@ fn linked(id: &str, status: &str, deps: &[&str], related: &[&str]) -> Task {
         related: related.iter().map(|s| s.to_string()).collect(),
         parent: None,
         kind: None,
+        demo_path: None,
         updated_ms: 0,
     }
 }
@@ -10005,6 +10007,121 @@ fn pr_base_round_trips_through_the_board_and_clears_on_empty() {
     let clear = TaskPatch { pr_base: Some("   ".into()), ..Default::default() };
     let cleared = reg.upsert_task(&g.id, "orch-1", Some(&t.id), clear).unwrap();
     assert_eq!(cleared.pr_base, None, "a blank pr_base clears the field rather than storing whitespace");
+}
+
+// ---------- #1091 slice B: demo_path ----------
+
+/// The compat half of #1091 slice B, the `pr_base`/#581 pattern applied to
+/// `demo_path`: a `tasks.json` written before this field existed must still
+/// load, with the field simply absent — never an error that would read a live
+/// board as empty (the same failure mode `pre_581_boards_load_with_pr_base_absent`
+/// guards). Also pins the OTHER half of the additive contract, the way #958
+/// pins it for `parent`/`kind` in `pre_958_boards_load_and_a_flat_board_never_gains_the_hierarchy_keys`:
+/// `demo_path` carries `skip_serializing_if = "Option::is_none"` (unlike
+/// `pr`/`pr_base`, which write an explicit `null`), so a board that never sets
+/// it must not GAIN the key on a later rewrite either.
+#[test]
+fn pre_1091_boards_load_with_demo_path_absent() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let path = reg.state_root().join(g.id.as_str()).join("tasks.json");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    // Exactly what loomux wrote before #1091 slice B — a prototype row, no
+    // demo_path key at all.
+    fs::write(
+        &path,
+        r##"[
+  {"id":"t-1","title":"Ship the parser","status":"prototype","issue":null,"pr":null,"assignee":"w-2","session":null,"notes":[],"updated_ms":11}
+]"##,
+    )
+    .unwrap();
+
+    let tasks = reg.tasks(&g.id);
+    assert_eq!(tasks.len(), 1, "a pre-#1091 board must still load — a parse failure reads as an EMPTY board");
+    assert_eq!(tasks[0].status, "prototype", "the fields that were there are untouched");
+    assert_eq!(
+        tasks[0].demo_path, None,
+        "an absent demo_path deserializes to None (no demo recorded), never an error"
+    );
+
+    // A rewrite that never touches demo_path must not GAIN the key — the
+    // same guarantee #958 pins for `parent`/`kind`, so an older loomux (and a
+    // human reading the file) keeps seeing exactly what it saw before.
+    reg.upsert_task(&g.id, "orch", Some("t-1"), patch(None, Some("in-progress"), None)).unwrap();
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(text.contains("in-progress"), "the edit itself landed");
+    assert!(!text.contains("\"demo_path\""), "a board that never set demo_path must not gain the key:\n{text}");
+}
+
+/// `demo_path` survives the write→read path an orchestrator actually uses
+/// (the `upsert_task` engine call `mcp.rs`'s tool arm and the Tauri board-edit
+/// sibling both funnel through), and clears on the empty string like every
+/// other optional text field (`pr`/`pr_base`'s idiom) — so "the demo moved,
+/// no longer at this path" is expressible without hand-editing the board.
+#[test]
+fn demo_path_round_trips_through_the_board_and_clears_on_empty() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let t = reg.upsert_task(&g.id, "orch-1", None, patch(Some("Demo the redesign"), None, None)).unwrap();
+
+    let mut p = patch(None, Some("prototype"), None);
+    p.demo_path = Some("C:/Projects/loomux-worktrees/feat/1091-demo-path".into());
+    let saved = reg.upsert_task(&g.id, "orch-1", Some(&t.id), p).unwrap();
+    assert_eq!(saved.demo_path.as_deref(), Some("C:/Projects/loomux-worktrees/feat/1091-demo-path"));
+
+    // Durable, not just in the returned snapshot: re-read from tasks.json.
+    let path = reg.state_root().join(g.id.as_str()).join("tasks.json");
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(text.contains("1091-demo-path"), "demo_path must reach the file:\n{text}");
+    let reread = reg.tasks(&g.id);
+    assert_eq!(reread[0].demo_path.as_deref(), Some("C:/Projects/loomux-worktrees/feat/1091-demo-path"));
+
+    // Empty string clears (same filter as `pr`/`pr_base`); omitting the field
+    // leaves it untouched.
+    let untouched = reg.upsert_task(&g.id, "orch-1", Some(&t.id), patch(None, None, Some("still there"))).unwrap();
+    assert_eq!(
+        untouched.demo_path.as_deref(),
+        Some("C:/Projects/loomux-worktrees/feat/1091-demo-path"),
+        "omitted means untouched"
+    );
+    let clear = TaskPatch { demo_path: Some("   ".into()), ..Default::default() };
+    let cleared = reg.upsert_task(&g.id, "orch-1", Some(&t.id), clear).unwrap();
+    assert_eq!(cleared.demo_path, None, "a blank demo_path clears the field rather than storing whitespace");
+}
+
+/// The MCP surface #1091 slice B adds: `demo_path` is settable through the
+/// SAME `upsert_task` tool as every other field (D2's "extend, don't add a
+/// second tool" posture applied here too), and reads back through `get_task`
+/// — the full-record read the not-yet-built NEEDS-YOU panel (slice C) and the
+/// human board's `orch_tasks` both use. It deliberately does NOT reach the
+/// compact `list_tasks` projection: #245 keeps that row minimal on purpose,
+/// and slice B's plan (D7) never asked to widen it.
+#[test]
+fn demo_path_is_settable_through_the_upsert_task_tool_and_omitted_from_the_compact_list() {
+    let (reg, _d, co, cw) = setup_mcp();
+    let created = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "upsert_task", "arguments": { "title": "Demo the redesign", "status": "prototype" } }))
+        .unwrap();
+    assert_eq!(created["isError"], false);
+    let id = created["content"][0]["text"].as_str().unwrap().split_whitespace().next().unwrap().to_string();
+
+    let updated = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "upsert_task", "arguments": { "id": id, "demo_path": "C:/Projects/loomux-worktrees/feat/1091-demo-path" } }))
+        .unwrap();
+    assert_eq!(updated["isError"], false);
+
+    let detail = dispatch(&reg, &cw, "tools/call",
+        &json!({ "name": "get_task", "arguments": { "id": id } })).unwrap();
+    let dtext = detail["content"][0]["text"].as_str().unwrap();
+    assert!(dtext.contains("1091-demo-path"), "get_task must surface demo_path: {dtext}");
+
+    let listed = dispatch(&reg, &cw, "tools/call",
+        &json!({ "name": "list_tasks", "arguments": {} })).unwrap();
+    let ltext = listed["content"][0]["text"].as_str().unwrap();
+    assert!(
+        !ltext.contains("1091-demo-path"),
+        "the compact list_tasks row must not carry demo_path (#245): {ltext}"
+    );
 }
 
 #[test]
