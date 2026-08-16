@@ -457,15 +457,6 @@ can add, edit, annotate, reorder, and delete tasks; orrerix notifies you when th
   sets assignee + `in-progress` in one guarded write. That refusal is the board telling
   you the task is taken or blocked (it is what stops a post-compact re-read handing the
   same work to a second worker): read the error, don't route around it with a plain write.
-- **Finish before you start, where the repo says how much is too much.** `list_tasks()`
-  carries `wip`: the per-status limits this repo declares (`board.wip` in
-  `.loomux/workflow.yml`) with the live count in each. It is EMPTY for most repos, and then
-  this bullet is about nothing. Where a cap exists, a status at or over its count is full:
-  finish or re-status something there before putting more in — a `review` queue growing while
-  you keep claiming new work is the failure the caps exist to make visible, and *max live
-  agents* does not catch it (it caps agents, not work). Under `enforce: true` your write into
-  a full status is refused outright, and that refusal is not a retry: relieve the status, or
-  leave the task where it is. A cap counts LEAF rows, so a container does not consume one.
 - **`blocked` is for blockers OUTSIDE the board** — a human decision, an upstream repo, a
   flaky environment — with a note saying what. Ordering *between* board items belongs in
   `deps`, where it is machine-readable.
