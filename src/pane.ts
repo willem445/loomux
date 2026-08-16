@@ -2580,9 +2580,20 @@ export class Pane implements VoiceTargetPane {
    *  which keys on `(reason, detail)` together. The two differ because their
    *  details do: an attention detail is free text the scan can change under a
    *  steady reason, while a held detail is `delivery_held_detail(agent_id,
-   *  reason)` (orchestration/mod.rs), a total function of a fixed `agent_id`
-   *  and a three-variant enum. It therefore cannot move without the reason
-   *  moving, and the cheaper check loses nothing. Copy `setAttention`'s rule
+   *  reason)` (orchestration/mod.rs), a total function over a three-variant
+   *  enum that interpolates nothing but `agent_id`. So under a steady reason it
+   *  cannot move, and the cheaper check loses nothing.
+   *
+   *  Naming the input that is ASSUMED rather than proven, since this comment
+   *  exists because its predecessor over-claimed: that argument holds only
+   *  while `agent_id` is constant for the pane, which is a property of the
+   *  pane-to-agent binding, not of the function. The events dispatch by
+   *  `pty_id` (orchestration.ts), so a pane rebound to a different agent while
+   *  held, with the reason unchanged, would take the early return and keep the
+   *  previous agent's name. The blast radius is the chip's `title` tooltip and
+   *  nothing else — no state, no delivery — which is why the cheap check still
+   *  wins; if a rebind ever needs to repaint it, key on `(reason, detail)` like
+   *  `setAttention` rather than reaching for a rebind hook here. Copy `setAttention`'s rule
    *  here only if that stops being true; copy this one to a NEW badge only
    *  after checking its detail the same way (`setQueueDepth` below is the
    *  other outcome — it keys on the whole reading).

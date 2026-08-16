@@ -265,7 +265,26 @@ export function feedbackRoute(status: string): FeedbackRoute {
  *     the call that actually failed.
  *
  *  The note route is a single call, so it has no partial state to remember and
- *  `findingsLanded` never applies to it. */
+ *  `findingsLanded` never applies to it.
+ *
+ *  **`status-only` deliberately re-sends nothing, and that is a trade, not an
+ *  oversight.** The findings the backend already holds are the ones from the
+ *  press that succeeded; if the human amends the text in the still-open
+ *  textarea before retrying, the amendment is DROPPED. The alternative —
+ *  re-recording — is the duplicate write this whole guard exists to stop, so
+ *  losing the edit is the better failure, but it is silent, and a caller that
+ *  wants to surface it should do so at the dialog rather than by widening this
+ *  step. The same edge in the other direction: the caller checks for empty text
+ *  BEFORE asking for a step, so a retry with the box cleared is a no-op and the
+ *  owed status flip never happens.
+ *
+ *  **Scope: one dialog instance.** `state` is per-dialog, so this closes a
+ *  second PRESS, not a second DIALOG. A human who dismisses the dialog while a
+ *  write is in flight and reopens it gets fresh state, and a Send there is a
+ *  genuine second write. That takes two deliberate gestures rather than one
+ *  habitual double-tap, so it is left as it is — but it is the one crossing
+ *  this function does not cover, and it is named here rather than left for the
+ *  next reader to discover. */
 export interface FeedbackSubmitState {
   /** A write is outstanding for this dialog — Send is disabled, but the
    *  keyboard path reaches `submit` regardless of the button's state. */

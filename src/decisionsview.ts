@@ -607,6 +607,13 @@ export class DecisionsView {
     // The state is held here; what a press MEANS is `feedbackSubmitStep`'s, so
     // that the guard is pinned by `test/decisions.test.ts` rather than by this
     // untested wiring.
+    //
+    // `state` is per-dialog by construction, which bounds what this closes: a
+    // second PRESS, not a second DIALOG. `close()` does not cancel an in-flight
+    // write, so dismissing mid-flight (Escape, or the overlay click below) and
+    // reopening mints fresh state, and a Send there is a real second write.
+    // Two deliberate gestures, not the habitual double-tap this fixes — see
+    // `feedbackSubmitStep`'s doc, which carries the same bound.
     const state: FeedbackSubmitState = { inFlight: false, findingsLanded: false };
     const submit = () => {
       const findings = ta.value.trim();
