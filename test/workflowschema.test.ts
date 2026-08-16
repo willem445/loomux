@@ -210,6 +210,12 @@ function docFor(section: string, field: string, yaml: string): string {
       return (
         ["version: 1", ...roster, "resources:", "  ci:", `    ${field}: ${yaml}`].join("\n") + "\n"
       );
+    case "board":
+      return ["version: 1", ...roster, "board:", `  ${field}: ${yaml}`].join("\n") + "\n";
+    case "board.wip":
+      return (
+        ["version: 1", ...roster, "board:", "  wip:", `    ${field}: ${yaml}`].join("\n") + "\n"
+      );
     default:
       throw new Error(`this test has no fixture shape for section "${section}"`);
   }
@@ -240,6 +246,16 @@ function readBack(w: Workflow, section: string, field: string): { value: unknown
       return at(w.merge_queue as unknown as Record<string, unknown>);
     case "resource":
       return at(w.resources?.ci as unknown as Record<string, unknown>);
+    case "board":
+      return at(w.board as unknown as Record<string, unknown>);
+    // `board.wip` is the one section whose unknown-key bag does not sit on the section
+    // itself: the caps are a plain `Record<string, number>`, so an `extra` key inside it
+    // would be indistinguishable from a cap. It lives on the parent as `wipExtra`.
+    case "board.wip":
+      return {
+        value: w.board?.wip?.[field],
+        extra: (w.board?.wipExtra as Record<string, unknown> | undefined)?.[field],
+      };
     default:
       throw new Error(`this test cannot read section "${section}"`);
   }
@@ -336,6 +352,17 @@ const FIELDS_WITHOUT_AN_EDITOR = new Set<string>([
   "merge_queue.checks_timeout_minutes",
   "resource.slots",
   "resource.max_hold_minutes",
+  // #1175. The pane PARSES, PRESERVES and RE-EMITS `board:` (that is what the two
+  // tests above check) — it just has no generated form for it yet, like every other
+  // field on this list.
+  "board.enforce",
+  "board.wip.queued",
+  "board.wip.in-progress",
+  "board.wip.review",
+  "board.wip.pr",
+  "board.wip.prototype",
+  "board.wip.human-testing",
+  "board.wip.blocked",
 ]);
 
 test("every schema field is either editable in the pane or listed as not yet editable", () => {
@@ -521,7 +548,13 @@ test("every bound the pane clamps to is the bound the manifest declares (#1020)"
   // a ceiling no engine constant and no manifest row declares, and the earlier version of
   // this test could not see it because it asserted only the bounds it named.
   for (const [id, bounds] of Object.entries(POLICY_BOUNDS)) {
-    const [section, field] = id.split(".") as [string, string];
+    // Split on the LAST dot, not the first: a section name may itself contain one
+    // (`intake.labels`, `board.wip`), so `id.split(".")` reads `board.wip.queued` as
+    // section `board`, field `wip` — a field that does not exist, which the `bound`
+    // assertion would then report as a missing manifest row rather than as this
+    // helper's own bug.
+    const dot = id.lastIndexOf(".");
+    const [section, field] = [id.slice(0, dot), id.slice(dot + 1)];
     const declared = bound(section, field);
     assert.equal(bounds.min, declared.min, `${id}: min`);
     // **`max` is compared including its ABSENCE.** A manifest row with no `max` means the
