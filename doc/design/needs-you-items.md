@@ -175,6 +175,42 @@ the rest of this feature refuses.
 defined as "cannot write a file". The upgrade migration used to run here; see
 [the migration](#the-one-shot-migration) for why that was wrong twice over.
 
+### What an agent reads
+
+**Never a stored `Item`.** `project_list` — the projection behind slice B's
+`list_needs_you` — returns `needsyou::AgentItem`, an explicitly enumerated
+struct built field-by-field from `&Item` with **no `..` spread and no derive**.
+That is the point of it: adding a field to `Item` must not be able to put that
+field on an agent surface by itself. Whole-struct serialization onto an agent
+surface is the class that failed on #1160, and this struct is what it costs to
+pre-empt it.
+
+| shown | withheld |
+| --- | --- |
+| `id`, `kind`, `raiser`, `text`, `task`, `urgency`, `status`, `created_ms`, `resolved_ms`, `resolved_by` | `resolution` — the human's verbatim close-out note |
+| `had_resolution` — that a note exists | |
+
+`resolved_by` is shown deliberately: an orchestrator must be able to tell "the
+human looked" from "the board moved on" from "I withdrew this myself", which is
+the whole reason those three tags stay distinguishable.
+
+**Withholding `resolution` diverges from the `humanq` precedent, where the shared
+`list_questions` returns the human's verbatim answer — and the divergence is the
+decision, argued in full in
+[human-questions.md](human-questions.md)'s "items vs. questions" comparison table.**
+In one line: text written *to* an agent reaches it, text written *about* the
+human's own queue is not broadcast. An answer is instructions addressed to the
+asker and work is held pending it; a resolution note is the human annotating
+their own queue while clearing it, the note already reaches the orchestrator's
+pane through `resolve_notice`, and the only thing declined is putting it on a
+read every delegate may call. Reviewed and settled as-is: coming out of #1160,
+"the other registry is wider" is not a reason to loosen an agent surface when the
+other registry's payload is functionally different.
+
+The assertion that polices this is on the **serialized** form, not the struct: a
+field present in Rust but absent from the wire would pass a field-by-field check
+and still leak.
+
 ### `orch-needs-you-changed`
 
 Emitted from `write_needs_you`, the single mutation point — so, the single

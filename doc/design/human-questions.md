@@ -361,6 +361,35 @@ distinguishable where it matters:
 | trusted source | closed `AnswerSource` | closed `ResolveSource` — same shape, same reason |
 | agent may settle its own? | no; may `withdraw_question` | no; may `withdraw_attention` |
 | terminal states | `answered` \| `withdrawn` (the decision was, or was not, obtained) | `resolved`, with `resolved_by` carrying which of three ways |
+| what an agent reads of a settled row | the human's **verbatim answer** | `had_resolution` — that a note exists, **not the note** |
+
+**That last row is a deliberate divergence, not an oversight** (#1151). The two
+payloads are different speech acts, and the rule is not "items are more secret
+than questions":
+
+> **Text written *to* an agent reaches it. Text written *about* the human's own
+> queue is not broadcast.**
+
+An answer *exists to be read by an agent* — the agent asked "A or B?", work is
+held pending the reply, and the answer is instructions addressed to the asker.
+Withholding it would break the feature, which is why `list_questions` returns it
+in full. A resolution note is the human annotating their own attention queue as
+they clear it: the item resolves perfectly well without one, and nothing
+downstream changes either way.
+
+The note is not hidden from the agent it was plausibly written for —
+`needsyou::resolve_notice` delivers it, sanitized, into the **orchestrator's own
+pane**. What the projection declines to do is put it on a *shared* read that
+every delegate may call. And the reversal is asymmetric: narrow → wide is an
+additive field, while wide → narrow breaks a shipped contract and cannot unring
+the bell for notes already read. `had_resolution` keeps the failure mode that
+would actually matter off the table, since an agent can tell that words exist and
+ask rather than invent.
+
+The mechanism is `needsyou::AgentItem`, an enumerated projection built
+field-by-field with no spread and no derive, so a field added to `needsyou::Item`
+cannot reach an agent surface merely by existing. See the "what an agent reads"
+section of [needs-you-items.md](needs-you-items.md).
 
 What they share is `Urgency` — imported from here rather than re-declared, so the
 panel's one urgency-pinned sort is a single comparison rather than a mapping
