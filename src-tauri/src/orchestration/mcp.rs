@@ -728,8 +728,7 @@ fn tool_defs(
     // conjunction and are the real gate; this listing is cosmetic, as
     // everywhere else on this surface.
     if role == Role::Reviewer && role_hint == Some("liaison") {
-        tools.push(group_usage_tool());
-        tools.push(ask_human_tool());
+        tools.push(group_usage_tool()); // SCRATCH NEUTER: the ask_human listing push, removed
     }
     // `process`-hinted worker blocks only (#250/#324 slice D binding rider):
     // slice B shipped this gated to worker-kind generally, since `role_hint`
