@@ -51493,6 +51493,50 @@ fn a_resolved_demo_item_is_never_resurrected_while_its_task_stays_parked() {
     assert_ne!(open[0].id, item.id, "…with its own id and its own timestamps");
 }
 
+/// The FIRST guard, isolated — what the marker itself buys, which nothing else
+/// in this section catches.
+///
+/// The property is that the migration is once-ever, not a reconciler: a board
+/// that gains a demo-gated row by a legacy path AFTER the first load is
+/// deliberately NOT picked up. That is correct rather than a shortfall — every
+/// status change after the registry exists goes through the hook, which raises
+/// on the transition — and it is the observable difference between "the marker
+/// stopped it" and "it ran again and found nothing to do", which `EverRaised`
+/// would otherwise hide.
+#[test]
+fn the_marker_stops_the_migration_reconsidering_a_board_that_changed_later() {
+    let (reg, dir, g, _orch) = setup_needs_you();
+    write_legacy_board(&dir, &g);
+    drop(reg);
+    let reg = relaunch_with_group(&dir, &g);
+    assert_eq!(reg.needs_you(&g).unwrap().len(), 2, "the premise: the first load migrated");
+
+    // A THIRD parked row appears by the same legacy path — a direct tasks.json
+    // write, never through `upsert_task`, so no hook fires for it.
+    let dir_g = dir.path().join(g.as_str());
+    let mut tasks: Value =
+        serde_json::from_str(&fs::read_to_string(dir_g.join("tasks.json")).unwrap()).unwrap();
+    tasks.as_array_mut().unwrap().push(json!({
+        "id": "t-4", "title": "Parked later", "status": "prototype", "notes": [],
+        "deps": [], "related": [], "updated_ms": 2
+    }));
+    fs::write(dir_g.join("tasks.json"), serde_json::to_string_pretty(&tasks).unwrap()).unwrap();
+
+    drop(reg);
+    let reg = relaunch_with_group(&dir, &g);
+    let items = reg.needs_you(&g).unwrap();
+    assert_eq!(items.len(), 2, "the migration is once-ever — it does not reconsider the board");
+    assert!(
+        !items.iter().any(|i| i.task.as_deref() == Some("t-4")),
+        "t-4 arrived after the migration answered, so it is the hook's business, not its"
+    );
+    assert_eq!(
+        audit_of(&reg.audit_log(&g), "needs-you-open").len(),
+        2,
+        "and no second run means no third audit line"
+    );
+}
+
 /// The second guard, isolated. The marker normally means the migration is never
 /// reconsidered at all — so it, not `Dedupe::EverRaised`, is what the test above
 /// actually exercises. This one deletes the marker to reach the case the marker
