@@ -10990,13 +10990,13 @@ fn a_pre_1156_board_stays_editable_everywhere_except_its_shape() {
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
     let path = reg.state_root().join(g.id.as_str()).join("tasks.json");
     fs::create_dir_all(path.parent().unwrap()).unwrap();
-    // A board loomux itself wrote under #958: t- ids throughout, a top-level
-    // feature, a story straight under it (legal then, refused now), and a
-    // level-less row.
+    // A board loomux itself wrote under #958: t- ids throughout, a TOP-LEVEL
+    // `feature` (the illegal row — a feature owes an epic), a story inside it
+    // (that rung is legal, then and now), and a level-less row.
     fs::write(
         &path,
         r##"[
-  {"id":"t-1","title":"The board","status":"in-progress","issue":null,"pr":null,"assignee":null,"session":null,"notes":[],"kind":"feature","updated_ms":11},
+  {"id":"t-1","title":"The board","status":"queued","issue":null,"pr":null,"assignee":null,"session":null,"notes":[],"kind":"feature","updated_ms":11},
   {"id":"t-2","title":"Sorting","status":"queued","issue":null,"pr":null,"assignee":null,"session":null,"notes":[],"parent":"t-1","kind":"story","updated_ms":12},
   {"id":"t-3","title":"Plain old row","status":"queued","issue":null,"pr":null,"assignee":null,"session":null,"notes":[],"updated_ms":13}
 ]"##,
@@ -11004,41 +11004,60 @@ fn a_pre_1156_board_stays_editable_everywhere_except_its_shape() {
     .unwrap();
     let gid = g.id;
     assert_eq!(reg.tasks(&gid).len(), 3, "a pre-#1156 board still loads");
+    // The premise, asserted rather than assumed: t-1 is a row the ladder
+    // refuses, so every edit below is landing on one.
+    assert!(
+        reg.upsert_task(&gid, "orch", Some("t-1"), kind_patch("feature")).is_err(),
+        "the fixture's t-1 must really be an illegal shape, or this test witnesses nothing"
+    );
 
-    // EVERY field but the two that assert the shape is still writable on the
-    // illegal rows — this is the guarantee, and it is the one worth the most.
-    reg.upsert_task(&gid, "orch", Some("t-1"), patch(None, Some("done"), Some("a note"))).unwrap();
+    // EVERY field but the two that assert the shape is still writable on that
+    // illegal row — this is the guarantee, and it is the one worth the most.
     // The claim goes first: it guards on the row's own deps being `done`, so
     // adding an unmet one below would refuse it for a reason that has nothing
     // to do with the ladder.
-    reg.upsert_task(&gid, "orch", Some("t-2"), claim_patch("w-1")).unwrap();
-    reg.upsert_task(&gid, "orch", Some("t-2"), deps_patch(&["t-3"])).unwrap();
-    let t2 = reg.get_task(&gid, "t-2").unwrap();
-    assert_eq!(t2.deps, vec!["t-3".to_string()], "deps still land on a row the ladder would refuse");
-    assert_eq!(t2.assignee.as_deref(), Some("w-1"), "...and so does a claim");
-    assert_eq!(reg.get_task(&gid, "t-1").unwrap().status, "done", "...and a status");
+    reg.upsert_task(&gid, "orch", Some("t-1"), claim_patch("w-1")).unwrap();
+    reg.upsert_task(&gid, "orch", Some("t-1"), deps_patch(&["t-3"])).unwrap();
+    reg.upsert_task(&gid, "orch", Some("t-1"), patch(None, Some("review"), Some("a note"))).unwrap();
+    let t1 = reg.get_task(&gid, "t-1").unwrap();
+    assert_eq!(t1.deps, vec!["t-3".to_string()], "deps still land on a row the ladder refuses");
+    assert_eq!(t1.assignee.as_deref(), Some("w-1"), "...and so does a claim");
+    assert_eq!(t1.status, "review", "...and a status");
+    assert_eq!(t1.notes.len(), 1, "...and a note");
     assert_eq!(
-        (t2.kind.as_deref(), t2.parent.as_deref()),
-        (Some("story"), Some("t-1")),
+        (t1.kind.as_deref(), t1.parent.as_deref()),
+        (Some("feature"), None),
         "and none of those edits quietly repaired — or destroyed — the legacy shape"
     );
 
     // Only a write that RE-ASSERTS the shape is judged. Re-writing the level it
     // already carries is such a write, deliberately: it is a fresh claim about
-    // where this row sits, and the board answers it honestly.
-    let err = reg.upsert_task(&gid, "orch", Some("t-2"), kind_patch("story")).unwrap_err();
+    // where this row sits, and the board answers it honestly. (That is the
+    // assertion the premise check above already made; this one pins the TEXT.)
+    let err = reg.upsert_task(&gid, "orch", Some("t-1"), kind_patch("feature")).unwrap_err();
     assert!(err.contains("must sit inside"), "re-asserting an illegal shape is refused: {err}");
+    assert!(err.contains("clear its level"), "...naming the fix, as every ladder refusal does: {err}");
 
-    // ...and the way out is either move, in one write each.
+    // The way out, three writes and no id rewritten. t-1 cannot become the epic
+    // the ladder wants while a `story` sits inside it, so the child goes first —
+    // the both-directions rule doing exactly what it is for.
+    let blocked = reg.upsert_task(&gid, "orch", Some("t-1"), kind_patch("epic")).unwrap_err();
+    assert!(blocked.contains("t-2"), "the child is what blocks the promotion, and is named: {blocked}");
     reg.upsert_task(&gid, "orch", Some("t-2"), kind_patch("")).unwrap();
     reg.upsert_task(&gid, "orch", Some("t-1"), kind_patch("epic")).unwrap();
     reg.upsert_task(&gid, "orch", Some("t-2"), kind_patch("feature")).unwrap();
-    let fixed = reg.get_task(&gid, "t-2").unwrap();
+    let ids: Vec<(String, Option<String>)> =
+        reg.tasks(&gid).iter().map(|t| (t.id.clone(), t.kind.clone())).collect();
     assert_eq!(
-        (fixed.id.as_str(), fixed.kind.as_deref(), fixed.parent.as_deref()),
-        ("t-2", Some("feature"), Some("t-1")),
+        ids,
+        vec![
+            ("t-1".to_string(), Some("epic".to_string())),
+            ("t-2".to_string(), Some("feature".to_string())),
+            ("t-3".to_string(), None),
+        ],
         "the board is legal now, and NO id was rewritten getting there"
     );
+    assert_eq!(reg.get_task(&gid, "t-2").unwrap().parent.as_deref(), Some("t-1"));
 }
 
 /// Promote-on-delete is the one path that can land a row where no write could
