@@ -19,6 +19,7 @@ import {
   childCounts,
   clearableCount,
   clearedIds,
+  settledIds,
   depCandidates,
   depState,
   DONE_STATUS,
@@ -529,7 +530,12 @@ export class TasksView {
     // Only offered while they are on screen — see the ctor comment.
     this.restoreClearedBtn.hidden = archived === 0 || !this.showCleared;
     this.restoreClearedBtn.textContent = `↩ restore all (${archived})`;
-    this.restoreClearedBtn.title = `Bring all ${archived} cleared item${archived === 1 ? "" : "s"} back into the list`;
+    // "All" means the rows the toggle beside it is hiding — the same set, so
+    // the two counts can never disagree about what this button acts on. A
+    // cleared container still holding live work is not in that set (it never
+    // left the list); its own ↩ is how it comes back.
+    this.restoreClearedBtn.title =
+      `Bring back all ${archived} item${archived === 1 ? "" : "s"} the 👁 toggle hides`;
   }
 
   /** Archive every clearable done row in one backend call. Non-destructive and
@@ -906,6 +912,10 @@ export class TasksView {
     // its order stays the human's priority order. What is derived from it: the
     // tree (from `parent`), finished subtrees sinking below the live work of
     // their own sibling group, and the archived rows dropping out until 👁.
+    // Board-level, computed once for the whole render like `usesDeps`/`blocked`
+    // above: which rows are finished subtrees (#1152). Each row's ▲/▼ needs it,
+    // and re-deriving it per row would walk the tree once per row.
+    const settled = settledIds(this.tasks);
     const rows = visibleRows(this.tasks, this.collapsed, this.showCleared);
     if (rows.length === 0) {
       // The board is not empty — everything on it is archived. Say that,
@@ -921,7 +931,7 @@ export class TasksView {
       return;
     }
     for (const row of rows) {
-      this.listEl.appendChild(this.renderTask(row, usesDeps, usesHierarchy, blocked));
+      this.listEl.appendChild(this.renderTask(row, usesDeps, usesHierarchy, blocked, settled));
     }
     this.drainFocus();
   }
@@ -1236,7 +1246,8 @@ export class TasksView {
     boardRow: BoardRow<OrchTask>,
     usesDeps: boolean,
     usesHierarchy: boolean,
-    blocked: ReadonlyMap<string, string>
+    blocked: ReadonlyMap<string, string>,
+    settled: ReadonlySet<string>
   ): HTMLElement {
     const t = boardRow.task;
     const row = el("div", "task-row");
@@ -1296,7 +1307,7 @@ export class TasksView {
     const order = el("div", "task-order");
     const up = el("button", "task-btn", "▲") as HTMLButtonElement;
     const down = el("button", "task-btn", "▼") as HTMLButtonElement;
-    const pos = siblingPosition(this.tasks, t.id);
+    const pos = siblingPosition(this.tasks, t.id, settled);
     up.disabled = pos.index <= 0;
     down.disabled = pos.index < 0 || pos.index === pos.count - 1;
     // A settled row reports {-1, 0} above, so both buttons are already off —
