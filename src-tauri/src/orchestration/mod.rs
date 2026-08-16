@@ -8987,8 +8987,11 @@ pub const TASK_KINDS: [&str; 4] = ["epic", "feature", "story", "task"];
 /// as data. `ladder_rule` is the ONLY place this table exists on this
 /// side, so the write path and every error string it produces cannot drift
 /// apart; the board's mirror of it (`src/taskboard.ts`) is what the picker
-/// filters on, and `hierarchy_ladder_matches_the_boards_copy` pins the two
-/// against the same case list.
+/// filters on, and the two are held together by ONE test — `the board's ladder
+/// table is the backend's, read out of the Rust source`
+/// (`test/taskboard.test.ts`), which reads the arms below out of this file's
+/// source. Not `the_ladder_table_is_pinned_on_the_rust_side`, which despite its
+/// name only asserts this side against Rust literals.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LadderRule {
     /// No rule at all — a kind-less row, and any value outside `TASK_KINDS`

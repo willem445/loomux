@@ -415,9 +415,13 @@ export function withoutDep(deps: readonly string[] | null | undefined, id: strin
  *  doc/design/task-hierarchy.md). The difference is what the rule reads: a
  *  cycle or a depth bust is a property of the whole mutable tree, re-derived
  *  per candidate, where the ladder is a fixed table over two closed
- *  vocabularies that both sides enumerate in full. `test/taskboard.test.ts` and
- *  `src-tauri/tests/orchestration.rs` pin the same case list against each side,
- *  so a divergence reddens rather than being discovered by a refused write. */
+ *  vocabularies that both sides enumerate in full. What makes a divergence
+ *  REDDEN rather than be discovered by a refused write is one specific test —
+ *  `the board's ladder table is the backend's, read out of the Rust source`
+ *  (test/taskboard.test.ts), which reads `ladder_rule`'s arms out of the Rust
+ *  source and compares them to the table below. The two per-side table tests
+ *  do NOT buy that: each asserts its own side against its own literals, so
+ *  editing one language's rule and its own test leaves the other green. */
 export const KINDS = ["epic", "feature", "story", "task"] as const;
 
 /** Where a row of a given kind may sit (#1156) — the mirror of the backend's

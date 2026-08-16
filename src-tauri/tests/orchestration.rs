@@ -139,8 +139,10 @@ use loomux_lib::orchestration::{
     spawn_rate_exceeded, spawn_request_expired, strip_ansi, submit_confirmed, submit_sequence,
     blocking_ancestor, board_summaries, cap_task_notes, task_ready, task_summary, unmet_deps,
     TASK_STATUSES,
-    // #1156: the strict Agile ladder, as a table the board's own copy is
-    // pinned against (`hierarchy_ladder_matches_the_boards_copy`).
+    // #1156: the strict Agile ladder, pinned against Rust literals here
+    // (`the_ladder_table_is_pinned_on_the_rust_side`) and against the board's
+    // copy from the OTHER side, by a guard that reads `ladder_rule`'s arms out
+    // of mod.rs (`test/taskboard.test.ts`).
     ladder_rule, LadderRule, TASK_KINDS,
     // #865: done-row cap on list_tasks — the pure keep/drop rule and its default.
     filter_done_rows, LIST_TASKS_DONE_CAP,
@@ -10997,15 +10999,18 @@ fn kind_patch(kind: &str) -> TaskPatch {
     TaskPatch { kind: Some(kind.into()), ..Default::default() }
 }
 
-/// The whole ladder as a table, pinned against the board's own copy of it.
+/// The whole ladder as a table, on this side.
 ///
-/// `test/taskboard.test.ts`'s "the ladder table is the same one the backend
-/// enforces" asserts THIS case list against the frontend's `ladderRule`. #958
-/// §9 refused to mirror the cycle and depth-cap rules into the picker for good
-/// reasons; #1156 mirrors this one, so the pair of tests is what stands in for
-/// the shared code the two languages cannot have.
+/// This test does NOT pin the board's copy — it asserts the Rust table against
+/// Rust literals, so what it catches is a rule edited without its own test.
+/// The CROSS-LANGUAGE pin is `the board's ladder table is the backend's, read
+/// out of the Rust source` (`test/taskboard.test.ts`), which reads the arms of
+/// `ladder_rule` out of this file's source and compares them to the board's
+/// table; that is the one that reddens when the two ladders part. Naming the
+/// wrong one here was a review finding — a pair of same-shaped tests looks like
+/// an equivalence and is not one.
 #[test]
-fn hierarchy_ladder_matches_the_boards_copy() {
+fn the_ladder_table_is_pinned_on_the_rust_side() {
     assert_eq!(ladder_rule(Some("epic")), LadderRule::TopLevelOnly);
     assert_eq!(ladder_rule(Some("feature")), LadderRule::Inside("epic"));
     assert_eq!(ladder_rule(Some("story")), LadderRule::Inside("feature"));

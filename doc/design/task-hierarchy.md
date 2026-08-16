@@ -405,10 +405,20 @@ is what shipped.
   full, so the copy is a lookup, not a re-derivation. It also earns more: on a levelled row an
   unfiltered nest picker is almost entirely illegal choices, which teaches the ladder one toast at
   a time. The backend stays the authority — every refusal still surfaces through the same toast —
-  and the two tables are pinned against the same case list from both sides
-  (`hierarchy_ladder_matches_the_boards_copy` in `src-tauri/tests/orchestration.rs`, "the ladder
-  table is the same one the backend enforces" in `test/taskboard.test.ts`), so a divergence
-  reddens rather than being discovered by a user's refused write.
+  and the two tables are held together by **one** test: `the board's ladder table is the
+  backend's, read out of the Rust source` (`test/taskboard.test.ts`) reads `ladder_rule`'s match
+  arms out of the Rust source and compares them to the board's table, so editing either ladder
+  alone reddens rather than being discovered by a user's refused write.
+
+  **The two per-side table tests do not buy that, and the first draft of this note said they
+  did.** `the_ladder_table_is_pinned_on_the_rust_side` and "the ladder table is the same one the
+  backend enforces" each assert their own side against their own literals, so editing one
+  language's rule *and its own test* leaves the other green and the ladders diverged. A pair of
+  same-shaped tests either side of a language boundary reads like an equivalence and is not one —
+  it catches a rule edited without its test, which is worth having and is a strictly weaker claim.
+  The source-scanning guard is what makes the equivalence real, in the shape `tests/groupid.rs`
+  and `test/perfpolicy.test.ts` already establish: default-deny, decided on a shape that cannot
+  compile another way, blind spots stated in the test itself.
 - **Set kind — landed later, slice K.** Everything above shipped with #1027; this one item
   followed in a later slice once the demo showed the badge but no way to change it. A third,
   separate picker (a `🏷` button, alongside `⤵` nest and `🔗` depends-on) — the same
