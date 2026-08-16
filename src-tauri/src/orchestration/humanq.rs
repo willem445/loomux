@@ -484,7 +484,10 @@ pub fn validate_ask(req: AskRequest) -> Result<AskRequest, String> {
                     .into(),
             );
         }
-        if req.allow_free_text == Some(false) {
+        // [scratch] NEUTERED: the tidy-looking symmetry N2 warns about —
+        // refuse whenever allow_free_text was mentioned at all, rather than
+        // only when it was denied.
+        if req.allow_free_text.is_some() {
             return Err(
                 "allow_free_text: false needs options — with no options and no free text there \
                  is nothing left for the human to answer with"
