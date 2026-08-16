@@ -411,6 +411,15 @@ reads dimmed and in italics — so an old assignee on a done, reopened, or stall
 task never looks like the same agent is still sitting there. `done` items dim
 further still, receding behind whatever's still active.
 
+A row that's blocked on a human decision or parked for a demo also wears a
+small **marker chip** right after its id — the first thing to catch your eye
+once you know the shape. **❓ needs a decision** means a pending question names
+this row; **👀 needs a look** means the row itself sits in `prototype` or
+`human-testing` with no question naming it (a row that's somehow both shows
+only the decision chip — it's the more specific, more blocking ask). Click it
+to jump straight to that item in the [NEEDS-YOU panel](#steering-attention-and-audit)
+(`Alt+Q`).
+
 ### Dependencies — what's actually startable
 
 A task can declare that it waits on other tasks on the same board. The
@@ -506,15 +515,56 @@ These deserve their own detail — see:
   message.
 - **Attention routing** — a pane earns a pulsing **needs-attention** chip when an
   agent is parked on a prompt only you can answer, when a worker reports done or
-  blocked, when a task hits a human merge gate, or when the orchestrator has a
-  question pending your answer. There's no way to answer one yet — that needs
-  the inbox panel (#1091 slice C, not yet shipped), so the pane chip is the
-  only surface today: hover it for the question count, and ask the
-  orchestrator to summarize its pending questions if you want the text.
-  Until the panel lands, the orchestrator can withdraw a question that's
-  been overtaken by events; there is no other way to settle one. An optional
-  per-group **desktop notification** toggle (🔔 in the lifecycle panel) raises
-  an OS toast for those events (off by default).
+  blocked, when a task hits a human merge gate, or when the orchestrator (or a
+  liaison pane, if the group's workflow has one) has a question pending your
+  answer. Hovering the question chip shows a live count; clicking it focuses
+  the pane and acknowledges the chip — acknowledging only tells loomux you've
+  seen it, so a chip that's still genuinely true comes right back on the next
+  scan.
+  - **The NEEDS-YOU panel** (`Alt+Q`, or the raised-hand icon in an
+    orchestrator pane's header) is where you actually act on a pending
+    question or a demo — everything currently waiting on you, badged with a
+    running total in its own header:
+    - **Decisions** — one card per pending question. Pick one of its options
+      (each can carry the asker's own reasoning under the label), type a
+      free-text answer, or both; a question decides for itself whether it
+      allows a single pick, several, or no free text at all, and the card
+      only offers what that question allows. Sending delivers your answer to
+      the **orchestrator's** pane — even for a question a liaison pane
+      posed, since the liaison never gets the answer notice itself and
+      instead reads the outcome back through its own `list_questions`. A
+      card that names the board row it's holding up links straight to it,
+      and answered or withdrawn questions fall into a faded "answered" tail
+      (the most recent ten) instead of vanishing.
+    - **Demos** — one card per board row parked in `prototype` or
+      `human-testing`, showing the worktree path where the demo lives (click
+      to copy) and a link to its PR when it has one, so you can go run it
+      yourself; a row with no recorded path says so rather than guessing one.
+      **Proceed** promotes a `prototype` (the same gesture as the board's own
+      Proceed button). **Feedback** is offered on either status and sends your
+      notes back to the orchestrator — on `human-testing` it's the
+      request-changes gesture and reopens the task, on `prototype` it's a
+      plain note that leaves the demo gate exactly where it was.
+
+    The panel is the only place a question gets **answered** — before it
+    existed there was no answer surface in the UI at all. Withdrawing one is
+    still a separate, orchestrator-only path: `withdraw_question` settles an
+    overtaken question too, just as *withdrawn* rather than answered, and
+    that was already true before this panel shipped.
+  - **loomux's protocol is that no agent asks you through a blocking
+    dialog.** The orchestrator's role instructions — and a liaison pane's,
+    where the group's workflow declares one — call for filing every question
+    through `ask_human` instead of a CLI's own interactive-question dialog,
+    because a dialog holds the whole pane and refuses every delivery queued
+    behind it. That is instruction an agent follows, not yet something
+    loomux enforces structurally on every CLI, so treat it as the norm
+    rather than a hard guarantee.
+  - An optional per-group **desktop notification** toggle (🔔 in the lifecycle
+    panel) raises an OS toast the first time a question needs your answer
+    (off by default). It fires for that and for the other reasons above —
+    **except** a task merely reaching a merge or demo gate, which is common
+    enough (every PR does it) that toasting on it would be noise; the board
+    and the NEEDS-YOU panel are where you see those.
   - Most chips clear themselves: they're recomputed every few seconds, and
     clicking one focuses the pane and acknowledges it.
   - The red **⚠ stuck prompt** chip is the exception. It means a prompt loomux
