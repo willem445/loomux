@@ -38995,7 +38995,6 @@ impl OrchRegistry {
             // descendant, so the group's own declaration does not cover it and
             // the descendant rule cannot reach it. Without this the agent's own
             // pane could not browse its own workspace once slice C enforces.
-            crate::rootreg::admit_derived(&self.roots, &wt);
             // #359: a reviewer's worktree is scratch space, not a checkout of
             // the PR it's reviewing — that branch may already be checked out
             // in the worker's own worktree, and git refuses the same branch

@@ -30,6 +30,15 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::obs::LockExt;
+// #1042 red-before-green scratch B: the BYPASS the extended scan now closes —
+// a bare-name import lets a brand-new admit site, in a file no allowlist row
+// mentions, match none of the call-shape needles. Never merged.
+use crate::rootreg::admit;
+
+#[allow(dead_code)]
+fn scratch_declare(roots: &loomux_engine::rootreg::RootRegistry, cwd: &str) {
+    let _ = admit(roots, cwd);
+}
 
 /// How often the `.git` metadata of watched repos is sampled. One second keeps
 /// the worst-case latency (poll interval + the frontend's 500 ms throttle)
