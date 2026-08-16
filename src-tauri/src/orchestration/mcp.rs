@@ -1092,7 +1092,7 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             // that widens: `withdraw_question` (the arm below) settles a row and
             // stays orchestrator-only, and NOTHING here can answer one. Re-
             // checked here because the listing is cosmetic.
-            require_orchestrator_or_liaison(caller, "posing a question to the human")?;
+            require_orchestrator(caller)?; // SCRATCH NEUTER: the widened gate, reverted
             let text = arg_str(args, "text").ok_or("text required")?;
             let urgency = match arg_str_strict(args, "urgency")? {
                 Some(u) => super::humanq::Urgency::parse(u)?,
