@@ -527,30 +527,34 @@ adds elsewhere in this note on `integration/ui-redesign` — the two land on
 different branches and must merge without touching each other's prose.*
 
 Q3 (not yet landed — see "What Q1 does and does not reach" above) will teach
-the orchestrator's protocol prose "use `ask_human`, never a blocking dialog";
-#1091 slice E, landing separately on `integration/ui-redesign`, will widen
-that same prose into `liaison.md`. Both are instruction-backed, not
-structural — the whole reason this note exists is that an instruction did not
-stop the #578 incident. Q4/H is the enforcement half: make the blocking
-dialog **unreachable** for the two roles whose pane a hold can stall a fleet
-behind, rather than merely discouraged.
+the orchestrator's protocol prose "use `ask_human`, never a blocking dialog".
+Q4/H is the enforcement half, landing here: make the blocking dialog
+**unreachable** for the two roles whose pane a hold can stall a fleet behind,
+rather than merely discouraged — instruction-backed alone did not stop the
+#578 incident.
 
-**`ask_human` is the orchestrator's replacement only — it is not a liaison's.**
-`ask_human` dispatches through `require_orchestrator` (`mcp.rs`): "Orchestrator-only
-in v1: delegates already have `message_orchestrator`, so questions to the
-human have one funnel." A `role_hint: liaison` block is `Role::Reviewer`
+**`ask_human` is the orchestrator's replacement TODAY — it is not yet a
+liaison's, and this slice does not change that.** `ask_human` dispatches
+through `require_orchestrator` (`mcp.rs`): "Orchestrator-only in v1:
+delegates already have `message_orchestrator`, so questions to the human have
+one funnel." A `role_hint: liaison` block is `Role::Reviewer`
 (`role_hint_requires` pins the hint to that kind), never the orchestrator, so
-it cannot call `ask_human` either — denying it `AskUserQuestion` here does not
-hand it a registry-backed question in exchange. That is not a gap this slice
-needs to close: a liaison's whole pane *is* the human conversation, so it asks
-in prose the way it always has (the interactive dialog only ever blocked that
-conversation, never enabled it), and anything that must become a durable,
-registry-backed question goes through `message_orchestrator` to the
-orchestrator's own `ask_human` funnel — the same "one funnel" `mcp.rs`
-already argues `ask_human`'s orchestrator-only gate for. #1091's UI work
-(slice E's prose + the panel) is what will make that relay path legible to
-the human as something other than ordinary pane chatter; it is not shipped by
-this slice.
+it cannot call `ask_human` — denying it `AskUserQuestion` here does not hand
+it a registry-backed question in exchange. **The interim, today:** a liaison's
+pane *is* the human conversation, so it asks in prose the way it always has
+(the dialog only ever blocked that conversation, never enabled it); anything
+that should become a registry row goes through `message_orchestrator`, and
+only becomes one if the orchestrator independently chooses to pose it — the
+liaison does not control that outcome, so this is a fallback, not the design.
+
+**The liaison's own durable path arrives with #1091 slice E** (landing
+separately, on `integration/ui-redesign`, not yet landed): it will widen the
+`ask_human` pose gate itself — `require_orchestrator` to
+`require_orchestrator_or_liaison` — plus the matching listing gate, so a
+liaison poses its **own** registry-backed, NEEDS-YOU-panel-badged question,
+the same way the orchestrator does today, rather than relaying through one.
+That is a capability change, not a prose one; `liaison.md` documenting it is
+downstream of the gate, not a substitute for it.
 
 ### The deny predicate
 
