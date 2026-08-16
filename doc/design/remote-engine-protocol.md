@@ -185,7 +185,7 @@ That is a fact about the transport. Nobody issued it, nothing checks it, and it
 cannot be revoked. Reproduce the same command surface over a socket and it
 evaporates: every peer that can open a connection becomes "the webview".
 
-And the surface is worse than one identifier. Today's 147 commands
+And the surface is worse than one identifier. Today's 150 commands
 (`src-tauri/src/command_manifest.rs`, the ACL manifest's single source of truth)
 include, by design:
 
@@ -462,8 +462,8 @@ over the same list, and a reviewer already knows how to read it.
 
 That mechanism is not optional bookkeeping, and this repo's own artifacts are the
 evidence. The plan-408 census counted 134 commands; `APP_COMMANDS` listed **141**
-when this section was written, **146** as of #1042 slice B, and **147** as of
-#996. Twelve arrived across those first two intervals, and under a
+when this section was written, **146** as of #1042 slice B, **147** as of
+#996, and **150** as of #1151 slice A. Twelve arrived across those first two intervals, and under a
 hand-maintained allowlist that
 nobody re-derived, every one would have been silently wire-reachable or silently
 broken. The count is dated rather than restated as a bare "today", because that
@@ -506,7 +506,7 @@ not.
 > is the cheap half and the enforcement is the expensive half.** Deciding
 > `orch_grant_merge` is owner-tier costs a table cell today; discovering it was
 > never marked, after a year of commands landing without anyone asking, costs an
-> audit of all 147 of them. The roster ships in v1 (§5.1); the tier column is the
+> audit of all 150 of them. The roster ships in v1 (§5.1); the tier column is the
 > hardening track reading from a table that was kept current all along.
 
 Three tiers, ordered: **viewer** ⊂ **operator** ⊂ **owner**.
@@ -538,9 +538,9 @@ are where the 64-vs-66 drift above lives).
 | **gh** (11) | 7 | wire | viewer | `gh_auth_status`, `gh_label_vocabulary`, `gh_issue_list`, `gh_issue_view`, `gh_pr_list`, `gh_pr_view`, `gh_activity`. `gh_label_vocabulary` reads the repo's label set (it is what stops the issues view hardcoding a vocabulary), so it is a read of the **server's** repo like the rest of this row |
 | | 4 | wire | operator | `gh_issue_create`, `gh_issue_set_labels`, `gh_issue_comment`, `gh_pr_comment` — these write to GitHub as the daemon's credential (H9) |
 | **gitwatch** (2) | 2 | wire | viewer | |
-| **orchestration** (69) | 19 | wire | viewer | reads: `orch_tasks`, `orch_audit`, `orch_merge_queue`, `orch_autonomy`, `orch_group_usage`, `orch_group_summary`, `orch_workflow_status`, `orch_workflow_preview`, `orch_group_watches`, `orch_lock_state`, `orch_group_paused`, `orch_notify_enabled`, `orch_spawn_expanded`, `orch_session_roles`, `orch_channel_list`, `orch_channel_for_pane`, `orch_questions_list`, `agent_autopilot_flags`, `agent_cli_knobs` — **all filtered by caller visibility** (§6.4) |
-| | 38 | wire | operator | group lifecycle, binding, steering, task CRUD, `orch_request_changes`, attention acks, spawn/solo flow, channel connect/disconnect/set-sender, and the `orch_set_*` knobs that are **not** autonomy raises |
-| | 11 | wire | **owner** | `orch_approve_task`, `orch_approve_tasks`, `orch_grant_merge`, `orch_grant_release`, `orch_set_autonomous`, `orch_set_auto_merge`, `orch_set_auto_release`, `orch_set_full_autonomy`, `orch_set_dangerous_mode`, `orch_set_autonomy_budget`, `orch_question_answer` |
+| **orchestration** (72) | 20 | wire | viewer | reads: `orch_tasks`, `orch_audit`, `orch_merge_queue`, `orch_autonomy`, `orch_group_usage`, `orch_group_summary`, `orch_workflow_status`, `orch_workflow_preview`, `orch_group_watches`, `orch_lock_state`, `orch_group_paused`, `orch_notify_enabled`, `orch_spawn_expanded`, `orch_session_roles`, `orch_channel_list`, `orch_channel_for_pane`, `orch_questions_list`, `orch_needs_you_list`, `agent_autopilot_flags`, `agent_cli_knobs` — **all filtered by caller visibility** (§6.4) |
+| | 39 | wire | operator | group lifecycle, binding, steering, task CRUD, `orch_request_changes`, attention acks, spawn/solo flow, channel connect/disconnect/set-sender, `orch_needs_you_clear`, and the `orch_set_*` knobs that are **not** autonomy raises. `orch_needs_you_clear` is operator and not owner because it stamps a per-group **view** watermark: it hides already-settled rows, mutates no record, and by construction cannot reach an open one — so the worst a peer holding it can do is hide history a human had left on screen |
+| | 12 | wire | **owner** | `orch_approve_task`, `orch_approve_tasks`, `orch_grant_merge`, `orch_grant_release`, `orch_set_autonomous`, `orch_set_auto_merge`, `orch_set_auto_release`, `orch_set_full_autonomy`, `orch_set_dangerous_mode`, `orch_set_autonomy_budget`, `orch_question_answer`, `orch_needs_you_resolve` |
 | | 1 | **retargeted** | viewer | `orch_open_ref` — the server resolves the ref to a URL (its `open_external_url` helper is the local half today) and returns it; the **client** opens it in the human's browser |
 | **cliprobe** (1) | 1 | wire | viewer | `probe_agent_cli` probes the **server's** CLIs |
 | **modelwire** (1) | 1 | wire | viewer | `list_cli_models` (#993) reads what the **server's** startup sweep found for a CLI. Operator under #993, when the command itself spawned the agent CLI and a viewer clicking `detect` could have spent the operator's credits. #1020 removed that: the command is a memo LOOKUP that cannot spawn anything, the sweep is the only spawn site and runs on the server's own schedule with no client able to trigger it, so the answer is now a read like `probe_agent_cli`'s. **The underlying cost claim is still unverified** (doc/design/model-catalog.md §Credit safety) — what changed is that no client gesture reaches it. Restoring a client-triggered ask would make this operator again |
@@ -558,10 +558,10 @@ are where the 64-vs-66 drift above lives).
 | **voice** (3) | 3 | **client-local** | — | mic capture and whisper are client hardware; the transcript rides `write_pty` like any other keystrokes |
 
 Totals, **derived from `APP_COMMANDS` at the commit this line was last touched
-and not since** (#996): **133 wire**, **8 client-local** (`take_startup_notice`,
+and not since** (#1151): **136 wire**, **8 client-local** (`take_startup_notice`,
 the four `uistate` UI-state commands, the three `voice_*`), **5 disabled**
 (`open_in_editor`, `fm_open`, `fm_open_with`, `fm_reveal`, `admit_root`), **1
-retargeted** (`orch_open_ref`) = **147**, the total `app_commands_len_is_<N>`
+retargeted** (`orch_open_ref`) = **150**, the total `app_commands_len_is_<N>`
 pins.
 
 > **The table now partitions `APP_COMMANDS` exactly, and that is precisely the
@@ -573,7 +573,16 @@ pins.
 > `command_manifest.rs` and the command's own doc comment rather than folded in
 > by arithmetic, because classifying a command is a security decision: two of
 > those five are an autonomy raise and the human-answer surface, and a third is
-> the root-minting door. **Slice C still owns the enforcement.** C2's roster test
+> the root-minting door. #1151 slice A's three (`orch_needs_you_list`,
+> `orch_needs_you_resolve`, `orch_needs_you_clear`) were placed in the same pass
+> that added them, each classified off its own doc comment rather than by family:
+> the resolve is owner for `orch_question_answer`'s **second** reason below —
+> human-connection-only, since it hard-codes its own trusted source rather than
+> taking one — while the clear is operator, because it stamps a per-group *view*
+> watermark that mutates no record and by construction cannot reach an open row.
+> Every count in the table was re-derived from `APP_COMMANDS` and its `n` column
+> checked to sum to it, per the paragraph below.
+> **Slice C still owns the enforcement.** C2's roster test
 > is what makes a sixth unplaced command fail CI instead of sitting here
 > unnoticed; until it ships, the paragraph below is the only thing between this
 > table and its next drift.

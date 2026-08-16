@@ -333,6 +333,40 @@ registry's `questions.json` is untouched by it. See #582/#958's `Task`
 doc-comments for the rest of the board's own contract — this section covers
 only what #1091 slice B adds to it.
 
+> **Superseded as of #1151, and this section is kept because the reasoning
+> below is still the board's.** A demo item is no longer a projection: it is a
+> first-class row in a second registry, `needs-you.json`, described in
+> [needs-you-items.md](needs-you-items.md). What follows about `Task.demo_path`,
+> the demo-gated statuses and the board deep-link is unchanged and is what that
+> registry's items *link to* — the item owns who asked, when, and open/resolved,
+> while the task keeps owning `demo_path`, `pr`, `assignee` and its status.
+
+### Items vs. questions — two registries, one panel
+
+The panel is **one surface over two registries**, and folding them together was
+rejected on purpose. `questions.json` is a shipped public contract with the trust
+boundary this note spends three layers arguing for; *answering* a question
+settles a decision the human was asked and releases the work waiting on it, while
+*resolving* a needs-you item says only "I have looked". Entangling the two would
+widen exactly the surface #946 kept narrow, and would migrate a live file holding
+decisions nobody has made yet.
+
+So `question` is deliberately **not** a needs-you `kind`, and the shapes stay
+distinguishable where it matters:
+
+| | question (`humanq`) | needs-you item (`needsyou`) |
+| --- | --- | --- |
+| the ask | decide this | look at this / tell us what you think |
+| settling it | `answer_question` — releases held work | `resolve_needs_you` — acknowledges only |
+| trusted source | closed `AnswerSource` | closed `ResolveSource` — same shape, same reason |
+| agent may settle its own? | no; may `withdraw_question` | no; may `withdraw_attention` |
+| terminal states | `answered` \| `withdrawn` (the decision was, or was not, obtained) | `resolved`, with `resolved_by` carrying which of three ways |
+
+What they share is `Urgency` — imported from here rather than re-declared, so the
+panel's one urgency-pinned sort is a single comparison rather than a mapping
+table — and the `needs-you-cleared` watermark, which hides **settled rows of both
+kinds** and touches neither file.
+
 ### `Task.demo_path` (slice B)
 
 One additive, optional field: `demo_path: Option<String>` — the worktree path
