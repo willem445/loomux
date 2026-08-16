@@ -11202,12 +11202,17 @@ pub struct OrchRegistry {
     /// ORCHESTRATOR — narrower than the Q4 CLI deny, which also covers the
     /// liaison — because `deliver_now` gates on `target_is_orchestrator`
     /// alone; see `deliver_now`'s `emit_held`/`emit_held_cleared` closures,
-    /// which are the sole writers. Latched for the same reason `attn_stranded` is: the
-    /// hold can run for `QUESTION_HOLD_MAX` (minutes) between two 3-second
-    /// `attention_tick` scans, so a reason RE-DERIVED each scan (the way
-    /// `waiting` is) could miss the whole window. Cleared the instant the
-    /// hold itself clears (`emit_held_cleared` fires unconditionally when a
-    /// hold that was entered ends, whatever the outcome — see
+    /// which are the sole writers. Latched, not RE-DERIVED each scan the way
+    /// `waiting` is, because there is nothing for `attention_tick` to
+    /// re-derive it from: the hold lives on `deliver_now`'s own call stack
+    /// (blocked inside `hold_for_human_input`, capped at `QUESTION_HOLD_MAX`
+    /// — 120s), not in any pty state a periodic scan could read the way
+    /// `waiting` reads a prompt-shaped tail. So the hold has to be mirrored
+    /// into this shared map at the moment it starts, or `attention_tick`
+    /// would have no way to know it is happening at all. Cleared the instant
+    /// the hold itself clears (`emit_held_cleared` fires unconditionally when
+    /// a hold that was entered ends, whatever the outcome — including at the
+    /// `QUESTION_HOLD_MAX` cap, even if the dialog is still on screen; see
     /// `wait_for_question_clear`), and pruned in `attention_tick` when the
     /// agent stops running, mirroring `attn_stranded`.
     ///
@@ -17998,12 +18003,14 @@ fn deliver_now(
         // that stays a passive badge, since a human answering a delegate's
         // dialog in person never stalls anyone else) is exactly the #578
         // stall: the `--disallowedTools` deny closes this for Claude, but a
-        // CLI with no tool-level deny can still land here, and this transient
-        // Tauri event alone is easy to miss across `QUESTION_HOLD_MAX`
-        // (minutes) between two 3-second `attention_tick` scans. `reg` is
-        // `None` for a delivery with no registry behind it (see this
-        // function's doc) — no belt without one, same as every other `reg`-
-        // gated behavior here.
+        // CLI with no tool-level deny can still land here. The `orch-
+        // delivery-held` event above only ever reaches a frontend that is
+        // subscribed and rendering AT THIS INSTANT; mirroring it into
+        // `attn_question_held` instead gives a client a state it can read at
+        // any later point too, the same way every other attention reason is
+        // polled rather than event-only. `reg` is `None` for a delivery with
+        // no registry behind it (see this function's doc) — no belt without
+        // one, same as every other `reg`-gated behavior here.
         if target_is_orchestrator && reason == HeldReason::InteractiveQuestion {
             if let Some(r) = &reg {
                 r.latch_question_held(&agent);

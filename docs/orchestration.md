@@ -607,12 +607,17 @@ These deserve their own detail — see:
     chip you cleared can always be looked up later.
   - **The ⛔ held on a dialog chip** is the most urgent of all — it outranks even
     a worker reporting blocked. It only ever appears on the **orchestrator's own**
-    pane, and only when its CLI's own interactive-question dialog has somehow ended
-    up on screen there anyway: on Claude that dialog is denied outright (see
-    below), but not every CLI loomux supports can be told to refuse it at that
-    level, so this chip is the fallback that still tells you a held orchestrator
-    pane is stranding every delegate's report queued behind it, not just its own.
-    It clears itself the moment the hold does — it never needs a dismiss.
+    pane, and only while loomux is **actively trying to deliver something to it
+    right now** and finding its CLI's own interactive-question dialog on screen:
+    on Claude that dialog is denied outright (see below), but not every CLI
+    loomux supports can be told to refuse it at that level, so this chip is the
+    fallback that still tells you a held orchestrator pane is stranding every
+    delegate's report queued behind it, not just its own. It comes down the
+    moment that delivery attempt stops holding — either because the dialog
+    cleared, or because the attempt gave up waiting (loomux tries again shortly
+    after, and the chip returns then if the dialog is still there) — so it never
+    needs a dismiss, but it can also briefly drop even while the dialog is still
+    up between one attempt ending and the next one starting.
   - **The orchestrator can't use its CLI's own question dialog at all, on Claude.**
     A single stuck question dialog on the orchestrator's pane once held a whole
     run overnight — every worker report queued behind it and started being

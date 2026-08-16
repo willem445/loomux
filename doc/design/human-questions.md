@@ -526,12 +526,31 @@ chip).
 adds elsewhere in this note on `integration/ui-redesign` — the two land on
 different branches and must merge without touching each other's prose.*
 
-Q3's protocol prose (and #1091 slice E's widened version of it, for
-`liaison.md` too) says "use `ask_human`, never a blocking dialog." Prose is
-instruction-backed, not structural — the whole reason this note exists is that
-an instruction did not stop the #578 incident. Q4/H is the enforcement half:
-make the blocking dialog **unreachable** for the two roles whose pane a hold
-can stall a fleet behind, rather than merely discouraged.
+Q3 (not yet landed — see "What Q1 does and does not reach" above) will teach
+the orchestrator's protocol prose "use `ask_human`, never a blocking dialog";
+#1091 slice E, landing separately on `integration/ui-redesign`, will widen
+that same prose into `liaison.md`. Both are instruction-backed, not
+structural — the whole reason this note exists is that an instruction did not
+stop the #578 incident. Q4/H is the enforcement half: make the blocking
+dialog **unreachable** for the two roles whose pane a hold can stall a fleet
+behind, rather than merely discouraged.
+
+**`ask_human` is the orchestrator's replacement only — it is not a liaison's.**
+`ask_human` dispatches through `require_orchestrator` (`mcp.rs`): "Orchestrator-only
+in v1: delegates already have `message_orchestrator`, so questions to the
+human have one funnel." A `role_hint: liaison` block is `Role::Reviewer`
+(`role_hint_requires` pins the hint to that kind), never the orchestrator, so
+it cannot call `ask_human` either — denying it `AskUserQuestion` here does not
+hand it a registry-backed question in exchange. That is not a gap this slice
+needs to close: a liaison's whole pane *is* the human conversation, so it asks
+in prose the way it always has (the interactive dialog only ever blocked that
+conversation, never enabled it), and anything that must become a durable,
+registry-backed question goes through `message_orchestrator` to the
+orchestrator's own `ask_human` funnel — the same "one funnel" `mcp.rs`
+already argues `ask_human`'s orchestrator-only gate for. #1091's UI work
+(slice E's prose + the panel) is what will make that relay path legible to
+the human as something other than ordinary pane chatter; it is not shipped by
+this slice.
 
 ### The deny predicate
 
@@ -594,7 +613,12 @@ names only Claude. Left as a follow-up, not faked as covered.
 For every CLI without a structural deny — including Codex, which is not
 currently in `SUPPORTED_CLIS` at all but was the CLI the original #1091
 plan-478 design named as having no tool-level deny mechanism whatsoever — the
-belt below is what actually catches a stalled fleet.
+belt below is what actually catches a stalled fleet **on the orchestrator's
+own pane**. The "Belt + prose only" rows above are accurate for the
+orchestrator; the belt is deliberately narrower than the deny it backstops
+(see the belt's own section below) and does not cover a liaison pane on any
+CLI — a liaison's dialog holding its own pane never stalls anyone else, which
+is the same reasoning that keeps the belt off every other delegate too.
 
 ### The latched-attention belt
 
@@ -611,12 +635,20 @@ set via `OrchRegistry::latch_question_held` / `unlatch_question_held`.
 report behind it too, not just its own status, which is the literal #578
 failure mode.
 
-Latched, not re-derived each 3-second scan, because a hold can run for
-`QUESTION_HOLD_MAX` (minutes) — long enough to fall between two scans if the
-reason were computed fresh each tick the way `waiting` is. It clears the
-instant the hold itself clears (`emit_held_cleared` fires unconditionally when
-any hold this function entered ends, whatever the outcome), so it cannot
-outlive the condition it describes the way `stranded` deliberately can.
+Latched, not re-derived each 3-second scan, because there is nothing for
+`attention_tick` to re-derive it FROM: the hold lives on `deliver_now`'s own
+call stack (it is mid-loop inside `hold_for_human_input`, blocked on
+`QUESTION_HOLD_MAX` — 120s — before it gives up), not in any pty state a
+periodic scan could read the way `waiting` reads a prompt-shaped tail. So the
+hold has to be mirrored into shared registry state at the moment it starts,
+or `attention_tick` would have no way to know it is happening at all. It
+clears the instant the hold itself clears (`emit_held_cleared` fires
+unconditionally when any hold this function entered ends, whatever the
+outcome) — including at the `QUESTION_HOLD_MAX` cap, even if the dialog is
+still on screen at that point; the drainer's next attempt re-raises it. So it
+cannot outlive the condition it describes the way `stranded` deliberately
+can, but it also does not promise "a dialog is on screen" so much as
+"deliveries are being stalled right now" — the useful half of that claim.
 
 **Disjoint from #1091 slice D's `question` attention reason by construction,
 not by convention.** D's reason is *derived* from the engine's `ask_human`

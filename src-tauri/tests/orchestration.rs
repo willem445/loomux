@@ -6257,11 +6257,17 @@ fn a_liaison_hinted_reviewer_denies_both_edits_and_the_question_dialog() {
         "exactly one --disallowedTools flag must carry both denials: {}",
         req.command
     );
+    // Tokenized, not a raw substring of `req.command` — `.contains("Edit")`
+    // is satisfied by `--permission-mode acceptEdits`, which every liaison
+    // command also carries, so a naive check here would pass whether or not
+    // `Edit` is actually in the deny list (the exact bug `6f2bc23e` fixed on
+    // the absence side, left live here on the presence side).
+    let command_tokens = shell_tokenize(&req.command);
     for denied in CLAUDE_EDIT_DENY_TOOLS.iter().chain(CLAUDE_QUESTION_DENY_TOOLS.iter()) {
         assert!(
-            req.command.contains(denied),
-            "a liaison-hinted reviewer must deny {denied}: {}",
-            req.command
+            command_tokens.iter().any(|t| t == denied),
+            "a liaison-hinted reviewer must deny {denied}: {:?}",
+            command_tokens
         );
     }
     assert_eq!(
@@ -7637,6 +7643,14 @@ fn build_agent_argv_matches_command_line() {
         workflow::ModelKnobs { effort: "", context: "1m" },
         workflow::ModelKnobs { effort: "low", context: "1m" },
     ];
+    // #946 Q4 / #1091 slice H: the role dimension this PR added.
+    // `Role::Worker, None` stays first — inert for
+    // `claude_denies_interactive_question`, i.e. byte-identical to the
+    // pre-Q4 matrix — with the two denying combinations swept alongside it
+    // so the total string-vs-argv equivalence this matrix exists to pin
+    // actually covers the new dimension instead of fixing it away.
+    let roles: [(Role, Option<&str>); 3] =
+        [(Role::Worker, None), (Role::Orchestrator, None), (Role::Reviewer, Some("liaison"))];
     // Every adapter, not just the two the matrix started with: an arm only one
     // of the two builders emits is precisely the drift this exists to catch,
     // and a CLI absent from the list is an arm nobody is checking.
@@ -7650,26 +7664,25 @@ fn build_agent_argv_matches_command_line() {
                     for (session, resume) in sessions {
                         for persona in &personas {
                             for knobs in knob_sets {
-                            // #946 Q4 / #1091 slice H: this matrix pins string-vs-argv
-                            // consistency at a FIXED role (Worker/no hint, inert for
-                            // `claude_denies_interactive_question`) — the role dimension
-                            // itself is covered by its own dedicated tests below.
-                            let line = reg.build_agent_command_ex(
-                                cli, "m", knobs, auto_ops, cfg, hook_settings, gdir, wd, session, resume, containment, persona,
-                                Role::Worker, None,
-                            );
-                            let argv = reg.build_agent_argv_ex(
-                                cli, "m", knobs, auto_ops, cfg, hook_settings, gdir, wd, session, resume, containment, persona,
-                                Role::Worker, None,
-                            );
-                            assert_eq!(
-                                shell_tokenize(&line),
-                                argv,
-                                "argv must equal the tokenized command line for \
-                                 cli={cli} auto_ops={auto_ops} containment={containment:?} \
-                                 hook_settings={hook_settings:?} knobs={knobs:?} \
-                                 session={session:?} resume={resume} persona={persona:?}\n  line: {line}"
-                            );
+                                for (role, role_hint) in roles {
+                                    let line = reg.build_agent_command_ex(
+                                        cli, "m", knobs, auto_ops, cfg, hook_settings, gdir, wd, session, resume, containment, persona,
+                                        role, role_hint,
+                                    );
+                                    let argv = reg.build_agent_argv_ex(
+                                        cli, "m", knobs, auto_ops, cfg, hook_settings, gdir, wd, session, resume, containment, persona,
+                                        role, role_hint,
+                                    );
+                                    assert_eq!(
+                                        shell_tokenize(&line),
+                                        argv,
+                                        "argv must equal the tokenized command line for \
+                                         cli={cli} auto_ops={auto_ops} containment={containment:?} \
+                                         hook_settings={hook_settings:?} knobs={knobs:?} \
+                                         session={session:?} resume={resume} persona={persona:?} \
+                                         role={role:?} role_hint={role_hint:?}\n  line: {line}"
+                                    );
+                                }
                             }
                         }
                     }
