@@ -5,6 +5,20 @@ These are byte copies of `src/orchestration/templates/{orchestrator,worker,revie
 integration branch with the block model and the workflow pane on it, and nothing else) —
 which is where the directory's name comes from.
 
+`manager.md` (#1161) is the fifth file here and the one exception to this directory's
+title: **no default group reads it.** A manager exists only when a repo's
+`.loomux/workflow.yml` declares `kind: manager`, and `write_instruction_files`'s
+class-fallback loop deliberately does not write `manager.md` — so there is nothing for the
+two "what a default group reads" pins
+(`the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was`,
+`the_default_rendering_never_names_the_gate_machinery`) to compare it against, and it is
+absent from the `PRE222` array those two iterate. What it IS part of is the live-vs-golden
+pairing in `a_workflow_placeholder_must_sit_at_the_end_of_a_line_it_shares` (via `GOLDENS`
+and `LIVE`), which is the half of this directory's job that is a fact about the template
+rather than about a group: an edit to `manager.md` still needs a human re-bless here, and
+the diff on this file is still the review surface for "what did we just tell the human's
+own interface to do differently?".
+
 They are not frozen forever: they are the *last human-blessed* copy. When the role
 templates deliberately change, the fixture is re-blessed (see below) and the diff on this
 directory is the record of what every default group was told to do differently. Re-blessings
@@ -662,6 +676,19 @@ so far:
   `doc/design/task-hierarchy.md`) — that asymmetry is taught in `upsert_task`'s tool
   description, where a rule about a write belongs, rather than by growing this section.
 
+- **#1161 M1, `manager.md` seeded** — a NEW file, and **no existing golden was
+  re-blessed**: `orchestrator.md`, `worker.md`, `reviewer.md` and `planner.md` are
+  byte-identical to their previous blessed copies, which is the proof that a fifth
+  capability class changed nothing a default group reads. The seed is the M1 skeleton of
+  the manager's contract — what the role is for (conversation, and sharpening a feature
+  request into something specific enough to build, with the human's explicit yes before
+  anything is relayed), what it structurally never does (write the repo, decide, speak
+  for the human, take work off the fleet), the directive ledger, duplicate deliveries,
+  and that an idle manager is the normal state rather than a stall. The elicitation
+  method in full, the mailbox turn-start discipline and the tool list by name are #1161
+  M4's and are deliberately not here — M1 ships no mailbox, so naming its tools would
+  advertise a mechanism the reader does not have.
+
 `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was` renders
 **these** with the six pre-#222 template variables and asserts that a group launched
 with the advanced orchestrator **off** gets exactly that text. They are the
@@ -687,7 +714,7 @@ a human, not a re-run.
   in `tests/workflow.rs` — read that array, not this sentence, which is a copy of it and
   has been stale before: `{{WORKFLOW}}`, `{{POST_MERGE_WORKFLOW_HOOK}}` and `{{MERGE_QUEUE}}`
   for `orchestrator.md`, `{{BLOCK_NOTE}}{{ADVISOR_CONSULT_NOTE}}` for `worker.md`,
-  `{{BLOCK_NOTE}}` for `reviewer.md` and `planner.md` — because
+  `{{BLOCK_NOTE}}` for `reviewer.md`, `planner.md` and `manager.md` — because
   `a_workflow_placeholder_must_sit_at_the_end_of_a_line_it_shares` asserts exactly
   "live, stripped of its keys, equals the golden". The *legacy* vars (`{{GROUP_ID}}`,
   `{{REPO}}`) are not keys and must stay. Leave a key in and that test fails with a
@@ -726,7 +753,8 @@ substitution `render_with_legacy_vars` does, not a text filter:
 python -c "
 keys={'orchestrator':['{{WORKFLOW}}','{{POST_MERGE_WORKFLOW_HOOK}}','{{MERGE_QUEUE}}'],
       'worker':['{{BLOCK_NOTE}}','{{ADVISOR_CONSULT_NOTE}}'],
-      'reviewer':['{{BLOCK_NOTE}}'],'planner':['{{BLOCK_NOTE}}']}
+      'reviewer':['{{BLOCK_NOTE}}'],'planner':['{{BLOCK_NOTE}}'],
+      'manager':['{{BLOCK_NOTE}}']}
 for f,ks in keys.items():
     live=open('src-tauri/src/orchestration/templates/%s.md'%f,'rb').read()
     for k in ks: live=live.replace(k.encode(),b'')

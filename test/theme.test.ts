@@ -407,6 +407,11 @@ test("one role table: every surface that names an agent role paints it the same 
     worker: "--id-jade",
     reviewer: "--id-violet",
     planner: "--id-amber",
+    // #1161. The constraint that governs a ROLE hue is distinctness from the other
+    // ROLE hues — a roster puts them side by side — and orchid is the furthest from
+    // the four above. Rose is the destructive-action dye and lime sits too close to
+    // the worker's jade.
+    manager: "--id-orchid",
   };
 
   // The role list comes from the TYPE, so a fifth role cannot be added to the app and

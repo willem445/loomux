@@ -86,6 +86,13 @@
 //!                             # kind: reviewer — anything else is a parse
 //!                             # error.
 //!
+//!   - id: manager           # OPTIONAL, at most one (#1161). The human's own
+//!     kind: manager         # interface pane: it converses, grooms feature
+//!     model: opus           # requests into briefs, and relays. cli:/model:/
+//!                           # effort:/context:/name: only — prompt:, profile:
+//!                           # and allow: are parse errors here, as on the
+//!                           # orchestrator block.
+//!
 //! edges:                   # ADVISORY: the declared happy path. The
 //!   - { from: worker, to: [rev-security] }   # orchestrator still schedules.
 //!
@@ -126,10 +133,23 @@ pub const WORKFLOW_PATH: &str = ".loomux/workflow.yml";
 /// breaking change can be detected rather than mis-parsed.
 pub const SCHEMA_VERSION: u32 = 1;
 
-/// The block ids of the built-in roster. These four keep their historic
-/// instruction-file names (`worker.md`, …), which is what makes a no-workflow
-/// group byte-for-byte identical to pre-#222 loomux.
-pub const BUILTIN_IDS: [&str; 4] = ["orchestrator", "worker", "reviewer", "planner"];
+/// The block ids that name a capability class, and so own that class's
+/// instruction file. The first four are the built-in roster's, and they keep
+/// their historic file names (`worker.md`, …) — which is what makes a
+/// no-workflow group byte-for-byte identical to pre-#222 loomux.
+///
+/// `manager` (#1161) is the fifth, and it is NOT a built-in-roster id: no
+/// default group has a manager block, and [`builtin_roster`] still synthesizes
+/// exactly four. It is here because the rule this array encodes is "a class
+/// name is a reserved id owning that class's file", and applying it to four of
+/// five classes is how the fifth quietly acquires a different rule. Note what
+/// this array does *not* do: what stops `- id: manager, kind: worker` is
+/// [`kind_from_str`] in `parse_workflow`'s reserved-id check, which reads the
+/// CLASS table rather than this one.
+///
+/// [`roster_is_custom`] deliberately does not read membership here as "nothing
+/// a workflow file put there" — see its own doc.
+pub const BUILTIN_IDS: [&str; 5] = ["orchestrator", "worker", "reviewer", "planner", "manager"];
 
 // ── the block ───────────────────────────────────────────────────────────────
 
@@ -235,7 +255,15 @@ impl Block {
         }
     }
 
-    /// Whether this block is one of the four built-in roster entries.
+    /// Whether this block's id is a reserved class name ([`BUILTIN_IDS`]) — so
+    /// it owns that class's instruction file rather than a `<id>.md` of its
+    /// own.
+    ///
+    /// For the four built-in classes this is also "is one of the built-in
+    /// roster entries", which is what it was called before #1161 and what every
+    /// pre-existing caller means by it. `- id: manager` satisfies it too and is
+    /// NOT a built-in roster entry, which is why [`roster_is_custom`] asks a
+    /// second question rather than reading this alone.
     pub fn is_builtin(&self) -> bool {
         BUILTIN_IDS.contains(&self.id.as_str())
     }
@@ -1214,13 +1242,33 @@ pub fn kind_from_str(s: &str) -> Option<Role> {
         "worker" => Some(Role::Worker),
         "reviewer" => Some(Role::Reviewer),
         "planner" => Some(Role::Planner),
+        // #1161. Declarable, but not spawnable and not part of any built-in
+        // roster: `spawn_agent` refuses it exactly as it refuses
+        // `orchestrator`, and `builtin_roster` never synthesizes one.
+        "manager" => Some(Role::Manager),
         _ => None,
     }
 }
 
+/// At most one `kind: manager` block per workflow (#1161).
+///
+/// Unlike reviewers — deliberately fanned out — two human interfaces is a
+/// coherence bug rather than a configuration: the human would have two panes
+/// each holding half a conversation, and everything downstream that says "the
+/// manager" (the pane badge, the orchestrator's relay target, the mailbox in
+/// M2) would have to pick one and silently ignore the other. Refused at parse,
+/// where an author can still fix it.
+pub const MANAGER_MAX: usize = 1;
+
 /// The kinds a workflow file may name, for error messages.
+///
+/// Ordered built-ins-first: this string is also the source of the schema
+/// manifest's `block.kind` values (`workflow_schema_field_facts`), which
+/// `the_workflow_schema_manifest_matches_the_engines_values_defaults_and_bounds`
+/// compares against `src/workflow-schema.json` as an ordered array — so the
+/// order here is a contract with that file, not presentation.
 pub fn kind_names() -> String {
-    "orchestrator, worker, reviewer, planner".to_string()
+    "orchestrator, worker, reviewer, planner, manager".to_string()
 }
 
 /// The capability class a `role_hint` REQUIRES — `None` for anything
@@ -1490,7 +1538,25 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
         // this. If app-level orchestrator customization is ever wanted, it can
         // arrive as an explicit human opt-in — which is a different thing from a
         // file that arrives with a `git clone`.
-        if kind == Role::Orchestrator {
+        //
+        // **THE MANAGER BLOCK IS LOOMUX-OWNED FOR THE SAME REASON** (#1161,
+        // decision D1 — human-blessed). The capability-closure table makes
+        // persona text inert for most classes: a repo can say anything it likes
+        // to a reviewer and the reviewer still cannot merge. That argument does
+        // not transfer here, because the manager's entire output surface IS
+        // persuasion — of the human in its pane, and of the orchestrator via
+        // relayed directives that the trust root then acts on as if the human
+        // had said them. A repo-authored persona there is a directive-laundering
+        // seam of the #189 class arriving with a `git clone`, and it is the one
+        // seam no capability table can close.
+        //
+        // A repo loses nothing it was promised: the elicitation method itself
+        // (spec-driven, "grill-me") ships in loomux's own `manager.md`. Pinning
+        // `cli:`/`model:`/`effort:`/`context:`/`name:` stays legal, on the same
+        // "picks from a value set loomux ships" line drawn above. Relaxing this
+        // later as an explicit human opt-in is cheap; tightening it later would
+        // be a breaking change to every workflow file already written.
+        if kind == Role::Orchestrator || kind == Role::Manager {
             let offenders: Vec<&str> = [
                 rb.prompt.is_some().then_some("prompt:"),
                 rb.profile.is_some().then_some("profile:"),
@@ -1500,12 +1566,21 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
             .flatten()
             .collect();
             if !offenders.is_empty() {
+                let why = if kind == Role::Orchestrator {
+                    "the orchestrator is loomux's trust root and a repo file may not author its \
+                     prompt or pre-approve its tools"
+                } else {
+                    "a manager speaks to the human and relays their direction into the trust root, \
+                     so a repo file authoring its persona could launder its own instructions into \
+                     what the human is told and what the orchestrator is asked to do"
+                };
                 errs.push(format!(
-                    "blocks[{i}] ({id}): an orchestrator block may not declare {} — the orchestrator \
-                     is loomux's trust root and a repo file may not author its prompt or pre-approve \
-                     its tools. Pin its cli:/model:/effort:/context: if you need to; put personas on \
-                     the blocks it spawns.",
-                    offenders.join(" / ")
+                    "blocks[{i}] ({id}): a{n} {k} block may not declare {offenders} — {why}. Pin \
+                     its cli:/model:/effort:/context: if you need to; put personas on the blocks \
+                     the orchestrator spawns.",
+                    n = if kind == Role::Orchestrator { "n" } else { "" },
+                    k = kind.as_str(),
+                    offenders = offenders.join(" / "),
                 ));
                 continue;
             }
@@ -1641,6 +1716,27 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
         errs.push("no blocks declared — a workflow needs at least one block".into());
     }
 
+    // At most one manager (#1161) — see [`MANAGER_MAX`] for why this is a
+    // coherence rule and not a capacity one. Checked after the loop rather than
+    // inside it because it is a property of the ROSTER, not of any one block:
+    // the second declaration is not more wrong than the first, and naming both
+    // is what lets an author see which two they wrote.
+    let managers: Vec<&str> = blocks
+        .iter()
+        .filter(|b| b.kind == Role::Manager)
+        .map(|b| b.id.as_str())
+        .collect();
+    if managers.len() > MANAGER_MAX {
+        errs.push(format!(
+            "blocks: {} manager blocks declared ({}) — a workflow may declare at most {MANAGER_MAX}. \
+             The manager is the human's single interface to this group: two of them would each hold \
+             half a conversation, and everything that says \"the manager\" downstream would have to \
+             pick one silently. Keep one and give the others another kind.",
+            managers.len(),
+            managers.join(", "),
+        ));
+    }
+
     let known: BTreeSet<&str> = blocks.iter().map(|b| b.id.as_str()).collect();
 
     let mut edges: Vec<Edge> = Vec::new();
@@ -1717,6 +1813,25 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
             match blocks.iter().find(|b| b.id == rname) {
                 None => {
                     errs.push(format!("gates.{name}: reviewer {rname:?} names no block"));
+                    bad = true;
+                }
+                // The manager (#1161) is structurally caught by the arm below —
+                // it is not reviewer-kind — but "that block's kind is manager,
+                // not a reviewer" describes the type error and not the mistake.
+                // An author who named the manager on a gate was reaching for
+                // "the human signs off", which is a real thing they wanted and
+                // a real thing this gate cannot express, so say that instead.
+                // The pane validator carries the same arm
+                // (`validateWorkflow`, gate-not-a-reviewer), and the liaison
+                // arm below is the shape both are modelled on.
+                Some(b) if b.kind == Role::Manager => {
+                    errs.push(format!(
+                        "gates.{name}: reviewer {:?} is a manager — the manager is the human's \
+                         interface, not a reviewer: it records no verdict, so a gate naming it \
+                         could never open. A gate reads REVIEWER verdicts; the human's own sign-off \
+                         is the merge gate loomux already applies on top of it.",
+                        b.id
+                    ));
                     bad = true;
                 }
                 // A gate reads reviewer verdicts. Naming a worker would make it
@@ -1990,11 +2105,18 @@ pub fn workflow_file_exists(repo: &str) -> bool {
 /// drops one that arrives from a hand-edited `group.json` — so the *only* honest
 /// answer about an orchestrator block's persona is "there isn't one".
 ///
+/// **The manager block is loomux-owned on the same terms** (#1161, decision
+/// D1), so it answers `false` here too. The parse refusal is the visible half;
+/// this is the half that holds when the parser is bypassed, and it has to,
+/// because bypassing the parser is precisely the case a repo-authored persona
+/// on the human's own interface would be worth attempting. See `parse_workflow`
+/// for the argument.
+///
 /// Anything that merely *reports* on a block therefore has to ask this too, or it
 /// advertises a persona the spawn will deny (rev-11's preview nit). One predicate,
 /// so the report and the spawn cannot disagree.
 pub fn persona_allowed(block: &Block) -> bool {
-    block.kind != Role::Orchestrator
+    !matches!(block.kind, Role::Orchestrator | Role::Manager)
 }
 
 /// Whether a roster carries anything a workflow file put there — a block outside
@@ -2006,8 +2128,20 @@ pub fn persona_allowed(block: &Block) -> bool {
 /// delegate's block note). A group with no workflow reads exactly as it did
 /// before blocks existed because this returns false and all of it collapses to
 /// the empty string.
+///
+/// **A declared manager counts, whatever its id** (#1161), and that third
+/// clause is load-bearing rather than defensive. `manager` is a reserved id
+/// ([`BUILTIN_IDS`]) so that a manager block owns `manager.md` — which means
+/// the obvious spelling of a declared manager, `- id: manager, kind: manager`,
+/// answers `is_builtin()` true and (D1 forbidding it a persona) `has_persona()`
+/// false. Without this clause a workflow whose only addition to the built-in
+/// four is a manager would report as "nothing a workflow file put there", and
+/// every workflow-aware surface — the orchestrator's roster note, its workflow
+/// section — would collapse to empty on the one roster that most needs to name
+/// what it added. The default path is untouched: [`builtin_roster`] synthesizes
+/// no manager, so this clause cannot fire for a group with no workflow file.
 pub fn roster_is_custom(blocks: &[Block]) -> bool {
-    blocks.iter().any(|b| !b.is_builtin() || b.has_persona())
+    blocks.iter().any(|b| !b.is_builtin() || b.has_persona() || b.kind == Role::Manager)
 }
 
 /// Read + validate `<repo>/.loomux/workflow.yml`.
@@ -2443,9 +2577,11 @@ pub struct CapacityRecommendation {
     /// slot.
     pub minimum: u32,
     /// What running **every declared tier concurrently** costs: every
-    /// distinct worker block, every distinct reviewer block, and one more if
-    /// the workflow declares a planner block. The orchestrator itself is
-    /// exempt from `max_agents` (mcp.rs) and is never counted here.
+    /// distinct worker block, every distinct reviewer block, one more if the
+    /// workflow declares a planner block, and one more if it declares a manager
+    /// block (#1161 — a manager is live for the whole session and, today,
+    /// occupies a cap slot like any non-orchestrator pane). The orchestrator
+    /// itself is exempt from `max_agents` (mcp.rs) and is never counted here.
     ///
     /// A workflow with two planner blocks still adds only one slot here — a
     /// repo declares a *second* planner to give it an alternate persona (a
@@ -2484,12 +2620,22 @@ pub fn recommend_capacity(blocks: &[Block], gate: Option<&Gate>) -> CapacityReco
     let workers = blocks.iter().filter(|b| b.kind == Role::Worker).count() as u32;
     let reviewers = blocks.iter().filter(|b| b.kind == Role::Reviewer).count() as u32;
     let has_planner = blocks.iter().any(|b| b.kind == Role::Planner);
+    // #1161. A declared manager is a live pane for the whole session, and
+    // today it occupies a `max_agents` slot exactly like a delegate
+    // (`live_delegate_count` exempts only the orchestrator) — so a preview that
+    // did not count it would under-advise by one on every roster that has one.
+    // `any`, not a count, for the same reason as the planner: a workflow may
+    // declare at most one (`MANAGER_MAX`), so the two spellings agree, and
+    // `any` says which fact is being relied on.
+    let has_manager = blocks.iter().any(|b| b.kind == Role::Manager);
 
     let reviewers_needed = gate.map_or(reviewers, gate_need);
     let worker_slot = u32::from(workers > 0);
     CapacityRecommendation {
+        // `minimum` is deliberately untouched: it is what ONE REVIEW ROUND
+        // costs, and a review round does not involve the manager.
         minimum: reviewers_needed + worker_slot,
-        recommended: workers + reviewers + u32::from(has_planner),
+        recommended: workers + reviewers + u32::from(has_planner) + u32::from(has_manager),
         reviewers_needed,
     }
 }
@@ -2524,6 +2670,12 @@ pub fn extra_tiers(blocks: &[Block], reviewers_needed: u32) -> Vec<String> {
     }
     if has_planner {
         out.push("the planner".to_string());
+    }
+    // #1161: `minimum` budgets a review round, which never includes the
+    // manager, so a declared one is entirely "extra" — and it is the tier a
+    // human would most notice going missing, since it is the pane they talk to.
+    if blocks.iter().any(|b| b.kind == Role::Manager) {
+        out.push("the manager".to_string());
     }
     out
 }

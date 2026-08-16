@@ -868,7 +868,8 @@ they were asked of every literal:
 **One role table, applied everywhere.** The four agent roles were coloured by two surfaces
 that disagreed with each other — the session browser painted a reviewer green and an
 orchestrator violet, the group roster painted an orchestrator azure and a reviewer violet.
-They now share one table: **orchestrator azure, worker jade, reviewer violet, planner amber**,
+They now share one table: **orchestrator azure, worker jade, reviewer violet, planner amber,
+manager orchid** (#1161 added the fifth row, and its rules on every role surface with it),
 used by the session badges, the group roster, and the workflow pane's role chips and nodes
 alike — and `test/theme.test.ts` reads all four of those surfaces and fails on a role that
 disagrees with the table or is missing from a surface that renders every role. A role's colour
@@ -878,8 +879,12 @@ is a claim, so it is measured rather than asserted.
 **Where the eight hues landed.** `lime` and `orchid` had no consumer at all before this
 slice: lime now marks a *human* actor in the audit log and the GitHub lane in the timeline
 (the two places the app distinguishes "a person did this" from "we did"), and orchid carries
-the prototype task column and its `proceed` action. `cyan` is the "ready / start / human
-testing" family, `violet` everything review- and PR-shaped.
+the prototype task column and its `proceed` action — and, since #1161, the MANAGER role,
+chosen because the constraint that governs a role hue is distinctness from the other role
+hues (a roster shows them side by side) and orchid is the furthest from azure/jade/violet/
+amber; rose is the destructive-action dye and lime sits too close to the worker’s jade.
+`cyan` is the "ready / start / human testing" family, `violet` everything review- and
+PR-shaped.
 
 **Alpha steps are `color-mix`, not new tokens.** The old stylesheet reached a tint by writing
 `rgba(224, 175, 104, 0.16)` — the hue restated in a third notation, invisible to every pin.

@@ -94,16 +94,18 @@ use serde::{Deserialize, Serialize};
 /// escape hatch. So a repo can declare five reviewers with five prompts and five
 /// models, and it cannot make one of them anything but a reviewer: the deny-flags
 /// (`build_agent_command`), the cwd rule (`spawn_agent_ex`) and the MCP tool
-/// scope (`mcp::tool_defs`) all key off this enum, and it has exactly four
-/// values.
+/// scope (`mcp::tool_defs`) all key off this enum, and its values are a closed,
+/// hand-written list — five a workflow file may name ([`workflow::kind_from_str`](crate::workflow::kind_from_str))
+/// plus [`Role::Solo`], which no workflow can reach.
 ///
 /// What each class *is* varies, and the enum should not be read as promising more
 /// than it enforces — read [`Role::containment`] for the exact per-class tier. A
 /// planner is structurally read-only ([`Role::is_read_only`] — editing tools AND
 /// `git commit`/`git push` denied at the CLI). A reviewer (#462) is structurally
 /// denied the CLI's *file-editing tools*, but keeps the shell, so its "never
-/// pushes" stays instruction-backed. The guarantee is over which posture a block
-/// gets, not that every posture is a sandbox.
+/// pushes" stays instruction-backed; a manager (#1161) rides that same tier for
+/// the same reason. The guarantee is over which posture a block gets, not that
+/// every posture is a sandbox.
 ///
 /// The name `Role` survives because ~72 call sites and the persisted wire
 /// format use it; read it as "capability class".
@@ -118,6 +120,24 @@ pub enum Role {
     /// exits. A planner NEVER writes code, branches, or PRs. It counts as a
     /// delegate against the live-agent cap, like a worker/reviewer.
     Planner,
+    /// **The human's own interface to the group** (#1161) — a pane the human
+    /// converses with: project discussion, status, and the requirements
+    /// engineering that turns a rough feature request into a groomed brief
+    /// before the orchestrator ever sees it.
+    ///
+    /// A fifth capability class rather than a `role_hint` on a reviewer,
+    /// because what distinguishes it is *structural* and a hint cannot express
+    /// it: `doc/design/liaison.md` states its own promotion trip-wire — a third
+    /// capability tool granted off "faces the human" — and this class fires it.
+    ///
+    /// Optional and **workflow-only**: a manager exists only when a repo's
+    /// `.loomux/workflow.yml` declares `kind: manager`. The built-in roster is
+    /// still exactly four blocks (`builtin_roster`), so a group with no workflow
+    /// file never constructs one and behaves exactly as it did before this
+    /// variant existed. `spawn_agent` refuses it for the same reason it refuses
+    /// `orchestrator`: the manager is the human's fixture, not a delegate an
+    /// orchestrator opens.
+    Manager,
     /// A standalone (non-orchestration) pane given a channel-scoped MCP
     /// identity (#271 W3 addendum, part A). Its whole purpose is
     /// `tool_defs`/`call_tool` returning/dispatching exactly `channel_send` +
@@ -139,6 +159,10 @@ impl Role {
             Role::Worker => "w",
             Role::Reviewer => "rev",
             Role::Planner => "plan",
+            // `mgr`, not `man`/`m`: the badge and roster conventions parse
+            // `<prefix>-<seq>`, and a prefix that reads as a word is what makes
+            // `mgr-3` legible next to `w-7`/`rev-5` in a task board row.
+            Role::Manager => "mgr",
             // Solo panes mint their id as `solo-N` directly (see
             // `OrchRegistry::solo_prepare`), never through `block.prefix()` —
             // they have no block. Never reached in practice.
@@ -157,6 +181,7 @@ impl Role {
             Role::Worker => "worker",
             Role::Reviewer => "reviewer",
             Role::Planner => "planner",
+            Role::Manager => "manager",
             Role::Solo => "solo",
         }
     }
@@ -180,6 +205,16 @@ impl Role {
             // stays whole: running the tests and `gh pr checkout <n> --detach`
             // ARE the job (see `Containment::NoEdits` for what that costs).
             Role::Reviewer => Containment::NoEdits,
+            // #1161. The reviewer's tier, chosen for the reviewer's reason: a
+            // manager must READ the codebase to ground its questioning, and
+            // must not write it. `ReadOnly` is the wrong rung and not merely a
+            // stricter one — it forces unattended mode
+            // (`Containment::forces_unattended`), which is hostile to a pane
+            // whose entire purpose is a human sitting in front of it. As with a
+            // reviewer, "the manager never pushes" therefore stays
+            // instruction-backed; what is structural is the denied editing
+            // tools (see `Containment::NoEdits` for the exact size of that).
+            Role::Manager => Containment::NoEdits,
             Role::Planner => Containment::ReadOnly,
             // Solo panes never traverse `spawn_agent_ex`/`build_agent_command`
             // (see the variant's doc) — an arbitrary human-launched CLI loomux
@@ -554,8 +589,8 @@ pub fn cli_can_host(cli: &str, role: Role) -> Result<(), String> {
 
 /// Default model for a capability class on a given CLI. Copilot picks its own
 /// best model ("auto"); on Claude the reasoning-heavy classes (orchestrator,
-/// planner) get the strong tier and the executing ones (worker, reviewer) the
-/// mid tier.
+/// planner, manager) get the strong tier and the executing ones (worker,
+/// reviewer) the mid tier.
 pub fn default_model(cli: &str, role: Role) -> &'static str {
     if cli == "copilot" {
         return "auto";
@@ -588,7 +623,11 @@ pub fn default_model(cli: &str, role: Role) -> &'static str {
         return "";
     }
     match role {
-        Role::Orchestrator | Role::Planner => "opus",
+        // #1161: the manager joins the strong tier. Its output IS a
+        // conversation with the human — eliciting requirements, spotting the
+        // ambiguity nobody stated — so conversational quality is the product
+        // here rather than a nicety. A block pins its own `model:` to disagree.
+        Role::Orchestrator | Role::Planner | Role::Manager => "opus",
         Role::Worker | Role::Reviewer => "sonnet",
         // A solo pane's model is whatever the human picked in the launcher —
         // loomux never spawns or models it. Never reached.
@@ -621,14 +660,23 @@ pub fn sanitize_model_opt(m: &str) -> String {
 /// `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was`
 /// writes a default group's four instruction files and byte-compares them
 /// against `src-tauri/tests/fixtures/pre222/`, which pins the name as well as
-/// the bytes for every class that has one. A mis-mapped name reddens there
-/// wherever this function is defined.
+/// the bytes for each of those four. A mis-mapped name reddens there wherever
+/// this function is defined.
+///
+/// [`Role::Manager`] (#1161) is deliberately outside that pin's reach, and the
+/// asymmetry is the feature: no default group has a manager, so no default
+/// group writes `manager.md` and there is nothing for a default-group pin to
+/// compare. Its name is pinned instead by
+/// `a_manager_block_writes_the_managers_own_instructions_file` (declaring one
+/// and reading the group dir) and its bytes by the same live-vs-golden pairing
+/// the other four get in `a_workflow_placeholder_must_sit_at_the_end_of_a_line_it_shares`.
 pub fn role_instructions_file(role: Role) -> &'static str {
     match role {
         Role::Orchestrator => "orchestrator.md",
         Role::Worker => "worker.md",
         Role::Reviewer => "reviewer.md",
         Role::Planner => "planner.md",
+        Role::Manager => "manager.md",
         Role::Solo => unreachable!("solo panes have no instructions file"),
     }
 }
@@ -767,16 +815,17 @@ mod tests {
     ///
     /// Deriving the expectation from `as_str()` would pin `Serialize` to
     /// whatever `as_str` happens to say, and vice versa — the table has to be a
-    /// third party or neither test means anything. These five strings are a
+    /// third party or neither test means anything. These six strings are a
     /// **persisted and cross-process contract**: they are what `agents.json`
     /// carries between app launches, what `list_agents`/`session_roles` hand
     /// the webview, and what the frontend matches on to decide a roster row's
     /// badge. Changing one is a breaking change to a state file, not a rename.
-    const WIRE_NAMES: [(Role, &str); 5] = [
+    const WIRE_NAMES: [(Role, &str); 6] = [
         (Role::Orchestrator, "orchestrator"),
         (Role::Worker, "worker"),
         (Role::Reviewer, "reviewer"),
         (Role::Planner, "planner"),
+        (Role::Manager, "manager"),
         (Role::Solo, "solo"),
     ];
 
@@ -797,6 +846,12 @@ mod tests {
     /// noticed: a solo pane is a `__solo__` pseudo-group member that never
     /// traverses a spawn, so a rename on it would change what every future
     /// `agents.json` records while every behavioural test stayed green.
+    ///
+    /// `manager` (#1161) is here for a third reason again: it is also the
+    /// string a repo's `.loomux/workflow.yml` writes as `kind:`
+    /// (`workflow::kind_from_str`) and the one `src/orchbadge.ts` matches to
+    /// label the pane `MGR`. Renaming its serde form would break a repo file
+    /// and a badge, not just a state file.
     #[test]
     fn every_role_variant_serializes_to_its_documented_lowercase_wire_name() {
         for (role, want) in WIRE_NAMES {
