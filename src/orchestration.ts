@@ -14,6 +14,7 @@ import { badgeFor, type OrchRole } from "./orchbadge";
 import { isSpawnRequestExpired } from "./spawnexpiry";
 import { sessionIdFromCommand } from "./panerestore";
 import type { AutonomyState } from "./autonomy";
+import type { OrchQuestion } from "./decisions";
 import type { WorkflowPreview } from "./roster";
 import { showToast } from "./toast";
 import { showContextMenu } from "./contextmenu";
@@ -269,6 +270,37 @@ export const setIdleTickMinutes = (groupId: string, minutes: number): Promise<nu
  *  default 2048; clamped 1..1MiB; durable, audited). Resolves to the applied value. */
 export const setIdleActivityFloor = (groupId: string, bytes: number): Promise<number> =>
   invoke<number>("orch_set_idle_activity_floor", { groupId, bytes });
+
+// ---------- human decisions (#946 Q1 engine, #1091 panel) ----------
+
+/** Every row of the group's `questions.json`, in file order — pending and
+ *  settled alike, exactly as stored.
+ *
+ *  Deliberately NOT the MCP `list_questions` projection: the command's return
+ *  type is a bare list, with nowhere to put that projection's omitted count,
+ *  so the split and the cap happen in `decisions.ts` where the panel can also
+ *  SAY how many settled rows it dropped. A read failure — no file, a malformed
+ *  one, a group id the backend refuses — arrives as an empty list rather than
+ *  a rejection, the same degrade `orch_tasks` takes: the panel shows nothing
+ *  instead of throwing. Nothing WRITES through this path, so the loud read
+ *  that protects the file from a read-modify-write on unparseable input is
+ *  untouched by that. */
+export const questionsList = (groupId: string): Promise<OrchQuestion[]> =>
+  invoke<OrchQuestion[]>("orch_questions_list", { groupId });
+
+/** Settle a pending question with the human's decision, from the app's own
+ *  webview.
+ *
+ *  **There is no `source` argument, and that absence is the trust boundary.**
+ *  Who answered is a property of this entry point — the backend hard-codes
+ *  `AnswerSource::Webview` — not something a caller states about itself, which
+ *  is why no agent can impersonate a human even if some future path reached
+ *  the command. Rejects with the backend's own message when the row is already
+ *  settled or the answer fails validation (empty, or over the 2000-character
+ *  cap, which it REFUSES rather than truncating — `decisions.ts` mirrors that
+ *  bound so the human is stopped before the click, not after it). */
+export const answerQuestion = (groupId: string, id: string, answer: string): Promise<void> =>
+  invoke("orch_question_answer", { groupId, id, answer });
 
 // ---------- human merge / release grants (#83) ----------
 

@@ -59,6 +59,8 @@ import { openInEditor, editorConfigDialog } from "./editor";
 import { GitView } from "./gitview";
 import { IssuesView } from "./issuesview";
 import { TasksView } from "./tasksview";
+import { DecisionsView } from "./decisionsview";
+import { PendingEmbedFocus } from "./embedfocus";
 import { AuditView } from "./auditview";
 import { TimelineView } from "./timelineview";
 import { GroupView } from "./groupview";
@@ -111,6 +113,9 @@ const ICON_BTN_PX = 13;
 const FOLDER_ICON = icon("folder", ICON_META_PX);
 const BRANCH_ICON = icon("git-branch", ICON_META_PX);
 const TASKS_ICON = icon("list-checks", ICON_BTN_PX);
+// NEEDS-YOU panel (#1091, Alt+Q): a raised hand — the group asking for the
+// human, rather than offering them help.
+const DECISIONS_ICON = icon("hand", ICON_BTN_PX);
 const GIT_ICON = icon("git-graph", ICON_BTN_PX);
 // Issues view (Alt+I): a dot inside a circle — GitHub's open-issue glyph.
 const ISSUES_ICON = icon("circle-dot", ICON_BTN_PX);
@@ -377,7 +382,15 @@ export interface PaneEvents {
  *  scope increase) once the multi-slot generalization made "one more
  *  dockable view" cheap to reason about — see doc/design/embedded-panels.md's
  *  "What's embeddable, and what isn't". */
-type EmbedKind = "tasks" | "git" | "issues" | "audit" | "group" | "editor" | "timeline";
+type EmbedKind =
+  | "tasks"
+  | "git"
+  | "issues"
+  | "audit"
+  | "group"
+  | "editor"
+  | "timeline"
+  | "decisions";
 
 /** #1042: compile-time pin that every view `embedtoggle.ts` lets declare the
  *  pane's cwd really is an `EmbedKind`. That module takes a plain `string` so it
@@ -389,6 +402,7 @@ void _CWD_DECLARING_VIEWS_ARE_EMBED_KINDS;
 
 const EMBED_KINDS: readonly EmbedKind[] = [
   "tasks",
+  "decisions",
   "git",
   "issues",
   "audit",
@@ -416,6 +430,10 @@ const EMBED_KINDS: readonly EmbedKind[] = [
  *  restores ITS scroll position or filter either. */
 const RESTORABLE_EMBED_KINDS: readonly EmbedKind[] = [
   "tasks",
+  // The NEEDS-YOU panel (#1091) is orchestrator-only and group-scoped, exactly
+  // like the board it sits beside, so it restores on the same terms — the DOCK
+  // preference only, never which card was expanded or half-answered.
+  "decisions",
   "audit",
   "group",
   "git",
@@ -429,7 +447,7 @@ const RESTORABLE_EMBED_KINDS: readonly EmbedKind[] = [
 
 function isRestorableEmbedKind(
   kind: EmbedKind
-): kind is "tasks" | "audit" | "group" | "git" | "editor" | "timeline" {
+): kind is "tasks" | "decisions" | "audit" | "group" | "git" | "editor" | "timeline" {
   return (RESTORABLE_EMBED_KINDS as readonly string[]).includes(kind);
 }
 
@@ -443,6 +461,7 @@ const EMBED_TOGGLE_LABEL: Record<EmbedKind, string> = {
   timeline: "The progress timeline",
   group: "The group lifecycle panel",
   editor: "The file editor",
+  decisions: "The needs-you panel",
 };
 
 /** Each kind's PANE HEADER toggle button's normal (undocked) title —
@@ -457,6 +476,7 @@ const EMBED_TOGGLE_TITLE: Record<EmbedKind, string> = {
   timeline: "Progress timeline (Alt+W)",
   group: "Group lifecycle (Alt+O)",
   editor: "File editor (Alt+F)",
+  decisions: "Needs you — decisions & demos (Alt+Q)",
 };
 
 /** One embeddable view's plumbing, registered once that view is lazily
@@ -544,6 +564,18 @@ export class Pane implements VoiceTargetPane {
   private tasksView: TasksView | null = null;
   private tasksOverlay: HTMLElement | null = null;
   private tasksBtn: HTMLButtonElement;
+  /** NEEDS-YOU panel (orchestrator panes only, #1091), same overlay
+   *  mechanics — pending human decisions and demo-gated board rows. */
+  private decisionsView: DecisionsView | null = null;
+  private decisionsOverlay: HTMLElement | null = null;
+  private decisionsBtn: HTMLButtonElement;
+  /** Focus requests parked for this pane's own embeds (#1091 slice C).
+   *  Per-PANE, because the surfaces that cite each other are embeds on the
+   *  SAME pane — a card naming `t-7` wants THIS pane's board, not another
+   *  window's. See embedfocus.ts for why the request is parked rather than
+   *  delivered: the target view may not be constructed yet, and even once it
+   *  is, its rows arrive from an async refresh. */
+  private readonly pendingFocus = new PendingEmbedFocus();
   /** Audit-log viewer (any orchestration pane), same overlay mechanics. */
   private auditView: AuditView | null = null;
   private auditOverlay: HTMLElement | null = null;
@@ -937,6 +969,17 @@ export class Pane implements VoiceTargetPane {
       this.toggleTasksView();
     });
     header.appendChild(this.tasksBtn);
+
+    this.decisionsBtn = document.createElement("button");
+    this.decisionsBtn.className = "pane-btn";
+    this.decisionsBtn.innerHTML = DECISIONS_ICON;
+    this.decisionsBtn.title = EMBED_TOGGLE_TITLE.decisions;
+    this.decisionsBtn.hidden = true; // shown for orchestrator panes in start()
+    this.decisionsBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      this.toggleDecisionsView();
+    });
+    header.appendChild(this.decisionsBtn);
 
     this.auditBtn = document.createElement("button");
     this.auditBtn.className = "pane-btn";
@@ -1474,6 +1517,10 @@ export class Pane implements VoiceTargetPane {
     this.orchRoleName = opts.orchRole ?? null;
     // The board lives on the orchestrator's pane; workers report there.
     this.tasksBtn.hidden = opts.orchRole !== "orchestrator";
+    // The NEEDS-YOU panel sits beside the board, on the same pane and the same
+    // terms (#1091): the orchestrator is who asks the human, and the demos it
+    // shows are its own board rows.
+    this.decisionsBtn.hidden = opts.orchRole !== "orchestrator";
     // The audit log is per-group and read-only, so it's useful from any
     // agent pane in the group, not just the orchestrator's.
     this.auditBtn.hidden = false;
@@ -3157,6 +3204,7 @@ export class Pane implements VoiceTargetPane {
     this.tasksView = new TasksView(this.orchGroup!, {
       onClose: () => this.toggleTasksView(),
       onEmbedMenu: (anchor) => this.showEmbedMenu("tasks", anchor),
+      takeFocus: () => this.pendingFocus.take("tasks"),
     });
     this.tasksOverlay = document.createElement("div");
     this.tasksOverlay.className = "git-overlay";
@@ -3170,6 +3218,98 @@ export class Pane implements VoiceTargetPane {
       setPanelActive: (active) => this.tasksView!.setPanelActive(active),
       floorPx: () => EMBED_MIN_PANEL_PX,
     });
+  }
+
+  /** Toggle the NEEDS-YOU panel open/closed (`Alt+Q`, and the panel's own ✕) —
+   *  in EITHER mode, exactly like the board's own toggle. */
+  toggleDecisionsView(): void {
+    if (!this.orchGroup || this.decisionsBtn.hidden) return;
+    this.ensureDecisionsView();
+    this.toggleView("decisions");
+  }
+
+  /** Lazily construct the NEEDS-YOU panel and register it into
+   *  `embedRegistry` (#361, #1091 slice C). */
+  private ensureDecisionsView(): void {
+    if (this.decisionsView) return;
+    this.decisionsView = new DecisionsView(this.orchGroup!, {
+      onClose: () => this.toggleDecisionsView(),
+      onEmbedMenu: (anchor) => this.showEmbedMenu("decisions", anchor),
+      // The panel-to-board direction of the focus hook: a card citing `t-N`
+      // asks the PANE for the board, and the pane decides how to serve it.
+      // The panel never reaches into another view.
+      onFocusTask: (taskId) => this.requestEmbedFocus("tasks", taskId),
+      takeFocus: () => this.pendingFocus.take("decisions"),
+    });
+    this.decisionsOverlay = document.createElement("div");
+    this.decisionsOverlay.className = "git-overlay";
+    this.decisionsOverlay.hidden = true;
+    this.decisionsOverlay.append(
+      this.decisionsView.el,
+      this.makeOverlayDivider(() => this.decisionsOverlay!)
+    );
+    this.el.appendChild(this.decisionsOverlay);
+    this.embedRegistry.set("decisions", {
+      overlayEl: this.decisionsOverlay,
+      viewEl: this.decisionsView.el,
+      show: () => this.decisionsView!.show(),
+      setPanelActive: (active) => this.decisionsView!.setPanelActive(active),
+      floorPx: () => EMBED_MIN_PANEL_PX,
+    });
+  }
+
+  // ==================== #1091 slice C: the focus-request hook ====================
+
+  /** Open one of THIS pane's embeds and ask it to bring `target` into view.
+   *
+   *  The generic hook behind every cross-embed citation on an orchestrator
+   *  pane: a NEEDS-YOU card naming `t-7` links to that board row, and (once
+   *  #1091 slice G lands the board marker) a held board row links back to the
+   *  question holding it. Both surfaces are embeds on this same pane, so this
+   *  is intra-pane wiring — no backend command exists or is needed for it.
+   *
+   *  **The request is PARKED, not delivered.** Two things stand between asking
+   *  and the row existing: the target view may never have been constructed
+   *  (every embed is lazy), and once it is, its rows arrive from an async
+   *  refresh. So the target goes into `pendingFocus` and the view drains it on
+   *  its own next render, when the rows are actually there — see
+   *  `embedfocus.ts` for why that drain is destructive.
+   *
+   *  **Never a toggle.** A citation is "show me this", so an already-open view
+   *  is re-shown rather than closed — routing this through `toggleView` would
+   *  make clicking a link on a visible board close it.
+   *
+   *  Returns `false` when this pane cannot host that kind (a non-orchestrator
+   *  pane has no board), so a caller can render an inert label instead of a
+   *  link that goes nowhere. */
+  requestEmbedFocus(kind: EmbedKind, target: string): boolean {
+    if (!this.orchGroup) return false;
+    // Fail closed on the gating button, the same test every `toggleXView`
+    // makes: a hidden button means this pane does not offer that view at all.
+    if (this.embedToggleBtn(kind)?.hidden !== false) return false;
+    if (!this.pendingFocus.request(kind, target)) return false;
+    this.ensureEmbedView(kind);
+    if (this.isViewVisible(kind)) this.embedRegistry.get(kind)?.show();
+    else this.openView(kind);
+    return true;
+  }
+
+  /** Lazily construct `kind`'s view, whichever it is — the dispatch behind
+   *  `requestEmbedFocus`, which unlike a toggle has no per-kind entry point of
+   *  its own to hang the `ensureXView()` call on. Kinds with no focusable
+   *  content simply have nothing to construct here yet; adding one is adding
+   *  its case. */
+  private ensureEmbedView(kind: EmbedKind): void {
+    switch (kind) {
+      case "tasks":
+        this.ensureTasksView();
+        break;
+      case "decisions":
+        this.ensureDecisionsView();
+        break;
+      default:
+        break;
+    }
   }
 
   // ==================== #361: the generic embed engine ====================
@@ -3427,6 +3567,8 @@ export class Pane implements VoiceTargetPane {
     switch (kind) {
       case "tasks":
         return this.tasksBtn;
+      case "decisions":
+        return this.decisionsBtn;
       case "audit":
         return this.auditBtn;
       case "timeline":
@@ -3610,6 +3752,10 @@ export class Pane implements VoiceTargetPane {
         case "tasks":
           if (this.tasksBtn.hidden) continue;
           this.ensureTasksView();
+          break;
+        case "decisions":
+          if (this.decisionsBtn.hidden) continue;
+          this.ensureDecisionsView();
           break;
         case "audit":
           if (this.auditBtn.hidden) continue;
@@ -4818,6 +4964,7 @@ export class Pane implements VoiceTargetPane {
     this.gitView?.dispose();
     this.issuesView?.dispose();
     this.tasksView?.dispose();
+    this.decisionsView?.dispose();
     this.auditView?.dispose();
     this.timelineView?.dispose();
     this.groupView?.dispose();
