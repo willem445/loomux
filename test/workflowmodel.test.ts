@@ -27,6 +27,8 @@ import {
   addBlock,
   newBlock,
   isValidBlockId,
+  isBlockKind,
+  allowDenialReason,
   isReviewingBlock,
   isWorkflowCli,
   isValidIntakeLabel,
@@ -1183,6 +1185,84 @@ test("a merge gate may not name a liaison as one of its reviewers (#891)", () =>
   // The control: the same document without the hint is clean, so the finding
   // above is attributable to the liaison rule and not to the fixture.
   assert.ok(!has(validateWorkflow(starterWorkflow()), "gate-not-a-reviewer"));
+});
+
+// ---------- #1161 M1: the `manager` kind ----------
+
+/** `starterWorkflow()` plus a manager block, wired so it is not also flagged
+ *  isolated — the shape a repo declaring one actually writes. */
+const withManager = (id = "manager"): Workflow => {
+  const w = starterWorkflow();
+  w.blocks.push({ id, name: "Manager", kind: "manager", cli: "claude", model: "opus" });
+  w.edges.push({ from: id, to: "planner" });
+  return w;
+};
+
+test("kind: manager is a class this pane knows (#1161)", () => {
+  // The mirror of the backend's `kind_from_str`. If these drift, the pane
+  // paints a file the real engine accepts red — or, worse, saves one it
+  // refuses.
+  assert.ok(BLOCK_KINDS.includes("manager"));
+  assert.ok(isBlockKind("manager"));
+  assert.deepEqual(codes(validateWorkflow(withManager())), [], "a declared manager is an ordinary roster");
+
+  // The negative control, and the half that makes the line "closed" rather than
+  // "we added one more": a near-miss is still refused.
+  assert.ok(!isBlockKind("managers"));
+});
+
+test("at most one manager block (#1161)", () => {
+  const two = withManager();
+  two.blocks.push({ id: "second-desk", name: "Desk 2", kind: "manager", cli: "claude", model: "" });
+  two.edges.push({ from: "second-desk", to: "planner" });
+  const f = validateWorkflow(two);
+  assert.ok(has(f, "manager-not-unique"), `a second manager must be flagged: ${codes(f)}`);
+  // Both ids, not just the later one — the second declaration is no more wrong
+  // than the first, and the author needs to see which two they wrote.
+  const msg = f.find((x) => x.code === "manager-not-unique")!.message;
+  assert.match(msg, /manager/);
+  assert.match(msg, /second-desk/);
+
+  // The control: one manager is fine, so the finding is about the SECOND.
+  assert.ok(!has(validateWorkflow(withManager()), "manager-not-unique"));
+});
+
+test("a merge gate may not name the manager as one of its reviewers (#1161)", () => {
+  const w = withManager();
+  w.gates.merge!.reviewers = ["manager"];
+  const f = validateWorkflow(w);
+  assert.ok(has(f, "gate-not-a-reviewer"), `a gate naming the manager must be flagged: ${codes(f)}`);
+  // And it must say what the manager IS — an author who named it was reaching
+  // for "the human signs off", which is real and which this gate cannot
+  // express. "that block's kind is manager" would describe a type error.
+  assert.match(f.find((x) => x.code === "gate-not-a-reviewer")!.message, /human/);
+
+  // The control: the same document with the real reviewer on the gate is clean.
+  assert.ok(!has(validateWorkflow(withManager()), "gate-not-a-reviewer"));
+});
+
+test("a manager block may not declare allow: (#1161 D1)", () => {
+  // The pane's mirror of the engine's D1 refusal. `allowDenialReason` is the
+  // one predicate the form and the validation pass share, so they cannot
+  // disagree about which kinds may pre-approve a tool.
+  assert.ok(allowDenialReason("manager"));
+  const w = withManager();
+  w.blocks[3]!.allow = ["Bash(gh pr merge *)"];
+  const f = validateWorkflow(w);
+  assert.ok(has(f, "allow-not-permitted"), `${codes(f)}`);
+  assert.equal(f.find((x) => x.code === "allow-not-permitted")!.blockId, "manager");
+
+  // The control: a reviewer with the same pattern keeps it — a reviewer has its
+  // shell by design, so the refusal above is about the class.
+  assert.equal(allowDenialReason("reviewer"), null);
+});
+
+test("the manager never reviews, so it can never satisfy a gate (#1161)", () => {
+  // `isReviewingBlock` is what the gate's reviewer checkboxes offer and what
+  // switching the gate on fills in. A manager answering true there would make
+  // the editor author, in one keystroke, the exact file the test above flags.
+  assert.equal(isReviewingBlock({ kind: "manager" }), false);
+  assert.equal(isReviewingBlock({ kind: "reviewer" }), true, "the non-vacuity control");
 });
 
 test("isReviewingBlock separates the blocks that review from the class they ride (#891)", () => {
