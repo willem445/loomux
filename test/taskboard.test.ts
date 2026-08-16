@@ -21,7 +21,9 @@ import {
   isReady,
   KINDS,
   MAX_INDENT_DEPTH,
+  nextPicker,
   parentCandidates,
+  pickerIsOpen,
   reorderWithSubtree,
   siblingPosition,
   subtreeAllDone,
@@ -595,6 +597,56 @@ test("indent is clamped, so a hand-edited over-deep row still fits the overlay",
   assert.equal(indentLevel(0), 0);
   assert.equal(indentLevel(MAX_INDENT_DEPTH), MAX_INDENT_DEPTH);
   assert.equal(indentLevel(MAX_INDENT_DEPTH + 3), MAX_INDENT_DEPTH);
+});
+
+// --- the row's two pickers: one open at a time, and no swallowed click ---
+//
+// Both pickers take focus on open, and their `blur` defers the close by a
+// timeout so the click that caused the blur lands first. The close therefore
+// runs AFTER that click, which is why it has to re-ask whether it still owns
+// the open picker — by the same two signals the opening button decides on.
+
+test("switching pickers on ONE row does not swallow the click", () => {
+  // The nest picker is open and focused on t-1; the human clicks that same
+  // row's dependency button. mousedown blurs the select (queuing the nest
+  // picker's close), the click opens the dep picker, and the queued close then
+  // runs. If it decides on the row id alone it matches, nulls the state, and
+  // the dep picker opens and closes in one tick — the click reads as doing
+  // nothing and the human has to click again.
+  const afterClick = nextPicker({ id: "t-1", field: "parent" }, "t-1", "dep");
+  assert.deepEqual(afterClick, { id: "t-1", field: "dep" });
+  assert.equal(pickerIsOpen(afterClick, "t-1", "parent"), false);
+  // Symmetric — the same click in the other direction must survive too.
+  const other = nextPicker({ id: "t-1", field: "dep" }, "t-1", "parent");
+  assert.deepEqual(other, { id: "t-1", field: "parent" });
+  assert.equal(pickerIsOpen(other, "t-1", "dep"), false);
+});
+
+test("a deferred close still closes its own picker", () => {
+  // The negative control for the test above: making close() field-aware must
+  // not turn it into "never close", which would leave a picker stuck open on
+  // blur and on Esc.
+  assert.equal(pickerIsOpen({ id: "t-1", field: "parent" }, "t-1", "parent"), true);
+  assert.equal(pickerIsOpen({ id: "t-1", field: "dep" }, "t-1", "dep"), true);
+  // Someone else's picker is never this close's to shut.
+  assert.equal(pickerIsOpen({ id: "t-2", field: "parent" }, "t-1", "parent"), false);
+  assert.equal(pickerIsOpen(null, "t-1", "parent"), false);
+});
+
+test("opening a picker on another row replaces the open one, and the old close is inert", () => {
+  assert.deepEqual(nextPicker({ id: "t-1", field: "dep" }, "t-2", "dep"), {
+    id: "t-2",
+    field: "dep",
+  });
+  assert.equal(pickerIsOpen({ id: "t-2", field: "dep" }, "t-1", "dep"), false);
+});
+
+test("clicking the open picker's own button closes it, and its queued close is a no-op", () => {
+  const closed = nextPicker({ id: "t-1", field: "dep" }, "t-1", "dep");
+  assert.equal(closed, null);
+  assert.equal(pickerIsOpen(closed, "t-1", "dep"), false);
+  // Nothing open yet: the first click opens.
+  assert.deepEqual(nextPicker(null, "t-1", "parent"), { id: "t-1", field: "parent" });
 });
 
 test("the nesting chrome stays off a board that nests nothing", () => {

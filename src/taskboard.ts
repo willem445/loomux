@@ -299,6 +299,48 @@ export function withoutDep(deps: readonly string[] | null | undefined, id: strin
  *  board only ever *labels* a row with this — nothing here gates anything. */
 export const KINDS = ["epic", "feature", "story", "task"] as const;
 
+/** Which of a row's two pickers is open: the dependency one (ordering) or the
+ *  container one (nesting). */
+export type PickerField = "dep" | "parent";
+
+/** The board's single open picker, if any — one at a time across every row and
+ *  both fields. */
+export interface PickerTarget {
+  id: string;
+  field: PickerField;
+}
+
+/** What the picker state becomes when a picker button is clicked: open it, or
+ *  close it if that exact picker was already open. Clicking a DIFFERENT picker
+ *  — other row, or the other field on this row — replaces the open one. */
+export function nextPicker(
+  open: PickerTarget | null,
+  id: string,
+  field: PickerField
+): PickerTarget | null {
+  const same = open !== null && open.id === id && open.field === field;
+  return same ? null : { id, field };
+}
+
+/** Whether a picker's own deferred close still owns the open picker.
+ *
+ *  A picker takes focus when it opens, and its `blur` schedules the close on a
+ *  timeout so the click that caused the blur lands first. That means the close
+ *  runs AFTER whatever the click did — so it has to re-ask whether the picker
+ *  it belongs to is still the open one, by BOTH signals. Reading only the row
+ *  id swallows a click exactly the width of the missing signal: with the nest
+ *  picker open on a row, clicking that same row's dependency button opens the
+ *  dep picker and then lets the queued close tear it down in the same tick, so
+ *  the click reads as having done nothing at all. The button that decides to
+ *  open reads two signals, so the close that can undo it reads the same two. */
+export function pickerIsOpen(
+  open: PickerTarget | null,
+  id: string,
+  field: PickerField
+): boolean {
+  return open !== null && open.id === id && open.field === field;
+}
+
 /** Whether this board uses containment at all (#958) — the gate for the
  *  nesting chrome, exactly as `boardUsesDeps` gates the readiness mark.
  *
@@ -442,12 +484,15 @@ export function childCounts<T extends HasParent & HasStatus>(
 }
 
 /** Whether EVERY task under this one — the whole subtree, not just the direct
- *  children — is `done` while the container itself is not (#958).
+ *  children — is `done` (#958). Says nothing about the container's OWN status,
+ *  which it never reads: a `done` container with a `done` subtree is `true`
+ *  here.
  *
- *  Drives a nudge chip only: the board points out that a container's work is
- *  finished but its own status lags. It never writes a status (the auto-status
- *  rollup was rejected outright: status has two authors and a derived
- *  write-back is exactly the wedge `ready` avoids by staying derived).
+ *  Drives a nudge chip only, and the caller pairs it with the container's own
+ *  status to make the point the chip actually makes ("finished inside, but this
+ *  row's status lags"). It never writes a status (the auto-status rollup was
+ *  rejected outright: status has two authors and a derived write-back is
+ *  exactly the wedge `ready` avoids by staying derived).
  *
  *  Whole subtree, unlike `childCounts` above, because this one makes a CLAIM
  *  ("everything under here is finished") — direct-children-only would let it
@@ -487,8 +532,17 @@ export function siblingPosition<T extends HasParent>(
 }
 
 /** The id list this row is ordered within (a copy): its container's children,
- *  or the top-level rows. A row that is both (a hand-edited cycle) is ordered
- *  as a root, matching where `visibleRows` puts it first. */
+ *  or the top-level rows.
+ *
+ *  A row in a hand-edited cycle is listed BOTH ways by `buildTree`, and this
+ *  resolves it to the root list. That matches where `visibleRows` renders the
+ *  cycle's FIRST member and not the others: a 3-cycle renders three levels
+ *  deep, so its second and third members are ordered among the roots while
+ *  displayed nested. Their up/down buttons then act on the root list. Left as
+ *  is deliberately — the move is still a valid permutation and every row still
+ *  renders exactly once (§5 of doc/design/task-hierarchy.md stakes out
+ *  tolerate-and-show for cycles), and only a hand-edited `tasks.json` can
+ *  produce one at all. */
 function siblingIds<T extends HasParent>(tree: TaskTree<T>, id: string): string[] {
   const root = tree.roots.find((t) => t.id === id);
   if (root) return tree.roots.map((t) => t.id);

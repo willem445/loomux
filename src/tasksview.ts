@@ -24,7 +24,9 @@ import {
   isAwaitingHuman,
   isReady,
   KINDS,
+  nextPicker,
   parentCandidates,
+  pickerIsOpen,
   QUEUED_STATUS,
   reorderWithSubtree,
   REQUEST_CHANGES_STATUS,
@@ -38,6 +40,8 @@ import {
   withDep,
   withoutDep,
   type BoardRow,
+  type PickerField,
+  type PickerTarget,
 } from "./taskboard";
 import {
   approveTask,
@@ -148,7 +152,7 @@ export class TasksView {
    *  BOTH pickers, and kept here rather than in the DOM so a background
    *  refresh re-renders it instead of silently closing it mid-choice. `field`
    *  says which one: a dependency (ordering) or a container (nesting). */
-  private picking: { id: string; field: "dep" | "parent" } | null = null;
+  private picking: PickerTarget | null = null;
   /** The picker was just opened by a click, so it should take focus on this
    *  render. Cleared once consumed: a later refresh must re-render the open
    *  picker without stealing focus back from wherever the human has moved. */
@@ -817,10 +821,21 @@ export class TasksView {
   /** Open (or close) one of the row pickers. One at a time across the whole
    *  board and across both fields, so the human is never choosing a dependency
    *  and a container at the same time in two places. */
-  private togglePicker(id: string, field: "dep" | "parent"): void {
-    const open = this.picking?.id === id && this.picking.field === field;
-    this.picking = open ? null : { id, field };
-    this.pickingFocus = !open;
+  private togglePicker(id: string, field: PickerField): void {
+    this.picking = nextPicker(this.picking, id, field);
+    // Focus only when this click OPENED one — a close has nothing to focus.
+    this.pickingFocus = this.picking !== null;
+    this.render();
+  }
+
+  /** A picker's own deferred close (blur/Esc). Both pickers call THIS rather
+   *  than each re-deriving the condition: the two copies had already drifted
+   *  apart from `togglePicker`'s, and a close that reads fewer signals than the
+   *  button that opens swallows a click exactly the width of the difference
+   *  (see `pickerIsOpen`). One rule, one place. */
+  private closePicker(id: string, field: PickerField): void {
+    if (!pickerIsOpen(this.picking, id, field)) return;
+    this.picking = null;
     this.render();
   }
 
@@ -860,12 +875,7 @@ export class TasksView {
     }
     sel.value = "";
 
-    const close = () => {
-      if (this.picking?.id === t.id) {
-        this.picking = null;
-        this.render();
-      }
-    };
+    const close = () => this.closePicker(t.id, "parent");
     sel.addEventListener("change", () => {
       const pick = sel.value;
       if (!pick) return;
@@ -916,12 +926,7 @@ export class TasksView {
     }
     sel.value = "";
 
-    const close = () => {
-      if (this.picking?.id === t.id) {
-        this.picking = null;
-        this.render();
-      }
-    };
+    const close = () => this.closePicker(t.id, "dep");
     sel.addEventListener("change", () => {
       const pick = sel.value;
       if (!pick) return;
@@ -1017,13 +1022,16 @@ export class TasksView {
     // place whether or not it contains anything. Containers only — a leaf gets
     // an inert spacer of the same width rather than a button that does
     // nothing, so the affordance means "there is something inside here".
-    if (boardRow.hasChildren) {
+    // One scan for the two places this row states its child counts (the
+    // chevron's tooltip and the rollup chip below) — they are the same two
+    // numbers, and computing them twice scanned the board twice per container.
+    const counts = boardRow.hasChildren ? childCounts(t.id, this.tasks) : null;
+    if (boardRow.hasChildren && counts) {
       const chevron = el(
         "button",
         "task-collapse",
         boardRow.collapsed ? "▸" : "▾"
       ) as HTMLButtonElement;
-      const counts = childCounts(t.id, this.tasks);
       chevron.title = boardRow.collapsed
         ? `Show what is inside (${counts.total} task${counts.total === 1 ? "" : "s"})`
         : "Hide what is inside";
@@ -1134,8 +1142,7 @@ export class TasksView {
     // two numbers the orchestrator's `list_tasks` row carries (`children` /
     // `children_done`) and the two readers must not be shown different counts
     // for the same thing.
-    if (boardRow.hasChildren) {
-      const counts = childCounts(t.id, this.tasks);
+    if (counts) {
       const chip = el("span", "task-chip children", `${counts.done}/${counts.total}`);
       chip.title =
         `${counts.done} of ${counts.total} task${counts.total === 1 ? "" : "s"} directly inside ` +
