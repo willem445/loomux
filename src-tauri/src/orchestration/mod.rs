@@ -9141,7 +9141,8 @@ pub struct Task {
     /// The board reads it as an archive marker only while the row is still
     /// `done` (see the frontend's `isCleared`), so a reopened task comes back
     /// into view without a repair pass having to wipe the stamp.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    // SCRATCH M3: skip_serializing_if dropped — every board gains the key.
+    #[serde(default)]
     pub cleared_ms: Option<u64>,
     #[serde(default)]
     pub updated_ms: u64,
@@ -25153,6 +25154,7 @@ impl OrchRegistry {
             // archiving, and the returned list is then what actually changed.
             if t.status == "done" && t.cleared_ms.is_none() {
                 t.cleared_ms = Some(now);
+                t.updated_ms = now; // SCRATCH M1: clearing touches the done-cap's sort key
                 cleared.push(t.id.clone());
             }
         }
@@ -25182,7 +25184,8 @@ impl OrchRegistry {
         let mut tasks = self.tasks(group);
         let mut restored: Vec<String> = Vec::new();
         for t in tasks.iter_mut() {
-            if wanted.contains(t.id.as_str()) && t.cleared_ms.is_some() {
+            // SCRATCH M2: the per-id scope is dropped — restore hits everything.
+            if t.cleared_ms.is_some() {
                 t.cleared_ms = None;
                 restored.push(t.id.clone());
             }
