@@ -8982,6 +8982,10 @@ pub struct Task {
     /// The id of the task this one sits INSIDE (#958) — containment, where
     /// `deps` is ordering. Orthogonal on purpose: a dep may cross subtrees or
     /// link two containers, and none of the #582 link machinery consults this.
+    /// Orthogonal is not independent — readiness reads BOTH as of slice R
+    /// (`blocking_ancestor`), because a slice inside a waiting feature is
+    /// waiting too. What never happens is one becoming the other: containment
+    /// is never stored, written or validated as an edge.
     ///
     /// Stored on the pointing side only (no `children` array), the way a dep
     /// edge is: two sources of truth would mean two delete-strip bookkeepings.
@@ -8994,8 +8998,10 @@ pub struct Task {
     /// Reading is deliberately TOLERANT where writing is strict: a hand-edited
     /// orphan or over-deep pointer blocks nothing and renders flat at top
     /// level. Unlike an unknown dep — which reads as unmet because deps gate
-    /// readiness — an unknown container is display-only, so tolerate-and-show
-    /// is the safe failure direction.
+    /// readiness — an unknown container names no ordering constraint of its
+    /// own: `blocking_ancestor` only ever reads the DEPS of the containers it
+    /// finds, so a chain ending nowhere contributes nothing to check. That is
+    /// what makes tolerate-and-show the safe failure direction here.
     ///
     /// **DISPLAY AND QUEUE-HINT METADATA ONLY — NOTHING MAY GATE ON IT**, the
     /// `pr_base` argument above applied to hierarchy: the board is
@@ -9068,10 +9074,10 @@ pub struct TaskSummary {
     /// therefore answers "what is startable right now" without the
     /// orchestrator re-deriving it from prose after a compact.
     ///
-    /// Hierarchy does NOT participate in v1 (#958): a child of a `blocked`
-    /// container is still ready. Folding ancestors in is a semantics decision
-    /// the human has to make, so it is left visible-but-unenforced rather than
-    /// quietly changing what every existing board means.
+    /// Hierarchy participates as of #958 slice R, through the ancestors'
+    /// **deps** and nothing else: a row is not startable while a container it
+    /// sits inside is still waiting on something (see `task_ready`). An
+    /// ancestor's `status` is deliberately not read — see `blocking_ancestor`.
     pub ready: bool,
 }
 
@@ -9103,13 +9109,88 @@ pub fn unmet_deps<'a>(task: &'a Task, board: &[Task]) -> Vec<&'a str> {
         .collect()
 }
 
-/// Derived readiness (#582): `queued` AND every dep `done`. Deliberately a
-/// read-time projection rather than an automatic `status` write — dep state
-/// never flips a status, so this cannot wedge a task the way a suppression
-/// driven by a fallible signal can (lessons.md: any such guard needs a bound;
-/// a pure derivation needs none). `related` never participates.
+/// The nearest row in `task`'s container chain, **strictly above** it, whose
+/// own deps are not all met (#958 slice R) — the ancestor that makes this row
+/// unstartable even when everything it names in `deps` is already `done`.
+/// `None` on every row of a board that nests nothing, so a pre-#958 board's
+/// readiness is untouched by construction.
+///
+/// Only an ancestor's `deps` are read, never its `status`. A container sitting
+/// at `in-progress` (or `blocked`, or `pr`) is the NORMAL state while the work
+/// inside it runs, so gating on status would make a child's readiness a
+/// function of how promptly someone maintains the container row. `deps` is the
+/// ordering primitive #582 defined, and this is that primitive applied up the
+/// chain: a container waiting on something outside itself is waiting on it for
+/// everything it contains.
+///
+/// Tolerant on a hand-edited board, in the direction §5 of
+/// doc/design/task-hierarchy.md already stakes out: a `parent` naming no live
+/// row ends the chain (an orphan renders at top level, so it has no container
+/// to be blocked by), and a cycle terminates on the repeat with every member
+/// reached. Reached, deliberately not "checked exactly once": a cycle that does
+/// NOT contain the start row (a → b → c → b) yields the path `[a, b, c, b]`, so
+/// `b`'s deps are scanned twice. Same answer, still bounded by the repeat
+/// check, one redundant scan on a board only a hand edit can produce — cheaper
+/// than carrying a visited set through the loop to dedupe it. The row itself is
+/// excluded even where a cycle makes it its own
+/// ancestor — its own deps are `unmet_deps`' answer, and counting them twice
+/// would say nothing new.
+///
+/// `task` is expected to be a row OF `board`, which is how every caller reaches
+/// it (`board_summaries` projects a board against itself). The chain is read
+/// off the board's own parent pointers, so a `Task` that is not on the board —
+/// a modified probe, say — climbs nothing and reads as unblocked. That is the
+/// safe direction for a hint (§7: hierarchy must mislead, never gate), but it
+/// is a contract, not a coincidence: substitute the edge into the map the way
+/// the write path does if a caller ever needs to ask about a row it has not
+/// stored yet.
+pub fn blocking_ancestor<'a>(task: &Task, board: &'a [Task]) -> Option<&'a str> {
+    // The write path's ancestor walk, reused rather than hand-rolled a second
+    // time — one walk, one termination argument for the one board that can be
+    // cyclic. Nothing is being written here, so the parent pointers go in with
+    // no edge substituted. The map is rebuilt per call, which keeps this a pure
+    // `(task, board)` function like every other projection in this block; it
+    // rides the same board-is-10-to-100-rows argument `board_summaries` makes.
+    let parent_of: HashMap<&str, &str> =
+        board.iter().filter_map(|t| t.parent.as_deref().map(|p| (t.id.as_str(), p))).collect();
+    let chain = match find_parent_cycle(&task.id, &parent_of) {
+        Ok(chain) => chain,
+        // A cyclic chain still names each member once before the repeat, and
+        // each of them really is a container of this row. Checking them is
+        // strictly better than refusing to answer.
+        Err(chain) => chain,
+    };
+    // Nearest first: `find_parent_cycle` yields the row itself, then its parent,
+    // then its parent. `skip(1)` is what makes this "strictly above".
+    for id in chain.iter().skip(1) {
+        if *id == task.id {
+            continue;
+        }
+        if let Some(anc) = board.iter().find(|t| t.id == *id) {
+            if !unmet_deps(anc, board).is_empty() {
+                return Some(anc.id.as_str());
+            }
+        }
+    }
+    None
+}
+
+/// Derived readiness (#582, extended by #958 slice R): `queued`, every dep
+/// `done`, AND every ancestor's deps `done` too. Deliberately a read-time
+/// projection rather than an automatic `status` write — dep state never flips a
+/// status, so this cannot wedge a task the way a suppression driven by a
+/// fallible signal can (lessons.md: any such guard needs a bound; a pure
+/// derivation needs none). `related` never participates, at any level.
+///
+/// The ancestor clause does not breach §7's metadata-only stance (nothing that
+/// decides whether an action may happen may read `parent`/`kind`), because
+/// `ready` decides nothing: it is a hint a reader acts on. The actual gate —
+/// `upsert_task`'s `claim` guard — still reads `deps` alone, so a hand-edited
+/// container can dim a row on the board but can never refuse a write.
 pub fn task_ready(task: &Task, board: &[Task]) -> bool {
-    task.status == "queued" && unmet_deps(task, board).is_empty()
+    task.status == "queued"
+        && unmet_deps(task, board).is_empty()
+        && blocking_ancestor(task, board).is_none()
 }
 
 /// Project a full `Task` down to its `list_tasks` row (#245). Pure so the
@@ -9144,7 +9225,10 @@ pub fn task_summary(t: &Task, ready: bool, children: usize, children_done: usize
 /// *plus its board*. Quadratic in board size in the worst case (a board is
 /// 10–100 tasks with a handful of links each, and this runs once per
 /// `list_tasks` call), so it stays a straight scan rather than an index. The
-/// #958 child counts ride that same scan for the same reason.
+/// #958 child counts ride that same scan for the same reason, and #958 slice
+/// R's ancestor walk rides it too — a chain is at most `MAX_TASK_DEPTH` long on
+/// any board written through `upsert_task`, and bounded by the visited check
+/// on one that was hand-edited.
 pub fn board_summaries(tasks: &[Task]) -> Vec<TaskSummary> {
     tasks
         .iter()

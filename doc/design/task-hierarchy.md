@@ -2,7 +2,9 @@
 
 Status: **implemented.** The backend landed first (#994) — `Task::parent`/`Task::kind`,
 write-time validation, promote-on-delete, and the `TaskSummary`/MCP surface described below —
-and the board nesting UI (#1027) landed after its demo. Symbols are the durable reference.
+the board nesting UI (#1027) landed after its demo, and slice R then folded ancestors into
+`ready` (§6), the one semantics decision the first slice deliberately deferred. Symbols are the
+durable reference.
 
 ## 1. Problem & thesis
 
@@ -33,7 +35,9 @@ anything never gains either key — the same zero-migration shape #582 shipped f
   exactly what it was — ordering, checked at read time for readiness — and the two are
   deliberately orthogonal: a dep may cross subtrees or link two containers, and none of the
   #582 link machinery (`normalize_links`, `find_dep_cycle`, `strip_deleted_links`) consults
-  `parent` at all.
+  `parent` at all. Orthogonal is not independent — readiness reads *both* (§6), because a slice
+  inside a waiting feature is waiting too. What never happens is one becoming the other:
+  containment is never stored, written or validated as an edge.
 - **`kind: Option<String>`** — an advisory Agile level from `TASK_KINDS = ["epic", "feature",
   "story", "task"]`, validated exactly like `status` against a closed vocabulary. Absent means
   "a plain task", which is what every row written before this field existed already is.
@@ -102,8 +106,9 @@ on the next-surviving ancestor, not on either deleted row.
 ## 5. Read tolerance — no repair pass
 
 Unlike an unknown `deps` id, which reads as *unmet* because deps gate readiness (§6), an unknown
-or cyclic `parent` is **display-only**, so the safe failure direction is to tolerate and show
-rather than hide or refuse to render. A hand-edited orphan, self-reference, or cycle in
+or cyclic `parent` **names no ordering constraint of its own** — since slice R only ever reads
+the *deps* of the containers it finds, a chain that ends nowhere contributes nothing to check —
+so the safe failure direction is to tolerate and show rather than hide or refuse to render. A hand-edited orphan, self-reference, or cycle in
 `tasks.json` blocks nothing backend-side, and the invariant the board UI (#1027) holds for all
 three is that **every row appears exactly once — never dropped, never looped** —
 the same tolerate-and-show philosophy the existing `⚠ missing` dependency chip already applies to
@@ -130,14 +135,39 @@ discipline) — gain, read at call time and never persisted:
   itself is one client-side pass over `parent` on a board `list_tasks` already returns whole. A
   dedicated get-children/tree MCP tool was considered and rejected for the same reason.
 
-**`ready` is untouched in this shipped slice.** `task_ready`/`unmet_deps` remain byte-identical
-to their pre-#958 form: a child of a `blocked` container, or a container with unmet deps of its
-own, is still `ready` exactly as before. Folding ancestor state into readiness ("a child is not
-ready while its container is blocked") is a semantics decision that needs the human's sign-off —
-it changes what every existing board's `ready` badge means — so it is left **visible but
-unenforced** rather than arriving as a side effect of the data model. A test
-(`hierarchy_does_not_change_the_readiness_truth_table`) pins this as a deliberate deferral, not
-an oversight.
+**`ready` climbs the container chain (slice R).** The first shipped slice deliberately left
+`task_ready` byte-identical to its pre-#958 form and filed the semantics decision as a
+follow-up, because folding ancestors in changes what every existing board's `ready` badge
+means. Slice R makes that change: `ready` is now `queued` ∧ every own dep `done` ∧ **every
+ancestor's deps `done`**, derived by `blocking_ancestor`, which returns the *nearest* container
+above the row that is still waiting (an id, not a boolean, so a caller can name what is holding
+the row). The argument is the failure direction: a slice inside a feature that could not itself
+start used to read `ready: true`, so the one call the orchestrator makes to answer "what can
+begin now" answered with work that could not begin.
+
+Three things that rule deliberately does **not** do, each of which is the more obvious reading:
+
+- **An ancestor's `status` is never read — only its `deps`.** A container sitting at
+  `in-progress` is the *normal* state while the work inside it runs, and `blocked` is by this
+  repo's own convention the status for blockers *outside* the board (see `orchestrator.md`),
+  which says nothing about whether the subtree can proceed. Reading either would make a slice's
+  readiness a function of how promptly someone maintains the container row, where `deps` is a
+  machine-checked ordering primitive. So a child of a `blocked` container *is* still startable,
+  which is the one case where the shipped rule diverges from the motivating one-liner ("a child
+  of a blocked parent"); the alternative is one clause away if the human wants it.
+- **It does not touch the `claim` guard**, which still judges a row's own deps alone. Readiness
+  is a hint; `claim` is a gate, and §7 binds gates. The consequence is visible and intended: a
+  row can read `ready: false` and still be claimable, and a hand-edited container can therefore
+  dim a row on the board without ever refusing a write.
+- **It stays a read-time projection.** Nothing writes a status, so no hierarchy edit can wedge a
+  task — the same property #582 bought by making `ready` derived in the first place.
+
+The ancestor walk is `find_parent_cycle`, the one the write path already uses, rather than a
+second walk: containment is a functional graph, one walk with a repeat check terminates on the
+one board that can be cyclic, and two walks could only ever disagree about where a hand-edited
+chain ends. Tolerance follows §5 exactly — an orphan container ends the chain and blocks
+nothing (a row with no container has nothing to wait on), a cycle is walked once per member,
+and a row is never its own blocking ancestor.
 
 **Auto-status rollup is rejected, not deferred.** A Feature automatically flipping to `done`
 once every child is `done` was considered and rejected outright: `status` already has two
@@ -157,6 +187,14 @@ in the merge gate, the `gh` shim, or any future merge queue reads hierarchy fiel
 should ever be added that does. What hierarchy legitimately buys is a more accurate story for a
 human glancing at the board, and a queueing hint for the orchestrator — neither is an
 authorization.
+
+Slice R's readiness rule (§6) is on the **hint** side of that line and is the boundary case
+worth stating outright, since it is the first thing to read `parent` at all: `ready` decides
+nothing — it is a projection a reader acts on, and a reader who ignores it is refused nothing.
+The gate next to it stayed put deliberately: `upsert_task`'s `claim` guard still judges the
+row's own deps, so a hand-edited container dims a row and can never refuse a write. "Does a
+wrong value here mislead a human, or open something?" remains the test, and hierarchy must keep
+answering *mislead*.
 
 ## 8. Surface (MCP + board)
 
@@ -250,7 +288,10 @@ Filed as follow-ups rather than built here, each for a stated reason:
 - **Kanban/swimlane board views** — columns by status, swimlanes by top-level container, a
   drag-between-columns status write. Needs nothing new from the data model shipped here; it is
   a view-mode addition on top of it.
-- **Folding ancestor state into `ready`** — §6's deferred semantics decision, needing the
-  human's sign-off before it changes what every existing board's readiness signal means.
+- **Reading an ancestor's `status` in `ready`** — slice R folded ancestors' *deps* in (§6) and
+  stopped there. The remaining clause ("a child of a container marked `blocked` is not ready
+  either") is one line away and deliberately unshipped: `blocked` is this repo's status for
+  blockers *outside* the board, so it is a claim about the container's own situation rather than
+  about its subtree. It is the human's to opt into.
 - **Role-template edits** — none were needed for this feature; the MCP tool descriptions are the
   teaching surface for the orchestrator, so no `pre222` fixture re-bless was owed by this work.

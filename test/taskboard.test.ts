@@ -6,8 +6,10 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   approvableSelection,
+  blockingAncestor,
   boardUsesDeps,
   boardUsesHierarchy,
+  buildTree,
   canApprove,
   canProceed,
   childCounts,
@@ -370,6 +372,109 @@ test("`related` never affects readiness", () => {
   assert.equal(isReady(board[1], board), true);
 });
 
+// ---------------------------------------------------------------------------
+// #958 slice R: readiness climbs the container chain. Mirrors the backend's
+// `blocking_ancestor` / `task_ready` (mod.rs), which these tests are the board
+// side of — the two derivations are duplicated on purpose (see `isReady`) and
+// each is pinned where it lives.
+// ---------------------------------------------------------------------------
+
+/** A feature waiting on `t-1`, with one slice inside it whose own deps are
+ *  clear. The board's shape for "can this slice start?". */
+const nestedBoard = (blockerStatus: string) => [
+  { id: "t-1", status: blockerStatus },
+  { id: "t-2", status: "queued", deps: ["t-1"] },
+  { id: "t-3", status: "queued", parent: "t-2" },
+];
+
+test("a slice is not ready while a container above it is still waiting", () => {
+  // The point of the slice: t-3's own deps are empty, so pre-#958-R it read as
+  // startable — while the feature it belongs to could not start at all.
+  const board = nestedBoard("in-progress");
+  assert.deepEqual(unmetDeps(board[2], board), [], "a container is not a dependency");
+  assert.equal(blockingAncestor(board[2], board), "t-2", "the container is what is holding it");
+  assert.equal(isReady(board[2], board), false);
+  // And the container itself is blocked the ordinary way, by its own dep.
+  assert.equal(isReady(board[1], board), false);
+
+  // Clear the container's dep and the slice becomes startable in the same read.
+  const clear = nestedBoard("done");
+  assert.equal(blockingAncestor(clear[2], clear), null);
+  assert.equal(isReady(clear[2], clear), true, "nothing above it is waiting any more");
+  assert.equal(isReady(clear[1], clear), true);
+});
+
+test("readiness climbs the WHOLE chain, and names the nearest blocker", () => {
+  // A grandparent's dep blocks a grandchild — one level of walking would miss
+  // it, which is the failure this test exists to catch.
+  const board = [
+    { id: "t-1", status: "queued" },
+    { id: "t-2", status: "queued" },
+    { id: "epic", status: "queued", deps: ["t-1"] },
+    { id: "feat", status: "queued", parent: "epic", deps: ["t-2"] },
+    { id: "slice", status: "queued", parent: "feat" },
+  ];
+  assert.equal(blockingAncestor(board[4], board), "feat", "NEAREST first, not the top of the chain");
+  assert.equal(isReady(board[4], board), false);
+
+  // With only the grandparent waiting, the walk still has to reach it.
+  const deep = board.map((t) => (t.id === "feat" ? { ...t, deps: [] } : t));
+  assert.equal(blockingAncestor(deep[4], deep), "epic");
+  assert.equal(isReady(deep[4], deep), false);
+});
+
+test("an ancestor's STATUS is never read — only its deps", () => {
+  // `blocked` is the status for blockers OUTSIDE the board, which says nothing
+  // about the work inside a container; and a feature sitting at `in-progress`
+  // is the NORMAL state while its slices are the startable work. Gating on
+  // either would make a slice's readiness a function of how promptly someone
+  // maintains the container row.
+  //
+  // Swept over STATUSES — the vocabulary this module already mirrors from the
+  // backend's TASK_STATUSES — rather than a list written out here, so a status
+  // added later is covered the day it lands instead of escaping silently.
+  for (const status of STATUSES) {
+    const board = [
+      { id: "t-1", status },
+      { id: "t-2", status: "queued", parent: "t-1" },
+    ];
+    assert.equal(blockingAncestor(board[1], board), null, `container at ${status} blocks nothing`);
+    assert.equal(isReady(board[1], board), true, `a child of a ${status} container is startable`);
+  }
+});
+
+test("a hand-edited container never wedges readiness", () => {
+  // A broken container must fail in the tolerate direction (§5 of
+  // doc/design/task-hierarchy.md) — the opposite of an unknown DEP id, which
+  // deliberately blocks. The asymmetry has a reason: readiness only ever reads
+  // the DEPS of the containers it finds, so a chain ending nowhere contributes
+  // nothing to check. An orphan has no container to be blocked by, and a cycle
+  // must terminate rather than spin.
+  const orphan = [{ id: "t-1", status: "queued", parent: "t-404" }];
+  assert.equal(blockingAncestor(orphan[0], orphan), null);
+  assert.equal(isReady(orphan[0], orphan), true);
+
+  const selfParent = [{ id: "t-1", status: "queued", parent: "t-1" }];
+  assert.equal(blockingAncestor(selfParent[0], selfParent), null, "its own deps are isReady's job");
+  assert.equal(isReady(selfParent[0], selfParent), true);
+
+  // A cycle still reports a REAL unmet dep on one of its members, having
+  // visited each exactly once.
+  const cycle = [
+    { id: "t-0", status: "queued" },
+    { id: "t-1", status: "queued", parent: "t-2" },
+    { id: "t-2", status: "queued", parent: "t-1", deps: ["t-0"] },
+  ];
+  assert.equal(blockingAncestor(cycle[1], cycle), "t-2");
+  assert.equal(isReady(cycle[1], cycle), false);
+  const benign = [
+    { id: "t-1", status: "queued", parent: "t-2" },
+    { id: "t-2", status: "queued", parent: "t-1" },
+  ];
+  assert.equal(blockingAncestor(benign[0], benign), null, "a cycle is not itself a blocker");
+  assert.equal(isReady(benign[0], benign), true);
+});
+
 test("the ready mark stays off a board that uses no deps", () => {
   // Every queued row on a dep-free board is trivially ready, so badging them
   // would put a mark on every queued row of every existing board and mean
@@ -506,6 +611,20 @@ test("a hand-edited hierarchy cycle renders every row exactly once", () => {
   const ids = visibleRows(board).map((r) => r.task.id);
   assert.equal(ids.length, 3);
   assert.deepEqual([...ids].sort(), ["t-1", "t-2", "t-3"]);
+
+  // And it holds through `buildTree`, not merely through `visibleRows`' own
+  // fallback loop — whose comment says "nothing should reach this". A cyclic
+  // row must be listed as a ROOT: that is the `cyclic` half of the shared
+  // ancestor walk (`ancestorChain`), and it is the only consumer of that half.
+  // Unpinned, a readiness-motivated change to that walk could stop reporting
+  // cycles, silently move the root set (t-3 to the front, both cycle members
+  // out of it) and leave the render-once invariant resting on the fallback —
+  // with the assertions above still green, since they sort and count only.
+  assert.deepEqual(
+    buildTree(board).roots.map((r) => r.id),
+    ["t-1", "t-2", "t-3"],
+    "a cyclic row is a root, in board order"
+  );
 });
 
 test("child counts are DIRECT children only, matching the backend's summary row", () => {
