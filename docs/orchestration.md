@@ -623,35 +623,60 @@ These deserve their own detail — see:
   seen it, so a chip that's still genuinely true comes right back on the next
   scan.
   - **The NEEDS-YOU panel** (`Alt+Q`, or the raised-hand icon in an
-    orchestrator pane's header) is where you actually act on a pending
-    question or a demo — everything currently waiting on you, badged with a
-    running total in its own header:
-    - **Decisions** — one card per pending question. Pick one of its options
-      (each can carry the asker's own reasoning under the label), type a
-      free-text answer, or both; a question decides for itself whether it
-      allows a single pick, several, or no free text at all, and the card
+    orchestrator pane's header) is everything currently waiting on you, in
+    **one list**, badged with a running total in its own header. The newest
+    ask is at the top, and anything raised as *urgent* is pinned above the
+    rest — so what just arrived is never at the bottom of a scroll. Two
+    kinds of card share that list:
+    - **Questions** — one card per pending `ask_human` question. Pick one of
+      its options (each can carry the asker's own reasoning under the label),
+      type a free-text answer, or both; a question decides for itself whether
+      it allows a single pick, several, or no free text at all, and the card
       only offers what that question allows. Sending delivers your answer to
       the **orchestrator's** pane — even for a question a liaison pane
       posed, since the liaison never gets the answer notice itself and
       instead reads the outcome back through its own `list_questions`. A
-      card that names the board row it's holding up links straight to it,
-      and answered or withdrawn questions fall into a faded "answered" tail
-      (the most recent ten) instead of vanishing.
-    - **Demos** — one card per board row parked in `prototype` or
-      `human-testing`, showing the worktree path where the demo lives (click
-      to copy) and a link to its PR when it has one, so you can go run it
-      yourself; a row with no recorded path says so rather than guessing one.
-      **Proceed** promotes a `prototype` (the same gesture as the board's own
-      Proceed button). **Feedback** is offered on either status and sends your
-      notes back to the orchestrator — on `human-testing` it's the
-      request-changes gesture and reopens the task, on `prototype` it's a
-      plain note that leaves the demo gate exactly where it was.
+      card that names the board row it's holding up links straight to it.
+    - **Needs-you items** — a **demo** parked for you to go run, or a request
+      for **feedback** on a direction. An item is its own record: it says who
+      raised it, when, and what they want back, and it *links* a board row
+      rather than being one. When it links a row, the card shows that row's
+      live state — the worktree path where the demo lives (click to copy), a
+      link to its PR when it has one, and its current status; a row with no
+      recorded path says so rather than guessing one. **Proceed** promotes a
+      `prototype` (the same gesture as the board's own Proceed button).
+      **Feedback** sends your notes back to the orchestrator — on
+      `human-testing` it's the request-changes gesture and reopens the task,
+      on `prototype` it's a plain note that leaves the demo gate exactly
+      where it was.
 
-    The panel is the only place a question gets **answered** — before it
-    existed there was no answer surface in the UI at all. Withdrawing one is
-    still a separate, orchestrator-only path: `withdraw_question` settles an
-    overtaken question too, just as *withdrawn* rather than answered, and
-    that was already true before this panel shipped.
+    A demo item appears by itself when the orchestrator parks a task in
+    `prototype` or `human-testing`, and settles by itself when that task
+    moves on — you never have to keep the two in step. If the linked row is
+    gone (pruned, or renamed), the card says so and stays clearable rather
+    than disappearing with the ask still outstanding.
+
+    **Resolve** on an item's card is your close-out: *I have seen this.* It
+    clears the row from the panel and **leaves the task exactly where it
+    is** — resolving is not a board move, and Proceed/Feedback stay the
+    board actions they always were. You can attach a note, which goes to the
+    orchestrator's pane; resolving without one just tidies your queue
+    quietly. A pending **question** has no Resolve: answer it, or the
+    orchestrator withdraws it — a dismissed-unanswered question is a
+    decision silently dropped.
+
+    Settled rows — answered or withdrawn questions, resolved items — fall
+    into a faded tail (the ten most recent) instead of vanishing.
+    **Clear completed** in the header hides that tail. It **deletes
+    nothing**: the rows stay on disk for the audit trail, the choice
+    survives a restart, and nothing still open can be touched by it, which
+    is why it doesn't ask you to confirm.
+
+    The panel is the only place a question gets **answered**, and the only
+    place an item gets **resolved** — no agent can do either, by any path.
+    Withdrawing stays the separate, agent-side path it always was:
+    `withdraw_question` settles an overtaken question too, just as
+    *withdrawn* rather than answered.
   - **orrerix's protocol is that no agent asks you through a blocking
     dialog.** The orchestrator's role instructions — and a liaison pane's,
     where the group's workflow declares one — call for filing every question

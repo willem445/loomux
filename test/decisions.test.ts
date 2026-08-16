@@ -229,6 +229,27 @@ test("the watermark hides settled rows only — an OPEN row is untouchable by it
   assert.equal(isCleared(1001, 1000), false);
 });
 
+test("`omitted` counts what the CAP dropped, never what the human cleared", () => {
+  // A cleared row is HANDLED, not hidden-but-outstanding. Reporting it back as
+  // "…older rows not shown" would contradict the gesture the human just made —
+  // and would leave a permanent "12 not shown" under a tail they emptied on
+  // purpose. (The cap's own truncation still has to be reported: that one the
+  // human did not choose.)
+  const rows = Array.from({ length: 8 }, (_, i) =>
+    q({ id: `s-${i}`, status: "answered", settled_ms: 100 + i })
+  );
+  // Clear the first five: three visible rows against a cap of 3 → nothing is
+  // dropped by the cap, so `omitted` is 0 even though five rows are hidden.
+  const cleared = projectPanel(EMPTY_VIEW, rows, [], 3);
+  assert.equal(cleared.omitted, 5, "precondition: with no clear, the cap drops five");
+  const afterClear = projectPanel({ items: [], cleared_ms: 104 }, rows, [], 3);
+  assert.deepEqual(
+    afterClear.settled.map((r) => (r.source === "question" ? r.question.id : r.item.id)),
+    ["s-7", "s-6", "s-5"]
+  );
+  assert.equal(afterClear.omitted, 0, "the five cleared rows are not 'not shown'");
+});
+
 test("a watermark of 0 hides NOTHING, because 0 is the never-cleared sentinel", () => {
   // The bug a bare `settledMs <= cleared` would ship: `0` means "never
   // cleared", and a settled row with no timestamp also reads as `0`, so the
