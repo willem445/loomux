@@ -74,7 +74,7 @@ use loomux_engine::rootreg::RootRegistry;
 pub fn admit(roots: &RootRegistry, path: &str) -> Result<(), String> {
     roots
         .admit(Path::new(path))
-        .map_err(|e| crate::fileedit::err(e.code(), e.to_string()))
+        .map_err(|e| e.to_string())
 }
 
 /// Declare a root the **engine itself** derived — a group's checkout, a worktree

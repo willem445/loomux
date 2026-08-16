@@ -26612,7 +26612,6 @@ impl OrchRegistry {
         // `repo` boundaries resolve before they reach here — see the note in
         // `crate::rootreg`'s module docs. Inert until then: nothing enforces and
         // no wire exists.
-        crate::rootreg::admit_derived(&self.roots, &info.repo);
         self.audit(&id, "loomux", if resumed { "group-resume" } else { "group-create" },
             json!({ "repo": repo, "max_agents": info.guardrails.max_agents,
                     "blocks": blocks_json(&info.guardrails.blocks) }));

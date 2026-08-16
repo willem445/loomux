@@ -197,6 +197,14 @@ impl DeclaredRoot {
     }
 }
 
+// #1042 red-before-green scratch M2: the blanket impl `tests/rootreg.rs`
+// exists to refuse. Never merged.
+impl AsRef<Path> for DeclaredRoot {
+    fn as_ref(&self) -> &Path {
+        &self.plain
+    }
+}
+
 /// The set of roots trusted sources have declared.
 ///
 /// In-memory for the lifetime of the process and never written to disk (module
