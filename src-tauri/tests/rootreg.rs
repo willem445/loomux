@@ -464,25 +464,38 @@ fn declared_root_never_gains_an_asref_path() {
 /// `.admit(` is what separates a method on a registry from a free function about
 /// queues.
 ///
-/// **That leaves one bypass, and it is closed rather than merely documented**
-/// (#1092 review, finding 1). A `use crate::rootreg::admit;` would let a call
-/// site spell the declaration as a bare `admit(...)`, which matches none of the
-/// four needles. So the second assertion below **bans importing a root-admit
-/// function by name anywhere** — every call site must spell it
-/// `rootreg::admit_derived(…)` / `RootRegistry::admit(…)`, which is exactly what
-/// the needles match. The coverage argument is then closed by construction
-/// instead of resting on "nobody will import it".
+/// **Every needle is defeated by an import, so imports are default-denied.**
+/// Each of the four spellings above can be dodged by naming the module or the
+/// function something else on the way in, and all three shapes are real:
 ///
-/// **Residual limits.** A call reached through a function pointer or a trait
-/// object, and a call assembled by a macro, are not matched — none exists today.
-/// An import that *aliases* (`use …::admit as declare;`) defeats both halves;
-/// it is unbounded for a textual scan, and it is the one hole this test states
-/// rather than closes. Renaming the FUNCTIONS themselves would dodge every
-/// needle, which is why the allowlist counts are exact rather than a maximum: a
-/// rename drops every count to zero and fails here instead of passing green.
-/// Nor is the frontend scanned: `admitRoot` is a wrapper over the one command,
-/// and what bounds it is that the command is the only door — which is what this
-/// scan pins on the Rust side.
+///   `use crate::rootreg::admit;`      then `admit(…)`
+///   `use crate::rootreg as rr;`       then `rr::admit(…)`
+///   `use crate::rootreg::{`⏎`admit,`⏎`};`  — the same, wrapped across lines
+///
+/// None of those calls matches a needle. So rather than chase the call sites,
+/// the second assertion below denies the *doorway*: **a `use` statement that
+/// mentions `rootreg` at all is an offender unless it is one of the two
+/// allowlisted type-only imports**, matched on its whole normalized text. That
+/// covers a function import, a module alias, an aliased function, and any of
+/// them wrapped across lines, because none of those can name the module without
+/// the word `rootreg` appearing in the statement.
+///
+/// Statements are joined to the terminating `;` before matching, which is what
+/// makes the multi-line braced form reachable at all — matching line-by-line is
+/// exactly how the first version of this guard missed it (#1092 review, N4).
+///
+/// **Residual limits, corrected.** An earlier version of this comment claimed an
+/// aliasing import defeated the scan; it did not, and naming a closed hole while
+/// two open ones sat beside it is worse than naming none. What genuinely remains:
+/// a call reached through a function pointer or a trait object, and a call — or
+/// an import — assembled by a macro; none exists today, and a macro-built `use`
+/// is the one shape this cannot see, because there is no `use` statement in the
+/// source to read. Renaming the FUNCTIONS themselves would dodge every needle,
+/// which is why the allowlist counts are exact rather than a maximum: a rename
+/// drops every count to zero and fails here instead of passing green. Nor is the
+/// frontend scanned: `admitRoot` is a wrapper over the one command, and what
+/// bounds it is that the command is the only door — which is what this scan pins
+/// on the Rust side.
 #[test]
 fn every_admit_site_in_the_workspace_is_an_argued_one() {
     /// One row per file permitted to declare a root, with the exact number of
@@ -529,10 +542,26 @@ fn every_admit_site_in_the_workspace_is_an_argued_one() {
         "rootreg::admit(",
     ];
 
+    /// The ONLY `use` statements permitted to mention `rootreg`, by file and by
+    /// whole normalized text. Both import a TYPE and neither can produce a call
+    /// spelling the needles miss.
+    ///
+    /// Whole-text rather than a prefix, so widening one — adding `admit` to the
+    /// braces, or an `as` alias — fails here instead of matching a row it has
+    /// outgrown.
+    const PERMITTED_USES: &[(&str, &str)] = &[
+        (
+            "src-tauri/orchestration/mod.rs",
+            "pub use loomux_engine::rootreg::{RootError, RootRegistry};",
+        ),
+        ("src-tauri/rootreg.rs", "use loomux_engine::rootreg::RootRegistry;"),
+    ];
+
     let files = production_sources();
     let mut seen = vec![0usize; PERMITTED.len()];
     let mut offenders: Vec<String> = Vec::new();
-    let mut bare_imports: Vec<String> = Vec::new();
+    let mut bad_uses: Vec<String> = Vec::new();
+    let mut permitted_uses_seen = vec![0usize; PERMITTED_USES.len()];
     let mut found_defining = false;
 
     for (name, path) in &files {
@@ -541,27 +570,53 @@ fn every_admit_site_in_the_workspace_is_an_argued_one() {
             continue;
         }
         let src = std::fs::read_to_string(path).unwrap();
-        for (i, line) in src.lines().enumerate() {
-            let trimmed = line.trim_start();
-            if trimmed.starts_with("//") {
-                continue;
-            }
-            // The bypass, closed. A `use crate::rootreg::admit;` (or a braced
-            // `use …::rootreg::{admit, admit_derived};`) would let a call site
-            // spell the declaration as a bare `admit(…)`, matching no needle
-            // below. Importing the TYPE is fine and expected — `RootRegistry`
-            // does not end in `admit` — so this keys on the function names only.
+        let lines: Vec<&str> = src.lines().collect();
+        // Pass 1 — the doorway. Every `use` STATEMENT, joined to its `;` so a
+        // braced import wrapped across lines is one string here (matching
+        // line-by-line is exactly how the first version missed it). Any
+        // statement mentioning `rootreg` is denied unless it is allowlisted
+        // whole: that covers a function import, a module alias
+        // (`use crate::rootreg as rr;`), an aliased function, and any of them
+        // wrapped — none can name the module without the word appearing.
+        let mut i = 0;
+        while i < lines.len() {
+            let trimmed = lines[i].trim_start();
             let is_use = ["use ", "pub use ", "pub(crate) use "]
                 .iter()
                 .any(|kw| trimmed.starts_with(kw));
-            if is_use && trimmed.contains("rootreg::") {
-                // `pub use` is checked too, and matters more than a plain `use`:
-                // a re-export would hand the bare spelling to every other module
-                // at once.
-                let after = trimmed.split("rootreg::").nth(1).unwrap_or("");
-                if after.contains("admit") {
-                    bare_imports.push(format!("{name}:{}: {trimmed}", i + 1));
+            if !is_use || trimmed.starts_with("//") {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            let mut stmt = String::new();
+            while i < lines.len() {
+                stmt.push(' ');
+                stmt.push_str(lines[i].trim());
+                if lines[i].contains(';') {
+                    break;
                 }
+                i += 1;
+            }
+            i += 1;
+            // Collapse runs of whitespace so a wrapped statement compares equal
+            // to the single-line spelling an allowlist row is written in.
+            let normalized = stmt.split_whitespace().collect::<Vec<_>>().join(" ");
+            if normalized.contains("rootreg") {
+                match PERMITTED_USES
+                    .iter()
+                    .position(|(f, s)| *f == name.as_str() && *s == normalized)
+                {
+                    Some(idx) => permitted_uses_seen[idx] += 1,
+                    None => bad_uses.push(format!("{name}:{}: {normalized}", start + 1)),
+                }
+            }
+        }
+        // Pass 2 — the call sites.
+        for (i, line) in lines.iter().enumerate() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") {
+                continue;
             }
             // A declaration is not a call: `pub(crate) fn admit_derived(`.
             if trimmed.contains("fn admit") {
@@ -584,15 +639,30 @@ fn every_admit_site_in_the_workspace_is_an_argued_one() {
          update `DEFINING_FILE` (and check the exemption still holds)"
     );
     assert!(
-        bare_imports.is_empty(),
-        "a root-admit function must never be IMPORTED by name (#1042, #1092 review \
-         finding 1) — an import lets a call site spell the declaration as a bare \
-         `admit(…)`, which is the one spelling the needles below cannot match \
-         without also matching `queue::admit`. Spell it `rootreg::admit_derived(…)` \
-         or `RootRegistry::admit(…)` at the call site instead; importing the TYPE \
-         `RootRegistry` is fine and is not what this catches. Found:\n{}",
-        bare_imports.join("\n")
+        bad_uses.is_empty(),
+        "a `use` statement mentioning `rootreg` must be one of the allowlisted \
+         TYPE-only imports (#1042; #1092 review N4). Every call-shape needle this \
+         test uses can be dodged by renaming the module or the function on the way \
+         in — `use crate::rootreg::admit;` then `admit(…)`, or \
+         `use crate::rootreg as rr;` then `rr::admit(…)`, or either wrapped across \
+         lines — so the doorway is default-denied rather than the call sites \
+         chased. Spell the call `rootreg::admit_derived(…)` / \
+         `RootRegistry::admit(…)` at its site instead. If a new import really is \
+         type-only and safe, add its whole normalized text to `PERMITTED_USES` \
+         with that argument. Found:\n{}",
+        bad_uses.join("\n")
     );
+    for (i, (file, stmt)) in PERMITTED_USES.iter().enumerate() {
+        assert_eq!(
+            permitted_uses_seen[i], 1,
+            "`PERMITTED_USES` expects exactly one `{stmt}` in {file} — found {}. A \
+             row matching nothing has stopped enforcing anything: the import it was \
+             argued for moved, changed shape, or went away, and until the row is \
+             updated a real replacement for it would be reported as an offender \
+             rather than checked against it.",
+            permitted_uses_seen[i]
+        );
+    }
     assert!(
         offenders.is_empty(),
         "a root may be declared ONLY where `PERMITTED` says (#1042). Found {} \

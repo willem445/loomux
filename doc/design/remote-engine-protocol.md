@@ -467,15 +467,19 @@ broken. The count is dated rather than restated as a bare "today", because that
 is the whole failure mode this paragraph is about: a number in prose is valid
 only at the commit it was derived on.
 
-Two nearby numbers show what happens to the ones a test does *not* pin. The
-manifest's own per-family comment reads `// orchestration (64)` above **66**
-entries; `architecture.md` described the file as "the ACL manifest's 123
-app-command names" until this slice corrected it. Both went stale quietly, in
-the two places whose whole job is to describe that list — while
-`app_commands_len_is_146`, the number that *is* pinned, stayed correct through
-every one of those additions. Default-deny plus a failing test is the only
-version of this that survives contact with a year of feature work; a table
-maintained by good intentions is the version that does not.
+Two nearby numbers show what happens to the ones a test does *not* pin, and both
+have moved again since this paragraph first cited them — which is the point
+rather than an embarrassment. The manifest's own per-family comment read
+`// orchestration (64)` above **66** entries when this section was written; it
+now reads `(69)` above 69, so that one was noticed and corrected by hand.
+`architecture.md` described the file as "the ACL manifest's 123 app-command
+names" until this section corrected it — and it had drifted again, to **143**,
+by the time #1042 slice B corrected it to **146**. The same file, the same way,
+twice. Meanwhile `app_commands_len_is_146`, the number that *is* pinned, has
+stayed correct through every one of those additions, because it cannot do
+otherwise. Default-deny plus a failing test is the only version of this that
+survives contact with a year of feature work; a number maintained by good
+intentions is the version that does not.
 
 ### 5.2 Four classes
 
