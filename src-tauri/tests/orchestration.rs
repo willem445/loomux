@@ -48434,7 +48434,16 @@ fn ask_human_registers_a_pending_question_and_answers_the_caller_immediately() {
     assert_eq!(q.id, "q-1");
     assert_eq!(q.asker, orch_id, "the asker is recorded, not inferred");
     assert_eq!(q.text, "Ship the rename in this PR or split it?", "text is trimmed");
-    assert_eq!(q.options, vec!["ship it here".to_string(), "split it".to_string()]);
+    // Re-spelled for `OptionSpec` (#1091), asserting the same thing it always
+    // did: a Q1-shaped call — bare strings, nothing richer — still stores
+    // exactly those strings.
+    assert_eq!(
+        q.options,
+        vec![
+            humanq::OptionSpec::Plain("ship it here".to_string()),
+            humanq::OptionSpec::Plain("split it".to_string()),
+        ]
+    );
     assert_eq!(q.task.as_deref(), Some("t-4"));
     assert_eq!(q.urgency, humanq::Urgency::High);
     assert_eq!(q.status, humanq::Status::Pending);
