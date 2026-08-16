@@ -5,9 +5,10 @@ answer surface — plus, from #1091, the shape of the ask itself (slice A), the
 demo half of the same human-attention surface (slice B), the NEEDS-YOU panel and
 its board deep-link (slices C and G, the Q2 surface), the derived attention
 reason and opt-in toast (slice D), and the protocol prose plus the liaison's
-pose gate (slice E). The structural deny of the blocking dialog (Q4) and the
-chat bridge (#947 / T1) sit on top of what is described here and extend this
-note as they land.*
+pose gate (slice E) — and, in its own later section, Q4 / #1091 slice H: the
+structural deny of the blocking dialog and its latched-attention belt. The
+chat bridge (#947 / T1) sits on top of what is described here and extends
+this note as it lands.*
 
 ## The problem
 
@@ -518,3 +519,117 @@ somehow both, because it is the more specific, more blocking ask. The chip
 routes through the same focus hook slice C built, opening the NEEDS-YOU panel
 at the citing question (a decision chip) or at the row's own card (a demo
 chip).
+
+## Q4 / #1091 slice H — the structural deny, and its per-CLI coverage
+
+*This section is deliberately its own, distinct from anything #1091 slice F
+adds elsewhere in this note on `integration/ui-redesign` — the two land on
+different branches and must merge without touching each other's prose.*
+
+Q3's protocol prose (and #1091 slice E's widened version of it, for
+`liaison.md` too) says "use `ask_human`, never a blocking dialog." Prose is
+instruction-backed, not structural — the whole reason this note exists is that
+an instruction did not stop the #578 incident. Q4/H is the enforcement half:
+make the blocking dialog **unreachable** for the two roles whose pane a hold
+can stall a fleet behind, rather than merely discouraged.
+
+### The deny predicate
+
+`claude_denies_interactive_question(role, role_hint) -> bool` —
+`role == Orchestrator OR role_hint == "liaison"` — is **orthogonal to
+`Containment`**, not a fourth tier on that ladder. `Containment` answers "may
+this agent edit files / mutate git"; this answers a different question
+entirely ("may this agent's CLI hand control to a dialog that blocks the whole
+pane"), and the two happen to compose in the same `--disallowedTools` value
+list on Claude only because that is where Claude's CLI puts every tool-level
+deny.
+
+- **The orchestrator** is `Containment::None` (denies nothing today) and still
+  gets this deny — the one case where `--disallowedTools` opens on an
+  orchestrator's command line at all.
+- **A liaison-hinted reviewer** (`kind: reviewer` + `role_hint: liaison`,
+  #891) is `Containment::NoEdits` and gets both denials in the **same**
+  `--disallowedTools` flag — Claude Code does not merge two occurrences of
+  that flag on one command line, so the deny is *extended* into the
+  already-open list for a liaison, never opened a second time.
+- A worker, a planner, and a plain (non-liaison) reviewer never get this deny:
+  a human standing at a delegate's own pane, answering its dialog in person,
+  never stalls anyone else — the incident this closes is specific to the two
+  roles other agents route their reports and questions through.
+
+A group with no liaison block simply never asks the predicate the question
+that would return `true` for one — no special case, no error. Nothing here
+adds a dependency on a liaison existing, which is the #891 principle this
+slice inherits rather than re-derives.
+
+### Per-CLI coverage — implemented vs. documented gap
+
+Only **Claude** gets code in this slice: `CLAUDE_QUESTION_DENY_TOOLS =
+["AskUserQuestion"]`, emitted via `--disallowedTools` from both
+`build_agent_command_ex` (the shell-line form) and `build_agent_argv_ex` (the
+structured argv form spawned directly), pinned against `KNOWN_CLAUDE_TOOLS`
+the same way `CLAUDE_EDIT_DENY_TOOLS` is (#448 discipline) so a typo or an
+upstream rename fails CI instead of silently denying nothing.
+
+The other three CLIs this repo supports (`SUPPORTED_CLIS`: `copilot`,
+`gemini`, `opencode`) are **not** given code here, and that gap is stated
+rather than left implicit:
+
+| CLI | Interactive-question tool? | Coverage |
+| --- | --- | --- |
+| **claude** | `AskUserQuestion` | Structural deny (this slice) |
+| **copilot** | None named in `KNOWN_COPILOT_DENY_CATEGORIES` (the CLI's own docs enumerate exactly three `--deny-tool` value shapes — `shell(COMMAND)`, `write`, `MCP_SERVER_NAME(tool)` — none of which names an interactive-choice tool) | Belt + prose only |
+| **opencode** | Its containment seam is a generated permissions document (`edit`/`bash`/git patterns), not per-tool names; no interactive-question entry exists in that vocabulary | Belt + prose only |
+| **gemini** | **`ask_user` is a real, known tool** — `KNOWN_GEMINI_TOOLS` already lists it (fetched from Gemini's own tool reference, the same snapshot discipline as the Claude list) | **Not implemented here** — see below |
+
+The Gemini finding is worth being explicit about rather than filing away
+silently: `ask_user` is exactly the kind of tool `GEMINI_EDIT_DENY_TOOLS`
+already denies siblings of (`write_file`, `replace`) via the generated
+`policy.toml`, so a future slice could plausibly deny it the same way. It is
+not done here because that is a second full builder path
+(`gemini_policy_toml`/`gemini_settings_json` generate a **file**, not argv —
+a different emit surface from Claude's, with its own tests) and Q4's own scope
+names only Claude. Left as a follow-up, not faked as covered.
+
+For every CLI without a structural deny — including Codex, which is not
+currently in `SUPPORTED_CLIS` at all but was the CLI the original #1091
+plan-478 design named as having no tool-level deny mechanism whatsoever — the
+belt below is what actually catches a stalled fleet.
+
+### The latched-attention belt
+
+A CLI-level deny only ever covers CLIs that *have* one. `attn_question_held`
+(an `OrchRegistry` field: agent ids currently holding delivery on
+`HeldReason::InteractiveQuestion` for their own pane) is the visibility net
+underneath it: whenever `deliver_now` holds a delivery because a live
+interactive dialog is on screen, and that pane belongs to the **orchestrator**
+specifically (never a delegate — a delegate's own dialog, answered by a human
+in person, never stalls anyone else), the hold is mirrored into this latched
+set via `OrchRegistry::latch_question_held` / `unlatch_question_held`.
+`attention_tick` reads it as a new reason, `held-dialog`, ranked **above even
+`blocked`** — because a held orchestrator pane strands every other agent's
+report behind it too, not just its own status, which is the literal #578
+failure mode.
+
+Latched, not re-derived each 3-second scan, because a hold can run for
+`QUESTION_HOLD_MAX` (minutes) — long enough to fall between two scans if the
+reason were computed fresh each tick the way `waiting` is. It clears the
+instant the hold itself clears (`emit_held_cleared` fires unconditionally when
+any hold this function entered ends, whatever the outcome), so it cannot
+outlive the condition it describes the way `stranded` deliberately can.
+
+**Disjoint from #1091 slice D's `question` attention reason by construction,
+not by convention.** D's reason is *derived* from the engine's `ask_human`
+registry (`questions.json` — a question the orchestrator posed and is waiting
+to be answered; no pane involved, no hold, no delivery pipe). This belt's
+reason is about the delivery pipe itself being physically held on a dialog
+currently on screen — a different subsystem, a different signal, landing on a
+different branch (`feat/1091-question-attention` vs. this slice's
+`feat/946-question-deny`, both merging into different targets). The two
+reasons sit beside each other in `attention_tick`'s match arm and in the
+frontend's `AttentionReason` union; nothing merges them.
+
+The frontend mirrors the reason in `src/attention.ts` (`held-dialog`: label,
+urgent — the priority its own doc lists it above `blocked`) and
+`src/tabroute.ts` (the same urgency + a `REASON_PRIORITY` entry above
+`blocked`'s), consistent with how `stranded` is mirrored in both files.

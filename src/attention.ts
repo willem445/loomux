@@ -5,6 +5,7 @@
 
 /** Reasons the backend attention scan emits (see the Rust `AttentionItem`). */
 export type AttentionReason =
+  | "held-dialog"
   | "blocked"
   | "stranded"
   | "waiting"
@@ -21,6 +22,11 @@ export interface AttentionPresentation {
 }
 
 const LABELS: Record<string, string> = {
+  // #946 Q4 / #1091 slice H: a blocking dialog holding the orchestrator's
+  // own delivery pipe — the belt for CLIs the AskUserQuestion deny can't
+  // reach. Outranks `blocked` (see the Rust `attention_tick` doc) because it
+  // strands every OTHER agent's report too, not just this pane's own status.
+  "held-dialog": "⛔ held on a dialog",
   blocked: "⚠ blocked",
   // #496 PR-C: a delivered prompt that was never submitted. Distinct from
   // `waiting` on purpose — a waiting pane is asking something and will keep
@@ -38,7 +44,7 @@ const LABELS: Record<string, string> = {
 /** Attention reasons rendered as urgent (red, not amber): the pane is stuck
  *  and will not un-stick itself. Kept as a set so adding a reason is one edit
  *  — `tabroute.ts` mirrors this rule (see its note on why it can't import). */
-const URGENT: ReadonlySet<string> = new Set(["blocked", "stranded"]);
+const URGENT: ReadonlySet<string> = new Set(["held-dialog", "blocked", "stranded"]);
 
 /** Whether a fresh `(reason, detail)` reading differs from the one currently
  *  applied to a pane — the identity check `Pane.setAttention` gates its DOM

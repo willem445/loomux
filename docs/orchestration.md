@@ -605,6 +605,21 @@ These deserve their own detail — see:
     chip: it says what it thinks is blocking). Every dismissal is written to the
     group's audit log with what was dismissed and how long it had been up, so a
     chip you cleared can always be looked up later.
+  - **The ⛔ held on a dialog chip** is the most urgent of all — it outranks even
+    a worker reporting blocked. It only ever appears on the **orchestrator's own**
+    pane, and only when its CLI's own interactive-question dialog has somehow ended
+    up on screen there anyway: on Claude that dialog is denied outright (see
+    below), but not every CLI loomux supports can be told to refuse it at that
+    level, so this chip is the fallback that still tells you a held orchestrator
+    pane is stranding every delegate's report queued behind it, not just its own.
+    It clears itself the moment the hold does — it never needs a dismiss.
+  - **The orchestrator can't use its CLI's own question dialog at all, on Claude.**
+    A single stuck question dialog on the orchestrator's pane once held a whole
+    run overnight — every worker report queued behind it and started being
+    refused. So on Claude, the orchestrator (and a human-interface/liaison agent,
+    if your workflow has one) is launched with that dialog denied outright; a
+    delegate pane is unaffected, since a human answering its dialog in person
+    never stalls anyone else.
 - **Audit viewer** (`Alt+A` or the history icon) — opens the group's
   `audit.jsonl` as a filterable, searchable timeline: every prompt, spawn, task
   edit, delivery outcome, and state write, one row each. A **follow** button
