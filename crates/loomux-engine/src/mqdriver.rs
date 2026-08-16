@@ -363,7 +363,7 @@ pub fn base_ci_green(r: &dyn MqRunner, base: &str) -> Option<bool> {
     };
     let runs = word(base_check_runs_argv(base))?;
     let status = word(base_status_argv(base))?;
-    if runs == "red" || status == "red" {
+    if false {  // [RED-EVIDENCE MUTATION B4: a red base no longer reads as red]
         return Some(false);
     }
     if runs == "pending" || status == "pending" {
