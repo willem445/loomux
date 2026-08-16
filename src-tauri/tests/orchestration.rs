@@ -49335,7 +49335,7 @@ fn a_questions_file_written_by_the_q1_build_loads_unmigrated() {
 fn ask_human_refuses_a_shape_that_would_reach_the_human_broken() {
     let (reg, _d, g, co, _cw, _) = setup_questions();
 
-    let cases: [(&str, Value, &str); 7] = [
+    let cases: [(&str, Value, &str); 8] = [
         (
             "an unknown select",
             json!({ "text": "pick", "options": ["a", "b"], "select": "multiple" }),
@@ -49373,6 +49373,15 @@ fn ask_human_refuses_a_shape_that_would_reach_the_human_broken() {
             json!({ "text": "pick", "options": [7] }),
             "array of answer-option strings",
         ),
+        // rev-802 N3: the description's own type check. Its two neighbours (a
+        // non-string label, a non-object item) were covered and this branch was
+        // not — and a wrong-typed description is the likeliest of the three to
+        // arrive, since it is the field an agent composes rather than names.
+        (
+            "an option description that is not a string",
+            json!({ "text": "pick", "options": [{ "label": "a", "description": 7 }] }),
+            "\"description\" must be a string",
+        ),
     ];
     for (what, args, needle) in cases {
         let out = q_call(&reg, &co, "ask_human", args);
@@ -49391,6 +49400,30 @@ fn ask_human_refuses_a_shape_that_would_reach_the_human_broken() {
         reg.questions(&g).unwrap()[0].options[0].description().map(str::len),
         Some(humanq::OPTION_DESC_MAX),
         "an at-cap description is stored WHOLE — this validator refuses, it never truncates"
+    );
+
+    // rev-802 N2: the ASYMMETRY between the two options-less refusals is
+    // deliberate, and pinned here because the obvious-looking symmetry —
+    // refusing whenever `allow_free_text` was mentioned at all — reads like a
+    // tidy-up and would start refusing a legitimate ask.
+    //
+    // `false` with no options is refused because it leaves the human nothing
+    // to answer with. `true` with no options asks for exactly what an
+    // options-less question already is, so there is no belief to correct and
+    // nothing to refuse. Without this case the tightening passes a green suite.
+    let redundant = q_call(&reg, &co, "ask_human", json!({
+        "text": "an open question that spells out the obvious?",
+        "allow_free_text": true,
+    }));
+    assert_eq!(
+        redundant["isError"], false,
+        "allow_free_text: true with no options AGREES with the default — refusing it would turn \
+         a redundant argument into a failed ask: {}",
+        q_text(&redundant)
+    );
+    assert!(
+        reg.questions(&g).unwrap()[1].allow_free_text,
+        "…and it stores what it asked for"
     );
 
     // Same posture as `Urgency::parse`, asserted on the parser itself: an

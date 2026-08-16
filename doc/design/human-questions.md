@@ -194,6 +194,23 @@ than dropping the row. Losing a pending question a human has not answered is
 the one failure this registry exists to prevent, so a refusal a human can see
 beats a silent read that a subsequent write would make permanent.
 
+**A description is agent-authored text on its way to a trusted surface.** Up to
+8 × 500 characters, written by an orchestrator, persisted, and rendered by the
+NEEDS-YOU panel — which is loomux's own webview. It is stored, never executed,
+and bounded on both axes, so the registry's job is done; the obligation lands on
+the renderer, and it is the same one every other agent-authored string in this
+app carries: **labels and descriptions are set as text nodes, never as
+`innerHTML`.** Stated here rather than left implicit because this slice is the
+first to route agent text onto that surface, and the panel that renders it is
+written in a different slice by a different worker.
+
+Both `select` and `allow_free_text` serialize **unconditionally**, following
+`urgency` and `status` rather than `options` and `task`: the
+`skip_serializing_if` fields are the ones that can be genuinely absent, while
+these two always carry a value that decides how the row may be answered. A
+pending question is a record a human may read straight out of the file, so it
+says what it means instead of requiring the reader to know the defaults.
+
 The answer stays **one string**. A surface composes it from the selection and
 the free text; nothing structured is persisted beside it, because the consumer
 is an LLM reading a pane notice, and labels quoted verbatim are unambiguous

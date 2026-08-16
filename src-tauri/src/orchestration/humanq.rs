@@ -303,6 +303,13 @@ pub struct Question {
     /// How many options the human may pick. `single` unless the ask said
     /// otherwise; meaningless without `options`, which is why an ask that
     /// gives one without the other is refused rather than stored.
+    ///
+    /// Serialized unconditionally, like `urgency`/`status` and unlike
+    /// `options`/`task` — the `skip_serializing_if` in this struct marks the
+    /// fields that can be genuinely ABSENT, while this one always has a value
+    /// that decides how the row is answered. A pending question is a record a
+    /// human may read straight out of the file, so it says what it means
+    /// rather than making the reader know the defaults (rev-802 N5).
     #[serde(default)]
     pub select: Select,
     /// Whether the answering surface offers a free-text box as well. Defaults
