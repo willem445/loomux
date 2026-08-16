@@ -7775,3 +7775,131 @@ fn more_resources_than_the_cap_are_refused() {
         "{errs:?}"
     );
 }
+
+// ───────────────── board: per-status WIP limits (#1175 / #1170 A2) ─────────
+
+/// A workflow with `body` appended, parsed.
+fn parse_board(body: &str) -> Result<workflow::Workflow, Vec<String>> {
+    workflow::parse_workflow(&format!(
+        "version: 1\nblocks:\n  - id: worker\n    kind: worker\n{body}"
+    ))
+}
+
+#[test]
+fn an_absent_board_block_declares_no_caps_at_all() {
+    // The opt-in guarantee: no `board:` and the feature is off, byte-for-byte —
+    // the posture `merge_queue:` and `resources:` take. Asserted against the
+    // `Default` the seam reads rather than against a hand-written expectation,
+    // so "off" cannot come to mean two things.
+    let wf = parse_board("").unwrap();
+    assert_eq!(wf.board, workflow::BoardPolicy::default());
+    assert!(wf.board.wip.is_empty(), "no caps");
+    assert!(!wf.board.enforce, "and warn is the product default, not enforce");
+    // A declared block with no caps is the same thing: `board:` on its own is
+    // YAML null, which is "never declared", and an empty `wip:` mapping is a
+    // repo that wrote the block and no limits.
+    assert_eq!(parse_board("board:\n").unwrap().board, workflow::BoardPolicy::default());
+}
+
+#[test]
+fn declared_caps_parse_by_their_wire_status_names() {
+    let wf = parse_board(
+        "board:\n  wip:\n    in-progress: 4\n    review: 3\n    human-testing: 2\n  enforce: true\n",
+    )
+    .unwrap();
+    assert_eq!(wf.board.wip.get("in-progress"), Some(&4));
+    assert_eq!(wf.board.wip.get("review"), Some(&3));
+    // The two hyphenated statuses are the ones a struct field cannot spell, so
+    // they are the ones a `rename` could silently get wrong — and a cap keyed
+    // `human_testing` would match no board status and cap nothing, in silence.
+    assert_eq!(wf.board.wip.get("human-testing"), Some(&2));
+    assert_eq!(wf.board.wip.len(), 3, "a status the file omitted has NO cap, not a default one");
+    assert!(wf.board.enforce);
+}
+
+#[test]
+fn a_zero_cap_is_a_loud_error_rather_than_a_silent_default() {
+    // Same posture as `merge_queue.max_batch: 0`: a repo that wrote `review: 0`
+    // believes something about how its board paces, and quietly handing it "no
+    // limit" would leave that belief in place while the behaviour went the
+    // other way. Under `enforce` a 0 would additionally wedge the status shut.
+    let errs = parse_board("board:\n  wip:\n    review: 0\n").unwrap_err();
+    assert!(
+        errs.iter().any(|e| e.contains("board.wip.review") && e.contains("at least 1")),
+        "review: 0 must name itself in the error, got: {errs:?}"
+    );
+}
+
+#[test]
+fn a_misspelt_status_is_refused_and_the_error_names_the_ones_that_exist() {
+    // This is the whole argument for a CLOSED struct over a `BTreeMap<String,
+    // u32>`: an open key namespace cannot tell a typo from a status a newer
+    // loomux might have, so `in-porgress: 4` would declare a limit on nothing,
+    // in silence, for the lifetime of the file.
+    let errs = parse_board("board:\n  wip:\n    in-porgress: 4\n").unwrap_err();
+    let joined = errs.join(" ");
+    assert!(joined.contains("in-porgress"), "the error names what was written: {errs:?}");
+    assert!(
+        joined.contains("in-progress") && joined.contains("review"),
+        "…and what it could have written — serde's own unknown-field message is the \
+         status list, which is why this module writes no check of its own: {errs:?}"
+    );
+}
+
+#[test]
+fn done_is_not_a_cappable_status() {
+    // `done` is terminal and it is the relief valve: every other cap is
+    // relieved by work reaching it, so a limit there would refuse the very
+    // transition that unblocks the board. The wire struct simply has no field
+    // for it, which makes this a parse error rather than a rule to remember.
+    let errs = parse_board("board:\n  wip:\n    done: 3\n").unwrap_err();
+    assert!(errs.join(" ").contains("done"), "the refusal names the key: {errs:?}");
+    assert_eq!(
+        workflow::WIP_UNCAPPABLE_STATUS, "done",
+        "the constant the docs, the error path and this test all read"
+    );
+    // Not a blanket refusal of everything, though — the negative control that
+    // keeps the assertion above from passing on a parser that rejects any cap.
+    assert!(parse_board("board:\n  wip:\n    review: 3\n").is_ok());
+}
+
+#[test]
+fn every_task_status_except_done_can_carry_a_cap() {
+    // The drift pin. `RawWip`'s field list is a second copy of `TASK_STATUSES`,
+    // which lives in `src-tauri` — on the other side of an arrow the engine
+    // crate may not point back along — so it cannot be derived. Both
+    // directions: a status that gained no field would arrive silently
+    // uncappable, and a field naming no status would cap nothing.
+    let declared: std::collections::BTreeSet<String> =
+        workflow::workflow_schema_keys().remove("board.wip").expect("the wip section").into_iter().collect();
+    let expected: std::collections::BTreeSet<String> = loomux_lib::orchestration::TASK_STATUSES
+        .iter()
+        .filter(|s| **s != workflow::WIP_UNCAPPABLE_STATUS)
+        .map(|s| s.to_string())
+        .collect();
+    assert_eq!(
+        declared, expected,
+        "board.wip's fields must be exactly TASK_STATUSES minus {}",
+        workflow::WIP_UNCAPPABLE_STATUS
+    );
+}
+
+#[test]
+fn the_board_block_can_never_widen_anything() {
+    // The capability-closure rule, applied to the newest block. `RawBoard` and
+    // `RawWip` are both `deny_unknown_fields`, so there is no spelling of
+    // "merge without the gate", no key naming a branch, an agent or a program,
+    // and no key at all this build does not recognize — an attempt is a hard
+    // parse error, not an ignored line.
+    for line in ["human_gate: false", "auto_merge: true", "reviewers: [w]", "enfroce: true"] {
+        assert!(
+            parse_board(&format!("board:\n  wip:\n    review: 2\n  {line}\n")).is_err(),
+            "{line:?} must not be tolerated inside board:"
+        );
+    }
+    // A mistyped block name is not silently ignored either.
+    assert!(parse_board("bord:\n  wip:\n    review: 2\n").is_err());
+    // Nor is a value of the wrong type — policy fails loud.
+    assert!(parse_board("board:\n  wip:\n    review: soon\n").is_err());
+    assert!(parse_board("board:\n  enforce: 3\n").is_err());
+}
