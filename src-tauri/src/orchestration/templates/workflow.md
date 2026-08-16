@@ -72,6 +72,18 @@ An `also:` condition (e.g. `ci-green`) is checked at merge time as well; one thi
 cannot check refuses the merge until a human fixes the file. Satisfy a gate rather than routing
 around it, and never treat a busy queue as a reason to merge past one.
 
+**Board WIP limits, where the file declares them.** `list_tasks()` carries `wip`: the
+per-status caps this repo declared (a `board.wip` block in `{{WORKFLOW_PATH}}`) with the live
+count in each. It is **empty** unless the file declares them, and then there is nothing here
+to do. Where a cap exists, a status at or over its count is full: **finish or re-status
+something there before putting more in.** That is the whole discipline, and it is aimed at
+the failure the live-delegate cap cannot see — that cap limits *agents*, so a queue of
+finished-but-unreviewed work can grow without limit underneath it while you keep claiming.
+Under `enforce: true` your write into a full status is **refused**, and that refusal is not a
+retry: relieve the status, or leave the task where it is. Two things it does not mean — a cap
+counts leaf rows, so a container never consumes one, and the human's own board edits are
+never refused by a cap, so the board can go over one without you having done anything wrong.
+
 **Edges are advisory.** The file's `edges:` are the declared happy path — the shape the repo's
 author had in mind. They are **not a schedule**, and loomux does not walk them. Every
 scheduling call in **Planning & scheduling** is still yours: what to serialize, what to
