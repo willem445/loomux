@@ -2364,6 +2364,36 @@ test("rewriting a section's key line keeps the comments around it (#1090)", () =
   assert.match(out, /^# THE POOLS\nresources: # none yet\n {2}catfish: \{\}$/m);
 });
 
+test("emptying the roster carries the `blocks:` line's own comment onto `blocks: []` (#1090)", () => {
+  // `pushBlocks`'s EMPTY branch rewrites the key line too — it always did, since `blocks: []` is
+  // the canonical empty roster — and it now goes through the same helper, so the comment on that
+  // line survives the rewrite instead of being dropped with it. Pinned separately from the
+  // `pushSection` case above because it is a different call site: deleting the last block is the
+  // ordinary way a human reaches it.
+  const original = `version: 1
+name: t
+
+# THE ROSTER
+blocks: # the agents a run may use
+  - id: w
+    name: W
+    kind: worker
+    cli: claude
+`;
+  const { workflow } = parseWorkflow(original);
+  const out = serializeWorkflowPreserving({ ...workflow, blocks: [] }, original);
+  assert.deepEqual(codes(parseWorkflow(out).findings), [], out);
+  assert.match(
+    out,
+    /^# THE ROSTER\nblocks: \[\] # the agents a run may use$/m,
+    "both comments survive — the one introducing the section and the one on its key line"
+  );
+  // …and the roster refilled from there keeps them again, back in block form.
+  const refilled = serializeWorkflowPreserving(workflow, out);
+  assert.match(refilled, /^# THE ROSTER\nblocks: # the agents a run may use$/m);
+  assert.deepEqual(parseWorkflow(refilled).workflow, workflow);
+});
+
 test("an untouched empty section is still reproduced byte for byte (#1090)", () => {
   // The rewrite is for a section whose body was REGENERATED. A file nobody touched — including
   // the `{}` sections this fix is about — must still come back exactly as it went in.

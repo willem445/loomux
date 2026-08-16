@@ -566,8 +566,13 @@ didn't touch, and falls back to the canonical emitters only for the piece that c
   content changed; only the content falls back to canonical when it did. Rewiring one edge, then,
   costs that section's content — not the paragraph explaining what the section is *for*, which
   review found was the larger share of what a block-roster edit used to cost (a deleted block
-  that also drops its edges and its gate seat used to take the `# ADVISORY` and `# ENFORCED`
-  headers with it; now it doesn't).
+  used to take the `# ADVISORY` and `# ENFORCED` headers with it along with its edges and its
+  gate seat; now it doesn't, **as long as the section still has something left in it**). A
+  deletion that empties `edges:` or `gates:` outright is the exception, and still costs the
+  comment: an empty `edges:`/`gates:` is not written at all, so there is no section left for it
+  to introduce. `intake:`/`merge_queue:`/`resources:` do not have that cliff — they are still
+  written when empty, as `key: {}` — and whether the two families should agree is a question
+  this fix only made visible, not one it answers.
 - **The `key:` line itself, though, is a function of the content that follows it** — it is the
   one part of a header that cannot simply be reused. An empty section is written `resources: {}`
   (and an empty roster `blocks: []`) rather than as a bare key, because a bare key is YAML *null*

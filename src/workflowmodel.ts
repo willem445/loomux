@@ -1717,18 +1717,22 @@ export function serializeWorkflowPreserving(w: Workflow, originalText: string): 
 
   /** Every section that is not `blocks:` — one shape, because they all want the same one.
    *
-   *  The SECTION HEADER (the `key:` line and whatever comment introduces it, e.g. "# ADVISORY
-   *  — the declared happy path") is reused whenever there is one, independent of whether the
-   *  content changed: regenerating the whole section including its header meant deleting one
-   *  edge dropped a comment that was never about that edge (#233 non-blocking #1). Only the
-   *  CONTENT falls back to canonical, and only when it changed.
+   *  The COMMENT INTRODUCING the section (e.g. "# ADVISORY — the declared happy path") is reused
+   *  whenever there is one, independent of whether the content changed: regenerating the whole
+   *  section including that comment meant deleting one edge dropped a comment that was never
+   *  about that edge (#233 non-blocking #1). Only the CONTENT falls back to canonical, and only
+   *  when it changed.
+   *
+   *  The `key:` line is NOT part of what gets reused unconditionally — it is a function of the
+   *  content that follows it, so a regenerated body re-derives it through `sectionHeaderLines`
+   *  (the reused one may be an empty map/sequence that block children can't legally follow, or
+   *  a bare key that re-reads as undeclared — #1090). That helper is where the rule, and what
+   *  happens to a trailing comment on the key line, is spelled out.
    *
    *  `present` is "the model still has something to write here": with an entry that no longer
    *  matches and nothing to write, the section is GONE, and falling through to the else-branch
-   *  (which emits nothing for empty `lines`) is what deletes it.
-   *
-   *  Regenerating the content re-derives the KEY LINE too (`sectionHeaderLines`) — the reused
-   *  one may be an empty map/sequence that block children can't legally follow (#1090). */
+   *  (which emits nothing for empty `lines`) is what deletes it — the introducing comment
+   *  included, since it has no section left to introduce. */
   const pushSection = (
     entry: TopEntry | undefined,
     unchanged: boolean,
