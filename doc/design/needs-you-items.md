@@ -331,11 +331,24 @@ resurrection in the ordinary case; each covers a case the other does not:
   `EverRaised` reads the settled row as accounted for. What breaks is cost and
   noise, not correctness: every resume re-reads and re-considers the whole board.
 
-Both must go before a close-out is actually undone, which is exactly what the
-red-before-green run showed: `a_resolved_demo_item_is_never_resurrected_...`
-reddens only when both are removed, while
-`the_migration_does_not_resurrect_a_settled_row_even_without_its_marker`
-isolates `EverRaised` by deleting the marker itself.
+Each guard has a test that isolates it, and the isolation is *measured* rather
+than argued — the first draft of this paragraph asserted a split the runs did not
+show, which is the failure mode the "run the mutation and see which tests redden"
+rule exists for:
+
+- `the_migration_does_not_resurrect_a_settled_row_even_without_its_marker`
+  isolates `EverRaised`: it deletes the marker itself, so the marker neuter is a
+  no-op for it, and it reddens on the `EverRaised` neuter **alone**.
+- `the_marker_stops_the_migration_reconsidering_a_board_that_changed_later`
+  isolates the marker, on the one observable `EverRaised` cannot mask — a board
+  that gains a demo-gated row by a legacy path *after* the first load is
+  deliberately not picked up, because the migration answered once and the hook
+  owns everything since.
+
+The two whole-flow resurrection tests redden only with the read path restored as
+well, so they evidence the composite behaviour rather than either guard alone;
+that is stated here rather than glossed, because a red evidences the assertion it
+reached and no more.
 
 **It runs at group load**, beside the pause / notify / autonomy marker re-seeds
 it resembles — never on a read. That is what keeps `orch_needs_you_list` an
