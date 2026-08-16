@@ -689,6 +689,17 @@ so far:
   M4's and are deliberately not here — M1 ships no mailbox, so naming its tools would
   advertise a mechanism the reader does not have.
 
+- **#1153 phase 2, the brand becomes Orrerix** — all five goldens, and every hunk is the
+  same one edit: the product's name in **prose**, case-preserving (`loomux` → `orrerix`,
+  `Loomux` → `Orrerix`), with `a` → `an` where the article precedes it. Nothing an agent
+  or the code *parses* moved, and that is the whole review question here: the `[loomux]`
+  notice marker, `.loomux/` paths, `LOOMUX_*` env vars, the `gh` shim's refusal text, the
+  `from`-`loomux` audit sender and the `agent-managed` label description (which mirrors
+  `src-tauri/src/gh.rs:153` verbatim) are all still spelled the way the shipping code
+  spells them, because they name identities that flip in phases 3 and 4 rather than
+  here. So a delta review of this directory should read every hunk as a brand noun and
+  find no surviving technical literal on the `+` side that is not on the `-` side.
+
 `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was` renders
 **these** with the six pre-#222 template variables and asserts that a group launched
 with the advanced orchestrator **off** gets exactly that text. They are the
