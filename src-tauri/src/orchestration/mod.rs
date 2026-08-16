@@ -16,6 +16,7 @@
 pub mod digest;
 pub mod humanq;
 pub mod mcp;
+pub mod needsyou;
 
 // MOVED to the `loomux-engine` crate (#888 slice A2), re-exported here under
 // their original paths — whatever a call site in this crate or in the
@@ -8969,6 +8970,32 @@ pub const MERGE_GATE_STATUSES: [&str; 2] = ["pr", "human-testing"];
 /// is **Proceed** (not the merge-gate approve/changes) — see `proceed_task`.
 pub const PROTOTYPE_STATUS: &str = "prototype";
 
+/// The statuses that park a task on a human's LOOK — `src/taskboard.ts`'s
+/// `DEMO_STATUSES`, mirrored on this side the way `ensure_at_merge_gate` mirrors
+/// `canApprove`. A task entering this set auto-raises a `demo` needs-you item
+/// and leaving it auto-resolves one (#1151; see [`needsyou`] and
+/// `OrchRegistry::sync_demo_item`).
+///
+/// **A backend copy rather than a read of the frontend's**, because the hook
+/// that consumes it runs inside `upsert_task`, where no frontend exists: the
+/// board moves from MCP calls with no webview open at all.
+/// `the_backend_demo_gate_set_matches_the_boards` is what keeps the two
+/// spellings from drifting.
+///
+/// **Owned here, beside the board's other status sets, and not in
+/// [`needsyou`]** — for the reason `taskboard.ts`'s own comment gives for owning
+/// `DEMO_STATUSES` rather than letting `decisions.ts` own it: which statuses
+/// park a task is a fact about the BOARD, and the needs-you registry is a
+/// consumer of it. Putting it in the consumer would make the next board-side
+/// reader import from the registry, which is the dependency backwards.
+pub const DEMO_GATED_STATUSES: [&str; 2] = [PROTOTYPE_STATUS, "human-testing"];
+
+/// Whether a board status parks the task on a human's look —
+/// `taskboard.ts`'s `isDemoGated`.
+pub fn is_demo_gated(status: &str) -> bool {
+    DEMO_GATED_STATUSES.contains(&status)
+}
+
 /// Agile levels for `Task::kind` (#958), kept as strings for the same reason
 /// `TASK_STATUSES` is — the wire/JSON form stays obvious — and validated on
 /// every write the same way.
@@ -10940,6 +10967,34 @@ pub struct OrchRegistry {
     /// the guard is dropped: an audit write is cheap, but a notice is a
     /// delivery, and a delivery enqueues.
     questions_lock: Mutex<()>,
+    /// Serializes every read-modify-write of a group's `needs-you.json` (#1151).
+    ///
+    /// **A leaf of its own, like `questions_lock`, and for the same reason**: the
+    /// items file and the board share no invariant that a single lock would be
+    /// protecting — an item names a task id, but the item is the lifecycle record
+    /// and the task keeps owning the facts, so nothing reads one row of each as a
+    /// unit.
+    ///
+    /// **Lock order — this one is nested, and that is the whole of it:**
+    /// `tasks_lock` → `needs_you_lock`, never the reverse. `upsert_task` keeps
+    /// the board lock across `sync_demo_item` so that a task's status and its
+    /// demo item cannot settle in opposite orders under two racing transitions
+    /// (in-then-out landing as out-then-in would leave an open demo item on a
+    /// task that is no longer parked — precisely the stale row the auto-resolve
+    /// exists to prevent). Nothing takes `tasks_lock` while holding this one:
+    /// the backfill reads the board through `tasks()`, which is a lock-free file
+    /// read, so the nesting cannot cycle.
+    ///
+    /// Also taken under this guard, both leaves and both the nesting
+    /// `tasks_lock`/`questions_lock` already have: `AUDIT_LOCK` on the refusal
+    /// paths (what was turned away must be recorded before returning), and the
+    /// app-handle mutex on every successful write (`write_needs_you` emits
+    /// `orch-needs-you-changed`, exactly as `write_tasks` emits under
+    /// `tasks_lock`).
+    ///
+    /// The resolve path's success audit and its pane DELIVERY both happen after
+    /// the guard is dropped: an audit write is cheap, a delivery enqueues.
+    needs_you_lock: Mutex<()>,
     /// Serializes every read-modify-write of a group's `usage.json` (#743 S4b).
     ///
     /// **A leaf of its own, split out of `tasks_lock`.** The usage store used to
@@ -23560,6 +23615,7 @@ impl OrchRegistry {
             orch_notice_inbox: Arc::new(Mutex::new(HashMap::new())),
             tasks_lock: Mutex::new(()),
             questions_lock: Mutex::new(()),
+            needs_you_lock: Mutex::new(()),
             usage_lock: Mutex::new(()),
             usage_memo: Mutex::new(HashMap::new()),
             default_branch_memo: Mutex::new(HashMap::new()),
@@ -24436,6 +24492,407 @@ impl OrchRegistry {
         Ok(question)
     }
 
+    // ---------- needs-you items (#1151) ----------
+
+    fn needs_you_path(&self, group: &GroupId) -> PathBuf {
+        self.group_dir(group).join(needsyou::NEEDS_YOU_FILE)
+    }
+
+    /// Read a group's needs-you file.
+    ///
+    /// **Absent is empty; malformed or unreadable is LOUD** — [`Self::questions`]'
+    /// posture, for its reason: every mutation below is a read-modify-write of
+    /// the whole file, so a read that answered "no items" for a file it merely
+    /// failed to parse would let the very next raise overwrite it, silently
+    /// destroying open items a human has not looked at.
+    pub fn needs_you(&self, group: &GroupId) -> Result<Vec<needsyou::Item>, String> {
+        let text = match fs::read_to_string(self.needs_you_path(group)) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(format!("cannot read {}: {e}", needsyou::NEEDS_YOU_FILE)),
+        };
+        serde_json::from_str(&text)
+            .map_err(|e| format!("{} is malformed: {e}", needsyou::NEEDS_YOU_FILE))
+    }
+
+    /// The one write. Atomic replace for #133's reason applied to a file whose
+    /// loss is a human's outstanding queue, and — being the single mutation
+    /// point — the single notification point, the `write_questions`/`write_tasks`
+    /// shape. All callers hold `needs_you_lock`.
+    fn write_needs_you(&self, group: &GroupId, items: &[needsyou::Item]) -> Result<(), String> {
+        let dir = self.group_dir(group);
+        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let body = serde_json::to_string_pretty(items).map_err(|e| e.to_string())?;
+        atomic_write(&dir.join(needsyou::NEEDS_YOU_FILE), body.as_bytes())
+            .map_err(|e| e.to_string())?;
+        if let Some(app) = self.app.lock_safe().clone() {
+            let _ = app.emit("orch-needs-you-changed", json!({ "group_id": group }));
+        }
+        Ok(())
+    }
+
+    fn needs_you_cleared_path(&self, group: &GroupId) -> PathBuf {
+        self.group_dir(group).join(needsyou::CLEARED_MARKER)
+    }
+
+    /// The clear-completed watermark, or `0` if this group has never cleared.
+    /// Absent AND unparseable both read as 0 — see [`needsyou::parse_cleared`]
+    /// for why this one fails toward showing more rather than hiding.
+    pub fn needs_you_cleared_ms(&self, group: &GroupId) -> u64 {
+        fs::read_to_string(self.needs_you_cleared_path(group))
+            .map(|s| needsyou::parse_cleared(&s))
+            .unwrap_or(0)
+    }
+
+    /// "Clear completed": stamp the watermark so the panel stops showing rows
+    /// settled at or before now. Returns the stamp.
+    ///
+    /// **Writes no item and deletes no row.** The file is not opened here at
+    /// all: that is what makes "clears the UI, persists on disk" a structural
+    /// claim rather than a promise, and it is why an OPEN item can never be
+    /// affected by this — the panel applies the watermark only to settled rows,
+    /// and there is nothing here that could touch an unsettled one even if it
+    /// did not.
+    ///
+    /// Under [`Self::marker_io`], `set_notify`'s shape: two clears racing must
+    /// not land their file writes in the opposite order to the stamps they
+    /// minted, or the earlier watermark would survive the later one and rows the
+    /// human just cleared would come back.
+    pub fn clear_needs_you(&self, group: &GroupId) -> Result<u64, String> {
+        let _io = self.marker_io.lock_safe();
+        let dir = self.group_dir(group);
+        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let stamp = now_ms();
+        atomic_write(&dir.join(needsyou::CLEARED_MARKER), stamp.to_string().as_bytes())
+            .map_err(|e| e.to_string())?;
+        self.audit(group, "human", "needs-you-clear", json!({ "cleared_ms": stamp }));
+        Ok(stamp)
+    }
+
+    /// The webview's read: every item plus the watermark, in one round trip.
+    ///
+    /// Runs the upgrade backfill first (see [`Self::backfill_demo_items`]) — the
+    /// one place a read is allowed to write, and only ever to ADD the demo items
+    /// a pre-#1151 board already deserved.
+    pub fn needs_you_view(&self, group: &GroupId) -> Result<needsyou::View, String> {
+        self.backfill_demo_items(group)?;
+        Ok(needsyou::View {
+            items: self.needs_you(group)?,
+            cleared_ms: self.needs_you_cleared_ms(group),
+        })
+    }
+
+    /// An agent-facing list: open items first, then the newest resolved rows up
+    /// to the cap, with the omitted count alongside so a filtered list is never
+    /// mistaken for the whole one. [`Self::question_list`]'s shape.
+    pub fn needs_you_list(
+        &self,
+        group: &GroupId,
+    ) -> Result<(Vec<needsyou::Item>, usize), String> {
+        self.backfill_demo_items(group)?;
+        Ok(needsyou::project_list(&self.needs_you(group)?, needsyou::LIST_RESOLVED_CAP))
+    }
+
+    /// Register something for the human to look at, and return it immediately.
+    ///
+    /// Nothing here blocks: a file write and an audit line. Raising a `demo` for
+    /// a task that already has one open **returns the existing item** rather than
+    /// a second row — the dedupe that lets the board hook and an explicit raise
+    /// coexist without duplicating the human's queue (see [`needsyou::admit`],
+    /// which is where that decision lives for all three callers).
+    pub fn raise_needs_you(
+        &self,
+        group: &GroupId,
+        raiser: &str,
+        req: needsyou::RaiseRequest,
+    ) -> Result<needsyou::Item, String> {
+        let (item, fresh) = {
+            let _guard = self.needs_you_lock.lock_safe();
+            let mut items = self.needs_you(group)?;
+            let (item, fresh) = needsyou::admit(&mut items, raiser, req, now_ms())?;
+            if fresh {
+                needsyou::prune(&mut items, needsyou::RESOLVED_RETAINED);
+                self.write_needs_you(group, &items)?;
+            }
+            (item, fresh)
+        };
+        if fresh {
+            self.audit(
+                group,
+                raiser,
+                "needs-you-open",
+                serde_json::to_value(&item).unwrap_or(Value::Null),
+            );
+        }
+        Ok(item)
+    }
+
+    /// Take back an item the raiser no longer needs a human to look at.
+    ///
+    /// Withdrawal is a settle, not a delete: the row stays so a human who was
+    /// mid-look can see what happened to it, and `resolved_by` records
+    /// `withdrawn:<agent>` so it is never mistaken for a human's acknowledgement.
+    pub fn withdraw_needs_you(
+        &self,
+        group: &GroupId,
+        actor: &str,
+        id: &str,
+    ) -> Result<needsyou::Item, String> {
+        let item = {
+            let _guard = self.needs_you_lock.lock_safe();
+            let mut items = self.needs_you(group)?;
+            let Some(idx) = items.iter().position(|i| i.id == id) else {
+                self.audit(group, actor, "needs-you-reject", json!({
+                    "id": id, "op": "withdraw", "reason": "unknown-item",
+                }));
+                return Err(format!("unknown needs-you item: {id}"));
+            };
+            if items[idx].status.is_resolved() {
+                self.audit(group, actor, "needs-you-reject", json!({
+                    "id": id, "op": "withdraw", "reason": "already-resolved",
+                    "resolved_by": items[idx].resolved_by,
+                }));
+                return Err(format!("{id} is already resolved — it cannot be withdrawn"));
+            }
+            items[idx].status = needsyou::Status::Resolved;
+            items[idx].resolved_by = Some(format!("withdrawn:{actor}"));
+            items[idx].resolved_ms = Some(now_ms());
+            let out = items[idx].clone();
+            needsyou::prune(&mut items, needsyou::RESOLVED_RETAINED);
+            self.write_needs_you(group, &items)?;
+            out
+        };
+        self.audit(group, actor, "needs-you-withdraw", json!({
+            "id": item.id, "kind": item.kind.label(), "task": item.task, "text": item.text,
+        }));
+        Ok(item)
+    }
+
+    /// The human closes out an item, and (with a note) tells the orchestrator.
+    ///
+    /// # TRUSTED CALLERS ONLY
+    ///
+    /// **No agent may reach this method.** Resolving is the human clearing their
+    /// own attention queue — the same no-self-served-gate boundary
+    /// [`Self::answer_question`] documents, and the reason no MCP tool reaches
+    /// here. An agent that wanted its own ask gone has
+    /// [`Self::withdraw_needs_you`], which settles it visibly as a withdrawal.
+    ///
+    /// `source` is a **closed enum supplied by the entry point**, never a
+    /// caller-supplied string: `orch_needs_you_resolve` hard-codes
+    /// [`needsyou::ResolveSource::Webview`], so "resolve as the human" has no
+    /// spelling. A new trusted surface adds a variant and its own entry point —
+    /// never a parameter, and never an MCP tool.
+    ///
+    /// **Resolving does NOT move the linked task.** It clears the attention row;
+    /// the board keeps whatever status it had, and Proceed / Request-changes stay
+    /// the board actions they always were.
+    pub fn resolve_needs_you(
+        &self,
+        group: &GroupId,
+        id: &str,
+        note: Option<&str>,
+        source: needsyou::ResolveSource,
+    ) -> Result<needsyou::Item, String> {
+        let tag = source.tag();
+        // Validated before the lock, and a bad note settles nothing: the audit
+        // records what was turned away rather than half-resolving a row.
+        let note = match note.map(str::trim).filter(|n| !n.is_empty()) {
+            Some(n) => match needsyou::validate_resolution(n) {
+                Ok(n) => Some(n),
+                Err(e) => {
+                    self.audit(group, "human", "needs-you-reject", json!({
+                        "id": id, "source": tag, "op": "resolve",
+                        "reason": "invalid-resolution", "detail": e,
+                    }));
+                    return Err(e);
+                }
+            },
+            None => None,
+        };
+        let item = {
+            let _guard = self.needs_you_lock.lock_safe();
+            let mut items = self.needs_you(group)?;
+            let Some(idx) = items.iter().position(|i| i.id == id) else {
+                // Group-scoped by construction: this read is the caller's own
+                // group's file, so an item belonging to another group is simply
+                // absent — the same refusal an id that never existed gets,
+                // leaking nothing about the other group. Membership is checked
+                // by WHICH FILE was read, not by comparing a field.
+                self.audit(group, "human", "needs-you-reject", json!({
+                    "id": id, "source": tag, "op": "resolve", "reason": "unknown-item",
+                }));
+                return Err(format!("unknown needs-you item: {id}"));
+            };
+            if items[idx].status.is_resolved() {
+                self.audit(group, "human", "needs-you-reject", json!({
+                    "id": id, "source": tag, "op": "resolve", "reason": "already-resolved",
+                    "resolved_by": items[idx].resolved_by,
+                }));
+                return Err(format!("{id} is already resolved — it cannot be resolved again"));
+            }
+            items[idx].status = needsyou::Status::Resolved;
+            items[idx].resolved_by = Some(tag.clone());
+            items[idx].resolved_ms = Some(now_ms());
+            items[idx].resolution = note.clone();
+            let out = items[idx].clone();
+            needsyou::prune(&mut items, needsyou::RESOLVED_RETAINED);
+            self.write_needs_you(group, &items)?;
+            out
+        };
+        // Audited before it is delivered, and both outside the lock: the durable
+        // record of a human's close-out must not depend on a pane existing to
+        // receive it.
+        self.audit(group, "human", "needs-you-resolve", json!({
+            "id": item.id, "source": tag, "kind": item.kind.label(),
+            "task": item.task, "raiser": item.raiser, "resolution": item.resolution,
+        }));
+        // A note is the only thing worth a pane notice: a note-less resolve is
+        // the human tidying their own queue, and one delivery per tidy is noise
+        // the orchestrator pays for. A delivery failure — no live orchestrator, a
+        // full queue, a restart mid-click — never fails the resolve; the item is
+        // settled durably either way and a cold orchestrator finds it through
+        // the list. The registry is the record, the notice only a notification.
+        if let Some(note) = item.resolution.as_deref() {
+            let _ = self.deliver_to_orchestrator(
+                group,
+                &needsyou::resolve_notice(&item.id, item.task.as_deref(), note),
+                "human",
+            );
+        }
+        Ok(item)
+    }
+
+    /// Synthesize the demo items a board already deserves but does not have.
+    ///
+    /// **Why a read path writes.** Auto-raise hangs off the status TRANSITION in
+    /// `upsert_task`, and a board holding demo-gated rows at the moment this
+    /// ships has already made those transitions — so without this, every
+    /// in-flight demo silently vanishes from the panel on the release that adds
+    /// the panel's own record. There is no other trigger: the rows may sit
+    /// untouched for days.
+    ///
+    /// Idempotent, through the same [`needsyou::admit`] dedupe every other
+    /// raiser uses, so it is safe on every read: a second call raises nothing.
+    /// It writes at most once — only when it actually added rows — so the steady
+    /// state costs one board read and one items read.
+    ///
+    /// Best-effort per row against the cap: a board with more parked tasks than
+    /// [`needsyou::OPEN_MAX`] backfills what fits and audits the refusal rather
+    /// than failing the read that triggered it.
+    fn backfill_demo_items(&self, group: &GroupId) -> Result<(), String> {
+        // The board read is outside the lock and lock-free itself (`tasks` does
+        // not take `tasks_lock`), which is what keeps the documented nesting
+        // one-directional: `tasks_lock` → `needs_you_lock`, never the reverse.
+        let parked: Vec<Task> = self
+            .tasks(group)
+            .into_iter()
+            .filter(|t| is_demo_gated(&t.status))
+            .collect();
+        if parked.is_empty() {
+            return Ok(());
+        }
+        let (added, refused) = {
+            let _guard = self.needs_you_lock.lock_safe();
+            let mut items = self.needs_you(group)?;
+            let mut added: Vec<needsyou::Item> = Vec::new();
+            let mut refused: Vec<(String, String)> = Vec::new();
+            for task in &parked {
+                let req = needsyou::RaiseRequest::demo_for(&task.id, &task.title, &task.status);
+                match needsyou::admit(&mut items, "board", req, now_ms()) {
+                    Ok((item, true)) => added.push(item),
+                    Ok((_, false)) => {}
+                    Err(e) => refused.push((task.id.clone(), e)),
+                }
+            }
+            if !added.is_empty() {
+                needsyou::prune(&mut items, needsyou::RESOLVED_RETAINED);
+                self.write_needs_you(group, &items)?;
+            }
+            (added, refused)
+        };
+        for item in &added {
+            self.audit(
+                group,
+                "board",
+                "needs-you-open",
+                serde_json::to_value(item).unwrap_or(Value::Null),
+            );
+        }
+        for (task, detail) in &refused {
+            self.audit(group, "board", "needs-you-reject", json!({
+                "op": "backfill", "task": task, "reason": "raise-refused", "detail": detail,
+            }));
+        }
+        Ok(())
+    }
+
+    /// Map a board status transition onto the task's demo item (#1151).
+    ///
+    /// Called from `upsert_task` **with `tasks_lock` still held** — see
+    /// [`Self::needs_you_lock`]'s doc for why the nesting is deliberate rather
+    /// than an oversight.
+    ///
+    /// Keyed on the TRANSITION, not on the write: a `request_changes` note or an
+    /// assignee edit on a task that is already parked crosses no boundary and
+    /// therefore changes nothing here, which is the behaviour that keeps one
+    /// human-visible row per parking rather than one per board edit.
+    ///
+    /// Best-effort on both sides. The board write has already landed and cannot
+    /// be unwound, so a failure here is audited as a refusal rather than turned
+    /// into an error that would make a successful board move look failed.
+    fn sync_demo_item(&self, group: &GroupId, task: &Task, prev_status: &str) {
+        let was = is_demo_gated(prev_status);
+        let now = is_demo_gated(&task.status);
+        if was == now {
+            return;
+        }
+        if now {
+            let req = needsyou::RaiseRequest::demo_for(&task.id, &task.title, &task.status);
+            if let Err(e) = self.raise_needs_you(group, "board", req) {
+                self.audit(group, "board", "needs-you-reject", json!({
+                    "op": "auto-raise", "task": task.id, "status": task.status,
+                    "reason": "raise-refused", "detail": e,
+                }));
+            }
+            return;
+        }
+        // Left the gate: the ask is moot, so the item settles as the BOARD's
+        // doing. `board:<new-status>` rather than a human's tag, because nobody
+        // acknowledged anything — the work simply moved on.
+        let settled = {
+            let _guard = self.needs_you_lock.lock_safe();
+            let mut items = match self.needs_you(group) {
+                Ok(items) => items,
+                Err(e) => {
+                    self.audit(group, "board", "needs-you-reject", json!({
+                        "op": "auto-resolve", "task": task.id, "reason": "unreadable", "detail": e,
+                    }));
+                    return;
+                }
+            };
+            let Some(idx) = items.iter().position(|i| i.is_open_demo_for(&task.id)) else {
+                return;
+            };
+            items[idx].status = needsyou::Status::Resolved;
+            items[idx].resolved_by = Some(format!("board:{}", task.status));
+            items[idx].resolved_ms = Some(now_ms());
+            let out = items[idx].clone();
+            needsyou::prune(&mut items, needsyou::RESOLVED_RETAINED);
+            if let Err(e) = self.write_needs_you(group, &items) {
+                self.audit(group, "board", "needs-you-reject", json!({
+                    "op": "auto-resolve", "task": task.id, "reason": "unwritable", "detail": e,
+                }));
+                return;
+            }
+            out
+        };
+        self.audit(group, "board", "needs-you-resolve", json!({
+            "id": settled.id, "source": settled.resolved_by, "kind": settled.kind.label(),
+            "task": settled.task, "raiser": settled.raiser,
+        }));
+    }
+
     // ---------- task board ----------
 
     pub fn tasks(&self, group: &GroupId) -> Vec<Task> {
@@ -24800,6 +25257,12 @@ impl OrchRegistry {
             }
         };
         let this_id = tasks[idx].id.clone();
+        // Read before any field is applied, because the demo-gate hook at the
+        // bottom keys on the TRANSITION rather than on the resulting status
+        // (#1151). A row created by this very call reads `queued` here — which is
+        // the right answer: creating a task straight into `prototype` IS an entry
+        // into the gate, and must raise the item a later flip into it would.
+        let prev_status = tasks[idx].status.clone();
         // ---- links (#582): normalize + existence-check against the board,
         // then reject a write that would close a dependency cycle.
         let deps = patch.deps.map(|v| normalize_links(v, &this_id, &tasks, "deps")).transpose()?;
@@ -25001,6 +25464,14 @@ impl OrchRegistry {
         // WHY the assignee moved — a guarded grab, not an ordinary field write.
         let action = if claim { "task-claim" } else { "task-upsert" };
         self.audit(group, actor, action, serde_json::to_value(&snapshot).unwrap());
+        // The demo-gate lifecycle hook (#1151), and the ONE place every status
+        // transition passes through: `proceed_task`, `request_changes`, the board
+        // overlay and every MCP `upsert_task` all funnel here, so hanging the
+        // needs-you mapping off this call is what makes it impossible to move a
+        // task into or out of the gate without the human's queue following.
+        //
+        // Still under `tasks_lock`, deliberately — see `needs_you_lock`'s doc.
+        self.sync_demo_item(group, &snapshot, &prev_status);
         Ok(snapshot)
     }
 
@@ -48226,6 +48697,80 @@ pub async fn orch_question_answer(
         reg.answer_question(&group_id, &id, &answer, humanq::AnswerSource::Webview).map(|_| ())
     })
     .await
+}
+
+// ---------- needs-you items (human side, #1151) ----------
+
+/// Everything the NEEDS-YOU panel renders from the item registry: the rows and
+/// the clear-completed watermark, in ONE round trip.
+///
+/// One call rather than two, deliberately: the panel hides settled rows stamped
+/// at or before the watermark, so fetching the two separately would let it
+/// render this second's rows against last second's watermark and flash back a
+/// row the human had just cleared.
+///
+/// Off-thread (#743 S4c) like every other fs-touching command. Unlike
+/// `orch_questions_list` this one is **not** lock-free: it runs the upgrade
+/// backfill, which is the single read path allowed to write (and only ever to
+/// ADD the demo items a pre-#1151 board already deserved — see
+/// `backfill_demo_items`).
+///
+/// **A read failure reads as empty here, and only here.** The registry method is
+/// deliberately loud about a malformed file — a read-modify-write that treats
+/// unparseable as empty destroys open items — but this command has no error
+/// channel and its caller renders a list, so the panel shows nothing rather than
+/// throwing, exactly as `orch_questions_list` and `orch_tasks` do. Nothing
+/// WRITES an item through this path, so the loud read that protects the file is
+/// untouched.
+#[tauri::command]
+pub async fn orch_needs_you_list(app: AppHandle, group_id: String) -> needsyou::View {
+    let reg = reg_of(&app);
+    // #904: no error channel; an unvalidated id yields the same empty view a
+    // group with no items does. See `command_group`.
+    let Ok(group_id) = command_group(&group_id) else { return needsyou::View::default() };
+    run_blocking(move || reg.needs_you_view(&group_id).unwrap_or_default()).await
+}
+
+/// The human closes out a needs-you item, from the app's own webview.
+///
+/// **There is deliberately no `source` parameter.** The source is a property of
+/// this entry point — `ResolveSource::Webview`, hard-coded below — not something
+/// a caller states about itself, which is what makes "who resolved this" a fact
+/// loomux establishes rather than one it is told. `orch_question_answer`'s shape,
+/// for the same reason and with the same consequence: there is no MCP tool that
+/// reaches the resolve entry point at all.
+///
+/// `note` is optional. With one, the orchestrator gets a sanitized best-effort
+/// pane notice; without one, event and audit only, because a delivery per tidy
+/// is noise. Either way the item is settled durably before anything is
+/// delivered, and a delivery failure never fails the resolve.
+#[tauri::command]
+pub async fn orch_needs_you_resolve(
+    app: AppHandle,
+    group_id: String,
+    id: String,
+    note: Option<String>,
+) -> Result<(), String> {
+    let reg = reg_of(&app);
+    let group_id = command_group(&group_id)?;
+    run_blocking(move || {
+        reg.resolve_needs_you(&group_id, &id, note.as_deref(), needsyou::ResolveSource::Webview)
+            .map(|_| ())
+    })
+    .await
+}
+
+/// "Clear completed": stamp this group's watermark and return it, so the panel
+/// can apply the new one without a second read.
+///
+/// **Deletes nothing and mutates no row** — see `clear_needs_you`. An OPEN item
+/// is untouchable through this command by construction, which is what makes the
+/// header button safe to click without a confirm.
+#[tauri::command]
+pub async fn orch_needs_you_clear(app: AppHandle, group_id: String) -> Result<u64, String> {
+    let reg = reg_of(&app);
+    let group_id = command_group(&group_id)?;
+    run_blocking(move || reg.clear_needs_you(&group_id)).await
 }
 
 // ---------- task board (human side) ----------

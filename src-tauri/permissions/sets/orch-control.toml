@@ -1,6 +1,6 @@
 [[set]]
 identifier = "orch-control"
-description = "Mutating orchestration operations: create/bind/steer/approve/grant-merge/grant-release, answering the human questions agents raise, task and channel management, autonomy settings, group lifecycle, solo mode."
+description = "Mutating orchestration operations: create/bind/steer/approve/grant-merge/grant-release, answering the human questions agents raise, resolving and clearing the needs-you items they raise, task and channel management, autonomy settings, group lifecycle, solo mode."
 permissions = [
     "allow-create-orchestration",
     "allow-promote-to-orchestrator",
@@ -21,6 +21,8 @@ permissions = [
     "allow-orch-grant-release",
     "allow-orch-request-changes",
     "allow-orch-question-answer",
+    "allow-orch-needs-you-resolve",
+    "allow-orch-needs-you-clear",
     "allow-orch-start-task",
     "allow-orch-proceed-task",
     "allow-orch-pause-group",
