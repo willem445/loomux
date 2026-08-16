@@ -24018,7 +24018,9 @@ impl OrchRegistry {
             // Resolved before the struct literal moves `req` apart: both are
             // methods on the whole request, and a partial move would put them
             // out of reach.
-            let select = req.select_or_default();
+            // [scratch] NEUTERED: what the ask said about `select` is parsed,
+            // validated, and then ignored — every row stores the default.
+            let select = humanq::Select::default();
             let allow_free_text = req.free_text_allowed();
             let question = humanq::Question {
                 id: humanq::next_id(&questions),
