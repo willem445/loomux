@@ -84,6 +84,7 @@ stub_commands!(
     fm_list, fm_new_folder, fm_new_file, fm_rename, fm_delete_start, fm_capabilities, fm_open, fm_open_with,
     fm_reveal,
     fm_hash_start,
+    admit_root,
     take_startup_notice,
     load_ui_tabs, save_ui_tabs, load_settings, save_settings, load_ssh_profiles, save_ssh_profiles,
     voice_start, voice_stop, voice_cancel,
@@ -188,7 +189,8 @@ fn app_commands_len_is_146() {
          read of the startup sweep's memo in #1020, \
          +1 for orch_set_full_autonomy — the full-autonomy toggle added in #778, +1 for \
          gh_label_vocabulary — the repo-resolved intake label vocabulary the issues view asks \
-         for instead of hardcoding, added in #778 review round 1) — \
+         for instead of hardcoding, added in #778 review round 1, +1 for admit_root — the \
+         trusted local webview's declaration of a filesystem root, added in #1042 slice B) — \
          if this is an intentional addition/removal, update this tripwire's count too"
     );
 }

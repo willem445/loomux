@@ -2522,6 +2522,66 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .task-row.task-row-dep-blocked { opacity: 0.68; }
 .task-row.task-row-dep-blocked:hover { opacity: 0.92; }
 
+/* ---------- board hierarchy (#958) ----------
+   Containment is drawn with indent + a guide rail, never with a nested DOM:
+   the list stays a flat sequence of .task-row siblings so scrolling, hover and
+   the existing row states behave exactly as they do on a flat board. Overlay
+   chrome throughout — nothing here touches the terminal or its geometry. */
+.task-row[class*="task-depth-"] {
+  border-left: 1px solid var(--border-soft);
+}
+.task-depth-1 { margin-left: 14px; }
+.task-depth-2 { margin-left: 28px; }
+.task-depth-3 { margin-left: 42px; }
+.task-depth-4 { margin-left: 56px; }
+/* Collapse chevron, and the same-width inert spacer a leaf gets so every row's
+   text starts on the same column whether or not it contains anything.
+   Sized up from the first cut after the demo — at 13px/8px in --text-dim it
+   was there but easy to miss, and it is the control the whole nesting feature
+   is operated through. It reads at rest now (its own faint chip, --text rather
+   than --text-dim) instead of only on hover. The two widths move TOGETHER or
+   containers and leaves stop sharing a left edge; the row itself is unchanged,
+   so nothing about the indent steps above shifts. */
+.task-collapse {
+  flex: none; width: 18px; height: 18px; padding: 0;
+  background: var(--panel-2); border: none; border-radius: 4px;
+  color: var(--text); font-size: 11px; line-height: 1; cursor: pointer;
+}
+/* --border-soft resolves to the same surface as --panel-2, so hovering to it
+   would be a no-op; --accent-dim is the next step up the same ramp. */
+.task-collapse:hover { background: var(--accent-dim); color: var(--text); }
+.task-collapse-spacer { flex: none; width: 18px; }
+/* Advisory Agile level: a label only. Purple → blue → cyan → dim reads as
+   epic → feature → story → task, reusing the palette the status chips already
+   established rather than introducing a second colour language. */
+.task-chip.kind {
+  font-size: 9px; font-weight: 600; letter-spacing: 0.3px; text-transform: uppercase;
+}
+.task-chip.kind.k-epic { background: rgba(187, 154, 247, 0.16); color: #c7a9ff; }
+.task-chip.kind.k-feature { background: rgba(122, 162, 247, 0.16); color: #a7bff8; }
+.task-chip.kind.k-story { background: rgba(125, 207, 255, 0.14); color: #7dcfff; }
+.task-chip.kind.k-task { background: var(--panel-2); color: var(--text-dim); }
+/* A level only a hand-edited tasks.json can hold — the backend refuses it on
+   write, so it reads as broken rather than as a fifth level. */
+.task-chip.kind.k-unknown {
+  background: rgba(247, 118, 142, 0.16); color: #f7899d; text-transform: none;
+}
+/* Direct-child rollup: the same two numbers the orchestrator's list_tasks row
+   carries. Neutral — a count is information, not a state. */
+.task-chip.children {
+  font-family: "Cascadia Mono", Consolas, monospace; font-size: 9px;
+}
+/* Everything inside is done but this row's own status lags. Green like `done`,
+   because that is what it is reporting; it is a prompt, never a write. */
+.task-chip.rollup-done { background: rgba(158, 206, 106, 0.14); color: #b4e878; }
+/* A container naming no row on the board — the hierarchy twin of the `missing`
+   dep chip, and the same red, because the fix is the same shape: re-point it. */
+.task-chip.parent-missing {
+  background: rgba(247, 118, 142, 0.16); color: #f7899d;
+  font-family: "Cascadia Mono", Consolas, monospace;
+}
+.task-btn.nest { font-size: 10px; }
+
 /* Merge-gate action buttons (approve / request changes) and the queued-task
    start button share the same compact pill shape. */
 .task-btn.approve, .task-btn.changes, .task-btn.start, .task-btn.proceed {

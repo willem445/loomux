@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-admit-root"
+description = "Enables the admit_root command without any pre-configured scope."
+commands.allow = ["admit_root"]
+
+[[permission]]
+identifier = "deny-admit-root"
+description = "Denies the admit_root command without any pre-configured scope."
+commands.deny = ["admit_root"]

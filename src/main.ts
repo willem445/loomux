@@ -46,7 +46,7 @@ import {
 import { matchShortcut } from "./shortcuts";
 import { SideDock } from "./sidedock";
 import { followsPaneChange, isActiveTabChange } from "./sidedockmodel";
-import { ftRootIsDir } from "./fileapi";
+import { admitRoot, ftRootIsDir } from "./fileapi";
 import { gitRepoRoot } from "./git";
 import { voiceController } from "./voicecontrol";
 import { initStatusBar } from "./statusbar";
@@ -633,14 +633,28 @@ async function openActionPane(
 ): Promise<Pane> {
   const events = eventsFor(ws);
   switch (a.type) {
-    case "spawn-terminal":
+    case "spawn-terminal": {
+      // #1042: the trusted webview re-declaring its own persisted state, before
+      // the pane exists. A spawn cwd is deliberately NOT an admit path on its
+      // own (`spawn_pty` widening the filesystem surface as a side effect would
+      // be an admit the roster cannot see) — so this declaration, and the
+      // launcher's matching one for a fresh pane, are what keep the restored
+      // pane's folder chip and git watch alive: they name this directory, or
+      // something the shell `cd`s into below it, and the descendant rule covers
+      // the rest without the pane's OSC-7 stream ever declaring anything.
+      if (a.cwd) await admitRoot(a.cwd);
       return ws.grid.openPane(
         { name: a.name, cwd: a.cwd ?? undefined, shellKind: a.shellKind ?? undefined, background: true },
         events,
         dir,
         anchor
       );
+    }
     case "resume-agent": {
+      // #1042: as `spawn-terminal` above — the recorded cwd is this webview's
+      // own persisted state, and it is what the resumed agent pane's chip and
+      // git watch will name back.
+      if (a.cwd) await admitRoot(a.cwd);
       // Resume into the idle TUI — loads context, spends nothing until a prompt,
       // and NEVER carries a replayed prompt (agentResumeCommand only rewrites flags).
       const resume = agentResumeCommand(a.command, a.argv, a.sessionId);
@@ -953,6 +967,18 @@ async function openActionPane(
       const what =
         kind === "files" ? "File explorer" : kind === "editor" ? "File editor" : "Workflow pane";
       const root = a.root;
+      // #1042: the trusted webview re-declaring its OWN persisted state — the
+      // same authority that admitted this root when the human first pointed the
+      // pane at it. Before the probe, because `ftRootIsDir` is an `ft_list_dir`
+      // call and slice C root-scopes it; a declaration after the probe would be
+      // a declaration for a pane that had already been failed soft.
+      //
+      // A remote client replaying a tabs file cannot do this: `admit_root` is
+      // off the wire roster, so the declaration is refused and the pane lands on
+      // the SAME welcome form this arm already opens for a deleted folder. And
+      // because the backend registry is never persisted, the replay itself can
+      // never make a root declared server-side.
+      if (root) await admitRoot(root);
       if (!root || !(await ftRootIsDir(root))) {
         showToast(
           `${what} "${a.name}": ${root ? `folder is gone — ${root}` : "no folder was recorded"}. Pick one to reopen it.`,
@@ -993,6 +1019,13 @@ async function openActionPane(
       // PATH" / the error, and ↻ recovers it once the environment does.
       const root = a.root;
       if (root) {
+        // #1042: as above — re-declare the recorded root before asking git,
+        // which slice C root-scopes. Note this arm's throw-vs-null distinction
+        // keeps working either way: a refused declaration does not make
+        // `gitRepoRoot` throw, and slice C's refusal arrives as a throw (a
+        // tooling-shaped failure), which this arm deliberately treats as "keep
+        // the pane" rather than as git's own "not a repo".
+        await admitRoot(root);
         let notARepo = false;
         try {
           notARepo = (await gitRepoRoot(root)) === null;

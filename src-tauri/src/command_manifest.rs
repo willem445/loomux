@@ -166,6 +166,8 @@ pub const APP_COMMANDS: &[&str] = &[
     "fm_reveal",
     // filehash (1)
     "fm_hash_start",
+    // rootreg (1)
+    "admit_root",
     // obs (1)
     "take_startup_notice",
     // uistate (6)

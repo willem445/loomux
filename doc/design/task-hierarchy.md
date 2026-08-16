@@ -1,9 +1,8 @@
 # Design: task-board Agile hierarchy (#958)
 
-Status: backend **implemented and merged** (#994) — `Task::parent`/`Task::kind`, write-time
-validation, promote-on-delete, and the `TaskSummary`/MCP surface described below are shipped.
-Board nesting UI (#1027) is **in review, demo-gated, not yet merged** — §9 describes its
-agreed design and is marked provisional where noted. Symbols are the durable reference.
+Status: **implemented.** The backend landed first (#994) — `Task::parent`/`Task::kind`,
+write-time validation, promote-on-delete, and the `TaskSummary`/MCP surface described below —
+and the board nesting UI (#1027) landed after its demo. Symbols are the durable reference.
 
 ## 1. Problem & thesis
 
@@ -105,8 +104,8 @@ on the next-surviving ancestor, not on either deleted row.
 Unlike an unknown `deps` id, which reads as *unmet* because deps gate readiness (§6), an unknown
 or cyclic `parent` is **display-only**, so the safe failure direction is to tolerate and show
 rather than hide or refuse to render. A hand-edited orphan, self-reference, or cycle in
-`tasks.json` blocks nothing backend-side, and the invariant the (provisional, #1027) board UI
-holds for all three is that **every row appears exactly once — never dropped, never looped** —
+`tasks.json` blocks nothing backend-side, and the invariant the board UI (#1027) holds for all
+three is that **every row appears exactly once — never dropped, never looped** —
 the same tolerate-and-show philosophy the existing `⚠ missing` dependency chip already applies to
 a dangling `deps` id. It is *not* the same rendering for all three: an orphan or a self-reference
 renders at the top level, while a cycle's members render once each, with only the first one
@@ -144,9 +143,9 @@ an oversight.
 once every child is `done` was considered and rejected outright: `status` already has two
 authors (a human and the orchestrator, each behind its own claim/approve guard and audit trail),
 and a derived write-back would recreate the exact wedge class the #582 design avoided by making
-`ready` a pure read-time projection instead of a stored status. Instead, the (provisional)
-board UI may badge a container whose children are all done but whose own status lags, as a
-**nudge** — never a status mutation.
+`ready` a pure read-time projection instead of a stored status. Instead, the board UI badges a
+container whose children are all done but whose own status lags, as a **nudge** — never a status
+mutation.
 
 ## 7. Metadata-only stance — nothing gates on `parent`/`kind`
 
@@ -180,12 +179,13 @@ authorization.
   rejected both times (§6): `list_tasks` already returns the whole board, and the tree is one
   client-side pass over `parent`.
 
-## 9. Board UI (design, #1027 — provisional, in review, demo-gated)
+## 9. Board UI (#1027)
 
-This slice is visible UI, deliberately held for a human's own eyes on the running app before it
-merges — the nesting affordances are the kind of thing that reads fine in a diff and wrong on
-screen. What follows is the **agreed design** the PR implements; treat it as provisional until
-the PR lands, since a demo can still change layout details.
+This slice was visible UI, so it was demo-gated: held for a human's own eyes on the running app
+before merging, because the nesting affordances are the kind of thing that reads fine in a diff
+and wrong on screen. The demo passed with one change — the collapse chevron was sized up and
+given a resting background, having been legible-but-easy-to-miss at its first size. What follows
+is what shipped.
 
 - **Derived display order.** `tasks.json` stays a flat array, and its order stays the priority
   order used everywhere else on the board; the tree is derived at render time from `parent` —
@@ -200,8 +200,8 @@ the PR lands, since a demo can still change layout details.
   existing behaviours, not one.
 - **Kind badge.** The advisory Agile level, shown as a label and nothing more — no enforcement
   rides on it (§2). A value outside the four known kinds (only reachable by hand-editing
-  `tasks.json`, since the backend refuses it on write) is designed to read as visibly broken
-  rather than as a silent fifth level.
+  `tasks.json`, since the backend refuses it on write) reads as visibly broken rather than as a
+  silent fifth level.
 - **Rollup chip + nudge.** A `done/total` chip for **direct** children — the same two numbers
   the orchestrator's own `list_tasks` row carries, so a human's board and the orchestrator's
   view of the same container never disagree. A separate "all inside done" nudge requires the
@@ -221,8 +221,8 @@ the PR lands, since a demo can still change layout details.
   container's whole subtree with it; the write is a full flattened permutation of the board's id
   array through the existing `orch_reorder_tasks`, since that command already expects the whole
   array and has no notion of siblings itself.
-- **Read tolerance in the UI.** As described in §5, every row is designed to appear **exactly
-  once — never dropped, never looped** — regardless of what a hand-edited `parent` says. The
+- **Read tolerance in the UI.** As described in §5, every row appears **exactly once — never
+  dropped, never looped** — regardless of what a hand-edited `parent` says. The
   *rendering* differs by case, though: an orphan (names no task on the board) or a self-reference
   (names the row itself) renders at the top level, at depth 0. A cycle does not: `buildTree` lists
   a cyclic row as both a root and a child, so the first member `visibleRows` reaches renders at
@@ -232,8 +232,7 @@ the PR lands, since a demo can still change layout details.
   rows, so nothing about them is "missing" in the sense the chip reports.
 - **No nesting chrome on a board that nests nothing.** The collapse gutter and related chrome
   are gated the same way the existing dependency/readiness chrome is gated on `deps` usage, so a
-  board that has never used hierarchy is designed to render exactly as it did before this
-  feature existed.
+  board that has never used hierarchy renders exactly as it did before this feature existed.
 
 ## 10. Explicitly out of scope
 
@@ -244,7 +243,7 @@ Filed as follow-ups rather than built here, each for a stated reason:
   a view-mode addition on top of it.
 - **Folding ancestor state into `ready`** — §6's deferred semantics decision, needing the
   human's sign-off before it changes what every existing board's readiness signal means.
-- **A dedicated kind picker on the board UI** — the brief for #1027 is nest/un-nest and display
+- **A dedicated kind picker on the board UI** — #1027's brief was nest/un-nest and display
   `kind`; setting `kind` itself stays an MCP-surface (orchestrator) action for now.
 - **Role-template edits** — none were needed for this feature; the MCP tool descriptions are the
   teaching surface for the orchestrator, so no `pre222` fixture re-bless was owed by this work.

@@ -87,7 +87,7 @@ import { ModelPicker } from "./modelpicker";
 import { ORCH_CLIS, orchCliFor } from "./orchclis";
 import { ICON_SETUP_PREVIEW_PX, setupPreviewMark } from "./setuppreview";
 import { knobState, knobValue, type CliKnobs, type KnobState, type KnobStates } from "./selectorknobs";
-import { ftRootIsDir } from "./fileapi";
+import { admitRoot, ftRootIsDir } from "./fileapi";
 import {
   AGENTS,
   addRecentRepo,
@@ -1428,6 +1428,12 @@ export class WelcomeForm {
     }
     if (!this.latch.begin()) return;
     this.setBusy(true, "Opening…");
+    // #1042: declare BEFORE probing, not after. `ftRootIsDir` is an `ft_list_dir`
+    // call, so once slice C root-scopes that command an undeclared root reads
+    // back as "folder not found" — the probe would answer for the declaration
+    // rather than for the directory. A human typed or picked this path into the
+    // trusted webview, which is what makes declaring it legitimate.
+    await admitRoot(root);
     if (!(await ftRootIsDir(root))) {
       this.showError(`Folder not found (or not a directory): ${root}`);
       this.repoInput.focus();
@@ -1757,6 +1763,12 @@ export class WelcomeForm {
       defaultPath: this.repoInput.value.trim() || undefined,
     });
     if (typeof picked === "string") {
+      // #1042: a human chose this folder in a native dialog the backend never
+      // sees. Declared here rather than only at submit because `refreshRoster`
+      // below already reads the repo, and because the pick IS the gesture — a
+      // path the human then edits away simply leaves a declared root nothing
+      // uses, which costs nothing locally (the webview may declare anything).
+      await admitRoot(picked);
       this.repoInput.value = picked;
       this.updateName();
       this.refreshRoster();
@@ -1849,6 +1861,13 @@ export class WelcomeForm {
       // Bash selection, or a non-UI caller) falls back to PowerShell so the pane
       // name can't misdescribe what spawned — mirrors the backend fallback.
       const shellKind = resolveShellKind(plan.shellKind, this.shellAvail);
+      // #1042: the human typed or picked this cwd, so declare it — the pane's
+      // folder chip and git watch will name it back to the backend the moment
+      // the shell reports it, and an OSC-7 report is resolve-only, never an
+      // admit. Declaring the SPAWN cwd here is what keeps that pane's whole
+      // normal life (this directory and everything it `cd`s into below it)
+      // resolvable without the byte stream ever declaring anything.
+      if (plan.cwd) await admitRoot(plan.cwd);
       if (plan.cwd) addRecentRepo(plan.cwd);
       this.setBusy(true, "Starting…");
       this.fire({ kind: "terminal", name: plan.name, cwd: plan.cwd ?? undefined, shellKind });
@@ -1866,6 +1885,10 @@ export class WelcomeForm {
       // for the file would turn "you don't have a workflow yet" into "this pane refuses to
       // open" — which is the one thing a config editor must never do.
       this.setBusy(true, "Opening…");
+      // #1042: declare before probing — `ftRootIsDir` is an `ft_list_dir` call,
+      // which slice C root-scopes, so an undeclared root would read back here as
+      // "folder not found" (see `openWorkflowPane`).
+      await admitRoot(plan.root);
       if (!(await ftRootIsDir(plan.root))) {
         this.showError(`Folder not found (or not a directory): ${plan.root}`);
         this.repoInput.focus();
@@ -1885,6 +1908,13 @@ export class WelcomeForm {
       // is the honest bar: the view resolves the top level itself, and picking a
       // subfolder of your repo should just work.
       this.setBusy(true, "Opening…");
+      // #1042: declare before asking git — slice C root-scopes `git_repo_root`'s
+      // `cwd` like every other root argument. What is declared is `plan.root`,
+      // the path the human typed, and NOT the `top` resolved below: `top` may be
+      // an ANCESTOR of it (a subfolder of a repo resolves to the repo), and an
+      // ancestor grants strictly more than the human named. The pane is fired
+      // with `plan.root` anyway (see the comment below), so nothing needs it.
+      await admitRoot(plan.root);
       let top: string | null;
       try {
         top = await gitRepoRoot(plan.root);
@@ -1928,6 +1958,11 @@ export class WelcomeForm {
           return;
         }
       }
+      // #1042: the group's checkout. The backend declares it again from
+      // `create_group` (engine-derived, and the path that also covers a RESUMED
+      // group), but declaring it here too is what makes the ordering right —
+      // the orchestrator pane's own reads start as soon as the group exists.
+      await admitRoot(plan.repo);
       addRecentRepo(plan.repo);
       const groupCli = orchCliFor(this.agentSel.value);
       setDefaultAgent(groupCli.id);
@@ -2020,6 +2055,13 @@ export class WelcomeForm {
     this.setBusy(true, "Creating worktree…");
     this.hideError();
     try {
+      // #1042: declare the repo the human typed/picked, once, before anything
+      // reads under it — `gitWorktreeAdd` below takes it as a root argument, and
+      // slice C root-scopes that. The worktrees it CUTS need no declaration
+      // here: they are siblings of the repo (`<repo>-worktrees/<name>`), and the
+      // backend declares each one as it creates it, which is the only place that
+      // knows the path it produced.
+      if (plan.repo) await admitRoot(plan.repo);
       const specs: AgentLaunchSpec[] = [];
       for (let i = 1; i <= plan.count; i++) {
         let cwd = plan.repo || undefined;
