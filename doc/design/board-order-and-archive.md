@@ -11,7 +11,7 @@ Two mechanisms answer that, and the whole design rests on keeping them separate.
 
 Within **each sibling group** (the top-level rows, or one container's children),
 the board renders the live rows first — in exactly the array order they already
-had — then the finished ones, newest-finished first.
+had — then the finished ones, most recently updated first.
 
 Three properties make this safe to turn on for everyone with no opt-in:
 
@@ -40,7 +40,7 @@ never rewrites priority data as a side effect of a click, which is the line that
 keeps it a projection at all.
 
 On a finished row both arrows are **off**. Its position is derived
-(newest-first), so a manual step there would either do nothing visible or
+(most recently updated first), so a manual step there would either do nothing visible or
 contradict the order the board just told the human it was using. Reopening the
 row puts it back in the manual list.
 
@@ -83,9 +83,12 @@ and pane that shows the board. That is board data by the same test `status` is.
   `list_tasks` — a human view action reaching into an agent's read. Clearing
   composes with that cap by leaving its input alone, and a test pins the kept
   set as identical across a clear.
-- **`TaskSummary` / `list_tasks`.** The compact agent-facing row does not carry
-  the field and does not filter on it, so the done-cap keeps meaning exactly
-  what it meant and nothing agent-facing can start gating on the archive.
+- **Any agent-facing read.** The compact `list_tasks` row (`TaskSummary`) does
+  not carry the field and does not filter on it, so the done-cap keeps meaning
+  exactly what it meant; and the full-record read, `get_task`, goes through
+  `AgentTaskView` (see below) rather than serializing the stored `Task`. Nothing
+  agent-facing can start gating on the archive because nothing agent-facing can
+  see it.
 - **The orchestrator's attention.** `notify_board_edit` exists to say the queue
   moved, and this moves nothing: no status, no priority, no link, nothing
   `TaskSummary` even carries. This follows the `reorder_tasks` precedent (a
@@ -102,6 +105,40 @@ field out as `None` rather than sweeping it up with `..Default::default()`, so
 an agent cannot reach it and a future patch field cannot leak there by
 omission. An agent tidying rows out of the human's sight is the one thing this
 feature must never become.
+
+### Human-only on the READ side too — and why that needed a type
+
+The write side above was airtight from the start. The read side was not, and it
+is worth recording exactly how it failed, because the shape recurs.
+
+`get_task` returned `serde_json::to_string(&task)` — the stored `Task`, straight
+onto the MCP surface. `cleared_ms` carries `skip_serializing_if =
+"Option::is_none"`, which omits the key while the stamp is *absent* and emits it
+the moment one *exists*. So every claim on this page, in `docs/orchestration.md`,
+in `Task::cleared_ms`'s own doc block, and in the name of the test meant to pin
+it was true right up until the human clicked 📥 — at which point any agent
+calling `get_task` on that row got `"cleared_ms": <ts>` back. Four surfaces
+agreed with each other and disagreed with the code.
+
+The fix is not a filter, because a filter is only as good as the next person
+remembering it. `AgentTaskView` is the agent-facing projection of a full task
+record, and `agent_task_view` builds it by destructuring `Task`
+**exhaustively**. Adding a field to `Task` therefore does not widen what agents
+see — it stops the crate compiling until somebody classifies the new field:
+name it in the view (agent-visible) or bind it to `_` beside `cleared_ms`
+(human-only). Default-deny, enforced by the compiler rather than by care, and
+the same posture `TaskSummary` already takes for the compact row.
+
+Deliberately *not* also guarded by a source scan. The scan that would catch a
+future `to_string(&task)` has to key off the binding's name, and this repo's own
+convention rules that out — "a source-scanning guard must not decide from a
+binding's name; a rename steps over it, so it enforces nothing". The exhaustive
+destructure is stronger and rename-proof.
+
+The lesson generalizes past this field: **a storage type with `#[derive(Serialize)]`
+is not a wire shape.** Serializing one onto an agent-facing surface publishes
+every field it will ever gain, and the publication is invisible at the call site
+that causes it.
 
 ### Read-time, so nothing needs repairing
 

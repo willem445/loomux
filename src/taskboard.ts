@@ -489,11 +489,22 @@ export interface BoardRow<T extends HasParent> {
   hasChildren: boolean;
   collapsed: boolean;
   /** This row and everything under it is `done`, so the board sinks it below
-   *  the live work and its position is DERIVED (newest-finished first), not
+   *  the live work and its position is DERIVED (most recently updated first), not
    *  the human's manual priority order. */
   settled: boolean;
-  /** The human archived this row from their working view. Only ever `true` on
-   *  a rendered row while "show cleared" is on — see `visibleRows`. */
+  /** The human archived this row from their working view — this row's OWN
+   *  stamp (`isCleared`), which is not the same question as whether the board
+   *  is hiding it.
+   *
+   *  Hiding is decided by `clearedIds`, the whole-subtree closure, so a
+   *  **cleared container still holding live work renders with "show cleared"
+   *  OFF** and wears this flag: it never left the list, because hiding it would
+   *  have taken the live child with it. That is the case `clearedIds` exists to
+   *  create, so it is normal, not a leak — the 📥 chip is what explains the
+   *  dimming, and the row's own ↩ is the way back. Consequence worth knowing at
+   *  the header: `👁 show cleared (N)` and `↩ restore all (N)` both count
+   *  `clearedIds`, so both can read 0 and be hidden entirely while such a row
+   *  is on screen. */
   cleared: boolean;
 }
 
@@ -600,7 +611,7 @@ export function buildTree<T extends HasParent>(board: readonly T[]): TaskTree<T>
 // mechanisms answer that, and keeping them separate is the point:
 //
 //  1. **Sinking** is automatic and derived. A finished subtree drops below the
-//     live work of its own sibling group, newest-finished first. Nothing is
+//     live work of its own sibling group, most recently updated first. Nothing is
 //     stored and nothing is written — it is a projection, exactly like
 //     `isReady`.
 //  2. **Clearing** is the human's explicit archive action, and it IS stored
@@ -706,7 +717,16 @@ export function clearedIds<T extends OrderedRow>(board: readonly T[]): Set<strin
 
 /** One sibling list, split into the two halves the board shows in order (#1152):
  *  `manual` — still-live rows in the human's own priority order, untouched —
- *  then the settled ones, newest-finished first.
+ *  then the settled ones, most-recently-updated first.
+ *
+ *  **The key is `updated_ms`, which is "last TOUCHED", not "finished".** No
+ *  `done_ms` exists, and inventing one to make this sentence exact would be a
+ *  new stored field on every row to order a list the human is looking at
+ *  because they are done with it. So the approximation is deliberate and it is
+ *  stated rather than papered over: a note added to a six-week-old `done` row
+ *  lifts it above work that actually finished yesterday. Every surface that
+ *  describes this order says "most recently updated" for that reason (#1152
+ *  review round 1, finding 3).
  *
  *  `ordered` is what renders; `manual` is what the ▲/▼ buttons step through,
  *  and the two being derived here together is what keeps a click meaning
@@ -738,7 +758,7 @@ export function positionAmong<T extends HasId>(
  *  subtree (recursively), with the depth each row should be indented to.
  *
  *  Within every sibling group the order is `orderSiblings`' — the human's
- *  manual priority order for live work, then finished subtrees newest-first
+ *  manual priority order for live work, then finished subtrees most recently updated first
  *  (#1152). `collapsed` hides a row's whole subtree, not just its direct
  *  children — a collapsed epic must not leave its grandchildren stranded at the
  *  top level — and `showCleared` brings the archived rows back.
@@ -847,7 +867,7 @@ export function subtreeAllDone<T extends HasParent & HasStatus>(
  *
  *  `{ index: -1, count: 0 }` — both buttons off — for an id that isn't on the
  *  board, and (since #1152) for a **settled** row: a finished subtree's
- *  position is derived, newest-finished first, so a manual step would either do
+ *  position is derived, most recently updated first, so a manual step would either do
  *  nothing visible or contradict the order the board just told the human it was
  *  using. Reopen the row and it rejoins the manual list. */
 export function siblingPosition<T extends OrderedRow>(
