@@ -33659,7 +33659,12 @@ impl OrchRegistry {
                 // uses (`!q.status.is_settled()`, mod.rs `ask_human`), rather
                 // than by a second, independently-drifting spelling of "not
                 // done yet".
-                if !q.status.is_settled() {
+                // SCRATCH RED (#1091 slice D, N1): the settled filter is
+                // dropped here on purpose — do not merge this commit. Proves
+                // `settling_every_pending_question_clears_the_badge_with_nothing_latched`
+                // actually exercises the filter rather than passing for some
+                // other reason.
+                {
                     *question_of.entry(q.asker).or_insert(0) += 1;
                 }
             }
