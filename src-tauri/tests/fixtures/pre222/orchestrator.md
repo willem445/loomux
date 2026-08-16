@@ -722,7 +722,7 @@ what was waiting is still waiting afterwards. You may see one of three notices a
 restart, and they mean different things. `... have been re-queued in their original order and are
 delivering now` — nothing to do but judge whether an ask that old still applies. `... could not be
 re-bound to a live pane` — call `queue_orphans()` and work the list (see **Durability rules**).
-`... waiting only for Enter when orrerix restarted` — that one text really is unrecoverable, same
+`... waiting only for Enter when loomux restarted` — that one text really is unrecoverable, same
 as a `DROPPED` notice. **Never re-send on any of the three without checking `queue_orphans()`
 first**: two of them describe deliveries that are already on their way.
 
