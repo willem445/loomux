@@ -20,6 +20,7 @@ import {
   isAwaitingHuman,
   isReady,
   KINDS,
+  kindCandidates,
   MAX_INDENT_DEPTH,
   nextPicker,
   parentCandidates,
@@ -591,6 +592,25 @@ test("the nest-under picker offers every other row, minus the current container"
   // rule here could only ever disagree with the authoritative one — the same
   // call depCandidates makes.
   assert.deepEqual(parentCandidates(board[0], board).map((t) => t.id), ["t-2", "t-3"]);
+});
+
+test("the kind picker offers the three levels a row doesn't already carry", () => {
+  const epic = row("t-1", "queued", undefined, "epic");
+  assert.deepEqual(kindCandidates(epic), ["feature", "story", "task"]);
+  const story = row("t-2", "queued", undefined, "story");
+  assert.deepEqual(kindCandidates(story), ["epic", "feature", "task"]);
+});
+
+test("the kind picker offers all four levels on a plain, kind-less row", () => {
+  assert.deepEqual(kindCandidates(row("t-1")), [...KINDS]);
+});
+
+test("the kind picker offers all four levels to fix an out-of-vocabulary kind", () => {
+  // Only reachable by hand-editing tasks.json — the backend refuses an
+  // unknown kind on write — but nothing here should silently exclude one of
+  // the four real levels because the current value doesn't match any of them.
+  const broken = row("t-1", "queued", undefined, "sprint");
+  assert.deepEqual(kindCandidates(broken), [...KINDS]);
 });
 
 test("indent is clamped, so a hand-edited over-deep row still fits the overlay", () => {

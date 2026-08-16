@@ -2355,6 +2355,9 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   font-family: "Cascadia Mono", Consolas, monospace;
 }
 .task-btn.nest { font-size: 10px; }
+/* Set-kind picker (#958 slice K): a separate entry point from ⤵ above — a
+   container's Agile level and what it sits inside are independent choices. */
+.task-btn.kindpick { font-size: 10px; }
 
 /* Merge-gate action buttons (approve / request changes) and the queued-task
    start button share the same compact pill shape. */

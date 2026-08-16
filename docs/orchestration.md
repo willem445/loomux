@@ -404,9 +404,10 @@ finish before it can start. A subtask of a container that's still `blocked` is n
 blocked by that — express ordering with a dependency, not by nesting.
 
 Each task can carry an advisory **kind** label — `epic`, `feature`, `story`, or `task` — set by
-the orchestrator to show the level a container sits at. It's a label only: nothing enforces that
-a `story` sits under a `feature` rather than straight under an `epic`, and a container is
-ordinary claimable work like any other task, not a special row.
+the orchestrator, or by you from the board's own **🏷** picker, to show the level a container
+sits at. It's a label only: nothing enforces that a `story` sits under a `feature` rather than
+straight under an `epic`, and a container is ordinary claimable work like any other task, not a
+special row.
 
 Two rules about nesting are backend behavior — they hold however the board reaches you, the UI
 below included:
@@ -426,7 +427,9 @@ Board controls for nesting:
   chevron** on any row that has subtasks — collapsing hides the whole subtree, not just its
   direct children, so a grandchild is never left stranded above its own container.
 - The **kind** label above shows on the row as a badge, so you can see at a glance which rows
-  are containers and at what level.
+  are containers and at what level. A **🏷** picker next to the nest control lets you set or
+  change it directly — the three levels the row doesn't already carry, plus a clear option once
+  it carries one.
 - The **▲/▼ priority arrows now move a task among its siblings**, not through the whole board:
   the first subtask of a container has nothing above it to swap with, so its ▲ is greyed out
   even though there are rows higher up the board. Moving a container moves everything inside it
