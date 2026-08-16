@@ -139,13 +139,13 @@ breaks main" into "CI is red." Three tests:
    (string search + bracket match, not a hand count) and diffs them against
    `command_manifest::APP_COMMANDS`. Fails if a command is registered in one
    list but not the other.
-2. **`app_commands_len_is_134`** — a drift tripwire against the current count,
+2. **`app_commands_len_is_146`** — a drift tripwire against the current count,
    so that adding a command is always a deliberate edit rather than a silent
    one. The running tally of what each command past the #363 plan's original
    audit of 120 was added for lives in that test's own assertion message,
    which is the copy that cannot go stale; this note deliberately does not
    duplicate it (it had drifted three commands behind by #608).
-3. **`main_has_all_134_and_zero_permission_denies_dangerous_spread`** — the
+3. **`main_has_all_146_and_zero_permission_denies_dangerous_spread`** — the
    one that matters most. It builds a real (headless) `tauri::test` mock app
    — `tauri::test::mock_builder()` + `.build(tauri::generate_context!())` —
    using the app's **actual on-disk `capabilities/`/`permissions/`**, the
