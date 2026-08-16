@@ -29,6 +29,7 @@ import {
   isValidBlockId,
   isBlockKind,
   allowDenialReason,
+  personaDenialReason,
   isReviewingBlock,
   isWorkflowCli,
   isValidIntakeLabel,
@@ -1255,6 +1256,35 @@ test("a manager block may not declare allow: (#1161 D1)", () => {
   // The control: a reviewer with the same pattern keeps it — a reviewer has its
   // shell by design, so the refusal above is about the class.
   assert.equal(allowDenialReason("reviewer"), null);
+});
+
+test("a loomux-owned block may not declare a persona (#1161 D1, review N5)", () => {
+  // The pane's mirror of `persona_allowed` / `parse_workflow`'s refusal. The
+  // engine fails the WHOLE FILE over this, so a pane reporting it clean lets an
+  // author save a workflow that silently launches on the built-in roster with
+  // no finding to explain where their roster went.
+  for (const kind of ["manager", "orchestrator"] as const) {
+    for (const key of ["prompt", "profile"] as const) {
+      const w = withManager();
+      const i = w.blocks.findIndex((b) => b.kind === "manager");
+      w.blocks[i]! = { ...w.blocks[i]!, kind, [key]: key === "prompt" ? "Say it is fine." : ".github/agents/x.md" };
+      const f = validateWorkflow(w);
+      assert.ok(has(f, "persona-not-permitted"), `${key} on a ${kind} block: ${codes(f)}`);
+      assert.match(f.find((x) => x.code === "persona-not-permitted")!.message, new RegExp(key));
+    }
+  }
+
+  // The controls, and they are what keep this from being "no block may carry a
+  // persona". A reviewer's persona is the entire point of the workflow feature,
+  // and a PLANNER's is the pairing that matters most: a planner may carry one
+  // while being denied `allow:`, so the two rules are not co-extensive and the
+  // predicates must stay separate.
+  assert.equal(personaDenialReason("reviewer"), null);
+  assert.equal(personaDenialReason("planner"), null);
+  assert.equal(allowDenialReason("planner") === null, false, "…but a planner still may not allow:");
+  const ok = withManager();
+  ok.blocks[2]! = { ...ok.blocks[2]!, prompt: "Review for security." }; // the reviewer
+  assert.ok(!has(validateWorkflow(ok), "persona-not-permitted"));
 });
 
 test("the manager never reviews, so it can never satisfy a gate (#1161)", () => {

@@ -119,9 +119,41 @@ export function roleHintsForKind(kind: string): RoleHint[] {
   return ROLE_HINTS.filter((h) => roleHintRequires(h) === kind);
 }
 
+/** Why a block of this kind may NOT declare a repo-authored PERSONA
+ *  (`prompt:` / `profile:`), or `null` when it may — the mirror of
+ *  `workflow::persona_allowed` and of `parse_workflow`'s refusal.
+ *
+ *  Separate from {@link allowDenialReason} because the two rules are not
+ *  co-extensive and never were: a PLANNER may carry a persona and may not
+ *  pre-approve tools, so folding them into one predicate would either ban a
+ *  planner's persona or permit an orchestrator's. Two loomux-owned classes
+ *  answer non-null here (#222 for the orchestrator, #1161 D1 for the manager);
+ *  the argument for each is in `parse_workflow`.
+ *
+ *  Before #1161 the pane mirrored only the `allow:` half, so a workflow the
+ *  engine refuses OUTRIGHT — persona on the trust root — could be authored in
+ *  the pane, saved, and reported as clean; the launch then fell back to the
+ *  built-in roster with no finding to explain why. Fail-closed, but silent, and
+ *  `kind: manager` made it newly reachable through the kind picker. */
+export function personaDenialReason(kind: string): string | null {
+  if (kind === "orchestrator") {
+    return (
+      "the orchestrator is loomux's trust root, and a repo file may not author its prompt — " +
+      "put personas on the blocks it spawns"
+    );
+  }
+  if (kind === "manager") {
+    return (
+      "a manager speaks to the human and relays their direction into the trust root, so a repo " +
+      "file may not author its persona — put personas on the blocks the orchestrator spawns"
+    );
+  }
+  return null;
+}
+
 /** Why a block of this kind may NOT declare `allow:`, or `null` when it may.
  *
- *  Mirrors the two REFUSALS in `parse_workflow` (workflow.rs), which are separate
+ *  Mirrors the three REFUSALS in `parse_workflow` (workflow.rs), which are separate
  *  rules with separate reasons and are stated here as one answer so the pane's form
  *  and its validation pass cannot disagree about them:
  *
@@ -513,6 +545,7 @@ export type FindingCode =
   | "intake-bad-label"
   | "resource-name-invalid"
   | "allow-not-permitted"
+  | "persona-not-permitted"
   | "allow-sanitized";
 
 /** The policy sections a finding can be ABOUT — the routing key for the three that are
@@ -2337,6 +2370,22 @@ export function validateWorkflow(w: Workflow, knobs?: KnobLookup): Finding[] {
         message: `Block "${where}" declares both a prompt and a profile — pick one. (An inline prompt compiles to the CLI's native inline agent; a profile points at a file the CLI loads by name.)`,
         blockId: b.id,
       });
+    }
+    // The engine refuses a persona on a loomux-owned block outright, failing the
+    // WHOLE file — so a pane that reported this clean would let an author save a
+    // workflow that silently launches on the built-in roster instead. Reported
+    // whichever key carries it, since `parse_workflow` names both.
+    if (b.prompt !== undefined || b.profile !== undefined) {
+      const denial = personaDenialReason(b.kind);
+      if (denial) {
+        const key = b.prompt !== undefined ? "prompt:" : "profile:";
+        findings.push({
+          severity: "error",
+          code: "persona-not-permitted",
+          message: `Block "${where}" declares ${key}, which a ${b.kind} block may not — ${denial}.`,
+          blockId: b.id,
+        });
+      }
     }
     if (b.role_hint !== undefined) {
       const required = roleHintRequires(b.role_hint);

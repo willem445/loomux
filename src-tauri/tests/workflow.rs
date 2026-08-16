@@ -1072,6 +1072,13 @@ fn a_declared_manager_raises_the_recommended_capacity_and_is_named_in_the_adviso
     // `max_agents` slot like any non-orchestrator pane (`live_delegate_count`
     // exempts only the orchestrator) — so the launcher's recommendation must
     // count it, or every roster with one under-advises by exactly one.
+    //
+    // **#1161 M3 INVERTS THIS TEST.** Decision D3 exempts the manager from
+    // `max_agents`; once it does, an exempt class is one `recommended` must not
+    // count (the rule `CapacityRecommendation::recommended` already states for
+    // the orchestrator), and both the `+1` below and the `extra_tiers` row go
+    // the other way. A green here after M3 lands means the exemption was added
+    // without moving this — do not simply delete the test to make it pass.
     let with = workflow::parse_workflow(
         "version: 1\nblocks:\n\
          \x20 - id: worker\n    kind: worker\n\
@@ -5065,6 +5072,86 @@ fn assert_manager_spawn_refused(reg: &OrchRegistry, caller: &Caller, group: &Gro
         before,
         "no manager pane may exist, not even briefly"
     );
+}
+
+#[test]
+fn every_block_the_orchestrator_is_told_to_spawn_is_one_spawn_agent_accepts() {
+    // #1161 review B1. Two surfaces tell the orchestrator which blocks it may
+    // open — its KICKOFF (`roster_note`) and its INSTRUCTION FILE
+    // (`workflow_section`'s `{{BLOCKS}}`, under "Your delegates" followed by
+    // "Spawn by block, not by kind") — and `spawn_agent` decides which it
+    // actually accepts. Those are three renderings of one membership rule, and
+    // before this they were two spellings of it: both lists filtered
+    // `kind != Orchestrator`, which stopped meaning "spawnable" the moment a
+    // second unspawnable class existed. A declared manager was listed as a
+    // delegate by a slice that refuses to spawn one — a contradiction the
+    // orchestrator reads on every turn, re-grounding included.
+    //
+    // So this pins the AGREEMENT rather than either side, in BOTH directions:
+    // advertised ⇒ accepted, and accepted ⇒ advertised. Asserting only the
+    // first would pass on a roster that advertised nothing at all.
+    let (reg, _d) = test_registry();
+    let repo = Repo::new().git_init().workflow(
+        "version: 1\nblocks:\n\
+         \x20 - id: worker\n    kind: worker\n\
+         \x20 - id: rev\n    kind: reviewer\n\
+         \x20 - id: plan\n    kind: planner\n\
+         \x20 - id: manager\n    kind: manager\n",
+    );
+    let g = reg.create_group(&repo.path(), rails()).unwrap();
+    // ONE orchestrator, used as both the kickoff's subject and the MCP caller:
+    // the two surfaces and the tool must be read against the same agent, or the
+    // comparison is between three different groups' answers.
+    let o = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let caller =
+        Caller { agent_id: o.id.clone(), group: g.id.clone(), role: Role::Orchestrator, role_hint: None };
+    let kickoff = reg.kickoff_prompt(&o, &g, "", None);
+    let file = instructions_lf(&reg, &g.id, "orchestrator.md");
+
+    // `clamped()` synthesizes the orchestrator block, so this roster carries all
+    // five classes — which makes the orchestrator block itself a second row in
+    // the same pin, and the pre-existing half non-vacuous.
+    let ids: Vec<String> = g.guardrails.blocks.iter().map(|b| b.id.clone()).collect();
+    assert!(ids.iter().any(|i| i == "orchestrator"), "the roster must carry all five classes: {ids:?}");
+    assert!(ids.iter().any(|i| i == "manager"), "{ids:?}");
+
+    let mut disagreements: Vec<String> = Vec::new();
+    for id in &ids {
+        // The rows are `  - <id> (kind, cli, model)` and `- **`<id>`** — …`, so
+        // the id followed by its opening delimiter is what "listed" means. A
+        // bare `contains(id)` would match the prose around the list.
+        let in_kickoff = kickoff.contains(&format!("- {id} ("));
+        let in_file = file.contains(&format!("**`{id}`**"));
+        let out = dispatch(
+            &reg,
+            &caller,
+            "tools/call",
+            &json!({ "name": "spawn_agent", "arguments": { "block": id, "task": "t" } }),
+        )
+        .unwrap();
+        let accepted = out["isError"] == json!(false);
+        if in_kickoff != accepted {
+            disagreements.push(format!(
+                "{id}: kickoff roster says spawnable={in_kickoff}, spawn_agent says {accepted} \
+                 ({})",
+                out["content"][0]["text"].as_str().unwrap_or("")
+            ));
+        }
+        if in_file != accepted {
+            disagreements.push(format!(
+                "{id}: the orchestrator's instruction file says spawnable={in_file}, \
+                 spawn_agent says {accepted}"
+            ));
+        }
+    }
+    assert!(disagreements.is_empty(), "a surface and the tool disagree:\n{}", disagreements.join("\n"));
+
+    // Non-vacuity: the loop above is satisfied by "nothing is advertised and
+    // nothing is accepted". Say what the answers actually are.
+    assert!(kickoff.contains("- worker ("), "a worker block IS a delegate and must be listed: {kickoff}");
+    assert!(!kickoff.contains("- manager ("), "the manager must NOT be listed as a delegate: {kickoff}");
+    assert!(file.contains("**`worker`**"), "{file}");
+    assert!(!file.contains("**`manager`**"), "nor in the instruction file: {file}");
 }
 
 #[test]
