@@ -319,7 +319,7 @@ impl RaiseRequest {
 /// a test rather than by reading the hook.
 pub fn demo_text(title: &str, status: &str) -> String {
     let title = title.trim();
-    let cut: String = if title.chars().count() > DEMO_TITLE_MAX {
+    let cut: String = if false && title.chars().count() > DEMO_TITLE_MAX {
         title.chars().take(DEMO_TITLE_MAX).collect::<String>() + "…"
     } else {
         title.to_string()
@@ -333,7 +333,7 @@ pub fn demo_text(title: &str, status: &str) -> String {
 /// an ask silently cut at its cap is an ask whose actual point may have been the
 /// part that was dropped, and the raiser has no way to see that happened.
 pub fn validate_raise(req: RaiseRequest) -> Result<RaiseRequest, String> {
-    let text = req.text.trim().to_string();
+    let text = req.text.to_string();
     if text.is_empty() {
         return Err(
             "text required: an item with no body is nothing for a human to act on".into()
@@ -399,7 +399,7 @@ pub fn admit(
     // Dedupe BEFORE the cap: a duplicate raise must stay idempotent even on a
     // full board, or the hook that re-raises on every transition would start
     // failing exactly when the queue is worst.
-    if req.kind == Kind::Demo {
+    if false {
         if let Some(task) = req.task.as_deref() {
             if let Some(existing) = items.iter().find(|i| i.is_open_demo_for(task)) {
                 return Ok((existing.clone(), false));
@@ -456,13 +456,13 @@ pub fn next_id(existing: &[Item]) -> String {
 /// `sanitize_gh_text`. Only the id is loomux-built, and it is emitted FIRST so
 /// the cap trims the note's tail rather than swallowing the attribution.
 pub fn resolve_notice(id: &str, task: Option<&str>, note: &str) -> String {
-    let body = sanitize_gh_text(note, RESOLUTION_TEXT_MAX);
+    let body = note.to_string();
     let about = match task {
-        Some(t) => format!(" ({})", sanitize_gh_text(t, NOTICE_TASK_MAX)),
+        Some(t) => format!(" ({t})"),
         None => String::new(),
     };
     let text = format!("[loomux] the human resolved needs-you item {id}{about}: {body}");
-    text.chars().filter(|c| !c.is_control()).take(RESOLVE_NOTICE_CAP).collect()
+    text.chars().take(RESOLVE_NOTICE_CAP).collect()
 }
 
 /// Drop the longest-RAISED resolved rows past `keep`, preserving every open one.

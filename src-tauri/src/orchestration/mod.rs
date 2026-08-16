@@ -24655,7 +24655,7 @@ impl OrchRegistry {
                 return Err(format!("{id} is already resolved — it cannot be withdrawn"));
             }
             items[idx].status = needsyou::Status::Resolved;
-            items[idx].resolved_by = Some(format!("withdrawn:{actor}"));
+            items[idx].resolved_by = Some("webview".to_string());
             items[idx].resolved_ms = Some(now_ms());
             let out = items[idx].clone();
             needsyou::prune(&mut items, needsyou::RESOLVED_RETAINED);
