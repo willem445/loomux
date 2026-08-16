@@ -9045,7 +9045,21 @@ pub struct Task {
     /// with no key, and `None` here means "no path recorded", never "there is
     /// no demo". The KEY ITSELF is omitted when absent, though — unlike `pr`,
     /// which has no `skip_serializing_if` and writes an explicit `null`. That
-    /// half follows `parent`/`kind` (#958), the fields that actually carry it.
+    /// half follows `parent`/`kind` (#958), the fields that actually carry it,
+    /// and the reason is the ASYMMETRY between the two groups rather than a
+    /// style preference: `pr` is a concept every worked row has, so its null
+    /// says something. A `demo_path` is set only on the two demo-gated statuses,
+    /// so on most boards NO row ever has one — and without the skip, the first
+    /// rewrite of any board would add a permanently-dead `"demo_path":null` to
+    /// every row of a file humans read and diff. Skipping keeps the additive
+    /// promise total: a board that never uses the feature is unchanged by its
+    /// existence, on disk and not just at load.
+    ///
+    /// Both halves are pinned by `pre_1091_boards_load_with_demo_path_absent`
+    /// (`tests/orchestration.rs`), which holds the only assertion in the tree
+    /// that names this key as text — so deleting `skip_serializing_if` below
+    /// reddens exactly that one test and nothing else. Run, not reasoned: see
+    /// the mutation evidence on #996.
     ///
     /// DISPLAY METADATA ONLY, the `pr_base` rule applied here: nothing gates on
     /// it, and it is agent-written, so a stale or wrong value misleads a human
