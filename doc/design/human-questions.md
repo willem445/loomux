@@ -1,11 +1,12 @@
 # Human questions — asking without blocking the fleet
 
 *#946. This note covers slice Q1: the registry, its MCP tools, and the trusted
-answer surface — plus, from #1091 slice A, the shape of the ask itself. The
-NEEDS-YOU panel (#1091 C, the Q2 surface), the orchestrator's protocol prose
-(Q3 / #1091 E), the structural deny of the blocking dialog (Q4) and the chat
-bridge (#947 / T1) sit on top of what is described here and extend this note as
-they land.*
+answer surface — plus, from #1091, the shape of the ask itself (slice A), the
+demo half of the same human-attention surface (slice B) and the protocol prose
+plus the liaison's pose gate (slice E). The NEEDS-YOU panel (#1091 C, the Q2
+surface), the structural deny of the blocking dialog (Q4) and the chat bridge
+(#947 / T1) sit on top of what is described here and extend this note as they
+land.*
 
 ## The problem
 
@@ -294,6 +295,8 @@ What is **not** here is the human's half:
   open-question invariant — mark the task blocked citing `q-N`, re-surface from
   `list_questions`, un-block only that task on the answer. Until it lands, an
   orchestrator's use of `ask_human` is guided by the tool description alone.
+  *(Delivered by #1091 slice E, below — this paragraph describes the state at
+  Q1's merge and is left as the record of it.)*
 - **The blocking dialog is still available.** Q4 adds it to the orchestrator's
   CLI deny tier, which is what makes the original incident impossible rather
   than merely discouraged.
@@ -365,3 +368,64 @@ NEEDS-YOU panel's DEMOS section (slice C) and the task-board marker + deep-link
 `tasks.json`, in the audit log, and to an MCP caller of `get_task` — **never**
 `list_tasks`, which deliberately omits it (above) — reachable, not yet
 surfaced.
+
+### Slice E: the protocol lives in the contract, and the liaison can pose
+
+Two changes, and they are one argument seen from each end of the pane pair that
+faces the human.
+
+**The orchestrator's half — a contract edit, not a tool-doc one.** Q1 shipped
+`ask_human` with a description written in the imperative and no template prose
+at all. That is the weakest place the rule could live: a tool description is
+read once, at listing time, and is among the first things a summary drops. The
+failure this feature exists to prevent is not "asked badly" — it is a CLI's own
+blocking question dialog holding the pane, which makes it take **no delivery at
+all**, so the stall is fleet-wide (#578). So `orchestrator.md` gains an
+**Asking the human** section carrying the prohibition, the consequence that
+makes it make sense, the six-step protocol and the authoring rules; INVARIANT 2
+gains the one sentence that survives a compaction; **Durability rules** adds
+`list_questions()` to the session-start reconcile, since a pending question
+outlives the process where a registered notification does not. Unconditional,
+never behind `{{WORKFLOW}}` — a group with no custom roster is exactly the group
+that would otherwise still be free to stall its own fleet. Re-blessed in the
+same commit (`tests/fixtures/pre222/README.md`).
+
+**The liaison's half — the pose gate widens.** `role_hint: liaison` blocks are
+`Role::Reviewer`, so before this the human's own pane could not call `ask_human`
+at all. Its only durable route for "the human should decide this later" was
+`message_orchestrator`, which becomes a registry row **only if the orchestrator
+independently chooses to open one** — orchestrator-controlled, and therefore not
+a path the human-facing pane has. `ask_human`'s dispatch gate and its listing
+therefore move from `require_orchestrator` to `require_orchestrator_or_liaison`,
+the same helper `group_usage` already uses (#891 S2), keyed on the same
+conjunction (`kind: reviewer` **and** `role_hint: liaison`) and reading a hint
+that is resolved from the group's roster rather than from anything a caller
+supplied.
+
+**What did NOT widen, and why each stayed put:**
+
+- **`withdraw_question` is still orchestrator-only.** Withdrawing *settles* a
+  row — any pending row, not only your own. The widening bought the human's pane
+  the ability to **add** to their inbox, never to decide what leaves it. A
+  liaison whose question is overtaken by events says so with
+  `message_orchestrator`, and the orchestrator withdraws.
+- **Nothing can answer one.** The trust boundary at the top of this note is
+  untouched: no answer tool exists, `AnswerSource` stays a closed enum supplied
+  by the entry point, and the widened tool is on the ASK side of a boundary that
+  was always drawn between asking and answering rather than between roles.
+- **The answer notice still goes to the orchestrator.** `answer_question`
+  delivers through `deliver_to_orchestrator` regardless of who asked, and this
+  slice deliberately does not change that: an answer's consequence is
+  un-blocking a board row, and only the orchestrator writes the board. The
+  asymmetry is stated in three places the reader will actually hit it — the
+  tool description, the liaison's own mechanics fragment ("`list_questions` is
+  how you see what became of yours") and the orchestrator's `{{LIAISON_NOTE}}`
+  ("`list_questions` will show questions you did not ask — read the `asker`") —
+  and is pinned by
+  `a_liaison_block_may_pose_a_question_to_the_human`, so a future change to the
+  routing reddens rather than quietly making that prose false.
+
+The capability argument for the grant itself, and why the "it only reads"
+reasoning that carried `group_usage` does **not** carry a write, is in
+`doc/design/liaison.md` — that note owns the enumeration of every hint-keyed
+exception, and a rule invisible there is the surprise it exists to prevent.

@@ -1554,6 +1554,14 @@ fn a_replace_mode_liaison_persona_still_gets_its_no_authority_mechanics() {
     pinned(at, &flat_doc, "already acted on is a duplicate", "a re-delivered kickoff must not become a second relay of one directive");
     pinned(at, &flat_doc, "serve status yourself", "answering 'how is it going' without costing the orchestrator a turn is the point");
     pinned(at, &flat_doc, "you never answer one", "every agent may ask and none may answer (#946) — the liaison is the pane most likely to be handed one and must know it presents, never settles");
+    // #1091 slice E — the pose-gate widening's prose half. Three claims, because
+    // the capability and its three edges are what a pane acts on: it may ask,
+    // never through a blocking dialog (the #578 failure the whole feature
+    // exists to remove), and the answer lands in the orchestrator's pane rather
+    // than its own.
+    pinned(at, &flat_doc, "ask_human` is yours too", "the liaison's own durable path to the human's inbox — without it, its only durable route is a relay the orchestrator may or may not choose to make a row");
+    pinned(at, &flat_doc, "never a blocking interactive dialog", "a modal on this pane takes no delivery at all — the rule the CLI-level deny enforces and this prose must not contradict");
+    pinned(at, &flat_doc, "goes to the orchestrator's pane and not yours", "answer_question delivers through deliver_to_orchestrator; a liaison told otherwise would sit waiting for a notice that is never coming");
 
     // The other half of the selection: a plain reviewer block in the SAME group, with
     // no hint, must read none of it — this is keyed on `role_hint`, not on the class.

@@ -616,6 +616,34 @@ so far:
   in a group that is neither autonomous nor in dangerous mode — is a separate mechanism question
   and is not here.
 
+- **#1091 slice E, the never-block question protocol** — `orchestrator.md` only (no other
+  role can put a question to the human; the liaison's half of the same rule is a `mod.rs`
+  fragment, which is not fixture-pinned). The question registry (#946 Q1) shipped its tools
+  and their descriptions and nothing else: no role template taught the protocol, so an
+  orchestrator's use of `ask_human` was guided by a tool description read once at listing
+  time. That is the wrong place for the rule the whole feature exists for, because the
+  failure it prevents is not "asked badly" — it is a CLI's own blocking question dialog
+  holding the pane, which makes it take no delivery at all and strands every agent reporting
+  to it (#578). So this is a **contract** edit, not a tool-doc one: a new **Asking the human**
+  section carrying the never-block rule and its consequence, the six-step protocol (ask → mark
+  the row `blocked` citing `q-N` → go do other work → un-block only that task on the answer
+  notice → re-surface from `list_questions()` rather than memory → withdraw generously), and
+  the question-authoring rules a human reading it away from the machine actually needs.
+  INVARIANT 2 gains the one sentence that makes the rule survive a summary, the MCP-tools
+  section gains the three tools, and **Durability rules** adds `list_questions()` to the
+  session-start reconcile — pending questions survive a restart where notifications do not.
+
+  Two existing passages are amended to agree rather than to repeat: **the open-question hold,
+  in practice** now says the `q-N` is what a blocked row cites, and **Monitoring open PRs**
+  re-raises from `list_questions()` rather than from memory. **Prototype → Proceed** step 2
+  gains `demo_path` and the rule that a demo is always a parked board row — an ad-hoc "I
+  prepped a worktree, take a look" ping survives neither a compaction nor a restart and leaves
+  the human nothing to press (#1091 slice B shipped the field).
+
+  Unconditional on purpose, and the alternative was considered and rejected: putting it behind
+  `{{WORKFLOW}}` would make never-block roster-dependent, so a group with no custom workflow
+  file — the default — would be the one still free to stall its own fleet.
+
 `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was` renders
 **these** with the six pre-#222 template variables and asserts that a group launched
 with the advanced orchestrator **off** gets exactly that text. They are the

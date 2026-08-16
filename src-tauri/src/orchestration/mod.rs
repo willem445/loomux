@@ -3581,7 +3581,18 @@ channel; keep the human oriented with short summaries."
              is the group's durable record of what the human has been asked, and it is yours \
              to read and to put in front of them — but no tool on your surface can settle a \
              row, by design, and neither your reply nor the orchestrator's is an answer. Carry \
-             the human's answer back verbatim and let the orchestrator act on it."
+             the human's answer back verbatim and let the orchestrator act on it.\n\
+             - **You may ADD to that record: `ask_human` is yours too.** Never a blocking \
+             interactive dialog — while one of those is on your screen this pane takes no \
+             delivery at all, and a question asked while the human was away has already \
+             stranded a whole fleet overnight. Use it for a decision the human should make \
+             LATER, or away from this pane: it returns an id immediately, survives your \
+             compact and a restart, and reaches them as a badged row rather than as scrollback \
+             they never scroll back to. A decision they are making with you RIGHT NOW is just \
+             the conversation — don't file it. Three things stay the orchestrator's: you write \
+             no board row, you cannot `withdraw_question`, and the `[loomux] answer to q-N` \
+             notice goes to the orchestrator's pane and not yours — `list_questions` is how \
+             you see what became of yours."
         ),
         _ => base,
     }
@@ -35175,6 +35186,13 @@ impl OrchRegistry {
                  human. When an answer reaches you through the liaison instead, settle the row \
                  yourself — `withdraw_question(q-N)` — rather than leaving a question the human \
                  has already answered sitting in their inbox.\n\
+                 - **`{id}` can open a row itself, and only you can close one.** It has \
+                 `ask_human` too, so `list_questions` will show questions you did not ask — \
+                 read the `asker`. It has no `withdraw_question` and the `[loomux] answer to \
+                 q-N` notice for its questions arrives in THIS pane, not its own: an answer to \
+                 a question `{id}` asked is one to act on and, where it settles something you \
+                 were holding, to un-block. A row of its that is overtaken by events reaches \
+                 you as a `message_orchestrator`, and withdrawing it is then yours.\n\
                  - **Status is its job, not a briefing you owe it.** `{id}` answers \"how is it \
                  going\" for itself, out of `list_tasks` / `get_task` / `list_agents` / \
                  `get_state` / `list_verdicts` and the group's audit log — read-only, and \

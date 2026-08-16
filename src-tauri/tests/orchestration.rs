@@ -23842,6 +23842,117 @@ fn the_orchestrator_contract_names_the_eligible_signal_and_its_partial_caveat() 
     );
 }
 
+/// **#1091 slice E — the never-block question protocol is in the CONTRACT.**
+///
+/// The question registry (#946 Q1) shipped its tools and their descriptions and
+/// no template prose at all, which put the rule the feature exists for in the
+/// weakest place available: a tool description is read once, at listing time,
+/// and is the first thing a summary drops. The failure it prevents is not
+/// "asked badly" — it is a CLI's own blocking dialog holding the pane, which
+/// makes it take no delivery at all and strands every agent reporting to it
+/// (#578).
+///
+/// Substance, not sentences, and each anchor is a DIFFERENT rule so a deletion
+/// reddens exactly one line here rather than being rescued by a neighbour: the
+/// tool that replaces the dialog, the prohibition itself, the consequence that
+/// makes the prohibition make sense, the durable re-read that survives a
+/// compaction, and the demo-park field. `{{HOLD_LABEL}}`-style placeholders are
+/// not involved — none of this is workflow-conditional, deliberately: behind
+/// `{{WORKFLOW}}` a group with no custom roster would be the one still free to
+/// stall its own fleet.
+#[test]
+fn the_orchestrator_contract_carries_the_never_block_question_protocol() {
+    for (anchor, why) in [
+        (
+            "Every question you put to the human goes through `ask_human`",
+            "orchestrator.md must name the tool that replaces the blocking dialog — a \
+             prohibition with no alternative beside it is one an orchestrator reasons its way \
+             around when it genuinely needs an answer (#946 Q1, #1091 slice E)",
+        ),
+        (
+            "Never through your CLI's own",
+            "orchestrator.md must prohibit the CLI's own interactive question dialog outright. \
+             The #946 Q4 deny makes it impossible on Claude; every other CLI is held by this \
+             sentence alone (#578)",
+        ),
+        (
+            "cannot take **any** delivery",
+            "orchestrator.md must say WHY a dialog is forbidden — that the pane stops taking \
+             deliveries, so the stall is fleet-wide and not the asker's own. Without the \
+             consequence the rule reads as a style preference (#578)",
+        ),
+        (
+            "never with your CLI's own interactive question dialog",
+            "INVARIANT 2 itself must carry the rule. The invariant block is the one part of \
+             this document a summary may never cost the orchestrator, and a never-block rule \
+             that lives only in a section below it is one a compaction can take (#578)",
+        ),
+        (
+            "*does* survive a restart",
+            "orchestrator.md must put `list_questions()` in the session-start reconcile and say \
+             what makes it different from the notifications beside it: a pending question \
+             outlives the process, so it is a hold that is still yours whether or not you \
+             remember opening it (#946 Q1)",
+        ),
+        (
+            "**A demo is ALWAYS a parked board row, never only a message.**",
+            "orchestrator.md must retire the ad-hoc `prepped a worktree, take a look` ping. It \
+             scrolls away, survives neither a compaction nor a restart, and leaves the human \
+             nothing to press (#1091 slice B, the demo-tracking scope addition)",
+        ),
+        (
+            "**record `demo_path`**",
+            "orchestrator.md must have the demo park record where the demo RUNS. loomux never \
+             guesses that path, so an unrecorded one leaves the human a Proceed button and no \
+             way to look at what they are proceeding on (#1091 slice B)",
+        ),
+    ] {
+        // Exactly once, for the reason `tests/workflow.rs`'s `pinned` helper
+        // enforces it: an anchor that occurs twice cannot detect the deletion of
+        // the rule it names, because the other occurrence rescues it — a pin you
+        // cannot make fail is a claim of coverage rather than coverage.
+        assert_eq!(
+            ORCHESTRATOR_TPL.matches(anchor).count(),
+            1,
+            "orchestrator.md must carry `{anchor}` exactly once: {why}"
+        );
+    }
+    // The protocol's ORDER is the part a summary destroys, and it is one
+    // sentence per step: ask, mark the row, go do other work, un-block only the
+    // one that was waiting. Pinned as the sequence rather than as five separate
+    // contains(), because "un-block ONLY the task" is a rule about which of
+    // several holds an answer releases and means nothing on its own.
+    let asking = ORCHESTRATOR_TPL
+        .split("## Asking the human")
+        .nth(1)
+        .expect("orchestrator.md must carry an `Asking the human` section")
+        .split("\n## ")
+        .next()
+        .unwrap();
+    for step in [
+        "Mark that task `blocked`",
+        "Go do other work",
+        "un-block **only** the task",
+        "Re-surface, don't re-ask",
+        "Withdraw generously",
+    ] {
+        assert!(
+            asking.contains(step),
+            "the ask-the-human protocol has lost the `{step}` step — the sequence is what makes \
+             an asked question a reason to switch tasks instead of a reason to idle (#946 Q3)"
+        );
+    }
+    // …and the authoring rules that make a question answerable away from the
+    // machine, which is the property the whole surface is built on.
+    for rule in ["by number", "allow_free_text", "One decision per question"] {
+        assert!(
+            asking.contains(rule),
+            "the ask-the-human section has lost `{rule}` — a question read away from this \
+             machine with no pane in front of it has to stand alone (#946 Q1, #1091 slice A)"
+        );
+    }
+}
+
 /// The PR half of that caveat (#795). Bounding the open-PR fetch too means a
 /// `PARTIAL` summary can now come from *either* listing, so the contract can no
 /// longer describe it as a statement about the backlog: it has to say what a
@@ -37179,12 +37290,19 @@ fn a_liaison_block_may_read_the_groups_usage() {
     assert!(text.contains("liaison"),
         "the refusal must name the rule it is applying, not just say no: {text}");
 
-    // THE WIDENING IS ONE TOOL WIDE. Every assertion above would also hold if
-    // the hint had promoted the liaison into the orchestrator tier wholesale —
+    // THE WIDENING IS NOT THE ORCHESTRATOR TIER. Every assertion above would
+    // also hold if the hint had promoted the liaison into that tier wholesale —
     // which would hand the human's pane `spawn_agent` and `send_prompt`, the
     // two tools the whole no-orchestration-authority argument rests on.
+    //
+    // `ask_human` was in this list until #1091 slice E widened it deliberately,
+    // and `withdraw_question` replaces it rather than the row simply being
+    // dropped: the two are the question registry's WRITE tier, so keeping its
+    // settling half here is what makes "the pose widened" a narrower claim than
+    // "the tier widened". `a_liaison_block_may_pose_a_question_to_the_human`
+    // owns the positive side.
     for orchestrator_only in
-        ["spawn_agent", "send_prompt", "kill_agent", "set_state", "ask_human", "queue_orphans"]
+        ["spawn_agent", "send_prompt", "kill_agent", "set_state", "withdraw_question", "queue_orphans"]
     {
         assert!(!names.contains(&orchestrator_only.to_string()),
             "the liaison holds no orchestration authority — {orchestrator_only} leaked: {names:?}");
@@ -37221,6 +37339,122 @@ fn a_liaison_block_may_read_the_groups_usage() {
         &json!({ "name": "group_usage", "arguments": {} })).unwrap();
     assert_eq!(refused["isError"], true,
         "the hint alone must never open this — the reviewer class is half the key");
+}
+
+/// **#1091 slice E — the liaison poses its own durable question.**
+///
+/// The second hint-keyed WIDENING, and the first that is a *write*. Before it,
+/// the pane the human is actually talking to had exactly one durable path for
+/// "the human should decide this later": `message_orchestrator`, which becomes
+/// a registry row only if the orchestrator independently chooses to open one —
+/// orchestrator-controlled, so not the human-facing pane's path at all. The
+/// widening makes the liaison's ask a `q-N` in the same `questions.json` the
+/// orchestrator's asks land in, with the same asker provenance.
+///
+/// Pinned in four directions, because a grant that is only pinned positively is
+/// indistinguishable from a tier promotion:
+///
+/// 1. The liaison CAN pose — at the gate, and the listing agrees.
+/// 2. A plain reviewer in the SAME group CANNOT — the hint is the only
+///    difference between the two blocks, so without this the test pins nothing
+///    about `liaison`.
+/// 3. The widening is the POSE only: `withdraw_question` still refuses it (it
+///    settles a row), and nothing on its surface can answer one.
+/// 4. The answer notice still goes to the ORCHESTRATOR's pane, not the asker's
+///    — `answer_question` delivers through `deliver_to_orchestrator` and this
+///    slice does not touch that. It is what the liaison's own prose promises,
+///    so a future change to the routing must redden here rather than quietly
+///    make that prose false.
+#[test]
+fn a_liaison_block_may_pose_a_question_to_the_human() {
+    let (reg, _d, _repo, gid) = liaison_group();
+    let liaison = reviewer_caller(&reg, &gid, "human");
+    let plain = reviewer_caller(&reg, &gid, "rev-security");
+    let orch = reg.spawn_agent(&gid, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let orch_id = orch.id.clone();
+    let orch = reg.resolve_token(&orch.token).unwrap();
+
+    // 1 — the gate, which is the real enforcement.
+    let out = dispatch(&reg, &liaison, "tools/call", &json!({
+        "name": "ask_human",
+        "arguments": { "text": "Ship the redesign this week, or hold it for the release?",
+                       "options": ["ship", "hold"], "task": "t-9" },
+    })).unwrap();
+    assert_eq!(out["isError"], false, "the liaison must be able to pose a question: {out:?}");
+    let reply = out["content"][0]["text"].as_str().unwrap();
+    assert!(reply.starts_with("q-1 registered"), "…and gets the id back immediately: {reply}");
+
+    // It landed in the SAME registry the orchestrator's questions land in,
+    // attributed to the liaison — not a parallel record, and not anonymous.
+    let qs = reg.questions(&gid).expect("questions.json readable");
+    assert_eq!(qs.len(), 1, "exactly one row: {qs:?}");
+    assert_eq!(qs[0].id, "q-1");
+    assert_eq!(qs[0].asker, liaison.agent_id, "the asker is the liaison, recorded not inferred");
+    assert_eq!(qs[0].task.as_deref(), Some("t-9"));
+    assert_eq!(qs[0].status, humanq::Status::Pending);
+    // …and the orchestrator reads it as an ordinary pending row of its own
+    // group's inbox, which is the whole point of one registry.
+    let listed = dispatch(&reg, &orch, "tools/call",
+        &json!({ "name": "list_questions", "arguments": {} })).unwrap();
+    let body: Value = serde_json::from_str(listed["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(body["questions"][0]["id"], "q-1");
+    assert_eq!(body["questions"][0]["asker"], liaison.agent_id);
+
+    // The listing agrees with the gate — a pane never shown a tool never calls
+    // it — and offers it EXACTLY once, the failure mode `group_usage`'s own pin
+    // names: two call sites for one shared definition, both reached.
+    let names = listed_tools(&reg, &liaison);
+    assert!(names.contains(&"ask_human".to_string()),
+        "a liaison must be OFFERED the tool, not merely permitted it: {names:?}");
+    assert_eq!(names.iter().filter(|n| *n == "ask_human").count(), 1,
+        "one definition, one listing per caller — never both call sites: {names:?}");
+
+    // 2 — THE NEGATIVE CONTROL. Same class, same group, same registry; the hint
+    // is the only difference. Without this, every assertion above would hold in
+    // a build that had simply made `ask_human` shared with every reviewer.
+    let plain_names = listed_tools(&reg, &plain);
+    assert!(!plain_names.contains(&"ask_human".to_string()),
+        "a plain reviewer must not even see it: {plain_names:?}");
+    let denied = dispatch(&reg, &plain, "tools/call", &json!({
+        "name": "ask_human", "arguments": { "text": "may I?" },
+    })).unwrap();
+    assert_eq!(denied["isError"], true, "…and must be refused at the gate, not only unlisted");
+    let text = denied["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("liaison"),
+        "the refusal must name the rule it is applying: {text}");
+    // The refusal names THIS capability, not the other caller's. One shared gate
+    // whose message was written for `group_usage` would tell a reviewer refused
+    // `ask_human` that usage aggregation is orchestrator-only.
+    assert!(text.contains("posing a question to the human"),
+        "the refusal must name what was refused: {text}");
+    assert_eq!(reg.questions(&gid).unwrap().len(), 1, "a refused ask registers nothing");
+
+    // 3 — THE WIDENING IS THE POSE ONLY. Withdrawal settles a row — any pending
+    // row, not just your own — and stays the orchestrator's.
+    let refused = dispatch(&reg, &liaison, "tools/call", &json!({
+        "name": "withdraw_question", "arguments": { "id": "q-1" },
+    })).unwrap();
+    assert_eq!(refused["isError"], true, "a liaison must not settle a row it opened");
+    assert!(refused["content"][0]["text"].as_str().unwrap().contains("orchestrator-only"),
+        "…and the refusal says why: {refused:?}");
+    assert!(!names.contains(&"withdraw_question".to_string()),
+        "…and it is not even offered: {names:?}");
+    assert_eq!(reg.questions(&gid).unwrap()[0].status, humanq::Status::Pending,
+        "the refused withdraw settled nothing");
+
+    // 4 — THE ANSWER STILL REACHES THE ORCHESTRATOR, not the asker. Un-blocking
+    // the work is what an answer is for, and only the orchestrator writes the
+    // board; the liaison's own prose tells it to re-read `list_questions`
+    // instead, so this routing is a promise and not an accident.
+    pause_with_pane(&reg, &gid, &orch_id, 7);
+    reg.answer_question(&gid, "q-1", "hold it", humanq::AnswerSource::Webview)
+        .expect("the webview may answer a liaison's question exactly as it answers any other");
+    let texts = delivered_texts(&reg, &gid);
+    assert!(
+        texts.iter().any(|t| t.contains("[loomux] answer to q-1 (via webview): hold it")),
+        "the answer notice goes to the orchestrator's pane: {texts:?}"
+    );
+    assert_eq!(reg.questions(&gid).unwrap()[0].status, humanq::Status::Answered);
 }
 
 #[test]
@@ -48574,15 +48808,23 @@ fn ask_human_registers_a_pending_question_and_answers_the_caller_immediately() {
     assert_eq!(opened[0].actor, orch_id);
 }
 
-/// **The write tools are orchestrator-only at the DISPATCH gate**, and the
-/// read tool is deliberately not.
+/// **The write tools refuse a delegate at the DISPATCH gate**, and the read
+/// tool is deliberately not.
 ///
 /// The role-filtered listing is cosmetic — a tool omitted from a listing is
 /// still callable by name — so what matters is that a worker's *call* is
 /// refused. `list_questions` is shared on purpose: a delegate reading that a
 /// question it depends on is already outstanding is the opposite of a leak.
+///
+/// Named for the DELEGATE it refuses rather than for the tier it admits, since
+/// #1091 slice E: the two write tools are no longer gated alike — `ask_human`
+/// is the orchestrator's plus a `liaison`-hinted reviewer's, `withdraw_question`
+/// the orchestrator's alone. A plain worker, which is what this test drives, is
+/// refused both either way. `a_liaison_block_may_pose_a_question_to_the_human`
+/// owns the hint-keyed half, including the negative control that a *hintless*
+/// reviewer is refused too.
 #[test]
-fn the_question_write_tools_are_orchestrator_only_and_the_dispatch_check_is_the_gate() {
+fn the_question_write_tools_refuse_a_delegate_and_the_dispatch_check_is_the_gate() {
     let (reg, _d, g, co, cw, _) = setup_questions();
     q_call(&reg, &co, "ask_human", json!({ "text": "A or B?" }));
 
