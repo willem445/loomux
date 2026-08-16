@@ -9012,6 +9012,20 @@ pub struct Task {
     /// metadata-only stance: it labels a row, it never authorizes anything.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
+    /// Worktree path where a demo of this item lives (#1091 slice B) — set on
+    /// a `prototype`/`human-testing` row so the panel/board can tell the human
+    /// exactly where to run it, instead of guessing from an assignee's roster
+    /// cwd (D7: explicit beats inferred — the orchestrator prepping the demo
+    /// often uses an integration-branch worktree no worker's cwd names). Same
+    /// additive/skipped-when-absent, empty-string-clears contract as `pr`: a
+    /// pre-#1091 board loads with no key, and `None` here means "no path
+    /// recorded", never "there is no demo".
+    ///
+    /// DISPLAY METADATA ONLY, the `pr_base` rule applied here: nothing gates on
+    /// it, and it is agent-written, so a stale or wrong value misleads a human
+    /// rather than opening anything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub demo_path: Option<String>,
     #[serde(default)]
     pub updated_ms: u64,
 }
@@ -9536,6 +9550,9 @@ pub struct TaskPatch {
     /// Advisory Agile level (#958) — one of `TASK_KINDS`, with the same
     /// untouched/empty-clears rule as `parent`.
     pub kind: Option<String>,
+    /// Worktree path for a demo of this item (#1091 slice B) — same
+    /// untouched/empty-clears rule as `pr`/`pr_base`. See `Task::demo_path`.
+    pub demo_path: Option<String>,
     /// Atomic claim (#582): guard this write on the task still being
     /// unclaimed, `queued`, and dep-satisfied, then set assignee + status in
     /// the same locked write. A plain (non-claim) upsert keeps its historic
@@ -24533,6 +24550,7 @@ impl OrchRegistry {
                     related: vec![],
                     parent: None,
                     kind: None,
+                    demo_path: None,
                     updated_ms: 0,
                 });
                 tasks.len() - 1
@@ -24696,6 +24714,9 @@ impl OrchRegistry {
         }
         if patch.pr_base.is_some() {
             task.pr_base = patch.pr_base.filter(|s| !s.trim().is_empty());
+        }
+        if patch.demo_path.is_some() {
+            task.demo_path = patch.demo_path.filter(|s| !s.trim().is_empty());
         }
         if patch.assignee.is_some() {
             task.assignee = patch.assignee.filter(|s| !s.trim().is_empty());
@@ -47994,6 +48015,10 @@ pub async fn orch_upsert_task(
     // deserializes to `None`, which is "leave it alone" in `TaskPatch`.
     parent: Option<String>,
     kind: Option<String>,
+    // #1091 slice B: same additive contract, for the human board's own
+    // demo_path edits (the orchestrator sets it through the MCP `upsert_task`
+    // tool's own arm — see `mcp.rs`).
+    demo_path: Option<String>,
 ) -> Result<Task, String> {
     let reg = reg_of(&app);
     let group_id = command_group(&group_id)?;
@@ -48002,7 +48027,7 @@ pub async fn orch_upsert_task(
             &group_id,
             "human",
             id.as_deref(),
-            TaskPatch { title, status, note, deps, parent, kind, ..Default::default() },
+            TaskPatch { title, status, note, deps, parent, kind, demo_path, ..Default::default() },
         )?;
         reg.notify_board_edit(&group_id, &format!("{} \"{}\" is now {}", task.id, task.title, task.status));
         Ok(task)

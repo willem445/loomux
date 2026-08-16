@@ -229,3 +229,54 @@ That is acceptable only because of the property the whole design is built on:
 asking never blocks. A question with no answer path costs a pending row and an
 unresolved decision — not a stalled fleet. It is still the reason Q2 should
 follow closely rather than eventually.
+
+## #1091: one human-attention surface, questions plus demos
+
+#1091 folds a second kind of "needs the human" item — a **demo item** — into
+the same NEEDS-YOU panel this registry feeds, per the human's demo-tracking
+scope addition on the issue. A demo item is deliberately **not** a second
+registry: it is a projection of the existing task board, in a demo-gated
+status (`prototype` or `human-testing`). The record stays `tasks.json`; this
+registry's `questions.json` is untouched by it. See #582/#958's `Task`
+doc-comments for the rest of the board's own contract — this section covers
+only what #1091 slice B adds to it.
+
+### `Task.demo_path` (slice B)
+
+One additive, optional field: `demo_path: Option<String>` — the worktree path
+where a demo of that task lives, e.g. `C:/Projects/loomux-worktrees/feat/x`.
+Same `#[serde(default, skip_serializing_if = "Option::is_none")]` contract as
+every other optional `Task` field added after the type's first release, so a
+pre-#1091 `tasks.json` loads with the key simply absent, and a board that never
+sets it rewrites without gaining the key.
+
+**Explicit beats inferred.** The alternative — deriving a demo location from
+the assignee's roster row (its `cwd`) — was rejected: the orchestrator
+preparing a demo often does so from an integration-branch worktree that no
+single worker's `cwd` names, and inferring would need a new read command plus
+its own ACL and perf-manifest entry to serve a worse answer than the
+orchestrator just recording the path it knows. `demo_path` is DISPLAY METADATA
+ONLY, the same posture as `pr_base` (#581): nothing gates on it, and a stale or
+wrong value misleads a human rather than opening anything.
+
+Set through the same two surfaces every other task field goes through — no new
+tool, no new command:
+
+- **MCP** `upsert_task(..., demo_path?)` — the orchestrator's write path,
+  same untouched/empty-clears rule as `pr`/`pr_base` (omit to leave it,
+  `""` to clear).
+- **Tauri** `orch_upsert_task(..., demo_path?)` — the human board's own edit
+  path, additive like the `parent`/`kind` args #958 added before it.
+
+Deliberately **not** added to `TaskSummary` — the compact row `list_tasks`
+returns (#245's size constraint: that row stays minimal by construction, and
+slice B's plan never asked to widen it). A caller that needs
+`demo_path` reads the full record: `get_task` (MCP) or `orch_tasks` (the human
+board's own Tauri read, already full `Task`s) — so the panel this field exists
+for (slice C, not yet built) needs no new read surface either.
+
+**What slice B does not build.** No UI renders `demo_path` yet — that is the
+NEEDS-YOU panel's DEMOS section (slice C) and the task-board marker + deep-link
+(slice G). Until either lands, a recorded `demo_path` is visible only in
+`tasks.json`, in the audit log, and to any MCP caller of `get_task`/`list_tasks`
+— reachable, not yet surfaced.
