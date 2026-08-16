@@ -250,6 +250,10 @@ export const MERGE_QUEUE_MAX_BATCH_MIN = 1;
 /** A threshold gate needs at least one passing review — `fact("gate.threshold", "min", 1)`
  *  on the engine, and the floor `validateWorkflow` has always enforced. */
 export const GATE_THRESHOLD_MIN = 1;
+/** The small-batch clause's floor — `fact("gate.max_diff_lines", "min", 1)` on the
+ *  engine. `0` is refused rather than read as "unlimited": the way to mean no limit is
+ *  to omit the key, and a bound that bounds nothing is a typo (#1174). */
+export const GATE_MAX_DIFF_LINES_MIN = 1;
 /** `checks_timeout_minutes` is the one policy number the engine CLAMPS rather than
  *  refuses (`clamp_expires_minutes`), so a value outside this range is a warning here,
  *  not an error: the file loads, it just doesn't do what it says. */
@@ -283,6 +287,9 @@ export const POLICY_BOUNDS: Readonly<Record<string, FieldBounds>> = {
   // bounded above by the reviewer list rather than by a constant — which
   // `validateWorkflow` checks against the list itself, where the real answer is.
   "gate.threshold": { min: GATE_THRESHOLD_MIN },
+  // No ceiling: "how big is too big" is the repo's call, and the engine invents no
+  // upper bound for it either (#1174).
+  "gate.max_diff_lines": { min: GATE_MAX_DIFF_LINES_MIN },
   // No ceiling, deliberately: `parse_workflow` refuses `max_batch: 0` and accepts every
   // integer above it, so the form must too.
   "merge_queue.max_batch": { min: MERGE_QUEUE_MAX_BATCH_MIN },
@@ -380,6 +387,10 @@ export interface MergeGate {
   reviewers: string[];
   /** Extra conditions (`ci-green`, …) — passed through; the backend owns their meaning. */
   also: string[];
+  /** The small-batch clause (#1174): the largest PR, in changed lines, the gate lets
+   *  through. Absent = no limit, and absent is kept apart from any number here — a
+   *  `0` this pane invented would be a file the engine refuses. */
+  max_diff_lines?: number;
 }
 
 export interface WorkflowGates {
@@ -482,6 +493,7 @@ export type FindingCode =
   | "gate-unknown-reviewer"
   | "gate-not-a-reviewer"
   | "gate-bad-threshold"
+  | "gate-bad-max-diff-lines"
   | "isolated-block"
   | "unreachable-block"
   | "no-entry-block"
@@ -1188,6 +1200,7 @@ function emitGatesLines(w: Workflow, order: Map<string, number>): string[] {
     if (gate.threshold !== undefined) out.push(`    threshold: ${gate.threshold}`);
     out.push(`    reviewers: [${sortByBlocks(gate.reviewers, order).map(emitScalar).join(", ")}]`);
     if (gate.also.length) out.push(`    also: [${gate.also.map(emitScalar).join(", ")}]`);
+    if (gate.max_diff_lines !== undefined) out.push(`    max_diff_lines: ${gate.max_diff_lines}`);
   }
   out.push(...extraLines(w.gates.extra, "  "));
   return out;
@@ -2183,6 +2196,17 @@ function readGate(raw: YamlValue, findings: Finding[]): MergeGate {
     Array.isArray(v) ? v.map((x) => asString(x) ?? "").filter(Boolean) : [];
   gate.reviewers = list(r.reviewers ?? []);
   gate.also = list(r.also ?? []);
+  // #1174. Read the same way `threshold` is — a non-number is a finding, never a
+  // coerced value — because `MergeGate` has no unknown-key bag: a key this function
+  // does not read is a line the next form edit DELETES.
+  if (typeof r.max_diff_lines === "number") gate.max_diff_lines = r.max_diff_lines;
+  else if (r.max_diff_lines !== undefined) {
+    findings.push({
+      severity: "error",
+      code: "gate-bad-max-diff-lines",
+      message: `gates.merge.max_diff_lines must be a number (found "${String(r.max_diff_lines)}").`,
+    });
+  }
   return gate;
 }
 
@@ -2404,6 +2428,21 @@ export function validateWorkflow(w: Workflow, knobs?: KnobLookup): Finding[] {
           code: "gate-not-a-reviewer",
           message: `The merge gate names "${id}" as a reviewer, but that block is a liaison — it presents the human's questions and never records a verdict, so the gate could never open.`,
           blockId: id,
+        });
+      }
+    }
+    // #1174. UNCONDITIONAL — unlike `threshold`, which is only meaningful under
+    // `require: threshold` and so is only checked there. This clause has no mode to
+    // hide behind: a `max_diff_lines: 0` is a file the engine refuses whatever else
+    // the gate says, and a pane that stayed quiet about it would be blessing a
+    // workflow that will not load.
+    if (gate.max_diff_lines !== undefined) {
+      const n = gate.max_diff_lines;
+      if (!Number.isInteger(n) || n < GATE_MAX_DIFF_LINES_MIN) {
+        findings.push({
+          severity: "error",
+          code: "gate-bad-max-diff-lines",
+          message: `max_diff_lines: ${n} — a merge gate's size limit must be a whole number ≥ ${GATE_MAX_DIFF_LINES_MIN}. Omit the key to declare no limit; 0 is refused, not read as "unlimited".`,
         });
       }
     }

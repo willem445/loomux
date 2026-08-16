@@ -253,7 +253,14 @@
           "name": "also",
           "type": "string-list",
           "default": [],
-          "help": "Extra conditions, e.g. \"ci-green\", \"body-unchanged\". The backend owns what each one means."
+          "help": "Extra conditions, e.g. \"ci-green\", \"body-unchanged\", \"base-green\". The backend owns what each one means, and a condition this build cannot check refuses the merge rather than being ignored."
+        },
+        {
+          "name": "max_diff_lines",
+          "type": "number",
+          "min": 1,
+          "on_out_of_range": "refuse",
+          "help": "The largest PR, in changed lines (additions + deletions), this gate will let through. Omit the key for no limit — 0 is refused, because a bound that bounds nothing is a typo. A PR whose size cannot be read is refused too."
         }
       ]
     },

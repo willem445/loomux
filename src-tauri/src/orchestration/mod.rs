@@ -33731,6 +33731,10 @@ impl OrchRegistry {
                 },
                 "reviewers": g.reviewers,
                 "also": g.also,
+                // #1174. `null` when undeclared — the pane keeps "no limit"
+                // apart from any number, so the chip never announces a clause
+                // this repo did not write.
+                "max_diff_lines": g.max_diff_lines,
                 "satisfiable": missing.is_empty(),
                 "missing_blocks": missing,
             })

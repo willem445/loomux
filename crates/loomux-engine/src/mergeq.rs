@@ -1397,6 +1397,33 @@ mod tests {
     }
 
     #[test]
+    fn every_condition_this_build_claims_to_know_is_one_the_queue_can_actually_check() {
+        // The trap this closes, which is silent in the direction that hurts: adding a
+        // token to `KNOWN_CONDITIONS` teaches the SHIM's `case` and leaves this
+        // function's `else` chain behind, so `condition_supported` answers yes while
+        // the queue refuses every landing with `Unsupported`. Fail-closed, and still
+        // a build in which a declared clause makes the merge queue unusable.
+        //
+        // Driven over the constant itself, so a fourth condition is red here rather
+        // than discovered by the first repo that declares it.
+        let v: BTreeMap<_, _> = [verdict("rev-a", Verdict::Pass, "NEW", "d")].into();
+        let all_satisfied = PrObservation {
+            body_digest: Some("d".into()),
+            ci_green: Some(true),
+            base_green: Some(true),
+            changed_lines: Some(1),
+        };
+        for c in crate::workflow::KNOWN_CONDITIONS {
+            let g = GateSpec::Declared(gate(&["rev-a"], &[c]));
+            assert_eq!(
+                recheck_gate(&g, &v, Some("NEW"), &all_satisfied),
+                GateRecheck::Ok,
+                "the queue has no arm for {c:?}, which this build reports as supported"
+            );
+        }
+    }
+
+    #[test]
     fn base_green_refuses_a_landing_onto_a_base_the_queue_cannot_call_healthy() {
         // #1174. The queue PUSHES to the base, so this clause is about the ref
         // it is about to write, not about the PR — which is why the queue has to

@@ -1070,6 +1070,54 @@ test("a gate that could never open is an error, not a runtime surprise", () => {
   assert.deepEqual(codes(validateWorkflow(good)), []);
 });
 
+test("the small-batch clause survives a round trip and refuses a limit that limits nothing (#1174)", () => {
+  // `MergeGate` has NO unknown-key bag, so a gate key the parser does not read is a
+  // line the next form edit silently DELETES. That is the failure this covers, and
+  // it is why the assertion is a round trip rather than a parse.
+  const text = `version: 1
+blocks:
+  - id: worker
+    kind: worker
+    cli: claude
+  - id: reviewer
+    kind: reviewer
+    cli: claude
+gates:
+  merge:
+    require: all-pass
+    reviewers: [reviewer]
+    max_diff_lines: 800
+`;
+  const parsed = parseWorkflow(text).workflow;
+  assert.equal(parsed.gates.merge!.max_diff_lines, 800);
+  const round = parseWorkflow(serializeWorkflow(parsed)).workflow;
+  assert.equal(round.gates.merge!.max_diff_lines, 800, "a save must not drop the limit");
+  assert.deepEqual(codes(validateWorkflow(parsed)), [], "a declared limit is a clean file");
+
+  // Undeclared stays undeclared — the emitter writes no line, so opening the gate
+  // form on a repo with no limit cannot invent one.
+  const none = starterWorkflow();
+  assert.equal(none.gates.merge!.max_diff_lines, undefined);
+  assert.ok(!serializeWorkflow(none).includes("max_diff_lines"));
+
+  // 0 is a file the ENGINE refuses, so the pane must say so rather than bless it.
+  const zero = starterWorkflow();
+  zero.gates.merge!.max_diff_lines = 0;
+  assert.ok(has(validateWorkflow(zero), "gate-bad-max-diff-lines"));
+  const fractional = starterWorkflow();
+  fractional.gates.merge!.max_diff_lines = 1.5;
+  assert.ok(has(validateWorkflow(fractional), "gate-bad-max-diff-lines"));
+  // …and a positive whole number is clean, so the two assertions above cannot be
+  // passing against a rule that simply flags everything.
+  const ok = starterWorkflow();
+  ok.gates.merge!.max_diff_lines = 1;
+  assert.deepEqual(codes(validateWorkflow(ok)), []);
+
+  // A non-number in the FILE is a finding at parse time, never a coerced value.
+  const bad = parseWorkflow(text.replace("max_diff_lines: 800", "max_diff_lines: eight"));
+  assert.ok(bad.findings.some((f) => f.code === "gate-bad-max-diff-lines"));
+});
+
 test("a block declaring both a prompt and a profile is ambiguous", () => {
   const w = starterWorkflow();
   w.blocks[2]!.prompt = "Review the auth path.";
