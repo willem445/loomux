@@ -567,10 +567,26 @@ fn tool_defs(
             // routes it through `message_orchestrator`, so there is one funnel
             // and one authoring standard for what a human is asked.
             tool("ask_human",
-                "Put a question to the human WITHOUT BLOCKING, and keep orchestrating. This returns a question id IMMEDIATELY — it does not wait for an answer and never can. USE THIS INSTEAD OF YOUR CLI'S OWN INTERACTIVE QUESTION DIALOG, always: while such a dialog is on your screen this pane cannot take ANY delivery, so every worker report, review verdict and merge request queues behind it — one question asked while the human is away has already stalled a whole fleet overnight, and that incident is why this tool exists. After calling it: mark the affected board task `blocked` citing the returned id, then GO DO OTHER WORK — review, dispatch, merge, everything not gated on this answer. The answer arrives later as a `[loomux] answer to q-N (via <source>): …` notice typed into this pane, at which point you un-block ONLY the task that was waiting on it. If nothing arrives, the question simply stays pending: read `list_questions` (it survives a /compact and an app restart, so it is your memory of what is outstanding, not your context), re-surface it in your next status update, and keep working. WHAT MAKES A GOOD QUESTION: self-contained — the human may read it away from the machine, with no pane in front of them. State the decision you need and what turns on it; cite the issue or PR by number for the detail rather than pasting diffs, file contents or logs; never include secrets. Give `options` when the decision really is a choice between named alternatives — it is what lets an answering surface offer buttons instead of prose. Give `task` so the answer can be tied back to the board row it releases. You cannot answer your own question, and neither can any other agent: answers only ever enter through surfaces the human controls.",
+                "Put a question to the human WITHOUT BLOCKING, and keep orchestrating. This returns a question id IMMEDIATELY — it does not wait for an answer and never can. USE THIS INSTEAD OF YOUR CLI'S OWN INTERACTIVE QUESTION DIALOG, always: while such a dialog is on your screen this pane cannot take ANY delivery, so every worker report, review verdict and merge request queues behind it — one question asked while the human is away has already stalled a whole fleet overnight, and that incident is why this tool exists. After calling it: mark the affected board task `blocked` citing the returned id, then GO DO OTHER WORK — review, dispatch, merge, everything not gated on this answer. The answer arrives later as a `[loomux] answer to q-N (via <source>): …` notice typed into this pane, at which point you un-block ONLY the task that was waiting on it. If nothing arrives, the question simply stays pending: read `list_questions` (it survives a /compact and an app restart, so it is your memory of what is outstanding, not your context), re-surface it in your next status update, and keep working. WHAT MAKES A GOOD QUESTION: self-contained — the human may read it away from the machine, with no pane in front of them. State the decision you need and what turns on it; cite the issue or PR by number for the detail rather than pasting diffs, file contents or logs; never include secrets. Give `options` when the decision really is a choice between named alternatives — it is what lets an answering surface offer buttons instead of prose — and give each one a `description` when the label alone does not carry the trade-off. THE HUMAN CAN ALWAYS TYPE THEIR OWN ANSWER INSTEAD: your options are the alternatives you thought of, and the one that matters is often the one you did not list, so leave `allow_free_text` at its default unless the options are genuinely exhaustive. Use `select: \"multi\"` only when the ask really is \"which of these\" rather than \"which one\". Give `task` so the answer can be tied back to the board row it releases. You cannot answer your own question, and neither can any other agent: answers only ever enter through surfaces the human controls.",
                 json!({
                     "text": { "type": "string", "description": "The question, self-contained and standing on its own away from this machine. Max 2000 characters — this is a decision to ask, not a briefing to paste; cite issue/PR numbers for the context." },
-                    "options": { "type": "array", "items": { "type": "string" }, "description": "Named alternatives, when the decision is a choice between them (max 8, 200 characters each). Omit for an open question — do not invent options to fill the field." },
+                    "options": {
+                        "type": "array",
+                        // A bare string OR {label, description?} — the string
+                        // form is what Q1 took and is still what gets stored
+                        // when there is no description, so an old caller's
+                        // call shape is unchanged (#1091).
+                        "items": { "anyOf": [
+                            { "type": "string" },
+                            { "type": "object", "properties": {
+                                "label": { "type": "string" },
+                                "description": { "type": "string" },
+                            }, "required": ["label"] }
+                        ] },
+                        "description": "Named alternatives, when the decision is a choice between them (max 8). Each is either a bare string, or {\"label\": \"…\", \"description\": \"…\"} when the label alone does not carry what picking it costs — label max 200 characters, description max 500 (the trade-off in a line, not the case for it; cite the issue or PR for that). Omit for an open question — do not invent options to fill the field.",
+                    },
+                    "select": { "type": "string", "enum": ["single", "multi"], "description": "How many of your options the human may pick. Default \"single\" — a question is a decision. \"multi\" when the ask really is \"which of these\" rather than \"which one\". Needs `options` (it describes them); an unrecognized value is rejected, never treated as single." },
+                    "allow_free_text": { "type": "boolean", "description": "Whether the human may type their own answer instead of picking one of your options. DEFAULT TRUE, and leaving it there is almost always right — the answer worth having is often the alternative you did not think to list. Pass false only when your options are genuinely exhaustive; it needs `options`, because a question offering neither options nor free text leaves the human nothing to answer with." },
                     "task": { "type": "string", "description": "The board task id this question is holding up, e.g. \"t-7\". Record it whenever there is one: it is what lets the answer release exactly one task instead of leaving you to work out which." },
                     "urgency": { "type": "string", "enum": ["normal", "high"], "description": "How loudly this should reach the human. Default \"normal\". An unrecognized value is rejected, never treated as normal." },
                 }),
@@ -798,16 +814,6 @@ fn arg_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
 /// link, and quietly leaving the old array in place would tell it the write
 /// succeeded while the board disagreed.
 fn arg_str_array(args: &Value, key: &str) -> Result<Option<Vec<String>>, String> {
-    arg_str_array_of(args, key, "task-id strings")
-}
-
-/// [`arg_str_array`] with the element noun spelled by the caller (#946).
-///
-/// Split out rather than generalized in place because the message is the
-/// useful half: `options must be an array of task-id strings` sends an agent
-/// looking for a board problem in a question it was asking. The `deps`/
-/// `related` wording is unchanged, byte for byte, by delegating above.
-fn arg_str_array_of(args: &Value, key: &str, noun: &str) -> Result<Option<Vec<String>>, String> {
     match args.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::Array(items)) => items
@@ -815,11 +821,11 @@ fn arg_str_array_of(args: &Value, key: &str, noun: &str) -> Result<Option<Vec<St
             .map(|v| {
                 v.as_str()
                     .map(str::to_string)
-                    .ok_or_else(|| format!("{key} must be an array of {noun}"))
+                    .ok_or_else(|| format!("{key} must be an array of task-id strings"))
             })
             .collect::<Result<Vec<String>, String>>()
             .map(Some),
-        Some(_) => Err(format!("{key} must be an array of {noun}")),
+        Some(_) => Err(format!("{key} must be an array of task-id strings")),
     }
 }
 
@@ -847,10 +853,60 @@ fn arg_str_strict<'a>(args: &'a Value, key: &str) -> Result<Option<&'a str>, Str
 /// is an error rather than a defaulted `false`, so `"claim": "true"` can never
 /// read as "no claim requested" and hand the same task out twice.
 fn arg_bool(args: &Value, key: &str) -> Result<bool, String> {
+    Ok(arg_bool_opt(args, key)?.unwrap_or(false))
+}
+
+/// [`arg_bool`] for a flag whose default is not `false` (#1091:
+/// `allow_free_text`). Absent or null is `None` — "the caller said nothing" —
+/// which is a different fact from `Some(false)` when the default is `true`,
+/// and the only one of the two that may be silently defaulted. The
+/// wrong-type refusal is the same, byte for byte, by delegating below.
+fn arg_bool_opt(args: &Value, key: &str) -> Result<Option<bool>, String> {
     match args.get(key) {
-        None | Some(Value::Null) => Ok(false),
-        Some(Value::Bool(b)) => Ok(*b),
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(b)) => Ok(Some(*b)),
         Some(_) => Err(format!("{key} must be true or false")),
+    }
+}
+
+/// `ask_human`'s `options` (#1091): each item is a bare string, or an object
+/// `{label, description?}`. Absent or null is `None`, like every other
+/// optional array here.
+///
+/// Hand-parsed rather than handed to serde's untagged deserializer because an
+/// untagged enum that matches nothing reports only "data did not match any
+/// variant", which tells an orchestrator neither which item was wrong nor what
+/// the shapes are. Every refusal below names the shape it wanted; bounds and
+/// emptiness are `validate_ask`'s, not repeated here.
+fn arg_option_specs(args: &Value, key: &str) -> Result<Option<Vec<super::humanq::OptionSpec>>, String> {
+    const SHAPE: &str = "must be an array of answer-option strings, or objects \
+                         {\"label\": \"…\", \"description\": \"…\"}";
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|item| match item {
+                Value::String(s) => Ok(super::humanq::OptionSpec::Plain(s.clone())),
+                Value::Object(map) => {
+                    let label = map
+                        .get("label")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| format!("each {key} object needs a string \"label\""))?
+                        .to_string();
+                    let description = match map.get("description") {
+                        None | Some(Value::Null) => String::new(),
+                        Some(Value::String(d)) => d.clone(),
+                        Some(_) => {
+                            return Err(format!("an {key} \"description\" must be a string"))
+                        }
+                    };
+                    Ok(super::humanq::OptionSpec::Detailed { label, description })
+                }
+                _ => Err(format!("{key} {SHAPE}")),
+            })
+            .collect::<Result<Vec<_>, String>>()
+            .map(Some),
+        Some(_) => Err(format!("{key} {SHAPE}")),
     }
 }
 
@@ -981,13 +1037,19 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                 Some(u) => super::humanq::Urgency::parse(u)?,
                 None => super::humanq::Urgency::default(),
             };
-            let options = arg_str_array_of(args, "options", "answer-option strings")?.unwrap_or_default();
+            let options = arg_option_specs(args, "options")?.unwrap_or_default();
+            let select = match arg_str_strict(args, "select")? {
+                Some(s) => Some(super::humanq::Select::parse(s)?),
+                None => None,
+            };
             let q = reg.ask_human(
                 &caller.group,
                 &caller.agent_id,
                 super::humanq::AskRequest {
                     text: text.to_string(),
                     options,
+                    select,
+                    allow_free_text: arg_bool_opt(args, "allow_free_text")?,
                     task: arg_str_strict(args, "task")?.map(str::to_string),
                     urgency,
                 },

@@ -81,8 +81,14 @@ pub const QUESTIONS_FILE: &str = "questions.json";
 /// #947) into a chat message.
 pub const QUESTION_TEXT_MAX: usize = 2000;
 
-/// Longest single suggested answer.
+/// Longest single suggested answer — the option's LABEL, which is also the
+/// text an answering surface quotes back verbatim as the human's answer.
 pub const OPTION_TEXT_MAX: usize = 200;
+
+/// Longest per-option description (#1091). Wider than the label because this is
+/// where the trade-off goes — "what you give up by picking this" — while the
+/// label stays short enough to sit on a button.
+pub const OPTION_DESC_MAX: usize = 500;
 
 /// Most suggested answers one question may carry. A question needing more than
 /// this is a question that has not been decided down to a choice yet.
@@ -174,6 +180,108 @@ impl Urgency {
     }
 }
 
+/// One named alternative on a question — a bare string, or a label with the
+/// reasoning behind it (#1091).
+///
+/// **Untagged, and a description-less option is normalized back to
+/// [`OptionSpec::Plain`] before it is stored.** Both halves matter:
+/// untagged means a `questions.json` written by the Q1 build — where every
+/// option was a bare string — parses unchanged, so nothing migrates; and
+/// normalizing on the way in means a richer build writing an option that
+/// carries no description writes a bare string too, rather than quietly
+/// changing the shape of every file it touches. The object form appears on
+/// disk exactly when a description was actually given.
+///
+/// The reverse is deliberately not promised: an OLD build reading a NEW file
+/// that does carry an object option fails its parse *loudly* (the read posture
+/// this module's `questions()` doc argues for) rather than dropping the row.
+/// Downgrade safety was never on offer here — losing a pending question the
+/// human has not answered is the one failure the registry exists to prevent,
+/// and a loud refusal is how it is prevented.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum OptionSpec {
+    /// `"ship it here"` — the Q1 shape, and still the stored shape whenever
+    /// there is no description to carry.
+    Plain(String),
+    /// `{"label": "ship it here", "description": "one review, bigger diff"}`.
+    Detailed {
+        label: String,
+        /// Absent in the wire form is the same as empty, and an empty one is
+        /// normalized to `Plain` by [`validate_ask`] — so a stored `Detailed`
+        /// always carries text here.
+        #[serde(default)]
+        description: String,
+    },
+}
+
+impl OptionSpec {
+    /// The choice itself — what a surface puts on the button, and what an
+    /// answer quotes back verbatim.
+    pub fn label(&self) -> &str {
+        match self {
+            OptionSpec::Plain(label) => label,
+            OptionSpec::Detailed { label, .. } => label,
+        }
+    }
+
+    /// The reasoning under the label, when there is any. `None` and `Some("")`
+    /// would mean the same thing to a renderer, so the empty case never
+    /// reaches one: it is normalized away at validation.
+    pub fn description(&self) -> Option<&str> {
+        match self {
+            OptionSpec::Plain(_) => None,
+            OptionSpec::Detailed { description, .. } => {
+                Some(description.as_str()).filter(|d| !d.is_empty())
+            }
+        }
+    }
+}
+
+/// How many of a question's options the human may choose (#1091).
+///
+/// Only meaningful alongside `options` — [`validate_ask`] refuses it on a
+/// question that has none, because there is then nothing for it to describe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Select {
+    /// Pick one. The default: a question is a decision.
+    Single,
+    /// Pick any number — the ask really is "which of these", not "which one".
+    Multi,
+}
+
+impl Default for Select {
+    fn default() -> Self {
+        Select::Single
+    }
+}
+
+impl Select {
+    /// Parse a tool argument, with [`Urgency::parse`]'s posture: unrecognized
+    /// is an ERROR, never a defaulted `single`. An orchestrator that wrote
+    /// `"multiple"` meant the human to be able to pick several, and silently
+    /// filing that as a one-of-N choice loses part of the answer it wanted.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "single" => Ok(Select::Single),
+            "multi" => Ok(Select::Multi),
+            other => Err(format!("unknown select {other:?} — use \"single\" or \"multi\"")),
+        }
+    }
+}
+
+/// Whether an answering surface offers a free-text box beside the options.
+///
+/// The default is `true`, and it is a default rather than a setting most asks
+/// touch: the affordance being mirrored (a CLI's own question dialog) always
+/// offers an "other" escape, and a human who can only pick from an agent's
+/// list is a human whose actual answer has nowhere to go. Denying it is an
+/// explicit opt-OUT, and only meaningful when options exist.
+fn free_text_default() -> bool {
+    true
+}
+
 /// One question put to the human, and its answer once it has one.
 ///
 /// Every field past the required core carries `#[serde(default)]` so a file
@@ -191,7 +299,18 @@ pub struct Question {
     pub asker: String,
     pub text: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub options: Vec<String>,
+    pub options: Vec<OptionSpec>,
+    /// How many options the human may pick. `single` unless the ask said
+    /// otherwise; meaningless without `options`, which is why an ask that
+    /// gives one without the other is refused rather than stored.
+    #[serde(default)]
+    pub select: Select,
+    /// Whether the answering surface offers a free-text box as well. Defaults
+    /// to `true` — including for a Q1-era row that has no such field, which is
+    /// the right reading of it: the only answer surface those rows were ever
+    /// written for was free text.
+    #[serde(default = "free_text_default")]
+    pub allow_free_text: bool,
     /// The board task this question is holding up, if any — what lets the
     /// orchestrator un-block exactly one task when the answer lands.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -243,12 +362,54 @@ impl AnswerSource {
 /// What `ask_human` was asked to register, after argument parsing and before
 /// validation. Split from the registry method so the validation below is a
 /// pure function of its input.
-#[derive(Clone, Debug, Default)]
+///
+/// `select` and `allow_free_text` are `Option` here and plain values on
+/// [`Question`], and that asymmetry is load-bearing rather than untidy:
+/// "single" and "free text allowed" are what an ask that said nothing gets,
+/// but they are also what an ask can say explicitly, and [`validate_ask`]
+/// refuses either of them on a question with no options. Collapsing the
+/// request to the stored type would erase the difference between *said* and
+/// *defaulted*, and the refusal — the thing that tells an orchestrator its
+/// `select: "multi"` did nothing — would have to be duplicated at the parse
+/// site, where it could then drift.
+#[derive(Clone, Debug)]
 pub struct AskRequest {
     pub text: String,
-    pub options: Vec<String>,
+    pub options: Vec<OptionSpec>,
+    pub select: Option<Select>,
+    pub allow_free_text: Option<bool>,
     pub task: Option<String>,
     pub urgency: Urgency,
+}
+
+impl Default for AskRequest {
+    /// Hand-written rather than derived because `bool`'s derived default is
+    /// `false`, and `allow_free_text: false` is the one value this field must
+    /// never acquire by accident — it takes the human's escape hatch away.
+    /// `None` is what "the ask did not say" has to mean here.
+    fn default() -> Self {
+        AskRequest {
+            text: String::new(),
+            options: Vec::new(),
+            select: None,
+            allow_free_text: None,
+            task: None,
+            urgency: Urgency::default(),
+        }
+    }
+}
+
+impl AskRequest {
+    /// What to store for `select`: what the ask said, or `single`.
+    pub fn select_or_default(&self) -> Select {
+        self.select.unwrap_or_default()
+    }
+
+    /// What to store for `allow_free_text`: what the ask said, or `true`.
+    /// See [`free_text_default`] for why the default is the permissive one.
+    pub fn free_text_allowed(&self) -> bool {
+        self.allow_free_text.unwrap_or_else(free_text_default)
+    }
 }
 
 /// Normalize and bounds-check an ask, or say exactly what is wrong with it.
@@ -277,17 +438,62 @@ pub fn validate_ask(req: AskRequest) -> Result<AskRequest, String> {
     }
     let mut options = Vec::with_capacity(req.options.len());
     for opt in req.options {
-        let opt = opt.trim().to_string();
-        if opt.is_empty() {
+        let label = opt.label().trim().to_string();
+        if label.is_empty() {
             return Err("an empty option is not a choice — drop it or give it text".into());
         }
-        if opt.chars().count() > OPTION_TEXT_MAX {
-            return Err(format!("an option is {} characters, max {OPTION_TEXT_MAX}", opt.chars().count()));
+        if label.chars().count() > OPTION_TEXT_MAX {
+            return Err(format!(
+                "an option is {} characters, max {OPTION_TEXT_MAX}",
+                label.chars().count()
+            ));
         }
-        options.push(opt);
+        let description = opt.description().unwrap_or_default().trim().to_string();
+        if description.chars().count() > OPTION_DESC_MAX {
+            return Err(format!(
+                "an option description is {} characters, max {OPTION_DESC_MAX} — the description \
+                 is the trade-off in a line, not the case for it; cite the issue or PR for that",
+                description.chars().count()
+            ));
+        }
+        // A description-less option is stored as the bare string it was in Q1,
+        // whichever form it arrived in. See `OptionSpec`.
+        options.push(if description.is_empty() {
+            OptionSpec::Plain(label)
+        } else {
+            OptionSpec::Detailed { label, description }
+        });
+    }
+    // `select` and `allow_free_text` describe a list of options. Given without
+    // one, they are not harmless no-ops to absorb: each says the orchestrator
+    // believed it was shaping a choice the human would be offered, and storing
+    // them silently would leave that belief uncorrected. Refuse, and name the
+    // missing half.
+    if options.is_empty() {
+        if req.select.is_some() {
+            return Err(
+                "select needs options — it says how many of them the human may pick, and this \
+                 question offers none"
+                    .into(),
+            );
+        }
+        if req.allow_free_text == Some(false) {
+            return Err(
+                "allow_free_text: false needs options — with no options and no free text there \
+                 is nothing left for the human to answer with"
+                    .into(),
+            );
+        }
     }
     let task = req.task.map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
-    Ok(AskRequest { text, options, task, urgency: req.urgency })
+    Ok(AskRequest {
+        text,
+        options,
+        select: req.select,
+        allow_free_text: req.allow_free_text,
+        task,
+        urgency: req.urgency,
+    })
 }
 
 /// Bounds-check an answer from a trusted surface.

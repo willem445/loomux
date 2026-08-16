@@ -24015,10 +24015,17 @@ impl OrchRegistry {
                     humanq::PENDING_MAX
                 ));
             }
+            // Resolved before the struct literal moves `req` apart: both are
+            // methods on the whole request, and a partial move would put them
+            // out of reach.
+            let select = req.select_or_default();
+            let allow_free_text = req.free_text_allowed();
             let question = humanq::Question {
                 id: humanq::next_id(&questions),
                 asker: asker.to_string(),
                 text: req.text,
+                select,
+                allow_free_text,
                 options: req.options,
                 task: req.task,
                 urgency: req.urgency,
