@@ -644,6 +644,24 @@ so far:
   `{{WORKFLOW}}` would make never-block roster-dependent, so a group with no custom workflow
   file — the default — would be the one still free to stall its own fleet.
 
+- **#958 slice R, readiness climbs the container chain** — `orchestrator.md` only, one bullet
+  in **The task board** (`worker.md`/`reviewer.md`/`planner.md` neither write nor read the
+  board's readiness signal and did not move). `ready` used to mean `queued` ∧ every own dep
+  `done`; it now additionally requires every container ABOVE the row to have all of ITS deps
+  `done`, so a slice whose feature is itself still waiting no longer advertises itself as
+  startable. The re-bless is warranted because the template stated the old rule as a
+  definition, and an orchestrator selecting work off `ready: true` would have kept reading a
+  rule the board no longer follows. Two things the bullet is careful to say, because both are
+  the kind of thing an orchestrator would otherwise infer wrongly: only an ancestor's **deps**
+  participate — its `status` is never read, so a child of a container merely marked `blocked`
+  IS still startable (`blocked` is for blockers outside the board, which is not a statement
+  about the subtree) — and the blocking dep stays directly readable from the same
+  `list_tasks` response, since every row carries its own `parent`, `deps` and `status`. The
+  `claim: true` bullet below it is deliberately untouched: the claim guard still judges a
+  row's OWN deps, because it is a gate and hierarchy is metadata (§7 of
+  `doc/design/task-hierarchy.md`) — that asymmetry is taught in `upsert_task`'s tool
+  description, where a rule about a write belongs, rather than by growing this section.
+
 `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was` renders
 **these** with the six pre-#222 template variables and asserts that a group launched
 with the advanced orchestrator **off** gets exactly that text. They are the

@@ -137,7 +137,8 @@ use loomux_lib::orchestration::{
     // request, so both have to be reachable from a test.
     attention_tail, ATTENTION_SCAN_BYTES,
     spawn_rate_exceeded, spawn_request_expired, strip_ansi, submit_confirmed, submit_sequence,
-    board_summaries, cap_task_notes, task_ready, task_summary, unmet_deps,
+    blocking_ancestor, board_summaries, cap_task_notes, task_ready, task_summary, unmet_deps,
+    TASK_STATUSES,
     // #865: done-row cap on list_tasks — the pure keep/drop rule and its default.
     filter_done_rows, LIST_TASKS_DONE_CAP,
     unconfirmed_delivery_notice, delivery_eaten_notice, watchdog_should_notify, worktree_cleanup_targets,
@@ -10760,40 +10761,147 @@ fn list_rows_carry_the_container_and_derived_child_counts() {
     assert_eq!(rows[1].children_done, 0, "a done container with an unfinished child says so");
 }
 
-/// v1 leaves readiness exactly as #582 defined it (#958). Folding ancestors in
-/// — "a child is not ready while its container is blocked" — is a semantics
-/// decision for the human, so this pins it as DEFERRED rather than letting it
-/// arrive by accident with the data model.
-#[test]
-fn hierarchy_does_not_change_the_readiness_truth_table() {
-    let board = vec![
-        kinded("t-1", "blocked", "epic", None),
-        kinded("t-2", "queued", "story", Some("t-1")),
-        kinded("t-3", "queued", "feature", None),
-        Task { parent: Some("t-3".into()), ..linked("t-4", "queued", &["t-2"], &[]) },
-    ];
-    assert!(
-        task_ready(&board[1], &board),
-        "v1 readiness is the task's OWN deps: a child of a BLOCKED container is still startable (#958 defers the change)"
-    );
-    assert!(unmet_deps(&board[1], &board).is_empty(), "a container is not a dependency");
-    assert!(
-        !task_ready(&board[3], &board),
-        "and a child's OWN dep still blocks it — containment and ordering stay orthogonal"
-    );
-    assert_eq!(unmet_deps(&board[3], &board), ["t-2"]);
+// ---------- #958 slice R: readiness climbs the container chain ----------
 
-    // A hand-edited orphan/cycle is TOLERATED on read: display-only metadata
-    // must never wedge the queue the way an unknown dep deliberately does.
+/// A row is startable only when its own deps AND every container above it are
+/// clear (#958 slice R). The failure direction is what made this worth
+/// changing: a slice inside a feature that could not itself start used to
+/// advertise itself as startable, so the board's answer to "what can begin
+/// now" included work that could not begin.
+#[test]
+fn readiness_climbs_the_container_chain() {
+    let board = vec![
+        linked("t-1", "in-progress", &[], &[]),
+        // The feature, waiting on t-1; the slice inside it declares no deps.
+        Task { kind: Some("feature".into()), ..linked("feat", "queued", &["t-1"], &[]) },
+        kinded("slice", "queued", "task", Some("feat")),
+    ];
+    assert!(unmet_deps(&board[2], &board).is_empty(), "a container is still not a dependency");
+    assert_eq!(
+        blocking_ancestor(&board[2], &board),
+        Some("feat"),
+        "the container it sits in is what is holding it"
+    );
+    assert!(!task_ready(&board[2], &board), "a slice whose feature is still waiting cannot start");
+    assert!(!task_ready(&board[1], &board), "and the feature is blocked the ordinary way");
+
+    // Finish what the feature was waiting on and BOTH become startable in the
+    // same read — nothing was written to make that happen.
+    let cleared: Vec<Task> =
+        board.iter().map(|t| Task { status: if t.id == "t-1" { "done".into() } else { t.status.clone() }, ..t.clone() }).collect();
+    assert_eq!(blocking_ancestor(&cleared[2], &cleared), None);
+    assert!(task_ready(&cleared[2], &cleared) && task_ready(&cleared[1], &cleared));
+
+    // The WHOLE chain, and the NEAREST blocker: one level of walking would miss
+    // a grandparent's dep, and a caller that names the wrong row sends a human
+    // to the wrong place.
+    let deep = vec![
+        linked("t-1", "queued", &[], &[]),
+        linked("t-2", "queued", &[], &[]),
+        Task { kind: Some("epic".into()), ..linked("epic", "queued", &["t-1"], &[]) },
+        Task { parent: Some("epic".into()), ..linked("feat", "queued", &["t-2"], &[]) },
+        kinded("slice", "queued", "task", Some("feat")),
+    ];
+    assert_eq!(blocking_ancestor(&deep[4], &deep), Some("feat"), "nearest first, not the root");
+    let only_epic: Vec<Task> =
+        deep.iter().map(|t| if t.id == "feat" { Task { deps: vec![], ..t.clone() } } else { t.clone() }).collect();
+    assert_eq!(
+        blocking_ancestor(&only_epic[4], &only_epic),
+        Some("epic"),
+        "two levels up still reaches the grandchild"
+    );
+    assert!(!board_summaries(&only_epic)[4].ready, "and the projected row says so");
+
+    // Orthogonality survives: a row's OWN dep still blocks it regardless of
+    // where it sits, and `related` still participates in nothing.
+    let own = vec![
+        linked("t-1", "queued", &[], &[]),
+        kinded("feat", "queued", "feature", None),
+        Task { parent: Some("feat".into()), ..linked("slice", "queued", &["t-1"], &["feat"]) },
+    ];
+    assert_eq!(blocking_ancestor(&own[2], &own), None, "nothing above it is waiting");
+    assert!(!task_ready(&own[2], &own), "but its own dep is");
+    assert_eq!(unmet_deps(&own[2], &own), ["t-1"]);
+}
+
+/// Only an ancestor's **deps** participate, never its `status` (#958 slice R).
+/// `blocked` is the status for blockers OUTSIDE the board — it says nothing
+/// about the work inside a container — and a feature at `in-progress` is the
+/// normal state while its slices are the startable work. Reading either would
+/// make a slice's readiness a function of how promptly someone maintains the
+/// container row, where deps are the ordering primitive #582 defined.
+///
+/// Swept over `TASK_STATUSES` itself rather than a list written out here: a
+/// ninth status added later must be covered by this sweep the day it lands, not
+/// silently escape it (CLAUDE.md — a concrete list goes stale).
+#[test]
+fn an_ancestors_status_never_enters_readiness() {
+    for status in TASK_STATUSES {
+        let board = vec![
+            kinded("feat", status, "feature", None),
+            kinded("slice", "queued", "task", Some("feat")),
+        ];
+        assert_eq!(blocking_ancestor(&board[1], &board), None, "container at {status} blocks nothing");
+        assert!(task_ready(&board[1], &board), "a child of a {status} container is startable");
+    }
+}
+
+/// A hand-edited container tolerates rather than wedges (§5 of
+/// doc/design/task-hierarchy.md) — the OPPOSITE direction from an unknown dep
+/// id, which deliberately blocks. The asymmetry is the point: an unknown dep is
+/// an ordering claim that cannot be verified, while an unknown container is a
+/// row with no container at all, and blocking it forever would hide work with
+/// nothing on the board explaining why.
+#[test]
+fn a_hand_edited_container_never_wedges_readiness() {
     let hand_edited = vec![
         kinded("t-1", "queued", "task", Some("t-404")),
         kinded("t-2", "queued", "task", Some("t-3")),
         kinded("t-3", "queued", "task", Some("t-2")),
+        kinded("t-4", "queued", "task", Some("t-4")),
     ];
     let rows = board_summaries(&hand_edited);
-    assert!(rows[0].ready, "an orphan parent blocks nothing — it is display metadata, not a gate");
+    assert!(rows[0].ready, "an orphan parent blocks nothing — there is no container to wait on");
     assert!(rows[1].ready && rows[2].ready, "nor does a hand-edited container cycle");
+    assert!(rows[3].ready, "nor a self-parent: its own deps are unmet_deps' answer, not this one's");
     assert_eq!(rows[1].children, 1, "the counts still answer, without walking into the loop");
+
+    // A cycle whose member carries a REAL unmet dep still reports it, having
+    // terminated on the repeat rather than spinning. (Termination, not
+    // deduplication: a cycle that does not contain the start row re-scans its
+    // entry member once — see `blocking_ancestor`'s doc.)
+    let cyclic_but_blocked = vec![
+        linked("t-0", "queued", &[], &[]),
+        kinded("t-1", "queued", "task", Some("t-2")),
+        Task { parent: Some("t-1".into()), ..linked("t-2", "queued", &["t-0"], &[]) },
+    ];
+    assert_eq!(blocking_ancestor(&cyclic_but_blocked[1], &cyclic_but_blocked), Some("t-2"));
+    assert!(!task_ready(&cyclic_but_blocked[1], &cyclic_but_blocked));
+}
+
+/// Readiness is a HINT; `claim` is the GATE — and §7's metadata-only stance
+/// binds the gate, not the hint. So the claim guard still judges a row's OWN
+/// deps and never reads `parent`: a hand-edited container can dim a row on the
+/// board, and can never refuse a write. This asymmetry is deliberate, and this
+/// test is what stops it being "fixed" into a hierarchy-reading gate.
+#[test]
+fn a_claim_is_judged_on_the_rows_own_deps_never_its_container() {
+    let (reg, _d) = test_registry();
+    let gid = board_with(&reg, &["the blocker", "the feature", "the slice"]);
+    reg.upsert_task(&gid, "orch", Some("t-2"), deps_patch(&["t-1"])).unwrap();
+    reg.upsert_task(&gid, "orch", Some("t-3"), parent_patch("t-2")).unwrap();
+
+    let board = reg.tasks(&gid);
+    let slice = board.iter().find(|t| t.id == "t-3").unwrap();
+    assert!(!task_ready(slice, &board), "the board says the slice is not startable yet");
+
+    // …and the claim still lands, because the slice's own deps are clear.
+    let claimed = reg.upsert_task(&gid, "orch", Some("t-3"), claim_patch("w-1")).unwrap();
+    assert_eq!(
+        (claimed.status.as_str(), claimed.assignee.as_deref()),
+        ("in-progress", Some("w-1")),
+        "hierarchy is metadata: it never decides whether an action may happen (§7)"
+    );
 }
 
 #[test]

@@ -439,9 +439,12 @@ you can edit them yourself:
   are shown read-only here and never affect anything below.
 - A `queued` task still waiting on something **dims**, so it can't be read as
   work anyone could pick up; one whose dependencies are all done is marked
-  **▸ ready**, next to ▶ Start. The ready mark appears only once some task on
-  the board actually declares a dependency — on a board that uses none, every
-  queued item is trivially ready and the badge would say nothing.
+  **▸ ready**, next to ▶ Start. A subtask dims the same way while a task it sits
+  *inside* is the one still waiting — you can't start a slice whose feature
+  can't start — and the chips saying what is holding it are on that container's
+  own row, which is always visible above it. The ready mark appears only once
+  some task on the board actually declares a dependency — on a board that uses
+  none, every queued item is trivially ready and the badge would say nothing.
 
 Only `done` satisfies a dependency: an item sitting at `pr` or `human-testing` is
 work *you* haven't signed off yet, so anything depending on it keeps waiting.
@@ -462,13 +465,16 @@ A task can sit *inside* another task — an Epic or Feature the orchestrator cre
 concrete slices under, following the same shape as Agile hierarchies (Epic → Feature → Story →
 Task). This is **containment**, and it's a different relationship from the **dependencies**
 above: a subtask's container says where it belongs on the board, a dependency says what must
-finish before it can start. A subtask of a container that's still `blocked` is not itself
-blocked by that — express ordering with a dependency, not by nesting.
+finish before it can start. Express ordering with a dependency, not by nesting — nesting a task
+under another one never means "after it". What nesting *does* carry is inherited waiting: a
+subtask isn't startable while a container above it still has unfinished dependencies of its own
+(see below).
 
 Each task can carry an advisory **kind** label — `epic`, `feature`, `story`, or `task` — set by
-the orchestrator to show the level a container sits at. It's a label only: nothing enforces that
-a `story` sits under a `feature` rather than straight under an `epic`, and a container is
-ordinary claimable work like any other task, not a special row.
+the orchestrator, or by you from the board's own **🏷** picker, to show the level a container
+sits at. It's a label only: nothing enforces that a `story` sits under a `feature` rather than
+straight under an `epic`, and a container is ordinary claimable work like any other task, not a
+special row.
 
 Two rules about nesting are backend behavior — they hold however the board reaches you, the UI
 below included:
@@ -488,7 +494,9 @@ Board controls for nesting:
   chevron** on any row that has subtasks — collapsing hides the whole subtree, not just its
   direct children, so a grandchild is never left stranded above its own container.
 - The **kind** label above shows on the row as a badge, so you can see at a glance which rows
-  are containers and at what level.
+  are containers and at what level. A **🏷** picker next to the nest control lets you set or
+  change it directly — the three levels the row doesn't already carry, plus a clear option once
+  it carries one.
 - The **▲/▼ priority arrows now move a task among its siblings**, not through the whole board:
   the first subtask of a container has nothing above it to swap with, so its ▲ is greyed out
   even though there are rows higher up the board. Moving a container moves everything inside it
@@ -502,9 +510,19 @@ Board controls for nesting:
   at nothing valid, renders at the top level with a broken-container marker rather than
   vanishing — the nesting equivalent of the `⚠` missing-dependency chip above.
 
-Like dependencies, nesting is board metadata: it never affects whether a merge is allowed, and
-it doesn't change how `ready` is computed — a subtask of a blocked container can still be marked
-ready to start.
+Readiness climbs the nesting: a task is marked ready only when its own dependencies are all
+done **and** every container above it has all of *its* dependencies done too. A slice inside a
+feature that can't start yet isn't startable either, so it no longer says it is.
+
+Only a container's **dependencies** count, never its status. A subtask of a container marked
+`blocked` is still ready to start — `blocked` is for blockers outside the board (a decision
+you owe, an upstream repo), which says nothing about the work nested inside. If you want that
+task held too, give it — or its container — a dependency, which is the machine-readable way to
+say it.
+
+Nesting is still board metadata everywhere it counts: it never affects whether a merge is
+allowed, and it never blocks the orchestrator from *assigning* a subtask — readiness is a
+signal for reading the board, not a lock.
 
 ## Steering, attention, and audit
 
