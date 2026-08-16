@@ -214,7 +214,7 @@ impl Role {
             // reviewer, "the manager never pushes" therefore stays
             // instruction-backed; what is structural is the denied editing
             // tools (see `Containment::NoEdits` for the exact size of that).
-            Role::Manager => Containment::None, // [scratch] neuter 1
+            Role::Manager => Containment::NoEdits,
             Role::Planner => Containment::ReadOnly,
             // Solo panes never traverse `spawn_agent_ex`/`build_agent_command`
             // (see the variant's doc) — an arbitrary human-launched CLI loomux

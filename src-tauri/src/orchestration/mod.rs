@@ -6008,7 +6008,7 @@ pub fn spawn_request_expired(deadline_ms: u64, now_ms: u64) -> bool {
 /// purpose is that they are in it. A minimized manager would also be the one
 /// pane a human could not tell apart from an absent one.
 pub fn spawn_opens_minimized(role: Role, group_opted_expanded: bool) -> bool {
-    role != Role::Orchestrator && !group_opted_expanded // [scratch] neuter 3
+    !matches!(role, Role::Orchestrator | Role::Manager) && !group_opted_expanded
 }
 
 /// Whether the spawn-rate guardrail should reject the next spawn: true when
