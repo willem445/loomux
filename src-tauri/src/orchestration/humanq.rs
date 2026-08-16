@@ -458,11 +458,9 @@ pub fn validate_ask(req: AskRequest) -> Result<AskRequest, String> {
         }
         // A description-less option is stored as the bare string it was in Q1,
         // whichever form it arrived in. See `OptionSpec`.
-        options.push(if description.is_empty() {
-            OptionSpec::Plain(label)
-        } else {
-            OptionSpec::Detailed { label, description }
-        });
+        // [scratch] NEUTERED: the description is validated exactly as before
+        // and then thrown away, so every option stores as a bare label.
+        options.push(OptionSpec::Plain(label));
     }
     // `select` and `allow_free_text` describe a list of options. Given without
     // one, they are not harmless no-ops to absorb: each says the orchestrator
