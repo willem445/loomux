@@ -1550,9 +1550,16 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
         // alone. `mcp::tool_defs` and, since #946 Q4 / #1091 slice H, the
         // Claude CLI's `AskUserQuestion` deny (`claude_denies_interactive_
         // question`) DO additionally key off this field for the single
-        // `liaison` hint — a widening, never a narrowing, so it cannot
-        // relax what `kind` already denies. What IS enforced here is that a
-        // hint can only sit on the kind it is
+        // `liaison` hint — in BOTH directions: `tool_defs` GRANTS a plain
+        // `kind: reviewer` block `group_usage`/`ask_human` once it also
+        // carries `liaison` (mcp.rs, `tool_defs`'s liaison arm — a deliberate
+        // widening of that block's tool surface, not a deny), while the
+        // AskUserQuestion deny ADDS a restriction the same hint does not
+        // otherwise carry. What neither direction ever touches is
+        // `Role::containment()` — the edit/git denial tier `kind` alone
+        // sets — so a liaison still can't edit a file or push regardless of
+        // what its hint grants or denies elsewhere. What IS enforced here is
+        // that a hint can only sit on the kind it is
         // meaningless without: an unrecognized value, or one paired with the
         // wrong kind, is a loud parse error — never coerced, never silently
         // dropped, the same shape `kind_from_str` itself enforces.
