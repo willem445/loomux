@@ -1,9 +1,11 @@
 # Human questions — asking without blocking the fleet
 
 *#946. This note covers slice Q1: the registry, its MCP tools, and the trusted
-answer surface. The inbox UI (Q2), the orchestrator's protocol prose (Q3), the
-structural deny of the blocking dialog (Q4) and the chat bridge (#947 / T1) sit
-on top of what is described here and extend this note as they land.*
+answer surface — plus, from #1091 slice A, the shape of the ask itself. The
+NEEDS-YOU panel (#1091 C, the Q2 surface), the orchestrator's protocol prose
+(Q3 / #1091 E), the structural deny of the blocking dialog (Q4) and the chat
+bridge (#947 / T1) sit on top of what is described here and extend this note as
+they land.*
 
 ## The problem
 
@@ -105,6 +107,8 @@ core carries `#[serde(default)]`, so a file written by an older build loads.
 | `id` | `q-1`, `q-2`, … |
 | `asker` | agent id that asked |
 | `text`, `options`, `task`, `urgency` | as asked; `options` omitted when empty |
+| `select` | `single` (default) \| `multi` — how many options may be picked (#1091) |
+| `allow_free_text` | bool, **default `true`** — may the human type their own answer (#1091) |
 | `status` | `pending` \| `answered` \| `withdrawn` |
 | `created_ms` | |
 | `answer`, `settled_by`, `settled_ms` | present once settled |
@@ -137,11 +141,70 @@ pruned at any count — `PENDING_MAX` bounds them by refusing new asks instead,
 loudly, because reaching it means questions are being asked faster than any human
 could answer.
 
+### The ask shape (#1091 slice A)
+
+What the human is *offered*, as opposed to what they are asked. Three additive
+pieces, mirroring the affordance a CLI's own question dialog has and this one
+did not:
+
+| piece | shape | default |
+| --- | --- | --- |
+| option items | `"ship it"` **or** `{"label": "ship it", "description": "one review, bigger diff"}` | — |
+| `select` | `single` \| `multi` | `single` |
+| `allow_free_text` | bool | **`true`** |
+
+`OptionSpec` is an untagged enum (`Plain` \| `Detailed`), and **a
+description-less option is normalized back to `Plain` before it is stored**,
+whichever form it arrived in. Both halves earn their place: untagged is what
+makes a Q1-era file — where every option was a bare string — parse with no
+migration; normalizing on the way in is what stops a richer build silently
+restyling every file it touches, so the object form appears on disk exactly
+where a description was actually given.
+
+**`allow_free_text` defaults to `true`, and that is the load-bearing default.**
+The options are the alternatives the *orchestrator* thought of; the answer
+worth having is often the one it did not list, so denying the free-text box is
+an explicit opt-out rather than something an ask can fall into. Two
+consequences follow, and both are deliberate: a Q1 row with no such field reads
+as `true` (free text was the only answer surface those rows were ever written
+for), and `AskRequest::default` is hand-written rather than derived, because
+`bool`'s derived `false` is precisely the value this field must never acquire
+by accident.
+
+**`select` and `allow_free_text` describe a list of options, so an ask that
+gives either without one is refused** rather than absorbed. Each says the
+orchestrator believed it was shaping a choice the human would be offered;
+storing them silently would leave that belief uncorrected, and — for
+`allow_free_text: false` with no options — would register a question with
+nothing at all to answer it with. For the same reason `select` is parsed with
+`Urgency::parse`'s posture: an unrecognized value is an error, never a
+defaulted `single`, because an orchestrator that wrote `"multiple"` meant the
+human to be able to pick several.
+
+Bounds follow `validate_ask`'s existing refuse-never-truncate rule:
+`OPTIONS_MAX` 8 unchanged, label `OPTION_TEXT_MAX` 200 unchanged, description
+`OPTION_DESC_MAX` 500 (wider, because the description is where the trade-off
+goes while the label stays short enough for a button). A truncated description
+would cut exactly the part that decides the answer.
+
+**Downgrade is not promised, and the asymmetry is the point.** An old build
+reading a new file that carries an object option fails its parse *loudly* — the
+posture the "reads are loud about a bad file" rule above argues for — rather
+than dropping the row. Losing a pending question a human has not answered is
+the one failure this registry exists to prevent, so a refusal a human can see
+beats a silent read that a subsequent write would make permanent.
+
+The answer stays **one string**. A surface composes it from the selection and
+the free text; nothing structured is persisted beside it, because the consumer
+is an LLM reading a pane notice, and labels quoted verbatim are unambiguous
+there while a `selected: string[]` would be permanent schema for a fidelity the
+notice and the audit line already carry.
+
 ### MCP tools
 
 | tool | tier |
 | --- | --- |
-| `ask_human(text, options?, task?, urgency?)` | orchestrator-only |
+| `ask_human(text, options?, select?, allow_free_text?, task?, urgency?)` | orchestrator-only |
 | `withdraw_question(id)` | orchestrator-only |
 | `list_questions()` | shared read |
 
