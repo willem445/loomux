@@ -19,6 +19,7 @@ import {
   composeAnswer,
   DEMO_STATUSES,
   EMPTY_DRAFT,
+  feedbackRoute,
   freeTextAllowed,
   isDemoGated,
   isPending,
@@ -37,7 +38,7 @@ import {
   type DemoTask,
   type OrchQuestion,
 } from "../src/decisions.ts";
-import { isAwaitingHuman, STATUSES } from "../src/taskboard.ts";
+import { canApprove, isAwaitingHuman, STATUSES } from "../src/taskboard.ts";
 
 // ---------- fixtures ----------
 
@@ -186,6 +187,45 @@ test("a demo item carries the recorded path, and says nothing when none was reco
   // way rather than rendering a blank mono chip.
   const [blank] = projectDemos([task({ id: "t-3", status: "prototype", demo_path: "  " })]);
   assert.equal(blank.path, null);
+});
+
+test("feedback on a prototype routes to the note verb, NOT the merge-gate one", () => {
+  // The defect this pins: `orch_request_changes` calls `ensure_at_merge_gate`,
+  // which admits only MERGE_GATE_STATUSES (pr / human-testing). Sending it at a
+  // `prototype` row is refused EVERY time — and the dialog had already closed,
+  // so the human's typed findings were gone with no way back. A prototype is
+  // the #147 demo gate, so the answer is a verb the backend accepts, not a
+  // hidden button.
+  const [proto] = projectDemos([task({ status: "prototype" })]);
+  assert.equal(proto.feedback, "note");
+  const [testing] = projectDemos([task({ status: "human-testing" })]);
+  assert.equal(testing.feedback, "merge-gate");
+});
+
+test("every demo-gated row has a working feedback verb — the tier is never half-actionable", () => {
+  // Totality is the property, not the two cases above: a future demo status
+  // that reached this tier with no accepted verb would silently drop the
+  // human's input again, so there is deliberately no third "cannot" value.
+  for (const d of projectDemos(STATUSES.map((s) => task({ id: `t-${s}`, status: s })))) {
+    assert.ok(
+      d.feedback === "merge-gate" || d.feedback === "note",
+      `${d.status} has no feedback route`
+    );
+  }
+});
+
+test("the feedback route mirrors the backend's merge-gate predicate, not a second spelling", () => {
+  // `canApprove` IS the frontend's mirror of `ensure_at_merge_gate`, and the
+  // board's own Changes button already gates on it. Stated as a relation so
+  // that changing one and not the other reddens here rather than shipping a
+  // panel that disagrees with the board about the same backend guard.
+  for (const s of STATUSES) {
+    assert.equal(
+      feedbackRoute(s) === "merge-gate",
+      canApprove(s),
+      `${s} disagrees with canApprove`
+    );
+  }
 });
 
 test("Proceed offers only on a prototype — the same guard the backend enforces", () => {

@@ -481,7 +481,7 @@ const EMBED_TOGGLE_TITLE: Record<EmbedKind, string> = {
 
 /** One embeddable view's plumbing, registered once that view is lazily
  *  constructed. Lets the generic engine (`openView`/`closeView`/`toggleView`/
- *  `embedViewAtSide`/`reclampViewFloor`) treat all five views uniformly
+ *  `embedViewAtSide`/`reclampViewFloor`) treat all eight views uniformly
  *  without hardcoding any one view's class. */
 interface EmbedEntry {
   /** The view's own floating-overlay host (unchanged pre-#361 mechanics). */
@@ -3289,6 +3289,18 @@ export class Pane implements VoiceTargetPane {
     if (this.embedToggleBtn(kind)?.hidden !== false) return false;
     if (!this.pendingFocus.request(kind, target)) return false;
     this.ensureEmbedView(kind);
+    // FAIL CLOSED on a kind this hook cannot actually route. `ensureEmbedView`
+    // has a deliberate silent default, and `openView` returns early on a
+    // missing registry entry — so without this check a kind whose header button
+    // is visible but which has no `ensureEmbedView` case would park a target
+    // nothing will ever drain and still answer `true`. `true` is the one answer
+    // that makes a caller render a link that goes nowhere, which is precisely
+    // what its `false` contract exists to prevent. Cheaper to make impossible
+    // here than to remember at each future call site.
+    if (!this.embedRegistry.has(kind)) {
+      this.pendingFocus.clear(kind);
+      return false;
+    }
     if (this.isViewVisible(kind)) this.embedRegistry.get(kind)?.show();
     else this.openView(kind);
     return true;
@@ -4966,6 +4978,10 @@ export class Pane implements VoiceTargetPane {
     this.issuesView?.dispose();
     this.tasksView?.dispose();
     this.decisionsView?.dispose();
+    // Drop any focus request parked for a view that will never render again,
+    // so it cannot be picked up by a later instance of that view (#1091 slice
+    // C — `PendingEmbedFocus.clear`'s own stated purpose).
+    for (const kind of EMBED_KINDS) this.pendingFocus.clear(kind);
     this.auditView?.dispose();
     this.timelineView?.dispose();
     this.groupView?.dispose();

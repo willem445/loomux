@@ -19,6 +19,11 @@
 // Nothing in this module reads or writes anything — it is a projection plus a
 // selection state machine, which is exactly the part worth pinning with tests.
 
+// Explicit `.ts`, like `agenticons.ts`/`channel.ts`: this module is imported
+// directly by `node --test`, which resolves real files rather than Vite's
+// extensionless specifiers.
+import { canApprove, canProceed } from "./taskboard.ts";
+
 // ---------- the question wire shape ----------
 
 /** One question's life stage, as `humanq::Status` serializes it. Both terminal
@@ -203,6 +208,43 @@ export function isDemoGated(status: string): boolean {
   return (DEMO_STATUSES as readonly string[]).includes(status);
 }
 
+/** Which backend verb this row's **Feedback** gesture must use.
+ *
+ *  The demo tier spans two statuses and the backend accepts a DIFFERENT verb
+ *  for each, so one button cannot mean one call:
+ *
+ *  - `"merge-gate"` — `orch_request_changes`, whose `ensure_at_merge_gate`
+ *    admits only `MERGE_GATE_STATUSES` (`pr`/`human-testing`). It records the
+ *    findings, delivers a typed notice, and the caller then reopens the row as
+ *    working so the panel cannot keep offering a gate action on a row that just
+ *    had changes asked of it.
+ *  - `"note"` — a plain board note through `orch_upsert_task`, which has no
+ *    status gate at all and still reaches the orchestrator (`notify_board_edit`).
+ *    This is what a `prototype` row gets, and it is the plan's own answer (D7:
+ *    a comment without findings rides the ordinary board-note path).
+ *
+ *  **Why a `prototype` row keeps the button at all**, rather than having it
+ *  hidden: `prototype` IS the #147 demo gate, so it is precisely the row where
+ *  "I looked, and this is not right" has to be sayable. Removing the
+ *  affordance would leave the tier half-actionable — Proceed or nothing — which
+ *  is the opposite of what the gate is for. And unlike the merge-gate verb, a
+ *  note deliberately does NOT move the status: a prototype that has received
+ *  feedback is still a prototype until the orchestrator or the human's own
+ *  Proceed moves it, and flipping it here would silently consume the gate. */
+export type FeedbackRoute = "merge-gate" | "note";
+
+/** Which verb `status` admits. TOTAL over the demo tier — every demo-gated row
+ *  has a working feedback path, so there is no third "cannot give feedback"
+ *  state for a caller to forget to handle.
+ *
+ *  `canApprove` is imported rather than re-spelled: it is the frontend's
+ *  existing mirror of `ensure_at_merge_gate`, already used by the board's own
+ *  Changes button, and two spellings of one backend guard is exactly the drift
+ *  this module's header warns about. */
+export function feedbackRoute(status: string): FeedbackRoute {
+  return canApprove(status) ? "merge-gate" : "note";
+}
+
 /** One demo card. `path` is `null` when the orchestrator recorded none — the
  *  panel then shows the PR link alone rather than guessing a worktree, because
  *  a caption is a claim. */
@@ -217,6 +259,11 @@ export interface DemoItem {
    *  same guard the board's button uses and the backend's `ensure_prototype`
    *  enforces. A `human-testing` row gets feedback, not a promote. */
   canProceed: boolean;
+  /** Which verb this row's **Feedback** button must call. See
+   *  [`feedbackRoute`] — the two demo statuses do not accept the same one, and
+   *  sending the merge-gate verb at a `prototype` row is refused backend-side
+   *  with the human's typed findings already gone. */
+  feedback: FeedbackRoute;
 }
 
 /** The demo tier: every board row in a demo-gated status, in board order.
@@ -238,7 +285,11 @@ export function projectDemos(tasks: readonly DemoTask[]): DemoItem[] {
       path: clean(t.demo_path),
       pr: clean(t.pr),
       assignee: clean(t.assignee),
-      canProceed: t.status === "prototype",
+      // `canProceed` from taskboard.ts, not a second inline `=== "prototype"`:
+      // it is the frontend's existing mirror of the backend's
+      // `ensure_prototype`, and one rule spelled twice is how the two drift.
+      canProceed: canProceed(t.status),
+      feedback: feedbackRoute(t.status),
     }));
 }
 

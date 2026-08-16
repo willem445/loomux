@@ -641,9 +641,12 @@ another docked bottom, and still pop open a THIRD view as a floating
 overlay (say, a quick look at issues) without any of it closing anything
 else — the only thing a floating overlay's OWN open still closes is OTHER
 floating overlays, never a docked one, on any edge. The file-editor overlay
-(never embeddable) still participates as a plain floating panel: it closes
-every OTHER floating overlay when IT opens, and is closed by any of the
-five opening as an overlay, same as before #361.
+participates on exactly the same terms as every other kind: it closes every
+OTHER floating overlay when IT opens, and is closed by any of the other
+seven opening as an overlay, same as before #361. (It was described here as
+"never embeddable" when this section was written, which stopped being true
+once the #361 scope increase made it an `EmbedKind` like the rest — the
+behaviour described is unchanged, only the aside was stale.)
 
 ## Reuse, not a fork
 
@@ -696,7 +699,7 @@ survives the move untouched. Verified per view, not assumed:
   search timer pre-#361 (the overlay-vs-#217-content-pane duality this view
   already had); nothing new needed there for docking. The one addition is
   `setPanelActive`, matching every other view's shape exactly — disables +
-  retitles its own ✕ while docked, same as the other five.
+  retitles its own ✕ while docked, same as the other seven.
 
 The overlay host (`.git-overlay`, one per view — unchanged) and each edge's
 slot (`.pane-embed-panel.side-*` / `.pane-embed-divider.side-*`) are all

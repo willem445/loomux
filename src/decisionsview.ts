@@ -543,18 +543,37 @@ export class DecisionsView {
       });
       actions.append(go);
     }
+    // Always offered, on BOTH demo statuses — but not always the same call.
+    // A `prototype` is the #147 demo gate, so it is exactly the row where "I
+    // looked, and this is not right" must be sayable; what changes is the verb
+    // the backend will accept for it (see `feedbackRoute`).
     const changes = el("button", "dlg-btn", "Feedback") as HTMLButtonElement;
-    changes.addEventListener("click", () => this.requestChanges(d));
+    changes.addEventListener("click", () => this.giveFeedback(d));
     actions.append(changes);
     card.append(actions);
     return card;
   }
 
-  /** Demo feedback: the board's own request-changes gesture, on the same two
-   *  commands — record the findings for the orchestrator, then reopen the task
-   *  as working, so the panel cannot keep offering Proceed on a row that just
-   *  had changes asked of it. */
-  private requestChanges(d: DemoItem): void {
+  /** Demo feedback, routed to the verb this row's status actually admits.
+   *
+   *  At the merge gate (`human-testing`) this is the board's own
+   *  request-changes gesture on the same two commands — record the findings,
+   *  then reopen the task as working so no surface keeps offering a gate
+   *  action on a row that just had changes asked of it.
+   *
+   *  On a `prototype` it is a plain board note instead, because
+   *  `orch_request_changes` REFUSES that status (`ensure_at_merge_gate`) and
+   *  sending it there would reject every time. The note reaches the
+   *  orchestrator all the same, and deliberately does not move the status: a
+   *  prototype that has had feedback is still a prototype until it is promoted
+   *  or re-dispatched, and flipping it here would silently consume the #147
+   *  demo gate.
+   *
+   *  **The dialog closes on SUCCESS, never before the write.** An earlier
+   *  shape closed first, so any rejection destroyed everything the human had
+   *  typed with no way back — the same shape the question-answer path already
+   *  avoids by restoring its draft on failure. */
+  private giveFeedback(d: DemoItem): void {
     if (this.el.querySelector(".tasks-dialog")) return; // one at a time
     const overlay = el("div", "tasks-dialog");
     const box = el("div", "tasks-dialog-box");
@@ -562,7 +581,10 @@ export class DecisionsView {
 
     const ta = document.createElement("textarea");
     ta.className = "dlg-input tasks-dialog-text";
-    ta.placeholder = "What did you find? This goes to the orchestrator.";
+    ta.placeholder =
+      d.feedback === "merge-gate"
+        ? "What needs to change? These findings go to the orchestrator."
+        : "What did you find? This goes to the orchestrator as a note on the demo.";
     ta.spellcheck = false;
     ta.rows = 4;
 
@@ -580,12 +602,26 @@ export class DecisionsView {
         ta.focus();
         return;
       }
-      close();
-      invoke("orch_request_changes", { groupId: this.groupId, id: d.id, findings })
-        .then(() =>
-          invoke("orch_upsert_task", { groupId: this.groupId, id: d.id, status: REQUEST_CHANGES_STATUS })
-        )
-        .catch((err) => this.toast(String(err)));
+      // Disable rather than close: the text stays on screen and recoverable
+      // until the write is known to have landed.
+      send.disabled = true;
+      const write =
+        d.feedback === "merge-gate"
+          ? invoke("orch_request_changes", { groupId: this.groupId, id: d.id, findings }).then(() =>
+              invoke("orch_upsert_task", {
+                groupId: this.groupId,
+                id: d.id,
+                status: REQUEST_CHANGES_STATUS,
+              })
+            )
+          : invoke("orch_upsert_task", { groupId: this.groupId, id: d.id, note: findings });
+      write
+        .then(() => close())
+        .catch((err) => {
+          send.disabled = false;
+          this.toast(String(err));
+          ta.focus();
+        });
     };
     cancel.addEventListener("click", close);
     send.addEventListener("click", submit);
