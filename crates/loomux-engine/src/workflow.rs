@@ -1557,9 +1557,10 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
         // AskUserQuestion deny ADDS a restriction the same hint does not
         // otherwise carry. What neither direction ever touches is
         // `Role::containment()` — the edit/git denial tier `kind` alone
-        // sets — so a liaison still can't edit a file or push regardless of
-        // what its hint grants or denies elsewhere. What IS enforced here is
-        // that a hint can only sit on the kind it is
+        // sets — so a liaison's containment is exactly a plain reviewer's
+        // (`NoEdits`: the CLI's editing tools denied, the shell intact),
+        // whatever its hint grants or denies elsewhere. What IS enforced
+        // here is that a hint can only sit on the kind it is
         // meaningless without: an unrecognized value, or one paired with the
         // wrong kind, is a loud parse error — never coerced, never silently
         // dropped, the same shape `kind_from_str` itself enforces.
