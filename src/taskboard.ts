@@ -715,6 +715,31 @@ export function clearedIds<T extends OrderedRow>(board: readonly T[]): Set<strin
   return closedSubtrees(board, buildTree(board).children, isCleared);
 }
 
+/** Why a focus request (a NEEDS-YOU deep link, #1091 slice C) found no rendered
+ *  row for its target — the three cases the board must tell apart:
+ *
+ *  - `gone` — the id names nothing on the board. The task really can be deleted
+ *    between the request being parked and the render draining it, so this stays
+ *    a SILENT no-op: an error here would fire on an ordinary race.
+ *  - `cleared` — it is on the board and archived, so 👁 is what brings it back.
+ *  - `hidden` — on the board, not archived, and still not rendered: it sits
+ *    inside a collapsed container (#958). Pre-dates #1152; the board simply
+ *    could not say so before.
+ *
+ *  The distinction is the whole point of the finding this answers: the request
+ *  is CONSUMED either way, so without it a deep link onto an off-screen row is
+ *  indistinguishable from one onto a deleted row — both look like a dead click. */
+export type FocusMiss = "gone" | "cleared" | "hidden";
+
+export function focusMiss<T extends OrderedRow>(
+  target: string,
+  board: readonly T[]
+): FocusMiss {
+  const row = board.find((t) => t.id === target);
+  if (!row) return "gone";
+  return isCleared(row) ? "cleared" : "hidden";
+}
+
 /** One sibling list, split into the two halves the board shows in order (#1152):
  *  `manual` — still-live rows in the human's own priority order, untouched —
  *  then the settled ones, most-recently-updated first.
