@@ -762,6 +762,30 @@ fn require_orchestrator(caller: &Caller) -> Result<(), String> {
     }
 }
 
+/// The liaison predicate itself — the CONJUNCTION (`kind: reviewer` **and**
+/// `role_hint: liaison`), in one place.
+///
+/// Extracted because it now has a second reader that is not a gate: `ask_human`
+/// branches its SUCCESS reply on it, since two clauses of the orchestrator's
+/// reply ("mark the affected task blocked", "expect a notice in this pane") are
+/// false for a liaison and were reachable the moment the gate widened (rev-820
+/// B1). A second hand-written copy of the conjunction would be a place for the
+/// two to disagree — and "the gate said liaison, the reply said orchestrator"
+/// is precisely the asymmetry CLAUDE.md's guard convention names.
+///
+/// Deliberately placed ABOVE [`require_orchestrator_or_liaison`]'s doc comment
+/// rather than between it and its `fn` — the same rule [`group_usage_tool`]
+/// states for [`tool_defs`] (#1086), and this helper is the second thing in
+/// this file to be caught by it (rev-825). Consecutive `///` lines merge into
+/// one block that attaches to whatever item comes next, so a helper dropped
+/// into that gap silently re-homes the gate's whole rationale onto itself —
+/// "its two callers", the blast-radius sentence and the `what` parameter all
+/// describing a bool predicate that has none of them — and leaves the gate
+/// undocumented, with nothing in the diff that looks wrong.
+fn caller_is_liaison(caller: &Caller) -> bool {
+    caller.role == Role::Reviewer && caller.role_hint.as_deref() == Some("liaison")
+}
+
 /// The gate for the hint-keyed WIDENINGS on this surface: the orchestrator,
 /// plus a `liaison`-hinted reviewer. `group_usage` (#891 S2) and `ask_human`
 /// (#1091 slice E) are its two callers. See the matching note in [`tool_defs`]
@@ -788,20 +812,6 @@ fn require_orchestrator(caller: &Caller) -> Result<(), String> {
 /// agent at spawn — the same lookup `record_verdict`'s deny layer and
 /// `idle_reap_candidates` make. Nothing an agent can put in a tool argument, a
 /// pane title, or its own prompt reaches this decision.
-/// The liaison predicate itself — the CONJUNCTION (`kind: reviewer` **and**
-/// `role_hint: liaison`), in one place.
-///
-/// Extracted because it now has a second reader that is not a gate: `ask_human`
-/// branches its SUCCESS reply on it, since two clauses of the orchestrator's
-/// reply ("mark the affected task blocked", "expect a notice in this pane") are
-/// false for a liaison and were reachable the moment the gate widened (rev-820
-/// B1). A second hand-written copy of the conjunction would be a place for the
-/// two to disagree — and "the gate said liaison, the reply said orchestrator"
-/// is precisely the asymmetry CLAUDE.md's guard convention names.
-fn caller_is_liaison(caller: &Caller) -> bool {
-    caller.role == Role::Reviewer && caller.role_hint.as_deref() == Some("liaison")
-}
-
 fn require_orchestrator_or_liaison(caller: &Caller, what: &str) -> Result<(), String> {
     if caller.role == Role::Orchestrator || caller_is_liaison(caller) {
         Ok(())
