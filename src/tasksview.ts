@@ -9,6 +9,7 @@ import { invoke, listen, type UnlistenFn } from "./transport.ts";
 import { swapIfConnected } from "./domutil";
 import {
   approvableSelection,
+  blockingAncestor,
   boardUsesDeps,
   boardUsesHierarchy,
   canApprove,
@@ -1054,8 +1055,16 @@ export class TasksView {
     // must not look like plain queued). Deliberately no new accent color —
     // the chips below name the blockers, and the amber/blue accents already
     // mean "waiting on YOU" and "live work".
+    //
+    // A row whose CONTAINER is the one waiting recedes identically (#958 slice
+    // R): it is unstartable for the same reason and must not read as startable.
+    // No chip of its own — the container carries the ✗ chips that say what is
+    // holding it, and a row is only ever visible when every container above it
+    // is expanded, so the explanation is already on screen, one line up.
     const unmet = unmetDeps(t, this.tasks);
-    const depBlocked = t.status === QUEUED_STATUS && unmet.length > 0;
+    const depBlocked =
+      t.status === QUEUED_STATUS &&
+      (unmet.length > 0 || blockingAncestor(t, this.tasks) !== null);
     if (depBlocked) row.classList.add("task-row-dep-blocked");
 
     // Multi-select: tick to add the row to the batch-delete set. A checkbox

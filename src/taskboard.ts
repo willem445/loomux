@@ -221,20 +221,32 @@ export function unmetDeps(task: HasLinks, board: readonly HasLinks[]): string[] 
   return (task.deps ?? []).filter((id) => depState(id, board) !== "met");
 }
 
-/** Derived readiness (#582): `queued` AND every dep `done`. The board mirrors
- *  the backend's `task_ready` rather than reading a `ready` flag off the wire,
- *  because the human's board reads full `Task`s via `orch_tasks` — `ready` is
- *  a `TaskSummary` field, and `TaskSummary` is the MCP `list_tasks` row the
- *  orchestrator gets, not this path. The rules are duplicated on purpose and
- *  pinned by tests on both sides; the alternative (a second derived field on
- *  the human command) would be a new wire shape for something the board can
- *  compute exactly from data it already has.
+/** A board row as far as readiness cares: its links, plus the container chain
+ *  readiness climbs (#958 slice R). Both halves are optional on the wire, so a
+ *  pre-#582 or pre-#958 row satisfies this exactly as it stands. */
+export type ReadinessRow = HasLinks & HasParent;
+
+/** Derived readiness (#582, extended by #958 slice R): `queued`, every dep
+ *  `done`, AND every container above it clear too (`blockingAncestor`). The
+ *  board mirrors the backend's `task_ready` rather than reading a `ready` flag
+ *  off the wire, because the human's board reads full `Task`s via `orch_tasks`
+ *  — `ready` is a `TaskSummary` field, and `TaskSummary` is the MCP
+ *  `list_tasks` row the orchestrator gets, not this path. The rules are
+ *  duplicated on purpose and pinned by tests on both sides; the alternative (a
+ *  second derived field on the human command) would be a new wire shape for
+ *  something the board can compute exactly from data it already has.
  *
  *  Like the backend, this is a read-time projection only: nothing here ever
- *  writes a status, so a wrong link can never wedge a task. `related` never
- *  participates. */
-export function isReady(task: HasLinks, board: readonly HasLinks[]): boolean {
-  return task.status === QUEUED_STATUS && unmetDeps(task, board).length === 0;
+ *  writes a status, so a wrong link — or a hand-edited container — can never
+ *  wedge a task. `related` never participates, at any level. */
+export function isReady(task: ReadinessRow, board: readonly ReadinessRow[]): boolean {
+  return (
+    task.status === QUEUED_STATUS &&
+    unmetDeps(task, board).length === 0 &&
+    // Defined with the rest of the hierarchy helpers below, since that is where
+    // the one ancestor walk lives — this call reaches it by hoisting.
+    blockingAncestor(task, board) === null
+  );
 }
 
 /** Whether this board uses dependencies at all (#582) — the gate for the
@@ -388,6 +400,58 @@ export function indentLevel(depth: number): number {
   return Math.max(0, Math.min(depth, MAX_INDENT_DEPTH));
 }
 
+/** The container chain above a row — its parent, then that row's parent, up to
+ *  a root — NEAREST FIRST, with the row itself never included, and only rows
+ *  that actually exist on the board (a `parent` naming nothing ends the chain,
+ *  which is exactly where `buildTree` puts such a row: the top level).
+ *
+ *  Terminates on any board, the one thing a walk over hand-editable data must
+ *  guarantee: a cycle stops at the first repeat, having listed each member
+ *  once, and reports that it did — `cyclic` is this same walk's other question.
+ *  Mirrors the backend's `find_parent_cycle` (mod.rs), which both of that
+ *  side's callers share for the same reason. */
+function ancestorChain<T extends HasParent>(
+  task: T,
+  byId: ReadonlyMap<string, T>
+): { chain: T[]; cyclic: boolean } {
+  const chain: T[] = [];
+  const seen = new Set([task.id]);
+  let cur = task.parent ?? null;
+  while (cur) {
+    if (seen.has(cur)) return { chain, cyclic: true };
+    seen.add(cur);
+    const row = byId.get(cur);
+    if (!row) break;
+    chain.push(row);
+    cur = row.parent ?? null;
+  }
+  return { chain, cyclic: false };
+}
+
+/** The nearest container above this row whose OWN deps aren't all met (#958
+ *  slice R), or `null` when the whole chain is clear — the board-side mirror of
+ *  the backend's `blocking_ancestor` (mod.rs), and the id is returned rather
+ *  than a boolean so a caller can name the row that is holding this one.
+ *
+ *  Only an ancestor's `deps` are read, never its `status`: a container sitting
+ *  at `in-progress` (or `blocked`, or `pr`) is the normal state while the work
+ *  inside it runs, so gating on status would make a subtask's readiness a
+ *  function of how promptly the container row is maintained. Containment still
+ *  isn't ordering — what climbs the chain here is the ordering primitive
+ *  itself, applied to every container: a feature waiting on something outside
+ *  it is waiting on it for every slice inside it.
+ *
+ *  Tolerant like every other hierarchy helper: an orphan container ends the
+ *  chain and blocks nothing, and a cycle terminates with each member checked
+ *  once. */
+export function blockingAncestor(task: ReadinessRow, board: readonly ReadinessRow[]): string | null {
+  const byId = new Map(board.map((t) => [t.id, t]));
+  for (const anc of ancestorChain(task, byId).chain) {
+    if (unmetDeps(anc, board).length > 0) return anc.id;
+  }
+  return null;
+}
+
 /** Build the containment tree from the flat board (#958).
  *
  *  Tolerant by construction, because `tasks.json` is hand-editable and the
@@ -398,18 +462,10 @@ export function indentLevel(depth: number): number {
 export function buildTree<T extends HasParent>(board: readonly T[]): TaskTree<T> {
   const byId = new Map(board.map((t) => [t.id, t]));
   /** Does walking up from this row ever come back to something it already
-   *  passed? Bounded by the visited set, so it terminates on any board — the
-   *  one thing a walk over hand-editable data must guarantee. */
-  const cyclic = (t: T): boolean => {
-    const seen = new Set([t.id]);
-    let cur = t.parent ?? null;
-    while (cur) {
-      if (seen.has(cur)) return true;
-      seen.add(cur);
-      cur = byId.get(cur)?.parent ?? null;
-    }
-    return false;
-  };
+   *  passed? The same walk `blockingAncestor` needs, asked its other question,
+   *  so the board keeps ONE ancestor walk rather than two that could disagree
+   *  about where a hand-edited chain ends. */
+  const cyclic = (t: T): boolean => ancestorChain(t, byId).cyclic;
   const roots: T[] = [];
   const children = new Map<string, T[]>();
   for (const t of board) {

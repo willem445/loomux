@@ -385,10 +385,14 @@ can add, edit, annotate, reorder, and delete tasks; loomux notifies you when the
   and a dep edge that would close a cycle is rejected with the cycle path named. Use
   `related` for a non-blocking see-also — it never affects readiness.
 - **"What's startable" is `ready: true`, top-of-board first — never a re-derivation.**
-  `ready` means `queued` AND every dep `done` (only `done` counts: a dep at `pr` or
-  `human-testing` is work the human hasn't signed off). Nothing auto-flips a status, so a
-  queued task with unmet deps just reads `ready: false`, and every row's status is in the
-  same response — which dep is holding it is directly readable.
+  `ready` means `queued`, every dep `done`, AND every container above it (`parent`, and its
+  parent, up to the top) having all of ITS deps `done` too — you cannot start a slice whose
+  feature is itself still waiting. Only `done` counts (a dep at `pr` or `human-testing` is work
+  the human hasn't signed off), and only an ancestor's DEPS count — its status is never read,
+  so a child of a container merely marked `blocked` is still startable. Nothing auto-flips a
+  status, so a queued task with unmet deps just reads `ready: false`, and every row's status,
+  deps and parent are in the same response — which dep is holding it, its own or a container's,
+  is directly readable.
 - **Assign with `claim: true`, never a plain `assignee` write.**
   `upsert_task(id: "t-9", assignee: "w-3", claim: true)` refuses unless the task is still
   `queued`, is unassigned or already that same agent's, and has every dep `done` — then
