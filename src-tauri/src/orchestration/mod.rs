@@ -9168,9 +9168,9 @@ pub fn blocking_ancestor<'a>(task: &Task, board: &'a [Task]) -> Option<&'a str> 
 /// `upsert_task`'s `claim` guard — still reads `deps` alone, so a hand-edited
 /// container can dim a row on the board but can never refuse a write.
 pub fn task_ready(task: &Task, board: &[Task]) -> bool {
-    task.status == "queued"
-        && unmet_deps(task, board).is_empty()
-        && blocking_ancestor(task, board).is_none()
+    // SCRATCH BRANCH ONLY — the ancestor clause is set aside here so CI shows
+    // the #958 slice R tests failing without it. Do not merge.
+    task.status == "queued" && unmet_deps(task, board).is_empty()
 }
 
 /// Project a full `Task` down to its `list_tasks` row (#245). Pure so the
