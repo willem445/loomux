@@ -8853,6 +8853,13 @@ pub struct AgentEntry {
 ///   loomux is self-healing it, or it needs the human's Enter
 /// - `waiting` — the pane is parked on a prompt (idle-with-prompt)
 /// - `report`  — a worker reported done (awaiting the human's review/merge)
+/// - `question` — this agent (orchestrator-only today) has a pending
+///   `ask_human` row nobody has answered yet (#1091 slice D); DERIVED from
+///   the `questions.json` registry each scan, never latched, so it clears
+///   the instant the row is answered or withdrawn — but it is the live-pane
+///   PROJECTION of that registry (the asker's pane must still be running),
+///   not the registry itself; a pending row against a stopped pane raises
+///   no item here even though the registry still durably holds it
 /// - `gate`    — this agent's task sits at a human merge gate on the board
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct AttentionItem {
@@ -33635,10 +33642,11 @@ impl OrchRegistry {
     /// from live agent state plus the supplied pty snapshots. Reasons, in
     /// priority order, are `blocked` (reported), `waiting` (parked on a prompt:
     /// output quiet past `ATTENTION_QUIET_MS`, a prompt-shaped tail, and no
-    /// recent human keystroke), `report` (reported done), and `gate` (this
-    /// agent's board task sits at a `pr`/`human-testing`/`blocked` merge gate).
-    /// Pure w.r.t. the OS/pty — the pty reads live in `attention_inputs` — so
-    /// the whole policy is testable with synthetic maps and no real CLI.
+    /// recent human keystroke), `report` (reported done), `question` (this
+    /// agent has a pending `ask_human` row nobody has answered yet), and `gate`
+    /// (this agent's board task sits at a `pr`/`human-testing`/`blocked` merge
+    /// gate). Pure w.r.t. the OS/pty — the pty reads live in `attention_inputs`
+    /// — so the whole policy is testable with synthetic maps and no real CLI.
     pub fn attention_tick(
         &self,
         now: u64,
@@ -33651,6 +33659,41 @@ impl OrchRegistry {
         let groups: HashSet<GroupId> =
             self.agents.lock_safe().values().map(|a| a.group.clone()).collect();
         let mut gate_of: HashMap<String, String> = HashMap::new();
+        // #1091 slice D: pending-question count per asker, across every live
+        // group — DERIVED from the #946 Q1 `questions.json` registry, exactly
+        // like `gate_of` is derived from the board. This map's LIFETIME is the
+        // registry's — a settled/withdrawn question just stops showing up here,
+        // so no dismiss machinery of its own is needed — but the ITEM this
+        // produces below is additionally gated on the asker's pane still being
+        // `AgentStatus::Running` (the per-agent loop below skips non-running
+        // agents before it ever consults this map), same as every other
+        // reason in this scan. So the badge is the live-pane
+        // PROJECTION of the registry, not the registry itself: a question
+        // pending against a stopped pane raises nothing here (no chip, no
+        // toast) even though the registry still durably holds it and slice
+        // C's panel will still show it. `asker` is orchestrator-only today
+        // (`humanq::Question` doc), so in practice this keys the
+        // orchestrator's own pane. A malformed `questions.json` collapses to
+        // "no pending questions" here — the same posture `self.tasks` already
+        // takes for `gate_of` above — rather than failing the whole scan;
+        // `questions()` stays LOUD for its own read-modify-write callers
+        // (`ask_human`, `list_questions`), which is where a human actually
+        // needs to hear about corruption.
+        let mut question_of: HashMap<String, usize> = HashMap::new();
+        for g in &groups {
+            for q in self.questions(g).unwrap_or_default() {
+                // `is_settled()` — not `== Status::Pending` — so a future
+                // non-terminal status (something other than the current
+                // pending/answered/withdrawn three) is still counted here by
+                // the SAME predicate `ask_human`'s own `PENDING_MAX` check
+                // uses (`!q.status.is_settled()`, mod.rs `ask_human`), rather
+                // than by a second, independently-drifting spelling of "not
+                // done yet".
+                if !q.status.is_settled() {
+                    *question_of.entry(q.asker).or_insert(0) += 1;
+                }
+            }
+        }
         for g in &groups {
             for t in self.tasks(g) {
                 // `prototype` is a human gate too (#147): the assigned pane is
@@ -33742,6 +33785,11 @@ impl OrchRegistry {
                 ("waiting", format!("{} is waiting on a prompt", a.name))
             } else if report == Some("done") {
                 ("report", format!("{} reported done — review & merge", a.name))
+            } else if let Some(&count) = question_of.get(a.id.as_str()) {
+                // Non-urgent amber, like `gate` — a question is a decision
+                // waiting on the human's own pace, not a wedged pane.
+                let noun = if count == 1 { "question" } else { "questions" };
+                ("question", format!("{count} pending {noun} — needs your answer"))
             } else if let Some(st) = gate_of.get(a.id.as_str()) {
                 ("gate", format!("task is {st} — awaiting your call"))
             } else {
