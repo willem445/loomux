@@ -896,9 +896,10 @@ fn arg_option_specs(args: &Value, key: &str) -> Result<Option<Vec<super::humanq:
                     let description = match map.get("description") {
                         None | Some(Value::Null) => String::new(),
                         Some(Value::String(d)) => d.clone(),
-                        Some(_) => {
-                            return Err(format!("an {key} \"description\" must be a string"))
-                        }
+                        // [scratch] NEUTERED: a wrong-typed description is
+                        // silently absorbed as "no description" instead of
+                        // being refused.
+                        Some(_) => String::new(),
                     };
                     Ok(super::humanq::OptionSpec::Detailed { label, description })
                 }
