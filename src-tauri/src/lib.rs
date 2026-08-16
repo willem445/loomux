@@ -185,6 +185,8 @@ pub fn run() {
             orchestration::orch_upsert_task,
             orchestration::orch_delete_task,
             orchestration::orch_delete_done_tasks,
+            orchestration::orch_clear_done_tasks,
+            orchestration::orch_restore_cleared_tasks,
             orchestration::orch_delete_tasks,
             orchestration::orch_reorder_tasks,
             orchestration::orch_open_ref,

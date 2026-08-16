@@ -9120,6 +9120,29 @@ pub struct Task {
     /// rather than opening anything.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub demo_path: Option<String>,
+    /// When the HUMAN cleared this row out of their board view (#1152) — an
+    /// archive stamp, never a delete. A long-lived group's board is mostly
+    /// history (400+ rows, nearly all `done`), and the human needs the finished
+    /// ones out of the scroll path without losing them: the row, its notes and
+    /// its links all stay here, the write is audited, and one click puts it
+    /// back. Same additive, skipped-when-absent contract as `parent`/`kind`/
+    /// `demo_path`, and for `demo_path`'s exact reason: most boards will never
+    /// use it, so a null must not appear on every row of a file humans read.
+    ///
+    /// **Written by the human's own commands only** (`orch_clear_done_tasks`,
+    /// `orch_restore_cleared_tasks`, and the human board's `orch_upsert_task`).
+    /// No MCP tool sets it and no agent can: it is the human's view of their own
+    /// board, and an agent tidying rows out of the human's sight is the one
+    /// thing this must never become.
+    ///
+    /// **Deliberately NOT read by anything agent-facing.** `TaskSummary` does
+    /// not carry it and `list_tasks` does not filter on it, so the
+    /// newest-`LIST_TASKS_DONE_CAP` rule keeps meaning exactly what it meant.
+    /// The board reads it as an archive marker only while the row is still
+    /// `done` (see the frontend's `isCleared`), so a reopened task comes back
+    /// into view without a repair pass having to wipe the stamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleared_ms: Option<u64>,
     #[serde(default)]
     pub updated_ms: u64,
 }
@@ -9725,6 +9748,15 @@ pub struct TaskPatch {
     /// Worktree path for a demo of this item (#1091 slice B) — same
     /// untouched/empty-clears rule as `pr`/`pr_base`. See `Task::demo_path`.
     pub demo_path: Option<String>,
+    /// The human's archive stamp (#1152): `None` leaves it untouched,
+    /// `Some(true)` stamps it with now, `Some(false)` clears it. A bool rather
+    /// than a timestamp because the caller has no business choosing WHEN it was
+    /// archived — the same reason `note` takes text and not a `ts_ms`.
+    ///
+    /// Reachable only from the human board's `orch_upsert_task`; `mcp.rs`
+    /// spells this field out as `None` rather than defaulting it, so an agent
+    /// cannot reach it and a future field cannot leak there by omission.
+    pub cleared: Option<bool>,
     /// Atomic claim (#582): guard this write on the task still being
     /// unclaimed, `queued`, and dep-satisfied, then set assignee + status in
     /// the same locked write. A plain (non-claim) upsert keeps its historic
@@ -24794,6 +24826,7 @@ impl OrchRegistry {
                     parent: None,
                     kind: None,
                     demo_path: None,
+                    cleared_ms: None,
                     updated_ms: 0,
                 });
                 tasks.len() - 1
@@ -24988,6 +25021,16 @@ impl OrchRegistry {
         if patch.kind.is_some() {
             task.kind = patch.kind.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
         }
+        // #1152. Applied after `status` above, deliberately: a patch that
+        // reopens a row and clears its archive stamp in one call must end with
+        // the stamp gone, whatever order the caller wrote the two arguments in.
+        // A stamp on a row that is NOT `done` is inert rather than illegal —
+        // the board honours it only while the row is done — so there is nothing
+        // to validate here, and the read-time rule is what keeps a reopened
+        // task visible without a repair pass.
+        if let Some(cleared) = patch.cleared {
+            task.cleared_ms = if cleared { Some(now_ms()) } else { None };
+        }
         // Last, so the claim's own two fields are what the guards above
         // approved — never a leftover from the generic patch application.
         if claim {
@@ -25073,6 +25116,83 @@ impl OrchRegistry {
             &format!("deleted {n} done task{}", if n == 1 { "" } else { "s" }),
         );
         Ok(removed)
+    }
+
+    /// Archive every `done` row out of the human's board view in a single
+    /// write, returning the ids stamped (empty if there was nothing to do)
+    /// — #1152's "clear completed items", and the NON-destructive twin of
+    /// `delete_done_tasks` above.
+    ///
+    /// Three properties, each load-bearing:
+    ///
+    /// - **Nothing is deleted.** Every row stays in `tasks.json` with its
+    ///   notes, links and container intact; all that changes is a `cleared_ms`
+    ///   stamp the human's board reads as "out of my way". `restore_cleared_tasks`
+    ///   below undoes it, and the audit entry records the batch either way.
+    /// - **`updated_ms` is deliberately NOT touched.** That field is what
+    ///   `filter_done_rows` picks the newest `LIST_TASKS_DONE_CAP` `done` rows
+    ///   by, so stamping 250 rows with a fresh `updated_ms` would silently
+    ///   rewrite which twenty the orchestrator sees on its next `list_tasks` —
+    ///   a human view action reaching into an agent's read. Clearing composes
+    ///   with that cap by leaving its input alone.
+    /// - **No board-change notice.** `notify_board_edit` exists to tell the
+    ///   orchestrator its queue moved, and this moves nothing: no status, no
+    ///   priority, no link, and nothing `TaskSummary` even carries. It is the
+    ///   `reorder_tasks` precedent (a board write the orchestrator is
+    ///   deliberately not interrupted for), not the `delete_done_tasks` one,
+    ///   and on a 250-row batch the alternative is a prompt about a view
+    ///   preference. The audit log is where it is recorded.
+    pub fn clear_done_tasks(&self, group: &GroupId, actor: &str) -> Result<Vec<String>, String> {
+        let _guard = self.tasks_lock.lock_safe();
+        let mut tasks = self.tasks(group);
+        let now = now_ms();
+        let mut cleared: Vec<String> = Vec::new();
+        for t in tasks.iter_mut() {
+            // Already-cleared rows are skipped rather than re-stamped: a second
+            // click must not rewrite the archive date of rows it isn't
+            // archiving, and the returned list is then what actually changed.
+            if t.status == "done" && t.cleared_ms.is_none() {
+                t.cleared_ms = Some(now);
+                cleared.push(t.id.clone());
+            }
+        }
+        if cleared.is_empty() {
+            return Ok(cleared);
+        }
+        self.write_tasks(group, &tasks)?;
+        self.audit(group, actor, "task-clear-done", json!({ "ids": cleared }));
+        Ok(cleared)
+    }
+
+    /// Un-archive a specific set of rows by id in a single board write (#1152),
+    /// returning the ids actually restored. The counterpart to
+    /// `clear_done_tasks`, backing both the board's per-row ↩ and its bulk
+    /// "restore all". Ids that name no row, or a row carrying no stamp, are
+    /// skipped rather than errored — the board can change under the human's
+    /// click — and the returned list is what actually moved. Like the clear, it
+    /// leaves `updated_ms` alone and raises no board-change notice.
+    pub fn restore_cleared_tasks(
+        &self,
+        group: &GroupId,
+        actor: &str,
+        ids: &[String],
+    ) -> Result<Vec<String>, String> {
+        let _guard = self.tasks_lock.lock_safe();
+        let wanted: HashSet<&str> = ids.iter().map(String::as_str).collect();
+        let mut tasks = self.tasks(group);
+        let mut restored: Vec<String> = Vec::new();
+        for t in tasks.iter_mut() {
+            if wanted.contains(t.id.as_str()) && t.cleared_ms.is_some() {
+                t.cleared_ms = None;
+                restored.push(t.id.clone());
+            }
+        }
+        if restored.is_empty() {
+            return Ok(restored);
+        }
+        self.write_tasks(group, &tasks)?;
+        self.audit(group, actor, "task-restore-cleared", json!({ "ids": restored }));
+        Ok(restored)
     }
 
     /// Delete a specific set of tasks by id in a single board write, returning
@@ -48437,6 +48557,9 @@ pub async fn orch_upsert_task(
     // demo_path edits (the orchestrator sets it through the MCP `upsert_task`
     // tool's own arm — see `mcp.rs`).
     demo_path: Option<String>,
+    // #1152: the human's archive stamp. Same additive contract; absent means
+    // "leave it alone". Human-only by construction — no MCP tool takes it.
+    cleared: Option<bool>,
 ) -> Result<Task, String> {
     let reg = reg_of(&app);
     let group_id = command_group(&group_id)?;
@@ -48445,7 +48568,17 @@ pub async fn orch_upsert_task(
             &group_id,
             "human",
             id.as_deref(),
-            TaskPatch { title, status, note, deps, parent, kind, demo_path, ..Default::default() },
+            TaskPatch {
+                title,
+                status,
+                note,
+                deps,
+                parent,
+                kind,
+                demo_path,
+                cleared,
+                ..Default::default()
+            },
         )?;
         reg.notify_board_edit(&group_id, &format!("{} \"{}\" is now {}", task.id, task.title, task.status));
         Ok(task)
@@ -48499,6 +48632,53 @@ pub async fn orch_delete_done_tasks(
     let reg = reg_of(&app);
     let group_id = command_group(&group_id)?;
     run_blocking(move || reg.delete_done_tasks(&group_id, "human")).await
+}
+
+/// Clear every `done` task out of the human's board view (#1152) — the board's
+/// "clear done" action. **Archives, never deletes**: each row keeps its place,
+/// notes and links in `tasks.json` and only gains a `cleared_ms` stamp, which
+/// `orch_restore_cleared_tasks` below removes again. Returns the ids stamped so
+/// the frontend can confirm what moved.
+///
+/// A HUMAN command with no MCP counterpart, deliberately: this is the human's
+/// view of their own board, and an agent tidying rows out of their sight is the
+/// one thing the feature must never become.
+///
+/// Off-thread (#762): one full-board rewrite under `tasks_lock` plus an audit,
+/// exactly like its delete-shaped neighbours.
+///
+/// **Reentrancy.** The family argument on [`orch_upsert_task`]. Specific to
+/// this one: the selection is computed inside the guard, from the board this
+/// call is about to rewrite — so a row an agent moved to `done` a millisecond
+/// earlier is either wholly archived or wholly not, and the returned list is
+/// what was actually stamped rather than what the frontend guessed.
+#[tauri::command]
+pub async fn orch_clear_done_tasks(
+    app: AppHandle,
+    group_id: String,
+) -> Result<Vec<String>, String> {
+    let reg = reg_of(&app);
+    let group_id = command_group(&group_id)?;
+    run_blocking(move || reg.clear_done_tasks(&group_id, "human")).await
+}
+
+/// Bring cleared tasks back into the human's board view (#1152) — the board's
+/// per-row ↩ and its bulk "restore all", which differ only in how many ids they
+/// send. Unknown ids, and ids naming a row that was never cleared, are skipped
+/// rather than errored (the board can change under the human's click); the
+/// returned list is what actually moved.
+///
+/// Off-thread (#762) and the same reentrancy argument as
+/// [`orch_clear_done_tasks`] above.
+#[tauri::command]
+pub async fn orch_restore_cleared_tasks(
+    app: AppHandle,
+    group_id: String,
+    ids: Vec<String>,
+) -> Result<Vec<String>, String> {
+    let reg = reg_of(&app);
+    let group_id = command_group(&group_id)?;
+    run_blocking(move || reg.restore_cleared_tasks(&group_id, "human", &ids)).await
 }
 
 /// Delete a specific set of tasks by id — the board's multi-select "delete

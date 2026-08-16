@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-orch-restore-cleared-tasks"
+description = "Enables the orch_restore_cleared_tasks command without any pre-configured scope."
+commands.allow = ["orch_restore_cleared_tasks"]
+
+[[permission]]
+identifier = "deny-orch-restore-cleared-tasks"
+description = "Denies the orch_restore_cleared_tasks command without any pre-configured scope."
+commands.deny = ["orch_restore_cleared_tasks"]

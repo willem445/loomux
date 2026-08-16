@@ -1220,6 +1220,13 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                     // board does not have.
                     parent: arg_str_strict(args, "parent")?.map(str::to_string),
                     kind: arg_str_strict(args, "kind")?.map(str::to_string),
+                    // #1152: the human board's archive stamp, spelled out as
+                    // `None` rather than swept up by `..Default::default()`.
+                    // The field is the HUMAN's view of their own board and no
+                    // MCP tool exposes it — writing it here explicitly is what
+                    // makes that a decision on the record, and what stops a
+                    // future `TaskPatch` field from reaching agents by omission.
+                    cleared: None,
                     claim,
                 },
             )?;

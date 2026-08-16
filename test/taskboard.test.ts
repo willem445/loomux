@@ -15,10 +15,16 @@ import {
   canApprove,
   canProceed,
   childCounts,
+  clearableCount,
+  clearedIds,
   DEMO_STATUSES,
   depCandidates,
   depState,
   doneCount,
+  isCleared,
+  orderSiblings,
+  positionAmong,
+  settledIds,
   grantableCount,
   hasMissingParent,
   indentLevel,
@@ -543,11 +549,18 @@ const row = (id: string, status = "queued", parent?: string, kind?: string) => (
   ...(kind === undefined ? {} : { kind }),
 });
 
-test("a board with no hierarchy renders exactly as it does today", () => {
+test("a board with no hierarchy renders flat, in board order, with no collapse gutter", () => {
   // The regression pin that matters most: every existing board arrives with no
   // `parent` key at all, and must come out of visibleRows in board order, flat,
   // with no collapse affordance anywhere.
-  const board = [row("t-1"), row("t-2", "done"), row("t-3")];
+  //
+  // Every row here is LIVE on purpose (#1152). This specimen used to carry a
+  // `done` row in the middle, which stopped witnessing "board order" the moment
+  // finished subtrees started sinking below the live work — a done row's
+  // position is now derived, so it can no longer stand for a row whose position
+  // is the board's. The relevant-first tests below own that half; this one keeps
+  // the flat/board-order property on rows it is still true of.
+  const board = [row("t-1"), row("t-2", "in-progress"), row("t-3")];
   assert.deepEqual(
     visibleRows(board).map((r) => [r.task.id, r.depth, r.hasChildren]),
     [["t-1", 0, false], ["t-2", 0, false], ["t-3", 0, false]]
@@ -883,4 +896,255 @@ test("a pending question citing a task id nothing on the board carries marks not
   assert.equal(boardMarker(board[0], map), null);
   // The orphaned citation doesn't wipe t-2's OWN demo-gated signal either.
   assert.deepEqual(boardMarker(board[1], map), { kind: "demo", target: "t-2" });
+});
+
+// --- relevant-first order and the cleared archive (#1152) ---
+
+/** A board row for the ordering projection: the hierarchy field above plus the
+ *  two #1152 reads — `updated_ms` (how the finished half is ordered) and
+ *  `cleared_ms` (the human's archive stamp). Both absent on every pre-#1152
+ *  board, so both are optional here too. */
+const orow = (
+  id: string,
+  status = "queued",
+  extra: { parent?: string; updated_ms?: number; cleared_ms?: number } = {}
+) => ({ id, status, ...extra });
+
+test("finished work sinks below the live work, and live priority order is untouched", () => {
+  // The human's ask (#1152): on a 400-row board the items anyone can act on
+  // must not be scattered among hundreds of done rows. What must NOT change is
+  // the drag order among the live ones — board order IS priority order, and
+  // "top = next" is a contract the orchestrator reads.
+  const board = [
+    orow("t-1", "done", { updated_ms: 10 }),
+    orow("t-2", "queued"),
+    orow("t-3", "done", { updated_ms: 30 }),
+    orow("t-4", "in-progress"),
+    orow("t-5", "done", { updated_ms: 20 }),
+    orow("t-6", "blocked"),
+  ];
+  assert.deepEqual(
+    visibleRows(board).map((r) => r.task.id),
+    // Live rows first, in exactly the array order they had; then the finished
+    // ones, newest-finished first.
+    ["t-2", "t-4", "t-6", "t-3", "t-5", "t-1"]
+  );
+  // And the split is reported on the row, which is what turns the manual
+  // reorder buttons off and explains why.
+  assert.deepEqual(
+    visibleRows(board).map((r) => r.settled),
+    [false, false, false, true, true, true]
+  );
+});
+
+test("ties in the finished half break on board order, never on an arbitrary sort", () => {
+  // A board whose rows carry no `updated_ms` at all must keep its own order
+  // rather than being shuffled by an unstable comparison.
+  const board = [orow("t-1", "done"), orow("t-2", "queued"), orow("t-3", "done")];
+  assert.deepEqual(visibleRows(board).map((r) => r.task.id), ["t-2", "t-1", "t-3"]);
+  // Same when the stamps are equal.
+  const tied = [
+    orow("t-1", "done", { updated_ms: 7 }),
+    orow("t-2", "done", { updated_ms: 7 }),
+    orow("t-3", "queued"),
+  ];
+  assert.deepEqual(visibleRows(tied).map((r) => r.task.id), ["t-3", "t-1", "t-2"]);
+});
+
+test("a done container holding live work does NOT sink, so the live row stays visible", () => {
+  // The failure this pins is losing work off the bottom of the board: sinking
+  // a container takes its whole subtree with it, so the rule has to be
+  // "finished, with nothing unfinished inside", not "status says done".
+  const board = [
+    orow("t-1", "done", { updated_ms: 50 }),
+    orow("t-2", "queued", { parent: "t-1" }),
+    orow("t-3", "queued"),
+  ];
+  assert.deepEqual(visibleRows(board).map((r) => [r.task.id, r.settled]), [
+    ["t-1", false],
+    ["t-2", false],
+    ["t-3", false],
+  ]);
+  // Finish the child and the whole subtree settles as one unit.
+  const finished = [
+    orow("t-1", "done", { updated_ms: 50 }),
+    orow("t-2", "done", { parent: "t-1", updated_ms: 51 }),
+    orow("t-3", "queued"),
+  ];
+  assert.deepEqual(visibleRows(finished).map((r) => [r.task.id, r.settled]), [
+    ["t-3", false],
+    ["t-1", true],
+    ["t-2", true],
+  ]);
+  assert.deepEqual([...settledIds(finished)].sort(), ["t-1", "t-2"]);
+});
+
+test("sinking happens inside every container, not only at the top level", () => {
+  const board = [
+    orow("t-1"),
+    orow("t-2", "done", { parent: "t-1", updated_ms: 5 }),
+    orow("t-3", "queued", { parent: "t-1" }),
+    orow("t-4", "in-progress", { parent: "t-1" }),
+  ];
+  assert.deepEqual(
+    visibleRows(board).map((r) => [r.task.id, r.depth]),
+    [["t-1", 0], ["t-3", 1], ["t-4", 1], ["t-2", 1]]
+  );
+});
+
+test("a hand-edited containment cycle never sinks or hides, and still renders once", () => {
+  // closedSubtrees fails safe on a cycle: a row it cannot finish walking is
+  // never treated as a closed finished/cleared subtree, so the tolerate-and-show
+  // rule (section 5 of doc/design/task-hierarchy.md) survives the projection.
+  const board = [
+    orow("t-1", "done", { parent: "t-2", cleared_ms: 1 }),
+    orow("t-2", "done", { parent: "t-1", cleared_ms: 1 }),
+    orow("t-3", "queued"),
+  ];
+  const ids = visibleRows(board).map((r) => r.task.id);
+  assert.equal(ids.length, 3);
+  assert.deepEqual([...ids].sort(), ["t-1", "t-2", "t-3"]);
+  assert.equal(settledIds(board).size, 0);
+  assert.equal(clearedIds(board).size, 0);
+});
+
+test("cleared rows drop out of the list and come back on request — nothing is lost", () => {
+  const board = [
+    orow("t-1", "done", { updated_ms: 10, cleared_ms: 999 }),
+    orow("t-2", "queued"),
+    orow("t-3", "done", { updated_ms: 20 }),
+  ];
+  assert.deepEqual(visibleRows(board).map((r) => r.task.id), ["t-2", "t-3"]);
+  const shown = visibleRows(board, [], true);
+  assert.deepEqual(shown.map((r) => r.task.id), ["t-2", "t-3", "t-1"]);
+  // The archive marker is reported per row so the view can label it and offer
+  // the per-row undo.
+  assert.deepEqual(shown.map((r) => r.cleared), [false, false, true]);
+});
+
+test("reopening a cleared task brings it straight back, with no repair pass", () => {
+  // The stamp alone must not hide a row: `isCleared` honours it only while the
+  // row is still `done`, so the orchestrator moving an archived task back to
+  // in-progress cannot leave live work invisible on the human's board.
+  const reopened = orow("t-1", "in-progress", { cleared_ms: 999 });
+  assert.equal(isCleared(reopened), false);
+  assert.equal(isCleared(orow("t-1", "done", { cleared_ms: 999 })), true);
+  assert.equal(isCleared(orow("t-1", "done")), false);
+  assert.deepEqual(visibleRows([reopened, orow("t-2")]).map((r) => r.task.id), ["t-1", "t-2"]);
+});
+
+test("a cleared container holding a live child stays on the board", () => {
+  // Hiding it would take the live child off the board with it — the same
+  // whole-subtree rule the sink uses, applied to the archive.
+  const board = [
+    orow("t-1", "done", { cleared_ms: 1 }),
+    orow("t-2", "queued", { parent: "t-1" }),
+  ];
+  assert.deepEqual(visibleRows(board).map((r) => r.task.id), ["t-1", "t-2"]);
+  assert.equal(clearedIds(board).size, 0);
+});
+
+test("the clear button counts what it would archive, not what is already archived", () => {
+  const board = [
+    orow("t-1", "done", { cleared_ms: 5 }),
+    orow("t-2", "done"),
+    orow("t-3", "queued"),
+    orow("t-4", "done"),
+  ];
+  assert.equal(clearableCount(board), 2);
+  // doneCount is the DESTRUCTIVE button's number and deliberately still counts
+  // every done row, archive included: understating what one confirm click
+  // destroys would be worse than two counts that look alike.
+  assert.equal(doneCount(board), 3);
+  // Nothing left to clear once they are all stamped.
+  assert.equal(clearableCount(board.map((t) => ({ ...t, cleared_ms: 5 }))), 0);
+});
+
+test("a board whose every row is cleared renders nothing — the view says so instead", () => {
+  // tasksview renders its own "everything here is cleared" line off this: an
+  // empty row list on a NON-empty board must never fall through to the "no
+  // tasks yet" message, which on a 400-row board would read as data loss.
+  const board = [orow("t-1", "done", { cleared_ms: 1 }), orow("t-2", "done", { cleared_ms: 1 })];
+  assert.equal(visibleRows(board).length, 0);
+  assert.equal(visibleRows(board, [], true).length, 2);
+});
+
+test("one reorder step is one step ON SCREEN, skipping the rows the board sank", () => {
+  // The dead click this pins: with a done row stored between two live ones, a
+  // move computed against the stored array swaps the live row with a row the
+  // human cannot see next to it, and the click appears to do nothing.
+  const board = [
+    orow("t-1", "queued"),
+    orow("t-2", "done", { updated_ms: 1 }),
+    orow("t-3", "queued"),
+  ];
+  assert.deepEqual(visibleRows(board).map((r) => r.task.id), ["t-1", "t-3", "t-2"]);
+  // t-1 down one: it must end up BELOW t-3 on screen.
+  const sent = reorderWithSubtree(board, "t-1", 1);
+  assert.deepEqual(sent, ["t-2", "t-3", "t-1"]);
+  const after = sent.map((id) => board.find((t) => t.id === id) as (typeof board)[number]);
+  assert.deepEqual(visibleRows(after).map((r) => r.task.id), ["t-3", "t-1", "t-2"]);
+  // And symmetrically upward.
+  assert.deepEqual(reorderWithSubtree(board, "t-3", -1), ["t-3", "t-1", "t-2"]);
+});
+
+test("a reorder never moves a settled row out of its own stored position", () => {
+  // The display rule is a projection. If a click rewrote the array into
+  // relevant-first order it would be silently re-prioritising rows on the
+  // orchestrator's own queue file as a side effect of a view preference.
+  const board = [
+    orow("t-1", "done", { updated_ms: 1 }),
+    orow("t-2", "queued"),
+    orow("t-3", "done", { updated_ms: 2 }),
+    orow("t-4", "queued"),
+  ];
+  // Exactly one row moves. The order sent is the stored one with the moved row
+  // lifted out and dropped beside its displayed neighbour — every other row,
+  // the two settled ones included, keeps its relative place.
+  const others = (sent: string[]) => sent.filter((id) => id !== "t-2" && id !== "t-4");
+  const down = reorderWithSubtree(board, "t-2", 1);
+  assert.deepEqual(down, ["t-1", "t-3", "t-4", "t-2"]);
+  assert.deepEqual(others(down), ["t-1", "t-3"]);
+  const up = reorderWithSubtree(board, "t-4", -1);
+  assert.deepEqual(up, ["t-1", "t-4", "t-2", "t-3"]);
+  assert.deepEqual(others(up), ["t-1", "t-3"]);
+  // Either way the human sees the same thing: t-4 is now the top priority.
+  const shown = (sent: string[]) =>
+    visibleRows(sent.map((id) => board.find((t) => t.id === id) as (typeof board)[number])).map(
+      (r) => r.task.id
+    );
+  assert.deepEqual(shown(down), ["t-4", "t-2", "t-3", "t-1"]);
+  assert.deepEqual(shown(up), ["t-4", "t-2", "t-3", "t-1"]);
+  // The live rows are at the ends of the manual list, so these are no-ops that
+  // still return the whole current order.
+  assert.deepEqual(reorderWithSubtree(board, "t-2", -1), ["t-1", "t-2", "t-3", "t-4"]);
+  assert.deepEqual(reorderWithSubtree(board, "t-4", 1), ["t-1", "t-2", "t-3", "t-4"]);
+});
+
+test("a settled row is not in the manual priority list, so both arrows are off", () => {
+  const board = [orow("t-1", "queued"), orow("t-2", "done"), orow("t-3", "queued")];
+  assert.deepEqual(siblingPosition(board, "t-1"), { index: 0, count: 2 });
+  assert.deepEqual(siblingPosition(board, "t-3"), { index: 1, count: 2 });
+  // {index:-1} is what disables both buttons in tasksview — a finished row's
+  // place is derived (newest-first), so a manual step there would contradict
+  // the order the board just told the human it was using.
+  assert.deepEqual(siblingPosition(board, "t-2"), { index: -1, count: 0 });
+  // Asking one to move is a no-op that still returns the whole current order.
+  assert.deepEqual(reorderWithSubtree(board, "t-2", -1), ["t-1", "t-2", "t-3"]);
+  assert.deepEqual(reorderWithSubtree(board, "t-2", 1), ["t-1", "t-2", "t-3"]);
+});
+
+test("orderSiblings splits one sibling list without mutating the tree's own array", () => {
+  const siblings = [
+    orow("t-1", "done", { updated_ms: 1 }),
+    orow("t-2"),
+    orow("t-3", "done", { updated_ms: 9 }),
+  ];
+  const before = siblings.map((t) => t.id);
+  const { manual, ordered } = orderSiblings(siblings, new Set(["t-1", "t-3"]));
+  assert.deepEqual(manual.map((t) => t.id), ["t-2"]);
+  assert.deepEqual(ordered.map((t) => t.id), ["t-2", "t-3", "t-1"]);
+  assert.deepEqual(siblings.map((t) => t.id), before, "siblingRows hands back the tree's own array");
+  assert.deepEqual(positionAmong(manual, "t-2"), { index: 0, count: 1 });
+  assert.deepEqual(positionAmong(manual, "t-3"), { index: -1, count: 0 });
 });
