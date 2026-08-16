@@ -2,11 +2,12 @@
 
 *#946. This note covers slice Q1: the registry, its MCP tools, and the trusted
 answer surface — plus, from #1091, the shape of the ask itself (slice A), the
-demo half of the same human-attention surface (slice B) and the protocol prose
-plus the liaison's pose gate (slice E). The NEEDS-YOU panel (#1091 C, the Q2
-surface), the structural deny of the blocking dialog (Q4) and the chat bridge
-(#947 / T1) sit on top of what is described here and extend this note as they
-land.*
+demo half of the same human-attention surface (slice B), the NEEDS-YOU panel and
+its board deep-link (slices C and G, the Q2 surface), the derived attention
+reason and opt-in toast (slice D), and the protocol prose plus the liaison's
+pose gate (slice E). The structural deny of the blocking dialog (Q4) and the
+chat bridge (#947 / T1) sit on top of what is described here and extend this
+note as they land.*
 
 ## The problem
 
@@ -114,8 +115,12 @@ core carries `#[serde(default)]`, so a file written by an older build loads.
 | `created_ms` | |
 | `answer`, `settled_by`, `settled_ms` | present once settled |
 
-`urgency` is carried but not yet acted on — Q2 keys the attention item and the
-opt-in toast off it. It is in the schema from the first slice because the
+**`urgency` is carried and rendered, but does not key either the attention item
+or the toast.** The NEEDS-YOU panel (slice C) reads it to flag a question's own
+card with a red "urgent" tag; the derived `question` attention reason (slice D)
+and the opt-in toast do not branch on it at all — every pending question raises
+the same non-urgent amber `question` chip regardless of `urgency`, the same
+posture `gate` already has. It is in the schema from the first slice because the
 persisted shape is a contract, and adding a field later means migrating files
 that are already holding questions a human has not answered.
 
@@ -290,7 +295,9 @@ What is **not** here is the human's half:
   latched attention reason and the opt-in toast are Q2. Until then a registered
   question is visible only in `questions.json`, in the audit log, and to agents
   through `list_questions` — the trusted answer command exists
-  (`orch_question_answer`) but nothing in the UI calls it.
+  (`orch_question_answer`) but nothing in the UI calls it. *(Delivered by
+  #1091 slices C and D, below — this paragraph describes the state at Q1's
+  merge and is left as the record of it.)*
 - **No role template teaches the protocol.** Q3 rewrites the orchestrator's
   open-question invariant — mark the task blocked citing `q-N`, re-surface from
   `list_questions`, un-block only that task on the answer. Until it lands, an
@@ -360,14 +367,14 @@ returns (#245's size constraint: that row stays minimal by construction, and
 slice B's plan never asked to widen it). A caller that needs
 `demo_path` reads the full record: `get_task` (MCP) or `orch_tasks` (the human
 board's own Tauri read, already full `Task`s) — so the panel this field exists
-for (slice C, not yet built) needs no new read surface either.
+for (slice C) needed no new read surface either.
 
-**What slice B does not build.** No UI renders `demo_path` yet — that is the
-NEEDS-YOU panel's DEMOS section (slice C) and the task-board marker + deep-link
-(slice G). Until either lands, a recorded `demo_path` is visible only in
-`tasks.json`, in the audit log, and to an MCP caller of `get_task` — **never**
-`list_tasks`, which deliberately omits it (above) — reachable, not yet
-surfaced.
+**What slice B did not build, at the time it landed.** No UI rendered
+`demo_path` — a recorded path was visible only in `tasks.json`, in the audit
+log, and to an MCP caller of `get_task` (never `list_tasks`, which deliberately
+omits it, above). That gap closed with the NEEDS-YOU panel's DEMOS section
+(slice C) and the task-board marker + deep-link (slice G) — both shipped; see
+the slice C/D/G section below.
 
 ### Slice E: the protocol lives in the contract, and the liaison can pose
 
@@ -449,3 +456,64 @@ The capability argument for the grant itself, and why the "it only reads"
 reasoning that carried `group_usage` does **not** carry a write, is in
 `doc/design/liaison.md` — that note owns the enumeration of every hint-keyed
 exception, and a rule invisible there is the surprise it exists to prevent.
+
+### Slices C, D, G: the NEEDS-YOU panel, the derived attention reason, and the board deep-link
+
+The human's half Q1 left open (above) is now shipped, in three pieces that stay
+disjoint on purpose (plan-783's D-vs-H conflict-avoidance note): a presenter
+(C), a badge (D), and a board-side pointer at both (G). None of them adds a
+Tauri command, a registry, or a second copy of a status set — each is wiring
+over what Q1/slice B already persisted.
+
+**Slice C — the panel.** A new `decisions` `EmbedKind` on orchestrator panes
+(`Alt+Q`), built the same way every other embed is: an overlay/flex-slot pane
+feature, never a PTY resize (constraint 1). It reads `orch_questions_list` and
+`orch_tasks` and writes through the commands that already existed —
+`orch_question_answer` for a decision, `orch_proceed_task`/
+`orch_request_changes`/`orch_upsert_task` for a demo (the same calls the task
+board's own buttons make) — so the panel and the board can never disagree about
+either record. Two projections, `decisions.ts`'s pure core: pending questions
+(unanswered) plus a faded settled tail capped at `SETTLED_SHOWN` (10, mirroring
+`LIST_SETTLED_CAP`), and demo-gated board rows (`prototype`/`human-testing`),
+each carrying whichever `demo_path`/`pr` the board holds. Answering composes the
+chosen option labels (verbatim) and any free text into the one string
+`answer_question` accepts — no structured `selected[]`, per the "answer stays
+one string" rule above.
+
+The panel-to-board direction (a question's card links to the `task` it cites)
+and the board-to-panel direction slice G adds both ride one generic mechanism,
+`pane.ts`'s `requestEmbedFocus(kind, target)` over `embedfocus.ts`'s
+`PendingEmbedFocus`: it parks a target id — one slot per embed kind, replacing
+any undrained request for that kind rather than queueing — and lazily
+constructs/opens the named embed, which drains the request (`take`, once) on
+its own next render, since every embed is lazily constructed and renders from
+an async refresh, so the target row may not exist yet at request time. Built
+once in slice C because both directions need it and it is intra-pane wiring,
+not a new command — see `src/embedfocus.ts` and `doc/design/embedded-panels.md`
+for the surrounding embed-engine contract it rides.
+
+**Slice D — the derived attention reason.** The 3-second attention scan gains a
+`question` reason: any agent with a pending question it asked (`q.asker`,
+counted from `questions.json`) gets a non-urgent amber chip, "N pending
+question(s)" — ranked below `blocked`/`stranded`/`waiting`/`report` and above
+`gate` in the scan's priority order, and re-derived every tick rather than
+latched, so it clears the instant the last pending row is answered or
+withdrawn. It rides the existing per-group opt-in desktop-toast path
+(`attention_toast_targets`) for free — that path already fires for every
+reason **except** `gate`, so a fresh question toasts exactly like a
+blocked/report event once a group opts in, while a task merely reaching a merge
+or demo gate (too common to alert on — every PR does it) still does not. See
+the `urgency` correction above: this reason and its toast do not read
+`urgency` at all.
+
+**Slice G — the board marker + deep-link.** `taskboard.ts` derives, never
+stores, two signals per row: **decision-blocked** — a pending question whose
+`task` names this row (`blockedTaskMap`, built once per board render from the
+pending-questions list) — and **demo-gated** — `isDemoGated`, the same status
+set (`prototype`/`human-testing`) the panel's own DEMOS tier uses, moved here
+from `decisions.ts` and re-exported so neither module holds its own copy.
+`boardMarker` projects at most one chip per row: decision wins when a row is
+somehow both, because it is the more specific, more blocking ask. The chip
+routes through the same focus hook slice C built, opening the NEEDS-YOU panel
+at the citing question (a decision chip) or at the row's own card (a demo
+chip).
