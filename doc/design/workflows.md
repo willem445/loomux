@@ -1051,7 +1051,8 @@ hex characters, refuses *this condition* and says so.
       merge:
         require: all-pass        # or: threshold: 2
         reviewers: [rev-security, rev-tests]
-        also: [ci-green, body-unchanged]
+        also: [ci-green, body-unchanged, base-green]
+        max_diff_lines: 800      # optional; omit for no limit
 
 `all-pass` (the default when `require:` is omitted) needs every named reviewer to
 have recorded a `pass` — so **a reviewer that has recorded nothing keeps the gate
@@ -1065,13 +1066,126 @@ merge over a `fail`.
 absent). **`body-unchanged`** (#565, previous section) re-reads the PR body at
 merge time and refuses if it is not the one the live passes were recorded
 against — for repos that squash-merge, where the body is the commit message.
-Anything this build does not know how to check **fails closed** — the
+**`base-green`** (#1174, below) refuses while the branch the PR would land on
+is itself broken. Anything this build does not know how to check **fails closed** — the
 merge is refused, with the condition named, and audited. That asymmetry is
 deliberate: a gate is a safety claim, and silently ignoring a clause of it would
 turn a stricter-looking workflow file into a weaker one, which is the worst thing a
 gate can do. (#197 Scope A's other condition, `no-live-agents-on-pr`, is therefore
 *declarable but not yet enforceable* — it refuses every merge until a build knows
 it. See **Still to come**.)
+
+### The small-batch clause: `max_diff_lines` (#1174)
+
+    gates:
+      merge:
+        reviewers: [rev-lead]
+        max_diff_lines: 800
+
+Refuses a merge whose PR changes more than `N` lines — additions plus
+deletions, over the whole PR. The practice is small-batch delivery
+(trunk-based development; Google's "small CLs"); the reason it earns a
+mechanism *here* is that loomux's entire quality story is the review gate, and
+an oversized PR is the canonical way an agent fleet defeats it — reviewers
+rubber-stamp what they cannot hold in context. "Split it" was previously
+reviewer prose. A declared threshold makes it mechanical.
+
+**A structured key, not an `also:` token.** `also:` is a closed vocabulary of
+*parameterless* conditions whose entire safety property is that every entry
+either matches a known name or fails closed. A parameter cannot live in that
+namespace: `max-diff-800` would be a token no build could recognise and every
+build would therefore refuse. So the threshold is a key, and — like
+`merge_queue:` before it — an older loomux fails the whole file's parse on the
+unknown key rather than silently dropping the clause. That is the documented
+consequence, not an oversight: a workflow file that says 800 must never load
+as a workflow file that says nothing.
+
+**Absent is off, and `0` is refused.** No key means the size is never asked
+about at all, so every repo that has not adopted this is byte-for-byte on its
+old path — including when the size would have been unreadable. `0` is a parse
+error rather than a synonym for "unlimited": the way to mean no limit is to
+omit the key, and a bound a repo wrote down must never be read as the absence
+of one. A negative or fractional value never reaches that check; serde refuses
+the whole file at `Option<u32>`, exactly as `threshold: -1` already does.
+
+**Where the number comes from.** `gh pr view --json additions,deletions`, i.e.
+gh's own JSON — deliberately *not* parsed out of `gh pr diff --stat`'s English
+summary line. That line is prose ("1 file changed, 2 insertions(+)"), gh may
+reword it, and it drops a clause entirely when a count is zero; a security shim
+that has to word-split a sentence to decide a merge fails in a new way every
+time that sentence changes. A size loomux cannot read **refuses** — an
+unmeasurable PR is not a small one.
+
+**One definition, three enforcement points.** `workflow::check_diff_size` is
+the pure decision: the merge queue calls it, and the shim's shell mirrors it.
+The queue matters here specifically because it never calls `gh pr merge` — it
+fast-forwards a scratch ref — so a clause the shim alone enforced would leave
+the queue as the way around the limit.
+
+### Stop the line: `also: [base-green]` (#1174)
+
+`ci-green` asks whether *this PR* is green. `base-green` asks whether the
+branch it would land on is — refusing while the base ref's HEAD is red, still
+running, or reports nothing at all. The practice is trunk-based "fix the build
+first" (Toyota's Andon cord; it is also the premise behind GitHub's own merge
+queue). Without it, nothing stops a fleet piling work onto a broken branch,
+which compounds failures and hands the merge queue's bisect a culprit set it
+cannot untangle. The base is resolved live at merge time, as the gate already
+does for everything else.
+
+**Two API endpoints, because one would be a lie on half of GitHub.** The
+combined-status endpoint (`/commits/{ref}/status`) sees only the legacy Status
+API; the check-runs endpoint (`/commits/{ref}/check-runs`) sees only check runs,
+which is what GitHub Actions reports. A repo using either alone reports
+*nothing* from the other, so "green" here means **neither surface said anything
+bad, and at least one of them said something at all**. Green is an allow-list of
+check-run conclusions (`success`, `neutral`, `skipped`), so a conclusion GitHub
+adds tomorrow reads as red rather than as green.
+
+**Unknown is never green, and the cost is stated.** A base HEAD with no checks
+and no statuses refuses, matching what `ci-green` already does for a PR with no
+checks reported and what the merge queue's `base-unverifiable` does for a base
+it cannot resolve. The cost is real and belongs in the open: on a repo whose CI
+can skip a commit (a `paths-ignore` filter, say), a base commit that ran nothing
+refuses every merge onto it until something does run. That is why the clause is
+opt-in — a repo that cannot promise its base always has checks should not
+declare it.
+
+**`gh api` has no `-R`.** Its `{owner}/{repo}` placeholders resolve from the
+current directory's remote, which is the *wrong* repository whenever the merge
+was invoked as `gh pr merge -R other/repo`. The shim therefore resolves
+`nameWithOwner` explicitly (through `gh repo view`'s positional repo argument,
+per #294) and refuses if it cannot. The merge queue keeps the placeholders: it
+only ever operates on its own group's repo, and never has an `-R` to honour.
+
+### The PR-open advisory, and which way each half fails (#1174)
+
+The size clause has an advisory half as well as an enforced one, and they are
+deliberately asymmetric:
+
+| | when | channel | fails |
+| --- | --- | --- | --- |
+| advisory | `gh pr create` | the **author's** own pane (stderr) + an audit line | **open** |
+| refusal | `gh pr merge` | the shim's refusal path | **closed** |
+
+**Why the author's pane and not the orchestrator's.** The obvious reading of
+"notify the orchestrator" has no honest implementation here. The shim is a
+POSIX script in another process; the orchestrator's notice inbox
+(`OrchNoticeInbox`) is in-memory in the Rust registry, and the only channel the
+shim has into loomux at all is `audit.jsonl`, which nothing reads back. Building
+one would mean a durable, agent-writable file whose contents are injected into
+the orchestrator's MCP tool results — a prompt-injection channel straight into
+the trust root, which is not a thing to add for a courtesy notice. The author's
+pane is also the *right* target on the merits: the author is the actor who can
+split the PR, and it learns at the moment the split is cheapest. The
+orchestrator still sees it — the audit line, and the worker's own report.
+
+**Why the advisory fails open.** It is a courtesy, not a gate. The extra
+`gh pr view` failing, timing out, or a gate file that cannot be read must never
+break or delay `gh pr create`, and the create always succeeds regardless of the
+PR's size. Every enforcement decision in this document fails *closed*; this one
+does not, because it decides nothing. The merge-time refusal is where the
+"unknown is never safe" rule applies, and it applies there in full.
 
 ### How it composes with the human gate
 
