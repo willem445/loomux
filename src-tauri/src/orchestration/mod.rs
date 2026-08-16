@@ -1833,7 +1833,7 @@ if [ -f "$LOOMUX_GROUP_DIR/merge_gate" ]; then
         case "$bg_runs" in none|pending|red|green) : ;; *) loomux_block_wf "base-unverifiable" "the gate requires base-green and loomux could not read the check runs on '$base' (its HEAD), so it cannot tell whether the branch this PR would land on is healthy — unknown is never treated as green" ;; esac
         case "$bg_stat" in none|pending|red|green) : ;; *) loomux_block_wf "base-unverifiable" "the gate requires base-green and loomux could not read the commit statuses on '$base' (its HEAD), so it cannot tell whether the branch this PR would land on is healthy — unknown is never treated as green" ;; esac
         case "$bg_runs$bg_stat" in
-          *red*)      loomux_block_wf "base-not-green" "the gate requires base-green and the HEAD of '$base' is RED. Fix the base branch first — piling more work onto a broken branch is what this clause exists to stop" ;;
+          *ThisWordNeverMatches*) : ;; # [RED-EVIDENCE MUTATION A2b: the base-is-red arm can no longer match]
           *pending*)  loomux_block_wf "base-not-green" "the gate requires base-green and the checks on the HEAD of '$base' have not finished. Wait for them: a base whose result is not in yet is not a base known to be green" ;;
           nonenone)   loomux_block_wf "base-not-green" "the gate requires base-green and the HEAD of '$base' reports no checks or statuses at all, so loomux cannot tell whether it is healthy — unknown is never treated as green. If this repo's CI legitimately skips some commits, do not declare base-green" ;;
         esac ;;
