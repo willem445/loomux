@@ -51073,7 +51073,8 @@ fn a_raised_item_persists_with_its_provenance_and_survives_a_restart() {
     assert!(item.created_ms > 0, "an item is stamped when it is raised");
     assert!(item.resolved_ms.is_none() && item.resolved_by.is_none() && item.resolution.is_none());
 
-    let opened = audit_of(&reg.audit_log(&g), "needs-you-open");
+    let log = reg.audit_log(&g);
+    let opened = audit_of(&log, "needs-you-open");
     assert_eq!(opened.len(), 1, "the raise is audited");
     assert_eq!(opened[0].detail["id"], "n-1");
     assert_eq!(opened[0].actor, "w-3");
@@ -51445,7 +51446,8 @@ fn a_human_resolve_settles_the_row_and_a_note_reaches_the_orchestrator_sanitized
     assert!(notice.contains("looks good"), "…and the human's actual words do: {notice:?}");
     assert!(notice.contains(&t.id), "the linked row is named so the orchestrator can act");
 
-    let resolved = audit_of(&reg.audit_log(&g), "needs-you-resolve");
+    let log = reg.audit_log(&g);
+    let resolved = audit_of(&log, "needs-you-resolve");
     assert_eq!(resolved.len(), 2, "both resolves are audited");
     assert_eq!(resolved[1].detail["source"], "webview");
 
@@ -51475,7 +51477,8 @@ fn a_resolved_item_can_never_be_re_settled_and_every_refusal_is_audited() {
         .expect_err("nor withdrawn out from under the human's close-out");
     assert!(withdrawn.contains("already resolved"), "{withdrawn}");
 
-    let refusals = audit_of(&reg.audit_log(&g), "needs-you-reject");
+    let log = reg.audit_log(&g);
+    let refusals = audit_of(&log, "needs-you-reject");
     let reasons: Vec<&str> =
         refusals.iter().filter_map(|e| e.detail["reason"].as_str()).collect();
     assert_eq!(reasons, vec!["unknown-item", "already-resolved", "already-resolved"]);
