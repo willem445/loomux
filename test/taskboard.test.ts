@@ -1119,6 +1119,11 @@ test("a reorder never moves a settled row out of its own stored position", () =>
   // still return the whole current order.
   assert.deepEqual(reorderWithSubtree(board, "t-2", -1), ["t-1", "t-2", "t-3", "t-4"]);
   assert.deepEqual(reorderWithSubtree(board, "t-4", 1), ["t-1", "t-2", "t-3", "t-4"]);
+  // A zero step is a no-op, not a move onto itself: the splice reads the
+  // target's index AFTER lifting the row out, and "beside myself" has no such
+  // index — an unguarded delta of 0 would corrupt the order rather than return
+  // it. The array-order rule this replaced was inert for 0 by construction.
+  assert.deepEqual(reorderWithSubtree(board, "t-2", 0), ["t-1", "t-2", "t-3", "t-4"]);
 });
 
 test("a settled row is not in the manual priority list, so both arrows are off", () => {
@@ -1129,6 +1134,13 @@ test("a settled row is not in the manual priority list, so both arrows are off",
   // place is derived (newest-first), so a manual step there would contradict
   // the order the board just told the human it was using.
   assert.deepEqual(siblingPosition(board, "t-2"), { index: -1, count: 0 });
+  // The view passes the board-level settled set in rather than making this
+  // walk the tree once per row. Same answers either way — a divergence here
+  // would mean the render and the pure helper disagreed about who can move.
+  const settled = settledIds(board);
+  for (const id of ["t-1", "t-2", "t-3", "t-404"]) {
+    assert.deepEqual(siblingPosition(board, id, settled), siblingPosition(board, id), id);
+  }
   // Asking one to move is a no-op that still returns the whole current order.
   assert.deepEqual(reorderWithSubtree(board, "t-2", -1), ["t-1", "t-2", "t-3"]);
   assert.deepEqual(reorderWithSubtree(board, "t-2", 1), ["t-1", "t-2", "t-3"]);

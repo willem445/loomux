@@ -852,9 +852,14 @@ export function subtreeAllDone<T extends HasParent & HasStatus>(
  *  using. Reopen the row and it rejoins the manual list. */
 export function siblingPosition<T extends OrderedRow>(
   board: readonly T[],
-  id: string
+  id: string,
+  // The board's settled set, when the caller already has it. A render asks this
+  // once per ROW, and deriving the set here would walk the whole tree again
+  // each time — so the view computes it once and threads it, exactly as it
+  // already does with `blocked` and the two board-level `usesX` flags.
+  settled: ReadonlySet<string> = settledIds(board)
 ): { index: number; count: number } {
-  const { manual } = orderSiblings(siblingRows(buildTree(board), id), settledIds(board));
+  const { manual } = orderSiblings(siblingRows(buildTree(board), id), settled);
   return positionAmong(manual, id);
 }
 
@@ -930,6 +935,10 @@ export function reorderWithSubtree<T extends OrderedRow>(
 
   // One step against what is on screen: the manual list is this row's sibling
   // group minus the finished subtrees the board has sunk to the bottom of it.
+  // A zero delta is a no-op rather than a move onto itself — the splice below
+  // reads the target's position AFTER lifting the row out, and "beside myself"
+  // has no such position.
+  if (delta === 0) return flatten();
   const { manual } = orderSiblings(siblingRows(tree, id), settledIds(board));
   const i = manual.findIndex((t) => t.id === id);
   const j = i + delta;
