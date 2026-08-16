@@ -38677,7 +38677,13 @@ impl OrchRegistry {
                 //   flag-severing pins (`claude_allow_patterns_are_not_severed_
                 //   from_the_allowedtools_flag` and friends) are the regression
                 //   net that would catch this landing in the wrong place.
-                if claude_denies_interactive_question(role, role_hint) {
+                if false && claude_denies_interactive_question(role, role_hint) {
+                    // SCRATCH-RED neuter (#946 Q4 / #1091 slice H): `false &&`
+                    // disables the wiring while leaving the pure predicate
+                    // function and its own dedicated test intact, so this
+                    // branch is unreachable and only the spawn-args tests
+                    // that actually go through build_agent_command_ex/argv_ex
+                    // redden. Never land this on the real branch.
                     if !containment.denies_edits() {
                         cmd.push_str(" --disallowedTools");
                     }
@@ -38960,7 +38966,13 @@ impl OrchRegistry {
                 // extend-vs-open choice as the string form; see that arm's
                 // comment for why this must never open a SECOND
                 // `--disallowedTools`.
-                if claude_denies_interactive_question(role, role_hint) {
+                if false && claude_denies_interactive_question(role, role_hint) {
+                    // SCRATCH-RED neuter (#946 Q4 / #1091 slice H): `false &&`
+                    // disables the wiring while leaving the pure predicate
+                    // function and its own dedicated test intact, so this
+                    // branch is unreachable and only the spawn-args tests
+                    // that actually go through build_agent_command_ex/argv_ex
+                    // redden. Never land this on the real branch.
                     if !containment.denies_edits() {
                         push(&mut a, "--disallowedTools");
                     }
