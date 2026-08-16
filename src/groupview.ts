@@ -1170,8 +1170,15 @@ export class GroupView {
 
     // Summary line: N agents · role breakdown · uptime · paused badge.
     this.summaryEl.replaceChildren();
+    // One entry per capability class the backend reports. A class omitted here
+    // is one the breakdown silently drops while `live_agents` still counts it,
+    // so the line reads "3 agents live · 1 orch, 1 worker" and the missing pane
+    // is invisible — the #47 planner bug, which is why `manager` (#1161) is here
+    // from the start. The orchestrator leads; the manager follows it, because it
+    // is the other pane the human deals with directly rather than a delegate.
     const roleBits = [
       s.roles.orchestrator ? `${s.roles.orchestrator} orch` : "",
+      s.roles.manager ? `${s.roles.manager} manager${s.roles.manager > 1 ? "s" : ""}` : "",
       s.roles.worker ? `${s.roles.worker} worker${s.roles.worker > 1 ? "s" : ""}` : "",
       s.roles.reviewer ? `${s.roles.reviewer} reviewer${s.roles.reviewer > 1 ? "s" : ""}` : "",
       s.roles.planner ? `${s.roles.planner} planner${s.roles.planner > 1 ? "s" : ""}` : "",

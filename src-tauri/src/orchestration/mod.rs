@@ -4251,10 +4251,17 @@ impl Guardrails {
         for b in &mut self.blocks {
             b.id = workflow::sanitize_id(&b.id).unwrap_or_else(|| b.kind.as_str().to_string());
         }
-        // 2. The four class names are RESERVED as ids for their own class. An
-        //    `id: planner, kind: reviewer` block would write its contract to
-        //    `reviewer.md` — the real reviewer's file (see
+        // 2. The FIVE class names are RESERVED as ids for their own class (#1161
+        //    added `manager`). An `id: planner, kind: reviewer` block would write
+        //    its contract to `reviewer.md` — the real reviewer's file (see
         //    `workflow::Block::instructions_file`) — and clobber it.
+        //
+        //    This step reads `kind_from_str`, so widening that function widens
+        //    this drop: an already-persisted `group.json` carrying
+        //    `id: manager, kind: worker` — legal to write before #1161 — now
+        //    loses that block silently here, where `parse_workflow` would refuse
+        //    the whole file. Both are the intended treatment of an id that has
+        //    become a class name; see the parser's arm for the argument.
         self.blocks
             .retain(|b| workflow::kind_from_str(&b.id).is_none_or(|reserved| reserved == b.kind));
         // 3. Ids are unique. A duplicate makes `block(id)` resolve to whichever
@@ -36660,11 +36667,18 @@ impl OrchRegistry {
             None => String::new(),
         };
         let cli = &g.guardrails.agent_cli;
+        // The `{{BLOCKS}}` list, under a heading that reads "Your delegates" and
+        // is immediately followed by "**Spawn by block, not by kind.**" — so the
+        // same rule as `roster_note` above applies, from the same predicate
+        // (#1161 review B1). A manager is not a delegate and is not spawnable;
+        // listing it here told the orchestrator to call a route this same slice
+        // refuses, which is the flat contradiction the liaison note below was
+        // written to avoid for its own class.
         let rows: Vec<String> = g
             .guardrails
             .blocks
             .iter()
-            .filter(|b| b.kind != Role::Orchestrator)
+            .filter(|b| workflow::is_spawnable_block(b))
             .map(|b| {
                 format!(
                     "- **`{id}`** — {name} · {kind} · {cli} · model `{model}`{persona}",
@@ -40427,6 +40441,16 @@ impl OrchRegistry {
         // group's own orchestrator in tests. Neither check is redundant: this one
         // catches `block: "<an orchestrator block>"`, which arrives with
         // `kind: worker` and would otherwise be promoted by `role = block.kind`.
+        //
+        // #1161: a MANAGER block deliberately has NO twin of this guard here,
+        // and the asymmetry is chosen rather than missed. `mcp::call_tool` is
+        // the only agent-reachable entry point and refuses it there (by `kind`
+        // and by `block`); this function is also the path loomux's own
+        // launch-time open will take in M3, so a blanket refusal keyed on
+        // `Role::Manager` here would refuse the one caller that is supposed to
+        // succeed. The orchestrator-block guard can be unconditional because
+        // loomux registers the group's own orchestrator through the un-named
+        // path; M3 decides which shape the manager's launch path takes.
         if block.kind == Role::Orchestrator && named.is_some() {
             return Err(format!(
                 "block {:?} is an orchestrator block — a group has exactly one orchestrator, opened at launch",
@@ -41063,11 +41087,17 @@ impl OrchRegistry {
         if !workflow::roster_is_custom(&g.guardrails.blocks) {
             return String::new();
         }
+        // `is_spawnable_block`, not `kind != Orchestrator` (#1161 review B1):
+        // this list's own sentence tells the orchestrator to pass each id to
+        // `spawn_agent`, so a block that tool refuses may not appear in it. The
+        // two spellings were the same statement while the orchestrator was the
+        // only unspawnable class; they stopped being the same the moment a
+        // second one existed.
         let rows: Vec<String> = g
             .guardrails
             .blocks
             .iter()
-            .filter(|b| b.kind != Role::Orchestrator)
+            .filter(|b| workflow::is_spawnable_block(b))
             .map(|b| {
                 format!(
                     "  - {} ({}, {}, {}){}",

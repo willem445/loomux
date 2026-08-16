@@ -1318,6 +1318,37 @@ pub fn is_reviewing_block(b: &Block) -> bool {
     b.kind == Role::Reviewer && b.role_hint.as_deref() != Some("liaison")
 }
 
+/// **Which blocks the orchestrator may open with `spawn_agent(block: …)`** —
+/// and therefore the only ones its kickoff roster and its instruction file may
+/// list under "your delegates" (#1161 review B1).
+///
+/// The list those two surfaces render is not "every block in the file"; its own
+/// sentence is *"pass `block: "<id>"` to spawn_agent to open one"*, so a block
+/// `spawn_agent` refuses does not belong in it. Before this predicate the filter
+/// was spelled inline as `kind != Orchestrator` at both call sites, which was
+/// the same statement while there was exactly one unspawnable class — and the
+/// moment a second arrived, the two surfaces went on advertising a route the
+/// tool refuses. An orchestrator obeying its own instruction file would call it,
+/// burn a turn on the refusal, and keep reading the same line on every turn
+/// after that, re-grounding included.
+///
+/// So it is ONE predicate, named for the question, and the tool's refusals are
+/// pinned against these surfaces in both directions by
+/// `every_block_the_orchestrator_is_told_to_spawn_is_one_spawn_agent_accepts`.
+/// Same discipline (and same reason) as [`is_reviewing_block`] next door: a
+/// membership rule with two call sites must not be two rules.
+///
+/// - **Orchestrator** — a group has exactly one, opened at launch;
+///   `spawn_agent` has refused `kind: "orchestrator"` since #222.
+/// - **Manager** (#1161) — the human's own interface, declared in the workflow
+///   file and opened for them; `spawn_agent` refuses it by `kind` and by
+///   `block`. What the orchestrator is told about a declared manager instead is
+///   M4's `{{MANAGER_NOTE}}`; until that lands it is told nothing, which is the
+///   honest state — this slice ships no channel to it.
+pub fn is_spawnable_block(b: &Block) -> bool {
+    !matches!(b.kind, Role::Orchestrator | Role::Manager)
+}
+
 /// The role hints a workflow file may name, for error messages.
 pub fn role_hint_names() -> String {
     "advisor, process, liaison".to_string()
@@ -1446,7 +1477,8 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
             ));
             continue;
         };
-        // The four class names are RESERVED as ids for their own class. Without
+        // The FIVE class names are RESERVED as ids for their own class (#1161
+        // added `manager`). Without
         // this, `- id: planner, kind: reviewer` is accepted and then two blocks
         // collide: `instructions_file()` keys "is this a built-in?" off the id but
         // names the file from the kind, so that block would write `reviewer.md` —
@@ -1456,6 +1488,17 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
         // the id `orchestrator`, and the duplicate id makes the repo's own block
         // permanently unreachable.) Coupling the two removes the whole class of
         // problem, and costs an author nothing: rename the block.
+        //
+        // **Widening `kind_from_str` widens THIS, and that is a breaking change
+        // to already-written workflow files** (#1161): `- id: manager, kind:
+        // worker` parsed clean before the class existed — the id was not a class
+        // name, so it took the custom-id branch and wrote `manager.md` — and is
+        // a parse error now, which fails the whole file and drops the repo back
+        // to the built-in roster. Unavoidable once `manager` names a class (the
+        // alternative is the `worker.md` collision above), and cheap to fix:
+        // rename the block. `Guardrails::clamped` step 2 is the same rule
+        // applied to an already-persisted `group.json`, where it drops the block
+        // rather than the file.
         if let Some(reserved) = kind_from_str(&id) {
             if reserved != kind {
                 errs.push(format!(
@@ -2627,6 +2670,16 @@ pub fn recommend_capacity(blocks: &[Block], gate: Option<&Gate>) -> CapacityReco
     // `any`, not a count, for the same reason as the planner: a workflow may
     // declare at most one (`MANAGER_MAX`), so the two spellings agree, and
     // `any` says which fact is being relied on.
+    //
+    // **M3 MUST INVERT THIS, NOT TICK IT OFF.** Decision D3 exempts the manager
+    // from `max_agents`, and this `+1` is correct only while it does not have
+    // that exemption. The moment `live_delegate_count` stops counting a manager,
+    // the rule stated two lines up — "the orchestrator is exempt from
+    // `max_agents` and is never counted here" — applies to the manager too, and
+    // both this term and
+    // `a_declared_manager_raises_the_recommended_capacity_and_is_named_in_the_advisory`
+    // have to go the other way. Landed in M1 rather than M3 because a preview
+    // that under-advises is wrong TODAY; it is not a head start on M3's work.
     let has_manager = blocks.iter().any(|b| b.kind == Role::Manager);
 
     let reviewers_needed = gate.map_or(reviewers, gate_need);
