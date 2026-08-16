@@ -6828,7 +6828,10 @@ fn the_small_batch_clause_parses_round_trips_and_refuses_a_limit_that_limits_not
         "version: 1\nblocks:\n  - id: r\n    kind: reviewer\ngates:\n  merge:\n    reviewers: [r]\n    max_diff_lines: 0\n",
     )
     .expect_err("0 must not load");
-    assert!(err.contains("max_diff_lines"), "the error must name the key: {err}");
+    assert!(
+        err.iter().any(|e| e.contains("max_diff_lines")),
+        "the error must name the key: {err:?}"
+    );
     // A negative or fractional value never reaches that check: serde refuses the
     // whole file at `Option<u32>`, exactly as `threshold: -1` already does.
     for bad in ["-1", "1.5", "eight hundred"] {

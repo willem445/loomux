@@ -1565,6 +1565,10 @@ export interface WorkflowGateStatus {
   require: string;
   reviewers: string[];
   also: string[];
+  /** The small-batch clause (#1174), or `null`/absent when the gate declares no
+   *  size limit — which is a different statement from a limit of 0, a value the
+   *  engine refuses outright. */
+  max_diff_lines?: number | null;
   satisfiable: boolean;
   missing_blocks: string[];
 }
