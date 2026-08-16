@@ -256,6 +256,23 @@ export const GATE_THRESHOLD_MIN = 1;
 export const MERGE_QUEUE_CHECKS_TIMEOUT_MIN = 5;
 export const MERGE_QUEUE_CHECKS_TIMEOUT_MAX = 240;
 
+/** The board statuses a `board.wip:` cap may name (#1175), in board order — the pane's
+ *  mirror of the engine's `RawWip` fields. `done` is deliberately absent: it is the
+ *  relief valve every other cap depends on, so the engine has no field for it and
+ *  `deny_unknown_fields` refuses one. */
+export const WIP_STATUSES = [
+  "queued",
+  "in-progress",
+  "review",
+  "pr",
+  "prototype",
+  "human-testing",
+  "blocked",
+] as const;
+
+/** `parse_workflow` refuses `0` — a cap of nothing is a stop, not a limit. */
+export const WIP_LIMIT_MIN = 1;
+
 /** One numeric field's range. `max` is OPTIONAL and its absence is a statement: the
  *  engine imposes no ceiling on that field, so neither may a form. */
 export interface FieldBounds {
@@ -295,6 +312,13 @@ export const POLICY_BOUNDS: Readonly<Record<string, FieldBounds>> = {
     min: RESOURCE_MAX_HOLD_MINUTES_MIN,
     max: RESOURCE_MAX_HOLD_MINUTES_MAX,
   },
+  // No ceiling on any WIP cap, and one row per status rather than seven typed out:
+  // a limit above the board's own size degenerates to "no limit", which is what the
+  // author asked for, so there is nothing to refuse — and spreading `WIP_STATUSES`
+  // means an eighth cappable status cannot arrive here bound-less.
+  ...Object.fromEntries(
+    WIP_STATUSES.map((s) => [`board.wip.${s}`, { min: WIP_LIMIT_MIN }] as const)
+  ),
 };
 
 /** A legal block id: lowercase-ish, human-meaningful, safe as a filename fragment and as
@@ -434,6 +458,27 @@ export interface WorkflowResource {
   extra?: Record<string, YamlValue>;
 }
 
+/** The `board.wip:` mapping (#1175) — one optional cap per board status. Typed as a
+ *  record rather than as seven named fields because the pane's job here is to
+ *  round-trip whatever the engine accepts: `WIP_STATUSES` is what says which keys are
+ *  known, and a key outside it lands in `extra` with an `unknown-key` finding, exactly
+ *  as `deny_unknown_fields` will refuse it on the engine side. */
+export type WorkflowWip = Record<string, number>;
+
+/** The `board:` section (#1175). Same declared-or-absent rule as `intake:` and
+ *  `merge_queue:`: an omitted key is the engine's own default, never a value this
+ *  module writes back in. */
+export interface WorkflowBoard {
+  wip?: WorkflowWip;
+  /** Absent, `true` or `false` — three states, and absent is NOT `false` on the wire
+   *  even though the engine reads them alike (the `merge_queue.enabled` argument). */
+  enforce?: boolean;
+  extra?: Record<string, YamlValue>;
+  /** Keys under `wip:` this build does not know — preserved so a file written by a
+   *  newer loomux survives a round-trip through an older pane. */
+  wipExtra?: Record<string, YamlValue>;
+}
+
 export interface Workflow {
   version: number;
   name: string;
@@ -451,6 +496,8 @@ export interface Workflow {
   /** Keyed by a repo-chosen resource name, in the file's own order (the emitter
    *  sorts, matching the engine's `BTreeMap`). */
   resources?: Record<string, WorkflowResource>;
+  /** Task-board policy — per-status WIP limits (#1175). */
+  board?: WorkflowBoard;
   extra?: Record<string, YamlValue>;
 }
 
@@ -499,6 +546,12 @@ export type FindingCode =
  *  neither a block nor a line (#1020). Same job `blockId` does for a block: the pane's
  *  roster and its findings list land the human on the form that can fix it, and neither
  *  has to match on the message text to work out which one that is. */
+/** `board:` (#1175) is deliberately NOT a member yet: this key routes a finding onto the
+ *  inspector form that can fix it, and the board section has no form — it is listed as
+ *  not-yet-editable in `test/workflowschema.test.ts` like every other field. A section
+ *  here with no form to land on would be a click that goes nowhere. Its findings carry a
+ *  message naming `board.wip.<status>` instead, which is what the raw-text view needs
+ *  anyway; the member and the form arrive together or not at all. */
 export type FindingSection = "intake" | "merge_queue" | "resources";
 
 /** One thing wrong with the workflow. `blockId` lets the pane render the finding INLINE
@@ -1135,6 +1188,30 @@ function emitResourcesLines(resources: Record<string, WorkflowResource>, indent 
   return emitMappingSection("resources", indent, body);
 }
 
+/** The `board:` section (#1175). Same declared-only rule as `intake:`/`merge_queue:`,
+ *  and the same three-state care on `enforce:`: absent and `false` mean the same thing
+ *  to the engine, so a save must not convert one into the other behind the human's back.
+ *
+ *  Caps are emitted in `WIP_STATUSES` order — the board's own order, and the order the
+ *  engine's struct declares them in — rather than sorted, so a file reads top-to-bottom
+ *  the way the board flows. */
+function emitBoardLines(board: WorkflowBoard, indent = ""): string[] {
+  const field = `${indent}  `;
+  const body: string[] = [];
+  if (board.wip) {
+    const inner: string[] = [];
+    for (const status of WIP_STATUSES) {
+      const v = board.wip[status];
+      if (v !== undefined) inner.push(`${field}  ${emitScalar(status)}: ${v}`);
+    }
+    inner.push(...extraLines(board.wipExtra, `${field}  `));
+    body.push(...emitMappingSection("wip", field, inner));
+  }
+  if (board.enforce !== undefined) body.push(`${field}enforce: ${board.enforce}`);
+  body.push(...extraLines(board.extra, field));
+  return emitMappingSection("board", indent, body);
+}
+
 /** One block entry, canonical key order, no leading/trailing blank line. `markerIndent` is
  *  where the `-` sits — 2 (this build's own convention) by default, but the comment-preserving
  *  serializer passes whatever indent the SURROUNDING roster already uses (0 for a same-column
@@ -1227,6 +1304,7 @@ export function serializeWorkflow(w: Workflow): string {
     w.intake ? emitIntakeLines(w.intake) : [],
     w.merge_queue ? emitMergeQueueLines(w.merge_queue) : [],
     w.resources ? emitResourcesLines(w.resources) : [],
+    w.board ? emitBoardLines(w.board) : [],
   ]) {
     if (lines.length) out.push("", ...lines);
   }
@@ -1560,7 +1638,15 @@ function splitBlockItems(content: string[]): BlockItems | null {
  *  `serializeWorkflowPreserving` — a `Record` over exactly this union — so a section
  *  added here without an emitter is a COMPILE error rather than a section that quietly
  *  stops being written to the file at all. */
-const SECTION_ORDER = ["blocks", "edges", "gates", "intake", "merge_queue", "resources"] as const;
+const SECTION_ORDER = [
+  "blocks",
+  "edges",
+  "gates",
+  "intake",
+  "merge_queue",
+  "resources",
+  "board",
+] as const;
 
 type SectionKey = (typeof SECTION_ORDER)[number];
 
@@ -1788,6 +1874,13 @@ export function serializeWorkflowPreserving(w: Workflow, originalText: string): 
         !!w.resources,
         w.resources ? emitResourcesLines(w.resources) : []
       ),
+    board: (entry) =>
+      pushSection(
+        entry,
+        deepEqualValue(w.board, orig.board),
+        !!w.board,
+        w.board ? emitBoardLines(w.board) : []
+      ),
   };
 
   // The document's OWN order is the output's order (#880): walk the entries as the file
@@ -1846,6 +1939,7 @@ const KNOWN_TOP = new Set([
   "intake",
   "merge_queue",
   "resources",
+  "board",
 ]);
 const KNOWN_BLOCK = new Set([
   "id",
@@ -1869,6 +1963,8 @@ const KNOWN_INTAKE = new Set(["source", "labels"]);
 const KNOWN_INTAKE_LABELS = new Set(INTAKE_LABEL_KEYS);
 const KNOWN_MERGE_QUEUE = new Set(["enabled", "max_batch", "checks_timeout_minutes"]);
 const KNOWN_RESOURCE = new Set(["slots", "max_hold_minutes"]);
+const KNOWN_BOARD = new Set(["wip", "enforce"]);
+const KNOWN_WIP = new Set<string>(WIP_STATUSES);
 
 function collectExtra(
   obj: Record<string, YamlValue>,
@@ -1989,6 +2085,35 @@ function readResources(
   return out;
 }
 
+/** `board:` (#1175) — per-status WIP limits plus one posture bool.
+ *
+ *  `wip:` is read against `WIP_STATUSES` rather than as an open map: the engine's
+ *  `RawWip` is a closed struct, so `in-porgress: 4` is a file that will not load, and a
+ *  pane that quietly preserved it as an unremarked key would call that file valid. The
+ *  unknown key is still PRESERVED (`wipExtra`) — dropping it is destructive — it is just
+ *  also reported, which is the honest pair `collectExtra` establishes everywhere else. */
+function readBoard(r: Record<string, YamlValue>, findings: Finding[]): WorkflowBoard {
+  const board: WorkflowBoard = {};
+  const wipSection = readSection(r.wip, "board.wip", findings);
+  if (wipSection) {
+    const wip: WorkflowWip = {};
+    for (const status of WIP_STATUSES) {
+      const n = readNumberField(wipSection, status, "board.wip", findings);
+      if (n !== undefined) wip[status] = n;
+    }
+    board.wip = wip;
+    const extra = collectExtra(wipSection, KNOWN_WIP);
+    if (extra) board.wipExtra = extra;
+  }
+  if (r.enforce !== undefined) {
+    if (typeof r.enforce === "boolean") board.enforce = r.enforce;
+    else findings.push(badValue("board.enforce", "true or false", r.enforce));
+  }
+  const extra = collectExtra(r, KNOWN_BOARD);
+  if (extra) board.extra = extra;
+  return board;
+}
+
 /** Read a workflow file. NEVER throws and NEVER refuses: a file it cannot fully
  *  understand still yields a workflow (with stub blocks) plus the findings that say why,
  *  because the pane's job is to let the human FIX the file — which it cannot do if the
@@ -2092,6 +2217,8 @@ export function parseWorkflow(text: string): ParseResult {
   if (mergeQueue) w.merge_queue = readMergeQueue(mergeQueue, findings);
   const resources = readSection(root.resources, "resources", findings);
   if (resources) w.resources = readResources(resources, findings);
+  const board = readSection(root.board, "board", findings);
+  if (board) w.board = readBoard(board, findings);
 
   return { workflow: w, findings };
 }
