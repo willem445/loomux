@@ -20,7 +20,7 @@ getrandom@<version>`.
 UI features are overlays or header/board chrome floating over the terminal — never a
 resize. Visual padding goes on the `.xterm` element, not the layout.
 
-## Never `git stash` in a loomux worktree [pinned]
+## Never `git stash` in an orrerix worktree [pinned]
 
 The stash stack is shared across ALL worktrees of a repo (#299). Commit WIP to your own
 branch instead. If you must stash: `git stash push -m "<your agent id>: ..."` and only

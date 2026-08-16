@@ -33,7 +33,7 @@ should not have been able to produce.
 
 ### Run `npm ci` first — a fresh worktree has no `node_modules`
 
-`node_modules/` is gitignored, so a worktree loomux just cut for you has
+`node_modules/` is gitignored, so a worktree orrerix just cut for you has
 **none**, and the frontend commands above do not work until you install.
 The trap is that `npm test` *looks* like it mostly works anyway: the
 DOM-free pure modules are tested with `node:test`/`node:assert` and Node's
@@ -187,11 +187,11 @@ For anything beyond the frontend-only and `rustfmt --check` steps above:
    to check documentation for the command."* Reading only the general page is
    how `8` comes to look like an anomaly rather than a documented state.
 4. **Never block the turn on the checks — register, end the turn, act on the
-   notice.** With loomux's `notify_when` MCP tool available:
+   notice.** With orrerix's `notify_when` MCP tool available:
    ```
    notify_when(kind: "pr_checks", pr: <pr>)
    ```
-   …then **end your turn.** loomux polls on your behalf and types a
+   …then **end your turn.** orrerix polls on your behalf and types a
    `[loomux] …` notice into your pane when the checks resolve.
 
    Waiting for that result in the same turn is a **deadlock**, not merely
@@ -210,7 +210,7 @@ For anything beyond the frontend-only and `rustfmt --check` steps above:
    rebase, not "still waiting on CI". That notice is also the *only* way you
    find out, which is exactly what a blocked turn suppresses.
 
-   Only where `notify_when` genuinely isn't available — no loomux pane, so
+   Only where `notify_when` genuinely isn't available — no orrerix pane, so
    nothing is being delivered to you and nothing can deadlock — poll
    `gh pr checks <pr>` yourself at **60 seconds or slower, never a tight
    loop.**

@@ -1,4 +1,4 @@
-# Loomux — instructions for Claude Code
+# Orrerix — instructions for Claude Code
 
 Tauri 2 desktop terminal multiplexer for AI agent management. Rust backend
 (`src-tauri/`), vanilla-TypeScript frontend (`src/` — no UI framework), xterm.js
@@ -159,12 +159,12 @@ compiles.
    the human, as does creating a release or pushing a `v*` tag. The carve-out
    exists so a human reviews one combined PR instead of five, not to reduce
    how much a human reviews. When in doubt, open the PR and ask. (#469)
-8. **Loomux is a generic agentic-dev tool — never bake this repo's or this
+8. **Orrerix is a generic agentic-dev tool — never bake this repo's or this
    machine's quirks into product code.** No toolchain special-casing (nothing
    cargo-/npm-specific in `src-tauri`; express "what's expensive/guarded/built
    here" as repo config, the way the resource guard's `resources:` block does)
    and no operator-setup assumptions (paths, core counts, installed tools). A
-   behavior that only makes sense for developing loomux itself belongs in
+   behavior that only makes sense for developing orrerix itself belongs in
    `.loomux/` config or the dev docs, not the product (precedent: #263).
 9. **Never self-approve a security/install gate** (npm's `allow-scripts`
    review, a `gh` shim confirmation, anything else that exists to make a

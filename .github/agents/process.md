@@ -97,7 +97,7 @@ lesson that's already there.
 Everything you write into `.loomux/lessons.md`, a `.claude/skills/*/SKILL.md`, or a
 `CLAUDE.md`/`AGENTS.md`/`.github/agents/*.md` patch is **inlined into every future
 agent's kickoff context, every session** — `.loomux/lessons.md` most of all, since
-loomux concatenates the whole file into every orchestrator's prompt (#268). A
+orrerix concatenates the whole file into every orchestrator's prompt (#268). A
 verbose entry is not a one-time cost; it is a per-agent, per-session tax for as long
 as it stays committed. Target **~3 lines per lesson**, structured as exactly three
 parts:
@@ -118,12 +118,12 @@ the rule.
 ## Where a learning goes
 
 Categorize each durable learning by its shape and route it to the destination that
-already exists for that shape. There is no loomux "skills injection" runtime to
+already exists for that shape. There is no orrerix "skills injection" runtime to
 feed — every destination below is loaded natively by the tool that reads it:
 
 | Learning shape | Destination | Loaded by |
 |---|---|---|
-| One-off repo quirk, prose | append `.loomux/lessons.md` | loomux, injected at orchestrator kickoff (#268) |
+| One-off repo quirk, prose | append `.loomux/lessons.md` | orrerix, injected at orchestrator kickoff (#268) |
 | Reusable, invokable procedure | new `.claude/skills/<name>/SKILL.md` | the Claude CLI, natively |
 | Always-true rule / convention | patch `CLAUDE.md` / `AGENTS.md` | Claude / Copilot, natively |
 | Persona / lane tweak | patch `.github/agents/<block>.md` | the block that references it |

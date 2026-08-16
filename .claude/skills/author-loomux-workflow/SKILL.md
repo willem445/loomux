@@ -1,11 +1,11 @@
 ---
 name: author-loomux-workflow
-description: When a human describes an agent-orchestration workflow in natural language for a repo that uses loomux (roles needed, review rigor, special personas, model/cost tiers), use this skill to author a correct `.loomux/workflow.yml` (+ persona files) against loomux's actual parser contract — never by pattern-matching another tool's YAML or guessing field names.
+description: When a human describes an agent-orchestration workflow in natural language for a repo that uses orrerix (roles needed, review rigor, special personas, model/cost tiers), use this skill to author a correct `.loomux/workflow.yml` (+ persona files) against orrerix's actual parser contract — never by pattern-matching another tool's YAML or guessing field names.
 ---
 
-# Author a loomux `.loomux/workflow.yml`
+# Author an orrerix `.loomux/workflow.yml`
 
-This skill is for an agent working **inside a repo that loomux orchestrates**,
+This skill is for an agent working **inside a repo that orrerix orchestrates**,
 asked to turn a human's plain-language description of a workflow ("I want a
 cheap worker tier, a strict security reviewer, and a database expert on call")
 into a working `.loomux/workflow.yml` plus any persona files it references.
@@ -17,16 +17,16 @@ a distillation of them as of the commit it was written against. If the repo
 you're working in has a newer `workflow.rs`, the parser wins; re-derive the
 field table below from it before authoring anything. The sibling
 `agent-cli-reference` skill states the same rule for agent-CLI facts; this is
-that discipline applied to loomux's own schema.
+that discipline applied to orrerix's own schema.
 
 ## Before you write anything: the one-line context check
 
 `.loomux/workflow.yml` only does anything if the human turns on the
 **advanced orchestrator** toggle for that repo (at launch, or live from the
-group lifecycle panel) — off (the default), loomux never even opens the
+group lifecycle panel) — off (the default), orrerix never even opens the
 file. Say this to the human once, in your summary: writing the file is not
 enough on its own, they still need to flip that switch and look at the
-resolved-roster preview loomux shows before anything spawns. That preview
+resolved-roster preview orrerix shows before anything spawns. That preview
 *is* the toggle's consent moment — don't present the file as something that
 silently takes effect.
 
@@ -63,11 +63,11 @@ Read the human's description and extract, explicitly, before writing YAML:
   a second worker tier, a merge gate at all), don't invent it. A workflow
   file that declares only what it's for is easier to read and easier for the
   human to consent to. Blocks the file doesn't declare simply don't exist —
-  loomux doesn't backfill them (except the orchestrator; see Invariant 2).
+  orrerix doesn't backfill them (except the orchestrator; see Invariant 2).
 
-## Step 2 — MAP to loomux concepts
+## Step 2 — MAP to orrerix concepts
 
-| Human language | loomux concept |
+| Human language | orrerix concept |
 |---|---|
 | "a role" / "an agent that does X" | a **block**: `id` (immutable identity), `name` (display only), `kind` (capability class), `cli`, `model`, and a persona (`prompt:` or `profile:`) |
 | "what kind of work can it do" | `kind` — one of exactly four: `orchestrator`, `worker`, `reviewer`, `planner`. This is the **only** thing that grants capability. See Invariant 1. |
@@ -95,10 +95,10 @@ soft warning:
 2. **The human merge gate is not expressible or removable in config.** A
    workflow's `gates.merge` is an *additional* necessary condition enforced
    by the `gh` PATH shim — it never substitutes for, weakens, or bypasses
-   loomux's own default-branch human-approval gate. There is no field that
+   orrerix's own default-branch human-approval gate. There is no field that
    turns that off. A `role_hint` does not turn it off either: a hint only
-   *selects* from loomux's closed set, and loomux's own code fixes what the
-   selection means, so config can opt into a behaviour loomux defines but can
+   *selects* from orrerix's closed set, and orrerix's own code fixes what the
+   selection means, so config can opt into a behaviour orrerix defines but can
    never author one.
 3. **No delegate block ever merges a PR** — not a worker, not a
    `process`-hinted worker, not a reviewer. Every one of them opens a PR and
@@ -117,14 +117,14 @@ soft warning:
    (`group_usage` and `ask_human`, both otherwise orchestrator-only, offered to
    that same liaison; `withdraw_question` is not).
    Every exception is enumerated in `doc/design/liaison.md`. What you cannot do
-   from a workflow file is invent one: you pick from a closed set and loomux's
+   from a workflow file is invent one: you pick from a closed set and orrerix's
    code decides the effect.
-5. **The orchestrator block is loomux-owned.** A workflow file may pin its
+5. **The orchestrator block is orrerix-owned.** A workflow file may pin its
    `cli:`/`model:`/`effort:`/`context:` and nothing else — `prompt:`,
    `profile:`, and `allow:` on an `orchestrator`-kind block are a parse
-   error. The pin list is exactly the picks from a closed value set loomux
+   error. The pin list is exactly the picks from a closed value set orrerix
    already ships (no field there authors text or pre-approves a tool), which
-   is why `effort:`/`context:` joined it. It is loomux's trust root; a
+   is why `effort:`/`context:` joined it. It is orrerix's trust root; a
    repo-authored persona there would be a direct prompt-injection seam with
    no gate. Put personas on the blocks the orchestrator spawns, never on it.
 6. **`mechanics_core` rides every persona non-overridably.** Even a `profile:`
@@ -132,7 +132,7 @@ soft warning:
    cannot strip the functional contract — the MCP tools, `report()`
    discipline, the task board, branch→PR flow, "never merge". Personas
    flavor an agent; they cannot re-arm what its `kind` denies or unbind what
-   loomux always injects.
+   orrerix always injects.
 
 ## Step 4 — AUTHOR
 
@@ -169,9 +169,9 @@ One block (`RawBlock`, `deny_unknown_fields`):
 
 **The caps-gating rule for `effort`/`context` (#687):** each is checked
 twice at parse time, and either check failing is a parse error, never a
-silent drop. First, the value must be in loomux's own closed vocabulary
+silent drop. First, the value must be in orrerix's own closed vocabulary
 above (a typo is never coerced to a neighboring level). Second, the block's
-own `cli:` must be a CLI loomux can actually deliver that knob on — today
+own `cli:` must be a CLI orrerix can actually deliver that knob on — today
 that's `claude` for both knobs; `copilot` and `gemini` accept neither
 (copilot's effort is settings-file-only with no flag/env, its context
 window is interactive-only; gemini's thinking level is a settings-file seam
@@ -186,8 +186,8 @@ hand there is no such rail, so this is it:
 | `cli:` | `effort:` | `context:` | why |
 |---|---|---|---|
 | `claude` | `low`, `medium`, `high`, `xhigh`, `max` | `1m` | `--effort <level>` is a session flag; `[1m]` is a model-alias suffix |
-| `copilot` | **none** | **none** | effort is `~/.copilot/settings.json`-only (no flag, no env, and loomux never writes a user's global settings); the context window is the interactive `/context` control |
-| `gemini` | **none** | **none** | its thinking level is a settings-file key whose schema is unverified, so loomux does not write it; its window is model-determined |
+| `copilot` | **none** | **none** | effort is `~/.copilot/settings.json`-only (no flag, no env, and orrerix never writes a user's global settings); the context window is the interactive `/context` control |
+| `gemini` | **none** | **none** | its thinking level is a settings-file key whose schema is unverified, so orrerix does not write it; its window is model-determined |
 
 **This table is a snapshot; `CliCaps` is the truth.** The rows come from
 `CLI_CAPS` in `crates/loomux-engine/src/model.rs`, which the `agent_cli_knobs`
@@ -195,7 +195,7 @@ Tauri command serves to the launcher — same source, so the launcher's greyed-o
 select and `parse_workflow`'s refusal can never disagree. A knob gets wired on a
 new CLI by adding values to that row, and this table is then stale. If the two
 disagree, `CLI_CAPS` wins and this table is the bug. **An empty cell is a
-positive claim, not a gap** — it means loomux has looked for a seam and found
+positive claim, not a gap** — it means orrerix has looked for a seam and found
 none it can use, which is why the parse error can quote a vendor reason rather
 than saying "unsupported".
 
@@ -208,7 +208,7 @@ means the CLI's own default applies.
 a clean parse is necessary, not sufficient.** The `[1m]` suffix also has to
 fit the block's `model:`: it's only defined for the `sonnet`/`opus`/
 `opusplan` families, not `haiku`/`fable`/`best`/`default` — and it fails
-open (stays valid) on a model id loomux doesn't recognize, e.g. a
+open (stays valid) on a model id orrerix doesn't recognize, e.g. a
 Bedrock/Vertex/Foundry deployment name. `parse_workflow` does not check this
 at all: `model: haiku` with `context: 1m` parses cleanly. The workflow
 **pane** does check it — it raises a `knob-unavailable` finding naming the
@@ -303,14 +303,14 @@ gates:
 Required frontmatter is a lenient `key: value` skim (`parse_profile` in
 `profiles.rs`), **not** a strict YAML parser — it's Copilot's own custom-agent
 file format, so copilot-native keys (`tools:`, `agents:`, …) are read by
-Copilot itself and silently ignored by loomux. The keys loomux understands:
+Copilot itself and silently ignored by orrerix. The keys orrerix understands:
 
 | Key | Required | Notes |
 |---|---|---|
 | `name` | no | defaults to the file stem; also the Copilot `--agent <name>` handle |
 | `description` | no | one-line summary; supports YAML's `>` folded-scalar form |
 | `kind` (or `role`) | no | a **compatibility check only** — if present, it must match the block's `kind` or loading the persona is an error. Never use it to move a block into a different class. |
-| `mode` | no (default `append`) | `append` layers the persona on loomux's built-in role contract; `replace` swaps the role *body* but never `mechanics_core` (Invariant 6) |
+| `mode` | no (default `append`) | `append` layers the persona on orrerix's built-in role contract; `replace` swaps the role *body* but never `mechanics_core` (Invariant 6) |
 | `allow` | no | comma-separated extra tool patterns; same read-only-kind ban as the block's `allow:` |
 
 Template, matching this repo's own `.github/agents/*.md` shape:
@@ -353,7 +353,7 @@ usually wants the default `append` instead (omit `mode:` entirely — see
 ## Step 5 — VALIDATE
 
 There is **no standalone CLI validator** — `orch_workflow_preview` is a
-Tauri command reachable only from inside the loomux app (the launcher's
+Tauri command reachable only from inside the orrerix app (the launcher's
 resolved-roster preview, or the workflow pane's live TypeScript-side check).
 As an authoring agent you cannot invoke either directly, so:
 
@@ -369,7 +369,7 @@ As an authoring agent you cannot invoke either directly, so:
    - `prompt:`/`profile:`/`allow:` on the `kind: orchestrator` block;
    - a `role_hint` on the wrong `kind` (`role_hint: advisor` on a `worker`
      block, etc.);
-   - `effort:`/`context:` not in loomux's closed vocabulary, or set on a
+   - `effort:`/`context:` not in orrerix's closed vocabulary, or set on a
      block whose `cli:` can't honor that knob (e.g. `context: 1m` on a
      `copilot` block) — check the per-CLI knob matrix in Step 4 BEFORE
      writing either key; the refusal names both fixes if you don't;
@@ -385,7 +385,7 @@ As an authoring agent you cannot invoke either directly, so:
    `parse_workflow` reports **every** problem in one pass, not just the
    first — read the whole error list if you have one, don't fix-and-rerun
    one at a time.
-2. **A broken or missing file never blocks a launch** — loomux audits and
+2. **A broken or missing file never blocks a launch** — orrerix audits and
    skips it, falling back to the built-in four-block roster. That is a
    safety property, not a substitute for getting the file right: it means
    the human's *custom* roster and merge gate silently don't apply, with
@@ -400,7 +400,7 @@ As an authoring agent you cannot invoke either directly, so:
 ## Step 6 — PITFALLS
 
 - **Comment-preserving YAML, but only through the pane (#233).** If a human
-  later edits the file through loomux's GUI workflow pane, their comments
+  later edits the file through orrerix's GUI workflow pane, their comments
   survive (`serializeWorkflowPreserving` reuses the original text's own lines
   per top-level piece it didn't touch). This means it's safe to leave
   explanatory comments in the file you author — including per-block
@@ -413,7 +413,7 @@ As an authoring agent you cannot invoke either directly, so:
   `#[serde(deny_unknown_fields)]` specifically so a typo'd key (`promt:`,
   `kinds:`, `revewers:`) is a loud parse error instead of a silent no-op
   discovered at runtime, or never. Don't add speculative fields
-  "in case loomux supports them later" — it doesn't, and the parser will
+  "in case orrerix supports them later" — it doesn't, and the parser will
   say so.
 - **An `also:` condition the shim can't check fails the gate closed, not
   silently.** `also: [some-condition]` where `some-condition` isn't
@@ -432,7 +432,7 @@ As an authoring agent you cannot invoke either directly, so:
   relaunch.** Only a **fresh** launch reads `.loomux/workflow.yml` — a
   **resumed** group keeps running the roster (and gate) it was launched
   with, even if you've since edited the file, because a resume is not a
-  consent moment (nobody's looking at a preview). loomux detects the drift
+  consent moment (nobody's looking at a preview). orrerix detects the drift
   and audits it (`workflow-changed-since-launch`) rather than silently
   applying it. If you author or edit a workflow file for a group that's
   already running, tell the human the change needs a relaunch (or the live

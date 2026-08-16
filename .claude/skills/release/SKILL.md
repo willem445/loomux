@@ -1,9 +1,9 @@
 ---
 name: release
-description: Cut a loomux release — version bump across all five files (including Cargo.lock and package-lock.json), bump PR, human-gated tag, CI publish, release notes, and npm trusted-publishing verification. Covers stable and beta/RC (pre-release) tags.
+description: Cut an orrerix release — version bump across all five files (including Cargo.lock and package-lock.json), bump PR, human-gated tag, CI publish, release notes, and npm trusted-publishing verification. Covers stable and beta/RC (pre-release) tags.
 ---
 
-# Cutting a loomux release
+# Cutting an orrerix release
 
 Releases are tag-driven: pushing a `v*` tag runs `.github/workflows/release.yml`,
 which builds installers for Windows / macOS (arm64 + x64) / Linux, creates the
@@ -73,7 +73,7 @@ vX.Y.Z`, and the release-notes write in step 4 — for ~90 minutes. It is not
 spent by the tag push, so do **not** go back to the human for a second grant
 mid-release; if a step is refused, the reason is one of: the window expired
 (ask for a fresh grant, saying so), the call names a *different* tag or
-release, or a release id loomux could not resolve (the refusal message says
+release, or a release id orrerix could not resolve (the refusal message says
 which). The version-bump PR's merge in step 1 is **not** covered — that is
 still the human's merge, as always.
 

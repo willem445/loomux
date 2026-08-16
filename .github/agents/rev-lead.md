@@ -73,7 +73,7 @@ Review every PR across all three surfaces, weighted by what the diff touches:
   line.** The full analysis goes in the review body on the PR — that is the
   record, and `list_verdicts` is what the gate reads. `review_verdict`'s
   summary is what the orchestrator routes on (verdict, what class of finding,
-  what has to happen next), and loomux copies it into the orchestrator's pane
+  what has to happen next), and orrerix copies it into the orchestrator's pane
   capped with a pointer to the rest. Your report is then verdict, head SHA,
   findings count, PR link — never a restatement of either. Pane text is the
   orchestrator's resident context, re-sent on every following API call, so a
