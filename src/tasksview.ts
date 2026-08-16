@@ -10,22 +10,38 @@ import { swapIfConnected } from "./domutil";
 import {
   approvableSelection,
   boardUsesDeps,
+  boardUsesHierarchy,
   canApprove,
   canProceed,
+  childCounts,
   depCandidates,
   depState,
+  DONE_STATUS,
   doneCount,
   grantableCount,
+  hasMissingParent,
+  indentLevel,
   isAwaitingHuman,
   isReady,
+  KINDS,
+  nextPicker,
+  parentCandidates,
+  pickerIsOpen,
   QUEUED_STATUS,
+  reorderWithSubtree,
   REQUEST_CHANGES_STATUS,
   retainExisting,
+  siblingPosition,
   STATUSES,
+  subtreeAllDone,
   taskActivityState,
   unmetDeps,
+  visibleRows,
   withDep,
   withoutDep,
+  type BoardRow,
+  type PickerField,
+  type PickerTarget,
 } from "./taskboard";
 import {
   approveTask,
@@ -67,8 +83,25 @@ export interface OrchTask {
    *  board's `orch_upsert_task` deliberately takes `deps` but not `related`,
    *  which the orchestrator maintains through its own tools. */
   related?: string[];
+  /** The task this one sits inside (#958) — containment, not ordering (that
+   *  is still `deps`). Optional on the wire like the link arrays: the backend
+   *  skips it when absent, so every pre-#958 board arrives with no key. The
+   *  board derives the whole tree from this field; nothing gates on it. */
+  parent?: string | null;
+  /** Advisory Agile level — one of `KINDS` (#958). Advisory means the board
+   *  only labels the row with it: a story directly inside an epic is legal,
+   *  and no affordance here changes behaviour based on it. */
+  kind?: string | null;
   updated_ms: number;
 }
+
+/** The nest picker's "take it back to the top level" option (#958). A sentinel
+ *  rather than `""`, because the empty value is already the picker's own
+ *  "nothing chosen yet" placeholder; it is translated to the empty string —
+ *  which is what `orch_upsert_task` reads as "clear the container" — at the
+ *  moment of the write, and never travels to the backend as an id. Ids are
+ *  monotonic `t-<n>`, so no row can ever collide with this value. */
+const TOP_LEVEL_CHOICE = "__top_level__";
 
 function el(tag: string, cls: string, text?: string): HTMLElement {
   const e = document.createElement(tag);
@@ -109,10 +142,17 @@ export class TasksView {
   /** Task ids the human has ticked for batch delete. Frontend-only, so it's
    *  pruned to live rows on every refresh (see retainExisting). */
   private selected = new Set<string>();
-  /** The task whose "add a dependency" picker is open, if any (#582) — one at
-   *  a time, and kept here rather than in the DOM so a background refresh
-   *  re-renders it instead of silently closing it mid-choice. */
-  private picking: string | null = null;
+  /** Containers the human has collapsed (#958). Frontend-only and deliberately
+   *  not persisted — the same shape as `expanded` above: a view preference
+   *  that survives re-renders but never becomes board data (the board is the
+   *  orchestrator's queue, not this window's UI state). Pruned to live rows on
+   *  every refresh, like `selected`. */
+  private collapsed = new Set<string>();
+  /** The task whose picker is open, if any (#582, #958) — one at a time across
+   *  BOTH pickers, and kept here rather than in the DOM so a background
+   *  refresh re-renders it instead of silently closing it mid-choice. `field`
+   *  says which one: a dependency (ordering) or a container (nesting). */
+  private picking: PickerTarget | null = null;
   /** The picker was just opened by a click, so it should take focus on this
    *  render. Cleared once consumed: a later refresh must re-render the open
    *  picker without stealing focus back from wherever the human has moved. */
@@ -327,8 +367,12 @@ export class TasksView {
     // Drop any ticked rows that vanished from the board (orchestrator edit,
     // another delete) so the "delete selected" count can't outlive its rows.
     this.selected = retainExisting(this.selected, this.tasks);
-    // Same for an open dep picker whose row has gone (#582).
-    if (this.picking && !this.tasks.some((t) => t.id === this.picking)) this.picking = null;
+    // Same for collapsed containers (#958) — housekeeping rather than
+    // correctness (ids are monotonic, so a stale flag can never match a later
+    // row): the set is kept to what the board actually holds.
+    this.collapsed = retainExisting(this.collapsed, this.tasks);
+    // Same for an open picker whose row has gone (#582, #958).
+    if (this.picking && !this.tasks.some((t) => t.id === this.picking?.id)) this.picking = null;
     this.render();
   }
 
@@ -680,7 +724,15 @@ export class TasksView {
     // boardUsesDeps): on a board with no links every queued row is trivially
     // ready and marking them all would say nothing.
     const usesDeps = boardUsesDeps(this.tasks);
-    this.tasks.forEach((t, i) => this.listEl.appendChild(this.renderTask(t, i, usesDeps)));
+    // Same board-level gate for the nesting chrome (#958): a board that nests
+    // nothing keeps exactly the rows it has today, with no collapse gutter.
+    const usesHierarchy = boardUsesHierarchy(this.tasks);
+    // Display order is DERIVED from `parent` (#958) — the board array stays
+    // flat and its order stays the priority order, exactly as before. On a
+    // board that uses no hierarchy this is the array, in order, at depth 0.
+    for (const row of visibleRows(this.tasks, this.collapsed)) {
+      this.listEl.appendChild(this.renderTask(row, usesDeps, usesHierarchy));
+    }
   }
 
   /** The dependency line under a task's row (#582): what is blocking it, what
@@ -698,7 +750,7 @@ export class TasksView {
   private renderLinks(t: OrchTask): HTMLElement | null {
     const deps = t.deps ?? [];
     const related = t.related ?? [];
-    const picking = this.picking === t.id;
+    const picking = this.picking?.id === t.id;
     if (deps.length === 0 && related.length === 0 && !picking) return null;
 
     const line = el("div", "task-links");
@@ -758,8 +810,96 @@ export class TasksView {
       }
     }
 
-    if (picking) line.appendChild(this.renderDepPicker(t));
+    if (picking) {
+      line.appendChild(
+        this.picking?.field === "parent" ? this.renderParentPicker(t) : this.renderDepPicker(t)
+      );
+    }
     return line;
+  }
+
+  /** Open (or close) one of the row pickers. One at a time across the whole
+   *  board and across both fields, so the human is never choosing a dependency
+   *  and a container at the same time in two places. */
+  private togglePicker(id: string, field: PickerField): void {
+    this.picking = nextPicker(this.picking, id, field);
+    // Focus only when this click OPENED one — a close has nothing to focus.
+    this.pickingFocus = this.picking !== null;
+    this.render();
+  }
+
+  /** A picker's own deferred close (blur/Esc). Both pickers call THIS rather
+   *  than each re-deriving the condition: the two copies had already drifted
+   *  apart from `togglePicker`'s, and a close that reads fewer signals than the
+   *  button that opens swallows a click exactly the width of the difference
+   *  (see `pickerIsOpen`). One rule, one place. */
+  private closePicker(id: string, field: PickerField): void {
+    if (!pickerIsOpen(this.picking, id, field)) return;
+    this.picking = null;
+    this.render();
+  }
+
+  /** The "⤵ nest under…" picker (#958): every other row, plus a top-level
+   *  escape when this one is already inside something.
+   *
+   *  Like the dep picker it does NOT pre-filter the choices the backend would
+   *  refuse — its own descendants (a cycle) or a pick that would bust the
+   *  depth cap. That rule lives in one authoritative place, inside the
+   *  backend's lock, and its error names the path; a second copy here could
+   *  only ever disagree with it, and it surfaces through the same toast. */
+  private renderParentPicker(t: OrchTask): HTMLElement {
+    const options = parentCandidates(t, this.tasks);
+    if (options.length === 0 && !t.parent) {
+      return el("span", "task-links-label", "no other task to nest under");
+    }
+    const sel = document.createElement("select");
+    sel.className = "task-dep-picker parent";
+    const placeholder = document.createElement("option");
+    placeholder.value = "";
+    placeholder.textContent = "⤵ nest under…";
+    sel.appendChild(placeholder);
+    if (t.parent) {
+      // The clear. `orch_upsert_task` reads an EMPTY parent as "take it to the
+      // top level" (omitting the field means "leave it alone"), so the sentinel
+      // below is mapped to "" on the way out — never sent as a literal id.
+      const top = document.createElement("option");
+      top.value = TOP_LEVEL_CHOICE;
+      top.textContent = "↥ top level (leave its container)";
+      sel.appendChild(top);
+    }
+    for (const c of options) {
+      const opt = document.createElement("option");
+      opt.value = c.id;
+      opt.textContent = `${c.id} — ${c.title}`;
+      sel.appendChild(opt);
+    }
+    sel.value = "";
+
+    const close = () => this.closePicker(t.id, "parent");
+    sel.addEventListener("change", () => {
+      const pick = sel.value;
+      if (!pick) return;
+      const parent = pick === TOP_LEVEL_CHOICE ? "" : pick;
+      this.picking = null;
+      // Close on our own rather than waiting for the board-change event: if the
+      // write is refused (a cycle, the depth cap), mutate() toasts the
+      // backend's own error and resyncs.
+      this.render();
+      void this.mutate(
+        invoke("orch_upsert_task", { groupId: this.groupId, id: t.id, parent })
+      );
+    });
+    // Keep keystrokes off the terminal underneath; Esc backs out unwritten.
+    sel.addEventListener("keydown", (e) => {
+      e.stopPropagation();
+      if (e.key === "Escape") close();
+    });
+    sel.addEventListener("blur", () => window.setTimeout(close, 0));
+    if (this.pickingFocus) {
+      this.pickingFocus = false;
+      window.setTimeout(() => sel.focus(), 0);
+    }
+    return sel;
   }
 
   /** The "＋ depends on…" picker: every other task on the board, minus the ones
@@ -786,12 +926,7 @@ export class TasksView {
     }
     sel.value = "";
 
-    const close = () => {
-      if (this.picking === t.id) {
-        this.picking = null;
-        this.render();
-      }
-    };
+    const close = () => this.closePicker(t.id, "dep");
     sel.addEventListener("change", () => {
       const pick = sel.value;
       if (!pick) return;
@@ -822,8 +957,17 @@ export class TasksView {
     return sel;
   }
 
-  private renderTask(t: OrchTask, index: number, usesDeps: boolean): HTMLElement {
+  private renderTask(
+    boardRow: BoardRow<OrchTask>,
+    usesDeps: boolean,
+    usesHierarchy: boolean
+  ): HTMLElement {
+    const t = boardRow.task;
     const row = el("div", "task-row");
+    // Nesting depth (#958). Clamped: the backend caps writes at depth 4, but a
+    // hand-edited tasks.json can be deeper and an unbounded indent would walk
+    // the row off the right edge of the overlay.
+    if (boardRow.depth > 0) row.classList.add(`task-depth-${indentLevel(boardRow.depth)}`);
     if (isAwaitingHuman(t.status)) row.classList.add("awaiting-human");
     const activity = taskActivityState(t.status, t.assignee, this.liveAgentIds);
     if (activity) row.classList.add(`task-row-${activity}`);
@@ -853,17 +997,19 @@ export class TasksView {
     });
 
     // Reorder: board order is the priority order the orchestrator follows.
+    // Sibling-scoped since #958 — a row moves among the rows sharing its
+    // container, and a container carries its whole subtree with it, so
+    // priority edits can never silently re-home a task.
     const order = el("div", "task-order");
     const up = el("button", "task-btn", "▲") as HTMLButtonElement;
     const down = el("button", "task-btn", "▼") as HTMLButtonElement;
-    up.disabled = index === 0;
-    down.disabled = index === this.tasks.length - 1;
-    up.title = "Higher priority";
-    down.title = "Lower priority";
+    const pos = siblingPosition(this.tasks, t.id);
+    up.disabled = pos.index <= 0;
+    down.disabled = pos.index < 0 || pos.index === pos.count - 1;
+    up.title = boardRow.depth > 0 ? "Higher priority within its container" : "Higher priority";
+    down.title = boardRow.depth > 0 ? "Lower priority within its container" : "Lower priority";
     const move = (delta: number) => {
-      const ids = this.tasks.map((x) => x.id);
-      ids.splice(index, 1);
-      ids.splice(index + delta, 0, t.id);
+      const ids = reorderWithSubtree(this.tasks, t.id, delta);
       void this.mutate(invoke("orch_reorder_tasks", { groupId: this.groupId, ids }));
     };
     up.addEventListener("click", () => move(-1));
@@ -872,6 +1018,34 @@ export class TasksView {
 
     const main = el("div", "task-main");
     const top = el("div", "task-top");
+    // Collapse chevron (#958), leftmost so every row's text starts at the same
+    // place whether or not it contains anything. Containers only — a leaf gets
+    // an inert spacer of the same width rather than a button that does
+    // nothing, so the affordance means "there is something inside here".
+    // One scan for the two places this row states its child counts (the
+    // chevron's tooltip and the rollup chip below) — they are the same two
+    // numbers, and computing them twice scanned the board twice per container.
+    const counts = boardRow.hasChildren ? childCounts(t.id, this.tasks) : null;
+    if (boardRow.hasChildren && counts) {
+      const chevron = el(
+        "button",
+        "task-collapse",
+        boardRow.collapsed ? "▸" : "▾"
+      ) as HTMLButtonElement;
+      chevron.title = boardRow.collapsed
+        ? `Show what is inside (${counts.total} task${counts.total === 1 ? "" : "s"})`
+        : "Hide what is inside";
+      chevron.addEventListener("click", () => {
+        if (this.collapsed.has(t.id)) this.collapsed.delete(t.id);
+        else this.collapsed.add(t.id);
+        this.render();
+      });
+      top.appendChild(chevron);
+    } else if (usesHierarchy) {
+      // The gutter only exists on a board that nests something — see
+      // boardUsesHierarchy. A flat board renders exactly the row it always has.
+      top.appendChild(el("span", "task-collapse-spacer"));
+    }
     // The first thing the eye should land on: unmistakable, not just a tint.
     if (activity === "active") {
       const badge = el("span", "task-active-badge", `● ACTIVE — ${t.assignee}`);
@@ -879,6 +1053,17 @@ export class TasksView {
       top.appendChild(badge);
     }
     top.appendChild(el("span", "task-id", t.id));
+
+    // Advisory Agile level (#958): a label, nothing more — no affordance on
+    // this board reads it, and the backend gates nothing on it either.
+    if (t.kind) {
+      const known = (KINDS as readonly string[]).includes(t.kind);
+      const kind = el("span", `task-chip kind k-${known ? t.kind : "unknown"}`, t.kind);
+      kind.title = known
+        ? `Agile level: ${t.kind} — advisory only, it labels this row and nothing more`
+        : `${t.kind} is not one of ${KINDS.join(" | ")} — only a hand-edited tasks.json can hold it`;
+      top.appendChild(kind);
+    }
 
     const status = document.createElement("select");
     status.className = `task-status st-${t.status}`;
@@ -950,6 +1135,42 @@ export class TasksView {
     if (t.session) {
       const chip = el("span", "task-chip session", `⟲ ${t.session.slice(0, 8)}`);
       chip.title = `Resumable session ${t.session} — the orchestrator can reopen this task's agent for follow-ups`;
+      top.appendChild(chip);
+    }
+
+    // Child rollup (#958). DIRECT children only, because these are the same
+    // two numbers the orchestrator's `list_tasks` row carries (`children` /
+    // `children_done`) and the two readers must not be shown different counts
+    // for the same thing.
+    if (counts) {
+      const chip = el("span", "task-chip children", `${counts.done}/${counts.total}`);
+      chip.title =
+        `${counts.done} of ${counts.total} task${counts.total === 1 ? "" : "s"} directly inside ` +
+        `this one ${counts.total === 1 ? "is" : "are"} done`;
+      top.appendChild(chip);
+      // The nudge (#958): everything underneath is finished but this row's own
+      // status hasn't caught up. A PROMPT, never a write — a derived status
+      // write-back is exactly the wedge that keeping `ready` derived avoids,
+      // and status here has two authors (the human and the orchestrator).
+      // Whole subtree, not just the direct children, so the claim it makes is
+      // one that can't be false with an open grandchild.
+      if (t.status !== DONE_STATUS && subtreeAllDone(t.id, this.tasks)) {
+        const nudge = el("span", "task-chip rollup-done", "⤴ all inside done");
+        nudge.title =
+          `Every task under ${t.id} is done, but ${t.id} itself is ${t.status}. ` +
+          `Nothing has been changed — set its status yourself if that's right.`;
+        top.appendChild(nudge);
+      }
+    }
+    // A container that names no row on the board (#958) — only reachable by
+    // hand-editing tasks.json, since the backend validates on write and
+    // re-homes survivors on delete. The row renders at top level, and this
+    // says why rather than leaving it looking like ordinary top-level work.
+    if (hasMissingParent(t, this.tasks)) {
+      const chip = el("span", "task-chip parent-missing", `⚠ in ${t.parent}`);
+      chip.title =
+        `${t.parent} names no task on this board, so this row shows at the top level. ` +
+        `Re-nest it with ⤵, or move it to the top level from the same picker.`;
       top.appendChild(chip);
     }
 
@@ -1046,13 +1267,18 @@ export class TasksView {
     // dep-free board keeps exactly the row height it has today.
     const linkBtn = el("button", "task-btn deplink", "🔗") as HTMLButtonElement;
     linkBtn.title = "Add a dependency — this task waits until the one you pick is done";
-    linkBtn.addEventListener("click", () => {
-      const open = this.picking === t.id;
-      this.picking = open ? null : t.id;
-      this.pickingFocus = !open;
-      this.render();
-    });
+    linkBtn.addEventListener("click", () => this.togglePicker(t.id, "dep"));
     top.appendChild(linkBtn);
+
+    // Nest (#958): put this row inside another one, or take it back to the top
+    // level. Containment, not ordering — deliberately a separate control from
+    // 🔗 above, since a container never blocks anything by being a container.
+    const nestBtn = el("button", "task-btn nest", "⤵") as HTMLButtonElement;
+    nestBtn.title = t.parent
+      ? `Move this task into a different container, or back to the top level (it is in ${t.parent})`
+      : "Move this task inside another one — grouping only, it changes nothing about what blocks it";
+    nestBtn.addEventListener("click", () => this.togglePicker(t.id, "parent"));
+    top.appendChild(nestBtn);
 
     const notesBtn = el("button", "task-btn notes", `🗨 ${t.notes.length}`) as HTMLButtonElement;
     notesBtn.title = "Notes";

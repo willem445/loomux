@@ -283,3 +283,344 @@ export function withDep(deps: readonly string[] | null | undefined, id: string):
 export function withoutDep(deps: readonly string[] | null | undefined, id: string): string[] {
   return [...(deps ?? [])].filter((d) => d !== id);
 }
+
+// ---------------------------------------------------------------------------
+// Board hierarchy (#958): containment, not ordering.
+//
+// `parent` names the row this one sits inside; `deps` still names what must
+// finish first, and the two are orthogonal (a dep may cross subtrees). The
+// board array stays FLAT and its order stays the priority order — every tree
+// below is derived from `parent` at render time, exactly like `isReady` is
+// derived rather than read off the wire.
+// ---------------------------------------------------------------------------
+
+/** The advisory Agile levels, in the backend's `TASK_KINDS` order (#958).
+ *  Advisory means advisory: a story directly inside an epic is legal, and the
+ *  board only ever *labels* a row with this — nothing here gates anything. */
+export const KINDS = ["epic", "feature", "story", "task"] as const;
+
+/** Which of a row's two pickers is open: the dependency one (ordering) or the
+ *  container one (nesting). */
+export type PickerField = "dep" | "parent";
+
+/** The board's single open picker, if any — one at a time across every row and
+ *  both fields. */
+export interface PickerTarget {
+  id: string;
+  field: PickerField;
+}
+
+/** What the picker state becomes when a picker button is clicked: open it, or
+ *  close it if that exact picker was already open. Clicking a DIFFERENT picker
+ *  — other row, or the other field on this row — replaces the open one. */
+export function nextPicker(
+  open: PickerTarget | null,
+  id: string,
+  field: PickerField
+): PickerTarget | null {
+  const same = open !== null && open.id === id && open.field === field;
+  return same ? null : { id, field };
+}
+
+/** Whether a picker's own deferred close still owns the open picker.
+ *
+ *  A picker takes focus when it opens, and its `blur` schedules the close on a
+ *  timeout so the click that caused the blur lands first. That means the close
+ *  runs AFTER whatever the click did — so it has to re-ask whether the picker
+ *  it belongs to is still the open one, by BOTH signals. Reading only the row
+ *  id swallows a click exactly the width of the missing signal: with the nest
+ *  picker open on a row, clicking that same row's dependency button opens the
+ *  dep picker and then lets the queued close tear it down in the same tick, so
+ *  the click reads as having done nothing at all. The button that decides to
+ *  open reads two signals, so the close that can undo it reads the same two. */
+export function pickerIsOpen(
+  open: PickerTarget | null,
+  id: string,
+  field: PickerField
+): boolean {
+  return open !== null && open.id === id && open.field === field;
+}
+
+/** Whether this board uses containment at all (#958) — the gate for the
+ *  nesting chrome, exactly as `boardUsesDeps` gates the readiness mark.
+ *
+ *  On a board where nothing is nested, the collapse column is 13px of empty
+ *  gutter in front of every row and the indent rail can never appear, so the
+ *  affordances are suppressed and such a board keeps precisely the shape it
+ *  has today. A single nested row turns the column on for the whole board:
+ *  once nesting exists, a row sitting at the top level is saying something,
+ *  and it needs the same left edge as the rows that aren't. */
+export function boardUsesHierarchy<T extends HasParent>(board: readonly T[]): boolean {
+  return board.some((t) => !!t.parent);
+}
+
+/** A board row as far as the hierarchy helpers care. Both fields are optional
+ *  on the wire for the same reason `deps` is: the backend skips them when
+ *  absent, so every pre-#958 board arrives with no keys at all. */
+export interface HasParent extends HasId {
+  parent?: string | null;
+  kind?: string | null;
+}
+
+/** The derived tree: which rows sit at top level, and each row's direct
+ *  children, both in board (priority) order. */
+export interface TaskTree<T extends HasParent> {
+  roots: T[];
+  children: Map<string, T[]>;
+}
+
+/** One rendered board line: the row, how deep it sits, and whether it has
+ *  children / is currently collapsed. */
+export interface BoardRow<T extends HasParent> {
+  task: T;
+  depth: number;
+  hasChildren: boolean;
+  collapsed: boolean;
+}
+
+/** How many indent steps the board actually draws. The backend caps writes at
+ *  `MAX_TASK_DEPTH` (4), but a hand-edited `tasks.json` can be deeper, and an
+ *  unbounded indent would walk such a row off the right edge of the overlay. */
+export const MAX_INDENT_DEPTH = 4;
+
+/** Clamp a tree depth to the indent the stylesheet actually draws. */
+export function indentLevel(depth: number): number {
+  return Math.max(0, Math.min(depth, MAX_INDENT_DEPTH));
+}
+
+/** Build the containment tree from the flat board (#958).
+ *
+ *  Tolerant by construction, because `tasks.json` is hand-editable and the
+ *  backend deliberately runs no repair pass over it: a row whose `parent`
+ *  names nothing, names itself, or sits in a cycle is treated as a ROOT rather
+ *  than being dropped from the board. Same philosophy as the `missing` dep
+ *  chip — a broken link must be visible, never invisible. */
+export function buildTree<T extends HasParent>(board: readonly T[]): TaskTree<T> {
+  const byId = new Map(board.map((t) => [t.id, t]));
+  /** Does walking up from this row ever come back to something it already
+   *  passed? Bounded by the visited set, so it terminates on any board — the
+   *  one thing a walk over hand-editable data must guarantee. */
+  const cyclic = (t: T): boolean => {
+    const seen = new Set([t.id]);
+    let cur = t.parent ?? null;
+    while (cur) {
+      if (seen.has(cur)) return true;
+      seen.add(cur);
+      cur = byId.get(cur)?.parent ?? null;
+    }
+    return false;
+  };
+  const roots: T[] = [];
+  const children = new Map<string, T[]>();
+  for (const t of board) {
+    const parent = t.parent ?? null;
+    // Registered under its container whenever that container exists at all —
+    // including for a cyclic row, which is ALSO listed as a root below. That
+    // double listing is what lets `visibleRows` show both halves of a cycle
+    // once each: whichever it reaches first renders, and the other is skipped
+    // as already seen rather than recursed into.
+    if (parent && parent !== t.id && byId.has(parent)) {
+      const kids = children.get(parent);
+      if (kids) kids.push(t);
+      else children.set(parent, [t]);
+    }
+    if (!parent || parent === t.id || !byId.has(parent) || cyclic(t)) roots.push(t);
+  }
+  return { roots, children };
+}
+
+/** The rows to render, in display order: roots in board order, each followed
+ *  by its own subtree (recursively, in board order), with the depth each row
+ *  should be indented to.
+ *
+ *  `collapsed` hides a row's whole subtree, not just its direct children — a
+ *  collapsed epic must not leave its grandchildren stranded at the top level.
+ *  Every row on the board appears EXACTLY ONCE, whatever `parent` says: that
+ *  is the invariant a hand-edited cycle would otherwise break, in either
+ *  direction (an infinite render, or a row that silently vanishes). */
+export function visibleRows<T extends HasParent>(
+  board: readonly T[],
+  collapsed: Iterable<string> = []
+): BoardRow<T>[] {
+  const hidden = new Set(collapsed);
+  const { roots, children } = buildTree(board);
+  const rows: BoardRow<T>[] = [];
+  const seen = new Set<string>();
+  // `visible` is threaded down rather than returning early on a collapsed row:
+  // the hidden subtree still has to be WALKED, so its rows are marked seen and
+  // can't be picked up again by the fallback below as stray top-level rows.
+  const walk = (task: T, depth: number, visible: boolean): void => {
+    if (seen.has(task.id)) return;
+    seen.add(task.id);
+    const kids = children.get(task.id) ?? [];
+    const isCollapsed = kids.length > 0 && hidden.has(task.id);
+    if (visible) rows.push({ task, depth, hasChildren: kids.length > 0, collapsed: isCollapsed });
+    for (const k of kids) walk(k, depth + 1, visible && !isCollapsed);
+  };
+  for (const r of roots) walk(r, 0, true);
+  // Nothing should reach this — `buildTree` makes every unreachable row a root
+  // — but a row that fell out of the board would be work made invisible, so it
+  // renders at top level instead of being trusted away.
+  for (const t of board) walk(t, 0, true);
+  return rows;
+}
+
+/** Direct-child counts for a container row: how many children it has and how
+ *  many of those are `done`.
+ *
+ *  DIRECT children only, deliberately: these are the same two numbers the
+ *  backend puts on a `TaskSummary` (`children` / `children_done`), and the
+ *  human's board and the orchestrator's `list_tasks` rows disagreeing about a
+ *  count they both display would be a defect, not a nuance. */
+export function childCounts<T extends HasParent & HasStatus>(
+  id: string,
+  board: readonly T[]
+): { total: number; done: number } {
+  const kids = buildTree(board).children.get(id) ?? [];
+  return {
+    total: kids.length,
+    done: kids.reduce((n, k) => (k.status === DONE_STATUS ? n + 1 : n), 0),
+  };
+}
+
+/** Whether EVERY task under this one — the whole subtree, not just the direct
+ *  children — is `done` (#958). Says nothing about the container's OWN status,
+ *  which it never reads: a `done` container with a `done` subtree is `true`
+ *  here.
+ *
+ *  Drives a nudge chip only, and the caller pairs it with the container's own
+ *  status to make the point the chip actually makes ("finished inside, but this
+ *  row's status lags"). It never writes a status (the auto-status rollup was
+ *  rejected outright: status has two authors and a derived write-back is
+ *  exactly the wedge `ready` avoids by staying derived).
+ *
+ *  Whole subtree, unlike `childCounts` above, because this one makes a CLAIM
+ *  ("everything under here is finished") — direct-children-only would let it
+ *  say that with an open grandchild, which is simply false. A row with no
+ *  children never qualifies: there is nothing under it to have finished. */
+export function subtreeAllDone<T extends HasParent & HasStatus>(
+  id: string,
+  board: readonly T[]
+): boolean {
+  const { children } = buildTree(board);
+  const seen = new Set([id]); // visited set: a hand-edited cycle must terminate
+  const queue = [...(children.get(id) ?? [])];
+  let any = false;
+  while (queue.length > 0) {
+    const t = queue.shift() as T;
+    if (seen.has(t.id)) continue;
+    seen.add(t.id);
+    any = true;
+    if (t.status !== DONE_STATUS) return false;
+    queue.push(...(children.get(t.id) ?? []));
+  }
+  return any;
+}
+
+/** Where a row sits among its SIBLINGS (not on the board): drives whether the
+ *  up/down buttons are disabled. Reordering is sibling-scoped — the first
+ *  child of a container has nowhere higher to go, even though the board array
+ *  has rows above it. `{ index: -1, count: 0 }` for an id that isn't on the
+ *  board. */
+export function siblingPosition<T extends HasParent>(
+  board: readonly T[],
+  id: string
+): { index: number; count: number } {
+  const siblings = siblingIds(buildTree(board), id);
+  const index = siblings.indexOf(id);
+  return index < 0 ? { index: -1, count: 0 } : { index, count: siblings.length };
+}
+
+/** The id list this row is ordered within (a copy): its container's children,
+ *  or the top-level rows.
+ *
+ *  A row in a hand-edited cycle is listed BOTH ways by `buildTree`, and this
+ *  resolves it to the root list. That matches where `visibleRows` renders the
+ *  cycle's FIRST member and not the others: a 3-cycle renders three levels
+ *  deep, so its second and third members are ordered among the roots while
+ *  displayed nested. Their up/down buttons then act on the root list. Left as
+ *  is deliberately — the move is still a valid permutation and every row still
+ *  renders exactly once (§5 of doc/design/task-hierarchy.md stakes out
+ *  tolerate-and-show for cycles), and only a hand-edited `tasks.json` can
+ *  produce one at all. */
+function siblingIds<T extends HasParent>(tree: TaskTree<T>, id: string): string[] {
+  const root = tree.roots.find((t) => t.id === id);
+  if (root) return tree.roots.map((t) => t.id);
+  for (const kids of tree.children.values()) {
+    if (kids.some((k) => k.id === id)) return kids.map((k) => k.id);
+  }
+  return [];
+}
+
+/** The full flattened id order to send to `orch_reorder_tasks` after moving a
+ *  row one step among its siblings (#958).
+ *
+ *  A container moves WITH its subtree: reordering is about priority between
+ *  siblings, and a parent that left its children behind would silently
+ *  re-home them (the array is flat, so "left behind" means "now sits under
+ *  whoever is above them"). Out-of-range moves are a no-op that still returns
+ *  the current order, so a caller can send it unconditionally.
+ *
+ *  Always a permutation of the board — every id present exactly once — since
+ *  `reorder_tasks` appends whatever the caller omitted, and an omission would
+ *  therefore be a silent priority change nobody asked for. */
+export function reorderWithSubtree<T extends HasParent>(
+  board: readonly T[],
+  id: string,
+  delta: number
+): string[] {
+  const tree = buildTree(board);
+  const rootIds = tree.roots.map((t) => t.id);
+  const childIds = new Map<string, string[]>();
+  for (const [parent, kids] of tree.children) childIds.set(parent, kids.map((k) => k.id));
+
+  /** Depth-first over the (possibly just-reordered) sibling lists: a container
+   *  is immediately followed by its own subtree, which is what makes the move
+   *  carry the children with it. Visited-guarded for the cyclic board. */
+  const flatten = (): string[] => {
+    const out: string[] = [];
+    const seen = new Set<string>();
+    const walk = (rowId: string): void => {
+      if (seen.has(rowId)) return;
+      seen.add(rowId);
+      out.push(rowId);
+      for (const k of childIds.get(rowId) ?? []) walk(k);
+    };
+    for (const r of rootIds) walk(r);
+    for (const t of board) walk(t.id); // never omit a row — see the doc above
+    return out;
+  };
+
+  // The live sibling array (inside rootIds/childIds, so splicing it is what
+  // `flatten` then reads) — reordering is scoped to it and to nothing else.
+  const siblings = rootIds.includes(id)
+    ? rootIds
+    : [...childIds.values()].find((kids) => kids.includes(id));
+  if (!siblings) return flatten();
+  const i = siblings.indexOf(id);
+  const j = i + delta;
+  if (i < 0 || j < 0 || j >= siblings.length) return flatten();
+  siblings.splice(i, 1);
+  siblings.splice(j, 0, id);
+  return flatten();
+}
+
+/** The rows the "nest under…" picker offers: every other row on the board,
+ *  minus the one it is already inside (picking that is a no-op write).
+ *
+ *  Deliberately does NOT filter out choices that would close a hierarchy cycle
+ *  or bust the depth cap — the exact call `depCandidates` makes, for the exact
+ *  reason: the backend rejects those inside its lock with an error naming the
+ *  path, that error surfaces through this view's toast, and a second copy of
+ *  the rule here could only ever disagree with the authoritative one. */
+export function parentCandidates<T extends HasParent>(task: T, board: readonly T[]): T[] {
+  return board.filter((t) => t.id !== task.id && t.id !== task.parent);
+}
+
+/** Whether this row's `parent` names no task on the board — only reachable by
+ *  hand-editing `tasks.json` (the backend validates on write and re-homes
+ *  survivors on delete), so the board says so on the row rather than rendering
+ *  it at top level with no explanation. */
+export function hasMissingParent<T extends HasParent>(task: T, board: readonly T[]): boolean {
+  return !!task.parent && !board.some((t) => t.id === task.parent);
+}
