@@ -2829,6 +2829,11 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 /* Explicit beats inferred: with no recorded path the card SAYS so rather than
    guessing one, so the absence is legible instead of looking like a bug. */
 .decisions-nopath { font-size: 10.5px; color: var(--ink-faint); font-style: italic; }
+/* The other absence a card can have (#1151): an item whose linked board row is
+   gone. Its own class rather than a reuse of the no-path one — the two say
+   different things, and a rule written for "no demo path recorded" should not
+   silently own "that task no longer exists". */
+.decisions-missing { font-size: 10px; color: var(--ink-faint); font-style: italic; }
 
 /* ---------- audit log overlay ---------- */
 .audit-view {

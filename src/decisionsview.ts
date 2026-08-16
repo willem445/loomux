@@ -165,14 +165,14 @@ export class DecisionsView {
     head.append(this.countEl);
     head.append(el("span", "tasks-group", groupId));
 
-    // Clear completed. Hidden — not merely disabled — while there is no tail,
-    // because a control that can never do anything on this render is chrome
-    // the eye has to re-dismiss every time. No confirm: it stamps a watermark
-    // and deletes nothing, which the title says in both halves so the human
-    // does not have to trust the word "clear" (needs-you-items.md).
-    // A text-labelled header button in the board's own idiom (`clear-done`),
-    // not a new one: `.tasks-head .pane-btn` is always opaque, and the width
-    // override the label needs already exists there for its two siblings.
+    // Clear completed, in the board header's own text-button idiom
+    // (`clear-done`) rather than a new one — `.tasks-head .pane-btn` is always
+    // opaque, and the width override a label needs already exists there.
+    // Hidden, not merely disabled, while there is no tail: a control that can
+    // do nothing on this render is chrome the eye re-dismisses every time. No
+    // confirm, because it stamps a watermark and deletes nothing — which the
+    // title says in both halves, so the human does not have to trust the word
+    // "clear" (needs-you-items.md).
     this.clearBtn = el("button", "pane-btn decisions-clear", "Clear completed") as HTMLButtonElement;
     this.clearBtn.title =
       "Hide the settled rows below — they stay on disk, and nothing still open is touched";
@@ -325,9 +325,10 @@ export class DecisionsView {
     // header chip and the list cannot come to disagree about what is waiting.
     const count = needsYouCount(this.view, this.questions);
     const decisions = open.filter((r) => r.source === "question").length;
+    const items = open.length - decisions;
     this.countEl.textContent = String(count);
     this.countEl.hidden = count === 0;
-    this.countEl.title = `${decisions} decision${decisions === 1 ? "" : "s"}, ${count - decisions} item${count - decisions === 1 ? "" : "s"}`;
+    this.countEl.title = `${decisions} decision${decisions === 1 ? "" : "s"}, ${items} item${items === 1 ? "" : "s"}`;
 
     // Only offered when there is something to clear — see the constructor.
     this.clearBtn.hidden = settled.length === 0;
@@ -611,7 +612,7 @@ export class DecisionsView {
       // The join degraded. SAY which row is missing rather than dropping the
       // reference — "t-12 is not on the board" is the fact the human needs to
       // decide whether this row is stale; a silently task-less card is not.
-      head.append(el("span", "decisions-nopath", `${linked} is not on the board`));
+      head.append(el("span", "decisions-missing", `${linked} is not on the board`));
     }
     if (row.urgent) card.classList.add("urgent");
     card.append(head);
@@ -623,6 +624,11 @@ export class DecisionsView {
 
     if (task) card.append(this.taskMeta(task));
 
+    // The board actions follow the JOINED ROW, not the item's kind: what a task
+    // in `prototype` admits is a fact about that task, so a feedback ask that
+    // names one offers the same Proceed a demo ask does. Gating them on `kind`
+    // instead would mean a human looking at a parked prototype could not
+    // promote it from here for a reason nothing on screen explains.
     const actions = el("div", "decisions-card-actions");
     if (task?.canProceed) {
       // The SAME command the board's own Proceed button calls, guarded the
