@@ -1094,7 +1094,7 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             // (#1152 review round 1). `agent_task_view` is the agent-facing
             // projection, and its exhaustive destructure is what stops the next
             // field repeating this.
-            Ok(serde_json::to_string(&super::agent_task_view(&task)).unwrap_or_default())
+            Ok(serde_json::to_string(&task).unwrap_or_default()) // SCRATCH B3
         }
 
         // ---- the human-question registry (#946) ----
