@@ -323,6 +323,29 @@ PR chips are **clickable** and open in your browser.
 Statuses: `queued`, `in-progress`, `review`, `pr`, `human-testing`,
 `prototype`, `done`, `blocked`.
 
+### What order the board is in
+
+The order you can drag is the **priority order** — top is next, and the
+orchestrator reads it that way. Two things are derived from it rather than
+being part of it:
+
+- **Finished work sinks.** An item that is `done`, with nothing unfinished
+  nested inside it, drops below the live work **of its own group** (the
+  top-level rows, or its container's children — see [Parent tasks and
+  subtasks](#parent-tasks-and-subtasks)),
+  ordered newest-finished first. Nothing about your priority order changes:
+  live items keep exactly the relative order you gave them, and a `done`
+  container that still holds an open task stays where it is, so live work can
+  never disappear under a finished parent.
+- **Cleared items drop out** until you ask for them — see **📥 clear done**
+  below.
+
+Because of the sink, the ▲/▼ buttons move an item one step relative to the
+items you can *see* above and below it, skipping whatever finished rows happen
+to sit between them in the file. On a finished item both arrows are off: its
+place is derived (newest first), not yours to set — reopen it and it rejoins
+the priority list.
+
 Board controls:
 
 - **▶ Start** on a `queued` item nudges the orchestrator to begin now — it
@@ -372,7 +395,26 @@ Board controls:
   verdict) promotes it: two-click confirm flips it to `in-progress`, records
   your decision, and prompts the orchestrator to take the prototype to a full
   production build.
+- **📥 clear done (N)** clears every finished item out of the list in one
+  click. **Nothing is deleted.** Each item keeps its place, its notes and its
+  links in the group's board file, the action is recorded in the audit log,
+  and it comes straight back:
+  - **👁 show cleared (N)** puts them back on screen (they read dimmer, and
+    each wears a small *cleared* label saying when you cleared it),
+  - **↩** on any one of them brings that one back into the working list, and
+  - **↩ restore all (N)**, next to the toggle while they are on screen, brings
+    back the lot.
+
+  Clearing is *your* view of *your* board: no agent can clear an item, and no
+  agent can see that you cleared one — the orchestrator's own view of the
+  board is byte-for-byte what it was. Reopening a cleared item (moving it off
+  `done`) brings it back on its own, so a task the orchestrator picks up again
+  can never stay hidden. Because it is a view action and not a work change,
+  the orchestrator is *not* interrupted with a notice about it, the same way
+  it isn't for a reorder.
 - **🗑 done (N)** deletes all `done` items in one action (two-click confirm).
+  This one is permanent and it does **not** spare the cleared ones — the count
+  is every `done` item on the board.
 - **🗑 selected (N)** deletes exactly the rows you tick, by id, in one action.
 - **✓ Approve selected (N)** approves several merge-gate items at once, using
   the same tick boxes. The count is only the ticked rows that are actually at
@@ -397,9 +439,12 @@ highlighted so what's waiting on you stands out. A working-status item
 difference unmistakable rather than subtle:
 
 - **Active** — its assignee is an agent that's actually live right now. The row
-  gets a bold, glowing, gently pulsing treatment and a **"● ACTIVE — \<agent
-  id\>"** badge — the first thing your eye should land on. This is deliberately
-  the loudest state on the board.
+  gets a bold, glowing, gently pulsing treatment and, just after the task id, a
+  **"● ACTIVE — \<agent id\>"** badge naming who is on it. This is deliberately
+  the loudest state on the board. The glow is what says *active*; the badge
+  sits behind the id rather than in front of it, so an active row's left edge
+  is exactly where every other row's is — an item's indent means one thing
+  only, that it is nested inside another item.
 - **Idle** — the status still says `in-progress`/`review`, but the assignee
   isn't a currently-live agent (its pane was killed, or it's an older session).
   The row reads as muted, not active — an idle/stalled assignment can never be

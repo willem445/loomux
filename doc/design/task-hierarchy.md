@@ -228,7 +228,10 @@ is what shipped.
 - **Derived display order.** `tasks.json` stays a flat array, and its order stays the priority
   order used everywhere else on the board; the tree is derived at render time from `parent` —
   roots in board order, each followed by its own subtree, recursively. A child stored above its
-  container in the raw array still renders nested under it.
+  container in the raw array still renders nested under it. (#1152 added a second derivation on
+  top of this one: within each sibling group, finished subtrees sink below the live rows, and
+  cleared rows drop out. Both are projections of the same untouched array, and the live rows'
+  relative order is exactly what it was — see `doc/design/board-order-and-archive.md`.)
 - **Collapse.** A chevron appears on containers only (a leaf gets an inert spacer, so the
   affordance itself communicates "there is something inside here"). Collapsing hides the whole
   subtree, not just the direct children — leaving a grandchild rendered at the top level would
