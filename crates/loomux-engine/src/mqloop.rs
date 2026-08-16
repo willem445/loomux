@@ -1377,10 +1377,16 @@ pub fn enqueue(
     let observed = PrObservation {
         body_digest: Some(body_digest(&facts.body)),
         ci_green: pr_ci_green(r, pr),
-        // #1174, read unconditionally for the same reason `ci_green` is here:
-        // enqueue happens once per PR, so the round-trip is not worth a branch
-        // that could get the condition wrong.
-        base_green: crate::mqdriver::base_ci_green(r, &target),
+        // #1174, read only when the gate names the clause — unlike `ci_green`
+        // above, which is unconditional here. Two calls (check-runs + statuses)
+        // is not a round trip to spend on every enqueue in every repo, and the
+        // predicate cannot get it wrong in the dangerous direction: an
+        // un-fetched value is `None`, which the clause refuses on.
+        base_green: if crate::mqdriver::declares_base_green(gate) {
+            crate::mqdriver::base_ci_green(r, &target)
+        } else {
+            None
+        },
         changed_lines: facts.changed_lines,
     };
     let recheck = recheck_gate(gate, verdicts, Some(facts.head.as_str()), &observed);

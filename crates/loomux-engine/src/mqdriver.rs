@@ -377,12 +377,21 @@ pub fn base_ci_green(r: &dyn MqRunner, base: &str) -> Option<bool> {
 }
 
 /// Whether this gate names `base-green`, and therefore whether the base's checks
-/// have to be read at all. Fails toward fetching, exactly like
-/// [`declares_ci_green`] and for the same reason.
+/// have to be read at all.
+///
+/// **Answers `false` for `Absent`/`Malformed`, where [`declares_ci_green`]
+/// answers `true`** — a deliberate divergence, not an oversight. Both of those
+/// refuse the landing *before any observation is read*
+/// ([`crate::mergeq::recheck_gate`] returns `NotConfigured`/`Malformed` on its
+/// first two lines), so a fetch there buys nothing and costs a round trip.
+/// And the fail direction is still the safe one: an un-fetched value is `None`,
+/// which this clause reads as `BaseUnknown` and **refuses**. `declares_ci_green`
+/// fails toward fetching to avoid a *spurious refusal*, which is not a risk for
+/// a value nothing consults.
 pub(crate) fn declares_base_green(spec: &GateSpec) -> bool {
     match spec {
         GateSpec::Declared(g) => g.also.iter().any(|c| c == "base-green"),
-        GateSpec::Absent | GateSpec::Malformed => true,
+        GateSpec::Absent | GateSpec::Malformed => false,
     }
 }
 
