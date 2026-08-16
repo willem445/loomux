@@ -1571,7 +1571,7 @@ if [ "$cmd" = "pr" ] && [ "$sub" = "create" ]; then
       a_lines=$("$REAL_GH" pr view $a_rf --json additions,deletions --jq '.additions + .deletions' 2>/dev/null)
       case "$a_lines" in ''|*[!0-9]*) a_lines="" ;; esac
       if [ -n "$a_lines" ] && [ "$a_lines" -gt "$a_max" ]; then
-        printf '%s\n' "loomux: heads up — this PR changes $a_lines lines and this repo's merge gate declares max_diff_lines: $a_max, so the merge WILL be refused as it stands. Split it now, before anyone reviews it: a split after review means the review is spent twice. (This notice is advisory only — the PR was created.)" >&2
+        : # [RED-EVIDENCE MUTATION B2: the create-time notice is never printed]
         loomux_audit "pr-size-advisory" "{\"lines\":$a_lines,\"limit\":$a_max}"
       fi
     fi
