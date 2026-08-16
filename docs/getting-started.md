@@ -59,7 +59,7 @@ and never installs an older build over a newer one:
 | a stable release (`1.0.0`) | the newest **stable** release |
 | a beta/RC (`1.1.0-beta11`) | the newest release of either kind |
 
-If the launcher cannot read the version of your installed Orrerix, `orrerix
+If the launcher cannot read the version of your installed Orrerix, `loomux
 update` stops and says so rather than guessing — it has no way to tell an update
 from a downgrade, so it does neither. Installing your preferred build once from
 the releases page clears it.
