@@ -21,6 +21,7 @@ import {
   depCandidates,
   depState,
   doneCount,
+  focusMiss,
   isCleared,
   orderSiblings,
   positionAmong,
@@ -1144,6 +1145,31 @@ test("a settled row is not in the manual priority list, so both arrows are off",
   // Asking one to move is a no-op that still returns the whole current order.
   assert.deepEqual(reorderWithSubtree(board, "t-2", -1), ["t-1", "t-2", "t-3"]);
   assert.deepEqual(reorderWithSubtree(board, "t-2", 1), ["t-1", "t-2", "t-3"]);
+});
+
+test("a focus miss tells a deleted row apart from one that is merely off-screen", () => {
+  // The request is CONSUMED whether or not a row renders, so without this
+  // split a NEEDS-YOU deep link onto a cleared or collapsed row is
+  // indistinguishable from one onto a deleted row — every case a dead click.
+  const board = [
+    orow("t-1", "done", { cleared_ms: 5 }),
+    orow("t-2", "queued", { parent: "t-1" }),
+    orow("t-3", "queued"),
+  ];
+  // Archived: 👁 is the way back.
+  assert.equal(focusMiss("t-1", board), "cleared");
+  // On the board, not archived — so it is off-screen for the OTHER reason
+  // (inside a collapsed container), which pre-dates #1152.
+  assert.equal(focusMiss("t-2", board), "hidden");
+  assert.equal(focusMiss("t-3", board), "hidden");
+  // Names nothing: stays silent, because a task really can be deleted between
+  // the request being parked and the render draining it.
+  assert.equal(focusMiss("t-404", board), "gone");
+  // The stamp alone is not enough — the same read-time rule the hide uses, so a
+  // reopened row can never be reported as "cleared, press 👁" when 👁 would not
+  // bring it back.
+  const reopened = [orow("t-1", "in-progress", { cleared_ms: 5 })];
+  assert.equal(focusMiss("t-1", reopened), "hidden");
 });
 
 test("orderSiblings splits one sibling list without mutating the tree's own array", () => {

@@ -19,7 +19,7 @@ import {
   childCounts,
   clearableCount,
   clearedIds,
-  isCleared,
+  focusMiss,
   settledIds,
   depCandidates,
   depState,
@@ -966,13 +966,13 @@ export class TasksView {
     if (!target) return;
     const row = this.listEl.querySelector<HTMLElement>(`[data-item-id="${CSS.escape(target)}"]`);
     if (!row) {
-      const known = this.tasks.find((t) => t.id === target);
-      if (known) {
-        this.toast(
-          isCleared(known)
-            ? `${target} is cleared — use 👁 show cleared above to bring it back into view.`
-            : `${target} is on the board but hidden right now — expand the container it sits in.`
-        );
+      // Which of the three cases this is lives in `focusMiss` (DOM-free, and
+      // tested there); this only turns it into words.
+      const miss = focusMiss(target, this.tasks);
+      if (miss === "cleared") {
+        this.toast(`${target} is cleared — use 👁 show cleared above to bring it back into view.`);
+      } else if (miss === "hidden") {
+        this.toast(`${target} is on the board but hidden right now — expand the container it sits in.`);
       }
       return;
     }
