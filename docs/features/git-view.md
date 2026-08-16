@@ -66,7 +66,7 @@ Top-right of the graph:
 ## Worktrees
 
 If the repository has [git worktrees](https://git-scm.com/docs/git-worktree)
-(loomux creates one per agent session during orchestration), a **worktree chip**
+(orrerix creates one per agent session during orchestration), a **worktree chip**
 appears in the header next to the repo name. Click it to switch the whole view —
 graph, commits, working-tree changes, diffs, and branch — to any listed worktree,
 or back to the primary checkout, **without leaving the pane or opening a new
@@ -81,7 +81,7 @@ its history, its unstaged files, its commits.
   you're off the primary tree, so it's obvious the view is scoped elsewhere. Its
   tooltip shows the full path and branch.
 - The primary checkout is labelled *(primary)* in the menu. A bare repository
-  entry, or one whose directory is gone — whether git flagged it or loomux saw
+  entry, or one whose directory is gone — whether git flagged it or orrerix saw
   it vanish — is listed but disabled *(missing)*.
 - The selection sticks across refreshes. If the worktree is pruned or removed
   while you're viewing it — even by a plain `rm -rf` that git hasn't noticed —
@@ -111,7 +111,7 @@ on a tree you've moved away from. The **primary checkout keeps full write access
 ## Safety
 
 History-changing operations (cherry-pick, revert, merge, rebase) ask for
-confirmation first. If any of them hit a conflict, loomux **aborts** the
+confirmation first. If any of them hit a conflict, orrerix **aborts** the
 operation and leaves your working tree exactly as it was, reporting the conflict
 — it never leaves you in a half-finished, conflicted state to untangle. Resolve
 those in a terminal.

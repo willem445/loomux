@@ -146,7 +146,7 @@ export function buildContextMenu(
   // courtesy a folder already got. (Why the refusal is that broad: a junction pointing
   // outside the root is exactly the shape a recursive Recycle-Bin delete would escape
   // through, so we never hand the shell the chance to ask. See the design note.)
-  const inert = target.isSymlink ? "Loomux doesn't follow or modify symlinks — this one is shown, but left alone." : undefined;
+  const inert = target.isSymlink ? "Orrerix doesn't follow or modify symlinks — this one is shown, but left alone." : undefined;
 
   items.push({
     label: isDir ? "Open" : "Open (default app)",

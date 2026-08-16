@@ -1404,7 +1404,7 @@ async function reconnectSshPaneOnce(
   if (recordedSessionId && plan.mode === "fresh") {
     showToast(
       `${profile.name}: reconnected with a NEW remote session — this connection's CLI ` +
-        `has no session id loomux can resume, so the earlier conversation is not the one on screen.`,
+        `has no session id orrerix can resume, so the earlier conversation is not the one on screen.`,
       "info"
     );
   }
@@ -2528,7 +2528,7 @@ async function flushSessionForQuit(): Promise<void> {
     // No toast: the window is about to die and nobody would read it. The breadcrumb is
     // for the next boot's crash/obs report, where "the last save never landed" is the
     // one clue that explains a layout that looks a step behind.
-    console.warn(`loomux: final session save did not land within ${QUIT_FLUSH_TIMEOUT_MS}ms — quitting anyway`);
+    console.warn(`orrerix: final session save did not land within ${QUIT_FLUSH_TIMEOUT_MS}ms — quitting anyway`);
   }
 }
 
@@ -2566,7 +2566,7 @@ function guardQuit(): void {
       const quit = await modal<boolean>((resolve) => ({
         title:
           files.length === 1 ? "1 file has unsaved edits" : `${files.length} files have unsaved edits`,
-        body: "Quitting loomux now discards them. Cancel, save what you want to keep, then quit again.",
+        body: "Quitting orrerix now discards them. Cancel, save what you want to keep, then quit again.",
         bodyLines: files,
         buttons: [
           { label: "Cancel", value: false },

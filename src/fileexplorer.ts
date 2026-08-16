@@ -1235,7 +1235,7 @@ export class FileExplorerView {
         // Say the whole truth: it is inert, not merely un-followed. Every op on it is
         // refused (see `explainOpError`), and a tooltip that only said "never
         // followed" would leave the user surprised when Del/F2 bounced.
-        name.title = "Symlink — shown, but loomux won't follow, open, rename or delete it.";
+        name.title = "Symlink — shown, but orrerix won't follow, open, rename or delete it.";
       }
       if (entry.is_hidden) row.classList.add("hidden-entry");
       const size = el("span", "fileexp-size", formatSize(entry));
@@ -1541,7 +1541,7 @@ export class FileExplorerView {
  *  simply the wrong verb. Say what actually happened instead. */
 function explainOpError(err: unknown, verb: string): string {
   if (errorCode(err) === "symlink") {
-    return `Loomux won't ${verb} a symlink — it's shown here, but it's left alone. Use your OS file manager for links and junctions.`;
+    return `Orrerix won't ${verb} a symlink — it's shown here, but it's left alone. Use your OS file manager for links and junctions.`;
   }
   return `Couldn't ${verb}: ${errorMessage(err)}`;
 }

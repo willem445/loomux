@@ -24,7 +24,7 @@ redirect it — without fighting the CLI's own input box.
 
 ## Steering strip
 
-Type steering in the strip and press **Enter** — loomux enqueues it to the
+Type steering in the strip and press **Enter** — orrerix enqueues it to the
 orchestrator through the **same serialized delivery path** worker reports use, so
 your message and an incoming report can never land in each other's text: the
 pane's input has exactly one writer.
@@ -35,13 +35,13 @@ pane's input has exactly one writer.
   resized).
 - Focus the strip with **`Alt+P`** (or click it); **`Esc`** hands focus back to
   the terminal.
-- Because it's a loomux field and not the CLI's own input box, it never steals
+- Because it's an orrerix field and not the CLI's own input box, it never steals
   the terminal's keys — type freely in the terminal and the strip stays out of
   the way.
 - Steering a **paused** group, or a pane with no live orchestrator, is reported
   inline rather than silently dropped.
 
-You can still type directly into the CLI if you prefer; loomux holds an incoming
+You can still type directly into the CLI if you prefer; orrerix holds an incoming
 report for a few seconds while it sees you typing there, but the strip is the
 collision-proof path.
 
@@ -51,7 +51,7 @@ Paste an image with **`Ctrl+V`** (or click the paperclip to pick files) and it
 joins the message as a thumbnail chip — remove one with its **✕**, or queue
 several.
 
-On send, loomux saves each image to the group's scratch dir and adds an
+On send, orrerix saves each image to the group's scratch dir and adds an
 `Attached image:` reference line to the message — formatted the way the
 orchestrator's CLI reads it (a plain path for Claude Code, OpenCode, and every
 other CLI except Copilot, which gets an `@<path>` mention) — so the agent

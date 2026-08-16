@@ -401,7 +401,7 @@ export class WorkflowView {
       "div",
       "wf-start-body",
       "Declares the agent blocks a run may use, the path between them, and the gate that must " +
-        "pass before a merge. Committed, so everyone who clones the repo gets it. Loomux reads " +
+        "pass before a merge. Committed, so everyone who clones the repo gets it. Orrerix reads " +
         "it only when Advanced orchestrator is ticked."
     );
     const starterBtn = document.createElement("button");
@@ -644,7 +644,7 @@ export class WorkflowView {
         code === "not-found"
           ? null
           : code === "binary"
-            ? `The file is there, but it isn't valid UTF-8 text — so loomux can't read it, and neither can the backend. A workflow written from PowerShell with \`>\` or \`Out-File\` is UTF-16; re-save it as UTF-8 (\`Set-Content -Encoding utf8NoBOM\`) and it will open.`
+            ? `The file is there, but it isn't valid UTF-8 text — so orrerix can't read it, and neither can the backend. A workflow written from PowerShell with \`>\` or \`Out-File\` is UTF-16; re-save it as UTF-8 (\`Set-Content -Encoding utf8NoBOM\`) and it will open.`
             : `${errorMessage(err)}`;
     }
     await this.loadLayout();
@@ -1211,7 +1211,7 @@ export class WorkflowView {
         "Intake",
         intake
           ? `${intake.source || "inherited source"}${declaredLabels ? ` · ${declaredLabels} label(s)` : ""}`
-          : "not declared — loomux's default",
+          : "not declared — orrerix's default",
         this.sectionBad("intake")
       )
     );
@@ -1486,7 +1486,7 @@ export class WorkflowView {
     value: number | undefined,
     bounds: FieldBounds,
     onChange: (v: number | undefined) => void,
-    placeholder = "loomux's default"
+    placeholder = "orrerix's default"
   ): HTMLInputElement {
     const i = document.createElement("input");
     i.className = "wf-input";
@@ -1569,13 +1569,13 @@ export class WorkflowView {
     version.className = "wf-input";
     version.value = String(w.version);
     version.disabled = true;
-    box.append(this.field("Schema version", version, "Set by loomux; a newer version needs a newer build."));
+    box.append(this.field("Schema version", version, "Set by orrerix; a newer version needs a newer build."));
     box.append(
       el(
         "p",
         "wf-note",
         "Edges are ADVISORY — they declare the intended path; the orchestrator still decides when to spawn what. " +
-          "The merge gate is ENFORCED: loomux refuses `gh pr merge` until every reviewer it names has recorded a PASS."
+          "The merge gate is ENFORCED: orrerix refuses `gh pr merge` until every reviewer it names has recorded a PASS."
       )
     );
     return box;
@@ -1683,8 +1683,8 @@ export class WorkflowView {
       this.field(
         "Model",
         picker.root,
-        "The CLI's own list, merged over loomux's suggestions — or type any id (a Bedrock " +
-          "profile, a gateway deployment, a model newer than this build). Unset leaves it to loomux."
+        "The CLI's own list, merged over orrerix's suggestions — or type any id (a Bedrock " +
+          "profile, a gateway deployment, a model newer than this build). Unset leaves it to orrerix."
       )
     );
 
@@ -1796,7 +1796,7 @@ export class WorkflowView {
             if (v === "profile") t.profile = b.profile ?? "";
           })
         ),
-        "none = loomux's built-in role instructions. prompt = inline (compiled to the CLI's native inline agent). " +
+        "none = orrerix's built-in role instructions. prompt = inline (compiled to the CLI's native inline agent). " +
           "profile = a .github/agents/*.md file (Copilot's native --agent)."
       )
     );
@@ -1916,7 +1916,7 @@ export class WorkflowView {
           ? `A ${b.kind} block may not declare allow: — ${denial}.`
           : "Pre-approved tool patterns, passed to the CLI's own --allowedTools/--allow-tool. " +
               "RESTRICT-ONLY: deny beats allow on both CLIs, so this can never re-grant what the " +
-              "block's kind takes away. loomux passes only letters, digits and ( ) : * _ - . / , and spaces."
+              "block's kind takes away. orrerix passes only letters, digits and ( ) : * _ - . / , and spaces."
       )
     );
 
@@ -1998,7 +1998,7 @@ export class WorkflowView {
       el(
         "p",
         "wf-note",
-        "ENFORCED, not advised: loomux refuses `gh pr merge` (via the PATH shim an agent cannot get around) " +
+        "ENFORCED, not advised: orrerix refuses `gh pr merge` (via the PATH shim an agent cannot get around) " +
           "until every reviewer this gate names has recorded a verdict of PASS. This is what makes a second " +
           "reviewer more than a suggestion."
       )
@@ -2161,7 +2161,7 @@ export class WorkflowView {
         "p",
         "wf-note",
         "Where autonomous work comes from: which source the orchestrator polls, and the label " +
-          "vocabulary it matches on. Every field is optional — an undeclared one inherits loomux's " +
+          "vocabulary it matches on. Every field is optional — an undeclared one inherits orrerix's " +
           "built-in profile, so a repo can override one label and keep the other four."
       )
     );
@@ -2182,7 +2182,7 @@ export class WorkflowView {
         "Source",
         this.labelledSelect(
           [
-            { value: "", label: "inherit loomux's default" },
+            { value: "", label: "inherit orrerix's default" },
             ...INTAKE_SOURCES.map((s) => ({ value: s, label: s })),
           ],
           intake.source ?? "",
@@ -2233,7 +2233,7 @@ export class WorkflowView {
         "p",
         "wf-note",
         `A label is letters, digits, - and _ (no leading -, at most ${ID_MAX_CHARS} characters). ` +
-          "loomux rejects anything else rather than rewriting it, so the label it looks for stays " +
+          "orrerix rejects anything else rather than rewriting it, so the label it looks for stays " +
           "the one your repo actually has."
       )
     );
@@ -2281,7 +2281,7 @@ export class WorkflowView {
         "Enabled",
         this.labelledSelect(
           [
-            { value: "", label: "not declared — off (loomux's default)" },
+            { value: "", label: "not declared — off (orrerix's default)" },
             { value: "true", label: "true — run the queue" },
             { value: "false", label: "false — declared off" },
           ],
@@ -2307,7 +2307,7 @@ export class WorkflowView {
             else q.max_batch = v;
           }, false)
         ),
-        "How many approved sub-PRs one batch may carry. Empty inherits loomux's default; a batch of none could never land anything."
+        "How many approved sub-PRs one batch may carry. Empty inherits orrerix's default; a batch of none could never land anything."
       )
     );
 
@@ -2324,7 +2324,7 @@ export class WorkflowView {
               else q.checks_timeout_minutes = v;
             }, false)
         ),
-        `How long to wait for a batch's checks before calling it unverifiable. loomux clamps this to ${MERGE_QUEUE_CHECKS_TIMEOUT_MIN}–${MERGE_QUEUE_CHECKS_TIMEOUT_MAX}.`
+        `How long to wait for a batch's checks before calling it unverifiable. orrerix clamps this to ${MERGE_QUEUE_CHECKS_TIMEOUT_MIN}–${MERGE_QUEUE_CHECKS_TIMEOUT_MAX}.`
       )
     );
     const findings = this.sectionFindingList("merge_queue");
@@ -2339,7 +2339,7 @@ export class WorkflowView {
         "p",
         "wf-note",
         "Named locks agents take turns on — a build directory, a test database, anything two agents " +
-          "must not hold at once. loomux never learns what a name MEANS: it counts slots and bounds " +
+          "must not hold at once. orrerix never learns what a name MEANS: it counts slots and bounds " +
           "how long a hold may last, and the agents' own briefs say what to acquire."
       )
     );
@@ -2399,12 +2399,12 @@ export class WorkflowView {
       num(
         "Slots",
         "slots",
-        `How many agents may hold it at once (${RESOURCE_SLOTS_MIN}–${RESOURCE_SLOTS_MAX}). Empty inherits loomux's default.`
+        `How many agents may hold it at once (${RESOURCE_SLOTS_MIN}–${RESOURCE_SLOTS_MAX}). Empty inherits orrerix's default.`
       );
       num(
         "Max hold (minutes)",
         "max_hold_minutes",
-        `How long one hold may last before it expires (${RESOURCE_MAX_HOLD_MINUTES_MIN}–${RESOURCE_MAX_HOLD_MINUTES_MAX}). Empty inherits loomux's default.`
+        `How long one hold may last before it expires (${RESOURCE_MAX_HOLD_MINUTES_MIN}–${RESOURCE_MAX_HOLD_MINUTES_MAX}). Empty inherits orrerix's default.`
       );
       box.append(card);
     }

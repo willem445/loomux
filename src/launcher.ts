@@ -1656,7 +1656,7 @@ export class WelcomeForm {
     if (!known && cli) {
       const o = document.createElement("option");
       o.value = cli;
-      o.textContent = `${cli} — not a CLI loomux knows`;
+      o.textContent = `${cli} — not a CLI orrerix knows`;
       this.sshCliSel.appendChild(o);
     }
     this.sshCliSel.value = cli ?? "";

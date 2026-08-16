@@ -1,6 +1,6 @@
-# Loomux documentation site
+# Orrerix documentation site
 
-The user-facing documentation for loomux, published to **GitHub Pages** at
+The user-facing documentation for orrerix, published to **GitHub Pages** at
 <https://willem445.github.io/loomux/>. This folder is the whole site: Markdown
 pages plus one `_config.yml`.
 

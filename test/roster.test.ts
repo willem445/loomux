@@ -286,13 +286,13 @@ test("#255 rev-1 NB2: the raise target never exceeds MAX_AGENTS_CEILING", () => 
   assert.ok(hard);
   assert.match(hard!, /at least 3/);
   assert.match(hard!, /or 12 to run every declared tier at once/, "offers the CLAMPED number, not 13");
-  assert.match(hard!, /above loomux's 12-agent limit/, "says WHY 12 is offered instead of 13");
+  assert.match(hard!, /above orrerix's 12-agent limit/, "says WHY 12 is offered instead of 13");
 
   // Soft tier (cap at the minimum, short of the full roster): same clamp.
   const soft = capacityWarning(r, 5);
   assert.ok(soft);
   assert.match(soft!, /Raise it to 12/);
-  assert.match(soft!, /above loomux's 12-agent limit/);
+  assert.match(soft!, /above orrerix's 12-agent limit/);
 
   // A roster whose recommendation fits comfortably under the ceiling must not
   // get the ceiling caveat at all — it would be noise.
@@ -323,7 +323,7 @@ test("#255 rev-2 non-blocking #2: when even the ceiling can't reach the minimum,
 
   const msg = capacityWarning(r, 4);
   assert.ok(msg, "max_agents (4) is nowhere near this roster's minimum (15)");
-  assert.match(msg!, /minimum itself \(15\) is above loomux's 12-agent limit/);
+  assert.match(msg!, /minimum itself \(15\) is above orrerix's 12-agent limit/);
   assert.doesNotMatch(
     msg!,
     /or 12 to run every declared tier at once/,
@@ -340,7 +340,7 @@ test("#255 rev-2 non-blocking #2: when even the ceiling can't reach the minimum,
   // not the ordinary hard-tier phrasing.
   const atCeiling = capacityWarning(r, MAX_AGENTS_CEILING);
   assert.ok(atCeiling, "12 < minimum (15) — still below it, the warning must not go quiet");
-  assert.match(atCeiling!, /minimum itself \(15\) is above loomux's 12-agent limit/);
+  assert.match(atCeiling!, /minimum itself \(15\) is above orrerix's 12-agent limit/);
 });
 
 test("#255 rev-2 non-blocking #3: MAX_AGENTS_CEILING mirrors the Rust source it's duplicated from", () => {

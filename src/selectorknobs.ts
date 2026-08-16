@@ -166,7 +166,7 @@ function narrowEffort(caps: CliKnobValues, detail: ModelDetail | null): KnobStat
   const fallback: KnobState = { enabled: true, values: caps.values, reason: "" };
   if (!detail) return fallback;
   if (detail.supportsEffort === false) {
-    return off(`${detail.name || detail.id} reports no reasoning-effort setting, so loomux sets none on it.`);
+    return off(`${detail.name || detail.id} reports no reasoning-effort setting, so orrerix sets none on it.`);
   }
   if (!detail.effortLevels.length) return fallback;
   return { enabled: true, values: [...detail.effortLevels], reason: "" };
@@ -191,11 +191,11 @@ export function knobState(
 ): KnobStates {
   const want = cli.trim();
   if (!caps || caps.cli !== want) {
-    const reason = `loomux has not read ${want || "this CLI"}'s capabilities yet.`;
+    const reason = `orrerix has not read ${want || "this CLI"}'s capabilities yet.`;
     return { effort: off(reason), context: off(reason) };
   }
   if (!caps.known) {
-    const reason = `loomux has never evaluated ${want}, so it sets no thinking level or context window on it.`;
+    const reason = `orrerix has never evaluated ${want}, so it sets no thinking level or context window on it.`;
     return { effort: off(reason), context: off(reason) };
   }
   const effort = narrowEffort(caps.effort, detail);

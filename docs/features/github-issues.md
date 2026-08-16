@@ -25,7 +25,7 @@ return.
 
 ## Authentication
 
-It reads and writes through the authenticated **`gh` CLI** — loomux stores no
+It reads and writes through the authenticated **`gh` CLI** — orrerix stores no
 token or secret; `gh` uses whatever `gh auth login` you already have. If `gh`
 isn't installed, or you haven't logged in, the panel says so with a one-line hint
 instead of failing calls. (See [Troubleshooting](../troubleshooting.html#gh-not-found-or-not-authenticated).)
@@ -72,7 +72,7 @@ running when you label, since the label is durable on GitHub and picked up
 whenever one next starts here. An `agent-managed` label (set by an orchestrator
 that already owns the issue) is shown read-only.
 
-If the repo doesn't have these agent labels yet, loomux **creates the one you
+If the repo doesn't have these agent labels yet, orrerix **creates the one you
 toggle on first use** (with its standard color and description) — so the
 handshake works on a fresh repo without any manual label setup. Only these
 allow-listed labels are ever created. See the

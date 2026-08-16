@@ -18,7 +18,7 @@ nav_order: 3
 ---
 
 Dictate a prompt instead of typing it. Press **`Alt+S`** to start recording
-(push-to-talk), speak, and press **`Alt+S`** again to stop — loomux transcribes
+(push-to-talk), speak, and press **`Alt+S`** again to stop — orrerix transcribes
 your speech **locally** and drops the text at your current focus. **`Esc`**
 cancels at any point (including mid-transcription). Transcription is never
 auto-submitted: you review it and press Enter yourself.
@@ -47,9 +47,9 @@ responsive and you can `Esc` to abort.
 ## Local & open source, opt-in
 
 Speech-to-text is [whisper.cpp](https://github.com/ggml-org/whisper.cpp) (MIT)
-running entirely on your machine — no audio leaves the box, no cloud STT. Loomux
+running entirely on your machine — no audio leaves the box, no cloud STT. Orrerix
 does **not** ship the whisper runtime (it would add ~150 MB to the installer), so
-voice is opt-in: install a whisper build and a model once and loomux picks them
+voice is opt-in: install a whisper build and a model once and orrerix picks them
 up automatically.
 
 ## Set it up (Windows)
@@ -57,14 +57,14 @@ up automatically.
 ### The easy way — the staging script
 
 Run the convenience script from a checkout. It downloads a pinned,
-checksum-verified runtime **plus** the `base.en` model into the location loomux
+checksum-verified runtime **plus** the `base.en` model into the location orrerix
 auto-detects (`%LOCALAPPDATA%\loomux\whisper`):
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\stage-whisper.ps1
 ```
 
-Restart loomux and press `Alt+S`.
+Restart orrerix and press `Alt+S`.
 
 ### By hand
 
@@ -81,18 +81,18 @@ Restart loomux and press `Alt+S`.
 
 2. Download a ggml model — e.g. `ggml-base.en.bin` from
    [ggerganov/whisper.cpp](https://huggingface.co/ggerganov/whisper.cpp).
-3. Place them where loomux looks by default:
+3. Place them where orrerix looks by default:
 
    ```
    %LOCALAPPDATA%\loomux\whisper\whisper-cli.exe      (with the DLLs beside it)
    %LOCALAPPDATA%\loomux\whisper\models\ggml-base.en.bin
    ```
 
-Restart loomux and press `Alt+S`.
+Restart orrerix and press `Alt+S`.
 
 ### Custom locations (env overrides)
 
-To keep the runtime or model elsewhere, point loomux at them:
+To keep the runtime or model elsewhere, point orrerix at them:
 
 - `LOOMUX_WHISPER_CLI` → a `whisper-cli.exe` (with its DLLs beside it)
 - `LOOMUX_WHISPER_MODEL` → any ggml `.bin` (e.g. a larger multilingual model)
@@ -104,7 +104,7 @@ locations it checked, so it's actionable.
 
 ## Performance & tuning
 
-- **Threads.** Loomux passes `-t` capped at your CPU's parallelism (max 8) —
+- **Threads.** Orrerix passes `-t` capped at your CPU's parallelism (max 8) —
   whisper.cpp otherwise defaults to 4, so this is a 2× win on a many-core machine,
   without oversubscribing (its CPU inference is memory-bandwidth-bound and gains
   flatten past ~8 threads).
@@ -117,18 +117,18 @@ locations it checked, so it's actionable.
   build — download a `cublas` release asset and point `LOOMUX_WHISPER_CLI` at it.
 - **Extra flags.** `LOOMUX_WHISPER_ARGS` is appended verbatim to the whisper
   command (whitespace-split, no shell quoting) for power users — e.g.
-  `LOOMUX_WHISPER_ARGS="-t 12 -bs 5"`. It comes *after* loomux's args and whisper
+  `LOOMUX_WHISPER_ARGS="-t 12 -bs 5"`. It comes *after* orrerix's args and whisper
   takes the last value of a flag, so your overrides win.
 
 ## Vocabulary biasing
 
 Bias recognition toward your own jargon with an optional
 `%LOCALAPPDATA%\loomux\whisper\vocab.txt` — one term or phrase per line, `#` for
-comments. Loomux assembles it into whisper's `--prompt` (an initial-prompt hint):
+comments. Orrerix assembles it into whisper's `--prompt` (an initial-prompt hint):
 
 ```
-# loomux project terms
-loomux
+# orrerix project terms
+orrerix
 ConPTY
 tmux
 gh
@@ -141,7 +141,7 @@ orchestrator
 ```
 
 Keep it a **short curated list**: whisper's initial prompt is capped (~224
-tokens) and only a curated list is reliably honored — loomux truncates to a
+tokens) and only a curated list is reliably honored — orrerix truncates to a
 conservative budget and logs a warning if `vocab.txt` is over-long. Set
 `LOOMUX_WHISPER_PROMPT` to a raw prompt string to override the file entirely.
 
@@ -151,12 +151,12 @@ conservative budget and logs a warning if `vocab.txt` is over-long. Set
 
 ## Limits & diagnostics
 
-- Recordings are **capped at 5 minutes**; loomux appends a "recording capped"
+- Recordings are **capped at 5 minutes**; orrerix appends a "recording capped"
   note rather than growing memory without bound.
 - If the mic can't be opened (no device, or Windows microphone privacy blocks
-  it), or the whisper runtime is missing/misconfigured, loomux surfaces a
+  it), or the whisper runtime is missing/misconfigured, orrerix surfaces a
   **specific** message rather than failing silently.
-- To debug a capture, set `LOOMUX_VOICE_KEEP_WAV=1` — loomux keeps the scratch
+- To debug a capture, set `LOOMUX_VOICE_KEEP_WAV=1` — orrerix keeps the scratch
   WAV and logs its path, duration, and level. A near-zero level on a long capture
   is the fingerprint of a silent/starved mic.
 

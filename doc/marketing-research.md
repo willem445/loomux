@@ -399,6 +399,59 @@ dashboard's fixed glazing you can open the window and reach in.
 - Whatever the name, keep the loom brand story — it's genuinely good; the
   problem was only the `-mux` suffix pointing at the wrong layer.
 
+### Decision (2026-08-16): **Orrerix**
+
+The name is **Orrerix**. It is a coinage, and it is not on any shortlist above
+— it is derived from the one metaphor the research liked best and had to throw
+away for availability rather than for fit.
+
+**Why it is a coinage rather than the word itself.** Round 2 killed the bare
+word: see *"Killed in round 2: **orrery** (perfect metaphor … but
+CaseyHaralson/orrery is already an AI-agent workflow orchestration CLI on
+GitHub, and the domains are taken)"* above. Nothing about that verdict was
+about the metaphor — the entry says "perfect metaphor" in the same breath — so
+the fix is to keep the image and shed the collision. `Orrerix` does that: it is
+one token, it is not `orrery`, and it does not carry the `loom` stem the
+**Rebrand caveats** section downgraded after `ghuntley/loom` turned up. (Cited
+by the passage's own words rather than by line number: a line cite is valid only
+at the commit it was derived on, and this file is still being appended to.)
+
+**The brand story it keeps.** An orrery is a desk-sized machine of many bodies
+in independent motion, geared so one mechanism keeps them all in phase — which
+is the product, not a metaphor for it: independent agents in their own panes,
+one orchestrator holding the phase, and a human who can see the whole mechanism
+at once. That satisfies the caveat above ("keep the loom brand story") on its
+actual terms — the thing worth keeping was the *mechanism* story; the `-mux`
+suffix, and now the `loom` stem, were only ever the parts pointing at the wrong
+layer.
+
+**Availability evidence — recorded here as OWED, not as done.** The name was
+checked and reported **CLEAR ON ALL 8 SURFACES**, but that check exists as a
+screenshot held by the human and is **not yet committed to this repo**. Until
+it lands here it is not evidence this document can be read as carrying, so it
+is written down as an open item rather than a result:
+
+| # | Surface | Recorded here? |
+|---|---|---|
+| 1 | npm registry | pending commit |
+| 2 | GitHub repo search | pending commit |
+| 3 | GitHub org availability | pending commit |
+| 4 | `.dev` domain (DNS **and** registrar WHOIS) | pending commit |
+| 5 | `.com` domain (DNS **and** registrar WHOIS) | pending commit |
+| 6 | web/product search | pending commit |
+| 7 | trademark (USPTO/EUIPO class 9/42) | pending commit |
+| 8 | social handles | pending commit |
+
+Surfaces 3, 4/5 (the WHOIS half), 7 and 8 are exactly the ones the **Rebrand
+caveats** section lists as *"Not done"* and says to do "before committing", so
+they are the ones whose recorded result matters most. The rename is phased
+(#1153) and phase 1 moves **only** the user-facing brand — window title, in-app
+strings, README and `docs/` prose. Every public identity that a clearance
+failure would actually cost something to unwind — the GitHub repo name, the npm
+package, `productName`/`identifier`, release-asset names — is held back to the
+human-gated final phase, and the gate on that phase is this table being filled
+in from the committed evidence.
+
 ## Second pass (2026-08-14): specs, meta-harnesses and deterministic orchestrators
 
 The first pass surveyed *products shaped like loomux* (GUI/TUI multiplexers with

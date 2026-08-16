@@ -32,7 +32,7 @@ at that pane's folder.
 | --- | --- |
 | **Git** | The same commit graph, diff preview and staging/commit surface as the [git view](git-view.html) — scoped to the dock's folder instead of one pane's. It refreshes when you select the tab, when you open the dock, and when you click back onto a pane in the same folder, so a commit you just made shows up. |
 | **Files** | The file explorer: browse the folder, open a file in the application your OS associates with it, create, rename and delete. |
-| **Editor** | loomux's own editor — a file tree, project search, and a text buffer for a quick read or a one-line fix. |
+| **Editor** | orrerix's own editor — a file tree, project search, and a text buffer for a quick read or a one-line fix. |
 
 In the **Files** tab, right-clicking a file and choosing *Open in editor pane*
 opens it in the dock's own **Editor** tab rather than taking a whole new pane —
@@ -71,7 +71,7 @@ active pane the next time you click the tab.
 
 Closing the dock never discards anything either: closing is hiding, and your
 buffer, the loaded commit log and your place in the file tree are all still
-there when you reopen it. Quitting loomux with unsaved edits in the dock's
+there when you reopen it. Quitting orrerix with unsaved edits in the dock's
 editor asks first, the same as everywhere else — the confirm lists it as
 `side dock editor`, with the folder it belongs to.
 

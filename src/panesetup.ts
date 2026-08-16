@@ -453,7 +453,7 @@ export function sshDiscardedFieldError(raw: SshProfile, kept: SshProfile): strin
   }
   if (raw.identityFile !== null && kept.identityFile === null) {
     return (
-      "The identity file must be a PATH to a private key, not the key itself — loomux never " +
+      "The identity file must be a PATH to a private key, not the key itself — orrerix never " +
       "stores key material, so a pasted key is refused rather than written to sshprofiles.json."
     );
   }
@@ -495,7 +495,7 @@ export function sshRemoteCwdWarning(remoteCli: string | null, remoteCwd: string 
 export function sshRemoteCliWarning(remoteCli: string | null, known: readonly string[]): string {
   if (!remoteCli || known.includes(remoteCli)) return "";
   return (
-    `"${remoteCli}" isn't a CLI loomux knows — it will be run on the remote host exactly as ` +
+    `"${remoteCli}" isn't a CLI orrerix knows — it will be run on the remote host exactly as ` +
     `written, with no session id and no autopilot flags.`
   );
 }
@@ -565,7 +565,7 @@ export function sshLaunchArgv(program: string, profile: SshProfile, sessionId: s
  *  in — a second copy in main.ts is how the two would come to say different
  *  things about the same failure. */
 export const SSH_NO_CLIENT =
-  "No ssh client found — loomux looked on PATH and in the Windows OpenSSH install " +
+  "No ssh client found — orrerix looked on PATH and in the Windows OpenSSH install " +
   "(System32\\OpenSSH). Install the OpenSSH Client optional feature, or put ssh.exe on PATH.";
 
 /** Shown on a restored SSH pane whose saved connection is no longer in the store

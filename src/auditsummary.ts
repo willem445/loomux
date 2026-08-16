@@ -56,14 +56,14 @@ export function summarize(e: AuditEntry): string {
     // written by an older loomux, and the viewer says so rather than leaving a
     // reader to assume the current build behaves this way.
     case "prompt-suppressed-paused":
-      return `✕ ${str(d.to) ?? "?"} — discarded, older loomux (group paused): ${firstLine(str(d.text) ?? "")}`;
+      return `✕ ${str(d.to) ?? "?"} — discarded, older orrerix (group paused): ${firstLine(str(d.text) ?? "")}`;
     // #569: the resume-time tally for those legacy discards. `delivered` is
     // whether the orchestrator actually took the notice; when it did not, the
     // reason is named, because "the orchestrator was told" is a claim and this
     // is the line that has to be honest about it.
     case "pause-suppression-notice": {
       const n = typeof d.count === "number" ? d.count : Number(d.count ?? NaN);
-      const what = `${n} deliver${n === 1 ? "y" : "ies"} discarded by an earlier loomux while paused`;
+      const what = `${n} deliver${n === 1 ? "y" : "ies"} discarded by an earlier orrerix while paused`;
       return d.delivered
         ? `${what} — orchestrator notified on resume`
         : `${what} — could NOT notify the orchestrator (${str(d.error) ?? "?"}); panes badged instead`;

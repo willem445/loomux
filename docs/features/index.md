@@ -7,7 +7,7 @@ has_children: true
 
 # Feature pages
 
-Deep dives on loomux's per-feature panels and tools. Each one floats *over* the
+Deep dives on orrerix's per-feature panels and tools. Each one floats *over* the
 terminal it's scoped to and never resizes the PTY underneath. The pane-scoped
 panels close with `Esc`; the window-level ones (the session browser, the side
 dock) have their own toggle in the top bar, so that `Esc` keeps reaching your

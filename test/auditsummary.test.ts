@@ -164,7 +164,7 @@ test("prompt-suppressed-paused reads as a discard by an OLDER build", () => {
     entry("prompt-suppressed-paused", { to: "orch-1", text: "report: done, PR #123 is green" }, "w-2")
   );
   assert.match(s, /discarded/, "the word has to be there — this payload no longer exists");
-  assert.match(s, /older loomux/, "and it must not read as something the current build does");
+  assert.match(s, /older orrerix/, "and it must not read as something the current build does");
   assert.match(s, /orch-1/, "and the pane that never got it");
   assert.match(s, /PR #123 is green/, "and the payload, so it can be re-sent");
 });
@@ -179,7 +179,7 @@ test("the resume tally says whether the orchestrator was actually told", () => {
   const told = summarize(entry("pause-suppression-notice", { count: 3, delivered: true }, "loomux"));
   assert.equal(
     told,
-    "3 deliveries discarded by an earlier loomux while paused — orchestrator notified on resume"
+    "3 deliveries discarded by an earlier orrerix while paused — orchestrator notified on resume"
   );
 
   // The honesty case: "the orchestrator was told" is a claim, and this line is
@@ -189,7 +189,7 @@ test("the resume tally says whether the orchestrator was actually told", () => {
   );
   assert.equal(
     untold,
-    "1 delivery discarded by an earlier loomux while paused — could NOT notify the orchestrator (no live orchestrator in this group); panes badged instead"
+    "1 delivery discarded by an earlier orrerix while paused — could NOT notify the orchestrator (no live orchestrator in this group); panes badged instead"
   );
 });
 

@@ -4,7 +4,7 @@ layout: default
 nav_order: 1
 ---
 
-# Loomux documentation
+# Orrerix documentation
 {: .no_toc }
 
 A dead-simple terminal multiplexer for AI agent management — without the bloat.
@@ -19,14 +19,14 @@ A dead-simple terminal multiplexer for AI agent management — without the bloat
 fabric is woven — here, the frame holding a matrix of terminal panes, each one
 carrying an agent (or just a shell).
 
-Loomux gives you Windows Terminal–class smoothness with the multiplexing
+Orrerix gives you Windows Terminal–class smoothness with the multiplexing
 features it lacks: instant matrix splits, nameable panes, a native session
 browser that restores Claude Code, GitHub Copilot CLI, and OpenCode sessions
 straight into a pane, and — the headline feature — a built-in
 **orchestrator/worker** workflow for running a small fleet of AI agents, each
 in its own visible pane, that you gatekeep only at review and merge.
 
-![A loomux window with several agent panes](https://raw.githubusercontent.com/willem445/loomux/main/sample.jpg)
+![An orrerix window with several agent panes](https://raw.githubusercontent.com/willem445/loomux/main/sample.jpg)
 
 ## What's here
 
@@ -49,7 +49,7 @@ in its own visible pane, that you gatekeep only at review and merge.
 
 ## For contributors
 
-This site is the **user** guide. If you want to build on loomux, the developer
+This site is the **user** guide. If you want to build on orrerix, the developer
 docs stay in the repository:
 
 - [`README.md`](https://github.com/willem445/loomux/blob/main/README.md) — the

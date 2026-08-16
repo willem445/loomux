@@ -23,7 +23,7 @@ grid of panes and its own minimize dock — and switching tabs swaps the entire
 workspace in and out, so you can keep several projects side by side without their
 panes competing for screen space.
 
-Like every loomux panel, tabs never resize the terminal underneath: a background
+Like every orrerix panel, tabs never resize the terminal underneath: a background
 tab is **hidden, not torn down**, so its PTYs keep running and switching never
 repaints a terminal (the same no-resize promise as maximize).
 
@@ -78,7 +78,7 @@ you're looking at another project.
 - A tab running orchestration shows a **`⛓`** marker; a tab holding a **dormant**
   (restored-but-not-resumed) group shows a static **`ORCH`** chip. A tab can mix
   normal agents and orchestration, so these are independent of the agent count.
-- When the orchestrator focuses an agent (or you restore its session), loomux
+- When the orchestrator focuses an agent (or you restore its session), orrerix
   **switches to that agent's tab first, then focuses the pane**.
 
 See the [orchestration guide](../orchestration.html) for the group workflow
@@ -109,7 +109,7 @@ this is the per-tab form of, including what happens to a very long pause.
 
 ## Restore your session on launch
 
-Reopen loomux with a saved session and it asks first: a **"Restore your last
+Reopen orrerix with a saved session and it asks first: a **"Restore your last
 session?"** splash with **Restore** and **Start fresh**. Tick *Remember my
 choice* and future launches skip the splash and do what you picked; leave it
 unticked to be asked again next launch. Pressing **Esc** is a non-committal
@@ -126,7 +126,7 @@ divider positions you'd dragged. Each pane comes back by kind:
   (PowerShell / cmd / Git Bash) — instant, nothing to resume.
 - **Agent panes** (Claude) **auto-resume their session** — the CLI reopens with
   its prior context loaded, into the idle TUI. Resuming **spends nothing until
-  you send a prompt**, and loomux never replays one for you. If the recorded
+  you send a prompt**, and orrerix never replays one for you. If the recorded
   session has no saved conversation (you closed it before sending a prompt, or
   the transcript was deleted), the pane comes back as a **fresh** session in the
   same spot — same folder, same agent — instead of erroring; a best-effort CLI
@@ -145,7 +145,7 @@ divider positions you'd dragged. Each pane comes back by kind:
   edit — and if you deleted the saved connection, the card says so rather than
   guessing at one. With Claude Code on the far end the reconnect **resumes the
   remote session** it recorded; other CLIs come back on a new conversation,
-  because only Claude's session id travels on the command line where loomux can
+  because only Claude's session id travels on the command line where orrerix can
   put it. The same **Reconnect** offer appears if a live connection drops
   mid-session — the pane stays open with the output that explains why (a timeout,
   a closed connection, a refused key) and the offer floats over it, so you read

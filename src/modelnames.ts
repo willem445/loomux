@@ -189,7 +189,7 @@ export const INHERIT_MODEL_LABEL = "(none) — the model your own CLI config sel
  *  copilot and `pro` on gemini — only on opencode is it genuinely nothing. So the
  *  row names the RULE (whose default it is) rather than one CLI's outcome, which
  *  is the only phrasing true of all four. */
-export const BLOCK_DEFAULT_MODEL_LABEL = "(unset) — loomux's default for this block's kind and CLI";
+export const BLOCK_DEFAULT_MODEL_LABEL = "(unset) — orrerix's default for this block's kind and CLI";
 
 /** The label for one row of a curated model list: `INHERIT_MODEL_LABEL` for the
  *  empty id, `modelLabel` for every real one. */

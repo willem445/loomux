@@ -1,4 +1,4 @@
-# Loomux
+# Orrerix
 
 **A terminal multiplexer for AI coding agents — hand it a goal and a queue of
 work, and let it run.**
@@ -6,11 +6,11 @@ work, and let it run.**
 [![CI](https://github.com/willem445/loomux/actions/workflows/ci.yml/badge.svg)](https://github.com/willem445/loomux/actions/workflows/ci.yml)
 [![Docs](https://img.shields.io/badge/docs-github%20pages-blue)](https://willem445.github.io/loomux/)
 
-![A loomux window running an orchestrator and several agent panes](sample.jpg)
+![An orrerix window running an orchestrator and several agent panes](sample.jpg)
 
 [![Autonomous](https://img.shields.io/badge/autonomous-82%25%20unsupervised-blueviolet)](#hand-it-a-batch-of-work-and-walk-away)
 
-**loomux builds itself.** 82% of its own active development time ran fully
+**orrerix builds itself.** 82% of its own active development time ran fully
 unsupervised — agents alone planning, building, adversarially reviewing, and
 shipping the work, with humans holding only the merge and release gates.
 
@@ -19,7 +19,7 @@ shipping the work, with humans holding only the merge and release gates.
 - 48 human touch-points (prompts, merge approvals, release grants) against ~21,600
   audited agent/system events — about 0.2%
 
-Loomux is a native desktop terminal for Windows, macOS and Linux — instant matrix
+Orrerix is a native desktop terminal for Windows, macOS and Linux — instant matrix
 splits, nameable panes, project tabs, session restore — with an
 **orchestrator/worker workflow built in**. Point a group at a repo, label some
 GitHub issues, and an orchestrator plans the work, spawns workers and reviewers
@@ -39,6 +39,10 @@ fabric is woven.
 npx loomux-desktop            # Node 18+, any platform — downloads and launches
 npm install -g loomux-desktop # …or install it and just run `loomux`
 ```
+
+> The published package, the installers, the app binary and this repo are still
+> named **loomux** — the rename to Orrerix is landing in phases and the shipping
+> identities move last, so the commands above are the current ones (#1153).
 
 <details>
 <summary>Other install paths — Windows / macOS / Linux one-liners, release assets, betas</summary>
@@ -79,7 +83,7 @@ Label a few issues `agent-ready`, set a token budget, flip **Autonomous mode** o
 — and close the laptop. The orchestrator keeps pulling labeled work off the board
 for as long as you leave it running, hours or days, without you poking it.
 
-That's only sane because the guardrails live in loomux itself, outside the agent
+That's only sane because the guardrails live in orrerix itself, outside the agent
 process — not in a prompt asking an agent nicely:
 
 - **It won't merge or publish.** Every agent pane runs behind a `gh`/`git` shim
@@ -96,7 +100,7 @@ process — not in a prompt asking an agent nicely:
 - **It can't overspend.** Crossing the token budget suspends autonomous mode
   unconditionally — even if the state file can't be written — and the suspension
   survives a restart.
-- **It doesn't burn tokens on nothing.** Before waking the orchestrator, loomux
+- **It doesn't burn tokens on nothing.** Before waking the orchestrator, orrerix
   runs a zero-token, host-side check for actual new work (`gh issue list` /
   `gh pr list`, no LLM turn). A tick with nothing to report is skipped quietly.
 - **It survives a restart.** Queued prompts live on disk and re-queue in order
@@ -142,7 +146,7 @@ enforced at the CLI level.
 - **A bisecting merge queue** — opt in and a batch of approved sub-PRs is tested
   *together* on a scratch ref before any of them lands, because five green PRs
   can still make a red branch. The commit CI tested is the commit that lands; if
-  the batch breaks, loomux bisects and tells you which PR did it instead of
+  the batch breaks, orrerix bisects and tells you which PR did it instead of
   leaving someone to guess. It lands only on an integration branch, never your
   default one.
 - **A real terminal underneath** — WezTerm's PTY layer and xterm.js, so escape
@@ -158,20 +162,20 @@ enforced at the CLI level.
 - **Lessons that outlive a session** — a committed `.loomux/lessons.md` feeds
   hard-won repo knowledge into the next orchestrator's kickoff.
 
-## Why loomux over…
+## Why orrerix over…
 
 - **tmux / zellij / [herdr](https://github.com/ogulcancelik/herdr)** — they
-  multiplex your agents; loomux manages your agents' *work*.
+  multiplex your agents; orrerix manages your agents' *work*.
 - **Prompt-layer orchestrators
   ([superpowers](https://github.com/obra/superpowers),
   [gstack](https://github.com/garrytan/gstack),
   [oh-my-claudecode](https://github.com/yeachan-heo/oh-my-claudecode),
   [gsd-pi](https://github.com/open-gsd/gsd-pi))** — review gates written as
-  prompts *inside* one agent CLI, which an agent can talk its way past. Loomux
+  prompts *inside* one agent CLI, which an agent can talk its way past. Orrerix
   gates from outside the process instead — host-side, and backed by a machine
   account when you want it airtight. Complementary, not competing — install them
   inside a worker's pane.
-- **IDE-shaped agent platforms** — loomux is still a terminal: lightweight,
+- **IDE-shaped agent platforms** — orrerix is still a terminal: lightweight,
   native, and it opens *your* editor instead of embedding one.
 - **Unattended fleets you can't see** — every agent here works in a pane you can
   read and interrupt mid-task, and the merge button stays human by default.
