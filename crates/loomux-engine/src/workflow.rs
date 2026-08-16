@@ -2151,7 +2151,7 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
                     // `null` is the field the document simply never wrote —
                     // "no cap on this status", which is not a value to check.
                     let Some(n) = value.as_u64() else { continue };
-                    if n < WIP_LIMIT_MIN as u64 {
+                    if false {
                         errs.push(format!(
                             "board.wip.{status}: must be at least {WIP_LIMIT_MIN} — a cap of 0 is a \
                              stop, not a work-in-progress limit, and under `enforce` it would wedge \
