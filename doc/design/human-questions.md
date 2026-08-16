@@ -32,8 +32,9 @@ state where human absence stops machine progress.*
 
 The literal reading of #946 — a dedicated liaison agent that holds the pending
 question and relays it — was rejected because it re-creates the incident one
-level up. An agent pane is an LLM session: it compacts, it dies, it gets
-idle-killed. Putting the thing that un-blocks the fleet inside one means a
+level up. An agent pane is an LLM session: it compacts, it wedges, it dies —
+and exempting one from the idle reaper, as a liaison now is (#891 S4), changes
+none of those. Putting the thing that un-blocks the fleet inside one means a
 wedged liaison is a deaf fleet, and the failure is harder to see than the one it
 replaced. A liaison may still *present* questions and relay context (that is
 #891's job, and it composes with this); it simply is not the record.

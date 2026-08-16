@@ -1970,6 +1970,17 @@ dependencies = [
  "serde_norway",
  "sha2",
  "tempfile",
+ "winreg 0.55.0",
+]
+
+[[package]]
+name = "loomux-server"
+version = "0.0.0"
+dependencies = [
+ "loomux-engine",
+ "serde",
+ "serde_norway",
+ "tempfile",
 ]
 
 [[package]]

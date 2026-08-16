@@ -507,8 +507,42 @@ fn first_line(s: &str) -> String {
 ///
 /// Finally caps the length.
 pub fn sanitize_gh_text(s: &str, max_len: usize) -> String {
+    sanitize_pane_text(s, max_len, Lines::Collapse)
+}
+
+/// What a pane-bound scrub does with the line structure of untrusted text
+/// (#891 rev-2 F1b).
+///
+/// `Collapse` is the historical and default answer, and the right one for a
+/// one-line status: no newline survives, so nothing the text contains can ever
+/// *begin* a line of its own.
+///
+/// `Keep` exists for one shape — a recorded verdict's summary, which is
+/// deliberately multi-line prose (`workflow::sanitize_summary` preserves `\n`
+/// and `\t` on purpose, and the verdict notice already ends with a
+/// loomux-minted second line). Collapsing it would silently reflow a
+/// reviewer's findings into one paragraph, so the newlines stay and the
+/// bracket mapping does the work: a forged span can start a line, but with no
+/// `[` to open it, it cannot read as a `[loomux] …` notice. **That is the
+/// whole guarantee here — line position is not what makes a notice trusted,
+/// the token is.**
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Lines {
+    /// Drop every control character, newlines included.
+    Collapse,
+    /// Drop every control character except `\n` and `\t`.
+    Keep,
+}
+
+/// The one rule for untrusted text entering a `[loomux] …` line, with the line
+/// policy chosen by the caller. Both halves — the control-character filter and
+/// the bracket mapping — are defined here once; `sanitize_gh_text` is this
+/// function with `Lines::Collapse`, and every other spelling of "scrub before
+/// a pane sees it" in this codebase routes here rather than reimplementing
+/// either half.
+pub fn sanitize_pane_text(s: &str, max_len: usize, lines: Lines) -> String {
     s.chars()
-        .filter(|c| !c.is_control())
+        .filter(|c| !c.is_control() || (lines == Lines::Keep && matches!(c, '\n' | '\t')))
         .map(|c| match c {
             '[' => '(',
             ']' => ')',

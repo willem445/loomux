@@ -27,6 +27,7 @@ import {
   addBlock,
   newBlock,
   isValidBlockId,
+  isReviewingBlock,
   isWorkflowCli,
   isValidIntakeLabel,
   isValidResourceName,
@@ -1124,6 +1125,93 @@ test("role_hint case handling matches the backend's lowercasing (#250/#324 rider
     codes(validateWorkflow(w)),
     [],
     "a capitalized role_hint the real parser accepts must not be flagged as unknown here"
+  );
+});
+
+test("role_hint: liaison requires kind: reviewer (#891)", () => {
+  // The human-facing pane rides the reviewer capability class. Mirrors the
+  // backend's `role_hint_requires`, including its trim + lowercase, so this
+  // pane never flags a file the real parser accepts.
+  assert.equal(roleHintRequires("liaison"), "reviewer");
+  assert.equal(roleHintRequires(" Liaison "), "reviewer");
+  assert.equal(roleHintRequires("liason"), undefined, "a typo is rejected, never coerced");
+
+  // On a reviewer block the gate does not name: no hint finding, no gate finding.
+  const ok = starterWorkflow();
+  ok.blocks.push({
+    id: "human",
+    name: "Liaison",
+    kind: "reviewer",
+    cli: "claude",
+    model: "",
+    role_hint: "liaison",
+  });
+  ok.edges.push({ from: "worker", to: "human" });
+  assert.deepEqual(
+    codes(validateWorkflow(ok)).filter((c) => c.startsWith("role-hint") || c.startsWith("gate-")),
+    []
+  );
+
+  // On every other kind it is the same named finding — "requires reviewer" is a
+  // claim about the whole set of kinds it is NOT allowed on, so check them all.
+  for (const [i, kind] of [
+    [0, "planner"],
+    [1, "worker"],
+  ] as const) {
+    const bad = starterWorkflow();
+    bad.blocks[i]!.role_hint = "liaison";
+    const f = validateWorkflow(bad);
+    assert.ok(has(f, "role-hint-wrong-kind"), `liaison on a ${kind} block must be flagged`);
+    assert.equal(f.find((x) => x.code === "role-hint-wrong-kind")!.blockId, kind);
+  }
+});
+
+test("a merge gate may not name a liaison as one of its reviewers (#891)", () => {
+  // A liaison IS reviewer-kind, so it slips past the "not a reviewer" check —
+  // but it never records a verdict, so a gate naming one could never open.
+  // The backend refuses the same file at parse; this pane must not call it fine.
+  const w = starterWorkflow();
+  w.blocks[2]!.role_hint = "liaison"; // blocks[2] is the block the gate names
+  const f = validateWorkflow(w);
+  assert.ok(has(f, "gate-not-a-reviewer"), `a gate naming a liaison must be flagged: ${codes(f)}`);
+  assert.match(
+    f.find((x) => x.code === "gate-not-a-reviewer")!.message,
+    /liaison/,
+    "and the message must say why, not just that the block is wrong"
+  );
+
+  // The control: the same document without the hint is clean, so the finding
+  // above is attributable to the liaison rule and not to the fixture.
+  assert.ok(!has(validateWorkflow(starterWorkflow()), "gate-not-a-reviewer"));
+});
+
+test("isReviewingBlock separates the blocks that review from the class they ride (#891)", () => {
+  // The pane's mirror of the backend's `is_reviewing_block`. It is what the
+  // merge-gate reviewer list offers and what switching the gate ON fills in —
+  // and the pairing that matters is the last two: a liaison is reviewer-KIND,
+  // so a `kind` filter cannot tell them apart and the editor would author a
+  // file `validateWorkflow` flags `gate-not-a-reviewer` on the same keystroke.
+  assert.equal(isReviewingBlock({ kind: "reviewer" }), true);
+  assert.equal(isReviewingBlock({ kind: "worker" }), false);
+  assert.equal(isReviewingBlock({ kind: "reviewer", role_hint: "process" }), true,
+    "another hint on a reviewer subtracts nothing — only the liaison does");
+  assert.equal(isReviewingBlock({ kind: "reviewer", role_hint: "liaison" }), false);
+  // Trimmed and case-folded, like `roleHintRequires` and the backend parser: a
+  // file the real engine reads as a liaison must not read as a reviewer here.
+  assert.equal(isReviewingBlock({ kind: "reviewer", role_hint: " Liaison " }), false);
+
+  // The property the two call sites depend on, asserted directly rather than
+  // through the DOM they live in: filtering a real roster leaves exactly the
+  // blocks a merge gate may name.
+  const w = starterWorkflow();
+  w.blocks[2]!.role_hint = "liaison";
+  const gateable = w.blocks.filter(isReviewingBlock).map((b) => b.id);
+  assert.ok(!gateable.includes(w.blocks[2]!.id), `the liaison must not be offered: ${gateable}`);
+  assert.deepEqual(
+    validateWorkflow({ ...w, gates: { merge: { require: "all-pass", reviewers: gateable, also: [] } } })
+      .filter((f) => f.code === "gate-not-a-reviewer"),
+    [],
+    "a gate filled from this predicate must validate clean — that is the whole point of it"
   );
 });
 

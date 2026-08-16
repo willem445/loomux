@@ -48,8 +48,9 @@ Each is shipped, tested, and citable — prefer copying one to inventing a shape
   `pty.rs` `write_pty` (~L1580) and `change_dir` (~L1685), both #734. `git.rs`
   is the one to copy: it is the largest instance, and the only one whose
   conversion had to give something up — the freeze it removed was also an
-  accidental mutual exclusion, so it carries the worked example of restoring
-  the ordering (`src/gitqueue.ts`) and of the residual left behind (#754).
+  accidental mutual exclusion (INV-7), so it carries the worked example of
+  restoring the ordering (`src/gitqueue.ts`) and of the residual left
+  behind (#754).
   The delegation helper for a NEW conversion is `blocking.rs` `run_blocking`
   (#746, shared by the nine gesture modules); `git.rs`, `gh.rs` and
   `orchestration/mod.rs` keep their own older private copies, which is history,
@@ -188,6 +189,18 @@ scan pins the shape.
   ladder, and any suppression driven by a fallible signal has a release that
   does not depend on that signal. See P4. *Enforced: review* + the pure-module
   unit tests each policy already carries.
+- **INV-7 — A conversion that deletes an exclusion argues it, per command.**
+  P1 removes an accidental mutual exclusion along with the freeze; **P7**
+  carries the shape and the ticket remedy. What this invariant adds is *who
+  owes the argument and where*: it is owed **in code, above each converted
+  command** whose body touches state another command also touches (an index, a
+  file, a remote ref), and it is one of three — something else already
+  serializes it (a lock the body itself takes; #752's per-command
+  `Reentrancy` docs are the worked set), the ordering is restored at the one
+  choke point every caller already passes (`src/gitqueue.ts`, bounded per
+  INV-6), or the body is stateless. Per command, never per module: the
+  stateless argument that carries `gh.rs` (#724) does not carry `git.rs`
+  (#726/#744, residual #754). *Enforced: review.*
 
 ## 4. Argued exceptions
 
@@ -199,7 +212,7 @@ These are deliberate and stay. Each is argued **in code** at the cite; an E1/E2
 | **X1** | `resize_pty` stays sync | `pty.rs` `resize_pty` + its doc (~L1624) | A sync command inherits arrival ordering from main-thread dispatch, and resizes need it: `shouldResizePty` suppresses only an *identically sized* in-flight call, so two sizes can be outstanding and off-thread could land them in either order, leaving ConPTY at the older geometry with no event to correct it. The bounded-resize claim is marked ASSUMED in-code with its named falsifier. | INV-1 |
 | **X2** | `fm_delete_start` uses a dedicated OS thread, not `spawn_blocking` | `filemgr.rs` `fm_delete_start` + its doc (~L887) | `SHFileOperationW` is a Shell/COM API whose STA requirement the main thread was satisfying implicitly (wry `OleInitialize`s it). A generic async pool has no defined apartment state, so the thread enters its own STA for the duration. | INV-1 |
 | **X3** | The `thread::spawn`-and-stream family: `ft_search_start`, `ft_files_start`, `fm_hash_start` | `fileedit.rs` `ft_search_start` (~L1134), `ft_files_start` (~L1211); `filehash.rs` `fm_hash_start` (~L221) | Sync commands that start a cancellable streaming walk and return immediately. The work is off the webview thread and the results arrive as bounded batch events (P5 gates the handler side); the shared cancel registry is why they are threads with a flag rather than opaque pool tasks. | INV-1 |
-| **X4** | `mq_state_lock` held across git/gh subprocess runs, on the fleet's single gh-poll thread | `orchestration/mod.rs` `OrchRegistry::mq_state_lock` + its doc (~L8914); the holding sites `queue_merge_with` (~L35967) and `mq_drive_group_with` (~L36346); `orchestration/mqdriver.rs` `MQ_CMD_TIMEOUT` (~L202) | One registry-wide lock is deliberate — the driver services one group per tick, so per-group locks buy no usable concurrency at the cost of a lock-ordering question. Every call is bounded by `MQ_CMD_TIMEOUT` (60 s), and the coupling is self-documented. **Scope of the exception: it costs fleet latency, not GUI latency** — nothing here runs on the webview thread. Decoupling is #748, not a licence to widen this. | INV-4, INV-5 |
+| **X4** | `mq_state_lock` held across git/gh subprocess runs, on the fleet's single gh-poll thread | `orchestration/mod.rs` `OrchRegistry::mq_state_lock` + its doc (~L8914); the holding sites `queue_merge_with` (~L35967) and `mq_drive_group_with` (~L36346); `crates/loomux-engine/src/mqdriver.rs` `MQ_CMD_TIMEOUT` (#888 batch 12a moved it out of `orchestration/`) | One registry-wide lock is deliberate — the driver services one group per tick, so per-group locks buy no usable concurrency at the cost of a lock-ordering question. Every call is bounded by `MQ_CMD_TIMEOUT` (60 s), and the coupling is self-documented. **Scope of the exception: it costs fleet latency, not GUI latency** — nothing here runs on the webview thread. Decoupling is #748, not a licence to widen this. | INV-4, INV-5 |
 | **X5** | The compact-nudge cadence reads every agent's full pty tail (outside the `agents` lock since #743 S7 — the whole-ring *read* is the exception, not the lock scope) | `orchestration/mod.rs` `OrchRegistry::any_compact_pending` + its doc (~L25955) | The elevated cadence is registry-wide and its cost is bounded and stated: ≤256 KiB × 6 wakes/min per agent (sub-1 MiB/s for a large fleet), and the elevated cadence itself cannot run beyond ~20 min by the state machine's own timeouts. Two cheap tightenings are named in-code, neither built speculatively. | INV-5 |
 | **X6** | `AUDIT_LOCK` and `creation` are process-global | `orchestration/mod.rs` `AUDIT_LOCK` (~L10040), `append_audit` (~L10212), `rotate_audit_if_needed` (~L10070); `OrchRegistry::creation` (~L9102) | Both serialize by design. `AUDIT_LOCK` makes append and rotation one unit and is held only for the open+write, never across orchestration work; the JSON is formatted before the lock is taken. `creation` serializes group id choice against orchestrator registration, which is a correctness requirement, and fires once per group launch. Named so each stays a decision rather than an accident. | INV-5 |
 

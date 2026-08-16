@@ -6,9 +6,12 @@ terminals, Vite. `doc/design/architecture.md` maps every module; deeper designs
 live in `doc/design/`.
 
 The repo root is a **Cargo workspace**: `src-tauri` (the desktop app, links
-Tauri) and `crates/loomux-engine` (the Tauri-free orchestration core, filling
-up one batch at a time as #888 moves modules into it). One `Cargo.lock` and one
-`target/`, both at the repo root. See `doc/design/engine-extraction.md`.
+Tauri), `crates/loomux-engine` (the Tauri-free orchestration core, filling up
+one batch at a time as #888 moves modules into it) and `crates/loomux-server`
+(the remote-engine daemon that will host that core — a binary, and a leaf
+nothing else depends on). One `Cargo.lock` and one `target/`, both at the repo
+root. See `doc/design/engine-extraction.md` and
+`doc/design/remote-engine-daemon.md`.
 
 ## Commands
 
@@ -27,6 +30,18 @@ CI) — match the surrounding style instead of reformatting. (Agents may still
 run `rustfmt --check` as a *syntax* check, discarding its formatting
 opinions — see the `ci-validate` skill.)
 
+### Running these in an agent worktree
+
+- **`npm ci` before any `npm`/`node` command.** `node_modules/` is gitignored
+  and not shared between worktrees, so a freshly-cut one has none. A
+  missing-package error is *you never installed*, never a red suite — the
+  `ci-validate` skill has the trap in full.
+- **Anchor every `cd` at an absolute path.** The Bash tool's cwd persists
+  between calls, so a second relative `cd src-tauri/src/...` resolves against
+  the previous `cd` and fails with `No such file or directory`.
+- **There is no `python3`** — the `WindowsApps` alias stub exits 126
+  (`Permission denied`). Use `node -e` for ad-hoc scripting.
+
 ### Agent workers: NO local Rust builds — CI is the only build/test path
 
 The Commands table above is for humans. For agent workers, **local
@@ -40,8 +55,9 @@ How workers validate instead: push early, open a draft PR immediately,
 and read CI (`ci-validate` skill's draft-PR-early flow). Iterate by
 reasoning + pushing; CI is both the proof and the compiler.
 Frontend-only commands that never invoke `rustc` (`npm run build`/`tsc`,
-`npm test`/`node --test`) remain fine locally, as does `rustfmt --check
---edition 2021 <changed .rs>` — a parser, not a build, and the one pre-push
+`npm test`/`node --test`) remain fine locally once `npm ci` has run in the
+worktree (see above), as does `rustfmt --check --edition 2021 <changed .rs>`
+— a parser, not a build, and the one pre-push
 syntax check for Rust (#558; see the skill for the read-stderr recipe and why
 `cargo check` is not covered). The one `cargo` exception: `cargo update
 --workspace` for release lockfile bumps — dependency resolution only, never
@@ -97,6 +113,39 @@ compiles.
    reach a `join` as a value.
    Membership ("may this caller touch this group?") is a **separate** check and
    is not implied by holding a valid id.
+   **Four identifier families share one validating constructor** (#925):
+   `loomux_engine::pathseg::PathSegment`. The group id (via `GroupId`, which
+   keeps its own type and delegates only its *checks*), the agent-session id,
+   the agent id, and merge-queue batch ids (via `mergeq::valid_id_component`)
+   all run the same `check_segment`. Express a **new** family through
+   `PathSegment` rather than writing another private "is this a safe id"
+   predicate — the reason the consolidation happened is that four had drifted
+   apart and the weakest was the one guarding a live `Path::join`.
+   **One family is deliberately outside it**, and it is named here so nobody
+   concludes the rule is decorative on finding it: workflow **block ids** are
+   validated by `workflow::sanitize_id`, which is weaker than `check_segment`
+   on exactly the two rules the alphabet does not give you — it permits a
+   leading `-` and a Windows reserved device name — and it **rewrites rather
+   than refuses** (`sanitize_id("../x")` yields `x`), which is the
+   two-strings-name-one-directory hazard `pathseg` exists to avoid; bounded
+   only because `parse_workflow` rejects an id `sanitize_id` had to change. A
+   block id becomes `<id>.md` in the group dir. That is operator-authored
+   config rather than caller input, so it is not a containment breach and #925
+   left it alone; the filename scan below carries it as an argued allowlist row
+   rather than being blind to it.
+   The join scan's permitted-assembly-point list is one row **per family**
+   (each required exactly once, so a renamed one fails loudly rather than
+   watching nothing), and a sibling scan in `src-tauri/tests/pathseg.rs` covers
+   the shape it structurally cannot see: a value interpolated into a **file
+   name** (`format!("{x}.json")`). Its trigger is the *shape* — an
+   interpolation plus a file-extension literal, matched inside the `format!`
+   template — never a binding's name, per the source-scanning-guard convention
+   below; default-deny, with an argued allowlist whose rows each name a proof
+   that is re-checked, and which fails when a row goes stale.
+   Still open, and **not** closed by any of this: the `ft_*`/`fm_*`/git `repo`
+   **roots** are arbitrary caller-supplied absolute paths checked only by
+   `is_dir()`. That is a root-admission problem, not a segment one — no
+   predicate separates a repo from `~/.ssh` — and it is tracked on #1042.
 7. **No agent ever merges a PR to the default branch.** Open the PR and stop;
    the human reviews and merges. This is the rule for *every* agent —
    workers, reviewers and planners have no merge authority at all, anywhere,
@@ -160,11 +209,55 @@ compiles.
   and `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was` go red
   alone, on a round where nothing else moved. Procedure and re-bless log:
   `src-tauri/tests/fixtures/pre222/README.md` (#867, #868, #874).
+- **A source-scanning guard must not decide from a binding's *name*** — a rename
+  steps over it, so it enforces nothing. Decide on name-independent axes and
+  default-deny: the receiver (anything building a path off a declared root is
+  denied unless it is on an allow-list carrying a reason per entry) plus a shape
+  that cannot compile any other way (`.join(x.as_str())`); a name heuristic is a
+  labelled supplement at best, and the residual blind spot is stated where the
+  scan is implemented. Precedents: `tests/groupid.rs`, `tests/perf_dispatch.rs`,
+  `test/perfpolicy.test.ts`. Signature: the guard's own doc quotes the line it
+  was written for, and that line still passes (#922).
 - `src-tauri/src/orchestration/mod.rs` is tens of thousands of lines — grep for
   the function/struct, don't read it top to bottom.
 - Comments in this codebase explain *why* (design constraints, Windows quirks,
   issue numbers) — keep that density and style.
 - Write tests that test intent, not implementation echoes.
+- **A coverage claim is a claim.** When a PR body or comment says a test or mechanism
+  polices a property, run the one mutation that removes it and watch WHICH tests
+  redden — a match is evidence, a mismatch is a correction; disclose it (#664, #673,
+  #682). A red evidences only the assertion it REACHED and MOVED: a panic before it,
+  a split test's already-green half, or a companion that also passed broken prove
+  nothing — split the test, or say which half moved (#710, #712, #727). A mutation a
+  *reviewer* names is still unrun; run it before quoting it into the body, which
+  becomes the squash message (#868).
+- **A test's specimen must stay a member of the class it witnesses.** When a directive
+  moves a real specimen out of that class (a declared value converging with the
+  default, a file gaining its "absent" block, a concrete list going stale), relocate
+  the property onto a witness that still distinguishes — never relax the assertion to
+  fit today's specimen. If the converged case still deserves coverage, give it its own
+  strictly-weaker, explicitly-labelled assertion (#689). The same drift bites outside
+  tests: a hand-derived value a claim rests on (a line cite, a count) is valid only at
+  the commit it was derived on, and your own next commit invalidates it as silently as
+  a rebase. Cite a SYMBOL (#763); a position that must be recorded is swept in the
+  LAST commit touching its source (#752).
+- **A per-CLI identity string is read off the source, never branched on it.**
+  `source === "claude" ? "claude" : "copilot"` is right only while there are
+  exactly two CLIs; a third silently inherits the else-branch and the pane
+  name, badge or resume command asserts the wrong CLI. Gating *behavior* a CLI
+  genuinely has (`cli == "claude"` for hook settings) is fine — producing a
+  *name* that way is a defect. Adding a CLI means grepping `"claude" ?`,
+  `== "claude"`, `"claude" =>` (match-arm dispatch the first two patterns
+  miss) and the `!= "claude"` polarity across `src/` and `src-tauri/src/`,
+  and classifying every hit as behavior or mistype (#722, #841).
+- **A guard reads every one of its inputs by one rule.** Taking one signal from
+  "the options OR the existing state" and the next from the options alone is a
+  bypass exactly the width of that asymmetry; so is a check present at one call
+  site and absent from its sibling. Union every field on one side *inside* the
+  pure guard — never at the DOM call sites, which drift — and pin all four
+  crossings of {which side says X} × {which side says Y} plus the negative
+  control, so "refuse everything" cannot pass either. Worked example:
+  `sshOrchestrationRefusal` and `doc/design/ssh-panes.md` (#859, #906, #921).
 
 ## Refinements & scope increases from the user
 
@@ -189,6 +282,13 @@ narrow their ask back down to the original ticket on your own judgment.
   the branch — after cleaning the worktree, verify with
   `git ls-remote --heads origin <branch>` and `git push origin --delete
   <branch>` if it survived. Whoever performs the merge owns this step (#662).
+- **Git Bash mangles a `<ref>:<path>` argument when the path starts with a
+  dot.** `git rev-parse origin/main:.github/x` is rewritten to
+  `origin\main;.github\x` and errors, while `origin/main:src/x` works — so a
+  blob-by-blob sweep silently reports exactly the dot-directory files
+  (`.claude/`, `.github/`, `.loomux/`) as mismatched, and an error string
+  compared as a blob reads as a real difference. Prefix `MSYS_NO_PATHCONV=1`
+  on any `git`/`gh` invocation whose argument carries a ref-colon-path (#841).
 - GitHub issues are the work queue. Labels the orchestration workflow uses:
   `agent-managed` (an orchestrator owns it), `agent-ready` (groomed — go),
   `agent-investigation` (research only — post findings as an issue comment,
@@ -196,6 +296,11 @@ narrow their ask back down to the original ticket on your own judgment.
 - User-visible behavior changes must update the matching user-docs page under
   `docs/` (the README is a pitch, not a manual — only touch it when the pitch
   itself changes); substantial designs get a `doc/design/*.md` note.
+- **Every number in a PR body is measured at the base AND at the head** — never
+  derived by arithmetic, remembered, or carried from a mid-branch run. Counts,
+  deltas, diffstats and run ids all go stale on the next commit. Read both
+  totals out of the two runs' own logs, and check that the per-file deltas sum
+  to the total you are claiming (#859, #862, #889, #907, #914, #921).
 - **Correcting a false claim is a multi-surface edit.** A design rationale here
   lives on several permanent surfaces at once — the code comment, the
   `doc/design/*.md` note, the PR body (which becomes the squash message), and
@@ -203,7 +308,25 @@ narrow their ask back down to the original ticket on your own judgment.
   it) — so a claim deleted from one survives on the others. Verify the purge by
   grepping the *entity* the claim names, never the phrasing you rewrote.
   Signature: a re-review that clears a claim on two surfaces and finds it alive
-  on the third (#878).
+  on the third (#878). **Correct the twin, not just the named site**: one entity
+  grep clears the sites you thought of, while each line you rewrite still has a
+  paraphrase elsewhere (a comment and its design-note gloss), so grep each
+  corrected line's own distinctive noun (`by provenance`, `strictly narrower`)
+  across the tree in the same pass. Signature of the miss: the same finding
+  reopens a third round, on twins of lines an earlier round corrected (#922).
+  An earlier **commit subject** superseded later in the same PR is a surface
+  too — the squash aggregates it and it cannot be edited in place, so flag it
+  in the body for whoever squashes (#909).
+- **A doc naming a file or test that hasn't landed must say so in its tense
+  and name the slice** — `` `tests/perf_dispatch.rs` *will* enforce … (#743
+  S2/S3) `` — or the pointer waits for that slice. Present tense beside a
+  shipped guarantee in the same construction reads as shipped, and the reader
+  who acts on it gets silent green (#750).
+- **A claim about how markdown RENDERS is measured, never read off the
+  source.** Put the text through GitHub's own GFM endpoint before claiming a PR
+  body, issue comment or `docs/` page renders a certain way — `gh api -X POST
+  markdown -f mode=gfm -f text="$(cat file.md)"`. A blank line silently ends a
+  table, and the row you claimed becomes a paragraph of literal pipes (#926).
 - **Historical context lives in design notes, ADRs, and issue/PR history —
   never in user docs, this repo's own agent instruction files
   (`.github/agents/`, `.claude/skills/`, `.loomux/workflow.yml`), or this

@@ -446,6 +446,52 @@ loop (`t-1 → t-3 → t-2 → t-1`) — you'll see it in the board's toast, and
 is written. Deleting a task strips it from every remaining task's links in the
 same write, so a delete never leaves a dangling dependency behind.
 
+### Parent tasks and subtasks
+
+A task can sit *inside* another task — an Epic or Feature the orchestrator created to hang
+concrete slices under, following the same shape as Agile hierarchies (Epic → Feature → Story →
+Task). This is **containment**, and it's a different relationship from the **dependencies**
+above: a subtask's container says where it belongs on the board, a dependency says what must
+finish before it can start. A subtask of a container that's still `blocked` is not itself
+blocked by that — express ordering with a dependency, not by nesting.
+
+Each task can carry an advisory **kind** label — `epic`, `feature`, `story`, or `task` — set by
+the orchestrator to show the level a container sits at. It's a label only: nothing enforces that
+a `story` sits under a `feature` rather than straight under an `epic`, and a container is
+ordinary claimable work like any other task, not a special row.
+
+Two rules about nesting are backend behavior, live today regardless of which board UI you're
+running:
+
+- Deleting a container **promotes** its subtasks rather than deleting or orphaning them: they
+  move up to the nearest container still on the board (or to the top level, if the whole chain
+  above them was deleted in the same action). Nothing under a container you delete disappears
+  with it.
+- Nesting can run at most 4 levels deep; a write that would go deeper is refused with an error
+  explaining why, the same way an invalid dependency write is.
+
+Board controls for nesting (design shown here; the nesting UI (#1027) is currently in review, so
+treat the details below as what's coming rather than shipped — this caveat is owed to come out
+once #1027 merges):
+
+- A **⤵ nest** picker on a row lets you choose which other task it sits inside, or promote it
+  back to the top level.
+- Rows nest visually under their container, indented one step per level, with a **collapse
+  chevron** on any row that has subtasks — collapsing hides the whole subtree, not just its
+  direct children, so a grandchild is never left stranded above its own container.
+- A container shows a **done/total** chip counting its *direct* subtasks — the same count you'd
+  see if you asked the orchestrator for the board. A container whose entire subtree is done but
+  whose own status hasn't caught up gets a nudge badge — it's a prompt for you, never something
+  that flips the container's status on its own; only you or the orchestrator ever change a
+  task's status.
+- A subtask whose container was removed by hand-editing the board file, or that otherwise points
+  at nothing valid, renders at the top level with a broken-container marker rather than
+  vanishing — the nesting equivalent of the `⚠` missing-dependency chip above.
+
+Like dependencies, nesting is board metadata: it never affects whether a merge is allowed, and
+it doesn't change how `ready` is computed — a subtask of a blocked container can still be marked
+ready to start.
+
 ## Steering, attention, and audit
 
 These deserve their own detail — see:
@@ -1097,11 +1143,26 @@ restoring them).
 A workflow can declare a **process-pro** block — a worker that runs after a
 PR merges, reads that session's record cold, and opens a normal PR proposing
 a durable lesson (an entry in `.loomux/lessons.md`, a `.claude/skills/` entry,
-a `CLAUDE.md` rule). Like every other agent it proposes and stops: you review
-and merge, or you don't.
+a `CLAUDE.md` rule). Like every other agent it proposes and stops; it never
+merges anything, its own PR included.
 
-The thing worth knowing when one of those PRs lands in front of you is what
-it is allowed to claim. Anything the process-pro writes into those files is
+**Unlike every other agent's PR, though, this one does not come to you.** The
+learning loop is meant to be self-managed, so a process-pro PR is *orchestrator-
+owned*: the orchestrator reviews it and then merges or closes it itself, rather
+than parking it in your merge queue. That is deliberate — a loop whose whole
+output is "here is another PR for the human to read" costs you more attention
+than the lessons are worth, and stops running the week you get busy. The bar it
+merges on is the ordinary one, not a lower one: the group's review passed, CI
+green, findings settled. Only the *owner of the decision* changes.
+
+Two things that follow. Closing is a normal outcome — most sessions produce no
+durable lesson, and an orchestrator that merges every proposal is not filtering.
+And you are not out of the loop: each merge is audit-announced and recorded on
+its board task, so the lessons that landed while you were elsewhere are there to
+read back, and a lesson you disagree with is a curation PR away from being gone.
+
+The thing worth knowing when you *do* read one is what it is allowed to claim.
+Anything the process-pro writes into those files is
 inlined into every future session's context, so a wrong or trivial lesson is
 a cost you keep paying — which makes "was this actually a recurring problem,
 or did one agent have one bad afternoon?" the question the review turns on.
@@ -1112,8 +1173,10 @@ how many *other* sessions in the group hit the same wall, and which ones.
 So a proposal should read like *"three sessions hit this — `w-2`, `w-7`,
 `w-9`"*, and you can go look at those sessions. A proposal from a wall only
 one session ever hit is supposed to say so and argue why it will recur anyway
-(a documented rule somebody missed, say) — if it doesn't, that is your cue to
-push back rather than merge a lesson built on one bad afternoon.
+(a documented rule somebody missed, say) — if it doesn't, that is the cue to
+close it rather than merge a lesson built on one bad afternoon. The orchestrator
+is the one holding that cue on a normal run; it is also what you check for if
+you go back over what the loop merged.
 
 Two caveats the proposal should carry when they apply, because they change
 what the number is worth: a brand-new group has no earlier sessions to

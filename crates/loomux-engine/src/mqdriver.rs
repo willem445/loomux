@@ -36,7 +36,8 @@
 //! that ever builds a landing refspec; the [`BatchVerification`] adapter over
 //! `notify.rs`'s classification (§5); and namespace-exact cleanup (§10).
 //!
-//! Not here, and in `mqloop.rs` (D2) instead: §8's batch construction (the merge
+//! Not here, and in [`crate::mqloop`] (D2) instead: §8's
+//! batch construction (the merge
 //! commits onto the scratch), the draft PR and its body builder, the bounded
 //! observation loop (`checks_timeout_minutes`), §9's bisect and culprit
 //! attribution, §4's crash reconcile, and `merge_queue.json` persistence — plus,
@@ -56,10 +57,42 @@
 //!    create-only by *primitive*; the landing push is fast-forward by *verb*;
 //!    cleanup deletes only the exact ref this batch minted. No pattern, no
 //!    glob, no `--force`.
+//!
+//! # Why it is in this crate (#888 slice A3 batch 12a)
+//!
+//! Nothing here is desktop-specific: `std::process` plus [`crate::subproc`]'s
+//! bounded capture, and every outbound edge — [`crate::mergeq`],
+//! [`crate::notify`], [`crate::workflow`] — was already on this side. The queue
+//! runs on the same single `gh` poll loop a headless daemon would run, so the
+//! driver belongs with the core it drives rather than with the window.
+//!
+//! **Three items are `pub(crate)`, and that is the whole of their reach**:
+//! `as_args`, `landable` and `declares_ci_green`. They were `pub(super)`
+//! in `src-tauri/src/orchestration/mqdriver.rs` — visible within
+//! `orchestration` — and batch 12a had to widen them to `pub` for exactly one
+//! reason: their only caller, `mqloop`, was still on the other side of the
+//! crate boundary, and no visibility narrower than `pub` crosses one. Batch 12b
+//! moved `mqloop` here, so that reason expired and the keyword went back down.
+//! `pub(crate)` is the faithful translation of the old `pub(super)`, not a new
+//! narrowing invented for this batch: the scope that used to be "the
+//! `orchestration` module" is now "this crate".
+//!
+//! It is also load-bearing, which is why it was worth reverting rather than
+//! leaving as harmless surplus. `landable` is **half** of the constraint-7
+//! refusal — the refspec-shape predicate — and [`validate_target`] is the whole
+//! of it, ordering the unverifiable / default-branch / target / assertion
+//! refusals so an unreadable answer can never *fail to match* the default and
+//! read as safe. While the item was `pub`, "reach the half instead" was
+//! reachable from anywhere in `src-tauri` (which depends on this crate directly
+//! and already spells `loomux_engine::…` in `gh.rs` and `obs.rs`), and no
+//! re-export shape could have prevented it — batch 12a's header said so
+//! explicitly and could do nothing about it. Now the compiler prevents it. If
+//! you are writing a new branch-name guard: [`validate_target`], and from
+//! inside this crate you have no other option.
 
-use super::mergeq::{new_batch_id, scratch_branch, GateRecheck, GateSpec, PrObservation};
-use super::notify::{self, PollResult};
-use super::workflow::{body_digest, BlockId, ReviewVerdict};
+use crate::mergeq::{new_batch_id, scratch_branch, GateRecheck, GateSpec, PrObservation};
+use crate::notify::{self, PollResult};
+use crate::workflow::{body_digest, BlockId, ReviewVerdict};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -170,7 +203,7 @@ impl ProcessRunner {
         // of it (null stdin, both pipes drained concurrently, the kill's own
         // bounded reap, the abandoned-reader ceiling) exists because of a
         // specific way an unbounded wait bites, and a copy would drift.
-        match super::capture_raw_with_timeout(cmd, MQ_CMD_TIMEOUT) {
+        match crate::subproc::capture_raw_with_timeout(cmd, MQ_CMD_TIMEOUT) {
             Ok((status, stdout, stderr)) => Ok(CmdOut {
                 code: status.code(),
                 stdout,
@@ -231,7 +264,7 @@ impl MqRunner for ProcessRunner {
 // ── the live lookups (§7) ───────────────────────────────────────────────────
 
 /// The argv for the repo default-branch lookup — **the shim's own lookup**
-/// (`mod.rs:759`), in Rust.
+/// (`orchestration/mod.rs:759`), in Rust.
 ///
 /// Note #294 by construction: the shim passes the repo **positionally** to
 /// `gh repo view` (`-R` is not a flag it accepts), and this call passes no repo
@@ -295,7 +328,7 @@ struct RawPrFacts {
     body: String,
 }
 
-pub(super) fn as_args(v: &[String]) -> Vec<&str> {
+pub(crate) fn as_args(v: &[String]) -> Vec<&str> {
     v.iter().map(|s| s.as_str()).collect()
 }
 
@@ -304,7 +337,7 @@ pub(super) fn as_args(v: &[String]) -> Vec<&str> {
 /// Any failure — `gh` missing, a non-zero exit, an empty answer — is
 /// [`TargetRefusal::BaseUnverifiable`], never a default and never an empty
 /// string that flows onward. This mirrors the shim's `unverifiable-base` posture
-/// at `mod.rs:761-763`: **unknown is never treated as safe.**
+/// at `orchestration/mod.rs:761-763`: **unknown is never treated as safe.**
 pub fn resolve_default_branch(r: &dyn MqRunner) -> Result<String, TargetRefusal> {
     resolve_default_branch_detailed(r).map_err(ResolveFailure::into_refusal)
 }
@@ -447,7 +480,7 @@ impl TargetRefusal {
 ///   `git::default_base_ref` falls through to when it cannot resolve anything,
 ///   and it is exactly the kind of plausible-looking string a security refusal
 ///   must not accept — see [`validate_target`].
-pub(super) fn landable(name: &str) -> bool {
+pub(crate) fn landable(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 200
         && name.is_ascii()
@@ -467,7 +500,7 @@ pub(super) fn landable(name: &str) -> bool {
 /// Whether a name is usable as the **right-hand side of a comparison** — the
 /// default branch, the recorded target, a caller's assertion.
 ///
-/// Deliberately looser than [`landable`] in exactly one way: it accepts a
+/// Deliberately looser than `landable` in exactly one way: it accepts a
 /// `refs/heads/`-qualified spelling, which [`same_branch`] then normalizes.
 /// **The asymmetry is the point, and it is a security property, not a
 /// convenience.** `base` becomes a refspec component, so it must be a plain
@@ -478,12 +511,12 @@ pub(super) fn landable(name: &str) -> bool {
 /// instead. Fail-closed either way, but the first is a refusal that says the
 /// wrong thing, and #581's whole §7 rests on this comparison landing.
 ///
-/// Defined as [`landable`] applied after an optional `refs/heads/` is stripped,
+/// Defined as `landable` applied after an optional `refs/heads/` is stripped,
 /// rather than as its own looser list — so the `refs/heads/` allowance is the
 /// *only* difference between the two, provably, instead of being the difference
 /// a reader has to diff two predicates to find.
 ///
-/// Everything else [`landable`] refuses is still refused here, and that
+/// Everything else `landable` refuses is still refused here, and that
 /// direction matters: a `default` carrying a `:` or a `*` is not a branch git
 /// would let exist, so it is a **corrupt answer**, and a corrupt answer must
 /// refuse rather than merely fail to match the base — failing to match is
@@ -504,7 +537,7 @@ fn usable_for_comparison(name: &str) -> bool {
 ///
 /// Nothing is *rewritten* here; this only decides whether two strings name the
 /// same branch. Note where the normalization can actually bite: `base` has
-/// already been through [`landable`], which rejects a `refs/`-qualified name
+/// already been through `landable`, which rejects a `refs/`-qualified name
 /// outright, so the live-vs-live half is normalized on the **default's** side —
 /// see [`usable_for_comparison`] for why that side is deliberately looser.
 ///
@@ -553,7 +586,7 @@ fn same_branch(a: &str, b: &str) -> bool {
 /// # Which lookup is authoritative
 ///
 /// `base` and `default` must be **live** answers from the real `gh` — the same
-/// two lookups the shim makes at `mod.rs:750` and `mod.rs:759`. They are
+/// two lookups the shim makes at `orchestration/mod.rs:750` and `:759`. They are
 /// deliberately **not** `git::default_base_ref:631`, despite that being the
 /// obvious reuse: that helper answers "what does local git think the default
 /// base is", derived from local refs after a best-effort fetch, and it falls
@@ -569,7 +602,7 @@ fn same_branch(a: &str, b: &str) -> bool {
 /// # Order of refusals, and why it is this order
 ///
 /// 1. **Unverifiable first.** If either name is missing, or is a string the
-///    queue will not build a refspec from ([`landable`]), nothing downstream can
+///    queue will not build a refspec from (`landable`), nothing downstream can
 ///    be decided — including whether it is the default branch. Refusing here
 ///    means an unreadable answer can never *fail to match* the default and thus
 ///    read as safe.
@@ -980,7 +1013,7 @@ fn land_refspec(scratch_sha: &str, target: &str) -> String {
 /// lease. A target that moved under the batch therefore makes the push **fail**
 /// rather than overwrite (§10), and the queue never calls `gh pr merge` at all,
 /// so it cannot reach the shim's default-branch arms and the per-PR human grant
-/// path (`mod.rs:943-960`) is untouched.
+/// path (`orchestration/mod.rs:943-960`) is untouched.
 pub fn land_push_argv(scratch_sha: &str, target: &str) -> Vec<String> {
     vec!["push".into(), REMOTE.into(), land_refspec(scratch_sha, target)]
 }
@@ -993,7 +1026,7 @@ pub fn land_push_argv(scratch_sha: &str, target: &str) -> Vec<String> {
 /// couples "did we look at CI" to "could we read the gate file", and a future
 /// edit that made an unreadable gate reachable would silently also have made it
 /// unobserved. The cheap direction is the safe one.
-pub(super) fn declares_ci_green(spec: &GateSpec) -> bool {
+pub(crate) fn declares_ci_green(spec: &GateSpec) -> bool {
     match spec {
         GateSpec::Declared(g) => g.also.iter().any(|c| c == "ci-green"),
         GateSpec::Absent | GateSpec::Malformed => true,
@@ -1050,7 +1083,8 @@ pub struct Landed {
 ///
 /// `verdicts` is supplied by the caller rather than read here because the
 /// verdict files live in the group dir, which is the registry's business and not
-/// this module's — the same separation that keeps `mod.rs` wiring-only.
+/// this module's — the same separation that keeps `orchestration/mod.rs`
+/// wiring-only.
 pub fn land_batch(
     r: &dyn MqRunner,
     scratch_sha: &str,
@@ -1111,7 +1145,7 @@ pub fn land_batch(
             body_digest: Some(body_digest(&facts.body)),
             ci_green: if declares_ci_green(gate) { pr_ci_green(r, pr) } else { None },
         };
-        let recheck = super::mergeq::recheck_gate(
+        let recheck = crate::mergeq::recheck_gate(
             gate,
             &verdicts(pr),
             Some(facts.head.as_str()),

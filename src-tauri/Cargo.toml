@@ -204,9 +204,15 @@ rusqlite = { version = "0.40", default-features = false, features = ["bundled"] 
 # per-engine utilization + dedicated VRAM usage for any WDDM adapter (AMD,
 # Intel, NVIDIA); DXGI reports total VRAM and the adapter name.
 [target.'cfg(windows)'.dependencies]
-# Fresh PATH resolution from the registry, so CLIs installed while loomux
-# (or its parent terminal) is already running are still found by new panes
-# and probes. Pure windows-sys underneath — no getrandom (see note above).
+# The caller that needed this (fresh PATH resolution from the registry,
+# so CLIs installed while loomux is already running are still found by new
+# panes and probes) moved whole into crates/loomux-engine (#888 slice A4
+# batch 13, which declares the same version there). `grep -rn winreg
+# src-tauri/src/` finds nothing but that fact — no code here calls it.
+# Retained rather than removed: dropping it is a separate cleanup this batch
+# didn't take, not a claim that something here still needs it. Pure
+# windows-sys underneath — no getrandom (see note above) — so it is harmless
+# either way.
 winreg = "0.55"
 windows = { version = "0.57", features = [
     "Win32_Foundation",

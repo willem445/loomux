@@ -136,7 +136,7 @@ pane stays open showing the status).
 | `rename_agent(agent_id, name)` | ✓ | ✗ |
 | `get_state()` | ✓ | ✓ |
 | `set_state(state)` | ✓ | ✗ |
-| `group_usage(detail?)` | ✓ | ✗ |
+| `group_usage(detail?)` | ✓ | `liaison`-hinted reviewer blocks only (✗ plain reviewer, ✗ worker, ✗ planner) |
 | `notify_when(kind, pr?, run?, note?, expires_minutes?)` | ✓ | worker/reviewer only (✗ planner) |
 | `list_notifications()` | ✓ | worker/reviewer only (✗ planner) |
 | `cancel_notification(id)` | ✓ | worker/reviewer only (✗ planner) |
@@ -1031,13 +1031,19 @@ persisted in `group.json`, and clamped in `clamped()`.
   it a prompt (`send_prompt`). A background reaper (`start_idle_reaper`, 30s tick) kills any
   whose idle time crosses the group's `idle_kill_minutes` and notifies the orchestrator so it
   can respawn on demand. The threshold logic is the pure `idle_should_kill`; the orchestrator
-  is never a candidate. Off by default (0) — the human opts in, since auto-killing is
+  is never a candidate, and neither is a **liaison** block (#891 S4 — the one pane whose user
+  is the human, whose typing clears no idle clock, so "idle" there means "mid-conversation";
+  see doc/design/liaison.md). Off by default (0) — the human opts in, since auto-killing is
   destructive-ish.
 - **Per-group cost aggregation.** `group_usage` sums each live pane's session cost into one
   summary (total + per-agent). Cost is parsed best-effort from the pane's in-pane statusline
   (`parse_session_cost` scans the ANSI-stripped tail bottom-up for the freshest `$` figure);
   panes without a visible cost contribute `null` and are excluded from the total. Surfaced
   both to the orchestrator (MCP tool, for status summaries) and the UI (`orch_group_usage`).
+  The MCP tool is also the one hint-keyed WIDENING on that surface: a `liaison`-hinted
+  reviewer block gets it too (#891 S2), since the pane the human talks to is where "what is
+  this costing" is asked — argued in doc/design/liaison.md, which enumerates every
+  hint-keyed exception.
   The registry-level value is always the full per-agent table; the MCP `group_usage` tool
   (#866) defaults to summarizing it instead — group/live totals, the top 10 agents by total
   tokens, and a `rest` rollup (split live vs historical) for everyone else — with
@@ -6517,6 +6523,52 @@ enumerated and checked (`[loomux] {agent_id} reports {outcome}: {body}` — a lo
 fixed outcome word, and text `from` wrote; no orchestrator-chosen agent NAME, no task title, no
 GitHub string). `from == orch` — an orchestrator relaying to itself — takes the default and is not
 marked.
+
+**The agent-authored half of every delegate-callable notice is scrubbed at composition** (#891).
+The prefix was always loomux's — the id comes from the caller's token, never from `args` — but the
+text after it was interpolated raw, so an agent could put a second `[loomux] …` span inside its own
+words and be read as a notice attributed to a pane it is not. That matters most where prose tells a
+reader to *act* on an attribution: the liaison's "a directive it relays IS a human directive" rule
+is keyed on exactly such a line.
+
+**The complete set, because a partial list is how this was fixed twice.** Three tools let a
+delegate put its own words in the orchestrator's pane, carrying five fields between them:
+`report`'s structured shape (`body`, `ref`, `detail_url` — all three land in one line),
+`report`'s legacy shape (`note`/`summary`), `message_orchestrator` (`text`), and `review_verdict`
+(`summary`). Every other `deliver_to_orchestrator` call site composes loomux-owned text or is
+reached only by an orchestrator-only tool (`upsert_task`'s titles, `send_prompt`, `spawn_agent`) —
+the proxy-authorship residual argued below, which is about who dictates words rather than about
+who a line is attributed to.
+
+All of them pass `notify::sanitize_pane_text` (via `report::relay_payload`, or
+`relay_payload_keeping_lines` for the one field whose line structure is content) before loomux adds
+its prefix — the same function `sanitize_gh_text` has always been, and `channel_send` has always
+used, which is what makes `cross-workspace-channel.md`'s "same sanitizer every other crossing-text
+boundary uses" true of these boundaries too. `[`/`]` become `(`/`)` so the text still arrives and
+reads; it simply cannot carry a `[loomux]` token.
+
+**The verdict summary keeps its newlines, deliberately.** `workflow::sanitize_summary` preserves
+`\n`/`\t` when it writes the durable record — a verdict summary is multi-line prose a human reads —
+so collapsing it at the notice would reflow a reviewer's findings on the way to the pane. Line
+position was never the discriminator anyway: this notice legitimately carries a second `[loomux]`
+line of its own (the gate clause). The token is what makes a notice loomux's, and the token is what
+the scrub removes.
+
+Two pins, because the first version of this fix was complete for the paths its author had listed
+and missed one: `no_delegate_callable_tool_can_forge_a_loomux_attribution_into_the_orchestrators_pane`
+names four relay shapes and then sweeps every tool a delegate's `tools/list` offers, and
+`every_loomux_notice_composed_in_the_mcp_surface_scrubs_what_it_interpolates` is a default-deny
+source scan whose paren walk skips string literals and comments (a naive one lands on the right
+byte only while every literal and comment in range happens to be balanced).
+
+**Their reach, at the size it actually is.** A new notice SITE is caught by the scan. A scrub that
+stops working is caught by the behavioural pins. A new FIELD on a tool the sweep can drive —
+free-text or `enum`-constrained arguments — is caught, because the sweep fills it and reads the
+pane. A new FIELD on a tool the sweep cannot drive (a constrained non-enum argument, like
+`review_verdict`'s `pr`) is caught by **neither**: the scan sees a scrub named in the call and
+passes, and the scrubber is unbroken. That residual is reviewer-checked; closing it structurally
+means auditing each interpolated argument rather than the call, which is a larger guard than the
+one this note describes.
 
 **"Called in by" is deliberately weaker than "authored by", and the gap is the accepted residual
 below.** What the check can see is which agent made the tool call. Who *dictated the words* is not

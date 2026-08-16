@@ -109,6 +109,20 @@ sha2 = "0.10"
 # also declares it, per batch 3's rule.
 dirs = "6"
 
+# `winpath::fresh_path` (slice A4 batch 13) reads the machine + user PATH
+# registry values so a CLI installed while loomux is already running is still
+# found by new panes and probes. Target-gated to mirror `src-tauri/Cargo.toml`'s
+# identical `[target.'cfg(windows)'.dependencies]` section — same version,
+# same reasoning, restated here because a manifest states what the crate that
+# now calls it needs, not what a sibling happens to declare (batch 3's rule).
+#
+# Clear under both bans in the header above: already a direct src-tauri
+# dependency and already in `Cargo.lock`, so this adds no NEW package to the
+# graph the getrandom audit reasons about, and `winreg` 0.55's own dependency
+# chain is `cfg-if` + `windows-sys` — no getrandom by any path.
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"
+
 # The crate's first dev-dependency, and the boundary it sits on is worth stating
 # once: dev-dependencies are never built for a downstream crate, so nothing here
 # can reach the shipped binary — the ban above is about load-time imports of

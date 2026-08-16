@@ -472,6 +472,21 @@ test("a role_hint block gets an ADVISOR/PROCESS chip (#250/#324)", () => {
   assert.equal(describeBlock(block({ id: "w", kind: "worker" })), "worker · claude · sonnet");
 });
 
+test("a liaison block is badged LIAISON, and stays a reviewer first (#891)", () => {
+  // The chip is the one glance that tells a human which reviewer-class pane is
+  // the one THEY will be talking to — at the moment they consent to it existing.
+  assert.equal(
+    describeBlock(block({ id: "human", kind: "reviewer", role_hint: "liaison" })),
+    "reviewer · claude · sonnet · LIAISON"
+  );
+  // A value the backend would never resolve renders NO chip, rather than a
+  // guessed label — the hint is not free text the roster will echo back.
+  assert.equal(
+    describeBlock(block({ id: "x", kind: "reviewer", role_hint: "liason" })),
+    "reviewer · claude · sonnet"
+  );
+});
+
 test("the roster description counts delegates, not the orchestrator", () => {
   // Every group has exactly one orchestrator and it is not a choice the roster
   // makes, so counting it would just pad every line with the same "1 orchestrator".

@@ -111,8 +111,24 @@ free-by-assumption — so both are **v1 requirements**, not recommendations:
    (§4.1) for the future browser client; it costs nothing and it is the one
    control that must **not** defer with the rest of the auth work.
 
-Both are cheap, both belong to C2 (the listener slice), and together they are
-what makes "SSH to a workstation" a boundary rather than a hope.
+Both are cheap, and together they are what makes "SSH to a workstation" a
+boundary rather than a hope. They land in **different slices**, which this note
+originally assigned both to C2 and now records otherwise:
+
+- **Control 1 landed in C1a**, the daemon skeleton, as **config-layer
+  validation**: a config naming a routable address without
+  `allow_routable_bind: true` does not load at all, and `ServerConfig` holds an
+  already-classified `ListenTarget` so an unchecked one is unrepresentable —
+  the `GroupId` shape (#904) applied to a bind address. It belongs there
+  because the config schema names the address anyway, and a field whose unsafe
+  value is spellable with the refusal deferred is a half contract; deciding it
+  at parse time also needs no socket, which is what makes it C1a's to test.
+  **C2 must not re-implement it**: it receives a checked value and binds it,
+  and it must not re-derive the address from the config text.
+- **Control 2 remains C2's** — there is no upgrade to check until a listener
+  exists.
+
+See `doc/design/remote-engine-daemon.md` §3 for the full argument.
 
 ### 1.3 The accepted risk, stated plainly
 
@@ -146,8 +162,9 @@ becomes an unexamined one:
   §7.0 is the checklist.
 
 Two things stay in v1 despite the deferral, because they are cheap now and
-expensive to retrofit: **path-root validation** (#904, #925 — a connected client
-must not escape the server-declared roots even when it is trusted to connect) and
+expensive to retrofit: **path-root validation** (#904 and #925 for the
+identifiers, #1042 for the roots — a connected client must not escape the
+server-declared roots even when it is trusted to connect) and
 **command-roster classification** (§5 — default-deny). Neither depends on knowing
 *who* is calling, which is precisely why neither needs to wait for auth. They are
 also the two that would be most tempting to skip "until auth lands", and the two
@@ -194,8 +211,9 @@ port is never naive.
 2. **Validate every caller-supplied identifier server-side**, independent of any
    client trust (§7 T2). #904 did this for `group_id` — one validating
    constructor, deserialization through the same gate, one path-assembly point.
-   #925 is the same treatment for what remains, and this note upgrades it from
-   cleanup to a **merge blocker for any listener slice**.
+   #925 is the same treatment for the remaining *identifiers* (landed:
+   `pathseg::PathSegment`), and #1042 is the root half — this note upgrades that
+   remainder from cleanup to a **merge blocker for any listener slice**.
 3. **Keep caller classes structurally separate** (§6.3, §7 T3). Humans and agents
    are distinguished today by *transport* — trusted IPC versus MCP tokens. That
    separation must survive as two listeners with two credential namespaces, or
@@ -503,11 +521,11 @@ are where the 64-vs-66 drift above lives).
 |---|---|---|---|---|
 | **pty** (9) | | | | |
 | `spawn_pty`, `kill_pty`, `write_pty`, `resize_pty` | 4 | wire | operator | `spawn_pty` executes by design — the single most dangerous name on the wire. `write_pty`'s `human` flag is **derived from the connection session's caller class**, never read from the frame (§6.3) |
-| `dir_info`, `change_dir` | 2 | wire | viewer / operator | path arguments root-scoped (#925) |
+| `dir_info`, `change_dir` | 2 | wire | viewer / operator | path arguments root-scoped (#1042) |
 | `pty_backend_info`, `discover_git_bash`, `discover_ssh` | 3 | wire | viewer | answered with **server** facts; the client must not report its own shell discovery for a server pane |
 | **sessions** (3) | 3 | wire | viewer / operator | agent-CLI store scans are server-side; `record_*_launch_posture` is operator |
 | **git** (22) | 6 | wire | viewer | the reads: `git_repo_root`, `git_log`, `git_status`, `git_diff`, `git_branches`, `git_worktree_list` |
-| | 16 | wire | operator | every write: stage/unstage/commit/commit_files/checkout/discard/worktree_add/fetch/push/pull/tag/branch_create/cherry_pick/revert/merge/rebase. `repo` is root-scoped (#925). Note H9: these push as whoever the daemon is |
+| | 16 | wire | operator | every write: stage/unstage/commit/commit_files/checkout/discard/worktree_add/fetch/push/pull/tag/branch_create/cherry_pick/revert/merge/rebase. `repo` is root-scoped (#1042). #925 routed exactly two arms through `safe_resolve` — `git_discard(untracked)` and `git_diff(untracked)`; `git_stage`/`git_unstage` `paths` still reach the git CLI directly and are contained by git own outside-repository refusal, not by #925. Note H9: these push as whoever the daemon is |
 | **gh** (11) | 7 | wire | viewer | `gh_auth_status`, `gh_label_vocabulary`, `gh_issue_list`, `gh_issue_view`, `gh_pr_list`, `gh_pr_view`, `gh_activity`. `gh_label_vocabulary` reads the repo's label set (it is what stops the issues view hardcoding a vocabulary), so it is a read of the **server's** repo like the rest of this row |
 | | 4 | wire | operator | `gh_issue_create`, `gh_issue_set_labels`, `gh_issue_comment`, `gh_pr_comment` — these write to GitHub as the daemon's credential (H9) |
 | **gitwatch** (2) | 2 | wire | viewer | |
@@ -570,7 +588,7 @@ Two families deserve a sentence they do not get from the table:
 
 **`ft_*`/`fm_*` are a server-filesystem browser** the moment they cross the wire.
 That is fine and intended — it is how a human edits a server file — but it means
-H3's answer is load-bearing, and #925 is what makes the answer enforceable
+H3's answer is load-bearing, and #1042 is what makes the answer enforceable
 rather than aspirational.
 
 **The dialog plugin never crosses.** A folder picker picks *client* folders,
@@ -833,7 +851,7 @@ held to.
 | id | v1 status | why |
 |---|---|---|
 | **T1** RCE via unauthenticated peer | **OPEN — accepted** | §1.3. Mitigated only by reachability (§1.2: loopback bind + `Origin` refusal), never by identity. This is *the* accepted risk |
-| **T2** path & identifier injection | **CLOSED in v1** | #904 landed; #925 completes it. Cheap, independent of identity, and expensive to retrofit — so it stays in (§1.3) |
+| **T2** path & identifier injection | **HALF-CLOSED in v1** | #904 landed; #925 closed the identifier half; #1042 owes the root half. Cheap, independent of identity, and expensive to retrofit — so it stays in (§1.3) |
 | **T3** authority laundering (agent ⇒ human) | **structurally held** | Not by role tiers, which do not exist yet, but by the listeners staying separate (§6.3): MCP keeps its own token namespace, and the display socket adds no grant-writing path that the MCP roster lacks. The *tiering* half is deferred |
 | **T4** cross-user exposure | **N/A in v1** | One user, one account (H9). Nothing to expose across. Becomes live the moment a second person connects — which is the trigger for the hardening track, not a later nice-to-have |
 | **T5** transport attacks | **partially closed** | `Origin` refusal is **in v1** and non-negotiable (§1.2 — SSH does not close it). TLS defers to the reverse proxy; credentials-in-URLs and revocation are moot with no credentials |
@@ -850,7 +868,7 @@ client**. Each of those individually invalidates §1.3's basis.
 | id | threat | primary answer | lands in | test |
 |---|---|---|---|---|
 | **T1** | unauthenticated peer ⇒ remote code execution | authn before dispatch; default-deny roster; role tiers | C1, C2 | missing / invalid / expired / revoked credential each rejected **before registry state is touched** |
-| **T2** | path & identifier injection | validated newtypes + server-declared roots | #904 (done), **#925 (blocker)** | traversal / separator / absolute / empty cases per identifier family |
+| **T2** | path & identifier injection | validated newtypes + server-declared roots | #904 (done), #925 (identifiers, done), **#1042 (roots, blocker)** | traversal / separator / absolute / empty cases per identifier family |
 | **T3** | authority laundering (agent ⇒ human) | two listeners, two namespaces; grant writes owner-human only; `human` derived | C1, C2 | an agent-namespace credential is rejected on the display listener; no grant-writing tool exists in the MCP roster |
 | **T4** | cross-user exposure (team vs private) | server-side visibility filtering; `not_found`, never `unauthorized` | C1 | a non-member's enumeration omits the private workspace session; a direct fetch returns `not_found` |
 | **T5** | transport attacks | TLS; `Origin` check on upgrade; credentials never in URLs; revocation | C1, C2 | cross-origin upgrade refused; a revoked connection session dies mid-connection |
@@ -885,6 +903,21 @@ pattern applied to what #904 deliberately left: the `ft_*`/`fm_*` roots, the git
 Copilot digest arm. **No listener slice merges while any caller-supplied
 identifier still reaches a path join unvalidated** — this note is the citation a
 reviewer uses to make that a blocking finding.
+
+**T2 has since split in two, and only one half is closed.** Working #925
+established that those three are not one problem. The **identifier** half —
+`session_id`, the agent id, and the `rel` arguments of `git_diff`/`git_discard`
+— is segment validation, and it landed as `pathseg::PathSegment`, the one
+validating constructor `GroupId` and every other path-component family now share
+(`groupid-and-path-roots.md`). The **root** half is not a segment problem at all:
+`ft_*`/`fm_*`/git take `(root, rel)`, the `rel` side was already contained by
+`fileedit::safe_resolve`, and what is unguarded is the caller-supplied absolute
+`root` itself. No string predicate can close that — for a root, absolute is
+*required* — so it needs H3's registry, and it is tracked on **#1042**.
+
+For a reviewer, the operative sentence is therefore: **#1042, not #925, is the
+listener's remaining T2 blocker.** A green #925 segment slice does not lift the
+gate, and must not be cited as though it had.
 
 **T3 — authority laundering.** Covered in §6.3. The one-line version: the day
 there is one API for humans and agents, the merge gate is decorative.
@@ -1161,14 +1194,17 @@ queued behind it. The prototype path is now:
 
 ```
   #904  GroupId + one path-assembly point         ── landed
-  #925  remaining identifier families             ── still a merge blocker for listener code
+  #925  remaining identifier families             ── identifier half landed
+  #1042 server-declared root registry             ── still a merge blocker for listener code
   B1    this note                                 ── RESOLVED; gate lifted
   A1    engine workspace scaffold                 ── start now, the serial chain's head
   A2 ► A3 ► A4  engine extraction (#847 Ph. 0-2 +)── the crate boundary the daemon consumes
 
-  C1'   server skeleton, NO auth                  ── config + wiring only; loopback bind
-                                                     + Origin refusal (§1.2) are C2's
-  C2 ► C4 ► C5   listener, streams, replay
+  C1a   server skeleton, NO auth                  ── crate + config; CARRIES §1.2's bind
+                                                     refusal as config validation
+  C1b   engine hosting (waits A4)                 ── the daemon owns a registry
+  C2 ► C4 ► C5   listener, streams, replay        ── Origin refusal (§1.2) is C2's; the
+                                                     bind refusal is NOT C2's to repeat
   C3    headless PaneHost (parallel, waits A4)
   D1 ► D2        remote client (D1 waits B1 fixtures — available now)
   E1 ► E2        docker-ready, then containers (fast-follow, H5)
@@ -1182,16 +1218,24 @@ owns a registry and serves nothing yet — days, not weeks.
 
 **What did not shrink, and must not be quietly dropped along with auth:**
 
-- **#925 remains a merge blocker for listener code.** This is the one to guard
+- **#1042 remains a merge blocker for listener code.** This is the one to guard
   hardest, because the temptation now is to read "no auth in v1" as "security
-  work defers". It does not: #925 is *path* validation, it does not depend on
+  work defers". It does not: this is *path* validation, it does not depend on
   knowing who is calling, and §1.3 keeps it explicitly in v1. A listener PR that
   merges ahead of it is a blocking finding (§7 T2).
+
+  The blocker moved from #925 to #1042 when the two halves separated, and the
+  distinction is the thing to hold onto: #925 closed the **identifier** half
+  (validated segments — session id, agent id, the `rel` arguments), which is
+  real work but is *not* what H3 asks for. H3 asks that an arbitrary
+  client-supplied absolute **root** be refused, and no segment validator can
+  express that. **A green #925 is not the gate lifting.**
 - **The two §1.2 controls are v1 requirements** — loopback-or-unix-socket bind
   with a routable interface refused by default, and `Origin` refusal on upgrade.
-  They belong to C2 and they are what the accepted risk in §1.3 is conditioned
-  on. A C2 that ships without them has not deferred security; it has removed the
-  boundary the deferral assumed.
+  They are what the accepted risk in §1.3 is conditioned on. A prototype that
+  ships without them has not deferred security; it has removed the boundary the
+  deferral assumed. **The first landed in C1a as config-layer validation and is
+  not C2's to repeat** (§1.2); the second is C2's, unchanged.
 - **Roster classification lands with the dispatcher** (§5.1), default-deny, with
   its test. Tiers defer (§5.3); classification does not.
 
@@ -1223,7 +1267,7 @@ cannot depend on a lib that links Tauri and wants webkit2gtk — not a security 
   prerequisites get filed once and referenced from both rather than duplicated.
 - **#857 (repo split / licensing)** stays HELD. Flagged in §1; no dependency
   taken in either direction.
-- **#925** as above.
+- **#1042** as above (#925 closed the identifier half; the root half is what blocks).
 
 ---
 
@@ -1248,15 +1292,15 @@ deployment documentation and §8.2's Pi topology — not to any prototype slice.
 Cleared to start:
 
 - **A1** — engine workspace scaffold, then the A2 → A3 → A4 extraction chain.
-- **C** — the daemon, without auth: skeleton, listener (carrying §1.2's two
-  controls and §5.1's roster), headless `PaneHost`, per-client streams,
-  replay-on-attach.
+- **C** — the daemon, without auth: skeleton (carrying §1.2's bind refusal as
+  config validation), listener (carrying §1.2's `Origin` refusal and §5.1's
+  roster), headless `PaneHost`, per-client streams, replay-on-attach.
 - **track-D slices D1 → D2** — the remote client; D1 can begin immediately
   against §4.6's contract fixtures, with no server in existence.
 - **E1** — docker-ready packaging, with **E2** containers as the fast-follow H5
   chose.
 
-Still blocking, and unchanged by any of the above: **#925** for listener code
+Still blocking, and unchanged by any of the above: **#1042** for listener code
 (§13). Still true, and the thing this note exists to keep true: the prototype is
 a prototype *because of where it runs*, not because the security model was
 skipped. §7.0 is the way out, and its four triggers are what say when the way out

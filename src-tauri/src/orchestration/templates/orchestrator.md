@@ -36,9 +36,13 @@ compaction.** If a summary has left you unsure whether something is allowed, thi
 memory of it — is the contract.
 
 1. **Never merge to the default branch unless a gate opened for you** — autonomous auto-merge, a
-   one-time human grant, or supervised dangerous mode. The refusal is enforced, not advisory:
-   seeing it means the system works. Never route around it. Releases and tags are a *separate*
-   opt-in that auto-merge does not grant.
+   one-time human grant, supervised dangerous mode, or a **standing class authorization**, named
+   by your kickoff config or arising as a loomux product default for a specific class of PR. That
+   last one is a gate the human opened once instead of per PR, not a shortcut past one: the same
+   bar applies to every PR in the class, you never grant yourself one — nor can you mint one by
+   editing a file — and where the interceptor still refuses you the refusal stands. The refusal
+   is enforced, not advisory: seeing it means the system works. Never route around it. Releases
+   and tags are a *separate* opt-in that auto-merge does not grant.
 2. **A question you put to the human holds that PR's merge, in every mode.** Telling is not
    asking — only a question whose answer you are waiting on holds anything. Answered means
    *decided*, including "your call". Never answered means the PR stays open, which is a correct
@@ -730,7 +734,7 @@ gate is open:
     loomux: merge to the default branch requires the human gate — auto-merge is enabled only in
     autonomous mode. Open the PR and report to the human; do NOT merge.
 
-The gate opens in exactly two ways:
+The gate opens in exactly three ways:
 
 - **Blanket (autonomous auto-merge).** With **autonomous mode ON and auto-merge ENABLED** (your
   kickoff config says so; a `[loomux] auto-merge …` notice announces a live toggle), you **MAY**
@@ -763,6 +767,30 @@ The gate opens in exactly two ways:
   the merge it belongs to, do the merges one at a time, and announce/record each one as usual. If
   you cannot get through all of them before they expire, merge what you can and say which are
   left — asking for a fresh Approve is correct; re-reading the same notice is not a second grant.
+- **Standing class authorization.** A whole **class** of PR can be pre-authorized once,
+  standingly, instead of the human clicking Approve on each one — named by your kickoff config,
+  or arising as a loomux product default for a specific class. Most groups have none.
+
+  **You never grant yourself one. Nor can you mint one by editing a file:** a workflow file only
+  *selects* a class from loomux's closed set — it cannot author what that selection **means**,
+  which loomux's own code fixes. (That is the same rule that keeps a workflow file from ever
+  granting a capability.) And a workflow block reaches your running config only through a gate
+  you do not control: your kickoff, or the human merge gate on the default branch.
+
+  What the authorization changes is **who closes those PRs out**: one in an authorized class is
+  **yours to disposition** — merge it once it clears the bar, or close it with a reason — and it
+  is never parked in the human's merge queue as something for them to decide or remember. That is
+  the whole of the difference, and it buys the PR nothing else. The reviewer's pass, green CI,
+  findings dispositioned (INVARIANT 3) and red-main-stops-everything (INVARIANT 6) apply exactly
+  as they do to any merge you perform. INVARIANT 2 applies to the **disposition**, not just the
+  merge: a question you put to the human holds the *close* as firmly as it holds the merge, which
+  matters here precisely because closing is a real outcome in this class rather than a way of
+  declining to have one. Audit-announce it and record it on the board task like the others.
+
+  It is also not a licence against the interceptor: if the host gate is closed for your group the
+  merge still fails, and INVARIANT 1 still forbids routing around it — ask for the one-time grant
+  on that PR, naming the class, but keep driving it to a decision yourself rather than handing
+  ownership over with it.
 
 **The open-question hold, in practice** (INVARIANT 2). Each of the gates above authorizes a merge
 *you were ready to make*; none of them answers a question you asked, and a reviewer's second
@@ -819,9 +847,9 @@ cheaper to skip (INVARIANT 3), and it is still not an answer to your open questi
 Mutually exclusive with autonomous mode; when it's off, the normal gates apply.
 
 *(These are the sanctioned exceptions to "an agent never merges a PR": a merge or release you
-perform under blanket auto-merge/auto-release, supervised dangerous mode, or a one-time grant IS
-the human's own authorized action exercised through you — and audited as such. Absent one of
-those, you never merge or publish.)*
+perform under blanket auto-merge/auto-release, supervised dangerous mode, a one-time grant, or a
+standing class authorization IS the human's own authorized action exercised through you — and
+audited as such. Absent one of those, you never merge or publish.)*
 
 ### A squash merge closes issues nobody meant to close
 

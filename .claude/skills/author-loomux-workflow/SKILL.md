@@ -57,7 +57,8 @@ Read the human's description and extract, explicitly, before writing YAML:
   `kind: planner` block with `role_hint: advisor` — read-only, spawned only
   when the orchestrator is stuck on a question), or a process/lessons role
   that runs after a merge (→ `kind: worker` with `role_hint: process`). Both
-  hints are optional and purely cosmetic — see Invariant 3.
+  hints are optional; neither is purely cosmetic — a hint can change which MCP
+  tools its block is offered, within the enumerated list. See Invariant 4.
 - **What stays default.** If the human didn't ask for something (a planner,
   a second worker tier, a merge gate at all), don't invent it. A workflow
   file that declares only what it's for is easier to read and easier for the
@@ -72,7 +73,7 @@ Read the human's description and extract, explicitly, before writing YAML:
 | "what kind of work can it do" | `kind` — one of exactly four: `orchestrator`, `worker`, `reviewer`, `planner`. This is the **only** thing that grants capability. See Invariant 1. |
 | "cheap" / "strong" / "which model" | `cli:` + `model:` on the block. Empty `cli:` inherits the group's default CLI; empty `model:` inherits the kind's default for the resolved CLI (`opus` for orchestrator/planner, `sonnet` for worker/reviewer on `claude`; always `auto` on `copilot`; always `pro` on `gemini`). |
 | "a domain expert, consulted on demand" | `kind: planner` + `role_hint: advisor` — read-only, spawned only when stuck on a specific question, exits the moment it reports. |
-| "someone who writes up lessons after a PR merges" | `kind: worker` + `role_hint: process` — opens a normal PR, never merges it, same human gate as any worker. |
+| "someone who writes up lessons after a PR merges" | `kind: worker` + `role_hint: process` — opens a normal PR and never merges it. Its PRs are a standing-authorized merge class the orchestrator dispositions itself rather than deferring to the human (#1021); the bar (review, green CI, findings settled) is unchanged. |
 | "must all pass" / "any 2 of these 3" | `gates.merge.require: all-pass` (the default) or `require: threshold` + `threshold: N` |
 | "also needs CI green" | `gates.merge.also: [ci-green]` — the only condition the shim can check today (see Step 5) |
 | "the happy path" / "who hands off to whom" | `edges:` — **advisory only**. The orchestrator's scheduling judgment is the feature; edges are context it's shown, never a graph it's forced to walk. |
@@ -95,16 +96,28 @@ soft warning:
    workflow's `gates.merge` is an *additional* necessary condition enforced
    by the `gh` PATH shim — it never substitutes for, weakens, or bypasses
    loomux's own default-branch human-approval gate. There is no field that
-   turns that off.
-3. **No agent ever merges a PR** — not a worker, not a `process`-hinted
-   worker, not a reviewer. Every block opens a PR and stops; a human merges.
-   This isn't configurable per block either.
-4. **`role_hint` is cosmetic, never structural.** `advisor`/`process` select
-   only a persona addendum, a template fragment, and a roster badge.
-   Capability comes from `kind` alone, always — `kind_from_str` and
-   `role_hint_requires` both *reject* unrecognized or mismatched values
-   rather than coercing them, so you cannot spell a fifth capability class
-   by combining hint + kind cleverly.
+   turns that off. A `role_hint` does not turn it off either: a hint only
+   *selects* from loomux's closed set, and loomux's own code fixes what the
+   selection means, so config can opt into a behaviour loomux defines but can
+   never author one.
+3. **No delegate block ever merges a PR** — not a worker, not a
+   `process`-hinted worker, not a reviewer. Every one of them opens a PR and
+   stops, and this isn't configurable per block. The orchestrator merges only
+   where a gate opened for it — autonomous auto-merge, a one-time human
+   grant, supervised dangerous mode, or a standing class authorization
+   (process-pro PRs are one, #1021). Absent a gate, a human merges.
+4. **You cannot author what a `role_hint` means.** It mostly selects a persona
+   addendum, a template fragment, and a roster badge. Capability comes from
+   `kind` — `kind_from_str` and `role_hint_requires` both *reject* unrecognized
+   or mismatched values rather than coercing them, so you cannot spell a fifth
+   capability class by combining hint + kind cleverly. A few MCP tools do read
+   the hint, and the rules do not all point the same way: two NARROW the class
+   the hint sits on (`session_digest` offered to `process`-hinted workers alone;
+   `review_verdict` withheld from a `liaison`-hinted reviewer) and one WIDENS it
+   (`group_usage`, otherwise orchestrator-only, offered to that same liaison).
+   Every exception is enumerated in `doc/design/liaison.md`. What you cannot do
+   from a workflow file is invent one: you pick from a closed set and loomux's
+   code decides the effect.
 5. **The orchestrator block is loomux-owned.** A workflow file may pin its
    `cli:`/`model:`/`effort:`/`context:` and nothing else — `prompt:`,
    `profile:`, and `allow:` on an `orchestrator`-kind block are a parse
@@ -149,7 +162,7 @@ One block (`RawBlock`, `deny_unknown_fields`):
 | `prompt` | string | no | inline persona text; mutually exclusive with `profile` |
 | `profile` | string | no | repo-relative path to a persona file; mutually exclusive with `prompt`; no `..`, no absolute path, no drive letter |
 | `allow` | list of string | no (default `[]`) | extra pre-approved tool patterns; **rejected outright** if the block's `kind` is read-only (`planner`) |
-| `role_hint` | string | no | `advisor` (requires `kind: planner`) or `process` (requires `kind: worker`); any other value, or a value paired with the wrong `kind`, is a parse error |
+| `role_hint` | string | no | `advisor` (requires `kind: planner`), `process` (requires `kind: worker`), or `liaison` (requires `kind: reviewer`); any other value, or a value paired with the wrong `kind`, is a parse error |
 | `effort` | string | no (default `""`) | thinking level; `""` = the CLI's own default. One of `low`, `medium`, `high`, `xhigh`, `max` — see the caps-gating rule below |
 | `context` | string | no (default `""`) | context-window variant; `""` = the model's own window. One of `1m` today — same caps-gating rule. Composed into the model alias at emit (`sonnet[1m]`), never written into `model:` itself |
 

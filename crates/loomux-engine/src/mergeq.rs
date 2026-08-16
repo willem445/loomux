@@ -547,9 +547,9 @@ pub fn scratch_branch(group: &str, batch_id: &str) -> Option<String> {
 /// locations. `scratch_branch` refused such a name and the cleanup path
 /// refused to guess at one, so the *ref* namespace was already closed; the
 /// other two interpolations were not, and this is the predicate that closes
-/// them (the guard at the top of `mqloop::drive`).
+/// them (the guard at the top of [`crate::mqloop::drive`]).
 ///
-/// Deliberately much stricter than `mqdriver::landable`, which governs a
+/// Deliberately much stricter than `crate::mqdriver::landable`, which governs a
 /// *branch* the queue lands on and therefore has to accept the shapes a real
 /// branch name takes (`feat/integration-batch-2`). An id is loomux's own
 /// generated or configured token, so it gets the narrower alphabet: a `/` that
@@ -558,12 +558,24 @@ pub fn scratch_branch(group: &str, batch_id: &str) -> Option<String> {
 ///
 /// Rejected, never rewritten — `false` means "do not build anything from this",
 /// not "here is a sanitized version".
+///
+/// # One checker, and the one behavior this consolidation changed (#925)
+///
+/// The rules are [`pathseg::check_segment`](crate::pathseg::check_segment)'s;
+/// this is the merge queue's *name* for them, not a fourth copy. The leading
+/// `trim()` is kept deliberately — it is this predicate's own pre-existing
+/// contract (a configured id with stray whitespace is accepted, then used
+/// trimmed), and changing it would be a behavior change wearing a refactor's
+/// clothes.
+///
+/// One rule genuinely arrives that was not here before: the shared checker
+/// refuses a **Windows reserved device name** (`CON`, `NUL`, `COM3`, …). That
+/// is a strengthening, not a regression, and it is the right way round — a
+/// batch id becomes a worktree directory and a `--body-file` path, and on
+/// Windows `NUL` names a device rather than a file. No id the queue mints
+/// (`mq-{hex}`) can collide with the list, so nothing real is refused.
 pub fn valid_id_component(s: &str) -> bool {
-    let s = s.trim();
-    !s.is_empty()
-        && s.len() <= 64
-        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-        && !s.starts_with('-')
+    crate::pathseg::check_segment(s.trim()).is_ok()
 }
 
 // ── the batch planner (§4, §8) ──────────────────────────────────────────────

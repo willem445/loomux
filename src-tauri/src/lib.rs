@@ -8,7 +8,10 @@ pub mod filemgr; // pub: the file-manager integration test links its pure fns (#
 mod gh;
 mod git;
 mod gitwatch;
-mod winpath;
+// winpath (#888 slice A4 batch 13) moved whole into loomux-engine — std +
+// winreg only, no Tauri surface left behind, so the re-export is the entire
+// module rather than a local shim file.
+pub use loomux_engine::winpath;
 mod metrics;
 mod modelwire; // the list-models control probe (#993)
 mod obs;

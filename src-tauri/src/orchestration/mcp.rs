@@ -314,10 +314,37 @@ fn lock_menu_text(locks: &[(String, workflow::ResourcePolicy)]) -> String {
         .join(", ")
 }
 
+/// `group_usage`'s definition, written once because TWO tiers list it: the
+/// orchestrator's, and the liaison's one hint-keyed widening (#891 S2). Shared
+/// for the same reason [`channel_tool_defs`] is — two copies of a description
+/// this long drift, and a liaison reading a staler account of the same tool
+/// than the orchestrator does would be a difference nobody chose.
+///
+/// Deliberately placed ABOVE [`tool_defs`]'s doc comment rather than between it
+/// and its `fn`: consecutive `///` lines merge into one block that attaches to
+/// whatever item comes next, so sitting in that gap silently re-homes
+/// `tool_defs`'s documentation onto this helper — including a `locks` paragraph
+/// describing a parameter it does not take — and leaves `tool_defs` undocumented
+/// with nothing in the diff that looks wrong (rev-lead, PR #1086).
+fn group_usage_tool() -> Value {
+    tool("group_usage",
+        "Aggregate the group's token usage and estimated dollar cost into one summary, split live vs lifetime (killed/recycled agents still count). Tokens come from each agent's session transcript and are exact; dollars are estimated from a model price table (subscription/Max accounts show $0 in the CLI, so cite tokens). Fold it into your status updates so the human sees spend at a glance. Defaults to a SUMMARY sized for that: group + live totals, `agent_count` (the whole lifetime roster), `top_agents` (up to 10, by total tokens descending), and `rest` — `{count, tokens, cost_usd, cost_basis, live: {count, tokens}, historical: {count, tokens}}` for every agent folded out of `top_agents`. Top-N is picked by lifetime tokens, so a group with a long history can push every live agent out of `top_agents`; `rest.live` keeps their count/tokens visible instead of forcing `detail: true` just to see who's still running. `rest.cost_basis` labels whether `rest.cost_usd` is `estimated`, `reported`, or `mixed` (same rule as the top-level `*_cost_basis` fields), so a blended figure is never shown as one honest number. The `rest` count itself is what keeps this from being a silent truncation. Pass `detail: true` for the full per-agent `agents` table instead — on a large lifetime roster (654 agents measured at 173,245 chars) that is too big to fold into a status update, so ask for it only when you need a specific agent's row.",
+        json!({
+            "detail": { "type": "boolean", "description": "Return the full per-agent `agents` table instead of the top_agents/rest summary. Default false." },
+        }), &[])
+}
+
 /// The tool surface is role-filtered so workers never even see privileged
 /// tools; `call_tool` re-checks anyway (listing is cosmetic, not security).
-/// `role_hint` additionally scopes `session_digest` to `process`-hinted
-/// worker blocks (#250/#324 slice D) — every other tool ignores it.
+/// `role_hint` additionally scopes three tools, and NOT all in the same
+/// direction. Two NARROW the class they sit on: `session_digest` is listed only
+/// for `process`-hinted worker blocks (#250/#324 slice D), and `review_verdict`
+/// is withheld from a `liaison`-hinted reviewer block (#891). One WIDENS:
+/// `group_usage`, `require_orchestrator`-only for every other tier, is listed
+/// for that same liaison (#891 S2) — the first hint-keyed rule on this surface
+/// that yields more than its `kind` alone. Every other tool ignores the hint.
+/// `doc/design/liaison.md` enumerates every exception, narrowing and widening
+/// alike.
 ///
 /// `locks` is the group's declared `resources:` block (#858). It is a
 /// LISTING input, not just a description input: a repo that declares no
@@ -554,11 +581,7 @@ fn tool_defs(
                     "id": { "type": "string", "description": "Question id, e.g. q-3 — from ask_human's reply or list_questions." },
                 }),
                 &["id"]),
-            tool("group_usage",
-                "Aggregate the group's token usage and estimated dollar cost into one summary, split live vs lifetime (killed/recycled agents still count). Tokens come from each agent's session transcript and are exact; dollars are estimated from a model price table (subscription/Max accounts show $0 in the CLI, so cite tokens). Fold it into your status updates so the human sees spend at a glance. Defaults to a SUMMARY sized for that: group + live totals, `agent_count` (the whole lifetime roster), `top_agents` (up to 10, by total tokens descending), and `rest` — `{count, tokens, cost_usd, cost_basis, live: {count, tokens}, historical: {count, tokens}}` for every agent folded out of `top_agents`. Top-N is picked by lifetime tokens, so a group with a long history can push every live agent out of `top_agents`; `rest.live` keeps their count/tokens visible instead of forcing `detail: true` just to see who's still running. `rest.cost_basis` labels whether `rest.cost_usd` is `estimated`, `reported`, or `mixed` (same rule as the top-level `*_cost_basis` fields), so a blended figure is never shown as one honest number. The `rest` count itself is what keeps this from being a silent truncation. Pass `detail: true` for the full per-agent `agents` table instead — on a large lifetime roster (654 agents measured at 173,245 chars) that is too big to fold into a status update, so ask for it only when you need a specific agent's row.",
-                json!({
-                    "detail": { "type": "boolean", "description": "Return the full per-agent `agents` table instead of the top_agents/rest summary. Default false." },
-                }), &[]),
+            group_usage_tool(),
             tool("queue_orphans",
                 "Deliveries nobody ever received, in TWO lists: `orphans` — queued but never delivered when loomux last restarted, and unable to re-bind to a live pane; and `refused` — declined at the front door by loomux, so they were never queued at all. Call it once on session start, with the rest of your re-sync. You no longer have to poll it to learn about refusals to YOUR OWN pane: when that pane's queue drains back below its cap, loomux relays a bounded roster of what it refused while full — sender, preview, reason, and whether the sender has since got it through — on the result of your next tool call (#658). This tool is the whole group's history and the other lists; it is not your only path to your own. Returns {count, orphans:[{id, to, queued_minutes_ago, reason, source, text, text_bytes, truncated}], refused_count, refused_omitted, refused_window_truncated, refused:[{from, to, refused_minutes_ago, reason, queue_depth, enqueue_reason, payload, bytes, preview, text, truncated, consequence}]}, oldest ask first in both. `text` is the payload verbatim (capped at 8KB, with `truncated: true` and the full copy on that delivery's `prompt` line in the audit log) when it came from the durable queue snapshot — `source: \"snapshot\"`, or `source: \"archive\"`, which means the same thing to you: the payload is intact and re-sendable, it has simply aged out of the hot snapshot into `queue-orphans-archive.jsonl` so that loomux stops re-writing it on every delivery. An archived entry is still re-queued automatically if its pane ever comes back, exactly like a snapshot one; the two differ only in which file a human opens. `text` is null in exactly two cases, both meaning \"re-derive this one, don't guess\": `source: \"audit\"` (an entry queued by a loomux build older than the durable snapshot — id and target known, payload not), and `reason: \"stranded-submit-not-replayable\"` (the text had already been typed into that pane and was waiting only for Enter when loomux restarted; the pane is gone, so no bytes remain — the audit log's `prompt` line for that delivery is the only record of what it said). THESE ARE LOST WORK, NOT A LOG: each is something you or an agent sent that nobody ever received, so treat a non-empty result as a to-do list — re-send what still applies (the pane it was for is gone, so re-target it: a resumed session, or a fresh agent), and say what you dropped as stale rather than dropping it silently. An empty result is the normal case and needs no comment. Deliveries that DID re-bind (this group's orchestrator pane, or an agent resumed onto the same session id) were already re-queued automatically in their original order and are not listed here. EACH REFUSAL'S `reason` SAYS WHAT TO DO WITH IT, and they are not interchangeable: `queue-full-at-call` — the target pane was at its 8-deep cap; the pane is alive, so this is the one worth re-sending once it drains (`queue_depth` is how full it was). `agent-dead-at-call` — the target was already dead when this was sent; that pane will NEVER take it, so re-target it at a live or resumed agent or drop it as stale, and do not re-send it as-is. `no-terminal-at-call` — the target existed but had no terminal bound yet (a delivery that arrived during the spawn-to-bind window); it was simply too early, so re-send it now if the agent has since bound. `no-app-handle` / `registry-not-shared` — loomux itself could not process the pane's queue and withdrew the admission; these should never appear in a running build, so treat one as a loomux defect worth reporting to the human, not just as a payload to re-send. `queue_depth` and `enqueue_reason` are null for every reason except `queue-full-at-call`, which is the only one that reached the queue at all — null there means \"no measurement was taken\", not \"the pane was empty\". THE `refused` LIST IS DIFFERENT IN THREE WAYS, and each changes what you do with it. (1) A refusal does not need a restart to happen — a pane at capacity refuses every arrival for as long as it stays there — so this list can be non-empty on a perfectly ordinary session, and `refused_count` counts everything in the readable audit window with only the most recent 8 listed (`refused_omitted` says how many were left in `audit.jsonl`). `refused_window_truncated: true` means that window was ITSELF cut at 5000 entries, so `refused_count` counts only the readable tail and older refusals may exist that this scan never saw — read `audit.jsonl` directly (action `delivery-dropped`, and the `reason` values above) if you need the whole history. When it is false, `refused_count` really is all of them. (2) The SENDER was told synchronously (`delivery queue for … full — NOT queued`), so many of these were already handled by whoever sent them; the ones that matter are those whose sender then died, or where `from` is `loomux` itself and nobody was listening. Check before re-sending, and prefer asking the sender over guessing. (3) `text` is the payload the refusal recorded — carried on the refusal's own audit line for a refusal that never reached the queue, and for a `queue-full-at-call` one recovered from that delivery's `prompt` audit line and verified against the refusal's recorded byte count and preview. Either way, when it is non-null it is re-sendable verbatim; when it is null, `preview` (a bounded one-liner) and `bytes` are what you have — re-derive, do not guess. `payload: \"stranded-submit\"` is the one kind that never had text at all: its bytes were already pasted into that pane and only the Enter was refused, so the pane is sitting with an unsubmitted prompt in its input box (`consequence` says so) — recover it by looking at the pane, not by re-sending. NOTHING IS RE-ADMITTED BY READING THIS: a refused delivery was explicitly declined and stays declined, because slipping it back into a queue now would put it behind — or ahead of — everything the pane has accepted since. Re-sending is your call, deliberately made.",
                 json!({}), &[]),
@@ -601,7 +624,20 @@ fn tool_defs(
     // Reviewers only: the verdict is the gate. Listed for the capability class, and
     // re-checked in `call_tool` — the listing is cosmetic, the dispatch check is the
     // enforcement (a worker that could file its own PASS would make the gate a prop).
-    if role == Role::Reviewer {
+    //
+    // …EXCEPT the liaison (#891). It rides the reviewer capability class because it
+    // needs exactly that posture — persistent, contained (`Containment::NoEdits`,
+    // NOT read-only: the shell stays), board-reading — and not because it reviews
+    // anything: it converses with the human and relays. A pane that never reads a
+    // diff must not be able to record the durable, attributed PASS that opens a
+    // merge gate, so this hint-keyed rule NARROWS the class it sits on. (The
+    // same hint also WIDENS, a few lines below — the two rules are independent
+    // and are argued separately in `doc/design/liaison.md`.)
+    // Enforced at all three layers a verdict
+    // passes through (this listing, the `call_tool` dispatch arm, and
+    // `record_verdict` next to the write) — the same "never one check in a JSON
+    // shim" discipline the class check itself gets, for the same reason.
+    if role == Role::Reviewer && role_hint != Some("liaison") {
         tools.push(tool("review_verdict",
             "Record your REVIEW OUTCOME for a pull request. This is durable, attributed state — not a notification — and when this repo's .loomux/workflow.yml declares a merge gate, it is what loomux's gh interceptor reads before allowing `gh pr merge`. Call it once you have finished reviewing, after posting your review on the PR, and then report() to the orchestrator as usual. verdict: `pass` (reviewed, nothing blocking), `fail` (blocking findings — fix and re-review), `escalate` (you will not decide this one: ambiguous requirement, out of your depth, a risk you won't sign off on — a human must look). fail and escalate BOTH refuse the merge, and one blocking verdict beats any number of passes, so never record `pass` to be agreeable or to unblock the queue. Your verdict is bound to the PR's CURRENT HEAD COMMIT: if the author pushes anything afterwards, your pass goes STALE and the gate reopens until you review the new commits and record again — so review the head as it stands, and expect to be asked again after a fix. Re-recording replaces your own earlier verdict (that is how you upgrade a `fail` to a `pass`, and how you refresh a stale one). loomux ALSO records a digest of the PR body as it stands when you call this — you never pass it and cannot forget it — because on a squash-merging repo that body becomes the permanent commit message: it is reviewed content, so review it, and expect to be asked again if it is edited after you pass. The summary must stand on its own for a human reading it a week later: what you reviewed, and what decided the verdict. Verdict words are lowercase.",
             json!({
@@ -610,6 +646,29 @@ fn tool_defs(
                 "summary": { "type": "string", "description": "Why. One or two lines a human can act on." },
             }),
             &["pr", "verdict", "summary"]));
+    }
+    // …and the liaison's WIDENING (#891 S2), the other half of the same hint:
+    // `group_usage`, which every other tier reaches only through
+    // `require_orchestrator`. "What is this group costing?" is one of the
+    // questions the pane exists to answer, and the alternative is the human
+    // asking the orchestrator to interrupt its own dispatch loop and relay a
+    // number the registry already has. It is a READ of an aggregate scoped to
+    // the caller's own group — no cross-group reach, nothing settled, nothing
+    // written — which is why widening for it is arguable at all where widening
+    // `send_prompt` or a board write would not be.
+    //
+    // Keyed on the CONJUNCTION, not on the hint alone, and that asymmetry with
+    // the deny above is deliberate: a DENY keyed on the hint alone fails closed
+    // for every class that might ever carry it, while a GRANT must name the one
+    // class it is granting from. `parse_workflow` already refuses `liaison` on
+    // any kind but `reviewer`, so the class costs a real liaison nothing — and
+    // if some future path ever produced a non-reviewer caller carrying the
+    // hint, it gets the narrower answer instead of an orchestrator-only tool.
+    //
+    // `call_tool`'s `group_usage` arm re-checks the same conjunction and is the
+    // real gate; this listing is cosmetic, as everywhere else on this surface.
+    if role == Role::Reviewer && role_hint == Some("liaison") {
+        tools.push(group_usage_tool());
     }
     // `process`-hinted worker blocks only (#250/#324 slice D binding rider):
     // slice B shipped this gated to worker-kind generally, since `role_hint`
@@ -639,6 +698,35 @@ fn require_orchestrator(caller: &Caller) -> Result<(), String> {
         Ok(())
     } else {
         Err("permission denied: this tool is orchestrator-only".into())
+    }
+}
+
+/// `group_usage`'s gate: the orchestrator, plus the one hint-keyed WIDENING on
+/// this surface (#891 S2). See the matching note in [`tool_defs`] for why the
+/// liaison gets this tool and why the check is a conjunction rather than the
+/// hint alone.
+///
+/// A SEPARATE function from [`require_orchestrator`] on purpose, not a hint arm
+/// added inside it: that one gates roughly twenty tools — `spawn_agent`,
+/// `send_prompt`, `kill_agent`, `set_state`, every board write, the whole merge
+/// queue — and a widening written there would widen all of them at once, which
+/// is precisely the accident a capability widening must not be one edit away
+/// from. The blast radius of this function is exactly one tool.
+///
+/// **The hint is not caller-supplied.** `Caller::role_hint` is resolved in
+/// `resolve_token` from the group's own roster, via the block recorded on the
+/// agent at spawn — the same lookup `record_verdict`'s deny layer and
+/// `idle_reap_candidates` make. Nothing an agent can put in a tool argument, a
+/// pane title, or its own prompt reaches this decision.
+fn require_orchestrator_or_liaison(caller: &Caller) -> Result<(), String> {
+    let liaison =
+        caller.role == Role::Reviewer && caller.role_hint.as_deref() == Some("liaison");
+    if caller.role == Role::Orchestrator || liaison {
+        Ok(())
+    } else {
+        Err("permission denied: usage aggregation is orchestrator-only, plus this \
+             group's liaison block if it declares one"
+            .into())
     }
 }
 
@@ -1005,7 +1093,14 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             Ok(format!("removed {id}"))
         }
         "group_usage" => {
-            require_orchestrator(caller)?;
+            // The gate, and the only tool on this surface that is not simply
+            // orchestrator-only (#891 S2). `reg.group_usage` reads the caller's
+            // OWN group — `caller.group` is resolved from the token, never
+            // passed as an argument — so there is no third, deeper layer to add
+            // here the way `record_verdict` has one: the registry function
+            // takes no caller identity, because the only thing it could check
+            // is a group the caller already is in.
+            require_orchestrator_or_liaison(caller)?;
             let detail = arg_bool(args, "detail")?;
             let full = reg.group_usage(&caller.group);
             let out = if detail {
@@ -1249,13 +1344,22 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                                     owner_rec.role
                                 )
                             })?;
-                        reg.group(&caller.group)
+                        // #891 S4 / #1072 review N5: the same class-default
+                        // resolution `spawn_agent_ex` does, so it needs the same
+                        // refusal — `block_for` now skips a liaison, and a bare
+                        // resume into a liaison-only roster would otherwise be
+                        // told the file declares no reviewer block while it
+                        // plainly declares one.
+                        let group = reg.group(&caller.group);
+                        group
+                            .as_ref()
                             .and_then(|g| g.guardrails.block_for(owner_role).map(|b| b.id.clone()))
-                            .ok_or_else(|| {
-                                format!(
+                            .ok_or_else(|| match group.as_ref() {
+                                Some(g) => g.guardrails.no_default_block_message(owner_role),
+                                None => format!(
                                     "this group's workflow declares no {} block",
                                     owner_role.as_str()
-                                )
+                                ),
                             })?
                     } else {
                         owner_rec.block.clone()
@@ -1628,8 +1732,17 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                     let body = note.map(report::truncate_note).unwrap_or_else(|| summary.unwrap_or("").to_string());
                     report::structured_notice(&caller.agent_id, o, &body, arg_str(args, "ref"), arg_str(args, "detail_url"))
                 }
-                // Legacy path: byte-for-byte the pre-#398 message, uncapped.
-                None => format!("[loomux] {} reports {status}: {}", caller.agent_id, note.or(summary).unwrap()),
+                // Legacy path: the pre-#398 message, still uncapped — but its
+                // agent-authored half goes through the same scrub the
+                // structured path now applies inside `structured_notice`
+                // (#891 rev-1 F1). A check present on one shape of a tool and
+                // absent from the other is a bypass exactly the width of that
+                // asymmetry, and both shapes land in the same pane.
+                None => format!(
+                    "[loomux] {} reports {status}: {}",
+                    caller.agent_id,
+                    report::relay_payload(note.or(summary).unwrap())
+                ),
             };
             // #576 residual: the relay variant, which opts this notice into the
             // question gate's delivery record — the note is the CALLER's words
@@ -1657,6 +1770,16 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             if caller.role != Role::Reviewer {
                 return Err("permission denied: review_verdict is for reviewer-kind blocks — \
                             use report(status, summary)".into());
+            }
+            // The liaison rides the reviewer class for its posture, not to review
+            // (#891). It is denied the verdict at all three layers; see the note
+            // on the `tool_defs` listing for why this narrows rather than widens.
+            if caller.role_hint.as_deref() == Some("liaison") {
+                return Err("permission denied: a liaison block never records a verdict — \
+                            it presents the human's questions and relays their answers, and \
+                            a verdict is what opens this repo's merge gate. Relay what you \
+                            found with message_orchestrator or report(status, summary) \
+                            instead.".into());
             }
             let pr = arg_str(args, "pr").ok_or("pr required")?;
             let verdict = arg_str(args, "verdict").ok_or("verdict required")?;
@@ -1693,7 +1816,21 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                     rec.block,
                     rec.verdict.as_str().to_uppercase(),
                     rec.pr,
-                    report::verdict_notice_summary(&rec.summary),
+                    // #891 rev-2 F1b: the summary is the third delegate-authored
+                    // field that reaches this pane, and it was the one left raw —
+                    // `sanitize_summary` (at the durable write) keeps newlines by
+                    // design and never touched brackets, so a reviewer's summary
+                    // could carry a forged `[loomux] …` line into the pane that
+                    // `{{LIAISON_NOTE}}` tells to read such lines as the human.
+                    // The gate clause beside it has been scrubbed at source since
+                    // #791 (`gh_failure_text`), which is what made this asymmetry
+                    // two arguments of one `format!`.
+                    //
+                    // `_keeping_lines`, and scrubbed BEFORE the truncation: a
+                    // verdict summary is multi-line prose the reviewer meant, and
+                    // `verdict_notice_summary`'s own marker carries brackets that
+                    // a later scrub would neutralize.
+                    report::verdict_notice_summary(&report::relay_payload_keeping_lines(&rec.summary)),
                     gate.as_deref().map(|g| format!("\n[loomux] {g}")).unwrap_or_default(),
                 ),
                 &caller.agent_id,
@@ -1883,9 +2020,22 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             // (report already does this via set_agent_idle).
             reg.note_agent_activity(&caller.agent_id);
             // #576 residual: same relay variant, same reason as `report` above.
+            //
+            // #891 rev-1 F1: the id in the prefix is loomux's — resolved from
+            // the caller's token, never from `args` — but everything after the
+            // colon is the agent's, and this line is the one a liaison's relay
+            // is recognized BY. Raw, a delegate could put a second
+            // `[loomux] message from <liaison>:` span inside its own text and
+            // speak into the orchestrator's directive ledger with the human's
+            // standing. Same scrub as `channel_send` and `report`, one hop
+            // before loomux adds its own prefix.
             reg.deliver_relayed_to_orchestrator(
                 &caller.group,
-                &format!("[loomux] message from {}: {text}", caller.agent_id),
+                &format!(
+                    "[loomux] message from {}: {}",
+                    caller.agent_id,
+                    report::relay_payload(text)
+                ),
                 &caller.agent_id,
             )?;
             Ok("message delivered".into())

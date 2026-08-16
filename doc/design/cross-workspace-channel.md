@@ -75,7 +75,10 @@ only from the trusted webview (constraint 5), never MCP tools. There is no `chan
   peer's pane: control characters (including newlines) are stripped so an embedded newline
   can't forge a second `[loomux] …`-prefixed line, and `[`/`]` are mapped to `(`/`)` so the
   literal token `[loomux]` can't survive even mid-line. Same sanitizer every other
-  crossing-text boundary in this codebase uses — no new mechanism.
+  crossing-text boundary in this codebase uses — no new mechanism. (It is
+  `notify::sanitize_pane_text` since #891, which is what `sanitize_gh_text` has always
+  been: one rule, with a `Lines` policy for the one boundary — a recorded verdict's
+  summary — whose multi-line structure is content rather than an injection vector.)
 - The identity line prefixed to every delivered message (`[loomux] channel chan-3 - w-2
   (worker, C:/repo): <text>`) is built by loomux from the **caller's own backend-resolved**
   identity (`OrchRegistry::channel_member_label`) — name, role, and repo — never from

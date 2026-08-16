@@ -32,7 +32,7 @@ function repoHas(rel: string): boolean {
   return existsSync(new URL(`../${rel}`, import.meta.url));
 }
 
-test("the workspace root manifest declares both members and resolver 2", () => {
+test("the workspace root manifest declares every member and resolver 2", () => {
   assert.ok(repoHas("Cargo.toml"), "the Cargo workspace root manifest must exist at the repo root");
   const root = repoFile("Cargo.toml");
 
@@ -43,7 +43,11 @@ test("the workspace root manifest declares both members and resolver 2", () => {
   // That is the ground the getrandom audit in src-tauri/Cargo.toml stands on.
   assert.match(root, /^resolver = "2"$/m, "the workspace must state resolver 2 explicitly");
 
-  for (const member of ["src-tauri", "crates/loomux-engine"]) {
+  // `crates/loomux-server` joined in #888 slice C1a. A member that is declared
+  // but absent, or present but undeclared, fails the same silent way the three
+  // hazards at the top of this file do: `cargo check --workspace` simply never
+  // compiles a directory nobody listed.
+  for (const member of ["src-tauri", "crates/loomux-engine", "crates/loomux-server"]) {
     assert.ok(
       new RegExp(`"${member}"`).test(root),
       `the workspace members must include ${member}`
@@ -97,7 +101,7 @@ function lockVersionOf(lock: string, name: string): string | undefined {
   return undefined;
 }
 
-test("the lockfile's loomux entry is not shadowed by its loomux-engine sibling", () => {
+test("the lockfile's loomux entry is not shadowed by its loomux-* siblings", () => {
   const lock = repoFile("Cargo.lock");
   const appVersion = JSON.parse(repoFile("package.json")).version;
 
@@ -106,20 +110,23 @@ test("the lockfile's loomux entry is not shadowed by its loomux-engine sibling",
     appVersion,
     "the `loomux` entry in the root Cargo.lock must carry the release version — this is the field scripts/check-versions.js reads"
   );
-  // `loomux` is a strict prefix of `loomux-engine`, so any prefix/substring
-  // match in the version checker would read the wrong entry. Pinning that the
-  // two versions genuinely differ keeps that hazard testable rather than
-  // theoretical.
-  assert.equal(
-    lockVersionOf(lock, "loomux-engine"),
-    "0.0.0",
-    "loomux-engine is publish=false and deliberately pinned at 0.0.0, outside the release version set"
-  );
-  assert.notEqual(
-    lockVersionOf(lock, "loomux-engine"),
-    appVersion,
-    "the two lock entries must stay distinguishable, so a loose name match in check-versions.js fails loudly instead of silently agreeing"
-  );
+  // `loomux` is a strict prefix of BOTH `loomux-engine` and `loomux-server`, so
+  // any prefix/substring match in the version checker would read the wrong
+  // entry. Pinning that the versions genuinely differ keeps that hazard
+  // testable rather than theoretical — and it grows with each sibling, which is
+  // the point: every new `loomux-*` member is another chance for a loose match.
+  for (const sibling of ["loomux-engine", "loomux-server"]) {
+    assert.equal(
+      lockVersionOf(lock, sibling),
+      "0.0.0",
+      `${sibling} is publish=false and deliberately pinned at 0.0.0, outside the release version set`
+    );
+    assert.notEqual(
+      lockVersionOf(lock, sibling),
+      appVersion,
+      "the lock entries must stay distinguishable, so a loose name match in check-versions.js fails loudly instead of silently agreeing"
+    );
+  }
 });
 
 test("check-versions.js reads the workspace-root lockfile", () => {
@@ -131,17 +138,45 @@ test("check-versions.js reads the workspace-root lockfile", () => {
   );
 });
 
-test("the engine crate is publish=false and declares no tauri dependency", () => {
-  const manifest = repoFile("crates/loomux-engine/Cargo.toml");
-  assert.match(manifest, /^publish = false$/m, "loomux-engine is an internal boundary, not a published artifact");
+test("the non-desktop crates are publish=false and declare no tauri dependency", () => {
+  // The rule is the same for both and the reason is the same for both: a core —
+  // or a daemon — that needs webkit2gtk in order to build is not a deployment
+  // shape. The arrow runs `loomux-server -> loomux-engine -> (no tauri)`, and
+  // `src-tauri -> loomux-engine`; it never points back.
+  //
   // The manifest-level half of the rule. Plan-463 slice A4 adds the CI step
-  // that denies tauri from the crate's resolved `cargo tree`; this catches the
+  // that denies tauri from the resolved `cargo tree`; this catches the
   // straightforward way it would get there in the meantime, and costs nothing.
-  assert.doesNotMatch(
-    manifest,
-    /^\s*tauri[\w-]*\s*=/m,
-    "loomux-engine must never depend on tauri — a core that needs webkit2gtk to build defeats the entire extraction (src-tauri depends on the engine; the arrow never points back)"
+  for (const crate of ["loomux-engine", "loomux-server"]) {
+    const manifest = repoFile(`crates/${crate}/Cargo.toml`);
+    assert.match(manifest, /^publish = false$/m, `${crate} is an internal boundary, not a published artifact`);
+    assert.doesNotMatch(
+      manifest,
+      /^\s*tauri[\w-]*\s*=/m,
+      `${crate} must never depend on tauri — that dependency is what the whole extraction exists to avoid`
+    );
+  }
+});
+
+test("the daemon crate depends on the engine, and nothing depends on the daemon", () => {
+  const server = repoFile("crates/loomux-server/Cargo.toml");
+  assert.match(
+    server,
+    /^loomux-engine = \{ path = "\.\.\/loomux-engine"/m,
+    "loomux-server hosts the engine — the dependency IS the crate's reason to exist, and it is what pins the arrow's direction"
   );
+
+  // The daemon is a leaf. If the desktop app ever grew a dependency on it, the
+  // Windows binary would start linking a Linux-target daemon's dependency tree
+  // — including, eventually, its WebSocket stack — straight through the
+  // getrandom audit boundary CLAUDE.md constraint 2 draws around that binary.
+  for (const crate of ["src-tauri", "crates/loomux-engine"]) {
+    assert.doesNotMatch(
+      repoFile(`${crate}/Cargo.toml`),
+      /^\s*loomux-server\s*=/m,
+      `${crate} must not depend on loomux-server: the daemon is a leaf, and its dependency tree is deliberately not audited for the shipped Windows binary`
+    );
+  }
 });
 
 test("every build-output path agrees on the workspace-root target/", () => {
