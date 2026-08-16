@@ -32,6 +32,7 @@ import {
   citedTask,
   EMPTY_DRAFT,
   freeTextAllowed,
+  isPending,
   isUrgent,
   needsYouCount,
   normalizeOptions,
@@ -240,7 +241,10 @@ export class DecisionsView {
     // question was answered elsewhere or withdrawn by its asker must not come
     // back holding stale input.
     this.drafts = retainDrafts(this.drafts, this.questions);
-    const answerable = new Set(this.questions.filter((q) => q.status === "pending").map((q) => q.id));
+    // `isPending`, not a second inline status test: the draft map and the
+    // expanded set must be pruned by exactly the same rule, and two spellings
+    // of "answerable" is how they drift apart.
+    const answerable = new Set(this.questions.filter(isPending).map((q) => q.id));
     for (const id of [...this.open]) if (!answerable.has(id)) this.open.delete(id);
     this.render();
   }

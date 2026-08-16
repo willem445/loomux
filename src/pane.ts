@@ -4247,6 +4247,7 @@ export class Pane implements VoiceTargetPane {
     if (this.gitOverlay && !this.gitOverlay.hidden) return this.gitOverlay;
     if (this.issuesOverlay && !this.issuesOverlay.hidden) return this.issuesOverlay;
     if (this.tasksOverlay && !this.tasksOverlay.hidden) return this.tasksOverlay;
+    if (this.decisionsOverlay && !this.decisionsOverlay.hidden) return this.decisionsOverlay;
     if (this.auditOverlay && !this.auditOverlay.hidden) return this.auditOverlay;
     if (this.timelineOverlay && !this.timelineOverlay.hidden) return this.timelineOverlay;
     if (this.groupOverlay && !this.groupOverlay.hidden) return this.groupOverlay;
