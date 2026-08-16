@@ -781,16 +781,20 @@ test("two CLIs that draw the same glyph stay apart in colour, under every simula
   //
   // Seven hues on one ground do not survive colour-vision deficiency and these do not — the
   // design accepts that for identity, because identity is always also carried by position,
-  // label and SHAPE. Here the shape is a single letter, and three of the roster's CLIs start
-  // with `C`: `claude` and `codex` both badge a plain `C` (copilot draws the vendored
-  // octicon, so it is shape-distinct). For that pair — and only that pair — colour is the
-  // ONLY channel left, so it has to survive what the others are excused from.
+  // label and SHAPE. The worst collapse in this set is tritan codex/copilot at 1.4 ΔE, i.e.
+  // one colour to a tritanope, and it is fine BECAUSE those two are shape-distinct: codex
+  // badges a plain `C` and copilot draws the vendored octicon.
+  //
+  // What is not fine is two CLIs that draw the SAME shape, because then colour is the only
+  // channel left and the excuse above evaporates. Three of the roster's CLIs start with `C`
+  // and two of them badge a plain one — `claude` and `codex` — so that is the pair this test
+  // exists for. Its worst view is 25.1 ΔE (protan; deutan 42.2, tritan 135.4).
   //
   // The collision set is computed from the renderer, not listed here, so an eighth CLI whose
   // name starts with `C` inherits this obligation the moment it is added rather than the day
-  // someone notices two identical badges in different colours that a deuteranope cannot tell
-  // apart. Floor of 15 ΔE: today's pair is at 25.1, low enough that a legitimate nudge does
-  // not trip it, high enough that a genuine collapse does.
+  // someone notices two identical badges in colours a dichromat cannot tell apart. Floor of
+  // 15 ΔE: low enough that a legitimate nudge to a hue does not trip it, high enough that a
+  // genuine collapse does.
   const glyph = (program: string) => agentMarkFor(program).svg.replace(/class="[^"]*"/, "");
   const collisions: [string, string][] = [];
   const names = Object.keys(CLI_HUES);
@@ -820,14 +824,16 @@ test("two CLIs that draw the same glyph stay apart in colour, under every simula
 
 test("no per-CLI hue can be mistaken for the ink it is drawn beside", () => {
   // A NEAR-MISS, PINNED. The first candidate for copilot was a pewter (#93a8c4) chosen to
-  // evoke GitHub's monochrome mark — and it landed 9 ΔE from `--ink-dim`, which is the colour
-  // of the header text the mark sits next to. It would have measured perfectly: AA on every
-  // ground, well clear of all six other CLI hues. It would also have read as an UNDYED mark,
-  // i.e. as the bug this whole table exists to fix, on the one CLI most likely to be running.
+  // evoke GitHub's monochrome mark — and it landed 8.7 ΔE from `--ink-dim`, which is the
+  // colour of the header text the mark sits next to. It would have measured perfectly: AA on
+  // every ground, well clear of all six other CLI hues. It would also have read as an UNDYED
+  // mark, i.e. as the bug this whole table exists to fix, on the CLI most likely to be
+  // running.
   //
   // Distance from the other hues is not the property that matters here; distance from the
-  // NEUTRAL the mark is drawn against is. 20 ΔE at normal vision — the rejected pewter was at
-  // 9, the shipped set's worst is comfortably clear of it.
+  // NEUTRAL the mark is drawn against is. Floor of 20 ΔE at normal vision: the rejected
+  // pewter was at 8.7, and the shipped set's closest approach is 20.6 (copilot/inkDim) — so
+  // the floor is doing real work rather than sitting where nothing can reach it.
   const INK = { ink: SEMANTIC.ink, inkDim: SEMANTIC.inkDim, inkFaint: SEMANTIC.inkFaint };
   for (const [cli, value] of Object.entries(CLI_HUES)) {
     for (const [name, neutral] of Object.entries(INK)) {
@@ -873,6 +879,37 @@ test("one CLI table: every surface that names a CLI paints it that CLI's own tok
   // Both surfaces still exist — a rename that made every rule above unmatchable would leave
   // `wrong` empty and this test green while checking nothing.
   assert.ok(seenAny >= Object.keys(CLI_HUES).length + 3, `only ${seenAny} CLI rules matched`);
+});
+
+test("the design note's per-CLI CVD table is re-derived, not remembered", () => {
+  // THE FINDING THIS TEST IS THE FIX FOR. The first round of this feature quoted CVD figures
+  // in three places — theme.ts, the design note and the PR body — that were produced by a
+  // throwaway script using DIFFERENT dichromat matrices from the ones the suite runs. The
+  // numbers were plausible, internally consistent, and wrong: a claimed "deutan
+  // copilot/hermes 12.6" was near the PROTAN value, and no pair measured 12.6 under any
+  // simulation at all. Nothing caught it, because a measurement written into prose is a
+  // measurement nothing re-runs.
+  //
+  // So the note's own table is derived here from `simulate`/`deltaE` — the same code the
+  // assertions above use — and the note has to agree with it. A hue nudge now forces the
+  // prose to be re-derived instead of silently outliving the palette it described, which is
+  // the same job the mist-row pin below does for the ink ramp.
+  const doc = read("../doc/design/ui-redesign.md");
+  for (const kind of CVD_KINDS) {
+    const { distance, a, b } = closestPair({ ...CLI_HUES }, (h) => simulate(h, kind));
+    const row = doc.match(new RegExp(`\\|\\s*${kind}\\s*\\|\\s*([a-z/]+)\\s*\\|\\s*\\*{0,2}([0-9.]+)`));
+    assert.ok(row, `ui-redesign.md's per-CLI CVD table has no ${kind} row`);
+    assert.equal(
+      row[1],
+      `${a}/${b}`,
+      `the note says the closest ${kind} pair is ${row[1]}; it is ${a}/${b}`
+    );
+    assert.equal(
+      row[2],
+      distance.toFixed(1),
+      `the note says ${kind} ${row[1]} is ${row[2]} ΔE; it is ${distance.toFixed(1)}`
+    );
+  }
 });
 
 test("the design note's per-CLI table matches theme.ts", () => {

@@ -112,7 +112,7 @@ terminal-only value survives: ANSI green (`#57bd77`), because the app's greens a
 
 **Eight is a measurement, not a preference.** The revision's target was 8–10, and a ninth
 hue was tried in all three gaps the wheel still had. Every candidate landed closer to an
-existing hue than the eight-set's own closest pair (violet/orchid, 30.4 ΔE in CIE76): a
+existing hue than the eight-set's own closest pair (rose/orchid, 30.4 ΔE in CIE76): a
 tangerine came out 20–29 ΔE from amber, an indigo 13–23 from azure and violet, a fern 10–24
 from ANSI green. The warm arc is the crowded one because two *state* dyes already live there
 and neither may move, so a third warm hue costs exactly the state legibility the palette
@@ -363,30 +363,48 @@ identity in the position-mixing check, so that is measured rather than asserted.
 
 **Seven more pigments does not reopen "eight is a measurement".** That ceiling (§The palette)
 was measured for hues that must be told apart *across the whole app*, where a ninth candidate
-landed closer to an existing hue than the eight-set's own closest pair (violet/orchid,
+landed closer to an existing hue than the eight-set's own closest pair (rose/orchid,
 30.4 ΔE). These seven never face that comparison: they appear in exactly **two positions** —
 the agent mark and the session list's CLI chip — and only ever against each other. Measured
-on their own terms they are the tighter set, closest pair **31.5 ΔE** (opencode/codex), and
+on their own terms they are the tighter set, closest pair **31.5 ΔE** (codex/opencode), and
 the test derives the bar from `IDENTITY`'s own closest pair rather than hard-coding it, so
 seven extra pigments stay justified only while they remain the more legible set.
 
-**Colour-vision deficiency, and the one obligation this table can carry that identity
-cannot.** Seven hues on one dark ground do not survive CVD and these do not — to a
-deuteranope claude/opencode are 10.7 ΔE apart, copilot/hermes 12.6. That is the same trade
-identity already makes and states: *which thing this is* is always also carried by position,
-label and shape. Here the shape is usually a single letter, and the roster has three CLIs
-starting with `C` — so there is one pair for which colour is the **only** remaining channel,
-`claude`/`codex`, both badging a plain `C` (copilot draws the vendored octicon and is
-shape-distinct). That pair is held to a floor under every simulation, and the test computes
-the collision set *from the renderer* rather than listing it, so an eighth CLI starting with
-`C` inherits the obligation the day it is added.
+> Every ΔE in this section is CIE76 over the Viénot LMS dichromat simulation in
+> `test/theme.test.ts` — the same code the suite runs, and the only method quoted anywhere in
+> this feature. Two surfaces disagreeing because one of them measured differently is a class
+> of error, not a rounding.
+
+**Colour-vision deficiency — and the worst case is tritan, not the red-green ones.** Seven
+hues on one dark ground do not survive CVD and these do not. Closest pair per simulation:
+
+| Simulation | Closest pair | ΔE |
+| --- | --- | --- |
+| protan | copilot/hermes | 12.5 |
+| deutan | claude/opencode | 10.5 |
+| tritan | codex/copilot | **1.4** |
+
+1.4 ΔE is the honest headline: a tritanope sees codex and copilot as *one colour*. That is
+the same trade identity already makes and states — *which thing this is* is always also
+carried by position, label and **shape**. Here the shape is usually a single letter, so the
+trade holds only while no two CLIs draw the same one; where two do, colour is the last
+channel left and has to survive what the others are excused from.
+
+The roster has three CLIs starting with `C`, and exactly one pair where colour is the **only**
+remaining channel: `claude`/`codex`, both badging a plain `C` (`copilot` draws the vendored
+octicon, so it is shape-distinct). Its worst view is **25.1 ΔE** (protan; deutan 42.2, tritan
+135.4), against a floor of 15. And every pair that *does* collapse is shape-distinct —
+codex/copilot is a `C` against the octicon, claude/hermes (3.8, tritan) a `C` against an `H`.
+The test computes the collision set *from the renderer* rather than listing it, so an eighth
+CLI starting with `C` inherits the obligation the day it is added.
 
 **Distance from the neutrals, not just from each other.** The first copilot candidate was a
 pewter (`#93a8c4`) chosen to evoke GitHub's monochrome mark. It cleared AA on every ground and
-sat well clear of all six other CLI hues — and 9 ΔE from `--ink-dim`, which is the colour of
-the header text the mark is drawn beside. It would have read as an *undyed* mark, i.e. as the
-exact bug this table exists to fix, on the CLI most likely to be running. The shipped set is
-held 20 ΔE clear of every step of the ink ramp.
+sat well clear of all six other CLI hues — and **8.7 ΔE** from `--ink-dim`, which is the
+colour of the header text the mark is drawn beside. It would have read as an *undyed* mark,
+i.e. as the exact bug this table exists to fix, on the CLI most likely to be running. The
+shipped set is held 20 ΔE clear of every step of the ink ramp, with 20.6 (copilot/`--ink-dim`)
+the closest it comes.
 
 **One CLI, one answer, everywhere.** The session list already dyed its CLI chips — claude
 amber, copilot azure, opencode jade — so loomux had two colour tables for one question, and a

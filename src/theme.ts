@@ -215,21 +215,30 @@ export const IDENTITY_LIT = {
  *
  * WHY SEVEN MORE PIGMENTS DOES NOT BREAK "EIGHT IS A MEASUREMENT". That ceiling was measured
  * for hues that must be told apart ACROSS THE WHOLE APP — a ninth would have landed closer to
- * an existing hue than the eight-set's own closest pair (violet/orchid, 30.4 ΔE). These seven
+ * an existing hue than the eight-set's own closest pair (rose/orchid, 30.4 ΔE). These seven
  * never have to survive that comparison, because they only ever appear in ONE position
  * against each other: the agent mark and the session list's CLI chip. Measured on their own
- * terms they are the tighter set — closest pair 31.5 ΔE (opencode/codex), better than the
+ * terms they are the tighter set — closest pair 31.5 ΔE (codex/opencode), better than the
  * eight's own 30.4 — and test/theme.test.ts holds them to that floor.
  *
- * COLOUR-VISION DEFICIENCY, HONESTLY. Seven hues on one ground do not survive CVD, and these
- * do not: to a deuteranope claude/opencode are 10.7 ΔE apart and copilot/hermes 12.6. That is
- * the same trade the identity channel already makes and states (state dyes stay separable,
- * identity does not have to) — with one extra obligation this table CAN carry, because the
- * glyph is right there: any two CLIs that draw the SAME SHAPE must stay separable by colour
- * under every simulation. Today that is exactly one pair — claude and codex both badge `C` —
- * and they are 25.1 ΔE apart at worst. test/theme.test.ts computes the collision set from the
- * renderer rather than hard-coding it, so an eighth CLI starting with `C` inherits the
- * obligation automatically.
+ * COLOUR-VISION DEFICIENCY, HONESTLY — AND THE WORST CASE IS TRITAN, NOT THE RED-GREEN ONES.
+ * Seven hues on one ground do not survive CVD and these do not. Closest pair per simulation:
+ * protan copilot/hermes 12.5, deutan claude/opencode 10.5, and tritan codex/copilot **1.4** —
+ * which is the honest headline, because a tritanope sees those two as one colour. (Every
+ * figure here and below is CIE76 over the Viénot LMS simulation in test/theme.test.ts; that
+ * is the only method quoted anywhere in this feature, so two surfaces cannot disagree by
+ * having measured differently.)
+ *
+ * That collapse is the same trade the identity channel already makes and states — state dyes
+ * stay separable, identity does not have to, because identity is also carried by position,
+ * label and SHAPE. Here the shape is usually one letter, so the trade holds only while no two
+ * CLIs draw the same one; where they do, colour is the last channel and has to survive what
+ * the others are excused from. Today that is exactly one pair — claude and codex both badge
+ * `C` — and its worst view is 25.1 ΔE (protan; deutan 42.2, tritan 135.4). Every pair that
+ * DOES collapse is shape-distinct: codex/copilot is a `C` against the vendored octicon,
+ * claude/hermes (3.8 tritan) a `C` against an `H`. test/theme.test.ts computes the collision
+ * set from the renderer rather than hard-coding it, so an eighth CLI starting with `C`
+ * inherits the obligation automatically.
  *
  * Keys are program names as `normalizeAgentProgram` spells them, which is what lets
  * src/agenticons.ts stamp `cli-<program>` without a second table to keep in step;
