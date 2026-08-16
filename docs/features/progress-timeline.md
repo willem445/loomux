@@ -105,7 +105,7 @@ log comes back without its filters.
 
 - **Only what the audit log and GitHub recorded.** It doesn't read agent
   transcripts, so "the agent thought about X for ten minutes" isn't here.
-- **A merge gate is not a merge.** Loomux audits its *permission* to merge and
+- **A merge gate is not a merge.** Orrerix audits its *permission* to merge and
   then runs `gh`, which can still fail. A dot reading "merge allowed" means
   exactly that; only a GitHub `merged` dot means the PR actually merged.
 - **A first kickoff and a later delivery look the same**, because the audit

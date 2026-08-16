@@ -42,11 +42,11 @@ and resumes it there. The pane is auto-named from the session.
 dead group's orchestrator session restores the *whole* orchestration — same group
 id, state, task board, and audit history — with fresh MCP identity wired in.
 Worker/reviewer sessions rejoin their group when it's running. See
-[Restart after loomux closes](../orchestration.html#persistence--restart).
+[Restart after orrerix closes](../orchestration.html#persistence--restart).
 
 ## Open in editor
 
-Loomux is a terminal, not an editor — so when you need to open files in a real
+Orrerix is a terminal, not an editor — so when you need to open files in a real
 editor, the **`</>`** button in a pane header (or **`Alt+E`**) launches your
 editor on that pane's current folder. The first time, you're asked for the editor
 command; it's remembered after that.
@@ -54,8 +54,8 @@ command; it's remembered after that.
 - Set it to `code` (VS Code), `zed`, `subl`, or any command on your `PATH`, or a
   full path to the editor executable.
 - The workspace folder is passed as the editor's sole argument, spawned detached
-  — the editor keeps running independently of loomux.
+  — the editor keeps running independently of orrerix.
 - Right-click the `</>` button any time to change the editor command.
 
-If nothing is configured, or the editor can't be found/launched, loomux shows a
+If nothing is configured, or the editor can't be found/launched, orrerix shows a
 short toast explaining what went wrong.

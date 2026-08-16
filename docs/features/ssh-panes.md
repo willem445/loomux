@@ -24,8 +24,8 @@ scrolls back.
 
 Two things it is *not*, and both are load-bearing:
 
-- **Nothing loomux-side runs on the remote host.** There is no daemon, no
-  service, no protocol, no remote state loomux owns. The pane's child process is
+- **Nothing orrerix-side runs on the remote host.** There is no daemon, no
+  service, no protocol, no remote state orrerix owns. The pane's child process is
   a local `ssh.exe`; everything past that is between OpenSSH and the host you
   configured.
 - **An SSH pane is a solo pane.** It can display and drive a remote agent, but it
@@ -36,11 +36,11 @@ Two things it is *not*, and both are load-bearing:
 You could always type `ssh host` into a Terminal pane, and that still works. What
 this pane kind adds is saved connections, a first-class launch of a remote agent
 CLI (with a resumable Claude Code session), restore across app restarts, and
-honest degradation of every loomux feature that needs a *local* filesystem.
+honest degradation of every orrerix feature that needs a *local* filesystem.
 
 ## What you need
 
-The Windows **OpenSSH client** (`ssh.exe`). loomux looks for it on `PATH` first —
+The Windows **OpenSSH client** (`ssh.exe`). orrerix looks for it on `PATH` first —
 so a newer OpenSSH, or a wrapper you put ahead of the inbox client, wins, exactly
 as it does for every other program on your machine — and then in the inbox
 install directory (`%SystemRoot%\System32\OpenSSH`), which covers a stripped
@@ -48,7 +48,7 @@ install directory (`%SystemRoot%\System32\OpenSSH`), which covers a stripped
 
 If neither turns up anything, **Create is refused** with:
 
-> No ssh client found — loomux looked on PATH and in the Windows OpenSSH install
+> No ssh client found — orrerix looked on PATH and in the Windows OpenSSH install
 > (System32\OpenSSH). Install the OpenSSH Client optional feature, or put ssh.exe
 > on PATH.
 
@@ -65,8 +65,8 @@ ssh client**, then fill in the section that appears:
 | **Connection** | The saved connection to launch, or **New connection…**. Picking one fills every field below from it; the fields *are* the connection's editor, so what you launch is what gets saved. |
 | **Name** | The label the picker shows. Free text, and not an identity — renaming a connection keeps the panes that use it pointed at it. |
 | **Destination** | `user@host`, a bare `host`, or a `Host` alias from your own `ssh_config`. Required. One field rather than separate user/host boxes, because an alias has neither — and an alias is how your `ProxyJump`, `IdentityFile` and `User` come along for free. |
-| **Port** | `-p`. Blank means loomux passes nothing and your ssh config decides. |
-| **Identity file** | `-i`. A **path** to a private key — never the key itself (see [below](#credentials-loomux-holds-none)). Blank means your ssh config decides. |
+| **Port** | `-p`. Blank means orrerix passes nothing and your ssh config decides. |
+| **Identity file** | `-i`. A **path** to a private key — never the key itself (see [below](#credentials-orrerix-holds-none)). Blank means your ssh config decides. |
 | **Remote shell** | **POSIX (sh/bash/zsh)** or **cmd.exe** — which shell's quoting rules the remote command is built for. A declaration, not a guess; see [Remote shell](#remote-shell-a-declaration-not-a-detection). |
 | **Keepalive (s)** | `ServerAliveInterval`. Blank emits *nothing at all*, so your own ssh config's keepalive settings win untouched. |
 | **Extra ssh flags** | Space-separated argv words passed to `ssh` verbatim and in order (`-J jump.example.net`). The escape hatch for anything the fields above don't model. |
@@ -89,7 +89,7 @@ reason, instead of being quietly discarded on the way to `ssh`:
 - a **Port** or **Keepalive** outside its range (1–65535 and 1–86400) — you are
   told, rather than connecting on port 22 and wondering;
 - an **Identity file** that is actually key material — refused: that field takes a
-  path, and loomux will not write a key into the connections file (see below).
+  path, and orrerix will not write a key into the connections file (see below).
 
 A **Remote folder** with **Remote CLI = None** is the one case that is neither
 refused nor honoured: there is no remote command for the `cd` to prefix, so the
@@ -103,17 +103,17 @@ launch warns inline —
 Synthesizing a login shell (`cd … && exec $SHELL -l`) would mean *guessing* the
 remote's login shell, which is exactly what **Remote shell** exists to avoid.
 
-## Credentials: loomux holds none
+## Credentials: orrerix holds none
 
 Authentication is entirely your ssh setup's business — `ssh_config`, `ssh-agent`,
-and interactive prompts in the pane. loomux passes no `BatchMode`, so a prompt is
-free to appear and you answer it in the pane. This mirrors how loomux treats
+and interactive prompts in the pane. orrerix passes no `BatchMode`, so a prompt is
+free to appear and you answer it in the pane. This mirrors how orrerix treats
 GitHub: it stores no token and shells out to your authenticated `gh`.
 
 Saved connections live in **`%APPDATA%\loomux\sshprofiles.json`**, a plain,
 hand-editable JSON file next to `tabs.json` and `settings.json`. It holds
 hostnames, ports, the *path* of an identity file, a remote folder, a CLI name and
-your extra flags. **loomux never writes a password or a passphrase into it**, and
+your extra flags. **orrerix never writes a password or a passphrase into it**, and
 two structural guards keep that true rather than merely stated:
 
 1. **Read and write are both allowlists.** Only the declared fields are read in,
@@ -125,14 +125,14 @@ two structural guards keep that true rather than merely stated:
 Guard 2 has one honest gap, stated here rather than left to be inferred: it is a
 **line-break test** (plus an armour-header test as a belt), because every real
 key wraps its base64 body across lines — so a key body pasted as a *single line
-with no header* looks exactly like a path and gets through. Nothing loomux does
+with no header* looks exactly like a path and gets through. Nothing orrerix does
 produces that shape, and the value is then handed to `ssh -i` as a filename that
 does not exist, which fails loudly rather than storing anything. The guard fails
 closed on everything a key actually looks like; it is not a content classifier.
 
 Editing the file by hand is fine. A malformed *entry* is dropped on load rather
 than taking the whole list with it; a file that won't parse as JSON at all is
-renamed aside to `sshprofiles.corrupt.json` and loomux starts from an empty
+renamed aside to `sshprofiles.corrupt.json` and orrerix starts from an empty
 list — the same treatment `tabs.json` gets.
 
 > **The trust boundary, stated plainly.** Anyone who can write
@@ -148,11 +148,11 @@ list — the same treatment `tabs.json` gets.
 
 **Remote CLI** offers the same catalog the Agent pane kind offers (minus *custom*,
 whose command line is a *local* one you own), plus **None — a plain login shell**.
-The name you pick is run on the remote host as written; loomux's catalog decides
+The name you pick is run on the remote host as written; orrerix's catalog decides
 what *flags* it can add, not what the remote machine is allowed to have installed.
-A name loomux doesn't recognize warns and still runs:
+A name orrerix doesn't recognize warns and still runs:
 
-> ⚠ "beam" isn't a CLI loomux knows — it will be run on the remote host exactly as
+> ⚠ "beam" isn't a CLI orrerix knows — it will be run on the remote host exactly as
 > written, with no session id and no autopilot flags.
 
 What actually reaches the far host, with **Remote CLI = Claude Code** and a
@@ -166,7 +166,7 @@ cd '/srv/app' && exec 'claude' '--session-id' '<uuid>'
 
 **Claude Code is the only remote CLI that gets a session id**, and for a
 structural reason rather than a preference: Claude's session identity is a value
-loomux puts *on the command line*, which travels through ssh untouched. Every
+orrerix puts *on the command line*, which travels through ssh untouched. Every
 other CLI's session id is *discovered* by reading a store on the machine the CLI
 runs on — a mechanism that reaches your machine, not the far host. So a remote
 Copilot or OpenCode pane runs fine and records **no** session id, which is what
@@ -174,8 +174,8 @@ makes its reconnect honest instead of a `--resume` of an id nobody can look up.
 
 **No autopilot flags and no MCP/channel tools are applied to a remote CLI.** The
 Autopilot and Channel-tools toggles belong to the Agent kind and are hidden here:
-loomux's MCP server listens on loopback only and its per-agent config reaches only
-children loomux spawns itself, so neither could be delivered to a process on
+orrerix's MCP server listens on loopback only and its per-agent config reaches only
+children orrerix spawns itself, so neither could be delivered to a process on
 another machine.
 
 ### Remote shell: a declaration, not a detection
@@ -230,7 +230,7 @@ command line:
   connection still names Claude Code; otherwise it is a plain fresh connect.
 
 If a recorded session could not be resumed — because you switched that connection
-to a CLI whose session identity loomux cannot carry — the pane says so rather than
+to a CLI whose session identity orrerix cannot carry — the pane says so rather than
 letting you discover it by asking an agent about work it has no memory of.
 
 **Reconnect fresh** is offered beside it when there *is* a recorded session: it
@@ -253,7 +253,7 @@ mount, without a click, is a pane whose record carries no connection at all — 
 Two things Reconnect does not preserve: the **scrollback** of the dead session
 (the terminal is reset before the new client starts, so the old session's tail
 cannot paint over the new one's first bytes), and anything the remote process was
-doing that did not survive the disconnection. loomux kills the local ssh client
+doing that did not survive the disconnection. orrerix kills the local ssh client
 when the pane closes; what the far host does with the session at that point is
 the far host's business — which is precisely why a resumable Claude session is
 worth having.
@@ -270,7 +270,7 @@ rather than left to produce a wrong answer:
 | **Git view** (`Alt+G`) | Opens, and never shows a repository. It has no local folder to read, so it sits on its placeholder — *"Waiting for the shell to report its folder…"* — which on an SSH pane is a wait that never ends, since the folder the remote shell reports is deliberately ignored. Misleading wording, but the alternative (pointing it at whatever local path happened to match a remote one) would be worse than showing nothing. |
 | **External git watching** | Never registered. A watch here would either resolve to nothing or report an unrelated *local* repo's changes as though they were the remote one's. |
 | **Session browser, usage meter, transcripts** | A remote session never appears. All three read stores on the machine the CLI ran on, and that machine isn't this one. |
-| **The tab's agent counter** | An SSH pane counts for nothing. The CLI on the far end may well be an agent — but not one this loomux spawned, supervises, or can account for. |
+| **The tab's agent counter** | An SSH pane counts for nothing. The CLI on the far end may well be an agent — but not one this orrerix spawned, supervises, or can account for. |
 | **Orchestration membership** | Refused outright. See below. |
 
 Typing *into* the pane works normally, including paste: it is a transparent byte
@@ -284,7 +284,7 @@ the machinery degrades gracefully:
 
 - **Worktrees** are local directories made by local `git`;
 - **the MCP server** is loopback-only, and its per-agent config reaches only
-  children loomux spawns itself — so a remote agent could not report at all;
+  children orrerix spawns itself — so a remote agent could not report at all;
 - **the `gh` shim** — which is what *enforces* the merge gate — also reaches only
   locally-spawned children, so a remote `gh` would face no gate. That is a
   security regression, and it is the reason this line is drawn hard;
@@ -297,7 +297,7 @@ as an ordinary dormant SSH card.
 
 **So: in v1 an SSH pane is display-only** — a remote solo pane you drive yourself.
 Every "make *X* work remotely" follow-up (remote sessions in the browser, remote
-usage, remote orchestration members, a tunnelled MCP server) needs a loomux
+usage, remote orchestration members, a tunnelled MCP server) needs an orrerix
 process on the far end, which is the **remote engine** ([#888]), not this feature.
 
 [#888]: https://github.com/willem445/loomux/issues/888

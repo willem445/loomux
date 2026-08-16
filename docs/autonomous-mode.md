@@ -33,7 +33,7 @@ Both are **off by default**, both survive an app restart, and both are
 **mutually exclusive** — one is for when you've stepped away, the other for when
 you're at the keyboard.
 
-Three of the guarantees below are **structurally enforced by loomux** — an agent
+Three of the guarantees below are **structurally enforced by orrerix** — an agent
 that violates them is *blocked*, regardless of what it's instructed to do:
 
 - the **merge / release gate** (a default-branch merge or a release/tag publish is
@@ -45,7 +45,7 @@ that violates them is *blocked*, regardless of what it's instructed to do:
 
 Other behaviors on this page are **policy the orchestrator is *instructed* to
 follow**, not a hard wall — they're delivered to it as prompt text, so they hold
-as long as the orchestrator obeys its instructions, not as a boundary loomux
+as long as the orchestrator obeys its instructions, not as a boundary orrerix
 enforces. Each is flagged where it appears (the labeled-work-only intake, the
 `agent-hold` veto under [full autonomy](#full-autonomy-the-orchestrator-picks-the-work),
 and the "adequately tested" bar the orchestrator applies before self-merging).
@@ -76,7 +76,7 @@ switch the backend would reject.
 
 ## Autonomous mode
 
-When you're away, nothing in loomux normally pokes an idle orchestrator, so its
+When you're away, nothing in orrerix normally pokes an idle orchestrator, so its
 periodic cadence (poll `agent-ready` / `agent-investigation`, groom, re-check open
 PRs) simply never runs. Autonomous mode adds the missing **tick source**.
 
@@ -89,7 +89,7 @@ PRs) simply never runs. Autonomous mode adds the missing **tick source**.
   orchestrator to start **labeled** issues (`agent-ready` / `agent-investigation`) —
   exactly the [label handshake](orchestration.html#the-label-handshake) you already
   control — and the orchestrator's instructions keep it to those. This is a
-  convention the orchestrator is *instructed* to follow, not a gate loomux enforces:
+  convention the orchestrator is *instructed* to follow, not a gate orrerix enforces:
   the label funnel is your consent boundary as long as the orchestrator obeys it,
   but nothing structurally blocks an unlabeled issue the way the merge gate blocks a
   merge. (Merging/publishing what it produces is still gated regardless.) This is the
@@ -113,7 +113,7 @@ PRs) simply never runs. Autonomous mode adds the missing **tick source**.
   skipped entirely — no ticks, no deliveries — and your pause/off toggle is
   instant.
 - **An intake gate runs by default whenever autonomous mode is on.** Out of the
-  box, the idle window firing is not sufficient on its own: loomux also
+  box, the idle window firing is not sufficient on its own: orrerix also
   runs a zero-token, host-side check (`gh issue list` / `gh pr list`, no LLM
   turn) for the same signals the tick exists to catch — a new
   `agent-ready`/`agent-investigation` label, an open PR's checks going green or
@@ -150,8 +150,8 @@ PRs) simply never runs. Autonomous mode adds the missing **tick source**.
   `idle-tick` entry carries the `empty_streak` it reached and the
   `fallback_minutes` interval that produced it.
 
-Autonomous mode is generic: loomux's own orchestration group is just another
-group, so turning it on for the repo loomux itself is developed in would idle-tick
+Autonomous mode is generic: orrerix's own orchestration group is just another
+group, so turning it on for the repo orrerix itself is developed in would idle-tick
 that orchestrator like any other.
 
 ## Full autonomy: the orchestrator picks the work
@@ -170,9 +170,9 @@ autonomous is off, and turning autonomous off turns this off too).
 - **The goal.** The optional **Goal** field is one line describing what this run
   is *for* ("harden any bugs, close out new issues identified as you work"). It
   travels with the enable and is echoed into the orchestrator's kickoff config and
-  its toggle notice. **loomux never interprets it** — ranking candidates against
+  its toggle notice. **orrerix never interprets it** — ranking candidates against
   the goal, and stating a one-line rationale per pickup, is the orchestrator's
-  job, not policy in loomux. It's normalized to a single bounded line (whitespace
+  job, not policy in orrerix. It's normalized to a single bounded line (whitespace
   collapsed, 500 characters) because it's typed into a CLI pane. Edit it while the
   mode is on and you **re-aim** the run: the orchestrator is re-notified and
   re-triages.
@@ -186,13 +186,13 @@ autonomous is off, and turning autonomous off turns this off too).
 chip; `gh issue edit <n> --add-label agent-hold` does the same thing. The label is
 created on demand with the description *"Held by the human — full-autonomy agents
 must not start this"*, so it reads correctly on GitHub for anyone who's never seen
-loomux.
+orrerix.
 
 **If your repo renamed it** (`intake.labels.hold:` in `.loomux/workflow.yml`),
 `agent-hold` above is simply not your veto — substitute your own spelling
 throughout this page, including in the hand-typed `gh` command.
 
-The rule, rather than a list of places: **nothing in loomux names the veto by a
+The rule, rather than a list of places: **nothing in orrerix names the veto by a
 built-in literal.** Every surface that mentions it — what the poller excludes,
 what the hold button writes, what the label allow-list permits and creates, what
 the orchestrator's contract, kickoff config and toggle notice say, and what the
@@ -202,7 +202,7 @@ which is why it is the name used everywhere in this documentation. A veto only
 some layers can see is not a veto, so the resolution is the mechanism rather
 than a set of places that has to be kept in sync.
 
-- **loomux's half is host-side and zero-token:** a held issue is excluded from the
+- **orrerix's half is host-side and zero-token:** a held issue is excluded from the
   eligible-work signal the intake poll produces, so the orchestrator is never even
   woken about it. Matching is case-insensitive, and a repo that renamed the label
   has *its* spelling honored — a veto that silently didn't match would be the one
@@ -274,7 +274,7 @@ money-stop.
   current token total as an anchor; the meter counts spend **since that moment**,
   not lifetime history. The panel shows a live spend-vs-budget meter.
 - **Crossing the cap suspends autonomy — unconditionally.** When autonomous-era
-  spend reaches the budget, loomux **turns autonomous mode off**, delivers a single
+  spend reaches the budget, orrerix **turns autonomous mode off**, delivers a single
   notice, and shows a distinct **"suspended: budget exhausted"** banner (separate
   from a plain toggle-off). This money-stop fires even if the underlying state file
   can't be written — continued spend past the cap is the one thing this feature
@@ -289,7 +289,7 @@ money-stop.
 ## The merge & release gate
 
 "Never merge" is **structurally enforced**, not merely instructed — an instruction
-in a prompt is not a boundary. Every agent pane runs behind a loomux `gh` / `git`
+in a prompt is not a boundary. Every agent pane runs behind an orrerix `gh` / `git`
 shim that **blocks** a default-branch merge or a release/tag publish unless it's
 authorized.
 
@@ -366,7 +366,7 @@ each one**, while you supervise.
 - **Only while *not* autonomous.** Dangerous mode is the supervised counterpart to
   autonomous, and the two are **mutually exclusive**, enforced both ways:
 
-  | You do… | …and loomux |
+  | You do… | …and orrerix |
   | --- | --- |
   | Enable dangerous mode while autonomous is on | **rejects it** with a clear error |
   | Enable autonomous while dangerous mode is on | **force-clears** dangerous mode (with a notice) |
@@ -408,7 +408,7 @@ approve-with-comment path:
   PR and any per-item notes — instead of once per PR.
 - Grants are written **only by these human surfaces** (board Approve and the
   grant commands) — **no agent tool can mint one.** Agents *consume* a grant through
-  the shim; they never create one through loomux.
+  the shim; they never create one through orrerix.
 
 This is why simply clicking **Approve** works even with every blanket toggle off:
 Approve writes the grant.

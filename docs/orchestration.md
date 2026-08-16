@@ -16,7 +16,7 @@ nav_order: 4
 
 ---
 
-Loomux's headline feature is a native **orchestrator / worker** pattern: a
+Orrerix's headline feature is a native **orchestrator / worker** pattern: a
 long-lived planning agent that manages a small fleet of worker agents, each in
 its own visible pane, with a reviewer agent per PR and an optional **planner**
 that scopes bigger work first. You gatekeep only the final review and merge.
@@ -39,7 +39,7 @@ in an audit log.
    configured providers actually expose, for OpenCode; the CLI's own help for the
    others — so new models appear automatically, with a custom-entry escape hatch.
 
-   Loomux also asks each CLI directly which models *this machine and this
+   Orrerix also asks each CLI directly which models *this machine and this
    account* can actually run, and what each one supports — the same list your
    CLI's own model picker would show. What comes back adds rows to the dropdown
    (nothing is ever removed), labels each with the CLI's own name for it, and
@@ -48,25 +48,25 @@ in an audit log.
    CLI reports for the selected model then become the ones the **thinking
    level** knob offers.
 
-   This happens **automatically, once, when loomux starts** — there is nothing
+   This happens **automatically, once, when orrerix starts** — there is nothing
    to click. Detection runs in the background, so a picker you open in the first
    seconds may show its built-in suggestions for a moment and fill in the real
-   list as the answer arrives. A CLI you install *while loomux is running* is
+   list as the answer arrives. A CLI you install *while orrerix is running* is
    not detected until you restart it.
 
    **Copilot CLI is the exception on both counts.** It has no supported way to
    list its models — its help no longer enumerates them, and it answers neither
    of the questions above — so its dropdown is a built-in catalog of the models
-   Copilot offers, kept in loomux rather than read from your machine.
+   Copilot offers, kept in orrerix rather than read from your machine.
 
    That list is Copilot's product catalog, not your account's, and it can go out
-   of date between loomux releases. So it can disagree with what you can
+   of date between orrerix releases. So it can disagree with what you can
    actually run **in both directions**: it may offer a model your plan does not
    include — picking one fails at launch rather than being hidden, which is
-   deliberate, since loomux would otherwise have to guess your entitlements —
+   deliberate, since orrerix would otherwise have to guess your entitlements —
    and it may omit a model your plan *does* include, whether because your
    account has access the general catalog does not list or because the model is
-   newer than your build of loomux. **The custom-entry box is the answer to
+   newer than your build of orrerix. **The custom-entry box is the answer to
    every one of those cases:** type the id and it is used as-is. If your Copilot
    CLI offers a model this dropdown does not, that is expected rather than a
    sign it is unavailable to you.
@@ -96,16 +96,16 @@ Beside each role's CLI and model select, the launcher offers two more
 per-role knobs: **thinking level** and **context window** — three knobs in
 total (model, thinking level, context) for each of orchestrator, worker,
 reviewer, and planner. All three default to **CLI default** — the empty
-value, which loomux emits nothing for, so the CLI runs exactly as it would
+value, which orrerix emits nothing for, so the CLI runs exactly as it would
 with no flag at all.
 
 - **Thinking level** sets how hard the model reasons before answering
   (`low`/`medium`/`high`/`xhigh`/`max`), on Claude Code only. Copilot CLI and
   Gemini CLI grey the control out with a reason shown inline: Copilot's
   effort level lives in `~/.copilot/settings.json` with no flag or
-  environment variable to set it, and loomux never writes a user's global
+  environment variable to set it, and orrerix never writes a user's global
   settings file to reach it; Gemini's thinking level is a settings-file key
-  too (`modelConfigs.aliases.<alias>.thinkingConfig`) — the seam loomux uses
+  too (`modelConfigs.aliases.<alias>.thinkingConfig`) — the seam orrerix uses
   to generate a per-agent Gemini settings file already exists, but the key's
   schema needs a live check against a running Gemini CLI, so the knob stays
   disabled until that's verified.
@@ -125,16 +125,16 @@ inline as the control's own hint — never silently ignored:
   `opusplan` families — `haiku`, `fable`, `best` and `default` each grey out
   with their own reason (there is no `haiku[1m]` or `fable[1m]`; `best` and
   `default` resolve per account, so there's no fixed name to append the
-  suffix to). A model id loomux doesn't recognize — a full model name it
+  suffix to). A model id orrerix doesn't recognize — a full model name it
   hasn't seen, or a Bedrock/Vertex/Foundry deployment name — leaves the knob
-  **enabled** instead: loomux only disables what it can affirmatively rule
+  **enabled** instead: orrerix only disables what it can affirmatively rule
   out, never what it merely doesn't know, since on those providers the
   suffix is exactly how the 1M window gets selected.
 
 A knob that clears both checks is still an entitlement, not a guarantee:
 `opus[1m]` is a real, documented alias, but `[1m]` access is plan- and
 credit-gated on Claude's side, so picking it for an account that can't serve
-it fails visibly at the CLI, in the pane — loomux doesn't pre-judge your
+it fails visibly at the CLI, in the pane — orrerix doesn't pre-judge your
 account's entitlements by hiding the option. That's a different failure from
 the model gate above: the model gate hides a suffix that has no defined
 meaning at all, while the entitlement case leaves a meaningful suffix
@@ -155,12 +155,12 @@ click away from the block and back. See
 and the `author-loomux-workflow` skill.
 
 **Permissions** are either *Auto* (Claude Code's native auto permission mode plus
-pre-approved `git`/`gh` and loomux agent tools — recommended) or *Accept edits
-only*. Loomux never uses `--dangerously-skip-permissions`.
+pre-approved `git`/`gh` and orrerix agent tools — recommended) or *Accept edits
+only*. Orrerix never uses `--dangerously-skip-permissions`.
 
 Under *Auto*, **group Copilot** agents run in Copilot's true **autopilot mode**
 (`--autopilot`) — an unattended worker should persist autonomously rather than
-pause to ask — and loomux answers the resulting "Enable autopilot mode" consent
+pause to ask — and orrerix answers the resulting "Enable autopilot mode" consent
 dialog for them automatically at spawn (your group-level *Auto* choice is the
 consent). A lone Copilot pane launched with the **Autopilot** checkbox on gets
 the same flags and the same dialog-answering watcher — see
@@ -205,19 +205,19 @@ What the confirm tells you before anything happens:
 
 The item is offered on standalone **Claude** agent panes. It's greyed with the
 reason on an agent pane that can't be promoted *yet* — a non-Claude CLI, a pane
-loomux hasn't learned a session id for (send it a prompt first: an agent nobody
+orrerix hasn't learned a session id for (send it a prompt first: an agent nobody
 has spoken to has no conversation to carry over), or a pane with no working
 directory to make the group's repo — and it isn't offered at all on a shell pane,
 a pane running something that isn't an agent CLI, or a pane that already belongs
 to an orchestration group.
-loomux also refuses a session that was *ever* a recorded member of a group, even
+orrerix also refuses a session that was *ever* a recorded member of a group, even
 a long-dormant one: a delegate's transcript carries a delegate's contract, and
 two role contracts in one session is not a thing to seat on purpose. Every
 refusal says which one it is, and a refused promotion changes nothing at all —
 the pane keeps running exactly as it was.
 
 If the relaunch itself fails after the old process was stopped (a spawn that
-doesn't come up, a bind that times out), loomux does **not** quietly start a new
+doesn't come up, a bind that times out), orrerix does **not** quietly start a new
 session in its place — that would look like success while discarding the very
 thing you promoted. The group is already durable on disk, so the toast names it
 and points you at its **Resume** card in the session browser, which brings the
@@ -228,7 +228,7 @@ promote a pane, its own or anyone else's.
 
 ## How it works
 
-Loomux hosts a local **MCP server**; every agent pane in a group connects with
+Orrerix hosts a local **MCP server**; every agent pane in a group connects with
 its own identity token (`--strict-mcp-config`, so workers see nothing else). The
 orchestrator:
 
@@ -268,17 +268,17 @@ commit`/`git push` are denied.
 
 What it *is* pre-approved for, since a planner runs with no human in its pane to
 approve anything: read-only shell and `git`, `gh` (it reads the issue and posts
-its plan through it), the loomux tools, and — so it can ground a plan in a
+its plan through it), the orrerix tools, and — so it can ground a plan in a
 vendor's actual reference docs rather than in recall — `WebFetch`/`WebSearch`.
 That last pair means a planner pane can reach arbitrary hosts, which is worth
 knowing if you plan on sensitive repositories; to switch it off, add a `WebFetch`
 (or `WebSearch`) entry to `permissions.deny` in the repository's own
-`.claude/settings.json` — a deny rule there beats anything loomux pre-approves.
-Running a build or test command is *not* pre-approved, and loomux offers no way to
+`.claude/settings.json` — a deny rule there beats anything orrerix pre-approves.
+Running a build or test command is *not* pre-approved, and orrerix offers no way to
 widen that — a planner's persona `allow:` patterns are dropped, unconditionally.
 Your own `.claude/settings.json` can still add one if you decide to: permission
 rules merge across scopes rather than override — the same merge rule that makes
-the `WebFetch` switch-off above work. So what loomux *denies* there is no way to
+the `WebFetch` switch-off above work. So what orrerix *denies* there is no way to
 allow, but what it merely leaves out of its allow-list — general `Bash`, and so
 `cargo check` — a repo-level `permissions.allow` can grant. Absent that, a plan
 will say when it could not confirm something by running it.
@@ -309,7 +309,7 @@ next starts on that repo.
 You can apply `agent-ready` / `agent-investigation` / `agent-hold` straight from
 the [GitHub issues view](features/github-issues.html) — toggle the **ready**,
 **investigate** or **hold** control on an issue row. If the repo doesn't have these labels
-yet, loomux creates the one you toggle on first use (only these allow-listed
+yet, orrerix creates the one you toggle on first use (only these allow-listed
 labels are ever created).
 
 ## The task board
@@ -347,7 +347,7 @@ Board controls:
   depends on the PR's **base branch**, which the orchestrator records on the
   task alongside the PR itself:
   - **Base is the default branch** (or the orchestrator recorded no base, or
-    loomux could not resolve the repo's default branch) — the warning above.
+    orrerix could not resolve the repo's default branch) — the warning above.
     Unknown is treated as "assume the default branch": a board that guessed the
     other way would quietly downplay a merge straight into `main`.
   - **Base is some other branch** — a stacked sub-PR into an integration
@@ -358,12 +358,12 @@ Board controls:
 
   This narrows the **story**, not the gate. A custom workflow's merge gate
   applies to every merge of a PR wherever it lands, integration branches
-  included, and it is enforced against the base ref loomux resolves live at
+  included, and it is enforced against the base ref orrerix resolves live at
   merge time — never against what a task says. The recorded base is display
   metadata the orchestrator writes, so treat it the way you'd treat any other
   board text: informative, not authoritative. Two ways the label can be
   *wrong-but-harmless*, both worth knowing: the orchestrator can record a stale
-  base if it retargets the PR without updating the board, and loomux reads your
+  base if it retargets the PR without updating the board, and orrerix reads your
   repo's default branch from the clone's own refs rather than fetching, so a
   default branch renamed on the remote reads as the old name until something
   fetches. Either way the worst case is a sentence that misdescribes the PR —
@@ -536,7 +536,7 @@ These deserve their own detail — see:
   blocked, when a task hits a human merge gate, or when the orchestrator (or a
   liaison pane, if the group's workflow has one) has a question pending your
   answer. Hovering the question chip shows a live count; clicking it focuses
-  the pane and acknowledges the chip — acknowledging only tells loomux you've
+  the pane and acknowledges the chip — acknowledging only tells orrerix you've
   seen it, so a chip that's still genuinely true comes right back on the next
   scan.
   - **The NEEDS-YOU panel** (`Alt+Q`, or the raised-hand icon in an
@@ -569,13 +569,13 @@ These deserve their own detail — see:
     still a separate, orchestrator-only path: `withdraw_question` settles an
     overtaken question too, just as *withdrawn* rather than answered, and
     that was already true before this panel shipped.
-  - **loomux's protocol is that no agent asks you through a blocking
+  - **orrerix's protocol is that no agent asks you through a blocking
     dialog.** The orchestrator's role instructions — and a liaison pane's,
     where the group's workflow declares one — call for filing every question
     through `ask_human` instead of a CLI's own interactive-question dialog,
     because a dialog holds the whole pane and refuses every delivery queued
     behind it. That is instruction an agent follows, not yet something
-    loomux enforces structurally on every CLI, so treat it as the norm
+    orrerix enforces structurally on every CLI, so treat it as the norm
     rather than a hard guarantee.
   - An optional per-group **desktop notification** toggle (🔔 in the lifecycle
     panel) raises an OS toast the first time a question needs your answer
@@ -585,13 +585,13 @@ These deserve their own detail — see:
     and the NEEDS-YOU panel are where you see those.
   - Most chips clear themselves: they're recomputed every few seconds, and
     clicking one focuses the pane and acknowledges it.
-  - The red **⚠ stuck prompt** chip is the exception. It means a prompt loomux
-    sent was never submitted, and it stays up until loomux has evidence the pane
-    is fine again. loomux keeps looking for that evidence for as long as the chip
+  - The red **⚠ stuck prompt** chip is the exception. It means a prompt orrerix
+    sent was never submitted, and it stays up until orrerix has evidence the pane
+    is fine again. orrerix keeps looking for that evidence for as long as the chip
     is up — every half-minute or so it re-reads the pane, even long after the
     delivery that raised the chip has been given up on. If the prompt has left the
     box **and** you have typed in that pane since, the chip comes down on its own;
-    if the prompt is still sitting there, or loomux cannot read enough of the pane
+    if the prompt is still sitting there, or orrerix cannot read enough of the pane
     to tell, the chip stays, because taking it down would be the one mistake it
     exists to prevent.
   - Some chips have no reading that could ever release them — one reporting
@@ -599,7 +599,7 @@ These deserve their own detail — see:
     that already happened. So that chip carries its own **✕ dismiss** button
     beside it. Clicking ✕ takes the chip down for good, whatever raised it.
   - **✕ takes the chip down and nothing else.** It does not unstick the pane, and
-    loomux never presses Enter on your behalf because you dismissed something. If
+    orrerix never presses Enter on your behalf because you dismissed something. If
     the prompt really is still sitting unsubmitted in that pane's input box, it
     still is afterwards — so if you're not sure, look at the pane first (hover the
     chip: it says what it thinks is blocking). Every dismissal is written to the
@@ -607,14 +607,14 @@ These deserve their own detail — see:
     chip you cleared can always be looked up later.
   - **The ⛔ held on a dialog chip** is the most urgent of all — it outranks even
     a worker reporting blocked. It only ever appears on the **orchestrator's own**
-    pane, and only while loomux is **actively trying to deliver something to it
+    pane, and only while orrerix is **actively trying to deliver something to it
     right now** and finding its CLI's own interactive-question dialog on screen:
     on Claude that dialog is denied outright (see below), but not every CLI
-    loomux supports can be told to refuse it at that level, so this chip is the
+    orrerix supports can be told to refuse it at that level, so this chip is the
     fallback that still tells you a held orchestrator pane is stranding every
     delegate's report queued behind it, not just its own. It comes down the
     moment that delivery attempt stops holding — either because the dialog
-    cleared, or because the attempt gave up waiting (loomux tries again shortly
+    cleared, or because the attempt gave up waiting (orrerix tries again shortly
     after, and the chip returns then if the dialog is still there) — so it never
     needs a dismiss, but it can also briefly drop even while the dialog is still
     up between one attempt ending and the next one starting.
@@ -638,14 +638,14 @@ These deserve their own detail — see:
   record. Read-only, and it states its own coverage boundaries — what it is
   *not* showing is printed under the chart rather than left to look like quiet.
 - **Delivery queue.** If a pane is busy — an interactive question on screen, or a
-  human's own line still sitting in its input box — loomux holds a prompt
+  human's own line still sitting in its input box — orrerix holds a prompt
   delivery rather than typing over it. A hold that never clears **queues** the
   prompt instead of dropping it: nothing is lost, there's no timeout (you might
   be away for hours), and the queue drains automatically, in order, the moment
   the pane is free again — the first thing it delivers is a one-line summary of
   what was waiting. One exception to "no timeout", and it only ever moves a queue
   *forward*: if the hold is the interactive-question one, and after 15 minutes the
-  pane's own screen still shows its ordinary input box, loomux stops believing its
+  pane's own screen still shows its ordinary input box, orrerix stops believing its
   own question detection and pastes anyway (you'll have had the "stuck behind a
   question" badge for five minutes by then). It does **not** stop checking before
   it presses Enter — if a real dialog is up at that moment the Enter is still
@@ -656,7 +656,7 @@ These deserve their own detail — see:
   would just create a duplicate); a payload is only ever reported gone if the
   notice says **DROPPED** (the pane's queue was already full, or the agent's
   pane closed while entries were still waiting). The orchestrator's *own* pane
-  is the one case loomux can't announce this way — a prompt about that pane's
+  is the one case orrerix can't announce this way — a prompt about that pane's
   blocked delivery would queue behind the very block it reports — so those
   notices ride back to the orchestrator on the result of its next tool call
   instead, and you'll see them in the audit viewer either way.
@@ -679,7 +679,7 @@ These deserve their own detail — see:
   it was refused. Deliveries whose sender has since got them through are
   *marked* as re-sent rather than dropped from the list — the receiving pane
   can't tell the difference from the outside, and a list that quietly omitted
-  them would read as "these are all still missing". Loomux never re-sends them
+  them would read as "these are all still missing". Orrerix never re-sends them
   itself: the senders were told at the time, so the roster names who to ask.
   It's bounded (the newest few, with the rest counted and left in the audit
   log), fires once per drain rather than once per delivery, and obeys the same
@@ -692,7 +692,7 @@ These deserve their own detail — see:
 Distinct from the 🔔 desktop-notification toggle above — that raises a toast for *you*; this
 notice goes to the *agent*, typed into its own pane. Agents don't sit watching a PR's CI:
 the orchestrator, workers, and reviewers can register a background watch — a PR's checks, or
-a specific GitHub Actions run — and go do other work; loomux polls in the background (every
+a specific GitHub Actions run — and go do other work; orrerix polls in the background (every
 30s) and types a `[loomux] PR #241 checks: SUCCESS — … (watch n-3)`-style notice into the
 registering agent's own pane the moment it resolves, expires, or fails repeatedly. A watch is
 capped (4 per agent / 12 per group) and time-bounded (5–240 min, default 60). Pausing a group
@@ -700,7 +700,7 @@ freezes a watch entirely (no polling, firing, or expiry) until you resume it.
 
 Watches live only in memory, and the two ways an agent loses track of one are different:
 a `/compact` drops the agent's *memory* of a watch (the watch itself is still registered and
-still live), so it re-lists to recover what it was waiting on; closing loomux drops the watch
+still live), so it re-lists to recover what it was waiting on; closing orrerix drops the watch
 *itself* — the registry is empty on the next launch — so it must be re-registered from
 scratch, not merely re-listed.
 
@@ -726,9 +726,9 @@ gets a notice, and `watchdog-suppressed` audit lines mark the wait the whole tim
 
 **When a notice can't get in.** A `[loomux]` notice is typed into the agent's pane, and a pane
 that is mid-turn can't take one — so if an agent blocks its own turn waiting on the very thing
-the notice would tell it about, the notice sits in that pane's queue and nothing clears. Loomux
+the notice would tell it about, the notice sits in that pane's queue and nothing clears. Orrerix
 watches for exactly that shape: a pane that has accepted nothing for ten minutes while holding
-one of loomux's own notices gets a `[loomux] notice undeliverable 10 min: … — pane mid-turn …`
+one of orrerix's own notices gets a `[loomux] notice undeliverable 10 min: … — pane mid-turn …`
 sent to the group's orchestrator (and to the audit viewer as `notice-undeliverable`), alongside
 the ⏸ held chip and the needs-attention badge you'd see anyway. The message says which of the
 three it looked like — a pane mid-turn, a human's own line in the box, or a dialog waiting for an
@@ -736,45 +736,45 @@ answer — because those need different things from you. If the stuck pane is th
 own, the notice rides back on its next tool call instead of being typed into it.
 
 **When you fix a stuck prompt yourself.** A **⚠ stuck prompt** chip means a prompt was typed
-into that pane but never submitted, and loomux queues a repair — one Enter, held back until the
+into that pane but never submitted, and orrerix queues a repair — one Enter, held back until the
 pane is safe to write to. If you get there first (click into the pane and press Enter, or clear
-the box), loomux now checks the pane rather than the keyboard: once the prompt is no longer
+the box), orrerix now checks the pane rather than the keyboard: once the prompt is no longer
 sitting in the box, the repair is dropped instead of pressed a second time, the chip comes down,
 and anything queued behind it — steering messages, worker reports — starts flowing again on the
 next poll. Before this, your fix was invisible to the queue, and continuing to type in that pane
 kept the repair pending indefinitely, silently holding everything behind it.
 
-The repair is only ever dropped once loomux can *see* that the prompt has left the box. While
-it is still sitting there, loomux keeps waiting for a safe moment to press Enter — because the
+The repair is only ever dropped once orrerix can *see* that the prompt has left the box. While
+it is still sitting there, orrerix keeps waiting for a safe moment to press Enter — because the
 alternative is pasting the next message on top of it and sending the two merged into one. So a
 pane blocked by your own half-typed line, or by a dialog waiting for an answer, still holds its
 queue, and the chip is what tells you it needs you.
 
 **And on a pane nobody is delivering to any more.** The check above rides a repair or a
-delivery, so it used to stop once loomux gave up on the pane — after which a chip on a
+delivery, so it used to stop once orrerix gave up on the pane — after which a chip on a
 finished worker or a drained orchestrator could stay up until you restarted. It no longer
-does: for as long as a **⚠ stuck prompt** chip is up, loomux re-reads that pane every half
+does: for as long as a **⚠ stuck prompt** chip is up, orrerix re-reads that pane every half
 minute and applies the same rule. Two things have to be true together for the chip to come
 down by itself — the prompt is no longer in the box, **and** you have typed in that pane
-since loomux submitted it. Either alone is not enough, deliberately: a prompt that vanished
+since orrerix submitted it. Either alone is not enough, deliberately: a prompt that vanished
 with nobody at the keyboard is exactly the case where the chip is the only trace left of it,
 and a keystroke on its own says nothing about where the prompt went.
 
-Between those, the wording can still change under you. A chip that said loomux could not
+Between those, the wording can still change under you. A chip that said orrerix could not
 read the pane, or that its repair attempts were used up, becomes "its text is gone — check
-the pane" once loomux can see the box is clear. That is the chip getting more honest, not a
+the pane" once orrerix can see the box is clear. That is the chip getting more honest, not a
 new problem: it stays up, and it stays up until you deal with it or dismiss it. Whatever
-takes a chip down — your ✕, or loomux's own reading — is written to the group's audit log
+takes a chip down — your ✕, or orrerix's own reading — is written to the group's audit log
 with what it was and what was read, so you can always look up where one went.
 
-**One chip is answered by loomux retrying, not by loomux looking.** A **⚠ stuck prompt** chip
+**One chip is answered by orrerix retrying, not by orrerix looking.** A **⚠ stuck prompt** chip
 that says the repair could not even be *queued* — the pane already had the maximum number of
 messages waiting — is not a claim about what is in the box, so re-reading the pane could never
-settle it. Instead, once that pane's queue has drained and nothing is delivering to it, loomux
+settle it. Instead, once that pane's queue has drained and nothing is delivering to it, orrerix
 queues the repair it could not queue before, and the chip changes to "loomux is re-sending it".
 From there it behaves like any other repair: held back until the pane is safe to write to,
 dropped if you get there first, and gone once the message lands. If the queue is still full, or
-a delivery is in progress, the chip stays exactly as it was and loomux tries again shortly —
+a delivery is in progress, the chip stays exactly as it was and orrerix tries again shortly —
 nothing is taken down on a guess. Before this the repair was simply never attempted again, so a
 pane that filled up once could carry that chip until you restarted, with the prompt still
 sitting unsent in its box.
@@ -793,12 +793,12 @@ the **advanced orchestrator** on):
 resources:
   build:
     slots: 1              # how many agents may hold it at once — 1 is a mutex
-    max_hold_minutes: 45  # loomux takes it back after this, whatever happens
+    max_hold_minutes: 45  # orrerix takes it back after this, whatever happens
   gpu:
     slots: 2              # omitting max_hold_minutes means the default, 30
 ```
 
-What a resource *means* is entirely yours — loomux never learns that `build` is a compiler.
+What a resource *means* is entirely yours — orrerix never learns that `build` is a compiler.
 It knows the name, the slot count and the clock. Declare nothing and the feature is off:
 the agents in that group are not even offered the tools.
 
@@ -835,8 +835,8 @@ a notice that will never arrive. An agent that changes its mind can call `releas
 queued to withdraw, so nobody sits behind a slot it no longer wants.
 
 **A lock always comes back.** Three things can end a hold: the holder releases it, the holder's
-pane dies (loomux reclaims it immediately and hands it to whoever is next), or the hold runs
-past `max_hold_minutes` (loomux reclaims it and tells the ex-holder its work is no longer
+pane dies (orrerix reclaims it immediately and hands it to whoever is next), or the hold runs
+past `max_hold_minutes` (orrerix reclaims it and tells the ex-holder its work is no longer
 serialized, so it can re-acquire). There is no state in which a resource is stuck forever
 because an agent forgot.
 
@@ -855,11 +855,11 @@ when a reclaim is imminent. The audit viewer (`Alt+A`) has a sentence for each l
 event — taken, queued, released, granted, reclaimed, timed out — so "why did that build take
 40 minutes" is answerable after the fact.
 
-Lock state lives in memory only. Closing loomux clears it, which is the right answer: every
+Lock state lives in memory only. Closing orrerix clears it, which is the right answer: every
 pane that could have been holding a lock died with it.
 
 **It is cooperative, and deliberately so.** A lock is taken because an agent asked for one —
-loomux does not intercept your build command, and an agent that never calls `acquire_lock` is
+orrerix does not intercept your build command, and an agent that never calls `acquire_lock` is
 not stopped. An earlier design tried to enforce this by shadowing the guarded program on
 `PATH`, and it was abandoned: a shim only catches the shells it shadows, so the guarantee it
 appeared to give was not one it could keep. Advisory locking that is honest about being
@@ -926,7 +926,7 @@ command), a claude/copilot pane launched with the checkbox off, or any pane that
 already running before its channel tools were wired up, becomes connectable the first
 time you right-click it: it joins as a **receive-only** member (a dashed variant of the
 chip, instead of solid) — it can never be the sender, and its direction is always ▼. This
-is a structural fact, not a bug: those CLIs have no way for loomux to hand them a
+is a structural fact, not a bug: those CLIs have no way for orrerix to hand them a
 channel-send capability today (tracked as a follow-up), and an already-running pane
 can't be handed one either without restarting it. A receive-only pane still gets every message the sender sends it — it just
 can't talk back.
@@ -947,7 +947,7 @@ whole channel closes and every remaining pane is notified: a channel with no one
 is as dead as one with only a single member left, and there's no automatic promotion (a
 human always picks who sends).
 
-**Limits.** Channels are **in-memory only** — closing loomux drops every channel;
+**Limits.** Channels are **in-memory only** — closing orrerix drops every channel;
 after a restart, reconnect the panes you want linked. A pane holds **at most one channel**
 at a time (see Multi-party, above). Full (sender-capable) standalone membership only works
 for claude/copilot today — see "Standalone panes" above.
@@ -960,10 +960,10 @@ agent's state, and running session cost with a group total.
 
 **Where those cost figures come from.** Tokens are exact — read from each CLI's own
 record of the session, never scraped off the pane. Dollars depend on the CLI. For
-Claude Code, loomux prices the tokens itself against a dated table, so the figure is
+Claude Code, orrerix prices the tokens itself against a dated table, so the figure is
 an **estimate** — and on a subscription/Max account the real marginal cost is $0
 regardless, which is why tokens are the honest metric there. OpenCode prices its own
-sessions, so loomux **reports** its number instead of guessing one (including a
+sessions, so orrerix **reports** its number instead of guessing one (including a
 genuine $0.00 on a free model, which is an answer, not a blank). Each total is
 labelled accordingly — *estimated*, *reported*, or *mixed* for a group running both.
 A CLI with no readable record falls back to whatever dollar figure it prints in its
@@ -971,14 +971,14 @@ own statusline, which disappears when the pane does.
 
 From the lifecycle panel you can:
 
-- **Pause** the group — loomux stops delivering prompts so its agents finish
+- **Pause** the group — orrerix stops delivering prompts so its agents finish
   their turn and idle out (reversible with resume). **Pausing holds deliveries
   rather than dropping them**: nothing is typed into a pane while you're
   paused, so nobody spends tokens, but a worker's `done` report fired
   mid-pause is queued — on disk, so it survives a restart taken during the
   pause — and delivered when you resume, labelled as having waited on the
   pause rather than on a blocked pane. An agent *spawned* during a pause is
-  held the same way, and resumes as the boot it is: loomux still waits for
+  held the same way, and resumes as the boot it is: orrerix still waits for
   its CLI to finish painting and still answers Copilot's "Enable autopilot
   mode" dialog before typing the brief, instead of pasting into a half-booted
   pane and leaving the agent sitting at a consent dialog nobody dismissed.
@@ -993,7 +993,7 @@ From the lifecycle panel you can:
   confirm; it's destructive). An optional **remove worktrees** checkbox also
   deletes each agent's git worktree — uncommitted changes are lost, but the
   branches (where the PRs live) are always kept.
-- **Max live agents** stepper (1–12) — adjust the cap on the fly; loomux
+- **Max live agents** stepper (1–12) — adjust the cap on the fly; orrerix
   persists it, audits the change, and tells the orchestrator to re-plan against
   the new ceiling. Lowering the cap below the current live count never kills
   anyone — it just blocks new spawns until attrition brings the count back under.
@@ -1029,7 +1029,7 @@ for the full design.
 bound to the commit it reviewed, so a re-push re-opens the gate. The PR *body*
 is not part of that commit — and a squash merge turns it into the permanent
 commit message, so a body edited after a reviewer passed lands text nobody
-reviewed. loomux always records a digest of the body a verdict reviewed and
+reviewed. orrerix always records a digest of the body a verdict reviewed and
 tells the orchestrator when it has moved (on a `pass`: the approval no longer
 covers what would be committed; on a `fail`: the finding may already be fixed).
 Adding `body-unchanged` to your gate's `also:` list also *refuses the merge*
@@ -1062,26 +1062,26 @@ prevent. A human Approve grant still never opens the workflow gate by itself
 (see *The task board*, above); toggling the workflow off is what actually
 clears it.
 
-**loomux never silently arms a gate it can't satisfy.** If a workflow's merge
+**orrerix never silently arms a gate it can't satisfy.** If a workflow's merge
 gate names reviewer blocks the currently-running roster can't actually spawn —
-most commonly a broken or missing `workflow.yml` on a relaunch — loomux
+most commonly a broken or missing `workflow.yml` on a relaunch — orrerix
 doesn't drop the gate to keep merges flowing; it arms the gate anyway and
 shows a loud warning in the lifecycle panel, so the mismatch is something you
 see rather than something a bounced merge makes you go find.
 
-**Copilot personas: a `tools:` list must let loomux through.** If a block sets
+**Copilot personas: a `tools:` list must let orrerix through.** If a block sets
 `cli: copilot` and points `profile:` at a `.github/agents/*.md` file, Copilot
 loads that file directly — and if the file declares a `tools:` list, that list
 *filters* everything the agent can reach, MCP servers included. A list that
 never names loomux produces a delegate that can see the loomux server and use
 none of it: it cannot report, read the task board, or be steered, and from
-inside its own pane it looks like loomux is broken. Add the server to the list:
+inside its own pane it looks like orrerix is broken. Add the server to the list:
 
 ```yaml
 tools: ["read", "edit", "execute", "loomux/*"]
 ```
 
-loomux repairs this for you where it safely can — it launches such a block from
+orrerix repairs this for you where it safely can — it launches such a block from
 its own stand-in for the persona, carrying every line of your file plus that
 grant, and never edits anything in your repo — but it always tells you, in the
 spawn reply and the audit log, which file to fix.
@@ -1089,20 +1089,20 @@ spawn reply and the audit log, which file to fix.
 Three cases it deliberately leaves alone, because each is a choice you made
 rather than something you forgot. It says so, and the fix is yours:
 
-- the persona declares its own `mcp-servers:` — loomux's stand-in would drop them;
-- `tools: []`, which disables every tool — loomux won't turn "nothing" into
+- the persona declares its own `mcp-servers:` — orrerix's stand-in would drop them;
+- `tools: []`, which disables every tool — orrerix won't turn "nothing" into
   "nothing except loomux";
-- the list already names loomux per-tool (`loomux/report`) — loomux won't widen a
+- the list already names loomux per-tool (`loomux/report`) — orrerix won't widen a
   scope you set on purpose.
 
 **Picking a block's model.** The workflow pane's block form offers the same
 model dropdown the launcher does, filled the same way: the CLI's own reported
-models first, backed by loomux's suggestions, plus a **custom…** entry for any
+models first, backed by orrerix's suggestions, plus a **custom…** entry for any
 id neither list carries (a Bedrock inference profile, a gateway deployment
-name, a model newer than your build). A CLI loomux has no suggestions for and
+name, a model newer than your build). A CLI orrerix has no suggestions for and
 can't get a list out of gives you that free-text box directly. Leaving the
 model **unset** is a real choice with its own row: the block then runs
-whatever loomux defaults to for its kind on its CLI — `sonnet`/`opus` on
+whatever orrerix defaults to for its kind on its CLI — `sonnet`/`opus` on
 Claude Code, `auto` on Copilot, `pro` on Gemini, and on OpenCode no `--model`
 at all, so your own config decides.
 
@@ -1113,18 +1113,18 @@ described elsewhere on this page, each with an enable-toggle and its fields.
 The block form covers the rest: `role_hint`, and `allow:` as a list of tool
 patterns (one row per pattern, because a real pattern contains commas). The one
 key with no control is `authored_with:`, and deliberately — it records which
-loomux *created* the file, is stamped once, and a save must never invent or
+orrerix *created* the file, is stamped once, and a save must never invent or
 restamp it.
 
-Two things those forms will not let you do, because loomux's engine would
+Two things those forms will not let you do, because orrerix's engine would
 refuse the file: write a number outside a field's range (the inputs clamp —
 slots 1–64, max hold 1–480 minutes, at most 32 resources, a batch of at least
 1), and pair a `role_hint` with a kind that hint does not apply to. A value a
 *hand-edited* file already carries is shown as a finding instead, with the
-distinction that matters spelled out — a bound loomux **refuses** reads as an
+distinction that matters spelled out — a bound orrerix **refuses** reads as an
 error, one it **clamps** (`checks_timeout_minutes`) as a warning.
 
-An untouched section is never rewritten. loomux writes only what the file
+An untouched section is never rewritten. orrerix writes only what the file
 declares, so opening these forms to look at them changes nothing, and a section
 you tick on and then off again leaves the file exactly as it was — including
 its comments.
@@ -1133,7 +1133,7 @@ its comments.
 per-block, so nothing stops a reviewer lane from running on a different
 CLI/model than the one that wrote the code — a second model tends to catch a
 different class of defect than the one already primed on its own output.
-Worth considering for any reviewer-heavy workflow; loomux's own dogfood
+Worth considering for any reviewer-heavy workflow; orrerix's own dogfood
 `.loomux/workflow.yml` notes the same above its reviewer blocks.
 
 ### Turning on the merge queue
@@ -1162,7 +1162,7 @@ Three things worth knowing before you enable it:
 - **`checks_timeout_minutes` is a backstop, not the mechanism.** A batch normally resolves
   when its checks do. The timeout exists so a repo whose CI never attaches surfaces as
   **unverifiable** — loudly, with nothing landed — instead of a batch sitting pending forever.
-- **Adding the block is not inert to older loomux builds.** The workflow file rejects keys it
+- **Adding the block is not inert to older orrerix builds.** The workflow file rejects keys it
   does not recognize, so on a build that predates the merge queue, `merge_queue:` fails the
   parse of the **whole file** — your `gates:` included — rather than being ignored. That is
   deliberate (a key the build doesn't understand means you believe a policy is in force that
@@ -1188,12 +1188,12 @@ gate:
   require: [rev-gemini]
 ```
 
-You need the CLI itself installed and logged in — loomux spawns `gemini` from
+You need the CLI itself installed and logged in — orrerix spawns `gemini` from
 your `PATH` the same way it spawns `claude`. A CLI named by a workflow block is
 **not** checked before launch (only the CLIs picked in the launcher's own role
 dropdowns are), so if it isn't installed the pane still opens, prints the
 shell's not-recognized error (on Windows, `The term 'gemini' is not
-recognized…`), and exits; the orchestrator is then told that agent died. Nothing else is needed: the reviewer's loomux
+recognized…`), and exits; the orchestrator is then told that agent died. Nothing else is needed: the reviewer's orrerix
 tools (including the `pass`/`fail` verdict the merge gate reads) are wired up
 per agent, and its containment is generated per agent too, so a gemini
 reviewer is denied the file-editing tools exactly like a Claude one.
@@ -1203,12 +1203,12 @@ Two differences worth knowing before you pick gemini for a lane:
 - **`allow:` doesn't apply to a gemini block.** Those patterns are
   Claude/Copilot tool-matcher strings. A gemini block runs with its class's
   baseline and can't be widened.
-- **No compact nudge.** loomux's context-pressure nudge types `/compact`,
+- **No compact nudge.** orrerix's context-pressure nudge types `/compact`,
   which gemini doesn't have (its command is `/compress`), so gemini agents
   are skipped rather than sent a command that doesn't exist.
-- **No session history features.** loomux can't resume a gemini session or
+- **No session history features.** orrerix can't resume a gemini session or
   read its transcript — gemini mints its own session ids rather than
-  accepting one, so there's nothing for loomux to record and reopen later.
+  accepting one, so there's nothing for orrerix to record and reopen later.
 
 `cli: opencode` is a fourth choice, and it runs opposite gemini on that last
 point:
@@ -1218,18 +1218,18 @@ point:
   tool-matcher strings `allow:` speaks, so an opencode block also runs with
   its class's baseline and can't be widened — same decision, same reason, as
   gemini's arm.
-- **No compact nudge.** opencode isn't on the short list of CLIs loomux will
+- **No compact nudge.** opencode isn't on the short list of CLIs orrerix will
   paste `/compact` into (claude and copilot only), so an opencode agent's
   context management is left to the CLI itself, same as gemini's.
 - **Session history *does* work.** opencode has no `--session-id` to hand a
-  pane up front, so loomux learns which session is the reviewer's after it
+  pane up front, so orrerix learns which session is the reviewer's after it
   starts rather than minting one — but once bound, that session resumes and
   its transcript reads back like any claude or copilot one.
 
 **Why not codex?** codex can't deny its editing tool by name, and its sandbox
 is all-or-nothing — strict enough to block the tests and `gh` a review needs,
 or open enough to let the reviewer rewrite the code it's reviewing. A reviewer
-that can't be contained would quietly weaken the merge gate, so loomux refuses
+that can't be contained would quietly weaken the merge gate, so orrerix refuses
 the pairing rather than shipping it.
 
 Turning it on live shows the same resolved-roster confirm (name, blocks, any
@@ -1268,7 +1268,7 @@ inlined into every future session's context, so a wrong or trivial lesson is
 a cost you keep paying — which makes "was this actually a recurring problem,
 or did one agent have one bad afternoon?" the question the review turns on.
 
-loomux answers it mechanically rather than leaving it to the agent's opinion
+orrerix answers it mechanically rather than leaving it to the agent's opinion
 of itself. Each piece of friction it found carries a **recurrence** count:
 how many *other* sessions in the group hit the same wall, and which ones.
 So a proposal should read like *"three sessions hit this — `w-2`, `w-7`,
@@ -1315,7 +1315,7 @@ other change to the file takes.
 A repo can turn on a **merge queue** (`merge_queue:` in its `.loomux/workflow.yml`) so a
 batch of approved sub-PRs is tested *together* on a scratch ref before any of them reaches
 the integration branch — the combination is what gets a gate, instead of each PR getting one
-and nobody checking the pile. The queue runs in loomux itself and lands only on an
+and nobody checking the pile. The queue runs in orrerix itself and lands only on an
 integration branch, never on your default branch; see
 [`doc/design/merge-queue.md`](https://github.com/willem445/loomux/blob/main/doc/design/merge-queue.md)
 for the design.
@@ -1338,12 +1338,12 @@ queued PR:
 
 Two things the row will never do quietly. If more PRs are queued than fit, it says *showing 6
 of 12 entries* rather than showing you six and letting them read as all of them. And if
-loomux cannot read the queue's state file at all — a torn write, or a file written by a newer
+orrerix cannot read the queue's state file at all — a torn write, or a file written by a newer
 build — it says **that**, loudly, instead of drawing an empty queue: "nothing is queued" and
-"loomux can't read the queue" are the same picture otherwise, and only one of them means
+"orrerix can't read the queue" are the same picture otherwise, and only one of them means
 your PR is fine.
 
-**How quickly it moves.** The queue is driven by loomux's background poller, which wakes
+**How quickly it moves.** The queue is driven by orrerix's background poller, which wakes
 every 30 seconds and advances **one group's queue per wake** — so a batch normally starts
 within a wake or two of the last PR being queued, and a batch whose CI has just gone green
 lands about that fast too. If several groups have live queues they take turns, oldest first.
@@ -1359,7 +1359,7 @@ The row is absent entirely until a group actually has a queue, which is the defa
 **What the orchestrator does with it.** It queues an approved sub-PR rather than merging it,
 reads the queue's state, and can pull a PR back out — three tools, no merge authority beyond
 what it already had. When a batch goes red it gets one notice naming the culprit, and a
-comment lands on that PR with the failing check and the batch's sibling set. loomux
+comment lands on that PR with the failing check and the batch's sibling set. orrerix
 deliberately does **not** brief the PR's author itself: attribution is mechanical, but
 deciding who picks it up — and whether to resume that worker or spawn a fresh one — is a
 judgment call, so it stays the orchestrator's.
@@ -1373,7 +1373,7 @@ landed, and the thing to look at is your CI.
 
 ## Guardrails
 
-Enforced by loomux, not the model:
+Enforced by orrerix, not the model:
 
 - a cap on live agents (≤12, set at launch and adjustable live);
 - models pinned per role at launch;
@@ -1383,10 +1383,10 @@ Enforced by loomux, not the model:
 ### Compact-nudge
 
 The orchestrator pane lives for the whole session and every turn re-reads its entire
-history — it's typically the biggest token consumer in a group. Loomux can drive Claude
+history — it's typically the biggest token consumer in a group. Orrerix can drive Claude
 Code's own `/compact` for it at a natural lull: once an eligible pane has been idle at its
 input prompt (the same output-quiet signal the watchdog and idle-tick already read — never
-mid-turn) past a configured window, loomux pastes `/compact` for it exactly like any other
+mid-turn) past a configured window, orrerix pastes `/compact` for it exactly like any other
 prompt delivery — no PTY resize, no new agent capability — and it never overwrites text
 you're mid-typing (a held nudge is silently skipped, not queued; it just tries again at the
 next natural lull).
@@ -1404,28 +1404,28 @@ the quiet-window (above), a minimum context floor is on **automatically** at a s
 (50%) — nothing to configure. Three states, if you do want to tune it: leave it alone (the
 50% default applies as soon as the quiet-window is set); set it explicitly to a percentage of
 your own choosing; or set it to `0` to go back to firing on the quiet window alone, with no
-context check at all. This floor only ever governs loomux's own unprompted timing — **calling
+context check at all. This floor only ever governs orrerix's own unprompted timing — **calling
 `request_compact()` yourself always fires immediately**, at any context level, because that's
-your judgment call, not loomux's.
+your judgment call, not orrerix's.
 
 **The orchestrator can also ask for it directly.** `request_compact()` is the primary
 mechanism — the timed nudge above is the fallback for personas that never call it. The
-orchestrator (or any agent) calls it as the LAST action of a turn, at a natural lull; loomux
+orchestrator (or any agent) calls it as the LAST action of a turn, at a natural lull; orrerix
 pastes `/compact` the moment the pane actually goes idle, not immediately (a mid-turn write
 would land as a queued message). Before calling it, the persona is expected to offload
 durable state (task board, `set_state`, relevant GitHub issues/PRs) — the tool warns, but
 never blocks, if that looks skipped. If a group sets a context-usage threshold (percent of
 the model's context window), crossing it delivers a `[loomux] context at NN% …` notice; if
-the agent still hasn't asked by the next check, loomux requests one on its behalf rather than
+the agent still hasn't asked by the next check, orrerix requests one on its behalf rather than
 letting the CLI hit its own emergency auto-compact with no offload.
 
-**Loomux also catches that emergency auto-compact itself, when it happens anyway.** There's
-no way to plan around a compact nobody asked for, but loomux recognizes Claude Code's own
+**Orrerix also catches that emergency auto-compact itself, when it happens anyway.** There's
+no way to plan around a compact nobody asked for, but orrerix recognizes Claude Code's own
 auto-compact banner in the pane and treats it the same as any other compact: whichever way
 one gets triggered — the timed nudge, a direct request, the threshold fallback, a human
-typing `/compact` by hand, or the CLI's own emergency auto-compact — once it's done, loomux
+typing `/compact` by hand, or the CLI's own emergency auto-compact — once it's done, orrerix
 re-grounds the pane in its full role instructions (not just a pointer to go re-read them)
-and prompts it to re-sync live state. Before doing so, loomux checks that context actually
+and prompts it to re-sync live state. Before doing so, orrerix checks that context actually
 shrank (a real signal a compaction ran, not just an ordinary quiet moment) — if it can't
 confirm that, it skips the re-grounding rather than risk delivering it on a loop.
 
@@ -1433,7 +1433,7 @@ confirm that, it skips the re-grounding rather than risk delivering it on a loop
 entry — a human directive, a scope decision, a piece of feedback — the moment it receives
 one, before acting on it. The point is timing: an emergency auto-compact strikes with no
 warning turn, so there's no "offload before it happens" moment to rely on for something that
-only ever lived in the conversation. Loomux embeds each agent's own ledger (its recent tail,
+only ever lived in the conversation. Orrerix embeds each agent's own ledger (its recent tail,
 size-capped, pointing at the full file if anything had to be cut) right alongside the role
 instructions in that same re-grounding notice, so a directive survives a compact even when
 nothing warned anyone first. `note_directive(text, replace: true)` rewrites the whole ledger
@@ -1453,18 +1453,18 @@ with nothing pending shows neither line. The percent is against the model's actu
 window, so a larger tier (Opus) reads correctly — a group can override the guess explicitly
 if it's ever wrong for a given deployment.
 
-**A finished re-grounding tells you how strong the evidence behind it was.** Loomux stops
+**A finished re-grounding tells you how strong the evidence behind it was.** Orrerix stops
 retrying a re-grounding on one of two signals, and they are not the same strength, so the
 panel says which one it got rather than reporting both as success:
 
-- **`re-grounding delivered`** — loomux's own submit sampler watched the notice's Enter land.
+- **`re-grounding delivered`** — orrerix's own submit sampler watched the notice's Enter land.
   The text reached the pane's input box and was submitted.
 - **`re-grounding unproven (agent alive)`** — no delivery confirmation ever arrived, but the
-  agent called a loomux tool afterwards. That proves the agent is alive and working; it
+  agent called an orrerix tool afterwards. That proves the agent is alive and working; it
   proves nothing about the notice. A re-grounding that was genuinely lost, on a pane that
   happened to be busy for its own reasons, finishes exactly this way.
 
-Neither one proves the agent *read* the re-grounding — nothing loomux can observe from
+Neither one proves the agent *read* the re-grounding — nothing orrerix can observe from
 outside an agent's session does, so it doesn't claim to. The audit log draws the same
 distinction, under two separate actions (`compact-reinjection-confirmed` and
 `compact-reinjection-liveness-only`), so counting one of them doesn't quietly include the
@@ -1487,7 +1487,7 @@ The group id is derived from the repo path, so relaunching an orchestrator on th
 same repo resumes its state; GitHub issues remain the source of truth for the
 work queue.
 
-**Restart after loomux closes:** orchestration sessions are marked in the
+**Restart after orrerix closes:** orchestration sessions are marked in the
 [session browser](features/session-browser.html) (`ORCH` / `W` / `REV` chips).
 Clicking a dead group's orchestrator session restores the *whole* orchestration
 — same group id, state, task board, and audit history, with fresh MCP identity
@@ -1499,12 +1499,12 @@ by the recorded membership the chip itself reflects, never by which CLI wrote
 the session — a chipped row restores its group on every agent CLI, and a row
 with no chip is a plain session and restores as one.
 
-**Per-task sessions:** each worker is scoped to exactly one work item, and loomux
+**Per-task sessions:** each worker is scoped to exactly one work item, and orrerix
 records its session id. Follow-ups on a finished task *resume* that worker's
 session (same context, same workspace) instead of cold-starting a new agent or
 disturbing a busy one.
 
-**The delivery queue (above) is in-memory only.** If loomux restarts while a
+**The delivery queue (above) is in-memory only.** If orrerix restarts while a
 prompt is queued behind a blocked pane, that queued prompt is lost — every
 enqueue is still recorded in `audit.jsonl`, so the loss is visible after the
 fact, but nothing replays it automatically **yet** — a replay is a planned

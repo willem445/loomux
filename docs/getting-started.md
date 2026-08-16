@@ -18,8 +18,13 @@ nav_order: 2
 
 ## Install
 
-Loomux ships as a native desktop app for Windows, macOS, and Linux. Pick
+Orrerix ships as a native desktop app for Windows, macOS, and Linux. Pick
 whichever install path suits you — they all land on the same app.
+
+> The npm package, the installers, the installed app and this repo are still
+> named **loomux**: the rename to Orrerix is landing in phases and the shipping
+> identities move last, so every command on this page is the current one. The
+> app's own taskbar and Start-menu entry still read *Loomux* too.
 
 ### npm (any platform)
 
@@ -43,7 +48,7 @@ loomux help       # full usage
 ```
 
 Plain `loomux` **never** updates an existing install. Installing over a running
-Loomux closes it — and everything running inside it — so when you update is your
+Orrerix closes it — and everything running inside it — so when you update is your
 call, not the launcher's.
 
 `loomux update` picks the newest release **on the channel you are already on**
@@ -54,7 +59,7 @@ and never installs an older build over a newer one:
 | a stable release (`1.0.0`) | the newest **stable** release |
 | a beta/RC (`1.1.0-beta11`) | the newest release of either kind |
 
-If the launcher cannot read the version of your installed Loomux, `loomux
+If the launcher cannot read the version of your installed Orrerix, `orrerix
 update` stops and says so rather than guessing — it has no way to tell an update
 from a downgrade, so it does neither. Installing your preferred build once from
 the releases page clears it.
@@ -109,7 +114,7 @@ xattr -cr /Applications/Loomux.app
 
 ## First launch
 
-Open loomux and you get a single terminal pane running your default shell — it
+Open orrerix and you get a single terminal pane running your default shell — it
 behaves like any native terminal, because under the hood it *is* one (real
 ConPTY on Windows, forkpty on macOS/Linux, via WezTerm's PTY layer). Colors,
 escape sequences, and wide characters render exactly as they would natively.
@@ -130,7 +135,7 @@ From here you can:
 
 ## Your first agent pane
 
-Loomux is built to run AI coding agents, but it doesn't bundle them — it drives
+Orrerix is built to run AI coding agents, but it doesn't bundle them — it drives
 the CLIs you already have installed. The three first-class ones are:
 
 - **[Claude Code](https://claude.com/claude-code)** — the `claude` CLI.
@@ -152,17 +157,17 @@ command — Claude Code's native Auto mode plus pre-approved `git`/`gh`, or, for
 Copilot, the same true autopilot mode an orchestration worker gets (`--autopilot
 --allow-all-tools --allow-all-paths`). Copilot only opens its blocking "Enable
 autopilot mode" dialog on the pane's first submit, which for a lone pane is your
-own first Enter — so loomux runs a watcher that answers it for you rather than
+own first Enter — so orrerix runs a watcher that answers it for you rather than
 leaving it on screen. For OpenCode it's `--auto`, which answers each permission
 ask itself as it comes up rather than opening a separate confirmation dialog, so
 no watcher is needed on a fresh launch. Uncheck the box to launch in the CLI's
-normal interactive mode. Loomux never uses `--dangerously-skip-permissions`.
+normal interactive mode. Orrerix never uses `--dangerously-skip-permissions`.
 Your last choice is remembered for next time.
 
 That posture survives a **restore**, too (an app restart, or resuming from the
-session browser) — but only when loomux launched the session itself *and*
+session browser) — but only when orrerix launched the session itself *and*
 recorded an unambiguous toggle state for it. For Claude that record is per
-session, so it's never ambiguous; for Copilot — which hands loomux no session id
+session, so it's never ambiguous; for Copilot — which hands orrerix no session id
 at launch — it's per folder, so two sessions launched from the same folder with
 the toggle flipped between them deliberately resolve to *no* flags rather than a
 guess. A session with no such record comes back in plain interactive mode instead
@@ -183,6 +188,6 @@ work to a fleet that manages itself, that's the
 | The issues/PR view and the orchestration PR workflow | `gh` CLI, authenticated (`gh auth login`) |
 | Voice prompts (Windows, opt-in) | a whisper.cpp runtime + a model — see [Voice prompts](features/voice-prompts.html) |
 
-If a required CLI is missing, loomux tells you inline rather than failing
+If a required CLI is missing, orrerix tells you inline rather than failing
 silently — the launcher warns when a selected role's CLI isn't installed, and
 the issues panel says so if `gh` isn't set up.

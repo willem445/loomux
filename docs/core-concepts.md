@@ -37,7 +37,7 @@ There is no global mode — each pane declares its own kind:
 | **File editor** | The file tree + code editor (the `Alt+F` surface) as a pane, rooted at a folder you choose. |
 | **Git** | The git view (the `Alt+G` surface) as a pane, over a repo you choose. |
 | **Workflow** | The repo's agent workflow — which blocks a run may use, the path between them, the gate that must pass before a merge — as an editable pane over `.loomux/workflow.yml`. Point it at a repo that has no workflow file yet and the pane offers to create one. See [custom agent workflows](orchestration.html#custom-agent-workflows). |
-| **SSH** | A remote shell — or an agent CLI on a remote host — over *your own* ssh client, with saved connections that hold no credentials. A solo pane: it can never join an orchestration group, and every loomux feature that needs a local filesystem is switched off rather than left to guess. See [SSH panes](features/ssh-panes.html). |
+| **SSH** | A remote shell — or an agent CLI on a remote host — over *your own* ssh client, with saved connections that hold no credentials. A solo pane: it can never join an orchestration group, and every orrerix feature that needs a local filesystem is switched off rather than left to guess. See [SSH panes](features/ssh-panes.html). |
 
 **File explorer**, **File editor**, **Git** and **Workflow** are **content
 panes**: a pane that *is* a surface rather than a process. No shell, no CLI, no
@@ -46,14 +46,14 @@ drag, maximize and restore exactly like a terminal pane, and they never count
 toward a tab's agent badge, because a viewer is not an agent.
 
 **Not every CLI in the Agent list runs everywhere.** The picker offers what
-loomux can launch; availability is the CLI's own. **Ante** is the one standing
+orrerix can launch; availability is the CLI's own. **Ante** is the one standing
 exception worth knowing before you pick it: Antigma documents it as macOS- and
 Linux-only and ships no Windows binary, so on Windows it will fail to launch no
 matter how the pane is configured. The launcher also warns inline when a
 selected CLI isn't installed. Orchestration groups are narrower still — the
 launcher's own role pickers offer **Claude Code, Copilot CLI, or OpenCode**
 for orchestrator/worker/reviewer/planner. That's a curated suggestion list,
-not the full set loomux can orchestrate on: a `.loomux/workflow.yml` block
+not the full set orrerix can orchestrate on: a `.loomux/workflow.yml` block
 can also name **Gemini CLI** for a reviewer lane (see
 [cross-model reviewers](orchestration.html#setting-up-a-cross-model-reviewer))
 — it just isn't one of the launcher's own dropdown options.
@@ -84,7 +84,7 @@ What differs from the overlay, and only this:
   from `Ctrl+Shift+W`. Closing the whole **tab** asks too (click ✕ once to arm, again to
   confirm — the same two-step a tab with live agents uses), and its tooltip says what is
   at stake. Re-rooting the editor to a different folder asks, because the file you had
-  open doesn't exist under the new root. And **quitting loomux** asks: one dialog listing
+  open doesn't exist under the new root. And **quitting orrerix** asks: one dialog listing
   every unsaved file across every tab — including the `Alt+F` editors you left open
   inside terminal panes, which are the ones you forget — with **Quit anyway** or
   **Cancel**. If nothing is unsaved, quitting is silent, as it should be.
@@ -111,9 +111,9 @@ is the same git view, worktree switching included.
 
 ### The file explorer pane
 
-A **file explorer** pane is loomux's Windows-Explorer equivalent, living inside a
+A **file explorer** pane is orrerix's Windows-Explorer equivalent, living inside a
 pane. Pick a folder and you get a real file manager: browse it, open things, and
-do the usual housekeeping — without leaving loomux or opening an OS Explorer
+do the usual housekeeping — without leaving orrerix or opening an OS Explorer
 window per project.
 
 - **Browse** — double-click a folder to go in; the breadcrumb and the **↑** button
@@ -121,7 +121,7 @@ window per project.
   selection, `Enter` opens.
 - **Double-click a file → it opens in your default app for that extension**, exactly
   like Explorer. A `.png` goes to your image viewer, a `.pdf` to your PDF reader,
-  a `.docx` to Word. Loomux doesn't open it and has no opinion about its type.
+  a `.docx` to Word. Orrerix doesn't open it and has no opinion about its type.
 - **New file** (`Ctrl+N`) and **new folder** (`Ctrl+Shift+N`) — type the name inline.
   A new file is created **empty** and is *not* opened; double-click it when you want it.
 - **Rename** (`F2`) and **delete** (`Del`).
@@ -129,7 +129,7 @@ window per project.
   and the confirmation says so. On macOS/Linux there's no bin, so it's permanent,
   and the confirmation says *that* instead. It never promises an undo you don't have.
 - A delete runs **off the UI thread**: a `node_modules`-sized folder can take a while,
-  and nothing else in loomux stops while it does. The row pulses, the status line names
+  and nothing else in orrerix stops while it does. The row pulses, the status line names
   what's going, and the ops that would write to the same tree wait their turn — but you
   can keep browsing, hashing and opening files throughout. There is no Cancel, because
   a delete stopped halfway leaves half a folder in the Recycle Bin and half on disk;
@@ -145,7 +145,7 @@ editor pane**, **Rename**, **Delete**, **Hash →**, and **New →**. Right-clic
 space below the rows for **New →** on its own.
 
 **Open in file editor pane** is the in-app counterpart to **Open**: where *Open* hands
-the file to the application your OS associates with it, this opens it in loomux's own
+the file to the application your OS associates with it, this opens it in orrerix's own
 editor, in a new pane beside the browser — rooted where the browser is rooted, so the
 editor's tree shows the same project. On a folder the item reads **Open folder in editor
 pane** and roots the new pane at that folder. Either way the browser stays exactly where
@@ -155,7 +155,7 @@ The menu acts on **the row you right-clicked** — always, even if the list re-s
 search finishes underneath it while the menu is open. It works the same on a **Go-to-file
 result**: right-click a search hit and you get the same menu, acting on that file.
 
-A **symlink** row's actions are greyed with a reason — loomux shows links but never follows
+A **symlink** row's actions are greyed with a reason — orrerix shows links but never follows
 or modifies them.
 
 #### Hashes
@@ -314,13 +314,13 @@ be rearranged in place:
 - **Which agent CLI is this?** A pane launched with an agent wears a small mark at
   the far left of its header, before the role badge — **in that CLI's own colour**,
   so you can tell a Copilot pane from a Claude one across a wall of terminals
-  without reading the titles. Each CLI loomux ships support for has its own hue
+  without reading the titles. Each CLI orrerix ships support for has its own hue
   (Claude terracotta, Codex teal, Copilot blue, opencode green, Gemini indigo,
   Hermes magenta, Ante citron); anything else keeps the violet that just means
   "an agent". The same colours mark the CLI chips in the session list. Agents with
   a recognisable mark show it; everything else shows a
   lettered badge with the program's initial (`C` for Claude, `O` for opencode),
-  and `?` if loomux couldn't make out what was launched. Hover it for the program
+  and `?` if orrerix couldn't make out what was launched. Hover it for the program
   name. A plain shell pane has no agent, so it carries no mark at all. An **SSH
   pane** shows the CLI its saved connection runs on the far end — not `ssh`,
   which is only the transport getting you there; if the connection doesn't name
@@ -335,7 +335,7 @@ be rearranged in place:
 > is deliberately never carried by an icon — it has its own signals, so the two
 > never compete for your attention. This legend is about **icon** marks
 > specifically, and the one exception is the agent mark: it wears its *own CLI's*
-> colour when loomux has one for that program, and falls back to the violet above
+> colour when orrerix has one for that program, and falls back to the violet above
 > when it doesn't. The same hue can mean something else elsewhere on screen — lime
 > also marks a human actor in the audit log and GitHub timeline, for instance,
 > and orchid also colours the prototype task column — as the rest of the
@@ -344,7 +344,7 @@ be rearranged in place:
 
 > **Why overlays, never re-splits, for the git/issues/board/audit panels:**
 > resizing a PTY forces the program inside it to repaint, which pollutes
-> scrollback. Loomux's feature panels float *over* the terminal instead, so the
+> scrollback. Orrerix's feature panels float *over* the terminal instead, so the
 > PTY box never changes size. You'll see this promise repeated across the
 > feature pages — it's a core design rule.
 
@@ -387,17 +387,17 @@ a restart — are on the **[Project tabs](features/project-tabs.html)** feature 
 
 ## Settings
 
-loomux has no settings/preferences window yet — the handful of durable app
+orrerix has no settings/preferences window yet — the handful of durable app
 settings that exist live in a hand-editable `settings.json` next to `tabs.json`
 in the app's data directory (Windows:
 `%APPDATA%\loomux\settings.json`). It's seeded with the defaults on first run,
-so the file is there to find. Edit it and relaunch loomux to pick up a change
+so the file is there to find. Edit it and relaunch orrerix to pick up a change
 — there's no live reload.
 
 | Key | Default | What changing it does |
 | --- | --- | --- |
 | `pasteOnPlainCtrlV` | `true` | Set `false` and plain `Ctrl+V` in a terminal pane passes through to whatever's running there (vim, readline, an agent CLI) instead of pasting. `Ctrl+Shift+V` still always pastes. |
-| `unfocusedRenderThrottleMs` | `100` | How long a **visible but unfocused** pane batches its output before drawing it, in milliseconds. The pane you're focused on is never throttled, and a pane that has been quiet still draws its next output immediately — only a pane that is already streaming, that you aren't reading, is batched. Batching also switches off entirely while the loomux window is hidden — see below. Set `0` to turn it off and draw every pane at full rate (see below). Values above `1000` are clamped. |
+| `unfocusedRenderThrottleMs` | `100` | How long a **visible but unfocused** pane batches its output before drawing it, in milliseconds. The pane you're focused on is never throttled, and a pane that has been quiet still draws its next output immediately — only a pane that is already streaming, that you aren't reading, is batched. Batching also switches off entirely while the orrerix window is hidden — see below. Set `0` to turn it off and draw every pane at full rate (see below). Values above `1000` are clamped. |
 
 ### Why `unfocusedRenderThrottleMs` exists
 
@@ -409,12 +409,12 @@ sixty, so a busy background pane scrolls in slightly coarser steps.
 
 How much that helps depends on your GPU and how many panes stream at once, so
 it's a knob rather than a fixed answer: set it to `0`, relaunch, and compare. If
-loomux feels *worse* with the throttle on, that's worth reporting — and `0`
+orrerix feels *worse* with the throttle on, that's worth reporting — and `0`
 restores exactly the old behaviour in the meantime.
 
-### What loomux stops doing while its window is hidden
+### What orrerix stops doing while its window is hidden
 
-Minimize loomux (or leave it fully behind another window) and every timed
+Minimize orrerix (or leave it fully behind another window) and every timed
 refresh in the UI pauses: the tab strip's agent/cost chips, an open project
 panel, a hover preview, and an armed **▶ follow** in the audit or timeline
 view. Bring the window back and each one refreshes immediately, so what you see
