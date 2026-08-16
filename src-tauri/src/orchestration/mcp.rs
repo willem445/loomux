@@ -1226,8 +1226,7 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                     // MCP tool exposes it — writing it here explicitly is what
                     // makes that a decision on the record, and what stops a
                     // future `TaskPatch` field from reaching agents by omission.
-                    // SCRATCH M4: the field is wired through to agents.
-                    cleared: args.get("cleared").and_then(Value::as_bool),
+                    cleared: None,
                     claim,
                 },
             )?;

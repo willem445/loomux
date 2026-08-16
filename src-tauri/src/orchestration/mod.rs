@@ -9141,8 +9141,7 @@ pub struct Task {
     /// The board reads it as an archive marker only while the row is still
     /// `done` (see the frontend's `isCleared`), so a reopened task comes back
     /// into view without a repair pass having to wipe the stamp.
-    // SCRATCH M3: skip_serializing_if dropped — every board gains the key.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cleared_ms: Option<u64>,
     #[serde(default)]
     pub updated_ms: u64,
@@ -25145,19 +25144,11 @@ impl OrchRegistry {
     ///   preference. The audit log is where it is recorded.
     pub fn clear_done_tasks(&self, group: &GroupId, actor: &str) -> Result<Vec<String>, String> {
         let _guard = self.tasks_lock.lock_safe();
-        let mut tasks = self.tasks(group);
-        let now = now_ms();
-        let mut cleared: Vec<String> = Vec::new();
-        for t in tasks.iter_mut() {
-            // Already-cleared rows are skipped rather than re-stamped: a second
-            // click must not rewrite the archive date of rows it isn't
-            // archiving, and the returned list is then what actually changed.
-            if t.status == "done" && t.cleared_ms.is_none() {
-                t.cleared_ms = Some(now);
-                t.updated_ms = now; // SCRATCH M1: clearing touches the done-cap's sort key
-                cleared.push(t.id.clone());
-            }
-        }
+        // SCRATCH M5: "clear" implemented as a DELETE — the exact failure mode
+        // the issue names, and the one this round exists to evidence.
+        let (removed, tasks): (Vec<Task>, Vec<Task>) =
+            self.tasks(group).into_iter().partition(|t| t.status == "done" && t.cleared_ms.is_none());
+        let cleared: Vec<String> = removed.iter().map(|t| t.id.clone()).collect();
         if cleared.is_empty() {
             return Ok(cleared);
         }
@@ -25184,8 +25175,7 @@ impl OrchRegistry {
         let mut tasks = self.tasks(group);
         let mut restored: Vec<String> = Vec::new();
         for t in tasks.iter_mut() {
-            // SCRATCH M2: the per-id scope is dropped — restore hits everything.
-            if t.cleared_ms.is_some() {
+            if wanted.contains(t.id.as_str()) && t.cleared_ms.is_some() {
                 t.cleared_ms = None;
                 restored.push(t.id.clone());
             }
