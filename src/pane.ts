@@ -54,6 +54,7 @@ import { heldPresentation } from "./heldbadge";
 import { queuePresentation, type QueueDepthReading } from "./queuebadge";
 import { makeRenameCommit } from "./panerename";
 import { shouldResizePty } from "./panefit";
+import { planFit, FIT_WINDOW_MS, FIT_MAX_WAIT_MS } from "./resizeburst";
 import { swapEditor } from "./domutil";
 import { openInEditor, editorConfigDialog } from "./editor";
 import { GitView } from "./gitview";
@@ -2351,10 +2352,40 @@ export class Pane implements VoiceTargetPane {
    *  divider) is coalescing resizes (#432 item 1). See `beginResizeHold`. */
   private resizeHolds = 0;
 
+  /** When the current unbroken run of geometry changes began (#1149), or null
+   *  while this pane is quiet. Cleared wherever a fit actually runs — `runFit`
+   *  is the single place that does both — because a ceiling measured from a
+   *  burst that is already over binds on the very next tick. */
+  private fitBurstStartMs: number | null = null;
+
   private applyFit(): void {
-    // Debounce: divider drags fire many resize events per frame.
+    // Coalesce a burst of geometry changes into ONE fit (#1149). The debounce
+    // this replaced was a fixed 16 ms, which is NARROWER than the interval
+    // between the ResizeObserver deliveries it was debouncing (once per frame,
+    // 16.7 ms at 60 Hz) — so it coalesced nothing, and anything animated fit,
+    // reflowed and resized the ConPTY once per frame for its whole duration.
+    // `#sessions` animates its width over 240 ms, so a single toggle cost ~15
+    // ResizePseudoConsole calls PER PANE (CLAUDE.md constraint 1). `planFit`
+    // waits for the geometry to settle instead, with a ceiling so a gesture
+    // that never settles still reflows periodically — see resizeburst.ts for
+    // both constants and why the ceiling has to clear the transition.
+    const plan = planFit({
+      nowMs: Date.now(),
+      burstStartMs: this.fitBurstStartMs,
+      windowMs: FIT_WINDOW_MS,
+      maxWaitMs: FIT_MAX_WAIT_MS,
+    });
+    this.fitBurstStartMs = plan.burstStartMs;
     clearTimeout(this.fitTimer);
-    this.fitTimer = window.setTimeout(() => this.doFit(), 16);
+    this.fitTimer = window.setTimeout(() => this.runFit(), plan.dueInMs);
+  }
+
+  /** Run the debounced fit and end the burst it belonged to. Every path that
+   *  fits goes through here — the timer above and `endResizeHold`'s immediate
+   *  flush — so no path can leave a stale burst start behind. */
+  private runFit(): void {
+    this.fitBurstStartMs = null;
+    this.doFit();
   }
 
   /** Begin coalescing this pane's PTY resizes: `doResize` keeps fitting
@@ -2375,12 +2406,12 @@ export class Pane implements VoiceTargetPane {
   /** End a hold begun by `beginResizeHold`. Once the last outstanding hold
    *  releases, forces an immediate (non-debounced) fit so the drag's
    *  settled size reaches the PTY right away instead of waiting out however
-   *  much of the 16ms debounce window was left. */
+   *  much of the debounce window was left. */
   endResizeHold(): void {
     this.resizeHolds = Math.max(0, this.resizeHolds - 1);
     if (this.resizeHolds === 0) {
       clearTimeout(this.fitTimer);
-      this.doFit();
+      this.runFit();
     }
   }
 

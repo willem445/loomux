@@ -21,10 +21,15 @@ The obvious implementation is the one the app already has an example of, and
 that example is a warning rather than a precedent. `#sessions` — the left
 session browser — is an in-flow flex sibling of `#grid-area` at `width: 344px`
 with a `0.24s` width **transition**. Opening it therefore shrinks the grid,
-which resizes every terminal in it, *on every frame of the animation*. That is
-precisely the continuous, chrome-driven PTY resizing CLAUDE.md constraint 1
-exists to refuse, and `doc/design/ui-redesign.md` §X10 names it explicitly as
-the mistake a right-hand rail must not repeat.
+which refits every terminal in it and resizes every ConPTY behind them. That
+used to happen *on every frame of the animation*; #1149 coalesced the fit burst
+(`src/resizeburst.ts`) so it now happens **once per pane per toggle**, at the
+settled geometry. The reduction does not change this decision, it sharpens it:
+one resize per pane is the *floor* for a panel that displaces the grid, the
+per-frame layout work is still paid for the whole animation, and an out-of-flow
+panel pays zero of either. That is the continuous, chrome-driven PTY resizing
+CLAUDE.md constraint 1 exists to refuse, and `doc/design/ui-redesign.md` §X10
+names it explicitly as the mistake a right-hand rail must not repeat.
 
 So the dock is out of flow. An absolutely-positioned child of a flex container
 is **not a flex item**, so it cannot move `#grid-area` by a pixel: no pane's

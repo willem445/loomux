@@ -178,6 +178,89 @@ remains nothing-to-do, upstream having declined to fix it.
   simulating a DOM in tests -- see the #432 PR for what to check by hand
   (a real divider drag under load).
 
+## The storm the brackets could not see (#1149)
+
+`beginResizeHold`/`endResizeHold` above coalesce a *drag*, because a drag has
+a start and an end to bracket. Nothing bracketed the other shape, and the
+debounce those brackets sit on could not coalesce it either:
+
+- **`applyFit` debounced on 16 ms**, and a `ResizeObserver` callback is
+  delivered once per frame in the rendering steps -- 16.7 ms apart at 60 Hz.
+  A `setTimeout` armed for 16 ms resolves from the task queue *before* the
+  next frame's delivery, so the window never closed over two consecutive
+  frames. A debounce narrower than the interval between the events it
+  debounces is not a debounce; it is a one-frame delay.
+- **`#sessions` animates its width over 240 ms** (`styles.css`) as an *in-flow
+  flex item*, so opening or closing the session browser walks `#grid-area`
+  through ~15 intermediate widths. Each one was a fit: an xterm buffer reflow
+  over the whole scrollback, plus a `ResizePseudoConsole` -- so ~15 ConPTY
+  resizes per pane per toggle, every one of them a fresh roll of the
+  cursor-desync dice this note is about, and on a six-pane tab ~90 for one
+  click. That is what #1149 reported as lag.
+
+The fix is in the debounce itself rather than in another pair of brackets:
+`src/resizeburst.ts`'s `planFit` waits `FIT_WINDOW_MS` (60) for the geometry
+to *stop moving* and fits once at the settled size, with a ceiling of
+`FIT_MAX_WAIT_MS` (400) so a gesture that never settles -- a window-edge drag
+-- still reflows periodically instead of freezing at a stale size. The two
+constants are coupled on purpose: the ceiling must clear the longest animated
+transition plus one window, because a ceiling that fired mid-transition would
+put a ConPTY resize at an *intermediate* geometry, which is the repaint the
+coalescer exists to remove. `test/resizeburst.test.ts` pins that inequality,
+so a future transition longer than 240 ms fails there with the reason rather
+than quietly costing an extra resize.
+
+Being in the debounce is the point. A bracket covers the gestures somebody
+remembered to bracket; this covers every consumer of the path -- the
+transition, equalize, autosize, a native split, the window's own resize, and
+the side-dock autosize (#1150) that has not been written yet.
+
+### Where it schedules MORE, and why that is the trade
+
+It would be convenient to say the coalescer only ever *removes* resizes. It
+does not, and the exception is worth stating precisely because it is sharp.
+Two conditions, and it needs both:
+
+- the burst **outlasts** `FIT_MAX_WAIT_MS`, so a ceiling fit fires inside it;
+- the `ResizeObserver` gap is **under 16 ms** -- a display above 62.5 Hz --
+  where the old window was *wider* than the frame interval and so collapsed a
+  burst of any length into a single trailing fit.
+
+Cross both and this schedules more: a 2 s window-edge drag is 1 fit today on a
+144 Hz display and 5 here. Everywhere else it schedules fewer or the same, and
+for every burst *shorter* than the ceiling -- which is every animated
+transition in the app, and all of #1149 -- exactly one against one-per-frame.
+
+What is being given up is not a property anyone chose. On a high-refresh
+display today, a gesture with no settled geometry leaves the terminal **frozen
+at its pre-gesture size for the entire gesture**, because the old debounce
+never fired at all; at 60 Hz the identical code reflowed ~60 times a second.
+Those are two faces of the same accident -- where the frame gap happened to
+fall relative to a 16 ms window -- and the ceiling replaces both with one
+chosen cadence. `test/resizeburst.test.ts` pins the boundary in both
+directions (62.5 Hz vs 63 Hz; a ceiling-length burst vs a longer one) so it
+stays a measured trade rather than a sentence, and the added fits are capped
+at one per ceiling.
+
+**The alternative that would make the universal claim true, considered and not
+taken.** Let a ceiling fit reflow xterm but withhold its `resizePty` until the
+burst settles -- the `held` state #432 already built for divider drags. That
+caps ConPTY resizes at one per burst on every display. It is not free: it puts
+xterm and the child at *different* geometries for up to `FIT_MAX_WAIT_MS` at a
+time, which is exactly the divergence this whole note is about under conpty's
+resize quirk, and it would introduce it on the window-drag path, where no
+display rate has it today. Trading a resize-count regression above 62.5 Hz for
+a correctness-class regression at every rate is a product call rather than a
+refactor, so it is recorded here rather than taken quietly.
+
+What it does not change: the intermediate widths still happen. The panel
+still animates, the terminals are simply not re-fitted at each step, so they
+reflow once when it settles. The alternative -- making `#sessions` an overlay
+that occludes rather than displaces, the way `.sidedock` is built -- would
+remove the resize entirely, but it is a different product decision (it
+changes what opening the browser *does* to the grid) and it would fix only
+`#sessions`.
+
 ## Changelog watch (tracked in #432)
 
 - **microsoft/vscode#224488** (or its successor) -- if VS Code's conpty.dll
