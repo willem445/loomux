@@ -311,10 +311,14 @@ be rearranged in place:
   dock at once, leaving just the orchestrator. Click again to restore them all.
   Handy once a big group has opened a pane per agent and you want the screen
   back. (More in the [orchestration guide](orchestration.html).)
-- **Which agent CLI is this?** A pane launched with an agent wears a small violet
-  mark at the far left of its header, before the role badge — so you can tell a
-  Copilot pane from a Claude one across a wall of terminals without reading the
-  titles. Agents with a recognisable mark show it; everything else shows a
+- **Which agent CLI is this?** A pane launched with an agent wears a small mark at
+  the far left of its header, before the role badge — **in that CLI's own colour**,
+  so you can tell a Copilot pane from a Claude one across a wall of terminals
+  without reading the titles. Each CLI loomux ships support for has its own hue
+  (Claude terracotta, Codex teal, Copilot blue, opencode green, Gemini indigo,
+  Hermes magenta, Ante citron); anything else keeps the violet that just means
+  "an agent". The same colours mark the CLI chips in the session list. Agents with
+  a recognisable mark show it; everything else shows a
   lettered badge with the program's initial (`C` for Claude, `O` for opencode),
   and `?` if loomux couldn't make out what was launched. Hover it for the program
   name. A plain shell pane has no agent, so it carries no mark at all. An **SSH
@@ -325,12 +329,14 @@ be rearranged in place:
 > **The icons are colour-coded, and the colour means something.** A mark's hue
 > says *which kind of thing* it is, not what state it's in: cyan for your
 > workspace (folders, paths, the file actions), amber for code you edit, jade
-> for data and documents you read, lime for git, violet for the agents
-> themselves, orchid for the group's boards (tasks, issues, audit, timeline),
+> for data and documents you read, lime for git, violet for agents in general,
+> orchid for the group's boards (tasks, issues, audit, timeline),
 > rose for anything destructive, azure while the mic is capturing. Agent *state*
 > is deliberately never carried by an icon — it has its own signals, so the two
 > never compete for your attention. This legend is about **icon** marks
-> specifically; the same hue can mean something else elsewhere on screen — lime
+> specifically, and the one exception is the agent mark: it wears its *own CLI's*
+> colour when loomux has one for that program, and falls back to the violet above
+> when it doesn't. The same hue can mean something else elsewhere on screen — lime
 > also marks a human actor in the audit log and GitHub timeline, for instance,
 > and orchid also colours the prototype task column — as the rest of the
 > interface adopts this palette. The file tree uses the same scheme, which is

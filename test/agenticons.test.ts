@@ -20,6 +20,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import {
   AGENT_VIEWBOX,
+  CLI_DYE_PROGRAMS,
   ICON_AGENT_PX,
   MARK_PROGRAMS,
   MARK_SOURCES,
@@ -31,6 +32,8 @@ import {
 } from "../src/agenticons.ts";
 import { buildSshArgv } from "../src/sshcommand.ts";
 import { ROLE_TOKEN } from "../src/icons.ts";
+import { AGENTS } from "../src/agents.ts";
+import { CLI_HUES, CSS_TOKENS } from "../src/theme.ts";
 
 const read = (rel: string) => readFileSync(new URL(rel, import.meta.url), "utf8");
 
@@ -305,22 +308,150 @@ test("no mark carries a colour of its own", () => {
   }
 });
 
-test("the agent mark takes the fleet role's dye rather than minting a hue", () => {
+/** Every class on a mark's `<svg>`, in source order. */
+function classesOf(svg: string): string[] {
+  const cls = svg.match(/class="([^"]*)"/);
+  assert.ok(cls, `mark renders with no class — nothing can dye it: ${svg.slice(0, 60)}…`);
+  return cls[1].split(/\s+/).filter(Boolean);
+}
+
+test("a mark reaches its colour through exactly one documented dye class", () => {
   // The identity channel's rule (doc/design/ui-redesign.md): a mark may only reach a colour
-  // through a documented role. "The agents themselves" is already a role — `fleet` — and an
-  // agent-type glyph is the most literal possible member of it, so this module reuses that
-  // class instead of adding a ninth. If someone gives these marks their own `.ic-agent`,
-  // this goes red here AND in test/icons.test.ts's both-directions CSS pin, which is the
-  // second half of the same argument.
-  assert.ok(ROLE_TOKEN.fleet, "icons.ts no longer has a fleet role for these marks to borrow");
-  for (const program of ["copilot", "claude", "unheard-of"]) {
-    const cls = agentMarkFor(program).svg.match(/class="([^"]*)"/);
-    assert.ok(cls, `${program} renders with no class — nothing can dye it`);
+  // through a documented mapping, never ad hoc. There are now two such mappings and a mark
+  // takes EXACTLY ONE of them — its CLI's `cli-<program>` (theme.ts §CLI_HUES) if it has one,
+  // the `fleet` icon role's `ic-fleet` if it does not.
+  //
+  // BOTH HALVES MATTER. Wearing neither is an undyed mark, which renders in the surrounding
+  // ink and looks deliberate. Wearing both would make the mark's colour depend on which of
+  // the two CSS blocks happens to sit lower in styles.css — a pin that holds only by source
+  // order, and test/icons.test.ts's `.ic-*` scan says in its own comment that it cannot see
+  // an overriding selector, so the fight would be invisible to the suite as well.
+  assert.ok(ROLE_TOKEN.fleet, "icons.ts no longer has a fleet role for undyed marks to borrow");
+  const dyeOf = (svg: string) =>
+    classesOf(svg).filter((c) => c.startsWith("ic-") || c.startsWith("cli-"));
+
+  for (const program of CLI_DYE_PROGRAMS) {
     assert.deepEqual(
-      cls[1].split(/\s+/).filter((c) => c.startsWith("ic-")),
-      ["ic-fleet"],
-      `${program} must wear exactly the fleet role class`
+      dyeOf(agentMarkFor(program).svg),
+      [`cli-${program}`],
+      `${program} is on the CLI hue roster but does not wear its own dye class alone`
     );
+  }
+  // A CLI with no hue keeps the fleet violet — the colour twin of the letter badge's total
+  // fallback, and an honest "loomux has no brand hue for this program".
+  for (const program of ["aider", "zed-agent", "unheard-of"]) {
+    assert.deepEqual(dyeOf(agentMarkFor(program).svg), ["ic-fleet"], program);
+  }
+  // The neutral tier must not borrow a CLI's pigment for the same reason it must not borrow
+  // a CLI's caption: it is declining to name a program, and a hue would name one.
+  for (const view of [agentMarkFor("ssh"), agentMark({ argv: ["ssh"], remote: true })!]) {
+    assert.equal(view.kind, "unknown", "fixture drifted — this should be the neutral tier");
+    assert.deepEqual(dyeOf(view.svg), ["ic-fleet"]);
+  }
+});
+
+test("the dye class is a closed roster, not an interpolated program name", () => {
+  // THE SECURITY PROPERTY, and it is a NEW one this feature had to answer: `program` comes
+  // off a launch command (human-typed, or supplied by a workflow file) and the dye now puts
+  // a program-derived token into a `class` ATTRIBUTE inside a string that pane.ts injects
+  // with `innerHTML`. `class="ic cli-${program}"` would put `"><img src=x onerror=…>`
+  // straight into the markup — the letter badge's clamp would still be intact and completely
+  // beside the point, because the escape would be happening two attributes to the left.
+  //
+  // It cannot happen, and not because anything is escaped: only a name that MATCHES the
+  // roster is ever interpolated, so what reaches the attribute is one of seven compile-time
+  // strings. Same discipline as the clamp — make the hostile value unexpressible.
+  for (const hostile of [
+    `<script>alert(1)</script>`,
+    `"><img src=x onerror=alert(1)>`,
+    `claude" onload="alert(1)`,
+    `claude x`,
+    `CLAUDE`, // pre-normalization spelling: the roster is keyed the way the app spells it
+    `__proto__`,
+    `constructor`,
+  ]) {
+    const view = agentMarkFor(hostile);
+    for (const c of classesOf(view.svg)) {
+      assert.match(c, /^(ic|ic-fleet|cli-[a-z]+)$/, `"${hostile}" produced the class "${c}"`);
+    }
+    assert.equal(/\son[a-z]+\s*=/i.test(view.svg), false, `${hostile} carries an event handler`);
+    assert.equal(view.svg.includes("<img"), false, hostile);
+    // Exactly one `class` attribute — an injected `class="…"` of its own would also read as
+    // "a class attribute" to the assertions above if they only looked at the first match.
+    assert.equal((view.svg.match(/\sclass=/g) ?? []).length, 1, hostile);
+  }
+  // And through the two public entry points, the way a launch line actually arrives.
+  assert.deepEqual(classesOf(agentMark({ command: `"><b> --go` })!.svg), ["ic", "ic-fleet"]);
+  assert.deepEqual(classesOf(agentMark({ knownCli: `"><b>`, remote: true })!.svg), ["ic", "ic-fleet"]);
+});
+
+test("the CLI hue roster, the token layer and the stylesheet name the same programs", () => {
+  // THREE SURFACES, ONE ROSTER, pinned in every direction — the same shape test/icons.test.ts
+  // uses on the icon role table, for the same reason: each surface is only ever WRONG
+  // relative to another file, so reading any one of them tells you nothing.
+  //
+  //   * a program in the renderer's roster with no `--cli-*` token dyes with a variable that
+  //     does not exist — the mark falls back to `currentColor` and renders in header ink,
+  //     which looks like a deliberate grey rather than a missing colour;
+  //   * a `--cli-*` token no program claims is a pigment nothing in the app can produce;
+  //   * a `.cli-*` rule with no program behind it is a hue nobody can explain, and a program
+  //     with no rule is an undyed mark again.
+  const fromRenderer = [...CLI_DYE_PROGRAMS].sort();
+
+  const fromTokens = Object.keys(CSS_TOKENS)
+    .filter((t) => t.startsWith("--cli-"))
+    .map((t) => t.slice("--cli-".length))
+    .sort();
+  assert.deepEqual(fromTokens, fromRenderer, "theme.ts's --cli-* tokens and CLI_DYE_PROGRAMS drifted");
+
+  assert.deepEqual(
+    Object.keys(CLI_HUES).sort(),
+    fromRenderer,
+    "theme.ts's CLI_HUES and CLI_DYE_PROGRAMS drifted"
+  );
+
+  const css = read("../src/styles.css").replace(/\/\*[\s\S]*?\*\//g, "");
+  const rules = new Map<string, string>();
+  for (const [, program, value] of css.matchAll(/\.cli-([a-z0-9-]+)\s*\{\s*color:\s*([^;]+);/g)) {
+    rules.set(program, value.trim());
+  }
+  assert.deepEqual([...rules.keys()].sort(), fromRenderer, "styles.css's .cli-* rules drifted");
+  for (const program of fromRenderer) {
+    assert.equal(
+      rules.get(program),
+      `var(--cli-${program})`,
+      `.cli-${program} names ${rules.get(program)}, not its own token — a CLI wearing another ` +
+        "CLI's pigment is the exact confusion this table exists to end"
+    );
+  }
+});
+
+test("every CLI on the launchable roster has a hue, or the app is still part-purple", () => {
+  // The FEATURE's own claim, and the one a "we dyed the three we thought of" implementation
+  // would fail. The human's note was that every agent pane came out the same violet; dyeing
+  // some of `AGENTS` and not the rest fixes that for the CLIs someone remembered and leaves
+  // the others in the exact state being complained about, with no signal anywhere that they
+  // were skipped. Derived from src/agents.ts rather than listed here, so a CLI added to the
+  // launcher arrives with this obligation attached.
+  //
+  // `custom` is excluded and it is the only exclusion: it names no program at all (its
+  // command is whatever the human types), so `agentMarkFor` reads THAT command, and a hue
+  // keyed on the literal string "custom" would dye every hand-typed CLI the same colour —
+  // one violet traded for one khaki.
+  const launchable = AGENTS.filter((a) => a.id !== "custom").map((a) => a.id);
+  assert.ok(launchable.length >= 5, "the agent catalog shrank — this test is checking nothing");
+  const undyed = launchable.filter((id) => !(CLI_DYE_PROGRAMS as readonly string[]).includes(id));
+  assert.deepEqual(
+    undyed,
+    [],
+    `these launchable CLIs still take the fleet violet: ${undyed.join(", ")} — a pane running ` +
+      "one is indistinguishable from a pane running any other"
+  );
+  // The catalog's ids ARE the program names (src/setuppreview.ts relies on the same fact),
+  // so the roster keys can be trusted to match what a launch line normalizes to.
+  for (const { id, command } of AGENTS) {
+    if (id === "custom") continue;
+    assert.equal(command, id, `AGENTS.${id} launches "${command}" — the hue is keyed on the id`);
   }
 });
 
@@ -356,19 +487,20 @@ test("every vendored mark's licence paperwork names it, in all three places", ()
   assert.match(read("../src/vendor/octicons/LICENSE"), /MIT License/);
 });
 
-test("the mark's own rule adds no colour — the role class is still the only dye", () => {
-  // The channel rule, checked on the surface rather than in the registry. `.ic-fleet` is
-  // what makes these marks violet; if `.pane-cli-icon` grew a `color` of its own it would
-  // silently win for the letter tier (whose <text> and <rect> both say `currentColor`) and
-  // the mark would stop reaching its hue through a documented role — the one thing
-  // doc/design/ui-redesign.md's maintainability rule 3 forbids.
+test("the mark's own rule adds no colour — the dye class is still the only dye", () => {
+  // The channel rule, checked on the surface rather than in the registry. The mark's hue
+  // comes from the ONE dye class the resolver stamps — `.cli-<program>` for a CLI on the hue
+  // roster, `.ic-fleet` for one without — and if `.pane-cli-icon` grew a `color` of its own
+  // it would silently win for the letter tier (whose <text> and <rect> both say
+  // `currentColor`), and the mark would stop reaching its hue through a documented mapping —
+  // the one thing doc/design/ui-redesign.md's maintainability rule 3 forbids.
   const css = read("../src/styles.css").replace(/\/\*[\s\S]*?\*\//g, "");
   const rule = css.match(/\.pane-cli-icon\s*\{([^}]*)\}/);
   assert.ok(rule, "styles.css has no .pane-cli-icon rule — the header mark is unstyled");
   assert.equal(
     /(^|;)\s*color\s*:/.test(rule[1]),
     false,
-    ".pane-cli-icon paints a colour; the mark must take .ic-fleet's dye and nothing else"
+    ".pane-cli-icon paints a colour; the mark must take its dye class's colour and nothing else"
   );
 });
 
