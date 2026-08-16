@@ -159,9 +159,10 @@ export class TasksView {
    *  every refresh, like `selected`. */
   private collapsed = new Set<string>();
   /** The task whose picker is open, if any (#582, #958) — one at a time across
-   *  BOTH pickers, and kept here rather than in the DOM so a background
+   *  EVERY picker, and kept here rather than in the DOM so a background
    *  refresh re-renders it instead of silently closing it mid-choice. `field`
-   *  says which one: a dependency (ordering) or a container (nesting). */
+   *  says which one: a dependency (ordering), a container (nesting), or an
+   *  Agile level (#958 slice K). */
   private picking: PickerTarget | null = null;
   /** The picker was just opened by a click, so it should take focus on this
    *  render. Cleared once consumed: a later refresh must re-render the open
@@ -834,8 +835,9 @@ export class TasksView {
   }
 
   /** Open (or close) one of the row pickers. One at a time across the whole
-   *  board and across both fields, so the human is never choosing a dependency
-   *  and a container at the same time in two places. */
+   *  board and across every field, so the human is never choosing a
+   *  dependency, a container, and an Agile level at the same time in three
+   *  places. */
   private togglePicker(id: string, field: PickerField): void {
     this.picking = nextPicker(this.picking, id, field);
     // Focus only when this click OPENED one — a close has nothing to focus.
@@ -843,11 +845,13 @@ export class TasksView {
     this.render();
   }
 
-  /** A picker's own deferred close (blur/Esc). Both pickers call THIS rather
-   *  than each re-deriving the condition: the two copies had already drifted
-   *  apart from `togglePicker`'s, and a close that reads fewer signals than the
-   *  button that opens swallows a click exactly the width of the difference
-   *  (see `pickerIsOpen`). One rule, one place. */
+  /** A picker's own deferred close (blur/Esc). Every picker calls THIS rather
+   *  than each re-deriving the condition — the original two copies (dep,
+   *  parent) had already drifted apart from `togglePicker`'s, and a close that
+   *  reads fewer signals than the button that opens swallows a click exactly
+   *  the width of the difference (see `pickerIsOpen`). One rule, one place —
+   *  which is what let the kind picker (#958 slice K) become a third caller of
+   *  this same close for free, rather than a third copy of the condition. */
   private closePicker(id: string, field: PickerField): void {
     if (!pickerIsOpen(this.picking, id, field)) return;
     this.picking = null;

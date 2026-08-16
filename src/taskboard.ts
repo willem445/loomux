@@ -304,7 +304,7 @@ export const KINDS = ["epic", "feature", "story", "task"] as const;
 export type PickerField = "dep" | "parent" | "kind";
 
 /** The board's single open picker, if any — one at a time across every row and
- *  both fields. */
+ *  every field. */
 export interface PickerTarget {
   id: string;
   field: PickerField;
@@ -312,7 +312,7 @@ export interface PickerTarget {
 
 /** What the picker state becomes when a picker button is clicked: open it, or
  *  close it if that exact picker was already open. Clicking a DIFFERENT picker
- *  — other row, or the other field on this row — replaces the open one. */
+ *  — other row, or a different field on this row — replaces the open one. */
 export function nextPicker(
   open: PickerTarget | null,
   id: string,

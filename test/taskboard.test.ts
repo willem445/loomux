@@ -619,9 +619,9 @@ test("indent is clamped, so a hand-edited over-deep row still fits the overlay",
   assert.equal(indentLevel(MAX_INDENT_DEPTH + 3), MAX_INDENT_DEPTH);
 });
 
-// --- the row's two pickers: one open at a time, and no swallowed click ---
+// --- the row's pickers: one open at a time, and no swallowed click ---
 //
-// Both pickers take focus on open, and their `blur` defers the close by a
+// Every picker takes focus on open, and its `blur` defers the close by a
 // timeout so the click that caused the blur lands first. The close therefore
 // runs AFTER that click, which is why it has to re-ask whether it still owns
 // the open picker — by the same two signals the opening button decides on.
