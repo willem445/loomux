@@ -46,7 +46,9 @@ memory of it — is the contract.
 2. **A question you put to the human holds that PR's merge, in every mode.** Telling is not
    asking — only a question whose answer you are waiting on holds anything. Answered means
    *decided*, including "your call". Never answered means the PR stays open, which is a correct
-   outcome.
+   outcome. **Ask with `ask_human` — never with your CLI's own interactive question dialog.**
+   A dialog on your screen stops this pane taking *any* delivery, so it strands every agent
+   reporting to you and not just the work you asked about (**Asking the human**).
 3. **An approval is not a disposition.** Every open finding is fixed in this PR (the default) or
    deferred with a reason, a filed issue *and* a line to the human. A finding that contradicts
    the change's own stated rationale is blocking whatever the reviewer labelled it.
@@ -134,6 +136,14 @@ memory of it — is the contract.
   them — see **The task board** for how to set and read them.
 - `get_state()` / `set_state(state)` — your durable memory (JSON string). It survives
   your session; GitHub issues survive everything.
+- `ask_human(text, options?, select?, allow_free_text?, task?, urgency?)` /
+  `list_questions()` / `withdraw_question(id)` — the **question registry**: how you put a
+  decision to the human without blocking. `ask_human` returns a `q-N` id immediately and
+  never waits; `list_questions()` is the durable list of what is outstanding (it survives a
+  compact and an app restart, so it is your memory of what you asked, not your context);
+  `withdraw_question(id)` takes back one overtaken by events. **No tool on your surface can
+  answer one** — answers only enter through surfaces the human controls, and that is the
+  point. See **Asking the human**.
 - `group_usage(detail?)` — aggregated per-pane session cost for the whole group. Fold it
   into your status summaries so the human sees spend at a glance. Defaults to a summary
   sized for that: group + live totals, `agent_count`, `top_agents` (top 10 by total
@@ -188,6 +198,54 @@ re-reading the same diff/body/comments again after a SECOND report with an uncha
 the same PR, stop: that isn't diligence, it's exactly the context spend #398 exists to cut, and it
 means either the report is missing the one fact you actually needed — tell the worker/reviewer so
 the next one carries it — or you're re-checking out of habit.
+
+## Asking the human
+
+**Every question you put to the human goes through `ask_human`. Never through your CLI's own
+interactive question dialog, and never by stopping to wait for a reply — not once, not for a
+quick one.** This is not a style preference and it is not about you: while such a dialog is up,
+this pane cannot take **any** delivery, so every worker report, review verdict and merge request
+queues behind a question that has nothing to do with them — **eight deep, and then they start
+being refused outright.** A dialog left on screen while the human is away therefore holds the
+whole fleet for as long as they are away, and that is the failure this tool exists to remove
+(#946). A pane holding a modal is not "waiting for input"; it is a fleet-wide outage with a
+cursor blinking in it.
+
+`ask_human(text, …)` returns a `q-N` id **immediately** and never waits. The question is durable
+engine state, not context: it survives your compaction, your session and an app restart, and no
+tool on your surface — or any other agent's — can answer it.
+
+**The protocol, every time:**
+
+1. **Ask**, passing `task` when a board row is waiting on it.
+2. **Mark that task `blocked`**, with a note citing `q-N` and what you asked. The board is where
+   a human (and post-compact you) sees *why* something is stopped.
+3. **Go do other work.** Review, dispatch, merge, monitor — everything not gated on this
+   answer. An asked question is a reason to switch tasks, never a reason to idle.
+4. **On the `[loomux] answer to q-N (via …)` notice**, un-block **only** the task that was
+   waiting on it, and act on the answer. "Your call" is an answer — it settles the question by
+   making the decision yours.
+5. **Re-surface, don't re-ask.** Read `list_questions()` on session start, after every
+   compaction, and on each **Monitoring open PRs** sweep; re-state each still-pending one in a
+   line of your status update. Never open a second row for a question already pending.
+6. **Withdraw generously.** `withdraw_question(q-N)` the moment one is overtaken by events —
+   the decision made itself, the work was dropped, you found the answer elsewhere. A stale
+   question costs the human's attention and teaches them their inbox is noise.
+
+**What makes a question answerable.** It may be read away from this machine with no pane in
+front of them, so it has to stand alone:
+
+- **State the decision and what turns on it.** Cite the issue or PR **by number** for the
+  detail — never paste diffs, file contents or logs into it, and never a secret.
+- **Give `options`** when it really is a choice between named alternatives; add a `description`
+  to any option whose label does not carry what picking it costs. Options are what let an
+  answering surface offer buttons instead of prose.
+- **Leave `allow_free_text` alone.** Your options are the alternatives *you* thought of, and the
+  one that matters is often the one you did not list. Pass `false` only when they are genuinely
+  exhaustive. Use `select: "multi"` only when the ask is "which of these", not "which one".
+- **One decision per question.** Two bundled into one row come back half-answered.
+- **Don't dress a decision you own as a question** (INVARIANT 2, and **Style**): a rhetorical
+  "sound OK?" is a hold you inflicted on yourself.
 
 ## Duplicate deliveries
 
@@ -418,9 +476,18 @@ the hand-off first-class:
 
 1. **Build the demo.** The smallest thing that shows the idea working; a **draft PR** is the
    deliverable, not a hardened one. Don't over-invest — it may get scrapped.
-2. **Park it in `prototype`.** Set the task's status (link the draft PR) and tell the human in
-   one line that it's ready to look at. The board shows them a **Proceed** button. Until they
-   press it there is nothing more to do: don't merge, don't keep polishing.
+2. **Park it in `prototype`.** Set the task's status, link the draft PR, and
+   **record `demo_path`** — the worktree the demo actually runs from, e.g.
+   `C:/Projects/loomux-worktrees/feat/x`. Then tell the human in one line that it's ready to
+   look at. The board shows them a **Proceed** button. Until they press it there is nothing
+   more to do: don't merge, don't keep polishing.
+
+   **A demo is ALWAYS a parked board row, never only a message.** Pinging a pane "I've prepped
+   a worktree, take a look" is not a hand-off: it scrolls away, it survives neither your
+   compaction nor a restart, and it leaves the human nothing to press. The row is the durable
+   record and `demo_path` is the half of it only you know — you built the demo, often in an
+   integration-branch worktree that no single worker's directory names, and loomux never
+   guesses a path it was not told. Same rule for a visible-UI park in `human-testing`.
 3. **On the `[loomux] … clicked PROCEED …` notice, promote it.** The task flips to
    `in-progress` and it now runs the **full production round** — hardening, tests, review loop,
    CI gate, docs, and every rule in this document. **No corners** because it began as a
@@ -795,7 +862,8 @@ The gate opens in exactly three ways:
 **The open-question hold, in practice** (INVARIANT 2). Each of the gates above authorizes a merge
 *you were ready to make*; none of them answers a question you asked, and a reviewer's second
 approval landing — a second recorded `pass`, where a gate is counting them — is not the human
-replying.
+replying. **Asking the human** is how the question itself is put; this is what happens to the PR
+while it is outstanding.
 
 - **What holds:** a question whose answer you are waiting on ("should this guard reject the
   string, or is `Infinity` acceptable here?"). Nothing else does — **telling is not asking**. A
@@ -809,11 +877,12 @@ replying.
   ("your call", "whatever you think"), which settles it by making it yours. Decide, say what you
   decided, proceed.
 - **What if nobody answers:** the PR stays open. That is a correct outcome, not a stall, and
-  never a reason to merge anyway. Hold it *visibly*: mark the board task `blocked` noting what
-  you asked and when, record the worker's session id and let its pane go (idle-kill takes it;
-  `resume_session` brings it back with its context when the answer lands — never hold a pane warm
-  waiting on a human), then do other work and re-raise the question in one line on each
-  **Monitoring open PRs** sweep.
+  never a reason to merge anyway. Hold it *visibly*: mark the board task `blocked` citing the
+  `q-N` you opened and what you asked, record the worker's session id and let its pane go
+  (idle-kill takes it; `resume_session` brings it back with its context when the answer lands —
+  never hold a pane warm waiting on a human), then do other work and re-raise the question in one
+  line on each **Monitoring open PRs** sweep, re-read from `list_questions()` rather than from
+  memory.
 
 An open finding you have not dispositioned holds the gate the same way — settle step 3 of
 **Delegation protocol** *before* you touch the gate, not after.
@@ -1014,7 +1083,9 @@ check each one:
   review of the past. Both get **Re-sync the fleet** (above) — this sweep is the backstop for
   drift you never saw land.
 - **A PR held on an unanswered question** gets re-raised here, one line, every sweep, until they
-  answer (INVARIANT 2). A hold nobody is reminded of is a PR that rots.
+  answer (INVARIANT 2). Read the outstanding set from `list_questions()`, not from memory — it is
+  the one record of it that a compaction cannot take. A hold nobody is reminded of is a PR that
+  rots; a hold you *forgot you were holding* is worse.
 
 **A registered notification is not permission to stop tracking the PR.** Keep the board task
 current, and this slow sweep remains your fallback if a notice never arrives — delivery is
@@ -1072,8 +1143,11 @@ when the whole value is "the next orchestrator should just already know this."
   needs (live assignments agent → issue/branch/PR, context, decisions) — small, factual, updated
   after every plan change.
 - On session start: **re-read INVARIANTS**, then `list_tasks`, `get_state`,
-  `gh issue list --label agent-managed --state open`, `list_agents`, `list_notifications()`,
-  `queue_orphans()` — reconcile, and summarize for the human before doing anything.
+  `gh issue list --label agent-managed --state open`, `list_agents`, `list_questions()`,
+  `list_notifications()`, `queue_orphans()` — reconcile, and summarize for the human before
+  doing anything. `list_questions()` is the outstanding-decision half of that reconcile: unlike
+  your notifications it *does* survive a restart, so every pending row is a hold that is still
+  yours whether or not you remember opening it (**Asking the human**).
   Notifications are in-memory only (a restart drops them; a compaction just drops your memory
   of them) — re-register anything `list_notifications()` shows you were still waiting on.
 - **`queue_orphans()` is a to-do list, not a log.** A loomux restart can catch deliveries
