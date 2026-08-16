@@ -21,7 +21,7 @@ export type PreviewNode =
 
 /** Whether an attention reason is urgent, mirroring attention.ts. */
 const isUrgentReason = (reason: string): boolean =>
-  reason === "blocked" || reason === "stranded";
+  reason === "held-dialog" || reason === "blocked" || reason === "stranded";
 
 // Priority when several panes in one tab need attention: show the most urgent
 // reason on the tab chip. This is its OWN cross-pane ranking, not a literal
@@ -30,8 +30,11 @@ const isUrgentReason = (reason: string): boolean =>
 // different agents' different reasons against each other on one tab) — it
 // already diverged from the chain before this slice: `gate` (2) has long
 // outranked `report` (1) here even though the backend chain checks `report`
-// first (#157).
+// first (#157). `held-dialog` (#946 Q4 / #1091 slice H) slots in at the top
+// regardless, since it is more urgent than every other reason on both
+// rankings.
 const REASON_PRIORITY: Record<string, number> = {
+  "held-dialog": 6,
   blocked: 5,
   stranded: 4,
   waiting: 3,

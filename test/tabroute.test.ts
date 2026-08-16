@@ -86,8 +86,8 @@ test("'question' slots strictly between the pre-existing 'gate' and 'report' (#1
   // Inserted at 1.5 — between gate (2) and report (1) — without renumbering
   // either of them, or `blocked`/`stranded`/`waiting` above. See the
   // REASON_PRIORITY comment in tabroute.ts for why the non-renumbering is
-  // deliberate (avoids a value collision with #1114's own insertion into
-  // this same literal on a different branch).
+  // deliberate (it's what let #1114's own `held-dialog` insertion into this
+  // same literal, on a different branch, land at 6 with no value collision).
   const underGate = tabAttention(
     [
       { pty_id: 1, reason: "gate" },
@@ -117,15 +117,32 @@ test("'question' slots strictly between the pre-existing 'gate' and 'report' (#1
   );
 });
 
-test("every attention class badges the tab, urgent for blocked and stranded", () => {
-  for (const reason of ["blocked", "stranded", "waiting", "report", "question", "gate"]) {
+test("every attention class badges the tab, urgent for held-dialog/blocked/stranded", () => {
+  for (const reason of ["held-dialog", "blocked", "stranded", "waiting", "report", "question", "gate"]) {
     const out = tabAttention([{ pty_id: 1, reason }], ptyMap([[1, "ws-a"]]));
     assert.deepEqual(
       out.get("ws-a"),
-      { urgent: reason === "blocked" || reason === "stranded", reason },
+      { urgent: reason === "held-dialog" || reason === "blocked" || reason === "stranded", reason },
       `${reason} must badge the tab`
     );
   }
+});
+
+test("a held-dialog pane outranks even blocked on the tab chip (#946 Q4 / #1091 slice H)", () => {
+  // Mirrors the backend's own ranking in `attention_tick`: a live dialog
+  // holding the orchestrator's delivery pipe strands every other agent's
+  // report behind it, so it must win the tab chip over a plain `blocked`.
+  const out = tabAttention(
+    [
+      { pty_id: 1, reason: "blocked" },
+      { pty_id: 2, reason: "held-dialog" },
+    ],
+    ptyMap([
+      [1, "ws-a"],
+      [2, "ws-a"],
+    ])
+  );
+  assert.deepEqual(out.get("ws-a"), { urgent: true, reason: "held-dialog" });
 });
 
 test("a stranded pane outranks waiting on the tab chip but not blocked", () => {

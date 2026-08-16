@@ -5,6 +5,7 @@
 
 /** Reasons the backend attention scan emits (see the Rust `AttentionItem`). */
 export type AttentionReason =
+  | "held-dialog"
   | "blocked"
   | "stranded"
   | "waiting"
@@ -15,12 +16,17 @@ export type AttentionReason =
 export interface AttentionPresentation {
   /** Short glyph+word label shown in the header chip / dock chip tooltip. */
   label: string;
-  /** `blocked` and `stranded` are the urgent ones — callers tint them red
-   *  rather than amber. */
+  /** `held-dialog`, `blocked` and `stranded` are the urgent ones — callers
+   *  tint them red rather than amber. */
   urgent: boolean;
 }
 
 const LABELS: Record<string, string> = {
+  // #946 Q4 / #1091 slice H: a blocking dialog holding the orchestrator's
+  // own delivery pipe — the belt for CLIs the AskUserQuestion deny can't
+  // reach. Outranks `blocked` (see the Rust `attention_tick` doc) because it
+  // strands every OTHER agent's report too, not just this pane's own status.
+  "held-dialog": "⛔ held on a dialog",
   blocked: "⚠ blocked",
   // #496 PR-C: a delivered prompt that was never submitted. Distinct from
   // `waiting` on purpose — a waiting pane is asking something and will keep
@@ -38,7 +44,7 @@ const LABELS: Record<string, string> = {
 /** Attention reasons rendered as urgent (red, not amber): the pane is stuck
  *  and will not un-stick itself. Kept as a set so adding a reason is one edit
  *  — `tabroute.ts` mirrors this rule (see its note on why it can't import). */
-const URGENT: ReadonlySet<string> = new Set(["blocked", "stranded"]);
+const URGENT: ReadonlySet<string> = new Set(["held-dialog", "blocked", "stranded"]);
 
 /** Whether a fresh `(reason, detail)` reading differs from the one currently
  *  applied to a pane — the identity check `Pane.setAttention` gates its DOM
@@ -91,14 +97,21 @@ const DISMISS_TITLE =
 /** Whether the chip for `reason` on a pane identified by `agentId` offers an
  *  explicit dismiss (#825 M1), and what to draw for it.
  *
- *  **Only `stranded`, and that is the whole rule.** It is the one LATCHED
- *  reason: raised backend-side into `attn_stranded` and held until something
- *  removes it, which for several blocker classes is nothing at all — so an idle
- *  pane can wear a stuck-prompt chip indefinitely. The others are re-derived by
- *  every 3-second attention scan (`waiting`, `gate`) or already released by the
- *  focus ack (`report`, `blocked`), so a dismiss control on them would be a
- *  button whose effect visibly evaporates on the next tick — which teaches the
- *  human that dismissing does not work, the very complaint this exists to fix.
+ *  **Only `stranded`, and being latched is necessary but not sufficient.**
+ *  `stranded` is raised backend-side into `attn_stranded` and held until
+ *  something removes it, which for several blocker classes is nothing at
+ *  all — so an idle pane can wear a stuck-prompt chip indefinitely, and only
+ *  a human's own gesture can ever take it down.
+ *  `held-dialog` (#946 Q4 / #1091 slice H) is latched too, but the hold that
+ *  raises it is itself bounded (`QUESTION_HOLD_MAX`) and clears it
+ *  unconditionally the instant that hold ends — so nothing can leave it up
+ *  forever, and an explicit dismiss would just race a backend clear that is
+ *  already coming, sometimes evaporating on the very next tick anyway.
+ *  Every OTHER reason is re-derived by every 3-second attention scan
+ *  (`waiting`, `gate`) or already released by the focus ack (`report`,
+ *  `blocked`), so a dismiss control on any of them would be a button whose
+ *  effect visibly evaporates on the next tick — which teaches the human that
+ *  dismissing does not work, the very complaint this exists to fix.
  *
  *  **No agent id, no control.** The backend releases the badge by agent id
  *  (`orch_dismiss_stranded`), so a plain (non-orchestration) pane has nothing

@@ -605,6 +605,28 @@ These deserve their own detail — see:
     chip: it says what it thinks is blocking). Every dismissal is written to the
     group's audit log with what was dismissed and how long it had been up, so a
     chip you cleared can always be looked up later.
+  - **The ⛔ held on a dialog chip** is the most urgent of all — it outranks even
+    a worker reporting blocked. It only ever appears on the **orchestrator's own**
+    pane, and only while loomux is **actively trying to deliver something to it
+    right now** and finding its CLI's own interactive-question dialog on screen:
+    on Claude that dialog is denied outright (see below), but not every CLI
+    loomux supports can be told to refuse it at that level, so this chip is the
+    fallback that still tells you a held orchestrator pane is stranding every
+    delegate's report queued behind it, not just its own. It comes down the
+    moment that delivery attempt stops holding — either because the dialog
+    cleared, or because the attempt gave up waiting (loomux tries again shortly
+    after, and the chip returns then if the dialog is still there) — so it never
+    needs a dismiss, but it can also briefly drop even while the dialog is still
+    up between one attempt ending and the next one starting.
+  - **The orchestrator can't use its CLI's own question dialog at all, on Claude.**
+    A single stuck question dialog on the orchestrator's pane once held a whole
+    run overnight — the in-flight workers finished their PRs, and then nothing
+    was reviewed, dispatched or merged until morning, because every delivery to
+    a held pane queues instead of landing (and that queue is bounded: enough of
+    them and further ones are refused outright). So on Claude, the orchestrator
+    (and a human-interface/liaison agent, if your workflow has one) is launched
+    with that dialog denied outright; a delegate pane is unaffected, since a
+    human answering its dialog in person never stalls anyone else.
 - **Audit viewer** (`Alt+A` or the history icon) — opens the group's
   `audit.jsonl` as a filterable, searchable timeline: every prompt, spawn, task
   edit, delivery outcome, and state write, one row each. A **follow** button

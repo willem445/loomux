@@ -4684,6 +4684,57 @@ pub const CLAUDE_EDIT_DENY_TOOLS: &[&str] = &["Edit", "Write", "NotebookEdit"];
 /// own; see `claude_command_minimizes_init_approvals_without_bypass`.
 pub const CLAUDE_READONLY_DENY_GIT: &[&str] = &["Bash(git commit *)", "Bash(git push *)"];
 
+/// The blocking interactive-choice tool a Claude agent denies once its ROLE
+/// (not its [`Containment`] tier — see [`claude_denies_interactive_question`])
+/// warrants it — #946 Q4 / #1091 slice H. One entry: Claude Code's own
+/// `AskUserQuestion` dialog, which holds the whole pane until a human answers
+/// it in person.
+///
+/// Same drift-pin discipline as [`CLAUDE_EDIT_DENY_TOOLS`] (#448):
+/// `claude_question_deny_tools_are_known_claude_tools` asserts every entry is
+/// in [`KNOWN_CLAUDE_TOOLS`], so a typo or an upstream rename reads as a
+/// startup warning instead of a silent no-op deny.
+pub const CLAUDE_QUESTION_DENY_TOOLS: &[&str] = &["AskUserQuestion"];
+
+/// Whether a Claude agent's launch denies [`CLAUDE_QUESTION_DENY_TOOLS`] —
+/// #946 Q4 / #1091 slice H.
+///
+/// **The failure mode this closes.** An orchestrator's `AskUserQuestion`
+/// modal holds the whole pane — every delivery to it, including a delegate's
+/// report, queues instead of landing, and that queue is bounded
+/// (`queue::QUEUE_MAX_PER_PANE`, today 8): once full, further admissions are
+/// refused. A blocking question doesn't just stall the asker, it strands
+/// every agent trying to report to it — the incident `doc/design/
+/// human-questions.md`'s "The problem" section narrates (a run held
+/// overnight on one unanswered question, nothing reviewed or merged until
+/// morning). `ask_human` (#946 Q1, shipped) is the non-blocking replacement
+/// for BOTH roles this deny covers: #1091 slice E widened its dispatch gate
+/// from `require_orchestrator` to `require_orchestrator_or_liaison`, so a
+/// liaison poses its own durable, registry-backed question through the same
+/// tool rather than only relaying through the orchestrator — see the design
+/// note's Q4/H section for the full picture.
+///
+/// **Orthogonal to [`Containment`] by construction** — deliberately NOT a
+/// fourth tier on that ladder, which is about edits/git and answers a
+/// different question. The orchestrator is `Containment::None` (denies
+/// nothing today) and still gets this deny; a liaison-hinted reviewer is
+/// `Containment::NoEdits` (#891) and gets both denials in the SAME
+/// `--disallowedTools` list. A worker, a planner, and a non-liaison reviewer
+/// never get this one: a human standing at a DELEGATE's own pane, answering
+/// its dialog in person, never stalls anyone else, so the dialog stays
+/// reachable exactly where holding it is harmless.
+///
+/// **H7 (human decision, #1091 plan-783 part 2): the liaison is included.**
+/// The liaison — the human-interface agent (#891, `kind: reviewer` +
+/// `role_hint: liaison`) — can hold a pane just as the orchestrator can, so
+/// it is named here explicitly rather than left to fall out of some other
+/// rule. A group with no liaison block simply never asks this function the
+/// question that would return `true` for one — no error, no special case:
+/// the #891 principle that nothing may depend on a liaison existing.
+pub fn claude_denies_interactive_question(role: Role, role_hint: Option<&str>) -> bool {
+    role == Role::Orchestrator || role_hint == Some("liaison")
+}
+
 /// The tool-spec values `--deny-tool`/`--allow-tool` are documented to
 /// accept, per the official
 /// [CLI configuration guide](https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/configure-copilot-cli)
@@ -8859,6 +8910,9 @@ pub struct AgentEntry {
 /// One pane that needs the human, pushed to the frontend as an `orch-attention`
 /// event (the full current set each scan; the frontend badges panes by
 /// `pty_id`). `reason`, most- to least-urgent:
+/// - `held-dialog` — #946 Q4 / #1091 slice H: a blocking interactive dialog
+///   is holding the ORCHESTRATOR's own delivery pipe, stranding every
+///   delegate report queued behind it
 /// - `blocked` — a worker reported it is blocked
 /// - `stranded` — a delivered prompt was never submitted (#496 PR-C): either
 ///   loomux is self-healing it, or it needs the human's Enter
@@ -11148,6 +11202,35 @@ pub struct OrchRegistry {
     /// prompt. Cleared by `clear_stranded` when the ledger says the delivery
     /// resolved, and pruned in `attention_tick` when the agent stops running.
     attn_stranded: Mutex<HashMap<String, StrandedNote>>,
+    /// Attention routing (#946 Q4 / #1091 slice H, the latched-attention
+    /// belt): agent ids currently holding delivery on `HeldReason::
+    /// InteractiveQuestion` (#420) for their OWN pane. Written only for the
+    /// ORCHESTRATOR — narrower than the Q4 CLI deny, which also covers the
+    /// liaison — because `deliver_now` gates on `target_is_orchestrator`
+    /// alone; see `deliver_now`'s `emit_held`/`emit_held_cleared` closures,
+    /// which are the sole writers. Latched, not RE-DERIVED each scan the way
+    /// `waiting` is, because there is nothing for `attention_tick` to
+    /// re-derive it from: the hold lives on `deliver_now`'s own call stack
+    /// (blocked inside `hold_for_human_input`, capped at `QUESTION_HOLD_MAX`
+    /// — 120s), not in any pty state a periodic scan could read the way
+    /// `waiting` reads a prompt-shaped tail. So the hold has to be mirrored
+    /// into this shared map at the moment it starts, or `attention_tick`
+    /// would have no way to know it is happening at all. Cleared the instant
+    /// the hold itself clears (`emit_held_cleared` fires unconditionally when
+    /// a hold that was entered ends, whatever the outcome — including at the
+    /// `QUESTION_HOLD_MAX` cap, even if the dialog is still on screen; see
+    /// `wait_for_question_clear`), and pruned in `attention_tick` when the
+    /// agent stops running, mirroring `attn_stranded`.
+    ///
+    /// **Disjoint from #1091 slice D's `question` reason by construction.**
+    /// D's reason is DERIVED from the engine's `ask_human` registry (a
+    /// question the orchestrator posed and is waiting to be answered — #946
+    /// Q1 state, no pane involved). This map is about the delivery PIPE
+    /// itself being held on a live interactive dialog on screen — a
+    /// different signal, populated by a different subsystem. The two sit
+    /// beside each other in `attention_tick`'s `reason` match, never merged
+    /// into one.
+    attn_question_held: Mutex<HashSet<String>>,
     /// Groups with desktop notifications enabled (durable `notify` marker file).
     notify_groups: Mutex<HashSet<GroupId>>,
     /// Autonomous mode (#83): groups whose orchestrator is idle-ticked to run its
@@ -17921,9 +18004,36 @@ fn deliver_now(
     // common no-op case where the box was already clear.
     let emit_held = |reason: HeldReason| {
         let _ = app.emit("orch-delivery-held", delivery_held_event(&agent, &group, pty_id, reason));
+        // #946 Q4 / #1091 slice H — the latched-attention belt. A blocking
+        // dialog held on the ORCHESTRATOR's own pane (never a delegate's —
+        // that stays a passive badge, since a human answering a delegate's
+        // dialog in person never stalls anyone else) strands every delegate
+        // report queued behind it: the `--disallowedTools` deny closes this
+        // for Claude, but a CLI with no tool-level deny can still land here.
+        // The `orch-delivery-held` event above only ever reaches a frontend that is
+        // subscribed and rendering AT THIS INSTANT; mirroring it into
+        // `attn_question_held` instead gives a client a state it can read at
+        // any later point too, the same way every other attention reason is
+        // polled rather than event-only. `reg` is `None` for a delivery with
+        // no registry behind it (see this function's doc) — no belt without
+        // one, same as every other `reg`-gated behavior here.
+        if target_is_orchestrator && reason == HeldReason::InteractiveQuestion {
+            if let Some(r) = &reg {
+                r.latch_question_held(&agent);
+            }
+        }
     };
     let emit_held_cleared = || {
         let _ = app.emit("orch-delivery-held-cleared", delivery_held_cleared_event(pty_id));
+        // Unconditional removal is safe, not merely convenient:
+        // `attn_question_held`'s doc explains why every hold this function
+        // enters is sequential within one locked delivery attempt, so
+        // clearing an id the latch was never holding for (a Typing/
+        // BoxOccupied hold's own clear) is a no-op, never a race with a
+        // DIFFERENT hold's latch.
+        if let Some(r) = &reg {
+            r.unlatch_question_held(&agent);
+        }
     };
 
     let start = std::time::Instant::now();
@@ -23467,6 +23577,7 @@ impl OrchRegistry {
             attn_waiting_ack: Mutex::new(HashSet::new()),
             attn_emitted: Mutex::new(HashMap::new()),
             attn_stranded: Mutex::new(HashMap::new()),
+            attn_question_held: Mutex::new(HashSet::new()),
             notify_groups: Mutex::new(HashSet::new()),
             autonomous_groups: Mutex::new(HashSet::new()),
             auto_merge_groups: Mutex::new(HashSet::new()),
@@ -33756,13 +33867,18 @@ impl OrchRegistry {
 
     /// One attention pass: compute the current set of panes that need the human
     /// from live agent state plus the supplied pty snapshots. Reasons, in
-    /// priority order, are `blocked` (reported), `waiting` (parked on a prompt:
-    /// output quiet past `ATTENTION_QUIET_MS`, a prompt-shaped tail, and no
-    /// recent human keystroke), `report` (reported done), `question` (this
-    /// agent has a pending `ask_human` row nobody has answered yet), and `gate`
-    /// (this agent's board task sits at a `pr`/`human-testing`/`blocked` merge
-    /// gate). Pure w.r.t. the OS/pty — the pty reads live in `attention_inputs`
-    /// — so the whole policy is testable with synthetic maps and no real CLI.
+    /// priority order, are `held-dialog` (#946 Q4 / #1091 slice H — a live
+    /// interactive dialog is holding the ORCHESTRATOR's own delivery pipe;
+    /// see `attn_question_held`'s doc for why this outranks even `blocked`),
+    /// `blocked` (reported), `stranded` (a delivered prompt never submitted),
+    /// `waiting` (parked on a prompt: output quiet past `ATTENTION_QUIET_MS`,
+    /// a prompt-shaped tail, and no recent human keystroke), `report`
+    /// (reported done), `question` (#1091 slice D — this agent has a pending
+    /// `ask_human` row nobody has answered yet), and `gate` (this agent's
+    /// board task sits at a `pr`/`human-testing`/`blocked`/`prototype` merge
+    /// gate). Pure w.r.t. the OS/pty — the pty reads live in
+    /// `attention_inputs` — so the whole policy is testable with synthetic
+    /// maps and no real CLI.
     pub fn attention_tick(
         &self,
         now: u64,
@@ -33833,6 +33949,11 @@ impl OrchRegistry {
         // monitor's actuation (`actuate_stranded`). Taken here, once, in the
         // same lock order as the other attention maps.
         let mut stranded = self.attn_stranded.lock_safe();
+        // #946 Q4 / #1091 slice H: the latched-attention belt's own map,
+        // taken in the same lock order (after `attn_stranded`, before
+        // `agents`) for the same reason every other attention map is taken
+        // here rather than re-locked per agent.
+        let mut question_held = self.attn_question_held.lock_safe();
         let agents = self.agents.lock_safe();
         let mut out = Vec::new();
         for a in agents.values() {
@@ -33843,6 +33964,7 @@ impl OrchRegistry {
                 // any more, and its note would otherwise outlive it (the map
                 // is latched — nothing else prunes it).
                 stranded.remove(&a.id);
+                question_held.remove(&a.id);
                 continue;
             }
             // Track how long the pane's output has been stable.
@@ -33888,7 +34010,19 @@ impl OrchRegistry {
                     .unwrap_or(false);
 
             let report = reports.get(a.id.as_str()).copied();
-            let (reason, detail): (&'static str, String) = if report == Some("blocked") {
+            let (reason, detail): (&'static str, String) = if question_held.contains(a.id.as_str()) {
+                // #946 Q4 / #1091 slice H: outranks even `blocked`, because
+                // a live dialog holding this pane's delivery pipe stalls
+                // every OTHER agent's report behind it, not just this one's
+                // own status. Disjoint from
+                // #1091 slice D's `question` reason (a pending `ask_human`
+                // question, engine-registry state, no pane involved) — see
+                // `attn_question_held`'s doc.
+                ("held-dialog", format!(
+                    "{} is holding on a blocking dialog — every report queued behind it is stuck too",
+                    a.name
+                ))
+            } else if report == Some("blocked") {
                 ("blocked", format!("{} reported blocked — it needs you", a.name))
             } else if let Some(note) = stranded.get(a.id.as_str()) {
                 // #496 PR-C: ranked directly under `blocked` and above
@@ -38293,6 +38427,15 @@ impl OrchRegistry {
     /// `_ex` form with its block's knobs (the `spawn_agent`/`spawn_agent_ex`
     /// shape); this one survives because "a block that pinned nothing produces
     /// exactly today's line" is a property worth keeping directly assertable.
+    ///
+    /// Nor does it carry a role (#946 Q4 / #1091 slice H) — it always builds
+    /// as `Role::Worker` with no `role_hint`, the one combination
+    /// [`claude_denies_interactive_question`] is guaranteed to answer `false`
+    /// for, so this form's long-standing callers (most of this suite) see no
+    /// behavior change from that predicate existing. A caller that wants the
+    /// question-deny predicate evaluated for a real role calls
+    /// [`Self::build_agent_command_ex`] directly, the way both real spawn
+    /// sites do.
     #[allow(clippy::too_many_arguments)]
     #[doc(hidden)] // pub for integration tests
     pub fn build_agent_command(
@@ -38322,6 +38465,8 @@ impl OrchRegistry {
             resume,
             containment,
             persona,
+            Role::Worker,
+            None,
         )
     }
 
@@ -38333,6 +38478,12 @@ impl OrchRegistry {
     /// is also why an unset knob is not merely a default but the whole
     /// back-compat guarantee: a group on a CLI build predating `--effort` is
     /// unaffected unless a human opts in.
+    ///
+    /// `role`/`role_hint` (#946 Q4 / #1091 slice H) feed
+    /// [`claude_denies_interactive_question`] alone — a role-keyed deny
+    /// orthogonal to `containment`, never a substitute for it. See that
+    /// function's doc for the predicate and [`CLAUDE_QUESTION_DENY_TOOLS`]
+    /// for what gets denied.
     #[allow(clippy::too_many_arguments)]
     #[doc(hidden)] // pub for integration tests
     pub fn build_agent_command_ex(
@@ -38355,6 +38506,8 @@ impl OrchRegistry {
         resume: bool,
         containment: Containment,
         persona: &PersonaInject,
+        role: Role,
+        role_hint: Option<&str>,
     ) -> String {
         // A planner never mutates and has no human in its pane, so there is
         // nothing for `auto_ops` to gate: it must explore, post its plan
@@ -38720,6 +38873,33 @@ impl OrchRegistry {
                         }
                     }
                 }
+                // #946 Q4 / #1091 slice H: role-keyed, not containment-keyed
+                // (see `claude_denies_interactive_question`'s doc) — so this
+                // sits OUTSIDE the `containment.denies_edits()` block above,
+                // not nested inside it the way the git-mutation denial is.
+                // Two cases:
+                // - The block above already opened `--disallowedTools`
+                //   (a liaison-hinted reviewer, `Containment::NoEdits`) — EXTEND
+                //   that SAME value list. Claude Code does not merge two
+                //   `--disallowedTools` flags on one command line (the second
+                //   occurrence would win, silently dropping the edit/git
+                //   denial already emitted), so opening a second one here
+                //   would be a regression, not an addition.
+                // - Nothing opened it yet (the orchestrator, `Containment::None`
+                //   — #465/#462 never gave it a tier) — open it fresh. This is
+                //   the one case where a `--disallowedTools` flag appears on an
+                //   orchestrator's command line at all; the #610/#417
+                //   flag-severing pins (`claude_allow_patterns_are_not_severed_
+                //   from_the_allowedtools_flag` and friends) are the regression
+                //   net that would catch this landing in the wrong place.
+                if claude_denies_interactive_question(role, role_hint) {
+                    if !containment.denies_edits() {
+                        cmd.push_str(" --disallowedTools");
+                    }
+                    for t in CLAUDE_QUESTION_DENY_TOOLS {
+                        cmd.push_str(&format!(" {t}"));
+                    }
+                }
                 // Claude's native custom agent, by FILE (round #417
                 // correction 6, replacing the pre-round-6 inline `--agents
                 // '<json>' --agent <id>` pair — see `PersonaInject::
@@ -38777,6 +38957,9 @@ impl OrchRegistry {
         containment: Containment,
         persona: &PersonaInject,
     ) -> Vec<String> {
+        // See `build_agent_command`'s doc: same inert sentinel
+        // (`Role::Worker`, no hint) so this form's long-standing callers see
+        // no change from the #946 Q4 / #1091 slice H predicate existing.
         self.build_agent_argv_ex(
             cli,
             model,
@@ -38790,12 +38973,17 @@ impl OrchRegistry {
             resume,
             containment,
             persona,
+            Role::Worker,
+            None,
         )
     }
 
     /// [`Self::build_agent_argv`] with the block's model knobs (#687) — the
     /// structured twin of [`Self::build_agent_command_ex`], and pinned equal to
     /// it (knobs included) by `build_agent_argv_matches_command_line`.
+    ///
+    /// `role`/`role_hint`: see [`Self::build_agent_command_ex`]'s doc — same
+    /// meaning, same [`claude_denies_interactive_question`] predicate.
     #[allow(clippy::too_many_arguments)]
     #[doc(hidden)] // pub for integration tests
     pub fn build_agent_argv_ex(
@@ -38812,6 +39000,8 @@ impl OrchRegistry {
         resume: bool,
         containment: Containment,
         persona: &PersonaInject,
+        role: Role,
+        role_hint: Option<&str>,
     ) -> Vec<String> {
         let unattended = auto_ops || containment.forces_unattended();
         let mut a: Vec<String> = Vec::new();
@@ -38979,6 +39169,18 @@ impl OrchRegistry {
                         for t in CLAUDE_READONLY_DENY_GIT {
                             push(&mut a, t);
                         }
+                    }
+                }
+                // #946 Q4 / #1091 slice H — same predicate and same
+                // extend-vs-open choice as the string form; see that arm's
+                // comment for why this must never open a SECOND
+                // `--disallowedTools`.
+                if claude_denies_interactive_question(role, role_hint) {
+                    if !containment.denies_edits() {
+                        push(&mut a, "--disallowedTools");
+                    }
+                    for t in CLAUDE_QUESTION_DENY_TOOLS {
+                        push(&mut a, t);
                     }
                 }
                 if let Some(agent) = &persona.claude_agent {
@@ -39328,6 +39530,10 @@ impl OrchRegistry {
             resume,
             role.containment(), // deny edits (and, for a planner, commits) at the CLI level
             &inject,
+            role,
+            // #946 Q4 / #1091 slice H (H7): the liaison-hinted block feeds
+            // `claude_denies_interactive_question` the same way `role` does.
+            block.role_hint.as_deref(),
         );
         let argv = self.build_agent_argv_ex(
             &cli,
@@ -39342,6 +39548,8 @@ impl OrchRegistry {
             resume,
             role.containment(),
             &inject,
+            role,
+            block.role_hint.as_deref(),
         );
         // Round #417 correction 6: fail loudly, pre-spawn, rather than
         // handing CreateProcessW a command line it will refuse with an
@@ -40933,6 +41141,27 @@ impl OrchRegistry {
                 "stranded_ms": now_ms().saturating_sub(note.since_ms),
             }));
         }
+    }
+
+    /// #946 Q4 / #1091 slice H — the latched-attention belt's sole writer.
+    /// Called only from `deliver_now`'s `emit_held` closure, only for the
+    /// ORCHESTRATOR's own pane (see `attn_question_held`'s doc for why the
+    /// belt is orchestrator-only, unlike the Q4 CLI deny which also covers
+    /// the liaison). No audit entry: the hold itself is already audited
+    /// (`delivery-held-for-question`) at the call site that decided to hold;
+    /// this only mirrors that decision into the attention set so
+    /// `attention_tick` can surface it.
+    pub fn latch_question_held(&self, agent_id: &str) {
+        self.attn_question_held.lock_safe().insert(agent_id.to_string());
+    }
+
+    /// Releases [`Self::latch_question_held`]. Called unconditionally from
+    /// `deliver_now`'s `emit_held_cleared` closure whenever ANY hold in that
+    /// function clears (Typing/BoxOccupied included) — safe because removing
+    /// an id the latch was never holding for is a no-op; see
+    /// `attn_question_held`'s doc for why that can't race a different hold.
+    pub fn unlatch_question_held(&self, agent_id: &str) {
+        self.attn_question_held.lock_safe().remove(agent_id);
     }
 
     /// The human explicitly dismissed a pane's stuck-prompt chip (#825 M1).
@@ -47027,6 +47256,13 @@ fn register_orchestrator_pane(
         // `match` (`Role::containment`) rather than at a literal here.
         containment,
         &inject,
+        // #946 Q4 / #1091 slice H: this spawn site only ever builds the
+        // orchestrator's own pane (see `role: Role::Orchestrator` on the
+        // entry below) — `Role::Orchestrator` alone already satisfies
+        // `claude_denies_interactive_question`, so `role_hint` is `None`
+        // rather than threaded from `block` the way `spawn_agent_ex` does.
+        Role::Orchestrator,
+        None,
     );
     let argv = reg.build_agent_argv_ex(
         &cli,
@@ -47041,6 +47277,8 @@ fn register_orchestrator_pane(
         resume,
         containment,
         &inject,
+        Role::Orchestrator,
+        None,
     );
     // Round #417 correction 6: see `command_line_length_guard`'s doc — the
     // orchestrator's own pane must fail loudly pre-spawn too, not just
