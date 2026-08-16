@@ -147,9 +147,9 @@ const CANT_BE_SENDER_REASON =
 
 const PROMOTE_LABEL = "Promote to orchestrator…";
 const PROMOTE_CLI_REASON =
-  "Promoting is Claude-only for now — a promotion resumes this pane's own session, and loomux only knows a claude pane's session id well enough to reopen it.";
+  "Promoting is Claude-only for now — a promotion resumes this pane's own session, and orrerix only knows a claude pane's session id well enough to reopen it.";
 const PROMOTE_NO_SESSION_REASON =
-  "loomux doesn't know this pane's conversation yet — a promotion resumes the session it already has, so send this agent a prompt first.";
+  "orrerix doesn't know this pane's conversation yet — a promotion resumes the session it already has, so send this agent a prompt first.";
 const PROMOTE_NO_WORKDIR_REASON =
   "This pane has no working directory, and a promoted pane's own directory becomes the group's repository.";
 

@@ -35,7 +35,7 @@ export function showRestoreSplash(host: HTMLElement = document.body): Promise<Sp
     const body = document.createElement("p");
     body.className = "restore-splash-body";
     body.textContent =
-      "loomux can bring back every tab and its pane layout, and reopen the agent " +
+      "orrerix can bring back every tab and its pane layout, and reopen the agent " +
       "sessions that were live — resuming a session loads its context but spends " +
       "nothing until you send a prompt. Orchestration groups come back dormant, " +
       "with a Resume button.";

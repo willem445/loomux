@@ -530,7 +530,7 @@ export class GroupView {
     const tickRow = el("div", "group-auto-tick");
     const tickWrap = el("label", "group-auto-tickwrap") as HTMLLabelElement;
     tickWrap.title =
-      "How long the orchestrator's pane must be output-quiet before loomux delivers one " +
+      "How long the orchestrator's pane must be output-quiet before orrerix delivers one " +
       "idle tick (poll labeled issues, re-check PRs). Default 5 min; min 1.";
     tickWrap.append(el("span", "group-auto-blabel", "Idle tick"));
     this.tickMinInput = document.createElement("input");
@@ -1483,7 +1483,7 @@ export class GroupView {
     this.autoBtn.classList.toggle("on", a.autonomous);
     this.autoBtn.title = a.autonomous
       ? "Idle-ticking is live — the orchestrator polls labeled issues and re-checks PRs while you're away. Click to stop."
-      : "Enable idle-ticking: loomux pokes the orchestrator to run its intake/monitoring cadence when the group goes quiet.";
+      : "Enable idle-ticking: orrerix pokes the orchestrator to run its intake/monitoring cadence when the group goes quiet.";
 
     // Merge gate: reflect the backend flag AND the #83 dependency — auto-merge
     // exists only in autonomous mode, so with autonomous off the control is locked

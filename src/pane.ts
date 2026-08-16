@@ -1595,7 +1595,7 @@ export class Pane implements VoiceTargetPane {
       this.writer.ready((data, human) => writePty(ptyId, data, human));
     } catch (err) {
       // Never leave a dead black pane: surface the failure in-terminal.
-      this.term.writeln(`\x1b[91mloomux: failed to start shell\x1b[0m`);
+      this.term.writeln(`\x1b[91morrerix: failed to start shell\x1b[0m`);
       this.term.writeln(`\x1b[90m${String(err)}\x1b[0m`);
     }
   }

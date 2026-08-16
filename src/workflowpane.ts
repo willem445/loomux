@@ -349,7 +349,7 @@ export function rewriteImpact(
 export function rewriteImpactMessage(impact: RewriteImpact, file: string): string {
   const n = impact.droppedComments;
   const comments = n > 0 ? `the comments on ${n} line${n === 1 ? "" : "s"} will be dropped` : "";
-  const shape = impact.reformats ? "the file will be rewritten in loomux's canonical form" : "";
+  const shape = impact.reformats ? "the file will be rewritten in orrerix's canonical form" : "";
   const both = [comments, shape].filter(Boolean).join(", and ");
   return (
     `Formatting ${file} re-writes the whole file from the workflow model, in canonical form — ` +

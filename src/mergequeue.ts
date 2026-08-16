@@ -222,7 +222,7 @@ export function mergeQueueView(status: MergeQueueStatus, rowLimit = ROW_LIMIT): 
     case "unreadable":
       return {
         kind: "problem",
-        line: "merge queue: merge_queue.json is unreadable — not showing a queue loomux can't read",
+        line: "merge queue: merge_queue.json is unreadable — not showing a queue orrerix can't read",
         detail: status.detail,
       };
     case "unsupported-version":

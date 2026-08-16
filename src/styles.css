@@ -73,7 +73,7 @@
          and their role table, git-graph lanes, diff add/delete, task-board
          columns, workflow-mode chrome, project tabs, resource meters, the syntax
          sub-palette. Four of these carry the same pigment as a --state-* token above and
-         that is deliberate: loomux has one palette, and the token a surface NAMES is what
+         that is deliberate: orrerix has one palette, and the token a surface NAMES is what
          declares which question it is answering. An --id-* token may only be used through a
          documented role mapping; "it needed a different blue" is still refused. Reserved
          by slice A; slice B (#957) was the first consumer, mapping the bulk of surfaces, and
@@ -210,8 +210,8 @@
  * states in its own comment that it cannot see an overriding selector. Nothing here is one.
  *
  * A CLI WITH NO HUE KEEPS THE FLEET VIOLET, which is the honest answer rather than a gap:
- * loomux gains CLIs faster than it gains a considered pigment for each, and violet reads as
- * "an agent loomux has no brand hue for" — the colour twin of the letter badge's own total
+ * orrerix gains CLIs faster than it gains a considered pigment for each, and violet reads as
+ * "an agent orrerix has no brand hue for" — the colour twin of the letter badge's own total
  * fallback. The roster is theme.ts's CLI_HUES; test/agenticons.test.ts pins that list, this
  * block and the renderer's stamping against each other in every direction. */
 .cli-claude   { color: var(--cli-claude); }
@@ -798,9 +798,9 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 }
 
 /* ---------- delivery-held badge (#246) ---------- */
-/* Loomux is currently withholding an outbound prompt because it believes the
+/* Orrerix is currently withholding an outbound prompt because it believes the
    human's own input occupies this pane's CLI box. Distinct from .pane-attn
-   (which flags a pane the human should look AT): this flags a pane loomux is
+   (which flags a pane the human should look AT): this flags a pane orrerix is
    NOT writing to right now — a live-test report found the original muted,
    non-pulsing treatment too easy to miss, so it now pulses (base look +
    animation shared with .pane-attn above) rather than inventing a second
@@ -1324,7 +1324,7 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 }
 /* The session list's CLI chip — the app's OTHER "which program is this" position, and now
    on the same table as the pane mark (#1020 wave 2). These three used to name --id-amber /
-   --id-azure / --id-jade, so loomux answered one question with two different colour tables:
+   --id-azure / --id-jade, so orrerix answered one question with two different colour tables:
    a Copilot session chip was literally the same azure as the ORCHESTRATOR role chip beside
    it on the same row. Naming --cli-* instead makes the CLI answer one answer app-wide (the
    shape test/theme.test.ts already enforces for the four agent roles) and pulls the chip off

@@ -58,8 +58,8 @@ export function compactionStatusTitle(status: CompactionStatus): string | null {
     case "armed":
       if (status.source === "hook") return "a PreCompact/SessionStart hook confirmed this directly — waiting to observe the pane go busy";
       return status.trusted
-        ? "loomux pasted /compact itself — waiting to observe the pane go busy"
-        : "loomux believes a compact started (banner or manual typing) — waiting to observe the pane go busy";
+        ? "orrerix pasted /compact itself — waiting to observe the pane go busy"
+        : "orrerix believes a compact started (banner or manual typing) — waiting to observe the pane go busy";
     case "awaiting_evidence":
       // Round 10: a hook already confirmed the compaction directly — there
       // is no inference left to run and no outcome left undecided, only
@@ -81,8 +81,8 @@ export function compactionStatusTitle(status: CompactionStatus): string | null {
       // Enter land proves the text reached the box, and no artifact loomux can
       // observe proves the agent then read it.
       return status.evidence === "delivery"
-        ? "loomux's own submit sampler watched the re-grounding's Enter land — the paste reached the box; nothing loomux can observe proves the agent read it"
-        : "the agent called a loomux tool after the re-grounding was sent — that proves it is alive and executing, NOT that it read the re-grounding, and not even that the paste arrived. A genuinely lost re-grounding on a pane that was busy anyway closes exactly this way";
+        ? "orrerix's own submit sampler watched the re-grounding's Enter land — the paste reached the box; nothing orrerix can observe proves the agent read it"
+        : "the agent called an orrerix tool after the re-grounding was sent — that proves it is alive and executing, NOT that it read the re-grounding, and not even that the paste arrived. A genuinely lost re-grounding on a pane that was busy anyway closes exactly this way";
   }
 }
 

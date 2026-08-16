@@ -75,7 +75,7 @@ export function resumeFailureReason(kind: ResumeFailureKind): string {
       // a loop. Nor does it offer a fresh spawn AS A REJOIN — that would join
       // the unverified group. It names the two routes that exist and is
       // explicit that a group rejoin isn't one of them.
-      return "loomux has no record of which orchestration group it belongs to, so it wasn't rejoined into one on a guess. Nothing will rejoin it into a group — but the conversation isn't lost: it reopens outside orchestration with the CLI's own resume command (shown in the session row's tooltip), and the orchestrator can spawn a fresh agent for the work.";
+      return "orrerix has no record of which orchestration group it belongs to, so it wasn't rejoined into one on a guess. Nothing will rejoin it into a group — but the conversation isn't lost: it reopens outside orchestration with the CLI's own resume command (shown in the session row's tooltip), and the orchestrator can spawn a fresh agent for the work.";
     default:
       return "It could not be resumed.";
   }

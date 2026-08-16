@@ -379,7 +379,7 @@ export function capacityWarning(r: ResolvedRoster, maxAgents: number): string | 
   const target = capacityRaiseTarget(r)!;
   const overCeiling =
     recommended > MAX_AGENTS_CEILING
-      ? ` (this workflow's full roster needs ${recommended}, above loomux's ${MAX_AGENTS_CEILING}-agent ` +
+      ? ` (this workflow's full roster needs ${recommended}, above orrerix's ${MAX_AGENTS_CEILING}-agent ` +
         `limit — ${MAX_AGENTS_CEILING} is as high as this cap can go)`
       : "";
 
@@ -394,7 +394,7 @@ export function capacityWarning(r: ResolvedRoster, maxAgents: number): string | 
     // instead of offering a fix that doesn't land (rev-2 non-blocking #2).
     if (target < minimum) {
       return (
-        `${base} This workflow's minimum itself (${minimum}) is above loomux's ${MAX_AGENTS_CEILING}-agent ` +
+        `${base} This workflow's minimum itself (${minimum}) is above orrerix's ${MAX_AGENTS_CEILING}-agent ` +
         `limit — ${MAX_AGENTS_CEILING} is the highest max_agents can go, and even that will not cover one ` +
         `full review round without evictions.`
       );

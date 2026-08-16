@@ -1,4 +1,4 @@
-# Jekyll configuration for the Loomux documentation site.
+# Jekyll configuration for the Orrerix documentation site.
 #
 # Tooling decision (see docs/README.md for the full rationale): this is a
 # GitHub-Pages-native Jekyll site — plain checked-in Markdown plus this config,
@@ -7,7 +7,7 @@
 # `actions/jekyll-build-pages` in .github/workflows/docs.yml, so there is
 # nothing to install, pin in a lockfile, or keep patched in this repo.
 
-title: Loomux
+title: Orrerix
 description: >-
   A dead-simple terminal multiplexer for AI agent management — instant matrix
   splits, native agent-session restore, and a built-in orchestrator/worker
@@ -29,7 +29,7 @@ heading_anchors: true
 color_scheme: dark
 
 aux_links:
-  "Loomux on GitHub":
+  "Orrerix on GitHub":
     - "https://github.com/willem445/loomux"
 aux_links_new_tab: true
 
@@ -38,7 +38,7 @@ nav_external_links:
     url: https://github.com/willem445/loomux/releases/latest
 
 footer_content: >-
-  Loomux is MIT-licensed. This site documents what ships on
+  Orrerix is MIT-licensed. This site documents what ships on
   <code>main</code>; the source of truth is the code.
 
 # Keep Jekyll from trying to render repo scaffolding as pages.

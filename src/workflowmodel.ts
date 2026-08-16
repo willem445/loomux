@@ -131,7 +131,7 @@ export function roleHintsForKind(kind: string): RoleHint[] {
 export function allowDenialReason(kind: string): string | null {
   if (kind === "orchestrator") {
     return (
-      "the orchestrator is loomux's trust root, and a repo file may not pre-approve its tools — " +
+      "the orchestrator is orrerix's trust root, and a repo file may not pre-approve its tools — " +
       "put personas and allow: patterns on the blocks it spawns"
     );
   }
@@ -2034,7 +2034,7 @@ export function parseWorkflow(text: string): ParseResult {
       findings.push({
         severity: "error",
         code: "version-unsupported",
-        message: `version: ${root.version} is not supported by this build of loomux (it reads version ${WORKFLOW_VERSION}).`,
+        message: `version: ${root.version} is not supported by this build of orrerix (it reads version ${WORKFLOW_VERSION}).`,
       });
     }
   }
@@ -2233,7 +2233,7 @@ function knobFindings(b: WorkflowBlock, where: string, lookup: KnobLookup | unde
       severity: "error",
       code: "knob-unavailable",
       message:
-        `Block "${where}" declares ${key}: ${v}, which loomux cannot deliver on ${b.cli} — ` +
+        `Block "${where}" declares ${key}: ${v}, which orrerix cannot deliver on ${b.cli} — ` +
         (state.reason || `${key} must be one of ${state.values.join(", ")}.`),
       blockId: b.id,
     });
@@ -2305,7 +2305,7 @@ export function validateWorkflow(w: Workflow, knobs?: KnobLookup): Finding[] {
         severity: "error",
         code: "unknown-cli",
         message: b.cli
-          ? `Block "${where}" runs cli "${b.cli}", which loomux cannot spawn (supported: ${WORKFLOW_CLIS.join(", ")}).`
+          ? `Block "${where}" runs cli "${b.cli}", which orrerix cannot spawn (supported: ${WORKFLOW_CLIS.join(", ")}).`
           : `Block "${where}" has no cli — pick one of ${WORKFLOW_CLIS.join(", ")}.`,
         blockId: b.id,
       });
@@ -2462,7 +2462,7 @@ function allowFindings(b: WorkflowBlock, where: string): Finding[] {
         code: "allow-sanitized",
         message:
           `Block "${where}" declares the allow: pattern "${pattern}", which has no characters ` +
-          `loomux can pass to the CLI — it is dropped, and pre-approves nothing.`,
+          `orrerix can pass to the CLI — it is dropped, and pre-approves nothing.`,
         blockId: b.id,
       });
     } else if (clean !== pattern.trim()) {
@@ -2470,7 +2470,7 @@ function allowFindings(b: WorkflowBlock, where: string): Finding[] {
         severity: "warning",
         code: "allow-sanitized",
         message:
-          `Block "${where}" declares the allow: pattern "${pattern}", but loomux passes only ` +
+          `Block "${where}" declares the allow: pattern "${pattern}", but orrerix passes only ` +
           `letters, digits and ( ) : * _ - . / , and spaces — the CLI will be given "${clean}".`,
         blockId: b.id,
       });
@@ -2498,7 +2498,7 @@ function sectionFindings(w: Workflow): Finding[] {
       err(
         "intake",
         "intake-unknown-source",
-        `intake.source: "${w.intake.source}" is not a source loomux knows — use one of ${INTAKE_SOURCES.join(", ")} (or leave it out to inherit).`
+        `intake.source: "${w.intake.source}" is not a source orrerix knows — use one of ${INTAKE_SOURCES.join(", ")} (or leave it out to inherit).`
       );
     }
     for (const key of INTAKE_LABEL_KEYS) {
@@ -2508,7 +2508,7 @@ function sectionFindings(w: Workflow): Finding[] {
           "intake",
           "intake-bad-label",
           `intake.labels.${key}: "${v}" is not a usable label — letters, digits, - and _, no leading -, at most ${ID_MAX_CHARS} characters. ` +
-            `loomux rejects it rather than rewriting it, so your repo's own labels keep matching.`
+            `orrerix rejects it rather than rewriting it, so your repo's own labels keep matching.`
         );
       }
     }
@@ -2536,7 +2536,7 @@ function sectionFindings(w: Workflow): Finding[] {
           code: "section-out-of-range",
           message:
             `merge_queue.checks_timeout_minutes: ${timeout} is outside ${MERGE_QUEUE_CHECKS_TIMEOUT_MIN}–${MERGE_QUEUE_CHECKS_TIMEOUT_MAX}, ` +
-            `so loomux will clamp it — the queue will not wait for the time this file names.`,
+            `so orrerix will clamp it — the queue will not wait for the time this file names.`,
           section: "merge_queue",
         });
       }
@@ -2559,7 +2559,7 @@ function sectionFindings(w: Workflow): Finding[] {
           "resources",
           "resource-name-invalid",
           `resources: "${name}" is not a usable resource name — letters, digits, - and _, at most ${ID_MAX_CHARS} characters. ` +
-            `loomux rejects it rather than rewriting it, so the name an agent's acquire_lock call uses is the name you wrote.`
+            `orrerix rejects it rather than rewriting it, so the name an agent's acquire_lock call uses is the name you wrote.`
         );
       }
       const r = resources[name]!;
@@ -2619,7 +2619,7 @@ function unknownKeyFindings(w: Workflow): Finding[] {
         message:
           `${where} declares "${key}", which is not part of the workflow schema — ` +
           `this build's engine refuses unknown keys, so the file will not load. ` +
-          `(The pane keeps the line as written; check the spelling, or the file needs a newer loomux.)`,
+          `(The pane keeps the line as written; check the spelling, or the file needs a newer orrerix.)`,
         blockId,
       });
     }
@@ -2927,7 +2927,7 @@ export function scaffoldWorkflowText(authoredWith?: string): string {
   const stamp = authoredWith ? `authored_with: ${authoredWith}\n` : "";
   return `# .loomux/workflow.yml — this repo's agent workflow (loomux #222).
 # Committed on purpose: everyone who clones the repo gets the same roster.
-# Loomux reads it only when "Advanced orchestrator" is ticked in the launcher.
+# Orrerix reads it only when "Advanced orchestrator" is ticked in the launcher.
 
 version: 1
 ${stamp}name: default
@@ -2955,7 +2955,7 @@ blocks:
     model: opus
     # A persona is optional: an inline \`prompt:\` (compiled to the CLI's native inline
     # agent) or a \`profile:\` path to a .github/agents/*.md file. Omit both and the
-    # block runs loomux's built-in role instructions.
+    # block runs orrerix's built-in role instructions.
     #
     # prompt: |
     #   Review ONLY for security defects: injection, authz, secrets, path traversal.
@@ -2967,7 +2967,7 @@ edges:
   - { from: planner, to: worker }
   - { from: worker, to: reviewer }
 
-# GATES — ENFORCED. Loomux refuses \`gh pr merge\` until every reviewer named here has
+# GATES — ENFORCED. Orrerix refuses \`gh pr merge\` until every reviewer named here has
 # recorded a PASS verdict. An agent cannot get around it: the refusal lives in the PATH
 # shim, not in a prompt. Add a second reviewer to the list and it is a second reviewer
 # that must actually pass — which is what makes multi-reviewer more than theatre.

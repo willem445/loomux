@@ -75,7 +75,7 @@ export function promoteConfirmLines(repo: string, workflow: PromoteWorkflow | nu
       "the conversation carries over, but the turn it is in right now is interrupted.",
     "Group: a new group for this repo, or — if this repo already has one — the existing " +
       "dormant group is reattached (its board and audit history carry over), or a sibling " +
-      "group beside a live one. loomux tells you which once it resolves.",
+      "group beside a live one. orrerix tells you which once it resolves.",
   ];
   if (workflow === null) return lines;
   const named = workflow.name || ".loomux/workflow.yml";
@@ -116,7 +116,7 @@ export function promoteRecoveryNote(groupId: string, stage: "spawn" | "bind"): s
   const what =
     stage === "spawn"
       ? "the promoted session didn't start"
-      : "the promoted session started but loomux couldn't bind it to the group";
+      : "the promoted session started but orrerix couldn't bind it to the group";
   return (
     `Promotion incomplete — ${what}. Group ${groupId} is on disk with its board and audit log: ` +
     `reopen it from the session browser's ${groupId} Resume card, which brings this conversation back with it.`
