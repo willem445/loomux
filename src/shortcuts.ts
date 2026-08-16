@@ -19,6 +19,7 @@ export type ShortcutAction =
   | "toggle-files"
   | "open-editor"
   | "toggle-tasks"
+  | "toggle-decisions"
   | "toggle-audit"
   | "toggle-timeline"
   | "toggle-group"
@@ -98,6 +99,25 @@ export function matchShortcut(e: KeyboardEvent): ShortcutAction | null {
       case "KeyF": return "toggle-files";
       case "KeyE": return "open-editor";
       case "KeyT": return "toggle-tasks";
+      // Alt+Q (#1091) — the NEEDS-YOU panel, the board's decision sibling.
+      // NOT Alt+D, which is readline's kill-word in every bash pane.
+      //
+      // CHECKED against the agent CLIs' own references per the
+      // agent-cli-reference discipline, and this one comes out CONFIRMED FREE
+      // rather than merely unverified:
+      //   - Claude Code's interactive-mode reference documents Alt+V/M/P/T/O/
+      //     Y/B/F (and Alt+Enter) and no Alt+Q; its keybindings reference lists
+      //     no Meta+Q default either.
+      //   - Copilot CLI's command reference DOES carry key tables, and its Alt
+      //     rows are Alt+V, Alt+Enter, Alt+arrows and Alt+scroll — no Alt+Q. It
+      //     binds Ctrl+Q (queue a message), which this does not touch; named
+      //     here so a future reader grepping "Q" does not reopen the question.
+      // Readline in this repo's bash leaves `\eq` unbound (`\eQ` is only
+      // do-lowercase-version) — the same shape Alt+W relies on. Neither
+      // vendor documents any Alt+SHIFT default at all, so that variant is
+      // UNVERIFIED rather than free; the `!e.shiftKey` guard on this whole
+      // block is what keeps loomux from taking it.
+      case "KeyQ": return "toggle-decisions";
       case "KeyA": return "toggle-audit";
       // Alt+W (#608) — the progress timeline, the audit log's chart sibling.
       // Verified free before landing, per the agent-cli-reference discipline:

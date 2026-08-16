@@ -47,8 +47,9 @@ edge. So:
   possible dividers alike — see *Divider mechanics* below for exactly what
   that means, because "one resize on release" turns out not to be it.
 - **A docked panel's own internal changes never reach the PTY — with one
-  narrow, bounded, and named exception.** For six of the seven views (task
-  board, git, issues, audit, the file editor, the progress timeline),
+  narrow, bounded, and named exception.** For seven of the eight views (task
+  board, git, issues, audit, the file editor, the progress timeline, the
+  NEEDS-YOU panel),
   refreshing a list, expanding a row, typing in a filter — none of it
   changes the panel's MINIMUM size, so none of it touches `termEl`.
   Verified per view below, not assumed. (The timeline is the one whose
@@ -280,7 +281,7 @@ rather than an overlay?). That is a *different concept* from this feature
 (a view sharing space with a terminal that's still right there), and the
 two are easy to conflate on the same class. So every embeddable view's
 runtime toggle method is named **`setPanelActive(active: boolean)`**, not
-`setEmbedded` — applied uniformly to all seven views (including `TasksView`
+`setEmbedded` — applied uniformly to all eight views (including `TasksView`
 and `FileEditView`, neither of which has a collision of its own, for one
 consistent interface across the set) so a reader never has to remember
 which view's method means what. `FileEditView` in particular already had
@@ -290,14 +291,15 @@ trap `GitView` hit, avoided the same way.
 
 ## What's embeddable, and what isn't
 
-**Seven** views are embeddable: the **task board**, **git**, **GitHub
+**Eight** views are embeddable: the **task board**, **git**, **GitHub
 issues**, the **audit log**, the **group lifecycle panel** ("lifecycle
 status" in the issue — the panel behind `GroupView`'s overlay toggle), the
-**file editor** overlay (`Alt+F`), and the **progress timeline** (`Alt+W`,
-#608). All seven are wired through one generic engine in `pane.ts`
+**file editor** overlay (`Alt+F`), the **progress timeline** (`Alt+W`,
+#608), and the **NEEDS-YOU panel** (`Alt+Q`, #1091). All eight are wired
+through one generic engine in `pane.ts`
 (`EmbedKind`, `EmbedEntry`, `embedRegistry`,
 `openView`/`closeView`/`toggleView`/`embedViewAtSide`/`unembedView`) — see
-*The generic engine*, below. Any THREE of the seven may be docked at once,
+*The generic engine*, below. Any THREE of the eight may be docked at once,
 one per edge; the rest (however many aren't docked) stay available as
 floating overlays.
 
@@ -639,9 +641,12 @@ another docked bottom, and still pop open a THIRD view as a floating
 overlay (say, a quick look at issues) without any of it closing anything
 else — the only thing a floating overlay's OWN open still closes is OTHER
 floating overlays, never a docked one, on any edge. The file-editor overlay
-(never embeddable) still participates as a plain floating panel: it closes
-every OTHER floating overlay when IT opens, and is closed by any of the
-five opening as an overlay, same as before #361.
+participates on exactly the same terms as every other kind: it closes every
+OTHER floating overlay when IT opens, and is closed by any of the other
+seven opening as an overlay, same as before #361. (It was described here as
+"never embeddable" when this section was written, which stopped being true
+once the #361 scope increase made it an `EmbedKind` like the rest — the
+behaviour described is unchanged, only the aside was stale.)
 
 ## Reuse, not a fork
 
@@ -694,7 +699,7 @@ survives the move untouched. Verified per view, not assumed:
   search timer pre-#361 (the overlay-vs-#217-content-pane duality this view
   already had); nothing new needed there for docking. The one addition is
   `setPanelActive`, matching every other view's shape exactly — disables +
-  retitles its own ✕ while docked, same as the other five.
+  retitles its own ✕ while docked, same as the other seven.
 
 The overlay host (`.git-overlay`, one per view — unchanged) and each edge's
 slot (`.pane-embed-panel.side-*` / `.pane-embed-divider.side-*`) are all
@@ -882,8 +887,8 @@ were added. Malformed individual entries are dropped, not the whole array;
 two entries claiming the SAME side are also de-duplicated (first wins) —
 `test/tabstore.test.ts` pins both.
 
-**`PersistedEmbedView` is `"tasks" | "audit" | "group" | "git" | "editor"`
-— every `EmbedKind` except `"issues"`.** `git` and `editor` joined this
+**`PersistedEmbedView` is every `EmbedKind` except `"issues"`** — today
+`"tasks" | "decisions" | "audit" | "group" | "git" | "editor" | "timeline"`. `git` and `editor` joined this
 round (#361 scope increase) once it became clear the thing that actually
 gated restorability was never "is this an orchestration-family view" — it
 was "is this docked on an ORCHESTRATOR pane," which `git`/`editor` satisfy
@@ -1075,9 +1080,9 @@ lifecycle panel):**
     git/issues/file-editor there (`refuseOverlay`, unchanged) — there is no
     terminal on a content pane to share space with.
 
-**Restart survival (`tasks`/`audit`/`group`/`git`/`editor`/`timeline`, on an
-ORCHESTRATOR pane specifically — not `issues`, and not any of the six on a
-plain terminal/agent pane):**
+**Restart survival (`tasks`/`decisions`/`audit`/`group`/`git`/`editor`/
+`timeline`, on an ORCHESTRATOR pane specifically — not `issues`, and not any
+of the seven on a plain terminal/agent pane):**
 
 12. Dock the task board left and the group panel bottom, quit and relaunch
     loomux with that group's tab still around — it should restore dormant
@@ -1114,7 +1119,7 @@ plain terminal/agent pane):**
 
 **Overlay toggle vs. dock (#361 user-demo finding):**
 
-16. Dock a view (any of the seven) to any edge and leave it open. Click the
+16. Dock a view (any of the eight) to any edge and leave it open. Click the
     PANE HEADER's own toggle button for that view (not its embed button —
     the plain header icon, e.g. the git/task-board/audit/group/issues/
     file-editor button) — nothing should happen: no black/empty area where

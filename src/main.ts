@@ -2653,6 +2653,9 @@ document.addEventListener(
       case "toggle-tasks":
         activeGrid().activePane?.toggleTasksView();
         break;
+      case "toggle-decisions":
+        activeGrid().activePane?.toggleDecisionsView();
+        break;
       case "toggle-audit":
         activeGrid().activePane?.toggleAuditView();
         break;

@@ -92,6 +92,14 @@ export interface OrchTask {
    *  only labels the row with it: a story directly inside an epic is legal,
    *  and no affordance here changes behaviour based on it. */
   kind?: string | null;
+  /** Worktree path where a demo of this row lives (#1091 slice B) — recorded
+   *  by the orchestrator on a `prototype`/`human-testing` row so the NEEDS-YOU
+   *  panel can tell the human where to go run it. Optional on the wire like
+   *  `parent`/`kind`: the backend omits the key entirely when absent, so a
+   *  pre-#1091 board arrives without it. Absent means "no path recorded", never
+   *  "there is no demo" — nothing here guesses one from an assignee's cwd.
+   *  Display metadata: nothing gates on it. */
+  demo_path?: string | null;
   updated_ms: number;
 }
 
@@ -177,7 +185,15 @@ export class TasksView {
 
   constructor(
     private groupId: string,
-    opts: { onClose: () => void; onEmbedMenu: (anchor: HTMLElement) => void }
+    private opts: {
+      onClose: () => void;
+      onEmbedMenu: (anchor: HTMLElement) => void;
+      /** Drain any focus request parked for the BOARD (#1091 slice C), called
+       *  once per render. Non-null only when something asked for a specific
+       *  row while the board was closed or unbuilt — a NEEDS-YOU card citing
+       *  `t-N` is the first caller. `undefined` when the host wires no focus. */
+      takeFocus?: () => string | null;
+    }
   ) {
     this.el = el("div", "tasks-view");
 
@@ -733,6 +749,24 @@ export class TasksView {
     for (const row of visibleRows(this.tasks, this.collapsed)) {
       this.listEl.appendChild(this.renderTask(row, usesDeps, usesHierarchy));
     }
+    this.drainFocus();
+  }
+
+  /** Bring a requested row into view and flash it (#1091 slice C).
+   *
+   *  Drained LAST in a render, once the rows exist, and consumed — so an
+   *  ordinary refresh never yanks the viewport back to a row the human has
+   *  already scrolled away from. A target that names no row on this render is
+   *  a no-op: the task may have been deleted between the request and the
+   *  render, which is not worth an error. */
+  private drainFocus(): void {
+    const target = this.opts.takeFocus?.() ?? null;
+    if (!target) return;
+    const row = this.listEl.querySelector<HTMLElement>(`[data-item-id="${CSS.escape(target)}"]`);
+    if (!row) return;
+    row.scrollIntoView({ block: "nearest" });
+    row.classList.add("task-row-focused");
+    window.setTimeout(() => row.classList.remove("task-row-focused"), 1600);
   }
 
   /** The dependency line under a task's row (#582): what is blocking it, what
@@ -964,6 +998,10 @@ export class TasksView {
   ): HTMLElement {
     const t = boardRow.task;
     const row = el("div", "task-row");
+    // The anchor the focus hook scrolls to (#1091 slice C). A data attribute
+    // rather than an id: several boards can be open at once across panes, and
+    // duplicate DOM ids would make `querySelector` pick an arbitrary one.
+    row.dataset.itemId = t.id;
     // Nesting depth (#958). Clamped: the backend caps writes at depth 4, but a
     // hand-edited tasks.json can be deeper and an unbounded indent would walk
     // the row off the right edge of the overlay.

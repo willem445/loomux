@@ -321,6 +321,21 @@ const STREAMS: StreamRow[] = [
     debt: null,
   },
   {
+    event: "orch-questions-changed",
+    rate: "producer",
+    bound: "throttled",
+    cite: "src/refreshgate.ts",
+    reason:
+      "Emitted on every questions.json write — an ask, an answer, a withdraw, a prune — so " +
+      "its rate is set by the orchestrator, not by a clock. The NEEDS-YOU panel refreshes " +
+      "through the same CoalescingRefresh the board uses (#743 S5): single-flight with a " +
+      "trailing-edge merge, so a burst costs the run already in flight plus exactly one more " +
+      "per open panel, and the trailing run reads the final registry. The panel's OTHER " +
+      "listener (orch-tasks-changed, below) shares that one gate, so a simultaneous burst on " +
+      "both streams still coalesces to one refresh rather than two.",
+    debt: null,
+  },
+  {
     event: "orch-tasks-changed",
     rate: "producer",
     bound: "throttled",
