@@ -2528,7 +2528,7 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
    the existing row states behave exactly as they do on a flat board. Overlay
    chrome throughout — nothing here touches the terminal or its geometry. */
 .task-row[class*="task-depth-"] {
-  border-left: 1px solid var(--border-soft);
+  border-left: 1px solid var(--line);
 }
 .task-depth-1 { margin-left: 14px; }
 .task-depth-2 { margin-left: 28px; }
@@ -2544,12 +2544,13 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
    so nothing about the indent steps above shifts. */
 .task-collapse {
   flex: none; width: 18px; height: 18px; padding: 0;
-  background: var(--panel-2); border: none; border-radius: 4px;
-  color: var(--text); font-size: 11px; line-height: 1; cursor: pointer;
+  background: var(--surface-2); border: none; border-radius: 4px;
+  color: var(--ink); font-size: 11px; line-height: 1; cursor: pointer;
 }
-/* --border-soft resolves to the same surface as --panel-2, so hovering to it
-   would be a no-op; --accent-dim is the next step up the same ramp. */
-.task-collapse:hover { background: var(--accent-dim); color: var(--text); }
+/* --surface-2 is already the elevation ladder's top step, so hovering to
+   another rung would be a no-op; the accent tint used by the other compact
+   icon buttons (dormant-btn, the dock's resize grip) is the next step up. */
+.task-collapse:hover { background: color-mix(in srgb, var(--accent) 28%, transparent); color: var(--ink); }
 .task-collapse-spacer { flex: none; width: 18px; }
 /* Advisory Agile level: a label only. Purple → blue → cyan → dim reads as
    epic → feature → story → task, reusing the palette the status chips already
@@ -2557,14 +2558,16 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .task-chip.kind {
   font-size: 9px; font-weight: 600; letter-spacing: 0.3px; text-transform: uppercase;
 }
-.task-chip.kind.k-epic { background: rgba(187, 154, 247, 0.16); color: #c7a9ff; }
-.task-chip.kind.k-feature { background: rgba(122, 162, 247, 0.16); color: #a7bff8; }
-.task-chip.kind.k-story { background: rgba(125, 207, 255, 0.14); color: #7dcfff; }
-.task-chip.kind.k-task { background: var(--panel-2); color: var(--text-dim); }
+.task-chip.kind.k-epic { background: color-mix(in srgb, var(--id-violet) 16%, transparent); color: var(--id-violet); }
+.task-chip.kind.k-feature { background: color-mix(in srgb, var(--id-azure) 16%, transparent); color: var(--id-azure); }
+.task-chip.kind.k-story { background: color-mix(in srgb, var(--id-cyan) 14%, transparent); color: var(--id-cyan); }
+.task-chip.kind.k-task { background: var(--surface-2); color: var(--ink-dim); }
 /* A level only a hand-edited tasks.json can hold — the backend refuses it on
-   write, so it reads as broken rather than as a fifth level. */
+   write, so it reads as broken rather than as a fifth level. Same red as the
+   `missing` dep chip below: both are the "a hand-edited tasks.json produced
+   this" state, not an identity. */
 .task-chip.kind.k-unknown {
-  background: rgba(247, 118, 142, 0.16); color: #f7899d; text-transform: none;
+  background: color-mix(in srgb, var(--state-danger) 16%, transparent); color: var(--state-danger); text-transform: none;
 }
 /* Direct-child rollup: the same two numbers the orchestrator's list_tasks row
    carries. Neutral — a count is information, not a state. */
@@ -2573,11 +2576,11 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 }
 /* Everything inside is done but this row's own status lags. Green like `done`,
    because that is what it is reporting; it is a prompt, never a write. */
-.task-chip.rollup-done { background: rgba(158, 206, 106, 0.14); color: #b4e878; }
+.task-chip.rollup-done { background: color-mix(in srgb, var(--id-jade) 16%, transparent); color: var(--id-jade); }
 /* A container naming no row on the board — the hierarchy twin of the `missing`
    dep chip, and the same red, because the fix is the same shape: re-point it. */
 .task-chip.parent-missing {
-  background: rgba(247, 118, 142, 0.16); color: #f7899d;
+  background: color-mix(in srgb, var(--state-danger) 16%, transparent); color: var(--state-danger);
   font-family: "Cascadia Mono", Consolas, monospace;
 }
 .task-btn.nest { font-size: 10px; }
