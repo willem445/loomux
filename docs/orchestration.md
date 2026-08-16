@@ -521,18 +521,21 @@ These deserve their own detail — see:
   the pane and acknowledges the chip — acknowledging only tells loomux you've
   seen it, so a chip that's still genuinely true comes right back on the next
   scan.
-  - **The NEEDS-YOU panel** (`Alt+Q`, on an orchestrator pane) is where you
-    actually act on a pending question or a demo — everything currently
-    waiting on you, badged with a running total in its own header:
+  - **The NEEDS-YOU panel** (`Alt+Q`, or the raised-hand icon in an
+    orchestrator pane's header) is where you actually act on a pending
+    question or a demo — everything currently waiting on you, badged with a
+    running total in its own header:
     - **Decisions** — one card per pending question. Pick one of its options
       (each can carry the asker's own reasoning under the label), type a
       free-text answer, or both; a question decides for itself whether it
       allows a single pick, several, or no free text at all, and the card
-      only offers what that question allows. Sending settles the row and
-      delivers your answer straight back to the asker's pane. A card that
-      names the board row it's holding up links straight to it, and answered
-      or withdrawn questions fall into a faded "answered" tail (the most
-      recent ten) instead of vanishing.
+      only offers what that question allows. Sending delivers your answer to
+      the **orchestrator's** pane — even for a question a liaison pane
+      posed, since the liaison never gets the answer notice itself and
+      instead reads the outcome back through its own `list_questions`. A
+      card that names the board row it's holding up links straight to it,
+      and answered or withdrawn questions fall into a faded "answered" tail
+      (the most recent ten) instead of vanishing.
     - **Demos** — one card per board row parked in `prototype` or
       `human-testing`, showing the worktree path where the demo lives (click
       to copy) and a link to its PR when it has one, so you can go run it
@@ -542,16 +545,22 @@ These deserve their own detail — see:
       notes back to the orchestrator — on `human-testing` it's the
       request-changes gesture and reopens the task, on `prototype` it's a
       plain note that leaves the demo gate exactly where it was.
-    Before this panel, a pending question had no answer surface at all — the
-    orchestrator could withdraw one overtaken by events, and that was the only
-    way to settle it. Now the panel is the only place that settles a question.
-  - **No agent holds this pane open with a blocking dialog to get your answer.**
-    The orchestrator — and the liaison, if the group's workflow declares a
-    human-facing liaison pane — files every question through `ask_human`,
-    which returns instantly and never waits, so the pane stays free to keep
-    taking deliveries the whole time you're away.
+
+    The panel is the only place a question gets **answered** — before it
+    existed there was no answer surface in the UI at all. Withdrawing one is
+    still a separate, orchestrator-only path: `withdraw_question` settles an
+    overtaken question too, just as *withdrawn* rather than answered, and
+    that was already true before this panel shipped.
+  - **loomux's protocol is that no agent asks you through a blocking
+    dialog.** The orchestrator's role instructions — and a liaison pane's,
+    where the group's workflow declares one — call for filing every question
+    through `ask_human` instead of a CLI's own interactive-question dialog,
+    because a dialog holds the whole pane and refuses every delivery queued
+    behind it. That is instruction an agent follows, not yet something
+    loomux enforces structurally on every CLI, so treat it as the norm
+    rather than a hard guarantee.
   - An optional per-group **desktop notification** toggle (🔔 in the lifecycle
-    panel) raises an OS toast the moment a new question needs your answer
+    panel) raises an OS toast the first time a question needs your answer
     (off by default). It fires for that and for the other reasons above —
     **except** a task merely reaching a merge or demo gate, which is common
     enough (every PR does it) that toasting on it would be noise; the board

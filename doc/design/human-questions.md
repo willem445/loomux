@@ -292,12 +292,13 @@ though it were.
 What is **not** here is the human's half:
 
 - **No surface shows the human a pending question.** The inbox panel, the
-  latched attention reason and the opt-in toast are Q2. Until then a registered
-  question is visible only in `questions.json`, in the audit log, and to agents
-  through `list_questions` — the trusted answer command exists
-  (`orch_question_answer`) but nothing in the UI calls it. *(Delivered by
-  #1091 slices C and D, below — this paragraph describes the state at Q1's
-  merge and is left as the record of it.)*
+  *then-planned* latched attention reason and the opt-in toast are Q2. Until
+  then a registered question is visible only in `questions.json`, in the audit
+  log, and to agents through `list_questions` — the trusted answer command
+  exists (`orch_question_answer`) but nothing in the UI calls it. *(Delivered
+  by #1091 slices C and D, below — this paragraph describes the state at Q1's
+  merge and is left as the record of it. The attention reason shipped
+  RE-DERIVED every scan, not latched — see the slice C/D/G section below.)*
 - **No role template teaches the protocol.** Q3 rewrites the orchestrator's
   open-question invariant — mark the task blocked citing `q-N`, re-surface from
   `list_questions`, un-block only that task on the answer. Until it lands, an
