@@ -9135,9 +9135,16 @@ pub struct Task {
     /// board, and an agent tidying rows out of the human's sight is the one
     /// thing this must never become.
     ///
-    /// **Deliberately NOT read by anything agent-facing.** `TaskSummary` does
+    /// **Deliberately NOT read by anything agent-facing, and that takes TWO
+    /// mechanisms because there are two agent read paths.** `TaskSummary` does
     /// not carry it and `list_tasks` does not filter on it, so the
-    /// newest-`LIST_TASKS_DONE_CAP` rule keeps meaning exactly what it meant.
+    /// newest-`LIST_TASKS_DONE_CAP` rule keeps meaning exactly what it meant;
+    /// and `get_task` — the full-record read — serializes `AgentTaskView`, not
+    /// this struct. **Never serialize a `Task` onto the MCP surface**: the
+    /// `skip_serializing_if` below hides this key only while the stamp is
+    /// absent, so a bare `to_string(&task)` publishes it the instant a human
+    /// clears anything (#1152 review round 1). `agent_task_view`'s exhaustive
+    /// destructure is what stops the next field repeating that.
     /// The board reads it as an archive marker only while the row is still
     /// `done` (see the frontend's `isCleared`), so a reopened task comes back
     /// into view without a repair pass having to wipe the stamp.
@@ -9210,6 +9217,114 @@ pub struct TaskSummary {
 /// children omits the keys entirely, the way an empty link array does.
 fn count_is_zero(n: &usize) -> bool {
     *n == 0
+}
+
+/// `skip_serializing_if` for `AgentTaskView`'s borrowed link slices — the
+/// borrowed form of `Vec::is_empty`, which serde cannot use through a `&[T]`
+/// field (it passes `&&[T]`).
+fn borrowed_slice_is_empty(v: &&[String]) -> bool {
+    v.is_empty()
+}
+
+/// The agent-facing view of ONE full task record — what the MCP `get_task`
+/// tool returns (#1152 review round 1).
+///
+/// **`Task` is a storage shape, not a wire shape, and must never be serialized
+/// straight onto the MCP surface.** It also carries state that belongs to the
+/// HUMAN's own board (`cleared_ms`), and a `#[derive(Serialize)]` on the
+/// storage type hands every future field to agents the moment somebody adds
+/// one. That is not hypothetical: it is exactly how `cleared_ms` reached
+/// agents through `get_task` in the first place, while four other surfaces
+/// documented that it could not.
+///
+/// **Default-deny, and enforced by the compiler rather than by care.**
+/// `agent_task_view` below destructures `Task` **exhaustively**, so adding a
+/// field to `Task` does not quietly widen this view — it stops the crate
+/// compiling until somebody classifies the new field as agent-visible (name it
+/// here) or human-only (bind it to `_` there, next to `cleared_ms`). The
+/// failure direction is therefore "an agent lacks a field somebody meant to
+/// expose", which is visible and one line to fix, instead of "agents silently
+/// gained one nobody meant to expose", which is invisible and is the whole
+/// reason this type exists.
+///
+/// Deliberately NOT guarded by a source scan as well. The scan that would
+/// catch a future `to_string(&task)` has to key off the binding's *name*, and
+/// this repo's own convention rules that out — "a source-scanning guard must
+/// not decide from a binding's name; a rename steps over it, so it enforces
+/// nothing". The exhaustive destructure is both stronger and rename-proof.
+///
+/// Field-for-field identical to `Task` minus `cleared_ms`, including every
+/// `skip_serializing_if`, so no agent-visible shape changes: a caller that
+/// never saw `cleared_ms` (i.e. every board before a human ever clicked clear)
+/// gets byte-identical JSON to what it got before.
+#[derive(Serialize)]
+pub struct AgentTaskView<'a> {
+    pub id: &'a str,
+    pub title: &'a str,
+    pub status: &'a str,
+    pub issue: Option<&'a str>,
+    pub pr: Option<&'a str>,
+    pub pr_base: Option<&'a str>,
+    pub assignee: Option<&'a str>,
+    pub session: Option<&'a str>,
+    pub notes: &'a [TaskNote],
+    #[serde(skip_serializing_if = "borrowed_slice_is_empty")]
+    pub deps: &'a [String],
+    #[serde(skip_serializing_if = "borrowed_slice_is_empty")]
+    pub related: &'a [String],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub demo_path: Option<&'a str>,
+    pub updated_ms: u64,
+}
+
+/// Project a stored `Task` onto the agent-facing view — see `AgentTaskView`.
+pub fn agent_task_view(task: &Task) -> AgentTaskView<'_> {
+    // EXHAUSTIVE ON PURPOSE. This destructure is the guard: a new field on
+    // `Task` breaks this line, and whoever adds it has to say which side of the
+    // human/agent boundary it falls on. Do not replace it with `..`.
+    let Task {
+        id,
+        title,
+        status,
+        issue,
+        pr,
+        pr_base,
+        assignee,
+        session,
+        notes,
+        deps,
+        related,
+        parent,
+        kind,
+        demo_path,
+        // HUMAN-ONLY (#1152): the human's archive stamp on their own board.
+        // Withheld here, not merely undocumented — `docs/orchestration.md`
+        // promises the human that no agent can see they cleared a row, and this
+        // binding is where that promise is kept.
+        cleared_ms: _,
+        updated_ms,
+    } = task;
+    AgentTaskView {
+        id,
+        title,
+        status,
+        issue: issue.as_deref(),
+        pr: pr.as_deref(),
+        pr_base: pr_base.as_deref(),
+        assignee: assignee.as_deref(),
+        session: session.as_deref(),
+        notes,
+        deps,
+        related,
+        parent: parent.as_deref(),
+        kind: kind.as_deref(),
+        demo_path: demo_path.as_deref(),
+        updated_ms: *updated_ms,
+    }
 }
 
 /// The only status that satisfies a dependency edge (#582). Merged/accepted is

@@ -1087,7 +1087,14 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
         "get_task" => {
             let id = arg_str(args, "id").ok_or("id required")?;
             let task = reg.get_task(&caller.group, id).ok_or_else(|| format!("unknown task: {id}"))?;
-            Ok(serde_json::to_string(&task).unwrap_or_default())
+            // NEVER `to_string(&task)`. `Task` is the storage shape and also
+            // carries the human's own board state, so serializing it here hands
+            // agents every field it will ever gain — which is how `cleared_ms`
+            // reached this response while four other surfaces said it could not
+            // (#1152 review round 1). `agent_task_view` is the agent-facing
+            // projection, and its exhaustive destructure is what stops the next
+            // field repeating this.
+            Ok(serde_json::to_string(&super::agent_task_view(&task)).unwrap_or_default())
         }
 
         // ---- the human-question registry (#946) ----

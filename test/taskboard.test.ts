@@ -926,7 +926,7 @@ test("finished work sinks below the live work, and live priority order is untouc
   assert.deepEqual(
     visibleRows(board).map((r) => r.task.id),
     // Live rows first, in exactly the array order they had; then the finished
-    // ones, newest-finished first.
+    // ones, most recently updated first.
     ["t-2", "t-4", "t-6", "t-3", "t-5", "t-1"]
   );
   // And the split is reported on the row, which is what turns the manual
@@ -1131,7 +1131,7 @@ test("a settled row is not in the manual priority list, so both arrows are off",
   assert.deepEqual(siblingPosition(board, "t-1"), { index: 0, count: 2 });
   assert.deepEqual(siblingPosition(board, "t-3"), { index: 1, count: 2 });
   // {index:-1} is what disables both buttons in tasksview — a finished row's
-  // place is derived (newest-first), so a manual step there would contradict
+  // place is derived (most recently updated first), so a manual step there would contradict
   // the order the board just told the human it was using.
   assert.deepEqual(siblingPosition(board, "t-2"), { index: -1, count: 0 });
   // The view passes the board-level settled set in rather than making this

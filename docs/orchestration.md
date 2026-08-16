@@ -333,17 +333,20 @@ being part of it:
   nested inside it, drops below the live work **of its own group** (the
   top-level rows, or its container's children — see [Parent tasks and
   subtasks](#parent-tasks-and-subtasks)),
-  ordered newest-finished first. Nothing about your priority order changes:
-  live items keep exactly the relative order you gave them, and a `done`
-  container that still holds an open task stays where it is, so live work can
-  never disappear under a finished parent.
+  ordered most recently updated first. Nothing about your priority order
+  changes: live items keep exactly the relative order you gave them, and a
+  `done` container that still holds an open task stays where it is, so live
+  work can never disappear under a finished parent. ("Most recently updated",
+  not "most recently finished" — anything that touches an item counts, so the
+  orchestrator adding a note to an old finished item lifts it back to the top
+  of the finished group.)
 - **Cleared items drop out** until you ask for them — see **📥 clear done**
   below.
 
 Because of the sink, the ▲/▼ buttons move an item one step relative to the
 items you can *see* above and below it, skipping whatever finished rows happen
 to sit between them in the file. On a finished item both arrows are off: its
-place is derived (newest first), not yours to set — reopen it and it rejoins
+place is derived (most recently updated first), not yours to set — reopen it and it rejoins
 the priority list.
 
 Board controls:

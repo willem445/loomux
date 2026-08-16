@@ -19,6 +19,7 @@ import {
   childCounts,
   clearableCount,
   clearedIds,
+  isCleared,
   settledIds,
   depCandidates,
   depState,
@@ -940,14 +941,41 @@ export class TasksView {
    *
    *  Drained LAST in a render, once the rows exist, and consumed — so an
    *  ordinary refresh never yanks the viewport back to a row the human has
-   *  already scrolled away from. A target that names no row on this render is
-   *  a no-op: the task may have been deleted between the request and the
-   *  render, which is not worth an error. */
+   *  already scrolled away from.
+   *
+   *  A target that names no row on this render used to be a silent no-op, which
+   *  conflates two different situations (#1152 review round 1, finding 4). The
+   *  request is CONSUMED either way, so a deep link from the NEEDS-YOU panel
+   *  onto a row that is merely off-screen simply appeared to do nothing:
+   *  already true for a row inside a collapsed container (#958), and #1152 adds
+   *  a second way — a cleared row, hidden until 👁. So the two cases are now
+   *  told apart by the board itself rather than by the human's guess:
+   *
+   *  - the id names NO row on the board — still a silent no-op, because the
+   *    task really can be deleted between the request and the render, and that
+   *    is not worth an error;
+   *  - the id names a row that IS on the board but is not rendered — say so,
+   *    and say which affordance brings it back.
+   *
+   *  A toast rather than an auto-reveal: flipping the human's view (expanding a
+   *  container, turning the archive on) as a side effect of a click elsewhere
+   *  is a bigger behaviour than the problem, and this at least makes the state
+   *  legible. Covers the pre-existing collapsed case too, not just the new one. */
   private drainFocus(): void {
     const target = this.opts.takeFocus?.() ?? null;
     if (!target) return;
     const row = this.listEl.querySelector<HTMLElement>(`[data-item-id="${CSS.escape(target)}"]`);
-    if (!row) return;
+    if (!row) {
+      const known = this.tasks.find((t) => t.id === target);
+      if (known) {
+        this.toast(
+          isCleared(known)
+            ? `${target} is cleared — use 👁 show cleared above to bring it back into view.`
+            : `${target} is on the board but hidden right now — expand the container it sits in.`
+        );
+      }
+      return;
+    }
     row.scrollIntoView({ block: "nearest" });
     row.classList.add("task-row-focused");
     window.setTimeout(() => row.classList.remove("task-row-focused"), 1600);
@@ -1262,8 +1290,11 @@ export class TasksView {
     if (isAwaitingHuman(t.status)) row.classList.add("awaiting-human");
     const activity = taskActivityState(t.status, t.assignee, this.liveAgentIds);
     if (activity) row.classList.add(`task-row-${activity}`);
-    // Only ever true while "show cleared" is on — an archived row recedes
-    // further still, so the working items keep the eye even in that view.
+    // An archived row recedes further still, so the working items keep the eye
+    // even in the show-cleared view. Usually that IS the show-cleared view —
+    // but not only: a cleared container still holding live work is never
+    // hidden (`clearedIds` is a whole-subtree closure), so it can carry this
+    // class with the toggle off. See `BoardRow.cleared`.
     if (boardRow.cleared) row.classList.add("task-row-cleared");
     // A queued task waiting on an unfinished dep recedes, so it can't be read
     // as work anyone could pick up right now (#582's core ask: blocked-queued
@@ -1311,16 +1342,16 @@ export class TasksView {
     up.disabled = pos.index <= 0;
     down.disabled = pos.index < 0 || pos.index === pos.count - 1;
     // A settled row reports {-1, 0} above, so both buttons are already off —
-    // its place at the bottom is derived (newest-finished first) and a manual
+    // its place at the bottom is derived (most recently updated first) and a manual
     // step there would contradict the order the board just told the human it
     // was using. Say so rather than leaving two dead arrows unexplained.
     up.title = boardRow.settled
-      ? "Finished work is ordered newest-first — reopen it to give it a priority again"
+      ? "Finished work sits at the bottom, most recently updated first — reopen it to give it a priority again"
       : boardRow.depth > 0
         ? "Higher priority within its container"
         : "Higher priority";
     down.title = boardRow.settled
-      ? "Finished work is ordered newest-first — reopen it to give it a priority again"
+      ? "Finished work sits at the bottom, most recently updated first — reopen it to give it a priority again"
       : boardRow.depth > 0
         ? "Lower priority within its container"
         : "Lower priority";
@@ -1405,9 +1436,10 @@ export class TasksView {
       top.appendChild(chip);
     }
 
-    // Archived (#1152). Shown only when the archive is on screen, since a
-    // hidden row has no chip to wear — it says WHY this row is here in a view
-    // the human asked for, and the ↩ below is its undo.
+    // Archived (#1152) — the row's own stamp, so it appears on every rendered
+    // cleared row: the ones the 👁 toggle just revealed, and the cleared
+    // container that was never hidden because live work sits inside it. It says
+    // WHY the row is dimmed, and the ↩ below is its undo. See `BoardRow.cleared`.
     if (boardRow.cleared) {
       const chip = el("span", "task-chip cleared", "📥 cleared");
       chip.title = `Cleared from the working list on ${fmtTime(t.cleared_ms ?? 0)} — still on the board, nothing was deleted`;

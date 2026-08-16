@@ -10447,15 +10447,31 @@ fn no_mcp_tool_can_archive_a_row_or_see_that_one_was_archived() {
         "an agent passing the field anyway must not archive a row on the human's board"
     );
 
-    // Nor can an agent tell that the human archived one: the compact row has no
-    // such field, and the row is still listed exactly as it was.
+    // Nor can an agent tell that the human archived one. BOTH read paths, not
+    // just the compact one: `get_task` used to serialize the stored `Task`
+    // straight out, so it shipped `cleared_ms` the moment a stamp existed —
+    // review round 1's blocking finding, and the reason the assertion below
+    // exists at all. The test name claims the whole property; it has to check
+    // every surface that could break it.
     reg.clear_done_tasks(&group, "human").unwrap();
     assert!(reg.tasks(&group)[0].cleared_ms.is_some(), "the human's clear did land");
+
     let listed = dispatch(&reg, &co, "tools/call", &json!({ "name": "list_tasks", "arguments": {} }))
         .unwrap()
         .to_string();
     assert!(!listed.contains("cleared"), "list_tasks must not leak the archive marker: {listed}");
     assert!(listed.contains("t-1"), "and the archived row is still listed for the orchestrator");
+
+    let got = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "get_task", "arguments": { "id": "t-1" } }))
+        .unwrap()
+        .to_string();
+    assert!(!got.contains("cleared"), "get_task must not leak the archive marker either: {got}");
+    // ...and it must still be the FULL record. A projection that fixed the leak
+    // by returning less than agents need would pass the line above and break
+    // the tool: `get_task` exists to carry the note history `list_tasks` omits.
+    assert!(got.contains("t-1") && got.contains("\\\"notes\\\""), "get_task is still the full record: {got}");
+    assert!(got.contains("done"), "...including the status: {got}");
 }
 
 /// The MCP surface #1091 slice B adds: `demo_path` is settable through the
