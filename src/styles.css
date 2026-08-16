@@ -2467,6 +2467,19 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 }
 .task-chip.link:hover { color: var(--ink); text-decoration: underline; }
 
+/* Board marker + deep-link (#1091 slice G): an obvious chip on a row blocked
+   on a human decision or gated on a demo, clicking through to the NEEDS-YOU
+   panel at that item. Token-only (--state-attention, test/theme.test.ts
+   gates a raw colour below the :root block) — same amber the merge-gate
+   `.awaiting-human` row wash already uses, so this reads as one language
+   with "waiting on you" rather than a new colour meaning a new thing. */
+.task-chip.marker {
+  border: none; font: inherit; font-size: 9.5px; font-weight: 600; cursor: pointer;
+  color: var(--state-attention);
+  background: color-mix(in srgb, var(--state-attention) 16%, transparent);
+}
+.task-chip.marker:hover { background: color-mix(in srgb, var(--state-attention) 28%, transparent); }
+
 /* Dependency links (#582). The links line only exists on rows that HAVE links
    (or an open picker), so a board using no dependencies keeps exactly the row
    height it has today. */

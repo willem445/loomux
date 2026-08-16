@@ -3205,6 +3205,11 @@ export class Pane implements VoiceTargetPane {
       onClose: () => this.toggleTasksView(),
       onEmbedMenu: (anchor) => this.showEmbedMenu("tasks", anchor),
       takeFocus: () => this.pendingFocus.take("tasks"),
+      // The board-to-panel direction of the focus hook (#1091 slice G): a row
+      // marked decision-blocked or demo-gated links straight to that item in
+      // the NEEDS-YOU panel, routed through this same hook the panel's own
+      // onFocusTask below uses the other way.
+      onFocusDecision: (id) => this.requestEmbedFocus("decisions", id),
     });
     this.tasksOverlay = document.createElement("div");
     this.tasksOverlay.className = "git-overlay";
