@@ -96,6 +96,17 @@ Each is shipped, tested, and citable — prefer copying one to inventing a shape
   state every `HIDDEN_RECHECK_MS` (5 s) rather than on the event that
   suppressed it. The recheck issues no IPC, so the independent release costs
   nothing the suppression was there to save.
+  And the coalescing case: `resizeburst.ts` `planFit` (#1149) holds a pane's
+  fit back while its geometry is still moving — trailing edge, so an animated
+  layout change collapses to one xterm reflow and one `ResizePseudoConsole`
+  instead of one per frame — and releases on `FIT_MAX_WAIT_MS` (400) measured
+  from the start of the burst, because a gesture with no settled geometry (a
+  window-edge drag) would otherwise withhold the fit for as long as the human
+  holds the mouse. The bound is the clock rather than the burst signal, which
+  is the same independent-release rule `pollgate.ts` follows. Its predecessor
+  is the counter-example worth keeping: a fixed 16 ms debounce, narrower than
+  the once-per-frame `ResizeObserver` delivery it debounced, coalesced
+  nothing at all.
 - **P5 — rAF dirty-flag on the handler side.** A batch stream sets a flag and
   schedules one `requestAnimationFrame` render instead of rendering per batch.
   Precedent: `FileExplorer.onFilesBatch` (`fileexplorer.ts`, the `ft-files`

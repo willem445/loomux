@@ -6,9 +6,12 @@
 // THE ONE STRUCTURAL RULE. This panel is `position: absolute` inside
 // `#workspace` — an OVERLAY, never a flex sibling. `#sessions` is the
 // counter-example the redesign brief names explicitly (ui-redesign.md §X10): it
-// is an in-flow flex item that animates its width, so opening it shrinks the
-// grid, resizing every terminal on every frame of the animation. That is the
-// cost CLAUDE.md constraint 1 exists to refuse. An out-of-flow child of a flex
+// is an in-flow flex item that animates its width, so opening it walks the grid
+// through a whole animation's worth of intermediate widths — a layout pass per
+// frame, and a terminal reflow plus a ConPTY resize on every pane. #1149
+// coalesced the second half of that to ONE per pane per toggle (resizeburst.ts),
+// which is a cost reduced, not a cost removed: the number a displacing panel can
+// reach is one, and the number an overlay pays is zero. An out-of-flow child of a flex
 // container is not a flex item, so nothing here can move `#grid-area` by a
 // pixel; no pane's `ResizeObserver` fires, no `applyFit()` runs, and no ConPTY
 // is resized — by construction, not by care. The dock therefore OCCLUDES panes

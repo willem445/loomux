@@ -4295,8 +4295,12 @@ button.wf-finding:hover { background: var(--surface-2); }
  *     item of #workspace at all. It cannot squeeze #grid-area, no pane's ResizeObserver
  *     fires, no applyFit() runs, and no ConPTY is resized — CLAUDE.md constraint 1 held by
  *     construction rather than by care. Contrast #sessions, an in-flow flex item that
- *     ANIMATES its width and so resizes every terminal on every frame of the transition
- *     (doc/design/ui-redesign.md §X10 names it as the mistake not to repeat).
+ *     ANIMATES its width, so the whole transition is a layout pass per frame and every
+ *     terminal in the grid is refitted and its ConPTY resized — once per pane per toggle
+ *     since #1149 coalesced the fit burst (src/resizeburst.ts), where it used to be once
+ *     per pane PER FRAME. One is the floor for a panel that displaces; zero is what being
+ *     out of flow costs (doc/design/ui-redesign.md §X10 names it as the mistake not to
+ *     repeat).
  *   - The cost, stated rather than hidden: the dock OCCLUDES panes instead of displacing
  *     them. That is the trade the no-resize rule buys, and it is why the dock defaults
  *     closed, toggles in one click, and reserves a strip of grid it may never cover

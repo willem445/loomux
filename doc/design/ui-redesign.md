@@ -656,9 +656,12 @@ looking. A rail listing every agent with its state — the same warp colours —
 
 **The case against, and it is real.** loomux already has a left panel, and it is a warning
 rather than a precedent: `#sessions` is an in-flow flex sibling of the grid at `width: 344px`
-with a `0.24s` width **transition**, so opening it shrinks the grid — resizing every pane,
-and doing so on every frame of the animation. That is exactly the PTY-resize cost constraint
-1 exists to prevent. A rail that toggles would repeat the mistake at higher frequency.
+with a `0.24s` width **transition**, so opening it shrinks the grid — refitting every pane and
+resizing every ConPTY behind it. That was once per pane *per frame of the animation* until
+#1149 coalesced the fit burst (`src/resizeburst.ts`) down to once per pane per toggle; the
+per-frame layout work is unchanged, and one resize per pane is the floor a displacing panel
+can reach. That is the PTY-resize cost constraint 1 exists to prevent, and the recommendation
+below is unaffected — a rail that toggles would still repeat the mistake at higher frequency.
 
 **Recommendation.** A rail, yes — but a **persistent, fixed-width** one that is part of the
 app frame and never animates its width, so the geometry cost is paid once at startup like any
