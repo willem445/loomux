@@ -207,6 +207,100 @@ fn resuming_a_group_redeclares_its_checkout_into_a_fresh_registry() {
     );
 }
 
+/// The worktree an agent spawn cuts is declared **in its own right**, and this
+/// test is written so it cannot pass for the wrong reason (#1092 review,
+/// finding 2 — the previous coverage proved the call site existed, not that it
+/// worked).
+///
+/// The trap it is built to avoid: a worktree that happened to live *inside* the
+/// checkout would resolve through the group's declaration and the descendant
+/// rule, with the worktree's own declaration doing nothing — and the test would
+/// still be green with that line deleted. loomux puts worktrees at
+/// `<repo>-worktrees/<name>`, a SIBLING of the checkout, so the assertion below
+/// first proves the sibling relationship and only then that it resolves. The two
+/// together mean the resolution can have come from nowhere but the worktree's
+/// own admit.
+#[test]
+fn spawning_an_agent_declares_the_worktree_it_cut() {
+    let git = |dir: &std::path::Path, args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "")
+            .env("GIT_CONFIG_SYSTEM", "")
+            .output()
+            .expect("git must be installed for this test");
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    };
+
+    // A bare remote with a real default branch: `git_worktree_add_sync` cuts
+    // from `origin/<default>`, never the checkout's incidental HEAD (#204), so
+    // the fixture needs an origin to resolve.
+    let bare = tempfile::tempdir().unwrap();
+    git(bare.path(), &["init", "-q", "--bare"]);
+    git(bare.path(), &["symbolic-ref", "HEAD", "refs/heads/main"]);
+
+    let seed = tempfile::tempdir().unwrap();
+    git(seed.path(), &["init", "-q"]);
+    git(seed.path(), &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    git(seed.path(), &["config", "user.email", "t@t"]);
+    git(seed.path(), &["config", "user.name", "t"]);
+    std::fs::write(seed.path().join("base.txt"), "base").unwrap();
+    git(seed.path(), &["add", "-A"]);
+    git(seed.path(), &["commit", "-qm", "base on main"]);
+    git(seed.path(), &["remote", "add", "origin", &bare.path().to_string_lossy()]);
+    git(seed.path(), &["push", "-qu", "origin", "main"]);
+
+    let cloneparent = tempfile::tempdir().unwrap();
+    git(cloneparent.path(), &["clone", "-q", &bare.path().to_string_lossy(), "wc"]);
+    let primary = cloneparent.path().join("wc");
+
+    let repo_path = s(&primary);
+    let (reg, _d) = test_registry();
+    let roots = reg.roots();
+    let g = reg.create_group(&repo_path, rails()).unwrap();
+
+    let w = reg
+        .spawn_agent(&g.id, Role::Worker, "w", "t", true, Some("agent-x".into()))
+        .unwrap();
+
+    // 1. The worktree is genuinely OUTSIDE the declared checkout. If this ever
+    //    stops holding, the resolve below stops proving anything and this test
+    //    must be rewritten rather than relaxed.
+    assert!(
+        !std::path::Path::new(&w.cwd).starts_with(&primary),
+        "a cut worktree must be a SIBLING of the checkout (`<repo>-worktrees/<name>`), \
+         not inside it — otherwise it would resolve through the group's own \
+         declaration and this test could not tell the two apart. Got worktree {:?} \
+         under repo {:?}",
+        w.cwd,
+        primary
+    );
+
+    // 2. And it resolves anyway — which, given 1, can only be its own admit.
+    assert!(
+        roots.resolve(&w.cwd).is_ok(),
+        "the worktree an agent spawn cut must be declared in its own right — \
+         without it the agent's pane cannot read its own workspace once slice C \
+         enforces. Worktree: {:?}",
+        w.cwd
+    );
+
+    // 3. The negative control on the same axis: the worktrees PARENT directory
+    //    (`<repo>-worktrees`) is an ancestor of what was declared, and an
+    //    ancestor grants strictly more than was declared, so it must be refused.
+    //    This is what separates "the worktree was declared" from "something
+    //    broad enough to contain it was declared".
+    let worktrees_parent = std::path::Path::new(&w.cwd)
+        .parent()
+        .expect("a cut worktree has a parent directory");
+    assert!(
+        roots.resolve(&s(worktrees_parent)).is_err(),
+        "the worktrees PARENT must not resolve — only the cut worktree itself was \
+         declared, and an ancestor grants more than that. Parent: {worktrees_parent:?}"
+    );
+}
+
 // ---------- 3. the source scans ----------
 
 fn collect_rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
@@ -353,29 +447,42 @@ fn declared_root_never_gains_an_asref_path() {
 /// describe code that no longer exists.
 ///
 /// **Decided on shape, never on a binding's name** (the convention in
-/// CLAUDE.md). The needles are the three call syntaxes a root declaration can
+/// CLAUDE.md). The needles are the four call syntaxes a root declaration can
 /// have, and no rename of a *variable* steps over any of them:
 ///
-///   `.admit(`            — the `RootRegistry` method, the primitive itself
-///   `admit_derived(`     — the best-effort engine-derived wrapper
-///   `rootreg::admit(`    — the shared error mapping, qualified
+///   `.admit(`               — the `RootRegistry` method, the primitive itself
+///   `RootRegistry::admit(`  — the same method called as an associated fn
+///   `admit_derived(`        — the best-effort engine-derived wrapper
+///   `rootreg::admit(`       — the shared error mapping, qualified
 ///
-/// A bare `admit(` was deliberately **rejected** as a needle, and the reason is
-/// worth recording because it is the kind of thing that makes a scan look
-/// thorough while enforcing nothing: `queue::admit` is an unrelated function —
-/// the prompt queue's admission control — with a dozen call sites across both
-/// crates. A needle that matched it would have to allowlist all of them, and an
-/// allowlist that large stops being an argument and becomes a list nobody reads.
-/// The dot in `.admit(` is what separates a method on a registry from a free
-/// function about queues.
+/// A bare `admit(` is deliberately **not** a needle, and the reason is worth
+/// recording because it is the kind of thing that makes a scan look thorough
+/// while enforcing nothing: `queue::admit` is an unrelated function — the prompt
+/// queue's admission control — with a dozen call sites across both crates. A
+/// needle matching it would have to allowlist all of them, and an allowlist that
+/// large stops being an argument and becomes a list nobody reads. The dot in
+/// `.admit(` is what separates a method on a registry from a free function about
+/// queues.
+///
+/// **That leaves one bypass, and it is closed rather than merely documented**
+/// (#1092 review, finding 1). A `use crate::rootreg::admit;` would let a call
+/// site spell the declaration as a bare `admit(...)`, which matches none of the
+/// four needles. So the second assertion below **bans importing a root-admit
+/// function by name anywhere** — every call site must spell it
+/// `rootreg::admit_derived(…)` / `RootRegistry::admit(…)`, which is exactly what
+/// the needles match. The coverage argument is then closed by construction
+/// instead of resting on "nobody will import it".
 ///
 /// **Residual limits.** A call reached through a function pointer or a trait
 /// object, and a call assembled by a macro, are not matched — none exists today.
-/// Renaming the FUNCTIONS themselves would dodge every needle, which is why the
-/// allowlist counts are exact rather than a maximum: a rename drops every count
-/// to zero and fails here instead of passing green. Nor is the frontend scanned:
-/// `admitRoot` is a wrapper over the one command, and what bounds it is that the
-/// command is the only door — which is what this scan pins on the Rust side.
+/// An import that *aliases* (`use …::admit as declare;`) defeats both halves;
+/// it is unbounded for a textual scan, and it is the one hole this test states
+/// rather than closes. Renaming the FUNCTIONS themselves would dodge every
+/// needle, which is why the allowlist counts are exact rather than a maximum: a
+/// rename drops every count to zero and fails here instead of passing green.
+/// Nor is the frontend scanned: `admitRoot` is a wrapper over the one command,
+/// and what bounds it is that the command is the only door — which is what this
+/// scan pins on the Rust side.
 #[test]
 fn every_admit_site_in_the_workspace_is_an_argued_one() {
     /// One row per file permitted to declare a root, with the exact number of
@@ -415,11 +522,17 @@ fn every_admit_site_in_the_workspace_is_an_argued_one() {
     /// exempting a file that no longer holds what the exemption was argued for.
     const DEFINING_FILE: &str = "loomux-engine/rootreg.rs";
 
-    const NEEDLES: &[&str] = &[".admit(", "admit_derived(", "rootreg::admit("];
+    const NEEDLES: &[&str] = &[
+        ".admit(",
+        "RootRegistry::admit(",
+        "admit_derived(",
+        "rootreg::admit(",
+    ];
 
     let files = production_sources();
     let mut seen = vec![0usize; PERMITTED.len()];
     let mut offenders: Vec<String> = Vec::new();
+    let mut bare_imports: Vec<String> = Vec::new();
     let mut found_defining = false;
 
     for (name, path) in &files {
@@ -432,6 +545,23 @@ fn every_admit_site_in_the_workspace_is_an_argued_one() {
             let trimmed = line.trim_start();
             if trimmed.starts_with("//") {
                 continue;
+            }
+            // The bypass, closed. A `use crate::rootreg::admit;` (or a braced
+            // `use …::rootreg::{admit, admit_derived};`) would let a call site
+            // spell the declaration as a bare `admit(…)`, matching no needle
+            // below. Importing the TYPE is fine and expected — `RootRegistry`
+            // does not end in `admit` — so this keys on the function names only.
+            let is_use = ["use ", "pub use ", "pub(crate) use "]
+                .iter()
+                .any(|kw| trimmed.starts_with(kw));
+            if is_use && trimmed.contains("rootreg::") {
+                // `pub use` is checked too, and matters more than a plain `use`:
+                // a re-export would hand the bare spelling to every other module
+                // at once.
+                let after = trimmed.split("rootreg::").nth(1).unwrap_or("");
+                if after.contains("admit") {
+                    bare_imports.push(format!("{name}:{}: {trimmed}", i + 1));
+                }
             }
             // A declaration is not a call: `pub(crate) fn admit_derived(`.
             if trimmed.contains("fn admit") {
@@ -452,6 +582,16 @@ fn every_admit_site_in_the_workspace_is_an_argued_one() {
         "the scan never reached {DEFINING_FILE}, the module that DEFINES the admit \
          — its exemption is argued for a file that is no longer where it was, so \
          update `DEFINING_FILE` (and check the exemption still holds)"
+    );
+    assert!(
+        bare_imports.is_empty(),
+        "a root-admit function must never be IMPORTED by name (#1042, #1092 review \
+         finding 1) — an import lets a call site spell the declaration as a bare \
+         `admit(…)`, which is the one spelling the needles below cannot match \
+         without also matching `queue::admit`. Spell it `rootreg::admit_derived(…)` \
+         or `RootRegistry::admit(…)` at the call site instead; importing the TYPE \
+         `RootRegistry` is fine and is not what this catches. Found:\n{}",
+        bare_imports.join("\n")
     );
     assert!(
         offenders.is_empty(),
