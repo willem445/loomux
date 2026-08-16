@@ -12,6 +12,7 @@ import {
   decideFollow,
   decideViewSync,
   decodeDockPrefs,
+  dockBoxes,
   encodeDockPrefs,
   followsPaneChange,
   isActiveTabChange,
@@ -192,10 +193,11 @@ test("a dock width is clamped to something readable", () => {
   assert.equal(clampDockWidth(500), 500);
 });
 
-test("the dock may never cover the whole workspace", () => {
-  // The dock is an overlay: nothing about the grid pushes back on its width, so
-  // without this a wide dock hides every pane while the panes carry on
-  // rendering full-size underneath it.
+test("the dock may never take the whole workspace", () => {
+  // Nothing about the grid pushes back on a persisted or dragged width, so
+  // without this a wide dock would squeeze the panes out of the row entirely
+  // (and, before #1150 made it displace, would have covered them instead —
+  // same number, same promise, different mechanism).
   const workspace = 800;
   assert.equal(clampDockWidth(9999, workspace), workspace - DOCK_TERM_RESERVE_PX);
   assert.ok(clampDockWidth(9999, workspace) < workspace);
@@ -214,9 +216,78 @@ test("a non-finite width falls back rather than reaching a style property", () =
   assert.equal(clampDockWidth(Number.POSITIVE_INFINITY), DEFAULT_DOCK_PREFS.width);
 });
 
+// ---------- dockBoxes: the column, and the panel the column clips ----------
+
+test("a closed dock's COLUMN is zero — that is how the panes get the space back (#1150)", () => {
+  // The feature, in one assertion. The dock is a flex sibling of #grid-area, so
+  // an open pane reclaims the room only if the dock's own column reaches 0; a
+  // closed dock that kept its width would sit there as an empty strip and the
+  // autosize the human asked for would never happen.
+  assert.equal(dockBoxes(false, 420).columnPx, 0);
+  assert.equal(dockBoxes(true, 420).columnPx, 420);
+});
+
+test("a closed dock's CONTENTS keep their width, so the toggle slides rather than reflows", () => {
+  // Not an oversight — the inner panel is absolutely positioned at a fixed
+  // width and the column clips it. If it collapsed with the column, every frame
+  // of the 240 ms transition would re-lay-out a git graph or a file tree at an
+  // intermediate width, and the reopen would do it again on the way back.
+  assert.equal(dockBoxes(false, 420).contentPx, 420);
+  assert.equal(dockBoxes(false, 420).contentPx, dockBoxes(true, 420).contentPx);
+});
+
+test("both widths come out of ONE call, so they cannot disagree", () => {
+  // An open dock's column and its contents are the same number BY
+  // CONSTRUCTION. Two separate clamps could round differently, or drift when
+  // one caller was updated and the other was not, and the symptom would be a
+  // 1px sliver of grid showing through the panel.
+  for (const w of [DOCK_MIN_W - 50, 301, 420, 899, DOCK_MAX_W + 50]) {
+    const boxes = dockBoxes(true, w);
+    assert.equal(boxes.columnPx, boxes.contentPx, `width ${w}`);
+    assert.equal(boxes.columnPx, clampDockWidth(w), `width ${w}`);
+  }
+});
+
+test("a corrupt persisted width never reaches a style property", () => {
+  // `style.width = "NaNpx"` is ignored, which leaves the column at whatever it
+  // was — including, for a dock being closed, its full open width.
+  for (const bad of [Number.NaN, Number.POSITIVE_INFINITY]) {
+    assert.equal(dockBoxes(true, bad).columnPx, DEFAULT_DOCK_PREFS.width);
+    assert.equal(dockBoxes(false, bad).columnPx, 0);
+    assert.equal(dockBoxes(false, bad).contentPx, DEFAULT_DOCK_PREFS.width);
+  }
+});
+
+test("sidedock.ts hides the dock by COLLAPSING it, never with `hidden` (#1150)", () => {
+  // The pure module being green says nothing about whether the DOM half uses
+  // it. DOM wiring is hand-verified in this repo, but this particular wire has
+  // a silent failure mode worth a guard: `el.hidden` is `display: none`, which
+  // hides the dock perfectly well and looks like a tidy-up. It would also skip
+  // the width transition entirely, so the panes would snap instead of
+  // autosizing and the burst `resizeburst.ts` is sized for would never exist —
+  // and every other test in this file would still pass.
+  //
+  // The axis is the DOM PROPERTY, not any identifier around it (a rename cannot
+  // step over `.hidden = `), and it is default-deny in both directions: the one
+  // `dockBoxes` call must be found, so moving the geometry somewhere else fails
+  // here loudly rather than leaving this guard watching nothing.
+  const src = readFileSync(new URL("../src/sidedock.ts", import.meta.url), "utf8");
+  assert.doesNotMatch(
+    src,
+    /\bthis\.el\.hidden\s*=/,
+    "the dock's own column must never be display:none — that is the transition, and the autosize"
+  );
+  assert.equal(
+    [...src.matchAll(/\bdockBoxes\s*\(/g)].length,
+    1,
+    "sidedock.ts must set its geometry from exactly one dockBoxes call — a second one is a " +
+      "second copy of the rule, and none means this guard is watching nothing"
+  );
+});
+
 // ---------- the reserve's REAL enforcement point: the stylesheet ----------
 
-/** The `.sidedock` rule body, read off the stylesheet.
+/** One CSS rule body, read off the stylesheet by its selector.
  *
  *  Anchored to the start of a line and sliced to the rule's OWN closing brace,
  *  never `css.slice(css.indexOf(".sidedock {"), css.indexOf(".sidedock-grip"))`,
@@ -235,19 +306,22 @@ test("a non-finite width falls back rather than reaching a style property", () =
  *  inserted above a `.sidedock` rule changed to `position: relative`, the old
  *  extraction PASSED while the invariant it exists to defend was broken. This
  *  version reddens on the same input, because it reads the rule. */
-function sidedockRule(): string {
+function cssRule(selector: string): string {
   const css = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
-  const open = /^\.sidedock\s*\{/m.exec(css);
-  assert.ok(open, "the .sidedock rule must exist in src/styles.css");
+  const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const open = new RegExp(`^${escaped}\\s*\\{`, "m").exec(css);
+  assert.ok(open, `the ${selector} rule must exist in src/styles.css`);
   const end = css.indexOf("}", open.index);
-  assert.ok(end > open.index, ".sidedock's rule is unterminated");
+  assert.ok(end > open.index, `${selector}'s rule is unterminated`);
   const rule = css.slice(open.index, end + 1);
   assert.ok(
     /[a-z-]+\s*:/.test(rule),
-    `.sidedock's rule body carries no declarations — the slice is wrong, not the CSS:\n${rule}`
+    `${selector}'s rule body carries no declarations — the slice is wrong, not the CSS:\n${rule}`
   );
   return rule;
 }
+
+const sidedockRule = () => cssRule(".sidedock");
 
 test("the stylesheet bounds the dock's width, so boot/restore/resize are all covered", () => {
   // `clampDockWidth`'s reserve only ever runs on the DRAG path. Boot, a restore
@@ -267,13 +341,91 @@ test("the stylesheet bounds the dock's width, so boot/restore/resize are all cov
   );
 });
 
-test("the dock is an overlay, and the stylesheet is where that is true", () => {
-  // Constraint 1 rests entirely on `.sidedock` being out of flow: an
-  // absolutely-positioned child of `#workspace` is not a flex item, so it
-  // cannot squeeze `#grid-area` and no pane ever hears a resize. If someone
-  // makes it `position: relative` or `static` to "fix" a layout quirk, every
-  // terminal starts reflowing and nothing else in this suite would notice.
-  assert.match(sidedockRule(), /position:\s*absolute/, ".sidedock must stay absolutely positioned");
+test("the dock is an IN-FLOW flex item, and the stylesheet is where that is true (#1150)", () => {
+  // The dock used to be `position: absolute` — out of flow, occluding panes,
+  // unable to squeeze `#grid-area` by construction. #1150 moved it into the
+  // flex row at the human's direction so the open panes autosize the way
+  // `#sessions` already makes them (doc/design/side-dock.md).
+  //
+  // Out of flow is therefore now the REGRESSION, not the invariant: an
+  // absolutely-positioned `.sidedock` would silently stop displacing the grid,
+  // the panes would go back to being covered, and every other test here would
+  // still pass. Both spellings are refused, because `fixed` occludes the same
+  // way `absolute` does.
+  const rule = sidedockRule();
+  assert.doesNotMatch(
+    rule,
+    /position:\s*(absolute|fixed)/,
+    ".sidedock must stay in flow — out of flow is what #1150 removed"
+  );
+});
+
+test("the dock's column animates, so its resize burst reaches the coalescer (#1150)", () => {
+  // The whole point of animating rather than snapping: an animated width is a
+  // BURST of ResizeObserver deliveries, which `src/resizeburst.ts` collapses
+  // into one fit per pane per toggle. It is the same treatment `#sessions`
+  // gets, through the same seam, with no second coalescer anywhere near the
+  // dock. `test/resizeburst.test.ts` pins the duration against the ceiling.
+  assert.match(
+    sidedockRule(),
+    /transition:[^;]*\bwidth\b/,
+    ".sidedock must animate its width — that is the burst the coalescer is for"
+  );
+  // The fixed-width inner is what keeps the hosted git graph / file tree from
+  // re-laying out at every intermediate width; without the clip it would paint
+  // straight over the grid while the column collapses.
+  assert.match(sidedockRule(), /overflow:\s*hidden/, ".sidedock must clip its fixed-width inner");
+});
+
+test("a closed dock collapses its width — it does not `display: none` (#1150)", () => {
+  // `display: none` is the obvious way to hide a panel and it would break the
+  // feature twice over: no transition can run from it, so the panes would snap
+  // rather than autosize, and the burst the coalescer is sized for would never
+  // exist. The closed state is a zero-width column (`dockBoxes`) plus this
+  // rule, which only removes the border that would otherwise be a stray 1px
+  // line down the grid's right edge.
+  const rule = cssRule(".sidedock.collapsed");
+  assert.doesNotMatch(rule, /display:/, "a collapsed dock is zero-width, never display:none");
+  assert.match(rule, /border-left-width:\s*0/);
+});
+
+test("a drag suppresses the transition, or the dock lags the cursor (#1150)", () => {
+  // The transition exists for the toggle. On the grip drag the width follows
+  // the mouse, and a 240 ms ease on every mousemove makes the dock trail the
+  // pointer AND turns a settled drag into a burst that keeps arriving after the
+  // human stopped moving — the coalescer would then fit at a width the drag had
+  // already left.
+  assert.match(cssRule(".sidedock.resizing"), /transition:\s*none/);
+});
+
+test("the grid keeps its reserve however the two side panels are combined (#1150)", () => {
+  // `.sidedock`'s `max-width` bounds what the dock ASKS for, against the whole
+  // workspace. That was the entire guarantee while the dock only covered the
+  // grid — but a dock that DISPLACES shares the row with `#sessions` (344px,
+  // `flex: none`), and `max-width: calc(100% - 240px)` does not know that. With
+  // both panels open on a 640px window the two fixed columns want 764px, and
+  // the grid — `min-width: 0` before #1150 — would be squeezed to nothing while
+  // both panels kept their full width.
+  //
+  // The floor therefore lives on the thing being protected: `#grid-area` keeps
+  // DOCK_TERM_RESERVE_PX no matter what asks for room, and the dock (the only
+  // shrinkable item in the row) gives the space up instead.
+  const rule = cssRule("#grid-area");
+  const min = /min-width:\s*(\d+)px/.exec(rule);
+  assert.ok(min, `#grid-area needs a min-width floor; rule was:\n${rule}`);
+  assert.equal(
+    Number(min[1]),
+    DOCK_TERM_RESERVE_PX,
+    "the grid's floor must mirror DOCK_TERM_RESERVE_PX — it IS the reserve, now that the dock displaces"
+  );
+  // A floor the dock cannot push through is only half of it: the dock has to be
+  // the item that yields. `flex: none` (what `#sessions` has) would overflow
+  // the workspace instead of shrinking.
+  assert.match(
+    sidedockRule(),
+    /flex:\s*0\s+1\s+auto/,
+    ".sidedock must be shrinkable, so a squeezed row costs the dock and not the grid"
+  );
 });
 
 // ---------- prefs ----------

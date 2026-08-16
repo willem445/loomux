@@ -31,28 +31,35 @@ export const DOCK_MIN_W = 280;
 /** Widest the dock may be dragged, absent a window constraint. */
 export const DOCK_MAX_W = 900;
 
-/** How much of the workspace the dock must always leave uncovered.
+/** How much of the workspace the terminal grid always keeps.
  *
- *  The dock is an OVERLAY, not a flex sibling (CLAUDE.md constraint 1 — see
- *  doc/design/side-dock.md), so nothing about the terminal grid pushes back on
- *  it: a wide enough dock would simply hide every pane while the panes carried
- *  on rendering underneath at full size. This is the same reserve idea as
- *  `TERM_RESERVE_H` in overlaysize.ts, on the other axis, and for the same
- *  reason — an overlay that can cover its own host entirely is a way to lose
- *  the app. The value is duplicated rather than imported for the reason
- *  embedded-panels.md records: a pure module that imports another pure module
- *  has no import spelling that satisfies both `tsc` and bare `node --test`.
+ *  Since #1150 the dock DISPLACES the grid rather than covering it (it is a
+ *  flex sibling of `#grid-area`, the mirror of `#sessions`), so this number
+ *  changed meaning without changing value: it used to be how much of the grid
+ *  the dock could never hide, and it is now how much of the row the grid never
+ *  gives up. Either way it is the same promise — a panel that can consume its
+ *  own host entirely is a way to lose the app, the same reason `TERM_RESERVE_H`
+ *  exists in overlaysize.ts on the other axis. The value is duplicated rather
+ *  than imported for the reason embedded-panels.md records: a pure module that
+ *  imports another pure module has no import spelling that satisfies both `tsc`
+ *  and bare `node --test`.
  *
- *  **THE RESERVE IS ENFORCED IN CSS, NOT HERE** — `.sidedock`'s `max-width`
- *  (styles.css), which holds at boot, on a restore from persistence, and on
- *  every window resize, none of which run this function. It used to be applied
- *  only on the drag path, so a width persisted on a wide monitor came back
- *  whole on a narrow one and covered every pane (#1097 rev-767 B2). A CSS
- *  bound closes all three at once with no JS and nothing that could reach a
- *  PTY. `clampDockWidth` below still applies it on the drag, so the number
- *  that gets PERSISTED is sane too; `test/sidedockmodel.test.ts` pins the
- *  stylesheet's copy of both constants against these, so the mirror cannot
- *  drift silently. */
+ *  **THE RESERVE IS ENFORCED IN CSS, NOT HERE**, and in TWO places that are not
+ *  redundant (styles.css):
+ *
+ *   - `.sidedock`'s `max-width` bounds what the dock ASKS FOR, at boot, on a
+ *     restore from persistence, and on every window resize — none of which run
+ *     this module. It used to be applied only on the drag path, so a width
+ *     persisted on a wide monitor came back whole on a narrow one and covered
+ *     every pane (#1097 rev-767 B2).
+ *   - `#grid-area`'s `min-width` is the floor the grid KEEPS. It exists because
+ *     the max-width above is measured against the whole workspace and cannot
+ *     see `#sessions` taking 344px of the same row; with both panels open on a
+ *     narrow window, the grid — and not the panel — is what would vanish.
+ *
+ *  `clampDockWidth` below still applies the reserve on the drag, so the number
+ *  that gets PERSISTED is sane too; `test/sidedockmodel.test.ts` pins both
+ *  stylesheet copies against this constant, so the mirror cannot drift. */
 export const DOCK_TERM_RESERVE_PX = 240;
 
 /**
@@ -72,6 +79,43 @@ export function clampDockWidth(px: number, availablePx = Number.POSITIVE_INFINIT
     : DOCK_MAX_W;
   const max = Math.min(DOCK_MAX_W, roomy);
   return Math.round(Math.max(DOCK_MIN_W, Math.min(max, px)));
+}
+
+/** The dock's two widths: the COLUMN it occupies in `#workspace`'s flex row,
+ *  and the fixed width its contents are laid out at. */
+export interface DockBoxes {
+  /** What the flex row gives the dock — `0` while it is closed. */
+  columnPx: number;
+  /** The absolutely-positioned inner panel's width, which the column clips. */
+  contentPx: number;
+}
+
+/**
+ * The two widths the DOM sets when the dock opens, closes or is dragged (#1150).
+ *
+ * Handed back together, the same way `resizeburst.ts`'s `FitPlan` returns its
+ * delay and burst start together: they are two halves of one decision and a
+ * caller that could set them from separate calls could set them inconsistently.
+ *
+ * **`columnPx` is 0 when closed, and that is the whole feature.** The dock is a
+ * flex sibling of `#grid-area` now, so the panes get their space back only if
+ * the dock's column actually reaches zero. It has to get there by ANIMATING —
+ * `display: none` would return the space in one jump, with no burst for
+ * `resizeburst.ts` to coalesce and no autosize for the human to see.
+ *
+ * **`contentPx` is NOT 0 when closed, and that is not an oversight.** The panel
+ * inside the column keeps its full width throughout, so a toggle slides a
+ * fixed-size panel behind a moving clip instead of re-laying-out a git graph or
+ * a file tree at fifteen intermediate widths. It is also what makes the reopen
+ * cheap: the contents are already at the width they will be shown at.
+ *
+ * Both are clamped through `clampDockWidth`, so a corrupt persisted width
+ * cannot reach a style property as `NaN` (which collapses the element silently)
+ * and the two can never disagree about what "the dock's width" is.
+ */
+export function dockBoxes(open: boolean, width: number): DockBoxes {
+  const contentPx = clampDockWidth(width);
+  return { columnPx: open ? contentPx : 0, contentPx };
 }
 
 // ---------- roots ----------
@@ -271,10 +315,12 @@ export interface DockPrefs {
   width: number;
 }
 
-/** Closed by default: the dock OCCLUDES the grid rather than shrinking it (the
- *  no-PTY-resize trade, doc/design/side-dock.md), so it may not cover a pane on
- *  first run before anyone has asked for it. Git first because it is the tab
- *  that most wants a folder it did not have to choose. */
+/** Closed by default. The reason survived #1150 changing what an open dock DOES
+ *  to the grid — it used to cover panes, it now shrinks them — because the
+ *  reason was never about which of the two it is: a first run should hand the
+ *  human a full-width terminal, not a panel they have not asked for and a grid
+ *  already narrowed to make room for it. Git first because it is the tab that
+ *  most wants a folder it did not have to choose. */
 export const DEFAULT_DOCK_PREFS: DockPrefs = { open: false, tab: "git", width: 420 };
 
 /** Where the prefs live. UI chrome state is localStorage in this codebase (the

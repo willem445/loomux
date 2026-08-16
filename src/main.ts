@@ -211,6 +211,17 @@ sideDock = new SideDock(workspaceEl, {
   // `activeWorkspace` THROWS before the first tab exists, and this is read at
   // construction — which happens before boot seeds one.
   activeCwd: () => (tabs.count === 0 ? null : tabs.activeWorkspace.grid.activePane?.workdir ?? null),
+  // The dock's grip drag resizes the grid since #1150, so it is bracketed like
+  // any other divider (#432). Only the ACTIVE tab's panes are held: a background
+  // tab's are `display: none` and report zero width, which `shouldResizePty`
+  // already refuses, so holding them would be bookkeeping with no effect.
+  // Captured once, released once — same list both times, whatever happens to
+  // the tab set mid-drag.
+  holdPaneResizes: () => {
+    const held = tabs.count === 0 ? [] : tabs.activeWorkspace.grid.panes();
+    held.forEach((p) => p.beginResizeHold());
+    return () => held.forEach((p) => p.endResizeHold());
+  },
 });
 
 // Switching PROJECT TABS changes the active pane without any grid's `setActive`

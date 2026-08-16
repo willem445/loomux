@@ -22,6 +22,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { planFit, FIT_WINDOW_MS, FIT_MAX_WAIT_MS, type FitPlan } from "../src/resizeburst.ts";
+import { shouldResizePty } from "../src/panefit.ts";
 
 /** The debounce as `pane.ts` runs it: one timer, re-armed on every tick. */
 type Schedule = (nowMs: number, burstStartMs: number | null) => FitPlan;
@@ -67,10 +68,45 @@ function frames(durationMs: number, hz = 60): number[] {
 
 // ---------- the case the issue is about ----------
 
-/** `#sessions` is an in-flow flex item with `transition: width 0.24s`
- *  (styles.css), so a toggle drives #grid-area — and therefore every pane's
- *  termEl — through a 240 ms animation. */
-const SESSIONS_TRANSITION_MS = 240;
+/** How long one selector's rule animates its WIDTH for, in ms, read off the
+ *  stylesheet rather than remembered here.
+ *
+ *  A duration copied into a test is valid only at the commit it was copied on,
+ *  and the thing it is compared against — `FIT_MAX_WAIT_MS` — is a ceiling
+ *  sized FOR it. A stale copy would keep asserting an inequality about a
+ *  transition the app no longer has, which is the one failure this pin exists
+ *  to prevent. Anchored to the start of a line and sliced to the rule's own
+ *  closing brace, for the reason `test/sidedockmodel.test.ts`'s `cssRule`
+ *  records: `.sidedock` and `#sessions` both appear in comments above their
+ *  rules, so an `indexOf` slice can select a region that is not the rule. */
+function widthTransitionMs(selector: string): number {
+  const css = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
+  const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const open = new RegExp(`^${escaped}\\s*\\{`, "m").exec(css);
+  assert.ok(open, `${selector} must exist in src/styles.css`);
+  const end = css.indexOf("}", open.index);
+  const rule = css.slice(open.index, end + 1);
+  const m = /transition:\s*width\s+([\d.]+)(ms|s)\b/.exec(rule);
+  assert.ok(
+    m,
+    `${selector} must animate its width — it shares the flex row with #grid-area, so its ` +
+      `toggle is the burst this policy is sized for; rule was:\n${rule}`
+  );
+  return m[2] === "ms" ? Number(m[1]) : Number(m[1]) * 1000;
+}
+
+/** The panels that share `#workspace`'s flex row with `#grid-area`, so that
+ *  toggling one animates every pane's `termEl` through the whole transition:
+ *  `#sessions` on the left, and `.sidedock` on the right since #1150 moved it
+ *  from an overlay into the row (doc/design/side-dock.md).
+ *
+ *  LIMIT, stated rather than left to be discovered: this list is written down,
+ *  so a THIRD in-flow panel added to `#workspace` is not detected here. Nothing
+ *  in a stylesheet says which rules are flex siblings of the grid; the two that
+ *  are, are named. */
+const LAYOUT_PANELS = ["#sessions", ".sidedock"] as const;
+
+const SESSIONS_TRANSITION_MS = widthTransitionMs("#sessions");
 
 test("a Sessions open/close fits each pane ONCE, not once per animation frame", () => {
   const ticks = frames(SESSIONS_TRANSITION_MS);
@@ -98,17 +134,77 @@ test("a Sessions open/close fits each pane ONCE, not once per animation frame", 
   );
 });
 
-test("the Sessions transition never trips the ceiling — that is what FIT_MAX_WAIT_MS is sized for", () => {
+test("NO layout panel's transition trips the ceiling — that is what FIT_MAX_WAIT_MS is sized for", () => {
   // The two constants are not independent: a ceiling below transition + window
   // would put a fit at an intermediate geometry, which is the ConPTY repaint
   // this module exists to remove. Pinned as the inequality rather than as the
-  // resulting count, so a future transition longer than 240 ms fails HERE, with
+  // resulting count, so a transition longer than the budget fails HERE, with
   // the reason, instead of quietly costing an extra resize.
-  assert.ok(
-    FIT_MAX_WAIT_MS > SESSIONS_TRANSITION_MS + FIT_WINDOW_MS,
-    `FIT_MAX_WAIT_MS (${FIT_MAX_WAIT_MS}) must exceed the longest animated transition ` +
-      `(${SESSIONS_TRANSITION_MS} ms) plus one window (${FIT_WINDOW_MS} ms)`
+  //
+  // It is asserted for EVERY panel in the row, not just `#sessions`, because
+  // #1150 added the second one: the side dock now displaces the grid on the
+  // right the way the session browser does on the left, and it reaches the PTY
+  // through this same policy — no coalescer of its own (side-dock.md). A dock
+  // animating over ~340 ms would be a ceiling fit mid-slide on every toggle.
+  for (const panel of LAYOUT_PANELS) {
+    const ms = widthTransitionMs(panel);
+    assert.ok(
+      FIT_MAX_WAIT_MS > ms + FIT_WINDOW_MS,
+      `FIT_MAX_WAIT_MS (${FIT_MAX_WAIT_MS}) must exceed ${panel}'s transition ` +
+        `(${ms} ms) plus one window (${FIT_WINDOW_MS} ms)`
+    );
+  }
+});
+
+test("a dock toggle costs each pane ONE fit, the same as a Sessions toggle (#1150)", () => {
+  // The requirement #1150 was built against: reuse the seam, add nothing. So
+  // the dock's open/close is measured the same way #1149's own case is — as a
+  // tick stream through the shipped policy — and the answer has to be the same
+  // number, because it IS the same policy reached by the same route (a width
+  // transition on a flex sibling of #grid-area).
+  const ticks = frames(widthTransitionMs(".sidedock"));
+  assert.equal(
+    fitTimes(ticks, coalesced).length,
+    1,
+    "opening or closing the dock must fit each pane once, at the settled geometry"
   );
+  assert.equal(
+    fitTimes(ticks, perFrame).length,
+    ticks.length,
+    "and the pre-#1149 debounce is what it would have cost — which is why #1150 waited for it"
+  );
+});
+
+test("the dock's GRIP drag is bracketed instead, and this is the size of the difference (#1150)", () => {
+  // Two gestures, two mechanisms, and the asymmetry is deliberate — so it is
+  // measured here rather than asserted in a design note.
+  //
+  // The toggle is a transition: it has no end to hook, and it settles, so the
+  // coalescer's WINDOW resolves it (one fit, above). The grip drag is the other
+  // shape: geometry that keeps moving for as long as a human holds the mouse
+  // and never settles, so the coalescer falls back to its CEILING and fits
+  // every FIT_MAX_WAIT_MS — deliberately, because a terminal frozen at its
+  // pre-drag size for the whole gesture is the failure the ceiling exists to
+  // prevent. Each of those fits is a ResizePseudoConsole per pane.
+  //
+  // A drag DOES have an end to hook, which is exactly what #432's
+  // begin/endResizeHold is for, and `sidedock.ts` brackets the grip with it:
+  // xterm keeps fitting on every ceiling tick (the terminal tracks the drag)
+  // while `shouldResizePty` refuses the PTY call, and the release flushes one.
+  const dragMs = 2000;
+  const fits = fitTimes(frames(dragMs), coalesced);
+  assert.equal(
+    fits.length,
+    Math.floor(dragMs / FIT_MAX_WAIT_MS),
+    "a gesture that never settles fits once per ceiling — the coalescer alone cannot do better"
+  );
+
+  const pty = (held: boolean, size: string) =>
+    shouldResizePty({ clientWidth: 800, size, sentSize: "80x24", ptyId: 1, held, pending: null });
+  // Un-bracketed, every one of those ceiling fits is a ConPTY resize.
+  assert.equal(fits.filter((_, i) => pty(false, `${100 + i}x24`)).length, fits.length);
+  // Bracketed, none of them is, and endResizeHold's flush is the one that lands.
+  assert.equal(fits.filter((_, i) => pty(true, `${100 + i}x24`)).length, 0);
 });
 
 test("a slow machine still coalesces: 20 Hz frames are inside the window", () => {

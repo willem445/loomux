@@ -3,20 +3,28 @@
 // pane is currently active. The pure decisions are in sidedockmodel.ts; the
 // argument for the whole shape is doc/design/side-dock.md.
 //
-// THE ONE STRUCTURAL RULE. This panel is `position: absolute` inside
-// `#workspace` — an OVERLAY, never a flex sibling. `#sessions` is the
-// counter-example the redesign brief names explicitly (ui-redesign.md §X10): it
-// is an in-flow flex item that animates its width, so opening it walks the grid
-// through a whole animation's worth of intermediate widths — a layout pass per
-// frame, and a terminal reflow plus a ConPTY resize on every pane. #1149
-// coalesced the second half of that to ONE per pane per toggle (resizeburst.ts),
-// which is a cost reduced, not a cost removed: the number a displacing panel can
-// reach is one, and the number an overlay pays is zero. An out-of-flow child of a flex
-// container is not a flex item, so nothing here can move `#grid-area` by a
-// pixel; no pane's `ResizeObserver` fires, no `applyFit()` runs, and no ConPTY
-// is resized — by construction, not by care. The dock therefore OCCLUDES panes
-// rather than displacing them, which is the honest trade and the reason it
-// defaults closed and toggles in one click.
+// THE ONE STRUCTURAL RULE, and #1150 reversed it. This panel is a FLEX SIBLING
+// of `#grid-area` — the mirror of `#sessions` on the other edge — so opening it
+// shrinks the grid and the open panes autosize to share the row. It shipped as
+// the opposite: `position: absolute`, out of flow, occluding panes precisely so
+// that nothing here could ever move a terminal. The human asked for the
+// Sessions behaviour instead (#1150, beta1 feedback), and doc/design/side-dock.md
+// carries the argument for why that is affordable now and was not before.
+//
+// The short form, because it is the thing to keep true: a displacing panel used
+// to cost one xterm reflow plus one `ResizePseudoConsole` per pane PER FRAME of
+// its transition. #1149 moved the coalescing into the fit debounce itself
+// (resizeburst.ts), so a whole animated burst collapses into ONE fit per pane at
+// the settled geometry. This module inherits that by doing nothing at all: the
+// panes' own `ResizeObserver`s see the flex row change and the shared policy
+// decides the rest. There is no coalescer here, no bracketing of the toggle, and
+// no code on the resize path — which is exactly the property to preserve, since
+// anything added here would be a second mechanism covering one gesture instead
+// of the one mechanism covering every consumer.
+//
+// The one gesture that IS bracketed is the grip drag, and it is bracketed with
+// the mechanism that already exists for divider drags (`beginResizeHold` /
+// `endResizeHold`, #432) rather than a new one — see `beginResize`.
 //
 // WHY IT OWNS ITS OWN VIEW INSTANCES. `Pane` already builds a `GitView` and a
 // `FileEditView` per pane, for its Alt+G / Alt+F overlays and its #361 embed
@@ -40,6 +48,7 @@ import {
   decideFollow,
   decideViewSync,
   decodeDockPrefs,
+  dockBoxes,
   encodeDockPrefs,
   normalizeDockRoot,
   type DockPrefs,
@@ -64,6 +73,24 @@ export interface SideDockHost {
   /** The active tab's active pane's working directory, or null when it has
    *  none (an SSH pane, whose OSC 7 names a remote path; a welcome pane). */
   activeCwd(): string | null;
+
+  /**
+   * Begin coalescing every visible pane's PTY resize for the duration of a
+   * gesture, and return the release.
+   *
+   * Only the grip drag uses this, and only since #1150 made the grip a real
+   * divider with terminals on the other side of it. A drag has a start and an
+   * end, which is the shape `Pane.beginResizeHold` was built for (#432): xterm
+   * keeps re-fitting so the terminal looks right throughout, and the
+   * `ResizePseudoConsole` call is withheld until release, collapsing a whole
+   * drag into one. The open/close toggle deliberately does NOT use it — a CSS
+   * transition has no end to hook, and `resizeburst.ts` already coalesces it
+   * without being told.
+   *
+   * The dock cannot reach panes itself (it is app-level chrome, and which panes
+   * exist is the active tab's business), so the host supplies this.
+   */
+  holdPaneResizes(): () => void;
 }
 
 /** One hosted view, plus the root it was constructed at. */
@@ -88,9 +115,14 @@ const TAB_LABEL: Record<DockTab, string> = { git: "Git", files: "Files", editor:
 const TAB_ICON = { git: "git-graph", files: "folder-open", editor: "file-pen" } as const;
 
 export class SideDock {
-  /** The overlay panel itself, appended to `#workspace`. */
+  /** The dock's own column in `#workspace`'s flex row. */
   readonly el: HTMLElement;
 
+  /** The panel inside that column, at a fixed width the column clips (#1150).
+   *  Everything except the grip lives in here: the grip has to stay on the
+   *  column's live left edge, which the panel's edge stops being the moment the
+   *  column is narrower than the panel. */
+  private readonly innerEl: HTMLElement;
   private readonly bodyEl: HTMLElement;
   private readonly rootChipEl: HTMLElement;
   private readonly holdEl: HTMLElement;
@@ -112,8 +144,9 @@ export class SideDock {
     this.el = document.createElement("aside");
     this.el.className = "sidedock";
     this.el.setAttribute("aria-label", "Side dock");
-    this.el.hidden = !this.prefs.open;
-    this.el.style.width = `${this.prefs.width}px`;
+
+    this.innerEl = document.createElement("div");
+    this.innerEl.className = "sidedock-inner";
 
     const grip = document.createElement("div");
     grip.className = "sidedock-grip";
@@ -153,8 +186,14 @@ export class SideDock {
     this.bodyEl = document.createElement("div");
     this.bodyEl.className = "sidedock-body";
 
-    this.el.append(grip, head, this.rootChipEl, this.holdEl, this.bodyEl);
+    this.innerEl.append(head, this.rootChipEl, this.holdEl, this.bodyEl);
+    this.el.append(grip, this.innerEl);
+    // LAST in the row, after #grid-area — the dock is the right-hand column and
+    // the flex order is the visual one.
     this.workspaceEl.appendChild(this.el);
+    // Before the first paint, so a dock restored open is simply open and a dock
+    // restored closed never animates itself shut in front of the human.
+    this.applyBoxes();
 
     this.syncTabButtons();
     // Boot with whatever pane is active. A dock restored CLOSED returns from
@@ -177,7 +216,7 @@ export class SideDock {
       return;
     }
     this.prefs.open = true;
-    this.el.hidden = false;
+    this.applyBoxes();
     savePrefs(this.prefs);
     // `open` is set FIRST, because every follow path is guarded on it: this is
     // the call that pulls the live cwd for the first time and adopts it. Reading
@@ -190,7 +229,7 @@ export class SideDock {
   close(): void {
     if (!this.prefs.open) return;
     this.prefs.open = false;
-    this.el.hidden = true;
+    this.applyBoxes();
     savePrefs(this.prefs);
     // Nothing is disposed. Closing is hiding: it must not destroy the editor's
     // buffer, and it should not throw away a git view's loaded log either. The
@@ -495,12 +534,27 @@ export class SideDock {
     const startX = e.clientX;
     const startW = this.el.offsetWidth;
     this.el.classList.add("resizing");
+    // The grip is a DIVIDER now (#1150): the grid is on the other side of it, so
+    // every mousemove re-fits every pane. Bracketed exactly the way grid.ts
+    // brackets its split divider — xterm keeps fitting so the terminals track
+    // the drag, and the ConPTY resize is withheld until release. Without it a
+    // drag costs one ResizePseudoConsole per pane per FIT_MAX_WAIT_MS (the
+    // coalescer's ceiling, which is what a gesture with no settled geometry
+    // resolves to) for as long as the human holds the mouse.
+    //
+    // The release is captured ONCE here rather than re-derived in `onEnd`, so
+    // begin/end stay balanced 1:1 per pane even if the pane set changes
+    // mid-drag — the same reason grid.ts captures its pane list up front.
+    const release = this.host.holdPaneResizes();
     startDragSession({
       // Dragging LEFT widens: the dock is pinned to the right edge.
       onMove: (ev) =>
         this.applyWidth(clampDockWidth(startW + (startX - ev.clientX), this.workspaceEl.clientWidth)),
+      // Fires on mouseup OR on a drag that ends without one (window blur,
+      // Escape) — `startDragSession`'s whole job — so the hold cannot strand.
       onEnd: () => {
         this.el.classList.remove("resizing");
+        release();
         // Persist on release only, never per mousemove — the same discipline
         // every other divider in this codebase already keeps.
         savePrefs(this.prefs);
@@ -510,7 +564,33 @@ export class SideDock {
 
   private applyWidth(px: number): void {
     this.prefs.width = px;
-    this.el.style.width = `${px}px`;
+    this.applyBoxes();
+  }
+
+  /**
+   * Push the dock's geometry into the DOM: the column's width, the fixed width
+   * of the panel it clips, and the closed state.
+   *
+   * ONE place, called from construction, `show`, `close` and the drag, because
+   * the column and its contents have to move together — `dockBoxes` returns
+   * both for that reason.
+   *
+   * **A closed dock is `inert`, not `hidden`.** It used to be `el.hidden`, which
+   * is `display: none` — nothing to tab into, nothing for a screen reader. A
+   * zero-width column with `overflow: hidden` is only VISUALLY empty: without
+   * this, the closed dock's buttons and its editor's textarea would still be in
+   * the tab order and still be announced, which is a regression the human would
+   * hit long before they worked out why. Applied immediately rather than on
+   * `transitionend`: a panel that is on its way out should stop taking input at
+   * the moment it is dismissed, and nothing has to be scheduled or cleaned up.
+   */
+  private applyBoxes(): void {
+    const boxes = dockBoxes(this.prefs.open, this.prefs.width);
+    this.el.style.width = `${boxes.columnPx}px`;
+    this.innerEl.style.width = `${boxes.contentPx}px`;
+    this.el.classList.toggle("collapsed", !this.prefs.open);
+    this.el.inert = !this.prefs.open;
+    this.el.setAttribute("aria-hidden", String(!this.prefs.open));
   }
 }
 
