@@ -1351,28 +1351,30 @@ export class TasksView {
       // boardUsesHierarchy. A flat board renders exactly the row it always has.
       top.appendChild(el("span", "task-collapse-spacer"));
     }
-    // The first thing the eye should land on: unmistakable, not just a tint.
+    top.appendChild(el("span", "task-id", t.id));
+
+    // Unmistakable, not just a tint — but it sits AFTER the id, not in front of
+    // it (#1152, human beta feedback). `.task-top` is a flex row, so a badge in
+    // the leading slot pushed the id and everything after it right by its own
+    // width, and an active row read as INDENTED — indistinguishable at a glance
+    // from a row nested inside a container, which is a real and different thing
+    // here (#958's `.task-depth-N` on the row itself). Every row's left edge is
+    // now decided by its depth alone. The glow, pulse and left accent on the row
+    // are what carry "active" the moment the eye lands on it; the badge names
+    // WHO, one position further in.
     if (activity === "active") {
       const badge = el("span", "task-active-badge", `● ACTIVE — ${t.assignee}`);
       badge.title = `${t.assignee} is actively working on this right now`;
       top.appendChild(badge);
-    }
-    top.appendChild(el("span", "task-id", t.id));
-
-    // Archived (#1152). Shown only when the archive is on screen, since a
-    // hidden row has no chip to wear — it says WHY this row is here in a view
-    // the human asked for, and carries the per-row undo.
-    if (boardRow.cleared) {
-      const chip = el("span", "task-chip cleared", "📥 cleared");
-      chip.title = `Cleared from the working list on ${fmtTime(t.cleared_ms ?? 0)} — still on the board, nothing was deleted`;
-      top.appendChild(chip);
     }
 
     // Board marker + deep-link (#1091 slice G): an obvious chip on a row
     // that is blocked on a human decision or gated on a demo, routing
     // through the pane's focus hook to open the NEEDS-YOU panel at that
     // item. Placed right after the id, ahead of every other chip, so it is
-    // the first thing the eye lands on after "which row is this".
+    // the first chip the eye lands on after "which row is this". (On a live
+    // row the ACTIVE badge above precedes it — that one is louder still, and
+    // both sit behind the id so no row's left edge moves.)
     const marker: BoardMarker | null = boardMarker(t, blocked);
     if (marker) {
       const chip = el(
@@ -1389,6 +1391,15 @@ export class TasksView {
           this.toast("The NEEDS-YOU panel isn't available on this pane.");
         }
       });
+      top.appendChild(chip);
+    }
+
+    // Archived (#1152). Shown only when the archive is on screen, since a
+    // hidden row has no chip to wear — it says WHY this row is here in a view
+    // the human asked for, and the ↩ below is its undo.
+    if (boardRow.cleared) {
+      const chip = el("span", "task-chip cleared", "📥 cleared");
+      chip.title = `Cleared from the working list on ${fmtTime(t.cleared_ms ?? 0)} — still on the board, nothing was deleted`;
       top.appendChild(chip);
     }
 
