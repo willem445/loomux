@@ -21,12 +21,14 @@ export type PreviewNode =
 
 /** Whether an attention reason is urgent, mirroring attention.ts. */
 const isUrgentReason = (reason: string): boolean =>
-  reason === "blocked" || reason === "stranded";
+  reason === "held-dialog" || reason === "blocked" || reason === "stranded";
 
 // Priority when several panes in one tab need attention: show the most urgent
 // reason on the tab chip. Mirrors the backend's own ordering in
-// `attention_tick` (blocked > stranded > waiting > gate/report).
+// `attention_tick` (held-dialog > blocked > stranded > waiting > gate/report
+// — #946 Q4 / #1091 slice H put the new reason at the top).
 const REASON_PRIORITY: Record<string, number> = {
+  "held-dialog": 6,
   blocked: 5,
   stranded: 4,
   waiting: 3,

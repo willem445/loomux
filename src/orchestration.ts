@@ -131,7 +131,8 @@ export interface OrchestratorConfig {
 }
 
 /** One pane that needs the human, from the backend attention scan. `reason`
- *  is (most→least urgent) "blocked" | "stranded" | "waiting" | "report" | "gate". */
+ *  is (most→least urgent) "held-dialog" | "blocked" | "stranded" | "waiting" |
+ *  "report" | "gate" — #946 Q4 / #1091 slice H added "held-dialog" at the top. */
 export interface AttentionItem {
   /** Empty for a plain (non-orchestration) pane, which is keyed only by pty_id. */
   agent_id: string;

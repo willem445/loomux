@@ -5,6 +5,8 @@ import assert from "node:assert/strict";
 import { attentionPresentation, dockChipAttention, attentionDismiss } from "../src/attention.ts";
 
 test("each known reason maps to its label", () => {
+  // #946 Q4 / #1091 slice H: the latched-attention belt's reason.
+  assert.equal(attentionPresentation("held-dialog").label, "⛔ held on a dialog");
   assert.equal(attentionPresentation("blocked").label, "⚠ blocked");
   assert.equal(attentionPresentation("stranded").label, "⚠ stuck prompt");
   assert.equal(attentionPresentation("waiting").label, "⚠ waiting");
@@ -12,7 +14,11 @@ test("each known reason maps to its label", () => {
   assert.equal(attentionPresentation("gate").label, "⚑ your call");
 });
 
-test("'blocked' and 'stranded' are the urgent reasons", () => {
+test("'held-dialog', 'blocked', and 'stranded' are the urgent reasons", () => {
+  // #946 Q4 / #1091 slice H: a blocking dialog holding the orchestrator's own
+  // delivery pipe strands every OTHER agent's report behind it too — at
+  // least as urgent as a plain `blocked` report, never merely amber.
+  assert.equal(attentionPresentation("held-dialog").urgent, true);
   assert.equal(attentionPresentation("blocked").urgent, true);
   // #496 PR-C: a prompt that was delivered but never submitted wedges the
   // pane until an Enter lands — red, not the amber of a pane that is merely
@@ -110,6 +116,18 @@ test("a stranded chip with no agent identity offers no dismiss", () => {
   // Offering the control anyway would be a click that silently fails.
   assert.equal(attentionDismiss("stranded", null).dismissible, false);
   assert.equal(attentionDismiss("stranded", "").dismissible, false, "an empty id is no id");
+});
+
+// #946 Q4 / #1091 slice H: `held-dialog` is ALSO latched (backend-side, until
+// the hold itself clears — see `attn_question_held`'s Rust doc), same as
+// `stranded`, and still deliberately gets no dismiss control. Unlike
+// `stranded`, nothing can leave it up forever: the hold that raised it is
+// bounded (`QUESTION_HOLD_MAX`) and clears it unconditionally when it ends,
+// so a human-facing "take it down early" gesture would race a backend clear
+// that is already coming — the button `attentionDismiss`'s own doc warns
+// against, one whose effect would sometimes evaporate on the very next tick.
+test("the held-dialog chip offers no dismiss, unlike stranded", () => {
+  assert.equal(attentionDismiss("held-dialog", "orch-1").dismissible, false);
 });
 
 test("the dismiss tooltip promises only what the dismiss actually does", () => {

@@ -148,6 +148,9 @@ use loomux_lib::orchestration::{
     CLAUDE_EDIT_DENY_TOOLS, CLAUDE_READONLY_DENY_GIT, KNOWN_CLAUDE_TOOLS,
     COPILOT_EDIT_DENY_TOOLS, COPILOT_READONLY_DENY_GIT, KNOWN_COPILOT_DENY_CATEGORIES,
     SUPPORTED_CLIS,
+    // #946 Q4 / #1091 slice H: the role-keyed AskUserQuestion deny (orchestrator
+    // + liaison) and its latched-attention belt.
+    CLAUDE_QUESTION_DENY_TOOLS, claude_denies_interactive_question,
     // #267 stage 2: gemini as a reviewer-capable CLI, and the capability table
     // that decides which classes any CLI may host.
     cli_can_host, cli_caps, cli_extra_env, gemini_policy_toml, gemini_settings_json,
@@ -6116,6 +6119,14 @@ fn a_spawn_carries_the_deny_flags_of_the_class_it_spawned() {
     // Still a reviewer, not a planner: the shell it works through is intact.
     assert!(!rev.command.contains("Bash(git commit"), "{}", rev.command);
     assert!(!rev.command.contains("Bash(git push"), "{}", rev.command);
+    // #946 Q4 / #1091 slice H (H7): this is a PLAIN reviewer — no
+    // `role_hint: liaison` — so it must not pick up the question deny just
+    // because it already carries a `--disallowedTools` list for #462.
+    assert!(
+        !rev.command.contains("AskUserQuestion"),
+        "a non-liaison reviewer must not deny AskUserQuestion: {}",
+        rev.command
+    );
 
     // A worker off the SAME site must come out with nothing denied — this is the
     // half that fails if the site starts denying unconditionally.
@@ -6132,6 +6143,15 @@ fn a_spawn_carries_the_deny_flags_of_the_class_it_spawned() {
     assert!(
         p.command.contains("\"Bash(git commit *)\"") && p.command.contains("\"Bash(git push *)\""),
         "a planner spawn must still deny git mutation: {}",
+        p.command
+    );
+    // #946 Q4 / #1091 slice H: a planner is read-only already and has no
+    // `role_hint`, so H7's predicate must not reach it either — the deny is
+    // role-keyed (orchestrator/liaison), not "already contained at all".
+    assert!(
+        !p.command.contains("AskUserQuestion"),
+        "a planner must not deny AskUserQuestion — H7 names only the \
+         orchestrator and a liaison-hinted reviewer: {}",
         p.command
     );
 
@@ -6157,11 +6177,136 @@ fn a_spawn_carries_the_deny_flags_of_the_class_it_spawned() {
     )
     .unwrap();
     assert_eq!(orch.role, Role::Orchestrator);
+    // #946 Q4 / #1091 slice H flips this assertion (it used to read
+    // `!orch.command.contains("--disallowedTools")`, back when the
+    // orchestrator's tier — `Containment::None` — carried no deny flags at
+    // all). This IS the site that opens a `--disallowedTools` flag where
+    // none existed before: the orchestrator's `Containment` stays `None` (it
+    // must still drive its own git/gh flow unrestricted — the block below
+    // pins that), but it now denies the blocking AskUserQuestion dialog by
+    // ROLE instead (`claude_denies_interactive_question`), the fix for the
+    // #578 stall (a held dialog on this exact pane refused 8 delegate
+    // reports behind it).
+    for denied in CLAUDE_QUESTION_DENY_TOOLS {
+        assert!(
+            orch.command.contains(denied),
+            "the orchestrator spawn must deny {denied} — the #578 fleet-stall \
+             fix: {}",
+            orch.command
+        );
+    }
+    assert!(orch.command.contains("--disallowedTools"), "{}", orch.command);
     assert!(
-        !orch.command.contains("--disallowedTools"),
-        "the orchestrator spawn site must pass its own class's tier (None): {}",
-        orch.command
+        orch.argv.windows(2).any(|w| w == ["--disallowedTools", "AskUserQuestion"]),
+        "the direct-spawn argv must carry it too: {:?}",
+        orch.argv
     );
+    // Still `Containment::None` in every other respect: the orchestrator must
+    // keep driving git/gh unrestricted, and this new role-keyed deny must not
+    // smuggle in the edit/git tiers meant only for a contained class.
+    for untouched in CLAUDE_EDIT_DENY_TOOLS {
+        assert!(
+            !orch.command.contains(untouched),
+            "the orchestrator must still keep {untouched} — Containment::None \
+             is unchanged: {}",
+            orch.command
+        );
+    }
+    assert!(!orch.command.contains("Bash(git commit"), "{}", orch.command);
+    assert!(!orch.command.contains("Bash(git push"), "{}", orch.command);
+}
+
+/// H7 (#1091 plan-783): the liaison — a `kind: reviewer` block carrying
+/// `role_hint: liaison` (#891) — is named in the deny predicate explicitly,
+/// not merely swept in by already being contained. This spawns a liaison
+/// block through the REAL site (`spawn_agent_ex`, the way an orchestrator
+/// actually dispatches one) and asserts its command/argv carry BOTH the
+/// pre-existing #462 edit denial AND the new #946 Q4 one, in the SAME
+/// `--disallowedTools` list — never two occurrences of the flag, since Claude
+/// Code does not merge two `--disallowedTools` flags on one command line (see
+/// `claude_denies_interactive_question`'s doc: a second occurrence would
+/// silently drop the edit denial already emitted).
+#[test]
+fn a_liaison_hinted_reviewer_denies_both_edits_and_the_question_dialog() {
+    // `liaison_group` (below, #891) already builds exactly this shape: a
+    // roster with a `human` block carrying `kind: reviewer` +
+    // `role_hint: liaison`. Reused rather than re-declared so this test can
+    // never drift from what the #891 liaison tests actually spawn.
+    let (reg, _d, _repo, gid) = liaison_group();
+    let a = reg
+        .spawn_agent_ex(&gid, Role::Reviewer, Some("human".into()), "liaison", "t", false, None, None, None, None, None)
+        .unwrap();
+    let req = reg
+        .spawn_request_for_test(&a.id)
+        .unwrap_or_else(|| panic!("no spawn request for the liaison"));
+    assert_eq!(req.role, Role::Reviewer, "sanity: the liaison block is still Role::Reviewer");
+
+    // ONE --disallowedTools flag, both denials inside it.
+    assert_eq!(
+        req.command.matches("--disallowedTools").count(),
+        1,
+        "exactly one --disallowedTools flag must carry both denials: {}",
+        req.command
+    );
+    for denied in CLAUDE_EDIT_DENY_TOOLS.iter().chain(CLAUDE_QUESTION_DENY_TOOLS.iter()) {
+        assert!(
+            req.command.contains(denied),
+            "a liaison-hinted reviewer must deny {denied}: {}",
+            req.command
+        );
+    }
+    assert_eq!(
+        req.argv.iter().filter(|t| t.as_str() == "--disallowedTools").count(),
+        1,
+        "the argv form must agree — one flag, not two: {:?}",
+        req.argv
+    );
+    for denied in CLAUDE_EDIT_DENY_TOOLS.iter().chain(CLAUDE_QUESTION_DENY_TOOLS.iter()) {
+        assert!(req.argv.iter().any(|t| t == denied), "{denied} missing from argv: {:?}", req.argv);
+    }
+    // A liaison is still `NoEdits`, not `ReadOnly`: git commit/push stay
+    // reachable through the shell — #891 gives it no reason to touch git at
+    // all, but #462's own guarantee for a reviewer must not narrow here.
+    assert!(!req.command.contains("Bash(git commit"), "{}", req.command);
+    assert!(!req.command.contains("Bash(git push"), "{}", req.command);
+}
+
+/// The predicate itself (#946 Q4 / #1091 H7), independent of any spawn
+/// plumbing: exactly orchestrator OR liaison-hinted, nothing else — the unit
+/// `a_liaison_hinted_reviewer_denies_both_edits_and_the_question_dialog` and
+/// `a_spawn_carries_the_deny_flags_of_the_class_it_spawned` exercise through
+/// real spawns.
+#[test]
+fn claude_denies_interactive_question_is_exactly_orchestrator_or_liaison() {
+    assert!(claude_denies_interactive_question(Role::Orchestrator, None));
+    assert!(claude_denies_interactive_question(Role::Orchestrator, Some("liaison")));
+    assert!(claude_denies_interactive_question(Role::Reviewer, Some("liaison")));
+    // Every other (role, hint) pairing this codebase can actually produce
+    // (`role_hint_requires` pins `liaison` to `Role::Reviewer` alone) reads false.
+    assert!(!claude_denies_interactive_question(Role::Worker, None));
+    assert!(!claude_denies_interactive_question(Role::Reviewer, None));
+    assert!(!claude_denies_interactive_question(Role::Planner, None));
+    assert!(!claude_denies_interactive_question(Role::Reviewer, Some("advisor")));
+    assert!(!claude_denies_interactive_question(Role::Reviewer, Some("process")));
+}
+
+/// #448-style drift pin, sibling of `claude_edit_deny_tools_are_known_claude_tools`:
+/// `CLAUDE_QUESTION_DENY_TOOLS` names a real Claude Code tool, so a typo or an
+/// upstream rename fails CI instead of silently denying nothing.
+///
+/// Mutation evidence (red before green): temporarily adding a typo'd entry
+/// (e.g. "AskUserQuestions") fails this assertion immediately; the real
+/// spelling passes.
+#[test]
+fn claude_question_deny_tools_are_known_claude_tools() {
+    for t in CLAUDE_QUESTION_DENY_TOOLS {
+        assert!(
+            KNOWN_CLAUDE_TOOLS.contains(t),
+            "{t:?} in CLAUDE_QUESTION_DENY_TOOLS is not a known Claude Code tool per \
+             the Tools reference (https://code.claude.com/docs/en/tools-reference) — \
+             typo, or was the tool renamed/removed upstream? (#448 discipline)"
+        );
+    }
 }
 
 /// #448: the editing-tool guarantee is spelled as string literals
@@ -7496,11 +7641,17 @@ fn build_agent_argv_matches_command_line() {
                     for (session, resume) in sessions {
                         for persona in &personas {
                             for knobs in knob_sets {
+                            // #946 Q4 / #1091 slice H: this matrix pins string-vs-argv
+                            // consistency at a FIXED role (Worker/no hint, inert for
+                            // `claude_denies_interactive_question`) — the role dimension
+                            // itself is covered by its own dedicated tests below.
                             let line = reg.build_agent_command_ex(
                                 cli, "m", knobs, auto_ops, cfg, hook_settings, gdir, wd, session, resume, containment, persona,
+                                Role::Worker, None,
                             );
                             let argv = reg.build_agent_argv_ex(
                                 cli, "m", knobs, auto_ops, cfg, hook_settings, gdir, wd, session, resume, containment, persona,
+                                Role::Worker, None,
                             );
                             assert_eq!(
                                 shell_tokenize(&line),
@@ -27040,6 +27191,90 @@ fn stranded_badge_outranks_waiting_and_clears_when_the_delivery_resolves() {
     );
 }
 
+/// #946 Q4 / #1091 slice H — the latched-attention belt. `latch_question_held`/
+/// `unlatch_question_held` are `deliver_now`'s own write path (`emit_held`/
+/// `emit_held_cleared` when `HeldReason::InteractiveQuestion` fires on the
+/// orchestrator's pane); this test exercises the SAME public methods rather
+/// than re-deriving a fake PTY dialog, so it pins `attention_tick`'s reading
+/// of the latch without needing a real held delivery.
+#[test]
+fn held_question_dialog_outranks_blocked_and_clears_with_the_hold() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/held-dialog-repo", watchdog_rails(0)).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let now = 1_000_000_000_000u64;
+    let no_out = HashMap::new();
+    let no_tails = HashMap::new();
+    let no_input = HashMap::new();
+
+    // Precondition: an orchestrator that also reported "blocked" would
+    // normally read as `blocked` — the reason this belt must OUTRANK it,
+    // not merely coexist with it (a held dialog strands every OTHER agent's
+    // report too, not just this one's own status).
+    reg.note_report_attention(&orch.id, "blocked");
+    let blocked_only = reg.attention_tick(now, &no_out, &no_tails, &no_input);
+    assert!(
+        blocked_only.iter().any(|i| i.agent_id == orch.id && i.reason == "blocked"),
+        "precondition: without the latch this pane reads as blocked"
+    );
+
+    reg.latch_question_held(&orch.id);
+    let held = reg.attention_tick(now + 1000, &no_out, &no_tails, &no_input);
+    let item = held
+        .iter()
+        .find(|i| i.agent_id == orch.id)
+        .expect("a held dialog must surface in the attention scan");
+    assert_eq!(item.reason, "held-dialog", "the held dialog must outrank the plain `blocked` report");
+    assert_eq!(item.pty_id, reg.agent(&orch.id).unwrap().pty_id);
+
+    // Cleared the instant the hold clears (deliver_now's emit_held_cleared) —
+    // latched though it is, it must not survive past the hold that raised it.
+    reg.unlatch_question_held(&orch.id);
+    let cleared = reg.attention_tick(now + 2000, &no_out, &no_tails, &no_input);
+    assert!(
+        cleared.iter().all(|i| !(i.agent_id == orch.id && i.reason == "held-dialog")),
+        "the belt must release once the hold itself clears"
+    );
+    // The underlying `blocked` report is untouched by the latch's own
+    // lifecycle — it re-emerges once the belt steps aside, exactly the
+    // priority-ladder property `stranded_badge_outranks_waiting_and_clears_
+    // when_the_delivery_resolves` pins for `stranded`/`waiting`.
+    assert!(cleared.iter().any(|i| i.agent_id == orch.id && i.reason == "blocked"));
+}
+
+/// A delegate's own dialog never raises the belt — only the orchestrator's
+/// pane does (see `attn_question_held`'s doc for why the belt is narrower
+/// than the #946 Q4 CLI deny, which also covers the liaison). Latching a
+/// worker id directly (bypassing `deliver_now`'s own `target_is_orchestrator`
+/// gate, which this test cannot reach without a real PTY) still must not
+/// change how `attention_tick` reads it: only the reason string decides,
+/// which is the property this pins.
+#[test]
+fn attention_tick_does_not_special_case_a_non_orchestrator_in_the_held_set() {
+    let (reg, _d, g, wid) = attention_setup();
+    let now = 1_000_000_000_000u64;
+    let no_out = HashMap::new();
+    let no_tails = HashMap::new();
+    let no_input = HashMap::new();
+
+    reg.mark_stranded(&g, &wid, Some(StrandedBlocker::HumanInput));
+    let before = reg.attention_tick(now, &no_out, &no_tails, &no_input);
+    let before_reason =
+        before.iter().find(|i| i.agent_id == wid).map(|i| i.reason).unwrap_or("");
+    assert_eq!(before_reason, "stranded");
+
+    reg.latch_question_held(&wid);
+    let after = reg.attention_tick(now + 1000, &no_out, &no_tails, &no_input);
+    let after_reason = after.iter().find(|i| i.agent_id == wid).map(|i| i.reason).unwrap_or("");
+    assert_eq!(
+        after_reason, "stranded",
+        "the held-dialog reason is not gated on role inside attention_tick itself — \
+         it is gated at the ONE writer, deliver_now's target_is_orchestrator check — \
+         so this test only pins that attention_tick has no separate opinion. If this \
+         ever changes, `deliver_now` must be the only place that decides who latches."
+    );
+}
+
 #[test]
 fn stranded_detail_names_the_blocker_the_human_must_clear() {
     // The badge text is the entire user-facing surface of this feature: each
@@ -46170,13 +46405,13 @@ fn claude_emits_the_knobs_only_when_set_and_no_other_cli_ever_does() {
     let line = |cli, model, k| {
         reg.build_agent_command_ex(
             cli, model, k, false, cfg, None, gdir, wd, None, false, Containment::None,
-            &PersonaInject::default(),
+            &PersonaInject::default(), Role::Worker, None,
         )
     };
     let argv = |cli, model, k| {
         reg.build_agent_argv_ex(
             cli, model, k, false, cfg, None, gdir, wd, None, false, Containment::None,
-            &PersonaInject::default(),
+            &PersonaInject::default(), Role::Worker, None,
         )
     };
 
@@ -46264,11 +46499,11 @@ fn the_effort_flag_does_not_sever_the_allowedtools_value_list() {
         ] {
             let line = reg.build_agent_command_ex(
                 "claude", "opus", knobs, true, cfg, Some(hooks), gdir, wd, None, false,
-                containment, &p,
+                containment, &p, Role::Worker, None,
             );
             let argv_form = reg.build_agent_argv_ex(
                 "claude", "opus", knobs, true, cfg, Some(hooks), gdir, wd, None, false,
-                containment, &p,
+                containment, &p, Role::Worker, None,
             );
             for (form, tokens) in [("command", shell_tokenize(&line)), ("argv", argv_form)] {
                 let allowed = claude_allowed_tools_values(&tokens);

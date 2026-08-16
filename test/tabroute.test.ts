@@ -64,15 +64,32 @@ test("tabAttention keeps the highest-priority reason when a tab has several", ()
   assert.deepEqual(out.get("ws-a"), { urgent: false, reason: "waiting" }, "waiting outranks report");
 });
 
-test("every attention class badges the tab, urgent for blocked and stranded", () => {
-  for (const reason of ["blocked", "stranded", "waiting", "report", "gate"]) {
+test("every attention class badges the tab, urgent for held-dialog/blocked/stranded", () => {
+  for (const reason of ["held-dialog", "blocked", "stranded", "waiting", "report", "gate"]) {
     const out = tabAttention([{ pty_id: 1, reason }], ptyMap([[1, "ws-a"]]));
     assert.deepEqual(
       out.get("ws-a"),
-      { urgent: reason === "blocked" || reason === "stranded", reason },
+      { urgent: reason === "held-dialog" || reason === "blocked" || reason === "stranded", reason },
       `${reason} must badge the tab`
     );
   }
+});
+
+test("a held-dialog pane outranks even blocked on the tab chip (#946 Q4 / #1091 slice H)", () => {
+  // Mirrors the backend's own ranking in `attention_tick`: a live dialog
+  // holding the orchestrator's delivery pipe strands every other agent's
+  // report behind it, so it must win the tab chip over a plain `blocked`.
+  const out = tabAttention(
+    [
+      { pty_id: 1, reason: "blocked" },
+      { pty_id: 2, reason: "held-dialog" },
+    ],
+    ptyMap([
+      [1, "ws-a"],
+      [2, "ws-a"],
+    ])
+  );
+  assert.deepEqual(out.get("ws-a"), { urgent: true, reason: "held-dialog" });
 });
 
 test("a stranded pane outranks waiting on the tab chip but not blocked", () => {
