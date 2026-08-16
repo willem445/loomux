@@ -48,12 +48,42 @@
 // clock, which does not depend on the burst signal still being right, so no
 // pattern of ResizeObserver deliveries can withhold a pane's fit indefinitely.
 //
-// STRICTLY FEWER, NEVER MORE. Every fit this schedules happens at a time the
-// old 16 ms debounce would also have fitted at or before — the window only ever
-// grows the wait, and the ceiling only ever cuts it back to a point still
-// inside the burst. So no input sequence produces more PTY resizes than
-// shipped today; `test/resizeburst.test.ts` pins that as a property over the
-// tick patterns the app actually generates, not just as a claim here.
+// WHAT THIS CAN AND CANNOT PROMISE, EXACTLY. The tempting claim — "strictly
+// fewer resizes than the 16 ms debounce, on every input" — is FALSE, and the
+// boundary is sharp enough to state rather than hedge. It has two conditions
+// and needs BOTH:
+//
+//   - the burst OUTLASTS `maxWaitMs`, so a ceiling fit fires inside it, AND
+//   - the ResizeObserver gap is under 16 ms — a display above 62.5 Hz — where
+//     the old window happened to be WIDER than the frame interval and so
+//     collapsed a burst of any length into a single trailing fit.
+//
+// Cross both and this schedules more: a 2 s window-edge drag on a 144 Hz
+// display is 1 fit today and 5 here. Everywhere else it schedules fewer or the
+// same — and in particular for every burst SHORTER than the ceiling, which is
+// every animated transition in this app and the whole of #1149, it schedules
+// exactly one against the old policy's one-per-frame.
+//
+// The trade is deliberate, and the thing being given up is worth naming: on a
+// high-refresh display today, a gesture with no settled geometry leaves the
+// terminal FROZEN at its pre-gesture size for the entire gesture, because the
+// old debounce never fired. That is not a property anyone chose — it is the
+// same accident that produced 15 fits at 60 Hz, read off the other side of the
+// same comparison. The ceiling replaces both accidents with one deliberate
+// cadence. `test/resizeburst.test.ts` pins the boundary in BOTH directions
+// (62.5 Hz vs 63 Hz, and ceiling-length vs longer) so this stays a measured
+// trade rather than a sentence.
+//
+// The alternative that would make the universal claim true, considered and NOT
+// taken: let a ceiling fit reflow xterm but withhold its `resizePty` until the
+// burst settles — the `held` state #432 already built for divider drags. That
+// caps ConPTY resizes at one per burst on every display. It is not free: it
+// puts xterm and the child at DIFFERENT geometries for up to `maxWaitMs` at a
+// time, which under conpty's resize quirk is #430's own failure class, and it
+// would introduce that divergence on the window-drag path, where no display
+// rate has it today. Trading a resize-count regression above 62.5 Hz for a
+// correctness-class regression at every rate is a product call, not a
+// refactor — so it is written down here rather than taken quietly.
 
 /** How long a pane waits for its geometry to stop moving before it fits.
  *
@@ -76,7 +106,14 @@ export const FIT_WINDOW_MS = 60;
  *  intermediate geometry, which is precisely the repaint this module exists to
  *  remove. And it must be low enough that a continuous gesture with no settled
  *  geometry (dragging the window's edge) still reflows often enough to look
- *  alive — ~2.5 times a second here, against ~60 before. */
+ *  alive — ~2.5 times a second here, whatever the display does.
+ *
+ *  "Whatever the display does" is the half that is easy to get wrong, because
+ *  the OLD behaviour was not one behaviour: the same drag reflowed ~60 times a
+ *  second at 60 Hz and NOT ONCE at 144 Hz, purely from where the frame gap fell
+ *  relative to a 16 ms window. This constant is where that accident is replaced
+ *  by a chosen number, and it is also where this policy can schedule MORE than
+ *  its predecessor — see the header's boundary. */
 export const FIT_MAX_WAIT_MS = 400;
 
 /** One `ResizeObserver` delivery, as this policy sees it. */
@@ -95,7 +132,17 @@ export interface BurstTick {
  *  burst start that disagrees with the delay computed from it. */
 export interface FitPlan {
   /** Delay for the (one) fit timer. At least 1 ms: a zero-delay reschedule on
-   *  a tick stream that never stops is a busy loop, not a coalescer. */
+   *  a tick stream that never stops is a busy loop, not a coalescer.
+   *
+   *  The residue that floor leaves, stated because everything else here reasons
+   *  about its degenerate inputs (rev-1 on #1157): past the ceiling `dueInMs`
+   *  pins to 1 ms, so a tick stream arriving faster than 1 ms apart would
+   *  re-arm the timer forever and the fit would starve. The producer is a
+   *  `ResizeObserver`, which delivers once per frame, so nothing in this app
+   *  can reach it — and the floor is still right over 0, which would starve on
+   *  a stream merely faster than the task queue. If a sub-millisecond geometry
+   *  producer is ever wired to `applyFit`, this is the line that stops being
+   *  true. */
   dueInMs: number;
   burstStartMs: number;
 }

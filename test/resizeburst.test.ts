@@ -139,7 +139,7 @@ test("a gesture that never settles still fits, on the ceiling", () => {
   // A window-edge drag has no settled geometry for as long as the human holds
   // the mouse, so the trailing edge alone would withhold the fit for the whole
   // drag. The bound is the clock, not the burst signal (performance.md §2 P4).
-  const ticks = frames(2000);
+  const ticks = frames(2000, 60);
   const after = fitTimes(ticks, coalesced);
   assert.ok(after.length >= 4, `a 2 s drag must keep reflowing, got ${after.length} fits`);
   const gaps = after.slice(1).map((t, i) => t - after[i]);
@@ -151,38 +151,122 @@ test("a gesture that never settles still fits, on the ceiling", () => {
   }
   assert.ok(
     after.length < fitTimes(ticks, perFrame).length / 10,
-    "and it must still be an order fewer than one per frame"
+    "and at 60 Hz it must still be an order fewer than one per frame"
   );
 });
 
-// ---------- the property the constraint asks for ----------
+// ---------- what this can and cannot promise ----------
+//
+// The claim these two tests replaced was "no tick stream produces MORE fits
+// than the 16 ms debounce did", asserted over nine streams. It is FALSE, and
+// the nine streams were exactly one short of showing it: the two variables that
+// have to be crossed — a refresh rate above 62.5 Hz AND a burst longer than the
+// ceiling — were each covered alone and never together (rev-1 on #1157). What
+// follows pins the real boundary in both directions instead, because a property
+// stated one condition too wide is worth less than a narrower one that is true.
 
-test("no tick stream produces MORE fits than the 16 ms debounce did", () => {
-  // "Never resize the PTY more than today" is the hard half of the brief, and
-  // it is a property of every input, not of the three streams above. These
-  // cover the shapes the app generates: an animated transition, a continuous
-  // drag, a one-shot change, a slow trickle wider than both windows, and a
-  // stuttering stream that keeps crossing the window boundary.
-  const streams: Record<string, number[]> = {
-    "sessions transition": frames(SESSIONS_TRANSITION_MS),
-    "sessions transition at 20 Hz": frames(SESSIONS_TRANSITION_MS, 20),
-    "sessions transition at 144 Hz": frames(SESSIONS_TRANSITION_MS, 144),
-    "long window drag": frames(2000),
-    "one-shot": [FRAME_MS],
-    "nothing at all": [],
-    "trickle wider than both windows": [0, 500, 1000, 1500],
-    "stutter across the window edge": [0, 59, 130, 189, 260, 319],
-    "repeated toggles": [...frames(240), ...frames(240).map((t) => t + 1000)],
-  };
-  for (const [name, ticks] of Object.entries(streams)) {
+/** Every burst shape the app produces that is SHORTER than the ceiling. */
+const SHORT_BURSTS: Record<string, number[]> = {
+  "sessions transition": frames(SESSIONS_TRANSITION_MS),
+  "sessions transition at 20 Hz": frames(SESSIONS_TRANSITION_MS, 20),
+  "sessions transition at 144 Hz": frames(SESSIONS_TRANSITION_MS, 144),
+  "one-shot": [FRAME_MS],
+  "nothing at all": [],
+  "trickle wider than both windows": [0, 500, 1000, 1500],
+  "stutter across the window edge": [0, 59, 130, 189, 260, 319],
+  "repeated toggles": [...frames(240), ...frames(240).map((t) => t + 1000)],
+};
+
+test("for a burst shorter than the ceiling, this never adds a fit — at any refresh rate", () => {
+  // The half that IS universal, and the half #1149 is about: every animated
+  // transition in the app is shorter than FIT_MAX_WAIT_MS, so no ceiling fit
+  // fires inside one and the trailing edge can only ever remove fits. The
+  // "trickle" and "stutter" rows are bursts that END and restart rather than
+  // one long one, which is why they belong here and not below.
+  for (const [name, ticks] of Object.entries(SHORT_BURSTS)) {
     const before = fitTimes(ticks, perFrame).length;
     const after = fitTimes(ticks, coalesced).length;
     assert.ok(
       after <= before,
       `"${name}": the coalescer scheduled ${after} fits where the 16 ms debounce scheduled ` +
-        `${before} — this policy may only ever remove ConPTY resizes`
+        `${before} — inside a burst shorter than the ceiling this may only ever remove resizes`
     );
   }
+});
+
+test("a burst that OUTLASTS the ceiling adds fits above 62.5 Hz — pinned, not hidden", () => {
+  // The crossed stream the old nine were missing. Above 62.5 Hz the frame gap
+  // is under the old 16 ms window, so the old debounce coalesced a burst of ANY
+  // length into one trailing fit — leaving the terminal frozen at its
+  // pre-gesture size for the whole gesture. The ceiling replaces that with a
+  // cadence, and that costs real ConPTY resizes.
+  //
+  // Asserted as `after > before`, deliberately: this is a trade, and a trade
+  // that is merely tolerated by a `<=` nobody crosses is a trade nobody can
+  // find. Anyone who makes this equal again has to come here and say so.
+  const drag144 = frames(2000, 144);
+  const before = fitTimes(drag144, perFrame).length;
+  const after = fitTimes(drag144, coalesced).length;
+  assert.equal(before, 1, "at 144 Hz the 16 ms window swallowed the whole 2 s drag");
+  assert.ok(
+    after > before,
+    `a 2 s drag at 144 Hz must be recorded as scheduling MORE than the old debounce ` +
+      `(${after} vs ${before}); if this went equal, the ceiling changed and the module ` +
+      `header's boundary and the PR body's table are now wrong too`
+  );
+  // ...and bounded: one fit per ceiling, not one per frame. The cost of the
+  // trade is capped, which is the reason it is acceptable at all.
+  assert.ok(
+    after <= Math.ceil(2000 / FIT_MAX_WAIT_MS) + 1,
+    `the added fits must stay at one per ${FIT_MAX_WAIT_MS} ms ceiling, got ${after}`
+  );
+});
+
+test("the boundary is the old 16 ms window, in both directions", () => {
+  // A specimen either side of it, on the same 2 s burst. 62.5 Hz is exactly a
+  // 16 ms gap — the last rate at which the old debounce fired per frame — and
+  // 63 Hz is the first at which it coalesced everything. Both directions run,
+  // so neither "always fewer" nor "always more" can pass this.
+  const drag = (hz: number): { before: number; after: number } => {
+    const ticks = frames(2000, hz);
+    return { before: fitTimes(ticks, perFrame).length, after: fitTimes(ticks, coalesced).length };
+  };
+  const at62 = drag(62.5);
+  assert.ok(
+    at62.after < at62.before,
+    `at 62.5 Hz (gap exactly 16 ms) the coalescer must still remove fits: ` +
+      `${at62.after} vs ${at62.before}`
+  );
+  const at63 = drag(63);
+  assert.ok(
+    at63.after > at63.before,
+    `at 63 Hz (gap just under 16 ms) the old debounce coalesced the whole drag, so the ` +
+      `ceiling must show up as an increase: ${at63.after} vs ${at63.before}`
+  );
+});
+
+test("the ceiling is what crosses the boundary — a burst inside it never does", () => {
+  // The OTHER variable, isolated at a rate where the old policy coalesced
+  // everything. Below the ceiling the two policies agree; past it they diverge.
+  // Pinning both sides here is what stops the finding from being read as "high
+  // refresh is worse", which would be the wrong lesson: it is high refresh AND
+  // a burst longer than the ceiling.
+  const at = (durationMs: number): { before: number; after: number } => {
+    const ticks = frames(durationMs, 144);
+    return { before: fitTimes(ticks, perFrame).length, after: fitTimes(ticks, coalesced).length };
+  };
+  const inside = at(FIT_MAX_WAIT_MS);
+  assert.equal(
+    inside.after,
+    inside.before,
+    `a ${FIT_MAX_WAIT_MS} ms burst at 144 Hz sits inside the ceiling and must cost the same`
+  );
+  const past = at(FIT_MAX_WAIT_MS + 40);
+  assert.ok(
+    past.after > past.before,
+    `a burst just past the ceiling must be where the extra fit appears: ` +
+      `${past.after} vs ${past.before}`
+  );
 });
 
 // ---------- the repairs, which each have a way of making things worse ----------
