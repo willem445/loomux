@@ -450,11 +450,17 @@ before.** The registry fills; that is all it does. Boundary `resolve` on every
 root-taking family — with the choke functions changing signature so the compiler
 holds the property — is slice C, and it is slice C that introduces the
 `root-not-declared` error code to a caller. Until then the code exists on
-`RootError` and is returned to nobody. Slice C also owes the §5.4 roster row for
-`admit_root` (the classification is argued here and in the command's own doc
-comment; the roster table is where C2's test will read it from), the
+`RootError` and is returned to nobody. Slice C also owes the
 `git_repo_root`/ancestor question if it ever needs a root of its own, and the
 TOCTOU reasoning for a symlink swapped after `resolve` canonicalized it.
+
+`admit_root`'s §5.4 roster row is **placed** (#996) — class `disabled`, the
+classification argued here and in the command's own doc comment. What slice C
+still owes there is the *enforcement*, not the row: C2's roster test is what
+reads the table and makes a future unplaced command fail CI, which is the
+wording `remote-engine-protocol.md` §5.4 now carries too. Do not add a second
+`rootreg` row — the table partitions `APP_COMMANDS` exactly, and a duplicate is
+the two-copies-drift failure §5.4 exists to argue against.
 
 Deferred past all three, and recorded so the absence is deliberate: a
 `roots_list` wire command and a daemon config's seeded roots (there is no wire

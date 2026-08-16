@@ -216,14 +216,45 @@ test("a non-finite width falls back rather than reaching a style property", () =
 
 // ---------- the reserve's REAL enforcement point: the stylesheet ----------
 
+/** The `.sidedock` rule body, read off the stylesheet.
+ *
+ *  Anchored to the start of a line and sliced to the rule's OWN closing brace,
+ *  never `css.slice(css.indexOf(".sidedock {"), css.indexOf(".sidedock-grip"))`,
+ *  which is what these two tests used to do. `indexOf` takes the FIRST
+ *  occurrence of each end, so an earlier mention of either name — and `.sidedock`
+ *  already appears in comments ~35 lines above the real rule — selects a region
+ *  that is not the rule.
+ *
+ *  An EMPTY slice is not the hazard; that case is loud, because `assert.match`
+ *  and `assert.ok(...includes...)` both throw on `""` (checked, not assumed).
+ *  The hazard is a non-empty WRONG slice, and the specific way it goes wrong
+ *  here is nasty: a comment that explains the overlay invariant naturally names
+ *  both the rule and the property, so the slice contains the exact text the
+ *  assertion greps for. Reproduced — with a comment reading
+ *  `.sidedock { } is position: absolute so it never becomes a flex item`
+ *  inserted above a `.sidedock` rule changed to `position: relative`, the old
+ *  extraction PASSED while the invariant it exists to defend was broken. This
+ *  version reddens on the same input, because it reads the rule. */
+function sidedockRule(): string {
+  const css = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
+  const open = /^\.sidedock\s*\{/m.exec(css);
+  assert.ok(open, "the .sidedock rule must exist in src/styles.css");
+  const end = css.indexOf("}", open.index);
+  assert.ok(end > open.index, ".sidedock's rule is unterminated");
+  const rule = css.slice(open.index, end + 1);
+  assert.ok(
+    /[a-z-]+\s*:/.test(rule),
+    `.sidedock's rule body carries no declarations — the slice is wrong, not the CSS:\n${rule}`
+  );
+  return rule;
+}
+
 test("the stylesheet bounds the dock's width, so boot/restore/resize are all covered", () => {
   // `clampDockWidth`'s reserve only ever runs on the DRAG path. Boot, a restore
   // from persistence, and a window resize do not call it — so a width persisted
   // on a wide monitor used to come back whole on a narrow one and occlude every
   // pane. The bound that actually holds is CSS, and this reads it off disk.
-  const css = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
-  const rule = css.slice(css.indexOf(".sidedock {"), css.indexOf(".sidedock-grip"));
-  assert.ok(rule.includes(".sidedock {"), "the .sidedock rule must exist");
+  const rule = sidedockRule();
   const maxWidth = /max-width:\s*max\(\s*(\d+)px\s*,\s*calc\(\s*100%\s*-\s*(\d+)px\s*\)\s*\)/.exec(rule);
   assert.ok(maxWidth, `.sidedock needs a max-width bound; rule was:\n${rule}`);
   // PINNED both ways: the stylesheet cannot be a fourth copy of these numbers
@@ -242,9 +273,7 @@ test("the dock is an overlay, and the stylesheet is where that is true", () => {
   // cannot squeeze `#grid-area` and no pane ever hears a resize. If someone
   // makes it `position: relative` or `static` to "fix" a layout quirk, every
   // terminal starts reflowing and nothing else in this suite would notice.
-  const css = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
-  const rule = css.slice(css.indexOf(".sidedock {"), css.indexOf(".sidedock-grip"));
-  assert.match(rule, /position:\s*absolute/, ".sidedock must stay absolutely positioned");
+  assert.match(sidedockRule(), /position:\s*absolute/, ".sidedock must stay absolutely positioned");
 });
 
 // ---------- prefs ----------

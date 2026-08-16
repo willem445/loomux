@@ -240,6 +240,82 @@ export function feedbackRoute(status: string): FeedbackRoute {
   return canApprove(status) ? "merge-gate" : "note";
 }
 
+/** What one press of **Send** (or Ctrl+Enter) on the feedback dialog owes,
+ *  given the route and what an earlier press of the same dialog already
+ *  achieved.
+ *
+ *  This lives here rather than inline in the dialog because the dialog cannot
+ *  pin it: `decisionsview.ts`'s `submit()` is DOM + IPC wiring, so a mutation
+ *  deleting the guard there reddens nothing. Here it reddens a named test.
+ *
+ *  Two duplicate-write windows, both opened by the fix that made the dialog
+ *  close on SUCCESS rather than before the write — the right trade (keeping the
+ *  human's text beats losing it), but the old close-first shape could not be
+ *  re-submitted because the dialog was already gone:
+ *
+ *  1. **A second press while the first write is outstanding.** Hitting
+ *     Ctrl+Enter twice is an ordinary habit when a dialog does not visibly
+ *     respond. On a merge-gate row that used to issue two `orch_request_changes`
+ *     calls — two `Requested changes: …` notes on one task and two `[loomux]`
+ *     deliveries for one decision. `inFlight` makes the second press a no-op.
+ *  2. **A retry after a PARTIAL failure.** The merge-gate route is a two-call
+ *     chain. If `orch_request_changes` lands and the status flip then fails, the
+ *     dialog re-enables Send — and a retry that re-ran the whole chain would
+ *     record the findings a second time. `findingsLanded` narrows the retry to
+ *     the call that actually failed.
+ *
+ *  The note route is a single call, so it has no partial state to remember and
+ *  `findingsLanded` never applies to it.
+ *
+ *  **`status-only` deliberately re-sends nothing, and that is a trade, not an
+ *  oversight.** The findings the backend already holds are the ones from the
+ *  press that succeeded; if the human amends the text in the still-open
+ *  textarea before retrying, the amendment is DROPPED. The alternative —
+ *  re-recording — is the duplicate write this whole guard exists to stop, so
+ *  losing the edit is the better failure, but it is silent, and a caller that
+ *  wants to surface it should do so at the dialog rather than by widening this
+ *  step. The same edge in the other direction: the caller checks for empty text
+ *  BEFORE asking for a step, so a retry with the box cleared is a no-op and the
+ *  owed status flip never happens.
+ *
+ *  **Scope: one dialog instance.** `state` is per-dialog, so this closes a
+ *  second PRESS, not a second DIALOG. A human who dismisses the dialog while a
+ *  write is in flight and reopens it gets fresh state, and a Send there is a
+ *  genuine second write. That takes two deliberate gestures rather than one
+ *  habitual double-tap, so it is left as it is — but it is the one crossing
+ *  this function does not cover, and it is named here rather than left for the
+ *  next reader to discover. */
+export interface FeedbackSubmitState {
+  /** A write is outstanding for this dialog — Send is disabled, but the
+   *  keyboard path reaches `submit` regardless of the button's state. */
+  inFlight: boolean;
+  /** `orch_request_changes` has already succeeded for this dialog. Merge-gate
+   *  only; always `false` on the note route. */
+  findingsLanded: boolean;
+}
+
+/** TOTAL over `(route, state)` — there is no "cannot submit" value, because a
+ *  press that must do nothing is `"ignore"`, which the caller must handle
+ *  explicitly rather than by falling through. */
+export type FeedbackStep =
+  /** Do nothing: a write for this dialog is already outstanding. */
+  | "ignore"
+  /** Record the findings, then flip the status. The merge-gate chain. */
+  | "findings-then-status"
+  /** The findings are already recorded; only the status flip is still owed. */
+  | "status-only"
+  /** One board note, and deliberately no status change. */
+  | "note";
+
+export function feedbackSubmitStep(
+  route: FeedbackRoute,
+  state: FeedbackSubmitState
+): FeedbackStep {
+  if (state.inFlight) return "ignore";
+  if (route === "note") return "note";
+  return state.findingsLanded ? "status-only" : "findings-then-status";
+}
+
 /** One demo card. `path` is `null` when the orchestrator recorded none — the
  *  panel then shows the PR link alone rather than guessing a worktree, because
  *  a caption is a claim. */

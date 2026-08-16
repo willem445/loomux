@@ -2549,10 +2549,10 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .task-depth-4 { margin-left: 56px; }
 /* Collapse chevron, and the same-width inert spacer a leaf gets so every row's
    text starts on the same column whether or not it contains anything.
-   Sized up from the first cut after the demo — at 13px/8px in --text-dim it
+   Sized up from the first cut after the demo — at 13px/8px in --ink-dim it
    was there but easy to miss, and it is the control the whole nesting feature
-   is operated through. It reads at rest now (its own faint chip, --text rather
-   than --text-dim) instead of only on hover. The two widths move TOGETHER or
+   is operated through. It reads at rest now (its own faint chip, --ink rather
+   than --ink-dim) instead of only on hover. The two widths move TOGETHER or
    containers and leaves stop sharing a left edge; the row itself is unchanged,
    so nothing about the indent steps above shifts. */
 .task-collapse {
@@ -2561,8 +2561,10 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   color: var(--ink); font-size: 11px; line-height: 1; cursor: pointer;
 }
 /* --surface-2 is already the elevation ladder's top step, so hovering to
-   another rung would be a no-op; the accent tint used by the other compact
-   icon buttons (dormant-btn, the dock's resize grip) is the next step up. */
+   another rung would be a no-op; the accent tint the other compact icon
+   buttons use is the next step up. Matched to .dormant-btn:hover at 28% — the
+   dock's resize grip is the same tint but deliberately stronger (35%), being a
+   drag handle rather than a click target. */
 .task-collapse:hover { background: color-mix(in srgb, var(--accent) 28%, transparent); color: var(--ink); }
 .task-collapse-spacer { flex: none; width: 18px; }
 /* Advisory Agile level: a label only. Purple → blue → cyan → dim reads as
