@@ -4707,12 +4707,12 @@ pub const CLAUDE_QUESTION_DENY_TOOLS: &[&str] = &["AskUserQuestion"];
 /// every agent trying to report to it — the incident `doc/design/
 /// human-questions.md`'s "The problem" section narrates (a run held
 /// overnight on one unanswered question, nothing reviewed or merged until
-/// morning). `ask_human` (#946 Q1, shipped) is the orchestrator's
-/// non-blocking replacement, making the old path structurally unreachable
-/// for it; a liaison's own durable replacement is #1091 slice E's pose-gate
-/// widening (`require_orchestrator` → `require_orchestrator_or_liaison`),
-/// not yet landed — see the design note's Q4/H section for why `ask_human`
-/// alone does not cover the liaison half of this deny.
+/// morning). `ask_human` (#946 Q1, shipped) is the non-blocking replacement
+/// for BOTH roles this deny covers: #1091 slice E widened its dispatch gate
+/// from `require_orchestrator` to `require_orchestrator_or_liaison`, so a
+/// liaison poses its own durable, registry-backed question through the same
+/// tool rather than only relaying through the orchestrator — see the design
+/// note's Q4/H section for the full picture.
 ///
 /// **Orthogonal to [`Containment`] by construction** — deliberately NOT a
 /// fourth tier on that ladder, which is about edits/git and answers a
