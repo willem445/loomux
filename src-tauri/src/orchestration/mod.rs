@@ -9005,13 +9005,13 @@ pub enum LadderRule {
 
 /// The strict Agile ladder (#1156), and the one function that knows it.
 pub fn ladder_rule(kind: Option<&str>) -> LadderRule {
-    match kind {
-        Some("epic") => LadderRule::TopLevelOnly,
-        Some("feature") => LadderRule::Inside("epic"),
-        Some("story") => LadderRule::Inside("feature"),
-        Some("task") => LadderRule::Inside("story"),
-        _ => LadderRule::Exempt,
-    }
+    // RED-EVIDENCE NEUTER (#1156) — scratch/1156-red-evidence ONLY, never merged.
+    // The ladder table, emptied: every level becomes exempt, which is exactly
+    // the pre-#1156 semantics ("nothing enforces which level sits under
+    // which"). Wiring, signatures and call sites are untouched, so this
+    // reddens behaviour rather than the build.
+    let _ = kind;
+    LadderRule::Exempt
 }
 
 /// `epic` → `an epic`, `feature` → `a feature` — the errors below read as
@@ -9108,12 +9108,10 @@ fn check_ladder(
 /// one of those at once. The `kind` field is the truth; the badge renders it
 /// beside the id (`doc/design/task-hierarchy.md` §2.2).
 fn kind_id_prefix(kind: Option<&str>) -> &'static str {
-    match kind {
-        Some("epic") => "e",
-        Some("feature") => "f",
-        Some("story") => "us",
-        _ => "t",
-    }
+    // RED-EVIDENCE NEUTER (#1156) — scratch/1156-red-evidence ONLY, never
+    // merged. The pre-#1156 mint: one prefix for every row, whatever its level.
+    let _ = kind;
+    "t"
 }
 
 /// The prefixes `next_task_id` counts. Kept in one place so the high-water scan
