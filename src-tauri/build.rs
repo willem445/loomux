@@ -1,4 +1,5 @@
-// Single source of truth for the 120 app command names (#363); shared with
+// Single source of truth for the app command names (#363) — the count lives in
+// `tests/acl_manifest.rs`'s `app_commands_len_is_<N>`, never in a comment; shared with
 // `lib.rs` via `mod command_manifest` so the ACL coherence test can diff
 // this exact list against `generate_handler!` and `capabilities/default.json`.
 // `build.rs` can't depend on the compiled lib, so it's pulled in with

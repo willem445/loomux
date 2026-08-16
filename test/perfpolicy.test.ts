@@ -148,6 +148,20 @@ const STREAMS: StreamRow[] = [
     debt: null,
   },
   {
+    event: "models-detected",
+    rate: "lifecycle",
+    bound: "argued-none",
+    cite: "src-tauri/src/modelwire.rs",
+    reason:
+      "The startup model sweep (#1020), which runs ONCE per app run and emits at most one event " +
+      "per CLI that has a PROTOCOLS row — one today (claude), four if every SUPPORTED_CLIS entry " +
+      "ever gained one. There is no rate to bound: the producer is a single sequential pass that " +
+      "then exits. The per-event cost is bounded on the other side too — `acceptReport` drops a " +
+      "report that changed nothing before any listener is called, so an empty sweep result " +
+      "repaints nothing at all.",
+    debt: null,
+  },
+  {
     event: "ft-files",
     rate: "producer",
     bound: "rAF-gated",
@@ -304,6 +318,22 @@ const STREAMS: StreamRow[] = [
       "handler's O(panes x tabs) scan plus tab-bar refresh is paid at gesture rate. No defensive " +
       "batching: if channels ever become agent-driven this row's rate class changes and so must " +
       "its bound.",
+    debt: null,
+  },
+  {
+    event: "orch-questions-changed",
+    rate: "producer",
+    bound: "throttled",
+    cite: "src/refreshgate.ts",
+    reason:
+      "Emitted on every questions.json write — an ask, an answer, a withdraw, a prune — so " +
+      "its rate is set by the orchestrator, not by a clock. Both the NEEDS-YOU panel and the " +
+      "task board (#1091 slice G's board-marker chip) refresh through their OWN " +
+      "CoalescingRefresh (#743 S5): single-flight with a trailing-edge merge, so a burst costs " +
+      "each open view the refetch already in flight plus exactly one more, and the trailing " +
+      "run reads the final registry. Each view already shares that same gate with its own " +
+      "orch-tasks-changed listener (below), so a simultaneous burst on both streams still " +
+      "coalesces to one refresh per view, not two.",
     debt: null,
   },
   {

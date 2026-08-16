@@ -61,13 +61,14 @@ and four golden fixtures, and buy no capability the reviewer class plus two
 hint-keyed rules cannot already express. If the exception list below ever grows
 past a couple of entries, *that* is the trigger to revisit — not aesthetics.
 
-## Two hint-keyed capability rules, in opposite directions
+## Three hint-keyed capability rules, in two directions
 
-`review_verdict` is **withheld** from the liaison, and `group_usage` — otherwise
-orchestrator-only — is **offered** to it. They are argued separately below
-because they are separate arguments: closing a fail-open window and widening a
-capability answer to different bars, and a note that presented them as one list
-would let the second borrow the first's obviousness.
+`review_verdict` is **withheld** from the liaison; `group_usage` and `ask_human`
+— both otherwise orchestrator-only — are **offered** to it. All three are argued
+separately below because they are separate arguments: closing a fail-open window
+and widening a capability answer to different bars, and the two widenings answer
+to different bars again (one is a read, one is a write), so a note that presented
+them as one list would let each borrow the previous one's obviousness.
 
 ### `review_verdict` is withheld
 
@@ -125,7 +126,9 @@ Granted at the two layers this tool has, and keyed on the **conjunction**
    a function of its own rather than a hint arm inside `require_orchestrator`.
    That one gates roughly twenty tools, including `spawn_agent`, `send_prompt`
    and every board write; a widening written there would widen all of them at
-   once, and this widening's blast radius is exactly one tool.
+   once. The separate function widens nothing on its own: it is opted into one
+   call site at a time, so its blast radius is exactly the arms that name it —
+   `group_usage` and, since #1091 slice E, `ask_human`.
 
 There is no third layer, and the absence is structural rather than an omission:
 `OrchRegistry::group_usage` takes a group and no caller, because the only
@@ -139,19 +142,88 @@ could ever carry it; a GRANT must name the one class it is granting from.
 class costs a real liaison nothing — it is there for the future producer of a
 `Caller` that does not inherit that guarantee.
 
-**Neither rule reads anything the agent supplied.** `Caller::role_hint` is
-resolved in `resolve_token` from the group's own roster, via the block recorded
-on the agent at spawn — the same lookup `record_verdict`'s deny layer and
-`idle_reap_candidates` make. There is no tool argument, pane title or prompt
-text that reaches either decision.
+### `ask_human` is offered (#1091 slice E)
+
+The second widening, and the first that is a **write** — so the paragraph above
+that carried `group_usage` ("a READ of an aggregate, settles nothing, writes
+nothing") does not carry it, and reusing it would be exactly the borrowing this
+section's split is meant to prevent. It needs its own argument.
+
+**What the pane could not do.** A `role_hint: liaison` block is
+`Role::Reviewer`, and `ask_human` was `require_orchestrator`-only, so the pane
+the human is actually talking to had no way to put a decision into the human's
+own durable inbox. Its only route was `message_orchestrator` — which becomes a
+registry row **only if the orchestrator independently chooses to open one**.
+That is orchestrator-controlled by construction, so as a *liaison* capability it
+does not exist: the human's pane could raise a decision and have it evaporate,
+which is the failure the registry was built to end (`human-questions.md`).
+
+**What makes it grantable is what the write is.** It appends a row to the
+human's own inbox. It settles nothing, releases no work, opens no gate, and
+cannot be answered by the pane that opened it or by any other agent — the
+registry's boundary was always drawn between **asking and answering**, not
+between roles, and every agent already may ask in the sense that matters (a
+delegate asks through `message_orchestrator`). What the liaison gains is that
+its ask lands in the record rather than in someone else's judgment about whether
+to record it. Contrast the writes that were *not* granted and will not be: a
+board write is durable orchestration state, `send_prompt` and `spawn_agent` are
+authority. A widening argued from "the human's pane would find it useful" would
+have taken those too.
+
+**The pose only.** `withdraw_question` is the other half of the same WRITE tier
+and stays orchestrator-only, deliberately: withdrawing *settles* a row — any
+pending row, not just your own — and the grant buys the human's pane the ability
+to add to their inbox, never to decide what leaves it. A liaison whose question
+is overtaken by events says so with `message_orchestrator`.
+
+**The answer notice still goes to the orchestrator.** `answer_question` delivers
+through `deliver_to_orchestrator` regardless of who asked, and this slice does
+not touch that: an answer's consequence is un-blocking a board row, and only the
+orchestrator writes the board. The liaison reads what became of its question
+from `list_questions` (already on its surface, shared tier), and its own prose
+says so rather than leaving it to be discovered.
+
+Granted at the two layers this tool has, keyed on the same **conjunction**:
+
+1. `mcp::tool_defs` — `ask_human_tool()`, one shared definition with two call
+   sites, pushed for a liaison-hinted reviewer beside `group_usage_tool()`.
+   Shared rather than copied for the reason `group_usage_tool()` is: two copies
+   of a description that long drift, and the two panes that can pose a question
+   reading different accounts of what makes a good one is the authoring-standard
+   split the single funnel exists to prevent.
+2. `mcp::call_tool`'s `ask_human` arm — `require_orchestrator_or_liaison`, whose
+   refusal names *this* capability ("posing a question to the human") rather
+   than the other caller's, since one shared gate with one hard-coded message
+   would tell a pane refused `ask_human` that usage aggregation is
+   orchestrator-only. The arm's **success** reply is branched on the same
+   predicate (`caller_is_liaison`, one function, so the gate and the reply
+   cannot disagree): the orchestrator's version tells the caller to mark the
+   board row and to expect the answer notice in its own pane, and both are
+   false here. A widened gate that left them there would have told the human's
+   own pane to wait for something that never comes — the stall the feature
+   exists to remove, reintroduced by a string.
+
+There is no third layer, and the absence is structural in the same way
+`group_usage`'s is: `OrchRegistry::ask_human` takes the group and an `asker`
+string it records rather than checks, because there is no narrower question to
+ask of a caller already resolved to this group. The *dangerous* half of this
+registry — `answer_question` — has its deepest layer precisely there, and it is
+untouched.
+
+**None of the three rules reads anything the agent supplied.**
+`Caller::role_hint` is resolved in `resolve_token` from the group's own roster,
+via the block recorded on the agent at spawn — the same lookup
+`record_verdict`'s deny layer and `idle_reap_candidates` make. There is no tool
+argument, pane title or prompt text that reaches any of these decisions.
 
 ## Why the exceptions are not a hole in the doctrine
 
-`role_hint` was introduced as **inert with respect to capability**, and three
+`role_hint` was introduced as **inert with respect to capability**, and four
 rules read it today: `session_digest` is offered to `process`-hinted workers
-alone, `review_verdict` is withheld from a liaison, and `group_usage` is offered
-to one. The third is the first `role_hint` in loomux that yields **more** than
-its `kind` alone.
+alone, `review_verdict` is withheld from a liaison, and `group_usage` and
+`ask_human` are offered to one. The third was the first `role_hint` in loomux
+that yields **more** than its `kind` alone; the fourth is the first that yields
+a **write**.
 
 So the doctrine is not *hints never grant*. It is **inert by default, with
 every exception enumerated here — narrowing and widening alike**, and the table
@@ -162,7 +234,11 @@ What a widening does change is the **bar**, not the doctrine. A narrowing needs
 only to be safe; a grant has to argue the tool, and the argument that carried
 `group_usage` — a caller-group-scoped read that settles and writes nothing — is
 the reason it did not carry `send_prompt` or a board write alongside it. Reuse
-that argument, not this precedent.
+that argument, not this precedent. `ask_human` is the demonstration: it is a
+write, so that argument does not reach it and it had to make its own — the row
+it appends is in the human's own inbox, settles nothing, and cannot be answered
+by the pane that wrote it. Two grants, two arguments; the second borrowed
+nothing from the first but the gate function.
 
 The invariant that genuinely does hold is the one about the **file**, not about
 the hint: **a workflow file can never grant a capability**, because a repo
@@ -177,6 +253,7 @@ a liaison is, and cannot add to it.
 | `process` | `worker` | **narrows**: `session_digest` offered to this hint only | shipped |
 | `liaison` | `reviewer` | **narrows**: `review_verdict` withheld from this hint | shipped |
 | `liaison` | `reviewer` | **widens**: `group_usage`, otherwise orchestrator-only | shipped |
+| `liaison` | `reviewer` | **widens**: `ask_human` — the pose only; `withdraw_question` stays orchestrator-only | shipped |
 
 **Capability is not the only thing a hint can key on, so the enumeration owes a
 second table.** These rules change no tool surface at all — the liaison's tokens
@@ -191,33 +268,51 @@ table too early:
 | A liaison is not a class's default block | `block_for` (**Lifecycle**, below) | A bare `spawn_agent(kind: "reviewer")` must not open the human's pane |
 | A liaison is never idle-reaped | `idle_reap_candidates` (**Lifecycle**, below) | The reaper cannot see a human typing, so "idle" there means "mid-conversation" |
 
-Four rules and two capability rules is more than the "couple of entries" that
+Four rules and three capability rules is more than the "couple of entries" that
 paragraph above named as the trigger to revisit a first-class `Role::Liaison` —
-so, deliberately: **the count is not the trigger, the ROOT is.** Five of the six
-follow from one fact stated once — a liaison rides `reviewer` and reviews
+so, deliberately: **the count is not the trigger, the ROOT is.** Five of the
+seven follow from one fact stated once — a liaison rides `reviewer` and reviews
 nothing — and each is the same three-word predicate at a different site.
 
-**The `group_usage` grant is the one that does not**, and this note says so
-rather than filing it under the same root. It follows from a second fact — a
-liaison faces the human, and a human asks what this is costing — which is the
-first thing about a liaison that is not a consequence of the class it borrows.
-That is worth watching, because "a rule that does not reduce to the root
-sentence" is exactly the test named above.
+**The two grants are the ones that do not**, and this note says so rather than
+filing them under the same root. Both follow from a second fact — a liaison
+faces the human — which is the first thing about a liaison that is not a
+consequence of the class it borrows: a human asks what this is costing
+(`group_usage`), and a human has decisions to make later, away from the pane
+(`ask_human`). That is worth watching, because "a rule that does not reduce to
+the root sentence" is exactly the test named above.
 
-It is still not a fifth kind, for a reason of size rather than of principle: the
-second root has bought exactly one tool, that tool is a caller-group-scoped
-read, and a `Role::Liaison` would cost ~60 sites, a template and four golden
-fixtures to express it. **The trip-wire is the second root accreting**, not the
-first: a third and a fourth tool granted because the human's pane wants them is
-a class-shaped need being paid for one hint-keyed exception at a time, and the
-answer then is the fifth kind, deliberately, not a longer table.
+**The second root has now accreted, and this note said that was the trip-wire.**
+So the judgment is recorded rather than left implicit. `ask_human` is the second
+tool granted from it, and the honest reading is that a `Role::Liaison` moved
+from "not needed" to "argued but not yet earned" — the answer is still no, for
+two reasons and not one:
+
+- **This tool is the second root's own definition, not a convenience on top of
+  it.** "A liaison faces the human" and "the liaison can put a decision into the
+  human's inbox" are close to the same sentence; the trip-wire was written
+  against tools accumulating *around* the root ("a third and a fourth tool
+  granted because the human's pane wants them"), which is a different shape from
+  the root's own mechanism arriving.
+- **The cost has not moved.** A fifth kind is still ~60 sites, a template and
+  four golden fixtures, and both grants are still expressible as one predicate
+  at two call sites of one gate function.
+
+**The trip-wire therefore tightens rather than resets: a THIRD tool on the
+second root is the trigger**, and the next one that is a *write* is the trigger
+regardless of count — because two writes granted to a pane whose whole doctrine
+is "holds no orchestration authority" is a class asking to exist, and the answer
+then is the fifth kind, deliberately, not a longer table.
 
 ## The prose
 
-Nothing about this feature is mechanical. No notice is rerouted, no report
-changes destination, no board write moves — which is what makes the degradation
-argument structural instead of a promise: kill the pane and the group behaves
-byte-for-byte as it did. The feature is therefore two pieces of prose, and the
+**No traffic is rerouted by any of this.** No notice changes destination, no
+report is re-addressed, no board write moves — which is what makes the
+degradation argument structural instead of a promise: kill the pane and the
+group behaves byte-for-byte as it did. That is still true with the capability
+rules above in place, and deliberately: `ask_human` gave the liaison a tool, not
+a destination — the answer notice for a question it posed still goes to the
+orchestrator's pane. The feature is therefore two pieces of prose, and the
 reason no goldened role template is touched by either.
 
 **The orchestrator's fragment** — `{{LIAISON_NOTE}}` in `templates/workflow.md`,
@@ -286,6 +381,17 @@ through an answering surface. Nothing here makes the liaison the holder of a
 question, which is the shape #946 rejected on the grounds that a wedged liaison
 is a deaf fleet.
 
+**Since #1091 slice E the liaison also WRITES to that record, and the sentence
+above is unchanged by it.** Posing a question puts a row in `questions.json`;
+the pane still holds nothing, and a liaison that wedges mid-conversation leaves
+its questions exactly where the orchestrator and every answering surface can
+already see them — which is the property that made the registry the record in
+the first place. Both fragments say what the widening does not reach: the
+liaison writes no board row, cannot `withdraw_question`, and is not the pane the
+`[loomux] answer to q-N` notice arrives in; the orchestrator's fragment adds
+that `list_questions` will now show it rows it did not open, so read the
+`asker`.
+
 That last rule is about the **orchestrator's own** kill-idle-panes discipline,
 and it now sits beside a matching promise about loomux's reaper rather than a
 warning about it: `idle_reap_candidates` skips the hint (**Lifecycle**), so the
@@ -308,7 +414,12 @@ relay with the agent's own commentary kept separate from the quote,
 `note_directive` at the moment of receipt, the duplicate-delivery rule, the
 read-only tools to answer "how is it going" from, and the half of #946's trust
 boundary that lands on this pane in particular — it is the one most likely to be
-handed an answer, and it may present a question but never settle one.
+handed an answer, and it may present a question but never settle one. Since
+#1091 slice E it also carries the pose: `ask_human` is yours, never a blocking
+interactive dialog (the pane takes no delivery while one is up), for a decision
+the human should make later or away from this pane rather than for the one they
+are making with you right now — and the three edges of the grant, since a pane
+that has to discover them is a pane that waits for a notice that is not coming.
 
 **Where that addendum actually appears** is the same rule as for every other
 hint, and it is worth being exact about: a block's instructions file is the core

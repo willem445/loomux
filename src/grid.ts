@@ -1,7 +1,48 @@
 // Split-tree layout: panes live at the leaves, splits are flex rows or
 // columns with draggable dividers. Splitting in the same direction as the
-// parent inserts a sibling (so repeated splits form an even matrix rather
-// than a lopsided staircase); splitting across creates a nested split.
+// parent inserts a flat sibling; splitting across creates a nested split.
+//
+// A same-direction insert has TWO placement policies (#885), picked per call
+// site and computed in the pure, DOM-free `splitfloor.ts`:
+//
+//   - `halve` — the target pane pays for the newcomer out of its OWN weight,
+//     so the row's total is unchanged and every other pane keeps its exact
+//     grow/total RATIO. That is a ratio guarantee, not a pixel one: the new
+//     divider is itself a flex sibling and takes ~4px off the row's free
+//     space, so each sibling loses its ratio's share of those 4px (~1px in a
+//     typical row) and drops a terminal column on the occasions when that
+//     lands across a cell boundary. So: ONE guaranteed PTY resize (the
+//     target) plus a rare sub-cell nudge per sibling — against `share`, which
+//     moves and resizes every sibling in the row, every time. Every HUMAN
+//     split gesture uses this: the pane you are standing in is the one that
+//     shrinks, which is what tmux/wezterm do and what a split "feels" like.
+//   - `share` — the newcomer joins at the MEAN of the weights already in the
+//     row, so a row that was even is even again (N panes at 1/N) and repeated
+//     placements form a real even matrix rather than a lopsided staircase.
+//     Kept for PROGRAMMATIC batch placement — the multi-agent welcome fan-out,
+//     a pane rejoining from the dock, a restore replay — where halving
+//     repeatedly would deal out a 1/2, 1/4, 1/8, 1/16 sliver staircase.
+//
+// Cross-direction splits need no policy: nesting a two-way split inside the
+// target's slot already halves the target alone. See
+// doc/design/pane-splitting-and-floors.md.
+//
+// WHERE THE THREE PANE SLICES MEET. `halve` is #885's `splitfloor.planRowSplit`.
+// `share` is #936's `paneequalize.planEvenInsert` — NOT splitfloor's own
+// `share` branch, which is the pre-#885 "1/N on top of the existing total" and
+// is exactly the staircase #936 reported. Removal is #936's too: a closing
+// pane's weight goes to its survivors in equal absolute parts (`planRemoval`)
+// rather than being dropped for flex to re-share proportionally. Autosize
+// (`paneautosize.ts`) is the third, on-demand operation: it levels the WHOLE
+// tab across nesting when the human asks, and never by itself.
+//
+// That routing is also what keeps the #954 magnitude clamp in the path. It
+// lives at `paneequalize`'s entry points, so every operation that can inflate
+// a row's weights — the close, which preserves the total across one fewer
+// pane — re-bases an out-of-band row on the way in. `halve` reaches no clamp
+// and needs none: it preserves the row's total EXACTLY, which is both why it
+// cannot inflate anything and the guarantee a re-base would rewrite.
+// `test/splitfloor.test.ts` pins the routing; the design note argues it.
 //
 // On top of splitting, panes can be dragged by their header to reorder
 // (swap two slots) or re-dock to another pane's edge, maximized to cover the
@@ -17,6 +58,12 @@ import { dockChipQueue, queuePresentation } from "./queuebadge";
 import { planGroupMinimize } from "./group";
 import { shouldFocusNewPane, shouldRestoreFocus, shouldPreserveMaximize } from "./panefocus";
 import { startDragSession } from "./dragsession";
+import { planEvenInsert, planRemoval, readGrow } from "./paneequalize";
+import { equalizeWeights, type SplitShape } from "./paneautosize";
+// `parseGrow` is deliberately NOT imported: it is byte-for-byte `readGrow`
+// above, and one reader for the row keeps the two policies' weight repair
+// identical rather than merely equivalent-looking.
+import { planRowSplit, type SplitPolicy } from "./splitfloor";
 
 type Dir = "row" | "column";
 
@@ -129,7 +176,17 @@ export class Grid {
     /** Fired whenever the pane set / layout changes (open, close) so the host can
      *  re-render the tab strip's live agent counter and re-persist the layout
      *  (#194 P4). Defaults to a no-op for callers that don't care. */
-    private onChange: () => void = () => {}
+    private onChange: () => void = () => {},
+    /** Fired whenever the ACTIVE pane changes — a different question from
+     *  `onChange`, which is about the pane SET. The right-side dock follows the
+     *  active pane's folder (#1020 item 6) and this is its one trigger.
+     *
+     *  Deliberately hung off `setActive` rather than off `PaneEvents.onFocus`:
+     *  focus is only one of the ways the active pane moves. Closing a pane and
+     *  inheriting its neighbour, finishing a drag, `moveFocus`, opening a pane
+     *  and toggling maximize all reach `setActive` directly, and a dock wired to
+     *  focus alone would sit on a stale folder after every one of them. */
+    private onActive: () => void = () => {}
   ) {
     this.rootEl.addEventListener("pointerdown", (e) => this.onPointerDown(e));
     this.renderDock();
@@ -201,15 +258,21 @@ export class Grid {
   }
 
   /** Create a pane and place it: first pane fills the grid, later panes
-   *  split relative to `relativeTo` (default: the active pane). */
+   *  split relative to `relativeTo` (default: the active pane).
+   *
+   *  `policy` defaults to `share` — this opener's callers are programmatic
+   *  (the multi-agent fan-out, restore replay, orchestrator spawns), which is
+   *  exactly what the even-matrix policy is for. A human gesture routes
+   *  through `openWelcomePane` and passes `halve`. */
   async openPane(
     opts: PaneOptions,
     events: PaneEvents,
     dir: Dir = "row",
-    relativeTo?: Pane
+    relativeTo?: Pane,
+    policy: SplitPolicy = "share"
   ): Promise<Pane> {
     const pane = new Pane(events);
-    const takeFocus = this.placeLeaf(pane, !!opts.background, dir, relativeTo);
+    const takeFocus = this.placeLeaf(pane, !!opts.background, dir, relativeTo, policy);
     await pane.start(opts, takeFocus);
     // Re-notify now that the PTY exists: placeLeaf fired onChange BEFORE start, so
     // the pane was still ptyId-less (live:false) and the agent counter undercounted
@@ -254,10 +317,22 @@ export class Grid {
   /** Land a pane in "setup" state (#194): placed in the grid like any pane but
    *  with NO PTY — it shows the welcome/pane-setup form (`formEl`) until the user
    *  submits, at which point the caller converts it via `pane.startFromWelcome`.
-   *  No terminal is opened here, so nothing can resize a ConPTY before submit. */
-  openWelcomePane(events: PaneEvents, formEl: HTMLElement, dir: Dir = "row", relativeTo?: Pane): Pane {
+   *  No terminal is opened here, so nothing can resize a ConPTY before submit.
+   *
+   *  This is the opener every human split gesture lands in (Ctrl+Shift+E/O,
+   *  the top-bar buttons, a pane header's ◫/⬓), so those pass `halve` (#885).
+   *  It also serves restore fail-softs (a pane whose folder is gone comes back
+   *  as a welcome form), which keep the `share` default: a replayed layout is
+   *  programmatic placement, not a gesture. */
+  openWelcomePane(
+    events: PaneEvents,
+    formEl: HTMLElement,
+    dir: Dir = "row",
+    relativeTo?: Pane,
+    policy: SplitPolicy = "share"
+  ): Pane {
     const pane = new Pane(events);
-    const takeFocus = this.placeLeaf(pane, false, dir, relativeTo);
+    const takeFocus = this.placeLeaf(pane, false, dir, relativeTo, policy);
     pane.startWelcome(formEl);
     if (takeFocus) pane.focusWelcome();
     return pane;
@@ -275,7 +350,10 @@ export class Grid {
     relativeTo?: Pane
   ): Pane {
     const pane = new Pane(events);
-    const takeFocus = this.placeLeaf(pane, !!opts.background, dir, relativeTo);
+    // `share`: content panes are opened programmatically beside their source
+    // (the file browser's "open in editor pane", restore replay) — not one of
+    // the four human split gestures #885 moved to `halve`.
+    const takeFocus = this.placeLeaf(pane, !!opts.background, dir, relativeTo, "share");
     pane.startContent({ ...opts, background: !takeFocus });
     // Re-notify now that the pane KNOWS what kind it is. placeLeaf fired onChange while
     // it was still a bare Pane, and `capture()` would have serialized it as a rootless
@@ -299,7 +377,10 @@ export class Grid {
     relativeTo?: Pane
   ): Pane {
     const pane = new Pane(events);
-    this.placeLeaf(pane, true, dir, relativeTo);
+    // `share`: this opener exists only for restore replay — programmatic
+    // placement, and `applyLayoutWeights` overwrites every weight afterwards
+    // anyway, so the policy is not even observable here.
+    this.placeLeaf(pane, true, dir, relativeTo, "share");
     pane.startDormant(record, contentEl);
     return pane;
   }
@@ -325,13 +406,72 @@ export class Grid {
     walk(this.root, weights);
   }
 
+  /** Autosize (#936): give every pane in this tab an equal share of the space,
+   *  on demand. The human's answer to a layout that has drifted — a nested
+   *  staircase from the agent fan-out, a row where one pane ended up holding
+   *  most of the width — without having to drag each divider back by hand.
+   *
+   *  What it adds over the even-share split policy (#945, `paneequalize.ts`):
+   *  that policy keeps a row even WITHIN one split — a newcomer at the mean, a
+   *  closing pane's weight shared out in equal absolute parts — and each of its
+   *  operations touches only the row it happened in. Equality across NESTING is
+   *  a different property: a pane beside a stacked pair is a half and two
+   *  quarters however even each split is on its own, because a pane's size is
+   *  the product of its share at every level. That product is what this levels,
+   *  and it is why the gesture is not made redundant by #945.
+   *
+   *  On demand is the whole design: nothing levels the tab by itself, and a
+   *  divider the human dragged stays where they put it until they ask. It is
+   *  also indifferent to which policy a split gesture ends up with (#900's
+   *  halve or #945's even share) — it reads the tree's SHAPE, never its
+   *  weights.
+   *
+   *  The weights come from the pure `equalizeWeights` — each node weighted by
+   *  the number of panes under it, which is what makes the LEAVES equal rather
+   *  than each split's children (see paneautosize.ts). Applied through the same
+   *  `applyLayoutWeights` a session restore uses, so there is one place that
+   *  writes a whole tree's weights.
+   *
+   *  Fullscreen exits first: autosize is a request to see the layout, and
+   *  silently re-weighting a tree the human cannot see (with one pane covering
+   *  it) would look like the button did nothing.
+   *
+   *  Constraint 1: a discrete, human-initiated layout operation, the same class
+   *  as a split or a divider drag — one resize for each pane whose size actually
+   *  changes, and `shouldResizePty` (panefit.ts) drops the ones whose `cols x
+   *  rows` did not move. Nothing continuous, nothing chrome-driven. Docked panes
+   *  are untouched: they are outside the tree and hold no space to even out. */
+  autosize(): void {
+    if (!this.root) return;
+    if (this.maximized) this.exitMaximize();
+    // Hand the module the SHAPE and nothing else — no panes, no elements. It is
+    // a parallel tree of empty objects, a few dozen at the very most, and it is
+    // what keeps `paneautosize.ts` honestly DOM-free rather than DOM-free by
+    // convention. (Passing the live nodes would also trip TS's weak-type check:
+    // `SplitShape`'s only field is optional, so a LeafNode shares no property
+    // with it.)
+    const shape = (n: TreeNode): SplitShape =>
+      n.kind === "leaf" ? {} : { children: n.children.map(shape) };
+    this.applyLayoutWeights(equalizeWeights(shape(this.root)));
+    // The new weights are what a restore must reproduce (#194 P4) — persist
+    // them, exactly as a finished divider drag does.
+    this.onChange();
+  }
+
   /** Insert a freshly-constructed pane's leaf into the tree and settle focus.
    *  Shared by `openPane` (which then spawns a PTY) and `openWelcomePane` (which
    *  renders a setup form instead). Returns whether the new pane took focus.
    *
    *  `background` is an orchestrator-driven spawn that must not steal focus/active
-   *  from where the human is typing (#117) nor collapse a fullscreen view (#155). */
-  private placeLeaf(pane: Pane, background: boolean, dir: Dir, relativeTo?: Pane): boolean {
+   *  from where the human is typing (#117) nor collapse a fullscreen view (#155).
+   *  `policy` is the caller's split intent (#885) — see `insertBeside`. */
+  private placeLeaf(
+    pane: Pane,
+    background: boolean,
+    dir: Dir,
+    relativeTo: Pane | undefined,
+    policy: SplitPolicy
+  ): boolean {
     // Snapshot the human's focus FIRST — before any relayout below. Both
     // exitMaximize and insertBeside → renderSplit do replaceChildren(), which
     // detaches the focused pane's subtree (the steering strip or a terminal) and
@@ -364,7 +504,7 @@ export class Grid {
       pane.el.style.flex = "1 1 0";
       this.rootEl.appendChild(pane.el);
     } else {
-      this.insertBeside(this.leaves.get(target)!, leaf, dir);
+      this.insertBeside(this.leaves.get(target)!, leaf, dir, policy);
     }
 
     // Preserving fullscreen (#155): insertBeside re-seated the maximized pane's
@@ -390,17 +530,61 @@ export class Grid {
     return takeFocus;
   }
 
-  private insertBeside(at: LeafNode, leaf: LeafNode, dir: Dir, before = false): void {
+  /** Insert `leaf` beside `at`. `policy` decides who pays for the new pane's
+   *  space on a SAME-DIRECTION insert (see the module comment); it is required
+   *  rather than defaulted so every call site states which intent it is —
+   *  a human gesture (`halve`) or programmatic placement (`share`). */
+  private insertBeside(
+    at: LeafNode,
+    leaf: LeafNode,
+    dir: Dir,
+    policy: SplitPolicy,
+    before = false
+  ): void {
     const parent = at.parent;
     if (parent && parent.dir === dir) {
-      // Same-direction split: add a sibling next to the target, giving it an
-      // equal share of the row/column.
+      // Same-direction split: add a flat sibling next to the target. The FLAT
+      // N-way row is deliberate under both policies — it is why a divider drag
+      // only ever negotiates with its two immediate neighbours — so the policy
+      // changes the weights, never the structure.
+      //
+      // THE ONE PLACE #885 AND #936 MEET. `halve` is #885's policy, unchanged:
+      // the target pays for the newcomer out of its own weight, so a human
+      // split is local. `share` — programmatic batch placement — is served by
+      // #936's `planEvenInsert` rather than `splitfloor`'s own `share` branch,
+      // because the two slices disagree about exactly this arithmetic and #936
+      // is the fix: splitfloor's `share` is the pre-#885 "newcomer at 1/N on
+      // top of the existing total", which is the lopsided 1, .5, .33, .25
+      // staircase #936 reported. `planEvenInsert` gives the newcomer the MEAN
+      // of the row, which is the even matrix both slices' comments promise.
+      //
+      // It also puts every magnitude-raising path through `paneequalize`'s
+      // entry clamp (#954): a close preserves the row's total across one fewer
+      // pane, so it is the operation that inflates weights, and `planRemoval`
+      // re-bases an out-of-band row on the way in. `halve` needs no clamp and
+      // deliberately does not get one — it preserves the row's total EXACTLY,
+      // which is the guarantee that makes a human split local, and a re-base
+      // would rewrite the very numbers that guarantee is about. See
+      // doc/design/pane-splitting-and-floors.md, "Where the clamp sits".
+      //
+      // Same plan shape (`weights` + `insertedIndex`) either way, so the
+      // write-back below is common to both.
       const idx = parent.children.indexOf(at);
-      parent.children.splice(before ? idx : idx + 1, 0, leaf);
+      const grows = parent.children.map((c) => readGrow(nodeEl(c).style.flexGrow));
+      const plan =
+        policy === "halve"
+          ? planRowSplit(grows, idx, "halve", before)
+          : planEvenInsert(grows, idx, before);
+      parent.children.splice(plan.insertedIndex, 0, leaf);
       leaf.parent = parent;
-      const share = 1 / (parent.children.length - 1);
-      for (const c of parent.children) nodeEl(c).style.flex ||= "1 1 0";
-      nodeEl(leaf).style.flex = `${share} 1 0`;
+      // Write every child's weight, not just the newcomer's: under `halve` the
+      // untouched siblings get written back the value they already had (so
+      // nothing moves), and under `share` it is what makes `paneequalize` the
+      // single source of the row's arithmetic (including a re-base, which
+      // rewrites all of them at once while moving no pane).
+      parent.children.forEach((c, i) => {
+        nodeEl(c).style.flex = `${plan.weights[i]} 1 0`;
+      });
       this.renderSplit(parent);
     } else {
       // Cross-direction: replace the leaf with a new 2-way split.
@@ -466,16 +650,37 @@ export class Grid {
 
   /** Detach a leaf's element and unlink it from the tree, collapsing a
    *  now-single-child split. Does NOT dispose the pane — used by close (which
-   *  disposes after), minimize, and move. */
+   *  disposes after), minimize, and move.
+   *
+   *  The leaving pane's weight is handed to its surviving siblings in equal
+   *  parts (`planRemoval`) instead of being dropped on the floor. Dropping it
+   *  is not free even though flex always fills the split: flex re-shares the
+   *  freed space PROPORTIONALLY, so the pane that was already biggest takes
+   *  nearly all of it and a sliver stays a sliver — the "close a pane, get
+   *  dead unusable space back" of #936. */
   private removeFromTree(leaf: LeafNode): void {
     const parent = leaf.parent;
     leaf.pane.el.remove();
     if (!parent) {
       this.root = null;
     } else {
-      parent.children.splice(parent.children.indexOf(leaf), 1);
-      if (parent.children.length === 1) this.collapse(parent);
-      else this.renderSplit(parent);
+      const idx = parent.children.indexOf(leaf);
+      const weights = planRemoval(
+        parent.children.map((c) => readGrow(nodeEl(c).style.flexGrow)),
+        idx
+      );
+      parent.children.splice(idx, 1);
+      if (parent.children.length === 1) {
+        // A one-child split is about to be replaced by that child, which takes
+        // the SPLIT's own weight in the grandparent's slot — so there is no
+        // sibling to redistribute to and nothing `weights` could usefully say.
+        this.collapse(parent);
+      } else {
+        parent.children.forEach((c, i) => {
+          nodeEl(c).style.flex = `${weights[i]} 1 0`;
+        });
+        this.renderSplit(parent);
+      }
     }
     leaf.parent = null;
   }
@@ -564,6 +769,10 @@ export class Grid {
     this.active?.setActive(false);
     this.active = pane;
     pane.setActive(true);
+    // After the pane is live, so a listener that reads `activePane` sees the new
+    // one. Inside the early-return guard above, so re-focusing the pane that is
+    // already active stays free.
+    this.onActive();
   }
 
   // ---------- maximize ----------
@@ -659,7 +868,10 @@ export class Grid {
       this.root = leaf;
       this.rootEl.replaceChildren(pane.el);
     } else {
-      this.insertBeside(targetLeaf, leaf, "row");
+      // `share`: a dock restore is a pane REJOINING the grid, not the human
+      // splitting the pane they are in — the row makes room for it the way it
+      // always has. (#885 slice B revisits what happens when there is no room.)
+      this.insertBeside(targetLeaf, leaf, "row", "share");
     }
     this.setActive(pane);
     pane.focus();
@@ -725,7 +937,10 @@ export class Grid {
         this.root = leaf;
         this.rootEl.replaceChildren(pane.el);
       } else {
-        this.insertBeside(targetLeaf, leaf, "row");
+        // `share`, as in `restore` — and doubly so here: a batch group-unfold
+        // laying panes out as an even matrix is exactly what that policy is
+        // for, where halving each restore in turn would deal out slivers.
+        this.insertBeside(targetLeaf, leaf, "row", "share");
       }
       // Seat the next restore beside this one, not back at the orchestrator.
       this.setActive(pane);
@@ -991,7 +1206,23 @@ export class Grid {
 
   /** Move a pane out of its current slot and re-dock it to an edge of the
    *  target, forming (or joining) a split in that direction. This is a genuine
-   *  restructure, so affected panes may resize once. */
+   *  restructure, so affected panes may resize once.
+   *
+   *  `halve` (#885): drag-to-edge is one of the four human split gestures —
+   *  "put this pane HERE, in that pane's space" — so the DROP TARGET is what
+   *  pays for the arriving pane.
+   *
+   *  That is the only half of this operation the policy governs, and the other
+   *  half moves panes regardless of it: the pane also LEAVES a slot, and since
+   *  #936 `removeFromTree` hands its weight to the surviving siblings in equal
+   *  absolute parts, so the old row's TOTAL is preserved and every survivor
+   *  grows by the same absolute amount. When the drag stays inside one row,
+   *  that is the same row — e.g. [A=1, B=1, C=1] with C dropped on A's right
+   *  edge becomes [A=1.5, B=1.5] on the way out and ends [A=.75, C=.75,
+   *  B=1.5], so B goes from a third of the row to a half. That is correct (a
+   *  departing pane has to give its space back) and is not what this policy
+   *  governs; it just means "the rest of the layout doesn't move" is a claim
+   *  about a SPLIT and not about a MOVE. */
   moveToEdge(source: Pane, target: Pane, dir: Dir, before: boolean): void {
     if (source === target || this.maximized) return;
     const leaf = this.leaves.get(source);
@@ -999,7 +1230,7 @@ export class Grid {
     if (!leaf || !targetLeaf) return;
     this.removeFromTree(leaf);
     source.el.style.flex = "1 1 0";
-    this.insertBeside(targetLeaf, leaf, dir, before);
+    this.insertBeside(targetLeaf, leaf, dir, "halve", before);
     this.setActive(source);
     source.focus();
   }

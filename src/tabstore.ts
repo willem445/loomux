@@ -177,7 +177,14 @@ export interface PersistedPane {
  *  representable here at all — see the field comment above). Kept local
  *  rather than imported from pane.ts: tabstore.ts is the pure persistence
  *  layer pane.ts depends ON, not the reverse. */
-export type PersistedEmbedView = "tasks" | "audit" | "group" | "git" | "editor" | "timeline";
+export type PersistedEmbedView =
+  | "tasks"
+  | "decisions"
+  | "audit"
+  | "group"
+  | "git"
+  | "editor"
+  | "timeline";
 
 /** Which edge of the terminal a docked view sits on (#361) — mirrors
  *  `pane.ts`'s own `EmbedSide`, kept local for the same reason
@@ -296,6 +303,8 @@ const EMBED_VIEWS: readonly PersistedEmbedView[] = [
   // `isEmbedView` and keeps the rest of the pane, which is the same path a
   // malformed entry takes.
   "timeline",
+  // #1091's NEEDS-YOU panel, on the same additive terms.
+  "decisions",
 ];
 const EMBED_SIDES: readonly PersistedEmbedSide[] = ["left", "right", "bottom"];
 

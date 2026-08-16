@@ -9,7 +9,9 @@ import { invoke, listen, type UnlistenFn } from "./transport.ts";
 import { swapIfConnected } from "./domutil";
 import {
   approvableSelection,
+  blockedTaskMap,
   blockingAncestor,
+  boardMarker,
   boardUsesDeps,
   boardUsesHierarchy,
   canApprove,
@@ -41,6 +43,7 @@ import {
   visibleRows,
   withDep,
   withoutDep,
+  type BoardMarker,
   type BoardRow,
   type PickerField,
   type PickerTarget,
@@ -49,9 +52,11 @@ import {
   approveTask,
   approveTasks,
   groupSummary,
+  questionsList,
   workflowStatus,
   type WorkflowStatus,
 } from "./orchestration";
+import { isPending, type OrchQuestion } from "./decisions";
 import { normalizeComment } from "./autonomy";
 import { CoalescingRefresh } from "./refreshgate";
 import { approveWillMerge, gateExitsMessage } from "./workflowstatus";
@@ -94,6 +99,14 @@ export interface OrchTask {
    *  only labels the row with it: a story directly inside an epic is legal,
    *  and no affordance here changes behaviour based on it. */
   kind?: string | null;
+  /** Worktree path where a demo of this row lives (#1091 slice B) — recorded
+   *  by the orchestrator on a `prototype`/`human-testing` row so the NEEDS-YOU
+   *  panel can tell the human where to go run it. Optional on the wire like
+   *  `parent`/`kind`: the backend omits the key entirely when absent, so a
+   *  pre-#1091 board arrives without it. Absent means "no path recorded", never
+   *  "there is no demo" — nothing here guesses one from an assignee's cwd.
+   *  Display metadata: nothing gates on it. */
+  demo_path?: string | null;
   updated_ms: number;
 }
 
@@ -136,6 +149,11 @@ export class TasksView {
   private toastEl: HTMLElement;
   private toastTimer: number | undefined;
   private tasks: OrchTask[] = [];
+  /** Pending + settled questions (#1091 slice G) — read alongside `tasks` so
+   *  the board can derive the decision-blocked marker. Best-effort like
+   *  `liveAgentIds`/`workflow` below: a failed read just means no marker
+   *  until the next successful refresh, never a broken board. */
+  private questions: OrchQuestion[] = [];
   /** Ids of the group's currently-live agents (#339 refinement) — an
    *  assignee not in this set reads as history, not active work, however
    *  recently its task was touched. Refreshed alongside `tasks`; best-effort
@@ -181,7 +199,11 @@ export class TasksView {
   private readonly refresher = new CoalescingRefresh(() => this.refreshNow());
   /** The open request-changes modal, if any (kept to one at a time). */
   private dialogEl: HTMLElement | null = null;
-  private unlisten: UnlistenFn | null = null;
+  private unlistenTasks: UnlistenFn | null = null;
+  /** #1091 slice G: the board's marker chip needs `orch-questions-changed`
+   *  too — a question being asked, answered, or withdrawn changes whether a
+   *  row is decision-blocked, independently of any `orch-tasks-changed`. */
+  private unlistenQuestions: UnlistenFn | null = null;
   private disposed = false;
 
   private embedBtn: HTMLButtonElement;
@@ -189,7 +211,21 @@ export class TasksView {
 
   constructor(
     private groupId: string,
-    opts: { onClose: () => void; onEmbedMenu: (anchor: HTMLElement) => void }
+    private opts: {
+      onClose: () => void;
+      onEmbedMenu: (anchor: HTMLElement) => void;
+      /** Drain any focus request parked for the BOARD (#1091 slice C), called
+       *  once per render. Non-null only when something asked for a specific
+       *  row while the board was closed or unbuilt — a NEEDS-YOU card citing
+       *  `t-N` is the first caller. `undefined` when the host wires no focus. */
+      takeFocus?: () => string | null;
+      /** The board-to-panel direction of the focus hook (#1091 slice G): ask
+       *  the pane to open the NEEDS-YOU panel at `id` — a `q-N` for a
+       *  decision-blocked row, this row's own `t-N` for a demo-gated one (see
+       *  `boardMarker` in `taskboard.ts`). Returns whether the pane could
+       *  route it, mirroring `decisionsview.ts`'s `onFocusTask` the other way. */
+      onFocusDecision: (id: string) => boolean;
+    }
   ) {
     this.el = el("div", "tasks-view");
 
@@ -273,7 +309,18 @@ export class TasksView {
       if (payload.group_id === this.groupId) this.refresh();
     }).then((u) => {
       if (this.disposed) u();
-      else this.unlisten = u;
+      else this.unlistenTasks = u;
+    });
+    // #1091 slice G: the marker chip's decision signal depends on the
+    // questions list too, not just the board — both listeners share the one
+    // `refresher` gate above, so a simultaneous burst on both streams still
+    // coalesces to one refresh, exactly like the NEEDS-YOU panel's own pair
+    // (decisionsview.ts).
+    void listen<{ group_id: string }>("orch-questions-changed", ({ payload }) => {
+      if (payload.group_id === this.groupId) this.refresh();
+    }).then((u) => {
+      if (this.disposed) u();
+      else this.unlistenQuestions = u;
     });
   }
 
@@ -309,7 +356,8 @@ export class TasksView {
     clearTimeout(this.toastTimer);
     clearTimeout(this.clearDoneTimer);
     clearTimeout(this.deleteSelectedTimer);
-    this.unlisten?.();
+    this.unlistenTasks?.();
+    this.unlistenQuestions?.();
     this.el.remove();
   }
 
@@ -376,6 +424,11 @@ export class TasksView {
     // the board's primary data — a failed read must not toast-error the whole
     // board (tasks above already succeeded), it just leaves Approve unlabeled.
     this.workflow = await workflowStatus(this.groupId).catch(() => null);
+    // Best-effort like liveAgentIds/workflow above (#1091 slice G): the
+    // decision-blocked marker is an enrichment on top of the tasks the board
+    // already has, not core data — a failed read just means no marker until
+    // the next successful refresh.
+    this.questions = await questionsList(this.groupId).catch(() => []);
     // Drop any ticked rows that vanished from the board (orchestrator edit,
     // another delete) so the "delete selected" count can't outlive its rows.
     this.selected = retainExisting(this.selected, this.tasks);
@@ -739,12 +792,36 @@ export class TasksView {
     // Same board-level gate for the nesting chrome (#958): a board that nests
     // nothing keeps exactly the rows it has today, with no collapse gutter.
     const usesHierarchy = boardUsesHierarchy(this.tasks);
+    // t-N → q-N for every row a PENDING question cites (#1091 slice G) —
+    // computed once for the whole render, like usesDeps/usesHierarchy above.
+    // `isPending` is decisions.ts's own rule (never re-spelled here — see
+    // `blockedTaskMap`'s doc), so a settled question can never leave a stale
+    // marker on a row it no longer holds up.
+    const blocked = blockedTaskMap(this.questions.filter(isPending));
     // Display order is DERIVED from `parent` (#958) — the board array stays
     // flat and its order stays the priority order, exactly as before. On a
     // board that uses no hierarchy this is the array, in order, at depth 0.
     for (const row of visibleRows(this.tasks, this.collapsed)) {
-      this.listEl.appendChild(this.renderTask(row, usesDeps, usesHierarchy));
+      this.listEl.appendChild(this.renderTask(row, usesDeps, usesHierarchy, blocked));
     }
+    this.drainFocus();
+  }
+
+  /** Bring a requested row into view and flash it (#1091 slice C).
+   *
+   *  Drained LAST in a render, once the rows exist, and consumed — so an
+   *  ordinary refresh never yanks the viewport back to a row the human has
+   *  already scrolled away from. A target that names no row on this render is
+   *  a no-op: the task may have been deleted between the request and the
+   *  render, which is not worth an error. */
+  private drainFocus(): void {
+    const target = this.opts.takeFocus?.() ?? null;
+    if (!target) return;
+    const row = this.listEl.querySelector<HTMLElement>(`[data-item-id="${CSS.escape(target)}"]`);
+    if (!row) return;
+    row.scrollIntoView({ block: "nearest" });
+    row.classList.add("task-row-focused");
+    window.setTimeout(() => row.classList.remove("task-row-focused"), 1600);
   }
 
   /** The dependency line under a task's row (#582): what is blocking it, what
@@ -1039,10 +1116,15 @@ export class TasksView {
   private renderTask(
     boardRow: BoardRow<OrchTask>,
     usesDeps: boolean,
-    usesHierarchy: boolean
+    usesHierarchy: boolean,
+    blocked: ReadonlyMap<string, string>
   ): HTMLElement {
     const t = boardRow.task;
     const row = el("div", "task-row");
+    // The anchor the focus hook scrolls to (#1091 slice C). A data attribute
+    // rather than an id: several boards can be open at once across panes, and
+    // duplicate DOM ids would make `querySelector` pick an arbitrary one.
+    row.dataset.itemId = t.id;
     // Nesting depth (#958). Clamped: the backend caps writes at depth 4, but a
     // hand-edited tasks.json can be deeper and an unbounded indent would walk
     // the row off the right edge of the overlay.
@@ -1140,6 +1222,30 @@ export class TasksView {
       top.appendChild(badge);
     }
     top.appendChild(el("span", "task-id", t.id));
+
+    // Board marker + deep-link (#1091 slice G): an obvious chip on a row
+    // that is blocked on a human decision or gated on a demo, routing
+    // through the pane's focus hook to open the NEEDS-YOU panel at that
+    // item. Placed right after the id, ahead of every other chip, so it is
+    // the first thing the eye lands on after "which row is this".
+    const marker: BoardMarker | null = boardMarker(t, blocked);
+    if (marker) {
+      const chip = el(
+        "button",
+        "task-chip marker",
+        marker.kind === "decision" ? "❓ needs a decision" : "👀 needs a look"
+      ) as HTMLButtonElement;
+      chip.title =
+        marker.kind === "decision"
+          ? "A pending question is holding this up — open it in the NEEDS-YOU panel"
+          : "Parked for a demo — open it in the NEEDS-YOU panel";
+      chip.addEventListener("click", () => {
+        if (!this.opts.onFocusDecision(marker.target)) {
+          this.toast("The NEEDS-YOU panel isn't available on this pane.");
+        }
+      });
+      top.appendChild(chip);
+    }
 
     // Advisory Agile level (#958): a label, nothing more — no affordance on
     // this board reads it, and the backend gates nothing on it either.

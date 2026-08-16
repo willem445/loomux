@@ -14,6 +14,11 @@
 // keeps a `custom…` entry, so a missing id costs a human one line of typing, and
 // a stale id in a hardcoded table would cost them a failed spawn (#329).
 //
+// That "shortcut" sizing holds for every row whose CLI can be asked something.
+// It does NOT hold for copilot, whose row is a full catalog because nothing on
+// the machine will answer for it — see the row itself for why, and for what
+// retires it (#1020).
+//
 // Every id here is one PATH probe (`probe_agent_cli`) away from being refused at
 // submit: the `id` IS the program name the launcher probes, which is why
 // `orchclis.test.ts` pins it against `AGENTS`.
@@ -52,8 +57,77 @@ export const ORCH_CLIS: OrchCli[] = [
     defaults: { orchestrator: "opus", worker: "sonnet", reviewer: "sonnet", planner: "opus" },
   },
   {
+    // The one row that carries a FULL vendor catalog rather than a shortcut, and
+    // it is deliberate — human-directed (#1020), not a conclusion an agent may
+    // re-derive or extend to another CLI.
+    //
+    // Every other row stays short because something on the machine will answer
+    // for it: the picker puts the CLI's own reply in front of these suggestions
+    // (`mergeModelOptions`), so a curated list only has to cover the defaults.
+    // **Nothing answers for copilot.** It has no `ENUMERATORS` row (cliprobe.rs)
+    // and no `PROTOCOLS` row (modelwire.rs), so its only live source is
+    // `parse_models_from_help`, and copilot's `--help` no longer enumerates
+    // models under `--model` — the parse comes back empty. The merge then has
+    // nothing to lead with and this list IS the menu, which is why five ids left
+    // a human retyping two dozen others from memory.
+    //
+    // The order is copilot's own, not sorted, and `auto` stays FIRST: it is
+    // copilot's pick-for-me value and the default on every role.
+    //
+    // **INTERIM.** A static catalog standing in for a live answer ages exactly
+    // the way #329 warns, and this one is meant to be retired rather than
+    // maintained: when copilot gains a *supported* way to enumerate its models,
+    // give it the `ENUMERATORS`/`PROTOCOLS` row and cut this back to the handful
+    // the defaults need. No change here is required for that — the machine's
+    // answer already sorts in front of these. (Today's `copilot … model list` is
+    // rejected as unsupported and only spills a catalog on its ERROR path, which
+    // is not a contract loomux may parse.)
+    //
+    // **What this list is NOT: an entitlement claim.** Copilot also reports a
+    // much shorter per-account "Supported models" set, which varies by plan and
+    // subscription. That is a fact about one machine, and baking it in is the
+    // host special-casing constraint 8 forbids — these are the models copilot
+    // offers as a product, and hiding one here would make loomux wrong for
+    // everyone whose plan differs from the one that produced the list.
+    //
+    // So this list and any given account's DIVERGE BOTH WAYS, and neither
+    // direction is fixable from here. It offers ids a plan may not cover — those
+    // are refused at spawn, a truthful failure. It also OMITS ids a plan may
+    // cover: the capture behind this row named `claude-opus-4.6` and
+    // `claude-opus-4.5` as supported, and neither is in copilot's Available
+    // catalog. `custom…` is what answers both, which is why the user docs sell
+    // it as more than an escape from staleness.
     id: "copilot",
-    models: ["auto", "claude-sonnet-4.6", "claude-haiku-4.5", "gpt-5.2", "gpt-5.3-codex"],
+    models: [
+      "auto",
+      "gpt-5.6-sol",
+      "gpt-5.6-terra",
+      "gpt-5.6-luna",
+      "gpt-5.5",
+      "gpt-5.4",
+      "gpt-5.4-mini",
+      "gpt-5.3-codex",
+      "gpt-5-mini",
+      "claude-sonnet-5",
+      "claude-fable-5",
+      "claude-opus-5",
+      "claude-opus-4.8",
+      "claude-opus-4.8-fast",
+      "claude-opus-4.7",
+      "claude-sonnet-4.6",
+      "claude-sonnet-4.5",
+      "claude-haiku-4.5",
+      "mai-code-1-flash-picker",
+      "gemini-3.7-flash",
+      "gemini-3.6-flash",
+      "gemini-3.5-flash",
+      "gemini-3.1-pro-preview",
+      "grok-4.5",
+      "kimi-k3",
+      "kimi-k2.7-code",
+      "grok-4.6",
+      "mai-code-1.1-flash",
+    ],
     defaults: { orchestrator: "auto", worker: "auto", reviewer: "auto", planner: "auto" },
   },
   {

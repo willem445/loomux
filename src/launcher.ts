@@ -40,6 +40,7 @@ import {
   capacityRaiseTarget,
   capacityWarning,
   describeBlock,
+  orchestratorCliOf,
   resolveRoster,
   type OrchRole,
   type ResolvedRoster,
@@ -78,12 +79,13 @@ import {
   discoverGitBash,
   discoverSsh,
   loadSshProfiles,
-  probeAgentCli,
   saveSshProfiles,
 } from "./pty";
-import { ModelCatalog, type CliProbe } from "./modelcatalog";
+import { type CliProbe } from "./modelcatalog";
+import { modelCatalog } from "./modelprobe";
 import { ModelPicker } from "./modelpicker";
 import { ORCH_CLIS, orchCliFor } from "./orchclis";
+import { ICON_SETUP_PREVIEW_PX, setupPreviewMark } from "./setuppreview";
 import { knobState, knobValue, type CliKnobs, type KnobState, type KnobStates } from "./selectorknobs";
 import { admitRoot, ftRootIsDir } from "./fileapi";
 import {
@@ -176,8 +178,20 @@ export type WelcomeResult =
    *  profile, the minted session id — is what this form just did.
    *
    *  No `cwd`: the pane's LOCAL directory stays home (the repo is on the far end).
-   *  `profileId` is what the pane records — the connection, not its contents. */
-  | { kind: "ssh"; name: string; argv: string[]; profileId: string; sessionId?: string };
+   *  `profileId` is what the pane records — the connection, not its contents.
+   *
+   *  `defaultCli` is the profile's far-end CLI, carried alongside the argv because the
+   *  argv cannot express it: `argv[0]` is the local ssh client and the remote command is
+   *  one opaque quoted string after `--`. The pane's header mark needs the real agent, and
+   *  this is the only place on the launch path that still holds the profile (#992). */
+  | {
+      kind: "ssh";
+      name: string;
+      argv: string[];
+      profileId: string;
+      defaultCli: string | null;
+      sessionId?: string;
+    };
 
 const basename = (p: string): string => p.split(/[\\/]/).filter(Boolean).pop() ?? "";
 
@@ -327,7 +341,6 @@ export class WelcomeForm {
   private channelToolsInput: HTMLInputElement;
   // Orchestrator guardrails.
   private orchFields: HTMLElement;
-  private workersInput: HTMLInputElement;
   private maxAgentsInput: HTMLInputElement;
   private idleKillInput: HTMLInputElement;
   private spawnRateInput: HTMLInputElement;
@@ -366,6 +379,10 @@ export class WelcomeForm {
    *  whenever `maxAgentsInput` changes, so the #255 capacity warning tracks the
    *  cap live as the human types without waiting on a new preview. */
   private lastRoster: ResolvedRoster | null = null;
+  /** Whether {@link lastRoster} still describes the form's CURRENT inputs. False across a
+   *  re-resolve's async gap, so the card's CLI badge — which is derived from the roster
+   *  (#1020 rev-740 1b) — says nothing rather than describing the inputs it had before. */
+  private rosterFresh = false;
   /** One backend preview per (repo, group CLI), memoized for the form's life. */
   private previews = new Map<string, Promise<WorkflowPreview | null>>();
   /** Monotonic token: a preview that resolves after the human has moved on
@@ -374,15 +391,37 @@ export class WelcomeForm {
   private rosterTimer: number | null = null;
   private permsSel: HTMLSelectElement;
   private agentWarn: HTMLElement;
-  /** The shared model catalog (#935): one probe per program per app run (the
-   *  backend caches too), and the one merge of curated suggestions with what the
-   *  CLI reported. Owns the memo this form used to keep itself, so the models it
+  /** The shared model catalog (#935): one probe per program for an answer worth
+   *  keeping, and the one merge of curated suggestions with what the CLI
+   *  reported. Owns the memo this form used to keep itself, so the models it
    *  offers and the models the workflow pane's block editor offers come from the
-   *  same code. */
-  private catalog = new ModelCatalog(probeAgentCli);
+   *  same code — and, being the app-wide instance (`modelprobe.ts`), from the same
+   *  memo: this pane BECOMES that editor when "Edit workflow…" is pressed, and a
+   *  per-form catalog would re-probe every CLI across that handover.
+   *
+   *  A probe that found nothing is NOT kept (`worthKeeping`), so this form asking
+   *  again — which it does on every CLI change — is what reaches a CLI installed
+   *  since the app started. */
+  private catalog = modelCatalog;
+  /** Whether this form has ever been on screen — the "has it died yet?" half of
+   *  the `catalog.onReport` liveness test (#1020). A form that has not been
+   *  appended yet and one whose pane has been closed are both `isConnected ===
+   *  false`, and only the second is dead. */
+  private mounted = false;
+  /** `role:cli` pairs a detection reply has already been applied to (#1020).
+   *
+   *  The push and the pull are two deliveries of ONE sweep answer and both can
+   *  land, in either order. Deduping inside the funnel they share is what makes
+   *  the no-double-repaint property hold for both orderings, rather than only
+   *  the one a flag captured before the await can see (rev-713 non-blocking 3). */
+  private detectionsApplied = new Set<string>();
   /** Autopilot flags per program, memoized. Empty string = the CLI has no
    *  unattended flag surface, so the toggle is hidden/inert for it (#101). */
   private autopilotFlags = new Map<string, Promise<string>>();
+
+  /** The card-header CLI preview (#1020 item 4) — the mark for whatever this form is
+   *  currently describing, or hidden when it describes no agent at all. */
+  private previewEl: HTMLElement;
 
   private errorEl: HTMLElement;
   private submitBtn: HTMLButtonElement;
@@ -410,6 +449,21 @@ export class WelcomeForm {
     const subtitle = document.createElement("p");
     subtitle.className = "welcome-sub";
     subtitle.textContent = "Pick what this pane becomes.";
+    // #1020 item 4: the card SHOWS which agent CLI it is about to launch, using the same
+    // mark a pane header wears once it is running (`agentMark`, #992) — so the preview and
+    // the thing it previews are the same glyph rather than two drawings of one idea. It
+    // sits in the card's own header, opposite the title, which is the one spot on this
+    // form that was empty at every width. `hidden` until a state names a CLI: most of them
+    // do not, and `setupPreviewMark` is where that judgement lives.
+    this.previewEl = document.createElement("span");
+    this.previewEl.className = "welcome-preview";
+    this.previewEl.hidden = true;
+    const head = document.createElement("div");
+    head.className = "welcome-head";
+    const heading = document.createElement("div");
+    heading.className = "welcome-heading";
+    heading.append(title, subtitle);
+    head.append(heading, this.previewEl);
 
     this.kindSel = select([
       ["agent", "Agent — a coding-agent CLI"],
@@ -437,6 +491,7 @@ export class WelcomeForm {
       this.applyAutopilot();
       this.applyChannelTools();
       this.updateName();
+      this.paintPreview();
     });
     this.agentField = field("Agent", this.agentSel);
     this.agentWarn = document.createElement("div");
@@ -447,7 +502,13 @@ export class WelcomeForm {
     this.customInput.className = "dlg-input";
     this.customInput.placeholder = "e.g. aider --model sonnet";
     this.customInput.spellcheck = false;
-    this.customInput.addEventListener("input", () => this.updateAgentWarning());
+    this.customInput.addEventListener("input", () => {
+      this.updateAgentWarning();
+      // Per keystroke, because the preview IS the feedback on what the typed command
+      // resolves to — `aider …` badges an A, `bash` refuses to badge at all. The work is
+      // one pure call plus an innerHTML write on a 20px glyph.
+      this.paintPreview();
+    });
     this.customField = field("Command", this.customInput);
 
     this.countInput = numberInput(1, 1, 8);
@@ -500,7 +561,10 @@ export class WelcomeForm {
       ["", "None — a plain login shell"],
       ...AGENTS.filter((a) => a.id !== "custom").map((a) => [a.id, a.label] as [string, string]),
     ]);
-    this.sshCliSel.addEventListener("change", () => this.updateSshWarning());
+    this.sshCliSel.addEventListener("change", () => {
+      this.updateSshWarning();
+      this.paintPreview();
+    });
     this.sshRemoteCwdInput = textInput("directory on the REMOTE host — optional");
     this.sshRemoteCwdInput.addEventListener("input", () => this.updateSshWarning());
     this.sshWarn = document.createElement("div");
@@ -611,7 +675,12 @@ export class WelcomeForm {
     // Orchestrator guardrails: enforced by the backend; the form only collects
     // them. Models are pinned per role at group creation; the suggestion list
     // follows the selected agent CLI.
-    this.workersInput = numberInput(2, 0, 6);
+    // #1020 item 5 removed the "Initial workers" field. Opening N idle workers at launch
+    // pre-decides a question only the orchestrator can answer — it has not read the issue
+    // yet, so any N is a guess, and a wrong one is either panes nobody asked for or a cost
+    // the human did not choose. The backend now defaults an unsent count to 0, which is the
+    // rule `PromoteConfig::initial_workers` has always used ("the orchestrator decides what
+    // it needs"); the launcher simply stops sending one.
     this.maxAgentsInput = numberInput(4, 1, MAX_AGENTS_CEILING);
     // #255: the cap this input sets is exactly what a declared workflow's
     // capacity warning is judged against — repaint (no new backend fetch, the
@@ -643,7 +712,14 @@ export class WelcomeForm {
     // CLI's suggestions (issue #4).
     this.roleControls = ORCH_ROLES.map(({ key }) => {
       const cli = select(ORCH_CLIS.map((c) => [c.id, c.id]));
-      const model = new ModelPicker();
+      // #993. Both hooks read `cli.value` at call time rather than closing over
+      // a snapshot: a role's CLI is a live select, and a picker that had bound
+      // the CLI it was constructed with would report gemini's models on a
+      // copilot row after one change — the stale-reply failure `knobState`
+      // already refuses at the other end.
+      const model = new ModelPicker({
+        detailFor: (id) => this.catalog.detail(orchCliFor(cli.value).id, id),
+      });
       // #687: thinking level + context window, per role. Both start empty ("CLI
       // default") and are populated from `agent_cli_knobs` — a CLI that has no
       // seam for one renders it disabled carrying the vendor's own reason, never
@@ -658,6 +734,12 @@ export class WelcomeForm {
         this.applyRoleModels(key);
         this.updateAgentWarning();
         this.refreshRoster();
+        // The orchestrator role's CLI is the one the launched pane actually runs, so the
+        // card's preview has to follow it (#1020 rev-740 blocking 1). Called for every
+        // role rather than only `orchestrator`: `paintPreview` re-reads the control it
+        // needs, and a listener that fired selectively would be one `key` comparison away
+        // from silently going stale if the preview ever widens.
+        this.paintPreview();
       });
       // The context knob depends on the MODEL, not just the CLI (`haiku[1m]` is
       // not an alias the vendor documents), so a model change re-derives it.
@@ -667,6 +749,29 @@ export class WelcomeForm {
       };
       return { key, cli, model, effort, context };
     });
+    // Take the startup sweep's answers as they land (#1020). This is the route
+    // that matters most on THIS form: loomux opens showing it, so the common
+    // case is a welcome card already on screen while the sweep is still running
+    // — the lookup in `applyRoleModels` was answered "nothing yet", and without
+    // this the role dropdowns would keep their curated seeds until the human
+    // closed and reopened the form.
+    // **This form's release is the catalog's prune, not an unsubscribe call,
+    // and that is deliberate rather than an omission** (rev-713 blocking 2).
+    // `WorkflowView` holds its unsubscribe and calls it from `dispose()`; this
+    // class has no equivalent moment. `fire()` looks like one and is not —
+    // `reopenAfterLaunchFailure` revives a still-mounted form after a downstream
+    // launch throws, and a form released at `fire()` would come back deaf to the
+    // sweep. So liveness is answered instead, and the catalog drops this
+    // subscription the next time anything subscribes. Holding an unsubscribe
+    // nobody could safely call would be worse than not holding one.
+    this.catalog.onReport(
+      (program) => {
+        for (const rc of this.roleControls) {
+          if (orchCliFor(rc.cli.value).id === program) this.refreshRoleFromDetection(rc.key, program);
+        }
+      },
+      () => this.aliveForReports()
+    );
     // Advanced orchestrator (#222). The checkbox is the whole opt-in; everything
     // below it is the human being shown what they are opting into, BEFORE the
     // group spawns — the roster the repo declares, each block's CLI/model, which
@@ -707,12 +812,6 @@ export class WelcomeForm {
       ["auto", "Auto — pre-approve git/gh + agent tools (recommended)"],
       ["edits", "Accept edits only — you approve git/gh yourself"],
     ]);
-    const guardRow1 = document.createElement("div");
-    guardRow1.className = "dlg-row";
-    guardRow1.append(
-      field("Initial workers", this.workersInput),
-      field("Max live agents", this.maxAgentsInput)
-    );
     // One row per role: [role label] CLI select + model picker + the two model
     // knobs (#687), which sit beside the model because that is what they modify.
     const roleField = (
@@ -727,17 +826,23 @@ export class WelcomeForm {
       pair.append(cli, model.root, effort, context);
       return field(label, pair);
     };
-    const guardRow2 = document.createElement("div");
-    guardRow2.className = "dlg-field";
+    const roleRows = document.createElement("div");
+    roleRows.className = "dlg-field";
     for (const rc of this.roleControls) {
       const label = ORCH_ROLES.find((r) => r.key === rc.key)!.label;
-      guardRow2.append(
+      roleRows.append(
         roleField(`${label} — CLI + model, thinking level, context`, rc.cli, rc.model, rc.effort, rc.context)
       );
     }
-    const guardRow3 = document.createElement("div");
-    guardRow3.className = "dlg-row";
-    guardRow3.append(
+    // #1020 item 3: the four numeric guardrails are ONE row rather than a pair of two,
+    // which is what removing "Initial workers" (item 5) left room for — the old split put
+    // a lone "Max live agents" beside an empty half, and the cap belongs with the other
+    // three caps anyway. `.dlg-grid` gives them equal columns instead of the flex widths
+    // that made a 3-up row and a 2-up row disagree about where their fields started.
+    const guardNumbers = document.createElement("div");
+    guardNumbers.className = "dlg-row dlg-grid";
+    guardNumbers.append(
+      field("Max live agents", this.maxAgentsInput),
       field("Idle-kill (min, 0=off)", this.idleKillInput),
       field("Max spawns/hour (0=∞)", this.spawnRateInput),
       field("Watchdog stall (min, 0=off)", this.watchdogInput)
@@ -745,9 +850,8 @@ export class WelcomeForm {
     this.orchFields = document.createElement("div");
     this.orchFields.className = "dlg-field";
     this.orchFields.append(
-      guardRow1,
-      guardRow2,
-      guardRow3,
+      roleRows,
+      guardNumbers,
       field(
         "Autonomy budget (tokens, 0=no cap)",
         this.autonomyBudgetInput,
@@ -770,8 +874,7 @@ export class WelcomeForm {
     actions.append(this.submitBtn);
 
     dlg.append(
-      title,
-      subtitle,
+      head,
       field("Kind", this.kindSel),
       this.agentField,
       this.customField,
@@ -869,7 +972,47 @@ export class WelcomeForm {
     this.applyAutopilot();
     this.applyChannelTools();
     this.updateName();
+    // After `applyOrchCli`, never before: entering orchestrator mode can re-point the Agent
+    // picker at a supported CLI, and a preview painted first would show the one it moved off.
+    this.paintPreview();
     this.refreshRoster();
+  }
+
+  /** Repaint the card-header CLI preview (#1020 item 4).
+   *
+   *  Every decision is `setupPreviewMark`'s (which state names a CLI, and which program
+   *  it names); this is the DOM half and nothing else. The accessible name is the mark's
+   *  own `label`, set as TEXT on the wrapper — never interpolated into the markup, which
+   *  is the one rule `agenticons` §Safety asks every consumer to keep (`src/pane.ts`'s
+   *  `refreshAgentMark` is the same eight lines, deliberately). */
+  private paintPreview(): void {
+    // The RESOLVED roster's answer, never a control's (#1020 rev-740 1b). `rosterFresh` is
+    // false while a re-resolve is in flight, so the badge goes blank rather than describing
+    // the previous repo/toggle state for a beat — the same fail-closed rule the module
+    // applies to every other ambiguous state. `lastRoster` is null off the orchestrator
+    // kind, where nothing reads this field anyway.
+    const roster = this.rosterFresh ? this.lastRoster : null;
+    const view = setupPreviewMark(
+      {
+        kind: this.kind,
+        agentId: this.agentSel.value,
+        customCommand: this.customInput.value,
+        sshCli: this.sshCliSel.value,
+        orchestratorCli: roster ? orchestratorCliOf(roster, orchCliFor(this.agentSel.value).id) : null,
+      },
+      ICON_SETUP_PREVIEW_PX
+    );
+    this.previewEl.hidden = !view;
+    this.previewEl.innerHTML = view?.svg ?? "";
+    if (view) {
+      this.previewEl.title = view.label;
+      this.previewEl.setAttribute("role", "img");
+      this.previewEl.setAttribute("aria-label", view.label);
+    } else {
+      this.previewEl.removeAttribute("title");
+      this.previewEl.removeAttribute("role");
+      this.previewEl.removeAttribute("aria-label");
+    }
   }
 
   /** Show the channel-tools toggle only where it applies — agent kind,
@@ -949,12 +1092,28 @@ export class WelcomeForm {
   }
 
   /** Populate a role's model picker from its selected CLI: curated suggestions
-   *  first, merged with the CLI's own reported models once the probe returns. */
+   *  first, merged with the CLI's own reported models once the probe returns,
+   *  and with whatever the CLI itself reported to the startup sweep (#1020). */
   private applyRoleModels(role: OrchRole): void {
     const rc = this.roleControls.find((r) => r.key === role)!;
     const cli = orchCliFor(rc.cli.value);
     rc.model.setOptions(this.catalog.models(cli.id), cli.defaults[role], cli.id);
     this.applyRoleKnobs(role);
+    // The detection LOOKUP, fired from the paint path — which #993 forbade and
+    // #1020 makes correct: this cannot spawn an agent CLI, because the backend
+    // sweep already did that once at startup and this reads what it left
+    // (`src-tauri/src/modelwire.rs`). The catalog issues it at most once per CLI
+    // per app run, so a form that repaints costs nothing.
+    //
+    // The refresh below is skipped when the answer was ALREADY in hand: the
+    // `setOptions` two lines up has just painted it, so repainting would rebuild
+    // the menu for nothing — the same care the probe reply takes with its
+    // `p.models.length` guard, and the same reason.
+    const had = this.catalog.report(cli.id) !== null;
+    void this.catalog.detect(cli.id).then((r) => {
+      if (had || !r.models.length) return;
+      this.refreshRoleFromDetection(role, cli.id);
+    });
     void this.probe(cli.id).then((p) => {
       if (this.kind !== "orchestrator" || rc.cli.value !== cli.id) return;
       // Nothing reported = nothing to merge, and re-setting an identical list
@@ -965,6 +1124,69 @@ export class WelcomeForm {
         rc.model.setOptions(this.catalog.models(cli.id), cli.defaults[role], cli.id);
         this.applyRoleKnobs(role);
       }
+    });
+  }
+
+  /** Whether this form is still something a pushed report should repaint. */
+  private aliveForReports(): boolean {
+    // "Not on screen yet" is not dead: the constructor runs before the caller
+    // appends `el`, and a report can land in that window. Dead is HAVING been on
+    // screen and no longer being there — the pane was closed, and repainting its
+    // detached controls forever is what an unreleased subscription does.
+    if (this.el.isConnected) {
+      this.mounted = true;
+      return true;
+    }
+    return !this.mounted;
+  }
+
+  /** Bring one role's controls up to date with a detection reply for `cliId`.
+   *
+   *  **A detection reply owes this row more than its dropdown** (#997 review):
+   *  it is precisely the answer that makes `roleKnobState` respond differently,
+   *  so repainting only the menu would leave the Thinking-level select offering
+   *  levels the payload then drops.
+   *
+   *  Shared by both routes a reply can arrive on — the lookup fired from
+   *  `applyRoleModels` and the sweep's push (`catalog.onReport`) — because the
+   *  work they owe is identical, and a second copy is the second place a fix
+   *  would have to be remembered.
+   *
+   *  **Idempotent per role+CLI**, which is where the two routes are reconciled:
+   *  whichever delivery of the sweep's one answer arrives first does the work
+   *  and the other is a no-op, in either order. A flag captured before the await
+   *  cannot do this — it only sees the ordering where the lookup went first
+   *  (rev-713 non-blocking 3).
+   *
+   *  Deliberately NOT a call to `applyRoleModels`: that would re-issue the
+   *  lookup this is the answer to, and re-enter itself on every reply. */
+  private refreshRoleFromDetection(role: OrchRole, cliId: string): void {
+    const rc = this.roleControls.find((r) => r.key === role);
+    // Re-derive rather than repaint blindly: the human may have changed this
+    // role's CLI since the reply was asked for, and painting a row from a reply
+    // about a CLI it has moved off is exactly the silent-wrong-answer the knob
+    // path refuses. Checked BEFORE the idempotence mark, so a delivery this row
+    // has moved away from does not consume the slot the right one needs.
+    if (!rc || this.kind !== "orchestrator" || orchCliFor(rc.cli.value).id !== cliId) return;
+    if (this.detectionsApplied.has(`${role}:${cliId}`)) return;
+    this.detectionsApplied.add(`${role}:${cliId}`);
+    const cli = orchCliFor(cliId);
+    // The knobs first, immediately and unconditionally: they are what this reply
+    // is the answer for, and repainting them touches nothing a human can be
+    // inside.
+    this.applyRoleKnobs(role);
+    // The MENU is the destructive half — rebuilding it under a half-typed id
+    // resolves that id to the dropdown branch and hides the input beneath the
+    // caret — so it is deferred to the moment that stops being true, never
+    // dropped (#997 review NB-3). Dropping it is permanent here in a way it is
+    // not in the workflow pane: `applyRoleModels` is otherwise reached only from
+    // the role's CLI `change` listener and the seed pass. The re-check inside
+    // the callback is the same staleness guard as above, re-run because a
+    // deferral can outlive the CLI it was for.
+    rc.model.runWhenNotEditing(() => {
+      if (orchCliFor(rc.cli.value).id !== cliId) return;
+      rc.model.setOptions(this.catalog.models(cliId), cli.defaults[role], cliId);
+      this.applyRoleKnobs(role);
     });
   }
 
@@ -991,7 +1213,10 @@ export class WelcomeForm {
     const rc = this.roleControls.find((r) => r.key === role)!;
     const cli = orchCliFor(rc.cli.value);
     const model = rc.model.value || cli.defaults[role];
-    return knobState(this.knownKnobs.get(cli.id) ?? null, cli.id, model);
+    // #993: what the CLI itself reported about THIS model narrows the levels
+    // `CLI_CAPS` offers in general — `null` (nobody detected) leaves the knob
+    // exactly as it was.
+    return knobState(this.knownKnobs.get(cli.id) ?? null, cli.id, model, this.catalog.detail(cli.id, model));
   }
 
   /** Repopulate a role's two knob selects from its CLI's capability record and
@@ -1078,8 +1303,16 @@ export class WelcomeForm {
     if (this.kind !== "orchestrator") {
       this.rosterEl.replaceChildren();
       this.lastRoster = null;
+      this.rosterFresh = false;
       return;
     }
+    // Whatever `lastRoster` says describes the inputs as they were BEFORE this call, and
+    // the CLI badge is derived from it (#1020 rev-740 1b). Mark it stale for the whole of
+    // the async gap: a badge is a claim, and one made from the previous repo's workflow
+    // file is the same wrong answer this finding is about, just briefer. The roster BOX
+    // keeps its old contents deliberately — prose that lingers a beat reads as stale, a
+    // brand mark reads as an answer.
+    this.rosterFresh = false;
     const advanced = this.advancedInput.checked;
     const repo = this.repoInput.value.trim();
     const cli = orchCliFor(this.agentSel.value).id;
@@ -1116,6 +1349,11 @@ export class WelcomeForm {
    *  noise in the form's default state. */
   private paintRoster(r: ResolvedRoster, advanced: boolean): void {
     this.lastRoster = r;
+    this.rosterFresh = true;
+    // The roster IS the preview's source now, so the badge repaints wherever the roster
+    // lands — including the async arrival, which is the only route by which a declared
+    // workflow file's CLI ever reaches this form (#1020 rev-740 1b).
+    this.paintPreview();
     const rows: HTMLElement[] = [];
     const line = (cls: string, text: string): HTMLElement => {
       const el = document.createElement("div");
@@ -1402,6 +1640,10 @@ export class WelcomeForm {
     this.setSshCli(picked?.defaultCli ?? null);
     this.updateSshWarning();
     this.updateName();
+    // `setSshCli` assigns the select's value, and an assignment fires no `change` — so the
+    // preview has to be repainted here or picking a saved connection would leave the card
+    // showing the previous one's CLI.
+    this.paintPreview();
   }
 
   /** Select a remote CLI, keeping one this build doesn't know rather than
@@ -1603,7 +1845,14 @@ export class WelcomeForm {
         return;
       }
       await this.persistSshProfile(plan.profile);
-      this.fire({ kind: "ssh", name: plan.name, argv, profileId: plan.profile.id, sessionId });
+      this.fire({
+        kind: "ssh",
+        name: plan.name,
+        argv,
+        profileId: plan.profile.id,
+        defaultCli: plan.profile.defaultCli,
+        sessionId,
+      });
       return;
     }
 
@@ -1736,7 +1985,6 @@ export class WelcomeForm {
           workerCli: worker.cli,
           reviewerCli: reviewer.cli,
           plannerCli: planner.cli,
-          initialWorkers: intVal(this.workersInput, 2),
           maxAgents: intVal(this.maxAgentsInput, 4),
           workerModel: worker.model,
           reviewerModel: reviewer.model,

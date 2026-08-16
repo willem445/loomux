@@ -2,6 +2,7 @@ import "./styles.css";
 import { invoke, hostVersion } from "./transport.ts";
 import { showToast } from "./toast";
 import type { Grid } from "./grid";
+import type { SplitPolicy } from "./splitfloor";
 import { Workspace } from "./workspace";
 import { TabManager } from "./tabs";
 import { TabBar } from "./tabbar";
@@ -43,10 +44,13 @@ import {
   type KeepOpenReason,
 } from "./dirtystate";
 import { matchShortcut } from "./shortcuts";
+import { SideDock } from "./sidedock";
+import { followsPaneChange, isActiveTabChange } from "./sidedockmodel";
 import { admitRoot, ftRootIsDir } from "./fileapi";
 import { gitRepoRoot } from "./git";
 import { voiceController } from "./voicecontrol";
 import { initStatusBar } from "./statusbar";
+import { startModelDetection } from "./modelprobe";
 import { initHintBar } from "./hintbar";
 import { WelcomeForm, type WelcomeResult, type AgentLaunchSpec } from "./launcher";
 import {
@@ -137,8 +141,16 @@ window.addEventListener("unhandledrejection", (e) => {
 });
 
 const sessionsEl = document.getElementById("sessions")!;
+const workspaceEl = document.getElementById("workspace")!;
 const stackEl = document.getElementById("workspace-stack")!;
 const tabBarEl = document.getElementById("tab-bar")!;
+
+/** The right-side dock (#1020 item 6): git / files / editor over the right edge
+ *  of the workspace, following the active pane's folder. Assigned once the tab
+ *  manager below exists — it is declared here, ahead of the Workspace factory
+ *  that notifies it, so the factory's closure has a name to reach and nothing
+ *  depends on module-init ordering. */
+let sideDock: SideDock | null = null;
 
 // Project tabs (#63): each tab is a Workspace (its own Grid + dock). The old
 // module-scope single `grid` is gone; everything acts on the ACTIVE tab's grid.
@@ -166,7 +178,23 @@ const tabs = new TabManager<Workspace>((id) => {
       // old MED-1 "silent shell only" rule existed solely to avoid that overlay.
       openWelcomeIn(w);
     },
-    () => onGridChanged()
+    () => onGridChanged(),
+    // The active pane moved inside THIS tab — which is only the dock's business
+    // when this tab is the foreground one. Every workspace has a grid, so every
+    // workspace gets this callback; a background tab reshuffling its own active
+    // pane (an agent finishing, a delegate spawning, a group resuming) must not
+    // drive a follow.
+    //
+    // It is not enough that the dock reads the active pane itself rather than
+    // the pane this fired for. That gets the right pane and still re-reads its
+    // LIVE cwd at a moment the human did not cause — adopting a `cd` they typed
+    // earlier and had every reason to think was ignored, whenever some other
+    // tab's agent happened to be busy (#1097 rev-776, the second door onto the
+    // same defect as the `tabs.onChange` one below).
+    (w) => {
+      if (!followsPaneChange(w.id, tabs.activeTabId)) return;
+      sideDock?.followActivePane();
+    }
   );
   stackEl.appendChild(ws.el);
   return ws;
@@ -178,6 +206,35 @@ let tabBar: TabBar<Workspace> | null = null;
 
 /** The active tab's grid — the single-grid `grid` of the pre-tabs app. */
 const activeGrid = (): Grid => tabs.activeWorkspace.grid;
+
+sideDock = new SideDock(workspaceEl, {
+  // `activeWorkspace` THROWS before the first tab exists, and this is read at
+  // construction — which happens before boot seeds one.
+  activeCwd: () => (tabs.count === 0 ? null : tabs.activeWorkspace.grid.activePane?.workdir ?? null),
+});
+
+// Switching PROJECT TABS changes the active pane without any grid's `setActive`
+// firing: `applyActive` focuses the incoming tab's already-active pane, and
+// `setActive` early-returns on the pane it is already on. So the dock needs a
+// second trigger, or it keeps showing the previous tab's repo.
+//
+// `tabs.onChange` is the only subscription available, and it is a tab-SET
+// listener, not an active-tab one — it also fires on rename, colour, reorder,
+// close, an attention flip in any background tab, and orch-channel traffic.
+// Following it unfiltered was a real defect (#1097 rev-767 B1): the dock re-reads
+// the active pane's LIVE cwd, so a `cd` the human typed minutes ago and that was
+// correctly ignored at the time would be adopted later, at whatever unrelated
+// moment some other tab's attention chip happened to flip — silently rebuilding
+// the file explorer out from under them and closing a clean editor file.
+//
+// So the id is compared, and only a genuine active-tab change gets through.
+let lastActiveTabId: string | null = tabs.activeTabId;
+tabs.onChange(() => {
+  const next = tabs.activeTabId;
+  if (!isActiveTabChange(lastActiveTabId, next)) return;
+  lastActiveTabId = next;
+  sideDock?.followActivePane();
+});
 
 // Voice push-to-talk (#58, Alt+S): the global capture controller finds its
 // insertion target via the active pane (of the active tab).
@@ -193,7 +250,9 @@ function eventsFor(ws: Workspace): PaneEvents {
     // close it. Every human-initiated single-pane close — header ✕, dock chip ✕,
     // Ctrl+Shift+W — arrives through that one path.
     onCloseRequest: (pane) => ws.grid.closePane(pane),
-    onSplit: (pane, dir) => openWelcomeIn(ws, dir, pane),
+    // A pane header's ◫/⬓ — a human split gesture, so the pane being split is
+    // the one that pays for the new one (#885 `halve`).
+    onSplit: (pane, dir) => openWelcomeIn(ws, dir, pane, "halve"),
     // The file browser's "Open in file editor pane" (#217): an editor pane beside the
     // browser, in the browser's own tab. Same call the welcome flow makes.
     onOpenEditorPane: (pane, opts) => {
@@ -847,13 +906,13 @@ async function openActionPane(
           pane,
           a.profileId,
           useRecordedSession ? a.sessionId : null,
-          async (argv, sessionId, profileId) => {
+          async (argv, sessionId, profileId, defaultCli) => {
             try {
               await pane.startFromDormant({
                 name: a.name,
                 argv,
                 sessionId: sessionId ?? undefined,
-                ssh: { profileId },
+                ssh: { profileId, defaultCli },
               });
             } catch (err) {
               // Review NB4, the dormant half: `startFromDormant` has already
@@ -1276,7 +1335,12 @@ async function reconnectSshPane(
   pane: Pane,
   profileId: string | null,
   recordedSessionId: string | null,
-  launch: (argv: string[], sessionId: string | null, profileId: string) => Promise<void>
+  launch: (
+    argv: string[],
+    sessionId: string | null,
+    profileId: string,
+    defaultCli: string | null
+  ) => Promise<void>
 ): Promise<RestoreCardResult> {
   return withSubmitLatch(
     sshReconnectLatch(pane),
@@ -1291,7 +1355,12 @@ async function reconnectSshPane(
 async function reconnectSshPaneOnce(
   profileId: string | null,
   recordedSessionId: string | null,
-  launch: (argv: string[], sessionId: string | null, profileId: string) => Promise<void>
+  launch: (
+    argv: string[],
+    sessionId: string | null,
+    profileId: string,
+    defaultCli: string | null
+  ) => Promise<void>
 ): Promise<RestoreCardResult> {
   if (!profileId) return { ok: false, message: SSH_PROFILE_GONE };
   const program = await discoverSsh().catch(() => null);
@@ -1318,7 +1387,10 @@ async function reconnectSshPaneOnce(
     return { ok: false, message: String(err instanceof Error ? err.message : err) };
   }
   try {
-    await launch(plan.argv, plan.sessionId, profile.id);
+    // The profile is in hand right here and nowhere downstream — the pane only records a
+    // profile ID, and resolving it back costs an async store read the header mark cannot
+    // wait for. So the far-end CLI travels with the argv (#992 review B1).
+    await launch(plan.argv, plan.sessionId, profile.id, profile.defaultCli);
   } catch (err) {
     return { ok: false, message: String(err) };
   }
@@ -1662,10 +1734,18 @@ function tryResumeFallback(pane: Pane, exit: PtyExit): boolean {
  *  file explorer (#214), which should open on the project you're looking at, not
  *  the last repo you happened to launch app-wide. Falls back to the recent-repo
  *  default when there's no context (an empty tab, a welcome pane). */
-function openWelcomeIn(ws: Workspace, dir: "row" | "column" = "row", relativeTo?: Pane): Pane {
+function openWelcomeIn(
+  ws: Workspace,
+  dir: "row" | "column" = "row",
+  relativeTo?: Pane,
+  // `share` by default because this function also serves restore fail-softs (a
+  // pane whose folder/repo is gone comes back as a welcome form) — programmatic
+  // placement. The human split gestures pass `halve` explicitly (#885).
+  policy: SplitPolicy = "share"
+): Pane {
   const context = relativeTo ?? ws.grid.activePane;
   const form = new WelcomeForm(context?.workdir ?? undefined);
-  const pane = ws.grid.openWelcomePane(eventsFor(ws), form.el, dir, relativeTo);
+  const pane = ws.grid.openWelcomePane(eventsFor(ws), form.el, dir, relativeTo, policy);
   form.onSubmit = (result) => void handleWelcomeSubmit(ws, pane, form, result);
   return pane;
 }
@@ -1707,7 +1787,9 @@ async function handleWelcomeSubmit(
       name: result.name,
       argv: result.argv,
       sessionId: result.sessionId,
-      ssh: { profileId: result.profileId },
+      // `defaultCli` rides along so the pane's header mark can name the agent running on
+      // the far end rather than the ssh client carrying it (#992 review B1).
+      ssh: { profileId: result.profileId, defaultCli: result.defaultCli },
     });
     reapIfExited(ws, pane);
     // Converted in place — no grid open/close fired, so notify explicitly, same
@@ -1834,7 +1916,13 @@ async function handleWelcomeSubmit(
       },
       eventsFor(ws),
       d,
-      prev
+      prev,
+      // Pinned to `share` (#885), not left to the default: this fan-out is THE
+      // reason the even-matrix policy is kept. It places a whole fleet in one
+      // pass, each pane beside the last — halving every time would deal out a
+      // 1/2, 1/4, 1/8, 1/16 sliver staircase instead of the matrix the
+      // alternating direction above is building.
+      "share"
     );
     await bindSoloIfNeeded(p, spec);
     watchCopilotAutopilotIfNeeded(p, spec);
@@ -1914,9 +2002,11 @@ function recordClaudePostureIfNeeded(spec: AgentLaunchSpec): void {
 }
 
 /** Open a welcome pane in the active tab — the entry point the toolbar/shortcuts
- *  use for a "new pane". */
+ *  use for a "new pane". `halve` (#885): Ctrl+Shift+E/O and the two top-bar
+ *  split buttons are human gestures, so the active pane pays for the new one
+ *  out of its own space and no other pane on screen moves. */
 const openPane = (dir: "row" | "column" = "row", relativeTo?: Pane): void => {
-  openWelcomeIn(tabs.activeWorkspace, dir, relativeTo);
+  openWelcomeIn(tabs.activeWorkspace, dir, relativeTo, "halve");
 };
 
 /** Dispose or keep a just-dead pane per `keepOpenOnExit`, with one override
@@ -1994,7 +2084,7 @@ function mountSshReconnectCard(ws: Workspace, pane: Pane, initialError?: string)
   /** One reconnect attempt, in place. `sessionId` null forces the fresh path —
    *  that is the whole of the "Reconnect fresh" escape below. */
   const attempt = (useRecordedSession: boolean): Promise<RestoreCardResult> =>
-    reconnectSshPane(pane, profileId, useRecordedSession ? recordedSessionId : null, async (argv, sessionId, profileId) => {
+    reconnectSshPane(pane, profileId, useRecordedSession ? recordedSessionId : null, async (argv, sessionId, profileId, defaultCli) => {
       try {
         // In place, in the same pane: `respawnFresh` wipes the dead session's
         // output, clears this very card, and starts the new ssh client on the
@@ -2003,7 +2093,7 @@ function mountSshReconnectCard(ws: Workspace, pane: Pane, initialError?: string)
           name: pane.name,
           argv,
           sessionId: sessionId ?? undefined,
-          ssh: { profileId },
+          ssh: { profileId, defaultCli },
         });
       } catch (err) {
         // NB4: the card this click came from is already detached. Put a fresh
@@ -2415,7 +2505,13 @@ void onPtyExit((exit) => {
  *  forgets, which is why the sweep is total rather than "the active tab". The pure
  *  filter (dirtystate.dirtyBuffers) decides which reports count as unsaved. */
 function unsavedBuffers(): DirtyBuffer[] {
-  return dirtyBuffers(tabs.tabs.flatMap((ws) => ws.bufferReports()));
+  const paneReports = tabs.tabs.flatMap((ws) => ws.bufferReports());
+  // The side dock's editor (#1020 item 6) is the one buffer holder that is NOT
+  // inside a pane, so walking tabs→panes cannot reach it. A quit that misses a
+  // holder silently destroys it, which is the whole of #219 — so it is
+  // concatenated here rather than left to be discovered.
+  const dockReport = sideDock?.bufferReport();
+  return dirtyBuffers(dockReport ? [...paneReports, dockReport] : paneReports);
 }
 
 /** Persist on the way out — with a DEADLINE.
@@ -2510,6 +2606,9 @@ document.addEventListener(
       case "split-down":
         openPane("column");
         break;
+      case "autosize-panes":
+        activeGrid().autosize();
+        break;
       case "close-pane": {
         // Through the pane's own close request, like the header ✕ and the dock chip:
         // one entry point for every human-initiated single-pane close (rev-100).
@@ -2553,6 +2652,9 @@ document.addEventListener(
         break;
       case "toggle-tasks":
         activeGrid().activePane?.toggleTasksView();
+        break;
+      case "toggle-decisions":
+        activeGrid().activePane?.toggleDecisionsView();
         break;
       case "toggle-audit":
         activeGrid().activePane?.toggleAuditView();
@@ -2603,6 +2705,17 @@ document.addEventListener(
 document.getElementById("btn-sessions")!.addEventListener("click", () => sessions.toggle());
 document.getElementById("btn-split-right")!.addEventListener("click", () => openPane("row"));
 document.getElementById("btn-split-down")!.addEventListener("click", () => openPane("column"));
+// Autosize (#936): even out every pane in the active tab. Same one-line call as
+// the Ctrl+Shift+A path — the button is an affordance for it, not a second
+// implementation of it.
+document.getElementById("btn-autosize")!.addEventListener("click", () => activeGrid().autosize());
+// The side dock (#1020 item 6). A button and no keyboard chord, deliberately: every
+// remaining free chord has to clear the agent-cli-reference check first (a Ctrl+Shift+
+// binding is withheld from every terminal pane, so taking one steals it from whatever
+// CLI is running with no escape hatch), and that check is a doc read this change did not
+// do. A dock nobody can toggle from the keyboard is a missing convenience; a dock that
+// eats an agent's binding is a defect.
+document.getElementById("btn-sidedock")!.addEventListener("click", () => sideDock?.toggle());
 
 // Keep the browser from hijacking terminal-relevant defaults (Ctrl+F etc.
 // stays inside the shell; F5/F7 reach TUI apps instead of the webview).
@@ -2648,6 +2761,12 @@ void (async () => {
 
 // Start streaming CPU/mem/GPU/VRAM into the bottom status bar.
 initStatusBar();
+
+// Take the backend's automatic model detection as it lands (#1020). The sweep
+// starts in Tauri's `setup`, so it is already running by now — subscribing
+// early is what decides whether an open picker learns its models by push or has
+// to pull for them. Neither loses the answer; the push is just sooner.
+startModelDetection();
 
 // Let the shortcut hint bar scroll horizontally on a vertical wheel when it
 // overflows a narrow window.

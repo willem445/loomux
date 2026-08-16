@@ -185,7 +185,7 @@ That is a fact about the transport. Nobody issued it, nothing checks it, and it
 cannot be revoked. Reproduce the same command surface over a socket and it
 evaporates: every peer that can open a connection becomes "the webview".
 
-And the surface is worse than one identifier. Today's 141 commands
+And the surface is worse than one identifier. Today's 147 commands
 (`src-tauri/src/command_manifest.rs`, the ACL manifest's single source of truth)
 include, by design:
 
@@ -297,8 +297,9 @@ describe the authenticated design:
 
 ### 4.2 Frame kinds
 
-**RPC frames** mirror today's `invoke` shape, so the 128 wire-reachable commands
-port mechanically behind the existing `EngineTransport` seam:
+**RPC frames** mirror today's `invoke` shape, so the wire-reachable commands
+(§5.4 counts them, and is the only place that should) port mechanically behind
+the existing `EngineTransport` seam:
 
 ```jsonc
 // client → server
@@ -454,14 +455,16 @@ This is not a new mechanism, which is the point — it is the third instance of
 one `tests/acl_manifest.rs` already runs three times over. That file pins that
 `generate_handler!` and `APP_COMMANDS` agree
 (`generate_handler_matches_app_commands`), pins the **total**
-(`app_commands_len_is_146`, carrying its per-delta provenance), and pins that
-every command is granted to `main`. A remote roster is the same shape of guard
+(`app_commands_len_is_<N>`, where N **is** the count, so the test's own name
+carries its per-delta provenance), and pins that every command is granted to
+`main`. A remote roster is the same shape of guard
 over the same list, and a reviewer already knows how to read it.
 
 That mechanism is not optional bookkeeping, and this repo's own artifacts are the
 evidence. The plan-408 census counted 134 commands; `APP_COMMANDS` listed **141**
-when this section was written and lists **146** as of #1042 slice B. Twelve
-arrived across those two intervals, and under a hand-maintained allowlist that
+when this section was written, **146** as of #1042 slice B, and **147** as of
+#996. Twelve arrived across those first two intervals, and under a
+hand-maintained allowlist that
 nobody re-derived, every one would have been silently wire-reachable or silently
 broken. The count is dated rather than restated as a bare "today", because that
 is the whole failure mode this paragraph is about: a number in prose is valid
@@ -475,11 +478,15 @@ now reads `(69)` above 69, so that one was noticed and corrected by hand.
 `architecture.md` described the file as "the ACL manifest's 123 app-command
 names" until this section corrected it — and it had drifted again, to **143**,
 by the time #1042 slice B corrected it to **146**. The same file, the same way,
-twice. Meanwhile `app_commands_len_is_146`, the number that *is* pinned, has
-stayed correct through every one of those additions, because it cannot do
-otherwise. Default-deny plus a failing test is the only version of this that
-survives contact with a year of feature work; a number maintained by good
-intentions is the version that does not.
+twice. Meanwhile the total that *is* pinned — `app_commands_len_is_<N>`, whose
+own name is what every one of those additions had to edit — has stayed correct
+through all of them, because it cannot do otherwise. It is cited by placeholder
+rather than by today's literal for the same reason `acl-manifest.md` cites it
+that way: spelled out, the citation itself goes stale, and this file has already
+carried a dangling `app_commands_len_is_146` past two reviews. Default-deny plus
+a failing test is the only version of this that survives contact with a year of
+feature work; a number maintained by good intentions is the version that does
+not.
 
 ### 5.2 Four classes
 
@@ -499,7 +506,7 @@ intentions is the version that does not.
 > is the cheap half and the enforcement is the expensive half.** Deciding
 > `orch_grant_merge` is owner-tier costs a table cell today; discovering it was
 > never marked, after a year of commands landing without anyone asking, costs an
-> audit of 141 of them. The roster ships in v1 (§5.1); the tier column is the
+> audit of all 147 of them. The roster ships in v1 (§5.1); the tier column is the
 > hardening track reading from a table that was kept current all along.
 
 Three tiers, ordered: **viewer** ⊂ **operator** ⊂ **owner**.
@@ -528,14 +535,15 @@ are where the 64-vs-66 drift above lives).
 | **sessions** (3) | 3 | wire | viewer / operator | agent-CLI store scans are server-side; `record_*_launch_posture` is operator |
 | **git** (22) | 6 | wire | viewer | the reads: `git_repo_root`, `git_log`, `git_status`, `git_diff`, `git_branches`, `git_worktree_list` |
 | | 16 | wire | operator | every write: stage/unstage/commit/commit_files/checkout/discard/worktree_add/fetch/push/pull/tag/branch_create/cherry_pick/revert/merge/rebase. `repo` is root-scoped (#1042). #925 routed exactly two arms through `safe_resolve` — `git_discard(untracked)` and `git_diff(untracked)`; `git_stage`/`git_unstage` `paths` still reach the git CLI directly and are contained by git own outside-repository refusal, not by #925. Note H9: these push as whoever the daemon is |
-| **gh** (10) | 6 | wire | viewer | `gh_auth_status`, `gh_issue_list`, `gh_issue_view`, `gh_pr_list`, `gh_pr_view`, `gh_activity` |
+| **gh** (11) | 7 | wire | viewer | `gh_auth_status`, `gh_label_vocabulary`, `gh_issue_list`, `gh_issue_view`, `gh_pr_list`, `gh_pr_view`, `gh_activity`. `gh_label_vocabulary` reads the repo's label set (it is what stops the issues view hardcoding a vocabulary), so it is a read of the **server's** repo like the rest of this row |
 | | 4 | wire | operator | `gh_issue_create`, `gh_issue_set_labels`, `gh_issue_comment`, `gh_pr_comment` — these write to GitHub as the daemon's credential (H9) |
 | **gitwatch** (2) | 2 | wire | viewer | |
-| **orchestration** (66) | 18 | wire | viewer | reads: `orch_tasks`, `orch_audit`, `orch_merge_queue`, `orch_autonomy`, `orch_group_usage`, `orch_group_summary`, `orch_workflow_status`, `orch_workflow_preview`, `orch_group_watches`, `orch_lock_state`, `orch_group_paused`, `orch_notify_enabled`, `orch_spawn_expanded`, `orch_session_roles`, `orch_channel_list`, `orch_channel_for_pane`, `agent_autopilot_flags`, `agent_cli_knobs` — **all filtered by caller visibility** (§6.4) |
+| **orchestration** (69) | 19 | wire | viewer | reads: `orch_tasks`, `orch_audit`, `orch_merge_queue`, `orch_autonomy`, `orch_group_usage`, `orch_group_summary`, `orch_workflow_status`, `orch_workflow_preview`, `orch_group_watches`, `orch_lock_state`, `orch_group_paused`, `orch_notify_enabled`, `orch_spawn_expanded`, `orch_session_roles`, `orch_channel_list`, `orch_channel_for_pane`, `orch_questions_list`, `agent_autopilot_flags`, `agent_cli_knobs` — **all filtered by caller visibility** (§6.4) |
 | | 38 | wire | operator | group lifecycle, binding, steering, task CRUD, `orch_request_changes`, attention acks, spawn/solo flow, channel connect/disconnect/set-sender, and the `orch_set_*` knobs that are **not** autonomy raises |
-| | 9 | wire | **owner** | `orch_approve_task`, `orch_approve_tasks`, `orch_grant_merge`, `orch_grant_release`, `orch_set_autonomous`, `orch_set_auto_merge`, `orch_set_auto_release`, `orch_set_dangerous_mode`, `orch_set_autonomy_budget` |
+| | 11 | wire | **owner** | `orch_approve_task`, `orch_approve_tasks`, `orch_grant_merge`, `orch_grant_release`, `orch_set_autonomous`, `orch_set_auto_merge`, `orch_set_auto_release`, `orch_set_full_autonomy`, `orch_set_dangerous_mode`, `orch_set_autonomy_budget`, `orch_question_answer` |
 | | 1 | **retargeted** | viewer | `orch_open_ref` — the server resolves the ref to a URL (its `open_external_url` helper is the local half today) and returns it; the **client** opens it in the human's browser |
 | **cliprobe** (1) | 1 | wire | viewer | `probe_agent_cli` probes the **server's** CLIs |
+| **modelwire** (1) | 1 | wire | viewer | `list_cli_models` (#993) reads what the **server's** startup sweep found for a CLI. Operator under #993, when the command itself spawned the agent CLI and a viewer clicking `detect` could have spent the operator's credits. #1020 removed that: the command is a memo LOOKUP that cannot spawn anything, the sweep is the only spawn site and runs on the server's own schedule with no client able to trigger it, so the answer is now a read like `probe_agent_cli`'s. **The underlying cost claim is still unverified** (doc/design/model-catalog.md §Credit safety) — what changed is that no client gesture reaches it. Restoring a client-triggered ask would make this operator again |
 | **editor** (1) | 1 | **disabled** | — | `open_in_editor` spawns an editor on the machine holding the files; remotely that is either a no-op on a headless box or an arbitrary-process-spawn primitive. The file-editor pane is what covers this case |
 | **fileedit** (7) | 4 | wire | operator | `ft_list_dir`, `ft_read_file`, `ft_search_start`, `ft_files_start` — reads, but reads of **server** files, so operator not viewer (H3) |
 | | 3 | wire | operator | `ft_write_file`, `ft_replace`, `ft_search_cancel` |
@@ -543,33 +551,66 @@ are where the 64-vs-66 drift above lives).
 | | 4 | wire | operator | `fm_new_folder`, `fm_new_file`, `fm_rename`, `fm_delete_start` |
 | | 3 | **disabled** | — | `fm_open`, `fm_open_with`, `fm_reveal` — `ShellExecuteW`/`xdg-open` on the server |
 | **filehash** (1) | 1 | wire | operator | |
+| **rootreg** (1) | 1 | **disabled** | — | `admit_root` is the display-side door of the declared-root registry (#1042 slice B): off the roster and advertised as absent, exactly like `open_in_editor` and `fm_open`, so a remote peer may **use** a declared root and can never **mint** one. That absence *is* the enforcement — argued in `rootreg.rs`'s module doc and in `groupid-and-path-roots.md`'s "the admit tier". It exists at all because `pickDirectory` is a client-side dialog the engine never sees. An authenticated remote admit path would re-enter here as `wire`/**owner** behind auth — a capability *added* later, which is §1.1 H3's rule |
 | **obs** (1) | 1 | **client-local** | — | `take_startup_notice` is about the client's own launch |
 | **uistate** (6) | 4 | **client-local** | — | `load/save_ui_tabs`, `load/save_settings` — client UI state, plus the `engine_id` binding of §4.3 |
 | | 2 | wire | operator | `load/save_ssh_profiles` — **named consequence:** in remote mode an SSH pane is opened *by the engine*, so the hosts it can reach and the identity files it names are the server's, not the client's. The profile store follows the panes. The no-secrets invariant of `sshprofile.ts` is what makes this survivable |
 | **voice** (3) | 3 | **client-local** | — | mic capture and whisper are client hardware; the transcript rides `write_pty` like any other keystrokes |
 
-Totals, **derived at the commit this table was written and not since**: **128
-wire**, **8 client-local** (`take_startup_notice`, the four `uistate` UI-state
-commands, the three `voice_*`), **4 disabled** (`open_in_editor`, `fm_open`,
-`fm_open_with`, `fm_reveal`), **1 retargeted** (`orch_open_ref`) = 141.
+Totals, **derived from `APP_COMMANDS` at the commit this line was last touched
+and not since** (#996): **133 wire**, **8 client-local** (`take_startup_notice`,
+the four `uistate` UI-state commands, the three `voice_*`), **5 disabled**
+(`open_in_editor`, `fm_open`, `fm_open_with`, `fm_reveal`, `admit_root`), **1
+retargeted** (`orch_open_ref`) = **147**, the total `app_commands_len_is_<N>`
+pins.
 
-> **Five rows are missing, and the totals above are stale by exactly that.**
-> `APP_COMMANDS` is at 146 (see the count above). Four commands arrived after
-> this table was derived and were never classified — `gh_label_vocabulary`,
-> `orch_questions_list`, `orch_question_answer`, `orch_set_full_autonomy` — and
-> #1042 slice B adds a fifth, `admit_root` (class **disabled**; argued in
-> `groupid-and-path-roots.md`'s "the admit tier" and in the command's own doc
-> comment). They are named here rather than quietly folded in because
-> classifying a command is a security decision — two of those four are an
-> autonomy raise and the human-answer surface — and slice B had no mandate to
-> make four of them. **Slice C owns the reconciliation**: it adds all five rows
-> and re-derives the totals in one pass, which is also when C2's roster test
-> starts reading them.
+> **The table now partitions `APP_COMMANDS` exactly, and that is precisely the
+> part nothing enforces.** The five rows this note spent two revisions missing
+> are placed: `gh_label_vocabulary`, `orch_questions_list`,
+> `orch_question_answer` and `orch_set_full_autonomy` sit in their families' rows
+> above, and `admit_root` — the last one, and the reason these totals were still
+> one short — has its own **rootreg** row. Each disposition was read off
+> `command_manifest.rs` and the command's own doc comment rather than folded in
+> by arithmetic, because classifying a command is a security decision: two of
+> those five are an autonomy raise and the human-answer surface, and a third is
+> the root-minting door. **Slice C still owns the enforcement.** C2's roster test
+> is what makes a sixth unplaced command fail CI instead of sitting here
+> unnoticed; until it ships, the paragraph below is the only thing between this
+> table and its next drift.
 
 The authoritative per-command list is the generated roster the C2 test pins —
 this table is the *argument* for it, not a second copy to drift. Which is the
 whole point of §5.1: a table in a design note is exactly the artifact that goes
 stale, so the note argues and the test enforces.
+
+**And until C2 ships, nothing enforces it, which is why this table has now gone
+stale four times** (#1018 rounds 1–2, then #996). "The note argues and the test
+enforces" describes the end state, not today: the roster test is part of C2, so
+between now and then these numbers are exactly the unpinned kind §5's own opening
+paragraphs warn about. A command added to `APP_COMMANDS` in the meantime does not
+fail anything here — it silently leaves a name with no disposition, which is how
+`gh_label_vocabulary`, `orch_set_full_autonomy`, `orch_questions_list`,
+`orch_question_answer` and `admit_root` all reached this file unplaced.
+**Re-derive these counts from `APP_COMMANDS` when you touch them; never bump them
+relatively, and do not derive them by hand.** A relative bump is what carried the
+error through two separate reviews, and hand arithmetic over 26 rows is what
+carried it through a third; the fourth pass parsed both sides — `APP_COMMANDS`'s
+family comments and this table's `n` column — and diffed them, which is the
+shape C2 makes permanent.
+
+**`orch_question_answer` is owner-tier for a different reason than the rest of
+that row, and the difference matters.** The other ten are grant-writes — the
+enforcement behind constraints 7 and 9. This one is not; it qualifies on the
+*other* half of the owner definition, "human connection sessions only". The
+command hard-codes `AnswerSource::Webview` rather than taking a `source`
+parameter, precisely so that who answered is a fact loomux establishes rather
+than one a caller asserts about itself (see its doc comment). Cross the wire at
+any lower tier and that guarantee inverts: a remote peer's answer gets stamped as
+a human's, and the registry can no longer distinguish the human it was waiting on
+from anything else holding a socket. Owner is therefore the fail-closed reading,
+not a comfortable one — if the tiers are ever restructured so that "grant-write"
+and "human-session-only" stop travelling together, this command follows the
+second, not the first.
 
 Two families deserve a sentence they do not get from the table:
 

@@ -35,11 +35,16 @@ export class Workspace implements ManagedWorkspace {
    *  app-wide "never leave the grid empty" rule.
    *  @param onChange invoked when this tab's pane set / layout changes (open or
    *  close) so the host can re-render the tab strip's live agent counter and
-   *  re-persist the layout (#194 P4). */
+   *  re-persist the layout (#194 P4).
+   *  @param onActive invoked when this tab's ACTIVE pane changes, so app-level
+   *  chrome that follows the active pane — the right-side dock (#1020 item 6) —
+   *  can re-point itself. A different question from onChange, which is about the
+   *  pane SET: the active pane moves without the set changing, and vice versa. */
   constructor(
     readonly id: string,
     onEmpty: (ws: Workspace) => void,
-    onChange: (ws: Workspace) => void = () => {}
+    onChange: (ws: Workspace) => void = () => {},
+    onActive: (ws: Workspace) => void = () => {}
   ) {
     this.el = document.createElement("div");
     this.el.className = "workspace";
@@ -63,6 +68,9 @@ export class Workspace implements ManagedWorkspace {
       },
       () => {
         if (!this.disposed) onChange(this);
+      },
+      () => {
+        if (!this.disposed) onActive(this);
       }
     );
   }

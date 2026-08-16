@@ -6,13 +6,16 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   approvableSelection,
+  blockedTaskMap,
   blockingAncestor,
+  boardMarker,
   boardUsesDeps,
   boardUsesHierarchy,
   buildTree,
   canApprove,
   canProceed,
   childCounts,
+  DEMO_STATUSES,
   depCandidates,
   depState,
   doneCount,
@@ -20,6 +23,7 @@ import {
   hasMissingParent,
   indentLevel,
   isAwaitingHuman,
+  isDemoGated,
   isReady,
   KINDS,
   kindCandidates,
@@ -814,4 +818,69 @@ test("a PR ref the backend cannot resolve is still counted as linked", () => {
   // and drifting from it. Such an item lands in the notice's
   // no-PR-number-could-be-resolved sentence instead.
   assert.equal(grantableCount([{ pr: "TBD" }]), 1);
+});
+
+// --- board marker + deep-link (#1091 slice G) ---
+
+test("the t-N -> q-N map cites only pending questions with a real task field", () => {
+  const map = blockedTaskMap([
+    { id: "q-1", task: "t-1" },
+    { id: "q-2", task: "  " },
+    { id: "q-3" },
+  ]);
+  assert.deepEqual([...map], [["t-1", "q-1"]]);
+});
+
+test("two pending questions citing the same task: the FIRST in list order wins", () => {
+  // Pending order is ask order, oldest first (decisions.ts's projectQuestions
+  // keeps file order for exactly this reason) — the row should link to the
+  // oldest still-open ask, not whichever the caller iterated last.
+  const map = blockedTaskMap([
+    { id: "q-1", task: "t-7" },
+    { id: "q-2", task: "t-7" },
+  ]);
+  assert.equal(map.get("t-7"), "q-1");
+});
+
+test("the chip is decision-blocked for a row a pending question cites, whatever its status", () => {
+  const map = blockedTaskMap([{ id: "q-9", task: "t-1" }]);
+  assert.deepEqual(boardMarker(row("t-1", "queued"), map), { kind: "decision", target: "q-9" });
+  // Even on a demo-gated row: the decision is the more specific, more
+  // blocking ask, and the brief calls for exactly one chip per row, not two
+  // competing for the same corner.
+  assert.deepEqual(boardMarker(row("t-1", "human-testing"), map), {
+    kind: "decision",
+    target: "q-9",
+  });
+});
+
+test("the chip is demo-gated for exactly the two demo statuses, when nothing blocks it", () => {
+  const nothingPending = blockedTaskMap([]);
+  for (const s of DEMO_STATUSES) {
+    assert.deepEqual(boardMarker(row("t-1", s), nothingPending), { kind: "demo", target: "t-1" });
+  }
+  assert.equal(boardMarker(row("t-1", "queued"), nothingPending), null);
+  // `pr` is awaiting-human (the merge gate) but deliberately not a demo —
+  // isDemoGated is narrower than isAwaitingHuman, so this row gets no chip.
+  assert.equal(isDemoGated("pr"), false);
+  assert.equal(boardMarker(row("t-1", "pr"), nothingPending), null);
+});
+
+test("a settled question clears the chip, because it drops out of the caller's pending list", () => {
+  // There is no separate "clear" step to forget: `blockedTaskMap` is handed
+  // only PENDING questions each render (tasksview.ts filters with
+  // decisions.ts's own isPending), so a settled/withdrawn question simply
+  // stops appearing in the list the very next time it's built.
+  const whilePending = blockedTaskMap([{ id: "q-1", task: "t-1" }]);
+  assert.deepEqual(boardMarker(row("t-1"), whilePending), { kind: "decision", target: "q-1" });
+  const afterSettle = blockedTaskMap([]);
+  assert.equal(boardMarker(row("t-1"), afterSettle), null);
+});
+
+test("a pending question citing a task id nothing on the board carries marks nothing, and does not crash", () => {
+  const map = blockedTaskMap([{ id: "q-1", task: "t-404" }]);
+  const board = [row("t-1"), row("t-2", "prototype")];
+  assert.equal(boardMarker(board[0], map), null);
+  // The orphaned citation doesn't wipe t-2's OWN demo-gated signal either.
+  assert.deepEqual(boardMarker(board[1], map), { kind: "demo", target: "t-2" });
 });

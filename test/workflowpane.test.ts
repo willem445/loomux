@@ -191,7 +191,7 @@ test("creating a file destroys nothing, so it never asks", () => {
   assert.equal(rewriteImpact("   \n", serializeWorkflow(starterWorkflow()), canon), null);
 });
 
-test("editing the YAML tab by hand is never a 'rewrite' — you can see what you're saving", () => {
+test("editing the raw YAML by hand is never a 'rewrite' — you can see what you're saving", () => {
   // The human typed it. Warning them that their own keystrokes will change the file would be
   // absurd — and DELETING A COMMENT is the sharpest version of that, because it is exactly what
   // the `droppedComments` signal would otherwise trip on. They selected the line and pressed

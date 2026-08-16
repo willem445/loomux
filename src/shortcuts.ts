@@ -5,6 +5,7 @@
 export type ShortcutAction =
   | "split-right"
   | "split-down"
+  | "autosize-panes"
   | "close-pane"
   | "new-tab"
   | "close-tab"
@@ -18,6 +19,7 @@ export type ShortcutAction =
   | "toggle-files"
   | "open-editor"
   | "toggle-tasks"
+  | "toggle-decisions"
   | "toggle-audit"
   | "toggle-timeline"
   | "toggle-group"
@@ -38,8 +40,28 @@ export function matchShortcut(e: KeyboardEvent): ShortcutAction | null {
       case "KeyO": return "split-down";
       case "KeyW": return "close-pane";
       case "KeyP": return "toggle-sessions";
-      // Ctrl+Shift+A is intentionally unbound: it toggled the removed agents
-      // mode (#194). Left free pending a repurpose decision.
+      // Ctrl+Shift+A (#936), the repurpose the removed agents mode (#194) left
+      // this key parked for: A for Autosize — even out every pane in the tab.
+      // It sits with the other layout gestures (E/O split, M maximize) rather
+      // than in the Alt+<key> space, which is overlays and focus.
+      //
+      // CHECKED against the agent CLIs' own references per the
+      // agent-cli-reference discipline — which is not the same as verified
+      // free, and keeping the two apart is the whole point of writing it out:
+      //   - Claude Code's interactive-mode reference DOES document `Ctrl+A`
+      //     ("Move cursor to start of current line") and `Ctrl+_` /
+      //     `Ctrl+Shift+-` (undo), and does NOT document Ctrl+Shift+A. The
+      //     unshifted Ctrl+A a shell or agent actually uses is untouched by
+      //     this, and test/shortcuts.test.ts pins that it stays untouched.
+      //   - Copilot CLI's reference pages are SILENT on it — its CLI reference
+      //     index carries no key table at all — so that one is UNVERIFIED, not
+      //     confirmed free. A reference that lists no bindings is not evidence
+      //     of no conflict.
+      // This chord is withheld from every terminal pane (isAppShortcut), so a
+      // CLI that does bind it loses it with no escape hatch. Settling that
+      // needs a human with Copilot running, not a doc read: it is a demo
+      // checklist item, open at the time of writing.
+      case "KeyA": return "autosize-panes";
       case "KeyM": return "maximize-pane";
       // Project tabs (#63). T=new, K=close; the bracket keys page between tabs
       // (VSCode-style) and stay clear of Alt+arrows (pane focus) and the browser
@@ -77,6 +99,25 @@ export function matchShortcut(e: KeyboardEvent): ShortcutAction | null {
       case "KeyF": return "toggle-files";
       case "KeyE": return "open-editor";
       case "KeyT": return "toggle-tasks";
+      // Alt+Q (#1091) — the NEEDS-YOU panel, the board's decision sibling.
+      // NOT Alt+D, which is readline's kill-word in every bash pane.
+      //
+      // CHECKED against the agent CLIs' own references per the
+      // agent-cli-reference discipline, and this one comes out CONFIRMED FREE
+      // rather than merely unverified:
+      //   - Claude Code's interactive-mode reference documents Alt+V/M/P/T/O/
+      //     Y/B/F (and Alt+Enter) and no Alt+Q; its keybindings reference lists
+      //     no Meta+Q default either.
+      //   - Copilot CLI's command reference DOES carry key tables, and its Alt
+      //     rows are Alt+V, Alt+Enter, Alt+arrows and Alt+scroll — no Alt+Q. It
+      //     binds Ctrl+Q (queue a message), which this does not touch; named
+      //     here so a future reader grepping "Q" does not reopen the question.
+      // Readline in this repo's bash leaves `\eq` unbound (`\eQ` is only
+      // do-lowercase-version) — the same shape Alt+W relies on. Neither
+      // vendor documents any Alt+SHIFT default at all, so that variant is
+      // UNVERIFIED rather than free; the `!e.shiftKey` guard on this whole
+      // block is what keeps loomux from taking it.
+      case "KeyQ": return "toggle-decisions";
       case "KeyA": return "toggle-audit";
       // Alt+W (#608) — the progress timeline, the audit log's chart sibling.
       // Verified free before landing, per the agent-cli-reference discipline:

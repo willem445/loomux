@@ -12,6 +12,11 @@
 //   * `layoutPruneIds` — a drag pruned the layout file against the UNSAVED buffer, so deleting
 //     a block (without saving) and then dragging another one wrote the deletion into
 //     `workflow.layout.json` on disk before the human had committed it to `workflow.yml`.
+//   * `inspectorTarget` / `surfaceForFinding` / `canvasDeleteAllowed` (#880 slice B) — the view
+//     decided, per call site, whether a selection was worth *showing*. It got it wrong in the
+//     one place it mattered most: clicking a block on the canvas selected it and re-rendered
+//     the property form BEHIND the tab the human was not looking at, so click-to-edit — the
+//     headline ask on #880 — appeared to do nothing at all.
 //
 // None of those is a rendering bug or a wiring bug. They are all the view answering a question
 // it should never have been holding the answer to.
@@ -70,6 +75,175 @@ export function createAllowed(state: {
   text: string;
 }): boolean {
   return paneSurface(state) === "start";
+}
+
+// ---------- what the pane is showing, and where it is showing it (#880 slice B) ----------
+
+/** Which entry of the workflow the INSPECTOR is editing. The workflow's own settings and the
+ *  gate are selections in the same list as the blocks, because they are edited the same way and
+ *  a second place to click would be a second place to look.
+ *
+ *  A block is addressed by its INDEX in the roster, not by its id — deliberately. The id is the
+ *  identity of a *valid* block, but this pane's whole contract is that a file it cannot fully
+ *  understand still opens and is still repairable, and the blocks that need repairing are
+ *  exactly the ones whose id is missing or duplicated. Keying by id would make two id-less stubs
+ *  indistinguishable, and a duplicate pair unfixable — the inspector would edit whichever came
+ *  first, forever. The index addresses a ROW, which is what the human is actually pointing at.
+ *
+ *  An EDGE is the exception, and for the mirror-image reason: it is held by the pair of ids it
+ *  joins, not by its index in the edge list, because the canonical formatter re-groups edges on
+ *  every save — an index would point at a different edge the moment anything else changed. */
+export type Selection =
+  | { kind: "workflow" }
+  | { kind: "block"; index: number }
+  | { kind: "gate" }
+  | { kind: "edge"; from: string; to: string }
+  /** The three OPTIONAL policy sections (#1020). They are addressed by nothing at all —
+   *  there is exactly one of each, and (unlike a block or an edge) selecting one that the
+   *  file does not declare is not a stale selection but the ordinary way to declare it. */
+  | { kind: "intake" }
+  | { kind: "merge_queue" }
+  | { kind: "resources" };
+
+/** What the inspector actually renders. `Selection` is what the human last pointed at;
+ *  `InspectorTarget` is what is still *there* to show them — the two differ whenever the model
+ *  moved underneath the selection (a block deleted in the YAML, an edge erased on the canvas)
+ *  or the buffer stopped parsing entirely. */
+export type InspectorTarget =
+  /** The YAML doesn't parse, so there is nothing to edit — see `blocked` below. */
+  | { kind: "blocked" }
+  | { kind: "workflow" }
+  | { kind: "block"; index: number }
+  | { kind: "gate" }
+  | { kind: "edge"; from: string; to: string }
+  | { kind: "intake" }
+  | { kind: "merge_queue" }
+  | { kind: "resources" };
+
+/** What the inspector shows for the current selection.
+ *
+ *  THE RULE THE TABS USED TO BREAK (#880). Before this, the property form lived behind a
+ *  "Blocks" tab and the canvas behind a "Graph" tab, so *selecting* something and *showing* it
+ *  were two separate acts — and the canvas performed only the first. `onCanvasDown` set the
+ *  selection and re-rendered the form, off screen, behind the tab the human was not on; the
+ *  gate box remembered to call `setTab("form")` and the node handler did not. Clicking a block
+ *  therefore appeared to do nothing, which is the exact interaction #880 was opened about.
+ *
+ *  With the inspector docked beside the canvas there is no second act to forget: the selection
+ *  IS what the inspector shows, and this function is the whole of that. What is left is the two
+ *  ways a selection can outlive the thing it points at, which the view used to handle by
+ *  reassigning its own selection field and calling itself recursively:
+ *
+ *    * a BLOCK index past the end of the roster — the block was deleted here, or by a hand edit
+ *      in the YAML view;
+ *    * an EDGE the workflow no longer declares — erased here, or edited away in the YAML.
+ *
+ *  Both fall back to the workflow's own settings rather than rendering an editor over nothing.
+ *
+ *  `syntaxBroken` short-circuits everything, and that is the one rule this pane has never been
+ *  allowed to bend: a form edit serializes the model back over the buffer, so editing a model we
+ *  only half understood would silently destroy the broken text the human is in the middle of
+ *  fixing. Unparseable YAML disables the editor and says why — it does not fall back to a
+ *  different editor. */
+export function inspectorTarget(
+  selection: Selection,
+  w: Workflow,
+  syntaxBroken: boolean
+): InspectorTarget {
+  if (syntaxBroken) return { kind: "blocked" };
+  if (selection.kind === "block") {
+    return w.blocks[selection.index] ? selection : { kind: "workflow" };
+  }
+  if (selection.kind === "edge") {
+    const { from, to } = selection;
+    return w.edges.some((e) => e.from === from && e.to === to) ? selection : { kind: "workflow" };
+  }
+  return selection;
+}
+
+/** What the inspector's header says it is editing.
+ *
+ *  It exists because the docked inspector has to answer "what am I looking at?" from across the
+ *  pane, at a glance, while the canvas is still on screen beside it. The `sub` line carries the
+ *  block's **id** specifically — not its name — because the id is the thing edges and the merge
+ *  gate reference, it is the thing you read in a diff, and (unlike the name) it is the thing a
+ *  human is trying to confirm when they click a node to check they clicked the right one. A
+ *  block whose id is missing says so rather than falling back to the name, because "this block
+ *  has no id" is a repair the pane exists to prompt. */
+export function inspectorHeading(
+  target: InspectorTarget,
+  w: Workflow
+): { title: string; sub: string } {
+  switch (target.kind) {
+    case "blocked":
+      return { title: "Nothing to edit", sub: "the YAML doesn't parse" };
+    case "block": {
+      const b = w.blocks[target.index];
+      return {
+        title: b?.name || b?.id || `Block ${target.index + 1}`,
+        sub: `block · ${b?.id || "(no id)"}`,
+      };
+    }
+    case "gate":
+      return { title: "Merge gate", sub: "gate · merge" };
+    case "edge":
+      return { title: `${target.from} → ${target.to}`, sub: "edge · advisory" };
+    // The policy sections say, in the sub-line, whether the FILE declares them — because
+    // "declared" and "inheriting loomux's default" are the distinction those three forms
+    // exist to make visible, and it is invisible everywhere else in the pane.
+    case "intake":
+      return {
+        title: "Intake",
+        sub: w.intake ? "intake · declared" : "intake · not declared (inherited)",
+      };
+    case "merge_queue":
+      return {
+        title: "Merge queue",
+        sub: w.merge_queue ? "merge_queue · declared" : "merge_queue · not declared (off)",
+      };
+    case "resources": {
+      const n = Object.keys(w.resources ?? {}).length;
+      return {
+        title: "Resources",
+        sub: w.resources ? `resources · ${n} declared` : "resources · not declared (no locks)",
+      };
+    }
+    case "workflow":
+      return { title: "Workflow settings", sub: w.name || "(unnamed)" };
+  }
+}
+
+/** The pane's PRIMARY surface — what fills the space between the roster and the inspector.
+ *
+ *  The canvas is primary and the raw YAML is a toggle over it (#880): they are two modalities
+ *  over the same buffer, and only one of them can usefully own the middle of the pane. The
+ *  inspector is not on this list — it is docked beside whichever surface is showing, in both
+ *  modes, which is the point of docking it. */
+export type Surface = "canvas" | "yaml";
+
+/** Which surface a finding's click-to-navigate must switch to, or `null` to leave the surface
+ *  alone.
+ *
+ *  A finding that names a LINE is asking for the caret, and the caret lives in the YAML. A
+ *  finding that names only a BLOCK is asking for that block's editor — which, since the
+ *  inspector is docked and always on screen, is already visible: selecting the block is the
+ *  whole navigation, and switching surface as well would drag the human off the canvas they
+ *  were reading. That is the same `setTab("form")` this pane used to have to remember, now
+ *  stated as the fact that there is nothing to remember. */
+export function surfaceForFinding(finding: { line?: number }): Surface | null {
+  return finding.line ? "yaml" : null;
+}
+
+/** May a bare Delete/Backspace erase what the canvas has selected?
+ *
+ *  Only on the canvas, and only outside a form control — and the second half matters far more
+ *  now than it did under the tabs. The property form and the graph used to be mutually
+ *  exclusive tabs, so "typing in a field" and "looking at the canvas" could not happen at once;
+ *  with the inspector docked beside the canvas they always do. A Delete that erased the selected
+ *  block while the human was editing that block's prompt would be the most expensive keystroke
+ *  in the app, and it is now one field away at all times. */
+export function canvasDeleteAllowed(state: { surface: Surface; inField: boolean }): boolean {
+  return state.surface === "canvas" && !state.inField;
 }
 
 // ---------- how a save is allowed to write ----------

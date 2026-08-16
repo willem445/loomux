@@ -98,6 +98,66 @@ export function roleHintRequires(hint: string): BlockKind | undefined {
   return undefined;
 }
 
+/** The role hints a block of THIS kind may legally declare — derived from
+ *  {@link ROLE_HINTS} and {@link roleHintRequires}, never listed a second time.
+ *
+ *  That derivation is the whole point (#1020): the form that offers these must not
+ *  be able to spell something the parser rejects, and the only way to guarantee it
+ *  is for the offer and the rule to be the SAME statement. A hint added to
+ *  `ROLE_HINTS` (with its pairing in `roleHintRequires`) shows up here — and so in
+ *  the pane — with no edit at all; a hardcoded picker would silently keep offering
+ *  the old two while `validateWorkflow` had moved on. */
+export function roleHintsForKind(kind: string): RoleHint[] {
+  return ROLE_HINTS.filter((h) => roleHintRequires(h) === kind);
+}
+
+/** Why a block of this kind may NOT declare `allow:`, or `null` when it may.
+ *
+ *  Mirrors the two REFUSALS in `parse_workflow` (workflow.rs), which are separate
+ *  rules with separate reasons and are stated here as one answer so the pane's form
+ *  and its validation pass cannot disagree about them:
+ *
+ *   - an ORCHESTRATOR block may not declare `prompt:`/`profile:`/`allow:` at all —
+ *     it is the group's trust root, and a repo file that could pre-approve its
+ *     tools would be a prompt-injection seam into the one agent running
+ *     unsupervised;
+ *   - a READ-ONLY class (today: `planner`, via `Role::containment`) may not, because
+ *     `allow: Bash(python *)` hands it a shell that writes files while naming
+ *     nothing on the deny list. Reviewers and workers keep `allow:` — a reviewer has
+ *     its shell by design (running the tests is the job).
+ *
+ *  An UNRECOGNIZED kind answers `null`: `unknown-kind` already says what is wrong
+ *  with that block, and stacking a second finding on top of it explains nothing. */
+export function allowDenialReason(kind: string): string | null {
+  if (kind === "orchestrator") {
+    return (
+      "the orchestrator is loomux's trust root, and a repo file may not pre-approve its tools — " +
+      "put personas and allow: patterns on the blocks it spawns"
+    );
+  }
+  if (kind === "planner") {
+    return (
+      "a planner's class is read-only, and a pre-approved tool pattern could hand it a shell " +
+      "that writes files — move the work to a worker block"
+    );
+  }
+  return null;
+}
+
+/** What the engine will actually apply for one `allow:` entry, or `null` when it
+ *  drops the entry entirely. Mirrors `sanitize_allow` (profiles.rs): everything
+ *  outside its alphabet is FILTERED OUT — silently, on the way to the CLI's
+ *  `--allowedTools` / `--allow-tool` flag — so a pattern carrying a `$`, a `|` or a
+ *  quote reaches the agent as a different pattern than the one in the file, and the
+ *  human never hears about it. The pane says so instead (`allow-sanitized`). */
+export function sanitizeAllowPattern(pattern: string): string | null {
+  const cleaned = pattern
+    .trim()
+    .replace(/[^A-Za-z0-9():*_\-. ,/]/g, "")
+    .trim();
+  return cleaned || null;
+}
+
 /** Does this block actually REVIEW PRs? — reviewer-kind, minus the liaison
  *  (#891). Mirrors the backend's `is_reviewing_block` (workflow.rs), which the
  *  `{{REVIEWERS}}` fan-out, a reviewer's "one of N" lane and the class-default
@@ -134,6 +194,108 @@ export type GateRequire = (typeof GATE_REQUIRES)[number];
  *  The picker still offers `GATE_REQUIRES` only: there is no reason to offer a human
  *  two spellings of one thing. */
 export const GATE_REQUIRES_ACCEPTED = ["all-pass", "all", "threshold"] as const;
+
+/** Where autonomous work comes from (#382 P1). Mirrors the engine's
+ *  `intake_source_from_str` (workflow.rs). An EMPTY `source:` is legal and means the
+ *  built-in default, which is why "" is accepted by {@link isIntakeSource} but is not
+ *  offered as a value: "inherit" is a different statement from "github-labels", and a
+ *  picker that spelled it out would PIN what the file meant to inherit. */
+export const INTAKE_SOURCES = ["github-labels", "board", "none"] as const;
+export type IntakeSourceName = (typeof INTAKE_SOURCES)[number];
+
+export function isIntakeSource(v: string): boolean {
+  const s = v.trim().toLowerCase();
+  return s === "" || (INTAKE_SOURCES as readonly string[]).includes(s);
+}
+
+/** How long an identifier the engine's `sanitize_id` will carry (`MAX_ID_CHARS`,
+ *  workflow.rs). Longer is not truncated — it is REJECTED, because a resource called
+ *  something the author didn't write is worse than one that fails to load. */
+export const ID_MAX_CHARS = 48;
+
+/** A label the intake profile may name. The engine rejects rather than rewrites
+ *  (`sanitize_intake_label`): a label the repo's own GitHub labels no longer match is
+ *  a silent no-op, so a space or a `#` is a hard error there and a finding here.
+ *  A LEADING `-` is banned on top of the id alphabet — the hold spelling becomes a
+ *  positional argument to `gh label create`, and a dash-leading positional is read as
+ *  a flag. Empty is not a rejection: it means "inherit this one". */
+export function isValidIntakeLabel(v: string): boolean {
+  const s = v.trim();
+  if (!s) return true;
+  return s.length <= ID_MAX_CHARS && /^[A-Za-z0-9_][A-Za-z0-9_-]*$/.test(s);
+}
+
+/** A resource name (#858). Same alphabet as a block id at the engine
+ *  (`sanitize_id`), and — like every other author-written identifier in that file —
+ *  rejected rather than rewritten, so `heavy build` never becomes a resource called
+ *  `heavybuild` that the author's own `acquire_lock` call cannot name. Unlike an
+ *  intake label, a leading `-` is fine: nothing puts a resource name in an argv. */
+export function isValidResourceName(v: string): boolean {
+  const s = v.trim();
+  return !!s && s.length <= ID_MAX_CHARS && /^[A-Za-z0-9_-]+$/.test(s);
+}
+
+/** The bounds `parse_workflow` enforces on the policy sections — mirrored here so the
+ *  pane's forms cannot write a file the engine then refuses to load, and so a
+ *  hand-written file that already carries one gets a finding rather than a clean bill
+ *  of health. Every one of these is a REFUSAL on the engine (`RESOURCE_SLOTS_MAX`,
+ *  `RESOURCE_MAX_HOLD_MINUTES_MAX`, `RESOURCES_MAX`, and `max_batch`'s floor of 1),
+ *  with the single exception noted on the checks-timeout pair below. */
+export const RESOURCE_SLOTS_MIN = 1;
+export const RESOURCE_SLOTS_MAX = 64;
+export const RESOURCE_MAX_HOLD_MINUTES_MIN = 1;
+export const RESOURCE_MAX_HOLD_MINUTES_MAX = 480;
+export const RESOURCES_MAX = 32;
+export const MERGE_QUEUE_MAX_BATCH_MIN = 1;
+/** A threshold gate needs at least one passing review — `fact("gate.threshold", "min", 1)`
+ *  on the engine, and the floor `validateWorkflow` has always enforced. */
+export const GATE_THRESHOLD_MIN = 1;
+/** `checks_timeout_minutes` is the one policy number the engine CLAMPS rather than
+ *  refuses (`clamp_expires_minutes`), so a value outside this range is a warning here,
+ *  not an error: the file loads, it just doesn't do what it says. */
+export const MERGE_QUEUE_CHECKS_TIMEOUT_MIN = 5;
+export const MERGE_QUEUE_CHECKS_TIMEOUT_MAX = 240;
+
+/** One numeric field's range. `max` is OPTIONAL and its absence is a statement: the
+ *  engine imposes no ceiling on that field, so neither may a form. */
+export interface FieldBounds {
+  min: number;
+  max?: number;
+}
+
+/** Every bounded number a policy form writes, keyed by its manifest field id.
+ *
+ *  This table exists because a bound that lives as a literal at the point of use is a
+ *  bound nothing can check (#1020 review, finding 2): `merge_queue.max_batch` was clamped
+ *  to a hand-typed `64` in the form — a ceiling the engine does not impose and the
+ *  manifest does not declare — so typing `100` silently wrote `64` into the file, and no
+ *  test in the tree could see it. The table is the fix in kind rather than in degree: the
+ *  forms read their bounds from HERE, `test/workflowschema.test.ts` pins every entry
+ *  against `src/workflow-schema.json` (whose own `min`/`max` the Rust side pins against
+ *  the engine's constants), and it pins in BOTH directions — a manifest bound missing from
+ *  this table, and a table bound the manifest does not declare, both redden.
+ *
+ *  So "engine → manifest → pane, with no step left to assumption" is now enforced for the
+ *  numbers rather than asserted about them: a `max` cannot enter a form without first
+ *  existing in the engine. */
+export const POLICY_BOUNDS: Readonly<Record<string, FieldBounds>> = {
+  // No ceiling here either: a gate may name any number of reviewers, so `threshold` is
+  // bounded above by the reviewer list rather than by a constant — which
+  // `validateWorkflow` checks against the list itself, where the real answer is.
+  "gate.threshold": { min: GATE_THRESHOLD_MIN },
+  // No ceiling, deliberately: `parse_workflow` refuses `max_batch: 0` and accepts every
+  // integer above it, so the form must too.
+  "merge_queue.max_batch": { min: MERGE_QUEUE_MAX_BATCH_MIN },
+  "merge_queue.checks_timeout_minutes": {
+    min: MERGE_QUEUE_CHECKS_TIMEOUT_MIN,
+    max: MERGE_QUEUE_CHECKS_TIMEOUT_MAX,
+  },
+  "resource.slots": { min: RESOURCE_SLOTS_MIN, max: RESOURCE_SLOTS_MAX },
+  "resource.max_hold_minutes": {
+    min: RESOURCE_MAX_HOLD_MINUTES_MIN,
+    max: RESOURCE_MAX_HOLD_MINUTES_MAX,
+  },
+};
 
 /** A legal block id: lowercase-ish, human-meaningful, safe as a filename fragment and as
  *  a shell-adjacent token. Deliberately strict — the id ends up in agent ids, pane names
@@ -325,16 +487,31 @@ export type FindingCode =
   | "no-entry-block"
   | "unknown-key"
   | "section-not-a-mapping"
-  | "section-bad-value";
+  | "section-bad-value"
+  | "section-out-of-range"
+  | "intake-unknown-source"
+  | "intake-bad-label"
+  | "resource-name-invalid"
+  | "allow-not-permitted"
+  | "allow-sanitized";
+
+/** The policy sections a finding can be ABOUT — the routing key for the three that are
+ *  neither a block nor a line (#1020). Same job `blockId` does for a block: the pane's
+ *  roster and its findings list land the human on the form that can fix it, and neither
+ *  has to match on the message text to work out which one that is. */
+export type FindingSection = "intake" | "merge_queue" | "resources";
 
 /** One thing wrong with the workflow. `blockId` lets the pane render the finding INLINE
  *  next to the block it is about (the whole reason the validation pass is worth having is
- *  that it tells you WHERE); `line` does the same for the raw-text view. */
+ *  that it tells you WHERE); `line` does the same for the raw-text view, and `section` for
+ *  the policy sections. */
 export interface Finding {
   severity: FindingSeverity;
   code: FindingCode;
   message: string;
   blockId?: string;
+  /** Which policy section this is about, when it is about one. */
+  section?: FindingSection;
   /** 1-based source line, when the finding came from reading the text. */
   line?: number;
 }
@@ -906,7 +1083,10 @@ function emitIntakeLines(intake: WorkflowIntake, indent = ""): string[] {
   return emitMappingSection("intake", indent, body);
 }
 
-const INTAKE_LABEL_KEYS = ["ready", "investigate", "owned", "prototype", "hold"] as const;
+/** The five label fields, in the order the engine's own struct declares them — which is
+ *  therefore the order they are emitted in and the order a form should show them. */
+export const INTAKE_LABEL_KEYS = ["ready", "investigate", "owned", "prototype", "hold"] as const;
+export type IntakeLabelKey = (typeof INTAKE_LABEL_KEYS)[number];
 
 function emitIntakeLabelLines(labels: WorkflowIntakeLabels, indent: string): string[] {
   const field = `${indent}  `;
@@ -1386,6 +1566,52 @@ type SectionKey = (typeof SECTION_ORDER)[number];
 
 const TOP_SECTION_KEYS: ReadonlySet<string> = new Set<string>(SECTION_ORDER);
 
+/** Does this `key: …` line already carry a value on it — `resources: {}`, `blocks: []`, a
+ *  hand-written one-line flow mapping — as opposed to being the bare block header (`resources:`)
+ *  that block-indented children are allowed to follow? Quote- and flow-aware, because it asks
+ *  `splitKey`, the real reader's own splitter, rather than looking for a colon. A line this scan
+ *  can't read as a key at all counts as carrying a value: the safe answer is the one that makes
+ *  the caller REPLACE it rather than write children under something it doesn't understand. */
+function keyLineHasInlineValue(line: string): boolean {
+  const split = splitKey(stripComment(line).trim());
+  return !split || split.rest !== "";
+}
+
+/** The header lines to write for a section whose BODY is being regenerated: the original's own
+ *  leading trivia (the comment that introduces the SECTION — see `pushSection`), then a `key:`
+ *  line that AGREES with the body about to follow it.
+ *
+ *  Reusing the original key line verbatim is only safe when the two forms already agree. A key
+ *  line carrying an inline value cannot take block children: splicing a regenerated body under
+ *  the empty-mapping form this file's own emitter writes (`emitMappingSection`) produced
+ *
+ *      resources: {}
+ *        catfish: {}
+ *
+ *  which is not YAML at all — so the pane disabled the form over text it had just written itself
+ *  (#1090). The inverse is as bad and silent: a section emptied back down to `key: {}` kept its
+ *  bare `resources:` header, and a bare key is YAML *null*, i.e. "never declared" — deleting a
+ *  section the human deliberately left empty, which is the whole reason `emitMappingSection`
+ *  writes `{}` in the first place (rev-5 F4).
+ *
+ *  So the original key line is reused only when BOTH it and the regenerated one are bare block
+ *  headers; otherwise the canonical line wins, and the original's own trailing comment rides
+ *  along with it (that comment is about the section, not about the spelling that had to change).
+ *  "Both carry an inline value" is NOT a reason to reuse: an inline value is the section's whole
+ *  content, so keeping `resources: { build: { slots: 2 } }` over a regenerated `resources: {}`
+ *  would silently undo the deletion that emptied it. */
+function sectionHeaderLines(entry: TopEntry, keyLine: string): string[] {
+  const trivia = entry.header.slice(0, -1);
+  const original = entry.header[entry.header.length - 1]!;
+  if (!keyLineHasInlineValue(original) && !keyLineHasInlineValue(keyLine)) {
+    return [...trivia, original];
+  }
+  // Everything the comment-stripper left behind, trailing whitespace included, so `resources: {}
+  // # pools` re-emits as `resources: # pools` and not as `resources:# pools`.
+  const comment = original.slice(stripComment(original).trimEnd().length);
+  return [...trivia, keyLine + comment];
+}
+
 /** Render the workflow the way a form or canvas edit should: reusing the ORIGINAL text's own
  *  lines — comments, blank-line runs, key order, quoting style, all of it — for every top-level
  *  piece the edit didn't touch, and falling back to the canonical emitters only for the piece
@@ -1443,7 +1669,7 @@ export function serializeWorkflowPreserving(w: Workflow, originalText: string): 
   // it didn't have.
   //
   // NOTE (reorder): a block is matched by id, not by position, so its own comment travels WITH
-  // it if the roster gets reordered by hand (in the YAML tab) — a deliberate property, not a
+  // it if the roster gets reordered by hand (in the raw YAML) — a deliberate property, not a
   // bug. What is NOT preserved across a reorder is the blank-line spacing BETWEEN items: each
   // item's leading trivia was captured relative to its ORIGINAL neighbor, so after a reorder it
   // separates a different pair than it used to. The result is still valid YAML and never loses
@@ -1457,7 +1683,7 @@ export function serializeWorkflowPreserving(w: Workflow, originalText: string): 
       // section, not about any one block, so it survives the roster being emptied out too —
       // only the LAST line of the header (the `blocks:`/`blocks: […]` key line itself) is
       // replaced with the canonical empty form.
-      if (blocksEntry) out.push(...blocksEntry.header.slice(0, -1), "blocks: []");
+      if (blocksEntry) out.push(...sectionHeaderLines(blocksEntry, "blocks: []"));
       else out.push("", "blocks: []");
       return;
     }
@@ -1470,9 +1696,11 @@ export function serializeWorkflowPreserving(w: Workflow, originalText: string): 
         if (b.id && !origById.has(b.id)) origById.set(b.id, { block: b, raw: split!.items[i]! });
       });
     }
-    // The `blocks:` line and whatever comment introduces the SECTION (not any one block) is
-    // reused whenever we have one to reuse, independent of which items below it changed.
-    if (blocksEntry) out.push(...blocksEntry.header);
+    // The comment introducing the SECTION (not any one block) is reused whenever we have one to
+    // reuse, independent of which items below it changed — but the `blocks:` line itself only
+    // when it is a bare block header: a roster written `blocks: []` and then given its first
+    // entry has to lose the `[]`, or the items land under a line that can't take them (#1090).
+    if (blocksEntry) out.push(...sectionHeaderLines(blocksEntry, "blocks:"));
     else out.push("", "blocks:");
     let firstItem = true;
     for (const b of w.blocks) {
@@ -1489,23 +1717,32 @@ export function serializeWorkflowPreserving(w: Workflow, originalText: string): 
 
   /** Every section that is not `blocks:` — one shape, because they all want the same one.
    *
-   *  The SECTION HEADER (the `key:` line and whatever comment introduces it, e.g. "# ADVISORY
-   *  — the declared happy path") is reused whenever there is one, independent of whether the
-   *  content changed: regenerating the whole section including its header meant deleting one
-   *  edge dropped a comment that was never about that edge (#233 non-blocking #1). Only the
-   *  CONTENT falls back to canonical, and only when it changed.
+   *  The COMMENT INTRODUCING the section (e.g. "# ADVISORY — the declared happy path") is reused
+   *  whenever there is one, independent of whether the content changed: regenerating the whole
+   *  section including that comment meant deleting one edge dropped a comment that was never
+   *  about that edge (#233 non-blocking #1). Only the CONTENT falls back to canonical, and only
+   *  when it changed.
+   *
+   *  The `key:` line is NOT part of what gets reused unconditionally — it is a function of the
+   *  content that follows it, so a regenerated body re-derives it through `sectionHeaderLines`
+   *  (the reused one may be an empty map/sequence that block children can't legally follow, or
+   *  a bare key that re-reads as undeclared — #1090). That helper is where the rule, and what
+   *  happens to a trailing comment on the key line, is spelled out.
    *
    *  `present` is "the model still has something to write here": with an entry that no longer
    *  matches and nothing to write, the section is GONE, and falling through to the else-branch
-   *  (which emits nothing for empty `lines`) is what deletes it. */
+   *  (which emits nothing for empty `lines`) is what deletes it — the introducing comment
+   *  included, since it has no section left to introduce. */
   const pushSection = (
     entry: TopEntry | undefined,
     unchanged: boolean,
     present: boolean,
     lines: string[]
   ): void => {
-    if (entry && (unchanged || present)) {
-      out.push(...entry.header, ...(unchanged ? entry.content : lines.slice(1)));
+    if (entry && unchanged) {
+      out.push(...entry.header, ...entry.content);
+    } else if (entry && present && lines.length) {
+      out.push(...sectionHeaderLines(entry, lines[0]!), ...lines.slice(1));
     } else if (lines.length) {
       out.push("", ...lines);
     }
@@ -2099,6 +2336,7 @@ export function validateWorkflow(w: Workflow, knobs?: KnobLookup): Finding[] {
         });
       }
     }
+    findings.push(...allowFindings(b, where));
     findings.push(...knobFindings(b, where, knobs));
   }
 
@@ -2171,7 +2409,7 @@ export function validateWorkflow(w: Workflow, knobs?: KnobLookup): Finding[] {
     }
     if (gate.require === "threshold") {
       const t = gate.threshold;
-      if (t === undefined || !Number.isInteger(t) || t < 1) {
+      if (t === undefined || !Number.isInteger(t) || t < GATE_THRESHOLD_MIN) {
         findings.push({
           severity: "error",
           code: "gate-bad-threshold",
@@ -2187,9 +2425,175 @@ export function validateWorkflow(w: Workflow, knobs?: KnobLookup): Finding[] {
     }
   }
 
+  findings.push(...sectionFindings(w));
   findings.push(...unknownKeyFindings(w));
   findings.push(...reachabilityFindings(w, byId));
   return findings;
+}
+
+/** The `allow:` half of the pre-run pass (#1020) — two rules, and they fail in opposite
+ *  directions, which is why they carry different severities.
+ *
+ *  A kind that may not declare `allow:` at all is a REFUSAL on the engine
+ *  (`parse_workflow`): the file does not load, so it is an error here. A pattern the
+ *  engine's `sanitize_allow` would REWRITE is the quieter one and arguably the worse: the
+ *  file loads, the agent spawns, and the tool pattern it was pre-approved for is not the
+ *  one anybody wrote — `Bash(echo "$X")` reaches the CLI as `Bash(echo X)`, which matches
+ *  nothing. Nothing downstream can tell the human that; this can. */
+function allowFindings(b: WorkflowBlock, where: string): Finding[] {
+  if (!b.allow?.length) return [];
+  const denial = allowDenialReason(b.kind);
+  if (denial) {
+    return [
+      {
+        severity: "error",
+        code: "allow-not-permitted",
+        message: `Block "${where}" declares allow:, which a ${b.kind} block may not — ${denial}.`,
+        blockId: b.id,
+      },
+    ];
+  }
+  const out: Finding[] = [];
+  for (const pattern of b.allow) {
+    const clean = sanitizeAllowPattern(pattern);
+    if (clean === null) {
+      out.push({
+        severity: "warning",
+        code: "allow-sanitized",
+        message:
+          `Block "${where}" declares the allow: pattern "${pattern}", which has no characters ` +
+          `loomux can pass to the CLI — it is dropped, and pre-approves nothing.`,
+        blockId: b.id,
+      });
+    } else if (clean !== pattern.trim()) {
+      out.push({
+        severity: "warning",
+        code: "allow-sanitized",
+        message:
+          `Block "${where}" declares the allow: pattern "${pattern}", but loomux passes only ` +
+          `letters, digits and ( ) : * _ - . / , and spaces — the CLI will be given "${clean}".`,
+        blockId: b.id,
+      });
+    }
+  }
+  return out;
+}
+
+/** The policy sections' half of the pre-run pass (#1020): `intake:`, `merge_queue:` and
+ *  `resources:`, checked against the same bounds and vocabularies `parse_workflow` uses.
+ *
+ *  All of these are things the pane can now WRITE, which is exactly why it must also be
+ *  able to say them: a form that offers a number the engine refuses turns a config screen
+ *  into a way to break your own workflow file, and the pane reporting "valid" over a file
+ *  that will not load is the failure mode this whole pass exists to prevent. Each finding
+ *  carries its `section`, so clicking it lands on the form that can fix it. */
+function sectionFindings(w: Workflow): Finding[] {
+  const out: Finding[] = [];
+  const err = (section: FindingSection, code: FindingCode, message: string): void => {
+    out.push({ severity: "error", code, message, section });
+  };
+
+  if (w.intake) {
+    if (w.intake.source !== undefined && !isIntakeSource(w.intake.source)) {
+      err(
+        "intake",
+        "intake-unknown-source",
+        `intake.source: "${w.intake.source}" is not a source loomux knows — use one of ${INTAKE_SOURCES.join(", ")} (or leave it out to inherit).`
+      );
+    }
+    for (const key of INTAKE_LABEL_KEYS) {
+      const v = w.intake.labels?.[key];
+      if (v !== undefined && !isValidIntakeLabel(v)) {
+        err(
+          "intake",
+          "intake-bad-label",
+          `intake.labels.${key}: "${v}" is not a usable label — letters, digits, - and _, no leading -, at most ${ID_MAX_CHARS} characters. ` +
+            `loomux rejects it rather than rewriting it, so your repo's own labels keep matching.`
+        );
+      }
+    }
+  }
+
+  const mq = w.merge_queue;
+  if (mq) {
+    if (
+      mq.max_batch !== undefined &&
+      (!Number.isInteger(mq.max_batch) || mq.max_batch < MERGE_QUEUE_MAX_BATCH_MIN)
+    ) {
+      err(
+        "merge_queue",
+        "section-out-of-range",
+        `merge_queue.max_batch: ${mq.max_batch} — a batch must carry at least ${MERGE_QUEUE_MAX_BATCH_MIN} PR, and a batch of none could never land anything.`
+      );
+    }
+    const timeout = mq.checks_timeout_minutes;
+    if (timeout !== undefined && Number.isInteger(timeout)) {
+      if (timeout < MERGE_QUEUE_CHECKS_TIMEOUT_MIN || timeout > MERGE_QUEUE_CHECKS_TIMEOUT_MAX) {
+        // CLAMPED by the engine, not refused — so this is a warning, and it says what will
+        // actually happen rather than implying the file is broken.
+        out.push({
+          severity: "warning",
+          code: "section-out-of-range",
+          message:
+            `merge_queue.checks_timeout_minutes: ${timeout} is outside ${MERGE_QUEUE_CHECKS_TIMEOUT_MIN}–${MERGE_QUEUE_CHECKS_TIMEOUT_MAX}, ` +
+            `so loomux will clamp it — the queue will not wait for the time this file names.`,
+          section: "merge_queue",
+        });
+      }
+    }
+  }
+
+  const resources = w.resources;
+  if (resources) {
+    const names = Object.keys(resources);
+    if (names.length > RESOURCES_MAX) {
+      err(
+        "resources",
+        "section-out-of-range",
+        `resources: ${names.length} declared — at most ${RESOURCES_MAX} are allowed (every name is listed in the acquire_lock tool description every agent in the group reads).`
+      );
+    }
+    for (const name of names) {
+      if (!isValidResourceName(name)) {
+        err(
+          "resources",
+          "resource-name-invalid",
+          `resources: "${name}" is not a usable resource name — letters, digits, - and _, at most ${ID_MAX_CHARS} characters. ` +
+            `loomux rejects it rather than rewriting it, so the name an agent's acquire_lock call uses is the name you wrote.`
+        );
+      }
+      const r = resources[name]!;
+      const bound = (
+        key: "slots" | "max_hold_minutes",
+        min: number,
+        max: number,
+        why: string
+      ): void => {
+        const v = r[key];
+        if (v === undefined) return;
+        if (!Number.isInteger(v) || v < min || v > max) {
+          err(
+            "resources",
+            "section-out-of-range",
+            `resources.${name}.${key}: ${v} is outside ${min}–${max} — ${why}.`
+          );
+        }
+      };
+      bound(
+        "slots",
+        RESOURCE_SLOTS_MIN,
+        RESOURCE_SLOTS_MAX,
+        "a resource with no slots could never be acquired, and past the maximum a declaration serializes nothing"
+      );
+      bound(
+        "max_hold_minutes",
+        RESOURCE_MAX_HOLD_MINUTES_MIN,
+        RESOURCE_MAX_HOLD_MINUTES_MAX,
+        "a hold that expires as it is granted serializes nothing, and one on a scarce resource has to be bounded by something a working session outlives"
+      );
+    }
+  }
+  return out;
 }
 
 /** Every key this build doesn't know, wherever it sits (#880).

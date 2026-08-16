@@ -109,6 +109,33 @@ export function modelOptions(cli: string, probe: CliProbe | null): string[] {
   return mergeModelOptions(curatedModels(cli), probe?.models ?? []);
 }
 
+/** The options a WORKFLOW BLOCK's picker offers, given what {@link modelOptions}
+ *  merged for its CLI.
+ *
+ *  One rule on top of the launcher's list, and it is a property of the FILE
+ *  rather than of the CLI: a block's `model:` is optional, and leaving it out is
+ *  a declared state — `workflow.rs`'s `model_of` resolves it to
+ *  `default_model(cli, kind)`. The launcher has no equivalent, because every role
+ *  there starts on a real default drawn from the curated row. So the blank row is
+ *  offered on EVERY CLI here, not only on the one whose curated row carries it —
+ *  without it, a block that declares no model would open on whatever happens to
+ *  be first in the menu (`sonnet`, on claude), which reads as a choice somebody
+ *  made and takes away the only way to say "leave it to loomux" once a model has
+ *  been picked. That is a field NARROWER than the free text it replaces, which is
+ *  the one thing #935 may not do.
+ *
+ *  But only when there is a menu to put it in front of. A CLI with no curated
+ *  row and nothing back from its probe (`gemini`, today — it is probed like any
+ *  other, the reply is what carries nothing) has no dropdown at all —
+ *  `pickerSelection` opens such a picker straight onto its custom input, which IS
+ *  the field then, and a one-row menu reading "(unset)" in front of it would be a
+ *  menu whose only purpose is to be escaped from. An empty custom box already
+ *  means exactly what the blank row means. */
+export function blockModelOptions(models: readonly string[]): string[] {
+  if (!models.length) return [];
+  return models.includes(INHERIT_MODEL) ? [...models] : [INHERIT_MODEL, ...models];
+}
+
 /** The select value that means "let me type an id" — a sentinel, not a model, so
  *  it can never collide with one: every real id the pickers carry is either empty
  *  (inherit) or a vendor id, and none of them starts with `__`. */
@@ -150,11 +177,152 @@ export function pickerSelection(models: readonly string[], current: string): Pic
     : { selected: first, custom: "", showCustom: false };
 }
 
-/** The probe seam: one call per program per app run, shared by every surface.
+/** Whether a probe reply is worth remembering for the rest of the app run.
+ *
+ *  **This mirrors the backend's own caching rule, and it has to.**
+ *  `probe_agent_cli` (cliprobe.rs) caches only a COMPLETE probe: "failures and
+ *  partial answers are NOT [cached] — a CLI installed while loomux is running
+ *  must become launchable on the next probe … and by the same argument an
+ *  opencode whose `models` run failed — a network blip, a provider configured or
+ *  `opencode auth login` completed a minute later — must be able to report its
+ *  real list without a restart." A memo in FRONT of that backend which keeps
+ *  those answers anyway does not merely duplicate the cache; it deletes the
+ *  recovery, because there is then no next probe to reach it.
+ *
+ *  Completeness is deliberately not a wire field ("a caching fact, not a wire
+ *  field", cliprobe.rs), so this reads the same fact off the reply itself: an
+ *  answer that carries no list is exactly the answer a later probe might improve
+ *  on. For an enumerator CLI that is completeness verbatim (`complete =
+ *  !listed.is_empty()`); for a help-parsed one it is stricter, and stricter in
+ *  the safe direction — the cost is an extra IPC to a backend that has the answer
+ *  in a HashMap, against a stale "this CLI has nothing" that would last the
+ *  session. */
+export function worthKeeping(probe: CliProbe): boolean {
+  return probe.available && probe.models.length > 0;
+}
+
+/** What a CLI's own list-models reply said about ONE model (#993).
+ *
+ *  A different kind of claim from the two above it. `curated` is a suggestion
+ *  this repo wrote down, and `probed` (`--help`, `opencode models`) is what the
+ *  CLI advertises it *accepts*. This is what the CLI reports about a model's own
+ *  capabilities **on the machine in front of the human** — which nothing else
+ *  can answer, because an effort level is per-model and per-account. A table of
+ *  them here would be the third copy of the thing #329 says not to keep one of.
+ *
+ *  The fields mirror Claude Code's own `ModelInfo`, which Anthropic types in
+ *  `@anthropic-ai/claude-agent-sdk`'s `sdk.d.ts` and publishes at
+ *  <https://docs.claude.com/en/api/agent-sdk/typescript> §ModelInfo (read
+ *  2026-08-14 per the `agent-cli-reference` discipline):
+ *
+ *      value: string;                 // Model identifier to use in API calls
+ *      resolvedModel?: string;        // Canonical wire model id this row's `value` resolves to
+ *      displayName: string;           // Human-readable display name
+ *      description: string;           // Description of the model's capabilities
+ *      supportsEffort?: boolean;      // Whether this model supports effort levels
+ *      supportedEffortLevels?: ('low' | 'medium' | 'high' | 'xhigh' | 'max')[];
+ *
+ *  Renamed rather than mirrored verbatim because this is loomux's own shape, not
+ *  one vendor's: a Copilot or opencode probe will fill the same fields from
+ *  whatever its own reply calls them. Every capability field on that type is
+ *  OPTIONAL, and a real reply exercises that — `haiku` comes back carrying no
+ *  effort fields at all — so absent has to stay distinguishable from false. */
+export interface ModelDetail {
+  /** The id VERBATIM as the CLI reported it (`ModelInfo.value`) — what `--model`
+   *  would receive. May itself carry a `[1m]` suffix: `opus[1m]` is a row the
+   *  CLI lists, not something loomux composes. */
+  id: string;
+  /** The canonical wire id `id` resolves to (`ModelInfo.resolvedModel`), or `""`
+   *  when the CLI did not say. Anthropic documents it as requiring Claude Code
+   *  v2.1.197 or later, so `""` is the ordinary answer from an older install and
+   *  never an error. Worth carrying because it turns an alias into the exact
+   *  model the account is really being served — the one id a context-window
+   *  lookup can be sure about. */
+  resolvedId: string;
+  /** The CLI's own display name (`ModelInfo.displayName`), or `""`. */
+  name: string;
+  /** The CLI's own description (`ModelInfo.description`), or `""`. Reported
+   *  prose, shown verbatim: loomux never parses a number out of it. */
+  description: string;
+  /** Whether the CLI said this model takes a reasoning-effort setting.
+   *
+   *  **`null` is a third state, not a synonym for `false`.** The docs-say-X /
+   *  docs-are-silent / docs-say-NOT-X rule (`agent-cli-reference`) applied to a
+   *  reply instead of a page: `false` is the CLI saying this model has no effort
+   *  knob, and `null` is the CLI not raising the subject — an older build, a
+   *  field that moved, a row like `haiku` that simply omits it. They must not
+   *  collapse, because `false` turns the knob OFF and `null` has to leave it
+   *  exactly as it was. */
+  supportsEffort: boolean | null;
+  /** The effort levels the CLI listed for this model, in its own order. Empty
+   *  when it listed none — which, paired with `supportsEffort: null`, is simply
+   *  "nothing was said". */
+  effortLevels: string[];
+}
+
+/** A whole list-models reply. `models` empty is the ordinary failure: the CLI is
+ *  not installed, is an older build without the control request, or answered in
+ *  a shape this build does not recognise. Every one of those degrades to the
+ *  seed rather than to an error a form has to render. */
+export interface ModelReport {
+  models: ModelDetail[];
+  /** Human-readable reason the reply carried nothing, or `null`. Diagnostic
+   *  only — no surface refuses anything on it. */
+  error: string | null;
+}
+
+/** The report for a CLI loomux could not ask at all. */
+export const reportFailure = (error: string): ModelReport => ({ models: [], error });
+
+/** Strip the `[1m]` context suffix from an id, if it carries one.
+ *
+ *  The suffix selects a context window on an existing model (model-config
+ *  §Extended context); it does not name a different model, and a CLI enumerating
+ *  its models reports the base ids. So `sonnet[1m]` has to find `sonnet`'s row —
+ *  otherwise a human who picked the 1M variant would silently lose the effort
+ *  levels the plain variant shows, which reads as the suffix having disabled
+ *  something. */
+function withoutContextSuffix(id: string): string {
+  const raw = id.trim();
+  return raw.toLowerCase().endsWith("[1m]") ? raw.slice(0, -4) : raw;
+}
+
+/** The reported detail for `id`, or `null` when the reply said nothing about it.
+ *
+ *  Matching widens in one direction only, and each step is a statement loomux
+ *  can defend: verbatim (the ids are the same string), then case-insensitively
+ *  (a vendor id is not case-significant, and `modelnames.ts` already compares
+ *  this way), then with `[1m]` stripped (the suffix is a context window, not a
+ *  model). It never widens to a FAMILY: `claude-sonnet-4-5` must not pick up
+ *  `sonnet`'s reported effort levels, because they are a different model's. */
+export function detailFor(models: readonly ModelDetail[], id: string): ModelDetail | null {
+  const raw = id.trim();
+  if (!raw) return null;
+  const exact = models.find((m) => m.id === raw);
+  if (exact) return exact;
+  const want = withoutContextSuffix(raw).toLowerCase();
+  if (!want) return null;
+  return models.find((m) => withoutContextSuffix(m.id).toLowerCase() === want) ?? null;
+}
+
+/** Whether a list-models reply is worth remembering for the rest of the app run.
+ *
+ *  The same rule as {@link worthKeeping} and for the same reason: a reply that
+ *  carried nothing is exactly the reply a later ask might improve on — the CLI
+ *  was installed a minute later, an upgrade added the control request, a login
+ *  completed. Keeping it would delete the recovery rather than duplicate a
+ *  cache. */
+export function reportWorthKeeping(report: ModelReport): boolean {
+  return report.models.length > 0;
+}
+
+/** The probe seam, shared by every surface: one call per program per app run for
+ *  an answer worth keeping, and a fresh ask for one that is not.
  *
  *  Memoized on the PROMISE, not the result, so two forms opening at once make one
- *  backend call rather than two (the backend caches too — this keeps the IPC and
- *  the 8s worst case off the second caller as well).
+ *  backend call rather than two — which is also what bounds the re-ask: an answer
+ *  that was not worth keeping costs one probe per *caller that asks again*, never
+ *  a stampede, and callers ask per surface rather than per paint.
  *
  *  Never rejects. A probe is loomux asking the machine a question it can live
  *  without an answer to: the surfaces all render curated suggestions plus a
@@ -170,17 +338,30 @@ export class ModelCatalog {
    *  shorthand would put this module out of reach of its own tests. */
   private readonly probeFn: (program: string) => Promise<CliProbe>;
 
-  constructor(probeFn: (program: string) => Promise<CliProbe>) {
+  constructor(
+    probeFn: (program: string) => Promise<CliProbe>,
+    detectFn: ((program: string) => Promise<ModelReport>) | null = null
+  ) {
     this.probeFn = probeFn;
+    this.detectFn = detectFn;
   }
 
   probe(program: string): Promise<CliProbe> {
+    const kept = this.resolved.get(program);
+    if (kept) return Promise.resolve(kept);
     let p = this.inflight.get(program);
     if (!p) {
       p = this.probeFn(program)
         .catch((e: unknown) => probeFailure(String(e)))
         .then((r) => {
-          this.resolved.set(program, r);
+          // Kept only if {@link worthKeeping}. The `inflight` entry is dropped
+          // either way, and that is the whole fix: an answer this memo does not
+          // keep leaves nothing behind, so the NEXT caller reaches the backend
+          // and can be told that the CLI has since been installed, or that
+          // opencode can enumerate now. Deleting it here rather than never
+          // memoizing at all keeps concurrent callers on one call.
+          if (worthKeeping(r)) this.resolved.set(program, r);
+          this.inflight.delete(program);
           return r;
         });
       this.inflight.set(program, p);
@@ -188,17 +369,231 @@ export class ModelCatalog {
     return p;
   }
 
-  /** The probe reply already in hand, or `null` while one is still in flight —
-   *  for the synchronous paths (a form's first paint) that must render before
-   *  awaiting anything. */
+  /** The probe reply already in hand, or `null` when there is none worth having
+   *  — one still in flight, or one that carried nothing — for the synchronous
+   *  paths (a form's first paint) that must render before awaiting anything.
+   *  Both `null` cases mean the same thing to a caller: render the curated
+   *  suggestions, and re-paint if something better lands. */
   cached(program: string): CliProbe | null {
     return this.resolved.get(program) ?? null;
   }
 
   /** The options to offer for `cli` RIGHT NOW: curated, merged with the probe
-   *  reply if one has landed. Synchronous by design — a form paints immediately
-   *  and re-paints when {@link probe} resolves. */
+   *  reply if one has landed, then with anything the CLI's own list-models reply
+   *  named. Synchronous by design — a form paints immediately and re-paints when
+   *  {@link probe} or {@link detect} resolves.
+   *
+   *  The list-models ids go through the same {@link mergeModelOptions} the probe
+   *  reply does, and for the same reason: a machine's own answer beats a
+   *  suggestion, so they lead, and the curated entries stay behind them rather
+   *  than being replaced. Detection therefore only ever ADDS rows and re-orders
+   *  them — a role's default is still on the menu afterwards, which is the
+   *  property `orchclis.test.ts` names. */
   models(cli: string): string[] {
-    return modelOptions(cli, this.cached(cli));
+    const base = modelOptions(cli, this.cached(cli));
+    const detected = this.report(cli);
+    return detected ? mergeModelOptions(base, detected.models.map((m) => m.id)) : base;
+  }
+
+  // ---- the list-models reply (#993, made automatic by #1020) ---------------
+  //
+  // Still a SECOND seam rather than a widening of the first, but for a
+  // different reason than it had under #993. Then, `detect` SPAWNED the CLI and
+  // `probe` did not, so the two were kept apart by what they cost and this one
+  // moved only when a human clicked. Now neither spawns from here at all: the
+  // backend's startup sweep runs the control request once, unbidden, and
+  // `detect` is a lookup against what it left behind (`src-tauri/src/modelwire.rs`).
+  //
+  // What still separates them is the ANSWER, not the cost. `probe` reports what
+  // a CLI says it accepts; this reports what the CLI said about the models on
+  // this machine — ids, display names, per-model effort levels. Merging them
+  // would collapse two different kinds of claim into one map, which is the
+  // thing the header of this module is about.
+
+  /** Every program a lookup has been issued for, resolved or not.
+   *
+   *  **Kept forever, unlike {@link probe}'s, and the difference is the point.**
+   *  A probe memo drops an answer that was not worth keeping so the NEXT caller
+   *  re-asks and can be told the CLI has since appeared. That re-ask was
+   *  affordable because it was one IPC; here, under #993, it was affordable
+   *  because it cost a human gesture. #1020 removed the gesture — the callers
+   *  are paints now, and a form that re-renders would re-issue on every paint.
+   *
+   *  So the bound moved into the memo: one lookup per program per app run. It
+   *  costs nothing to be wrong about, because the lookup is not the only
+   *  delivery — {@link acceptReport} overwrites whatever this remembered when
+   *  the sweep's own answer arrives. */
+  private detectAsked = new Map<string, Promise<ModelReport>>();
+  /** Reports {@link reportWorthKeeping} judged keepable — what {@link report}
+   *  serves. Separate from {@link detectAsked} because a barren answer must
+   *  still leave `report()` null (a surface has to fall back to its seed) while
+   *  bounding the ask. */
+  private detectResolved = new Map<string, ModelReport>();
+  /** Subscribers to {@link onReport}: what to run, and how to ask whether the
+   *  thing that registered it is still there.
+   *
+   *  **The two are separate functions, and that separation is the whole fix for
+   *  the leak the first cut shipped.** When liveness was the delivery
+   *  callback's return value, the only way to ask "are you still alive?" was to
+   *  DELIVER — which repaints — so pruning could only ever happen when a report
+   *  actually changed something. The producer changes something at most once per
+   *  program per app run and sometimes never (if the pull wins the race,
+   *  `acceptReport` refuses before it ever reaches the listeners), so in the
+   *  ordinary case the prune ran zero times and every host built after the sweep
+   *  was retained for the life of the process. Asking is now free of side
+   *  effects, so it can happen on the one event that keeps recurring:
+   *  registration. */
+  private reportListeners: { handler: (program: string) => void; isAlive: () => boolean }[] = [];
+
+  /** The injected backend call (`pty.ts`'s `listCliModels`, read through
+   *  `modelwire.ts`). Optional: the launcher's own catalog is constructed
+   *  before this slice existed in it, and a catalog with no detector simply
+   *  reports nothing rather than failing. */
+  private readonly detectFn: ((program: string) => Promise<ModelReport>) | null;
+
+  /** Look up what the backend's startup sweep found for `program`.
+   *
+   *  **Safe on a paint path, which is what #1020 changed.** The call it makes
+   *  cannot spawn an agent CLI — the sweep already did that, once, at startup —
+   *  so a picker fires this on open the way it fires {@link probe}. It resolves
+   *  from the backend memo, normally immediately.
+   *
+   *  Issued at most once per program per app run (see {@link detectAsked}); a
+   *  form that repaints re-reads the resolved promise and issues nothing. An
+   *  answer that carried nothing is still not KEPT — {@link report} stays null
+   *  and surfaces show their seed — it is simply not asked for again, because
+   *  the sweep is what would have to change its mind, and the sweep pushes.
+   *
+   *  Never rejects: a lookup that failed leaves every surface exactly as it
+   *  was. */
+  detect(program: string): Promise<ModelReport> {
+    const asked = this.detectAsked.get(program);
+    if (asked) return asked;
+    const detect = this.detectFn;
+    if (!detect) return Promise.resolve(reportFailure("this catalog has no list-models detector wired"));
+    const p = detect(program)
+      .catch((e: unknown) => reportFailure(String(e)))
+      .then((r) => {
+        // Never downgrade: an event may have landed while this was in flight,
+        // and it carries the same memo this was reading. Whichever arrived with
+        // a real answer wins.
+        if (reportWorthKeeping(r)) this.detectResolved.set(program, r);
+        return this.detectResolved.get(program) ?? r;
+      });
+    this.detectAsked.set(program, p);
+    return p;
+  }
+
+  /** Take a report the backend pushed, rather than one this catalog asked for
+   *  (#1020 — `models-detected`).
+   *
+   *  The push half of detection. A picker painted while the sweep was still
+   *  running has already read "nothing yet" and memoized that lookup, so
+   *  without this its dropdown would keep the seed for the life of the app.
+   *
+   *  Two reports are refused, and each refusal is a repaint somebody does not
+   *  owe:
+   *
+   *  - One that carries NOTHING. It says only that the sweep found nothing for
+   *    that CLI, which is what every surface already assumes — and storing it
+   *    would overwrite a real answer that arrived first.
+   *  - One for a CLI an answer is ALREADY held for. The sweep runs once per app
+   *    run and asks each CLI once, so a second answer for the same program is
+   *    not a new fact: it is this same answer arriving by the other route, and
+   *    the two routes racing is the ordinary case rather than the odd one. The
+   *    picker that already painted it must not be rebuilt a second time —
+   *    possibly under a caret, since a deferred rebuild fires on blur.
+   *
+   *  Returns whether anything changed, which is what makes "fired only for a
+   *  report that changed something" true of {@link onReport} rather than merely
+   *  intended. A design that ever re-sweeps mid-run has to revisit the second
+   *  refusal — it is a statement about the producer, not about reports. */
+  acceptReport(program: string, report: ModelReport): boolean {
+    // FIRST, and outside both refusals below. Retention must not depend on
+    // whether this particular report happens to change anything, because in the
+    // ordinary case no report ever does: the producer emits once per program
+    // per app run, and if the pull won the race this returns at the second
+    // refusal every time. A prune behind those `return`s is a prune that never
+    // runs (rev-713 blocking 2).
+    this.pruneReportListeners();
+    if (!reportWorthKeeping(report)) return false;
+    if (this.detectResolved.has(program)) return false;
+    this.detectResolved.set(program, report);
+    // Also settles the pull side: a picker that opens later reads this instead
+    // of issuing a lookup for an answer already in hand.
+    this.detectAsked.set(program, Promise.resolve(report));
+    for (const l of this.reportListeners) l.handler(program);
+    return true;
+  }
+
+  /** Drop every subscriber whose host says it is gone.
+   *
+   *  Side-effect free by construction — it asks `isAlive`, never `handler` — so
+   *  it is safe to run on any event, which is what lets it run on one that
+   *  actually recurs. */
+  private pruneReportListeners(): void {
+    this.reportListeners = this.reportListeners.filter((l) => l.isAlive());
+  }
+
+  /** Be told when a pushed report lands, so a form already on screen can
+   *  refresh (#1020).
+   *
+   *  `isAlive` is asked, never inferred: liveness is a fact only the host knows
+   *  (`this.disposed`, `el.isConnected`) and this module is DOM-free, so it
+   *  cannot look. It must be free of side effects — {@link pruneReportListeners}
+   *  calls it at times no repaint is wanted.
+   *
+   *  **Registration is what bounds retention**, and it is deliberately not the
+   *  only defence. Each host also holds the returned unsubscribe and calls it
+   *  from its own teardown, which releases immediately rather than at the next
+   *  registration; the prune here is the backstop for a host discarded without
+   *  one (a launcher form dropped with its pane never reaches a teardown at
+   *  all). Registration is the right event to hang it on because it is the only
+   *  one that keeps happening: every new host subscribes, so the list cannot
+   *  grow past the live hosts plus the one being added. Hanging it on delivery
+   *  instead is the bug this replaced — the producer delivers at most once per
+   *  program per app run, so hosts built afterwards were never asked.
+   *
+   *  Handlers fire only for a report that CHANGED something
+   *  ({@link acceptReport}), so one never has to ask whether it has already seen
+   *  this report. */
+  onReport(handler: (program: string) => void, isAlive: () => boolean): () => void {
+    this.pruneReportListeners();
+    const entry = { handler, isAlive };
+    this.reportListeners.push(entry);
+    return () => {
+      this.reportListeners = this.reportListeners.filter((l) => l !== entry);
+    };
+  }
+
+  /** How many subscribers {@link onReport} is holding right now.
+   *
+   *  **A reader with no product caller, which this repo otherwise refuses**, and
+   *  the exception is argued rather than assumed: RETENTION is the property, and
+   *  it is invisible from every other angle. The first cut of this seam pruned
+   *  only when a report changed state — something the producer does at most once
+   *  per program per app run and often never — so every host built after the
+   *  sweep was retained for the life of the process, and the whole suite stayed
+   *  green because nothing could see the list. A leak no test can observe is a
+   *  leak that comes back.
+   *
+   *  Deliberately does NOT prune before answering: a getter that tidied up first
+   *  would report the list as healthy no matter when the tidying actually
+   *  happens, which is precisely the bug it exists to catch. */
+  get liveReportListeners(): number {
+    return this.reportListeners.length;
+  }
+
+  /** The list-models reply already in hand for `cli`, or `null`. */
+  report(cli: string): ModelReport | null {
+    return this.detectResolved.get(cli) ?? null;
+  }
+
+  /** What the CLI reported about one model, or `null` when it has not been
+   *  asked, or asked and said nothing about this id. All three are the same
+   *  thing to a surface: show what you already knew. */
+  detail(cli: string, id: string): ModelDetail | null {
+    const report = this.report(cli);
+    return report ? detailFor(report.models, id) : null;
   }
 }

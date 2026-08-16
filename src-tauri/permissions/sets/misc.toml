@@ -1,11 +1,12 @@
 [[set]]
 identifier = "misc"
-description = "Ungrouped single-module commands: session listing, copilot/claude autopilot launch-posture recording, agent CLI probing, external editor launch, file hashing, declaring a filesystem root, startup notice, durable UI tab state, durable app settings, durable SSH connection profiles, voice capture."
+description = "Ungrouped single-module commands: session listing, copilot/claude autopilot launch-posture recording, agent CLI probing, list-models control probing, external editor launch, file hashing, declaring a filesystem root, startup notice, durable UI tab state, durable app settings, durable SSH connection profiles, voice capture."
 permissions = [
     "allow-list-sessions",
     "allow-record-copilot-launch-posture",
     "allow-record-claude-launch-posture",
     "allow-probe-agent-cli",
+    "allow-list-cli-models",
     "allow-open-in-editor",
     "allow-fm-hash-start",
     "allow-admit-root",

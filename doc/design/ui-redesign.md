@@ -80,7 +80,7 @@ not one value has moved:
 | Name | Value | Role |
 | --- | --- | --- |
 | **slate** | `#0a0b0d` → `#343945` | the ground and the elevation ladder; every surface and border |
-| **mist** | `#e7e9ee` / `#9ba3b1` / `#656d7b` | the ink: primary, secondary, faint |
+| **mist** | `#cfd2d9` / `#9ba3b1` / `#656d7b` | the ink: primary, secondary, faint |
 
 **The ground is a deep cool neutral.** Blue sits a few points above red at every step of the
 slate ramp (`B−R` = 3, 5, 7, 10, 12, 17 as it climbs), so the chrome reads cool and recedes
@@ -112,7 +112,7 @@ terminal-only value survives: ANSI green (`#57bd77`), because the app's greens a
 
 **Eight is a measurement, not a preference.** The revision's target was 8–10, and a ninth
 hue was tried in all three gaps the wheel still had. Every candidate landed closer to an
-existing hue than the eight-set's own closest pair (violet/orchid, 30.4 ΔE in CIE76): a
+existing hue than the eight-set's own closest pair (rose/orchid, 30.4 ΔE in CIE76): a
 tangerine came out 20–29 ΔE from amber, an indigo 13–23 from azure and violet, a fern 10–24
 from ANSI green. The warm arc is the crowded one because two *state* dyes already live there
 and neither may move, so a third warm hue costs exactly the state legibility the palette
@@ -154,7 +154,7 @@ the failure mode the whole token layer exists to prevent.
 | --- | --- | --- |
 | **state** | what is this agent doing? | the **state positions** only: the warp thread, the status chip, the state dot |
 | **interaction** | what can I act on? | focus ring, caret, active tab, primary action — one accent, nothing else |
-| **identity** | *which* thing is this? | icon strokes and their role table, per-CLI marks, git-graph lanes, diff add/delete, task-board columns, workflow-mode chrome, project tabs, resource meters, the syntax sub-palette |
+| **identity** | *which* thing is this? | icon strokes and their role table, per-CLI marks (its own `--cli-*` sub-table — §The per-CLI hues), git-graph lanes, diff add/delete, task-board columns, workflow-mode chrome, project tabs, resource meters, the syntax sub-palette |
 
 Identity is the channel this revision adds, and it is what makes the app colourful. It says
 which *thing* you are looking at — a surface, an action family, a CLI, a git lane — as
@@ -184,6 +184,281 @@ collapsed.
 That is also the answer to the risk this revision introduces: the control on fruit salad is
 not "use fewer colours", it is that the colourful channel is never the load-bearing one.
 
+## The icon system — a role, never a hue
+
+The first *icon* surface to consume the identity channel — slice B (below) mapped the bulk
+of the channel's other surfaces first — and the shape every later icon consumer should copy.
+`src/icons.ts` is one registry; `test/icons.test.ts` holds it to everything below.
+
+**Colour is assignment, not asset.** No icon carries a colour. The glyphs are `currentColor`
+line art, the registry stamps `.ic-<role>` onto the `<svg>` it renders, and the stylesheet
+maps each role to exactly one `var(--id-*)`. So recolouring the app never touches an SVG, and
+a consumer cannot pick a hue — it picks a **meaning** and the table picks the hue. There is
+deliberately no per-call override: rule 3 below allows an `--id-*` token only *through a
+documented role mapping*, and an argument at the call site is precisely the ad-hoc route it
+refuses.
+
+**Eight roles, eight hues, one claim each.**
+
+| Role | Token | The question it answers | Where it shows |
+| --- | --- | --- | --- |
+| `workspace` | `--id-cyan` | where the work lives | folders, the cwd chip, the file actions |
+| `source` | `--id-amber` | code you edit | source-file rows, the two ways into an editor |
+| `content` | `--id-jade` | data and documents you read | config, markup, images, lockfiles, text |
+| `vcs` | `--id-lime` | the repository's history | the branch chip, the git overlay |
+| `fleet` | `--id-violet` | the agents themselves | group view, fold-group, and the per-pane agent mark of a CLI with no `--cli-*` hue |
+| `board` | `--id-orchid` | the group's work surfaces | tasks, issues, audit, timeline |
+| `danger` | `--id-rose` | destructive actions | delete |
+| `live` | `--id-azure` | capture in progress | push-to-talk |
+
+**The bijection is the discipline, and it is the answer to fruit salad at icon scale.** A hue
+claimed by two roles has stopped saying *which thing this is* — the user sees amber and has to
+work out whether it means source or tasks — and at that point the table has quietly become a
+palette of nice colours. So each identity hue is claimed by exactly one role, checked both
+ways. It also fixes the ceiling §The palette measured: a ninth icon family cannot arrive by
+minting a ninth colour. It has to displace one, and argue why.
+
+That ceiling binds the `--id-*` set and the *roles* that claim it, and the one set that has
+ever been allowed past it went the other way round: the per-CLI hues (§The per-CLI hues) are
+outside `--id-*` for exactly this reason — a CLI could not take a role's hue without giving
+that hue a second meaning — and they buy their own pigments by only ever meeting each other,
+in one position, rather than by joining this table.
+
+**No icon role may name a `--state-*` token.** An icon that reports agent state takes its
+colour from the *position* it sits in — the warp thread, the status chip, the state dot — not
+from this registry. That is the position rule doing its work one layer down: `--state-danger`
+and `--id-rose` are the same pigment, so the test checks the token a role *names*, never a
+hex, and an icon dyed with a state token would look right, measure right, and still have moved
+a fleet signal onto the channel that collapses under colour-vision deficiency.
+
+**Hue groups, shape distinguishes.** The file tree is the densest icon surface in the app and
+the one where this could most easily go wrong. Fifteen file categories share **three** roles —
+folders, code you run, content you read — so a listing separates the kinds at a glance while
+fifteen distinct glyphs separate the members. Fifteen hues down a two-hundred-row tree would
+be noise; three is a legend.
+
+**Vendored, not depended on.** The base set is [Lucide](https://github.com/lucide-icons/lucide)
+(ISC), copied verbatim as SVG-string constants at a pinned commit, with the licence and
+provenance in `src/vendor/lucide/` and an entry in `THIRD_PARTY_NOTICES.md`. Not an npm
+package: the plan's no-new-dependency line holds, nothing in the build has to resolve an icon
+package, and the copy stays small enough to audit — which is only true while **the set is
+limited to icons a surface actually renders**, so a test walks `src/` and fails on one that
+nothing asks for. The wrapper keeps Lucide's own `viewBox`, stroke weight, caps and joins, so
+a re-vendor is a diff a reviewer can read against upstream. The alternatives were considered
+and refused: hand-drawing fifty glyphs (the uneven set this replaced is the evidence), an icon
+font (a webfont, with the flash of the wrong face §Type already rejects), and per-file `.svg`
+assets through Vite (works, but string constants are what every consumer already takes and are
+what keeps the registry node-testable).
+
+### The second tier — brand marks, and the licence that decides whether one exists
+
+One surface asks the registry a question it cannot answer: **which agent CLI is running in
+this pane** (#992). The mark has to be a *brand*, because recognising Copilot is the entire
+value — an abstract glyph loomux invented would say nothing a supervisor could read. That
+puts it outside `src/icons.ts` on two counts, and `src/agenticons.ts` is where it lands.
+
+**Why a second module rather than more rows.** `icon()` pins every body to `ICON_VIEWBOX` —
+Lucide's 24 grid, stroked — and a vendored brand mark arrives on the grid its vendor drew it
+on (`copilot-16` is a filled 16). Rescaling one onto the registry's grid would be exactly the
+"do not restyle" rule above, broken; admitting a second grid into `icon()` would dissolve the
+uniformity that makes a vendored set worth having. Two modules, one grid each, is the honest
+shape.
+
+**It started by borrowing `fleet`, and wave 2 gave it its own table instead.** An agent-type
+glyph is the most literal possible member of *"the agents themselves"*, so the mark shipped
+wearing `.ic-fleet` — which answers *is this an agent* and, it turned out, nothing else: with
+three CLIs on screen every agent pane came out the same violet. §The per-CLI hues is the
+answer and carries the full argument; what matters *here* is what it did and did not change
+about this tier:
+
+- **The mark now reaches its colour through `.cli-<program>`** when its program is on the hue
+  roster, and `.ic-fleet` when it is not — one class or the other, never both. Violet no
+  longer means *this is an agent*; it means *an agent loomux has no brand hue for*.
+- **The bijection above still survives untouched**, which was the real content of the original
+  claim. `--cli-*` is a separate token set precisely *because* each `--id-*` hue is claimed by
+  exactly one icon role, so no CLI takes a role's meaning. What is no longer true is the "no
+  ninth colour" half: there are seven more pigments, in their own sub-table, argued in §The
+  per-CLI hues on the ground that they meet only each other.
+- **`test/icons.test.ts` does not cover these marks for free**, and never quite did — its
+  both-directions scan reads bare `.ic-<role>` rules, so `.cli-*` was always outside it. The
+  three-surface roster pin in `test/agenticons.test.ts` is what holds the CLI table (renderer
+  ↔ `CSS_TOKENS` ↔ stylesheet), and the `.ic-*` scan carries a note that the `.cli-*` block
+  beside it is deliberately *not* the overriding selector its own caveat warns about.
+- **Shape groups, hue distinguishes** — the inverse of the file tree one layer up. Every agent
+  mark is a 16-grid mark or badge, which is what makes them read as one channel; the hue says
+  *which CLI*, and the glyph carries it redundantly wherever a licence or a distinct initial
+  allows.
+
+**Two tiers, because a licence is not always available.** A vendored mark needs **two**
+permissions, and only one of them is what an OSS licence talks about:
+
+- **Copyright in the artwork**, which a project can grant over its own glyph. Primer Octicons
+  is MIT, from GitHub, over GitHub's `copilot-16` — granted outright.
+- **Trademark in the mark**, which no OSS licence grants and which is not needed for
+  *nominative* use: drawing the Copilot mark on a pane that is running Copilot is the mark
+  identifying the thing it names. That permission survives only while the artwork is
+  **unmodified** and no affiliation is implied, which is why the vendoring rules here are the
+  strictest in the codebase.
+
+A CLI whose vendor grants neither — Claude and opencode today — therefore gets tier two: a
+**generated letter badge**, a rounded rect around the program's first character. This is a
+refusal, not a gap. A hand-traced lookalike is a derivative of a mark with no grant behind it,
+and a third-party icon aggregator's CC0 covers the aggregator's *tracing*, not the trademark
+it traces; neither is a permission, and shipping one would be the practice #992 was written to
+avoid.
+
+**The fallback is total, and that is the design.** loomux gains CLIs faster than vendors
+publish brand kits, so the resolver never asks *"is this one of ours"* — a fixed roster would
+make the next CLI a user launches the one pane with no mark, which is the pane they most need
+to find. It asks *"does this program have a mark, and if not, what letter is it"*. Adding a
+CLI is a table row when a licensed glyph exists and **no change at all** when it doesn't.
+
+**It refuses to guess, which is the other half.** No launch command resolves to *nothing
+drawn* — a plain shell is not an agent, and a neutral badge on every terminal is noise dressed
+as information. An unreadable program name resolves to `?`, which reads as "loomux does not
+know" and is true. The prior art #992 cites coerced unidentified panes to a default brand and
+had to undo it: a wrong mark is strictly worse than no mark, because a reader takes it as an
+answer.
+
+**The launch line is not always evidence, which is where that principle nearly died.** An
+#887 SSH pane's child process is the local ssh client, so its `argv[0]` is `ssh` — and the
+agent, if any, runs on the far end where argv cannot reach it. Read naively, that produced a
+confident, specific, wrong caption ("Agent CLI: ssh") on panes that were running Claude:
+exactly the failure the paragraph above claims does not happen, arrived at through a route
+nobody had thought to check. Two rules came out of it, and both generalise past SSH:
+
+- **Prefer what loomux already knows over what it can infer.** The pane's SSH profile names
+  the far-end CLI (`defaultCli`), and that is the program the remote command was actually
+  composed from — an authoritative answer sitting one field away from a guessed one. It is
+  threaded to the pane by the callers that hold the profile, because resolving it later
+  costs an async store read the header cannot wait for.
+- **A caption is a claim, so the neutral tier must not carry one.** Where nothing
+  authoritative exists, the mark degrades to `?` labelled *"agent CLI unknown"* — never to
+  the transport's own initial, and never to an "Agent CLI:" caption. The denylist that
+  enforces this is a list of *transports and shells*, never an allowlist of agents: an
+  allowlist would quietly undo the total fallback above.
+
+**The generated tier is a clamp, not an escape.** Its one variable byte comes from a launch
+command — human-typed, or supplied by a workflow file — and the result is injected with
+`innerHTML` in a webview that can reach the IPC bridge. So the badge admits one character and
+only if it is `[A-Z0-9]`, else `?`. Nothing else is expressible, so there is nothing to
+escape, and the rule cannot decay into "we escaped the characters we thought of".
+
+### The per-CLI hues — `--cli-*`, and why they could not be `--id-*`
+
+The mark above answers *which CLI is this* in **shape**. Until wave 2 it answered it in
+**colour** not at all: every agent mark took the `fleet` role's `--id-violet`, which is the
+right answer to *is this an agent* and no answer to *which one*. The human's note on the
+wave-2 demo was the predictable consequence — a wall of panes running three different CLIs
+came out one colour, so the glyph had to be read rather than seen, which is the opposite of
+what the mark is for. Purple everywhere.
+
+**The obvious fix is the one the bijection forbids.** Handing opencode `--id-jade` and claude
+`--id-amber` costs nothing to write and quietly destroys the thing that makes eight hues
+legible: each identity hue is claimed by exactly *one* icon role (§The icon system), so jade
+would no longer resolve to `content` — it would mean "content, or opencode, work it out from
+where you saw it". That is the failure the bijection exists to prevent, arrived at from the
+inside. So a per-CLI hue needs a pigment no role has claimed, which means a new set, which
+means a new prefix:
+
+| CLI | Token | Value | What it leans on |
+| --- | --- | --- | --- |
+| **claude** | `--cli-claude` | `#e08a5f` | Anthropic's warm terracotta |
+| **codex** | `--cli-codex` | `#3ec2a8` | OpenAI's green |
+| **copilot** | `--cli-copilot` | `#7fa8d8` | GitHub's blue |
+| **opencode** | `--cli-opencode` | `#5fc873` | — loomux's own pick |
+| **gemini** | `--cli-gemini` | `#8b8ff0` | Gemini's blue-violet |
+| **hermes** | `--cli-hermes` | `#e072c0` | — loomux's own pick |
+| **ante** | `--cli-ante` | `#c3c455` | — loomux's own pick |
+
+**Evocation, never replication.** Not one value above is a vendor's own hex, and none is
+presented as one. Leaning a pigment toward a brand's family is the same nominative use that
+lets loomux draw GitHub's own glyph for a pane running GitHub Copilot (§The second tier);
+*copying* a trademark colour exactly would be a claim of affiliation loomux does not make and
+does not need. Three of the seven have no vendor colour identity to lean on at all, so they
+were picked outright, for separation and nothing else — and the table says so rather than
+implying an association that isn't there.
+
+**This is the identity channel, not a fourth one.** *Which CLI is this* is the identity
+question by definition — §The three colour channels already lists per-CLI marks as an
+identity consumer. `--cli-*` is a **sub-table** of that channel for one closed roster, and it
+inherits the channel's rules whole: the state positions stay reserved, and a `--cli-*` token
+may no more enter one than an `--id-*` token may. `test/theme.test.ts` counts `--cli-*` as
+identity in the position-mixing check, so that is measured rather than asserted.
+
+**Seven more pigments does not reopen "eight is a measurement".** That ceiling (§The palette)
+was measured for hues that must be told apart *across the whole app*, where a ninth candidate
+landed closer to an existing hue than the eight-set's own closest pair (rose/orchid,
+30.4 ΔE). These seven never face that comparison: they appear in exactly **two positions** —
+the agent mark and the session list's CLI chip — and only ever against each other. Measured
+on their own terms they are the tighter set, closest pair **31.5 ΔE** (codex/opencode), and
+the test derives the bar from `IDENTITY`'s own closest pair rather than hard-coding it, so
+seven extra pigments stay justified only while they remain the more legible set.
+
+> Every ΔE in this section is CIE76 over the Viénot LMS dichromat simulation in
+> `test/theme.test.ts` — the same code the suite runs, and the only method quoted anywhere in
+> this feature. Two surfaces disagreeing because one of them measured differently is a class
+> of error, not a rounding.
+
+**Colour-vision deficiency — and the worst case is tritan, not the red-green ones.** Seven
+hues on one dark ground do not survive CVD and these do not. Closest pair per simulation:
+
+| Simulation | Closest pair | ΔE |
+| --- | --- | --- |
+| protan | copilot/hermes | 12.5 |
+| deutan | claude/opencode | 10.5 |
+| tritan | codex/copilot | **1.4** |
+
+1.4 ΔE is the honest headline: a tritanope sees codex and copilot as *one colour*. That is
+the same trade identity already makes and states — *which thing this is* is always also
+carried by position, label and **shape**. Here the shape is usually a single letter, so the
+trade holds only while no two CLIs draw the same one; where two do, colour is the last
+channel left and has to survive what the others are excused from.
+
+The roster has three CLIs starting with `C`, and exactly one pair where colour is the **only**
+remaining channel: `claude`/`codex`, both badging a plain `C` (`copilot` draws the vendored
+octicon, so it is shape-distinct). Its worst view is **25.1 ΔE** (protan; deutan 42.2, tritan
+135.4), against a floor of 15. And every pair that *does* collapse is shape-distinct —
+codex/copilot is a `C` against the octicon, claude/hermes (3.8, tritan) a `C` against an `H`.
+The test computes the collision set *from the renderer* rather than listing it, so an eighth
+CLI starting with `C` inherits the obligation the day it is added.
+
+**Distance from the neutrals, not just from each other.** The first copilot candidate was a
+pewter (`#93a8c4`) chosen to evoke GitHub's monochrome mark. It cleared AA on every ground and
+sat well clear of all six other CLI hues — and **8.7 ΔE** from `--ink-dim`, which is the
+colour of the header text the mark is drawn beside. It would have read as an *undyed* mark,
+i.e. as the exact bug this table exists to fix, on the CLI most likely to be running. The
+shipped set is held 20 ΔE clear of every step of the ink ramp, with 20.6 (copilot/`--ink-dim`)
+the closest it comes.
+
+**One CLI, one answer, everywhere.** The session list already dyed its CLI chips — claude
+amber, copilot azure, opencode jade — so loomux had two colour tables for one question, and a
+Copilot chip was the same azure as the *orchestrator role* chip beside it on the same row.
+Those three rules now name `--cli-*`, and `test/theme.test.ts` checks both surfaces against
+the table the way it already does for the four agent roles.
+
+**Either the CLI's class or the fleet's, never both.** `src/agenticons.ts` stamps
+`cli-<program>` on a mark whose program is on the roster and `ic-fleet` on one that is not, so
+no `.cli-*` rule ever has to out-specify `.ic-fleet` — a mark that wore both would take
+whichever block sat lower in `styles.css`, a pin held by source order alone. A CLI with no hue
+keeping the fleet violet is also the honest answer rather than a gap: loomux gains CLIs faster
+than it gains a considered pigment for each, and violet reads as *"an agent loomux has no
+brand hue for"* — the colour twin of the letter badge's own total fallback.
+
+**The roster is a closed list, which is also the injection answer.** The dye now puts a
+program-derived token into a `class` attribute inside a string injected with `innerHTML`, and
+`program` comes off a launch line. Interpolating it would put `"><img src=x onerror=…>` into
+the markup two attributes to the left of the clamp that makes the letter tier safe. Only a
+name that *matches* the roster is ever interpolated, so what reaches the attribute is one of
+seven compile-time strings — the same discipline as the clamp: make the hostile value
+unexpressible rather than escaped.
+
+**What this deliberately does not do: the glyphs.** Wave 2 changes the marks' colour and
+nothing about their shape. Whether claude, opencode and the rest should have drawn glyphs
+rather than letter badges is the licensing question §The second tier answers, and it is
+tracked separately (#992) — a hue needs no licence, so it could ship now; a glyph cannot, so
+it did not.
+
 ## Elevation — the model, not a decoration
 
 Four surfaces, one ladder, and the rule that governs it: **height means "closer to the
@@ -201,6 +476,20 @@ principle 1 says surfaces separate by elevation and a hairline, not by a slab;
 `test/theme.test.ts` fails a surface step above 1.3:1. The two border steps above the ramp
 deliberately open up (1.146:1 and 1.245:1), because an edge that nobody can see is not doing
 the separating the surfaces are refusing to do.
+
+**The project-tab strip is where the ladder had to be spent rather than named** (wave 2). The
+strip was flat and, in one place, inverted: `#tab-bar` and an inactive `.tab` were both
+`--surface-1`, so an unselected tab had no body at all and its hairline was standing in for
+one; and `.tab.active` was `--surface-term`, which made the tab you are actually in the
+darkest thing on screen. That is the model read backwards, and it did not buy the browser-tab
+continuity that would justify it — the bar's own bottom hairline runs straight across
+underneath, and the workspace below is `--surface-0`, not `--surface-term`. The strip now
+spends one step per state: the bar is the deepest surface (a recessed trough, and a clean
+step down from `#topbar`'s gradient above it), idle is the app ground, hover is the panel
+step, and the active tab is the raised step with the strong border and its accent edge. What
+`test/theme.test.ts` pins is the *relationship* — a tab is never the bar's own colour, and
+the tab you are in is the highest surface in the strip — so re-tuning stays legal and
+re-flattening does not.
 
 Shadows are the second half of the model and they are rationed: `--shadow-card` for a raised
 object, `--shadow-float` for one that genuinely floats over the work. **Neither may sit under
@@ -534,24 +823,127 @@ Shipped: this note, `src/theme.ts`, the semantic token layer in `:root` — incl
 `--id-*` identity tokens — `TERM_THEME` derived from `theme.ts`, the `index.html` pre-paint
 sync, and `test/theme.test.ts`.
 
-**The identity tokens are reserved, not consumed.** Nothing paints an `--id-*` token yet, the
-same way `--rail-w` is declared and unused: slice A's job is to make the decision once, in a
-place the later slices can point at. Slice K writes the icon role→dye table against them,
-slice B maps the surfaces below to them, and until then the identity channel is a promise the
-tests hold rather than something visible on screen. The honest read of this PR is that it
-removes the rule that kept the app grey and picks the colours — it does not yet apply them.
+**Slice A reserved the identity tokens rather than consuming them**, the same way `--rail-w`
+is declared and unused: its job was to make the decision once, in a place the later slices
+could point at. **Slice B is the first surface to consume the channel** — it maps the bulk of
+the app's surfaces onto the eight `--id-*` tokens (§What slice B migrated, below). Slice K adds
+the icon role→dye table (§The icon system) on top of that map — claiming all eight hues again,
+this time across the pane headers, the file toolbars and every row of the file trees — the
+channel's first *icon* consumer, not its first consumer.
 
 Not shipped: any restyling — and the honest description of that is not "the old design
 wearing the new colours", because only the rules that went through a *token* moved. The
-eleven pre-redesign token names survive as an explicitly temporary **legacy bridge** aliasing
-onto the new layer, so everything that consumed one is now on the new palette and nothing
-breaks. Everything that hard-coded a colour instead is untouched: **397 colour literals** sit
-below the token block (249 hex, 148 `rgb()`/`rgba()`), **169 of them the retired Tokyo Night
-palette** this brief renounces — 59 of the old amber, 39 red, 35 blue, 21 green, 10 cyan, 5
+eleven pre-redesign token names survived as an explicitly temporary **legacy bridge** aliasing
+onto the new layer, so everything that consumed one moved to the new palette and nothing
+broke. Everything that hard-coded a colour instead was untouched: **401 colour literals** sat
+below the token block (249 hex, 152 `rgb()`/`rgba()`), **175 of them the retired Tokyo Night
+palette** this brief renounces — 59 of the old amber, 39 red, 35 blue, 21 green, 14 cyan, 7
 magenta — concentrated in the task board, the audit log, the workflow pane and its mode
 chrome, project tabs, session restore, and the attention badge. Until slice B those surfaces
-stay visibly on the old palette while the rest moves, which is a transitional state, not the
-design.
+stayed visibly on the old palette while the rest moved, which was a transitional state, not
+the design.
 
-Slice B migrates the literals and deletes the bridge; slices C through I restyle the surfaces
+Slice B migrated the literals and deleted the bridge; slices C through I restyle the surfaces
 to this brief; X9 and X10 need a plan decision before anyone starts them.
+
+## What slice B migrated, and the role map it migrated against
+
+Slice B is the slice that makes the palette visible. It moved all 401 literals onto the
+tokens, retired the bridge, and — because rule 3 requires it — wrote down the mapping it used
+rather than deciding hue by hue in the diff.
+
+**How a role was chosen.** The token a surface names declares which question its colour is
+answering, so the mapping is by role and never by nearest hex. Three questions, in the order
+they were asked of every literal:
+
+| If the colour means… | it takes | examples migrated |
+| --- | --- | --- |
+| something failed, needs you, finished, or is live | `--state-*` | error banners and toasts, the attention chip and its pulse, blocked findings, an awaiting-human task row, a running agent's row edge |
+| something the human can act on | `--accent` / `--selection` / `--focus` | the active pane's ring, primary buttons, keyboard-selected rows, on-state toggles, the drop indicator, editor search matches |
+| *which* thing this is | `--id-*` | git-graph lanes, per-CLI and per-role badges, task-board columns, timeline lanes, workflow node kinds, action families, project-tab and channel colours, diff add/delete, the git status letters |
+
+**One role table, applied everywhere.** The four agent roles were coloured by two surfaces
+that disagreed with each other — the session browser painted a reviewer green and an
+orchestrator violet, the group roster painted an orchestrator azure and a reviewer violet.
+They now share one table: **orchestrator azure, worker jade, reviewer violet, planner amber**,
+used by the session badges, the group roster, and the workflow pane's role chips and nodes
+alike — and `test/theme.test.ts` reads all four of those surfaces and fails on a role that
+disagrees with the table or is missing from a surface that renders every role. A role's colour
+is the same thing wherever it appears or it is not identity, it is decoration; that sentence
+is a claim, so it is measured rather than asserted.
+
+**Where the eight hues landed.** `lime` and `orchid` had no consumer at all before this
+slice: lime now marks a *human* actor in the audit log and the GitHub lane in the timeline
+(the two places the app distinguishes "a person did this" from "we did"), and orchid carries
+the prototype task column and its `proceed` action. `cyan` is the "ready / start / human
+testing" family, `violet` everything review- and PR-shaped.
+
+**Alpha steps are `color-mix`, not new tokens.** The old stylesheet reached a tint by writing
+`rgba(224, 175, 104, 0.16)` — the hue restated in a third notation, invisible to every pin.
+The migrated form is `color-mix(in srgb, var(--state-attention) 16%, transparent)`, which is
+an *expression over a pinned colour*: change the dye in `theme.ts` and every tint of it moves.
+The alternative — minting `--state-attention-16` and friends — would have put roughly forty
+new colour declarations in `:root`, which is the fourth-copy failure the token layer exists to
+prevent. `color-mix` is Baseline-2023 and this app ships against evergreen WebView2, so the
+support argument is the same one `:has()` and custom properties already rest on.
+
+**The `Lit` steps stay out of the stylesheet.** A chip whose text was a lightened hue
+(`#f2c66a` on an amber chip) now takes the base dye instead. Every hue clears AA on all three
+grounds, so the base is measurably legible where the lightened value was only assumed to be,
+and `:root` carries what the stylesheet uses rather than the whole palette. The first slice
+that genuinely needs a `Lit` step mints and pins it then.
+
+**Two state tokens are still unconsumed, and that is correct.** `--state-held` and
+`--state-idle` are achromatic *by design* — a stopped agent is marked by form, not hue — and
+the form that marks it is the warp thread, which does not exist until slices C and D. Nothing
+in the current chrome is the right home for them, and painting a chip grey to use up a token
+would be the opposite of the argument. The delivery-held badge deliberately keeps the
+attention dye it has always had (see its own comment in the stylesheet); the *thread* is where
+`held` becomes visible.
+
+**What changed on screen beyond the swap.** Six things, each a consequence of the design
+rather than a preference:
+
+- The glows are gone (`--accent-glow` was the bridge's one literal). Three rules carried one:
+  the two hover glows go entirely, the drop indicator's 22px halo goes with them, and the
+  active pane keeps an accent **ring** instead, raised from 12% to 55% so it reads without
+  the halo.
+- Four hover backgrounds that used to be a hand-mixed value lighter than their rest surface
+  now step `--surface-1` → `--surface-2`, so the hover lifts one rung of the ladder rather
+  than landing on its own rest colour.
+- Eighteen hand-rolled alpha-black shadows collapse onto `--shadow-card` and `--shadow-float`,
+  which is the rationing §Elevation asks for.
+- A follow/live toggle is interaction, not a state, so `.audit-follow.on` and
+  `.timeline-follow.on` take the accent instead of the old green.
+- Text and marks sitting **on** a filled hue take `--surface-0`. The eight hues are chosen to
+  be legible *as ink* on the dark grounds, so light-on-hue is the pairing that loses
+  contrast: the mic button, the voice overlay badge with its dot and spinner, and the
+  merged-PR chip move off white onto the dark ink every other filled chip already used.
+- The planner's session badge is coloured **at all**. `sessions.ts` emits a role chip for
+  every `OrchRole` and the stylesheet had rules for three of the four, so a planner session
+  rendered uncoloured — the one role whose colour was not the same wherever it appeared, on
+  the surface the role table names first.
+
+**The rule is now measured, not written down.** `test/theme.test.ts` fails on any hex, any
+CSS colour function, or any named colour below the token block; on a hue buried inside a
+composite token value, where the theme.ts pin cannot see it (a shadow may embed alpha-black
+and nothing else); on any surviving value from the retired palette anywhere in `src/`; and on
+any reference to a deleted bridge name. Rule 1 was prose while 401 literals contradicted it;
+it is a test now.
+
+**Three of those tests measure the ROLE rather than the value, which is the harder half.**
+A migration that puts the right pigment in the wrong channel looks perfect and reads wrong,
+and no contrast or distinctness check can see it:
+
+- *One role table.* All four surfaces that name an agent role — session badges, the group
+  roster, the workflow pane's nodes and its chips — are read and compared against the table
+  written above, and the role list itself comes from the `OrchRole` union so a fifth role
+  cannot be added and silently skipped. A role missing from a surface that renders every
+  role fails too: that is how a planner badge went uncoloured for as long as it did.
+- *No position mixes channels.* A rule and its variants (`.x` and `.x.warn`) paint the same
+  element in the same property, so they are one position; if one answers "what is this
+  doing" and another "which thing is this", the position has two channels and one of them
+  is wrong. This is `styles.css`'s own "no `--id-*` in a state position" rule, computed.
+- *An overlay over live content stays translucent.* The drop indicator is a wash you read
+  the terminal *through*; painted opaque it stops being a preview and becomes an occluder.
+  The hue was never wrong there, which is precisely why nothing else would have caught it.

@@ -3581,7 +3581,18 @@ channel; keep the human oriented with short summaries."
              is the group's durable record of what the human has been asked, and it is yours \
              to read and to put in front of them — but no tool on your surface can settle a \
              row, by design, and neither your reply nor the orchestrator's is an answer. Carry \
-             the human's answer back verbatim and let the orchestrator act on it."
+             the human's answer back verbatim and let the orchestrator act on it.\n\
+             - **You may ADD to that record: `ask_human` is yours too.** Never a blocking \
+             interactive dialog — while one of those is on your screen this pane takes no \
+             delivery at all, and a question asked while the human was away has already \
+             stranded a whole fleet overnight. Use it for a decision the human should make \
+             LATER, or away from this pane: it returns an id immediately, survives your \
+             compact and a restart, and reaches them as a badged row rather than as scrollback \
+             they never scroll back to. A decision they are making with you RIGHT NOW is just \
+             the conversation — don't file it. Three things stay the orchestrator's: you write \
+             no board row, you cannot `withdraw_question`, and the `[loomux] answer to q-N` \
+             notice goes to the orchestrator's pane and not yours — `list_questions` is how \
+             you see what became of yours."
         ),
         _ => base,
     }
@@ -8853,6 +8864,13 @@ pub struct AgentEntry {
 ///   loomux is self-healing it, or it needs the human's Enter
 /// - `waiting` — the pane is parked on a prompt (idle-with-prompt)
 /// - `report`  — a worker reported done (awaiting the human's review/merge)
+/// - `question` — this agent (orchestrator-only today) has a pending
+///   `ask_human` row nobody has answered yet (#1091 slice D); DERIVED from
+///   the `questions.json` registry each scan, never latched, so it clears
+///   the instant the row is answered or withdrawn — but it is the live-pane
+///   PROJECTION of that registry (the asker's pane must still be running),
+///   not the registry itself; a pending row against a stopped pane raises
+///   no item here even though the registry still durably holds it
 /// - `gate`    — this agent's task sits at a human merge gate on the board
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct AttentionItem {
@@ -9018,6 +9036,36 @@ pub struct Task {
     /// metadata-only stance: it labels a row, it never authorizes anything.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
+    /// Worktree path where a demo of this item lives (#1091 slice B) — set on
+    /// a `prototype`/`human-testing` row so the panel/board can tell the human
+    /// exactly where to run it, instead of guessing from an assignee's roster
+    /// cwd (D7: explicit beats inferred — the orchestrator prepping the demo
+    /// often uses an integration-branch worktree no worker's cwd names). Same
+    /// additive, empty-string-clears contract as `pr`: a pre-#1091 board loads
+    /// with no key, and `None` here means "no path recorded", never "there is
+    /// no demo". The KEY ITSELF is omitted when absent, though — unlike `pr`,
+    /// which has no `skip_serializing_if` and writes an explicit `null`. That
+    /// half follows `parent`/`kind` (#958), the fields that actually carry it,
+    /// and the reason is the ASYMMETRY between the two groups rather than a
+    /// style preference: `pr` is a concept every worked row has, so its null
+    /// says something. A `demo_path` is set only on the two demo-gated statuses,
+    /// so on most boards NO row ever has one — and without the skip, the first
+    /// rewrite of any board would add a permanently-dead `"demo_path":null` to
+    /// every row of a file humans read and diff. Skipping keeps the additive
+    /// promise total: a board that never uses the feature is unchanged by its
+    /// existence, on disk and not just at load.
+    ///
+    /// Both halves are pinned by `pre_1091_boards_load_with_demo_path_absent`
+    /// (`tests/orchestration.rs`), which holds the only assertion in the tree
+    /// that names this key as text — so deleting `skip_serializing_if` below
+    /// reddens exactly that one test and nothing else. Run, not reasoned: see
+    /// the mutation evidence on #996.
+    ///
+    /// DISPLAY METADATA ONLY, the `pr_base` rule applied here: nothing gates on
+    /// it, and it is agent-written, so a stale or wrong value misleads a human
+    /// rather than opening anything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub demo_path: Option<String>,
     #[serde(default)]
     pub updated_ms: u64,
 }
@@ -9620,6 +9668,9 @@ pub struct TaskPatch {
     /// Advisory Agile level (#958) — one of `TASK_KINDS`, with the same
     /// untouched/empty-clears rule as `parent`.
     pub kind: Option<String>,
+    /// Worktree path for a demo of this item (#1091 slice B) — same
+    /// untouched/empty-clears rule as `pr`/`pr_base`. See `Task::demo_path`.
+    pub demo_path: Option<String>,
     /// Atomic claim (#582): guard this write on the task still being
     /// unclaimed, `queued`, and dep-satisfied, then set assignee + status in
     /// the same locked write. A plain (non-claim) upsert keeps its historic
@@ -24092,17 +24143,31 @@ impl OrchRegistry {
             let mut questions = self.questions(group)?;
             let pending = questions.iter().filter(|q| !q.status.is_settled()).count();
             if pending >= humanq::PENDING_MAX {
+                // Actionable for BOTH callers that can reach this (#1091 slice
+                // E, rev-820 NB1): `withdraw_question` is the orchestrator's
+                // alone, so telling a liaison to withdraw would name a tool it
+                // has not got — the same defect the success reply above was
+                // corrected for. The advice is written once, for whoever reads
+                // it, rather than threading a role into the registry.
                 return Err(format!(
                     "{pending} questions are already pending for this group (max {}) — no human is \
-                     working through a backlog that size; withdraw the ones overtaken by events \
-                     before asking another",
+                     working through a backlog that size. Clear the ones overtaken by events \
+                     before asking another: withdraw_question if you hold it, otherwise name them \
+                     to the orchestrator, which does",
                     humanq::PENDING_MAX
                 ));
             }
+            // Resolved before the struct literal moves `req` apart: both are
+            // methods on the whole request, and a partial move would put them
+            // out of reach.
+            let select = req.select_or_default();
+            let allow_free_text = req.free_text_allowed();
             let question = humanq::Question {
                 id: humanq::next_id(&questions),
                 asker: asker.to_string(),
                 text: req.text,
+                select,
+                allow_free_text,
                 options: req.options,
                 task: req.task,
                 urgency: req.urgency,
@@ -24617,6 +24682,7 @@ impl OrchRegistry {
                     related: vec![],
                     parent: None,
                     kind: None,
+                    demo_path: None,
                     updated_ms: 0,
                 });
                 tasks.len() - 1
@@ -24780,6 +24846,9 @@ impl OrchRegistry {
         }
         if patch.pr_base.is_some() {
             task.pr_base = patch.pr_base.filter(|s| !s.trim().is_empty());
+        }
+        if patch.demo_path.is_some() {
+            task.demo_path = patch.demo_path.filter(|s| !s.trim().is_empty());
         }
         if patch.assignee.is_some() {
             task.assignee = patch.assignee.filter(|s| !s.trim().is_empty());
@@ -33689,10 +33758,11 @@ impl OrchRegistry {
     /// from live agent state plus the supplied pty snapshots. Reasons, in
     /// priority order, are `blocked` (reported), `waiting` (parked on a prompt:
     /// output quiet past `ATTENTION_QUIET_MS`, a prompt-shaped tail, and no
-    /// recent human keystroke), `report` (reported done), and `gate` (this
-    /// agent's board task sits at a `pr`/`human-testing`/`blocked` merge gate).
-    /// Pure w.r.t. the OS/pty — the pty reads live in `attention_inputs` — so
-    /// the whole policy is testable with synthetic maps and no real CLI.
+    /// recent human keystroke), `report` (reported done), `question` (this
+    /// agent has a pending `ask_human` row nobody has answered yet), and `gate`
+    /// (this agent's board task sits at a `pr`/`human-testing`/`blocked` merge
+    /// gate). Pure w.r.t. the OS/pty — the pty reads live in `attention_inputs`
+    /// — so the whole policy is testable with synthetic maps and no real CLI.
     pub fn attention_tick(
         &self,
         now: u64,
@@ -33705,6 +33775,41 @@ impl OrchRegistry {
         let groups: HashSet<GroupId> =
             self.agents.lock_safe().values().map(|a| a.group.clone()).collect();
         let mut gate_of: HashMap<String, String> = HashMap::new();
+        // #1091 slice D: pending-question count per asker, across every live
+        // group — DERIVED from the #946 Q1 `questions.json` registry, exactly
+        // like `gate_of` is derived from the board. This map's LIFETIME is the
+        // registry's — a settled/withdrawn question just stops showing up here,
+        // so no dismiss machinery of its own is needed — but the ITEM this
+        // produces below is additionally gated on the asker's pane still being
+        // `AgentStatus::Running` (the per-agent loop below skips non-running
+        // agents before it ever consults this map), same as every other
+        // reason in this scan. So the badge is the live-pane
+        // PROJECTION of the registry, not the registry itself: a question
+        // pending against a stopped pane raises nothing here (no chip, no
+        // toast) even though the registry still durably holds it and slice
+        // C's panel will still show it. `asker` is orchestrator-only today
+        // (`humanq::Question` doc), so in practice this keys the
+        // orchestrator's own pane. A malformed `questions.json` collapses to
+        // "no pending questions" here — the same posture `self.tasks` already
+        // takes for `gate_of` above — rather than failing the whole scan;
+        // `questions()` stays LOUD for its own read-modify-write callers
+        // (`ask_human`, `list_questions`), which is where a human actually
+        // needs to hear about corruption.
+        let mut question_of: HashMap<String, usize> = HashMap::new();
+        for g in &groups {
+            for q in self.questions(g).unwrap_or_default() {
+                // `is_settled()` — not `== Status::Pending` — so a future
+                // non-terminal status (something other than the current
+                // pending/answered/withdrawn three) is still counted here by
+                // the SAME predicate `ask_human`'s own `PENDING_MAX` check
+                // uses (`!q.status.is_settled()`, mod.rs `ask_human`), rather
+                // than by a second, independently-drifting spelling of "not
+                // done yet".
+                if !q.status.is_settled() {
+                    *question_of.entry(q.asker).or_insert(0) += 1;
+                }
+            }
+        }
         for g in &groups {
             for t in self.tasks(g) {
                 // `prototype` is a human gate too (#147): the assigned pane is
@@ -33796,6 +33901,11 @@ impl OrchRegistry {
                 ("waiting", format!("{} is waiting on a prompt", a.name))
             } else if report == Some("done") {
                 ("report", format!("{} reported done — review & merge", a.name))
+            } else if let Some(&count) = question_of.get(a.id.as_str()) {
+                // Non-urgent amber, like `gate` — a question is a decision
+                // waiting on the human's own pace, not a wedged pane.
+                let noun = if count == 1 { "question" } else { "questions" };
+                ("question", format!("{count} pending {noun} — needs your answer"))
             } else if let Some(st) = gate_of.get(a.id.as_str()) {
                 ("gate", format!("task is {st} — awaiting your call"))
             } else {
@@ -35229,6 +35339,13 @@ impl OrchRegistry {
                  human. When an answer reaches you through the liaison instead, settle the row \
                  yourself — `withdraw_question(q-N)` — rather than leaving a question the human \
                  has already answered sitting in their inbox.\n\
+                 - **`{id}` can open a row itself, and only you can close one.** It has \
+                 `ask_human` too, so `list_questions` will show questions you did not ask — \
+                 read the `asker`. It has no `withdraw_question` and the `[loomux] answer to \
+                 q-N` notice for its questions arrives in THIS pane, not its own: an answer to \
+                 a question `{id}` asked is one to act on and, where it settles something you \
+                 were holding, to un-block. A row of its that is overtaken by events reaches \
+                 you as a `message_orchestrator`, and withdrawing it is then yours.\n\
                  - **Status is its job, not a briefing you owe it.** `{id}` answers \"how is it \
                  going\" for itself, out of `list_tasks` / `get_task` / `list_agents` / \
                  `get_state` / `list_verdicts` and the group's audit log — read-only, and \
@@ -45120,7 +45237,13 @@ pub struct RoleKnobs {
 pub async fn create_orchestration(
     app: AppHandle,
     repo: String,
-    initial_workers: u32,
+    // #1020 item 5: OPTIONAL, and the launcher stops sending it. An absent
+    // value deserializes to `None`, which `starter_workers` resolves to 0 — no
+    // idle workers at launch, the orchestrator opens what the work needs.
+    // Optional rather than deleted because this argument is still the only way
+    // a caller CAN ask, and a wire shape that could no longer express "open
+    // two" would be a capability removal dressed up as a default change.
+    initial_workers: Option<u32>,
     max_agents: u32,
     agent_cli: String,
     // Per-role CLI overrides (issue #4). Empty inherits `agent_cli`; the
@@ -45162,7 +45285,7 @@ pub async fn create_orchestration(
 fn create_orchestration_sync(
     reg: &Arc<OrchRegistry>,
     repo: String,
-    initial_workers: u32,
+    initial_workers: Option<u32>,
     max_agents: u32,
     agent_cli: String,
     orchestrator_cli: String,
@@ -45503,7 +45626,12 @@ pub fn promote_to_orchestrator_sync(
         // reattach, or live sibling), resolved by `create_group_ex`'s candidate
         // scan under the creation lock.
         None,
-        config.initial_workers,
+        // `Some`, not `None`: a promote's count is a real, defaulted field of
+        // its own payload (`PromoteConfig`, 0 unless the modal says otherwise),
+        // so this caller HAS an answer — it just usually says zero. `None` means
+        // "nobody was asked", which after #1020 is the launcher and only the
+        // launcher.
+        Some(config.initial_workers),
     )?;
 
     // ── retire the pane's standalone identity ────────────────────────────
@@ -46631,6 +46759,28 @@ pub async fn orch_end_group(
     run_blocking(move || reg.end_group(&group_id, cleanup_worktrees)).await
 }
 
+/// Idle workers a group opens the moment its orchestrator binds, given what the
+/// caller asked for and the group's own live-agent cap.
+///
+/// **`None` is zero, and that is the whole of #1020 item 5.** The launcher used
+/// to collect an "initial workers" count (defaulting to 2) and now collects
+/// nothing at all, so an absent value is not a missing field to fill in with a
+/// sensible number — it is the human declining to pre-decide. Any N chosen here
+/// is chosen before the orchestrator has read the issue, so it is a guess, and a
+/// wrong guess costs either panes nobody asked for or spend nobody chose. Zero
+/// is the rule [`PromoteConfig::initial_workers`] has always carried, for the
+/// same stated reason: the orchestrator decides what it needs.
+///
+/// The clamp is unchanged and lives here rather than at the caller because the
+/// two are one answer — "how many does this launch open" — and splitting them
+/// would leave the default in a command's argument list and the cap three
+/// functions away, with neither reading as the other's neighbour. A cap of 0
+/// therefore still yields 0 however many were asked for, which is the existing
+/// behaviour written down rather than a new rule.
+pub fn starter_workers(requested: Option<u32>, max_agents: u32) -> u32 {
+    requested.unwrap_or(0).min(max_agents)
+}
+
 /// Create (or reattach to) a group and register its orchestrator, under the
 /// creation lock: the group id is picked by liveness, and a group only
 /// becomes live once its orchestrator is registered, so id selection and
@@ -46665,7 +46815,7 @@ pub fn create_orchestration_group(
     guardrails: Guardrails,
     origin: SessionOrigin,
     expect_group: Option<&str>,
-    initial_workers: u32,
+    initial_workers: Option<u32>,
 ) -> Result<SpawnRequest, String> {
     // Paths are interpolated into a quoted shell line; a quote inside one
     // would escape it. (Windows filesystems forbid `"` in names; this
@@ -46719,7 +46869,7 @@ fn register_orchestrator_pane(
     reg: &Arc<OrchRegistry>,
     group: &GroupInfo,
     origin: &SessionOrigin,
-    initial_workers: u32,
+    initial_workers: Option<u32>,
 ) -> Result<SpawnRequest, String> {
     // The orchestrator is a block like any other (#222) — it just isn't spawned
     // through `spawn_agent_ex`, because a group has exactly one and it is minted
@@ -47100,13 +47250,18 @@ fn register_orchestrator_pane(
                 baseline,
             );
         }
-        // The launcher's "initial workers" count assumes the group HAS a worker
-        // block. A repo whose `.loomux/workflow.yml` declares only reviewers
-        // (a review-only workflow) has none (#222) — and then every spawn below
-        // would fail with "declares no worker block", the human would get zero
-        // panes, and the only trace would be an audit line they'd have to go
-        // looking for. Say it out loud in the orchestrator's pane instead.
-        let starters = initial_workers.min(group2.guardrails.max_agents);
+        // A starter-worker count assumes the group HAS a worker block. A repo
+        // whose `.loomux/workflow.yml` declares only reviewers (a review-only
+        // workflow) has none (#222) — and then every spawn below would fail
+        // with "declares no worker block", the human would get zero panes, and
+        // the only trace would be an audit line they'd have to go looking for.
+        // Say it out loud in the orchestrator's pane instead.
+        //
+        // Reachable only from a caller that ASKS for starters, which since
+        // #1020 is the promote modal and not the launcher — the launcher sends
+        // no count and `starter_workers` resolves that to 0, so this branch
+        // sits under `starters > 0` and simply never fires for a launch.
+        let starters = starter_workers(initial_workers, group2.guardrails.max_agents);
         if starters > 0 && group2.guardrails.block_for(Role::Worker).is_none() {
             reg2.audit(&group2.id, "loomux", "initial-workers-skipped", json!({
                 "requested": starters,
@@ -47115,7 +47270,7 @@ fn register_orchestrator_pane(
             let _ = reg2.deliver_to_orchestrator(
                 &group2.id,
                 &format!(
-                    "[loomux] the launcher asked for {starters} initial worker(s), but this repo's \
+                    "[loomux] this launch asked for {starters} initial worker(s), but this repo's \
                      {} declares no worker block — none were opened. Spawn the blocks it does \
                      declare instead (they are listed above).",
                     workflow::WORKFLOW_PATH
@@ -47389,7 +47544,10 @@ pub fn resume_recorded_session(
             guardrails,
             origin,
             Some(&record.group_id),
-            0,
+            // A restore re-opens a group that already has whatever workers it
+            // had; nobody is asking for starters, which is what `None` says.
+            // (`Some(0)` would have been the same number and the wrong claim.)
+            None,
         )
         .map(Some);
     }
@@ -48037,6 +48195,10 @@ pub async fn orch_upsert_task(
     // deserializes to `None`, which is "leave it alone" in `TaskPatch`.
     parent: Option<String>,
     kind: Option<String>,
+    // #1091 slice B: same additive contract, for the human board's own
+    // demo_path edits (the orchestrator sets it through the MCP `upsert_task`
+    // tool's own arm — see `mcp.rs`).
+    demo_path: Option<String>,
 ) -> Result<Task, String> {
     let reg = reg_of(&app);
     let group_id = command_group(&group_id)?;
@@ -48045,7 +48207,7 @@ pub async fn orch_upsert_task(
             &group_id,
             "human",
             id.as_deref(),
-            TaskPatch { title, status, note, deps, parent, kind, ..Default::default() },
+            TaskPatch { title, status, note, deps, parent, kind, demo_path, ..Default::default() },
         )?;
         reg.notify_board_edit(&group_id, &format!("{} \"{}\" is now {}", task.id, task.title, task.status));
         Ok(task)

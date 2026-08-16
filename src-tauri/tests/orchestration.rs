@@ -45,6 +45,9 @@ use loomux_lib::orchestration::{
     CompactionStatus,
     auto_compact_banner_detected, compact_nudge_poll_interval, compaction_confirmed, copilot_compaction_marker_detected, directive_ledger_embed, ledger_capped,
     human_typed_compact_detected, copilot_autopilot_prompt_detected, create_orchestration_group,
+    // #1020 item 5: how many idle workers a launch opens, and what an unasked
+    // count resolves to.
+    starter_workers,
     delivery_held_cleared_event, delivery_held_detail, delivery_held_event,
     exit_cause, exit_diagnostic, exit_notice_route, ExitInitiator, ExitNoticeRoute,
     resolve_output_text, format_output_tail, OUTPUT_TAIL_MAX_BYTES,
@@ -6154,7 +6157,7 @@ fn a_spawn_carries_the_deny_flags_of_the_class_it_spawned() {
         rails(),
         SessionOrigin::Fresh,
         None,
-        0,
+        None,
     )
     .unwrap();
     assert_eq!(orch.role, Role::Orchestrator);
@@ -9419,6 +9422,7 @@ fn task_summary_drops_notes_but_counts_them() {
         related: vec![],
         parent: None,
         kind: None,
+        demo_path: None,
         updated_ms: 42,
     };
     let s = task_summary(&t, false, 0, 0);
@@ -9880,6 +9884,7 @@ fn linked(id: &str, status: &str, deps: &[&str], related: &[&str]) -> Task {
         related: related.iter().map(|s| s.to_string()).collect(),
         parent: None,
         kind: None,
+        demo_path: None,
         updated_ms: 0,
     }
 }
@@ -10003,6 +10008,121 @@ fn pr_base_round_trips_through_the_board_and_clears_on_empty() {
     let clear = TaskPatch { pr_base: Some("   ".into()), ..Default::default() };
     let cleared = reg.upsert_task(&g.id, "orch-1", Some(&t.id), clear).unwrap();
     assert_eq!(cleared.pr_base, None, "a blank pr_base clears the field rather than storing whitespace");
+}
+
+// ---------- #1091 slice B: demo_path ----------
+
+/// The compat half of #1091 slice B, the `pr_base`/#581 pattern applied to
+/// `demo_path`: a `tasks.json` written before this field existed must still
+/// load, with the field simply absent — never an error that would read a live
+/// board as empty (the same failure mode `pre_581_boards_load_with_pr_base_absent`
+/// guards). Also pins the OTHER half of the additive contract, the way #958
+/// pins it for `parent`/`kind` in `pre_958_boards_load_and_a_flat_board_never_gains_the_hierarchy_keys`:
+/// `demo_path` carries `skip_serializing_if = "Option::is_none"` (unlike
+/// `pr`/`pr_base`, which write an explicit `null`), so a board that never sets
+/// it must not GAIN the key on a later rewrite either.
+#[test]
+fn pre_1091_boards_load_with_demo_path_absent() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let path = reg.state_root().join(g.id.as_str()).join("tasks.json");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    // Exactly what loomux wrote before #1091 slice B — a prototype row, no
+    // demo_path key at all.
+    fs::write(
+        &path,
+        r##"[
+  {"id":"t-1","title":"Ship the parser","status":"prototype","issue":null,"pr":null,"assignee":"w-2","session":null,"notes":[],"updated_ms":11}
+]"##,
+    )
+    .unwrap();
+
+    let tasks = reg.tasks(&g.id);
+    assert_eq!(tasks.len(), 1, "a pre-#1091 board must still load — a parse failure reads as an EMPTY board");
+    assert_eq!(tasks[0].status, "prototype", "the fields that were there are untouched");
+    assert_eq!(
+        tasks[0].demo_path, None,
+        "an absent demo_path deserializes to None (no demo recorded), never an error"
+    );
+
+    // A rewrite that never touches demo_path must not GAIN the key — the
+    // same guarantee #958 pins for `parent`/`kind`, so an older loomux (and a
+    // human reading the file) keeps seeing exactly what it saw before.
+    reg.upsert_task(&g.id, "orch", Some("t-1"), patch(None, Some("in-progress"), None)).unwrap();
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(text.contains("in-progress"), "the edit itself landed");
+    assert!(!text.contains("\"demo_path\""), "a board that never set demo_path must not gain the key:\n{text}");
+}
+
+/// `demo_path` survives the write→read path an orchestrator actually uses
+/// (the `upsert_task` engine call `mcp.rs`'s tool arm and the Tauri board-edit
+/// sibling both funnel through), and clears on the empty string like every
+/// other optional text field (`pr`/`pr_base`'s idiom) — so "the demo moved,
+/// no longer at this path" is expressible without hand-editing the board.
+#[test]
+fn demo_path_round_trips_through_the_board_and_clears_on_empty() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let t = reg.upsert_task(&g.id, "orch-1", None, patch(Some("Demo the redesign"), None, None)).unwrap();
+
+    let mut p = patch(None, Some("prototype"), None);
+    p.demo_path = Some("C:/Projects/loomux-worktrees/feat/1091-demo-path".into());
+    let saved = reg.upsert_task(&g.id, "orch-1", Some(&t.id), p).unwrap();
+    assert_eq!(saved.demo_path.as_deref(), Some("C:/Projects/loomux-worktrees/feat/1091-demo-path"));
+
+    // Durable, not just in the returned snapshot: re-read from tasks.json.
+    let path = reg.state_root().join(g.id.as_str()).join("tasks.json");
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(text.contains("1091-demo-path"), "demo_path must reach the file:\n{text}");
+    let reread = reg.tasks(&g.id);
+    assert_eq!(reread[0].demo_path.as_deref(), Some("C:/Projects/loomux-worktrees/feat/1091-demo-path"));
+
+    // Empty string clears (same filter as `pr`/`pr_base`); omitting the field
+    // leaves it untouched.
+    let untouched = reg.upsert_task(&g.id, "orch-1", Some(&t.id), patch(None, None, Some("still there"))).unwrap();
+    assert_eq!(
+        untouched.demo_path.as_deref(),
+        Some("C:/Projects/loomux-worktrees/feat/1091-demo-path"),
+        "omitted means untouched"
+    );
+    let clear = TaskPatch { demo_path: Some("   ".into()), ..Default::default() };
+    let cleared = reg.upsert_task(&g.id, "orch-1", Some(&t.id), clear).unwrap();
+    assert_eq!(cleared.demo_path, None, "a blank demo_path clears the field rather than storing whitespace");
+}
+
+/// The MCP surface #1091 slice B adds: `demo_path` is settable through the
+/// SAME `upsert_task` tool as every other field (D2's "extend, don't add a
+/// second tool" posture applied here too), and reads back through `get_task`
+/// — the full-record read the not-yet-built NEEDS-YOU panel (slice C) and the
+/// human board's `orch_tasks` both use. It deliberately does NOT reach the
+/// compact `list_tasks` projection: #245 keeps that row minimal on purpose,
+/// and slice B's plan (D7) never asked to widen it.
+#[test]
+fn demo_path_is_settable_through_the_upsert_task_tool_and_omitted_from_the_compact_list() {
+    let (reg, _d, co, cw) = setup_mcp();
+    let created = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "upsert_task", "arguments": { "title": "Demo the redesign", "status": "prototype" } }))
+        .unwrap();
+    assert_eq!(created["isError"], false);
+    let id = created["content"][0]["text"].as_str().unwrap().split_whitespace().next().unwrap().to_string();
+
+    let updated = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "upsert_task", "arguments": { "id": id, "demo_path": "C:/Projects/loomux-worktrees/feat/1091-demo-path" } }))
+        .unwrap();
+    assert_eq!(updated["isError"], false);
+
+    let detail = dispatch(&reg, &cw, "tools/call",
+        &json!({ "name": "get_task", "arguments": { "id": id } })).unwrap();
+    let dtext = detail["content"][0]["text"].as_str().unwrap();
+    assert!(dtext.contains("1091-demo-path"), "get_task must surface demo_path: {dtext}");
+
+    let listed = dispatch(&reg, &cw, "tools/call",
+        &json!({ "name": "list_tasks", "arguments": {} })).unwrap();
+    let ltext = listed["content"][0]["text"].as_str().unwrap();
+    assert!(
+        !ltext.contains("1091-demo-path"),
+        "the compact list_tasks row must not carry demo_path (#245): {ltext}"
+    );
 }
 
 #[test]
@@ -11604,7 +11724,7 @@ fn concurrent_same_repo_launches_get_distinct_groups() {
         let reg = reg.clone();
         let repo = repo_path.clone();
         handles.push(std::thread::spawn(move || {
-            create_orchestration_group(&reg, &repo, rails(), SessionOrigin::Fresh, None, 0).map(|r| r.group_id)
+            create_orchestration_group(&reg, &repo, rails(), SessionOrigin::Fresh, None, None).map(|r| r.group_id)
         }));
     }
     let ids: Vec<GroupId> = handles.into_iter().map(|h| h.join().unwrap().unwrap()).collect();
@@ -11617,7 +11737,7 @@ fn repo_paths_with_quotes_are_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let reg = Arc::new(relaunch_registry(dir.path()));
     reg.set_port(45999);
-    let err = create_orchestration_group(&reg, "/tmp/evil\" ; rm -rf /", rails(), SessionOrigin::Fresh, None, 0)
+    let err = create_orchestration_group(&reg, "/tmp/evil\" ; rm -rf /", rails(), SessionOrigin::Fresh, None, None)
         .unwrap_err();
     assert!(err.contains("quote"), "the quote check must fire before anything else, got: {err}");
 }
@@ -23830,6 +23950,117 @@ fn the_orchestrator_contract_names_the_eligible_signal_and_its_partial_caveat() 
     );
 }
 
+/// **#1091 slice E — the never-block question protocol is in the CONTRACT.**
+///
+/// The question registry (#946 Q1) shipped its tools and their descriptions and
+/// no template prose at all, which put the rule the feature exists for in the
+/// weakest place available: a tool description is read once, at listing time,
+/// and is the first thing a summary drops. The failure it prevents is not
+/// "asked badly" — it is a CLI's own blocking dialog holding the pane, which
+/// makes it take no delivery at all and strands every agent reporting to it
+/// (#946).
+///
+/// Substance, not sentences, and each anchor is a DIFFERENT rule so a deletion
+/// reddens exactly one line here rather than being rescued by a neighbour: the
+/// tool that replaces the dialog, the prohibition itself, the consequence that
+/// makes the prohibition make sense, the durable re-read that survives a
+/// compaction, and the demo-park field. `{{HOLD_LABEL}}`-style placeholders are
+/// not involved — none of this is workflow-conditional, deliberately: behind
+/// `{{WORKFLOW}}` a group with no custom roster would be the one still free to
+/// stall its own fleet.
+#[test]
+fn the_orchestrator_contract_carries_the_never_block_question_protocol() {
+    for (anchor, why) in [
+        (
+            "Every question you put to the human goes through `ask_human`",
+            "orchestrator.md must name the tool that replaces the blocking dialog — a \
+             prohibition with no alternative beside it is one an orchestrator reasons its way \
+             around when it genuinely needs an answer (#946 Q1, #1091 slice E)",
+        ),
+        (
+            "Never through your CLI's own",
+            "orchestrator.md must prohibit the CLI's own interactive question dialog outright. \
+             The #946 Q4 deny makes it impossible on Claude; every other CLI is held by this \
+             sentence alone (#946)",
+        ),
+        (
+            "cannot take **any** delivery",
+            "orchestrator.md must say WHY a dialog is forbidden — that the pane stops taking \
+             deliveries, so the stall is fleet-wide and not the asker's own. Without the \
+             consequence the rule reads as a style preference (#946)",
+        ),
+        (
+            "never with your CLI's own interactive question dialog",
+            "INVARIANT 2 itself must carry the rule. The invariant block is the one part of \
+             this document a summary may never cost the orchestrator, and a never-block rule \
+             that lives only in a section below it is one a compaction can take (#946)",
+        ),
+        (
+            "*does* survive a restart",
+            "orchestrator.md must put `list_questions()` in the session-start reconcile and say \
+             what makes it different from the notifications beside it: a pending question \
+             outlives the process, so it is a hold that is still yours whether or not you \
+             remember opening it (#946 Q1)",
+        ),
+        (
+            "**A demo is ALWAYS a parked board row, never only a message.**",
+            "orchestrator.md must retire the ad-hoc `prepped a worktree, take a look` ping. It \
+             scrolls away, survives neither a compaction nor a restart, and leaves the human \
+             nothing to press (#1091 slice B, the demo-tracking scope addition)",
+        ),
+        (
+            "**record `demo_path`**",
+            "orchestrator.md must have the demo park record where the demo RUNS. loomux never \
+             guesses that path, so an unrecorded one leaves the human a Proceed button and no \
+             way to look at what they are proceeding on (#1091 slice B)",
+        ),
+    ] {
+        // Exactly once, for the reason `tests/workflow.rs`'s `pinned` helper
+        // enforces it: an anchor that occurs twice cannot detect the deletion of
+        // the rule it names, because the other occurrence rescues it — a pin you
+        // cannot make fail is a claim of coverage rather than coverage.
+        assert_eq!(
+            ORCHESTRATOR_TPL.matches(anchor).count(),
+            1,
+            "orchestrator.md must carry `{anchor}` exactly once: {why}"
+        );
+    }
+    // The protocol's ORDER is the part a summary destroys, and it is one
+    // sentence per step: ask, mark the row, go do other work, un-block only the
+    // one that was waiting. Pinned as the sequence rather than as five separate
+    // contains(), because "un-block ONLY the task" is a rule about which of
+    // several holds an answer releases and means nothing on its own.
+    let asking = ORCHESTRATOR_TPL
+        .split("## Asking the human")
+        .nth(1)
+        .expect("orchestrator.md must carry an `Asking the human` section")
+        .split("\n## ")
+        .next()
+        .unwrap();
+    for step in [
+        "Mark that task `blocked`",
+        "Go do other work",
+        "un-block **only** the task",
+        "Re-surface, don't re-ask",
+        "Withdraw generously",
+    ] {
+        assert!(
+            asking.contains(step),
+            "the ask-the-human protocol has lost the `{step}` step — the sequence is what makes \
+             an asked question a reason to switch tasks instead of a reason to idle (#946 Q3)"
+        );
+    }
+    // …and the authoring rules that make a question answerable away from the
+    // machine, which is the property the whole surface is built on.
+    for rule in ["by number", "allow_free_text", "One decision per question"] {
+        assert!(
+            asking.contains(rule),
+            "the ask-the-human section has lost `{rule}` — a question read away from this \
+             machine with no pane in front of it has to stand alone (#946 Q1, #1091 slice A)"
+        );
+    }
+}
+
 /// The PR half of that caveat (#795). Bounding the open-PR fetch too means a
 /// `PARTIAL` summary can now come from *either* listing, so the contract can no
 /// longer describe it as a statement about the backlog: it has to say what a
@@ -32358,6 +32589,113 @@ fn attention_toasts_once_per_onset_only_for_optin_groups() {
     assert!(reg.attention_toast_targets(&gate).is_empty(), "gate is not a toastable event");
 }
 
+/// #1091 slice D: a pending `ask_human` question DERIVES a `question`
+/// attention item on the asker's own pane (orchestrator-only today). RED on
+/// base: `question` is not a reason `attention_tick` ever emits there, so
+/// `.find(...)` returns `None` and `.expect(...)` panics — a real behavioral
+/// miss, not a compile error.
+///
+/// Split into four separate `#[test]`s (review finding N1 on #1123) rather
+/// than one long one: `cargo test` stops a test function at its first
+/// panicking assertion, so a single function covering "flags", "bumps the
+/// count", "clears on settle", and "toasts" would have only ever evidenced
+/// whichever assertion the RED run's mutation happened to reach — the other
+/// three would carry no red evidence at all despite reading as asserted.
+/// Four functions means four independent reds, each attributable to its own
+/// assertion.
+#[test]
+fn attention_flags_the_asker_with_a_pending_question() {
+    let (reg, _d, _g, co, _cw, orch_id) = setup_questions();
+    let now = 1_000_000_000_000u64;
+    let empty = HashMap::new();
+
+    // No pending question yet — no badge.
+    assert!(
+        reg.attention_tick(now, &empty, &no_tails(), &empty).iter().all(|i| i.agent_id != orch_id),
+        "nothing pending, nothing to flag"
+    );
+
+    let out = q_call(&reg, &co, "ask_human", json!({ "text": "ship it here or split it?" }));
+    assert_eq!(out["isError"], false, "{}", q_text(&out));
+
+    let flagged = reg.attention_tick(now, &empty, &no_tails(), &empty);
+    let item = flagged
+        .iter()
+        .find(|i| i.agent_id == orch_id && i.reason == "question")
+        .expect("a pending question must flag the asker's pane");
+    assert!(item.detail.contains('1'), "detail should say how many are pending: {}", item.detail);
+}
+
+#[test]
+fn a_second_pending_question_bumps_the_count_on_the_same_item() {
+    let (reg, _d, _g, co, _cw, orch_id) = setup_questions();
+    let now = 1_000_000_000_000u64;
+    let empty = HashMap::new();
+
+    q_call(&reg, &co, "ask_human", json!({ "text": "ship it here or split it?" }));
+    let out2 = q_call(&reg, &co, "ask_human", json!({ "text": "another one?" }));
+    assert_eq!(out2["isError"], false, "{}", q_text(&out2));
+
+    let flagged = reg.attention_tick(now, &empty, &no_tails(), &empty);
+    let item = flagged
+        .iter()
+        .find(|i| i.agent_id == orch_id && i.reason == "question")
+        .expect("two pending questions must still flag the asker's pane");
+    assert!(item.detail.contains('2'), "two pending: {}", item.detail);
+}
+
+/// Pins the slice's central "non-latched by design" claim: the registry
+/// itself is the latch, so settling every pending row must clear the badge
+/// with no separate ack — unlike `stranded`. The predicate this guards is
+/// `!q.status.is_settled()` in `attention_tick`'s `question_of` build
+/// (mod.rs): drop it (or invert it) and this is the one assertion that
+/// reddens, because a withdrawn/answered row would keep counting.
+#[test]
+fn settling_every_pending_question_clears_the_badge_with_nothing_latched() {
+    let (reg, _d, _g, co, _cw, orch_id) = setup_questions();
+    let now = 1_000_000_000_000u64;
+    let empty = HashMap::new();
+
+    q_call(&reg, &co, "ask_human", json!({ "text": "ship it here or split it?" }));
+    q_call(&reg, &co, "ask_human", json!({ "text": "another one?" }));
+    assert!(
+        reg.attention_tick(now, &empty, &no_tails(), &empty).iter().any(|i| i.agent_id == orch_id),
+        "sanity: two pending questions must flag the pane before withdrawal"
+    );
+
+    // Withdrawing both settles them — the badge clears with no separate ack.
+    q_call(&reg, &co, "withdraw_question", json!({ "id": "q-1" }));
+    q_call(&reg, &co, "withdraw_question", json!({ "id": "q-2" }));
+    assert!(
+        reg.attention_tick(now, &empty, &no_tails(), &empty).iter().all(|i| i.agent_id != orch_id),
+        "settling every pending question must clear the badge with nothing latched"
+    );
+}
+
+/// **Forward guard, not a new-behaviour pin** (review finding N2 on #1123):
+/// `attention_toast_targets` already toasts every reason but `gate`, and this
+/// PR adds no logic to that function — the guard below reddens only if a
+/// FUTURE change adds `question` to an exclusion list (or otherwise special-
+/// cases it), not from anything in this diff. Kept as its own test, separate
+/// from the three above, precisely so the red-before-green evidence for those
+/// three is never read as covering this one too.
+#[test]
+fn a_question_attention_item_toasts_like_any_other_event_not_like_gate() {
+    let (reg, _d, g, _co, _cw, orch_id) = setup_questions();
+    let pending = vec![AttentionItem {
+        agent_id: orch_id.clone(),
+        group: g.to_string(),
+        name: "orch".into(),
+        role: Some(Role::Orchestrator),
+        pty_id: None,
+        reason: "question",
+        detail: "1 pending question — needs your answer".into(),
+    }];
+    assert!(reg.attention_toast_targets(&pending).is_empty(), "no toasts until opted in");
+    reg.set_notify(&g, true).unwrap();
+    assert_eq!(reg.attention_toast_targets(&pending), vec![orch_id.clone()]);
+}
+
 #[test]
 fn notify_optin_is_durable_across_restart() {
     let dir = tempfile::tempdir().unwrap();
@@ -35340,6 +35678,38 @@ fn disk_tick_notifies_once_per_episode_and_skips_paused() {
 }
 
 #[test]
+fn a_launch_that_asks_for_no_starter_workers_opens_none() {
+    // #1020 item 5. The launcher's "Initial workers" field is gone, so a launch now sends
+    // NO count at all — and the whole point of the change is what that absence resolves to.
+    // Before this, the form defaulted to 2 and every group came up with two idle workers
+    // sitting on a repo nobody had briefed them about; the human's instruction was that
+    // spawning workers at startup makes no sense, so the orchestrator opens what the work
+    // needs instead.
+    assert_eq!(
+        starter_workers(None, 4),
+        0,
+        "an unasked-for count must be 0 — the orchestrator decides what it needs"
+    );
+
+    // A caller that DOES ask still gets what it asked for. `PromoteConfig` is that caller,
+    // and it carries its own defaulted field, so making `None` mean 0 must not quietly mean
+    // "0 for everyone" — the distinction between "nobody asked" and "asked for two" is the
+    // reason this takes an `Option` rather than a `u32` the launcher passes 0 in.
+    assert_eq!(starter_workers(Some(2), 4), 2);
+
+    // The cap wins over the request, unchanged: a group may never open more starters than
+    // its own live-agent guardrail allows, or the launch itself would breach the ceiling the
+    // human set on the same form.
+    assert_eq!(starter_workers(Some(9), 4), 4, "a request above the cap is clamped to it");
+    assert_eq!(starter_workers(Some(1), 0), 0, "a zero cap admits nothing, however small the ask");
+
+    // An explicit zero and an absent value agree on the NUMBER while meaning different
+    // things — pinned so a future reader does not "simplify" the Option away on the grounds
+    // that both come out 0 today. They are the same only while the default is 0.
+    assert_eq!(starter_workers(Some(0), 4), starter_workers(None, 4));
+}
+
+#[test]
 fn create_orchestration_group_maps_resume_session_onto_the_workflow_pin() {
     use std::sync::Arc;
     // #222 rev-11 F2, at the entry point instead of one layer below it.
@@ -35370,7 +35740,7 @@ fn create_orchestration_group_maps_resume_session_onto_the_workflow_pin() {
 
     // ── SessionOrigin::Fresh ⇒ the repo's file is read ──
     declare("rev-approved");
-    let launched = create_orchestration_group(&reg, &repo_path, advanced.clone(), SessionOrigin::Fresh, None, 0)
+    let launched = create_orchestration_group(&reg, &repo_path, advanced.clone(), SessionOrigin::Fresh, None, None)
         .unwrap();
     let gid = launched.group_id.clone();
     assert!(
@@ -35392,7 +35762,7 @@ fn create_orchestration_group_maps_resume_session_onto_the_workflow_pin() {
         persisted,
         SessionOrigin::Resume("11111111-2222-3333-4444-555555555555".into()),
         Some(&gid),
-        0,
+        None,
     )
     .expect("a resume must not fail");
 
@@ -35413,7 +35783,7 @@ fn create_orchestration_group_maps_resume_session_onto_the_workflow_pin() {
     let reg2 = Arc::new(relaunch_registry(state2.path()));
     reg2.set_port(45999);
     let relaunched =
-        create_orchestration_group(&reg2, &repo_path, advanced, SessionOrigin::Fresh, None, 0).unwrap();
+        create_orchestration_group(&reg2, &repo_path, advanced, SessionOrigin::Fresh, None, None).unwrap();
     assert!(
         reg2.group(&relaunched.group_id).unwrap().guardrails.block("rev-never-seen").is_some(),
         "editing the workflow and launching again must pick up the new roster"
@@ -35795,7 +36165,7 @@ fn dormant_group_and_a_promotable_pane(
         Guardrails { advanced_orchestrator: true, max_agents: 7, ..rails() },
         SessionOrigin::Fresh,
         None,
-        0,
+        None,
     )
     .unwrap();
     let gid = launched.group_id.clone();
@@ -35882,7 +36252,7 @@ fn promote_beside_a_live_group_opens_a_sibling_rather_than_a_second_orchestrator
     // orchestrator in one group — refused everywhere else in loomux (a resume
     // refuses while one is live; `spawn_agent` refuses `kind: orchestrator`),
     // and promote must not become the loophole.
-    let live = create_orchestration_group(&reg, &repo_path, rails(), SessionOrigin::Fresh, None, 0)
+    let live = create_orchestration_group(&reg, &repo_path, rails(), SessionOrigin::Fresh, None, None)
         .unwrap();
     let req = promote_to_orchestrator_sync(&reg, &repo_path, &sid, "claude", PromoteConfig::default());
     drop_claude_store(&store);
@@ -36103,7 +36473,7 @@ fn promote_never_retires_an_agent_that_is_not_a_standalone_pane() {
     // way to take out another group's orchestrator.
     let other = tempfile::tempdir().unwrap();
     let other_repo = other.path().to_string_lossy().replace('\\', "/");
-    let victim = create_orchestration_group(&reg, &other_repo, rails(), SessionOrigin::Fresh, None, 0)
+    let victim = create_orchestration_group(&reg, &other_repo, rails(), SessionOrigin::Fresh, None, None)
         .unwrap();
     let req = promote_to_orchestrator_sync(
         &reg,
@@ -36149,7 +36519,7 @@ fn start_fresh_on_an_orchestrator_does_not_re_read_the_workflow_file() {
         Guardrails { advanced_orchestrator: true, ..rails() },
         SessionOrigin::Fresh,
         None,
-        0,
+        None,
     )
     .unwrap();
     let gid = launched.group_id.clone();
@@ -36467,7 +36837,7 @@ fn a_resumed_session_re_checks_the_pinned_roster_against_the_live_cap_too() {
         Guardrails { advanced_orchestrator: true, max_agents: 5, ..rails() },
         SessionOrigin::Fresh,
         None,
-        0,
+        None,
     )
     .unwrap();
     let gid = launched.group_id.clone();
@@ -36485,7 +36855,7 @@ fn a_resumed_session_re_checks_the_pinned_roster_against_the_live_cap_too() {
         persisted,
         SessionOrigin::Resume("11111111-2222-3333-4444-555555555555".into()),
         Some(&gid),
-        0,
+        None,
     )
     .expect("a resume must not fail");
 
@@ -36520,7 +36890,7 @@ fn a_resumed_group_with_no_declared_workflow_gets_no_capacity_audit_either() {
         Guardrails { advanced_orchestrator: true, max_agents: 2, ..rails() },
         SessionOrigin::Fresh,
         None,
-        0,
+        None,
     )
     .unwrap();
     let gid = launched.group_id.clone();
@@ -36539,7 +36909,7 @@ fn a_resumed_group_with_no_declared_workflow_gets_no_capacity_audit_either() {
         persisted,
         SessionOrigin::Resume("11111111-2222-3333-4444-555555555555".into()),
         Some(&gid),
-        0,
+        None,
     )
     .expect("a resume must not fail");
 
@@ -37135,12 +37505,19 @@ fn a_liaison_block_may_read_the_groups_usage() {
     assert!(text.contains("liaison"),
         "the refusal must name the rule it is applying, not just say no: {text}");
 
-    // THE WIDENING IS ONE TOOL WIDE. Every assertion above would also hold if
-    // the hint had promoted the liaison into the orchestrator tier wholesale —
+    // THE WIDENING IS NOT THE ORCHESTRATOR TIER. Every assertion above would
+    // also hold if the hint had promoted the liaison into that tier wholesale —
     // which would hand the human's pane `spawn_agent` and `send_prompt`, the
     // two tools the whole no-orchestration-authority argument rests on.
+    //
+    // `ask_human` was in this list until #1091 slice E widened it deliberately,
+    // and `withdraw_question` replaces it rather than the row simply being
+    // dropped: the two are the question registry's WRITE tier, so keeping its
+    // settling half here is what makes "the pose widened" a narrower claim than
+    // "the tier widened". `a_liaison_block_may_pose_a_question_to_the_human`
+    // owns the positive side.
     for orchestrator_only in
-        ["spawn_agent", "send_prompt", "kill_agent", "set_state", "ask_human", "queue_orphans"]
+        ["spawn_agent", "send_prompt", "kill_agent", "set_state", "withdraw_question", "queue_orphans"]
     {
         assert!(!names.contains(&orchestrator_only.to_string()),
             "the liaison holds no orchestration authority — {orchestrator_only} leaked: {names:?}");
@@ -37177,6 +37554,173 @@ fn a_liaison_block_may_read_the_groups_usage() {
         &json!({ "name": "group_usage", "arguments": {} })).unwrap();
     assert_eq!(refused["isError"], true,
         "the hint alone must never open this — the reviewer class is half the key");
+}
+
+/// **#1091 slice E — the liaison poses its own durable question.**
+///
+/// The second hint-keyed WIDENING, and the first that is a *write*. Before it,
+/// the pane the human is actually talking to had exactly one durable path for
+/// "the human should decide this later": `message_orchestrator`, which becomes
+/// a registry row only if the orchestrator independently chooses to open one —
+/// orchestrator-controlled, so not the human-facing pane's path at all. The
+/// widening makes the liaison's ask a `q-N` in the same `questions.json` the
+/// orchestrator's asks land in, with the same asker provenance.
+///
+/// Pinned in four directions, because a grant that is only pinned positively is
+/// indistinguishable from a tier promotion:
+///
+/// 1. The liaison CAN pose — at the gate, and the listing agrees.
+/// 2. A plain reviewer in the SAME group CANNOT — the hint is the only
+///    difference between the two blocks, so without this the test pins nothing
+///    about `liaison`.
+/// 3. The widening is the POSE only: `withdraw_question` still refuses it (it
+///    settles a row), and nothing on its surface can answer one.
+/// 4. The answer notice still goes to the ORCHESTRATOR's pane, not the asker's
+///    — `answer_question` delivers through `deliver_to_orchestrator` and this
+///    slice does not touch that. It is what the liaison's own prose promises,
+///    so a future change to the routing must redden here rather than quietly
+///    make that prose false.
+#[test]
+fn a_liaison_block_may_pose_a_question_to_the_human() {
+    let (reg, _d, _repo, gid) = liaison_group();
+    let liaison = reviewer_caller(&reg, &gid, "human");
+    let plain = reviewer_caller(&reg, &gid, "rev-security");
+    let orch = reg.spawn_agent(&gid, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let orch_id = orch.id.clone();
+    let orch = reg.resolve_token(&orch.token).unwrap();
+
+    // 1 — the gate, which is the real enforcement.
+    let out = dispatch(&reg, &liaison, "tools/call", &json!({
+        "name": "ask_human",
+        "arguments": { "text": "Ship the redesign this week, or hold it for the release?",
+                       "options": ["ship", "hold"], "task": "t-9" },
+    })).unwrap();
+    assert_eq!(out["isError"], false, "the liaison must be able to pose a question: {out:?}");
+    let reply = out["content"][0]["text"].as_str().unwrap().to_string();
+    assert!(reply.starts_with("q-1 registered"), "…and gets the id back immediately: {reply}");
+
+    // 1a — THE SUCCESS REPLY IS THE CALLER'S, not the orchestrator's (rev-820
+    // B1). This string is read at the moment the pane decides what to do next,
+    // and the orchestrator's version instructs two things a liaison cannot do:
+    // write the board row, and wait for the answer notice in its own pane. A
+    // widened gate that left them there would have told the human's pane to
+    // stall exactly the way this feature exists to stop.
+    assert!(
+        !reply.contains("Mark the affected task blocked"),
+        "a liaison holds no board-write tool — its own mechanics fragment says it writes no \
+         board row, so the reply must not instruct one: {reply}"
+    );
+    assert!(
+        !reply.contains("notice in this pane"),
+        "the answer notice is delivered to the orchestrator, so promising it HERE leaves the \
+         liaison waiting for one that never arrives: {reply}"
+    );
+    assert!(
+        reply.contains("ORCHESTRATOR's pane") && reply.contains("list_questions"),
+        "…and saying where it does NOT go is only half a fix: the reply must say where the \
+         answer actually surfaces and how this pane sees the outcome: {reply}"
+    );
+    assert!(
+        reply.contains("message_orchestrator"),
+        "withdrawing is the orchestrator's, so the reply must name the route for a question \
+         overtaken by events rather than leaving the liaison a tool it has not got: {reply}"
+    );
+    // (The positive control for this branch runs at the end of the test, once
+    // the row-count assertions below have had the single-row board they need.)
+
+    // It landed in the SAME registry the orchestrator's questions land in,
+    // attributed to the liaison — not a parallel record, and not anonymous.
+    let qs = reg.questions(&gid).expect("questions.json readable");
+    assert_eq!(qs.len(), 1, "exactly one row: {qs:?}");
+    assert_eq!(qs[0].id, "q-1");
+    assert_eq!(qs[0].asker, liaison.agent_id, "the asker is the liaison, recorded not inferred");
+    assert_eq!(qs[0].task.as_deref(), Some("t-9"));
+    assert_eq!(qs[0].status, humanq::Status::Pending);
+    // …and the orchestrator reads it as an ordinary pending row of its own
+    // group's inbox, which is the whole point of one registry.
+    let listed = dispatch(&reg, &orch, "tools/call",
+        &json!({ "name": "list_questions", "arguments": {} })).unwrap();
+    let body: Value = serde_json::from_str(listed["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(body["questions"][0]["id"], "q-1");
+    assert_eq!(body["questions"][0]["asker"], liaison.agent_id);
+
+    // The listing agrees with the gate — a pane never shown a tool never calls
+    // it — and offers it EXACTLY once, the failure mode `group_usage`'s own pin
+    // names: two call sites for one shared definition, both reached.
+    let names = listed_tools(&reg, &liaison);
+    assert!(names.contains(&"ask_human".to_string()),
+        "a liaison must be OFFERED the tool, not merely permitted it: {names:?}");
+    assert_eq!(names.iter().filter(|n| *n == "ask_human").count(), 1,
+        "one definition, one listing per caller — never both call sites: {names:?}");
+
+    // 2 — THE NEGATIVE CONTROL. Same class, same group, same registry; the hint
+    // is the only difference. Without this, every assertion above would hold in
+    // a build that had simply made `ask_human` shared with every reviewer.
+    let plain_names = listed_tools(&reg, &plain);
+    assert!(!plain_names.contains(&"ask_human".to_string()),
+        "a plain reviewer must not even see it: {plain_names:?}");
+    let denied = dispatch(&reg, &plain, "tools/call", &json!({
+        "name": "ask_human", "arguments": { "text": "may I?" },
+    })).unwrap();
+    assert_eq!(denied["isError"], true, "…and must be refused at the gate, not only unlisted");
+    let text = denied["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("liaison"),
+        "the refusal must name the rule it is applying: {text}");
+    // The refusal names THIS capability, not the other caller's. One shared gate
+    // whose message was written for `group_usage` would tell a reviewer refused
+    // `ask_human` that usage aggregation is orchestrator-only.
+    assert!(text.contains("posing a question to the human"),
+        "the refusal must name what was refused: {text}");
+    assert_eq!(reg.questions(&gid).unwrap().len(), 1, "a refused ask registers nothing");
+
+    // 3 — THE WIDENING IS THE POSE ONLY. Withdrawal settles a row — any pending
+    // row, not just your own — and stays the orchestrator's.
+    let refused = dispatch(&reg, &liaison, "tools/call", &json!({
+        "name": "withdraw_question", "arguments": { "id": "q-1" },
+    })).unwrap();
+    assert_eq!(refused["isError"], true, "a liaison must not settle a row it opened");
+    assert!(refused["content"][0]["text"].as_str().unwrap().contains("orchestrator-only"),
+        "…and the refusal says why: {refused:?}");
+    assert!(!names.contains(&"withdraw_question".to_string()),
+        "…and it is not even offered: {names:?}");
+    assert_eq!(reg.questions(&gid).unwrap()[0].status, humanq::Status::Pending,
+        "the refused withdraw settled nothing");
+
+    // 4 — THE ANSWER STILL REACHES THE ORCHESTRATOR, not the asker. Un-blocking
+    // the work is what an answer is for, and only the orchestrator writes the
+    // board; the liaison's own prose tells it to re-read `list_questions`
+    // instead, so this routing is a promise and not an accident.
+    pause_with_pane(&reg, &gid, &orch_id, 7);
+    reg.answer_question(&gid, "q-1", "hold it", humanq::AnswerSource::Webview)
+        .expect("the webview may answer a liaison's question exactly as it answers any other");
+    let texts = delivered_texts(&reg, &gid);
+    assert!(
+        texts.iter().any(|t| t.contains("[loomux] answer to q-1 (via webview): hold it")),
+        "the answer notice goes to the orchestrator's pane: {texts:?}"
+    );
+    assert_eq!(reg.questions(&gid).unwrap()[0].status, humanq::Status::Answered);
+
+    // 1a's POSITIVE CONTROL, deferred to here so the row counts above stay
+    // single-row. Every "the liaison's reply must not say X" assertion is
+    // satisfied just as well by a build that deleted the guidance for BOTH
+    // callers — which would be a regression on the orchestrator's own protocol
+    // rather than a fix. So the orchestrator, in this same group, must still
+    // get exactly the two clauses the liaison must not, and must not get the
+    // liaison's.
+    let orch_reply = dispatch(&reg, &orch, "tools/call", &json!({
+        "name": "ask_human", "arguments": { "text": "and one the orchestrator asks?" },
+    })).unwrap()["content"][0]["text"].as_str().unwrap().to_string();
+    assert!(
+        orch_reply.contains("Mark the affected task blocked")
+            && orch_reply.contains("notice in this pane"),
+        "the orchestrator's own reply keeps its board-row and own-pane clauses — the branch is \
+         per-caller, not a deletion: {orch_reply}"
+    );
+    assert!(
+        !orch_reply.contains("ORCHESTRATOR's pane"),
+        "…and neither reply is the other's: the orchestrator must not be told its own answer \
+         arrives somewhere else: {orch_reply}"
+    );
 }
 
 #[test]
@@ -48507,7 +49051,16 @@ fn ask_human_registers_a_pending_question_and_answers_the_caller_immediately() {
     assert_eq!(q.id, "q-1");
     assert_eq!(q.asker, orch_id, "the asker is recorded, not inferred");
     assert_eq!(q.text, "Ship the rename in this PR or split it?", "text is trimmed");
-    assert_eq!(q.options, vec!["ship it here".to_string(), "split it".to_string()]);
+    // Re-spelled for `OptionSpec` (#1091), asserting the same thing it always
+    // did: a Q1-shaped call — bare strings, nothing richer — still stores
+    // exactly those strings.
+    assert_eq!(
+        q.options,
+        vec![
+            humanq::OptionSpec::Plain("ship it here".to_string()),
+            humanq::OptionSpec::Plain("split it".to_string()),
+        ]
+    );
     assert_eq!(q.task.as_deref(), Some("t-4"));
     assert_eq!(q.urgency, humanq::Urgency::High);
     assert_eq!(q.status, humanq::Status::Pending);
@@ -48521,15 +49074,23 @@ fn ask_human_registers_a_pending_question_and_answers_the_caller_immediately() {
     assert_eq!(opened[0].actor, orch_id);
 }
 
-/// **The write tools are orchestrator-only at the DISPATCH gate**, and the
-/// read tool is deliberately not.
+/// **The write tools refuse a delegate at the DISPATCH gate**, and the read
+/// tool is deliberately not.
 ///
 /// The role-filtered listing is cosmetic — a tool omitted from a listing is
 /// still callable by name — so what matters is that a worker's *call* is
 /// refused. `list_questions` is shared on purpose: a delegate reading that a
 /// question it depends on is already outstanding is the opposite of a leak.
+///
+/// Named for the DELEGATE it refuses rather than for the tier it admits, since
+/// #1091 slice E: the two write tools are no longer gated alike — `ask_human`
+/// is the orchestrator's plus a `liaison`-hinted reviewer's, `withdraw_question`
+/// the orchestrator's alone. A plain worker, which is what this test drives, is
+/// refused both either way. `a_liaison_block_may_pose_a_question_to_the_human`
+/// owns the hint-keyed half, including the negative control that a *hintless*
+/// reviewer is refused too.
 #[test]
-fn the_question_write_tools_are_orchestrator_only_and_the_dispatch_check_is_the_gate() {
+fn the_question_write_tools_refuse_a_delegate_and_the_dispatch_check_is_the_gate() {
     let (reg, _d, g, co, cw, _) = setup_questions();
     q_call(&reg, &co, "ask_human", json!({ "text": "A or B?" }));
 
@@ -49220,4 +49781,281 @@ fn retention_drops_old_settled_rows_and_never_a_pending_one() {
     let ids: Vec<String> = reg.questions(&g).unwrap().into_iter().map(|q| q.id).collect();
     let fresh = ids.last().unwrap();
     assert_eq!(fresh, &format!("q-{}", settled + 5), "{ids:?}");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// The ask SHAPE (#1091 slice A)
+//
+// What a human is offered when a question reaches them: named alternatives
+// that can carry the trade-off under the label, one pick or several, and — by
+// default, always — the ability to type an answer nobody listed. The panel
+// that renders it is a later slice; these pin that the shape survives the
+// engine, since a durable record is the only thing a renderer can render.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// An option can carry the trade-off under its label — and an option that
+/// carries none is stored as the bare string it was in Q1.
+///
+/// Split from the pick-shape test below rather than asserted alongside it: an
+/// `assert` that panics stops the test, so two properties in one test means a
+/// mutation of the second can never be evidenced.
+#[test]
+fn ask_human_carries_option_descriptions_and_stores_the_rest_as_plain_strings() {
+    let (reg, dir, g, co, cw, _) = setup_questions();
+
+    let out = q_call(&reg, &co, "ask_human", json!({
+        "text": "Which platforms must go green before this merges?",
+        "options": [
+            { "label": "  all three  ", "description": "  slowest, and the only claim CI can back  " },
+            { "label": "windows only", "description": "" },
+            "ubuntu only"
+        ],
+        "task": "t-4",
+    }));
+    assert_eq!(out["isError"], false, "{}", q_text(&out));
+
+    let q = reg.questions(&g).expect("questions.json readable").remove(0);
+    assert_eq!(
+        q.options,
+        vec![
+            humanq::OptionSpec::Detailed {
+                label: "all three".to_string(),
+                description: "slowest, and the only claim CI can back".to_string(),
+            },
+            // Given as an object, stored as the string it is: an option with
+            // an empty description is not an option that HAS a description.
+            humanq::OptionSpec::Plain("windows only".to_string()),
+            humanq::OptionSpec::Plain("ubuntu only".to_string()),
+        ],
+        "label and description are trimmed, and a description-less option normalizes to a string"
+    );
+    assert_eq!(q.options[0].label(), "all three");
+    assert_eq!(q.options[0].description(), Some("slowest, and the only claim CI can back"));
+    assert_eq!(q.options[1].description(), None, "an empty description never reaches a renderer");
+
+    // The FILE, not just the parsed struct: the object form appears exactly
+    // where a description was actually given, so a build that never uses
+    // descriptions goes on writing what Q1 wrote.
+    let raw: Value = serde_json::from_str(
+        &fs::read_to_string(dir.path().join(g.as_str()).join("questions.json")).unwrap(),
+    )
+    .expect("questions.json is valid json");
+    assert_eq!(raw[0]["options"][0]["label"], "all three", "{}", raw[0]["options"]);
+    assert_eq!(raw[0]["options"][1], json!("windows only"), "{}", raw[0]["options"]);
+    assert_eq!(raw[0]["options"][2], json!("ubuntu only"), "{}", raw[0]["options"]);
+
+    // …and it reaches the read tier both roles share, which is where the
+    // NEEDS-YOU panel and any presenting agent will find it.
+    let listed = q_call(&reg, &cw, "list_questions", json!({}));
+    let body: Value = serde_json::from_str(&q_text(&listed)).unwrap();
+    assert_eq!(
+        body["questions"][0]["options"][0]["description"],
+        "slowest, and the only claim CI can back"
+    );
+}
+
+/// How many picks, and whether the human may write their own answer — carried
+/// when the ask says so, and permissive when it does not.
+#[test]
+fn ask_human_carries_the_pick_shape_and_defaults_to_the_human_keeping_their_own_words() {
+    let (reg, dir, g, co, _cw, _) = setup_questions();
+
+    let out = q_call(&reg, &co, "ask_human", json!({
+        "text": "Which platforms must go green before this merges?",
+        "options": ["ubuntu", "windows", "macos"],
+        "select": "multi",
+        "allow_free_text": false,
+    }));
+    assert_eq!(out["isError"], false, "{}", q_text(&out));
+
+    let q = reg.questions(&g).expect("questions.json readable").remove(0);
+    assert_eq!(q.select, humanq::Select::Multi, "the ask said several picks are legitimate");
+    assert!(!q.allow_free_text, "the ask closed the free-text escape explicitly");
+    let raw: Value = serde_json::from_str(
+        &fs::read_to_string(dir.path().join(g.as_str()).join("questions.json")).unwrap(),
+    )
+    .expect("questions.json is valid json");
+    assert_eq!(raw[0]["select"], "multi", "the pick shape is durable, not a parse-time nicety");
+    assert_eq!(raw[0]["allow_free_text"], false);
+
+    // THE DEFAULT IS THE PERMISSIVE ONE. An ask that offers options and says
+    // nothing else still leaves the human able to answer something the
+    // orchestrator did not think of — the affordance this slice exists for,
+    // and the one a `false` default would silently take away.
+    q_call(&reg, &co, "ask_human", json!({ "text": "A or B?", "options": ["A", "B"] }));
+    let quiet = reg.questions(&g).unwrap().remove(1);
+    assert!(
+        quiet.allow_free_text,
+        "an ask that said nothing must not close the human's escape hatch"
+    );
+    assert_eq!(quiet.select, humanq::Select::Single, "…and a question is a decision by default");
+}
+
+/// **The no-migration claim, tested against a file rather than asserted.**
+///
+/// The rows in `questions.json` when this ships are questions a human has not
+/// answered yet — the one thing the registry exists to not lose. So a file
+/// written by the Q1 build (bare-string options, no `select`, no
+/// `allow_free_text`) must load, list, and take a new ask appended beside it,
+/// with the defaults read as what those rows always meant.
+#[test]
+fn a_questions_file_written_by_the_q1_build_loads_unmigrated() {
+    let (reg, dir, g, co, _cw, _) = setup_questions();
+
+    // Verbatim Q1 shape: every field it wrote, and not one this slice added.
+    let q1_file = r#"[
+      {
+        "id": "q-1",
+        "asker": "orch-1",
+        "text": "Ship the rename in this PR or split it?",
+        "options": ["ship it here", "split it"],
+        "task": "t-4",
+        "urgency": "high",
+        "status": "pending",
+        "created_ms": 1750000000000
+      }
+    ]"#;
+    let path = dir.path().join(g.as_str()).join("questions.json");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, q1_file).unwrap();
+
+    let qs = reg.questions(&g).expect("a Q1-shaped file still parses");
+    assert_eq!(qs.len(), 1, "the pending row a human has not answered is still there");
+    assert_eq!(
+        qs[0].options,
+        vec![
+            humanq::OptionSpec::Plain("ship it here".to_string()),
+            humanq::OptionSpec::Plain("split it".to_string()),
+        ],
+        "bare-string options are still options"
+    );
+    assert_eq!(qs[0].select, humanq::Select::Single, "an absent select reads as one pick");
+    assert!(
+        qs[0].allow_free_text,
+        "an absent allow_free_text must read as TRUE — free text was the only answer surface \
+         those rows were ever written for, and defaulting it to false would retroactively take \
+         the human's answer away"
+    );
+
+    // It lists, and a new ask lands beside it — the read-modify-write path a
+    // parse failure would have turned into a data loss.
+    let listed = q_call(&reg, &co, "list_questions", json!({}));
+    let body: Value = serde_json::from_str(&q_text(&listed)).unwrap();
+    assert_eq!(body["questions"][0]["id"], "q-1");
+    q_call(&reg, &co, "ask_human", json!({ "text": "and the next one?" }));
+    let after = reg.questions(&g).unwrap();
+    assert_eq!(after.len(), 2, "the old row survived the rewrite");
+    assert_eq!(after[1].id, "q-2", "the id high-water mark was read off the old file");
+
+    // The rewrite did not restyle what it did not change: the old row's
+    // options are still bare strings on disk.
+    let raw: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(raw[0]["options"], json!(["ship it here", "split it"]), "{}", raw[0]);
+}
+
+/// The refusals. Each is a shape whose acceptance would leave the human worse
+/// off than the refusal does — a choice they cannot make, a field that did
+/// nothing, or a description truncated where the trade-off was.
+#[test]
+fn ask_human_refuses_a_shape_that_would_reach_the_human_broken() {
+    let (reg, _d, g, co, _cw, _) = setup_questions();
+
+    let cases: [(&str, Value, &str); 8] = [
+        (
+            "an unknown select",
+            json!({ "text": "pick", "options": ["a", "b"], "select": "multiple" }),
+            "unknown select",
+        ),
+        (
+            "select with nothing to select from",
+            json!({ "text": "pick", "select": "multi" }),
+            "select needs options",
+        ),
+        (
+            "no options and no free text — nothing to answer with",
+            json!({ "text": "pick", "allow_free_text": false }),
+            "allow_free_text: false needs options",
+        ),
+        (
+            "a description past the cap",
+            json!({ "text": "pick", "options": [
+                { "label": "a", "description": "x".repeat(humanq::OPTION_DESC_MAX + 1) }
+            ] }),
+            "max",
+        ),
+        (
+            "a label past the cap, in the object form",
+            json!({ "text": "pick", "options": [{ "label": "x".repeat(humanq::OPTION_TEXT_MAX + 1) }] }),
+            "max",
+        ),
+        (
+            "an option object with no label",
+            json!({ "text": "pick", "options": [{ "description": "why" }] }),
+            "needs a string \"label\"",
+        ),
+        (
+            "an option that is neither string nor object",
+            json!({ "text": "pick", "options": [7] }),
+            "array of answer-option strings",
+        ),
+        // rev-802 N3: the description's own type check. Its two neighbours (a
+        // non-string label, a non-object item) were covered and this branch was
+        // not — and a wrong-typed description is the likeliest of the three to
+        // arrive, since it is the field an agent composes rather than names.
+        (
+            "an option description that is not a string",
+            json!({ "text": "pick", "options": [{ "label": "a", "description": 7 }] }),
+            "\"description\" must be a string",
+        ),
+    ];
+    for (what, args, needle) in cases {
+        let out = q_call(&reg, &co, "ask_human", args);
+        assert_eq!(out["isError"], true, "{what} must be refused");
+        assert!(q_text(&out).contains(needle), "{what}: {}", q_text(&out));
+    }
+    assert!(reg.questions(&g).unwrap().is_empty(), "no refused ask left a record behind");
+
+    // A description at the cap is accepted — the refusals above are bounds,
+    // not a narrower shape smuggled in as validation.
+    let at_cap = q_call(&reg, &co, "ask_human", json!({ "text": "pick", "options": [
+        { "label": "a", "description": "x".repeat(humanq::OPTION_DESC_MAX) }
+    ] }));
+    assert_eq!(at_cap["isError"], false, "{}", q_text(&at_cap));
+    assert_eq!(
+        reg.questions(&g).unwrap()[0].options[0].description().map(str::len),
+        Some(humanq::OPTION_DESC_MAX),
+        "an at-cap description is stored WHOLE — this validator refuses, it never truncates"
+    );
+
+    // rev-802 N2: the ASYMMETRY between the two options-less refusals is
+    // deliberate, and pinned here because the obvious-looking symmetry —
+    // refusing whenever `allow_free_text` was mentioned at all — reads like a
+    // tidy-up and would start refusing a legitimate ask.
+    //
+    // `false` with no options is refused because it leaves the human nothing
+    // to answer with. `true` with no options asks for exactly what an
+    // options-less question already is, so there is no belief to correct and
+    // nothing to refuse. Without this case the tightening passes a green suite.
+    let redundant = q_call(&reg, &co, "ask_human", json!({
+        "text": "an open question that spells out the obvious?",
+        "allow_free_text": true,
+    }));
+    assert_eq!(
+        redundant["isError"], false,
+        "allow_free_text: true with no options AGREES with the default — refusing it would turn \
+         a redundant argument into a failed ask: {}",
+        q_text(&redundant)
+    );
+    assert!(
+        reg.questions(&g).unwrap()[1].allow_free_text,
+        "…and it stores what it asked for"
+    );
+
+    // Same posture as `Urgency::parse`, asserted on the parser itself: an
+    // orchestrator that wrote "multiple" meant the human to be able to pick
+    // several, and filing that as a one-of-N choice loses half the answer.
+    assert!(humanq::Select::parse("multiple").is_err());
+    assert!(humanq::Select::parse("Multi").is_err(), "and it is not case-forgiving either");
+    assert_eq!(humanq::Select::parse("multi").unwrap(), humanq::Select::Multi);
+    assert_eq!(humanq::Select::parse("single").unwrap(), humanq::Select::Single);
 }

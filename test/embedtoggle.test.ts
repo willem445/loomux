@@ -51,7 +51,16 @@ const ALL_ACTIONS: readonly EmbedToggleAction[] = ["open", "close", "noop"];
 // Every `EmbedKind` in pane.ts. Listed literally rather than imported, so this
 // stays a DOM-free unit — and so a kind added to the union without a decision
 // here shows up as a gap a reader can see.
-const ALL_KINDS = ["tasks", "git", "issues", "audit", "group", "editor", "timeline"] as const;
+const ALL_KINDS = [
+  "tasks",
+  "decisions",
+  "git",
+  "issues",
+  "audit",
+  "group",
+  "editor",
+  "timeline",
+] as const;
 
 test("a view-OPEN gesture on a cwd-reading view declares the cwd", () => {
   for (const kind of CWD_DECLARING_VIEWS) {
@@ -81,13 +90,21 @@ test("the docked NO-OP never declares — the gesture did not even do anything",
 });
 
 test("a view that does not read the cwd never declares, in any direction", () => {
-  // The negative control on the OTHER axis. `tasks`/`audit`/`group`/`timeline`
-  // are group-scoped — their repo was declared when the group was created — so
-  // opening one says nothing about this pane's cwd. Without this, a
-  // `toggleDeclaresCwd` that ignored `kind` entirely would pass every assertion
-  // above.
+  // The negative control on the OTHER axis.
+  // `tasks`/`decisions`/`audit`/`group`/`timeline` are group-scoped — their repo
+  // was declared when the group was created — so opening one says nothing about
+  // this pane's cwd. Without this, a `toggleDeclaresCwd` that ignored `kind`
+  // entirely would pass every assertion above.
+  //
+  // `decisions` (#1091) is the first kind added since this guard was written,
+  // and it went in WITHOUT being added here — so the guard silently stopped
+  // covering the newest panel while still passing, which is the one thing the
+  // `ALL_KINDS` comment above promises cannot happen. It fails closed
+  // (`CWD_DECLARING_VIEWS` is git/issues/editor), which is the correct decision
+  // for a group-scoped panel, and now that decision is pinned rather than
+  // merely true.
   const nonDeclaring = ALL_KINDS.filter((k) => !(CWD_DECLARING_VIEWS as readonly string[]).includes(k));
-  assert.deepEqual(nonDeclaring, ["tasks", "audit", "group", "timeline"]);
+  assert.deepEqual(nonDeclaring, ["tasks", "decisions", "audit", "group", "timeline"]);
   for (const kind of nonDeclaring) {
     for (const action of ALL_ACTIONS) {
       assert.equal(toggleDeclaresCwd(kind, action), false, `${kind} + ${action} must NOT declare`);

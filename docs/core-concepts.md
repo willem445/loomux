@@ -215,15 +215,73 @@ instead of an empty listing — pick a new folder and carry on.
 
 ## The split grid
 
-Loomux arranges panes as a **matrix**, not a lopsided staircase:
-
 - **Split right** (`Ctrl+Shift+E`) adds a pane beside the current one.
 - **Split down** (`Ctrl+Shift+O`) adds one below.
 
-Splitting again *in the same direction* adds a sibling column or row, so
-repeated splits build an even grid instead of nesting ever-smaller boxes.
+**A split only ever spends the pane you are in.** The pane you split gives up
+half its space to the new one, and every other pane keeps its share of the
+screen: the layout doesn't re-flow around the new pane. The only thing that
+shifts your other panes is the new divider itself, which takes a few pixels of
+row for its own — about one pixel per pane in a typical layout. So the pane you
+split repaints, and the rest normally don't: occasionally one sits close enough
+to a character-cell boundary that losing that pixel costs it a column, and it
+repaints too. Splitting is a local edit, not a rearrangement of the tab.
 
-Drag the divider between two panes to **resize** them.
+Panes stay in a flat row or column as you split within one, so the dividers keep
+working the obvious way: dragging one trades space between its two neighbours
+only. Drag the divider between two panes to **resize** them, and a divider you
+moved stays where you put it.
+
+When you launch **several agents at once** from one welcome screen, they are
+placed differently on purpose: the fleet is spread evenly across the tab as a
+matrix, alternating rows and columns, rather than each new agent halving what is
+left of the last one (which would end in unreadable slivers). A pane rejoining
+the grid from the dock arrives the same way — it is the grid making room, not
+you spending a pane.
+
+**Closing a pane** hands its space back to the panes beside it in equal parts,
+so the smallest pane gains the most. Close one of five equal panes and the other
+four are four equal panes again.
+
+### Autosize
+
+Layouts drift, and after all of the above there are three reasons rather than
+one.
+
+**Halving.** A split spends the pane you are in, so splitting again and again
+into the newest pane walks the sizes down — a half, a quarter, an eighth. That
+is the deliberate cost of a split being local, and it is also the fastest way to
+end up looking at slivers.
+
+**Nesting.** Even placement is even *within one row or column*. Split *down*
+inside a pane of a row and that pane's slot becomes a stacked pair: the row is
+now shared between the panes beside it and the **pair**, so those come out as a
+half and two quarters rather than three thirds. An orchestrator opening a pane
+per agent nests the same way.
+
+**Dividers you dragged stay dragged** — deliberately, since a position you chose
+is not drift.
+
+**Autosize** (`Ctrl+Shift+A`, or the `▦` button in the top bar) gives every pane
+in the tab an equal share of the space, in one press — *across* nesting levels,
+which is the part a split's own arithmetic cannot do for you. That half and two
+quarters becomes three equal thirds.
+
+It happens only when you ask. A split spends the pane you are in, and a close
+gives that pane's space to its neighbours — both stay inside the row or column
+they happened in — but nothing levels the whole tab behind your back, and a
+divider you positioned deliberately stays where you put it until you press
+Autosize. Pressing it twice does nothing the second time, and the evened-out
+layout is what a restored session comes back to.
+
+If a pane is maximized, Autosize **drops you out of fullscreen first** — unlike
+a background pane joining the grid, which deliberately leaves fullscreen alone.
+Evening out a grid you cannot see would look like the button did nothing.
+
+Two things it can't do: panes have a minimum size, so a tab holding more panes
+than fit at that minimum can't have them all equal; and panes end up with equal
+*area*, not identical shapes — Autosize re-sizes the grid you have, it never
+rearranges which panes sit beside which.
 
 ### Rearranging without re-splitting
 
@@ -234,7 +292,9 @@ be rearranged in place:
   another. A snap preview shows where it will land:
   - drop on the **middle** to *swap* the two panes, or
   - drop on an **edge** (left/right/top/bottom half) to move the pane there,
-    re-splitting the target.
+    splitting the target — which, like any split, hands over half of *that*
+    pane's space. (Dragging a pane *out* of a row re-shares that row's space
+    among the panes left behind.)
 
   Release to drop, or press `Esc` to cancel. Swapping two equally-sized slots
   never resizes their terminals, so no scrollback is disturbed.
@@ -246,11 +306,41 @@ be rearranged in place:
 - **Minimize** (`Alt+M` or the — button) parks a pane in the **dock** strip at
   the bottom of the grid — it keeps running. Click its chip to bring it back, or
   the chip's ✕ to close it for good.
-- **Fold a whole group** — an orchestrator pane has a fold toggle (the stacked
-  panes icon) that minimizes *every* worker/reviewer pane in its group to the
+- **Fold a whole group** — an orchestrator pane has a fold toggle (the collapsing
+  chevrons) that minimizes *every* worker/reviewer pane in its group to the
   dock at once, leaving just the orchestrator. Click again to restore them all.
   Handy once a big group has opened a pane per agent and you want the screen
   back. (More in the [orchestration guide](orchestration.html).)
+- **Which agent CLI is this?** A pane launched with an agent wears a small mark at
+  the far left of its header, before the role badge — **in that CLI's own colour**,
+  so you can tell a Copilot pane from a Claude one across a wall of terminals
+  without reading the titles. Each CLI loomux ships support for has its own hue
+  (Claude terracotta, Codex teal, Copilot blue, opencode green, Gemini indigo,
+  Hermes magenta, Ante citron); anything else keeps the violet that just means
+  "an agent". The same colours mark the CLI chips in the session list. Agents with
+  a recognisable mark show it; everything else shows a
+  lettered badge with the program's initial (`C` for Claude, `O` for opencode),
+  and `?` if loomux couldn't make out what was launched. Hover it for the program
+  name. A plain shell pane has no agent, so it carries no mark at all. An **SSH
+  pane** shows the CLI its saved connection runs on the far end — not `ssh`,
+  which is only the transport getting you there; if the connection doesn't name
+  a CLI, you get the neutral `?` rather than a guess.
+
+> **The icons are colour-coded, and the colour means something.** A mark's hue
+> says *which kind of thing* it is, not what state it's in: cyan for your
+> workspace (folders, paths, the file actions), amber for code you edit, jade
+> for data and documents you read, lime for git, violet for agents in general,
+> orchid for the group's boards (tasks, issues, audit, timeline),
+> rose for anything destructive, azure while the mic is capturing. Agent *state*
+> is deliberately never carried by an icon — it has its own signals, so the two
+> never compete for your attention. This legend is about **icon** marks
+> specifically, and the one exception is the agent mark: it wears its *own CLI's*
+> colour when loomux has one for that program, and falls back to the violet above
+> when it doesn't. The same hue can mean something else elsewhere on screen — lime
+> also marks a human actor in the audit log and GitHub timeline, for instance,
+> and orchid also colours the prototype task column — as the rest of the
+> interface adopts this palette. The file tree uses the same scheme, which is
+> why a listing separates folders from code from config at a glance.
 
 > **Why overlays, never re-splits, for the git/issues/board/audit panels:**
 > resizing a PTY forces the program inside it to repaint, which pollutes
@@ -362,12 +452,13 @@ this table mirrors it.
 | Move focus | `Alt+←/→/↑/↓` (or click) |
 | Resize panes | drag the divider between them |
 | Reorder / move panes | drag a pane by its header |
+| Autosize panes | `Ctrl+Shift+A` (or ▦ in the top bar) |
 | Maximize pane | `Ctrl+Shift+M` (or ⤢); same keys restore |
 | Minimize pane | `Alt+M` (or —); restore from the dock |
 | Session browser | `Ctrl+Shift+P` (or the *sessions* button) |
 | Open in editor | `Alt+E` (or the `</>` button in a pane header) |
-| Git view | `Alt+G` (or the ⑂ icon) |
-| GitHub issues view | `Alt+I` (or the ◉ icon) |
+| Git view | `Alt+G` (or the lime commit-graph icon) |
+| GitHub issues view | `Alt+I` (or the orchid ◉ icon) |
 | Voice prompt | `Alt+S` (push-to-talk; `Esc` cancels) |
 | Copy / paste | `Ctrl+C` (with a selection) / `Ctrl+Shift+C`, `Ctrl+Shift+V` (`Ctrl+V` also pastes by default — [Settings](#settings)) |
 

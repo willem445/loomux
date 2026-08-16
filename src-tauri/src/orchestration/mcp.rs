@@ -334,15 +334,63 @@ fn group_usage_tool() -> Value {
         }), &[])
 }
 
+/// `ask_human`'s definition, written once because TWO tiers list it: the
+/// orchestrator's, and the liaison's second hint-keyed widening (#1091 slice
+/// E). Shared for the reason [`group_usage_tool`] is — two copies of a
+/// description this long drift, and the two panes that can pose a question
+/// reading different accounts of what makes a good one is exactly the
+/// authoring-standard split the single funnel exists to prevent.
+///
+/// The description is written for the orchestrator and then says, in its own
+/// paragraph, which of its sentences a liaison must read differently: a liaison
+/// writes no board row, cannot withdraw, and — because `answer_question`
+/// delivers through `deliver_to_orchestrator` — is not the pane the answer
+/// notice arrives in. Naming those three in the tool text rather than only in
+/// `doc/design/liaison.md` is deliberate: the description is what the pane
+/// actually reads.
+fn ask_human_tool() -> Value {
+    tool("ask_human",
+        "Put a question to the human WITHOUT BLOCKING, and keep orchestrating. This returns a question id IMMEDIATELY — it does not wait for an answer and never can. USE THIS INSTEAD OF YOUR CLI'S OWN INTERACTIVE QUESTION DIALOG, always: while such a dialog is on your screen this pane cannot take ANY delivery, so every worker report, review verdict and merge request queues behind it — one question asked while the human is away has already stalled a whole fleet overnight, and that incident is why this tool exists. After calling it: mark the affected board task `blocked` citing the returned id, then GO DO OTHER WORK — review, dispatch, merge, everything not gated on this answer. The answer arrives later as a `[loomux] answer to q-N (via <source>): …` notice typed into this pane, at which point you un-block ONLY the task that was waiting on it. If nothing arrives, the question simply stays pending: read `list_questions` (it survives a /compact and an app restart, so it is your memory of what is outstanding, not your context), re-surface it in your next status update, and keep working. WHAT MAKES A GOOD QUESTION: self-contained — the human may read it away from the machine, with no pane in front of them. State the decision you need and what turns on it; cite the issue or PR by number for the detail rather than pasting diffs, file contents or logs; never include secrets. Give `options` when the decision really is a choice between named alternatives — it is what lets an answering surface offer buttons instead of prose — and give each one a `description` when the label alone does not carry the trade-off. THE HUMAN CAN ALWAYS TYPE THEIR OWN ANSWER INSTEAD: your options are the alternatives you thought of, and the one that matters is often the one you did not list, so leave `allow_free_text` at its default unless the options are genuinely exhaustive. Use `select: \"multi\"` only when the ask really is \"which of these\" rather than \"which one\". Give `task` so the answer can be tied back to the board row it releases. You cannot answer your own question, and neither can any other agent: answers only ever enter through surfaces the human controls. \
+         \
+         IF YOU ARE THE LIAISON, three of the sentences above are the orchestrator's and not yours, and this is the whole of the difference. (1) You write no board row — say what is outstanding in your own pane instead, and never ask the orchestrator to mark one on your behalf. (2) The answer notice is delivered to the ORCHESTRATOR's pane, not yours, because un-blocking the work is what an answer is for; `list_questions` is how you see what became of a question you asked, and it is durable across your own compact and a restart. (3) You cannot `withdraw_question` — that settles a row, and a row you no longer need is one you tell the orchestrator about. Everything else is yours exactly as written, and this tool is the reason a decision the human should make LATER, away from this pane, does not have to be a line of scrollback they never scroll back to.",
+        json!({
+            "text": { "type": "string", "description": "The question, self-contained and standing on its own away from this machine. Max 2000 characters — this is a decision to ask, not a briefing to paste; cite issue/PR numbers for the context." },
+            "options": {
+                "type": "array",
+                // A bare string OR {label, description?} — the string
+                // form is what Q1 took and is still what gets stored
+                // when there is no description, so an old caller's
+                // call shape is unchanged (#1091).
+                "items": { "anyOf": [
+                    { "type": "string" },
+                    { "type": "object", "properties": {
+                        "label": { "type": "string" },
+                        "description": { "type": "string" },
+                    }, "required": ["label"] }
+                ] },
+                "description": "Named alternatives, when the decision is a choice between them (max 8). Each is either a bare string, or {\"label\": \"…\", \"description\": \"…\"} when the label alone does not carry what picking it costs — label max 200 characters, description max 500 (the trade-off in a line, not the case for it; cite the issue or PR for that). Omit for an open question — do not invent options to fill the field.",
+            },
+            "select": { "type": "string", "enum": ["single", "multi"], "description": "How many of your options the human may pick. Default \"single\" — a question is a decision. \"multi\" when the ask really is \"which of these\" rather than \"which one\". Needs `options` (it describes them); an unrecognized value is rejected, never treated as single." },
+            "allow_free_text": { "type": "boolean", "description": "Whether the human may type their own answer instead of picking one of your options. DEFAULT TRUE, and leaving it there is almost always right — the answer worth having is often the alternative you did not think to list. Pass false only when your options are genuinely exhaustive; it needs `options`, because a question offering neither options nor free text leaves the human nothing to answer with." },
+            "task": { "type": "string", "description": "The board task id this question is holding up, e.g. \"t-7\". Record it whenever there is one: it is what lets the answer release exactly one task instead of leaving you to work out which. A liaison writes no board row and may still pass one it read from `list_tasks`." },
+            "urgency": { "type": "string", "enum": ["normal", "high"], "description": "How loudly this should reach the human. Default \"normal\". An unrecognized value is rejected, never treated as normal." },
+        }),
+        &["text"])
+}
+
 /// The tool surface is role-filtered so workers never even see privileged
 /// tools; `call_tool` re-checks anyway (listing is cosmetic, not security).
-/// `role_hint` additionally scopes three tools, and NOT all in the same
+/// `role_hint` additionally scopes four tools, and NOT all in the same
 /// direction. Two NARROW the class they sit on: `session_digest` is listed only
 /// for `process`-hinted worker blocks (#250/#324 slice D), and `review_verdict`
-/// is withheld from a `liaison`-hinted reviewer block (#891). One WIDENS:
-/// `group_usage`, `require_orchestrator`-only for every other tier, is listed
-/// for that same liaison (#891 S2) — the first hint-keyed rule on this surface
-/// that yields more than its `kind` alone. Every other tool ignores the hint.
+/// is withheld from a `liaison`-hinted reviewer block (#891). Two WIDEN, both
+/// for that same liaison and both otherwise `require_orchestrator`-only:
+/// `group_usage` (#891 S2), the first hint-keyed rule on this surface that
+/// yields more than its `kind` alone, and `ask_human` (#1091 slice E), which
+/// makes the human's own pane able to open a durable, badged question instead
+/// of relaying one the orchestrator may or may not choose to open. The rest of
+/// the question WRITE tier does not follow it: `withdraw_question` settles a
+/// row and stays orchestrator-only. Every other tool ignores the hint.
 /// `doc/design/liaison.md` enumerates every exception, narrowing and widening
 /// alike.
 ///
@@ -379,9 +427,11 @@ fn tool_defs(
         // `list_tasks`: the orchestrator reads it to re-find what it is waiting
         // on after a compact, and a delegate reads it to see that a question it
         // depends on is already outstanding rather than raising it again. Only
-        // the two WRITE tools below are orchestrator-only — and neither of
-        // them, nor any other tool on this surface, can ANSWER one. See
-        // `humanq`'s module doc for why no answer tool exists at all.
+        // the two WRITE tools below are gated at all — `ask_human` to the
+        // orchestrator plus a liaison, `withdraw_question` to the orchestrator
+        // alone — and neither of them, nor any other tool on this surface, can
+        // ANSWER one. See `humanq`'s module doc for why no answer tool exists
+        // at all.
         tool("list_questions",
             "Read the questions this group has put to the human: `{ questions: [...], omitted_settled: N }`. Every PENDING question is always listed, oldest first — that is the order they should be answered in — followed by the newest settled ones (answered or withdrawn), with `omitted_settled` naming how many older settled rows were left off (0 when none were). Each row carries id, asker, text, options, task, urgency, status, created_ms, and — once settled — answer, settled_by and settled_ms. THIS IS YOUR DURABLE MEMORY OF WHAT YOU ARE WAITING ON: read it on session start and after a /compact instead of trying to recall which questions are outstanding, and re-surface a still-pending one in your status updates rather than stalling on it. Read-only.",
             json!({}), &[]),
@@ -535,7 +585,7 @@ fn tool_defs(
                 "Persist the group's orchestration state (must be a valid JSON string). Call after every queue/plan change; this is your memory across sessions.",
                 json!({ "state": { "type": "string" } }), &["state"]),
             tool("upsert_task",
-                "Create (omit id, title required) or update a task on the shared board. status: queued | in-progress | review | pr | prototype | human-testing | done | blocked. Use `prototype` for a demo-gated draft the human will decide whether to promote — the board shows them a Proceed button, and clicking it prompts you to run the full production build. Keep the board current — it is the human's window into your queue. Record `pr_base` (the branch the PR targets) in the SAME call you record `pr`: the board reads it to tell a merge into the default branch from a sub-PR into an integration branch, and without it the human is shown the conservative default-branch warning either way. note appends a timestamped note. `deps`/`related` record ORDERING STRUCTURE that would otherwise live only in your context and your set_state prose: set `deps` whenever a plan implies one task must finish before another, and read it back as `ready` on list_tasks instead of re-deriving the queue after a compact. Both arrays REPLACE (they are not appends): omit one to leave it untouched, pass [] to clear it. Every id must name a live task on this board — an unknown id, a self-link, or a dep edge that would close a CYCLE is rejected outright (the error names the cycle path), and deleting a task strips its id from every other task's links in the same write. Only `done` satisfies a dep; `related` never blocks anything. `claim: true` (id required) is how you assign work: it refuses unless the task is still `queued`, is unassigned or already assigned to this same agent, and has every dep `done` — then sets assignee + status:in-progress in ONE guarded write, so a re-read after a compact can never hand the same task to a second worker. Re-claiming a task the same agent already holds is an idempotent no-op, so \"did my claim land before the compact?\" is safe to just ask again. A refused claim is the board telling you the task is taken or blocked; read the error, don't retry it as a plain assignee write. `parent`/`kind` give the board HIERARCHY, which is containment where `deps` is ordering — orthogonal (a dep may cross subtrees; nesting is never itself an edge) but not independent, since readiness reads both, and you will normally want both. The pattern: create the high-level item once (`kind: \"epic\"` or `\"feature\"`, no parent), then create each concrete slice with `parent` set to it AND per-slice `deps` for the order they must land in. That way one list_tasks answers both \"what is this work made of\" and \"what is startable right now\" — `ready` at slice granularity, instead of you re-deriving the queue from prose after a compact. Rows carry `children`/`children_done` counts so you can see a container's progress without walking the board yourself. Levels are advisory and a container is ordinary claimable work. Hierarchy is read as a HINT — a slice under a container with unmet deps reads `ready: false` — and never as a gate: no permission, no merge decision, and not even `claim` reads it (a claim is judged on the row's OWN deps).",
+                "Create (omit id, title required) or update a task on the shared board. status: queued | in-progress | review | pr | prototype | human-testing | done | blocked. Use `prototype` for a demo-gated draft the human will decide whether to promote — the board shows them a Proceed button, and clicking it prompts you to run the full production build. Record `demo_path` (the worktree path the demo runs from) in the SAME call whenever you park a task at `prototype` or `human-testing` — it retires the ad-hoc \"prepped a worktree, pinged the pane\" pattern by telling the human exactly where to go run it. Keep the board current — it is the human's window into your queue. Record `pr_base` (the branch the PR targets) in the SAME call you record `pr`: the board reads it to tell a merge into the default branch from a sub-PR into an integration branch, and without it the human is shown the conservative default-branch warning either way. note appends a timestamped note. `deps`/`related` record ORDERING STRUCTURE that would otherwise live only in your context and your set_state prose: set `deps` whenever a plan implies one task must finish before another, and read it back as `ready` on list_tasks instead of re-deriving the queue after a compact. Both arrays REPLACE (they are not appends): omit one to leave it untouched, pass [] to clear it. Every id must name a live task on this board — an unknown id, a self-link, or a dep edge that would close a CYCLE is rejected outright (the error names the cycle path), and deleting a task strips its id from every other task's links in the same write. Only `done` satisfies a dep; `related` never blocks anything. `claim: true` (id required) is how you assign work: it refuses unless the task is still `queued`, is unassigned or already assigned to this same agent, and has every dep `done` — then sets assignee + status:in-progress in ONE guarded write, so a re-read after a compact can never hand the same task to a second worker. Re-claiming a task the same agent already holds is an idempotent no-op, so \"did my claim land before the compact?\" is safe to just ask again. A refused claim is the board telling you the task is taken or blocked; read the error, don't retry it as a plain assignee write. `parent`/`kind` give the board HIERARCHY, which is containment where `deps` is ordering — orthogonal (a dep may cross subtrees; nesting is never itself an edge) but not independent, since readiness reads both, and you will normally want both. The pattern: create the high-level item once (`kind: \"epic\"` or `\"feature\"`, no parent), then create each concrete slice with `parent` set to it AND per-slice `deps` for the order they must land in. That way one list_tasks answers both \"what is this work made of\" and \"what is startable right now\" — `ready` at slice granularity, instead of you re-deriving the queue from prose after a compact. Rows carry `children`/`children_done` counts so you can see a container's progress without walking the board yourself. Levels are advisory and a container is ordinary claimable work. Hierarchy is read as a HINT — a slice under a container with unmet deps reads `ready: false` — and never as a gate: no permission, no merge decision, and not even `claim` reads it (a claim is judged on the row's OWN deps).",
                 json!({
                     "id": { "type": "string", "description": "Existing task id; omit to create" },
                     "title": { "type": "string" },
@@ -543,6 +593,7 @@ fn tool_defs(
                     "issue": { "type": "string", "description": "GitHub issue ref, e.g. #12" },
                     "pr": { "type": "string", "description": "PR ref or URL" },
                     "pr_base": { "type": "string", "description": "Branch the PR targets, as gh reports it (`gh pr view --json baseRefName`): `main`, `integration/581`, … Record it whenever you record `pr` — it is what lets the human's board say \"sub-PR into integration/581\" instead of warning about the default-branch merge gate on a PR that isn't one. DISPLAY METADATA ONLY: nothing gates on it, loomux re-resolves the real base ref live for every merge decision, so a wrong value here misleads a human rather than opening a merge." },
+                    "demo_path": { "type": "string", "description": "Worktree path where a demo of this item lives, e.g. \"C:/Projects/loomux-worktrees/<branch>\" — record it whenever you park a task at `prototype` or `human-testing` so the human can go run it directly instead of you pinging a pane. Prefer the worktree you actually built the demo in (often an integration-branch worktree, not any single worker's cwd) — explicit beats inferred. Omit = untouched, EMPTY STRING = clear, same rule as `pr`. DISPLAY METADATA ONLY: nothing gates on it." },
                     "assignee": { "type": "string", "description": "Agent id working on it" },
                     "session": { "type": "string", "description": "Worker session id for this task (enables follow-up resume)" },
                     "note": { "type": "string", "description": "Note to append" },
@@ -561,20 +612,14 @@ fn tool_defs(
                 &[]),
             tool("remove_task", "Delete a task from the shared board. It never cascades: any task whose `parent` was this one is PROMOTED to the nearest surviving ancestor (top level if the whole chain went) in the same write, so deleting a container removes the grouping and never the work items inside it — with their PR and session refs intact. Its id is likewise stripped from every other task's deps/related in that same write.",
                 json!({ "id": { "type": "string" } }), &["id"]),
-            // The human-question registry's WRITE tier (#946). Orchestrator-only
-            // and re-checked in `call_tool` — the listing is cosmetic, the
-            // dispatch check is the gate. A delegate that needs a human decision
-            // routes it through `message_orchestrator`, so there is one funnel
-            // and one authoring standard for what a human is asked.
-            tool("ask_human",
-                "Put a question to the human WITHOUT BLOCKING, and keep orchestrating. This returns a question id IMMEDIATELY — it does not wait for an answer and never can. USE THIS INSTEAD OF YOUR CLI'S OWN INTERACTIVE QUESTION DIALOG, always: while such a dialog is on your screen this pane cannot take ANY delivery, so every worker report, review verdict and merge request queues behind it — one question asked while the human is away has already stalled a whole fleet overnight, and that incident is why this tool exists. After calling it: mark the affected board task `blocked` citing the returned id, then GO DO OTHER WORK — review, dispatch, merge, everything not gated on this answer. The answer arrives later as a `[loomux] answer to q-N (via <source>): …` notice typed into this pane, at which point you un-block ONLY the task that was waiting on it. If nothing arrives, the question simply stays pending: read `list_questions` (it survives a /compact and an app restart, so it is your memory of what is outstanding, not your context), re-surface it in your next status update, and keep working. WHAT MAKES A GOOD QUESTION: self-contained — the human may read it away from the machine, with no pane in front of them. State the decision you need and what turns on it; cite the issue or PR by number for the detail rather than pasting diffs, file contents or logs; never include secrets. Give `options` when the decision really is a choice between named alternatives — it is what lets an answering surface offer buttons instead of prose. Give `task` so the answer can be tied back to the board row it releases. You cannot answer your own question, and neither can any other agent: answers only ever enter through surfaces the human controls.",
-                json!({
-                    "text": { "type": "string", "description": "The question, self-contained and standing on its own away from this machine. Max 2000 characters — this is a decision to ask, not a briefing to paste; cite issue/PR numbers for the context." },
-                    "options": { "type": "array", "items": { "type": "string" }, "description": "Named alternatives, when the decision is a choice between them (max 8, 200 characters each). Omit for an open question — do not invent options to fill the field." },
-                    "task": { "type": "string", "description": "The board task id this question is holding up, e.g. \"t-7\". Record it whenever there is one: it is what lets the answer release exactly one task instead of leaving you to work out which." },
-                    "urgency": { "type": "string", "enum": ["normal", "high"], "description": "How loudly this should reach the human. Default \"normal\". An unrecognized value is rejected, never treated as normal." },
-                }),
-                &["text"]),
+            // The human-question registry's WRITE tier (#946), re-checked in
+            // `call_tool` — the listing is cosmetic, the dispatch check is the
+            // gate. The two halves of this tier are NOT gated alike since #1091
+            // slice E: `ask_human` is the orchestrator's plus the liaison's
+            // (pushed below, next to `group_usage`), while `withdraw_question`
+            // stays orchestrator-only. A delegate that is neither routes a
+            // human decision through `message_orchestrator`.
+            ask_human_tool(),
             tool("withdraw_question",
                 "Take back a pending question that has been overtaken by events — the decision made itself, the work was dropped, or you found the answer elsewhere. The question is marked withdrawn rather than deleted, so a human who was part-way through answering can see what became of it. Refuses a question that is already answered or already withdrawn (you are told which). Withdraw generously: a stale question in the human's inbox costs their attention and teaches them the inbox is noise.",
                 json!({
@@ -647,8 +692,12 @@ fn tool_defs(
             }),
             &["pr", "verdict", "summary"]));
     }
-    // …and the liaison's WIDENING (#891 S2), the other half of the same hint:
-    // `group_usage`, which every other tier reaches only through
+    // …and the liaison's WIDENINGS, the other half of the same hint. Two tools,
+    // argued separately in `doc/design/liaison.md` because they answer to
+    // different bars — the second is a WRITE, so the first's "it only reads"
+    // argument does not carry it.
+    //
+    // `group_usage` (#891 S2), which every other tier reaches only through
     // `require_orchestrator`. "What is this group costing?" is one of the
     // questions the pane exists to answer, and the alternative is the human
     // asking the orchestrator to interrupt its own dispatch loop and relay a
@@ -656,6 +705,16 @@ fn tool_defs(
     // the caller's own group — no cross-group reach, nothing settled, nothing
     // written — which is why widening for it is arguable at all where widening
     // `send_prompt` or a board write would not be.
+    //
+    // `ask_human` (#1091 slice E). What it writes is a row in the HUMAN's own
+    // inbox: it settles nothing, releases no work, grants nothing, and cannot
+    // be answered by the pane that opened it or by any other agent — the
+    // registry's every-agent-may-ask/no-agent-may-answer boundary is untouched,
+    // and `withdraw_question`, which does settle a row, is deliberately NOT
+    // widened alongside it. Without this the liaison's only durable path is
+    // `message_orchestrator`, which becomes a registry row only if the
+    // orchestrator independently chooses to make it one — orchestrator-
+    // controlled, so not the human-facing pane's path at all.
     //
     // Keyed on the CONJUNCTION, not on the hint alone, and that asymmetry with
     // the deny above is deliberate: a DENY keyed on the hint alone fails closed
@@ -665,10 +724,12 @@ fn tool_defs(
     // if some future path ever produced a non-reviewer caller carrying the
     // hint, it gets the narrower answer instead of an orchestrator-only tool.
     //
-    // `call_tool`'s `group_usage` arm re-checks the same conjunction and is the
-    // real gate; this listing is cosmetic, as everywhere else on this surface.
+    // `call_tool`'s `group_usage` and `ask_human` arms re-check the same
+    // conjunction and are the real gate; this listing is cosmetic, as
+    // everywhere else on this surface.
     if role == Role::Reviewer && role_hint == Some("liaison") {
         tools.push(group_usage_tool());
+        tools.push(ask_human_tool());
     }
     // `process`-hinted worker blocks only (#250/#324 slice D binding rider):
     // slice B shipped this gated to worker-kind generally, since `role_hint`
@@ -701,32 +762,64 @@ fn require_orchestrator(caller: &Caller) -> Result<(), String> {
     }
 }
 
-/// `group_usage`'s gate: the orchestrator, plus the one hint-keyed WIDENING on
-/// this surface (#891 S2). See the matching note in [`tool_defs`] for why the
-/// liaison gets this tool and why the check is a conjunction rather than the
-/// hint alone.
+/// The liaison predicate itself — the CONJUNCTION (`kind: reviewer` **and**
+/// `role_hint: liaison`), in one place.
+///
+/// Extracted because it now has a second reader that is not a gate: `ask_human`
+/// branches its SUCCESS reply on it, since two clauses of the orchestrator's
+/// reply ("mark the affected task blocked", "expect a notice in this pane") are
+/// false for a liaison and were reachable the moment the gate widened (rev-820
+/// B1). A second hand-written copy of the conjunction would be a place for the
+/// two to disagree — and "the gate said liaison, the reply said orchestrator"
+/// is precisely the asymmetry CLAUDE.md's guard convention names.
+///
+/// Deliberately placed ABOVE [`require_orchestrator_or_liaison`]'s doc comment
+/// rather than between it and its `fn` — the same rule [`group_usage_tool`]
+/// states for [`tool_defs`] (#1086), and this helper is the second thing in
+/// this file to be caught by it (rev-825). Consecutive `///` lines merge into
+/// one block that attaches to whatever item comes next, so a helper dropped
+/// into that gap silently re-homes the gate's whole rationale onto itself —
+/// "its two callers", the blast-radius sentence and the `what` parameter all
+/// describing a bool predicate that has none of them — and leaves the gate
+/// undocumented, with nothing in the diff that looks wrong.
+fn caller_is_liaison(caller: &Caller) -> bool {
+    caller.role == Role::Reviewer && caller.role_hint.as_deref() == Some("liaison")
+}
+
+/// The gate for the hint-keyed WIDENINGS on this surface: the orchestrator,
+/// plus a `liaison`-hinted reviewer. `group_usage` (#891 S2) and `ask_human`
+/// (#1091 slice E) are its two callers. See the matching note in [`tool_defs`]
+/// for why the liaison gets each of them, and why the check is a conjunction
+/// rather than the hint alone.
 ///
 /// A SEPARATE function from [`require_orchestrator`] on purpose, not a hint arm
 /// added inside it: that one gates roughly twenty tools — `spawn_agent`,
 /// `send_prompt`, `kill_agent`, `set_state`, every board write, the whole merge
 /// queue — and a widening written there would widen all of them at once, which
 /// is precisely the accident a capability widening must not be one edit away
-/// from. The blast radius of this function is exactly one tool.
+/// from. **This function widens nothing on its own**: it is opted into one call
+/// site at a time, so its blast radius is exactly the arms that name it — two
+/// today, each argued in `doc/design/liaison.md` on its own terms. Adding a
+/// third is an edit to that arm and to that note, never to this function.
+///
+/// `what` is the capability being refused, in the refusal's own words
+/// ("usage aggregation", "posing a question to the human"), because a shared
+/// gate whose message named one caller's tool would tell a liaison refused
+/// `ask_human` that *usage aggregation* was orchestrator-only.
 ///
 /// **The hint is not caller-supplied.** `Caller::role_hint` is resolved in
 /// `resolve_token` from the group's own roster, via the block recorded on the
 /// agent at spawn — the same lookup `record_verdict`'s deny layer and
 /// `idle_reap_candidates` make. Nothing an agent can put in a tool argument, a
 /// pane title, or its own prompt reaches this decision.
-fn require_orchestrator_or_liaison(caller: &Caller) -> Result<(), String> {
-    let liaison =
-        caller.role == Role::Reviewer && caller.role_hint.as_deref() == Some("liaison");
-    if caller.role == Role::Orchestrator || liaison {
+fn require_orchestrator_or_liaison(caller: &Caller, what: &str) -> Result<(), String> {
+    if caller.role == Role::Orchestrator || caller_is_liaison(caller) {
         Ok(())
     } else {
-        Err("permission denied: usage aggregation is orchestrator-only, plus this \
-             group's liaison block if it declares one"
-            .into())
+        Err(format!(
+            "permission denied: {what} is orchestrator-only, plus this group's liaison \
+             block if it declares one"
+        ))
     }
 }
 
@@ -798,16 +891,6 @@ fn arg_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
 /// link, and quietly leaving the old array in place would tell it the write
 /// succeeded while the board disagreed.
 fn arg_str_array(args: &Value, key: &str) -> Result<Option<Vec<String>>, String> {
-    arg_str_array_of(args, key, "task-id strings")
-}
-
-/// [`arg_str_array`] with the element noun spelled by the caller (#946).
-///
-/// Split out rather than generalized in place because the message is the
-/// useful half: `options must be an array of task-id strings` sends an agent
-/// looking for a board problem in a question it was asking. The `deps`/
-/// `related` wording is unchanged, byte for byte, by delegating above.
-fn arg_str_array_of(args: &Value, key: &str, noun: &str) -> Result<Option<Vec<String>>, String> {
     match args.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::Array(items)) => items
@@ -815,11 +898,11 @@ fn arg_str_array_of(args: &Value, key: &str, noun: &str) -> Result<Option<Vec<St
             .map(|v| {
                 v.as_str()
                     .map(str::to_string)
-                    .ok_or_else(|| format!("{key} must be an array of {noun}"))
+                    .ok_or_else(|| format!("{key} must be an array of task-id strings"))
             })
             .collect::<Result<Vec<String>, String>>()
             .map(Some),
-        Some(_) => Err(format!("{key} must be an array of {noun}")),
+        Some(_) => Err(format!("{key} must be an array of task-id strings")),
     }
 }
 
@@ -847,10 +930,60 @@ fn arg_str_strict<'a>(args: &'a Value, key: &str) -> Result<Option<&'a str>, Str
 /// is an error rather than a defaulted `false`, so `"claim": "true"` can never
 /// read as "no claim requested" and hand the same task out twice.
 fn arg_bool(args: &Value, key: &str) -> Result<bool, String> {
+    Ok(arg_bool_opt(args, key)?.unwrap_or(false))
+}
+
+/// [`arg_bool`] for a flag whose default is not `false` (#1091:
+/// `allow_free_text`). Absent or null is `None` — "the caller said nothing" —
+/// which is a different fact from `Some(false)` when the default is `true`,
+/// and the only one of the two that may be silently defaulted. The
+/// wrong-type refusal is the same, byte for byte, by delegating below.
+fn arg_bool_opt(args: &Value, key: &str) -> Result<Option<bool>, String> {
     match args.get(key) {
-        None | Some(Value::Null) => Ok(false),
-        Some(Value::Bool(b)) => Ok(*b),
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(b)) => Ok(Some(*b)),
         Some(_) => Err(format!("{key} must be true or false")),
+    }
+}
+
+/// `ask_human`'s `options` (#1091): each item is a bare string, or an object
+/// `{label, description?}`. Absent or null is `None`, like every other
+/// optional array here.
+///
+/// Hand-parsed rather than handed to serde's untagged deserializer because an
+/// untagged enum that matches nothing reports only "data did not match any
+/// variant", which tells an orchestrator neither which item was wrong nor what
+/// the shapes are. Every refusal below names the shape it wanted; bounds and
+/// emptiness are `validate_ask`'s, not repeated here.
+fn arg_option_specs(args: &Value, key: &str) -> Result<Option<Vec<super::humanq::OptionSpec>>, String> {
+    const SHAPE: &str = "must be an array of answer-option strings, or objects \
+                         {\"label\": \"…\", \"description\": \"…\"}";
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|item| match item {
+                Value::String(s) => Ok(super::humanq::OptionSpec::Plain(s.clone())),
+                Value::Object(map) => {
+                    let label = map
+                        .get("label")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| format!("each {key} object needs a string \"label\""))?
+                        .to_string();
+                    let description = match map.get("description") {
+                        None | Some(Value::Null) => String::new(),
+                        Some(Value::String(d)) => d.clone(),
+                        Some(_) => {
+                            return Err(format!("an {key} \"description\" must be a string"))
+                        }
+                    };
+                    Ok(super::humanq::OptionSpec::Detailed { label, description })
+                }
+                _ => Err(format!("{key} {SHAPE}")),
+            })
+            .collect::<Result<Vec<_>, String>>()
+            .map(Some),
+        Some(_) => Err(format!("{key} {SHAPE}")),
     }
 }
 
@@ -971,41 +1104,86 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             Ok(json!({ "questions": rows, "omitted_settled": omitted_settled }).to_string())
         }
         "ask_human" => {
-            // Orchestrator-only in v1: delegates already have
-            // `message_orchestrator`, so questions to the human have one funnel
-            // and one authoring standard. Re-checked here because the listing
-            // is cosmetic.
-            require_orchestrator(caller)?;
+            // The orchestrator, plus a `liaison`-hinted reviewer (#1091 slice
+            // E). Every OTHER delegate still routes a human decision through
+            // `message_orchestrator`: one funnel and one authoring standard is
+            // the rule, and the liaison is not an exception to it but the other
+            // end of it — the pane the human is actually talking to, whose
+            // asks would otherwise become durable rows only when the
+            // orchestrator independently chose to make them ones. Posing is all
+            // that widens: `withdraw_question` (the arm below) settles a row and
+            // stays orchestrator-only, and NOTHING here can answer one. Re-
+            // checked here because the listing is cosmetic.
+            require_orchestrator_or_liaison(caller, "posing a question to the human")?;
             let text = arg_str(args, "text").ok_or("text required")?;
             let urgency = match arg_str_strict(args, "urgency")? {
                 Some(u) => super::humanq::Urgency::parse(u)?,
                 None => super::humanq::Urgency::default(),
             };
-            let options = arg_str_array_of(args, "options", "answer-option strings")?.unwrap_or_default();
+            let options = arg_option_specs(args, "options")?.unwrap_or_default();
+            let select = match arg_str_strict(args, "select")? {
+                Some(s) => Some(super::humanq::Select::parse(s)?),
+                None => None,
+            };
             let q = reg.ask_human(
                 &caller.group,
                 &caller.agent_id,
                 super::humanq::AskRequest {
                     text: text.to_string(),
                     options,
+                    select,
+                    allow_free_text: arg_bool_opt(args, "allow_free_text")?,
                     task: arg_str_strict(args, "task")?.map(str::to_string),
                     urgency,
                 },
             )?;
-            // The reply leads with the id (it is what the board note cites) and
-            // then says the one thing that decides what this agent does next.
-            // Stated at the call site, not only in the tool description, because
-            // the description is read once at listing time and this is read at
-            // the moment the decision is being made.
-            Ok(format!(
-                "{} registered — the human will be asked. DO NOT WAIT FOR IT: go on reviewing, \
-                 dispatching and merging everything not gated on this answer. Mark the affected \
-                 task blocked citing {}, and expect a [loomux] answer notice in this pane later. \
-                 list_questions has it meanwhile, across a /compact and across a restart.",
-                q.id, q.id
-            ))
+            // The reply leads with the id and then says the one thing that
+            // decides what this agent does next. Stated at the call site, not
+            // only in the tool description, because the description is read
+            // once at listing time and this is read at the moment the decision
+            // is being made.
+            //
+            // **Branched on the caller, for the same reason the gate above
+            // takes its refusal in words** (rev-820 B1): this string used to be
+            // written for the orchestrator alone, and widening the gate made it
+            // reachable by a caller for whom two of its clauses are false. A
+            // liaison holds no board-write tool at all, so "mark the affected
+            // task blocked" instructs it to do what its own mechanics fragment
+            // forbids; and `answer_question` delivers through
+            // `deliver_to_orchestrator` regardless of who asked, so "expect a
+            // notice in this pane" would leave it waiting for one that is never
+            // coming — the exact stall this feature removes. The gate has
+            // already resolved which caller this is; the reply reads that same
+            // predicate rather than a second copy of it.
+            Ok(if caller_is_liaison(caller) {
+                format!(
+                    "{} registered — it is in the human's inbox now. DO NOT WAIT FOR IT: carry on \
+                     with the human. Two things about it are the orchestrator's and not yours: the \
+                     board row (you write none, and do not ask it to write one for you), and the \
+                     [loomux] answer notice, which is delivered to the ORCHESTRATOR's pane because \
+                     un-blocking the work is what an answer is for. list_questions is how you see \
+                     what became of {}, across a /compact and across a restart — and if it is \
+                     overtaken by events, say so with message_orchestrator, since withdrawing is \
+                     the orchestrator's too.",
+                    q.id, q.id
+                )
+            } else {
+                format!(
+                    "{} registered — the human will be asked. DO NOT WAIT FOR IT: go on reviewing, \
+                     dispatching and merging everything not gated on this answer. Mark the affected \
+                     task blocked citing {}, and expect a [loomux] answer notice in this pane later. \
+                     list_questions has it meanwhile, across a /compact and across a restart.",
+                    q.id, q.id
+                )
+            })
         }
         "withdraw_question" => {
+            // Orchestrator-only, and deliberately NOT widened alongside
+            // `ask_human` (#1091 slice E): withdrawing SETTLES a row — any
+            // pending row, not only your own — and the widening bought the
+            // human's pane the ability to ADD to their inbox, never to decide
+            // what leaves it. A liaison whose question is overtaken by events
+            // says so with `message_orchestrator`.
             require_orchestrator(caller)?;
             let id = arg_str(args, "id").ok_or("id required")?;
             let q = reg.withdraw_question(&caller.group, &caller.agent_id, id)?;
@@ -1025,6 +1203,7 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                     issue: arg_str(args, "issue").map(str::to_string),
                     pr: arg_str(args, "pr").map(str::to_string),
                     pr_base: arg_str(args, "pr_base").map(str::to_string),
+                    demo_path: arg_str(args, "demo_path").map(str::to_string),
                     assignee: arg_str(args, "assignee").map(str::to_string),
                     session: arg_str(args, "session").map(str::to_string),
                     note: arg_str(args, "note").map(str::to_string),
@@ -1093,14 +1272,15 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             Ok(format!("removed {id}"))
         }
         "group_usage" => {
-            // The gate, and the only tool on this surface that is not simply
-            // orchestrator-only (#891 S2). `reg.group_usage` reads the caller's
-            // OWN group — `caller.group` is resolved from the token, never
-            // passed as an argument — so there is no third, deeper layer to add
-            // here the way `record_verdict` has one: the registry function
-            // takes no caller identity, because the only thing it could check
-            // is a group the caller already is in.
-            require_orchestrator_or_liaison(caller)?;
+            // The gate (#891 S2) — one of the two hint-keyed widenings on this
+            // surface, the other being `ask_human` (#1091 slice E).
+            // `reg.group_usage` reads the caller's OWN group — `caller.group`
+            // is resolved from the token, never passed as an argument — so
+            // there is no third, deeper layer to add here the way
+            // `record_verdict` has one: the registry function takes no caller
+            // identity, because the only thing it could check is a group the
+            // caller already is in.
+            require_orchestrator_or_liaison(caller, "usage aggregation")?;
             let detail = arg_bool(args, "detail")?;
             let full = reg.group_usage(&caller.group);
             let out = if detail {

@@ -48,7 +48,7 @@ import { decideRefresh, REPO_SIGNAL_WINDOW_MS } from "./refreshthrottle";
 import { planWebglRetry } from "./webglretry";
 import { showToast } from "./toast";
 import { isAppShortcut } from "./shortcuts";
-import { attentionPresentation, attentionDismiss } from "./attention";
+import { attentionPresentation, attentionDismiss, attentionChanged } from "./attention";
 import { dismissStranded } from "./orchestration";
 import { heldPresentation } from "./heldbadge";
 import { queuePresentation, type QueueDepthReading } from "./queuebadge";
@@ -59,6 +59,8 @@ import { openInEditor, editorConfigDialog } from "./editor";
 import { GitView } from "./gitview";
 import { IssuesView } from "./issuesview";
 import { TasksView } from "./tasksview";
+import { DecisionsView } from "./decisionsview";
+import { PendingEmbedFocus } from "./embedfocus";
 import { AuditView } from "./auditview";
 import { TimelineView } from "./timelineview";
 import { GroupView } from "./groupview";
@@ -87,6 +89,8 @@ import {
 } from "./dirtystate";
 import { FileEditView } from "./fileedit";
 import { FileExplorerView } from "./fileexplorer";
+import { icon } from "./icons.ts";
+import { agentMark } from "./agenticons.ts";
 import { WorkflowView } from "./workflowview";
 import { WORKFLOW_FILE } from "./workflowmodel";
 import type { PersistedPane, PersistedPaneKind } from "./tabstore";
@@ -97,32 +101,42 @@ import { adoptableSessionId, hasForkSession, sessionCliFromCommand } from "./pan
 // name the same CLIs by construction (#722).
 import type { Cli } from "./sessionreconcile";
 
-// Inline icons so the toolbar renders identically regardless of installed
-// fonts; they inherit color via `currentColor`.
-const FOLDER_ICON = `<svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"><path d="M1.9 4.3c0-.6.5-1.1 1.1-1.1h3l1.4 1.5h5.6c.6 0 1.1.5 1.1 1.1v5.4c0 .6-.5 1.1-1.1 1.1H3c-.6 0-1.1-.5-1.1-1.1z"/></svg>`;
-const BRANCH_ICON = `<svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><circle cx="4.5" cy="3.6" r="1.7"/><circle cx="4.5" cy="12.4" r="1.7"/><circle cx="11.5" cy="5.4" r="1.7"/><path d="M4.5 5.3v5.4M11.5 7.1c0 2.4-1.9 3.1-4 3.6"/></svg>`;
-const TASKS_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><path d="M5.5 4h8M5.5 8h8M5.5 12h8"/><circle cx="2.3" cy="4" r="0.9" fill="currentColor" stroke="none"/><circle cx="2.3" cy="8" r="0.9" fill="currentColor" stroke="none"/><circle cx="2.3" cy="12" r="0.9" fill="currentColor" stroke="none"/></svg>`;
-const GIT_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><circle cx="8" cy="2.8" r="1.6"/><circle cx="4" cy="13.2" r="1.6"/><circle cx="12" cy="13.2" r="1.6"/><path d="M8 4.4v2.2M8 6.6c0 2.6-4 2.4-4 5M8 6.6c0 2.6 4 2.4 4 5"/></svg>`;
+// The header's icons, from the registry (#879 slice K). They were hand-drawn
+// inline here — inline so the toolbar renders identically regardless of
+// installed fonts, which still holds — and the artwork now comes from
+// src/icons.ts, which also DYES each one by its role: the two meta chips read
+// as workspace and repo, the overlay buttons as the board they open, the group
+// controls as the fleet. The sizes below are the boxes these glyphs already
+// had, so nothing in the header moves.
+const ICON_META_PX = 12;
+const ICON_BTN_PX = 13;
+const FOLDER_ICON = icon("folder", ICON_META_PX);
+const BRANCH_ICON = icon("git-branch", ICON_META_PX);
+const TASKS_ICON = icon("list-checks", ICON_BTN_PX);
+// NEEDS-YOU panel (#1091, Alt+Q): a raised hand — the group asking for the
+// human, rather than offering them help.
+const DECISIONS_ICON = icon("hand", ICON_BTN_PX);
+const GIT_ICON = icon("git-graph", ICON_BTN_PX);
 // Issues view (Alt+I): a dot inside a circle — GitHub's open-issue glyph.
-const ISSUES_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3"><circle cx="8" cy="8" r="5.4"/><circle cx="8" cy="8" r="1.5" fill="currentColor" stroke="none"/></svg>`;
-// Progress timeline (#608): dots on an axis — the audit log's chart sibling.
-const TIMELINE_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><path d="M1.6 11.4h12.8"/><path d="M3.4 11.4v2M8 11.4v2M12.6 11.4v2"/><circle cx="4.2" cy="4" r="1.5" fill="currentColor" stroke="none"/><circle cx="8.6" cy="7.4" r="1.5" fill="currentColor" stroke="none"/><circle cx="12.2" cy="4" r="1.5" fill="currentColor" stroke="none"/></svg>`;
+const ISSUES_ICON = icon("circle-dot", ICON_BTN_PX);
+// Progress timeline (#608): the audit log's chart sibling.
+const TIMELINE_ICON = icon("chart-gantt", ICON_BTN_PX);
 // Audit viewer: a clock/history glyph for the group's audit-log timeline.
-const AUDIT_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M2.2 8a5.8 5.8 0 1 1 1.7 4.1"/><path d="M2.2 12.2V8.6H5.8"/><path d="M8 5.2V8l2 1.4"/></svg>`;
-const GROUP_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="3.4" r="1.7"/><circle cx="3.4" cy="11" r="1.7"/><circle cx="12.6" cy="11" r="1.7"/><path d="M8 5.1v3M6.7 9.6 4.5 9.9M9.3 9.6l2.2.3"/></svg>`;
-// Fold-group toggle (#46): stacked panes collapsing toward a baseline —
-// signals "minimize every worker/reviewer pane to the dock at once".
-const GROUP_MIN_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="2.4" width="10" height="3.2" rx="0.8"/><rect x="4.6" y="7" width="6.8" height="2.6" rx="0.7"/><path d="M4.2 13h7.6"/></svg>`;
+const AUDIT_ICON = icon("clock-fading", ICON_BTN_PX);
+const GROUP_ICON = icon("users", ICON_BTN_PX);
+// Fold-group toggle (#46): chevrons collapsing toward each other — signals
+// "minimize every worker/reviewer pane to the dock at once".
+const GROUP_MIN_ICON = icon("chevrons-down-up", ICON_BTN_PX);
 // "Open in editor": code-brackets glyph. Opens the pane's workspace folder in
 // the user's configured external editor (VS Code, Zed, …).
-const EDITOR_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M6 4.5 2.5 8 6 11.5M10 4.5 13.5 8 10 11.5"/></svg>`;
-// File-editor overlay (#174): a page with a fold + a small pencil, to read as
-// "edit files" distinct from the external-editor </> glyph above.
-const FILES_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 2.2h5l3.5 3.5v5.1"/><path d="M8.2 2.2v3.3h3.3"/><path d="M2.2 8.2h5.1v5.1H2.2z"/></svg>`;
+const EDITOR_ICON = icon("code-xml", ICON_BTN_PX);
+// File-editor overlay (#174): a page with a pencil, to read as "edit files"
+// distinct from the external-editor </> glyph above.
+const FILES_ICON = icon("file-pen", ICON_BTN_PX);
 // Attach affordance on the steering strip (#72): a paperclip.
-const PAPERCLIP_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M12.5 6.6 7.1 12a2.4 2.4 0 0 1-3.4-3.4l5.6-5.6a1.5 1.5 0 0 1 2.1 2.1l-5.4 5.4a.6.6 0 0 1-.9-.9l4.9-4.9"/></svg>`;
-// Voice-prompt push-to-talk button (#58): a simple microphone glyph.
-const MIC_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="1.8" width="4" height="7.4" rx="2"/><path d="M3.8 7.2a4.2 4.2 0 0 0 8.4 0M8 11.4v2.8M6 14.2h4"/></svg>`;
+const PAPERCLIP_ICON = icon("paperclip", ICON_BTN_PX);
+// Voice-prompt push-to-talk button (#58): a microphone.
+const MIC_ICON = icon("mic", ICON_BTN_PX);
 
 /** Pull image files out of a paste/drag `DataTransfer`. Returns only entries
  *  the browser tags as images, so a text or mixed paste yields []. */
@@ -259,8 +273,16 @@ export interface PaneOptions {
    *  Its presence is what suppresses this pane's LOCAL-filesystem affordances,
    *  which is not cosmetic: an SSH pane's shell reports REMOTE paths over OSC 7,
    *  and pointing a local git watch (or a local folder picker's `cd`) at
-   *  `/srv/app` is meaningless at best. See `start()`. */
-  ssh?: { profileId: string };
+   *  `/srv/app` is meaningless at best. See `start()`.
+   *
+   *  `defaultCli` is the profile's far-end CLI (`SshProfile.defaultCli`) — the program
+   *  `sshLaunchParams` actually composed the remote command from, so it is the pane's
+   *  REAL agent while `argv[0]` is only the transport that carries it. Passed here by
+   *  the callers that already hold the profile, because the store read that resolves it
+   *  is async and the header mark is drawn synchronously. Optional and nullable: a
+   *  profile with no default CLI is a plain remote shell, and a caller that cannot cheaply
+   *  supply it degrades to the neutral badge rather than to a wrong one (#992 review B1). */
+  ssh?: { profileId: string; defaultCli?: string | null };
   /** Recorded resumable agent session id (#194): so a restored Agent pane can
    *  `--resume <id>` back into its prior context (resuming into an idle TUI
    *  costs nothing until a prompt is sent). Set by the launcher for
@@ -360,7 +382,15 @@ export interface PaneEvents {
  *  scope increase) once the multi-slot generalization made "one more
  *  dockable view" cheap to reason about — see doc/design/embedded-panels.md's
  *  "What's embeddable, and what isn't". */
-type EmbedKind = "tasks" | "git" | "issues" | "audit" | "group" | "editor" | "timeline";
+type EmbedKind =
+  | "tasks"
+  | "git"
+  | "issues"
+  | "audit"
+  | "group"
+  | "editor"
+  | "timeline"
+  | "decisions";
 
 /** #1042: compile-time pin that every view `embedtoggle.ts` lets declare the
  *  pane's cwd really is an `EmbedKind`. That module takes a plain `string` so it
@@ -372,6 +402,7 @@ void _CWD_DECLARING_VIEWS_ARE_EMBED_KINDS;
 
 const EMBED_KINDS: readonly EmbedKind[] = [
   "tasks",
+  "decisions",
   "git",
   "issues",
   "audit",
@@ -399,6 +430,10 @@ const EMBED_KINDS: readonly EmbedKind[] = [
  *  restores ITS scroll position or filter either. */
 const RESTORABLE_EMBED_KINDS: readonly EmbedKind[] = [
   "tasks",
+  // The NEEDS-YOU panel (#1091) is orchestrator-only and group-scoped, exactly
+  // like the board it sits beside, so it restores on the same terms — the DOCK
+  // preference only, never which card was expanded or half-answered.
+  "decisions",
   "audit",
   "group",
   "git",
@@ -412,7 +447,7 @@ const RESTORABLE_EMBED_KINDS: readonly EmbedKind[] = [
 
 function isRestorableEmbedKind(
   kind: EmbedKind
-): kind is "tasks" | "audit" | "group" | "git" | "editor" | "timeline" {
+): kind is "tasks" | "decisions" | "audit" | "group" | "git" | "editor" | "timeline" {
   return (RESTORABLE_EMBED_KINDS as readonly string[]).includes(kind);
 }
 
@@ -426,6 +461,7 @@ const EMBED_TOGGLE_LABEL: Record<EmbedKind, string> = {
   timeline: "The progress timeline",
   group: "The group lifecycle panel",
   editor: "The file editor",
+  decisions: "The needs-you panel",
 };
 
 /** Each kind's PANE HEADER toggle button's normal (undocked) title —
@@ -440,11 +476,12 @@ const EMBED_TOGGLE_TITLE: Record<EmbedKind, string> = {
   timeline: "Progress timeline (Alt+W)",
   group: "Group lifecycle (Alt+O)",
   editor: "File editor (Alt+F)",
+  decisions: "Needs you — decisions & demos (Alt+Q)",
 };
 
 /** One embeddable view's plumbing, registered once that view is lazily
  *  constructed. Lets the generic engine (`openView`/`closeView`/`toggleView`/
- *  `embedViewAtSide`/`reclampViewFloor`) treat all five views uniformly
+ *  `embedViewAtSide`/`reclampViewFloor`) treat all eight views uniformly
  *  without hardcoding any one view's class. */
 interface EmbedEntry {
   /** The view's own floating-overlay host (unchanged pre-#361 mechanics). */
@@ -493,6 +530,10 @@ export class Pane implements VoiceTargetPane {
   name = "shell";
 
   private titleEl: HTMLElement;
+  /** The agent-type mark (#992): which CLI is running in this pane, as a glyph. Sits at
+   *  the head of the header row, before the group role badge, and stays hidden until a
+   *  launch line names a program — a plain shell has no agent type to report. */
+  private agentMarkEl: HTMLElement;
   private termEl: HTMLElement;
   private cwdEl: HTMLElement;
   private cwdTextEl: HTMLElement;
@@ -523,6 +564,18 @@ export class Pane implements VoiceTargetPane {
   private tasksView: TasksView | null = null;
   private tasksOverlay: HTMLElement | null = null;
   private tasksBtn: HTMLButtonElement;
+  /** NEEDS-YOU panel (orchestrator panes only, #1091), same overlay
+   *  mechanics — pending human decisions and demo-gated board rows. */
+  private decisionsView: DecisionsView | null = null;
+  private decisionsOverlay: HTMLElement | null = null;
+  private decisionsBtn: HTMLButtonElement;
+  /** Focus requests parked for this pane's own embeds (#1091 slice C).
+   *  Per-PANE, because the surfaces that cite each other are embeds on the
+   *  SAME pane — a card naming `t-7` wants THIS pane's board, not another
+   *  window's. See embedfocus.ts for why the request is parked rather than
+   *  delivered: the target view may not be constructed yet, and even once it
+   *  is, its rows arrive from an async refresh. */
+  private readonly pendingFocus = new PendingEmbedFocus();
   /** Audit-log viewer (any orchestration pane), same overlay mechanics. */
   private auditView: AuditView | null = null;
   private auditOverlay: HTMLElement | null = null;
@@ -612,6 +665,10 @@ export class Pane implements VoiceTargetPane {
    *  fact every local-filesystem suppression below reads, so a ninth pane kind
    *  can't be added to one site and forgotten at another. */
   private sshProfileId: string | null = null;
+  /** The far-end CLI of this pane's SSH profile, when a caller supplied it — the pane's
+   *  real agent, which `spawnArgv` (the local ssh client) cannot report. Only the header
+   *  mark reads it (#992). */
+  private sshDefaultCli: string | null = null;
   /** Standalone pane's channel-scoped identity (#271 W3 addendum) — a carrier
    *  DELIBERATELY separate from orchGroup/orchAgent/orchRoleName (those gate
    *  the full orchestration chrome; a plain standalone pane must never show
@@ -789,6 +846,18 @@ export class Pane implements VoiceTargetPane {
 
     const header = document.createElement("div");
     header.className = "pane-header";
+
+    // The agent-type mark (#992). Appended BEFORE the title so that `setBadge`, which
+    // inserts the role chip immediately before the title, lands between the two: the
+    // header reads mark → role → name, i.e. what program, which agent, what it's called.
+    // Pure header chrome — it floats in the header row and never touches the terminal's
+    // geometry, so CLAUDE.md constraint 1 (never resize the PTY for a UI feature) holds
+    // trivially.
+    this.agentMarkEl = document.createElement("span");
+    this.agentMarkEl.className = "pane-cli-icon";
+    this.agentMarkEl.hidden = true;
+    header.appendChild(this.agentMarkEl);
+
     this.titleEl = document.createElement("span");
     this.titleEl.className = "pane-title";
     this.titleEl.title = "Double-click to rename (F2)";
@@ -900,6 +969,17 @@ export class Pane implements VoiceTargetPane {
       this.toggleTasksView();
     });
     header.appendChild(this.tasksBtn);
+
+    this.decisionsBtn = document.createElement("button");
+    this.decisionsBtn.className = "pane-btn";
+    this.decisionsBtn.innerHTML = DECISIONS_ICON;
+    this.decisionsBtn.title = EMBED_TOGGLE_TITLE.decisions;
+    this.decisionsBtn.hidden = true; // shown for orchestrator panes in start()
+    this.decisionsBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      this.toggleDecisionsView();
+    });
+    header.appendChild(this.decisionsBtn);
 
     this.auditBtn = document.createElement("button");
     this.auditBtn.className = "pane-btn";
@@ -1239,6 +1319,7 @@ export class Pane implements VoiceTargetPane {
     // pane onto a remote host.
     this.refuseSshOrchestration(opts);
     this.sshProfileId = opts.ssh?.profileId ?? null;
+    this.sshDefaultCli = opts.ssh?.defaultCli ?? null;
     this.setName(opts.name ?? "shell");
     this.launchedCommand = !!opts.command?.trim();
     // Retain the launch inputs for a later capture() into the persisted layout
@@ -1246,6 +1327,7 @@ export class Pane implements VoiceTargetPane {
     this.spawnCommand = opts.command ?? null;
     this.spawnArgv = opts.argv ?? null;
     this.spawnShellKind = opts.shellKind ?? null;
+    this.refreshAgentMark();
     // #440: a caller (the launcher, an orch spawn) that already knows the id
     // wins outright. Otherwise, learn it from the command/argv line itself —
     // a human-typed `claude --resume <id>` / `--session-id <id>` custom
@@ -1435,6 +1517,10 @@ export class Pane implements VoiceTargetPane {
     this.orchRoleName = opts.orchRole ?? null;
     // The board lives on the orchestrator's pane; workers report there.
     this.tasksBtn.hidden = opts.orchRole !== "orchestrator";
+    // The NEEDS-YOU panel sits beside the board, on the same pane and the same
+    // terms (#1091): the orchestrator is who asks the human, and the demos it
+    // shows are its own board rows.
+    this.decisionsBtn.hidden = opts.orchRole !== "orchestrator";
     // The audit log is per-group and read-only, so it's useful from any
     // agent pane in the group, not just the orchestrator's.
     this.auditBtn.hidden = false;
@@ -1657,7 +1743,10 @@ export class Pane implements VoiceTargetPane {
     // pane's EXISTING ssh-ness, not just `opts`, since a promotion's options
     // describe the orchestrator it wants, not the pane it is rewriting.
     this.refuseSshOrchestration(opts);
-    if (opts.ssh) this.sshProfileId = opts.ssh.profileId;
+    if (opts.ssh) {
+      this.sshProfileId = opts.ssh.profileId;
+      this.sshDefaultCli = opts.ssh.defaultCli ?? null;
+    }
     // #887 S4: this pane is coming back to life, so any floating Reconnect card
     // is stale by definition — dropped here rather than at the (several) call
     // sites, so no future relaunch path can forget it and leave a card offering
@@ -1670,6 +1759,10 @@ export class Pane implements VoiceTargetPane {
     this.spawnCommand = opts.command ?? null;
     this.spawnArgv = opts.argv ?? null;
     this.spawnShellKind = opts.shellKind ?? null;
+    // A respawn can change the program outright — a dormant shell Started with a
+    // recorded agent command, or a welcome pane promoted to an orchestrator — so the
+    // mark is re-derived here rather than only at first start.
+    this.refreshAgentMark();
     // Same learn-it-from-the-line fallback as start() (#440) — a fresh respawn
     // (BUG-1 backstop, or a dormant Start with a recorded command) can equally
     // carry a self-naming --resume/--session-id.
@@ -2378,6 +2471,51 @@ export class Pane implements VoiceTargetPane {
     this.dockSyncListener?.();
   }
 
+  /** Draw (or clear) the agent-type mark from this pane's launch line (#992).
+   *
+   *  Reads `spawnCommand`/`spawnArgv` rather than taking an argument, so every path
+   *  that changes what this pane is running — first start, respawn, promotion —
+   *  reports the same answer by calling this after it has set them. The resolver
+   *  returns `null` for a pane with no command, which is how a plain shell ends up
+   *  wearing no mark instead of a neutral one.
+   *
+   *  `innerHTML` is the same injection the header's other glyphs use; what makes it
+   *  safe is on the other side (`src/agenticons.ts` §Safety) — the fallback badge
+   *  clamps the program name to a single `[A-Z0-9]` character, so no part of a launch
+   *  command can be expressed as markup here. The label is set as TEXT (`.title`, and an
+   *  `aria-label` ATTRIBUTE) precisely because that clamp does not apply to it — it is the
+   *  one place a raw program name survives, so it must never reach markup.
+   *
+   *  `sshDefaultCli` is passed as the AUTHORITATIVE answer and `isSshPane` as the flag
+   *  meaning "the launch line is a transport": an SSH pane's `spawnArgv[0]` is the local
+   *  ssh client, not the agent, and reading it captioned panes "Agent CLI: ssh" while they
+   *  ran Claude on the far end (#992 review B1).
+   *
+   *  The wrapper carries `role="img"` + `aria-label` rather than leaving the name in a
+   *  `title` alone: this glyph is the only thing in the header that reports which CLI the
+   *  pane runs, so unlike the app's decorative icons it needs an accessible name. The
+   *  `<svg>` inside stays `aria-hidden` — it is the labelled element's artwork, and
+   *  announcing both would read the name twice. */
+  private refreshAgentMark(): void {
+    const view = agentMark({
+      command: this.spawnCommand,
+      argv: this.spawnArgv,
+      knownCli: this.sshDefaultCli,
+      remote: this.isSshPane,
+    });
+    this.agentMarkEl.hidden = !view;
+    this.agentMarkEl.innerHTML = view?.svg ?? "";
+    if (view) {
+      this.agentMarkEl.title = view.label;
+      this.agentMarkEl.setAttribute("role", "img");
+      this.agentMarkEl.setAttribute("aria-label", view.label);
+    } else {
+      this.agentMarkEl.removeAttribute("title");
+      this.agentMarkEl.removeAttribute("role");
+      this.agentMarkEl.removeAttribute("aria-label");
+    }
+  }
+
   /** Mark this pane as part of an orchestration group: role chip before the
    *  title plus a group-colored accent on the header. */
   setBadge(badge: PaneBadge): void {
@@ -2391,12 +2529,23 @@ export class Pane implements VoiceTargetPane {
   }
 
   /** Flag (or clear) this pane as needing the human — driven by the backend
-   *  attention scan. Idempotent: a same-reason repeat is a no-op, so the 3-second
-   *  re-emits don't thrash the DOM. `null` clears the badge. */
+   *  attention scan. Idempotent on (reason, detail) TOGETHER: an identical
+   *  repeat of both is a no-op, so the 3-second re-emits don't thrash the DOM.
+   *  `null` clears the badge.
+   *
+   *  Deliberately NOT idempotent on `reason` alone (#1091 slice D review) —
+   *  see `attentionChanged` (attention.ts) for why, and for the pinned test.
+   *  Still cheap: this only runs when the outer `AttentionGate`
+   *  (attentiongate.ts) already decided the payload changed, since ITS
+   *  signature includes `detail` too — so a same-text re-emit never even
+   *  reaches here, and a changed `detail` was already going to trigger a DOM
+   *  pass; this just stops that pass from discarding the new text once it
+   *  arrives. */
   setAttention(reason: string | null, detail?: string): void {
-    if (reason === this.attentionReason) return;
+    const normalizedDetail = reason ? detail ?? null : null;
+    if (!attentionChanged(this.attentionReason, this.attentionDetail, reason, normalizedDetail)) return;
     this.attentionReason = reason;
-    this.attentionDetail = reason ? detail ?? null : null;
+    this.attentionDetail = normalizedDetail;
     if (!reason) {
       this.attnChip.hidden = true;
       this.el.classList.remove("needs-attention");
@@ -2424,10 +2573,33 @@ export class Pane implements VoiceTargetPane {
   /** Flag (or clear) that loomux is currently withholding a prompt delivery
    *  to this pane because it believes the human's own input occupies the
    *  CLI's box (#246) — driven by the backend's paired
-   *  orch-delivery-held / orch-delivery-held-cleared events. Idempotent on
-   *  the reason, same as `setAttention`. `null` clears the badge. Header
-   *  chrome only: this never touches the pane's size, so the no-PTY-resize
-   *  invariant holds trivially. */
+   *  orch-delivery-held / orch-delivery-held-cleared events. `null` clears the
+   *  badge.
+   *
+   *  Idempotent on the REASON ALONE — deliberately unlike `setAttention` above,
+   *  which keys on `(reason, detail)` together. The two differ because their
+   *  details do: an attention detail is free text the scan can change under a
+   *  steady reason, while a held detail is `delivery_held_detail(agent_id,
+   *  reason)` (orchestration/mod.rs), a total function over a three-variant
+   *  enum that interpolates nothing but `agent_id`. So under a steady reason it
+   *  cannot move, and the cheaper check loses nothing.
+   *
+   *  Naming the input that is ASSUMED rather than proven, since this comment
+   *  exists because its predecessor over-claimed: that argument holds only
+   *  while `agent_id` is constant for the pane, which is a property of the
+   *  pane-to-agent binding, not of the function. The events dispatch by
+   *  `pty_id` (orchestration.ts), so a pane rebound to a different agent while
+   *  held, with the reason unchanged, would take the early return and keep the
+   *  previous agent's name. The blast radius is the chip's `title` tooltip and
+   *  nothing else — no state, no delivery — which is why the cheap check still
+   *  wins; if a rebind ever needs to repaint it, key on `(reason, detail)` like
+   *  `setAttention` rather than reaching for a rebind hook here. Copy `setAttention`'s rule
+   *  here only if that stops being true; copy this one to a NEW badge only
+   *  after checking its detail the same way (`setQueueDepth` below is the
+   *  other outcome — it keys on the whole reading).
+   *
+   *  Header chrome only: this never touches the pane's size, so the
+   *  no-PTY-resize invariant holds trivially. */
   setHeld(reason: string | null, detail?: string): void {
     if (reason === this.heldReason) return;
     this.heldReason = reason;
@@ -3055,6 +3227,12 @@ export class Pane implements VoiceTargetPane {
     this.tasksView = new TasksView(this.orchGroup!, {
       onClose: () => this.toggleTasksView(),
       onEmbedMenu: (anchor) => this.showEmbedMenu("tasks", anchor),
+      takeFocus: () => this.pendingFocus.take("tasks"),
+      // The board-to-panel direction of the focus hook (#1091 slice G): a row
+      // marked decision-blocked or demo-gated links straight to that item in
+      // the NEEDS-YOU panel, routed through this same hook the panel's own
+      // onFocusTask below uses the other way.
+      onFocusDecision: (id) => this.requestEmbedFocus("decisions", id),
     });
     this.tasksOverlay = document.createElement("div");
     this.tasksOverlay.className = "git-overlay";
@@ -3068,6 +3246,110 @@ export class Pane implements VoiceTargetPane {
       setPanelActive: (active) => this.tasksView!.setPanelActive(active),
       floorPx: () => EMBED_MIN_PANEL_PX,
     });
+  }
+
+  /** Toggle the NEEDS-YOU panel open/closed (`Alt+Q`, and the panel's own ✕) —
+   *  in EITHER mode, exactly like the board's own toggle. */
+  toggleDecisionsView(): void {
+    if (!this.orchGroup || this.decisionsBtn.hidden) return;
+    this.ensureDecisionsView();
+    this.toggleView("decisions");
+  }
+
+  /** Lazily construct the NEEDS-YOU panel and register it into
+   *  `embedRegistry` (#361, #1091 slice C). */
+  private ensureDecisionsView(): void {
+    if (this.decisionsView) return;
+    this.decisionsView = new DecisionsView(this.orchGroup!, {
+      onClose: () => this.toggleDecisionsView(),
+      onEmbedMenu: (anchor) => this.showEmbedMenu("decisions", anchor),
+      // The panel-to-board direction of the focus hook: a card citing `t-N`
+      // asks the PANE for the board, and the pane decides how to serve it.
+      // The panel never reaches into another view.
+      onFocusTask: (taskId) => this.requestEmbedFocus("tasks", taskId),
+      takeFocus: () => this.pendingFocus.take("decisions"),
+    });
+    this.decisionsOverlay = document.createElement("div");
+    this.decisionsOverlay.className = "git-overlay";
+    this.decisionsOverlay.hidden = true;
+    this.decisionsOverlay.append(
+      this.decisionsView.el,
+      this.makeOverlayDivider(() => this.decisionsOverlay!)
+    );
+    this.el.appendChild(this.decisionsOverlay);
+    this.embedRegistry.set("decisions", {
+      overlayEl: this.decisionsOverlay,
+      viewEl: this.decisionsView.el,
+      show: () => this.decisionsView!.show(),
+      setPanelActive: (active) => this.decisionsView!.setPanelActive(active),
+      floorPx: () => EMBED_MIN_PANEL_PX,
+    });
+  }
+
+  // ==================== #1091 slice C: the focus-request hook ====================
+
+  /** Open one of THIS pane's embeds and ask it to bring `target` into view.
+   *
+   *  The generic hook behind every cross-embed citation on an orchestrator
+   *  pane: a NEEDS-YOU card naming `t-7` links to that board row, and (once
+   *  #1091 slice G lands the board marker) a held board row links back to the
+   *  question holding it. Both surfaces are embeds on this same pane, so this
+   *  is intra-pane wiring — no backend command exists or is needed for it.
+   *
+   *  **The request is PARKED, not delivered.** Two things stand between asking
+   *  and the row existing: the target view may never have been constructed
+   *  (every embed is lazy), and once it is, its rows arrive from an async
+   *  refresh. So the target goes into `pendingFocus` and the view drains it on
+   *  its own next render, when the rows are actually there — see
+   *  `embedfocus.ts` for why that drain is destructive.
+   *
+   *  **Never a toggle.** A citation is "show me this", so an already-open view
+   *  is re-shown rather than closed — routing this through `toggleView` would
+   *  make clicking a link on a visible board close it.
+   *
+   *  Returns `false` when this pane cannot host that kind (a non-orchestrator
+   *  pane has no board), so a caller can render an inert label instead of a
+   *  link that goes nowhere. */
+  requestEmbedFocus(kind: EmbedKind, target: string): boolean {
+    if (!this.orchGroup) return false;
+    // Fail closed on the gating button, the same test every `toggleXView`
+    // makes: a hidden button means this pane does not offer that view at all.
+    if (this.embedToggleBtn(kind)?.hidden !== false) return false;
+    if (!this.pendingFocus.request(kind, target)) return false;
+    this.ensureEmbedView(kind);
+    // FAIL CLOSED on a kind this hook cannot actually route. `ensureEmbedView`
+    // has a deliberate silent default, and `openView` returns early on a
+    // missing registry entry — so without this check a kind whose header button
+    // is visible but which has no `ensureEmbedView` case would park a target
+    // nothing will ever drain and still answer `true`. `true` is the one answer
+    // that makes a caller render a link that goes nowhere, which is precisely
+    // what its `false` contract exists to prevent. Cheaper to make impossible
+    // here than to remember at each future call site.
+    if (!this.embedRegistry.has(kind)) {
+      this.pendingFocus.clear(kind);
+      return false;
+    }
+    if (this.isViewVisible(kind)) this.embedRegistry.get(kind)?.show();
+    else this.openView(kind);
+    return true;
+  }
+
+  /** Lazily construct `kind`'s view, whichever it is — the dispatch behind
+   *  `requestEmbedFocus`, which unlike a toggle has no per-kind entry point of
+   *  its own to hang the `ensureXView()` call on. Kinds with no focusable
+   *  content simply have nothing to construct here yet; adding one is adding
+   *  its case. */
+  private ensureEmbedView(kind: EmbedKind): void {
+    switch (kind) {
+      case "tasks":
+        this.ensureTasksView();
+        break;
+      case "decisions":
+        this.ensureDecisionsView();
+        break;
+      default:
+        break;
+    }
   }
 
   // ==================== #361: the generic embed engine ====================
@@ -3325,6 +3607,8 @@ export class Pane implements VoiceTargetPane {
     switch (kind) {
       case "tasks":
         return this.tasksBtn;
+      case "decisions":
+        return this.decisionsBtn;
       case "audit":
         return this.auditBtn;
       case "timeline":
@@ -3508,6 +3792,10 @@ export class Pane implements VoiceTargetPane {
         case "tasks":
           if (this.tasksBtn.hidden) continue;
           this.ensureTasksView();
+          break;
+        case "decisions":
+          if (this.decisionsBtn.hidden) continue;
+          this.ensureDecisionsView();
           break;
         case "audit":
           if (this.auditBtn.hidden) continue;
@@ -3999,6 +4287,7 @@ export class Pane implements VoiceTargetPane {
     if (this.gitOverlay && !this.gitOverlay.hidden) return this.gitOverlay;
     if (this.issuesOverlay && !this.issuesOverlay.hidden) return this.issuesOverlay;
     if (this.tasksOverlay && !this.tasksOverlay.hidden) return this.tasksOverlay;
+    if (this.decisionsOverlay && !this.decisionsOverlay.hidden) return this.decisionsOverlay;
     if (this.auditOverlay && !this.auditOverlay.hidden) return this.auditOverlay;
     if (this.timelineOverlay && !this.timelineOverlay.hidden) return this.timelineOverlay;
     if (this.groupOverlay && !this.groupOverlay.hidden) return this.groupOverlay;
@@ -4716,6 +5005,11 @@ export class Pane implements VoiceTargetPane {
     this.gitView?.dispose();
     this.issuesView?.dispose();
     this.tasksView?.dispose();
+    this.decisionsView?.dispose();
+    // Drop any focus request parked for a view that will never render again,
+    // so it cannot be picked up by a later instance of that view (#1091 slice
+    // C — `PendingEmbedFocus.clear`'s own stated purpose).
+    for (const kind of EMBED_KINDS) this.pendingFocus.clear(kind);
     this.auditView?.dispose();
     this.timelineView?.dispose();
     this.groupView?.dispose();

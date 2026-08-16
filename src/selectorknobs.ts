@@ -40,6 +40,8 @@
 // that turns out not to support it fails at the CLI, visibly in the pane, which
 // is the same posture slice A took on plan-gated entitlements.
 
+import type { ModelDetail } from "./modelcatalog.ts";
+
 /** One knob's row in a CLI's capability record (`cli_knobs_json`, mod.rs).
  *  `note` is always populated for a CLI loomux has evaluated: an empty `values`
  *  is a CLAIM, and the note is the vendor fact behind it. */
@@ -131,14 +133,62 @@ export function contextModelState(model: string): { supported: boolean; reason: 
   }
 }
 
+/** Narrow a CLI's effort levels to the ones it reported for THIS model (#993).
+ *
+ *  `caps.effort.values` is what the CLI can deliver in general — `CLI_CAPS`,
+ *  written down in this repo. `detail` is what the CLI's own list-models reply
+ *  said about the selected model on the machine in front of the human, and it
+ *  outranks the written-down set for the same reason a probe outranks a curated
+ *  suggestion: it is specific and current.
+ *
+ *  Three states, and each does something different:
+ *
+ *    detail is null              nothing has been detected (nobody asked, the ask
+ *                                failed, the reply did not mention this model) →
+ *                                leave the knob exactly as it was. This is the
+ *                                default and the common case.
+ *    supportsEffort === false    the CLI said this model has no effort setting →
+ *                                turn the knob OFF, quoting the CLI rather than
+ *                                offering levels it just said do not apply.
+ *    levels are listed           offer those, in the CLI's own order.
+ *
+ *  Note what the middle row is NOT: `supportsEffort: null` (the field was
+ *  absent, which a real `haiku` row does) is the first row, not the second. An
+ *  omitted field is silence, and silence must not disable anything. */
+function narrowEffort(caps: CliKnobValues, detail: ModelDetail | null): KnobState {
+  // `caps` is the outer bound and detection may only ever shrink it. A CLI with
+  // no seam for the knob — copilot's effort lives in `~/.copilot/settings.json`,
+  // not on a flag — has none regardless of what any model reports about itself,
+  // and `knobValue` would happily pass a value through an `enabled` knob, so a
+  // reply that re-enabled it here would put a flag on the wire that this CLI
+  // cannot take.
+  if (!caps.values.length) return off(caps.note);
+  const fallback: KnobState = { enabled: true, values: caps.values, reason: "" };
+  if (!detail) return fallback;
+  if (detail.supportsEffort === false) {
+    return off(`${detail.name || detail.id} reports no reasoning-effort setting, so loomux sets none on it.`);
+  }
+  if (!detail.effortLevels.length) return fallback;
+  return { enabled: true, values: [...detail.effortLevels], reason: "" };
+}
+
 /** Per-knob state for one role/block: what the CLI can deliver (`caps`, from the
  *  backend) narrowed by what the selected `model` can carry.
  *
  *  `caps` is `null` before the async fetch lands, and mismatched when a reply for
  *  a CLI the human has since moved off arrives late. Both disable rather than
  *  assume: offering claude's five effort levels on a copilot row because a stale
- *  reply was still in hand is exactly the silent-wrong-answer this module is for. */
-export function knobState(caps: CliKnobs | null, cli: string, model: string): KnobStates {
+ *  reply was still in hand is exactly the silent-wrong-answer this module is for.
+ *
+ *  `detail` (#993) is what the CLI itself reported about `model`, when a human
+ *  has asked it. Optional and defaulting to `null`, which is exactly the
+ *  behaviour every caller had before it existed — nobody has to opt out. */
+export function knobState(
+  caps: CliKnobs | null,
+  cli: string,
+  model: string,
+  detail: ModelDetail | null = null
+): KnobStates {
   const want = cli.trim();
   if (!caps || caps.cli !== want) {
     const reason = `loomux has not read ${want || "this CLI"}'s capabilities yet.`;
@@ -148,9 +198,7 @@ export function knobState(caps: CliKnobs | null, cli: string, model: string): Kn
     const reason = `loomux has never evaluated ${want}, so it sets no thinking level or context window on it.`;
     return { effort: off(reason), context: off(reason) };
   }
-  const effort = caps.effort.values.length
-    ? { enabled: true, values: caps.effort.values, reason: "" }
-    : off(caps.effort.note);
+  const effort = narrowEffort(caps.effort, detail);
   if (!caps.context.values.length) return { effort, context: off(caps.context.note) };
   const model_ = contextModelState(model);
   return {

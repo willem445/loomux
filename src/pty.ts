@@ -15,6 +15,7 @@ import {
 import type { ShellKind } from "./panesetup";
 import type { CliKnobs } from "./selectorknobs";
 import type { CliProbe } from "./modelcatalog";
+import type { CliModelReply } from "./modelwire";
 
 export interface SpawnOptions {
   cols: number;
@@ -149,6 +150,40 @@ export const agentCliKnobs = (cli: string): Promise<CliKnobs | null> =>
  *  `node --test`. */
 export const probeAgentCli = (program: string): Promise<CliProbe> =>
   invoke<CliProbe>("probe_agent_cli", { program });
+
+/** What the startup sweep found out about a CLI's models — a LOOKUP, not an ask
+ *  (#993, reshaped by #1020).
+ *
+ *  The name is #993's and the reply shape is unchanged, but this can no longer
+ *  spawn anything: `src-tauri/src/modelwire.rs`'s startup sweep is the only
+ *  place that runs the control request, and this reads what it left behind. So
+ *  a paint may call it, which under #993 was the one thing forbidden — the
+ *  reason is that the spawn is gone, not that the rule relaxed.
+ *
+ *  A CLI the sweep has not reached yet answers with an error and no output;
+ *  the real answer arrives moments later on {@link onModelsDetected}. The reply
+ *  is bytes either way; `modelwire.ts` reads them. */
+export const listCliModels = (program: string): Promise<CliModelReply> =>
+  invoke<CliModelReply>("list_cli_models", { program });
+
+/** One CLI's sweep result, as the backend pushes it (`ModelsDetected`). */
+export interface ModelsDetected {
+  program: string;
+  reply: CliModelReply;
+}
+
+/** Subscribe to the startup sweep's per-CLI results (#1020).
+ *
+ *  The PUSH half of detection, and the half that reaches a form which is
+ *  already open: a picker painted while the sweep was still running has read a
+ *  "nothing yet" lookup, and nothing would ever correct it without this. The
+ *  PULL half ({@link listCliModels}) covers the opposite order — a form opened
+ *  after the event fired, or a webview that registered this listener too late
+ *  to catch it. One memo behind both. */
+export const onModelsDetected = (
+  handler: (detected: ModelsDetected) => void
+): Promise<UnlistenFn> =>
+  listen<ModelsDetected>("models-detected", (event) => handler(event.payload));
 
 /** Drive a pane's shell to `cd` into `path`. */
 export const changeDir = (id: number, path: string): Promise<void> =>

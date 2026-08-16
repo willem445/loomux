@@ -41,8 +41,9 @@ in its own visible pane, that you gatekeep only at review and merge.
 - **Feature pages** — [git view](features/git-view.html),
   [GitHub issues view](features/github-issues.html),
   [voice prompts](features/voice-prompts.html),
-  [steering & attachments](features/steering.html), and the
-  [session browser & editor launch](features/session-browser.html).
+  [steering & attachments](features/steering.html), the
+  [session browser & editor launch](features/session-browser.html), and the
+  [side dock](features/side-dock.html).
 - **[Troubleshooting](troubleshooting.html)** — the classics: whisper DLLs, `gh`
   auth, mic permission, disk.
 

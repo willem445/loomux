@@ -13,6 +13,7 @@ mod gitwatch;
 // module rather than a local shim file.
 pub use loomux_engine::winpath;
 mod metrics;
+mod modelwire; // the list-models control probe (#993)
 mod obs;
 pub mod opencodedb; // pub: the #722 usage-readback integration tests link its reader
 pub mod orchestration; // pub: integration smoke test links through it
@@ -76,6 +77,13 @@ pub fn run() {
         .setup(|app| {
             // Start streaming CPU/mem/GPU snapshots to the status bar.
             metrics::start(app.handle().clone());
+            // #1020: detect each supported CLI's models once, in the
+            // background, so every model picker opens already knowing what
+            // this machine offers instead of waiting for a human to ask. This
+            // is the ONLY path in loomux that reaches an agent CLI unbidden —
+            // see `modelwire.rs`'s header for the #1002 direction behind it and
+            // the boundary that keeps it the only one.
+            modelwire::start_startup_sweep(app.handle().clone());
             // Poll open panes' repos for external checkout/commit/stage (#36).
             let watcher = app.state::<Arc<gitwatch::GitWatcher>>().inner().clone();
             gitwatch::start(app.handle().clone(), watcher);
@@ -231,6 +239,7 @@ pub fn run() {
             orchestration::orch_confirm_solo_copilot_autopilot,
             orchestration::orch_solo_adopt,
             cliprobe::probe_agent_cli,
+            modelwire::list_cli_models,
             editor::open_in_editor,
             fileedit::ft_list_dir,
             fileedit::ft_read_file,

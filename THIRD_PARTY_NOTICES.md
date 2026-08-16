@@ -4,8 +4,8 @@ Loomux ships one third-party component inside its Windows installer (the ConPTY
 host, below). It also documents an **opt-in** component — the whisper.cpp voice
 runtime — which loomux does **not** distribute: users install it themselves if
 they want voice input. A third class is **shipped in-repo**: content vendored
-verbatim into this repository (the frontend-design agent skill, below). Each
-component is used under its own license.
+verbatim into this repository (the Lucide and Primer Octicons icon artwork and the
+frontend-design agent skill, below). Each component is used under its own license.
 
 ## whisper.cpp voice runtime — MIT (opt-in; not shipped)
 
@@ -47,6 +47,44 @@ Bundled in the Windows installer for clean terminal-resize behavior.
 - License: MIT (Copyright (c) Microsoft Corporation), full text in
   `src-tauri/resources/conhost/LICENSE`. Provenance notes in
   `src-tauri/resources/conhost/README.md`.
+
+## Lucide icons — ISC, with some icons MIT (shipped in-repo)
+
+`src/icons.ts` carries a curated set of [Lucide](https://github.com/lucide-icons/lucide)
+glyphs as inline SVG string constants — the artwork the app's icons are drawn
+from. It is a vendored copy, not an npm dependency: the icons ship inside the
+frontend bundle, so the notice belongs here rather than in the opt-in class.
+
+- Upstream: https://github.com/lucide-icons/lucide, version **1.31.0**
+  @ [`b7b6ecf1316d0af64c97a6b0392abe5e816a8e30`](https://github.com/lucide-icons/lucide/commit/b7b6ecf1316d0af64c97a6b0392abe5e816a8e30)
+- Vendored files: the 32 glyph bodies listed by `ICON_NAMES` in `src/icons.ts`,
+  each the inner markup of the upstream `icons/<name>.svg` at that commit,
+  copied verbatim. Only icons a surface actually renders are vendored, and
+  `test/icons.test.ts` fails on one that nothing uses.
+- License: **ISC** (Copyright (c) 2026 Lucide Icons and Contributors), full text
+  in `src/vendor/lucide/LICENSE`. Provenance and the re-vendoring procedure are
+  in the sibling `src/vendor/lucide/README.md`.
+- **Two of the vendored glyphs are Feather-derived and additionally carry the
+  MIT license** (Copyright (c) 2013-present Cole Bemis, text in the same
+  `LICENSE` file): `arrow-up` and `trash-2`.
+
+## Primer Octicons — MIT (shipped in-repo)
+
+`src/agenticons.ts` carries the per-agent pane marks — the glyphs that say which agent CLI
+is running in a pane (#992) — as inline SVG string constants. Like the Lucide artwork above
+it is a vendored copy, not an npm dependency, and it ships inside the frontend bundle.
+
+- Upstream: https://github.com/primer/octicons, version **19.33.0**
+  @ [`cc4e12df6ff8292447ba9141eaa2a6f6e1c59a85`](https://github.com/primer/octicons/commit/cc4e12df6ff8292447ba9141eaa2a6f6e1c59a85)
+- Vendored files: one glyph — `copilot-16` — the inner markup of the upstream
+  `icons/copilot-16.svg` at that commit, copied verbatim. `test/agenticons.test.ts` fails if
+  this notice stops naming a glyph the table vendors.
+- License: **MIT** (Copyright (c) 2026 GitHub Inc.), full text in
+  `src/vendor/octicons/LICENSE`. Provenance, the re-vendoring procedure, and the
+  trademark position (nominative use of an unmodified mark; no affiliation implied) are in
+  the sibling `src/vendor/octicons/README.md`.
+- Agent CLIs whose vendors publish no such grant are drawn as generated letter badges
+  instead — loomux redistributes no brand mark it has not been licensed for.
 
 ## frontend-design agent skill — Apache-2.0 (shipped in-repo)
 

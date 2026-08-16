@@ -1,28 +1,40 @@
-// The WORKFLOW pane (#222): `.loomux/workflow.yml`, made configurable.
+// The WORKFLOW pane (#222, restructured by #880): `.loomux/workflow.yml`, made configurable.
 //
-// Three surfaces over ONE model, and the model is the FILE (the Kestra pattern — a form
-// edit rewrites the YAML under the hood; the YAML is never a stale export of some hidden
-// canvas state):
+// ONE buffer, and the buffer is the FILE (the Kestra pattern — an inspector edit rewrites the
+// YAML under the hood; the YAML is never a stale export of some hidden canvas state). What
+// changed with #880 is not the model, it is the SHAPE OF THE SCREEN:
 //
-//   1. the ROSTER + property form — an interactive block list and a form per block. Every
-//      edit writes the YAML immediately.
-//   2. the raw YAML — a text editor over the same buffer. Typing here re-reads the model.
-//   3. the GRAPH — READ-ONLY (#222 Q6, adopted). It draws the declared happy path
-//      (ADVISORY edges: the orchestrator still schedules) and the merge gate (ENFORCED:
-//      the `gh` shim refuses a merge until the named reviewers' verdicts are PASS), and
-//      the two are drawn differently BECAUSE they mean different things. It cannot edit
-//      the file — GitLab's CI "Visualize" tab, not an editable canvas. OpenAI's
-//      Agent-Builder-as-source-of-truth shipped in Oct 2025 and is already being shut
-//      down; the file wins that argument.
+//   ┌────────────┬───────────────────────────────┬──────────────┐
+//   │  roster    │  the canvas (primary surface) │  inspector   │
+//   │  (blocks,  │  ── or the raw YAML, which is │  (whatever   │
+//   │   gate)    │     a toggle over the same    │   is         │
+//   │            │     space)                    │   selected)  │
+//   └────────────┴───────────────────────────────┴──────────────┘
 //
-// All the thinking lives in the pure `workflowmodel.ts` (parse / serialize / validate /
-// derive), which is where the tests are. This file is DOM: rendering, focus, dialogs, and
-// the read/write path through the hash-guarded `ft*` file commands.
+// The canvas is the primary surface and the inspector is DOCKED beside it, because the thing
+// #880 was opened about is that clicking a block did not visibly do anything: the property form
+// lived behind a "Blocks" tab, the canvas behind a "Graph" tab, and so selecting something and
+// showing it were two separate acts — of which the canvas performed only the first. Docking the
+// editor removes the second act rather than remembering to perform it. The roster stays as the
+// left column (it is also the keyboard/accessibility path to every selection), and the raw YAML
+// stays first-class as a toggle over the canvas: it is a different modality over the same file,
+// not a lesser one, and the file remains the source of truth.
 //
-// The one rule the sync has to obey: while the YAML does not PARSE, the form is disabled.
-// A form edit serializes the model back over the buffer, and serializing a model we only
+// The canvas EDITS the file (#222 v2 — it was read-only in v1 and the human asked for more). It
+// draws the declared happy path (ADVISORY edges: the orchestrator still schedules) and the merge
+// gate (ENFORCED: the `gh` shim refuses a merge until the named reviewers' verdicts are PASS),
+// and the two are drawn differently BECAUSE they mean different things. Every gesture goes out
+// through the same pure model as a form edit, so it can never become a second source of truth.
+//
+// All the thinking lives in the pure `workflowmodel.ts` (parse / serialize / validate / derive)
+// and `workflowpane.ts` (the pane's own decisions — which surface, what the inspector shows),
+// which is where the tests are. This file is DOM: rendering, focus, dialogs, and the read/write
+// path through the hash-guarded `ft*` file commands.
+//
+// The one rule the sync has to obey: while the YAML does not PARSE, the inspector is disabled.
+// An inspector edit serializes the model back over the buffer, and serializing a model we only
 // half-understood would silently destroy the broken text the human is in the middle of
-// fixing. So a syntax error disables the form and says why; every other kind of breakage
+// fixing. So a syntax error disables the editor and says why; every other kind of breakage
 // (an unknown kind, a dangling edge) still renders — as a stub, with a finding — because
 // a block you cannot see is a block you cannot repair.
 
@@ -43,19 +55,42 @@ import {
   isBlockKind,
   isReviewingBlock,
   isWorkflowCli,
+  isValidResourceName,
+  roleHintsForKind,
+  allowDenialReason,
   hasErrors,
   BLOCK_KINDS,
   WORKFLOW_CLIS,
   GATE_REQUIRES,
   WORKFLOW_FILE,
+  INTAKE_SOURCES,
+  INTAKE_LABEL_KEYS,
+  ID_MAX_CHARS,
+  RESOURCES_MAX,
+  RESOURCE_SLOTS_MIN,
+  RESOURCE_SLOTS_MAX,
+  RESOURCE_MAX_HOLD_MINUTES_MIN,
+  RESOURCE_MAX_HOLD_MINUTES_MAX,
+  MERGE_QUEUE_CHECKS_TIMEOUT_MIN,
+  MERGE_QUEUE_CHECKS_TIMEOUT_MAX,
+  POLICY_BOUNDS,
+  type FieldBounds,
   type Workflow,
   type WorkflowBlock,
   type WorkflowAnalysis,
+  type WorkflowResource,
+  type IntakeLabelKey,
   type Finding,
+  type FindingSection,
   type GraphNode,
 } from "./workflowmodel";
 import { agentCliKnobs } from "./pty";
-import { knobState, type CliKnobs, type KnobState, type KnobStates } from "./selectorknobs";
+import { knobState, type CliKnobs, type KnobStates } from "./selectorknobs";
+import { blockModelOptions, type CliProbe } from "./modelcatalog";
+import { modelCatalog } from "./modelprobe";
+import { ModelPicker } from "./modelpicker";
+import { BLOCK_DEFAULT_MODEL_LABEL } from "./modelnames";
+import { BlockKnobFields, type KnobFieldSpec } from "./workflowknobs";
 import {
   LAYOUT_FILE,
   parseLayout,
@@ -91,12 +126,19 @@ import {
   layoutPruneIds,
   rewriteImpact,
   rewriteImpactMessage,
+  inspectorTarget,
+  inspectorHeading,
+  surfaceForFinding,
+  canvasDeleteAllowed,
   type LayoutWrite,
+  type Selection,
+  type Surface,
 } from "./workflowpane";
 import { appVersion } from "./pty";
 import { closeDecision, discardEdits, type ConflictChoice } from "./dirtystate";
 import { showToast } from "./toast";
 import { modal, promptModal } from "./modal";
+import { IDENTITY, SEMANTIC } from "./theme.ts";
 
 /** What the hosting pane provides. Only one host today (the workflow PANE — a workflow
  *  builder is a station you keep open beside an agent, never a glance-and-dismiss
@@ -111,28 +153,6 @@ export interface WorkflowHost {
   /** This view IS a pane's content: no ✕, no Esc-to-close. Same fork as FileEditView. */
   embedded?: boolean;
 }
-
-type Tab = "form" | "yaml" | "graph";
-
-/** Which entry of the roster the property form is showing. The workflow's own settings
- *  and the gate are rows in the same list as the blocks, because they are edited the same
- *  way and a second place to click would be a second place to look.
- *
- *  A block is addressed by its INDEX in the roster, not by its id — deliberately. The id
- *  is the identity of a *valid* block, but this pane's whole contract is that a file it
- *  cannot fully understand still opens and is still repairable, and the blocks that need
- *  repairing are exactly the ones whose id is missing or duplicated. Keying the form by id
- *  would make two id-less stubs indistinguishable, and a duplicate pair unfixable — the
- *  form would edit whichever came first, forever. The index addresses a ROW, which is what
- *  the human is actually pointing at. */
-type Selection =
-  | { kind: "workflow" }
-  | { kind: "block"; index: number }
-  | { kind: "gate" }
-  /** An EDGE selected on the canvas (v2). Held by the pair of ids it joins, not by its index in
-   *  the edge list: the canonical formatter re-groups edges on every save, so an index would
-   *  point at a different edge the moment anything else changed. */
-  | { kind: "edge"; from: string; to: string };
 
 function el(tag: string, cls: string, text?: string): HTMLElement {
   const e = document.createElement(tag);
@@ -176,7 +196,9 @@ export class WorkflowView {
 
   private analysis: WorkflowAnalysis;
   private selection: Selection = { kind: "workflow" };
-  private tab: Tab = "form";
+  /** Which modality owns the middle of the pane. The canvas is primary; the raw YAML is a
+   *  toggle over it (#880). The inspector is beside BOTH, so it is not on this axis. */
+  private surface: Surface = "canvas";
   private disposed = false;
   /** This build's version, for `authored_with:` on a workflow this pane CREATES. Empty
    *  until the async lookup lands (and if it never does — the key is simply not written,
@@ -187,11 +209,14 @@ export class WorkflowView {
   private pathLabel: HTMLElement;
   private dirtyDot: HTMLElement;
   private saveBtn: HTMLButtonElement;
+  private yamlBtn: HTMLButtonElement;
   private statusEl: HTMLElement;
 
   // Body
   private rosterEl: HTMLElement;
-  private tabBar: HTMLElement;
+  /** The docked inspector's header (what is selected) and its body (the editor for it). */
+  private inspTitleEl: HTMLElement;
+  private inspSubEl: HTMLElement;
   private formPane: HTMLElement;
   private yamlPane: HTMLElement;
   private yamlArea: HTMLTextAreaElement;
@@ -220,6 +245,50 @@ export class WorkflowView {
    *  keystroke. Separate from `cliKnobs` because "asked, still in flight" and
    *  "asked, failed" are different states and only one of them is answerable. */
   private knobsAsked = new Set<string>();
+  /** One model probe per CLI per PANE — deliberately not per paint, and not once
+   *  per app run either.
+   *
+   *  Not per paint: the block form re-renders on every knob edit, and the catalog
+   *  no longer keeps an answer that carried nothing (`worthKeeping`), so probing
+   *  from the render path would be a subprocess per paint for exactly the CLIs
+   *  that have no answer to give.
+   *
+   *  Not once per app run: per pane IS the recovery granularity the app-wide memo
+   *  would otherwise cost. Install a CLI mid-session, open a workflow pane, and it
+   *  is asked again — which is what the pre-#935 per-form memo gave for free.
+   *
+   *  The PROMISE is what's held, not an "already asked" flag, so a second block
+   *  form painted while the first probe is still in flight still gets its
+   *  re-set. */
+  private modelProbes = new Map<string, Promise<CliProbe>>();
+  /** Redraws the block form's two knob rows in place, or `null` when no block
+   *  form is on screen. The form deliberately does not re-render on a model edit
+   *  (it would rebuild the input under the caret), so the rows that depend on the
+   *  model — and on a capability reply that lands whenever the IPC happens to
+   *  resolve — need a way to be refreshed without one (#935). */
+  private repaintBlockKnobs: (() => void) | null = null;
+  /** Rebuilds the block form's model dropdown as soon as doing so stops being
+   *  destructive, or `null` when no block form is on screen (#1020).
+   *
+   *  The sibling of {@link repaintBlockKnobs}, and nulled by the same line for
+   *  the same reason. A detection reply now arrives on the sweep's schedule
+   *  rather than after a click, so "which picker is live, and is the human
+   *  inside its custom-id box right now" is knowledge only the form has —
+   *  it installs this, and `renderInspector` takes it away when those controls
+   *  are detached. */
+  private refreshBlockModels: (() => void) | null = null;
+  /** Releases this pane's `modelCatalog.onReport` subscription. Held so
+   *  `dispose()` can call it — see the subscription itself. */
+  private unsubscribeReports: (() => void) | null = null;
+  /** CLIs a detection reply has already been applied to this pane for (#1020).
+   *
+   *  The push and the pull are two deliveries of ONE sweep answer and both can
+   *  land — the lookup's `.then` is already attached when the event arrives, and
+   *  neither call site can tell that the other got there first. Deduping in the
+   *  funnel they share, rather than at each call site, is what makes "the two
+   *  routes must not repaint a form twice" hold for BOTH orderings instead of
+   *  the one a guard captured at paint time covers (rev-713 non-blocking 3). */
+  private detectionsApplied = new Set<string>();
 
   // Canvas interaction state. All three are transient — none of them is ever serialized, and
   // the model never learns they existed.
@@ -236,6 +305,29 @@ export class WorkflowView {
     // Focusable like every other content view, so Alt+arrow nav / dock-restore / window
     // refocus land ON the surface without grabbing one of its inner controls.
     this.el.tabIndex = -1;
+
+    // Take the startup sweep's answers as they land (#1020) — the push half of
+    // detection, for a pane that was already open when one arrived. The pull
+    // half is in `blockForm`, for a form opened after the sweep finished.
+    //
+    // Not filtered by program, deliberately: only CLIs with a `PROTOCOLS` row
+    // are ever swept (one today), so this fires at most a handful of times in an
+    // app run, and deciding whether a report is "relevant" would mean deciding
+    // what a block with no `cli:` inherits — a question `analyzeWorkflow` is
+    // about to re-answer anyway.
+    //
+    // `disposed` is the liveness answer `onReport` asks for: a closed pane must
+    // stop being repainted, and this is the only teardown signal it has.
+    // The unsubscribe is HELD and called from `dispose()`, not discarded: the
+    // catalog is app-scoped and this pane is not, so a subscription nobody
+    // releases retains the whole view — its analysis, its detached DOM — for the
+    // life of the process (rev-713 blocking 2). `disposed` is the same answer
+    // given to the catalog's own prune, for a pane that is closed some other
+    // way.
+    this.unsubscribeReports = modelCatalog.onReport(
+      (program) => this.applyDetection(program),
+      () => !this.disposed
+    );
 
     // ---- header ----
     const head = el("div", "wf-head");
@@ -264,8 +356,28 @@ export class WorkflowView {
     reloadBtn.title = "Re-read the file from disk";
     reloadBtn.addEventListener("click", () => void this.reload());
 
+    // The YAML toggle — the one surface control left now that the tabs are gone (#880). It is a
+    // toggle and not a tab because the two are not peers on screen: the canvas is where the pane
+    // lives, and the raw text is a modality you switch INTO deliberately and come back from.
+    this.yamlBtn = document.createElement("button");
+    this.yamlBtn.className = "wf-btn";
+    this.yamlBtn.textContent = "YAML";
+    this.yamlBtn.title = "Edit the raw file instead of the canvas (the same buffer, the other way round)";
+    this.yamlBtn.addEventListener("click", () =>
+      this.setSurface(this.surface === "yaml" ? "canvas" : "yaml")
+    );
+
     const spacer = el("span", "wf-spacer");
-    head.append(this.pathLabel, this.dirtyDot, this.statusEl, spacer, formatBtn, reloadBtn, this.saveBtn);
+    head.append(
+      this.pathLabel,
+      this.dirtyDot,
+      this.statusEl,
+      spacer,
+      this.yamlBtn,
+      formatBtn,
+      reloadBtn,
+      this.saveBtn
+    );
     if (!host.embedded) {
       const closeBtn = document.createElement("button");
       closeBtn.className = "wf-btn";
@@ -338,21 +450,7 @@ export class WorkflowView {
     // ---- roster (left) ----
     this.rosterEl = el("div", "wf-roster");
 
-    // ---- panel (right): tabs over form / yaml / graph ----
-    this.tabBar = el("div", "wf-tabs");
-    for (const [key, label] of [
-      ["form", "Blocks"],
-      ["yaml", "YAML"],
-      ["graph", "Graph"],
-    ] as [Tab, string][]) {
-      const b = document.createElement("button");
-      b.className = "wf-tab";
-      b.textContent = label;
-      b.dataset.tab = key;
-      b.addEventListener("click", () => this.setTab(key));
-      this.tabBar.append(b);
-    }
-
+    // ---- the primary surface (middle) and the docked inspector (right) ----
     this.formPane = el("div", "wf-form");
     this.yamlPane = el("div", "wf-yaml");
     this.yamlArea = document.createElement("textarea");
@@ -364,19 +462,33 @@ export class WorkflowView {
       // eats a keystroke.
       this.text = this.yamlArea.value;
       this.reanalyze();
-      this.renderRoster();
+      this.renderSelection();
       this.renderFindings();
-      this.renderGraph();
       this.updateDirty();
     });
     this.yamlPane.append(this.yamlArea);
     this.graphPane = el("div", "wf-graph");
 
-    const panel = el("div", "wf-panel");
-    panel.append(this.tabBar, this.formPane, this.yamlPane, this.graphPane);
+    // The primary surface: the canvas, or the raw YAML in its place. Exactly one is on screen,
+    // and `hidden` is what says which (styles.css's `[hidden] { display: none !important }` is
+    // load-bearing here — see test/hiddenrule.test.ts for why that is not belt and braces).
+    const surfaceEl = el("div", "wf-surface");
+    surfaceEl.append(this.graphPane, this.yamlPane);
+
+    // The inspector, docked. Its HEAD is the part that makes a canvas click legible from across
+    // the pane: it names what is selected, by id, beside the node you just clicked.
+    this.inspTitleEl = el("div", "wf-insp-title");
+    this.inspSubEl = el("div", "wf-insp-sub");
+    const inspHead = el("div", "wf-insp-head");
+    inspHead.append(this.inspTitleEl, this.inspSubEl);
+    const inspector = el("div", "wf-inspector");
+    inspector.append(inspHead, this.formPane);
+
+    const main = el("div", "wf-main");
+    main.append(surfaceEl, inspector);
 
     this.bodyEl = el("div", "wf-body");
-    this.bodyEl.append(this.rosterEl, panel);
+    this.bodyEl.append(this.rosterEl, main);
 
     this.findingsEl = el("div", "wf-findings");
 
@@ -386,6 +498,11 @@ export class WorkflowView {
     // in the document has nothing to un-hide.
     this.el.append(head, this.errorEl, this.emptyEl, this.bodyEl, this.findingsEl);
 
+    // Which primary surface is showing, stated once BEFORE the first load resolves — otherwise
+    // both the canvas and the raw YAML sit un-hidden until `render()` first reaches its body
+    // surface, and a pane that opens on the error or start surface never gets there at all.
+    this.applySurface();
+
     // Ctrl+S saves from anywhere in the pane — including from inside the textarea, where
     // the browser would otherwise do nothing at all.
     this.el.addEventListener("keydown", (e) => {
@@ -394,12 +511,14 @@ export class WorkflowView {
         void this.save();
         return;
       }
-      // Delete removes what the CANVAS has selected — and only on the canvas. Anywhere else in
-      // the pane, Delete is the key that deletes a character, and a Delete that erased a block
-      // while you were editing a prompt would be the most expensive keystroke in the app.
-      if ((e.key === "Delete" || e.key === "Backspace") && this.tab === "graph") {
-        const inField = (e.target as HTMLElement | null)?.closest?.("input, textarea, select");
-        if (inField) return;
+      // Delete removes what the CANVAS has selected — and only on the canvas, and never from
+      // inside a field. Both halves are `canvasDeleteAllowed` (workflowpane.ts), and the second
+      // half matters more now than it did under the tabs: the inspector is docked BESIDE the
+      // canvas, so "typing in this block's prompt" and "this block is selected on the canvas"
+      // are now the normal state rather than mutually exclusive tabs.
+      if (e.key === "Delete" || e.key === "Backspace") {
+        const inField = !!(e.target as HTMLElement | null)?.closest?.("input, textarea, select");
+        if (!canvasDeleteAllowed({ surface: this.surface, inField })) return;
         e.preventDefault();
         this.deleteSelection();
       }
@@ -427,11 +546,16 @@ export class WorkflowView {
 
   dispose(): void {
     this.disposed = true;
+    // Released here rather than left to the catalog's next prune: this is the
+    // moment the view becomes garbage, and the prune only runs when something
+    // else subscribes — which may be never.
+    this.unsubscribeReports?.();
+    this.unsubscribeReports = null;
     this.el.remove();
   }
 
   focus(): void {
-    (this.tab === "yaml" ? this.yamlArea : this.el).focus();
+    (this.surface === "yaml" ? this.yamlArea : this.el).focus();
   }
 
   // ---------- the unsaved-work contract (shared with the editor pane, #219) ----------
@@ -750,10 +874,11 @@ export class WorkflowView {
     this.setText(scaffoldWorkflowText(this.appVersion));
     this.render();
     await this.save();
-    // Land them in the canvas, on the thing they just made. The empty state's job was to get
-    // out of the way; leaving them on a form with nothing selected would be a second empty
-    // state wearing a different hat.
-    this.setTab("graph");
+    // Land them on the canvas, looking at the thing they just made. Since #880 that is simply
+    // the pane's normal state — the canvas is the primary surface and the inspector is beside
+    // it — so all this has to do is make sure a YAML toggle left over from a previous file
+    // isn't sitting in front of it.
+    this.setSurface("canvas");
   }
 
   /** The file changed under us since we read it — an agent, git, or another editor. Same
@@ -823,8 +948,67 @@ export class WorkflowView {
    *  and the call failed, which `knobState` renders as disabled-with-a-reason. */
   private knobLookup = (cli: string, model: string): KnobStates | null => {
     const caps = this.cliKnobs.get(cli);
-    return caps === undefined ? null : knobState(caps, cli, model);
+    // #993: the detected per-model levels narrow the CLI's general set. The
+    // validation pass reads the same lookup the editor's controls do, so a
+    // block cannot be flagged for a level the picker was still offering.
+    return caps === undefined ? null : knobState(caps, cli, model, modelCatalog.detail(cli, model));
   };
+
+  /** Everything a list-models reply owes this pane (#993, #1020).
+   *
+   *  **A detection reply owes every surface `agent_cli_knobs` owes.** It is
+   *  precisely the answer that makes {@link knobLookup} respond differently, so
+   *  repainting only the dropdown leaves the Thinking-level row offering levels
+   *  this pane's own validator then rejects — the human picks `xhigh`, the next
+   *  mutation re-renders the row disabled, and the findings flag the block. The
+   *  treatment below is `ensureCliKnobs`'s, deliberately identical: same pass,
+   *  same three renders, same in-place knob repaint when the form must not be
+   *  rebuilt.
+   *
+   *  One method rather than one per route, because both routes owe the same
+   *  work: the lookup a block form fires when it paints, and the sweep's push
+   *  (`modelCatalog.onReport`) for a form that was already open when the answer
+   *  landed. A second copy is the second place a fix has to be remembered —
+   *  which is the bug #997 caught here in the first place.
+   *
+   *  **It never rebuilds the form unconditionally.** `replaceChildren` destroys
+   *  the input under the caret, so the pane's own rule holds: the form is
+   *  redrawn only when the human is not inside it, and repainted in place when
+   *  they are. The menu goes through {@link refreshBlockModels}, which is
+   *  `null` when no form is on screen and defers past the mid-type window when
+   *  one is.
+   *
+   *  **Idempotent per CLI**, which is where the two routes are reconciled: the
+   *  first delivery to arrive does the work and the second is a no-op, whichever
+   *  order they land in. A second application could only ever repeat the first —
+   *  the sweep asks each CLI once, so there is no later answer for the same one
+   *  to carry. */
+  private applyDetection(program: string): void {
+    if (this.detectionsApplied.has(program)) return;
+    this.detectionsApplied.add(program);
+    // The findings are the pane's, not any one form's, so they are recomputed
+    // and repainted whatever happened to the form meanwhile — a reply that
+    // landed after the human moved on still corrects the file's analysis.
+    this.analysis = analyzeWorkflow(this.text, this.knobLookup);
+    this.renderRoster();
+    this.renderFindings();
+    this.renderGraph();
+    // Through the LIVE hooks, never a captured closure: `renderInspector()`
+    // nulls both precisely so a late reply cannot paint into a detached row.
+    this.refreshBlockModels?.();
+    if (this.formPane.contains(document.activeElement)) this.repaintBlockKnobs?.();
+    else this.renderInspector();
+  }
+
+  /** Ask what models `cli` reports, at most once per pane — see {@link modelProbes}. */
+  private probeModels(cli: string): Promise<CliProbe> {
+    let p = this.modelProbes.get(cli);
+    if (!p) {
+      p = modelCatalog.probe(cli);
+      this.modelProbes.set(cli, p);
+    }
+    return p;
+  }
 
   /** Fetch `agent_cli_knobs` for every CLI the file names, once each (#687).
    *
@@ -851,7 +1035,12 @@ export class WorkflowView {
         this.renderRoster();
         this.renderFindings();
         this.renderGraph();
-        if (!this.formPane.contains(document.activeElement)) this.renderForm();
+        // …but the knob rows are exactly what this reply is the answer for, so
+        // when the inspector can't be redrawn they are repainted in place instead
+        // of being left saying "reading this CLI's capabilities…" until the human
+        // clicks elsewhere and back (#935).
+        if (this.formPane.contains(document.activeElement)) this.repaintBlockKnobs?.();
+        else this.renderInspector();
       });
     }
   }
@@ -926,28 +1115,25 @@ export class WorkflowView {
       this.statusEl.className = "wf-status";
       return;
     }
-    this.renderRoster();
-    this.renderForm();
+    this.renderSelection();
     this.renderFindings();
-    this.renderGraph();
-    this.applyTab();
+    this.applySurface();
   }
 
-  private setTab(tab: Tab): void {
-    this.tab = tab;
-    // Coming back to the form from the text: the model may have changed under it.
-    if (tab === "form") this.renderForm();
-    this.applyTab();
-    if (tab === "yaml") this.yamlArea.focus();
+  /** Switch the primary surface. There is no `renderInspector()` here on purpose: the inspector
+   *  is docked beside BOTH surfaces, so switching one does not change what it is showing — which
+   *  is the whole reason the tabs went. */
+  private setSurface(surface: Surface): void {
+    this.surface = surface;
+    this.applySurface();
+    if (surface === "yaml") this.yamlArea.focus();
   }
 
-  private applyTab(): void {
-    for (const b of Array.from(this.tabBar.children) as HTMLElement[]) {
-      b.classList.toggle("active", b.dataset.tab === this.tab);
-    }
-    this.formPane.hidden = this.tab !== "form";
-    this.yamlPane.hidden = this.tab !== "yaml";
-    this.graphPane.hidden = this.tab !== "graph";
+  private applySurface(): void {
+    this.graphPane.hidden = this.surface !== "canvas";
+    this.yamlPane.hidden = this.surface !== "yaml";
+    this.yamlBtn.classList.toggle("active", this.surface === "yaml");
+    this.yamlBtn.setAttribute("aria-pressed", String(this.surface === "yaml"));
   }
 
   /** The roster: the workflow itself, each block, and the gate — one column, one click to
@@ -968,11 +1154,7 @@ export class WorkflowView {
       const meta = el("span", "wf-row-sub", sub);
       r.append(main, meta);
       if (bad) r.append(el("span", "wf-row-bad", "!"));
-      r.addEventListener("click", () => {
-        this.selection = sel;
-        this.setTab("form");
-        this.renderRoster();
-      });
+      r.addEventListener("click", () => this.selectItem(sel));
       return r;
     };
 
@@ -1013,7 +1195,59 @@ export class WorkflowView {
       )
     );
 
+    // The three OPTIONAL policy sections (#1020), beside the gate for the same reason the gate
+    // is beside the blocks: they are edited the same way, and a second place to click would be
+    // a second place to look. Each sub-line answers the one question that matters about an
+    // optional section — does this FILE say anything, or is loomux's own default in force? —
+    // because a form full of empty fields cannot distinguish those two by itself.
+    rows.push(el("div", "wf-roster-head", "Policy"));
+    const intake = w.intake;
+    const declaredLabels = intake?.labels
+      ? Object.keys(intake.labels).filter((k) => k !== "extra").length
+      : 0;
+    rows.push(
+      row(
+        { kind: "intake" },
+        "Intake",
+        intake
+          ? `${intake.source || "inherited source"}${declaredLabels ? ` · ${declaredLabels} label(s)` : ""}`
+          : "not declared — loomux's default",
+        this.sectionBad("intake")
+      )
+    );
+    const mq = w.merge_queue;
+    rows.push(
+      row(
+        { kind: "merge_queue" },
+        "Merge queue",
+        mq
+          ? `${mq.enabled ? "on" : "off"}${mq.max_batch !== undefined ? ` · batch ${mq.max_batch}` : ""}`
+          : "not declared — off",
+        this.sectionBad("merge_queue")
+      )
+    );
+    const resourceCount = Object.keys(w.resources ?? {}).length;
+    rows.push(
+      row(
+        { kind: "resources" },
+        "Resources",
+        w.resources ? `${resourceCount} resource(s)` : "not declared — no locks",
+        this.sectionBad("resources")
+      )
+    );
+
     this.rosterEl.replaceChildren(...rows);
+  }
+
+  /** Does this policy section carry an ERROR? Routed by the finding's own `section` rather
+   *  than by matching its message, so a reworded message can never quietly stop marking the
+   *  row it is about. */
+  private sectionBad(section: FindingSection): boolean {
+    return this.sectionFindings(section).some((f) => f.severity === "error");
+  }
+
+  private sectionFindings(section: FindingSection): Finding[] {
+    return this.analysis.findings.filter((f) => f.section === section);
   }
 
   /** The findings about ONE block row. A finding names a block by ID, because that is what
@@ -1024,44 +1258,102 @@ export class WorkflowView {
     return this.analysis.findings.filter((f) => f.blockId === (b.id || ""));
   }
 
-  private renderForm(): void {
-    if (this.syntaxBroken()) {
+  /** Point the pane at something — from the roster, the canvas, or a finding. ONE path, because
+   *  the bug #880 is about was two paths that were supposed to agree and didn't: the gate box
+   *  remembered to bring the editor into view and the node handler didn't, so clicking a block
+   *  looked like a dead click. Every selecting gesture now goes through here, and the three
+   *  surfaces that show a selection are refreshed together or not at all. */
+  private selectItem(sel: Selection): void {
+    this.selection = sel;
+    this.renderSelection();
+  }
+
+  /** Re-render the three surfaces that DISPLAY the selection, in the one order that keeps them
+   *  agreeing with each other.
+   *
+   *  THE INSPECTOR GOES FIRST, and that is the whole reason this is a method rather than three
+   *  calls at four call sites. `renderInspector` is the render that NORMALIZES the selection —
+   *  it asks `inspectorTarget` what is actually still there and adopts the answer — while the
+   *  roster and the canvas merely *highlight* whatever `this.selection` currently says. Render
+   *  them first and a stale selection lights nothing at all: select the last block, let an agent
+   *  rewrite `workflow.yml` without it, press Reload, and the roster draws with an index no row
+   *  answers to while the inspector then quietly falls back to the workflow's own settings. The
+   *  two disagree until something else re-renders the roster.
+   *
+   *  It was written correctly in `mutate` and open-coded the wrong way round in the other three
+   *  places, which is the argument for stating it once: an ordering rule that lives in a comment
+   *  next to one of its four call sites is a rule the next three call sites will get wrong. */
+  private renderSelection(): void {
+    this.renderInspector();
+    this.renderRoster();
+    this.renderGraph();
+  }
+
+  /** The docked inspector: a header naming what is selected, and the editor for it.
+   *
+   *  WHAT IS SHOWN is `inspectorTarget` (workflowpane.ts) — including the two ways a selection
+   *  can outlive the thing it points at (a block deleted from under it, an edge erased) and the
+   *  one state where nothing may be edited at all. This used to be a chain of inline checks that
+   *  reassigned `this.selection` and re-entered itself; the reassignment is still needed — the
+   *  roster highlights the SELECTION, so a fallback the roster never hears about would leave a
+   *  stale row lit next to a different editor — but it happens once, here, from the answer. */
+  private renderInspector(): void {
+    // Whatever the last form left here belongs to controls that are about to be
+    // replaced. Cleared FIRST, so a late `agent_cli_knobs` reply can never paint
+    // into a detached row (#935) — every path below ends in a `formPane` swap.
+    // Same for the model dropdown's deferred rebuild (#1020): a detection reply
+    // that lands after the human selected another block must not reach the
+    // picker they left behind.
+    this.repaintBlockKnobs = null;
+    this.refreshBlockModels = null;
+    const w = this.analysis.workflow;
+    const target = inspectorTarget(this.selection, w, this.syntaxBroken());
+    // Adopt the fallback so the roster and the canvas agree with the editor. Never while
+    // `blocked`: that state is about the BUFFER, not the selection, and forgetting which block
+    // the human was on because they typo'd a colon would be its own small insult.
+    if (target.kind !== "blocked") this.selection = target;
+
+    const heading = inspectorHeading(target, w);
+    this.inspTitleEl.textContent = heading.title;
+    this.inspTitleEl.title = heading.title;
+    this.inspSubEl.textContent = heading.sub;
+
+    if (target.kind === "blocked") {
       const warn = el(
         "div",
         "wf-blocked",
-        "The YAML doesn't parse, so the form is disabled — editing it here would rewrite the text you're fixing. " +
-          "Open the YAML tab, fix the error below, and the form comes back."
+        "The YAML doesn't parse, so the editor is disabled — editing it here would rewrite the text you're fixing. " +
+          "Fix the error below in the raw file and the editor comes back."
       );
+      const toYaml = document.createElement("button");
+      toYaml.className = "wf-btn";
+      toYaml.textContent = "Edit the YAML";
+      toYaml.addEventListener("click", () => this.setSurface("yaml"));
+      warn.append(toYaml);
       this.formPane.replaceChildren(warn);
       return;
     }
-    const w = this.analysis.workflow;
-    if (this.selection.kind === "block") {
-      const index = this.selection.index;
-      const block = w.blocks[index];
-      if (!block) {
-        // The block the form was on is gone — deleted here, or deleted by an edit in the
-        // YAML tab. Fall back rather than render a form over nothing.
-        this.selection = { kind: "workflow" };
-        this.renderForm();
-        return;
-      }
-      this.formPane.replaceChildren(this.blockForm(w, block, index));
+    if (target.kind === "block") {
+      this.formPane.replaceChildren(this.blockForm(w, w.blocks[target.index]!, target.index));
       return;
     }
-    if (this.selection.kind === "edge") {
-      const { from, to } = this.selection;
-      // An edge that no longer exists (erased here, or in the YAML tab) is not an edge to show
-      // a panel for.
-      if (!w.edges.some((e) => e.from === from && e.to === to)) {
-        this.selection = { kind: "workflow" };
-        this.renderForm();
-        return;
-      }
-      this.formPane.replaceChildren(this.edgeForm(from, to));
+    if (target.kind === "edge") {
+      this.formPane.replaceChildren(this.edgeForm(target.from, target.to));
       return;
     }
-    this.formPane.replaceChildren(this.selection.kind === "gate" ? this.gateForm(w) : this.workflowForm(w));
+    if (target.kind === "intake") {
+      this.formPane.replaceChildren(this.intakeForm(w));
+      return;
+    }
+    if (target.kind === "merge_queue") {
+      this.formPane.replaceChildren(this.mergeQueueForm(w));
+      return;
+    }
+    if (target.kind === "resources") {
+      this.formPane.replaceChildren(this.resourcesForm(w));
+      return;
+    }
+    this.formPane.replaceChildren(target.kind === "gate" ? this.gateForm(w) : this.workflowForm(w));
   }
 
   // ---------- forms ----------
@@ -1086,42 +1378,42 @@ export class WorkflowView {
     return i;
   }
 
-  /** One model-knob control (#687): the CLI's own values plus "the CLI's default",
-   *  disabled with the vendor's reason where loomux cannot deliver the knob.
+  /** One model-knob field (#687): the label, the select, and the hint that
+   *  carries the vendor's reason where loomux cannot deliver the knob — plus the
+   *  `paint` that redraws all three from a fresh spec.
    *
-   *  `state` is `undefined` while the capability lookup is in flight — the control
-   *  is inert then, because offering values before knowing whether they exist is
-   *  how a form promises something the spawn won't do. A DECLARED value the state
-   *  doesn't offer still shows, marked: this is an editor, and silently dropping
-   *  what the file says would rewrite it the moment any other field is touched. */
-  private knobSelect(
-    state: KnobState | undefined,
-    value: string | undefined,
+   *  It is repaintable rather than rebuilt because the answer moves under a form
+   *  that must not re-render: `context` is only available where the SELECTED
+   *  model has a documented `[1m]` form, so it changes as the human types a model
+   *  id, and re-rendering the form on a keystroke would rebuild the input under
+   *  their caret. What to show is `workflowknobs.ts`' (`KnobFieldSpec`); this is
+   *  the DOM half. */
+  private knobRow(
+    label: string,
+    spec: KnobFieldSpec,
     onChange: (v: string) => void
-  ): HTMLSelectElement {
+  ): { field: HTMLElement; paint: (next: KnobFieldSpec) => void } {
     const s = document.createElement("select");
     s.className = "wf-input";
-    const current = (value ?? "").trim();
-    const add = (v: string, label: string): void => {
-      const opt = document.createElement("option");
-      opt.value = v;
-      opt.textContent = label;
-      s.append(opt);
-    };
-    add("", "(the CLI's default)");
-    for (const v of state?.values ?? []) add(v, v);
-    if (current && !(state?.values ?? []).includes(current)) add(current, `${current} (not delivered)`);
-    s.value = current;
-    s.disabled = !state?.enabled && !current;
     s.addEventListener("change", () => onChange(s.value));
-    return s;
-  }
-
-  /** The hint under a knob control: the vendor's reason when it is unavailable,
-   *  the plain description when it is not. */
-  private knobHint(state: KnobState | undefined, key: string, what: string): string {
-    if (!state) return `${key} — reading this CLI's capabilities…`;
-    return state.enabled ? `${key} — ${what}. Blank leaves the CLI's default.` : state.reason;
+    const hint = el("span", "wf-hint");
+    const field = el("label", "wf-field");
+    field.append(el("span", "wf-label", label), s, hint);
+    const paint = (next: KnobFieldSpec): void => {
+      s.replaceChildren(
+        ...next.options.map((o) => {
+          const opt = document.createElement("option");
+          opt.value = o.value;
+          opt.textContent = o.label;
+          return opt;
+        })
+      );
+      s.value = next.selected;
+      s.disabled = next.disabled;
+      hint.textContent = next.hint;
+    };
+    paint(spec);
+    return { field, paint };
   }
 
   private select(
@@ -1151,9 +1443,117 @@ export class WorkflowView {
     return s;
   }
 
+  /** A select whose options have a LABEL distinct from their value — the shape every
+   *  optional field here needs, because the empty value is a real choice ("inherit
+   *  loomux's default") that has to read as one rather than as a blank row. The plain
+   *  `select` above stays as it is: its values ARE their labels, which is right for a
+   *  closed enum like `kind`. */
+  private labelledSelect(
+    options: readonly { value: string; label: string }[],
+    value: string,
+    onChange: (v: string) => void
+  ): HTMLSelectElement {
+    const s = document.createElement("select");
+    s.className = "wf-input";
+    for (const o of options) {
+      const opt = document.createElement("option");
+      opt.value = o.value;
+      opt.textContent = o.label;
+      s.append(opt);
+    }
+    // Same rule as `select`: a value this build doesn't offer still SHOWS, marked, so that
+    // touching another field can never silently rewrite it to something nobody chose.
+    if (value && !options.some((o) => o.value === value)) {
+      const opt = document.createElement("option");
+      opt.value = value;
+      opt.textContent = `${value} (unknown)`;
+      s.append(opt);
+    }
+    s.value = value;
+    s.addEventListener("change", () => onChange(s.value));
+    return s;
+  }
+
+  /** A bounded whole-number field for the policy sections, or EMPTY for "loomux's default".
+   *
+   *  The bounds are the engine's own (`RESOURCE_SLOTS_MAX`, `RESOURCES_MAX`, … — mirrored in
+   *  workflowmodel.ts), and they are enforced on the way into the MODEL rather than only as
+   *  `min`/`max` attributes: a spinner's attributes are advisory, and a typed `9999` would
+   *  otherwise be written into a file the engine then refuses to load. The clamp is shown
+   *  back on blur, so it is never a value the human can't see. A hand-written out-of-range
+   *  value still gets its finding — this stops the FORM from producing one. */
+  private boundedNumber(
+    value: number | undefined,
+    bounds: FieldBounds,
+    onChange: (v: number | undefined) => void,
+    placeholder = "loomux's default"
+  ): HTMLInputElement {
+    const i = document.createElement("input");
+    i.className = "wf-input";
+    i.type = "number";
+    i.min = String(bounds.min);
+    // NO `max` attribute where the schema declares no ceiling. An absent `max` in
+    // `POLICY_BOUNDS` is a statement — the engine accepts anything above the floor — and a
+    // form that invented one would rewrite a legal `max_batch: 100` to whatever it made up
+    // (#1020 review, finding 2). The floor is real everywhere, so it is always applied.
+    if (bounds.max !== undefined) i.max = String(bounds.max);
+    i.value = value === undefined ? "" : String(value);
+    i.placeholder = placeholder;
+    const clamp = (n: number): number => {
+      const atLeast = Math.max(bounds.min, Math.round(n));
+      return bounds.max === undefined ? atLeast : Math.min(bounds.max, atLeast);
+    };
+    i.addEventListener("input", () => {
+      const raw = i.value.trim();
+      if (!raw) {
+        onChange(undefined);
+        return;
+      }
+      const n = Number(raw);
+      if (!Number.isFinite(n)) return; // a half-typed "-" or "e" — wait for the rest
+      onChange(clamp(n));
+    });
+    // Show the clamp once they stop typing. Doing it on `input` would fight the caret of
+    // someone typing "480" one digit at a time (the "4" would become the minimum).
+    i.addEventListener("change", () => {
+      const raw = i.value.trim();
+      if (!raw) return;
+      const n = Number(raw);
+      if (Number.isFinite(n)) i.value = String(clamp(n));
+    });
+    return i;
+  }
+
+  /** The enable-toggle every optional section is edited through, and the reason all three
+   *  forms are shaped like `gateForm`: the checkbox IS the section's presence in the file.
+   *
+   *  Off writes nothing at all — not `enabled: false`, not a block of defaults — because the
+   *  model emits only what is declared, so an untouched (or re-untouched) section leaves the
+   *  file exactly as it found it. That is the property a human relies on when they open this
+   *  form to look rather than to change something. */
+  private sectionToggle(label: string, on: boolean, onChange: (on: boolean) => void): HTMLElement {
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.checked = on;
+    cb.addEventListener("change", () => onChange(cb.checked));
+    const line = el("label", "wf-check");
+    line.append(cb, el("span", "wf-check-label", label));
+    return line;
+  }
+
+  /** The findings for one policy section, rendered inline under its form — the same
+   *  treatment `blockForm` gives a block's own findings, and for the same reason: the
+   *  place to say what is wrong with a value is beside the field that sets it. */
+  private sectionFindingList(section: FindingSection): HTMLElement | null {
+    const found = this.sectionFindings(section);
+    if (!found.length) return null;
+    const list = el("ul", "wf-inline-findings");
+    for (const f of found) list.append(el("li", `wf-finding wf-${f.severity}`, f.message));
+    return list;
+  }
+
   private workflowForm(w: Workflow): HTMLElement {
     const box = el("div", "wf-fields");
-    box.append(el("h3", "wf-form-title", "Workflow"));
     box.append(
       this.field(
         "Name",
@@ -1183,7 +1583,6 @@ export class WorkflowView {
 
   private blockForm(w: Workflow, b: WorkflowBlock, index: number): HTMLElement {
     const box = el("div", "wf-fields");
-    box.append(el("h3", "wf-form-title", b.name || b.id || `Block ${index + 1}`));
 
     /** Edit THIS row, by index. Never by id: the rows that most need editing are the ones
      *  whose id is missing or duplicated, and an id lookup would edit the wrong one. */
@@ -1229,15 +1628,63 @@ export class WorkflowView {
       )
     );
 
+    // The role hint (#250/#324): a persona/template/badge MARKER, never a capability — and
+    // the offer is DERIVED from the same pairing rule the validator applies
+    // (`roleHintsForKind`), so this picker cannot spell a combination the parser rejects, and
+    // a hint added to the model shows up here without an edit. A block already declaring one
+    // its kind can't carry still shows it, marked, because that is the finding it needs to fix.
+    const hints = roleHintsForKind(b.kind);
+    box.append(
+      this.field(
+        "Role hint",
+        this.labelledSelect(
+          [{ value: "", label: "none" }, ...hints.map((h) => ({ value: h, label: h }))],
+          b.role_hint ?? "",
+          (v) =>
+            edit((t) => {
+              if (v) t.role_hint = v;
+              else delete t.role_hint;
+            })
+        ),
+        hints.length
+          ? "Optional and INERT: it picks a persona/template fragment and a badge. Capability still comes from kind alone."
+          : `No role hint applies to a ${b.kind || "block"} — each hint requires the one kind it is meaningless without.`
+      )
+    );
+
     box.append(
       this.field("Agent CLI", this.select(WORKFLOW_CLIS, b.cli, (v) => edit((t) => (t.cli = v))))
     );
 
+    // The model field is the SAME control the launcher renders (#935): one
+    // dropdown, one catalog — the CLI's own reported models merged over this
+    // repo's curated suggestions — with the `custom…` escape that keeps it a
+    // wider field than the free-text box it replaces, not a narrower one. A CLI
+    // this repo has no curated row for (`gemini`) is still probed like any
+    // other — it is the REPLY that carries nothing today — and with nothing on
+    // either side the picker opens straight onto that custom input.
+    const cli = b.cli.trim();
+    const repaint = (): void => {
+      const now = this.analysis.workflow.blocks[index]?.model ?? picker.value;
+      picker.setOptions(blockModelOptions(modelCatalog.models(cli)), now, cli);
+    };
+    const picker = new ModelPicker({
+      selectClass: "wf-input",
+      inputClass: "wf-input",
+      placeholder: "model id…",
+      blankLabel: BLOCK_DEFAULT_MODEL_LABEL,
+      // #993. The lookup is live rather than a snapshot: the catalog's answer
+      // can arrive after this control was built, and a picker holding a copy
+      // taken at construction would show the old one forever.
+      detailFor: (id) => modelCatalog.detail(cli, id),
+    });
+    repaint();
     box.append(
       this.field(
         "Model",
-        this.textInput(b.model, (v) => edit((t) => (t.model = v), false), "(the CLI's default)"),
-        "e.g. opus, sonnet, auto. Blank leaves the CLI's default."
+        picker.root,
+        "The CLI's own list, merged over loomux's suggestions — or type any id (a Bedrock " +
+          "profile, a gateway deployment, a model newer than this build). Unset leaves it to loomux."
       )
     );
 
@@ -1247,31 +1694,90 @@ export class WorkflowView {
     // can carry. A knob this CLI/model cannot take renders disabled with that
     // reason as the hint, which is also the finding the validation pass raises if
     // the file declares one anyway.
-    const states = this.knobLookup(b.cli.trim(), b.model);
-    box.append(
-      this.field(
-        "Thinking level",
-        this.knobSelect(states?.effort, b.effort, (v) =>
-          edit((t) => {
-            if (v) t.effort = v;
-            else delete t.effort;
-          })
-        ),
-        this.knobHint(states?.effort, "effort:", "how hard this block's agent thinks")
-      )
+    const knobs = new BlockKnobFields(this.knobLookup, cli, b.model, b);
+    const effortRow = this.knobRow("Thinking level", knobs.effort, (v) =>
+      edit((t) => {
+        if (v) t.effort = v;
+        else delete t.effort;
+      })
     );
-    box.append(
-      this.field(
-        "Context window",
-        this.knobSelect(states?.context, b.context, (v) =>
-          edit((t) => {
-            if (v) t.context = v;
-            else delete t.context;
-          })
-        ),
-        this.knobHint(states?.context, "context:", "the model's context window")
-      )
+    const contextRow = this.knobRow("Context window", knobs.context, (v) =>
+      edit((t) => {
+        if (v) t.context = v;
+        else delete t.context;
+      })
     );
+    box.append(effortRow.field, contextRow.field);
+
+    /** Redraw the knob rows from whatever the model and the capability record now
+     *  say — the repaint that a form which must not re-render still owes them. */
+    const repaintKnobs = (): void => {
+      effortRow.paint(knobs.effort);
+      contextRow.paint(knobs.context);
+    };
+    this.repaintBlockKnobs = repaintKnobs;
+    // The menu's half of the same contract (#1020). Deferred past the mid-type
+    // window rather than dropped — rebuilding under a half-typed id resolves it
+    // to the dropdown branch and hides the input beneath the caret (#997 review
+    // NB-3) — and installed as a LIVE hook so `renderInspector` can take it
+    // away when these controls are detached.
+    this.refreshBlockModels = () => picker.runWhenNotEditing(repaint);
+
+    // Fires for a dropdown pick AND for every keystroke in the `custom…` box.
+    // The keystroke is the case that was broken: `context` is only offered where
+    // the selected model has a documented `[1m]` form, so typing a model over one
+    // that has none (or vice versa) has to re-derive the knob — and a `change`
+    // listener on the select alone never sees a typed id at all.
+    //
+    // `rerenderForm: false`, like every other free-text control here: rebuilding
+    // the form on a keystroke would rebuild the input the human is typing into
+    // and drop the caret at its end. That suppression is exactly why the repaint
+    // has to be explicit.
+    picker.onChange = () => {
+      const model = picker.value;
+      edit((t) => (t.model = model), false);
+      knobs.setModel(model);
+      repaintKnobs();
+    };
+
+    // What the CLI on THIS machine reports, once it answers. Only re-set when it
+    // reported something — re-setting an identical list would rebuild the menu
+    // for no gain — and only while this form is still the one on screen. The
+    // fallback is re-read from the MODEL rather than closed over from `b`: by the
+    // time this lands the human may have chosen the blank row, and a stale
+    // `b.model` would re-select the id they just cleared.
+    if (cli) {
+      void this.probeModels(cli).then((p) => {
+        if (!p.models.length || !this.formPane.contains(picker.root)) return;
+        // Never under the caret. `setOptions` re-runs `pickerSelection`, and an
+        // id the probe turns out to carry resolves to the DROPDOWN branch —
+        // which hides the custom input being typed into, sending the rest of the
+        // keystrokes nowhere. The pane takes the same care with the capability
+        // reply (`ensureCliKnobs`), and for the same reason. The menu is not
+        // lost: the next form render paints it from the resolved catalog.
+        if (picker.root.contains(document.activeElement)) return;
+        const now = this.analysis.workflow.blocks[index]?.model ?? "";
+        picker.setOptions(blockModelOptions(modelCatalog.models(cli)), now, cli);
+      });
+      // And the detection LOOKUP (#1020) — fired from this render path, which
+      // #993 forbade and this slice makes correct: it cannot spawn an agent CLI,
+      // because the backend swept them once at startup and this reads what it
+      // left (`src-tauri/src/modelwire.rs`).
+      //
+      // **Guarded on `report(cli)` being absent, and that guard is what makes it
+      // terminate.** `applyDetection` ends in `renderInspector()`, which rebuilds
+      // this form and re-runs this line: without the guard, every reply would
+      // re-enter the render it was answering. A reply worth having sets
+      // `report(cli)`, so the rebuilt form skips this; one that carries nothing
+      // returns below before refreshing anything. Both routes out are dead ends,
+      // which is the property to check if this ever grows a third.
+      if (!modelCatalog.report(cli)) {
+        void modelCatalog.detect(cli).then((r) => {
+          if (!r.models.length) return;
+          this.applyDetection(cli);
+        });
+      }
+    }
 
     // Persona: inline prompt, a profile file, or neither (the built-in role template).
     // Exactly one, enforced here rather than only reported: the two compile to different
@@ -1323,6 +1829,96 @@ export class WorkflowView {
         )
       );
     }
+
+    // `allow:` — extra pre-approved tool patterns (#222), a tag list rather than one
+    // comma-separated field for a reason that would otherwise corrupt the value: a real
+    // pattern CONTAINS commas (`Bash(gh pr view --json title,body)`), so a comma cannot also
+    // be the separator. One row per pattern, and the row is the whole editor for it.
+    //
+    // It is RESTRICT-ONLY, and the form says so out loud: deny beats allow on both CLIs, so a
+    // pattern here can never re-grant something loomux's containment took away — it only
+    // pre-approves something the block could already have been asked to approve. That is why
+    // the two kinds that may not declare it at all (the orchestrator, and the read-only class)
+    // are refused rather than merely warned.
+    // THE ROWS ARE LOCAL; the FILE is what is left when the empty ones are dropped.
+    //
+    // That one rule replaces the draft-row special case the first cut had, and closes the
+    // hole it left (#1020 review, finding 5): a *committed* row cleared with select-all-
+    // delete wrote `allow: [""]` and then raised the "dropped, and pre-approves nothing"
+    // warning about it — the pane complaining about its own keystroke, which is exactly
+    // what the draft row existed to avoid, reached from the other direction. An empty row
+    // is now a row you are in the middle of typing, wherever it came from, and it reaches
+    // the file only once it has something in it.
+    const denial = allowDenialReason(b.kind);
+    const rows: string[] = [...(b.allow ?? [])];
+    const allowList = el("div", "wf-checks");
+
+    /** Write the non-empty rows, in order. The key goes entirely when nothing is left: an
+     *  `allow: []` is a line that declares nothing, and the model emits only what is
+     *  declared. `rerenderForm: false` — this runs on every keystroke. */
+    const commitRows = (): void =>
+      edit((t) => {
+        const kept = rows.filter((p) => p.trim() !== "");
+        if (kept.length) t.allow = kept;
+        else delete t.allow;
+      }, false);
+
+    /** Rebuild the row DOM from `rows`. Only ever called from add/remove — deliberate
+     *  clicks, with no caret to protect — so the indices every row closure captures are
+     *  rebuilt at exactly the moments they would otherwise go stale. A keystroke mutates
+     *  `rows[i]` in place and repaints nothing. */
+    const paintRows = (): void => {
+      const built = rows.map((value, i) => {
+        const line = el("div", "wf-check");
+        const input = this.textInput(
+          value,
+          (v) => {
+            rows[i] = v;
+            commitRows();
+          },
+          "Bash(npm test *)"
+        );
+        const del = document.createElement("button");
+        del.className = "wf-btn wf-btn-danger";
+        del.textContent = "✕";
+        del.title = "Remove this pattern";
+        del.addEventListener("click", () => {
+          rows.splice(i, 1);
+          commitRows();
+          paintRows();
+        });
+        line.append(input, del);
+        return line;
+      });
+      const addPattern = el("button", "wf-add", "+ Add pattern") as HTMLButtonElement;
+      addPattern.disabled = !!denial;
+      addPattern.addEventListener("click", () => {
+        rows.push("");
+        paintRows();
+        // Focus the row just added — the point of pressing the button is to type in it.
+        const inputs = allowList.querySelectorAll<HTMLInputElement>("input.wf-input");
+        inputs[inputs.length - 1]?.focus();
+      });
+      const children: HTMLElement[] = [...built, addPattern];
+      if (!rows.length && !denial) {
+        children.push(
+          el("span", "wf-hint", "None — the block runs with its class's own tool surface.")
+        );
+      }
+      allowList.replaceChildren(...children);
+    };
+    paintRows();
+    box.append(
+      this.field(
+        "Extra allowed tools",
+        allowList,
+        denial
+          ? `A ${b.kind} block may not declare allow: — ${denial}.`
+          : "Pre-approved tool patterns, passed to the CLI's own --allowedTools/--allow-tool. " +
+              "RESTRICT-ONLY: deny beats allow on both CLIs, so this can never re-grant what the " +
+              "block's kind takes away. loomux passes only letters, digits and ( ) : * _ - . / , and spaces."
+      )
+    );
 
     // Outgoing edges, edited as "what runs after this" — the honest phrasing for an
     // advisory edge, and the only edge editing the form needs: every edge has a source.
@@ -1378,7 +1974,6 @@ export class WorkflowView {
    *  a human clicks on an advisory edge, and it is where they should learn that it is advisory. */
   private edgeForm(from: string, to: string): HTMLElement {
     const box = el("div", "wf-fields");
-    box.append(el("h3", "wf-form-title", `${from} → ${to}`));
     box.append(
       el(
         "p",
@@ -1399,7 +1994,6 @@ export class WorkflowView {
 
   private gateForm(w: Workflow): HTMLElement {
     const box = el("div", "wf-fields");
-    box.append(el("h3", "wf-form-title", "Merge gate"));
     box.append(
       el(
         "p",
@@ -1454,17 +2048,31 @@ export class WorkflowView {
     );
 
     if (gate.require === "threshold") {
-      const n = document.createElement("input");
-      n.className = "wf-input";
-      n.type = "number";
-      n.min = "1";
-      n.value = String(gate.threshold ?? 1);
-      n.addEventListener("input", () =>
-        this.mutate((next) => {
-          next.gates.merge!.threshold = Number(n.value) || 1;
-        }, false)
+      // Through the same bounded control, and the same `POLICY_BOUNDS` row, as every other
+      // number in this pane (#1020 review, finding 7). It used to hand-roll its own input
+      // whose floor was the string "1" and whose empty state wrote `Number("") || 1` — the
+      // pane inventing a threshold nobody typed, which is the same defect as the invented
+      // `max_batch` ceiling one finding earlier. Empty now means UNDECLARED, and a
+      // threshold gate with no threshold is exactly what `gate-bad-threshold` is for: the
+      // human is told what the gate needs instead of being given a number they didn't ask
+      // for.
+      box.append(
+        this.field(
+          "Threshold",
+          this.boundedNumber(
+            gate.threshold,
+            POLICY_BOUNDS["gate.threshold"]!,
+            (v) =>
+              this.mutate((next) => {
+                const g = next.gates.merge!;
+                if (v === undefined) delete g.threshold;
+                else g.threshold = v;
+              }, false),
+            "how many must pass"
+          ),
+          "How many of the named reviewers must record a PASS. There is no default — a threshold gate says the number."
+        )
       );
-      box.append(this.field("Threshold", n));
     }
 
     const reviewers = el("div", "wf-checks");
@@ -1537,9 +2145,323 @@ export class WorkflowView {
     return box;
   }
 
+  // ---------- the policy sections (#1020) ----------
+  //
+  // Three optional sections the file could always carry and the pane could never edit:
+  // `intake:` (#382 — where autonomous work comes from), `merge_queue:` (#581) and
+  // `resources:` (#858). All three are shaped like `gateForm` — an enable-toggle whose
+  // state IS the section's presence in the file, then the fields — and all three lean on
+  // the model's declared-only emission: a field left blank writes NO line, so opening a
+  // form to read it can never turn "inherit loomux's default" into a pin.
+
+  private intakeForm(w: Workflow): HTMLElement {
+    const box = el("div", "wf-fields");
+    box.append(
+      el(
+        "p",
+        "wf-note",
+        "Where autonomous work comes from: which source the orchestrator polls, and the label " +
+          "vocabulary it matches on. Every field is optional — an undeclared one inherits loomux's " +
+          "built-in profile, so a repo can override one label and keep the other four."
+      )
+    );
+
+    const intake = w.intake;
+    box.append(
+      this.sectionToggle("This repo declares its own intake", !!intake, (on) =>
+        this.mutate((next) => {
+          if (on) next.intake = {};
+          else delete next.intake;
+        })
+      )
+    );
+    if (!intake) return box;
+
+    box.append(
+      this.field(
+        "Source",
+        this.labelledSelect(
+          [
+            { value: "", label: "inherit loomux's default" },
+            ...INTAKE_SOURCES.map((s) => ({ value: s, label: s })),
+          ],
+          intake.source ?? "",
+          (v) =>
+            this.mutate((next) => {
+              const i = next.intake!;
+              if (v) i.source = v;
+              else delete i.source;
+            })
+        ),
+        "github-labels polls the repo's issues; board reads the task board; none disables autonomous intake."
+      )
+    );
+
+    const LABEL_HINTS: Record<IntakeLabelKey, string> = {
+      ready: "Groomed — an agent may start this.",
+      investigate: "Research only: post findings, write no code.",
+      owned: "An orchestrator has taken this issue.",
+      prototype: "Build for a demo, not for merge.",
+      hold: "The veto (#778): held by the human — do not start this, even under full autonomy.",
+    };
+    for (const key of INTAKE_LABEL_KEYS) {
+      const value = intake.labels?.[key];
+      box.append(
+        this.field(
+          `Label · ${key}`,
+          this.textInput(
+            value ?? "",
+            (v) =>
+              this.mutate((next) => {
+                const i = next.intake!;
+                const labels = i.labels ?? {};
+                if (v.trim()) labels[key] = v.trim();
+                else delete labels[key];
+                // An empty `labels:` mapping is a section nobody declared anything in — drop
+                // it rather than writing `labels: {}`, which would be a statement of its own.
+                if (Object.keys(labels).length) i.labels = labels;
+                else delete i.labels;
+              }, false),
+            "inherit"
+          ),
+          LABEL_HINTS[key]
+        )
+      );
+    }
+    box.append(
+      el(
+        "p",
+        "wf-note",
+        `A label is letters, digits, - and _ (no leading -, at most ${ID_MAX_CHARS} characters). ` +
+          "loomux rejects anything else rather than rewriting it, so the label it looks for stays " +
+          "the one your repo actually has."
+      )
+    );
+    const findings = this.sectionFindingList("intake");
+    if (findings) box.append(findings);
+    return box;
+  }
+
+  private mergeQueueForm(w: Workflow): HTMLElement {
+    const box = el("div", "wf-fields");
+    box.append(
+      el(
+        "p",
+        "wf-note",
+        "The bisecting merge queue: approved sub-PRs land as one batch, and a batch whose checks " +
+          "fail is bisected rather than dropped. An absent merge_queue: block means the feature is " +
+          "OFF — which is why unticking below removes the section instead of writing enabled: false."
+      )
+    );
+
+    const mq = w.merge_queue;
+    box.append(
+      this.sectionToggle("This repo declares a merge queue", !!mq, (on) =>
+        this.mutate((next) => {
+          if (on) next.merge_queue = { enabled: true };
+          else delete next.merge_queue;
+        })
+      )
+    );
+    if (!mq) return box;
+
+    // A THREE-WAY control, because the file has three states and a checkbox has two
+    // (#1020 review, finding 4). The old checkbox claimed, in its own comment, never to
+    // invent `enabled: false` — and then did, across two clicks: ticking wrote `true`, and
+    // unticking found the key defined and wrote `false` onto a file that had never carried
+    // it. Every repair that keeps a checkbox loses a state instead: untick-always-deletes
+    // silently drops an explicit `enabled: false` a human wrote.
+    //
+    // So the control shows what the file says. Absent and `false` mean the same thing to
+    // the engine (`#[serde(default)]`), which is exactly why the pane must not silently
+    // convert between them — it is the human's line, not ours, and this is the one form in
+    // the pane whose entire subject is what the file declares.
+    box.append(
+      this.field(
+        "Enabled",
+        this.labelledSelect(
+          [
+            { value: "", label: "not declared — off (loomux's default)" },
+            { value: "true", label: "true — run the queue" },
+            { value: "false", label: "false — declared off" },
+          ],
+          mq.enabled === undefined ? "" : String(mq.enabled),
+          (v) =>
+            this.mutate((next) => {
+              const q = next.merge_queue!;
+              if (v === "") delete q.enabled;
+              else q.enabled = v === "true";
+            })
+        ),
+        "An absent enabled: is off — the same thing the engine reads from enabled: false, kept apart here because the line is yours."
+      )
+    );
+
+    box.append(
+      this.field(
+        "Max batch",
+        this.boundedNumber(mq.max_batch, POLICY_BOUNDS["merge_queue.max_batch"]!, (v) =>
+          this.mutate((next) => {
+            const q = next.merge_queue!;
+            if (v === undefined) delete q.max_batch;
+            else q.max_batch = v;
+          }, false)
+        ),
+        "How many approved sub-PRs one batch may carry. Empty inherits loomux's default; a batch of none could never land anything."
+      )
+    );
+
+    box.append(
+      this.field(
+        "Checks timeout (minutes)",
+        this.boundedNumber(
+          mq.checks_timeout_minutes,
+          POLICY_BOUNDS["merge_queue.checks_timeout_minutes"]!,
+          (v) =>
+            this.mutate((next) => {
+              const q = next.merge_queue!;
+              if (v === undefined) delete q.checks_timeout_minutes;
+              else q.checks_timeout_minutes = v;
+            }, false)
+        ),
+        `How long to wait for a batch's checks before calling it unverifiable. loomux clamps this to ${MERGE_QUEUE_CHECKS_TIMEOUT_MIN}–${MERGE_QUEUE_CHECKS_TIMEOUT_MAX}.`
+      )
+    );
+    const findings = this.sectionFindingList("merge_queue");
+    if (findings) box.append(findings);
+    return box;
+  }
+
+  private resourcesForm(w: Workflow): HTMLElement {
+    const box = el("div", "wf-fields");
+    box.append(
+      el(
+        "p",
+        "wf-note",
+        "Named locks agents take turns on — a build directory, a test database, anything two agents " +
+          "must not hold at once. loomux never learns what a name MEANS: it counts slots and bounds " +
+          "how long a hold may last, and the agents' own briefs say what to acquire."
+      )
+    );
+
+    const resources = w.resources;
+    box.append(
+      this.sectionToggle("This repo declares shared resources", !!resources, (on) =>
+        this.mutate((next) => {
+          if (on) next.resources = {};
+          else delete next.resources;
+        })
+      )
+    );
+    if (!resources) return box;
+
+    // Sorted, matching the emitter (and the engine's BTreeMap): a resource map has no
+    // authored order to preserve, unlike the roster, where the order is meaning.
+    const names = Object.keys(resources).sort();
+    for (const name of names) {
+      const r = resources[name]!;
+      // A plain div, not `this.field(...)`: the card holds several inputs and a button, and
+      // wrapping that in the `<label>` `field` produces would nest labels around controls
+      // that already have their own.
+      const card = el("div", "wf-fields");
+      const head = el("div", "wf-check");
+      head.append(el("span", "wf-label", name));
+      const del = document.createElement("button");
+      del.className = "wf-btn wf-btn-danger";
+      del.textContent = "Remove";
+      del.addEventListener("click", () =>
+        this.mutate((next) => {
+          if (next.resources) delete next.resources[name];
+        })
+      );
+      head.append(del);
+      card.append(head);
+      const num = (
+        label: string,
+        key: keyof Pick<WorkflowResource, "slots" | "max_hold_minutes">,
+        hint: string
+      ): void => {
+        card.append(
+          this.field(
+            label,
+            this.boundedNumber(r[key], POLICY_BOUNDS[`resource.${key}`]!, (v) =>
+              this.mutate((next) => {
+                const target = next.resources?.[name];
+                if (!target) return;
+                if (v === undefined) delete target[key];
+                else target[key] = v;
+              }, false)
+            ),
+            hint
+          )
+        );
+      };
+      num(
+        "Slots",
+        "slots",
+        `How many agents may hold it at once (${RESOURCE_SLOTS_MIN}–${RESOURCE_SLOTS_MAX}). Empty inherits loomux's default.`
+      );
+      num(
+        "Max hold (minutes)",
+        "max_hold_minutes",
+        `How long one hold may last before it expires (${RESOURCE_MAX_HOLD_MINUTES_MIN}–${RESOURCE_MAX_HOLD_MINUTES_MAX}). Empty inherits loomux's default.`
+      );
+      box.append(card);
+    }
+
+    const add = el("button", "wf-add", "+ Add resource") as HTMLButtonElement;
+    add.disabled = names.length >= RESOURCES_MAX;
+    add.addEventListener("click", () => void this.addResource(names));
+    box.append(add);
+    if (names.length >= RESOURCES_MAX) {
+      box.append(
+        el(
+          "span",
+          "wf-hint",
+          `${RESOURCES_MAX} is the maximum — every name is listed in the acquire_lock tool description every agent in the group reads.`
+        )
+      );
+    }
+    const findings = this.sectionFindingList("resources");
+    if (findings) box.append(findings);
+    return box;
+  }
+
+  /** Add a resource — ASKING for the name, the same commitment `createBlock` makes about a
+   *  block id and for the same reason: the name is what an agent's own `acquire_lock` call
+   *  spells, loomux rejects rather than rewrites anything outside its alphabet, and a name
+   *  validated as it is typed never becomes a finding to decode afterwards. */
+  private async addResource(existing: readonly string[]): Promise<void> {
+    const name = await promptModal({
+      title: "New resource",
+      body:
+        "The name is what an agent asks for by (acquire_lock \"build\"). Letters, digits, - and _; " +
+        `at most ${ID_MAX_CHARS} characters.`,
+      label: "Resource name",
+      placeholder: "build",
+      affirm: "Add",
+      validate: (v) => {
+        if (!v.trim()) return "A resource needs a name.";
+        if (!isValidResourceName(v)) {
+          return `Use letters, digits, - and _ (at most ${ID_MAX_CHARS} characters).`;
+        }
+        if (existing.includes(v.trim())) return `This workflow already declares "${v.trim()}".`;
+        return null;
+      },
+    });
+    if (!name) return;
+    this.mutate((next) => {
+      const resources = next.resources ?? {};
+      // `{}` — declared with loomux's defaults, which is what a human means by adding a name
+      // and setting nothing. It emits as `build: {}`, the spelling the engine's serde accepts.
+      resources[name.trim()] = {};
+      next.resources = resources;
+    });
+  }
+
   /** Apply an edit to the model and write it straight back into the YAML.
    *
-   *  `rerenderForm` is false for the free-text controls: re-rendering the form on every
+   *  `rerenderForm` is false for the free-text controls: re-rendering the inspector on every
    *  keystroke would rebuild the very input the human is typing into and drop the caret at
    *  its end. Structural edits (a kind change, an edge toggle, a persona switch) DO
    *  re-render, because they change which controls exist. */
@@ -1547,11 +2469,18 @@ export class WorkflowView {
     const next: Workflow = structuredClone(this.analysis.workflow);
     edit(next);
     this.commit(next);
-    this.renderRoster();
+    if (rerenderForm) {
+      this.renderSelection();
+    } else {
+      // The one path that may skip the inspector, and it is safe to: `rerenderForm` is false
+      // only for the free-text controls (a name, a model, a prompt body), and typing in one can
+      // never remove the block or edge that is selected. There is no stale selection for
+      // `renderSelection`'s ordering rule to protect against here — only a caret to protect.
+      this.renderRoster();
+      this.renderGraph();
+    }
     this.renderFindings();
-    this.renderGraph();
     this.updateDirty();
-    if (rerenderForm) this.renderForm();
   }
 
   /** Create a block — from the roster's "+ Add block" or the canvas's "+ Block", the same one
@@ -1594,10 +2523,7 @@ export class WorkflowView {
     // origin on top of something else.
     this.layout = withPosition(this.layout, id, at ?? freeSlot(this.positions()));
     void this.saveLayout();
-    this.selection = { kind: "block", index };
-    this.renderRoster();
-    this.renderForm();
-    this.renderGraph();
+    this.selectItem({ kind: "block", index });
   }
 
   private async deleteBlock(b: WorkflowBlock, index: number): Promise<void> {
@@ -1647,25 +2573,33 @@ export class WorkflowView {
     }
     const rows = findings.map((f) => {
       const r = el("button", `wf-finding wf-${f.severity}`);
-      const where = f.line ? `line ${f.line}` : f.blockId || "";
+      const where = f.line ? `line ${f.line}` : f.blockId || f.section || "";
       if (where) r.append(el("span", "wf-finding-where", where));
       r.append(el("span", "wf-finding-msg", f.message));
       // Click a finding, land on the thing it is about — the whole value of a pre-run
       // validation pass is that it tells you WHERE.
       r.addEventListener("click", () => {
+        // WHICH SURFACE a finding needs is a rule (`surfaceForFinding`): a line wants the caret,
+        // which lives in the YAML; a block wants its editor, which — docked — is already on
+        // screen, so switching surface would drag the human off the canvas for nothing.
+        const surface = surfaceForFinding(f);
+        if (surface) this.setSurface(surface);
         if (f.line) {
-          this.setTab("yaml");
           this.focusLine(f.line);
           return;
         }
-        // A finding names a block by id; the form is keyed by ROW. Land on the first row
+        // A policy-section finding names its own section, which IS a selection — so the
+        // click lands on the form that can fix it, exactly like a block finding does.
+        if (f.section) {
+          this.selectItem({ kind: f.section });
+          return;
+        }
+        // A finding names a block by id; the inspector is keyed by ROW. Land on the first row
         // that answers to that id — which for a duplicate pair is the first of the two,
         // and the duplication is reported on both, so the human sees the pair either way.
         const index = this.analysis.workflow.blocks.findIndex((b) => b.id === f.blockId);
         if (index < 0) return;
-        this.selection = { kind: "block", index };
-        this.setTab("form");
-        this.renderRoster();
+        this.selectItem({ kind: "block", index });
       });
       return r;
     });
@@ -1801,7 +2735,14 @@ export class WorkflowView {
     root.setAttribute("height", String(height));
 
     const defs = svg("defs");
-    defs.append(arrowMarker("wf-arrow", "#6b7394"), arrowMarker("wf-arrow-gate", "#e0af68"));
+    // An SVG <marker>'s fill is a presentation attribute on an element the stylesheet does
+    // not reach, so these two take their values from theme.ts directly rather than through a
+    // custom property (#879 slice B). They mirror `.wf-edge` / `.wf-edge-gate` in styles.css:
+    // a plain edge is a faint rule, a gate edge is the identity amber the gate lane uses.
+    defs.append(
+      arrowMarker("wf-arrow", SEMANTIC.inkFaint),
+      arrowMarker("wf-arrow-gate", IDENTITY.amber)
+    );
     root.append(defs);
 
     // ---- advisory edges: solid, selectable, erasable ----
@@ -1886,10 +2827,7 @@ export class WorkflowView {
       box.setAttribute("class", "wf-gate-box");
       box.addEventListener("pointerdown", (ev) => {
         ev.stopPropagation();
-        this.selection = { kind: "gate" };
-        this.setTab("form");
-        this.renderRoster();
-        this.renderGraph();
+        this.selectItem({ kind: "gate" });
       });
       root.append(box);
       root.append(text(gateX + 12, gateY + 22, "⛔ merge gate", "wf-gate-title"));
@@ -1946,22 +2884,24 @@ export class WorkflowView {
         // gesture would only manufacture the dangling reference the validator then complains
         // about — the file would be describing a mistake the canvas talked you into.
         this.connecting = { from: block.id, at: pt };
-        root.setPointerCapture(e.pointerId);
+        capturePointer(root, e);
         this.renderGraph();
         return;
       }
 
-      this.selection = { kind: "block", index };
       this.dragging = {
         key,
         id: block?.id ?? "",
         grab: { x: pt.x - rect.x, y: pt.y - rect.y },
         at: { x: rect.x, y: rect.y },
       };
-      root.setPointerCapture(e.pointerId);
-      this.renderRoster();
-      this.renderForm();
-      this.renderGraph();
+      capturePointer(root, e);
+      // THE #880 GESTURE. This handler always did the selecting; what it never did was bring the
+      // editor into view, because the editor was behind a tab and only the gate box remembered
+      // to switch to it. There is no tab now and no second thing to remember: `selectItem`
+      // refreshes the roster, the inspector and the canvas together, so the block's editor
+      // appears beside the node under the pointer.
+      this.selectItem({ kind: "block", index });
       return;
     }
 
@@ -1973,13 +2913,11 @@ export class WorkflowView {
       drawn.map((d) => d.geom),
       pt
     );
-    this.selection =
+    this.selectItem(
       hit !== null
         ? { kind: "edge", from: drawn[hit]!.edge.from, to: drawn[hit]!.edge.to }
-        : { kind: "workflow" };
-    this.renderRoster();
-    this.renderForm();
-    this.renderGraph();
+        : { kind: "workflow" }
+    );
   }
 
   private onCanvasMove(e: PointerEvent, root: SVGElement): void {
@@ -2034,12 +2972,11 @@ export class WorkflowView {
    *  that cheap is a dialog people learn to click through. A BLOCK is different — it carries a
    *  prompt, a model, a seat on the gate — and deleting one still asks. */
   private eraseEdge(from: string, to: string): void {
+    // No selection tidy-up here: `mutate` re-renders the inspector, and an edge the workflow no
+    // longer declares is exactly the case `inspectorTarget` falls back on — so the selection
+    // lands on the workflow's own settings, once, by the rule rather than by a second check
+    // that had to stay in step with it.
     this.mutate((next) => Object.assign(next, disconnectBlocks(next, from, to)));
-    if (this.selection.kind === "edge" && this.selection.from === from && this.selection.to === to) {
-      this.selection = { kind: "workflow" };
-      this.renderForm();
-    }
-    this.renderGraph();
   }
 
   /** Delete whatever is selected — the keyboard half of the canvas. A canvas you can only
@@ -2059,6 +2996,23 @@ export class WorkflowView {
 /** How close to a node's out-port a press must land to mean "draw an edge" rather than "move
  *  the node". Generous — the port is a 5px dot, and the two gestures start in the same place. */
 const PORT_HIT = 12;
+
+/** Take pointer capture, BEST EFFORT — never letting it abort the gesture it belongs to.
+ *
+ *  `setPointerCapture` throws (`NotFoundError`) for a pointer id the browser doesn't consider
+ *  active, and it is called from the handler that also SELECTS the block. An exception here
+ *  would therefore skip the selection and re-create, exactly, the dead click #880 exists to fix
+ *  — a click that changes nothing the human can see. That trade is never worth taking, because
+ *  the capture is close to decorative anyway: the very next thing every caller does is
+ *  `renderGraph()`, which replaces the SVG root the capture was taken on, so the capture is
+ *  released a line later regardless and the drag continues on the new root's own listeners. */
+function capturePointer(root: SVGElement, e: PointerEvent): void {
+  try {
+    root.setPointerCapture(e.pointerId);
+  } catch {
+    // See above: the gesture is worth more than the capture.
+  }
+}
 
 // ---------- SVG helpers ----------
 

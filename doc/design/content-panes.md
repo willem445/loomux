@@ -358,13 +358,17 @@ over a text-defined graph** — Studio cannot edit topology at all. Kestra state
 follow outright: *"even if you use the UI to modify a workflow, the platform is still
 generating and updating the YAML definition under the hood."*
 
-So the pane holds ONE buffer — the YAML — and three views over it:
+So the pane holds ONE buffer — the YAML — and several views over it:
 
 ```
-  roster + property form   an edit here SERIALIZES the model back over the buffer
+  roster + inspector       an edit here SERIALIZES the model back over the buffer
   raw YAML (textarea)      an edit here RE-READS the model from the buffer
-  derived graph            READ-ONLY. It cannot write. It cannot corrupt the file.
+  canvas                   a gesture here goes out through the same pure model as a form edit
 ```
+
+How those views are ARRANGED is the subject of *"#880: the tabs die, the inspector docks"*
+below — they were three exclusive tabs originally, which turned out to be the thing wrong with
+the pane. The canvas was also read-only in v1 (*"v2: the canvas edits the file"* below).
 
 `workflowmodel.ts` is the pure half (parse → validate → derive → serialize) and holds every
 rule; `workflowview.ts` is DOM. That split is the house convention (`taskboard` ↔ `tasksview`)
@@ -374,7 +378,7 @@ unit-tested without simulating a DOM.
 **The one rule the sync has to obey: while the YAML does not PARSE, the form is disabled.**
 A form edit serializes the model back over the buffer, so serializing a model we only half
 understood would silently destroy the broken text the human is in the middle of fixing. A
-syntax error therefore disables the form and says why (the YAML tab and the findings strip
+syntax error therefore disables the form and says why (the raw YAML and the findings strip
 stay live, which is where the fix happens). Every *other* kind of breakage — an unknown kind,
 a dangling edge — still renders, as a stub with a finding, because **a block you cannot see is
 a block you cannot repair**; refusing to open a file you can't fully understand is ComfyUI's
@@ -555,14 +559,33 @@ didn't touch, and falls back to the canonical emitters only for the piece that c
   own first rule (§ above) — is reused whole when it `deepEqual`s what parsing the original text
   produced for that id. An edited block, or a brand-new one, regenerates canonically; every
   *other* block keeps its own comment, blank-line spacing and field order untouched.
-- **`edges:`** and **`gates:`** each split their SECTION HEADER (the key line and whatever
-  comment introduces it, e.g. "# ADVISORY — the declared happy path") from their CONTENT (the
-  fan-out entries, or the gate itself). The header is reused whenever the section still exists
-  at all, whether or not its content changed; only the content falls back to canonical when it
-  did. Rewiring one edge, then, costs that section's content — not the paragraph explaining what
-  the section is *for*, which review found was the larger share of what a block-roster edit
-  used to cost (a deleted block that also drops its edges and its gate seat used to take the
-  `# ADVISORY` and `# ENFORCED` headers with it; now it doesn't).
+- **`edges:`**, **`gates:`**, **`intake:`**, **`merge_queue:`** and **`resources:`** each split
+  their SECTION HEADER (the key line and whatever comment introduces it, e.g. "# ADVISORY — the
+  declared happy path") from their CONTENT (the fan-out entries, the gate itself, the fields).
+  The introducing comment is reused whenever the section still exists at all, whether or not its
+  content changed; only the content falls back to canonical when it did. Rewiring one edge, then,
+  costs that section's content — not the paragraph explaining what the section is *for*, which
+  review found was the larger share of what a block-roster edit used to cost (a deleted block
+  used to take the `# ADVISORY` and `# ENFORCED` headers with it along with its edges and its
+  gate seat; now it doesn't, **as long as the section still has something left in it**). A
+  deletion that empties `edges:` or `gates:` outright is the exception, and still costs the
+  comment: an empty `edges:`/`gates:` is not written at all, so there is no section left for it
+  to introduce. `intake:`/`merge_queue:`/`resources:` do not have that cliff — they are still
+  written when empty, as `key: {}` — and whether the two families should agree is a question
+  this fix only made visible, not one it answers.
+- **The `key:` line itself, though, is a function of the content that follows it** — it is the
+  one part of a header that cannot simply be reused. An empty section is written `resources: {}`
+  (and an empty roster `blocks: []`) rather than as a bare key, because a bare key is YAML *null*
+  and would re-read as "never declared", silently deleting a section a human deliberately left
+  empty. That spelling is also a dead end for block children: reusing it above a regenerated body
+  emitted `resources: {}` with `catfish: {}` indented under it — not YAML at all, so the pane
+  disabled the form over text it had just written itself the first time anyone added a resource
+  (#1090). So a regenerated body re-derives its key line (`sectionHeaderLines`): the original is
+  kept only when both it and the canonical one are bare block headers, and otherwise the
+  canonical line wins with the original's own trailing comment carried onto it. Same rule in both
+  directions, and the same rule for a hand-written one-line `resources: { build: { slots: 2 } }`,
+  whose inline value *is* the section's content — reusing that line under a regenerated body
+  would have written the content twice, or undone the deletion that emptied it.
 
 That granularity — whole section header, whole block by id, not per-field — is the deliberate
 boundary #233 draws: *comment-preserving for the parts an edit didn't touch*, not full-fidelity
@@ -614,7 +637,7 @@ had. `serializeWorkflow` (Format's full rewrite) has no original text to take a 
 and still always emits `\n`.
 
 **One known, accepted cosmetic gap: reordering.** A block is matched by `id`, not by position,
-so a reordered block's own comment travels WITH it — a hand-edit in the YAML tab that swaps two
+so a reordered block's own comment travels WITH it — a hand-edit in the raw YAML that swaps two
 blocks, followed by an unrelated form edit, keeps both blocks' comments. What does NOT
 travel correctly is the BLANK-LINE spacing between items: each item's leading trivia was
 captured relative to its *original* neighbor, so after a reorder it can separate a different
@@ -630,7 +653,7 @@ human who explicitly wants the whole file canonicalized. `rewriteImpact` (pure, 
 dropped"), with **Cancel as the default** — the only dialog in this pane where the affirmative
 is not the focused button, because it is the only one asking about work that is not
 recoverable, asked once per file (reset on `load()`). A file already in canonical form formats
-silently. The **YAML tab** remains unaffected either way: it saves exactly what you typed.
+silently. The **raw YAML view** remains unaffected either way: it saves exactly what you typed.
 
 **The dogfood pin (`test/workflowdogfood.test.ts`) now asserts the fix, not just the mitigation
 around it**: re-serializing the shipped file with nothing changed reproduces it byte-for-byte,
@@ -750,6 +773,71 @@ lesson is the one the CSS taught: **visibility is not a safety property.** The p
 against scaffolding over a workflow was that the button was *supposed to be invisible*, and a
 stylesheet was all it took to make that false.
 
+### #880: the tabs die, the inspector docks
+
+Everything above is about the pane being *right*. #880 is about the pane being *usable*, and the
+human's report was one sentence: clicking a block does nothing.
+
+It was true, and the cause is structural rather than a missing call site — though it presents as
+one. The pane had three exclusive tabs (Blocks / YAML / Graph), so **selecting** something and
+**showing** it were two separate acts. `onCanvasDown` performed the first: it set the selection
+and re-rendered the property form — behind the Blocks tab, off screen, while the human was
+looking at the Graph tab. The gate box's handler remembered to call `setTab("form")`; the node
+handler did not. Every unit test in the repo passed the whole time, because the model was right
+and the selection was right; the only thing wrong was which of three stacked panes was on top,
+which is the one thing a DOM-free test cannot see.
+
+Adding the missing `setTab("form")` would have fixed the symptom by making the canvas **throw
+the human off the canvas** every time they clicked a node — you would edit blind, or bounce
+between tabs. So the tabs go instead:
+
+```
+  ┌────────────┬───────────────────────────────┬──────────────┐
+  │  roster    │  the canvas (primary surface) │  inspector   │
+  │  (blocks,  │  ── or the raw YAML, which is │  (whatever   │
+  │   gate)    │     a toggle over the same    │   is         │
+  │            │     space)                    │   selected)  │
+  └────────────┴───────────────────────────────┴──────────────┘
+```
+
+- **the canvas is primary** — it is the thing the pane is for, and it now keeps the middle of the
+  screen at all times;
+- **the inspector is docked**, beside it, showing the editor for whatever is selected — block,
+  edge, gate, or (nothing selected) the workflow's own settings. There is no second act left to
+  forget: the selection *is* what the inspector shows;
+- **the roster stays** as the left column. It is a second way to reach the same selection, and
+  deliberately so — it is the pane's keyboard/accessibility path, and it is where a block with no
+  id or a duplicated id is still clickable when the canvas can only draw one of them;
+- **the raw YAML stays first-class**, as a toggle over the canvas rather than a tab beside it.
+  It is a different modality over the same buffer, not a lesser one — the file is still the
+  source of truth, and this is still the Kestra pattern. The inspector stays docked through the
+  toggle, because it is beside *both* surfaces rather than a peer of either.
+
+The rules that used to be implicit in "which tab is on top" are now stated in `workflowpane.ts`,
+where the pane's other three decisions already live:
+
+| The rule | What it settles |
+| --- | --- |
+| `inspectorTarget` | What the inspector shows — including the two ways a selection outlives what it points at (its block deleted, its edge erased), and the unparseable-buffer state where nothing may be edited at all. The view used to answer this inline, by reassigning its own selection field and re-entering itself. |
+| `inspectorHeading` | What it calls that. The sub-line carries the block's **id**, not its name: the canvas is on screen beside it, so "did I click the node I meant?" has to be answerable at a glance, and the id is what edges and the gate reference. |
+| `surfaceForFinding` | Where a finding's click-to-navigate lands. A finding naming a LINE wants the caret, so it wants the YAML; a finding naming a BLOCK wants an editor that is **already on screen**, so it moves no surface at all. That is the old `setTab("form")`, restated as the fact that there is nothing left to remember. |
+| `canvasDeleteAllowed` | When a bare Delete may erase the canvas selection. Only on the canvas, and never inside a field — and the second half matters far more docked than it did under tabs, where "typing in a block's prompt" and "that block is selected on the canvas" could not co-occur. Now they always do. |
+
+**What was deliberately NOT here.** The forms themselves moved unchanged: the descriptor-driven
+rebuild and the model/profile pickers are #880's later slices, and mixing them into a structural
+move would have made the diff unreviewable. The config surfaces named alongside them —
+`intake:`, `merge_queue:`, `resources:`, `allow:` and `role_hint` — **shipped in #1020**: the
+roster grew a `Policy` group whose three rows each open a form shaped like `gateForm`, and the
+block form grew the other two. The descriptor-driven rebuild is still pending, and those forms
+are its natural first consumers. Connection UX (port hover, legal-target highlighting mid-drag) and
+autosave are likewise their own slices. The pane's split geometry — a resizable or auto-sized
+inspector — is #885, not this: the inspector is a fixed-width column so the canvas keeps every
+pixel that is left. And the CSS here is **structural only** (layout, docking, the pressed state of
+one toggle); the visual token pass over this DOM is #879, running in parallel.
+
+`e2e/tests/workflow-editor.spec.ts` pins the part none of the pure tests can: in the real app,
+clicking a node makes that block's editor appear, named by its id, with the canvas still there.
+
 ### The rest is the pattern #217 already set
 
 The workflow file rides in the persisted `file` field the editor pane added; `cwd` carries the
@@ -790,10 +878,12 @@ construction, not by remembering.
 | `pty.ts` / `main.ts` (#219) | `guardAppClose` (the Tauri close hook, kept on the one Tauri seam) + the quit guard and its awaited `flushTabs` |
 | `orchestration.ts` (#219) | group-end keeps a pane holding unsaved edits, and says so |
 | `workflowmodel.ts` (#222) | the pure half: the YAML subset, the schema, the canonical formatter, the pre-run validation pass, the derived graph — all node:tested |
-| `workflowview.ts` (#222) | the DOM: roster + property form, raw YAML, the **editable canvas**, findings strip, save/conflict, the start + error surfaces — and the same `dirty` / `canDiscard` / `bufferReport` contract the editor has |
+| `workflowview.ts` (#222, restructured #880) | the DOM: roster + **docked inspector**, the **editable canvas** as the primary surface with raw YAML as a toggle over it, findings strip, save/conflict, the start + error surfaces — and the same `dirty` / `canDiscard` / `bufferReport` contract the editor has |
 | `workflowlayout.ts` (#222 v2) | the canvas's pure half: `.loomux/workflow.layout.json`, placement, hit-testing, edge routing — all DOM-free, all node:tested |
 | `modal.ts` (#222 v2) | `promptModal` — one line of text, validated on every keystroke (the affirm button is disabled while the id is bad), so a new block can be ASKED for its id instead of being given a generated one |
-| `workflowpane.ts` (#222 v2) | the pane's pure DECISIONS — which surface it shows, how a save is allowed to write, what the layout file may forget. Three rules the view used to hold itself, and got wrong. Plus `createAllowed` (#222 live fix): a create is permitted on the **start surface and nowhere else**, so it can never be reached over a workflow that is already there |
+| `workflowpane.ts` (#222 v2) | the pane's pure DECISIONS — which surface it shows, how a save is allowed to write, what the layout file may forget. Three rules the view used to hold itself, and got wrong. Plus `createAllowed` (#222 live fix): a create is permitted on the **start surface and nowhere else**, so it can never be reached over a workflow that is already there. Plus the four #880 rules that used to be implicit in "which tab is on top": `inspectorTarget`, `inspectorHeading`, `surfaceForFinding`, `canvasDeleteAllowed`. `Selection` gained `intake` / `merge_queue` / `resources` in #1020 — the three OPTIONAL policy sections, addressed by nothing at all, because there is one of each and selecting one the file does not declare is how you declare it (never a stale selection to fall back from) |
+| `test/workflowinspector.test.ts` (#880) | those four rules, node-tested: the fallbacks when a selection outlives its block or its edge, the unparseable-buffer refusal, the id in the header, and the finding that must NOT move a surface |
+| `e2e/tests/workflow-editor.spec.ts` (#880) | the assertion no DOM-free test can make: in the real app, clicking a node makes that block's editor appear beside it, named by its id — the dead click the issue was opened about |
 | `styles.css` → `[hidden] { display: none !important; }` (#222 live fix) | app-wide, one line: an author `display:` rule out-ranks the UA's `[hidden]` **by origin**, so `el.hidden = true` was silently ignored on all seven of the workflow pane's toggled elements — the pane drew its three exclusive surfaces at once, and the "Create workflow" button sat live over a loaded workflow. It also un-breaks the two elements *outside* the pane that had the same defect: the group view's budget meter (`Off ⇒ hidden`) and the tab bar's ✕ on a single tab (`never zero tabs`) |
 | `test/hiddenrule.test.ts` (#222 live fix) | two halves of one guarantee: **the guard is the only important `display` in the stylesheet** (read off every declaration, any selector — an important `display` is the *only* thing that can out-rank `[hidden]`), and **hiding an element hides it** (the cascade, modelled over the compound selectors that carry `display` here) |
 | `src-tauri/tests/workflowfile.rs` (#222 v2) | pins the two backend facts the create path rests on: a null-hash write clobbers (why a create must never use one), and `new_file` refuses atomically without truncating (why claiming the path fixes it) |

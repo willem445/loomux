@@ -85,6 +85,7 @@ import {
 } from "./fileapi";
 import { rankFileNames, moveSelection, basenameStart, queryTerms, type FileNameHit } from "./filematch";
 import { fileIconSvg, folderIconSvg } from "./fileicons";
+import { icon } from "./icons.ts";
 import { confirmModal } from "./modal";
 import { showToast } from "./toast";
 import { FrameGate } from "./framegate";
@@ -112,11 +113,17 @@ export interface FileExplorerHost {
  *  never costs the best hit, and the summary reports the true count. */
 const GOTO_RESULT_CAP = 200;
 
-const SVG_UP = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M8 12.5V3.5M4 7.5 8 3.5l4 4"/></svg>`;
-const SVG_NEW_FILE = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M9 1.9H4.4c-.6 0-1.1.5-1.1 1.1v10c0 .6.5 1.1 1.1 1.1h3.1"/><path d="M9 1.9l3.7 3.7V8"/><path d="M8.8 1.9v3.7h3.9"/><path d="M11.8 9.9v4.2M9.7 12h4.2"/></svg>`;
-const SVG_NEW_FOLDER = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M1.9 12.2V4.3c0-.6.5-1.1 1.1-1.1h3l1.4 1.5h5.6c.6 0 1.1.5 1.1 1.1v1.4"/><path d="M11.5 9.5v4.2M9.4 11.6h4.2"/></svg>`;
-const SVG_RENAME = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 11.2 10.8 2.9a1.6 1.6 0 0 1 2.3 2.3L4.8 13.5l-3 .7z"/></svg>`;
-const SVG_DELETE = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M2.8 4.3h10.4M6.2 4.3V2.8h3.6v1.5M4.2 4.3l.7 8.9h6.2l.7-8.9M6.6 6.6v4.4M9.4 6.6v4.4"/></svg>`;
+// Toolbar glyphs from the registry (#879 slice K), at the 13px box they already
+// had. Four of the five are workspace actions and dye cyan with the tree they
+// act on; DELETE is the one destructive action in this header and takes the
+// danger role, so the button that empties a directory does not look like the
+// one that creates a file.
+const TOOL_ICON_PX = 13;
+const SVG_UP = icon("arrow-up", TOOL_ICON_PX);
+const SVG_NEW_FILE = icon("file-plus", TOOL_ICON_PX);
+const SVG_NEW_FOLDER = icon("folder-plus", TOOL_ICON_PX);
+const SVG_RENAME = icon("pencil", TOOL_ICON_PX);
+const SVG_DELETE = icon("trash-2", TOOL_ICON_PX);
 
 function el(tag: string, cls: string, text?: string): HTMLElement {
   const e = document.createElement(tag);

@@ -15,10 +15,19 @@ import { attentionPresentation } from "./attention";
 import { pauseGroup, resumeGroup, groupSummary, groupUsage } from "./orchestration";
 import { tabCounts } from "./tabcounts";
 import { PollGate } from "./pollgate";
+import { IDENTITY } from "./theme.ts";
 
 // Reuse the orchestration group palette (orchbadge.ts GROUP_COLORS) so a tab's
-// color vocabulary matches the group-accent colors the panes already use.
-const TAB_COLORS = ["#7aa2f7", "#9ece6a", "#e0af68", "#bb9af7", "#7dcfff", "#f7768e"];
+// color vocabulary matches the group-accent colors the panes already use — the same six
+// identity hues, in the same order (#879 slice B).
+const TAB_COLORS = [
+  IDENTITY.azure,
+  IDENTITY.jade,
+  IDENTITY.amber,
+  IDENTITY.violet,
+  IDENTITY.cyan,
+  IDENTITY.rose,
+];
 
 // Preview cost, formalized (#63). Re-serializing every pane on a fast timer is
 // the preview's whole expense, so both levers are named + bounded here and in

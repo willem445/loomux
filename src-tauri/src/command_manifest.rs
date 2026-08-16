@@ -142,6 +142,8 @@ pub const APP_COMMANDS: &[&str] = &[
     "orch_solo_adopt",
     // cliprobe (1)
     "probe_agent_cli",
+    // modelwire (1)
+    "list_cli_models",
     // editor (1)
     "open_in_editor",
     // fileedit (7)

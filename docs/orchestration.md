@@ -38,8 +38,57 @@ in an audit log.
    selected CLI what it offers — `opencode models`, which lists the models *your*
    configured providers actually expose, for OpenCode; the CLI's own help for the
    others — so new models appear automatically, with a custom-entry escape hatch.
-3. Set the repository, how many idle workers to start with, and the guardrails:
-   **max live agents** and **permissions**.
+
+   Loomux also asks each CLI directly which models *this machine and this
+   account* can actually run, and what each one supports — the same list your
+   CLI's own model picker would show. What comes back adds rows to the dropdown
+   (nothing is ever removed), labels each with the CLI's own name for it, and
+   fills in a line under the control with the model's description, its
+   reasoning-effort levels, and its context-window size. The effort levels the
+   CLI reports for the selected model then become the ones the **thinking
+   level** knob offers.
+
+   This happens **automatically, once, when loomux starts** — there is nothing
+   to click. Detection runs in the background, so a picker you open in the first
+   seconds may show its built-in suggestions for a moment and fill in the real
+   list as the answer arrives. A CLI you install *while loomux is running* is
+   not detected until you restart it.
+
+   **Copilot CLI is the exception on both counts.** It has no supported way to
+   list its models — its help no longer enumerates them, and it answers neither
+   of the questions above — so its dropdown is a built-in catalog of the models
+   Copilot offers, kept in loomux rather than read from your machine.
+
+   That list is Copilot's product catalog, not your account's, and it can go out
+   of date between loomux releases. So it can disagree with what you can
+   actually run **in both directions**: it may offer a model your plan does not
+   include — picking one fails at launch rather than being hidden, which is
+   deliberate, since loomux would otherwise have to guess your entitlements —
+   and it may omit a model your plan *does* include, whether because your
+   account has access the general catalog does not list or because the model is
+   newer than your build of loomux. **The custom-entry box is the answer to
+   every one of those cases:** type the id and it is used as-is. If your Copilot
+   CLI offers a model this dropdown does not, that is expected rather than a
+   sign it is unavailable to you.
+
+   Every other CLI keeps the automatic behaviour described above, and Copilot
+   will too once it gains a way to be asked.
+
+3. Set the repository and the guardrails: **max live agents**, the cost and
+   recovery limits (idle-kill, max spawns/hour, watchdog stall), and
+   **permissions**.
+
+   A group starts with **no workers**, and there is no setting for it. The
+   orchestrator opens the ones the work needs once it has read the issue —
+   before that, any number would be a guess, and idle agents cost tokens. Ask
+   it for more (or fewer) at any time by typing into its pane.
+
+The card shows the **mark of the agent CLI** it is about to launch, beside the
+title: GitHub's own Copilot glyph for Copilot CLI, a lettered badge for the
+CLIs with no licensed mark, and nothing at all for a pane that runs no agent —
+a terminal, a file explorer, or an SSH connection with no remote CLI chosen.
+It is drawn in that CLI's own colour, and it is the same mark the pane header
+wears once the pane is running.
 
 ### Thinking level and context window
 
@@ -97,7 +146,11 @@ enforces the closed vocabulary and the per-CLI rule above; the workflow pane
 goes further and also validates `context:` against the block's `model:`,
 raising a per-block finding when the two disagree (e.g. `model: haiku` with
 `context: 1m`) — the same model-gate rule the launcher's select uses, so a
-hand-edited file can't drift from what the launcher would show. See
+hand-edited file can't drift from what the launcher would show. In the
+pane's block form the two controls follow the model **as you change it**,
+including a model id you type by hand: pick `sonnet` over `haiku` and the
+context window becomes selectable in the same keystroke, with no need to
+click away from the block and back. See
 [`doc/design/workflows.md`](https://github.com/willem445/loomux/blob/main/doc/design/workflows.md)
 and the `author-loomux-workflow` skill.
 
@@ -358,6 +411,15 @@ reads dimmed and in italics — so an old assignee on a done, reopened, or stall
 task never looks like the same agent is still sitting there. `done` items dim
 further still, receding behind whatever's still active.
 
+A row that's blocked on a human decision or parked for a demo also wears a
+small **marker chip** right after its id — the first thing to catch your eye
+once you know the shape. **❓ needs a decision** means a pending question names
+this row; **👀 needs a look** means the row itself sits in `prototype` or
+`human-testing` with no question naming it (a row that's somehow both shows
+only the decision chip — it's the more specific, more blocking ask). Click it
+to jump straight to that item in the [NEEDS-YOU panel](#steering-attention-and-audit)
+(`Alt+Q`).
+
 ### Dependencies — what's actually startable
 
 A task can declare that it waits on other tasks on the same board. The
@@ -471,9 +533,56 @@ These deserve their own detail — see:
   message.
 - **Attention routing** — a pane earns a pulsing **needs-attention** chip when an
   agent is parked on a prompt only you can answer, when a worker reports done or
-  blocked, or when a task hits a human merge gate. An optional per-group
-  **desktop notification** toggle (🔔 in the lifecycle panel) raises an OS toast
-  for those events (off by default).
+  blocked, when a task hits a human merge gate, or when the orchestrator (or a
+  liaison pane, if the group's workflow has one) has a question pending your
+  answer. Hovering the question chip shows a live count; clicking it focuses
+  the pane and acknowledges the chip — acknowledging only tells loomux you've
+  seen it, so a chip that's still genuinely true comes right back on the next
+  scan.
+  - **The NEEDS-YOU panel** (`Alt+Q`, or the raised-hand icon in an
+    orchestrator pane's header) is where you actually act on a pending
+    question or a demo — everything currently waiting on you, badged with a
+    running total in its own header:
+    - **Decisions** — one card per pending question. Pick one of its options
+      (each can carry the asker's own reasoning under the label), type a
+      free-text answer, or both; a question decides for itself whether it
+      allows a single pick, several, or no free text at all, and the card
+      only offers what that question allows. Sending delivers your answer to
+      the **orchestrator's** pane — even for a question a liaison pane
+      posed, since the liaison never gets the answer notice itself and
+      instead reads the outcome back through its own `list_questions`. A
+      card that names the board row it's holding up links straight to it,
+      and answered or withdrawn questions fall into a faded "answered" tail
+      (the most recent ten) instead of vanishing.
+    - **Demos** — one card per board row parked in `prototype` or
+      `human-testing`, showing the worktree path where the demo lives (click
+      to copy) and a link to its PR when it has one, so you can go run it
+      yourself; a row with no recorded path says so rather than guessing one.
+      **Proceed** promotes a `prototype` (the same gesture as the board's own
+      Proceed button). **Feedback** is offered on either status and sends your
+      notes back to the orchestrator — on `human-testing` it's the
+      request-changes gesture and reopens the task, on `prototype` it's a
+      plain note that leaves the demo gate exactly where it was.
+
+    The panel is the only place a question gets **answered** — before it
+    existed there was no answer surface in the UI at all. Withdrawing one is
+    still a separate, orchestrator-only path: `withdraw_question` settles an
+    overtaken question too, just as *withdrawn* rather than answered, and
+    that was already true before this panel shipped.
+  - **loomux's protocol is that no agent asks you through a blocking
+    dialog.** The orchestrator's role instructions — and a liaison pane's,
+    where the group's workflow declares one — call for filing every question
+    through `ask_human` instead of a CLI's own interactive-question dialog,
+    because a dialog holds the whole pane and refuses every delivery queued
+    behind it. That is instruction an agent follows, not yet something
+    loomux enforces structurally on every CLI, so treat it as the norm
+    rather than a hard guarantee.
+  - An optional per-group **desktop notification** toggle (🔔 in the lifecycle
+    panel) raises an OS toast the first time a question needs your answer
+    (off by default). It fires for that and for the other reasons above —
+    **except** a task merely reaching a merge or demo gate, which is common
+    enough (every PR does it) that toasting on it would be noise; the board
+    and the NEEDS-YOU panel are where you see those.
   - Most chips clear themselves: they're recomputed every few seconds, and
     clicking one focuses the pane and acknowledges it.
   - The red **⚠ stuck prompt** chip is the exception. It means a prompt loomux
@@ -963,6 +1072,40 @@ rather than something you forgot. It says so, and the fix is yours:
   "nothing except loomux";
 - the list already names loomux per-tool (`loomux/report`) — loomux won't widen a
   scope you set on purpose.
+
+**Picking a block's model.** The workflow pane's block form offers the same
+model dropdown the launcher does, filled the same way: the CLI's own reported
+models first, backed by loomux's suggestions, plus a **custom…** entry for any
+id neither list carries (a Bedrock inference profile, a gateway deployment
+name, a model newer than your build). A CLI loomux has no suggestions for and
+can't get a list out of gives you that free-text box directly. Leaving the
+model **unset** is a real choice with its own row: the block then runs
+whatever loomux defaults to for its kind on its CLI — `sonnet`/`opus` on
+Claude Code, `auto` on Copilot, `pro` on Gemini, and on OpenCode no `--model`
+at all, so your own config decides.
+
+**Every setting in the file is editable in the pane.** Beside the roster's
+block rows and its merge-gate row sit three more: **Intake**, **Merge queue**
+and **Resources** — the same `intake:`, `merge_queue:` and `resources:` blocks
+described elsewhere on this page, each with an enable-toggle and its fields.
+The block form covers the rest: `role_hint`, and `allow:` as a list of tool
+patterns (one row per pattern, because a real pattern contains commas). The one
+key with no control is `authored_with:`, and deliberately — it records which
+loomux *created* the file, is stamped once, and a save must never invent or
+restamp it.
+
+Two things those forms will not let you do, because loomux's engine would
+refuse the file: write a number outside a field's range (the inputs clamp —
+slots 1–64, max hold 1–480 minutes, at most 32 resources, a batch of at least
+1), and pair a `role_hint` with a kind that hint does not apply to. A value a
+*hand-edited* file already carries is shown as a finding instead, with the
+distinction that matters spelled out — a bound loomux **refuses** reads as an
+error, one it **clamps** (`checks_timeout_minutes`) as a warning.
+
+An untouched section is never rewritten. loomux writes only what the file
+declares, so opening these forms to look at them changes nothing, and a section
+you tick on and then off again leaves the file exactly as it was — including
+its comments.
 
 **Reviewer diversity across models.** A block's `cli`/`model` are set
 per-block, so nothing stops a reviewer lane from running on a different

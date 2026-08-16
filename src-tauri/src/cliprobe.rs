@@ -206,7 +206,23 @@ pub fn parse_models_from_list(out: &str) -> Vec<String> {
 }
 
 /// Run `<program> <args>` without a console window, bounded by a timeout.
-fn run_cli(program: &str, args: &str) -> Result<String, String> {
+///
+/// `stdin` is `None` for a probe that only reads the CLI's output, and
+/// `Some(line)` for one that has to ask a question first — `modelwire.rs`'s
+/// list-models control request is the only caller that does, and it is why this
+/// is `pub(crate)` rather than private. Sharing it rather than copying it is
+/// deliberate: the fresh-PATH resolution, the hidden-window creation flag, the
+/// two drain threads and the deadline poll are the parts that are easy to get
+/// subtly wrong on Windows, and a second copy would be a second place to fix
+/// each of them.
+///
+/// The payload is written and stdin is then CLOSED, which is what tells a CLI
+/// reading a `stream-json` input stream that no more requests are coming. It is
+/// written after the drain threads are already running, so a CLI that answers
+/// before it has read the whole request cannot deadlock against a full stdout
+/// pipe — though in practice the payload is a single short line, far inside the
+/// pipe buffer.
+pub(crate) fn run_cli(program: &str, args: &str, stdin: Option<&str>) -> Result<String, String> {
     // The program name is interpolated into a shell line on Windows (npm
     // shims are .cmd files that CreateProcess can't exec directly).
     if !program.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
@@ -238,7 +254,7 @@ fn run_cli(program: &str, args: &str) -> Result<String, String> {
         cmd.env("PATH", path);
     }
     let mut child = cmd
-        .stdin(Stdio::null())
+        .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -259,6 +275,21 @@ fn run_cli(program: &str, args: &str) -> Result<String, String> {
         let _ = stderr.read_to_string(&mut buf);
         buf
     });
+    // After the drains are live, never before: a write that blocked on a full
+    // stdout pipe with nobody reading it would hang until the deadline.
+    // Dropping the handle closes stdin, which is the EOF a stream-json reader
+    // waits for before it will exit.
+    if let Some(payload) = stdin {
+        if let Some(mut pipe) = child.stdin.take() {
+            use std::io::Write;
+            // A failed write is not fatal on its own — the CLI may have exited
+            // first, and the reply (or the absence of one) on stdout is what
+            // the caller actually reads.
+            let _ = pipe.write_all(payload.as_bytes());
+            let _ = pipe.write_all(b"\n");
+            let _ = pipe.flush();
+        }
+    }
     let deadline = Instant::now() + HELP_TIMEOUT;
     loop {
         match child.try_wait() {
@@ -340,7 +371,8 @@ fn probe_with(program: &str, run: impl Fn(&str, &str) -> Result<String, String>)
 }
 
 fn probe_uncached(program: &str) -> (CliProbe, bool) {
-    probe_with(program, run_cli)
+    // No stdin: this probe only reads what the CLI prints unprompted.
+    probe_with(program, |program, args| run_cli(program, args, None))
 }
 
 /// Probe an agent CLI (availability + model list). COMPLETE probes are cached
@@ -382,18 +414,27 @@ fn probe_uncached(program: &str) -> (CliProbe, bool) {
 /// conversion exists to remove, moved rather than deleted.
 #[tauri::command]
 pub async fn probe_agent_cli(program: String) -> CliProbe {
-    crate::blocking::run_blocking(move || {
-        let program = program.trim().to_lowercase();
-        if let Some(hit) = cache().lock().unwrap().get(&program) {
-            return hit.clone();
-        }
-        let (probe, complete) = probe_uncached(&program);
-        if probe.available && complete {
-            cache().lock().unwrap().insert(program, probe.clone());
-        }
-        probe
-    })
-    .await
+    crate::blocking::run_blocking(move || probe_cached(&program)).await
+}
+
+/// The body of [`probe_agent_cli`], callable from a thread that is not serving
+/// a command — the #1020 startup sweep warms this cache so the launcher's first
+/// paint does not wait eight seconds for a `--help` run it could have had
+/// already. Every rule above (what is cached, what is not, the accepted
+/// interleaving) is this function's; the command is the delegation wrapper.
+///
+/// Blocking: never call it from the webview thread. `probe_agent_cli` is the
+/// path that owns that concern.
+pub(crate) fn probe_cached(program: &str) -> CliProbe {
+    let program = program.trim().to_lowercase();
+    if let Some(hit) = cache().lock().unwrap().get(&program) {
+        return hit.clone();
+    }
+    let (probe, complete) = probe_uncached(&program);
+    if probe.available && complete {
+        cache().lock().unwrap().insert(program, probe.clone());
+    }
+    probe
 }
 
 #[cfg(test)]

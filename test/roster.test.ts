@@ -24,6 +24,7 @@ import {
   describeBlock,
   describeRoster,
   joinWithAnd,
+  orchestratorCliOf,
   resolveRoster,
   rosterNeedsReview,
   type RolePick,
@@ -600,4 +601,57 @@ test("an opencode block with no model says so, rather than inventing one (#722)"
   assert.equal(worker.cli, "opencode");
   assert.equal(worker.model, "", "an empty pick must stay empty — never back-filled with a guess");
   assert.equal(describeBlock(worker), "worker · opencode · default model");
+});
+
+// ---------- #1020 rev-740 1b: which CLI the launched orchestrator pane runs ----------
+// The setup card's preview badge derives from this, and it had been wrong twice by reading
+// a form control instead — first the group-default picker, then the per-role select. Both
+// were correct for the case they named and wrong for the next one, because the launch does
+// not read controls at all: it reads the roster resolved below.
+
+test("the orchestrator CLI comes from the resolved roster, not from the role picks", () => {
+  // The builtin case, where the two happen to agree — pinned so the declared case below is
+  // demonstrably a DIFFERENT answer rather than the only answer this function ever gives.
+  const builtin = resolveRoster(false, null, PICKS, "copilot");
+  assert.equal(orchestratorCliOf(builtin, "copilot"), "claude", "the orchestrator pick is claude");
+});
+
+test("a declared workflow file's CLI wins over the role select — the advanced-toggle twin", () => {
+  // THE FINDING. With the toggle on and a valid file, `create_group_ex` replaces the form's
+  // blocks with the file's (`guardrails.blocks = wf.blocks`), so the role select is ignored
+  // outright and the pane comes up on the declared `cli:`. A preview reading the select
+  // showed copilot over a pane running claude — and contradicted the roster box directly
+  // beneath it, which was already resolving this correctly.
+  const picksSayCopilot: RolePick[] = PICKS.map((p) =>
+    p.key === "orchestrator" ? { ...p, cli: "copilot" } : p
+  );
+  const declared = resolveRoster(true, DECLARED, picksSayCopilot, "copilot");
+  assert.equal(declared.status, "declared", "setup: the file is the roster");
+  assert.equal(
+    orchestratorCliOf(declared, "copilot"),
+    "claude",
+    "the declared block's cli must win — the role select is not consulted at all in this mode"
+  );
+  // The same picks under the toggle-OFF path still answer copilot, which is what makes the
+  // line above a statement about the ROSTER rather than about a hardcoded preference.
+  assert.equal(orchestratorCliOf(resolveRoster(false, DECLARED, picksSayCopilot, "claude"), "claude"), "copilot");
+});
+
+test("a declared block with no cli of its own inherits the group default", () => {
+  // `workflow::cli_of(block, guardrails.agent_cli)`'s second step, mirrored: a block that
+  // names no CLI runs the group's. Inventing one here would be the same class of wrong
+  // answer as reading the select.
+  const noCli = preview({ blocks: [block({ id: "orchestrator", kind: "orchestrator", cli: "" })] });
+  assert.equal(orchestratorCliOf(resolveRoster(true, noCli, PICKS, "opencode"), "opencode"), "opencode");
+});
+
+test("a roster naming no orchestrator answers null rather than guessing", () => {
+  // Unreachable today — the backend guarantees an orchestrator block and the preview runs
+  // the same clamp — so this pins the FAIL-CLOSED direction rather than a live case: the
+  // caller draws no badge, instead of inventing a CLI for a roster that names none.
+  const headless = preview({ blocks: [block({ id: "worker", kind: "worker" })] });
+  assert.equal(orchestratorCliOf(resolveRoster(true, headless, PICKS, "claude"), "claude"), null);
+  // ...and an empty group default cannot rescue it into an empty-string "answer" either.
+  const noCli = preview({ blocks: [block({ id: "orchestrator", kind: "orchestrator", cli: "" })] });
+  assert.equal(orchestratorCliOf(resolveRoster(true, noCli, PICKS, "  "), "  "), null);
 });

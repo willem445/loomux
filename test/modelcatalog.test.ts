@@ -29,12 +29,17 @@ import assert from "node:assert/strict";
 import {
   CUSTOM_OPTION,
   ModelCatalog,
+  blockModelOptions,
   curatedModels,
   mergeModelOptions,
   modelOptions,
   pickerSelection,
+  probeFailure,
+  reportFailure,
+  worthKeeping,
   type CliProbe,
 } from "../src/modelcatalog.ts";
+import { detailFor, type ModelDetail } from "../src/modelcatalog.ts";
 import { INHERIT_MODEL, ORCH_CLIS } from "../src/orchclis.ts";
 import { ORCH_ROLES } from "../src/roster.ts";
 
@@ -194,6 +199,65 @@ test("no current and no default falls to the first option, custom hidden", () =>
   });
 });
 
+// ── the block editor's list ─────────────────────────────────────────────────
+
+test("a block that declares no model opens on the blank row, not on the first suggestion (#935)", () => {
+  // `model:` is OPTIONAL in a workflow file, and leaving it out is a declared
+  // state — `model_of` (workflow.rs) resolves it to `default_model(cli, kind)`.
+  // The launcher has no equivalent (every role starts on a real default drawn
+  // from the curated row), so its list carries no blank row for claude. Handed
+  // that list unchanged, a block with no `model:` would open showing `sonnet` —
+  // a choice nobody made — and there would be no way back to "leave it to
+  // loomux" once anything was picked. That is a NARROWER field than the free
+  // text this replaces, which is the one thing #935 may not do.
+  const launcher = curatedModels("claude");
+  assert.equal(pickerSelection(launcher, "").selected, "sonnet", "the launcher's own list falls to first");
+
+  // The claim, asserted FIRST so a red lands on it rather than on the list shape
+  // that produces it: what a block with no `model:` OPENS ON.
+  const block = blockModelOptions(launcher);
+  assert.equal(
+    pickerSelection(block, "").selected,
+    INHERIT_MODEL,
+    "a block with no model: must open on the blank row, not on a suggestion"
+  );
+  assert.equal(pickerSelection(block, "").showCustom, false);
+  assert.deepEqual(block, [INHERIT_MODEL, ...launcher]);
+});
+
+test("a CLI whose curated row already carries the blank row gets no second one", () => {
+  // opencode's row leads with INHERIT_MODEL (#722), and `mergeModelOptions` pins
+  // it first. Two "(unset)" rows in one menu is a menu that looks broken.
+  const opencode = curatedModels("opencode");
+  assert.equal(opencode[0], INHERIT_MODEL, "the fixture this test is about");
+  const block = blockModelOptions(opencode);
+  assert.deepEqual(block, opencode);
+  assert.equal(block.filter((m) => m === INHERIT_MODEL).length, 1);
+});
+
+test("a CLI with nothing to offer stays empty, so the picker opens on its custom input", () => {
+  // `gemini` is a WORKFLOW_CLIS member with no ORCH_CLIS row, and today's
+  // `--help` parser reports nothing for it either. A lone "(unset)" row in front
+  // of an empty menu would be a dropdown whose only purpose is to be escaped
+  // from; an empty custom box already means what the blank row means.
+  const gemini = blockModelOptions(modelOptions("gemini", null));
+  assert.equal(
+    pickerSelection(gemini, "").showCustom,
+    true,
+    "a lone blank row would hide the free-text box behind a menu with one escape in it"
+  );
+  assert.deepEqual(gemini, []);
+  // …and the moment the machine reports something, the menu appears WITH the row.
+  const probed = modelOptions("gemini", probe(["pro", "flash"]));
+  assert.deepEqual(blockModelOptions(probed), [INHERIT_MODEL, "pro", "flash"]);
+});
+
+test("blockModelOptions copies — a caller that reorders it must not reorder the catalog", () => {
+  const opencode = curatedModels("opencode");
+  blockModelOptions(opencode).push("mutated");
+  assert.ok(!curatedModels("opencode").includes("mutated"));
+});
+
 // ── the probe seam ──────────────────────────────────────────────────────────
 
 test("one probe per program, however many surfaces ask", async () => {
@@ -223,6 +287,102 @@ test("a probe that rejects degrades to unavailable — it never rejects onwards"
   assert.deepEqual(catalog.models("claude"), curatedModels("claude"), "and the menu still fills");
 });
 
+// ── what the memo may keep (#935 slice C review, rev-507 finding 1) ──────────
+//
+// The catalog is now ONE app-wide instance rather than a field on each welcome
+// form, so its memo has no natural expiry — a pane closing used to be one. A
+// front memo that outlives the backend's own rule does not duplicate the cache,
+// it makes it unreachable, and the rule it must not outlive is stated in
+// cliprobe.rs: complete probes are cached for the app run, "failures and partial
+// answers are NOT — a CLI installed while loomux is running must become
+// launchable on the next probe".
+
+test("a probe that failed is not kept: the next ask reaches a CLI installed since (#935)", async () => {
+  // The reported regression, as a sequence: loomux starts with gemini not on
+  // PATH, a surface probes, the human installs gemini. With the failure memoized
+  // there is no next probe, and every surface reports it missing until loomux
+  // restarts — the recovery cliprobe.rs goes out of its way to keep.
+  let calls = 0;
+  const catalog = new ModelCatalog(async () => {
+    calls++;
+    return calls === 1 ? probeFailure("'gemini' was not found on PATH") : probe(["pro", "flash"]);
+  });
+  const first = await catalog.probe("gemini");
+  assert.equal(first.available, false);
+
+  // The claim, asserted before the memo detail it follows from.
+  const second = await catalog.probe("gemini");
+  assert.equal(second.available, true, "the retry must surface the success, not the cached failure");
+  assert.deepEqual(second.models, ["pro", "flash"]);
+  assert.equal(calls, 2, "and it must have actually re-asked the machine");
+});
+
+test("a failure leaves nothing behind for the synchronous paths either", async () => {
+  // `cached()` is what a form's first paint reads. A failure it can serve is a
+  // failure that outlives the ask, which is the same defect seen from the other
+  // side — and it would also make `models()` claim the machine had been asked.
+  const catalog = new ModelCatalog(async () => probeFailure("'gemini' was not found on PATH"));
+  await catalog.probe("gemini");
+  assert.equal(catalog.cached("gemini"), null, "nothing kept, so nothing stale to serve");
+  assert.deepEqual(catalog.models("claude"), curatedModels("claude"));
+});
+
+test("an available CLI that reported no list is not kept either — that is a PARTIAL answer", async () => {
+  // opencode's enumerator failing (a network blip, a provider configured or
+  // `opencode auth login` completed a minute later) returns available: true with
+  // an empty list, which the backend declines to cache for exactly the reason it
+  // declines to cache a failure. Completeness is deliberately not a wire field,
+  // so "carries no list" is how the front memo reads the same fact.
+  let calls = 0;
+  const catalog = new ModelCatalog(async () => {
+    calls++;
+    return calls === 1 ? probe([]) : probe(["opencode/deepseek-v4-flash-free"]);
+  });
+  assert.deepEqual((await catalog.probe("opencode")).models, []);
+  assert.deepEqual(
+    (await catalog.probe("opencode")).models,
+    ["opencode/deepseek-v4-flash-free"],
+    "the list that landed after `opencode auth login` must reach the picker"
+  );
+  assert.equal(calls, 2);
+});
+
+test("worthKeeping is the backend's rule, read off the reply", () => {
+  assert.equal(worthKeeping(probe(["sonnet"])), true);
+  assert.equal(worthKeeping(probe([])), false, "available but nothing to say is a partial answer");
+  assert.equal(worthKeeping(probeFailure("not found")), false);
+  // A failure can never carry models, but the predicate must not depend on that.
+  assert.equal(worthKeeping({ available: false, models: ["sonnet"], error: "x" }), false);
+});
+
+test("an answer worth keeping IS kept — the re-ask is bounded to the answers that aren't", async () => {
+  // The other half of the rule: a real list must not turn into an IPC per paint.
+  let calls = 0;
+  const catalog = new ModelCatalog(async () => {
+    calls++;
+    return probe(["sonnet"]);
+  });
+  await catalog.probe("claude");
+  await catalog.probe("claude");
+  await catalog.probe("claude");
+  assert.equal(calls, 1, "a complete probe is asked once for the app run");
+});
+
+test("concurrent askers share one probe even when the answer is not kept", async () => {
+  // Dropping the memo on a failure must not turn N surfaces opening at once into
+  // N subprocesses: the in-flight promise is still shared, and only a caller that
+  // asks AFTER it resolved pays for a fresh one.
+  let calls = 0;
+  const catalog = new ModelCatalog(async () => {
+    calls++;
+    return probeFailure("not found");
+  });
+  await Promise.all([catalog.probe("gemini"), catalog.probe("gemini"), catalog.probe("gemini")]);
+  assert.equal(calls, 1, "one flight, three askers");
+  await catalog.probe("gemini");
+  assert.equal(calls, 2, "and the ask after it resolved is the recovery path");
+});
+
 test("models() paints from curated before the probe lands, merged after", async () => {
   let release: (v: CliProbe) => void = () => {};
   const catalog = new ModelCatalog(() => new Promise<CliProbe>((r) => (release = r)));
@@ -240,4 +400,376 @@ test("models() paints from curated before the probe lands, merged after", async 
     "claude-sonnet-4.6",
     ...curatedModels("claude"),
   ]);
+});
+
+// ---- the list-models reply (#993, made automatic by #1020) -----------------
+//
+// A second seam beside the probe, and the tests below defend the reason it is
+// separate rather than folded in.
+//
+// **The credit-safety property, stated the way it actually holds now.** Under
+// #993 `detect` SPAWNED the CLI, so the restraint was that nothing ran unasked
+// and a second gesture did not become a second spawn. #1002 reversed that by
+// the human's own direction and #1020 implemented it, so both halves of the old
+// sentence are now false and the truth is:
+//
+//   - `detect` cannot spawn ANYTHING. It is a lookup against a memo the backend
+//     filled (`src-tauri/src/modelwire.rs`), and a paint may call it precisely
+//     because there is no longer any code behind it that could start a process.
+//   - Something DOES run unasked, deliberately: the backend's startup sweep,
+//     which is now the only thing in loomux that runs `list_cli_models`, once
+//     per CLI per app run, and the only place a control request is spawned.
+//
+// So the properties worth pinning here are no longer about refusing to spend.
+// They are about the BOUND that replaced the click — one lookup per CLI per app
+// run, because the callers are paints now and nothing else limits them — about
+// the push route that corrects a form which looked too early, and about the
+// answer never being allowed to narrow what the human can already pick.
+//
+// If you are auditing constraint-3 compliance, the spawn you are looking for is
+// in `modelwire.rs`'s `start_startup_sweep`, not here. `doc/design/model-catalog.md`
+// §Credit safety carries the decision and what remains unverified about it.
+
+const detail = (over: Partial<ModelDetail> & { id: string }): ModelDetail => ({
+  resolvedId: "",
+  name: "",
+  description: "",
+  supportsEffort: null,
+  effortLevels: [],
+  ...over,
+});
+
+test("a catalog with no detector wired reports nothing rather than failing", async () => {
+  // The launcher's catalog predates this slice. A surface that asks a catalog
+  // that cannot answer has to get a report, not a rejected promise reaching its
+  // render path.
+  const catalog = new ModelCatalog(async () => probe([]));
+  const report = await catalog.detect("claude");
+  assert.deepEqual(report.models, []);
+  assert.match(report.error ?? "", /detector/);
+  assert.equal(catalog.report("claude"), null);
+});
+
+test("no lookup rides along on a probe or a paint", async () => {
+  // #993's restraint, narrowed by #1020 rather than dropped. The lookup can no
+  // longer spawn an agent CLI, so a paint path may CALL it — but the paths that
+  // never wanted it still must not issue one behind a caller's back. `models()`,
+  // `cached()`, `detail()`, `report()` and `probe()` all answer from what is
+  // already in hand, and a form that only paints costs no IPC at all.
+  let detects = 0;
+  const catalog = new ModelCatalog(
+    async () => probe(["claude-sonnet-4.6"]),
+    async () => {
+      detects += 1;
+      return { models: [detail({ id: "opus" })], error: null };
+    }
+  );
+  catalog.models("claude");
+  catalog.detail("claude", "opus");
+  catalog.report("claude");
+  await catalog.probe("claude");
+  catalog.models("claude");
+  assert.equal(detects, 0, "reading what is already known must not reach the backend");
+  await catalog.detect("claude");
+  assert.equal(detects, 1, "only `detect` looks anything up");
+});
+
+test("a picker opening asks once per CLI, and the memo answers every reopen", async () => {
+  // **The bound that replaced the click** (#1020). Under #993 a re-ask cost a
+  // human gesture, which was the rate limit; the callers are paints now, and a
+  // form that re-renders would issue one per paint without this.
+  let detects = 0;
+  const catalog = new ModelCatalog(
+    async () => probe([]),
+    async () => {
+      detects += 1;
+      return { models: [detail({ id: "opus" })], error: null };
+    }
+  );
+  // Two pickers painting at once — the launcher opens four role rows together.
+  await Promise.all([catalog.detect("claude"), catalog.detect("claude")]);
+  assert.equal(detects, 1, "concurrent paints share one flight");
+  // …and the form re-rendering, over and over, the way selecting blocks does.
+  await catalog.detect("claude");
+  await catalog.detect("claude");
+  assert.equal(detects, 1, "a repaint reads the memo — it must never re-issue");
+  assert.deepEqual((await catalog.detect("claude")).models.map((m) => m.id), ["opus"], "and it is the same answer");
+});
+
+test("a barren answer leaves report() empty but is still not asked twice", async () => {
+  // The asymmetry #1020 introduces, and the reason for two maps rather than one.
+  //
+  // KEEPING the answer is still refused: `report()` stays null so every surface
+  // falls back to its seed, exactly as before. ASKING again is now refused too,
+  // which under #993 it was not — because the thing that would have to change
+  // its mind is the backend's startup sweep, and the sweep PUSHES
+  // (`acceptReport`). Re-issuing per paint would buy nothing and cost an IPC
+  // per render.
+  let detects = 0;
+  const catalog = new ModelCatalog(
+    async () => probe([]),
+    async () => {
+      detects += 1;
+      return { models: [], error: "no models detected for this CLI yet" };
+    }
+  );
+  const first = await catalog.detect("claude");
+  assert.deepEqual(first.models, []);
+  assert.equal(catalog.report("claude"), null, "a barren answer leaves nothing behind for a surface to show");
+  await catalog.detect("claude");
+  assert.equal(detects, 1, "…and is not chased on the next paint either");
+});
+
+test("a pushed report reaches a catalog that already looked and found nothing", async () => {
+  // The push half of #1020, and the case that makes it load-bearing: a picker
+  // painted while the sweep was still running looked, was told "nothing yet",
+  // and memoized that. Without `acceptReport` its dropdown would keep the
+  // curated seed for the life of the app — which is what the human sees as
+  // detection being broken.
+  let detects = 0;
+  const catalog = new ModelCatalog(
+    async () => probe([]),
+    async () => {
+      detects += 1;
+      return { models: [], error: "no models detected for this CLI yet" };
+    }
+  );
+  await catalog.detect("claude");
+  assert.equal(catalog.report("claude"), null);
+
+  const changed = catalog.acceptReport("claude", { models: [detail({ id: "opus" })], error: null });
+  assert.equal(changed, true, "a report that carries models changed something");
+  assert.deepEqual(catalog.report("claude")?.models.map((m) => m.id), ["opus"]);
+  assert.ok(catalog.models("claude").includes("opus"), "and it reaches the menu the picker paints from");
+
+  // The push also settles the pull, so a picker opening afterwards reads it
+  // rather than spending an IPC on an answer already in hand.
+  assert.deepEqual((await catalog.detect("claude")).models.map((m) => m.id), ["opus"]);
+  assert.equal(detects, 1, "the pushed answer is the answer — no second lookup");
+});
+
+test("a pushed report that carries nothing never overwrites one that does", async () => {
+  // The ordering hazard the push introduces: the sweep can emit for a CLI it
+  // found nothing for, and that must not land on top of a real answer — nor
+  // register as a change worth repainting for.
+  const catalog = new ModelCatalog(async () => probe([]));
+  catalog.acceptReport("claude", { models: [detail({ id: "opus" })], error: null });
+  const changed = catalog.acceptReport("claude", { models: [], error: "not installed" });
+  assert.equal(changed, false, "an empty report changes nothing, so no surface owes a repaint");
+  assert.deepEqual(
+    catalog.report("claude")?.models.map((m) => m.id),
+    ["opus"],
+    "and the real answer survives it — a later emit must not erase an earlier one"
+  );
+});
+
+test("the two routes racing does not repaint a form twice", async () => {
+  // The ordinary case, not the odd one: the lookup and the push are two
+  // deliveries of ONE sweep answer, and both can land. The second must not
+  // rebuild a dropdown that already shows it — a deferred rebuild fires on
+  // blur, so a redundant one can land under a caret the human has moved into.
+  //
+  // The rule is a statement about the PRODUCER: the sweep asks each CLI once
+  // per app run, so a second answer for the same CLI is never new information.
+  let fired = 0;
+  const catalog = new ModelCatalog(
+    async () => probe([]),
+    async () => ({ models: [detail({ id: "opus" })], error: null })
+  );
+  catalog.onReport(() => (fired += 1), () => true);
+  // The lookup wins the race…
+  await catalog.detect("claude");
+  assert.deepEqual(catalog.report("claude")?.models.map((m) => m.id), ["opus"]);
+  // …and the event arrives afterwards carrying the same answer.
+  const changed = catalog.acceptReport("claude", { models: [detail({ id: "opus" })], error: null });
+  assert.equal(changed, false, "the same answer by the other route is not a change");
+  assert.equal(fired, 0, "so nothing is asked to repaint what it already painted");
+});
+
+test("a listener whose host is gone is neither called nor retained", async () => {
+  // The lifecycle contract of `onReport`. Neither host has a teardown this
+  // module can rely on — a launcher form is discarded with its pane and has no
+  // safe release point at all — so a subscription that outlived its DOM would
+  // repaint detached controls for the rest of the app run.
+  const catalog = new ModelCatalog(async () => probe([]));
+  const alive: string[] = [];
+  const dead: string[] = [];
+  let deadHostIsAlive = true;
+  catalog.onReport((p) => alive.push(p), () => true);
+  catalog.onReport((p) => dead.push(p), () => deadHostIsAlive);
+  const unsubscribe = catalog.onReport(
+    () => assert.fail("an explicitly unsubscribed listener must never fire"),
+    () => true
+  );
+  unsubscribe();
+  deadHostIsAlive = false;
+
+  catalog.acceptReport("claude", { models: [detail({ id: "opus" })], error: null });
+  catalog.acceptReport("copilot", { models: [detail({ id: "gpt-5.2" })], error: null });
+  assert.deepEqual(alive, ["claude", "copilot"], "a live listener hears every report");
+  assert.deepEqual(dead, [], "a dead one is not called even once — liveness is asked before delivery, not by it");
+  assert.equal(catalog.liveReportListeners, 1, "and it is not still being held");
+});
+
+test("a host that registers after the sweep is released when the next one registers", async () => {
+  // **rev-713 blocking 2, and the leak this seam shipped with.** The first cut
+  // pruned only when a report CHANGED state, which the producer does at most
+  // once per program per app run — and zero times in the ordering where the pull
+  // wins the race, because `acceptReport` then refuses before reaching the
+  // listeners at all. So in the ordinary case nothing was ever pruned, and every
+  // WorkflowView and WelcomeForm built after the sweep was retained by the
+  // app-scoped catalog for the life of the process, holding its analysis and its
+  // detached DOM with it.
+  //
+  // The fix hangs pruning on REGISTRATION, which is the one event that keeps
+  // recurring: every new host subscribes, so the list cannot grow past the live
+  // hosts plus the one being added.
+  const catalog = new ModelCatalog(async () => probe([]));
+  // The sweep lands and is fully delivered — after this, nothing will ever
+  // change state again for `claude`.
+  catalog.onReport(() => {}, () => true);
+  catalog.acceptReport("claude", { models: [detail({ id: "opus" })], error: null });
+
+  // Now open and close ten panes, exactly as the review's repro describes. The
+  // assertion is on the PEAK, not the final count, because that is the property:
+  // retention is bounded by how many hosts are ALIVE, never by how many have
+  // ever been built. Under the shipped bug this climbs to 11 and stays there.
+  let peak = catalog.liveReportListeners;
+  for (let i = 0; i < 10; i += 1) {
+    let open = true;
+    catalog.onReport(() => {}, () => open);
+    open = false;
+    peak = Math.max(peak, catalog.liveReportListeners);
+  }
+  assert.ok(
+    peak <= 2,
+    `retention grew to ${peak} while never more than two hosts were alive at once — every closed pane is still ` +
+      `held by the app-scoped catalog, with its analysis and its detached DOM`
+  );
+
+  // One more opens: registering releases the last corpse too, so the steady
+  // state really is "the live ones", not "the live ones plus one".
+  catalog.onReport(() => {}, () => true);
+  assert.equal(catalog.liveReportListeners, 2, "the surviving original, and the newcomer");
+});
+
+test("a report that changes nothing still prunes, and still repaints nobody", async () => {
+  // Two properties that have to coexist, and the first cut got them backwards by
+  // tying one to the other. Delivery is conditional on a state change — otherwise
+  // a form rebuilds itself under a human's caret for no reason. RETENTION must
+  // not be: a refusal is the common case, so a prune behind it never runs.
+  const catalog = new ModelCatalog(async () => probe([]));
+  let fired = 0;
+  let hostAlive = true;
+  catalog.onReport(() => (fired += 1), () => hostAlive);
+  hostAlive = false;
+
+  const changed = catalog.acceptReport("claude", { models: [], error: "not installed" });
+  assert.equal(changed, false, "nothing changed, so nobody is asked to repaint");
+  assert.equal(fired, 0);
+  assert.equal(
+    catalog.liveReportListeners,
+    0,
+    "…but the dead host is released anyway — a refused report is exactly the case that must still prune"
+  );
+});
+
+test("a rejected detection degrades instead of reaching a render path", async () => {
+  const catalog = new ModelCatalog(async () => probe([]), async () => {
+    throw new Error("ipc exploded");
+  });
+  const report = await catalog.detect("claude");
+  assert.deepEqual(report.models, []);
+  assert.match(report.error ?? "", /ipc exploded/);
+});
+
+test("detection adds rows to the menu and never removes one", async () => {
+  // The property `orchclis.test.ts` names, carried to the new source: a role's
+  // default is drawn from the curated list, and a default that fell off the menu
+  // opens the picker on its `custom…` branch — which reads as a human's typing.
+  const catalog = new ModelCatalog(
+    async () => probe([]),
+    async () => ({ models: [detail({ id: "opus[1m]" }), detail({ id: "haiku" })], error: null })
+  );
+  const before = catalog.models("claude");
+  await catalog.detect("claude");
+  const after = catalog.models("claude");
+  for (const id of before) assert.ok(after.includes(id), `${id} fell off the menu`);
+  assert.ok(after.includes("opus[1m]"), "the CLI's own row is offered");
+  assert.equal(after[0], "opus[1m]", "what the machine reported leads what this repo suggested");
+});
+
+test("detail() answers only about the model the CLI actually named", async () => {
+  const catalog = new ModelCatalog(
+    async () => probe([]),
+    async () => ({ models: [detail({ id: "opus", supportsEffort: true, effortLevels: ["low", "max"] })], error: null })
+  );
+  assert.equal(catalog.detail("claude", "opus"), null, "nothing until a human asks");
+  await catalog.detect("claude");
+  assert.deepEqual(catalog.detail("claude", "opus")?.effortLevels, ["low", "max"]);
+  assert.equal(catalog.detail("claude", "sonnet"), null, "a model the reply did not mention stays unknown");
+  assert.equal(catalog.detail("copilot", "opus"), null, "and a CLI nobody detected stays unknown too");
+});
+
+test("a [1m] pick finds the base model's reported row", () => {
+  // The suffix selects a context window, not a different model, and the CLI
+  // enumerates base ids. Missing here would silently drop the effort levels the
+  // plain variant shows, which reads as the suffix having disabled something.
+  const models = [detail({ id: "sonnet", supportsEffort: true, effortLevels: ["low", "high"] })];
+  assert.equal(detailFor(models, "sonnet[1m]")?.id, "sonnet");
+  assert.equal(detailFor(models, "SONNET")?.id, "sonnet");
+  assert.equal(detailFor(models, "claude-sonnet-4-5"), null, "never widened to a family — that is a different model");
+  assert.equal(detailFor(models, ""), null);
+});
+
+test("an id the CLI itself reported with a suffix still matches verbatim first", () => {
+  const models = [detail({ id: "opus[1m]", name: "Opus (1M context)" }), detail({ id: "opus", name: "Opus" })];
+  assert.equal(detailFor(models, "opus[1m]")?.name, "Opus (1M context)", "the exact row wins before any widening");
+  assert.equal(detailFor(models, "opus")?.name, "Opus");
+});
+
+// ── the CLI nothing answers for (#1020) ─────────────────────────────────────
+
+test("copilot's dropdown fills from the curated catalog when nothing answers for it (#1020)", async () => {
+  // The end-to-end shape of the redesigned pane-setup's copilot bug. Copilot has
+  // no `ENUMERATORS` row and no `PROTOCOLS` row, so BOTH machine sources are
+  // silent by construction: its `--help` no longer enumerates models, so the
+  // probe reports an empty list, and the startup sweep never spawns it, so no
+  // report ever lands. Every other CLI degrades to its curated suggestions in
+  // that state; copilot LIVES there, which is why its curated list has to be a
+  // real menu rather than a seed for one.
+  const catalog = new ModelCatalog(
+    async () => probe([]), // available, but with nothing to say — copilot's real reply
+    async () => reportFailure("copilot has no list-models protocol row")
+  );
+  await catalog.probe("copilot");
+  await catalog.detect("copilot");
+  assert.equal(catalog.report("copilot"), null, "a barren detection is not an answer, so the seed has to carry it");
+
+  const menu = catalog.models("copilot");
+  assert.equal(menu[0], "auto", "the pick-for-me row still leads after the merge");
+  // The bug this pins is "the dropdown shows no real copilot models". A menu
+  // covering one or two vendor families is that bug wearing a longer list's
+  // clothes — copilot resells several, and the account-specific subset it also
+  // reports covers one.
+  const families = new Set(menu.filter((m) => m !== "auto").map((m) => /^[a-z]+/.exec(m)?.[0] ?? ""));
+  families.delete("");
+  assert.ok(families.size >= 5, `copilot's dropdown offers only ${[...families].join(", ")}`);
+  assert.deepEqual(menu, curatedModels("copilot"), "with both sources silent the menu IS the curated row, in its order");
+});
+
+test("a copilot model the machine DOES report still leads the curated catalog (#1020)", async () => {
+  // The interim list must not become a ceiling. It is written down only because
+  // nothing answers today; the moment copilot gains an enumerator or a protocol
+  // row, that answer has to sort in front of these without anyone editing the
+  // row — and the curated ids have to survive behind it, because the role
+  // defaults are drawn from them.
+  const catalog = new ModelCatalog(async () => probe(["gpt-6-unreleased", "auto"]));
+  await catalog.probe("copilot");
+  const menu = catalog.models("copilot");
+  assert.equal(menu[0], "gpt-6-unreleased", "the machine's own answer leads the suggestion");
+  assert.equal(menu.indexOf("auto"), 1, "and an id both sources name appears once, in the probe's position");
+  for (const id of curatedModels("copilot")) {
+    assert.ok(menu.includes(id), `the merge dropped the curated id ${id} — a role default could land off-menu`);
+  }
 });

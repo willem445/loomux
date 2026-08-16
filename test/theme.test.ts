@@ -19,9 +19,10 @@
 // would notice. Run `npm test`.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import {
   ANSI_SLOTS,
+  CLI_HUES,
   CSS_TOKENS,
   IDENTITY,
   IDENTITY_LIT,
@@ -30,10 +31,27 @@ import {
   SEMANTIC,
   TERMINAL_THEME,
 } from "../src/theme.ts";
+import { agentMarkFor } from "../src/agenticons.ts";
 
 const read = (rel: string) => readFileSync(new URL(rel, import.meta.url), "utf8");
 const stripCssComments = (s: string) => s.replace(/\/\*[\s\S]*?\*\//g, "");
 const HEX = /^#[0-9a-f]{6}$/;
+
+/**
+ * The body of the stylesheet's `:root` block, and the split point between the token layer
+ * and everything below it.
+ *
+ * ONE reader for both pins, anchored on a closing brace in COLUMN ZERO — the stylesheet's
+ * own convention for the end of a top-level rule. The two pins below used to carry a regex
+ * each, one of them ending at the first `}` it met anywhere; that one would have taken a
+ * nested block or a braced value as the end of the token layer and then happily reported
+ * every token after it "undeclared". Same text, one place, no second reading of it.
+ */
+function splitAtRoot(css: string): { tokens: string; below: string } {
+  const m = css.match(/^:root\s*\{([\s\S]*?)^\}/m);
+  assert.ok(m, "styles.css has no :root block — the token layer is the first thing in it");
+  return { tokens: m[1], below: css.slice(m.index! + m[0].length) };
+}
 
 // WCAG relative luminance / contrast. The design note (doc/design/ui-redesign.md) makes
 // contrast PROMISES about this palette; a promise nobody measures is prose.
@@ -177,12 +195,27 @@ test("no ANSI colour disappears into the terminal background", () => {
   }
 });
 
+test("ANSI brightWhite stays brighter than the terminal foreground", () => {
+  // brightWhite used to be PALETTE.mist000 — a surface-ladder token that moves whenever the
+  // ink ramp is retuned. mist000's #1020 item 11 tone-down did exactly that and pushed
+  // brightWhite (L 0.6437) BELOW the unrelated `foreground` literal (L 0.6921), inverting
+  // bright-white emphasis in every pane with no other test noticing (#1033 review). Pinning
+  // the ORDER, not a specific hex, is what survives the next ink-ramp edit: brightWhite is
+  // free to move, foreground is free to move, but bright-white must stay the brighter of the
+  // two or "bright" stops meaning anything.
+  assert.ok(
+    luminance(TERMINAL_THEME.brightWhite) > luminance(TERMINAL_THEME.foreground),
+    `brightWhite (${TERMINAL_THEME.brightWhite}, L ${luminance(TERMINAL_THEME.brightWhite).toFixed(4)}) ` +
+      `is not brighter than foreground (${TERMINAL_THEME.foreground}, L ` +
+      `${luminance(TERMINAL_THEME.foreground).toFixed(4)}) — ANSI bright-white would render ` +
+      "dimmer than plain terminal text"
+  );
+});
+
 test("the stylesheet declares every pinned token, with theme.ts's value", () => {
   const css = stripCssComments(read("../src/styles.css"));
-  const root = css.match(/:root\s*\{([\s\S]*?)\}/);
-  assert.ok(root, "styles.css has no :root block — the token layer is the first thing in it");
   const declared = new Map<string, string>();
-  for (const [, name, value] of root[1].matchAll(/(--[a-z0-9-]+)\s*:\s*([^;]+);/g)) {
+  for (const [, name, value] of splitAtRoot(css).tokens.matchAll(/(--[a-z0-9-]+)\s*:\s*([^;]+);/g)) {
     declared.set(name, value.trim());
   }
   for (const [name, expected] of Object.entries(CSS_TOKENS)) {
@@ -196,26 +229,23 @@ test("the stylesheet declares every pinned token, with theme.ts's value", () => 
 
 // The pin above runs theme.ts -> stylesheet. On its own that is one-directional: a token
 // minted straight into `:root` with a literal value is a FOURTH copy of a colour, and it
-// stays green because nothing walks the stylesheet back into CSS_TOKENS. Slice B mints
-// tokens by the dozen while migrating ~387 literals, which is exactly when that hole gets
-// used. So walk it the other way too: every raw colour declared in `:root` must be pinned.
+// stays green because nothing walks the stylesheet back into CSS_TOKENS. So walk it the
+// other way too: every raw colour declared in `:root` must be pinned.
 //
-// A `var(...)` value is not a raw colour — it is an alias onto something already pinned,
-// which is what the legacy bridge is made of, so the bridge passes this without exception.
-const BRIDGE_LITERALS = new Set([
-  // The one bridge declaration that is a literal rather than an alias: an alpha companion
-  // to --accent, which CSS cannot derive from a hex custom property without color-mix.
-  // It dies with the bridge in slice B, and no new entry may be added to this set.
-  "--accent-glow",
-]);
-const RAW_COLOUR = /^(#|(rgba?|hsla?|hwb|lab|lch|oklab|oklch|color)\()/i;
+// A `var(...)` value is not a raw colour — it is an alias onto something already pinned.
+// The set below is empty and stays empty: it held `--accent-glow`, the one alpha companion
+// the pre-token stylesheet could not express, and slice B retired it along with the rest of
+// the legacy bridge. An alpha step is now `color-mix(in srgb, var(--token) N%, transparent)`
+// at the call site, which is an expression over a pinned colour rather than a new one.
+const BRIDGE_LITERALS = new Set<string>([]);
+/** The colour notations CSS gives you. Kept in one place so every guard here sees them all. */
+const COLOUR_FN = "rgba?|hsla?|hwb|lab|lch|oklab|oklch|color";
+const RAW_COLOUR = new RegExp(`^(#|(${COLOUR_FN})\\()`, "i");
 
 test("no colour enters :root without a pin in theme.ts", () => {
   const css = stripCssComments(read("../src/styles.css"));
-  const root = css.match(/:root\s*\{([\s\S]*?)\n\}/);
-  assert.ok(root, "styles.css has no :root block");
   const unpinned: string[] = [];
-  for (const [, name, value] of root[1].matchAll(/(--[a-z0-9-]+)\s*:\s*([^;]+);/g)) {
+  for (const [, name, value] of splitAtRoot(css).tokens.matchAll(/(--[a-z0-9-]+)\s*:\s*([^;]+);/g)) {
     const v = value.trim();
     if (!RAW_COLOUR.test(v)) continue;
     if (name in CSS_TOKENS || BRIDGE_LITERALS.has(name)) continue;
@@ -226,6 +256,321 @@ test("no colour enters :root without a pin in theme.ts", () => {
     [],
     "these :root colours exist nowhere in theme.ts, so nothing keeps them equal to the " +
       `pre-paint block or the terminal: ${unpinned.join("; ")}`
+  );
+});
+
+test("a colour buried inside a composite :root value is alpha-black or it is pinned", () => {
+  // The pin above is anchored at the START of the value, so it sees `--x: #abc` and misses
+  // `--shadow-card: 0 2px 8px rgba(0, 0, 0, 0.35)` — a colour it cannot reach. The design
+  // note answers that by RULE ("shadow tokens are alpha-black only, declared in this block
+  // where a reader can see all of them at once"), and slice B put eighteen call sites on
+  // those two tokens, so materially more now rides on a rule nothing measured. This is that
+  // rule, measured: a composite value may embed black at any alpha and nothing else.
+  //
+  // Alpha-black is exempt because it is not a HUE — it is the absence of one, the ink a
+  // shadow is made of, and it carries no channel to get wrong. Any other colour buried in a
+  // composite is a hue that no surface can restyle and no pin keeps equal to theme.ts.
+  const css = stripCssComments(read("../src/styles.css"));
+  const embedded = new RegExp(`(#[0-9a-fA-F]{3,8}\\b|\\b(?:${COLOUR_FN})\\([^)]*\\))`, "gi");
+  const ALPHA_BLACK = /^rgba?\(\s*0\s*,\s*0\s*,\s*0\s*(,\s*[0-9.]+\s*)?\)$/i;
+  const offenders: string[] = [];
+  for (const [, name, value] of splitAtRoot(css).tokens.matchAll(/(--[a-z0-9-]+)\s*:\s*([^;]+);/g)) {
+    const v = value.trim();
+    if (RAW_COLOUR.test(v)) continue; // the whole value is a colour — the pin above owns it
+    for (const m of v.matchAll(embedded)) {
+      if (ALPHA_BLACK.test(m[0])) continue;
+      offenders.push(`${name}: ${v}  (embedded ${m[0]})`);
+    }
+  }
+  assert.deepEqual(
+    offenders,
+    [],
+    "a hue is hiding inside a composite token value, where the theme.ts pin cannot see it: " +
+      offenders.join("; ")
+  );
+});
+
+// --- the migration guard (#879 slice B) --------------------------------------------------
+//
+// Maintainability rule 1 of the design brief is "no raw colour outside the token block in
+// src/styles.css". Slice A could only WRITE that rule down; 401 literals below the block
+// were still painting the app in a palette the brief renounces, so the rule was prose. This
+// is the rule as a measurement.
+//
+// A literal is a hex, ANY of CSS's colour functions, or a named colour. A `color-mix()` over
+// a token is NOT a literal: it is an expression whose colour input is already pinned, which
+// is exactly how a surface reaches an alpha step without minting a fourth copy of a hue.
+//
+// The function list and the name list are both wider than what the stylesheet contains
+// today, deliberately. A guard that only matches the two notations the migration happened to
+// meet — `#hex` and comma-form `rgb()` — enforces the rule against HISTORY rather than
+// against the next slice, which is free to reach for `oklch()` or plain `red` and sail past
+// it. Nothing here fires on the current tree; all of it is the rule, not a finding.
+const NAMED_COLOURS = [
+  "aqua", "azure", "beige", "black", "blue", "brown", "coral", "crimson", "cyan", "fuchsia",
+  "gold", "gray", "green", "grey", "indigo", "ivory", "khaki", "lavender", "lime", "linen",
+  "magenta", "maroon", "navy", "olive", "orange", "orchid", "pink", "plum", "purple", "red",
+  "salmon", "silver", "snow", "tan", "teal", "tomato", "turquoise", "violet", "wheat",
+  "white", "yellow",
+];
+// The name lookarounds exclude `--id-azure`, `white-space`, `--state-ok` and every other
+// place a colour word is part of a longer identifier rather than a value.
+const CSS_LITERAL = new RegExp(
+  `#[0-9a-fA-F]{3,8}\\b|\\b(?:${COLOUR_FN})\\(|(?<![-\\w])(?:${NAMED_COLOURS.join("|")})(?![-\\w])`,
+  "gi"
+);
+
+test("no raw colour survives below the token block in styles.css", () => {
+  const below = splitAtRoot(stripCssComments(read("../src/styles.css"))).below;
+  const found: string[] = [];
+  for (const line of below.split(/\r?\n/)) {
+    for (const m of line.matchAll(CSS_LITERAL)) {
+      // #194-style issue refs never reach here (comments are stripped), but a 5- or
+      // 7-character run of hex digits is not a colour either.
+      if (m[0].startsWith("#") && ![4, 5, 7, 9].includes(m[0].length)) continue;
+      // `color-mix(` is the sanctioned alpha step, and its `in srgb` interpolation keyword
+      // is not a colour; `color(` on its own still is.
+      if (/^color$/i.test(m[0].replace("(", "")) && line.includes("color-mix(")) continue;
+      found.push(`${m[0]}  in  ${line.trim().slice(0, 90)}`);
+    }
+  }
+  assert.deepEqual(
+    found,
+    [],
+    `${found.length} raw colour(s) below the token block — a surface that hard-codes a hue ` +
+      "is a surface the palette cannot move, and it declares no channel, so nobody can tell " +
+      `whether it means state, interaction or identity:\n${found.join("\n")}`
+  );
+});
+
+test("no value from the retired Tokyo Night palette survives anywhere in src/", () => {
+  // The brief renounces this palette by name: borrowing a well-liked theme is how an app
+  // ends up with someone else's identity and no argument for any of it. These eight values
+  // ARE that theme — the six the stylesheet used, plus the two extra git-graph lanes — and
+  // catching them by value is what makes "renounced" checkable. A migration that misses one
+  // leaves a surface speaking the old palette while everything around it moved, which is the
+  // half-retired look slice B exists to end, and which nothing else in this repo would see.
+  const RETIRED: Record<string, string> = {
+    "#7aa2f7": "blue", "#9ece6a": "green", "#e0af68": "amber", "#bb9af7": "magenta",
+    "#7dcfff": "cyan", "#f7768e": "red", "#73daca": "teal", "#ff9e64": "orange",
+  };
+  const rgbOf = (hex: string) =>
+    [1, 3, 5].map((i) => Number.parseInt(hex.slice(i, i + 2), 16)).join(", ");
+
+  const dir = new URL("../src/", import.meta.url);
+  const files = readdirSync(dir).filter((f) => f.endsWith(".ts") || f === "styles.css");
+  assert.ok(files.length > 40, "the src/ sweep found almost nothing — is the path still right?");
+
+  const survivors: string[] = [];
+  for (const file of files) {
+    const text = readFileSync(new URL(file, dir), "utf8");
+    text.split(/\r?\n/).forEach((line, i) => {
+      // A hex quoted in prose is a doc, not a paint: only lines that are code count. The
+      // stylesheet's comments are `/* */`, TypeScript's are `//` and `*`.
+      const code = line.replace(/\/\/.*$/, "").trim();
+      if (code.startsWith("*") || code.startsWith("/*")) return;
+      for (const [hex, name] of Object.entries(RETIRED)) {
+        if (code.toLowerCase().includes(hex) || code.includes(rgbOf(hex))) {
+          survivors.push(`src/${file}:${i + 1} — Tokyo Night ${name} (${hex}): ${code.slice(0, 80)}`);
+        }
+      }
+    });
+  }
+  assert.deepEqual(
+    survivors,
+    [],
+    `the retired palette is still painting ${survivors.length} place(s):\n${survivors.join("\n")}`
+  );
+});
+
+// --- the role table, and the channel a position sits on (#879 slice B) --------------------
+
+/** Every `--token` a rule body names, in source order. */
+function tokensIn(body: string): string[] {
+  return [...body.matchAll(/var\(\s*(--[a-z0-9-]+)/g)].map((m) => m[1]);
+}
+
+test("one role table: every surface that names an agent role paints it the same hue", () => {
+  // THE CLAIM THIS TEST EXISTS FOR. The design note says "a role colour is the same thing
+  // wherever it appears, or it is not identity, it is decoration", and three separate
+  // surfaces name a role: the session browser's badges, the group roster's chips, and the
+  // workflow pane's nodes and chips. Before slice B two of them disagreed with each other —
+  // the session browser painted a reviewer green and an orchestrator violet while the roster
+  // painted an orchestrator azure — and nothing anywhere noticed, because a role's colour is
+  // only ever WRONG relative to another file.
+  //
+  // The table is written out here as the design's own claim, and deliberately NOT derived
+  // from one of the surfaces: deriving it from the stylesheet would make any surface that
+  // drifted define the answer for the others, which is the exact failure being caught.
+  const TABLE: Record<string, string> = {
+    orchestrator: "--id-azure",
+    worker: "--id-jade",
+    reviewer: "--id-violet",
+    planner: "--id-amber",
+  };
+
+  // The role list comes from the TYPE, so a fifth role cannot be added to the app and
+  // silently skipped here.
+  const union = read("../src/orchbadge.ts").match(/export type OrchRole =([^;]+);/);
+  assert.ok(union, "orchbadge.ts no longer declares the OrchRole union");
+  const roles = [...union[1].matchAll(/"([a-z]+)"/g)].map((m) => m[1]);
+  assert.deepEqual(
+    [...roles].sort(),
+    Object.keys(TABLE).sort(),
+    "OrchRole and the role colour table have drifted apart — one of them gained a role"
+  );
+
+  const css = stripCssComments(read("../src/styles.css"));
+  // `complete: true` for the two surfaces that render a chip for EVERY role: a role with no
+  // rule there renders uncoloured, which is the planner bug this test was written for.
+  // The workflow chips only ever exist for the roles workflowview.ts emits, so that surface
+  // is checked for agreement, not for coverage.
+  const SURFACES = [
+    { what: "session badge", re: /\.session-badge\.orch-role\.([a-z]+)\s*\{([^}]*)\}/g, complete: true },
+    { what: "group roster", re: /\.group-role\.role-([a-z]+)\s*\{([^}]*)\}/g, complete: true },
+    { what: "workflow node", re: /\.wf-node-([a-z]+)\s*\{([^}]*)\}/g, complete: false },
+    { what: "workflow chip", re: /\.wf-chip-([a-z]+)\s*\{([^}]*)\}/g, complete: false },
+  ];
+
+  const wrong: string[] = [];
+  for (const { what, re, complete } of SURFACES) {
+    const seen = new Set<string>();
+    for (const [, role, body] of css.matchAll(re)) {
+      if (!(role in TABLE)) continue; // .wf-node-unknown, .wf-node-ghost, .wf-node-title …
+      seen.add(role);
+      const used = [...new Set(tokensIn(body))];
+      const off = used.filter((t) => t !== TABLE[role]);
+      if (off.length) {
+        wrong.push(`${what} "${role}" names ${off.join(", ")}, the table says ${TABLE[role]}`);
+      }
+    }
+    if (complete) {
+      for (const role of roles) {
+        if (!seen.has(role)) {
+          wrong.push(
+            `${what} has no rule for "${role}" — that badge renders uncoloured, so the one ` +
+              "role table is not what ships"
+          );
+        }
+      }
+    }
+  }
+  assert.deepEqual(wrong, [], `the role table is not honoured:\n${wrong.join("\n")}`);
+});
+
+test("an overlay that covers live content paints a translucent wash, never an opaque fill", () => {
+  // These six rules all sit OVER something the user still has to perceive: the drop
+  // indicator over the pane you are about to drop onto, and five scrims over the surface a
+  // dialog belongs to. For the drop indicator the translucency is not a style at all — it is
+  // the affordance, because reading the terminal underneath is how you tell WHICH pane and
+  // WHICH half the drop will land on. Paint it opaque and the preview becomes an occluder on
+  // the one interaction where seeing the target is the entire point.
+  //
+  // That is exactly what a token swap did here: `--accent-glow` (14% azure) became
+  // `--selection`, which is the right token for a selected ROW's fill and an opaque slab
+  // anywhere else. Nothing was wrong with the hue, so nothing else in this file would have
+  // caught it — which is why the list is written out rather than inferred. A new overlay
+  // over live content belongs on it.
+  const OVERLAYS = [
+    ".drop-indicator",
+    ".launcher-overlay",
+    ".git-modal-backdrop",
+    ".issues-form-backdrop",
+    ".tasks-dialog",
+    ".restore-splash",
+  ];
+  const css = stripCssComments(read("../src/styles.css"));
+  const opaque: string[] = [];
+  for (const sel of OVERLAYS) {
+    const rule = css.match(
+      new RegExp(`(^|[},])\\s*${sel.replace(".", "\\.")}\\s*\\{([^}]*)\\}`, "m")
+    );
+    assert.ok(rule, `${sel} has no rule — either it was renamed or the overlay is gone`);
+    const bg = rule[2].match(/(?:^|;)\s*background(?:-color)?\s*:\s*([^;]+)/);
+    assert.ok(bg, `${sel} paints no background — it cannot be a wash over anything`);
+    const value = bg[1].trim();
+    // A wash is a colour carried at partial alpha: `color-mix(..., transparent)` is the
+    // sanctioned form, and a bare `transparent` is trivially fine.
+    if (!/transparent\s*\)?$/.test(value)) opaque.push(`${sel} { background: ${value} }`);
+  }
+  assert.deepEqual(
+    opaque,
+    [],
+    "these overlays sit over content the user must still see, and now hide it:\n" +
+      opaque.join("\n")
+  );
+});
+
+test("no position mixes the state and identity channels across its own variants", () => {
+  // The rule `styles.css` states in its own token block: "No --id-* token may appear in a
+  // state position." Enforcing that needs a definition of "position" a test can compute, and
+  // this is the honest one: a rule and its VARIANTS (the same selector plus extra classes or
+  // attributes) paint the same element in the same property, so they are one position. If
+  // one variant answers "what is this doing" and another answers "which thing is this", the
+  // position has two channels and one of them is wrong.
+  //
+  // Failure this catches, and did: a three-step budget meter whose healthy step was
+  // `--id-jade` while its `.warn` and `.over` steps were `--state-*`. Nothing looked wrong —
+  // the pigment is identical — but retune the identity hue for git-lane separability, which
+  // is what the identity channel is FOR, and the healthy bar moves while its own siblings
+  // stay put. No diff, no failure, a silently desynced ramp.
+  const css = stripCssComments(read("../src/styles.css"));
+  // `--cli-*` counts as IDENTITY, not as a fourth channel: "which CLI is this" is the
+  // identity question by definition, and the sub-table exists only because `--id-*` is
+  // bijective with the icon roles (theme.ts §CLI_HUES). Counting it here is what makes that
+  // claim measured — a `--cli-*` token sharing a position with a `--state-*` one fails.
+  const channelOf = (t: string) =>
+    t.startsWith("--state-") ? "state" : t.startsWith("--id-") || t.startsWith("--cli-") ? "identity" : null;
+
+  // property -> selector -> channel, for every rule that paints a channel token.
+  const paints = new Map<string, Map<string, string>>();
+  for (const [, sel, body] of css.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+    const selector = sel.trim().replace(/\s+/g, " ");
+    if (selector.startsWith("@") || selector.includes(",")) continue;
+    for (const decl of body.split(";")) {
+      const i = decl.indexOf(":");
+      if (i < 0) continue;
+      const prop = decl.slice(0, i).trim();
+      for (const token of tokensIn(decl.slice(i + 1))) {
+        const ch = channelOf(token);
+        if (!ch) continue;
+        if (!paints.has(prop)) paints.set(prop, new Map());
+        paints.get(prop)!.set(selector, ch);
+      }
+    }
+  }
+
+  const mixed: string[] = [];
+  for (const [prop, bySel] of paints) {
+    for (const [a, chA] of bySel) {
+      for (const [b, chB] of bySel) {
+        // b is a variant of a: same selector, then more classes/attributes on the end.
+        if (a === b || !b.startsWith(a) || !/^[.:[]/.test(b.slice(a.length))) continue;
+        if (chA !== chB) mixed.push(`${prop}: "${a}" is ${chA}, its variant "${b}" is ${chB}`);
+      }
+    }
+  }
+  assert.deepEqual(
+    mixed,
+    [],
+    "these positions answer two different questions depending on the variant, so the token " +
+      `layer can move one of them without the others:\n${mixed.join("\n")}`
+  );
+});
+
+test("no rule names a token from the retired legacy bridge", () => {
+  // Slice A's eleven aliases were declared temporary in their own comment and deleted by
+  // slice B. A `var(--panel)` that survives the deletion resolves to NOTHING — CSS drops the
+  // whole declaration and the surface silently loses its background, with no error anywhere.
+  const css = stripCssComments(read("../src/styles.css"));
+  const bridge =
+    /var\(\s*--(bg-app|bg-term|panel|panel-2|border|border-soft|text|text-dim|accent-dim|accent-glow|danger)(?![-a-z0-9])/g;
+  const used = [...css.matchAll(bridge)].map((m) => `--${m[1]}`);
+  assert.deepEqual(
+    [...new Set(used)],
+    [],
+    "these retired bridge names are still referenced, and each one resolves to nothing: " +
+      [...new Set(used)].join(", ")
   );
 });
 
@@ -381,6 +726,294 @@ test("the identity channel is eight distinct hues, each with its Lit step", () =
   }
 });
 
+// --- the per-CLI sub-table (#1020 wave 2) ------------------------------------------------
+//
+// Seven pigments that answer ONE question — which agent program is this pane running — in
+// two positions: the agent-type mark and the session list's CLI chip. The rationale for
+// their existence (and for why they could not be `--id-*` tokens) is theme.ts §CLI_HUES;
+// what is measured below is the part that would otherwise be prose.
+
+test("every per-CLI hue is readable wherever a mark or a chip can sit", () => {
+  // Same floor and same reasoning as the identity ramp above: the session chip carries a
+  // LABEL, so AA at text size on the three app grounds, not the 3:1 non-text floor. The
+  // pane mark can also sit over the terminal ground, where WCAG 1.4.11's 3:1 applies.
+  for (const [cli, value] of Object.entries(CLI_HUES)) {
+    for (const ground of [SEMANTIC.surface0, SEMANTIC.surface1, SEMANTIC.surface2]) {
+      const ratio = contrast(value, ground);
+      assert.ok(ratio >= 4.5, `${cli} (${value}) on ${ground} is ${ratio.toFixed(2)}:1, below AA`);
+    }
+    const term = contrast(value, SEMANTIC.surfaceTerm);
+    assert.ok(term >= 3, `${cli} (${value}) on the terminal ground is ${term.toFixed(2)}:1`);
+  }
+});
+
+test("the per-CLI hues are at least as separable as the eight they sit beside", () => {
+  // THE CEILING ARGUMENT, MEASURED. The design note's "eight is a measurement, not a
+  // preference" was about hues that must be told apart across the WHOLE app; these seven only
+  // ever meet each other, in one position. That is a licence to mint seven more pigments ONLY
+  // if the resulting set is genuinely legible on its own terms, so the bar is the eight-set's
+  // own closest pair — derived here rather than hard-coded, so retuning an identity hue
+  // re-derives the bar instead of silently lowering it.
+  //
+  // A hard-coded floor sits underneath as well: if a future edit ever loosened the identity
+  // set, "at least as good as the eight" would stop meaning anything.
+  const cliClosest = closestPair({ ...CLI_HUES }, (h) => h);
+  const idClosest = closestPair({ ...IDENTITY }, (h) => h);
+  assert.ok(
+    cliClosest.distance >= idClosest.distance,
+    `the CLI hues' closest pair (${cliClosest.a}/${cliClosest.b}, ` +
+      `${cliClosest.distance.toFixed(1)} ΔE) is tighter than the eight identity hues' own ` +
+      `(${idClosest.a}/${idClosest.b}, ${idClosest.distance.toFixed(1)} ΔE) — seven extra ` +
+      "pigments are only justified while they are the more legible set"
+  );
+  assert.ok(cliClosest.distance >= 30, `closest CLI pair is ${cliClosest.distance.toFixed(1)} ΔE`);
+  // Distinct VALUES too, not merely distant ones: two CLIs sharing a pigment would pass a
+  // distance floor trivially only if the pair were excluded, and would read as one CLI.
+  assert.equal(
+    new Set(Object.values(CLI_HUES)).size,
+    Object.keys(CLI_HUES).length,
+    "two CLIs are painted the same pigment"
+  );
+});
+
+test("two CLIs that draw the same glyph stay apart in colour, under every simulation", () => {
+  // THE OBLIGATION THIS TABLE CAN CARRY AND THE IDENTITY CHANNEL CANNOT.
+  //
+  // Seven hues on one ground do not survive colour-vision deficiency and these do not — the
+  // design accepts that for identity, because identity is always also carried by position,
+  // label and SHAPE. The worst collapse in this set is tritan codex/copilot at 1.4 ΔE, i.e.
+  // one colour to a tritanope, and it is fine BECAUSE those two are shape-distinct: codex
+  // badges a plain `C` and copilot draws the vendored octicon.
+  //
+  // What is not fine is two CLIs that draw the SAME shape, because then colour is the only
+  // channel left and the excuse above evaporates. Three of the roster's CLIs start with `C`
+  // and two of them badge a plain one — `claude` and `codex` — so that is the pair this test
+  // exists for. Its worst view is 25.1 ΔE (protan; deutan 42.2, tritan 135.4).
+  //
+  // The collision set is computed from the renderer, not listed here, so an eighth CLI whose
+  // name starts with `C` inherits this obligation the moment it is added rather than the day
+  // someone notices two identical badges in colours a dichromat cannot tell apart. Floor of
+  // 15 ΔE: low enough that a legitimate nudge to a hue does not trip it, high enough that a
+  // genuine collapse does.
+  const glyph = (program: string) => agentMarkFor(program).svg.replace(/class="[^"]*"/, "");
+  const collisions: [string, string][] = [];
+  const names = Object.keys(CLI_HUES);
+  for (let i = 0; i < names.length; i++) {
+    for (let j = i + 1; j < names.length; j++) {
+      if (glyph(names[i]) === glyph(names[j])) collisions.push([names[i], names[j]]);
+    }
+  }
+  assert.ok(
+    collisions.some(([a, b]) => (a === "claude" && b === "codex") || (a === "codex" && b === "claude")),
+    "claude and codex no longer draw the same badge — either a glyph landed (good, and this " +
+      "fixture needs updating) or the letter tier changed shape"
+  );
+  const hues = CLI_HUES as Record<string, string>;
+  for (const [a, b] of collisions) {
+    for (const kind of [null, ...CVD_KINDS]) {
+      const view = (hex: string) => (kind === null ? hex : simulate(hex, kind));
+      const d = deltaE(view(hues[a]), view(hues[b]));
+      assert.ok(
+        d >= 15,
+        `${kind ?? "normal vision"}: "${a}" and "${b}" draw the SAME glyph and are ` +
+          `${d.toFixed(1)} ΔE apart — nothing distinguishes those two panes`
+      );
+    }
+  }
+});
+
+test("no per-CLI hue can be mistaken for the ink it is drawn beside", () => {
+  // A NEAR-MISS, PINNED. The first candidate for copilot was a pewter (#93a8c4) chosen to
+  // evoke GitHub's monochrome mark — and it landed 8.7 ΔE from `--ink-dim`, which is the
+  // colour of the header text the mark sits next to. It would have measured perfectly: AA on
+  // every ground, well clear of all six other CLI hues. It would also have read as an UNDYED
+  // mark, i.e. as the bug this whole table exists to fix, on the CLI most likely to be
+  // running.
+  //
+  // Distance from the other hues is not the property that matters here; distance from the
+  // NEUTRAL the mark is drawn against is. Floor of 20 ΔE at normal vision: the rejected
+  // pewter was at 8.7, and the shipped set's closest approach is 20.6 (copilot/inkDim) — so
+  // the floor is doing real work rather than sitting where nothing can reach it.
+  const INK = { ink: SEMANTIC.ink, inkDim: SEMANTIC.inkDim, inkFaint: SEMANTIC.inkFaint };
+  for (const [cli, value] of Object.entries(CLI_HUES)) {
+    for (const [name, neutral] of Object.entries(INK)) {
+      const d = deltaE(value, neutral);
+      assert.ok(
+        d >= 20,
+        `${cli} (${value}) is ${d.toFixed(1)} ΔE from ${name} (${neutral}) — it reads as ` +
+          "text colour, so the mark looks undyed rather than branded"
+      );
+    }
+  }
+});
+
+test("one CLI table: every surface that names a CLI paints it that CLI's own token", () => {
+  // The twin of "one role table" above, and it exists because loomux had TWO answers to this
+  // question. The session list dyed its claude / copilot / opencode chips `--id-amber` /
+  // `--id-azure` / `--id-jade` while the pane mark dyed every CLI the fleet violet, so the
+  // same program was three colours depending on where you looked — and a Copilot chip was
+  // the same azure as the ORCHESTRATOR role chip sitting beside it on the same row.
+  //
+  // Written out as the design's claim and checked against BOTH surfaces, rather than derived
+  // from one of them: deriving it would let whichever surface drifted define the answer for
+  // the other, which is exactly the failure being caught.
+  const css = stripCssComments(read("../src/styles.css"));
+  const SURFACES = [
+    // No leading delimiter in either pattern, deliberately: a `[},]` guard would be consumed
+    // by one match and then missing for the rule immediately after it, so a block of
+    // consecutive one-line rules would be read every OTHER line. (It was, at first.)
+    { what: "agent mark dye", re: /\.cli-([a-z0-9-]+)\s*\{([^}]*)\}/g },
+    { what: "session chip", re: /\.session-badge\.([a-z0-9-]+)\s*\{([^}]*)\}/g },
+  ];
+  const wrong: string[] = [];
+  let seenAny = 0;
+  for (const { what, re } of SURFACES) {
+    for (const [, cli, body] of css.matchAll(re)) {
+      if (!(cli in CLI_HUES)) continue; // .session-badge.orch-role, .session-badge.session-pr …
+      seenAny++;
+      const off = [...new Set(tokensIn(body))].filter((t) => t !== `--cli-${cli}`);
+      if (off.length) wrong.push(`${what} "${cli}" names ${off.join(", ")}, not --cli-${cli}`);
+    }
+  }
+  assert.deepEqual(wrong, [], `a CLI is painted two different ways:\n${wrong.join("\n")}`);
+  // Both surfaces still exist — a rename that made every rule above unmatchable would leave
+  // `wrong` empty and this test green while checking nothing.
+  assert.ok(seenAny >= Object.keys(CLI_HUES).length + 3, `only ${seenAny} CLI rules matched`);
+});
+
+test("every surface that quotes a per-CLI CVD figure re-derives it, rather than remembering", () => {
+  // THE FINDING THIS TEST IS THE FIX FOR. The first round of this feature quoted CVD figures
+  // in three places — theme.ts, the design note and the PR body — that were produced by a
+  // throwaway script using DIFFERENT dichromat matrices from the ones the suite runs. The
+  // numbers were plausible, internally consistent, and wrong: a claimed "deutan
+  // copilot/hermes 12.6" was near the PROTAN value, and no pair measured 12.6 under any
+  // simulation at all. Nothing caught it, because a measurement written into prose is a
+  // measurement nothing re-runs.
+  //
+  // BOTH PROSE SURFACES, not just the one that happens to be a markdown table (review N4).
+  // Pinning the note alone left theme.ts's own copy of the same three figures free to be
+  // corrupted with the suite still green — which is the identical gap one file to the left,
+  // and the whole reason #878 says a claim lives on several surfaces at once.
+  //
+  // The two are compared through the SAME normalization (markdown pipes, bold markers and
+  // JSDoc's leading `*` all collapse to whitespace), so one regex per claim reads both. A
+  // second parser would be a second thing to get wrong.
+  const flatten = (s: string) => s.replace(/[|*]/g, " ").replace(/\s+/g, " ");
+  const SURFACES = [
+    { what: "doc/design/ui-redesign.md", text: flatten(read("../doc/design/ui-redesign.md")) },
+    { what: "src/theme.ts", text: flatten(read("../src/theme.ts")) },
+  ];
+
+  // 1. The closest pair under each simulation — the figures round 1 got wrong.
+  for (const kind of CVD_KINDS) {
+    const { distance, a, b } = closestPair({ ...CLI_HUES }, (h) => simulate(h, kind));
+    for (const { what, text } of SURFACES) {
+      const m = text.match(new RegExp(`\\b${kind}\\s+([a-z]+/[a-z]+)\\s+([0-9]+\\.[0-9])\\b`));
+      assert.ok(m, `${what} quotes no closest ${kind} pair for the CLI hues`);
+      assert.equal(m[1], `${a}/${b}`, `${what} says the closest ${kind} pair is ${m[1]}; it is ${a}/${b}`);
+      assert.equal(
+        m[2],
+        distance.toFixed(1),
+        `${what} says ${kind} ${m[1]} is ${m[2]} ΔE; it is ${distance.toFixed(1)}`
+      );
+    }
+  }
+
+  // 2. The same-glyph pair's three dichromat views — the load-bearing safety claim, and the
+  //    one a reader is most likely to take on trust because it is the reassuring number.
+  const hues = CLI_HUES as Record<string, string>;
+  const views = CVD_KINDS.map((k) =>
+    deltaE(simulate(hues.claude, k), simulate(hues.codex, k)).toFixed(1)
+  );
+  for (const { what, text } of SURFACES) {
+    const m = text.match(/([0-9]+\.[0-9]) ΔE \(protan; deutan ([0-9]+\.[0-9]), tritan ([0-9]+\.[0-9])\)/);
+    assert.ok(m, `${what} no longer states claude/codex's three dichromat views in the pinned shape`);
+    assert.deepEqual(
+      [m[1], m[2], m[3]],
+      views,
+      `${what} says claude/codex is ${m[1]}/${m[2]}/${m[3]} (protan/deutan/tritan); it is ` +
+        views.join("/")
+    );
+  }
+});
+
+test("the design note's per-CLI table matches theme.ts", () => {
+  // Same pin as the mist row below, for the same reason: doc/design/ui-redesign.md carries
+  // its own copy of these seven values as a table, and it is the one mirror nothing reads
+  // back. A demo that swaps a hue after the human looks at it would otherwise leave the note
+  // describing the palette that was rejected.
+  const doc = read("../doc/design/ui-redesign.md");
+  for (const [cli, value] of Object.entries(CLI_HUES)) {
+    // name | token | value — the token column is matched loosely so a later column edit
+    // does not break the pin, but the VALUE column is exact.
+    const row = doc.match(
+      new RegExp(`\\|\\s*\\*\\*${cli}\\*\\*\\s*\\|[^|]*\\|\\s*\`(#[0-9a-f]{6})\``, "i")
+    );
+    assert.ok(row, `ui-redesign.md has no per-CLI table row for ${cli}`);
+    assert.equal(row[1], value, `ui-redesign.md says ${cli} is ${row[1]}, theme.ts says ${value}`);
+  }
+});
+
+test("the tab strip climbs: no tab shares the bar's ground, and the active one is highest", () => {
+  // THE DEFECT CLASS, not the styling. The human's note was that the project tabs were hard
+  // to tell apart, and the stylesheet said exactly why: `#tab-bar` and an inactive `.tab`
+  // were BOTH `--surface-1` — the same colour, so an unselected tab had no body at all and
+  // its hairline was standing in for one — while `.tab.active` was `--surface-term`, the
+  // DEEPEST surface in the app, so the one tab you are in was the darkest thing in the strip.
+  // Both are invisible in a diff (each rule names a perfectly ordinary elevation token) and
+  // neither is visible to any other test here, which is why this one is written against the
+  // RELATIONSHIP between the four rules rather than against the four values.
+  //
+  // Deliberately not a pin on which token each rule names: raising the whole strip a step is
+  // a legitimate future edit, and "an inactive tab is not the bar" plus "the tab you are in
+  // is the highest surface in the strip" survives it. Only a regression to the flat or
+  // inverted strip fails.
+  const css = stripCssComments(read("../src/styles.css"));
+  const groundOf = (selector: string): string => {
+    const rule = css.match(
+      new RegExp(`(^|[},])\\s*${selector.replace(/[.#]/g, "\\$&")}\\s*\\{([^}]*)\\}`, "m")
+    );
+    assert.ok(rule, `${selector} has no rule — the tab strip was restructured`);
+    const bg = rule[2].match(/(?:^|;)\s*background(?:-color)?\s*:\s*([^;]+)/);
+    assert.ok(bg, `${selector} paints no background`);
+    return bg[1].trim();
+  };
+  // `transparent` means "whatever is behind me", which for a tab is the bar — so a tab
+  // painted transparent IS the bar's colour and fails the first assertion below, as it
+  // should: a tab with no body of its own is the flat strip this test exists to refuse.
+  const resolve = (value: string, behind: string): string => {
+    if (value === "transparent") return behind;
+    const token = value.match(/^var\(\s*(--[a-z0-9-]+)\s*\)$/);
+    assert.ok(token, `the tab strip paints ${value}, which is not a token or transparent`);
+    const hex: string | undefined = (CSS_TOKENS as Record<string, string>)[token[1]];
+    assert.ok(hex, `${token[1]} is not a pinned colour token`);
+    return hex;
+  };
+
+  const bar = resolve(groundOf("#tab-bar"), "");
+  const idle = resolve(groundOf(".tab"), bar);
+  const hover = resolve(groundOf(".tab:hover"), bar);
+  const active = resolve(groundOf(".tab.active"), bar);
+
+  assert.notEqual(
+    idle,
+    bar,
+    "an inactive tab is painted the bar's own colour, so it has no body — only its hairline " +
+      "says a tab is there"
+  );
+  assert.ok(
+    luminance(active) > luminance(bar),
+    `the active tab (${active}) is no lighter than the strip it sits in (${bar}) — the tab ` +
+      "you are in must be the surface CLOSEST to the human, which is what the elevation " +
+      "ladder means by height (§Elevation)"
+  );
+  assert.ok(
+    luminance(active) >= luminance(hover) && luminance(hover) >= luminance(idle),
+    `the strip does not climb: idle ${idle}, hover ${hover}, active ${active}`
+  );
+  assert.equal(new Set([bar, hover, active]).size, 3, "two of the tab states are one colour");
+});
+
 const STATE_DYES = {
   working: SEMANTIC.stateWorking,
   attention: SEMANTIC.stateAttention,
@@ -460,6 +1093,25 @@ test("no identity-only hue may fill a state role", () => {
         "by design: a stopped agent is marked by form, not by hue"
     );
   }
+});
+
+test("the design note's mist row matches theme.ts", () => {
+  // doc/design/ui-redesign.md §The palette carries its own copy of the ink ramp as a table
+  // row — the third mirror alongside styles.css and index.html, but the only one nothing
+  // reads back. A slice that moves mist000/200/400 in theme.ts (as #1020 item 11 did) can
+  // drift the doc silently, which is exactly the kind of gap the other two pins exist to
+  // close for their own surfaces.
+  const doc = read("../doc/design/ui-redesign.md");
+  const row = doc.match(
+    /\|\s*\*\*mist\*\*\s*\|\s*`(#[0-9a-f]{6})`\s*\/\s*`(#[0-9a-f]{6})`\s*\/\s*`(#[0-9a-f]{6})`/i
+  );
+  assert.ok(row, "ui-redesign.md has no `**mist**` palette-table row to pin");
+  assert.deepEqual(
+    [row[1], row[2], row[3]],
+    [PALETTE.mist000, PALETTE.mist200, PALETTE.mist400],
+    `ui-redesign.md's mist row is ${row[1]} / ${row[2]} / ${row[3]}, theme.ts says ` +
+      `${PALETTE.mist000} / ${PALETTE.mist200} / ${PALETTE.mist400}`
+  );
 });
 
 test("every palette entry is a well-formed hex colour", () => {

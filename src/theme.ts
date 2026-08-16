@@ -5,8 +5,8 @@
 // in index.html (which must be right BEFORE the bundle loads, or the app flashes the wrong
 // colour at startup), and the xterm.js ITheme in pane.ts (terminals render on a WebGL
 // canvas — CSS custom properties are invisible to them). Before this module the three were
-// hand-kept in sync, which is to say they were not: the pre-paint hex and `--bg-app` agreed
-// only because nobody had changed one of them yet.
+// hand-kept in sync, which is to say they were not: the pre-paint hex and the stylesheet's
+// app ground agreed only because nobody had changed one of them yet.
 //
 // So: the values live here, in DOM-free TypeScript that a node:test can read, and the other
 // two surfaces are PINNED TO IT by test/theme.test.ts rather than by good intentions. The
@@ -21,7 +21,8 @@
 // DOM-free on purpose: node:test imports this directly (no jsdom, no bundler).
 
 /**
- * Two neutral ramps and eight named hues.
+ * Two neutral ramps, eight named hues, and a seven-pigment per-CLI set that answers one
+ * closed question in one position (see `CLI_HUES`).
  *
  * `slate` is a deep, cool neutral — blue sits a few points above red at every step, so the
  * ground reads cool and recedes behind terminal output rather than tinting it. `mist` is
@@ -48,7 +49,36 @@ export const PALETTE = {
 
   // --- mist: the ink. `mist400` is BELOW 4.5:1 on every ground by design — it is for
   //     non-essential meta and rules only. Anything a user must read uses mist200 or better.
-  mist000: "#e7e9ee", // primary ink            (15.6:1 on slate100)
+  //
+  //     mist000 was toned down from its original 15.6:1 (#e7e9ee) at the human's request —
+  //     "a little extreme" against the near-black grounds (#1020 item 11). The candidate
+  //     matrix considered, measured against slate100 (the app ground) with the identical
+  //     WCAG formula test/theme.test.ts runs, all comfortably clear the ramp's own AAA floor
+  //     (>=7:1 on every ground, test: "the ink ramp keeps the contrast the design note
+  //     promises") with room to spare even on slate300, the lightest ground it sits on:
+  //
+  //       candidate      hex        surface0   surface1   surface2   surfaceTerm
+  //       mild trim      #d7dae0    13.50:1    12.80:1    11.78:1    14.06:1
+  //       DEFAULT (mid)  #cfd2d9    12.49:1    11.85:1    10.90:1    13.01:1   <- shipped
+  //       strong trim    #c7cad2    11.53:1    10.94:1    10.06:1    12.01:1
+  //
+  //     Terminal consequence: none of these candidates touch TERMINAL_THEME.brightWhite
+  //     (below) — it is its own literal, not PALETTE.mist000, precisely so that swapping the
+  //     candidate here can never again silently re-paint the terminal's bright-white slot. It
+  //     did once: shipping DEFAULT while brightWhite aliased mist000 put brightWhite (L
+  //     0.6437) BELOW `foreground` (L 0.6921), inverting bright-white emphasis in every pane
+  //     (#1033 review) — see the brightWhite comment in TERMINAL_THEME.
+  //
+  //     DEFAULT was picked as the midpoint of the requested ~12-13:1 band. Which candidate
+  //     reads right is a human call at the demo (#1020 human input 4) — swap this one hex
+  //     to move the whole app; nothing else here needs to change (styles.css / index.html
+  //     stay pinned to whichever value lands here). The surface ladder itself (below) was
+  //     deliberately left untouched: its steps are already at the finest gap 8-bit hex can
+  //     express at this luminance (adjacent hex values differ by ~0.02:1 of contrast here),
+  //     so softening it further either does nothing visible or risks breaking the strictly-
+  //     increasing elevation order for no perceptible gain — a call for a design slice with
+  //     room to re-derive the whole ladder, not a same-day tone-down.
+  mist000: "#cfd2d9", // primary ink            (12.5:1 on slate100)
   mist200: "#9ba3b1", // secondary ink          (7.4:1)
   mist400: "#656d7b", // faint meta / dividers  (3.2-3.8:1 — non-text use only)
 
@@ -76,6 +106,33 @@ export const PALETTE = {
   violetLit: "#c39ce8",
   orchid: "#e767a8", //   identity only
   orchidLit: "#f08cbd",
+
+  // --- the per-CLI brand hues (#1020 wave 2). Seven pigments that exist for ONE position —
+  //     the agent-type mark and the session list's CLI chip — and answer one closed
+  //     question: *which program is this pane running*. They are not a ninth..fifteenth
+  //     identity hue and they do not compete with the eight above; see `CLI_HUES` for why
+  //     they had to be their own set rather than borrowed `--id-*` tokens.
+  //
+  //     EVOCATION, NOT REPLICATION. Where a vendor has a well-known palette the pigment
+  //     leans toward it — clay for Anthropic's warm terracotta, teal for OpenAI's green,
+  //     steel for GitHub's blue, indigo for Gemini's blue-violet — but no value here is a
+  //     vendor's own hex, and none is presented as one. A trademark colour copied exactly
+  //     is a claim of affiliation loomux does not make and does not need: the same
+  //     nominative-use reasoning that lets agenticons.ts draw GitHub's own glyph (§Licensing
+  //     there) is why it may lean toward GitHub's blue without taking it. The three CLIs
+  //     whose vendors publish no colour identity at all (opencode, hermes, ante) get hues
+  //     loomux picked outright, for separation and nothing else.
+  //
+  //     No `Lit` step: unlike the eight, nothing paints an emphasis tier of a CLI hue — a
+  //     mark is one flat glyph and a chip is a 16% wash of the base. A step nothing paints
+  //     is a token the pin cannot check (design note, §The Lit step).
+  clay: "#e08a5f", //     claude   — warm terracotta
+  citron: "#c3c455", //   ante     — yellow-green
+  fern: "#5fc873", //     opencode — a true green
+  teal: "#3ec2a8", //     codex    — green-cyan
+  steel: "#7fa8d8", //    copilot  — a cool desaturated blue
+  indigo: "#8b8ff0", //   gemini   — blue-violet
+  fuchsia: "#e072c0", //  hermes   — magenta
 
   // --- terminal-only. ANSI wants a true green in a slot where the app's greens are a teal
   //     (jade) and a yellow-green (lime); neither reads as "green" to a CLI, so ANSI green
@@ -128,6 +185,73 @@ export const IDENTITY_LIT = {
   azure: PALETTE.azureLit,
   violet: PALETTE.violetLit,
   orchid: PALETTE.orchidLit,
+} as const;
+
+/**
+ * §The per-CLI hues — program name → the pigment that says *which CLI this pane runs*.
+ *
+ * WHY THIS EXISTS AT ALL. Before this table every agent pane in the app was the same
+ * violet: the mark took the `fleet` icon role's dye (`--id-violet`, "the agents
+ * themselves"), which is the correct answer to *is this an agent?* and no answer at all to
+ * *which one?* — the question the mark was added to answer (#992). A wall of ten panes
+ * running three different CLIs came out one colour, so the glyph had to be read rather than
+ * seen, which is exactly what the mark exists to avoid.
+ *
+ * WHY IT COULD NOT REUSE `--id-*`, WHICH IS THE ONLY INTERESTING DECISION HERE. The eight
+ * identity hues are in BIJECTION with the eight icon roles — each hue claimed by exactly one
+ * role, enforced in both directions by test/icons.test.ts, and that bijection is what stops
+ * eight hues from decaying into a palette of nice colours. Handing `--id-jade` to opencode
+ * would not add a meaning, it would give jade a SECOND one, and "jade" would stop resolving
+ * to `content` — the failure the bijection was written to prevent. So a per-CLI hue needs a
+ * pigment no icon role has claimed, which means a new set, which means a new prefix. That
+ * prefix is also the reviewable signal: `--cli-*` in a diff says "this surface is answering
+ * *which program*", the same way `--state-*` vs `--id-*` already declares state vs identity.
+ *
+ * THEY ARE STILL THE IDENTITY CHANNEL, NOT A FOURTH ONE. "Which CLI is this" is the
+ * identity question by definition (design note, §The three colour channels, which already
+ * lists "per-CLI marks" as an identity consumer). `--cli-*` is a SUB-TABLE of that channel
+ * for one closed roster, not a new channel with new rules: an identity hue may still never
+ * enter a state position, and neither may one of these.
+ *
+ * WHY SEVEN MORE PIGMENTS DOES NOT BREAK "EIGHT IS A MEASUREMENT". That ceiling was measured
+ * for hues that must be told apart ACROSS THE WHOLE APP — a ninth would have landed closer to
+ * an existing hue than the eight-set's own closest pair (rose/orchid, 30.4 ΔE). These seven
+ * never have to survive that comparison, because they only ever appear in ONE position
+ * against each other: the agent mark and the session list's CLI chip. Measured on their own
+ * terms they are the tighter set — closest pair 31.5 ΔE (codex/opencode), better than the
+ * eight's own 30.4 — and test/theme.test.ts holds them to that floor.
+ *
+ * COLOUR-VISION DEFICIENCY, HONESTLY — AND THE WORST CASE IS TRITAN, NOT THE RED-GREEN ONES.
+ * Seven hues on one ground do not survive CVD and these do not. Closest pair per simulation:
+ * protan copilot/hermes 12.5, deutan claude/opencode 10.5, and tritan codex/copilot **1.4** —
+ * which is the honest headline, because a tritanope sees those two as one colour. (Every
+ * figure here and below is CIE76 over the Viénot LMS simulation in test/theme.test.ts; that
+ * is the only method quoted anywhere in this feature, so two surfaces cannot disagree by
+ * having measured differently.)
+ *
+ * That collapse is the same trade the identity channel already makes and states — state dyes
+ * stay separable, identity does not have to, because identity is also carried by position,
+ * label and SHAPE. Here the shape is usually one letter, so the trade holds only while no two
+ * CLIs draw the same one; where they do, colour is the last channel and has to survive what
+ * the others are excused from. Today that is exactly one pair — claude and codex both badge
+ * `C` — and its worst view is 25.1 ΔE (protan; deutan 42.2, tritan 135.4). Every pair that
+ * DOES collapse is shape-distinct: codex/copilot is a `C` against the vendored octicon,
+ * claude/hermes (3.8 tritan) a `C` against an `H`. test/theme.test.ts computes the collision
+ * set from the renderer rather than hard-coding it, so an eighth CLI starting with `C`
+ * inherits the obligation automatically.
+ *
+ * Keys are program names as `normalizeAgentProgram` spells them, which is what lets
+ * src/agenticons.ts stamp `cli-<program>` without a second table to keep in step;
+ * test/agenticons.test.ts pins the two lists against each other in both directions.
+ */
+export const CLI_HUES = {
+  claude: PALETTE.clay,
+  codex: PALETTE.teal,
+  copilot: PALETTE.steel,
+  opencode: PALETTE.fern,
+  gemini: PALETTE.indigo,
+  hermes: PALETTE.fuchsia,
+  ante: PALETTE.citron,
 } as const;
 
 /**
@@ -200,7 +324,7 @@ export const TERM_METRICS = { fontSize: 14, lineHeight: 1.1 } as const;
  */
 export const TERMINAL_THEME = {
   background: PALETTE.slate000,
-  foreground: "#d5d9e1", // mist000 held back a touch — this is read for hours at a time
+  foreground: "#d5d9e1", // independent literal, not derived from mist000 — read for hours at a time
   cursor: PALETTE.azure, // the caret is interaction, so it takes the accent (SEMANTIC.focus)
   cursorAccent: PALETTE.slate000,
   selectionBackground: PALETTE.azureDeep,
@@ -230,7 +354,13 @@ export const TERMINAL_THEME = {
   brightBlue: PALETTE.azureLit,
   brightMagenta: PALETTE.violetLit,
   brightCyan: PALETTE.cyanLit,
-  brightWhite: PALETTE.mist000,
+  // Independent literal, NOT PALETTE.mist000: the primary-ink tone-down (#1020 item 11) must
+  // never carry into ANSI bright-white, or a later mist000 edit silently dims the terminal's
+  // brightest slot below `foreground` (#d5d9e1, L 0.6921) — exactly what aliasing this to
+  // mist000 once did (L 0.6437 < 0.6921), inverting bright-white emphasis in every pane
+  // (#1033 review). Kept at mist000's pre-tone-down value so brightWhite stays the brightest
+  // thing a CLI can print.
+  brightWhite: "#e7e9ee",
 } as const;
 
 /** The 16 ANSI slot names, in wire order. Exported so the test names what it checks. */
@@ -294,6 +424,17 @@ export const CSS_TOKENS = {
   "--id-azure": IDENTITY.azure,
   "--id-violet": IDENTITY.violet,
   "--id-orchid": IDENTITY.orchid,
+  // The per-CLI sub-table (see CLI_HUES). A separate prefix rather than eight more `--id-*`
+  // entries, because `--id-*` is bijective with the icon role table and a CLI claiming one
+  // would give that hue a second meaning. Every key here is a program name, so the token a
+  // rule names IS the program it dyes — there is no third spelling to drift.
+  "--cli-claude": CLI_HUES.claude,
+  "--cli-codex": CLI_HUES.codex,
+  "--cli-copilot": CLI_HUES.copilot,
+  "--cli-opencode": CLI_HUES.opencode,
+  "--cli-gemini": CLI_HUES.gemini,
+  "--cli-hermes": CLI_HUES.hermes,
+  "--cli-ante": CLI_HUES.ante,
   "--font-mono": FONT.mono,
   "--font-ui": FONT.ui,
 } as const;
