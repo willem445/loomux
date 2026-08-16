@@ -9124,6 +9124,15 @@ pub fn unmet_deps<'a>(task: &'a Task, board: &[Task]) -> Vec<&'a str> {
 /// checked once. The row itself is excluded even where a cycle makes it its own
 /// ancestor — its own deps are `unmet_deps`' answer, and counting them twice
 /// would say nothing new.
+///
+/// `task` is expected to be a row OF `board`, which is how every caller reaches
+/// it (`board_summaries` projects a board against itself). The chain is read
+/// off the board's own parent pointers, so a `Task` that is not on the board —
+/// a modified probe, say — climbs nothing and reads as unblocked. That is the
+/// safe direction for a hint (§7: hierarchy must mislead, never gate), but it
+/// is a contract, not a coincidence: substitute the edge into the map the way
+/// the write path does if a caller ever needs to ask about a row it has not
+/// stored yet.
 pub fn blocking_ancestor<'a>(task: &Task, board: &'a [Task]) -> Option<&'a str> {
     // The write path's ancestor walk, reused rather than hand-rolled a second
     // time — one walk, one termination argument for the one board that can be
