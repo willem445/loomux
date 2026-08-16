@@ -729,3 +729,13 @@ mod tests {
         assert_eq!(w.len(), 1, "an unsuperseded claim must install its watch");
     }
 }
+
+// #1042 red-before-green round 4, mutation A: the MODULE-ALIAS bypass (#1092
+// review N4a). No `rootreg::` prefix at the call site, so it matches no needle.
+// Never merged.
+use crate::rootreg as rr;
+
+#[allow(dead_code)]
+fn scratch_alias_declare(roots: &loomux_engine::rootreg::RootRegistry, cwd: &str) {
+    let _ = rr::admit(roots, cwd);
+}

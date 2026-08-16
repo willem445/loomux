@@ -291,3 +291,15 @@ pub fn fm_hash_start(
         reg.end(id);
     });
 }
+
+// #1042 red-before-green round 4, mutation B: the WRAPPED BRACED import (#1092
+// review N4b). Line-by-line matching never sees `admit` on the `use` line.
+// Never merged.
+use crate::rootreg::{
+    admit,
+};
+
+#[allow(dead_code)]
+fn scratch_braced_declare(roots: &loomux_engine::rootreg::RootRegistry, cwd: &str) {
+    let _ = admit(roots, cwd);
+}
