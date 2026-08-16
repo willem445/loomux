@@ -32254,14 +32254,22 @@ fn attention_toasts_once_per_onset_only_for_optin_groups() {
 }
 
 /// #1091 slice D: a pending `ask_human` question DERIVES a `question`
-/// attention item on the asker's own pane (orchestrator-only today), and it
-/// clears the instant the row is settled — no separate dismiss, because the
-/// `questions.json` registry itself is the latch. RED on base: `question` is
-/// not a reason `attention_tick` ever emits there, so the first assertion's
-/// `count` is 0, not 1 — a real behavioral miss, not a compile error.
+/// attention item on the asker's own pane (orchestrator-only today). RED on
+/// base: `question` is not a reason `attention_tick` ever emits there, so
+/// `.find(...)` returns `None` and `.expect(...)` panics — a real behavioral
+/// miss, not a compile error.
+///
+/// Split into four separate `#[test]`s (review finding N1 on #1123) rather
+/// than one long one: `cargo test` stops a test function at its first
+/// panicking assertion, so a single function covering "flags", "bumps the
+/// count", "clears on settle", and "toasts" would have only ever evidenced
+/// whichever assertion the RED run's mutation happened to reach — the other
+/// three would carry no red evidence at all despite reading as asserted.
+/// Four functions means four independent reds, each attributable to its own
+/// assertion.
 #[test]
-fn attention_flags_the_asker_with_a_pending_question_and_clears_on_settle() {
-    let (reg, _d, g, co, _cw, orch_id) = setup_questions();
+fn attention_flags_the_asker_with_a_pending_question() {
+    let (reg, _d, _g, co, _cw, orch_id) = setup_questions();
     let now = 1_000_000_000_000u64;
     let empty = HashMap::new();
 
@@ -32280,13 +32288,44 @@ fn attention_flags_the_asker_with_a_pending_question_and_clears_on_settle() {
         .find(|i| i.agent_id == orch_id && i.reason == "question")
         .expect("a pending question must flag the asker's pane");
     assert!(item.detail.contains('1'), "detail should say how many are pending: {}", item.detail);
+}
 
-    // A second pending question bumps the count on the same item.
+#[test]
+fn a_second_pending_question_bumps_the_count_on_the_same_item() {
+    let (reg, _d, _g, co, _cw, orch_id) = setup_questions();
+    let now = 1_000_000_000_000u64;
+    let empty = HashMap::new();
+
+    q_call(&reg, &co, "ask_human", json!({ "text": "ship it here or split it?" }));
     let out2 = q_call(&reg, &co, "ask_human", json!({ "text": "another one?" }));
     assert_eq!(out2["isError"], false, "{}", q_text(&out2));
-    let flagged2 = reg.attention_tick(now, &empty, &no_tails(), &empty);
-    let item2 = flagged2.iter().find(|i| i.agent_id == orch_id && i.reason == "question").unwrap();
-    assert!(item2.detail.contains('2'), "two pending: {}", item2.detail);
+
+    let flagged = reg.attention_tick(now, &empty, &no_tails(), &empty);
+    let item = flagged
+        .iter()
+        .find(|i| i.agent_id == orch_id && i.reason == "question")
+        .expect("two pending questions must still flag the asker's pane");
+    assert!(item.detail.contains('2'), "two pending: {}", item.detail);
+}
+
+/// Pins the slice's central "non-latched by design" claim: the registry
+/// itself is the latch, so settling every pending row must clear the badge
+/// with no separate ack — unlike `stranded`. The predicate this guards is
+/// `!q.status.is_settled()` in `attention_tick`'s `question_of` build
+/// (mod.rs): drop it (or invert it) and this is the one assertion that
+/// reddens, because a withdrawn/answered row would keep counting.
+#[test]
+fn settling_every_pending_question_clears_the_badge_with_nothing_latched() {
+    let (reg, _d, _g, co, _cw, orch_id) = setup_questions();
+    let now = 1_000_000_000_000u64;
+    let empty = HashMap::new();
+
+    q_call(&reg, &co, "ask_human", json!({ "text": "ship it here or split it?" }));
+    q_call(&reg, &co, "ask_human", json!({ "text": "another one?" }));
+    assert!(
+        reg.attention_tick(now, &empty, &no_tails(), &empty).iter().any(|i| i.agent_id == orch_id),
+        "sanity: two pending questions must flag the pane before withdrawal"
+    );
 
     // Withdrawing both settles them — the badge clears with no separate ack.
     q_call(&reg, &co, "withdraw_question", json!({ "id": "q-1" }));
@@ -32295,9 +32334,18 @@ fn attention_flags_the_asker_with_a_pending_question_and_clears_on_settle() {
         reg.attention_tick(now, &empty, &no_tails(), &empty).iter().all(|i| i.agent_id != orch_id),
         "settling every pending question must clear the badge with nothing latched"
     );
+}
 
-    // A `question` item is a fresh event exactly like `blocked`/`report` — it
-    // toasts once opted in, unlike the persistent `gate` state.
+/// **Forward guard, not a new-behaviour pin** (review finding N2 on #1123):
+/// `attention_toast_targets` already toasts every reason but `gate`, and this
+/// PR adds no logic to that function — the guard below reddens only if a
+/// FUTURE change adds `question` to an exclusion list (or otherwise special-
+/// cases it), not from anything in this diff. Kept as its own test, separate
+/// from the three above, precisely so the red-before-green evidence for those
+/// three is never read as covering this one too.
+#[test]
+fn a_question_attention_item_toasts_like_any_other_event_not_like_gate() {
+    let (reg, _d, g, _co, _cw, orch_id) = setup_questions();
     let pending = vec![AttentionItem {
         agent_id: orch_id.clone(),
         group: g.to_string(),

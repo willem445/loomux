@@ -24,17 +24,34 @@ const isUrgentReason = (reason: string): boolean =>
   reason === "blocked" || reason === "stranded";
 
 // Priority when several panes in one tab need attention: show the most urgent
-// reason on the tab chip. Mirrors the backend's own ordering in
-// `attention_tick` (blocked > stranded > waiting > report > question > gate).
+// reason on the tab chip. This is its OWN cross-pane ranking, not a literal
+// mirror of attention_tick's per-agent if/else chain (that chain resolves
+// which reason wins for ONE agent that could match several; this ranks
+// different agents' different reasons against each other on one tab) — it
+// already diverged from the chain before this slice: `gate` (2) has long
+// outranked `report` (1) here even though the backend chain checks `report`
+// first (#157).
 const REASON_PRIORITY: Record<string, number> = {
-  blocked: 6,
-  stranded: 5,
-  waiting: 4,
-  report: 3,
-  // #1091 slice D: ranked with the other board/registry-derived reasons,
-  // just above `gate` — see attention_tick's own ordering.
-  question: 2,
-  gate: 1,
+  blocked: 5,
+  stranded: 4,
+  waiting: 3,
+  gate: 2,
+  // #1091 slice D: deliberately 1.5, not a renumber. Every pre-existing
+  // value above is UNCHANGED (`gate` still outranks `report`, #157's own
+  // ordering, untouched) — `question` just slots between them. That keeps
+  // `blocked`'s value at 5, which matters beyond just staying vertically
+  // minimal: #1114 (issue #946 Q4 / plan-783 slice H, on `main`) inserts its
+  // own `held-dialog` reason into this SAME literal at the very top, above
+  // `blocked`. Had this slice renumbered `blocked` upward (an earlier
+  // revision did, to 6), the two PRs' values for `blocked` and `held-dialog`
+  // land on the same integer — a merge-tool-plausible resolution of the
+  // #1018 catch-up produces a silent tie, broken by emission order rather
+  // than intent. Leaving `blocked` untouched removes that hazard regardless
+  // of which PR's hunk the catch-up resolves toward. Target merged ladder
+  // once #1114 lands: `held-dialog` (6) > `blocked` (5) > `stranded` (4) >
+  // `waiting` (3) > `gate` (2) > `question` (1.5) > `report` (1).
+  question: 1.5,
+  report: 1,
 };
 const reasonRank = (reason: string): number => REASON_PRIORITY[reason] ?? 0;
 
@@ -69,7 +86,7 @@ export function tabAttention(
     const wsId = ptyToWs.get(it.pty_id);
     if (!wsId) continue;
     const prev = out.get(wsId);
-    // Keep whichever reason ranks highest (blocked > waiting > report > question > gate).
+    // Keep whichever reason ranks highest (blocked > stranded > waiting > gate > question > report).
     if (!prev || reasonRank(it.reason) > reasonRank(prev.reason)) {
       out.set(wsId, { urgent: isUrgentReason(it.reason), reason: it.reason });
     }

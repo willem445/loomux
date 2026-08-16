@@ -507,8 +507,10 @@ These deserve their own detail — see:
 - **Attention routing** — a pane earns a pulsing **needs-attention** chip when an
   agent is parked on a prompt only you can answer, when a worker reports done or
   blocked, when a task hits a human merge gate, or when the orchestrator has a
-  question pending your answer (`ask_human`, not yet surfaced by a dedicated
-  panel — see the pane chip and `list_questions` meanwhile). An optional
+  question pending your answer. There's no dedicated panel for it yet — until
+  one lands, the pane chip is the only surface: hover it for the question
+  count, and ask the orchestrator to summarize its pending questions if you
+  want the text before answering. An optional
   per-group **desktop notification** toggle (🔔 in the lifecycle panel) raises
   an OS toast for those events (off by default).
   - Most chips clear themselves: they're recomputed every few seconds, and

@@ -64,10 +64,31 @@ test("tabAttention keeps the highest-priority reason when a tab has several", ()
   assert.deepEqual(out.get("ws-a"), { urgent: false, reason: "waiting" }, "waiting outranks report");
 });
 
-test("'question' ranks between 'report' and 'gate', mirroring attention_tick", () => {
-  // #1091 slice D: a pending ask_human question is board/registry-derived
-  // like `gate`, but is still an actionable ask — rank it just above `gate`.
-  const overGate = tabAttention(
+test("'gate' outranks 'report' on the tab chip (#157) — pinned so a future reorder reddens", () => {
+  // Pre-existing, established ordering — unrelated to #1091 slice D, but
+  // never had its own pin (review finding B2 on #1123): a silent swap of
+  // these two shipped green once already. Pinning it here means it can't
+  // happen invisibly again.
+  const out = tabAttention(
+    [
+      { pty_id: 1, reason: "report" },
+      { pty_id: 2, reason: "gate" },
+    ],
+    ptyMap([
+      [1, "ws-a"],
+      [2, "ws-a"],
+    ])
+  );
+  assert.deepEqual(out.get("ws-a"), { urgent: false, reason: "gate" }, "gate outranks report");
+});
+
+test("'question' slots strictly between the pre-existing 'gate' and 'report' (#1091 slice D)", () => {
+  // Inserted at 1.5 — between gate (2) and report (1) — without renumbering
+  // either of them, or `blocked`/`stranded`/`waiting` above. See the
+  // REASON_PRIORITY comment in tabroute.ts for why the non-renumbering is
+  // deliberate (avoids a value collision with #1114's own insertion into
+  // this same literal on a different branch).
+  const underGate = tabAttention(
     [
       { pty_id: 1, reason: "gate" },
       { pty_id: 2, reason: "question" },
@@ -77,9 +98,9 @@ test("'question' ranks between 'report' and 'gate', mirroring attention_tick", (
       [2, "ws-a"],
     ])
   );
-  assert.deepEqual(overGate.get("ws-a"), { urgent: false, reason: "question" }, "question outranks gate");
+  assert.deepEqual(underGate.get("ws-a"), { urgent: false, reason: "gate" }, "gate outranks question");
 
-  const underReport = tabAttention(
+  const overReport = tabAttention(
     [
       { pty_id: 1, reason: "question" },
       { pty_id: 2, reason: "report" },
@@ -90,9 +111,9 @@ test("'question' ranks between 'report' and 'gate', mirroring attention_tick", (
     ])
   );
   assert.deepEqual(
-    underReport.get("ws-a"),
-    { urgent: false, reason: "report" },
-    "report outranks question"
+    overReport.get("ws-a"),
+    { urgent: false, reason: "question" },
+    "question outranks report"
   );
 });
 
