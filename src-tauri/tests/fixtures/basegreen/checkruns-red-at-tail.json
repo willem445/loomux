@@ -1,0 +1,7 @@
+{"total_count":6,"check_runs":[
+  {"name":"deploy","status":"completed","conclusion":"skipped"},
+  {"name":"build","status":"completed","conclusion":"success"},
+  {"name":"E2E","status":"completed","conclusion":"success"},
+  {"name":"build (windows-latest)","status":"completed","conclusion":"failure"},
+  {"name":"build (macos-latest)","status":"completed","conclusion":"failure"},
+  {"name":"build (ubuntu-22.04)","status":"completed","conclusion":"failure"}]}

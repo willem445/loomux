@@ -1169,6 +1169,14 @@ never treated as green, so a repo whose CI legitimately skips some commits
 (leaving a base commit with no checks on it) should not declare this — every
 merge onto such a commit would be refused until something ran there.
 
+The same strictness covers a case you would otherwise never think about: GitHub
+returns a commit's check runs one **page** at a time, so a base carrying more
+checks than a single page can report is treated as unreadable — not as green —
+and the merge is refused. loomux asks for the largest page the API allows (100),
+so this only bites a base with more than 100 checks on one commit; if that is
+permanently true of your default branch, `base-green` cannot be enforced for it
+and should not be declared.
+
 **Verdict notices are short on purpose.** Recording a verdict also types a
 courtesy notice into the orchestrator's pane, so it learns the review landed
 without polling for it. That notice carries the verdict, the PR, and only the
