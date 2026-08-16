@@ -305,17 +305,37 @@ reconciles the item file against the board can only ever fight the human.
 
 Framed as a migration the question is well posed — "did this group exist before
 the registry did?" — asked once, answered once, never changing. Two mechanisms
-enforce that, and both are load-bearing:
+enforce it:
 
 1. **The `needs-you-migrated` marker**, written even when nothing was added
    (`already considered` and `found nothing to do` are the same answer for every
-   run after the first). Without it, every group resume would re-run and
-   re-raise.
+   run after the first). Without it, every group resume would re-run.
 2. **`Dedupe::EverRaised`** — for the migration, *any* demo row for the task,
    settled or not, is proof the registry has already seen it. A raise uses
    `Dedupe::OpenEpisode` instead, because there a settled row is a closed episode
    and a re-parked task genuinely deserves a new one. The two scopes are a named
    enum rather than a bool precisely so the difference cannot be lost again.
+
+**They are belt-and-braces, not one guard and one decoration — and the precise
+claim is worth stating, because the loose one ("both are load-bearing") is what
+this paragraph first said and it is not true.** Either alone prevents the
+resurrection in the ordinary case; each covers a case the other does not:
+
+- Remove `EverRaised` alone and the ordinary case still holds, because the marker
+  means the migration is never reconsidered. What breaks is the case where the
+  marker is *absent while items already exist* — reachable, not hypothetical: the
+  unreadable-file branch returns without writing the marker, and the group stays
+  live and keeps raising through the hook, so the next load re-runs the migration
+  against a file that already holds settled rows.
+- Remove the marker alone and the ordinary case still holds too, because
+  `EverRaised` reads the settled row as accounted for. What breaks is cost and
+  noise, not correctness: every resume re-reads and re-considers the whole board.
+
+Both must go before a close-out is actually undone, which is exactly what the
+red-before-green run showed: `a_resolved_demo_item_is_never_resurrected_...`
+reddens only when both are removed, while
+`the_migration_does_not_resurrect_a_settled_row_even_without_its_marker`
+isolates `EverRaised` by deleting the marker itself.
 
 **It runs at group load**, beside the pause / notify / autonomy marker re-seeds
 it resembles — never on a read. That is what keeps `orch_needs_you_list` an

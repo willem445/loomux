@@ -50816,6 +50816,41 @@ fn a_resolved_demo_item_is_never_resurrected_while_its_task_stays_parked() {
     assert_ne!(open[0].id, item.id, "…with its own id and its own timestamps");
 }
 
+/// The second guard, isolated. The marker normally means the migration is never
+/// reconsidered at all — so it, not `Dedupe::EverRaised`, is what the test above
+/// actually exercises. This one deletes the marker to reach the case the marker
+/// cannot cover: a migration that DOES re-run against a file already holding
+/// settled rows.
+///
+/// Reachable rather than contrived: `migrate_demo_items` returns without writing
+/// the marker when the items file will not read, and the group stays live and
+/// keeps raising through the board hook, so the next load re-runs it.
+#[test]
+fn the_migration_does_not_resurrect_a_settled_row_even_without_its_marker() {
+    let (reg, dir, g, _orch) = setup_needs_you();
+    reg.upsert_task(&g, "orch-1", None, patch(Some("The sidebar"), Some("prototype"), None))
+        .unwrap();
+    let item = open_items(&reg, &g).remove(0);
+    reg.resolve_needs_you(&g, &item.id, None, needsyou::ResolveSource::Webview).unwrap();
+
+    // The premise: the marker is gone, so the migration WILL run again, against
+    // a board whose task is still parked and a file whose only row is settled.
+    let marker = dir.path().join(g.as_str()).join("needs-you-migrated");
+    fs::remove_file(&marker).expect("the marker exists until this line");
+    drop(reg);
+
+    let reg = relaunch_with_group(&dir, &g);
+    assert!(marker.is_file(), "the premise: the migration re-ran and re-stamped the marker");
+    let after = reg.needs_you(&g).unwrap();
+    assert_eq!(after.len(), 1, "a re-run migration must not mint a replacement row");
+    assert_eq!(after[0].id, item.id);
+    assert_eq!(
+        after[0].resolved_by.as_deref(),
+        Some("webview"),
+        "the human's close-out survives a migration that ran a second time"
+    );
+}
+
 /// The same guarantee for the other settle an agent can reach: a withdrawn demo
 /// item on a still-parked task must not come back attributed to `board`.
 #[test]
