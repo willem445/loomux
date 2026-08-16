@@ -27581,15 +27581,21 @@ fn held_question_dialog_outranks_blocked_and_clears_with_the_hold() {
     assert!(cleared.iter().any(|i| i.agent_id == orch.id && i.reason == "blocked"));
 }
 
-/// A delegate's own dialog never raises the belt — only the orchestrator's
-/// pane does (see `attn_question_held`'s doc for why the belt is narrower
-/// than the #946 Q4 CLI deny, which also covers the liaison). Latching a
-/// worker id directly (bypassing `deliver_now`'s own `target_is_orchestrator`
-/// gate, which this test cannot reach without a real PTY) still must not
-/// change how `attention_tick` reads it: only the reason string decides,
-/// which is the property this pins.
+/// `attention_tick` itself has NO role check on `attn_question_held` — the
+/// belt's "orchestrator only" scope (narrower than the #946 Q4 CLI deny,
+/// which also covers the liaison) is enforced entirely at the ONE writer,
+/// `deliver_now`'s `target_is_orchestrator` gate (see `attn_question_held`'s
+/// doc). This test proves that by doing what only the writer should ever do
+/// in production — latching a WORKER id directly, bypassing
+/// `target_is_orchestrator` (which this test cannot reach without a real
+/// PTY) — and confirming `attention_tick` reads it exactly the way it would
+/// for an orchestrator: `held-dialog`, outranking `stranded`. If a future
+/// change adds a second, redundant role check inside `attention_tick`, this
+/// test is the one that catches the drift between "gated at the write side"
+/// (the design) and "gated nowhere in particular" (two enforcement points
+/// that can silently disagree).
 #[test]
-fn attention_tick_does_not_special_case_a_non_orchestrator_in_the_held_set() {
+fn attention_tick_reads_the_held_set_with_no_role_check_of_its_own() {
     let (reg, _d, g, wid) = attention_setup();
     let now = 1_000_000_000_000u64;
     let no_out = HashMap::new();
@@ -27606,11 +27612,11 @@ fn attention_tick_does_not_special_case_a_non_orchestrator_in_the_held_set() {
     let after = reg.attention_tick(now + 1000, &no_out, &no_tails, &no_input);
     let after_reason = after.iter().find(|i| i.agent_id == wid).map(|i| i.reason).unwrap_or("");
     assert_eq!(
-        after_reason, "stranded",
-        "the held-dialog reason is not gated on role inside attention_tick itself — \
-         it is gated at the ONE writer, deliver_now's target_is_orchestrator check — \
-         so this test only pins that attention_tick has no separate opinion. If this \
-         ever changes, `deliver_now` must be the only place that decides who latches."
+        after_reason, "held-dialog",
+        "attention_tick must have no role opinion of its own — production code never \
+         calls latch_question_held for a non-orchestrator id (deliver_now's \
+         target_is_orchestrator gate is the only enforcement point), but if attention_tick \
+         ever DID special-case role here too, the two checks could silently disagree"
     );
 }
 
