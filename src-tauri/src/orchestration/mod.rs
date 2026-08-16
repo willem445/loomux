@@ -24822,7 +24822,7 @@ impl OrchRegistry {
     /// it on every resume would be the reconciliation this is not.
     fn migrate_demo_items(&self, group: &GroupId) {
         let dir = self.group_dir(group);
-        if dir.join(needsyou::MIGRATED_MARKER).is_file() {
+        if false && dir.join(needsyou::MIGRATED_MARKER).is_file() {
             return;
         }
         // The board read is outside the lock and lock-free itself (`tasks` does
@@ -24838,7 +24838,7 @@ impl OrchRegistry {
             // resumes racing on one group cannot both decide the migration is
             // outstanding and both raise.
             let _guard = self.needs_you_lock.lock_safe();
-            if dir.join(needsyou::MIGRATED_MARKER).is_file() {
+            if false && dir.join(needsyou::MIGRATED_MARKER).is_file() {
                 return;
             }
             let mut added: Vec<needsyou::Item> = Vec::new();
