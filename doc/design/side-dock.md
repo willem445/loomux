@@ -76,7 +76,10 @@ Two triggers, one debounced pull, one decision:
   `moveFocus`, opening a pane and toggling maximize all reach `setActive`
   directly, and a dock wired to focus alone would sit on a stale folder after
   every one of them. It fires inside the existing same-pane early return, so
-  re-focusing the pane you are already on stays free.
+  re-focusing the pane you are already on stays free. **Every workspace has a
+  grid and therefore gets this callback, so the handler is gated on
+  `followsPaneChange(w.id, tabs.activeTabId)`** — only the foreground tab's
+  pane changes may move the dock (below).
 - **An active-tab change**, because switching *project tabs* changes the active
   pane with no grid's `setActive` firing at all: `applyActive` focuses the
   incoming tab's already-active pane, and `setActive` early-returns on it.
@@ -89,9 +92,16 @@ Two triggers, one debounced pull, one decision:
 Both funnel into one trailing-edge debounce (250ms). A human walking the grid
 with Alt+arrow fires `setActive` per keystroke, and only where they stop
 matters. Both also **pull** the active pane's cwd rather than trusting the pane
-the event fired for — a background tab's agent exiting reshuffles that tab's
-active pane too, and that must not yank the dock away from what the human is
-looking at.
+the event fired for, so the dock can never hold a stale snapshot of a value that
+moves.
+
+**That pull is why the gating matters, not a substitute for it.** An earlier
+revision reasoned the opposite way — the dock reads the active pane itself, so
+surely it does not matter which workspace's event woke it — and that is exactly
+backwards. Reading the *right* pane at the *wrong moment* is the entire defect:
+the cwd is live, so any uncaused wake-up can adopt a directory change the human
+made long ago. Both gates below exist because a follow's *timing* is as
+load-bearing as its *target*.
 
 The decision itself is `decideFollow` (`sidedockmodel.ts`), and it carries two
 rules worth naming:
@@ -137,6 +147,24 @@ worse than either pure choice.
 `isActiveTabChange(prev, next)` is the fix and it is pinned in
 `test/sidedockmodel.test.ts`: the dock compares tab ids rather than trusting the
 event, and every other emit source leaves the id alone.
+
+**There were two doors onto that defect, and the first fix closed only one.**
+The other is `Grid.setActive`'s own callback, which is wired **per workspace** —
+every project tab has a grid, so every project tab gets one. A *background* tab
+opening or closing a pane (an agent finishing, a delegate spawning, a group
+resuming) calls `setActive` on the survivor, and an ungated handler would then
+re-read the *foreground* pane's live cwd and adopt a stale `cd` — the identical
+user-visible failure, arriving through a different event, and equally dependent
+on whether some other tab's agent happened to be busy.
+
+`followsPaneChange(workspaceId, activeTabId)` closes it, and the `Workspace` is
+already passed to the callback, so the gate is one comparison. Both predicates
+are pinned by mutation: restoring either defect reddens the suite.
+
+The general rule, worth stating once because it is what both fixes have in
+common: **a follow re-reads a value that moves, so every signal that can fire
+one has to be justified — reading the right pane is not the same as reading it
+at a moment the human caused.**
 
 ### What is *not* followed: a `cd` on its own
 

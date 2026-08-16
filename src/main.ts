@@ -45,7 +45,7 @@ import {
 } from "./dirtystate";
 import { matchShortcut } from "./shortcuts";
 import { SideDock } from "./sidedock";
-import { isActiveTabChange } from "./sidedockmodel";
+import { followsPaneChange, isActiveTabChange } from "./sidedockmodel";
 import { ftRootIsDir } from "./fileapi";
 import { gitRepoRoot } from "./git";
 import { voiceController } from "./voicecontrol";
@@ -179,12 +179,22 @@ const tabs = new TabManager<Workspace>((id) => {
       openWelcomeIn(w);
     },
     () => onGridChanged(),
-    // The active pane moved inside this tab. Only the ACTIVE tab's grid can be
-    // the one the dock follows, and the dock reads the active pane itself
-    // (`activeCwd` below) rather than trusting the pane this fired for — a
-    // background tab whose agent exits reshuffles its own active pane too, and
-    // that must not yank the dock away from what the human is looking at.
-    () => sideDock?.followActivePane()
+    // The active pane moved inside THIS tab — which is only the dock's business
+    // when this tab is the foreground one. Every workspace has a grid, so every
+    // workspace gets this callback; a background tab reshuffling its own active
+    // pane (an agent finishing, a delegate spawning, a group resuming) must not
+    // drive a follow.
+    //
+    // It is not enough that the dock reads the active pane itself rather than
+    // the pane this fired for. That gets the right pane and still re-reads its
+    // LIVE cwd at a moment the human did not cause — adopting a `cd` they typed
+    // earlier and had every reason to think was ignored, whenever some other
+    // tab's agent happened to be busy (#1097 rev-776, the second door onto the
+    // same defect as the `tabs.onChange` one below).
+    (w) => {
+      if (!followsPaneChange(w.id, tabs.activeTabId)) return;
+      sideDock?.followActivePane();
+    }
   );
   stackEl.appendChild(ws.el);
   return ws;

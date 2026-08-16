@@ -13,6 +13,7 @@ import {
   decideViewSync,
   decodeDockPrefs,
   encodeDockPrefs,
+  followsPaneChange,
   isActiveTabChange,
   isDockTab,
   normalizeDockRoot,
@@ -103,6 +104,33 @@ test("a tab notification that leaves the active tab alone must NOT move the dock
   // file explorer out from under them.
   assert.equal(isActiveTabChange("ws-1", "ws-1"), false);
   assert.equal(isActiveTabChange(null, null), false);
+});
+
+test("a pane change in a BACKGROUND tab must not move the dock", () => {
+  // THE rev-776 REGRESSION PIN — the second door onto the same defect. Every
+  // workspace has a grid, so every workspace gets an `onActive` callback; only
+  // the foreground one may drive a follow. A background tab opening or closing
+  // a pane (an agent finishing, a delegate spawning, a group resuming) calls
+  // `setActive` on the survivor, and an ungated follow would then re-read the
+  // FOREGROUND pane's live cwd and adopt a directory change the human made
+  // earlier and had every reason to think was ignored.
+  //
+  // Reading the RIGHT pane is not the same as reading it at the right MOMENT,
+  // which is what the first fix got wrong.
+  assert.equal(followsPaneChange("ws-2", "ws-1"), false);
+  assert.equal(followsPaneChange("ws-3", "ws-1"), false);
+});
+
+test("a pane change in the FOREGROUND tab does move the dock", () => {
+  assert.equal(followsPaneChange("ws-1", "ws-1"), true);
+});
+
+test("before any tab exists, no pane change is in the foreground", () => {
+  // Pins the CONTRACT at boot, not a guard: this falls out of the comparison
+  // itself, because no real workspace id is null. Stated because mutating an
+  // explicit null-check away reddened nothing — so the check was removed rather
+  // than left standing as a guard that guards nothing.
+  assert.equal(followsPaneChange("ws-1", null), false);
 });
 
 test("a genuine tab switch DOES move the dock", () => {

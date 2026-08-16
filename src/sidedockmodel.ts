@@ -176,6 +176,38 @@ export function isActiveTabChange(prevTabId: string | null, nextTabId: string | 
   return prevTabId !== nextTabId;
 }
 
+/**
+ * Is a workspace's pane-active change one the dock may follow — i.e. did it
+ * happen in the FOREGROUND tab?
+ *
+ * `Grid.setActive`'s `onActive` callback is wired for **every** workspace, one
+ * per project tab, because every grid has one. Only the foreground tab's may
+ * move the dock, and the reason is the same one that governs `isActiveTabChange`
+ * above: a follow re-reads the active pane's **live** cwd, so *when* it runs is
+ * as load-bearing as *what* it reads.
+ *
+ * This closed the second door on the same defect (#1097 rev-776). The first
+ * revision took no workspace argument at all and justified it by saying the dock
+ * "reads the active pane itself rather than trusting the pane the event fired
+ * for". That is true and it is not sufficient — reading the *right* pane at the
+ * *wrong* moment is the whole bug. A background tab opens or closes a pane (an
+ * agent finishing, a delegate spawning, a group resuming), its grid calls
+ * `setActive` on the survivor, and the dock — pointed at the foreground pane all
+ * along — re-reads *that* pane's cwd and adopts a `cd` the human typed earlier
+ * and had every reason to think was ignored. Explorer rebuilt, clean editor file
+ * closed, at a moment nothing they did caused, dependent on whether some other
+ * tab's agent happened to be busy.
+ *
+ * A null `activeTabId` (before the first tab exists) follows nothing, and that
+ * falls out of the comparison rather than needing a guard of its own: no real
+ * workspace id is null. An explicit `activeTabId !== null` clause was written
+ * here first and then removed — mutating it away reddened nothing, which makes
+ * it a guard that guards nothing and a claim the code does not keep.
+ */
+export function followsPaneChange(workspaceId: string, activeTabId: string | null): boolean {
+  return workspaceId === activeTabId;
+}
+
 // ---------- 2. what one tab's view does about it ----------
 
 export type ViewSync =
