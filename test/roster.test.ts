@@ -18,6 +18,7 @@ import { dirname, join } from "node:path";
 import {
   MAX_AGENTS_CEILING,
   ORCH_ROLES,
+  ROSTER_ROLES,
   builtinRoster,
   capacityRaiseTarget,
   capacityWarning,
@@ -505,6 +506,41 @@ test("the roster description counts delegates, not the orchestrator", () => {
     ]),
     "2 workers, 1 planner",
     "class order follows the role table, not the file's order"
+  );
+  // #1161: and a declared manager is named, not silently omitted. It is the
+  // block the human is about to consent to talking to, so it is the last one
+  // the consent line may drop — and it would have been, since `ORCH_ROLES`
+  // (which this used to iterate) deliberately has no manager row.
+  assert.equal(
+    describeRoster([
+      block({ id: "orchestrator", kind: "orchestrator" }),
+      block({ id: "manager", kind: "manager" }),
+      block({ id: "w", kind: "worker" }),
+      block({ id: "rev", kind: "reviewer" }),
+    ]),
+    "1 manager, 1 worker, 1 reviewer"
+  );
+});
+
+test("the manager is declarable but never part of the built-in roster (#1161)", () => {
+  // The whole compatibility promise of the manager feature, at the one place
+  // it could break silently. `builtinRoster` maps ORCH_ROLES into the blocks a
+  // toggle-off launch runs, so a `manager` row there would put a manager in
+  // EVERY default group — the one thing this class promises never to do.
+  assert.ok(
+    !ORCH_ROLES.some((r) => r.key === "manager"),
+    "a manager row in ORCH_ROLES is a manager in every default group"
+  );
+  assert.deepEqual(
+    builtinRoster([], "claude").map((b) => b.kind),
+    ["orchestrator", "worker", "reviewer", "planner"]
+  );
+  // ...and ROSTER_ROLES, which describes a DECLARED roster, does carry it —
+  // the two lists exist precisely because those are different questions.
+  assert.ok(ROSTER_ROLES.some((r) => r.key === "manager"));
+  assert.deepEqual(
+    ROSTER_ROLES.map((r) => r.key),
+    ["orchestrator", "manager", "worker", "reviewer", "planner"]
   );
 });
 

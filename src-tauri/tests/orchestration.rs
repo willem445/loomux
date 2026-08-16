@@ -5989,11 +5989,24 @@ fn claude_command_minimizes_init_approvals_without_bypass() {
 /// of completeness; this is the claim being made checkable.)
 #[test]
 fn every_capability_class_pins_its_deny_tier() {
-    for role in [Role::Orchestrator, Role::Worker, Role::Reviewer, Role::Planner, Role::Solo] {
+    for role in [
+        Role::Orchestrator,
+        Role::Worker,
+        Role::Reviewer,
+        Role::Planner,
+        Role::Manager,
+        Role::Solo,
+    ] {
         let want = match role {
             Role::Orchestrator | Role::Worker => Containment::None,
             Role::Reviewer => Containment::NoEdits,
             Role::Planner => Containment::ReadOnly,
+            // #1161. The reviewer's tier for the reviewer's reason: a manager
+            // reads the codebase to ground its questions and never writes it.
+            // `ReadOnly` would be the wrong rung, not merely a stricter one —
+            // it forces unattended mode, and the whole point of this class is
+            // that a human is sitting in front of it.
+            Role::Manager => Containment::NoEdits,
             Role::Solo => Containment::None,
         };
         assert_eq!(role.containment(), want, "{role:?} changed deny tier — was that deliberate?");
@@ -6011,6 +6024,12 @@ fn every_capability_class_pins_its_deny_tier() {
     // silently pick that up with them.
     assert!(Role::Planner.is_read_only());
     assert!(!Role::Reviewer.is_read_only(), "a reviewer is contained, but it is NOT read-only");
+    // #1161, and the reason it is worth stating rather than following from the
+    // tier above: a manager IS banned from `allow:`, but by decision D1 (a
+    // repo may not author the human's interface), NOT by `is_read_only()`. If
+    // this ever flipped, the D1 ban would silently become a duplicate of the
+    // read-only one and the two rules would stop being separable.
+    assert!(!Role::Manager.is_read_only(), "a manager is contained, but it is NOT read-only");
 }
 
 /// #462: a reviewer's containment, asserted through the same selector the spawn
@@ -32981,7 +33000,7 @@ fn notify_optin_is_durable_across_restart() {
 }
 
 #[test]
-fn spawn_opens_minimized_exempts_only_the_orchestrator() {
+fn spawn_opens_minimized_exempts_the_orchestrator_and_the_manager() {
     // #260: every delegate role docks by default...
     for role in [Role::Worker, Role::Reviewer, Role::Planner] {
         assert!(spawn_opens_minimized(role, false), "{role:?} should dock by default");
@@ -32992,6 +33011,11 @@ fn spawn_opens_minimized_exempts_only_the_orchestrator() {
     // not just "expanded happens to be the group default").
     assert!(!spawn_opens_minimized(Role::Orchestrator, false));
     assert!(!spawn_opens_minimized(Role::Orchestrator, true));
+    // #1161: and neither does the manager, on the same unconditional terms.
+    // The delegate loop above is this pair's non-vacuity control — it is what
+    // makes "exempt" mean something rather than "the function returns false".
+    assert!(!spawn_opens_minimized(Role::Manager, false), "a docked manager is a conversation the human cannot see");
+    assert!(!spawn_opens_minimized(Role::Manager, true));
 }
 
 #[test]
