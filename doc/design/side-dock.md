@@ -77,11 +77,14 @@ Two triggers, one debounced pull, one decision:
   directly, and a dock wired to focus alone would sit on a stale folder after
   every one of them. It fires inside the existing same-pane early return, so
   re-focusing the pane you are already on stays free.
-- **`tabs.onChange`**, because switching *project tabs* changes the active pane
-  with no grid's `setActive` firing at all: `applyActive` focuses the incoming
-  tab's already-active pane, and `setActive` early-returns on it. Without this
-  second trigger the dock keeps showing the previous tab's repo — plainly
-  broken, and invisible until you have two tabs open.
+- **An active-tab change**, because switching *project tabs* changes the active
+  pane with no grid's `setActive` firing at all: `applyActive` focuses the
+  incoming tab's already-active pane, and `setActive` early-returns on it.
+  Without this second trigger the dock keeps showing the previous tab's repo —
+  plainly broken, and invisible until you have two tabs open. There is no
+  active-tab event to subscribe to, only the tab-**set** listener
+  `tabs.onChange`, so the dock filters it through `isActiveTabChange` (below);
+  subscribing to it raw is a defect, not a shortcut.
 
 Both funnel into one trailing-edge debounce (250ms). A human walking the grid
 with Alt+arrow fires `setActive` per keystroke, and only where they stop
@@ -99,23 +102,63 @@ the path names a folder on the *far* end — and a welcome pane has none yet.
 Clicking one of those is not a request to empty the sidebar, so the dock keeps
 the last real root it had.
 
-**A closed dock does no work.** The action is `park`: the root is recorded, and
-not one view is constructed, refreshed, or measured. Opening the dock re-asks
-the same question with the parked root, which is the only way a parked value is
-ever redeemed — there is no second entry point to keep in sync.
+**A closed dock does nothing at all** — not even bookkeeping. `decideFollow`
+returns `none` outright, `followActivePane` arms no timer, and no view is
+constructed, refreshed or measured. It deliberately keeps **no pending root**:
+opening the dock runs the same decision against the *live* cwd, which is
+strictly more accurate than replaying a root that was current several minutes
+ago.
 
-### What is *not* followed: a `cd` inside the pane you are already on
+An earlier revision did park a root, and it was wrong twice over: it recorded
+the root on the *closed* call, so the reopen saw `dockRoot === paneCwd` and
+returned `none` — the redemption actually happened as a side effect of
+`syncActiveView` building from the already-set field — and the `adopt` its own
+test witnessed was therefore a state the implementation could never reach (#1097
+rev-767 N3). Dropping `park` makes every state this function can return
+reachable from the real flow.
 
-The dock follows **which pane is active**, not the live cwd of one pane. Typing
-`cd ../other-repo` in the focused terminal does not move the dock.
+### The trigger is the whole correctness argument
 
-This is the brief's own boundary (`Grid.setActive` is named as the trigger) and
-#934's wording ("whichever pane is currently highlighted/focused"), and it is
-left where it is rather than quietly widened. It is also not free to add: there
-is no event for a cwd change today — `Pane.onCwdReported` assigns `cwdRaw` and
-calls a 500ms-throttled `signalDirRefresh` — so following it means a new pane
-event and a second throttle interacting with this one. Worth doing if the human
-asks at demo; not worth smuggling into this PR.
+A follow re-reads the active pane's **live** cwd. That is right for the two
+signals above and wrong for anything else, because the cwd moves continuously
+(OSC 7 rewrites it on every prompt) while those signals do not.
+
+This is exactly where the first revision was broken (#1097 rev-767 B1). It
+subscribed to `tabs.onChange` directly — which is a tab-**set** listener, not an
+active-tab one: `emit()` also fires from `renameTab`, `setColor`, `moveTab`,
+`closeTab`, `setTabAttention` (every time a background agent's attention flips)
+and `touch()` (orch-channel traffic). So a `cd` the human typed and that was
+correctly ignored at the time would be silently adopted **later**, at whatever
+unrelated moment some other tab's chip happened to change: the file explorer
+rebuilt out from under them, a clean editor file closed, and *whether it
+happened at all* depended on background activity. Nondeterministic following is
+worse than either pure choice.
+
+`isActiveTabChange(prev, next)` is the fix and it is pinned in
+`test/sidedockmodel.test.ts`: the dock compares tab ids rather than trusting the
+event, and every other emit source leaves the id alone.
+
+### What is *not* followed: a `cd` on its own
+
+The dock re-reads the active pane's folder **only when the active pane or the
+active tab changes**. Typing `cd ../other-repo` in the focused terminal does not
+move it; nothing else does either, until you click somewhere.
+
+The precise consequence, stated because it is the honest version of "does not
+follow a `cd`": if you `cd` in pane A, click pane B, then click back to pane A,
+the dock lands on A's *new* folder — the cwd is read fresh at the moment of a
+signal, never snapshotted at spawn. That is deterministic and human-caused,
+which is the property that matters; what the dock refuses is moving at a moment
+nobody asked for.
+
+Following a `cd` *as it happens* is the brief's own boundary (`Grid.setActive`
+is named as the trigger) and #934's wording ("whichever pane is currently
+highlighted/focused"), and it is left where it is rather than quietly widened.
+It is also not free to add: there is no event for a cwd change today —
+`Pane.onCwdReported` assigns `cwdRaw` and calls a 500ms-throttled
+`signalDirRefresh` — so following it means a new pane event and a second
+throttle interacting with this one. Worth doing if the human asks at demo; not
+worth smuggling in here.
 
 ## Hosting the three views, and the one thing that made it interesting
 
@@ -152,6 +195,25 @@ which is exactly the rule #219 exists to state. So:
   catches up when its tab is next selected.
 - **closing the dock disposes nothing.** Closing is hiding: it must not destroy
   the editor's buffer, and it should not throw away a loaded git log either.
+
+### Liveness: the git tab refreshes, the other two do not
+
+A view built once and only reparented is a **snapshot**, and for git that reads
+as a bug: commit in the very pane the dock is following, and the graph would
+still show the repo as of whenever the tab was built (#1097 rev-767 N2).
+
+So `Hosted` carries an optional `refresh()`, called when the active tab is
+selected, when the dock opens, and on any follow signal that resolves to `none`
+(same folder — the "clicked back after committing" case). Only git implements
+it, via `GitView.notifyPrompt()`: the same throttled (500ms) call `Pane` already
+drives from OSC 7 for its own instance, and a no-op unless the view is visible,
+so a closed dock still costs nothing.
+
+The explorer and the editor deliberately have **no** `refresh`. For them a
+reload means re-navigating to the root or rebuilding the tree, which throws away
+the human's place in it — a destructive operation that belongs behind their own
+explicit refresh affordances, not on a signal they did not ask for. The
+asymmetry is the point: a refresh is only free where it is free.
 
 ### The dock's editor is the one buffer holder outside every pane
 
@@ -190,9 +252,37 @@ config.
 the human their tab choice and nothing else, while `open` and `width` survive.
 That is `tabstore.decodePane`'s leniency applied at a smaller scale, for the
 same reason — record-wise rejection silently discards a whole preference on the
-next boot after a stray hand-edit or a version that wrote one extra field. A
-persisted width is clamped on the way in as well as out, so a pref written on a
-wider monitor cannot restore a dock that covers the app.
+next boot after a stray hand-edit or a version that wrote one extra field.
+
+**A persisted width is bounded on the way in to `[DOCK_MIN_W, DOCK_MAX_W]` and
+no further** — `decodeDockPrefs` has no live window width, so it cannot apply
+the workspace reserve, and it does not pretend to.
+
+### Where the reserve is actually enforced, and why it moved
+
+`.sidedock { max-width: max(280px, calc(100% - 240px)) }`, in the stylesheet.
+
+The first revision applied the reserve **only on the drag path**
+(`clampDockWidth(…, workspaceEl.clientWidth)`), which left three ways to get a
+dock that covers the entire grid: boot, a restore from persistence, and any
+window resize after the drag. Drag to 900px on a wide monitor, then shrink the
+window toward the app's own 640px `minWidth`, and the dock is still 900px over a
+~640px workspace — every pane occluded, with 0 of the promised 240px delivered
+(#1097 rev-767 B2).
+
+CSS closes all three at once, with no listener to forget and nothing that could
+reach a PTY — which matters more here than saving code, because a JS re-clamp
+would mean a `resize` handler running next to the one subsystem this whole note
+exists to keep away from the grid. `max()` preserves the documented narrow-window
+degradation: below the reserve the minimum wins, exactly as `clampDockWidth`
+already decided.
+
+`clampDockWidth` keeps the reserve too, so the number that gets *persisted* is
+sane rather than merely rendered sane. That makes the two constants a mirror, so
+`test/sidedockmodel.test.ts` reads the rule off disk and fails if the
+stylesheet's copies of `DOCK_MIN_W` and `DOCK_TERM_RESERVE_PX` ever drift — the
+same both-ways pinning `theme.test.ts` applies to the palette, and the reason
+duplicating two numbers is safe here.
 
 ## Colour, and the two channels on one row
 

@@ -4028,12 +4028,28 @@ button.wf-finding:hover { background: var(--surface-2); }
  * the way principle 1 says surfaces should: elevation plus a hairline.
  *
  * z-index 40 sits above a maximized pane (30) so the dock stays reachable, and below the
- * pane drag layer (60/61), context menus (80+), toasts (100) and modals (1000). */
+ * pane drag layer (60/61), the tab menu (90), the shared context menu (200), toasts (100)
+ * and modals (1000). ONE surface ties with it rather than sitting above: `.git-menu` is
+ * also 40 — the menu the dock's own Git tab opens — and it paints above only because
+ * `showMenu` appends it to `document.body`, i.e. after `#app` in document order. That is
+ * true but fragile, so it is written down rather than left to be rediscovered: a future
+ * `.sidedock` z-index raise must raise `.git-menu` with it.
+ *
+ * THE WIDTH BOUND IS HERE, NOT IN JS, and that is the point (#1097 rev-767 B2). The
+ * reserve used to be applied only while dragging, so a width persisted on a wide monitor
+ * came back whole on a narrow one and covered every pane — and the same held after any
+ * window resize. `max-width` holds at boot, on restore, and on every resize, with no
+ * listener to forget and nothing that could reach a PTY. `max()` keeps the documented
+ * narrow-window degradation: below the reserve the minimum wins, exactly as
+ * `clampDockWidth` already decided. PINNED: both numbers mirror DOCK_MIN_W and
+ * DOCK_TERM_RESERVE_PX in src/sidedockmodel.ts, and test/sidedockmodel.test.ts reads this
+ * rule off disk and fails if they drift. */
 #workspace { position: relative; }
 
 .sidedock {
   position: absolute; top: 0; right: 0; bottom: 0;
   z-index: 40;
+  max-width: max(280px, calc(100% - 240px));
   display: flex; flex-direction: column; min-width: 0;
   background: var(--surface-1);
   border-left: var(--line-w) solid var(--line-strong);

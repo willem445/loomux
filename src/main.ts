@@ -45,6 +45,7 @@ import {
 } from "./dirtystate";
 import { matchShortcut } from "./shortcuts";
 import { SideDock } from "./sidedock";
+import { isActiveTabChange } from "./sidedockmodel";
 import { ftRootIsDir } from "./fileapi";
 import { gitRepoRoot } from "./git";
 import { voiceController } from "./voicecontrol";
@@ -204,10 +205,26 @@ sideDock = new SideDock(workspaceEl, {
 
 // Switching PROJECT TABS changes the active pane without any grid's `setActive`
 // firing: `applyActive` focuses the incoming tab's already-active pane, and
-// `setActive` early-returns on the pane it is already on. So the dock needs this
-// second trigger, or it keeps showing the previous tab's repo. Same debounced
-// pull, same decision — `decideFollow` still no-ops when the folder is unchanged.
-tabs.onChange(() => sideDock?.followActivePane());
+// `setActive` early-returns on the pane it is already on. So the dock needs a
+// second trigger, or it keeps showing the previous tab's repo.
+//
+// `tabs.onChange` is the only subscription available, and it is a tab-SET
+// listener, not an active-tab one — it also fires on rename, colour, reorder,
+// close, an attention flip in any background tab, and orch-channel traffic.
+// Following it unfiltered was a real defect (#1097 rev-767 B1): the dock re-reads
+// the active pane's LIVE cwd, so a `cd` the human typed minutes ago and that was
+// correctly ignored at the time would be adopted later, at whatever unrelated
+// moment some other tab's attention chip happened to flip — silently rebuilding
+// the file explorer out from under them and closing a clean editor file.
+//
+// So the id is compared, and only a genuine active-tab change gets through.
+let lastActiveTabId: string | null = tabs.activeTabId;
+tabs.onChange(() => {
+  const next = tabs.activeTabId;
+  if (!isActiveTabChange(lastActiveTabId, next)) return;
+  lastActiveTabId = next;
+  sideDock?.followActivePane();
+});
 
 // Voice push-to-talk (#58, Alt+S): the global capture controller finds its
 // insertion target via the active pane (of the active tab).

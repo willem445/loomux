@@ -41,7 +41,18 @@ export const DOCK_MAX_W = 900;
  *  reason — an overlay that can cover its own host entirely is a way to lose
  *  the app. The value is duplicated rather than imported for the reason
  *  embedded-panels.md records: a pure module that imports another pure module
- *  has no import spelling that satisfies both `tsc` and bare `node --test`. */
+ *  has no import spelling that satisfies both `tsc` and bare `node --test`.
+ *
+ *  **THE RESERVE IS ENFORCED IN CSS, NOT HERE** — `.sidedock`'s `max-width`
+ *  (styles.css), which holds at boot, on a restore from persistence, and on
+ *  every window resize, none of which run this function. It used to be applied
+ *  only on the drag path, so a width persisted on a wide monitor came back
+ *  whole on a narrow one and covered every pane (#1097 rev-767 B2). A CSS
+ *  bound closes all three at once with no JS and nothing that could reach a
+ *  PTY. `clampDockWidth` below still applies it on the drag, so the number
+ *  that gets PERSISTED is sane too; `test/sidedockmodel.test.ts` pins the
+ *  stylesheet's copy of both constants against these, so the mirror cannot
+ *  drift silently. */
 export const DOCK_TERM_RESERVE_PX = 240;
 
 /**
@@ -95,45 +106,74 @@ export function normalizeDockRoot(raw: string | null | undefined): string | null
 // ---------- 1. where the dock points ----------
 
 export type FollowAction =
-  /** Nothing to do: no cwd to follow, or the dock is already there. */
+  /** Nothing to do: the dock is closed, there is no cwd, or it is already there. */
   | { kind: "none" }
-  /** The dock is CLOSED — record the root and build nothing. */
-  | { kind: "park"; root: string }
   /** Re-root now. */
   | { kind: "adopt"; root: string };
 
 export interface FollowInput {
   /** Is the dock currently open? */
   open: boolean;
-  /** The root the dock is pointed at now (or the parked one), null at boot. */
+  /** The root the dock is pointed at now, null before it has ever adopted one. */
   dockRoot: string | null;
-  /** The newly-active pane's working directory. */
+  /** The active pane's working directory, read at the moment of the signal. */
   paneCwd: string | null;
 }
 
 /**
- * The dock followed the active pane somewhere — now what?
+ * A follow signal arrived — should the dock re-root, and where?
  *
- * Two rules carry the weight, and both are the reason this is a function rather
- * than an `if` in the DOM layer:
+ * Three rules, and each is here rather than as an `if` in the DOM layer because
+ * each is a promise the docs make:
  *
  * **A pane with no local cwd never blanks the dock.** An SSH pane reports no
  * local path at all (`Pane.isSshPane` refuses OSC 7 outright — the path names a
  * folder on the far end), and a welcome pane has none yet. Clicking one of
- * those is not a request to empty the sidebar; the dock keeps showing the last
- * real root it had.
+ * those is not a request to empty the sidebar; the dock keeps the last real
+ * root it had.
  *
- * **A closed dock does no work.** `park` is the whole of the "only while the
- * dock is open" requirement: the root is remembered so opening the dock lands
- * on the right folder, and not one view is constructed or refreshed in the
- * meantime. Re-running this with `paneCwd = <the parked root>` at open time is
- * how the parked value is redeemed — there is no second entry point.
+ * **A closed dock does nothing at all** — not even bookkeeping. It deliberately
+ * remembers no "pending" root: opening the dock runs this same decision against
+ * the *live* cwd, which is strictly more accurate than replaying a root that was
+ * current several minutes ago. That also keeps every state this function can
+ * return reachable from the real flow, which an earlier `park` action was not
+ * (#1097 rev-767 N3: it recorded a root that made the next call a no-op, so the
+ * `adopt` its own test witnessed could never actually occur).
+ *
+ * **The same folder is never re-adopted.** Re-rooting disposes and rebuilds a
+ * view, so an equality check is the difference between a signal being free and
+ * a signal costing the human their place in a file tree.
  */
 export function decideFollow(i: FollowInput): FollowAction {
+  if (!i.open) return { kind: "none" };
   const next = normalizeDockRoot(i.paneCwd);
   if (next === null) return { kind: "none" };
   if (next === normalizeDockRoot(i.dockRoot)) return { kind: "none" };
-  return i.open ? { kind: "adopt", root: next } : { kind: "park", root: next };
+  return { kind: "adopt", root: next };
+}
+
+/**
+ * Is a tab-manager notification an ACTIVE-TAB change — the only kind the dock
+ * may follow?
+ *
+ * `TabManager.onChange` is a tab-**set** listener, not an active-tab one. Its
+ * `emit()` fires from `addTab`, `closeTab`, `switchTo`, `renameTab`, `setColor`,
+ * `moveTab`, `setTabAttention` (every time a background agent's attention state
+ * flips) and `touch()` (orch-channel traffic). Subscribing to it directly and
+ * re-rooting on every notification is a real defect, and it was this one
+ * (#1097 rev-767 B1): the dock re-reads the active pane's *live* cwd, so a
+ * `cd` the human typed minutes ago — correctly ignored at the time — would get
+ * adopted later, at whatever unrelated moment some other tab flipped its
+ * attention chip. That silently rebuilt the file explorer out from under them
+ * and closed a clean editor file, at a moment nothing they did caused.
+ *
+ * The dock therefore follows a tab notification only when the active tab id
+ * genuinely moved. Comparing ids (rather than trusting the event) is what makes
+ * "switching project tabs" mean exactly that, and it is the entire fix: every
+ * other emit source leaves the id alone.
+ */
+export function isActiveTabChange(prevTabId: string | null, nextTabId: string | null): boolean {
+  return prevTabId !== nextTabId;
 }
 
 // ---------- 2. what one tab's view does about it ----------
@@ -238,6 +278,10 @@ export function decodeDockPrefs(raw: string | null): DockPrefs {
   return {
     open: typeof o.open === "boolean" ? o.open : DEFAULT_DOCK_PREFS.open,
     tab: isDockTab(o.tab) ? o.tab : DEFAULT_DOCK_PREFS.tab,
+    // No live window width is available here, so this bounds the value to
+    // [DOCK_MIN_W, DOCK_MAX_W] only. The workspace reserve is NOT applied on
+    // this path and cannot be — the stylesheet's `max-width` is what keeps a
+    // restored width from covering the grid (see DOCK_TERM_RESERVE_PX).
     width: typeof o.width === "number" ? clampDockWidth(o.width) : DEFAULT_DOCK_PREFS.width,
   };
 }

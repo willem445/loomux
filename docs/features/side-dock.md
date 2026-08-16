@@ -30,7 +30,7 @@ at that pane's folder.
 
 | Tab | What it is |
 | --- | --- |
-| **Git** | The same commit graph, diff preview and staging/commit surface as the [git view](git-view.html) — scoped to the dock's folder instead of one pane's. |
+| **Git** | The same commit graph, diff preview and staging/commit surface as the [git view](git-view.html) — scoped to the dock's folder instead of one pane's. It refreshes when you select the tab, when you open the dock, and when you click back onto a pane in the same folder, so a commit you just made shows up. |
 | **Files** | The file explorer: browse the folder, open a file in the application your OS associates with it, create, rename and delete. |
 | **Editor** | loomux's own editor — a file tree, project search, and a text buffer for a quick read or a one-line fix. |
 
@@ -50,9 +50,14 @@ doesn't reload the git log once per keystroke.
 
 Two things it deliberately does not do:
 
-- **It does not follow a `cd`.** Typing `cd ../other-project` in the pane you
-  are already in does not move the dock. Use a tab's 📁 picker to point it
-  somewhere else by hand.
+- **It does not move on its own.** The dock re-reads the folder only when you
+  change which pane or which project tab is active — never on a timer, and never
+  because something happened in a pane you were not looking at. Typing
+  `cd ../other-project` in the pane you are already in does not move it. (The
+  folder is read fresh at the moment you click, though, so if you `cd` and then
+  come back to that pane later, the dock does land on the new folder. Use a
+  tab's 📁 picker to point it somewhere by hand and it stays there until you
+  click a pane in a different folder.)
 - **It does not blank on a pane with no local folder.** An [SSH pane](ssh-panes.html)
   works on a directory on the remote machine, and a new empty pane has no folder
   yet; clicking either leaves the dock showing the last real folder it had.
@@ -83,7 +88,9 @@ closed, it is one click away either direction, and it always leaves a strip of
 grid uncovered no matter how wide you drag it.
 
 **Resizing:** drag the dock's left edge. The width, whether it was open, and
-which tab you were on are all remembered for next time.
+which tab you were on are all remembered for next time. However wide you drag
+it — and whatever width it was remembered at — it is capped so a strip of grid
+always stays visible, including after you shrink the window.
 
 ## Relationship to the per-pane panels
 

@@ -71,6 +71,9 @@ interface Hosted {
   dispose(): void;
   /** Unsaved edits? Only the editor can answer yes. */
   dirty(): boolean;
+  /** Re-read the repo/disk in place, cheaply. Absent where a refresh would
+   *  cost the human their place — see `refreshActiveView`. */
+  refresh?(): void;
 }
 
 const TAB_LABEL: Record<DockTab, string> = { git: "Git", files: "Files", editor: "Editor" };
@@ -91,7 +94,8 @@ export class SideDock {
   private readonly tabBtns = new Map<DockTab, HTMLButtonElement>();
 
   private prefs: DockPrefs;
-  /** Where the dock is pointed, or is waiting to point once it opens. */
+  /** Where the dock is pointed. Null until it first adopts one. Nothing is
+   *  recorded here while the dock is closed — see `followActivePane`. */
   private dockRoot: string | null = null;
   private readonly views = new Map<DockTab, Hosted>();
   private followTimer: number | undefined;
@@ -150,8 +154,8 @@ export class SideDock {
     this.workspaceEl.appendChild(this.el);
 
     this.syncTabButtons();
-    // Boot with whatever pane is active. Park-not-adopt while closed means a
-    // dock restored closed constructs nothing at all until it is opened.
+    // Boot with whatever pane is active. A dock restored CLOSED returns from
+    // this immediately and constructs nothing at all until it is opened.
     this.followActivePane(true);
   }
 
@@ -172,8 +176,10 @@ export class SideDock {
     this.prefs.open = true;
     this.el.hidden = false;
     savePrefs(this.prefs);
-    // Redeem whatever root was parked while we were closed: the same decision,
-    // re-asked now that `open` is true (sidedockmodel.decideFollow).
+    // `open` is set FIRST, because every follow path is guarded on it: this is
+    // the call that pulls the live cwd for the first time and adopts it. Reading
+    // it now, rather than replaying a root captured while hidden, is why the
+    // dock needs no pending-root state at all.
     this.followActivePane(true);
     this.syncActiveView();
   }
@@ -202,6 +208,10 @@ export class SideDock {
    */
   followActivePane(immediate = false): void {
     this.clearFollowTimer();
+    // A closed dock does nothing at all — it does not even arm a timer, and it
+    // records no pending root. `show()` pulls the live cwd, which is a better
+    // answer than replaying one captured while the dock was hidden.
+    if (!this.prefs.open) return;
     if (immediate) {
       this.applyFollow();
       return;
@@ -265,14 +275,33 @@ export class SideDock {
       dockRoot: this.dockRoot,
       paneCwd: this.host.activeCwd(),
     });
-    if (action.kind === "none") return;
-    // `park` and `adopt` both record the root; only `adopt` touches a view.
-    // That is the entire difference between an open dock and a closed one, and
-    // it is why a closed dock costs nothing but this one string assignment.
+    if (action.kind === "none") {
+      // Same folder (or nothing to follow) — no rebuild. But coming back to a
+      // pane you just committed in should show the commit, so the active view
+      // gets a cheap live refresh rather than staying the snapshot it was built
+      // as (#1097 rev-767 N2). Guarded on `open` by `followActivePane`, and
+      // `refresh` is a no-op for every view that cannot do it without cost.
+      this.refreshActiveView();
+      return;
+    }
     this.dockRoot = action.root;
-    if (action.kind === "park") return;
     this.renderRootChip();
     this.syncActiveView();
+  }
+
+  /**
+   * Ask the active view to re-read the repo/disk, without rebuilding it.
+   *
+   * Only the git tab has one, and deliberately: `GitView.notifyPrompt()` is the
+   * throttled (500ms) refresh `Pane` already drives from OSC 7, and it no-ops
+   * unless the view is visible. The explorer and the editor have none — for
+   * them "refresh" would mean re-navigating to the root or reloading the tree,
+   * which throws away the human's place in it. Those keep their own explicit
+   * refresh affordances, which is the right shape for a destructive reload.
+   */
+  private refreshActiveView(): void {
+    if (!this.prefs.open) return;
+    this.views.get(this.prefs.tab)?.refresh?.();
   }
 
   private selectTab(tab: DockTab): void {
@@ -280,6 +309,9 @@ export class SideDock {
     savePrefs(this.prefs);
     this.syncTabButtons();
     this.syncActiveView();
+    // Selecting a tab whose view is already at the right root would otherwise
+    // just unhide a snapshot (#1097 rev-767 N2).
+    this.refreshActiveView();
   }
 
   private syncTabButtons(): void {
@@ -339,7 +371,15 @@ export class SideDock {
       const view = new GitView({ getCwd: () => root, onClose: () => {}, embedded: true });
       this.bodyEl.appendChild(view.el);
       view.show();
-      return { el: view.el, builtRoot: root, dispose: () => view.dispose(), dirty: () => false };
+      return {
+        el: view.el,
+        builtRoot: root,
+        dispose: () => view.dispose(),
+        dirty: () => false,
+        // Throttled (500ms) and a no-op while hidden — the same call Pane makes
+        // from OSC 7 for its own instance.
+        refresh: () => view.notifyPrompt(),
+      };
     }
     if (tab === "files") {
       const view = new FileExplorerView({

@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 
 import {
   DEFAULT_DOCK_PREFS,
@@ -12,6 +13,7 @@ import {
   decideViewSync,
   decodeDockPrefs,
   encodeDockPrefs,
+  isActiveTabChange,
   isDockTab,
   normalizeDockRoot,
   type DockPrefs,
@@ -46,32 +48,32 @@ test("an absent or blank cwd is no root at all", () => {
 // ---------- decideFollow ----------
 
 test("focusing a pane in another repo re-roots an open dock", () => {
-  assert.deepEqual(
-    decideFollow({ open: true, dockRoot: "C:\\a", paneCwd: "C:\\b" }),
-    { kind: "adopt", root: "C:\\b" }
-  );
-});
-
-test("a CLOSED dock parks the root and builds nothing", () => {
-  // The "no work while closed" requirement. `park` must NOT be `adopt`: adopting
-  // is what constructs and refreshes views, and a closed dock has no business
-  // doing either while the human is looking at terminals.
-  assert.deepEqual(
-    decideFollow({ open: false, dockRoot: null, paneCwd: "C:\\b" }),
-    { kind: "park", root: "C:\\b" }
-  );
-});
-
-test("a parked root is redeemed by re-asking with the dock open", () => {
-  // There is no second entry point for the parked value — opening the dock runs
-  // the same decision with the parked root as the cwd, which must now adopt.
-  const parked = decideFollow({ open: false, dockRoot: null, paneCwd: "C:\\b" });
-  assert.equal(parked.kind, "park");
-  const root = parked.kind === "park" ? parked.root : "";
-  assert.deepEqual(decideFollow({ open: true, dockRoot: null, paneCwd: root }), {
+  assert.deepEqual(decideFollow({ open: true, dockRoot: "C:\\a", paneCwd: "C:\\b" }), {
     kind: "adopt",
     root: "C:\\b",
   });
+});
+
+test("a CLOSED dock does nothing at all — it does not even record a root", () => {
+  // The "no work while closed" requirement. It must not be `adopt` (which is
+  // what constructs and rebuilds views), and it must not be a third
+  // "remember this for later" state either: the dock keeps no pending root, so
+  // opening it re-reads the LIVE cwd instead of replaying a stale one.
+  assert.deepEqual(decideFollow({ open: false, dockRoot: null, paneCwd: "C:\\b" }), { kind: "none" });
+  assert.deepEqual(decideFollow({ open: false, dockRoot: "C:\\a", paneCwd: "C:\\b" }), { kind: "none" });
+});
+
+test("opening the dock adopts the live cwd — the real redemption path", () => {
+  // Exactly the pair `show()` runs: `open` has just been set true, the dock has
+  // never adopted a root, and the cwd is pulled fresh. An earlier version
+  // recorded the root on the CLOSED call, which made this call a no-op and made
+  // the `adopt` its own test witnessed unreachable from the real flow (N3).
+  assert.deepEqual(decideFollow({ open: true, dockRoot: null, paneCwd: "C:\\b" }), {
+    kind: "adopt",
+    root: "C:\\b",
+  });
+  // Re-opening on the folder it was already showing is inert.
+  assert.deepEqual(decideFollow({ open: true, dockRoot: "C:\\b", paneCwd: "C:\\b" }), { kind: "none" });
 });
 
 test("focusing an SSH or welcome pane does not blank the dock", () => {
@@ -89,10 +91,28 @@ test("re-focusing a pane in the folder already shown is not a re-root", () => {
   assert.deepEqual(decideFollow({ open: true, dockRoot: "C:\\a", paneCwd: "C:\\a\\" }), { kind: "none" });
 });
 
-test("a same-root focus change is inert even while the dock is closed", () => {
-  // "none" beats "park": there is nothing to remember, so nothing should be
-  // recorded that would make the next open look like a pending re-root.
-  assert.deepEqual(decideFollow({ open: false, dockRoot: "C:\\a", paneCwd: "C:\\a" }), { kind: "none" });
+// ---------- isActiveTabChange: which notifications may move the dock ----------
+
+test("a tab notification that leaves the active tab alone must NOT move the dock", () => {
+  // THE REGRESSION PIN for the follow trigger. TabManager.onChange is a
+  // tab-SET listener: it also fires on rename, colour, reorder, and — the one
+  // that actually bit — setTabAttention, every time a background agent's
+  // attention flips. Following it unfiltered means the dock re-reads the active
+  // pane's LIVE cwd at a moment the human did not cause, adopting a directory
+  // change that was correctly ignored when it was typed, and rebuilding the
+  // file explorer out from under them.
+  assert.equal(isActiveTabChange("ws-1", "ws-1"), false);
+  assert.equal(isActiveTabChange(null, null), false);
+});
+
+test("a genuine tab switch DOES move the dock", () => {
+  // The trigger still has to exist: switching project tabs changes the active
+  // pane without any grid's setActive firing, so without this the dock keeps
+  // showing the previous tab's repo.
+  assert.equal(isActiveTabChange("ws-1", "ws-2"), true);
+  // Boot (no tab yet, then the first one) counts, and so does losing the last.
+  assert.equal(isActiveTabChange(null, "ws-1"), true);
+  assert.equal(isActiveTabChange("ws-2", null), true);
 });
 
 // ---------- decideViewSync ----------
@@ -166,6 +186,39 @@ test("a non-finite width falls back rather than reaching a style property", () =
   assert.equal(clampDockWidth(Number.POSITIVE_INFINITY), DEFAULT_DOCK_PREFS.width);
 });
 
+// ---------- the reserve's REAL enforcement point: the stylesheet ----------
+
+test("the stylesheet bounds the dock's width, so boot/restore/resize are all covered", () => {
+  // `clampDockWidth`'s reserve only ever runs on the DRAG path. Boot, a restore
+  // from persistence, and a window resize do not call it — so a width persisted
+  // on a wide monitor used to come back whole on a narrow one and occlude every
+  // pane. The bound that actually holds is CSS, and this reads it off disk.
+  const css = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
+  const rule = css.slice(css.indexOf(".sidedock {"), css.indexOf(".sidedock-grip"));
+  assert.ok(rule.includes(".sidedock {"), "the .sidedock rule must exist");
+  const maxWidth = /max-width:\s*max\(\s*(\d+)px\s*,\s*calc\(\s*100%\s*-\s*(\d+)px\s*\)\s*\)/.exec(rule);
+  assert.ok(maxWidth, `.sidedock needs a max-width bound; rule was:\n${rule}`);
+  // PINNED both ways: the stylesheet cannot be a fourth copy of these numbers
+  // that drifts from the module the tests reason about.
+  assert.equal(Number(maxWidth[1]), DOCK_MIN_W, "the CSS floor must mirror DOCK_MIN_W");
+  assert.equal(
+    Number(maxWidth[2]),
+    DOCK_TERM_RESERVE_PX,
+    "the CSS reserve must mirror DOCK_TERM_RESERVE_PX"
+  );
+});
+
+test("the dock is an overlay, and the stylesheet is where that is true", () => {
+  // Constraint 1 rests entirely on `.sidedock` being out of flow: an
+  // absolutely-positioned child of `#workspace` is not a flex item, so it
+  // cannot squeeze `#grid-area` and no pane ever hears a resize. If someone
+  // makes it `position: relative` or `static` to "fix" a layout quirk, every
+  // terminal starts reflowing and nothing else in this suite would notice.
+  const css = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
+  const rule = css.slice(css.indexOf(".sidedock {"), css.indexOf(".sidedock-grip"));
+  assert.match(rule, /position:\s*absolute/, ".sidedock must stay absolutely positioned");
+});
+
 // ---------- prefs ----------
 
 test("a first run gets the defaults, and the dock starts closed", () => {
@@ -206,9 +259,11 @@ test("one bad field costs only that field", () => {
   });
 });
 
-test("a persisted width is clamped on the way in as well as out", () => {
-  // A pref written by a wider monitor, or hand-edited, must not restore a dock
-  // that covers the app.
+test("a persisted width is bounded to the absolute range on the way in", () => {
+  // This path has NO live window width, so it can only apply DOCK_MIN_W /
+  // DOCK_MAX_W — the workspace reserve is the stylesheet's job (see the
+  // max-width test above). Stating that here rather than claiming
+  // restore-safety this assertion does not actually witness.
   assert.equal(decodeDockPrefs('{"width":99999}').width, DOCK_MAX_W);
   assert.equal(decodeDockPrefs('{"width":-5}').width, DOCK_MIN_W);
   assert.equal(JSON.parse(encodeDockPrefs({ open: true, tab: "git", width: 99999 })).width, DOCK_MAX_W);
