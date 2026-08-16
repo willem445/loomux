@@ -407,7 +407,7 @@ export function withoutDep(deps: readonly string[] | null | undefined, id: strin
 
 /** The Agile levels, in the backend's `TASK_KINDS` order (#958).
  *
- *  ENFORCED since #1156: the ladder below is the backend's `containment_rule`,
+ *  ENFORCED since #1156: the ladder below is the backend's `ladder_rule`,
  *  mirrored here so the pickers can offer only what a write would accept. The
  *  backend stays the authority — every refusal it makes surfaces in this view's
  *  toast — and this copy is a convenience, which is a claim #958 explicitly
@@ -1135,9 +1135,19 @@ export function kindFits<T extends HasParent>(
   board: readonly T[]
 ): boolean {
   const container = task.parent ? board.find((t) => t.id === task.parent) : undefined;
-  if (task.parent && !container) return kind === null;
-  const ownOk = container ? mayContain(container.kind, kind) : mayBeTopLevel(kind);
+  // Own link. The unresolvable-container case is a THIRD branch, not an early
+  // return: a row whose `parent` names nothing can carry no level, but that says
+  // nothing about the rows inside it, and returning here skipped the children
+  // walk below — offering a clear on a row holding levelled children, which the
+  // backend then refused (rev round 1, N1). Every branch must fall through to
+  // the same second question, because the backend asks both every time.
+  const ownOk = task.parent
+    ? container
+      ? mayContain(container.kind, kind)
+      : kind === null
+    : mayBeTopLevel(kind);
   if (!ownOk) return false;
+  // Children: this row's new level must still hold everything already inside it.
   return board.every((c) => c.parent !== task.id || mayContain(kind, c.kind));
 }
 

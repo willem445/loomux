@@ -9152,9 +9152,16 @@ fn task_id_number(id: &str) -> Option<u32> {
 }
 
 /// How deep the container chain may run (#958) — the epic → feature → story →
-/// task ceiling. A hard cap where the levels themselves are advisory, because
-/// this is what bounds every rollup and render walk over the tree; without it
-/// a hand-built chain could make an O(depth) walk arbitrarily expensive.
+/// task ceiling. It bounds every rollup and render walk over the tree; without
+/// it a hand-built chain could make an O(depth) walk arbitrarily expensive.
+///
+/// **Still load-bearing after #1156, and not redundant with the ladder**, which
+/// is the reading to resist now that the levels are enforced. The ladder bounds
+/// a chain only where every row on it carries a level; a chain of LEVEL-LESS
+/// rows is exempt (`ladder_rule`) and can be nested arbitrarily deep, and that
+/// is the flat board — the common case, not the edge one. So this cap is what
+/// actually bounds the walks, exactly as it was before, and the ladder's own
+/// four rungs happen to agree with it rather than replace it.
 pub const MAX_TASK_DEPTH: usize = 4;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -9365,9 +9372,10 @@ pub struct TaskSummary {
     pub deps: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub related: Vec<String>,
-    /// This row's container and advisory level (#958), skipped when absent so
-    /// a board with no hierarchy pays nothing for the fields — the same
-    /// pay-for-what-you-use rule the link arrays follow.
+    /// This row's container and Agile level (#958; the level is enforced since
+    /// #1156 — see `ladder_rule`), skipped when absent so a board with no
+    /// hierarchy pays nothing for the fields — the same pay-for-what-you-use
+    /// rule the link arrays follow.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -25075,9 +25083,11 @@ impl OrchRegistry {
                 return Err(format!("invalid status {s:?} — use one of {}", TASK_STATUSES.join(" | ")));
             }
         }
-        // The advisory level is validated like the status (#958). The EMPTY
-        // string is not an invalid kind, it is the clear — the `pr` rule — so
-        // it has to pass here to reach the apply below.
+        // The level is validated against the closed VOCABULARY here, like the
+        // status (#958) — where it sits on the ladder is judged further down,
+        // inside the lock, because that needs the whole board (#1156). The
+        // EMPTY string is not an invalid kind, it is the clear — the `pr` rule
+        // — so it has to pass here to reach the apply below.
         if let Some(k) = patch.kind.as_deref().map(str::trim) {
             if !k.is_empty() && !TASK_KINDS.contains(&k) {
                 return Err(format!("invalid kind {k:?} — use one of {}", TASK_KINDS.join(" | ")));

@@ -2588,7 +2588,8 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
    drag handle rather than a click target. */
 .task-collapse:hover { background: color-mix(in srgb, var(--accent) 28%, transparent); color: var(--ink); }
 .task-collapse-spacer { flex: none; width: 18px; }
-/* Advisory Agile level: a label only. Purple → blue → cyan → dim reads as
+/* The Agile level (#1156: enforced, and the authority on what a row is — the
+   id prefix only says where it started). Purple → blue → cyan → dim reads as
    epic → feature → story → task, reusing the palette the status chips already
    established rather than introducing a second colour language. */
 .task-chip.kind {

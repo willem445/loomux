@@ -4,6 +4,7 @@
 // `npm test`.
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import {
   approvableSelection,
   blockedTaskMap,
@@ -839,11 +840,30 @@ test("a broken container pointer leaves no level the row can take", () => {
   assert.equal(kindFits(board[0], "task", board), false);
 });
 
+test("a broken container pointer does not excuse the row's own children", () => {
+  // rev round 1, N1. `kindFits` used to answer the unresolvable-container case
+  // with an early return, which skipped the children walk entirely — so the
+  // picker offered "clear" on t-1 and the backend then refused the write
+  // (`t-1 cannot have its level cleared — t-2 is a story…`). Both questions are
+  // asked on every write, so both must be asked on every candidate.
+  const board = [row("t-1", "queued", "t-404", "feature"), row("t-2", "queued", "t-1", "story")];
+  assert.equal(
+    kindFits(board[0], null, board),
+    false,
+    "clearing t-1's level would strand the story inside it, whatever its own container is"
+  );
+  assert.deepEqual(kindPickerChoices(board[0], board), { candidates: [], clear: false });
+  // The control: with the child level-less, the clear IS legal again — so the
+  // fix narrowed the picker by the children rule, not by refusing outright.
+  const freed = [row("t-1", "queued", "t-404", "feature"), row("t-2", "queued", "t-1")];
+  assert.deepEqual(kindPickerChoices(freed[0], freed), { candidates: [], clear: true });
+});
+
 test("the ladder table is the same one the backend enforces", () => {
-  // The whole rule, as a table — the case list `hierarchy_ladder_matches_the_
-  // boards_copy` (src-tauri/tests/orchestration.rs) asserts against the Rust
-  // `containment_rule`. Two copies of a rule are only safe while something
-  // reddens when they part; this pair of tests is that something.
+  // The whole rule, as a table. This half pins the BOARD's copy against
+  // literals; the test below reads the backend's own table out of the Rust
+  // source and pins the two against each other, which is what makes "a
+  // divergence reddens" true rather than merely intended (rev round 1, N2).
   assert.deepEqual(ladderRule("epic"), { rule: "top-level-only" });
   assert.deepEqual(ladderRule("feature"), { rule: "inside", container: "epic" });
   assert.deepEqual(ladderRule("story"), { rule: "inside", container: "feature" });
@@ -864,6 +884,89 @@ test("the ladder table is the same one the backend enforces", () => {
   assert.equal(mayBeTopLevel("epic"), true);
   assert.equal(mayBeTopLevel(null), true);
   for (const k of ["feature", "story", "task"]) assert.equal(mayBeTopLevel(k), false);
+  // Every level in the VOCABULARY has a place on the ladder, so a fifth kind
+  // cannot ship silently exempt on this side — the loop the Rust table test
+  // already carries, which this one was missing (rev round 1, N3).
+  for (const k of KINDS) {
+    assert.notDeepEqual(ladderRule(k), { rule: "exempt" }, `${k} must have a place on the ladder`);
+  }
+});
+
+// The MECHANICAL half of the cross-language pin (rev round 1, N2). The board
+// keeps a second copy of the backend's ladder so the pickers can offer only
+// legal targets, and `taskboard.ts` argues that is safe because the rule is a
+// lookup over closed vocabularies rather than a re-derivation over the tree.
+// That argument is only worth anything if a divergence REDDENS — and two tests
+// each asserting their own table against their own literals do not do that:
+// editing the Rust rule and its Rust test leaves this side green on the old
+// table, which is exactly the hole the reviewer named.
+//
+// So this reads the backend's table out of the Rust source and compares it to
+// this side's, in the shape `tests/groupid.rs` and `test/perfpolicy.test.ts`
+// already establish for a source-scanning guard: DEFAULT-DENY (an unreadable
+// file, a missing function, or a table it cannot parse all FAIL), decided on a
+// shape that cannot compile any other way rather than on any binding's name,
+// and with its blind spots stated rather than implied.
+//
+// What it cannot see, stated: the arms are matched textually, so a `ladder_rule`
+// rewritten to compute its answer (a nested match, a helper call, a non-literal
+// container) parses to fewer arms than `KINDS` has entries — which is why the
+// per-level completeness assertion below is the one that must fail loudly, and
+// does. It reads the rule ONLY; the enforcement that consumes it is pinned by
+// the Rust suite.
+const RUST_LADDER = new URL("../src-tauri/src/orchestration/mod.rs", import.meta.url);
+
+test("the board's ladder table is the backend's, read out of the Rust source", () => {
+  const src = readFileSync(RUST_LADDER, "utf8");
+  const start = src.indexOf("pub fn ladder_rule(");
+  assert.notEqual(
+    start,
+    -1,
+    "ladder_rule is gone or renamed in mod.rs — this guard reads that function by name, so " +
+      "update it here rather than deleting the only thing pinning the two ladders together"
+  );
+  // The function body: up to the first closing brace at column 0.
+  const end = src.indexOf("\n}", start);
+  assert.notEqual(end, -1, "could not find the end of ladder_rule's body");
+  const body = src.slice(start, end);
+
+  const arms = [...body.matchAll(/Some\("([a-z]+)"\)\s*=>\s*LadderRule::(TopLevelOnly|Exempt|Inside\("([a-z]+)"\))/g)];
+  assert.ok(
+    arms.length > 0,
+    `no ladder arms could be parsed out of ladder_rule — the guard matches ` +
+      `\`Some("<kind>") => LadderRule::…\`, so either the table moved or it is now computed. ` +
+      `Body was:\n${body}`
+  );
+  // Default-deny on the fall-through too: an exempt catch-all is what makes a
+  // level-less row legal anywhere, and it is a load-bearing part of the table.
+  assert.match(body, /_\s*=>\s*LadderRule::Exempt/, "the backend's exempt catch-all is gone");
+
+  const rust = new Map(
+    arms.map(([, kind, variant, container]) => [
+      kind,
+      variant.startsWith("Inside")
+        ? { rule: "inside", container }
+        : variant === "TopLevelOnly"
+          ? { rule: "top-level-only" }
+          : { rule: "exempt" },
+    ])
+  );
+  // Every level this side knows must appear in the backend's table, and agree.
+  // This is the assertion that catches a rewrite the regex cannot follow: an
+  // arm it fails to parse is an arm missing from `rust`.
+  for (const k of KINDS) {
+    assert.ok(rust.has(k), `${k} has no arm in the backend's ladder_rule (or the guard could not parse it)`);
+    assert.deepEqual(
+      ladderRule(k),
+      rust.get(k),
+      `the board's ladder disagrees with the backend's for "${k}" — the pickers would offer ` +
+        `something upsert_task refuses (or hide something it allows)`
+    );
+  }
+  // ...and the backend must know no level this side has never heard of.
+  for (const k of rust.keys()) {
+    assert.ok((KINDS as readonly string[]).includes(k), `the backend has a level the board does not: ${k}`);
+  }
 });
 
 test("the level tooltip is derived from the ladder, never written out beside it", () => {
