@@ -300,10 +300,12 @@ export function withoutDep(deps: readonly string[] | null | undefined, id: strin
 // Board hierarchy (#958): containment, not ordering.
 //
 // `parent` names the row this one sits inside; `deps` still names what must
-// finish first, and the two are orthogonal (a dep may cross subtrees). The
-// board array stays FLAT and its order stays the priority order — every tree
-// below is derived from `parent` at render time, exactly like `isReady` is
-// derived rather than read off the wire.
+// finish first, and the two are orthogonal (a dep may cross subtrees).
+// Orthogonal is not independent: readiness reads BOTH (`blockingAncestor`),
+// because a slice inside a waiting feature is waiting too — what never happens
+// is one becoming the other. The board array stays FLAT and its order stays the
+// priority order — every tree below is derived from `parent` at render time,
+// exactly like `isReady` is derived rather than read off the wire.
 // ---------------------------------------------------------------------------
 
 /** The advisory Agile levels, in the backend's `TASK_KINDS` order (#958).

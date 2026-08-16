@@ -135,6 +135,7 @@ use loomux_lib::orchestration::{
     attention_tail, ATTENTION_SCAN_BYTES,
     spawn_rate_exceeded, spawn_request_expired, strip_ansi, submit_confirmed, submit_sequence,
     blocking_ancestor, board_summaries, cap_task_notes, task_ready, task_summary, unmet_deps,
+    TASK_STATUSES,
     // #865: done-row cap on list_tasks — the pure keep/drop rule and its default.
     filter_done_rows, LIST_TASKS_DONE_CAP,
     unconfirmed_delivery_notice, delivery_eaten_notice, watchdog_should_notify, worktree_cleanup_targets,
@@ -10709,9 +10710,13 @@ fn readiness_climbs_the_container_chain() {
 /// normal state while its slices are the startable work. Reading either would
 /// make a slice's readiness a function of how promptly someone maintains the
 /// container row, where deps are the ordering primitive #582 defined.
+///
+/// Swept over `TASK_STATUSES` itself rather than a list written out here: a
+/// ninth status added later must be covered by this sweep the day it lands, not
+/// silently escape it (CLAUDE.md — a concrete list goes stale).
 #[test]
 fn an_ancestors_status_never_enters_readiness() {
-    for status in ["blocked", "in-progress", "review", "pr", "human-testing", "done", "prototype"] {
+    for status in TASK_STATUSES {
         let board = vec![
             kinded("feat", status, "feature", None),
             kinded("slice", "queued", "task", Some("feat")),
@@ -10742,7 +10747,9 @@ fn a_hand_edited_container_never_wedges_readiness() {
     assert_eq!(rows[1].children, 1, "the counts still answer, without walking into the loop");
 
     // A cycle whose member carries a REAL unmet dep still reports it, having
-    // visited each member exactly once rather than spinning.
+    // terminated on the repeat rather than spinning. (Termination, not
+    // deduplication: a cycle that does not contain the start row re-scans its
+    // entry member once — see `blocking_ancestor`'s doc.)
     let cyclic_but_blocked = vec![
         linked("t-0", "queued", &[], &[]),
         kinded("t-1", "queued", "task", Some("t-2")),

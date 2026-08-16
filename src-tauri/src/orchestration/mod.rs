@@ -8982,6 +8982,10 @@ pub struct Task {
     /// The id of the task this one sits INSIDE (#958) — containment, where
     /// `deps` is ordering. Orthogonal on purpose: a dep may cross subtrees or
     /// link two containers, and none of the #582 link machinery consults this.
+    /// Orthogonal is not independent — readiness reads BOTH as of slice R
+    /// (`blocking_ancestor`), because a slice inside a waiting feature is
+    /// waiting too. What never happens is one becoming the other: containment
+    /// is never stored, written or validated as an edge.
     ///
     /// Stored on the pointing side only (no `children` array), the way a dep
     /// edge is: two sources of truth would mean two delete-strip bookkeepings.
@@ -8994,8 +8998,10 @@ pub struct Task {
     /// Reading is deliberately TOLERANT where writing is strict: a hand-edited
     /// orphan or over-deep pointer blocks nothing and renders flat at top
     /// level. Unlike an unknown dep — which reads as unmet because deps gate
-    /// readiness — an unknown container is display-only, so tolerate-and-show
-    /// is the safe failure direction.
+    /// readiness — an unknown container names no ordering constraint of its
+    /// own: `blocking_ancestor` only ever reads the DEPS of the containers it
+    /// finds, so a chain ending nowhere contributes nothing to check. That is
+    /// what makes tolerate-and-show the safe failure direction here.
     ///
     /// **DISPLAY AND QUEUE-HINT METADATA ONLY — NOTHING MAY GATE ON IT**, the
     /// `pr_base` argument above applied to hierarchy: the board is
@@ -9121,7 +9127,12 @@ pub fn unmet_deps<'a>(task: &'a Task, board: &[Task]) -> Vec<&'a str> {
 /// doc/design/task-hierarchy.md already stakes out: a `parent` naming no live
 /// row ends the chain (an orphan renders at top level, so it has no container
 /// to be blocked by), and a cycle terminates on the repeat with every member
-/// checked once. The row itself is excluded even where a cycle makes it its own
+/// reached. Reached, deliberately not "checked exactly once": a cycle that does
+/// NOT contain the start row (a → b → c → b) yields the path `[a, b, c, b]`, so
+/// `b`'s deps are scanned twice. Same answer, still bounded by the repeat
+/// check, one redundant scan on a board only a hand edit can produce — cheaper
+/// than carrying a visited set through the loop to dedupe it. The row itself is
+/// excluded even where a cycle makes it its own
 /// ancestor — its own deps are `unmet_deps`' answer, and counting them twice
 /// would say nothing new.
 ///
