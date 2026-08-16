@@ -86,6 +86,17 @@ pub const NEEDS_YOU_FILE: &str = "needs-you.json";
 /// items a human has not seen yet.
 pub const CLEARED_MARKER: &str = "needs-you-cleared";
 
+/// The per-group marker that says the one-shot upgrade migration has run.
+///
+/// **Its presence is the whole of the once-ever guarantee**, and that guarantee
+/// is load-bearing rather than tidy: the migration synthesizes demo items for a
+/// board that predates the registry, so a second run has nothing to recover and
+/// everything to break — it would re-raise a row the human had already resolved,
+/// under a new id, on a task still sitting in its demo status. Written even when
+/// the migration added nothing, because "already considered" and "found nothing
+/// to do" are the same answer for every run after the first.
+pub const MIGRATED_MARKER: &str = "needs-you-migrated";
+
 /// Longest item body. [`super::humanq::QUESTION_TEXT_MAX`]'s budget, for the
 /// same reason: generous, because a self-contained ask is the point, but bounded
 /// because this text is rendered into a panel row and delivered into a pane.
@@ -253,13 +264,48 @@ pub struct Item {
 }
 
 impl Item {
-    /// Whether this row is the open demo item for `task` — the dedupe key, in
-    /// one place so the hook, the backfill and an explicit raise cannot disagree
-    /// about what "already raised" means.
+    /// Whether this row is a demo item for `task`, whatever state it is in.
+    pub fn is_demo_for(&self, task: &str) -> bool {
+        self.kind == Kind::Demo && self.task.as_deref() == Some(task)
+    }
+
+    /// Whether this row is the OPEN demo item for `task` — the ordinary dedupe
+    /// key, in one place so the hook and an explicit raise cannot disagree about
+    /// what "already raised" means.
     pub fn is_open_demo_for(&self, task: &str) -> bool {
-        self.status == Status::Open
-            && self.kind == Kind::Demo
-            && self.task.as_deref() == Some(task)
+        self.status == Status::Open && self.is_demo_for(task)
+    }
+}
+
+/// **Which existing rows count as "this task has already been raised".**
+///
+/// The two scopes are genuinely different, and conflating them was a real
+/// defect rather than a hypothetical one (rev-lead round 1, blocking 1): the
+/// migration below ran on every read, deduped on [`Dedupe::OpenEpisode`], and so
+/// minted a fresh demo item one refresh after the human resolved the previous
+/// one — the row came back under a new id, and again on every subsequent
+/// resolve. A human's close-out has to stick.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Dedupe {
+    /// One OPEN demo row per task — what an ordinary raise wants. A settled row
+    /// is a *closed episode*: a task that leaves the gate and comes back has
+    /// genuinely been parked twice, and the second parking is a second ask that
+    /// deserves its own row and its own timestamps.
+    OpenEpisode,
+    /// ANY demo row for this task, settled or not — what the one-shot migration
+    /// wants. A settled row is proof the registry has already seen this task, so
+    /// there is nothing to migrate, and re-raising would undo a close-out rather
+    /// than recover a lost one. Never use this for a raise: it would make a
+    /// re-parked task silently invisible for ever after its first episode.
+    EverRaised,
+}
+
+impl Dedupe {
+    fn matches(self, item: &Item, task: &str) -> bool {
+        match self {
+            Dedupe::OpenEpisode => item.is_open_demo_for(task),
+            Dedupe::EverRaised => item.is_demo_for(task),
+        }
     }
 }
 
@@ -332,6 +378,25 @@ pub fn demo_text(title: &str, status: &str) -> String {
 /// **Rejects rather than truncates**, [`super::humanq::validate_ask`]'s posture:
 /// an ask silently cut at its cap is an ask whose actual point may have been the
 /// part that was dropped, and the raiser has no way to see that happened.
+///
+/// # What this does NOT check: that `task` names a real board row
+///
+/// Stated rather than left to be discovered (rev-lead round 1, non-blocking 2).
+/// Being pure is not the reason — the reason is that it is not a defect for
+/// slice A's callers and *is* one for slice B's. Every raiser today is the board
+/// hook, which supplies the id of a row it has just written, so the check would
+/// have nothing to catch. Once `request_attention` ships, an agent naming a task
+/// that does not exist — or one that will never move again — pins a permanently
+/// open row on the human's queue: nothing auto-resolves it, because the hook
+/// only ever fires on a real row's transition, and the only bounds left are
+/// [`OPEN_MAX`] and a human or the raiser clearing it by hand.
+///
+/// **So the existence check belongs at that entry point, not here**, where the
+/// board is in reach and the refusal can name the id. `raise_needs_you` is
+/// deliberately not made board-aware for it: a registry method that reads
+/// `tasks.json` to validate would take the board's lock from inside the items
+/// lock, which is the nesting `needs_you_lock`'s doc rules out in the other
+/// direction.
 pub fn validate_raise(req: RaiseRequest) -> Result<RaiseRequest, String> {
     let text = req.text.trim().to_string();
     if text.is_empty() {
@@ -378,31 +443,47 @@ pub fn validate_resolution(note: &str) -> Result<String, String> {
     Ok(note)
 }
 
+/// The outcome of a raise: the row the caller should quote back, and **whether
+/// it is new**.
+///
+/// `fresh: false` means the raise deduped onto a row that already existed — the
+/// caller must not audit a second open or write the file again, and a caller
+/// with an actual author to answer (slice B's `request_attention`) must say so,
+/// because a deduped raise **keeps the existing row's text and discards the new
+/// ask's** (rev-lead round 1, non-blocking 3). Returning that bit rather than a
+/// bare [`Item`] is what stops "I asked for a look at the empty state" from
+/// silently becoming the board's generic "— parked in prototype for your look".
+#[derive(Clone, Debug, PartialEq)]
+pub struct Raised {
+    pub item: Item,
+    pub fresh: bool,
+}
+
 /// Admit a raise into an already-loaded item list: validate, dedupe, mint,
-/// append. Returns the item and **whether it is new** — `false` means the raise
-/// deduped onto a row that was already open, and the caller must not audit a
-/// second open or write the file again.
+/// append.
 ///
 /// **Pure, and the single place "already raised" is decided.** The board hook,
-/// the upgrade backfill and an explicit agent raise all come through here, which
-/// is what makes "one open demo item per task, whoever asked" true by
-/// construction rather than by three call sites agreeing. `now_ms` is a
-/// parameter for the same reason: it keeps this a function of its inputs, so a
-/// test can pin ordering without a clock.
+/// the one-shot migration and an explicit agent raise all come through here,
+/// which is what makes "one open demo item per task, whoever asked" true by
+/// construction rather than by three call sites agreeing — with the one
+/// difference between them named in the [`Dedupe`] argument rather than left
+/// implicit. `now_ms` is a parameter for the same reason: it keeps this a
+/// function of its inputs, so a test can pin ordering without a clock.
 pub fn admit(
     items: &mut Vec<Item>,
     raiser: &str,
     req: RaiseRequest,
     now_ms: u64,
-) -> Result<(Item, bool), String> {
+    dedupe: Dedupe,
+) -> Result<Raised, String> {
     let req = validate_raise(req)?;
     // Dedupe BEFORE the cap: a duplicate raise must stay idempotent even on a
     // full board, or the hook that re-raises on every transition would start
     // failing exactly when the queue is worst.
     if req.kind == Kind::Demo {
         if let Some(task) = req.task.as_deref() {
-            if let Some(existing) = items.iter().find(|i| i.is_open_demo_for(task)) {
-                return Ok((existing.clone(), false));
+            if let Some(existing) = items.iter().find(|i| dedupe.matches(i, task)) {
+                return Ok(Raised { item: existing.clone(), fresh: false });
             }
         }
     }
@@ -428,7 +509,7 @@ pub fn admit(
         resolution: None,
     };
     items.push(item.clone());
-    Ok((item, true))
+    Ok(Raised { item, fresh: true })
 }
 
 /// The next id for this group: `n-{highest + 1}`, read off the file rather than
@@ -492,6 +573,70 @@ pub fn prune(items: &mut Vec<Item>, keep: usize) {
     });
 }
 
+/// **What an AGENT is shown of an item — an explicitly enumerated projection,
+/// never the stored struct.**
+///
+/// The field list here is a decision, and it is written down as one so that
+/// adding a field to [`Item`] can never *by itself* put that field on an agent
+/// surface. That failure class is not hypothetical — whole-struct serialization
+/// onto an agent surface is exactly what went wrong on #1160 — and the cost of
+/// pre-empting it is this struct.
+///
+/// **What is shown, and why.** Everything an agent needs to decide what to do
+/// next: the id to quote, what was asked, which row it is about, how loud it is,
+/// and — once settled — *how* it was settled. `resolved_by` is included
+/// deliberately: an orchestrator must be able to tell "the human looked" from
+/// "the board moved on" from "I withdrew this myself", which is the whole reason
+/// those three tags stay distinguishable.
+///
+/// **What is withheld, and why.** `resolution` — the human's verbatim close-out
+/// note. It is *not* a secret: `resolve_notice` delivers it, sanitized, into the
+/// orchestrator's own pane, which is the surface it was written for. But
+/// [`project_list`] feeds a **shared** read that every delegate may call, and a
+/// note the human typed to their orchestrator is not thereby addressed to every
+/// worker in the fleet. The narrower answer is the one that can be widened later
+/// without a migration; the wider one cannot be narrowed without breaking a
+/// contract. `had_resolution` carries the one bit an agent actually needs — that
+/// a note exists at all, so it can ask rather than invent.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct AgentItem {
+    pub id: String,
+    pub kind: Kind,
+    pub raiser: String,
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    pub urgency: Urgency,
+    pub status: Status,
+    pub created_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_by: Option<String>,
+    /// Whether a human close-out note exists — not the note itself. See above.
+    pub had_resolution: bool,
+}
+
+impl From<&Item> for AgentItem {
+    /// Field-by-field on purpose: `..` spread or a derive would re-open exactly
+    /// the hole this type exists to close.
+    fn from(i: &Item) -> Self {
+        AgentItem {
+            id: i.id.clone(),
+            kind: i.kind,
+            raiser: i.raiser.clone(),
+            text: i.text.clone(),
+            task: i.task.clone(),
+            urgency: i.urgency,
+            status: i.status,
+            created_ms: i.created_ms,
+            resolved_ms: i.resolved_ms,
+            resolved_by: i.resolved_by.clone(),
+            had_resolution: i.resolution.is_some(),
+        }
+    }
+}
+
 /// What an agent-facing list returns: every open item (oldest first — the order
 /// they were raised in), then the newest resolved rows up to `cap`, plus how
 /// many resolved rows were left off.
@@ -502,10 +647,14 @@ pub fn prune(items: &mut Vec<Item>, keep: usize) {
 /// Newest-first presentation is the PANEL's job, not this projection's — the
 /// panel unions these with questions and sorts the union. Sorting here would put
 /// a second, weaker ordering in the way of that one.
-pub fn project_list(items: &[Item], cap: usize) -> (Vec<Item>, usize) {
-    let mut open: Vec<Item> = items.iter().filter(|i| !i.status.is_resolved()).cloned().collect();
-    let resolved: Vec<Item> =
-        items.iter().filter(|i| i.status.is_resolved()).cloned().collect();
+/// Returns [`AgentItem`]s, never [`Item`]s — see that type for why the
+/// projection is the return value rather than something the caller is trusted to
+/// remember to apply.
+pub fn project_list(items: &[Item], cap: usize) -> (Vec<AgentItem>, usize) {
+    let mut open: Vec<AgentItem> =
+        items.iter().filter(|i| !i.status.is_resolved()).map(AgentItem::from).collect();
+    let resolved: Vec<AgentItem> =
+        items.iter().filter(|i| i.status.is_resolved()).map(AgentItem::from).collect();
     let omitted = resolved.len().saturating_sub(cap);
     open.extend(resolved.into_iter().skip(omitted));
     (open, omitted)
