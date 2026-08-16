@@ -218,6 +218,12 @@ palette of nice colours. So each identity hue is claimed by exactly one role, ch
 ways. It also fixes the ceiling §The palette measured: a ninth icon family cannot arrive by
 minting a ninth colour. It has to displace one, and argue why.
 
+That ceiling binds the `--id-*` set and the *roles* that claim it, and the one set that has
+ever been allowed past it went the other way round: the per-CLI hues (§The per-CLI hues) are
+outside `--id-*` for exactly this reason — a CLI could not take a role's hue without giving
+that hue a second meaning — and they buy their own pigments by only ever meeting each other,
+in one position, rather than by joining this table.
+
 **No icon role may name a `--state-*` token.** An icon that reports agent state takes its
 colour from the *position* it sits in — the warp thread, the status chip, the state dot — not
 from this registry. That is the position rule doing its work one layer down: `--state-danger`
@@ -258,11 +264,30 @@ on (`copilot-16` is a filled 16). Rescaling one onto the registry's grid would b
 uniformity that makes a vendored set worth having. Two modules, one grid each, is the honest
 shape.
 
-**It borrows `fleet` rather than minting a hue.** An agent-type glyph is the most literal
-possible member of *"the agents themselves"*, so it wears `.ic-fleet` and the bijection above
-survives untouched — no ninth colour, no ad-hoc override, and the both-directions CSS pin in
-`test/icons.test.ts` covers these marks for free. Hue groups, shape distinguishes, one layer
-up from the file tree: violet says *this is an agent*, the glyph says *which CLI*.
+**It started by borrowing `fleet`, and wave 2 gave it its own table instead.** An agent-type
+glyph is the most literal possible member of *"the agents themselves"*, so the mark shipped
+wearing `.ic-fleet` — which answers *is this an agent* and, it turned out, nothing else: with
+three CLIs on screen every agent pane came out the same violet. §The per-CLI hues is the
+answer and carries the full argument; what matters *here* is what it did and did not change
+about this tier:
+
+- **The mark now reaches its colour through `.cli-<program>`** when its program is on the hue
+  roster, and `.ic-fleet` when it is not — one class or the other, never both. Violet no
+  longer means *this is an agent*; it means *an agent loomux has no brand hue for*.
+- **The bijection above still survives untouched**, which was the real content of the original
+  claim. `--cli-*` is a separate token set precisely *because* each `--id-*` hue is claimed by
+  exactly one icon role, so no CLI takes a role's meaning. What is no longer true is the "no
+  ninth colour" half: there are seven more pigments, in their own sub-table, argued in §The
+  per-CLI hues on the ground that they meet only each other.
+- **`test/icons.test.ts` does not cover these marks for free**, and never quite did — its
+  both-directions scan reads bare `.ic-<role>` rules, so `.cli-*` was always outside it. The
+  three-surface roster pin in `test/agenticons.test.ts` is what holds the CLI table (renderer
+  ↔ `CSS_TOKENS` ↔ stylesheet), and the `.ic-*` scan carries a note that the `.cli-*` block
+  beside it is deliberately *not* the overriding selector its own caveat warns about.
+- **Shape groups, hue distinguishes** — the inverse of the file tree one layer up. Every agent
+  mark is a 16-grid mark or badge, which is what makes them read as one channel; the hue says
+  *which CLI*, and the glyph carries it redundantly wherever a licence or a distinct initial
+  allows.
 
 **Two tiers, because a licence is not always available.** A vendored mark needs **two**
 permissions, and only one of them is what an OSS licence talks about:

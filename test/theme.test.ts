@@ -881,7 +881,7 @@ test("one CLI table: every surface that names a CLI paints it that CLI's own tok
   assert.ok(seenAny >= Object.keys(CLI_HUES).length + 3, `only ${seenAny} CLI rules matched`);
 });
 
-test("the design note's per-CLI CVD table is re-derived, not remembered", () => {
+test("every surface that quotes a per-CLI CVD figure re-derives it, rather than remembering", () => {
   // THE FINDING THIS TEST IS THE FIX FOR. The first round of this feature quoted CVD figures
   // in three places — theme.ts, the design note and the PR body — that were produced by a
   // throwaway script using DIFFERENT dichromat matrices from the ones the suite runs. The
@@ -890,24 +890,49 @@ test("the design note's per-CLI CVD table is re-derived, not remembered", () => 
   // simulation at all. Nothing caught it, because a measurement written into prose is a
   // measurement nothing re-runs.
   //
-  // So the note's own table is derived here from `simulate`/`deltaE` — the same code the
-  // assertions above use — and the note has to agree with it. A hue nudge now forces the
-  // prose to be re-derived instead of silently outliving the palette it described, which is
-  // the same job the mist-row pin below does for the ink ramp.
-  const doc = read("../doc/design/ui-redesign.md");
+  // BOTH PROSE SURFACES, not just the one that happens to be a markdown table (review N4).
+  // Pinning the note alone left theme.ts's own copy of the same three figures free to be
+  // corrupted with the suite still green — which is the identical gap one file to the left,
+  // and the whole reason #878 says a claim lives on several surfaces at once.
+  //
+  // The two are compared through the SAME normalization (markdown pipes, bold markers and
+  // JSDoc's leading `*` all collapse to whitespace), so one regex per claim reads both. A
+  // second parser would be a second thing to get wrong.
+  const flatten = (s: string) => s.replace(/[|*]/g, " ").replace(/\s+/g, " ");
+  const SURFACES = [
+    { what: "doc/design/ui-redesign.md", text: flatten(read("../doc/design/ui-redesign.md")) },
+    { what: "src/theme.ts", text: flatten(read("../src/theme.ts")) },
+  ];
+
+  // 1. The closest pair under each simulation — the figures round 1 got wrong.
   for (const kind of CVD_KINDS) {
     const { distance, a, b } = closestPair({ ...CLI_HUES }, (h) => simulate(h, kind));
-    const row = doc.match(new RegExp(`\\|\\s*${kind}\\s*\\|\\s*([a-z/]+)\\s*\\|\\s*\\*{0,2}([0-9.]+)`));
-    assert.ok(row, `ui-redesign.md's per-CLI CVD table has no ${kind} row`);
-    assert.equal(
-      row[1],
-      `${a}/${b}`,
-      `the note says the closest ${kind} pair is ${row[1]}; it is ${a}/${b}`
-    );
-    assert.equal(
-      row[2],
-      distance.toFixed(1),
-      `the note says ${kind} ${row[1]} is ${row[2]} ΔE; it is ${distance.toFixed(1)}`
+    for (const { what, text } of SURFACES) {
+      const m = text.match(new RegExp(`\\b${kind}\\s+([a-z]+/[a-z]+)\\s+([0-9]+\\.[0-9])\\b`));
+      assert.ok(m, `${what} quotes no closest ${kind} pair for the CLI hues`);
+      assert.equal(m[1], `${a}/${b}`, `${what} says the closest ${kind} pair is ${m[1]}; it is ${a}/${b}`);
+      assert.equal(
+        m[2],
+        distance.toFixed(1),
+        `${what} says ${kind} ${m[1]} is ${m[2]} ΔE; it is ${distance.toFixed(1)}`
+      );
+    }
+  }
+
+  // 2. The same-glyph pair's three dichromat views — the load-bearing safety claim, and the
+  //    one a reader is most likely to take on trust because it is the reassuring number.
+  const hues = CLI_HUES as Record<string, string>;
+  const views = CVD_KINDS.map((k) =>
+    deltaE(simulate(hues.claude, k), simulate(hues.codex, k)).toFixed(1)
+  );
+  for (const { what, text } of SURFACES) {
+    const m = text.match(/([0-9]+\.[0-9]) ΔE \(protan; deutan ([0-9]+\.[0-9]), tritan ([0-9]+\.[0-9])\)/);
+    assert.ok(m, `${what} no longer states claude/codex's three dichromat views in the pinned shape`);
+    assert.deepEqual(
+      [m[1], m[2], m[3]],
+      views,
+      `${what} says claude/codex is ${m[1]}/${m[2]}/${m[3]} (protan/deutan/tritan); it is ` +
+        views.join("/")
     );
   }
 });

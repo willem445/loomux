@@ -73,6 +73,13 @@ export const LUCIDE_PIN = {
  * family cannot be added by minting a ninth colour (the brief measured eight as the ceiling)
  * — it has to argue its way into an existing role or displace one. test/icons.test.ts
  * enforces the bijection in both directions.
+ *
+ * The per-CLI hues (theme.ts §CLI_HUES, `--cli-*`) are the one set that ever got past that
+ * ceiling, and they got past it by NOT joining this table: a CLI could not take a role's hue
+ * without giving that hue a second meaning, which is the bijection's whole point, so it has
+ * its own tokens and its own pin (test/agenticons.test.ts). Nothing below changes — the roles
+ * are still eight, still bijective, and a `.cli-*` rule never meets an `.ic-*` one on the same
+ * element.
  */
 export type IconRole =
   /** Where the work lives: folders, paths, the file actions that move them around. */
