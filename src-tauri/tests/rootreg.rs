@@ -207,8 +207,14 @@ fn resuming_a_group_redeclares_its_checkout_into_a_fresh_registry() {
     );
 }
 
-/// The worktree an agent spawn cuts is declared **in its own right**, and this
-/// test is written so it cannot pass for the wrong reason (#1092 review,
+/// The worktree an agent spawn cuts is declared **in its own right**.
+///
+/// No agent CLI is launched, and that is structural rather than careful: the
+/// registry here has no `AppHandle`, so `spawn_agent` skips the pane round-trip
+/// entirely (constraint 3 — tests fake the agent side, always). What actually
+/// runs is the git worktree cut and the declaration that follows it.
+///
+/// This test is written so it cannot pass for the wrong reason (#1092 review,
 /// finding 2 — the previous coverage proved the call site existed, not that it
 /// worked).
 ///
