@@ -1333,8 +1333,8 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .session-badge.claude { background: color-mix(in srgb, var(--cli-claude) 16%, transparent); color: var(--cli-claude); }
 .session-badge.copilot { background: color-mix(in srgb, var(--cli-copilot) 16%, transparent); color: var(--cli-copilot); }
 .session-badge.opencode { background: color-mix(in srgb, var(--cli-opencode) 16%, transparent); color: var(--cli-opencode); }
-/* The four agent roles, in the one role table this app has: orchestrator azure, worker
-   jade, reviewer violet, planner amber. Every surface that names a role uses it — this
+/* The agent roles, in the one role table this app has: orchestrator azure, worker
+   jade, reviewer violet, planner amber, manager orchid. Every surface that names a role uses it — this
    list, .group-role.role-* and the workflow pane's .wf-node-* / .wf-chip-* — and
    test/theme.test.ts reads all four surfaces and fails on a role that disagrees or is
    missing. sessions.ts emits this chip for EVERY OrchRole, so a role with no rule here
@@ -1343,6 +1343,7 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .session-badge.orch-role.worker { background: color-mix(in srgb, var(--id-jade) 16%, transparent); color: var(--id-jade); }
 .session-badge.orch-role.reviewer { background: color-mix(in srgb, var(--id-violet) 16%, transparent); color: var(--id-violet); }
 .session-badge.orch-role.planner { background: color-mix(in srgb, var(--id-amber) 16%, transparent); color: var(--id-amber); }
+.session-badge.orch-role.manager { background: color-mix(in srgb, var(--id-orchid) 16%, transparent); color: var(--id-orchid); }
 /* #1: the PR chip, shown only once the task board records one for this
    session's work — a distinct accent from the role chips so it reads as
    "external reference", not another identity badge. */
@@ -3298,6 +3299,13 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 /* Planner (#47) — the row this table never gained, so a planner fell through to
    the neutral base color while its chip also read "AGENT" (#222 §2a). */
 .group-role.role-planner { background: color-mix(in srgb, var(--id-amber) 16%, transparent); color: var(--id-amber); }
+/* Manager (#1161) — orchid, and a rule on every role surface from the start,
+   because the planner's absence above is what left a planner badge uncoloured
+   for as long as it did. Orchid because the constraint that governs a ROLE hue
+   is distinctness from the other ROLE hues, which is what a roster puts side by
+   side: it is the hue furthest from azure/jade/violet/amber. Rose is the
+   destructive-action dye and lime sits too close to the worker's jade. */
+.group-role.role-manager { background: color-mix(in srgb, var(--id-orchid) 16%, transparent); color: var(--id-orchid); }
 /* The workflow block an agent IS (#222). Only rendered when it differs from the
    role — i.e. never for the built-in roster. */
 .group-block {
@@ -4231,6 +4239,11 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .wf-node-worker { stroke: var(--id-jade); }
 .wf-node-reviewer { stroke: var(--id-violet); }
 .wf-node-planner { stroke: var(--id-amber); }
+/* #1161. `renderNode` classes a node from `isBlockKind(kind)`, so a declared
+   manager block already draws `.wf-node-manager` — without this rule it would
+   fall through to `.wf-node`'s neutral --line stroke and read as no role at
+   all, which is the failure the role table exists to prevent. */
+.wf-node-manager { stroke: var(--id-orchid); }
 .wf-node-unknown, .wf-node-ghost { stroke: var(--state-danger); stroke-dasharray: 4 3; }
 .wf-node-title { fill: var(--ink); font-size: 12.5px; font-weight: 600; }
 .wf-node-sub { fill: var(--ink-dim); font-size: 11px; }

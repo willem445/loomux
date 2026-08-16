@@ -4817,11 +4817,35 @@ fn plain_rails() -> Guardrails {
 /// sides moved together and the two regressions the pin claimed to catch (prose
 /// added unconditionally to a template; a placeholder moved onto its own line) both
 /// sailed straight through it (rev-11 F1).
+/// `manager.md` is deliberately NOT here — see [`GOLDENS`].
 const PRE222: [(&str, &str); 4] = [
     ("orchestrator.md", include_str!("fixtures/pre222/orchestrator.md")),
     ("worker.md", include_str!("fixtures/pre222/worker.md")),
     ("reviewer.md", include_str!("fixtures/pre222/reviewer.md")),
     ("planner.md", include_str!("fixtures/pre222/planner.md")),
+];
+
+/// Every blessed golden, in `LIVE` order — [`PRE222`] plus `manager.md` (#1161).
+///
+/// The split between this and `PRE222` is the difference between two questions
+/// that used to have one answer:
+///
+/// - **"what does a DEFAULT group read?"** — `PRE222`, iterated by the two pins
+///   that launch a plain group and read its dir. A manager exists only when a
+///   workflow declares one, and `write_instruction_files`'s class-fallback loop
+///   deliberately does not write `manager.md`, so a default group's dir has no
+///   such file: adding it to `PRE222` would not strengthen those pins, it would
+///   make them look for something that is correctly absent.
+/// - **"has a template drifted from what a human last blessed?"** — this, paired
+///   against `LIVE` below. That question is about the TEMPLATE and is asked of
+///   all five equally, which is why `manager.md` gets the same re-bless gate as
+///   the other four rather than a weaker one.
+const GOLDENS: [(&str, &str); 5] = [
+    PRE222[0],
+    PRE222[1],
+    PRE222[2],
+    PRE222[3],
+    ("manager.md", include_str!("fixtures/pre222/manager.md")),
 ];
 
 /// The live templates, with the placeholder(s) each must carry. Each element of the
@@ -4834,7 +4858,7 @@ const PRE222: [(&str, &str); 4] = [
 /// `{{BLOCK_NOTE}}{{ADVISOR_CONSULT_NOTE}}`), they stay a single contiguous-string key
 /// — same reasoning `block.md`'s `{{PERSONA_NOTE}}{{LANE_NOTE}}{{GATE_NOTE}}` already
 /// relies on.
-const LIVE: [(&str, &str, &[&str]); 4] = [
+const LIVE: [(&str, &str, &[&str]); 5] = [
     (
         "orchestrator.md",
         loomux_lib::orchestration::ORCHESTRATOR_TPL,
@@ -4847,6 +4871,10 @@ const LIVE: [(&str, &str, &[&str]); 4] = [
     ),
     ("reviewer.md", loomux_lib::orchestration::REVIEWER_TPL, &["{{BLOCK_NOTE}}", "{{LOCKS}}"]),
     ("planner.md", loomux_lib::orchestration::PLANNER_TPL, &["{{BLOCK_NOTE}}"]),
+    // #1161. `{{BLOCK_NOTE}}` and nothing else: a manager may never carry a
+    // persona (`persona_allowed`), and it holds no locks, so neither
+    // `{{LOCKS}}` nor an advisor-consult note has anything to say to it.
+    ("manager.md", loomux_lib::orchestration::MANAGER_TPL, &["{{BLOCK_NOTE}}"]),
 ];
 
 /// Render a template with the plain per-group VALUE variables `render_template`
@@ -5222,7 +5250,14 @@ fn a_workflow_placeholder_must_sit_at_the_end_of_a_line_it_shares() {
     // ...and the placeholders are the ONLY thing the live templates added. Belt to the
     // golden fixture's braces: it makes "the fixture is stale" and "someone edited a
     // template" distinguishable at a glance.
-    for ((file, golden), (_, live, keys)) in PRE222.iter().zip(LIVE.iter()) {
+    // A `zip` is only a pairing if the two arrays agree on order, and both are
+    // hand-written — so say so rather than assume it. Without this a row
+    // inserted into one array and appended to the other would compare
+    // `manager.md`'s live text against `planner.md`'s golden and fail with a
+    // full-file dump that names neither cause (#1161 widened both to five).
+    assert_eq!(GOLDENS.len(), LIVE.len(), "GOLDENS and LIVE must pair 1:1");
+    for ((file, golden), (live_file, live, keys)) in GOLDENS.iter().zip(LIVE.iter()) {
+        assert_eq!(file, live_file, "GOLDENS and LIVE are out of order at {file}");
         let mut stripped = lf(live);
         for key in *keys {
             stripped = stripped.replace(key, "");

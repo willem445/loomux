@@ -27,14 +27,34 @@ import type { OrchRole } from "./orchbadge";
 
 export type { OrchRole };
 
-/** The four capability classes, in roster order — the order the launcher lists
- *  its per-role CLI/model rows and the order a resolved roster reads best in.
- *  `label` is the form caption; the short chip text lives in orchbadge.ts. */
+/** The four BUILT-IN capability classes, in roster order — the order the launcher
+ *  lists its per-role CLI/model rows and the order a resolved roster reads best in.
+ *  `label` is the form caption; the short chip text lives in orchbadge.ts.
+ *
+ *  **`manager` is deliberately absent, and this array is why** (#1161). It is not
+ *  merely the form's row list: {@link builtinRoster} maps it into the blocks a
+ *  toggle-off launch runs, so a fifth entry here would put a manager in every
+ *  default group — the one thing the manager feature promises it will never do. A
+ *  manager arrives only from a repo's workflow file. See {@link ROSTER_ROLES} for
+ *  the list that describes a DECLARED roster. */
 export const ORCH_ROLES: readonly { key: OrchRole; label: string }[] = [
   { key: "orchestrator", label: "Orchestrator" },
   { key: "worker", label: "Worker" },
   { key: "reviewer", label: "Reviewer" },
   { key: "planner", label: "Planner" },
+];
+
+/** Every class a DECLARED roster may contain, in description order — the built-in
+ *  four plus `manager` (#1161).
+ *
+ *  Read by {@link describeRoster}, which describes a workflow's blocks rather than
+ *  the launcher's form. The manager leads because it is the block a human most
+ *  wants named: it is the pane they will be talking to. Never read by
+ *  {@link builtinRoster} or the launcher's per-role form — see {@link ORCH_ROLES}. */
+export const ROSTER_ROLES: readonly { key: OrchRole; label: string }[] = [
+  ORCH_ROLES[0]!,
+  { key: "manager", label: "Manager" },
+  ...ORCH_ROLES.slice(1),
 ];
 
 /** How a block's repo-authored instructions (if any) reach its agent. `none` is
@@ -280,7 +300,10 @@ export function resolveRoster(
  *  group has exactly one and it is not a choice the roster makes). */
 export function describeRoster(blocks: readonly RosterBlock[]): string {
   const parts: string[] = [];
-  for (const { key, label } of ORCH_ROLES) {
+  // ROSTER_ROLES, not ORCH_ROLES: this describes a DECLARED workflow's blocks,
+  // and a declared manager the human is about to consent to must not be the one
+  // block the summary silently omits (#1161).
+  for (const { key, label } of ROSTER_ROLES) {
     if (key === "orchestrator") continue;
     const n = blocks.filter((b) => b.kind === key).length;
     if (n) parts.push(`${n} ${label.toLowerCase()}${n > 1 ? "s" : ""}`);

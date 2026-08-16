@@ -865,7 +865,10 @@ fn require_not_planner(caller: &Caller, denied: PlannerDenied) -> Result<(), Str
 /// rev-38 in the same clone). A planner is untouched — it never gets a
 /// worktree under any circumstance, per its existing read-only contract —
 /// and the orchestrator is exempt by construction (`spawn_agent` can never
-/// name `kind: "orchestrator"`).
+/// name `kind: "orchestrator"`). A manager (#1161) is exempt the same way the
+/// orchestrator is — `spawn_agent` refuses `kind: "manager"` outright — and
+/// would be excluded on its merits regardless: it works read-only in the
+/// human's own checkout, which is the repo the conversation is about.
 pub(crate) fn needs_dedicated_workspace(role: Role) -> bool {
     matches!(role, Role::Worker | Role::Reviewer)
 }
@@ -1339,6 +1342,22 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                         .into(),
                 );
             }
+            // ...and `manager` is the second kind loomux can name that this
+            // tool may not open (#1161). Same shape as the orchestrator
+            // refusal, different reason: the manager is not a *delegate* at
+            // all. It is the human's own interface, declared in the repo's
+            // workflow file and opened for the human — so an orchestrator
+            // spawning one would be minting the human a conversation partner
+            // they did not ask for, in a pane they were not looking at, from
+            // the one agent the manager exists to relay TO.
+            if kind == Some(Role::Manager) {
+                return Err(
+                    "kind must be worker | reviewer | planner — a manager is the human's own \
+                     interface, declared in .loomux/workflow.yml and opened for them, never \
+                     spawned by you. To put something to the human, use ask_human."
+                        .into(),
+                );
+            }
             // A block names one of the repo's declared personas (#222). Its
             // `kind` is authoritative when set, so `kind` above is only the
             // fallback for a plain spawn.
@@ -1355,6 +1374,27 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                 .map(str::trim)
                 .filter(|b| !b.is_empty())
                 .map(str::to_string);
+            // The other half of the manager refusal above, and the half that
+            // would otherwise make the first one decorative: `block:` names a
+            // declared block and its kind WINS over `kind:` (same precedence
+            // `spawn_agent_ex` applies), so a roster that declares a manager
+            // hands the orchestrator a second spelling of the spawn the check
+            // above just refused — one that needs no `kind` argument at all.
+            // Refused on the block's OWN resolved kind, so it cannot be spelled
+            // around by renaming the block. Both refusals sit here rather than
+            // deeper, so the orchestrator gets a sentence rather than a spawn
+            // that half-happens.
+            if let Some(id) = block.as_deref() {
+                let block_kind =
+                    reg.group(&caller.group).and_then(|g| g.guardrails.block(id).map(|b| b.kind));
+                if block_kind == Some(Role::Manager) {
+                    return Err(format!(
+                        "block {id:?} is this group's manager — the human's own interface, opened \
+                         for them rather than spawned by you. Spawn a worker, reviewer or planner \
+                         block; to put something to the human, use ask_human."
+                    ));
+                }
+            }
             let task = arg_str(args, "task").unwrap_or("");
             let name = arg_str(args, "name").unwrap_or("");
             let requested_worktree = args.get("worktree").and_then(Value::as_bool);

@@ -44,7 +44,15 @@ export interface OrchCli {
   /** The model each capability class starts on. `INHERIT_MODEL` means "send
    *  nothing and let the CLI decide" — never a silent pick. Every value must be
    *  either `INHERIT_MODEL` or one of `models`, or the picker would open on its
-   *  `custom…` branch with a prefilled id (pinned in `orchclis.test.ts`). */
+   *  `custom…` branch with a prefilled id (pinned in `orchclis.test.ts`).
+   *
+   *  `Record<OrchRole, …>` on purpose: a new capability class is a compile
+   *  error here rather than a silent hole. `manager` (#1161) has a row for
+   *  exactly that reason and renders NO launcher form field — a manager arrives
+   *  through the repo's workflow file, never the built-in roster, so this value
+   *  is only ever the fallback a declared block inherits when it pins no
+   *  `model:` of its own (mirroring the backend's `default_model(cli,
+   *  Role::Manager)`). */
   defaults: Record<OrchRole, string>;
 }
 
@@ -54,7 +62,7 @@ export const ORCH_CLIS: OrchCli[] = [
     models: ["sonnet", "opus", "haiku", "fable"],
     // Reasoning-heavy roles (orchestrator, planner) default to the strong
     // tier; executing roles (worker, reviewer) to the mid tier.
-    defaults: { orchestrator: "opus", worker: "sonnet", reviewer: "sonnet", planner: "opus" },
+    defaults: { orchestrator: "opus", worker: "sonnet", reviewer: "sonnet", planner: "opus", manager: "opus" },
   },
   {
     // The one row that carries a FULL vendor catalog rather than a shortcut, and
@@ -128,7 +136,7 @@ export const ORCH_CLIS: OrchCli[] = [
       "grok-4.6",
       "mai-code-1.1-flash",
     ],
-    defaults: { orchestrator: "auto", worker: "auto", reviewer: "auto", planner: "auto" },
+    defaults: { orchestrator: "auto", worker: "auto", reviewer: "auto", planner: "auto", manager: "auto" },
   },
   {
     // #722. Model ids here are `provider_id/model_id` — the `/` is part of the
@@ -162,6 +170,7 @@ export const ORCH_CLIS: OrchCli[] = [
       worker: INHERIT_MODEL,
       reviewer: INHERIT_MODEL,
       planner: INHERIT_MODEL,
+      manager: INHERIT_MODEL,
     },
   },
 ];
