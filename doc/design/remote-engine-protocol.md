@@ -454,22 +454,25 @@ This is not a new mechanism, which is the point — it is the third instance of
 one `tests/acl_manifest.rs` already runs three times over. That file pins that
 `generate_handler!` and `APP_COMMANDS` agree
 (`generate_handler_matches_app_commands`), pins the **total**
-(`app_commands_len_is_141`, carrying its per-delta provenance), and pins that
+(`app_commands_len_is_146`, carrying its per-delta provenance), and pins that
 every command is granted to `main`. A remote roster is the same shape of guard
 over the same list, and a reviewer already knows how to read it.
 
 That mechanism is not optional bookkeeping, and this repo's own artifacts are the
-evidence. The plan-408 census counted 134 commands; `APP_COMMANDS` today lists
-**141**. Seven arrived in the interval, and under a hand-maintained allowlist
-that nobody re-derived, every one would have been silently wire-reachable or
-silently broken.
+evidence. The plan-408 census counted 134 commands; `APP_COMMANDS` listed **141**
+when this section was written and lists **146** as of #1042 slice B. Twelve
+arrived across those two intervals, and under a hand-maintained allowlist that
+nobody re-derived, every one would have been silently wire-reachable or silently
+broken. The count is dated rather than restated as a bare "today", because that
+is the whole failure mode this paragraph is about: a number in prose is valid
+only at the commit it was derived on.
 
 Two nearby numbers show what happens to the ones a test does *not* pin. The
 manifest's own per-family comment reads `// orchestration (64)` above **66**
 entries; `architecture.md` described the file as "the ACL manifest's 123
 app-command names" until this slice corrected it. Both went stale quietly, in
 the two places whose whole job is to describe that list — while
-`app_commands_len_is_141`, the number that *is* pinned, stayed correct through
+`app_commands_len_is_146`, the number that *is* pinned, stayed correct through
 every one of those additions. Default-deny plus a failing test is the only
 version of this that survives contact with a year of feature work; a table
 maintained by good intentions is the version that does not.
@@ -541,10 +544,23 @@ are where the 64-vs-66 drift above lives).
 | | 2 | wire | operator | `load/save_ssh_profiles` — **named consequence:** in remote mode an SSH pane is opened *by the engine*, so the hosts it can reach and the identity files it names are the server's, not the client's. The profile store follows the panes. The no-secrets invariant of `sshprofile.ts` is what makes this survivable |
 | **voice** (3) | 3 | **client-local** | — | mic capture and whisper are client hardware; the transcript rides `write_pty` like any other keystrokes |
 
-Totals, and they add up to the manifest exactly: **128 wire**, **8 client-local**
-(`take_startup_notice`, the four `uistate` UI-state commands, the three
-`voice_*`), **4 disabled** (`open_in_editor`, `fm_open`, `fm_open_with`,
-`fm_reveal`), **1 retargeted** (`orch_open_ref`) = 141.
+Totals, **derived at the commit this table was written and not since**: **128
+wire**, **8 client-local** (`take_startup_notice`, the four `uistate` UI-state
+commands, the three `voice_*`), **4 disabled** (`open_in_editor`, `fm_open`,
+`fm_open_with`, `fm_reveal`), **1 retargeted** (`orch_open_ref`) = 141.
+
+> **Five rows are missing, and the totals above are stale by exactly that.**
+> `APP_COMMANDS` is at 146 (see the count above). Four commands arrived after
+> this table was derived and were never classified — `gh_label_vocabulary`,
+> `orch_questions_list`, `orch_question_answer`, `orch_set_full_autonomy` — and
+> #1042 slice B adds a fifth, `admit_root` (class **disabled**; argued in
+> `groupid-and-path-roots.md`'s "the admit tier" and in the command's own doc
+> comment). They are named here rather than quietly folded in because
+> classifying a command is a security decision — two of those four are an
+> autonomy raise and the human-answer surface — and slice B had no mandate to
+> make four of them. **Slice C owns the reconciliation**: it adds all five rows
+> and re-derives the totals in one pass, which is also when C2's roster test
+> starts reading them.
 
 The authoritative per-command list is the generated roster the C2 test pins —
 this table is the *argument* for it, not a second copy to drift. Which is the

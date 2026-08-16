@@ -74,7 +74,7 @@ import {
   EMBED_SIDES,
   type EmbedSide,
 } from "./embedsplit";
-import { embedToggleAction } from "./embedtoggle";
+import { CWD_DECLARING_VIEWS, embedToggleAction, toggleDeclaresCwd } from "./embedtoggle";
 import { startDragSession } from "./dragsession";
 import { showContextMenu, type MenuItem } from "./contextmenu";
 import {
@@ -361,6 +361,14 @@ export interface PaneEvents {
  *  dockable view" cheap to reason about — see doc/design/embedded-panels.md's
  *  "What's embeddable, and what isn't". */
 type EmbedKind = "tasks" | "git" | "issues" | "audit" | "group" | "editor" | "timeline";
+
+/** #1042: compile-time pin that every view `embedtoggle.ts` lets declare the
+ *  pane's cwd really is an `EmbedKind`. That module takes a plain `string` so it
+ *  stays free of the pane, which means a typo'd or renamed kind there would
+ *  silently stop matching and quietly declare nothing — a guard that has become
+ *  a no-op. This line is what makes that a build failure instead. */
+const _CWD_DECLARING_VIEWS_ARE_EMBED_KINDS: readonly EmbedKind[] = CWD_DECLARING_VIEWS;
+void _CWD_DECLARING_VIEWS_ARE_EMBED_KINDS;
 
 const EMBED_KINDS: readonly EmbedKind[] = [
   "tasks",
@@ -2718,7 +2726,7 @@ export class Pane implements VoiceTargetPane {
   }
 
   /** #1042: declare this pane's live cwd as a root, because a HUMAN just asked
-   *  for a view at it.
+   *  to OPEN a view at it.
    *
    *  This is the one place the distinction the whole design rests on becomes
    *  code. The cwd itself arrived on an agent-controllable channel — the pane's
@@ -2729,25 +2737,34 @@ export class Pane implements VoiceTargetPane {
    *  stream. It is the trusted local webview acting on a human gesture, and it
    *  declares.
    *
+   *  **Called only from `toggleView`, and only on the `open` action.** It used
+   *  to be called from each `toggleXView` *before* `toggleView` decided what the
+   *  gesture even was, which meant a CLOSE and a docked NO-OP declared too —
+   *  so dismissing a panel permanently declared whatever directory the agent in
+   *  that pane happened to have `cd`'d to. That is the exact inversion of the
+   *  rule this helper exists to implement (#1092 review). `toggleDeclaresCwd`
+   *  now owns the decision, `toggleView` is the one call site, and both halves —
+   *  which direction, which views — are pinned in `test/embedtoggle.test.ts`.
+   *
    *  Normally there is nothing new to declare: a pane's spawn cwd was declared
    *  by the launcher (or by restore), and the descendant rule already covers
    *  everything the shell `cd`s into below it. This matters exactly when the cwd
    *  has left every declared root — which is the case the gesture is for.
    *
    *  Fire-and-forget, and slice C owes it one look. The declaration is *issued*
-   *  before the view is even constructed, but two Tauri commands in flight are
-   *  not ordered against each other, so once slice C root-scopes the view's own
-   *  reads there is a race here in principle. Bounded rather than ignored: every
-   *  one of these views re-reads on its own (a shell prompt, an external git
-   *  change, a manual ↻), so losing that race costs one empty render, not the
-   *  feature. If slice C wants it airtight, these gestures become `async` and
-   *  await this — a change this helper is shaped to make one line.
+   *  before the view opens, but two Tauri commands in flight are not ordered
+   *  against each other, so once slice C root-scopes the view's own reads there
+   *  is a race here in principle. Bounded rather than ignored: every one of
+   *  these views re-reads on its own (a shell prompt, an external git change, a
+   *  manual ↻), so losing that race costs one empty render, not the feature. If
+   *  slice C wants it airtight, `toggleView` becomes `async` and awaits this —
+   *  a change this helper is shaped to make one line.
    *
    *  Never for an SSH pane: its cwd names a directory on the REMOTE machine, and
    *  declaring that string here would declare whatever happens to sit at the
    *  same path locally. `onCwdReported` already refuses to act on an SSH pane's
    *  report for the same reason; this is the belt on that suspender. */
-  private declareCwdForGesture(): void {
+  private declareCwd(): void {
     if (this.isSshPane) return;
     const cwd = this.cwdRaw;
     if (cwd) void admitRoot(cwd);
@@ -2766,7 +2783,6 @@ export class Pane implements VoiceTargetPane {
       return;
     }
     if (this.refuseOverlay("The git view")) return;
-    this.declareCwdForGesture();
     this.ensureGitView();
     this.toggleView("git");
   }
@@ -2992,7 +3008,6 @@ export class Pane implements VoiceTargetPane {
    *  the PTY; only one overlay is open at a time. */
   toggleIssuesView(): void {
     if (this.refuseOverlay("The issues view")) return;
-    this.declareCwdForGesture();
     this.ensureIssuesView();
     this.toggleView("issues");
   }
@@ -3362,6 +3377,14 @@ export class Pane implements VoiceTargetPane {
       showToast(`${EMBED_TOGGLE_LABEL[kind]} is docked — un-embed it (its side menu) to use this toggle.`, "info");
       return;
     }
+    // #1042: the cwd declaration belongs HERE, after the action is known, for
+    // the same reason the docked no-op does — this is the one function every
+    // entry point routes through, and it is the only place that knows whether
+    // the gesture is an open. Declaring from the `toggleXView` wrappers instead
+    // (as this first shipped) declared on close and on the docked no-op too,
+    // turning a dismissal into a permanent declaration of an agent-chosen
+    // directory (#1092 review).
+    if (toggleDeclaresCwd(kind, action)) this.declareCwd();
     if (action === "close") this.closeView(kind);
     else this.openView(kind);
   }
@@ -3662,7 +3685,6 @@ export class Pane implements VoiceTargetPane {
       return;
     }
     if (this.refuseOverlay("The file editor")) return;
-    this.declareCwdForGesture();
     this.ensureFileEditView();
     this.toggleView("editor");
   }
