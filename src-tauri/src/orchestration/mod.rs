@@ -9064,7 +9064,7 @@ pub struct Task {
     /// DISPLAY METADATA ONLY, the `pr_base` rule applied here: nothing gates on
     /// it, and it is agent-written, so a stale or wrong value misleads a human
     /// rather than opening anything.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub demo_path: Option<String>,
     #[serde(default)]
     pub updated_ms: u64,
