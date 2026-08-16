@@ -2573,10 +2573,22 @@ export class Pane implements VoiceTargetPane {
   /** Flag (or clear) that loomux is currently withholding a prompt delivery
    *  to this pane because it believes the human's own input occupies the
    *  CLI's box (#246) — driven by the backend's paired
-   *  orch-delivery-held / orch-delivery-held-cleared events. Idempotent on
-   *  the reason, same as `setAttention`. `null` clears the badge. Header
-   *  chrome only: this never touches the pane's size, so the no-PTY-resize
-   *  invariant holds trivially. */
+   *  orch-delivery-held / orch-delivery-held-cleared events. `null` clears the
+   *  badge.
+   *
+   *  Idempotent on the REASON ALONE — deliberately unlike `setAttention` above,
+   *  which keys on `(reason, detail)` together. The two differ because their
+   *  details do: an attention detail is free text the scan can change under a
+   *  steady reason, while a held detail is `delivery_held_detail(agent_id,
+   *  reason)` (orchestration/mod.rs), a total function of a fixed `agent_id`
+   *  and a three-variant enum. It therefore cannot move without the reason
+   *  moving, and the cheaper check loses nothing. Copy `setAttention`'s rule
+   *  here only if that stops being true; copy this one to a NEW badge only
+   *  after checking its detail the same way (`setQueueDepth` below is the
+   *  other outcome — it keys on the whole reading).
+   *
+   *  Header chrome only: this never touches the pane's size, so the
+   *  no-PTY-resize invariant holds trivially. */
   setHeld(reason: string | null, detail?: string): void {
     if (reason === this.heldReason) return;
     this.heldReason = reason;
