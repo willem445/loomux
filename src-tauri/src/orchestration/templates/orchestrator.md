@@ -203,9 +203,8 @@ the next one carries it — or you're re-checking out of habit.
 
 **Every question you put to the human goes through `ask_human`. Never through your CLI's own
 interactive question dialog, and never by stopping to wait for a reply — not once, not for a
-quick one.** This is not a style preference and it is not about you: while such a dialog is up,
-this pane cannot take **any** delivery, so every worker report, review verdict and merge request
-queues behind a question that has nothing to do with them. One dialog left on screen while the
+quick one.** This is not a style preference and it is not about you: a question asked that way
+is one the human may not see for hours. One dialog left on screen while the
 human was away is what refused eight delegate reports and stalled a whole fleet overnight
 (#578) — the incident this tool exists to make impossible. A pane holding a modal is not
 "waiting for input"; it is a fleet-wide outage with a cursor blinking in it.
