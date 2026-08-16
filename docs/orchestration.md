@@ -425,6 +425,12 @@ Board controls for nesting:
 - Rows nest visually under their container, indented one step per level, with a **collapse
   chevron** on any row that has subtasks — collapsing hides the whole subtree, not just its
   direct children, so a grandchild is never left stranded above its own container.
+- The **kind** label above shows on the row as a badge, so you can see at a glance which rows
+  are containers and at what level.
+- The **▲/▼ priority arrows now move a task among its siblings**, not through the whole board:
+  the first subtask of a container has nothing above it to swap with, so its ▲ is greyed out
+  even though there are rows higher up the board. Moving a container moves everything inside it
+  along with it, so re-prioritising a feature never scatters its subtasks.
 - A container shows a **done/total** chip counting its *direct* subtasks — the same count you'd
   see if you asked the orchestrator for the board. A container whose entire subtree is done but
   whose own status hasn't caught up gets a nudge badge — it's a prompt for you, never something
