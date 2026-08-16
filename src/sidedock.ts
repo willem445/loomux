@@ -193,7 +193,7 @@ export class SideDock {
     this.workspaceEl.appendChild(this.el);
     // Before the first paint, so a dock restored open is simply open and a dock
     // restored closed never animates itself shut in front of the human.
-    this.applyBoxes();
+    this.applyOpenState();
 
     this.syncTabButtons();
     // Boot with whatever pane is active. A dock restored CLOSED returns from
@@ -216,7 +216,7 @@ export class SideDock {
       return;
     }
     this.prefs.open = true;
-    this.applyBoxes();
+    this.applyOpenState();
     savePrefs(this.prefs);
     // `open` is set FIRST, because every follow path is guarded on it: this is
     // the call that pulls the live cwd for the first time and adopts it. Reading
@@ -229,7 +229,7 @@ export class SideDock {
   close(): void {
     if (!this.prefs.open) return;
     this.prefs.open = false;
-    this.applyBoxes();
+    this.applyOpenState();
     savePrefs(this.prefs);
     // Nothing is disposed. Closing is hiding: it must not destroy the editor's
     // buffer, and it should not throw away a git view's loaded log either. The
@@ -568,26 +568,40 @@ export class SideDock {
   }
 
   /**
-   * Push the dock's geometry into the DOM: the column's width, the fixed width
-   * of the panel it clips, and the closed state.
+   * Push the dock's two widths into the DOM: the column's, and the fixed width
+   * of the panel the column clips.
    *
-   * ONE place, called from construction, `show`, `close` and the drag, because
-   * the column and its contents have to move together — `dockBoxes` returns
-   * both for that reason.
+   * ONE place, and both from ONE `dockBoxes` call, because the column and its
+   * contents have to agree about what "the dock's width" is.
    *
-   * **A closed dock is `inert`, not `hidden`.** It used to be `el.hidden`, which
-   * is `display: none` — nothing to tab into, nothing for a screen reader. A
-   * zero-width column with `overflow: hidden` is only VISUALLY empty: without
-   * this, the closed dock's buttons and its editor's textarea would still be in
-   * the tab order and still be announced, which is a regression the human would
-   * hit long before they worked out why. Applied immediately rather than on
-   * `transitionend`: a panel that is on its way out should stop taking input at
-   * the moment it is dismissed, and nothing has to be scheduled or cleaned up.
+   * Two style writes and nothing else, because the drag calls this on every
+   * mousemove: the open/closed half below is the part that must not be on a
+   * per-frame path.
    */
   private applyBoxes(): void {
     const boxes = dockBoxes(this.prefs.open, this.prefs.width);
     this.el.style.width = `${boxes.columnPx}px`;
     this.innerEl.style.width = `${boxes.contentPx}px`;
+  }
+
+  /**
+   * Everything that changes when the dock OPENS or CLOSES — the widths above,
+   * the collapse class, and the accessibility half. Called from construction,
+   * `show` and `close`, and deliberately NOT from the drag: `open` cannot change
+   * during one, and re-writing `aria-hidden` sixty times a second is churn on
+   * the one gesture this change already made more expensive.
+   *
+   * **A closed dock is `inert`, not `hidden`.** It used to be `el.hidden`, which
+   * is `display: none` — nothing to tab into, nothing for a screen reader. A
+   * zero-width column with `overflow: hidden` is only VISUALLY empty: without
+   * this, the closed dock's buttons and its editor's buffer would still be in
+   * the tab order and still be announced, which is a regression the human would
+   * hit long before they worked out why. Applied immediately rather than on
+   * `transitionend`: a panel that is on its way out should stop taking input at
+   * the moment it is dismissed, and nothing has to be scheduled or cleaned up.
+   */
+  private applyOpenState(): void {
+    this.applyBoxes();
     this.el.classList.toggle("collapsed", !this.prefs.open);
     this.el.inert = !this.prefs.open;
     this.el.setAttribute("aria-hidden", String(!this.prefs.open));

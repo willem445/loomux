@@ -106,7 +106,7 @@ perfectly well and break the feature silently.
 **A closed column is only *visually* empty, so it is `inert`.** `display: none`
 took the dock out of the tab order and out of a screen reader's traversal for
 free. A zero-width column with `overflow: hidden` does not: without the `inert`
-+ `aria-hidden` that `applyBoxes` sets, a closed dock's tab buttons and its
++ `aria-hidden` that `applyOpenState` sets, a closed dock's tab buttons and its
 editor's buffer would still be focusable and still announced. Applied at the
 moment of the toggle rather than on `transitionend` — a dismissed panel should
 stop taking input immediately, and there is nothing to schedule or clean up.
