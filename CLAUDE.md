@@ -70,6 +70,19 @@ compiles.
    floating over the terminal. Resizing ConPTY triggers full repaints that
    pollute scrollback. Visual padding belongs on the `.xterm` element, not on
    the layout.
+   **Two panels are in the layout, and both are deliberate**: `#sessions` and
+   `.sidedock` (#1150, at the human's direction) are flex siblings of
+   `#grid-area`, so opening either autosizes the open panes. What makes them
+   permissible is not that they are old or asked-for: it is that each width
+   change is a DISCRETE human click whose purpose is to change how much room
+   the terminals get, and that `src/resizeburst.ts` collapses the whole
+   animated burst into one fit per pane at the settled geometry. A PASSIVE or
+   continuous trigger (a focus change, a follow, a timer, an attention flip)
+   may still never reach a PTY resize — the side dock's own pane-following
+   costs zero, and that is the line, not the panel count. Adding a third
+   in-flow panel, or animating one of these two for longer than
+   `FIT_MAX_WAIT_MS` minus a window, needs the argument in
+   `doc/design/side-dock.md` and `doc/design/xterm-resize-reflow.md` first.
 2. **No getrandom-based crates in `src-tauri`** (uuid v4, rand, tempfile with
    default features). They import `bcryptprimitives.dll!ProcessPrng`, which
    this project's Windows 10 baseline doesn't export — the binary then fails

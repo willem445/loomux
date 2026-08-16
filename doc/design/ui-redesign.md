@@ -663,6 +663,15 @@ per-frame layout work is unchanged, and one resize per pane is the floor a displ
 can reach. That is the PTY-resize cost constraint 1 exists to prevent, and the recommendation
 below is unaffected — a rail that toggles would still repeat the mistake at higher frequency.
 
+**What #1150 changed about that argument, and what it did not.** The app now has a *second*
+displacing panel: the side dock moved from an overlay into the flex row at the human's
+direction, so opening it autosizes the open panes (doc/design/side-dock.md). That settles the
+question of whether a displacing panel is permissible — it is, once #1149 made the price one
+coalesced resize per pane per toggle instead of fifteen — but it does not weaken the
+recommendation below, and the reason is the word *toggles*. A dock toggle is a click whose
+whole purpose is to change how much room the terminals get. A rail's width changing is chrome
+moving for its own reasons, and the cost scales with how often that happens.
+
 **Recommendation.** A rail, yes — but a **persistent, fixed-width** one that is part of the
 app frame and never animates its width, so the geometry cost is paid once at startup like any
 other version change. It should *replace* work the tab bar is doing rather than add a second

@@ -75,22 +75,26 @@ there when you reopen it. Quitting orrerix with unsaved edits in the dock's
 editor asks first, the same as everywhere else — the confirm lists it as
 `side dock editor`, with the folder it belongs to.
 
-## It covers panes; it does not shrink them
+## Opening it makes room: your panes resize to share the row
 
-The dock floats *over* the right-hand side of your grid rather than squeezing
-it. That is on purpose: making room for it would mean resizing the terminals
-underneath, and resizing a terminal makes full-screen CLI tools repaint and
-dump duplicate frames into your scrollback. Nothing about opening, closing or
-resizing the dock touches a running program.
+The dock takes its own column down the right-hand side, so opening it shrinks
+your panes to fit beside it and closing it gives the space straight back —
+the same thing the [session browser](session-browser.html) does on the left.
+Nothing is hidden behind it.
 
-The trade is that an open dock hides part of whatever is behind it. It starts
-closed, it is one click away either direction, and it always leaves a strip of
-grid uncovered no matter how wide you drag it.
+That does mean the terminals in view are resized when you open or close the
+dock, which full-screen tools notice: expect the same one-off repaint you get
+from the session browser, once per pane per click, not a continuous cost.
+Moving between panes with the dock already open costs nothing at all — the
+dock re-points itself inside a column that has not moved.
+
+It starts closed, so a fresh window is all terminal until you ask for the dock.
 
 **Resizing:** drag the dock's left edge. The width, whether it was open, and
 which tab you were on are all remembered for next time. However wide you drag
-it — and whatever width it was remembered at — it is capped so a strip of grid
-always stays visible, including after you shrink the window.
+it — and whatever width it was remembered at — the grid keeps a usable strip,
+including after you shrink the window or open the session browser as well: on a
+narrow window it is the dock that gives up width, never the terminals.
 
 ## Relationship to the per-pane panels
 

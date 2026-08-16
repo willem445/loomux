@@ -213,7 +213,8 @@ than quietly costing an extra resize.
 Being in the debounce is the point. A bracket covers the gestures somebody
 remembered to bracket; this covers every consumer of the path -- the
 transition, equalize, autosize, a native split, the window's own resize, and
-the side-dock autosize (#1150) that has not been written yet.
+the side-dock autosize (#1150), which was written afterwards and inherited it
+without adding a line to the resize path.
 
 ### Where it schedules MORE, and why that is the trade
 
@@ -256,10 +257,18 @@ refactor, so it is recorded here rather than taken quietly.
 What it does not change: the intermediate widths still happen. The panel
 still animates, the terminals are simply not re-fitted at each step, so they
 reflow once when it settles. The alternative -- making `#sessions` an overlay
-that occludes rather than displaces, the way `.sidedock` is built -- would
-remove the resize entirely, but it is a different product decision (it
-changes what opening the browser *does* to the grid) and it would fix only
-`#sessions`.
+that occludes rather than displaces -- would remove the resize entirely, but
+it is a different product decision (it changes what opening the browser
+*does* to the grid) and it would fix only `#sessions`.
+
+The app has now gone the OTHER way on that same decision, which is worth
+recording here because this note is where the cost lives. `.sidedock` was
+built as exactly that overlay, and #1150 moved it into the flex row at the
+human's direction: opening the dock autosizes the open panes rather than
+covering them, at one coalesced resize per pane per toggle. It is a second
+consumer of this policy that pays what `#sessions` pays, and it pays it
+because the coalescer made the price a discrete event instead of a per-frame
+storm. See doc/design/side-dock.md for the argument.
 
 ## Changelog watch (tracked in #432)
 

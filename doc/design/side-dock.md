@@ -1,8 +1,8 @@
 # The right-side dock: git, files and editor, following the active pane (#1020 item 6)
 
-Status: implemented on `integration/ui-redesign`. Issues: #1020 item 6 (the ask
-this builds), #934 (the original ORCA-sidebar direction), #1018 (the integration
-PR the human demos).
+Status: implemented (main). Issues: #1020 item 6 (the ask this builds), #934
+(the original ORCA-sidebar direction), #1018 (the PR it landed in), #1150 (the
+beta1 feedback that made it displace the grid rather than cover it).
 
 The ask, from the human's live demo of #1018: *"right sidebar hosting the
 built-in git / file-explorer / file-editor, optionally open, auto-loaded to the
@@ -12,42 +12,118 @@ panel — plus one requirement worth quoting because it shapes the whole design:
 *"the sidebar auto-updates to the directory of whichever pane is currently
 highlighted/focused."*
 
-## The one structural decision, and why it is not negotiable
+## The one structural decision, and it was reversed on purpose (#1150)
 
-**The dock is an overlay. It is `position: absolute` inside `#workspace`, and it
-occludes panes rather than displacing them.**
+**The dock is a flex sibling of `#grid-area`. Opening it shrinks the grid and
+the open panes autosize to share the row; closing it gives the column back.**
 
-The obvious implementation is the one the app already has an example of, and
-that example is a warning rather than a precedent. `#sessions` — the left
-session browser — is an in-flow flex sibling of `#grid-area` at `width: 344px`
-with a `0.24s` width **transition**. Opening it therefore shrinks the grid,
-which refits every terminal in it and resizes every ConPTY behind them. That
-used to happen *on every frame of the animation*; #1149 coalesced the fit burst
-(`src/resizeburst.ts`) so it now happens **once per pane per toggle**, at the
-settled geometry. The reduction does not change this decision, it sharpens it:
-one resize per pane is the *floor* for a panel that displaces the grid, the
-per-frame layout work is still paid for the whole animation, and an out-of-flow
-panel pays zero of either. That is the continuous, chrome-driven PTY resizing
-CLAUDE.md constraint 1 exists to refuse, and `doc/design/ui-redesign.md` §X10
-names it explicitly as the mistake a right-hand rail must not repeat.
+It shipped as the exact opposite — `position: absolute` inside `#workspace`,
+out of flow, occluding panes precisely so that no code path here could reach a
+terminal — and the reversal is the whole of #1150. It is worth writing down both
+halves, because the first one was right when it was written and the second one
+is right now, and the difference between them is not a change of mind.
 
-So the dock is out of flow. An absolutely-positioned child of a flex container
-is **not a flex item**, so it cannot move `#grid-area` by a pixel: no pane's
-`ResizeObserver` fires, no `applyFit()` runs, no ConPTY is resized. The
-constraint holds *by construction* rather than by care — there is no code path
-that could regress it, because there is no code path that touches the grid at
-all. The only stylesheet change to the existing layout is `position: relative`
-on `#workspace`, which establishes a containing block and moves nothing.
+### What the overlay bought, and why it stopped being worth it
 
-**The cost is real and is stated rather than hidden: an open dock covers the
-right-hand panes.** Three things pay for it:
+The overlay's argument was a cost argument. `#sessions` — the left session
+browser, an in-flow flex sibling at `width: 344px` with a `0.24s` width
+transition — shrinks the grid when it opens, which refits every terminal and
+resizes every ConPTY behind them, and that used to happen **on every frame of
+the animation**: ~15 xterm reflows plus 15 `ResizePseudoConsole` calls per pane
+per toggle, ~90 with six panes open. Against that, an out-of-flow panel paying
+*zero* was not a close call.
 
-- it defaults **closed**, so nothing is covered before anyone asks;
-- it toggles in one click from the top bar, so reclaiming the space is cheap;
-- it may never cover the whole workspace — `DOCK_TERM_RESERVE_PX` (240px) is
-  reserved out of every width clamp, the same idea as `overlaysize.ts`'s
-  `TERM_RESERVE_H` on the other axis, and for the same reason: an overlay that
-  can cover its own host entirely is a way to lose the app.
+Two things changed.
+
+**#1149 removed the multiplier.** The coalescing now lives in the fit debounce
+itself (`src/resizeburst.ts`), so a whole animated burst collapses into **one**
+fit per pane at the settled geometry. The displacing panel's cost went from
+~15 per pane per toggle to 1. That is not a rounding difference; it is the
+difference between a per-frame storm and a discrete event.
+
+**The human used it and asked for the other trade** (#1150, beta1 feedback:
+*"the side dock's button should autosize the OPEN panes the way the Sessions UI
+does, not the current hover behavior"*). The overlay's stated cost — "an open
+dock covers the right-hand panes" — was mitigated by defaulting closed and by
+being one click from open. Neither mitigation helps the person who wants it
+**open**, which is the person who asked: for them the dock was permanently
+covering the panes they were watching, and "you can close it" is not an answer
+to "I want to see both".
+
+### Why this does not break the constraint it looks like it breaks
+
+CLAUDE.md constraint 1 says a UI feature must not resize the PTY, and the thing
+it exists to prevent is *continuous, chrome-driven* resizing — the repaint tax
+`doc/design/xterm-resize-reflow.md` documents, where a ConPTY resize makes the
+Win10 inbox conhost repaint the screen and TUIs duplicate frames into scrollback.
+The repo already distinguishes that from a **discrete, user-initiated** geometry
+change: `doc/design/embedded-panels.md` builds dividers that resize the PTY
+deliberately, on the argument that docking a panel *inside* a pane is a gesture
+the human made, not a tax the chrome levies.
+
+The dock's two triggers fall on opposite sides of exactly that line, and only
+one of them moved:
+
+- **Opening or closing the dock** is a click. One coalesced resize per open
+  pane, at the settled geometry, on a gesture whose entire purpose is to change
+  how much room the terminals get. That is the discrete category, and it is now
+  what happens.
+- **Following the active pane** — the frequent, passive trigger, firing on every
+  focus change, every Alt+arrow step, every project-tab switch — still resizes
+  **nothing at all**. It re-points a panel inside a column whose width did not
+  move. This was the trigger the original note called out as "passive, frequent,
+  and exactly the trigger the constraint targets", and it remains free.
+
+So the rule is unchanged and the dock's membership in it changed. What is *not*
+licensed by this: the overlay-class features stay overlays (the per-pane git
+view, the task board, the audit viewer, badges, the compose strip), and nothing
+here permits a *passive* signal to resize a terminal.
+
+### The residual costs, stated rather than hidden
+
+- **One xterm reflow + one ConPTY resize per open pane per toggle.** The floor
+  for anything that displaces the grid. `test/resizeburst.test.ts` measures it
+  as exactly one, through the same simulator #1149 used for `#sessions`.
+- **The per-frame *layout* work of the 240 ms animation**, which #1149 did not
+  remove and this does not either. The panel's own contents are lifted out of
+  it (below), so what re-lays-out each frame is the grid, not a git graph.
+- **The grip drag now has terminals on the other side of it** (below).
+- **A narrow window with both side panels open squeezes the dock**, deliberately,
+  rather than squeezing the grid (below).
+
+### The mechanism, and the two things that are easy to get wrong
+
+**Closed is a zero-width column, not `display: none`.** `el.hidden` is what the
+overlay used, and it is the obvious way to hide a panel — but `display: none`
+gives the column back in one jump, with no transition. No transition means no
+burst, which means nothing for the coalescer to coalesce and no autosize for the
+human to watch; it also means the panes snap, which is the "feel" half of what
+#1150 asked for. `dockBoxes` (`sidedockmodel.ts`) returns `columnPx: 0` for a
+closed dock, and `test/sidedockmodel.test.ts` pins both that and the absence of
+`this.el.hidden =` in the DOM half, because `display: none` would hide the dock
+perfectly well and break the feature silently.
+
+**A closed column is only *visually* empty, so it is `inert`.** `display: none`
+took the dock out of the tab order and out of a screen reader's traversal for
+free. A zero-width column with `overflow: hidden` does not: without the `inert`
++ `aria-hidden` that `applyBoxes` sets, a closed dock's tab buttons and its
+editor's buffer would still be focusable and still announced. Applied at the
+moment of the toggle rather than on `transitionend` — a dismissed panel should
+stop taking input immediately, and there is nothing to schedule or clean up.
+
+**The contents do not animate; only the column does.** `.sidedock-inner` is
+absolutely positioned at a fixed width (`contentPx`, set from the same
+`dockBoxes` call as the column's own width, so the two cannot disagree) and the
+column clips it. Otherwise every frame of the slide would re-lay-out a git graph
+or a file tree at an intermediate width — cheap for the terminals, expensive for
+the panel. `.sessions-inner` is the same device for the same reason; anchored
+right instead of left, so the collapse wipes from the grid side.
+
+The residual: when the row is squeezed (below) the column is narrower than the
+panel it clips, so the panel is cropped rather than re-laid-out at the smaller
+width. That is the deliberate direction of this trade — the human's own dragged
+width is what the contents are laid out for — and it is bounded by the grid's
+floor.
 
 ### Why not the per-pane embed engine, which already docks things to a right edge
 
@@ -291,31 +367,43 @@ next boot after a stray hand-edit or a version that wrote one extra field.
 no further** — `decodeDockPrefs` has no live window width, so it cannot apply
 the workspace reserve, and it does not pretend to.
 
-### Where the reserve is actually enforced, and why it moved
+### Where the reserve is actually enforced, and why it is now in two places
 
-`.sidedock { max-width: max(280px, calc(100% - 240px)) }`, in the stylesheet.
+`DOCK_TERM_RESERVE_PX` (240px) changed meaning without changing value when the
+dock started displacing: it used to be how much of the grid an open dock could
+never *cover*, and it is now how much of the row the grid never *gives up*. Same
+promise either way — a panel that can consume its own host entirely is a way to
+lose the app, the same reason `overlaysize.ts` reserves `TERM_RESERVE_H` on the
+other axis.
 
-The first revision applied the reserve **only on the drag path**
+**`.sidedock { max-width: max(280px, calc(100% - 240px)) }`** bounds what the
+dock *asks for*. The first revision applied the reserve **only on the drag path**
 (`clampDockWidth(…, workspaceEl.clientWidth)`), which left three ways to get a
-dock that covers the entire grid: boot, a restore from persistence, and any
-window resize after the drag. Drag to 900px on a wide monitor, then shrink the
-window toward the app's own 640px `minWidth`, and the dock is still 900px over a
-~640px workspace — every pane occluded, with 0 of the promised 240px delivered
-(#1097 rev-767 B2).
+dock that took the entire grid: boot, a restore from persistence, and any window
+resize after the drag. Drag to 900px on a wide monitor, then shrink the window
+toward the app's own 640px `minWidth`, and the dock is still 900px over a ~640px
+workspace, with 0 of the promised 240px delivered (#1097 rev-767 B2). CSS closes
+all three at once, with no listener to forget. `max()` preserves the documented
+narrow-window degradation: below the reserve the minimum wins, exactly as
+`clampDockWidth` already decided.
 
-CSS closes all three at once, with no listener to forget and nothing that could
-reach a PTY — which matters more here than saving code, because a JS re-clamp
-would mean a `resize` handler running next to the one subsystem this whole note
-exists to keep away from the grid. `max()` preserves the documented narrow-window
-degradation: below the reserve the minimum wins, exactly as `clampDockWidth`
-already decided.
+**`#grid-area { min-width: 240px }`** is the floor the grid *keeps*, and it
+exists because the max-width above is measured against the whole workspace and
+**cannot see `#sessions`**, which takes 344px of the same row. That was harmless
+while the dock only covered the grid; once it displaces, the two panels compete
+for one row. On a 640px window with both open they want 764px, and a grid at
+`min-width: 0` would hand over every pixel it had and render nothing while both
+panels kept their full width. So the floor goes on the thing being protected,
+and `.sidedock`'s `flex: 0 1 auto` is its other half: the dock is the row's only
+shrinkable item, so a squeezed row costs the dock its width rather than costing
+the grid its existence.
 
 `clampDockWidth` keeps the reserve too, so the number that gets *persisted* is
-sane rather than merely rendered sane. That makes the two constants a mirror, so
-`test/sidedockmodel.test.ts` reads the rule off disk and fails if the
-stylesheet's copies of `DOCK_MIN_W` and `DOCK_TERM_RESERVE_PX` ever drift — the
-same both-ways pinning `theme.test.ts` applies to the palette, and the reason
-duplicating two numbers is safe here.
+sane rather than merely rendered sane. `test/sidedockmodel.test.ts` reads **both**
+stylesheet rules off disk and fails if either copy of `DOCK_MIN_W` or
+`DOCK_TERM_RESERVE_PX` drifts from the module — the same both-ways pinning
+`theme.test.ts` applies to the palette, and the reason duplicating the numbers is
+safe here.
 
 ## Colour, and the two channels on one row
 
@@ -342,16 +430,38 @@ fall on a live WebGL terminal canvas — the documented way to make this app slo
 (`doc/design/performance.md`) and what maintainability rule 5 refuses. The dock
 separates the way principle 1 says surfaces should: elevation plus a hairline.
 
-## The resize grip
+## The resize grip, which is a real divider now
 
-The dock is width-draggable, persisted on release only. This is cheap in a way
-an embed slot's divider is not: there is no terminal on the other side of the
-drag, so the gesture moves nothing but the dock's own box and touches no PTY at
-all. The drag goes through `startDragSession` (so it cannot strand state on an
-Alt-Tab-away mid-drag) and applies the same `.resizing` →
-`content-visibility: hidden` treatment to the hosted views' heavy lists that the
-embed slots and floating overlays already use — same mechanism, same class name,
-extended to three more list classes.
+The dock is width-draggable, persisted on release only. This used to be the
+cheapest drag in the app — there was no terminal on the other side of it, so the
+gesture moved nothing but the dock's own box. #1150 put the grid on the other
+side of it, which makes it a divider like any other, and it is treated like one:
+
+**The drag is bracketed with `beginResizeHold` / `endResizeHold` (#432)**, the
+mechanism `grid.ts` already uses for a split divider, reached through a
+`holdPaneResizes()` callback on `SideDockHost` because app-level chrome has no
+business knowing which panes exist. xterm keeps re-fitting on every tick so the
+terminals track the drag; the `ResizePseudoConsole` call is withheld until
+release. This is not a second coalescer — it is the one that was already there,
+for the gesture shape it was built for.
+
+The distinction from the toggle is the point, and `test/resizeburst.test.ts`
+measures both. A **transition** has no end to hook but it *settles*, so
+`resizeburst.ts`'s window resolves it: one fit per pane, at the settled size, no
+bracketing required. A **drag** never settles for as long as the human holds the
+mouse, so the coalescer correctly falls back to its ceiling and fits every
+`FIT_MAX_WAIT_MS` (400 ms) — deliberately, because a terminal frozen at its
+pre-drag size for the whole gesture is the failure that ceiling exists to
+prevent. A drag *does* have an end to hook, so it gets the bracket, and a 2 s
+drag costs one ConPTY resize per pane instead of five.
+
+Two smaller pieces: the drag goes through `startDragSession` (so the hold cannot
+strand on an Alt-Tab-away mid-drag — `onEnd` fires exactly once, from mouseup,
+blur or Escape), and `.sidedock.resizing` turns the width transition **off**,
+because the toggle's 240 ms ease on a mousemove-driven width would both trail the
+pointer and keep the geometry moving after the human stopped. The same
+`.resizing` class keeps its `content-visibility: hidden` treatment for the hosted
+views' heavy lists, shared with the embed slots and floating overlays.
 
 ## Deliberately out of scope
 

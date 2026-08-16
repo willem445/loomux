@@ -299,13 +299,16 @@ test("sidedock.ts hides the dock by COLLAPSING it, never with `hidden` (#1150)",
  *  An EMPTY slice is not the hazard; that case is loud, because `assert.match`
  *  and `assert.ok(...includes...)` both throw on `""` (checked, not assumed).
  *  The hazard is a non-empty WRONG slice, and the specific way it goes wrong
- *  here is nasty: a comment that explains the overlay invariant naturally names
- *  both the rule and the property, so the slice contains the exact text the
- *  assertion greps for. Reproduced — with a comment reading
- *  `.sidedock { } is position: absolute so it never becomes a flex item`
- *  inserted above a `.sidedock` rule changed to `position: relative`, the old
- *  extraction PASSED while the invariant it exists to defend was broken. This
- *  version reddens on the same input, because it reads the rule. */
+ *  here is nasty: everything between the rule and the next name is swallowed,
+ *  including OTHER rules whose declarations answer the assertion's question
+ *  differently. Measured on today's stylesheet rather than argued: the naive
+ *  `slice(indexOf(".sidedock {"), indexOf(".sidedock-grip"))` is 2023 chars and
+ *  matches `position: absolute` — not from `.sidedock`, which is in flow, but
+ *  from `.sidedock-inner`, which is legitimately absolute inside it. The
+ *  in-flow assertion below would fail on a perfectly correct stylesheet; with
+ *  the polarity the old overlay test had, the same slice would have PASSED on a
+ *  broken one. Anchoring to a line-start selector and stopping at the rule's
+ *  own brace is what makes both directions read the rule itself. */
 function cssRule(selector: string): string {
   const css = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
   const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
