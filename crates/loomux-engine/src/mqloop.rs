@@ -1377,6 +1377,11 @@ pub fn enqueue(
     let observed = PrObservation {
         body_digest: Some(body_digest(&facts.body)),
         ci_green: pr_ci_green(r, pr),
+        // #1174, read unconditionally for the same reason `ci_green` is here:
+        // enqueue happens once per PR, so the round-trip is not worth a branch
+        // that could get the condition wrong.
+        base_green: crate::mqdriver::base_ci_green(r, &target),
+        changed_lines: facts.changed_lines,
     };
     let recheck = recheck_gate(gate, verdicts, Some(facts.head.as_str()), &observed);
     if let Some(code) = recheck.refusal_code() {
@@ -2241,6 +2246,8 @@ fn refresh_and_select(
 
     let mut selected: Vec<u64> = Vec::new();
     let mut examined = 0usize;
+    // Memoized for this pass — see the `base_green` comment below.
+    let mut base_green_pass: Option<Option<bool>> = None;
     for pr in &window {
         if selected.len() >= cfg.max_batch as usize {
             break;
@@ -2291,8 +2298,21 @@ fn refresh_and_select(
                 } else {
                     None
                 };
-                let observed =
-                    PrObservation { body_digest: Some(body_digest(&facts.body)), ci_green };
+                // #1174. Same declares-first discipline as `ci_green` above,
+                // and the same target for every entry in this pass — the queue
+                // has ONE target, so this is one question, asked once.
+                let base_green = if crate::mqdriver::declares_base_green(gate) {
+                    *base_green_pass
+                        .get_or_insert_with(|| crate::mqdriver::base_ci_green(r, &target))
+                } else {
+                    None
+                };
+                let observed = PrObservation {
+                    body_digest: Some(body_digest(&facts.body)),
+                    ci_green,
+                    base_green,
+                    changed_lines: facts.changed_lines,
+                };
                 let recheck =
                     recheck_gate(gate, &verdicts(*pr), Some(facts.head.as_str()), &observed);
                 if recheck.passed() {
