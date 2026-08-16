@@ -20,8 +20,18 @@
 //!
 //! # Why this is not `humanq`, and not `AttentionItem`
 //!
+//! *A note on how [`super::humanq`]'s answer-source type is referred to below.*
+//! It is named indirectly, never spelled, throughout this file — on purpose.
+//! `the_mcp_surface_has_no_path_to_the_answer_entry_point` asserts that exactly
+//! two source files under `src/` contain that identifier at all, so that a new
+//! file naming it is a new answering surface and has to be argued for. Spelling
+//! it here in prose would cost that guard an allowlist row it cannot verify —
+//! "prose only" is not something a text scan can check, and the row would still
+//! be sitting there on the day the prose became code. A doc link is not worth
+//! weakening a security guard, so this file describes the type instead.
+//!
 //! **Not `humanq`.** `questions.json` is a shipped public contract with a
-//! purpose-built trust boundary (a closed `AnswerSource`, two boundary tests),
+//! purpose-built trust boundary (a closed answer-source enum, two boundary tests),
 //! and *answering* a question — which releases the work that was waiting on it —
 //! is a different power from *resolving* an item, which acknowledges that a
 //! human has looked. Folding the two stores together would widen the one surface
@@ -42,7 +52,7 @@
 //!    the entry point (`orch_needs_you_resolve` hard-codes
 //!    [`ResolveSource::Webview`]), never a caller-supplied string, so "resolve as
 //!    the human" has no spelling. Same shape and same reason as
-//!    [`humanq::AnswerSource`](super::humanq::AnswerSource).
+//!    [`super::humanq`]'s own answer-source enum.
 //! 2. **The raiser withdraws it** — an item overtaken by events should not need
 //!    a human click. Settles as `withdrawn:<agent>`, which is visibly not a
 //!    human's acknowledgement.
@@ -256,7 +266,7 @@ impl Item {
 /// **Which trusted surface a resolve came from — a closed set, never a
 /// caller-supplied string.**
 ///
-/// [`humanq::AnswerSource`](super::humanq::AnswerSource)'s shape, for the same
+/// [`super::humanq`]'s answer-source enum's shape, for the same
 /// reason: each variant is an entry point loomux itself controls, there is no
 /// variant for an agent, and adding one would defeat the feature rather than
 /// extend it. The board's auto-resolve and an agent's withdraw are deliberately
@@ -272,7 +282,7 @@ pub enum ResolveSource {
 
 impl ResolveSource {
     /// The stable string recorded on the item and in the audit log. `String`
-    /// rather than `&'static str` for [`humanq::AnswerSource::tag`](super::humanq::AnswerSource::tag)'s
+    /// rather than `&'static str` for the question registry's equivalent tag's
     /// reason: a future surface carries an identity, and a signature that has to
     /// widen later is a signature every call site re-touches.
     pub fn tag(&self) -> String {
