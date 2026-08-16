@@ -1902,7 +1902,8 @@ pane's unknown-key bag. A workflow that declared `allow:` therefore rendered,
 in the GUI, exactly like a workflow that didn't. Nothing was wrong with the
 engine and nothing was wrong with the pane; the two simply had no shared
 statement of what a workflow file is, so they could not disagree out loud.
-`intake:`, `merge_queue:` and `resources:` each arrived the same way later.
+`intake:`, `merge_queue:`, `resources:` and `board:` each arrived the same way
+later.
 
 **The manifest is the schema rather than a description of it, in the specific
 sense that tests hold each side to it — and it is worth being exact about which
@@ -1947,6 +1948,19 @@ as match arms in `parse_workflow` and which is therefore hand-listed in
 capability data the backend answers per CLI and model (`agent_cli_knobs`).
 Full engine parity for a live buffer remains `workflow_check`'s job, not the
 manifest's.
+
+**A field the pane cannot edit is still a field the pane must not lose
+(#1175).** `board:` joined the manifest with no form: every one of its fields is
+listed as not-yet-editable in `test/workflowschema.test.ts`, which is the
+explicit half of the "editable or listed" rule rather than an omission. What it
+does NOT get to skip is the round-trip — the parser must read it into
+`WorkflowBoard` rather than into `extra`, and the canonical serializer must emit
+it — both pinned by the same two tests every other field passes. That split is
+the point of separating the manifest from the forms: a section can arrive in the
+engine and be safe to open, edit and save in the pane, one release before it has
+a control. `FindingSection` is deliberately *not* widened to `board` in the
+meantime, because that key routes a finding onto the form that can fix it, and a
+click that lands nowhere is worse than a finding that only names its field.
 
 **A field the pane can EDIT is a field the pane needs a rule for (#1020).**
 When the inspector grew forms for `intake:`, `merge_queue:` and `resources:`,
