@@ -1566,6 +1566,52 @@ type SectionKey = (typeof SECTION_ORDER)[number];
 
 const TOP_SECTION_KEYS: ReadonlySet<string> = new Set<string>(SECTION_ORDER);
 
+/** Does this `key: …` line already carry a value on it — `resources: {}`, `blocks: []`, a
+ *  hand-written one-line flow mapping — as opposed to being the bare block header (`resources:`)
+ *  that block-indented children are allowed to follow? Quote- and flow-aware, because it asks
+ *  `splitKey`, the real reader's own splitter, rather than looking for a colon. A line this scan
+ *  can't read as a key at all counts as carrying a value: the safe answer is the one that makes
+ *  the caller REPLACE it rather than write children under something it doesn't understand. */
+function keyLineHasInlineValue(line: string): boolean {
+  const split = splitKey(stripComment(line).trim());
+  return !split || split.rest !== "";
+}
+
+/** The header lines to write for a section whose BODY is being regenerated: the original's own
+ *  leading trivia (the comment that introduces the SECTION — see `pushSection`), then a `key:`
+ *  line that AGREES with the body about to follow it.
+ *
+ *  Reusing the original key line verbatim is only safe when the two forms already agree. A key
+ *  line carrying an inline value cannot take block children: splicing a regenerated body under
+ *  the empty-mapping form this file's own emitter writes (`emitMappingSection`) produced
+ *
+ *      resources: {}
+ *        catfish: {}
+ *
+ *  which is not YAML at all — so the pane disabled the form over text it had just written itself
+ *  (#1090). The inverse is as bad and silent: a section emptied back down to `key: {}` kept its
+ *  bare `resources:` header, and a bare key is YAML *null*, i.e. "never declared" — deleting a
+ *  section the human deliberately left empty, which is the whole reason `emitMappingSection`
+ *  writes `{}` in the first place (rev-5 F4).
+ *
+ *  So the original key line is reused only when BOTH it and the regenerated one are bare block
+ *  headers; otherwise the canonical line wins, and the original's own trailing comment rides
+ *  along with it (that comment is about the section, not about the spelling that had to change).
+ *  "Both carry an inline value" is NOT a reason to reuse: an inline value is the section's whole
+ *  content, so keeping `resources: { build: { slots: 2 } }` over a regenerated `resources: {}`
+ *  would silently undo the deletion that emptied it. */
+function sectionHeaderLines(entry: TopEntry, keyLine: string): string[] {
+  const trivia = entry.header.slice(0, -1);
+  const original = entry.header[entry.header.length - 1]!;
+  if (!keyLineHasInlineValue(original) && !keyLineHasInlineValue(keyLine)) {
+    return [...trivia, original];
+  }
+  // Everything the comment-stripper left behind, trailing whitespace included, so `resources: {}
+  // # pools` re-emits as `resources: # pools` and not as `resources:# pools`.
+  const comment = original.slice(stripComment(original).trimEnd().length);
+  return [...trivia, keyLine + comment];
+}
+
 /** Render the workflow the way a form or canvas edit should: reusing the ORIGINAL text's own
  *  lines — comments, blank-line runs, key order, quoting style, all of it — for every top-level
  *  piece the edit didn't touch, and falling back to the canonical emitters only for the piece
@@ -1637,7 +1683,7 @@ export function serializeWorkflowPreserving(w: Workflow, originalText: string): 
       // section, not about any one block, so it survives the roster being emptied out too —
       // only the LAST line of the header (the `blocks:`/`blocks: […]` key line itself) is
       // replaced with the canonical empty form.
-      if (blocksEntry) out.push(...blocksEntry.header.slice(0, -1), "blocks: []");
+      if (blocksEntry) out.push(...sectionHeaderLines(blocksEntry, "blocks: []"));
       else out.push("", "blocks: []");
       return;
     }
@@ -1650,9 +1696,11 @@ export function serializeWorkflowPreserving(w: Workflow, originalText: string): 
         if (b.id && !origById.has(b.id)) origById.set(b.id, { block: b, raw: split!.items[i]! });
       });
     }
-    // The `blocks:` line and whatever comment introduces the SECTION (not any one block) is
-    // reused whenever we have one to reuse, independent of which items below it changed.
-    if (blocksEntry) out.push(...blocksEntry.header);
+    // The comment introducing the SECTION (not any one block) is reused whenever we have one to
+    // reuse, independent of which items below it changed — but the `blocks:` line itself only
+    // when it is a bare block header: a roster written `blocks: []` and then given its first
+    // entry has to lose the `[]`, or the items land under a line that can't take them (#1090).
+    if (blocksEntry) out.push(...sectionHeaderLines(blocksEntry, "blocks:"));
     else out.push("", "blocks:");
     let firstItem = true;
     for (const b of w.blocks) {
@@ -1669,23 +1717,32 @@ export function serializeWorkflowPreserving(w: Workflow, originalText: string): 
 
   /** Every section that is not `blocks:` — one shape, because they all want the same one.
    *
-   *  The SECTION HEADER (the `key:` line and whatever comment introduces it, e.g. "# ADVISORY
-   *  — the declared happy path") is reused whenever there is one, independent of whether the
-   *  content changed: regenerating the whole section including its header meant deleting one
-   *  edge dropped a comment that was never about that edge (#233 non-blocking #1). Only the
-   *  CONTENT falls back to canonical, and only when it changed.
+   *  The COMMENT INTRODUCING the section (e.g. "# ADVISORY — the declared happy path") is reused
+   *  whenever there is one, independent of whether the content changed: regenerating the whole
+   *  section including that comment meant deleting one edge dropped a comment that was never
+   *  about that edge (#233 non-blocking #1). Only the CONTENT falls back to canonical, and only
+   *  when it changed.
+   *
+   *  The `key:` line is NOT part of what gets reused unconditionally — it is a function of the
+   *  content that follows it, so a regenerated body re-derives it through `sectionHeaderLines`
+   *  (the reused one may be an empty map/sequence that block children can't legally follow, or
+   *  a bare key that re-reads as undeclared — #1090). That helper is where the rule, and what
+   *  happens to a trailing comment on the key line, is spelled out.
    *
    *  `present` is "the model still has something to write here": with an entry that no longer
    *  matches and nothing to write, the section is GONE, and falling through to the else-branch
-   *  (which emits nothing for empty `lines`) is what deletes it. */
+   *  (which emits nothing for empty `lines`) is what deletes it — the introducing comment
+   *  included, since it has no section left to introduce. */
   const pushSection = (
     entry: TopEntry | undefined,
     unchanged: boolean,
     present: boolean,
     lines: string[]
   ): void => {
-    if (entry && (unchanged || present)) {
-      out.push(...entry.header, ...(unchanged ? entry.content : lines.slice(1)));
+    if (entry && unchanged) {
+      out.push(...entry.header, ...entry.content);
+    } else if (entry && present && lines.length) {
+      out.push(...sectionHeaderLines(entry, lines[0]!), ...lines.slice(1));
     } else if (lines.length) {
       out.push("", ...lines);
     }

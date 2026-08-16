@@ -2212,6 +2212,202 @@ test("the three sections a form writes survive a round-trip through their own te
   );
 });
 
+// ---------- empty ↔ block: a section that gains or loses its last child (#1090) ----------
+//
+// The bug, from the #1018 demo: a file with an empty `resources: {}` given its first resource
+// through the form came back as
+//
+//     resources: {}
+//       catfish: {}
+//
+// — the preserving serializer reused the original key line, which commits the section to the
+// inline empty-mapping form, and then wrote block children under it. Not YAML, so the pane
+// declared its own output unreadable and disabled the form. Every section reused through
+// `pushSection` had it, plus `blocks:`; the inverse direction (last child removed, key line
+// left as a bare `resources:`) is the silent half — a bare key is YAML null, i.e. undeclared.
+
+/** A file with one worker and nothing else, ready to have a section spliced onto it. */
+const oneWorker = (section: string): string =>
+  `version: 1
+name: t
+
+blocks:
+  - id: w
+    name: W
+    kind: worker
+    cli: claude
+
+${section}
+`;
+
+/** Serialize `edited` against `original`, then assert the result both PARSES cleanly and reads
+ *  back as exactly the model that was written — the two halves the pane depends on. */
+const roundTrip = (edited: Workflow, original: string, why: string): string => {
+  const out = serializeWorkflowPreserving(edited, original);
+  const reread = parseWorkflow(out);
+  assert.deepEqual(codes(reread.findings), [], `${why}\n--- emitted ---\n${out}`);
+  assert.deepEqual(reread.workflow, edited, `${why}\n--- emitted ---\n${out}`);
+  return out;
+};
+
+test("a section gaining its first child stops being an empty map (#1090)", () => {
+  const cases: { section: string; edit: (w: Workflow) => Workflow; body: RegExp }[] = [
+    {
+      section: "resources: {}",
+      edit: (w) => ({ ...w, resources: { catfish: {} } }),
+      body: /^ {2}catfish: \{\}$/m,
+    },
+    {
+      section: "intake: {}",
+      edit: (w) => ({ ...w, intake: { source: "board" } }),
+      body: /^ {2}source: board$/m,
+    },
+    {
+      section: "merge_queue: {}",
+      edit: (w) => ({ ...w, merge_queue: { enabled: true } }),
+      body: /^ {2}enabled: true$/m,
+    },
+  ];
+  for (const c of cases) {
+    const original = oneWorker(c.section);
+    const { workflow } = parseWorkflow(original);
+    const out = roundTrip(c.edit(workflow), original, `${c.section} + one child`);
+    const key = c.section.split(":")[0]!;
+    assert.match(out, new RegExp(`^${key}:$`, "m"), "the key line must lose its `{}`");
+    assert.match(out, c.body);
+  }
+});
+
+test("a section losing its last child goes back to `{}`, not to nothing (#1090)", () => {
+  // The silent inverse: leaving the bare `resources:` header behind re-reads as YAML null, so
+  // the section a human deliberately kept (empty) would be gone on the next open — exactly what
+  // `emitMappingSection` writes `{}` to prevent, one save later.
+  const cases: { section: string; edit: (w: Workflow) => Workflow }[] = [
+    { section: "resources:\n  catfish:\n    slots: 2", edit: (w) => ({ ...w, resources: {} }) },
+    { section: "intake:\n  source: board", edit: (w) => ({ ...w, intake: {} }) },
+    { section: "merge_queue:\n  enabled: true", edit: (w) => ({ ...w, merge_queue: {} }) },
+  ];
+  for (const c of cases) {
+    const original = oneWorker(c.section);
+    const { workflow } = parseWorkflow(original);
+    const out = roundTrip(c.edit(workflow), original, `${c.section} − its last child`);
+    const key = c.section.split(":")[0]!;
+    assert.match(out, new RegExp(`^${key}: \\{\\}$`, "m"), "still declared, now empty");
+  }
+});
+
+test("an empty flow sequence gaining its first item becomes a block header too (#1090)", () => {
+  // `blocks: []` is this file's own empty-roster spelling (rev-5 F4) and `edges: []`/`gates: {}`
+  // are shapes a hand-written file can carry, so all three can be handed their first entry.
+  const emptyRoster = "version: 1\nname: t\n\nblocks: []\n";
+  const { workflow } = parseWorkflow(emptyRoster);
+  // The block comes from the READER (parsing a file that already has one) rather than a
+  // hand-written literal, so the round-trip compares models, not optional-field spellings.
+  const worker = parseWorkflow(oneWorker("")).workflow.blocks;
+  const withBlock = roundTrip({ ...workflow, blocks: worker }, emptyRoster, "blocks: [] + one block");
+  assert.match(withBlock, /^blocks:$/m);
+  assert.match(withBlock, /^ {2}- id: w$/m);
+
+  const two = oneWorker("  - id: r\n    name: R\n    kind: reviewer\n    cli: claude\n\nedges: []");
+  const parsedTwo = parseWorkflow(two);
+  const withEdge = roundTrip(
+    { ...parsedTwo.workflow, edges: [{ from: "w", to: "r" }] },
+    two,
+    "edges: [] + one edge"
+  );
+  assert.match(withEdge, /^edges:$/m);
+  assert.match(withEdge, /^ {2}- \{ from: w, to: r \}$/m);
+
+  const gated = two.replace("edges: []", "gates: {}");
+  const parsedGated = parseWorkflow(gated);
+  const targetGates = parseWorkflow(
+    two.replace("edges: []", "gates:\n  merge:\n    require: all\n    reviewers: [r]")
+  ).workflow.gates; // read, not hand-written, for the same reason as `worker` above
+  const withGate = roundTrip(
+    { ...parsedGated.workflow, gates: targetGates },
+    gated,
+    "gates: {} + a merge gate"
+  );
+  assert.match(withGate, /^gates:$/m);
+  assert.match(withGate, /^ {2}merge:$/m);
+});
+
+test("a hand-written one-line section is rewritten, not written twice (#1090)", () => {
+  // A flow mapping carries the section's WHOLE content on the key line, so reusing that line
+  // under a regenerated body would emit `build:` twice — once inline, once as a child.
+  const original = oneWorker("resources: { build: { slots: 2 } }");
+  const { workflow } = parseWorkflow(original);
+  const out = roundTrip(
+    { ...workflow, resources: { build: { slots: 2 }, docs: {} } },
+    original,
+    "an inline flow mapping + one more resource"
+  );
+  assert.equal(out.match(/build/g)?.length, 1, "the inline copy must be gone, not duplicated");
+
+  // …and the same line REPLACED by `{}` when the model empties out, rather than left standing
+  // and silently undoing the deletion.
+  const emptied = roundTrip({ ...workflow, resources: {} }, original, "an inline mapping emptied");
+  assert.match(emptied, /^resources: \{\}$/m);
+});
+
+test("rewriting a section's key line keeps the comments around it (#1090)", () => {
+  // #233's bar still holds through the rewrite: the comment ABOVE the section introduces the
+  // section, and the one ON the key line came from the same human — neither is about the
+  // empty-vs-block spelling that had to change.
+  const original = oneWorker("# THE POOLS\nresources: {} # none yet");
+  const { workflow } = parseWorkflow(original);
+  const out = roundTrip(
+    { ...workflow, resources: { catfish: {} } },
+    original,
+    "a commented empty section + one child"
+  );
+  assert.match(out, /^# THE POOLS\nresources: # none yet\n {2}catfish: \{\}$/m);
+});
+
+test("emptying the roster carries the `blocks:` line's own comment onto `blocks: []` (#1090)", () => {
+  // `pushBlocks`'s EMPTY branch rewrites the key line too — it always did, since `blocks: []` is
+  // the canonical empty roster — and it now goes through the same helper, so the comment on that
+  // line survives the rewrite instead of being dropped with it. Pinned separately from the
+  // `pushSection` case above because it is a different call site: deleting the last block is the
+  // ordinary way a human reaches it.
+  const original = `version: 1
+name: t
+
+# THE ROSTER
+blocks: # the agents a run may use
+  - id: w
+    name: W
+    kind: worker
+    cli: claude
+`;
+  const { workflow } = parseWorkflow(original);
+  const out = serializeWorkflowPreserving({ ...workflow, blocks: [] }, original);
+  assert.deepEqual(codes(parseWorkflow(out).findings), [], out);
+  assert.match(
+    out,
+    /^# THE ROSTER\nblocks: \[\] # the agents a run may use$/m,
+    "both comments survive — the one introducing the section and the one on its key line"
+  );
+  // …and the roster refilled from there keeps them again, back in block form.
+  const refilled = serializeWorkflowPreserving(workflow, out);
+  assert.match(refilled, /^# THE ROSTER\nblocks: # the agents a run may use$/m);
+  assert.deepEqual(parseWorkflow(refilled).workflow, workflow);
+});
+
+test("an untouched empty section is still reproduced byte for byte (#1090)", () => {
+  // The rewrite is for a section whose body was REGENERATED. A file nobody touched — including
+  // the `{}` sections this fix is about — must still come back exactly as it went in.
+  const original = oneWorker("# THE POOLS\nresources: {} # none yet\n\nintake: {}");
+  const { workflow } = parseWorkflow(original);
+  assert.equal(serializeWorkflowPreserving(workflow, original), original);
+  const renamed: Workflow = { ...workflow, name: "t2" };
+  assert.equal(
+    serializeWorkflowPreserving(renamed, original),
+    original.replace("name: t", "name: t2"),
+    "an edit ELSEWHERE must not reformat the empty sections either"
+  );
+});
+
 test("the identifier rules accept exactly what the engine accepts (#1020)", () => {
   assert.equal(isValidIntakeLabel("agent-ready"), true);
   assert.equal(isValidIntakeLabel("Agent_Ready1"), true);
