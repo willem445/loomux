@@ -154,9 +154,9 @@
         {
           "name": "kind",
           "type": "enum",
-          "values": ["orchestrator", "worker", "reviewer", "planner"],
+          "values": ["orchestrator", "worker", "reviewer", "planner", "manager"],
           "required": true,
-          "help": "The capability class. CLOSED: a workflow file may define any persona, but it can never invent a capability."
+          "help": "The capability class. CLOSED: a workflow file may define any persona, but it can never invent a capability. `manager` is the human's own interface pane — at most one per workflow, never spawned by the orchestrator, and (like `orchestrator`) it may not declare prompt/profile/allow."
         },
         {
           "name": "cli",

@@ -8,7 +8,12 @@
 import type { PaneBadge } from "./pane";
 import { IDENTITY } from "./theme.ts";
 
-export type OrchRole = "orchestrator" | "worker" | "reviewer" | "planner";
+/** A capability class, as the backend's `Role` serializes it. `manager` (#1161)
+ *  is declarable only in a repo's `.loomux/workflow.yml` — it is never part of
+ *  the built-in roster, so widening this union deliberately does NOT widen
+ *  `ORCH_ROLES` (roster.ts), which is the launcher's per-role form AND the
+ *  built-in roster itself. */
+export type OrchRole = "orchestrator" | "worker" | "reviewer" | "planner" | "manager";
 
 // Per-group identity: a stable accent color keyed off the order groups first
 // appear. Color is the group-pairing cue ("this orchestrator ↔ its workers");
@@ -53,6 +58,9 @@ const ROLE_LABELS: Record<OrchRole, string> = {
   worker: "W",
   reviewer: "REV",
   planner: "PLAN",
+  // #1161. `MGR`, matching the agent-id prefix (`mgr-3`) the backend mints, so
+  // the chip and the id it cross-references read as the same word.
+  manager: "MGR",
 };
 
 /** The short chip text for a role ("REV"). The one source for it: the pane badge
