@@ -6208,12 +6208,17 @@ fn a_spawn_carries_the_deny_flags_of_the_class_it_spawned() {
     // Still `Containment::None` in every other respect: the orchestrator must
     // keep driving git/gh unrestricted, and this new role-keyed deny must not
     // smuggle in the edit/git tiers meant only for a contained class.
+    //
+    // Checked against the TOKENIZED argv, not a raw substring of `command` —
+    // `"Edit"` is a substring of `"acceptEdits"` (the `--permission-mode`
+    // value every orchestrator command carries), so a naive `.contains("Edit")`
+    // false-positives on every orchestrator spawn regardless of this deny.
     for untouched in CLAUDE_EDIT_DENY_TOOLS {
         assert!(
-            !orch.command.contains(untouched),
+            !orch.argv.iter().any(|t| t == untouched),
             "the orchestrator must still keep {untouched} — Containment::None \
-             is unchanged: {}",
-            orch.command
+             is unchanged: {:?}",
+            orch.argv
         );
     }
     assert!(!orch.command.contains("Bash(git commit"), "{}", orch.command);
