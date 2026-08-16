@@ -607,6 +607,69 @@ Nesting is still board metadata everywhere it counts: it never affects whether a
 allowed, and it never blocks the orchestrator from *assigning* a subtask — readiness is a
 signal for reading the board, not a lock.
 
+### WIP limits (finish before you start)
+
+**Max live agents** caps how many agents run at once. It says nothing about how much *work*
+is open — so an orchestrator can pile up ten items waiting on review while cheerfully
+starting more. **WIP limits** cap the work instead: how many items may sit in a status at
+one time.
+
+Declare them in `.loomux/workflow.yml` (the file that carries your roster, so this needs the
+**advanced orchestrator** on):
+
+```yaml
+board:
+  wip:
+    in-progress: 4
+    review: 3
+```
+
+Declare nothing and the feature is off — no limits, no counts, nothing changes. A status you
+leave out simply has no cap.
+
+**The board shows you where you stand.** Each declared limit gets a chip on the task board's
+header: `review 2/3` while there is room, amber at `3/3`, red past it. Your orchestrator sees
+exactly the same numbers when it reads the board.
+
+**By default a limit warns rather than refuses.** Crossing one lets the write through, tells
+your orchestrator ("`review` now holds 4 of a declared 3"), and records it in the audit log.
+That is usually what you want first: a limit is a guess until you have run under it, and
+three notices teach you more about the right number than a week of refusals would. When you
+believe the number, turn it into a refusal:
+
+```yaml
+board:
+  wip:
+    review: 3
+  enforce: true
+```
+
+**`enforce: true` only ever refuses your agents.** Your own board edits are never bounced by
+a limit you set — you are the one resolving the overload, and the board's authority is
+yours. They still show up on the chip and still tell the orchestrator, so nothing about the
+board goes quiet; you just cannot be blocked by your own rule.
+
+A refused write names the limit, how full the status is and which items are in the way, so
+your orchestrator can finish one rather than retry.
+
+**What counts, exactly.** Only a *move into* a capped status is judged — editing an item
+already sitting there, and any move out, always lands, so a status that has gone over is
+never stuck. Assigning work (`claim`) counts as a move into `in-progress`, which is the
+point. And only leaf items count: a container in `review` does not consume a slot, because
+the work inside it is counted where the work is.
+
+You can cap any status **except `done`** — that one is the release valve every other limit
+depends on, so loomux refuses a file that tries. You *can* cap `blocked`, which is useful as
+a warning; think twice before enforcing it, since refusing a move to `blocked` refuses an
+agent's report that something is stuck.
+
+**A bad value fails the whole file, on purpose** — `review: 0`, a misspelt status
+(`in-porgress`), or any key loomux does not recognise stops `.loomux/workflow.yml` from
+loading at all, taking your roster and merge gate with it, and the launcher shows you why.
+The error names the statuses you *could* have written. That is deliberate: a repo that wrote
+`review: 0` believes something about how its board paces, and quietly substituting a default
+would leave that belief in place while the behaviour went the other way.
+
 ## Steering, attention, and audit
 
 These deserve their own detail — see:
@@ -1189,15 +1252,19 @@ whatever orrerix defaults to for its kind on its CLI — `sonnet`/`opus` on
 Claude Code, `auto` on Copilot, `pro` on Gemini, and on OpenCode no `--model`
 at all, so your own config decides.
 
-**Every setting in the file is editable in the pane.** Beside the roster's
-block rows and its merge-gate row sit three more: **Intake**, **Merge queue**
-and **Resources** — the same `intake:`, `merge_queue:` and `resources:` blocks
-described elsewhere on this page, each with an enable-toggle and its fields.
-The block form covers the rest: `role_hint`, and `allow:` as a list of tool
-patterns (one row per pattern, because a real pattern contains commas). The one
-key with no control is `authored_with:`, and deliberately — it records which
-orrerix *created* the file, is stamped once, and a save must never invent or
-restamp it.
+**Almost every setting in the file is editable in the pane.** Beside the
+roster's block rows and its merge-gate row sit three more: **Intake**, **Merge
+queue** and **Resources** — the same `intake:`, `merge_queue:` and `resources:`
+blocks described elsewhere on this page, each with an enable-toggle and its
+fields. The block form covers the rest: `role_hint`, and `allow:` as a list of
+tool patterns (one row per pattern, because a real pattern contains commas).
+
+Two keys have no control. `authored_with:` deliberately never will — it records
+which orrerix *created* the file, is stamped once, and a save must never invent
+or restamp it. `board:` (WIP limits) does not have one **yet**: the pane reads
+it, keeps it, and writes it back untouched when you edit anything else, so
+editing your workflow in the pane is safe — you just set the limits in the text
+editor for now.
 
 Two things those forms will not let you do, because orrerix's engine would
 refuse the file: write a number outside a field's range (the inputs clamp —
