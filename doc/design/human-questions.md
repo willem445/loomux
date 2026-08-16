@@ -523,8 +523,8 @@ chip).
 ## Q4 / #1091 slice H — the structural deny, and its per-CLI coverage
 
 *This section is deliberately its own, distinct from anything #1091 slice F
-adds elsewhere in this note on `integration/ui-redesign` — the two land on
-different branches and must merge without touching each other's prose.*
+adds elsewhere in this note — kept separate so the two never edit the same
+prose.*
 
 Q3 teaches the orchestrator's protocol prose "use `ask_human`, never a
 blocking dialog" (`orchestrator.md`'s **Asking the human** section); #1091
@@ -650,9 +650,7 @@ not by convention.** D's reason is *derived* from the engine's `ask_human`
 registry (`questions.json` — a question the orchestrator posed and is waiting
 to be answered; no pane involved, no hold, no delivery pipe). This belt's
 reason is about the delivery pipe itself being physically held on a dialog
-currently on screen — a different subsystem, a different signal, landing on a
-different branch (`feat/1091-question-attention` vs. this slice's
-`feat/946-question-deny`, both merging into different targets). The two
+currently on screen — a different subsystem, a different signal. The two
 reasons sit beside each other in `attention_tick`'s match arm and in the
 frontend's `AttentionReason` union; nothing merges them.
 

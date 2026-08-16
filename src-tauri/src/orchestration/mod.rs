@@ -11227,9 +11227,9 @@ pub struct OrchRegistry {
     /// question the orchestrator posed and is waiting to be answered — #946
     /// Q1 state, no pane involved). This map is about the delivery PIPE
     /// itself being held on a live interactive dialog on screen — a
-    /// different signal, populated by a different subsystem, on a different
-    /// branch. The two land beside each other in `attention_tick`'s `reason`
-    /// match, never merged into one.
+    /// different signal, populated by a different subsystem. The two sit
+    /// beside each other in `attention_tick`'s `reason` match, never merged
+    /// into one.
     attn_question_held: Mutex<HashSet<String>>,
     /// Groups with desktop notifications enabled (durable `notify` marker file).
     notify_groups: Mutex<HashSet<GroupId>>,

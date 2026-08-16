@@ -1545,10 +1545,14 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
             continue;
         }
         // role_hint (#250/#324) is a persona/template MARKER, never a
-        // capability — it selects only which addendum/template fragment/badge
-        // a block gets, and `resolve_persona`/`mcp::tool_defs`/the CLI
-        // deny-flags all key off `kind` alone, never this field. What IS
-        // enforced here is that a hint can only sit on the kind it is
+        // capability class of its own — it selects which addendum/template
+        // fragment/badge a block gets, and `resolve_persona` keys off `kind`
+        // alone. `mcp::tool_defs` and, since #946 Q4 / #1091 slice H, the
+        // Claude CLI's `AskUserQuestion` deny (`claude_denies_interactive_
+        // question`) DO additionally key off this field for the single
+        // `liaison` hint — a widening, never a narrowing, so it cannot
+        // relax what `kind` already denies. What IS enforced here is that a
+        // hint can only sit on the kind it is
         // meaningless without: an unrecognized value, or one paired with the
         // wrong kind, is a loud parse error — never coerced, never silently
         // dropped, the same shape `kind_from_str` itself enforces.

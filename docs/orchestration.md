@@ -620,11 +620,13 @@ These deserve their own detail — see:
     up between one attempt ending and the next one starting.
   - **The orchestrator can't use its CLI's own question dialog at all, on Claude.**
     A single stuck question dialog on the orchestrator's pane once held a whole
-    run overnight — every worker report queued behind it and started being
-    refused. So on Claude, the orchestrator (and a human-interface/liaison agent,
-    if your workflow has one) is launched with that dialog denied outright; a
-    delegate pane is unaffected, since a human answering its dialog in person
-    never stalls anyone else.
+    run overnight — the in-flight workers finished their PRs, and then nothing
+    was reviewed, dispatched or merged until morning, because every delivery to
+    a held pane queues instead of landing (and that queue is bounded: enough of
+    them and further ones are refused outright). So on Claude, the orchestrator
+    (and a human-interface/liaison agent, if your workflow has one) is launched
+    with that dialog denied outright; a delegate pane is unaffected, since a
+    human answering its dialog in person never stalls anyone else.
 - **Audit viewer** (`Alt+A` or the history icon) — opens the group's
   `audit.jsonl` as a filterable, searchable timeline: every prompt, spawn, task
   edit, delivery outcome, and state write, one row each. A **follow** button
