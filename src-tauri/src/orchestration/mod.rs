@@ -1641,7 +1641,7 @@ if [ -f "$LOOMUX_GROUP_DIR/merge_gate" ]; then
   # a `*` could reach a filename. (loomux never writes one — sanitize_id /
   # sanitize_condition reject glob characters — so this is belt, not braces.)
   set -f
-  g_req="all-pass"; g_thr=0; g_revs=""; g_also=""
+  g_req="all-pass"; g_thr=0; g_revs=""; g_also=""; g_maxdiff=0
   # `|| [ -n "$g_k" ]` is load-bearing: POSIX `read` returns non-zero at EOF, so a
   # final line with NO trailing newline would otherwise be silently DROPPED — and a
   # dropped `reviewer`/`also` line makes the gate WEAKER, which is the one direction
@@ -1653,6 +1653,9 @@ if [ -f "$LOOMUX_GROUP_DIR/merge_gate" ]; then
       require)  g_req="$g_v"; [ -n "$g_w" ] && g_thr="$g_w" ;;
       reviewer) [ -n "$g_v" ] && g_revs="$g_revs $g_v" ;;
       also)     [ -n "$g_v" ] && g_also="$g_also $g_v" ;;
+      # #1174's small-batch clause. A structured key, not an `also:` token,
+      # because it carries a NUMBER — see `Gate::max_diff_lines`.
+      max-diff-lines) g_maxdiff="$g_v" ;;
       # An unrecognized key is NOT skipped. loomux writes an `unrepresentable` line
       # when it cannot safely serialize a token (rather than dropping the clause),
       # and a hand edit or a truncation lands here too. Skipping any of them would
@@ -1675,6 +1678,28 @@ if [ -f "$LOOMUX_GROUP_DIR/merge_gate" ]; then
                [ "$g_thr" -ge 1 ] || loomux_block_wf "malformed-gate" "the declared merge gate says require: threshold but carries no usable threshold number" ;;
     *) loomux_block_wf "malformed-gate" "the merge gate declares an unrecognized require value ('$g_req') — loomux understands 'all-pass' and 'threshold'. A rule it cannot read is not a rule it will guess at" ;;
   esac
+  # THE SMALL-BATCH CLAUSE (#1174), checked BEFORE the verdict counting below —
+  # deliberately. Its remedy ("split this PR") does not depend on any verdict, and
+  # the whole point of a size gate is that the split happens before review effort
+  # is spent; telling an agent to wait for reviewers on a PR it is going to have to
+  # split anyway is the wrong first sentence. An unusable number is a MALFORMED
+  # gate, never "no limit": the lax reading of a bound the repo wrote down is the
+  # one direction this design never takes. (loomux only writes well-formed values —
+  # `parse_workflow` refuses 0 and serde refuses a negative — so this is the
+  # hand-edited/truncated case, the same one the `require` arm above covers.)
+  case "$g_maxdiff" in ''|*[!0-9]*) loomux_block_wf "malformed-gate" "the merge gate declares a max-diff-lines value loomux cannot read as a number ('$g_maxdiff')" ;; esac
+  if [ "$g_maxdiff" -gt 0 ]; then
+    # additions+deletions over the whole PR, from gh's own JSON — NOT parsed out of
+    # `gh pr diff --stat`'s English summary line, whose wording ("1 file changed, 2
+    # insertions(+)") is prose gh may reword and which drops the word entirely for a
+    # zero count. A shim that has to word-split a sentence to decide a merge is a
+    # shim that fails in a new way every time that sentence changes.
+    d_lines=$("$REAL_GH" pr view $rf "$num" --json additions,deletions --jq '.additions + .deletions' 2>/dev/null)
+    case "$d_lines" in
+      ''|*[!0-9]*) loomux_block_wf "diff-size-unknown" "the gate declares max_diff_lines: $g_maxdiff and loomux could not read this PR's size, so it cannot tell whether it is within the limit — an unmeasurable PR is refused, not waved through" ;;
+    esac
+    [ "$d_lines" -le "$g_maxdiff" ] || loomux_block_wf "diff-too-large" "this PR changes $d_lines lines and this repo's merge gate declares max_diff_lines: $g_maxdiff. Split it into PRs that each land under the limit — a review nobody can hold in their head is the failure this gate exists to prevent"
+  fi
   g_pass=0; g_out=""; g_bad=""; g_stale=""
   for g_r in $g_revs; do
     g_vf="$LOOMUX_GROUP_DIR/verdicts/pr-$num/$g_r"
@@ -1766,6 +1791,37 @@ if [ -f "$LOOMUX_GROUP_DIR/merge_gate" ]; then
           [ "$(head -n5 "$b_vf" 2>/dev/null | tail -n1)" = "$b_now" ] || b_bad="$b_bad $b_r"
         done
         [ -z "$b_bad" ] || loomux_block_wf "body-changed" "the PR body is not the one reviewer(s)$b_bad passed — and this repo squash-merges, so that body becomes the permanent commit message. Whoever edited it, the fix is the same: those reviewers re-read the body as it stands and re-record" ;;
+      # #1174 STOP THE LINE. `ci-green` asks about THIS PR; `base-green` asks about
+      # the branch it would land on. Merging onto a base whose HEAD is already red
+      # compounds failures and hands the merge queue's bisect a culprit set it cannot
+      # untangle — so the fleet stops until the base is fixed, which is the whole of
+      # trunk-based "fix the build first".
+      #
+      # TWO endpoints, because ONE would be a lie on half of GitHub: the combined
+      # status API sees only the legacy Status API, and the check-runs API sees only
+      # check runs (GitHub Actions). A repo using either alone reports "none" from
+      # the other, so "green" means neither said anything bad AND at least one of them
+      # said something at all. Zero signal from BOTH is UNKNOWN, and unknown refuses —
+      # the same call `ci-green` makes on a PR with no checks reported, and the same
+      # posture the merge queue's `base-unverifiable` takes.
+      base-green)
+        # `gh api` has no -R: its {owner}/{repo} placeholders resolve from the CWD's
+        # remote, which is the WRONG repo whenever the merge was invoked with -R. So
+        # the repo is resolved explicitly, through the one flag `gh repo view` accepts
+        # (a positional, per #294), and an unresolvable one refuses.
+        bg_nwo=$("$REAL_GH" repo view $repo --json nameWithOwner --jq .nameWithOwner 2>/dev/null)
+        case "$bg_nwo" in
+          ''|*[!A-Za-z0-9._/-]*) loomux_block_wf "base-unverifiable" "the gate requires base-green and loomux could not resolve which repository this PR belongs to, so it cannot read the base branch's checks" ;;
+        esac
+        bg_runs=$("$REAL_GH" api "repos/$bg_nwo/commits/$base/check-runs" --jq 'if (.check_runs|length) == 0 then "none" elif any(.check_runs[]; .status != "completed") then "pending" elif any(.check_runs[]; .conclusion != "success" and .conclusion != "neutral" and .conclusion != "skipped") then "red" else "green" end' 2>/dev/null)
+        bg_stat=$("$REAL_GH" api "repos/$bg_nwo/commits/$base/status" --jq 'if (.statuses|length) == 0 then "none" elif .state == "success" then "green" elif .state == "pending" then "pending" else "red" end' 2>/dev/null)
+        case "$bg_runs" in none|pending|red|green) : ;; *) loomux_block_wf "base-unverifiable" "the gate requires base-green and loomux could not read the check runs on '$base' (its HEAD), so it cannot tell whether the branch this PR would land on is healthy — unknown is never treated as green" ;; esac
+        case "$bg_stat" in none|pending|red|green) : ;; *) loomux_block_wf "base-unverifiable" "the gate requires base-green and loomux could not read the commit statuses on '$base' (its HEAD), so it cannot tell whether the branch this PR would land on is healthy — unknown is never treated as green" ;; esac
+        case "$bg_runs$bg_stat" in
+          *red*)      loomux_block_wf "base-not-green" "the gate requires base-green and the HEAD of '$base' is RED. Fix the base branch first — piling more work onto a broken branch is what this clause exists to stop" ;;
+          *pending*)  loomux_block_wf "base-not-green" "the gate requires base-green and the checks on the HEAD of '$base' have not finished. Wait for them: a base whose result is not in yet is not a base known to be green" ;;
+          nonenone)   loomux_block_wf "base-not-green" "the gate requires base-green and the HEAD of '$base' reports no checks or statuses at all, so loomux cannot tell whether it is healthy — unknown is never treated as green. If this repo's CI legitimately skips some commits, do not declare base-green" ;;
+        esac ;;
       *) loomux_block_wf "unknown-condition" "the gate names the condition '$g_c', which this loomux build does not know how to check — an unknown condition fails closed. Remove it from gates.merge.also, or upgrade loomux" ;;
     esac
   done

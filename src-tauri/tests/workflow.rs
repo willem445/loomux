@@ -6291,6 +6291,7 @@ fn gate(require: GateRequire, reviewers: &[&str], also: &[&str]) -> workflow::Ga
         require,
         reviewers: reviewers.iter().map(|s| s.to_string()).collect(),
         also: also.iter().map(|s| s.to_string()).collect(),
+        max_diff_lines: None,
     }
 }
 
@@ -6795,6 +6796,91 @@ fn the_gate_file_the_shim_reads_round_trips_and_carries_only_clean_tokens() {
 }
 
 #[test]
+fn the_small_batch_clause_parses_round_trips_and_refuses_a_limit_that_limits_nothing() {
+    // #1174 A1. A STRUCTURED KEY, not an `also:` token: `also:` is a closed
+    // vocabulary of parameterless conditions, and a threshold is a number.
+    let wf = workflow::parse_workflow(
+        "version: 1\nblocks:\n  - id: r\n    kind: reviewer\ngates:\n  merge:\n    reviewers: [r]\n    max_diff_lines: 800\n",
+    )
+    .expect("a declared limit parses");
+    let g = wf.gates.get("merge").unwrap();
+    assert_eq!(g.max_diff_lines, Some(800));
+
+    // It reaches the shim, and comes back the same — the shim reads THIS file,
+    // so a key that does not round-trip is a clause the shim never enforces.
+    let text = workflow::gate_file_text(g);
+    assert!(text.contains("max-diff-lines 800\n"), "{text}");
+    assert_eq!(workflow::parse_gate_file(&text).as_ref(), Some(g), "round trip");
+
+    // ABSENT = the feature off, and the gate file says nothing at all about it.
+    let plain = workflow::parse_workflow(
+        "version: 1\nblocks:\n  - id: r\n    kind: reviewer\ngates:\n  merge:\n    reviewers: [r]\n",
+    )
+    .unwrap();
+    let plain = plain.gates.get("merge").unwrap();
+    assert_eq!(plain.max_diff_lines, None);
+    assert!(!workflow::gate_file_text(plain).contains("max-diff-lines"));
+
+    // `0` is a PARSE ERROR, not "unlimited". A bound the repo wrote down must
+    // never be read as the absence of one — the rule `threshold: 0` already
+    // follows, and the reason both refuse rather than clamping.
+    let err = workflow::parse_workflow(
+        "version: 1\nblocks:\n  - id: r\n    kind: reviewer\ngates:\n  merge:\n    reviewers: [r]\n    max_diff_lines: 0\n",
+    )
+    .expect_err("0 must not load");
+    assert!(err.contains("max_diff_lines"), "the error must name the key: {err}");
+    // A negative or fractional value never reaches that check: serde refuses the
+    // whole file at `Option<u32>`, exactly as `threshold: -1` already does.
+    for bad in ["-1", "1.5", "eight hundred"] {
+        assert!(
+            workflow::parse_workflow(&format!(
+                "version: 1\nblocks:\n  - id: r\n    kind: reviewer\ngates:\n  merge:\n    reviewers: [r]\n    max_diff_lines: {bad}\n"
+            ))
+            .is_err(),
+            "max_diff_lines: {bad} must not load"
+        );
+    }
+
+    // A gate FILE carrying a number the shim could not use is MALFORMED — every
+    // merge refused — never silently limitless. `require threshold 0` falls back
+    // to the stricter all-pass; there is no stricter fallback for a size limit,
+    // so the whole file goes unusable instead. Both halves choose the same
+    // direction, which is the only property that matters here.
+    for bad in ["max-diff-lines 0", "max-diff-lines abc", "max-diff-lines"] {
+        assert!(
+            workflow::parse_gate_file(&format!("require all-pass\nreviewer a\n{bad}\n")).is_none(),
+            "{bad:?} must not read back as a usable gate"
+        );
+    }
+}
+
+#[test]
+fn check_diff_size_is_the_one_definition_of_too_big() {
+    // The pure spec the shim's shell mirrors and the merge queue re-runs (#1174).
+    let with = |limit: Option<u32>| workflow::Gate {
+        require: workflow::GateRequire::AllPass,
+        reviewers: vec!["r".into()],
+        also: vec![],
+        max_diff_lines: limit,
+    };
+    use workflow::DiffSizeVerdict as V;
+    assert_eq!(workflow::check_diff_size(&with(Some(800)), Some(799)), V::Ok);
+    assert_eq!(workflow::check_diff_size(&with(Some(800)), Some(800)), V::Ok, "at the limit is within it — `max` means at most");
+    assert_eq!(
+        workflow::check_diff_size(&with(Some(800)), Some(801)),
+        V::TooLarge { lines: 801, limit: 800 }
+    );
+    // Unknown REFUSES. This is the fail-closed half, and it is the one an
+    // implementation drifts on: a size loomux could not read is not a small PR.
+    assert_eq!(workflow::check_diff_size(&with(Some(800)), None), V::Unknown { limit: 800 });
+    assert!(!V::Unknown { limit: 800 }.ok() && !V::TooLarge { lines: 1, limit: 0 }.ok());
+    // …and with no limit declared, an unreadable size is STILL fine: a repo that
+    // never asked for this must not start refusing merges because of it.
+    assert_eq!(workflow::check_diff_size(&with(None), None), V::Ok);
+    assert_eq!(workflow::check_diff_size(&with(None), Some(9_999_999)), V::Ok);
+}
+
+#[test]
 fn an_also_condition_this_build_cannot_check_is_not_silently_ignored() {
     // A gate is a safety claim, so dropping a clause loomux doesn't understand would
     // turn a stricter-looking workflow file into a weaker one. An unknown condition
@@ -6804,7 +6890,14 @@ fn an_also_condition_this_build_cannot_check_is_not_silently_ignored() {
     // #565's opt-in body-digest check is a condition, not a new config surface: a repo
     // that squash-merges declares it, one that merge-commits leaves it out.
     assert!(workflow::condition_supported("body-unchanged"));
-    for unknown in ["no-live-agents-on-pr", "human-signoff", "ci_green", "CI-GREEN", "body_unchanged"] {
+    // #1174's stop-the-line clause: opt-in for the same reason `body-unchanged`
+    // is — a repo with no CI would otherwise be refused every merge by a clause
+    // it never asked for.
+    assert!(workflow::condition_supported("base-green"));
+    for unknown in [
+        "no-live-agents-on-pr", "human-signoff", "ci_green", "CI-GREEN", "body_unchanged",
+        "base_green", "BASE-GREEN", "basegreen",
+    ] {
         assert!(!workflow::condition_supported(unknown), "{unknown:?} must not read as supported");
     }
     // The PARSER still accepts them — the file format is forward-compatible, and a

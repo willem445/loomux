@@ -1494,6 +1494,7 @@ fn workflow_mode_notice_reads_naturally() {
         require: workflow::GateRequire::AllPass,
         reviewers: vec!["rev-orch".into(), "rev-ui".into(), "rev-tests".into()],
         also: vec!["ci-green".into()],
+        max_diff_lines: None,
     };
     assert_eq!(
         workflow_mode_notice(true, "loomux", Some(&all_pass_gate)),
@@ -1504,6 +1505,7 @@ fn workflow_mode_notice_reads_naturally() {
         require: workflow::GateRequire::Threshold(2),
         reviewers: vec!["a".into(), "b".into(), "c".into()],
         also: vec![],
+        max_diff_lines: None,
     };
     assert_eq!(
         workflow_mode_notice(true, "focused-review", Some(&threshold_gate)),

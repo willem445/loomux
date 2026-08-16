@@ -317,6 +317,19 @@ pub struct Gate {
     /// closed** in the shim rather than silently passing — see
     /// [`KNOWN_CONDITIONS`].
     pub also: Vec<String>,
+    /// The small-batch clause (#1174): the largest PR, in changed lines
+    /// (additions + deletions), this gate will let through. `None` — the key
+    /// absent — is the whole feature off, byte-for-byte the pre-#1174 flow.
+    ///
+    /// **A structured key rather than an `also:` token, deliberately.** `also:`
+    /// is a closed vocabulary of *parameterless* conditions; a threshold is a
+    /// number, and stuffing it into a token (`max-diff-800`) would put a
+    /// parameter into a namespace whose whole safety property is that every
+    /// entry either matches a known name or fails closed.
+    ///
+    /// Pure repo config (CLAUDE.md constraint 8): loomux never learns what 800
+    /// means for this repo, only that this repo said 800.
+    pub max_diff_lines: Option<u32>,
 }
 
 // ── resources: named lock resources (#858) ─────────────────────────────────
@@ -992,6 +1005,8 @@ struct RawGate {
     reviewers: Vec<String>,
     #[serde(default)]
     also: Vec<String>,
+    #[serde(default)]
+    max_diff_lines: Option<u32>,
 }
 
 /// `to: worker` and `to: [rev-a, rev-b]` are both legal — a fan-out reads
@@ -1069,6 +1084,7 @@ pub fn workflow_schema_keys() -> BTreeMap<String, Vec<String>> {
         threshold: Some(1),
         reviewers: vec!["rev".into()],
         also: vec!["ci-green".into()],
+        max_diff_lines: Some(800),
     };
     let labels = RawIntakeLabels {
         ready: "agent-ready".into(),
@@ -1219,6 +1235,11 @@ pub fn workflow_schema_field_facts() -> BTreeMap<String, serde_json::Value> {
     // above; the refuse-vs-clamp half is pinned behaviorally by the test, because
     // it is a fact about what `parse_workflow` DOES, not one this file can assert.
     fact("gate.threshold", "min", json!(1));
+    // #1174. A floor, no ceiling: "how big is too big" is this repo's call and
+    // loomux has no business inventing an upper bound for it. `0` is refused
+    // rather than read as "unlimited" — a gate clause that gates nothing is a
+    // typo, and the way to mean "no limit" is to omit the key.
+    fact("gate.max_diff_lines", "min", json!(1));
     fact("merge_queue.max_batch", "min", json!(1));
     fact("merge_queue.checks_timeout_minutes", "min", json!(NOTIFY_EXPIRES_MIN));
     fact("merge_queue.checks_timeout_minutes", "max", json!(NOTIFY_EXPIRES_MAX));
@@ -1943,6 +1964,16 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
                 }
             }
         }
+        // #1174's small-batch clause. `0` is a parse error, not "unlimited":
+        // the same rule `threshold` follows, and for the same reason — a bound
+        // a repo wrote down must never be read as the absence of one. A
+        // negative or fractional value never reaches here at all; serde refuses
+        // the whole file at `Option<u32>`, which is exactly what `threshold: -1`
+        // already does.
+        if rg.max_diff_lines == Some(0) {
+            errs.push(format!("gates.{name}: max_diff_lines must be a positive number — omit the key to declare no limit"));
+            bad = true;
+        }
         if bad {
             continue;
         }
@@ -1952,6 +1983,7 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
                 require,
                 reviewers: rg.reviewers.iter().map(|r| r.trim().to_string()).collect(),
                 also,
+                max_diff_lines: rg.max_diff_lines,
             },
         );
     }
@@ -2538,7 +2570,12 @@ pub fn parse_verdict_file(pr: u64, block: &str, text: &str) -> Option<ReviewVerd
 /// and the check would be noise. Baking it in either way would be baking one
 /// repo's merge habit into a generic tool (CLAUDE.md constraint 8), so it is a
 /// clause a repo writes down.
-pub const KNOWN_CONDITIONS: [&str; 2] = ["ci-green", "body-unchanged"];
+/// `base-green` (#1174) is the stop-the-line clause: it refuses a merge while
+/// the **base ref's HEAD** is red or its checks cannot be resolved, so a fleet
+/// cannot pile work onto a branch that is already broken. Opt-in for the same
+/// reason `body-unchanged` is: a repo with no CI would otherwise be refused
+/// every merge forever by a clause it never asked for.
+pub const KNOWN_CONDITIONS: [&str; 3] = ["ci-green", "body-unchanged", "base-green"];
 
 /// Whether the shim can evaluate this `also:` condition. See [`KNOWN_CONDITIONS`].
 pub fn condition_supported(c: &str) -> bool {
@@ -2859,8 +2896,22 @@ pub fn gate_file_text(gate: &Gate) -> String {
             _ => out.push_str(&format!("{POISON_KEY} unusable-condition\n")),
         }
     }
+    // #1174. A `0` here would be a clause that gates nothing, and `parse_workflow`
+    // has already refused it — so if one ever reaches this far the file is
+    // poisoned rather than written with a limit the shim would ignore.
+    match gate.max_diff_lines {
+        None => {}
+        Some(0) => out.push_str(&format!("{POISON_KEY} unusable-max-diff-lines\n")),
+        Some(n) => out.push_str(&format!("{MAX_DIFF_LINES_KEY} {n}\n")),
+    }
     out
 }
+
+/// The [`MERGE_GATE_FILE`] key carrying [`Gate::max_diff_lines`]. Hyphenated to
+/// match `all-pass`/`ci-green` — the file's own spelling convention, which is
+/// not the YAML key's (`max_diff_lines`), because the two have different
+/// readers and the shim's is a `case` over word-split tokens.
+pub const MAX_DIFF_LINES_KEY: &str = "max-diff-lines";
 
 /// The key [`gate_file_text`] writes when a token cannot be represented safely.
 /// Nothing parses it — by design: the shim refuses any gate-file line whose key it
@@ -2885,6 +2936,7 @@ pub fn parse_gate_file(text: &str) -> Option<Gate> {
     let mut require = GateRequire::AllPass;
     let mut reviewers: Vec<BlockId> = Vec::new();
     let mut also: Vec<String> = Vec::new();
+    let mut max_diff_lines: Option<u32> = None;
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -2909,12 +2961,61 @@ pub fn parse_gate_file(text: &str) -> Option<Gate> {
                 Some(c) => also.push(c),
                 None => return None,
             },
+            // #1174. Unlike `require threshold`, an unusable number here has no
+            // stricter fallback to land on — "no limit" is the LAXER reading, so
+            // the whole file is unusable instead, which the callers report as
+            // "malformed — every merge refused". Same direction as the
+            // `reviewer`/`also` arms above.
+            (Some(MAX_DIFF_LINES_KEY), Some(n), _) => {
+                match n.parse::<u32>().ok().filter(|n| *n > 0) {
+                    Some(n) => max_diff_lines = Some(n),
+                    None => return None,
+                }
+            }
             // Anything else — a poison line, a truncated key, a hand edit — makes
             // the whole file unusable. Skipping it would drop a requirement.
             _ => return None,
         }
     }
-    (!reviewers.is_empty()).then_some(Gate { require, reviewers, also })
+    (!reviewers.is_empty()).then_some(Gate { require, reviewers, also, max_diff_lines })
+}
+
+/// What the small-batch clause (#1174) says about one PR — the pure decision
+/// the shim's shell mirrors and the merge queue re-runs, so there is exactly
+/// one definition of "too big" in this codebase and two readers of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiffSizeVerdict {
+    /// No `max_diff_lines` declared, or the PR is within it.
+    Ok,
+    /// The PR's changed-line count exceeds the declared limit.
+    TooLarge { lines: u64, limit: u32 },
+    /// The limit is declared and the PR's size could not be read at all.
+    /// **Refuses** — the same posture `ci-green` takes on unreadable checks and
+    /// the queue takes on an unverifiable base: unknown is never "fine".
+    Unknown { limit: u32 },
+}
+
+impl DiffSizeVerdict {
+    pub fn ok(&self) -> bool {
+        matches!(self, DiffSizeVerdict::Ok)
+    }
+}
+
+/// Apply [`Gate::max_diff_lines`] to a PR whose changed-line count is `lines`
+/// (additions + deletions), or `None` when that could not be resolved.
+///
+/// A gate that declares no limit answers [`DiffSizeVerdict::Ok`] **without
+/// looking at `lines`** — the absent-config no-op that keeps every repo which
+/// never declared the key on exactly the path it was on before #1174.
+pub fn check_diff_size(gate: &Gate, lines: Option<u64>) -> DiffSizeVerdict {
+    let Some(limit) = gate.max_diff_lines else {
+        return DiffSizeVerdict::Ok;
+    };
+    match lines {
+        None => DiffSizeVerdict::Unknown { limit },
+        Some(lines) if lines > u64::from(limit) => DiffSizeVerdict::TooLarge { lines, limit },
+        Some(_) => DiffSizeVerdict::Ok,
+    }
 }
 
 // ── schema field-inventory pin (#382 P1 rev-26 NB1) ─────────────────────────
