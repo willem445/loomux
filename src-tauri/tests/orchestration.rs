@@ -10015,7 +10015,11 @@ fn pr_base_round_trips_through_the_board_and_clears_on_empty() {
 /// `demo_path`: a `tasks.json` written before this field existed must still
 /// load, with the field simply absent — never an error that would read a live
 /// board as empty (the same failure mode `pre_581_boards_load_with_pr_base_absent`
-/// guards).
+/// guards). Also pins the OTHER half of the additive contract, the way #958
+/// pins it for `parent`/`kind` in `pre_958_boards_load_and_a_flat_board_never_gains_the_hierarchy_keys`:
+/// `demo_path` carries `skip_serializing_if = "Option::is_none"` (unlike
+/// `pr`/`pr_base`, which write an explicit `null`), so a board that never sets
+/// it must not GAIN the key on a later rewrite either.
 #[test]
 fn pre_1091_boards_load_with_demo_path_absent() {
     let (reg, _d) = test_registry();
@@ -10039,6 +10043,14 @@ fn pre_1091_boards_load_with_demo_path_absent() {
         tasks[0].demo_path, None,
         "an absent demo_path deserializes to None (no demo recorded), never an error"
     );
+
+    // A rewrite that never touches demo_path must not GAIN the key — the
+    // same guarantee #958 pins for `parent`/`kind`, so an older loomux (and a
+    // human reading the file) keeps seeing exactly what it saw before.
+    reg.upsert_task(&g.id, "orch", Some("t-1"), patch(None, Some("in-progress"), None)).unwrap();
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(text.contains("in-progress"), "the edit itself landed");
+    assert!(!text.contains("\"demo_path\""), "a board that never set demo_path must not gain the key:\n{text}");
 }
 
 /// `demo_path` survives the write→read path an orchestrator actually uses

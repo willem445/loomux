@@ -9017,9 +9017,11 @@ pub struct Task {
     /// exactly where to run it, instead of guessing from an assignee's roster
     /// cwd (D7: explicit beats inferred — the orchestrator prepping the demo
     /// often uses an integration-branch worktree no worker's cwd names). Same
-    /// additive/skipped-when-absent, empty-string-clears contract as `pr`: a
-    /// pre-#1091 board loads with no key, and `None` here means "no path
-    /// recorded", never "there is no demo".
+    /// additive, empty-string-clears contract as `pr`: a pre-#1091 board loads
+    /// with no key, and `None` here means "no path recorded", never "there is
+    /// no demo". The KEY ITSELF is omitted when absent, though — unlike `pr`,
+    /// which has no `skip_serializing_if` and writes an explicit `null`. That
+    /// half follows `parent`/`kind` (#958), the fields that actually carry it.
     ///
     /// DISPLAY METADATA ONLY, the `pr_base` rule applied here: nothing gates on
     /// it, and it is agent-written, so a stale or wrong value misleads a human

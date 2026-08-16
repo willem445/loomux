@@ -246,9 +246,13 @@ only what #1091 slice B adds to it.
 One additive, optional field: `demo_path: Option<String>` — the worktree path
 where a demo of that task lives, e.g. `C:/Projects/loomux-worktrees/feat/x`.
 Same `#[serde(default, skip_serializing_if = "Option::is_none")]` contract as
-every other optional `Task` field added after the type's first release, so a
-pre-#1091 `tasks.json` loads with the key simply absent, and a board that never
-sets it rewrites without gaining the key.
+`parent`/`kind` (#958) — **not** every optional `Task` field: `pr`/`pr_base`/
+`assignee`/`session`/`issue` carry only `#[serde(default)]` and write an
+explicit `null` when absent, while `parent`/`kind`/`demo_path` omit the key
+entirely. Either way a pre-#1091 `tasks.json` loads with the key simply
+absent, and a board that never sets `demo_path` rewrites without gaining the
+key (pinned the same way #958 pins it for `parent`/`kind`: a rewrite of an
+untouched board must not gain the key).
 
 **Explicit beats inferred.** The alternative — deriving a demo location from
 the assignee's roster row (its `cwd`) — was rejected: the orchestrator
@@ -278,5 +282,6 @@ for (slice C, not yet built) needs no new read surface either.
 **What slice B does not build.** No UI renders `demo_path` yet — that is the
 NEEDS-YOU panel's DEMOS section (slice C) and the task-board marker + deep-link
 (slice G). Until either lands, a recorded `demo_path` is visible only in
-`tasks.json`, in the audit log, and to any MCP caller of `get_task`/`list_tasks`
-— reachable, not yet surfaced.
+`tasks.json`, in the audit log, and to an MCP caller of `get_task` — **never**
+`list_tasks`, which deliberately omits it (above) — reachable, not yet
+surfaced.
