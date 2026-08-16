@@ -25,11 +25,17 @@ import {
   isAwaitingHuman,
   isDemoGated,
   isReady,
+  ladderRule,
   KINDS,
-  kindCandidates,
+  kindFits,
+  kindPickerChoices,
+  levelRuleText,
+  mayBeTopLevel,
+  mayContain,
   MAX_INDENT_DEPTH,
   nextPicker,
   parentCandidates,
+  parentPickerChoices,
   pickerIsOpen,
   reorderWithSubtree,
   siblingPosition,
@@ -705,7 +711,10 @@ test("sibling position counts siblings, not board rows", () => {
   assert.deepEqual(siblingPosition(board, "t-404"), { index: -1, count: 0 });
 });
 
-test("the nest-under picker offers every other row, minus the current container", () => {
+test("on a LEVEL-LESS board the nest picker still offers every other row", () => {
+  // The exemption, stated as a test (#1156): a board that carries no Agile
+  // levels is a flat board, and the ladder must be invisible on it — forever,
+  // not as a migration allowance. This is the pre-#1156 behaviour, unchanged.
   const board = [row("t-1"), row("t-2", "queued", "t-1"), row("t-3")];
   // t-1 is already t-2's container — offering it again would send a no-op write.
   assert.deepEqual(parentCandidates(board[1], board).map((t) => t.id), ["t-3"]);
@@ -713,27 +722,145 @@ test("the nest-under picker offers every other row, minus the current container"
   // Its own descendant IS offered, deliberately: the backend rejects the cycle
   // inside its lock with an error naming the path, and a second copy of that
   // rule here could only ever disagree with the authoritative one — the same
-  // call depCandidates makes.
+  // call depCandidates makes. #1156 narrowed this picker by LEVEL and left that
+  // decision exactly where it was.
   assert.deepEqual(parentCandidates(board[0], board).map((t) => t.id), ["t-2", "t-3"]);
 });
 
-test("the kind picker offers the three levels a row doesn't already carry", () => {
-  const epic = row("t-1", "queued", undefined, "epic");
-  assert.deepEqual(kindCandidates(epic), ["feature", "story", "task"]);
-  const story = row("t-2", "queued", undefined, "story");
-  assert.deepEqual(kindCandidates(story), ["epic", "feature", "task"]);
+test("the nest picker offers only containers the ladder would accept", () => {
+  const board = [
+    row("e-1", "queued", undefined, "epic"),
+    row("f-1", "queued", "e-1", "feature"),
+    row("f-2", "queued", "e-1", "feature"),
+    row("us-1", "queued", "f-1", "story"),
+    row("t-9"), // a level-less row on the same board
+  ];
+  const at = (id: string) => board.find((t) => t.id === id)!;
+  // A feature may move to another epic — there is only one here, and it is
+  // already its container, so nothing is offered.
+  assert.deepEqual(parentCandidates(at("f-1"), board).map((t) => t.id), []);
+  // A story's legal containers are the features — not the epic above them, and
+  // not the level-less row.
+  assert.deepEqual(parentCandidates(at("us-1"), board).map((t) => t.id), ["f-2"]);
+  // The level-less row may go anywhere (the exemption), including inside a
+  // story and inside the epic.
+  assert.deepEqual(parentCandidates(at("t-9"), board).map((t) => t.id), [
+    "e-1",
+    "f-1",
+    "f-2",
+    "us-1",
+  ]);
+  // ...but nothing may be nested inside the level-less row except another
+  // level-less row: "inside an epic" is a claim its container does not make.
+  assert.deepEqual(parentCandidates(at("e-1"), board).map((t) => t.id), []);
 });
 
-test("the kind picker offers all four levels on a plain, kind-less row", () => {
-  assert.deepEqual(kindCandidates(row("t-1")), [...KINDS]);
+test("the top-level escape is offered only when leaving the container is legal", () => {
+  const board = [
+    row("e-1", "queued", undefined, "epic"),
+    row("f-1", "queued", "e-1", "feature"),
+    row("t-9", "queued", "e-1"),
+  ];
+  const at = (id: string) => board.find((t) => t.id === id)!;
+  // A feature cannot exist at top level, so "↥ top level" would be a write the
+  // backend refuses — and with no other epic to move to, the picker has nothing
+  // at all to say. The label has to name the missing LEVEL: "no task to nest
+  // under" reads as a bug on a board that plainly has tasks.
+  const feature = parentPickerChoices(at("f-1"), board);
+  assert.equal(feature.topLevel, false);
+  assert.deepEqual(feature.candidates, []);
+  assert.equal(feature.emptyLabel, "no epic to nest this feature under");
+  // A level-less row nested in that epic may always leave it.
+  assert.equal(parentPickerChoices(at("t-9"), board).topLevel, true);
+  // An epic is already at top level, so there is no escape to offer.
+  assert.equal(parentPickerChoices(at("e-1"), board).topLevel, false);
+  assert.equal(parentPickerChoices(at("e-1"), board).emptyLabel, "an epic is top-level only");
 });
 
-test("the kind picker offers all four levels to fix an out-of-vocabulary kind", () => {
-  // Only reachable by hand-editing tasks.json — the backend refuses an
-  // unknown kind on write — but nothing here should silently exclude one of
-  // the four real levels because the current value doesn't match any of them.
-  const broken = row("t-1", "queued", undefined, "sprint");
-  assert.deepEqual(kindCandidates(broken), [...KINDS]);
+test("the kind picker offers only levels this row could legally take here", () => {
+  const board = [
+    row("e-1", "queued", undefined, "epic"),
+    row("f-1", "queued", "e-1", "feature"),
+    row("t-9", "queued", "f-1"),
+    row("t-8"),
+  ];
+  const at = (id: string) => board.find((t) => t.id === id)!;
+  // A row inside a feature can only ever be a story — the level below its
+  // container — plus the clear.
+  assert.deepEqual(kindPickerChoices(at("t-9"), board), { candidates: ["story"], clear: false });
+  // A top-level row can only be an epic (or stay level-less).
+  assert.deepEqual(kindPickerChoices(at("t-8"), board), { candidates: ["epic"], clear: false });
+  // e-1 holds a feature, so it cannot stop being an epic: neither another level
+  // nor the clear is offered, and the picker is empty.
+  assert.deepEqual(kindPickerChoices(at("e-1"), board), { candidates: [], clear: false });
+  // f-1's only child is level-less, so f-1 may be cleared — but it still cannot
+  // become anything else, since its own container is an epic.
+  assert.deepEqual(kindPickerChoices(at("f-1"), board), { candidates: [], clear: true });
+});
+
+test("the kind picker offers nothing on a row whose container is level-less", () => {
+  // Not a dead end by accident: the backend refuses a level here too, because
+  // "inside a feature" is a claim about the container. The way out is to level
+  // the container first — which is what an empty picker sends the human to do,
+  // rather than a toast after a refused write.
+  const board = [row("t-1"), row("t-2", "queued", "t-1")];
+  assert.deepEqual(kindPickerChoices(board[1], board), { candidates: [], clear: false });
+});
+
+test("the kind picker offers nothing but the clear on an out-of-vocabulary kind", () => {
+  // Only reachable by hand-editing tasks.json — the backend refuses an unknown
+  // kind on write. Such a row is EXEMPT (no rule can say where a fifth level
+  // belongs), so clearing it is legal; the levels it could take still depend on
+  // where it sits, and at top level that is `epic` alone.
+  const board = [row("t-1", "queued", undefined, "sprint")];
+  assert.deepEqual(kindPickerChoices(board[0], board), { candidates: ["epic"], clear: true });
+});
+
+test("a broken container pointer leaves no level the row can take", () => {
+  // t-404 is not on the board (hand-edited only). The backend refuses a level
+  // write it cannot judge, so the picker offers none — and the clear only if
+  // there is something to clear.
+  const board = [row("t-1", "queued", "t-404", "story")];
+  assert.deepEqual(kindPickerChoices(board[0], board), { candidates: [], clear: true });
+  assert.equal(kindFits(board[0], "task", board), false);
+});
+
+test("the ladder table is the same one the backend enforces", () => {
+  // The whole rule, as a table — the case list `hierarchy_ladder_matches_the_
+  // boards_copy` (src-tauri/tests/orchestration.rs) asserts against the Rust
+  // `containment_rule`. Two copies of a rule are only safe while something
+  // reddens when they part; this pair of tests is that something.
+  assert.deepEqual(ladderRule("epic"), { rule: "top-level-only" });
+  assert.deepEqual(ladderRule("feature"), { rule: "inside", container: "epic" });
+  assert.deepEqual(ladderRule("story"), { rule: "inside", container: "feature" });
+  assert.deepEqual(ladderRule("task"), { rule: "inside", container: "story" });
+  assert.deepEqual(ladderRule(null), { rule: "exempt" });
+  assert.deepEqual(ladderRule(undefined), { rule: "exempt" });
+  assert.deepEqual(ladderRule("sprint"), { rule: "exempt" });
+  // The ladder is a chain: no level may contain itself, and no level may skip.
+  assert.equal(mayContain("epic", "story"), false);
+  assert.equal(mayContain("epic", "epic"), false);
+  assert.equal(mayContain("story", "task"), true);
+  assert.equal(mayContain("task", "task"), false);
+  // Both exemption directions, which is what a flat board depends on.
+  assert.equal(mayContain("epic", null), true);
+  assert.equal(mayContain(null, null), true);
+  assert.equal(mayContain(null, "task"), false);
+  // Only an epic (or a level-less row) belongs at top level.
+  assert.equal(mayBeTopLevel("epic"), true);
+  assert.equal(mayBeTopLevel(null), true);
+  for (const k of ["feature", "story", "task"]) assert.equal(mayBeTopLevel(k), false);
+});
+
+test("the level tooltip is derived from the ladder, never written out beside it", () => {
+  // The claim this feature exists to correct was a stale word ("advisory") in
+  // prose next to a rule that had changed. Deriving the sentence is what stops
+  // the next one.
+  assert.equal(levelRuleText("epic"), "it sits at the top level and inside nothing");
+  assert.equal(levelRuleText("feature"), "it must sit inside an epic");
+  assert.equal(levelRuleText("story"), "it must sit inside a feature");
+  assert.equal(levelRuleText("task"), "it must sit inside a story");
+  assert.equal(levelRuleText(null), "no level, so it may sit anywhere");
 });
 
 test("indent is clamped, so a hand-edited over-deep row still fits the overlay", () => {

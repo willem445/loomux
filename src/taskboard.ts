@@ -405,10 +405,82 @@ export function withoutDep(deps: readonly string[] | null | undefined, id: strin
 // exactly like `isReady` is derived rather than read off the wire.
 // ---------------------------------------------------------------------------
 
-/** The advisory Agile levels, in the backend's `TASK_KINDS` order (#958).
- *  Advisory means advisory: a story directly inside an epic is legal, and the
- *  board only ever *labels* a row with this — nothing here gates anything. */
+/** The Agile levels, in the backend's `TASK_KINDS` order (#958).
+ *
+ *  ENFORCED since #1156: the ladder below is the backend's `containment_rule`,
+ *  mirrored here so the pickers can offer only what a write would accept. The
+ *  backend stays the authority — every refusal it makes surfaces in this view's
+ *  toast — and this copy is a convenience, which is a claim #958 explicitly
+ *  refused to make for the cycle and depth-cap rules (§9 of
+ *  doc/design/task-hierarchy.md). The difference is what the rule reads: a
+ *  cycle or a depth bust is a property of the whole mutable tree, re-derived
+ *  per candidate, where the ladder is a fixed table over two closed
+ *  vocabularies that both sides enumerate in full. `test/taskboard.test.ts` and
+ *  `src-tauri/tests/orchestration.rs` pin the same case list against each side,
+ *  so a divergence reddens rather than being discovered by a refused write. */
 export const KINDS = ["epic", "feature", "story", "task"] as const;
+
+/** Where a row of a given kind may sit (#1156) — the mirror of the backend's
+ *  `LadderRule` enum, discriminated the same way. */
+export type LadderRule =
+  | { rule: "exempt" }
+  | { rule: "top-level-only" }
+  | { rule: "inside"; container: string };
+
+/** The strict Agile ladder (#1156), and the one place this side knows it.
+ *
+ *  A kind-less row is `exempt` — legal anywhere, permanently. That is not a
+ *  migration allowance that ages out: a flat board of plain rows is the right
+ *  shape for work with no hierarchy worth describing, and loomux is a generic
+ *  tool that must not require a methodology (CLAUDE.md constraint 8). Any
+ *  out-of-vocabulary kind (hand-edited `tasks.json` only) is exempt too, for
+ *  the same reason the backend exempts it: no rule can name where a fifth
+ *  level belongs. */
+export function ladderRule(kind: string | null | undefined): LadderRule {
+  switch (kind) {
+    case "epic":
+      return { rule: "top-level-only" };
+    case "feature":
+      return { rule: "inside", container: "epic" };
+    case "story":
+      return { rule: "inside", container: "feature" };
+    case "task":
+      return { rule: "inside", container: "story" };
+    default:
+      return { rule: "exempt" };
+  }
+}
+
+/** Whether a row levelled `childKind` may sit directly inside one levelled
+ *  `containerKind`. Both sides may be null/absent — an unlevelled container
+ *  holds only unlevelled rows, since "inside an epic" is a claim about the
+ *  container that a row carrying no level does not make. */
+export function mayContain(
+  containerKind: string | null | undefined,
+  childKind: string | null | undefined
+): boolean {
+  const rule = ladderRule(childKind);
+  if (rule.rule === "exempt") return true;
+  if (rule.rule === "top-level-only") return false;
+  return containerKind === rule.container;
+}
+
+/** Whether a row levelled `kind` may sit at the top level — i.e. whether
+ *  "promote out of its container" is a move the backend would accept. */
+export function mayBeTopLevel(kind: string | null | undefined): boolean {
+  return ladderRule(kind).rule !== "inside";
+}
+
+/** The ladder rule for one level, as a phrase for a tooltip. Derived from
+ *  `ladderRule` rather than written out per level, so the badge and the
+ *  picker button cannot end up describing a rule the board no longer enforces
+ *  — the failure mode #1156 is itself correcting on the word "advisory". */
+export function levelRuleText(kind: string | null | undefined): string {
+  const rule = ladderRule(kind);
+  if (rule.rule === "top-level-only") return "it sits at the top level and inside nothing";
+  if (rule.rule === "inside") return `it must sit inside ${rule.container === "epic" ? "an" : "a"} ${rule.container}`;
+  return "no level, so it may sit anywhere";
+}
 
 /** Which of a row's pickers is open: the dependency one (ordering), the
  *  container one (nesting), or the Agile-level one (#958 slice K). */
@@ -761,15 +833,95 @@ export function reorderWithSubtree<T extends HasParent>(
 }
 
 /** The rows the "nest under…" picker offers: every other row on the board,
- *  minus the one it is already inside (picking that is a no-op write).
+ *  minus the one it is already inside (picking that is a no-op write), minus
+ *  every row the strict ladder would refuse as this row's container (#1156).
  *
- *  Deliberately does NOT filter out choices that would close a hierarchy cycle
- *  or bust the depth cap — the exact call `depCandidates` makes, for the exact
- *  reason: the backend rejects those inside its lock with an error naming the
- *  path, that error surfaces through this view's toast, and a second copy of
- *  the rule here could only ever disagree with the authoritative one. */
+ *  Still deliberately does NOT filter out choices that would close a hierarchy
+ *  cycle or bust the depth cap — the exact call `depCandidates` makes, for the
+ *  exact reason: those are properties of the whole tree, re-derived per
+ *  candidate, and a second copy of them here could only ever disagree with the
+ *  one inside the backend's lock. The ladder is filtered because it is not that
+ *  kind of rule (see `KINDS`) — and because an unfiltered nest picker on a
+ *  levelled row is mostly illegal choices, which teaches the ladder by toast. */
 export function parentCandidates<T extends HasParent>(task: T, board: readonly T[]): T[] {
-  return board.filter((t) => t.id !== task.id && t.id !== task.parent);
+  return board.filter(
+    (t) => t.id !== task.id && t.id !== task.parent && mayContain(t.kind, task.kind)
+  );
+}
+
+/** Everything the nest picker needs, decided in one place: the containers it
+ *  may offer, whether the "↥ top level" escape is one of them, and what to say
+ *  instead when it can offer nothing at all (#1156).
+ *
+ *  The empty case is worth a real sentence rather than a generic one: on a
+ *  levelled row it is the ladder talking, and the reader needs to know WHICH
+ *  level is missing from the board — otherwise "no task to nest under" reads as
+ *  a bug on a board that is visibly full of tasks. */
+export interface ParentPickerChoices<T> {
+  candidates: T[];
+  topLevel: boolean;
+  emptyLabel: string;
+}
+
+export function parentPickerChoices<T extends HasParent>(
+  task: T,
+  board: readonly T[]
+): ParentPickerChoices<T> {
+  const candidates = parentCandidates(task, board);
+  const rule = ladderRule(task.kind);
+  const emptyLabel =
+    rule.rule === "inside"
+      ? `no ${rule.container} to nest this ${task.kind} under`
+      : rule.rule === "top-level-only"
+        ? `an ${task.kind} is top-level only`
+        : "no other task to nest under";
+  return { candidates, topLevel: !!task.parent && mayBeTopLevel(task.kind), emptyLabel };
+}
+
+/** Whether a row could carry `kind` (null = no level) as it currently sits —
+ *  its own container must accept the new level, and so must every row already
+ *  inside it. The backend judges exactly these two directions on a `kind`
+ *  write; this is the picker's copy of that question.
+ *
+ *  A row whose `parent` names nothing on the board (hand-edited only) can carry
+ *  no level at all: the backend refuses a level write against a container it
+ *  cannot resolve, so the only level offered there is none. */
+export function kindFits<T extends HasParent>(
+  task: T,
+  kind: string | null,
+  board: readonly T[]
+): boolean {
+  const container = task.parent ? board.find((t) => t.id === task.parent) : undefined;
+  if (task.parent && !container) return kind === null;
+  const ownOk = container ? mayContain(container.kind, kind) : mayBeTopLevel(kind);
+  if (!ownOk) return false;
+  return board.every((c) => c.parent !== task.id || mayContain(kind, c.kind));
+}
+
+/** What the "set kind…" picker offers (#958 slice K, narrowed by #1156): the
+ *  levels this row does not already carry AND could legally take where it sits,
+ *  plus whether the clear is one of them.
+ *
+ *  The clear is NOT unconditional. Clearing the level of a row that holds
+ *  levelled children would leave them inside an unlevelled container, which the
+ *  backend refuses — so on such a row the picker offers nothing and the row's
+ *  contents have to be dealt with first. Unlike before #1156 this list can be
+ *  EMPTY (a row whose container is unlevelled has no legal level at all), which
+ *  is why the caller must handle an empty picker rather than assuming four
+ *  minus one. */
+export interface KindPickerChoices {
+  candidates: string[];
+  clear: boolean;
+}
+
+export function kindPickerChoices<T extends HasParent>(
+  task: T,
+  board: readonly T[]
+): KindPickerChoices {
+  return {
+    candidates: KINDS.filter((k) => k !== task.kind && kindFits(task, k, board)),
+    clear: !!task.kind && kindFits(task, null, board),
+  };
 }
 
 /** Whether this row's `parent` names no task on the board — only reachable by
@@ -780,17 +932,3 @@ export function hasMissingParent<T extends HasParent>(task: T, board: readonly T
   return !!task.parent && !board.some((t) => t.id === task.parent);
 }
 
-/** The rows the "set kind…" picker offers (#958 slice K): every level in
- *  `KINDS` other than this task's current one — picking the level it already
- *  has would be a no-op write, the same reasoning `parentCandidates` uses to
- *  exclude the current container. Unlike `parentCandidates`, this can never
- *  come back empty: `KINDS` has four entries and at most one is excluded.
- *
- *  A task carrying an out-of-vocabulary `kind` (only reachable by hand-editing
- *  `tasks.json` — the backend refuses it on write, same as an invalid
- *  `status`) matches none of `KINDS`, so nothing is excluded and all four
- *  levels are offered; picking one is how the board fixes it back onto the
- *  known vocabulary. */
-export function kindCandidates<T extends HasParent>(task: T): readonly string[] {
-  return KINDS.filter((k) => k !== task.kind);
-}

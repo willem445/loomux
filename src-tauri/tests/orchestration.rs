@@ -139,6 +139,9 @@ use loomux_lib::orchestration::{
     spawn_rate_exceeded, spawn_request_expired, strip_ansi, submit_confirmed, submit_sequence,
     blocking_ancestor, board_summaries, cap_task_notes, task_ready, task_summary, unmet_deps,
     TASK_STATUSES,
+    // #1156: the strict Agile ladder, as a table the board's own copy is
+    // pinned against (`hierarchy_ladder_matches_the_boards_copy`).
+    ladder_rule, LadderRule, TASK_KINDS,
     // #865: done-row cap on list_tasks — the pure keep/drop rule and its default.
     filter_done_rows, LIST_TASKS_DONE_CAP,
     unconfirmed_delivery_notice, delivery_eaten_notice, watchdog_should_notify, worktree_cleanup_targets,
@@ -10673,29 +10676,36 @@ fn parent_writes_are_validated_against_the_whole_board() {
     assert!(reg.get_task(&gid, "t-2").unwrap().kind.is_none(), "nothing written");
 }
 
-/// Levels are ADVISORY (#958): skipping one is legal, and a container is an
-/// ordinary work item that can still be claimed. Pinning this is the point —
-/// it is the decision the investigation made, and the cheap direction is to be
-/// able to add enforcement later, not to discover it was assumed.
+/// Levels are ENFORCED (#1156, overturning #958's advisory position at the
+/// human's direction), and a container is still an ordinary work item that can
+/// be claimed. The second half is unchanged and still worth pinning: enforcing
+/// the ladder must not turn a container into a special non-work row.
 #[test]
-fn levels_are_advisory_and_a_container_is_still_ordinary_work() {
+fn levels_are_enforced_and_a_container_is_still_ordinary_work() {
     let (reg, _d) = test_registry();
     let gid = board_with(&reg, &["the epic", "a slice"]);
     let epic = TaskPatch { kind: Some("epic".into()), ..Default::default() };
     reg.upsert_task(&gid, "orch", Some("t-1"), epic).unwrap();
     assert_eq!(reg.get_task(&gid, "t-1").unwrap().kind.as_deref(), Some("epic"));
 
-    // A story straight under an epic, with no feature between them: accepted,
-    // and RECORDED as written — a validator that silently dropped the level it
-    // disapproved of would pass a rejection test while still enforcing.
+    // A story straight under an epic, with no feature between them: REFUSED,
+    // where #958 accepted and stored it. The refusal names the level that is
+    // missing rather than only saying no.
     let mut p = parent_patch("t-1");
     p.kind = Some("story".into());
-    let story = reg.upsert_task(&gid, "orch", Some("t-2"), p).unwrap();
-    assert_eq!(
-        (story.parent.as_deref(), story.kind.as_deref()),
-        (Some("t-1"), Some("story")),
-        "skipping a level is legal, and the skip is stored rather than quietly normalized away"
+    let err = reg.upsert_task(&gid, "orch", Some("t-2"), p).unwrap_err();
+    assert!(
+        err.contains("story") && err.contains("feature"),
+        "skipping a level is refused, and the error names the level that belongs between them: {err}"
     );
+    let t2 = reg.get_task(&gid, "t-2").unwrap();
+    assert_eq!((t2.parent, t2.kind), (None, None), "a refused ladder write lands NEITHER field");
+
+    // The legal shape, one rung at a time.
+    let mut p = parent_patch("t-1");
+    p.kind = Some("feature".into());
+    let feature = reg.upsert_task(&gid, "orch", Some("t-2"), p).unwrap();
+    assert_eq!((feature.parent.as_deref(), feature.kind.as_deref()), (Some("t-1"), Some("feature")));
 
     // And the epic itself is claimable — hierarchy is not a work/container
     // split, so nothing about having children changes the claim guards.
@@ -10712,32 +10722,383 @@ fn parent_and_kind_clear_on_empty_and_stay_untouched_when_omitted() {
     let (reg, _d) = test_registry();
     let gid = board_with(&reg, &["the epic", "a slice"]);
 
+    let epic = TaskPatch { kind: Some("epic".into()), ..Default::default() };
+    reg.upsert_task(&gid, "orch", Some("t-1"), epic).unwrap();
     let mut p = parent_patch("t-1");
-    p.kind = Some("story".into());
+    p.kind = Some("feature".into());
     let t = reg.upsert_task(&gid, "orch", Some("t-2"), p).unwrap();
     assert_eq!(t.parent.as_deref(), Some("t-1"));
-    assert_eq!(t.kind.as_deref(), Some("story"));
+    assert_eq!(t.kind.as_deref(), Some("feature"));
     // Durable, not just in the returned snapshot.
     assert_eq!(reg.tasks(&gid)[1].parent.as_deref(), Some("t-1"));
 
-    // A create can name its container in the SAME call — the orchestrator's
-    // actual pattern is "make the epic, then hang each slice under it".
+    // A create can name its container AND its level in the SAME call — the
+    // orchestrator's actual pattern is "make the epic, then hang each feature
+    // under it". The ladder is judged on that one write, not on a half-built
+    // row: creating it at the wrong level is refused the same way.
     let mut create = patch(Some("nested at birth"), None, None);
     create.parent = Some("t-1".into());
-    create.kind = Some("task".into());
+    create.kind = Some("feature".into());
     let born = reg.upsert_task(&gid, "orch", None, create).unwrap();
     assert_eq!(born.parent.as_deref(), Some("t-1"), "a new row can be created already inside its container");
 
     // Omitted = untouched: an ordinary status/note edit must never orphan a row.
     let t = reg.upsert_task(&gid, "orch", Some("t-2"), patch(None, None, Some("unrelated edit"))).unwrap();
     assert_eq!(t.parent.as_deref(), Some("t-1"), "a patch that omits parent must not clear it");
-    assert_eq!(t.kind.as_deref(), Some("story"));
+    assert_eq!(t.kind.as_deref(), Some("feature"));
 
-    // Empty (or blank) clears rather than storing whitespace.
+    // Empty (or blank) clears rather than storing whitespace. Both fields in
+    // ONE write, which is also the only way out for a levelled row: clearing
+    // just the container would leave a top-level feature, which the ladder
+    // refuses (#1156) — the escape is to stop claiming the level too.
     let clear = TaskPatch { parent: Some("  ".into()), kind: Some("".into()), ..Default::default() };
     let t = reg.upsert_task(&gid, "orch", Some("t-2"), clear).unwrap();
     assert_eq!(t.parent, None, "a blank parent promotes the row to top level");
     assert_eq!(t.kind, None, "...and a blank kind clears the label, it is not an invalid kind");
+}
+
+// ---------- #1156: the strict Agile ladder + kind-prefixed ids ----------
+
+/// A create that names its level and its container in ONE call — the shape the
+/// tool description teaches, and the only way to build a legal ladder.
+fn create_at(title: &str, kind: &str, parent: Option<&str>) -> TaskPatch {
+    TaskPatch {
+        title: Some(title.into()),
+        kind: Some(kind.into()),
+        parent: parent.map(String::from),
+        ..Default::default()
+    }
+}
+
+/// A level-only patch — the shape a re-level takes. `""` is the clear.
+fn kind_patch(kind: &str) -> TaskPatch {
+    TaskPatch { kind: Some(kind.into()), ..Default::default() }
+}
+
+/// The whole ladder as a table, pinned against the board's own copy of it.
+///
+/// `test/taskboard.test.ts`'s "the ladder table is the same one the backend
+/// enforces" asserts THIS case list against the frontend's `ladderRule`. #958
+/// §9 refused to mirror the cycle and depth-cap rules into the picker for good
+/// reasons; #1156 mirrors this one, so the pair of tests is what stands in for
+/// the shared code the two languages cannot have.
+#[test]
+fn hierarchy_ladder_matches_the_boards_copy() {
+    assert_eq!(ladder_rule(Some("epic")), LadderRule::TopLevelOnly);
+    assert_eq!(ladder_rule(Some("feature")), LadderRule::Inside("epic"));
+    assert_eq!(ladder_rule(Some("story")), LadderRule::Inside("feature"));
+    assert_eq!(ladder_rule(Some("task")), LadderRule::Inside("story"));
+    // The exemption, at the level of the rule itself.
+    assert_eq!(ladder_rule(None), LadderRule::Exempt);
+    assert_eq!(ladder_rule(Some("sprint")), LadderRule::Exempt);
+    // Every level in the VOCABULARY has a place on the ladder, so adding a
+    // fifth kind to `TASK_KINDS` without placing it reddens here rather than
+    // shipping a level that is silently exempt from the rule it looks like it
+    // should obey.
+    for k in TASK_KINDS {
+        assert_ne!(ladder_rule(Some(k)), LadderRule::Exempt, "{k} must have a place on the ladder");
+    }
+}
+
+/// AC1: every rung, refused from every wrong place, with the fix named.
+///
+/// The refusal has to name the fix for the same reason the cycle refusal names
+/// the path: the caller has exactly two moves out of a ladder violation — nest
+/// the row where its level belongs, or stop claiming that level — and an error
+/// that only says no leaves them guessing between them.
+#[test]
+fn the_ladder_refuses_every_wrong_container_and_names_the_fix() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let gid = g.id;
+    let epic = reg.upsert_task(&gid, "orch", None, create_at("v1.2.0", "epic", None)).unwrap();
+    let feat = reg.upsert_task(&gid, "orch", None, create_at("board sort", "feature", Some(&epic.id))).unwrap();
+    let story = reg.upsert_task(&gid, "orch", None, create_at("sort by status", "story", Some(&feat.id))).unwrap();
+    // The row every refusal below is attempted ON, so each one can be checked
+    // for having written nothing.
+    let spare = reg.upsert_task(&gid, "orch", None, patch(Some("spare"), None, None)).unwrap();
+
+    // (level to claim, container to claim it in, the word the error must name)
+    let cases: [(&str, Option<&str>, &str); 6] = [
+        // A feature with no epic above it: the level claims to break an epic
+        // down, and there is no epic.
+        ("feature", None, "epic"),
+        // A story straight under the epic — the shape #958 explicitly allowed.
+        ("story", Some(epic.id.as_str()), "feature"),
+        // A task under the feature, skipping the story.
+        ("task", Some(feat.id.as_str()), "story"),
+        // Down the ladder instead of up.
+        ("feature", Some(story.id.as_str()), "epic"),
+        // An epic is top-level only, wherever you try to put it.
+        ("epic", Some(epic.id.as_str()), "top-level only"),
+        ("epic", Some(story.id.as_str()), "top-level only"),
+    ];
+    for (kind, parent, must_name) in cases {
+        let p = TaskPatch {
+            kind: Some(kind.into()),
+            parent: Some(parent.unwrap_or("").to_string()),
+            ..Default::default()
+        };
+        let err = reg.upsert_task(&gid, "orch", Some(&spare.id), p).unwrap_err();
+        assert!(
+            err.contains(must_name),
+            "a {kind} in {parent:?} must be refused naming {must_name}: {err}"
+        );
+        assert!(
+            err.contains("clear its level"),
+            "...and every refusal names the other way out: {err}"
+        );
+        let after = reg.get_task(&gid, &spare.id).unwrap();
+        assert_eq!(
+            (after.kind, after.parent),
+            (None, None),
+            "a refused ladder write lands NEITHER field ({kind} in {parent:?})"
+        );
+    }
+
+    // The negative control: the same rows, placed right, all land. Without this
+    // "refuse everything" would pass every assertion above.
+    assert_eq!(story.parent.as_deref(), Some(feat.id.as_str()));
+    let t = reg.upsert_task(&gid, "orch", None, create_at("a subtask", "task", Some(&story.id))).unwrap();
+    assert_eq!((t.kind.as_deref(), t.parent.as_deref()), (Some("task"), Some(story.id.as_str())));
+}
+
+/// AC2, the direction a row's own container pointer cannot see: re-levelling a
+/// row is judged against the rows INSIDE it too.
+#[test]
+fn a_re_level_is_judged_against_the_rows_inside_it_too() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let gid = g.id;
+    let epic = reg.upsert_task(&gid, "orch", None, create_at("v1.2.0", "epic", None)).unwrap();
+    let feat = reg.upsert_task(&gid, "orch", None, create_at("board sort", "feature", Some(&epic.id))).unwrap();
+
+    // Demoting the epic would strand the feature inside it. The refusal names
+    // the CHILD, which is the row the caller cannot see from the write.
+    let err = reg.upsert_task(&gid, "orch", Some(&epic.id), kind_patch("feature")).unwrap_err();
+    assert!(err.contains(&feat.id), "the refusal names the row inside that would be stranded: {err}");
+    // ...and so would clearing it: an unlevelled container holds only
+    // unlevelled rows.
+    let err = reg.upsert_task(&gid, "orch", Some(&epic.id), kind_patch("")).unwrap_err();
+    assert!(err.contains("cleared"), "clearing a container's level is refused too: {err}");
+    assert_eq!(
+        reg.get_task(&gid, &epic.id).unwrap().kind.as_deref(),
+        Some("epic"),
+        "neither refusal wrote anything"
+    );
+
+    // The child's level is exactly what makes both refusals: clear the CHILD
+    // first and the same two writes land. This is the negative control — a
+    // check that refused every re-level would pass the two assertions above.
+    reg.upsert_task(&gid, "orch", Some(&feat.id), kind_patch("")).unwrap();
+    reg.upsert_task(&gid, "orch", Some(&epic.id), kind_patch("")).unwrap();
+    assert_eq!(reg.get_task(&gid, &epic.id).unwrap().kind, None);
+
+    // A pure REPARENT of the container is not a re-level, so it does not
+    // re-judge the rows inside it: a child's rule reads its container's LEVEL,
+    // never where that container itself sits.
+    let epic2 = reg.upsert_task(&gid, "orch", None, create_at("v1.3.0", "epic", None)).unwrap();
+    reg.upsert_task(&gid, "orch", Some(&epic.id), kind_patch("feature")).unwrap();
+    reg.upsert_task(&gid, "orch", Some(&epic.id), parent_patch(&epic2.id)).unwrap();
+    assert_eq!(reg.get_task(&gid, &epic.id).unwrap().parent.as_deref(), Some(epic2.id.as_str()));
+}
+
+/// The exemption, as a first-class guarantee rather than a migration
+/// allowance: a row with NO level may sit anywhere, forever.
+///
+/// This is the shape of every pre-#1156 board, and it is also the shape a group
+/// that runs no Agile at all wants — loomux is a generic agentic-dev tool and
+/// must not require a methodology (CLAUDE.md constraint 8). Ladder enforcement
+/// that reached level-less rows would make the board unusable for both.
+#[test]
+fn a_level_less_row_is_exempt_from_the_ladder() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let gid = g.id;
+    let epic = reg.upsert_task(&gid, "orch", None, create_at("v1.2.0", "epic", None)).unwrap();
+    let feat = reg.upsert_task(&gid, "orch", None, create_at("board sort", "feature", Some(&epic.id))).unwrap();
+
+    // A plain row goes anywhere on a levelled board — including places no
+    // LEVELLED row could go (straight inside an epic, beside a feature).
+    let plain = reg.upsert_task(&gid, "orch", None, patch(Some("a plain row"), None, None)).unwrap();
+    for container in [epic.id.as_str(), feat.id.as_str()] {
+        reg.upsert_task(&gid, "orch", Some(&plain.id), parent_patch(container)).unwrap();
+        assert_eq!(reg.get_task(&gid, &plain.id).unwrap().parent.as_deref(), Some(container));
+    }
+    // ...and back to the top level, which a feature could not do.
+    reg.upsert_task(&gid, "orch", Some(&plain.id), parent_patch("")).unwrap();
+    assert_eq!(reg.get_task(&gid, &plain.id).unwrap().parent, None);
+
+    // A plain row also CONTAINS plain rows — the whole flat board, on which the
+    // ladder is invisible.
+    let child = reg.upsert_task(&gid, "orch", None, patch(Some("a plain child"), None, None)).unwrap();
+    reg.upsert_task(&gid, "orch", Some(&child.id), parent_patch(&plain.id)).unwrap();
+    assert_eq!(reg.get_task(&gid, &child.id).unwrap().parent.as_deref(), Some(plain.id.as_str()));
+
+    // The one thing exemption does NOT buy: a LEVELLED row inside an
+    // unlevelled one. "Inside a feature" is a claim about the container, and a
+    // row carrying no level does not make it.
+    let err = reg.upsert_task(&gid, "orch", Some(&child.id), kind_patch("story")).unwrap_err();
+    assert!(err.contains("carries no level"), "the refusal says which side is missing a level: {err}");
+}
+
+/// The migration guarantee, on a board written before any of this existed: an
+/// existing row must not become UNEDITABLE because its shape predates the rule.
+///
+/// This is the whole reason the ladder is triggered by the write that asserts
+/// the shape rather than by the row's existence. Judging every write would have
+/// frozen the status, notes, assignee and deps of every row on every board that
+/// used #958's advisory levels — which is the DOMINANT shape #958 §2 describes,
+/// a top-level `feature` with its slices under it.
+#[test]
+fn a_pre_1156_board_stays_editable_everywhere_except_its_shape() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let path = reg.state_root().join(g.id.as_str()).join("tasks.json");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    // A board loomux itself wrote under #958: t- ids throughout, a top-level
+    // feature, a story straight under it (legal then, refused now), and a
+    // level-less row.
+    fs::write(
+        &path,
+        r##"[
+  {"id":"t-1","title":"The board","status":"in-progress","issue":null,"pr":null,"assignee":null,"session":null,"notes":[],"kind":"feature","updated_ms":11},
+  {"id":"t-2","title":"Sorting","status":"queued","issue":null,"pr":null,"assignee":null,"session":null,"notes":[],"parent":"t-1","kind":"story","updated_ms":12},
+  {"id":"t-3","title":"Plain old row","status":"queued","issue":null,"pr":null,"assignee":null,"session":null,"notes":[],"updated_ms":13}
+]"##,
+    )
+    .unwrap();
+    let gid = g.id;
+    assert_eq!(reg.tasks(&gid).len(), 3, "a pre-#1156 board still loads");
+
+    // EVERY field but the two that assert the shape is still writable on the
+    // illegal rows — this is the guarantee, and it is the one worth the most.
+    reg.upsert_task(&gid, "orch", Some("t-1"), patch(None, Some("done"), Some("a note"))).unwrap();
+    reg.upsert_task(&gid, "orch", Some("t-2"), deps_patch(&["t-3"])).unwrap();
+    reg.upsert_task(&gid, "orch", Some("t-2"), claim_patch("w-1")).unwrap();
+    let t2 = reg.get_task(&gid, "t-2").unwrap();
+    assert_eq!(t2.deps, vec!["t-3".to_string()], "deps still land on a row the ladder would refuse");
+    assert_eq!(t2.assignee.as_deref(), Some("w-1"), "...and so does a claim");
+    assert_eq!(reg.get_task(&gid, "t-1").unwrap().status, "done", "...and a status");
+    assert_eq!(
+        (t2.kind.as_deref(), t2.parent.as_deref()),
+        (Some("story"), Some("t-1")),
+        "and none of those edits quietly repaired — or destroyed — the legacy shape"
+    );
+
+    // Only a write that RE-ASSERTS the shape is judged. Re-writing the level it
+    // already carries is such a write, deliberately: it is a fresh claim about
+    // where this row sits, and the board answers it honestly.
+    let err = reg.upsert_task(&gid, "orch", Some("t-2"), kind_patch("story")).unwrap_err();
+    assert!(err.contains("must sit inside"), "re-asserting an illegal shape is refused: {err}");
+
+    // ...and the way out is either move, in one write each.
+    reg.upsert_task(&gid, "orch", Some("t-2"), kind_patch("")).unwrap();
+    reg.upsert_task(&gid, "orch", Some("t-1"), kind_patch("epic")).unwrap();
+    reg.upsert_task(&gid, "orch", Some("t-2"), kind_patch("feature")).unwrap();
+    let fixed = reg.get_task(&gid, "t-2").unwrap();
+    assert_eq!(
+        (fixed.id.as_str(), fixed.kind.as_deref(), fixed.parent.as_deref()),
+        ("t-2", Some("feature"), Some("t-1")),
+        "the board is legal now, and NO id was rewritten getting there"
+    );
+}
+
+/// Promote-on-delete is the one path that can land a row where no write could
+/// have put it, and it stays that way on purpose (#958 §4/§5).
+///
+/// The alternatives are all worse: refusing the human's delete, cascading it
+/// into the work items inside, or silently stripping the survivor's level —
+/// destroying data to preserve an invariant about a label.
+#[test]
+fn promote_on_delete_can_leave_a_shape_no_write_could_have_asked_for() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let gid = g.id;
+    let epic = reg.upsert_task(&gid, "orch", None, create_at("v1.2.0", "epic", None)).unwrap();
+    let feat = reg.upsert_task(&gid, "orch", None, create_at("board sort", "feature", Some(&epic.id))).unwrap();
+    reg.upsert_task(&gid, "orch", Some(&feat.id), patch(None, None, Some("real work here"))).unwrap();
+
+    reg.delete_task(&gid, "human", &epic.id).unwrap();
+    let orphan = reg.get_task(&gid, &feat.id).unwrap();
+    assert_eq!(orphan.parent, None, "the delete promoted it rather than cascading into it");
+    assert_eq!(orphan.kind.as_deref(), Some("feature"), "...and kept its level, notes and all");
+    assert_eq!(orphan.notes.len(), 1);
+
+    // The row is perfectly readable and perfectly editable — it is only the
+    // next write that re-asserts its shape that has to resolve it, and that
+    // error names both ways out.
+    reg.upsert_task(&gid, "orch", Some(&feat.id), patch(None, Some("in-progress"), None)).unwrap();
+    let err = reg.upsert_task(&gid, "orch", Some(&feat.id), kind_patch("feature")).unwrap_err();
+    assert!(err.contains("nest it under") && err.contains("clear its level"), "both ways out: {err}");
+    reg.upsert_task(&gid, "orch", Some(&feat.id), kind_patch("")).unwrap();
+    assert_eq!(reg.get_task(&gid, &feat.id).unwrap().kind, None);
+}
+
+/// AC3: a new row's id carries the level it was created at, off ONE shared
+/// counter.
+///
+/// Shared rather than per-prefix so that every number on a board is used once:
+/// with a counter per prefix a board holds `e-1`, `f-1`, `us-1` and `t-1` at
+/// the same time, and a half-remembered "1" with the wrong prefix names a real
+/// but WRONG row — a silent mis-link in `deps`/`parent`, which is the exact
+/// class of confusion this feature exists to remove.
+#[test]
+fn new_ids_carry_their_level_off_one_shared_counter() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let gid = g.id;
+    let epic = reg.upsert_task(&gid, "orch", None, create_at("v1.2.0", "epic", None)).unwrap();
+    let feat = reg.upsert_task(&gid, "orch", None, create_at("board sort", "feature", Some(&epic.id))).unwrap();
+    let story = reg.upsert_task(&gid, "orch", None, create_at("sort by status", "story", Some(&feat.id))).unwrap();
+    let task = reg.upsert_task(&gid, "orch", None, create_at("the sort fn", "task", Some(&story.id))).unwrap();
+    let plain = reg.upsert_task(&gid, "orch", None, patch(Some("a plain row"), None, None)).unwrap();
+    assert_eq!(
+        [epic.id.as_str(), feat.id.as_str(), story.id.as_str(), task.id.as_str(), plain.id.as_str()],
+        ["e-1", "f-2", "us-3", "t-4", "t-5"],
+        "each level mints its own prefix, and the NUMBER is unique across all of them"
+    );
+
+    // The counter is a high-water mark over the whole board, so a delete never
+    // hands a number back out — the same guarantee the pre-#1156 `t-` mint had.
+    reg.delete_task(&gid, "human", &plain.id).unwrap();
+    let next = reg.upsert_task(&gid, "orch", None, patch(Some("after the delete"), None, None)).unwrap();
+    assert_eq!(next.id, "t-6", "a deleted number is never reissued: audit and session state still cite it");
+}
+
+/// The other half of AC4, and the rule with the most references riding on it:
+/// levelling an EXISTING row never rewrites its id.
+///
+/// An id is quoted by `deps`, `related` and `parent` on other rows, by every
+/// audit line, by agents' stored session state, and by a human's memory.
+/// Rewriting one would have to rewrite all of those atomically and could not
+/// touch the last two at all, so the id a row is minted with is the id it keeps
+/// — the `kind` field, not the prefix, is what says what a row IS.
+#[test]
+fn levelling_an_existing_row_never_rewrites_its_id() {
+    let (reg, _d) = test_registry();
+    let gid = board_with(&reg, &["the container", "a slice"]);
+    // Both minted before anyone thought about levels — the legacy id space.
+    assert_eq!(reg.tasks(&gid).iter().map(|t| t.id.clone()).collect::<Vec<_>>(), ["t-1", "t-2"]);
+    reg.upsert_task(&gid, "orch", Some("t-1"), kind_patch("epic")).unwrap();
+    let mut p = parent_patch("t-1");
+    p.kind = Some("feature".into());
+    reg.upsert_task(&gid, "orch", Some("t-2"), p).unwrap();
+
+    let board = reg.tasks(&gid);
+    assert_eq!(
+        board.iter().map(|t| (t.id.as_str(), t.kind.as_deref())).collect::<Vec<_>>(),
+        [("t-1", Some("epic")), ("t-2", Some("feature"))],
+        "a t- id that became an epic KEEPS its id — the prefix is where it started, kind is what it is"
+    );
+    // ...and the reference that was already pointing at it still resolves,
+    // which is the whole point of not rewriting.
+    assert_eq!(board[1].parent.as_deref(), Some("t-1"));
+
+    // A NEW row on that same board is minted at its level, above the legacy
+    // high-water mark — so the two id shapes coexist without collision.
+    let fresh = reg.upsert_task(&gid, "orch", None, create_at("v1.3.0", "epic", None)).unwrap();
+    assert_eq!(fresh.id, "e-3");
 }
 
 /// Promote-on-delete (#958), the `strip_deleted_links` reasoning applied to
@@ -11080,39 +11441,57 @@ fn hierarchy_args_round_trip_through_the_mcp_shim() {
         dispatch(&reg, c, "tools/call", &json!({ "name": "upsert_task", "arguments": args })).unwrap()
     };
     let text_of = |r: &Value| r["content"][0]["text"].as_str().unwrap_or_default().to_string();
+    // A row created WITH a level is minted at that level's prefix (#1156);
+    // one created without keeps `t-`, and both draw on the same counter.
     call(&co, json!({ "title": "the epic", "kind": "epic" }));
     call(&co, json!({ "title": "slice A" }));
+    assert!(reg.get_task(&co.group, "e-1").is_some(), "an epic is minted e-N through the shim");
+    assert!(reg.get_task(&co.group, "t-2").is_some(), "a level-less row keeps t-N, off the shared counter");
 
     // Both fields parse and land.
-    assert_eq!(call(&co, json!({ "id": "t-2", "parent": "t-1", "kind": "story" }))["isError"], false);
+    assert_eq!(call(&co, json!({ "id": "t-2", "parent": "e-1", "kind": "feature" }))["isError"], false);
     let t2 = reg.get_task(&co.group, "t-2").unwrap();
-    assert_eq!((t2.parent.as_deref(), t2.kind.as_deref()), (Some("t-1"), Some("story")));
-    assert_eq!(reg.get_task(&co.group, "t-1").unwrap().kind.as_deref(), Some("epic"), "kind lands on a CREATE too");
+    assert_eq!((t2.parent.as_deref(), t2.kind.as_deref()), (Some("e-1"), Some("feature")));
+    assert_eq!(reg.get_task(&co.group, "e-1").unwrap().kind.as_deref(), Some("epic"), "kind lands on a CREATE too");
+    assert_eq!(t2.id, "t-2", "...and levelling a row NEVER rewrites the id it was minted with");
 
     // list_tasks — readable by ANY role — carries the container and the count.
     let listed = dispatch(&reg, &cw, "tools/call", &json!({ "name": "list_tasks", "arguments": {} })).unwrap();
     let rows = text_of(&listed);
-    assert!(rows.contains(r#""parent":"t-1""#), "compact rows carry the container id: {rows}");
+    assert!(rows.contains(r#""parent":"e-1""#), "compact rows carry the container id: {rows}");
     assert!(rows.contains(r#""children":1"#), "...and the derived child count: {rows}");
 
     // Registry rejections surface as tool errors WITH the reason — a caller
-    // must be able to tell a cycle from a permission problem.
-    let cyc = call(&co, json!({ "id": "t-1", "parent": "t-2" }));
+    // must be able to tell a cycle from a permission problem, or from the
+    // ladder. The cycle pair is level-less, so it is the CYCLE being reported
+    // and not the ladder refusing first.
+    call(&co, json!({ "title": "plain A" }));
+    call(&co, json!({ "title": "plain B" }));
+    assert_eq!(call(&co, json!({ "id": "t-4", "parent": "t-3" }))["isError"], false);
+    let cyc = call(&co, json!({ "id": "t-3", "parent": "t-4" }));
     assert_eq!(cyc["isError"], true);
     assert!(text_of(&cyc).contains("cycle"), "the cycle reason survives the shim: {}", text_of(&cyc));
     let bad_kind = call(&co, json!({ "id": "t-2", "kind": "saga" }));
     assert_eq!(bad_kind["isError"], true);
     assert!(text_of(&bad_kind).contains("epic"), "the vocabulary is named back: {}", text_of(&bad_kind));
+    let bad_rung = call(&co, json!({ "id": "t-2", "kind": "story" }));
+    assert_eq!(bad_rung["isError"], true);
+    assert!(
+        text_of(&bad_rung).contains("must sit inside"),
+        "and so does the ladder's own refusal: {}",
+        text_of(&bad_rung)
+    );
 
     // Empty string clears through this same shim, the way `pr` does — for BOTH
-    // fields.
-    assert_eq!(call(&co, json!({ "id": "t-2", "parent": "" }))["isError"], false);
-    assert_eq!(reg.get_task(&co.group, "t-2").unwrap().parent, None);
+    // fields. The level goes first: a feature promoted to top level is a shape
+    // the ladder refuses, so the clear order is itself part of the contract.
     assert_eq!(call(&co, json!({ "id": "t-2", "kind": "" }))["isError"], false);
     assert_eq!(reg.get_task(&co.group, "t-2").unwrap().kind, None, "\"\" clears the level, it is not an invalid kind");
+    assert_eq!(call(&co, json!({ "id": "t-2", "parent": "" }))["isError"], false);
+    assert_eq!(reg.get_task(&co.group, "t-2").unwrap().parent, None);
 
     // And the board stays orchestrator-write.
-    assert_eq!(call(&cw, json!({ "id": "t-2", "parent": "t-1" }))["isError"], true);
+    assert_eq!(call(&cw, json!({ "id": "t-2", "parent": "e-1" }))["isError"], true);
 }
 
 /// rev-611 NB1: the advertised schema must admit the clear its own description
@@ -11167,10 +11546,13 @@ fn wrong_typed_hierarchy_args_are_refused_not_silently_dropped() {
 
     // null is still "leave it alone", not a type error — that is what keeps an
     // omitted-vs-explicitly-null caller working the way every other field does.
-    assert_eq!(call(json!({ "id": "t-2", "parent": "t-1", "kind": "epic" }))["isError"], false);
+    // (t-1 was minted level-less and KEEPS its t- id after becoming an epic:
+    // #1156 grandfathers every existing id rather than rewriting references.)
+    assert_eq!(call(json!({ "id": "t-1", "kind": "epic" }))["isError"], false);
+    assert_eq!(call(json!({ "id": "t-2", "parent": "t-1", "kind": "feature" }))["isError"], false);
     assert_eq!(call(json!({ "id": "t-2", "parent": null, "kind": null }))["isError"], false);
     let t2 = reg.get_task(&co.group, "t-2").unwrap();
-    assert_eq!((t2.parent.as_deref(), t2.kind.as_deref()), (Some("t-1"), Some("epic")), "null left both alone");
+    assert_eq!((t2.parent.as_deref(), t2.kind.as_deref()), (Some("t-1"), Some("feature")), "null left both alone");
 }
 
 #[test]
