@@ -1571,7 +1571,7 @@ fi
 # tell us. A courtesy notice that could break or delay opening a PR would be a
 # far worse trade than one that occasionally does not appear.
 #
-# It goes to the pane of the agent that OPENED the pr — which is the actor that
+# It goes to the pane of the agent that OPENED the PR — which is the actor that
 # can split it, at the moment the split is cheapest. It is deliberately not sent
 # to the orchestrator: the shim's only channel into loomux is audit.jsonl, and
 # building a durable agent-writable file whose text lands in the orchestrator's
