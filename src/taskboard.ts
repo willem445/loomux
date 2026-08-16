@@ -437,12 +437,18 @@ export type LadderRule =
  *  the same reason the backend exempts it: no rule can name where a fifth
  *  level belongs. */
 export function ladderRule(kind: string | null | undefined): LadderRule {
-  // RED-EVIDENCE NEUTER (#1156) — scratch/1156-red-evidence ONLY, never merged.
-  // The board's copy of the table, emptied the same way the backend's is on
-  // this branch: every level exempt, i.e. the pre-#1156 "it's a label only"
-  // behaviour, with every signature and call site left intact.
-  void kind;
-  return { rule: "exempt" };
+  switch (kind) {
+    case "epic":
+      return { rule: "top-level-only" };
+    case "feature":
+      return { rule: "inside", container: "epic" };
+    case "story":
+      return { rule: "inside", container: "feature" };
+    case "task":
+      return { rule: "inside", container: "story" };
+    default:
+      return { rule: "exempt" };
+  }
 }
 
 /** Whether a row levelled `childKind` may sit directly inside one levelled

@@ -10865,42 +10865,76 @@ fn the_ladder_refuses_every_wrong_container_and_names_the_fix() {
 
 /// AC2, the direction a row's own container pointer cannot see: re-levelling a
 /// row is judged against the rows INSIDE it too.
+///
+/// The witness has to be a board the ladder would not have built, because on a
+/// ladder-legal board a row's own link already pins its level exactly — the
+/// only level a row inside an epic may carry is `feature`, so every re-level of
+/// it is refused by its own link before any child is consulted. The shape where
+/// the child check is the ONLY thing standing between the caller and a stranded
+/// row is the legacy one: a top-level `feature` holding a `story`, which #958
+/// §2 called the dominant real shape. Promoting that feature to the epic the
+/// ladder now wants is legal for its own link and wrong for the row inside it.
 #[test]
 fn a_re_level_is_judged_against_the_rows_inside_it_too() {
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let path = reg.state_root().join(g.id.as_str()).join("tasks.json");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(
+        &path,
+        r##"[
+  {"id":"t-1","title":"The board","status":"queued","issue":null,"pr":null,"assignee":null,"session":null,"notes":[],"kind":"feature","updated_ms":11},
+  {"id":"t-2","title":"Sorting","status":"queued","issue":null,"pr":null,"assignee":null,"session":null,"notes":[],"parent":"t-1","kind":"story","updated_ms":12}
+]"##,
+    )
+    .unwrap();
     let gid = g.id;
-    let epic = reg.upsert_task(&gid, "orch", None, create_at("v1.2.0", "epic", None)).unwrap();
-    let feat = reg.upsert_task(&gid, "orch", None, create_at("board sort", "feature", Some(&epic.id))).unwrap();
 
-    // Demoting the epic would strand the feature inside it. The refusal names
-    // the CHILD, which is the row the caller cannot see from the write.
-    let err = reg.upsert_task(&gid, "orch", Some(&epic.id), kind_patch("feature")).unwrap_err();
-    assert!(err.contains(&feat.id), "the refusal names the row inside that would be stranded: {err}");
-    // ...and so would clearing it: an unlevelled container holds only
-    // unlevelled rows.
-    let err = reg.upsert_task(&gid, "orch", Some(&epic.id), kind_patch("")).unwrap_err();
+    // An epic belongs at top level, so t-1's OWN link is happy — and the write
+    // is still refused, naming the row inside that it would strand.
+    let err = reg.upsert_task(&gid, "orch", Some("t-1"), kind_patch("epic")).unwrap_err();
+    assert!(err.contains("t-2"), "the refusal names the row inside that would be stranded: {err}");
+    assert!(err.contains("t-1 cannot be an epic"), "...and what it refused to do: {err}");
+    // Clearing t-1's level strands the same child — an unlevelled container
+    // holds only unlevelled rows — so that is refused too.
+    let err = reg.upsert_task(&gid, "orch", Some("t-1"), kind_patch("")).unwrap_err();
     assert!(err.contains("cleared"), "clearing a container's level is refused too: {err}");
     assert_eq!(
-        reg.get_task(&gid, &epic.id).unwrap().kind.as_deref(),
-        Some("epic"),
+        reg.get_task(&gid, "t-1").unwrap().kind.as_deref(),
+        Some("feature"),
         "neither refusal wrote anything"
     );
 
-    // The child's level is exactly what makes both refusals: clear the CHILD
-    // first and the same two writes land. This is the negative control — a
-    // check that refused every re-level would pass the two assertions above.
-    reg.upsert_task(&gid, "orch", Some(&feat.id), kind_patch("")).unwrap();
-    reg.upsert_task(&gid, "orch", Some(&epic.id), kind_patch("")).unwrap();
-    assert_eq!(reg.get_task(&gid, &epic.id).unwrap().kind, None);
+    // The CHILD's level is exactly what makes both refusals: deal with it first
+    // and the same two writes land. This is the negative control — a check that
+    // refused every re-level would pass both assertions above.
+    reg.upsert_task(&gid, "orch", Some("t-2"), kind_patch("")).unwrap();
+    reg.upsert_task(&gid, "orch", Some("t-1"), kind_patch("epic")).unwrap();
+    assert_eq!(reg.get_task(&gid, "t-1").unwrap().kind.as_deref(), Some("epic"));
+    // ...and the child can now be re-levelled onto the rung that actually fits
+    // under an epic, which is the whole migration path in three writes.
+    reg.upsert_task(&gid, "orch", Some("t-2"), kind_patch("feature")).unwrap();
 
-    // A pure REPARENT of the container is not a re-level, so it does not
-    // re-judge the rows inside it: a child's rule reads its container's LEVEL,
-    // never where that container itself sits.
+    // A pure REPARENT of a container is NOT a re-level, so it does not re-judge
+    // the rows inside it: a child's rule reads its container's LEVEL, never
+    // where that container itself sits. t-1 keeps its story-turned-feature
+    // child while moving under another epic.
     let epic2 = reg.upsert_task(&gid, "orch", None, create_at("v1.3.0", "epic", None)).unwrap();
-    reg.upsert_task(&gid, "orch", Some(&epic.id), kind_patch("feature")).unwrap();
-    reg.upsert_task(&gid, "orch", Some(&epic.id), parent_patch(&epic2.id)).unwrap();
-    assert_eq!(reg.get_task(&gid, &epic.id).unwrap().parent.as_deref(), Some(epic2.id.as_str()));
+    let err = reg.upsert_task(&gid, "orch", Some("t-1"), parent_patch(&epic2.id)).unwrap_err();
+    assert!(
+        err.contains("top-level only"),
+        "an epic still cannot be nested, and that is its OWN link talking, not its children's: {err}"
+    );
+    reg.upsert_task(&gid, "orch", Some("t-1"), kind_patch("")).unwrap_err();
+    let plain = reg.upsert_task(&gid, "orch", None, patch(Some("a plain container"), None, None)).unwrap();
+    let kid = reg.upsert_task(&gid, "orch", None, patch(Some("a plain child"), None, None)).unwrap();
+    reg.upsert_task(&gid, "orch", Some(&kid.id), parent_patch(&plain.id)).unwrap();
+    reg.upsert_task(&gid, "orch", Some(&plain.id), parent_patch(&epic2.id)).unwrap();
+    assert_eq!(
+        reg.get_task(&gid, &plain.id).unwrap().parent.as_deref(),
+        Some(epic2.id.as_str()),
+        "a reparent carrying children is judged on the mover's own link alone"
+    );
 }
 
 /// The exemption, as a first-class guarantee rather than a migration
@@ -10974,8 +11008,11 @@ fn a_pre_1156_board_stays_editable_everywhere_except_its_shape() {
     // EVERY field but the two that assert the shape is still writable on the
     // illegal rows — this is the guarantee, and it is the one worth the most.
     reg.upsert_task(&gid, "orch", Some("t-1"), patch(None, Some("done"), Some("a note"))).unwrap();
-    reg.upsert_task(&gid, "orch", Some("t-2"), deps_patch(&["t-3"])).unwrap();
+    // The claim goes first: it guards on the row's own deps being `done`, so
+    // adding an unmet one below would refuse it for a reason that has nothing
+    // to do with the ladder.
     reg.upsert_task(&gid, "orch", Some("t-2"), claim_patch("w-1")).unwrap();
+    reg.upsert_task(&gid, "orch", Some("t-2"), deps_patch(&["t-3"])).unwrap();
     let t2 = reg.get_task(&gid, "t-2").unwrap();
     assert_eq!(t2.deps, vec!["t-3".to_string()], "deps still land on a row the ladder would refuse");
     assert_eq!(t2.assignee.as_deref(), Some("w-1"), "...and so does a claim");
@@ -11059,11 +11096,23 @@ fn new_ids_carry_their_level_off_one_shared_counter() {
         "each level mints its own prefix, and the NUMBER is unique across all of them"
     );
 
-    // The counter is a high-water mark over the whole board, so a delete never
-    // hands a number back out — the same guarantee the pre-#1156 `t-` mint had.
+    // The high-water mark is read off the LIVE board, so deleting the newest
+    // row does hand its number back out. That is pre-#1156 behaviour, carried
+    // over deliberately rather than fixed here: the board is the only state
+    // there is, so "never reissue" would need a persisted counter — a new
+    // durable field, on every group, for a hazard that predates this change.
+    // Pinned so a future attempt at it is a deliberate change to a stated
+    // property rather than a surprise.
     reg.delete_task(&gid, "human", &plain.id).unwrap();
     let next = reg.upsert_task(&gid, "orch", None, patch(Some("after the delete"), None, None)).unwrap();
-    assert_eq!(next.id, "t-6", "a deleted number is never reissued: audit and session state still cite it");
+    assert_eq!(next.id, "t-5", "the mark is over the live board, so a deleted number IS reissued");
+
+    // What the shared counter does guarantee is the property #1156 needs: two
+    // LIVE rows never share a number, whatever their prefixes.
+    let ids: Vec<String> = reg.tasks(&gid).iter().map(|t| t.id.clone()).collect();
+    let numbers: Vec<&str> = ids.iter().map(|i| i.split_once('-').unwrap().1).collect();
+    let unique: HashSet<&&str> = numbers.iter().collect();
+    assert_eq!(unique.len(), numbers.len(), "no two live rows share a number: {ids:?}");
 }
 
 /// The other half of AC4, and the rule with the most references riding on it:
