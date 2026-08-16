@@ -531,7 +531,7 @@ the orchestrator's protocol prose "use `ask_human`, never a blocking dialog".
 Q4/H is the enforcement half, landing here: make the blocking dialog
 **unreachable** for the two roles whose pane a hold can stall a fleet behind,
 rather than merely discouraged — instruction-backed alone did not stop the
-#578 incident.
+incident this note's "The problem" section narrates (above).
 
 **`ask_human` is the orchestrator's replacement TODAY — it is not yet a
 liaison's, and this slice does not change that.** `ask_human` dispatches
@@ -636,8 +636,7 @@ in person, never stalls anyone else), the hold is mirrored into this latched
 set via `OrchRegistry::latch_question_held` / `unlatch_question_held`.
 `attention_tick` reads it as a new reason, `held-dialog`, ranked **above even
 `blocked`** — because a held orchestrator pane strands every other agent's
-report behind it too, not just its own status, which is the literal #578
-failure mode.
+report behind it too, not just its own status.
 
 Latched, not re-derived each 3-second scan, because there is nothing for
 `attention_tick` to re-derive it FROM: the hold lives on `deliver_now`'s own

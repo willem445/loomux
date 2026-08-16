@@ -6188,14 +6188,14 @@ fn a_spawn_carries_the_deny_flags_of_the_class_it_spawned() {
     // none existed before: the orchestrator's `Containment` stays `None` (it
     // must still drive its own git/gh flow unrestricted — the block below
     // pins that), but it now denies the blocking AskUserQuestion dialog by
-    // ROLE instead (`claude_denies_interactive_question`), the fix for the
-    // #578 stall (a held dialog on this exact pane refused 8 delegate
-    // reports behind it).
+    // ROLE instead (`claude_denies_interactive_question`) — a held dialog on
+    // this exact pane strands every delegate report queued behind it, since
+    // the queue that holds them is bounded (`queue::QUEUE_MAX_PER_PANE`).
     for denied in CLAUDE_QUESTION_DENY_TOOLS {
         assert!(
             orch.command.contains(denied),
-            "the orchestrator spawn must deny {denied} — the #578 fleet-stall \
-             fix: {}",
+            "the orchestrator spawn must deny {denied} — a held dialog here \
+             strands every delegate report queued behind it: {}",
             orch.command
         );
     }

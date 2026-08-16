@@ -4699,14 +4699,20 @@ pub const CLAUDE_QUESTION_DENY_TOOLS: &[&str] = &["AskUserQuestion"];
 /// Whether a Claude agent's launch denies [`CLAUDE_QUESTION_DENY_TOOLS`] —
 /// #946 Q4 / #1091 slice H.
 ///
-/// **The incident this closes (#578).** An orchestrator's `AskUserQuestion`
-/// modal held the whole pane long enough that its delivery queue filled and
-/// 8 delegate reports were refused: a blocking question doesn't just stall
-/// the asker, it strands every agent trying to report to it. `ask_human`
-/// (#946 Q1, shipped) is the non-blocking replacement — this makes the old
-/// path structurally unreachable for the two roles that can stall a fleet,
-/// rather than merely discouraged by prompt text (#1091 slice E carries the
-/// prompt-text half, on a separate branch).
+/// **The failure mode this closes.** An orchestrator's `AskUserQuestion`
+/// modal holds the whole pane — every delivery to it, including a delegate's
+/// report, queues instead of landing, and that queue is bounded
+/// (`queue::QUEUE_MAX_PER_PANE`, today 8): once full, further admissions are
+/// refused. A blocking question doesn't just stall the asker, it strands
+/// every agent trying to report to it — the incident `doc/design/
+/// human-questions.md`'s "The problem" section narrates (a run held
+/// overnight on one unanswered question, nothing reviewed or merged until
+/// morning). `ask_human` (#946 Q1, shipped) is the orchestrator's
+/// non-blocking replacement, making the old path structurally unreachable
+/// for it; a liaison's own durable replacement is #1091 slice E's pose-gate
+/// widening (`require_orchestrator` → `require_orchestrator_or_liaison`),
+/// not yet landed — see the design note's Q4/H section for why `ask_human`
+/// alone does not cover the liaison half of this deny.
 ///
 /// **Orthogonal to [`Containment`] by construction** — deliberately NOT a
 /// fourth tier on that ladder, which is about edits/git and answers a
@@ -8906,7 +8912,7 @@ pub struct AgentEntry {
 /// `pty_id`). `reason`, most- to least-urgent:
 /// - `held-dialog` — #946 Q4 / #1091 slice H: a blocking interactive dialog
 ///   is holding the ORCHESTRATOR's own delivery pipe, stranding every
-///   delegate report queued behind it (#578)
+///   delegate report queued behind it
 /// - `blocked` — a worker reported it is blocked
 /// - `stranded` — a delivered prompt was never submitted (#496 PR-C): either
 ///   loomux is self-healing it, or it needs the human's Enter
@@ -18001,10 +18007,10 @@ fn deliver_now(
         // #946 Q4 / #1091 slice H — the latched-attention belt. A blocking
         // dialog held on the ORCHESTRATOR's own pane (never a delegate's —
         // that stays a passive badge, since a human answering a delegate's
-        // dialog in person never stalls anyone else) is exactly the #578
-        // stall: the `--disallowedTools` deny closes this for Claude, but a
-        // CLI with no tool-level deny can still land here. The `orch-
-        // delivery-held` event above only ever reaches a frontend that is
+        // dialog in person never stalls anyone else) strands every delegate
+        // report queued behind it: the `--disallowedTools` deny closes this
+        // for Claude, but a CLI with no tool-level deny can still land here.
+        // The `orch-delivery-held` event above only ever reaches a frontend that is
         // subscribed and rendering AT THIS INSTANT; mirroring it into
         // `attn_question_held` instead gives a client a state it can read at
         // any later point too, the same way every other attention reason is
@@ -34006,9 +34012,9 @@ impl OrchRegistry {
             let report = reports.get(a.id.as_str()).copied();
             let (reason, detail): (&'static str, String) = if question_held.contains(a.id.as_str()) {
                 // #946 Q4 / #1091 slice H: outranks even `blocked`, because
-                // this is the literal #578 incident — a live dialog holding
-                // this pane's delivery pipe stalls every OTHER agent's report
-                // behind it, not just this one's own status. Disjoint from
+                // a live dialog holding this pane's delivery pipe stalls
+                // every OTHER agent's report behind it, not just this one's
+                // own status. Disjoint from
                 // #1091 slice D's `question` reason (a pending `ask_human`
                 // question, engine-registry state, no pane involved) — see
                 // `attn_question_held`'s doc.
