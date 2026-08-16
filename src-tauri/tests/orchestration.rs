@@ -10466,12 +10466,19 @@ fn no_mcp_tool_can_archive_a_row_or_see_that_one_was_archived() {
         &json!({ "name": "get_task", "arguments": { "id": "t-1" } }))
         .unwrap()
         .to_string();
-    assert!(!got.contains("cleared"), "get_task must not leak the archive marker either: {got}");
-    // ...and it must still be the FULL record. A projection that fixed the leak
-    // by returning less than agents need would pass the line above and break
-    // the tool: `get_task` exists to carry the note history `list_tasks` omits.
+    // Completeness FIRST, absence second, and the order is load-bearing.
+    // `get_task` exists to carry the note history `list_tasks` omits, so a
+    // projection that "fixed" the leak by returning less than agents need is
+    // the other failure direction and has to be caught separately. Asserting
+    // absence first would abort the test on the leak and leave these two
+    // unreached — which is the whole point of the rule that a red evidences
+    // only the assertion it REACHED and MOVED. This way the leak mutation runs
+    // them, they pass, and only the absence assertion below moves: the round
+    // then proves the test can tell the two directions apart, instead of
+    // merely asserting that it can.
     assert!(got.contains("t-1") && got.contains("\\\"notes\\\""), "get_task is still the full record: {got}");
     assert!(got.contains("done"), "...including the status: {got}");
+    assert!(!got.contains("cleared"), "get_task must not leak the archive marker either: {got}");
 }
 
 /// The MCP surface #1091 slice B adds: `demo_path` is settable through the
