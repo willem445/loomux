@@ -483,7 +483,7 @@ pub fn admit(
     if req.kind == Kind::Demo {
         if let Some(task) = req.task.as_deref() {
             if let Some(existing) = items.iter().find(|i| dedupe.matches(i, task)) {
-                return Ok(Raised { item: existing.clone(), fresh: false });
+                return Ok(Raised { item: existing.clone(), fresh: true });
             }
         }
     }
@@ -615,6 +615,8 @@ pub struct AgentItem {
     pub resolved_by: Option<String>,
     /// Whether a human close-out note exists — not the note itself. See above.
     pub had_resolution: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<String>,
 }
 
 impl From<&Item> for AgentItem {
@@ -633,6 +635,7 @@ impl From<&Item> for AgentItem {
             resolved_ms: i.resolved_ms,
             resolved_by: i.resolved_by.clone(),
             had_resolution: i.resolution.is_some(),
+            resolution: i.resolution.clone(),
         }
     }
 }
