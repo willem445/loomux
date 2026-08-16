@@ -60,6 +60,7 @@ import { isPending, type OrchQuestion } from "./decisions";
 import { normalizeComment } from "./autonomy";
 import { CoalescingRefresh } from "./refreshgate";
 import { approveWillMerge, gateExitsMessage } from "./workflowstatus";
+import { wipChips } from "./wipchips";
 
 export interface OrchTaskNote {
   ts_ms: number;
@@ -146,6 +147,8 @@ export class TasksView {
   private deleteSelectedBtn: HTMLButtonElement;
   private deleteSelectedTimer: number | undefined;
   private approveSelectedBtn: HTMLButtonElement;
+  /** The board's WIP chips (#1175) — hidden when the repo declares no caps. */
+  private wipEl: HTMLElement;
   private toastEl: HTMLElement;
   private toastTimer: number | undefined;
   private tasks: OrchTask[] = [];
@@ -232,6 +235,13 @@ export class TasksView {
     const head = el("div", "tasks-head");
     head.append(el("span", "tasks-title", "task board"));
     head.append(el("span", "tasks-group", groupId));
+
+    // The board's WIP chips (#1175). Hidden — and empty — for every repo that
+    // declares no `board.wip` block, which is most of them: the header keeps
+    // exactly the shape it had.
+    this.wipEl = el("span", "tasks-wip");
+    this.wipEl.hidden = true;
+    head.append(this.wipEl);
 
     // Batch-clear all done tasks in one action. Hidden until there is
     // something to clear (updated in render). Two-click confirm — a mis-click
@@ -779,6 +789,7 @@ export class TasksView {
     this.updateClearDone();
     this.updateDeleteSelected();
     this.updateApproveSelected();
+    this.renderWipChips();
     this.listEl.replaceChildren();
     if (this.tasks.length === 0) {
       this.listEl.appendChild(el("div", "tasks-empty", "No tasks yet — the orchestrator adds them as work items come in, or add one below."));
@@ -805,6 +816,33 @@ export class TasksView {
       this.listEl.appendChild(this.renderTask(row, usesDeps, usesHierarchy, blocked));
     }
     this.drainFocus();
+  }
+
+  /** The board's WIP chips (#1175) — `review 3/3` on the header, one per cap
+   *  the repo declares.
+   *
+   *  On the HEADER and not on a per-status column, because this board has no
+   *  status columns: it is one priority-ordered list whose order is meaning
+   *  (top = next). Inventing columns to hang a chip on would reorder the board
+   *  around a feature most repos never turn on. #1105's kanban view is where
+   *  the columns arrive, and `wipChips` already returns exactly what a column
+   *  header needs.
+   *
+   *  Rendered from `this.workflow`, which `refresh()` reads in the same pass as
+   *  the rows — so a chip is at most one refresh out of step with the list
+   *  under it, the same best-effort enrichment the live-agent set and the
+   *  question markers already are. It is a count beside a board that is itself
+   *  live; it authorizes nothing. */
+  private renderWipChips(): void {
+    const chips = wipChips(this.workflow?.wip);
+    this.wipEl.replaceChildren();
+    this.wipEl.hidden = chips.length === 0;
+    for (const c of chips) {
+      const chip = el("span", `wip-chip wip-${c.fill}`, c.text);
+      chip.title = c.title;
+      if (c.enforce) chip.classList.add("wip-enforced");
+      this.wipEl.appendChild(chip);
+    }
   }
 
   /** Bring a requested row into view and flash it (#1091 slice C).

@@ -662,6 +662,20 @@ so far:
   `doc/design/task-hierarchy.md`) — that asymmetry is taught in `upsert_task`'s tool
   description, where a rule about a write belongs, rather than by growing this section.
 
+- **#1175, board WIP limits** — `orchestrator.md` only, one bullet in **The task board**
+  (no other role writes the board, and none of them can be refused by a cap). A repo may
+  now declare per-status caps (`board.wip` in `.loomux/workflow.yml`); `list_tasks` carries
+  them with live counts as `wip`, empty for the repos — most of them — that declare none.
+  The re-bless is warranted because the DEFAULT posture of the feature is a warning, and a
+  warning changes nothing unless the agent whose queue discipline it is has been told to
+  read it: under `enforce: false` loomux notifies and the write still lands, so an
+  orchestrator that never reads `wip` respects no cap at all. The bullet also states the
+  two things an orchestrator would otherwise infer wrongly — that a refusal under
+  `enforce: true` is not a retry (relieve the status or leave the task alone), and that a
+  cap counts LEAF rows, so a container does not consume one. Deliberately NOT restated
+  here: which statuses are cappable and what a crossing looks like as an error, both of
+  which live in `upsert_task`'s tool description, where a rule about a write belongs.
+
 `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was` renders
 **these** with the six pre-#222 template variables and asserts that a group launched
 with the advanced orchestrator **off** gets exactly that text. They are the

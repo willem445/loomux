@@ -1518,6 +1518,30 @@ export interface WorkflowStatus {
   default_branch: string | null;
   blocks: WorkflowStatusBlock[];
   gate: WorkflowGateStatus | null;
+  /** The board's declared WIP caps with their live counts (#1175). **Always
+   *  present, and empty for the repos — most of them — that declare no
+   *  `board.wip` block**, so a reader never has to tell "no caps" apart from
+   *  "an older backend that didn't send the key"… except on exactly that older
+   *  backend, which is why every consumer reads it as `?? []`. */
+  wip: WipCap[];
+}
+
+/** One declared WIP cap and how full it is right now (#1175).
+ *
+ *  `count` is computed in the BACKEND, not tallied here: `wip_occupants` in
+ *  `orchestration/mod.rs` is the one definition of what a cap counts (leaf rows
+ *  only — a container's status is a rollup of its children), and a second tally
+ *  in TypeScript would be a second definition that drifts. The board renders
+ *  `count/limit`; it does not decide either number. */
+export interface WipCap {
+  /** A board status, exactly as `TASK_STATUSES` spells it. */
+  status: string;
+  limit: number;
+  count: number;
+  /** `true` when the repo declared `board.enforce: true` — an agent's write
+   *  into this status past the cap is refused rather than warned about. The
+   *  human's own board edits are never refused, under either setting. */
+  enforce: boolean;
 }
 
 /** The group's live workflow-mode status for the lifecycle UI (Slice C). A
