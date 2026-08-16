@@ -50362,6 +50362,42 @@ fn demo_req(text: &str, task: &str) -> needsyou::RaiseRequest {
     }
 }
 
+/// A registry restarted over the same state root, with the group **loaded** —
+/// `create_group` on the same repo resumes the same id and runs the marker
+/// re-seed, which is where the one-shot migration hangs.
+///
+/// Constructing a registry alone is not enough for anything in this section:
+/// `relaunch_registry` gives a fresh in-memory instance but never touches the
+/// group, and the migration is deliberately not on any read path.
+fn relaunch_with_group(dir: &tempfile::TempDir, group: &GroupId) -> OrchRegistry {
+    let reg = relaunch_registry(dir.path());
+    let resumed = reg.create_group("C:/tmp/repo", rails()).expect("the group resumes");
+    assert_eq!(&resumed.id, group, "a relaunch on the same repo must resume the same group");
+    reg
+}
+
+/// A board written by the build BEFORE the item registry existed: demo-gated
+/// rows, no items file, and **no migration marker**.
+///
+/// Removing the marker is the premise, not a trick. A group created by today's
+/// build is stamped as migrated the moment it is created — correctly, since a
+/// board born after the registry has nothing to migrate — so a group that
+/// predates the registry is exactly one whose marker was never written.
+fn write_legacy_board(dir: &tempfile::TempDir, group: &GroupId) {
+    let tasks = json!([
+        { "id": "t-1", "title": "Parked A", "status": "prototype", "notes": [],
+          "deps": [], "related": [], "updated_ms": 1 },
+        { "id": "t-2", "title": "Parked B", "status": "human-testing", "notes": [],
+          "deps": [], "related": [], "updated_ms": 1 },
+        { "id": "t-3", "title": "Not parked", "status": "in-progress", "notes": [],
+          "deps": [], "related": [], "updated_ms": 1 },
+    ]);
+    let dir_g = dir.path().join(group.as_str());
+    fs::create_dir_all(&dir_g).unwrap();
+    fs::write(dir_g.join("tasks.json"), serde_json::to_string_pretty(&tasks).unwrap()).unwrap();
+    let _ = fs::remove_file(dir_g.join("needs-you-migrated"));
+}
+
 /// The open items for `group`, in file order — what the panel's open tier shows.
 fn open_items(reg: &OrchRegistry, group: &GroupId) -> Vec<needsyou::Item> {
     reg.needs_you(group)
@@ -50382,7 +50418,8 @@ fn a_raised_item_persists_with_its_provenance_and_survives_a_restart() {
             task: Some("  t-4  ".into()),
             urgency: needsyou::Urgency::High,
         })
-        .expect("a well-formed feedback ask registers");
+        .expect("a well-formed feedback ask registers")
+        .item;
 
     assert_eq!(item.id, "n-1", "ids are minted off the file's own high-water mark");
     assert_eq!(item.raiser, "w-3", "the raiser is recorded, not inferred");
@@ -50410,7 +50447,7 @@ fn a_raised_item_persists_with_its_provenance_and_survives_a_restart() {
     assert_eq!(after, vec![item], "the reread row is byte-for-byte the one raised");
     // …and the next id continues from it rather than colliding.
     let second = reg2.raise_needs_you(&g, "w-3", feedback_req("and the second?")).unwrap();
-    assert_eq!(second.id, "n-2");
+    assert_eq!(second.item.id, "n-2");
 }
 
 /// Validation REJECTS rather than truncates or defaults, and every refusal
@@ -50496,7 +50533,7 @@ fn retention_never_drops_an_open_item() {
     reg.raise_needs_you(&g, "orch-1", feedback_req("the open one, raised first")).unwrap();
     for n in 0..(needsyou::RESOLVED_RETAINED + 5) {
         let item =
-            reg.raise_needs_you(&g, "orch-1", feedback_req(&format!("settled {n}"))).unwrap();
+            reg.raise_needs_you(&g, "orch-1", feedback_req(&format!("settled {n}"))).unwrap().item;
         reg.resolve_needs_you(&g, &item.id, None, needsyou::ResolveSource::Webview).unwrap();
     }
     let items = reg.needs_you(&g).unwrap();
@@ -50640,7 +50677,8 @@ fn an_explicit_demo_raise_dedupes_onto_the_one_the_board_already_raised() {
 
     let again = reg
         .raise_needs_you(&g, "w-7", demo_req("please look at the sidebar", &t.id))
-        .expect("a duplicate demo raise is idempotent, not an error");
+        .expect("a duplicate demo raise is idempotent, not an error")
+        .item;
     assert_eq!(again.id, auto.id, "the existing row is returned, not a second one");
     assert_eq!(again.raiser, "board", "…unchanged, so the first raiser keeps the attribution");
     assert_eq!(again.text, auto.text, "and the existing ask is not overwritten");
@@ -50654,9 +50692,9 @@ fn an_explicit_demo_raise_dedupes_onto_the_one_the_board_already_raised() {
     // The dedupe is scoped to OPEN demo rows for THAT task — it is not a
     // one-item-per-task rule and not a one-demo-ever rule.
     reg.resolve_needs_you(&g, &auto.id, None, needsyou::ResolveSource::Webview).unwrap();
-    let fresh = reg.raise_needs_you(&g, "w-7", demo_req("look again", &t.id)).unwrap();
+    let fresh = reg.raise_needs_you(&g, "w-7", demo_req("look again", &t.id)).unwrap().item;
     assert_eq!(fresh.id, "n-2", "once the row is settled, a new ask is a new row");
-    let other = reg.raise_needs_you(&g, "w-7", demo_req("a different row", "t-99")).unwrap();
+    let other = reg.raise_needs_you(&g, "w-7", demo_req("a different row", "t-99")).unwrap().item;
     assert_eq!(other.id, "n-3", "and another task gets its own");
     // Feedback is never deduped: two people can want an opinion on one row.
     reg.raise_needs_you(&g, "w-7", needsyou::RaiseRequest {
@@ -50676,47 +50714,230 @@ fn an_explicit_demo_raise_dedupes_onto_the_one_the_board_already_raised() {
     assert_eq!(open_items(&reg, &g).len(), 4, "feedback asks stack; demos do not");
 }
 
-/// A board that was already holding parked rows when this shipped gets its items
-/// synthesized on the first read — otherwise every in-flight demo silently
-/// vanishes from the panel on the release that adds the panel's own record.
+/// The one-shot upgrade migration: a board that predates the registry gets its
+/// demo items synthesized at GROUP LOAD, exactly once, ever.
 #[test]
-fn the_backfill_synthesizes_items_for_a_pre_existing_board_and_is_idempotent() {
+fn the_migration_synthesizes_items_for_a_pre_existing_board_exactly_once() {
     let (reg, dir, g, _orch) = setup_needs_you();
     // A board written by the build BEFORE this feature: parked rows, no items
     // file at all. Writing `tasks.json` directly is what makes that the
     // premise — going through `upsert_task` would fire the hook instead.
-    let tasks = json!([
-        { "id": "t-1", "title": "Parked A", "status": "prototype", "notes": [],
-          "deps": [], "related": [], "updated_ms": 1 },
-        { "id": "t-2", "title": "Parked B", "status": "human-testing", "notes": [],
-          "deps": [], "related": [], "updated_ms": 1 },
-        { "id": "t-3", "title": "Not parked", "status": "in-progress", "notes": [],
-          "deps": [], "related": [], "updated_ms": 1 },
-    ]);
-    let dir_g = dir.path().join(g.as_str());
-    fs::create_dir_all(&dir_g).unwrap();
-    fs::write(dir_g.join("tasks.json"), serde_json::to_string_pretty(&tasks).unwrap()).unwrap();
+    write_legacy_board(&dir, &g);
     assert!(reg.needs_you(&g).unwrap().is_empty(), "the premise: no items yet");
 
-    let view = reg.needs_you_view(&g).expect("the read backfills");
+    // The READ does not migrate — that is the property, not an implementation
+    // detail. `orch_needs_you_list` is viewer-tier, and a viewer must not be
+    // able to drive a file write by polling.
+    let before = reg.needs_you_view(&g).expect("the read still works");
+    assert!(before.items.is_empty(), "a read must not migrate — it must not write at all");
+    assert!(
+        !dir.path().join(g.as_str()).join("needs-you.json").exists(),
+        "…and must not have created the file"
+    );
+
+    // A relaunch is a group load, and that is what migrates.
+    drop(reg);
+    let reg = relaunch_with_group(&dir, &g);
+    let view = reg.needs_you_view(&g).unwrap();
     assert_eq!(view.items.len(), 2, "only the PARKED rows get an item");
     let mut linked: Vec<&str> = view.items.iter().filter_map(|i| i.task.as_deref()).collect();
     linked.sort();
     assert_eq!(linked, vec!["t-1", "t-2"]);
     assert!(view.items.iter().all(|i| i.raiser == "board" && i.kind == needsyou::Kind::Demo));
+    assert!(
+        dir.path().join(g.as_str()).join("needs-you-migrated").is_file(),
+        "the marker is what makes it once-ever"
+    );
 
-    // Idempotent through the same dedupe every other raiser uses, so it is safe
-    // on every read — which is the only reason a read may write at all.
-    let again = reg.needs_you_view(&g).unwrap();
-    assert_eq!(again.items, view.items, "a second read adds nothing and rewrites nothing");
-    let (listed, omitted) = reg.needs_you_list(&g).unwrap();
-    assert_eq!(listed.len(), 2, "and the agent-facing list backfills identically");
-    assert_eq!(omitted, 0);
+    // Load again: the marker means nothing is reconsidered, and reads stay pure.
+    drop(reg);
+    let reg = relaunch_with_group(&dir, &g);
+    assert_eq!(
+        reg.needs_you_view(&g).unwrap().items,
+        view.items,
+        "a second group load adds nothing and rewrites nothing"
+    );
     assert_eq!(
         audit_of(&reg.audit_log(&g), "needs-you-open").len(),
         2,
-        "two rows, two audit lines, across three reads"
+        "two rows, two audit lines, across two loads and three reads"
     );
+}
+
+/// **The regression rev-lead round 1 blocking 1 was about.** The human's
+/// close-out has to stick.
+///
+/// Resolving a demo item deliberately does NOT move the task, so the task is
+/// still demo-gated afterwards. A migration that reconciled items against the
+/// board would therefore mint a replacement row — the resolved item coming back
+/// under a new id, and again on every subsequent resolve. Two things stop it,
+/// and this drives both: the marker (so it never re-runs) and
+/// `Dedupe::EverRaised` (so even a first run reads a settled row as accounted
+/// for).
+#[test]
+fn a_resolved_demo_item_is_never_resurrected_while_its_task_stays_parked() {
+    let (reg, dir, g, _orch) = setup_needs_you();
+    let t = reg
+        .upsert_task(&g, "orch-1", None, patch(Some("The sidebar"), Some("prototype"), None))
+        .unwrap();
+    let item = open_items(&reg, &g).remove(0);
+
+    reg.resolve_needs_you(&g, &item.id, None, needsyou::ResolveSource::Webview).unwrap();
+    assert_eq!(reg.tasks(&g)[0].status, "prototype", "the premise: resolving leaves it parked");
+
+    // The panel refresh that used to resurrect it: resolve emits
+    // `orch-needs-you-changed`, the panel re-reads, and the read minted `n-2`.
+    for _ in 0..3 {
+        let view = reg.needs_you_view(&g).unwrap();
+        assert_eq!(view.items.len(), 1, "a read must never mint a replacement row");
+        assert_eq!(view.items[0].id, item.id);
+        assert_eq!(view.items[0].status, needsyou::Status::Resolved);
+    }
+
+    // …and not across a restart either, which is where the marker earns its
+    // keep: a group load DOES migrate, and must still not undo the close-out.
+    drop(reg);
+    let reg = relaunch_with_group(&dir, &g);
+    let after = reg.needs_you(&g).unwrap();
+    assert_eq!(after.len(), 1, "a group load must not resurrect it either");
+    assert_eq!(after[0].id, item.id);
+    assert_eq!(after[0].resolved_by.as_deref(), Some("webview"), "still the human's close-out");
+    assert!(
+        open_items(&reg, &g).is_empty(),
+        "nothing is open for a task the human has already signed off"
+    );
+
+    // The board is still the authority on a NEW episode: re-parking gives a
+    // fresh row, so none of the above has made this task permanently silent.
+    reg.upsert_task(&g, "orch-1", Some(&t.id), patch(None, Some("in-progress"), None)).unwrap();
+    reg.upsert_task(&g, "orch-1", Some(&t.id), patch(None, Some("prototype"), None)).unwrap();
+    let open = open_items(&reg, &g);
+    assert_eq!(open.len(), 1, "a second parking is a second ask");
+    assert_ne!(open[0].id, item.id, "…with its own id and its own timestamps");
+}
+
+/// The same guarantee for the other settle an agent can reach: a withdrawn demo
+/// item on a still-parked task must not come back attributed to `board`.
+#[test]
+fn a_withdrawn_demo_item_is_never_resurrected_while_its_task_stays_parked() {
+    let (reg, dir, g, _orch) = setup_needs_you();
+    reg.upsert_task(&g, "orch-1", None, patch(Some("The sidebar"), Some("human-testing"), None))
+        .unwrap();
+    let item = open_items(&reg, &g).remove(0);
+    reg.withdraw_needs_you(&g, "orch-1", &item.id).unwrap();
+
+    assert!(reg.needs_you_view(&g).unwrap().items.iter().all(|i| i.status.is_resolved()));
+    drop(reg);
+    let reg = relaunch_with_group(&dir, &g);
+    let after = reg.needs_you(&g).unwrap();
+    assert_eq!(after.len(), 1, "the withdrawal stands across a group load");
+    assert_eq!(after[0].resolved_by.as_deref(), Some("withdrawn:orch-1"));
+}
+
+/// `needs_you_view` and `needs_you_list` are PURE READS. Stated as its own test
+/// because the property is invisible in their bodies once the migration moved:
+/// nothing about a read failing to write is self-evident from a call site, and
+/// this is what makes putting work back on that path fail CI.
+#[test]
+fn the_read_paths_write_nothing_even_with_a_board_that_would_migrate() {
+    let (reg, dir, g, _orch) = setup_needs_you();
+    write_legacy_board(&dir, &g);
+    let dir_g = dir.path().join(g.as_str());
+    let items_path = dir_g.join("needs-you.json");
+    let marker_path = dir_g.join("needs-you-migrated");
+
+    for _ in 0..3 {
+        assert!(reg.needs_you_view(&g).unwrap().items.is_empty());
+        assert_eq!(reg.needs_you_list(&g).unwrap().0.len(), 0);
+    }
+    assert!(!items_path.exists(), "a read created the items file");
+    assert!(!marker_path.exists(), "a read claimed the migration");
+    assert!(
+        audit_of(&reg.audit_log(&g), "needs-you-open").is_empty(),
+        "a read appended an audit line — on the remote engine that is a viewer growing the log"
+    );
+
+    // And once a group load HAS migrated, reads still write nothing: the file's
+    // bytes are the check, so a rewrite with identical content would fail too.
+    drop(reg);
+    let reg = relaunch_with_group(&dir, &g);
+    let bytes = fs::read_to_string(&items_path).expect("the load migrated");
+    for _ in 0..3 {
+        reg.needs_you_view(&g).unwrap();
+        reg.needs_you_list(&g).unwrap();
+    }
+    assert_eq!(fs::read_to_string(&items_path).unwrap(), bytes, "a read rewrote the file");
+}
+
+/// What an AGENT is shown of an item is an enumerated projection, never the
+/// stored row — so a field added to `Item` cannot reach an agent surface just by
+/// existing (#1160's failure class).
+#[test]
+fn the_agent_facing_list_projects_and_withholds_the_humans_close_out_note() {
+    let (reg, _d, g, _orch) = setup_needs_you();
+    let raised = reg.raise_needs_you(&g, "w-1", feedback_req("what do you think?")).unwrap();
+    reg.resolve_needs_you(
+        &g,
+        &raised.item.id,
+        Some("ship it, but the empty state needs work"),
+        needsyou::ResolveSource::Webview,
+    )
+    .unwrap();
+
+    let (listed, _) = reg.needs_you_list(&g).unwrap();
+    let row = &listed[0];
+    // Everything an agent needs to decide what to do next…
+    assert_eq!(row.id, raised.item.id);
+    assert_eq!(row.text, "what do you think?");
+    assert_eq!(row.status, needsyou::Status::Resolved);
+    assert_eq!(
+        row.resolved_by.as_deref(),
+        Some("webview"),
+        "an orchestrator must still be able to tell a human's close-out from the board's"
+    );
+    // …and the one bit about the note, rather than the note.
+    assert!(row.had_resolution, "the existence of a note is what an agent needs to know");
+
+    // The withholding is asserted on the SERIALIZED form, which is what actually
+    // crosses to an agent — a field present on the struct but absent from the
+    // wire would pass a field-by-field check and still leak.
+    let wire = serde_json::to_value(&listed).unwrap();
+    let text = serde_json::to_string(&wire).unwrap();
+    assert!(
+        !text.contains("the empty state needs work"),
+        "the human's verbatim close-out must not reach a shared agent read: {text}"
+    );
+    assert!(!text.contains("\"resolution\""), "…nor the field itself: {text}");
+    // The record still holds it — this is a projection, not a deletion.
+    assert_eq!(
+        reg.needs_you(&g).unwrap()[0].resolution.as_deref(),
+        Some("ship it, but the empty state needs work"),
+        "the registry keeps the human's words; only the agent view drops them"
+    );
+}
+
+/// A deduped raise returns the EXISTING row and says so, because it discards the
+/// new ask's text — a caller with an author to answer has to be able to tell.
+#[test]
+fn a_deduped_raise_reports_that_it_was_not_registered_fresh() {
+    let (reg, _d, g, _orch) = setup_needs_you();
+    let t = reg
+        .upsert_task(&g, "orch-1", None, patch(Some("The sidebar"), Some("prototype"), None))
+        .unwrap();
+
+    let again = reg
+        .raise_needs_you(&g, "w-7", demo_req("look at the EMPTY STATE specifically", &t.id))
+        .unwrap();
+    assert!(!again.fresh, "a dedupe must be reported, not silently returned as a registration");
+    assert!(
+        !again.item.text.contains("EMPTY STATE"),
+        "the existing row's text is kept — which is exactly why `fresh` has to be surfaced: {:?}",
+        again.item.text
+    );
+
+    let fresh = reg.raise_needs_you(&g, "w-7", feedback_req("and the colour?")).unwrap();
+    assert!(fresh.fresh, "a genuine registration reports fresh");
+    assert_eq!(fresh.item.text, "and the colour?");
 }
 
 /// Resolving is the human's close-out: it settles the row, records WHICH trusted
@@ -50733,7 +50954,8 @@ fn a_human_resolve_settles_the_row_and_a_note_reaches_the_orchestrator_sanitized
     // per tidy is noise the orchestrator pays for.
     let quiet = reg
         .raise_needs_you(&g, "w-1", feedback_req("what do you think?"))
-        .unwrap();
+        .unwrap()
+        .item;
     let before = delivered_texts(&reg, &g).len();
     reg.resolve_needs_you(&g, &quiet.id, None, needsyou::ResolveSource::Webview).unwrap();
     assert_eq!(delivered_texts(&reg, &g).len(), before, "a note-less resolve delivers nothing");
@@ -50883,7 +51105,8 @@ fn clear_completed_stamps_a_watermark_and_leaves_every_row_untouched() {
 fn the_list_projection_caps_the_resolved_tail_and_reports_what_it_omitted() {
     let (reg, _d, g, _orch) = setup_needs_you();
     for n in 0..(needsyou::LIST_RESOLVED_CAP + 4) {
-        let item = reg.raise_needs_you(&g, "w-1", feedback_req(&format!("settled {n}"))).unwrap();
+        let item =
+            reg.raise_needs_you(&g, "w-1", feedback_req(&format!("settled {n}"))).unwrap().item;
         reg.resolve_needs_you(&g, &item.id, None, needsyou::ResolveSource::Webview).unwrap();
     }
     reg.raise_needs_you(&g, "w-1", feedback_req("open one")).unwrap();

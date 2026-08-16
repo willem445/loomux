@@ -24571,11 +24571,12 @@ impl OrchRegistry {
 
     /// The webview's read: every item plus the watermark, in one round trip.
     ///
-    /// Runs the upgrade backfill first (see [`Self::backfill_demo_items`]) — the
-    /// one place a read is allowed to write, and only ever to ADD the demo items
-    /// a pre-#1151 board already deserved.
+    /// **A pure read — it writes nothing.** It used to run the upgrade migration
+    /// inline, which was wrong twice over (rev-lead round 1): it re-raised rows
+    /// the human had just resolved, and it made a `viewer`-tier command write a
+    /// file, emit an event and grow the audit log on a poll. The migration is now
+    /// a once-ever step at group load — see [`Self::migrate_demo_items`].
     pub fn needs_you_view(&self, group: &GroupId) -> Result<needsyou::View, String> {
-        self.backfill_demo_items(group)?;
         Ok(needsyou::View {
             items: self.needs_you(group)?,
             cleared_ms: self.needs_you_cleared_ms(group),
@@ -24584,12 +24585,16 @@ impl OrchRegistry {
 
     /// An agent-facing list: open items first, then the newest resolved rows up
     /// to the cap, with the omitted count alongside so a filtered list is never
-    /// mistaken for the whole one. [`Self::question_list`]'s shape.
+    /// mistaken for the whole one. [`Self::question_list`]'s shape, and a pure
+    /// read for [`Self::needs_you_view`]'s reason.
+    ///
+    /// Returns [`needsyou::AgentItem`]s rather than stored rows — the projection
+    /// is the return type so that a field added to `Item` cannot reach an agent
+    /// surface just by existing.
     pub fn needs_you_list(
         &self,
         group: &GroupId,
-    ) -> Result<(Vec<needsyou::Item>, usize), String> {
-        self.backfill_demo_items(group)?;
+    ) -> Result<(Vec<needsyou::AgentItem>, usize), String> {
         Ok(needsyou::project_list(&self.needs_you(group)?, needsyou::LIST_RESOLVED_CAP))
     }
 
@@ -24600,31 +24605,38 @@ impl OrchRegistry {
     /// a second row — the dedupe that lets the board hook and an explicit raise
     /// coexist without duplicating the human's queue (see [`needsyou::admit`],
     /// which is where that decision lives for all three callers).
+    /// Returns [`needsyou::Raised`], not a bare item: a caller with an author to
+    /// answer must be able to tell a fresh registration from a dedupe, because a
+    /// dedupe keeps the EXISTING row's text and drops the new ask's.
     pub fn raise_needs_you(
         &self,
         group: &GroupId,
         raiser: &str,
         req: needsyou::RaiseRequest,
-    ) -> Result<needsyou::Item, String> {
-        let (item, fresh) = {
+    ) -> Result<needsyou::Raised, String> {
+        let raised = {
             let _guard = self.needs_you_lock.lock_safe();
             let mut items = self.needs_you(group)?;
-            let (item, fresh) = needsyou::admit(&mut items, raiser, req, now_ms())?;
-            if fresh {
+            // `OpenEpisode`: a settled row is a CLOSED episode, so a task that
+            // re-enters the gate gets a new row. Only the one-shot migration
+            // uses `EverRaised` — see `needsyou::Dedupe`.
+            let raised =
+                needsyou::admit(&mut items, raiser, req, now_ms(), needsyou::Dedupe::OpenEpisode)?;
+            if raised.fresh {
                 needsyou::prune(&mut items, needsyou::RESOLVED_RETAINED);
                 self.write_needs_you(group, &items)?;
             }
-            (item, fresh)
+            raised
         };
-        if fresh {
+        if raised.fresh {
             self.audit(
                 group,
                 raiser,
                 "needs-you-open",
-                serde_json::to_value(&item).unwrap_or(Value::Null),
+                serde_json::to_value(&raised.item).unwrap_or(Value::Null),
             );
         }
-        Ok(item)
+        Ok(raised)
     }
 
     /// Take back an item the raiser no longer needs a human to look at.
@@ -24763,24 +24775,56 @@ impl OrchRegistry {
         Ok(item)
     }
 
-    /// Synthesize the demo items a board already deserves but does not have.
+    /// **The one-shot upgrade migration**: synthesize the demo items a board
+    /// deserved before this registry existed. Runs at most once per group, ever.
     ///
-    /// **Why a read path writes.** Auto-raise hangs off the status TRANSITION in
-    /// `upsert_task`, and a board holding demo-gated rows at the moment this
-    /// ships has already made those transitions — so without this, every
-    /// in-flight demo silently vanishes from the panel on the release that adds
-    /// the panel's own record. There is no other trigger: the rows may sit
-    /// untouched for days.
+    /// # Why it exists
     ///
-    /// Idempotent, through the same [`needsyou::admit`] dedupe every other
-    /// raiser uses, so it is safe on every read: a second call raises nothing.
-    /// It writes at most once — only when it actually added rows — so the steady
-    /// state costs one board read and one items read.
+    /// Auto-raise hangs off the status TRANSITION in `upsert_task`, and a board
+    /// holding demo-gated rows at the moment this ships has already made those
+    /// transitions — so without this, every in-flight demo silently vanishes
+    /// from the panel on the release that adds the panel's own record. The rows
+    /// may then sit untouched for days with nothing to trigger a raise.
+    ///
+    /// # Why it is a migration and not a reconciliation
+    ///
+    /// This is the shape rev-lead's round-1 blocking finding was about, and the
+    /// distinction is the fix. As a *reconciliation* — "make the items agree
+    /// with the board, on every read" — it was actively wrong: a human resolving
+    /// a demo item deliberately does NOT move the task, so the task is still
+    /// demo-gated one refresh later, and the next read minted a replacement row
+    /// under a new id. The human's close-out came back, and again on every
+    /// subsequent resolve. The same held for an agent's withdrawal.
+    ///
+    /// As a *migration* it is well defined: it answers "did this group exist
+    /// before the registry did", which is asked once and never changes. Two
+    /// things enforce that, and both are needed:
+    ///
+    /// 1. **The [`needsyou::MIGRATED_MARKER`]**, written even when nothing was
+    ///    added. Without it, every resume would re-run and re-raise.
+    /// 2. **[`needsyou::Dedupe::EverRaised`]**, so that even a first run treats a
+    ///    *settled* demo row as proof the task is already accounted for. A raise
+    ///    uses `OpenEpisode` instead, because for a raise a settled row is a
+    ///    closed episode and a re-parked task deserves a new one.
+    ///
+    /// # Where it runs
+    ///
+    /// At group load (`create_group_ex`'s marker re-seed), beside the pause,
+    /// notify and autonomy markers it resembles — **never on a read**. That
+    /// keeps `orch_needs_you_list` a genuine `viewer`-tier command: on the
+    /// remote engine a peer holding only read rights must not be able to drive
+    /// a file write, an event emission and audit growth by polling.
     ///
     /// Best-effort per row against the cap: a board with more parked tasks than
-    /// [`needsyou::OPEN_MAX`] backfills what fits and audits the refusal rather
-    /// than failing the read that triggered it.
-    fn backfill_demo_items(&self, group: &GroupId) -> Result<(), String> {
+    /// [`needsyou::OPEN_MAX`] migrates what fits and audits the refusal rather
+    /// than failing the group load that triggered it. The marker is still
+    /// written — a partial migration is the answer for this board, and retrying
+    /// it on every resume would be the reconciliation this is not.
+    fn migrate_demo_items(&self, group: &GroupId) {
+        let dir = self.group_dir(group);
+        if dir.join(needsyou::MIGRATED_MARKER).is_file() {
+            return;
+        }
         // The board read is outside the lock and lock-free itself (`tasks` does
         // not take `tasks_lock`), which is what keeps the documented nesting
         // one-directional: `tasks_lock` → `needs_you_lock`, never the reverse.
@@ -24789,25 +24833,57 @@ impl OrchRegistry {
             .into_iter()
             .filter(|t| is_demo_gated(&t.status))
             .collect();
-        if parked.is_empty() {
-            return Ok(());
-        }
         let (added, refused) = {
+            // The marker is re-checked and written inside this guard, so two
+            // resumes racing on one group cannot both decide the migration is
+            // outstanding and both raise.
             let _guard = self.needs_you_lock.lock_safe();
-            let mut items = self.needs_you(group)?;
+            if dir.join(needsyou::MIGRATED_MARKER).is_file() {
+                return;
+            }
             let mut added: Vec<needsyou::Item> = Vec::new();
             let mut refused: Vec<(String, String)> = Vec::new();
-            for task in &parked {
-                let req = needsyou::RaiseRequest::demo_for(&task.id, &task.title, &task.status);
-                match needsyou::admit(&mut items, "board", req, now_ms()) {
-                    Ok((item, true)) => added.push(item),
-                    Ok((_, false)) => {}
-                    Err(e) => refused.push((task.id.clone(), e)),
+            if !parked.is_empty() {
+                let mut items = match self.needs_you(group) {
+                    Ok(items) => items,
+                    Err(e) => {
+                        // Leave the marker UNwritten: an unreadable file is the
+                        // one case where retrying next resume is right, because
+                        // nothing was decided and nothing was lost.
+                        self.audit(group, "board", "needs-you-reject", json!({
+                            "op": "migrate", "reason": "unreadable", "detail": e,
+                        }));
+                        return;
+                    }
+                };
+                for task in &parked {
+                    let req = needsyou::RaiseRequest::demo_for(&task.id, &task.title, &task.status);
+                    match needsyou::admit(
+                        &mut items,
+                        "board",
+                        req,
+                        now_ms(),
+                        needsyou::Dedupe::EverRaised,
+                    ) {
+                        Ok(raised) if raised.fresh => added.push(raised.item),
+                        Ok(_) => {}
+                        Err(e) => refused.push((task.id.clone(), e)),
+                    }
+                }
+                if !added.is_empty() {
+                    needsyou::prune(&mut items, needsyou::RESOLVED_RETAINED);
+                    if let Err(e) = self.write_needs_you(group, &items) {
+                        self.audit(group, "board", "needs-you-reject", json!({
+                            "op": "migrate", "reason": "unwritable", "detail": e,
+                        }));
+                        return;
+                    }
                 }
             }
-            if !added.is_empty() {
-                needsyou::prune(&mut items, needsyou::RESOLVED_RETAINED);
-                self.write_needs_you(group, &items)?;
+            // Written last, and written even for an empty board: from here on
+            // "already considered" and "found nothing to do" are the same answer.
+            if fs::create_dir_all(&dir).is_ok() {
+                let _ = atomic_write(&dir.join(needsyou::MIGRATED_MARKER), b"");
             }
             (added, refused)
         };
@@ -24821,10 +24897,9 @@ impl OrchRegistry {
         }
         for (task, detail) in &refused {
             self.audit(group, "board", "needs-you-reject", json!({
-                "op": "backfill", "task": task, "reason": "raise-refused", "detail": detail,
+                "op": "migrate", "task": task, "reason": "raise-refused", "detail": detail,
             }));
         }
-        Ok(())
     }
 
     /// Map a board status transition onto the task's demo item (#1151).
@@ -27269,6 +27344,14 @@ impl OrchRegistry {
         if dir.join("spawn_expanded").is_file() {
             self.spawn_expanded_groups.lock_safe().insert(id.clone());
         }
+        // The #1151 needs-you migration: a board that was already holding
+        // demo-gated rows before the item registry existed gets its items
+        // synthesized here, exactly once ever, guarded by its own marker like
+        // every durable per-group fact above it. Group load rather than the
+        // panel's read, deliberately — `orch_needs_you_list` is a `viewer`-tier
+        // command and must not be able to write a file. Best-effort: a group
+        // must still load if its items file will not.
+        self.migrate_demo_items(&id);
         // Autonomous mode (#83) and the auto-merge gate are durable per-group
         // choices too; re-seed them so a resumed group keeps ticking (and its
         // budget anchor, stored in the marker's content) across restarts. Audit
@@ -48722,11 +48805,16 @@ pub async fn orch_question_answer(
 /// render this second's rows against last second's watermark and flash back a
 /// row the human had just cleared.
 ///
-/// Off-thread (#743 S4c) like every other fs-touching command. Unlike
-/// `orch_questions_list` this one is **not** lock-free: it runs the upgrade
-/// backfill, which is the single read path allowed to write (and only ever to
-/// ADD the demo items a pre-#1151 board already deserved — see
-/// `backfill_demo_items`).
+/// Off-thread (#743 S4c) like every other fs-touching command, and — like
+/// `orch_questions_list` — **a pure read that writes nothing and takes no
+/// lock**. That is a deliberate property rather than an accident of the
+/// implementation: this command is classified `viewer` in the remote-engine
+/// roster (`remote-engine-protocol.md` §5.4), and that tier is defined as
+/// "cannot write a file". An earlier revision ran the upgrade migration inline
+/// here, which made a viewer-tier poll drive a file write, an event emission and
+/// audit growth — and re-raised rows the human had just resolved. The migration
+/// now runs once ever at group load; see `OrchRegistry::migrate_demo_items`.
+/// **Do not put work back on this path.**
 ///
 /// **A read failure reads as empty here, and only here.** The registry method is
 /// deliberately loud about a malformed file — a read-modify-write that treats

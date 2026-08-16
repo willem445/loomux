@@ -170,8 +170,10 @@ whole file, uncapped, for `orch_questions_list`'s reason — retention already
 bounds it, and a cap whose size the caller cannot see is the silent truncation
 the rest of this feature refuses.
 
-**It is the one read allowed to write**, because it runs the upgrade backfill
-(below).
+**It is a pure read.** It writes nothing, takes no lock, and must stay that way:
+§5.4 of `remote-engine-protocol.md` classifies it `viewer`, and that tier is
+defined as "cannot write a file". The upgrade migration used to run here; see
+[the migration](#the-one-shot-migration) for why that was wrong twice over.
 
 ### `orch-needs-you-changed`
 
@@ -270,28 +272,61 @@ leaves the queue when the work actually moves.
 **No duplication by construction** (#1151 decision D2). The dedupe lives in one
 pure function, `needsyou::admit`: a `demo` raise for a task that already has an
 open demo item returns the existing row rather than a second one, whether the
-hook, the backfill or an explicit `request_attention` asked. Dedupe runs *before*
+hook, the migration or an explicit `request_attention` asked. Dedupe runs *before*
 the cap, so a duplicate raise stays idempotent even on a full queue — otherwise
 the hook would start failing exactly when the backlog is worst. Feedback asks are
 never deduped: two agents can legitimately want an opinion on one row.
+
+**A deduped raise keeps the EXISTING row's text and discards the new ask's**, so
+`admit` returns a `Raised { item, fresh }` rather than a bare item. For the hook
+that bit is uninteresting; for a caller with an author to answer it is the
+difference between "registered" and "there was already one of these, and your
+words were not stored". Slice B's `request_attention` must say which.
 
 **Both halves are best-effort against the board.** The board write has already
 landed and cannot be unwound, so a raise refused by the cap, or an items file
 that will not read, is audited as a `needs-you-reject` rather than turned into an
 error that would make a successful board move look failed.
 
-### The backfill
+### The one-shot migration
 
 A board already holding demo-gated rows when this ships has made its transitions
-already, so without a backfill every in-flight demo would silently vanish from
-the panel on the release that adds the panel's own record. `backfill_demo_items`
-synthesizes the missing rows on the first list/load.
+already, so without this every in-flight demo would silently vanish from the
+panel on the release that adds the panel's own record. `migrate_demo_items`
+synthesizes the missing rows.
 
-It is the one place a read writes, and it is safe there for exactly one reason:
-it goes through the same `admit` dedupe as everything else, so it is idempotent —
-a second read adds nothing and rewrites nothing. It writes at most once per call,
-only when it actually added rows, so the steady state costs one board read and
-one items read.
+**It is a migration, not a reconciliation, and that distinction is the design.**
+The first cut ran it on every read and deduped on open rows only. That was
+actively wrong, because resolving a demo item deliberately does *not* move the
+task: the task was still demo-gated one refresh later, so the next read minted a
+replacement row under a new id. The human's close-out came back — and again on
+every subsequent resolve, and the same for an agent's withdrawal. A read that
+reconciles the item file against the board can only ever fight the human.
+
+Framed as a migration the question is well posed — "did this group exist before
+the registry did?" — asked once, answered once, never changing. Two mechanisms
+enforce that, and both are load-bearing:
+
+1. **The `needs-you-migrated` marker**, written even when nothing was added
+   (`already considered` and `found nothing to do` are the same answer for every
+   run after the first). Without it, every group resume would re-run and
+   re-raise.
+2. **`Dedupe::EverRaised`** — for the migration, *any* demo row for the task,
+   settled or not, is proof the registry has already seen it. A raise uses
+   `Dedupe::OpenEpisode` instead, because there a settled row is a closed episode
+   and a re-parked task genuinely deserves a new one. The two scopes are a named
+   enum rather than a bool precisely so the difference cannot be lost again.
+
+**It runs at group load**, beside the pause / notify / autonomy marker re-seeds
+it resembles — never on a read. That is what keeps `orch_needs_you_list` an
+honest `viewer`-tier command: a peer holding only read rights must not be able to
+drive a file write, an event emission and audit growth by polling. A group whose
+panel can be open has been through that load path this session, so the trigger is
+not weaker than the read was.
+
+Re-parking is not this mechanism's job and never was: the transition hook already
+gives a task that leaves and re-enters the gate a fresh row, which is pinned
+separately.
 
 ## Concurrency
 
@@ -303,9 +338,9 @@ own like `questions_lock`.
 its demo item cannot settle in opposite orders under two racing transitions — an
 in-then-out landing as out-then-in would leave an open demo item on a task that
 is no longer parked, which is precisely the stale row the auto-resolve exists to
-prevent. Nothing takes `tasks_lock` while holding `needs_you_lock`: the backfill
-reads the board through `tasks()`, which is a lock-free file read, so the nesting
-cannot cycle.
+prevent. Nothing takes `tasks_lock` while holding `needs_you_lock`: the migration
+reads the board through `tasks()`, which is a lock-free file read, and does so
+*before* acquiring the items lock, so the nesting cannot cycle.
 
 Also taken under the guard, both leaves and both the same nesting `tasks_lock`
 already has: `AUDIT_LOCK` on the refusal paths, and the app-handle mutex on every
@@ -329,7 +364,7 @@ delivery enqueues.
 ## What slice A does and does not reach
 
 **Reaches:** the entity, the registry and its caps, the lifecycle hook and
-backfill, the watermark, the three Tauri commands and their ACL grants, the
+one-shot migration, the watermark, the three Tauri commands and their ACL grants, the
 audit actions, the event.
 
 **Does not reach, and is not silently missing:**

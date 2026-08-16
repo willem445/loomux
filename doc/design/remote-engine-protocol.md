@@ -580,6 +580,15 @@ pins.
 > human-connection-only, since it hard-codes its own trusted source rather than
 > taking one — while the clear is operator, because it stamps a per-group *view*
 > watermark that mutates no record and by construction cannot reach an open row.
+> **`orch_needs_you_list`'s viewer row is the one that had to be earned rather
+> than asserted**, and it is worth recording how: as first written, that command
+> ran the #1151 upgrade migration inline, so it wrote `needs-you.json`, emitted an
+> event and appended audit lines — from a *read*, on a poll. Its own doc comment
+> said so in as many words while the table called it viewer, which is a tier
+> definition ("cannot write a file") contradicted by the command it was applied
+> to. The fix moved the migration to group load rather than relabelling the
+> command, because the write was the defect and the tier was right; that is the
+> direction to prefer whenever a classification and an implementation disagree.
 > Every count in the table was re-derived from `APP_COMMANDS` and its `n` column
 > checked to sum to it, per the paragraph below.
 > **Slice C still owns the enforcement.** C2's roster test
