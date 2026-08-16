@@ -469,22 +469,10 @@ pub fn validate_ask(req: AskRequest) -> Result<AskRequest, String> {
     // believed it was shaping a choice the human would be offered, and storing
     // them silently would leave that belief uncorrected. Refuse, and name the
     // missing half.
-    if options.is_empty() {
-        if req.select.is_some() {
-            return Err(
-                "select needs options — it says how many of them the human may pick, and this \
-                 question offers none"
-                    .into(),
-            );
-        }
-        if req.allow_free_text == Some(false) {
-            return Err(
-                "allow_free_text: false needs options — with no options and no free text there \
-                 is nothing left for the human to answer with"
-                    .into(),
-            );
-        }
-    }
+    // [scratch] NEUTERED: the whole options-less refusal is gone, so `select`
+    // and `allow_free_text: false` are absorbed silently on a question that
+    // offers nothing to select. Every other refusal (bounds, empty label,
+    // unknown select, malformed item) is untouched.
     let task = req.task.map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
     Ok(AskRequest {
         text,
