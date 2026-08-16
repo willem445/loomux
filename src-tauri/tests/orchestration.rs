@@ -48434,7 +48434,16 @@ fn ask_human_registers_a_pending_question_and_answers_the_caller_immediately() {
     assert_eq!(q.id, "q-1");
     assert_eq!(q.asker, orch_id, "the asker is recorded, not inferred");
     assert_eq!(q.text, "Ship the rename in this PR or split it?", "text is trimmed");
-    assert_eq!(q.options, vec!["ship it here".to_string(), "split it".to_string()]);
+    // Re-spelled for `OptionSpec` (#1091), asserting the same thing it always
+    // did: a Q1-shaped call — bare strings, nothing richer — still stores
+    // exactly those strings.
+    assert_eq!(
+        q.options,
+        vec![
+            humanq::OptionSpec::Plain("ship it here".to_string()),
+            humanq::OptionSpec::Plain("split it".to_string()),
+        ]
+    );
     assert_eq!(q.task.as_deref(), Some("t-4"));
     assert_eq!(q.urgency, humanq::Urgency::High);
     assert_eq!(q.status, humanq::Status::Pending);
@@ -49147,4 +49156,281 @@ fn retention_drops_old_settled_rows_and_never_a_pending_one() {
     let ids: Vec<String> = reg.questions(&g).unwrap().into_iter().map(|q| q.id).collect();
     let fresh = ids.last().unwrap();
     assert_eq!(fresh, &format!("q-{}", settled + 5), "{ids:?}");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// The ask SHAPE (#1091 slice A)
+//
+// What a human is offered when a question reaches them: named alternatives
+// that can carry the trade-off under the label, one pick or several, and — by
+// default, always — the ability to type an answer nobody listed. The panel
+// that renders it is a later slice; these pin that the shape survives the
+// engine, since a durable record is the only thing a renderer can render.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// An option can carry the trade-off under its label — and an option that
+/// carries none is stored as the bare string it was in Q1.
+///
+/// Split from the pick-shape test below rather than asserted alongside it: an
+/// `assert` that panics stops the test, so two properties in one test means a
+/// mutation of the second can never be evidenced.
+#[test]
+fn ask_human_carries_option_descriptions_and_stores_the_rest_as_plain_strings() {
+    let (reg, dir, g, co, cw, _) = setup_questions();
+
+    let out = q_call(&reg, &co, "ask_human", json!({
+        "text": "Which platforms must go green before this merges?",
+        "options": [
+            { "label": "  all three  ", "description": "  slowest, and the only claim CI can back  " },
+            { "label": "windows only", "description": "" },
+            "ubuntu only"
+        ],
+        "task": "t-4",
+    }));
+    assert_eq!(out["isError"], false, "{}", q_text(&out));
+
+    let q = reg.questions(&g).expect("questions.json readable").remove(0);
+    assert_eq!(
+        q.options,
+        vec![
+            humanq::OptionSpec::Detailed {
+                label: "all three".to_string(),
+                description: "slowest, and the only claim CI can back".to_string(),
+            },
+            // Given as an object, stored as the string it is: an option with
+            // an empty description is not an option that HAS a description.
+            humanq::OptionSpec::Plain("windows only".to_string()),
+            humanq::OptionSpec::Plain("ubuntu only".to_string()),
+        ],
+        "label and description are trimmed, and a description-less option normalizes to a string"
+    );
+    assert_eq!(q.options[0].label(), "all three");
+    assert_eq!(q.options[0].description(), Some("slowest, and the only claim CI can back"));
+    assert_eq!(q.options[1].description(), None, "an empty description never reaches a renderer");
+
+    // The FILE, not just the parsed struct: the object form appears exactly
+    // where a description was actually given, so a build that never uses
+    // descriptions goes on writing what Q1 wrote.
+    let raw: Value = serde_json::from_str(
+        &fs::read_to_string(dir.path().join(g.as_str()).join("questions.json")).unwrap(),
+    )
+    .expect("questions.json is valid json");
+    assert_eq!(raw[0]["options"][0]["label"], "all three", "{}", raw[0]["options"]);
+    assert_eq!(raw[0]["options"][1], json!("windows only"), "{}", raw[0]["options"]);
+    assert_eq!(raw[0]["options"][2], json!("ubuntu only"), "{}", raw[0]["options"]);
+
+    // …and it reaches the read tier both roles share, which is where the
+    // NEEDS-YOU panel and any presenting agent will find it.
+    let listed = q_call(&reg, &cw, "list_questions", json!({}));
+    let body: Value = serde_json::from_str(&q_text(&listed)).unwrap();
+    assert_eq!(
+        body["questions"][0]["options"][0]["description"],
+        "slowest, and the only claim CI can back"
+    );
+}
+
+/// How many picks, and whether the human may write their own answer — carried
+/// when the ask says so, and permissive when it does not.
+#[test]
+fn ask_human_carries_the_pick_shape_and_defaults_to_the_human_keeping_their_own_words() {
+    let (reg, dir, g, co, _cw, _) = setup_questions();
+
+    let out = q_call(&reg, &co, "ask_human", json!({
+        "text": "Which platforms must go green before this merges?",
+        "options": ["ubuntu", "windows", "macos"],
+        "select": "multi",
+        "allow_free_text": false,
+    }));
+    assert_eq!(out["isError"], false, "{}", q_text(&out));
+
+    let q = reg.questions(&g).expect("questions.json readable").remove(0);
+    assert_eq!(q.select, humanq::Select::Multi, "the ask said several picks are legitimate");
+    assert!(!q.allow_free_text, "the ask closed the free-text escape explicitly");
+    let raw: Value = serde_json::from_str(
+        &fs::read_to_string(dir.path().join(g.as_str()).join("questions.json")).unwrap(),
+    )
+    .expect("questions.json is valid json");
+    assert_eq!(raw[0]["select"], "multi", "the pick shape is durable, not a parse-time nicety");
+    assert_eq!(raw[0]["allow_free_text"], false);
+
+    // THE DEFAULT IS THE PERMISSIVE ONE. An ask that offers options and says
+    // nothing else still leaves the human able to answer something the
+    // orchestrator did not think of — the affordance this slice exists for,
+    // and the one a `false` default would silently take away.
+    q_call(&reg, &co, "ask_human", json!({ "text": "A or B?", "options": ["A", "B"] }));
+    let quiet = reg.questions(&g).unwrap().remove(1);
+    assert!(
+        quiet.allow_free_text,
+        "an ask that said nothing must not close the human's escape hatch"
+    );
+    assert_eq!(quiet.select, humanq::Select::Single, "…and a question is a decision by default");
+}
+
+/// **The no-migration claim, tested against a file rather than asserted.**
+///
+/// The rows in `questions.json` when this ships are questions a human has not
+/// answered yet — the one thing the registry exists to not lose. So a file
+/// written by the Q1 build (bare-string options, no `select`, no
+/// `allow_free_text`) must load, list, and take a new ask appended beside it,
+/// with the defaults read as what those rows always meant.
+#[test]
+fn a_questions_file_written_by_the_q1_build_loads_unmigrated() {
+    let (reg, dir, g, co, _cw, _) = setup_questions();
+
+    // Verbatim Q1 shape: every field it wrote, and not one this slice added.
+    let q1_file = r#"[
+      {
+        "id": "q-1",
+        "asker": "orch-1",
+        "text": "Ship the rename in this PR or split it?",
+        "options": ["ship it here", "split it"],
+        "task": "t-4",
+        "urgency": "high",
+        "status": "pending",
+        "created_ms": 1750000000000
+      }
+    ]"#;
+    let path = dir.path().join(g.as_str()).join("questions.json");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, q1_file).unwrap();
+
+    let qs = reg.questions(&g).expect("a Q1-shaped file still parses");
+    assert_eq!(qs.len(), 1, "the pending row a human has not answered is still there");
+    assert_eq!(
+        qs[0].options,
+        vec![
+            humanq::OptionSpec::Plain("ship it here".to_string()),
+            humanq::OptionSpec::Plain("split it".to_string()),
+        ],
+        "bare-string options are still options"
+    );
+    assert_eq!(qs[0].select, humanq::Select::Single, "an absent select reads as one pick");
+    assert!(
+        qs[0].allow_free_text,
+        "an absent allow_free_text must read as TRUE — free text was the only answer surface \
+         those rows were ever written for, and defaulting it to false would retroactively take \
+         the human's answer away"
+    );
+
+    // It lists, and a new ask lands beside it — the read-modify-write path a
+    // parse failure would have turned into a data loss.
+    let listed = q_call(&reg, &co, "list_questions", json!({}));
+    let body: Value = serde_json::from_str(&q_text(&listed)).unwrap();
+    assert_eq!(body["questions"][0]["id"], "q-1");
+    q_call(&reg, &co, "ask_human", json!({ "text": "and the next one?" }));
+    let after = reg.questions(&g).unwrap();
+    assert_eq!(after.len(), 2, "the old row survived the rewrite");
+    assert_eq!(after[1].id, "q-2", "the id high-water mark was read off the old file");
+
+    // The rewrite did not restyle what it did not change: the old row's
+    // options are still bare strings on disk.
+    let raw: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(raw[0]["options"], json!(["ship it here", "split it"]), "{}", raw[0]);
+}
+
+/// The refusals. Each is a shape whose acceptance would leave the human worse
+/// off than the refusal does — a choice they cannot make, a field that did
+/// nothing, or a description truncated where the trade-off was.
+#[test]
+fn ask_human_refuses_a_shape_that_would_reach_the_human_broken() {
+    let (reg, _d, g, co, _cw, _) = setup_questions();
+
+    let cases: [(&str, Value, &str); 8] = [
+        (
+            "an unknown select",
+            json!({ "text": "pick", "options": ["a", "b"], "select": "multiple" }),
+            "unknown select",
+        ),
+        (
+            "select with nothing to select from",
+            json!({ "text": "pick", "select": "multi" }),
+            "select needs options",
+        ),
+        (
+            "no options and no free text — nothing to answer with",
+            json!({ "text": "pick", "allow_free_text": false }),
+            "allow_free_text: false needs options",
+        ),
+        (
+            "a description past the cap",
+            json!({ "text": "pick", "options": [
+                { "label": "a", "description": "x".repeat(humanq::OPTION_DESC_MAX + 1) }
+            ] }),
+            "max",
+        ),
+        (
+            "a label past the cap, in the object form",
+            json!({ "text": "pick", "options": [{ "label": "x".repeat(humanq::OPTION_TEXT_MAX + 1) }] }),
+            "max",
+        ),
+        (
+            "an option object with no label",
+            json!({ "text": "pick", "options": [{ "description": "why" }] }),
+            "needs a string \"label\"",
+        ),
+        (
+            "an option that is neither string nor object",
+            json!({ "text": "pick", "options": [7] }),
+            "array of answer-option strings",
+        ),
+        // rev-802 N3: the description's own type check. Its two neighbours (a
+        // non-string label, a non-object item) were covered and this branch was
+        // not — and a wrong-typed description is the likeliest of the three to
+        // arrive, since it is the field an agent composes rather than names.
+        (
+            "an option description that is not a string",
+            json!({ "text": "pick", "options": [{ "label": "a", "description": 7 }] }),
+            "\"description\" must be a string",
+        ),
+    ];
+    for (what, args, needle) in cases {
+        let out = q_call(&reg, &co, "ask_human", args);
+        assert_eq!(out["isError"], true, "{what} must be refused");
+        assert!(q_text(&out).contains(needle), "{what}: {}", q_text(&out));
+    }
+    assert!(reg.questions(&g).unwrap().is_empty(), "no refused ask left a record behind");
+
+    // A description at the cap is accepted — the refusals above are bounds,
+    // not a narrower shape smuggled in as validation.
+    let at_cap = q_call(&reg, &co, "ask_human", json!({ "text": "pick", "options": [
+        { "label": "a", "description": "x".repeat(humanq::OPTION_DESC_MAX) }
+    ] }));
+    assert_eq!(at_cap["isError"], false, "{}", q_text(&at_cap));
+    assert_eq!(
+        reg.questions(&g).unwrap()[0].options[0].description().map(str::len),
+        Some(humanq::OPTION_DESC_MAX),
+        "an at-cap description is stored WHOLE — this validator refuses, it never truncates"
+    );
+
+    // rev-802 N2: the ASYMMETRY between the two options-less refusals is
+    // deliberate, and pinned here because the obvious-looking symmetry —
+    // refusing whenever `allow_free_text` was mentioned at all — reads like a
+    // tidy-up and would start refusing a legitimate ask.
+    //
+    // `false` with no options is refused because it leaves the human nothing
+    // to answer with. `true` with no options asks for exactly what an
+    // options-less question already is, so there is no belief to correct and
+    // nothing to refuse. Without this case the tightening passes a green suite.
+    let redundant = q_call(&reg, &co, "ask_human", json!({
+        "text": "an open question that spells out the obvious?",
+        "allow_free_text": true,
+    }));
+    assert_eq!(
+        redundant["isError"], false,
+        "allow_free_text: true with no options AGREES with the default — refusing it would turn \
+         a redundant argument into a failed ask: {}",
+        q_text(&redundant)
+    );
+    assert!(
+        reg.questions(&g).unwrap()[1].allow_free_text,
+        "…and it stores what it asked for"
+    );
+
+    // Same posture as `Urgency::parse`, asserted on the parser itself: an
+    // orchestrator that wrote "multiple" meant the human to be able to pick
+    // several, and filing that as a one-of-N choice loses half the answer.
+    assert!(humanq::Select::parse("multiple").is_err());
+    assert!(humanq::Select::parse("Multi").is_err(), "and it is not case-forgiving either");
+    assert_eq!(humanq::Select::parse("multi").unwrap(), humanq::Select::Multi);
+    assert_eq!(humanq::Select::parse("single").unwrap(), humanq::Select::Single);
 }
