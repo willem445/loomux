@@ -1,4 +1,4 @@
-# loomux's own agent workflow (#222) — the repo dogfoods its own feature.
+# orrerix's own agent workflow (#222) — the repo dogfoods its own feature.
 #
 # Turn the **advanced orchestrator** on in the launcher and this file *is* the
 # roster. With the toggle off, this file is not even opened. ROSTER changes
@@ -34,7 +34,7 @@ merge_queue:
   checks_timeout_minutes: 60
 
 blocks:
-  # The orchestrator is loomux's trust root: a repo file may pin its cli/model
+  # The orchestrator is orrerix's trust root: a repo file may pin its cli/model
   # and nothing else (no prompt:, no profile:, no allow:) — a parse error, on
   # purpose. See doc/design/workflows.md.
   - id: orchestrator
@@ -91,7 +91,7 @@ blocks:
 
   # ── process-pro: spawned after a merge, not on the per-PR path ────────────
   # `role_hint` is not cosmetic: a hint can change which MCP tools its block is
-  # offered, from a list loomux enumerates (doc/design/liaison.md). process
+  # offered, from a list orrerix enumerates (doc/design/liaison.md). process
   # is worker-kind: it mines the merged session via `session_digest`, opens a
   # normal PR proposing a lessons/skill update, and stops there; it never
   # merges anything, including its own PR.
@@ -110,7 +110,7 @@ blocks:
     profile: .github/agents/process.md
     role_hint: process
 
-# ADVISORY — the declared happy path, not a schedule. loomux does not walk
+# ADVISORY — the declared happy path, not a schedule. orrerix does not walk
 # these; the orchestrator still decides what to serialize, what to
 # parallelize, and when to plan first. The rework loop (findings → owning
 # worker → re-review of the new head) is the orchestrator's loop to run.
