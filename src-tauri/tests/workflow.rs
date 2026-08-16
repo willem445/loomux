@@ -5099,14 +5099,33 @@ fn every_block_the_orchestrator_is_told_to_spawn_is_one_spawn_agent_accepts() {
          \x20 - id: manager\n    kind: manager\n",
     );
     let g = reg.create_group(&repo.path(), rails()).unwrap();
+    // The instruction file is read HERE — from the group render, before any
+    // spawn — and that ordering is load-bearing rather than incidental.
+    //
+    // `spawn_agent_ex` re-renders the spawned block's instruction file from its
+    // OWN, shorter var list (`REPO`/`GROUP_ID`/`MAX_AGENTS`/the three
+    // `*_MODEL`s/`HOLD_LABEL`), and `render_template` leaves an unlisted key
+    // LITERAL — so a spawn rewrites the file with `{{WORKFLOW}}` intact and the
+    // whole workflow section, delegate list included, gone. That is a real
+    // pre-existing defect (this repo's own live group dir carries literal
+    // `{{ADVISOR_CONSULT_NOTE}}` and `{{LOCKS}}` in a delegate's file today),
+    // it is NOT this slice's, and reading around it here is deliberate: this
+    // test's subject is whether the two surfaces AGREE with the tool, and
+    // measuring a file that a separate bug has blanked would make it pass for
+    // the wrong reason — a vacuous green rather than a red about B1.
+    let file = instructions_lf(&reg, &g.id, "orchestrator.md");
+    assert!(
+        file.contains("Your delegates:"),
+        "the workflow section must be in the file this test reads, or it is measuring nothing: {file}"
+    );
+
     // ONE orchestrator, used as both the kickoff's subject and the MCP caller:
-    // the two surfaces and the tool must be read against the same agent, or the
-    // comparison is between three different groups' answers.
+    // the surfaces and the tool must be read against the same agent, or the
+    // comparison is between different groups' answers.
     let o = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
     let caller =
         Caller { agent_id: o.id.clone(), group: g.id.clone(), role: Role::Orchestrator, role_hint: None };
     let kickoff = reg.kickoff_prompt(&o, &g, "", None);
-    let file = instructions_lf(&reg, &g.id, "orchestrator.md");
 
     // `clamped()` synthesizes the orchestrator block, so this roster carries all
     // five classes — which makes the orchestrator block itself a second row in
