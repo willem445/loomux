@@ -62,6 +62,103 @@ export function isAwaitingHuman(status: string): boolean {
   );
 }
 
+/** The demo-gate statuses (#1091 slice B/C): a board row parked in front of
+ *  the human for a LOOK, as opposed to a decision — accepted H5 on #1091.
+ *  `PROTOTYPE_STATUS` is the #147 demo gate; `human-testing` is a visible-UI
+ *  park. Deliberately NARROWER than `isAwaitingHuman` above, which also
+ *  covers `pr` and `blocked`: those are the merge gate and a stall, both
+ *  owned by the board, neither a demo to go run.
+ *
+ *  Owned HERE, not by the NEEDS-YOU panel (`decisions.ts`), because
+ *  `decisions.ts` already imports FROM this module (`canApprove`,
+ *  `canProceed`) — a copy of this set there, alongside the one the board's
+ *  own marker chip needs (#1091 slice G), is exactly the "no new source of
+ *  truth" drift the slice-G brief warns against. `decisions.ts` re-exports
+ *  both names, so nothing importing them from there has to change. */
+export const DEMO_STATUSES = [PROTOTYPE_STATUS, "human-testing"] as const;
+
+export function isDemoGated(status: string): boolean {
+  return (DEMO_STATUSES as readonly string[]).includes(status);
+}
+
+// ---------------------------------------------------------------------------
+// Board marker + deep-link (#1091 slice G): an obvious chip on a row that is
+// blocked on a human DECISION or gated on a DEMO, routing through the pane's
+// focus hook (embedfocus.ts) to open the NEEDS-YOU panel at that item.
+//
+// Both signals are DERIVED, never stored: decision-blocked reads the
+// pending-questions list the NEEDS-YOU panel already owns, demo-gated reads
+// `isDemoGated` above, which the panel's own demo tier already uses. Neither
+// adds a field to a task or a second registry.
+// ---------------------------------------------------------------------------
+
+/** Just the fields the chip's decision signal needs from a question row.
+ *  Structural, like the `Has*` interfaces above, so this module never has to
+ *  import `decisions.ts`'s `OrchQuestion` — that module already imports FROM
+ *  this one, and a reverse import would cycle. Callers pass only PENDING
+ *  questions: this function does not read `status` at all, so `decisions.ts`'s
+ *  `isPending` stays the one place "pending" is decided — a second copy of
+ *  that rule here is how the two would drift apart. */
+export interface PendingQuestionRef {
+  id: string;
+  task?: string | null;
+}
+
+/** t-N → q-N for every row a pending question cites (#1091 slice G).
+ *
+ *  A blank or absent `task` cites nothing. When more than one pending
+ *  question names the same task, the FIRST one in the caller's list order
+ *  wins — pending order is ask order, oldest first (`decisions.ts`'s
+ *  `projectQuestions` keeps file order for exactly this reason), so a row
+ *  links to the oldest still-open ask rather than whichever the caller
+ *  happened to iterate last. A question citing a task id that names nothing
+ *  on the board still goes in the map — this function never reads the board
+ *  — but `boardMarker` below only ever looks a REAL row up by its own id, so
+ *  such an entry simply never matches anything and marks nothing. */
+export function blockedTaskMap(
+  pendingQuestions: readonly PendingQuestionRef[]
+): Map<string, string> {
+  const map = new Map<string, string>();
+  for (const q of pendingQuestions) {
+    const t = (q.task ?? "").trim();
+    if (!t || map.has(t)) continue;
+    map.set(t, q.id);
+  }
+  return map;
+}
+
+/** Which surface the board-marker chip should route the human to — both
+ *  route through the same focus hook, just with a different target id. */
+export type BoardMarkerKind = "decision" | "demo";
+
+/** What a row's chip is, and what clicking it should focus in the NEEDS-YOU
+ *  panel: the citing question's OWN id for a decision marker (its card is
+ *  what the human answers), the task's OWN id for a demo marker (there is no
+ *  question card for a demo — the demo card's `data-item-id` is the task id
+ *  itself, see `decisionsview.ts`'s `demoCard`). */
+export interface BoardMarker {
+  kind: BoardMarkerKind;
+  target: string;
+}
+
+/** The chip for one board row, or `null` when nothing is waiting on the human
+ *  for it (#1091 slice G).
+ *
+ *  Decision-blocked wins over demo-gated when a row is somehow both (a
+ *  pending question can cite a `human-testing` row while it's also parked for
+ *  a demo) — a decision is the more specific, more blocking ask, and the
+ *  brief calls for exactly one chip per row, not two competing for the same
+ *  corner. */
+export function boardMarker(
+  task: HasId & HasStatus,
+  blocked: ReadonlyMap<string, string>
+): BoardMarker | null {
+  const q = blocked.get(task.id);
+  if (q) return { kind: "decision", target: q };
+  if (isDemoGated(task.status)) return { kind: "demo", target: task.id };
+  return null;
+}
+
 /** The terminal status whose tasks the "delete all done" action clears. Must
  *  match the backend's `done` status string (validated in orchestration). */
 export const DONE_STATUS = "done";

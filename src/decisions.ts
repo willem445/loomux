@@ -22,7 +22,7 @@
 // Explicit `.ts`, like `agenticons.ts`/`channel.ts`: this module is imported
 // directly by `node --test`, which resolves real files rather than Vite's
 // extensionless specifiers.
-import { canApprove, canProceed } from "./taskboard.ts";
+import { canApprove, canProceed, DEMO_STATUSES, isDemoGated } from "./taskboard.ts";
 
 // ---------- the question wire shape ----------
 
@@ -196,17 +196,12 @@ export function isUrgent(q: OrchQuestion): boolean {
 
 // ---------- demos: projection ----------
 
-/** The statuses that put a board row in front of the human for a LOOK, as
- *  opposed to a decision — accepted H5 on #1091. `prototype` is the #147 demo
- *  gate; `human-testing` is a visible-UI park. Deliberately NARROWER than
- *  `taskboard.ts`'s `isAwaitingHuman`, which also covers `pr` and `blocked`:
- *  those are the merge gate and a stall, both of which the board already owns
- *  and neither of which is a demo to go run. */
-export const DEMO_STATUSES = ["prototype", "human-testing"] as const;
-
-export function isDemoGated(status: string): boolean {
-  return (DEMO_STATUSES as readonly string[]).includes(status);
-}
+/** `DEMO_STATUSES`/`isDemoGated` now live in `taskboard.ts` (#1091 slice G):
+ *  the board's own marker chip needs this exact demo-gate set too, and a
+ *  second copy here would be the "no new source of truth" drift the slice-G
+ *  brief warns against. Re-exported so nothing importing them from this
+ *  module has to change. */
+export { DEMO_STATUSES, isDemoGated };
 
 /** Which backend verb this row's **Feedback** gesture must use.
  *
