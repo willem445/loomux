@@ -337,6 +337,26 @@ const STREAMS: StreamRow[] = [
     debt: null,
   },
   {
+    event: "orch-needs-you-changed",
+    rate: "producer",
+    bound: "throttled",
+    cite: "src/refreshgate.ts",
+    reason:
+      "Emitted on every needs-you.json write — a raise, a resolve, a withdraw, the board hook, " +
+      "the one-shot migration (#1151) — so its rate is set by agents and the board, not by a " +
+      "clock. The NEEDS-YOU panel is the only listener and it refreshes through the SAME " +
+      "CoalescingRefresh (#743 S5) its orch-questions-changed and orch-tasks-changed listeners " +
+      "already share: single-flight with a trailing-edge merge, so a burst costs the refetch " +
+      "already in flight plus exactly one more and the trailing run reads the final registry. " +
+      "Sharing the gate is what bounds the worst case here, which is one BOARD write: the " +
+      "demo-gate hook lives inside upsert_task, so a status transition emits this AND " +
+      "orch-tasks-changed, and an ungated third listener would have doubled a board burst's " +
+      "cost for this panel rather than added to it. Clear-completed is deliberately not on this " +
+      "stream at all — it writes only the watermark marker, emits nothing, and the panel applies " +
+      "the stamp the command returns.",
+    debt: null,
+  },
+  {
     event: "orch-tasks-changed",
     rate: "producer",
     bound: "throttled",

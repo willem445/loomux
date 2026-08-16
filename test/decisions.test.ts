@@ -12,23 +12,29 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  anchorOf,
   ANSWER_MAX,
   answerFor,
   canSubmit,
   citedTask,
   composeAnswer,
-  DEMO_STATUSES,
   EMPTY_DRAFT,
+  EMPTY_VIEW,
   feedbackRoute,
   feedbackSubmitStep,
   freeTextAllowed,
-  isDemoGated,
+  isCleared,
+  isOpenItem,
   isPending,
   isUrgent,
+  itemTask,
+  linkTask,
   needsYouCount,
   normalizeOptions,
-  projectDemos,
-  projectQuestions,
+  projectPanel,
+  resolveBlock,
+  resolveNote,
+  RESOLUTION_MAX,
   retainDrafts,
   selectMode,
   setFreeText,
@@ -38,9 +44,17 @@ import {
   type AnswerDraft,
   type DemoTask,
   type FeedbackSubmitState,
+  type NeedsYouItem,
+  type NeedsYouView,
   type OrchQuestion,
 } from "../src/decisions.ts";
-import { canApprove, isAwaitingHuman, STATUSES } from "../src/taskboard.ts";
+import {
+  canApprove,
+  DEMO_STATUSES,
+  isAwaitingHuman,
+  isDemoGated,
+  STATUSES,
+} from "../src/taskboard.ts";
 
 // ---------- fixtures ----------
 
@@ -61,42 +75,219 @@ const task = (over: Partial<DemoTask> = {}): DemoTask => ({
   ...over,
 });
 
-// ---------- decisions: projection ----------
+let iseq = 0;
+const item = (over: Partial<NeedsYouItem> = {}): NeedsYouItem => ({
+  id: `n-${++iseq}`,
+  kind: "demo",
+  raiser: "board",
+  text: "a thing — parked in prototype for your look",
+  task: "t-1",
+  status: "open",
+  created_ms: 1000 + iseq,
+  ...over,
+});
 
-test("the pending tier holds exactly the answerable rows, and both terminal states settle", () => {
+const view = (items: NeedsYouItem[], cleared_ms = 0): NeedsYouView => ({ items, cleared_ms });
+
+// ---------- the unified projection ----------
+
+test("the open list holds exactly what is still waiting, from BOTH registries", () => {
   const pend = q({ id: "q-1" });
   const answered = q({ id: "q-2", status: "answered", answer: "yes" });
   const withdrawn = q({ id: "q-3", status: "withdrawn" });
-  const p = projectQuestions([answered, pend, withdrawn]);
-  assert.deepEqual(p.pending.map((x) => x.id), ["q-1"]);
+  const open = item({ id: "n-1" });
+  const resolved = item({ id: "n-2", status: "resolved", resolved_ms: 9, resolved_by: "webview" });
+  const p = projectPanel(view([open, resolved]), [answered, pend, withdrawn], []);
+  assert.deepEqual(p.open.map((r) => (r.source === "item" ? r.item.id : r.question.id)), [
+    "n-1",
+    "q-1",
+  ]);
   // `withdrawn` is settled too — a panel that only treated `answered` as
-  // settled would keep offering the human a question the asker took back.
-  assert.deepEqual(p.settled.map((x) => x.id), ["q-2", "q-3"]);
+  // settled would keep offering the human a question the asker took back. The
+  // same for an item: `board:<status>` and `withdrawn:<agent>` are resolutions.
+  assert.deepEqual(
+    p.settled.map((r) => (r.source === "item" ? r.item.id : r.question.id)).sort(),
+    ["n-2", "q-2", "q-3"]
+  );
   assert.equal(isPending(pend), true);
   assert.equal(isPending(withdrawn), false);
+  assert.equal(isOpenItem(open), true);
+  assert.equal(isOpenItem(resolved), false);
 });
 
-test("pending rows keep file order — which is ask order, which is oldest first", () => {
-  const rows = [q({ id: "q-1" }), q({ id: "q-2" }), q({ id: "q-3" })];
-  assert.deepEqual(projectQuestions(rows).pending.map((x) => x.id), ["q-1", "q-2", "q-3"]);
-});
-
-test("the settled tail keeps the NEWEST rows and reports how many it dropped", () => {
-  // 13 settled rows against a display cap of 3: the panel must show the last
-  // three and SAY that ten are missing, never imply the tail is the whole
-  // history (the contract `humanq::project_list` keeps for the MCP surface).
-  const rows = Array.from({ length: 13 }, (_, i) =>
-    q({ id: `s-${i}`, status: "answered" })
+test("the open list is urgency-pinned, then newest-first (#1151 D1)", () => {
+  // The complaint this answers: the old order was oldest-first, so the thing
+  // that just arrived was at the bottom of a long scroll. Urgency still wins
+  // over recency — an ask that said `high` said so precisely to jump the queue,
+  // and a strict newest-first would bury it under every routine row since.
+  const rows = projectPanel(
+    view([
+      item({ id: "n-old", created_ms: 100 }),
+      item({ id: "n-urgent-old", created_ms: 200, urgency: "high" }),
+      item({ id: "n-new", created_ms: 900 }),
+    ]),
+    [q({ id: "q-newest", created_ms: 950 }), q({ id: "q-urgent", created_ms: 300, urgency: "high" })],
+    []
+  ).open;
+  assert.deepEqual(
+    rows.map((r) => (r.source === "item" ? r.item.id : r.question.id)),
+    ["q-urgent", "n-urgent-old", "q-newest", "n-new", "n-old"]
   );
-  const p = projectQuestions(rows, 3);
-  assert.deepEqual(p.settled.map((x) => x.id), ["s-10", "s-11", "s-12"]);
+});
+
+test("rows tied on urgency and timestamp keep a FIXED order rather than shuffling", () => {
+  // A panel that reorders under the cursor between two refreshes is one the
+  // human stops trusting, and an agent burst can genuinely stamp two rows in
+  // the same millisecond. The tie order is items-then-questions, each in its
+  // own file order — the input order, kept because the sort is stable.
+  const items = [item({ id: "n-a", created_ms: 500 }), item({ id: "n-b", created_ms: 500 })];
+  const qs = [q({ id: "q-a", created_ms: 500 }), q({ id: "q-b", created_ms: 500 })];
+  const order = () =>
+    projectPanel(view(items), qs, []).open.map((r) =>
+      r.source === "item" ? r.item.id : r.question.id
+    );
+  assert.deepEqual(order(), ["n-a", "n-b", "q-a", "q-b"]);
+  assert.deepEqual(order(), order(), "the same input renders the same order every time");
+  // A row with no `created_ms` at all (a file written by an older build) sorts
+  // last rather than randomly, and stays there.
+  const withNulls = projectPanel(view([item({ id: "n-x", created_ms: undefined })]), qs, []).open;
+  const last = withNulls[withNulls.length - 1];
+  assert.equal(last.source === "item" && last.item.id, "n-x");
+});
+
+test("the settled tail is newest-settled-first and reports only what the CAP dropped", () => {
+  // 13 settled rows against a display cap of 3: the panel shows the three most
+  // recently settled and SAYS that ten are missing, never implying the tail is
+  // the whole history (the contract `project_list` keeps for the MCP surface).
+  const rows = Array.from({ length: 13 }, (_, i) =>
+    q({ id: `s-${i}`, status: "answered", settled_ms: 100 + i })
+  );
+  const p = projectPanel(EMPTY_VIEW, rows, [], 3);
+  assert.deepEqual(
+    p.settled.map((r) => (r.source === "question" ? r.question.id : r.item.id)),
+    ["s-12", "s-11", "s-10"]
+  );
   assert.equal(p.omitted, 10);
   // Under the cap nothing is dropped, and the count says so.
-  assert.equal(projectQuestions(rows.slice(0, 2), 3).omitted, 0);
+  assert.equal(projectPanel(EMPTY_VIEW, rows.slice(0, 2), [], 3).omitted, 0);
 });
 
-test("the default settled cap is the same depth the MCP list shows", () => {
+test("the tail interleaves both registries by WHEN they settled, not by which file", () => {
+  const p = projectPanel(
+    view([
+      item({ id: "n-mid", status: "resolved", resolved_ms: 200, resolved_by: "webview" }),
+      item({ id: "n-old", status: "resolved", resolved_ms: 50, resolved_by: "board:done" }),
+    ]),
+    [q({ id: "q-new", status: "answered", settled_ms: 300 })],
+    []
+  );
+  assert.deepEqual(
+    p.settled.map((r) => (r.source === "item" ? r.item.id : r.question.id)),
+    ["q-new", "n-mid", "n-old"]
+  );
+});
+
+test("the default settled cap is the same depth the MCP lists show", () => {
   assert.equal(SETTLED_SHOWN, 10);
+});
+
+// ---------- clear-completed: the watermark ----------
+
+test("the watermark hides settled rows only — an OPEN row is untouchable by it", () => {
+  // The property that makes the header button safe to click without a confirm:
+  // an open item raised long before the clear is still waiting on the human,
+  // and no stamp may make it disappear. The backend enforces this structurally
+  // (clear_needs_you never opens needs-you.json); this is the panel's half.
+  const stale = item({ id: "n-open", created_ms: 10 });
+  const settledBefore = item({
+    id: "n-gone",
+    status: "resolved",
+    resolved_ms: 500,
+    resolved_by: "webview",
+  });
+  const settledAfter = item({
+    id: "n-kept",
+    status: "resolved",
+    resolved_ms: 1500,
+    resolved_by: "webview",
+  });
+  const oldQuestion = q({ id: "q-gone", status: "answered", settled_ms: 400 });
+  const newQuestion = q({ id: "q-kept", status: "answered", settled_ms: 1400 });
+  const p = projectPanel(
+    view([stale, settledBefore, settledAfter], 1000),
+    [oldQuestion, newQuestion],
+    []
+  );
+  assert.deepEqual(p.open.map((r) => r.anchor), ["t-1"], "the open row survived its own clear");
+  assert.deepEqual(
+    p.settled.map((r) => (r.source === "item" ? r.item.id : r.question.id)),
+    ["n-kept", "q-kept"],
+    "both registries' tails are filtered by the ONE watermark"
+  );
+  // Exactly at the stamp is cleared — the marker means "at or before".
+  assert.equal(isCleared(1000, 1000), true);
+  assert.equal(isCleared(1001, 1000), false);
+});
+
+test("a watermark of 0 hides NOTHING, because 0 is the never-cleared sentinel", () => {
+  // The bug a bare `settledMs <= cleared` would ship: `0` means "never
+  // cleared", and a settled row with no timestamp also reads as `0`, so the
+  // whole tail of a group nobody has ever cleared would blank on first render.
+  const rows = [q({ id: "q-1", status: "answered", settled_ms: 0 })];
+  assert.equal(projectPanel(EMPTY_VIEW, rows, []).settled.length, 1);
+  assert.equal(isCleared(0, 0), false);
+  // Once something IS cleared, a timestamp-less settled row goes with it — it
+  // is by definition older than anything stamped, and the alternative is a row
+  // the human can never clear.
+  assert.equal(isCleared(0, 1), true);
+});
+
+test("clearing does not change the count — the count never held settled rows", () => {
+  const items = [
+    item({ id: "n-1" }),
+    item({ id: "n-2", status: "resolved", resolved_ms: 5, resolved_by: "webview" }),
+  ];
+  const qs = [q({ id: "q-1" }), q({ id: "q-2", status: "answered", settled_ms: 5 })];
+  assert.equal(needsYouCount(view(items, 0), qs), 2);
+  assert.equal(needsYouCount(view(items, 9999), qs), 2, "a clear cannot move the count");
+});
+
+test("the header count and the rendered list cannot disagree", () => {
+  // Two spellings of "what is waiting on you" is how a badge starts lying about
+  // the list under it. Stated as a relation so a change to either one reddens.
+  const items = [
+    item({ id: "n-1" }),
+    item({ id: "n-2", kind: "feedback", task: null }),
+    item({ id: "n-3", status: "resolved", resolved_ms: 5, resolved_by: "webview" }),
+  ];
+  const qs = [q({ id: "q-1" }), q({ id: "q-2", status: "withdrawn", settled_ms: 5 })];
+  for (const cleared of [0, 3, 9999]) {
+    const v = view(items, cleared);
+    assert.equal(needsYouCount(v, qs), projectPanel(v, qs, []).open.length, `cleared=${cleared}`);
+  }
+  assert.equal(needsYouCount(EMPTY_VIEW, []), 0);
+});
+
+// ---------- the deep-link anchor (slice G) ----------
+
+test("an open demo card anchors on its TASK id, which is what the board marker emits", () => {
+  // #1091 slice G's board chip emits `{kind:"demo", target: task.id}` — it has
+  // no idea an `n-N` exists. An item card that anchored on its own id would
+  // leave that chip landing on nothing, silently.
+  const p = projectPanel(view([item({ id: "n-4", task: "t-12" })]), [q({ id: "q-9" })], []);
+  assert.deepEqual(p.open.map((r) => r.anchor).sort(), ["q-9", "t-12"]);
+  assert.equal(anchorOf(item({ id: "n-4", task: "t-12" }), true), "t-12");
+});
+
+test("a feedback item and every settled row anchor on their OWN id", () => {
+  // The rule is exactly as wide as the link that needs it. A settled demo row
+  // anchoring on `t-N` too would give one task id two cards, and the deep-link
+  // would resolve to whichever rendered first.
+  assert.equal(anchorOf(item({ id: "n-5", kind: "feedback", task: "t-3" }), true), "n-5");
+  assert.equal(anchorOf(item({ id: "n-6", task: "t-3" }), false), "n-6");
+  // A demo item with no linked row falls back to its own id rather than to a
+  // blank anchor no selector could ever match.
+  assert.equal(anchorOf(item({ id: "n-7", task: "  " }), true), "n-7");
 });
 
 // ---------- options: the untagged wire shape ----------
@@ -149,15 +340,49 @@ test("urgency is presentation only, and normal is the quiet default", () => {
   assert.equal(isUrgent(q()), false);
 });
 
-// ---------- demos: projection ----------
+// ---------- the live task join ----------
 
-test("the demo tier is exactly the two gated statuses, and nothing else on the board", () => {
-  const rows = STATUSES.map((s) => task({ id: `t-${s}`, status: s }));
-  assert.deepEqual(
-    projectDemos(rows).map((d) => d.status),
-    ["prototype", "human-testing"]
-  );
-  for (const s of STATUSES) assert.equal(isDemoGated(s), (DEMO_STATUSES as readonly string[]).includes(s));
+test("an item's card reads the board LIVE — it never carries a snapshot", () => {
+  // The whole point of the entity split: the item owns the ask, the task keeps
+  // owning the facts. Move the row and the same item renders the new truth.
+  const before = linkTask("t-1", [task({ id: "t-1", status: "prototype", demo_path: "C:/wt/x" })]);
+  assert.equal(before!.status, "prototype");
+  assert.equal(before!.canProceed, true);
+  const after = linkTask("t-1", [task({ id: "t-1", status: "human-testing", demo_path: "C:/wt/x" })]);
+  assert.equal(after!.status, "human-testing");
+  assert.equal(after!.canProceed, false, "the item did not remember the old status");
+});
+
+test("a missing task DEGRADES the join to null — it never throws and never guesses", () => {
+  // An item outlives the row it names: a task can be pruned or renamed under an
+  // open item, and nothing validates the `task` string a feedback ask attaches.
+  // The card then loses its board affordances and keeps its Resolve, which the
+  // view hangs on the item rather than on the join.
+  assert.equal(linkTask("t-404", [task({ id: "t-1", status: "prototype" })]), null);
+  assert.equal(linkTask(null, [task({ id: "t-1" })]), null, "a feedback ask may name no row");
+  assert.equal(linkTask("  ", [task({ id: "t-1" })]), null);
+  assert.equal(linkTask("t-1", []), null, "an empty board is not an exception");
+  // …and the projection carries that null through rather than dropping the row.
+  const p = projectPanel(view([item({ id: "n-1", task: "t-404" })]), [], [task({ id: "t-1" })]);
+  assert.equal(p.open.length, 1, "the item is still waiting on the human");
+  assert.equal(p.open[0].source === "item" && p.open[0].task, null);
+  assert.equal(p.open[0].anchor, "t-404", "and still deep-linkable by the id it names");
+});
+
+test("the linked task is matched by exact id, so t-1 never joins t-10", () => {
+  const rows = [task({ id: "t-10", title: "ten" }), task({ id: "t-1", title: "one" })];
+  assert.equal(linkTask("t-1", rows)!.title, "one");
+  assert.equal(linkTask("t-10", rows)!.title, "ten");
+});
+
+test("the demo-gate vocabulary still lives on the board, not in this panel", () => {
+  // The panel no longer filters the board by status — the backend's transition
+  // hook does, and it owns its own copy of the set. What this pins is that the
+  // FRONTEND's copy stays the board's single one: a second spelling here is the
+  // drift #1091 slice G removed.
+  for (const s of STATUSES) {
+    assert.equal(isDemoGated(s), (DEMO_STATUSES as readonly string[]).includes(s));
+  }
 });
 
 test("the demo set is strictly narrower than the board's awaiting-human set", () => {
@@ -175,19 +400,19 @@ test("the demo set is strictly narrower than the board's awaiting-human set", ()
   );
 });
 
-test("a demo item carries the recorded path, and says nothing when none was recorded", () => {
-  const [withPath] = projectDemos([
+test("a joined row carries the recorded path, and says nothing when none was recorded", () => {
+  const withPath = linkTask("t-1", [
     task({ id: "t-1", status: "prototype", demo_path: "C:/wt/feat-x", pr: "#12", assignee: "w-3" }),
-  ]);
+  ])!;
   assert.equal(withPath.path, "C:/wt/feat-x");
   assert.equal(withPath.pr, "#12");
   assert.equal(withPath.assignee, "w-3");
   // No path recorded is NOT a guessed path: the panel shows the PR alone.
-  const [without] = projectDemos([task({ id: "t-2", status: "prototype" })]);
+  const without = linkTask("t-2", [task({ id: "t-2", status: "prototype" })])!;
   assert.equal(without.path, null);
   // An empty string clears the field backend-side; the panel reads it the same
   // way rather than rendering a blank mono chip.
-  const [blank] = projectDemos([task({ id: "t-3", status: "prototype", demo_path: "  " })]);
+  const blank = linkTask("t-3", [task({ id: "t-3", status: "prototype", demo_path: "  " })])!;
   assert.equal(blank.path, null);
 });
 
@@ -198,20 +423,23 @@ test("feedback on a prototype routes to the note verb, NOT the merge-gate one", 
   // so the human's typed findings were gone with no way back. A prototype is
   // the #147 demo gate, so the answer is a verb the backend accepts, not a
   // hidden button.
-  const [proto] = projectDemos([task({ status: "prototype" })]);
+  const proto = linkTask("t-1", [task({ status: "prototype" })])!;
   assert.equal(proto.feedback, "note");
-  const [testing] = projectDemos([task({ status: "human-testing" })]);
+  const testing = linkTask("t-1", [task({ status: "human-testing" })])!;
   assert.equal(testing.feedback, "merge-gate");
 });
 
-test("every demo-gated row has a working feedback verb — the tier is never half-actionable", () => {
-  // Totality is the property, not the two cases above: a future demo status
-  // that reached this tier with no accepted verb would silently drop the
-  // human's input again, so there is deliberately no third "cannot" value.
-  for (const d of projectDemos(STATUSES.map((s) => task({ id: `t-${s}`, status: s })))) {
+test("every joinable row has a working feedback verb — a card is never half-actionable", () => {
+  // Totality is the property, not the two cases above: a future status that
+  // reached a card with no accepted verb would silently drop the human's input
+  // again, so there is deliberately no third "cannot" value. Widened past the
+  // demo gate on purpose — an item can now name ANY board row, so the verb has
+  // to be total over the whole status set rather than over two of them.
+  for (const s of STATUSES) {
+    const d = linkTask("t-x", [task({ id: "t-x", status: s })])!;
     assert.ok(
       d.feedback === "merge-gate" || d.feedback === "note",
-      `${d.status} has no feedback route`
+      `${s} has no feedback route`
     );
   }
 });
@@ -288,39 +516,93 @@ test("the gate is not simply closed — a first press on an idle dialog always w
 });
 
 test("Proceed offers only on a prototype — the same guard the backend enforces", () => {
-  const [proto] = projectDemos([task({ status: "prototype" })]);
-  const [testing] = projectDemos([task({ status: "human-testing" })]);
+  const proto = linkTask("t-1", [task({ status: "prototype" })])!;
+  const testing = linkTask("t-1", [task({ status: "human-testing" })])!;
   assert.equal(proto.canProceed, true);
   assert.equal(testing.canProceed, false, "human-testing takes feedback, not a promote");
 });
 
-test("a demo item leaves the panel when its task leaves the gated status", () => {
-  const before = projectDemos([task({ id: "t-9", status: "prototype" })]);
-  const after = projectDemos([task({ id: "t-9", status: "done" })]);
-  assert.equal(before.length, 1);
-  assert.equal(after.length, 0);
+test("a row leaves the panel when its ITEM resolves, not when its task moves", () => {
+  // The model #1151 replaced: the card used to disappear the moment the board
+  // left the demo gate, because the card WAS the task. Now the item is the
+  // record — a task that moves on has its item auto-resolved by the backend
+  // hook, and until that lands the human still sees the ask they were given.
+  const parked = view([item({ id: "n-1", task: "t-9" })]);
+  const moved = [task({ id: "t-9", status: "done" })];
+  assert.equal(projectPanel(parked, [], moved).open.length, 1, "the ask outlives the status");
+  const resolved = view([
+    item({ id: "n-1", task: "t-9", status: "resolved", resolved_ms: 7, resolved_by: "board:done" }),
+  ]);
+  assert.equal(projectPanel(resolved, [], moved).open.length, 0);
+  assert.equal(projectPanel(resolved, [], moved).settled.length, 1, "it recedes, it does not vanish");
 });
 
 // ---------- the count ----------
 
-test("the count is pending decisions plus open demos, and clears as each settles", () => {
+test("the count is pending questions plus OPEN items, and clears as each settles", () => {
   const questions = [q({ id: "q-1" }), q({ id: "q-2" }), q({ id: "q-3", status: "answered" })];
-  const tasks = [
-    task({ id: "t-1", status: "prototype" }),
-    task({ id: "t-2", status: "done" }),
-    task({ id: "t-3", status: "human-testing" }),
+  const items = [
+    item({ id: "n-1" }),
+    item({ id: "n-2", status: "resolved", resolved_ms: 5, resolved_by: "webview" }),
+    item({ id: "n-3", kind: "feedback", task: null }),
   ];
-  assert.equal(needsYouCount(questions, tasks), 4);
-  // Answer both questions and promote the prototype: only the human-testing
-  // row is left, and no dismiss gesture was involved anywhere.
+  assert.equal(needsYouCount(view(items), questions), 4);
+  // Answer both questions and resolve one item: only the feedback ask is left,
+  // and the only gesture involved was settling the rows themselves.
   assert.equal(
     needsYouCount(
-      questions.map((x) => ({ ...x, status: "answered" as const })),
-      [tasks[0], tasks[1], tasks[2]].map((t) => (t.id === "t-1" ? { ...t, status: "in-progress" } : t))
+      view(items.map((i) => (i.id === "n-1" ? { ...i, status: "resolved" as const } : i))),
+      questions.map((x) => ({ ...x, status: "answered" as const }))
     ),
     1
   );
-  assert.equal(needsYouCount([], []), 0);
+  assert.equal(needsYouCount(EMPTY_VIEW, []), 0);
+});
+
+// ---------- the close-out note ----------
+
+test("an empty note box resolves with NULL, never with an empty string", () => {
+  // `validate_resolution` REFUSES an empty note ("resolve without one to close
+  // it silently"), so sending "" would turn the ordinary tidy — the common
+  // case, and the one that deliberately delivers no pane notice — into an error
+  // the human did nothing to earn.
+  assert.equal(resolveNote(""), null);
+  assert.equal(resolveNote("   \n "), null);
+  assert.equal(resolveNote("  looks good  "), "looks good", "and a real note is trimmed, not padded");
+});
+
+test("an empty box is not a block — the note is genuinely optional", () => {
+  assert.equal(resolveBlock(""), null);
+  assert.equal(resolveBlock("looks good"), null);
+});
+
+test("the note cap is the backend's, counted in characters and not UTF-16 units", () => {
+  // `validate_resolution` counts `chars()` and REJECTS over the cap rather than
+  // truncating, so the panel must block before the click — and must not refuse
+  // an all-astral note the backend would have taken.
+  assert.equal(RESOLUTION_MAX, 2000);
+  assert.equal(resolveBlock("x".repeat(RESOLUTION_MAX)), null, "exactly at the cap is fine");
+  assert.equal(resolveBlock("x".repeat(RESOLUTION_MAX + 1)), "too-long");
+  const astral = "🙂".repeat(1100);
+  assert.equal(astral.length, 2200, "precondition: over the cap by UTF-16 units");
+  assert.equal(resolveBlock(astral), null);
+  // The cap applies to what TRAVELS, which is the trimmed string.
+  assert.equal(resolveBlock(` ${"x".repeat(RESOLUTION_MAX)} `), null);
+});
+
+test("the linked task an item names is normalized the way a question's cited one is", () => {
+  assert.equal(itemTask(item({ task: "t-7" })), "t-7");
+  assert.equal(itemTask(item({ task: "  " })), null);
+  assert.equal(itemTask(item({ task: null })), null);
+});
+
+test("urgency reads the same way on both registries, from one function", () => {
+  // A question and an item carry the same `humanq::Urgency` — imported rather
+  // than cloned backend-side for exactly this reason. Two readers of it here
+  // would be two spellings of one word that the union sort must reconcile.
+  assert.equal(isUrgent(item({ urgency: "high" })), true);
+  assert.equal(isUrgent(item({ urgency: "normal" })), false);
+  assert.equal(isUrgent(item()), false, "absent is the quiet default, on an item too");
 });
 
 // ---------- the selection state machine ----------
@@ -463,4 +745,26 @@ test("drafts are dropped once their question settles, so stale input cannot come
   const kept = retainDrafts(drafts, [live, settled]);
   assert.deepEqual([...kept.keys()], ["q-1"]);
   assert.equal(kept.get("q-1")!.freeText, "half typed", "the surviving draft is untouched");
+});
+
+test("an item-driven refresh cannot drop a half-typed answer", () => {
+  // #1151 added a THIRD refresh trigger (`orch-needs-you-changed`), and every
+  // one of them re-runs this prune. An agent raising or resolving an item while
+  // the human is mid-answer must not cost them what they typed — so the prune
+  // is keyed on questions ALONE, and a refresh where no question changed is a
+  // no-op for the drafts however much else moved.
+  const live = q({ id: "q-1" });
+  const drafts = new Map<string, AnswerDraft>([["q-1", setFreeText(EMPTY_DRAFT, "half typed")]]);
+  let kept = retainDrafts(drafts, [live]);
+  kept = retainDrafts(kept, [live]);
+  kept = retainDrafts(kept, [live]);
+  assert.deepEqual([...kept.keys()], ["q-1"]);
+  assert.equal(kept.get("q-1")!.freeText, "half typed");
+  // The projection is where items and questions meet, and it reads no draft at
+  // all — the two halves of a refresh cannot reach each other.
+  assert.equal(
+    projectPanel(view([item({ id: "n-1" })]), [live], []).open.length,
+    2,
+    "the item and the question both render; neither consumed the other's state"
+  );
 });
