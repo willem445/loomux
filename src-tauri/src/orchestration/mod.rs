@@ -24715,9 +24715,13 @@ impl OrchRegistry {
         if patch.pr_base.is_some() {
             task.pr_base = patch.pr_base.filter(|s| !s.trim().is_empty());
         }
-        if patch.demo_path.is_some() {
-            task.demo_path = patch.demo_path.filter(|s| !s.trim().is_empty());
-        }
+        // SCRATCH RED (#1091 slice B, do-not-merge branch): neutered on
+        // purpose to produce a real CI red for the round-trip/MCP tests
+        // without a compile error masking the behavior. Schema + MCP arg +
+        // Tauri arg all stay wired; only the write application is skipped.
+        // if patch.demo_path.is_some() {
+        //     task.demo_path = patch.demo_path.filter(|s| !s.trim().is_empty());
+        // }
         if patch.assignee.is_some() {
             task.assignee = patch.assignee.filter(|s| !s.trim().is_empty());
         }
