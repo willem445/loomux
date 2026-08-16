@@ -31,6 +31,7 @@ import {
   answerFor,
   citedTask,
   EMPTY_DRAFT,
+  feedbackSubmitStep,
   freeTextAllowed,
   isPending,
   isUrgent,
@@ -45,6 +46,7 @@ import {
   toggleChoice,
   type AnswerDraft,
   type DemoItem,
+  type FeedbackSubmitState,
   type OrchQuestion,
   type SubmitBlock,
 } from "./decisions";
@@ -564,7 +566,11 @@ export class DecisionsView {
    *  On a `prototype` it is a plain board note instead, because
    *  `orch_request_changes` REFUSES that status (`ensure_at_merge_gate`) and
    *  sending it there would reject every time. The note reaches the
-   *  orchestrator all the same, and deliberately does not move the status: a
+   *  orchestrator all the same — but as the generic board-edit ping, NOT with
+   *  the findings inline the way the merge-gate verb delivers them: the
+   *  orchestrator sees `note_count` move and reads the text with `get_task`,
+   *  identically to every other human board note. It deliberately does not move
+   *  the status either: a
    *  prototype that has had feedback is still a prototype until it is promoted
    *  or re-dispatched, and flipping it here would silently consume the #147
    *  demo gate.
@@ -596,29 +602,46 @@ export class DecisionsView {
     overlay.append(box);
 
     const close = () => overlay.remove();
+    // Because the dialog now outlives its own write, `submit` is reachable more
+    // than once — the keydown path below calls it whatever state `send` is in.
+    // The state is held here; what a press MEANS is `feedbackSubmitStep`'s, so
+    // that the guard is pinned by `test/decisions.test.ts` rather than by this
+    // untested wiring.
+    const state: FeedbackSubmitState = { inFlight: false, findingsLanded: false };
     const submit = () => {
       const findings = ta.value.trim();
       if (!findings) {
         ta.focus();
         return;
       }
+      const step = feedbackSubmitStep(d.feedback, state);
+      if (step === "ignore") return;
       // Disable rather than close: the text stays on screen and recoverable
       // until the write is known to have landed.
       send.disabled = true;
+      state.inFlight = true;
+      const flipStatus = () =>
+        invoke("orch_upsert_task", {
+          groupId: this.groupId,
+          id: d.id,
+          status: REQUEST_CHANGES_STATUS,
+        });
       const write =
-        d.feedback === "merge-gate"
-          ? invoke("orch_request_changes", { groupId: this.groupId, id: d.id, findings }).then(() =>
-              invoke("orch_upsert_task", {
-                groupId: this.groupId,
-                id: d.id,
-                status: REQUEST_CHANGES_STATUS,
-              })
-            )
-          : invoke("orch_upsert_task", { groupId: this.groupId, id: d.id, note: findings });
+        step === "note"
+          ? invoke("orch_upsert_task", { groupId: this.groupId, id: d.id, note: findings })
+          : step === "status-only"
+            ? flipStatus()
+            : invoke("orch_request_changes", { groupId: this.groupId, id: d.id, findings })
+                .then(() => {
+                  // Recorded — a retry after a failed flip must not say it twice.
+                  state.findingsLanded = true;
+                })
+                .then(flipStatus);
       write
         .then(() => close())
         .catch((err) => {
           send.disabled = false;
+          state.inFlight = false;
           this.toast(String(err));
           ta.focus();
         });

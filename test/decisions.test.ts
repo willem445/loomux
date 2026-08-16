@@ -20,6 +20,7 @@ import {
   DEMO_STATUSES,
   EMPTY_DRAFT,
   feedbackRoute,
+  feedbackSubmitStep,
   freeTextAllowed,
   isDemoGated,
   isPending,
@@ -36,6 +37,7 @@ import {
   toggleChoice,
   type AnswerDraft,
   type DemoTask,
+  type FeedbackSubmitState,
   type OrchQuestion,
 } from "../src/decisions.ts";
 import { canApprove, isAwaitingHuman, STATUSES } from "../src/taskboard.ts";
@@ -224,6 +226,63 @@ test("the feedback route mirrors the backend's merge-gate predicate, not a secon
       feedbackRoute(s) === "merge-gate",
       canApprove(s),
       `${s} disagrees with canApprove`
+    );
+  }
+});
+
+// ---------- the feedback dialog's submit gate ----------
+//
+// The dialog closes on SUCCESS rather than before the write, so `submit` is
+// reachable a second time while the first write is still in the air — a plain
+// double Ctrl+Enter, which is what a human does when a dialog does not visibly
+// respond. Every crossing of {route} × {inFlight} × {findingsLanded} is pinned
+// below, because a guard that reads one input and not the other is a bypass
+// exactly the width of the asymmetry.
+
+const fresh: FeedbackSubmitState = { inFlight: false, findingsLanded: false };
+
+test("a second submit while the first write is outstanding is a no-op, on BOTH routes", () => {
+  // The defect: two concurrent chains for one decision. On a merge-gate row
+  // that is two `orch_request_changes` calls — two `Requested changes: …` notes
+  // on one task and two `[loomux]` deliveries the orchestrator must reconcile.
+  const busy = { ...fresh, inFlight: true };
+  assert.equal(feedbackSubmitStep("merge-gate", busy), "ignore");
+  assert.equal(feedbackSubmitStep("note", busy), "ignore");
+  // ...and it stays a no-op whatever the OTHER input says, so the guard cannot
+  // be walked around by getting one call of the two-call chain through.
+  assert.equal(feedbackSubmitStep("merge-gate", { inFlight: true, findingsLanded: true }), "ignore");
+  assert.equal(feedbackSubmitStep("note", { inFlight: true, findingsLanded: true }), "ignore");
+});
+
+test("a retry after a PARTIAL merge-gate failure re-runs only the call that failed", () => {
+  // The merge-gate route is a two-call chain. If `orch_request_changes` lands
+  // and the status flip then fails, the dialog re-enables Send — and a retry
+  // that re-ran the whole chain would record the human's findings twice for one
+  // failure they did not cause.
+  assert.equal(
+    feedbackSubmitStep("merge-gate", { inFlight: false, findingsLanded: true }),
+    "status-only"
+  );
+  assert.equal(feedbackSubmitStep("merge-gate", fresh), "findings-then-status");
+});
+
+test("the note route is one call, so nothing about it is ever partially done", () => {
+  // `findingsLanded` is merge-gate state; the note route must not read it, or a
+  // stale flag would silently downgrade a real note to a status flip the note
+  // route deliberately never performs.
+  assert.equal(feedbackSubmitStep("note", fresh), "note");
+  assert.equal(feedbackSubmitStep("note", { inFlight: false, findingsLanded: true }), "note");
+});
+
+test("the gate is not simply closed — a first press on an idle dialog always writes", () => {
+  // The negative control. Without it, `() => "ignore"` passes every assertion
+  // above, and a dialog that refuses every submit is a worse defect than the
+  // duplicate write this gate exists to stop.
+  for (const route of ["merge-gate", "note"] as const) {
+    assert.notEqual(
+      feedbackSubmitStep(route, fresh),
+      "ignore",
+      `${route}: an idle dialog's first press must do something`
     );
   }
 });
