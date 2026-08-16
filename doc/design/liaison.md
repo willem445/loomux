@@ -195,7 +195,13 @@ Granted at the two layers this tool has, keyed on the same **conjunction**:
    refusal names *this* capability ("posing a question to the human") rather
    than the other caller's, since one shared gate with one hard-coded message
    would tell a pane refused `ask_human` that usage aggregation is
-   orchestrator-only.
+   orchestrator-only. The arm's **success** reply is branched on the same
+   predicate (`caller_is_liaison`, one function, so the gate and the reply
+   cannot disagree): the orchestrator's version tells the caller to mark the
+   board row and to expect the answer notice in its own pane, and both are
+   false here. A widened gate that left them there would have told the human's
+   own pane to wait for something that never comes — the stall the feature
+   exists to remove, reintroduced by a string.
 
 There is no third layer, and the absence is structural in the same way
 `group_usage`'s is: `OrchRegistry::ask_human` takes the group and an `asker`

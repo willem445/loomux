@@ -24038,10 +24038,17 @@ impl OrchRegistry {
             let mut questions = self.questions(group)?;
             let pending = questions.iter().filter(|q| !q.status.is_settled()).count();
             if pending >= humanq::PENDING_MAX {
+                // Actionable for BOTH callers that can reach this (#1091 slice
+                // E, rev-820 NB1): `withdraw_question` is the orchestrator's
+                // alone, so telling a liaison to withdraw would name a tool it
+                // has not got — the same defect the success reply above was
+                // corrected for. The advice is written once, for whoever reads
+                // it, rather than threading a role into the registry.
                 return Err(format!(
                     "{pending} questions are already pending for this group (max {}) — no human is \
-                     working through a backlog that size; withdraw the ones overtaken by events \
-                     before asking another",
+                     working through a backlog that size. Clear the ones overtaken by events \
+                     before asking another: withdraw_question if you hold it, otherwise name them \
+                     to the orchestrator, which does",
                     humanq::PENDING_MAX
                 ));
             }

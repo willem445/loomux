@@ -1556,7 +1556,7 @@ fn a_replace_mode_liaison_persona_still_gets_its_no_authority_mechanics() {
     pinned(at, &flat_doc, "you never answer one", "every agent may ask and none may answer (#946) — the liaison is the pane most likely to be handed one and must know it presents, never settles");
     // #1091 slice E — the pose-gate widening's prose half. Three claims, because
     // the capability and its three edges are what a pane acts on: it may ask,
-    // never through a blocking dialog (the #578 failure the whole feature
+    // never through a blocking dialog (the #946 failure the whole feature
     // exists to remove), and the answer lands in the orchestrator's pane rather
     // than its own.
     pinned(at, &flat_doc, "ask_human` is yours too", "the liaison's own durable path to the human's inbox — without it, its only durable route is a relay the orchestrator may or may not choose to make a row");

@@ -624,7 +624,7 @@ so far:
   time. That is the wrong place for the rule the whole feature exists for, because the
   failure it prevents is not "asked badly" — it is a CLI's own blocking question dialog
   holding the pane, which makes it take no delivery at all and strands every agent reporting
-  to it (#578). So this is a **contract** edit, not a tool-doc one: a new **Asking the human**
+  to it (#946). So this is a **contract** edit, not a tool-doc one: a new **Asking the human**
   section carrying the never-block rule and its consequence, the six-step protocol (ask → mark
   the row `blocked` citing `q-N` → go do other work → un-block only that task on the answer
   notice → re-surface from `list_questions()` rather than memory → withdraw generously), and

@@ -23850,7 +23850,7 @@ fn the_orchestrator_contract_names_the_eligible_signal_and_its_partial_caveat() 
 /// and is the first thing a summary drops. The failure it prevents is not
 /// "asked badly" — it is a CLI's own blocking dialog holding the pane, which
 /// makes it take no delivery at all and strands every agent reporting to it
-/// (#578).
+/// (#946).
 ///
 /// Substance, not sentences, and each anchor is a DIFFERENT rule so a deletion
 /// reddens exactly one line here rather than being rescued by a neighbour: the
@@ -23873,19 +23873,19 @@ fn the_orchestrator_contract_carries_the_never_block_question_protocol() {
             "Never through your CLI's own",
             "orchestrator.md must prohibit the CLI's own interactive question dialog outright. \
              The #946 Q4 deny makes it impossible on Claude; every other CLI is held by this \
-             sentence alone (#578)",
+             sentence alone (#946)",
         ),
         (
             "cannot take **any** delivery",
             "orchestrator.md must say WHY a dialog is forbidden — that the pane stops taking \
              deliveries, so the stall is fleet-wide and not the asker's own. Without the \
-             consequence the rule reads as a style preference (#578)",
+             consequence the rule reads as a style preference (#946)",
         ),
         (
             "never with your CLI's own interactive question dialog",
             "INVARIANT 2 itself must carry the rule. The invariant block is the one part of \
              this document a summary may never cost the orchestrator, and a never-block rule \
-             that lives only in a section below it is one a compaction can take (#578)",
+             that lives only in a section below it is one a compaction can take (#946)",
         ),
         (
             "*does* survive a restart",
@@ -37381,8 +37381,37 @@ fn a_liaison_block_may_pose_a_question_to_the_human() {
                        "options": ["ship", "hold"], "task": "t-9" },
     })).unwrap();
     assert_eq!(out["isError"], false, "the liaison must be able to pose a question: {out:?}");
-    let reply = out["content"][0]["text"].as_str().unwrap();
+    let reply = out["content"][0]["text"].as_str().unwrap().to_string();
     assert!(reply.starts_with("q-1 registered"), "…and gets the id back immediately: {reply}");
+
+    // 1a — THE SUCCESS REPLY IS THE CALLER'S, not the orchestrator's (rev-820
+    // B1). This string is read at the moment the pane decides what to do next,
+    // and the orchestrator's version instructs two things a liaison cannot do:
+    // write the board row, and wait for the answer notice in its own pane. A
+    // widened gate that left them there would have told the human's pane to
+    // stall exactly the way this feature exists to stop.
+    assert!(
+        !reply.contains("Mark the affected task blocked"),
+        "a liaison holds no board-write tool — its own mechanics fragment says it writes no \
+         board row, so the reply must not instruct one: {reply}"
+    );
+    assert!(
+        !reply.contains("notice in this pane"),
+        "the answer notice is delivered to the orchestrator, so promising it HERE leaves the \
+         liaison waiting for one that never arrives: {reply}"
+    );
+    assert!(
+        reply.contains("ORCHESTRATOR's pane") && reply.contains("list_questions"),
+        "…and saying where it does NOT go is only half a fix: the reply must say where the \
+         answer actually surfaces and how this pane sees the outcome: {reply}"
+    );
+    assert!(
+        reply.contains("message_orchestrator"),
+        "withdrawing is the orchestrator's, so the reply must name the route for a question \
+         overtaken by events rather than leaving the liaison a tool it has not got: {reply}"
+    );
+    // (The positive control for this branch runs at the end of the test, once
+    // the row-count assertions below have had the single-row board they need.)
 
     // It landed in the SAME registry the orchestrator's questions land in,
     // attributed to the liaison — not a parallel record, and not anonymous.
@@ -37455,6 +37484,28 @@ fn a_liaison_block_may_pose_a_question_to_the_human() {
         "the answer notice goes to the orchestrator's pane: {texts:?}"
     );
     assert_eq!(reg.questions(&gid).unwrap()[0].status, humanq::Status::Answered);
+
+    // 1a's POSITIVE CONTROL, deferred to here so the row counts above stay
+    // single-row. Every "the liaison's reply must not say X" assertion is
+    // satisfied just as well by a build that deleted the guidance for BOTH
+    // callers — which would be a regression on the orchestrator's own protocol
+    // rather than a fix. So the orchestrator, in this same group, must still
+    // get exactly the two clauses the liaison must not, and must not get the
+    // liaison's.
+    let orch_reply = dispatch(&reg, &orch, "tools/call", &json!({
+        "name": "ask_human", "arguments": { "text": "and one the orchestrator asks?" },
+    })).unwrap()["content"][0]["text"].as_str().unwrap().to_string();
+    assert!(
+        orch_reply.contains("Mark the affected task blocked")
+            && orch_reply.contains("notice in this pane"),
+        "the orchestrator's own reply keeps its board-row and own-pane clauses — the branch is \
+         per-caller, not a deletion: {orch_reply}"
+    );
+    assert!(
+        !orch_reply.contains("ORCHESTRATOR's pane"),
+        "…and neither reply is the other's: the orchestrator must not be told its own answer \
+         arrives somewhere else: {orch_reply}"
+    );
 }
 
 #[test]

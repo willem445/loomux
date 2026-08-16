@@ -380,7 +380,7 @@ at all. That is the weakest place the rule could live: a tool description is
 read once, at listing time, and is among the first things a summary drops. The
 failure this feature exists to prevent is not "asked badly" — it is a CLI's own
 blocking question dialog holding the pane, which makes it take **no delivery at
-all**, so the stall is fleet-wide (#578). So `orchestrator.md` gains an
+all**, so the stall is fleet-wide (#946). So `orchestrator.md` gains an
 **Asking the human** section carrying the prohibition, the consequence that
 makes it make sense, the six-step protocol and the authoring rules; INVARIANT 2
 gains the one sentence that survives a compaction; **Durability rules** adds
@@ -420,10 +420,30 @@ supplied.
   asymmetry is stated in three places the reader will actually hit it — the
   tool description, the liaison's own mechanics fragment ("`list_questions` is
   how you see what became of yours") and the orchestrator's `{{LIAISON_NOTE}}`
-  ("`list_questions` will show questions you did not ask — read the `asker`") —
-  and is pinned by
-  `a_liaison_block_may_pose_a_question_to_the_human`, so a future change to the
-  routing reddens rather than quietly making that prose false.
+  ("`list_questions` will show questions you did not ask — read the `asker`").
+  **The ROUTING itself** is pinned by
+  `a_liaison_block_may_pose_a_question_to_the_human` (direction 4), so a future
+  change to it reddens rather than quietly making those three surfaces false;
+  the prose surfaces are not each individually pinned, and saying so is the
+  difference between a coverage claim and coverage. The tool reply is the one
+  of them that IS asserted, since it is read at the moment the pane acts.
+
+**Two run-time strings are branched on the caller, and that is the same defect
+class twice.** Widening a gate makes every message on the widened path reachable
+by a caller it was not written for. `require_orchestrator_or_liaison` therefore
+takes the refused capability in words rather than hard-coding one caller's tool
+name; `ask_human`'s SUCCESS reply branches on `caller_is_liaison`, because the
+orchestrator's version tells the caller to mark a board row (a liaison has no
+tool for it) and to expect the answer notice in its own pane (it will not
+arrive there); and `PENDING_MAX`'s refusal names `withdraw_question` *or* the
+orchestrator, rather than a tool half its callers have not got. The predicate
+itself lives in one function so the gate and the reply cannot disagree — "the
+gate said liaison, the reply said orchestrator" is exactly the asymmetry
+CLAUDE.md's guard convention names. The reply branch is pinned both ways
+(`a_liaison_block_may_pose_a_question_to_the_human`, step 1a plus its positive
+control): the liaison's reply must not carry the two orchestrator clauses, and
+the orchestrator's must still carry them — an assertion that only checked the
+first would pass on a build that deleted the guidance for everyone.
 
 The capability argument for the grant itself, and why the "it only reads"
 reasoning that carried `group_usage` does **not** carry a write, is in

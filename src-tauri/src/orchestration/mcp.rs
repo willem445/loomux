@@ -788,10 +788,22 @@ fn require_orchestrator(caller: &Caller) -> Result<(), String> {
 /// agent at spawn — the same lookup `record_verdict`'s deny layer and
 /// `idle_reap_candidates` make. Nothing an agent can put in a tool argument, a
 /// pane title, or its own prompt reaches this decision.
+/// The liaison predicate itself — the CONJUNCTION (`kind: reviewer` **and**
+/// `role_hint: liaison`), in one place.
+///
+/// Extracted because it now has a second reader that is not a gate: `ask_human`
+/// branches its SUCCESS reply on it, since two clauses of the orchestrator's
+/// reply ("mark the affected task blocked", "expect a notice in this pane") are
+/// false for a liaison and were reachable the moment the gate widened (rev-820
+/// B1). A second hand-written copy of the conjunction would be a place for the
+/// two to disagree — and "the gate said liaison, the reply said orchestrator"
+/// is precisely the asymmetry CLAUDE.md's guard convention names.
+fn caller_is_liaison(caller: &Caller) -> bool {
+    caller.role == Role::Reviewer && caller.role_hint.as_deref() == Some("liaison")
+}
+
 fn require_orchestrator_or_liaison(caller: &Caller, what: &str) -> Result<(), String> {
-    let liaison =
-        caller.role == Role::Reviewer && caller.role_hint.as_deref() == Some("liaison");
-    if caller.role == Role::Orchestrator || liaison {
+    if caller.role == Role::Orchestrator || caller_is_liaison(caller) {
         Ok(())
     } else {
         Err(format!(
@@ -1115,18 +1127,45 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                     urgency,
                 },
             )?;
-            // The reply leads with the id (it is what the board note cites) and
-            // then says the one thing that decides what this agent does next.
-            // Stated at the call site, not only in the tool description, because
-            // the description is read once at listing time and this is read at
-            // the moment the decision is being made.
-            Ok(format!(
-                "{} registered — the human will be asked. DO NOT WAIT FOR IT: go on reviewing, \
-                 dispatching and merging everything not gated on this answer. Mark the affected \
-                 task blocked citing {}, and expect a [loomux] answer notice in this pane later. \
-                 list_questions has it meanwhile, across a /compact and across a restart.",
-                q.id, q.id
-            ))
+            // The reply leads with the id and then says the one thing that
+            // decides what this agent does next. Stated at the call site, not
+            // only in the tool description, because the description is read
+            // once at listing time and this is read at the moment the decision
+            // is being made.
+            //
+            // **Branched on the caller, for the same reason the gate above
+            // takes its refusal in words** (rev-820 B1): this string used to be
+            // written for the orchestrator alone, and widening the gate made it
+            // reachable by a caller for whom two of its clauses are false. A
+            // liaison holds no board-write tool at all, so "mark the affected
+            // task blocked" instructs it to do what its own mechanics fragment
+            // forbids; and `answer_question` delivers through
+            // `deliver_to_orchestrator` regardless of who asked, so "expect a
+            // notice in this pane" would leave it waiting for one that is never
+            // coming — the exact stall this feature removes. The gate has
+            // already resolved which caller this is; the reply reads that same
+            // predicate rather than a second copy of it.
+            Ok(if caller_is_liaison(caller) {
+                format!(
+                    "{} registered — it is in the human's inbox now. DO NOT WAIT FOR IT: carry on \
+                     with the human. Two things about it are the orchestrator's and not yours: the \
+                     board row (you write none, and do not ask it to write one for you), and the \
+                     [loomux] answer notice, which is delivered to the ORCHESTRATOR's pane because \
+                     un-blocking the work is what an answer is for. list_questions is how you see \
+                     what became of {}, across a /compact and across a restart — and if it is \
+                     overtaken by events, say so with message_orchestrator, since withdrawing is \
+                     the orchestrator's too.",
+                    q.id, q.id
+                )
+            } else {
+                format!(
+                    "{} registered — the human will be asked. DO NOT WAIT FOR IT: go on reviewing, \
+                     dispatching and merging everything not gated on this answer. Mark the affected \
+                     task blocked citing {}, and expect a [loomux] answer notice in this pane later. \
+                     list_questions has it meanwhile, across a /compact and across a restart.",
+                    q.id, q.id
+                )
+            })
         }
         "withdraw_question" => {
             // Orchestrator-only, and deliberately NOT widened alongside
