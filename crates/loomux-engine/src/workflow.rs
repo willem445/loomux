@@ -2116,7 +2116,7 @@ pub fn workflow_file_exists(repo: &str) -> bool {
 /// advertises a persona the spawn will deny (rev-11's preview nit). One predicate,
 /// so the report and the spawn cannot disagree.
 pub fn persona_allowed(block: &Block) -> bool {
-    !matches!(block.kind, Role::Orchestrator | Role::Manager)
+    block.kind != Role::Orchestrator // [scratch] neuter 2
 }
 
 /// Whether a roster carries anything a workflow file put there — a block outside
