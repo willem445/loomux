@@ -309,7 +309,9 @@ pub struct Question {
     /// to `true` — including for a Q1-era row that has no such field, which is
     /// the right reading of it: the only answer surface those rows were ever
     /// written for was free text.
-    #[serde(default = "free_text_default")]
+    // [scratch] NEUTERED: bool's own derived default, so a Q1-era row with no
+    // such field reads as `false` instead of `true`.
+    #[serde(default)]
     pub allow_free_text: bool,
     /// The board task this question is holding up, if any — what lets the
     /// orchestrator un-block exactly one task when the answer lands.
