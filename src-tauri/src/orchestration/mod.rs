@@ -35072,6 +35072,14 @@ impl OrchRegistry {
     /// group view's 2 s poll, and a repo that declares no `board:` block must
     /// pay exactly what it paid before this feature existed (#743's standard
     /// for this command).
+    /// [`Self::wip_status`] for the MCP `list_tasks` reply — the same rows the
+    /// human's board renders, so the orchestrator and the human are reading
+    /// one board and one set of caps.
+    #[doc(hidden)] // pub for integration tests
+    pub fn wip_status_for_agents(&self, group: &GroupId) -> Vec<Value> {
+        self.wip_status(group)
+    }
+
     fn wip_status(&self, group: &GroupId) -> Vec<Value> {
         let board = self.board_policy(group);
         if board.wip.is_empty() {
