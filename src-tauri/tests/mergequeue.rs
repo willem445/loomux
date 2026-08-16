@@ -53,7 +53,8 @@ use loomux_lib::orchestration::mqdriver::{
     MintError, MqRunner, TargetRefusal, MINT_ATTEMPTS, REMOTE,
 };
 use loomux_lib::orchestration::workflow::{
-    body_digest, parse_gate_file, BlockId, ReviewVerdict, Verdict,
+    body_digest, parse_gate_file, BlockId, ReviewVerdict, Verdict, BASE_CHECK_RUNS_JQ,
+    BASE_STATUS_JQ,
 };
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -1145,7 +1146,11 @@ fn the_lookup_argvs_are_the_shims_own_two_lookups() {
     // check runs, so a repo using either alone reports nothing from the other.
     assert_eq!(
         base_check_runs_argv("integration/x")[..2],
-        ["api".to_string(), "repos/{owner}/{repo}/commits/integration/x/check-runs".to_string()]
+        [
+            "api".to_string(),
+            "repos/{owner}/{repo}/commits/integration/x/check-runs?per_page=100".to_string()
+        ],
+        "the API maximum page size — a MITIGATION for pagination, never the guard (#1181)"
     );
     assert_eq!(
         base_status_argv("integration/x")[..2],
@@ -1165,6 +1170,15 @@ fn the_lookup_argvs_are_the_shims_own_two_lookups() {
         assert!(runs_jq.contains(good), "{runs_jq}");
     }
     assert!(!runs_jq.contains("failure"), "an allow-list must not be spelled as a deny-list: {runs_jq}");
+    // The argv carries the SHARED constant, not a copy that matches today.
+    assert_eq!(runs_jq, BASE_CHECK_RUNS_JQ);
+    assert_eq!(base_status_argv("m").remove(3), BASE_STATUS_JQ);
+    // #1181: the paginated endpoint's guard is a comparison against total_count,
+    // and it is what a per_page bump can never replace.
+    assert!(
+        runs_jq.contains("total_count") && runs_jq.contains("truncated"),
+        "a page that does not carry every run must not be able to answer green: {runs_jq}"
+    );
     assert_eq!(ls_remote_argv("loomux/mq/g1-mq-1"), vec![
         "ls-remote",
         "--exit-code",
@@ -1174,6 +1188,89 @@ fn the_lookup_argvs_are_the_shims_own_two_lookups() {
     // Slice C's schema constant is what D1 builds against — a mismatch here
     // would mean the two slices disagree about the file they share.
     assert_eq!(MERGE_QUEUE_VERSION, 1);
+}
+
+/// Is a real `jq` available to EXECUTE the reductions? (Preinstalled on all
+/// three GitHub-hosted runner images; frequently absent on a dev box.) Skipped
+/// rather than failed when missing — the `have_sh()` precedent.
+fn have_jq() -> bool {
+    std::process::Command::new("jq")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// **The reductions, EXECUTED** (#1181 rev-lead NB1 — and the blocking finding).
+///
+/// `BASE_CHECK_RUNS_JQ`/`BASE_STATUS_JQ` *are* the `base-green` decision, and
+/// until this test nothing ran them: the queue's `Fake` and the shim harness's
+/// fake `gh` both return the already-reduced word, and the only other pins were
+/// string containment. So every test agreed about a string none of them had
+/// evaluated — which is how a suite green on three platforms coexisted with a
+/// truncated page reducing to `green` and a red base merging.
+///
+/// **Limit, stated rather than implied:** the shipped consumer is `gh`'s built-in
+/// **gojq**, and this runs the same expression under **jq**. The constructs used
+/// (`any/2`, `length`, `>`, string equality, `if`/`elif`) are ones the two
+/// implement identically; nothing here proves gojq parity in general, and a
+/// reduction that reached for a jq-only builtin would need a different harness.
+#[test]
+fn the_base_green_reductions_reduce_real_payloads_to_the_right_word() {
+    if !have_jq() {
+        eprintln!("SKIP the_base_green_reductions_reduce_real_payloads_to_the_right_word: no jq");
+        return;
+    }
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/basegreen");
+    let reduce = |jq: &str, fixture: &str| -> String {
+        let json = std::fs::read_to_string(dir.join(fixture))
+            .unwrap_or_else(|e| panic!("{fixture}: {e}"));
+        let mut c = std::process::Command::new("jq")
+            .args(["-r", jq])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn jq");
+        use std::io::Write;
+        c.stdin.as_mut().unwrap().write_all(json.as_bytes()).unwrap();
+        let out = c.wait_with_output().expect("run jq");
+        assert!(
+            out.status.success(),
+            "{fixture}: jq refused the expression: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+
+    for (fixture, want) in [
+        ("checkruns-green.json", "green"),
+        // Every green-ish conclusion in the allow-list, and nothing else.
+        ("checkruns-red-at-tail.json", "red"),
+        // THE REGRESSION. Same six runs, page cut before the three failures:
+        // `any(.check_runs[]; …)` can only see page 1, so before #1181 this
+        // reduced to `green` and the merge onto a red base was allowed.
+        ("checkruns-truncated.json", "truncated"),
+        // A run still in progress is PENDING, never red — `conclusion: null`
+        // would satisfy the conclusion allow-list's negation, so the red clause
+        // is guarded on `.status == "completed"`. A refusal that called a
+        // still-building base "RED" would be a false sentence.
+        ("checkruns-pending.json", "pending"),
+        ("checkruns-none.json", "none"),
+    ] {
+        assert_eq!(reduce(BASE_CHECK_RUNS_JQ, fixture), want, "check-runs: {fixture}");
+    }
+    for (fixture, want) in [
+        ("status-green.json", "green"),
+        ("status-red.json", "red"),
+        // `.state` is `pending` both for a pending context and for NO statuses,
+        // so the count is read first — otherwise a repo with no legacy statuses
+        // would hold every merge forever.
+        ("status-none.json", "none"),
+        ("status-pending.json", "pending"),
+    ] {
+        assert_eq!(reduce(BASE_STATUS_JQ, fixture), want, "status: {fixture}");
+    }
 }
 
 /// #1174: how the two base-check answers COMBINE. Driven through the real
@@ -1200,6 +1297,16 @@ fn base_ci_green_combines_two_surfaces_and_treats_silence_as_unknown() {
     // Red OUTRANKS pending: the worse answer wins, so a base that is both
     // broken and still building is reported broken.
     assert_eq!(ask("red", "pending"), Some(false));
+    // #1181: a truncated page is UNKNOWN, from either surface, and it outranks
+    // pending/none the way the shim's chain does. The queue lands ONTO this
+    // branch, so "we could not see all of its checks" is never "it is fine".
+    assert_eq!(ask("truncated", "green"), None);
+    assert_eq!(ask("green", "truncated"), None);
+    assert_eq!(ask("truncated", "none"), None);
+    // …but a run we CAN see failing still reports red, which is the more
+    // actionable answer and the reason the reduction tests red first.
+    assert_eq!(ask("red", "truncated"), Some(false));
+
     // Unknown — `None`, which the gate refuses on. Still running, silent on
     // both surfaces, or an answer this build cannot read at all.
     assert_eq!(ask("pending", "green"), None);

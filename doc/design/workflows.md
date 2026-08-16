@@ -1142,6 +1142,43 @@ bad, and at least one of them said something at all**. Green is an allow-list of
 check-run conclusions (`success`, `neutral`, `skipped`), so a conclusion GitHub
 adds tomorrow reads as red rather than as green.
 
+**One reduction, two consumers — not two copies that match.** `BASE_CHECK_RUNS_JQ`
+and `BASE_STATUS_JQ` live in `workflow.rs` with the rest of the gate contract;
+the shim interpolates them into its POSIX body and the merge queue passes them
+to `gh --jq`. The first cut kept a copy in each place. The copies were
+byte-identical — which *looked* like the two-implementations-one-contract
+property holding, and was: what the contract said was wrong in both, and two
+matching copies cannot tell you that. A shared constant makes "the shim and the
+queue ask GitHub the same question" a fact about the program.
+
+**`check-runs` is PAGINATED, and the truncation clause is what makes the
+"unknown is never green" rule true rather than merely stated.** `check_runs` is
+capped at `per_page` while `total_count` counts them all, so
+`any(.check_runs[]; …)` asks *"is anything on this page red"*. Without a guard,
+a base with more runs than one page — an ordinary OS x version matrix, which is
+exactly the repo that adopts a stop-the-line clause — reports **green** with its
+failures sitting on page 2, and the merge onto a red base is allowed. Measured
+against this repo's own API on a commit carrying three `failure` runs: `red` at
+full page size, `green` at `?per_page=3`. The reduction therefore compares
+`total_count` against the page it was handed and answers `truncated`, which both
+halves refuse on. `?per_page=100` (the API maximum) rides along as a
+*mitigation* — it makes the refusal rare — but a page size is a number GitHub
+may cap differently tomorrow, and the comparison is not.
+
+**Only the check-runs half needs that clause, and the asymmetry is the tell.**
+`/commits/{ref}/status` carries a top-level `.state` that is GitHub's own rollup
+across *all* statuses, so `BASE_STATUS_JQ` is pagination-proof by construction.
+`check-runs` has no rollup field — only `total_count`. One half was safe and the
+other was not, for a reason that has nothing to do with how carefully either was
+written.
+
+**A visible failure outranks truncation, and neither is reported as the other.**
+The reduction tests `red` first (guarded on `.status == "completed"`, so a run
+still in progress is `pending` and never `red` — a refusal calling a
+still-building base "RED" would be a false sentence), then truncation, then
+pending, then silence. Both refuse; they differ in what the agent reading the
+refusal is told to do.
+
 **Unknown is never green, and the cost is stated.** A base HEAD with no checks
 and no statuses refuses, matching what `ci-green` already does for a PR with no
 checks reported and what the merge queue's `base-unverifiable` does for a base
@@ -1186,6 +1223,15 @@ break or delay `gh pr create`, and the create always succeeds regardless of the
 PR's size. Every enforcement decision in this document fails *closed*; this one
 does not, because it decides nothing. The merge-time refusal is where the
 "unknown is never safe" rule applies, and it applies there in full.
+
+**Silence is the failure mode; a confident wrong answer is not allowed.** The
+lookup has no PR number to use — it resolves the current branch's PR, which is
+the one just created. `gh pr create --head <other-branch>` breaks that
+assumption, and would print a real size for the *wrong* PR, so that one shape
+is skipped outright rather than measured: everywhere else on this path doubt
+produces no notice, and a notice that misinforms is worse than none. The
+neighbouring case closes itself — a branch that already has an open PR makes
+`gh pr create` fail, and a non-zero exit skips the advisory already.
 
 ### How it composes with the human gate
 

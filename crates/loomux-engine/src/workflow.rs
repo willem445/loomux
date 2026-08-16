@@ -2405,6 +2405,60 @@ pub fn condition_supported(c: &str) -> bool {
     KNOWN_CONDITIONS.contains(&c.trim())
 }
 
+/// The `base-green` reductions (#1174) — **one definition, two consumers**: the
+/// `gh` shim interpolates these constants into its POSIX body, and
+/// `mqdriver::base_check_runs_argv`/`base_status_argv` pass them to `gh --jq`.
+///
+/// They live here, with the rest of the gate contract, precisely because the
+/// first cut had a *copy* in each place. The two were byte-identical, which
+/// looked like the two-implementations-one-contract property holding — and it
+/// was, but what the contract SAID was wrong in both, and nothing could have
+/// told them apart from two copies that had drifted. A shared constant makes
+/// "the shim and the queue ask GitHub the same question" a fact about the
+/// program rather than a claim in a PR body.
+///
+/// Each reduces a JSON payload to ONE word from a closed vocabulary —
+/// `red` | `truncated` | `pending` | `none` | `green` — because the shim has no
+/// JSON parser and must decide a merge from a shell `case`.
+///
+/// **The clause order is the contract, and each step earns its place:**
+///
+/// 1. **`red` first, and only for COMPLETED runs.** A visible failure is the
+///    most actionable answer, so it outranks everything below — but a run still
+///    in progress carries `conclusion: null`, which the conclusion allow-list
+///    would otherwise call red. Reporting "the base is RED" about a base that
+///    is merely still building would be a false sentence in a refusal, so
+///    `.status == "completed"` guards it.
+/// 2. **`truncated` next — the #1181 review's blocking finding.**
+///    `/commits/{ref}/check-runs` is **paginated**: `check_runs` is capped at
+///    `per_page` while `total_count` counts them all. `any(.check_runs[]; …)`
+///    therefore asks "is anything on THIS PAGE red", and before this clause a
+///    base with more runs than one page — an ordinary OS x version matrix,
+///    exactly the repo that adopts a stop-the-line gate — reported **green**
+///    with its failures sitting on page 2. Reproduced against this repo's own
+///    API: a commit with 3 `failure` runs answered `red` at full page size and
+///    `green` at `?per_page=3`. A page that does not carry every run says
+///    nothing about the runs it omits, so it is not an answer.
+/// 3. `pending`, then `none`, then `green` — the residue, unchanged.
+///
+/// **Only the check-runs half needs the truncation clause**, and the asymmetry
+/// is worth stating rather than leaving to be re-derived: the combined-status
+/// endpoint carries a top-level `.state` that is GitHub's own rollup across
+/// *all* statuses, so [`BASE_STATUS_JQ`] is pagination-proof by construction.
+/// `check-runs` has no rollup field — only `total_count` — which is why one
+/// half was safe and the other was not.
+///
+/// Green is an ALLOW-list of conclusions (`success`, `neutral`, `skipped`), so
+/// a conclusion GitHub adds tomorrow reads as red rather than as green.
+pub const BASE_CHECK_RUNS_JQ: &str = "if any(.check_runs[]; .status == \"completed\" and .conclusion != \"success\" and .conclusion != \"neutral\" and .conclusion != \"skipped\") then \"red\" elif (.total_count > (.check_runs|length)) then \"truncated\" elif any(.check_runs[]; .status != \"completed\") then \"pending\" elif (.check_runs|length) == 0 then \"none\" else \"green\" end";
+
+/// The combined-status reduction — see [`BASE_CHECK_RUNS_JQ`] for the shared
+/// contract and for why this one needs no truncation clause.
+///
+/// `.state` is `pending` both when a context is pending and when there are no
+/// statuses at all, so the count is read first and answers `none`.
+pub const BASE_STATUS_JQ: &str = "if (.statuses|length) == 0 then \"none\" elif .state == \"success\" then \"green\" elif .state == \"pending\" then \"pending\" else \"red\" end";
+
 /// Why a merge gate is (not) satisfied — the pure spec the shim's shell mirrors,
 /// and what the `review_verdict` tool reports back to the reviewer that just voted.
 #[derive(Clone, Debug, PartialEq, Eq)]

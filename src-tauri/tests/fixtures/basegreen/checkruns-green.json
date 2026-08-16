@@ -1,0 +1,4 @@
+{"total_count":3,"check_runs":[
+  {"name":"build","status":"completed","conclusion":"success"},
+  {"name":"deploy","status":"completed","conclusion":"skipped"},
+  {"name":"lint","status":"completed","conclusion":"neutral"}]}

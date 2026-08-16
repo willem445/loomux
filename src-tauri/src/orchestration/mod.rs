@@ -1563,12 +1563,27 @@ if [ "$cmd" = "pr" ] && [ "$sub" = "create" ]; then
       [ "$a_k" = "max-diff-lines" ] && a_max="$a_v"
     done < "$LOOMUX_GROUP_DIR/merge_gate"
     case "$a_max" in ''|*[!0-9]*) a_max=0 ;; esac
-    if [ "$a_max" -gt 0 ]; then
-      a_rf=""
-      [ -n "$repo" ] && a_rf="-R $repo"
-      # No PR number: `pr view` with none resolves the current branch's PR, which
-      # is the one just created. Unresolvable → nothing is said.
-      a_lines=$("$REAL_GH" pr view $a_rf --json additions,deletions --jq '.additions + .deletions' 2>/dev/null)
+    # `--head` names a branch OTHER than the checked-out one, and the lookup below
+    # has no PR number to use — it resolves the CURRENT branch's PR, which would
+    # then be a confident size for the wrong PR (#1181 rev-lead NB3). Every other
+    # doubt on this path goes silent; this one would print misinformation, so it
+    # is the one shape that is skipped outright rather than measured. (The
+    # neighbouring case — a branch that already has an open PR — closes itself:
+    # `gh pr create` fails there, and a non-zero rc already skips all of this.)
+    a_head=0
+    for a_tok in "$@"; do
+      case "$a_tok" in --head|--head=*|-H|-H?*) a_head=1 ;; esac
+    done
+    if [ "$a_max" -gt 0 ] && [ "$a_head" = "0" ]; then
+      # Fully quoted, in both branches — no unquoted expansion, so there is no
+      # globbing question to answer here at all (#1181 rev-lead NB2). The merge
+      # path below word-splits its own `-R` under `set -f`; this path runs BEFORE
+      # `set -f` is reached, so it must not rely on it.
+      if [ -n "$repo" ]; then
+        a_lines=$("$REAL_GH" pr view -R "$repo" --json additions,deletions --jq '.additions + .deletions' 2>/dev/null)
+      else
+        a_lines=$("$REAL_GH" pr view --json additions,deletions --jq '.additions + .deletions' 2>/dev/null)
+      fi
       case "$a_lines" in ''|*[!0-9]*) a_lines="" ;; esac
       if [ -n "$a_lines" ] && [ "$a_lines" -gt "$a_max" ]; then
         printf '%s\n' "loomux: heads up — this PR changes $a_lines lines and this repo's merge gate declares max_diff_lines: $a_max, so the merge WILL be refused as it stands. Split it now, before anyone reviews it: a split after review means the review is spent twice. (This notice is advisory only — the PR was created.)" >&2
@@ -1828,15 +1843,31 @@ if [ -f "$LOOMUX_GROUP_DIR/merge_gate" ]; then
         case "$bg_nwo" in
           ''|*[!A-Za-z0-9._/-]*) loomux_block_wf "base-unverifiable" "the gate requires base-green and loomux could not resolve which repository this PR belongs to, so it cannot read the base branch's checks" ;;
         esac
-        bg_runs=$("$REAL_GH" api "repos/$bg_nwo/commits/$base/check-runs" --jq 'if (.check_runs|length) == 0 then "none" elif any(.check_runs[]; .status != "completed") then "pending" elif any(.check_runs[]; .conclusion != "success" and .conclusion != "neutral" and .conclusion != "skipped") then "red" else "green" end' 2>/dev/null)
-        bg_stat=$("$REAL_GH" api "repos/$bg_nwo/commits/$base/status" --jq 'if (.statuses|length) == 0 then "none" elif .state == "success" then "green" elif .state == "pending" then "pending" else "red" end' 2>/dev/null)
-        case "$bg_runs" in none|pending|red|green) : ;; *) loomux_block_wf "base-unverifiable" "the gate requires base-green and loomux could not read the check runs on '$base' (its HEAD), so it cannot tell whether the branch this PR would land on is healthy — unknown is never treated as green" ;; esac
-        case "$bg_stat" in none|pending|red|green) : ;; *) loomux_block_wf "base-unverifiable" "the gate requires base-green and loomux could not read the commit statuses on '$base' (its HEAD), so it cannot tell whether the branch this PR would land on is healthy — unknown is never treated as green" ;; esac
-        case "$bg_runs$bg_stat" in
-          *red*)      loomux_block_wf "base-not-green" "the gate requires base-green and the HEAD of '$base' is RED. Fix the base branch first — piling more work onto a broken branch is what this clause exists to stop" ;;
-          *pending*)  loomux_block_wf "base-not-green" "the gate requires base-green and the checks on the HEAD of '$base' have not finished. Wait for them: a base whose result is not in yet is not a base known to be green" ;;
-          nonenone)   loomux_block_wf "base-not-green" "the gate requires base-green and the HEAD of '$base' reports no checks or statuses at all, so loomux cannot tell whether it is healthy — unknown is never treated as green. If this repo's CI legitimately skips some commits, do not declare base-green" ;;
-        esac ;;
+        # ONE definition of each reduction, interpolated from `workflow.rs` — see
+        # BASE_CHECK_RUNS_JQ. The first cut kept a COPY here; the two were
+        # byte-identical, and both were wrong in the same way (#1181 rev-lead),
+        # which is precisely the failure a copy cannot surface.
+        #
+        # `per_page=100` is the API maximum and only a MITIGATION: the reduction's
+        # own total_count clause is what stops a truncated page reading green.
+        bg_runs=$("$REAL_GH" api "repos/$bg_nwo/commits/$base/check-runs?per_page=100" --jq '__BASE_CHECK_RUNS_JQ__' 2>/dev/null)
+        bg_stat=$("$REAL_GH" api "repos/$bg_nwo/commits/$base/status" --jq '__BASE_STATUS_JQ__' 2>/dev/null)
+        case "$bg_runs" in none|pending|red|green|truncated) : ;; *) loomux_block_wf "base-unverifiable" "the gate requires base-green and loomux could not read the check runs on '$base' (its HEAD), so it cannot tell whether the branch this PR would land on is healthy — unknown is never treated as green" ;; esac
+        case "$bg_stat" in none|pending|red|green|truncated) : ;; *) loomux_block_wf "base-unverifiable" "the gate requires base-green and loomux could not read the commit statuses on '$base' (its HEAD), so it cannot tell whether the branch this PR would land on is healthy — unknown is never treated as green" ;; esac
+        # Compared word by word, never as a concatenation (#1181 rev-lead NB4). The
+        # concatenated form happened to be right for every pair in today's
+        # vocabulary, but it was right by an argument nobody had written down and
+        # one new word away from being wrong — and this round added a word.
+        # Ordered worst-answer-first, mirroring `base_ci_green` arm for arm.
+        if [ "$bg_runs" = "red" ] || [ "$bg_stat" = "red" ]; then
+          loomux_block_wf "base-not-green" "the gate requires base-green and the HEAD of '$base' is RED. Fix the base branch first — piling more work onto a broken branch is what this clause exists to stop"
+        elif [ "$bg_runs" = "truncated" ] || [ "$bg_stat" = "truncated" ]; then
+          loomux_block_wf "base-unverifiable" "the gate requires base-green and the HEAD of '$base' has more check runs than one API page reports, so loomux cannot see all of them and will not guess about the ones it cannot. Re-run the merge once the run count settles; if this base permanently carries more than 100 checks, base-green cannot be enforced for it and should not be declared"
+        elif [ "$bg_runs" = "pending" ] || [ "$bg_stat" = "pending" ]; then
+          loomux_block_wf "base-not-green" "the gate requires base-green and the checks on the HEAD of '$base' have not finished. Wait for them: a base whose result is not in yet is not a base known to be green"
+        elif [ "$bg_runs" = "none" ] && [ "$bg_stat" = "none" ]; then
+          loomux_block_wf "base-not-green" "the gate requires base-green and the HEAD of '$base' reports no checks or statuses at all, so loomux cannot tell whether it is healthy — unknown is never treated as green. If this repo's CI legitimately skips some commits, do not declare base-green"
+        fi ;;
       *) loomux_block_wf "unknown-condition" "the gate names the condition '$g_c', which this loomux build does not know how to check — an unknown condition fails closed. Remove it from gates.merge.also, or upgrade loomux" ;;
     esac
   done
@@ -1881,7 +1912,15 @@ loomux_block "gate-closed" "$default" "$num"
     // endings, which git may check out as CRLF on Windows — but a CRLF `#!/bin/sh`
     // script is broken under POSIX sh. The `.cmd` wrapper (which needs CRLF) is
     // built separately with explicit `\r\n`.
-    TPL.replace("__REAL_GH__", real_gh)
+    // #1174/#1181: the `base-green` reductions are ONE definition (workflow.rs),
+    // interpolated here and passed to `gh --jq` by the merge queue — so the shim
+    // and the queue cannot ask GitHub different questions. Both are single-quoted
+    // in the template above and neither contains a `'`, which is what makes a
+    // plain substitution safe; the test below asserts that, so a future edit that
+    // introduces one is red rather than a broken shim.
+    TPL.replace("__BASE_CHECK_RUNS_JQ__", workflow::BASE_CHECK_RUNS_JQ)
+        .replace("__BASE_STATUS_JQ__", workflow::BASE_STATUS_JQ)
+        .replace("__REAL_GH__", real_gh)
         .replace("__DEPS_PREAMBLE__\n", &shim_deps_preamble(paths.utils_dir.as_deref()))
         .replace("__RELEASE_GRANT_VALID__\n", RELEASE_GRANT_VALID_SH)
         .replace("__GIT_PLUMBING__\n", &gh_shim_git_plumbing(paths.git_dir.as_deref()))

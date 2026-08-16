@@ -315,12 +315,16 @@ pub fn pr_facts_argv(pr: u64) -> Vec<String> {
 /// runner is invoked in. The shim cannot use it (its merge may carry `-R`, which
 /// `gh api` has no equivalent of, so it resolves `nameWithOwner` explicitly);
 /// the queue never has one — it only ever operates on its own group's repo.
+/// `?per_page=100` is the API maximum, and it is the *mitigation*, never the
+/// guard: it makes truncation rare, and [`BASE_CHECK_RUNS_JQ`]'s `total_count`
+/// clause is what keeps a truncated page from reading green. A page size is a
+/// number GitHub is free to cap differently; the count comparison is not.
 pub fn base_check_runs_argv(base: &str) -> Vec<String> {
     vec![
         "api".into(),
-        format!("repos/{{owner}}/{{repo}}/commits/{base}/check-runs"),
+        format!("repos/{{owner}}/{{repo}}/commits/{base}/check-runs?per_page=100"),
         "--jq".into(),
-        BASE_CHECK_RUNS_JQ.into(),
+        crate::workflow::BASE_CHECK_RUNS_JQ.into(),
     ]
 }
 
@@ -330,19 +334,9 @@ pub fn base_status_argv(base: &str) -> Vec<String> {
         "api".into(),
         format!("repos/{{owner}}/{{repo}}/commits/{base}/status"),
         "--jq".into(),
-        BASE_STATUS_JQ.into(),
+        crate::workflow::BASE_STATUS_JQ.into(),
     ]
 }
-
-/// The check-runs reduction, byte-for-byte what the `gh` shim passes (#1174).
-/// Green is an ALLOW-list of conclusions — `success`, `neutral`, `skipped` —
-/// so a conclusion GitHub adds tomorrow reads as red rather than as green.
-pub const BASE_CHECK_RUNS_JQ: &str = "if (.check_runs|length) == 0 then \"none\" elif any(.check_runs[]; .status != \"completed\") then \"pending\" elif any(.check_runs[]; .conclusion != \"success\" and .conclusion != \"neutral\" and .conclusion != \"skipped\") then \"red\" else \"green\" end";
-
-/// The combined-status reduction, byte-for-byte what the `gh` shim passes.
-/// `state` is `pending` both when a context is pending and when there are no
-/// statuses at all, so the count is read first and answers `none`.
-pub const BASE_STATUS_JQ: &str = "if (.statuses|length) == 0 then \"none\" elif .state == \"success\" then \"green\" elif .state == \"pending\" then \"pending\" else \"red\" end";
 
 /// Whether the HEAD of `base` is all-green (#1174's `base-green` clause).
 ///
@@ -356,8 +350,11 @@ pub fn base_ci_green(r: &dyn MqRunner, base: &str) -> Option<bool> {
         if !out.ok() {
             return None;
         }
+        // The closed vocabulary the two reductions may answer in. Anything else
+        // — including a future word one of them learns and this list does not —
+        // is `None`, which refuses.
         match out.line().trim() {
-            w @ ("none" | "pending" | "red" | "green") => Some(w.to_string()),
+            w @ ("none" | "pending" | "red" | "green" | "truncated") => Some(w.to_string()),
             _ => None,
         }
     };
@@ -365,6 +362,13 @@ pub fn base_ci_green(r: &dyn MqRunner, base: &str) -> Option<bool> {
     let status = word(base_status_argv(base))?;
     if runs == "red" || status == "red" {
         return Some(false);
+    }
+    // #1181 rev-lead: the check-runs endpoint is PAGINATED, so a page that does
+    // not carry every run tells us nothing about the runs it left out. Reported
+    // as its own word rather than folded into `pending`, because the two need
+    // different sentences from the shim — and refused either way.
+    if runs == "truncated" || status == "truncated" {
+        return None;
     }
     if runs == "pending" || status == "pending" {
         return None;

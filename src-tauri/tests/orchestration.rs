@@ -38603,6 +38603,24 @@ fn gh_shim_script_enforces_the_workflow_merge_gate() {
         "…and an oversized PR and an unmeasurable one are distinct, audited refusals");
     assert!(sh.contains("base-green") && sh.contains("/check-runs") && sh.contains("/status"),
         "base-green reads BOTH check surfaces — either alone is blind to half of GitHub");
+    // ONE definition, two consumers (#1181 rev-lead). The shim interpolates the
+    // same constants the merge queue passes to `gh --jq`, so the two cannot ask
+    // GitHub different questions — the first cut kept a copy here, the copies were
+    // byte-identical, and both were wrong in the same way, which is exactly what a
+    // copy cannot surface.
+    assert!(sh.contains(workflow::BASE_CHECK_RUNS_JQ),
+        "the shim must carry the SHARED check-runs reduction, not a copy of it");
+    assert!(sh.contains(workflow::BASE_STATUS_JQ),
+        "…and the shared status reduction");
+    // Both are interpolated into single-quoted shell words, so a `'` in either
+    // would end the quote and hand the rest of the reduction to the shell as code.
+    // Neither has one today; this is what makes that a fact rather than luck.
+    for jq in [workflow::BASE_CHECK_RUNS_JQ, workflow::BASE_STATUS_JQ] {
+        assert!(!jq.contains('\''),
+            "a single quote in a reduction would break out of the shim's quoting: {jq}");
+    }
+    assert!(sh.contains("per_page=100"),
+        "the page-size mitigation rides along with the truncation guard");
     assert!(sh.contains("nameWithOwner"),
         "…and resolves the repo explicitly, because `gh api`'s {{owner}}/{{repo}} placeholders would ignore a -R");
     // EVERY condition this build claims to know must have an arm in the shell. The
@@ -38909,6 +38927,22 @@ fn gh_shim_harness_refuses_a_merge_onto_a_base_that_is_not_green() {
     let (ok, err) = try_merge("none", "none");
     assert!(!ok, "a base nobody can call healthy is not a base to merge onto");
     assert!(err.contains("no checks or statuses at all"), "{err}");
+
+    // #1181 rev-lead, BLOCKING: the check-runs endpoint is PAGINATED, and a page
+    // that does not carry every run says nothing about the ones it omits. Before
+    // the fix this reduced to `green` and the merge onto a red base was ALLOWED —
+    // the fail-open inversion of this clause's entire premise.
+    let (ok, err) = try_merge("truncated", "green");
+    assert!(!ok, "a base whose check runs loomux cannot see in full must not be merged onto");
+    assert!(err.contains("more check runs than one API page"), "{err}");
+    // …from either surface, and it outranks a merely-pending sibling.
+    assert!(!try_merge("green", "truncated").0);
+    assert!(!try_merge("truncated", "pending").0);
+    // A visible failure still outranks truncation: `red` is the more actionable
+    // answer, and the reduction puts it first for that reason.
+    let (ok, err) = try_merge("red", "truncated");
+    assert!(!ok);
+    assert!(err.contains("is RED"), "a visible failure is reported as red, not as unreadable: {err}");
 
     // An answer loomux could not read at all is the same refusal class, and the
     // repo itself failing to resolve is too — both are `base-unverifiable`.

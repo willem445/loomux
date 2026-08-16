@@ -1,0 +1,4 @@
+{"total_count":6,"check_runs":[
+  {"name":"deploy","status":"completed","conclusion":"skipped"},
+  {"name":"build","status":"completed","conclusion":"success"},
+  {"name":"E2E","status":"completed","conclusion":"success"}]}
