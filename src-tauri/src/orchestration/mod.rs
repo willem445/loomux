@@ -9460,10 +9460,16 @@ impl WipBreach {
     /// the count, the rows in the way, and the file to change — a refusal a
     /// reader cannot act on just becomes a retry.
     pub fn refusal(&self, this_id: &str) -> String {
-        let held = if self.occupants.is_empty() {
-            String::new()
-        } else {
-            format!(" ({})", self.occupants.join(", "))
+        // `occupants` is capped at `WIP_NAMED_OCCUPANTS`, and a truncated list
+        // that did not SAY it was truncated would read as the whole set —
+        // "finish one of these two" on a status holding nine. `count - 1` is
+        // the real occupant count, so the two are comparable here.
+        let held = match (self.occupants.len() as u32, self.count - 1) {
+            (0, _) => String::new(),
+            (shown, total) if shown < total => {
+                format!(" ({}, and {} more)", self.occupants.join(", "), total - shown)
+            }
+            _ => format!(" ({})", self.occupants.join(", ")),
         };
         format!(
             "board.wip: {} is capped at {} and already holds {}{held} — finish one or move it out \
@@ -35220,14 +35226,20 @@ impl OrchRegistry {
     pub fn workflow_status_within(&self, group: &GroupId, default_branch_max_age: Duration) -> Value {
         let info = self.group(group);
         let guardrails = info.as_ref().map(|g| g.guardrails.clone()).unwrap_or_default();
-        let name = if guardrails.advanced_orchestrator {
-            info.as_ref()
-                .and_then(|g| workflow::load_workflow(&g.repo).ok().flatten())
-                .map(|wf| wf.name)
-                .unwrap_or_default()
+        // ONE load for the two things this call reads out of the workflow file
+        // — the display `name` and the `board:` policy below (#1175). They used
+        // to be two `load_workflow` calls, which is two YAML parses of the same
+        // file on a command that sits in the group view's 2 s poll.
+        let declared = if guardrails.advanced_orchestrator {
+            info.as_ref().and_then(|g| workflow::load_workflow(&g.repo).ok().flatten())
         } else {
-            String::new()
+            // The toggle being off is authoritative "this group declares
+            // nothing", exactly as `board_policy`/`merge_queue_policy` read it
+            // — not an unread file.
+            None
         };
+        let name = declared.as_ref().map(|wf| wf.name.clone()).unwrap_or_default();
+        let board = declared.map(|wf| wf.board).unwrap_or_default();
         let gate = self.merge_gate(group).map(|g| {
             let missing = workflow::gate_missing_blocks(&g, &guardrails.blocks);
             json!({
@@ -35271,35 +35283,41 @@ impl OrchRegistry {
                 "persona": b.has_persona(),
             })).collect::<Vec<_>>(),
             "gate": gate,
-            "wip": self.wip_status(group),
+            "wip": self.wip_rows(group, &board),
         })
     }
 
-    /// The board's declared WIP caps with their live counts (#1175) — what the
-    /// board renders as `3/4` beside each capped status, and an empty list for
-    /// every group that declares none.
+    /// The board's declared WIP caps with their live counts (#1175), for the
+    /// MCP `list_tasks` reply — the same rows the human's board renders, so the
+    /// orchestrator and the human are reading one board and one set of caps.
+    ///
+    /// Reads the policy itself, unlike [`Self::wip_rows`], because this is the
+    /// agent path and there is no already-loaded workflow to hand it.
+    #[doc(hidden)] // pub for integration tests
+    pub fn wip_status_for_agents(&self, group: &GroupId) -> Vec<Value> {
+        self.wip_rows(group, &self.board_policy(group))
+    }
+
+    /// The `{status, limit, count, enforce}` rows for an ALREADY-RESOLVED
+    /// policy — what the board renders as `3/4` beside each capped status, and
+    /// an empty list for every group that declares none.
+    ///
+    /// Takes the policy rather than reading it so [`Self::workflow_status`],
+    /// which already loaded this repo's workflow for the file's `name`, does
+    /// not parse the same YAML a second time on a call that sits in the group
+    /// view's 2 s poll.
     ///
     /// Counted here, in the backend, rather than shipped as bare limits for the
-    /// frontend to tally: `wip_occupants` is the one definition of what a cap
+    /// frontend to tally: [`wip_occupants`] is the one definition of what a cap
     /// counts, and a second tally in TypeScript is a second definition that
     /// would drift the first time either side learned something about
     /// containers.
     ///
     /// **A group with no caps reads nothing.** The `tasks.json` read below is
-    /// behind the empty-map check on purpose: this whole function is on the
-    /// group view's 2 s poll, and a repo that declares no `board:` block must
-    /// pay exactly what it paid before this feature existed (#743's standard
-    /// for this command).
-    /// [`Self::wip_status`] for the MCP `list_tasks` reply — the same rows the
-    /// human's board renders, so the orchestrator and the human are reading
-    /// one board and one set of caps.
-    #[doc(hidden)] // pub for integration tests
-    pub fn wip_status_for_agents(&self, group: &GroupId) -> Vec<Value> {
-        self.wip_status(group)
-    }
-
-    fn wip_status(&self, group: &GroupId) -> Vec<Value> {
-        let board = self.board_policy(group);
+    /// behind the empty-map check on purpose: a repo that declares no `board:`
+    /// block must pay exactly what it paid before this feature existed (#743's
+    /// standard for this command).
+    fn wip_rows(&self, group: &GroupId, board: &workflow::BoardPolicy) -> Vec<Value> {
         if board.wip.is_empty() {
             return vec![];
         }
