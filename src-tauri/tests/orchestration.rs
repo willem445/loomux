@@ -52336,3 +52336,28 @@ fn the_caps_and_their_live_counts_reach_both_the_board_and_the_agent() {
     let status = reg.workflow_status(&g);
     assert_eq!(status["wip"], serde_json::Value::Array(rows), "the board reads the same rows");
 }
+
+/// A refusal names up to `WIP_NAMED_OCCUPANTS` rows, and **says so when there
+/// are more**. A truncated list that did not admit it reads as the whole set —
+/// "finish one of these four" on a status holding six — which is a refusal that
+/// misdescribes the board it is refusing on.
+#[test]
+fn a_refusal_that_cannot_name_every_occupant_says_how_many_it_left_out() {
+    let (reg, _d, g) = wip_board(
+        "wip-trunc",
+        "board:\n  wip:\n    review: 6\n  enforce: true\n",
+        &["a", "b", "c", "d", "e", "f", "g"],
+    );
+    for t in ["t-1", "t-2", "t-3", "t-4", "t-5", "t-6"] {
+        reg.upsert_task(&g, "orch", Some(t), status_patch("review")).unwrap();
+    }
+    let err = reg
+        .upsert_task(&g, "orch", Some("t-7"), status_patch("review"))
+        .expect_err("the seventh entry into a cap of 6 must be refused");
+    assert!(err.contains("already holds 6"), "the count is the REAL one, not the named subset: {err}");
+    assert!(err.contains("t-1") && err.contains("t-4"), "the first four are named: {err}");
+    assert!(
+        err.contains("and 2 more"),
+        "…and the two it could not name are admitted rather than dropped: {err}"
+    );
+}
