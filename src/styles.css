@@ -4001,3 +4001,127 @@ button.wf-finding:hover { background: var(--surface-2); }
 .wf-inline-findings .wf-finding { display: list-item; padding: 0; cursor: default; }
 .wf-inline-findings .wf-error { color: var(--state-danger); }
 .wf-inline-findings .wf-warning { color: var(--state-attention); }
+
+/* ======================== the right-side dock (#1020 item 6, #934) ==========================
+ *
+ * An OVERLAY over the right edge of #workspace — never a flex sibling. This is the whole
+ * structural point, and it is worth stating next to the rules that implement it:
+ *
+ *   - #workspace gains `position: relative` and NOTHING else. That makes it the containing
+ *     block for the panel below; it moves no flex item by a pixel, because a bare
+ *     `position: relative` with `z-index: auto` changes only what an absolutely-positioned
+ *     descendant resolves against.
+ *   - `.sidedock` is `position: absolute`, so it is OUT OF FLOW and therefore not a flex
+ *     item of #workspace at all. It cannot squeeze #grid-area, no pane's ResizeObserver
+ *     fires, no applyFit() runs, and no ConPTY is resized — CLAUDE.md constraint 1 held by
+ *     construction rather than by care. Contrast #sessions, an in-flow flex item that
+ *     ANIMATES its width and so resizes every terminal on every frame of the transition
+ *     (doc/design/ui-redesign.md §X10 names it as the mistake not to repeat).
+ *   - The cost, stated rather than hidden: the dock OCCLUDES panes instead of displacing
+ *     them. That is the trade the no-resize rule buys, and it is why the dock defaults
+ *     closed, toggles in one click, and reserves a strip of grid it may never cover
+ *     (DOCK_TERM_RESERVE_PX, sidedockmodel.ts).
+ *
+ * NO SHADOW, deliberately. `--shadow-float` is a 40px soft shadow, and its penumbra would
+ * fall on a live WebGL terminal canvas — the documented way to make this app slow
+ * (doc/design/performance.md), and what maintainability rule 5 refuses. The dock separates
+ * the way principle 1 says surfaces should: elevation plus a hairline.
+ *
+ * z-index 40 sits above a maximized pane (30) so the dock stays reachable, and below the
+ * pane drag layer (60/61), context menus (80+), toasts (100) and modals (1000). */
+#workspace { position: relative; }
+
+.sidedock {
+  position: absolute; top: 0; right: 0; bottom: 0;
+  z-index: 40;
+  display: flex; flex-direction: column; min-width: 0;
+  background: var(--surface-1);
+  border-left: var(--line-w) solid var(--line-strong);
+}
+
+/* The resize grip. Widening the dock costs nothing but the dock's own box — there is no
+   terminal on the other side of this drag, which is exactly what makes an overlay's
+   divider cheap where an embed slot's is not. */
+.sidedock-grip {
+  position: absolute; top: 0; left: calc(-1 * var(--space-1)); bottom: 0;
+  width: var(--space-3);
+  cursor: ew-resize; z-index: 1;
+}
+.sidedock-grip:hover { background: color-mix(in srgb, var(--accent) 35%, transparent); }
+
+.sidedock-head {
+  flex: none; display: flex; align-items: center; gap: var(--space-2);
+  padding: var(--space-2) var(--space-2) var(--space-2) var(--space-3);
+  border-bottom: var(--line-w) solid var(--line);
+}
+.sidedock-tabs { flex: 1; display: flex; align-items: stretch; gap: var(--space-1); min-width: 0; }
+
+.sidedock-tab {
+  flex: none; display: inline-flex; align-items: center; gap: var(--space-2);
+  padding: var(--space-1) var(--space-3);
+  font-family: var(--font-ui); font-size: var(--text-s);
+  color: var(--ink-dim); cursor: pointer;
+  background: transparent; border: none;
+  border-radius: var(--radius-s);
+  /* Square-bottomed against the accent underline below: the active tab is a tab, not a
+     floating object. */
+  border-bottom: var(--thread) solid transparent;
+  transition: color var(--dur-fast) var(--ease), background var(--dur-fast) var(--ease);
+}
+.sidedock-tab:hover { color: var(--ink); background: var(--surface-2); }
+/* The active tab is one of the four positions the ONE interaction accent is allowed
+   (doc/design/ui-redesign.md §The three colour channels). The tab's ICON keeps its own
+   identity dye from the registry — the two channels sit on different properties of the
+   same row, which is what keeps them readable as different questions. */
+.sidedock-tab.active { color: var(--ink); border-bottom-color: var(--accent); }
+
+.sidedock-close {
+  flex: none; padding: 0 var(--space-2);
+  background: transparent; border: none; cursor: pointer;
+  color: var(--ink-faint); font-size: var(--text-s);
+}
+.sidedock-close:hover { color: var(--ink); }
+
+/* The folder the dock is following. An eyebrow-scale mono string, because it is a machine
+   identifier — the rule --font-mono exists for. */
+.sidedock-root {
+  flex: none; display: flex; align-items: center; gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  font-family: var(--font-mono); font-size: var(--text-xs);
+  color: var(--ink-dim);
+  border-bottom: var(--line-w) solid var(--line);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.sidedock-root-none { color: var(--ink-faint); font-style: italic; }
+
+/* "This tab stopped following, and here is why." Achromatic on purpose: the honest dye for
+   an unsaved-edits warning is --state-attention, and that token is reserved to the agent
+   STATE positions (the warp thread, the status chip, the state dot). Reaching for a
+   different hue merely because it is permitted is the "it needed a slightly different blue"
+   failure maintainability rule 2 refuses, so this says it with ink and a hairline instead. */
+.sidedock-hold {
+  flex: none;
+  margin: var(--space-2) var(--space-3) 0;
+  padding: var(--space-2) var(--space-3);
+  font-family: var(--font-ui); font-size: var(--text-xs); line-height: 1.5;
+  color: var(--ink);
+  background: var(--surface-2);
+  border: var(--line-w) solid var(--line-strong);
+  border-radius: var(--radius-s);
+}
+
+.sidedock-body { flex: 1; min-height: 0; min-width: 0; display: flex; }
+/* Each hosted view fills the body; only the active tab's is left unhidden (the app-wide
+   `[hidden] { display: none !important }` rule does the hiding). */
+.sidedock-body > * { flex: 1; min-width: 0; min-height: 0; }
+
+/* Suspend the heavy lists' layout for the duration of a grip drag, exactly as the embed
+   slots and the floating overlays already do (#361) — same mechanism, same class name,
+   extended to the three views this dock hosts. */
+.sidedock.resizing .git-graph-list,
+.sidedock.resizing .git-files-list,
+.sidedock.resizing .git-diff-body,
+.sidedock.resizing .fileexp-list,
+.sidedock.resizing .fileedit-tree {
+  content-visibility: hidden;
+}

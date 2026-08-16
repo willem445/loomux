@@ -76,8 +76,16 @@ export function discardEdits(saved: string): string {
  *  pane, dismissed and easy to forget; DOCKED (#361 scope increase) is that same Alt+F
  *  editor sharing space with the terminal as a permanent-looking side panel — visually
  *  the LEAST likely of the three to read as "still open, still holding edits", since it
- *  looks like a fixture of the pane rather than something you opened and could close. */
-export type DirtyHost = "pane" | "overlay" | "docked";
+ *  looks like a fixture of the pane rather than something you opened and could close.
+ *
+ *  SIDEDOCK (#1020 item 6) is the app-level right-side dock's editor tab, and it is the
+ *  one holder that lives outside every pane — so it is also the one the quit sweep cannot
+ *  reach by walking tabs and panes, and has to be concatenated in deliberately
+ *  (main.ts's `unsavedBuffers`). It reads as furniture for the same reason `docked` does,
+ *  and worse: it is not even attached to the pane whose folder it happens to be showing,
+ *  so "which pane is that in?" has no answer at all. It is named separately rather than
+ *  folded into `docked` precisely so the confirm can say where to go look. */
+export type DirtyHost = "pane" | "overlay" | "docked" | "sidedock";
 
 /** One pane's unsaved-work report, as the DOM layer sees it. A pane with no editor at
  *  all reports nothing; a pane with a clean one reports `dirty: false`. */
@@ -164,9 +172,17 @@ export function withDeadline(work: Promise<unknown>, ms: number): Promise<"done"
 /** One line per unsaved buffer for that confirm — "tab · pane — file", with the Alt+F
  *  overlay/docked cases marked, since "which pane is that even in?" is the whole
  *  difficulty of both — a docked editor looks like part of the pane's furniture, not
- *  something someone opened, so it needs the same call-out an overlay already got. */
+ *  something someone opened, so it needs the same call-out an overlay already got.
+ *
+ *  The side dock (#1020) is the one line that does NOT name a pane, because it does not
+ *  live in one: it is a single app-level panel, so "side dock editor" locates it exactly
+ *  and a pane column would be a fabrication. Its `tab` field carries the folder the dock
+ *  was pointed at, which is the disambiguator a tab name provides for every other line. */
 export function dirtyBufferLines(dirty: readonly DirtyBuffer[]): string[] {
   return dirty.map((d) => {
+    if (d.host === "sidedock") {
+      return `side dock editor — ${d.file ?? "unsaved file"} (in ${d.tab})`;
+    }
     const where =
       d.host === "overlay"
         ? `${d.pane} (Alt+F editor)`

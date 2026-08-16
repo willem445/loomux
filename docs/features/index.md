@@ -8,8 +8,10 @@ has_children: true
 # Feature pages
 
 Deep dives on loomux's per-feature panels and tools. Each one floats *over* the
-terminal it's scoped to and never resizes the PTY underneath — press `Esc` to
-return to the shell.
+terminal it's scoped to and never resizes the PTY underneath. The pane-scoped
+panels close with `Esc`; the window-level ones (the session browser, the side
+dock) have their own toggle in the top bar, so that `Esc` keeps reaching your
+shell.
 
 - **[Project tabs](project-tabs.html)** — several project workspaces in one
   window; each a full split grid with its own dock, previews, and per-project
@@ -32,3 +34,6 @@ return to the shell.
 - **[SSH panes](ssh-panes.html)** — a remote shell or agent CLI over your own ssh
   client, with saved connections that hold no credentials, dormant-until-you-click
   reconnect, and an honest account of what a remote pane cannot do.
+- **[Side dock](side-dock.html)** — git, files and the editor in one collapsible
+  panel down the right edge, pointed at whichever pane you are working in
+  (`⬔ dock` in the top bar).

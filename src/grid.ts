@@ -176,7 +176,17 @@ export class Grid {
     /** Fired whenever the pane set / layout changes (open, close) so the host can
      *  re-render the tab strip's live agent counter and re-persist the layout
      *  (#194 P4). Defaults to a no-op for callers that don't care. */
-    private onChange: () => void = () => {}
+    private onChange: () => void = () => {},
+    /** Fired whenever the ACTIVE pane changes — a different question from
+     *  `onChange`, which is about the pane SET. The right-side dock follows the
+     *  active pane's folder (#1020 item 6) and this is its one trigger.
+     *
+     *  Deliberately hung off `setActive` rather than off `PaneEvents.onFocus`:
+     *  focus is only one of the ways the active pane moves. Closing a pane and
+     *  inheriting its neighbour, finishing a drag, `moveFocus`, opening a pane
+     *  and toggling maximize all reach `setActive` directly, and a dock wired to
+     *  focus alone would sit on a stale folder after every one of them. */
+    private onActive: () => void = () => {}
   ) {
     this.rootEl.addEventListener("pointerdown", (e) => this.onPointerDown(e));
     this.renderDock();
@@ -759,6 +769,10 @@ export class Grid {
     this.active?.setActive(false);
     this.active = pane;
     pane.setActive(true);
+    // After the pane is live, so a listener that reads `activePane` sees the new
+    // one. Inside the early-return guard above, so re-focusing the pane that is
+    // already active stays free.
+    this.onActive();
   }
 
   // ---------- maximize ----------

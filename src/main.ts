@@ -44,6 +44,7 @@ import {
   type KeepOpenReason,
 } from "./dirtystate";
 import { matchShortcut } from "./shortcuts";
+import { SideDock } from "./sidedock";
 import { ftRootIsDir } from "./fileapi";
 import { gitRepoRoot } from "./git";
 import { voiceController } from "./voicecontrol";
@@ -139,8 +140,16 @@ window.addEventListener("unhandledrejection", (e) => {
 });
 
 const sessionsEl = document.getElementById("sessions")!;
+const workspaceEl = document.getElementById("workspace")!;
 const stackEl = document.getElementById("workspace-stack")!;
 const tabBarEl = document.getElementById("tab-bar")!;
+
+/** The right-side dock (#1020 item 6): git / files / editor over the right edge
+ *  of the workspace, following the active pane's folder. Assigned once the tab
+ *  manager below exists — it is declared here, ahead of the Workspace factory
+ *  that notifies it, so the factory's closure has a name to reach and nothing
+ *  depends on module-init ordering. */
+let sideDock: SideDock | null = null;
 
 // Project tabs (#63): each tab is a Workspace (its own Grid + dock). The old
 // module-scope single `grid` is gone; everything acts on the ACTIVE tab's grid.
@@ -168,7 +177,13 @@ const tabs = new TabManager<Workspace>((id) => {
       // old MED-1 "silent shell only" rule existed solely to avoid that overlay.
       openWelcomeIn(w);
     },
-    () => onGridChanged()
+    () => onGridChanged(),
+    // The active pane moved inside this tab. Only the ACTIVE tab's grid can be
+    // the one the dock follows, and the dock reads the active pane itself
+    // (`activeCwd` below) rather than trusting the pane this fired for — a
+    // background tab whose agent exits reshuffles its own active pane too, and
+    // that must not yank the dock away from what the human is looking at.
+    () => sideDock?.followActivePane()
   );
   stackEl.appendChild(ws.el);
   return ws;
@@ -180,6 +195,19 @@ let tabBar: TabBar<Workspace> | null = null;
 
 /** The active tab's grid — the single-grid `grid` of the pre-tabs app. */
 const activeGrid = (): Grid => tabs.activeWorkspace.grid;
+
+sideDock = new SideDock(workspaceEl, {
+  // `activeWorkspace` THROWS before the first tab exists, and this is read at
+  // construction — which happens before boot seeds one.
+  activeCwd: () => (tabs.count === 0 ? null : tabs.activeWorkspace.grid.activePane?.workdir ?? null),
+});
+
+// Switching PROJECT TABS changes the active pane without any grid's `setActive`
+// firing: `applyActive` focuses the incoming tab's already-active pane, and
+// `setActive` early-returns on the pane it is already on. So the dock needs this
+// second trigger, or it keeps showing the previous tab's repo. Same debounced
+// pull, same decision — `decideFollow` still no-ops when the folder is unchanged.
+tabs.onChange(() => sideDock?.followActivePane());
 
 // Voice push-to-talk (#58, Alt+S): the global capture controller finds its
 // insertion target via the active pane (of the active tab).
@@ -2417,7 +2445,13 @@ void onPtyExit((exit) => {
  *  forgets, which is why the sweep is total rather than "the active tab". The pure
  *  filter (dirtystate.dirtyBuffers) decides which reports count as unsaved. */
 function unsavedBuffers(): DirtyBuffer[] {
-  return dirtyBuffers(tabs.tabs.flatMap((ws) => ws.bufferReports()));
+  const paneReports = tabs.tabs.flatMap((ws) => ws.bufferReports());
+  // The side dock's editor (#1020 item 6) is the one buffer holder that is NOT
+  // inside a pane, so walking tabs→panes cannot reach it. A quit that misses a
+  // holder silently destroys it, which is the whole of #219 — so it is
+  // concatenated here rather than left to be discovered.
+  const dockReport = sideDock?.bufferReport();
+  return dirtyBuffers(dockReport ? [...paneReports, dockReport] : paneReports);
 }
 
 /** Persist on the way out — with a DEADLINE.
@@ -2612,6 +2646,13 @@ document.getElementById("btn-split-down")!.addEventListener("click", () => openP
 // the Ctrl+Shift+A path — the button is an affordance for it, not a second
 // implementation of it.
 document.getElementById("btn-autosize")!.addEventListener("click", () => activeGrid().autosize());
+// The side dock (#1020 item 6). A button and no keyboard chord, deliberately: every
+// remaining free chord has to clear the agent-cli-reference check first (a Ctrl+Shift+
+// binding is withheld from every terminal pane, so taking one steals it from whatever
+// CLI is running with no escape hatch), and that check is a doc read this change did not
+// do. A dock nobody can toggle from the keyboard is a missing convenience; a dock that
+// eats an agent's binding is a defect.
+document.getElementById("btn-sidedock")!.addEventListener("click", () => sideDock?.toggle());
 
 // Keep the browser from hijacking terminal-relevant defaults (Ctrl+F etc.
 // stays inside the shell; F5/F7 reach TUI apps instead of the webview).

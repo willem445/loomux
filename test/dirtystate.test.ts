@@ -164,6 +164,31 @@ test("a DOCKED editor gets its own call-out too (#361 scope increase) — not mi
   assert.deepEqual(lines, ["loomux · claude · fix (docked editor) — src/git.ts"]);
 });
 
+test("the SIDE DOCK's editor is named as itself, not attributed to a pane (#1020 item 6)", () => {
+  // The dock is one app-level panel, not a thing inside a pane — so a "tab · pane" line
+  // would invent a location the human cannot go to. It says what it is and which folder
+  // it was pointed at, which is the disambiguator a tab name provides everywhere else.
+  const lines = dirtyBufferLines(
+    dirtyBuffers([
+      report({ tab: "C:\\Projects\\loomux", pane: "editor", host: "sidedock", file: "src/main.ts", dirty: true }),
+    ])
+  );
+  assert.deepEqual(lines, ["side dock editor — src/main.ts (in C:\\Projects\\loomux)"]);
+});
+
+test("the side dock's buffer counts toward the quit gate like any other holder", () => {
+  // The dock's editor sits outside every pane, so main.ts has to concatenate its report
+  // into the sweep deliberately. Once it is in, nothing about the gate is special-cased:
+  // if the ONLY dirty buffer in the app is the dock's, quitting must still ask.
+  const dirty = dirtyBuffers([
+    report({ tab: "loomux", pane: "pane.ts", host: "pane", file: "src/pane.ts", dirty: false }),
+    report({ tab: "C:\\Projects\\loomux", pane: "editor", host: "sidedock", file: "src/main.ts", dirty: true }),
+  ]);
+  assert.equal(dirty.length, 1);
+  assert.equal(dirty[0].host, "sidedock");
+  assert.equal(quitDecision(dirty), "confirm");
+});
+
 // ---------- a pane whose process just died (#219) ----------
 
 const exited = (code: number | null, expected = false) => ({ exit_code: code, expected });
