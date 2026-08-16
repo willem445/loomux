@@ -33737,11 +33737,10 @@ impl OrchRegistry {
                 ("waiting", format!("{} is waiting on a prompt", a.name))
             } else if report == Some("done") {
                 ("report", format!("{} reported done — review & merge", a.name))
-            } else if let Some(&count) = question_of.get(a.id.as_str()) {
-                // Non-urgent amber, like `gate` — a question is a decision
-                // waiting on the human's own pace, not a wedged pane.
-                let noun = if count == 1 { "question" } else { "questions" };
-                ("question", format!("{count} pending {noun} — needs your answer"))
+            // SCRATCH RED (#1091 slice D): the `question` arm is neutered here
+            // on purpose — this branch is what the real PR adds back. Do not
+            // merge this commit; it exists only to produce a red CI run for
+            // `attention_flags_the_asker_with_a_pending_question_and_clears_on_settle`.
             } else if let Some(st) = gate_of.get(a.id.as_str()) {
                 ("gate", format!("task is {st} — awaiting your call"))
             } else {
