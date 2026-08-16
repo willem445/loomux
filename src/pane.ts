@@ -48,7 +48,7 @@ import { decideRefresh, REPO_SIGNAL_WINDOW_MS } from "./refreshthrottle";
 import { planWebglRetry } from "./webglretry";
 import { showToast } from "./toast";
 import { isAppShortcut } from "./shortcuts";
-import { attentionPresentation, attentionDismiss } from "./attention";
+import { attentionPresentation, attentionDismiss, attentionChanged } from "./attention";
 import { dismissStranded } from "./orchestration";
 import { heldPresentation } from "./heldbadge";
 import { queuePresentation, type QueueDepthReading } from "./queuebadge";
@@ -2482,12 +2482,23 @@ export class Pane implements VoiceTargetPane {
   }
 
   /** Flag (or clear) this pane as needing the human — driven by the backend
-   *  attention scan. Idempotent: a same-reason repeat is a no-op, so the 3-second
-   *  re-emits don't thrash the DOM. `null` clears the badge. */
+   *  attention scan. Idempotent on (reason, detail) TOGETHER: an identical
+   *  repeat of both is a no-op, so the 3-second re-emits don't thrash the DOM.
+   *  `null` clears the badge.
+   *
+   *  Deliberately NOT idempotent on `reason` alone (#1091 slice D review) —
+   *  see `attentionChanged` (attention.ts) for why, and for the pinned test.
+   *  Still cheap: this only runs when the outer `AttentionGate`
+   *  (attentiongate.ts) already decided the payload changed, since ITS
+   *  signature includes `detail` too — so a same-text re-emit never even
+   *  reaches here, and a changed `detail` was already going to trigger a DOM
+   *  pass; this just stops that pass from discarding the new text once it
+   *  arrives. */
   setAttention(reason: string | null, detail?: string): void {
-    if (reason === this.attentionReason) return;
+    const normalizedDetail = reason ? detail ?? null : null;
+    if (!attentionChanged(this.attentionReason, this.attentionDetail, reason, normalizedDetail)) return;
     this.attentionReason = reason;
-    this.attentionDetail = reason ? detail ?? null : null;
+    this.attentionDetail = normalizedDetail;
     if (!reason) {
       this.attnChip.hidden = true;
       this.el.classList.remove("needs-attention");

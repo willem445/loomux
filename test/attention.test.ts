@@ -2,7 +2,12 @@
 // pane header chip and the minimize-dock chip. Run with `npm test`.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { attentionPresentation, dockChipAttention, attentionDismiss } from "../src/attention.ts";
+import {
+  attentionPresentation,
+  dockChipAttention,
+  attentionDismiss,
+  attentionChanged,
+} from "../src/attention.ts";
 
 test("each known reason maps to its label", () => {
   assert.equal(attentionPresentation("blocked").label, "⚠ blocked");
@@ -129,4 +134,37 @@ test("the dismiss tooltip promises only what the dismiss actually does", () => {
     /does not unstick the pane/i,
     `the tooltip must say what it does NOT do: ${title}`,
   );
+});
+
+// #1091 slice D review: `Pane.setAttention` used to be idempotent on `reason`
+// ALONE, which meant a pending-question count going from 1 to 2 — same
+// `reason: "question"`, different `detail` — never reached the chip's
+// tooltip: the docs claimed "hover it for the question count" while the code
+// silently kept showing whatever count first raised the badge. Same defect
+// shape for `gate` (detail carries the task's status, which can change
+// without the task leaving the gate-status set). `attentionChanged` is the
+// extracted, pure identity check `setAttention` now gates on — this pins
+// that a detail-only change is still a change.
+test("attentionChanged fires on a detail change even when the reason stays the same", () => {
+  assert.equal(
+    attentionChanged("question", "1 pending question — needs your answer", "question", "1 pending question — needs your answer"),
+    false,
+    "an identical repeat is a no-op",
+  );
+  assert.equal(
+    attentionChanged("question", "1 pending question — needs your answer", "question", "2 pending questions — needs your answer"),
+    true,
+    "a growing count must not be swallowed by same-reason idempotency",
+  );
+  assert.equal(
+    attentionChanged("gate", "task is pr — awaiting your call", "gate", "task is human-testing — awaiting your call"),
+    true,
+    "gate's status text is the same live-detail shape as question's count",
+  );
+});
+
+test("attentionChanged treats a fresh reason and a clear as changes too", () => {
+  assert.equal(attentionChanged(null, null, "question", "1 pending question — needs your answer"), true);
+  assert.equal(attentionChanged("question", "1 pending question — needs your answer", null, null), true);
+  assert.equal(attentionChanged(null, null, null, null), false, "clear-on-clear is still a no-op");
 });

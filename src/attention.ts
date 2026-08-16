@@ -40,6 +40,25 @@ const LABELS: Record<string, string> = {
  *  — `tabroute.ts` mirrors this rule (see its note on why it can't import). */
 const URGENT: ReadonlySet<string> = new Set(["blocked", "stranded"]);
 
+/** Whether a fresh `(reason, detail)` reading differs from the one currently
+ *  applied to a pane — the identity check `Pane.setAttention` gates its DOM
+ *  work on (#1091 slice D review). `detail` participates deliberately:
+ *  several reasons carry a live count/status in `detail` while the reason
+ *  string itself stays put — `question`'s "N pending question(s)" as N
+ *  grows, `gate`'s "task is {status}" as the task moves between gate
+ *  statuses without leaving the gate set. A reason-only check would freeze
+ *  the tooltip at whatever text first raised the chip; this is why the
+ *  earlier version of this check (`reason === this.attentionReason` alone)
+ *  was a real defect, not merely an optimization choice. */
+export function attentionChanged(
+  prevReason: string | null,
+  prevDetail: string | null,
+  nextReason: string | null,
+  nextDetail: string | null,
+): boolean {
+  return nextReason !== prevReason || nextDetail !== prevDetail;
+}
+
 /** Map an attention reason to its label + urgency. Unknown reasons fall back
  *  to a generic non-urgent badge rather than throwing, so a new backend reason
  *  never blanks the UI. */
