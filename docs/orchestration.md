@@ -1145,6 +1145,30 @@ until the reviewers whose passes are live have re-recorded against the body as
 it stands. It is opt-in because it is only true of squash-merging repos; where
 merges keep the PR body as discussion rather than history, leave it out.
 
+**Keep the batches small: `max_diff_lines`.** A merge gate can also declare a
+size limit — `gates.merge: { max_diff_lines: 800 }` — and loomux refuses any
+merge of a PR that changes more than that many lines (additions + deletions,
+across the whole PR). The reason is the one thing this whole feature rests on:
+a review nobody can hold in their head is a review that rubber-stamps, and an
+oversized PR is the standard way an agent fleet defeats its own review gate.
+The number is yours; loomux never invents one. **Omit the key for no limit** —
+`0` is refused rather than read as "unlimited", because a bound that bounds
+nothing is a typo. You also get an advisory at `gh pr create` time, printed
+into the pane of the agent that opened the PR, so a split can happen before
+review effort is spent rather than after; that advisory is best-effort and
+never blocks or delays the PR being created. The refusal at merge time is the
+enforced half, and a PR whose size loomux cannot read is refused too.
+
+**Stop the line: `also: [base-green]`.** Nothing otherwise stops agents merging
+more work onto a branch whose HEAD is already broken — which compounds
+failures and makes the merge queue's bisect unable to say which change was at
+fault. Adding `base-green` to your gate's `also:` list refuses a merge while
+the HEAD of the PR's **base** branch is red, still running, or reports no
+checks at all. Opt-in, and deliberately strict: "loomux could not tell" is
+never treated as green, so a repo whose CI legitimately skips some commits
+(leaving a base commit with no checks on it) should not declare this — every
+merge onto such a commit would be refused until something ran there.
+
 **Verdict notices are short on purpose.** Recording a verdict also types a
 courtesy notice into the orchestrator's pane, so it learns the review landed
 without polling for it. That notice carries the verdict, the PR, and only the

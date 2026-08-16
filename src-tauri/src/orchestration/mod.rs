@@ -1564,6 +1564,50 @@ elif [ "$cmd" = "api" ]; then
   case "$all" in *pulls*) case "$all" in *"/merge"*) is_merge=1 ;; esac ;; esac
 fi
 
+# ── THE PR-OPEN SIZE ADVISORY (#1174) — BEST-EFFORT, AND IT FAILS *OPEN* ──────
+# The only thing in this shim that does. It decides NOTHING: `gh pr create` runs
+# first, its exit status is passed through untouched, and every step below is
+# skipped on any doubt — no gate file, an unreadable limit, a size gh would not
+# tell us. A courtesy notice that could break or delay opening a PR would be a
+# far worse trade than one that occasionally does not appear.
+#
+# It goes to the pane of the agent that OPENED the pr — which is the actor that
+# can split it, at the moment the split is cheapest. It is deliberately not sent
+# to the orchestrator: the shim's only channel into loomux is audit.jsonl, and
+# building a durable agent-writable file whose text lands in the orchestrator's
+# tool results would be a prompt-injection channel into the trust root. See
+# doc/design/workflows.md → "The PR-open advisory, and which way each half fails".
+#
+# The REFUSAL is the enforced half and lives in the merge gate below, where
+# "unknown is never safe" applies in full.
+if [ "$cmd" = "pr" ] && [ "$sub" = "create" ]; then
+  "$REAL_GH" "$@"
+  a_rc=$?
+  if [ "$a_rc" -eq 0 ] && [ -n "$LOOMUX_GROUP_DIR" ] && [ -f "$LOOMUX_GROUP_DIR/merge_gate" ]; then
+    a_max=0
+    # Builtins only — no sed/awk — and the same trailing-newline-safe read as the
+    # gate parser. An unrecognized key is simply not this one; unlike the gate
+    # parser, an unreadable file here means "say nothing", never "refuse".
+    while read -r a_k a_v || [ -n "$a_k" ]; do
+      [ "$a_k" = "max-diff-lines" ] && a_max="$a_v"
+    done < "$LOOMUX_GROUP_DIR/merge_gate"
+    case "$a_max" in ''|*[!0-9]*) a_max=0 ;; esac
+    if [ "$a_max" -gt 0 ]; then
+      a_rf=""
+      [ -n "$repo" ] && a_rf="-R $repo"
+      # No PR number: `pr view` with none resolves the current branch's PR, which
+      # is the one just created. Unresolvable → nothing is said.
+      a_lines=$("$REAL_GH" pr view $a_rf --json additions,deletions --jq '.additions + .deletions' 2>/dev/null)
+      case "$a_lines" in ''|*[!0-9]*) a_lines="" ;; esac
+      if [ -n "$a_lines" ] && [ "$a_lines" -gt "$a_max" ]; then
+        printf '%s\n' "loomux: heads up — this PR changes $a_lines lines and this repo's merge gate declares max_diff_lines: $a_max, so the merge WILL be refused as it stands. Split it now, before anyone reviews it: a split after review means the review is spent twice. (This notice is advisory only — the PR was created.)" >&2
+        loomux_audit "pr-size-advisory" "{\"lines\":$a_lines,\"limit\":$a_max}"
+      fi
+    fi
+  fi
+  exit "$a_rc"
+fi
+
 if [ "$is_merge" = "0" ]; then
   exec "$REAL_GH" "$@"
 fi

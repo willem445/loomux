@@ -38008,6 +38008,9 @@ fn shim_with_fake_gh(bin: &Path) -> PathBuf {
          \x20 exit 0\n\
          fi\n\
          if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"checks\" ]; then exit \"${FAKE_CHECKS:-0}\"; fi\n\
+         if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"create\" ]; then\n\
+         \x20 printf 'https://example.invalid/pr/7\\n'; exit \"${FAKE_CREATE_RC:-0}\"\n\
+         fi\n\
          printf 'MERGED\\n'; exit 0\n").unwrap();
     let shim = bin.join("gh");
     fs::write(&shim, gh_shim_sh(&fake.display().to_string(), &shim_paths())).unwrap();
@@ -39302,7 +39305,7 @@ fn gh_shim_script_enforces_the_workflow_merge_gate() {
     assert!(sh.contains("base-green") && sh.contains("/check-runs") && sh.contains("/status"),
         "base-green reads BOTH check surfaces — either alone is blind to half of GitHub");
     assert!(sh.contains("nameWithOwner"),
-        "…and resolves the repo explicitly, because `gh api`'s {owner}/{repo} placeholders would ignore a -R");
+        "…and resolves the repo explicitly, because `gh api`'s {{owner}}/{{repo}} placeholders would ignore a -R");
     // EVERY condition this build claims to know must have an arm in the shell. The
     // failure this closes is silent and one-directional: a token added to
     // KNOWN_CONDITIONS with no arm here falls through to `unknown-condition` and
@@ -39499,6 +39502,66 @@ fn gh_shim_harness_refuses_a_merge_over_max_diff_lines() {
     let audit = fs::read_to_string(group_dir.join("audit.jsonl")).unwrap_or_default();
     assert!(audit.contains("\"reason\":\"diff-too-large\"") && audit.contains("\"reason\":\"diff-size-unknown\""),
         "both refusals are audited distinctly: {audit}");
+}
+
+/// #1174, executed: the PR-open advisory — the one thing in this shim that
+/// FAILS OPEN, because it decides nothing.
+#[test]
+fn gh_shim_harness_warns_at_pr_create_without_ever_blocking_it() {
+    if !have_sh() {
+        eprintln!("SKIP gh_shim_harness_warns_at_pr_create_without_ever_blocking_it: no POSIX sh");
+        return;
+    }
+    let (_reg, d, _repo, gid) = gated_group("    max_diff_lines: 50\n");
+    let group_dir = d.path().join(gid.as_str());
+    let bin = tempfile::tempdir().unwrap();
+    let shim = shim_with_fake_gh(bin.path());
+    let create = |gd: &Path, env: &[(&str, &str)]| -> (bool, String) {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg(&shim).args(["pr", "create", "--title", "t", "--body", "b"])
+            .env("LOOMUX_GROUP_DIR", gd);
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().expect("run shim");
+        (out.status.success(), String::from_utf8_lossy(&out.stderr).into_owned())
+    };
+
+    // Over the limit: the PR is STILL CREATED, and the author is told now — when
+    // the split is cheap — rather than after a review has been spent on it.
+    let (ok, err) = create(&group_dir, &[("FAKE_DIFF_LINES", "500")]);
+    assert!(ok, "the advisory must never fail the create: {err}");
+    assert!(err.contains("500") && err.contains("50"), "it names the size and the limit: {err}");
+    assert!(err.contains("advisory only"), "…and says it did not block anything: {err}");
+
+    // Under the limit: silence. An advisory that fired on every PR would be
+    // ignored by the third one.
+    let (ok, err) = create(&group_dir, &[("FAKE_DIFF_LINES", "10")]);
+    assert!(ok && !err.contains("heads up"), "a PR within the limit is not warned about: {err}");
+
+    // FAIL-OPEN, and this is the half that distinguishes it from every other
+    // check in this shim: a size gh would not report REFUSES at merge time and
+    // says NOTHING here. Same for the real gh failing — the exit status is
+    // passed through and no advisory is invented about a PR that was not created.
+    let (ok, err) = create(&group_dir, &[("FAKE_DIFF_LINES", "")]);
+    assert!(ok && !err.contains("heads up"), "an unreadable size is silent here, not fatal: {err}");
+    let (ok, err) = create(&group_dir, &[("FAKE_DIFF_LINES", "500"), ("FAKE_CREATE_RC", "1")]);
+    assert!(!ok, "a failed create must still fail");
+    assert!(!err.contains("heads up"), "…and must not be advised about: {err}");
+
+    // No group dir at all — a merge would be REFUSED for this (it is evasion of a
+    // gate); a create is not gated at all, so it simply proceeds unadvised.
+    let nowhere = tempfile::tempdir().unwrap();
+    assert!(create(nowhere.path(), &[("FAKE_DIFF_LINES", "500")]).0);
+
+    // The negative control: no declared limit, nothing said, whatever the size.
+    let (_r2, d2, _rp2, gid2) = gated_group("");
+    let (ok, err) = create(&d2.path().join(gid2.as_str()), &[("FAKE_DIFF_LINES", "999999")]);
+    assert!(ok && !err.contains("heads up"), "a repo with no declared limit hears nothing: {err}");
+
+    let audit = fs::read_to_string(group_dir.join("audit.jsonl")).unwrap_or_default();
+    assert!(audit.contains("pr-size-advisory"),
+        "the advisory is in the audit log — which is how the orchestrator sees it: {audit}");
 }
 
 /// #1174 A3, executed: the stop-the-line clause through the REAL shim.
