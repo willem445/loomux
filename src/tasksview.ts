@@ -24,6 +24,7 @@ import {
   isAwaitingHuman,
   isReady,
   KINDS,
+  kindCandidates,
   nextPicker,
   parentCandidates,
   pickerIsOpen,
@@ -103,6 +104,15 @@ export interface OrchTask {
  *  monotonic `t-<n>`, so no row can ever collide with this value. */
 const TOP_LEVEL_CHOICE = "__top_level__";
 
+/** The kind picker's "clear the label" option (#958 slice K) — same sentinel
+ *  shape as `TOP_LEVEL_CHOICE` above and for the same reason: `""` is already
+ *  the picker's own placeholder ("nothing chosen yet"), so the clear needs its
+ *  own value. Translated to `""` — which `orch_upsert_task` reads as "clear
+ *  the label" — only at the moment of the write, and never sent as a literal
+ *  kind. `KINDS` entries are plain words (`epic`, `feature`, …), so no real
+ *  kind can ever collide with this value. */
+const CLEAR_KIND_CHOICE = "__clear_kind__";
+
 function el(tag: string, cls: string, text?: string): HTMLElement {
   const e = document.createElement(tag);
   e.className = cls;
@@ -149,9 +159,10 @@ export class TasksView {
    *  every refresh, like `selected`. */
   private collapsed = new Set<string>();
   /** The task whose picker is open, if any (#582, #958) — one at a time across
-   *  BOTH pickers, and kept here rather than in the DOM so a background
+   *  EVERY picker, and kept here rather than in the DOM so a background
    *  refresh re-renders it instead of silently closing it mid-choice. `field`
-   *  says which one: a dependency (ordering) or a container (nesting). */
+   *  says which one: a dependency (ordering), a container (nesting), or an
+   *  Agile level (#958 slice K). */
   private picking: PickerTarget | null = null;
   /** The picker was just opened by a click, so it should take focus on this
    *  render. Cleared once consumed: a later refresh must re-render the open
@@ -811,16 +822,22 @@ export class TasksView {
     }
 
     if (picking) {
+      const field = this.picking?.field;
       line.appendChild(
-        this.picking?.field === "parent" ? this.renderParentPicker(t) : this.renderDepPicker(t)
+        field === "parent"
+          ? this.renderParentPicker(t)
+          : field === "kind"
+            ? this.renderKindPicker(t)
+            : this.renderDepPicker(t)
       );
     }
     return line;
   }
 
   /** Open (or close) one of the row pickers. One at a time across the whole
-   *  board and across both fields, so the human is never choosing a dependency
-   *  and a container at the same time in two places. */
+   *  board and across every field, so the human is never choosing a
+   *  dependency, a container, and an Agile level at the same time in three
+   *  places. */
   private togglePicker(id: string, field: PickerField): void {
     this.picking = nextPicker(this.picking, id, field);
     // Focus only when this click OPENED one — a close has nothing to focus.
@@ -828,11 +845,13 @@ export class TasksView {
     this.render();
   }
 
-  /** A picker's own deferred close (blur/Esc). Both pickers call THIS rather
-   *  than each re-deriving the condition: the two copies had already drifted
-   *  apart from `togglePicker`'s, and a close that reads fewer signals than the
-   *  button that opens swallows a click exactly the width of the difference
-   *  (see `pickerIsOpen`). One rule, one place. */
+  /** A picker's own deferred close (blur/Esc). Every picker calls THIS rather
+   *  than each re-deriving the condition — the original two copies (dep,
+   *  parent) had already drifted apart from `togglePicker`'s, and a close that
+   *  reads fewer signals than the button that opens swallows a click exactly
+   *  the width of the difference (see `pickerIsOpen`). One rule, one place —
+   *  which is what let the kind picker (#958 slice K) become a third caller of
+   *  this same close for free, rather than a third copy of the condition. */
   private closePicker(id: string, field: PickerField): void {
     if (!pickerIsOpen(this.picking, id, field)) return;
     this.picking = null;
@@ -888,6 +907,65 @@ export class TasksView {
       void this.mutate(
         invoke("orch_upsert_task", { groupId: this.groupId, id: t.id, parent })
       );
+    });
+    // Keep keystrokes off the terminal underneath; Esc backs out unwritten.
+    sel.addEventListener("keydown", (e) => {
+      e.stopPropagation();
+      if (e.key === "Escape") close();
+    });
+    sel.addEventListener("blur", () => window.setTimeout(close, 0));
+    if (this.pickingFocus) {
+      this.pickingFocus = false;
+      window.setTimeout(() => sel.focus(), 0);
+    }
+    return sel;
+  }
+
+  /** The "🏷 set kind…" picker (#958 slice K): the three Agile levels this row
+   *  doesn't already carry, plus a clear option once it carries one. `kind` is
+   *  advisory-only (§2 of doc/design/task-hierarchy.md) — this picker changes
+   *  a label and nothing else, same as the badge it sits under says. Unlike
+   *  the nest/dep pickers there is no authoritative backend rule this could
+   *  disagree with: `kindCandidates` and the backend's own `TASK_KINDS` check
+   *  are both just "one of the four known levels", so nothing is deliberately
+   *  left unfiltered here. */
+  private renderKindPicker(t: OrchTask): HTMLElement {
+    const options = kindCandidates(t);
+    const sel = document.createElement("select");
+    sel.className = "task-dep-picker kind";
+    const placeholder = document.createElement("option");
+    placeholder.value = "";
+    placeholder.textContent = "🏷 set kind…";
+    sel.appendChild(placeholder);
+    if (t.kind) {
+      // The clear. `orch_upsert_task` reads an EMPTY kind as "clear the
+      // label" (omitting the field means "leave it alone"), so the sentinel
+      // below is mapped to "" on the way out — never sent as a literal kind.
+      const clear = document.createElement("option");
+      clear.value = CLEAR_KIND_CHOICE;
+      clear.textContent = "— clear (plain task)";
+      sel.appendChild(clear);
+    }
+    for (const k of options) {
+      const opt = document.createElement("option");
+      opt.value = k;
+      opt.textContent = k;
+      sel.appendChild(opt);
+    }
+    sel.value = "";
+
+    const close = () => this.closePicker(t.id, "kind");
+    sel.addEventListener("change", () => {
+      const pick = sel.value;
+      if (!pick) return;
+      const kind = pick === CLEAR_KIND_CHOICE ? "" : pick;
+      this.picking = null;
+      // Close on our own rather than waiting for the board-change event: if
+      // the write is refused (an out-of-vocabulary value — unreachable from
+      // this picker, but mutate() still resyncs on any backend error),
+      // mutate() toasts the backend's own error.
+      this.render();
+      void this.mutate(invoke("orch_upsert_task", { groupId: this.groupId, id: t.id, kind }));
     });
     // Keep keystrokes off the terminal underneath; Esc backs out unwritten.
     sel.addEventListener("keydown", (e) => {
@@ -1279,6 +1357,17 @@ export class TasksView {
       : "Move this task inside another one — grouping only, it changes nothing about what blocks it";
     nestBtn.addEventListener("click", () => this.togglePicker(t.id, "parent"));
     top.appendChild(nestBtn);
+
+    // Set kind (#958 slice K): the Agile-level picker. Always present, like
+    // 🔗/⤵ above — one entry point in the same place whether or not the row
+    // already carries a label, rather than making the badge itself (absent on
+    // most rows) the only way in.
+    const kindBtn = el("button", "task-btn kindpick", "🏷") as HTMLButtonElement;
+    kindBtn.title = t.kind
+      ? `Change this row's Agile level (currently ${t.kind}) — advisory only, a label and nothing more`
+      : "Set this row's Agile level (epic / feature / story / task) — advisory only, a label and nothing more";
+    kindBtn.addEventListener("click", () => this.togglePicker(t.id, "kind"));
+    top.appendChild(kindBtn);
 
     const notesBtn = el("button", "task-btn notes", `🗨 ${t.notes.length}`) as HTMLButtonElement;
     notesBtn.title = "Notes";

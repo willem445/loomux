@@ -299,12 +299,12 @@ export function withoutDep(deps: readonly string[] | null | undefined, id: strin
  *  board only ever *labels* a row with this — nothing here gates anything. */
 export const KINDS = ["epic", "feature", "story", "task"] as const;
 
-/** Which of a row's two pickers is open: the dependency one (ordering) or the
- *  container one (nesting). */
-export type PickerField = "dep" | "parent";
+/** Which of a row's pickers is open: the dependency one (ordering), the
+ *  container one (nesting), or the Agile-level one (#958 slice K). */
+export type PickerField = "dep" | "parent" | "kind";
 
 /** The board's single open picker, if any — one at a time across every row and
- *  both fields. */
+ *  every field. */
 export interface PickerTarget {
   id: string;
   field: PickerField;
@@ -312,7 +312,7 @@ export interface PickerTarget {
 
 /** What the picker state becomes when a picker button is clicked: open it, or
  *  close it if that exact picker was already open. Clicking a DIFFERENT picker
- *  — other row, or the other field on this row — replaces the open one. */
+ *  — other row, or a different field on this row — replaces the open one. */
 export function nextPicker(
   open: PickerTarget | null,
   id: string,
@@ -623,4 +623,19 @@ export function parentCandidates<T extends HasParent>(task: T, board: readonly T
  *  it at top level with no explanation. */
 export function hasMissingParent<T extends HasParent>(task: T, board: readonly T[]): boolean {
   return !!task.parent && !board.some((t) => t.id === task.parent);
+}
+
+/** The rows the "set kind…" picker offers (#958 slice K): every level in
+ *  `KINDS` other than this task's current one — picking the level it already
+ *  has would be a no-op write, the same reasoning `parentCandidates` uses to
+ *  exclude the current container. Unlike `parentCandidates`, this can never
+ *  come back empty: `KINDS` has four entries and at most one is excluded.
+ *
+ *  A task carrying an out-of-vocabulary `kind` (only reachable by hand-editing
+ *  `tasks.json` — the backend refuses it on write, same as an invalid
+ *  `status`) matches none of `KINDS`, so nothing is excluded and all four
+ *  levels are offered; picking one is how the board fixes it back onto the
+ *  known vocabulary. */
+export function kindCandidates<T extends HasParent>(task: T): readonly string[] {
+  return KINDS.filter((k) => k !== task.kind);
 }

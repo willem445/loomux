@@ -217,6 +217,15 @@ is what shipped.
   dependency picker offers a cycle-closing dep — the rule lives once, inside the backend's lock
   (§3), and its error names the path through this same picker's toast. A second, client-side copy
   of that rule could only ever disagree with the one that actually decides.
+- **Set kind — landed later, slice K.** Everything above shipped with #1027; this one item
+  followed in a later slice once the demo showed the badge but no way to change it. A third,
+  separate picker (a `🏷` button, alongside `⤵` nest and `🔗` depends-on) offers the levels a row
+  doesn't already carry, plus a clear option once it carries one — the same one-picker-at-a-time
+  state (`PickerTarget`/`nextPicker`/`pickerIsOpen`) the nest and dep pickers already share,
+  generalized from two fields to three. Unlike the nest/dep pickers there is no backend rule this
+  could disagree with: `kind` is validated only against the closed four-word vocabulary (§2),
+  which the picker already enumerates completely, so nothing is deliberately left unfiltered here
+  the way a cycle or depth-cap choice is above.
 - **Sibling-scoped reorder.** Up/down move a row among its siblings only, carrying a
   container's whole subtree with it; the write is a full flattened permutation of the board's id
   array through the existing `orch_reorder_tasks`, since that command already expects the whole
@@ -243,7 +252,5 @@ Filed as follow-ups rather than built here, each for a stated reason:
   a view-mode addition on top of it.
 - **Folding ancestor state into `ready`** — §6's deferred semantics decision, needing the
   human's sign-off before it changes what every existing board's readiness signal means.
-- **A dedicated kind picker on the board UI** — #1027's brief was nest/un-nest and display
-  `kind`; setting `kind` itself stays an MCP-surface (orchestrator) action for now.
 - **Role-template edits** — none were needed for this feature; the MCP tool descriptions are the
   teaching surface for the orchestrator, so no `pre222` fixture re-bless was owed by this work.

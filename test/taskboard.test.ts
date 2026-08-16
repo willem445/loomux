@@ -20,6 +20,7 @@ import {
   isAwaitingHuman,
   isReady,
   KINDS,
+  kindCandidates,
   MAX_INDENT_DEPTH,
   nextPicker,
   parentCandidates,
@@ -593,15 +594,34 @@ test("the nest-under picker offers every other row, minus the current container"
   assert.deepEqual(parentCandidates(board[0], board).map((t) => t.id), ["t-2", "t-3"]);
 });
 
+test("the kind picker offers the three levels a row doesn't already carry", () => {
+  const epic = row("t-1", "queued", undefined, "epic");
+  assert.deepEqual(kindCandidates(epic), ["feature", "story", "task"]);
+  const story = row("t-2", "queued", undefined, "story");
+  assert.deepEqual(kindCandidates(story), ["epic", "feature", "task"]);
+});
+
+test("the kind picker offers all four levels on a plain, kind-less row", () => {
+  assert.deepEqual(kindCandidates(row("t-1")), [...KINDS]);
+});
+
+test("the kind picker offers all four levels to fix an out-of-vocabulary kind", () => {
+  // Only reachable by hand-editing tasks.json — the backend refuses an
+  // unknown kind on write — but nothing here should silently exclude one of
+  // the four real levels because the current value doesn't match any of them.
+  const broken = row("t-1", "queued", undefined, "sprint");
+  assert.deepEqual(kindCandidates(broken), [...KINDS]);
+});
+
 test("indent is clamped, so a hand-edited over-deep row still fits the overlay", () => {
   assert.equal(indentLevel(0), 0);
   assert.equal(indentLevel(MAX_INDENT_DEPTH), MAX_INDENT_DEPTH);
   assert.equal(indentLevel(MAX_INDENT_DEPTH + 3), MAX_INDENT_DEPTH);
 });
 
-// --- the row's two pickers: one open at a time, and no swallowed click ---
+// --- the row's pickers: one open at a time, and no swallowed click ---
 //
-// Both pickers take focus on open, and their `blur` defers the close by a
+// Every picker takes focus on open, and its `blur` defers the close by a
 // timeout so the click that caused the blur lands first. The close therefore
 // runs AFTER that click, which is why it has to re-ask whether it still owns
 // the open picker — by the same two signals the opening button decides on.
