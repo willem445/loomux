@@ -9194,6 +9194,154 @@ fn task_id_number(id: &str) -> Option<u32> {
 /// four rungs happen to agree with it rather than replace it.
 pub const MAX_TASK_DEPTH: usize = 4;
 
+/// Who is writing to the board — the one input a WIP limit reads that is not on
+/// the board itself (#1175).
+///
+/// It is a parameter and not a look at `actor`, deliberately. Every human path
+/// happens to pass the literal string `"human"` today, so a `actor == "human"`
+/// test would work; it would also be a guard that a renamed constant steps
+/// straight over, which is the failure the source-scanning-guard convention in
+/// CLAUDE.md exists to prevent. The compiler is the check here: a call site
+/// cannot reach [`OrchRegistry::upsert_task_from`] without saying which of
+/// these it is.
+///
+/// **[`OrchRegistry::upsert_task`] resolves to `Agent`**, which is the stricter
+/// of the two. A new call site that forgets to think about origin therefore
+/// gets the posture that can only ever refuse *too much*, and a refusal is
+/// visible; the human-lenient posture has to be asked for by name
+/// ([`OrchRegistry::upsert_task_by_human`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteOrigin {
+    /// An MCP tool call — the orchestrator's own board write.
+    Agent,
+    /// The human's board, or a registry action the human's board drives.
+    Human,
+}
+
+/// How many board rows to name in a WIP refusal. The point of naming them at
+/// all is that "finish one of these" is an instruction the reader can act on
+/// without going and looking; past a handful the list stops being an
+/// instruction and starts being the board.
+const WIP_NAMED_OCCUPANTS: usize = 4;
+
+/// A write that would put one more row into a status than its cap allows
+/// (#1175). Produced by [`wip_entry_breach`]; what happens to it —
+/// refuse, or warn and let it land — is the caller's policy, not this type's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WipBreach {
+    /// The board status the write was entering.
+    pub status: String,
+    /// The declared cap on that status.
+    pub limit: u32,
+    /// What the count WOULD be after this write — always `> limit`.
+    pub count: u32,
+    /// Up to [`WIP_NAMED_OCCUPANTS`] rows already sitting in that status, so
+    /// the refusal can say which work to finish rather than only that some
+    /// exists. Never includes the row being written.
+    pub occupants: Vec<String>,
+}
+
+impl WipBreach {
+    /// The refusal an agent gets under `board.enforce: true`. Names the cap,
+    /// the count, the rows in the way, and the file to change — a refusal a
+    /// reader cannot act on just becomes a retry.
+    pub fn refusal(&self, this_id: &str) -> String {
+        let held = if self.occupants.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", self.occupants.join(", "))
+        };
+        format!(
+            "board.wip: {} is capped at {} and already holds {}{held} — finish one or move it out \
+             of {} before putting {this_id} there. The cap is `board.wip.{}` in \
+             .loomux/workflow.yml.",
+            self.status,
+            self.limit,
+            self.count - 1,
+            self.status,
+            self.status,
+        )
+    }
+}
+
+/// The rows a WIP cap counts as sitting in `status` right now (#1175) — the
+/// ONE definition of what a cap counts, shared by the write seam that enforces
+/// it and by every surface that displays `n/N`. Two answers to "how many are in
+/// review" would be a board whose chip disagrees with its own refusal.
+///
+/// **Leaf rows only.** A container's status is a rollup of the work its
+/// children carry, so counting a `feature` in `in-progress` *and* the three
+/// stories under it counts the same work twice — and would make `in-progress:
+/// 4` mean four items on a flat board and rather fewer on a nested one, which
+/// is a cap nobody can reason about.
+///
+/// `skip` drops one id from the tally: the row a prospective write is about,
+/// which the caller counts itself.
+pub fn wip_occupants<'a>(tasks: &'a [Task], status: &str, skip: Option<&str>) -> Vec<&'a str> {
+    let containers: HashSet<&str> = tasks.iter().filter_map(|t| t.parent.as_deref()).collect();
+    tasks
+        .iter()
+        .filter(|t| {
+            t.status == status
+                && Some(t.id.as_str()) != skip
+                && !containers.contains(t.id.as_str())
+        })
+        .map(|t| t.id.as_str())
+        .collect()
+}
+
+/// Would this write put one more row into a capped status than the cap allows?
+///
+/// **Only an ENTRY is counted.** A patch that leaves a row where it already is
+/// — a note, a title, a `pr` ref on something already in `review` — never
+/// crosses a cap, so it is never refused by one. That is what keeps an
+/// over-limit board (a cap lowered under a live board, or a hand-edited
+/// `tasks.json`) workable rather than frozen: every write that *relieves*
+/// the cap, and every write that does not touch it, still lands. Only adding to
+/// it is judged.
+///
+/// **Leaf rows only.** A container's status is a rollup of the work its
+/// children carry, so counting a `feature` in `in-progress` *and* the three
+/// stories under it counts the same work twice — and makes `in-progress: 4`
+/// mean four items on a flat board and rather fewer on a nested one, which is
+/// a cap nobody can reason about. The row being written is exempt from the
+/// whole check when it is itself a container, for the same reason.
+///
+/// Returns `None` when there is no cap on the target status, when the write is
+/// not an entry, or when the resulting count is within the cap.
+pub fn wip_entry_breach(
+    board: &workflow::BoardPolicy,
+    tasks: &[Task],
+    this_id: &str,
+    is_new: bool,
+    old_status: &str,
+    new_status: &str,
+) -> Option<WipBreach> {
+    if !is_new && old_status == new_status {
+        return None;
+    }
+    let limit = *board.wip.get(new_status)?;
+    // The row being written is exempt from the whole check when it is itself a
+    // container, for the reason `wip_occupants` gives: what it carries is
+    // counted where the work actually is.
+    if tasks.iter().any(|t| t.parent.as_deref() == Some(this_id)) {
+        return None;
+    }
+    let occupants = wip_occupants(tasks, new_status, Some(this_id));
+    // `+ 1` is the row this write is putting there; `occupants` deliberately
+    // excludes it, so the count is of the board AFTER the write either way.
+    let count = occupants.len() as u32 + 1;
+    if count <= limit {
+        return None;
+    }
+    Some(WipBreach {
+        status: new_status.to_string(),
+        limit,
+        count,
+        occupants: occupants.into_iter().take(WIP_NAMED_OCCUPANTS).map(str::to_string).collect(),
+    })
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TaskNote {
     pub ts_ms: u64,
@@ -25612,6 +25760,38 @@ impl OrchRegistry {
         }
     }
 
+    /// An **agent-origin** board write — the MCP `upsert_task` tool's path, and
+    /// the default for anything that does not say otherwise. See
+    /// [`WriteOrigin`] for why the strict posture is the unnamed one, and
+    /// [`Self::upsert_task_from`] for what the write actually does.
+    pub fn upsert_task(
+        &self,
+        group: &GroupId,
+        actor: &str,
+        id: Option<&str>,
+        patch: TaskPatch,
+    ) -> Result<Task, String> {
+        self.upsert_task_from(group, WriteOrigin::Agent, actor, id, patch)
+    }
+
+    /// A **human-origin** board write — the board pane's own edits, and the
+    /// registry actions that pane drives (approve, request changes, proceed).
+    ///
+    /// The only thing this changes is that a WIP limit can warn but never
+    /// refuse (#1175): the board's authority is the human's, not a queue
+    /// discipline — the same reason `claim` is deliberately not exposed on the
+    /// human's board command — and a limit a human declared for their agents
+    /// must not bounce the human who declared it.
+    pub fn upsert_task_by_human(
+        &self,
+        group: &GroupId,
+        actor: &str,
+        id: Option<&str>,
+        patch: TaskPatch,
+    ) -> Result<Task, String> {
+        self.upsert_task_from(group, WriteOrigin::Human, actor, id, patch)
+    }
+
     /// Create (id = None, title required) or edit a task. Notes append; all
     /// other patch fields replace. Returns the resulting task.
     ///
@@ -25619,9 +25799,12 @@ impl OrchRegistry {
     /// before any field is written, and nothing is persisted until
     /// `write_tasks` at the bottom — so every rejection below leaves the board
     /// exactly as it was, inside the one `tasks_lock` this method already held.
-    pub fn upsert_task(
+    /// The WIP check (#1175) is the last of those validations and obeys the
+    /// same rule: a refused entry writes nothing at all.
+    pub fn upsert_task_from(
         &self,
         group: &GroupId,
+        origin: WriteOrigin,
         actor: &str,
         id: Option<&str>,
         patch: TaskPatch,
@@ -25659,7 +25842,22 @@ impl OrchRegistry {
                 }
             }
         }
-        let _guard = self.tasks_lock.lock_safe();
+        // Read the board policy BEFORE taking `tasks_lock`, the way `with_locks`
+        // reads `lock_resources` before taking the lock table (#1175): this is a
+        // `workflow.yml` open + YAML parse, and `tasks_lock` is a process-global
+        // mutex serializing every group's board write, so the read does not
+        // belong inside it.
+        //
+        // Skipped outright for a write that CANNOT be an entry — an edit to an
+        // existing row that names no status and makes no claim leaves the row
+        // exactly where it is, so no cap can be crossed and no file needs
+        // reading. That is the hot path (a note append, a `pr` ref), and it
+        // stays exactly as expensive as it was before this feature existed.
+        let may_enter = id.is_none() || patch.claim || patch.status.is_some();
+        let board =
+            if may_enter { self.board_policy(group) } else { workflow::BoardPolicy::default() };
+
+        let guard = self.tasks_lock.lock_safe();
         let mut tasks = self.tasks(group);
         let idx = match id {
             Some(id) => tasks
@@ -25895,6 +26093,35 @@ impl OrchRegistry {
                 }
             }
         }
+        // ---- WIP limits (#1175). Last of the pre-mutation validations, and
+        // deliberately after the claim guards: a claim that is refused because
+        // the task is already held should say so, not report a board-pacing
+        // limit the caller was never going to reach.
+        //
+        // The same reading of the patch the apply below performs — a `claim`
+        // IS the move to `in-progress`, and a patch with no `status` leaves the
+        // row where it is — so what is judged is where this write actually
+        // lands the row.
+        let breach = if board.wip.is_empty() {
+            None
+        } else {
+            let old_status = tasks[idx].status.clone();
+            let new_status = if patch.claim {
+                "in-progress".to_string()
+            } else {
+                patch.status.clone().unwrap_or_else(|| old_status.clone())
+            };
+            wip_entry_breach(&board, &tasks, &this_id, id.is_none(), &old_status, &new_status)
+        };
+        if let Some(b) = &breach {
+            // Refuse only an AGENT's write, and only under an explicit
+            // `enforce: true`. Warn-and-land is the default posture, and the
+            // human's own board edit is never refused under either setting —
+            // see `upsert_task_by_human`.
+            if board.enforce && origin == WriteOrigin::Agent {
+                return Err(b.refusal(&this_id));
+            }
+        }
         let claim = patch.claim;
         let task = &mut tasks[idx];
         if let Some(t) = patch.title {
@@ -25976,7 +26203,68 @@ impl OrchRegistry {
         //
         // Still under `tasks_lock`, deliberately — see `needs_you_lock`'s doc.
         self.sync_demo_item(group, &snapshot, &prev_status);
+        // A crossing that was allowed to land is audited under its own action,
+        // so the durable record shows the board went over a declared cap and
+        // WHICH cap — a fact the `task-upsert` entry above cannot carry,
+        // because it records the row and not the board around it. Only ever
+        // written for a landed crossing: a refusal returned above, before any
+        // write, and an audit entry for a write that did not happen would be
+        // the log claiming something the board never did.
+        if let Some(b) = &breach {
+            self.audit(
+                group,
+                actor,
+                "task-wip-crossed",
+                json!({
+                    "task": this_id,
+                    "status": b.status,
+                    "limit": b.limit,
+                    "count": b.count,
+                    "enforce": board.enforce,
+                    "origin": match origin {
+                        WriteOrigin::Agent => "agent",
+                        WriteOrigin::Human => "human",
+                    },
+                }),
+            );
+        }
+        drop(guard);
+        // Outside the tasks lock: notify is best-effort and can block on
+        // delivery, the rule every other board notice already follows.
+        if let Some(b) = &breach {
+            self.notify_wip_crossing(group, origin, &this_id, b);
+        }
         Ok(snapshot)
+    }
+
+    /// Tell the orchestrator its board just went over a declared WIP cap
+    /// (#1175). The warn half of the feature: the write has already landed, so
+    /// this is the only thing that makes the crossing visible to the agent
+    /// whose queue discipline it is.
+    ///
+    /// Says who crossed it, because the answer changes what the orchestrator
+    /// should do: its own crossing is its own to unwind, while the human's is a
+    /// board it should re-read rather than argue with.
+    fn notify_wip_crossing(
+        &self,
+        group: &GroupId,
+        origin: WriteOrigin,
+        task_id: &str,
+        b: &WipBreach,
+    ) {
+        let who = match origin {
+            WriteOrigin::Agent => format!("{task_id} moved in"),
+            WriteOrigin::Human => format!("the human moved {task_id} in"),
+        };
+        let _ = self.deliver_to_orchestrator(
+            group,
+            &format!(
+                "[loomux] WIP limit crossed: {} now holds {} of a declared {} ({who}). Finish or \
+                 re-status one before starting more work. Call list_tasks to see the board.",
+                b.status, b.count, b.limit
+            ),
+            "loomux",
+        );
     }
 
     pub fn delete_task(&self, group: &GroupId, actor: &str, id: &str) -> Result<(), String> {
@@ -26227,7 +26515,7 @@ impl OrchRegistry {
     /// error for beats a confident notice that misdescribes what was authorized.
     pub fn approve_task(&self, group: &GroupId, id: &str, comment: Option<&str>) -> Result<Task, String> {
         self.ensure_at_merge_gate(group, id)?;
-        let task = self.upsert_task(
+        let task = self.upsert_task_by_human(
             group,
             "human",
             Some(id),
@@ -26354,7 +26642,7 @@ impl OrchRegistry {
                 .map(str::trim)
                 .filter(|c| !c.is_empty())
                 .map(str::to_string);
-            let task = self.upsert_task(
+            let task = self.upsert_task_by_human(
                 group,
                 "human",
                 Some(&it.id),
@@ -26410,7 +26698,7 @@ impl OrchRegistry {
             return Err("request changes needs a note describing what to fix".into());
         }
         self.ensure_at_merge_gate(group, id)?;
-        let task = self.upsert_task(
+        let task = self.upsert_task_by_human(
             group,
             "human",
             Some(id),
@@ -26468,7 +26756,7 @@ impl OrchRegistry {
         if self.is_paused(group) {
             return Err("group is paused — resume before starting tasks".into());
         }
-        let task = self.upsert_task(
+        let task = self.upsert_task_by_human(
             group,
             "human",
             Some(id),
@@ -26519,7 +26807,7 @@ impl OrchRegistry {
     /// The notice is best-effort (the board is the source of truth).
     pub fn proceed_task(&self, group: &GroupId, id: &str) -> Result<Task, String> {
         self.ensure_prototype(group, id)?;
-        let task = self.upsert_task(
+        let task = self.upsert_task_by_human(
             group,
             "human",
             Some(id),
@@ -34765,7 +35053,43 @@ impl OrchRegistry {
                 "persona": b.has_persona(),
             })).collect::<Vec<_>>(),
             "gate": gate,
+            "wip": self.wip_status(group),
         })
+    }
+
+    /// The board's declared WIP caps with their live counts (#1175) — what the
+    /// board renders as `3/4` beside each capped status, and an empty list for
+    /// every group that declares none.
+    ///
+    /// Counted here, in the backend, rather than shipped as bare limits for the
+    /// frontend to tally: `wip_occupants` is the one definition of what a cap
+    /// counts, and a second tally in TypeScript is a second definition that
+    /// would drift the first time either side learned something about
+    /// containers.
+    ///
+    /// **A group with no caps reads nothing.** The `tasks.json` read below is
+    /// behind the empty-map check on purpose: this whole function is on the
+    /// group view's 2 s poll, and a repo that declares no `board:` block must
+    /// pay exactly what it paid before this feature existed (#743's standard
+    /// for this command).
+    fn wip_status(&self, group: &GroupId) -> Vec<Value> {
+        let board = self.board_policy(group);
+        if board.wip.is_empty() {
+            return vec![];
+        }
+        let tasks = self.tasks(group);
+        board
+            .wip
+            .iter()
+            .map(|(status, limit)| {
+                json!({
+                    "status": status,
+                    "limit": limit,
+                    "count": wip_occupants(&tasks, status, None).len(),
+                    "enforce": board.enforce,
+                })
+            })
+            .collect()
     }
 
     /// The repo's default-branch NAME, served from [`Self::default_branch_memo`]
@@ -44959,6 +45283,36 @@ impl OrchRegistry {
         }
     }
 
+    /// This group's `board:` policy — the per-status WIP caps and the enforce
+    /// posture as declared, or **no caps at all** when the block is absent, the
+    /// file will not parse, or the workflow is not in force for this group
+    /// (#1175).
+    ///
+    /// One reader for the whole block, the reason `merge_queue_policy` gives:
+    /// the write seam and the board's own count display must not come to
+    /// different conclusions about what this repo declared.
+    ///
+    /// **An unreadable or unparseable file resolves to no caps, and that is
+    /// deliberate.** It is fail-open, which is the wrong direction for a
+    /// security check and the right one here: a WIP limit paces work, it does
+    /// not guard anything (the human merge gate is not reachable from this
+    /// block at all — see `workflow::BoardPolicy`), and a file caught mid-save
+    /// already makes the whole workflow — gates included — unenforceable down
+    /// the loud `workflow-invalid` path. Wedging every board write behind a
+    /// half-written YAML file would be a far larger claim than a pacing
+    /// discipline earns. Same posture, same reasoning, as
+    /// [`Self::merge_queue_policy`].
+    fn board_policy(&self, group: &GroupId) -> workflow::BoardPolicy {
+        let Some(g) = self.group(group) else { return workflow::BoardPolicy::default() };
+        if !g.guardrails.advanced_orchestrator {
+            return workflow::BoardPolicy::default();
+        }
+        match workflow::load_workflow(&g.repo) {
+            Ok(Some(wf)) => wf.board,
+            _ => workflow::BoardPolicy::default(),
+        }
+    }
+
     /// The gate spec the queue re-enforces (§6), read through the same
     /// `merge_gate` file the `gh` shim reads — never a second opinion.
     ///
@@ -49583,7 +49937,7 @@ pub async fn orch_upsert_task(
     let reg = reg_of(&app);
     let group_id = command_group(&group_id)?;
     run_blocking(move || {
-        let task = reg.upsert_task(
+        let task = reg.upsert_task_by_human(
             &group_id,
             "human",
             id.as_deref(),

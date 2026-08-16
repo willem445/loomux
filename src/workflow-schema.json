@@ -132,6 +132,12 @@
           "section": "resource",
           "max_entries": 32,
           "help": "Named lock resources agents may acquire, keyed by a name this repo chooses (loomux never learns what it means). Absent = the lock tools are not offered at all."
+        },
+        {
+          "name": "board",
+          "type": "section",
+          "section": "board",
+          "help": "Task-board policy — how much work may sit in each status at once. Absent = no limits, and behavior is byte-for-byte unchanged."
         }
       ]
     },
@@ -362,6 +368,79 @@
           "max": 480,
           "on_out_of_range": "refuse",
           "help": "How long one hold may last before the sweep reclaims it — the bound that keeps a crashed holder from parking the resource forever."
+        }
+      ]
+    },
+    "board": {
+      "title": "Board",
+      "help": "Task-board policy (#1175). Kanban WIP limits: `max live agents` caps concurrent agents, this caps concurrent WORK, so \"finish before you start\" is mechanical rather than prose.",
+      "fields": [
+        {
+          "name": "wip",
+          "type": "section",
+          "section": "board.wip",
+          "help": "Per-status caps on how many work items may sit in a status at once. A status you omit has no cap."
+        },
+        {
+          "name": "enforce",
+          "type": "bool",
+          "default": false,
+          "help": "false (the default) = a crossing warns the orchestrator and audits, and the write still lands. true = an AGENT's write crossing a cap is refused; the human's own board edits still only warn, under either setting."
+        }
+      ]
+    },
+    "board.wip": {
+      "title": "WIP limits",
+      "help": "One cap per board status, counted over LEAF work items (a container's status is a rollup of its children, so counting both would count the same work twice). `done` has no field on purpose: it is the relief valve every other cap depends on.",
+      "fields": [
+        {
+          "name": "queued",
+          "type": "number",
+          "min": 1,
+          "on_out_of_range": "refuse",
+          "help": "Cap on the backlog — kanban's input queue limit. Omit for no cap."
+        },
+        {
+          "name": "in-progress",
+          "type": "number",
+          "min": 1,
+          "on_out_of_range": "refuse",
+          "help": "Cap on work being actively done. The usual first limit to set. Omit for no cap."
+        },
+        {
+          "name": "review",
+          "type": "number",
+          "min": 1,
+          "on_out_of_range": "refuse",
+          "help": "Cap on items with a reviewer engaged — half of the review-debt signal. Omit for no cap."
+        },
+        {
+          "name": "pr",
+          "type": "number",
+          "min": 1,
+          "on_out_of_range": "refuse",
+          "help": "Cap on open PRs past review, waiting on the human's merge gate — the other half of review debt. Omit for no cap."
+        },
+        {
+          "name": "prototype",
+          "type": "number",
+          "min": 1,
+          "on_out_of_range": "refuse",
+          "help": "Cap on demo-gated drafts awaiting the human's promote/scrap verdict. Omit for no cap."
+        },
+        {
+          "name": "human-testing",
+          "type": "number",
+          "min": 1,
+          "on_out_of_range": "refuse",
+          "help": "Cap on items parked for the human to validate. Omit for no cap."
+        },
+        {
+          "name": "blocked",
+          "type": "number",
+          "min": 1,
+          "on_out_of_range": "refuse",
+          "help": "Cap on blocked work. Prefer leaving this one uncapped under `enforce: true` — refusing a move to `blocked` refuses an agent's report of reality. Omit for no cap."
         }
       ]
     }
