@@ -652,19 +652,27 @@ board goes quiet; you just cannot be blocked by your own rule.
 A refused write names the limit, how full the status is and which items are in the way, so
 your orchestrator can finish one rather than retry.
 
-**What counts, exactly.** Only a *move into* a capped status is judged — editing an item
-already sitting there, and any move out, always lands, so a status that has gone over is
-never stuck. Assigning work (`claim`) counts as a move into `in-progress`, which is the
-point. And only leaf items count: a container in `review` does not consume a slot, because
-the work inside it is counted where the work is.
+**What counts, exactly.** A write is judged on the board it *produces*: a limit fires when a
+status ends up over its cap **and** this write is what raised it. So editing an item already
+sitting in a full status always lands, and so does every move out — a status that has gone
+over is never stuck. Assigning work (`claim`) raises `in-progress`, which is the point.
+
+Only leaf items count: a container in `review` does not consume a slot, because the work
+inside it is counted where the work is. That is why nesting an item under another *as you
+move it* can be within a limit that the same move without the nesting would exceed — the row
+you nested it under stops being counted in the same write. It cuts the other way too:
+un-nesting the last item out of a container makes that container countable again, which can
+put its status over a cap without anything having changed status at all.
 
 You can cap any status **except `done`** — that one is the release valve every other limit
-depends on, so loomux refuses a file that tries. You *can* cap `blocked`, which is useful as
-a warning; think twice before enforcing it, since refusing a move to `blocked` refuses an
-agent's report that something is stuck.
+depends on, so orrerix refuses a file that tries. You *can* cap `blocked`, and it is useful
+as a warning — but note that `enforce: true` is one switch for **every** cap you declare, not
+one per status. So if you turn enforcement on, a `blocked` cap becomes a refusal too, and
+refusing a move to `blocked` refuses an agent's report that something is stuck. Under
+`enforce: true`, leave `blocked` uncapped.
 
 **A bad value fails the whole file, on purpose** — `review: 0`, a misspelt status
-(`in-porgress`), or any key loomux does not recognise stops `.loomux/workflow.yml` from
+(`in-porgress`), or any key orrerix does not recognise stops `.loomux/workflow.yml` from
 loading at all, taking your roster and merge gate with it, and the launcher shows you why.
 The error names the statuses you *could* have written. That is deliberate: a repo that wrote
 `review: 0` believes something about how its board paces, and quietly substituting a default

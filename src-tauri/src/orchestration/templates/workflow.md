@@ -80,9 +80,13 @@ something there before putting more in.** That is the whole discipline, and it i
 the failure the live-delegate cap cannot see — that cap limits *agents*, so a queue of
 finished-but-unreviewed work can grow without limit underneath it while you keep claiming.
 Under `enforce: true` your write into a full status is **refused**, and that refusal is not a
-retry: relieve the status, or leave the task where it is. Two things it does not mean — a cap
-counts leaf rows, so a container never consumes one, and the human's own board edits are
-never refused by a cap, so the board can go over one without you having done anything wrong.
+retry: relieve the status, or leave the task where it is. Three things it does not mean — a
+cap counts LEAF rows, so a container never consumes one (which also means a `parent` write
+can move a count with no status changing at all: un-nesting the last child makes its
+container countable again); a write is judged on the board it PRODUCES, so editing something
+already in a full status, and every move out of one, always lands; and the human's own board
+edits are never refused by a cap, so the board can go over one without you having done
+anything wrong.
 
 **Edges are advisory.** The file's `edges:` are the declared happy path — the shape the repo's
 author had in mind. They are **not a schedule**, and orrerix does not walk them. Every

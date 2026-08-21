@@ -1018,7 +1018,7 @@ struct RawBoard {
 /// The price is that the field list is a second copy of `TASK_STATUSES` (which
 /// lives in `src-tauri`, on the other side of an arrow this crate may not
 /// point back along). It is pinned, not trusted:
-/// `src-tauri/tests/orchestration.rs` asserts this struct's serde field names
+/// `src-tauri/tests/workflow.rs` asserts this struct's serde field names
 /// are exactly `TASK_STATUSES` minus [`WIP_UNCAPPABLE_STATUS`], so a ninth
 /// status reddens rather than quietly arriving uncappable.
 ///
