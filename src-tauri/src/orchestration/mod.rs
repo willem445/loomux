@@ -9326,7 +9326,7 @@ pub fn wip_occupants<'a>(tasks: &'a [Task], status: &str) -> Vec<&'a str> {
 /// child moving out from under a container turns that container into countable
 /// work.
 pub fn wip_may_change(is_new: bool, patch: &TaskPatch) -> bool {
-    is_new || patch.claim || patch.status.is_some() || patch.parent.is_some()
+    is_new || patch.claim || patch.status.is_some()
 }
 
 /// The leaf count of every capped status, as the board stands (#1175).
