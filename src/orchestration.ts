@@ -14,7 +14,7 @@ import { badgeFor, type OrchRole } from "./orchbadge";
 import { isSpawnRequestExpired } from "./spawnexpiry";
 import { sessionIdFromCommand } from "./panerestore";
 import type { AutonomyState } from "./autonomy";
-import type { OrchQuestion } from "./decisions";
+import type { NeedsYouView, OrchQuestion } from "./decisions";
 import type { WorkflowPreview } from "./roster";
 import { showToast } from "./toast";
 import { showContextMenu } from "./contextmenu";
@@ -304,6 +304,63 @@ export const questionsList = (groupId: string): Promise<OrchQuestion[]> =>
  *  bound so the human is stopped before the click, not after it). */
 export const answerQuestion = (groupId: string, id: string, answer: string): Promise<void> =>
   invoke("orch_question_answer", { groupId, id, answer });
+
+// ---------- needs-you items (#1151 slice A engine, slice C panel) ----------
+
+/** The group's `needs-you.json` rows AND the clear-completed watermark, in one
+ *  round trip.
+ *
+ *  **One call, not two, and that is the contract rather than a convenience.**
+ *  The panel hides settled rows stamped at or before the watermark, so a
+ *  separately-fetched stamp would let it render this second's rows against last
+ *  second's watermark and flash back a row the human had just cleared.
+ *
+ *  Uncapped: both retention limits already bound the file (`OPEN_MAX`,
+ *  `RESOLVED_RETAINED`), and a cap whose size the caller cannot see is the
+ *  silent truncation this feature refuses. A read failure — no file, a
+ *  malformed one, a group id the backend refuses — arrives as an empty view
+ *  rather than a rejection, the same degrade `orch_tasks` and
+ *  `orch_questions_list` take. Nothing WRITES through this path, so the loud
+ *  read that protects the file from a read-modify-write on unparseable input is
+ *  untouched by that. */
+export const needsYouList = (groupId: string): Promise<NeedsYouView> =>
+  invoke<NeedsYouView>("orch_needs_you_list", { groupId });
+
+/** The human closes out one item, from the app's own webview.
+ *
+ *  **There is no `source` argument, and that absence is the trust boundary** —
+ *  `answerQuestion`'s shape, for the same reason. Who resolved a row is a
+ *  property of this entry point (the backend hard-codes `ResolveSource::Webview`),
+ *  not something a caller states about itself, and no MCP tool reaches the
+ *  resolve method at all: an agent that wants its own ask gone has
+ *  `withdraw_attention`, which settles it *visibly* as a withdrawal.
+ *
+ *  `note` is optional and must be `null` rather than `""` when the human typed
+ *  nothing — the backend REFUSES an empty note (`validate_resolution`), because
+ *  a note-less resolve is the quiet tidy and deliberately delivers no pane
+ *  notice, while a note is sanitized and delivered to the orchestrator.
+ *  `resolveNote` in `decisions.ts` is the one place that mapping happens.
+ *
+ *  **Resolving does not move the task.** It clears the attention row; the board
+ *  keeps whatever status it had. */
+export const resolveNeedsYou = (
+  groupId: string,
+  id: string,
+  note: string | null = null
+): Promise<void> => invoke("orch_needs_you_resolve", { groupId, id, note });
+
+/** "Clear completed": stamp this group's watermark, and resolve to the new
+ *  stamp so the panel can apply it without a second read.
+ *
+ *  **Deletes nothing and mutates no row.** The backend never opens
+ *  `needs-you.json` on this path at all, which is what makes "clears the UI,
+ *  persists on disk" structural rather than a promise — and why an OPEN row
+ *  cannot be affected by it: there is nothing in the path that could touch one.
+ *  The choice survives a restart, because it is a marker file rather than
+ *  session state. It emits no change event (no row changed), so the caller
+ *  applies the returned stamp itself. */
+export const clearNeedsYou = (groupId: string): Promise<number> =>
+  invoke<number>("orch_needs_you_clear", { groupId });
 
 // ---------- human merge / release grants (#83) ----------
 

@@ -2707,6 +2707,16 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   background: color-mix(in srgb, var(--state-attention) 16%, transparent);
   border: 1px solid color-mix(in srgb, var(--state-attention) 35%, transparent);
 }
+/* Clear completed (#1151) — the board's `clear-done` shape, because it is the
+   same kind of thing: a text-labelled header action that sizes to its content
+   rather than to the icon slot. Deliberately NOT red and with no armed/confirm
+   state, unlike its board siblings: this one deletes nothing at all, it stamps
+   a watermark that hides settled rows, so an accidental click costs a click to
+   undo rather than a row. It is hidden outright when there is no tail, so it
+   never reads as a control that does nothing. */
+.tasks-head .pane-btn.decisions-clear {
+  flex: none; width: auto; padding: 0 8px; font-size: 10.5px; height: 20px;
+}
 .decisions-body { display: flex; flex-direction: column; gap: 6px; }
 /* Eyebrow section labels — the redesign's own section idiom (#879). */
 .decisions-section {
@@ -2742,8 +2752,32 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   background: color-mix(in srgb, var(--state-attention) 16%, transparent);
 }
 .decisions-asker { font-family: var(--font-mono); font-size: 10px; }
+/* The OTHER identity a card can show (#1151): the linked row's assignee. Same
+   mono family so both read as agent ids, but dimmer and not bold — who asked
+   is the card's subject, who is doing the work is context for it, and two
+   identically-weighted chips side by side made the reader guess which was
+   which. Both also carry a title. */
+.decisions-assignee {
+  font-family: var(--font-mono); font-size: 10px; color: var(--ink-faint);
+}
 .decisions-when, .decisions-status { font-size: 10px; color: var(--ink-faint); }
+/* Which registry a card came from, now that the two are one list (#1151): a
+   quiet outline chip, on the NEUTRAL channel rather than the state one, because
+   `demo` vs `feedback` says what kind of look is wanted, not how loudly. Urgency
+   is what claims the state channel, and only one thing may. */
+.decisions-kind {
+  flex: none; font-size: 9px; font-weight: 700; letter-spacing: 0.4px;
+  text-transform: uppercase; border-radius: 4px; padding: 1px 6px;
+  color: var(--ink-dim); border: 1px solid var(--line-strong);
+}
 .decisions-text { color: var(--ink); line-height: 1.45; user-select: text; cursor: pointer; }
+/* The joined board row's own title, under the raiser's words. Subordinate on
+   purpose: the item's text is what the human was ASKED, the task title is
+   context for it, and the two are different claims. */
+.decisions-subtext {
+  font-size: 10.5px; color: var(--ink-dim); user-select: text;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 .decisions-card.settled .decisions-text { cursor: default; }
 .decisions-answer {
   font-size: 11px; line-height: 1.4; color: var(--ink-dim); user-select: text;
@@ -2780,6 +2814,11 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .decisions-freetext { width: 100%; resize: vertical; font-size: 11.5px; }
 .decisions-form { display: flex; flex-direction: column; gap: 6px; }
 .decisions-card-actions { display: flex; align-items: center; gap: 6px; justify-content: flex-end; }
+/* Close-out sits apart from the board actions beside it (#1151). Proceed and
+   Feedback MOVE the work; Resolve only clears the row and deliberately leaves
+   the task where it is, so the gap says "different kind of thing" before the
+   tooltip has to. */
+.decisions-resolve { margin-left: 8px; }
 /* Why the send button is disabled — a sentence, never a dead button. */
 .decisions-block-hint {
   flex: 1; min-width: 0; font-size: 10.5px; color: var(--ink-faint);
@@ -2798,6 +2837,11 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 /* Explicit beats inferred: with no recorded path the card SAYS so rather than
    guessing one, so the absence is legible instead of looking like a bug. */
 .decisions-nopath { font-size: 10.5px; color: var(--ink-faint); font-style: italic; }
+/* The other absence a card can have (#1151): an item whose linked board row is
+   gone. Its own class rather than a reuse of the no-path one — the two say
+   different things, and a rule written for "no demo path recorded" should not
+   silently own "that task no longer exists". */
+.decisions-missing { font-size: 10px; color: var(--ink-faint); font-style: italic; }
 
 /* ---------- audit log overlay ---------- */
 .audit-view {

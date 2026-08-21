@@ -1,16 +1,24 @@
-// The NEEDS-YOU panel (#1091 slice C): one surface for everything in a group
-// that is waiting on the human, in two tiers.
+// The NEEDS-YOU panel (#1091 slice C, reworked by #1151 slice C): one surface,
+// one list, for everything in a group that is waiting on the human.
 //
-//   DECISIONS — pending `ask_human` questions. The human picks an option,
-//   types a reply, or both, and the composed answer settles the row through
+//   QUESTIONS — pending `ask_human` rows. The human picks an option, types a
+//   reply, or both, and the composed answer settles the row through
 //   `orch_question_answer` and arrives in the orchestrator's pane as an
 //   ordinary inbound notice. This panel is the TRUSTED answering surface: the
 //   backend hard-codes who answered, so no agent can settle a row by any path.
 //
-//   DEMOS — board rows parked in `prototype`/`human-testing`, projected from
-//   the SAME `tasks.json` the board renders and acted on through the SAME
-//   commands the board's own buttons call. There is no second record, so the
-//   two surfaces cannot disagree about a demo's state.
+//   NEEDS-YOU ITEMS — first-class rows from `needs-you.json` (#1151 slice A):
+//   a demo parked for a look, or an ask for feedback. The item owns the ask;
+//   the board row it names is joined live and acted on through the SAME
+//   commands the board's own buttons call, so the two surfaces cannot disagree
+//   about a task's state. **Resolving an item does not move its task** — it
+//   clears the attention row, and every control that offers it says so.
+//
+// The two are ONE list, urgency-pinned then newest-first, because "what is
+// waiting on me" is one question and the old tiering forced the human to scan
+// three places for it. Settled rows fall into a faded tail that
+// **Clear completed** hides — a per-group watermark, not a delete: nothing
+// leaves the disk (needs-you-items.md).
 //
 // Structure follows `TasksView` deliberately — same overlay/embed mechanics,
 // same `CoalescingRefresh` gate, same edit-in-progress deferral — because it
@@ -25,29 +33,44 @@
 // `orchestration.ts` or an `invoke` from `transport.ts`, never `@tauri-apps`.
 
 import { invoke, listen, type UnlistenFn } from "./transport.ts";
-import { answerQuestion, questionsList } from "./orchestration";
+import {
+  answerQuestion,
+  clearNeedsYou,
+  needsYouList,
+  questionsList,
+  resolveNeedsYou,
+} from "./orchestration";
 import { CoalescingRefresh } from "./refreshgate";
 import {
   answerFor,
   citedTask,
   EMPTY_DRAFT,
+  EMPTY_VIEW,
   feedbackSubmitStep,
   freeTextAllowed,
   isPending,
   isUrgent,
+  itemTask,
+  mergeCleared,
   needsYouCount,
   normalizeOptions,
-  projectDemos,
-  projectQuestions,
+  projectPanel,
+  resolveBlock,
+  resolveNote,
+  RESOLUTION_MAX,
   retainDrafts,
   selectMode,
   setFreeText,
   submitBlock,
   toggleChoice,
   type AnswerDraft,
-  type DemoItem,
   type FeedbackSubmitState,
+  type LinkedTask,
+  type NeedsYouItem,
+  type NeedsYouView,
+  type OpenRow,
   type OrchQuestion,
+  type SettledRow,
   type SubmitBlock,
 } from "./decisions";
 import { REQUEST_CHANGES_STATUS } from "./taskboard";
@@ -82,6 +105,11 @@ export class DecisionsView {
 
   private questions: OrchQuestion[] = [];
   private tasks: OrchTask[] = [];
+  /** The item registry's rows AND the clear-completed watermark, from ONE
+   *  read — see `NeedsYouView`. Held together because the watermark decides
+   *  which of these rows are hidden, and a stamp from a different read could
+   *  flash back a row the human had just cleared. */
+  private view: NeedsYouView = EMPTY_VIEW;
   /** Half-composed answers, keyed by question id, so a re-render (a burst of
    *  board writes, another question arriving) never destroys what the human
    *  has typed. Frontend-only, so they are pruned to still-answerable rows on
@@ -101,10 +129,12 @@ export class DecisionsView {
   private readonly refresher = new CoalescingRefresh(() => this.refreshNow());
   private unlistenQuestions: UnlistenFn | null = null;
   private unlistenTasks: UnlistenFn | null = null;
+  private unlistenItems: UnlistenFn | null = null;
   private disposed = false;
 
   private embedBtn: HTMLButtonElement;
   private closeBtn: HTMLButtonElement;
+  private clearBtn: HTMLButtonElement;
 
   constructor(
     private groupId: string,
@@ -136,6 +166,21 @@ export class DecisionsView {
     head.append(this.countEl);
     head.append(el("span", "tasks-group", groupId));
 
+    // Clear completed, in the board header's own text-button idiom
+    // (`clear-done`) rather than a new one — `.tasks-head .pane-btn` is always
+    // opaque, and the width override a label needs already exists there.
+    // Hidden, not merely disabled, while there is no tail: a control that can
+    // do nothing on this render is chrome the eye re-dismisses every time. No
+    // confirm, because it stamps a watermark and deletes nothing — which the
+    // title says in both halves, so the human does not have to trust the word
+    // "clear" (needs-you-items.md).
+    this.clearBtn = el("button", "pane-btn decisions-clear", "Clear completed") as HTMLButtonElement;
+    this.clearBtn.title =
+      "Hide the settled rows below — they stay on disk, and nothing still open is touched";
+    this.clearBtn.hidden = true;
+    this.clearBtn.addEventListener("click", () => void this.clearCompleted());
+    head.append(this.clearBtn);
+
     this.embedBtn = el("button", "pane-btn embed", "⬒") as HTMLButtonElement;
     this.embedBtn.addEventListener("click", () => opts.onEmbedMenu(this.embedBtn));
     head.append(this.embedBtn);
@@ -157,10 +202,13 @@ export class DecisionsView {
       }, 0);
     });
 
-    // TWO producers, one panel: a question mutation and a board write both
-    // change what is waiting on the human. Both are declared in the #743 perf
-    // manifest (test/perfpolicy.test.ts) and both land on the same coalescing
-    // gate, so a burst on either costs one trailing refresh, not one per event.
+    // THREE producers, one panel: a question mutation, an item mutation and a
+    // board write all change what is waiting on the human — and a single board
+    // write can be all three at once, since the demo-gate hook raises or
+    // resolves an item inside `upsert_task`. All three are declared in the #743
+    // perf manifest (test/perfpolicy.test.ts) and all three land on the SAME
+    // coalescing gate, so that write costs one trailing refresh rather than
+    // three, and a burst on any of them costs the run in flight plus one.
     void listen<{ group_id: string }>("orch-questions-changed", ({ payload }) => {
       if (payload.group_id === this.groupId) this.refresh();
     }).then((u) => {
@@ -172,6 +220,12 @@ export class DecisionsView {
     }).then((u) => {
       if (this.disposed) u();
       else this.unlistenTasks = u;
+    });
+    void listen<{ group_id: string }>("orch-needs-you-changed", ({ payload }) => {
+      if (payload.group_id === this.groupId) this.refresh();
+    }).then((u) => {
+      if (this.disposed) u();
+      else this.unlistenItems = u;
     });
   }
 
@@ -197,6 +251,7 @@ export class DecisionsView {
     clearTimeout(this.toastTimer);
     this.unlistenQuestions?.();
     this.unlistenTasks?.();
+    this.unlistenItems?.();
     this.el.remove();
   }
 
@@ -226,15 +281,25 @@ export class DecisionsView {
       return;
     }
     this.pendingRefresh = false;
-    // Both reads degrade to empty backend-side rather than rejecting (an
+    // All three reads degrade to empty backend-side rather than rejecting (an
     // unreadable file, a group id the backend refuses), so a failure here is a
     // transport-level one — report it and keep the last good render rather
-    // than blanking the panel.
+    // than blanking the panel. One `Promise.all`, so the three land together
+    // and the render never mixes this second's items with last second's board.
     try {
-      [this.questions, this.tasks] = await Promise.all([
+      const [questions, tasks, view] = await Promise.all([
         questionsList(this.groupId),
         invoke<OrchTask[]>("orch_tasks", { groupId: this.groupId }),
+        needsYouList(this.groupId),
       ]);
+      this.questions = questions;
+      this.tasks = tasks;
+      // The rows come from the read wholesale; the WATERMARK does not. A
+      // clear that landed while this read was in flight holds a newer stamp
+      // than the file had when it was read, and assigning the view wholesale
+      // would bring back the tail the human just dismissed — see
+      // `mergeCleared`, where the argument for `max` lives.
+      this.view = { items: view.items, cleared_ms: mergeCleared(view.cleared_ms, this.view.cleared_ms) };
     } catch (err) {
       this.toast(String(err));
       return;
@@ -262,13 +327,20 @@ export class DecisionsView {
   // ---------- render ----------
 
   private render(): void {
-    const { pending, settled, omitted } = projectQuestions(this.questions);
-    const demos = projectDemos(this.tasks);
+    const { open, settled, omitted } = projectPanel(this.view, this.questions, this.tasks);
 
-    const count = needsYouCount(this.questions, this.tasks);
+    // `needsYouCount` rather than `open.length` — the same number by
+    // construction, and the relation is pinned in test/decisions.test.ts so the
+    // header chip and the list cannot come to disagree about what is waiting.
+    const count = needsYouCount(this.view, this.questions);
+    const decisions = open.filter((r) => r.source === "question").length;
+    const items = open.length - decisions;
     this.countEl.textContent = String(count);
     this.countEl.hidden = count === 0;
-    this.countEl.title = `${pending.length} decision${pending.length === 1 ? "" : "s"}, ${demos.length} demo${demos.length === 1 ? "" : "s"}`;
+    this.countEl.title = `${decisions} decision${decisions === 1 ? "" : "s"}, ${items} item${items === 1 ? "" : "s"}`;
+
+    // Only offered when there is something to clear — see the constructor.
+    this.clearBtn.hidden = settled.length === 0;
 
     const list = el("div", "decisions-body");
 
@@ -276,20 +348,21 @@ export class DecisionsView {
       list.append(el("div", "tasks-empty", "Nothing is waiting on you."));
     }
 
-    if (pending.length > 0) {
-      list.append(this.section("decisions", pending.length));
-      for (const q of pending) list.append(this.questionCard(q));
-    }
-    if (demos.length > 0) {
-      list.append(this.section("demos", demos.length));
-      for (const d of demos) list.append(this.demoCard(d));
+    // ONE list, urgency-pinned then newest-first. No per-source tier: a human
+    // asking "what needs me" wants one queue, and the source is a badge on the
+    // card rather than a heading to scan past.
+    if (open.length > 0) {
+      list.append(this.section("waiting", open.length));
+      for (const row of open) list.append(this.openCard(row));
     }
     if (settled.length > 0) {
-      list.append(this.section("answered", settled.length));
-      for (const q of settled) list.append(this.settledCard(q));
+      list.append(this.section("settled", settled.length));
+      for (const row of settled) list.append(this.settledCard(row));
       if (omitted > 0) {
-        // Never let a capped tail read as the whole history.
-        list.append(el("div", "decisions-omitted", `${omitted} older decision${omitted === 1 ? "" : "s"} not shown`));
+        // Never let a capped tail read as the whole history. Counts only what
+        // the CAP dropped — rows the human cleared are not "not shown", they
+        // are handled, and reporting them back would undo the gesture.
+        list.append(el("div", "decisions-omitted", `${omitted} older row${omitted === 1 ? "" : "s"} not shown`));
       }
     }
 
@@ -322,7 +395,18 @@ export class DecisionsView {
     window.setTimeout(() => card.classList.remove("decisions-focused"), 1600);
   }
 
-  // ---------- decision cards ----------
+  // ---------- cards ----------
+
+  /** One open row, whichever registry it came from. The `anchor` — what a
+   *  deep-link targets — is the projection's, never re-derived here: an open
+   *  demo item anchors on its TASK id because that is what the board's marker
+   *  chip emits (#1091 slice G), and getting that rule wrong in a second place
+   *  is how the board's "👀 needs a look" chip would quietly stop landing. */
+  private openCard(row: OpenRow): HTMLElement {
+    const card = row.source === "question" ? this.questionCard(row.question) : this.itemCard(row);
+    card.dataset.itemId = row.anchor;
+    return card;
+  }
 
   private questionCard(q: OrchQuestion): HTMLElement {
     const card = el("div", "decisions-card");
@@ -473,32 +557,137 @@ export class DecisionsView {
     this.refresh();
   }
 
-  private settledCard(q: OrchQuestion): HTMLElement {
+  /** The faded tail: a settled question or a resolved item, rendered from the
+   *  same union the projection built so the two cannot drift apart in order.
+   *  History, not work — no action of any kind is offered here. */
+  private settledCard(row: SettledRow): HTMLElement {
     const card = el("div", "decisions-card settled");
-    card.dataset.itemId = q.id;
+    card.dataset.itemId = row.anchor;
     const head = el("div", "decisions-card-head");
-    head.append(el("span", "decisions-id", q.id));
-    head.append(el("span", "decisions-status", q.status));
-    if (q.settled_ms) head.append(el("span", "decisions-when", fmtTime(q.settled_ms)));
+    if (row.source === "question") {
+      const q = row.question;
+      head.append(el("span", "decisions-id", q.id));
+      head.append(el("span", "decisions-status", q.status));
+      if (q.settled_ms) head.append(el("span", "decisions-when", fmtTime(q.settled_ms)));
+      card.append(head);
+      card.append(el("div", "decisions-text", q.text));
+      if (q.answer) card.append(el("div", "decisions-answer", q.answer));
+      return card;
+    }
+    const item = row.item;
+    head.append(el("span", "decisions-id", item.id));
+    head.append(el("span", "decisions-kind", item.kind));
+    // WHO closed it, verbatim from the record: `webview` (the human looked),
+    // `board:<status>` (the work moved on) or `withdrawn:<agent>` (the raiser
+    // took it back). The three are kept distinguishable backend-side precisely
+    // so a reader can tell them apart, so the panel shows the tag rather than
+    // flattening all three to "resolved".
+    if (item.resolved_by) head.append(el("span", "decisions-status", item.resolved_by));
+    if (item.resolved_ms) head.append(el("span", "decisions-when", fmtTime(item.resolved_ms)));
+    const linked = itemTask(item);
+    if (linked) head.append(el("span", "decisions-asker", linked));
     card.append(head);
-    card.append(el("div", "decisions-text", q.text));
-    if (q.answer) card.append(el("div", "decisions-answer", q.answer));
+    card.append(el("div", "decisions-text", item.text));
+    if (item.resolution) card.append(el("div", "decisions-answer", item.resolution));
     return card;
   }
 
-  // ---------- demo cards ----------
+  // ---------- item cards ----------
 
-  private demoCard(d: DemoItem): HTMLElement {
+  /** One open needs-you item: the ask, plus whatever the linked board row
+   *  currently says.
+   *
+   *  **The join can be `null`, and the card still works.** A task can be pruned
+   *  or renamed under an open item, and a `feedback` ask may name no task at
+   *  all — so the board affordances (path, PR, Proceed, Feedback) are the part
+   *  that disappears, never Resolve. An item the human can see but cannot clear
+   *  would be a permanent row on their queue. */
+  private itemCard(row: Extract<OpenRow, { source: "item" }>): HTMLElement {
+    const { item, task } = row;
     const card = el("div", "decisions-card demo");
-    card.dataset.itemId = d.id;
 
     const head = el("div", "decisions-card-head");
-    head.append(this.taskLink(d.id, d.id));
-    head.append(el("span", "decisions-status", d.status));
-    if (d.assignee) head.append(el("span", "decisions-asker", d.assignee));
+    head.append(el("span", "decisions-id", item.id));
+    head.append(el("span", "decisions-kind", item.kind));
+    if (row.urgent) head.append(el("span", "decisions-urgent", "urgent"));
+    // WHO ASKED. Titled, because the card can carry a second mono identity
+    // chip (the linked row's assignee, below) and the two mean opposite
+    // things: this one wants the human's attention, that one is doing the
+    // work. `board` here means the demo-gate hook raised it, not an agent.
+    const raiser = el("span", "decisions-asker", item.raiser);
+    raiser.title = item.raiser === "board" ? "Raised automatically when the task was parked" : `Raised by ${item.raiser}`;
+    head.append(raiser);
+    if (item.created_ms) head.append(el("span", "decisions-when", fmtTime(item.created_ms)));
+    const linked = itemTask(item);
+    if (task) {
+      head.append(this.taskLink(task.id, task.id));
+      head.append(el("span", "decisions-status", task.status));
+      // WHO IS DOING IT — the board's fact, not the item's, so its own class
+      // rather than a second `.decisions-asker` beside the raiser.
+      if (task.assignee) {
+        const who = el("span", "decisions-assignee", task.assignee);
+        who.title = `${task.assignee} is assigned to ${task.id}`;
+        head.append(who);
+      }
+    } else if (linked) {
+      // The join degraded. SAY which row is missing rather than dropping the
+      // reference — "t-12 is not on the board" is the fact the human needs to
+      // decide whether this row is stale; a silently task-less card is not.
+      head.append(el("span", "decisions-missing", `${linked} is not on the board`));
+    }
+    if (row.urgent) card.classList.add("urgent");
     card.append(head);
-    card.append(el("div", "decisions-text", d.title));
 
+    card.append(el("div", "decisions-text", item.text));
+    // The board's own title, when there is a row to read it from: the item's
+    // text is what the RAISER wrote, and the two are different claims.
+    if (task) card.append(el("div", "decisions-subtext", task.title));
+
+    if (task) card.append(this.taskMeta(task));
+
+    // The board actions follow the JOINED ROW, not the item's kind: what a task
+    // in `prototype` admits is a fact about that task, so a feedback ask that
+    // names one offers the same Proceed a demo ask does. Gating them on `kind`
+    // instead would mean a human looking at a parked prototype could not
+    // promote it from here for a reason nothing on screen explains.
+    const actions = el("div", "decisions-card-actions");
+    if (task?.canProceed) {
+      // The SAME command the board's own Proceed button calls, guarded the
+      // same way — two surfaces, one gesture, so demo state cannot fork.
+      const go = el("button", "dlg-btn primary", "Proceed") as HTMLButtonElement;
+      go.title = "Promote this prototype — the board action, not a close-out";
+      go.addEventListener("click", () => {
+        go.disabled = true;
+        invoke("orch_proceed_task", { groupId: this.groupId, id: task.id }).catch((err) => {
+          go.disabled = false;
+          this.toast(String(err));
+        });
+      });
+      actions.append(go);
+    }
+    if (task) {
+      // Always offered once there is a row to act on, on BOTH demo statuses —
+      // but not always the same call. A `prototype` is the #147 demo gate, so
+      // it is exactly the row where "I looked, and this is not right" must be
+      // sayable; what changes is the verb the backend will accept for it (see
+      // `feedbackRoute`).
+      const changes = el("button", "dlg-btn", "Feedback") as HTMLButtonElement;
+      changes.addEventListener("click", () => this.giveFeedback(task));
+      actions.append(changes);
+    }
+    // ALWAYS offered, join or no join. Two claims in the label's title,
+    // because "resolve" alone would read as a decision about the work: it
+    // clears the attention row and deliberately leaves the task where it is.
+    const resolve = el("button", "dlg-btn decisions-resolve", "Resolve") as HTMLButtonElement;
+    resolve.title = "Clear this from needs-you — the task stays exactly where it is";
+    resolve.addEventListener("click", () => this.resolveItem(item));
+    actions.append(resolve);
+    card.append(actions);
+    return card;
+  }
+
+  /** The joined board row's demo affordances: where to run it, and its PR. */
+  private taskMeta(d: LinkedTask): HTMLElement {
     const meta = el("div", "decisions-meta");
     if (d.path) {
       // The path is the point of a demo card: the human goes and runs it.
@@ -529,31 +718,117 @@ export class DecisionsView {
       });
       meta.append(pr);
     }
-    card.append(meta);
+    return meta;
+  }
 
-    const actions = el("div", "decisions-card-actions");
-    if (d.canProceed) {
-      // The SAME command the board's own Proceed button calls, guarded the
-      // same way — two surfaces, one gesture, so demo state cannot fork.
-      const go = el("button", "dlg-btn primary", "Proceed") as HTMLButtonElement;
-      go.addEventListener("click", () => {
-        go.disabled = true;
-        invoke("orch_proceed_task", { groupId: this.groupId, id: d.id }).catch((err) => {
-          go.disabled = false;
+  /** Close out an item: the human says "I have seen this".
+   *
+   *  **A dialog rather than a bare ✕, and the note is optional in it.** Two
+   *  reasons, both about what the gesture MEANS: an accidental click on a row
+   *  the human has not looked at costs them the record of the ask, and the
+   *  dialog is where "this does not move the task" can be said in a sentence
+   *  rather than only in a tooltip nobody hovers. An empty box sends `null`,
+   *  which the backend treats as the quiet tidy it is — no pane notice — while
+   *  a note is delivered to the orchestrator (`resolveNote`).
+   *
+   *  There is no MCP resolve at all: this dialog is the only path, which is the
+   *  same no-self-served-gate boundary answering a question has. */
+  private resolveItem(item: NeedsYouItem): void {
+    if (this.el.querySelector(".tasks-dialog")) return; // one at a time
+    const overlay = el("div", "tasks-dialog");
+    const box = el("div", "tasks-dialog-box");
+    box.append(el("div", "tasks-dialog-title", `Resolve ${item.id}`));
+    const linked = itemTask(item);
+    box.append(
+      el(
+        "div",
+        "decisions-hint",
+        linked
+          ? `Clears this from needs-you. ${linked} keeps whatever status it has — resolving is not a board move.`
+          : "Clears this from needs-you. Nothing else changes."
+      )
+    );
+
+    const ta = document.createElement("textarea");
+    ta.className = "dlg-input tasks-dialog-text";
+    ta.placeholder = "Optional note back to the orchestrator — leave empty to just clear it.";
+    ta.spellcheck = false;
+    ta.rows = 3;
+
+    const actions = el("div", "dlg-actions");
+    const hint = el("span", "decisions-block-hint");
+    const cancel = el("button", "dlg-btn", "Cancel") as HTMLButtonElement;
+    const send = el("button", "dlg-btn primary", "Resolve") as HTMLButtonElement;
+    actions.append(hint, cancel, send);
+    box.append(ta, actions);
+    overlay.append(box);
+
+    const close = () => overlay.remove();
+    let inFlight = false;
+    // The cap is the backend's (`validate_resolution` REJECTS over it rather
+    // than truncating), mirrored here so the human is stopped before the click
+    // rather than losing the paste to a rejection after it.
+    const sync = () => {
+      const block = resolveBlock(ta.value);
+      send.disabled = block !== null || inFlight;
+      hint.textContent = block
+        ? `Too long — the note must be ${RESOLUTION_MAX} characters or fewer.`
+        : "";
+    };
+    const submit = () => {
+      if (inFlight || resolveBlock(ta.value) !== null) return;
+      inFlight = true;
+      sync();
+      // Closes on SUCCESS, never before the write — the same rule the feedback
+      // dialog learned: a rejection that had already closed the dialog would
+      // take the human's typed note with it.
+      resolveNeedsYou(this.groupId, item.id, resolveNote(ta.value))
+        .then(() => close())
+        .catch((err) => {
+          inFlight = false;
+          sync();
           this.toast(String(err));
-        });
-      });
-      actions.append(go);
+          ta.focus();
+        })
+        .finally(() => this.refresh());
+    };
+    ta.addEventListener("input", sync);
+    cancel.addEventListener("click", close);
+    send.addEventListener("click", submit);
+    ta.addEventListener("keydown", (e) => {
+      e.stopPropagation();
+      if (e.key === "Escape") close();
+      if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) submit();
+    });
+    overlay.addEventListener("mousedown", (e) => {
+      if (e.target === overlay) close();
+    });
+
+    this.el.appendChild(overlay);
+    sync();
+    ta.focus();
+  }
+
+  /** Hide the settled tail. Stamps a per-group watermark; **deletes nothing**,
+   *  which is why it takes no confirm.
+   *
+   *  The new stamp comes back from the command, so it is applied without a
+   *  second read — `clear_needs_you` writes only the marker and emits no
+   *  `orch-needs-you-changed`, so nothing else would tell this panel. */
+  private async clearCompleted(): Promise<void> {
+    this.clearBtn.disabled = true;
+    try {
+      const cleared = await clearNeedsYou(this.groupId);
+      // `mergeCleared`, not a bare assign: a refresh may have resolved between
+      // the click and this line with an OLDER stamp, and the watermark only
+      // ever moves forward.
+      this.view = { ...this.view, cleared_ms: mergeCleared(cleared, this.view.cleared_ms) };
+      this.render();
+    } catch (err) {
+      this.toast(String(err));
+    } finally {
+      this.clearBtn.disabled = false;
     }
-    // Always offered, on BOTH demo statuses — but not always the same call.
-    // A `prototype` is the #147 demo gate, so it is exactly the row where "I
-    // looked, and this is not right" must be sayable; what changes is the verb
-    // the backend will accept for it (see `feedbackRoute`).
-    const changes = el("button", "dlg-btn", "Feedback") as HTMLButtonElement;
-    changes.addEventListener("click", () => this.giveFeedback(d));
-    actions.append(changes);
-    card.append(actions);
-    return card;
   }
 
   /** Demo feedback, routed to the verb this row's status actually admits.
@@ -579,7 +854,7 @@ export class DecisionsView {
    *  shape closed first, so any rejection destroyed everything the human had
    *  typed with no way back — the same shape the question-answer path already
    *  avoids by restoring its draft on failure. */
-  private giveFeedback(d: DemoItem): void {
+  private giveFeedback(d: LinkedTask): void {
     if (this.el.querySelector(".tasks-dialog")) return; // one at a time
     const overlay = el("div", "tasks-dialog");
     const box = el("div", "tasks-dialog-box");
