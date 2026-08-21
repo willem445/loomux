@@ -250,7 +250,8 @@ so far:
   **Review round 1 (#489) correction:** the first version of this step claimed a
   build/typecheck command "is denied outright unless it was separately pre-approved
   for your block" — checked against the code and false. Two #222 capability-closure
-  guards (`workflow.rs:891`'s parser refusal, `mod.rs`'s `persona_inject` emptying
+  guards (`parse_workflow`'s CAPABILITY CLOSURE refusal — *“a … block cannot declare allow: —
+  its class is read-only”* — and `mod.rs`'s `persona_inject` emptying
   `extra_allow` for every read-only block regardless of source) make the denial
   absolute: there is no per-repo opt-in, by any mechanism, today. Corrected to say so
   plainly; the opt-in question itself is filed separately as #490 rather than answered
@@ -695,17 +696,42 @@ so far:
   or the code *parses* moved, and that is the whole review question here: the `[loomux]`
   notice marker, `.loomux/` paths, `LOOMUX_*` env vars, the `gh` shim's refusal text, the
   `from`-`loomux` audit sender and the `agent-managed` label description (which mirrors
-  `src-tauri/src/gh.rs:153` verbatim) are all still spelled the way the shipping code
+  `gh.rs`'s `label_spec` arm for it verbatim) are all still spelled the way the shipping code
   spells them, because they name identities that flip in phases 3 and 4 rather than
   here. So a delta review of this directory should read every hunk as a brand noun and
   find no surviving technical literal on the `+` side that is not on the `-` side. The
   one that is easy to misread as a missed rename is
   `` `... waiting only for Enter when loomux restarted` `` in `orchestrator.md`: it is a
-  **quotation** of the notice `queue.rs` emits (`queue.rs:1847`), given so the reader can
+  **quotation** of the notice `queue.rs::stranded_lost_notice` emits, given so the reader can
   recognize it on sight, so it spells what the code spells. The paraphrase of the same
   fact two sections later is ordinary prose and did rename — a string an agent MATCHES
   stays, a sentence an agent READS moves.
 
+
+- **#1151 slice B, the needs-you item tools** — `orchestrator.md` only, in three places, and
+  the reason only one golden moves is the shipped convention rather than an oversight: the
+  READ half of a registry is not taught to delegates. `list_questions` has been shared with
+  every role since #946 and appears in **no** delegate template; `list_needs_you` is shared on
+  the same terms and is documented the same way. The three hunks are (1) the tool enumeration,
+  which gains `request_attention` / `list_needs_you` / `withdraw_attention` beside the question
+  registry's own row; (2) the session-start reconcile, where `list_needs_you()` joins
+  `list_questions()` as "the outstanding-LOOK half" — both survive a restart, which is the
+  property that puts either of them in that list; and (3) **Prototype → Proceed**, which now
+  says what parking a row actually does. That third one is the substantive change for an
+  orchestrator, and it removes a real gap: parking already raised a durable item (#1151 slice
+  A shipped the board hook), and nothing told the orchestrator so — leaving it able to see a
+  demo in the panel with no account of where the row came from, whether it should raise a
+  second one by hand, or why its own raise of a parked task came back with someone else's
+  text.
+
+  The one thing a reviewer should check here is what the prose refuses rather than what it
+  adds: **it tells the orchestrator it cannot resolve an item**, and that is a claim about a
+  boundary, not an encouragement. Resolving is the human saying they have looked; withdrawing
+  is the raiser taking an ask back, and the template says which is which so that a settled row
+  is never read as an acknowledgement nobody gave. It also draws the item-vs-question line
+  explicitly, because the two registries reach one panel and picking the wrong one is the
+  mistake that costs an orchestrator a release: a question's answer un-blocks a task, an
+  item's resolve does not.
 `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was` renders
 **these** with the six pre-#222 template variables and asserts that a group launched
 with the advanced orchestrator **off** gets exactly that text. They are the
@@ -728,11 +754,13 @@ a human, not a re-run.
 
   **A plain `cp` of the live template is wrong**, and it fails in a way that hides its
   own cause. These files are the live template *minus* the key(s) `LIVE` lists for it
-  in `tests/workflow.rs` — read that array, not this sentence, which is a copy of it and
-  has been stale before: `{{WORKFLOW}}`, `{{POST_MERGE_WORKFLOW_HOOK}}` and `{{MERGE_QUEUE}}`
-  for `orchestrator.md`, `{{BLOCK_NOTE}}{{ADVISOR_CONSULT_NOTE}}` for `worker.md`,
-  `{{BLOCK_NOTE}}` for `reviewer.md`, `planner.md` and `manager.md` — because
-  `a_workflow_placeholder_must_sit_at_the_end_of_a_line_it_shares` asserts exactly
+  in `tests/workflow.rs` — **read that array, and do not trust any list of
+  keys written down anywhere else, this file included.** No enumeration is kept here on
+  purpose: the one that used to be was a copy, it went stale twice (most recently by missing
+  `{{LOCKS_ORCH}}` and `{{LOCKS}}`, which #858 added), and a stale copy in the procedure is
+  worse than no copy — following it silently leaves a key in. `LIVE` pairs each golden with
+  its template and its keys in one place, which is what makes it the authority. Strip them
+  because `a_workflow_placeholder_must_sit_at_the_end_of_a_line_it_shares` asserts exactly
   "live, stripped of its keys, equals the golden". The *legacy* vars (`{{GROUP_ID}}`,
   `{{REPO}}`) are not keys and must stay. Leave a key in and that test fails with a
   full-file `left`/`right` dump rather than a one-line cause — the "byte copies"
@@ -767,17 +795,20 @@ So compare **bytes with the keys removed, in binary, without a line-based tool**
 substitution `render_with_legacy_vars` does, not a text filter:
 
 ```sh
-python -c "
-keys={'orchestrator':['{{WORKFLOW}}','{{POST_MERGE_WORKFLOW_HOOK}}','{{MERGE_QUEUE}}'],
-      'worker':['{{BLOCK_NOTE}}','{{ADVISOR_CONSULT_NOTE}}'],
-      'reviewer':['{{BLOCK_NOTE}}'],'planner':['{{BLOCK_NOTE}}'],
-      'manager':['{{BLOCK_NOTE}}']}
-for f,ks in keys.items():
-    live=open('src-tauri/src/orchestration/templates/%s.md'%f,'rb').read()
-    for k in ks: live=live.replace(k.encode(),b'')
-    gold=open('src-tauri/tests/fixtures/pre222/%s.md'%f,'rb').read()
-    print(f, 'OK' if live==gold else 'MISMATCH')
-"
+# Transcribe `keys` from `LIVE` (src-tauri/tests/workflow.rs) as you run this — it is an
+# input to the check, never a record of what the keys are. No python3 here (CLAUDE.md).
+node -e '
+const fs=require("fs");
+const keys={orchestrator:["{{WORKFLOW}}","{{POST_MERGE_WORKFLOW_HOOK}}","{{MERGE_QUEUE}}","{{LOCKS_ORCH}}"],
+            worker:["{{BLOCK_NOTE}}{{ADVISOR_CONSULT_NOTE}}","{{LOCKS}}"],
+            reviewer:["{{BLOCK_NOTE}}","{{LOCKS}}"],
+            planner:["{{BLOCK_NOTE}}"], manager:["{{BLOCK_NOTE}}"]};
+for (const [f,ks] of Object.entries(keys)) {
+  let live=fs.readFileSync(`src-tauri/src/orchestration/templates/${f}.md`).toString("binary");
+  for (const k of ks) live=live.split(k).join("");
+  const gold=fs.readFileSync(`src-tauri/tests/fixtures/pre222/${f}.md`).toString("binary");
+  console.log(f, live===gold ? "OK" : "MISMATCH");
+}'
 ```
 
 Both files come out of the same working tree, so both carry that tree's line endings and the
