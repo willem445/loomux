@@ -25135,7 +25135,12 @@ impl OrchRegistry {
                 // application, not here, so there is one place that writes it.
                 let born_kind = patch.kind.as_deref().map(str::trim).filter(|k| !k.is_empty());
                 tasks.push(Task {
-                    id: next_task_id(born_kind, &tasks),
+                    id: {
+                        // RED-EVIDENCE NEUTER — the pre-#1156 t- mint.
+                        let _ = born_kind;
+                        let max: u32 = tasks.iter().filter_map(|t| t.id.strip_prefix("t-").and_then(|n| n.parse::<u32>().ok())).max().unwrap_or(0);
+                        format!("t-{}", max + 1)
+                    },
                     title: title.to_string(),
                     status: "queued".into(),
                     issue: None,
@@ -25246,56 +25251,10 @@ impl OrchRegistry {
                 }
             }
         }
-        // ---- the strict Agile ladder (#1156). Same placement and same reason
-        // as everything above it: read-only against the board, so a refusal
-        // leaves it exactly as it was.
-        //
-        // TRIGGERED BY THE WRITE THAT ASSERTS THE SHAPE, never by the row's
-        // mere existence. A patch touching neither `kind` nor `parent` is not
-        // judged at all, which is the whole compatibility story: every
-        // pre-#1156 board holds shapes this ladder refuses (a top-level
-        // `feature` and its slices was the DOMINANT one — #958 §2 said so), and
-        // those rows must stay editable for status, notes, assignee, deps and
-        // everything else forever. The narrower rule also matches the one this
-        // method already applies to the container/link overlap directly above:
-        // a residual shape is tolerated, and only a write that RE-ASSERTS it is
-        // refused.
-        if patch.kind.is_some() || patch.parent.is_some() {
-            let effective_kind: Option<&str> = match patch.kind.as_deref().map(str::trim) {
-                Some("") => None,
-                Some(k) => Some(k),
-                None => tasks[idx].kind.as_deref(),
-            };
-            // Outer `None` = this row's container names nothing on the board;
-            // inner `None` = it exists and carries no level. See
-            // `check_ladder`.
-            let parent_kind: Option<Option<&str>> = effective_parent
-                .and_then(|p| tasks.iter().find(|t| t.id == p))
-                .map(|t| t.kind.as_deref());
-            check_ladder(&this_id, effective_kind, effective_parent, parent_kind)
-                .map_err(|e| format!("hierarchy: {e}"))?;
-            // BOTH DIRECTIONS (#1156 AC2). The check above judges this row's
-            // own link; the rows INSIDE it are judged against its NEW level,
-            // which nothing else on this path can see. Only a `kind` write can
-            // invalidate a child — a child's rule reads its container's LEVEL,
-            // never where that container itself sits — so a pure reparent skips
-            // this walk rather than re-judging children it cannot have moved.
-            if patch.kind.is_some() {
-                let becoming = match effective_kind {
-                    Some(k) => format!("cannot be {}", a_level(k)),
-                    None => "cannot have its level cleared".to_string(),
-                };
-                for child in tasks.iter().filter(|t| t.parent.as_deref() == Some(this_id.as_str())) {
-                    check_ladder(
-                        &child.id,
-                        child.kind.as_deref(),
-                        Some(&this_id),
-                        Some(effective_kind),
-                    )
-                    .map_err(|e| format!("hierarchy: {this_id} {becoming} — {e}"))?;
-                }
-            }
-        }
+        // RED-EVIDENCE NEUTER — scratch only, never merged: the strict
+        // ladder block is removed from the write path. `ladder_rule` and
+        // `check_ladder` are left EXACTLY as they are, so the table the
+        // cross-language guard reads still matches the board's copy.
         // ---- claim guards (#582). Read the row and the board BEFORE the
         // mutable borrow below; a failed guard returns without writing.
         let claimant = patch
