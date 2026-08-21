@@ -89,7 +89,9 @@ here permits a *passive* signal to resize a terminal.
   it (below), so what re-lays-out each frame is the grid, not a git graph.
 - **The grip drag now has terminals on the other side of it** (below).
 - **A narrow window with both side panels open squeezes the dock**, deliberately,
-  rather than squeezing the grid (below).
+  rather than squeezing the grid — down to the point where a readable dock no
+  longer fits beside the grid's reserve, below which it is not shown at all
+  (below).
 
 ### The mechanism, and the two things that are easy to get wrong
 
@@ -119,11 +121,63 @@ or a file tree at an intermediate width — cheap for the terminals, expensive f
 the panel. `.sessions-inner` is the same device for the same reason; anchored
 right instead of left, so the collapse wipes from the grid side.
 
-The residual: when the row is squeezed (below) the column is narrower than the
-panel it clips, so the panel is cropped rather than re-laid-out at the smaller
-width. That is the deliberate direction of this trade — the human's own dragged
-width is what the contents are laid out for — and it is bounded by the grid's
-floor.
+That fixed width is derived from the room, not from the preference alone
+(`clampDockWidth(width, room)`), so a column the flex row squeezed gets a panel
+laid out FOR that width rather than a cropped slice of a wider one. An earlier
+revision of this section recorded the cropping as an accepted residual; a
+reviewer of #1189 was right that it is not one, and the next section is what
+replaced it.
+
+### The floor: readable, or absent — never a sliver
+
+The fixed-width panel above has a consequence that only shows up at the narrow
+end, and a reviewer of #1189 found it before the human did. `#sessions` takes
+344px of the row, so the dock and the grid share `workspace - 344`; the grid
+keeps 240 of that; the dock gets the rest. Below a **864px window** — a
+half-screen window on a 1366 laptop, not some pathological minimum — the rest is
+less than `DOCK_MIN_W`, and a panel laid out for 420px was being *cropped* into
+it. At the app's own 640px minimum that is a 56px strip of a 420px panel, which
+does not read as "narrow", it reads as broken.
+
+Two things fix it, and they are different fixes:
+
+**The panel follows the room down.** `contentPx` is `clampDockWidth(width,
+room)`, so a squeezed column gets a panel laid out *for* that width rather than
+a slice of a wider one. The human's own preference is an input here and is never
+written back, so widening the window restores it exactly.
+
+**Below the room a readable dock needs, it takes no column at all.**
+`dockBoxes` returns `starved` when `room - reserve < DOCK_MIN_W`, and a starved
+dock renders as a zero-width column — the same rendering as a closed one, and
+inert for the same reason. This is the honest end of the trade the section above
+describes: the grid keeps its reserve, the dock is what yields, and yielding now
+has a point at which it stops being a strip of cropped chrome and becomes
+nothing at all.
+
+**`open` is not touched by any of it.** Starving is a rendering verdict, not a
+close: the dock comes back on its own, in the state the human left it, as soon
+as the room returns. What makes that automatic is a `ResizeObserver` on
+`#grid-area` — the one piece of JS that reacts to the room, and worth justifying
+because an earlier revision of this note refused exactly that ("a JS re-clamp
+would mean a resize handler running next to the one subsystem this whole note
+exists to keep away from the grid"). Three things make it different:
+
+- it fires on the row's geometry, so it catches `#sessions` opening — which is
+  not a window resize and produces no `resize` event at all;
+- it **cannot oscillate**, and that is a property rather than a hope: the room
+  it measures is `grid + dock`, which is invariant to how wide it makes the
+  dock, so a write produces at most one more delivery that measures the same
+  room and returns without writing;
+- the expensive half — the collapse class, `inert`, `aria-hidden`, the toggle
+  button — runs only when the starve verdict actually flips. A window drag that
+  never crosses 864px costs two style writes per frame, and the geometry change
+  it does cause is coalesced by `resizeburst.ts` like every other one.
+
+**The toggle button says so.** A dock that cannot be shown would otherwise make
+the top-bar control appear dead — click, nothing, click, nothing. `SideDockHost`
+gained `setToggleAvailability`, so the button disables itself and names both ways
+out: close the session browser, or widen the window. A control that explains why
+it cannot help is the difference between a constraint and a bug.
 
 ### Why not the per-pane embed engine, which already docks things to a right edge
 
@@ -367,7 +421,7 @@ next boot after a stray hand-edit or a version that wrote one extra field.
 no further** — `decodeDockPrefs` has no live window width, so it cannot apply
 the workspace reserve, and it does not pretend to.
 
-### Where the reserve is actually enforced, and why it is now in two places
+### Where the reserve is actually enforced, and why it is now in three places
 
 `DOCK_TERM_RESERVE_PX` (240px) changed meaning without changing value when the
 dock started displacing: it used to be how much of the grid an open dock could
@@ -398,12 +452,23 @@ and `.sidedock`'s `flex: 0 1 auto` is its other half: the dock is the row's only
 shrinkable item, so a squeezed row costs the dock its width rather than costing
 the grid its existence.
 
-`clampDockWidth` keeps the reserve too, so the number that gets *persisted* is
-sane rather than merely rendered sane. `test/sidedockmodel.test.ts` reads **both**
-stylesheet rules off disk and fails if either copy of `DOCK_MIN_W` or
-`DOCK_TERM_RESERVE_PX` drifts from the module — the same both-ways pinning
-`theme.test.ts` applies to the palette, and the reason duplicating the numbers is
-safe here.
+**`clampDockWidth`, against the room the dock and the grid SHARE**, is the third,
+and it bounds the two things CSS cannot see: the width that gets *persisted*, and
+the width the panel inside the column is laid out at. The quantity matters — it
+is not the workspace's width. Those were the same number while the dock was an
+overlay, and #1150 pulled them apart by 344px: passing the workspace's width
+accepted every width in that gap, so a drag past what the row could seat stopped
+tracking the pointer while the number being persisted kept climbing, and the next
+boot restored a width the layout silently ignored (#1189 review, finding 2 — the
+same "measured against the wrong whole" defect as the CSS half, caught at the
+other call site).
+
+`test/sidedockmodel.test.ts` reads **both** stylesheet rules off disk and fails if
+either copy of `DOCK_MIN_W` or `DOCK_TERM_RESERVE_PX` drifts from the module — the
+same both-ways pinning `theme.test.ts` applies to the palette, and the reason
+duplicating the numbers is safe here — and pins the drag's own call site to the
+shared room, because the function being right is worth nothing if its argument is
+the wrong quantity.
 
 ## Colour, and the two channels on one row
 

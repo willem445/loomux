@@ -292,6 +292,20 @@ html, body {
   background: var(--surface-2);
 }
 .bar-btn:active { transform: translateY(0.5px); }
+/* A top-bar control that cannot help right now has to LOOK like it (#1150). The
+   side dock disables its own toggle when the row has no room to seat it, and a
+   disabled button that still lit up on hover and depressed on click would be
+   the same "did that do anything?" confusion the floor exists to remove — the
+   dock would be honest and the button would not. `title` carries the reason and
+   both ways out; this carries the fact. Every state is restated rather than
+   left to specificity, because `:hover` and `:active` both still match a
+   disabled button. */
+.bar-btn:disabled,
+.bar-btn:disabled:hover {
+  color: var(--ink-faint); border-color: var(--line);
+  background: var(--surface-1); cursor: default;
+}
+.bar-btn:disabled:active { transform: none; }
 
 /* ---------- workspace ---------- */
 #workspace { display: flex; flex: 1; min-height: 0; }
@@ -4416,7 +4430,7 @@ button.wf-finding:hover { background: var(--surface-2); }
  * document order. True but fragile, so it stays written down: a `.sidedock` z-index raise
  * must raise `.git-menu` with it.
  *
- * THE WIDTH BOUND IS HERE, NOT IN JS (#1097 rev-767 B2). The reserve used to be applied
+ * THE RENDERED WIDTH BOUND IS HERE (#1097 rev-767 B2), and it is not the only bound — The reserve used to be applied
  * only while dragging, so a width persisted on a wide monitor came back whole on a narrow
  * one and covered every pane — and the same held after any window resize. `max-width`
  * holds at boot, on restore, and on every resize, with no listener to forget. `max()` keeps
@@ -4427,9 +4441,17 @@ button.wf-finding:hover { background: var(--surface-2); }
  *
  * It bounds what the dock ASKS FOR, against the whole workspace, and that is no longer the
  * whole guarantee: it cannot see #sessions, which takes 344px of the same row. The floor
- * that actually protects the terminal now lives on #grid-area's `min-width` (above), and
+ * that actually protects the terminal lives on #grid-area's `min-width` (above), and
  * `flex: 0 1 auto` here is its other half — the dock is the row's only shrinkable item, so
- * a squeezed row costs the dock its width rather than costing the grid its existence. */
+ * a squeezed row costs the dock its width rather than costing the grid its existence.
+ *
+ * THE THIRD BOUND IS IN JS, and saying "the bound is in CSS" was only ever true of the
+ * RENDERED width. `sidedockmodel.ts`'s `dockBoxes` bounds two things a stylesheet cannot:
+ * the width that gets PERSISTED (against the room the dock and grid share, not the
+ * workspace — #1189 review finding 2), and the width the fixed panel INSIDE the column is
+ * laid out at. The second is why a squeezed dock is narrow rather than cropped, and why
+ * below the room a readable dock needs (`DOCK_MIN_W` + the reserve) it takes no column at
+ * all instead of showing a sliver of a panel built for a width it does not have. */
 .sidedock {
   position: relative;
   flex: 0 1 auto;

@@ -207,7 +207,13 @@ let tabBar: TabBar<Workspace> | null = null;
 /** The active tab's grid — the single-grid `grid` of the pre-tabs app. */
 const activeGrid = (): Grid => tabs.activeWorkspace.grid;
 
-sideDock = new SideDock(workspaceEl, {
+/** The dock button, held so the dock can report that the row has no room for
+ *  it (#1150). Its resting title is read off the markup rather than duplicated
+ *  here, so the two cannot drift. */
+const dockBtn = document.getElementById("btn-sidedock") as HTMLButtonElement;
+const dockBtnTitle = dockBtn.title;
+
+sideDock = new SideDock(workspaceEl, document.getElementById("grid-area")!, {
   // `activeWorkspace` THROWS before the first tab exists, and this is read at
   // construction — which happens before boot seeds one.
   activeCwd: () => (tabs.count === 0 ? null : tabs.activeWorkspace.grid.activePane?.workdir ?? null),
@@ -221,6 +227,13 @@ sideDock = new SideDock(workspaceEl, {
     const held = tabs.count === 0 ? [] : tabs.activeWorkspace.grid.panes();
     held.forEach((p) => p.beginResizeHold());
     return () => held.forEach((p) => p.endResizeHold());
+  },
+  // A dock the row cannot seat is hidden rather than cropped (#1150), so the
+  // control has to say why — otherwise it is a button that does nothing, which
+  // is the other way for this to look broken.
+  setToggleAvailability: (available, reason) => {
+    dockBtn.disabled = !available;
+    dockBtn.title = reason ?? dockBtnTitle;
   },
 });
 

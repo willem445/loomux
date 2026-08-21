@@ -44,58 +44,76 @@ export const DOCK_MAX_W = 900;
  *  imports another pure module has no import spelling that satisfies both `tsc`
  *  and bare `node --test`.
  *
- *  **THE RESERVE IS ENFORCED IN CSS, NOT HERE**, and in TWO places that are not
- *  redundant (styles.css):
+ *  **THE RESERVE IS ENFORCED IN THREE PLACES, none of them redundant.** Two are
+ *  CSS, because CSS holds at boot, on a restore from persistence and on every
+ *  window resize with no listener to forget:
  *
- *   - `.sidedock`'s `max-width` bounds what the dock ASKS FOR, at boot, on a
- *     restore from persistence, and on every window resize — none of which run
- *     this module. It used to be applied only on the drag path, so a width
- *     persisted on a wide monitor came back whole on a narrow one and covered
- *     every pane (#1097 rev-767 B2).
+ *   - `.sidedock`'s `max-width` bounds what the dock ASKS FOR. It used to be
+ *     applied only on the drag path, so a width persisted on a wide monitor came
+ *     back whole on a narrow one and covered every pane (#1097 rev-767 B2).
  *   - `#grid-area`'s `min-width` is the floor the grid KEEPS. It exists because
- *     the max-width above is measured against the whole workspace and cannot
- *     see `#sessions` taking 344px of the same row; with both panels open on a
+ *     the max-width above is measured against the whole workspace and cannot see
+ *     `#sessions` taking 344px of the same row; with both panels open on a
  *     narrow window, the grid — and not the panel — is what would vanish.
  *
- *  `clampDockWidth` below still applies the reserve on the drag, so the number
- *  that gets PERSISTED is sane too; `test/sidedockmodel.test.ts` pins both
- *  stylesheet copies against this constant, so the mirror cannot drift. */
+ *  The third is `dockBoxes`/`clampDockWidth` here, against the room the dock and
+ *  the grid actually SHARE. CSS decides what is rendered; this decides what is
+ *  persisted and how wide the panel inside the column is laid out, and neither
+ *  of those is something a stylesheet can answer. Passing the workspace's width
+ *  instead was a real defect (#1189 review, finding 2): every width between
+ *  `room - 240` and `workspace - 240` is one the row can never seat, so a drag
+ *  through that gap persisted a number the layout silently ignored.
+ *
+ *  `test/sidedockmodel.test.ts` pins both stylesheet copies against this
+ *  constant, so the mirror cannot drift. */
 export const DOCK_TERM_RESERVE_PX = 240;
 
 /**
- * Clamp a dock width to something both readable and non-covering.
+ * Clamp a dock width to something both readable and non-takeable.
  *
- * `availablePx` is the workspace's own width when it is known; the default
- * leaves only the absolute bounds, for callers reasoning about a persisted
- * value before the window has been measured. A non-finite input (a corrupt
- * pref, a measurement taken while the window was hidden) falls back to the
- * default width rather than propagating `NaN` into a style property, where it
- * would silently collapse the dock to zero.
+ * `roomPx` is **the width the dock and the terminal grid SHARE** — not the
+ * workspace's own width, which is a different and larger number whenever
+ * `#sessions` (344px, `flex: none`) is open beside them. That distinction is
+ * the whole point of the parameter since #1150 made the dock displace: the
+ * workspace-wide bound accepts widths the row can never seat, so a drag past
+ * that point stops tracking the pointer while the number being persisted keeps
+ * climbing, and the next boot restores a width the layout silently ignores
+ * (review of #1189, finding 2). The caller measures it as
+ * `#grid-area` + `.sidedock`, which is invariant to where the divider between
+ * them sits and therefore stable for the length of a drag.
+ *
+ * The default leaves only the absolute bounds, for callers reasoning about a
+ * persisted value before anything has been measured. A non-finite input (a
+ * corrupt pref, a measurement taken while the window was hidden) falls back to
+ * the default width rather than propagating `NaN` into a style property, where
+ * it would silently collapse the dock to zero.
  */
-export function clampDockWidth(px: number, availablePx = Number.POSITIVE_INFINITY): number {
+export function clampDockWidth(px: number, roomPx = Number.POSITIVE_INFINITY): number {
   if (!Number.isFinite(px)) return DEFAULT_DOCK_PREFS.width;
-  const roomy = Number.isFinite(availablePx)
-    ? Math.max(DOCK_MIN_W, availablePx - DOCK_TERM_RESERVE_PX)
+  const roomy = Number.isFinite(roomPx)
+    ? Math.max(DOCK_MIN_W, roomPx - DOCK_TERM_RESERVE_PX)
     : DOCK_MAX_W;
   const max = Math.min(DOCK_MAX_W, roomy);
   return Math.round(Math.max(DOCK_MIN_W, Math.min(max, px)));
 }
 
-/** The dock's two widths: the COLUMN it occupies in `#workspace`'s flex row,
- *  and the fixed width its contents are laid out at. */
+/** The dock's two widths, plus the verdict that can zero the first of them. */
 export interface DockBoxes {
-  /** What the flex row gives the dock — `0` while it is closed. */
+  /** What the flex row gives the dock — `0` while it is closed OR starved. */
   columnPx: number;
   /** The absolutely-positioned inner panel's width, which the column clips. */
   contentPx: number;
+  /** True when the row cannot seat a readable dock beside the grid's reserve. */
+  starved: boolean;
 }
 
 /**
- * The two widths the DOM sets when the dock opens, closes or is dragged (#1150).
+ * The widths the DOM sets when the dock opens, closes, is dragged, or the room
+ * around it changes (#1150).
  *
  * Handed back together, the same way `resizeburst.ts`'s `FitPlan` returns its
- * delay and burst start together: they are two halves of one decision and a
- * caller that could set them from separate calls could set them inconsistently.
+ * delay and burst start together: they are parts of one decision, and a caller
+ * that could set them from separate calls could set them inconsistently.
  *
  * **`columnPx` is 0 when closed, and that is the whole feature.** The dock is a
  * flex sibling of `#grid-area` now, so the panes get their space back only if
@@ -104,18 +122,38 @@ export interface DockBoxes {
  * `resizeburst.ts` to coalesce and no autosize for the human to see.
  *
  * **`contentPx` is NOT 0 when closed, and that is not an oversight.** The panel
- * inside the column keeps its full width throughout, so a toggle slides a
- * fixed-size panel behind a moving clip instead of re-laying-out a git graph or
- * a file tree at fifteen intermediate widths. It is also what makes the reopen
- * cheap: the contents are already at the width they will be shown at.
+ * inside the column keeps its width throughout, so a toggle slides a fixed-size
+ * panel behind a moving clip instead of re-laying-out a git graph or a file tree
+ * at fifteen intermediate widths. It is also what makes the reopen cheap: the
+ * contents are already at the width they will be shown at.
  *
- * Both are clamped through `clampDockWidth`, so a corrupt persisted width
- * cannot reach a style property as `NaN` (which collapses the element silently)
- * and the two can never disagree about what "the dock's width" is.
+ * **`starved` is the floor, and it exists because the fixed-width panel above
+ * cannot adapt to a column narrower than itself — it can only be cropped by
+ * one** (review of #1189, finding 3). With `#sessions` open the row gives the
+ * dock `room - 240`, which falls under `DOCK_MIN_W` for any room below 520 — a
+ * half-screen window on a 1366 laptop. Rather than render the right-hand sliver
+ * of a panel laid out for a width it does not have, the dock takes no column at
+ * all: readable, or absent. The caller says so on the toggle button, because a
+ * control that silently does nothing is the other way to look broken.
+ *
+ * The direction of the trade is not in question — the grid keeps its reserve and
+ * the dock is what yields (doc/design/side-dock.md). What this adds is a point
+ * at which yielding stops being a cropped strip.
+ *
+ * `roomPx` is the width the dock and the grid SHARE (see `clampDockWidth`). A
+ * missing or unmeasurable one — boot, before the window has been laid out —
+ * fails OPEN: an unmeasured room is not evidence of a small one, and hiding the
+ * dock on it would be a worse failure than showing it and correcting on the
+ * first real measurement.
  */
-export function dockBoxes(open: boolean, width: number): DockBoxes {
-  const contentPx = clampDockWidth(width);
-  return { columnPx: open ? contentPx : 0, contentPx };
+export function dockBoxes(open: boolean, width: number, roomPx?: number): DockBoxes {
+  const room =
+    typeof roomPx === "number" && Number.isFinite(roomPx) && roomPx > 0
+      ? roomPx
+      : Number.POSITIVE_INFINITY;
+  const starved = room - DOCK_TERM_RESERVE_PX < DOCK_MIN_W;
+  const contentPx = clampDockWidth(width, room);
+  return { columnPx: open && !starved ? contentPx : 0, contentPx, starved };
 }
 
 // ---------- roots ----------

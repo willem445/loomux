@@ -261,27 +261,168 @@ test("a corrupt persisted width never reaches a style property", () => {
 test("sidedock.ts hides the dock by COLLAPSING it, never with `hidden` (#1150)", () => {
   // The pure module being green says nothing about whether the DOM half uses
   // it. DOM wiring is hand-verified in this repo, but this particular wire has
-  // a silent failure mode worth a guard: `el.hidden` is `display: none`, which
-  // hides the dock perfectly well and looks like a tidy-up. It would also skip
-  // the width transition entirely, so the panes would snap instead of
-  // autosizing and the burst `resizeburst.ts` is sized for would never exist —
-  // and every other test in this file would still pass.
+  // a silent failure mode worth a guard: setting `hidden` on the dock's own
+  // column is `display: none`, which hides it perfectly well and looks like a
+  // tidy-up. It would also skip the width transition entirely, so the panes
+  // would snap instead of autosizing and the burst `resizeburst.ts` is sized
+  // for would never exist — and every other test in this file would pass.
   //
-  // The axis is the DOM PROPERTY, not any identifier around it (a rename cannot
-  // step over `.hidden = `), and it is default-deny in both directions: the one
-  // `dockBoxes` call must be found, so moving the geometry somewhere else fails
-  // here loudly rather than leaving this guard watching nothing.
+  // DEFAULT-DENY ON THE RECEIVER, not on one spelling of it. An earlier version
+  // of this guard matched `this.el.hidden =` while claiming in its own comment
+  // to be identifier-independent, which was false twice over: the regex WAS the
+  // identifier, and a single alias stepped straight over it — with
+  // `const col = this.el; col.hidden = !this.prefs.open;` in `applyOpenState`
+  // the file stayed green (found in review of #1189; re-run below the rewrite).
+  // So this reads EVERY `x.hidden =` in the file and requires `x` to be on a
+  // list that says why that element is allowed to be display:none'd. An alias
+  // of the column is not on the list, whatever it is called.
+  //
+  // RESIDUAL BLIND SPOT, stated where the scan lives (CLAUDE.md's convention
+  // for source-scanning guards): this matches a dotted receiver written
+  // literally. A computed write (`this.el["hidden"] = true`), an
+  // `Object.assign(this.el, { hidden: true })`, or a write through a reference
+  // some other module holds are all invisible to it. None appears today, and
+  // none is a spelling anyone reaches for by accident — which is the class this
+  // guard is for.
   const src = readFileSync(new URL("../src/sidedock.ts", import.meta.url), "utf8");
-  assert.doesNotMatch(
-    src,
-    /\bthis\.el\.hidden\s*=/,
-    "the dock's own column must never be display:none — that is the transition, and the autosize"
-  );
+  const allowed = new Map([
+    [
+      "this.holdEl",
+      "the hold notice — a plain in-flow child of the panel, not the column. A line that is " +
+        "simply absent is exactly what display:none is for",
+    ],
+    [
+      "v.el",
+      "one hosted view inside the body — selecting a tab shows one and hides the rest, which " +
+        "must not animate and must not stay laid out while hidden",
+    ],
+  ]);
+  const found = [
+    ...src.matchAll(/([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\.hidden\s*=(?!=)/g),
+  ].map((m) => m[1]);
+  for (const receiver of found) {
+    assert.ok(
+      allowed.has(receiver),
+      `sidedock.ts sets \`${receiver}.hidden\`, which is not on the allow-list. If that is the ` +
+        `dock's own column under any name, it is display:none — no width transition, so the ` +
+        `panes snap instead of autosizing and the coalescer never sees a burst. If it is ` +
+        `genuinely some other element, add it here with the reason it may be hidden that way.`
+    );
+  }
+  // Every row is re-checked, so a rename that leaves a row watching nothing
+  // fails here rather than silently widening what is permitted.
+  for (const [receiver, why] of allowed) {
+    assert.ok(
+      found.includes(receiver),
+      `the allow-list row \`${receiver}\` (${why}) matches nothing in sidedock.ts any more — ` +
+        `re-point it rather than leaving a stale exemption standing`
+    );
+  }
   assert.equal(
     [...src.matchAll(/\bdockBoxes\s*\(/g)].length,
     1,
     "sidedock.ts must set its geometry from exactly one dockBoxes call — a second one is a " +
       "second copy of the rule, and none means this guard is watching nothing"
+  );
+});
+
+test("the width the row can actually seat is what bounds a drag, not the workspace's", () => {
+  // REGRESSION PIN for review finding 2 on #1189. `clampDockWidth`'s bound is
+  // `room - reserve`, and before this the caller passed the WORKSPACE's width —
+  // a quantity that cannot see `#sessions` taking 344px of the same row. The two
+  // agreed exactly while the dock was an overlay, which is why the asymmetry
+  // arrived with #1150 rather than being an old bug.
+  //
+  // Workspace 1000 with the session browser open: the dock and the grid share
+  // 656, so the row can seat 416 and no more.
+  const workspace = 1000;
+  const sessions = 344;
+  const room = workspace - sessions;
+  assert.equal(clampDockWidth(760, room), room - DOCK_TERM_RESERVE_PX);
+  assert.equal(clampDockWidth(760, room), 416);
+  // The bound the old call site used accepted 760 — 344px of dead zone, in
+  // which the dock stops tracking the pointer while the number being persisted
+  // keeps climbing.
+  assert.equal(clampDockWidth(760, workspace), 760);
+});
+
+test("the dock's contents follow the room down, so a squeezed column is narrow and not cropped", () => {
+  // The panel is laid out at a FIXED width and clipped by the column, so a
+  // column the flex row squeezed below that width shows a cropped slice of a
+  // panel built for a width it does not have. Deriving `contentPx` from the room
+  // is what keeps the two the same number.
+  assert.equal(dockBoxes(true, 900, 1000).contentPx, 760);
+  assert.equal(dockBoxes(true, 900, 1000).columnPx, 760);
+  // ...and the human's own preference is not destroyed by a temporarily narrow
+  // window: it is an input here, never written back, so widening restores it.
+  assert.equal(dockBoxes(true, 900, 2000).contentPx, DOCK_MAX_W);
+});
+
+test("below the room a readable dock needs, it takes NO column rather than a sliver (#1150)", () => {
+  // REGRESSION PIN for review finding 3. The floor is exactly where a readable
+  // dock stops fitting beside the grid's reserve: room < DOCK_MIN_W + reserve.
+  // With the session browser open that is a 864px window — a half-screen window
+  // on a 1366 laptop, which is why "it only bites at the 640px minimum" was the
+  // wrong reading.
+  const floor = DOCK_MIN_W + DOCK_TERM_RESERVE_PX;
+  assert.equal(floor, 520);
+
+  const fits = dockBoxes(true, 420, floor);
+  assert.equal(fits.starved, false);
+  assert.equal(fits.columnPx, DOCK_MIN_W, "exactly at the floor the dock is readable, so it shows");
+
+  const starved = dockBoxes(true, 420, floor - 1);
+  assert.equal(starved.starved, true);
+  assert.equal(starved.columnPx, 0, "one pixel under, it takes no column at all — never a sliver");
+});
+
+test("a starved dock keeps the human's open state, so it comes back on its own", () => {
+  // Starving is a rendering verdict, not a close: `open` is the human's intent
+  // and nothing here overwrites it. Widen the window (or close the session
+  // browser) and the same preference produces a column again — which is what
+  // makes the ResizeObserver in sidedock.ts the whole of the recovery path.
+  const width = 420;
+  assert.equal(dockBoxes(true, width, 400).columnPx, 0);
+  assert.equal(dockBoxes(true, width, 1200).columnPx, width);
+  // And a dock the human actually closed is not "starved" merely because the
+  // room is small — the two answers stay separate.
+  assert.equal(dockBoxes(false, width, 1200).starved, false);
+  assert.equal(dockBoxes(false, width, 400).starved, true);
+  assert.equal(dockBoxes(false, width, 400).columnPx, 0);
+});
+
+test("an UNMEASURED room fails open — it is not evidence of a small one", () => {
+  // At construction the row may not be laid out yet, and a zero or NaN reading
+  // would hide a dock that has plenty of room. The first real delivery from the
+  // ResizeObserver corrects it either way, so the safe direction is to show.
+  for (const unmeasured of [undefined, 0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+    const boxes = dockBoxes(true, 420, unmeasured);
+    assert.equal(boxes.starved, false, `room: ${String(unmeasured)}`);
+    assert.equal(boxes.columnPx, 420, `room: ${String(unmeasured)}`);
+  }
+});
+
+test("sidedock.ts clamps the drag against the SHARED room, not the workspace", () => {
+  // The pure bound above is only as good as what the DOM half feeds it, and the
+  // defect finding 2 describes lived entirely at the call site: the function was
+  // right, its argument was the wrong quantity.
+  //
+  // Positively pinned rather than blacklisted — the one clamp must be reached
+  // with the cached room — and default-deny, because the call has to be found at
+  // all. `this.room` is maintained by the ResizeObserver and is invariant to the
+  // dock's own width, which is what makes it safe to hold for a whole drag.
+  const src = readFileSync(new URL("../src/sidedock.ts", import.meta.url), "utf8");
+  const calls = [...src.matchAll(/clampDockWidth\s*\(/g)];
+  assert.equal(
+    calls.length,
+    1,
+    "sidedock.ts must clamp in exactly one place — if that moved, this guard is watching nothing"
+  );
+  assert.match(
+    src.slice(calls[0].index, calls[0].index + 160),
+    /,\s*this\.room\s*\)/,
+    "the drag must clamp against the room the dock shares with the grid; the workspace's own " +
+      "width is larger by whatever #sessions is taking, and widths in that gap can never be seated"
   );
 });
 

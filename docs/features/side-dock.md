@@ -92,9 +92,16 @@ It starts closed, so a fresh window is all terminal until you ask for the dock.
 
 **Resizing:** drag the dock's left edge. The width, whether it was open, and
 which tab you were on are all remembered for next time. However wide you drag
-it — and whatever width it was remembered at — the grid keeps a usable strip,
-including after you shrink the window or open the session browser as well: on a
-narrow window it is the dock that gives up width, never the terminals.
+it — and whatever width it was remembered at — your terminals keep a usable
+strip, including after you shrink the window or open the session browser as
+well: when room runs short it is the dock that gives up width, never the panes.
+
+**In a window too narrow for both:** with the session browser open as well,
+there is a point — around a half-screen window on a 1366-wide laptop — where a
+dock narrow enough to fit is too narrow to read. Rather than show you a sliver,
+the dock hides itself and the **`⬔ dock`** button says why. Close the session
+browser, or widen the window, and it comes straight back exactly as you left
+it; it never forgets that you had it open.
 
 ## Relationship to the per-pane panels
 
