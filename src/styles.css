@@ -2752,6 +2752,14 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   background: color-mix(in srgb, var(--state-attention) 16%, transparent);
 }
 .decisions-asker { font-family: var(--font-mono); font-size: 10px; }
+/* The OTHER identity a card can show (#1151): the linked row's assignee. Same
+   mono family so both read as agent ids, but dimmer and not bold — who asked
+   is the card's subject, who is doing the work is context for it, and two
+   identically-weighted chips side by side made the reader guess which was
+   which. Both also carry a title. */
+.decisions-assignee {
+  font-family: var(--font-mono); font-size: 10px; color: var(--ink-faint);
+}
 .decisions-when, .decisions-status { font-size: 10px; color: var(--ink-faint); }
 /* Which registry a card came from, now that the two are one list (#1151): a
    quiet outline chip, on the NEUTRAL channel rather than the state one, because

@@ -29,6 +29,7 @@ import {
   isUrgent,
   itemTask,
   linkTask,
+  mergeCleared,
   needsYouCount,
   normalizeOptions,
   projectPanel,
@@ -261,6 +262,24 @@ test("a watermark of 0 hides NOTHING, because 0 is the never-cleared sentinel", 
   // is by definition older than anything stamped, and the alternative is a row
   // the human can never clear.
   assert.equal(isCleared(0, 1), true);
+});
+
+test("the watermark only ever moves forward, so a slow read cannot undo a clear", () => {
+  // The failure this closes (rev-lead round 1, non-blocking 3): a refresh
+  // starts and reads the marker while it still holds 0; the human then clicks
+  // Clear completed, the marker is stamped T and the tail goes; the in-flight
+  // read resolves LAST with the pre-clear 0 and, assigned wholesale, brings
+  // the dismissed tail straight back until some later event re-read the file.
+  assert.equal(mergeCleared(0, 1700), 1700, "a stale read cannot lower the stamp");
+  // …and a genuinely newer stamp (another window cleared) still wins, which is
+  // what makes this a merge rather than "ignore the read".
+  assert.equal(mergeCleared(1800, 1700), 1800);
+  assert.equal(mergeCleared(0, 0), 0, "never-cleared stays the sentinel");
+  // The property, not the three cases: max is total and monotonic, so no pair
+  // of stamps can produce one lower than either.
+  for (const [a, b] of [[0, 0], [0, 5], [5, 0], [5, 5], [9, 5], [5, 9]]) {
+    assert.ok(mergeCleared(a, b) >= a && mergeCleared(a, b) >= b, `${a},${b} went backwards`);
+  }
 });
 
 test("clearing does not change the count — the count never held settled rows", () => {

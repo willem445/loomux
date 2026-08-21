@@ -51,6 +51,7 @@ import {
   isPending,
   isUrgent,
   itemTask,
+  mergeCleared,
   needsYouCount,
   normalizeOptions,
   projectPanel,
@@ -286,11 +287,19 @@ export class DecisionsView {
     // than blanking the panel. One `Promise.all`, so the three land together
     // and the render never mixes this second's items with last second's board.
     try {
-      [this.questions, this.tasks, this.view] = await Promise.all([
+      const [questions, tasks, view] = await Promise.all([
         questionsList(this.groupId),
         invoke<OrchTask[]>("orch_tasks", { groupId: this.groupId }),
         needsYouList(this.groupId),
       ]);
+      this.questions = questions;
+      this.tasks = tasks;
+      // The rows come from the read wholesale; the WATERMARK does not. A
+      // clear that landed while this read was in flight holds a newer stamp
+      // than the file had when it was read, and assigning the view wholesale
+      // would bring back the tail the human just dismissed — see
+      // `mergeCleared`, where the argument for `max` lives.
+      this.view = { items: view.items, cleared_ms: mergeCleared(view.cleared_ms, this.view.cleared_ms) };
     } catch (err) {
       this.toast(String(err));
       return;
@@ -601,13 +610,25 @@ export class DecisionsView {
     head.append(el("span", "decisions-id", item.id));
     head.append(el("span", "decisions-kind", item.kind));
     if (row.urgent) head.append(el("span", "decisions-urgent", "urgent"));
-    head.append(el("span", "decisions-asker", item.raiser));
+    // WHO ASKED. Titled, because the card can carry a second mono identity
+    // chip (the linked row's assignee, below) and the two mean opposite
+    // things: this one wants the human's attention, that one is doing the
+    // work. `board` here means the demo-gate hook raised it, not an agent.
+    const raiser = el("span", "decisions-asker", item.raiser);
+    raiser.title = item.raiser === "board" ? "Raised automatically when the task was parked" : `Raised by ${item.raiser}`;
+    head.append(raiser);
     if (item.created_ms) head.append(el("span", "decisions-when", fmtTime(item.created_ms)));
     const linked = itemTask(item);
     if (task) {
       head.append(this.taskLink(task.id, task.id));
       head.append(el("span", "decisions-status", task.status));
-      if (task.assignee) head.append(el("span", "decisions-asker", task.assignee));
+      // WHO IS DOING IT — the board's fact, not the item's, so its own class
+      // rather than a second `.decisions-asker` beside the raiser.
+      if (task.assignee) {
+        const who = el("span", "decisions-assignee", task.assignee);
+        who.title = `${task.assignee} is assigned to ${task.id}`;
+        head.append(who);
+      }
     } else if (linked) {
       // The join degraded. SAY which row is missing rather than dropping the
       // reference — "t-12 is not on the board" is the fact the human needs to
@@ -798,7 +819,10 @@ export class DecisionsView {
     this.clearBtn.disabled = true;
     try {
       const cleared = await clearNeedsYou(this.groupId);
-      this.view = { ...this.view, cleared_ms: cleared };
+      // `mergeCleared`, not a bare assign: a refresh may have resolved between
+      // the click and this line with an OLDER stamp, and the watermark only
+      // ever moves forward.
+      this.view = { ...this.view, cleared_ms: mergeCleared(cleared, this.view.cleared_ms) };
       this.render();
     } catch (err) {
       this.toast(String(err));

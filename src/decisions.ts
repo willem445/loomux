@@ -542,6 +542,25 @@ export function isCleared(settledMs: number, cleared: number): boolean {
   return cleared > 0 && settledMs <= cleared;
 }
 
+/** Reconcile a freshly-read watermark with the one already held.
+ *
+ *  **The watermark only ever moves FORWARD, so `max` is the rule and not a
+ *  heuristic**: `clear_needs_you` stamps `now`, and nothing anywhere lowers it.
+ *
+ *  This exists because the panel learns the stamp two ways — from a read, and
+ *  from the value `orch_needs_you_clear` hands back — and the second is not a
+ *  read, so it can be newer than a read already in flight. A refresh that
+ *  started before the human clicked **Clear completed** carries the PRE-clear
+ *  stamp, and assigning it wholesale would bring back the tail they just
+ *  dismissed, until some later event happened to re-read the marker.
+ *
+ *  `NeedsYouView`'s one-call design closes the two-READS version of this (rows
+ *  rendered against a stamp fetched a moment apart). This closes the same
+ *  symptom arriving from the local-apply side, which that design cannot see. */
+export function mergeCleared(fresh: number, held: number): number {
+  return Math.max(fresh, held);
+}
+
 /** The sort (#1151 decision D1): **urgency-pinned, then newest-first.**
  *
  *  Newest-first because the old oldest-first order forced a long scroll to
