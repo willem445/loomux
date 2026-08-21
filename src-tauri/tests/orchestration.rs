@@ -52788,9 +52788,12 @@ fn a_combined_parent_and_status_write_is_judged_on_the_board_it_produces() {
     assert_eq!(reg.get_task(&g, "t-4").unwrap().parent.as_deref(), Some("t-2"), "…parent included");
 
     // (c) A parent-ONLY write can push a status over, with no status in the
-    // patch at all — reparenting the last child out from under a container in a
-    // full status turns that container into countable work. The old
-    // `may_enter` predicate never even read the policy for this shape.
+    // patch at all — promoting a container's last child to TOP LEVEL turns
+    // that container into countable work, and nothing stops being counted in
+    // its place. (Re-parenting it under another row in the same status would
+    // NOT bite: the new parent stops being counted in the same write, which is
+    // case (a).) The old `may_enter` predicate never even read the policy for
+    // this shape.
     let (reg, _d, g) = wip_board("wip-b1-parent-only", REVIEW_TWO_ENFORCED, &["a", "b", "c", "d"]);
     reg.upsert_task(&g, "orch", Some("t-3"), parent_patch("t-2")).unwrap();
     for t in ["t-1", "t-2", "t-4"] {
@@ -52802,7 +52805,12 @@ fn a_combined_parent_and_status_write_is_judged_on_the_board_it_produces() {
         "control: t-1 and t-4 are the leaves in review; t-2 is a container"
     );
     let err = reg
-        .upsert_task(&g, "orch", Some("t-3"), parent_patch("t-1"))
+        .upsert_task(
+            &g,
+            "orch",
+            Some("t-3"),
+            TaskPatch { parent: Some(String::new()), ..Default::default() },
+        )
         .expect_err("moving t-2's only child away makes t-2 a third leaf in a review capped at 2");
     assert!(err.contains("review"), "the refusal names the status that went over: {err}");
     assert!(

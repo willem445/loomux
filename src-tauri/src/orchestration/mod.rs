@@ -26125,7 +26125,6 @@ impl OrchRegistry {
         } else {
             workflow::BoardPolicy::default()
         };
-            if may_enter { self.board_policy(group) } else { workflow::BoardPolicy::default() };
 
         let guard = self.tasks_lock.lock_safe();
         let mut tasks = self.tasks(group);
