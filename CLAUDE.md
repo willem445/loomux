@@ -301,10 +301,19 @@ narrow their ask back down to the original ticket on your own judgment.
   deltas, diffstats and run ids all go stale on the next commit. Read both
   totals out of the two runs' own logs, and check that the per-file deltas sum
   to the total you are claiming (#859, #862, #889, #907, #914, #921).
+- **A doc that partitions a manifest is reconciled by a script that parses BOTH
+  sides — never by hand arithmetic, never by a relative bump.** Diff the manifest
+  against the doc's own count column, cite the pinning test by placeholder
+  (`app_commands_len_is_<N>`, never today's literal — spelled out it goes stale
+  as a dangling symbol), and sweep the count *entity* across every doc surface
+  per the multi-surface rule (#878). Signature: the table's rows sum to **fewer**
+  than the manifest — a family missing its row outright, or existing rows
+  undercounting — so commands sit in it with no disposition and nobody
+  classified them (#1018, #1143; `doc/design/remote-engine-protocol.md` §5.4).
 - **Correcting a false claim is a multi-surface edit.** A design rationale here
   lives on several permanent surfaces at once — the code comment, the
   `doc/design/*.md` note, the PR body (which becomes the squash message), and
-  the `docs/` page when the claim is user-visible (the bullet above mandates
+  the `docs/` page when the claim is user-visible (the user-docs bullet mandates
   it) — so a claim deleted from one survives on the others. Verify the purge by
   grepping the *entity* the claim names, never the phrasing you rewrote.
   Signature: a re-review that clears a claim on two surfaces and finds it alive
