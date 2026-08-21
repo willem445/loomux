@@ -1165,6 +1165,20 @@ halves refuse on. `?per_page=100` (the API maximum) rides along as a
 *mitigation* — it makes the refusal rare — but a page size is a number GitHub
 may cap differently tomorrow, and the comparison is not.
 
+**Both reductions check the SHAPE of what they were handed, not just its
+contents.** The truncation clause rests on `total_count`, and jq sorts `null`
+below every number — so an absent key makes `.total_count > (.check_runs|length)`
+evaluate `null > N`, which is **false**, and the expression falls straight through
+to `green`. That is the same defect as the pagination one, one clause further in:
+an unstated assumption about the payload, failing open, in the clause whose whole
+premise is that unknown is never green. `has("total_count")` answers `truncated`
+instead. The status reduction carries the same guard over *its* inputs — `null |
+length` is `0` rather than an error, so an absent `statuses` would read as the
+definite claim "this commit has no legacy statuses", and an absent `state` would
+fall to the `else` and report `red`, refusing while saying something false. A
+guard reads every one of its inputs by one rule; one checked input beside an
+unchecked one is a bypass exactly the width of that asymmetry.
+
 **Only the check-runs half needs that clause, and the asymmetry is the tell.**
 `/commits/{ref}/status` carries a top-level `.state` that is GitHub's own rollup
 across *all* statuses, so `BASE_STATUS_JQ` is pagination-proof by construction.

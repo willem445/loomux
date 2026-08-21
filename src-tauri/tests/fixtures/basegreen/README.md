@@ -14,3 +14,22 @@ reading `green` (#1181 rev-lead, blocking).
 `checkruns-truncated.json` is the regression: `total_count` exceeds the runs on
 the page, and the failure is one of the omitted ones. Under the pre-#1181
 expression it reduced to `green`.
+
+## The shape fixtures (#1181 rev-lead NB5)
+
+`checkruns-no-total-count.json` and the `status-no-*.json` pair drop a field the
+reductions' own clauses rest on. Both endpoints document these as always
+present; the point is that the reduction must not *assume* it, because jq fails
+open on the absence rather than erroring:
+
+- `null > N` is **false** (jq sorts null below every number), so a missing
+  `total_count` skipped the truncation clause entirely and fell through to
+  `green` — round one's defect in different clothing;
+- `null | length` is **0**, not an error, so a missing `statuses` read as the
+  definite claim "no legacy statuses exist";
+- a missing `state` fell to the `else` and reported `red` — which refuses, but
+  says something false about the base while doing it.
+
+`checkruns-no-total-count-with-failure.json` is the negative control: a payload
+can be shape-broken AND carry a visible failure, and `red` still wins, because a
+failure loomux can actually see is the more actionable answer.

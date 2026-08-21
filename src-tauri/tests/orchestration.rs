@@ -39635,7 +39635,7 @@ fn gh_shim_harness_refuses_a_merge_onto_a_base_that_is_not_green() {
     // the fail-open inversion of this clause's entire premise.
     let (ok, err) = try_merge("truncated", "green");
     assert!(!ok, "a base whose check runs loomux cannot see in full must not be merged onto");
-    assert!(err.contains("more check runs than one API page"), "{err}");
+    assert!(err.contains("cannot account for all of the checks"), "{err}");
     // …from either surface, and it outranks a merely-pending sibling.
     assert!(!try_merge("green", "truncated").0);
     assert!(!try_merge("truncated", "pending").0);

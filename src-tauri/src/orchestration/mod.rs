@@ -1891,7 +1891,7 @@ if [ -f "$LOOMUX_GROUP_DIR/merge_gate" ]; then
         if [ "$bg_runs" = "red" ] || [ "$bg_stat" = "red" ]; then
           loomux_block_wf "base-not-green" "the gate requires base-green and the HEAD of '$base' is RED. Fix the base branch first — piling more work onto a broken branch is what this clause exists to stop"
         elif [ "$bg_runs" = "truncated" ] || [ "$bg_stat" = "truncated" ]; then
-          loomux_block_wf "base-unverifiable" "the gate requires base-green and the HEAD of '$base' has more check runs than one API page reports, so loomux cannot see all of them and will not guess about the ones it cannot. Re-run the merge once the run count settles; if this base permanently carries more than 100 checks, base-green cannot be enforced for it and should not be declared"
+          loomux_block_wf "base-unverifiable" "the gate requires base-green and loomux cannot account for all of the checks on the HEAD of '$base' — either it reports more check runs than one API page carries, or a payload arrived without the field that says how many there are. Either way loomux will not guess about the checks it cannot see. Re-run the merge once the run count settles; if this base permanently carries more than 100 checks, base-green cannot be enforced for it and should not be declared"
         elif [ "$bg_runs" = "pending" ] || [ "$bg_stat" = "pending" ]; then
           loomux_block_wf "base-not-green" "the gate requires base-green and the checks on the HEAD of '$base' have not finished. Wait for them: a base whose result is not in yet is not a base known to be green"
         elif [ "$bg_runs" = "none" ] && [ "$bg_stat" = "none" ]; then

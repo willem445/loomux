@@ -2618,6 +2618,26 @@ pub fn condition_supported(c: &str) -> bool {
 ///    nothing about the runs it omits, so it is not an answer.
 /// 3. `pending`, then `none`, then `green` — the residue, unchanged.
 ///
+/// **The shape the payload is ASSUMED to have is checked, not assumed (#1181
+/// rev-lead NB5).** `total_count` is documented as always present, and the
+/// truncation clause above rests entirely on it — but jq sorts `null` below
+/// every number, so an absent key makes `.total_count > (.check_runs|length)`
+/// evaluate `null > N`, which is **false**, and the expression falls straight
+/// through to `green`. That is round one's defect wearing a different hat: an
+/// unstated assumption about the payload, failing open, in the one clause whose
+/// whole premise is that unknown is never green. `has("total_count")` answers
+/// `truncated` instead, so a payload that cannot support the question refuses
+/// rather than passing.
+///
+/// **[`BASE_STATUS_JQ`] carries the same guard over ITS inputs**, which the
+/// review did not ask for and this repo's own rule requires: a guard reads every
+/// one of its inputs by one rule, and taking one signal from a checked shape and
+/// the next from an unchecked one is a bypass exactly the width of that
+/// asymmetry. `null | length` is `0` in jq rather than an error, so an absent
+/// `statuses` would read as the *definite* claim "this commit has no legacy
+/// statuses"; an absent `state` would fall to the `else` and report `red`,
+/// which refuses but says something false about the base while doing it.
+///
 /// **Only the check-runs half needs the truncation clause**, and the asymmetry
 /// is worth stating rather than leaving to be re-derived: the combined-status
 /// endpoint carries a top-level `.state` that is GitHub's own rollup across
@@ -2627,14 +2647,14 @@ pub fn condition_supported(c: &str) -> bool {
 ///
 /// Green is an ALLOW-list of conclusions (`success`, `neutral`, `skipped`), so
 /// a conclusion GitHub adds tomorrow reads as red rather than as green.
-pub const BASE_CHECK_RUNS_JQ: &str = "if any(.check_runs[]; .status == \"completed\" and .conclusion != \"success\" and .conclusion != \"neutral\" and .conclusion != \"skipped\") then \"red\" elif (.total_count > (.check_runs|length)) then \"truncated\" elif any(.check_runs[]; .status != \"completed\") then \"pending\" elif (.check_runs|length) == 0 then \"none\" else \"green\" end";
+pub const BASE_CHECK_RUNS_JQ: &str = "if any(.check_runs[]; .status == \"completed\" and .conclusion != \"success\" and .conclusion != \"neutral\" and .conclusion != \"skipped\") then \"red\" elif (has(\"total_count\")|not) then \"truncated\" elif (.total_count > (.check_runs|length)) then \"truncated\" elif any(.check_runs[]; .status != \"completed\") then \"pending\" elif (.check_runs|length) == 0 then \"none\" else \"green\" end";
 
 /// The combined-status reduction — see [`BASE_CHECK_RUNS_JQ`] for the shared
 /// contract and for why this one needs no truncation clause.
 ///
 /// `.state` is `pending` both when a context is pending and when there are no
 /// statuses at all, so the count is read first and answers `none`.
-pub const BASE_STATUS_JQ: &str = "if (.statuses|length) == 0 then \"none\" elif .state == \"success\" then \"green\" elif .state == \"pending\" then \"pending\" else \"red\" end";
+pub const BASE_STATUS_JQ: &str = "if (has(\"statuses\")|not) or (has(\"state\")|not) then \"truncated\" elif (.statuses|length) == 0 then \"none\" elif .state == \"success\" then \"green\" elif .state == \"pending\" then \"pending\" else \"red\" end";
 
 /// Why a merge gate is (not) satisfied — the pure spec the shim's shell mirrors,
 /// and what the `review_verdict` tool reports back to the reviewer that just voted.

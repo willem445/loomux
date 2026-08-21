@@ -1257,6 +1257,16 @@ fn the_base_green_reductions_reduce_real_payloads_to_the_right_word() {
         // still-building base "RED" would be a false sentence.
         ("checkruns-pending.json", "pending"),
         ("checkruns-none.json", "none"),
+        // #1181 rev-lead NB5: the truncation clause rests on `total_count`, and
+        // jq sorts `null` BELOW every number — so an absent key makes `null > N`
+        // false, skips that clause and falls through to `green`. Round one's
+        // defect in different clothing, which is why the shape is checked and
+        // not assumed.
+        ("checkruns-no-total-count.json", "truncated"),
+        // …and the negative control: a payload can be shape-broken AND carry a
+        // visible failure, and `red` still wins — a failure we can actually see
+        // is the more actionable answer.
+        ("checkruns-no-total-count-with-failure.json", "red"),
     ] {
         assert_eq!(reduce(BASE_CHECK_RUNS_JQ, fixture), want, "check-runs: {fixture}");
     }
@@ -1268,9 +1278,44 @@ fn the_base_green_reductions_reduce_real_payloads_to_the_right_word() {
         // would hold every merge forever.
         ("status-none.json", "none"),
         ("status-pending.json", "pending"),
+        // The same guard over THIS reduction's inputs — not asked for by the
+        // review, required by the repo's own rule that a guard reads every one of
+        // its inputs by one rule. `null | length` is 0 rather than an error, so an
+        // absent `statuses` would read as the definite claim "no legacy statuses
+        // exist"; an absent `state` would fall to the `else` and report `red`,
+        // refusing while saying something false about the base.
+        ("status-no-statuses.json", "truncated"),
+        ("status-no-state.json", "truncated"),
     ] {
         assert_eq!(reduce(BASE_STATUS_JQ, fixture), want, "status: {fixture}");
     }
+
+    // ── the two defects, EXECUTED rather than described ────────────────────
+    //
+    // Both review rounds found this expression failing OPEN on an assumption it
+    // never checked, and a green suite saw neither. So the superseded
+    // expressions are kept as literals and run against the same fixtures: the
+    // reds that justify the guards are part of the suite permanently, instead
+    // of living on a scratch branch someone has to go and find.
+    //
+    // These strings are HISTORY, deliberately NOT derived from the live
+    // constants — that is the whole point. Editing the constants must not
+    // touch them.
+    const BEFORE_ROUND_1: &str = "if (.check_runs|length) == 0 then \"none\" elif any(.check_runs[]; .status != \"completed\") then \"pending\" elif any(.check_runs[]; .conclusion != \"success\" and .conclusion != \"neutral\" and .conclusion != \"skipped\") then \"red\" else \"green\" end";
+    assert_eq!(
+        reduce(BEFORE_ROUND_1, "checkruns-truncated.json"),
+        "green",
+        "the pre-round-1 reduction called a TRUNCATED page green: six runs, three failing, page cut before them — the merge onto a red base this clause exists to stop"
+    );
+    const BEFORE_ROUND_2: &str = "if any(.check_runs[]; .status == \"completed\" and .conclusion != \"success\" and .conclusion != \"neutral\" and .conclusion != \"skipped\") then \"red\" elif (.total_count > (.check_runs|length)) then \"truncated\" elif any(.check_runs[]; .status != \"completed\") then \"pending\" elif (.check_runs|length) == 0 then \"none\" else \"green\" end";
+    assert_eq!(
+        reduce(BEFORE_ROUND_2, "checkruns-no-total-count.json"),
+        "green",
+        "round 1 guarded with a field it never checked for: jq sorts null below every number, so `null > N` is false and an absent total_count fell through to green — the same fail-open one clause further in"
+    );
+    // …and both fixtures answer `truncated` under the SHIPPED reduction, in the
+    // table above. Old expression green, new expression refuses: the before and
+    // after, executed on every run.
 }
 
 /// #1174: how the two base-check answers COMBINE. Driven through the real
