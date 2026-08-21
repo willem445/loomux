@@ -62,7 +62,7 @@ function tooltip(c: WipCap, fill: WipFill): string {
   const advice = ` Finish or re-status something in ${c.status} before starting more work.`;
   const enforced = c.enforce
     ? ` The orchestrator's own writes into ${c.status} are refused while it is full (board.enforce: true) — your edits here are not.`
-    : ` loomux warns the orchestrator about this; it does not refuse anything (set board.enforce: true in .loomux/workflow.yml to make it a refusal for agents).`;
+    : ` orrerix warns the orchestrator about this; it does not refuse anything (set board.enforce: true in .loomux/workflow.yml to make it a refusal for agents).`;
   return head + over + advice + enforced;
 }
 

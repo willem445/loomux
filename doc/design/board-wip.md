@@ -90,37 +90,61 @@ sometimes goes. Rejected, for three reasons:
 It is not foreclosed: an additive sibling key could express groups later without changing
 what is here.
 
-## Enforcement: one seam, judged on entry, counted on leaves
+## Enforcement: one seam, judged on the board the write produces
 
-The check sits in `upsert_task_from`, last in the run of pre-mutation validations that
-already refuses dependency cycles, hierarchy cycles and failed claim guards — after the
-claim guards deliberately, so a claim refused because the task is already held says *that*,
-not a board-pacing limit the caller was never going to reach. Nothing is persisted until
-`write_tasks` at the bottom, so a refusal leaves the board exactly as it was, which is the
-same contract every other refusal there keeps.
+The check sits in `upsert_task_from`, in the same run of validations that already refuses
+dependency cycles, hierarchy cycles, the ladder and failed claim guards. Nothing is persisted
+until `write_tasks`, so a refusal leaves the board exactly as it was — the contract every
+other refusal there keeps.
 
-**Only an entry is judged.** A patch that leaves a row where it already is — a note, a PR
-ref, a re-assertion of the current status — crosses nothing and is never refused. Neither
-is any move *out*. This is what keeps an over-limit board (a cap lowered under live work, a
-human edit, warn mode doing its job) workable rather than frozen: every write that relieves
-a cap still lands, and only adding to one is judged. A `claim` counts as an entry into
-`in-progress`, which is the motivating case — an orchestrator starting new work while
-review debt grows *is* a sequence of claims — and it reaches the status by its own route,
-so a check that read `patch.status` alone would have left exactly that case unguarded.
+**It judges the post-write board against the pre-write board, and that is a correction.**
+The first cut judged an *entry*: the target status read off the patch, the container topology
+read off the un-mutated board. That is CLAUDE.md's *"a guard reads every one of its inputs by
+one rule"* violated exactly — one signal from the patch, the next from the state it is about
+to replace — and it failed in both directions (rev-1 B1):
 
-**Only leaf rows are counted.** A container's status is a rollup of the work its children
+- A combined `parent` + `status` write, **the shape `upsert_task`'s own tool description
+  recommends**, was refused for a count that included the very row the write turns into a
+  container.
+- Clearing a `parent` while entering a status silently exceeded the cap, because the
+  ex-container left behind became countable work that nothing recounted — no refusal, no
+  audit, no notice, on the posture where the notice *is* the feature.
+- A `parent`-only write never consulted the policy at all, though reparenting the last child
+  out from under a row flips that row from container to leaf and raises its status's count.
+
+So there is no "entry" concept left. `wip_counts` takes the leaf count of every capped status
+before the apply; `wip_breaches` takes it again after, on the real mutated board, and reports
+a status that is **over its limit** *and* **higher than it was**. Both halves matter: the first
+is the cap, and the second is what keeps every write that relieves or ignores a full status
+landing — an edit to a row already sitting in one, and every move out of one. An over-limit
+board (a cap lowered under live work, a human edit, warn mode doing its job) stays workable
+rather than frozen, and it stays so for a reason that is now a property of the comparison
+rather than a special case in the code.
+
+A `claim` needs no special handling either: it sets `in-progress` on the row like any other
+write, and the post-write board says so. That it is the motivating case — an orchestrator
+starting new work while review debt grows *is* a sequence of claims — is why it gets its own
+test, not why it gets its own branch.
+
+**Only LEAF rows are counted.** A container's status is a rollup of the work its children
 carry, so counting a `feature` in `in-progress` *and* the three stories under it counts the
-same work twice, and makes `in-progress: 4` mean four items on a flat board and rather
-fewer on a nested one — a cap nobody can reason about. #1156 is making nesting the normal
-shape, which makes this the difference between a cap that means something and one that
-drifts with how the board happens to be structured. The row being written is exempt from
-the check entirely when it is itself a container, for the same reason: what it carries is
-counted where the work is.
+same work twice, and makes `in-progress: 4` mean four items on a flat board and rather fewer
+on a nested one — a cap nobody can reason about. #1156 made nesting the normal shape, which
+is what turns this from a nicety into the difference between a cap that means something and
+one that drifts with how the board happens to be structured.
 
-`wip_occupants` is the **one** definition of what a cap counts, shared by the seam that
-enforces it and by every surface that displays `n/N`. A second tally in the frontend would
-be a second definition, and the first time either side learned something about containers
-the board would be showing a number its own refusals disagree with.
+**Containment decides that, never `kind`** (#1156). A row is a container because something
+points at it. Counting by level instead would let any row exempt itself from every cap by
+declaring `kind: epic` — and `kind` is written by the same agent, on the same call, as the
+status, so a cap the caller can opt out of is not a cap. It also gives the honest answer for
+the shape the strict ladder makes common: a **childless** `feature` sitting in `in-progress`
+IS the work someone is doing and consumes a slot, and it stops consuming one the moment real
+slices are nested under it and counted in its place.
+
+`wip_occupants` is the **one** definition of what a cap counts, shared by the seam and by
+every display, and it takes the board it is asked about — there is deliberately no `skip`
+parameter, because a guard that subtracts a row out of one board while adding it to another
+in its head is precisely how the first cut came to read two inputs by two rules.
 
 ## Warn by default; enforce is opt-in
 
@@ -134,6 +158,15 @@ agent whose queue discipline it is has been told to read it.
 Warn-first is the right default because a limit is a *guess* until a team has run under it.
 A repo that discovers `review: 3` is wrong learns it from three notices, not from a week of
 refusals. The refusal is what you turn on once you believe the number.
+
+**`enforce` is board-wide, and the successor is per-status.** One bool covers every cap, so a
+repo cannot enforce `review` while merely warning on `blocked` — which matters because
+`blocked` is the one status where a refusal refuses an agent's *report of reality*, and the
+user docs recommend not enforcing it. Today the only way to follow that advice once you
+enforce anything is to leave `blocked` uncapped, which loses the warning too. A per-cap
+`enforce` is the additive fix (`wip: { blocked: { limit: 4, enforce: false } }` beside the
+bare-number form), and it is deliberately not in this change: it doubles the config surface
+for a refinement no repo has asked for yet, and nothing here forecloses it (rev-1 N4).
 
 ## Human writes are never refused
 
@@ -196,6 +229,34 @@ Three fills, not two: **full** (`count >= limit`) is the state the practice is a
 start nothing new — and **over** additionally means the board is somewhere a cap says it
 should not be. A two-state chip would say nothing until the board was already past the
 limit.
+
+## What the rebase onto #1151/#1152/#1156 settled
+
+**#1152's archive cannot hide work from a cap.** `clear_done_tasks` only ever stamps rows that
+are already `done`, and `done` is uncappable — so a cleared row is never sitting in a capped
+status. `restore_cleared_tasks` clears the stamp and touches no status, so a restore cannot
+put a status over a cap either. And the archive is read-time (`isCleared` requires the row to
+STILL be `done`), so re-statusing an archived row brings it straight back into the human's
+view *and* into the counts together — the chip can never show a number for work the board is
+hiding.
+
+**#1151's `sync_demo_item` stays inside `tasks_lock`.** Its own doc says so, and this change
+inserts the crossing audit next to it — audit under the lock, `drop(guard)`, then the notice,
+which is the ordering every other board notice already follows (delivery is best-effort and
+can block).
+
+**Deletes are not judged, deliberately.** `delete_task`/`delete_tasks`/`clear_done_tasks`
+remove or archive rows; removing the last child of a container turns that container into a
+leaf, so a delete *can* leave a status over a cap. Refusing a delete has no coherent relief
+action — the caller is already removing work — and the board is not silent about the result:
+the chip on the header recomputes from the same `wip_occupants` on the next refresh and shows
+the over-cap state, and the next write that raises that status reports it. The boundary is
+stated here rather than discovered.
+
+**The crossing notice repeats, and that is intended.** A board sitting at 5/2 in warn mode
+notifies on every subsequent write that raises the count. Suppressing repeats would trade
+away the signal on the posture where the signal is the whole feature; at real board sizes it
+is a handful of lines, and the cure for the noise is to relieve the status (rev-1 N5).
 
 ## What this deliberately does not do
 
