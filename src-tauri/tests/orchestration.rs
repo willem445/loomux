@@ -52144,7 +52144,7 @@ fn an_enforced_cap_refuses_an_agent_entry_and_writes_nothing() {
     // Actionable, not merely correct: the cap, the count, and WHICH rows are in
     // the way, so "finish one of these" needs no second call to act on.
     assert!(err.contains("review"), "the refusal names the status: {err}");
-    assert!(err.contains('2'), "…the cap: {err}");
+    assert!(err.contains("capped at 2"), "…the cap: {err}");
     assert!(err.contains("t-1") && err.contains("t-2"), "…and the rows already there: {err}");
     assert!(err.contains("t-3"), "…and the row it refused: {err}");
     assert!(
@@ -52169,6 +52169,8 @@ fn an_enforced_cap_refuses_an_agent_entry_and_writes_nothing() {
 #[test]
 fn an_enforced_cap_never_refuses_the_human_even_where_it_refuses_the_agent() {
     let (reg, _d, g) = wip_board("wip-human", REVIEW_TWO_ENFORCED, &["a", "b", "c", "d"]);
+    let orch = reg.spawn_agent(&g, Role::Orchestrator, "orch", "run", false, None).unwrap();
+    pause_with_pane(&reg, &g, &orch.id, 72);
     for t in ["t-1", "t-2"] {
         reg.upsert_task(&g, "orch", Some(t), status_patch("review")).unwrap();
     }
@@ -52190,6 +52192,17 @@ fn an_enforced_cap_never_refuses_the_human_even_where_it_refuses_the_agent() {
         .expect("the human's crossing is audited like anyone's");
     assert_eq!(crossing.detail["origin"], "human");
     assert_eq!(crossing.detail["enforce"], true, "…on a config that DOES enforce, for agents");
+
+    // …and the NOTICE says whose edit it was, which is the half that changes
+    // what the orchestrator does about it: its own crossing is its to unwind,
+    // the human's is a board to re-read rather than argue with (rev-1 N5).
+    let notices = delivered_texts(&reg, &g);
+    assert!(
+        notices
+            .iter()
+            .any(|t| t.contains("WIP limit crossed") && t.contains("the human's board edit to t-3")),
+        "the crossing notice must name the human as its author: {notices:?}"
+    );
 }
 
 /// Only an ENTRY is judged. Three cases in one test because they are one
@@ -52354,10 +52367,149 @@ fn a_refusal_that_cannot_name_every_occupant_says_how_many_it_left_out() {
     let err = reg
         .upsert_task(&g, "orch", Some("t-7"), status_patch("review"))
         .expect_err("the seventh entry into a cap of 6 must be refused");
-    assert!(err.contains("already holds 6"), "the count is the REAL one, not the named subset: {err}");
+    assert!(
+        err.contains("holding 7"),
+        "the count is the REAL post-write one, not the named subset: {err}"
+    );
     assert!(err.contains("t-1") && err.contains("t-4"), "the first four are named: {err}");
     assert!(
         err.contains("and 2 more"),
         "…and the two it could not name are admitted rather than dropped: {err}"
     );
+}
+
+/// **rev-1 B1: the guard reads the whole post-write board, by one rule.**
+///
+/// The first cut derived the target status from the patch and the container
+/// topology from the un-mutated board, which is CLAUDE.md's "a guard reads every
+/// one of its inputs by one rule" violated exactly — and it failed in BOTH
+/// directions. All four crossings of {this row reparented in / out} x {the
+/// target status full / not} are pinned here, in one test, because the property
+/// is a relationship between the two axes: a "refuse everything" guard passes
+/// (a) and (c) alone, and a "refuse nothing" guard passes (b) and (d) alone.
+#[test]
+fn a_combined_parent_and_status_write_is_judged_on_the_board_it_produces() {
+    // (a) The false REFUSAL. `review: 2` full with two leaves; the write nests
+    // the new row under one of them, which turns that row into a container and
+    // frees the slot in the same write. The old guard counted the pre-write
+    // leaves and refused, naming as an occupant the very row it was about to
+    // stop counting.
+    let (reg, _d, g) = wip_board("wip-b1-in", REVIEW_TWO_ENFORCED, &["a", "b", "c"]);
+    for t in ["t-1", "t-2"] {
+        reg.upsert_task(&g, "orch", Some(t), status_patch("review")).unwrap();
+    }
+    let landed = reg.upsert_task(
+        &g,
+        "orch",
+        Some("t-3"),
+        TaskPatch {
+            parent: Some("t-2".into()),
+            status: Some("review".into()),
+            ..Default::default()
+        },
+    );
+    assert!(
+        landed.is_ok(),
+        "t-2 becomes a container in this very write, so review holds two LEAVES afterwards \
+         (t-1, t-3) and the write is within the cap: {landed:?}"
+    );
+    assert!(
+        !wip_audit_actions(&reg, &g).contains(&"task-wip-crossed".to_string()),
+        "…and it is not a crossing either — warn mode must not announce one"
+    );
+
+    // (b) The false PERMIT. Same cap. `t-2` is a container of `t-4`, so it is
+    // not counted; clearing that parent AND entering review adds TWO leaves to
+    // review in one write (`t-4` arriving, `t-2` becoming countable). The old
+    // guard counted one and let it through with no refusal, no audit and no
+    // notice — under warn mode the notice is the entire feature.
+    let (reg, _d, g) = wip_board("wip-b1-out", REVIEW_TWO_ENFORCED, &["a", "b", "c", "d"]);
+    reg.upsert_task(&g, "orch", Some("t-4"), parent_patch("t-2")).unwrap();
+    for t in ["t-1", "t-2"] {
+        reg.upsert_task(&g, "orch", Some(t), status_patch("review")).unwrap();
+    }
+    assert_eq!(
+        reg.wip_status_for_agents(&g)[0]["count"],
+        1,
+        "control: t-2 is a container, so review holds one leaf and there is room"
+    );
+    let err = reg
+        .upsert_task(
+            &g,
+            "orch",
+            Some("t-4"),
+            TaskPatch {
+                parent: Some(String::new()), // the clear
+                status: Some("review".into()),
+                ..Default::default()
+            },
+        )
+        .expect_err("clearing the parent AND entering review adds two leaves to a cap of 2");
+    assert!(err.contains("holding 3"), "the refusal counts the post-write board: {err}");
+    assert_eq!(
+        reg.get_task(&g, "t-4").unwrap().status,
+        "queued",
+        "and the refused write left the row alone"
+    );
+    assert_eq!(reg.get_task(&g, "t-4").unwrap().parent.as_deref(), Some("t-2"), "…parent included");
+
+    // (c) A parent-ONLY write can push a status over, with no status in the
+    // patch at all — reparenting the last child out from under a container in a
+    // full status turns that container into countable work. The old
+    // `may_enter` predicate never even read the policy for this shape.
+    let (reg, _d, g) = wip_board("wip-b1-parent-only", REVIEW_TWO_ENFORCED, &["a", "b", "c", "d"]);
+    reg.upsert_task(&g, "orch", Some("t-3"), parent_patch("t-2")).unwrap();
+    for t in ["t-1", "t-2", "t-4"] {
+        reg.upsert_task(&g, "orch", Some(t), status_patch("review")).unwrap();
+    }
+    assert_eq!(
+        reg.wip_status_for_agents(&g)[0]["count"],
+        2,
+        "control: t-1 and t-4 are the leaves in review; t-2 is a container"
+    );
+    let err = reg
+        .upsert_task(&g, "orch", Some("t-3"), parent_patch("t-1"))
+        .expect_err("moving t-2's only child away makes t-2 a third leaf in a review capped at 2");
+    assert!(err.contains("review"), "the refusal names the status that went over: {err}");
+    assert!(
+        err.contains("holding 3"),
+        "…and counts the board this write produces, not the one it started from: {err}"
+    );
+
+    // (d) The negative control the three above need: a parent write that moves
+    // nothing into a capped status is not refused, so none of this is a guard
+    // that simply says no to reparenting.
+    let (reg, _d, g) = wip_board("wip-b1-control", REVIEW_TWO_ENFORCED, &["a", "b", "c"]);
+    reg.upsert_task(&g, "orch", Some("t-1"), status_patch("review")).unwrap();
+    assert!(
+        reg.upsert_task(&g, "orch", Some("t-3"), parent_patch("t-2")).is_ok(),
+        "a reparent among queued rows touches no cap and must land"
+    );
+}
+
+/// rev-1 N3: the cost claim the PR makes out loud — a write that cannot move a
+/// count does not read the workflow file — pinned on the predicate that decides
+/// it, since the read itself has no observable effect to assert on.
+#[test]
+fn the_wip_guard_reads_the_policy_only_for_a_write_that_could_move_a_count() {
+    let note = TaskPatch { note: Some("just a note".into()), ..Default::default() };
+    assert!(
+        !loomux_lib::orchestration::wip_may_change(false, &note),
+        "a note on an existing row cannot change any count, so it must not pay a YAML parse"
+    );
+    let title = TaskPatch { title: Some("renamed".into()), ..Default::default() };
+    assert!(!loomux_lib::orchestration::wip_may_change(false, &title));
+    let pr = TaskPatch { pr: Some("#9".into()), ..Default::default() };
+    assert!(!loomux_lib::orchestration::wip_may_change(false, &pr));
+
+    // …and every shape that CAN move one does read it. `parent` is the one the
+    // first cut missed (rev-1 B1): it moves no row's status and changes the
+    // counts anyway, by changing which rows are leaves.
+    assert!(loomux_lib::orchestration::wip_may_change(true, &note), "a new row enters a status");
+    assert!(loomux_lib::orchestration::wip_may_change(false, &status_patch("review")));
+    assert!(loomux_lib::orchestration::wip_may_change(false, &parent_patch("t-1")));
+    assert!(loomux_lib::orchestration::wip_may_change(
+        false,
+        &TaskPatch { claim: true, ..Default::default() }
+    ));
 }
