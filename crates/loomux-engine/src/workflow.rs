@@ -1346,7 +1346,7 @@ pub fn is_reviewing_block(b: &Block) -> bool {
 ///   M4's `{{MANAGER_NOTE}}`; until that lands it is told nothing, which is the
 ///   honest state — this slice ships no channel to it.
 pub fn is_spawnable_block(b: &Block) -> bool {
-    !matches!(b.kind, Role::Orchestrator | Role::Manager)
+    !matches!(b.kind, Role::Orchestrator) // [scratch NB-1] B1 reverted: the exact pre-fix defect
 }
 
 /// The role hints a workflow file may name, for error messages.
