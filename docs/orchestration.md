@@ -518,14 +518,39 @@ under another one never means "after it". What nesting *does* carry is inherited
 subtask isn't startable while a container above it still has unfinished dependencies of its own
 (see below).
 
-Each task can carry an advisory **kind** label — `epic`, `feature`, `story`, or `task` — set by
-the orchestrator, or by you from the board's own **🏷** picker, to show the level a container
-sits at. It's a label only: nothing enforces that a `story` sits under a `feature` rather than
-straight under an `epic`, and a container is ordinary claimable work like any other task, not a
-special row.
+Each task can carry a **level** — `epic`, `feature`, `story`, or `task` — set by the
+orchestrator, or by you from the board's own **🏷** picker. The level is **enforced**, not a
+label: an epic sits at the top level and inside nothing, a feature sits inside an epic, a story
+inside a feature, and a task inside a story. Writes that break that are refused with an error
+saying which level is missing and how to fix it. A container is still ordinary claimable work
+like any other task, not a special row.
 
-Two rules about nesting are backend behavior — they hold however the board reaches you, the UI
-below included:
+The task level is optional in the sense that matters: a story with no tasks under it is finished
+work, not a gap. Break a story down into tasks only when the pieces are worth tracking
+separately.
+
+**A task with no level is exempt from all of that**, permanently — it can sit anywhere and
+contain anything. That's what a plain board is: if your work has no hierarchy worth describing,
+never set a level and the rules above are invisible to you. It's also what every board created
+before levels were enforced looks like, which is why nothing on an existing board broke: the
+rules are checked only when a write actually *sets* a level or moves a task, so an older task
+whose shape predates them stays fully editable — status, notes, assignee, dependencies, all of
+it. Only a write that re-states that task's level or container has to resolve it, and the error
+tells you both ways: nest it where the level belongs, or clear the level.
+
+The one thing the exemption doesn't allow is a *levelled* task inside an unlevelled one — "inside
+a feature" is a claim about the container, so the container needs the level first.
+
+**Task ids show the level a task was created at** — `e-3` for an epic, `f-4` a feature, `us-5` a
+story, `t-6` a task or a plain row. The numbers come from one counter shared across all four, so
+no two tasks ever share a number and a mistyped prefix names nothing rather than someone else's
+task. Changing a task's level later never renames it: everything that points at a task — other
+tasks' dependencies, the audit log, an agent's own notes, your memory — points at that string. On
+a task whose level changed after it was created, the **badge** is the truth and the prefix just
+says where it started.
+
+Three more rules about nesting are backend behavior — they hold however the board reaches you,
+the UI below included:
 
 - Deleting a container **promotes** its subtasks rather than deleting or orphaning them: they
   move up to the nearest container still on the board (or to the top level, if the whole chain
@@ -533,18 +558,28 @@ below included:
   with it.
 - Nesting can run at most 4 levels deep; a write that would go deeper is refused with an error
   explaining why, the same way an invalid dependency write is.
+- Deleting a container can leave a subtask somewhere the level rules wouldn't have put it — a
+  feature whose epic you delete ends up at the top level. That's deliberate: the alternatives are
+  refusing your delete, deleting the work inside, or silently stripping the level off the
+  survivor. The task reads and edits normally; it's the next time you change *its* level or
+  container that you'll be asked to resolve it.
 
 Board controls for nesting:
 
 - A **⤵ nest** picker on a row lets you choose which other task it sits inside, or promote it
-  back to the top level.
+  back to the top level. It offers only containers the level rules allow — on a levelled row that
+  is the level directly above it, and on an unlevelled row it's every other task. "Top level" is
+  offered only where the row's own level permits it, so a feature is never offered a move its
+  epic-shaped rule would refuse.
 - Rows nest visually under their container, indented one step per level, with a **collapse
   chevron** on any row that has subtasks — collapsing hides the whole subtree, not just its
   direct children, so a grandchild is never left stranded above its own container.
-- The **kind** label above shows on the row as a badge, so you can see at a glance which rows
-  are containers and at what level. A **🏷** picker next to the nest control lets you set or
-  change it directly — the three levels the row doesn't already carry, plus a clear option once
-  it carries one.
+- The **level** shows on the row as a badge, so you can see at a glance which rows are containers
+  and at what level. A **🏷** picker next to the nest control lets you set or change it directly —
+  offering only the levels this row could legally take where it sits, plus the clear when that is
+  legal too. It can come back **empty**, and that's information rather than a bug: a row inside an
+  unlevelled container has no legal level until the container gets one, and a container holding
+  levelled rows can't drop its own level while they're inside it.
 - The **▲/▼ priority arrows now move a task among its siblings**, not through the whole board:
   the first subtask of a container has nothing above it to swap with, so its ▲ is greyed out
   even though there are rows higher up the board. Moving a container moves everything inside it

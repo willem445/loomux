@@ -31,9 +31,10 @@ import {
   isAwaitingHuman,
   isReady,
   KINDS,
-  kindCandidates,
+  kindPickerChoices,
+  levelRuleText,
   nextPicker,
-  parentCandidates,
+  parentPickerChoices,
   pickerIsOpen,
   QUEUED_STATUS,
   reorderWithSubtree,
@@ -99,9 +100,10 @@ export interface OrchTask {
    *  skips it when absent, so every pre-#958 board arrives with no key. The
    *  board derives the whole tree from this field; nothing gates on it. */
   parent?: string | null;
-  /** Advisory Agile level — one of `KINDS` (#958). Advisory means the board
-   *  only labels the row with it: a story directly inside an epic is legal,
-   *  and no affordance here changes behaviour based on it. */
+  /** Agile level — one of `KINDS` (#958), enforced since #1156: a levelled row
+   *  must sit directly inside the level above it, so this field decides what
+   *  the nest and level pickers may offer. Absent = no level, which is exempt
+   *  from the ladder and legal anywhere. */
   kind?: string | null;
   /** Worktree path where a demo of this row lives (#1091 slice B) — recorded
    *  by the orchestrator on a `prototype`/`human-testing` row so the NEEDS-YOU
@@ -126,7 +128,8 @@ export interface OrchTask {
  *  "nothing chosen yet" placeholder; it is translated to the empty string —
  *  which is what `orch_upsert_task` reads as "clear the container" — at the
  *  moment of the write, and never travels to the backend as an id. Ids are
- *  monotonic `t-<n>`, so no row can ever collide with this value. */
+ *  `<prefix>-<n>` over a closed set of prefixes (#1156), so no row can ever
+ *  collide with this value. */
 const TOP_LEVEL_CHOICE = "__top_level__";
 
 /** The kind picker's "clear the label" option (#958 slice K) — same sentinel
@@ -1093,18 +1096,22 @@ export class TasksView {
     this.render();
   }
 
-  /** The "⤵ nest under…" picker (#958): every other row, plus a top-level
-   *  escape when this one is already inside something.
+  /** The "⤵ nest under…" picker (#958): every row that could legally contain
+   *  this one (#1156), plus a top-level escape when leaving its container is
+   *  itself legal.
    *
-   *  Like the dep picker it does NOT pre-filter the choices the backend would
-   *  refuse — its own descendants (a cycle) or a pick that would bust the
-   *  depth cap. That rule lives in one authoritative place, inside the
-   *  backend's lock, and its error names the path; a second copy here could
-   *  only ever disagree with it, and it surfaces through the same toast. */
+   *  Like the dep picker it still does NOT pre-filter the choices the backend
+   *  would refuse for a reason derived from the whole tree — its own
+   *  descendants (a cycle) or a pick that would bust the depth cap. Those rules
+   *  live in one authoritative place, inside the backend's lock, and their
+   *  errors name the path; a second copy here could only ever disagree, and it
+   *  surfaces through the same toast. `parentPickerChoices` decides everything
+   *  this picker shows, so the legality question is answered DOM-free and once
+   *  (see its doc for why the ladder is the one rule that is mirrored). */
   private renderParentPicker(t: OrchTask): HTMLElement {
-    const options = parentCandidates(t, this.tasks);
-    if (options.length === 0 && !t.parent) {
-      return el("span", "task-links-label", "no other task to nest under");
+    const { candidates: options, topLevel, emptyLabel } = parentPickerChoices(t, this.tasks);
+    if (options.length === 0 && !topLevel) {
+      return el("span", "task-links-label", emptyLabel);
     }
     const sel = document.createElement("select");
     sel.className = "task-dep-picker parent";
@@ -1112,10 +1119,12 @@ export class TasksView {
     placeholder.value = "";
     placeholder.textContent = "⤵ nest under…";
     sel.appendChild(placeholder);
-    if (t.parent) {
+    if (topLevel) {
       // The clear. `orch_upsert_task` reads an EMPTY parent as "take it to the
       // top level" (omitting the field means "leave it alone"), so the sentinel
       // below is mapped to "" on the way out — never sent as a literal id.
+      // Offered only when the row's own level permits top level (#1156): a
+      // `feature` promoted out of its epic is a write the backend refuses.
       const top = document.createElement("option");
       top.value = TOP_LEVEL_CHOICE;
       top.textContent = "↥ top level (leave its container)";
@@ -1156,26 +1165,31 @@ export class TasksView {
     return sel;
   }
 
-  /** The "🏷 set kind…" picker (#958 slice K): the three Agile levels this row
-   *  doesn't already carry, plus a clear option once it carries one. `kind` is
-   *  advisory-only (§2 of doc/design/task-hierarchy.md) — this picker changes
-   *  a label and nothing else, same as the badge it sits under says. Unlike
-   *  the nest/dep pickers there is no authoritative backend rule this could
-   *  disagree with: `kindCandidates` and the backend's own `TASK_KINDS` check
-   *  are both just "one of the four known levels", so nothing is deliberately
-   *  left unfiltered here. */
+  /** The "🏷 set kind…" picker (#958 slice K): the Agile levels this row could
+   *  legally take where it sits (#1156), plus the clear when that is legal too.
+   *
+   *  Since #1156 the level is enforced rather than a label, so this picker
+   *  offers only what a write would accept — including, on a row whose
+   *  container or children rule every level out, NOTHING. `kindPickerChoices`
+   *  answers all of that DOM-free; the backend remains the authority and its
+   *  refusal still surfaces through `mutate`'s toast. */
   private renderKindPicker(t: OrchTask): HTMLElement {
-    const options = kindCandidates(t);
+    const { candidates: options, clear: mayClear } = kindPickerChoices(t, this.tasks);
+    if (options.length === 0 && !mayClear) {
+      return el("span", "task-links-label", "no level this row can take here");
+    }
     const sel = document.createElement("select");
     sel.className = "task-dep-picker kind";
     const placeholder = document.createElement("option");
     placeholder.value = "";
     placeholder.textContent = "🏷 set kind…";
     sel.appendChild(placeholder);
-    if (t.kind) {
+    if (mayClear) {
       // The clear. `orch_upsert_task` reads an EMPTY kind as "clear the
       // label" (omitting the field means "leave it alone"), so the sentinel
       // below is mapped to "" on the way out — never sent as a literal kind.
+      // Withheld when this row holds levelled children (#1156): clearing would
+      // leave them inside an unlevelled container, which the backend refuses.
       const clear = document.createElement("option");
       clear.value = CLEAR_KIND_CHOICE;
       clear.textContent = "— clear (plain task)";
@@ -1446,13 +1460,14 @@ export class TasksView {
       top.appendChild(chip);
     }
 
-    // Advisory Agile level (#958): a label, nothing more — no affordance on
-    // this board reads it, and the backend gates nothing on it either.
+    // The Agile level (#958). Enforced since #1156 — where this row may sit is
+    // decided by it — but still nothing outside the board reads it: no
+    // permission, no merge decision, and not the claim guard.
     if (t.kind) {
       const known = (KINDS as readonly string[]).includes(t.kind);
       const kind = el("span", `task-chip kind k-${known ? t.kind : "unknown"}`, t.kind);
       kind.title = known
-        ? `Agile level: ${t.kind} — advisory only, it labels this row and nothing more`
+        ? `Agile level: ${t.kind} — ${levelRuleText(t.kind)}`
         : `${t.kind} is not one of ${KINDS.join(" | ")} — only a hand-edited tasks.json can hold it`;
       top.appendChild(kind);
     }
@@ -1678,8 +1693,8 @@ export class TasksView {
     // most rows) the only way in.
     const kindBtn = el("button", "task-btn kindpick", "🏷") as HTMLButtonElement;
     kindBtn.title = t.kind
-      ? `Change this row's Agile level (currently ${t.kind}) — advisory only, a label and nothing more`
-      : "Set this row's Agile level (epic / feature / story / task) — advisory only, a label and nothing more";
+      ? `Change this row's Agile level (currently ${t.kind}) — ${levelRuleText(t.kind)}`
+      : "Set this row's Agile level — epic (top level) ⊃ feature ⊃ story ⊃ task; a row with no level may sit anywhere";
     kindBtn.addEventListener("click", () => this.togglePicker(t.id, "kind"));
     top.appendChild(kindBtn);
 

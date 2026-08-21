@@ -8973,18 +8973,198 @@ pub const PROTOTYPE_STATUS: &str = "prototype";
 /// `TASK_STATUSES` is — the wire/JSON form stays obvious — and validated on
 /// every write the same way.
 ///
-/// The levels are ADVISORY: nothing enforces that a `story` sits under a
-/// `feature` rather than straight under an `epic`. Enforcement would buy no
-/// data integrity (every reader needs the tree, not ladder discipline), fight
-/// the dominant real shape (a feature plus its slices), and make reparenting
-/// and kind-less migrated rows harder — and it stays one write-time check to
-/// add later if the discipline is ever wanted, which is the cheap direction.
+/// The levels are STRICT since #1156: an epic is top-level only, and a
+/// feature/story/task must sit directly inside the level above it
+/// (`ladder_rule`). #958 shipped them ADVISORY and argued for it; the
+/// human overturned that from using it — see `doc/design/task-hierarchy.md` §2
+/// for both sides of the argument. A KIND-LESS row is exempt from the ladder
+/// and always will be (§2.1): that is what keeps a flat board — the shape a
+/// group that runs no Agile at all wants, and the shape every pre-#1156 board
+/// already has — fully functional.
 pub const TASK_KINDS: [&str; 4] = ["epic", "feature", "story", "task"];
 
+/// Where a row of a given kind is allowed to sit (#1156) — the whole ladder,
+/// as data. `ladder_rule` is the ONLY place this table exists on this
+/// side, so the write path and every error string it produces cannot drift
+/// apart; the board's mirror of it (`src/taskboard.ts`) is what the picker
+/// filters on, and the two are held together by ONE test — `the board's ladder
+/// table is the backend's, read out of the Rust source`
+/// (`test/taskboard.test.ts`), which reads the arms below out of this file's
+/// source. Not `the_ladder_table_is_pinned_on_the_rust_side`, which despite its
+/// name only asserts this side against Rust literals.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LadderRule {
+    /// No rule at all — a kind-less row, and any value outside `TASK_KINDS`
+    /// (only reachable by hand-editing `tasks.json`, since a write is refused).
+    Exempt,
+    /// Top level only: it may not sit inside anything.
+    TopLevelOnly,
+    /// It MUST sit directly inside a row of exactly this kind. Required, not
+    /// merely constrained: a `story` at top level is refused, because "a story
+    /// breaks a feature down" is the claim the level makes, and a story that
+    /// breaks nothing down is the shape #1156 exists to stop.
+    Inside(&'static str),
+}
+
+/// The strict Agile ladder (#1156), and the one function that knows it.
+pub fn ladder_rule(kind: Option<&str>) -> LadderRule {
+    match kind {
+        Some("epic") => LadderRule::TopLevelOnly,
+        Some("feature") => LadderRule::Inside("epic"),
+        Some("story") => LadderRule::Inside("feature"),
+        Some("task") => LadderRule::Inside("story"),
+        _ => LadderRule::Exempt,
+    }
+}
+
+/// `epic` → `an epic`, `feature` → `a feature` — the errors below read as
+/// sentences, and a level's article is a property of the word, not of the
+/// caller.
+fn a_level(kind: &str) -> String {
+    let article = if kind.starts_with(['a', 'e', 'i', 'o', 'u']) { "an" } else { "a" };
+    format!("{article} {kind}")
+}
+
+/// Judge ONE containment edge against the ladder: a row of `kind` sitting
+/// inside `parent_id` (#1156). `Ok(())` or the refusal, WITHOUT a prefix — the
+/// call sites add one, because the same edge is judged from two directions and
+/// the caller is what says which.
+///
+/// `parent_kind` is a nested option on purpose, and each layer means something
+/// different: the OUTER `None` is "`parent_id` names no row on this board" (a
+/// hand-edited dangling pointer — writing a kind onto such a row is refused
+/// rather than tolerated, because the write is a fresh assertion about a
+/// container nobody can resolve), and the INNER `None` is "that row exists and
+/// carries no level". It is ignored entirely when `parent_id` is `None`.
+///
+/// Every refusal NAMES THE FIX, the way the cycle refusal names the path: an
+/// error that only says no leaves the caller guessing between "nest it" and
+/// "clear the kind", which are the only two moves that ever resolve one.
+fn check_ladder(
+    row: &str,
+    kind: Option<&str>,
+    parent_id: Option<&str>,
+    parent_kind: Option<Option<&str>>,
+) -> Result<(), String> {
+    let Some(kind) = kind else { return Ok(()) };
+    match ladder_rule(Some(kind)) {
+        // A hand-edited fifth level lands here too. It is already visibly
+        // broken on the board (#958 §9) and no ladder rule can name where it
+        // belongs, so the write path judges it exactly as it judges a kind-less
+        // row rather than inventing a position for it.
+        LadderRule::Exempt => Ok(()),
+        LadderRule::TopLevelOnly => match parent_id {
+            None => Ok(()),
+            Some(p) => Err(format!(
+                "{row} is {}, and {} is top-level only — take it out of {p}, or clear its level",
+                a_level(kind),
+                a_level(kind)
+            )),
+        },
+        LadderRule::Inside(want) => {
+            let Some(p) = parent_id else {
+                return Err(format!(
+                    "{row} is {}, which must sit inside {} — it is at top level; nest it under {} \
+                     or clear its level",
+                    a_level(kind),
+                    a_level(want),
+                    a_level(want)
+                ));
+            };
+            match parent_kind {
+                Some(Some(k)) if k == want => Ok(()),
+                Some(Some(k)) => Err(format!(
+                    "{row} is {}, which must sit inside {} — {p} is {}; nest it under {} or clear \
+                     its level",
+                    a_level(kind),
+                    a_level(want),
+                    a_level(k),
+                    a_level(want)
+                )),
+                Some(None) => Err(format!(
+                    "{row} is {}, which must sit inside {} — {p} carries no level; make {p} {} \
+                     first, or clear this row's level",
+                    a_level(kind),
+                    a_level(want),
+                    a_level(want)
+                )),
+                None => Err(format!(
+                    "{row} is {}, which must sit inside {} — its container {p} is not on this \
+                     board; nest it under {} or clear its level",
+                    a_level(kind),
+                    a_level(want),
+                    a_level(want)
+                )),
+            }
+        }
+    }
+}
+
+/// The id prefix a NEW row of each kind is minted with (#1156) — `e-3`, `f-4`,
+/// `us-5`, `t-6`. Kind-less rows keep `t-`, which is what every id on every
+/// board minted before this existed already is.
+///
+/// The prefix is a fact about how a row was MINTED, never a live assertion of
+/// its level: re-kinding a row does not rewrite its id, because ids are
+/// referenced by `deps`/`related`/`parent`, by the audit log, by agents' stored
+/// session state and by a human's memory, and rewriting one would break every
+/// one of those at once. The `kind` field is the truth; the badge renders it
+/// beside the id (`doc/design/task-hierarchy.md` §2.2).
+fn kind_id_prefix(kind: Option<&str>) -> &'static str {
+    match kind {
+        Some("epic") => "e",
+        Some("feature") => "f",
+        Some("story") => "us",
+        _ => "t",
+    }
+}
+
+/// The prefixes `next_task_id` counts. Kept in one place so the high-water scan
+/// and the mint can never recognize different id spaces.
+const TASK_ID_PREFIXES: [&str; 4] = ["e", "f", "us", "t"];
+
+/// The next id for a new row of `kind` (#1156): a SHARED high-water mark across
+/// all four prefixes, so every number on a board is used once no matter which
+/// prefix carries it.
+///
+/// Shared, not per-prefix, and the reason is misreference. With a counter per
+/// prefix a board holds `e-1`, `f-1`, `us-1` and `t-1` at once, so an agent (or
+/// a human) that remembers "1" and guesses the prefix lands on a REAL BUT WRONG
+/// row — a silent mis-link in `deps`/`parent`, the exact class this feature is
+/// otherwise trying to make legible. Sharing the counter makes a wrong prefix
+/// name nothing, so it comes back as `unknown task`. The cost is cosmetic: the
+/// first epic on a board of 40 legacy rows is `e-41`, not `e-1`.
+///
+/// No randomness anywhere near this (CLAUDE.md constraint 2): it is `max + 1`
+/// over what the board already holds, which is also what makes it survive a
+/// hand-edited `tasks.json` without a registry-side counter to keep in sync.
+fn next_task_id(kind: Option<&str>, tasks: &[Task]) -> String {
+    let max: u32 = tasks.iter().filter_map(|t| task_id_number(&t.id)).max().unwrap_or(0);
+    format!("{}-{}", kind_id_prefix(kind), max + 1)
+}
+
+/// The number in a minted id, or `None` for anything else on the board (a
+/// hand-written `note-for-later`, an id from some future prefix). Ignoring what
+/// it cannot parse is what the pre-#1156 `t-`-only scan already did.
+fn task_id_number(id: &str) -> Option<u32> {
+    let (prefix, n) = id.split_once('-')?;
+    if !TASK_ID_PREFIXES.contains(&prefix) {
+        return None;
+    }
+    n.parse().ok()
+}
+
 /// How deep the container chain may run (#958) — the epic → feature → story →
-/// task ceiling. A hard cap where the levels themselves are advisory, because
-/// this is what bounds every rollup and render walk over the tree; without it
-/// a hand-built chain could make an O(depth) walk arbitrarily expensive.
+/// task ceiling. It bounds every rollup and render walk over the tree; without
+/// it a hand-built chain could make an O(depth) walk arbitrarily expensive.
+///
+/// **Still load-bearing after #1156, and not redundant with the ladder**, which
+/// is the reading to resist now that the levels are enforced. The ladder bounds
+/// a chain only where every row on it carries a level; a chain of LEVEL-LESS
+/// rows is exempt (`ladder_rule`) and can be nested arbitrarily deep, and that
+/// is the flat board — the common case, not the edge one. So this cap is what
+/// actually bounds the walks, exactly as it was before, and the ladder's own
+/// four rungs happen to agree with it rather than replace it.
 pub const MAX_TASK_DEPTH: usize = 4;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -9062,10 +9242,11 @@ pub struct Task {
     /// Stored on the pointing side only (no `children` array), the way a dep
     /// edge is: two sources of truth would mean two delete-strip bookkeepings.
     /// Validated on write like a link id — names a live task, never itself,
-    /// never closing a cycle, never deeper than `MAX_TASK_DEPTH` — and when the
-    /// container is deleted its children are PROMOTED to the nearest surviving
-    /// ancestor in the same locked write, so "a parent names a live task" holds
-    /// without a repair pass.
+    /// never closing a cycle, never deeper than `MAX_TASK_DEPTH`, and (#1156)
+    /// obeying the strict Agile ladder whenever this row or its container
+    /// carries a `kind` — and when the container is deleted its children are
+    /// PROMOTED to the nearest surviving ancestor in the same locked write, so
+    /// "a parent names a live task" holds without a repair pass.
     ///
     /// Reading is deliberately TOLERANT where writing is strict: a hand-edited
     /// orphan or over-deep pointer blocks nothing and renders flat at top
@@ -9084,10 +9265,20 @@ pub struct Task {
     /// hierarchy, and a board that uses none rewrites without gaining the key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
-    /// Advisory Agile level — one of `TASK_KINDS` (#958), absent meaning "a
-    /// plain task", which is what every row written before this existed is.
-    /// Same additive/skipped-when-absent contract as `parent`, and the same
-    /// metadata-only stance: it labels a row, it never authorizes anything.
+    /// Agile level — one of `TASK_KINDS` (#958), absent meaning "a plain task",
+    /// which is what every row written before this existed is. Same
+    /// additive/skipped-when-absent contract as `parent`.
+    ///
+    /// STRICT since #1156: setting this asserts where the row sits, and the
+    /// write is refused unless `parent` agrees (`ladder_rule`) — in BOTH
+    /// directions, since a re-kind can invalidate a child as easily as its own
+    /// link. ABSENT IS EXEMPT, permanently: a kind-less row may sit anywhere,
+    /// which is what keeps a flat board (and every pre-#1156 board) working.
+    ///
+    /// Still metadata in the sense that matters: nothing that decides whether
+    /// an ACTION may happen reads it — not `claim`, not the merge gate, not any
+    /// permission. What #1156 added is a constraint on what the board will
+    /// STORE, the same kind of check `status` and `deps` have always had.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
     /// Worktree path where a demo of this item lives (#1091 slice B) — set on
@@ -9184,9 +9375,10 @@ pub struct TaskSummary {
     pub deps: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub related: Vec<String>,
-    /// This row's container and advisory level (#958), skipped when absent so
-    /// a board with no hierarchy pays nothing for the fields — the same
-    /// pay-for-what-you-use rule the link arrays follow.
+    /// This row's container and Agile level (#958; the level is enforced since
+    /// #1156 — see `ladder_rule`), skipped when absent so a board with no
+    /// hierarchy pays nothing for the fields — the same pay-for-what-you-use
+    /// rule the link arrays follow.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -9703,6 +9895,16 @@ fn subtree_height(root: &str, tasks: &[Task]) -> usize {
 /// would land the child on a row this very write just deleted. `removed` is
 /// therefore the removed ROWS (their own `parent` values are the chain), and a
 /// chain that leaves the board entirely lands the survivor at top level.
+///
+/// PROMOTION CAN LAND A ROW WHERE THE #1156 LADDER WOULD NOT HAVE PUT IT — a
+/// `feature` whose epic was deleted ends up at top level, which no write could
+/// have asked for. That is deliberate, and it is the same strict-write/tolerant-
+/// read split the rest of hierarchy already has (`doc/design/task-hierarchy.md`
+/// §5): the alternatives are refusing the human's delete, cascading it into the
+/// work items, or silently STRIPPING the survivor's level — destroying data to
+/// preserve an invariant about a label. The row reads and renders fine; the
+/// next write that touches its own `kind`/`parent` is where it has to be
+/// resolved, and that error names both ways out.
 fn promote_orphans(tasks: &mut [Task], removed: &[Task]) -> Vec<String> {
     let gone: HashMap<&str, Option<&str>> =
         removed.iter().map(|t| (t.id.as_str(), t.parent.as_deref())).collect();
@@ -9857,8 +10059,11 @@ pub struct TaskPatch {
     /// board. Any other value is validated against the whole board before
     /// anything is written.
     pub parent: Option<String>,
-    /// Advisory Agile level (#958) — one of `TASK_KINDS`, with the same
-    /// untouched/empty-clears rule as `parent`.
+    /// Agile level (#958) — one of `TASK_KINDS`, with the same
+    /// untouched/empty-clears rule as `parent`. Setting it (or clearing it) is
+    /// what triggers the strict ladder check (#1156), in both directions; a
+    /// patch that leaves this `None` and touches no `parent` is never judged
+    /// against the ladder at all.
     pub kind: Option<String>,
     /// Worktree path for a demo of this item (#1091 slice B) — same
     /// untouched/empty-clears rule as `pr`/`pr_base`. See `Task::demo_path`.
@@ -24881,9 +25086,11 @@ impl OrchRegistry {
                 return Err(format!("invalid status {s:?} — use one of {}", TASK_STATUSES.join(" | ")));
             }
         }
-        // The advisory level is validated like the status (#958). The EMPTY
-        // string is not an invalid kind, it is the clear — the `pr` rule — so
-        // it has to pass here to reach the apply below.
+        // The level is validated against the closed VOCABULARY here, like the
+        // status (#958) — where it sits on the ladder is judged further down,
+        // inside the lock, because that needs the whole board (#1156). The
+        // EMPTY string is not an invalid kind, it is the clear — the `pr` rule
+        // — so it has to pass here to reach the apply below.
         if let Some(k) = patch.kind.as_deref().map(str::trim) {
             if !k.is_empty() && !TASK_KINDS.contains(&k) {
                 return Err(format!("invalid kind {k:?} — use one of {}", TASK_KINDS.join(" | ")));
@@ -24921,13 +25128,14 @@ impl OrchRegistry {
                     .map(str::trim)
                     .filter(|t| !t.is_empty())
                     .ok_or("a new task needs a title")?;
-                let max: u32 = tasks
-                    .iter()
-                    .filter_map(|t| t.id.strip_prefix("t-").and_then(|n| n.parse().ok()))
-                    .max()
-                    .unwrap_or(0);
+                // The level this row is being CREATED with picks its id prefix
+                // (#1156) — already validated against `TASK_KINDS` above, and
+                // absent (a plain row) mints `t-` exactly as it always has.
+                // `kind` itself is applied further down by the generic patch
+                // application, not here, so there is one place that writes it.
+                let born_kind = patch.kind.as_deref().map(str::trim).filter(|k| !k.is_empty());
                 tasks.push(Task {
-                    id: format!("t-{}", max + 1),
+                    id: next_task_id(born_kind, &tasks),
                     title: title.to_string(),
                     status: "queued".into(),
                     issue: None,
@@ -25035,6 +25243,56 @@ impl OrchRegistry {
                     return Err(format!(
                         "parent: {p} is this task's container — it cannot also be a {field} link"
                     ));
+                }
+            }
+        }
+        // ---- the strict Agile ladder (#1156). Same placement and same reason
+        // as everything above it: read-only against the board, so a refusal
+        // leaves it exactly as it was.
+        //
+        // TRIGGERED BY THE WRITE THAT ASSERTS THE SHAPE, never by the row's
+        // mere existence. A patch touching neither `kind` nor `parent` is not
+        // judged at all, which is the whole compatibility story: every
+        // pre-#1156 board holds shapes this ladder refuses (a top-level
+        // `feature` and its slices was the DOMINANT one — #958 §2 said so), and
+        // those rows must stay editable for status, notes, assignee, deps and
+        // everything else forever. The narrower rule also matches the one this
+        // method already applies to the container/link overlap directly above:
+        // a residual shape is tolerated, and only a write that RE-ASSERTS it is
+        // refused.
+        if patch.kind.is_some() || patch.parent.is_some() {
+            let effective_kind: Option<&str> = match patch.kind.as_deref().map(str::trim) {
+                Some("") => None,
+                Some(k) => Some(k),
+                None => tasks[idx].kind.as_deref(),
+            };
+            // Outer `None` = this row's container names nothing on the board;
+            // inner `None` = it exists and carries no level. See
+            // `check_ladder`.
+            let parent_kind: Option<Option<&str>> = effective_parent
+                .and_then(|p| tasks.iter().find(|t| t.id == p))
+                .map(|t| t.kind.as_deref());
+            check_ladder(&this_id, effective_kind, effective_parent, parent_kind)
+                .map_err(|e| format!("hierarchy: {e}"))?;
+            // BOTH DIRECTIONS (#1156 AC2). The check above judges this row's
+            // own link; the rows INSIDE it are judged against its NEW level,
+            // which nothing else on this path can see. Only a `kind` write can
+            // invalidate a child — a child's rule reads its container's LEVEL,
+            // never where that container itself sits — so a pure reparent skips
+            // this walk rather than re-judging children it cannot have moved.
+            if patch.kind.is_some() {
+                let becoming = match effective_kind {
+                    Some(k) => format!("cannot be {}", a_level(k)),
+                    None => "cannot have its level cleared".to_string(),
+                };
+                for child in tasks.iter().filter(|t| t.parent.as_deref() == Some(this_id.as_str())) {
+                    check_ladder(
+                        &child.id,
+                        child.kind.as_deref(),
+                        Some(&this_id),
+                        Some(effective_kind),
+                    )
+                    .map_err(|e| format!("hierarchy: {this_id} {becoming} — {e}"))?;
                 }
             }
         }
