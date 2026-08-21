@@ -5,9 +5,9 @@ description: When a change depends on Claude Code, GitHub Copilot CLI, or any ot
 
 # Agent-CLI facts come from reference docs, not inference
 
-Loomux orchestrates other vendors' agent CLIs. Their capabilities change
+Orrerix orchestrates other vendors' agent CLIs. Their capabilities change
 under us, their flags have precise semantics we don't control, and a wrong
-assumption about them ships as a loomux bug (#417/#418, #329). The rule that
+assumption about them ships as an orrerix bug (#417/#418, #329). The rule that
 replaces guessing:
 
 > Before designing or reviewing ANYTHING that depends on an agent CLI's
@@ -53,7 +53,7 @@ OpenCode (root: https://opencode.ai/docs/):
 - Rules (`AGENTS.md`/`CLAUDE.md` loading): https://opencode.ai/docs/rules/
 - Windows/WSL guidance: https://opencode.ai/docs/windows-wsl
 
-Its docs are silent on several surfaces loomux depends on (the session store's
+Its docs are silent on several surfaces orrerix depends on (the session store's
 layout, the exact merge ranks, `--agent` failure behavior, `run` without
 `--auto`), so those are read from the CLI's own source at a pinned commit and
 recorded as labeled observations in `doc/design/opencode.md` — not inferred,

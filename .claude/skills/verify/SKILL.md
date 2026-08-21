@@ -1,11 +1,11 @@
 ---
 name: verify
-description: Verify a loomux change end-to-end — what can be exercised automatically, what must be left to the human, and the traps (GUI app, no live agent CLIs, Windows manifest).
+description: Verify an orrerix change end-to-end — what can be exercised automatically, what must be left to the human, and the traps (GUI app, no live agent CLIs, Windows manifest).
 ---
 
-# Verifying a change in loomux
+# Verifying a change in orrerix
 
-Loomux is a GUI app (Tauri window) whose core behavior involves live PTYs and
+Orrerix is a GUI app (Tauri window) whose core behavior involves live PTYs and
 real agent CLIs — the two things you must NOT drive yourself. Verification here
 means: exercise everything that is automatable, then hand the human a precise
 manual checklist for the rest.

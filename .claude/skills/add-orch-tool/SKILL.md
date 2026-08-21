@@ -1,11 +1,11 @@
 ---
 name: add-orch-tool
-description: Add or change an MCP orchestration tool (the tools loomux exposes to orchestrator/worker/reviewer/planner agents) — every layer that must move together.
+description: Add or change an MCP orchestration tool (the tools orrerix exposes to orchestrator/worker/reviewer/planner agents) — every layer that must move together.
 ---
 
 # Adding an MCP orchestration tool
 
-Loomux's orchestration agents talk to a local MCP server
+Orrerix's orchestration agents talk to a local MCP server
 (`src-tauri/src/orchestration/mcp.rs`) backed by `OrchRegistry`
 (`src-tauri/src/orchestration/mod.rs`). A new tool touches up to six places;
 missing one produces a tool that lists but doesn't dispatch, or works but is

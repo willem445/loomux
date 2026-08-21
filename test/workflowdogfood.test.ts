@@ -218,8 +218,8 @@ test("editing one block's model keeps every other block's comments — and the s
 
   // The file header, the untouched blocks' own comments, and both section headers survive —
   // only the roster in general was touched, not edges or gates, and not the OTHER blocks.
-  assert.match(out, /loomux's own agent workflow/, "the file preamble survives");
-  assert.match(out, /The orchestrator is loomux's trust root/, "an untouched block's comment survives");
+  assert.match(out, /orrerix's own agent workflow/, "the file preamble survives");
+  assert.match(out, /The orchestrator is orrerix's trust root/, "an untouched block's comment survives");
   assert.match(out, /two worker tiers, routed by difficulty/, "the comment on the untouched sibling worker survives");
   assert.match(out, /one reviewer lane/, "the reviewer's comment survives");
   assert.match(out, /the bisecting merge queue/, "the merge_queue block's comment survives");

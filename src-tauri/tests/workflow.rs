@@ -3534,7 +3534,7 @@ fn claude_block_compiles_to_a_generated_native_agent_file() {
     let generated = fs::read_to_string(&generated_path)
         .unwrap_or_else(|e| panic!("generated claude agent file must exist at {}: {e}", generated_path.display()));
     assert!(generated.contains("security defects"));
-    assert!(generated.contains("Loomux reviewer instructions"), "the mechanics core rides along too: {generated}");
+    assert!(generated.contains("Orrerix reviewer instructions"), "the mechanics core rides along too: {generated}");
     assert!(generated.starts_with(&format!("---\nname: {handle}\ndescription:")), "{generated}");
 
     // Unlike the pre-round-6 payload, this is a FILE — the real apostrophe
@@ -3589,7 +3589,7 @@ fn copilot_uses_its_native_agent_flag_only_for_a_user_authored_github_agents_fil
     assert!(generated_text.contains("perf regressions"), "{generated_text}");
     // Round 8: the generated body is now `copilot_agent_body`'s SLIM
     // composition, not the full reviewer.md template — it never contains
-    // "Loomux reviewer instructions" (that heading lives only in the full
+    // "Orrerix reviewer instructions" (that heading lives only in the full
     // template, on purpose; that's the whole point of this round). What it
     // DOES still carry: the non-negotiable mechanics core, and a pointer
     // to the full instructions file for everything else.
@@ -4235,7 +4235,7 @@ fn the_invariants_digest_leads_the_document_and_carries_what_compaction_would_co
     let o = flat(&orch);
 
     let digest = o.find("## invariants").expect("orchestrator.md must open with an INVARIANTS digest");
-    let tools = o.find("## your loomux mcp tools").expect("the tools section still exists");
+    let tools = o.find("## your orrerix mcp tools").expect("the tools section still exists");
     assert!(
         digest < tools,
         "the digest must lead the document — a rule stated 400 lines in is a rule a summary \

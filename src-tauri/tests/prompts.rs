@@ -131,7 +131,7 @@ fn the_invariants_digest_leads_the_document_and_carries_what_compaction_would_co
     let o = flat(&orch);
 
     let digest = o.find("## invariants").expect("orchestrator.md must open with an INVARIANTS digest");
-    let tools = o.find("## your loomux mcp tools").expect("the tools section still exists");
+    let tools = o.find("## your orrerix mcp tools").expect("the tools section still exists");
     assert!(
         digest < tools,
         "the digest must lead the document — a rule stated 400 lines in is a rule a summary has \
@@ -675,9 +675,9 @@ fn a_first_turn_primer_leads_every_role_template_with_the_calls_that_role_actual
 
     for (name, doc, heavy_heading) in [
         ("orchestrator.md", &orch, "## invariants"),
-        ("worker.md", &worker, "## your loomux mcp tools"),
-        ("reviewer.md", &reviewer, "## your loomux mcp tools"),
-        ("planner.md", &planner, "## your loomux mcp tools"),
+        ("worker.md", &worker, "## your orrerix mcp tools"),
+        ("reviewer.md", &reviewer, "## your orrerix mcp tools"),
+        ("planner.md", &planner, "## your orrerix mcp tools"),
     ] {
         let flat_doc = flat(doc);
         let primer = flat_doc
@@ -714,7 +714,7 @@ fn a_first_turn_primer_leads_every_role_template_with_the_calls_that_role_actual
     }
 
     let w = flat(&worker);
-    let worker_primer = section(&w, "## your first turn", "## your loomux mcp tools");
+    let worker_primer = section(&w, "## your first turn", "## your orrerix mcp tools");
     pinned("worker.md's first-turn primer", worker_primer, "delivery id",
         "the duplicate-delivery check must be the FIRST thing a worker does, or it can burn a \
          whole turn re-doing work it already did");
@@ -722,12 +722,12 @@ fn a_first_turn_primer_leads_every_role_template_with_the_calls_that_role_actual
         "the orchestrator should hear a worker is on the task before anything else happens");
 
     let r = flat(&reviewer);
-    let reviewer_primer = section(&r, "## your first turn", "## your loomux mcp tools");
+    let reviewer_primer = section(&r, "## your first turn", "## your orrerix mcp tools");
     pinned("reviewer.md's first-turn primer", reviewer_primer, "gh pr view",
         "a reviewer's first move is reading the PR, not guessing at its own tools");
 
     let p = flat(&planner);
-    let planner_primer = section(&p, "## your first turn", "## your loomux mcp tools");
+    let planner_primer = section(&p, "## your first turn", "## your orrerix mcp tools");
     pinned("planner.md's first-turn primer", planner_primer, "gh issue view",
         "a planner's first move is reading the work item in full");
 }

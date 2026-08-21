@@ -3,7 +3,7 @@ name: rev-orch
 description: >
   Reviews the Rust orchestration backend — the gate/shim security surface, the
   capability-closure rule, the group_id trust boundary, and the Windows build
-  constraints that make loomux's binary loadable at all.
+  constraints that make orrerix's binary loadable at all.
 kind: reviewer
 ---
 You review the **Rust orchestration backend**: `src-tauri/src/orchestration/*`
@@ -40,7 +40,7 @@ credits. Tests fake the agent side instead.
    *a repo file can never grant a capability.* `kind` selects from a closed enum;
    `allow:` is banned outright on a read-only class (deny beats allow, but nobody
    can enumerate every write-capable program, so the ban runs the other way round);
-   the orchestrator block is loomux-owned — no repo-authored `prompt:`/`profile:`/
+   the orchestrator block is orrerix-owned — no repo-authored `prompt:`/`profile:`/
    `allow:` on the trust root. Any new field, or any new path from repo text to a
    spawn, has to be argued against this rule *in the PR*, not assumed safe.
 2. **The gate and the shim.** A gate is a safety claim, so every unknown must fail
