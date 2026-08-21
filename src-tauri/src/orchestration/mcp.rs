@@ -435,6 +435,15 @@ fn tool_defs(
         tool("list_questions",
             "Read the questions this group has put to the human: `{ questions: [...], omitted_settled: N }`. Every PENDING question is always listed, oldest first — that is the order they should be answered in — followed by the newest settled ones (answered or withdrawn), with `omitted_settled` naming how many older settled rows were left off (0 when none were). Each row carries id, asker, text, options, task, urgency, status, created_ms, and — once settled — answer, settled_by and settled_ms. THIS IS YOUR DURABLE MEMORY OF WHAT YOU ARE WAITING ON: read it on session start and after a /compact instead of trying to recall which questions are outstanding, and re-surface a still-pending one in your status updates rather than stalling on it. Read-only.",
             json!({}), &[]),
+        // The needs-you item registry's READ tier (#1151 slice B). Shared for
+        // `list_questions`'s reason plus one of its own: the human's panel unions
+        // the two registries, so an agent able to read only half of what is waiting
+        // on the human would be reasoning about a queue the human does not see.
+        // Only the two WRITE tools below are gated, and there is deliberately NO
+        // resolve tool at any tier — see the `request_attention` arm in `call_tool`.
+        tool("list_needs_you",
+            "Read what this group has put in front of the human to LOOK at: `{ items: [...], omitted_resolved: N }`. These are NEEDS-YOU items — a demo parked for the human to go run, or a request for their feedback — and they are a DIFFERENT registry from `list_questions`: a question wants a DECISION that releases held work, an item wants the human's EYES and releases nothing. The human's panel shows both together, so read both when you work out what is outstanding. Every OPEN item is always listed, oldest-raised first, followed by the newest resolved ones, with `omitted_resolved` naming how many older resolved rows were left off (0 when none were). Each row carries id, kind (`demo` or `feedback`), raiser, text, task, urgency, status, created_ms, and — once resolved — resolved_ms, resolved_by and `had_resolution`. READ `resolved_by` RATHER THAN JUST `status`: `webview` means the human actually looked and cleared it, `board:<new-status>` means the linked task moved on and the ask went moot, and `withdrawn:<agent>` means the raiser took it back — three quite different facts about whether the human ever saw the thing, and only the first is an acknowledgement. `had_resolution: true` says the human left a close-out note; the note itself is delivered into the ORCHESTRATOR's pane rather than carried here, so ask for it rather than inventing one. THIS IS YOUR DURABLE MEMORY OF WHAT YOU HAVE PARKED: it survives a /compact and a restart, so read it on session start instead of trying to recall which demos are still waiting on the human. Read-only — nothing on this surface can resolve an item.",
+            json!({}), &[]),
         tool("get_task",
             "Read ONE task's full record, including its note history (capped: only the newest notes are kept verbatim, older ones collapse into one placeholder — the full text of every note is always in this group's audit log regardless). Use this after list_tasks's compact row shows a note_count worth reading.",
             json!({ "id": { "type": "string", "description": "Task id, e.g. t-3" } }),
@@ -624,6 +633,31 @@ fn tool_defs(
                 "Take back a pending question that has been overtaken by events — the decision made itself, the work was dropped, or you found the answer elsewhere. The question is marked withdrawn rather than deleted, so a human who was part-way through answering can see what became of it. Refuses a question that is already answered or already withdrawn (you are told which). Withdraw generously: a stale question in the human's inbox costs their attention and teaches them the inbox is noise.",
                 json!({
                     "id": { "type": "string", "description": "Question id, e.g. q-3 — from ask_human's reply or list_questions." },
+                }),
+                &["id"]),
+            // The needs-you item registry's WRITE tier (#1151 slice B), re-checked
+            // in `call_tool` — the listing is cosmetic, the dispatch check is the
+            // gate. BOTH halves are orchestrator-only, and unlike the question
+            // tier's split (`ask_human` widened to a liaison, `withdraw_question`
+            // not) neither is widened to the liaison hint. That is deliberate and
+            // argued in `doc/design/liaison.md`: raising is a WRITE on the
+            // faces-the-human root, which is the trip-wire that note names — and
+            // whose answer, `Role::Manager` (#1161 M1), now exists. The
+            // human-facing pane's raise therefore belongs to the manager's own
+            // enumerated surface, not to a third row on the liaison's table.
+            tool("request_attention",
+                "Put something in front of the human to LOOK at, WITHOUT BLOCKING, and keep orchestrating. Returns an item id (`n-N`) immediately and never waits. THIS IS NOT `ask_human`, and the difference decides which one you want: a question wants a DECISION and the answer RELEASES the work that was waiting on it; an item wants the human's EYES and releases nothing. 'Which of these two shapes should this take?' is a question. 'The demo is parked in this worktree, go run it' and 'tell me whether this feels right' are items. Asking the wrong one is not fatal — both reach the same panel — but a question the human answers un-blocks a task, and an item they clear does not. kind `demo`: something is BUILT and parked for them to run. It REQUIRES `task`, because the panel opens that board row to show what to run and from where — and the row is what carries `demo_path`, so record that on the task before you raise. kind `feedback`: you want an opinion — on a direction, a shape, a trade-off. `task` is optional there, since an opinion can be wanted before any row exists; give it whenever there is one. YOU USUALLY DO NOT NEED TO RAISE A DEMO AT ALL. Moving a task INTO `prototype` or `human-testing` raises its demo item for you, and moving it out resolves that item — so park the row and the item follows. Raising `demo` for a task that already has one open therefore returns THE EXISTING ITEM'S id and KEEPS ITS TEXT, discarding yours; the reply says so plainly when that happens. If your ask is genuinely different from 'this is parked, go look', it is `feedback`, not a second demo. WHAT MAKES A GOOD ITEM: self-contained, like a good question — the human may read it away from the machine. Say what to look at and what you want back; cite the issue or PR by number rather than pasting diffs, files or logs; never include secrets. Max 2000 characters, and an over-long body is REFUSED rather than cut, so the point cannot be silently lost. AFTER CALLING IT: go do other work. Nothing is gated on this. `list_needs_you` is your durable memory of what is still parked — it survives a /compact and a restart — and if the ask is overtaken by events, `withdraw_attention` takes it back rather than leaving it in the human's queue. YOU CANNOT RESOLVE AN ITEM, and neither can any other agent: clearing it is the human saying they have looked, and it only ever enters through surfaces they control.",
+                json!({
+                    "kind": { "type": "string", "enum": ["demo", "feedback"], "description": "`demo` = something built and parked for the human to RUN (requires `task`). `feedback` = you want their opinion on a direction or a shape (`task` optional). An unrecognized value is rejected, never defaulted — filing a demo as feedback silently changes what the human is being asked to do." },
+                    "text": { "type": "string", "description": "What to look at and what you want back, standing on its own away from this machine. Max 2000 characters — REFUSED rather than truncated if you go over; cite the issue or PR for the detail." },
+                    "task": { "type": "string", "description": "The board row this is about, e.g. \"t-7\". REQUIRED for `demo` and recommended for `feedback`. It must name a LIVE row on this board: an item pointing at a task that does not exist can never be auto-resolved by a board move, so it would sit in the human's queue until someone cleared it by hand." },
+                    "urgency": { "type": "string", "enum": ["normal", "high"], "description": "How loudly this should reach the human. Default \"normal\"; the panel pins `high` above the rest. An unrecognized value is rejected, never treated as normal." },
+                }),
+                &["kind", "text"]),
+            tool("withdraw_attention",
+                "Take back a needs-you item the human no longer needs to look at — the demo was scrapped, the feedback arrived another way, the ask was overtaken by events. The item is settled as `withdrawn:<your agent id>` rather than deleted, so a human part-way through looking can still see what became of it, and so it is never mistaken for their own acknowledgement. Refuses an item that is already resolved (you are told which), and refuses an id this group does not have. Withdraw generously: a stale row in the human's queue costs their attention and teaches them the queue is noise. This is NOT resolving — nothing on this surface can do that. Withdrawing takes back YOUR OWN group's ask; resolving is the human saying they looked.",
+                json!({
+                    "id": { "type": "string", "description": "Item id, e.g. n-3 — from request_attention's reply or list_needs_you." },
                 }),
                 &["id"]),
             group_usage_tool(),
@@ -1210,6 +1244,131 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             let id = arg_str(args, "id").ok_or("id required")?;
             let q = reg.withdraw_question(&caller.group, &caller.agent_id, id)?;
             Ok(format!("{} withdrawn — it is no longer in the human's inbox", q.id))
+        }
+
+        // ---- the needs-you item registry (#1151 slice B) ----
+        //
+        // Three tools, and — exactly as with the question tier above — there is
+        // deliberately NO FOURTH. Nothing on this surface can RESOLVE an item:
+        // `OrchRegistry::resolve_needs_you` is reachable only from the trusted
+        // `orch_needs_you_resolve` command, and its provenance is a closed
+        // `ResolveSource` enum with no agent-shaped variant. An agent that could
+        // clear the human's own attention queue would be certifying that the
+        // human had looked at something they may never have seen.
+        // `no_agent_token_can_resolve_a_needs_you_item_through_the_mcp_surface`
+        // and `the_mcp_surface_has_no_path_to_the_item_resolve_entry_point` are
+        // what keep that true as this file grows.
+        //
+        // Withdrawing is NOT that fourth tool: it settles a row as
+        // `withdrawn:<agent>`, which is visibly not an acknowledgement — the
+        // same distinction `withdraw_question` draws, pinned the same way.
+        "list_needs_you" => {
+            let (rows, omitted_resolved) = reg.needs_you_list(&caller.group)?;
+            Ok(json!({ "items": rows, "omitted_resolved": omitted_resolved }).to_string())
+        }
+        "request_attention" => {
+            // ORCHESTRATOR-ONLY, and this is a deliberate departure from the
+            // plan this slice was built from (#1151), which specified
+            // `require_orchestrator_or_liaison` by analogy with `ask_human`.
+            //
+            // `doc/design/liaison.md` states its own trip-wire: the two liaison
+            // widenings (`group_usage`, then `ask_human`) hang off a second
+            // root — "a liaison faces the human" — and "a THIRD tool on the
+            // second root is the trigger, and the next one that is a *write* is
+            // the trigger regardless of count". Raising an item is both at once:
+            // the third tool on that root, and its second write. The note also
+            // says what the trigger's answer is — "the fifth kind, deliberately,
+            // not a longer table" — and `Role::Manager` (#1161 M1) now exists,
+            // citing this very trip-wire as the reason it does.
+            //
+            // So the human-facing pane's raise belongs to the manager's own
+            // enumerated tool surface (#1161 M2/M4), not to a third row on the
+            // liaison's table. Widening this later is one word; narrowing a
+            // shipped grant is a contract break, which is why the narrow answer
+            // is the one that ships first.
+            require_orchestrator(caller)?;
+            let kind = super::needsyou::Kind::parse(
+                arg_str_strict(args, "kind")?.ok_or("kind required: \"demo\" or \"feedback\"")?,
+            )?;
+            let text = arg_str_strict(args, "text")?.ok_or("text required")?;
+            let urgency = match arg_str_strict(args, "urgency")? {
+                Some(u) => super::needsyou::Urgency::parse(u)?,
+                None => super::needsyou::Urgency::default(),
+            };
+            let task = arg_str_strict(args, "task")?.map(str::trim).filter(|t| !t.is_empty());
+            // **The task-existence check lives HERE, and
+            // `needsyou::validate_raise` says so in its own doc.** It is not a
+            // defect for the registry's other callers — the board hook supplies
+            // the id of a row it has just written — and it is one for this tool:
+            // an item naming a task that does not exist can never be
+            // auto-resolved by a board move, so it pins a permanently open row
+            // on the human's queue that only a human or a withdraw can clear.
+            // Refused BY NAME, because a caller that mistyped `t-7` as `t7`
+            // needs to see which string was wrong.
+            //
+            // Deliberately not pushed down into the registry: `raise_needs_you`
+            // would then read `tasks.json` from inside the items lock, which is
+            // the nesting `needs_you_lock`'s doc rules out in the other
+            // direction.
+            if let Some(t) = task {
+                if !reg.tasks(&caller.group).iter().any(|row| row.id == t) {
+                    return Err(format!(
+                        "unknown task: {t} — an item must name a live row on this board, or \
+                         nothing can ever auto-resolve it and it sits in the human's queue until \
+                         someone clears it by hand. Check list_tasks."
+                    ));
+                }
+            }
+            let raised = reg.raise_needs_you(
+                &caller.group,
+                &caller.agent_id,
+                super::needsyou::RaiseRequest {
+                    kind,
+                    text: text.to_string(),
+                    task: task.map(str::to_string),
+                    urgency,
+                },
+            )?;
+            // **The reply says WHICH of the two things happened**, because they
+            // differ in a way the caller cannot otherwise see: a deduped raise
+            // keeps the EXISTING row's text and discards the one just written
+            // (`needsyou::Raised::fresh` exists for exactly this). Returning a
+            // bare id for both would let "I asked for a look at the empty state"
+            // become the board hook's generic "parked in prototype for your
+            // look" with nothing to notice it by.
+            Ok(if raised.fresh {
+                format!(
+                    "{} registered — it is in the human's needs-you queue now. DO NOT WAIT FOR IT: \
+                     nothing is gated on this, so carry on. list_needs_you has it meanwhile, \
+                     across a /compact and across a restart, and withdraw_attention takes it back \
+                     if it is overtaken by events. You cannot resolve it — only the human can.",
+                    raised.item.id
+                )
+            } else {
+                format!(
+                    "{} was ALREADY OPEN for {} — this is that item, not a new one, and ITS text \
+                     stands: what you just wrote was NOT recorded. One open demo per task is \
+                     deliberate (parking the row raises it for you), so if your ask is genuinely \
+                     different from \"this is parked, go look\", raise it as kind \"feedback\" \
+                     rather than as a second demo.",
+                    raised.item.id,
+                    raised.item.task.as_deref().unwrap_or("that task")
+                )
+            })
+        }
+        "withdraw_attention" => {
+            // Orchestrator-only, on the same terms as the raise above and for
+            // `withdraw_question`'s additional reason: withdrawing SETTLES a
+            // row — any open row, not only the one you raised.
+            require_orchestrator(caller)?;
+            let id = arg_str(args, "id").ok_or("id required")?;
+            let item = reg.withdraw_needs_you(&caller.group, &caller.agent_id, id)?;
+            Ok(format!(
+                "{} withdrawn — it is out of the human's needs-you queue. The row is kept, settled \
+                 as withdrawn rather than resolved, so it is never mistaken for the human having \
+                 looked.",
+                item.id
+            ))
         }
 
         "upsert_task" => {

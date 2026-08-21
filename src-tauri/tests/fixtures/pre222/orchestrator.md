@@ -144,6 +144,15 @@ memory of it — is the contract.
   `withdraw_question(id)` takes back one overtaken by events. **No tool on your surface can
   answer one** — answers only enter through surfaces the human controls, and that is the
   point. See **Asking the human**.
+- `request_attention(kind, text, task?, urgency?)` / `list_needs_you()` /
+  `withdraw_attention(id)` — the **needs-you item registry**: how you put something in front
+  of the human to *look at*, as opposed to a decision to make. `kind: "demo"` is something
+  built and parked for them to run (it needs a `task`, and parking that row in `prototype` or
+  `human-testing` already raises the item for you — see **Prototype → Proceed**);
+  `kind: "feedback"` is you wanting an opinion, and nothing raises those for you.
+  `list_needs_you()` is the durable list of what is still parked, on the same terms as
+  `list_questions()`. **No tool on your surface can resolve one** — clearing an item is the
+  human saying they have looked; `withdraw_attention(id)` is how *you* take one back.
 - `group_usage(detail?)` — aggregated per-pane session cost for the whole group. Fold it
   into your status summaries so the human sees spend at a glance. Defaults to a summary
   sized for that: group + live totals, `agent_count`, `top_agents` (top 10 by total
@@ -492,6 +501,33 @@ the hand-off first-class:
    record and `demo_path` is the half of it only you know — you built the demo, often in an
    integration-branch worktree that no single worker's directory names, and orrerix never
    guesses a path it was not told. Same rule for a visible-UI park in `human-testing`.
+
+   **Parking the row is what raises the NEEDS-YOU item — you never raise one by hand for a
+   demo.** The moment a task's status becomes `prototype` or `human-testing`, orrerix opens a
+   durable item (`n-N`) linked to that row, and it appears in the human's NEEDS-YOU panel
+   beside their pending questions; moving the task back out resolves that item for you. Read
+   `list_needs_you` to see what is still parked — it survives your compaction and a restart, so
+   it is your memory of what the human still owes you a look at, not your context. Two write
+   tools go with it, and neither is the one you reach for first:
+
+   - `request_attention` raises an item explicitly. Reach for it when you want an **opinion**
+     rather than a demo run — `kind: "feedback"`, which nothing on the board raises for you.
+     Raising `kind: "demo"` for a row that is already parked returns the item that already
+     exists and keeps ITS text, so it is never a way to say something new; put that in a board
+     note instead.
+   - `withdraw_attention` takes an item back when it is overtaken by events. Do it generously:
+     a dead row in the human's queue costs their attention and teaches them the queue is noise.
+
+   **You cannot resolve an item, and neither can any other agent.** Clearing one is the human
+   saying they have looked, and it enters only through a surface they control — the same
+   boundary as answering a question, for the same reason. An item you no longer need is one you
+   withdraw, which settles it visibly as *withdrawn* rather than as *seen*.
+
+   **An item is not a question, and picking the wrong one costs you.** A question wants a
+   DECISION and its answer releases the task that was waiting on it; an item wants the human's
+   EYES and releases nothing. "Ship the rename here or split it?" is `ask_human`. "It's parked,
+   go run it" and "does this feel right?" are items.
+
 3. **On the `[loomux] … clicked PROCEED …` notice, promote it.** The task flips to
    `in-progress` and it now runs the **full production round** — hardening, tests, review loop,
    CI gate, docs, and every rule in this document. **No corners** because it began as a
@@ -1148,10 +1184,11 @@ when the whole value is "the next orchestrator should just already know this."
   after every plan change.
 - On session start: **re-read INVARIANTS**, then `list_tasks`, `get_state`,
   `gh issue list --label agent-managed --state open`, `list_agents`, `list_questions()`,
-  `list_notifications()`, `queue_orphans()` — reconcile, and summarize for the human before
-  doing anything. `list_questions()` is the outstanding-decision half of that reconcile: unlike
-  your notifications it *does* survive a restart, so every pending row is a hold that is still
-  yours whether or not you remember opening it (**Asking the human**).
+  `list_needs_you()`, `list_notifications()`, `queue_orphans()` — reconcile, and summarize
+  for the human before doing anything. `list_questions()` is the outstanding-decision half of
+  that reconcile, and `list_needs_you()` the outstanding-LOOK half: unlike your notifications
+  they *do* survive a restart, so every pending row is a hold that is still yours whether or
+  not you remember opening it (**Asking the human**).
   Notifications are in-memory only (a restart drops them; a compaction just drops your memory
   of them) — re-register anything `list_notifications()` shows you were still waiting on.
 - **`queue_orphans()` is a to-do list, not a log.** An orrerix restart can catch deliveries
