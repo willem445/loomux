@@ -480,13 +480,32 @@ export interface TaskTree<T extends HasParent> {
   children: Map<string, T[]>;
 }
 
-/** One rendered board line: the row, how deep it sits, and whether it has
- *  children / is currently collapsed. */
+/** One rendered board line: the row, how deep it sits, whether it has children
+ *  / is currently collapsed, and which side of the relevant-first split it
+ *  landed on (#1152 — see `settledIds` / `isCleared`). */
 export interface BoardRow<T extends HasParent> {
   task: T;
   depth: number;
   hasChildren: boolean;
   collapsed: boolean;
+  /** This row and everything under it is `done`, so the board sinks it below
+   *  the live work and its position is DERIVED (most recently updated first), not
+   *  the human's manual priority order. */
+  settled: boolean;
+  /** The human archived this row from their working view — this row's OWN
+   *  stamp (`isCleared`), which is not the same question as whether the board
+   *  is hiding it.
+   *
+   *  Hiding is decided by `clearedIds`, the whole-subtree closure, so a
+   *  **cleared container still holding live work renders with "show cleared"
+   *  OFF** and wears this flag: it never left the list, because hiding it would
+   *  have taken the live child with it. That is the case `clearedIds` exists to
+   *  create, so it is normal, not a leak — the 📥 chip is what explains the
+   *  dimming, and the row's own ↩ is the way back. Consequence worth knowing at
+   *  the header: `👁 show cleared (N)` and `↩ restore all (N)` both count
+   *  `clearedIds`, so both can read 0 and be hidden entirely while such a row
+   *  is on screen. */
+  cleared: boolean;
 }
 
 /** How many indent steps the board actually draws. The backend caps writes at
@@ -584,35 +603,229 @@ export function buildTree<T extends HasParent>(board: readonly T[]): TaskTree<T>
   return { roots, children };
 }
 
-/** The rows to render, in display order: roots in board order, each followed
- *  by its own subtree (recursively, in board order), with the depth each row
- *  should be indented to.
+// ---------------------------------------------------------------------------
+// Relevant-first order and the cleared archive (#1152).
+//
+// A long-lived group's board is mostly history: 400+ rows, nearly all `done`,
+// with the handful that anyone can act on scattered among them. Two separate
+// mechanisms answer that, and keeping them separate is the point:
+//
+//  1. **Sinking** is automatic and derived. A finished subtree drops below the
+//     live work of its own sibling group, most recently updated first. Nothing is
+//     stored and nothing is written — it is a projection, exactly like
+//     `isReady`.
+//  2. **Clearing** is the human's explicit archive action, and it IS stored
+//     (`cleared_ms` on the task, stamped by the board's own command). It hides
+//     the row from the working view until they ask for it back. It never
+//     deletes: the row, its notes and its links stay in `tasks.json`, and the
+//     audit log records the action.
+//
+// What sinking must never do is override the human's manual priority order
+// among rows that are still live — board order IS priority order, and "top =
+// next" is a contract the orchestrator reads. So the split is a STABLE
+// partition of each sibling list: within the live half, relative order is
+// untouched.
+// ---------------------------------------------------------------------------
+
+/** The archive stamp (#1152): when the human cleared this row out of their
+ *  working view. Optional on the wire like every other additive field — the
+ *  backend skips the key when absent, so every pre-#1152 board arrives without
+ *  it, and absent means "not cleared". */
+export interface HasCleared {
+  cleared_ms?: number | null;
+}
+
+/** Just the field the settled half is ordered by. Optional because the pure
+ *  helpers here are exercised with minimal rows; a row without one sorts as
+ *  `0`, i.e. oldest, and ties keep board order. */
+export interface HasUpdated {
+  updated_ms?: number;
+}
+
+/** Everything the board's display projection reads off a row (#1152). */
+export type OrderedRow = HasParent & HasStatus & HasUpdated & HasCleared;
+
+/** Whether a row is currently archived out of the human's working view.
  *
- *  `collapsed` hides a row's whole subtree, not just its direct children — a
- *  collapsed epic must not leave its grandchildren stranded at the top level.
- *  Every row on the board appears EXACTLY ONCE, whatever `parent` says: that
- *  is the invariant a hand-edited cycle would otherwise break, in either
- *  direction (an infinite render, or a row that silently vanishes). */
-export function visibleRows<T extends HasParent>(
+ *  Read-time, deliberately: the stamp alone is not enough, the row must STILL
+ *  be `done`. Reopening a cleared task (the orchestrator moving it back to
+ *  `in-progress`, or a human status edit) therefore brings it straight back
+ *  into view without anything having to remember to wipe the stamp — the same
+ *  no-repair-pass discipline `isReady` and the dep chips follow. Clear it
+ *  again and the stamp is refreshed. */
+export function isCleared(task: HasStatus & HasCleared): boolean {
+  return !!task.cleared_ms && task.status === DONE_STATUS;
+}
+
+/** How many rows the board's **clear done** action would archive: `done` rows
+ *  not already cleared. Drives the button's count and whether it shows at all.
+ *  Deliberately NOT `doneCount` — that one counts every `done` row and drives
+ *  the destructive *delete* button, which still offers to remove the archive
+ *  too. */
+export function clearableCount(tasks: readonly (HasStatus & HasCleared)[]): number {
+  return tasks.reduce((n, t) => (t.status === DONE_STATUS && !isCleared(t) ? n + 1 : n), 0);
+}
+
+/** The ids whose row AND whole subtree satisfy `pred` — the rows the board may
+ *  treat as one unit, because acting on such a row can never strand a
+ *  descendant that doesn't satisfy it.
+ *
+ *  This is the guard that makes both projections below safe on a nested board:
+ *  a `done` epic with one `queued` slice inside it is NOT finished, and sinking
+ *  or hiding it would take that live slice down with it. Terminates on a
+ *  hand-edited containment cycle and fails SAFE there — re-entering a row
+ *  mid-walk answers `false`, so a cyclic row is never sunk or hidden on the
+ *  strength of a walk that hasn't finished. */
+function closedSubtrees<T extends HasParent>(
   board: readonly T[],
-  collapsed: Iterable<string> = []
+  children: ReadonlyMap<string, T[]>,
+  pred: (t: T) => boolean
+): Set<string> {
+  const memo = new Map<string, boolean>();
+  const visiting = new Set<string>();
+  const holds = (t: T): boolean => {
+    const cached = memo.get(t.id);
+    if (cached !== undefined) return cached;
+    if (visiting.has(t.id)) return false;
+    visiting.add(t.id);
+    const ok = pred(t) && (children.get(t.id) ?? []).every(holds);
+    visiting.delete(t.id);
+    memo.set(t.id, ok);
+    return ok;
+  };
+  const out = new Set<string>();
+  for (const t of board) if (holds(t)) out.add(t.id);
+  return out;
+}
+
+/** The rows the board sinks below the live work: `done`, with nothing
+ *  unfinished under them (#1152). Their displayed position is derived, so the
+ *  manual reorder buttons are off on them — see `siblingPosition`. */
+export function settledIds<T extends HasParent & HasStatus>(
+  board: readonly T[]
+): Set<string> {
+  return closedSubtrees(board, buildTree(board).children, (t) => t.status === DONE_STATUS);
+}
+
+/** The rows the board actually hides while "show cleared" is off (#1152):
+ *  cleared, with nothing un-cleared under them. A cleared container holding a
+ *  live child stays on the board — it is the only thing on screen that says
+ *  where that child lives. */
+export function clearedIds<T extends OrderedRow>(board: readonly T[]): Set<string> {
+  return closedSubtrees(board, buildTree(board).children, isCleared);
+}
+
+/** Why a focus request (a NEEDS-YOU deep link, #1091 slice C) found no rendered
+ *  row for its target — the three cases the board must tell apart:
+ *
+ *  - `gone` — the id names nothing on the board. The task really can be deleted
+ *    between the request being parked and the render draining it, so this stays
+ *    a SILENT no-op: an error here would fire on an ordinary race.
+ *  - `cleared` — it is on the board and archived, so 👁 is what brings it back.
+ *  - `hidden` — on the board, not archived, and still not rendered: it sits
+ *    inside a collapsed container (#958). Pre-dates #1152; the board simply
+ *    could not say so before.
+ *
+ *  The distinction is the whole point of the finding this answers: the request
+ *  is CONSUMED either way, so without it a deep link onto an off-screen row is
+ *  indistinguishable from one onto a deleted row — both look like a dead click. */
+export type FocusMiss = "gone" | "cleared" | "hidden";
+
+export function focusMiss<T extends OrderedRow>(
+  target: string,
+  board: readonly T[]
+): FocusMiss {
+  const row = board.find((t) => t.id === target);
+  if (!row) return "gone";
+  return isCleared(row) ? "cleared" : "hidden";
+}
+
+/** One sibling list, split into the two halves the board shows in order (#1152):
+ *  `manual` — still-live rows in the human's own priority order, untouched —
+ *  then the settled ones, most-recently-updated first.
+ *
+ *  **The key is `updated_ms`, which is "last TOUCHED", not "finished".** No
+ *  `done_ms` exists, and inventing one to make this sentence exact would be a
+ *  new stored field on every row to order a list the human is looking at
+ *  because they are done with it. So the approximation is deliberate and it is
+ *  stated rather than papered over: a note added to a six-week-old `done` row
+ *  lifts it above work that actually finished yesterday. Every surface that
+ *  describes this order says "most recently updated" for that reason (#1152
+ *  review round 1, finding 3).
+ *
+ *  `ordered` is what renders; `manual` is what the ▲/▼ buttons step through,
+ *  and the two being derived here together is what keeps a click meaning
+ *  exactly one displayed position. Stable: `sort` has been stable since ES2019,
+ *  so settled rows with equal (or absent) `updated_ms` keep board order. */
+export function orderSiblings<T extends OrderedRow>(
+  siblings: readonly T[],
+  settled: ReadonlySet<string>
+): { manual: T[]; ordered: T[] } {
+  const manual: T[] = [];
+  const finished: T[] = [];
+  for (const t of siblings) (settled.has(t.id) ? finished : manual).push(t);
+  finished.sort((a, b) => (b.updated_ms ?? 0) - (a.updated_ms ?? 0));
+  return { manual, ordered: [...manual, ...finished] };
+}
+
+/** Where an id sits in a manually-ordered list. A row that isn't in it — a
+ *  settled row, or an id naming nothing — reports `{ index: -1, count: 0 }`,
+ *  which is what disables both reorder buttons. */
+export function positionAmong<T extends HasId>(
+  manual: readonly T[],
+  id: string
+): { index: number; count: number } {
+  const index = manual.findIndex((t) => t.id === id);
+  return index < 0 ? { index: -1, count: 0 } : { index, count: manual.length };
+}
+
+/** The rows to render, in display order: roots first, each followed by its own
+ *  subtree (recursively), with the depth each row should be indented to.
+ *
+ *  Within every sibling group the order is `orderSiblings`' — the human's
+ *  manual priority order for live work, then finished subtrees most recently updated first
+ *  (#1152). `collapsed` hides a row's whole subtree, not just its direct
+ *  children — a collapsed epic must not leave its grandchildren stranded at the
+ *  top level — and `showCleared` brings the archived rows back.
+ *
+ *  Every row on the board appears AT MOST ONCE and, unless it is archived,
+ *  exactly once: that is the invariant a hand-edited cycle would otherwise
+ *  break, in either direction (an infinite render, or a row that silently
+ *  vanishes). */
+export function visibleRows<T extends OrderedRow>(
+  board: readonly T[],
+  collapsed: Iterable<string> = [],
+  showCleared = false
 ): BoardRow<T>[] {
   const hidden = new Set(collapsed);
+  const settled = settledIds(board);
+  const archived = showCleared ? new Set<string>() : clearedIds(board);
   const { roots, children } = buildTree(board);
   const rows: BoardRow<T>[] = [];
   const seen = new Set<string>();
-  // `visible` is threaded down rather than returning early on a collapsed row:
-  // the hidden subtree still has to be WALKED, so its rows are marked seen and
-  // can't be picked up again by the fallback below as stray top-level rows.
+  // `visible` is threaded down rather than returning early on a collapsed (or
+  // archived) row: the hidden subtree still has to be WALKED, so its rows are
+  // marked seen and can't be picked up again by the fallback below as stray
+  // top-level rows.
   const walk = (task: T, depth: number, visible: boolean): void => {
     if (seen.has(task.id)) return;
     seen.add(task.id);
-    const kids = children.get(task.id) ?? [];
+    const kids = orderSiblings(children.get(task.id) ?? [], settled).ordered;
     const isCollapsed = kids.length > 0 && hidden.has(task.id);
-    if (visible) rows.push({ task, depth, hasChildren: kids.length > 0, collapsed: isCollapsed });
-    for (const k of kids) walk(k, depth + 1, visible && !isCollapsed);
+    const show = visible && !archived.has(task.id);
+    if (show) {
+      rows.push({
+        task,
+        depth,
+        hasChildren: kids.length > 0,
+        collapsed: isCollapsed,
+        settled: settled.has(task.id),
+        cleared: isCleared(task),
+      });
+    }
+    for (const k of kids) walk(k, depth + 1, show && !isCollapsed);
   };
-  for (const r of roots) walk(r, 0, true);
+  for (const r of orderSiblings(roots, settled).ordered) walk(r, 0, true);
   // Nothing should reach this — `buildTree` makes every unreachable row a root
   // — but a row that fell out of the board would be work made invisible, so it
   // renders at top level instead of being trusted away.
@@ -672,22 +885,32 @@ export function subtreeAllDone<T extends HasParent & HasStatus>(
   return any;
 }
 
-/** Where a row sits among its SIBLINGS (not on the board): drives whether the
- *  up/down buttons are disabled. Reordering is sibling-scoped — the first
- *  child of a container has nowhere higher to go, even though the board array
- *  has rows above it. `{ index: -1, count: 0 }` for an id that isn't on the
- *  board. */
-export function siblingPosition<T extends HasParent>(
+/** Where a row sits among the siblings it is MANUALLY ordered within: drives
+ *  whether the up/down buttons are disabled. Reordering is sibling-scoped — the
+ *  first child of a container has nowhere higher to go, even though the board
+ *  array has rows above it.
+ *
+ *  `{ index: -1, count: 0 }` — both buttons off — for an id that isn't on the
+ *  board, and (since #1152) for a **settled** row: a finished subtree's
+ *  position is derived, most recently updated first, so a manual step would either do
+ *  nothing visible or contradict the order the board just told the human it was
+ *  using. Reopen the row and it rejoins the manual list. */
+export function siblingPosition<T extends OrderedRow>(
   board: readonly T[],
-  id: string
+  id: string,
+  // The board's settled set, when the caller already has it. A render asks this
+  // once per ROW, and deriving the set here would walk the whole tree again
+  // each time — so the view computes it once and threads it, exactly as it
+  // already does with `blocked` and the two board-level `usesX` flags.
+  settled: ReadonlySet<string> = settledIds(board)
 ): { index: number; count: number } {
-  const siblings = siblingIds(buildTree(board), id);
-  const index = siblings.indexOf(id);
-  return index < 0 ? { index: -1, count: 0 } : { index, count: siblings.length };
+  const { manual } = orderSiblings(siblingRows(buildTree(board), id), settled);
+  return positionAmong(manual, id);
 }
 
-/** The id list this row is ordered within (a copy): its container's children,
- *  or the top-level rows.
+/** The rows this one is ordered within: its container's children, or the
+ *  top-level rows. The tree's own arrays, so callers must not mutate them —
+ *  `orderSiblings` copies.
  *
  *  A row in a hand-edited cycle is listed BOTH ways by `buildTree`, and this
  *  resolves it to the root list. That matches where `visibleRows` renders the
@@ -698,11 +921,10 @@ export function siblingPosition<T extends HasParent>(
  *  renders exactly once (§5 of doc/design/task-hierarchy.md stakes out
  *  tolerate-and-show for cycles), and only a hand-edited `tasks.json` can
  *  produce one at all. */
-function siblingIds<T extends HasParent>(tree: TaskTree<T>, id: string): string[] {
-  const root = tree.roots.find((t) => t.id === id);
-  if (root) return tree.roots.map((t) => t.id);
+function siblingRows<T extends HasParent>(tree: TaskTree<T>, id: string): T[] {
+  if (tree.roots.some((t) => t.id === id)) return tree.roots;
   for (const kids of tree.children.values()) {
-    if (kids.some((k) => k.id === id)) return kids.map((k) => k.id);
+    if (kids.some((k) => k.id === id)) return kids;
   }
   return [];
 }
@@ -716,10 +938,20 @@ function siblingIds<T extends HasParent>(tree: TaskTree<T>, id: string): string[
  *  whoever is above them"). Out-of-range moves are a no-op that still returns
  *  the current order, so a caller can send it unconditionally.
  *
+ *  One step is one step **on screen** (#1152). The board sinks finished
+ *  subtrees below the live work, so between two live rows the stored array can
+ *  hold any number of settled ones — and a move computed against the array
+ *  would step onto one of those and change nothing the human can see. So the
+ *  step is taken against `orderSiblings`' manual list and then applied to the
+ *  stored order as a minimal splice: the row lands immediately beside its
+ *  displayed neighbour and every other row, settled ones included, keeps the
+ *  array position the human or the orchestrator gave it. The display rule stays
+ *  a projection — it never rewrites priority data as a side effect of a click.
+ *
  *  Always a permutation of the board — every id present exactly once — since
  *  `reorder_tasks` appends whatever the caller omitted, and an omission would
  *  therefore be a silent priority change nobody asked for. */
-export function reorderWithSubtree<T extends HasParent>(
+export function reorderWithSubtree<T extends OrderedRow>(
   board: readonly T[],
   id: string,
   delta: number
@@ -746,17 +978,28 @@ export function reorderWithSubtree<T extends HasParent>(
     return out;
   };
 
+  // One step against what is on screen: the manual list is this row's sibling
+  // group minus the finished subtrees the board has sunk to the bottom of it.
+  // A zero delta is a no-op rather than a move onto itself — the splice below
+  // reads the target's position AFTER lifting the row out, and "beside myself"
+  // has no such position.
+  if (delta === 0) return flatten();
+  const { manual } = orderSiblings(siblingRows(tree, id), settledIds(board));
+  const i = manual.findIndex((t) => t.id === id);
+  const j = i + delta;
+  if (i < 0 || j < 0 || j >= manual.length) return flatten();
+  const target = manual[j].id;
+
   // The live sibling array (inside rootIds/childIds, so splicing it is what
   // `flatten` then reads) — reordering is scoped to it and to nothing else.
   const siblings = rootIds.includes(id)
     ? rootIds
     : [...childIds.values()].find((kids) => kids.includes(id));
   if (!siblings) return flatten();
-  const i = siblings.indexOf(id);
-  const j = i + delta;
-  if (i < 0 || j < 0 || j >= siblings.length) return flatten();
-  siblings.splice(i, 1);
-  siblings.splice(j, 0, id);
+  siblings.splice(siblings.indexOf(id), 1);
+  // `target` is a sibling and is not `id`, so it is still in the array here.
+  const at = siblings.indexOf(target);
+  siblings.splice(delta < 0 ? at : at + 1, 0, id);
   return flatten();
 }
 

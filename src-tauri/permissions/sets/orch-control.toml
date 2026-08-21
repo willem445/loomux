@@ -12,6 +12,8 @@ permissions = [
     "allow-orch-upsert-task",
     "allow-orch-delete-task",
     "allow-orch-delete-done-tasks",
+    "allow-orch-clear-done-tasks",
+    "allow-orch-restore-cleared-tasks",
     "allow-orch-delete-tasks",
     "allow-orch-reorder-tasks",
     "allow-orch-open-ref",

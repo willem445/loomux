@@ -2305,16 +2305,30 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   border-bottom: 1px solid var(--surface-2);
 }
 .tasks-head .pane-btn { opacity: 1; }
-/* Batch-clear button carries a text label, so it sizes to its content unlike
+/* Batch-delete button carries a text label, so it sizes to its content unlike
    the icon-only pane buttons; armed (awaiting the confirm click) it goes red. */
-.tasks-head .pane-btn.clear-done {
+.tasks-head .pane-btn.delete-done {
   flex: none; width: auto; padding: 0 8px; font-size: 10.5px; height: 20px;
 }
-.tasks-head .pane-btn.clear-done:hover { color: var(--state-danger); }
-.tasks-head .pane-btn.clear-done[data-confirm] {
+.tasks-head .pane-btn.delete-done:hover { color: var(--state-danger); }
+.tasks-head .pane-btn.delete-done[data-confirm] {
   color: var(--surface-0); background: var(--state-danger);
 }
-/* Multi-select batch delete — same shape/confirm treatment as clear-done. */
+/* The archive trio (#1152) — same text-label shape as their destructive
+   neighbour, deliberately NOT red: clearing, un-hiding and restoring are all
+   reversible, and colouring them like the delete would say otherwise. */
+.tasks-head .pane-btn.clear-done,
+.tasks-head .pane-btn.show-cleared,
+.tasks-head .pane-btn.restore-cleared {
+  flex: none; width: auto; padding: 0 8px; font-size: 10.5px; height: 20px;
+}
+.tasks-head .pane-btn.clear-done:hover,
+.tasks-head .pane-btn.show-cleared:hover,
+.tasks-head .pane-btn.restore-cleared:hover { color: var(--ink); }
+.tasks-head .pane-btn.show-cleared.active {
+  color: var(--ink); background: var(--surface-2);
+}
+/* Multi-select batch delete — same shape/confirm treatment as delete-done. */
 .tasks-head .pane-btn.delete-selected {
   flex: none; width: auto; padding: 0 8px; font-size: 10.5px; height: 20px;
 }
@@ -2401,6 +2415,10 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 /* Done tasks recede instead of competing with what's still active. */
 .task-row.task-row-done { opacity: 0.55; }
 .task-row.task-row-done:hover { opacity: 0.85; }
+/* An archived row (#1152) recedes further still — it is only on screen at all
+   because the human asked to see the cleared items. */
+.task-row.task-row-cleared { opacity: 0.4; }
+.task-row.task-row-cleared:hover { opacity: 0.8; }
 /* Multi-select tick box — nudged down to line up with the row's first line. */
 .task-select { flex: none; margin: 3px 0 0; cursor: pointer; accent-color: var(--state-danger); }
 .task-order { display: flex; flex-direction: column; flex: none; }
@@ -2448,6 +2466,9 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   max-width: 130px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .task-chip.session { font-family: "Cascadia Mono", Consolas, monospace; }
+/* Archived (#1152) — plain and quiet: it explains why a row is in this view,
+   it is not a state anyone needs to act on. */
+.task-chip.cleared { font-style: italic; }
 /* The assigned agent (#339, refined): LIVE vs HISTORY are visually distinct
    so an old assignee on a done/reopened/stalled task can never read as
    current work — the human's exact complaint about the first cut of this. */

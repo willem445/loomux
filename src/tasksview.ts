@@ -17,6 +17,10 @@ import {
   canApprove,
   canProceed,
   childCounts,
+  clearableCount,
+  clearedIds,
+  focusMiss,
+  settledIds,
   depCandidates,
   depState,
   DONE_STATUS,
@@ -107,6 +111,13 @@ export interface OrchTask {
    *  "there is no demo" — nothing here guesses one from an assignee's cwd.
    *  Display metadata: nothing gates on it. */
   demo_path?: string | null;
+  /** When the human cleared this row out of their working board view (#1152).
+   *  Optional on the wire like `parent`/`kind`/`demo_path`: the backend omits
+   *  the key entirely when absent, so a pre-#1152 board arrives without it and
+   *  absent means "not cleared". An ARCHIVE marker, never a delete — the row,
+   *  its notes and its links stay on the board, and `isCleared` only honours
+   *  the stamp while the row is still `done`. */
+  cleared_ms?: number | null;
   updated_ms: number;
 }
 
@@ -141,8 +152,15 @@ export class TasksView {
   readonly el: HTMLElement;
   private listEl: HTMLElement;
   private addInput: HTMLInputElement;
+  /** Archive every `done` row out of the working view (#1152) — non-destructive,
+   *  so no confirm step. */
   private clearDoneBtn: HTMLButtonElement;
-  private clearDoneTimer: number | undefined;
+  /** Show/hide the archive, and bring all of it back (#1152). */
+  private showClearedBtn: HTMLButtonElement;
+  private restoreClearedBtn: HTMLButtonElement;
+  /** The DESTRUCTIVE batch: delete every `done` row, archive included (#120). */
+  private deleteDoneBtn: HTMLButtonElement;
+  private deleteDoneTimer: number | undefined;
   private deleteSelectedBtn: HTMLButtonElement;
   private deleteSelectedTimer: number | undefined;
   private approveSelectedBtn: HTMLButtonElement;
@@ -177,6 +195,12 @@ export class TasksView {
    *  orchestrator's queue, not this window's UI state). Pruned to live rows on
    *  every refresh, like `selected`. */
   private collapsed = new Set<string>();
+  /** Whether the archived (cleared) rows are on screen right now (#1152).
+   *  Frontend-only and deliberately not persisted, exactly like `collapsed`
+   *  above: WHICH rows are archived is durable board data (`cleared_ms`, written
+   *  by the human's own command), but whether this particular window is
+   *  currently looking at them is a view preference and belongs nowhere else. */
+  private showCleared = false;
   /** The task whose picker is open, if any (#582, #958) — one at a time across
    *  EVERY picker, and kept here rather than in the DOM so a background
    *  refresh re-renders it instead of silently closing it mid-choice. `field`
@@ -233,15 +257,45 @@ export class TasksView {
     head.append(el("span", "tasks-title", "task board"));
     head.append(el("span", "tasks-group", groupId));
 
-    // Batch-clear all done tasks in one action. Hidden until there is
-    // something to clear (updated in render). Two-click confirm — a mis-click
-    // must not wipe the board — mirroring the per-row delete. The backend does
-    // this as one operation so the orchestrator gets a single board-change
-    // notice for the whole batch, not one per task (#120).
+    // Archive every done row out of the working view in one action (#1152).
+    // NOTHING is deleted — the rows keep their notes, links and place in
+    // tasks.json, the action is audited, and the 👁 toggle beside this brings
+    // them back — so unlike its destructive neighbour below there is no
+    // two-click confirm to stand between the human and a reversible action.
     this.clearDoneBtn = el("button", "pane-btn clear-done", "") as HTMLButtonElement;
     this.clearDoneBtn.hidden = true;
     this.clearDoneBtn.addEventListener("click", () => this.onClearDone());
     head.append(this.clearDoneBtn);
+
+    // Show/hide the archive. A per-window view preference, so it lives in
+    // `showCleared` and is not persisted; hidden entirely while there is
+    // nothing archived to look at.
+    this.showClearedBtn = el("button", "pane-btn show-cleared", "") as HTMLButtonElement;
+    this.showClearedBtn.hidden = true;
+    this.showClearedBtn.addEventListener("click", () => {
+      this.showCleared = !this.showCleared;
+      this.render();
+    });
+    head.append(this.showClearedBtn);
+
+    // Bulk un-archive, the counterpart to one clear click. Only shown while the
+    // archive is on screen: a bulk restore the human cannot see the effect of
+    // would be the same kind of blind batch the clear button avoids by being
+    // reversible in the first place.
+    this.restoreClearedBtn = el("button", "pane-btn restore-cleared", "") as HTMLButtonElement;
+    this.restoreClearedBtn.hidden = true;
+    this.restoreClearedBtn.addEventListener("click", () => this.onRestoreAll());
+    head.append(this.restoreClearedBtn);
+
+    // Batch-DELETE all done tasks in one action. Hidden until there is
+    // something to delete (updated in render). Two-click confirm — a mis-click
+    // must not wipe the board — mirroring the per-row delete. The backend does
+    // this as one operation so the orchestrator gets a single board-change
+    // notice for the whole batch, not one per task (#120).
+    this.deleteDoneBtn = el("button", "pane-btn delete-done", "") as HTMLButtonElement;
+    this.deleteDoneBtn.hidden = true;
+    this.deleteDoneBtn.addEventListener("click", () => this.onDeleteDone());
+    head.append(this.deleteDoneBtn);
 
     // Multi-select delete: tick task rows, then clear them in one action. Like
     // "delete all done" it's a single backend call (one coalesced notice #120)
@@ -354,7 +408,7 @@ export class TasksView {
   dispose(): void {
     this.disposed = true;
     clearTimeout(this.toastTimer);
-    clearTimeout(this.clearDoneTimer);
+    clearTimeout(this.deleteDoneTimer);
     clearTimeout(this.deleteSelectedTimer);
     this.unlistenTasks?.();
     this.unlistenQuestions?.();
@@ -448,32 +502,88 @@ export class TasksView {
     await this.mutate(invoke("orch_upsert_task", { groupId: this.groupId, title }));
   }
 
-  /** Reflect the current done-count on the batch-clear button, resetting any
+  /** Reflect the archive on the three cleared-item buttons (#1152) — called
+   *  from render() so every label matches the board it sits above.
+   *
+   *  The two counts are deliberately different questions: the clear button
+   *  offers what it would archive NOW (`clearableCount` — done, not already
+   *  archived), while the toggle names what is actually being hidden
+   *  (`clearedIds` — the closure, so a cleared container still holding live work
+   *  is not counted as out of sight when it isn't). */
+  private updateCleared(): void {
+    const clearable = clearableCount(this.tasks);
+    this.clearDoneBtn.hidden = clearable === 0;
+    this.clearDoneBtn.textContent = `📥 clear done (${clearable})`;
+    this.clearDoneBtn.title =
+      `Clear ${clearable} done item${clearable === 1 ? "" : "s"} out of this list. ` +
+      `Nothing is deleted: they stay in the board file and the audit log, and 👁 brings them back.`;
+
+    const archived = clearedIds(this.tasks).size;
+    this.showClearedBtn.hidden = archived === 0;
+    this.showClearedBtn.classList.toggle("active", this.showCleared);
+    this.showClearedBtn.textContent = this.showCleared
+      ? `👁 hide cleared (${archived})`
+      : `👁 show cleared (${archived})`;
+    this.showClearedBtn.title = this.showCleared
+      ? `Hide the ${archived} cleared item${archived === 1 ? "" : "s"} again`
+      : `Show the ${archived} cleared item${archived === 1 ? "" : "s"} — they are still on the board, just out of the way`;
+
+    // Only offered while they are on screen — see the ctor comment.
+    this.restoreClearedBtn.hidden = archived === 0 || !this.showCleared;
+    this.restoreClearedBtn.textContent = `↩ restore all (${archived})`;
+    // "All" means the rows the toggle beside it is hiding — the same set, so
+    // the two counts can never disagree about what this button acts on. A
+    // cleared container still holding live work is not in that set (it never
+    // left the list); its own ↩ is how it comes back.
+    this.restoreClearedBtn.title =
+      `Bring back all ${archived} item${archived === 1 ? "" : "s"} the 👁 toggle hides`;
+  }
+
+  /** Archive every clearable done row in one backend call. Non-destructive and
+   *  reversible, so no confirm step: the rows stay in `tasks.json` with a
+   *  `cleared_ms` stamp, the write is audited, and 👁 / ↩ undo it. */
+  private onClearDone(): void {
+    void this.mutate(invoke("orch_clear_done_tasks", { groupId: this.groupId }));
+  }
+
+  /** Un-archive everything currently hidden, in one backend call. */
+  private onRestoreAll(): void {
+    const ids = [...clearedIds(this.tasks)];
+    if (ids.length === 0) return;
+    void this.mutate(invoke("orch_restore_cleared_tasks", { groupId: this.groupId, ids }));
+  }
+
+  /** Reflect the current done-count on the batch-delete button, resetting any
    *  pending confirm — called from render() so the label always matches the
    *  board (and a stale "sure?" can't linger after the set changes). */
-  private updateClearDone(): void {
-    clearTimeout(this.clearDoneTimer);
-    delete this.clearDoneBtn.dataset.confirm;
+  private updateDeleteDone(): void {
+    clearTimeout(this.deleteDoneTimer);
+    delete this.deleteDoneBtn.dataset.confirm;
     const n = doneCount(this.tasks);
-    this.clearDoneBtn.hidden = n === 0;
-    this.clearDoneBtn.textContent = `🗑 done (${n})`;
-    this.clearDoneBtn.title = `Delete all ${n} done task${n === 1 ? "" : "s"} — the orchestrator is notified once`;
+    this.deleteDoneBtn.hidden = n === 0;
+    this.deleteDoneBtn.textContent = `🗑 done (${n})`;
+    // Every done row, cleared ones included — the archive is not a safe place
+    // this button spares, and a count that quietly excluded it would understate
+    // what one confirm click is about to destroy.
+    this.deleteDoneBtn.title =
+      `Delete all ${n} done task${n === 1 ? "" : "s"}, cleared ones included — permanent, ` +
+      `and the orchestrator is notified once`;
   }
 
   /** Two-click confirm, then delete every done task in one backend call. The
    *  batch is a single operation so the orchestrator gets ONE board-change
    *  notice, not one per task (#120). */
-  private onClearDone(): void {
-    if (this.clearDoneBtn.dataset.confirm) {
-      clearTimeout(this.clearDoneTimer);
-      delete this.clearDoneBtn.dataset.confirm;
+  private onDeleteDone(): void {
+    if (this.deleteDoneBtn.dataset.confirm) {
+      clearTimeout(this.deleteDoneTimer);
+      delete this.deleteDoneBtn.dataset.confirm;
       void this.mutate(invoke("orch_delete_done_tasks", { groupId: this.groupId }));
       return;
     }
     const n = doneCount(this.tasks);
-    this.clearDoneBtn.dataset.confirm = "1";
-    this.clearDoneBtn.textContent = `delete ${n}?`;
-    this.clearDoneTimer = window.setTimeout(() => this.updateClearDone(), 2500);
+    this.deleteDoneBtn.dataset.confirm = "1";
+    this.deleteDoneBtn.textContent = `delete ${n}?`;
+    this.deleteDoneTimer = window.setTimeout(() => this.updateDeleteDone(), 2500);
   }
 
   /** Reflect the current selection size on the delete-selected button and reset
@@ -776,7 +886,8 @@ export class TasksView {
   }
 
   private render(): void {
-    this.updateClearDone();
+    this.updateCleared();
+    this.updateDeleteDone();
     this.updateDeleteSelected();
     this.updateApproveSelected();
     this.listEl.replaceChildren();
@@ -798,11 +909,30 @@ export class TasksView {
     // `blockedTaskMap`'s doc), so a settled question can never leave a stale
     // marker on a row it no longer holds up.
     const blocked = blockedTaskMap(this.questions.filter(isPending));
-    // Display order is DERIVED from `parent` (#958) — the board array stays
-    // flat and its order stays the priority order, exactly as before. On a
-    // board that uses no hierarchy this is the array, in order, at depth 0.
-    for (const row of visibleRows(this.tasks, this.collapsed)) {
-      this.listEl.appendChild(this.renderTask(row, usesDeps, usesHierarchy, blocked));
+    // Display order is DERIVED (#958, #1152) — the board array stays flat and
+    // its order stays the human's priority order. What is derived from it: the
+    // tree (from `parent`), finished subtrees sinking below the live work of
+    // their own sibling group, and the archived rows dropping out until 👁.
+    // Board-level, computed once for the whole render like `usesDeps`/`blocked`
+    // above: which rows are finished subtrees (#1152). Each row's ▲/▼ needs it,
+    // and re-deriving it per row would walk the tree once per row.
+    const settled = settledIds(this.tasks);
+    const rows = visibleRows(this.tasks, this.collapsed, this.showCleared);
+    if (rows.length === 0) {
+      // The board is not empty — everything on it is archived. Say that,
+      // rather than showing the "no tasks yet" line for a board with 400 rows
+      // in it, which would read as data loss.
+      this.listEl.appendChild(
+        el(
+          "div",
+          "tasks-empty",
+          "Every item on this board is cleared. Nothing was deleted — use 👁 show cleared above to bring it back."
+        )
+      );
+      return;
+    }
+    for (const row of rows) {
+      this.listEl.appendChild(this.renderTask(row, usesDeps, usesHierarchy, blocked, settled));
     }
     this.drainFocus();
   }
@@ -811,14 +941,41 @@ export class TasksView {
    *
    *  Drained LAST in a render, once the rows exist, and consumed — so an
    *  ordinary refresh never yanks the viewport back to a row the human has
-   *  already scrolled away from. A target that names no row on this render is
-   *  a no-op: the task may have been deleted between the request and the
-   *  render, which is not worth an error. */
+   *  already scrolled away from.
+   *
+   *  A target that names no row on this render used to be a silent no-op, which
+   *  conflates two different situations (#1152 review round 1, finding 4). The
+   *  request is CONSUMED either way, so a deep link from the NEEDS-YOU panel
+   *  onto a row that is merely off-screen simply appeared to do nothing:
+   *  already true for a row inside a collapsed container (#958), and #1152 adds
+   *  a second way — a cleared row, hidden until 👁. So the two cases are now
+   *  told apart by the board itself rather than by the human's guess:
+   *
+   *  - the id names NO row on the board — still a silent no-op, because the
+   *    task really can be deleted between the request and the render, and that
+   *    is not worth an error;
+   *  - the id names a row that IS on the board but is not rendered — say so,
+   *    and say which affordance brings it back.
+   *
+   *  A toast rather than an auto-reveal: flipping the human's view (expanding a
+   *  container, turning the archive on) as a side effect of a click elsewhere
+   *  is a bigger behaviour than the problem, and this at least makes the state
+   *  legible. Covers the pre-existing collapsed case too, not just the new one. */
   private drainFocus(): void {
     const target = this.opts.takeFocus?.() ?? null;
     if (!target) return;
     const row = this.listEl.querySelector<HTMLElement>(`[data-item-id="${CSS.escape(target)}"]`);
-    if (!row) return;
+    if (!row) {
+      // Which of the three cases this is lives in `focusMiss` (DOM-free, and
+      // tested there); this only turns it into words.
+      const miss = focusMiss(target, this.tasks);
+      if (miss === "cleared") {
+        this.toast(`${target} is cleared — use 👁 show cleared above to bring it back into view.`);
+      } else if (miss === "hidden") {
+        this.toast(`${target} is on the board but hidden right now — expand the container it sits in.`);
+      }
+      return;
+    }
     row.scrollIntoView({ block: "nearest" });
     row.classList.add("task-row-focused");
     window.setTimeout(() => row.classList.remove("task-row-focused"), 1600);
@@ -1117,7 +1274,8 @@ export class TasksView {
     boardRow: BoardRow<OrchTask>,
     usesDeps: boolean,
     usesHierarchy: boolean,
-    blocked: ReadonlyMap<string, string>
+    blocked: ReadonlyMap<string, string>,
+    settled: ReadonlySet<string>
   ): HTMLElement {
     const t = boardRow.task;
     const row = el("div", "task-row");
@@ -1132,6 +1290,12 @@ export class TasksView {
     if (isAwaitingHuman(t.status)) row.classList.add("awaiting-human");
     const activity = taskActivityState(t.status, t.assignee, this.liveAgentIds);
     if (activity) row.classList.add(`task-row-${activity}`);
+    // An archived row recedes further still, so the working items keep the eye
+    // even in the show-cleared view. Usually that IS the show-cleared view —
+    // but not only: a cleared container still holding live work is never
+    // hidden (`clearedIds` is a whole-subtree closure), so it can carry this
+    // class with the toggle off. See `BoardRow.cleared`.
+    if (boardRow.cleared) row.classList.add("task-row-cleared");
     // A queued task waiting on an unfinished dep recedes, so it can't be read
     // as work anyone could pick up right now (#582's core ask: blocked-queued
     // must not look like plain queued). Deliberately no new accent color —
@@ -1168,15 +1332,29 @@ export class TasksView {
     // Reorder: board order is the priority order the orchestrator follows.
     // Sibling-scoped since #958 — a row moves among the rows sharing its
     // container, and a container carries its whole subtree with it, so
-    // priority edits can never silently re-home a task.
+    // priority edits can never silently re-home a task. A step is one step
+    // among the rows the human can SEE above/below it (#1152), so the sunk
+    // finished rows in between are not positions a click can land on.
     const order = el("div", "task-order");
     const up = el("button", "task-btn", "▲") as HTMLButtonElement;
     const down = el("button", "task-btn", "▼") as HTMLButtonElement;
-    const pos = siblingPosition(this.tasks, t.id);
+    const pos = siblingPosition(this.tasks, t.id, settled);
     up.disabled = pos.index <= 0;
     down.disabled = pos.index < 0 || pos.index === pos.count - 1;
-    up.title = boardRow.depth > 0 ? "Higher priority within its container" : "Higher priority";
-    down.title = boardRow.depth > 0 ? "Lower priority within its container" : "Lower priority";
+    // A settled row reports {-1, 0} above, so both buttons are already off —
+    // its place at the bottom is derived (most recently updated first) and a manual
+    // step there would contradict the order the board just told the human it
+    // was using. Say so rather than leaving two dead arrows unexplained.
+    up.title = boardRow.settled
+      ? "Finished work sits at the bottom, most recently updated first — reopen it to give it a priority again"
+      : boardRow.depth > 0
+        ? "Higher priority within its container"
+        : "Higher priority";
+    down.title = boardRow.settled
+      ? "Finished work sits at the bottom, most recently updated first — reopen it to give it a priority again"
+      : boardRow.depth > 0
+        ? "Lower priority within its container"
+        : "Lower priority";
     const move = (delta: number) => {
       const ids = reorderWithSubtree(this.tasks, t.id, delta);
       void this.mutate(invoke("orch_reorder_tasks", { groupId: this.groupId, ids }));
@@ -1215,19 +1393,30 @@ export class TasksView {
       // boardUsesHierarchy. A flat board renders exactly the row it always has.
       top.appendChild(el("span", "task-collapse-spacer"));
     }
-    // The first thing the eye should land on: unmistakable, not just a tint.
+    top.appendChild(el("span", "task-id", t.id));
+
+    // Unmistakable, not just a tint — but it sits AFTER the id, not in front of
+    // it (#1152, human beta feedback). `.task-top` is a flex row, so a badge in
+    // the leading slot pushed the id and everything after it right by its own
+    // width, and an active row read as INDENTED — indistinguishable at a glance
+    // from a row nested inside a container, which is a real and different thing
+    // here (#958's `.task-depth-N` on the row itself). Every row's left edge is
+    // now decided by its depth alone. The glow, pulse and left accent on the row
+    // are what carry "active" the moment the eye lands on it; the badge names
+    // WHO, one position further in.
     if (activity === "active") {
       const badge = el("span", "task-active-badge", `● ACTIVE — ${t.assignee}`);
       badge.title = `${t.assignee} is actively working on this right now`;
       top.appendChild(badge);
     }
-    top.appendChild(el("span", "task-id", t.id));
 
     // Board marker + deep-link (#1091 slice G): an obvious chip on a row
     // that is blocked on a human decision or gated on a demo, routing
     // through the pane's focus hook to open the NEEDS-YOU panel at that
     // item. Placed right after the id, ahead of every other chip, so it is
-    // the first thing the eye lands on after "which row is this".
+    // the first chip the eye lands on after "which row is this". (On a live
+    // row the ACTIVE badge above precedes it — that one is louder still, and
+    // both sit behind the id so no row's left edge moves.)
     const marker: BoardMarker | null = boardMarker(t, blocked);
     if (marker) {
       const chip = el(
@@ -1244,6 +1433,16 @@ export class TasksView {
           this.toast("The NEEDS-YOU panel isn't available on this pane.");
         }
       });
+      top.appendChild(chip);
+    }
+
+    // Archived (#1152) — the row's own stamp, so it appears on every rendered
+    // cleared row: the ones the 👁 toggle just revealed, and the cleared
+    // container that was never hidden because live work sits inside it. It says
+    // WHY the row is dimmed, and the ↩ below is its undo. See `BoardRow.cleared`.
+    if (boardRow.cleared) {
+      const chip = el("span", "task-chip cleared", "📥 cleared");
+      chip.title = `Cleared from the working list on ${fmtTime(t.cleared_ms ?? 0)} — still on the board, nothing was deleted`;
       top.appendChild(chip);
     }
 
@@ -1492,6 +1691,19 @@ export class TasksView {
       this.render();
     });
     top.appendChild(notesBtn);
+
+    // Per-row un-archive (#1152). No confirm: it puts a row back into a list,
+    // which is the reversible direction of a reversible action.
+    if (boardRow.cleared) {
+      const restore = el("button", "task-btn restore", "↩") as HTMLButtonElement;
+      restore.title = "Bring this one back into the working list";
+      restore.addEventListener("click", () =>
+        void this.mutate(
+          invoke("orch_restore_cleared_tasks", { groupId: this.groupId, ids: [t.id] })
+        )
+      );
+      top.appendChild(restore);
+    }
 
     // Delete with a two-click confirm, mirroring the git view's pattern.
     const del = el("button", "task-btn danger", "✕") as HTMLButtonElement;

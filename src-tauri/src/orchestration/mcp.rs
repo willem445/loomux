@@ -1087,7 +1087,14 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
         "get_task" => {
             let id = arg_str(args, "id").ok_or("id required")?;
             let task = reg.get_task(&caller.group, id).ok_or_else(|| format!("unknown task: {id}"))?;
-            Ok(serde_json::to_string(&task).unwrap_or_default())
+            // NEVER `to_string(&task)`. `Task` is the storage shape and also
+            // carries the human's own board state, so serializing it here hands
+            // agents every field it will ever gain — which is how `cleared_ms`
+            // reached this response while four other surfaces said it could not
+            // (#1152 review round 1). `agent_task_view` is the agent-facing
+            // projection, and its exhaustive destructure is what stops the next
+            // field repeating this.
+            Ok(serde_json::to_string(&super::agent_task_view(&task)).unwrap_or_default())
         }
 
         // ---- the human-question registry (#946) ----
@@ -1220,6 +1227,13 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                     // board does not have.
                     parent: arg_str_strict(args, "parent")?.map(str::to_string),
                     kind: arg_str_strict(args, "kind")?.map(str::to_string),
+                    // #1152: the human board's archive stamp, spelled out as
+                    // `None` rather than swept up by `..Default::default()`.
+                    // The field is the HUMAN's view of their own board and no
+                    // MCP tool exposes it — writing it here explicitly is what
+                    // makes that a decision on the record, and what stops a
+                    // future `TaskPatch` field from reaching agents by omission.
+                    cleared: None,
                     claim,
                 },
             )?;

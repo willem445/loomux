@@ -9592,6 +9592,7 @@ fn task_summary_drops_notes_but_counts_them() {
         parent: None,
         kind: None,
         demo_path: None,
+        cleared_ms: None,
         updated_ms: 42,
     };
     let s = task_summary(&t, false, 0, 0);
@@ -10054,6 +10055,7 @@ fn linked(id: &str, status: &str, deps: &[&str], related: &[&str]) -> Task {
         parent: None,
         kind: None,
         demo_path: None,
+        cleared_ms: None,
         updated_ms: 0,
     }
 }
@@ -10257,6 +10259,226 @@ fn demo_path_round_trips_through_the_board_and_clears_on_empty() {
     let clear = TaskPatch { demo_path: Some("   ".into()), ..Default::default() };
     let cleared = reg.upsert_task(&g.id, "orch-1", Some(&t.id), clear).unwrap();
     assert_eq!(cleared.demo_path, None, "a blank demo_path clears the field rather than storing whitespace");
+}
+
+// ---------------------------------------------------------------------------
+// #1152: "clear completed items" — the human's ARCHIVE action on their own
+// board. The whole feature rests on it never being a delete, and on it never
+// reaching into what agents read.
+// ---------------------------------------------------------------------------
+
+/// Clearing stamps the done rows and touches nothing else — not the board's
+/// membership, not its order, not the rows' own content. The failure this pins
+/// is the obvious one: a "clear" implemented as a delete would satisfy the
+/// human's ask on screen and destroy the traceability the issue asks for in the
+/// same click.
+#[test]
+fn clearing_done_tasks_archives_them_and_deletes_nothing() {
+    let (reg, _d) = test_registry();
+    let g = board_with(&reg, &["ship it", "review it", "old work", "older work"]);
+    for id in ["t-3", "t-4"] {
+        reg.upsert_task(&g, "orch", Some(id), patch(None, Some("done"), None)).unwrap();
+    }
+    reg.upsert_task(&g, "orch", Some("t-2"), patch(None, Some("in-progress"), Some("note"))).unwrap();
+
+    let cleared = reg.clear_done_tasks(&g, "human").unwrap();
+    assert_eq!(cleared, vec!["t-3".to_string(), "t-4".to_string()], "exactly the done rows, in board order");
+
+    let after = reg.tasks(&g);
+    assert_eq!(
+        after.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+        vec!["t-1", "t-2", "t-3", "t-4"],
+        "every row is still on the board, in the order it was in — nothing was deleted or moved"
+    );
+    assert!(after[2].cleared_ms.is_some() && after[3].cleared_ms.is_some(), "the done rows carry the stamp");
+    assert!(after[0].cleared_ms.is_none() && after[1].cleared_ms.is_none(), "live rows are untouched");
+    assert_eq!(after[1].notes.len(), 1, "content is untouched too");
+
+    // Idempotent: a second click has nothing to archive and rewrites no stamp.
+    let stamp = after[2].cleared_ms;
+    assert!(reg.clear_done_tasks(&g, "human").unwrap().is_empty(), "nothing left to clear");
+    assert_eq!(reg.tasks(&g)[2].cleared_ms, stamp, "an already-cleared row keeps its original archive date");
+}
+
+/// Clearing composes with the `list_tasks` done-cap instead of fighting it
+/// (#865): the cap keeps the newest `LIST_TASKS_DONE_CAP` done rows **by
+/// `updated_ms`**, so a clear that stamped a fresh `updated_ms` onto 250 rows
+/// would silently rewrite which twenty the orchestrator sees next. The property
+/// is that a human view action changes nothing an agent reads.
+#[test]
+fn clearing_does_not_disturb_what_list_tasks_shows_the_orchestrator() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    for i in 0..(LIST_TASKS_DONE_CAP + 5) {
+        let title = format!("task {i}");
+        reg.upsert_task(&g.id, "orch", None, patch(Some(&title), None, None)).unwrap();
+    }
+    // Every row done, so the board is genuinely over the cap and the kept set
+    // is decided by `updated_ms` rather than by there being little to choose.
+    let ids: Vec<String> = reg.tasks(&g.id).iter().map(|t| t.id.clone()).collect();
+    for id in &ids {
+        reg.upsert_task(&g.id, "orch", Some(id.as_str()), patch(None, Some("done"), None)).unwrap();
+    }
+    let before = reg.tasks(&g.id);
+    let (kept_before, omitted_before) = filter_done_rows(board_summaries(&before), LIST_TASKS_DONE_CAP);
+    let stamps_before: Vec<u64> = before.iter().map(|t| t.updated_ms).collect();
+
+    reg.clear_done_tasks(&g.id, "human").unwrap();
+
+    let after = reg.tasks(&g.id);
+    assert_eq!(
+        after.iter().map(|t| t.updated_ms).collect::<Vec<_>>(),
+        stamps_before,
+        "clearing must not touch updated_ms — it is the cap's own sort key"
+    );
+    let (kept_after, omitted_after) = filter_done_rows(board_summaries(&after), LIST_TASKS_DONE_CAP);
+    assert_eq!(omitted_after, omitted_before, "the same number of rows is elided");
+    assert!(omitted_before > 0, "the specimen must actually be over the cap, or this proves nothing");
+    assert_eq!(
+        kept_after.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
+        kept_before.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
+        "and the SAME twenty rows are the ones kept"
+    );
+}
+
+/// The archive is reversible, per id, and never wider than the ids asked for.
+#[test]
+fn restoring_clears_the_stamp_for_exactly_the_named_rows() {
+    let (reg, _d) = test_registry();
+    let g = board_with(&reg, &["a", "b", "c"]);
+    for id in ["t-1", "t-2", "t-3"] {
+        reg.upsert_task(&g, "orch", Some(id), patch(None, Some("done"), None)).unwrap();
+    }
+    reg.clear_done_tasks(&g, "human").unwrap();
+
+    // A real id, an id that names nothing, and an id that was never cleared:
+    // only the first moves, and the miss is skipped rather than fatal.
+    let restored = reg
+        .restore_cleared_tasks(&g, "human", &["t-2".into(), "t-404".into()])
+        .unwrap();
+    assert_eq!(restored, vec!["t-2".to_string()]);
+    let after = reg.tasks(&g);
+    assert!(after[1].cleared_ms.is_none(), "t-2 is back in the working list");
+    assert!(after[0].cleared_ms.is_some() && after[2].cleared_ms.is_some(), "its siblings stayed archived");
+    assert!(
+        reg.restore_cleared_tasks(&g, "human", &["t-2".into()]).unwrap().is_empty(),
+        "restoring a row that carries no stamp changes nothing"
+    );
+}
+
+/// The board's own `orch_upsert_task` path can set and clear the stamp per row
+/// (that is what the per-row ↩ rides on), and — the property that keeps a
+/// reopened task visible — reopening and un-archiving in ONE patch ends with
+/// the stamp gone whichever order the caller wrote the arguments in.
+#[test]
+fn the_archive_stamp_is_settable_and_clearable_through_a_board_patch() {
+    let (reg, _d) = test_registry();
+    let g = board_with(&reg, &["a"]);
+    let done = TaskPatch { status: Some("done".into()), cleared: Some(true), ..Default::default() };
+    let t = reg.upsert_task(&g, "human", Some("t-1"), done).unwrap();
+    assert!(t.cleared_ms.is_some(), "the human board can archive a single row");
+
+    let untouched = reg.upsert_task(&g, "human", Some("t-1"), patch(None, None, Some("hi"))).unwrap();
+    assert_eq!(untouched.cleared_ms, t.cleared_ms, "omitting `cleared` leaves it alone");
+
+    let reopen = TaskPatch {
+        status: Some("in-progress".into()),
+        cleared: Some(false),
+        ..Default::default()
+    };
+    let back = reg.upsert_task(&g, "human", Some("t-1"), reopen).unwrap();
+    assert_eq!(back.cleared_ms, None, "reopen + un-archive in one write leaves no stamp behind");
+    assert_eq!(back.status, "in-progress");
+}
+
+/// A board written before #1152 loads with no stamp, and a rewrite that never
+/// archives anything must not GAIN the key — the same additive guarantee
+/// `parent`/`kind`/`demo_path` carry, so an older loomux (and a human reading
+/// `tasks.json`) keeps seeing exactly what it saw before.
+#[test]
+fn pre_1152_boards_load_with_cleared_ms_absent_and_do_not_gain_the_key() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let path = reg.state_root().join(g.id.as_str()).join("tasks.json");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(
+        &path,
+        r##"[
+  {"id":"t-1","title":"Ship the parser","status":"done","issue":null,"pr":null,"assignee":"w-2","session":null,"notes":[],"updated_ms":11}
+]"##,
+    )
+    .unwrap();
+
+    let tasks = reg.tasks(&g.id);
+    assert_eq!(tasks.len(), 1, "a pre-#1152 board must still load — a parse failure reads as an EMPTY board");
+    assert_eq!(tasks[0].cleared_ms, None, "an absent cleared_ms deserializes to None, never an error");
+
+    reg.upsert_task(&g.id, "orch", Some("t-1"), patch(None, Some("in-progress"), None)).unwrap();
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(text.contains("in-progress"), "the edit itself landed");
+    assert!(!text.contains("\"cleared_ms\""), "a board that never archived must not gain the key:\n{text}");
+}
+
+/// The archive is the HUMAN's view of their own board: no MCP tool writes it,
+/// and none reads it back. An agent tidying rows out of the human's sight is
+/// the one thing this feature must never become — and the compact `list_tasks`
+/// row deliberately does not carry the field either, so nothing agent-facing
+/// can start gating on it by accident.
+#[test]
+fn no_mcp_tool_can_archive_a_row_or_see_that_one_was_archived() {
+    let (reg, _d, co, _cw) = setup_mcp();
+    let created = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "upsert_task", "arguments": { "title": "Ship it", "status": "done" } }))
+        .unwrap();
+    assert_eq!(created["isError"], false, "setup: {created}");
+    let group = co.group.clone();
+
+    // The tool surface offers no way in: `cleared` is not a documented argument
+    // of any tool, and passing it anyway archives nothing.
+    let schemas = dispatch(&reg, &co, "tools/list", &json!({})).unwrap().to_string();
+    assert!(
+        !schemas.contains("\"cleared\""),
+        "no MCP tool may advertise the human board's archive field:\n{schemas}"
+    );
+    let _ = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "upsert_task", "arguments": { "id": "t-1", "cleared": true } }));
+    assert_eq!(
+        reg.tasks(&group)[0].cleared_ms, None,
+        "an agent passing the field anyway must not archive a row on the human's board"
+    );
+
+    // Nor can an agent tell that the human archived one. BOTH read paths, not
+    // just the compact one: `get_task` used to serialize the stored `Task`
+    // straight out, so it shipped `cleared_ms` the moment a stamp existed —
+    // review round 1's blocking finding, and the reason the assertion below
+    // exists at all. The test name claims the whole property; it has to check
+    // every surface that could break it.
+    reg.clear_done_tasks(&group, "human").unwrap();
+    assert!(reg.tasks(&group)[0].cleared_ms.is_some(), "the human's clear did land");
+
+    let listed = dispatch(&reg, &co, "tools/call", &json!({ "name": "list_tasks", "arguments": {} }))
+        .unwrap()
+        .to_string();
+    assert!(!listed.contains("cleared"), "list_tasks must not leak the archive marker: {listed}");
+    assert!(listed.contains("t-1"), "and the archived row is still listed for the orchestrator");
+
+    let got = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "get_task", "arguments": { "id": "t-1" } }))
+        .unwrap()
+        .to_string();
+    // Completeness FIRST, absence second, and the order is load-bearing.
+    // `get_task` exists to carry the note history `list_tasks` omits, so a
+    // projection that "fixed" the leak by returning less than agents need is
+    // the other failure direction and has to be caught separately. Asserting
+    // absence first would abort the test on the leak and leave these two
+    // unreached — which is the whole point of the rule that a red evidences
+    // only the assertion it REACHED and MOVED. This way the leak mutation runs
+    // them, they pass, and only the absence assertion below moves: the round
+    // then proves the test can tell the two directions apart, instead of
+    // merely asserting that it can.
+    assert!(got.contains("t-1") && got.contains("\\\"notes\\\""), "get_task is still the full record: {got}");
+    assert!(got.contains("done"), "...including the status: {got}");
+    assert!(!got.contains("cleared"), "get_task must not leak the archive marker either: {got}");
 }
 
 /// The MCP surface #1091 slice B adds: `demo_path` is settable through the

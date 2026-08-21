@@ -5,16 +5,16 @@
 //! without an explicit grant silently unreachable for every window,
 //! including `main`. These tests turn that silent failure into a red test:
 //!
-//!   - `generate_handler_matches_app_commands` / `app_commands_len_is_147`:
+//!   - `generate_handler_matches_app_commands` / `app_commands_len_is_149`:
 //!     `src/lib.rs`'s `generate_handler!` and `command_manifest::APP_COMMANDS`
 //!     are the two hand-maintained lists this migration depends on staying
 //!     identical; this diffs them directly out of the `lib.rs` source rather
 //!     than trusting a hand count.
-//!   - `main_has_all_147_and_zero_permission_denies_dangerous_spread`: builds
+//!   - `main_has_all_149_and_zero_permission_denies_dangerous_spread`: builds
 //!     a real (headless) `tauri::test` mock app using the app's *actual*
 //!     `capabilities/`/`permissions/` on disk (via the same `generate_context!`
 //!     `build.rs` already feeds — not a reimplementation of ACL resolution),
-//!     invokes all 147 commands against the `main` window label, and invokes
+//!     invokes all 149 commands against the `main` window label, and invokes
 //!     a representative dangerous spread + a benign control against the
 //!     `plugin-zero-template` window label (see
 //!     `capabilities/plugin-zero-template.json`). This is both the coherence
@@ -23,7 +23,7 @@
 //!
 //! Red-before-green (cited in the PR): dropping `orch_grant_merge` from
 //! `permissions/sets/orch-control.toml` makes
-//! `main_has_all_147_and_zero_permission_denies_dangerous_spread` fail with
+//! `main_has_all_149_and_zero_permission_denies_dangerous_spread` fail with
 //! `main is missing a grant for: ["orch_grant_merge"]`.
 
 // Stub commands: same bare identifiers as the real commands in
@@ -63,7 +63,8 @@ stub_commands!(
     agent_autopilot_flags, agent_cli_knobs, create_orchestration, promote_to_orchestrator, bind_agent,
     orch_agent_renamed, orch_session_roles,
     resume_orch_session, orch_tasks, orch_audit, orch_merge_queue, orch_steer, orch_save_attachment, orch_upsert_task,
-    orch_delete_task, orch_delete_done_tasks, orch_delete_tasks, orch_reorder_tasks, orch_open_ref,
+    orch_delete_task, orch_delete_done_tasks, orch_clear_done_tasks, orch_restore_cleared_tasks,
+    orch_delete_tasks, orch_reorder_tasks, orch_open_ref,
     orch_approve_task, orch_approve_tasks, orch_grant_merge, orch_grant_release, orch_request_changes, orch_start_task,
     orch_proceed_task, orch_pause_group, orch_resume_group, orch_group_paused, orch_ack_attention,
     orch_ack_attention_pty, orch_dismiss_stranded, orch_notify_enabled, orch_set_notify, orch_spawn_expanded,
@@ -161,11 +162,11 @@ fn generate_handler_matches_app_commands() {
 }
 
 #[test]
-fn app_commands_len_is_147() {
+fn app_commands_len_is_149() {
     assert_eq!(
         loomux_lib::command_manifest::APP_COMMANDS.len(),
-        147,
-        "APP_COMMANDS drifted from the expected count of 147 (120 per the #363 plan's audited \
+        149,
+        "APP_COMMANDS drifted from the expected count of 149 (120 per the #363 plan's audited \
          count, +1 for orch_confirm_solo_copilot_autopilot added in #364, +2 for \
          orch_set_advanced_orchestrator/orch_workflow_status added in #316/#355, +3 for \
          orch_set_compact_nudge_minutes/orch_set_compact_nudge_roles/ \
@@ -190,13 +191,15 @@ fn app_commands_len_is_147() {
          +1 for orch_set_full_autonomy — the full-autonomy toggle added in #778, +1 for \
          gh_label_vocabulary — the repo-resolved intake label vocabulary the issues view asks \
          for instead of hardcoding, added in #778 review round 1, +1 for admit_root — the \
-         trusted local webview's declaration of a filesystem root, added in #1042 slice B) — \
+         trusted local webview's declaration of a filesystem root, added in #1042 slice B, \
+         +2 for orch_clear_done_tasks/orch_restore_cleared_tasks — the human board's \
+         non-destructive clear-completed archive and its undo, added in #1152) — \
          if this is an intentional addition/removal, update this tripwire's count too"
     );
 }
 
 #[test]
-fn main_has_all_147_and_zero_permission_denies_dangerous_spread() {
+fn main_has_all_149_and_zero_permission_denies_dangerous_spread() {
     // Catches drift in *this test file* before it can mask a real gap: the
     // stub list above must match APP_COMMANDS exactly.
     let mut stub_names: Vec<&str> = STUB_COMMAND_NAMES.to_vec();
