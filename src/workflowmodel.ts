@@ -138,7 +138,7 @@ export function roleHintsForKind(kind: string): RoleHint[] {
 export function personaDenialReason(kind: string): string | null {
   if (kind === "orchestrator") {
     return (
-      "the orchestrator is loomux's trust root, and a repo file may not author its prompt — " +
+      "the orchestrator is orrerix's trust root, and a repo file may not author its prompt — " +
       "put personas on the blocks it spawns"
     );
   }
@@ -2478,7 +2478,7 @@ export function validateWorkflow(w: Workflow, knobs?: KnobLookup): Finding[] {
         findings.push({
           severity: "error",
           code: "gate-not-a-reviewer",
-          message: `The merge gate names "${id}" as a reviewer, but that block is the manager — the human's interface, which records no verdict, so the gate could never open. A gate reads reviewer verdicts; the human's own sign-off is the merge gate loomux already applies on top of it.`,
+          message: `The merge gate names "${id}" as a reviewer, but that block is the manager — the human's interface, which records no verdict, so the gate could never open. A gate reads reviewer verdicts; the human's own sign-off is the merge gate orrerix already applies on top of it.`,
           blockId: id,
         });
       } else if (b.kind !== "reviewer") {
