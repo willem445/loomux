@@ -1238,11 +1238,19 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
         //
         // Three tools, and — exactly as with the question tier above — there is
         // deliberately NO FOURTH. Nothing on this surface can RESOLVE an item:
-        // `OrchRegistry::resolve_needs_you` is reachable only from the trusted
-        // `orch_needs_you_resolve` command, and its provenance is a closed
-        // `ResolveSource` enum with no agent-shaped variant. An agent that could
+        // the registry's resolve method is reachable only from the trusted
+        // `orch_needs_you_resolve` command, and the provenance it records comes
+        // from a closed enum with no agent-shaped variant. An agent that could
         // clear the human's own attention queue would be certifying that the
         // human had looked at something they may never have seen.
+        //
+        // **Neither that method nor that type is NAMED here, and the omission is
+        // deliberate rather than stylistic.** The two guards below scan this file
+        // for those identifiers, and prose naming one would cost each guard an
+        // allowlist row it cannot verify: "it is only a comment" is not something
+        // a text scan can check, and the row would still be sitting there on the
+        // day the comment became code. `needsyou.rs`'s module doc sets this
+        // precedent for the question registry's equivalent type, for this reason.
         // `no_agent_token_can_resolve_a_needs_you_item_through_the_mcp_surface`
         // and `the_mcp_surface_has_no_path_to_the_item_resolve_entry_point` are
         // what keep that true as this file grows.
