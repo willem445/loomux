@@ -6,9 +6,10 @@
 // Run with `npm test`.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { badgeFor, agentSeq, metaForGroup, resetGroupMeta } from "../src/orchbadge.ts";
+import { readFileSync } from "node:fs";
+import { badgeFor, agentSeq, metaForGroup, resetGroupMeta, roleLabel } from "../src/orchbadge.ts";
 
-type Role = "orchestrator" | "worker" | "reviewer" | "planner";
+type Role = "orchestrator" | "worker" | "reviewer" | "planner" | "manager";
 const req = (group_id: string, agent_id: string, role: Role) => ({ group_id, agent_id, role });
 
 test.beforeEach(() => resetGroupMeta());
@@ -45,6 +46,49 @@ test("each role maps to its short uppercase tag", () => {
   assert.equal(badgeFor(req("g", "rev-1", "reviewer")).label.split(" ")[0], "REV");
   assert.equal(badgeFor(req("g", "orch-1", "orchestrator")).label.split(" ")[0], "ORCH");
   assert.equal(badgeFor(req("g", "plan-1", "planner")).label.split(" ")[0], "PLAN");
+  assert.equal(badgeFor(req("g", "mgr-1", "manager")).label.split(" ")[0], "MGR");
+});
+
+test("every role has a tag of its own, and it is the agent-id prefix uppercased", () => {
+  // The hand-written list above is a list, so it says nothing about a role
+  // nobody added a line for — a fifth role's label was unpinned on BOTH sides
+  // until this test, and mutating it to another role's tag was silently green
+  // across the whole suite (#1161 review N6).
+  //
+  // Two properties it cannot miss, derived from the OrchRole union rather than
+  // re-listed: every role has a tag, and no two share one. A duplicate is the
+  // failure that matters — two classes badging identically is a pane you cannot
+  // tell apart from another pane, which is exactly what a role chip is for.
+  const union = readFileSync(new URL("../src/orchbadge.ts", import.meta.url), "utf8").match(
+    /export type OrchRole =([^;]+);/
+  );
+  assert.ok(union, "orchbadge.ts no longer declares the OrchRole union");
+  const roles = [...union[1].matchAll(/"([a-z]+)"/g)].map((m) => m[1]);
+  assert.ok(roles.length >= 5, `expected the full union, got ${roles.join(", ")}`);
+
+  const seen = new Map<string, string>();
+  for (const role of roles) {
+    const tag = roleLabel(role);
+    assert.notEqual(tag, "AGENT", `${role} has no tag of its own — it falls through to AGENT`);
+    assert.match(tag, /^[A-Z]+$/, `${role} → ${tag} must be a short uppercase tag`);
+    const clash = seen.get(tag);
+    assert.equal(clash, undefined, `${role} and ${clash} both badge as ${tag}`);
+    seen.set(tag, role);
+  }
+
+  // ...and the tag IS the agent-id prefix the backend mints, uppercased, which
+  // is what makes a chip ("MGR 3") cross-reference 1:1 to a roster row (`mgr-3`).
+  // Pinned against the backend's `Role::prefix` for the classes whose ids an
+  // agent actually carries; asserting it here is what the `MGR` comment claims.
+  for (const [prefix, role] of [
+    ["w", "worker"],
+    ["rev", "reviewer"],
+    ["orch", "orchestrator"],
+    ["plan", "planner"],
+    ["mgr", "manager"],
+  ] as const) {
+    assert.equal(roleLabel(role), prefix.toUpperCase(), `${role}'s tag must be ${prefix} uppercased`);
+  }
 });
 
 test("an unknown role degrades to AGENT, never throws", () => {

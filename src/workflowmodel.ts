@@ -39,11 +39,19 @@ import type { KnobStates } from "./selectorknobs";
 // ---------- the closed enums ----------
 
 /** The capability classes. CLOSED, deliberately (#222 §2c): a workflow file may define
- *  unlimited personas but may never invent a capability — `kind` picks one of these four
+ *  unlimited personas but may never invent a capability — `kind` picks one of these
  *  and inherits its structural guarantees (a planner gets no worktree and no write tools;
  *  a reviewer may `gh pr review` but can never push). A repo file that could grant itself
- *  write access would be a footgun with `auto_ops` on and nobody watching. */
-export const BLOCK_KINDS = ["orchestrator", "worker", "reviewer", "planner"] as const;
+ *  write access would be a footgun with `auto_ops` on and nobody watching.
+ *
+ *  Order mirrors the backend's `kind_names()` (workflow.rs), which is also the order
+ *  `src/workflow-schema.json` declares — the two are compared as ordered arrays by
+ *  `the_workflow_schema_manifest_matches_the_engines_values_defaults_and_bounds`.
+ *
+ *  `manager` (#1161) is a class the workflow file may name and `spawn_agent` may not:
+ *  it is the human's own interface pane, opened for them rather than spawned by the
+ *  orchestrator, and at most one may be declared. */
+export const BLOCK_KINDS = ["orchestrator", "worker", "reviewer", "planner", "manager"] as const;
 export type BlockKind = (typeof BLOCK_KINDS)[number];
 
 export function isBlockKind(v: string): v is BlockKind {
@@ -111,9 +119,41 @@ export function roleHintsForKind(kind: string): RoleHint[] {
   return ROLE_HINTS.filter((h) => roleHintRequires(h) === kind);
 }
 
+/** Why a block of this kind may NOT declare a repo-authored PERSONA
+ *  (`prompt:` / `profile:`), or `null` when it may — the mirror of
+ *  `workflow::persona_allowed` and of `parse_workflow`'s refusal.
+ *
+ *  Separate from {@link allowDenialReason} because the two rules are not
+ *  co-extensive and never were: a PLANNER may carry a persona and may not
+ *  pre-approve tools, so folding them into one predicate would either ban a
+ *  planner's persona or permit an orchestrator's. Two loomux-owned classes
+ *  answer non-null here (#222 for the orchestrator, #1161 D1 for the manager);
+ *  the argument for each is in `parse_workflow`.
+ *
+ *  Before #1161 the pane mirrored only the `allow:` half, so a workflow the
+ *  engine refuses OUTRIGHT — persona on the trust root — could be authored in
+ *  the pane, saved, and reported as clean; the launch then fell back to the
+ *  built-in roster with no finding to explain why. Fail-closed, but silent, and
+ *  `kind: manager` made it newly reachable through the kind picker. */
+export function personaDenialReason(kind: string): string | null {
+  if (kind === "orchestrator") {
+    return (
+      "the orchestrator is orrerix's trust root, and a repo file may not author its prompt — " +
+      "put personas on the blocks it spawns"
+    );
+  }
+  if (kind === "manager") {
+    return (
+      "a manager speaks to the human and relays their direction into the trust root, so a repo " +
+      "file may not author its persona — put personas on the blocks the orchestrator spawns"
+    );
+  }
+  return null;
+}
+
 /** Why a block of this kind may NOT declare `allow:`, or `null` when it may.
  *
- *  Mirrors the two REFUSALS in `parse_workflow` (workflow.rs), which are separate
+ *  Mirrors the three REFUSALS in `parse_workflow` (workflow.rs), which are separate
  *  rules with separate reasons and are stated here as one answer so the pane's form
  *  and its validation pass cannot disagree about them:
  *
@@ -121,6 +161,10 @@ export function roleHintsForKind(kind: string): RoleHint[] {
  *     it is the group's trust root, and a repo file that could pre-approve its
  *     tools would be a prompt-injection seam into the one agent running
  *     unsupervised;
+ *   - a MANAGER block may not either (#1161, decision D1) — its whole output surface is
+ *     persuading the human and relaying their direction into that same trust root, so a
+ *     repo-authored persona there would launder the repo's own instructions into what the
+ *     human is told;
  *   - a READ-ONLY class (today: `planner`, via `Role::containment`) may not, because
  *     `allow: Bash(python *)` hands it a shell that writes files while naming
  *     nothing on the deny list. Reviewers and workers keep `allow:` — a reviewer has
@@ -133,6 +177,13 @@ export function allowDenialReason(kind: string): string | null {
     return (
       "the orchestrator is orrerix's trust root, and a repo file may not pre-approve its tools — " +
       "put personas and allow: patterns on the blocks it spawns"
+    );
+  }
+  if (kind === "manager") {
+    return (
+      "a manager speaks to the human and relays their direction into the trust root, so a repo " +
+      "file may not author its persona or pre-approve its tools — put personas and allow: " +
+      "patterns on the blocks the orchestrator spawns"
     );
   }
   if (kind === "planner") {
@@ -473,6 +524,7 @@ export type FindingCode =
   | "prompt-and-profile"
   | "role-hint-unknown"
   | "role-hint-wrong-kind"
+  | "manager-not-unique"
   | "knob-unavailable"
   | "edge-not-a-mapping"
   | "edge-unknown-block"
@@ -493,6 +545,7 @@ export type FindingCode =
   | "intake-bad-label"
   | "resource-name-invalid"
   | "allow-not-permitted"
+  | "persona-not-permitted"
   | "allow-sanitized";
 
 /** The policy sections a finding can be ABOUT — the routing key for the three that are
@@ -2318,6 +2371,22 @@ export function validateWorkflow(w: Workflow, knobs?: KnobLookup): Finding[] {
         blockId: b.id,
       });
     }
+    // The engine refuses a persona on a loomux-owned block outright, failing the
+    // WHOLE file — so a pane that reported this clean would let an author save a
+    // workflow that silently launches on the built-in roster instead. Reported
+    // whichever key carries it, since `parse_workflow` names both.
+    if (b.prompt !== undefined || b.profile !== undefined) {
+      const denial = personaDenialReason(b.kind);
+      if (denial) {
+        const key = b.prompt !== undefined ? "prompt:" : "profile:";
+        findings.push({
+          severity: "error",
+          code: "persona-not-permitted",
+          message: `Block "${where}" declares ${key}, which a ${b.kind} block may not — ${denial}.`,
+          blockId: b.id,
+        });
+      }
+    }
     if (b.role_hint !== undefined) {
       const required = roleHintRequires(b.role_hint);
       if (!required) {
@@ -2338,6 +2407,19 @@ export function validateWorkflow(w: Workflow, knobs?: KnobLookup): Finding[] {
     }
     findings.push(...allowFindings(b, where));
     findings.push(...knobFindings(b, where, knobs));
+  }
+
+  // At most one manager (#1161) — mirrors the backend's own post-loop check in
+  // `parse_workflow`. A roster property, not a block one: the second
+  // declaration is no more wrong than the first, so the finding names them all
+  // and anchors on none.
+  const managers = w.blocks.filter((b) => b.kind === "manager").map((b) => b.id || "(no id)");
+  if (managers.length > 1) {
+    findings.push({
+      severity: "error",
+      code: "manager-not-unique",
+      message: `${managers.length} blocks declare kind: manager (${managers.join(", ")}) — a workflow may declare at most one. The manager is the human's single interface to the group: two would each hold half a conversation.`,
+    });
   }
 
   for (const e of w.edges) {
@@ -2386,6 +2468,18 @@ export function validateWorkflow(w: Workflow, knobs?: KnobLookup): Finding[] {
           severity: "error",
           code: "gate-unknown-reviewer",
           message: `The merge gate requires a verdict from "${id}", but no block has that id — the gate could never open.`,
+        });
+      } else if (b.kind === "manager") {
+        // Reached before the generic kind arm below, which would otherwise
+        // describe this as a type error ("that block's kind is manager").
+        // An author who named the manager on a gate meant "the human signs
+        // off", which is real and which this gate cannot express — so say
+        // that. Mirrors the backend's own arm in `parse_workflow` (#1161).
+        findings.push({
+          severity: "error",
+          code: "gate-not-a-reviewer",
+          message: `The merge gate names "${id}" as a reviewer, but that block is the manager — the human's interface, which records no verdict, so the gate could never open. A gate reads reviewer verdicts; the human's own sign-off is the merge gate orrerix already applies on top of it.`,
+          blockId: id,
         });
       } else if (b.kind !== "reviewer") {
         findings.push({
@@ -2933,9 +3027,10 @@ version: 1
 ${stamp}name: default
 
 # BLOCKS — the agents a run may use. \`kind\` is a capability class and the list is
-# closed (orchestrator | worker | reviewer | planner): a workflow file can define any
-# persona, but it can never grant a capability. A planner is read-only; a reviewer can
-# review but never push; a worker gets a worktree.
+# closed (orchestrator | worker | reviewer | planner | manager): a workflow file can
+# define any persona, but it can never grant a capability. A planner is read-only; a
+# reviewer can review but never push; a worker gets a worktree; a manager (at most one)
+# is the human's own interface pane and writes nothing.
 blocks:
   - id: planner            # immutable, human-meaningful — edges and gates name THIS
     name: Planner          # display only; safe to rename at any time

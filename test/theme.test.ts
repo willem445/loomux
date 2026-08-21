@@ -407,6 +407,11 @@ test("one role table: every surface that names an agent role paints it the same 
     worker: "--id-jade",
     reviewer: "--id-violet",
     planner: "--id-amber",
+    // #1161. The constraint that governs a ROLE hue is distinctness from the other
+    // ROLE hues — a roster puts them side by side — and orchid is the furthest from
+    // the four above. Rose is the destructive-action dye and lime sits too close to
+    // the worker's jade.
+    manager: "--id-orchid",
   };
 
   // The role list comes from the TYPE, so a fifth role cannot be added to the app and
@@ -428,7 +433,20 @@ test("one role table: every surface that names an agent role paints it the same 
   const SURFACES = [
     { what: "session badge", re: /\.session-badge\.orch-role\.([a-z]+)\s*\{([^}]*)\}/g, complete: true },
     { what: "group roster", re: /\.group-role\.role-([a-z]+)\s*\{([^}]*)\}/g, complete: true },
-    { what: "workflow node", re: /\.wf-node-([a-z]+)\s*\{([^}]*)\}/g, complete: false },
+    // #1161 review N6: `complete: true`, which it was not before. `renderNode`
+    // classes a node `wf-node-${isBlockKind(kind) ? kind : "unknown"}`, so the
+    // workflow canvas draws a node for EVERY declared block whose kind the pane
+    // knows — a role with no rule falls through to `.wf-node`'s neutral --line
+    // stroke and reads as no role at all, which is the same failure as the
+    // uncoloured planner badge one surface up. Deleting `.wf-node-planner` or
+    // `.wf-node-worker` was silently green until this flipped; both now redden,
+    // and `styles.css`'s claim that this test "reads all four surfaces and fails
+    // on a role that ... is missing" is true of this one for the first time.
+    { what: "workflow node", re: /\.wf-node-([a-z]+)\s*\{([^}]*)\}/g, complete: true },
+    // The chips stay `complete: false`, and that is not an oversight: they are
+    // the SCAFFOLD PREVIEW (`workflowview.ts`'s three hardcoded rows), not a
+    // per-block render, so they only ever exist for the roles that preview
+    // names. Agreement where a rule exists is all this surface can promise.
     { what: "workflow chip", re: /\.wf-chip-([a-z]+)\s*\{([^}]*)\}/g, complete: false },
   ];
 

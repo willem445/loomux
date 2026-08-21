@@ -506,6 +506,41 @@ test("the roster description counts delegates, not the orchestrator", () => {
     "2 workers, 1 planner",
     "class order follows the role table, not the file's order"
   );
+  // #1161: and a declared manager is named, not silently omitted. It is the
+  // block the human is about to consent to talking to, so it is the last one
+  // the consent line may drop — and it would have been, since `ORCH_ROLES`
+  // (which this used to iterate) deliberately has no manager row.
+  assert.equal(
+    describeRoster([
+      block({ id: "orchestrator", kind: "orchestrator" }),
+      block({ id: "manager", kind: "manager" }),
+      block({ id: "w", kind: "worker" }),
+      block({ id: "rev", kind: "reviewer" }),
+    ]),
+    "1 manager, 1 worker, 1 reviewer"
+  );
+});
+
+test("the manager is declarable but never part of the built-in roster (#1161)", () => {
+  // The whole compatibility promise of the manager feature, at the one place
+  // it could break silently. `builtinRoster` maps ORCH_ROLES into the blocks a
+  // toggle-off launch runs, so a `manager` row there would put a manager in
+  // EVERY default group — the one thing this class promises never to do.
+  //
+  // Deliberately asserted against ORCH_ROLES and `builtinRoster` rather than
+  // against `ROSTER_ROLES`: importing a symbol that exists only WITH the change
+  // makes this module unloadable without it, and a module that will not load is
+  // a compile error wearing a test's name — it says nothing about behaviour.
+  // What ROSTER_ROLES contains is observable through `describeRoster` above,
+  // ordering included, which is where it is pinned.
+  assert.ok(
+    !ORCH_ROLES.some((r) => r.key === "manager"),
+    "a manager row in ORCH_ROLES is a manager in every default group"
+  );
+  assert.deepEqual(
+    builtinRoster([], "claude").map((b) => b.kind),
+    ["orchestrator", "worker", "reviewer", "planner"]
+  );
 });
 
 // ---------- model knobs (#687) ----------

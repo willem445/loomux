@@ -1418,14 +1418,31 @@ export interface GroupSummary {
   /** Current adjustable live-agent cap (guardrail), or null if the group is
    *  unknown to the registry. Drives the GroupView stepper. */
   max_agents: number | null;
-  /** Live delegates — workers + reviewers + planners (what counts against
-   *  `max_agents`; the orchestrator is exempt). Lowering the cap below this
-   *  blocks new spawns. */
+  /** What counts against `max_agents` — every live pane the cap applies to,
+   *  which today is workers + reviewers + planners + a declared manager (#1161).
+   *  The ORCHESTRATOR is the only exemption, on both sides: the backend sums
+   *  exactly this set in `group_summary`, mirroring `live_delegate_count`, which
+   *  is the value enforcement actually reads. Lowering the cap below this blocks
+   *  new spawns. (#1161 M3 may exempt the manager per decision D3; when it does,
+   *  the backend's sum and this sentence move together or the panel starts
+   *  disagreeing with the guardrail it is describing.) */
   live_delegates: number;
   paused: boolean;
   /** Group uptime (from the earliest live agent), or null if none are live. */
   uptime_ms: number | null;
-  roles: { orchestrator: number; worker: number; reviewer: number; planner: number };
+  /** Per-class live counts. A KEY PER CAPABILITY CLASS — mirroring the backend's
+   *  `group_summary`, which emits one per `Role` variant it can see. A class
+   *  missing here is a class the panel silently drops from its breakdown: that
+   *  is the #47 planner bug (`styles.css`'s `.group-role.role-planner` comment
+   *  names it), and `manager` is here from the start rather than after someone
+   *  notices the numbers do not add up. */
+  roles: {
+    orchestrator: number;
+    worker: number;
+    reviewer: number;
+    planner: number;
+    manager: number;
+  };
   agents: AgentSummary[];
 }
 

@@ -538,6 +538,20 @@ pub const WORKER_TPL: &str = include_str!("templates/worker.md");
 pub const REVIEWER_TPL: &str = include_str!("templates/reviewer.md");
 #[doc(hidden)]
 pub const PLANNER_TPL: &str = include_str!("templates/planner.md");
+/// The manager's role contract (#1161).
+///
+/// Unlike the four above it is **not** part of any default group's rendering:
+/// `write_instruction_files`'s class-fallback loop deliberately does not write
+/// `manager.md`, because no built-in roster has a manager and a file appearing
+/// in every group dir would be a default-path change for a feature nobody
+/// declared. It is written by the block loop, for a roster that declares one.
+///
+/// It is still golden-pinned the same way (`tests/fixtures/pre222/manager.md`
+/// and the `LIVE` pairing in `tests/workflow.rs`) — what it is NOT part of is
+/// the two "what a default group reads" pins, which have nothing to compare it
+/// against.
+#[doc(hidden)]
+pub const MANAGER_TPL: &str = include_str!("templates/manager.md");
 /// Workflow-aware fragments (#222), substituted into the role templates above as
 /// `{{WORKFLOW}}` (orchestrator) and `{{BLOCK_NOTE}}` (worker/reviewer/planner).
 ///
@@ -575,6 +589,7 @@ pub(crate) fn role_template(role: Role) -> &'static str {
         Role::Worker => WORKER_TPL,
         Role::Reviewer => REVIEWER_TPL,
         Role::Planner => PLANNER_TPL,
+        Role::Manager => MANAGER_TPL,
         // Solo panes never receive a kickoff prompt and have no role
         // template — an arbitrary human-launched CLI, not a loomux
         // persona (#271 W3 addendum). Never reached: `kickoff_body`
@@ -591,6 +606,19 @@ pub(crate) fn role_template(role: Role) -> &'static str {
 /// Exposed (doc-hidden) so tests can pin the exact text.
 #[doc(hidden)]
 pub const PLANNER_READONLY_NOTE: &str = "You explore the codebase read-only to produce an implementation plan. You never create branches, worktrees, commits, or PRs — your deliverable is a plan written as a GitHub issue comment.";
+
+/// The manager's kickoff "branch note" (#1161) — the counterpart to
+/// [`PLANNER_READONLY_NOTE`], and the same kind of claim: the CLI-level
+/// editing denial ([`Containment::NoEdits`]) and the repo-root cwd are what
+/// make most of it structural; the note is how the agent learns the whole
+/// contract instead of discovering half of it as a tool error.
+///
+/// Deliberately says the manager works in the human's own checkout: that is
+/// the repo the conversation is about, and grounding a question in the wrong
+/// tree is worse than not grounding it.
+/// Exposed (doc-hidden) so tests can pin the exact text.
+#[doc(hidden)]
+pub const MANAGER_WORKSPACE_NOTE: &str = "You work in the repository itself — the human's own checkout, read-only. Read it freely so your questions are grounded in what is actually there; you never create branches, worktrees, commits, or PRs, and loomux denies your CLI's file-editing tools.";
 
 /// Hard ceiling on `max_agents` regardless of what the launcher asks for.
 const MAX_AGENTS_CEILING: u32 = 12;
@@ -3487,6 +3515,39 @@ channel; keep the human oriented with short summaries."
              GitHub issue comment, then `report` and exit. You never write code, branches, \
              worktrees, or PRs (loomux also denies those at the CLI level)."
         ),
+        // #1161 M1: the MINIMAL core, and deliberately not `common` — every
+        // clause of that spine is false here. A manager has no `report`
+        // (it never completes), no branch (it never writes), and no "one task
+        // per session" (its session IS the human's ongoing conversation). The
+        // elicitation method, the brief hand-off and the mailbox turn-start
+        // discipline are M4's, and land here rather than anywhere else because
+        // a `mode: replace` persona would never read `manager.md`.
+        //
+        // Reachable only through a hand-edited `group.json` today —
+        // `persona_allowed` denies a manager a persona, so the parser can never
+        // produce a replace-mode manager — but written as a real contract
+        // rather than an `unreachable!()`, because that denial is a policy
+        // decision (D1) that a later human opt-in could relax, and because M4
+        // fills this arm in for its own reasons.
+        Role::Manager => "\
+These loomux mechanics are guaranteed by the app and are NOT optional, whatever your \
+persona says:\n\
+- **You are the human's interface to this group, not one of its delegates.** You \
+converse with the human in this pane: project discussion, status, and turning a rough \
+feature request into something specific enough to build. You hold no authority the human \
+has not exercised themselves.\n\
+- You act through the loomux MCP tools. `message_orchestrator(text)` is how you reach the \
+orchestrator; `list_agents()` / `get_state()` / `list_tasks()` / `list_verdicts()` / \
+`list_questions()` are read-only context — answer \"how is it going\" from those rather \
+than by spending an orchestrator turn on it. These tools never need approval; use them, \
+don't ask the human to.\n\
+- You never write the repository: no branches, no commits, no PRs, no merges (loomux also \
+denies your CLI's file-editing tools). You read it, so that what you ask the human is \
+grounded in what is actually there.\n\
+- You relay; you do not decide. A direction the human gives you goes to the orchestrator \
+as THEIR direction, quoted, not as yours — and the human's own sign-off on GitHub remains \
+the only thing that starts or merges work."
+            .to_string(),
         // A solo pane never gets a kickoff/persona — it's an arbitrary
         // human-launched CLI, not a loomux delegate. Never reached.
         Role::Solo => unreachable!("solo panes have no mechanics core — they receive no kickoff"),
@@ -4190,10 +4251,17 @@ impl Guardrails {
         for b in &mut self.blocks {
             b.id = workflow::sanitize_id(&b.id).unwrap_or_else(|| b.kind.as_str().to_string());
         }
-        // 2. The four class names are RESERVED as ids for their own class. An
-        //    `id: planner, kind: reviewer` block would write its contract to
-        //    `reviewer.md` — the real reviewer's file (see
+        // 2. The FIVE class names are RESERVED as ids for their own class (#1161
+        //    added `manager`). An `id: planner, kind: reviewer` block would write
+        //    its contract to `reviewer.md` — the real reviewer's file (see
         //    `workflow::Block::instructions_file`) — and clobber it.
+        //
+        //    This step reads `kind_from_str`, so widening that function widens
+        //    this drop: an already-persisted `group.json` carrying
+        //    `id: manager, kind: worker` — legal to write before #1161 — now
+        //    loses that block silently here, where `parse_workflow` would refuse
+        //    the whole file. Both are the intended treatment of an id that has
+        //    become a class name; see the parser's arm for the argument.
         self.blocks
             .retain(|b| workflow::kind_from_str(&b.id).is_none_or(|reserved| reserved == b.kind));
         // 3. Ids are unique. A duplicate makes `block(id)` resolve to whichever
@@ -5940,8 +6008,15 @@ pub fn spawn_request_expired(deadline_ms: u64, now_ms: u64) -> bool {
 /// both `SpawnRequest` construction sites (`spawn_agent_ex` for delegates,
 /// `create_orchestration_group` for the orchestrator) call this SAME
 /// function, so the "orchestrator is exempt" rule can't drift between them.
+///
+/// **The manager (#1161) is exempt on #260's own argument, not by analogy.**
+/// That argument is "the pane the human works through is never hidden", and
+/// the manager is that pane more literally than the orchestrator: a docked
+/// manager is a conversation the human cannot see, in a class whose entire
+/// purpose is that they are in it. A minimized manager would also be the one
+/// pane a human could not tell apart from an absent one.
 pub fn spawn_opens_minimized(role: Role, group_opted_expanded: bool) -> bool {
-    role != Role::Orchestrator && !group_opted_expanded
+    !matches!(role, Role::Orchestrator | Role::Manager) && !group_opted_expanded
 }
 
 /// Whether the spawn-rate guardrail should reject the next spawn: true when
@@ -36040,7 +36115,8 @@ impl OrchRegistry {
             .filter(|a| a.group == group && a.status != AgentStatus::Dead)
             .cloned()
             .collect();
-        let (mut orch, mut worker, mut reviewer, mut planner) = (0u32, 0u32, 0u32, 0u32);
+        let (mut orch, mut worker, mut reviewer, mut planner, mut manager) =
+            (0u32, 0u32, 0u32, 0u32, 0u32);
         let mut earliest: Option<u64> = None;
         // Production bug fix (PR #329 round 7): same override this group's
         // escalation threshold uses (`agent_context_percents`) — one shared
@@ -36054,6 +36130,7 @@ impl OrchRegistry {
                     Role::Worker => worker += 1,
                     Role::Reviewer => reviewer += 1,
                     Role::Planner => planner += 1,
+                    Role::Manager => manager += 1,
                     // A solo pane never belongs to a real orchestration
                     // group's summary — it lives in `__solo__` — but the
                     // match must stay exhaustive.
@@ -36110,11 +36187,17 @@ impl OrchRegistry {
             // cap would (harmlessly) block spawns until attrition. Must match
             // `live_delegate_count` (the value enforcement actually reads):
             // planners count too (#47), so a cap-below-live warning stays honest.
+            // A manager counts here for exactly that reason and no other —
+            // `live_delegate_count` exempts only the orchestrator, so today a
+            // live manager DOES occupy a cap slot, and a summary that left it
+            // out would under-report the number enforcement uses. #1161 M3
+            // decides whether to exempt it; when it does, this sum moves with
+            // `live_delegate_count`, not before it.
             "max_agents": self.group(group).map(|g| g.guardrails.max_agents),
-            "live_delegates": worker + reviewer + planner,
+            "live_delegates": worker + reviewer + planner + manager,
             "paused": self.is_paused(group),
             "uptime_ms": earliest.map(|e| now.saturating_sub(e)),
-            "roles": { "orchestrator": orch, "worker": worker, "reviewer": reviewer, "planner": planner },
+            "roles": { "orchestrator": orch, "worker": worker, "reviewer": reviewer, "planner": planner, "manager": manager },
             "agents": list,
         })
     }
@@ -36584,11 +36667,18 @@ impl OrchRegistry {
             None => String::new(),
         };
         let cli = &g.guardrails.agent_cli;
+        // The `{{BLOCKS}}` list, under a heading that reads "Your delegates" and
+        // is immediately followed by "**Spawn by block, not by kind.**" — so the
+        // same rule as `roster_note` above applies, from the same predicate
+        // (#1161 review B1). A manager is not a delegate and is not spawnable;
+        // listing it here told the orchestrator to call a route this same slice
+        // refuses, which is the flat contradiction the liaison note below was
+        // written to avoid for its own class.
         let rows: Vec<String> = g
             .guardrails
             .blocks
             .iter()
-            .filter(|b| b.kind != Role::Orchestrator)
+            .filter(|b| workflow::is_spawnable_block(b))
             .map(|b| {
                 format!(
                     "- **`{id}`** — {name} · {kind} · {cli} · model `{model}`{persona}",
@@ -36946,6 +37036,17 @@ impl OrchRegistry {
         // separately-derived one that could drift from what actually got
         // written.
         let mut current: HashSet<String> = HashSet::new();
+        // HAND-LISTED, and `Role::Manager` is deliberately NOT in it (#1161).
+        // The list is not "every capability class" — it is "the classes whose
+        // instruction file must exist even when the roster omits the block",
+        // and that requirement comes from legacy sessions rejoining without a
+        // block id (`kickoff_prompt`'s class fallback). No session predates the
+        // manager, so nothing can fall back to `manager.md`; adding it here
+        // would instead write that file into EVERY group dir, including every
+        // default one — a visible change to the default path for a feature the
+        // repo never declared, which is exactly what clarification (1) of #1161
+        // forbids. A declared manager's file is written by the block loop below,
+        // like any other declared block's.
         for role in [Role::Orchestrator, Role::Worker, Role::Reviewer, Role::Planner] {
             // Skip the classes the roster covers — a block whose id is a class
             // name owns that class's file (ids are reserved per class, see
@@ -38688,14 +38789,27 @@ impl OrchRegistry {
         // block's instruction file are resolved through, so a `mode: replace`
         // orchestrator persona cannot rewrite `orchestrator.md` either. See
         // `parse_workflow` for why the trust root is not a customization surface.
+        //
+        // #1161: `persona_allowed` now answers `false` for a MANAGER block too
+        // (decision D1), and it drops through this same door. The audit ACTION
+        // keeps its historic name — it is a durable record key other tooling
+        // and tests read, and renaming it would rewrite the meaning of every
+        // record already on disk — while the `why` field names the block's own
+        // class, so a record says which rule fired.
         if !workflow::persona_allowed(block) && (block.has_persona() || !block.allow.is_empty()) {
             self.audit(&group.id, "loomux", "workflow-orchestrator-persona-denied", json!({
                 "block": block.id,
+                "kind": block.kind,
                 "prompt": block.prompt.is_some(),
                 "profile": block.profile,
                 "allow": block.allow,
-                "why": "the orchestrator is loomux's trust root — a repo file may not author its \
-                        prompt or pre-approve its tools",
+                "why": if block.kind == Role::Manager {
+                    "a manager speaks to the human and relays their direction into the trust root \
+                     — a repo file may not author its prompt or pre-approve its tools"
+                } else {
+                    "the orchestrator is loomux's trust root — a repo file may not author its \
+                     prompt or pre-approve its tools"
+                },
             }));
             return Ok(None);
         }
@@ -40327,6 +40441,16 @@ impl OrchRegistry {
         // group's own orchestrator in tests. Neither check is redundant: this one
         // catches `block: "<an orchestrator block>"`, which arrives with
         // `kind: worker` and would otherwise be promoted by `role = block.kind`.
+        //
+        // #1161: a MANAGER block deliberately has NO twin of this guard here,
+        // and the asymmetry is chosen rather than missed. `mcp::call_tool` is
+        // the only agent-reachable entry point and refuses it there (by `kind`
+        // and by `block`); this function is also the path loomux's own
+        // launch-time open will take in M3, so a blanket refusal keyed on
+        // `Role::Manager` here would refuse the one caller that is supposed to
+        // succeed. The orchestrator-block guard can be unconditional because
+        // loomux registers the group's own orchestrator through the un-named
+        // path; M3 decides which shape the manager's launch path takes.
         if block.kind == Role::Orchestrator && named.is_some() {
             return Err(format!(
                 "block {:?} is an orchestrator block — a group has exactly one orchestrator, opened at launch",
@@ -40446,7 +40570,17 @@ impl OrchRegistry {
                 return Err(format!("cwd does not exist: {c}"));
             }
             (c, String::new(), None)
-        } else if use_worktree && role != Role::Orchestrator && role != Role::Planner {
+        } else if use_worktree
+            && role != Role::Orchestrator
+            && role != Role::Planner
+            // #1161: never a worktree for a manager, on the orchestrator's
+            // rule rather than the planner's. A manager works in the repo the
+            // human is talking about — the same checkout they have open — and
+            // a branch cut for a pane that never commits is a stray branch and
+            // a stray directory per session. `needs_dedicated_workspace`
+            // (mcp.rs) is the other half and likewise excludes it.
+            && role != Role::Manager
+        {
             // Cut the branch from the default branch (or an explicit `base`),
             // never the primary checkout's incidental HEAD (#204).
             // `_sync` because this is not the command path: spawning runs on
@@ -40483,6 +40617,12 @@ impl OrchRegistry {
             (wt.clone(), note, Some(branch_name.clone()))
         } else if role == Role::Orchestrator {
             (group.repo.clone(), String::new(), None)
+        } else if role == Role::Manager {
+            // The repo root, like the orchestrator — and a note, unlike it,
+            // because a manager's containment (`NoEdits`) leaves the shell
+            // whole, so the first thing that stops it is a denied Edit tool and
+            // that should read as policy rather than as a broken environment.
+            (group.repo.clone(), MANAGER_WORKSPACE_NOTE.to_string(), None)
         } else if role == Role::Reviewer {
             (group.repo.clone(), "You review; you do not create branches or push. Inspect PRs via gh (checking out the PR branch locally is fine).".to_string(), None)
         } else if role == Role::Planner {
@@ -40947,11 +41087,17 @@ impl OrchRegistry {
         if !workflow::roster_is_custom(&g.guardrails.blocks) {
             return String::new();
         }
+        // `is_spawnable_block`, not `kind != Orchestrator` (#1161 review B1):
+        // this list's own sentence tells the orchestrator to pass each id to
+        // `spawn_agent`, so a block that tool refuses may not appear in it. The
+        // two spellings were the same statement while the orchestrator was the
+        // only unspawnable class; they stopped being the same the moment a
+        // second one existed.
         let rows: Vec<String> = g
             .guardrails
             .blocks
             .iter()
-            .filter(|b| b.kind != Role::Orchestrator)
+            .filter(|b| workflow::is_spawnable_block(b))
             .map(|b| {
                 format!(
                     "  - {} ({}, {}, {}){}",
@@ -41111,6 +41257,25 @@ impl OrchRegistry {
                     format!("{head}\nYour task:\n{}", a.task)
                 }
             }
+            // #1161. Its own arm rather than joining the delegate one above,
+            // because two of that arm's three moves are wrong here: a manager
+            // has no assigned task (the human's first message is the task), and
+            // "call report(\"progress\", \"ready\") and wait for prompts" names
+            // a tool it does not hold and a delivery channel it does not take.
+            // The head is otherwise deliberately the same shape — name, id,
+            // group, repo, instructions file, workspace note, delivery id — so
+            // the one thing that differs between a manager's kickoff and every
+            // other is the thing that genuinely differs.
+            Role::Manager => format!(
+                "You are \"{name}\" ({id}), the MANAGER of loomux agent group {gid} for repository \
+                 {repo} — the human's own interface to this group, not one of its delegates.\n\
+                 First read your role instructions: {ins}\n{note}\n{delivery}\n\
+                 Greet the human briefly, say what you can do for them, and wait. They set the \
+                 agenda in this pane; nothing else will.",
+                name = a.name, id = a.id, gid = g.id, repo = g.repo,
+                ins = instructions.display(), note = branch_note,
+                delivery = kickoff_delivery_note(&g.id, &a.id),
+            ),
             // A solo pane never gets a kickoff (see `role_template`'s doc) —
             // `spawn_agent_ex`/`kickoff_prompt` are never called for one.
             Role::Solo => unreachable!("solo panes never receive a kickoff"),
