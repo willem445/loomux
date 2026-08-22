@@ -589,6 +589,22 @@
 //! proof is `fn find_claude_session_cwd(root: &Path, session_id: &PathSegment)`
 //! is file-scoped — the flagged `format!` and its proof travel in the same file,
 //! so the row stays proven.
+//!
+//! # Modules born here rather than moved
+//!
+//! [`mailbox`] (#1161 M2) is the first module in this crate that was never in
+//! `src-tauri` at all. It is not a batch and does not appear in the sequence
+//! above, which is why it is called out: a reader tracing "which batch moved
+//! this" would otherwise search for one that does not exist.
+//!
+//! It is here because the #888 *direction* — not just its backlog — says so.
+//! The manager mailbox is orchestration state: a per-group file, a validation
+//! rule and a retention policy, with nothing host-shaped in it. Landing it in
+//! `src-tauri` and moving it later would be a batch nobody needed to schedule.
+//! Its host-side half (the `OrchRegistry` methods that hold the lock, write the
+//! file and emit the event) stays in `mod.rs` with every other registry method,
+//! exactly as `humanq`'s does — the split is the same one, drawn in the same
+//! place, and only the crate the pure half lives in differs.
 
 pub mod brand;
 pub mod fsatomic;
@@ -596,6 +612,7 @@ pub mod groupid;
 pub mod intake;
 pub mod lessons;
 pub mod locks;
+pub mod mailbox;
 pub mod mergeq;
 pub mod mergeqview;
 pub mod model;
