@@ -2459,14 +2459,14 @@ fn enqueue_text_was_first_is_true_only_for_the_admission_that_finds_an_empty_que
     let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
     let pty = 112u32;
 
-    let first = reg.enqueue_text(&g.id, &w.id, "loomux", "one", pty, queue::EnqueueReason::Arrival).unwrap();
+    let first = reg.enqueue_text(&g.id, &w.id, "orrerix", "one", pty, queue::EnqueueReason::Arrival).unwrap();
     assert!(first.was_first, "the first admission to an empty queue must observe was_first: true");
 
-    let second = reg.enqueue_text(&g.id, &w.id, "loomux", "two", pty, queue::EnqueueReason::Arrival).unwrap();
+    let second = reg.enqueue_text(&g.id, &w.id, "orrerix", "two", pty, queue::EnqueueReason::Arrival).unwrap();
     assert!(!second.was_first, "landing behind an existing entry must never report was_first: true");
     assert!(second.id > first.id, "ids still increase monotonically regardless of was_first");
 
-    let coalesced = reg.enqueue_text(&g.id, &w.id, "loomux", "one", pty, queue::EnqueueReason::Arrival).unwrap();
+    let coalesced = reg.enqueue_text(&g.id, &w.id, "orrerix", "one", pty, queue::EnqueueReason::Arrival).unwrap();
     assert!(!coalesced.was_first, "a coalesce match must never report was_first: true");
     assert_eq!(coalesced.id, first.id, "a coalesce reports the id of the entry it merged into");
     assert_eq!(reg.queue_depth(pty), 2, "the coalesced duplicate must not grow the queue");
@@ -2480,13 +2480,13 @@ fn enqueue_text_rejects_newest_at_cap_never_evicts_oldest() {
     let pty = 102u32;
 
     for i in 0..queue::QUEUE_MAX_PER_PANE {
-        reg.enqueue_text(&g.id, &w.id, "loomux", &format!("distinct-{i}"), pty, queue::EnqueueReason::BehindQueue)
+        reg.enqueue_text(&g.id, &w.id, "orrerix", &format!("distinct-{i}"), pty, queue::EnqueueReason::BehindQueue)
             .unwrap();
     }
     assert_eq!(reg.queue_depth(pty), queue::QUEUE_MAX_PER_PANE);
 
     let err = reg
-        .enqueue_text(&g.id, &w.id, "loomux", "one-too-many", pty, queue::EnqueueReason::Question)
+        .enqueue_text(&g.id, &w.id, "orrerix", "one-too-many", pty, queue::EnqueueReason::Question)
         .unwrap_err();
     assert!(err.contains("NOT queued"), "must be a synchronous, truthful rejection: {err}");
     assert_eq!(reg.queue_depth(pty), queue::QUEUE_MAX_PER_PANE, "depth must not change on rejection");
@@ -2509,16 +2509,16 @@ fn enqueue_text_coalesces_a_byte_identical_repeat_and_bumps_the_counter() {
     let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
     let pty = 103u32;
 
-    reg.enqueue_text(&g.id, &w.id, "loomux", "give me a status update", pty, queue::EnqueueReason::Question).unwrap();
-    reg.enqueue_text(&g.id, &w.id, "loomux", "give me a status update", pty, queue::EnqueueReason::BehindQueue).unwrap();
-    reg.enqueue_text(&g.id, &w.id, "loomux", "give me a status update", pty, queue::EnqueueReason::BehindQueue).unwrap();
+    reg.enqueue_text(&g.id, &w.id, "orrerix", "give me a status update", pty, queue::EnqueueReason::Question).unwrap();
+    reg.enqueue_text(&g.id, &w.id, "orrerix", "give me a status update", pty, queue::EnqueueReason::BehindQueue).unwrap();
+    reg.enqueue_text(&g.id, &w.id, "orrerix", "give me a status update", pty, queue::EnqueueReason::BehindQueue).unwrap();
 
     assert_eq!(reg.queue_depth(pty), 1, "byte-identical repeats must collapse, not accumulate");
     assert_eq!(reg.queue_snapshot(pty)[0].coalesced, 2, "two duplicates coalesced into the original");
 
     // A DIFFERENT ask must still be admitted — coalescing never guesses at
     // semantic staleness, only exact-byte repeats.
-    reg.enqueue_text(&g.id, &w.id, "loomux", "give me a status update now", pty, queue::EnqueueReason::BehindQueue).unwrap();
+    reg.enqueue_text(&g.id, &w.id, "orrerix", "give me a status update now", pty, queue::EnqueueReason::BehindQueue).unwrap();
     assert_eq!(reg.queue_depth(pty), 2);
 
     let coalesced_audits =
@@ -2533,8 +2533,8 @@ fn enqueue_stranded_front_lands_ahead_of_already_queued_text() {
     let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
     let pty = 104u32;
 
-    reg.enqueue_text(&g.id, &w.id, "loomux", "queued behind", pty, queue::EnqueueReason::BehindQueue).unwrap();
-    reg.enqueue_stranded_front(&g.id, &w.id, "loomux", pty, queue::EnqueueReason::Question)
+    reg.enqueue_text(&g.id, &w.id, "orrerix", "queued behind", pty, queue::EnqueueReason::BehindQueue).unwrap();
+    reg.enqueue_stranded_front(&g.id, &w.id, "orrerix", pty, queue::EnqueueReason::Question)
         .unwrap();
 
     let snap = reg.queue_snapshot(pty);
@@ -2551,10 +2551,10 @@ fn enqueue_stranded_front_respects_the_same_cap() {
     let pty = 105u32;
 
     for i in 0..queue::QUEUE_MAX_PER_PANE {
-        reg.enqueue_text(&g.id, &w.id, "loomux", &format!("d-{i}"), pty, queue::EnqueueReason::BehindQueue).unwrap();
+        reg.enqueue_text(&g.id, &w.id, "orrerix", &format!("d-{i}"), pty, queue::EnqueueReason::BehindQueue).unwrap();
     }
     let err = reg
-        .enqueue_stranded_front(&g.id, &w.id, "loomux", pty, queue::EnqueueReason::Question)
+        .enqueue_stranded_front(&g.id, &w.id, "orrerix", pty, queue::EnqueueReason::Question)
         .unwrap_err();
     assert!(err.contains("NOT queued"), "got: {err}");
 }
@@ -2566,8 +2566,8 @@ fn pop_front_dequeued_removes_only_a_matching_front_id_and_audits_queued_ms() {
     let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
     let pty = 106u32;
 
-    reg.enqueue_text(&g.id, &w.id, "loomux", "first", pty, queue::EnqueueReason::Question).unwrap();
-    reg.enqueue_text(&g.id, &w.id, "loomux", "second", pty, queue::EnqueueReason::BehindQueue).unwrap();
+    reg.enqueue_text(&g.id, &w.id, "orrerix", "first", pty, queue::EnqueueReason::Question).unwrap();
+    reg.enqueue_text(&g.id, &w.id, "orrerix", "second", pty, queue::EnqueueReason::BehindQueue).unwrap();
     let first_id = reg.queue_snapshot(pty)[0].id;
     let first_enqueued_ms = reg.queue_snapshot(pty)[0].enqueued_ms;
 
@@ -3003,8 +3003,8 @@ fn drop_queue_audits_every_entry_individually_and_sends_one_coalesced_notice() {
     let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
     let pty = 107u32;
 
-    reg.enqueue_text(&g.id, &w.id, "loomux", "one", pty, queue::EnqueueReason::Question).unwrap();
-    reg.enqueue_text(&g.id, &w.id, "loomux", "two", pty, queue::EnqueueReason::BehindQueue).unwrap();
+    reg.enqueue_text(&g.id, &w.id, "orrerix", "one", pty, queue::EnqueueReason::Question).unwrap();
+    reg.enqueue_text(&g.id, &w.id, "orrerix", "two", pty, queue::EnqueueReason::BehindQueue).unwrap();
     let ids: Vec<u64> = reg.queue_snapshot(pty).iter().map(|e| e.id).collect();
 
     reg.drop_queue(&g.id, pty, queue::DropReason::AgentDied);
@@ -3050,8 +3050,8 @@ fn queue_orphans_finds_an_enqueued_entry_with_no_terminal_event() {
         let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
         let pty = 108u32;
 
-        reg.enqueue_text(&g.id, &w.id, "loomux", "resolved", pty, queue::EnqueueReason::Question).unwrap();
-        reg.enqueue_text(&g.id, &w.id, "loomux", "orphaned", pty, queue::EnqueueReason::BehindQueue).unwrap();
+        reg.enqueue_text(&g.id, &w.id, "orrerix", "resolved", pty, queue::EnqueueReason::Question).unwrap();
+        reg.enqueue_text(&g.id, &w.id, "orrerix", "orphaned", pty, queue::EnqueueReason::BehindQueue).unwrap();
         let snap = reg.queue_snapshot(pty);
         let (resolved_id, orphaned_id) = (snap[0].id, snap[1].id);
 
@@ -4415,7 +4415,7 @@ fn orch_pane_at_capacity(reg: &OrchRegistry, pty: u32) -> (GroupId, AgentEntry, 
     // Distinct texts, or `admit`'s byte-identical coalescing would fold them
     // into one entry and the pane would never reach its cap.
     for i in 0..queue::QUEUE_MAX_PER_PANE {
-        reg.enqueue_text(&g.id, &orch.id, "loomux", &format!("[orrerix] advisory {i}"), pty,
+        reg.enqueue_text(&g.id, &orch.id, "orrerix", &format!("[orrerix] advisory {i}"), pty,
             queue::EnqueueReason::Arrival).unwrap();
     }
     assert_eq!(reg.queue_depth(pty), queue::QUEUE_MAX_PER_PANE, "precondition: the pane is full");
@@ -5121,7 +5121,7 @@ fn a_worker_pane_that_drains_is_told_by_a_delivery_rather_than_a_relay() {
     let pty = 5891u32;
     reg.set_pty_for_test(&w.id, pty);
     for i in 0..queue::QUEUE_MAX_PER_PANE {
-        reg.enqueue_text(&g.id, &w.id, "loomux", &format!("[orrerix] advisory {i}"), pty,
+        reg.enqueue_text(&g.id, &w.id, "orrerix", &format!("[orrerix] advisory {i}"), pty,
             queue::EnqueueReason::Arrival).unwrap();
     }
 
@@ -5331,7 +5331,7 @@ fn a_refused_roster_never_becomes_a_line_in_the_next_roster() {
     let roster_text = format!("{REFUSAL_ROSTER_OPENER} While it was full, 1 delivery to you was \
         REFUSED and never queued");
     let real = "report: done, PR #654 is ready";
-    let by_reason = refusal_line(1_000, "loomux", "orch-1", &roster_text, "refusal-roster");
+    let by_reason = refusal_line(1_000, "orrerix", "orch-1", &roster_text, "refusal-roster");
     let by_opener = AuditEntry {
         ts_ms: 1_001,
         actor: "loomux".into(),
@@ -5451,7 +5451,7 @@ fn the_roster_is_emitted_once_per_drain_and_never_recurses() {
 
     // Back to the cap and down again, with nothing refused in between: the
     // second drain has nothing to say and must say nothing.
-    reg.enqueue_text(&gid, &orch.id, "loomux", "[orrerix] advisory refill", pty,
+    reg.enqueue_text(&gid, &orch.id, "orrerix", "[orrerix] advisory refill", pty,
         queue::EnqueueReason::Arrival).unwrap();
     assert_eq!(reg.queue_depth(pty), queue::QUEUE_MAX_PER_PANE);
     let front = reg.queue_snapshot(pty).remove(0);
@@ -5485,7 +5485,7 @@ fn deliver_prompt_front_door_enqueues_behind_a_non_empty_queue_without_an_app_ha
     let pty = 109u32;
     reg.set_pty_for_test(&w.id, pty);
 
-    reg.enqueue_text(&g.id, &w.id, "loomux", "already queued", pty, queue::EnqueueReason::Question).unwrap();
+    reg.enqueue_text(&g.id, &w.id, "orrerix", "already queued", pty, queue::EnqueueReason::Question).unwrap();
     assert_eq!(reg.queue_depth(pty), 1);
 
     reg.deliver_prompt(&w.id, "a fresh prompt", "orch", Delivery::MidSession)
@@ -5531,7 +5531,7 @@ fn deliver_prompt_front_door_propagates_the_synchronous_full_error() {
     reg.set_pty_for_test(&w.id, pty);
 
     for i in 0..queue::QUEUE_MAX_PER_PANE {
-        reg.enqueue_text(&g.id, &w.id, "loomux", &format!("d-{i}"), pty, queue::EnqueueReason::BehindQueue).unwrap();
+        reg.enqueue_text(&g.id, &w.id, "orrerix", &format!("d-{i}"), pty, queue::EnqueueReason::BehindQueue).unwrap();
     }
     let err = reg.deliver_prompt(&w.id, "one too many", "orch", Delivery::MidSession).unwrap_err();
     assert!(err.contains("NOT queued"), "the ORIGINAL caller must see the truthful rejection, got: {err}");
@@ -6507,7 +6507,7 @@ fn copilot_tool_permission_flags_ride_one_occurrence_each() {
     let attended = cmd(false, Containment::None, &persona);
     assert_eq!(
         copilot_tool_patterns(&attended, "--allow-tool"),
-        ["loomux", "shell(git:*)", "shell(gh:*)", "shell(npm:*)", "shell(cargo:*)"],
+        ["orrerix", "shell(git:*)", "shell(gh:*)", "shell(npm:*)", "shell(cargo:*)"],
         "every allow pattern must sit in one comma-separated value, MCP server first: {attended}"
     );
 
@@ -6516,7 +6516,7 @@ fn copilot_tool_permission_flags_ride_one_occurrence_each() {
     let unattended = cmd(true, Containment::None, &persona);
     assert_eq!(
         copilot_tool_patterns(&unattended, "--allow-tool"),
-        ["loomux", "shell(npm:*)", "shell(cargo:*)"],
+        ["orrerix", "shell(npm:*)", "shell(cargo:*)"],
         "an unattended agent drops the git/gh pair (it has --allow-all-tools) but never the \
          MCP grant: {unattended}"
     );
@@ -6530,7 +6530,7 @@ fn copilot_tool_permission_flags_ride_one_occurrence_each() {
     );
     // …and the read-only class still grants loomux, which is the whole point:
     // a planner with no MCP tools cannot post its plan or report.
-    assert_eq!(copilot_tool_patterns(&planner, "--allow-tool"), ["loomux"]);
+    assert_eq!(copilot_tool_patterns(&planner, "--allow-tool"), ["orrerix"]);
 
     // An uncontained agent emits no `--deny-tool` at all rather than an empty
     // value — a flag with nothing after it is a parse hazard, not a no-op.
@@ -6555,7 +6555,7 @@ fn copilot_command_uses_copilot_adapter_flags() {
     // The bare MCP server name is copilot's documented "all tools from this
     // server" form (`SERVER-NAME` row of the tool-permission-patterns table);
     // #802 changed only its packaging, never the value.
-    assert!(copilot_tool_patterns(&cmd, "--allow-tool").contains(&"loomux".to_string()), "got: {cmd}");
+    assert!(copilot_tool_patterns(&cmd, "--allow-tool").contains(&"orrerix".to_string()), "got: {cmd}");
     assert!(cmd.contains("--add-dir \"C:/data/group\""));
     assert!(
         cmd.contains("--add-dir \"C:/repo\""),
@@ -7076,7 +7076,7 @@ fn build_agent_command_full_line_snapshots() {
         cmd("copilot", "auto", true, Containment::None),
         "copilot --additional-mcp-config \"@C:/x/cfg.json\" --model auto \
          --add-dir \"C:/data/group\" --add-dir \"C:/repo\" --no-auto-update \
-         --autopilot --allow-all-tools --allow-all-paths --allow-tool \"loomux\""
+         --autopilot --allow-all-tools --allow-all-paths --allow-tool \"orrerix\""
     );
 
     // Copilot worker, auto_ops OFF → the conservative git/gh allowlist branch.
@@ -7109,7 +7109,7 @@ fn build_agent_command_full_line_snapshots() {
         cmd("copilot", "auto", false, Containment::ReadOnly),
         "copilot --additional-mcp-config \"@C:/x/cfg.json\" --model auto \
          --add-dir \"C:/data/group\" --add-dir \"C:/repo\" --no-auto-update \
-         --autopilot --allow-all-tools --allow-all-paths --allow-tool \"loomux\" \
+         --autopilot --allow-all-tools --allow-all-paths --allow-tool \"orrerix\" \
          --deny-tool \"write,shell(git commit),shell(git push)\""
     );
 
@@ -7135,7 +7135,7 @@ fn build_agent_command_full_line_snapshots() {
         cmd("copilot", "auto", true, Containment::NoEdits),
         "copilot --additional-mcp-config \"@C:/x/cfg.json\" --model auto \
          --add-dir \"C:/data/group\" --add-dir \"C:/repo\" --no-auto-update \
-         --autopilot --allow-all-tools --allow-all-paths --allow-tool \"loomux\" \
+         --autopilot --allow-all-tools --allow-all-paths --allow-tool \"orrerix\" \
          --deny-tool \"write\""
     );
     assert_eq!(
@@ -7588,7 +7588,7 @@ fn build_agent_argv_snapshots() {
             "copilot", "--additional-mcp-config", "@C:/x/cfg.json", "--model", "auto", "--add-dir",
             "C:/data/group", "--add-dir", "C:/repo", "--no-auto-update",
             "--autopilot", "--allow-all-tools", "--allow-all-paths",
-            "--allow-tool", "loomux", "--deny-tool", "write",
+            "--allow-tool", "orrerix", "--deny-tool", "write",
         ]
     );
 
@@ -7601,7 +7601,7 @@ fn build_agent_argv_snapshots() {
             "copilot", "--additional-mcp-config", "@C:/x/cfg.json", "--model", "auto", "--add-dir",
             "C:/data/group", "--add-dir", "C:/repo", "--no-auto-update",
             "--autopilot", "--allow-all-tools", "--allow-all-paths",
-            "--allow-tool", "loomux",
+            "--allow-tool", "orrerix",
             "--deny-tool", "write,shell(git commit),shell(git push)",
         ]
     );
@@ -7767,7 +7767,7 @@ fn gemini_is_a_supported_orchestration_cli() {
 /// different CLI's spelling of something loomux already does for claude and
 /// copilot:
 ///
-/// - **`--allowed-mcp-server-names loomux`** — gemini's analogue of claude's
+/// - **`--allowed-mcp-server-names <server>`** — gemini's analogue of claude's
 ///   `--strict-mcp-config`: the reviewer reaches `review_verdict` and nothing
 ///   the user's own settings might have added. (The server itself is declared
 ///   in the generated settings file, not on argv — gemini has no
@@ -7796,7 +7796,7 @@ fn gemini_reviewer_command_is_a_gemini_invocation() {
     for want in [
         "--model pro",
         "--approval-mode yolo",
-        "--allowed-mcp-server-names loomux",
+        "--allowed-mcp-server-names orrerix",
     ] {
         assert!(cmd.contains(want), "gemini command is missing {want:?}: {cmd}");
     }
@@ -8030,14 +8030,14 @@ fn a_gemini_agent_reaches_the_same_loomux_mcp_server_every_other_cli_does() {
     let settings: Value =
         serde_json::from_str(&gemini_settings_json(5123, "tok-abc", Containment::NoEdits, None))
             .expect("valid JSON");
-    let server = &settings["mcpServers"]["loomux"];
+    let server = &settings["mcpServers"]["orrerix"];
     assert_eq!(
         server["httpUrl"].as_str(),
         Some("http://127.0.0.1:5123/mcp"),
         "gemini must be pointed at THIS loomux instance's port: {settings}"
     );
     assert_eq!(
-        server["headers"]["X-Loomux-Agent"].as_str(),
+        server["headers"]["X-Orrerix-Agent"].as_str(),
         Some("tok-abc"),
         "the per-agent token is what makes `review_verdict` attributable: {settings}"
     );
@@ -8637,17 +8637,17 @@ fn an_opencode_spawn_delivers_its_config_and_containment_by_env() {
         env.get("OPENCODE_CONFIG_CONTENT").expect("the generated config must ride the pane env"),
     )
     .expect("OPENCODE_CONFIG_CONTENT must be valid JSON");
-    assert_eq!(cfg["mcp"]["loomux"]["type"].as_str(), Some("remote"), "{cfg}");
+    assert_eq!(cfg["mcp"]["orrerix"]["type"].as_str(), Some("remote"), "{cfg}");
     assert!(
-        cfg["mcp"]["loomux"]["url"].as_str().unwrap_or_default().contains("/mcp"),
+        cfg["mcp"]["orrerix"]["url"].as_str().unwrap_or_default().contains("/mcp"),
         "the loomux MCP endpoint: {cfg}"
     );
     assert!(
-        cfg["mcp"]["loomux"]["headers"]["X-Loomux-Agent"].is_string(),
+        cfg["mcp"]["orrerix"]["headers"]["X-Orrerix-Agent"].is_string(),
         "the per-agent token is what makes every MCP call attributable: {cfg}"
     );
     assert_eq!(
-        cfg["mcp"]["loomux"]["oauth"], json!(false),
+        cfg["mcp"]["orrerix"]["oauth"], json!(false),
         "OAuth auto-detection is on by default and loomux authenticates by header — a 401 \
          during discovery must not start a flow this server never speaks: {cfg}"
     );
@@ -12066,12 +12066,12 @@ fn path_keys_follow_the_hosts_own_path_semantics() {
 /// single place a reader checks to see what an agent was granted.
 #[test]
 fn copilot_tool_permissions_do_not_repeat_a_pattern() {
-    // `loomux` and `shell(git:*)` are both already in the attended baseline.
-    let extra = vec!["loomux".to_string(), "shell(git:*)".to_string(), "shell(make:*)".to_string()];
+    // The MCP grant and `shell(git:*)` are both already in the attended baseline.
+    let extra = vec!["orrerix".to_string(), "shell(git:*)".to_string(), "shell(make:*)".to_string()];
     let (allow, _) = copilot_tool_permissions(false, Containment::None, &extra);
     assert_eq!(
         allow,
-        ["loomux", "shell(git:*)", "shell(gh:*)", "shell(make:*)"],
+        ["orrerix", "shell(git:*)", "shell(gh:*)", "shell(make:*)"],
         "each pattern appears once, at its FIRST position: {allow:?}"
     );
 }
@@ -12144,7 +12144,7 @@ fn copilot_permissions_grant_writes_the_documented_shape() {
     let approvals = v["locations"][REPO]["tool_approvals"].as_array().unwrap();
     assert_eq!(approvals.len(), 2, "the user's own approval must survive: {merged}");
     assert_eq!(approvals[0]["kind"], "commands");
-    assert_eq!(approvals[1]["serverName"], "loomux");
+    assert_eq!(approvals[1]["serverName"], "orrerix");
 
     // An existing key naming the SAME directory is REUSED, never duplicated:
     // copilot loads exactly one key ("If the key doesn't match, the saved
@@ -12252,7 +12252,7 @@ fn pre_trust_edits_the_legacy_extensionless_permissions_file_when_that_is_the_li
     let v: serde_json::Value = serde_json::from_str(&text).unwrap();
     let approvals = v["locations"][r"C:\Projects\demo"]["tool_approvals"].as_array().unwrap();
     assert_eq!(approvals.len(), 2, "the user's own approval must survive the grant: {text}");
-    assert_eq!(approvals[1]["serverName"], "loomux");
+    assert_eq!(approvals[1]["serverName"], "orrerix");
 }
 
 /// The pure posture function both copilot command builders share — pinned here
@@ -12263,17 +12263,17 @@ fn copilot_tool_permissions_lead_with_the_mcp_grant() {
     let extra = vec!["shell(make:*)".to_string()];
 
     let (allow, deny) = copilot_tool_permissions(true, Containment::None, &extra);
-    assert_eq!(allow, ["loomux", "shell(make:*)"]);
+    assert_eq!(allow, ["orrerix", "shell(make:*)"]);
     assert!(deny.is_empty());
 
     let (allow, deny) = copilot_tool_permissions(false, Containment::None, &extra);
-    assert_eq!(allow, ["loomux", "shell(git:*)", "shell(gh:*)", "shell(make:*)"]);
+    assert_eq!(allow, ["orrerix", "shell(git:*)", "shell(gh:*)", "shell(make:*)"]);
     assert!(deny.is_empty());
 
     // A reviewer (NoEdits) denies writes and nothing git-related — its shell IS
     // its job (#462).
     let (allow, deny) = copilot_tool_permissions(true, Containment::NoEdits, &[]);
-    assert_eq!(allow, ["loomux"]);
+    assert_eq!(allow, ["orrerix"]);
     assert_eq!(deny, ["write"]);
 
     // A planner (ReadOnly) is the ladder's top rung: the reviewer's denials
@@ -12657,7 +12657,7 @@ fn audit_rotates_at_cap_and_backfill_reads_both_generations() {
     // Force a rotation with a tiny cap: the spawn entry moves to audit.1.
     rotate_audit_if_needed(&gdir, 1);
     assert!(gdir.join("audit.1.jsonl").is_file(), "rotation must produce the old generation");
-    reg.audit(&g.id, "loomux", "post-rotate", json!({}));
+    reg.audit(&g.id, "orrerix", "post-rotate", json!({}));
     assert!(gdir.join("audit.jsonl").is_file());
     // Session mapping still resolves from the rotated generation.
     let sessions: Vec<String> = reg.session_roles().into_iter().map(|r| r.session_id).collect();
@@ -15738,11 +15738,11 @@ fn pause_holds_delivery_and_persists_across_restart() {
         // A target with no pane has nowhere to hold anything, paused or not —
         // #569 made those two answers the same `Err` rather than an `Ok` that
         // quietly dropped the payload on the paused side.
-        let err = reg.deliver_prompt(&w.id, "hello", "loomux", Delivery::MidSession).unwrap_err();
+        let err = reg.deliver_prompt(&w.id, "hello", "orrerix", Delivery::MidSession).unwrap_err();
         assert!(err.contains("terminal"), "unpaused delivery must reach the pty step, got: {err}");
         reg.pause_group(&g.id).unwrap();
         let paused_err =
-            reg.deliver_prompt(&w.id, "hello", "loomux", Delivery::MidSession).unwrap_err();
+            reg.deliver_prompt(&w.id, "hello", "orrerix", Delivery::MidSession).unwrap_err();
         assert!(
             paused_err.contains("terminal"),
             "a paused delivery to a pane-less agent must say so too, not report false success:              {paused_err}"
@@ -15752,7 +15752,7 @@ fn pause_holds_delivery_and_persists_across_restart() {
         // the queue, and nothing pasted.
         reg.set_pty_for_test(&w.id, 5698);
         assert!(reg.is_paused(&g.id));
-        reg.deliver_prompt(&w.id, "hello again", "loomux", Delivery::MidSession).unwrap();
+        reg.deliver_prompt(&w.id, "hello again", "orrerix", Delivery::MidSession).unwrap();
         assert_eq!(reg.queue_depth(5698), 1, "a paused delivery is queued, never destroyed");
         let log = fs::read_to_string(reg.state_root().join(g.id.as_str()).join("audit.jsonl")).unwrap();
         assert!(
@@ -21719,8 +21719,8 @@ fn loomux_shim_refuses_outright_with_no_path_that_runs_the_launcher() {
     assert!(cmd.trim_end().ends_with("exit /b 1"), "the .cmd refuses too");
     assert!(cmd.contains("self-launch-blocked"), "the .cmd audits the refusal");
     // Deliberately unlike gh.cmd/git.cmd: no sh delegation, and therefore no
-    // `:loomux_no_sh` fallback that would run the real launcher when sh is absent.
-    assert!(!cmd.contains("LOOMUX_SH") && !cmd.contains("loomux_no_sh"),
+    // `:orrerix_no_sh` fallback that would run the real launcher when sh is absent.
+    assert!(!cmd.contains("ORRERIX_SH") && !cmd.contains("orrerix_no_sh"),
         "a refusal must not have a degraded path that falls through to the launcher");
     // cmd.exe re-parses an echo's text after expanding it, so the message itself
     // (past the `>&2 echo ` redirect, which is meant to be parsed) must carry no
@@ -24156,8 +24156,8 @@ fn no_single_broken_text_tool_can_let_a_gated_command_through() {
                 "with `{tool}` broken, {what} must be refused — [stdout] {out} [stderr] {err}");
             // …and refused BY THE GATE. Without this the sweep would pass just as
             // happily on a shim that died of a shell error, which proves nothing.
-            assert!(err.contains("loomux:"),
-                "with `{tool}` broken, {what} was refused but not by the gate (no loomux refusal \
+            assert!(err.contains("orrerix:"),
+                "with `{tool}` broken, {what} was refused but not by the gate (no gate refusal \
                  on stderr) — [stdout] {out} [stderr] {err}");
         }
     }
@@ -24181,7 +24181,7 @@ fn gh_and_git_shim_deps_preamble_stays_byte_identical() {
     assert_eq!(slice(&gh), slice(&git), "the #509 dependency preamble has drifted between the two shims");
     // And it really does both halves: repair, then assert.
     let p = slice(&gh);
-    assert!(p.contains("PATH=\"$LOOMUX_UTILS:$PATH\""), "prepends the resolved coreutils dir");
+    assert!(p.contains("PATH=\"$ORX_UTILS:$PATH\""), "prepends the resolved coreutils dir");
     // rev-21 N5: match the LIST LINE, not the preamble text. `p.contains(" tr ")`
     // was also satisfied by the prose above it, so a tool named only in a comment
     // would have passed — the assertion would not have caught the drift it exists
@@ -24241,7 +24241,7 @@ fn gh_shim_script_bakes_real_gh_and_enforces_the_guards() {
     assert!(sh.contains("baseRefName"), "resolves the PR base branch");
     assert!(sh.contains("defaultBranchRef"), "resolves the repo default branch");
     // BOTH markers required for a default-branch merge; fail-safe otherwise.
-    assert!(sh.contains("$LOOMUX_GROUP_DIR/autonomous") && sh.contains("$LOOMUX_GROUP_DIR/auto_merge"),
+    assert!(sh.contains("$ORX_GD/autonomous") && sh.contains("$ORX_GD/auto_merge"),
         "checks both consent markers");
     assert!(sh.contains("unverifiable-base"), "fail-safe block on an undeterminable base");
     assert!(sh.contains("merge-gate-blocked") && sh.contains("audit.jsonl"), "audits refusals");
@@ -26910,7 +26910,7 @@ fn record_aborted_preenter_outcome_makes_the_next_deliverys_flush_actually_fire(
 macro_rules! ledger_with {
     ($pty:expr, $submit_sent_ms:expr) => {{
         let m: std::sync::Mutex<HashMap<u32, _>> = std::sync::Mutex::new(HashMap::new());
-        record_inflight_delivery(&m, $pty, $submit_sent_ms, "loomux".to_string(), None);
+        record_inflight_delivery(&m, $pty, $submit_sent_ms, "orrerix".to_string(), None);
         m
     }};
 }
@@ -26942,7 +26942,7 @@ fn a_resends_inflight_claim_supersedes_the_stale_monitor_before_its_own_record_c
     // single line `deliver_now` gained: everything the Enter causes,
     // including the record D1's monitor would otherwise match, happens after
     // this point.
-    record_inflight_delivery(&last_delivery, pty, d2_ms, "loomux".to_string(), None);
+    record_inflight_delivery(&last_delivery, pty, d2_ms, "orrerix".to_string(), None);
 
     // (3) D1's monitor's next tick, taken in the real order: hook first, then
     // ledger. Any record it can see now is checked against a ledger that
@@ -27023,7 +27023,7 @@ fn a_stranded_badge_survives_an_inflight_claim_and_drops_on_a_confirmed_one() {
     let d1_ms = 1_000u64;
     let last_delivery = ledger_with!(pty, d1_ms);
 
-    record_inflight_delivery(&last_delivery, pty, 9_000, "loomux".to_string(), None);
+    record_inflight_delivery(&last_delivery, pty, 9_000, "orrerix".to_string(), None);
     assert_eq!(
         observe_ledger(&last_delivery, pty, d1_ms),
         LedgerView { superseded: true, outstanding: false, newer_confirmed: false },
@@ -27033,7 +27033,7 @@ fn a_stranded_badge_survives_an_inflight_claim_and_drops_on_a_confirmed_one() {
     let pm = PtyManager::default();
     pm.register_fake_for_test(pty, STRANDED_TAIL.as_bytes());
     assert_eq!(
-        drain_stranded_submit(&pm, &last_delivery, "loomux".to_string(), pty, b"\r", Vec::new()),
+        drain_stranded_submit(&pm, &last_delivery, "orrerix".to_string(), pty, b"\r", Vec::new()),
         StrandedMarkerAction::Press
     );
     assert!(
@@ -27348,10 +27348,10 @@ fn stranded_selfheal_admits_a_submit_through_the_queue_ahead_of_pending_text() {
     let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
     let pty = 496u32;
 
-    reg.enqueue_text(&g.id, &w.id, "loomux", "the next brief", pty, queue::EnqueueReason::Arrival)
+    reg.enqueue_text(&g.id, &w.id, "orrerix", "the next brief", pty, queue::EnqueueReason::Arrival)
         .unwrap();
 
-    let healed = reg.actuate_stranded(&g.id, &w.id, "loomux", pty, StrandedAction::SelfHeal);
+    let healed = reg.actuate_stranded(&g.id, &w.id, "orrerix", pty, StrandedAction::SelfHeal);
     assert!(healed, "a clear self-heal decision must actually admit a submit");
 
     let snap = reg.queue_snapshot(pty);
@@ -27396,7 +27396,7 @@ fn a_selfheal_marker_is_audited_as_a_selfheal_and_never_as_a_question() {
     let pty = 5601u32;
 
     assert!(
-        reg.actuate_stranded(&g.id, &w.id, "loomux", pty, StrandedAction::SelfHeal),
+        reg.actuate_stranded(&g.id, &w.id, "orrerix", pty, StrandedAction::SelfHeal),
         "a clear self-heal decision must actually admit a marker to audit"
     );
 
@@ -27447,7 +27447,7 @@ fn a_marker_left_by_an_occupied_box_is_audited_as_box_occupied_not_a_question() 
     // when #532's occupancy gate is what declined the Enter. The drainer loop
     // itself needs an `AppHandle` and so is not test-drivable (this file's
     // standing convention — drive the methods it calls); this is that method.
-    reg.enqueue_stranded_front(&g.id, &w.id, "loomux", pty, queue::EnqueueReason::BoxOccupied)
+    reg.enqueue_stranded_front(&g.id, &w.id, "orrerix", pty, queue::EnqueueReason::BoxOccupied)
         .unwrap();
 
     let queued: Vec<_> =
@@ -27477,7 +27477,7 @@ fn the_drainers_own_marker_still_says_question() {
     let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
     let pty = 5602u32;
 
-    reg.enqueue_stranded_front(&g.id, &w.id, "loomux", pty, queue::EnqueueReason::Question)
+    reg.enqueue_stranded_front(&g.id, &w.id, "orrerix", pty, queue::EnqueueReason::Question)
         .unwrap();
 
     let queued: Vec<_> =
@@ -27575,9 +27575,9 @@ fn a_queued_stranded_submit_presses_enter_through_the_real_replay() {
     let captured = pm.register_fake_for_test(pty, STRANDED_TAIL.as_bytes());
     let last_delivery: std::sync::Mutex<HashMap<u32, _>> = std::sync::Mutex::new(HashMap::new());
     // The ledger state a stranded delivery leaves: recorded, unconfirmed.
-    record_aborted_preenter_outcome(&last_delivery, pty, "loomux".to_string(), None);
+    record_aborted_preenter_outcome(&last_delivery, pty, "orrerix".to_string(), None);
 
-    let action = drain_stranded_submit(&pm, &last_delivery, "loomux".to_string(), pty, b"\r", Vec::new());
+    let action = drain_stranded_submit(&pm, &last_delivery, "orrerix".to_string(), pty, b"\r", Vec::new());
 
     assert_eq!(
         action,
@@ -27610,7 +27610,7 @@ fn stranded_human_content_badges_and_never_submits() {
         0,
         STRANDED_SELFHEAL_MAX_HEALS,
     );
-    let healed = reg.actuate_stranded(&g.id, &w.id, "loomux", pty, action);
+    let healed = reg.actuate_stranded(&g.id, &w.id, "orrerix", pty, action);
 
     assert!(!healed, "human content in the box must never produce a submit");
     assert_eq!(reg.queue_depth(pty), 0, "nothing may be queued for a pane loomux must not press Enter on");
@@ -27652,12 +27652,12 @@ fn a_selfheal_never_cuts_in_front_of_a_drainer_that_owns_an_entry() {
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
     let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
     let pty = 4964u32;
-    reg.enqueue_text(&g.id, &w.id, "loomux", "mid-delivery", pty, queue::EnqueueReason::Arrival)
+    reg.enqueue_text(&g.id, &w.id, "orrerix", "mid-delivery", pty, queue::EnqueueReason::Arrival)
         .unwrap();
     let _generation = reg.register_drainer_for_test(pty).expect("nothing holds this pty yet");
     assert!(reg.drainer_active(pty));
 
-    let healed = reg.actuate_stranded(&g.id, &w.id, "loomux", pty, StrandedAction::SelfHeal);
+    let healed = reg.actuate_stranded(&g.id, &w.id, "orrerix", pty, StrandedAction::SelfHeal);
 
     assert!(!healed, "no heal may be admitted while a drainer owns the queue front");
     assert_eq!(reg.queue_depth(pty), 1, "the queue must be exactly as the drainer left it");
@@ -27684,7 +27684,7 @@ fn stranded_selfheal_is_bounded_and_never_double_queues() {
     let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
     let pty = 4963u32;
 
-    assert!(reg.actuate_stranded(&g.id, &w.id, "loomux", pty, StrandedAction::SelfHeal));
+    assert!(reg.actuate_stranded(&g.id, &w.id, "orrerix", pty, StrandedAction::SelfHeal));
     assert_eq!(reg.queue_depth(pty), 1);
 
     // Budget spent: the decision no longer even asks for a heal.
@@ -27697,7 +27697,7 @@ fn stranded_selfheal_is_bounded_and_never_double_queues() {
     // Belt and braces: even a caller that ignores the budget cannot stack a
     // second Enter behind the first, and the un-fired marker does not burn
     // budget it never used.
-    let healed_again = reg.actuate_stranded(&g.id, &w.id, "loomux", pty, StrandedAction::SelfHeal);
+    let healed_again = reg.actuate_stranded(&g.id, &w.id, "orrerix", pty, StrandedAction::SelfHeal);
     assert!(!healed_again, "a marker already queued must not count as a fresh heal");
     assert_eq!(reg.queue_depth(pty), 1, "a second Enter must never be stacked behind an unfired one");
     let audits = reg.audit_log(&g.id);
@@ -27924,7 +27924,7 @@ fn a_re_delivery_supersedes_the_monitor_that_triggered_it() {
     // The lost kickoff's own ledger entry: in flight, unconfirmed. Its
     // monitor is watching under this `submit_sent_ms`.
     let kickoff_ms = 1_000u64;
-    record_inflight_delivery(&last_delivery, pty, kickoff_ms, "loomux".to_string(), None);
+    record_inflight_delivery(&last_delivery, pty, kickoff_ms, "orrerix".to_string(), None);
     assert_eq!(
         observe_ledger(&last_delivery, pty, kickoff_ms),
         LedgerView { superseded: false, outstanding: true, newer_confirmed: false },
@@ -27932,14 +27932,14 @@ fn a_re_delivery_supersedes_the_monitor_that_triggered_it() {
     );
 
     // The recovery admits the brief...
-    assert!(reg.redeliver_lost_kickoff(&g.id, &w.id, "loomux", pty, KICKOFF_BRIEF));
+    assert!(reg.redeliver_lost_kickoff(&g.id, &w.id, "orrerix", pty, KICKOFF_BRIEF));
 
     // ...and the drain that picks it up records its own in-flight delivery
     // before pressing Enter (#454's ordering — `deliver_now` mints a fresh
     // `submit_sent_ms` for every delivery, so a re-delivery can never reuse
     // the original's identity).
     let redelivery_ms = kickoff_ms + 1;
-    record_inflight_delivery(&last_delivery, pty, redelivery_ms, "loomux".to_string(), None);
+    record_inflight_delivery(&last_delivery, pty, redelivery_ms, "orrerix".to_string(), None);
 
     let view = observe_ledger(&last_delivery, pty, kickoff_ms);
     assert!(view.superseded, "the re-delivery must take ownership of the pane from the old monitor");
@@ -27970,7 +27970,7 @@ fn a_lost_fresh_kickoff_is_re_delivered_through_the_queue_front_door() {
     let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
     let pty = 5170u32;
 
-    let sent = reg.redeliver_lost_kickoff(&g.id, &w.id, "loomux", pty, KICKOFF_BRIEF);
+    let sent = reg.redeliver_lost_kickoff(&g.id, &w.id, "orrerix", pty, KICKOFF_BRIEF);
 
     assert!(sent, "a lost fresh kickoff must actually be re-admitted, not merely badged");
     let snap = reg.queue_snapshot(pty);
@@ -28008,10 +28008,10 @@ fn a_re_delivery_never_double_sends_a_brief_that_is_still_queued() {
     let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
     let pty = 5171u32;
 
-    reg.enqueue_text(&g.id, &w.id, "loomux", KICKOFF_BRIEF, pty, queue::EnqueueReason::Arrival)
+    reg.enqueue_text(&g.id, &w.id, "orrerix", KICKOFF_BRIEF, pty, queue::EnqueueReason::Arrival)
         .unwrap();
 
-    let sent = reg.redeliver_lost_kickoff(&g.id, &w.id, "loomux", pty, KICKOFF_BRIEF);
+    let sent = reg.redeliver_lost_kickoff(&g.id, &w.id, "orrerix", pty, KICKOFF_BRIEF);
 
     assert!(!sent, "a coalesced re-delivery is not a send, and must not burn the budget");
     assert_eq!(reg.queue_depth(pty), 1, "the same brief must never occupy two queue slots");
@@ -28146,7 +28146,7 @@ fn an_eaten_kickoff_badges_and_then_re_delivers_the_brief() {
         StrandedAction::Attention(StrandedBlocker::NotHolding),
         "the eaten-paste signature — an Enter would be a guess, so the self-heal must refuse"
     );
-    reg.actuate_stranded(&g.id, &w.id, "loomux", pty, stranded);
+    reg.actuate_stranded(&g.id, &w.id, "orrerix", pty, stranded);
     assert_eq!(
         reg.stranded_note(&w.id).expect("the human is told either way").blocker,
         Some(StrandedBlocker::NotHolding)
@@ -28167,7 +28167,7 @@ fn an_eaten_kickoff_badges_and_then_re_delivers_the_brief() {
         KICKOFF_REDELIVERY_MAX,
     );
     assert_eq!(recovery, KickoffRecovery::Redeliver);
-    assert!(reg.redeliver_lost_kickoff(&g.id, &w.id, "loomux", pty, KICKOFF_BRIEF));
+    assert!(reg.redeliver_lost_kickoff(&g.id, &w.id, "orrerix", pty, KICKOFF_BRIEF));
     reg.mark_stranded(&g.id, &w.id, None);
 
     assert_eq!(
@@ -28408,11 +28408,11 @@ fn a_queue_full_pane_badges_queue_full_not_a_spent_heal() {
     let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
     let pty = 4965u32;
     for i in 0..queue::QUEUE_MAX_PER_PANE {
-        reg.enqueue_text(&g.id, &w.id, "loomux", &format!("d-{i}"), pty, queue::EnqueueReason::BehindQueue)
+        reg.enqueue_text(&g.id, &w.id, "orrerix", &format!("d-{i}"), pty, queue::EnqueueReason::BehindQueue)
             .unwrap();
     }
 
-    let healed = reg.actuate_stranded(&g.id, &w.id, "loomux", pty, StrandedAction::SelfHeal);
+    let healed = reg.actuate_stranded(&g.id, &w.id, "orrerix", pty, StrandedAction::SelfHeal);
 
     assert!(!healed, "a rejected admission is not a heal");
     assert_eq!(
@@ -29317,8 +29317,8 @@ fn a_stranded_front_marker_never_pushes_the_escalation_clock_forward() {
     // The pane is held; the episode opens. Then the paste lands and the Enter is
     // withheld: the text entry is replaced by a marker minted right now.
     reg.hold_escalation_step(&g.id, &w.id, pty, WriteAdmission::HoldQuestion, 1, t0, bound, None, None);
-    reg.enqueue_text(&g.id, &w.id, "loomux", "the brief", pty, queue::EnqueueReason::Arrival).unwrap();
-    reg.enqueue_stranded_front(&g.id, &w.id, "loomux", pty, queue::EnqueueReason::Question)
+    reg.enqueue_text(&g.id, &w.id, "orrerix", "the brief", pty, queue::EnqueueReason::Arrival).unwrap();
+    reg.enqueue_stranded_front(&g.id, &w.id, "orrerix", pty, queue::EnqueueReason::Question)
         .unwrap();
     reg.note_hold(&g.id, &w.id, pty, HoldObservation::Aborted, t0 + 1_000);
 
@@ -29455,12 +29455,12 @@ fn a_loomux_notice_is_recognised_by_its_sender_and_its_marker_together() {
     let notice = notify::watch_conflicting_notice("watch-1", 577);
 
     // Exactly the four payloads a real queue can hold, in arrival order.
-    reg.enqueue_text(&g.id, &w.id, "loomux", &notice, pty, queue::EnqueueReason::Arrival).unwrap();
-    reg.enqueue_text(&g.id, &w.id, "loomux", "You are a worker. Your task:", pty,
+    reg.enqueue_text(&g.id, &w.id, "orrerix", &notice, pty, queue::EnqueueReason::Arrival).unwrap();
+    reg.enqueue_text(&g.id, &w.id, "orrerix", "You are a worker. Your task:", pty,
         queue::EnqueueReason::KickoffRecovery).unwrap();
     reg.enqueue_text(&g.id, &w.id, "o-1", "[orrerix] pretend I am the host", pty,
         queue::EnqueueReason::BehindQueue).unwrap();
-    reg.enqueue_stranded_front(&g.id, &w.id, "loomux", pty, queue::EnqueueReason::Question)
+    reg.enqueue_stranded_front(&g.id, &w.id, "orrerix", pty, queue::EnqueueReason::Question)
         .unwrap();
 
     let entries = reg.queue_snapshot(pty);
@@ -29630,7 +29630,7 @@ fn a_pane_holding_loomuxs_own_notice_past_the_bound_tells_the_orchestrator() {
     let bound = QUESTION_HOLD_STALE_AFTER.as_millis() as u64;
     let t0 = 4_000_000u64;
 
-    reg.enqueue_text(&g.id, &w.id, "loomux", &notify::watch_conflicting_notice("watch-1", 577),
+    reg.enqueue_text(&g.id, &w.id, "orrerix", &notify::watch_conflicting_notice("watch-1", 577),
         pty, queue::EnqueueReason::Arrival).unwrap();
     reg.enqueue_text(&g.id, &w.id, "o-1", "any word yet?", pty, queue::EnqueueReason::BehindQueue)
         .unwrap();
@@ -29706,7 +29706,7 @@ fn the_notice_still_fires_when_another_mechanism_already_owns_the_badge() {
     let bound = QUESTION_HOLD_STALE_AFTER.as_millis() as u64;
     let t0 = 5_000_000u64;
 
-    reg.enqueue_text(&g.id, &w.id, "loomux", &notify::watch_conflicting_notice("watch-2", 577),
+    reg.enqueue_text(&g.id, &w.id, "orrerix", &notify::watch_conflicting_notice("watch-2", 577),
         pty, queue::EnqueueReason::Arrival).unwrap();
     reg.mark_stranded(&g.id, &w.id, Some(StrandedBlocker::QueueNearFull));
 
@@ -29749,7 +29749,7 @@ fn a_held_kickoff_is_not_reported_as_an_undeliverable_notice() {
     let bound = QUESTION_HOLD_STALE_AFTER.as_millis() as u64;
     let t0 = 6_000_000u64;
 
-    reg.enqueue_text(&g.id, &w.id, "loomux", "You are a worker. Your task: fix #1", pty,
+    reg.enqueue_text(&g.id, &w.id, "orrerix", "You are a worker. Your task: fix #1", pty,
         queue::EnqueueReason::KickoffRecovery).unwrap();
     reg.hold_escalation_step(&g.id, &w.id, pty, WriteAdmission::HoldBoxOccupied, 1, t0, bound,
         Some(0), None);
@@ -29822,7 +29822,7 @@ fn a_bound_crossed_with_nothing_queued_does_not_burn_the_report() {
 
     // The watch fires. Its notice lands behind the work already waiting, on a
     // pane that is still held — #590, exactly.
-    reg.enqueue_text(&g.id, &w.id, "loomux", &notify::watch_conflicting_notice("watch-5", 577),
+    reg.enqueue_text(&g.id, &w.id, "orrerix", &notify::watch_conflicting_notice("watch-5", 577),
         pty, queue::EnqueueReason::BehindQueue).unwrap();
 
     assert_eq!(
@@ -29890,10 +29890,10 @@ fn an_undeliverable_notice_is_never_reported_as_a_front_door_refusal() {
     // would be withdrawn as `no-app-handle` instead).
     let orch_pty = 5916u32;
     reg.set_pty_for_test(&orch.id, orch_pty);
-    reg.enqueue_text(&g.id, &orch.id, "loomux", "already queued for the orchestrator", orch_pty,
+    reg.enqueue_text(&g.id, &orch.id, "orrerix", "already queued for the orchestrator", orch_pty,
         queue::EnqueueReason::Arrival).unwrap();
 
-    reg.enqueue_text(&g.id, &w.id, "loomux", &notify::watch_conflicting_notice("watch-4", 577),
+    reg.enqueue_text(&g.id, &w.id, "orrerix", &notify::watch_conflicting_notice("watch-4", 577),
         pty, queue::EnqueueReason::Arrival).unwrap();
     reg.hold_escalation_step(&g.id, &w.id, pty, WriteAdmission::HoldBoxOccupied, 1, t0, bound,
         Some(0), None);
@@ -29935,7 +29935,7 @@ fn an_orchestrators_own_stuck_pane_parks_its_notice_in_the_inbox() {
     let bound = QUESTION_HOLD_STALE_AFTER.as_millis() as u64;
     let t0 = 7_000_000u64;
 
-    reg.enqueue_text(&g.id, &orch.id, "loomux", &notify::watch_conflicting_notice("watch-3", 577),
+    reg.enqueue_text(&g.id, &orch.id, "orrerix", &notify::watch_conflicting_notice("watch-3", 577),
         pty, queue::EnqueueReason::Arrival).unwrap();
     reg.hold_escalation_step(&g.id, &orch.id, pty, WriteAdmission::HoldBoxOccupied, 1, t0, bound,
         Some(0), None);
@@ -30018,7 +30018,7 @@ fn suppressed_during_pause_reads_only_the_window_the_last_pause_opened() {
         audit("orch-1", "prompt", json!({ "to": "w-1", "text": "unrelated" })),
         audit("human", "group-pause", json!({})),
         suppressed("w-2", "orch-1", "report: done, PR #123 is green"),
-        audit("loomux", "delivery-queued", json!({ "to": "w-2" })),
+        audit("orrerix", "delivery-queued", json!({ "to": "w-2" })),
         suppressed("human", "w-3", "also update the README"),
     ];
 
@@ -30055,7 +30055,7 @@ fn suppressed_during_pause_does_not_stop_at_a_group_restore_that_shares_the_resu
     let entries = vec![
         audit("human", "group-pause", json!({})),
         suppressed("w-1", "orch-1", "sent before the restart"),
-        audit("loomux", "group-resume", json!({ "repo": "C:/tmp/repo", "max_agents": 4 })),
+        audit("orrerix", "group-resume", json!({ "repo": "C:/tmp/repo", "max_agents": 4 })),
         suppressed("w-1", "orch-1", "sent after it"),
     ];
 
@@ -30217,7 +30217,7 @@ fn the_window_scan_picks_up_a_queue_full_refusal_but_not_an_ordinary_one() {
     // them at every resume would be the notice-becomes-noise failure the cap on
     // this list exists to prevent.
     let dropped = |reason: &str, text: &str| {
-        audit("loomux", "delivery-dropped", json!({
+        audit("orrerix", "delivery-dropped", json!({
             "to": "orch-1", "from": "w-2", "reason": "queue-full-at-call",
             "enqueue_reason": reason, "preview": text,
         }))
@@ -30613,7 +30613,7 @@ fn a_resume_kickoff_held_through_a_pause_is_not_itself_armed_for_recovery() {
     reg.set_pty_for_test(&w.id, 5723);
 
     reg.pause_group(&g.id).unwrap();
-    reg.deliver_prompt(&w.id, "you were resumed; here is where you left off", "loomux",
+    reg.deliver_prompt(&w.id, "you were resumed; here is where you left off", "orrerix",
                        Delivery::ResumeKickoff)
         .unwrap();
 
@@ -31050,7 +31050,7 @@ fn a_queue_full_refusal_during_a_pause_is_reported_to_the_orchestrator_on_resume
     // byte-identical coalescing would fold them into one entry and never reach
     // capacity at all.
     for i in 0..queue::QUEUE_MAX_PER_PANE {
-        reg.deliver_prompt(&orch.id, &format!("[orrerix] advisory {i}"), "loomux", Delivery::MidSession)
+        reg.deliver_prompt(&orch.id, &format!("[orrerix] advisory {i}"), "orrerix", Delivery::MidSession)
             .unwrap();
     }
     assert_eq!(reg.queue_depth(5820), queue::QUEUE_MAX_PER_PANE, "precondition: the pane is at capacity");
@@ -31110,7 +31110,7 @@ fn the_loss_notice_lands_even_when_the_overflowing_pane_is_the_orchestrators_own
     reg.pause_group(&g.id).unwrap();
 
     for i in 0..queue::QUEUE_MAX_PER_PANE {
-        reg.deliver_prompt(&orch.id, &format!("[orrerix] advisory {i}"), "loomux", Delivery::MidSession)
+        reg.deliver_prompt(&orch.id, &format!("[orrerix] advisory {i}"), "orrerix", Delivery::MidSession)
             .unwrap();
     }
     reg.deliver_prompt(&orch.id, "report: done, PR #77 is green", &w.id, Delivery::MidSession)
@@ -31179,7 +31179,7 @@ fn the_loss_notice_headroom_is_one_entry_and_a_second_resume_is_refused() {
     // Round 1: fill, overflow, resume — the notice takes the headroom.
     reg.pause_group(&g.id).unwrap();
     for i in 0..queue::QUEUE_MAX_PER_PANE {
-        reg.deliver_prompt(&orch.id, &format!("[orrerix] advisory {i}"), "loomux", Delivery::MidSession)
+        reg.deliver_prompt(&orch.id, &format!("[orrerix] advisory {i}"), "orrerix", Delivery::MidSession)
             .unwrap();
     }
     reg.deliver_prompt(&orch.id, "first lost report", &w.id, Delivery::MidSession).unwrap_err();
@@ -31308,7 +31308,7 @@ fn queue_pressure_warns_before_the_cap_and_releases_on_evidence() {
 
     // Fill to one below the near-full threshold: still ordinary.
     for i in 0..(queue::QUEUE_NEAR_FULL_AT - 1) {
-        reg.enqueue_text(&g.id, &w.id, "loomux", &format!("d-{i}"), pty, queue::EnqueueReason::BehindQueue)
+        reg.enqueue_text(&g.id, &w.id, "orrerix", &format!("d-{i}"), pty, queue::EnqueueReason::BehindQueue)
             .unwrap();
     }
     assert!(
@@ -31319,7 +31319,7 @@ fn queue_pressure_warns_before_the_cap_and_releases_on_evidence() {
 
     // The admission that crosses the threshold is the last moment a warning
     // can still be a warning.
-    reg.enqueue_text(&g.id, &w.id, "loomux", "crosses", pty, queue::EnqueueReason::BehindQueue).unwrap();
+    reg.enqueue_text(&g.id, &w.id, "orrerix", "crosses", pty, queue::EnqueueReason::BehindQueue).unwrap();
     let pressure: Vec<_> = reg
         .audit_log(&g.id)
         .into_iter()
@@ -31338,7 +31338,7 @@ fn queue_pressure_warns_before_the_cap_and_releases_on_evidence() {
     );
 
     // Sitting at pressure is not a new event every time something arrives.
-    reg.enqueue_text(&g.id, &w.id, "loomux", "another", pty, queue::EnqueueReason::BehindQueue).unwrap();
+    reg.enqueue_text(&g.id, &w.id, "orrerix", "another", pty, queue::EnqueueReason::BehindQueue).unwrap();
     assert_eq!(
         reg.audit_log(&g.id).iter().filter(|e| e.action == "delivery-queue-pressure").count(),
         1,
@@ -31381,7 +31381,7 @@ fn a_queue_full_drop_names_what_it_dropped_and_badges_the_pane() {
     let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
     let pty = 5632u32;
     for i in 0..queue::QUEUE_MAX_PER_PANE {
-        reg.enqueue_text(&g.id, &w.id, "loomux", &format!("d-{i}"), pty, queue::EnqueueReason::BehindQueue)
+        reg.enqueue_text(&g.id, &w.id, "orrerix", &format!("d-{i}"), pty, queue::EnqueueReason::BehindQueue)
             .unwrap();
     }
 
@@ -31624,9 +31624,9 @@ fn queue_depth_snapshot_reports_every_pane_that_has_a_queue_and_no_others() {
          to cost no event at all"
     );
 
-    reg.enqueue_text(&g.id, &a.id, "loomux", "one", pty_a, queue::EnqueueReason::Arrival).unwrap();
-    reg.enqueue_text(&g.id, &a.id, "loomux", "two", pty_a, queue::EnqueueReason::BehindQueue).unwrap();
-    reg.enqueue_text(&g.id, &b.id, "loomux", "solo", pty_b, queue::EnqueueReason::Arrival).unwrap();
+    reg.enqueue_text(&g.id, &a.id, "orrerix", "one", pty_a, queue::EnqueueReason::Arrival).unwrap();
+    reg.enqueue_text(&g.id, &a.id, "orrerix", "two", pty_a, queue::EnqueueReason::BehindQueue).unwrap();
+    reg.enqueue_text(&g.id, &b.id, "orrerix", "solo", pty_b, queue::EnqueueReason::Arrival).unwrap();
 
     let items = reg.queue_depth_snapshot(now_ms());
     assert_eq!(
@@ -31671,7 +31671,7 @@ fn a_pane_held_for_twenty_minutes_reads_stalled_even_when_every_queued_entry_is_
     let held_since = now - 20 * 60 * 1_000;
 
     reg.note_hold(&g.id, &w.id, pty, HoldObservation::HeldPoll, held_since);
-    reg.enqueue_text(&g.id, &w.id, "loomux", "fresh", pty, queue::EnqueueReason::Question).unwrap();
+    reg.enqueue_text(&g.id, &w.id, "orrerix", "fresh", pty, queue::EnqueueReason::Question).unwrap();
 
     let item = reg
         .queue_depth_snapshot(now)
@@ -31705,7 +31705,7 @@ fn queue_depth_push_emits_only_when_the_reading_the_human_would_see_changed() {
         "and must keep emitting nothing, tick after tick"
     );
 
-    reg.enqueue_text(&g.id, &w.id, "loomux", "one", pty, queue::EnqueueReason::Arrival).unwrap();
+    reg.enqueue_text(&g.id, &w.id, "orrerix", "one", pty, queue::EnqueueReason::Arrival).unwrap();
     // Every `now` below is measured from the entry's OWN stamp rather than from
     // a wall-clock reading taken before the enqueue: the admission does disk I/O
     // (`queue.json`), so on a loaded runner the two can be tens of milliseconds
@@ -31728,7 +31728,7 @@ fn queue_depth_push_emits_only_when_the_reading_the_human_would_see_changed() {
     let ticked = reg.queue_depth_push(queued_at + 1_100).expect("a second of age IS a visible change");
     assert_eq!(ticked[0].waiting_ms, 1_000, "…and it is the coarsened age that is pushed");
 
-    reg.enqueue_text(&g.id, &w.id, "loomux", "two", pty, queue::EnqueueReason::BehindQueue).unwrap();
+    reg.enqueue_text(&g.id, &w.id, "orrerix", "two", pty, queue::EnqueueReason::BehindQueue).unwrap();
     let deeper =
         reg.queue_depth_push(queued_at + 1_100).expect("a depth change must reach the webview immediately");
     assert_eq!(deeper[0].depth, 2);
@@ -31762,7 +31762,7 @@ fn the_queue_badge_skip_releases_itself_rather_than_waiting_for_the_reading_to_c
     let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
     let pty = 314u32;
 
-    reg.enqueue_text(&g.id, &w.id, "loomux", "one", pty, queue::EnqueueReason::Arrival).unwrap();
+    reg.enqueue_text(&g.id, &w.id, "orrerix", "one", pty, queue::EnqueueReason::Arrival).unwrap();
     let queued_at = reg.queue_snapshot(pty)[0].enqueued_ms;
     // An hour in, where the coarsening has made two ticks 3 s apart identical —
     // exactly the state an unbounded skip goes silent in.
@@ -32268,7 +32268,7 @@ macro_rules! janitor_pane {
         record_stranded_outcome_at_for_test(
             &ledger,
             pty,
-            "loomux".to_string(),
+            "orrerix".to_string(),
             now_ms() - 60_000,
             Some(STRANDED_PROMPT.to_string()),
         );
@@ -32522,13 +32522,13 @@ fn a_pane_with_no_recorded_stranded_text_is_never_judged() {
 
     // An empty ledger first: the pane has no delivery record at all.
     let empty: std::sync::Mutex<HashMap<u32, _>> = std::sync::Mutex::new(HashMap::new());
-    record_stranded_outcome_at_for_test(&empty, 9_999, "loomux".to_string(), now_ms() - 60_000, None);
+    record_stranded_outcome_at_for_test(&empty, 9_999, "orrerix".to_string(), now_ms() - 60_000, None);
     reg.stranded_janitor_pass(&pm, &empty);
     assert!(reg.stranded_note(&wid).is_some(), "no record for this pane — nothing to judge");
 
     // Then a record for THIS pane that carries no text.
     let textless: std::sync::Mutex<HashMap<u32, _>> = std::sync::Mutex::new(HashMap::new());
-    record_stranded_outcome_at_for_test(&textless, pty, "loomux".to_string(), now_ms() - 60_000, None);
+    record_stranded_outcome_at_for_test(&textless, pty, "orrerix".to_string(), now_ms() - 60_000, None);
     reg.stranded_janitor_pass(&pm, &textless);
     assert!(
         reg.stranded_note(&wid).is_some(),
@@ -35477,11 +35477,11 @@ fn unconfirmed_delivery_notifies_the_orchestrator_and_suppresses_the_exceptions(
     assert!(notices(&reg).is_empty(), "an unconfirmed delivery to the orchestrator must not notify");
 
     // The real case: an unconfirmed delivery to the worker → exactly one notice,
-    // audited to loomux, naming the stranded agent.
+    // audited to this app itself, naming the stranded agent.
     reg.notify_unconfirmed_delivery(&g.id, &w.id, false, false, false, 1_003);
     let after = notices(&reg);
     assert_eq!(after.len(), 1, "an unconfirmed worker delivery notifies exactly once");
-    assert_eq!(after[0].actor, "loomux", "the notice is a loomux system message");
+    assert_eq!(after[0].actor, "orrerix", "the notice is a system message from this app");
     assert_eq!(after[0].detail["to"], w.id, "the notice names the stranded worker");
 }
 
@@ -36258,7 +36258,7 @@ fn a_throwaway_registry_never_writes_the_users_real_copilot_trusted_folders() {
     );
     let perms_text = fs::read_to_string(&perms).unwrap();
     assert!(
-        perms_text.contains("C:/tmp/copilot-repo") && perms_text.contains("loomux"),
+        perms_text.contains("C:/tmp/copilot-repo") && perms_text.contains("orrerix"),
         "and carry the real grant, not an empty file: {perms_text}",
     );
 }
@@ -39286,7 +39286,7 @@ fn gh_shim_script_enforces_the_workflow_merge_gate() {
     // A source-text pin of the shape. Every behavioural claim is EXECUTED below.
     let sh = gh_shim_sh("C:/Program Files/GitHub CLI/gh.exe", &shim_paths());
     assert!(sh.contains("loomux_block_wf"), "the workflow gate has its own refusal path");
-    assert!(sh.contains("$LOOMUX_GROUP_DIR/merge_gate"), "keyed off the declared-gate spec file");
+    assert!(sh.contains("$ORX_GD/merge_gate"), "keyed off the declared-gate spec file");
     assert!(sh.contains("verdicts/pr-$num/$g_r"), "reads the per-reviewer verdict files for THIS pr");
     assert!(sh.contains("headRefOid"), "and binds a verdict to the revision it reviewed");
     assert!(sh.contains("|| [ -n \"$g_k\" ]"),
@@ -43672,7 +43672,7 @@ fn a_stale_human_input_block_releases_the_real_stranded_press() {
     // after it, and nothing has touched the pane since. `last > submit` (the
     // latch is SET) and `now - last >= bound` (it has gone stale).
     let stamp = now_ms() - (HUMAN_INPUT_BLOCK_BOUND_MS + 60_000);
-    record_stranded_outcome_at_for_test(&last_delivery, pty, "loomux".to_string(), stamp - 60_000, None);
+    record_stranded_outcome_at_for_test(&last_delivery, pty, "orrerix".to_string(), stamp - 60_000, None);
     pm.set_user_input_ms_for_test(pty, stamp);
     assert_eq!(
         pm.input_pending(pty),
@@ -43680,7 +43680,7 @@ fn a_stale_human_input_block_releases_the_real_stranded_press() {
         "precondition: nothing of the human's is in the box — the bound may only release on this"
     );
 
-    let action = drain_stranded_submit(&pm, &last_delivery, "loomux".to_string(), pty, b"\r", Vec::new());
+    let action = drain_stranded_submit(&pm, &last_delivery, "orrerix".to_string(), pty, b"\r", Vec::new());
 
     assert_eq!(
         action,
@@ -43707,7 +43707,7 @@ fn a_fresh_human_keystroke_still_blocks_the_real_stranded_press() {
     // as "no human input since our submit" and this test would pass for the
     // wrong reason (it did, on the first run — the press fired because the two
     // timestamps tied, not because the guard let it through).
-    record_stranded_outcome_at_for_test(&last_delivery, pty, "loomux".to_string(), now_ms() - 5_000, None);
+    record_stranded_outcome_at_for_test(&last_delivery, pty, "orrerix".to_string(), now_ms() - 5_000, None);
 
     // A genuine keystroke, through the real signal path: a real key event
     // (`human_origin: true`) carrying real content.
@@ -43717,7 +43717,7 @@ fn a_fresh_human_keystroke_still_blocks_the_real_stranded_press() {
         "precondition: the keystroke lands strictly after the delivery's own submit"
     );
 
-    let action = drain_stranded_submit(&pm, &last_delivery, "loomux".to_string(), pty, b"\r", Vec::new());
+    let action = drain_stranded_submit(&pm, &last_delivery, "orrerix".to_string(), pty, b"\r", Vec::new());
 
     assert_eq!(
         action,
@@ -43740,7 +43740,7 @@ fn a_stale_block_with_human_text_still_in_the_box_never_releases_the_press() {
     record_stranded_outcome_at_for_test(
         &last_delivery,
         pty,
-        "loomux".to_string(),
+        "orrerix".to_string(),
         now_ms() - (HUMAN_INPUT_BLOCK_BOUND_MS + 120_000),
         None,
     );
@@ -43752,7 +43752,7 @@ fn a_stale_block_with_human_text_still_in_the_box_never_releases_the_press() {
     let stamp = now_ms() - (HUMAN_INPUT_BLOCK_BOUND_MS + 60_000);
     pm.set_user_input_ms_for_test(pty, stamp);
 
-    let action = drain_stranded_submit(&pm, &last_delivery, "loomux".to_string(), pty, b"\r", Vec::new());
+    let action = drain_stranded_submit(&pm, &last_delivery, "orrerix".to_string(), pty, b"\r", Vec::new());
 
     assert_eq!(
         action,
@@ -44043,7 +44043,7 @@ fn a_human_pressing_enter_in_the_pane_retires_the_queued_marker() {
     record_stranded_outcome_at_for_test(
         &last_delivery,
         pty,
-        "loomux".to_string(),
+        "orrerix".to_string(),
         now_ms() - 60_000,
         Some(STRANDED_PROMPT.to_string()),
     );
@@ -44059,7 +44059,7 @@ fn a_human_pressing_enter_in_the_pane_retires_the_queued_marker() {
     );
 
     let action =
-        drain_stranded_submit(&pm, &last_delivery, "loomux".to_string(), pty, b"\r", Vec::new());
+        drain_stranded_submit(&pm, &last_delivery, "orrerix".to_string(), pty, b"\r", Vec::new());
 
     assert_eq!(
         action,
@@ -44090,7 +44090,7 @@ fn the_wired_marker_holds_while_the_pane_still_shows_our_stranded_text() {
     record_stranded_outcome_at_for_test(
         &last_delivery,
         pty,
-        "loomux".to_string(),
+        "orrerix".to_string(),
         now_ms() - 60_000,
         // STRANDED_TAIL's own prompt line, so the box reading is `Holds`.
         Some(STRANDED_PROMPT.to_string()),
@@ -44099,7 +44099,7 @@ fn the_wired_marker_holds_while_the_pane_still_shows_our_stranded_text() {
     assert_eq!(pm.input_pending(pty), Some(false), "precondition: no HUMAN characters outstanding");
 
     let action =
-        drain_stranded_submit(&pm, &last_delivery, "loomux".to_string(), pty, b"\r", Vec::new());
+        drain_stranded_submit(&pm, &last_delivery, "orrerix".to_string(), pty, b"\r", Vec::new());
 
     assert!(
         !matches!(action, StrandedMarkerAction::Retire(_)),
@@ -44872,7 +44872,7 @@ fn an_oversized_stranded_batch_reaches_the_badge_and_the_audit() {
 
     let action =
         stranded_selfheal_action(true, false, false, BoxReading::Unverifiable, 0, STRANDED_SELFHEAL_MAX_HEALS);
-    let healed = reg.actuate_stranded(&g.id, &w.id, "loomux", pty, action);
+    let healed = reg.actuate_stranded(&g.id, &w.id, "orrerix", pty, action);
 
     assert!(!healed, "an unreadable box must never produce a blind submit");
     assert_eq!(reg.queue_depth(pty), 0, "nothing queued for a pane loomux cannot account for");
@@ -48729,7 +48729,7 @@ fn the_wired_declined_flush_leaves_the_pane_untouched_when_our_text_is_still_the
     record_stranded_outcome_at_for_test(
         &last_delivery,
         pty,
-        "loomux".to_string(),
+        "orrerix".to_string(),
         now_ms() - 60_000,
         Some(STRANDED_PROMPT.to_string()),
     );
