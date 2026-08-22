@@ -2,8 +2,8 @@
 
 *#1151. This note covers slice A — the item entity, the per-group registry, the
 board lifecycle mapping, the clear-completed watermark, and the trusted Tauri
-commands — and slice B, the MCP surface an agent reaches them through. The panel
-rework (slice C) extends this note as it lands. It is the companion to
+commands — and slice B, the MCP surface an agent reaches them through. It also covers
+slice C's panel, which reads both registries into one list. It is the companion to
 [human-questions.md](human-questions.md), which owns the other half of the same
 panel.*
 
@@ -35,8 +35,8 @@ is available — is **joined live from `tasks.json` at render**.
 
 That split is the whole design. Snapshotting a task's fields onto an item would
 create a second record about board state that starts drifting the moment the
-board moves, which is exactly the shape slice C's projection was written to
-avoid. The item owns the *ask*; the task keeps owning the *facts*.
+board moves, which is exactly the shape the old DEMOS projection (#1091 slice C,
+which #1151 slice C replaced) already had. The item owns the *ask*; the task keeps owning the *facts*.
 
 ```
 needs-you.json   ── item n-3 ──link──▶  tasks.json ── t-12
@@ -270,7 +270,7 @@ and still leak.
 
 Emitted from `write_needs_you`, the single mutation point — so, the single
 notification point, the `orch-tasks-changed` / `orch-questions-changed` shape. The
-panel is the listener (slice C).
+panel is the listener (`decisionsview.ts`, #1151 slice C).
 
 ### Audit actions
 
@@ -486,20 +486,22 @@ delivery enqueues.
 4. **New task statuses for attention.** The exact model being rejected: it makes
    the ask a property of the work item again, which is where this started.
 
-## What slices A and B do and do not reach
+## What this note's slices do and do not reach
 
 **Reaches:** the entity, the registry and its caps, the lifecycle hook and
 one-shot migration, the watermark, the three Tauri commands and their ACL grants, the
 audit actions, the event — and (slice B) the three MCP tools an agent reaches the
 registry through.
 
+**The panel is slice C (#1188), and it has landed** — `decisionsview.ts` listens
+for `orch-needs-you-changed` and renders one unified list over both registries,
+and the old DEMOS projection is gone. So the three surfaces this note describes
+are all live, and a reader should treat the whole note as shipped behaviour
+rather than as a design still arriving in pieces.
+
 **Does not reach, and is not silently missing:**
 
-- **The panel** — slice C. `orch-needs-you-changed` has no listener until then,
-  which is cheaper than a second visit to the write path later. The DEMOS tier
-  keeps rendering its projection in the meantime, so nothing regresses: the items
-  accumulate correctly behind it and the panel starts reading them when C lands.
 - **The sort** (#1151 decision D1, urgency-pinned then newest-first) is the
   panel's, not this projection's. `project_list` returns open rows in raise order
   and a newest-first resolved tail; sorting here would put a second, weaker
-  ordering in the way of the union sort C has to do anyway.
+  ordering in the way of the union sort the panel does anyway.
