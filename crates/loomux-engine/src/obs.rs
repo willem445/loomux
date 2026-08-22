@@ -423,7 +423,7 @@ pub fn data_root() -> PathBuf {
 /// orchestration state live under the same root.
 pub fn logs_dir() -> PathBuf {
     #[cfg(test)]
-    if let Some(dir) = LOG_DIR_OVERRIDE.lock().unwrap().clone() {
+    if let Some(dir) = LOG_DIR_OVERRIDE.lock_safe().clone() {
         return dir;
     }
     data_root().join("logs")
@@ -1358,13 +1358,33 @@ mod tests {
 
     /// Serializes the few tests that install the global panic hook / use the
     /// log-dir override, so parallel execution can't cross their global state.
+    ///
+    /// **Always locked with `lock_safe`, never `.lock().unwrap()`.** A test that
+    /// fails while holding this poisons it, and every later `.unwrap()` on it
+    /// then panics with `PoisonError` — so ONE genuine failure is reported as
+    /// three, two of them in tests that were never run against the change. That
+    /// is the mutex-poison cascade `LockExt` exists to stop (see its doc), and
+    /// a harness that reproduced it in miniature was making its own evidence
+    /// unattributable: a red-before-green round is only usable if the tests it
+    /// reddens are the tests the mutation actually broke.
     static SERIAL: Mutex<()> = Mutex::new(());
 
+    /// Restores the log-dir override on the way out **however the scope ends**.
+    /// Without this, a test that fails inside `with_log_dir` leaves the
+    /// override pointing at its own deleted temp dir, and the next test to read
+    /// `logs_dir()` fails for a reason that has nothing to do with it.
+    struct LogDirOverride;
+
+    impl Drop for LogDirOverride {
+        fn drop(&mut self) {
+            *LOG_DIR_OVERRIDE.lock_safe() = None;
+        }
+    }
+
     fn with_log_dir<T>(dir: &Path, f: impl FnOnce() -> T) -> T {
-        *LOG_DIR_OVERRIDE.lock().unwrap() = Some(dir.to_path_buf());
-        let out = f();
-        *LOG_DIR_OVERRIDE.lock().unwrap() = None;
-        out
+        *LOG_DIR_OVERRIDE.lock_safe() = Some(dir.to_path_buf());
+        let _restore = LogDirOverride;
+        f()
     }
 
     #[test]
@@ -1883,7 +1903,7 @@ mod tests {
     /// them, or one of the two would silently observe the other's directory.
     #[test]
     fn a_refused_allocation_writes_a_record_and_still_returns_null() {
-        let _serial = SERIAL.lock().unwrap();
+        let _serial = SERIAL.lock_safe();
         let tmp = tempfile::tempdir().unwrap();
         assert!(
             install_alloc_error_reporting_in(tmp.path(), "9.9.9-test"),
@@ -2065,7 +2085,7 @@ mod tests {
 
     #[test]
     fn forced_panic_in_background_thread_writes_crash_log() {
-        let _serial = SERIAL.lock().unwrap();
+        let _serial = SERIAL.lock_safe();
         let tmp = tempfile::tempdir().unwrap();
         with_log_dir(tmp.path(), || {
             let prev = std::panic::take_hook();
@@ -2119,7 +2139,7 @@ mod tests {
         assert!(second.notice().unwrap().contains("exited unexpectedly"));
 
         // Clean exit removes it; the following launch is clean again.
-        let _serial = SERIAL.lock().unwrap();
+        let _serial = SERIAL.lock_safe();
         with_log_dir(tmp.path(), || mark_clean_exit());
         assert!(!running_lock(tmp.path()).exists());
         assert!(!check_and_arm_in(tmp.path()).unclean);
