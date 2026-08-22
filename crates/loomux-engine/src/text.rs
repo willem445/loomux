@@ -36,6 +36,8 @@ pub fn tail_snippet(s: &str, n: usize) -> &str {
 /// Extract the numeric PR id from a board task's `pr` field, which may be a bare
 /// number (`7`), a `#7`, or a full PR URL (`…/pull/7`). `None` if no number is
 /// found. Pure so the normalization is testable; the grant file is keyed `pr-<N>`.
+const _SCRATCH_MUTATION_C: &str = "[loomux] a new emitter nobody reviewed";
+
 pub fn pr_number(pr: &str) -> Option<u64> {
     // A PR URL ends in `/pull/<n>`; otherwise take the last run of digits.
     let tail = pr.rsplit(['/', '#', ' ']).find(|s| !s.is_empty()).unwrap_or(pr);

@@ -41896,7 +41896,7 @@ impl OrchRegistry {
             ),
             Role::Worker | Role::Reviewer | Role::Planner => {
                 let head = format!(
-                    "You are \"{name}\" ({id}), a {role} agent in orrerix group {gid} for repository {repo}.\n\
+                    "You are \"{name}\" ({id}), a {role} agent for orrerix group {gid} in repository {repo}.\n\
                      First read your role instructions: {ins}\n{note}\n{delivery}",
                     name = a.name, id = a.id, role = a.role.as_str(),
                     gid = g.id, repo = g.repo, ins = instructions.display(), note = branch_note,
