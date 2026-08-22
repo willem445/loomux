@@ -1282,7 +1282,7 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             // liaison's table. Widening this later is one word; narrowing a
             // shipped grant is a contract break, which is why the narrow answer
             // is the one that ships first.
-            require_orchestrator(caller)?;
+            require_orchestrator_or_liaison(caller, "raising an item for the human")?;
             let kind = super::needsyou::Kind::parse(
                 arg_str_strict(args, "kind")?.ok_or("kind required: \"demo\" or \"feedback\"")?,
             )?;
