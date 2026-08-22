@@ -1388,6 +1388,14 @@ pub fn enqueue(
             None
         },
         changed_lines: facts.changed_lines,
+        // #1176, behind the same declares-first branch `base_green` uses, and
+        // safe for the same reason: an un-fetched value is `None`, which
+        // routing REFUSES on rather than reads as "no rule fired".
+        changed_files: if crate::mqdriver::declares_routing(gate) {
+            crate::mqdriver::pr_changed_files(r, pr)
+        } else {
+            None
+        },
     };
     let recheck = recheck_gate(gate, verdicts, Some(facts.head.as_str()), &observed);
     if let Some(code) = recheck.refusal_code() {
