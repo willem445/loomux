@@ -32,8 +32,8 @@
 //!    decision is a defect, not an optimization.
 
 use crate::workflow::{
-    check_diff_size, condition_supported, evaluate_merge_gate, parse_gate_file, BlockId,
-    DiffSizeVerdict, Gate, GateOutcome, ReviewVerdict,
+    check_diff_size, condition_supported, evaluate_merge_gate, parse_gate_file, route_reviewers,
+    BlockId, DiffSizeVerdict, Gate, GateOutcome, ReviewVerdict,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -727,6 +727,20 @@ pub struct PrObservation {
     /// `max_diff_lines`. `None` when it could not be read, which
     /// [`workflow::check_diff_size`] turns into a refusal.
     pub changed_lines: Option<u64>,
+    /// The PR's changed paths for #1176's path-based reviewer routing.
+    ///
+    /// `None` is the same refusal every other field here takes on `None` —
+    /// with one extra reason to be strict about it. The driver fills this from
+    /// `workflow::ROUTING_FILES_JQ`, which answers `None` not only when gh
+    /// failed but when the file list it got back **could not be shown to be
+    /// complete** (that list pages at 100). A short list would fail OPEN and
+    /// invisibly: a rule whose only matching file sits on page two never fires,
+    /// and the queue lands a PR one required lane short with nothing anywhere
+    /// saying so.
+    ///
+    /// The driver leaves it `None` when the gate declares no routing, and
+    /// [`route_reviewers`] never looks at it in that case.
+    pub changed_files: Option<Vec<String>>,
 }
 
 /// Why an `also:` clause refuses.
@@ -772,6 +786,11 @@ pub enum GateRecheck {
     /// `max_diff_lines`, or its size could not be read at all. Never
     /// [`DiffSizeVerdict::Ok`], which is not a refusal.
     DiffSize(DiffSizeVerdict),
+    /// The gate routes reviewers by path (#1176) and the PR's changed-file list
+    /// could not be resolved, or could not be shown to be complete. **Refuses**:
+    /// the unknown here is *which reviewers are required*, so treating it as
+    /// "no rule fired" would be guessing in favour of landing.
+    RoutingUnaccountable,
 }
 
 impl GateRecheck {
@@ -827,6 +846,18 @@ pub fn recheck_gate(
         GateSpec::Malformed => return GateRecheck::Malformed,
         GateSpec::Declared(g) => g,
     };
+    // #1176's path routing, resolved BEFORE anything counts verdicts — it is
+    // what decides whose verdicts are counted. From here down `gate` is the
+    // EFFECTIVE gate: the same one, with routing already resolved into its
+    // reviewer list, so `evaluate_merge_gate`, `gate_need` and the
+    // `body-unchanged` loop below all read one list and there is still exactly
+    // one gate decision in this codebase. A queue that skipped a routed lane the
+    // shim requires would BE the way around path routing.
+    let Some(routed) = route_reviewers(gate, observed.changed_files.as_deref()) else {
+        return GateRecheck::RoutingUnaccountable;
+    };
+    let effective = routed.gate(gate);
+    let gate = &effective;
     // An empty head is NO head (rev-157). `evaluate_merge_gate` would refuse an
     // empty string anyway — but only incidentally, because no stored head
     // equals `""` so every verdict reads *stale*, which is arithmetic about
@@ -1252,6 +1283,7 @@ mod tests {
             reviewers: reviewers.iter().map(|r| r.to_string()).collect(),
             also: also.iter().map(|c| c.to_string()).collect(),
             max_diff_lines: None,
+            routing: Vec::new(),
         }
     }
 
@@ -1283,6 +1315,11 @@ mod tests {
             // the gate at all.
             base_green: None,
             changed_lines: None,
+            // #1176, on the same footing and for the same reason: no gate in
+            // this suite declares `routing:`, so the list must be inert here —
+            // and `None` is the value that would REFUSE if one ever did, rather
+            // than a plausible one that would hide a routing check gone missing.
+            changed_files: None,
         }
     }
 
@@ -1348,6 +1385,7 @@ mod tests {
             reviewers: vec!["rev-a".into(), "rev-b".into(), "rev-c".into()],
             also: vec![],
             max_diff_lines: None,
+            routing: Vec::new(),
         });
         let v: BTreeMap<_, _> = [
             verdict("rev-a", Verdict::Pass, "NEW", ""),
@@ -1412,6 +1450,7 @@ mod tests {
             ci_green: Some(true),
             base_green: Some(true),
             changed_lines: Some(1),
+            changed_files: Some(Vec::new()),
         };
         for c in crate::workflow::KNOWN_CONDITIONS {
             let g = GateSpec::Declared(gate(&["rev-a"], &[c]));
@@ -1616,5 +1655,132 @@ mod tests {
         // land, and the reviewer half already counts it as stale (§6).
         let v: BTreeMap<_, _> = [verdict("rev-b", Verdict::Pass, "OLD", &then)].into();
         assert_eq!(body_unchanged(&g, &v, Some("NEW"), Some(&now)), None);
+    }
+
+    /// A gate whose declared list is `rev-a` and which routes `rev-ui` for
+    /// `src/**` (#1176), built through the gate-FILE reader so this suite reads
+    /// the same bytes the shim does.
+    fn routed_gate() -> Gate {
+        parse_gate_file(
+            "require all-pass\nreviewer rev-a\nroute-path 1 src/**\nroute-reviewer 1 rev-ui\n",
+        )
+        .expect("the routed gate file must parse")
+    }
+
+    #[test]
+    fn the_queue_requires_the_lanes_path_routing_names() {
+        // §6's rule, applied to #1176: a gate the SHIM would refuse must never be
+        // a gate the QUEUE lands, or the queue becomes the way around routing.
+        let spec = GateSpec::Declared(routed_gate());
+        let files = |v: &[&str]| Some(v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let with = |changed: Option<Vec<String>>| PrObservation {
+            changed_files: changed,
+            ..observed(Some(true), None)
+        };
+        // The declared reviewer alone, on a diff that fires the rule: SHORT,
+        // waiting on a lane the gate's own `reviewers:` never names.
+        let only_a: BTreeMap<_, _> = [verdict("rev-a", Verdict::Pass, "NEW", "")].into();
+        match recheck_gate(&spec, &only_a, Some("NEW"), &with(files(&["src/app.ts"]))) {
+            GateRecheck::Reviewers(GateOutcome::Short { outstanding, need, .. }) => {
+                assert_eq!(outstanding, vec!["rev-ui".to_string()]);
+                assert_eq!(need, 2, "the routed lane counts toward `all-pass`");
+            }
+            other => panic!("a routed lane must keep the queue's gate shut: {other:?}"),
+        }
+        // The same verdicts, a diff the rule does not match: the gate is the
+        // declared one and it passes. Routing is additive, never subtractive.
+        assert_eq!(
+            recheck_gate(&spec, &only_a, Some("NEW"), &with(files(&["docs/x.md"]))),
+            GateRecheck::Ok
+        );
+        // Both lanes live: Ok on the matching diff too.
+        let both: BTreeMap<_, _> = [
+            verdict("rev-a", Verdict::Pass, "NEW", ""),
+            verdict("rev-ui", Verdict::Pass, "NEW", ""),
+        ]
+        .into();
+        assert_eq!(
+            recheck_gate(&spec, &both, Some("NEW"), &with(files(&["src/app.ts"]))),
+            GateRecheck::Ok
+        );
+        // THE FAIL-CLOSED CASE. Every verdict the declared gate names is a live
+        // PASS and the queue still refuses: the unknown is *which lanes are
+        // required*, so "no rule fired" would be a guess in favour of landing.
+        assert_eq!(
+            recheck_gate(&spec, &both, Some("NEW"), &with(None)),
+            GateRecheck::RoutingUnaccountable
+        );
+        assert_eq!(
+            recheck_gate(&spec, &both, Some("NEW"), &with(None)).refusal_code(),
+            Some("gate-not-met")
+        );
+        // …and a COMPLETE answer that happens to be empty is not that: a PR
+        // that changed nothing fires nothing, and the declared gate stands.
+        assert_eq!(recheck_gate(&spec, &only_a, Some("NEW"), &with(files(&[]))), GateRecheck::Ok);
+        // A gate with NO routing never consults the list — the absent-config
+        // no-op, which is what keeps every pre-#1176 repo on its old path.
+        let plain = GateSpec::Declared(gate(&["rev-a"], &[]));
+        assert_eq!(recheck_gate(&plain, &only_a, Some("NEW"), &with(None)), GateRecheck::Ok);
+
+        // RE-STALING APPLIES PER REQUIRED REVIEWER, routed or declared (#1176
+        // AC4). It is not a separate mechanism and must not become one: a routed
+        // lane is in the effective gate's reviewer list by the time
+        // `evaluate_merge_gate` runs, so "a pass only counts for the revision it
+        // reviewed" covers it for free. This pins that the free thing is real.
+        let stale_ui: BTreeMap<_, _> = [
+            verdict("rev-a", Verdict::Pass, "NEW", ""),
+            verdict("rev-ui", Verdict::Pass, "OLD", ""),
+        ]
+        .into();
+        match recheck_gate(&spec, &stale_ui, Some("NEW"), &with(files(&["src/app.ts"]))) {
+            GateRecheck::Reviewers(GateOutcome::Short { stale, outstanding, .. }) => {
+                assert_eq!(stale, vec!["rev-ui".to_string()], "the routed lane's pass went stale");
+                assert!(outstanding.is_empty(), "it HAS voted — just not on this revision");
+            }
+            other => panic!("a routed lane's stale pass must not open the gate: {other:?}"),
+        }
+        // …and a routed lane's BLOCKING verdict beats the declared lane's pass,
+        // whatever revision it was recorded against — blockers are
+        // revision-independent for a routed reviewer too.
+        let blocked: BTreeMap<_, _> = [
+            verdict("rev-a", Verdict::Pass, "NEW", ""),
+            verdict("rev-ui", Verdict::Fail, "OLD", ""),
+        ]
+        .into();
+        assert_eq!(
+            recheck_gate(&spec, &blocked, Some("NEW"), &with(files(&["src/app.ts"]))),
+            GateRecheck::Reviewers(GateOutcome::Blocked { blocking: vec!["rev-ui".into()] })
+        );
+    }
+
+    #[test]
+    fn a_routed_lane_is_body_digest_checked_like_any_other() {
+        // The effective gate is what the `body-unchanged` loop reads, so a lane
+        // routing added is covered by #565 exactly as a declared one is. A loop
+        // still reading the DECLARED list would skip precisely the reviewer this
+        // PR's paths made necessary.
+        let mut g = routed_gate();
+        g.also = vec!["body-unchanged".to_string()];
+        let spec = GateSpec::Declared(g);
+        let now = body_digest("the body");
+        let then = body_digest("a different body");
+        let v: BTreeMap<_, _> = [
+            verdict("rev-a", Verdict::Pass, "NEW", &now),
+            verdict("rev-ui", Verdict::Pass, "NEW", &then),
+        ]
+        .into();
+        let observed = PrObservation {
+            body_digest: Some(now.clone()),
+            changed_files: Some(vec!["src/app.ts".to_string()]),
+            ..observed(Some(true), None)
+        };
+        assert_eq!(
+            recheck_gate(&spec, &v, Some("NEW"), &observed),
+            GateRecheck::Condition {
+                condition: "body-unchanged".to_string(),
+                refusal: ConditionRefusal::BodyChanged { reviewers: vec!["rev-ui".into()] },
+            },
+            "the routed lane's stale body digest must refuse, exactly as a declared lane's does"
+        );
     }
 }

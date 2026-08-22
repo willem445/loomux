@@ -20,6 +20,8 @@ import {
   removeBlockAt,
   nextBlockId,
   starterWorkflow,
+  GATE_ROUTING_RULES_MAX,
+  GATE_ROUTING_PATHS_MAX,
   scaffoldWorkflowText,
   connectBlocks,
   disconnectBlocks,
@@ -2631,4 +2633,149 @@ test("the scaffold's own header names the file it is about to be written to", ()
   assert.match(scaffoldWorkflowText("1.0.0").split("\n")[0], /^# \.orrerix\/workflow\.yml /);
   // And whatever the header says, the body must still parse and validate clean.
   assert.deepEqual(analyzeWorkflow(scaffoldWorkflowText("1.0.0", LEGACY_WORKFLOW_FILE)).findings, []);
+});
+
+// ---------- path-based reviewer routing (#1176) ----------
+
+const ROUTED_YAML = `version: 1
+blocks:
+  - id: worker
+    kind: worker
+    cli: claude
+  - id: rev-lead
+    kind: reviewer
+    cli: claude
+  - id: rev-ui
+    kind: reviewer
+    cli: claude
+gates:
+  merge:
+    require: all-pass
+    reviewers: [rev-lead]
+    routing:
+      - paths: ["src/**", "index.html"]
+        reviewers: [rev-ui]
+`;
+
+test("routing rules survive a round trip — the pane preserves what it cannot yet edit (#1176)", () => {
+  // THE failure this covers: `MergeGate` has no unknown-key bag, so a gate key the
+  // parser does not read is a line the next form edit silently DELETES — and here
+  // the thing deleted would be a REQUIRED REVIEWER. The pane offers no control for
+  // these rules yet; round-tripping them is what makes that safe rather than lossy.
+  const parsed = parseWorkflow(ROUTED_YAML).workflow;
+  assert.deepEqual(parsed.gates.merge!.routing, [
+    { paths: ["src/**", "index.html"], reviewers: ["rev-ui"] },
+  ]);
+  assert.deepEqual(codes(validateWorkflow(parsed)), [], "a well-formed rule is a clean file");
+
+  const text = serializeWorkflow(parsed);
+  // A glob starting with `*` MUST come back quoted: YAML reads a bare leading `*`
+  // as an ALIAS, so an unquoted `**/Cargo.toml` is a file that will not load.
+  const starred = parseWorkflow(ROUTED_YAML.replace('"src/**", "index.html"', '"**/Cargo.toml"'))
+    .workflow;
+  const starredText = serializeWorkflow(starred);
+  assert.ok(starredText.includes('"**/Cargo.toml"'), `a leading-star glob must be quoted:\n${starredText}`);
+  assert.deepEqual(
+    parseWorkflow(starredText).workflow.gates.merge!.routing,
+    [{ paths: ["**/Cargo.toml"], reviewers: ["rev-ui"] }],
+    "…and survive the round trip it makes possible"
+  );
+
+  assert.deepEqual(
+    parseWorkflow(text).workflow.gates.merge!.routing,
+    parsed.gates.merge!.routing,
+    `a save must not drop or mangle a routing rule:\n${text}`
+  );
+
+  // Undeclared stays undeclared: opening the gate form on a repo with no routing
+  // cannot invent an empty block.
+  const none = starterWorkflow();
+  assert.equal(none.gates.merge!.routing, undefined);
+  assert.ok(!serializeWorkflow(none).includes("routing"));
+});
+
+test("the pane refuses every routing rule the engine refuses (#1176)", () => {
+  const routed = (rules: unknown): ReturnType<typeof validateWorkflow> => {
+    const w = parseWorkflow(ROUTED_YAML).workflow;
+    (w.gates.merge as { routing?: unknown }).routing = rules;
+    return validateWorkflow(w);
+  };
+
+  // A rule with no paths can never fire; one with no reviewers requires nobody.
+  assert.ok(has(routed([{ paths: [], reviewers: ["rev-ui"] }]), "gate-bad-routing"));
+  assert.ok(has(routed([{ paths: ["src/**"], reviewers: [] }]), "gate-bad-routing"));
+
+  // The reviewer checks are the gate's OWN checks, from one definition — so a
+  // routing rule cannot quietly accept a block `reviewers:` would refuse.
+  assert.ok(has(routed([{ paths: ["src/**"], reviewers: ["ghost"] }]), "gate-unknown-reviewer"));
+  assert.ok(has(routed([{ paths: ["src/**"], reviewers: ["worker"] }]), "gate-not-a-reviewer"));
+  // …and the finding names the RULE, so a human knows which line to fix.
+  const f = routed([
+    { paths: ["a/**"], reviewers: ["rev-ui"] },
+    { paths: ["b/**"], reviewers: ["ghost"] },
+  ]);
+  assert.ok(
+    f.some((x) => x.code === "gate-unknown-reviewer" && x.message.includes("Routing rule 2")),
+    JSON.stringify(f)
+  );
+
+  // Globs outside the alphabet, and the three shapes that could never fire.
+  for (const bad of ["src/[ab]*", "a?c", "src/a b", "/src/**", "src/", "../etc/**", ""]) {
+    assert.ok(
+      has(routed([{ paths: [bad], reviewers: ["rev-ui"] }]), "gate-bad-routing"),
+      `"${bad}" must be a finding`
+    );
+  }
+  // …and the ones that are fine, so the rule above is not simply flagging everything.
+  for (const ok of ["src/**", "**/Cargo.toml", "package-lock.json", "a_b-c.d/*", "a..b.txt"]) {
+    assert.deepEqual(
+      codes(routed([{ paths: [ok], reviewers: ["rev-ui"] }])),
+      [],
+      `"${ok}" is inside the alphabet`
+    );
+  }
+
+  // The caps.
+  assert.ok(
+    has(
+      routed(
+        Array.from({ length: GATE_ROUTING_RULES_MAX + 1 }, (_, i) => ({
+          paths: [`d${i}/**`],
+          reviewers: ["rev-ui"],
+        }))
+      ),
+      "gate-bad-routing"
+    )
+  );
+  assert.ok(
+    has(
+      routed([
+        {
+          paths: Array.from({ length: GATE_ROUTING_PATHS_MAX + 1 }, (_, i) => `d${i}/**`),
+          reviewers: ["rev-ui"],
+        },
+      ]),
+      "gate-bad-routing"
+    )
+  );
+
+  // The pair with no honest reading: a threshold counts passes over a FIXED list.
+  const thresholded = parseWorkflow(ROUTED_YAML).workflow;
+  thresholded.gates.merge!.require = "threshold";
+  thresholded.gates.merge!.threshold = 1;
+  assert.ok(has(validateWorkflow(thresholded), "gate-bad-routing"));
+
+  // A malformed `routing:` in the FILE is a finding at parse time, never a
+  // coerced value and never a silently dropped key.
+  assert.ok(
+    parseWorkflow(ROUTED_YAML.replace(/    routing:[\s\S]*$/, "    routing: nope\n")).findings.some(
+      (x) => x.code === "gate-bad-routing"
+    )
+  );
+  assert.ok(
+    parseWorkflow(
+      ROUTED_YAML.replace('      - paths: ["src/**", "index.html"]', "      - path: [src]")
+    ).findings.some((x) => x.code === "gate-bad-routing"),
+    "an unknown key inside a rule is a refusal — the engine refuses the whole file over one"
+  );
 });
