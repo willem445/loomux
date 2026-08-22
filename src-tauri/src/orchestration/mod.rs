@@ -4647,7 +4647,7 @@ impl Guardrails {
 /// administrator." An org that blocks bypass-permissions mode neuters these two
 /// atoms while leaving `--autopilot` (not a permissive option) working, so the
 /// pane runs unattended and prompts anyway. The targeted grants loomux emits
-/// alongside them — `--allow-tool loomux` in the base command, `--add-dir` for
+/// alongside them — `--allow-tool <server>` in the base command, `--add-dir` for
 /// the group dir and workdir — are NOT permissive options and are what keeps
 /// such a pane usable at all. Nothing here can override the policy, and loomux
 /// must not pretend to.
@@ -4690,7 +4690,7 @@ pub const COPILOT_GROUP_AUTOPILOT_FLAGS: &str = "--autopilot --allow-all-tools -
 /// official [CLI reference](https://code.claude.com/docs/en/cli-reference),
 /// `--allowedTools` takes space-separated values in one occurrence (the page's
 /// own example: `"Bash(git log *)" "Bash(git diff *)" "Read"`), so a value list
-/// ends at the next flag. #417 inserted `--settings` between `mcp__loomux` and
+/// ends at the next flag. #417 inserted `--settings` between the tool prefix and
 /// these patterns, which silently demoted them from allow rules to stray
 /// positional arguments on every real spawn. Pinned by
 /// `claude_allow_patterns_are_not_severed_from_the_allowedtools_flag`.
@@ -4723,7 +4723,7 @@ pub const CLAUDE_UNATTENDED_ALLOW: &str = "\"Bash(git *)\" \"Bash(gh *)\"";
 /// rewrites the user's settings to achieve it.
 ///
 /// **The entries, and why each is here:**
-/// - `mcp__loomux` — `report`/`message_orchestrator`; the planner's only way
+/// - the MCP tool prefix — `report`/`message_orchestrator`; the planner's only way
 ///   to answer the orchestrator at all. (The documented form: per the
 ///   permissions reference, `mcp__<server>` "matches any tool provided by" that
 ///   server.)
@@ -4789,10 +4789,10 @@ pub const CLAUDE_UNATTENDED_ALLOW: &str = "\"Bash(git *)\" \"Bash(gh *)\"";
 ///
 /// `readonly_pane_settings_carry_permissions_allow` pins the list, including
 /// #465's no-bare-mutation-grant invariant restated for this layer: nothing but
-/// `mcp__loomux`, a scoped `Name(...)` pattern, or one of the two enumerated
+/// the MCP tool prefix, a scoped `Name(...)` pattern, or one of the two enumerated
 /// research tools may ever appear here.
 pub const CLAUDE_READONLY_SETTINGS_ALLOW: &[&str] =
-    &["mcp__loomux", "Bash(git *)", "Bash(gh *)", "WebFetch", "WebSearch"];
+    &[brand::MCP_TOOL_PREFIX, "Bash(git *)", "Bash(gh *)", "WebFetch", "WebSearch"];
 
 /// The `permissions.deny` rules that ride the same `--settings` object as
 /// [`CLAUDE_READONLY_SETTINGS_ALLOW`] (#614 review B1) — **derived from the
@@ -5027,7 +5027,7 @@ pub const COPILOT_ATTENDED_ALLOW: &[&str] = &["shell(git:*)", "shell(gh:*)"];
 /// So the repeated form loomux emitted before #802 is a form the docs never
 /// describe, and its failure mode — if a later occurrence *replaces* an earlier
 /// one instead of accumulating — is exactly the #802 report: the base
-/// `--allow-tool loomux` grant silently dropped by the git/gh pair or by a
+/// `--allow-tool <server>` grant silently dropped by the git/gh pair or by a
 /// block's `allow:` patterns emitted after it. Those extra occurrences are, on
 /// copilot, the ONLY argv difference a workflow block introduces over the
 /// built-in roster.
@@ -5046,7 +5046,7 @@ pub const COPILOT_TOOL_LIST_SEP: &str = ",";
 /// Shared by the string and argv builders so the two can't drift, and pure so
 /// the whole posture is assertable without a spawn (CLAUDE.md constraint 3).
 ///
-/// The allow list always leads with [`LOOMUX_MCP_SERVER`] — the bare
+/// The allow list always leads with [`MCP_SERVER`] — the bare
 /// server-name form, which the reference's "Tool permission patterns" table
 /// documents as a permission kind in its own right (`SERVER-NAME | MCP server
 /// tool invocation | MyMCP(create_issue), MyMCP`) with a worked example: "#
@@ -5065,7 +5065,7 @@ pub fn copilot_tool_permissions(
     containment: Containment,
     extra_allow: &[String],
 ) -> (Vec<String>, Vec<String>) {
-    let mut allow = vec![LOOMUX_MCP_SERVER.to_string()];
+    let mut allow = vec![MCP_SERVER.to_string()];
     if !unattended {
         // An unattended agent already has `--allow-all-tools`; the git/gh pair
         // is the attended tier's substitute for it, not an addition to it.
@@ -5192,23 +5192,26 @@ pub const GEMINI_UNATTENDED_FLAGS: &str = "--approval-mode yolo";
 /// follows).
 pub const GEMINI_ATTENDED_FLAGS: &str = "--approval-mode default";
 
-/// The MCP server name loomux declares to every agent CLI. Gemini needs it as a
-/// value (`--allowed-mcp-server-names`, its analogue of claude's
+/// The MCP server name this app declares to every agent CLI. Gemini needs it as
+/// a value (`--allowed-mcp-server-names`, its analogue of claude's
 /// `--strict-mcp-config`: an allowlist rather than a "only my file" switch), so
-/// the string that was a literal in three places is now one constant.
-pub const LOOMUX_MCP_SERVER: &str = "loomux";
+/// the string that was a literal in three places is now one constant — and
+/// since #1153 phase 3 it is [`brand::MCP_SERVER`], the same word the data dir
+/// and the audit actor use, because a rename that moved one of them and not the
+/// others is a group whose allowlist denies its own tools.
+pub const MCP_SERVER: &str = brand::MCP_SERVER;
 
 /// The `tools:` entries a generated Copilot agent file adds so loomux's own MCP
 /// server survives a persona's tool filter (#802).
 ///
-/// `loomux/*` is the documented spelling: the [custom-agents configuration
+/// `<server>/*` is the documented spelling: the [custom-agents configuration
 /// reference](https://docs.github.com/en/copilot/reference/custom-agents-configuration)'s
 /// *Tools* section says *"You can also explicitly enable all tools from a
 /// specific MCP server using `some-mcp-server/*`"*, alongside *"Tool names from
 /// specific MCP servers can be prefixed with the server name followed by a
 /// `/`"*.
 ///
-/// The bare `loomux` alongside it is a **deliberate hedge, and free**. The same
+/// The bare server name alongside it is a **deliberate hedge, and free**. The same
 /// section states *"All unrecognized tool names are ignored"*, so an entry the
 /// CLI does not understand costs nothing — while the failure it insures against
 /// is #802 recurring silently for a fourth round because the one documented
@@ -5217,9 +5220,9 @@ pub const LOOMUX_MCP_SERVER: &str = "loomux";
 /// Copilot's vocabulary). Drop the bare form once a live run confirms which one
 /// Copilot honors — the answer is a live observation loomux cannot make for
 /// itself (CLAUDE.md constraint 3).
-pub const COPILOT_LOOMUX_TOOL_GRANTS: [&str; 2] = ["loomux/*", LOOMUX_MCP_SERVER];
+pub const COPILOT_MCP_TOOL_GRANTS: [&str; 2] = ["orrerix/*", MCP_SERVER];
 
-/// A persona's `tools:` list with [`COPILOT_LOOMUX_TOOL_GRANTS`] appended —
+/// A persona's `tools:` list with [`COPILOT_MCP_TOOL_GRANTS`] appended —
 /// the user's own scoping intent preserved verbatim, widened by exactly the one
 /// server loomux needs the delegate to be able to call (#802).
 ///
@@ -5227,7 +5230,7 @@ pub const COPILOT_LOOMUX_TOOL_GRANTS: [&str; 2] = ["loomux/*", LOOMUX_MCP_SERVER
 /// file that already grants the server is idempotent.
 fn copilot_tools_with_loomux(tools: &[String]) -> Vec<String> {
     let mut out: Vec<String> = tools.to_vec();
-    for grant in COPILOT_LOOMUX_TOOL_GRANTS {
+    for grant in COPILOT_MCP_TOOL_GRANTS {
         if !out.iter().any(|t| t == grant) {
             out.push(grant.to_string());
         }
@@ -5236,12 +5239,14 @@ fn copilot_tools_with_loomux(tools: &[String]) -> Vec<String> {
 }
 
 /// `{ "loomux": <server> }` — the one-entry server map every CLI's generated
-/// config wraps its server entry in, keyed by [`LOOMUX_MCP_SERVER`] so the name
-/// on argv (`--allowed-mcp-server-names loomux`, `--allow-tool loomux`,
-/// `--allowedTools mcp__loomux`) and the name in the file can't drift apart.
+/// config wraps its server entry in, keyed by [`MCP_SERVER`] so the name
+/// on argv (`--allowed-mcp-server-names <server>`, `--allow-tool <server>`,
+/// `--allowedTools mcp__<server>`) and the name in the file can't drift
+/// apart — every one of those argv spellings is now built from this const or
+/// from [`brand::MCP_TOOL_PREFIX`], which a unit test derives from it.
 fn one_server_map(server: Value) -> Value {
     let mut m = serde_json::Map::new();
-    m.insert(LOOMUX_MCP_SERVER.to_string(), server);
+    m.insert(MCP_SERVER.to_string(), server);
     Value::Object(m)
 }
 
@@ -5309,7 +5314,7 @@ pub struct AgentCliConfig {
 ///
 /// The MCP server is declared with `httpUrl` + `headers`, the streamable-HTTP
 /// shape in gemini's `mcpServers` schema, carrying the same
-/// `X-Loomux-Agent` token every other CLI's config does — one server contract,
+/// agent token header every other CLI's config does — one server contract,
 /// three spellings.
 #[doc(hidden)] // pub for integration tests
 pub fn gemini_settings_json(
@@ -5321,7 +5326,7 @@ pub fn gemini_settings_json(
     let mut cfg = json!({
         "mcpServers": one_server_map(json!({
             "httpUrl": format!("http://127.0.0.1:{port}/mcp"),
-            "headers": { "X-Loomux-Agent": token },
+            "headers": { (brand::AGENT_TOKEN_HEADER): token },
         }))
     });
     if containment.denies_edits() {
@@ -5658,7 +5663,7 @@ pub fn opencode_config_json(
             "type": "remote",
             "url": format!("http://127.0.0.1:{port}/mcp"),
             "enabled": true,
-            "headers": { "X-Loomux-Agent": token },
+            "headers": { (brand::AGENT_TOKEN_HEADER): token },
             "oauth": false,
             "timeout": OPENCODE_MCP_TIMEOUT_MS,
         })),
@@ -10934,14 +10939,14 @@ impl ResolvedPersona {
     /// true for a persona that declares no `tools:` — Copilot's documented
     /// default is every tool.
     pub fn grants_loomux_tools(&self) -> bool {
-        profiles::tools_grant_mcp_server(self.copilot_tools.as_deref(), LOOMUX_MCP_SERVER)
+        profiles::tools_grant_mcp_server(self.copilot_tools.as_deref(), MCP_SERVER)
     }
 
     /// Whether the `tools:` list names loomux's server at all, including a
     /// single-tool grant like `loomux/report` (#802). Wording only — see
     /// [`profiles::AgentProfile::mentions_mcp_server`].
     pub fn mentions_loomux_tools(&self) -> bool {
-        profiles::tools_mention_mcp_server(self.copilot_tools.as_deref(), LOOMUX_MCP_SERVER)
+        profiles::tools_mention_mcp_server(self.copilot_tools.as_deref(), MCP_SERVER)
     }
 }
 
@@ -10974,7 +10979,7 @@ pub enum ToolsGapAction {
     /// "nothing except me".
     KeptNativeForExplicitEmptyList,
     /// The list already names loomux per-tool (`loomux/report`). The user scoped
-    /// the server deliberately; widening that to `loomux/*` would be loomux
+    /// the server deliberately; widening that to `orrerix/*` would be this app
     /// granting itself more than it was given.
     KeptNativeForPerToolScope,
     /// The copy could not be written (unwritable agents dir, or a body over the
@@ -11020,7 +11025,7 @@ pub fn copilot_tools_gap_warning(
     };
     let partial = if persona.mentions_loomux_tools() {
         format!(
-            " It grants some {LOOMUX_MCP_SERVER} tools but not all of them, so the delegate \
+            " It grants some {MCP_SERVER} tools but not all of them, so the delegate \
              would be missing whichever ones it did not name."
         )
     } else {
@@ -11031,7 +11036,7 @@ pub fn copilot_tools_gap_warning(
             "loomux launched it from a generated copy of that persona carrying the same list \
              plus \"{}\" instead, so this spawn works — but the repo file is still the one to \
              fix.",
-            COPILOT_LOOMUX_TOOL_GRANTS.join("\", \""),
+            COPILOT_MCP_TOOL_GRANTS.join("\", \""),
         ),
         ToolsGapAction::KeptNativeForMcpServers => {
             "loomux did NOT rewrite it, because the persona declares its own `mcp-servers:` \
@@ -11063,7 +11068,7 @@ pub fn copilot_tools_gap_warning(
         "block {block_id}: copilot persona \"{}\" declares tools: {shown}, which does not grant \
          loomux's MCP server. Copilot's `tools:` is a FILTER over built-in AND MCP tools, so the \
          loomux server loads but none of its tools reach the agent (#802).{partial} Add \
-         \"loomux/*\" to that file's tools: list. {tail}",
+         \"orrerix/*\" to that file's tools: list. {tail}",
         persona.name,
     )
 }
@@ -13346,7 +13351,7 @@ fn pre_trust_copilot_folder_in(home: &Path, location: &str, folder: &str) {
     let perms_path = copilot_permissions_file(home);
     let perms_text = fs::read_to_string(&perms_path).unwrap_or_default();
     if let Some(updated) =
-        copilot_permissions_grant(&perms_text, location, folder, LOOMUX_MCP_SERVER)
+        copilot_permissions_grant(&perms_text, location, folder, MCP_SERVER)
     {
         // `atomic_write` creates the destination directory itself.
         let _ = atomic_write(&perms_path, updated.as_bytes());
@@ -31248,12 +31253,12 @@ impl OrchRegistry {
                 // pane ever needs an allow list to be honoured (a read-only
                 // solo tier, say), merge the two into one occurrence first.
                 "claude" => format!(
-                    "--mcp-config \"{}\" --strict-mcp-config --allowedTools mcp__loomux",
-                    cfg.display()
+                    "--mcp-config \"{}\" --strict-mcp-config --allowedTools {tools}",
+                    cfg.display(), tools = brand::MCP_TOOL_PREFIX
                 ),
                 "copilot" => format!(
-                    "--additional-mcp-config \"@{}\" --allow-tool loomux",
-                    cfg.display()
+                    "--additional-mcp-config \"@{}\" --allow-tool {server}",
+                    cfg.display(), server = MCP_SERVER
                 ),
                 _ => unreachable!("has_seam is only true for a CliCaps row with mcp_argv_seam"),
             };
@@ -39006,7 +39011,7 @@ impl OrchRegistry {
         let mut server = json!({
             "type": "http",
             "url": format!("http://127.0.0.1:{port}/mcp"),
-            "headers": { "X-Loomux-Agent": token },
+            "headers": { (brand::AGENT_TOKEN_HEADER): token },
         });
         if cli == "copilot" {
             server["tools"] = json!(["*"]);
@@ -39762,7 +39767,7 @@ impl OrchRegistry {
         //    rides along for the same reason: loomux has no opinion about those
         //    keys, and "no opinion" must mean "carried", not "deleted".
         // 2. `tools:` is the user's list verbatim plus
-        //    `COPILOT_LOOMUX_TOOL_GRANTS` — the only edit loomux makes, and the
+        //    `COPILOT_MCP_TOOL_GRANTS` — the only edit loomux makes, and the
         //    reason the file exists.
         //
         // Omitting `tools:` entirely (the `false` path) is Copilot's documented
@@ -39883,14 +39888,14 @@ impl OrchRegistry {
             // generated agent file has never had a `tools:` key, so it inherits
             // the documented all-tools default.
             //
-            // Neither `--allow-tool loomux` nor the `permissions-config.json`
+            // Neither `--allow-tool <server>` nor the `permissions-config.json`
             // approval (#803) can undo it: those grant PERMISSION over what is
             // available, and this decides what is available at all. The only
             // documented repair is an agent file whose own list carries the
             // grant — and loomux may never write into the user's
             // `.github/agents/` (#222). So it re-points `--agent` at a
             // loomux-owned copy in `~/.copilot/agents/` carrying the user's list
-            // PLUS `COPILOT_LOOMUX_TOOL_GRANTS`, which is the generated-file
+            // PLUS `COPILOT_MCP_TOOL_GRANTS`, which is the generated-file
             // path that already exists a few lines below.
             // **Only a NATIVE persona can have this bug at all** (rev-lead N1).
             // The filter bites when Copilot loads the USER's file, which happens
@@ -39909,7 +39914,7 @@ impl OrchRegistry {
                     "block": block.id,
                     "persona": p.name,
                     "tools": p.copilot_tools.clone().unwrap_or_default(),
-                    "missing": COPILOT_LOOMUX_TOOL_GRANTS,
+                    "missing": COPILOT_MCP_TOOL_GRANTS,
                     "mentions_server": p.mentions_loomux_tools(),
                     "action": match refusal {
                         None => "re-pointed --agent at a loomux-generated stand-in carrying every \
@@ -40451,7 +40456,7 @@ impl OrchRegistry {
                 // list-valued flags).
                 format!(
                     "gemini {resume_flag}--model {model} {approval} \
-                     --include-directories \"{}\" --allowed-mcp-server-names {LOOMUX_MCP_SERVER}",
+                     --include-directories \"{}\" --allowed-mcp-server-names {MCP_SERVER}",
                     group_dir.display()
                 )
             }
@@ -40532,9 +40537,10 @@ impl OrchRegistry {
                 let model_arg = claude_model_arg(model, knobs.context);
                 let mut cmd = format!(
                     "claude {session_flag}--mcp-config \"{}\" --strict-mcp-config \
-                     --model {model_arg} --permission-mode {perm} --add-dir \"{}\" --allowedTools mcp__loomux",
+                     --model {model_arg} --permission-mode {perm} --add-dir \"{}\" --allowedTools {tools}",
                     cfg.display(),
-                    group_dir.display()
+                    group_dir.display(),
+                    tools = brand::MCP_TOOL_PREFIX
                 );
                 if unattended {
                     // Pre-approve git + gh so the unattended flow runs without
@@ -40832,7 +40838,7 @@ impl OrchRegistry {
                 push(&mut a, "--include-directories");
                 a.push(group_dir.display().to_string());
                 push(&mut a, "--allowed-mcp-server-names");
-                push(&mut a, LOOMUX_MCP_SERVER);
+                push(&mut a, MCP_SERVER);
             }
             // OpenCode (#722) — see the string form for why this arm is short:
             // its MCP, containment and persona-definition seams are one
@@ -40887,7 +40893,7 @@ impl OrchRegistry {
                 push(&mut a, "--add-dir");
                 a.push(group_dir.display().to_string());
                 push(&mut a, "--allowedTools");
-                push(&mut a, "mcp__loomux");
+                push(&mut a, brand::MCP_TOOL_PREFIX);
                 if unattended {
                     // == CLAUDE_UNATTENDED_ALLOW, as literal (unquoted) tokens.
                     push(&mut a, "Bash(git *)");

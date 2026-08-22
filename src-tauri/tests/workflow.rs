@@ -2063,7 +2063,7 @@ fn default_roster_command_lines_now_carry_the_durable_contract_via_a_generated_c
         let expected = format!(
             "claude --mcp-config \"C:/x/cfg.json\" --strict-mcp-config \
              --model {model} --permission-mode {perm} --add-dir \"C:/data/group\" \
-             --allowedTools mcp__loomux{extra} --agent {handle}"
+             --allowedTools mcp__orrerix{extra} --agent {handle}"
         );
         assert_eq!(cmd, &expected, "{block_id}'s command line changed in an unexpected way");
         assert_eq!(handle, &format!("loomux-{}-{block_id}", g.id), "handle naming convention");
@@ -2874,7 +2874,7 @@ fn copilot_persona_tools_list_without_loomux_is_repaired_by_a_generated_copy() {
         .map(|t| t.as_str().unwrap().to_string())
         .collect();
     assert!(
-        tools.contains(&"loomux/*".to_string()),
+        tools.contains(&"orrerix/*".to_string()),
         "the documented server-wildcard grant must be present: {tools:?}"
     );
     // The user's own scoping intent survives verbatim — loomux widens by exactly
@@ -2937,7 +2937,7 @@ fn loomux_repairs_an_omission_but_never_a_deliberate_narrowing() {
     let (cmd, line) = case("[\"read\", \"loomux/report\"]");
     assert!(
         cmd.contains("--agent p"),
-        "a per-tool scope is left as written — widening it to loomux/* would be loomux granting \
+        "a per-tool scope is left as written — widening it to orrerix/* would be this app granting \
          itself more than it was given: {cmd}"
     );
     assert!(line.contains("per-tool"), "and says why: {line}");
@@ -2947,7 +2947,7 @@ fn loomux_repairs_an_omission_but_never_a_deliberate_narrowing() {
 fn copilot_persona_that_grants_loomux_or_declares_no_tools_keeps_the_native_path() {
     // The repair must not over-trigger: an unfiltered persona (the common case,
     // and every file in this repo's own `.github/agents/`) is untouched, and so
-    // is one that already grants the server — by `*`, by `loomux/*`, or by the
+    // is one that already grants the server — by `*`, by `orrerix/*`, or by the
     // bare argv spelling the CLI's own `--allow-tool` uses.
     //
     // rev-lead N3: this was a guard that had never been observed red, i.e. a
@@ -2957,7 +2957,7 @@ fn copilot_persona_that_grants_loomux_or_declares_no_tools_keeps_the_native_path
     // "always repair" fails these; and a `grants_mcp_server` stuck at either
     // constant fails one side or the other. No mutation run needed, and the
     // coverage lives in CI forever rather than in a cited log line.
-    for tools_line in ["", "tools: [\"*\"]\n", "tools: [\"read\", \"loomux/*\"]\n", "tools: [\"read\", \"loomux\"]\n"] {
+    for tools_line in ["", "tools: [\"*\"]\n", "tools: [\"read\", \"orrerix/*\"]\n", "tools: [\"read\", \"orrerix\"]\n"] {
         let (reg, d) = test_registry();
         let repo = Repo::new().workflow(&copilot_profile_workflow("w", "open.md")).agent_file(
             "open.md",
@@ -2987,7 +2987,7 @@ fn copilot_persona_that_grants_loomux_or_declares_no_tools_keeps_the_native_path
         // out must come out the OTHER way. Without this, every assertion above
         // would still pass if the repair had been disabled outright, and the
         // test would be certifying nothing.
-        let stripped = tools_line.replace("\"loomux/*\"", "\"search\"").replace("\"loomux\"", "\"search\"");
+        let stripped = tools_line.replace("\"orrerix/*\"", "\"search\"").replace("\"orrerix\"", "\"search\"");
         let stripped = if tools_line.is_empty() { "tools: [\"read\"]\n".to_string() } else { stripped.replace("[\"*\"]", "[\"read\"]") };
         let (reg2, d2) = test_registry();
         let repo2 = Repo::new().workflow(&copilot_profile_workflow("w", "open.md")).agent_file(
@@ -3167,7 +3167,7 @@ fn mcp_spawn_reply_says_when_a_persona_tools_list_stripped_the_loomux_server() {
     assert_eq!(out["isError"], json!(false), "{:?}", out["content"][0]["text"]);
     let text = out["content"][0]["text"].as_str().unwrap();
     assert!(
-        text.contains("loomux/*"),
+        text.contains("orrerix/*"),
         "the reply must carry the exact line to add to the persona file: {text}"
     );
     assert!(text.contains("scoped"), "...and name the persona to add it to: {text}");

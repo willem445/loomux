@@ -5953,7 +5953,7 @@ fn claude_command_minimizes_init_approvals_without_bypass() {
     assert!(cmd.contains("--strict-mcp-config"), "workers must not see the user's other MCP servers");
     assert!(cmd.contains("--add-dir \"C:/data/group\""),
         "instructions dir must be a workspace so reading it never prompts");
-    assert!(cmd.contains("--allowedTools mcp__loomux"),
+    assert!(cmd.contains("--allowedTools mcp__orrerix"),
         "loomux tools must be pre-approved so report/list never prompt");
     assert!(!cmd.contains("Bash(git"), "git is not pre-approved for a non-auto_ops worker");
     let cmd = reg.build_agent_command("claude", "sonnet", true, cfg, None, gdir, Path::new("C:/repo"), None, false, Containment::None, &PersonaInject::default());
@@ -6456,7 +6456,7 @@ fn planner_runs_unattended_regardless_of_auto_ops() {
 /// last-wins rather than by accumulating, every pattern but the last is
 /// silently dropped — which is #802's report ("the CLI lists the loomux MCP
 /// server as available, but the agent has no permission to use its tools"),
-/// since `--allow-tool loomux` was emitted FIRST.
+/// since `--allow-tool orrerix` was emitted FIRST.
 ///
 /// Returns the patterns in order, or an empty vec when the option is absent.
 fn copilot_tool_patterns(cmd: &str, flag: &str) -> Vec<String> {
@@ -6776,7 +6776,7 @@ fn claude_effective_permission_mode_is_dontask_only_for_read_only() {
 /// "everything not pre-approved is denied" just as surely as the old
 /// per-name deny list did, only relocated to the allow side. This pins the
 /// actual list a read-only agent's `--allowedTools` resolves to: every
-/// token must be either the literal `mcp__loomux` or a SCOPED `Name(...)`
+/// token must be either the literal `mcp__orrerix` or a SCOPED `Name(...)`
 /// pattern, never a bare tool name.
 ///
 /// Mutation evidence (red before green): with `CLAUDE_UNATTENDED_ALLOW`
@@ -6808,12 +6808,12 @@ fn claude_readonly_allowed_tools_contain_no_unscoped_grant() {
     assert!(!allowed.is_empty(), "read-only --allowedTools must not be empty under dontAsk");
     for t in allowed {
         assert!(
-            t == "mcp__loomux" || (t.contains('(') && t.ends_with(')')),
+            t == "mcp__orrerix" || (t.contains('(') && t.ends_with(')')),
             "{t:?} in the read-only --allowedTools list is a BARE tool grant — under \
              dontAsk (#465) a bare grant re-opens the exact fail-open direction this \
              mode exists to close (Claude would be pre-approved to use ALL of that \
              tool, present and future capabilities alike). Every entry must be \
-             `mcp__loomux` or a scoped `Name(...)` pattern."
+             `mcp__orrerix` or a scoped `Name(...)` pattern."
         );
     }
 }
@@ -7060,7 +7060,7 @@ fn build_agent_command_full_line_snapshots() {
     assert_eq!(
         cmd("claude", "sonnet", true, Containment::None),
         "claude --mcp-config \"C:/x/cfg.json\" --strict-mcp-config \
-         --model sonnet --permission-mode auto --add-dir \"C:/data/group\" --allowedTools mcp__loomux \
+         --model sonnet --permission-mode auto --add-dir \"C:/data/group\" --allowedTools mcp__orrerix \
          \"Bash(git *)\" \"Bash(gh *)\""
     );
 
@@ -7068,7 +7068,7 @@ fn build_agent_command_full_line_snapshots() {
     assert_eq!(
         cmd("claude", "sonnet", false, Containment::None),
         "claude --mcp-config \"C:/x/cfg.json\" --strict-mcp-config \
-         --model sonnet --permission-mode acceptEdits --add-dir \"C:/data/group\" --allowedTools mcp__loomux"
+         --model sonnet --permission-mode acceptEdits --add-dir \"C:/data/group\" --allowedTools mcp__orrerix"
     );
 
     // Copilot worker, auto_ops ON → group autopilot: --autopilot + all tools/paths.
@@ -7096,7 +7096,7 @@ fn build_agent_command_full_line_snapshots() {
     assert_eq!(
         cmd("claude", "opus", false, Containment::ReadOnly),
         "claude --mcp-config \"C:/x/cfg.json\" --strict-mcp-config \
-         --model opus --permission-mode dontAsk --add-dir \"C:/data/group\" --allowedTools mcp__loomux \
+         --model opus --permission-mode dontAsk --add-dir \"C:/data/group\" --allowedTools mcp__orrerix \
          \"Bash(git *)\" \"Bash(gh *)\" --disallowedTools Edit Write NotebookEdit \
          \"Bash(git commit *)\" \"Bash(git push *)\""
     );
@@ -7122,13 +7122,13 @@ fn build_agent_command_full_line_snapshots() {
     assert_eq!(
         cmd("claude", "sonnet", true, Containment::NoEdits),
         "claude --mcp-config \"C:/x/cfg.json\" --strict-mcp-config \
-         --model sonnet --permission-mode auto --add-dir \"C:/data/group\" --allowedTools mcp__loomux \
+         --model sonnet --permission-mode auto --add-dir \"C:/data/group\" --allowedTools mcp__orrerix \
          \"Bash(git *)\" \"Bash(gh *)\" --disallowedTools Edit Write NotebookEdit"
     );
     assert_eq!(
         cmd("claude", "sonnet", false, Containment::NoEdits),
         "claude --mcp-config \"C:/x/cfg.json\" --strict-mcp-config \
-         --model sonnet --permission-mode acceptEdits --add-dir \"C:/data/group\" --allowedTools mcp__loomux \
+         --model sonnet --permission-mode acceptEdits --add-dir \"C:/data/group\" --allowedTools mcp__orrerix \
          --disallowedTools Edit Write NotebookEdit"
     );
     assert_eq!(
@@ -7218,7 +7218,7 @@ fn claude_flag_values(tokens: &[String], flag: &str) -> Vec<String> {
 /// #610, the root cause: `--settings` (#417) is emitted BETWEEN
 /// `--allowedTools`'s first value and the git/gh patterns that follow it, so
 /// on every spawn that actually has a hook-settings file — i.e. every real
-/// Claude spawn — the value list Claude parses is just `mcp__loomux` and the
+/// Claude spawn — the value list Claude parses is just `mcp__orrerix` and the
 /// patterns land as stray positional arguments. That is invisible on a worker
 /// (`--permission-mode auto` approves git/gh without consulting the allow
 /// list) and total on a planner (`dontAsk` denies everything not
@@ -7226,7 +7226,7 @@ fn claude_flag_values(tokens: &[String], flag: &str) -> Vec<String> {
 /// `gh` entirely denied while read-only `git` — Claude's own built-in
 /// read-only Bash carve-out, no allow rule involved — kept working.
 ///
-/// The one token that survived the truncation, `mcp__loomux`, is also the one
+/// The one token that survived the truncation, `mcp__orrerix`, is also the one
 /// capability planners demonstrably kept (`report`/`message_orchestrator`
 /// worked throughout), which is what rules OUT "dontAsk ignores
 /// `--allowedTools` entirely" as the explanation.
@@ -7246,7 +7246,7 @@ fn claude_allow_patterns_are_not_severed_from_the_allowedtools_flag() {
         // A read-only block never carries `extra_allow` (#222's capability
         // closure empties it) — pass it only where it can legitimately appear.
         let p = if containment == Containment::ReadOnly { PersonaInject::default() } else { persona.clone() };
-        let mut want = vec!["mcp__loomux", "Bash(git *)", "Bash(gh *)"];
+        let mut want = vec!["mcp__orrerix", "Bash(git *)", "Bash(gh *)"];
         if containment != Containment::ReadOnly {
             want.push("Bash(make:*)");
         }
@@ -7354,7 +7354,7 @@ fn readonly_pane_settings_carry_permissions_allow() {
     // `git fetch` (a git subcommand, so `Bash(git *)` covers it — the ReadOnly
     // deny list carves out only `commit`/`push`, and deny beats allow), and
     // the loomux MCP server for `report`/`message_orchestrator`.
-    for want in ["mcp__loomux", "Bash(git *)", "Bash(gh *)"] {
+    for want in ["mcp__orrerix", "Bash(git *)", "Bash(gh *)"] {
         assert!(allow.iter().any(|r| r == want), "#610: {want:?} missing from {allow:?}");
     }
     // The research capability the same issue decided on: a planner must be
@@ -7377,9 +7377,9 @@ fn readonly_pane_settings_carry_permissions_allow() {
     for rule in &allow {
         let scoped = rule.contains('(') && rule.ends_with(')');
         assert!(
-            rule == "mcp__loomux" || scoped || RESEARCH_TOOLS.contains(&rule.as_str()),
+            rule == "mcp__orrerix" || scoped || RESEARCH_TOOLS.contains(&rule.as_str()),
             "#610/#465: {rule:?} is a BARE tool grant in a dontAsk pane's permissions.allow. \
-             Only `mcp__loomux`, a scoped `Name(...)` pattern, or one of the enumerated \
+             Only `mcp__orrerix`, a scoped `Name(...)` pattern, or one of the enumerated \
              non-mutating research tools {:?} may appear here.",
             RESEARCH_TOOLS
         );
@@ -7564,7 +7564,7 @@ fn build_agent_argv_snapshots() {
         vec![
             "claude", "--mcp-config", "C:/x/cfg.json", "--strict-mcp-config", "--model", "sonnet",
             "--permission-mode", "auto", "--add-dir", "C:/data/group", "--allowedTools",
-            "mcp__loomux", "Bash(git *)", "Bash(gh *)",
+            "mcp__orrerix", "Bash(git *)", "Bash(gh *)",
         ]
     );
 
@@ -7578,7 +7578,7 @@ fn build_agent_argv_snapshots() {
         vec![
             "claude", "--mcp-config", "C:/x/cfg.json", "--strict-mcp-config", "--model", "sonnet",
             "--permission-mode", "auto", "--add-dir", "C:/data/group", "--allowedTools",
-            "mcp__loomux", "Bash(git *)", "Bash(gh *)", "--disallowedTools", "Edit", "Write",
+            "mcp__orrerix", "Bash(git *)", "Bash(gh *)", "--disallowedTools", "Edit", "Write",
             "NotebookEdit",
         ]
     );
@@ -42202,13 +42202,13 @@ fn solo_prepare_builds_the_exact_per_cli_flag_strings_and_delivery_only_falls_ba
     let args = claude["mcp_args"].as_str().unwrap();
     assert!(args.contains("--mcp-config \""), "got: {args}");
     assert!(args.contains("--strict-mcp-config"), "got: {args}");
-    assert!(args.contains("--allowedTools mcp__loomux"), "got: {args}");
+    assert!(args.contains("--allowedTools mcp__orrerix"), "got: {args}");
 
     let copilot = reg.solo_prepare("copilot", "C:/tmp/solo", "cp").unwrap();
     assert_eq!(copilot["delivery_only"], json!(false));
     let cargs = copilot["mcp_args"].as_str().unwrap();
     assert!(cargs.contains("--additional-mcp-config \"@"), "got: {cargs}");
-    assert!(cargs.contains("--allow-tool loomux"), "got: {cargs}");
+    assert!(cargs.contains("--allow-tool orrerix"), "got: {cargs}");
 
     // No config seam today (A2): AgentEntry still exists (a valid
     // deliver_prompt target once connected), but no token is ever minted.
@@ -48176,7 +48176,7 @@ fn the_effort_flag_does_not_sever_the_allowedtools_value_list() {
         } else {
             persona.clone()
         };
-        let mut want = vec!["mcp__loomux", "Bash(git *)", "Bash(gh *)"];
+        let mut want = vec!["mcp__orrerix", "Bash(git *)", "Bash(gh *)"];
         if containment != Containment::ReadOnly {
             want.push("Bash(make:*)");
         }
