@@ -212,11 +212,19 @@ enumeration, so neither note can drift into claiming the widening happened.
 **`request_attention` checks that `task` names a live board row, and that check lives
 at the tool rather than in the registry.** `validate_raise` is pure and deliberately
 board-blind: for the hook and the migration the check would have nothing to catch
-(both supply the id of a row they have just read), and for an agent it catches the
-one input that produces an item nothing can ever settle. An item pointing at a task
-that does not exist is never auto-resolved — the hook only fires on a real row's
-transition — so it pins a permanently open row on the human's queue until a human or
-a withdraw clears it by hand. Pushing the check down into `raise_needs_you` would
+(both supply the id of a row they have just read), and for an agent it catches a
+dangling link.
+
+**What a phantom id actually costs, and it is not the same for the two kinds.**
+Both lose the LINK: the panel joins the task live to show what to look at, so the
+human gets a card pointing at nothing. A `demo` loses more — it also loses any way
+to settle on its own, because the auto-resolve filters `is_open_demo_for` and so
+fires only for a demo item and only on a real row's transition. A `feedback` item
+is **never** auto-resolved, however real its task; it ends when the human resolves
+it or the raiser withdraws it. So the check is justified by the link for both
+kinds, and additionally by the settle for `demo` — an earlier draft of this
+paragraph gave only the settle reason, which implied a feedback item with a good
+task would eventually clear itself. Pushing the check down into `raise_needs_you` would
 mean reading `tasks.json` from inside the items lock, the nesting `needs_you_lock`
 rules out in the other direction; so the tool reads the board first, then raises.
 

@@ -650,7 +650,7 @@ fn tool_defs(
                 json!({
                     "kind": { "type": "string", "enum": ["demo", "feedback"], "description": "`demo` = something built and parked for the human to RUN (requires `task`). `feedback` = you want their opinion on a direction or a shape (`task` optional). An unrecognized value is rejected, never defaulted — filing a demo as feedback silently changes what the human is being asked to do." },
                     "text": { "type": "string", "description": "What to look at and what you want back, standing on its own away from this machine. Max 2000 characters — REFUSED rather than truncated if you go over; cite the issue or PR for the detail." },
-                    "task": { "type": "string", "description": "The board row this is about, e.g. \"t-7\". REQUIRED for `demo` and recommended for `feedback`. It must name a LIVE row on this board: an item pointing at a task that does not exist can never be auto-resolved by a board move, so it would sit in the human's queue until someone cleared it by hand." },
+                    "task": { "type": "string", "description": "The board row this is about, e.g. \"t-7\". REQUIRED for `demo` and recommended for `feedback`. It must name a LIVE row on this board, for two different reasons. The panel joins that row live to show the human what to go look at, so a phantom id leaves them a card with a dead link. And for `demo` it also decides whether the item can ever settle WITHOUT them: the board's auto-resolve fires only when a real row leaves the demo statuses, and only for demo items — so a demo pointing at nothing stays on their queue until someone clears it by hand. A `feedback` item is never auto-resolved either way; it ends when the human resolves it or you withdraw it." },
                     "urgency": { "type": "string", "enum": ["normal", "high"], "description": "How loudly this should reach the human. Default \"normal\"; the panel pins `high` above the rest. An unrecognized value is rejected, never treated as normal." },
                 }),
                 &["kind", "text"]),
@@ -1307,10 +1307,14 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             // **The task-existence check lives HERE, and
             // `needsyou::validate_raise` says so in its own doc.** It is not a
             // defect for the registry's other callers — the board hook supplies
-            // the id of a row it has just written — and it is one for this tool:
-            // an item naming a task that does not exist can never be
-            // auto-resolved by a board move, so it pins a permanently open row
-            // on the human's queue that only a human or a withdraw can clear.
+            // the id of a row it has just written — and it is one for this tool.
+            // A phantom id costs both kinds their LINK: the panel joins the row
+            // live, so the human gets a card pointing at nothing. It costs a
+            // `demo` more than that — the auto-resolve filters
+            // `is_open_demo_for`, i.e. it fires only for a DEMO item and only on
+            // a real row's transition, so a demo linked to nothing has no way to
+            // settle but by hand. (`feedback` never auto-resolves at all, whatever
+            // its task — so this check buys it the link, not a settle.)
             // Refused BY NAME, because a caller that mistyped `t-7` as `t7`
             // needs to see which string was wrong.
             //
@@ -1321,9 +1325,9 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             if let Some(t) = task {
                 if !reg.tasks(&caller.group).iter().any(|row| row.id == t) {
                     return Err(format!(
-                        "unknown task: {t} — an item must name a live row on this board, or \
-                         nothing can ever auto-resolve it and it sits in the human's queue until \
-                         someone clears it by hand. Check list_tasks."
+                        "unknown task: {t} — an item must name a live row on this board: the \
+                         human's panel joins that row to show what to look at, and for a demo it \
+                         is also what lets the board settle the item later. Check list_tasks."
                     ));
                 }
             }

@@ -53204,10 +53204,12 @@ fn a_liaison_may_pose_a_question_but_may_not_raise_a_needs_you_item() {
 ///
 /// `needsyou::validate_raise` is pure and board-blind, and says in its own doc
 /// that the existence check belongs at this entry point: for the board hook the
-/// check would have nothing to catch, and for an agent it catches the one input
-/// that produces an item NOTHING can ever settle — the auto-resolve only fires
-/// on a real row's transition, so an item naming a phantom task sits open in the
-/// human's queue until a human or a withdraw clears it by hand.
+/// check would have nothing to catch, and for an agent it catches an id that
+/// leaves the human a card joined to nothing — and, for a `demo`, an item the
+/// board can never settle, since the auto-resolve filters `is_open_demo_for` and
+/// so fires only for a demo item and only on a real row's transition. A
+/// `feedback` item is never auto-resolved whatever its task, which is why the
+/// check is justified by the LINK rather than by the settle alone.
 #[test]
 fn request_attention_refuses_a_phantom_task_a_bad_kind_and_a_demo_with_no_row() {
     let (reg, _d, g, co, _cw, _orch, task) = setup_needs_you_mcp();
